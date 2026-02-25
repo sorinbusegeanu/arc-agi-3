@@ -1,7 +1,6 @@
 .env
-zod01/logs*/
-zod01/runs/
-zod01/datasets/
-zod01/models/
-zod01/data/
 **/__pycache__/
+html/  
+other_repos/  
+runs/
+
