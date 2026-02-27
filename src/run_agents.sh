@@ -6,7 +6,7 @@ INPUT=""
 OUTDIR=""
 SAVE_VIZ=""
 FORMAT="both"
-GAME=""
+GAME="all"
 SEED="0"
 MAX_STEPS="80"
 PROBE_STEPS="10"
@@ -26,6 +26,11 @@ SIMPLE_TRACE=""
 FULL_TRACE=""
 FP_DIR=""
 ACTION_SCHEMA_PATH=""
+MODE=""
+EPISODES=""
+ITERS=""
+CHECKPOINT=""
+GAMES_FLAG=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -101,11 +106,20 @@ while [[ $# -gt 0 ]]; do
       GAME="$2"
       shift 2
       ;;
+    --games)
+      GAME="$2"
+      GAMES_FLAG="--games"
+      shift 2
+      ;;
     --seed)
       SEED="$2"
       shift 2
       ;;
     --max-steps)
+      MAX_STEPS="$2"
+      shift 2
+      ;;
+    --max-actions)
       MAX_STEPS="$2"
       shift 2
       ;;
@@ -129,6 +143,22 @@ while [[ $# -gt 0 ]]; do
       FP_SAVE_MODE="$2"
       shift 2
       ;;
+    --mode)
+      MODE="$2"
+      shift 2
+      ;;
+    --episodes)
+      EPISODES="$2"
+      shift 2
+      ;;
+    --iters)
+      ITERS="$2"
+      shift 2
+      ;;
+    --checkpoint)
+      CHECKPOINT="$2"
+      shift 2
+      ;;
     *)
       echo "Unknown argument: $1" >&2
       exit 1
@@ -137,7 +167,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$AGENT" ]]; then
-  echo "Usage: $0 --agent fp_analyst|simple_explorer|full_explorer|rule_proposer|mechanic_classifier|goal_detector|planner|trajectory_summarizer|executable_hypothesis_engine|test_selector|mechanic_synthesizer|swarm [args...]" >&2
+  echo "Usage: $0 --agent fp_analyst|simple_explorer|full_explorer|rule_proposer|mechanic_classifier|goal_detector|planner|trajectory_summarizer|executable_hypothesis_engine|test_selector|mechanic_synthesizer|swarm|rl_agent [args...]" >&2
   exit 1
 fi
 
@@ -147,6 +177,13 @@ if [[ -x "/home/zodrak/zod/.venv/bin/python" ]]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [[ "$AGENT" != "rl_agent" ]]; then
+  if [[ -n "$MODE" || -n "$EPISODES" || -n "$ITERS" || -n "$CHECKPOINT" || -n "$GAMES_FLAG" ]]; then
+    echo "RL-only args (--mode/--episodes/--iters/--checkpoint/--games) are only valid with --agent rl_agent" >&2
+    exit 1
+  fi
+fi
 
 if [[ "$AGENT" == "fp_analyst" ]]; then
   if [[ -z "$INPUT" || -z "$OUTDIR" ]]; then
@@ -269,6 +306,16 @@ if [[ "$AGENT" == "swarm" ]]; then
     exit 1
   fi
   PYTHONPATH="$SCRIPT_DIR" "$PYTHON_EXEC" -m arc_agi_agent.run_swarm --game "$GAME" --seed "$SEED" --max-steps "$MAX_STEPS" --probe-steps "$PROBE_STEPS" --snapshot-every-steps "$SNAPSHOT_EVERY_STEPS" --fp-save-mode "$FP_SAVE_MODE" --op-mode "$OP_MODE" --outdir "$OUTDIR" $DEBUG
+  exit 0
+fi
+
+if [[ "$AGENT" == "rl_agent" ]]; then
+  if [[ -z "$OUTDIR" ]]; then
+    echo "Usage: $0 --agent rl_agent --mode <collect|train|eval> --games <selector> [--seed <n>] [--max-actions <n>] [--episodes <n>] [--iters <n>] [--checkpoint <path>] --outdir <dir>" >&2
+    exit 1
+  fi
+  MODE_ARG="${MODE:-eval}"
+  PYTHONPATH="$SCRIPT_DIR" "$PYTHON_EXEC" -m arc_agi_agent.rl.run_rl --mode "$MODE_ARG" --games "$GAME" --seed "$SEED" --max-actions "$MAX_STEPS" ${EPISODES:+--episodes "$EPISODES"} ${ITERS:+--iters "$ITERS"} ${CHECKPOINT:+--checkpoint "$CHECKPOINT"} --outdir "$OUTDIR"
   exit 0
 fi
 

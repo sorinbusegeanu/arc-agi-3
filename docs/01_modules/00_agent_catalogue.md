@@ -150,4 +150,15 @@ Purpose: deterministically synthesize new executable mechanic hypotheses (primit
 Purpose: deterministically compile (prev_observation, action, observation) plus FP_Analyst outputs into a canonical TransitionEventV1 record (multi-frame aware), which is the single source of truth for hypothesis scoring, synthesis, and test selection.
 
 
+15 Recurrent RL Agent for Novel Game Environments
+Build a single end-to-end reinforcement learning agent that:
 
+* Receives an observation at each step (grid(s) + metadata)
+* Selects an action (discrete or coordinate-based)
+* Learns through trial and error
+* Reaches terminal win states efficiently
+* Generalizes across unseen game mechanics without relying on a fixed rule catalog
+
+This replaces explicit mechanic inference with learned action utility through interaction.
+
+module list (Observation_Encoder, Recurrent_Memory, CoordProposer, Policy_Head, Value_Head, Reward_Shaper, Rollout_Collector, Trainer). 

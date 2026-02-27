@@ -530,4 +530,12 @@ def _infer_events(
 
     if not events:
         events.append(EventSignature(kind="unknown", confidence=0.1, details={}))
-    return events
+    # Map to fixed namespace
+    allowed = {"translation", "paint", "toggle", "gravity", "spawn", "despawn", "swap", "noop", "unknown"}
+    normalized = []
+    for ev in events:
+        kind = ev.kind if hasattr(ev, "kind") else None
+        if kind not in allowed:
+            kind = "unknown"
+        normalized.append(EventSignature(kind=kind, confidence=ev.confidence, details=ev.details))
+    return normalized

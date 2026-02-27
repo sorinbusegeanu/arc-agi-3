@@ -1,0 +1,217 @@
+RL training into existing run_agents.sh / agent registry
+0) Scope
+
+Make RL training runnable using the same project launcher patterns you already use for offline runs, without changing existing agent behavior.
+
+1) Agent registry integration
+1.1 New agent key
+
+Add a new registry entry:
+
+key: rl_agent
+
+class: RLAgent
+
+The registry must support two invocation styles:
+
+Style A: Inference-only (existing pattern)
+
+run_agents.sh --agent rl_agent --games ... --seed ... --max-actions ...
+Runs evaluation-style episodes (deterministic by default unless config overrides).
+
+Style B: Train (new)
+
+run_agents.sh --agent rl_agent --mode train ...
+Routes into RL training loop.
+
+2) CLI passthrough contract (run_agents.sh)
+
+run_agents.sh must accept and forward these arguments when --agent rl_agent:
+
+--mode {collect,train,eval} (default eval)
+
+--episodes N (collect/eval)
+
+--iters N (train loop iterations; default from config)
+
+--checkpoint PATH (optional load)
+
+--outdir PATH (required or default consistent with existing run output)
+
+existing args unchanged:
+
+--games
+
+--seed
+
+--max-actions
+
+No other agents should see --mode/--episodes/--iters; if present for non-RL agents, the launcher must error with a clear message.
+
+3) RLAgent interface contract
+
+RLAgent must expose a single entry method used by the launcher, consistent with existing agent entrypoints.
+
+3.1 Required method
+
+run(env_loader, args, cfg) -> RunResult
+
+Where:
+
+env_loader is the project’s existing environment loading facility (offline mode support).
+
+args is the parsed CLI args.
+
+cfg includes rl.* block.
+
+RLAgent.run(...) must dispatch by args.mode:
+
+eval:
+
+deterministic action selection (rl.deterministic_eval=true default)
+
+no parameter updates
+
+writes eval metrics + traces
+
+collect:
+
+stochastic or deterministic per config
+
+no parameter updates
+
+writes trajectory batches + traces
+
+train:
+
+iterative loop:
+
+collect rollouts
+
+train updates
+
+checkpoint
+
+periodic eval (optional)
+
+writes per-iter metrics and checkpoints
+
+4) Output directory contract
+
+All outputs must be created under:
+
+outdir/rl/<timestamp_or_run_id>/
+
+Subfolders:
+
+checkpoints/
+
+metrics/
+
+traces/
+
+trajectories/
+
+configs/
+
+The launcher must print the resolved run directory once.
+
+5) Trace integration contract
+5.1 Compatibility requirement
+
+RL traces must be written using the same trace writer mechanism as existing agents, but must:
+
+not break existing JSON schema consumers
+
+only add new optional keys under an rl namespace
+
+Example per-step additions:
+
+rl.discrete_logits_topk
+
+rl.coord_logits_topk
+
+rl.coord_candidates (only if ACTION6 available)
+
+rl.chosen_coord_index
+
+rl.reward_terms
+
+Existing keys must not be renamed.
+
+6) Checkpoint contract
+6.1 Save format
+
+A single checkpoint file must contain:
+
+ObservationEncoder weights
+
+RecurrentMemory weights
+
+PolicyHead weights
+
+ValueHead weights
+
+optimizer state (train mode)
+
+resolved config snapshot
+
+training iteration counter
+
+6.2 Load behavior
+
+If --checkpoint provided:
+
+load weights before starting collect/train/eval
+
+if missing optimizer state in checkpoint and mode=train:
+
+initialize optimizer fresh (log warning)
+
+7) Evaluation contract (for regression)
+
+run_agents.sh --agent rl_agent --mode eval must output:
+
+metrics/metrics_eval.json
+Including:
+
+win_rate
+
+mean_return
+
+mean_episode_len
+
+effect_rate
+
+novelty_rate
+
+8) Config integration
+8.1 Config key location
+
+Add an rl section to the same configuration system used by other agents.
+
+The launcher must allow overriding RL config keys using the existing override mechanism (if present), otherwise via --config.
+
+Minimum required:
+
+model dims
+
+reward weights
+
+rollout sizes
+
+algo selection
+
+checkpoint retention
+
+eval frequency
+
+9) No changes to existing agents
+
+This integration must be additive:
+
+no default agent changes
+
+no changes to existing CLI behavior unless --agent rl_agent is selected
+
+no changes to existing trace keys outside the optional rl namespace

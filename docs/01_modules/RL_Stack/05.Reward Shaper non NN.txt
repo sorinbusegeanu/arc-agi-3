@@ -1,0 +1,58 @@
+Reward_Shaper (non-NN)
+0) Scope and non-goals
+
+Scope: compute shaped reward r_t from (prev_obs, action, obs) using canonical diffs.
+
+Non-goals: training, policy, memory persistence.
+
+1) Inputs
+
+Required:
+
+TransitionEventV1 (preferred) 
+
+14_TransitionEvent_Compiler
+
+done (terminal flag)
+
+win (if env distinguishes win vs terminal; else infer from meta if available)
+
+Optional:
+
+per-episode seen_state_hashes set
+
+2) Outputs
+
+RewardV1:
+
+schema_version="REWARD_V1"
+
+r_total (float)
+
+terms: dict of term values for logging
+
+3) Reward terms (v1)
+
+r_win: +1.0 if win else 0.0
+
+r_effect: +β if changed_cells_count>0 OR meta_delta changed
+
+r_novel: +α if state_hash_after not in seen_state_hashes
+
+r_loop: -δ if state_hash_after repeats within recent window N (if provided)
+
+4) Configuration
+
+alpha_novel=0.05
+
+beta_effect=0.02
+
+delta_loop=0.05
+
+loop_window_N=25 (align with planner/explorer defaults)
+
+5) Deliverables
+
+reward_shaper_v1.py exposing:
+
+compute(event, done, win, seen_hashes, recent_hashes, cfg=None, ctx=None) -> RewardV1

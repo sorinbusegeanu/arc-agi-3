@@ -1,0 +1,100 @@
+Trainer (NN updates)
+0) Scope and non-goals
+
+Scope: update NN parameters from collected trajectories using recurrent actor-critic (v1).
+
+Non-goals: distributed training, hyperparameter sweeps, cross-run Memory writes.
+
+1) Inputs
+
+TrajectoryBatchV1 from Rollout_Collector
+
+NN modules:
+
+Observation_Encoder
+
+Recurrent_Memory
+
+Policy_Head
+
+Value_Head (part of policy module or separate MLP)
+
+2) Outputs
+
+updated weights (checkpoint)
+
+TrainStepReportV1:
+
+losses: policy, value, entropy
+
+KL / clip fraction if PPO-like
+
+mean episode return, win rate (batch)
+
+gradient norms
+
+3) Algorithm (v1 requirements)
+
+Use recurrent actor-critic with advantage estimates:
+
+compute returns G_t
+
+compute advantages A_t = G_t - V(h_t)
+
+Policy loss:
+
+start with A2C-style (simpler) OR PPO-style clipped objective (config switch)
+
+Value loss: MSE on returns
+
+Entropy bonus for exploration
+
+No off-policy replay in v1.
+
+4) Sequence handling
+
+Support variable episode lengths:
+
+pad sequences, use done mask to stop return propagation
+
+Hidden state handling:
+
+either store h_t from rollout OR recompute in trainer (config)
+
+v1 should recompute to avoid stale mismatch unless too costly.
+
+5) Checkpointing
+
+Save a single checkpoint artifact containing:
+
+module weights
+
+optimizer state
+
+config snapshot
+
+Deterministic filename pattern.
+
+6) Configuration
+
+algo="a2c" default (allow "ppo")
+
+lr=3e-4
+
+gamma=0.99
+
+entropy_coef=0.01
+
+value_coef=0.5
+
+max_grad_norm=1.0
+
+updates_per_batch=1
+
+7) Deliverables
+
+trainer.py exposing:
+
+train_step(batch, modules, optim, cfg, ctx) -> TrainStepReportV1
+
+checkpoint_io.py (save/load)

@@ -1,0 +1,60 @@
+Policy_Head (NN)
+0) Scope and non-goals
+
+Scope: produce an action distribution from h_t.
+
+Non-goals: training algorithm, reward shaping, rollout collection.
+
+1) Inputs
+
+h_t
+
+available_actions_sorted[] (mask) 
+
+ReadMe
+
+For coord policy (proposal mode): coord_candidates[] from CoordProposer (Spec 4)
+
+2) Outputs
+
+PolicyOutputV1:
+
+schema_version="POLICY_OUT_V1"
+
+pi_discrete: logits for {RESET,ACTION1..5,ACTION7} (fixed order)
+
+pi_coord: logits over K coord candidates (only if ACTION6 available; else null)
+
+action_mask: applied mask (for trace/debug)
+
+3) Architecture
+
+Discrete head: MLP on h_t → logits length Nd (fixed Nd=7 or include RESET=8 depending on schema).
+
+Coord head (proposal mode): for each candidate (x,y,tag):
+
+embed candidate features and combine with h_t via small MLP → scalar logit
+
+output logits length K
+
+4) Action masking rules
+
+Must hard-mask invalid actions by setting logits to -inf before sampling/argmax.
+
+If mask eliminates all actions, fallback to lowest id available.
+
+5) Configuration
+
+coord_mode="proposal" (no spatial map in v1)
+
+coord_topK=16
+
+policy_mlp_hidden=[256,128]
+
+6) Deliverables
+
+Policy_Head exposing:
+
+forward(h_t, available_actions, coord_candidates=None, cfg=None, ctx=None) -> PolicyOutputV1
+
+action_key_normalize_v1.py (shared normalization; must match explorers)

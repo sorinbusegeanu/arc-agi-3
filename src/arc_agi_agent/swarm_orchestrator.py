@@ -248,6 +248,17 @@ def step_once(
             "selected_action": action,
             "selected_reason": "fallback",
         }
+    if blackboard.action_selection_report is None and action is not None:
+        blackboard.action_selection_report = {
+            "mode": selection_reason,
+            "state_hash_before": blackboard.state_hash,
+            "candidates_before_filter": [],
+            "candidates_after_filter": [],
+            "filtered_out": [],
+            "scores": {},
+            "selected_action": action,
+            "selected_reason": selection_reason,
+        }
     dataflow["action_selection"] = ["action_selection_report", "planner_decision"]
 
     _audit_blackboard(
@@ -1238,6 +1249,43 @@ def _test_selector_suggestion(blackboard: Blackboard) -> Optional[Dict[str, Any]
         "disagreement_score": rep.get("score_breakdown", {}).get("disagreement_score", 0.0),
         "elimination_score": rep.get("score_breakdown", {}).get("elimination_score", 0.0),
     }
+
+
+def _engine_event_from_compiled(event: Any) -> EngineTransitionEventV1:
+    action = event.action_key if hasattr(event, "action_key") else {}
+    action_key = "UNKNOWN"
+    if isinstance(action, dict):
+        kind = action.get("kind")
+        action_id = action.get("id")
+        if kind == "COORD":
+            action_key = f"{action_id}@{action.get('x')},{action.get('y')}"
+        elif action_id:
+            action_key = str(action_id)
+    hist: Dict[str, int] = {}
+    for entry in getattr(event, "event_signatures", []) or []:
+        sig_id = entry.get("sig_id") if isinstance(entry, dict) else None
+        if sig_id:
+            hist[sig_id] = hist.get(sig_id, 0) + 1
+    grid_delta = getattr(event, "grid_delta", {}) if event else {}
+    meta_delta = getattr(event, "meta_delta", {}) if event else {}
+    return EngineTransitionEventV1(
+        state_hash_before=getattr(event, "state_hash_before", ""),
+        state_hash_after=getattr(event, "state_hash_after", ""),
+        action_key=action_key,
+        event_signature_histogram=hist,
+        delta_metrics={
+            "changed_cells": grid_delta.get("changed_cells_count", 0),
+            "changed_bbox": grid_delta.get("changed_bbox"),
+            "palette_added": len(grid_delta.get("palette_added", []) or []),
+            "palette_removed": len(grid_delta.get("palette_removed", []) or []),
+        },
+        meta_delta={
+            "available_actions_before": meta_delta.get("available_actions_before"),
+            "available_actions_after": meta_delta.get("available_actions_after"),
+            "reward": meta_delta.get("reward_after") or meta_delta.get("reward"),
+            "terminal": meta_delta.get("terminal_after") if isinstance(meta_delta, dict) else None,
+        },
+    )
 
 
 def _hypotheses_report_from_engine(blackboard: Blackboard) -> Optional[Dict[str, Any]]:

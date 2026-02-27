@@ -1,0 +1,96 @@
+Rollout_Collector (non-NN)
+0) Scope and non-goals
+
+Scope: execute episodes in offline engine, collect trajectories for training.
+
+Non-goals: updating parameters (Trainer does), planning/explorers.
+
+1) Inputs
+
+env handle (offline Arcade) 
+
+ReadMe
+
+agent modules:
+
+Observation_Encoder
+
+Recurrent_Memory
+
+CoordProposer
+
+Policy_Head
+
+TransitionEvent_Compiler (existing) 
+
+14_TransitionEvent_Compiler
+
+FP_Analyst (existing) 
+
+01_FP_Analyst
+
+Reward_Shaper (spec 5)
+
+2) Outputs
+
+TrajectoryBatchV1:
+
+sequences of length T (variable; pad in trainer)
+
+stored per step:
+
+obs_norm (optional reference)
+
+z_t, h_t
+
+action_key
+
+coord_candidates (if ACTION6 available)
+
+chosen_coord_index (if ACTION6 used)
+
+reward
+
+done
+
+available_actions_mask
+
+state_hash_before/after
+
+TransitionEventV1 (or pointer/path)
+
+3) Episode control
+
+respects max_steps_total budget and RESET semantics. 
+
+09_Swarm_Orchestrator_meta
+
+keeps seen_state_hashes for novelty reward.
+
+4) Determinism
+
+collection must be seed-controlled:
+
+env seed
+
+policy sampling seed (if stochastic training)
+
+log seeds per episode.
+
+5) Configuration
+
+episodes_per_batch=8
+
+max_steps_per_episode=40 
+
+09_Swarm_Orchestrator_meta
+
+stochastic_action=true during training collection
+
+6) Deliverables
+
+rollout_collector.py exposing:
+
+collect(env, modules, cfg, ctx) -> TrajectoryBatchV1
+
+writes optional rollout_trace.jsonl compatible with existing trace schemas (stable keys).

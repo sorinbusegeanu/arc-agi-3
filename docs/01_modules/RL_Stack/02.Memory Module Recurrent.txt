@@ -1,0 +1,60 @@
+Memory_Module_Recurrent (NN)
+0) Scope and non-goals
+
+Scope: maintain within-episode hidden state h_t for partial observability.
+
+Non-goals: cross-run Memory (SQLite) and persistence. 
+
+10_Memory_Module
+
+1) Inputs
+
+Required per step:
+
+z_t from Observation_Encoder
+
+a_{t-1} (previous action key, normalized)
+
+r_{t-1} (previous shaped reward scalar)
+
+done_{t-1} (bool)
+
+h_{t-1}
+
+2) Outputs
+
+RecurrentStateV1:
+
+schema_version="REC_STATE_V1"
+
+h_t: float vector [H]
+
+3) Network architecture requirements
+
+GRU (default) or LSTM (config switch).
+
+Action embedding:
+
+discrete action id embedding
+
+coord action adds (x,y) normalized to [0,1] and concatenated
+
+Reward embedding: scalar normalized + optionally clipped.
+
+4) Episode reset semantics
+
+If done_{t-1}=true or step_idx=0 or action is RESET: h_t = zeros.
+
+5) Configuration
+
+cell="gru"
+
+H=256
+
+action_emb_dim=32
+
+6) Deliverables
+
+Recurrent_Memory module/class exposing:
+
+step(z_t, prev_action, prev_reward, prev_done, h_prev, cfg=None, ctx=None) -> h_t

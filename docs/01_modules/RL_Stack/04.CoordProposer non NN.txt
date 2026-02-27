@@ -1,0 +1,60 @@
+CoordProposer (non-NN)
+0) Scope and non-goals
+
+Scope: generate a small, deterministic set of candidate (x,y) points for ACTION6.
+
+Non-goals: scoring/ranking of coords (Policy_Head does), exploration policy, learning.
+
+1) Inputs
+
+fp_report_current (required) 
+
+01_FP_Analyst
+
+Optional: fp_report_prev + TransitionEventV1 to focus on changed regions 
+
+14_TransitionEvent_Compiler
+
+2) Outputs
+
+CoordCandidatesV1:
+
+schema_version="COORD_CANDS_V1"
+
+coords[]: ordered list of {x,y,tag,source_grid_name} length K
+
+3) Candidate generators (ordered, deterministic)
+
+Use FP_Analyst outputs:
+
+object centroids (largest area first)
+
+bbox corners (y0,x0,y0,x1-1,y1-1,x0,y1-1,x1-1)
+
+boundary/frontier points from wall/obstacle heuristics (if present) 
+
+01_FP_Analyst
+
+grid corners + mid-edges
+
+changed_bbox focus point if prev exists
+
+Deduplicate by (x,y) preserving first occurrence.
+
+4) Bounds and coordinate convention
+
+Use environment convention (x,y) with 0 ≤ x < W, 0 ≤ y < H. 
+
+03_Full_Explorer
+
+5) Configuration
+
+coord_topK=16
+
+max_objects_used=8
+
+6) Deliverables
+
+coord_proposer_v1.py exposing:
+
+propose(fp_current, fp_prev=None, last_event=None, cfg=None, ctx=None) -> CoordCandidatesV1

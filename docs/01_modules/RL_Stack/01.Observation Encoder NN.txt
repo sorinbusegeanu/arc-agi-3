@@ -1,0 +1,84 @@
+Observation_Encoder (NN)
+0) Scope and non-goals
+
+Scope: convert one raw observation (grid(s) + meta) into a fixed-dim embedding z_t.
+
+Non-goals: action selection, temporal memory, training loop, reward shaping.
+
+1) Inputs
+
+Required:
+
+observation (raw env payload)
+
+fp_report_current (optional but supported; if provided, use its normalized grid + meta) 
+
+01_FP_Analyst
+
+action_schema (for meta normalization; optional)
+
+2) Normalized representation
+
+Define OBS_NORM_V1:
+
+grids[]: list of (name, H, W, int_grid) from FP_Analyst normalization if available, else parse directly 
+
+01_FP_Analyst
+
+meta: dict
+
+available_actions_sorted[] from meta (if present) 
+
+ReadMe
+
+3) Outputs
+
+EncoderOutputV1:
+
+schema_version="ENCODER_OUT_V1"
+
+z_t: float vector shape [D]
+
+grid_embed: optional [Dg]
+
+meta_embed: optional [Dm]
+
+debug: timings, input shapes
+
+4) Network architecture requirements
+
+Grid encoder: CNN over 64×64 categorical grid(s)
+
+Support 1 grid (primary) and optional multi-grid by concatenating channels (config).
+
+Metadata encoder: MLP over a fixed meta vector:
+
+includes available-actions mask + any numeric meta fields (config whitelist).
+
+Output projection to z_t with fixed D (config).
+
+5) Determinism
+
+Inference deterministic given weights and inputs.
+
+Normalization ordering stable (grid name order stable; meta vector key order fixed).
+
+6) Configuration (explicit defaults)
+
+use_multigrid=false
+
+D=256
+
+meta_key_whitelist=["available_actions","terminal","reward"] (ignore others unless added)
+
+cnn_channels=[32,64,128]
+
+mlp_hidden=[128]
+
+7) Deliverables
+
+Observation_Encoder module/class exposing:
+
+encode(observation, fp_report=None, cfg=None, ctx=None) -> EncoderOutputV1
+
+obs_normalize_v1.py (pure functions)
