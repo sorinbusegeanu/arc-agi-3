@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .goal_detector_config import GoalDetectorConfig
 from .goal_detector_types import GoalDetectorReport, GoalHints, ProgressEstimate, SignalEntry
+from .memory import memory_view
 from .goal_proxies import compute_proxies
 from .goal_signal_extract import extract_meta
 
@@ -12,6 +13,8 @@ from .goal_signal_extract import extract_meta
 def estimate(
     fp_reports: List[Dict[str, Any]],
     trace_path: Optional[str] = None,
+    memory: Optional[Any] = None,
+    memory_evidence: Optional[Dict[str, Any]] = None,
     cfg: Optional[GoalDetectorConfig] = None,
     ctx: Optional[Dict[str, Any]] = None,
 ) -> GoalDetectorReport:
@@ -50,11 +53,16 @@ def estimate(
     progress_estimate, signals, goal_hints, warnings = _compute_progress(
         meta_series, proxy_series, cfg, warnings
     )
+    stall_risk, stop_preds = _memory_stall_signals(fp_reports, memory, memory_evidence)
+    if stop_preds:
+        goal_hints.stop_condition_predicates.extend(stop_preds)
+    goal_hints.stall_risk = stall_risk
 
     run_summary = {
         "window_length": len(reports_window),
         "warnings": warnings,
         "signal_families": list(signals.keys()),
+        "stall_risk": stall_risk,
     }
     if ctx:
         run_summary["ctx"] = ctx
@@ -171,6 +179,31 @@ def _compute_progress(
         goal_hints,
         warnings,
     )
+
+
+def _memory_stall_signals(
+    fp_reports: List[Dict[str, Any]],
+    memory: Optional[Any],
+    memory_evidence: Optional[Dict[str, Any]],
+) -> Tuple[float, List[str]]:
+    if memory is None or not fp_reports:
+        return 0.0, []
+    last = fp_reports[-1]
+    state_hash = last.get("debug", {}).get("grid_hash") if isinstance(last, dict) else None
+    view = memory_view(memory, state_hash=state_hash, evidence=memory_evidence)
+    noop_state = view.get("noop_rate_by_state_action", {})
+    recent = view.get("last_k_actions_per_state", [])
+    stall_risk = 0.0
+    predicates: List[str] = []
+    if noop_state:
+        worst = max(noop_state.values()) if noop_state else 0.0
+        stall_risk = max(stall_risk, float(worst))
+        if worst >= 0.9:
+            predicates.append("high_state_noop_rate")
+    if len(set(recent)) <= 1 and recent:
+        stall_risk = max(stall_risk, 0.7)
+        predicates.append("repeated_action_sequence")
+    return min(1.0, stall_risk), predicates
 
 
 def _collect_reward(meta_series: List[Dict[str, Any]]) -> Tuple[List[float], Optional[str]]:

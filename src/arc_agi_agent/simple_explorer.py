@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from collections import Counter, deque
+from dataclasses import asdict
 from typing import Any, Dict, List, Optional, Tuple
 
 from .action_schema import ActionSchema, parse_action_schema_data
@@ -20,6 +21,7 @@ from .simple_explorer_types import (
     StateKey,
     TransitionNode,
 )
+from .memory import memory_view
 from .trace import TraceWriter
 from .transition_graph import TransitionGraphStore
 
@@ -244,6 +246,7 @@ def choose_action(
         current_state,
         action_ids,
     )
+    _apply_memory_ordering(frontier_state, current_state, action_ids, blackboard)
     step_idx = getattr(blackboard, "step_idx", None)
     if step_idx is None and isinstance(blackboard, dict):
         step_idx = blackboard.get("step_idx", 0)
@@ -287,6 +290,7 @@ def build_frontier_report(
             current_state,
             action_ids,
         )
+        _apply_memory_ordering(frontier_state, current_state, action_ids, blackboard)
 
     frontier: Dict[StateKey, Dict[str, Any]] = {}
     for state, actions in frontier_state.state_untried.items():
@@ -297,13 +301,30 @@ def build_frontier_report(
         }
 
     if isinstance(blackboard, dict):
-        history_len = len(blackboard.get("history", []))
+        history = blackboard.get("history", [])
     else:
-        history_len = len(getattr(blackboard, "history", []))
+        history = getattr(blackboard, "history", [])
+    history = history or []
+    history_len = len(history)
+    action_attempts_global: Dict[ActionKey, List[Dict[str, Any]]] = {}
+    for entry in history:
+        if not isinstance(entry, dict):
+            continue
+        action = entry.get("action") or {}
+        action_id = action.get("action_id")
+        if action_id not in action_ids:
+            continue
+        action_attempts_global.setdefault(action_id, []).append(entry)
+    action_effect_model = {
+        action_id: asdict(stats)
+        for action_id, stats in _summarize_action_effects(action_attempts_global).items()
+    }
+    memory_info = _memory_report_summary(blackboard, current_state)
     return {
         "run_summary": {"steps_executed": history_len},
-        "action_effect_model": {},
+        "action_effect_model": action_effect_model,
         "frontier": frontier,
+        "memory_used": memory_info,
     }
 
 
@@ -333,6 +354,69 @@ def _record_action_selection(
         blackboard.action_selection_report = report
     elif isinstance(blackboard, dict):
         blackboard["action_selection_report"] = report
+
+
+def _apply_memory_ordering(
+    frontier_state: SimpleFrontierState,
+    state_hash: str,
+    action_ids: List[str],
+    blackboard: Any,
+) -> None:
+    mem = getattr(blackboard, "memory", None)
+    if mem is None:
+        return
+    evidence = getattr(blackboard, "memory_evidence", None)
+    view = memory_view(mem, state_hash=state_hash, evidence=evidence)
+    noop_global = view.get("noop_rate_by_action", {})
+    noop_state = view.get("noop_rate_by_state_action", {})
+    attempts = view.get("attempts_by_action", {})
+    diversity = view.get("action_effect_signatures_by_action", {})
+    recent_actions = set(view.get("last_k_actions_per_state", []))
+    meta = getattr(blackboard, "memory_meta", None)
+    if meta is None and isinstance(blackboard, dict):
+        meta = blackboard.get("memory_meta")
+    threshold = 0.9
+    k_short = 5
+    if isinstance(meta, dict):
+        threshold = float(meta.get("noop_rate_block_threshold", threshold))
+        k_short = int(meta.get("window_sizes", {}).get("K_short", k_short))
+    actions = list(frontier_state.state_untried.get(state_hash, []))
+    if not actions:
+        return
+    filtered = []
+    for action_id in actions:
+        ns = noop_state.get(action_id, 0.0)
+        ng = noop_global.get(action_id, 0.0)
+        att = attempts.get(action_id, 0)
+        if (ns >= threshold or ng >= threshold) and (action_id in recent_actions or att >= k_short):
+            continue
+        filtered.append(action_id)
+    if filtered:
+        actions = filtered
+    def sort_key(action_id: str) -> Tuple[Any, ...]:
+        recent_penalty = 1 if action_id in recent_actions else 0
+        ns = noop_state.get(action_id, 0.0)
+        ng = noop_global.get(action_id, 0.0)
+        att = attempts.get(action_id, 0)
+        div = diversity.get(action_id, 0)
+        return (recent_penalty, ns, ng, att, -div, action_id)
+    actions.sort(key=sort_key)
+    frontier_state.state_untried[state_hash] = actions
+
+
+def _memory_report_summary(blackboard: Any, state_hash: Optional[str]) -> Dict[str, Any]:
+    mem = getattr(blackboard, "memory", None)
+    if mem is None:
+        return {"used": False}
+    evidence = getattr(blackboard, "memory_evidence", None)
+    view = memory_view(mem, state_hash=state_hash, evidence=evidence)
+    return {
+        "used": True,
+        "noop_rate_by_action": len(view.get("noop_rate_by_action", {})),
+        "noop_rate_by_state_action": len(view.get("noop_rate_by_state_action", {})),
+        "recent_actions_per_state": len(view.get("last_k_actions_per_state", [])),
+        "action_signature_diversity": len(view.get("action_effect_signatures_by_action", {})),
+    }
 
 
 def _parse_action_schema(action_schema: Any) -> ActionSchema:

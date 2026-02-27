@@ -293,4 +293,16 @@ Publishes:
 ---
 
 the environment’s coordinate convention is **(x,y)** and bounds are **0 ≤ x < W**, **0 ≤ y < H** for each active grid.
+Full_Explorer — Memory integration
 
+Full_Explorer must query Memory for coord priors and coord no-op maps to reduce wasted coord probing. Required read signals:
+
+noop_rate_by_coord[action_id][(x,y)] (or compressed “top noop coords”)
+
+effect_score_by_coord[action_id][(x,y)] (or “top effective coords”)
+
+optionally hotspots_by_event_signature if Memory maintains them
+
+Full_Explorer’s report should include both (a) what it computed this step/window and (b) what it pulled from Memory, with clear provenance (source: computed|memory). This makes downstream consumers (mechanic/rule/planner) auditable.
+
+The coordinate explorer must consume memory to bias coordinate selection heuristics (e.g., historically informative coord regions: object boundaries, frontiers, portals) conditioned on task_signature_v1 and the analyst’s object map. It must record coordinate-attempt outcomes with a canonical coord_signature (derived from object-relative position categories, not raw pixels only) so memory can generalize across similar boards. It must also record “coord-noop/coord-invalid” patterns to support cross-run avoidance, and only emit events to the orchestrator for persistence.

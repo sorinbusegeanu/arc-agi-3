@@ -12,6 +12,8 @@ MAX_STEPS="80"
 PROBE_STEPS="10"
 OP_MODE="offline"
 DEBUG=""
+SNAPSHOT_EVERY_STEPS="0"
+FP_SAVE_MODE="buffer"
 ACTION_SCHEMA=""
 SIMPLE_REPORT=""
 FULL_REPORT=""
@@ -119,6 +121,14 @@ while [[ $# -gt 0 ]]; do
       DEBUG="--debug"
       shift 1
       ;;
+    --snapshot-every-steps)
+      SNAPSHOT_EVERY_STEPS="$2"
+      shift 2
+      ;;
+    --fp-save-mode)
+      FP_SAVE_MODE="$2"
+      shift 2
+      ;;
     *)
       echo "Unknown argument: $1" >&2
       exit 1
@@ -127,7 +137,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$AGENT" ]]; then
-  echo "Usage: $0 --agent fp_analyst|simple_explorer|full_explorer|rule_proposer|mechanic_classifier|goal_detector|planner|trajectory_summarizer|swarm [args...]" >&2
+  echo "Usage: $0 --agent fp_analyst|simple_explorer|full_explorer|rule_proposer|mechanic_classifier|goal_detector|planner|trajectory_summarizer|executable_hypothesis_engine|test_selector|mechanic_synthesizer|swarm [args...]" >&2
   exit 1
 fi
 
@@ -205,20 +215,68 @@ if [[ "$AGENT" == "planner" ]]; then
   exit 0
 fi
 
-if [[ "$AGENT" == "swarm" ]]; then
-  if [[ -z "$GAME" || -z "$OUTDIR" ]]; then
-    echo "Usage: $0 --agent swarm --game <id> --outdir <dir> [--seed <n>] [--max-steps <n>] [--probe-steps <n>] [--op-mode offline|online] [--debug]" >&2
+if [[ "$AGENT" == "executable_hypothesis_engine" ]]; then
+  if [[ -z "$OUTDIR" || -z "$INPUT" || -z "${ACTION_SCHEMA:-}" ]]; then
+    echo "Usage: $0 --agent executable_hypothesis_engine --input <fp_report.json>[,<fp_report2.json>...] --outdir <dir> --action-schema <schema.json> [--simple <report.json>] [--full <report.json>] [--hypotheses <report.json>]" >&2
     exit 1
   fi
-  PYTHONPATH="$SCRIPT_DIR" "$PYTHON_EXEC" -m arc_agi_agent.run_swarm --game "$GAME" --seed "$SEED" --max-steps "$MAX_STEPS" --probe-steps "$PROBE_STEPS" --op-mode "$OP_MODE" --outdir "$OUTDIR" $DEBUG
+  INPUT_ARGS=()
+  IFS=',' read -ra FP_PATHS <<< "$INPUT"
+  for path in "${FP_PATHS[@]}"; do
+    if [[ -n "$path" ]]; then
+      INPUT_ARGS+=(--input_fp "$path")
+    fi
+  done
+  PYTHONPATH="$SCRIPT_DIR" "$PYTHON_EXEC" -m arc_agi_agent.cli --agent "$AGENT" "${INPUT_ARGS[@]}" --outdir "$OUTDIR" --action-schema "$ACTION_SCHEMA" ${SIMPLE_REPORT:+--simple "$SIMPLE_REPORT"} ${FULL_REPORT:+--full "$FULL_REPORT"} ${HYPOTHESES_REPORT:+--hypotheses "$HYPOTHESES_REPORT"}
+  exit 0
+fi
+
+if [[ "$AGENT" == "test_selector" ]]; then
+  if [[ -z "$OUTDIR" || -z "$INPUT" || -z "${ACTION_SCHEMA:-}" || -z "${HYPOTHESES_REPORT:-}" ]]; then
+    echo "Usage: $0 --agent test_selector --input <fp_report.json>[,<fp_report2.json>...] --outdir <dir> --action-schema <schema.json> --hypotheses <report.json> [--simple <report.json>] [--full <report.json>]" >&2
+    exit 1
+  fi
+  INPUT_ARGS=()
+  IFS=',' read -ra FP_PATHS <<< "$INPUT"
+  for path in "${FP_PATHS[@]}"; do
+    if [[ -n "$path" ]]; then
+      INPUT_ARGS+=(--input_fp "$path")
+    fi
+  done
+  PYTHONPATH="$SCRIPT_DIR" "$PYTHON_EXEC" -m arc_agi_agent.cli --agent "$AGENT" "${INPUT_ARGS[@]}" --outdir "$OUTDIR" --action-schema "$ACTION_SCHEMA" --hypotheses "$HYPOTHESES_REPORT" ${SIMPLE_REPORT:+--simple "$SIMPLE_REPORT"} ${FULL_REPORT:+--full "$FULL_REPORT"}
+  exit 0
+fi
+
+if [[ "$AGENT" == "mechanic_synthesizer" ]]; then
+  if [[ -z "$OUTDIR" || -z "$INPUT" ]]; then
+    echo "Usage: $0 --agent mechanic_synthesizer --input <fp_report.json>[,<fp_report2.json>...] --outdir <dir> [--hypotheses <report.json>] [--trace <trace.jsonl>]" >&2
+    exit 1
+  fi
+  INPUT_ARGS=()
+  IFS=',' read -ra FP_PATHS <<< "$INPUT"
+  for path in "${FP_PATHS[@]}"; do
+    if [[ -n "$path" ]]; then
+      INPUT_ARGS+=(--input_fp "$path")
+    fi
+  done
+  PYTHONPATH="$SCRIPT_DIR" "$PYTHON_EXEC" -m arc_agi_agent.cli --agent "$AGENT" "${INPUT_ARGS[@]}" --outdir "$OUTDIR" ${HYPOTHESES_REPORT:+--hypotheses "$HYPOTHESES_REPORT"} ${TRACE_PATH:+--trace "$TRACE_PATH"}
+  exit 0
+fi
+
+if [[ "$AGENT" == "swarm" ]]; then
+  if [[ -z "$GAME" || -z "$OUTDIR" ]]; then
+    echo "Usage: $0 --agent swarm --game <id> --outdir <dir> [--seed <n>] [--max-steps <n>] [--probe-steps <n>] [--snapshot-every-steps <n>] [--fp-save-mode buffer|files] [--op-mode offline|online] [--debug]" >&2
+    exit 1
+  fi
+  PYTHONPATH="$SCRIPT_DIR" "$PYTHON_EXEC" -m arc_agi_agent.run_swarm --game "$GAME" --seed "$SEED" --max-steps "$MAX_STEPS" --probe-steps "$PROBE_STEPS" --snapshot-every-steps "$SNAPSHOT_EVERY_STEPS" --fp-save-mode "$FP_SAVE_MODE" --op-mode "$OP_MODE" --outdir "$OUTDIR" $DEBUG
   exit 0
 fi
 
 if [[ "$AGENT" == "trajectory_summarizer" ]]; then
   if [[ -z "$OUTDIR" ]]; then
-    echo "Usage: $0 --agent trajectory_summarizer --outdir <dir> [--planner-trace <...>] [--simple-trace <...>] [--full-trace <...>] [--fp-dir <dir>] [--action-schema <schema.json>] [--hypotheses <report.json>] [--mechanic <report.json>] [--goal <report.json>]" >&2
+    echo "Usage: $0 --agent trajectory_summarizer --outdir <dir> [--planner-trace <...>] [--simple-trace <...>] [--full-trace <...>] [--fp-dir <dir>] [--action-schema <schema.json>] [--hypotheses <report.json>] [--mechanic <report.json>] [--goal <report.json>] [--memory <memory.json>]" >&2
     exit 1
   fi
-  PYTHONPATH="$SCRIPT_DIR" "$PYTHON_EXEC" -m arc_agi_agent.cli --agent "$AGENT" --outdir "$OUTDIR" ${PLANNER_TRACE:+--planner-trace "$PLANNER_TRACE"} ${SIMPLE_TRACE:+--simple-trace "$SIMPLE_TRACE"} ${FULL_TRACE:+--full-trace "$FULL_TRACE"} ${FP_DIR:+--fp-dir "$FP_DIR"} ${ACTION_SCHEMA_PATH:+--action-schema "$ACTION_SCHEMA_PATH"} ${HYPOTHESES_REPORT:+--hypotheses "$HYPOTHESES_REPORT"} ${MECHANIC_REPORT:+--mechanic "$MECHANIC_REPORT"} ${GOAL_REPORT:+--goal "$GOAL_REPORT"}
+  PYTHONPATH="$SCRIPT_DIR" "$PYTHON_EXEC" -m arc_agi_agent.cli --agent "$AGENT" --outdir "$OUTDIR" ${PLANNER_TRACE:+--planner-trace "$PLANNER_TRACE"} ${SIMPLE_TRACE:+--simple-trace "$SIMPLE_TRACE"} ${FULL_TRACE:+--full-trace "$FULL_TRACE"} ${FP_DIR:+--fp-dir "$FP_DIR"} ${ACTION_SCHEMA_PATH:+--action-schema "$ACTION_SCHEMA_PATH"} ${HYPOTHESES_REPORT:+--hypotheses "$HYPOTHESES_REPORT"} ${MECHANIC_REPORT:+--mechanic "$MECHANIC_REPORT"} ${GOAL_REPORT:+--goal "$GOAL_REPORT"} ${MEMORY_PATH:+--memory "$MEMORY_PATH"}
   exit 0
 fi

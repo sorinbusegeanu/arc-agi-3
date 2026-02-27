@@ -30,6 +30,8 @@ class Hypothesis:
     hypothesis_id: str
     name: str
     description: str
+    program_v1: Optional[Dict[str, Any]]
+    params: Dict[str, Any]
     confidence: float
     evidence: List[Dict[str, Any]]
     predictions: List[Dict[str, Any]]

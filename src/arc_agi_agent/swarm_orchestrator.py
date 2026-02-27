@@ -7,10 +7,30 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .action_schema import build_action_schema_from_env
 from .fp_analyst import FPAnalyst
+from .memory import (
+    memory_init,
+    memory_save,
+    memory_snapshot,
+    memory_update,
+    memory_view,
+    memory_query,
+    memory_ingest_run_summary,
+    task_signature_v1,
+    state_signature_v1,
+)
+from .memory_config import MemoryConfig
+from .memory_types import MemoryUpdateInputs
 from .planner_types import PlannerInputs
 from .swarm_orchestrator_config import SwarmOrchestratorConfig
 from .swarm_orchestrator_types import Blackboard, Disagreement
 from .trace import TraceWriter
+from .trajectory_summarizer import summarize as summarize_trajectory
+from .transition_event_compiler import compile_transition_event
+from .transition_event_compiler import to_json as transition_event_to_json
+from .executable_hypothesis_engine import seed_hypotheses, update as update_hypotheses
+from .executable_hypothesis_engine_types import TransitionEventV1 as EngineTransitionEventV1
+from .mechanic_synthesizer import synthesize as synthesize_mechanics
+from .discriminating_test_selector import select_test as select_discriminating_test
 
 
 def run_game(
@@ -44,6 +64,7 @@ def run_game(
         raise ValueError("FP_Analyst produced no grids")
     grid = fp_report.state_summary.grid_summaries[0]
     action_schema = build_action_schema_from_env(env.action_space, width=grid.width, height=grid.height)
+    task_signature = task_signature_v1(asdict(fp_report), _schema_to_dict(action_schema))
 
     blackboard = Blackboard(
         run_id=f"{game_id}_{seed}",
@@ -59,6 +80,24 @@ def run_game(
         phase="probe",
         action_schema=_schema_to_dict(action_schema),
     )
+    memory_cfg = MemoryConfig(
+        enabled=cfg.memory_enabled,
+        persist_across_runs=cfg.memory_persist_across_runs,
+        snapshot_every_steps=cfg.memory_snapshot_every_steps,
+    )
+    blackboard.memory = memory_init(
+        {"run_id": blackboard.run_id, "game_id": game_id, "seed": seed, "step_idx": 0},
+        memory_cfg,
+    )
+    blackboard.memory_evidence = memory_query(task_signature, game_id=game_id, cfg=memory_cfg)
+    blackboard.memory_meta = {
+        "computed_at_step": 0,
+        "window_sizes": {"K_short": memory_cfg.K_short, "K_long": memory_cfg.K_long},
+        "persisted": memory_cfg.persist_across_runs,
+        "noop_rate_block_threshold": memory_cfg.noop_rate_block_threshold,
+        "task_signature": task_signature,
+        "memory_dir": memory_cfg.memory_dir,
+    }
     blackboard.simple_explorer = agents["simple_explorer"].build_frontier_report(
         blackboard, blackboard.action_schema, blackboard.simple_frontier_state, None
     )
@@ -75,6 +114,7 @@ def run_game(
         blackboard.artifacts["decision_trace"] = os.path.join(outdir, "decision_trace.jsonl")
         blackboard.artifacts["blackboard_dir"] = outdir
         trace_writer = TraceWriter(blackboard.artifacts["decision_trace"])
+        _record_fp_step(blackboard, _clean_fp_payload(blackboard.fp_current), cfg)
     else:
         trace_writer = None
 
@@ -83,6 +123,37 @@ def run_game(
         obs = obs_next
         if blackboard.phase == "done":
             break
+
+    if outdir and blackboard.memory is not None:
+        memory_save(blackboard.memory, os.path.join(outdir, "memory.json"))
+        with open(os.path.join(outdir, "memory_meta.json"), "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "version": getattr(blackboard.memory, "version", "1.0"),
+                    "config": memory_cfg.__dict__,
+                    "computed_at_step": blackboard.step_idx,
+                    "task_signature": task_signature,
+                },
+                f,
+                indent=2,
+            )
+        terminal = _terminal_from_history(blackboard.history)
+        win = terminal == "WIN"
+        _flush_fp_buffer(blackboard, cfg)
+        summary = summarize_trajectory(
+            planner_trace=blackboard.artifacts.get("decision_trace"),
+            fp_dir=outdir,
+            action_schema=blackboard.action_schema,
+            proposer=blackboard.rule_proposer,
+            classifier=blackboard.mechanic_classifier,
+            goal=blackboard.goal_detector,
+            cfg=None,
+            ctx={"game_id": game_id, "seed": seed, "run_id": blackboard.run_id},
+            outdir=outdir,
+            task_signature=task_signature,
+            win=win,
+        )
+        memory_ingest_run_summary(summary.run_summary_v1, cfg=memory_cfg)
 
     return blackboard
 
@@ -127,6 +198,8 @@ def step_once(
         "rule_proposer",
         "goal_detector",
     ]
+    _ensure_hypotheses_engine(blackboard)
+    _update_conflict_flag(blackboard, cfg)
 
     action = None
     selection_reason = "fallback"
@@ -146,10 +219,14 @@ def step_once(
                 "selected_reason": "test_sequence",
             }
         else:
-            action = _probe_action(blackboard, agents, cfg)
-            selection_reason = "frontier_probe"
-            if blackboard.action_selection_report:
-                blackboard.action_selection_report["mode"] = "probe_simple" if action and action.get("type") == "simple" else "probe_full"
+            if _should_use_test_selector(blackboard, cfg):
+                action = _select_test_action(blackboard, cfg)
+                selection_reason = "test_selector"
+            if action is None:
+                action = _probe_action(blackboard, agents, cfg)
+                selection_reason = "frontier_probe"
+                if blackboard.action_selection_report:
+                    blackboard.action_selection_report["mode"] = "probe_simple" if action and action.get("type") == "simple" else "probe_full"
         if action is None:
             action, selection_reason = _planner_action(blackboard, agents, cfg)
             selection_reason = f"probe_{selection_reason}"
@@ -211,6 +288,18 @@ def step_once(
     state_after = fp_next.debug.grid_hash
     blackboard.state_hash = state_after
     dataflow["fp_analyst_post"] = ["fp_current", "state_hash"]
+    _record_fp_step(blackboard, _clean_fp_payload(blackboard.fp_current), cfg)
+    transition_event = compile_transition_event(
+        prev_observation=observation,
+        observation=obs_next,
+        action_taken=action,
+        fp_prev_report=asdict(fp_report),
+        fp_curr_report=asdict(fp_next),
+        ctx={"game_id": blackboard.game_id, "seed": blackboard.seed, "step_idx": blackboard.step_idx},
+    )
+    engine_event = _engine_event_from_compiled(transition_event)
+    blackboard.transition_events.append(engine_event)
+    _update_hypotheses_engine(blackboard, engine_event, cfg)
     step_record = _make_step_record(
         blackboard.step_idx,
         state_before,
@@ -220,6 +309,67 @@ def step_once(
         obs_next,
         blackboard.planner_decision,
     )
+    step_record["transition_event"] = transition_event_to_json(transition_event)
+    step_record["hypotheses_ranked"] = _hypothesis_rankings(blackboard)
+    if blackboard.test_selector_report:
+        step_record["test_selector"] = blackboard.test_selector_report
+    blackboard.events.append(
+        {
+            "type": "ACTION_ATTEMPT_V1",
+            "run_id": blackboard.run_id,
+            "game_id": blackboard.game_id,
+            "task_signature": blackboard.memory_meta.get("task_signature") if blackboard.memory_meta else None,
+            "state_signature": state_signature_v1(asdict(fp_next)),
+            "action_key": _action_key(step_record.get("action")),
+            "no_effect": step_record.get("fp_diff", {}).get("changed_cells", 0) == 0,
+            "changed_cells": step_record.get("fp_diff", {}).get("changed_cells", 0),
+            "event_signatures": step_record.get("fp_diff", {}).get("event_signatures", []),
+        }
+    )
+    if blackboard.memory is not None and cfg.memory_enabled:
+        memory_cfg = MemoryConfig(
+            enabled=cfg.memory_enabled,
+            persist_across_runs=cfg.memory_persist_across_runs,
+            snapshot_every_steps=cfg.memory_snapshot_every_steps,
+        )
+        inputs = MemoryUpdateInputs(
+            ctx={
+                "run_id": blackboard.run_id,
+                "game_id": blackboard.game_id,
+                "seed": blackboard.seed,
+                "step_idx": blackboard.step_idx,
+            },
+            state_hash_before=state_before,
+            state_hash_after=fp_next.debug.grid_hash,
+            action=step_record.get("action") or {},
+            action_schema=blackboard.action_schema,
+            fp_report_before=asdict(fp_report),
+            fp_report_after=asdict(fp_next),
+            diff_summary=asdict(fp_next.diff_summary) if fp_next.diff_summary else None,
+            fp_diff=step_record.get("fp_diff"),
+            planner_decision=blackboard.planner_decision,
+            goal_report=blackboard.goal_detector,
+            mechanic_classifier=blackboard.mechanic_classifier,
+            rule_proposer=blackboard.rule_proposer,
+            simple_report=blackboard.simple_explorer,
+            full_report=blackboard.full_explorer,
+        )
+        blackboard.memory = memory_update(blackboard.memory, inputs, memory_cfg)
+        blackboard.memory_meta = {
+            "computed_at_step": blackboard.step_idx,
+            "window_sizes": {"K_short": memory_cfg.K_short, "K_long": memory_cfg.K_long},
+            "persisted": memory_cfg.persist_across_runs,
+            "noop_rate_block_threshold": memory_cfg.noop_rate_block_threshold,
+            "task_signature": blackboard.memory_meta.get("task_signature") if blackboard.memory_meta else None,
+            "memory_dir": memory_cfg.memory_dir,
+        }
+        if memory_cfg.snapshot_every_steps > 0 and blackboard.step_idx % memory_cfg.snapshot_every_steps == 0:
+            outdir = blackboard.artifacts.get("blackboard_dir")
+            if outdir:
+                memory_save(
+                    blackboard.memory,
+                    os.path.join(outdir, f"memory_step_{blackboard.step_idx}.json"),
+                )
     if cfg.debug:
         step_record["dataflow"] = _dataflow_audit(
             blackboard,
@@ -254,10 +404,11 @@ def step_once(
             blackboard.fp_current = asdict(fp_analyst.analyze(obs_reset))
             blackboard.fp_current.setdefault("debug", {})["_obs"] = obs_reset
             blackboard.state_hash = blackboard.fp_current.get("debug", {}).get("grid_hash", blackboard.state_hash)
+            _record_fp_step(blackboard, _clean_fp_payload(blackboard.fp_current), cfg)
             _audit_blackboard(blackboard, when="post_reset")
             return obs_reset
         blackboard.phase = "done"
-    if blackboard.step_idx % cfg.snapshot_every_steps == 0:
+    if cfg.snapshot_every_steps > 0 and blackboard.step_idx % cfg.snapshot_every_steps == 0:
         _snapshot_blackboard(blackboard)
 
     return obs_next
@@ -335,6 +486,8 @@ def _recompute_strategic(blackboard: Blackboard, agents: Dict[str, Any], debug: 
             simple_report=blackboard.simple_explorer,
             full_report=blackboard.full_explorer,
             action_schema=action_schema,
+            memory=blackboard.memory,
+            memory_evidence=blackboard.memory_evidence,
             cfg=None,
             ctx={"debug": debug},
         )
@@ -346,12 +499,22 @@ def _recompute_strategic(blackboard: Blackboard, agents: Dict[str, Any], debug: 
             simple_report=blackboard.simple_explorer,
             full_report=blackboard.full_explorer,
             action_schema=action_schema,
+            memory=blackboard.memory,
+            memory_evidence=blackboard.memory_evidence,
             cfg=None,
             ctx={"debug": debug},
         )
     )
     blackboard.rule_proposer_meta = {"step_idx_built": blackboard.step_idx}
-    blackboard.goal_detector = asdict(agents["goal_detector"].estimate(fp_reports, cfg=None, ctx={"debug": debug}))
+    blackboard.goal_detector = asdict(
+        agents["goal_detector"].estimate(
+            fp_reports,
+            memory=blackboard.memory,
+            memory_evidence=blackboard.memory_evidence,
+            cfg=None,
+            ctx={"debug": debug},
+        )
+    )
     blackboard.goal_detector_meta = {"step_idx_built": blackboard.step_idx}
 
 
@@ -444,6 +607,9 @@ def _dataflow_audit(
             "full_explorer": full_frontier.get("diagnostics", {})
             if isinstance(full_frontier, dict)
             else {},
+            "memory": blackboard.memory.last_update_debug
+            if blackboard.memory is not None and hasattr(blackboard.memory, "last_update_debug")
+            else {},
         },
     }
 
@@ -452,6 +618,7 @@ def _planner_inputs_audit(inputs: PlannerInputs) -> Dict[str, Any]:
     hypotheses = inputs.hypotheses_report or {}
     mechanic = inputs.mechanic_prior or {}
     full = inputs.full_report or {}
+    mem = inputs.memory_view or {}
     return {
         "hypotheses_count": len(hypotheses.get("hypotheses", [])) if isinstance(hypotheses, dict) else 0,
         "mechanic_families_count": len(
@@ -462,6 +629,8 @@ def _planner_inputs_audit(inputs: PlannerInputs) -> Dict[str, Any]:
         "coord_action_effect_model_count": len(
             full.get("coord_action_effect_model", {}) if isinstance(full, dict) else {}
         ),
+        "memory_noop_actions": len(mem.get("noop_rate_by_action", {})),
+        "memory_coord_priors": len(mem.get("coord_effect_score_by_action", {})),
     }
 
 
@@ -623,10 +792,16 @@ def _planner_action(blackboard: Blackboard, agents: Dict[str, Any], cfg: SwarmOr
     _ensure_fresh_reports(blackboard, agents, max_age=0, debug=cfg.debug)
     inputs = PlannerInputs(
         mechanic_prior=blackboard.mechanic_classifier,
-        hypotheses_report=blackboard.rule_proposer,
+        hypotheses_report=_hypotheses_report_from_engine(blackboard) or blackboard.rule_proposer,
         simple_report=blackboard.simple_explorer,
         full_report=blackboard.full_explorer,
         goal_report=blackboard.goal_detector,
+        memory_view=memory_view(
+            blackboard.memory,
+            state_hash=blackboard.state_hash,
+            evidence=blackboard.memory_evidence,
+        ),
+        test_selector_suggestion=_test_selector_suggestion(blackboard),
     )
     blackboard.planner_inputs_audit = _planner_inputs_audit(inputs) if cfg.debug else None
     action, planner_state, decision_trace = agents["planner"].plan_next(
@@ -844,6 +1019,83 @@ def _bbox_area_value(bbox: Any) -> int:
     return max(0, y1 - y0 + 1) * max(0, x1 - x0 + 1)
 
 
+def _terminal_from_history(history: List[Dict[str, Any]]) -> Optional[str]:
+    for rec in reversed(history):
+        if rec.get("terminal") is True:
+            info = rec.get("info") or {}
+            if isinstance(info, dict):
+                return info.get("state")
+    return None
+
+
+def _run_summary_v1(blackboard: Blackboard, task_signature: str, win: bool) -> Dict[str, Any]:
+    return {
+        "schema_version": "RUN_SUMMARY_V1",
+        "run_id": blackboard.run_id,
+        "game_id": blackboard.game_id,
+        "seed": blackboard.seed,
+        "task_signature": task_signature,
+        "steps": blackboard.step_idx,
+        "win": bool(win),
+        "events": blackboard.events[-200:],
+    }
+
+
+def _write_json_safe(path: str, payload: Dict[str, Any]) -> None:
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+    except Exception:
+        return
+
+
+def _clean_fp_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    cleaned = _make_jsonable(payload)
+    debug = cleaned.get("debug")
+    if isinstance(debug, dict) and "_obs" in debug:
+        debug = dict(debug)
+        debug.pop("_obs", None)
+        cleaned["debug"] = debug
+    return cleaned
+
+
+def _record_fp_step(blackboard: Blackboard, payload: Dict[str, Any], cfg: SwarmOrchestratorConfig) -> None:
+    if not blackboard.artifacts.get("blackboard_dir"):
+        return
+    mode = (cfg.fp_save_mode or "buffer").lower()
+    if mode == "files":
+        outdir = blackboard.artifacts.get("blackboard_dir")
+        if outdir:
+            _write_json_safe(os.path.join(outdir, f"fp_step_{blackboard.step_idx}.json"), payload)
+        return
+    blackboard.fp_step_buffer.append(_minimal_fp_payload(payload))
+
+
+def _flush_fp_buffer(blackboard: Blackboard, cfg: SwarmOrchestratorConfig) -> None:
+    mode = (cfg.fp_save_mode or "buffer").lower()
+    if mode != "buffer":
+        return
+    outdir = blackboard.artifacts.get("blackboard_dir")
+    if not outdir:
+        return
+    path = os.path.join(outdir, "fp_steps.jsonl")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            for entry in blackboard.fp_step_buffer:
+                f.write(json.dumps(entry) + "\n")
+    except Exception:
+        return
+
+
+def _minimal_fp_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    debug = payload.get("debug", {}) if isinstance(payload, dict) else {}
+    state = payload.get("state_summary", {}) if isinstance(payload, dict) else {}
+    return {
+        "debug": {"grid_fingerprint": debug.get("grid_fingerprint"), "grid_hash": debug.get("grid_hash")},
+        "state_summary": {"step_idx": state.get("step_idx"), "object_catalog": state.get("object_catalog", [])},
+    }
+
+
 def _schema_to_dict(schema: Any) -> Dict[str, Any]:
     return {
         "version": schema.version,
@@ -864,6 +1116,144 @@ def _empty_full_report(blackboard: Blackboard) -> Dict[str, Any]:
         "coord_action_effect_model": {},
         "frontier": {},
         "coord_actions_supported": coord_supported,
+    }
+
+
+def _ensure_hypotheses_engine(blackboard: Blackboard) -> None:
+    if blackboard.hypotheses_engine is not None:
+        return
+    try:
+        blackboard.hypotheses_engine = seed_hypotheses(blackboard.rule_proposer)
+    except Exception:
+        blackboard.hypotheses_engine = seed_hypotheses(None)
+
+
+def _update_hypotheses_engine(blackboard: Blackboard, event: Any, cfg: SwarmOrchestratorConfig) -> None:
+    if blackboard.hypotheses_engine is None:
+        _ensure_hypotheses_engine(blackboard)
+    hypotheses = blackboard.hypotheses_engine or []
+    hypotheses = update_hypotheses(hypotheses, blackboard.transition_events, cfg=None)
+    if _should_synthesize(blackboard, cfg):
+        synthesis = synthesize_mechanics(
+            events=blackboard.transition_events[-cfg.probe_steps_max :],
+            fp_current=blackboard.fp_current,
+            available_actions_current=_available_actions_from_fp(blackboard.fp_current),
+            existing_hypotheses=hypotheses,
+            cfg=None,
+            ctx={"step_idx": blackboard.step_idx},
+        )
+        if synthesis.diagnostics.get("triggered") and synthesis.candidates:
+            for cand in synthesis.candidates:
+                exists = any(h.hypothesis_id == cand.hypothesis.hypothesis_id for h in hypotheses)
+                if not exists:
+                    hypotheses.append(cand.hypothesis)
+            hypotheses = update_hypotheses(hypotheses, blackboard.transition_events, cfg=None)
+            blackboard.hypotheses_engine_meta = synthesis.diagnostics
+    blackboard.hypotheses_engine = hypotheses
+
+
+def _available_actions_from_fp(fp_current: Dict[str, Any]) -> List[str]:
+    features = fp_current.get("features_v1") or {}
+    meta = features.get("meta_features") or {}
+    actions = meta.get("available_actions_sorted") or []
+    return list(actions)
+
+
+def _should_synthesize(blackboard: Blackboard, cfg: SwarmOrchestratorConfig) -> bool:
+    return True
+
+
+def _hypothesis_rankings(blackboard: Blackboard) -> List[Dict[str, Any]]:
+    hyps = blackboard.hypotheses_engine or []
+    ranked = sorted(hyps, key=lambda h: (-h.confidence, h.hypothesis_id))
+    return [
+        {
+            "hypothesis_id": h.hypothesis_id,
+            "confidence": float(h.confidence),
+            "falsified": bool(h.fit_stats.get("falsified")) if isinstance(h.fit_stats, dict) else False,
+        }
+        for h in ranked
+    ]
+
+
+def _update_conflict_flag(blackboard: Blackboard, cfg: SwarmOrchestratorConfig) -> None:
+    ranked = _hypothesis_rankings(blackboard)
+    if len(ranked) < 2:
+        blackboard.conflict_open = False
+        return
+    delta = abs(float(ranked[0]["confidence"]) - float(ranked[1]["confidence"]))
+    blackboard.hypothesis_conf_deltas.append(delta)
+    if len(blackboard.hypothesis_conf_deltas) > cfg.conflict_open_M:
+        blackboard.hypothesis_conf_deltas = blackboard.hypothesis_conf_deltas[-cfg.conflict_open_M :]
+    if len(blackboard.hypothesis_conf_deltas) >= cfg.conflict_open_M and all(
+        d < cfg.conflict_open_delta for d in blackboard.hypothesis_conf_deltas
+    ):
+        blackboard.conflict_open = True
+    else:
+        blackboard.conflict_open = False
+
+
+def _should_use_test_selector(blackboard: Blackboard, cfg: SwarmOrchestratorConfig) -> bool:
+    if blackboard.step_idx < cfg.probe_steps_max:
+        return True
+    if cfg.probe_every_k > 0 and blackboard.step_idx % cfg.probe_every_k == 0:
+        return True
+    return bool(blackboard.conflict_open)
+
+
+def _select_test_action(blackboard: Blackboard, cfg: SwarmOrchestratorConfig) -> Optional[Dict[str, Any]]:
+    hyps = blackboard.hypotheses_engine or []
+    report = select_discriminating_test(
+        hypotheses=hyps,
+        fp_current=blackboard.fp_current,
+        action_schema=blackboard.action_schema,
+        cfg=None,
+        ctx={"step_idx": blackboard.step_idx},
+        simple_report=blackboard.simple_explorer,
+        full_report=blackboard.full_explorer,
+    )
+    blackboard.test_selector_report = {
+        "selected_test": report.selected_test,
+        "score_breakdown": report.score_breakdown,
+        "alternatives_topM": [asdict(a) for a in report.alternatives_topM],
+        "run_summary": report.run_summary,
+    }
+    seq = report.selected_test.get("action_sequence") or []
+    return seq[0] if seq else None
+
+
+def _test_selector_suggestion(blackboard: Blackboard) -> Optional[Dict[str, Any]]:
+    rep = blackboard.test_selector_report
+    if not rep:
+        return None
+    seq = rep.get("selected_test", {}).get("action_sequence") or []
+    if not seq:
+        return None
+    action = seq[0]
+    action_key = action.get("action_id")
+    if action.get("type") == "coord":
+        action_key = f"{action.get('action_id')}@{action.get('x')},{action.get('y')}"
+    return {
+        "action_key": action_key,
+        "disagreement_score": rep.get("score_breakdown", {}).get("disagreement_score", 0.0),
+        "elimination_score": rep.get("score_breakdown", {}).get("elimination_score", 0.0),
+    }
+
+
+def _hypotheses_report_from_engine(blackboard: Blackboard) -> Optional[Dict[str, Any]]:
+    hyps = blackboard.hypotheses_engine or []
+    if not hyps:
+        return None
+    return {
+        "hypotheses": [
+            {
+                "hypothesis_id": h.hypothesis_id,
+                "confidence": float(h.confidence),
+                "predictions": h.predictions,
+                "tests": h.tests if hasattr(h, "tests") else [],
+            }
+            for h in hyps
+        ]
     }
 
 

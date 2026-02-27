@@ -26,6 +26,7 @@ class ProgressEstimate:
 class GoalHints:
     likely_goal_type: str
     stop_condition_predicates: List[str]
+    stall_risk: float = 0.0
 
 
 @dataclass

@@ -209,3 +209,14 @@ Concrete defaults needed to avoid assumptions:
 
 * the family set match exactly the Rule_Proposer hypothesis set  and  `unknown` should always retain a minimum prior mass (e.g., 0.05) even when evidence is strong.
 
+Mechanic_Classifier must query Memory for longer-horizon evidence aggregation beyond the local window, specifically:
+
+historical distributions of event_signatures per action and per coord
+
+counts of object-level deltas (spawn/despawn/translation-like patterns)
+
+prior mechanic outcomes for similar contexts (by grid_fingerprint and/or coarse “run features”)
+
+Mechanic_Classifier must treat Memory as prior evidence, not ground truth: it should produce a prior mixture that can be overridden by strong current-window evidence. Output must include an explicit memory_evidence_used section (counts + keys), so “collapsed/unknown” cases can be attributed to missing/low-quality evidence rather than gating.
+
+The classifier must consume memory as a prior over mechanic families conditioned on task_signature_v1 and early explorer traces. It must output a mechanic posterior plus a provenance record (features used, confidence, top-k families) in a canonical schema so memory can calibrate classifier reliability across runs. It must also emit normalized misclassification signals (e.g., “family X predicted but contradicted by test Y”) to accumulate cross-run confusion patterns per signature.

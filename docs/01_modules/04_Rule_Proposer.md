@@ -384,3 +384,27 @@ Replace the last line with:
 
 The structure of HypothesisTemplate is fully defined by 02_implementation/hypothesis_template.schema.yaml.
 This document defines behavioral and architectural constraints only.
+
+Rule_Proposer — Memory integration
+
+Rule_Proposer must query Memory for feature baselines and reliability stats used in gating/scoring:
+
+running estimates of trigger features (rates, denominators, stability)
+
+per-template historical success/utility metrics (e.g., “trigger fired but score nonpositive” frequency)
+
+action/coord effect model summaries (what signatures/actions are consistently informative)
+
+Rule_Proposer must use Memory in two deterministic ways:
+
+Gate calibration: if local-window denominators are too small, allow triggers to use Memory-backed smoothed estimates (explicitly marked).
+
+Template ranking: include Memory-derived penalties for repeatedly-unproductive templates in the current run.
+
+This directly targets the current failure mode where triggers fail because feature values are effectively zero due to missing/short windows.
+
+Rule Proposer / Hypothesis Builder — Memory integration (cross-run)
+
+The proposer must consume blackboard.memory_evidence.priors.templates/hypotheses/candidates to re-rank generated hypotheses/templates/candidates before gating. It must (1) down-rank items with high times_rejected or strong critic reject histograms for this task_signature_v1; (2) up-rank items with strong acceptance/win support for this signature or exact game_id; (3) attach candidate_signature_v1 to each proposal so downstream modules can record outcomes and update priors. Gating must remain deterministic and spec-driven: memory may only contribute additive weights and vetoes if explicitly enabled in config (e.g., “reject_if_reject_rate>τ”), never implicit.
+
+The proposer must consume memory to re-rank hypotheses and tests: promote hypotheses with high historical support for the current task_signature_v1 (or similar signatures) and down-rank hypotheses with high rejection/failure association. Each hypothesis and each discriminating test must carry a stable hypothesis_id / test_id so outcomes can be aggregated across runs. The proposer must also record when a hypothesis/test was used and whether it produced discriminating evidence (progress/info gain), emitting those as structured events for persistence.

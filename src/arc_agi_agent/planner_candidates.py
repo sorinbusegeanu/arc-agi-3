@@ -7,6 +7,7 @@ from .planner_types import CandidateAction, CandidateMeta, PlannerInputs, Planne
 _MAX_COORD_CANDIDATES = 64
 _TOPK_OBJECTS = 3
 _NEIGHBORHOOD_RADIUS = 1
+_MAX_MEMORY_CANDIDATES = 16
 
 
 def build_candidates(
@@ -36,6 +37,10 @@ def build_candidates(
     heuristic_candidates = _heuristic_candidates(inputs, action_schema, fp_report_current)
     for action, data in heuristic_candidates:
         _add_candidate(action, "from_heuristic", data, candidates, meta)
+
+    memory_candidates = _memory_candidates(inputs, action_schema, state_key)
+    for action, data in memory_candidates:
+        _add_candidate(action, "from_memory", data, candidates, meta)
 
     if not candidates:
         warnings.append("no_candidates")
@@ -125,6 +130,49 @@ def _heuristic_candidates(
 
     if len(candidates) > _MAX_COORD_CANDIDATES:
         candidates = candidates[:_MAX_COORD_CANDIDATES]
+    return candidates
+
+
+def _memory_candidates(
+    inputs: PlannerInputs,
+    action_schema: Dict[str, Any],
+    state_key: str,
+) -> List[Tuple[CandidateAction, Dict[str, Any]]]:
+    view = inputs.memory_view or {}
+    candidates: List[Tuple[CandidateAction, Dict[str, Any]]] = []
+    noop_by_action = view.get("noop_rate_by_action", {})
+    attempts_by_action = view.get("attempts_by_action", {})
+    recent_actions = set(view.get("last_k_actions_per_state", []))
+    simple_actions = _simple_actions(action_schema)
+    ranked_simple = []
+    for action_id in simple_actions:
+        noop = float(noop_by_action.get(action_id, 0.0))
+        attempts = int(attempts_by_action.get(action_id, 0))
+        ranked_simple.append((noop, attempts, action_id))
+    ranked_simple.sort(key=lambda item: (item[0], item[1], item[2]))
+    for noop, attempts, action_id in ranked_simple[:_MAX_MEMORY_CANDIDATES]:
+        if action_id in recent_actions and noop >= 0.9:
+            continue
+        candidates.append(
+            (
+                CandidateAction(type="simple", action_id=action_id),
+                {"memory": "action_prior", "noop_rate": noop, "attempts": attempts},
+            )
+        )
+
+    coord_actions = _coord_actions(action_schema)
+    coord_scores = view.get("coord_effect_score_by_action", {})
+    for action_id in coord_actions:
+        coords = coord_scores.get(action_id, {})
+        ranked = sorted(coords.items(), key=lambda kv: (-kv[1], kv[0]))
+        for coord_key, score in ranked[:_MAX_MEMORY_CANDIDATES]:
+            x_str, y_str = coord_key.split(",", 1)
+            candidates.append(
+                (
+                    CandidateAction(type="coord", action_id=action_id, x=int(x_str), y=int(y_str)),
+                    {"memory": "coord_prior", "score": float(score)},
+                )
+            )
     return candidates
 
 
@@ -219,6 +267,11 @@ def _hotspot_candidates(full_report: Dict[str, Any], coord_actions: List[str]) -
     for _, action_id, x, y in entries:
         actions.append(CandidateAction(type="coord", action_id=action_id, x=x, y=y))
     return actions
+
+
+def _simple_actions(action_schema: Dict[str, Any]) -> List[str]:
+    actions = action_schema.get("actions", []) if isinstance(action_schema, dict) else []
+    return sorted([a.get("action_id") for a in actions if a.get("kind") == "simple" and a.get("action_id")])
 
 
 def _grid_bounds(action_schema: Dict[str, Any]) -> Tuple[int, int]:

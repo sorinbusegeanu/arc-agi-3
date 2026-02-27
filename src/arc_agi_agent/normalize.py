@@ -32,6 +32,8 @@ def normalize_observation(
             "win_levels": getattr(observation, "win_levels", None),
             "guid": getattr(observation, "guid", None),
             "available_actions": getattr(observation, "available_actions", None),
+            "terminal": getattr(observation, "terminal", None),
+            "reward": getattr(observation, "reward", None),
         }
         return NormalizedObservation(grids=grids, grid_names=names, meta=meta, step_idx=0)
 
@@ -74,6 +76,8 @@ def normalize_observation(
             "win_levels": payload.get("win_levels"),
             "guid": payload.get("guid"),
             "available_actions": payload.get("available_actions"),
+            "terminal": payload.get("terminal"),
+            "reward": payload.get("reward"),
         }
         step_candidate = payload.get("step_idx", payload.get("step", payload.get("steps", 0)))
         step_idx = int(step_candidate) if step_candidate is not None else 0

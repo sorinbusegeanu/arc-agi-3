@@ -30,7 +30,9 @@ class CandidateMeta:
     expected_progress: float = 0.0
     hypothesis_align: float = 0.0
     action_cost: float = 0.0
+    info_gain: float = 0.0
     score: float = 0.0
+    memory_adjustment: float = 0.0
 
 
 @dataclass
@@ -61,3 +63,5 @@ class PlannerInputs:
     full_report: Optional[Dict[str, Any]] = None
     goal_report: Optional[Dict[str, Any]] = None
     transition_graph: Optional[Dict[str, Any]] = None
+    memory_view: Optional[Dict[str, Any]] = None
+    test_selector_suggestion: Optional[Dict[str, Any]] = None

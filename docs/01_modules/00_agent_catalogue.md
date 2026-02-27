@@ -130,3 +130,24 @@ ARC docs explicitly support running agents in swarm-style workflows; you can str
   * `progress_signal` (goal estimator)
 
 
+10. Memory module
+
+11) Executable Hypothesis Engine (mechanic model executor)
+
+Purpose: maintain a small set of executable mechanic hypotheses and score them against observed transitions by predicting TransitionEvents (event signatures + coarse deltas + meta deltas), not full next states.
+
+12 Discriminating Test Selector (active probing planner)
+
+Purpose: given top hypotheses and the current state, select the next probe action (including ACTION6(x,y) coordinate proposals) that maximally separates hypotheses via deterministic disagreement / elimination scoring.
+
+
+13 Mechanic_Synthesizer
+
+Purpose: deterministically synthesize new executable mechanic hypotheses (primitive programs + discrete parameters) from observed TransitionEvent history when the existing hypothesis set is insufficient (low fit, high ambiguity, or all falsified). Emits a bounded set of candidate programs compatible with Executable_Hypothesis_Engine and prioritized for Discriminating_Test_Selector.
+
+14. TransitionEvent_Compiler
+
+Purpose: deterministically compile (prev_observation, action, observation) plus FP_Analyst outputs into a canonical TransitionEventV1 record (multi-frame aware), which is the single source of truth for hypothesis scoring, synthesis, and test selection.
+
+
+

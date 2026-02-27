@@ -239,6 +239,8 @@ def _build_trace(
                     "expected_progress": getattr(cand_meta, "expected_progress", 0.0),
                     "hypothesis_align": getattr(cand_meta, "hypothesis_align", 0.0),
                     "action_cost": getattr(cand_meta, "action_cost", 0.0),
+                    "info_gain": getattr(cand_meta, "info_gain", 0.0),
+                    "memory_adjustment": getattr(cand_meta, "memory_adjustment", 0.0),
                     "tie_break": _stable_tiebreak(state_key, action),
                 },
             }

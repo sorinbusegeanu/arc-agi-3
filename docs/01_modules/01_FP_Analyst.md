@@ -236,4 +236,11 @@ FP_Analyst must provide stable fields consumed by:
 * `viz` (ascii + overlays)
 * Minimal CLI entry for debugging: `--game --step --save-viz`
 
+FP_Analyst — Memory integration
 
+FP_Analyst does not query Memory to make decisions. Instead, it must emit memory-ready facts in its report so the orchestrator (or Memory module) can store them. Each analyze(...) output should include (when available): state_hash, grid_fingerprint, object_catalog (stable object ids if tracking exists), and diff_summary (event signatures + changed cells/bbox area). Memory updates derived from FP_Analyst must be purely observational (no policy), and must be keyed by (game_id, seed, run_id, state_hash) plus step index.
+
+
+Frame & Pattern Analyst — Memory integration (cross-run)
+
+The analyst must produce a canonical, versioned state_summary that is stable across runs and is used to build task_signature_v1 / state_signature_v1. It must also emit normalized feature blocks needed by memory indexing (palette, object list, invariants, diff stats schema) and must never read persistent memory to “decide” facts. It should write only structured, minimal evidence events (e.g., ANALYST_SUMMARY_V1, INVARIANT_CANDIDATES_V1) into the run blackboard; the orchestrator persists them as part of the end-of-game summary.

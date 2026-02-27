@@ -52,10 +52,21 @@ class MechanicClassifierAgent:
         simple_report: Optional[Dict[str, Any]] = None,
         full_report: Optional[Dict[str, Any]] = None,
         action_schema: Optional[Dict[str, Any]] = None,
+        memory: Optional[Any] = None,
+        memory_evidence: Optional[Dict[str, Any]] = None,
         cfg: Any = None,
         ctx: Optional[Dict[str, Any]] = None,
     ) -> Any:
-        return classify_mechanics(fp_reports, simple_report, full_report, action_schema=action_schema, cfg=cfg, ctx=ctx)
+        return classify_mechanics(
+            fp_reports,
+            simple_report,
+            full_report,
+            action_schema=action_schema,
+            memory=memory,
+            memory_evidence=memory_evidence,
+            cfg=cfg,
+            ctx=ctx,
+        )
 
 
 @dataclass
@@ -66,16 +77,42 @@ class RuleProposerAgent:
         simple_report: Optional[Dict[str, Any]] = None,
         full_report: Optional[Dict[str, Any]] = None,
         action_schema: Optional[Dict[str, Any]] = None,
+        memory: Optional[Any] = None,
+        memory_evidence: Optional[Dict[str, Any]] = None,
         cfg: Any = None,
         ctx: Optional[Dict[str, Any]] = None,
     ) -> Any:
-        return propose_rules(fp_reports, simple_report, full_report, action_schema=action_schema, cfg=cfg, ctx=ctx)
+        return propose_rules(
+            fp_reports,
+            simple_report,
+            full_report,
+            action_schema=action_schema,
+            memory=memory,
+            memory_evidence=memory_evidence,
+            cfg=cfg,
+            ctx=ctx,
+        )
 
 
 @dataclass
 class GoalDetectorAgent:
-    def estimate(self, fp_reports: Any, trace_path: Optional[str] = None, cfg: Any = None, ctx: Any = None) -> Any:
-        return estimate_goal(fp_reports, trace_path=trace_path, cfg=cfg, ctx=ctx)
+    def estimate(
+        self,
+        fp_reports: Any,
+        trace_path: Optional[str] = None,
+        memory: Optional[Any] = None,
+        memory_evidence: Optional[Dict[str, Any]] = None,
+        cfg: Any = None,
+        ctx: Any = None,
+    ) -> Any:
+        return estimate_goal(
+            fp_reports,
+            trace_path=trace_path,
+            memory=memory,
+            memory_evidence=memory_evidence,
+            cfg=cfg,
+            ctx=ctx,
+        )
 
 
 @dataclass

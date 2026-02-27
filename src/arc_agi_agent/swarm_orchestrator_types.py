@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 from .planner_types import PlannerState
 from .simple_explorer_types import SimpleFrontierState
 from .full_explorer_types import FullFrontierState
+from .memory_types import MemoryState
 
 
 @dataclass
@@ -47,6 +48,17 @@ class Blackboard:
     action_selection_report: Optional[Dict[str, Any]] = None
     planner_decision: Optional[Dict[str, Any]] = None
     planner_inputs_audit: Optional[Dict[str, Any]] = None
+    memory: Optional[MemoryState] = None
+    memory_meta: Optional[Dict[str, Any]] = None
+    memory_evidence: Optional[Dict[str, Any]] = None
+    events: List[Dict[str, Any]] = field(default_factory=list)
+    fp_step_buffer: List[Dict[str, Any]] = field(default_factory=list)
+    transition_events: List[Any] = field(default_factory=list)
+    hypotheses_engine: Optional[List[Any]] = None
+    hypotheses_engine_meta: Optional[Dict[str, Any]] = None
+    test_selector_report: Optional[Dict[str, Any]] = None
+    hypothesis_conf_deltas: List[float] = field(default_factory=list)
+    conflict_open: bool = False
 
     disagreements: List[Disagreement] = field(default_factory=list)
     artifacts: Dict[str, Any] = field(default_factory=dict)

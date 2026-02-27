@@ -253,4 +253,8 @@ Expose:
 
   * `--agent trajectory_summarizer --planner-trace <...> [--simple-trace <...>] [--full-trace <...>] [--fp-dir <...>] --outdir <...>`
   * writes `lessons.json`
+Trajectory_Summarizer must consume Memory to enrich lessons.json with stable aggregates and cross-run comparisons, and it must optionally emit a memory_delta section (what would be added to Memory at end-of-run). Summarizer must never read other runs’ artifacts accidentally; it should only read the run’s trace + the Memory view that was explicitly bound to that run context. This prevents the earlier “step count mismatch / stale trace contamination” class of issues. 
 
+
+
+The summarizer is the primary producer of cross-run learning artifacts. It must generate a compact, canonical end-of-game record containing: task_signature_v1, key state signatures encountered, loop causes, action efficacy summaries, hypothesis/test outcomes, mechanic posterior evolution, and whether the game was won. It must also normalize failure modes into a stable taxonomy (labels + optional parameters) so memory can aggregate them. The summarizer emits a single RUN_SUMMARY_V1 payload to the orchestrator, which merges it into the persistent store deterministically.

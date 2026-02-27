@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from .feature_aggregate import aggregate_features
 from .grid_utils import grid_from_ascii
 from .summary_export import write_json, write_markdown
+from .memory import state_signature_v1
 from .trace_reader import read_trace
 from .trajectory_summarizer_config import TrajectorySummarizerConfig
 from .trajectory_summarizer_types import TrajectorySummaryReport
@@ -21,9 +22,12 @@ def summarize(
     proposer: Optional[Dict[str, Any]] = None,
     classifier: Optional[Dict[str, Any]] = None,
     goal: Optional[Dict[str, Any]] = None,
+    memory_path: Optional[str] = None,
     cfg: Optional[TrajectorySummarizerConfig] = None,
     ctx: Optional[Dict[str, Any]] = None,
     outdir: Optional[str] = None,
+    task_signature: Optional[str] = None,
+    win: Optional[bool] = None,
 ) -> TrajectorySummaryReport:
     cfg = cfg or TrajectorySummarizerConfig()
     traces = []
@@ -39,6 +43,7 @@ def summarize(
     warnings = _hash_warnings(step_records, fp_reports)
     if action_schema is None:
         warnings.append("action_schema_missing")
+    memory_snapshot = _load_memory_snapshot(memory_path)
     run_summary = _run_summary(step_records, fp_reports, ctx, warnings)
     if action_schema is not None:
         run_summary["never_used_actions"] = _never_used_actions(step_records, action_schema)
@@ -58,6 +63,16 @@ def summarize(
         "mechanic_outcomes": mechanic_outcomes,
         "run_features": run_features,
     }
+    state_signatures = _collect_state_signatures(step_records, fp_reports)
+    run_summary_v1 = _run_summary_v1(
+        run_summary,
+        lessons,
+        task_signature=task_signature,
+        win=win,
+        state_signatures=state_signatures,
+    )
+    if memory_snapshot:
+        lessons["memory_delta"] = _memory_delta(memory_snapshot)
 
     export_artifacts = {}
     if outdir:
@@ -65,6 +80,9 @@ def summarize(
         lessons_path = os.path.join(outdir, "lessons.json")
         write_json(lessons_path, {"run_summary": run_summary, "lessons": lessons})
         export_artifacts["lessons.json"] = lessons_path
+        run_v1_path = os.path.join(outdir, "run_summary_v1.json")
+        write_json(run_v1_path, run_summary_v1)
+        export_artifacts["run_summary_v1.json"] = run_v1_path
         if cfg.export_markdown:
             md_path = os.path.join(outdir, "summary.md")
             write_markdown(md_path, {"run_summary": run_summary, "lessons": lessons})
@@ -73,8 +91,111 @@ def summarize(
     return TrajectorySummaryReport(
         run_summary=run_summary,
         lessons=lessons,
+        run_summary_v1=run_summary_v1,
         export_artifacts=export_artifacts,
     )
+
+
+def _load_memory_snapshot(path: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not path:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _memory_delta(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    per_action = snapshot.get("per_action", {})
+    top_actions = []
+    for action_key, stats in per_action.items():
+        attempts = stats.get("attempts", 0)
+        if attempts <= 0:
+            continue
+        no_effect = stats.get("no_effect_count", 0)
+        rate = 1.0 - (no_effect / float(attempts))
+        top_actions.append((rate, action_key, attempts))
+    top_actions.sort(key=lambda item: (-item[0], item[1]))
+    return {
+        "per_action_count": len(per_action),
+        "top_actions": [
+            {"action_key": key, "effect_rate": rate, "attempts": attempts}
+            for rate, key, attempts in top_actions[:5]
+        ],
+    }
+
+
+def _run_summary_v1(
+    run_summary: Dict[str, Any],
+    lessons: Dict[str, Any],
+    *,
+    task_signature: Optional[str],
+    win: Optional[bool],
+    state_signatures: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    action_efficacy = lessons.get("action_efficacy", {})
+    hypothesis_outcomes = lessons.get("hypothesis_outcomes", {})
+    mechanic_outcomes = lessons.get("mechanic_outcomes", {})
+    failure_labels: List[str] = []
+    if not win:
+        failure_labels.append("no_win")
+    loops = lessons.get("loop_analysis", {}).get("loops", [])
+    if loops:
+        failure_labels.append("loop_detected")
+        loop_types = {loop.get("loop_type") for loop in loops if loop.get("loop_type")}
+        for loop_type in sorted(loop_types):
+            failure_labels.append(f"loop.{loop_type}")
+    failure_labels = sorted(set(failure_labels))
+    loop_causes = [
+        {
+            "loop_id": loop.get("loop_id"),
+            "loop_type": loop.get("loop_type"),
+            "start_step": loop.get("start_step"),
+            "end_step": loop.get("end_step"),
+        }
+        for loop in loops
+    ]
+    return {
+        "schema_version": "RUN_SUMMARY_V1",
+        "task_signature_v1": task_signature,
+        "game_id": run_summary.get("game_id"),
+        "seed": run_summary.get("seed"),
+        "run_id": run_summary.get("run_id"),
+        "win": bool(win) if win is not None else False,
+        "progress_metrics": {
+            "reward_total": run_summary.get("reward_total"),
+            "terminal_reached": run_summary.get("terminal_reached"),
+        },
+        "state_signatures": state_signatures or {"source": "state_hash", "values": []},
+        "loop_causes": loop_causes,
+        "action_efficacy": action_efficacy,
+        "hypothesis_outcomes": hypothesis_outcomes,
+        "mechanic_posterior_evolution": mechanic_outcomes,
+        "failure_labels": failure_labels,
+    }
+
+
+def _collect_state_signatures(
+    step_records: List[Dict[str, Any]],
+    fp_reports: Dict[int, Dict[str, Any]],
+) -> Dict[str, Any]:
+    seen = set()
+    values: List[str] = []
+    if fp_reports:
+        for step_idx in sorted(fp_reports.keys()):
+            report = fp_reports[step_idx]
+            sig = state_signature_v1(report)
+            if sig and sig not in seen:
+                seen.add(sig)
+                values.append(sig)
+        return {"source": "state_signature_v1", "values": values}
+    for rec in step_records:
+        for key in (rec.get("state_before"), rec.get("state_after")):
+            if key and key not in seen:
+                seen.add(key)
+                values.append(key)
+    return {"source": "state_hash", "values": values}
 
 
 def detect_loops(step_records: List[Dict[str, Any]], cfg: TrajectorySummarizerConfig) -> List[Dict[str, Any]]:
@@ -194,6 +315,25 @@ def _normalize_steps(traces: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 def _load_fp_reports(fp_dir: str, step_records: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
     reports = {}
+    buffer_path = os.path.join(fp_dir, "fp_steps.jsonl")
+    if os.path.exists(buffer_path):
+        try:
+            with open(buffer_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        payload = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    step_idx = payload.get("state_summary", {}).get("step_idx")
+                    if step_idx is None:
+                        continue
+                    reports[int(step_idx)] = payload
+            return reports
+        except Exception:
+            pass
     for rec in step_records:
         step_idx = rec.get("step_idx")
         if step_idx is None:

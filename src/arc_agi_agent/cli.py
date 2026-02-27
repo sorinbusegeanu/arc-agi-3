@@ -27,6 +27,16 @@ from .rule_proposer import propose as propose_rules
 from .rule_proposer_config import RuleProposerConfig
 from .simple_explorer import run as run_simple_explorer
 from .simple_explorer_config import SimpleExplorerConfig
+from .executable_hypothesis_engine import run_engine as run_executable_hypothesis_engine
+from .executable_hypothesis_engine import transition_events_from_trace
+from .executable_hypothesis_engine import asdict_report as exec_hypothesis_asdict
+from .executable_hypothesis_engine_config import ExecutableHypothesisEngineConfig
+from .discriminating_test_selector import select_test as select_discriminating_test
+from .discriminating_test_selector import asdict_report as test_selector_asdict
+from .discriminating_test_selector_config import DiscriminatingTestSelectorConfig
+from .mechanic_synthesizer import synthesize as synthesize_mechanic
+from .mechanic_synthesizer import asdict_report as mechan_synth_asdict
+from .mechanic_synthesizer_config import MechanicSynthesizerConfig
 
 logger = get_logger(__name__)
 
@@ -68,6 +78,9 @@ def main() -> int:
             "goal_detector",
             "planner",
             "trajectory_summarizer",
+            "executable_hypothesis_engine",
+            "test_selector",
+            "mechanic_synthesizer",
         ],
         help="Agent name",
     )
@@ -87,6 +100,7 @@ def main() -> int:
     parser.add_argument("--simple-trace", help="Path to simple explorer trace jsonl")
     parser.add_argument("--full-trace", help="Path to full explorer trace jsonl")
     parser.add_argument("--fp-dir", help="Directory containing fp_step_<step_idx>.json")
+    parser.add_argument("--memory", help="Path to memory snapshot json")
     parser.add_argument("--action-schema", dest="action_schema", help="Path to action_schema JSON")
 
     parser.add_argument("--game", help="Game id (simple_explorer/full_explorer) or 'all'")
@@ -258,6 +272,89 @@ def main() -> int:
         _write_json(os.path.join(args.outdir, "rule_proposer_report.json"), _serialize_report(report))
         return 0
 
+    if args.agent == "executable_hypothesis_engine":
+        if not args.input_fp:
+            raise SystemExit("--input_fp is required for executable_hypothesis_engine")
+        if not args.action_schema:
+            raise SystemExit("--action-schema is required for executable_hypothesis_engine")
+        if not args.outdir:
+            raise SystemExit("--outdir is required for executable_hypothesis_engine")
+        fp_reports = [_load_json(path) for path in args.input_fp]
+        action_schema = _load_json(args.action_schema)
+        simple_report = _load_json(args.simple) if args.simple else None
+        full_report = _load_json(args.full) if args.full else None
+        rule_report = _load_json(args.hypotheses) if args.hypotheses else None
+        os.makedirs(args.outdir, exist_ok=True)
+        report = run_executable_hypothesis_engine(
+            fp_reports=fp_reports,
+            action_schema=action_schema,
+            ctx={"game_id": None, "seed": None, "step_idx": None},
+            simple_report=simple_report,
+            full_report=full_report,
+            rule_proposer_report=rule_report,
+            cfg=ExecutableHypothesisEngineConfig(),
+        )
+        _write_json(os.path.join(args.outdir, "report.json"), exec_hypothesis_asdict(report))
+        return 0
+
+    if args.agent == "test_selector":
+        if not args.input_fp:
+            raise SystemExit("--input_fp is required for test_selector")
+        if not args.action_schema:
+            raise SystemExit("--action-schema is required for test_selector")
+        if not args.hypotheses:
+            raise SystemExit("--hypotheses is required for test_selector")
+        if not args.outdir:
+            raise SystemExit("--outdir is required for test_selector")
+        fp_reports = [_load_json(path) for path in args.input_fp]
+        fp_current = fp_reports[-1]
+        hypotheses_report = _load_json(args.hypotheses)
+        hypotheses = hypotheses_report.get("hypotheses", []) if isinstance(hypotheses_report, dict) else []
+        action_schema = _load_json(args.action_schema)
+        simple_report = _load_json(args.simple) if args.simple else None
+        full_report = _load_json(args.full) if args.full else None
+        os.makedirs(args.outdir, exist_ok=True)
+        report = select_discriminating_test(
+            hypotheses=hypotheses,
+            fp_current=fp_current,
+            action_schema=action_schema,
+            cfg=DiscriminatingTestSelectorConfig(),
+            ctx={},
+            simple_report=simple_report,
+            full_report=full_report,
+        )
+        _write_json(os.path.join(args.outdir, "report.json"), test_selector_asdict(report))
+        return 0
+
+    if args.agent == "mechanic_synthesizer":
+        if not args.input_fp:
+            raise SystemExit("--input_fp is required for mechanic_synthesizer")
+        if not args.outdir:
+            raise SystemExit("--outdir is required for mechanic_synthesizer")
+        fp_reports = [_load_json(path) for path in args.input_fp]
+        fp_current = fp_reports[-1]
+        hypotheses = []
+        events = []
+        if args.hypotheses:
+            hypotheses_report = _load_json(args.hypotheses)
+            hypotheses = hypotheses_report.get("hypotheses", []) if isinstance(hypotheses_report, dict) else []
+            events = hypotheses_report.get("transition_events", []) if isinstance(hypotheses_report, dict) else []
+        if not events and args.trace:
+            events = [asdict(ev) for ev in transition_events_from_trace(args.trace)]
+        os.makedirs(args.outdir, exist_ok=True)
+        if not events:
+            logger.warning("mechanic_synthesizer: no transition_events provided; using empty window")
+        report = synthesize_mechanic(
+            events=events,
+            fp_current=fp_current,
+            available_actions_current=[],
+            existing_hypotheses=hypotheses,
+            cfg=MechanicSynthesizerConfig(),
+            ctx={"trace_used": bool(args.trace)},
+        )
+        _write_json(os.path.join(args.outdir, "report.json"), mechan_synth_asdict(report))
+        return 0
+
     if args.agent == "mechanic_classifier":
         if not args.input_fp:
             raise SystemExit("--input_fp is required for mechanic_classifier")
@@ -420,9 +517,12 @@ def main() -> int:
             proposer=_load_json(args.hypotheses) if args.hypotheses else None,
             classifier=_load_json(args.mechanic) if args.mechanic else None,
             goal=_load_json(args.goal) if args.goal else None,
+            memory_path=args.memory,
             cfg=cfg,
             ctx={"outdir": args.outdir},
             outdir=args.outdir,
+            task_signature=None,
+            win=None,
         )
         return 0
 

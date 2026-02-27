@@ -13,6 +13,7 @@ from .mechanic_classifier_types import (
 )
 from .mechanic_family_catalog import MECHANIC_FAMILIES
 from .score_utils import feature_value, transform_value, triggers_met
+from .memory import memory_view
 
 
 def classify(
@@ -20,6 +21,8 @@ def classify(
     simple_report: Optional[Dict[str, Any]] = None,
     full_report: Optional[Dict[str, Any]] = None,
     action_schema: Optional[ActionSchema | Dict[str, Any]] = None,
+    memory: Optional[Any] = None,
+    memory_evidence: Optional[Dict[str, Any]] = None,
     cfg: Optional[MechanicClassifierConfig] = None,
     ctx: Optional[Dict[str, Any]] = None,
 ) -> MechanicClassifierReport:
@@ -63,8 +66,12 @@ def classify(
 
     features = aggregate_features(reports_window, simple_report, full_report)
     availability = _availability(reports_window, simple_report, full_report, schema)
+    mem_view = memory_view(memory, evidence=memory_evidence) if memory is not None else {}
+    features = _blend_memory_features(features, availability, mem_view, cfg)
 
     raw_scores, evidence = _score_families(features, availability, cfg)
+    if mem_view:
+        raw_scores = _apply_memory_priors(raw_scores, mem_view, reports_window)
     priors = _normalize_scores(raw_scores, cfg)
     priors_sorted = sorted(priors.items(), key=lambda kv: (-kv[1], kv[0]))
 
@@ -76,6 +83,13 @@ def classify(
         "priors_top3": priors_sorted[:3],
         "families_emitted": len(families),
         "fallback_reason": None,
+        "memory_evidence_used": {
+            "event_signature_baseline": len(mem_view.get("event_signature_baseline", {})),
+            "object_delta_baseline": len(mem_view.get("object_delta_baseline", {})),
+            "mechanic_by_fingerprint": len(mem_view.get("mechanic_by_fingerprint", {})),
+        }
+        if mem_view
+        else {},
     }
     if raw_scores and all(val <= 0 for val in raw_scores.values()):
         diagnostics["fallback_reason"] = "all_zero_scores"
@@ -230,6 +244,51 @@ def _normalize_scores(scores: Dict[str, float], cfg: MechanicClassifierConfig) -
     if total <= 0:
         return {family_id: (1.0 if family_id == "unknown.mechanic" else 0.0) for family_id in scores}
     return {family_id: val / total for family_id, val in scores.items()}
+
+
+def _blend_memory_features(
+    features: Dict[str, Any],
+    availability: Dict[str, Any],
+    mem_view: Dict[str, Any],
+    cfg: MechanicClassifierConfig,
+) -> Dict[str, Any]:
+    if not mem_view:
+        return features
+    blended = dict(features)
+    reports_with_diff = availability.get("reports_with_diff", 0)
+    weight = min(1.0, reports_with_diff / float(max(cfg.initial_T, 1)))
+    baselines = {}
+    baselines.update(mem_view.get("event_signature_baseline", {}))
+    baselines.update(mem_view.get("object_delta_baseline", {}))
+    for key, mem_val in baselines.items():
+        cur_val = blended.get(key)
+        if cur_val is None:
+            blended[key] = mem_val
+        else:
+            blended[key] = weight * float(cur_val) + (1.0 - weight) * float(mem_val)
+    return blended
+
+
+def _apply_memory_priors(
+    raw_scores: Dict[str, float],
+    mem_view: Dict[str, Any],
+    reports_window: List[Dict[str, Any]],
+) -> Dict[str, float]:
+    if not mem_view:
+        return raw_scores
+    fp_last = reports_window[-1] if reports_window else {}
+    debug = fp_last.get("debug") if isinstance(fp_last, dict) else None
+    fingerprint = debug.get("grid_fingerprint") if isinstance(debug, dict) else None
+    if not fingerprint:
+        return raw_scores
+    prior_bucket = mem_view.get("mechanic_by_fingerprint", {}).get(str(fingerprint))
+    if not prior_bucket:
+        return raw_scores
+    adjusted = dict(raw_scores)
+    for fam_id, entry in prior_bucket.items():
+        avg_prior = float(entry.get("avg_prior", 0.0))
+        adjusted[fam_id] = adjusted.get(fam_id, 0.0) + 0.25 * avg_prior
+    return adjusted
 
 
 def _build_family_priors(

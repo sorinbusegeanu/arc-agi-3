@@ -77,10 +77,21 @@ class VizArtifacts:
 
 
 @dataclass
+class FeaturesV1:
+    grid_index: Dict[str, Any]
+    object_index: List[Dict[str, Any]]
+    interaction_points: List[Dict[str, Any]]
+    meta_features: Dict[str, Any]
+
+
+@dataclass
 class DebugInfo:
     schema_warnings: List[str]
     timings_ms: Dict[str, float]
     grid_hash: str
+    grid_fingerprint: Optional[str] = None
+    state_summary_version: Optional[str] = None
+    diff_schema_version: Optional[str] = None
 
 
 @dataclass
@@ -88,4 +99,5 @@ class FPReport:
     state_summary: StateSummary
     diff_summary: Optional[DiffSummary]
     viz_artifacts: VizArtifacts
+    features_v1: Optional[FeaturesV1]
     debug: DebugInfo

@@ -295,4 +295,18 @@ Expose:
 Concrete defaults needed to avoid assumptions:
 
 the planner must operate on a single current grid
+Planner must query Memory for action and coord priors to improve candidate generation and ranking:
 
+action efficacy (avg_changed_cells, no_effect_rate, signature diversity) aggregated over the run and optionally across prior runs
+
+coord priors for coord actions (effective/noop coord maps)
+
+“escape actions” for states previously identified as self-loop/no-progress
+
+Planner must also write back (via orchestrator/Memory) its decision justification signals (selected candidate, top-k alternatives, computed scores) so Memory can learn planner-specific outcomes (e.g., “heuristic centroid candidate repeatedly no-ops”). This makes the planner’s subsource-based behavior tunable and accountable.
+
+Planner / ExplorationPolicy — Memory integration (cross-run)
+
+The planner must consume blackboard.memory_evidence and apply deterministic score deltas (not hard blocks by default) derived from cross-run priors. Specifically: (1) add a positive bias to actions/candidates with high win_support or low noop_rate for the current task_signature_v1; (2) subtract bias for actions known to loop or no-op under the current signature; (3) if coordinate actions exist, incorporate priors.coord (heatmap or coord-conditioned priors) as an additive term in candidate scoring; (4) if the planner supports backtracking/frontier selection, prefer frontier nodes whose signatures historically lead to progress. The planner must never write to the persistent store directly; it only emits structured “attempt events” back to the orchestrator for persistence.
+
+The planner must consume blackboard.memory_evidence as explicit, separable score terms that influence action selection deterministically: (1) signature-conditioned action efficacy priors, (2) loop/no-op avoidance priors, (3) mechanic-family prior weighting, (4) known “good tests” early vs exploitation later. It must log score decompositions for chosen vs rejected actions (base vs memory deltas) so memory updates remain auditable. The planner must not directly persist; it only emits structured decision events to the orchestrator.

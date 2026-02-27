@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import asdict
 
 from .action_schema import ActionSchema, ActionSpec, parse_action_schema_data
 from .feature_aggregate import aggregate_features
 from .hypothesis_catalog import HYPOTHESES
 from .rule_proposer_config import RuleProposerConfig
 from .rule_proposer_types import Hypothesis, RuleProposerReport, TestActionSpec, TestSpec
+from .primitive_program_v1 import default_hypotheses
 from .score_utils import eval_predicate, feature_value, transform_value
+from .memory import memory_view
 
 
 def propose(
@@ -15,6 +18,8 @@ def propose(
     simple_report: Optional[Dict[str, Any]] = None,
     full_report: Optional[Dict[str, Any]] = None,
     action_schema: Optional[ActionSchema | Dict[str, Any]] = None,
+    memory: Optional[Any] = None,
+    memory_evidence: Optional[Dict[str, Any]] = None,
     cfg: Optional[RuleProposerConfig] = None,
     ctx: Optional[Dict[str, Any]] = None,
 ) -> RuleProposerReport:
@@ -32,6 +37,8 @@ def propose(
 
     features = aggregate_features(reports_window, simple_report, full_report)
     availability = _build_availability(reports_window, simple_report, full_report, action_schema)
+    mem_view = memory_view(memory, evidence=memory_evidence) if memory is not None else {}
+    features, mem_used = _blend_memory_features(features, reports_window, mem_view, cfg)
 
     diagnostics: Dict[str, Any] = {
         "templates_total": len(HYPOTHESES),
@@ -46,7 +53,7 @@ def propose(
         "early_exit": None,
     }
     for template in HYPOTHESES:
-        gate = _template_gate_reason(template, reports_window, features, availability, cfg)
+        gate = _template_gate_reason(template, reports_window, features, availability, cfg, mem_view)
         if gate and gate.startswith("requires_"):
             diagnostics["requires_blocked"] += 1
         elif gate == "trigger_not_met":
@@ -54,12 +61,14 @@ def propose(
         elif gate == "trigger_insufficient_window":
             diagnostics["trigger_insufficient_window"] += 1
     if ctx and ctx.get("debug"):
-        diagnostics["trigger_evals"] = _trigger_evals(reports_window, features, availability, cfg)
+        diagnostics["trigger_evals"] = _trigger_evals(reports_window, features, availability, cfg, mem_view)
         diagnostics["feature_audit"] = _feature_audit(reports_window)
         diagnostics["score_audit"] = _score_audit(features, availability, top_n=10)
         diagnostics["trigger_thresholds"] = _trigger_thresholds(reports_window)
+        diagnostics["memory_used"] = mem_used
 
-    hypotheses = score_hypotheses(reports_window, features, availability, cfg)
+    hypotheses = score_hypotheses(reports_window, features, availability, cfg, mem_view)
+    _apply_memory_template_penalties(hypotheses, mem_view, cfg)
     ranked = _rank_hypotheses(hypotheses)
 
     if not availability["has_simple_report"] and not availability["has_full_report"]:
@@ -87,11 +96,20 @@ def propose(
             features,
             reports_window,
             cfg,
+            mem_view,
         )
         diagnostics["fallback_used"] = False
         diagnostics["fallback_block_reason"] = block_reason
         if allow_fallback:
-            fallback = _fallback_hypotheses(reports_window, features, availability, action_schema, cfg, full_report)
+            fallback = _fallback_hypotheses(
+                reports_window,
+                features,
+                availability,
+                action_schema,
+                cfg,
+                full_report,
+                mem_view,
+            )
             diagnostics["fallback_used"] = bool(fallback)
             diagnostics["hypotheses_final"] = len(fallback) if fallback else 0
             if fallback:
@@ -145,10 +163,11 @@ def score_hypotheses(
     features: Dict[str, Any],
     availability: Dict[str, bool],
     cfg: RuleProposerConfig,
+    mem_view: Optional[Dict[str, Any]] = None,
 ) -> List[Hypothesis]:
     hypotheses: List[Hypothesis] = []
     for template in HYPOTHESES:
-        hypothesis = _build_hypothesis_from_template(template, reports_window, features, availability, cfg)
+        hypothesis = _build_hypothesis_from_template(template, reports_window, features, availability, cfg, mem_view)
         hypotheses.append(hypothesis)
     return hypotheses
 
@@ -196,6 +215,7 @@ def _build_hypothesis_from_template(
     features: Dict[str, Any],
     availability: Dict[str, bool],
     cfg: RuleProposerConfig,
+    mem_view: Optional[Dict[str, Any]] = None,
 ) -> Hypothesis:
     requires = template.requires
     if requires.get("needs_coord_actions") and not availability.get("has_coord_actions", False):
@@ -207,7 +227,7 @@ def _build_hypothesis_from_template(
     if requires.get("needs_reward_signal") and not availability.get("has_reward_signal", False):
         return _empty_hypothesis(template, confidence=0.0)
 
-    trigger_status = _trigger_status(template, reports_window, features, availability, cfg)
+    trigger_status = _trigger_status(template, reports_window, features, availability, cfg, mem_view)
     score = _score_template(template, features)
     trigger_failed = False
     if trigger_status == "fail":
@@ -215,18 +235,25 @@ def _build_hypothesis_from_template(
         trigger_failed = True
     if trigger_status == "insufficient_window":
         trigger_failed = True
+    if trigger_status == "fail_memory":
+        trigger_failed = True
 
     score = max(0.0, min(1.0, score)) if template.scoring_function.get("clamp", True) else score
 
     evidence = _build_evidence(template, features)
+    evidence = list(evidence) + [{"trigger_status": trigger_status}]
     if trigger_failed:
         evidence = list(evidence) + [{"trigger_failed": True, "status": trigger_status}]
+    if trigger_status == "pass_memory":
+        evidence = list(evidence) + [{"trigger_memory_used": True}]
     predictions = _build_predictions(template, features)
     expected_observations = _build_expected_observations(predictions)
     return Hypothesis(
         hypothesis_id=template.hypothesis_id,
         name=template.name,
         description=_describe_hypothesis(template, features),
+        program_v1=_program_stub(template.hypothesis_id),
+        params=_params_stub(template.hypothesis_id),
         confidence=score,
         evidence=evidence,
         predictions=predictions,
@@ -243,6 +270,7 @@ def _fallback_hypotheses(
     action_schema: ActionSchema,
     cfg: RuleProposerConfig,
     full_report: Optional[Dict[str, Any]],
+    mem_view: Optional[Dict[str, Any]] = None,
 ) -> List[Hypothesis]:
     fallback: List[Hypothesis] = []
     for template in HYPOTHESES:
@@ -250,7 +278,7 @@ def _fallback_hypotheses(
             continue
         if _requires_gate_reason(template, availability) is not None:
             continue
-        hyp = _build_hypothesis_from_template(template, reports_window, features, availability, cfg)
+        hyp = _build_hypothesis_from_template(template, reports_window, features, availability, cfg, mem_view)
         hyp.confidence = cfg.fallback_confidence
         tests = build_tests(hyp, features, action_schema, cfg, reports_window, full_report)
         hyp.tests = tests[: cfg.tests_per_hypothesis]
@@ -267,12 +295,13 @@ def _fallback_gate(
     features: Dict[str, Any],
     reports_window: List[Dict[str, Any]],
     cfg: RuleProposerConfig,
+    mem_view: Optional[Dict[str, Any]] = None,
 ) -> Tuple[bool, str]:
     if availability.get("has_simple_report") is not True:
         return False, "missing_simple_report"
     if availability.get("has_full_report") is not True:
         return False, "missing_full_report"
-    if not _has_triggered_template(reports_window, features, availability, cfg):
+    if not _has_triggered_template(reports_window, features, availability, cfg, mem_view):
         return False, "no_triggered_template"
     if _coord_trials(full_report) <= 0:
         return False, "coord_trials_missing"
@@ -284,13 +313,15 @@ def _has_triggered_template(
     features: Dict[str, Any],
     availability: Dict[str, bool],
     cfg: RuleProposerConfig,
+    mem_view: Optional[Dict[str, Any]] = None,
 ) -> bool:
     for template in HYPOTHESES:
         if template.hypothesis_id == "unknown.mechanic":
             continue
         if _requires_gate_reason(template, availability) is not None:
             continue
-        if _trigger_status(template, reports_window, features, availability, cfg) == "pass":
+        status = _trigger_status(template, reports_window, features, availability, cfg, mem_view)
+        if status in {"pass", "pass_memory"}:
             return True
     return False
 
@@ -312,14 +343,17 @@ def _template_gate_reason(
     features: Dict[str, Any],
     availability: Dict[str, bool],
     cfg: RuleProposerConfig,
+    mem_view: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     requires_reason = _requires_gate_reason(template, availability)
     if requires_reason is not None:
         return requires_reason
-    trigger_status = _trigger_status(template, reports_window, features, availability, cfg)
+    trigger_status = _trigger_status(template, reports_window, features, availability, cfg, mem_view)
     if trigger_status == "insufficient_window":
         return "trigger_insufficient_window"
     if trigger_status == "fail":
+        return "trigger_not_met"
+    if trigger_status == "fail_memory":
         return "trigger_not_met"
     return None
 
@@ -342,14 +376,19 @@ def _trigger_evals(
     features: Dict[str, Any],
     availability: Dict[str, bool],
     cfg: RuleProposerConfig,
+    mem_view: Optional[Dict[str, Any]] = None,
     limit: int = 8,
 ) -> List[Dict[str, Any]]:
     details: List[Dict[str, Any]] = []
     window_ok = _diff_window_count(reports_window) >= cfg.trigger_window_min
+    mem_baselines = {}
+    if mem_view:
+        mem_baselines.update(mem_view.get("event_signature_baseline", {}))
+        mem_baselines.update(mem_view.get("object_delta_baseline", {}))
     for template in HYPOTHESES:
         if template.hypothesis_id == "unknown.mechanic":
             continue
-        gate = _template_gate_reason(template, reports_window, features, availability, cfg)
+        gate = _template_gate_reason(template, reports_window, features, availability, cfg, mem_view)
         if gate != "trigger_not_met":
             continue
         preds = []
@@ -360,6 +399,21 @@ def _trigger_evals(
             mode = _predicate_mode(key, predicate)
             if mode == "rate":
                 actual = feature_value(features, key)
+                if not window_ok and key in mem_baselines:
+                    actual = mem_baselines.get(key, actual)
+                    passed = eval_predicate(actual, op, target)
+                    preds.append(
+                        {
+                            "feature_key": key,
+                            "mode": "rate",
+                            "op": op,
+                            "target": target,
+                            "actual": actual,
+                            "passed": passed,
+                            "memory_used": True,
+                        }
+                    )
+                    continue
                 passed = eval_predicate(actual, op, target)
                 preds.append(
                     {
@@ -518,6 +572,51 @@ def _trigger_feature_keys() -> List[str]:
     return sorted(keys)
 
 
+def _blend_memory_features(
+    features: Dict[str, Any],
+    reports_window: List[Dict[str, Any]],
+    mem_view: Dict[str, Any],
+    cfg: RuleProposerConfig,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    if not mem_view:
+        return features, {"used": False}
+    blended = dict(features)
+    reports_with_diff = _diff_window_count(reports_window)
+    if reports_with_diff >= cfg.trigger_window_min:
+        return blended, {"used": False}
+    weight = min(1.0, reports_with_diff / float(max(cfg.trigger_window_min, 1)))
+    baselines = {}
+    baselines.update(mem_view.get("event_signature_baseline", {}))
+    baselines.update(mem_view.get("object_delta_baseline", {}))
+    used_keys = []
+    for key, mem_val in baselines.items():
+        cur_val = blended.get(key)
+        if cur_val is None:
+            blended[key] = mem_val
+        else:
+            blended[key] = weight * float(cur_val) + (1.0 - weight) * float(mem_val)
+        used_keys.append(key)
+    return blended, {"used": True, "keys": used_keys}
+
+
+def _apply_memory_template_penalties(
+    hypotheses: List[Hypothesis],
+    mem_view: Dict[str, Any],
+    cfg: RuleProposerConfig,
+) -> None:
+    if not mem_view:
+        return
+    stats = mem_view.get("template_stats", {})
+    for hyp in hypotheses:
+        meta = stats.get(hyp.hypothesis_id)
+        if not meta:
+            continue
+        considered = int(meta.get("times_considered", 0))
+        scored_positive = int(meta.get("times_scored_positive", 0))
+        if considered >= 5 and scored_positive == 0:
+            hyp.confidence = max(0.0, hyp.confidence - cfg.trigger_fail_penalty)
+
+
 def _event_signature_counts(rep: Dict[str, Any]) -> Dict[str, int]:
     diff = rep.get("diff_summary") or {}
     counts: Dict[str, int] = {"_total": 0}
@@ -564,11 +663,18 @@ def _trigger_status(
     features: Dict[str, Any],
     availability: Dict[str, bool],
     cfg: RuleProposerConfig,
+    mem_view: Optional[Dict[str, Any]] = None,
 ) -> str:
     if not template.trigger_features:
         return "pass"
-    if _diff_window_count(reports_window) < cfg.trigger_window_min:
+    window_ok = _diff_window_count(reports_window) >= cfg.trigger_window_min
+    mem_baselines = {}
+    if mem_view:
+        mem_baselines.update(mem_view.get("event_signature_baseline", {}))
+        mem_baselines.update(mem_view.get("object_delta_baseline", {}))
+    if not window_ok and not mem_baselines:
         return "insufficient_window"
+    memory_used = False
 
     for predicate in template.trigger_features:
         key = predicate.get("feature_key", "")
@@ -577,13 +683,23 @@ def _trigger_status(
         mode = _predicate_mode(key, predicate)
         if mode == "rate":
             actual = feature_value(features, key)
+            if not window_ok and key in mem_baselines:
+                actual = mem_baselines.get(key, actual)
+                memory_used = True
+                if not eval_predicate(actual, op, target):
+                    return "fail_memory"
+                continue
             if not eval_predicate(actual, op, target):
                 return "fail"
         else:
             values = _per_report_feature_values(reports_window, key)
             hits = sum(1 for v in values if eval_predicate(v, op, target))
+            if not window_ok:
+                return "insufficient_window"
             if hits < cfg.trigger_n_of_k:
                 return "fail"
+    if memory_used and not window_ok:
+        return "pass_memory"
     return "pass"
 
 
@@ -890,6 +1006,8 @@ def _empty_hypothesis(template: Any, confidence: float) -> Hypothesis:
         hypothesis_id=template.hypothesis_id,
         name=template.name,
         description=_describe_hypothesis(template, {}),
+        program_v1=_program_stub(template.hypothesis_id),
+        params=_params_stub(template.hypothesis_id),
         confidence=confidence,
         evidence=[],
         predictions=[],
@@ -915,6 +1033,19 @@ def _dependencies_from_requires(requires: Dict[str, bool]) -> List[str]:
     if requires.get("needs_reward_signal"):
         deps.append("requires_reward_signal")
     return deps
+
+
+def _program_stub(hypothesis_id: str) -> Optional[Dict[str, Any]]:
+    for hyp in default_hypotheses():
+        if hyp.hypothesis_id == hypothesis_id:
+            program = hyp.program_v1
+            return asdict(program) if hasattr(program, "__dataclass_fields__") else program
+    return None
+
+
+def _params_stub(hypothesis_id: str) -> Dict[str, Any]:
+    _ = hypothesis_id
+    return {}
 
 
 def _sorted_actions(actions: List[ActionSpec], kind: str) -> List[ActionSpec]:

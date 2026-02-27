@@ -43,6 +43,70 @@ def _write_json(path: str, payload: Any) -> None:
         json.dump(payload, f, indent=2)
 
 
+def _is_win(outdir: Optional[str]) -> bool:
+    if not outdir:
+        return False
+    trace_path = os.path.join(outdir, "decision_trace.jsonl")
+    if not os.path.exists(trace_path):
+        return False
+    terminal_state = None
+    terminal_flag = False
+    try:
+        with open(trace_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if entry.get("terminal") is True:
+                    terminal_flag = True
+                    info = entry.get("info") or {}
+                    if isinstance(info, dict):
+                        terminal_state = info.get("state")
+    except Exception:
+        return False
+    if not terminal_flag:
+        return False
+    if not terminal_state:
+        return False
+    return str(terminal_state).upper() == "WIN"
+
+
+def _is_game_played(outdir: Optional[str]) -> bool:
+    if not outdir:
+        return False
+    trace_path = os.path.join(outdir, "decision_trace.jsonl")
+    if not os.path.exists(trace_path):
+        return False
+    terminal_state = None
+    terminal_flag = False
+    try:
+        with open(trace_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if entry.get("terminal") is True:
+                    terminal_flag = True
+                    info = entry.get("info") or {}
+                    if isinstance(info, dict):
+                        terminal_state = info.get("state")
+    except Exception:
+        return False
+    if not terminal_flag:
+        return False
+    if not terminal_state:
+        return False
+    return str(terminal_state).upper() in {"WIN", "GAME_OVER"}
+
+
 def _run_job(args: Tuple[str, int, Dict[str, Any]]) -> Dict[str, Any]:
     game_id, seed, job_cfg = args
     _prepare_paths()
@@ -53,6 +117,7 @@ def _run_job(args: Tuple[str, int, Dict[str, Any]]) -> Dict[str, Any]:
     op_mode = job_cfg["op_mode"]
     max_steps = job_cfg["max_steps"]
     probe_steps = job_cfg["probe_steps"]
+    snapshot_every_steps = int(job_cfg.get("snapshot_every_steps", 0))
     debug = bool(job_cfg.get("debug", False))
     run_id = f"{game_id}_{seed}"
     outdir = _job_dir(base_outdir, game_id, seed)
@@ -75,6 +140,9 @@ def _run_job(args: Tuple[str, int, Dict[str, Any]]) -> Dict[str, Any]:
         max_steps_total=max_steps,
         probe_steps=probe_steps,
         exploit_steps=max(0, max_steps - probe_steps),
+        snapshot_every_steps=snapshot_every_steps,
+        fp_save_mode=str(job_cfg.get("fp_save_mode", "buffer")),
+        probe_steps_max=probe_steps,
         debug=debug,
     )
 
@@ -95,12 +163,15 @@ def _run_job(args: Tuple[str, int, Dict[str, Any]]) -> Dict[str, Any]:
         _write_json(action_schema_path, blackboard.action_schema)
 
         if os.path.exists(trace_path):
-            summarize_trajectory(
-                planner_trace=trace_path,
-                outdir=outdir,
-                action_schema=blackboard.action_schema,
-                ctx={"game_id": game_id, "seed": seed, "run_id": blackboard.run_id},
-            )
+            run_v1_path = os.path.join(outdir, "run_summary_v1.json")
+            if not os.path.exists(run_v1_path):
+                summarize_trajectory(
+                    planner_trace=trace_path,
+                    fp_dir=outdir,
+                    outdir=outdir,
+                    action_schema=blackboard.action_schema,
+                    ctx={"game_id": game_id, "seed": seed, "run_id": blackboard.run_id},
+                )
     except Exception as exc:
         exit_reason = "error"
         error_msg = str(exc)
@@ -142,8 +213,20 @@ def main() -> int:
     parser.add_argument("--workers", type=int, required=True, help="Worker process count")
     parser.add_argument("--max-steps", type=int, default=1000, help="Max steps per run")
     parser.add_argument("--probe-steps", type=int, default=900, help="Probe steps per run")
+    parser.add_argument(
+        "--snapshot-every-steps",
+        type=int,
+        default=0,
+        help="Write blackboard snapshot every N steps (default: 0 = disabled)",
+    )
     parser.add_argument("--debug", action="store_true", help="Enable detailed audit logging")
     parser.add_argument("--op-mode", choices=["offline", "online"], default="offline")
+    parser.add_argument(
+        "--fp-save-mode",
+        choices=["buffer", "files"],
+        default="buffer",
+        help="FP report persistence mode: buffer writes fp_steps.jsonl at end; files writes per-step files",
+    )
     parser.add_argument(
         "--outdir",
         default="/home/zodrak/zod/runs/swarm_parallel",
@@ -182,8 +265,10 @@ def main() -> int:
         "config": {
             "max_steps": args.max_steps,
             "probe_steps": args.probe_steps,
+            "snapshot_every_steps": args.snapshot_every_steps,
             "op_mode": args.op_mode,
             "debug": args.debug,
+            "fp_save_mode": args.fp_save_mode,
         },
     }
     _write_json(os.path.join(batch_outdir, "batch_meta.json"), batch_meta)
@@ -201,7 +286,9 @@ def main() -> int:
                         "op_mode": args.op_mode,
                         "max_steps": args.max_steps,
                         "probe_steps": args.probe_steps,
+                        "snapshot_every_steps": args.snapshot_every_steps,
                         "debug": args.debug,
+                        "fp_save_mode": args.fp_save_mode,
                     },
                 )
             )
@@ -225,6 +312,8 @@ def main() -> int:
         "total_runs": len(results),
         "ok": sum(1 for r in results if r.get("ok")),
         "failed": sum(1 for r in results if not r.get("ok")),
+        "games_played": sum(1 for r in results if _is_game_played(r.get("outdir"))),
+        "wins": sum(1 for r in results if _is_win(r.get("outdir"))),
     }
     _write_json(os.path.join(batch_outdir, "aggregate_stats.json"), stats)
     return 0

@@ -277,4 +277,15 @@ If goal type inferred, reweight deterministically:
 Concrete defaults needed to avoid assumptions:
 
 Implement a deterministic priority list for which metadata keys to treat as canonical if the environment provides multiple (e.g., `reward` vs `score`, `done` vs `terminal`).
+Goal_Detector must query Memory for progress baselines and stall/loop priors:
+
+typical reward/terminal progression patterns (if present in environment)
+
+historical “stagnation signatures”: high no-op rate, repeated self-loops, flat board-signal deltas
+
+nearest-neighbor run features (optional) to decide which progress metrics are meaningful
+
+Goal_Detector should output a deterministic stop_condition_predicates list and a stall_risk estimate that can drive orchestrator phase switching or “request discriminating tests” behavior. 
+
+The goal detector must consume memory only to bias which goal signals to monitor (e.g., counters vs board completion vs object disappearance) for the current signature, and to provide a stable default when reward is sparse. It must output a deterministic progress_signal definition (what is measured) plus time-series summaries (monotone counter changes, terminal flags, completion metrics) in canonical form so memory can learn which progress proxies correlated with wins across runs for similar signatures.
 

@@ -18,6 +18,7 @@ from .full_explorer_types import (
     FrontierEntry,
     TransitionNode,
 )
+from .memory import memory_view
 from .full_transition_graph import FullTransitionGraphStore
 from .fp_analyst import FPAnalyst
 from .grid_utils import bbox_area, grid_from_ascii, grid_hash
@@ -308,6 +309,7 @@ def choose_action(
         )
         candidates_before = _frontier_actions(raw)
         frontier_state.state_frontier[current_state] = frontier
+    _apply_memory_ordering(frontier_state, current_state, blackboard, cfg)
 
     candidate = _pop_coord_candidate(frontier_state, current_state, cfg)
     if candidate is None:
@@ -408,13 +410,66 @@ def build_frontier_report(
         "state_frontier_states": len(frontier_state.state_frontier),
         "reason": "stepwise_frontier_only",
     } if debug else {}
+    coord_proposals = _coord_proposals_from_fp(fp_current, cfg)
     return {
         "run_summary": {"steps_executed": getattr(blackboard, "step_idx", 0)},
         "coord_action_effect_model": coord_action_effect_model,
+        "coord_action_effect_model_source": "computed",
+        "memory_coord_priors": _memory_coord_priors(blackboard),
+        "coord_proposals": coord_proposals,
         "frontier": frontier_entries,
         "coord_actions_supported": True,
+        "memory_used": _memory_report_summary(blackboard),
         "diagnostics": diagnostics,
     }
+
+
+def _coord_proposals_from_fp(fp_current: Any, cfg: FullExplorerConfig) -> List[Dict[str, Any]]:
+    if fp_current is None:
+        return []
+    if isinstance(fp_current, dict):
+        state = fp_current.get("state_summary") or {}
+        grids = state.get("grid_summaries") or []
+        if not grids:
+            return []
+        grid_summary = grids[0]
+        bg_candidates = grid_summary.get("bg_candidates") or []
+        bg_color = bg_candidates[0][0] if bg_candidates else 0
+        viz = fp_current.get("viz_artifacts") or {}
+        ascii_grid = (viz.get("ascii_grid") or {}).get(grid_summary.get("name"))
+        if ascii_grid is None:
+            return []
+        grid_arr = _grid_from_ascii(ascii_grid)
+        diff = fp_current.get("diff_summary") or {}
+        diff_bbox = diff.get("changed_bbox")
+        candidates = select_build_coords(grid_arr, bg_color, diff_bbox, cfg)
+        return [
+            {
+                "x": cand.x,
+                "y": cand.y,
+                "tag": cand.selector,
+                "reason_short": cand.selector,
+                "source_grid_name": grid_summary.get("name"),
+            }
+            for cand in candidates[: cfg.max_coords_per_state]
+        ]
+    try:
+        candidates = build_coords(fp_current, cfg)
+    except Exception:
+        return []
+    if not fp_current.state_summary.grid_summaries:
+        return []
+    grid_name = fp_current.state_summary.grid_summaries[0].name
+    return [
+        {
+            "x": cand.x,
+            "y": cand.y,
+            "tag": cand.selector,
+            "reason_short": cand.selector,
+            "source_grid_name": grid_name,
+        }
+        for cand in candidates[: cfg.max_coords_per_state]
+    ]
 
 
 def _backfill_coord_trials(frontier_state: FullFrontierState, blackboard: Any, cfg: FullExplorerConfig) -> None:
@@ -658,6 +713,92 @@ def _record_action_selection(
         blackboard.action_selection_report = report
     elif isinstance(blackboard, dict):
         blackboard["action_selection_report"] = report
+
+
+def _apply_memory_ordering(
+    frontier_state: FullFrontierState,
+    state_hash: str,
+    blackboard: Any,
+    cfg: FullExplorerConfig,
+) -> None:
+    mem = getattr(blackboard, "memory", None)
+    if mem is None:
+        return
+    evidence = getattr(blackboard, "memory_evidence", None)
+    view = memory_view(mem, state_hash=state_hash, evidence=evidence)
+    noop_coords = view.get("coord_noop_rate_by_action", {})
+    effect_coords = view.get("coord_effect_score_by_action", {})
+    meta = getattr(blackboard, "memory_meta", None)
+    if meta is None and isinstance(blackboard, dict):
+        meta = blackboard.get("memory_meta")
+    threshold = 0.9
+    if isinstance(meta, dict):
+        threshold = float(meta.get("noop_rate_block_threshold", threshold))
+    candidates = frontier_state.state_frontier.get(state_hash)
+    if not candidates:
+        return
+    filtered = []
+    for cand in candidates:
+        coord_key = f"{cand.x},{cand.y}"
+        rate = noop_coords.get(cand.action_id, {}).get(coord_key, 0.0)
+        if rate >= threshold:
+            continue
+        filtered.append(cand)
+    if filtered:
+        candidates = filtered
+
+    def mem_key(cand: CoordActionCandidate) -> Tuple[Any, ...]:
+        coord_key = f"{cand.x},{cand.y}"
+        noop = noop_coords.get(cand.action_id, {}).get(coord_key, 0.0)
+        eff = effect_coords.get(cand.action_id, {}).get(coord_key, 0.0)
+        return (noop, -eff, cand.action_id, cand.y, cand.x)
+
+    candidates.sort(key=mem_key)
+    frontier_state.state_frontier[state_hash] = candidates
+
+
+def _memory_report_summary(blackboard: Any) -> Dict[str, Any]:
+    mem = getattr(blackboard, "memory", None)
+    if mem is None:
+        return {"used": False}
+    evidence = getattr(blackboard, "memory_evidence", None)
+    view = memory_view(mem, evidence=evidence)
+    return {
+        "used": True,
+        "coord_noop_rate_by_action": len(view.get("coord_noop_rate_by_action", {})),
+        "coord_effect_score_by_action": len(view.get("coord_effect_score_by_action", {})),
+    }
+
+
+def _memory_coord_priors(blackboard: Any) -> Dict[str, Any]:
+    mem = getattr(blackboard, "memory", None)
+    if mem is None:
+        return {"source": "memory", "top_effective": [], "top_noop": []}
+    evidence = getattr(blackboard, "memory_evidence", None)
+    view = memory_view(mem, evidence=evidence)
+    effect = view.get("coord_effect_score_by_action", {})
+    noop = view.get("coord_noop_rate_by_action", {})
+    top_effective: List[Tuple[float, str, str]] = []
+    top_noop: List[Tuple[float, str, str]] = []
+    for action_id, coords in effect.items():
+        for coord_key, score in coords.items():
+            top_effective.append((float(score), action_id, coord_key))
+    for action_id, coords in noop.items():
+        for coord_key, rate in coords.items():
+            top_noop.append((float(rate), action_id, coord_key))
+    top_effective.sort(key=lambda item: (-item[0], item[1], item[2]))
+    top_noop.sort(key=lambda item: (-item[0], item[1], item[2]))
+    return {
+        "source": "memory",
+        "top_effective": [
+            {"action_id": action_id, "coord": coord_key, "score": score}
+            for score, action_id, coord_key in top_effective[:5]
+        ],
+        "top_noop": [
+            {"action_id": action_id, "coord": coord_key, "noop_rate": rate}
+            for rate, action_id, coord_key in top_noop[:5]
+        ],
+    }
 
 
 def _build_frontier(

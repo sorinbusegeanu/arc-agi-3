@@ -273,3 +273,21 @@ ACTION4	Simple action - varies by game (semantically mapped to right)
 ACTION5	Simple action - varies by game (e.g., interact, select, rotate, attach/detach, execute, etc.)
 ACTION6	Complex action requiring x,y coordinates (0-63 range)
 ACTION7	Simple action - Undo (e.g., interact, select)
+
+
+
+Simple_Explorer — Memory integration
+
+Simple_Explorer must query Memory to avoid repeating known-noop actions and to prioritize underexplored actions when building/consuming its frontier. Memory is read-only for the explorer; it must not write. Required read signals:
+
+noop_rate_by_action (global and/or per-state)
+
+last_k_actions_per_state (to break self-loop floods)
+
+action_effect_signatures_by_action (to prefer actions that produce novel signatures)
+
+Selection rule should incorporate Memory as a deterministic tie-breaker / ordering input (not randomness), preserving the existing per-state frontier semantics described for orchestrator probe usage
+
+The simple explorer must consume blackboard.memory_evidence only to prioritize probes (e.g., actions historically informative/effectful for the current task_signature_v1) and to avoid repeated no-op loops known for this signature. It must record per-action effect statistics in a canonical format (action_effect_model deltas, no-op flags, loop signatures) and emit them as structured attempt events so memory can update signature-conditioned action priors across runs. It must not write to the persistent store directly.
+
+

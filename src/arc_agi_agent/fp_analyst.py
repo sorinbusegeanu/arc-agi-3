@@ -31,6 +31,7 @@ from .types import (
     StateSummary,
     VizArtifacts,
     DebugInfo,
+    FeaturesV1,
 )
 from .viz import (
     ascii_grid as render_ascii_grid,
@@ -43,6 +44,127 @@ from .viz import (
 )
 
 logger = get_logger(__name__)
+
+
+def _grid_fingerprint(state_summary: StateSummary) -> str:
+    if not state_summary.grid_summaries:
+        return ""
+    grid = state_summary.grid_summaries[0]
+    hist = grid.color_histogram or {}
+    parts = [f"{grid.width}x{grid.height}"]
+    parts.append(",".join(str(c) for c in grid.palette_sorted))
+    hist_items = sorted(((int(k), int(v)) for k, v in hist.items()), key=lambda kv: kv[0])
+    parts.append(",".join(f"{k}:{v}" for k, v in hist_items))
+    return "|".join(parts)
+
+
+def _features_v1(
+    norm: NormalizedObservation,
+    state_summary: StateSummary,
+    diff_summary: Optional[DiffSummary],
+) -> FeaturesV1:
+    grid_index: Dict[str, Any] = {}
+    primary_name = state_summary.grid_summaries[0].name if state_summary.grid_summaries else None
+    grids: List[Dict[str, Any]] = []
+    for grid_summary in state_summary.grid_summaries:
+        bg_color = grid_summary.bg_candidates[0][0] if grid_summary.bg_candidates else None
+        grids.append(
+            {
+                "name": grid_summary.name,
+                "height": grid_summary.height,
+                "width": grid_summary.width,
+                "palette_sorted": list(grid_summary.palette_sorted),
+                "bg_color": bg_color,
+                "bg_candidates_ranked": list(grid_summary.bg_candidates),
+            }
+        )
+    grid_index = {"primary_grid_name": primary_name, "grids": grids}
+
+    deltas: Dict[str, ObjectDelta] = {}
+    if diff_summary:
+        for delta in diff_summary.per_object_deltas:
+            deltas[delta.object_id] = delta
+    object_index: List[Dict[str, Any]] = []
+    for obj in state_summary.object_catalog:
+        delta = deltas.get(obj.id)
+        object_index.append(
+            {
+                "object_id": obj.id,
+                "grid_name": obj.grid_name,
+                "color": obj.color,
+                "bbox": obj.bbox,
+                "centroid": obj.centroid,
+                "area": obj.area,
+                "prev_object_id": None,
+                "dy": delta.dy if delta else None,
+                "dx": delta.dx if delta else None,
+            }
+        )
+
+    interaction_points: List[Dict[str, Any]] = []
+    for obj in state_summary.object_catalog:
+        cy, cx = obj.centroid
+        interaction_points.append(
+            {
+                "point": (int(round(cx)), int(round(cy))),
+                "tag": "centroid",
+                "source_grid_name": obj.grid_name,
+            }
+        )
+        y0, x0, y1, x1 = obj.bbox
+        for (x, y) in ((x0, y0), (x1, y0), (x0, y1), (x1, y1)):
+            interaction_points.append(
+                {
+                    "point": (int(x), int(y)),
+                    "tag": "bbox_corner",
+                    "source_grid_name": obj.grid_name,
+                }
+            )
+    if state_summary.grid_summaries:
+        grid = state_summary.grid_summaries[0]
+        corners = [(0, 0), (grid.width - 1, 0), (0, grid.height - 1), (grid.width - 1, grid.height - 1)]
+        for x, y in corners:
+            interaction_points.append({"point": (x, y), "tag": "corner", "source_grid_name": grid.name})
+        edges = [
+            (grid.width // 2, 0),
+            (grid.width // 2, grid.height - 1),
+            (0, grid.height // 2),
+            (grid.width - 1, grid.height // 2),
+        ]
+        for x, y in edges:
+            interaction_points.append({"point": (x, y), "tag": "edge", "source_grid_name": grid.name})
+    if diff_summary and diff_summary.changed_bbox:
+        y0, x0, y1, x1 = diff_summary.changed_bbox
+        cx = int((x0 + x1) / 2)
+        cy = int((y0 + y1) / 2)
+        grid_name = primary_name
+        interaction_points.append(
+            {"point": (cx, cy), "tag": "changed_bbox_focus", "source_grid_name": grid_name}
+        )
+    seen = set()
+    ordered_points = []
+    for entry in interaction_points:
+        key = (entry["point"], entry["tag"], entry.get("source_grid_name"))
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered_points.append(entry)
+
+    meta = norm.meta or {}
+    available_actions = meta.get("available_actions")
+    available_actions_sorted = sorted(str(a) for a in available_actions) if isinstance(available_actions, list) else []
+    meta_features = {
+        "available_actions_sorted": available_actions_sorted,
+        "terminal": meta.get("terminal"),
+        "reward": meta.get("reward"),
+        "recognized_meta_keys_sorted": sorted(str(k) for k in meta.keys()),
+    }
+    return FeaturesV1(
+        grid_index=grid_index,
+        object_index=object_index,
+        interaction_points=ordered_points,
+        meta_features=meta_features,
+    )
 
 
 class FPAnalyst:
@@ -79,10 +201,14 @@ class FPAnalyst:
                 ),
                 diff_summary=None,
                 viz_artifacts=VizArtifacts(ascii_grid={}, overlay_grids={}),
+                features_v1=None,
                 debug=DebugInfo(
                     schema_warnings=schema_warnings,
                     timings_ms=timings,
                     grid_hash="",
+                    grid_fingerprint="",
+                    state_summary_version="v1",
+                    diff_schema_version="v1",
                 ),
             )
             return report
@@ -111,10 +237,14 @@ class FPAnalyst:
             state_summary=state_summary,
             diff_summary=diff_summary,
             viz_artifacts=viz,
+            features_v1=_features_v1(norm, state_summary, diff_summary),
             debug=DebugInfo(
                 schema_warnings=schema_warnings,
                 timings_ms=timings,
                 grid_hash=grid_hash_value,
+                grid_fingerprint=_grid_fingerprint(state_summary),
+                state_summary_version="v1",
+                diff_schema_version="v1",
             ),
         )
         return report
@@ -365,7 +495,7 @@ def _infer_events(
 ) -> List[EventSignature]:
     events: List[EventSignature] = []
     if total_changed == 0:
-        return events
+        return [EventSignature(kind="noop", confidence=1.0, details={})]
 
     moved = [d for d in deltas if d.event == "moved"]
     appeared = [d for d in deltas if d.event == "appeared"]
@@ -398,4 +528,6 @@ def _infer_events(
         if vertical_moves and len(vertical_moves) / len(moved) > 0.6:
             events.append(EventSignature(kind="gravity", confidence=0.3, details={"vertical_moves": len(vertical_moves)}))
 
+    if not events:
+        events.append(EventSignature(kind="unknown", confidence=0.1, details={}))
     return events

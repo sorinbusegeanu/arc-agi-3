@@ -291,4 +291,10 @@ Each agent must have:
 Concrete defaults needed to avoid assumptions:
 
 Swarm_Orchestrator is inherently online because it coordinates real-time interaction.
+Swarm_Orchestrator must own the Memory lifecycle as part of the blackboard contract: initialize a run-scoped Memory view, pass it (or a handle) to all agents consistently, and apply Memory updates at well-defined points in the step loop (e.g., post-step after FP_Analyst diff is known; end-of-run after summarization). Memory must be treated as shared state alongside simple_explorer/full_explorer/rule_proposer/mechanic_classifier/goal_detector/planner outputs on the blackboard, with explicit “computed_at_step” and provenance rules
 
+Swarm Orchestrator (meta-agent) — Memory integration (cross-run)
+
+The orchestrator is the single entry/exit point for cross-run memory. At the start of each game, it must compute task_signature_v1 (and game_id) and call memory_query(...), then attach the returned MemoryEvidence to the shared blackboard as blackboard.memory_evidence (and optionally blackboard.memory_game = memory_query_game(game_id)). During the run, it must ensure all agent modules read memory only from the blackboard (no direct store access). At the end of the game and end of the run, it must persist a compact, canonical summary by calling memory_record_attempt(...) / memory_record_outcome(...) and then flushing aggregates atomically to the persistent store. If arbitration/budgeting exists, it must incorporate memory_evidence.calibration to adjust per-agent step budgets deterministically.
+
+The orchestrator must be the only module that reads/writes the persistent store. At each game start it computes signatures and calls memory_query(...), then attaches returned memory_evidence onto the blackboard for all agents. During play it collects structured events from agents (attempts, outcomes, hypothesis/test usage, progress signal deltas). At end-of-game and end-of-run it calls memory merge/flush once (atomic + locked), applying the deterministic merge rules, and optionally updates per-agent calibration stats used for future budget allocation and arbitration.

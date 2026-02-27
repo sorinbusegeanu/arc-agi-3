@@ -1,0 +1,165 @@
+Impacted agents (what changes, at spec level)
+Rule_Proposer (04)
+
+Still generates initial hypotheses[], but must additionally provide program_v1 + params stubs compatible with Executable_Hypothesis_Engine seeding.
+
+Existing tests[] remain allowed, but are now optional; Test Selector becomes the canonical source of arbitration probes. 
+
+04_Rule_Proposer
+
+FP_Analyst (01)
+
+Must guarantee the fields needed to compile TRANSITION_EVENT_V1 deterministically (hashes, signature histograms, delta metrics, meta extraction). 
+
+02_Simple_Explorer
+
+Full_Explorer (03)
+
+No behavioral change required.
+
+Must expose its coordinate proposal list in a reusable, stable format so Test Selector can consume it as an optional input. 
+
+00_agent_catalogue
+
+Planner / Controller (07)
+
+Add a scoring term info_gain_score sourced from Test Selector outputs (disagreement/elimination), instead of relying only on static proposer tests.
+
+Swarm_Orchestrator (09)
+
+When conflicts are open (or during probe phase), request select_test(...) and queue/execute that probe as the resolution test.
+
+Store TransitionEvents per step in the canonical trace so Hypothesis Engine updates are reproducible.
+
+Addendum specs needed to close Gap 3 (impacted agents)
+A) FP_Analyst (01) addendum
+A1) Add features_v1 block (versioned)
+
+FP_Analyst must emit a stable FEATURES_V1 struct consumed by:
+
+Executable_Hypothesis_Engine
+
+Mechanic_Synthesizer
+
+Discriminating_Test_Selector
+
+FEATURES_V1 must include (all deterministic):
+
+grid_index:
+
+primary_grid_name
+
+per-grid: H,W, palette_sorted, bg_color (single chosen), bg_candidates_ranked
+
+object_index:
+
+per object: object_id, grid_name, color, bbox, centroid, area
+
+optional tracking fields: prev_object_id, dy,dx
+
+interaction_points (ordered list of candidate points):
+
+point: (x,y)
+
+tag: "centroid"|"bbox_corner"|"edge"|"corner"|"changed_bbox_focus"|"boundary_frontier"|...
+
+source_grid_name
+
+meta_features:
+
+available_actions_sorted
+
+pass-through of terminal/reward if present
+
+recognized_meta_keys_sorted
+
+A2) Event signature ID namespace must be frozen
+
+FP_Analyst’s event_signatures must only output from a fixed enum set:
+translation, paint, toggle, gravity, spawn, despawn, swap, noop, unknown
+(If FP_Analyst currently has more, they must map into this set deterministically.)
+
+B) Swarm_Orchestrator (09) addendum
+B1) New “Gap3 loop” wiring (must be explicit)
+
+Orchestrator must call in this order per step (after receiving env observation):
+
+FP_Analyst analyze prev/curr
+
+TransitionEvent_Compiler compile event
+
+Executable_Hypothesis_Engine update confidence with compiled events
+
+If synthesis triggers (policy below), call Mechanic_Synthesizer and merge candidates into engine, then re-score
+
+If in probe phase OR conflict open, call Discriminating_Test_Selector to choose next action; else use Planner
+
+B2) Probe vs exploit policy (deterministic)
+
+Add config:
+
+probe_steps_max (e.g., 12)
+
+probe_every_k (optional)
+
+conflict_open_threshold (e.g., top2 Δ < 0.05 for 4 steps)
+Rules:
+
+During step_idx < probe_steps_max, prefer TestSelector unless:
+
+already terminal
+
+no actions available
+
+After probe, use Planner unless conflict_open is true.
+
+B3) Trace persistence
+
+Orchestrator must store:
+
+TransitionEventV1 per step
+
+hypotheses ranked list per step (ids + confidence + falsified)
+
+selected test action rationale (disagreement components)
+
+C) Planner_Controller (07) addendum
+C1) Add info_gain scoring channel
+
+Planner scoring must accept an optional test_selector_suggestion:
+
+suggested_action_key
+
+disagreement_score, elimination_score
+Planner uses this only when in probe mode or conflict open:
+
+either hard-pick suggestion
+
+or add w_info_gain * disagreement_score to its normal score
+
+Weights must be explicit in config and logged.
+
+D) Full_Explorer (03) addendum
+D1) Export coordinate proposals in reusable format
+
+Full_Explorer must output:
+
+coord_proposals[] as ordered list:
+
+(x,y)
+
+tag
+
+reason_short
+
+source_grid_name
+This must be deterministic and bounded (topK) so TestSelector can reuse it.
+
+E) Rule_Proposer (04) addendum
+E1) Demote “static tests” to optional
+
+Rule_Proposer remains a seeding agent only:
+
+emits initial hypothesis templates as executable program stubs when possible
+
+otherwise emits descriptive hypotheses with program_v1 = null (engine keeps them as non-executable until synthesizer replaces them)

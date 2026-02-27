@@ -30,6 +30,18 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=0, help="Seed")
     parser.add_argument("--max-steps", type=int, default=40, help="Max steps total")
     parser.add_argument("--probe-steps", type=int, default=10, help="Probe steps budget")
+    parser.add_argument(
+        "--snapshot-every-steps",
+        type=int,
+        default=0,
+        help="Write blackboard snapshot every N steps (default: 0 = disabled)",
+    )
+    parser.add_argument(
+        "--fp-save-mode",
+        choices=["buffer", "files"],
+        default="buffer",
+        help="FP report persistence mode: buffer writes fp_steps.jsonl at end; files writes per-step files",
+    )
     parser.add_argument("--outdir", required=True, help="Output directory")
     parser.add_argument("--debug", action="store_true", help="Enable detailed audit logging")
     parser.add_argument(
@@ -64,6 +76,9 @@ def main() -> int:
         max_steps_total=args.max_steps,
         probe_steps=args.probe_steps,
         exploit_steps=max(0, args.max_steps - args.probe_steps),
+        snapshot_every_steps=args.snapshot_every_steps,
+        probe_steps_max=args.probe_steps,
+        fp_save_mode=args.fp_save_mode,
         debug=args.debug,
     )
     agents = build_default_agents()
