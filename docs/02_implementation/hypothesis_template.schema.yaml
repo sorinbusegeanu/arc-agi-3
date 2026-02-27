@@ -1,0 +1,303 @@
+
+schema_version: "1.0"
+title: "RuleProposer HypothesisTemplate Schema"
+type: object
+additionalProperties: false
+required:
+
+* hypothesis_id
+* name
+* requires
+* trigger_features
+* scoring_function
+* predictions_builder
+* tests_builder
+  properties:
+  hypothesis_id:
+  type: string
+  minLength: 1
+  description: "Unique stable key, e.g. 'push.sokoban_like'"
+  name:
+  type: string
+  minLength: 1
+  description: "Human label"
+  requires:
+  type: object
+  additionalProperties: false
+  required:
+
+  * needs_object_tracking
+  * needs_coord_actions
+  * needs_simple_actions
+  * needs_reward_signal
+    properties:
+    needs_object_tracking: { type: boolean }
+    needs_coord_actions: { type: boolean }
+    needs_simple_actions: { type: boolean }
+    needs_reward_signal: { type: boolean }
+    trigger_features:
+    type: array
+    minItems: 0
+    items:
+    $ref: "#/definitions/FeaturePredicate"
+    scoring_function:
+    $ref: "#/definitions/ScoreSpec"
+    predictions_builder:
+    $ref: "#/definitions/PredictionsBuilderSpec"
+    tests_builder:
+    $ref: "#/definitions/TestsBuilderSpec"
+    tags:
+    type: array
+    items: { type: string }
+    priority:
+    type: integer
+    description: "Tie-breaker; higher wins"
+    notes:
+    type: string
+    description: "Dev-only, not emitted"
+
+definitions:
+FeaturePredicate:
+type: object
+additionalProperties: false
+required: [feature_key, op, value]
+properties:
+feature_key:
+type: string
+minLength: 1
+description: "Canonical feature namespace key (string)"
+op:
+type: string
+enum:
+- ">="
+- ">"
+- "<="
+- "<"
+- "=="
+- "!="
+- "in"
+- "not_in"
+- "exists"
+- "not_exists"
+- "ratio>="
+- "ratio<="
+value:
+description: "Comparison value"
+oneOf:
+- { type: number }
+- { type: integer }
+- { type: string }
+- { type: boolean }
+- { type: array, items: { oneOf: [{ type: number }, { type: integer }, { type: string }, { type: boolean }] } }
+- { type: object }
+scope:
+type: string
+enum: [global, per_action, per_object]
+description: "Optional evaluation scope"
+action_id:
+description: "Optional action selector for per_action scope"
+oneOf:
+- { type: integer }
+- { type: string }
+object_id:
+description: "Optional object selector for per_object scope"
+oneOf:
+- { type: integer }
+- { type: string }
+
+ScoreSpec:
+type: object
+additionalProperties: false
+required: [terms, penalties, clamp]
+properties:
+terms:
+type: array
+minItems: 0
+items: { $ref: "#/definitions/ScoreTerm" }
+penalties:
+type: array
+minItems: 0
+items: { $ref: "#/definitions/ScoreTerm" }
+clamp:
+type: boolean
+description: "If true, clamp final confidence to [0,1]"
+
+ScoreTerm:
+type: object
+additionalProperties: false
+required: [weight, feature_ref, transform]
+properties:
+weight:
+type: number
+description: "Positive or negative contribution weight"
+feature_ref:
+type: string
+minLength: 1
+description: "Feature key reference used in scoring"
+transform:
+type: string
+enum:
+- identity
+- clamp01
+- minmax
+- piecewise
+- logit
+- sigmoid
+- step
+description: "Deterministic transform applied to feature value"
+gate:
+$ref: "#/definitions/FeaturePredicate"
+params:
+type: object
+description: "Optional transform parameters (e.g., min/max, piecewise breakpoints)"
+
+PredictionsBuilderSpec:
+type: object
+additionalProperties: false
+required: [prediction_templates]
+properties:
+prediction_templates:
+type: array
+minItems: 0
+items: { $ref: "#/definitions/PredictionTemplate" }
+
+PredictionTemplate:
+type: object
+additionalProperties: false
+required: [prediction_id, text, expected_signatures, expected_metrics]
+properties:
+prediction_id:
+type: string
+minLength: 1
+text:
+type: string
+minLength: 1
+description: "Deterministic text template (no free-form generation)"
+expected_signatures:
+type: array
+items: { type: string }
+expected_metrics:
+type: object
+description: "Bounds/constraints on diff metrics (deterministic rules)"
+feature_refs:
+type: array
+items: { type: string }
+description: "Optional list of features referenced by this prediction"
+
+TestsBuilderSpec:
+type: object
+additionalProperties: false
+required: [test_templates]
+properties:
+test_templates:
+type: array
+minItems: 0
+items: { $ref: "#/definitions/TestTemplate" }
+
+TestTemplate:
+type: object
+additionalProperties: false
+required:
+- test_id
+- selector
+- action_family
+- sequence_len
+- expected_signatures
+- pass_criteria
+- fail_criteria
+- supports
+- refutes
+properties:
+test_id:
+type: string
+minLength: 1
+purpose:
+type: string
+selector:
+type: string
+description: "Coordinate selector strategy (even if no coords, set to 'none')"
+action_family:
+description: "Action id/name or a family label"
+oneOf:
+- { type: integer }
+- { type: string }
+- { type: array, items: { oneOf: [{ type: integer }, { type: string }] } }
+sequence_len:
+type: integer
+minimum: 1
+maximum: 3
+expected_signatures:
+type: array
+items: { type: string }
+pass_criteria:
+$ref: "#/definitions/CriteriaSpec"
+fail_criteria:
+$ref: "#/definitions/CriteriaSpec"
+supports:
+type: array
+items: { type: string }
+refutes:
+type: array
+items: { type: string }
+coord_policy:
+$ref: "#/definitions/CoordPolicy"
+max_generated_tests:
+type: integer
+minimum: 1
+maximum: 5
+description: "Cap for expansions from selector (default handled by Rule_Proposer)"
+
+CriteriaSpec:
+type: object
+additionalProperties: true
+description: "Deterministic boolean rules over diff_summary/event_signatures (implementation-defined keys)"
+properties:
+required_event_signatures:
+type: array
+items: { type: string }
+forbidden_event_signatures:
+type: array
+items: { type: string }
+metrics:
+type: object
+description: "Metric bounds"
+additionalProperties: false
+properties:
+changed_cells:
+$ref: "#/definitions/Range"
+changed_bbox_area:
+$ref: "#/definitions/Range"
+palette_added:
+$ref: "#/definitions/Range"
+palette_removed:
+$ref: "#/definitions/Range"
+object_count_delta:
+$ref: "#/definitions/Range"
+dy_mode:
+$ref: "#/definitions/Range"
+dx_mode:
+$ref: "#/definitions/Range"
+
+Range:
+type: object
+additionalProperties: false
+properties:
+min: { type: number }
+max: { type: number }
+
+CoordPolicy:
+type: object
+additionalProperties: false
+properties:
+needs_coord:
+type: boolean
+coord_source_priority:
+type: array
+items: { type: string }
+description: "e.g., ['hotspot','object_centroid','diff_bbox_center']"
+top_k_coords:
+type: integer
+minimum: 1
+fallback_to_noncoord:
+type: boolean
+

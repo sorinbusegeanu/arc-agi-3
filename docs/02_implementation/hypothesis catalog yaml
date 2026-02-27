@@ -1,0 +1,825 @@
+schema_version: "1.0"
+catalog_version: "v0"
+hypotheses:
+
+* hypothesis_id: "unknown.mechanic"
+  name: "Unknown mechanic"
+  requires:
+  needs_object_tracking: false
+  needs_coord_actions: false
+  needs_simple_actions: false
+  needs_reward_signal: false
+  trigger_features: []
+  scoring_function:
+  terms:
+  - weight: 0.5
+  feature_ref: "global.constant.one"
+  transform: "identity"
+  penalties: []
+  clamp: true
+  predictions_builder:
+  prediction_templates:
+  - prediction_id: "unknown.p0"
+  text: "Mechanic is unknown; run broad probes to gather discriminating evidence."
+  expected_signatures: []
+  expected_metrics: {}
+  feature_refs: []
+  tests_builder:
+  test_templates:
+  - test_id: "unknown.t0.simple_probe"
+  purpose: "Broad simple-action probe."
+  selector: "none"
+  action_family: "simple:any_top2"
+  sequence_len: 1
+  expected_signatures: []
+  pass_criteria:
+  metrics: {}
+  fail_criteria:
+  metrics: {}
+  supports: ["unknown.mechanic"]
+  refutes: []
+  coord_policy:
+  needs_coord: false
+  fallback_to_noncoord: true
+  - test_id: "unknown.t1.coord_hotspot"
+  purpose: "Broad coord probe at best-known hotspot (if available)."
+  selector: "hotspot"
+  action_family: "coord:any_top1"
+  sequence_len: 1
+  expected_signatures: []
+  pass_criteria:
+  metrics: {}
+  fail_criteria:
+  metrics: {}
+  supports: ["unknown.mechanic"]
+  refutes: []
+  coord_policy:
+  needs_coord: true
+  coord_source_priority: ["hotspot", "object_centroid", "grid_corner"]
+  top_k_coords: 1
+  fallback_to_noncoord: true
+
+* hypothesis_id: "move.avatar_4dir"
+  name: "Avatar-like movement (4-direction)"
+  requires:
+  needs_object_tracking: true
+  needs_coord_actions: false
+  needs_simple_actions: true
+  needs_reward_signal: false
+  trigger_features:
+
+  * feature_key: "global.simple_actions.available"
+    op: "=="
+    value: true
+  * feature_key: "global.event_sig.translation.rate"
+    op: ">="
+    value: 0.35
+  * feature_key: "global.motion.axis_aligned.rate"
+    op: ">="
+    value: 0.70
+    scoring_function:
+    terms:
+
+    * weight: 0.55
+      feature_ref: "global.event_sig.translation.rate"
+      transform: "clamp01"
+    * weight: 0.35
+      feature_ref: "global.motion.axis_aligned.rate"
+      transform: "clamp01"
+    * weight: 0.15
+      feature_ref: "global.object_tracking.persist.rate"
+      transform: "clamp01"
+      penalties:
+    * weight: 0.20
+      feature_ref: "global.event_sig.paint_growth.rate"
+      transform: "clamp01"
+    * weight: 0.15
+      feature_ref: "global.event_sig.toggle_flip.rate"
+      transform: "clamp01"
+      clamp: true
+      predictions_builder:
+      prediction_templates:
+    * prediction_id: "move4.p0"
+      text: "A dominant object translates under simple actions with mostly axis-aligned motion; blocking yields no-op."
+      expected_signatures: ["translation", "blocked_noop"]
+      expected_metrics:
+      changed_cells: { min: 1 }
+      feature_refs:
+
+      * "global.event_sig.translation.rate"
+      * "global.motion.axis_aligned.rate"
+        tests_builder:
+        test_templates:
+    * test_id: "move4.t0.try_all_simple_once"
+      purpose: "Identify which simple actions induce translation."
+      selector: "none"
+      action_family: "simple:all"
+      sequence_len: 1
+      expected_signatures: ["translation"]
+      pass_criteria:
+      required_event_signatures: ["translation"]
+      fail_criteria:
+      forbidden_event_signatures: ["paint_growth"]
+      supports: ["move.avatar_4dir"]
+      refutes: ["paint.fill_connected_until_boundary", "toggle.cell_state"]
+    * test_id: "move4.t1.repeat_best_translation"
+      purpose: "Check consistency of direction and blocking behavior."
+      selector: "none"
+      action_family: "simple:best_translation"
+      sequence_len: 2
+      expected_signatures: ["translation", "blocked_noop"]
+      pass_criteria:
+      metrics:
+      changed_cells: { min: 1 }
+      fail_criteria:
+      required_event_signatures: ["teleport_jump"]
+      supports: ["move.avatar_4dir"]
+      refutes: ["teleport.portal"]
+
+* hypothesis_id: "move.avatar_8dir"
+  name: "Avatar-like movement (8-direction)"
+  requires:
+  needs_object_tracking: true
+  needs_coord_actions: false
+  needs_simple_actions: true
+  needs_reward_signal: false
+  trigger_features:
+
+  * feature_key: "global.simple_actions.available"
+    op: "=="
+    value: true
+  * feature_key: "global.event_sig.translation.rate"
+    op: ">="
+    value: 0.30
+  * feature_key: "global.motion.diagonal.rate"
+    op: ">="
+    value: 0.20
+    scoring_function:
+    terms:
+
+    * weight: 0.45
+      feature_ref: "global.event_sig.translation.rate"
+      transform: "clamp01"
+    * weight: 0.45
+      feature_ref: "global.motion.diagonal.rate"
+      transform: "clamp01"
+      penalties:
+    * weight: 0.20
+      feature_ref: "global.event_sig.paint_growth.rate"
+      transform: "clamp01"
+      clamp: true
+      predictions_builder:
+      prediction_templates:
+    * prediction_id: "move8.p0"
+      text: "Some simple actions induce diagonal translation in addition to axis-aligned movement."
+      expected_signatures: ["translation"]
+      expected_metrics: {}
+      feature_refs:
+
+      * "global.motion.diagonal.rate"
+        tests_builder:
+        test_templates:
+    * test_id: "move8.t0.find_diagonal_action"
+      purpose: "Confirm diagonal translation exists among simple actions."
+      selector: "none"
+      action_family: "simple:all"
+      sequence_len: 1
+      expected_signatures: ["translation"]
+      pass_criteria:
+      metrics:
+      dx_mode: { min: 1 }
+      dy_mode: { min: 1 }
+      fail_criteria:
+      forbidden_event_signatures: ["toggle_flip", "paint_growth"]
+      supports: ["move.avatar_8dir"]
+      refutes: ["toggle.cell_state", "paint.fill_connected_until_boundary"]
+
+* hypothesis_id: "push.sokoban_like"
+  name: "Sokoban-like push"
+  requires:
+  needs_object_tracking: true
+  needs_coord_actions: false
+  needs_simple_actions: true
+  needs_reward_signal: false
+  trigger_features:
+
+  * feature_key: "global.event_sig.translation.rate"
+    op: ">="
+    value: 0.25
+  * feature_key: "global.coupled_translation.rate"
+    op: ">="
+    value: 0.12
+  * feature_key: "global.blocked_noop.when_adjacent.rate"
+    op: ">="
+    value: 0.10
+    scoring_function:
+    terms:
+
+    * weight: 0.50
+      feature_ref: "global.coupled_translation.rate"
+      transform: "clamp01"
+    * weight: 0.25
+      feature_ref: "global.blocked_noop.when_adjacent.rate"
+      transform: "clamp01"
+    * weight: 0.20
+      feature_ref: "global.event_sig.translation.rate"
+      transform: "clamp01"
+      penalties:
+    * weight: 0.25
+      feature_ref: "global.event_sig.teleport_jump.rate"
+      transform: "clamp01"
+    * weight: 0.15
+      feature_ref: "global.event_sig.paint_growth.rate"
+      transform: "clamp01"
+      clamp: true
+      predictions_builder:
+      prediction_templates:
+    * prediction_id: "push.p0"
+      text: "Moving into an adjacent object can push it; if blocked, movement becomes a no-op."
+      expected_signatures: ["translation", "blocked_noop"]
+      expected_metrics:
+      object_count_delta: { min: -1, max: 1 }
+      feature_refs:
+
+      * "global.coupled_translation.rate"
+      * "global.blocked_noop.when_adjacent.rate"
+        tests_builder:
+        test_templates:
+    * test_id: "push.t0.bump_nearest_object"
+      purpose: "Differentiate push vs pure movement."
+      selector: "adjacent_to_nearest_object"
+      action_family: "simple:best_translation_toward_object"
+      sequence_len: 1
+      expected_signatures: ["translation", "blocked_noop"]
+      pass_criteria:
+      required_event_signatures: ["translation"]
+      fail_criteria:
+      required_event_signatures: ["toggle_flip"]
+      supports: ["push.sokoban_like"]
+      refutes: ["toggle.cell_state"]
+    * test_id: "push.t1_repeat_bump"
+      purpose: "Check repeatability and blocking at boundaries."
+      selector: "adjacent_to_nearest_object"
+      action_family: "simple:best_translation_toward_object"
+      sequence_len: 2
+      expected_signatures: ["translation", "blocked_noop"]
+      pass_criteria:
+      metrics:
+      changed_cells: { min: 1 }
+      fail_criteria:
+      required_event_signatures: ["teleport_jump"]
+      supports: ["push.sokoban_like"]
+      refutes: ["teleport.portal"]
+
+* hypothesis_id: "paint.fill_connected_until_boundary"
+  name: "Fill connected region until boundary"
+  requires:
+  needs_object_tracking: false
+  needs_coord_actions: true
+  needs_simple_actions: false
+  needs_reward_signal: false
+  trigger_features:
+
+  * feature_key: "global.coord_actions.available"
+    op: "=="
+    value: true
+  * feature_key: "global.event_sig.fill_connected.rate"
+    op: ">="
+    value: 0.18
+    scoring_function:
+    terms:
+
+    * weight: 0.70
+      feature_ref: "global.event_sig.fill_connected.rate"
+      transform: "clamp01"
+    * weight: 0.20
+      feature_ref: "global.connectivity.preserved.rate"
+      transform: "clamp01"
+      penalties:
+    * weight: 0.20
+      feature_ref: "global.event_sig.toggle_flip.rate"
+      transform: "clamp01"
+      clamp: true
+      predictions_builder:
+      prediction_templates:
+    * prediction_id: "fill.p0"
+      text: "Selecting a cell causes its connected region to be filled/painted up to boundaries."
+      expected_signatures: ["fill_connected", "paint_growth"]
+      expected_metrics:
+      changed_bbox_area: { min: 4 }
+      feature_refs:
+
+      * "global.event_sig.fill_connected.rate"
+        tests_builder:
+        test_templates:
+    * test_id: "fill.t0.click_in_region"
+      purpose: "Confirm region-scale fill vs toggle."
+      selector: "object_interior_or_hotspot"
+      action_family: "coord:any_top1"
+      sequence_len: 1
+      expected_signatures: ["fill_connected", "paint_growth"]
+      pass_criteria:
+      required_event_signatures: ["fill_connected"]
+      fail_criteria:
+      required_event_signatures: ["toggle_flip"]
+      supports: ["paint.fill_connected_until_boundary"]
+      refutes: ["toggle.cell_state"]
+      coord_policy:
+      needs_coord: true
+      coord_source_priority: ["hotspot", "object_centroid", "region_frontier"]
+      top_k_coords: 1
+      fallback_to_noncoord: false
+    * test_id: "fill.t1_click_same_region_other_point"
+      purpose: "Check outcome invariance across seed choice."
+      selector: "same_region_different_point"
+      action_family: "coord:any_top1"
+      sequence_len: 1
+      expected_signatures: ["fill_connected"]
+      pass_criteria:
+      required_event_signatures: ["fill_connected"]
+      fail_criteria:
+      metrics:
+      changed_bbox_area: { max: 2 }
+      supports: ["paint.fill_connected_until_boundary"]
+      refutes: ["toggle.cell_state"]
+      coord_policy:
+      needs_coord: true
+      coord_source_priority: ["region_frontier", "object_centroid"]
+      top_k_coords: 1
+      fallback_to_noncoord: false
+
+* hypothesis_id: "toggle.cell_state"
+  name: "Toggle cell state"
+  requires:
+  needs_object_tracking: false
+  needs_coord_actions: true
+  needs_simple_actions: false
+  needs_reward_signal: false
+  trigger_features:
+
+  * feature_key: "global.coord_actions.available"
+    op: "=="
+    value: true
+  * feature_key: "global.event_sig.toggle_flip.rate"
+    op: ">="
+    value: 0.18
+    scoring_function:
+    terms:
+
+    * weight: 0.75
+      feature_ref: "global.event_sig.toggle_flip.rate"
+      transform: "clamp01"
+    * weight: 0.15
+      feature_ref: "global.toggle.reversible.rate"
+      transform: "clamp01"
+      penalties:
+    * weight: 0.20
+      feature_ref: "global.event_sig.fill_connected.rate"
+      transform: "clamp01"
+      clamp: true
+      predictions_builder:
+      prediction_templates:
+    * prediction_id: "toggle.p0"
+      text: "Interacting with the same coordinate repeatedly flips a localized cell/region state."
+      expected_signatures: ["toggle_flip"]
+      expected_metrics:
+      changed_bbox_area: { min: 1, max: 25 }
+      feature_refs:
+
+      * "global.event_sig.toggle_flip.rate"
+      * "global.toggle.reversible.rate"
+        tests_builder:
+        test_templates:
+    * test_id: "toggle.t0.double_click_same_coord"
+      purpose: "Check reversibility of state changes."
+      selector: "hotspot"
+      action_family: "coord:any_top1"
+      sequence_len: 2
+      expected_signatures: ["toggle_flip"]
+      pass_criteria:
+      required_event_signatures: ["toggle_flip"]
+      fail_criteria:
+      required_event_signatures: ["fill_connected"]
+      supports: ["toggle.cell_state"]
+      refutes: ["paint.fill_connected_until_boundary"]
+      coord_policy:
+      needs_coord: true
+      coord_source_priority: ["hotspot", "object_centroid"]
+      top_k_coords: 1
+      fallback_to_noncoord: false
+
+* hypothesis_id: "gravity.fall_down"
+  name: "Gravity / falling"
+  requires:
+  needs_object_tracking: true
+  needs_coord_actions: false
+  needs_simple_actions: false
+  needs_reward_signal: false
+  trigger_features:
+
+  * feature_key: "global.motion.dy_positive.rate"
+    op: ">="
+    value: 0.35
+  * feature_key: "global.motion.action_independent.vertical.rate"
+    op: ">="
+    value: 0.25
+    scoring_function:
+    terms:
+
+    * weight: 0.55
+      feature_ref: "global.motion.dy_positive.rate"
+      transform: "clamp01"
+    * weight: 0.35
+      feature_ref: "global.motion.action_independent.vertical.rate"
+      transform: "clamp01"
+      penalties:
+    * weight: 0.20
+      feature_ref: "global.event_sig.teleport_jump.rate"
+      transform: "clamp01"
+      clamp: true
+      predictions_builder:
+      prediction_templates:
+    * prediction_id: "grav.p0"
+      text: "Objects translate downward over steps with weak dependence on the chosen action."
+      expected_signatures: ["translation"]
+      expected_metrics:
+      dy_mode: { min: 1 }
+      feature_refs:
+
+      * "global.motion.dy_positive.rate"
+      * "global.motion.action_independent.vertical.rate"
+        tests_builder:
+        test_templates:
+    * test_id: "grav.t0_two_different_actions_compare"
+      purpose: "Disambiguate gravity from control-driven motion."
+      selector: "none"
+      action_family: "simple:any_two_distinct"
+      sequence_len: 2
+      expected_signatures: ["translation"]
+      pass_criteria:
+      metrics:
+      dy_mode: { min: 1 }
+      fail_criteria:
+      metrics:
+      dy_mode: { max: 0 }
+      supports: ["gravity.fall_down"]
+      refutes: ["move.avatar_4dir", "move.avatar_8dir"]
+
+* hypothesis_id: "wraparound.torus_edges"
+  name: "Wraparound edges (torus)"
+  requires:
+  needs_object_tracking: true
+  needs_coord_actions: false
+  needs_simple_actions: true
+  needs_reward_signal: false
+  trigger_features:
+
+  * feature_key: "global.wraparound.reappear.rate"
+    op: ">="
+    value: 0.10
+    scoring_function:
+    terms:
+
+    * weight: 0.85
+      feature_ref: "global.wraparound.reappear.rate"
+      transform: "clamp01"
+      penalties:
+    * weight: 0.20
+      feature_ref: "global.event_sig.teleport_jump.rate"
+      transform: "clamp01"
+      clamp: true
+      predictions_builder:
+      prediction_templates:
+    * prediction_id: "wrap.p0"
+      text: "Crossing a boundary causes reappearance on the opposite edge."
+      expected_signatures: ["translation"]
+      expected_metrics: {}
+      feature_refs:
+
+      * "global.wraparound.reappear.rate"
+        tests_builder:
+        test_templates:
+    * test_id: "wrap.t0_drive_to_edge"
+      purpose: "Confirm boundary-cross reappearance."
+      selector: "drive_toward_nearest_edge"
+      action_family: "simple:best_translation"
+      sequence_len: 3
+      expected_signatures: ["translation"]
+      pass_criteria:
+      required_event_signatures: ["translation"]
+      fail_criteria:
+      required_event_signatures: ["blocked_noop"]
+      supports: ["wraparound.torus_edges"]
+      refutes: ["push.sokoban_like"]
+
+* hypothesis_id: "teleport.portal"
+  name: "Teleport / portal"
+  requires:
+  needs_object_tracking: true
+  needs_coord_actions: false
+  needs_simple_actions: false
+  needs_reward_signal: false
+  trigger_features:
+
+  * feature_key: "global.event_sig.teleport_jump.rate"
+    op: ">="
+    value: 0.08
+  * feature_key: "global.teleport.destination_consistency.rate"
+    op: ">="
+    value: 0.35
+    scoring_function:
+    terms:
+
+    * weight: 0.60
+      feature_ref: "global.event_sig.teleport_jump.rate"
+      transform: "clamp01"
+    * weight: 0.30
+      feature_ref: "global.teleport.destination_consistency.rate"
+      transform: "clamp01"
+      penalties:
+    * weight: 0.20
+      feature_ref: "global.wraparound.reappear.rate"
+      transform: "clamp01"
+      clamp: true
+      predictions_builder:
+      prediction_templates:
+    * prediction_id: "tp.p0"
+      text: "An interaction causes an object to jump to a consistent destination (portal-like)."
+      expected_signatures: ["teleport_jump"]
+      expected_metrics: {}
+      feature_refs:
+
+      * "global.event_sig.teleport_jump.rate"
+      * "global.teleport.destination_consistency.rate"
+        tests_builder:
+        test_templates:
+    * test_id: "tp.t0_repeat_trigger"
+      purpose: "Check destination repeatability."
+      selector: "portal_candidate_contact"
+      action_family: "simple_or_coord:trigger_contact"
+      sequence_len: 2
+      expected_signatures: ["teleport_jump"]
+      pass_criteria:
+      required_event_signatures: ["teleport_jump"]
+      fail_criteria:
+      required_event_signatures: ["fill_connected"]
+      supports: ["teleport.portal"]
+      refutes: ["paint.fill_connected_until_boundary", "wraparound.torus_edges"]
+
+* hypothesis_id: "swap.objects"
+  name: "Swap objects"
+  requires:
+  needs_object_tracking: true
+  needs_coord_actions: false
+  needs_simple_actions: false
+  needs_reward_signal: false
+  trigger_features:
+
+  * feature_key: "global.swap_pattern.rate"
+    op: ">="
+    value: 0.10
+    scoring_function:
+    terms:
+
+    * weight: 0.85
+      feature_ref: "global.swap_pattern.rate"
+      transform: "clamp01"
+      penalties:
+    * weight: 0.20
+      feature_ref: "global.event_sig.paint_growth.rate"
+      transform: "clamp01"
+      clamp: true
+      predictions_builder:
+      prediction_templates:
+    * prediction_id: "swap.p0"
+      text: "An interaction causes two objects/regions to exchange positions or states."
+      expected_signatures: ["swap"]
+      expected_metrics: {}
+      feature_refs:
+
+      * "global.swap_pattern.rate"
+        tests_builder:
+        test_templates:
+    * test_id: "swap.t0_repeat_to_revert"
+      purpose: "Swaps often revert when repeated."
+      selector: "interaction_hotspot_or_adjacent_pair"
+      action_family: "simple_or_coord:any_top1"
+      sequence_len: 2
+      expected_signatures: ["swap"]
+      pass_criteria:
+      required_event_signatures: ["swap"]
+      fail_criteria:
+      required_event_signatures: ["teleport_jump"]
+      supports: ["swap.objects"]
+      refutes: ["teleport.portal"]
+
+* hypothesis_id: "collect.target_on_contact"
+  name: "Collect target on contact"
+  requires:
+  needs_object_tracking: true
+  needs_coord_actions: false
+  needs_simple_actions: true
+  needs_reward_signal: false
+  trigger_features:
+
+  * feature_key: "global.object_tracking.despawn.on_contact.rate"
+    op: ">="
+    value: 0.10
+    scoring_function:
+    terms:
+
+    * weight: 0.85
+      feature_ref: "global.object_tracking.despawn.on_contact.rate"
+      transform: "clamp01"
+      penalties:
+    * weight: 0.20
+      feature_ref: "global.object_tracking.spawn.rate"
+      transform: "clamp01"
+      clamp: true
+      predictions_builder:
+      prediction_templates:
+    * prediction_id: "collect.p0"
+      text: "Contact between a moving object and a target causes the target to disappear (collect)."
+      expected_signatures: ["despawn", "translation"]
+      expected_metrics:
+      object_count_delta: { min: -5, max: 0 }
+      feature_refs:
+
+      * "global.object_tracking.despawn.on_contact.rate"
+        tests_builder:
+        test_templates:
+    * test_id: "collect.t0_move_into_small_target"
+      purpose: "Verify despawn on contact."
+      selector: "nearest_small_object"
+      action_family: "simple:best_translation_toward_object"
+      sequence_len: 1
+      expected_signatures: ["despawn"]
+      pass_criteria:
+      required_event_signatures: ["despawn"]
+      fail_criteria:
+      forbidden_event_signatures: ["fill_connected"]
+      supports: ["collect.target_on_contact"]
+      refutes: ["paint.fill_connected_until_boundary"]
+
+* hypothesis_id: "line_draw"
+  name: "Line drawing"
+  requires:
+  needs_object_tracking: false
+  needs_coord_actions: true
+  needs_simple_actions: false
+  needs_reward_signal: false
+  trigger_features:
+
+  * feature_key: "global.event_sig.line_draw.rate"
+    op: ">="
+    value: 0.10
+    scoring_function:
+    terms:
+
+    * weight: 0.85
+      feature_ref: "global.event_sig.line_draw.rate"
+      transform: "clamp01"
+      penalties:
+    * weight: 0.15
+      feature_ref: "global.event_sig.toggle_flip.rate"
+      transform: "clamp01"
+      clamp: true
+      predictions_builder:
+      prediction_templates:
+    * prediction_id: "line.p0"
+      text: "Interacting draws a straight line segment aligned with grid directions."
+      expected_signatures: ["line_draw"]
+      expected_metrics: {}
+      feature_refs:
+
+      * "global.event_sig.line_draw.rate"
+        tests_builder:
+        test_templates:
+    * test_id: "line.t0_two_points_same_row"
+      purpose: "Confirm linearity and orientation."
+      selector: "two_points_same_row_or_col"
+      action_family: "coord:any_top1"
+      sequence_len: 2
+      expected_signatures: ["line_draw"]
+      pass_criteria:
+      required_event_signatures: ["line_draw"]
+      fail_criteria:
+      required_event_signatures: ["fill_connected"]
+      supports: ["line_draw"]
+      refutes: ["paint.fill_connected_until_boundary"]
+      coord_policy:
+      needs_coord: true
+      coord_source_priority: ["grid_edges_midpoint", "hotspot", "object_centroid"]
+      top_k_coords: 2
+      fallback_to_noncoord: false
+
+* hypothesis_id: "ray_cast"
+  name: "Ray cast until hit"
+  requires:
+  needs_object_tracking: false
+  needs_coord_actions: true
+  needs_simple_actions: false
+  needs_reward_signal: false
+  trigger_features:
+
+  * feature_key: "global.event_sig.ray_cast.rate"
+    op: ">="
+    value: 0.08
+    scoring_function:
+    terms:
+
+    * weight: 0.85
+      feature_ref: "global.event_sig.ray_cast.rate"
+      transform: "clamp01"
+      penalties:
+    * weight: 0.15
+      feature_ref: "global.event_sig.fill_connected.rate"
+      transform: "clamp01"
+      clamp: true
+      predictions_builder:
+      prediction_templates:
+    * prediction_id: "ray.p0"
+      text: "Interacting emits a ray that stops at the first obstacle/hit."
+      expected_signatures: ["ray_cast"]
+      expected_metrics: {}
+      feature_refs:
+
+      * "global.event_sig.ray_cast.rate"
+        tests_builder:
+        test_templates:
+    * test_id: "ray.t0_click_toward_obstacle"
+      purpose: "Confirm stop-at-hit behavior vs full line draw."
+      selector: "ray_toward_nearest_obstacle"
+      action_family: "coord:any_top1"
+      sequence_len: 1
+      expected_signatures: ["ray_cast"]
+      pass_criteria:
+      required_event_signatures: ["ray_cast"]
+      fail_criteria:
+      required_event_signatures: ["line_draw"]
+      supports: ["ray_cast"]
+      refutes: ["line_draw"]
+      coord_policy:
+      needs_coord: true
+      coord_source_priority: ["object_centroid", "adjacent_boundary"]
+      top_k_coords: 1
+      fallback_to_noncoord: false
+
+* hypothesis_id: "flood_spread"
+  name: "Flood / spread growth"
+  requires:
+  needs_object_tracking: false
+  needs_coord_actions: true
+  needs_simple_actions: false
+  needs_reward_signal: false
+  trigger_features:
+
+  * feature_key: "global.event_sig.paint_growth.rate"
+    op: ">="
+    value: 0.15
+  * feature_key: "global.growth.multi_step.frontier.rate"
+    op: ">="
+    value: 0.10
+    scoring_function:
+    terms:
+
+    * weight: 0.55
+      feature_ref: "global.growth.multi_step.frontier.rate"
+      transform: "clamp01"
+    * weight: 0.30
+      feature_ref: "global.event_sig.paint_growth.rate"
+      transform: "clamp01"
+      penalties:
+    * weight: 0.25
+      feature_ref: "global.event_sig.fill_connected.rate"
+      transform: "clamp01"
+      clamp: true
+      predictions_builder:
+      prediction_templates:
+    * prediction_id: "flood.p0"
+      text: "Growth spreads gradually over multiple steps (frontier expansion), not an instant full-region fill."
+      expected_signatures: ["paint_growth"]
+      expected_metrics: {}
+      feature_refs:
+
+      * "global.growth.multi_step.frontier.rate"
+        tests_builder:
+        test_templates:
+    * test_id: "flood.t0_trigger_then_wait"
+      purpose: "Differentiate autonomous spread vs one-shot fill."
+      selector: "hotspot_or_object_interior"
+      action_family: "coord:any_top1"
+      sequence_len: 1
+      expected_signatures: ["paint_growth"]
+      pass_criteria:
+      required_event_signatures: ["paint_growth"]
+      fail_criteria:
+      required_event_signatures: ["fill_connected"]
+      supports: ["flood_spread"]
+      refutes: ["paint.fill_connected_until_boundary"]
+      coord_policy:
+      needs_coord: true
+      coord_source_priority: ["hotspot", "object_centroid"]
+      top_k_coords: 1
+      fallback_to_noncoord: false
+
