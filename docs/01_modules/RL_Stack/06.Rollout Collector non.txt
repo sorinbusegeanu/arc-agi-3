@@ -94,3 +94,16 @@ rollout_collector.py exposing:
 collect(env, modules, cfg, ctx) -> TrajectoryBatchV1
 
 writes optional rollout_trace.jsonl compatible with existing trace schemas (stable keys).
+
+
+Store per step:
+
+mode_t
+
+mode_logits_topk (optional compact)
+
+mode_probs (optional)
+
+repeat_flag, effect_flag, novel_flag, steps_since_novel
+
+everything previously stored for actor/value training

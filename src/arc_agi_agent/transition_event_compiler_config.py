@@ -9,3 +9,4 @@ class TransitionEventCompilerConfig:
     enable_multigrid: bool = False
     hash_meta_whitelist: List[str] = field(default_factory=lambda: ["available_actions", "terminal", "reward"])
     changed_colors_topM: int = 12
+    log_transition_events: bool = False

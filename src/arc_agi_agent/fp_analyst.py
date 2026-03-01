@@ -40,7 +40,6 @@ from .viz import (
     component_id_overlay,
     diff_mask_overlay,
     motion_overlay,
-    save_grid_image,
 )
 
 logger = get_logger(__name__)
@@ -229,8 +228,12 @@ class FPAnalyst:
         diff_summary = self._build_diff_summary(norm, prev_norm)
         timings["diff_summary_ms"] = (time.time() - t2) * 1000
 
+        build_viz = self._resolve_build_viz(ctx)
         t3 = time.time()
-        viz = self._build_viz(norm, prev_norm, state_summary, ascii_cache, overlay_cache)
+        if build_viz:
+            viz = self._build_viz(norm, prev_norm, state_summary, ascii_cache, overlay_cache)
+        else:
+            viz = VizArtifacts(ascii_grid={}, overlay_grids={})
         timings["viz_ms"] = (time.time() - t3) * 1000
 
         report = FPReport(
@@ -248,6 +251,208 @@ class FPAnalyst:
             ),
         )
         return report
+
+    def analyze_fast(
+        self,
+        observation: Any,
+        cfg: Optional[Dict[str, Any]] = None,
+        ctx: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        del ctx
+        timings: Dict[str, float] = {}
+        schema_warnings: List[str] = []
+        t0 = time.time()
+        norm = normalize_observation(observation, schema_warnings=schema_warnings)
+        timings["normalize_ms"] = (time.time() - t0) * 1000
+
+        grids = norm.grids
+        if not grids:
+            return {
+                "schema_version": "FP_REPORT_FAST_V1",
+                "state_summary": {"step_idx": int(norm.step_idx), "grid_summaries": [], "object_catalog": [], "invariants": []},
+                "diff_summary": None,
+                "viz_artifacts": None,
+                "features_v1": {
+                    "grid_index": {"primary_grid_name": None, "grids": []},
+                    "object_index": [],
+                    "interaction_points": [],
+                    "meta_features": {"available_actions_sorted": []},
+                },
+                "debug": {"schema_warnings": schema_warnings, "timings_ms": timings, "grid_hash": ""},
+            }
+
+        fast_cfg = self._resolve_fast_cfg(cfg)
+        max_components = int(fast_cfg["max_components"])
+        min_area = int(fast_cfg["min_area"])
+
+        object_index: List[Dict[str, Any]] = []
+        interaction_points: List[Dict[str, Any]] = []
+        grid_summaries: List[Dict[str, Any]] = []
+
+        for idx, grid in enumerate(grids):
+            name = norm.grid_names[idx] if idx < len(norm.grid_names) else f"frame_{idx}"
+            pal = palette(grid)
+            skip_bg_candidates = bool(fast_cfg.get("skip_bg_candidates", False))
+            if skip_bg_candidates:
+                bg_color = self._trivial_bg_color(grid, norm.meta if isinstance(norm.meta, dict) else {})
+                bg_list = []
+            else:
+                bg_list = bg_candidates(grid, self.config.bg_detection_weights)
+                bg_color = bg_list[0][0] if bg_list else None
+            colors = [c for c in pal if c != bg_color]
+            if bg_color is not None:
+                colors.append(bg_color)
+
+            comps = extract_components(
+                grid=grid,
+                colors=colors,
+                connectivity=self.config.connectivity,
+                min_area=min_area,
+                max_objects=max_components,
+                grid_name=name,
+            )
+            comps.sort(key=lambda c: (-int(c.area), int(c.bbox[0]), int(c.bbox[1]), str(c.id)))
+            comps = comps[:max_components]
+            for comp in comps:
+                object_index.append(
+                    {
+                        "object_id": comp.id,
+                        "grid_name": name,
+                        "color": int(comp.color),
+                        "bbox": tuple(int(v) for v in comp.bbox),
+                        "centroid": (float(comp.centroid[0]), float(comp.centroid[1])),
+                        "area": int(comp.area),
+                        "prev_object_id": None,
+                        "dy": None,
+                        "dx": None,
+                    }
+                )
+                cy, cx = comp.centroid
+                interaction_points.append(
+                    {
+                        "point": (int(round(cx)), int(round(cy))),
+                        "tag": "centroid",
+                        "source_grid_name": name,
+                    }
+                )
+                y0, x0, y1, x1 = comp.bbox
+                interaction_points.append({"point": (int(x0), int(y0)), "tag": "bbox_corner", "source_grid_name": name})
+                interaction_points.append({"point": (int(x1), int(y1)), "tag": "bbox_corner", "source_grid_name": name})
+
+            grid_summaries.append(
+                {
+                    "name": name,
+                    "height": int(grid.shape[0]),
+                    "width": int(grid.shape[1]),
+                    "palette_sorted": pal,
+                    "bg_color": bg_color,
+                    "bg_candidates": bg_list,
+                }
+            )
+
+        available_actions = []
+        if isinstance(norm.meta, dict) and isinstance(norm.meta.get("available_actions"), list):
+            available_actions = sorted(str(a) for a in norm.meta["available_actions"])
+
+        features_v1 = {
+            "grid_index": {
+                "primary_grid_name": grid_summaries[0]["name"] if grid_summaries else None,
+                "grids": [
+                    {
+                        "name": gs["name"],
+                        "height": gs["height"],
+                        "width": gs["width"],
+                        "palette_sorted": list(gs["palette_sorted"]),
+                        "bg_color": int(gs["bg_candidates"][0][0]) if gs["bg_candidates"] else None,
+                        "bg_candidates_ranked": list(gs["bg_candidates"]),
+                    }
+                    for gs in grid_summaries
+                ],
+            },
+            "object_index": object_index,
+            "interaction_points": interaction_points,
+            "meta_features": {
+                "available_actions_sorted": available_actions,
+                "terminal": norm.meta.get("terminal") if isinstance(norm.meta, dict) else None,
+                "reward": norm.meta.get("reward") if isinstance(norm.meta, dict) else None,
+            },
+        }
+
+        return {
+            "schema_version": "FP_REPORT_FAST_V1",
+            "state_summary": {
+                "step_idx": int(norm.step_idx),
+                "grid_summaries": grid_summaries,
+                "object_catalog": [],
+                "invariants": [],
+            },
+            "diff_summary": None,
+            "viz_artifacts": None,
+            "features_v1": features_v1,
+            "debug": {
+                "schema_warnings": schema_warnings,
+                "timings_ms": timings,
+                "grid_hash": grid_hash(grids),
+                "grid_fingerprint": "",
+                "state_summary_version": "fast_v1",
+                "diff_schema_version": "fast_v1",
+            },
+        }
+
+    def _resolve_build_viz(self, ctx: Optional[Dict[str, Any]]) -> bool:
+        if isinstance(ctx, dict):
+            fp_cfg = ctx.get("fp_analyst")
+            if isinstance(fp_cfg, dict) and "build_viz" in fp_cfg:
+                return bool(fp_cfg.get("build_viz"))
+            pipeline = ctx.get("pipeline")
+            if isinstance(pipeline, dict) and str(pipeline.get("mode", "")).lower() == "rl_only":
+                return False
+        return True
+
+    def _resolve_fast_cfg(self, cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        out = {"max_components": 32, "min_area": 1, "skip_bg_candidates": False}
+        pipeline_mode = ""
+        explicit_skip_bg: Optional[bool] = None
+        if isinstance(cfg, dict):
+            pipeline = cfg.get("pipeline")
+            if isinstance(pipeline, dict):
+                pipeline_mode = str(pipeline.get("mode", ""))
+            fp_cfg = cfg.get("fp_analyst", cfg)
+            if isinstance(fp_cfg, dict):
+                fast_cfg = fp_cfg.get("fast")
+                if isinstance(fast_cfg, dict):
+                    out["max_components"] = int(fast_cfg.get("max_components", out["max_components"]))
+                    out["min_area"] = int(fast_cfg.get("min_area", out["min_area"]))
+                    if "skip_bg_candidates" in fast_cfg:
+                        explicit_skip_bg = bool(fast_cfg.get("skip_bg_candidates"))
+        if str(pipeline_mode).lower() == "rl_only":
+            # Default in RL-only unless explicitly overridden.
+            if explicit_skip_bg is None:
+                out["skip_bg_candidates"] = True
+            else:
+                out["skip_bg_candidates"] = explicit_skip_bg
+        elif explicit_skip_bg is not None:
+            out["skip_bg_candidates"] = explicit_skip_bg
+        return out
+
+    def _trivial_bg_color(self, grid: Any, meta: Dict[str, Any]) -> Optional[int]:
+        bg_meta = meta.get("bg_color") if isinstance(meta, dict) else None
+        if isinstance(bg_meta, (int, float)):
+            return int(bg_meta)
+        arr = grid
+        if getattr(arr, "size", 0) == 0:
+            return None
+        counts: Dict[int, int] = {}
+        best_color = None
+        best_count = -1
+        for v in arr.flat:
+            c = int(v)
+            counts[c] = counts.get(c, 0) + 1
+            n = counts[c]
+            if n > best_count or (n == best_count and (best_color is None or c < best_color)):
+                best_count = n
+                best_color = c
+        return best_color
 
     def render(self, report: FPReport, mode: str = "ascii") -> str:
         if mode == "ascii":
@@ -472,18 +677,7 @@ class FPAnalyst:
                 overlay = motion_overlay(grid, motions)
                 overlays_out[name]["object_motion_overlay"] = ascii_overlay(grid, overlay)
 
-            if self.config.save_images:
-                output_dir = f"{self.config.output_dir}/viz"
-                try:
-                    import os
-
-                    os.makedirs(output_dir, exist_ok=True)
-                    path = f"{output_dir}/{name}_step{state_summary.step_idx}.png"
-                    saved = save_grid_image(path, grid)
-                    if saved:
-                        save_paths.append(saved)
-                except Exception as e:
-                    logger.warning("Failed to save image: %s", e)
+            # PNG debug image export intentionally disabled.
 
         return VizArtifacts(ascii_grid=ascii_out, overlay_grids=overlays_out, save_paths=save_paths)
 

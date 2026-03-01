@@ -1,0 +1,217 @@
+Disable unused (non-RL) modules and their logging
+Goal
+
+When running --agent rl_agent, ensure:
+
+non-RL modules are not instantiated
+
+their logs/traces/messages are suppressed
+
+traces contain only RL-relevant data (+ FP/TransitionEvent if required)
+
+This is a guidance document (behavior + knobs), not code.
+
+1) Define “RL-only mode” as a first-class run mode
+1.1 Single switch
+
+Add a config/CLI switch (one name, project-wide):
+
+--rl-only true (or pipeline.mode=rl_only)
+
+In RL-only mode:
+
+only the RL stack + required infra is active
+
+all other modules are disabled by default
+
+2) Module enable/disable registry (centralized)
+
+Create a single config section controlling all modules:
+
+modules.enabled = {
+  fp_analyst: true,
+  transition_event: true,
+  trace_writer: true,
+
+  rl_encoder: true,
+  rl_memory: true,
+  rl_controller: true,
+  rl_actor: true,
+  rl_value: true,
+  rl_coord_proposer: true,
+  rl_reward_shaper: true,
+  rl_rollout_collector: true,
+  rl_trainer: true,
+
+  swarm_orchestrator: false,
+  planner: false,
+  simple_explorer: false,
+  full_explorer: false,
+  rule_proposer: false,
+  mechanic_classifier: false,
+  hypothesis_engine: false,
+  discriminating_test_selector: false,
+  mechanic_synthesizer: false,
+  memory_store: false
+}
+
+Rules:
+
+RL-only mode sets this map automatically.
+
+If a disabled module is requested by code path, it must raise a clear error: ModuleDisabledError(<name>).
+
+3) Hard disable instantiation (not just “don’t call”)
+
+For each non-RL module:
+
+Do not construct the object at all.
+
+Do not allocate model weights.
+
+Do not load checkpoints.
+
+Do not create per-module loggers.
+
+This avoids:
+
+overhead
+
+accidental side effects (writing memory, generating prompts, etc.)
+
+4) Logging suppression policy
+4.1 Replace per-module loggers with a single run logger
+
+In RL-only mode, only these log streams are permitted:
+
+rl.* (training/eval metrics, losses, mode/action usage)
+
+fp.* (optional; limited to summary counts)
+
+event.* (optional TransitionEvent summaries)
+
+trace.* (trace writer)
+
+All other namespaces are blocked.
+
+4.2 Explicit log-level overrides
+
+In RL-only mode, force:
+
+planner logger level = ERROR
+
+explorer logger level = ERROR
+
+proposer logger level = ERROR
+
+hypothesis logger level = ERROR
+
+memory logger level = ERROR
+
+And disable their file handlers entirely.
+
+5) Trace slimming rules
+5.1 RL trace schema
+
+When rl_agent is active, trace must contain only:
+
+episode header: game_id, seed, max_actions
+
+per-step:
+
+mode (id/name)
+
+action (id + x,y if applicable)
+
+reward_total + reward_terms
+
+state_hash_before/after
+
+effect/novel/loop flags
+
+optional compact logits topk
+
+Do not include:
+
+planner candidate lists
+
+explorer frontier dumps
+
+rule proposals
+
+hypothesis sets
+
+memory retrieval dumps
+
+5.2 Keep infra summaries only
+
+FP_Analyst and TransitionEvent may log:
+
+object counts
+
+changed_cells_count
+
+bbox
+No full grids unless explicitly enabled.
+
+6) Messaging / “agent chatter” suppression
+
+If your current pipeline uses message buses / blackboard messages:
+
+Disable all publishers except:
+
+RLAgent (action decisions)
+
+Reward_Shaper (reward terms)
+
+Trainer (loss/grad info)
+
+Eval (episode outcome)
+
+All other message channels become no-ops.
+
+7) Explicit disable list for “not needed anymore” modules
+
+In RL-only mode, default OFF:
+
+Swarm Orchestrator (decision role)
+
+Planner / Controller
+
+Simple Explorer / Full Explorer
+
+Rule Proposer
+
+Mechanic Classifier / Library Matcher
+
+Executable Hypothesis Engine
+
+Discriminating Test Selector
+
+Mechanic Synthesizer
+
+Memory Store (unless explicitly used for priors)
+
+They may remain in repo but must not run.
+
+8) Safety: guard against accidental use
+
+Add these runtime assertions when --agent rl_agent:
+
+assert action_source == "rl_agent"
+
+assert modules.enabled[non_rl_module] == false for each non-RL module
+
+If any non-RL module emits a trace entry, fail the run with a clear error.
+
+9) Recommended incremental rollout
+
+RL-only mode first disables just:
+
+explorers + planner + proposer + hypothesis pipeline
+
+Then disable memory store writes
+
+Then turn off their loggers + trace sections
+
+Finally, remove their initialization from the RL run path

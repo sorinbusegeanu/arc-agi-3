@@ -18,3 +18,7 @@ class TransitionEventV1:
     event_signatures: List[Dict[str, Any]]
     object_deltas: Dict[str, Any]
     meta_delta: Dict[str, Any]
+    state_hash_before_filtered: str = ""
+    state_hash_after_filtered: str = ""
+    ui_exclusion_mask_rle: Optional[Dict[str, Any]] = None
+    ui_exclusion_bboxes: Optional[List[Any]] = None

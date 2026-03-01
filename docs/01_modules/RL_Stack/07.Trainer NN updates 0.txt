@@ -98,3 +98,45 @@ trainer.py exposing:
 train_step(batch, modules, optim, cfg, ctx) -> TrainStepReportV1
 
 checkpoint_io.py (save/load)
+
+Trainer changes (hierarchical actor-critic)
+
+Train three heads jointly:
+
+Controller policy (mode policy)
+
+Actor policy (action policy conditioned on mode)
+
+Value (shared value on h_t)
+
+Advantage / return definition
+
+Use one shared return G_t from shaped reward (includes win + shaping). Advantage A_t = G_t - V(h_t).
+
+Loss terms (V1)
+
+L_actor: standard policy gradient loss for chosen action (discrete + coord) using A_t
+
+L_controller: policy gradient loss for chosen mode using A_t
+
+L_value: value regression to G_t
+
+L_entropy_actor: entropy bonus on actor logits
+
+L_entropy_mode: entropy bonus on mode logits (separate coefficient)
+
+Optional “mode shaping” auxiliary loss (recommended)
+
+A deterministic heuristic label mode_target_t computed from episode signals:
+
+If repeat_flag true for last step(s): target escape_loop
+
+Else if ACTION6 is available and salient click targets exist: target focus_click (weak)
+
+Else if steps_since_novel small and early in episode: target probe
+
+Else: target exploit
+
+Add a small cross-entropy:
+
+L_mode_aux = CE(mode_logits, mode_target) with low weight

@@ -56,3 +56,15 @@ loop_window_N=25 (align with planner/explorer defaults)
 reward_shaper_v1.py exposing:
 
 compute(event, done, win, seen_hashes, recent_hashes, cfg=None, ctx=None) -> RewardV1
+
+Keep shaped reward terms as before. Additionally emit:
+
+repeat_flag
+
+novel_flag
+
+effect_flag
+
+steps_since_novel (tracked per episode)
+
+These are used as controller inputs and for mode supervision losses.

@@ -1,6 +1,6 @@
 """ARC-AGI agent utilities."""
 
-from .config import FPAnalystConfig
+from .config import FPAnalystConfig, RLConfig
 from .fp_analyst import FPAnalyst
 from .full_explorer import run as run_full_explorer
 from .full_explorer_config import FullExplorerConfig
@@ -31,6 +31,7 @@ from .types import FPReport
 __all__ = [
     "FPAnalyst",
     "FPAnalystConfig",
+    "RLConfig",
     "FPReport",
     "run_simple_explorer",
     "SimpleExplorerConfig",

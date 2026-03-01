@@ -1,0 +1,36 @@
+Hierarchical_Controller (NN) — NEW (replaces part of old Policy_Head responsibilities)
+Role
+
+Select a discrete mode m_t each step.
+
+Modes (V1)
+
+probe, exploit, escape_loop, focus_click
+
+Inputs
+
+h_t
+
+optional: summary scalars from Reward_Shaper / loop tracker:
+
+repeat_flag (bool)
+
+steps_since_novel (int clipped)
+
+last_effect_flag (bool)
+
+Outputs
+
+mode_logits over 4 modes
+
+mode chosen by sampling during training, argmax during eval
+
+NN
+
+MLP head on h_t (+ optional small scalar features)
+
+Determinism
+
+Masking is not needed; always all modes available.
+
+Tie-break mode by fixed order.

@@ -31,6 +31,9 @@ EPISODES=""
 ITERS=""
 CHECKPOINT=""
 GAMES_FLAG=""
+WORKERS=""
+RUN_NAME=""
+RL_ONLY="true"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -155,8 +158,20 @@ while [[ $# -gt 0 ]]; do
       ITERS="$2"
       shift 2
       ;;
+    --workers)
+      WORKERS="$2"
+      shift 2
+      ;;
     --checkpoint)
       CHECKPOINT="$2"
+      shift 2
+      ;;
+    --run-name)
+      RUN_NAME="$2"
+      shift 2
+      ;;
+    --rl-only)
+      RL_ONLY="$2"
       shift 2
       ;;
     *)
@@ -179,8 +194,8 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [[ "$AGENT" != "rl_agent" ]]; then
-  if [[ -n "$MODE" || -n "$EPISODES" || -n "$ITERS" || -n "$CHECKPOINT" || -n "$GAMES_FLAG" ]]; then
-    echo "RL-only args (--mode/--episodes/--iters/--checkpoint/--games) are only valid with --agent rl_agent" >&2
+  if [[ -n "$MODE" || -n "$EPISODES" || -n "$ITERS" || -n "$CHECKPOINT" || -n "$GAMES_FLAG" || -n "$WORKERS" || -n "$RUN_NAME" || "$RL_ONLY" != "true" ]]; then
+    echo "RL-only args (--mode/--episodes/--iters/--workers/--checkpoint/--games/--run-name/--rl-only) are only valid with --agent rl_agent" >&2
     exit 1
   fi
 fi
@@ -311,11 +326,11 @@ fi
 
 if [[ "$AGENT" == "rl_agent" ]]; then
   if [[ -z "$OUTDIR" ]]; then
-    echo "Usage: $0 --agent rl_agent --mode <collect|train|eval> --games <selector> [--seed <n>] [--max-actions <n>] [--episodes <n>] [--iters <n>] [--checkpoint <path>] --outdir <dir>" >&2
+    echo "Usage: $0 --agent rl_agent --mode <collect|train|eval> --games <selector> [--seed <n>] [--max-actions <n>] [--episodes <n>] [--iters <n>] [--workers <n>] [--checkpoint <path>] [--run-name <name>] --outdir <dir>" >&2
     exit 1
   fi
   MODE_ARG="${MODE:-eval}"
-  PYTHONPATH="$SCRIPT_DIR" "$PYTHON_EXEC" -m arc_agi_agent.rl.run_rl --mode "$MODE_ARG" --games "$GAME" --seed "$SEED" --max-actions "$MAX_STEPS" ${EPISODES:+--episodes "$EPISODES"} ${ITERS:+--iters "$ITERS"} ${CHECKPOINT:+--checkpoint "$CHECKPOINT"} --outdir "$OUTDIR"
+  PYTHONPATH="$SCRIPT_DIR" "$PYTHON_EXEC" -m arc_agi_agent.rl.run_rl --mode "$MODE_ARG" --games "$GAME" --seed "$SEED" --max-actions "$MAX_STEPS" ${EPISODES:+--episodes "$EPISODES"} ${ITERS:+--iters "$ITERS"} ${WORKERS:+--workers "$WORKERS"} ${CHECKPOINT:+--checkpoint "$CHECKPOINT"} ${RUN_NAME:+--run-name "$RUN_NAME"} --rl-only "$RL_ONLY" --outdir "$OUTDIR"
   exit 0
 fi
 

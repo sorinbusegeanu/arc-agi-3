@@ -162,3 +162,11 @@ Build a single end-to-end reinforcement learning agent that:
 This replaces explicit mechanic inference with learned action utility through interaction.
 
 module list (Observation_Encoder, Recurrent_Memory, CoordProposer, Policy_Head, Value_Head, Reward_Shaper, Rollout_Collector, Trainer). 
+Objective change
+
+Replace a single flat policy with a two-level policy:
+
+Controller chooses a high-level mode each step.
+
+Actor chooses the concrete action (discrete + optional coord) conditioned on that mode.
+

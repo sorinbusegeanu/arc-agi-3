@@ -12,6 +12,7 @@ from .planner_types import PlannerInputs, PlannerState
 from .rule_proposer import propose as propose_rules
 from .simple_explorer import build_frontier_report as simple_build_frontier_report
 from .simple_explorer import choose_action as simple_choose_action
+from .rl.rl_agent import RLAgent
 
 
 @dataclass
@@ -148,6 +149,7 @@ def build_default_agents(fp_analyst: Optional[FPAnalyst] = None) -> Dict[str, An
         "rule_proposer": RuleProposerAgent(),
         "goal_detector": GoalDetectorAgent(),
         "planner": PlannerAgent(),
+        "rl_agent": RLAgent,
     }
 
 

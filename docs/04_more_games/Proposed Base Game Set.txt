@@ -1,0 +1,241 @@
+Proposed Base Game Set (ranked for mechanic diversity)
+
+Designed for ARCEngine constraints:
+
+64×64 grid
+
+Discrete actions (ACTION1–5, ACTION7)
+
+Click action (ACTION6(x,y))
+
+Reset
+
+Deterministic seed-based generation
+
+Tier 1 — Core Mechanic Families (must-have)
+1) Sokoban (Push Blocks)
+
+Push-only movement
+
+Irreversible traps
+
+Spatial planning
+
+Variants:
+
+5,000 solvable layouts
+
+10 palettes
+
+5 box/goal density configs
+→ ~250,000 variants
+
+2) Maze Collect-All
+
+Corridors + collectibles
+
+No enemies (pure navigation)
+
+Variants:
+
+10,000 maze seeds
+
+10 collectible configs
+
+10 spawn configs
+→ ~1,000,000 variants
+
+3) Key–Door Puzzle
+
+Gated access
+
+State-dependent environment
+
+Variants:
+
+5,000 layouts
+
+10 key-door wiring patterns
+
+5 spawn configs
+→ ~250,000 variants
+
+4) Enemy Avoidance (Pacman-lite)
+
+Moving adversaries
+
+Survival constraint
+
+Variants:
+
+2,000 maze layouts
+
+20 patrol logic seeds
+
+5 speed configs
+→ ~200,000 variants
+
+5) Breakout-like
+
+Projectile physics
+
+Destruction objective
+
+Variants:
+
+1,000 brick patterns
+
+20 ball seeds
+
+10 paddle parameters
+→ ~200,000 variants
+
+6) Snake
+
+Growing body constraint
+
+Spatial self-collision
+
+Variants:
+
+10,000 spawn seeds
+
+5 obstacle densities
+
+10 fruit spawn rules
+→ ~500,000 variants
+
+7) Lights-Out / Toggle Puzzle (Click-heavy)
+
+Pure ACTION6-based mechanic
+
+Global effect from local click
+
+Variants:
+
+20,000 initial boards
+
+5 toggle radius configs
+→ ~100,000 variants
+
+8) Sliding Tile Puzzle
+
+Permutation planning
+
+Deterministic state space
+
+Variants:
+
+50,000 solvable permutations
+→ 50,000 variants
+
+Tier 2 — State / Physics Extensions
+9) Boulder Dash–Lite
+
+Falling objects
+
+Digging terrain
+
+Gravity rules
+
+Variants:
+
+5,000 cave layouts
+
+5 gravity configs
+→ 25,000 variants
+
+10) Frogger-like
+
+Timed movement lanes
+
+Moving hazards
+
+Variants:
+
+2,000 lane layouts
+
+10 speed seeds
+→ 20,000 variants
+
+11) Space-Invaders-lite
+
+Shooting + enemy waves
+
+Variants:
+
+1,000 wave patterns
+
+20 enemy movement configs
+→ 20,000 variants
+
+12) Switch-Activated Platforms
+
+Mode-dependent environment
+
+Local click toggles global changes
+
+Variants:
+
+5,000 layouts
+
+10 switch wiring patterns
+→ 50,000 variants
+
+Tier 3 — Higher-Order Compositional Games
+13) Multi-Room Dungeon (Zelda-lite)
+
+Keys, enemies, toggles, multiple rooms
+
+Variants:
+
+1,000 room graphs
+
+10 wiring patterns
+→ 10,000 variants
+
+14) Push + Toggle Hybrid
+
+Combine Sokoban + switches
+
+Variants:
+
+2,000 hybrid layouts
+→ 2,000 variants
+
+15) Timed Escape (Countdown hazard)
+
+Time pressure + obstacles
+
+Variants:
+
+5,000 layouts
+→ 5,000 variants
+
+Required Variant Design Rules
+
+Every base game must:
+
+Accept a seed argument.
+
+Generate layout + parameters deterministically from seed.
+
+Expose parameter ranges in a config schema:
+
+layout_seed
+
+object_density
+
+enemy_speed
+
+toggle_radius
+
+palette_id
+
+etc.
+
+Separate train vs eval by seed range:
+
+Train seeds: 0–999,999
+
+Eval seeds: 1,000,000–1,099,999

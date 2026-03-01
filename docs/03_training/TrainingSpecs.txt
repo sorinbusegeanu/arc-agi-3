@@ -1,0 +1,303 @@
+# Updated Training Specs (Hierarchical RL)
+
+## 0) Scope
+
+Defines:
+
+* training phases and exact schedules
+* metrics (definitions + how computed)
+* checkpoint policy (which metric selects “best” and which weights are saved)
+* parallelism (what is trained jointly vs frozen)
+* evaluation protocol (fixed, deterministic, reproducible)
+
+No code.
+
+---
+
+## 1) Models and whether they train in parallel
+
+### 1.1 Train jointly (single optimizer step updates all)
+
+All NN components are trained **in parallel** on the same trajectories, every iteration:
+
+* `Observation_Encoder`
+* `Recurrent_Memory`
+* `Hierarchical_Controller`
+* `Policy_Actor`
+* `Value_Head`
+
+Default: **single optimizer** over all parameters.
+
+### 1.2 Optional two-optimizer mode (only if configured)
+
+If enabled, use separate optimizers:
+
+* `optim_actor`: Encoder + Memory + Policy_Actor
+* `optim_ctrl`: Controller
+* `optim_value`: Value_Head
+
+Rationale: stabilize controller/value.
+Default remains single optimizer unless instability observed.
+
+### 1.3 Frozen components (always deterministic)
+
+* `CoordProposer` (non-NN)
+* `Reward_Shaper` (non-NN)
+
+---
+
+## 2) Metrics: exact definitions (per-episode and aggregated)
+
+All metrics computed per episode, then aggregated per iteration (mean; also median where specified).
+
+### 2.1 Outcome metrics (primary)
+
+* **WinRate**: `wins / episodes`
+
+  * `win` is true only if environment indicates success terminal state.
+* **MeanReturn**: average of total shaped return per episode:
+
+  * `Return = Σ_t (γ^t * r_total_t)` with `γ = rl.gamma` (default 0.99)
+* **MedianReturn**: median of per-episode total return.
+
+### 2.2 Transition / exploration metrics (secondary)
+
+Computed from `TransitionEvent` and episode state hashes:
+
+* **EffectRate**: fraction of steps with non-noop effect:
+
+  * `effect_step = 1 if (changed_cells_count > 0) OR (meta_delta_changed == true) else 0`
+  * `EffectRate = Σ effect_step / total_steps`
+* **NoveltyRate**: fraction of steps that reach a new state hash within episode:
+
+  * `novel_step = 1 if state_hash_after not in seen_hashes else 0`
+* **LoopRate**: fraction of steps where `state_hash_after` appears in the last `N` hashes (N = `rl.reward.loop_window_N`):
+
+  * `loop_step = 1 if state_hash_after in recent_hashes[-N:] else 0`
+
+### 2.3 Controller metrics
+
+* **ModeUsage[m]**: fraction of steps where chosen mode == m
+  Modes: `probe, exploit, escape_loop, focus_click`
+* **ModeEntropy**: mean entropy of controller mode distribution per step:
+
+  * `H_mode = -Σ p(m) log p(m)` (natural log)
+* **ModeAuxAcc** (only if aux CE enabled): accuracy vs heuristic label `mode_target_t`
+
+  * `ModeAuxAcc = mean( argmax(mode_logits) == mode_target )`
+
+### 2.4 Policy (actor) metrics
+
+* **ActionUsage[a]**: frequency of each discrete action id (including RESET if used)
+* **CoordSelectRate**: fraction of steps where ACTION6 is selected
+* **CoordTagUsage[tag]**: for ACTION6 steps, frequency by candidate tag chosen (centroid/corner/edge/changed_focus/…)
+* **PolicyEntropy**: mean entropy of discrete action distribution (masked)
+
+### 2.5 Optimization health metrics (must be logged)
+
+* **PolicyLoss_actor**
+* **PolicyLoss_controller**
+* **ValueLoss**
+* **EntropyBonus_actor**
+* **EntropyBonus_controller**
+* **GradNorm_total**
+* If PPO: **ApproxKL**, **ClipFrac**
+
+---
+
+## 3) Checkpointing policy (what metric selects “best”)
+
+Two checkpoint classes are required:
+
+### 3.1 “Latest” checkpoint (always saved)
+
+Saved every `save_every_iters`:
+
+* includes weights for all NN modules + optimizer state(s) + iteration counter + resolved config.
+
+### 3.2 “Best” checkpoints (metric-selected)
+
+You must maintain separate “best” checkpoints for different training stages because early-stage objectives differ.
+
+#### Stage A: Exploration learning (before wins are common)
+
+**Primary selection metric:** `EvalMeanReturn`
+**Tie-breakers (in order):**
+
+1. higher `EvalEffectRate`
+2. lower `EvalLoopRate`
+3. higher `EvalNoveltyRate`
+4. lower iteration index (earlier is better)
+
+Checkpoint label:
+
+* `best_exploration.ckpt`
+
+#### Stage B: Win optimization (once WinRate is non-trivial)
+
+Switch when `EvalWinRate >= win_switch_threshold` for `K` consecutive evals.
+
+* defaults: `win_switch_threshold = 0.05`, `K = 3`
+
+**Primary selection metric:** `EvalWinRate`
+**Tie-breakers:**
+
+1. higher `EvalMeanReturn`
+2. lower `EvalMeanEpisodeLen`
+3. lower `EvalLoopRate`
+
+Checkpoint label:
+
+* `best_win.ckpt`
+
+#### Stage C (optional): Robustness (held-out generalization)
+
+If you maintain multiple eval sets, keep:
+
+* `best_generalization.ckpt` selected by `EvalWinRate` on the held-out set only.
+
+### 3.3 Per-model checkpointing
+
+No separate per-model “best” files.
+Each “best_*” checkpoint always contains the **full joint model** (encoder+memory+controller+actor+value), because they are trained jointly and not meaningful alone.
+
+---
+
+## 4) Training phases and exact schedules
+
+### 4.1 Phase 0 — Smoke (wiring)
+
+* Train set: 1–5 games
+* `max_actions`: 30–50
+* `episodes_per_iter`: 4–8
+* `iters`: 10–20
+* **Success criteria (must be met):**
+
+  * `TrainEffectRate > 0.05`
+  * `TrainNoveltyRate > 0.05`
+  * `ValueLoss` finite; no NaNs
+  * checkpoints created
+
+No “best” selection in Phase 0.
+
+### 4.2 Phase 1 — Exploration + loop handling
+
+* Train set: 200–2000 games (sample each iteration)
+* `max_actions`: 60–80
+* `episodes_per_iter`: 16–64
+* `iters`: 200–1000
+* Enable controller aux CE (`aux_ce_coef > 0`)
+* Reward weights:
+
+  * novelty and effect enabled (non-zero)
+  * loop penalty enabled
+
+**Primary training target:** raise `EvalMeanReturn` and `EvalEffectRate`, reduce `EvalLoopRate`.
+Maintain `best_exploration.ckpt`.
+
+### 4.3 Phase 2 — Win optimization
+
+* Train set: thousands+ games
+* `max_actions`: 100 (benchmark)
+* `episodes_per_iter`: 32–128
+* `iters`: long-running
+* Anneal novelty:
+
+  * linearly reduce `alpha_novel` from initial to near 0 over `anneal_iters`
+  * keep loop penalty
+  * win reward remains +1
+
+Switch selection to `best_win.ckpt` once threshold is met.
+
+### 4.4 Phase 3 — Stabilization (if needed)
+
+If instability:
+
+* switch algo to PPO
+* reduce LR by 2–10×
+* increase `episodes_per_iter`
+
+Selection remains `best_win.ckpt`.
+
+---
+
+## 5) Evaluation spec (must be strict)
+
+### 5.1 Eval sets
+
+Two fixed lists are required:
+
+* `eval_easy` (optional)
+* `eval_holdout` (required; never used for training)
+
+Each list is fixed by explicit game IDs file committed to repo or stored in run output.
+
+### 5.2 Eval cadence
+
+Run eval every `eval_every_iters` (default 5).
+
+### 5.3 Determinism rules
+
+Eval must be deterministic:
+
+* mode selection: argmax
+* action selection: argmax (after masking + mode logit biases)
+* coord selection: argmax over candidate logits
+* fixed seeds: episode seed derived deterministically from `(global_seed, eval_iter, episode_idx)`
+
+### 5.4 Eval outputs
+
+For each eval run, write:
+
+* `metrics_eval.json` including all metrics in §2 (prefixed `Eval`)
+* per-episode table file (jsonl) with:
+
+  * game_id, seed, win, return, steps, effect_rate, novelty_rate, loop_rate, mode_usage distribution
+* traces for at least `trace_eval_episodes` (default 10), deterministic selection of which episodes are traced.
+
+### 5.5 Metrics used for checkpoint selection
+
+Only **eval** metrics decide “best” checkpoints:
+
+* `EvalMeanReturn` for exploration stage
+* `EvalWinRate` for win stage
+
+Never use training metrics for “best” selection.
+
+---
+
+## 6) Parallel workers and metric aggregation
+
+### 6.1 Rollout workers
+
+If `--workers > 1`, collection is parallel; training update is single-process.
+
+### 6.2 Aggregation rule
+
+All metrics are computed per episode, then aggregated across workers:
+
+* `mean` and `median` for return
+* `mean` for rates
+* `sum` counts reported additionally for sanity:
+
+  * total_episodes, total_steps, wins
+
+---
+
+## 7) Required run artifacts (training-critical)
+
+Per training run directory:
+
+* `configs/resolved_config.json`
+* `checkpoints/latest_*.ckpt`
+* `checkpoints/best_exploration.ckpt` (once Phase 1 starts)
+* `checkpoints/best_win.ckpt` (once switch condition met)
+* `metrics/train_iter_*.json`
+* `metrics/eval_iter_*.json`
+* `metrics/summary.json` (rolling bests + switch condition state)
+* `seeds.jsonl` (episode seeds)
+
+---
+
+If you want this converted into “drop-in” docs matching your existing naming scheme (e.g., `docs/06_training/...`), say the target folder and file naming convention and I’ll output the exact doc filenames and contents.
+

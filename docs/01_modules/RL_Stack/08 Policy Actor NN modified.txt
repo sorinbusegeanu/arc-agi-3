@@ -58,3 +58,54 @@ Policy_Head exposing:
 forward(h_t, available_actions, coord_candidates=None, cfg=None, ctx=None) -> PolicyOutputV1
 
 action_key_normalize_v1.py (shared normalization; must match explorers)
+
+Policy_Actor (NN) — modified (old Policy_Head becomes “actor”)
+Role
+
+Choose environment action conditioned on (h_t, m_t).
+
+Inputs
+
+h_t
+
+m_t (embedded to mode_emb, concat to h_t)
+
+available-actions mask
+
+coord candidates (from CoordProposer) if ACTION6 is available
+
+Outputs
+
+pi_discrete logits over fixed discrete action set
+
+pi_coord logits over K candidates (proposal mode only)
+
+Mode-conditioned masking/bias rules (hard-coded, deterministic)
+
+This is the key to making hierarchy effective.
+
+probe:
+
+encourages exploration: increases entropy (via training loss term) and/or adds a small bias toward actions that tend to change state (configurable)
+
+no hard mask by default
+
+exploit:
+
+no special mask; normal goal-directed behavior learned from extrinsic+shaped reward
+
+escape_loop:
+
+hard-mask the previous action if it repeats within last L steps (requires loop tracker input), else soft-penalize it
+
+focus_click:
+
+soft bias toward ACTION6 if available; if not available, fall back to normal discrete selection
+
+These biases must be implemented as additive logit offsets (deterministic constants per mode).
+
+NN
+
+Same as before: MLP heads
+
+plus mode embedding table
