@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import hashlib
+from array import array
 import json
 import math
 import time
@@ -615,7 +616,7 @@ class Trainer:
                 coord_candidates = step.get("coord_candidates") or []
                 chosen_coord_index = step.get("chosen_coord_index")
 
-                ctrl_out = modules["controller"].forward(h_t, ctx={"is_train": False})
+                ctrl_out = modules["controller"].forward(h_t, ctx={"is_train": True})
                 actor_out = modules["actor"].forward(h_t, mode_id, action_ids, coord_candidates, cfg=cfg_eff)
                 value = modules["value"].forward(h_t).view(1)
                 ret = torch.tensor([rets[i]], dtype=torch.float32, device=device)
@@ -1038,6 +1039,15 @@ class Trainer:
             h_rows.append(h_row)
         h_t_all = torch.stack(h_rows, dim=0).contiguous()
         mode_id_all = torch.tensor([int(r["mode_id"]) for r in flat], dtype=torch.long, device=device)
+        if mode_id_all.numel() > 0:
+            min_mode = int(mode_id_all.min().detach().cpu().item())
+            max_mode = int(mode_id_all.max().detach().cpu().item())
+            if min_mode < 0 or max_mode >= num_modes:
+                bad_mask = (mode_id_all < 0) | (mode_id_all >= num_modes)
+                bad_idx = bad_mask.nonzero(as_tuple=False).view(-1)[:8].detach().cpu().tolist()
+                raise RuntimeError(
+                    f"PPO invalid mode_id_all min={min_mode} max={max_mode} num_modes={num_modes} bad_indices={bad_idx}"
+                )
         chosen_coord_index_all = torch.tensor([int(r["chosen_coord_index"]) for r in flat], dtype=torch.long, device=device)
         mask_valid_step_all = torch.tensor([int(r["mask_valid_step"]) == 1 for r in flat], dtype=torch.bool, device=device).contiguous()
         old_logp_mode_all = torch.tensor([float(r["old_logp_mode"]) for r in flat], dtype=torch.float32, device=device).contiguous()
@@ -1065,16 +1075,17 @@ class Trainer:
                 continue
             if coord_feat_dim_flat is None:
                 raise RuntimeError("coord_feat_dim must be provided by actor or cfg")
-            sig_rows: List[str] = []
+            sig_ints: List[int] = [int(k), int(coord_feat_dim_flat)]
             for cj, cand in enumerate(coords[:k]):
                 fv = cand.get("feat_vec") if isinstance(cand, dict) else None
                 if not isinstance(fv, list) or len(fv) != coord_feat_dim_flat:
                     raise RuntimeError(
                         f"Inconsistent coord feature dim at ep={r.get('ep_idx', '?')} step={r.get('step_idx', '?')} cand={cj}: got {len(fv) if isinstance(fv, list) else None} expected {coord_feat_dim_flat}"
                     )
-                sig_rows.append(",".join(f"{float(x):.4f}" for x in fv))
-            raw = "|".join(sig_rows)
-            coord_sig_all.append(hashlib.sha1(raw.encode("utf-8")).hexdigest())
+                for x in fv:
+                    sig_ints.append(int(round(float(x) * 10000.0)))
+            raw = array("i", sig_ints).tobytes()
+            coord_sig_all.append(hashlib.sha1(raw).hexdigest())
         aux_mode_target_all = [r.get("aux_mode_target") for r in flat]
         aux_mode_weight_all = torch.tensor([float(r.get("aux_mode_weight", 1.0)) for r in flat], dtype=torch.float32, device=device)
         aux_present_all = torch.tensor([t is not None for t in aux_mode_target_all], dtype=torch.bool, device=device)
@@ -1201,11 +1212,57 @@ class Trainer:
             modules["value"].train(prev[2])
 
         allow_bias_cache: Dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+        allow_bias_cache_keys: List[tuple] = []
 
         allow_bias_cache_max = int(ppo_cfg.get("allow_bias_cache_max", 256))
 
-        def _vectorized_logp_eval(valid_indices: List[int], diagnostics: bool = False) -> Dict[str, Any]:
-            if not valid_indices:
+        def _vectorized_logp_eval(valid_indices: torch.Tensor, diagnostics: bool = False) -> Dict[str, Any]:
+            if isinstance(valid_indices, torch.Tensor):
+                if valid_indices.numel() == 0:
+                    zf = torch.zeros((0,), dtype=torch.float32, device=device)
+                    zb = torch.zeros((0,), dtype=torch.bool, device=device)
+                    return {
+                        "old_mode": zf,
+                        "old_action": zf,
+                        "old_coord": zf,
+                        "old_total": zf,
+                        "new_mode": zf,
+                        "new_action": zf,
+                        "new_coord": zf,
+                        "new_total": zf,
+                        "action_mask_union": torch.zeros((0, 0), dtype=torch.bool, device=device),
+                        "coord_mask": torch.zeros((0, 0), dtype=torch.bool, device=device),
+                        "coord_use": zb,
+                        "coord_use_count": 0,
+                        "mode_index": torch.zeros((0,), dtype=torch.long, device=device),
+                        "chosen_coord_index": torch.zeros((0,), dtype=torch.long, device=device),
+                    }
+                idx_t = valid_indices.to(device=device)
+                valid_indices_list = idx_t.detach().cpu().tolist()
+            else:
+                if not valid_indices:
+                    zf = torch.zeros((0,), dtype=torch.float32, device=device)
+                    zb = torch.zeros((0,), dtype=torch.bool, device=device)
+                    return {
+                        "old_mode": zf,
+                        "old_action": zf,
+                        "old_coord": zf,
+                        "old_total": zf,
+                        "new_mode": zf,
+                        "new_action": zf,
+                        "new_coord": zf,
+                        "new_total": zf,
+                        "action_mask_union": torch.zeros((0, 0), dtype=torch.bool, device=device),
+                        "coord_mask": torch.zeros((0, 0), dtype=torch.bool, device=device),
+                        "coord_use": zb,
+                        "coord_use_count": 0,
+                        "mode_index": torch.zeros((0,), dtype=torch.long, device=device),
+                        "chosen_coord_index": torch.zeros((0,), dtype=torch.long, device=device),
+                    }
+                valid_indices_list = list(valid_indices)
+                idx_t = torch.tensor(valid_indices_list, dtype=torch.long, device=device)
+
+            if idx_t.numel() == 0:
                 zf = torch.zeros((0,), dtype=torch.float32, device=device)
                 zb = torch.zeros((0,), dtype=torch.bool, device=device)
                 return {
@@ -1225,7 +1282,6 @@ class Trainer:
                     "chosen_coord_index": torch.zeros((0,), dtype=torch.long, device=device),
                 }
 
-            idx_t = torch.tensor(valid_indices, dtype=torch.long, device=device)
             m = int(idx_t.numel())
             h_t = h_t_all.index_select(0, idx_t).contiguous()
             mode_index = mode_id_all.index_select(0, idx_t)
@@ -1250,7 +1306,7 @@ class Trainer:
             action_temperature = float(cfg_eff.get("temperature", 1.0))
 
             groups: Dict[tuple, List[int]] = {}
-            for row_j, sample_i in enumerate(valid_indices):
+            for row_j, sample_i in enumerate(valid_indices_list):
                 mode_id = int(mode_index_cpu[row_j])
                 action_ids_row = action_ids_all[sample_i]
                 sig = (mode_id, tuple(map(str, action_ids_row)))
@@ -1261,7 +1317,7 @@ class Trainer:
                 action_ids_row = list(action_ids_row)
                 idx_rows = torch.tensor(rows, dtype=torch.long, device=device)
                 h_group = h_t.index_select(0, idx_rows).contiguous()
-                sample_indices = [valid_indices[r] for r in rows]
+                sample_indices = [valid_indices_list[r] for r in rows]
                 env_masks = [action_env_mask_local_all[sample_i] for sample_i in sample_indices]
                 env_mask_batch = torch.stack(env_masks, dim=0)
                 cache_key = (mode_id, tuple(map(str, action_ids_row)))
@@ -1277,9 +1333,12 @@ class Trainer:
                     bias_cfg = (cfg_eff.get("mode_action_bias", {}) or {}).get(str(mode_id), {})
                     bias_row = [float(bias_cfg.get(a, 0.0)) for a in action_ids_row] if isinstance(bias_cfg, dict) else [0.0 for _ in action_ids_row]
                     bias_row_t = torch.tensor([bias_row], dtype=torch.float32, device=device)
-                    if len(allow_bias_cache) >= allow_bias_cache_max:
-                        allow_bias_cache.pop(next(iter(allow_bias_cache)))
-                    allow_bias_cache[cache_key] = (allow_row_t, bias_row_t)
+                    if cache_key not in allow_bias_cache:
+                        allow_bias_cache[cache_key] = (allow_row_t, bias_row_t)
+                        allow_bias_cache_keys.append(cache_key)
+                        if len(allow_bias_cache_keys) > allow_bias_cache_max:
+                            evict_key = allow_bias_cache_keys.pop(0)
+                            allow_bias_cache.pop(evict_key, None)
                 allow_mask = allow_row_t.expand(env_mask_batch.shape[0], -1)
                 mode_bias = bias_row_t.expand(env_mask_batch.shape[0], -1)
                 final_mask = env_mask_batch & allow_mask
@@ -1347,7 +1406,7 @@ class Trainer:
             valid_coords: List[int] = [0 for _ in range(m)] if diagnostics else []
             coord_feat_dim = _coord_feat_dim(cfg_eff, modules["actor"])
             groups = {}
-            for row_j, sample_i in enumerate(valid_indices):
+            for row_j, sample_i in enumerate(valid_indices_list):
                 mode_id = int(mode_index_cpu[row_j])
                 action_ids_row = action_ids_all[sample_i]
                 if bool(coord_use_cpu[row_j]):
@@ -1362,46 +1421,106 @@ class Trainer:
             for sig, rows in groups.items():
                 mode_id, action_ids_row, k_coord, _coord_sig = sig
                 action_ids_row = list(action_ids_row)
-                sample_indices = [valid_indices[r] for r in rows]
+                sample_indices = [valid_indices_list[r] for r in rows]
                 if k_coord > 0:
-                    for row_j in rows:
-                        sample_i = valid_indices[row_j]
-                        coords = coord_candidates_all[sample_i][:k_coord]
-                        h_row = h_t[row_j].unsqueeze(0)
-                        coord_mask = torch.ones((1, k_coord), dtype=torch.bool, device=device)
-                        actor_out_coord = modules["actor"].forward(
-                            h_row,
-                            mode_id,
-                            action_ids_row,
-                            coords,
-                            cfg=cfg_eff,
-                        )
-                        pi_coord = _build_coord_pi(
-                            actor_out_coord["pi_coord"][:, :k_coord],
-                            coord_mask,
-                            torch.full((1,), int(mode_id), dtype=torch.long, device=device),
-                            cfg_eff,
-                            action_temperature,
-                            apply_bias=True,
-                        )
-                        coord_rows_t = torch.tensor([row_j], dtype=torch.long, device=device)
-                        cidx_t = chosen_coord_index.index_select(0, coord_rows_t)
-                        if bool((cidx_t < 0).any()) or bool((cidx_t >= k_coord).any()):
-                            coord_sample_indices = [sample_i]
-                            cidx_list = [int(cidx_t[0].detach().cpu().item())]
-                            raise RuntimeError(
-                                f"PPO invalid chosen_coord_index step={coord_sample_indices} chosen_coord_index={cidx_list} k={k_coord}"
+                    idx_rows = torch.tensor(rows, dtype=torch.long, device=device)
+                    h_group = h_t.index_select(0, idx_rows).contiguous()
+                    coords_batch = [coord_candidates_all[sample_i][:k_coord] for sample_i in sample_indices]
+                    batched_ok = True
+                    coords_feat = torch.zeros((len(rows), k_coord, coord_feat_dim), dtype=torch.float32, device=device)
+                    coords_mask = torch.zeros((len(rows), k_coord), dtype=torch.bool, device=device)
+                    for b, coords in enumerate(coords_batch):
+                        if len(coords) < k_coord:
+                            batched_ok = False
+                            break
+                        for cj, cand in enumerate(coords[:k_coord]):
+                            fv = cand.get("feat_vec") if isinstance(cand, dict) else None
+                            if not isinstance(fv, list) or len(fv) != coord_feat_dim:
+                                batched_ok = False
+                                break
+                            coords_feat[b, cj, :] = torch.tensor(fv, dtype=torch.float32, device=device)
+                            coords_mask[b, cj] = True
+                        if not batched_ok:
+                            break
+                    if batched_ok:
+                        try:
+                            actor_out_coord = modules["actor"].forward(
+                                h_group,
+                                mode_id,
+                                action_ids_row,
+                                coords_feat,
+                                cfg=cfg_eff,
                             )
-                        c_logp, c_ent = modules["actor"].coord_logp_entropy(
-                            pi_coord,
-                            cidx_t,
-                            coord_mask=None,
-                        )
-                        coord_logp_new.index_copy_(0, coord_rows_t, c_logp.view(-1))
-                        coord_entropy_all.index_copy_(0, coord_rows_t, c_ent.view(-1))
-                        if diagnostics:
-                            coord_mask_list[row_j] = [True for _ in range(k_coord)]
-                            valid_coords[row_j] = int(k_coord)
+                            pi_raw = actor_out_coord["pi_coord"]
+                            if pi_raw.dim() != 3 or pi_raw.shape[0] != len(rows):
+                                batched_ok = False
+                            else:
+                                pi_coord = _build_coord_pi(
+                                    pi_raw[:, :k_coord],
+                                    coords_mask,
+                                    torch.full((len(rows),), int(mode_id), dtype=torch.long, device=device),
+                                    cfg_eff,
+                                    action_temperature,
+                                    apply_bias=True,
+                                )
+                                cidx_t = chosen_coord_index.index_select(0, idx_rows)
+                                if bool((cidx_t < 0).any()) or bool((cidx_t >= k_coord).any()):
+                                    cidx_list = [int(v) for v in cidx_t.detach().cpu().tolist()]
+                                    raise RuntimeError(
+                                        f"PPO invalid chosen_coord_index step={sample_indices} chosen_coord_index={cidx_list} k={k_coord}"
+                                    )
+                                c_logp, c_ent = modules["actor"].coord_logp_entropy(
+                                    pi_coord,
+                                    cidx_t,
+                                    coord_mask=None,
+                                )
+                                coord_logp_new.index_copy_(0, idx_rows, c_logp.view(-1))
+                                coord_entropy_all.index_copy_(0, idx_rows, c_ent.view(-1))
+                                if diagnostics:
+                                    for row_j in rows:
+                                        coord_mask_list[row_j] = [True for _ in range(k_coord)]
+                                        valid_coords[row_j] = int(k_coord)
+                        except Exception:
+                            batched_ok = False
+                    if not batched_ok:
+                        for row_j in rows:
+                            sample_i = valid_indices_list[row_j]
+                            coords = coord_candidates_all[sample_i][:k_coord]
+                            h_row = h_t[row_j].unsqueeze(0)
+                            coord_mask = torch.ones((1, k_coord), dtype=torch.bool, device=device)
+                            actor_out_coord = modules["actor"].forward(
+                                h_row,
+                                mode_id,
+                                action_ids_row,
+                                coords,
+                                cfg=cfg_eff,
+                            )
+                            pi_coord = _build_coord_pi(
+                                actor_out_coord["pi_coord"][:, :k_coord],
+                                coord_mask,
+                                torch.full((1,), int(mode_id), dtype=torch.long, device=device),
+                                cfg_eff,
+                                action_temperature,
+                                apply_bias=True,
+                            )
+                            coord_rows_t = torch.tensor([row_j], dtype=torch.long, device=device)
+                            cidx_t = chosen_coord_index.index_select(0, coord_rows_t)
+                            if bool((cidx_t < 0).any()) or bool((cidx_t >= k_coord).any()):
+                                coord_sample_indices = [sample_i]
+                                cidx_list = [int(cidx_t[0].detach().cpu().item())]
+                                raise RuntimeError(
+                                    f"PPO invalid chosen_coord_index step={coord_sample_indices} chosen_coord_index={cidx_list} k={k_coord}"
+                                )
+                            c_logp, c_ent = modules["actor"].coord_logp_entropy(
+                                pi_coord,
+                                cidx_t,
+                                coord_mask=None,
+                            )
+                            coord_logp_new.index_copy_(0, coord_rows_t, c_logp.view(-1))
+                            coord_entropy_all.index_copy_(0, coord_rows_t, c_ent.view(-1))
+                            if diagnostics:
+                                coord_mask_list[row_j] = [True for _ in range(k_coord)]
+                                valid_coords[row_j] = int(k_coord)
 
             if diagnostics:
                 max_k = max([len(r) for r in coord_mask_list], default=0)
@@ -1439,15 +1558,15 @@ class Trainer:
             }
 
         # Pre-update sanity check: recompute logp on incoming batch before any optimizer step.
-        pre_valid_idx = [i for i in range(n) if mask_valid_step_cpu[i]]
+        pre_valid_idx_t = mask_valid_step_all.nonzero(as_tuple=False).view(-1)
         with torch.no_grad():
             t_pre_eval_start = time.time()
             if preupdate_eval_mode:
                 prev_states = _set_eval_for_recompute()
-                pre_eval = _vectorized_logp_eval(pre_valid_idx, diagnostics=True)
+                pre_eval = _vectorized_logp_eval(pre_valid_idx_t, diagnostics=True)
                 _restore_train_mode(prev_states)
             else:
-                pre_eval = _vectorized_logp_eval(pre_valid_idx, diagnostics=True)
+                pre_eval = _vectorized_logp_eval(pre_valid_idx_t, diagnostics=True)
             t_pre_eval += time.time() - t_pre_eval_start
             pre_old_mode = pre_eval["old_mode"]
             pre_old_action = pre_eval["old_action"]
@@ -1502,7 +1621,10 @@ class Trainer:
             else:
                 diff = (pre_old_action - pre_new_action).abs()
                 max_i = int(diff.argmax().detach().cpu().item()) if diff.numel() > 0 else -1
-            global_i = pre_valid_idx[max_i] if max_i >= 0 and max_i < len(pre_valid_idx) else -1
+            if max_i >= 0 and max_i < int(pre_valid_idx_t.numel()):
+                global_i = int(pre_valid_idx_t[max_i].detach().cpu().item())
+            else:
+                global_i = -1
             local_action_ids = action_ids_all[global_i] if global_i >= 0 else []
             local_action_index = action_index_cpu[global_i] if global_i >= 0 else -1
             action_id_dbg = local_action_ids[local_action_index] if 0 <= local_action_index < len(local_action_ids) else "ACTION1"
@@ -1607,8 +1729,8 @@ class Trainer:
         epochs_ran = 0
         entropy_action_discrete_vals: List[torch.Tensor] = []
         entropy_action_coord_vals: List[torch.Tensor] = []
-        entropy_mode_sum: Dict[int, float] = {}
-        entropy_mode_count: Dict[int, int] = {}
+        entropy_mode_sum_t = torch.zeros((num_modes,), dtype=torch.float32, device=device)
+        entropy_mode_count_t = torch.zeros((num_modes,), dtype=torch.float32, device=device)
 
         stop_early = False
         device_check_done = False
@@ -1625,11 +1747,11 @@ class Trainer:
             )
             gen = torch.Generator(device="cpu")
             gen.manual_seed(rng_seed + epoch)
-            indices = torch.randperm(n, generator=gen, device="cpu").tolist()
+            perm = torch.randperm(n, generator=gen, device="cpu")
 
             for mb_start in range(0, n, mb_size):
-                mb_idx = indices[mb_start : mb_start + mb_size]
-                if not mb_idx:
+                mb_idx_t_cpu = perm[mb_start : mb_start + mb_size]
+                if mb_idx_t_cpu.numel() == 0:
                     continue
                 mb_done += 1
 
@@ -1649,16 +1771,24 @@ class Trainer:
                 ent_action_discrete: List[torch.Tensor] = []
                 ent_action_coord: List[torch.Tensor] = []
 
-                mb_idx_t = torch.tensor(mb_idx, dtype=torch.long, device=device)
+                mb_idx_t = mb_idx_t_cpu.to(device=device)
                 valid_sel = mask_valid_step_all.index_select(0, mb_idx_t)
                 valid_idx_t = mb_idx_t[valid_sel]
                 if valid_idx_t.numel() == 0:
                     continue
                 idx_t = valid_idx_t
-                valid_idx = valid_idx_t.detach().cpu().tolist()
                 m = int(idx_t.numel())
                 h_t = h_t_all.index_select(0, idx_t).contiguous()
                 mode_index = mode_id_all.index_select(0, idx_t)
+                if mode_index.numel() > 0:
+                    min_mode = int(mode_index.min().detach().cpu().item())
+                    max_mode = int(mode_index.max().detach().cpu().item())
+                    if min_mode < 0 or max_mode >= num_modes:
+                        bad_mask = (mode_index < 0) | (mode_index >= num_modes)
+                        bad_vals = mode_index[bad_mask].detach().cpu().tolist()[:8]
+                        raise RuntimeError(
+                            f"PPO invalid mode_index iter={iter_idx} epoch={epoch + 1} minibatch={mb_done} min={min_mode} max={max_mode} num_modes={num_modes} bad_values={bad_vals}"
+                        )
                 chosen_coord_index = chosen_coord_index_all.index_select(0, idx_t)
                 old_logp_mode = old_logp_mode_all.index_select(0, idx_t)
                 old_logp_action = old_logp_action_all.index_select(0, idx_t)
@@ -1670,10 +1800,10 @@ class Trainer:
                 t_mb_eval_start = time.time()
                 if preupdate_eval_mode:
                     prev_states = _set_eval_for_recompute()
-                    eval_out = _vectorized_logp_eval(valid_idx)
+                    eval_out = _vectorized_logp_eval(valid_idx_t)
                     _restore_train_mode(prev_states)
                 else:
-                    eval_out = _vectorized_logp_eval(valid_idx)
+                    eval_out = _vectorized_logp_eval(valid_idx_t)
                 t_mb_eval += time.time() - t_mb_eval_start
                 value_new = modules["value"].forward(h_t).view(-1)
 
@@ -1685,7 +1815,7 @@ class Trainer:
                 coord_entropy_all = eval_out["coord_entropy"]
                 coord_use = eval_out["coord_use"]
                 coord_mask = eval_out["coord_mask"]
-                ctrl_logits = eval_out["mode_logits"]
+                ctrl_logits = eval_out["mode_logits"] / float(controller_temp)
 
                 ratio_mode = torch.exp(mode_logp_new - old_logp_mode)
                 ratio_mode_clip = torch.clamp(ratio_mode, 1.0 - clip_eps_controller, 1.0 + clip_eps_controller)
@@ -1728,12 +1858,8 @@ class Trainer:
                 value_losses.append(v_loss)
 
                 ent_mode.append(mode_entropy_new.mean())
-                for mode_val in range(num_modes):
-                    sel = mode_index == mode_val
-                    if bool(sel.any()):
-                        val = float(mode_entropy_new[sel].mean().detach().cpu().item())
-                        entropy_mode_sum[mode_val] = entropy_mode_sum.get(mode_val, 0.0) + val
-                        entropy_mode_count[mode_val] = entropy_mode_count.get(mode_val, 0) + 1
+                entropy_mode_sum_t.scatter_add_(0, mode_index, mode_entropy_new)
+                entropy_mode_count_t.scatter_add_(0, mode_index, torch.ones_like(mode_entropy_new))
 
                 aux_present = aux_present_all.index_select(0, idx_t)
                 if bool(aux_present.any()):
@@ -1806,10 +1932,10 @@ class Trainer:
                         t_mb_eval_start = time.time()
                         if preupdate_eval_mode:
                             prev_states = _set_eval_for_recompute()
-                            post_eval = _vectorized_logp_eval(valid_idx)
+                            post_eval = _vectorized_logp_eval(valid_idx_t)
                             _restore_train_mode(prev_states)
                         else:
-                            post_eval = _vectorized_logp_eval(valid_idx)
+                            post_eval = _vectorized_logp_eval(valid_idx_t)
                         t_mb_eval += time.time() - t_mb_eval_start
                         post_log_ratio_mode = post_eval["new_mode"] - post_eval["old_mode"]
                         post_log_ratio_action = post_eval["new_action"] - post_eval["old_action"]
@@ -2007,8 +2133,12 @@ class Trainer:
                 "entropy_action_discrete": float(torch.stack(entropy_action_discrete_vals).mean().detach().cpu().item()) if entropy_action_discrete_vals else 0.0,
                 "entropy_action_coord": float(torch.stack(entropy_action_coord_vals).mean().detach().cpu().item()) if entropy_action_coord_vals else 0.0,
                 "entropy_by_mode": {
-                    str(k): float(entropy_mode_sum.get(k, 0.0) / max(1, entropy_mode_count.get(k, 0)))
-                    for k in sorted(entropy_mode_sum.keys())
+                    str(k): float(
+                        entropy_mode_sum_t[k].detach().cpu().item()
+                        / max(1.0, entropy_mode_count_t[k].detach().cpu().item())
+                    )
+                    for k in range(num_modes)
+                    if float(entropy_mode_count_t[k].detach().cpu().item()) > 0.0
                 },
                 "ppo_epochs_ran": int(epochs_ran),
                 "adv_mean": float(adv_mean),

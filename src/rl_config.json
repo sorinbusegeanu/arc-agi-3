@@ -74,10 +74,13 @@
   "deterministic_eval": true,
   "save_trajectory_batches": false,
   "reward": {
-    "alpha_novel": 0.05,
-    "beta_effect": 0.02,
-    "negative_step": 0.5,
-    "delta_loop": 0.05,
+    "alpha_novel": 0.02,
+    "beta_effect": 0.2,
+    "lambda_noop": 0.005,
+    "flash_changed_total_thresh": 0.5,
+    "flash_changed_masked_thresh": 0.5,
+    "flash_hist_l1_thresh": 0.15,
+    "delta_loop": 0.01,
     "loop_window_N": 25,
     "ui_bar": {
       "enabled": true,
@@ -128,9 +131,9 @@
     "max_grad_norm": 0.5,
     "bptt_chunk_len": 32,
     "value_coef": 0.5,
-    "entropy_coef_actor_phase1": 0.02,
+    "entropy_coef_actor_phase1": 0.01,
     "entropy_coef_actor_phase2": 0.005,
-    "entropy_coef_controller": 0.01,
+    "entropy_coef_controller": 0.005,
     "aux_ce_coef": 0.02
   },
   "ckpt": {

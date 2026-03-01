@@ -17,6 +17,10 @@ def _default_cfg() -> Dict[str, Any]:
         "delta_loop": 0.05,
         "loop_window_N": 25,
         "controller_aux_weight": 0.2,
+        "lambda_noop": 0.05,
+        "flash_changed_total_thresh": 0.5,
+        "flash_changed_masked_thresh": 0.5,
+        "flash_hist_l1_thresh": 0.15,
     }
 
 
@@ -116,8 +120,8 @@ class RewardShaper:
         delta = np.asarray(grid_curr != grid_prev, dtype=bool)
         h = int(grid_curr.shape[0])
         w = int(grid_curr.shape[1])
-        den = int(max(1, h))
         area = int(max(1, h * w))
+        masked_area = 0  # will be set after hud_mask computed
         raw_count = int(delta.sum())
         if raw_count > (area // 2):
             raw_count = 0
@@ -128,8 +132,11 @@ class RewardShaper:
             hud_mask = np.zeros((h, w), dtype=bool)
         if hud_mask.shape != delta.shape:
             hud_mask = np.zeros_like(delta, dtype=bool)
+        masked_area = int(max(1, int((~hud_mask).sum())))
+        den = masked_area
         delta_masked = np.asarray(delta & ~hud_mask, dtype=bool)
-        changed_cells_masked_count = int(delta_masked.sum())
+        masked_count_raw = int(delta_masked.sum())
+        changed_cells_masked_count = int(masked_count_raw)
         if changed_cells_masked_count > (area // 2):
             changed_cells_masked_count = 0
         hud_overlap_count = int(np.logical_and(delta, hud_mask).sum())
@@ -146,6 +153,25 @@ class RewardShaper:
                 x1 = max(0, min(w, x1))
                 if y1 > y0 and x1 > x0:
                     changed_cells_bbox_count = int(delta[y0:y1, x0:x1].sum())
+        raw_count_raw = int(delta.sum())
+        changed_total_frac = float(raw_count_raw) / float(area)
+        changed_masked_frac = float(masked_count_raw) / float(masked_area)
+        flash_changed_total_thresh = float(cfg_ctx.get("flash_changed_total_thresh", 0.5))
+        flash_changed_masked_thresh = float(cfg_ctx.get("flash_changed_masked_thresh", 0.5))
+        flash_hist_l1_thresh = float(cfg_ctx.get("flash_hist_l1_thresh", 0.15))
+        hist_l1 = 1.0
+        flash_event = False
+        try:
+            h_prev = np.bincount(grid_prev.reshape(-1).clip(0, 10), minlength=11).astype(np.float64)
+            h_curr = np.bincount(grid_curr.reshape(-1).clip(0, 10), minlength=11).astype(np.float64)
+            hist_l1 = float(np.abs(h_prev - h_curr).sum() / float(area))
+            flash_event = (
+                (changed_total_frac >= flash_changed_total_thresh)
+                and (changed_masked_frac >= flash_changed_masked_thresh)
+                and (hist_l1 <= flash_hist_l1_thresh)
+            )
+        except Exception:
+            flash_event = False
         return {
             "effect_changed_cells_masked": float(changed_cells_masked_count) / float(den),
             "changed_cells_masked_count": float(changed_cells_masked_count),
@@ -154,6 +180,13 @@ class RewardShaper:
             "hud_overlap_count": float(hud_overlap_count),
             "changed_cells_outside_count": float(changed_cells_outside_count),
             "changed_cells_bbox_count": float(changed_cells_bbox_count),
+            "changed_total_count": float(raw_count),
+            "changed_masked_frac": float(masked_count_raw) / float(masked_area),
+            "changed_total_frac": float(raw_count_raw) / float(area),
+            "masked_area": float(masked_area),
+            "area": float(area),
+            "flash_event": float(1.0 if flash_event else 0.0),
+            "hist_l1": float(hist_l1),
             "H": float(h),
             "W": float(w),
             "den": float(den),
@@ -171,8 +204,11 @@ class RewardShaper:
     ) -> Dict[str, Any]:
         cfg_eff = {**_default_cfg(), **(cfg or {})}
         cfg_ctx = dict(ctx or {})
-        seen = seen_hashes or set()
-        recent = recent_hashes or []
+        cfg_ctx.setdefault("flash_changed_total_thresh", float(cfg_eff.get("flash_changed_total_thresh", 0.5)))
+        cfg_ctx.setdefault("flash_changed_masked_thresh", float(cfg_eff.get("flash_changed_masked_thresh", 0.5)))
+        cfg_ctx.setdefault("flash_hist_l1_thresh", float(cfg_eff.get("flash_hist_l1_thresh", 0.15)))
+        seen = seen_hashes if seen_hashes is not None else set()
+        recent = recent_hashes if recent_hashes is not None else []
 
         grid_prev = np.asarray(cfg_ctx.get("grid_prev"), dtype=np.int64)
         grid_curr = np.asarray(cfg_ctx.get("grid_curr"), dtype=np.int64)
@@ -187,6 +223,8 @@ class RewardShaper:
                 w = int(pre.get("W", int(grid_curr.shape[1])))
                 den = int(pre.get("den", max(1, h * w)))
                 changed_cells_raw = int(pre.get("changed_cells_raw", 0))
+                changed_cells_masked_count = int(pre.get("changed_cells_masked_count", 0))
+                flash_event = bool(float(pre.get("flash_event", 0.0)))
             else:
                 eff = self.effect_from_transition(game_id, grid_prev, grid_curr, cfg_ctx)
                 effect_changed_cells = float(eff["effect_changed_cells_masked"])
@@ -194,7 +232,19 @@ class RewardShaper:
                 w = int(eff["W"])
                 den = int(eff["den"])
                 changed_cells_raw = int(eff["changed_cells_raw"])
-            state_hash = stable_hash_grid(grid_curr)
+                changed_cells_masked_count = int(eff.get("changed_cells_masked_count", 0.0))
+                flash_event = bool(float(eff.get("flash_event", 0.0)))
+            use_hud_mask = bool(cfg_ctx.get("use_hud_mask", True))
+            if use_hud_mask:
+                hud_mask = self._load_hud_mask(str(game_id), (int(grid_curr.shape[0]), int(grid_curr.shape[1])), cfg_ctx)
+                if hud_mask.shape == grid_curr.shape and np.any(hud_mask):
+                    grid_for_hash = np.array(grid_curr, copy=True)
+                    grid_for_hash[hud_mask] = 0
+                    state_hash = stable_hash_grid(grid_for_hash)
+                else:
+                    state_hash = stable_hash_grid(grid_curr)
+            else:
+                state_hash = stable_hash_grid(grid_curr)
         else:
             grid_delta = event.get("grid_delta", {}) if isinstance(event, dict) else {}
             effect_changed_cells = float(grid_delta.get("changed_cells_count_filtered", grid_delta.get("changed_cells_count", 0)) or 0)
@@ -203,29 +253,64 @@ class RewardShaper:
                 or (event.get("state_hash_after") if isinstance(event, dict) else None)
                 or ""
             )
+            changed_cells_raw = int(grid_delta.get("changed_cells_count", 0) or 0)
+            changed_cells_masked_count = int(grid_delta.get("changed_cells_count_filtered", changed_cells_raw) or 0)
+            flash_event = False
 
         action_key = event.get("action_key", {}) if isinstance(event, dict) else {}
         action_id = str(action_key.get("id") or action_key.get("action_id") or "")
 
         r_win = 1.0 if bool(win) else 0.0
         r_env = 0.0
-        effect_flag = float(effect_changed_cells) > 0.0
+        effect_changed_cells_metric = float(effect_changed_cells)
+        effect_flag_raw = float(effect_changed_cells_metric) > 0.0
         novel_flag = bool(state_hash and state_hash not in seen)
         repeat_flag = bool(state_hash and state_hash in recent)
 
-        negative_step = float(cfg_eff.get("negative_step", 0.5))
-        r_effect = float(cfg_eff["beta_effect"]) * float(effect_changed_cells - negative_step)
-        r_novel = 0.0
-        r_loop = 0.0
+        beta_effect = float(cfg_eff.get("beta_effect", 0.0))
+        lambda_noop = float(cfg_eff.get("lambda_noop", 0.0))
+        if flash_event:
+            r_effect = 0.0
+            r_noop = 0.0
+            effect_changed_cells = 0.0
+        else:
+            r_effect = beta_effect * float(effect_changed_cells)
+            is_explicit_noop = action_id.upper() in ("ACTION0", "NOOP", "NOP")
+            r_noop = (
+                (-lambda_noop)
+                if (not is_explicit_noop and float(effect_changed_cells) == 0.0 and not win)
+                else 0.0
+            )
+        effect_flag_filtered = float(effect_changed_cells) > 0.0
+        novel_flag_filtered = (not flash_event) and novel_flag
+        repeat_flag_filtered = (not flash_event) and repeat_flag
+        # Flash event gating (life-loss / forced change): do not award exploration terms
+        if flash_event:
+            r_novel = 0.0
+            r_loop = 0.0
+        else:
+            alpha_novel = float(cfg_eff.get("alpha_novel", 0.0))
+            delta_loop = float(cfg_eff.get("delta_loop", 0.0))
+            r_novel = alpha_novel * (1.0 if novel_flag else 0.0)
+            r_loop = (-delta_loop) * (1.0 if repeat_flag else 0.0)
 
-        r_total = float(r_win + r_env + r_effect + r_novel + r_loop)
+        r_total = float(r_win + r_env + r_effect + r_novel + r_loop + r_noop)
 
         if action_id.upper() == "ACTION6":
             mode_target = 2
-        elif float(effect_changed_cells) > 0.0 or win:
+        elif (float(effect_changed_cells) > 0.0 and not flash_event) or win:
             mode_target = 1
         else:
             mode_target = 0
+
+        if (not flash_event) and state_hash:
+            if seen_hashes is not None:
+                seen_hashes.add(state_hash)
+            if recent_hashes is not None:
+                recent_hashes.append(state_hash)
+                N = int(cfg_eff.get("loop_window_N", 25))
+                if N > 0 and len(recent_hashes) > N:
+                    del recent_hashes[:-N]
 
         return {
             "schema_version": "REWARD_V1",
@@ -236,13 +321,15 @@ class RewardShaper:
                 "r_effect": float(r_effect),
                 "r_novel": float(r_novel),
                 "r_loop": float(r_loop),
-                "effect_flag_raw": bool(effect_flag),
-                "effect_flag_filtered": bool(effect_flag),
+                "r_noop": float(r_noop),
+                "flash_event": bool(flash_event),
+                "effect_flag_raw": bool(effect_flag_raw),
+                "effect_flag_filtered": bool(effect_flag_filtered),
                 "novel_flag_raw": bool(novel_flag),
-                "novel_flag_filtered": bool(novel_flag),
+                "novel_flag_filtered": bool(novel_flag_filtered),
                 "repeat_flag_raw": bool(repeat_flag),
-                "repeat_flag_filtered": bool(repeat_flag),
-                "effect_changed_cells": float(effect_changed_cells),
+                "repeat_flag_filtered": bool(repeat_flag_filtered),
+                "effect_changed_cells": float(effect_changed_cells_metric),
                 "state_hash": str(state_hash),
             },
             "aux": {

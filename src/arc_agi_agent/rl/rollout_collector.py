@@ -488,6 +488,38 @@ class RolloutCollector:
                         pass
                 reward_total = float(reward["r_total"])
                 reward_terms = reward.get("terms", {}) if isinstance(reward.get("terms"), dict) else {}
+                raw_env_reward = None
+                if isinstance(event_json, dict):
+                    raw_env_reward = event_json.get("reward")
+                    if raw_env_reward is None:
+                        raw_env_reward = event_json.get("env_reward")
+                if reward_total < -0.5 or reward_total > 2.0:
+                    logger.error(
+                        "reward_out_of_range game_id=%s step=%s action_id=%s flash_event=%s env_reward=%s r_total=%.6f terms=%s",
+                        game_id,
+                        step_idx,
+                        action_id,
+                        bool(reward_terms.get("flash_event", False)),
+                        raw_env_reward,
+                        reward_total,
+                        reward_terms,
+                    )
+                    raise RuntimeError("reward_total out of expected range")
+                logger.info(
+                    "reward_step game_id=%s step=%s action_id=%s env_reward=%s r_total=%.6f r_win=%.6f r_env=%.6f r_effect=%.6f r_novel=%.6f r_loop=%.6f r_noop=%.6f flash_event=%s",
+                    game_id,
+                    step_idx,
+                    action_id,
+                    raw_env_reward,
+                    reward_total,
+                    float(reward_terms.get("r_win", 0.0)),
+                    float(reward_terms.get("r_env", 0.0)),
+                    float(reward_terms.get("r_effect", 0.0)),
+                    float(reward_terms.get("r_novel", 0.0)),
+                    float(reward_terms.get("r_loop", 0.0)),
+                    float(reward_terms.get("r_noop", 0.0)),
+                    bool(reward_terms.get("flash_event", False)),
+                )
                 action_log = (
                     f"ACTION6({int(action.get('x')) if action.get('x') is not None else 0},{int(action.get('y')) if action.get('y') is not None else 0})"
                     if action.get("type") == "coord" and chosen_coord_index is not None
@@ -605,15 +637,42 @@ class RolloutCollector:
                 if done:
                     break
 
-            batch["episodes"].append(
-                {
-                    "game_id": game_id,
-                    "seed": seed,
-                    "steps": steps,
-                    "done": bool(done if collect_mode == "probe" else (steps and steps[-1].get("done", False))),
-                    "win": bool(steps and any(s.get("win", False) for s in steps)),
-                    "num_steps": len(steps),
-                }
-            )
+                if steps:
+                    r_env_sum = 0.0
+                    r_win_sum = 0.0
+                    r_effect_sum = 0.0
+                    r_novel_sum = 0.0
+                    r_loop_sum = 0.0
+                    r_noop_sum = 0.0
+                    for s in steps:
+                        terms = s.get("reward_terms", {}) if isinstance(s.get("reward_terms"), dict) else {}
+                        r_env_sum += float(terms.get("r_env", 0.0))
+                        r_win_sum += float(terms.get("r_win", 0.0))
+                        r_effect_sum += float(terms.get("r_effect", 0.0))
+                        r_novel_sum += float(terms.get("r_novel", 0.0))
+                        r_loop_sum += float(terms.get("r_loop", 0.0))
+                        r_noop_sum += float(terms.get("r_noop", 0.0))
+                    logger.info(
+                        "reward_breakdown game_id=%s seed=%s steps=%s r_env=%.6f r_win=%.6f r_effect=%.6f r_novel=%.6f r_loop=%.6f r_noop=%.6f",
+                        game_id,
+                        seed,
+                        len(steps),
+                        r_env_sum,
+                        r_win_sum,
+                        r_effect_sum,
+                        r_novel_sum,
+                        r_loop_sum,
+                        r_noop_sum,
+                    )
+                batch["episodes"].append(
+                    {
+                        "game_id": game_id,
+                        "seed": seed,
+                        "steps": steps,
+                        "done": bool(done if collect_mode == "probe" else (steps and steps[-1].get("done", False))),
+                        "win": bool(steps and any(s.get("win", False) for s in steps)),
+                        "num_steps": len(steps),
+                    }
+                )
 
         return batch
