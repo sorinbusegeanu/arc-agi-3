@@ -262,9 +262,7 @@ class RolloutCollector:
         trace_enabled = bool(cfg_eff.get("log", {}).get("write_trace", False))
         save_full_batch = bool(cfg_eff.get("rl", {}).get("save_full_batch", False))
         frame_stack_len = max(1, int(cfg_eff.get("frame_stack", 4)))
-        collect_mode = str(cfg_eff.get("mode", "train")).lower()
         minimal_batch_mode = bool(rl_only_mode and (not trace_enabled) and (not save_full_batch))
-        hud_probe_acc = (ctx or {}).get("hud_probe_accumulator")
 
         batch = {"schema_version": "TRAJECTORY_BATCH_V1", "episodes": [], "available_actions_mask_format": "bool_nd"}
 
@@ -327,152 +325,108 @@ class RolloutCollector:
                 grid_stack_list = list(frame_buffer)
                 while len(grid_stack_list) < frame_stack_len:
                     grid_stack_list.insert(0, grid_stack_list[0].copy())
-                if collect_mode == "probe":
-                    mode_id = 0
-                    mode_logits = torch.zeros((1, max(1, len(cfg_eff.get("modes", [])))), dtype=torch.float32)
-                    coords = []
-                    grid0 = grid_stack_list[-1].tolist() if grid_stack_list else None
-                    avail = obs_norm_curr.get("meta", {}).get("available_actions_sorted", [])
-                    cand_ids: List[str] = []
-                    if isinstance(avail, list) and avail:
-                        for a in avail:
-                            if isinstance(a, int):
-                                if 0 <= int(a) < len(action_ids):
-                                    cand_ids.append(str(action_ids[int(a)]))
-                                continue
-                            s = str(a)
-                            if s in action_ids:
-                                cand_ids.append(s)
-                                continue
-                            if s.isdigit():
-                                ii = int(s)
-                                if 0 <= ii < len(action_ids):
-                                    cand_ids.append(str(action_ids[ii]))
-                    if not cand_ids:
-                        cand_ids = list(action_ids)
-                    non_coord = [a for a in cand_ids if str(a).upper() != "ACTION6"]
-                    action_id = random.choice(non_coord if non_coord else cand_ids)
-                    action_idx = action_ids.index(action_id) if action_id in action_ids else 0
-                    policy_entropy = 0.0
-                    mode_entropy = 0.0
-                    old_value = 0.0
+                with torch.no_grad():
+                    enc = modules["encoder"].encode(
+                        obs,
+                        fp_report=fp_curr,
+                        ctx={
+                            "action_schema": {"actions": [{"action_id": a} for a in action_ids]},
+                            "obs_norm": obs_norm_curr,
+                            "grid_stack": grid_stack_list,
+                        },
+                    )
+                    z_t = enc["z_t"]
+                    mem = modules["memory"].step(z_t, prev_action, prev_reward, prev_done, h_t)
+                    h_t = mem["h_t"]
+                    h_core = h_t[0] if isinstance(h_t, tuple) else h_t
+
+                    if modules["controller"] is not None:
+                        ctrl = modules["controller"].forward(h_core, ctx={"is_train": stochastic})
+                        mode_id = int(ctrl["mode_id"].view(-1)[0].item())
+                        mode_logits = ctrl["mode_logits"]
+                    else:
+                        mode_id = 0
+                        _num_modes = max(1, int(cfg_eff.get("num_modes", 4)))
+                        mode_logits = torch.zeros((1, _num_modes), dtype=torch.float32, device=h_core.device)
+
+                    if intrinsic_enabled and isinstance(enc.get("grid_embed"), torch.Tensor):
+                        grid_embed_t = enc["grid_embed"].detach()
+                        grid_embed_vec = grid_embed_t.view(-1).to(dtype=torch.float16).cpu().tolist()
+                        with torch.no_grad():
+                            _, _, _, err_scalar = modules["intrinsic_rnd"](grid_embed_t)
+                        rnd_err_raw = float(err_scalar.view(-1)[0].item())
+                        rnd_phi = float(
+                            modules["intrinsic_rnd"].compute_phi(
+                                rnd_err_raw,
+                                rnd_norm_state,
+                                float(intrinsic_cfg.get("rnd_phi_clip", 5.0)),
+                            )
+                        )
+                        intrinsic_terms = {"rnd_err_raw": rnd_err_raw, "rnd_phi": rnd_phi}
+
+                    if self.coord_proposer is None:
+                        raise ModuleDisabledError("rl_coord_proposer")
+                    cand_out = self.coord_proposer.propose(fp_curr, fp_prev, cfg={"coord_topK": int(cfg_eff.get("coord_topK", 16))})
+                    coords = cand_out.get("coords", [])
+
+                    grid0 = None
+                    if isinstance(enc.get("obs_norm"), dict):
+                        grids = enc["obs_norm"].get("grids", [])
+                        if isinstance(grids, list) and grids:
+                            grid0 = grids[0].get("grid") if isinstance(grids[0], dict) else None
+                    actor = modules["actor"].forward(
+                        h_core,
+                        mode_id,
+                        available_actions=action_ids,
+                        coord_candidates=coords,
+                        ctx={"grid": grid0, "fp_report": fp_curr},
+                    )
+                    feat_vecs = actor.get("coord_feature_vectors") if isinstance(actor, dict) else None
+                    if isinstance(feat_vecs, list) and len(feat_vecs) == len(coords):
+                        coords = [{**c, "feat_vec": feat_vecs[i]} for i, c in enumerate(coords)]
+
+                    # Apply env available-actions mask to logits before selection
+                    mask_raw = _action_mask(enc["obs_norm"]["meta"], actor["action_ids"])
+                    aid_to_idx = {str(aid): i for i, aid in enumerate(actor["action_ids"])}
+                    available_actions_mask = normalize_available_actions_mask(mask_raw, len(actor["action_ids"]), aid_to_idx)
+                    env_mask_t = torch.tensor(available_actions_mask, dtype=torch.bool, device=h_core.device).unsqueeze(0)
+                    pi_discrete_masked = actor["pi_discrete"] + (env_mask_t.float() - 1.0) * 1e9
+
+                    action_idx = _pick_discrete(pi_discrete_masked, stochastic=stochastic)
+                    action_id = actor["action_ids"][action_idx]
+                    policy_entropy = _entropy_from_logits(pi_discrete_masked)
+                    mode_entropy = _entropy_from_logits(mode_logits)
+                    old_value = float(modules["value"].forward(h_core).view(-1)[0].item())
+
                     chosen_coord_index = None
                     chosen_coord_tag = None
                     old_logp_coord = 0.0
                     mask_has_coord = 0
                     action = {"type": "simple", "action_id": action_id}
-                    available_actions_mask = [True] * len(action_ids)
-                    old_logp_mode_t = torch.tensor([0.0], dtype=torch.float32)
-                    old_logp_action_t = torch.tensor([0.0], dtype=torch.float32)
-                    old_logp_total_t = torch.tensor([0.0], dtype=torch.float32)
-                    old_mode_entropy_t = torch.tensor([0.0], dtype=torch.float32)
-                    old_action_entropy_t = torch.tensor([0.0], dtype=torch.float32)
-                    h_core = torch.zeros((1, 1), dtype=torch.float32)
-                    z_t = h_core
-                    enc = {"obs_norm": obs_norm_curr}
-                else:
-                    with torch.no_grad():
-                        enc = modules["encoder"].encode(
-                            obs,
-                            fp_report=fp_curr,
-                            ctx={
-                                "action_schema": {"actions": [{"action_id": a} for a in action_ids]},
-                                "obs_norm": obs_norm_curr,
-                                "grid_stack": grid_stack_list,
-                            },
-                        )
-                        z_t = enc["z_t"]
-                        mem = modules["memory"].step(z_t, prev_action, prev_reward, prev_done, h_t)
-                        h_t = mem["h_t"]
-                        h_core = h_t[0] if isinstance(h_t, tuple) else h_t
-
-                        if modules["controller"] is not None:
-                            ctrl = modules["controller"].forward(h_core, ctx={"is_train": stochastic})
-                            mode_id = int(ctrl["mode_id"].view(-1)[0].item())
-                            mode_logits = ctrl["mode_logits"]
-                        else:
-                            mode_id = 0
-                            _num_modes = max(1, int(cfg_eff.get("num_modes", 4)))
-                            mode_logits = torch.zeros((1, _num_modes), dtype=torch.float32, device=h_core.device)
-
-                        if intrinsic_enabled and isinstance(enc.get("grid_embed"), torch.Tensor):
-                            grid_embed_t = enc["grid_embed"].detach()
-                            grid_embed_vec = grid_embed_t.view(-1).to(dtype=torch.float16).cpu().tolist()
-                            with torch.no_grad():
-                                _, _, _, err_scalar = modules["intrinsic_rnd"](grid_embed_t)
-                            rnd_err_raw = float(err_scalar.view(-1)[0].item())
-                            rnd_phi = float(
-                                modules["intrinsic_rnd"].compute_phi(
-                                    rnd_err_raw,
-                                    rnd_norm_state,
-                                    float(intrinsic_cfg.get("rnd_phi_clip", 5.0)),
-                                )
-                            )
-                            intrinsic_terms = {"rnd_err_raw": rnd_err_raw, "rnd_phi": rnd_phi}
-
-                        if self.coord_proposer is None:
-                            raise ModuleDisabledError("rl_coord_proposer")
-                        cand_out = self.coord_proposer.propose(fp_curr, fp_prev, cfg={"coord_topK": int(cfg_eff.get("coord_topK", 16))})
-                        coords = cand_out.get("coords", [])
-
-                        grid0 = None
-                        if isinstance(enc.get("obs_norm"), dict):
-                            grids = enc["obs_norm"].get("grids", [])
-                            if isinstance(grids, list) and grids:
-                                grid0 = grids[0].get("grid") if isinstance(grids[0], dict) else None
-                        actor = modules["actor"].forward(
-                            h_core,
-                            mode_id,
-                            available_actions=action_ids,
-                            coord_candidates=coords,
-                            ctx={"grid": grid0, "fp_report": fp_curr},
-                        )
-                        feat_vecs = actor.get("coord_feature_vectors") if isinstance(actor, dict) else None
-                        if isinstance(feat_vecs, list) and len(feat_vecs) == len(coords):
-                            coords = [{**c, "feat_vec": feat_vecs[i]} for i, c in enumerate(coords)]
-
-                        # Apply env available-actions mask to logits before selection
-                        mask_raw = _action_mask(enc["obs_norm"]["meta"], actor["action_ids"])
-                        aid_to_idx = {str(aid): i for i, aid in enumerate(actor["action_ids"])}
-                        available_actions_mask = normalize_available_actions_mask(mask_raw, len(actor["action_ids"]), aid_to_idx)
-                        env_mask_t = torch.tensor(available_actions_mask, dtype=torch.bool, device=h_core.device).unsqueeze(0)
-                        pi_discrete_masked = actor["pi_discrete"] + (env_mask_t.float() - 1.0) * 1e9
-
-                        action_idx = _pick_discrete(pi_discrete_masked, stochastic=stochastic)
-                        action_id = actor["action_ids"][action_idx]
-                        policy_entropy = _entropy_from_logits(pi_discrete_masked)
-                        mode_entropy = _entropy_from_logits(mode_logits)
-                        old_value = float(modules["value"].forward(h_core).view(-1)[0].item())
-
-                        chosen_coord_index = None
-                        chosen_coord_tag = None
-                        old_logp_coord = 0.0
-                        mask_has_coord = 0
-                        action = {"type": "simple", "action_id": action_id}
-                        if action_id.upper() == "ACTION6" and coords and actor.get("pi_coord") is not None:
-                            chosen_coord_index = _pick_discrete(actor["pi_coord"], stochastic=stochastic)
-                            c = coords[chosen_coord_index]
-                            chosen_coord_tag = c.get("tag")
-                            action = {"type": "coord", "action_id": "ACTION6", "x": int(c["x"]), "y": int(c["y"]) }
-                            mask_has_coord = 1
-                        old_logp_mode_t, old_logp_action_t, old_logp_coord_t, old_logp_total_t = modules["actor"].compute_logp_components(
-                            h_core,
-                            {
-                                "mode_id": mode_id,
-                                "mode_logits": mode_logits,
-                                "action_ids": actor["action_ids"],
-                                "action_index": action_idx,
-                                "available_actions_mask": available_actions_mask,
-                                "coord_candidates": coords,
-                                "chosen_coord_index": int(chosen_coord_index) if chosen_coord_index is not None else -1,
-                                "has_coord": bool(mask_has_coord == 1),
-                            },
-                            cfg=cfg_eff,
-                            ctx={"grid": grid0, "fp_report": fp_curr},
-                        )
-                        old_logp_coord = float(old_logp_coord_t.detach().cpu().item())
-                        old_mode_entropy_t = torch.tensor([mode_entropy], dtype=torch.float32, device=mode_logits.device)
-                        old_action_entropy_t = torch.tensor([policy_entropy], dtype=torch.float32, device=mode_logits.device)
+                    if action_id.upper() == "ACTION6" and coords and actor.get("pi_coord") is not None:
+                        chosen_coord_index = _pick_discrete(actor["pi_coord"], stochastic=stochastic)
+                        c = coords[chosen_coord_index]
+                        chosen_coord_tag = c.get("tag")
+                        action = {"type": "coord", "action_id": "ACTION6", "x": int(c["x"]), "y": int(c["y"]) }
+                        mask_has_coord = 1
+                    old_logp_mode_t, old_logp_action_t, old_logp_coord_t, old_logp_total_t = modules["actor"].compute_logp_components(
+                        h_core,
+                        {
+                            "mode_id": mode_id,
+                            "mode_logits": mode_logits,
+                            "action_ids": actor["action_ids"],
+                            "action_index": action_idx,
+                            "available_actions_mask": available_actions_mask,
+                            "coord_candidates": coords,
+                            "chosen_coord_index": int(chosen_coord_index) if chosen_coord_index is not None else -1,
+                            "has_coord": bool(mask_has_coord == 1),
+                        },
+                        cfg=cfg_eff,
+                        ctx={"grid": grid0, "fp_report": fp_curr},
+                    )
+                    old_logp_coord = float(old_logp_coord_t.detach().cpu().item())
+                    old_mode_entropy_t = torch.tensor([mode_entropy], dtype=torch.float32, device=mode_logits.device)
+                    old_action_entropy_t = torch.tensor([policy_entropy], dtype=torch.float32, device=mode_logits.device)
                 from arcengine import GameAction
 
                 action_obj = GameAction.from_name(action["action_id"])
@@ -564,11 +518,6 @@ class RolloutCollector:
                     },
                 )
                 prev_rnd_phi = rnd_phi
-                if collect_mode == "probe" and hud_probe_acc is not None:
-                    try:
-                        hud_probe_acc.observe(game_id, grid_curr, grid_next)
-                    except Exception:
-                        pass
                 reward_total = float(reward["r_total"])
                 reward_terms = reward.get("terms", {}) if isinstance(reward.get("terms"), dict) else {}
                 raw_env_reward = None
@@ -627,20 +576,6 @@ class RolloutCollector:
                 state_hash_t_minus_2 = state_hash_prev
                 state_hash_prev = current_hash or None
 
-                if collect_mode == "probe":
-                    obs = obs_next
-                    obs_norm_curr = obs_norm_next
-                    fp_prev = fp_curr
-                    fp_curr = fp_next
-                    grid_curr = grid_next
-                    frame_buffer.append(grid_next.copy())
-                    prev_action = action
-                    prev_reward = reward_total
-                    prev_done = done
-                    if done:
-                        break
-                    continue
-
                 step = {
                     "step_idx": step_idx,
                     # Keep rollout payload fully serializable so multiprocessing
@@ -693,7 +628,7 @@ class RolloutCollector:
                 step["repeat_flag_filtered"] = bool(terms.get("repeat_flag_filtered", False))
                 if not minimal_batch_mode:
                     step["z_t"] = z_t.detach().cpu().tolist()
-                    step["mode_logits"] = ctrl["mode_logits"].detach().cpu().tolist()
+                    step["mode_logits"] = mode_logits.detach().cpu().tolist()
                     step["mode_entropy"] = mode_entropy
                     step["pi_discrete_logits"] = actor["pi_discrete"].detach().cpu().tolist()
                     step["policy_entropy"] = policy_entropy
@@ -746,7 +681,7 @@ class RolloutCollector:
                     "game_id": game_id,
                     "seed": seed,
                     "steps": steps,
-                    "done": bool(done if collect_mode == "probe" else (steps and steps[-1].get("done", False))),
+                    "done": bool(steps and steps[-1].get("done", False)),
                     "win": bool(steps and any(s.get("win", False) for s in steps)),
                     "num_steps": len(steps),
                 }
