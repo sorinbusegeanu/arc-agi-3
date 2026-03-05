@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional, Set
+import math
+from typing import Any, Dict, Optional
 
 import numpy as np
 
@@ -12,12 +13,15 @@ logger = logging.getLogger(__name__)
 
 def _default_cfg() -> Dict[str, Any]:
     return {
-        "alpha_novel": 0.05,
-        "beta_effect": 0.02,
-        "delta_loop": 0.05,
-        "loop_window_N": 25,
-        "controller_aux_weight": 0.2,
-        "lambda_noop": 0.05,
+        "movement_cell_thresh": 55,
+        "noop_cell_thresh": 10,
+        "r_effect_movement": 0.01,
+        "r_effect_screen": 0.1,
+        "revert_penalty": 0.2,
+        "beta_potential": 0.05,
+        "gamma": 0.995,
+        "step_penalty_rate": 0.0005,
+        "step_penalty_cap": 0.1,
         "flash_changed_total_thresh": 0.5,
         "flash_changed_masked_thresh": 0.5,
         "flash_hist_l1_thresh": 0.15,
@@ -25,88 +29,8 @@ def _default_cfg() -> Dict[str, Any]:
 
 
 class RewardShaper:
-    def __init__(self) -> None:
-        self._hud_masks: Dict[str, np.ndarray] = {}
-        self._hud_mask_load_logged: Set[str] = set()
-
     def reset_hud_cache(self) -> None:
-        self._hud_masks.clear()
-        self._hud_mask_load_logged.clear()
-
-    @staticmethod
-    def _rle_to_mask(payload: Dict[str, Any], expected_shape: tuple[int, int]) -> Optional[np.ndarray]:
-        shape = payload.get("shape")
-        runs = payload.get("runs")
-        if not (isinstance(shape, list) and len(shape) == 2 and isinstance(runs, list)):
-            return None
-        h = int(shape[0])
-        w = int(shape[1])
-        if (h, w) != expected_shape:
-            return None
-        flat = np.zeros((h * w,), dtype=bool)
-        for run in runs:
-            if not (isinstance(run, list) and len(run) == 2):
-                continue
-            start = int(run[0])
-            ln = int(run[1])
-            if ln <= 0:
-                continue
-            end = min(h * w, start + ln)
-            if start < 0 or start >= h * w:
-                continue
-            flat[start:end] = True
-        return flat.reshape((h, w))
-
-    def _load_hud_mask(self, game_id: str, grid_shape: tuple[int, int], cfg_ctx: Dict[str, Any]) -> np.ndarray:
-        gid = str(game_id)
-        if gid in self._hud_masks:
-            m = self._hud_masks[gid]
-            if m.shape == grid_shape:
-                return m
-            # Grid shape changed; drop cached mask and rebuild from spec.
-            self._hud_masks.pop(gid, None)
-        mask = np.zeros(grid_shape, dtype=bool)
-        specs = cfg_ctx.get("hud_specs", {})
-        spec = specs.get(gid) if isinstance(specs, dict) else None
-        if isinstance(spec, dict):
-            if isinstance(spec.get("bboxes"), list):
-                for bb in spec.get("bboxes", []):
-                    if not (isinstance(bb, list) and len(bb) == 4):
-                        continue
-                    y0, x0, y1, x1 = [int(v) for v in bb]
-                    y0 = max(0, min(grid_shape[0], y0))
-                    y1 = max(0, min(grid_shape[0], y1))
-                    x0 = max(0, min(grid_shape[1], x0))
-                    x1 = max(0, min(grid_shape[1], x1))
-                    if y1 > y0 and x1 > x0:
-                        mask[y0:y1, x0:x1] = True
-            elif isinstance(spec.get("hud_bbox"), list) and len(spec["hud_bbox"]) == 4:
-                y0, x0, y1, x1 = [int(v) for v in spec["hud_bbox"]]
-                y0 = max(0, min(grid_shape[0], y0))
-                y1 = max(0, min(grid_shape[0], y1))
-                x0 = max(0, min(grid_shape[1], x0))
-                x1 = max(0, min(grid_shape[1], x1))
-                if y1 > y0 and x1 > x0:
-                    mask[y0:y1, x0:x1] = True
-            if not np.any(mask) and isinstance(spec.get("hud_mask_rle"), dict):
-                dec = self._rle_to_mask(spec["hud_mask_rle"], expected_shape=grid_shape)
-                if dec is not None:
-                    mask = dec
-        self._hud_masks[gid] = mask
-        if gid not in self._hud_mask_load_logged:
-            mask_bbox = None
-            if np.any(mask):
-                ys, xs = np.where(mask)
-                mask_bbox = [int(ys.min()), int(xs.min()), int(ys.max()) + 1, int(xs.max()) + 1]
-            logger.info(
-                "hud_mask_loaded game_id=%s shape=%s area=%s bbox=%s source=in_memory_spec",
-                gid,
-                list(grid_shape),
-                int(mask.sum()),
-                mask_bbox,
-            )
-            self._hud_mask_load_logged.add(gid)
-        return mask
+        pass  # HUD masking removed; kept for call-site compatibility.
 
     def effect_from_transition(
         self,
@@ -118,78 +42,35 @@ class RewardShaper:
         if grid_prev.shape != grid_curr.shape:
             grid_prev = grid_curr.copy()
         delta = np.asarray(grid_curr != grid_prev, dtype=bool)
-        h = int(grid_curr.shape[0])
-        w = int(grid_curr.shape[1])
-        area = int(max(1, h * w))
-        masked_area = 0  # will be set after hud_mask computed
+        h, w = int(grid_curr.shape[0]), int(grid_curr.shape[1])
+        area = max(1, h * w)
         raw_count = int(delta.sum())
-        if raw_count > (area // 2):
+        if raw_count > area // 2:
             raw_count = 0
-        use_hud_mask = bool(cfg_ctx.get("use_hud_mask", True))
-        if use_hud_mask:
-            hud_mask = self._load_hud_mask(str(game_id), (h, w), cfg_ctx)
-        else:
-            hud_mask = np.zeros((h, w), dtype=bool)
-        if hud_mask.shape != delta.shape:
-            hud_mask = np.zeros_like(delta, dtype=bool)
-        masked_area = int(max(1, int((~hud_mask).sum())))
-        den = masked_area
-        delta_masked = np.asarray(delta & ~hud_mask, dtype=bool)
-        masked_count_raw = int(delta_masked.sum())
-        changed_cells_masked_count = int(masked_count_raw)
-        if changed_cells_masked_count > (area // 2):
-            changed_cells_masked_count = 0
-        hud_overlap_count = int(np.logical_and(delta, hud_mask).sum())
-        changed_cells_outside_count = int(np.logical_and(delta, ~hud_mask).sum())
-        changed_cells_bbox_count = 0
-        if use_hud_mask:
-            specs = cfg_ctx.get("hud_specs", {})
-            spec = specs.get(str(game_id)) if isinstance(specs, dict) else None
-            if isinstance(spec, dict) and isinstance(spec.get("hud_bbox"), list) and len(spec["hud_bbox"]) == 4:
-                y0, x0, y1, x1 = [int(v) for v in spec["hud_bbox"]]
-                y0 = max(0, min(h, y0))
-                y1 = max(0, min(h, y1))
-                x0 = max(0, min(w, x0))
-                x1 = max(0, min(w, x1))
-                if y1 > y0 and x1 > x0:
-                    changed_cells_bbox_count = int(delta[y0:y1, x0:x1].sum())
-        raw_count_raw = int(delta.sum())
-        changed_total_frac = float(raw_count_raw) / float(area)
-        changed_masked_frac = float(masked_count_raw) / float(masked_area)
+
+        changed_total_frac = float(delta.sum()) / float(area)
         flash_changed_total_thresh = float(cfg_ctx.get("flash_changed_total_thresh", 0.5))
         flash_changed_masked_thresh = float(cfg_ctx.get("flash_changed_masked_thresh", 0.5))
         flash_hist_l1_thresh = float(cfg_ctx.get("flash_hist_l1_thresh", 0.15))
+
         hist_l1 = 1.0
         flash_event = False
-        try:
-            h_prev = np.bincount(grid_prev.reshape(-1).clip(0, 10), minlength=11).astype(np.float64)
-            h_curr = np.bincount(grid_curr.reshape(-1).clip(0, 10), minlength=11).astype(np.float64)
-            hist_l1 = float(np.abs(h_prev - h_curr).sum() / float(area))
-            flash_event = (
-                (changed_total_frac >= flash_changed_total_thresh)
-                and (changed_masked_frac >= flash_changed_masked_thresh)
-                and (hist_l1 <= flash_hist_l1_thresh)
-            )
-        except Exception:
-            flash_event = False
+        if changed_total_frac >= flash_changed_total_thresh:
+            try:
+                h_prev = np.bincount(grid_prev.reshape(-1).clip(0, 10), minlength=11).astype(np.float64)
+                h_curr = np.bincount(grid_curr.reshape(-1).clip(0, 10), minlength=11).astype(np.float64)
+                hist_l1 = float(np.abs(h_prev - h_curr).sum() / float(area))
+                flash_event = (changed_total_frac >= flash_changed_masked_thresh) and (hist_l1 <= flash_hist_l1_thresh)
+            except Exception:
+                flash_event = False
+
         return {
-            "effect_changed_cells_masked": float(changed_cells_masked_count) / float(den),
-            "changed_cells_masked_count": float(changed_cells_masked_count),
-            "changed_cells_raw": float(raw_count),
-            "hud_mask_area": float(hud_mask.sum()),
-            "hud_overlap_count": float(hud_overlap_count),
-            "changed_cells_outside_count": float(changed_cells_outside_count),
-            "changed_cells_bbox_count": float(changed_cells_bbox_count),
-            "changed_total_count": float(raw_count),
-            "changed_masked_frac": float(masked_count_raw) / float(masked_area),
-            "changed_total_frac": float(raw_count_raw) / float(area),
-            "masked_area": float(masked_area),
-            "area": float(area),
+            "cells_changed": float(raw_count),
+            "changed_total_frac": changed_total_frac,
             "flash_event": float(1.0 if flash_event else 0.0),
             "hist_l1": float(hist_l1),
             "H": float(h),
             "W": float(w),
-            "den": float(den),
         }
 
     def compute(
@@ -197,143 +78,114 @@ class RewardShaper:
         event: Dict[str, Any],
         done: bool,
         win: bool,
-        seen_hashes: Optional[Set[str]],
-        recent_hashes: Optional[list[str]],
+        t: int = 0,
+        visit_counts: Optional[Dict[str, int]] = None,
+        state_hash_t_minus_2: Optional[str] = None,
         cfg: Optional[Dict[str, Any]] = None,
         ctx: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         cfg_eff = {**_default_cfg(), **(cfg or {})}
-        cfg_ctx = dict(ctx or {})
-        cfg_ctx.setdefault("flash_changed_total_thresh", float(cfg_eff.get("flash_changed_total_thresh", 0.5)))
-        cfg_ctx.setdefault("flash_changed_masked_thresh", float(cfg_eff.get("flash_changed_masked_thresh", 0.5)))
-        cfg_ctx.setdefault("flash_hist_l1_thresh", float(cfg_eff.get("flash_hist_l1_thresh", 0.15)))
-        seen = seen_hashes if seen_hashes is not None else set()
-        recent = recent_hashes if recent_hashes is not None else []
+        ctx = ctx or {}
 
-        grid_prev = np.asarray(cfg_ctx.get("grid_prev"), dtype=np.int64)
-        grid_curr = np.asarray(cfg_ctx.get("grid_curr"), dtype=np.int64)
-        has_grids = grid_prev.ndim == 2 and grid_curr.ndim == 2
+        grid_prev = np.asarray(ctx.get("grid_prev"))
+        grid_curr = np.asarray(ctx.get("grid_curr"))
 
-        if has_grids:
-            game_id = str(cfg_ctx.get("game_id") or event.get("game_id") or "")
-            pre = cfg_ctx.get("effect_transition")
-            if isinstance(pre, dict) and "effect_changed_cells_masked" in pre:
-                effect_changed_cells = float(pre.get("effect_changed_cells_masked", 0.0))
-                h = int(pre.get("H", int(grid_curr.shape[0])))
-                w = int(pre.get("W", int(grid_curr.shape[1])))
-                den = int(pre.get("den", max(1, h * w)))
-                changed_cells_raw = int(pre.get("changed_cells_raw", 0))
-                changed_cells_masked_count = int(pre.get("changed_cells_masked_count", 0))
-                flash_event = bool(float(pre.get("flash_event", 0.0)))
-            else:
-                eff = self.effect_from_transition(game_id, grid_prev, grid_curr, cfg_ctx)
-                effect_changed_cells = float(eff["effect_changed_cells_masked"])
-                h = int(eff["H"])
-                w = int(eff["W"])
-                den = int(eff["den"])
-                changed_cells_raw = int(eff["changed_cells_raw"])
-                changed_cells_masked_count = int(eff.get("changed_cells_masked_count", 0.0))
-                flash_event = bool(float(eff.get("flash_event", 0.0)))
-            use_hud_mask = bool(cfg_ctx.get("use_hud_mask", True))
-            if use_hud_mask:
-                hud_mask = self._load_hud_mask(str(game_id), (int(grid_curr.shape[0]), int(grid_curr.shape[1])), cfg_ctx)
-                if hud_mask.shape == grid_curr.shape and np.any(hud_mask):
-                    grid_for_hash = np.array(grid_curr, copy=True)
-                    grid_for_hash[hud_mask] = 0
-                    state_hash = stable_hash_grid(grid_for_hash)
-                else:
-                    state_hash = stable_hash_grid(grid_curr)
-            else:
-                state_hash = stable_hash_grid(grid_curr)
+        # --- Effect transition (cell diff + flash detection) ---
+        pre = ctx.get("effect_transition")
+        if isinstance(pre, dict) and "cells_changed" in pre:
+            cells_changed = int(pre.get("cells_changed", 0))
+            flash_event = bool(float(pre.get("flash_event", 0.0)))
         else:
-            grid_delta = event.get("grid_delta", {}) if isinstance(event, dict) else {}
-            effect_changed_cells = float(grid_delta.get("changed_cells_count_filtered", grid_delta.get("changed_cells_count", 0)) or 0)
+            eff = self.effect_from_transition(
+                str(ctx.get("game_id", "")), grid_prev, grid_curr,
+                {
+                    "flash_changed_total_thresh": float(cfg_eff["flash_changed_total_thresh"]),
+                    "flash_changed_masked_thresh": float(cfg_eff["flash_changed_masked_thresh"]),
+                    "flash_hist_l1_thresh": float(cfg_eff["flash_hist_l1_thresh"]),
+                },
+            )
+            cells_changed = int(eff["cells_changed"])
+            flash_event = bool(float(eff["flash_event"]))
+
+        # --- State hash ---
+        if grid_curr.ndim == 2:
+            state_hash = stable_hash_grid(grid_curr)
+        else:
             state_hash = str(
-                (event.get("state_hash_after_filtered") if isinstance(event, dict) else None)
-                or (event.get("state_hash_after") if isinstance(event, dict) else None)
-                or ""
+                (event.get("state_hash_after_filtered") or event.get("state_hash_after") or "")
+                if isinstance(event, dict) else ""
             )
-            changed_cells_raw = int(grid_delta.get("changed_cells_count", 0) or 0)
-            changed_cells_masked_count = int(grid_delta.get("changed_cells_count_filtered", changed_cells_raw) or 0)
-            flash_event = False
 
-        action_key = event.get("action_key", {}) if isinstance(event, dict) else {}
-        action_id = str(action_key.get("id") or action_key.get("action_id") or "")
+        # --- m_noop: treat as no-op if fewer than noop_cell_thresh cells changed ---
+        noop_cell_thresh = int(cfg_eff.get("noop_cell_thresh", 10))
+        m_noop = 0 if cells_changed < noop_cell_thresh else 1
 
+        # --- r_win ---
         r_win = 1.0 if bool(win) else 0.0
-        r_env = 0.0
-        effect_changed_cells_metric = float(effect_changed_cells)
-        effect_flag_raw = float(effect_changed_cells_metric) > 0.0
-        novel_flag = bool(state_hash and state_hash not in seen)
-        repeat_flag = bool(state_hash and state_hash in recent)
 
-        beta_effect = float(cfg_eff.get("beta_effect", 0.0))
-        lambda_noop = float(cfg_eff.get("lambda_noop", 0.0))
-        if flash_event:
+        # --- r_effect ---
+        movement_thresh = int(cfg_eff.get("movement_cell_thresh", 55))
+        r_effect_movement = float(cfg_eff.get("r_effect_movement", 0.01))
+        r_effect_screen = float(cfg_eff.get("r_effect_screen", 0.1))
+        if flash_event or cells_changed == 0:
             r_effect = 0.0
-            r_noop = 0.0
-            effect_changed_cells = 0.0
+        elif cells_changed <= movement_thresh:
+            r_effect = r_effect_movement
         else:
-            r_effect = beta_effect * float(effect_changed_cells)
-            is_explicit_noop = action_id.upper() in ("ACTION0", "NOOP", "NOP")
-            r_noop = (
-                (-lambda_noop)
-                if (not is_explicit_noop and float(effect_changed_cells) == 0.0 and not win)
-                else 0.0
+            r_effect = r_effect_screen
+
+        # --- r_revert (A→B→A penalty) ---
+        revert_flag = bool(
+            state_hash
+            and state_hash_t_minus_2
+            and state_hash == state_hash_t_minus_2
+        )
+        r_revert = -float(cfg_eff.get("revert_penalty", 0.2)) if revert_flag else 0.0
+
+        # --- r_potential ---
+        vc = visit_counts if visit_counts is not None else {}
+        n_curr = int(vc.get(state_hash, 0)) if state_hash else 0
+        if grid_prev.ndim == 2:
+            prev_hash = stable_hash_grid(grid_prev)
+        else:
+            prev_hash = str(
+                (event.get("state_hash_before_filtered") or event.get("state_hash_before") or "")
+                if isinstance(event, dict) else ""
             )
-        effect_flag_filtered = float(effect_changed_cells) > 0.0
-        novel_flag_filtered = (not flash_event) and novel_flag
-        repeat_flag_filtered = (not flash_event) and repeat_flag
-        # Flash event gating (life-loss / forced change): do not award exploration terms
-        if flash_event:
-            r_novel = 0.0
-            r_loop = 0.0
-        else:
-            alpha_novel = float(cfg_eff.get("alpha_novel", 0.0))
-            delta_loop = float(cfg_eff.get("delta_loop", 0.0))
-            r_novel = alpha_novel * (1.0 if novel_flag else 0.0)
-            r_loop = (-delta_loop) * (1.0 if repeat_flag else 0.0)
+        n_prev = int(vc.get(prev_hash, 0)) if prev_hash else 0
 
-        r_total = float(r_win + r_env + r_effect + r_novel + r_loop + r_noop)
+        r_potential = 0.0
 
-        if action_id.upper() == "ACTION6":
-            mode_target = 2
-        elif (float(effect_changed_cells) > 0.0 and not flash_event) or win:
-            mode_target = 1
-        else:
-            mode_target = 0
+        if state_hash and visit_counts is not None and not flash_event:
+            visit_counts[state_hash] = n_curr + 1
 
-        if (not flash_event) and state_hash:
-            if seen_hashes is not None:
-                seen_hashes.add(state_hash)
-            if recent_hashes is not None:
-                recent_hashes.append(state_hash)
-                N = int(cfg_eff.get("loop_window_N", 25))
-                if N > 0 and len(recent_hashes) > N:
-                    del recent_hashes[:-N]
+        # --- r_step (unconditional growing time penalty) ---
+        rate = float(cfg_eff.get("step_penalty_rate", 0.0005))
+        cap = float(cfg_eff.get("step_penalty_cap", 0.1))
+        r_step = -min(rate * float(t), cap)
+
+        # --- Total ---
+        r_total = r_win + float(m_noop) * (r_effect + r_revert + r_potential) + r_step
 
         return {
             "schema_version": "REWARD_V1",
-            "r_total": r_total,
+            "r_total": float(r_total),
             "terms": {
                 "r_win": float(r_win),
-                "r_env": float(r_env),
                 "r_effect": float(r_effect),
-                "r_novel": float(r_novel),
-                "r_loop": float(r_loop),
-                "r_noop": float(r_noop),
+                "r_revert": float(r_revert),
+                "r_potential": float(r_potential),
+                "r_step": float(r_step),
+                "m_noop": int(m_noop),
                 "flash_event": bool(flash_event),
-                "effect_flag_raw": bool(effect_flag_raw),
-                "effect_flag_filtered": bool(effect_flag_filtered),
-                "novel_flag_raw": bool(novel_flag),
-                "novel_flag_filtered": bool(novel_flag_filtered),
-                "repeat_flag_raw": bool(repeat_flag),
-                "repeat_flag_filtered": bool(repeat_flag_filtered),
-                "effect_changed_cells": float(effect_changed_cells_metric),
+                "effect_flag": bool(cells_changed > 0 and not flash_event),
+                "revert_flag": bool(revert_flag),
+                "delta_c": int(cells_changed),
+                "cells_changed": int(cells_changed),
                 "state_hash": str(state_hash),
             },
             "aux": {
-                "mode_target": int(mode_target),
+                "mode_target": 1 if (cells_changed > 0 and not flash_event) or win else 0,
                 "mode_weight": float(cfg_eff.get("controller_aux_weight", 0.2)),
             },
         }

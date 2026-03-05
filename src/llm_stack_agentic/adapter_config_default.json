@@ -1,0 +1,8 @@
+{
+  "adapter": "default",
+  "adapter_args": {
+    "op_mode": "offline",
+    "env_dir": "/home/zodrak/zod/environment_files",
+    "render_mode": null
+  }
+}

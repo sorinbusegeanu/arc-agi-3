@@ -1,0 +1,45 @@
+Spec: Frame Diff Channel in ObservationEncoder
+Motivation
+The encoder receives a stack of 4 frames as CNN input. Cell changes between frames are implicit — the CNN must learn to compare frames internally. The reward signal (r_effect, r_revert) is computed directly from frame diffs. Making the diff explicit as an additional input channel gives the encoder a direct spatial change signal aligned with the reward.
+Input change
+Current encoder input:
+frame_stack: [F_{t-3}, F_{t-2}, F_{t-1}, F_t]   shape: (4, H, W)
+New encoder input:
+frame_stack: [F_{t-3}, F_{t-2}, F_{t-1}, F_t]   shape: (4, H, W)
+diff_channel: (F_t != F_{t-1}).astype(int)        shape: (1, H, W)
+
+combined input to CNN:                             shape: (5, H, W)
+Diff channel definition
+diff[y][x] = 1  if grid_curr[y][x] != grid_prev[y][x]
+           = 0  otherwise
+Binary mask. Does not encode the magnitude of change or the new value — just where change happened. This keeps it simple and directly mirrors what cells_changed counts.
+Implementation notes
+In observation_encoder.py:
+
+Add a use_diff_channel: true config flag (default true)
+Change CNN input channels from frame_stack (4) to frame_stack + 1 (5) when enabled
+Compute diff in encode() from grid_curr and grid_prev passed via ctx
+If grid_prev is not available (first step of episode), use a zero diff channel
+
+In rollout_collector.py:
+
+Already tracks grid_curr and grid_prev — pass both into encoder ctx
+
+In rl_config.json:
+json"encoder": {
+  "use_diff_channel": true
+}
+What it enables
+
+Encoder directly sees where change happened this step
+Attention naturally focuses on changed cells when computing z_t
+Directly correlated with r_effect signal — encoder features and reward are grounded in the same spatial signal
+Helps the GRU track "what just changed" without having to learn frame subtraction internally
+
+What it does NOT do
+
+Does not replace the frame stack — history is still needed for context
+Does not encode color values of changed cells — just location
+Does not replace r_effect — it is an input feature, not a reward
+
+Add a second diff channel for F_{t-1} != F_{t-2} (two-step diff) to give the encoder a sense of trajectory — cells that changed in both the last two steps vs only the most recent step. Keep as optional since it adds another channel and complexity.

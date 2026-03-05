@@ -9,7 +9,7 @@
       "trace_writer": true,
       "rl_encoder": true,
       "rl_memory": true,
-      "rl_controller": true,
+      "rl_controller": false,
       "rl_actor": true,
       "rl_value": true,
       "rl_coord_proposer": true,
@@ -39,6 +39,10 @@
     "escape_loop",
     "focus_click"
   ],
+  "mode_roles": {
+    "explore": ["probe", "escape_loop"],
+    "exploit": ["exploit", "focus_click"]
+  },
   "controller": {
     "sample_mode_train": true,
     "temperature": 1.0
@@ -53,13 +57,13 @@
     "0": {},
     "1": {},
     "2": {},
-    "3": {}
+    "3": { "ACTION6": 2.0 }
   },
   "mode_coord_bias": {},
   "coord_mode": "proposal",
   "coord_topK": 16,
   "frame_stack": 4,
-  "hud_probe_enabled": true,
+  "hud_probe_enabled": false,
   "hud_probe_steps": 200,
   "hud_cache_dir": "runs/cache",
   "hud_detect_window": 30,
@@ -68,30 +72,27 @@
   "hud_edge_margin": 4,
   "hud_min_component_area": 20,
   "hud_dilate_px": 1,
-  "rollout_batch_episodes": 75,
-  "rollout_max_steps": 100,
+  "rollout_batch_episodes": 150,
+  "rollout_max_steps": 200,
   "stochastic_actions_train": true,
   "deterministic_eval": true,
   "save_trajectory_batches": false,
   "reward": {
-    "alpha_novel": 0.02,
-    "beta_effect": 0.2,
-    "lambda_noop": 0.005,
+    "movement_cell_thresh": 55,
+    "noop_cell_thresh": 3,
+    "r_effect_movement": 0.01,
+    "r_effect_screen": 0.1,
+    "revert_penalty": 0.2,
+    "beta_potential": 0.0,
+    "gamma": 0.995,
+    "step_penalty_rate": 0.0001,
+    "step_penalty_cap": 0.1,
     "flash_changed_total_thresh": 0.5,
     "flash_changed_masked_thresh": 0.5,
-    "flash_hist_l1_thresh": 0.15,
-    "delta_loop": 0.01,
-    "loop_window_N": 25,
-    "ui_bar": {
-      "enabled": true,
-      "min_row_diff_frac": 0.6,
-      "min_row_diff_abs": 8,
-      "max_band_height": 3,
-      "min_total_diff_frac": 0.6,
-      "min_run_frac": 0.5,
-      "min_run_abs": 8,
-      "pad_cols": 1
-    }
+    "flash_hist_l1_thresh": 0.15
+  },
+  "intrinsic": {
+    "enabled": false
   },
   "algo": "ppo",
   "controller_coef": 1.0,
@@ -112,11 +113,13 @@
     "vf_clip_eps": 0.2,
     "epochs": 5,
     "minibatches": 10,
+    "value_recompute_chunk": 8192,
+    "max_steps_per_train_step": 300000,
     "adv_norm": true,
     "target_kl_early": 0.02,
-    "target_kl_late": 0.01,
+    "target_kl_late": 0.02,
     "lr": 0.0003,
-    "lr_adapt_enabled": true,
+    "lr_adapt_enabled": false,
     "lr_adapt_target_kl": 0.02,
     "lr_adapt_min_lr_mult": 0.1,
     "lr_adapt_max_lr_mult": 3.0,
@@ -127,13 +130,13 @@
     "adam_beta1": 0.9,
     "adam_beta2": 0.999,
     "adam_eps": 1e-05,
-    "weight_decay": 0.01,
+    "weight_decay": 0.0,
     "max_grad_norm": 0.5,
     "bptt_chunk_len": 32,
     "value_coef": 0.5,
-    "entropy_coef_actor_phase1": 0.01,
-    "entropy_coef_actor_phase2": 0.005,
-    "entropy_coef_controller": 0.005,
+    "entropy_coef_actor_phase1": 0.05,
+    "entropy_coef_actor_phase2": 0.02,
+    "entropy_coef_controller": 0.01,
     "aux_ce_coef": 0.02
   },
   "ckpt": {
@@ -158,6 +161,10 @@
   "empty_mode_action_allow_means_all": true,
   "rl": {
     "fast_collect": true
+  },
+  "encoder": {
+    "use_diff_channel": true,
+    "use_diff_channel_2": false
   },
   "fp_analyst": {
     "build_viz": false,

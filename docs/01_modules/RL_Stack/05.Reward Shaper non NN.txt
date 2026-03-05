@@ -1,70 +1,161 @@
-Reward_Shaper (non-NN)
-0) Scope and non-goals
+# Reward_Shaper (non-NN) — v2
+
+## 0) Scope and non-goals
 
 Scope: compute shaped reward r_t from (prev_obs, action, obs) using canonical diffs.
 
-Non-goals: training, policy, memory persistence.
+Non-goals: training, policy, memory persistence, RND/intrinsic network.
 
-1) Inputs
+---
+
+## 1) Inputs
 
 Required:
-
-TransitionEventV1 (preferred) 
-
-14_TransitionEvent_Compiler
-
-done (terminal flag)
-
-win (if env distinguishes win vs terminal; else infer from meta if available)
+- TransitionEventV1 (preferred) → 14_TransitionEvent_Compiler
+- done (terminal flag)
+- win (if env distinguishes win vs terminal; else infer from meta if available)
+- t (current step index, 0-based, for step penalty)
 
 Optional:
+- per-episode visit_counts dict (state_hash → int)
+- state_hash_t_minus_2 (previous-previous hash, for revert detection)
 
-per-episode seen_state_hashes set
+---
 
-2) Outputs
+## 2) Outputs
 
 RewardV1:
+- schema_version="REWARD_V1"
+- r_total (float)
+- terms: dict of term values for logging
 
-schema_version="REWARD_V1"
+---
 
-r_total (float)
+## 3) Reward terms (v2)
 
-terms: dict of term values for logging
+$$r_t = r_{\text{win}} + m_{\text{noop}} \cdot \left( r_{\text{effect}} + r_{\text{revert}} + r_{\text{potential}} \right) - \min(0.0005 \cdot t,\ 0.1)$$
 
-3) Reward terms (v1)
+### r_win
+```
++1.0 if win else 0.0
+```
 
-r_win: +1.0 if win else 0.0
+### m_noop — zero multiplier
+```
+0  if action ∈ {NOOP, ACTION0}
+1  otherwise
+```
+Applied to r_effect, r_revert, r_potential.
+r_step is NOT zeroed by m_noop — applies unconditionally every step.
 
-r_effect: +β if changed_cells_count>0 OR meta_delta changed
+### r_effect — progress signal
+```
+0.0   if flash_event
++0.01 if 0 < Δc ≤ 50   (sprite movement only)
++0.1  if Δc > 50        (sprite movement + additional screen change)
+```
+Where Δc = changed_cells_masked_count (HUD-excluded).
 
-r_novel: +α if state_hash_after not in seen_state_hashes
+### r_revert — anti A→B→A penalty
+```
+-0.2  if h_t == h_{t-2}
+ 0.0  otherwise
+```
+Penalizes immediate undo of the previous action.
 
-r_loop: -δ if state_hash_after repeats within recent window N (if provided)
+### r_potential — count-based exploration
+```
+β_p * (γ * φ(n_s') - φ(n_s))
 
-4) Configuration
+φ(n) = 1 / √(1 + n)
+n_s  = visit count of state s
+```
 
-alpha_novel=0.05
+### r_step — growing time penalty (unconditional)
+```
+-min(0.0005 * t, 0.1)
+```
+Grows linearly from 0, capped at -0.1 at step 200.
 
-beta_effect=0.02
+---
 
-delta_loop=0.05
+## 4) Step penalty reference table
 
-loop_window_N=25 (align with planner/explorer defaults)
+| Step | Penalty | Net with r_effect movement (+0.01) | Net with r_effect screen change (+0.1) |
+|------|---------|-------------------------------------|----------------------------------------|
+| 10   | -0.005  | +0.005                              | +0.095                                 |
+| 20   | -0.01   | 0.0                                 | +0.09                                  |
+| 50   | -0.025  | -0.015                              | +0.075                                 |
+| 100  | -0.05   | -0.04                               | +0.05                                  |
+| 200  | -0.1 (cap) | -0.09                            | 0.0                                    |
+| 200+ | -0.1 (flat) | -0.09                           | 0.0                                    |
 
-5) Deliverables
+Movement bonus offset at step ~20. Screen change bonus offset at step ~200 (cap).
 
-reward_shaper_v1.py exposing:
+---
 
-compute(event, done, win, seen_hashes, recent_hashes, cfg=None, ctx=None) -> RewardV1
+## 5) Flash event
 
-Keep shaped reward terms as before. Additionally emit:
+Gates r_effect to 0.0. Triggered when ALL of:
+- changed_total_frac ≥ 0.5
+- changed_masked_frac ≥ 0.5
+- hist_l1 ≤ 0.15 (color distribution nearly unchanged)
 
-repeat_flag
+Interpretation: full-screen visual change with same color palette = life loss /
+level transition, not meaningful agent action.
 
-novel_flag
+---
 
-effect_flag
+## 6) Configuration
 
-steps_since_novel (tracked per episode)
+| Parameter                    | Value  | Description                                      |
+|------------------------------|--------|--------------------------------------------------|
+| movement_cell_thresh         | 50     | Δc threshold between movement and screen change  |
+| revert_penalty               | 0.2    | Magnitude of A→B→A penalty                       |
+| beta_potential               | 0.05   | Potential shaping scale                          |
+| gamma                        | 0.995  | Discount for potential shaping                   |
+| step_penalty_rate            | 0.0005 | Per-step penalty increment                       |
+| step_penalty_cap             | 0.1    | Maximum step penalty magnitude                   |
+| flash_changed_total_thresh   | 0.5    | Flash detection: total changed fraction          |
+| flash_changed_masked_thresh  | 0.5    | Flash detection: masked changed fraction         |
+| flash_hist_l1_thresh         | 0.15   | Flash detection: histogram L1 threshold          |
 
-These are used as controller inputs and for mode supervision losses.
+---
+
+## 7) Dropped terms (v1 → v2)
+
+| Term          | Reason                                                        |
+|---------------|---------------------------------------------------------------|
+| r_hash_change | Redundant with r_effect                                       |
+| r_novel       | Redundant with r_potential                                    |
+| r_loop        | Replaced by r_revert (A→B→A); longer loops zeroed not penalized |
+| r_intrinsic   | RND stub, always 0.0, no RND module planned                   |
+| r_noop (penalty) | Replaced by m_noop zero multiplier + unconditional r_step  |
+
+---
+
+## 8) Deliverables
+
+`reward_shaper_v2.py` exposing:
+
+```python
+compute(
+    event,
+    done,
+    win,
+    t,                       # current step index
+    visit_counts,            # dict state_hash -> int
+    state_hash_t_minus_2,    # for revert detection
+    cfg=None,
+    ctx=None,
+) -> RewardV1
+```
+
+Emit in terms dict:
+- r_win, r_effect, r_revert, r_potential, r_step
+- m_noop (0 or 1)
+- r_total
+- flash_event (bool)
+- effect_flag (bool: Δc > 0 and not flash)
+- revert_flag (bool: h_t == h_{t-2})
+- delta_c (int: changed_cells_masked_count)

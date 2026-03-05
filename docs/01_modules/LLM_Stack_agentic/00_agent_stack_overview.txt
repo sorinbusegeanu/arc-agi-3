@@ -1,0 +1,367 @@
+# Spec: Change-Point Macro Curriculum (CPMC) for ARC-AGI-3
+
+## 0. Goal
+
+Solve a level by iteratively:
+
+1. **Explore** until a **big change in pixels** (a “change-point”) is observed.1
+2. **Stop exploration** and **extract the action segment** that led to that change.
+3. **Optimize** that segment to minimize number of steps while reliably reproducing the change-point.
+4. **Store** the optimized segment as a **deterministic macro** in a replay buffer.
+5. Start a new round where the agent **replays known macros first**, then explores to the **next** change-point, optimizes, stores, repeat.
+6. Continue until **terminal win**; output solution as concatenation of macros + final tail actions.
+
+This is a curriculum over **trajectory segments** instead of full episodes.
+0. explore for 4 screens
+1. Parallel, Visual Describer Agent (LLM) receives 4 frames and describes the screen. Then proposes POIs and identifies x,y for each. Then sggest which regions should be ignored for CP detection (progress bar, score area). Identify possible exits. Suggesy possible win scenarios
+2. for each POI, another explorer agent navigates to that point, all trajectories saved. If POI reached, all actions recorded and observations. 
+3. After pixel change go back to 1
+4. Until game over or win.
+5. If game over all secrens are sent to another agent, analyser, check each screen for changes -> new poi or logic for exit. analyse and identuig scenarios for exit or win conddition
+
+---
+
+## 1. Definitions
+
+### 1.1 Observation
+
+Environment-provided observation, at minimum a grid image; may include metadata (available actions, terminal flags, score/counters).
+
+### 1.2 Pixel-change metrics
+
+Given consecutive observations `obs_t → obs_{t+1}` define:
+
+* `changed_cells`: count of grid cells that differ
+* `changed_ratio = changed_cells / (H*W)` for the main grid
+* Optionally compute per-region deltas if masks exist (UI, playfield, etc.)
+
+### 1.3 Change-point (CP)
+
+A step `t` is a change-point if `changed_ratio` is “large” relative to recent history.
+
+CP must be robust against:
+
+* constant UI animation (progress bar, timers)
+* small repeated motion (avatar moving one cell)
+* stochastic flicker
+
+### 1.4 Segment
+
+A segment `S_i` is a contiguous sequence of transitions starting at a segment start state and ending at the first CP (or terminal/win).
+
+* `S_i.actions = [a_0, a_1, …, a_{L-1}]`
+* `S_i.start_state = state at segment start`
+* `S_i.end_state = state at CP`
+
+### 1.5 Macro
+
+A macro `M_i` is a deterministic action sequence intended to reproduce the CP reached by `S_i` with minimal steps.
+
+---
+
+## 2. Agents and Responsibilities
+
+### 2.1 Frame & Pattern Analyst (FP_Analyst)
+
+Responsibilities:
+
+* Provide diff tools: compute changed_ratio, changed masks, bounding boxes of change regions.
+* Provide masks to ignore UI/progress bars when computing change.
+* Provide coarse object/component summaries to help coordinate action proposals.
+
+Outputs to blackboard:
+
+* `diff_metrics` (per-step)
+* `ui_mask` / `ignore_mask` (if detectable)
+* `object_map` (optional)
+
+### 2.2 TransitionEvent_Compiler
+
+Responsibilities:
+
+* Compile each `(obs_t, action_t, obs_{t+1})` into a canonical event:
+
+  * `changed_ratio`
+  * `changed_bbox`
+  * per-color change histogram
+  * object count delta (if available from FP_Analyst)
+  * terminal flag delta (if present)
+
+Output:
+
+* `TransitionEventV1` appended to trajectory log.
+
+### 2.3 Simple Action Explorer / Full Action Explorer
+
+Responsibilities:
+
+* Run exploration policy until CP trigger fires.
+* Full explorer uses coordinate heuristics (object centroids, frontiers) when ACTION6 exists.
+
+Output:
+
+* `segment_candidate`: recorded actions + TransitionEvent stream until CP.
+
+### 2.4 Goal / Reward Signal Detector
+
+Responsibilities:
+
+* Detect “progress” indicators distinct from CP detection:
+
+  * terminal flags
+  * score/counter increments
+  * board completion patterns
+* Provide a scalar `progress_signal` for tie-breaking and macro ranking.
+
+### 2.5 Trajectory Summarizer (Replay → Lessons)
+
+Responsibilities:
+
+* Summarize each segment into:
+
+  * CP signature (see §3.3)
+  * start-state signature
+  * macro candidate stats (length, success rate)
+* Provide compression for memory/replay storage.
+
+### 2.6 Planner / Controller (Two-level)
+
+Responsibilities:
+
+* Choose high-level mode:
+
+  * `REPLAY` (execute known macros deterministically)
+  * `EXPLORE` (search for next CP)
+  * `OPTIMIZE` (reduce macro length / increase reliability)
+* Maintain “segment index” i and chain macros.
+
+### 2.7 Segment Optimizer Agent (new)
+
+Responsibilities:
+
+* Given `(segment start, CP signature, initial action list)` produce improved macro:
+
+  * shorter length, same CP signature, higher reliability
+* Supports two strategies (configurable):
+
+  * `mutation_search` (edit action list)
+  * `segment_RL` (train on segment objective)
+
+Outputs:
+
+* `optimized_macro` stored in replay buffer.
+
+---
+
+## 3. Core Algorithms
+
+### 3.1 CP detection
+
+Inputs:
+
+* TransitionEvent stream with `changed_ratio` (masked by ignore_mask).
+
+Rules (config-driven):
+
+* Maintain rolling window `W` of recent `changed_ratio`.
+* Define baseline `b = median(W)` and scale `s = MAD(W)` (robust).
+* Trigger CP if:
+
+  * `changed_ratio >= cp_abs_threshold` OR
+  * `changed_ratio >= b + cp_k * max(s, cp_min_scale)`
+* Additional guards:
+
+  * ignore first `cp_warmup_steps` transitions of a segment
+  * optional minimum time between CPs
+
+### 3.2 Segment extraction
+
+When CP triggers:
+
+* finalize `S_i` including:
+
+  * start obs/state hash
+  * end obs/state hash
+  * actions list
+  * TransitionEvent list
+* push to `segment_queue` for optimizer
+
+### 3.3 CP signature (matching target)
+
+CP signature must allow “same event” recognition even if exact pixels differ.
+
+Signature fields (configurable subset):
+
+* `changed_ratio_bin`
+* `changed_bbox` (quantized)
+* `palette_delta` (colors added/removed)
+* `object_count_delta` (if available)
+* `terminal_delta` (if any)
+* `progress_signal_delta` (if any)
+
+Matching:
+
+* `signature_distance(sig_a, sig_b) <= threshold`
+
+### 3.4 Macro replay policy
+
+At episode start or segment start:
+
+* Attempt to replay stored macros `[M_0..M_{i-1}]` deterministically.
+* After each macro replay:
+
+  * verify that resulting TransitionEvents contain a CP matching the macro’s CP signature
+  * if mismatch, abort replay chain and fall back to EXPLORE (or branch, §5.2)
+
+### 3.5 Segment optimization objective
+
+Primary:
+
+* minimize macro length `L`
+
+Constraints:
+
+* CP signature must match
+* macro must be reliable: success rate ≥ `min_success_rate` over N trials
+
+Secondary tie-breakers:
+
+* increased `progress_signal`
+* lower loop rate / fewer repeated states
+
+### 3.6 Optimizer strategy A: mutation search
+
+Loop for `opt_budget_trials`:
+
+* sample an edit operator:
+
+  * delete subsequence
+  * replace action
+  * swap adjacent actions
+  * coordinate jitter / alternative coordinate proposal (for ACTION6)
+* replay from segment start (reset env deterministically)
+* accept if CP signature matches and `(L shorter OR success stats improved)`
+
+### 3.7 Optimizer strategy B: segment RL
+
+Define segment-level reward:
+
+* terminal success at CP match: `+R_cp`
+* per-step penalty: `-λ_step`
+* optional shaping via `progress_signal_delta`
+  Train policy restricted to segment start distribution (on-policy preferred).
+  Output best deterministic macro by greedy rollout.
+
+---
+
+## 4. Blackboard / Shared State
+
+### 4.1 Required fields
+
+* `state_summary` (from FP_Analyst)
+* `ignore_mask` (for CP metric)
+* `transition_events[]` (current episode)
+* `current_segment` (actions/events since last segment boundary)
+* `macro_buffer` (indexed, see §4.2)
+* `progress_signal` (current + deltas)
+* `controller_mode`
+* `segment_index i`
+
+### 4.2 Macro buffer schema (conceptual)
+
+For each macro entry:
+
+* `macro_id`
+* `segment_index`
+* `start_state_signature`
+* `cp_signature`
+* `actions[]`
+* `stats`: attempts, successes, success_rate, best_length, last_updated_iter
+
+Selection:
+
+* for a given `(segment_index, start_state_signature)` choose top-K by:
+
+  1. success_rate
+  2. shortest length
+
+---
+
+## 5. Control Flow
+
+### 5.1 Main loop (per episode)
+
+1. `REPLAY`: try macros `M_0..M_{i-1}` deterministically with verification after each.
+2. If replay chain succeeds and game not won:
+
+   * `EXPLORE`: explore from current state until next CP or terminal.
+   * On CP: extract `S_i`, enqueue optimization, set `i := i+1`.
+3. `OPTIMIZE`: optimize the newest segment (or backlog) within budget.
+4. Repeat until terminal win or episode budget exhausted.
+
+### 5.2 Branching (when replay diverges)
+
+If macro replay does not reproduce CP signature:
+
+* create a new branch key:
+
+  * same segment index but different start signature
+* store separate macro sets per branch
+
+Branching must be bounded (cap branches per level).
+
+---
+
+## 6. Logging and Metrics
+
+Per episode:
+
+* number of CPs discovered
+* macro chain length
+* total steps
+* steps saved vs baseline exploration-only
+* macro replay verification failures
+* CP false positives rate (CP triggered but no meaningful progress / no stable signature)
+
+Per macro:
+
+* success_rate, median length, variance
+* signature stability across successes
+
+---
+
+## 7. Configuration Parameters (names to finalize)
+
+* `cp_window_W`
+* `cp_abs_threshold`
+* `cp_k`
+* `cp_min_scale`
+* `cp_warmup_steps`
+* `min_time_between_cps`
+* `min_success_rate`
+* `opt_budget_trials`
+* `opt_strategy = mutation_search | segment_RL`
+* `macro_top_k`
+* `max_branches_per_level`
+* `explore_step_budget_per_segment`
+* `replay_abort_on_mismatch = true`
+
+---
+
+## 8. Determinism Requirements
+
+* Replays must use fixed RNG seeds and deterministic action selection.
+* Macro execution is deterministic (no sampling).
+* CP metric masking and signature extraction must be deterministic.
+
+---
+
+## 9. Open Questions (to resolve in next iteration)
+
+1. What exact observation fields exist for terminal/progress in your environment JSON (to formalize `progress_signal`)?
+2. How to define/learn the `ignore_mask` robustly (static UI detection vs heuristic)?
+3. For coordinate actions (ACTION6), what is the canonical representation used in logs and action spaces (x,y order, bounds, masking)?
+4. Should CP detection be single-threshold or multi-tier (small/medium/big) to avoid stopping too early?
+
+If you answer those, the next revision can lock the schemas and parameter defaults.
+

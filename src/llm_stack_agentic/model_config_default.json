@@ -1,0 +1,20 @@
+{
+  "backend": "hf_server",
+  "model_name": "Qwen/Qwen3-VL-8B-Instruct-FP8",
+  "hf_server_base_url": "http://192.168.0.51:8000",
+  "include_grids_in_prompt": false,
+  "text_grids": false,
+  "use_thinking": false,
+  "server_extended_sampling": true,
+  "response_format": {"type": "json_object"},
+  "png_factor": 8,
+  "generation_params": {
+    "temperature": 0.6,
+    "top_p": 1.0,
+    "top_k": 0,
+    "min_p": 0.0,
+    "presence_penalty": 0.0,
+    "repetition_penalty": 1.05,
+    "max_new_tokens": 4096
+  }
+}

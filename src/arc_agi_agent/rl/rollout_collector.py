@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import csv
+import io
 import logging
+import os
 import random
 from collections import deque
 from typing import Any, Deque, Dict, List, Optional, Tuple
@@ -18,8 +21,46 @@ from .module_control import ModuleDisabledError, module_enabled
 from .obs_norm_v1 import normalize_obs_v1
 from .canonical_grid import canonical_grid
 from .reward_shaper import RewardShaper
+from .intrinsic_rnd import RNDNormState
 
 logger = logging.getLogger(__name__)
+
+_REWARD_LOG_FIELDS = [
+    "game_id", "ep", "step",
+    "r_win", "r_effect", "r_revert", "r_potential", "r_step", "r_total",
+    "m_noop", "flash", "effect_flag", "revert_flag", "cells_changed",
+]
+
+
+def _write_reward_log(path: str, game_id: str, ep: int, step: int, terms: Dict[str, Any], r_total: float) -> None:
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+        # Truncate and write header only on the very first step of a run.
+        first_step = ep == 0 and step == 0
+        row = [
+            game_id, ep, step,
+            round(float(terms.get("r_win", 0.0)), 4),
+            round(float(terms.get("r_effect", 0.0)), 4),
+            round(float(terms.get("r_revert", 0.0)), 4),
+            round(float(terms.get("r_potential", 0.0)), 4),
+            round(float(terms.get("r_step", 0.0)), 4),
+            round(r_total, 4),
+            int(terms.get("m_noop", 1)),
+            int(bool(terms.get("flash_event", False))),
+            int(bool(terms.get("effect_flag", False))),
+            int(bool(terms.get("revert_flag", False))),
+            int(terms.get("cells_changed", 0)),
+        ]
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        if first_step:
+            w.writerow(_REWARD_LOG_FIELDS)
+        w.writerow(row)
+        mode = "w" if first_step else "a"
+        with open(path, mode, encoding="utf-8", newline="") as f:
+            f.write(buf.getvalue())
+    except Exception:
+        pass
 
 
 def _default_cfg() -> Dict[str, Any]:
@@ -36,7 +77,15 @@ def _default_cfg() -> Dict[str, Any]:
 
 def _action_mask(meta: Dict[str, Any], action_ids: List[str]) -> List[int]:
     avail = meta.get("available_actions_sorted") or meta.get("available_actions") or []
-    avail_set = set(str(a) for a in avail) if isinstance(avail, list) else set()
+    if not isinstance(avail, list):
+        return [1] * len(action_ids)
+    avail_set: set = set()
+    for a in avail:
+        s = str(a)
+        avail_set.add(s)
+        # env provides integer indices (e.g. [1,2,3,4]) — also add "ACTION{n}" form
+        if s.isdigit():
+            avail_set.add(f"ACTION{s}")
     return [1 if a in avail_set else 0 for a in action_ids]
 
 
@@ -248,8 +297,12 @@ class RolloutCollector:
             prev_reward = 0.0
             prev_done = False
             done = False
-            seen_hashes: set[str] = set()
-            recent_hashes: List[str] = []
+            visit_counts: Dict[str, int] = {}
+            state_hash_t_minus_2: Optional[str] = None
+            state_hash_prev: Optional[str] = None
+            rnd_norm_state: Optional[RNDNormState] = None
+            prev_rnd_phi = 0.0
+            episode_ctx: Dict[str, Any] = {"episode_intrinsic_sum": 0.0}
             steps: List[Dict[str, Any]] = []
             obs_norm_curr = normalize_obs_v1(obs, fp_report=fp_curr)
             grid_curr = canonical_grid(obs_norm_curr)
@@ -260,8 +313,17 @@ class RolloutCollector:
             action_schema = build_action_schema_from_env(env.action_space, width=width, height=height)
             action_ids = [str(a.action_id) for a in action_schema.actions]
             logger.debug("game_id,step,action,reward,changed_pixels_masked_count,changed_cells_raw,win")
+            intrinsic_cfg = cfg_eff.get("intrinsic", {}) if isinstance(cfg_eff.get("intrinsic", {}), dict) else {}
+            intrinsic_enabled = bool(intrinsic_cfg.get("enabled", False)) and str(intrinsic_cfg.get("method", "")) == "rnd_grid_embed"
+            intrinsic_enabled = intrinsic_enabled and ("intrinsic_rnd" in modules)
+            if intrinsic_enabled and rnd_norm_state is None:
+                rnd_norm_state = RNDNormState()
 
             for step_idx in range(max_steps):
+                grid_embed_vec: Optional[list[float]] = None
+                rnd_err_raw = 0.0
+                rnd_phi = 0.0
+                intrinsic_terms: Dict[str, Any] = {}
                 grid_stack_list = list(frame_buffer)
                 while len(grid_stack_list) < frame_stack_len:
                     grid_stack_list.insert(0, grid_stack_list[0].copy())
@@ -324,10 +386,29 @@ class RolloutCollector:
                         h_t = mem["h_t"]
                         h_core = h_t[0] if isinstance(h_t, tuple) else h_t
 
-                        ctrl = modules["controller"].forward(h_core, ctx={"is_train": stochastic})
-                        mode_id_t = ctrl["mode_id"]
-                        mode_id = int(mode_id_t.view(-1)[0].item())
-                        mode_logits = ctrl["mode_logits"]
+                        if modules["controller"] is not None:
+                            ctrl = modules["controller"].forward(h_core, ctx={"is_train": stochastic})
+                            mode_id = int(ctrl["mode_id"].view(-1)[0].item())
+                            mode_logits = ctrl["mode_logits"]
+                        else:
+                            mode_id = 0
+                            _num_modes = max(1, int(cfg_eff.get("num_modes", 4)))
+                            mode_logits = torch.zeros((1, _num_modes), dtype=torch.float32, device=h_core.device)
+
+                        if intrinsic_enabled and isinstance(enc.get("grid_embed"), torch.Tensor):
+                            grid_embed_t = enc["grid_embed"].detach()
+                            grid_embed_vec = grid_embed_t.view(-1).to(dtype=torch.float16).cpu().tolist()
+                            with torch.no_grad():
+                                _, _, _, err_scalar = modules["intrinsic_rnd"](grid_embed_t)
+                            rnd_err_raw = float(err_scalar.view(-1)[0].item())
+                            rnd_phi = float(
+                                modules["intrinsic_rnd"].compute_phi(
+                                    rnd_err_raw,
+                                    rnd_norm_state,
+                                    float(intrinsic_cfg.get("rnd_phi_clip", 5.0)),
+                                )
+                            )
+                            intrinsic_terms = {"rnd_err_raw": rnd_err_raw, "rnd_phi": rnd_phi}
 
                         if self.coord_proposer is None:
                             raise ModuleDisabledError("rl_coord_proposer")
@@ -349,10 +430,18 @@ class RolloutCollector:
                         feat_vecs = actor.get("coord_feature_vectors") if isinstance(actor, dict) else None
                         if isinstance(feat_vecs, list) and len(feat_vecs) == len(coords):
                             coords = [{**c, "feat_vec": feat_vecs[i]} for i, c in enumerate(coords)]
-                        action_idx = _pick_discrete(actor["pi_discrete"], stochastic=stochastic)
+
+                        # Apply env available-actions mask to logits before selection
+                        mask_raw = _action_mask(enc["obs_norm"]["meta"], actor["action_ids"])
+                        aid_to_idx = {str(aid): i for i, aid in enumerate(actor["action_ids"])}
+                        available_actions_mask = normalize_available_actions_mask(mask_raw, len(actor["action_ids"]), aid_to_idx)
+                        env_mask_t = torch.tensor(available_actions_mask, dtype=torch.bool, device=h_core.device).unsqueeze(0)
+                        pi_discrete_masked = actor["pi_discrete"] + (env_mask_t.float() - 1.0) * 1e9
+
+                        action_idx = _pick_discrete(pi_discrete_masked, stochastic=stochastic)
                         action_id = actor["action_ids"][action_idx]
-                        policy_entropy = _entropy_from_logits(actor["pi_discrete"])
-                        mode_entropy = _entropy_from_logits(ctrl["mode_logits"])
+                        policy_entropy = _entropy_from_logits(pi_discrete_masked)
+                        mode_entropy = _entropy_from_logits(mode_logits)
                         old_value = float(modules["value"].forward(h_core).view(-1)[0].item())
 
                         chosen_coord_index = None
@@ -366,10 +455,6 @@ class RolloutCollector:
                             chosen_coord_tag = c.get("tag")
                             action = {"type": "coord", "action_id": "ACTION6", "x": int(c["x"]), "y": int(c["y"]) }
                             mask_has_coord = 1
-
-                        mask_raw = _action_mask(enc["obs_norm"]["meta"], actor["action_ids"])
-                        aid_to_idx = {str(aid): i for i, aid in enumerate(actor["action_ids"])}
-                        available_actions_mask = normalize_available_actions_mask(mask_raw, len(actor["action_ids"]), aid_to_idx)
                         old_logp_mode_t, old_logp_action_t, old_logp_coord_t, old_logp_total_t = modules["actor"].compute_logp_components(
                             h_core,
                             {
@@ -425,10 +510,7 @@ class RolloutCollector:
                             game_id,
                             np.asarray(grid_curr, dtype=np.int64),
                             np.asarray(grid_next, dtype=np.int64),
-                            {
-                                "hud_specs": cfg_eff.get("hud_specs", {}),
-                                "use_hud_mask": bool(collect_mode != "probe"),
-                            },
+                            {"use_hud_mask": False},
                         )
                     except Exception:
                         effect_transition = {"effect_changed_cells_masked": 0.0, "changed_cells_masked_count": 0.0, "changed_cells_raw": 0.0, "H": 0.0, "W": 0.0, "den": 1.0}
@@ -470,17 +552,18 @@ class RolloutCollector:
                     event_json,
                     done,
                     win,
-                    seen_hashes,
-                    recent_hashes,
+                    t=step_idx,
+                    visit_counts=visit_counts,
+                    state_hash_t_minus_2=state_hash_t_minus_2,
                     cfg=cfg_eff.get("reward"),
                     ctx={
                         "grid_prev": grid_curr,
                         "grid_curr": grid_next,
                         "game_id": game_id,
-                        "hud_specs": cfg_eff.get("hud_specs", {}),
                         "effect_transition": effect_transition,
                     },
                 )
+                prev_rnd_phi = rnd_phi
                 if collect_mode == "probe" and hud_probe_acc is not None:
                     try:
                         hud_probe_acc.observe(game_id, grid_curr, grid_next)
@@ -506,20 +589,22 @@ class RolloutCollector:
                     )
                     raise RuntimeError("reward_total out of expected range")
                 logger.info(
-                    "reward_step game_id=%s step=%s action_id=%s env_reward=%s r_total=%.6f r_win=%.6f r_env=%.6f r_effect=%.6f r_novel=%.6f r_loop=%.6f r_noop=%.6f flash_event=%s",
+                    "reward_step game_id=%s step=%s action_id=%s r_total=%.4f r_win=%.4f r_effect=%.4f r_revert=%.4f r_potential=%.4f m_noop=%s flash=%s delta_c=%s",
                     game_id,
                     step_idx,
                     action_id,
-                    raw_env_reward,
                     reward_total,
                     float(reward_terms.get("r_win", 0.0)),
-                    float(reward_terms.get("r_env", 0.0)),
                     float(reward_terms.get("r_effect", 0.0)),
-                    float(reward_terms.get("r_novel", 0.0)),
-                    float(reward_terms.get("r_loop", 0.0)),
-                    float(reward_terms.get("r_noop", 0.0)),
-                    bool(reward_terms.get("flash_event", False)),
+                    float(reward_terms.get("r_revert", 0.0)),
+                    float(reward_terms.get("r_potential", 0.0)),
+                    int(reward_terms.get("m_noop", 1)),
+                    int(bool(reward_terms.get("flash_event", False))),
+                    int(reward_terms.get("delta_c", 0)),
                 )
+                debug_reward_log = cfg_eff.get("debug_reward_log")
+                if debug_reward_log:
+                    _write_reward_log(str(debug_reward_log), game_id, ep_idx, step_idx, reward_terms, reward_total)
                 action_log = (
                     f"ACTION6({int(action.get('x')) if action.get('x') is not None else 0},{int(action.get('y')) if action.get('y') is not None else 0})"
                     if action.get("type") == "coord" and chosen_coord_index is not None
@@ -538,17 +623,9 @@ class RolloutCollector:
                 if state_label in {"GAME_OVER", "WIN"}:
                     logger.debug("game_end,%s,%s,%s", game_id, step_idx, state_label)
 
-                hash_for_visit = reward_terms.get("state_hash")
-                if not hash_for_visit:
-                    after_hash = event_json.get("state_hash_after")
-                    after_hash_filtered = event_json.get("state_hash_after_filtered")
-                    hash_for_visit = after_hash_filtered or after_hash
-                if hash_for_visit:
-                    seen_hashes.add(hash_for_visit)
-                    recent_hashes.append(hash_for_visit)
-                    loop_n = int(cfg_eff.get("reward", {}).get("loop_window_N", 25)) if isinstance(cfg_eff.get("reward"), dict) else 25
-                    if len(recent_hashes) > loop_n:
-                        recent_hashes.pop(0)
+                current_hash = reward_terms.get("state_hash") or ""
+                state_hash_t_minus_2 = state_hash_prev
+                state_hash_prev = current_hash or None
 
                 if collect_mode == "probe":
                     obs = obs_next
@@ -590,6 +667,7 @@ class RolloutCollector:
                     "reward": reward_total,
                     "reward_terms": reward.get("terms", {}),
                     "reward_aux": reward.get("aux", {}),
+                    "intrinsic_terms": intrinsic_terms,
                     "done": done,
                     "win": bool(win),
                     "available_actions_mask": available_actions_mask,
@@ -607,6 +685,8 @@ class RolloutCollector:
                         "frame_policy": event_json.get("frame_policy"),
                     },
                 }
+                if grid_embed_vec is not None:
+                    step["grid_embed"] = grid_embed_vec
                 terms = step.get("reward_terms", {}) if isinstance(step.get("reward_terms"), dict) else {}
                 step["effect_flag_filtered"] = bool(terms.get("effect_flag_filtered", terms.get("effect_flag_raw", False)))
                 step["novel_flag_filtered"] = bool(terms.get("novel_flag_filtered", False))
@@ -637,42 +717,39 @@ class RolloutCollector:
                 if done:
                     break
 
-                if steps:
-                    r_env_sum = 0.0
-                    r_win_sum = 0.0
-                    r_effect_sum = 0.0
-                    r_novel_sum = 0.0
-                    r_loop_sum = 0.0
-                    r_noop_sum = 0.0
-                    for s in steps:
-                        terms = s.get("reward_terms", {}) if isinstance(s.get("reward_terms"), dict) else {}
-                        r_env_sum += float(terms.get("r_env", 0.0))
-                        r_win_sum += float(terms.get("r_win", 0.0))
-                        r_effect_sum += float(terms.get("r_effect", 0.0))
-                        r_novel_sum += float(terms.get("r_novel", 0.0))
-                        r_loop_sum += float(terms.get("r_loop", 0.0))
-                        r_noop_sum += float(terms.get("r_noop", 0.0))
-                    logger.info(
-                        "reward_breakdown game_id=%s seed=%s steps=%s r_env=%.6f r_win=%.6f r_effect=%.6f r_novel=%.6f r_loop=%.6f r_noop=%.6f",
-                        game_id,
-                        seed,
-                        len(steps),
-                        r_env_sum,
-                        r_win_sum,
-                        r_effect_sum,
-                        r_novel_sum,
-                        r_loop_sum,
-                        r_noop_sum,
-                    )
-                batch["episodes"].append(
-                    {
-                        "game_id": game_id,
-                        "seed": seed,
-                        "steps": steps,
-                        "done": bool(done if collect_mode == "probe" else (steps and steps[-1].get("done", False))),
-                        "win": bool(steps and any(s.get("win", False) for s in steps)),
-                        "num_steps": len(steps),
-                    }
+            if steps:
+                r_win_sum = 0.0
+                r_effect_sum = 0.0
+                r_revert_sum = 0.0
+                r_potential_sum = 0.0
+                r_total_sum = 0.0
+                for s in steps:
+                    terms = s.get("reward_terms", {}) if isinstance(s.get("reward_terms"), dict) else {}
+                    r_win_sum += float(terms.get("r_win", 0.0))
+                    r_effect_sum += float(terms.get("r_effect", 0.0))
+                    r_revert_sum += float(terms.get("r_revert", 0.0))
+                    r_potential_sum += float(terms.get("r_potential", 0.0))
+                    r_total_sum += float(s.get("reward", 0.0))
+                logger.info(
+                    "reward_breakdown game_id=%s seed=%s steps=%s r_total=%.4f r_win=%.4f r_effect=%.4f r_revert=%.4f r_potential=%.4f",
+                    game_id,
+                    seed,
+                    len(steps),
+                    r_total_sum,
+                    r_win_sum,
+                    r_effect_sum,
+                    r_revert_sum,
+                    r_potential_sum,
                 )
+            batch["episodes"].append(
+                {
+                    "game_id": game_id,
+                    "seed": seed,
+                    "steps": steps,
+                    "done": bool(done if collect_mode == "probe" else (steps and steps[-1].get("done", False))),
+                    "win": bool(steps and any(s.get("win", False) for s in steps)),
+                    "num_steps": len(steps),
+                }
+            )
 
         return batch

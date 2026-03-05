@@ -1,0 +1,40 @@
+{
+  "system_prompt": "You are a game-state analyst for 2D grid-based games.\nDescribe only geometric structures: connected components, colors, shapes, movement.\nDo not interpret shapes as characters, creatures, or named agents.\nDo not assume intent or roles (e.g., player, enemy).\nIf uncertain whether something is UI or game object, mark confidence < 0.5.\nYou output strictly valid JSON. No text outside JSON.",
+  "task_lines": [
+    "You are given up to 4 consecutive frames from a grid-based game (Frame 0 is earliest).",
+    "Grid width W={W}, height H={H}. Origin top-left, x=column, y=row, 0-based.",
+    "",
+    "Your tasks:",
+    "1. Write a short game_description (1-2 sentences about what you observe).",
+    "2. Identify the sprite_character: the single movable element that changes position across frames.",
+    "3. Identify ignore_regions: HUD bars, score areas, static UI regions (up to 5).",
+    "4. Identify poi_list: points of interest that are static landmarks (doors, levers, walls, exits).",
+    "5. Identify exit_hypotheses: coordinates the sprite might use to exit the level."
+  ],
+  "frames_section": {
+    "grids_header": "Frames (as JSON grids):",
+    "images_header": "Frames provided as images in order (Frame 0 earliest, latest last):"
+  },
+  "schema_lines": [
+    "Return STRICT JSON matching this exact schema:",
+    "{",
+    "  \"game_description\": string,",
+    "  \"sprite_character\": {\"x\": int, \"y\": int, \"width\": int, \"height\": int, \"confidence\": float},",
+    "  \"ignore_regions\": [{\"x0\": int, \"y0\": int, \"x1\": int, \"y1\": int, \"confidence\": float}],",
+    "  \"poi_list\": [",
+    "    {\"id\": string, \"x\": int, \"y\": int, \"intent\": string, \"rationale\": string, \"priority\": int, \"confidence\": float}",
+    "  ],",
+    "  \"exit_hypotheses\": [",
+    "    {\"x\": int, \"y\": int, \"type\": string, \"confidence\": float}",
+    "  ]",
+    "}"
+  ],
+  "rules_lines": [
+    "Rules:",
+    "- All coordinates must be within bounds (0 <= x < W, 0 <= y < H).",
+    "- priority is 1-based integer ranking (1 = highest), max {K} POIs.",
+    "- confidence is float in [0.0, 1.0].",
+    "- ignore_regions and poi_list may be empty lists [].",
+    "- No text outside the JSON object."
+  ]
+}

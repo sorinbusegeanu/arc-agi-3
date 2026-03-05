@@ -19,6 +19,8 @@ def _default_cfg() -> Dict[str, Any]:
         "meta_hidden": 128,
         "meta_max_dim": 64,
         "frame_stack": 4,
+        "use_diff_channel": True,
+        "use_diff_channel_2": False,
     }
 
 
@@ -28,9 +30,12 @@ class ObservationEncoder(nn.Module):
         self.cfg = {**_default_cfg(), **(cfg or {})}
         chs = list(self.cfg["cnn_channels"])
         self.frame_stack = max(1, int(self.cfg.get("frame_stack", 4)))
+        self.use_diff_channel = bool(self.cfg.get("use_diff_channel", True))
+        self.use_diff_channel_2 = bool(self.cfg.get("use_diff_channel_2", False))
+        _diff_channels = (1 if self.use_diff_channel else 0) + (1 if self.use_diff_channel_2 else 0)
 
         layers: List[nn.Module] = []
-        in_ch = self.frame_stack
+        in_ch = self.frame_stack + _diff_channels
         for ch in chs:
             layers.append(nn.Conv2d(in_ch, ch, kernel_size=3, padding=1))
             layers.append(nn.ReLU())
@@ -131,6 +136,34 @@ class ObservationEncoder(nn.Module):
             obs_norm.get("grids", []),
             grid_stack=grid_stack,
         )
+
+        if self.use_diff_channel or self.use_diff_channel_2:
+            H, W = int(grid_t.shape[-2]), int(grid_t.shape[-1])
+            diff_channels: List[torch.Tensor] = []
+            gs = grid_stack if isinstance(grid_stack, list) and len(grid_stack) >= 2 else []
+
+            def _diff_channel(a: Any, b: Any) -> torch.Tensor:
+                na = np.asarray(a, dtype=np.int64)
+                nb = np.asarray(b, dtype=np.int64)
+                if na.shape == nb.shape == (H, W):
+                    d = (na != nb).astype(np.float32)
+                else:
+                    d = np.zeros((H, W), dtype=np.float32)
+                return torch.tensor(d, dtype=torch.float32, device=grid_t.device).unsqueeze(0).unsqueeze(0)
+
+            if self.use_diff_channel:
+                if len(gs) >= 2:
+                    diff_channels.append(_diff_channel(gs[-1], gs[-2]))
+                else:
+                    diff_channels.append(torch.zeros((1, 1, H, W), dtype=torch.float32, device=grid_t.device))
+            if self.use_diff_channel_2:
+                if len(gs) >= 3:
+                    diff_channels.append(_diff_channel(gs[-2], gs[-3]))
+                else:
+                    diff_channels.append(torch.zeros((1, 1, H, W), dtype=torch.float32, device=grid_t.device))
+
+            grid_t = torch.cat([grid_t] + diff_channels, dim=1)
+
         grid_feat = self.grid_backbone(grid_t)
         grid_embed = F.adaptive_avg_pool2d(grid_feat, output_size=1).flatten(1)
 
@@ -143,6 +176,7 @@ class ObservationEncoder(nn.Module):
             "schema_version": "ENCODER_OUT_V1",
             "z_t": z_t,
             "grid_embed": grid_embed,
+            "grid_embed_dim": int(grid_embed.shape[1]),
             "meta_embed": meta_embed,
             "obs_norm": obs_norm,
             "debug": {

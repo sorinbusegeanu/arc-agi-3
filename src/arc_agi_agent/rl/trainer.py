@@ -136,6 +136,8 @@ def normalize_ppo_cfg(ppo_cfg: Dict[str, Any]) -> Dict[str, Any]:
         "lr_adapt_upscale",
         "lr_adapt_upscale_patience_iters",
         "lr_adapt_use_abs_kl",
+        "value_recompute_chunk",
+        "max_steps_per_train_step",
     }
     unknown = sorted(set(cfg.keys()) - allowed)
     if unknown:
@@ -549,7 +551,23 @@ class Trainer:
         algo = str(cfg_eff.get("algo", "a2c")).lower()
         if algo == "ppo":
             return self._train_step_ppo(batch, modules, optim, cfg_eff, ctx)
-        return self._train_step_a2c(batch, modules, optim, cfg_eff)
+        iter_idx = int((ctx or {}).get("iter_idx", -1))
+        ep_count = len(batch.get("episodes", []))
+        step_count = sum(len(ep.get("steps", [])) for ep in batch.get("episodes", []))
+        logger.info(
+            "train_step_start iter=%s algo=a2c episodes=%s steps=%s",
+            iter_idx,
+            ep_count,
+            step_count,
+        )
+        t0 = time.time()
+        out = self._train_step_a2c(batch, modules, optim, cfg_eff, ctx)
+        logger.info(
+            "train_step_end iter=%s algo=a2c elapsed_s=%.1f",
+            iter_idx,
+            time.time() - t0,
+        )
+        return out
 
     def _train_step_a2c(
         self,
@@ -557,8 +575,9 @@ class Trainer:
         modules: Dict[str, Any],
         optim: Any,
         cfg_eff: Dict[str, Any],
+        ctx: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        required = {"controller", "actor", "value"}
+        required = {"actor", "value"}
         missing = [k for k in required if k not in modules]
         if missing:
             raise RuntimeError(f"trainer missing modules keys: missing={missing} available={sorted(modules.keys())}")
@@ -586,6 +605,11 @@ class Trainer:
         win_eps = 0
         done_eps = 0
         win_present = False
+
+        iter_idx = int((ctx or {}).get("iter_idx", -1))
+        total_eps = len(batch.get("episodes", []))
+        t_start = time.time()
+        last_emit = t_start
 
         for ep_idx, ep in enumerate(batch.get("episodes", [])):
             steps = ep.get("steps", [])
@@ -616,13 +640,17 @@ class Trainer:
                 coord_candidates = step.get("coord_candidates") or []
                 chosen_coord_index = step.get("chosen_coord_index")
 
-                ctrl_out = modules["controller"].forward(h_t, ctx={"is_train": True})
+                if modules["controller"] is not None:
+                    ctrl_out = modules["controller"].forward(h_t, ctx={"is_train": True})
+                    ctrl_logits = ctrl_out["mode_logits"] / float(controller_temp)
+                else:
+                    _num_modes = max(1, int(cfg_eff.get("num_modes", 4)))
+                    ctrl_logits = torch.zeros((1, _num_modes), dtype=torch.float32, device=device)
                 actor_out = modules["actor"].forward(h_t, mode_id, action_ids, coord_candidates, cfg=cfg_eff)
                 value = modules["value"].forward(h_t).view(1)
                 ret = torch.tensor([rets[i]], dtype=torch.float32, device=device)
                 adv = ret - value
 
-                ctrl_logits = ctrl_out["mode_logits"] / float(controller_temp)
                 mode_logp, mode_entropy = _mode_logp_entropy_from_logits(
                     ctrl_logits,
                     torch.tensor([mode_id], dtype=torch.long, device=device),
@@ -707,6 +735,17 @@ class Trainer:
                     aux_losses.append(F.cross_entropy(ctrl_out["mode_logits"], target) * w)
 
                 total_steps += 1
+                now = time.time()
+                if now - last_emit >= 5.0:
+                    logger.debug(
+                        "train_step_a2c_progress iter=%s ep=%s/%s steps=%s elapsed_s=%.1f",
+                        iter_idx,
+                        ep_idx + 1,
+                        total_eps,
+                        total_steps,
+                        now - t_start,
+                    )
+                    last_emit = now
 
             if any(bool(s.get("done", False)) for s in steps):
                 done_eps += 1
@@ -750,15 +789,20 @@ class Trainer:
             - entropy_coef * (entropy_actor + entropy_controller)
         )
 
+        logger.debug("train_step_a2c_backward_start iter=%s", iter_idx)
+        t_backward = time.time()
         _zero_grad(optim)
         total_loss.backward()
+        logger.debug("train_step_a2c_backward_done iter=%s elapsed_s=%.3f", iter_idx, time.time() - t_backward)
         grad_norm = torch.nn.utils.clip_grad_norm_(
-            list(modules["controller"].parameters())
+            (list(modules["controller"].parameters()) if modules["controller"] is not None else [])
             + list(modules["actor"].parameters())
             + list(modules["value"].parameters()),
             float(cfg_eff["max_grad_norm"]),
         )
+        t_step = time.time()
         _step_optim(optim)
+        logger.debug("train_step_a2c_optim_done iter=%s elapsed_s=%.3f", iter_idx, time.time() - t_step)
 
         mean_return = float(sum(episode_returns) / max(1, len(episode_returns))) if episode_returns else 0.0
         avg_reward = mean_return
@@ -796,7 +840,7 @@ class Trainer:
         cfg_eff: Dict[str, Any],
         ctx: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
-        required = {"controller", "actor", "value"}
+        required = {"actor", "value"}
         missing = [k for k in required if k not in modules]
         if missing:
             raise RuntimeError(f"trainer missing modules keys: missing={missing} available={sorted(modules.keys())}")
@@ -892,35 +936,104 @@ class Trainer:
         win_eps = 0
         done_eps = 0
         win_present = False
+        recompute_values_cfg = bool(ppo_cfg.get("recompute_values", True))
+        value_recompute_chunk = max(1, int(ppo_cfg.get("value_recompute_chunk", 8192)))
+        max_steps_per_train_step = int(ppo_cfg.get("max_steps_per_train_step", 200_000))
+        iter_idx = int((ctx or {}).get("iter_idx", -1))
+        total_eps = len(batch.get("episodes", []))
+        t_pre = time.time()
+        t_recompute_values = 0.0
+        t_flatten_records = 0.0
+        last_emit = t_pre
+        logger.info(
+            "train_step_preprocess_start iter=%s episodes=%s recompute_values=%s",
+            iter_idx,
+            total_eps,
+            recompute_values_cfg,
+        )
+        episodes = list(batch.get("episodes", []))
+        ep_slices: List[tuple[int, int]] = []
+        values_all: List[Optional[float]] = []
+        missing_indices: List[int] = []
+        total_steps_counted: Optional[int] = None
 
-        recompute_values = bool(ppo_cfg.get("recompute_values", True))
-        for ep_idx, ep in enumerate(batch.get("episodes", [])):
+        if recompute_values_cfg:
+            h_rows_all: List[torch.Tensor] = []
+            step_offset = 0
+            for ep in episodes:
+                steps = ep.get("steps", [])
+                start = step_offset
+                if steps:
+                    for s in steps:
+                        h_raw = _as_float_tensor(s.get("h_t"), device=device)
+                        if h_raw.dim() == 1:
+                            h_t = h_raw.unsqueeze(0)
+                        elif h_raw.dim() == 2:
+                            h_t = h_raw
+                        else:
+                            h_t = h_raw.reshape(1, -1)
+                        h_rows_all.append(h_t)
+                        old_val = s.get("old_value", None)
+                        if old_val is None:
+                            missing_indices.append(step_offset)
+                            values_all.append(None)
+                        else:
+                            values_all.append(float(old_val))
+                        step_offset += 1
+                ep_slices.append((start, step_offset))
+            total_steps_counted = step_offset
+
+            if max_steps_per_train_step > 0 and total_steps_counted > max_steps_per_train_step:
+                logger.error(
+                    "train_step_skipped_too_many_steps iter=%s episodes=%s steps=%s workers=%s games=%s max_steps_per_train_step=%s",
+                    iter_idx,
+                    total_eps,
+                    total_steps_counted,
+                    (ctx or {}).get("workers", "unknown"),
+                    (ctx or {}).get("games", "unknown"),
+                    max_steps_per_train_step,
+                )
+                return _empty_ppo_report(batch, stage=stage)
+
+            if missing_indices:
+                value_prev = modules["value"].training
+                modules["value"].eval()
+                h_all = torch.cat(h_rows_all, dim=0).contiguous() if h_rows_all else torch.zeros((0, 1), device=device)
+                with torch.no_grad():
+                    t_rv0 = time.time()
+                    for start in range(0, len(missing_indices), value_recompute_chunk):
+                        chunk_idx = missing_indices[start : start + value_recompute_chunk]
+                        idx_t = torch.tensor(chunk_idx, dtype=torch.long, device=device)
+                        h_chunk = h_all.index_select(0, idx_t).contiguous()
+                        vals_chunk = modules["value"].forward(h_chunk).view(-1).detach().cpu().tolist()
+                        for j, v in enumerate(vals_chunk):
+                            values_all[chunk_idx[j]] = float(v)
+                    t_recompute_values += time.time() - t_rv0
+                modules["value"].train(value_prev)
+
+        if total_steps_counted is None:
+            total_steps_counted = sum(len(ep.get("steps", []) or []) for ep in episodes)
+            if max_steps_per_train_step > 0 and total_steps_counted > max_steps_per_train_step:
+                logger.error(
+                    "train_step_skipped_too_many_steps iter=%s episodes=%s steps=%s workers=%s games=%s max_steps_per_train_step=%s",
+                    iter_idx,
+                    total_eps,
+                    total_steps_counted,
+                    (ctx or {}).get("workers", "unknown"),
+                    (ctx or {}).get("games", "unknown"),
+                    max_steps_per_train_step,
+                )
+                return _empty_ppo_report(batch, stage=stage)
+
+        for ep_idx, ep in enumerate(episodes):
             steps = ep.get("steps", [])
             if not steps:
                 continue
             rewards = [float(s.get("reward", 0.0)) for s in steps]
             dones = [bool(s.get("done", False)) for s in steps]
-            if recompute_values:
-                value_prev = modules["value"].training
-                modules["value"].eval()
-                h_rows_ep: List[torch.Tensor] = []
-                for s in steps:
-                    h_raw = _as_float_tensor(s.get("h_t"), device=device)
-                    if h_raw.dim() == 1:
-                        h_t = h_raw.unsqueeze(0)
-                    elif h_raw.dim() == 2:
-                        h_t = h_raw
-                    else:
-                        h_t = h_raw.reshape(1, -1)
-                    h_rows_ep.append(h_t)
-                h_ep = torch.cat(h_rows_ep, dim=0).contiguous() if h_rows_ep else torch.zeros((0, 1), device=device)
-                if h_rows_ep:
-                    with torch.no_grad():
-                        vals = modules["value"].forward(h_ep).view(-1).detach().cpu().tolist()
-                else:
-                    vals = []
-                values = [float(v) for v in vals]
-                modules["value"].train(value_prev)
+            if recompute_values_cfg:
+                start, end = ep_slices[ep_idx]
+                values = [float(v) if v is not None else 0.0 for v in values_all[start:end]]
             else:
                 values = [float(s.get("old_value", 0.0)) for s in steps]
             if use_gae:
@@ -930,6 +1043,7 @@ class Trainer:
                 advs = [rets[i] - values[i] for i in range(len(rets))]
             episode_returns.append(float(sum(rewards)))
 
+            t_flat0 = time.time()
             for i, s in enumerate(steps):
                 if "old_logp_mode" not in s:
                     raise RuntimeError("PPO batch missing old_logp_mode")
@@ -962,6 +1076,7 @@ class Trainer:
                     "action_index": action_index,
                     "ep_idx": int(ep_idx),
                     "step_idx": int(i),
+                    "grid_embed": s.get("grid_embed"),
                     "available_actions_mask": s.get("available_actions_mask", None),
                     "coord_candidates": coord_candidates,
                     "chosen_coord_index": -1 if s.get("chosen_coord_index") is None else int(s.get("chosen_coord_index")),
@@ -984,15 +1099,41 @@ class Trainer:
                     "done": bool(s.get("done", False)),
                     "win": bool(s.get("win", False)),
                     "coord_use": bool(coord_use),
+                    "intrinsic_terms": s.get("intrinsic_terms", {}),
+                    "flash_event": bool((s.get("reward_terms", {}) or {}).get("flash_event", False)),
                 }
                 flat.append(rec)
                 total_steps += 1
+            t_flatten_records += time.time() - t_flat0
             if any(bool(s.get("done", False)) for s in steps):
                 done_eps += 1
             ep_win_present = any(isinstance(s, dict) and ("win" in s) for s in steps)
             win_present = win_present or ep_win_present
             if ep_win_present and any(bool(s.get("win", False)) for s in steps):
                 win_eps += 1
+            now = time.time()
+            if now - last_emit >= 5.0:
+                logger.debug(
+                    "train_step_preprocess_progress iter=%s ep=%s/%s steps=%s elapsed_s=%.1f t_recompute=%.1f t_flatten=%.1f",
+                    iter_idx,
+                    ep_idx + 1,
+                    total_eps,
+                    total_steps,
+                    now - t_pre,
+                    t_recompute_values,
+                    t_flatten_records,
+                )
+                last_emit = now
+
+        logger.info(
+            "train_step_preprocess_done iter=%s episodes=%s steps=%s elapsed_s=%.1f t_recompute=%.1f t_flatten=%.1f",
+            iter_idx,
+            total_eps,
+            total_steps,
+            time.time() - t_pre,
+            t_recompute_values,
+            t_flatten_records,
+        )
 
         if not flat:
             return {
@@ -1059,6 +1200,9 @@ class Trainer:
         adv_t = torch.tensor([r["adv"] for r in flat], dtype=torch.float32, device=device).contiguous()
         coord_use_all = torch.tensor([bool(r.get("coord_use", False)) for r in flat], dtype=torch.bool, device=device).contiguous()
         action_ids_all = [list(r["action_ids"]) for r in flat]
+        action_ids_sig_all = [
+            hashlib.sha1("|".join(map(str, ids)).encode("utf-8")).hexdigest() for ids in action_ids_all
+        ]
         action_index_cpu = [int(r["action_index"]) for r in flat]
         coord_candidates_all = [list(r["coord_candidates"]) for r in flat]
         any_coord_use_flat = any(bool(r.get("coord_use", False)) for r in flat)
@@ -1090,6 +1234,41 @@ class Trainer:
         aux_mode_weight_all = torch.tensor([float(r.get("aux_mode_weight", 1.0)) for r in flat], dtype=torch.float32, device=device)
         aux_present_all = torch.tensor([t is not None for t in aux_mode_target_all], dtype=torch.bool, device=device)
         aux_target_t_all = torch.tensor([int(t) if t is not None else 0 for t in aux_mode_target_all], dtype=torch.long, device=device)
+        intrinsic_cfg = cfg_eff.get("intrinsic", {}) if isinstance(cfg_eff.get("intrinsic", {}), dict) else {}
+        intrinsic_enabled = bool(intrinsic_cfg.get("enabled", False)) and str(intrinsic_cfg.get("method", "")) == "rnd_grid_embed"
+        intrinsic_enabled = intrinsic_enabled and ("intrinsic_rnd" in modules)
+        grid_embed_all: Optional[torch.Tensor] = None
+        intrinsic_valid_mask: Optional[torch.Tensor] = None
+        rnd_phi_mean = 0.0
+        rnd_err_raw_mean = 0.0
+        if intrinsic_enabled:
+            grid_embed_dim = int(getattr(modules["intrinsic_rnd"].predictor[0], "in_features", 0))
+            grid_rows: List[torch.Tensor] = []
+            present_mask: List[bool] = []
+            flash_mask: List[bool] = []
+            phi_vals: List[float] = []
+            err_vals: List[float] = []
+            for r in flat:
+                ge = r.get("grid_embed")
+                if isinstance(ge, list) and ge and (grid_embed_dim == 0 or len(ge) == grid_embed_dim):
+                    grid_rows.append(torch.tensor(ge, dtype=torch.float32))
+                    present_mask.append(True)
+                else:
+                    grid_rows.append(torch.zeros((max(1, grid_embed_dim),), dtype=torch.float32))
+                    present_mask.append(False)
+                terms = r.get("intrinsic_terms", {}) if isinstance(r.get("intrinsic_terms", {}), dict) else {}
+                phi_vals.append(float(terms.get("rnd_phi", 0.0)) if present_mask[-1] else 0.0)
+                err_vals.append(float(terms.get("rnd_err_raw", 0.0)) if present_mask[-1] else 0.0)
+                flash_mask.append(bool(r.get("flash_event", False)))
+            if grid_rows:
+                grid_embed_all_cpu = torch.stack(grid_rows, dim=0).contiguous()
+                grid_embed_all = grid_embed_all_cpu.to(device=device, non_blocking=True)
+                present_mask_t = torch.tensor(present_mask, dtype=torch.bool, device=device)
+                flash_mask_t = torch.tensor(flash_mask, dtype=torch.bool, device=device)
+                intrinsic_valid_mask = mask_valid_step_all & present_mask_t & (~flash_mask_t)
+                denom = max(1, sum(1 for v in present_mask if v))
+                rnd_phi_mean = float(sum(phi_vals) / float(denom))
+                rnd_err_raw_mean = float(sum(err_vals) / float(denom))
         action_env_mask_local_all: List[torch.Tensor] = []
         action_mask_raw_type_all: List[str] = []
         action_mask_raw_len_all: List[int] = []
@@ -1115,7 +1294,7 @@ class Trainer:
                 sample_action_ids,
                 step_idx=idx_r,
             )
-            action_env_mask_local_all.append(torch.tensor(final_row, dtype=torch.bool, device=device).contiguous())
+            action_env_mask_local_all.append(torch.tensor(final_row, dtype=torch.bool).contiguous())
             action_mask_raw_type_all.append(str(raw_typ))
             action_mask_raw_len_all.append(int(raw_len))
             action_mask_raw_preview_all.append(list(raw_preview))
@@ -1198,16 +1377,18 @@ class Trainer:
         rollout_policy_version = (ctx or {}).get("rollout_policy_version", None)
 
         def _set_eval_for_recompute() -> tuple[bool, bool, bool]:
-            ctrl_prev = modules["controller"].training
+            ctrl_prev = modules["controller"].training if modules["controller"] is not None else False
             actor_prev = modules["actor"].training
             value_prev = modules["value"].training
-            modules["controller"].eval()
+            if modules["controller"] is not None:
+                modules["controller"].eval()
             modules["actor"].eval()
             modules["value"].eval()
             return ctrl_prev, actor_prev, value_prev
 
         def _restore_train_mode(prev: tuple[bool, bool, bool]) -> None:
-            modules["controller"].train(prev[0])
+            if modules["controller"] is not None:
+                modules["controller"].train(prev[0])
             modules["actor"].train(prev[1])
             modules["value"].train(prev[2])
 
@@ -1238,7 +1419,7 @@ class Trainer:
                         "chosen_coord_index": torch.zeros((0,), dtype=torch.long, device=device),
                     }
                 idx_t = valid_indices.to(device=device)
-                valid_indices_list = idx_t.detach().cpu().tolist()
+                idx_t_cpu = valid_indices.detach().cpu()
             else:
                 if not valid_indices:
                     zf = torch.zeros((0,), dtype=torch.float32, device=device)
@@ -1259,8 +1440,8 @@ class Trainer:
                         "mode_index": torch.zeros((0,), dtype=torch.long, device=device),
                         "chosen_coord_index": torch.zeros((0,), dtype=torch.long, device=device),
                     }
-                valid_indices_list = list(valid_indices)
-                idx_t = torch.tensor(valid_indices_list, dtype=torch.long, device=device)
+                idx_t_cpu = torch.tensor(list(valid_indices), dtype=torch.long)
+                idx_t = idx_t_cpu.to(device=device)
 
             if idx_t.numel() == 0:
                 zf = torch.zeros((0,), dtype=torch.float32, device=device)
@@ -1293,8 +1474,13 @@ class Trainer:
             coord_use_stored = coord_use_all.index_select(0, idx_t)
             coord_use_cpu = coord_use_stored.detach().to("cpu")
 
-            ctrl_out = modules["controller"].forward(h_t, ctx={"is_train": False})
-            ctrl_logits = ctrl_out["mode_logits"] / float(controller_temp)
+            if modules["controller"] is not None:
+                ctrl_out = modules["controller"].forward(h_t, ctx={"is_train": False})
+                ctrl_logits = ctrl_out["mode_logits"] / float(controller_temp)
+            else:
+                _num_modes = max(1, int(cfg_eff.get("num_modes", 4)))
+                ctrl_logits = torch.zeros((m, _num_modes), dtype=torch.float32, device=device)
+                ctrl_out = {"mode_logits": ctrl_logits}
             mode_logp_new, mode_entropy_new = _mode_logp_entropy_from_logits(ctrl_logits, mode_index)
 
             action_logp_new = torch.zeros((m,), dtype=torch.float32, device=device)
@@ -1305,22 +1491,43 @@ class Trainer:
             any_coord_use = bool(coord_use.any())
             action_temperature = float(cfg_eff.get("temperature", 1.0))
 
+            uniform_action_ids = True
+            if m > 0:
+                first_sig = action_ids_sig_all[int(idx_t_cpu[0].item())]
+                for row_j in range(1, m):
+                    sample_i = int(idx_t_cpu[row_j].item())
+                    if action_ids_sig_all[sample_i] != first_sig:
+                        uniform_action_ids = False
+                        break
+            if uniform_action_ids and m > 0:
+                first_mode = int(mode_index_cpu[0].item())
+                uniform_mode = True
+                for row_j in range(1, m):
+                    if int(mode_index_cpu[row_j].item()) != first_mode:
+                        uniform_mode = False
+                        break
+            else:
+                uniform_mode = False
+
             groups: Dict[tuple, List[int]] = {}
-            for row_j, sample_i in enumerate(valid_indices_list):
-                mode_id = int(mode_index_cpu[row_j])
-                action_ids_row = action_ids_all[sample_i]
-                sig = (mode_id, tuple(map(str, action_ids_row)))
-                groups.setdefault(sig, []).append(row_j)
+            if uniform_action_ids and uniform_mode:
+                groups[(int(mode_index_cpu[0].item()), first_sig)] = list(range(m))
+            else:
+                for row_j in range(m):
+                    sample_i = int(idx_t_cpu[row_j].item())
+                    mode_id = int(mode_index_cpu[row_j])
+                    sig = (mode_id, action_ids_sig_all[sample_i])
+                    groups.setdefault(sig, []).append(row_j)
 
             for sig, rows in groups.items():
-                mode_id, action_ids_row = sig
-                action_ids_row = list(action_ids_row)
+                mode_id, _action_sig = sig
                 idx_rows = torch.tensor(rows, dtype=torch.long, device=device)
                 h_group = h_t.index_select(0, idx_rows).contiguous()
-                sample_indices = [valid_indices_list[r] for r in rows]
+                sample_indices = [int(idx_t_cpu[r].item()) for r in rows]
+                action_ids_row = action_ids_all[sample_indices[0]]
                 env_masks = [action_env_mask_local_all[sample_i] for sample_i in sample_indices]
-                env_mask_batch = torch.stack(env_masks, dim=0)
-                cache_key = (mode_id, tuple(map(str, action_ids_row)))
+                env_mask_batch = torch.stack(env_masks, dim=0).to(device=device, non_blocking=True)
+                cache_key = (mode_id, action_ids_sig_all[sample_indices[0]])
                 if cache_key in allow_bias_cache:
                     allow_row_t, bias_row_t = allow_bias_cache[cache_key]
                 else:
@@ -1406,22 +1613,22 @@ class Trainer:
             valid_coords: List[int] = [0 for _ in range(m)] if diagnostics else []
             coord_feat_dim = _coord_feat_dim(cfg_eff, modules["actor"])
             groups = {}
-            for row_j, sample_i in enumerate(valid_indices_list):
+            for row_j in range(m):
+                sample_i = int(idx_t_cpu[row_j].item())
                 mode_id = int(mode_index_cpu[row_j])
-                action_ids_row = action_ids_all[sample_i]
                 if bool(coord_use_cpu[row_j]):
                     k_coord = min(int(cfg_eff.get("coord_topK", 16)), len(coord_candidates_all[sample_i]))
                     coord_sig = coord_sig_all[sample_i]
                 else:
                     k_coord = 0
                     coord_sig = None
-                sig = (mode_id, tuple(map(str, action_ids_row)), int(k_coord), coord_sig)
+                sig = (mode_id, action_ids_sig_all[sample_i], int(k_coord), coord_sig)
                 groups.setdefault(sig, []).append(row_j)
 
             for sig, rows in groups.items():
-                mode_id, action_ids_row, k_coord, _coord_sig = sig
-                action_ids_row = list(action_ids_row)
-                sample_indices = [valid_indices_list[r] for r in rows]
+                mode_id, _action_sig, k_coord, _coord_sig = sig
+                sample_indices = [int(idx_t_cpu[r].item()) for r in rows]
+                action_ids_row = action_ids_all[sample_indices[0]]
                 if k_coord > 0:
                     idx_rows = torch.tensor(rows, dtype=torch.long, device=device)
                     h_group = h_t.index_select(0, idx_rows).contiguous()
@@ -1731,6 +1938,10 @@ class Trainer:
         entropy_action_coord_vals: List[torch.Tensor] = []
         entropy_mode_sum_t = torch.zeros((num_modes,), dtype=torch.float32, device=device)
         entropy_mode_count_t = torch.zeros((num_modes,), dtype=torch.float32, device=device)
+        rnd_loss_vals: List[torch.Tensor] = []
+        rnd_err_raw_vals: List[torch.Tensor] = []
+        rnd_updates_done = 0
+        rnd_updates_limit = int(intrinsic_cfg.get("rnd_updates_per_iter", 0)) if intrinsic_enabled else 0
 
         stop_early = False
         device_check_done = False
@@ -1910,13 +2121,28 @@ class Trainer:
                 _zero_grad(optim)
                 total_loss.backward()
                 grad_norm = torch.nn.utils.clip_grad_norm_(
-                    list(modules["controller"].parameters())
+                    (list(modules["controller"].parameters()) if modules["controller"] is not None else [])
                     + list(modules["actor"].parameters())
                     + list(modules["value"].parameters()),
                     max_grad_norm,
                 )
                 _step_optim(optim)
                 t_mb_step += time.time() - t_mb_step_start
+
+                if intrinsic_enabled and grid_embed_all is not None and intrinsic_valid_mask is not None:
+                    if rnd_updates_limit <= 0 or rnd_updates_done < rnd_updates_limit:
+                        rnd_sel = intrinsic_valid_mask.index_select(0, idx_t)
+                        rnd_idx_t = idx_t[rnd_sel]
+                        if rnd_idx_t.numel() > 0:
+                            grid_embed_mb = grid_embed_all.index_select(0, rnd_idx_t)
+                            pred, tgt, _err_vec, err_scalar = modules["intrinsic_rnd"](grid_embed_mb)
+                            rnd_loss = F.mse_loss(pred, tgt)
+                            _zero_grad(optim)
+                            rnd_loss.backward()
+                            _step_optim(optim)
+                            rnd_loss_vals.append(rnd_loss.detach())
+                            rnd_err_raw_vals.append(err_scalar.mean().detach())
+                            rnd_updates_done += 1
 
                 last_total = total_loss.detach()
                 last_actor = loss_action_mb.detach()
@@ -2087,6 +2313,14 @@ class Trainer:
             t_mb_eval,
             t_mb_step,
         )
+        if intrinsic_enabled and grid_embed_all is not None:
+            logger.info(
+                "train_step_rnd_summary iter=%s grid_embed_rows=%s grid_embed_dim=%s rnd_updates=%s",
+                iter_idx,
+                int(grid_embed_all.shape[0]),
+                int(grid_embed_all.shape[1]) if grid_embed_all.dim() > 1 else 0,
+                int(rnd_updates_done),
+            )
 
         n_episodes = len(batch.get("episodes", []))
         mean_return = float(sum(episode_returns) / max(1, len(episode_returns))) if episode_returns else 0.0
@@ -2118,6 +2352,9 @@ class Trainer:
                 "train/vf_clip_eps_effective": float(vf_clip_eps),
                 "train/ppo_epochs_effective": int(ppo_epochs),
                 "train/ppo_minibatches_effective": int(ppo_minibatches),
+                "train/rnd_loss": float(torch.stack(rnd_loss_vals).mean().detach().cpu().item()) if rnd_loss_vals else 0.0,
+                "train/rnd_err_raw_mean": float(torch.stack(rnd_err_raw_vals).mean().detach().cpu().item()) if rnd_err_raw_vals else 0.0,
+                "train/rnd_phi_mean": float(rnd_phi_mean),
                 "clip_frac": float(
                     torch.stack([v for v in [torch.stack(clip_mode_vals).mean() if clip_mode_vals else None,
                                              torch.stack(clip_action_vals).mean() if clip_action_vals else None,

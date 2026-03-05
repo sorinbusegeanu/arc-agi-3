@@ -1,0 +1,27 @@
+ToDos.
+
+Canonical schemas: exact JSON schemas (versioned) for Observation, Action, TransitionEvent, POI, CP_Signature, Segment, Macro, EnvReport, Task, Patch/Event.
+
+Action encoding: coordinate action format, bounds, rounding, invalid-action handling, action availability masks.
+
+Determinism contract: seed propagation rules, RNG ownership per agent/task, replay determinism guarantees.
+
+CP metric contract: what grid(s) are diffed, masking representation, UI/progress-bar handling, quantization bins.
+
+POI semantics: intent tags taxonomy, “reached” definition, dedup rules, ranking/scoring function.
+
+Budgeting: global step budget, per-round caps, per-POI step budget, parallelism limits, timeouts.
+
+Branching policy: when to branch, max branches, branch keys, merge/eviction rules.
+
+Replay verification: how to confirm a macro succeeded (signature match tolerance, fallback behavior).
+
+Storage: on-disk layout, atomic writes, retention limits, indexing, run metadata.
+
+Logging/telemetry: required metrics, event log format, debug artifacts (frames, diffs), failure reason taxonomy.
+
+Failure handling: what counts as stagnation, loop detection thresholds, reset/retry strategy.
+
+LLM constraints: prompts, decoding params, strict output validation, retry rules on parse failure.
+
+Integration points: where this plugs into existing trainer/collector/orchestrator and what gets replaced vs wrapped.

@@ -12,6 +12,7 @@ from ..config import RLConfig
 from .action_key_normalize_v1 import action_key_to_index
 from .coord_proposer import CoordProposer
 from .hierarchical_controller import HierarchicalController
+from .intrinsic_rnd import IntrinsicRND
 from .module_control import module_enabled
 from .observation_encoder import ObservationEncoder
 from .policy_actor_value import PolicyActor, ValueHead
@@ -90,10 +91,12 @@ class RLAgent:
         self.cfg = {**base, **json_defaults, **(cfg or {})}
 
         module_enabled(self.cfg, "rl_encoder", required=True)
+        _encoder_sub = self.cfg.get("encoder", {}) if isinstance(self.cfg.get("encoder"), dict) else {}
         self.encoder = ObservationEncoder(
             {
                 "embed_dim": self.cfg["embed_dim"],
                 "frame_stack": int(self.cfg.get("frame_stack", 4)),
+                **_encoder_sub,
             }
         )
         module_enabled(self.cfg, "rl_memory", required=True)
@@ -103,14 +106,14 @@ class RLAgent:
                 "action_emb_dim": self.cfg["action_emb_dim"],
             }
         )
-        module_enabled(self.cfg, "rl_controller", required=True)
+        _ctrl_enabled = bool(module_enabled(self.cfg, "rl_controller", required=False))
         self.controller = HierarchicalController(
             {
                 "hidden_dim": self.cfg["hidden_dim"],
                 "num_modes": max(1, len(self.cfg.get("modes", [0, 1, 2]))),
                 "sample_mode_train": bool(self.cfg.get("controller", {}).get("sample_mode_train", True)),
             }
-        )
+        ) if _ctrl_enabled else None
         module_enabled(self.cfg, "rl_actor", required=True)
         self.actor = PolicyActor(
             {
@@ -124,6 +127,14 @@ class RLAgent:
         )
         module_enabled(self.cfg, "rl_value", required=True)
         self.value = ValueHead(self.cfg["hidden_dim"])  # type: ignore[arg-type]
+
+        self.intrinsic_rnd = None
+        intrinsic_cfg = self.cfg.get("intrinsic", {}) if isinstance(self.cfg.get("intrinsic", {}), dict) else {}
+        if bool(intrinsic_cfg.get("enabled", False)) and str(intrinsic_cfg.get("method", "")) == "rnd_grid_embed":
+            grid_embed_dim = int(self.encoder.cfg.get("cnn_channels", [128])[-1])
+            rnd_hidden = int(intrinsic_cfg.get("rnd_hidden", 256))
+            rnd_out = int(intrinsic_cfg.get("rnd_out", 128))
+            self.intrinsic_rnd = IntrinsicRND(grid_embed_dim, rnd_hidden, rnd_out)
 
         if module_enabled(self.cfg, "rl_coord_proposer", required=True):
             self.coord_proposer = CoordProposer()
@@ -143,19 +154,25 @@ class RLAgent:
             self.device = torch.device(requested_device if requested_device != "cuda" else "cuda:0")
         self.encoder.to(self.device)
         self.memory.to(self.device)
-        self.controller.to(self.device)
+        if self.controller is not None:
+            self.controller.to(self.device)
         self.actor.to(self.device)
         self.value.to(self.device)
+        if self.intrinsic_rnd is not None:
+            self.intrinsic_rnd.to(self.device)
         self.policy_version = -1
 
     def _build_modules(self) -> Dict[str, Any]:
-        return {
+        modules = {
             "encoder": self.encoder,
             "memory": self.memory,
             "controller": self.controller,
             "actor": self.actor,
             "value": self.value,
         }
+        if self.intrinsic_rnd is not None:
+            modules["intrinsic_rnd"] = self.intrinsic_rnd
+        return modules
 
     @staticmethod
     def _normalize_available_actions_mask(mask_obj: Any, nd: int, action_ids: Optional[List[str]] = None) -> tuple[List[bool], bool]:
@@ -196,15 +213,20 @@ class RLAgent:
         return out, pre_zero
 
     def apply_policy_snapshot(self, state_dict: Dict[str, Any], policy_version: int) -> None:
+        actor_sd = state_dict.get("actor", {})
+        if not actor_sd:
+            raise ValueError(f"apply_policy_snapshot: actor state_dict is empty (policy_version={policy_version})")
         modules = self._build_modules()
         modules["encoder"].load_state_dict(state_dict["encoder"])
         modules["memory"].load_state_dict(state_dict["memory"])
-        modules["controller"].load_state_dict(state_dict["controller"])
-        modules["actor"].load_state_dict(state_dict["actor"])
+        if modules["controller"] is not None and "controller" in state_dict:
+            modules["controller"].load_state_dict(state_dict["controller"])
+        modules["actor"].load_state_dict(actor_sd)
         modules["value"].load_state_dict(state_dict["value"])
         modules["encoder"].to(self.device)
         modules["memory"].to(self.device)
-        modules["controller"].to(self.device)
+        if modules["controller"] is not None:
+            modules["controller"].to(self.device)
         modules["actor"].to(self.device)
         modules["value"].to(self.device)
         self.policy_version = int(policy_version)
@@ -326,7 +348,7 @@ class RLAgent:
             "cfg": self.cfg,
             "encoder": modules["encoder"].state_dict(),
             "memory": modules["memory"].state_dict(),
-            "controller": modules["controller"].state_dict(),
+            "controller": modules["controller"].state_dict() if modules["controller"] is not None else None,
             "actor": modules["actor"].state_dict(),
             "value": modules["value"].state_dict(),
             "optim": optim.state_dict() if optim is not None else None,
@@ -337,7 +359,8 @@ class RLAgent:
         payload = torch.load(path, map_location="cpu")
         modules["encoder"].load_state_dict(payload.get("encoder", {}))
         modules["memory"].load_state_dict(payload.get("memory", {}))
-        modules["controller"].load_state_dict(payload.get("controller", {}))
+        if modules["controller"] is not None and payload.get("controller") is not None:
+            modules["controller"].load_state_dict(payload["controller"])
         modules["actor"].load_state_dict(payload.get("actor", {}))
         modules["value"].load_state_dict(payload.get("value", {}))
         if optim is not None and payload.get("optim") is not None:
@@ -362,8 +385,14 @@ class RLAgent:
             mem = modules["memory"].step(z_t, prev_action, prev_reward, prev_done, h_prev)
             h_t = mem["h_t"]
             h_core = h_t[0] if isinstance(h_t, tuple) else h_t
-            ctrl = modules["controller"].forward(h_core, ctx={"is_train": stochastic})
-            mode_id = int(ctrl["mode_id"].view(-1)[0].item())
+            if modules["controller"] is not None:
+                ctrl = modules["controller"].forward(h_core, ctx={"is_train": stochastic})
+                mode_id = int(ctrl["mode_id"].view(-1)[0].item())
+                _ctrl_mode_logits = ctrl["mode_logits"]
+            else:
+                mode_id = 0
+                _num_modes = max(1, int(self.cfg.get("num_modes", 4)))
+                _ctrl_mode_logits = torch.zeros((1, _num_modes), dtype=torch.float32, device=h_core.device)
             action_ids = [str(a.get("action_id")) for a in action_schema.get("actions", []) if a.get("action_id")]
             actor = modules["actor"].forward(h_core, mode_id=mode_id, available_actions=action_ids, coord_candidates=[])
             logits = actor["pi_discrete"]
@@ -374,7 +403,7 @@ class RLAgent:
                 idx = int(torch.argmax(logits, dim=1).item())
             action_id = actor["action_ids"][idx]
             mode_logp_t, _ = modules["actor"].mode_logp_entropy(
-                ctrl["mode_logits"],
+                _ctrl_mode_logits,
                 torch.tensor([mode_id], dtype=torch.long, device=logits.device),
             )
             mask_norm, _ = self._normalize_available_actions_mask(None, len(actor["action_ids"]), action_ids=list(actor["action_ids"]))
@@ -382,7 +411,7 @@ class RLAgent:
                 h_core,
                 {
                     "mode_id": mode_id,
-                    "mode_logits": ctrl["mode_logits"],
+                    "mode_logits": _ctrl_mode_logits,
                     "action_ids": actor["action_ids"],
                     "action_index": idx,
                     "available_actions_mask": [1 if x else 0 for x in mask_norm],
@@ -393,7 +422,7 @@ class RLAgent:
                 cfg=self.cfg,
                 ctx=None,
             )
-            logp_mode = float(mode_logp_t.detach().cpu().item())
+            logp_mode = float(mode_logp_t.detach().cpu().item()) if modules["controller"] is not None else 0.0
             logp_action_discrete = float(action_logp_t.detach().cpu().item())
             logp_coord = float(coord_logp_t_eff.detach().cpu().item()) if coord_logp_t_eff is not None else None
             logp_total = float(logp_mode + logp_action_discrete + (logp_coord or 0.0))
@@ -460,6 +489,8 @@ class RLAgent:
 
         num_iters = int(args.iters or cfg_eff["train"]["num_iters"])
         best_loss = float("inf")
+        best_winrate = -1.0
+        best_return = float("-inf")
 
         for iter_idx in range(num_iters):
             batch = self.collector.collect(
@@ -486,6 +517,14 @@ class RLAgent:
             if loss < best_loss:
                 best_loss = loss
                 self._save_checkpoint(os.path.join(outdir, "checkpoints", "best.pt"), modules, optim, iter_idx)
+            win_rate = float(report.get("win_rate", 0.0))
+            if win_rate > best_winrate:
+                best_winrate = win_rate
+                self._save_checkpoint(os.path.join(outdir, "checkpoints", "best_winrate.pt"), modules, optim, iter_idx)
+            mean_return = float(report.get("mean_return", float("-inf")))
+            if mean_return > best_return:
+                best_return = mean_return
+                self._save_checkpoint(os.path.join(outdir, "checkpoints", "best_return.pt"), modules, optim, iter_idx)
 
             if int(cfg_eff["eval"].get("every_iters", 0)) > 0 and (iter_idx + 1) % int(cfg_eff["eval"]["every_iters"]) == 0:
                 _ = self.collector.collect(

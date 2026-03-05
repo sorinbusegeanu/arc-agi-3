@@ -207,6 +207,7 @@ def _collect_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
     rollout_cfg_payload = payload.get("rollout_cfg_payload")
     worker_id = str(payload.get("worker_id", "unknown"))
     iter_idx = int(payload.get("iter_idx", -1))
+    debug_reward_log = payload.get("debug_reward_log") or None
     logger.info(
         "collect_worker_start iter=%s worker=%s seed_base=%s episodes=%s max_actions=%s stochastic=%s device=%s torch_threads=%s",
         iter_idx,
@@ -223,7 +224,8 @@ def _collect_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
     if int(policy_version) != int(getattr(agent, "policy_version", -1)):
         agent.apply_policy_snapshot(policy_state_dict, policy_version=policy_version)
     modules = agent._build_modules()
-    logger.info("worker_policy_version=%s", int(getattr(agent, "policy_version", -1)))
+    actor_norm = sum(p.norm().item() for p in agent.actor.parameters())
+    logger.info("worker_policy_version=%s actor_norm=%.4f", int(getattr(agent, "policy_version", -1)), actor_norm)
 
     env_factory = _build_env_factory(games=games, seed_base=seed_base, op_mode=op_mode, render_terminal=render_terminal)
     batch = agent.collector.collect(
@@ -238,6 +240,7 @@ def _collect_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
             "hud_specs": cfg.get("hud_specs", {}),
             "mode": collect_mode,
             "hud_cache_dir": str(cfg.get("hud_cache_dir", "runs/cache")),
+            "debug_reward_log": debug_reward_log,
         },
     )
     ep_count = len(batch.get("episodes", []))
@@ -338,6 +341,7 @@ def _collect_batch(
     rollout_cfg_payload: Optional[Dict[str, Any]] = None,
     render_terminal: bool = False,
     collect_mode: str = "train",
+    debug_reward_log: Optional[str] = None,
 ) -> Dict[str, Any]:
     logger.info(
         "collect_batch_start iter=%s episodes=%s max_actions=%s workers=%s stochastic=%s games=%s",
@@ -364,6 +368,7 @@ def _collect_batch(
                 "hud_specs": agent.cfg.get("hud_specs", {}),
                 "mode": str(collect_mode),
                 "hud_cache_dir": str(agent.cfg.get("hud_cache_dir", "runs/cache")),
+                "debug_reward_log": debug_reward_log or None,
             },
         )
         ep_count = len(batch.get("episodes", []))
@@ -394,7 +399,7 @@ def _collect_batch(
         state_dicts = {
             "encoder": _state_dict_cpu(modules["encoder"].state_dict()),
             "memory": _state_dict_cpu(modules["memory"].state_dict()),
-            "controller": _state_dict_cpu(modules["controller"].state_dict()),
+            "controller": _state_dict_cpu(modules["controller"].state_dict()) if modules["controller"] is not None else None,
             "actor": _state_dict_cpu(modules["actor"].state_dict()),
             "value": _state_dict_cpu(modules["value"].state_dict()),
         }
@@ -419,6 +424,7 @@ def _collect_batch(
                 "torch_num_threads": 1,
                 "render_terminal": bool(render_terminal),
                 "collect_mode": str(collect_mode),
+                "debug_reward_log": debug_reward_log or None,
             }
         )
         start += c
@@ -830,6 +836,7 @@ def main() -> int:
     parser.add_argument("--eval-easy", default=None)
     parser.add_argument("--render-terminal", action="store_true", help="Render game in terminal during env steps")
     parser.add_argument("--debug", default=None, help="Write debug logs to this file path")
+    parser.add_argument("--debug-reward", default=None, help="Write per-step reward breakdown to this file path (TSV)")
     parser.add_argument("--config", default=None)
     parser.add_argument("--outdir", required=True)
     args = parser.parse_args()
@@ -894,6 +901,7 @@ def main() -> int:
     )
 
     algo = str(cfg.get("algo", "a2c")).lower()
+    logger.info("algo_selected algo=%s", algo)
 
     def _resolve_train_episodes_per_iter() -> int:
         if args.episodes is not None and int(args.episodes) > 0:
@@ -977,6 +985,13 @@ def main() -> int:
         seed_base = int(args.seed + eval_iter * 100000)
         target_games = games_eval_holdout if args.mode == "eval" else games_train
         rollout_cfg_hash, rollout_cfg_payload = _rollout_cfg_hash(cfg)
+        eval_policy_state_dict = {
+            "encoder": _state_dict_cpu(modules["encoder"].state_dict()),
+            "memory": _state_dict_cpu(modules["memory"].state_dict()),
+            "controller": _state_dict_cpu(modules["controller"].state_dict()) if modules["controller"] is not None else None,
+            "actor": _state_dict_cpu(modules["actor"].state_dict()),
+            "value": _state_dict_cpu(modules["value"].state_dict()),
+        }
         batch = _collect_batch(
                     agent,
                     modules,
@@ -989,9 +1004,12 @@ def main() -> int:
                     workers=max(1, int(args.workers)),
                     pool=None,
                     iter_idx=0,
+                    policy_state_dict=eval_policy_state_dict,
+                    policy_version=0,
                     rollout_cfg_hash=str(rollout_cfg_hash),
                     rollout_cfg_payload=rollout_cfg_payload,
                     render_terminal=bool(args.render_terminal),
+                    debug_reward_log=args.debug_reward or None,
                 )
         _write_json(os.path.join(run_dir, "trajectories", "batch.json"), batch)
         logger.info(
@@ -1125,7 +1143,7 @@ def main() -> int:
             policy_state_dict = {
                 "encoder": _state_dict_cpu(modules["encoder"].state_dict()),
                 "memory": _state_dict_cpu(modules["memory"].state_dict()),
-                "controller": _state_dict_cpu(modules["controller"].state_dict()),
+                "controller": _state_dict_cpu(modules["controller"].state_dict()) if modules["controller"] is not None else None,
                 "actor": _state_dict_cpu(modules["actor"].state_dict()),
                 "value": _state_dict_cpu(modules["value"].state_dict()),
             }
@@ -1148,6 +1166,7 @@ def main() -> int:
                 rollout_cfg_hash=str(rollout_cfg_hash),
                 rollout_cfg_payload=rollout_cfg_payload,
                 render_terminal=bool(args.render_terminal),
+                debug_reward_log=args.debug_reward or None,
             )
             logger.info(
                 "iter_collect_done iter=%s episodes=%s steps=%s",
@@ -1155,14 +1174,26 @@ def main() -> int:
                 len(train_batch.get("episodes", [])),
                 sum(len(ep.get("steps", [])) for ep in train_batch.get("episodes", [])),
             )
+            logger.debug("iter_post_collect_start iter=%s", iter_idx)
+            t_post = time.time()
             _update_coverage_ledger(coverage_ledger, train_batch)
+            logger.debug("iter_post_collect_coverage_done iter=%s elapsed_s=%.3f", iter_idx, time.time() - t_post)
 
+            t_post = time.time()
             _append_jsonl(
                 os.path.join(run_dir, "seeds.jsonl"),
                 [{"split": "train", "iter": iter_idx, "game_id": ep.get("game_id"), "seed": ep.get("seed")} for ep in train_batch.get("episodes", [])],
             )
+            logger.debug("iter_post_collect_seeds_written iter=%s elapsed_s=%.3f", iter_idx, time.time() - t_post)
 
+            t_post = time.time()
             noncanonical_masks = _sample_noncanonical_masks(train_batch, sample_rows=32)
+            logger.debug(
+                "iter_post_collect_noncanonical_checked iter=%s rows=%s elapsed_s=%.3f",
+                iter_idx,
+                len(noncanonical_masks),
+                time.time() - t_post,
+            )
             if noncanonical_masks:
                 pipeline_mode = str((cfg.get("pipeline", {}) or {}).get("mode", "")).lower()
                 first = noncanonical_masks[0]
@@ -1187,6 +1218,8 @@ def main() -> int:
                     first.get("preview"),
                 )
 
+            logger.debug("train_step_start iter=%s", iter_idx)
+            t_train = time.time()
             train_loss = agent.trainer.train_step(
                 train_batch,
                 modules,
@@ -1201,6 +1234,7 @@ def main() -> int:
                     "rollout_cfg_payload": train_batch.get("rollout_cfg_payload"),
                 },
             )
+            logger.debug("train_step_done iter=%s elapsed_s=%.3f", iter_idx, time.time() - t_train)
             policy_version += 1
             train_metrics_agg, _ = _aggregate_metrics(train_batch, cfg)
             coverage_summary = coverage_ledger.summary()
@@ -1268,17 +1302,24 @@ def main() -> int:
 
             if save_every > 0 and iter_idx % save_every == 0:
                 agent._save_checkpoint(
-                    os.path.join(run_dir, "checkpoints", f"latest_{iter_idx:06d}.ckpt"),
+                    os.path.join(run_dir, "checkpoints", "last.ckpt"),
                     modules,
                     optim,
                     iter_idx,
                 )
-                logger.info("checkpoint_saved iter=%s kind=latest path=%s", iter_idx, os.path.join(run_dir, "checkpoints", f"latest_{iter_idx:06d}.ckpt"))
+                logger.info("checkpoint_saved iter=%s kind=last path=%s", iter_idx, os.path.join(run_dir, "checkpoints", "last.ckpt"))
 
             if eval_every > 0 and (iter_idx + 1) % eval_every == 0:
                 logger.info("eval_start iter=%s episodes=%s", iter_idx, int(resolved_eval_episodes))
                 print(f"[eval_start] iter={iter_idx} episodes={int(resolved_eval_episodes)}", flush=True)
                 eval_seed_base = int(args.seed + (iter_idx + 1) * 1_000_000)
+                eval_policy_state_dict = {
+                    "encoder": _state_dict_cpu(modules["encoder"].state_dict()),
+                    "memory": _state_dict_cpu(modules["memory"].state_dict()),
+                    "controller": _state_dict_cpu(modules["controller"].state_dict()) if modules["controller"] is not None else None,
+                    "actor": _state_dict_cpu(modules["actor"].state_dict()),
+                    "value": _state_dict_cpu(modules["value"].state_dict()),
+                }
                 eval_batch = _collect_batch(
                     agent,
                     modules,
@@ -1291,6 +1332,8 @@ def main() -> int:
                     workers=max(1, int(args.workers)),
                     pool=shared_pool,
                     iter_idx=iter_idx,
+                    policy_state_dict=eval_policy_state_dict,
+                    policy_version=int(policy_version),
                     rollout_cfg_hash=str(rollout_cfg_hash),
                     rollout_cfg_payload=rollout_cfg_payload,
                     render_terminal=bool(args.render_terminal),
@@ -1376,6 +1419,13 @@ def main() -> int:
 
                 if games_eval_easy:
                     logger.info("eval_easy_start iter=%s episodes=%s", iter_idx, int(resolved_eval_episodes))
+                    easy_policy_state_dict = {
+                        "encoder": _state_dict_cpu(modules["encoder"].state_dict()),
+                        "memory": _state_dict_cpu(modules["memory"].state_dict()),
+                        "controller": _state_dict_cpu(modules["controller"].state_dict()) if modules["controller"] is not None else None,
+                        "actor": _state_dict_cpu(modules["actor"].state_dict()),
+                        "value": _state_dict_cpu(modules["value"].state_dict()),
+                    }
                     easy_batch = _collect_batch(
                         agent,
                         modules,
@@ -1388,6 +1438,8 @@ def main() -> int:
                         workers=max(1, int(args.workers)),
                         pool=shared_pool,
                         iter_idx=iter_idx,
+                        policy_state_dict=easy_policy_state_dict,
+                        policy_version=int(policy_version),
                         rollout_cfg_hash=str(rollout_cfg_hash),
                         rollout_cfg_payload=rollout_cfg_payload,
                         render_terminal=bool(args.render_terminal),
