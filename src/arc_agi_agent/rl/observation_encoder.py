@@ -21,6 +21,8 @@ def _default_cfg() -> Dict[str, Any]:
         "frame_stack": 4,
         "use_diff_channel": True,
         "use_diff_channel_2": False,
+        "use_onehot": False,
+        "num_colors": 16,
     }
 
 
@@ -32,10 +34,13 @@ class ObservationEncoder(nn.Module):
         self.frame_stack = max(1, int(self.cfg.get("frame_stack", 4)))
         self.use_diff_channel = bool(self.cfg.get("use_diff_channel", True))
         self.use_diff_channel_2 = bool(self.cfg.get("use_diff_channel_2", False))
+        self.use_onehot = bool(self.cfg.get("use_onehot", False))
+        self.num_colors = max(2, int(self.cfg.get("num_colors", 16)))
         _diff_channels = (1 if self.use_diff_channel else 0) + (1 if self.use_diff_channel_2 else 0)
 
         layers: List[nn.Module] = []
-        in_ch = self.frame_stack + _diff_channels
+        _grid_channels = self.frame_stack * self.num_colors if self.use_onehot else self.frame_stack
+        in_ch = _grid_channels + _diff_channels
         for ch in chs:
             layers.append(nn.Conv2d(in_ch, ch, kernel_size=3, padding=1))
             layers.append(nn.ReLU())
@@ -78,6 +83,11 @@ class ObservationEncoder(nn.Module):
                 padded.insert(0, padded[0].copy())
             if len(padded) > self.frame_stack:
                 padded = padded[-self.frame_stack :]
+            if self.use_onehot:
+                frames = torch.tensor(np.stack(padded, axis=0), dtype=torch.long, device=device)  # (F, H, W)
+                frames = frames.clamp(0, self.num_colors - 1)
+                onehot = F.one_hot(frames, num_classes=self.num_colors).permute(0, 3, 1, 2).float()  # (F, C, H, W)
+                return onehot.reshape(1, -1, target_h, target_w)  # (1, F*C, H, W)
             arr = torch.tensor(np.stack(padded, axis=0), dtype=torch.float32, device=device).unsqueeze(0)
             vmax = max(1.0, float(arr.max().item()))
             return arr / vmax
@@ -88,6 +98,12 @@ class ObservationEncoder(nn.Module):
             g = grids[0]
             grid = np.asarray(g["grid"], dtype=np.int64)
             stack = [grid.copy() for _ in range(self.frame_stack)]
+            if self.use_onehot:
+                frames = torch.tensor(np.stack(stack, axis=0), dtype=torch.long, device=device)
+                frames = frames.clamp(0, self.num_colors - 1)
+                H, W = frames.shape[-2], frames.shape[-1]
+                onehot = F.one_hot(frames, num_classes=self.num_colors).permute(0, 3, 1, 2).float()
+                return onehot.reshape(1, -1, H, W)
             arr = torch.tensor(np.stack(stack, axis=0), dtype=torch.float32, device=device).unsqueeze(0)
             vmax = max(1.0, float(arr.max().item()))
             return arr / vmax

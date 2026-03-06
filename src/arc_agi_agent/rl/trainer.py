@@ -913,22 +913,13 @@ class Trainer:
         rollout_cfg_hash = (ctx or {}).get("rollout_cfg_hash")
         trainer_cfg_hash, trainer_payload = _rollout_cfg_hash(cfg_eff)
         if rollout_cfg_hash is not None and str(rollout_cfg_hash) != str(trainer_cfg_hash):
-            logger.error("rollout cfg mismatch trainer_payload=%s", json.dumps(trainer_payload, sort_keys=True, separators=(",", ":")))
             rollout_payload = (ctx or {}).get("rollout_cfg_payload")
-            if isinstance(rollout_payload, dict):
-                logger.error(
-                    "rollout cfg mismatch rollout_payload=%s",
-                    json.dumps(rollout_payload, sort_keys=True, separators=(",", ":")),
-                )
-            else:
-                logger.error("rollout cfg mismatch rollout_payload=missing")
-            logger.error(
-                "rollout cfg mismatch rollout_cfg_hash=%s trainer_cfg_hash=%s trainer_iter=%s; skipping update",
-                rollout_cfg_hash,
-                trainer_cfg_hash,
-                int((ctx or {}).get("iter_idx", -1)),
+            raise RuntimeError(
+                f"rollout cfg mismatch: rollout_cfg_hash={rollout_cfg_hash} trainer_cfg_hash={trainer_cfg_hash} "
+                f"iter={int((ctx or {}).get('iter_idx', -1))} "
+                f"trainer_payload={json.dumps(trainer_payload, sort_keys=True, separators=(',', ':'))} "
+                f"rollout_payload={json.dumps(rollout_payload, sort_keys=True, separators=(',', ':')) if isinstance(rollout_payload, dict) else 'missing'}"
             )
-            return _empty_ppo_report(batch, stage=stage)
 
         flat: List[Dict[str, Any]] = []
         episode_returns: List[float] = []
@@ -1333,6 +1324,21 @@ class Trainer:
             adv_t.index_copy_(0, valid_idx_t, adv_t_valid)
         adv_t = adv_t.contiguous()
 
+        _adv_cpu = adv_t.detach().cpu().tolist()
+        _adv_sum_by_action: Dict[str, float] = {}
+        _count_by_action: Dict[str, int] = {}
+        for _fi, _rec in enumerate(flat):
+            _aids = _rec.get("action_ids") or ["ACTION1"]
+            _aidx = int(_rec.get("action_index", 0))
+            _aid = str(_aids[_aidx]) if 0 <= _aidx < len(_aids) else "OOB"
+            _adv_sum_by_action[_aid] = _adv_sum_by_action.get(_aid, 0.0) + _adv_cpu[_fi]
+            _count_by_action[_aid] = _count_by_action.get(_aid, 0) + 1
+        _mean_adv_by_action = {k: round(_adv_sum_by_action[k] / _count_by_action[k], 5) for k in _count_by_action}
+        logger.debug(
+            "adv_by_action iter=%s count=%s mean_adv=%s",
+            iter_idx, _count_by_action, _mean_adv_by_action,
+        )
+
         mask_valid_step_cpu = [int(r.get("mask_valid_step", 1)) == 1 for r in flat]
 
         if debug_perf_checks:
@@ -1583,6 +1589,22 @@ class Trainer:
                 )
                 action_logp_new.index_copy_(0, idx_rows, act_logp.view(-1))
                 action_entropy_new.index_copy_(0, idx_rows, act_ent.view(-1))
+                # if diagnostics:
+                #     _probs_diag = torch.softmax(pi_discrete.detach().cpu(), dim=-1)
+                #     _argmax_diag = int(_probs_diag[0].argmax().item())
+                #     _old_lp = old_logp_action.detach().cpu()
+                #     for _di, (_si, _ai) in enumerate(zip(sample_indices[:5], local_indices[:5])):
+                #         _action_name = action_ids_row[_ai] if _ai < len(action_ids_row) else "OOB"
+                #         _argmax_name = action_ids_row[_argmax_diag] if _argmax_diag < len(action_ids_row) else "OOB"
+                #         _old_lp_val = float(_old_lp[rows[_di]].item()) if rows[_di] < _old_lp.numel() else float("nan")
+                #         _new_lp_val = float(act_logp.detach().cpu()[_di].item())
+                #         _ent_val = float(act_ent.detach().cpu()[_di].item())
+                #         logger.info(
+                #             "action_index_diag sample=%s action_index=%s action=%s argmax_action=%s "
+                #             "old_logp=%.4f new_logp=%.4f diff=%.4f entropy=%.4f",
+                #             _si, _ai, _action_name, _argmax_name,
+                #             _old_lp_val, _new_lp_val, _new_lp_val - _old_lp_val, _ent_val,
+                #         )
 
             if not any_coord_use:
                 coord_mask = torch.zeros((m, 0), dtype=torch.bool, device=device)
@@ -2009,12 +2031,13 @@ class Trainer:
                 old_value = old_value_all.index_select(0, idx_t)
 
                 t_mb_eval_start = time.time()
+                _run_diag = (epoch == 0 and mb_done == 1)
                 if preupdate_eval_mode:
                     prev_states = _set_eval_for_recompute()
-                    eval_out = _vectorized_logp_eval(valid_idx_t)
+                    eval_out = _vectorized_logp_eval(valid_idx_t, diagnostics=_run_diag)
                     _restore_train_mode(prev_states)
                 else:
-                    eval_out = _vectorized_logp_eval(valid_idx_t)
+                    eval_out = _vectorized_logp_eval(valid_idx_t, diagnostics=_run_diag)
                 t_mb_eval += time.time() - t_mb_eval_start
                 value_new = modules["value"].forward(h_t).view(-1)
 

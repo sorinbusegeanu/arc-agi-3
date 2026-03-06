@@ -138,6 +138,16 @@ def _state_dict_cpu(sd: Dict[str, Any]) -> Dict[str, Any]:
 
 
 
+def _eval_weight_checksum(state_dict: Dict[str, Any]) -> str:
+    """Return mean of first actor param tensor as a quick staleness check."""
+    import torch
+    actor_sd = state_dict.get("actor") or {}
+    for key, val in actor_sd.items():
+        if isinstance(val, torch.Tensor) and val.numel() > 0:
+            return f"actor.{key}:mean={val.float().mean().item():.6f}"
+    return "no_actor_params"
+
+
 def _split_counts(total: int, workers: int) -> List[int]:
     base = total // workers
     rem = total % workers
@@ -992,6 +1002,8 @@ def main() -> int:
             "actor": _state_dict_cpu(modules["actor"].state_dict()),
             "value": _state_dict_cpu(modules["value"].state_dict()),
         }
+        # logger.info("eval_weights source=%s checksum=%s",
+        #             args.checkpoint or "in-memory", _eval_weight_checksum(eval_policy_state_dict))
         batch = _collect_batch(
                     agent,
                     modules,
@@ -1000,7 +1012,7 @@ def main() -> int:
                     seed_base=seed_base,
                     episodes=episodes,
                     max_actions=resolved_max_steps,
-                    stochastic=args.mode == "collect" and bool(cfg.get("stochastic_actions_train", True)),
+                    stochastic=bool(cfg.get("eval", {}).get("stochastic", False)) if args.mode == "eval" else (args.mode == "collect" and bool(cfg.get("stochastic_actions_train", True))),
                     workers=max(1, int(args.workers)),
                     pool=None,
                     iter_idx=0,
@@ -1320,6 +1332,8 @@ def main() -> int:
                     "actor": _state_dict_cpu(modules["actor"].state_dict()),
                     "value": _state_dict_cpu(modules["value"].state_dict()),
                 }
+                # logger.info("eval_weights iter=%s source=in-memory checksum=%s",
+                #             iter_idx, _eval_weight_checksum(eval_policy_state_dict))
                 eval_batch = _collect_batch(
                     agent,
                     modules,
@@ -1328,7 +1342,7 @@ def main() -> int:
                     seed_base=eval_seed_base,
                     episodes=int(resolved_eval_episodes),
                     max_actions=resolved_max_steps,
-                    stochastic=False,
+                    stochastic=bool(cfg.get("eval", {}).get("stochastic", False)),
                     workers=max(1, int(args.workers)),
                     pool=shared_pool,
                     iter_idx=iter_idx,
@@ -1426,6 +1440,8 @@ def main() -> int:
                         "actor": _state_dict_cpu(modules["actor"].state_dict()),
                         "value": _state_dict_cpu(modules["value"].state_dict()),
                     }
+                    # logger.info("eval_weights iter=%s source=in-memory-easy checksum=%s",
+                    #             iter_idx, _eval_weight_checksum(easy_policy_state_dict))
                     easy_batch = _collect_batch(
                         agent,
                         modules,
@@ -1434,7 +1450,7 @@ def main() -> int:
                         seed_base=eval_seed_base + 10_000_000,
                         episodes=int(resolved_eval_episodes),
                         max_actions=resolved_max_steps,
-                        stochastic=False,
+                        stochastic=bool(cfg.get("eval", {}).get("stochastic", False)),
                         workers=max(1, int(args.workers)),
                         pool=shared_pool,
                         iter_idx=iter_idx,

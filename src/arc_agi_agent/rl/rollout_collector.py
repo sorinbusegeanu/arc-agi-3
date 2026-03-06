@@ -291,6 +291,8 @@ class RolloutCollector:
                 )
 
             h_t = None
+            # _h_norm = h_t.norm().item() if isinstance(h_t, torch.Tensor) else 0.0
+            # logger.info("episode_start game_id=%s ep_idx=%s h_t_norm=%.6f", game_id, ep_idx, _h_norm)
             prev_action = None
             prev_reward = 0.0
             prev_done = False
@@ -525,7 +527,7 @@ class RolloutCollector:
                     raw_env_reward = event_json.get("reward")
                     if raw_env_reward is None:
                         raw_env_reward = event_json.get("env_reward")
-                if reward_total < -0.5 or reward_total > 2.0:
+                if reward_total < -1.5 or reward_total > 2.0:
                     logger.error(
                         "reward_out_of_range game_id=%s step=%s action_id=%s flash_event=%s env_reward=%s r_total=%.6f terms=%s",
                         game_id,
@@ -575,6 +577,23 @@ class RolloutCollector:
                 current_hash = reward_terms.get("state_hash") or ""
                 state_hash_t_minus_2 = state_hash_prev
                 state_hash_prev = current_hash or None
+
+                # if not stochastic and step_idx < 10:
+                #     _probs = torch.softmax(pi_discrete_masked.view(-1), dim=0).detach().cpu()
+                #     _top5_vals, _top5_idx = torch.topk(_probs, min(5, len(_probs)))
+                #     _top5 = [(actor["action_ids"][int(i)], round(float(v), 4)) for i, v in zip(_top5_idx.tolist(), _top5_vals.tolist())]
+                #     _mask_size = int(sum(1 for m in available_actions_mask if m))
+                #     _sh_before = event_json.get("state_hash_before_filtered") or event_json.get("state_hash_before", "?")
+                #     _sh_after = event_json.get("state_hash_after_filtered") or event_json.get("state_hash_after", "?")
+                #     logger.info(
+                #         "eval_step_diag game_id=%s ep=%s step=%s chosen=%s entropy=%.4f mask_size=%s/%s "
+                #         "top5=%s hash_before=%s hash_after=%s",
+                #         game_id, ep_idx, step_idx, action_id,
+                #         policy_entropy, _mask_size, len(available_actions_mask),
+                #         _top5,
+                #         str(_sh_before)[-8:] if _sh_before and _sh_before != "?" else "?",
+                #         str(_sh_after)[-8:] if _sh_after and _sh_after != "?" else "?",
+                #     )
 
                 step = {
                     "step_idx": step_idx,

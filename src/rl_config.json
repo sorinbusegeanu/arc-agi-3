@@ -72,8 +72,8 @@
   "hud_edge_margin": 4,
   "hud_min_component_area": 20,
   "hud_dilate_px": 1,
-  "rollout_batch_episodes": 150,
-  "rollout_max_steps": 200,
+  "rollout_batch_episodes": 140,
+  "rollout_max_steps": 2000,
   "stochastic_actions_train": true,
   "deterministic_eval": true,
   "save_trajectory_batches": false,
@@ -81,12 +81,13 @@
     "movement_cell_thresh": 55,
     "noop_cell_thresh": 3,
     "r_effect_movement": 0.01,
-    "r_effect_screen": 0.1,
+    "r_effect_screen": 0.3,
     "revert_penalty": 0.2,
     "beta_potential": 0.0,
     "gamma": 0.995,
     "step_penalty_rate": 0.0001,
     "step_penalty_cap": 0.1,
+    "noop_penalty": 0.1,
     "flash_changed_total_thresh": 0.5,
     "flash_changed_masked_thresh": 0.5,
     "flash_hist_l1_thresh": 0.15
@@ -103,6 +104,7 @@
     "value_lr_mult": 1.0
   },
   "ppo": {
+    "preupdate_eval_mode": true,
     "gamma": 0.995,
     "gae_lambda": 0.95,
     "clip_eps": 0.2,
@@ -118,7 +120,7 @@
     "adv_norm": true,
     "target_kl_early": 0.02,
     "target_kl_late": 0.02,
-    "lr": 0.0003,
+    "lr": 0.0001,
     "lr_adapt_enabled": false,
     "lr_adapt_target_kl": 0.02,
     "lr_adapt_min_lr_mult": 0.1,
@@ -156,7 +158,8 @@
     "episodes": 4,
     "trace_eval_episodes": 10,
     "win_switch_threshold": 0.05,
-    "win_switch_consecutive_k": 3
+    "win_switch_consecutive_k": 3,
+    "stochastic": true
   },
   "empty_mode_action_allow_means_all": true,
   "rl": {
@@ -164,8 +167,11 @@
   },
   "encoder": {
     "use_diff_channel": true,
-    "use_diff_channel_2": false
+    "use_diff_channel_2": true,
+    "use_onehot": true,
+    "num_colors": 16
   },
+  "frame_stack": 3,
   "fp_analyst": {
     "build_viz": false,
     "fast": {

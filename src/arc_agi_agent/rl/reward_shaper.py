@@ -164,8 +164,11 @@ class RewardShaper:
         cap = float(cfg_eff.get("step_penalty_cap", 0.1))
         r_step = -min(rate * float(t), cap)
 
+        # --- r_noop penalty ---
+        r_noop = -float(cfg_eff.get("noop_penalty", 0.1)) if m_noop == 0 else 0.0
+
         # --- Total ---
-        r_total = r_win + float(m_noop) * (r_effect + r_revert + r_potential) + r_step
+        r_total = r_win + float(m_noop) * (r_effect + r_revert + r_potential) + r_step + r_noop
 
         return {
             "schema_version": "REWARD_V1",
@@ -176,6 +179,7 @@ class RewardShaper:
                 "r_revert": float(r_revert),
                 "r_potential": float(r_potential),
                 "r_step": float(r_step),
+                "r_noop": float(r_noop),
                 "m_noop": int(m_noop),
                 "flash_event": bool(flash_event),
                 "effect_flag": bool(cells_changed > 0 and not flash_event),
