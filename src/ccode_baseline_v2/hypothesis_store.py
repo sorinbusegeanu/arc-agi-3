@@ -129,6 +129,12 @@ class HypothesisStore:
         result.sort(key=lambda p: p.confidence, reverse=True)
         return result
 
+    def remove(self, poi_id: str) -> None:
+        """Remove a POI from the store entirely (used to evict ghost SELFs)."""
+        poi = self._pois.pop(poi_id, None)
+        if poi is not None:
+            self._by_identity.pop(poi.identity_key, None)
+
     def record_consequence(self, poi_id: str, result: ConsequenceResult) -> None:
         """Update confidence + consequence label after visiting a POI.
 

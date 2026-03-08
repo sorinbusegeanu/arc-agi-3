@@ -393,6 +393,12 @@ class FocusedExplorer:
             pos = _extract_position_fallback(frame_prev, frame_curr, self_hint=self_record, min_dist=min_dist)
             if pos is not None:
                 return pos
+            logger.warning(
+                "position_none self_bbox=%s self_color=%s self_version=%d",
+                self_record.bbox if self_record else None,
+                self_record.color_signature if self_record else None,
+                self_record.version if self_record else -1,
+            )
 
         # First step only — no movement to detect yet; use stored bbox as seed position
         if self_record is not None and frame_prev is None:

@@ -93,13 +93,28 @@ def _bbox_from_mask(comp_mask: np.ndarray) -> Tuple[int, int, int, int]:
     return int(rows[0]), int(cols[0]), int(rows[-1]) + 1, int(cols[-1]) + 1
 
 
-def _dominant_colors(frame: np.ndarray, comp_mask: np.ndarray, top_k: int = 3) -> List[int]:
+def _dominant_colors(
+    frame: np.ndarray,
+    comp_mask: np.ndarray,
+    top_k: int = 3,
+    min_freq: float = 0.20,   # color must be >= 20% of bbox pixels to be included
+) -> List[int]:
+    """Return up to top_k dominant colors that each cover >= min_freq of the component.
+
+    The min_freq threshold prevents border/background bleed (e.g. a single row of
+    color 11 at the edge of the bbox) from contaminating the color signature.
+    """
     pixels = frame[comp_mask]
     if pixels.size == 0:
         return [0]
     counts = np.bincount(pixels.clip(0, 15).astype(np.int64), minlength=16)
+    min_count = max(1, math.ceil(pixels.size * min_freq))
     order = counts.argsort()[::-1]
-    return [int(c) for c in order[:top_k] if counts[c] > 0]
+    result = [int(c) for c in order[:top_k] if counts[c] >= min_count]
+    # Always return at least the single most frequent color
+    if not result:
+        result = [int(order[0])]
+    return result
 
 
 def _cluster_fg_components(frame: np.ndarray, bg_colors: List[int]) -> List[dict]:
@@ -361,10 +376,21 @@ def _action_correlation(
     return result
 
 
-# ── Bbox area helper ─────────────────────────────────────────────────────────
+# ── Bbox area + IoU helpers ───────────────────────────────────────────────────
 
 def _bbox_area(bbox: Tuple) -> int:
     return max(0, bbox[2] - bbox[0]) * max(0, bbox[3] - bbox[1])
+
+
+def _bbox_iou(a: Tuple, b: Tuple) -> float:
+    """Intersection-over-union of two (y0,x0,y1,x1) bboxes."""
+    iy0 = max(a[0], b[0]); ix0 = max(a[1], b[1])
+    iy1 = min(a[2], b[2]); ix1 = min(a[3], b[3])
+    inter = max(0, iy1 - iy0) * max(0, ix1 - ix0)
+    if inter == 0:
+        return 0.0
+    union = _bbox_area(a) + _bbox_area(b) - inter
+    return float(inter) / max(union, 1)
 
 
 # ── SpriteDetector ────────────────────────────────────────────────────────────
@@ -404,6 +430,18 @@ class SpriteDetector:
         existing_self_in_store: List = []
         if store is not None:
             existing_self_in_store = [p for p in store.get_all() if p.tag == "SELF"]
+
+        # Evict ghost SELFs: if multiple SELF records exist, keep only the most recently
+        # updated one. A ghost SELF has a stale version that stopped incrementing.
+        if store is not None and len(existing_self_in_store) > 1:
+            existing_self_in_store.sort(key=lambda s: s.version, reverse=True)
+            for ghost in existing_self_in_store[1:]:
+                logger.warning(
+                    "SELF_evict ghost poi=%s version=%d bbox=%s",
+                    ghost.poi_id[:8], ghost.version, ghost.bbox,
+                )
+                store.remove(ghost.poi_id)
+            existing_self_in_store = existing_self_in_store[:1]
 
         if existing_self_in_store:
             # Bug F fix: stored SELF uses color+area key; candidates have position-based keys.
@@ -593,15 +631,29 @@ class POIDetector:
             episodes, pois, centroid_data, frame_episode_map, store=store
         )
 
+        # Build list of SELF bboxes (from store + newly detected) to guard against collisions
+        self_bboxes: List[Tuple] = []
+        if store is not None:
+            self_bboxes = [p.bbox for p in store.get_all() if p.tag == "SELF"]
+
         for poi in pois:
             if poi.poi_id == self_poi_id:
                 poi.tag = "SELF"
                 # Bug F fix: recompute identity key using SELF-scheme (color+area, not position)
                 poi.identity_key = _make_identity_key(poi.bbox, poi.color_signature, tag="SELF")
+                self_bboxes.append(poi.bbox)
             elif centroid_data.get(poi.poi_id, {}).get("var", 0.0) > float(
                 self.cfg.get("static_var_thresh", STATIC_VAR_THRESH)
             ) and poi.tag != "HUD":
-                poi.tag = "ENEMY"
+                # Fix 2: do not tag as ENEMY if bbox substantially overlaps an existing SELF
+                overlaps_self = any(_bbox_iou(poi.bbox, sb) > 0.5 for sb in self_bboxes)
+                if overlaps_self:
+                    logger.debug(
+                        "enemy_tag_skipped: poi=%s bbox=%s overlaps SELF",
+                        poi.poi_id[:8], poi.bbox,
+                    )
+                else:
+                    poi.tag = "ENEMY"
 
         # Step 5 — Reachability filter
         pois = _filter_reachable(pois, episodes, cfg=self.cfg)
