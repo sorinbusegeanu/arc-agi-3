@@ -655,6 +655,21 @@ class POIDetector:
                 else:
                     poi.tag = "ENEMY"
 
+        # Fix I: remove ANY non-SELF POI whose bbox substantially overlaps a SELF bbox
+        if self_bboxes:
+            removed_ids: set = set()
+            for poi in pois:
+                if poi.tag == "SELF":
+                    continue
+                if any(_bbox_iou(poi.bbox, sb) > 0.5 for sb in self_bboxes):
+                    removed_ids.add(poi.poi_id)
+                    logger.info(
+                        "fix_I_poi_removed: poi=%s tag=%s bbox=%s overlaps SELF",
+                        poi.poi_id[:8], poi.tag, poi.bbox,
+                    )
+            if removed_ids:
+                pois = [p for p in pois if p.poi_id not in removed_ids]
+
         # Step 5 — Reachability filter
         pois = _filter_reachable(pois, episodes, cfg=self.cfg)
 

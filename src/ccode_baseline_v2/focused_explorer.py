@@ -168,7 +168,7 @@ def _extract_position_fallback(
         len(all_small_curr), len(all_small_prev),
     )
 
-    logger.debug(
+    logger.info(
         "fallback_pool_before_hint curr=%d prev=%d",
         len(all_small_curr), len(all_small_prev),
     )

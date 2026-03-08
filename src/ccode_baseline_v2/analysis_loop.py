@@ -13,6 +13,8 @@ import os
 import time
 from typing import Any, Dict, List, Optional
 
+import numpy as np
+
 from .structs import EpisodeRecord
 from .config import N_RANDOM_EPISODES, M_FOCUSED_EPISODES, MAX_VERSIONS, default_cfg
 from .random_explorer import RandomExplorer
@@ -199,6 +201,37 @@ class AnalysisLoop:
                 self._history.append(diag)
                 self._save_summary("BUDGET_EXHAUSTED", time.time() - t0)
                 return "BUDGET_EXHAUSTED"
+
+            # Fix J: force SELF bbox refresh from last available frame before Phase 3
+            self_records = [p for p in store.get_all() if p.tag == "SELF"]
+            if self_records and episodes and episodes[-1].frames:
+                self_rec = self_records[0]
+                last_frame = episodes[-1].frames[-1]
+                frame_arr = np.asarray(last_frame)
+                if self_rec.color_signature:
+                    primary_color = self_rec.color_signature[0]
+                    mask = frame_arr == primary_color
+                    if mask.any():
+                        rows = np.where(mask.any(axis=1))[0]
+                        cols = np.where(mask.any(axis=0))[0]
+                        new_bbox = (int(rows[0]), int(cols[0]), int(rows[-1]) + 1, int(cols[-1]) + 1)
+                        if new_bbox != self_rec.bbox:
+                            logger.info(
+                                "fix_J_self_bbox_refresh: poi=%s old=%s new=%s color=%d",
+                                self_rec.poi_id[:8], self_rec.bbox, new_bbox, primary_color,
+                            )
+                            self_rec.bbox = new_bbox
+                            store._by_identity[self_rec.identity_key] = self_rec
+                        else:
+                            logger.info(
+                                "fix_J_self_bbox_unchanged: poi=%s bbox=%s color=%d",
+                                self_rec.poi_id[:8], self_rec.bbox, primary_color,
+                            )
+                    else:
+                        logger.info(
+                            "fix_J_self_color_not_found: poi=%s color=%d frame_shape=%s",
+                            self_rec.poi_id[:8], primary_color, frame_arr.shape,
+                        )
 
             # Phase 3 — Focused exploration
             logger.info("analysis_loop phase=3 version=%d m_focused=%d", version, self._m_focused)
