@@ -30,7 +30,14 @@ class StoragePathsV2:
             "exports",
             "logs",
         ]
-        paths = {}
+        game_root = self.game_root(game_id)
+        round_root = self.round_root(game_id, round_id)
+        os.makedirs(game_root, exist_ok=True)
+        os.makedirs(round_root, exist_ok=True)
+        paths = {
+            "game_root": game_root,
+            "round_root": round_root,
+        }
         for category in categories:
             path = self.category_path(game_id, round_id, category)
             os.makedirs(path, exist_ok=True)

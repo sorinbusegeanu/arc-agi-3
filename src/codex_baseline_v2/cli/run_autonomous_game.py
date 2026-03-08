@@ -24,6 +24,7 @@ def main() -> None:
     parser.add_argument("--env-id", default=None)
     parser.add_argument("--env-root", default=None)
     parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--render-terminal", action="store_true")
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as handle:
@@ -47,7 +48,7 @@ def main() -> None:
 
     def factory_wrapper():
         try:
-            return env_factory(env_id=env_id, env_root=env_root)
+            return env_factory(env_id=env_id, env_root=env_root, render_terminal=bool(args.render_terminal))
         except TypeError:
             return env_factory()
 

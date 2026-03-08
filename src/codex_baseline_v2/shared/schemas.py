@@ -31,6 +31,25 @@ class ObjectRecordV2:
         payload["bbox"] = self.bbox.to_dict()
         return payload
 
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "ObjectRecordV2":
+        return cls(
+            schema_version=str(payload.get("schema_version", SCHEMA_VERSION)),
+            object_id=str(payload["object_id"]),
+            game_id=str(payload["game_id"]),
+            episode_id=str(payload["episode_id"]),
+            bbox=BBox.from_dict(payload["bbox"]),
+            centroid=tuple(payload["centroid"]),
+            color=int(payload["color"]),
+            area=int(payload["area"]),
+            aspect_ratio=float(payload["aspect_ratio"]),
+            object_class=str(payload["object_class"]),
+            confidence=float(payload["confidence"]),
+            evidence_refs=list(payload.get("evidence_refs", [])),
+            first_seen_ref=payload.get("first_seen_ref"),
+            last_seen_ref=payload.get("last_seen_ref"),
+        )
+
 
 @dataclass(frozen=True)
 class ObservationSummaryV2:
@@ -62,6 +81,27 @@ class ObservationSummaryV2:
         payload["candidate_pois"] = [p.to_dict() for p in self.candidate_pois]
         return payload
 
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "ObservationSummaryV2":
+        return cls(
+            schema_version=str(payload.get("schema_version", SCHEMA_VERSION)),
+            game_id=str(payload["game_id"]),
+            episode_id=str(payload["episode_id"]),
+            step_idx=int(payload["step_idx"]),
+            palette=list(payload.get("palette", [])),
+            background_candidates=list(payload.get("background_candidates", [])),
+            foreground_candidates=list(payload.get("foreground_candidates", [])),
+            objects=[ObjectRecordV2.from_dict(o) for o in payload.get("objects", [])],
+            active_regions=[BBox.from_dict(b) for b in payload.get("active_regions", [])],
+            static_regions=[BBox.from_dict(b) for b in payload.get("static_regions", [])],
+            hud_region_candidates=[BBox.from_dict(b) for b in payload.get("hud_region_candidates", [])],
+            world_region_candidates=[BBox.from_dict(b) for b in payload.get("world_region_candidates", [])],
+            avatar_candidates=[ObjectRecordV2.from_dict(o) for o in payload.get("avatar_candidates", [])],
+            candidate_pois=[CandidatePOIV2.from_dict(p) for p in payload.get("candidate_pois", [])],
+            avatar_candidate_table=list(payload.get("avatar_candidate_table", [])),
+            avatar_rejection_reasons=list(payload.get("avatar_rejection_reasons", [])),
+        )
+
 
 @dataclass(frozen=True)
 class CandidatePOIV2:
@@ -89,6 +129,29 @@ class CandidatePOIV2:
         payload["bbox"] = self.bbox.to_dict()
         return payload
 
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "CandidatePOIV2":
+        return cls(
+            schema_version=str(payload.get("schema_version", SCHEMA_VERSION)),
+            poi_id=str(payload["poi_id"]),
+            game_id=str(payload["game_id"]),
+            source_type=str(payload["source_type"]),
+            bbox=BBox.from_dict(payload["bbox"]),
+            centroid=tuple(payload["centroid"]),
+            object_class=str(payload["object_class"]),
+            reachable_now=str(payload.get("reachable_now", "uncertain")),
+            confidence=float(payload.get("confidence", 0.0)),
+            expected_information_gain=float(payload.get("expected_information_gain", 0.0)),
+            expected_interaction_type=str(payload.get("expected_interaction_type", "unknown")),
+            evidence_count=int(payload.get("evidence_count", 0)),
+            first_seen_ref=payload.get("first_seen_ref"),
+            last_seen_ref=payload.get("last_seen_ref"),
+            type_confidence=float(payload.get("type_confidence", 0.5)),
+            utility_confidence=float(payload.get("utility_confidence", 0.5)),
+            rejection_reasons=list(payload.get("rejection_reasons", [])),
+            demotion_reasons=list(payload.get("demotion_reasons", [])),
+        )
+
 
 @dataclass(frozen=True)
 class ReachabilityRecordV2:
@@ -103,6 +166,19 @@ class ReachabilityRecordV2:
 
     def to_dict(self) -> Dict[str, Any]:
         return dataclass_to_dict(self)
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "ReachabilityRecordV2":
+        return cls(
+            schema_version=str(payload.get("schema_version", SCHEMA_VERSION)),
+            game_id=str(payload["game_id"]),
+            poi_id=str(payload["poi_id"]),
+            status=str(payload.get("status", "uncertain")),
+            confidence=float(payload.get("confidence", 0.0)),
+            distance_estimate=payload.get("distance_estimate"),
+            evidence_refs=list(payload.get("evidence_refs", [])),
+            reason_code=payload.get("reason_code"),
+        )
 
 
 @dataclass(frozen=True)
@@ -128,6 +204,28 @@ class ConsequenceRecordV2:
     def to_dict(self) -> Dict[str, Any]:
         return dataclass_to_dict(self)
 
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "ConsequenceRecordV2":
+        return cls(
+            schema_version=str(payload.get("schema_version", SCHEMA_VERSION)),
+            game_id=str(payload["game_id"]),
+            poi_id=str(payload["poi_id"]),
+            round_id=int(payload.get("round_id", 0)),
+            episode_id=str(payload.get("episode_id", "")),
+            instruction_id=payload.get("instruction_id"),
+            target_poi_id=payload.get("target_poi_id"),
+            distance_decreased=bool(payload.get("distance_decreased", False)),
+            reached=bool(payload.get("reached", False)),
+            contact=bool(payload.get("contact", False)),
+            local_change_magnitude=float(payload.get("local_change_magnitude", 0.0)),
+            global_change_magnitude=float(payload.get("global_change_magnitude", 0.0)),
+            reward_delta=payload.get("reward_delta"),
+            terminal_flag_changed=bool(payload.get("terminal_flag_changed", False)),
+            object_change_summary=str(payload.get("object_change_summary", "")),
+            followup_poi_ids=list(payload.get("followup_poi_ids", [])),
+            consequence_class=str(payload.get("consequence_class", "ambiguous")),
+        )
+
 
 @dataclass(frozen=True)
 class ActionDescriptorV2:
@@ -139,6 +237,16 @@ class ActionDescriptorV2:
 
     def to_dict(self) -> Dict[str, Any]:
         return dataclass_to_dict(self)
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "ActionDescriptorV2":
+        return cls(
+            schema_version=str(payload.get("schema_version", SCHEMA_VERSION)),
+            action_type=str(payload.get("action_type", "discrete")),
+            action_id=payload.get("action_id"),
+            coord=tuple(payload["coord"]) if payload.get("coord") is not None else None,
+            raw=payload.get("raw"),
+        )
 
 
 @dataclass(frozen=True)
@@ -170,6 +278,29 @@ class TrajectoryStepV2:
             payload["target_geometry"] = self.target_geometry.to_dict()
         return payload
 
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "TrajectoryStepV2":
+        return cls(
+            schema_version=str(payload.get("schema_version", SCHEMA_VERSION)),
+            game_id=str(payload["game_id"]),
+            episode_id=str(payload["episode_id"]),
+            step_idx=int(payload["step_idx"]),
+            action=ActionDescriptorV2.from_dict(payload["action"]),
+            pre_state_hash=payload.get("pre_state_hash"),
+            post_state_hash=payload.get("post_state_hash"),
+            state_hash_valid=bool(payload.get("state_hash_valid", False)),
+            instruction_id=payload.get("instruction_id"),
+            target_poi_id=payload.get("target_poi_id"),
+            target_type=payload.get("target_type"),
+            target_geometry=BBox.from_dict(payload["target_geometry"]) if payload.get("target_geometry") is not None else None,
+            target_source_round=payload.get("target_source_round"),
+            reward=float(payload.get("reward", 0.0)),
+            done=bool(payload.get("done", False)),
+            observation=payload.get("observation"),
+            observation_summary=ObservationSummaryV2.from_dict(payload["observation_summary"]) if payload.get("observation_summary") is not None else None,
+            info=dict(payload.get("info", {})),
+        )
+
 
 @dataclass(frozen=True)
 class TrajectoryEpisodeV2:
@@ -186,6 +317,19 @@ class TrajectoryEpisodeV2:
         payload = dataclass_to_dict(self)
         payload["steps"] = [s.to_dict() for s in self.steps]
         return payload
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "TrajectoryEpisodeV2":
+        return cls(
+            schema_version=str(payload.get("schema_version", SCHEMA_VERSION)),
+            game_id=str(payload["game_id"]),
+            episode_id=str(payload["episode_id"]),
+            steps=[TrajectoryStepV2.from_dict(s) for s in payload.get("steps", [])],
+            done=bool(payload.get("done", False)),
+            win=bool(payload.get("win", False)),
+            seed=payload.get("seed"),
+            metadata=dict(payload.get("metadata", {})),
+        )
 
 
 @dataclass(frozen=True)
@@ -210,6 +354,22 @@ class GameHypothesisStateV2:
         payload["consequence_table"] = [c.to_dict() for c in self.consequence_table]
         return payload
 
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "GameHypothesisStateV2":
+        return cls(
+            schema_version=str(payload.get("schema_version", SCHEMA_VERSION)),
+            game_id=str(payload["game_id"]),
+            round_id=int(payload["round_id"]),
+            traversable_map=payload.get("traversable_map"),
+            avatar_hypotheses=[ObjectRecordV2.from_dict(o) for o in payload.get("avatar_hypotheses", [])],
+            poi_table=[CandidatePOIV2.from_dict(p) for p in payload.get("poi_table", [])],
+            reachability_table=[ReachabilityRecordV2.from_dict(r) for r in payload.get("reachability_table", [])],
+            consequence_table=[ConsequenceRecordV2.from_dict(c) for c in payload.get("consequence_table", [])],
+            unresolved_hypotheses=list(payload.get("unresolved_hypotheses", [])),
+            falsified_hypotheses=list(payload.get("falsified_hypotheses", [])),
+            confidence=float(payload.get("confidence", 0.0)),
+        )
+
 
 @dataclass(frozen=True)
 class ControllerInstructionV2:
@@ -233,6 +393,25 @@ class ControllerInstructionV2:
         payload["target_region"] = self.target_region.to_dict() if self.target_region else None
         payload["target_geometry"] = self.target_geometry.to_dict() if self.target_geometry else None
         return payload
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "ControllerInstructionV2":
+        return cls(
+            schema_version=str(payload.get("schema_version", SCHEMA_VERSION)),
+            game_id=str(payload["game_id"]),
+            round_id=int(payload["round_id"]),
+            instruction_id=str(payload["instruction_id"]),
+            mode=str(payload["mode"]),
+            target_poi_id=payload.get("target_poi_id"),
+            target_region=BBox.from_dict(payload["target_region"]) if payload.get("target_region") is not None else None,
+            target_type=payload.get("target_type"),
+            target_geometry=BBox.from_dict(payload["target_geometry"]) if payload.get("target_geometry") is not None else None,
+            target_source_round=payload.get("target_source_round"),
+            rationale=str(payload.get("rationale", "")),
+            progress_metric=str(payload.get("progress_metric", "")),
+            stop_condition=str(payload.get("stop_condition", "")),
+            ranked_alternatives=list(payload.get("ranked_alternatives", [])),
+        )
 
 
 @dataclass(frozen=True)
@@ -261,6 +440,27 @@ class ExecutorOutcomeV2:
         payload["target_geometry"] = self.target_geometry.to_dict() if self.target_geometry else None
         return payload
 
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "ExecutorOutcomeV2":
+        return cls(
+            schema_version=str(payload.get("schema_version", SCHEMA_VERSION)),
+            game_id=str(payload["game_id"]),
+            round_id=int(payload["round_id"]),
+            instruction_id=str(payload["instruction_id"]),
+            instruction_mode=str(payload["instruction_mode"]),
+            target_poi_id=payload.get("target_poi_id"),
+            target_type=payload.get("target_type"),
+            target_geometry=BBox.from_dict(payload["target_geometry"]) if payload.get("target_geometry") is not None else None,
+            target_source_round=payload.get("target_source_round"),
+            actions=[ActionDescriptorV2.from_dict(a) for a in payload.get("actions", [])],
+            target_progress=[float(v) for v in payload.get("target_progress", [])],
+            reached=bool(payload.get("reached", False)),
+            contact=bool(payload.get("contact", False)),
+            blocked=bool(payload.get("blocked", False)),
+            outcome_summary=str(payload.get("outcome_summary", "")),
+            consequence_records=[ConsequenceRecordV2.from_dict(c) for c in payload.get("consequence_records", [])],
+        )
+
 
 @dataclass(frozen=True)
 class BlackboardStateV2:
@@ -284,3 +484,20 @@ class BlackboardStateV2:
         payload["consequence_table"] = [c.to_dict() for c in self.consequence_table]
         payload["avatar_hypotheses"] = [o.to_dict() for o in self.avatar_hypotheses]
         return payload
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "BlackboardStateV2":
+        return cls(
+            schema_version=str(payload.get("schema_version", SCHEMA_VERSION)),
+            game_id=str(payload["game_id"]),
+            round_id=int(payload["round_id"]),
+            palette=list(payload.get("palette", [])),
+            poi_table=[CandidatePOIV2.from_dict(p) for p in payload.get("poi_table", [])],
+            reachability_table=[ReachabilityRecordV2.from_dict(r) for r in payload.get("reachability_table", [])],
+            consequence_table=[ConsequenceRecordV2.from_dict(c) for c in payload.get("consequence_table", [])],
+            avatar_hypotheses=[ObjectRecordV2.from_dict(o) for o in payload.get("avatar_hypotheses", [])],
+            traversable_map=payload.get("traversable_map"),
+            unresolved_hypotheses=list(payload.get("unresolved_hypotheses", [])),
+            falsified_hypotheses=list(payload.get("falsified_hypotheses", [])),
+            metadata=dict(payload.get("metadata", {})),
+        )

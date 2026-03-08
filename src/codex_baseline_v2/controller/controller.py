@@ -18,6 +18,7 @@ def _rank_pois(
     pois: List[CandidatePOIV2],
     reachability: Dict[str, str],
     scoring_cfg: ScoringConfigV2,
+    recent_failures: Dict[str, float],
 ) -> List[Tuple[float, CandidatePOIV2]]:
     ranked = []
     for poi in pois:
@@ -29,6 +30,7 @@ def _rank_pois(
             ),
             scoring_cfg,
         )
+        score -= recent_failures.get(poi.poi_id, 0.0)
         ranked.append((score, poi))
     ranked.sort(key=lambda r: r[0], reverse=True)
     return ranked
@@ -47,6 +49,17 @@ def select_instruction(
         identity = canonical_state_identity(last_obs, include_payload=False)
         if identity.get("valid") and identity.get("state_hash"):
             state_ref = str(identity.get("state_hash"))[:8]
+    recent_failures: Dict[str, float] = {}
+    for consequence in blackboard.consequence_table[-20:]:
+        if not consequence.target_poi_id:
+            continue
+        if consequence.consequence_class == "no_change" and not consequence.distance_decreased and not consequence.reached and not consequence.contact:
+            recent_failures[consequence.target_poi_id] = recent_failures.get(consequence.target_poi_id, 0.0) + 0.75
+    history = blackboard.metadata.get("instruction_history", []) if isinstance(blackboard.metadata, dict) else []
+    for item in history[-5:]:
+        poi_id = item.get("target_poi_id") if isinstance(item, dict) else None
+        if poi_id and item.get("outcome") == "no_progress":
+            recent_failures[poi_id] = recent_failures.get(poi_id, 0.0) + 0.5
     if round_id == 0 or rng.random() < cfg.unguided_probe_fraction:
         return ControllerInstructionV2(
             schema_version=SCHEMA_VERSION,
@@ -65,7 +78,7 @@ def select_instruction(
             ranked_alternatives=[],
         )
     reachability = _reachability_map(blackboard)
-    ranked = _rank_pois(blackboard.poi_table, reachability, scoring_cfg)
+    ranked = _rank_pois(blackboard.poi_table, reachability, scoring_cfg, recent_failures)
     if not ranked:
         return ControllerInstructionV2(
             schema_version=SCHEMA_VERSION,
@@ -93,6 +106,8 @@ def select_instruction(
             skip_reason = "likely_hud"
         elif candidate.reachable_now == "exhausted_for_now":
             skip_reason = "exhausted_for_now"
+        elif recent_failures.get(candidate.poi_id, 0.0) >= 1.5:
+            skip_reason = "recent_no_progress"
         elif candidate.bbox.area() <= 0:
             skip_reason = "no_geometry"
         elif status in {"insufficient_evidence", "unknown_traversable", "unknown_avatar"} and candidate.expected_information_gain < 0.6:

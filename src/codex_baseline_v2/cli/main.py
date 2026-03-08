@@ -294,6 +294,8 @@ def cmd_run_autonomous_game(args: argparse.Namespace) -> None:
         "--workers",
         str(args.workers),
     ]
+    if getattr(args, "render_terminal", False):
+        argv.append("--render-terminal")
     prev = sys.argv[:]
     try:
         sys.argv = argv
@@ -389,6 +391,7 @@ def build_parser() -> argparse.ArgumentParser:
     autonomous_cmd.add_argument("--env-id", default=None)
     autonomous_cmd.add_argument("--env-root", default=None)
     autonomous_cmd.add_argument("--workers", type=int, default=1)
+    autonomous_cmd.add_argument("--render-terminal", action="store_true")
     autonomous_cmd.set_defaults(func=cmd_run_autonomous_game)
 
     collect_cmd = sub.add_parser("collect_trajectories")

@@ -19,13 +19,24 @@ def _atomic_write(path: str, payload: Dict[str, Any]) -> None:
     os.replace(tmp_path, path)
 
 
+def _write_blackboard_history(storage: StoragePathsV2, blackboard: BlackboardStateV2, payload: Dict[str, Any]) -> str:
+    history_path = os.path.join(
+        storage.category_path(blackboard.game_id, blackboard.round_id, "blackboard_snapshots"),
+        f"blackboard_round_{blackboard.round_id:03d}.json",
+    )
+    os.makedirs(os.path.dirname(history_path), exist_ok=True)
+    with open(history_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, sort_keys=True)
+    return history_path
+
+
 def save_blackboard(cfg: MemoryConfigV2, storage: StoragePathsV2, blackboard: BlackboardStateV2) -> str:
     path = os.path.join(storage.game_root(blackboard.game_id), "blackboard_latest.json")
     payload = blackboard.to_dict()
-    last_obs = payload.get("metadata", {}).get("last_observation")
+    payload.setdefault("metadata", {})
+    last_obs = payload["metadata"].get("last_observation")
     if isinstance(last_obs, list):
         identity = canonical_state_identity(last_obs, include_payload=False)
-        payload.setdefault("metadata", {})
         payload["metadata"]["last_observation_state_hash"] = identity.get("state_hash")
         payload["metadata"]["state_signature_version"] = identity.get("state_signature_version")
         payload["metadata"]["state_hash_valid"] = bool(identity.get("valid"))
@@ -34,6 +45,7 @@ def save_blackboard(cfg: MemoryConfigV2, storage: StoragePathsV2, blackboard: Bl
     else:
         with open(path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, sort_keys=True)
+    _write_blackboard_history(storage, blackboard, payload)
     return path
 
 
@@ -43,6 +55,13 @@ def load_blackboard(storage: StoragePathsV2, game_id: str) -> Optional[Dict[str,
         return None
     with open(path, "r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def load_blackboard_typed(storage: StoragePathsV2, game_id: str) -> Optional[BlackboardStateV2]:
+    payload = load_blackboard(storage, game_id)
+    if payload is None:
+        return None
+    return BlackboardStateV2.from_dict(payload)
 
 
 def append_round_report(storage: StoragePathsV2, game_id: str, round_id: int, report: Dict[str, Any]) -> str:

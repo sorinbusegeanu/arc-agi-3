@@ -22,7 +22,7 @@ class RoutePlanV2:
     blocked: bool
 
 
-def _build_graph(traversable_map: Optional[Dict[str, any]]) -> Dict[Tuple[int, int], int]:
+def _build_graph(traversable_map: Optional[Dict[str, object]]) -> Dict[Tuple[int, int], int]:
     if not traversable_map:
         return {}
     points = traversable_map.get("points", [])
@@ -35,9 +35,7 @@ def _bfs_distance(start: Tuple[int, int], graph: Dict[Tuple[int, int], int]) -> 
     while q:
         x, y = q.popleft()
         for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
-            if (nx, ny) not in graph:
-                continue
-            if (nx, ny) in dist:
+            if (nx, ny) not in graph or (nx, ny) in dist:
                 continue
             dist[(nx, ny)] = dist[(x, y)] + 1
             q.append((nx, ny))
@@ -45,11 +43,7 @@ def _bfs_distance(start: Tuple[int, int], graph: Dict[Tuple[int, int], int]) -> 
 
 
 def _target_cells(target: BBox) -> List[Tuple[int, int]]:
-    cells = []
-    for x in range(target.x1, target.x2 + 1):
-        for y in range(target.y1, target.y2 + 1):
-            cells.append((x, y))
-    return cells
+    return [(x, y) for x in range(target.x1, target.x2 + 1) for y in range(target.y1, target.y2 + 1)]
 
 
 def _distance_to_bbox(point: Tuple[int, int], bbox: BBox) -> float:
@@ -68,58 +62,85 @@ def plan_route(
     prev_distance: Optional[float],
 ) -> RoutePlanV2:
     graph = _build_graph(blackboard.traversable_map)
-    fallback_mode = None
     if not graph or current not in graph:
-        fallback_mode = "euclidean"
         distance = _distance_to_bbox(current, target.bbox)
         delta = None if prev_distance is None else prev_distance - distance
         return RoutePlanV2(
             next_subgoal=None,
             distance_estimate=distance,
-            distance_prev=prev_distance,
+            distance_prev=distance,
             distance_delta=delta,
-            progress_valid=True,
+            progress_valid=False,
             progress_reason="fallback_euclidean",
-            fallback_mode=fallback_mode,
+            fallback_mode="euclidean",
             confidence=0.2,
             stalled=False,
-            blocked=False,
+            blocked=True,
         )
-    dist = _bfs_distance(current, graph)
+
     target_cells = _target_cells(target.bbox)
-    best = None
-    for cell in target_cells:
-        if cell in dist:
-            d = dist[cell]
-            best = d if best is None or d < best else best
-    if best is None:
+    traversable_targets = [cell for cell in target_cells if cell in graph]
+    if traversable_targets:
+        anchor = min(traversable_targets, key=lambda cell: abs(cell[0] - current[0]) + abs(cell[1] - current[1]))
+        distance_map = _bfs_distance(anchor, graph)
+        progress_reason = "graph_to_target"
+        fallback_mode = None
+    else:
+        anchor = min(graph.keys(), key=lambda cell: _distance_to_bbox(cell, target.bbox))
+        distance_map = _bfs_distance(anchor, graph)
+        progress_reason = "graph_to_anchor"
+        fallback_mode = "anchor"
+
+    if current not in distance_map:
         return RoutePlanV2(
             next_subgoal=None,
             distance_estimate=None,
-            distance_prev=prev_distance,
+            distance_prev=None,
             distance_delta=None,
             progress_valid=False,
-            progress_reason="no_graph_path",
-            fallback_mode="graph",
+            progress_reason="current_off_path",
+            fallback_mode=fallback_mode,
             confidence=0.3,
             stalled=False,
             blocked=True,
         )
-    # pick a neighbor closer to target as next subgoal
-    next_cell = current
-    for nx, ny in ((current[0] - 1, current[1]), (current[0] + 1, current[1]), (current[0], current[1] - 1), (current[0], current[1] + 1)):
-        if (nx, ny) in dist and dist[(nx, ny)] < dist.get(next_cell, dist[(nx, ny)] + 1):
-            next_cell = (nx, ny)
-    delta = None if prev_distance is None else prev_distance - float(best)
+
+    current_distance = float(distance_map[current])
+    best_neighbor: Optional[Tuple[int, int]] = None
+    best_distance: Optional[float] = None
+    for neighbor in ((current[0] - 1, current[1]), (current[0] + 1, current[1]), (current[0], current[1] - 1), (current[0], current[1] + 1)):
+        if neighbor not in distance_map:
+            continue
+        neighbor_distance = float(distance_map[neighbor])
+        if best_distance is None or neighbor_distance < best_distance:
+            best_neighbor = neighbor
+            best_distance = neighbor_distance
+
+    if best_neighbor is None:
+        return RoutePlanV2(
+            next_subgoal=None,
+            distance_estimate=None,
+            distance_prev=current_distance,
+            distance_delta=None,
+            progress_valid=False,
+            progress_reason="no_routed_neighbor",
+            fallback_mode=fallback_mode,
+            confidence=0.3,
+            stalled=False,
+            blocked=True,
+        )
+
+    distance_delta = current_distance - float(best_distance)
+    stalled = bool(distance_delta <= 0.0)
     return RoutePlanV2(
-        next_subgoal=next_cell,
-        distance_estimate=float(best),
-        distance_prev=prev_distance,
-        distance_delta=delta,
+        next_subgoal=best_neighbor,
+        distance_estimate=float(best_distance),
+        distance_prev=current_distance,
+        distance_delta=distance_delta,
         progress_valid=True,
-        progress_reason="graph_distance",
-        fallback_mode=None,
-        confidence=0.7,
-        stalled=False,
+        progress_reason=progress_reason,
+        fallback_mode=fallback_mode,
+        confidence=0.8 if not stalled else 0.4,
+        stalled=stalled,
         blocked=False,
     )

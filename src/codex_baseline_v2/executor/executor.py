@@ -37,6 +37,8 @@ def execute_instruction_offline(
     contact = False
     blocked = False
     consequences: List[ConsequenceRecordV2] = []
+    initial_distance: Optional[float] = None
+    last_distance: Optional[float] = None
 
     for episode in episodes:
         for step in episode.steps:
@@ -51,6 +53,9 @@ def execute_instruction_offline(
                     centroid = target
                 distance = _compute_progress(centroid, target)
                 progress_values.append(distance)
+                if initial_distance is None:
+                    initial_distance = distance
+                last_distance = distance
                 if distance <= cfg.target_reach_distance:
                     reached = True
                     contact = True
@@ -59,7 +64,7 @@ def execute_instruction_offline(
         if len(actions) >= cfg.max_steps:
             break
 
-    if not actions:
+    if not actions or (progress_values and all(v >= progress_values[0] for v in progress_values[1:])):
         blocked = True
 
     if instruction.target_poi_id and target:
@@ -73,7 +78,7 @@ def execute_instruction_offline(
                 episode_id=episode_id,
                 instruction_id=instruction.instruction_id,
                 target_poi_id=instruction.target_poi_id,
-                distance_decreased=bool(progress_values),
+                distance_decreased=bool(initial_distance is not None and last_distance is not None and last_distance < initial_distance),
                 reached=reached,
                 contact=contact,
                 local_change_magnitude=0.0,

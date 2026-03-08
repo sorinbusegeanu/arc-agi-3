@@ -51,8 +51,8 @@
     "storage_dir": "runs_v2"
   },
   "resume": {
-    "reload_latest_blackboard": true,
-    "reload_unfinished_round": true
+    "reload_latest_blackboard": false,
+    "reload_unfinished_round": false
   },
   "rounds": 20,
   "routing": {

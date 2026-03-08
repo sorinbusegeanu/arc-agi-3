@@ -1,352 +1,426 @@
 # Implementation V2 Specification
 
 ## Status
-This document defines the concrete implementation plan for the V2 hierarchical trajectory-analysis system.
+This document describes the V2 system as it is currently implemented in `src/codex_baseline_v2/`.
 
-This is an implementation specification, not a code sample. Codex must implement exactly the package split and behavior described here.
+It is an implementation-state spec, not a target-state wish list. Where the code only partially covers the original baseline intent, this document records the implemented behavior and the current gaps.
 
 ## Implementation objective
-Build a runnable V2 system that performs:
+The current V2 package supports a one-game, multi-round trajectory-analysis loop with two operating styles:
 
-1. episode collection
-2. trajectory ingestion
-3. trajectory analysis
-4. hypothesis and POI update
-5. instructed exploration
-6. outcome logging
-7. iterative re-analysis
+1. offline replay from imported trajectory files
+2. autonomous live collection with a configured environment factory
 
-The first implementation target is one-game repeated exploration with offline analysis windows.
+The implemented loop is:
 
-## Implementation scope
-The first implementation must support only the following operating pattern:
+1. collect or import trajectories
+2. normalize them into V2 episode/step records
+3. run deterministic frame and transition analysis
+4. aggregate POIs, avatar candidates, traversability, and consequence signals
+5. select a controller instruction for later rounds
+6. execute either offline replay scoring or online target-following execution
+7. persist blackboard state, round reports, and per-round artifacts
 
-- choose one game
-- run an initial collection window of stochastic or broad exploration
-- analyze the collected episodes in batch
-- produce ranked POIs and reachability statuses
-- run a directed exploration window toward selected POIs
-- analyze outcomes again
-- repeat for a configured number of rounds
+## Current scope
+The code is currently single-game focused.
 
-Cross-game training or meta-learning is out of scope for this phase.
+Implemented scope:
+- one game per run
+- round 0 broad probing followed by later directed rounds
+- offline import/analyze workflows
+- online autonomous collection and instructed execution
+- persistent per-game storage under a V2-only directory tree
 
-## Package implementation plan
+Not currently implemented as a first-class feature:
+- multi-game orchestration from the V2 CLI
+- cross-game learning or meta-learning
+- a learned controller or learned executor
+- full PPO replacement
 
-### 1. `shared`
-Codex must implement typed records first.
+## Package layout
+The implemented package contains the original required boundaries plus runtime and metrics support packages:
 
-Required files in this package must define the stable data contracts used by all other V2 modules.
+- `shared`
+- `adapters`
+- `analyst`
+- `trajectory_analysis`
+- `memory`
+- `controller`
+- `executor`
+- `cli`
+- `runtime`
+- `metrics`
 
-Minimum contracts:
-- observation summary contract
-- object contract
-- POI contract
-- reachability contract
-- consequence contract
-- trajectory step contract
-- trajectory episode contract
-- blackboard contract
-- controller instruction contract
-- executor outcome contract
-- config contract if the project already uses typed config validation patterns
+The main code lives under `src/codex_baseline_v2/` and does not replace the legacy recurrent RL package in place.
 
-Implementation rule:
-Nothing else in V2 may use ad hoc dict payloads for these records.
+## Shared contracts
+Typed dataclass contracts are implemented in `shared/schemas.py`.
 
-### 2. `adapters`
-Codex must implement adapters second.
+Current schema types:
+- `ObjectRecordV2`
+- `ObservationSummaryV2`
+- `CandidatePOIV2`
+- `ReachabilityRecordV2`
+- `ConsequenceRecordV2`
+- `ActionDescriptorV2`
+- `TrajectoryStepV2`
+- `TrajectoryEpisodeV2`
+- `GameHypothesisStateV2`
+- `ControllerInstructionV2`
+- `ExecutorOutcomeV2`
+- `BlackboardStateV2`
 
-Required adapter responsibilities:
-- read current rollout records and map them into `TrajectoryEpisodeV2`
-- map current observation objects into a normalized observation payload for the analyst
-- map current actions into normalized discrete or coordinate action descriptors
-- preserve original raw references when possible for debugging
+Current schema characteristics:
+- explicit `schema_version`
+- explicit `game_id`
+- explicit `episode_id` where relevant
+- bbox and centroid geometry for objects and POIs
+- evidence and lifecycle fields on POIs and objects
+- target linkage fields on steps, instructions, outcomes, and consequences
+- blackboard metadata for diagnostics and metrics
 
-Implementation rule:
-Adapters must not mutate the legacy records in place.
+The code still allows some flexible payloads in `info`, `metadata`, and parts of `traversable_map`. Core cross-module records are typed, but the implementation is not yet free of all unstructured auxiliary payloads.
 
-### 3. `analyst`
-Codex must implement deterministic frame and transition analysis.
+## Config surface
+The current config tree is implemented in `shared/config.py` as nested dataclasses under `V2Config`.
 
-Required analyst pipeline order:
+Implemented config groups:
+- `analyst`
+- `trajectory_analysis`
+- `memory`
+- `controller`
+- `executor`
+- `scoring`
+- `logging`
+- `dataset_or_rollout_source`
+- `runtime`
+- `collection`
+- `routing`
+- `scheduler`
+- `storage`
+- `resume`
+- `target_scoring`
+- `env`
+- `debug`
 
+Top-level fields:
+- `rounds`
+- `game_id`
+
+The repository currently includes `v2_config_template.json` and `v2_config_01.json` as example config payloads.
+
+## Adapters
+The adapter layer is implemented and currently covers:
+
+- legacy trajectory import from JSON and JSONL payloads
+- observation normalization from rollout/environment step payloads
+- action normalization for discrete and coordinate-like actions
+- rollout adapter wrapper
+- metrics adapter module for V1/V2 comparison plumbing
+
+Current adapter behavior:
+- legacy episodes are converted into `TrajectoryEpisodeV2`
+- each step gets a normalized observation, normalized action, reward, done flag, and raw-step debug payload
+- state hashes are derived with `shared.state_identity`
+- adapters do not mutate the legacy payload in place
+
+The current import flow is centered on file-based replay, not streaming ingestion.
+
+## Analyst implementation
+The analyst is deterministic and currently runs per episode.
+
+Implemented analysis stages:
 1. palette extraction
-2. background color candidate scoring
-3. foreground component extraction
-4. per-color connected components
-5. bbox and centroid computation
-6. frame-diff analysis for transition windows
-7. active-region detection
-8. candidate HUD-region detection
-9. avatar candidate scoring
-10. candidate POI emission
+2. ranked background color scoring
+3. per-color connected component extraction
+4. bbox and centroid construction
+5. heuristic object classification
+6. elongated-structure clustering by color
+7. frame-diff motion region extraction
+8. avatar candidate scoring with cross-step accumulation
+9. POI mining from objects and motion regions
 
-Required analyst outputs for every processed transition batch:
+Implemented analyst outputs per summarized step:
+- palette
+- ranked background candidates
+- foreground candidates
 - object records
-- background/foreground summary
-- active/static masks or equivalent region summaries
-- avatar candidate list with confidence
-- candidate POI list with confidence and source type
+- active regions
+- static regions placeholder
+- HUD-region candidates
+- world-region candidates
+- avatar candidate list
+- avatar candidate scoring table
+- avatar rejection reasons
+- candidate POI list
 
-Implementation details:
-- background candidates must be ranked, not forced to one value immediately
-- per-color component extraction must support same-color separated components
-- elongated structures such as lines or bars must still be emitted as valid objects with bbox and aspect ratio
-- HUD-like region detection must stay probabilistic or heuristic; do not hard filter those objects out at analyst stage
-- avatar scoring must use repeated action-conditioned displacement evidence, not one-frame guesses
+Current analyst behavior notes:
+- background is ranked, not fixed
+- same-color disconnected regions are emitted separately
+- elongated same-color structures can produce clustered synthetic objects
+- HUD filtering is heuristic only
+- avatar scoring uses repeated displacement and motion consistency evidence through an accumulator
 
-### 4. `trajectory_analysis`
-Codex must implement an offline analysis engine operating on a batch of episodes for one game.
+Current limitations:
+- `static_regions` is present in the schema but not meaningfully populated yet
+- object classes are heuristic and currently limited to coarse labels such as `world_object`, `obstacle`, `hud_like`, and `unknown`
+- analyst output is driven by grid observations and does not yet use richer environment metadata
 
-Required analysis stages:
+## Trajectory analysis implementation
+The current trajectory-analysis engine is implemented in `trajectory_analysis/analyzer.py` and runs offline over a batch of analyzed episodes.
 
-1. aggregate analyst outputs over all selected episodes
-2. merge repeated objects and regions into persistent candidate structures
-3. infer traversable vs blocked areas from observed motion and non-motion
-4. infer action-conditioned movement signatures for avatar candidates
-5. generate POI candidates from persistent non-background objects and event hotspots
-6. estimate reachability of each POI
-7. score consequences of approaches, contacts, and interactions
-8. update hypothesis confidence and mark unresolved conflicts
+Implemented stages:
+1. collect step summaries from analyzed episodes
+2. accumulate candidate POIs
+3. accumulate avatar hypotheses
+4. mark traversable points from avatar centroids
+5. derive simple consequence records from POI overlap with active regions
+6. merge persistent POIs by geometry and source type
+7. estimate reachability from avatar centroids and traversable points
+8. emit a blackboard snapshot
 
-Required output artifacts:
-- updated blackboard state for the game
-- ranked POI table
+Implemented outputs:
+- `BlackboardStateV2`
+- merged POI table
 - reachability table
-- avatar hypothesis table
-- unresolved hypothesis report
-- falsified hypothesis report
-- summary statistics for the round
+- consequence table
+- avatar hypothesis list
+- traversable-map summary
+- unresolved hypothesis list
 
-Implementation rule:
-This package must be callable independently on stored trajectory files without running the environment.
+Current trajectory-analysis behavior notes:
+- POI persistence is controlled by `trajectory_analysis.min_poi_persistence`
+- traversability is stored as visited avatar-center points, not a full graph
+- consequence inference is currently overlap-based and coarse
+- unresolved hypotheses currently only expose a simple `avatar_identity` marker when multiple avatar candidates remain
 
-### 5. `memory`
-Codex must implement persistent per-game memory storage for V2.
+Current limitations:
+- no learned world model
+- no explicit falsification pipeline beyond empty `falsified_hypotheses`
+- no full route-history reasoning in the analyzer itself
+- no hard requirement in code for a 100-episode batch; the current default minimum is `min_episodes=1`
 
-Required stored layers:
-- raw round summaries
-- latest blackboard state
-- cumulative POI evidence
-- cumulative consequence evidence
-- controller decision history
-- executor outcome history
+## Memory and storage
+Persistent V2 memory is implemented in `memory/store.py` and `shared/storage.py`.
 
-Required behavior:
-- support schema versioning
-- support atomic updates
-- support append plus recompute pattern
-- support loading the latest stable blackboard state for a game before a new round starts
+Implemented storage properties:
+- game-scoped root directories
+- per-round directories named `round_XXX`
+- atomic blackboard writes through temp-file replace
+- latest blackboard snapshot at game root
+- per-round round report writing
 
-Implementation rule:
-Memory is game-scoped. Do not mix evidence across different games.
+Implemented storage categories:
+- `raw_trajectories`
+- `normalized_trajectories`
+- `analyst_outputs`
+- `blackboard_snapshots`
+- `round_reports`
+- `controller_decisions`
+- `executor_outcomes`
+- `exports`
+- `logs`
 
-### 6. `controller`
-Codex must implement deterministic target selection logic for the first V2 version.
+Current memory behavior:
+- persists latest blackboard for resume
+- records last-observation state-hash metadata when available
+- keeps round reports as per-round JSON files
 
-Required controller input sources:
-- latest blackboard state
-- controller config
-- round budget
-- current observation summary if available
+Current limitations:
+- no explicit append-only evidence log beyond stored artifacts and round reports
+- no multi-version migration framework beyond `schema_version` tagging
+- no separate persistent route cache beyond what is encoded in current blackboard content
 
-Required controller decision sequence:
+## Controller implementation
+The controller is implemented in `controller/controller.py`.
 
-1. determine current mode
-2. choose whether to preserve unguided probing quota
-3. rank eligible POIs
-4. choose a target POI or target region
-5. emit an instruction payload for the executor
+Current instruction selection behavior:
+1. preserve an unguided quota using `unguided_probe_fraction`
+2. rank POIs by information gain, confidence, and reachability
+3. reject likely HUD targets and obviously invalid targets
+4. choose the first eligible POI
+5. emit a `ControllerInstructionV2`
 
-Required mode policy:
-- start each new game with unguided_probe mode
-- after first analysis window, allow discriminating_probe and poi_approach
-- allow exploit_route only if confidence threshold and route confidence threshold are both met
+Current controller output fields:
+- `mode`
+- `instruction_id`
+- `target_poi_id`
+- `target_region`
+- `target_type`
+- `target_geometry`
+- `target_source_round`
+- `rationale`
+- `progress_metric`
+- `stop_condition`
+- `ranked_alternatives`
 
-Required controller output fields:
-- chosen mode
-- chosen target id or null
-- reason code
-- ranked alternatives
-- progress metric definition for the executor
-- stop condition for the current instruction
+Modes currently emitted by the main selector:
+- `unguided_probe`
+- `discriminating_probe`
+- `poi_approach`
 
-Implementation rule:
-The controller must be fully inspectable through logs and blackboard records. No hidden learned policy in this phase.
+Scaffolded but not currently emitted by `select_instruction`:
+- `poi_interaction_probe`
+- `exploit_route`
 
-### 7. `executor`
-Codex must implement the target-following exploration executor.
+Additional scheduling support exists in `controller/round_scheduler.py`, which defines budget allocation slots for:
+- `unguided_probe`
+- `discriminating_probe`
+- `poi_approach`
+- `poi_interaction_probe`
+- `exploit_route`
 
-Required executor capabilities:
-- perform broad local exploration with no target
-- move toward target regions using available movement primitives
-- probe around a POI boundary when direct contact is uncertain
-- report blocked motion and uncertainty
-- report local and global outcomes after each step
+That scheduler support is not yet the main decision path for the runtime controller.
 
-Required executor behavior:
-- use inferred traversable information if available
-- fall back gracefully when traversable map is weak or contradictory
-- stop an instruction when stop condition triggers, budget expires, target is reached, or repeated blocking is detected
+## Executor implementation
+Two executor paths are implemented.
 
-Required executor outputs for each instruction run:
-- stepwise action log
-- target progress values over time
-- whether POI was reached
-- whether contact or interaction occurred
-- outcome summaries linked to consequence records
+### Offline executor
+The offline executor replays analyzed episodes against an instruction and computes:
+- action log
+- target-progress series
+- reached/contact flags
+- blocked flag when no actions are available from replay
+- a synthetic consequence record for the targeted POI
 
-Implementation rule:
-The executor must not modify blackboard state directly. It returns outcomes; the analysis and memory layers update state.
+This path is used by the offline CLI workflows.
 
-### 8. `cli`
-Codex must implement these V2 entrypoints:
+### Online executor
+The online executor runs against a live environment session and currently supports:
+- environment reset
+- step-by-step instructed action selection
+- route planning toward a target POI
+- fallback moves when no route subgoal is available
+- progress tracking from route-planner distance estimates
+- blocked detection via repeated stalls
+- trajectory episode export from the executed instruction
 
-- initialize one game V2 session
-- import and analyze a trajectory batch
-- run one analysis round
-- run one directed exploration round
-- run a full multi-round one-game loop
-- print current blackboard summary
-- export round reports
+Current executor behavior notes:
+- long-horizon goals come from the controller instruction
+- route planning is used when a target POI exists
+- `target_reach_distance` gates the reached/contact decision
+- per-step records keep pre/post state hashes and target linkage fields
 
-CLI rule:
-Each command must operate on explicit V2 config and explicit V2 storage paths. No implicit reuse of V1 run directories.
+Current limitations:
+- local/global change magnitudes in executor consequence records are placeholders
+- online execution presently uses the first avatar hypothesis when available
+- the executor is target-following, not a full planner over complex long-horizon subgoals
 
-## Round protocol
-Codex must implement the following round protocol exactly.
+## Runtime orchestration
+The runtime package adds a live round loop that was not described in the original implementation spec.
 
-### Round 0: initial broad collection
-- run initial exploration for a configured number of episodes
-- store all raw trajectories
-- convert them into V2 trajectory records
-- run analyst over the transitions
-- run trajectory analysis
-- persist blackboard state
+Implemented runtime modules:
+- `environment_session.py`
+- `trajectory_policy.py`
+- `trajectory_collector.py`
+- `session_manager.py`
+- `round_orchestrator.py`
 
-### Round N: directed cycle
-- load latest blackboard state
-- controller selects mode and target
-- executor runs under instruction for configured episode budget or step budget
-- trajectories are stored
-- analyst processes new transitions
-- trajectory analysis updates blackboard state
-- memory persists updated state and round report
+Current runtime behavior:
+- round 0 collects random probe episodes
+- later rounds run one online instructed execution episode, with optional extra parallel instructed collection workers
+- analyzed episodes are written to storage
+- blackboard state is recomputed and persisted
+- round metrics and diagnostics are attached to blackboard metadata and round reports
+- a session manager can resume an existing game run
 
-## Required algorithmic behavior
+The runtime remains single-game oriented and expects a configured environment factory.
 
-### Background and foreground handling
-Codex must implement these rules:
-- background color is a ranked hypothesis, not a fixed assumption
-- foreground candidates include all significant non-background connected components
-- same-color but disconnected regions are treated as separate objects
-- object merging must be evidence-based across time, not color-only
+## CLI surface
+The implemented CLI lives in `cli/main.py` and currently exposes these subcommands:
 
-### Avatar detection
-Codex must implement these rules:
-- avatar candidates are object hypotheses linked to repeated action-conditioned displacement
-- multiple avatar candidates can coexist until evidence resolves them
-- avatar confidence increases when displacement is consistent with action sequences
-- avatar confidence decreases when candidate remains static under expected motion conditions
+- `init`
+- `import_analyze`
+- `directed_round`
+- `loop`
+- `print_blackboard`
+- `export_reports`
+- `run_autonomous_game`
+- `collect_trajectories`
+- `analyze_trajectories`
 
-### POI generation
-Codex must implement these POI sources:
-- persistent foreground object
-- motion hotspot
-- consequence hotspot
-- structural chokepoint
-- rare state-change region
-- candidate avatar if unresolved
+Current CLI coverage:
+- initialize a V2 storage/session directory
+- import legacy trajectory files and analyze them
+- run an offline directed round against imported trajectories
+- run a simple offline multi-round loop
+- print the latest blackboard JSON
+- export a stored round report
+- run a live autonomous one-game loop
+- collect trajectories from a live environment
+- analyze a saved trajectory batch
 
-### Reachability
-Codex must implement these rules:
-- classify each POI as reachable_now, unreachable_now, or uncertain
-- use observed movement and traversability evidence first
-- when no path evidence exists, keep status uncertain instead of unreachable
-- path distance must prefer graph/geodesic estimate when a traversable graph is available
+The CLI currently uses explicit config paths and explicit or config-derived storage/trajectory inputs. There is no implemented multi-game batch CLI command in this package.
 
-### Consequence scoring
-Codex must implement these consequence classes:
-- no_change
-- local_change
-- global_change
-- progress_like
-- terminal_like
-- ambiguous
+## Logging and metrics
+Structured logging helpers exist in `shared/logging_utils.py`.
 
-Each POI interaction history must accumulate these classes over time.
+Current round metrics are implemented in `shared/metrics.py` and include:
+- `episodes_collected`
+- `states_observed`
+- `unique_states`
+- `invalid_state_count`
+- `duplicate_state_count`
+- `state_hash_coverage_rate`
+- `state_hash_diagnostic`
+- `unique_pois`
+- `reachable_pois`
+- `poi_first_contacts`
+- `poi_interactions`
+- `hypothesis_resolution_rate`
+- `false_poi_rate`
+- `exploit_switch_rate`
+- `route_success_rate`
+- `target_progress_mean`
+- `target_progress_median`
+- `useful_screen_change_rate`
+- `no_effect_probe_rate`
+- `candidate_avatar_count`
+- `candidate_poi_count`
+- `reachable_poi_count`
+- `target_selection_count_by_mode`
+- `target_reached_count`
+- `interaction_count`
+- `false_poi_count`
+- `hypothesis_promoted_count`
+- `hypothesis_demoted_count`
+- `useful_change_rate`
+- `stagnant_probe_rate`
 
-### False POI handling
-Codex must implement safeguards:
-- preserve a configured fraction of unguided exploration in every round
-- decay POI confidence when repeated approach yields no informative consequence
-- do not permanently delete POIs after one failed round; mark them low-confidence first
+An additional `metrics/v2_metrics.py` module exists for an expanded report shape used by newer diagnostic work.
 
-## Storage layout requirements
-V2 must use a separate storage layout from V1.
+## Smoke tests
+Smoke coverage currently exists in `src/codex_baseline_v2/smoke_tests.py`.
 
-Required stored categories:
-- raw imported trajectories
-- normalized V2 trajectories
-- analyst outputs
-- blackboard snapshots
-- round reports
-- controller decisions
-- executor outcomes
-- exported summaries
+Implemented smoke checks:
+- analyst on a synthetic frame batch
+- avatar detection on a short transition
+- trajectory-analysis blackboard emission
+- memory save/load cycle
+- controller plus offline executor wiring
+- end-to-end dry run through import, analysis, selection, and offline execution
 
-Implementation rule:
-Directory naming and file naming must clearly separate game id, round id, and artifact type.
+## Current acceptance boundary
+The current implementation can be considered operational when all of the following hold:
 
-## Logging requirements
-Codex must implement explicit structured logs for:
-- round start and end
-- number of episodes analyzed
-- number of POIs emitted
-- number of reachable POIs
-- selected controller mode and target
-- executor target progress summary
-- consequence summary counts
-- hypothesis confidence changes
+1. `src/codex_baseline_v2/` imports successfully
+2. legacy trajectory files can be converted into `TrajectoryEpisodeV2`
+3. analyst summaries are attached to imported or collected steps
+4. trajectory analysis emits a `BlackboardStateV2`
+5. controller emits an explicit `ControllerInstructionV2`
+6. offline or online executor emits an `ExecutorOutcomeV2`
+7. blackboard state is persisted and reloadable per game
+8. CLI commands can run the offline and autonomous one-game flows
+9. smoke tests pass
 
-## Metrics requirements
-Codex must implement round-level metrics at minimum:
-- episodes_collected
-- states_observed
-- candidate_avatar_count
-- candidate_poi_count
-- reachable_poi_count
-- target_selection_count_by_mode
-- target_reached_count
-- interaction_count
-- false_poi_count
-- hypothesis_promoted_count
-- hypothesis_demoted_count
-- useful_change_rate
-- stagnant_probe_rate
+## Known implementation gaps relative to the original baseline intent
+The current codebase is functional but not feature-complete against the broader baseline design.
 
-## Minimal acceptance boundary for implementation
-The first V2 implementation is complete only when all of the following are true:
-
-1. a new V2 package exists beside the current package
-2. current trajectories can be imported through adapters
-3. one game can run for at least two rounds: initial collection plus one directed round
-4. analyst emits object and POI candidates from stored transitions
-5. trajectory analysis emits a blackboard state with POI and reachability tables
-6. controller emits explicit instructions
-7. executor follows those instructions and reports outcomes
-8. memory persists and reloads blackboard state between rounds
-9. CLI can run the end-to-end one-game loop
-
-## Restrictions
-Codex must not:
-- rewrite the current recurrent RL baseline in place
-- hide V2 logic inside the old reward shaper
-- collapse controller and executor into one module
-- hardcode a single background color assumption globally
-- force a single avatar candidate too early
-- use only Euclidean distance for target progress when path structure is available
-
-## Migration rule
-If a legacy component is reused, it must be accessed through a V2 adapter or explicit shared utility import. Do not create silent dependency chains from V2 internals into V1 training code.
+Known gaps:
+- main controller path does not yet emit `poi_interaction_probe` or `exploit_route`
+- trajectory analysis uses a simple point-based traversability map, not a full geodesic graph planner
+- consequence scoring remains heuristic and low-fidelity
+- blackboard falsification and hypothesis promotion/demotion are only lightly populated
+- memory persistence is snapshot-oriented rather than a full append-plus-recompute evidence system
+- multi-game CLI orchestration is not implemented
+- some schema fields are placeholders or only partially populated

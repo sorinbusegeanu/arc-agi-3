@@ -92,6 +92,12 @@ class TrajectoryCollectorV2:
                 info={
                     "available_actions": result.available_actions,
                     "step_info": result.info,
+                    "collection_mode": mode,
+                    "instruction_id": getattr(instruction, "instruction_id", None),
+                    "target_poi_id": getattr(instruction, "target_poi_id", None),
+                    "target_type": getattr(instruction, "target_type", None),
+                    "target_geometry": getattr(instruction, "target_geometry", None).to_dict() if getattr(instruction, "target_geometry", None) is not None else None,
+                    "target_source_round": getattr(instruction, "target_source_round", None),
                     "state_signature_version": pre_state.get("state_signature_version"),
                 },
             )
@@ -109,6 +115,9 @@ class TrajectoryCollectorV2:
             seed=(self.cfg.seed + episode_idx) if self.cfg.seed is not None else None,
             metadata={
                 "mode": mode,
+                "collection_mode": mode,
+                "instruction_id": getattr(instruction, "instruction_id", None),
+                "target_poi_id": getattr(instruction, "target_poi_id", None),
                 "state_counters": {
                     "observed_states_total": observed_states_total,
                     "unique_pre_states": len(unique_pre_states),

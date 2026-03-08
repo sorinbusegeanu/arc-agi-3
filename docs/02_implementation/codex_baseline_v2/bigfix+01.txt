@@ -1,0 +1,130 @@
+File: src/codex_baseline_v2/runtime/round_orchestrator.py
+
+1. In run_autonomous_rounds, in the round_id > 0 branch, stop discarding the loaded blackboard.
+2. Replace the line that assigns blackboard from analyze_trajectories([], cfg.trajectory_analysis, round_id=round_id) with logic that reconstructs a BlackboardStateV2 from the loaded persisted payload.
+3. Use that reconstructed blackboard as the input to select_instruction.
+4. After run_online_execution and after analyze_episodes(episodes, cfg.analyst), call analyze_trajectories with the analyzed episodes plus the prior blackboard so the new round updates cumulative state instead of rebuilding from scratch.
+5. Preserve prior POIs, prior reachability, prior consequences, prior avatar hypotheses, prior traversable evidence, and prior metadata history when the directed round finishes.
+6. Do not change round 0 behavior.
+7. Do not change anything else in this file.
+
+File: src/codex_baseline_v2/trajectory_analysis/analyzer.py
+
+1. Change the analyze_trajectories signature so it accepts an optional prior_blackboard argument of type BlackboardStateV2 | None.
+2. When prior_blackboard is provided, merge new evidence into the prior state instead of rebuilding the blackboard from only the current episodes.
+3. Merge palette by stable union preserving deterministic order.
+4. Merge POIs by evidence-based matching, not by exact bbox identity only.
+5. For POI merge, first try same poi_id if present, otherwise match by source_type plus IoU overlap plus centroid distance tolerance plus same object_class.
+6. When multiple current POIs match one prior POI, keep the strongest single match and leave the rest as distinct POIs.
+7. Update bbox by geometric union for matched POIs.
+8. Update centroid from the merged bbox.
+9. Update confidence, type_confidence, utility_confidence, evidence_count, first_seen_ref, and last_seen_ref by accumulation, not replacement.
+10. Keep rejection_reasons and demotion_reasons as sorted unique unions.
+11. Merge avatar_hypotheses across rounds using the same evidence-based matching rule used for objects, not raw concatenation.
+12. Merge traversable_map cumulatively by adding visit counts for repeated points instead of replacing the map each round.
+13. Preserve prior unresolved_hypotheses and falsified_hypotheses unless the new round adds more.
+14. Replace the synthetic consequence generation based only on active_region overlap with consequence generation derived from actual target execution evidence when step.instruction_id or step.target_poi_id is present.
+15. For steps that belong to instructed execution, derive consequence_class from real evidence: reached/contact/done/distance change/local change/global change.
+16. For steps without a target, do not fabricate target-linked consequence records.
+17. Return a BlackboardStateV2 whose game_id comes from prior_blackboard when episodes is empty and prior_blackboard is not None.
+18. Keep support for round 0 where prior_blackboard is None.
+19. Do not change anything else in this file.
+
+File: src/codex_baseline_v2/memory/store.py
+
+1. Add a function that loads blackboard_latest.json and reconstructs a BlackboardStateV2 object, not a raw dict.
+2. Keep the existing raw JSON loader only if some other file still needs it; otherwise replace it with the typed loader.
+3. Add a helper that also appends a copy of each saved blackboard into a round-scoped history file so cumulative debugging is preserved.
+4. When save_blackboard writes metadata hashes, preserve existing metadata keys instead of overwriting prior metadata structure.
+5. Do not change JSON formatting style.
+6. Do not change anything else in this file.
+
+File: src/codex_baseline_v2/executor/route_planner.py
+
+1. Fix plan_route so it selects a next_subgoal that is an actual step toward the target, not the current cell.
+2. Keep the BFS distance map, but compute distance-to-target semantics correctly.
+3. If the target cell is traversable, build distances outward from the target and choose the current-cell neighbor with the smallest distance value.
+4. If the target cell is not traversable, choose the traversable graph cell nearest to the target as the anchor, run BFS from that anchor, and choose the current-cell neighbor with the smallest anchor distance.
+5. distance_prev must represent the current position distance to the chosen anchor or target.
+6. distance_estimate must represent the chosen next_subgoal distance to the chosen anchor or target.
+7. distance_delta must be distance_prev minus distance_estimate so positive means progress.
+8. progress_valid must be true only when both current position and next_subgoal are on a valid routed path.
+9. blocked must be true when no routed neighbor exists.
+10. stalled must be true when the planner cannot find a strictly improving next_subgoal.
+11. Keep fallback_mode behavior consistent with existing call sites.
+12. Do not change anything else in this file.
+
+File: src/codex_baseline_v2/runtime/trajectory_policy.py
+
+1. In TrajectoryPolicyV2.instructed_action, remove the random fallback for discrete-action environments.
+2. Add deterministic target-conditioned action selection for discrete actions.
+3. For each available discrete action, estimate the resulting avatar position using the current observation, the current avatar hypothesis, the recent step history, and the route planner next_subgoal.
+4. Score candidate actions by whether they reduce distance to next_subgoal first, then distance to target centroid, then whether they avoid immediate repeats, then whether they avoid obviously blocked actions.
+5. If the environment exposes directional actions, map them explicitly against the desired dx and dy toward next_subgoal.
+6. If the environment does not expose semantic direction labels, learn the local action-to-motion mapping online within the current episode from observed state transitions and reuse that mapping for later instructed steps.
+7. Only fall back to unguided probing when no action has any positive routing score.
+8. Make the fallback deterministic from cfg seed plus round_id plus step_idx.
+9. Do not change random_probe behavior.
+10. Do not change anything else in this file.
+
+File: src/codex_baseline_v2/executor/online_executor.py
+
+1. Stop using the persisted blackboard avatar centroid as the live current position for all steps.
+2. At the start of online execution, infer the avatar from the current live observation.
+3. After every environment step, re-infer the avatar from the new observation before the next call to the route planner.
+4. Use the route planner on the live avatar position each step.
+5. Use the target_region centroid only as the goal, not as the assumed current position fallback unless no avatar can be inferred at all.
+6. If avatar inference is temporarily missing, keep the last confirmed live avatar position for a short bounded horizon; after that mark routing as uncertain.
+7. Build target_progress from real per-step distance values based on live avatar positions.
+8. Set reached when live avatar distance is within cfg.target_reach_distance.
+9. Set contact only when the live avatar bbox overlaps or touches the target bbox, not merely when distance is small.
+10. Set blocked from repeated non-progress under valid routing, not just from empty action lists.
+11. Emit consequence_records from the actual instructed rollout with real distance_decreased, reached, contact, terminal_flag_changed, and change magnitudes.
+12. Do not change anything else in this file.
+
+File: src/codex_baseline_v2/runtime/round_orchestrator.py
+
+1. After run_online_execution, merge outcome.consequence_records into the cumulative blackboard update path.
+2. Include controller instruction metadata and executor outcome metadata in blackboard.metadata history for later debugging.
+3. When directed rounds run in parallel, use the same selected instruction for all directed workers only if the design explicitly requires repeated confirmation; otherwise keep one instructed episode and let the remaining episodes be unguided probe episodes.
+4. Add a clear metadata flag that distinguishes random_probe, unguided_probe, discriminating_probe, and poi_approach episodes in the saved round artifacts.
+5. Do not change anything else in this file.
+
+File: src/codex_baseline_v2/shared/schemas.py
+
+1. Keep the existing schema names and fields.
+2. Add typed reconstruction helpers or classmethods for BlackboardStateV2, CandidatePOIV2, ObjectRecordV2, ReachabilityRecordV2, ConsequenceRecordV2, ControllerInstructionV2, ExecutorOutcomeV2, ObservationSummaryV2, TrajectoryStepV2, and TrajectoryEpisodeV2 so persisted JSON can be loaded back into typed objects without ad hoc parsing spread across the codebase.
+3. Do not remove existing to_dict behavior.
+4. Do not change anything else in this file.
+
+File: src/codex_baseline_v2/controller/controller.py
+
+1. Keep the selection policy structure.
+2. Make select_instruction robust to cumulative blackboards by preferring POIs that are high information gain, not exhausted, reachable or routeable, and not already repeatedly failed in recent consequence history.
+3. Read recent failure evidence from blackboard.consequence_table and blackboard.metadata history.
+4. Penalize targets with repeated instructed no-progress outcomes in the last few rounds.
+5. Do not change anything else in this file.
+
+File: src/codex_baseline_v2/executor/executor.py
+
+1. In execute_instruction_offline, change distance_decreased so it is true only when the final distance is smaller than the initial distance, not merely when any progress_values exist.
+2. Build progress_values from actual step-to-step avatar distance to target.
+3. Set blocked from no-progress or missing route evidence, not only from no actions.
+4. Do not change anything else in this file.
+
+File: src/codex_baseline_v2/runtime/trajectory_collector.py
+
+1. Preserve instruction_id, target_poi_id, target_type, target_geometry, and target_source_round on every instructed step.
+2. Preserve enough per-step metadata so analyzer can derive real consequence records from executed target episodes.
+3. Ensure the saved episodes distinguish instructed execution from unguided collection without relying only on round-level metadata.
+4. Do not change anything else in this file.
+
+Cross-file constraints
+
+1. Do not rename the package.
+2. Do not change CLI names.
+3. Do not change storage directory layout.
+4. Do not remove existing smoke tests.
+5. Do not simplify behavior by replacing directed execution with random probing.
+6. Keep all existing code and comments unless a direct change above requires editing them.
+7. Do not change anything else.
