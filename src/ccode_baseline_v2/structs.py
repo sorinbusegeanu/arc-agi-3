@@ -21,6 +21,9 @@ class POIRecord:
     identity_key: str = ""               # stable hash across versions (bbox-quantised + color)
     motion_detected: bool = False        # centroid moved > 0.5 cells across frames
     depriority: bool = False             # True when stale for STALE_VERSIONS cycles
+    pixel_hash: Optional[str] = None    # md5 of bbox crop pixels — most recent visual state
+    visit_count: int = 0                # total number of visits (not just first)
+    last_consequence: Optional[str] = None  # most recent consequence label
 
 
 @dataclass

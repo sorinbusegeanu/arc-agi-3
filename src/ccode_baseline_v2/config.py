@@ -33,6 +33,7 @@ CONFIDENCE_BIG        = 1.0
 CONFIDENCE_NONE_DELTA = -0.3
 STALE_VERSIONS          = 4    # visited POIs unseen for N versions → deprioritised (was 2)
 STALE_VERSIONS_UNVISITED= 8   # unvisited POIs get more time before deprioritisation
+MAX_REVISITS            = 6    # max times to revisit a BIG_CHANGE POI before giving up
 
 
 def default_cfg() -> dict:
@@ -63,4 +64,5 @@ def default_cfg() -> dict:
         "confidence_none_delta":CONFIDENCE_NONE_DELTA,
         "stale_versions":           STALE_VERSIONS,
         "stale_versions_unvisited": STALE_VERSIONS_UNVISITED,
+        "max_revisits":             MAX_REVISITS,
     }

@@ -28,6 +28,7 @@ for _extra in ("other_repos/arc-agi", "other_repos/ARCEngine"):
 
 from .config import default_cfg
 from .analysis_loop import AnalysisLoop
+from .env_factory import EnvFactory
 
 
 logging.basicConfig(
@@ -37,19 +38,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def _build_env_factory(game_id: str, seed: int, op_mode: str):
-    from arc_agi import Arcade, OperationMode
-
-    arcade = Arcade(operation_mode=OperationMode(op_mode))
-
-    def factory(ep_idx: int):
-        env_seed = seed + ep_idx
-        env = arcade.make(game_id, seed=env_seed)
-        if env is None:
-            raise RuntimeError(f"arcade.make failed for game_id={game_id}")
-        return env, game_id, env_seed
-
-    return factory
+def _build_env_factory(game_id: str, seed: int, op_mode: str) -> EnvFactory:
+    """Return a picklable EnvFactory (safe for multiprocessing workers)."""
+    return EnvFactory(game_id=game_id, op_mode=op_mode, base_seed=seed)
 
 
 def main():
@@ -66,6 +57,7 @@ def main():
     parser.add_argument("--m_focused",  type=int,    default=None,    help="Override M_FOCUSED_EPISODES")
     parser.add_argument("--max_steps",    type=int,  default=None,  help="Override MAX_STEPS_PER_EP")
     parser.add_argument("--max_versions", type=int,  default=None,  help="Override MAX_VERSIONS (loop budget)")
+    parser.add_argument("--workers",      type=int,  default=1,     help="Parallel worker processes for episode collection (default: 1)")
     args = parser.parse_args()
 
     cfg = default_cfg()
@@ -88,6 +80,7 @@ def main():
         seed=args.seed,
         store_path=args.store,
         out_dir=out_dir,
+        workers=args.workers,
     )
 
     logger.info("Starting analysis loop: game=%s seed=%d out_dir=%s", args.game, args.seed, out_dir)

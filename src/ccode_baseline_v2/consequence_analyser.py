@@ -5,13 +5,68 @@ classifies consequence, detects GAME_WON / LEVEL_CHANGE.
 """
 from __future__ import annotations
 
+import hashlib
 import math
-from typing import Tuple
+from dataclasses import dataclass
+from typing import List, Tuple
 
 import numpy as np
 
 from .structs import ConsequenceResult, POIRecord
 from .config import PIXEL_DIFF_THRESHOLD, HISTOGRAM_SHIFT_THR, K_PROXIMITY_PX
+
+
+# ── Object state delta ───────────────────────────────────────────────────────
+
+@dataclass
+class ObjectStateDelta:
+    poi_id: str
+    bbox: Tuple[int, int, int, int]
+    pixel_hash_before: str
+    pixel_hash_after: str
+    changed: bool            # pixel_hash_before != pixel_hash_after
+    changed_ratio: float     # fraction of bbox pixels that changed
+
+
+def _pixel_hash(crop: np.ndarray) -> str:
+    """MD5 of raw pixel bytes — stable visual fingerprint of a bbox region."""
+    return hashlib.md5(np.asarray(crop).tobytes()).hexdigest()[:12]
+
+
+def extract_object_deltas(
+    frame_before: np.ndarray,
+    frame_after: np.ndarray,
+    pois: List[POIRecord],
+) -> List[ObjectStateDelta]:
+    """For each POI bbox, crop both frames and compute pixel hash + diff ratio.
+
+    Called after a BIG_CHANGE/SMALL_CHANGE consequence to identify which specific
+    objects changed and record their new visual state (pixel_hash).
+    """
+    fb = np.asarray(frame_before)
+    fa = np.asarray(frame_after)
+    h, w = fb.shape[:2]
+    deltas: List[ObjectStateDelta] = []
+    for poi in pois:
+        y0, x0, y1, x1 = poi.bbox
+        y0, x0 = max(0, y0), max(0, x0)
+        y1, x1 = min(h, y1), min(w, x1)
+        if y1 <= y0 or x1 <= x0:
+            continue
+        crop_before = fb[y0:y1, x0:x1]
+        crop_after  = fa[y0:y1, x0:x1]
+        h_before = _pixel_hash(crop_before)
+        h_after  = _pixel_hash(crop_after)
+        ratio = float(np.sum(crop_before != crop_after)) / max(crop_before.size, 1)
+        deltas.append(ObjectStateDelta(
+            poi_id=poi.poi_id,
+            bbox=poi.bbox,
+            pixel_hash_before=h_before,
+            pixel_hash_after=h_after,
+            changed=(h_before != h_after),
+            changed_ratio=ratio,
+        ))
+    return deltas
 
 
 # ── Signal 1 — Pixel Diff ────────────────────────────────────────────────────

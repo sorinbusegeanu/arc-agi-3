@@ -15,7 +15,8 @@ import numpy as np
 
 from .structs import EpisodeRecord, POIRecord, ConsequenceResult
 from .hypothesis_store import HypothesisStore
-from .consequence_analyser import ConsequenceAnalyser
+from .consequence_analyser import ConsequenceAnalyser, extract_object_deltas
+from .match_detector import MatchDetector, MatchResult
 from .config import (
     MAX_STEPS_PER_EP, K_PROXIMITY_PX, ALPHA_REWARD, STUCK_STEPS, MAX_SPRITE_AREA,
     MIN_MOVEMENT_DIST,
@@ -147,12 +148,25 @@ def _extract_position_fallback(
         raw_curr = _extract_components(
             frame_curr, colors=_ALL_COLORS, connectivity=8, min_area=4, max_objects=64
         )
-    except Exception:
+    except Exception as e:
+        logger.warning("fallback_extract_components_failed: %s", e)
         return None
+
+    # Diagnostic: log all components before any filtering
+    logger.info(
+        "fallback_all_comps count=%d areas=%s",
+        len(raw_curr),
+        sorted(c.area for c in raw_curr)[:10],
+    )
 
     # Bug E1 fix: percentile-based filter instead of hard MAX_SPRITE_AREA cap
     all_small_prev = _small_components(raw_prev)
     all_small_curr = _small_components(raw_curr)
+
+    logger.info(
+        "fallback_pool_after_filter curr=%d prev=%d",
+        len(all_small_curr), len(all_small_prev),
+    )
 
     logger.debug(
         "fallback_pool_before_hint curr=%d prev=%d",
@@ -332,7 +346,9 @@ class FocusedExplorer:
         store: HypothesisStore,
         cfg: dict,
         seed: int,
-        sprite_detector=None,   # SpriteDetector instance (optional, for centroid extraction)
+        sprite_detector=None,     # SpriteDetector instance (optional)
+        match_detector=None,      # MatchDetector instance (optional)
+        workers: int = 1,
     ):
         self._factory = env_factory
         self._store = store
@@ -344,9 +360,16 @@ class FocusedExplorer:
         self._stuck_steps = int(cfg.get("stuck_steps", STUCK_STEPS))
         self._sprite_det = sprite_detector
         self._ca = ConsequenceAnalyser(cfg)
+        self._match_det: MatchDetector = match_detector if match_detector is not None else MatchDetector()
+        self._workers = max(1, int(workers))
         # diagnostics set during run()
         self.last_frontier_refreshes: int = 0
         self.last_queue_exhausted_episodes: int = 0
+        self.last_match_result: Optional[MatchResult] = None
+        self.pattern_match_history: list = []
+        # parallel merge: consequences + pixel hashes from workers re-applied by main process
+        self._consequence_log: list = []    # [(poi_id, ConsequenceResult)]
+        self._pixel_hash_updates: list = [] # [(poi_id, hash_str)]
 
     def _get_self_record(self) -> Optional[POIRecord]:
         """Fetch the current SELF POIRecord from store (live, not cached)."""
@@ -380,14 +403,25 @@ class FocusedExplorer:
         return None
 
     def run(self, m_episodes: int) -> List[EpisodeRecord]:
+        """Run m_episodes. Dispatches to parallel or sequential based on workers."""
+        if self._workers > 1 and m_episodes >= self._workers:
+            return self._run_parallel(m_episodes)
+        return self._run_sequential(m_episodes, ep_offset=0)
+
+    def _run_sequential(self, m_episodes: int, ep_offset: int = 0) -> List[EpisodeRecord]:
         """Run m_episodes with POI-shaped reward. Returns list of EpisodeRecord."""
         records: List[EpisodeRecord] = []
-        rng = random.Random(self._seed)
+        rng = random.Random(self._seed + ep_offset)
 
         frontier = FrontierQueue(self._store, self._cfg)
         queue_exhausted_eps = 0
+        self.last_match_result = None
+        self.pattern_match_history = []
+        self._consequence_log = []
+        self._pixel_hash_updates = []
 
-        for ep_idx in range(m_episodes):
+        for local_idx in range(m_episodes):
+            ep_idx = ep_offset + local_idx
             # Bug C fix: refresh at start of every episode from live store state
             frontier._refresh()
             if frontier.current_target() is None:
@@ -442,6 +476,7 @@ class FocusedExplorer:
                     near = self._ca.is_near_poi(curr_pos, target)
                     if near:
                         ca_result = self._ca.analyse(prev_grid, curr_grid)
+                        self._consequence_log.append((target.poi_id, ca_result))
                         frontier.mark_visited(target.poi_id, ca_result)
                         if ca_result.label == "GAME_WON":
                             actions_taken.append(action_key + ":GAME_WON")
@@ -451,6 +486,35 @@ class FocusedExplorer:
                             episode_exit_state = "won"
                             done = True
                             break
+
+                        # Pattern-match: update pixel hashes + check for object alignment
+                        if ca_result.label in ("BIG_CHANGE", "SMALL_CHANGE"):
+                            store_pois = self._store.get_all()
+                            poi_by_id = {p.poi_id: p for p in store_pois}
+                            deltas = extract_object_deltas(prev_grid, curr_grid, store_pois)
+                            for delta in deltas:
+                                if delta.changed and delta.poi_id in poi_by_id:
+                                    poi_by_id[delta.poi_id].pixel_hash = delta.pixel_hash_after
+                                    self._pixel_hash_updates.append((delta.poi_id, delta.pixel_hash_after))
+                            match = self._match_det.check(self._store, curr_grid)
+                            self.pattern_match_history.append({
+                                "version_ep": ep_idx,
+                                "trigger_poi": target.poi_id,
+                                "consequence": ca_result.label,
+                                "match_score": match.match_score,
+                                "confidence": match.confidence,
+                                "poi_a": match.poi_id_a,
+                                "poi_b": match.poi_id_b,
+                            })
+                            if match.matched:
+                                self.last_match_result = match
+                                logger.info(
+                                    "MATCH_DETECTED ep=%d step=%d poi_a=%s poi_b=%s score=%.3f",
+                                    ep_idx, step,
+                                    match.poi_id_a[:8] if match.poi_id_a else None,
+                                    match.poi_id_b[:8] if match.poi_id_b else None,
+                                    match.match_score,
+                                )
 
                 logger.debug(
                     "step=%d pos=%s target=%s near=%s done=%s",
@@ -503,3 +567,77 @@ class FocusedExplorer:
         self.last_frontier_refreshes = frontier.refresh_count
         self.last_queue_exhausted_episodes = queue_exhausted_eps
         return records
+
+    def _run_parallel(self, m_episodes: int) -> List[EpisodeRecord]:
+        """Split m_episodes across self._workers processes.
+
+        Each worker gets a deep copy of the store (read-only for targeting).
+        Consequences and pixel-hash updates are collected from workers and
+        re-applied to the real store sequentially after all workers finish.
+        """
+        import copy
+        from concurrent.futures import ProcessPoolExecutor
+
+        chunk_size = max(1, m_episodes // self._workers)
+        chunks = []
+        for start in range(0, m_episodes, chunk_size):
+            count = min(chunk_size, m_episodes - start)
+            store_copy = copy.deepcopy(self._store)
+            chunks.append((
+                self._factory, store_copy, start, count,
+                self._cfg, self._seed,
+            ))
+
+        logger.info("focused_explorer parallel workers=%d chunks=%d", self._workers, len(chunks))
+        with ProcessPoolExecutor(max_workers=self._workers) as ex:
+            results = list(ex.map(_focused_worker_fn, chunks))
+
+        # Merge results from all workers
+        all_episodes: List[EpisodeRecord] = []
+        self.last_match_result = None
+        self.pattern_match_history = []
+        self._consequence_log = []
+        self._pixel_hash_updates = []
+        total_refreshes = 0
+        total_exhausted = 0
+
+        for episodes, cons_log, ph_updates, pmh, lmr, refreshes, exhausted in results:
+            all_episodes.extend(episodes)
+            self._consequence_log.extend(cons_log)
+            self._pixel_hash_updates.extend(ph_updates)
+            self.pattern_match_history.extend(pmh)
+            total_refreshes += refreshes
+            total_exhausted += exhausted
+            if lmr is not None and lmr.matched:
+                if self.last_match_result is None or lmr.match_score > self.last_match_result.match_score:
+                    self.last_match_result = lmr
+
+        # Re-apply consequences to the REAL store sequentially
+        poi_map = {p.poi_id: p for p in self._store.get_all()}
+        for poi_id, ca_result in self._consequence_log:
+            self._store.record_consequence(poi_id, ca_result)
+        for poi_id, ph in self._pixel_hash_updates:
+            if poi_id in poi_map:
+                poi_map[poi_id].pixel_hash = ph
+
+        self.last_frontier_refreshes = total_refreshes
+        self.last_queue_exhausted_episodes = total_exhausted
+        return all_episodes
+
+
+# ── Top-level worker function (module-level for picklability) ─────────────────
+
+def _focused_worker_fn(args):
+    """Worker entry point for FocusedExplorer parallel mode."""
+    factory, store_copy, ep_start, ep_count, cfg, seed = args
+    explorer = FocusedExplorer(factory, store_copy, cfg, seed=seed, workers=1)
+    episodes = explorer._run_sequential(ep_count, ep_offset=ep_start)
+    return (
+        episodes,
+        explorer._consequence_log,
+        explorer._pixel_hash_updates,
+        explorer.pattern_match_history,
+        explorer.last_match_result,
+        explorer.last_frontier_refreshes,
+        explorer.last_queue_exhausted_episodes,
+    )

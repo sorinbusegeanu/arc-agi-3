@@ -19,6 +19,7 @@ from .random_explorer import RandomExplorer
 from .poi_detector import POIDetector
 from .hypothesis_store import HypothesisStore
 from .focused_explorer import FocusedExplorer
+from .match_detector import MatchDetector
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,7 @@ class AnalysisLoop:
         seed: int = 0,
         store_path: Optional[str] = None,
         out_dir: str = ".",
+        workers: int = 1,
     ):
         """
         Parameters
@@ -62,7 +64,11 @@ class AnalysisLoop:
         self._n_random    = int(self._cfg.get("n_random_episodes", N_RANDOM_EPISODES))
         self._m_focused   = int(self._cfg.get("m_focused_episodes", M_FOCUSED_EPISODES))
         self._max_versions = int(self._cfg.get("max_versions", MAX_VERSIONS))
+        self._workers = max(1, int(workers))
         self._history: List[Dict[str, Any]] = []   # per-version metrics
+        self._match_detector = MatchDetector()
+        self._pattern_match_history: List[Dict[str, Any]] = []
+        self._match_detected_version: Optional[int] = None
 
     # ── Metrics helpers ───────────────────────────────────────────────────────
 
@@ -104,12 +110,19 @@ class AnalysisLoop:
         }
 
     def _save_summary(self, exit_reason: str, elapsed: float) -> None:
+        pois = list(self._store._pois.values())
         summary = {
             "exit_reason":    exit_reason,
             "elapsed_sec":    round(elapsed, 1),
             "versions_run":   len(self._history),
             "history":        self._history,
             "final": self._store_metrics(self._store.version) if self._history else {},
+            "pattern_match_history": self._pattern_match_history,
+            "trigger_poi_visit_counts": {
+                p.poi_id: p.visit_count for p in pois if p.visit_count > 1
+            },
+            "match_detected_version": self._match_detected_version,
+            "exit_unlocked": self._match_detected_version is not None,
         }
         path = os.path.join(self._out_dir, "run_summary.json")
         with open(path, "w", encoding="utf-8") as f:
@@ -132,7 +145,7 @@ class AnalysisLoop:
 
         # Phase 1 — Random exploration
         logger.info("analysis_loop phase=1 n_random=%d", self._n_random)
-        explorer = RandomExplorer(self._factory, self._cfg, seed=self._seed)
+        explorer = RandomExplorer(self._factory, self._cfg, seed=self._seed, workers=self._workers)
         episodes: List[EpisodeRecord] = explorer.run(self._n_random)
 
         if any(_had_game_won(ep) for ep in episodes):
@@ -195,6 +208,8 @@ class AnalysisLoop:
                 cfg=self._cfg,
                 seed=self._seed + version,
                 sprite_detector=sd,
+                match_detector=self._match_detector,
+                workers=self._workers,
             )
             episodes = focused.run(self._m_focused)
             ep_snap = self._episode_metrics(episodes)
@@ -202,11 +217,31 @@ class AnalysisLoop:
             queue_exhausted_eps = focused.last_queue_exhausted_episodes
             action_key_sample = episodes[0].actions[:5] if episodes and episodes[0].actions else []
             self_bbox_updated = bool(sd and sd.self_bbox_updated)
+
+            # Pattern-match bookkeeping
+            for entry in focused.pattern_match_history:
+                self._pattern_match_history.append({"version": version, **entry})
+            last_match = focused.last_match_result
+            if last_match is not None and last_match.matched and self._match_detected_version is None:
+                self._match_detected_version = version
+                logger.info("PATTERN_MATCH version=%d score=%.3f confidence=%s",
+                            version, last_match.match_score, last_match.confidence)
+
+            match_snap = {
+                "match_score": last_match.match_score if last_match else 0.0,
+                "confidence": last_match.confidence if last_match else "none",
+                "matched": bool(last_match and last_match.matched),
+                "poi_a": last_match.poi_id_a if last_match else None,
+                "poi_b": last_match.poi_id_b if last_match else None,
+            }
+
             logger.info(
                 "analysis_loop phase3 terminal_eps=%d positions_none_rate=%.3f "
-                "frontier_refreshes=%d queue_exhausted_eps=%d self_bbox_updated=%s action_key_sample=%s",
+                "frontier_refreshes=%d queue_exhausted_eps=%d self_bbox_updated=%s "
+                "match_score=%.3f match_confidence=%s",
                 ep_snap["terminal_episodes"], ep_snap["positions_none_rate"],
-                frontier_refreshes, queue_exhausted_eps, self_bbox_updated, action_key_sample[:3],
+                frontier_refreshes, queue_exhausted_eps, self_bbox_updated,
+                match_snap["match_score"], match_snap["confidence"],
             )
 
             self._history.append({
@@ -220,6 +255,7 @@ class AnalysisLoop:
                 "frontier_refreshes": frontier_refreshes,
                 "queue_exhausted_episodes": queue_exhausted_eps,
                 "action_key_sample": action_key_sample,
+                "match_result": match_snap,
             })
 
             if ep_snap["game_won"]:

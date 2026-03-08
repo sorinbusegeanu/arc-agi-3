@@ -12,7 +12,7 @@ from typing import Dict, List, Optional
 from .structs import POIRecord, ConsequenceResult
 from .config import (
     CONFIDENCE_NEW, CONFIDENCE_BIG, CONFIDENCE_NONE_DELTA,
-    STALE_VERSIONS, STALE_VERSIONS_UNVISITED,
+    STALE_VERSIONS, STALE_VERSIONS_UNVISITED, MAX_REVISITS,
 )
 
 
@@ -108,25 +108,45 @@ class HypothesisStore:
         return list(self._pois.values())
 
     def get_targets(self) -> List[POIRecord]:
-        """Unvisited, reachable, non-SELF, non-HUD POIs, sorted by confidence DESC."""
+        """Reachable, non-SELF, non-HUD POIs eligible for targeting, sorted by confidence DESC.
+
+        Includes unvisited POIs and BIG_CHANGE POIs within their MAX_REVISITS budget
+        (multi-visit policy for pattern-match mechanic).
+        """
         result = [
             poi for poi in self._pois.values()
-            if not poi.visited
-            and poi.tag not in ("SELF", "HUD")
+            if poi.tag not in ("SELF", "HUD")
             and poi.reachable
             and not poi.depriority
+            and (
+                not poi.visited
+                or (
+                    poi.last_consequence == "BIG_CHANGE"
+                    and poi.visit_count < MAX_REVISITS
+                )
+            )
         ]
         result.sort(key=lambda p: p.confidence, reverse=True)
         return result
 
     def record_consequence(self, poi_id: str, result: ConsequenceResult) -> None:
-        """Update confidence + consequence label after visiting a POI."""
+        """Update confidence + consequence label after visiting a POI.
+
+        Multi-visit policy: BIG_CHANGE POIs stay in the target queue (depriority=False)
+        until they exceed MAX_REVISITS. NO_CHANGE POIs are deprioritised at that point.
+        """
         if poi_id not in self._pois:
             return
         poi = self._pois[poi_id]
-        poi.confidence = _update_confidence(poi, result)
-        poi.consequence = result.label
+        poi.visit_count += 1
         poi.visited = True
+        poi.last_consequence = result.label
+        poi.consequence = result.label
+        poi.confidence = _update_confidence(poi, result)
+        if result.label == "BIG_CHANGE":
+            poi.depriority = False   # keep targetable — may need re-visit for pattern match
+        elif result.label == "NO_CHANGE" and poi.visit_count >= MAX_REVISITS:
+            poi.depriority = True    # give up after enough fruitless visits
 
     # ── Persistence ───────────────────────────────────────────────────────────
 
@@ -146,6 +166,9 @@ class HypothesisStore:
                     "version":         poi.version,
                     "identity_key":    poi.identity_key,
                     "depriority":      poi.depriority,
+                    "pixel_hash":      poi.pixel_hash,
+                    "visit_count":     poi.visit_count,
+                    "last_consequence": poi.last_consequence,
                 }
                 for poi in self._pois.values()
             ],
@@ -172,6 +195,9 @@ class HypothesisStore:
                 version=int(rec["version"]),
                 identity_key=rec.get("identity_key", ""),
                 depriority=bool(rec.get("depriority", False)),
+                pixel_hash=rec.get("pixel_hash"),
+                visit_count=int(rec.get("visit_count", 0)),
+                last_consequence=rec.get("last_consequence"),
             )
             self._pois[poi.poi_id] = poi
             if poi.identity_key:

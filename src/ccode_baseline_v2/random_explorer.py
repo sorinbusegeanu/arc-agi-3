@@ -87,22 +87,13 @@ def _step_terminal(obs: Any):
 class RandomExplorer:
     """Run N episodes with random actions. Return EpisodeRecord per episode."""
 
-    def __init__(self, env_factory, cfg: dict, seed: int):
-        """
-        Parameters
-        ----------
-        env_factory : callable(ep_idx) → (env, game_id, env_seed)
-            Factory that creates a fresh env for each episode.
-        cfg : dict
-            Config dict (see config.py / config.default_cfg()).
-        seed : int
-            Base random seed; incremented per episode.
-        """
+    def __init__(self, env_factory, cfg: dict, seed: int, workers: int = 1):
         self._factory = env_factory
         self._cfg = cfg
         self._seed = seed
         self._max_steps = int(cfg.get("max_steps_per_ep", MAX_STEPS_PER_EP))
-        self._sprite_det: Optional[SpriteDetector] = None   # set after first analysis
+        self._workers = max(1, int(workers))
+        self._sprite_det: Optional[SpriteDetector] = None
 
     def _centroid(self, frame: np.ndarray) -> Optional[Tuple[int, int]]:
         if self._sprite_det is not None:
@@ -110,11 +101,18 @@ class RandomExplorer:
         return None
 
     def run(self, n_episodes: int) -> List[EpisodeRecord]:
-        """Run n_episodes random episodes. Returns list of EpisodeRecord."""
-        records: List[EpisodeRecord] = []
-        rng = random.Random(self._seed)
+        """Run n_episodes random episodes. Uses multiple processes when workers > 1."""
+        if self._workers > 1 and n_episodes >= self._workers:
+            return self._run_parallel(n_episodes)
+        return self._run_sequential(n_episodes, ep_offset=0)
 
-        for ep_idx in range(n_episodes):
+    def _run_sequential(self, n: int, ep_offset: int = 0) -> List[EpisodeRecord]:
+        """Run n episodes sequentially starting at factory index ep_offset."""
+        records: List[EpisodeRecord] = []
+        rng = random.Random(self._seed + ep_offset)
+
+        for local_idx in range(n):
+            ep_idx = ep_offset + local_idx
             env, game_id, env_seed = self._factory(ep_idx)
             obs = env.reset()
 
@@ -158,7 +156,6 @@ class RandomExplorer:
                     )
                     break
 
-            # Pad positions list to match frames length
             while len(positions) < len(frames):
                 positions.append(None)
 
@@ -178,3 +175,28 @@ class RandomExplorer:
             )
 
         return records
+
+    def _run_parallel(self, n_episodes: int) -> List[EpisodeRecord]:
+        """Split n_episodes across self._workers processes."""
+        from concurrent.futures import ProcessPoolExecutor
+
+        chunk_size = max(1, n_episodes // self._workers)
+        chunks = []
+        for start in range(0, n_episodes, chunk_size):
+            count = min(chunk_size, n_episodes - start)
+            chunks.append((self._factory, start, count, self._cfg, self._seed))
+
+        logger.info("random_explorer parallel workers=%d chunks=%d", self._workers, len(chunks))
+        with ProcessPoolExecutor(max_workers=self._workers) as ex:
+            results = list(ex.map(_random_worker_fn, chunks))
+
+        return [ep for chunk_records in results for ep in chunk_records]
+
+
+# ── Top-level worker function (must be at module level to be picklable) ───────
+
+def _random_worker_fn(args):
+    """Worker entry point for RandomExplorer parallel mode."""
+    factory, ep_start, ep_count, cfg, seed = args
+    explorer = RandomExplorer(factory, cfg, seed=seed, workers=1)
+    return explorer._run_sequential(ep_count, ep_offset=ep_start)
