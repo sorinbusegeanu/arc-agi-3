@@ -1,0 +1,111 @@
+{
+  "game_id": "example_game",
+  "rounds": 2,
+  "analyst": {
+    "connectivity": 4,
+    "min_area": 1,
+    "bg_border_weight": 0.35,
+    "bg_frequency_weight": 0.45,
+    "bg_connected_weight": 0.2,
+    "hud_height_ratio": 0.15,
+    "hud_width_ratio": 0.7,
+    "avatar_motion_threshold": 0.5
+  },
+  "trajectory_analysis": {
+    "min_episodes": 1,
+    "min_poi_persistence": 2,
+    "motion_hotspot_threshold": 0.2,
+    "consequence_hotspot_threshold": 0.2,
+    "traversable_min_visits": 2
+  },
+  "memory": {
+    "storage_dir": "runs_v2",
+    "atomic_writes": true
+  },
+  "controller": {
+    "unguided_probe_fraction": 0.2,
+    "exploit_confidence_threshold": 0.7,
+    "route_confidence_threshold": 0.6,
+    "info_gain_weight": 1.0,
+    "confidence_weight": 1.0,
+    "reachability_weight": 0.5,
+    "random_seed": 0
+  },
+  "executor": {
+    "max_steps": 40,
+    "blocked_repeat_limit": 4,
+    "target_reach_distance": 1.5
+  },
+  "scoring": {
+    "poi_rank_weight_info_gain": 1.0,
+    "poi_rank_weight_confidence": 1.0,
+    "poi_rank_weight_reachability": 0.5,
+    "hypothesis_info_gain_weight": 1.0,
+    "controller_target_weight": 1.0,
+    "executor_progress_weight": 1.0,
+    "consequence_weight_local": 0.7,
+    "consequence_weight_global": 1.0
+  },
+  "logging": {
+    "log_dir": "runs_v2/logs"
+  },
+  "dataset_or_rollout_source": {
+    "mode": "import_only",
+    "trajectory_path": null,
+    "episodes_per_round": 8,
+    "max_steps_per_episode": 40
+  },
+  "runtime": {
+    "max_rounds": 5,
+    "resume_if_exists": true,
+    "fail_on_missing_live_env": true
+  },
+  "collection": {
+    "initial_probe_episodes": 8,
+    "directed_probe_episodes": 4,
+    "max_steps_per_episode": 40,
+    "max_steps_per_instruction": 40,
+    "seed": 0,
+    "action_repeat_limit": 4
+  },
+  "routing": {
+    "use_graph_distance": true,
+    "route_stall_limit": 6,
+    "blocked_retry_limit": 4,
+    "local_probe_radius": 2
+  },
+  "scheduler": {
+    "unguided_min_fraction": 0.2,
+    "discriminating_probe_fraction": 0.2,
+    "poi_approach_fraction": 0.3,
+    "poi_interaction_fraction": 0.2,
+    "exploit_fraction": 0.1
+  },
+  "storage": {
+    "root_dir": "runs_v2",
+    "atomic_writes": true,
+    "keep_raw_frames": true,
+    "keep_raw_env_payloads": false
+  },
+  "resume": {
+    "reload_latest_blackboard": true,
+    "reload_unfinished_round": true
+  },
+  "target_scoring": {
+    "proximity_weight": 1.0,
+    "information_gain_weight": 1.0,
+    "consequence_weight": 1.0,
+    "confidence_weight": 1.0,
+    "stale_penalty": 0.2,
+    "likely_hud_penalty": 0.5
+  },
+  "debug": {
+    "strict_state_hash": false,
+    "export_avatar_candidates": false,
+    "export_reachability_reasons": false,
+    "export_target_linkage": false,
+    "export_poi_rejections": false,
+    "fail_on_missing_target_link": false,
+    "keep_invalid_steps_for_debug": false
+  }
+}
