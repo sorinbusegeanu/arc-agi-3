@@ -5,6 +5,7 @@ import os
 import importlib
 import multiprocessing as mp
 from dataclasses import dataclass
+from multiprocessing.pool import Pool
 from typing import Any, Dict, List, Optional, Tuple
 
 from codex_baseline_v2.runtime.environment_session import EnvironmentSessionV2, StepResultV2
@@ -12,6 +13,7 @@ from codex_baseline_v2.runtime.trajectory_policy import PolicyStateV2, Trajector
 from codex_baseline_v2.shared.state_identity import canonical_state_identity
 from codex_baseline_v2.shared.schemas import ActionDescriptorV2, SCHEMA_VERSION, TrajectoryEpisodeV2, TrajectoryStepV2
 from codex_baseline_v2.shared.storage import StoragePathsV2
+from codex_baseline_v2.storage.sqlite_intermediates import SQLiteIntermediateStoreV2, sqlite_db_path_for_round
 
 
 @dataclass
@@ -22,6 +24,11 @@ class CollectionConfigV2:
     seed: Optional[int] = None
     action_repeat_limit: int = 4
     keep_invalid_steps_for_debug: bool = False
+    write_raw_copy: bool = False
+    keep_observations_in_artifacts: bool = True
+    keep_raw_info_in_artifacts: bool = True
+    keep_observation_summaries_in_artifacts: bool = True
+    storage_backend: str = "files"
 
 
 class TrajectoryCollectorV2:
@@ -105,19 +112,21 @@ class TrajectoryCollectorV2:
             obs = result.observation
             if result.done:
                 break
+        status = session.progress_status()
         return TrajectoryEpisodeV2(
             schema_version=SCHEMA_VERSION,
             game_id=session.game_id,
             episode_id=f"round{round_id:03d}_ep{episode_idx:05d}",
             steps=steps,
             done=bool(steps and steps[-1].done),
-            win=False,
+            win=bool(status.get("win", False)),
             seed=(self.cfg.seed + episode_idx) if self.cfg.seed is not None else None,
             metadata={
                 "mode": mode,
                 "collection_mode": mode,
                 "instruction_id": getattr(instruction, "instruction_id", None),
                 "target_poi_id": getattr(instruction, "target_poi_id", None),
+                "win": bool(status.get("win", False)),
                 "state_counters": {
                     "observed_states_total": observed_states_total,
                     "unique_pre_states": len(unique_pre_states),
@@ -149,8 +158,8 @@ class TrajectoryCollectorV2:
         instruction: Optional[Any],
         round_id: int,
         workers: int,
+        pool: Optional[Pool] = None,
     ) -> List[TrajectoryEpisodeV2]:
-        ctx = mp.get_context("spawn")
         payloads = [
             (
                 env_factory_path,
@@ -164,8 +173,44 @@ class TrajectoryCollectorV2:
             )
             for ep_idx in range(self.cfg.episodes)
         ]
-        with ctx.Pool(processes=workers) as pool:
+        if pool is not None:
             return pool.map(_collect_episode_worker, payloads)
+        ctx = mp.get_context("spawn")
+        with ctx.Pool(processes=workers) as local_pool:
+            return local_pool.map(_collect_episode_worker, payloads)
+
+    def collect_round_parallel_iter(
+        self,
+        env_factory_path: str,
+        env_id: str,
+        env_root: str,
+        mode: str,
+        instruction: Optional[Any],
+        round_id: int,
+        workers: int,
+        pool: Optional[Pool] = None,
+    ):
+        payloads = [
+            (
+                env_factory_path,
+                env_id,
+                env_root,
+                self.cfg,
+                mode,
+                instruction,
+                round_id,
+                ep_idx,
+            )
+            for ep_idx in range(self.cfg.episodes)
+        ]
+        if pool is not None:
+            for episode in pool.imap_unordered(_collect_episode_worker, payloads):
+                yield episode
+            return
+        ctx = mp.get_context("spawn")
+        with ctx.Pool(processes=workers) as local_pool:
+            for episode in local_pool.imap_unordered(_collect_episode_worker, payloads):
+                yield episode
 
     def write_artifacts(self, game_id: str, round_id: int, episodes: List[TrajectoryEpisodeV2]) -> None:
         paths = self.storage.ensure_round_dirs(game_id, round_id)
@@ -173,14 +218,17 @@ class TrajectoryCollectorV2:
         norm_path = os.path.join(paths["normalized_trajectories"], "episodes.jsonl")
         counters = _compute_round_state_counters(episodes)
         counters_path = os.path.join(paths["round_root"], "state_counters.json")
-        with open(raw_path, "w", encoding="utf-8") as handle:
-            for ep in episodes:
-                handle.write(json.dumps(ep.to_dict(), sort_keys=True) + "\n")
+        lines = [json.dumps(_episode_to_artifact_dict(ep, self.cfg), sort_keys=True) + "\n" for ep in episodes]
         with open(norm_path, "w", encoding="utf-8") as handle:
-            for ep in episodes:
-                handle.write(json.dumps(ep.to_dict(), sort_keys=True) + "\n")
+            handle.writelines(lines)
+        if self.cfg.write_raw_copy:
+            with open(raw_path, "w", encoding="utf-8") as handle:
+                handle.writelines(lines)
         with open(counters_path, "w", encoding="utf-8") as handle:
             handle.write(json.dumps(counters, sort_keys=True))
+        if self.cfg.storage_backend == "sqlite":
+            sqlite_store = SQLiteIntermediateStoreV2(sqlite_db_path_for_round(self.storage.root, game_id, round_id))
+            sqlite_store.write_episode_batch(game_id, round_id, episodes)
 
 
 def _collect_episode_worker(payload: Tuple[str, str, str, CollectionConfigV2, str, Optional[Any], int, int]) -> TrajectoryEpisodeV2:
@@ -221,3 +269,18 @@ def _compute_round_state_counters(episodes: List[TrajectoryEpisodeV2]) -> Dict[s
         "unique_post_states": int(len(unique_post_states)),
         "invalid_state_count": int(invalid_state_count),
     }
+
+
+def _episode_to_artifact_dict(episode: TrajectoryEpisodeV2, cfg: CollectionConfigV2) -> Dict[str, Any]:
+    payload = episode.to_dict()
+    for step in payload.get("steps", []):
+        if not cfg.keep_observations_in_artifacts:
+            step["observation"] = None
+        if not cfg.keep_observation_summaries_in_artifacts:
+            step["observation_summary"] = None
+        if not cfg.keep_raw_info_in_artifacts and isinstance(step.get("info"), dict):
+            info = dict(step["info"])
+            info.pop("raw", None)
+            info.pop("step_info", None)
+            step["info"] = info
+    return payload

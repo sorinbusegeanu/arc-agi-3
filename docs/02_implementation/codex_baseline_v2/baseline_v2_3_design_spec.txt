@@ -1,0 +1,306 @@
+BASELINE V2.3 DESIGN SPEC
+
+Version: v2.3
+Scope: Extend baseline v2.2 into a hierarchical mechanic-learning agent for deep long-horizon causal chains, abstract visual generalization, and optimal long-range planning.
+
+1. PURPOSE
+
+v2.3 extends the baseline from:
+- POI discovery
+- directed interaction
+- event extraction
+- hidden-trigger discovery
+- short causal-chain reasoning
+
+into:
+- latent world-state induction
+- multi-hop mechanic/dependency graph construction
+- option/skill abstraction
+- hierarchical planning over skills and uncertainty
+- cross-area visual/entity generalization
+- later learned ranking/value guidance
+
+v2.3 is not one implementation step. It is a staged architecture:
+- v2.3.1 symbolic long-horizon causal structure
+- v2.3.2 option/skill library and symbolic hierarchical planner
+- v2.3.3 visual embedding and entity/event re-identification
+- v2.3.4 learned ranking/value guidance over planner decisions
+
+2. DESIGN PRINCIPLES
+
+2.1 Preserve determinism first
+The first stages must remain inspectable and debuggable. Learned components are added only after the symbolic graph/planner substrate exists.
+
+2.2 Event-first, not pixel-first
+Reasoning should operate primarily over:
+- tracks
+- areas
+- interventions
+- typed events
+- causal links
+- topology changes
+- latent state hypotheses
+- mechanic hypotheses
+- skills/options
+
+not over raw pixel differences.
+
+2.3 Separate observation, inference, and planning
+Observation:
+- object/track extraction
+- event extraction
+- area detection
+
+Inference:
+- latent state induction
+- mechanic graph construction
+- causal/dependency updates
+- skill model updates
+
+Planning:
+- subgoal generation
+- option selection
+- verification scheduling
+- long-range plan ranking
+
+2.4 Preserve falsifiability
+Every causal edge, latent state, and mechanic hypothesis must store:
+- support evidence
+- contradiction evidence
+- recency
+- uncertainty
+- confidence
+
+2.5 Planner acts on belief state
+The planner must reason over uncertain world hypotheses, not assume full correctness.
+
+3. TARGET CAPABILITIES
+
+3.1 Deep long-horizon causal chains
+The system should represent and test chains such as:
+- trigger A -> unlock B -> enable route C -> reach area D -> activate E -> final goal
+- contact object -> spawn enemy -> enemy destroys barrier -> new path opens
+
+3.2 Abstract visual generalization
+The system should match:
+- same functional object class with different appearance
+- same event type across different rooms
+- same mechanic pattern despite palette, position, or animation changes
+
+3.3 Optimal long-range planning
+The system should select between:
+- exploit known chain
+- verify uncertain mechanic
+- search for missing prerequisite
+- revisit area to test latent-state dependency
+- probe transition frontier
+using expected utility, cost, risk, and information gain.
+
+4. CORE REPRESENTATIONS
+
+4.1 LatentStateHypothesis
+Represents inferred hidden world state not directly visible.
+Examples:
+- switch_group_open
+- room_phase_2
+- boss_awake
+- key_flag_true
+- bridge_enabled
+
+Required fields:
+- latent_state_id
+- state_type
+- domain
+- current_value_hypothesis
+- confidence
+- support_event_ids
+- contradiction_event_ids
+- scope (global, area, object-group, route)
+- update_history
+
+4.2 MechanicGraph
+Persistent directed graph of:
+- trigger nodes
+- latent state nodes
+- event nodes
+- topology delta nodes
+- skill outcome nodes
+- goal/subgoal nodes
+
+Edges:
+- causes
+- enables
+- disables
+- requires
+- precedes_consistently
+- mutually_exclusive
+- ambiguous_with
+
+Every edge must store:
+- confidence
+- support count
+- contradiction count
+- delay distribution
+- context tags
+- verification status
+
+4.3 Skill / Option
+A reusable action abstraction.
+Examples:
+- go_to(region)
+- contact(poi)
+- probe_hidden_trigger(region)
+- cross_transition(edge)
+- return_to_anchor(area)
+- verify_mechanic(mechanic_id)
+
+Fields:
+- skill_id
+- skill_type
+- parameter schema
+- precondition set
+- effect prediction set
+- failure modes
+- average duration
+- success probability estimate
+- evidence refs
+
+4.4 PlannerBeliefState
+Planner-visible world summary:
+- current area
+- avatar state
+- reachable frontiers
+- active latent-state hypotheses
+- current mechanics known/uncertain
+- candidate subgoals
+- option set
+- estimated costs
+- information-gain estimates
+- contradiction hotspots
+
+4.5 VisualPrototypeMemory
+Stores learned or clustered object/event prototypes:
+- prototype_id
+- prototype_type
+- embedding centroid
+- structured feature summary
+- support refs
+- confidence
+- candidate semantic role
+
+4.6 SubgoalDependencyGraph
+Graph of:
+- required subgoals
+- unlocked subgoals
+- blocked subgoals
+- uncertain prerequisites
+- already verified skills
+
+5. ARCHITECTURAL LAYERS
+
+Layer A: Perception and extraction
+- observation adapter
+- object extraction / tracking
+- event extraction
+- area identity
+- topology delta extraction
+
+Layer B: Causal world inference
+- intervention traces
+- causal edge updates
+- latent-state induction
+- mechanic graph updates
+- contradiction handling
+
+Layer C: Skill abstraction
+- repeated sequence mining
+- skill definition
+- precondition/effect estimation
+- skill execution logging
+
+Layer D: Symbolic planning
+- subgoal generation
+- option expansion
+- utility scoring
+- best-first/beam/MCTS over skills
+- plan memory and replanning
+
+Layer E: Visual generalization
+- object crop embeddings
+- event embeddings
+- prototype clustering
+- re-identification
+
+Layer F: Learned ranking
+- option-value scorer
+- mechanic verification scorer
+- planner tie-breakers
+- uncertainty-aware prioritization
+
+6. STAGED DELIVERY
+
+6.1 v2.3.1
+Add symbolic long-horizon causal structure:
+- latent states
+- mechanic graph
+- dependency graph
+- planner belief-state construction
+
+6.2 v2.3.2
+Add skill/option layer and symbolic hierarchical planner:
+- option definitions
+- option execution records
+- option preconditions/effects
+- best-first or beam search over option graph
+- information-gain-aware planning
+
+6.3 v2.3.3
+Add visual generalization:
+- object/event embedding module
+- prototype memory
+- re-identification
+- cross-area matching
+
+6.4 v2.3.4
+Add learned ranking/value models:
+- planner option ranking
+- mechanic verification priority model
+- latent-state resolution priority model
+
+7. NON-GOALS FOR v2.3
+
+Not required in initial v2.3 stages:
+- end-to-end RL over raw pixels
+- opaque black-box planning with no inspectable state
+- full VLM-based reasoning
+- replacing the symbolic world model with a neural-only model
+
+8. SUCCESS CRITERIA
+
+v2.3 is successful when the agent can:
+- represent multi-hop mechanic chains explicitly
+- infer plausible hidden prerequisite states
+- execute reusable skills instead of only primitive action heuristics
+- plan across multiple areas/subgoals
+- match visually different but structurally similar objects/events better than v2.2
+- prioritize useful verification actions over random exploration
+
+9. FAILURE RISKS
+
+Main risks:
+- too many low-quality latent-state hypotheses
+- graph explosion
+- brittle skill induction
+- planner overfitting to wrong edges
+- weak re-identification quality
+- learned ranking introduced before symbolic state is strong enough
+
+10. DEVELOPMENT ORDER
+
+Mandatory order:
+1. v2.3.1
+2. v2.3.2
+3. v2.3.3
+4. v2.3.4
+
+Do not implement learned planning before symbolic causal graph and option planning exist.

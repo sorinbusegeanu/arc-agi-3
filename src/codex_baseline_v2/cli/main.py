@@ -9,6 +9,8 @@ from codex_baseline_v2.adapters.trajectory_import import import_legacy_from_path
 from codex_baseline_v2.analyst.analyst import analyze_episodes
 from codex_baseline_v2.controller.controller import select_instruction
 from codex_baseline_v2.executor.executor import execute_instruction_offline
+from dataclasses import replace
+
 from codex_baseline_v2.memory.store import append_round_report, load_blackboard, save_blackboard
 from codex_baseline_v2.shared.config import V2Config, load_config
 from codex_baseline_v2.shared.logging_utils import log_event
@@ -63,6 +65,10 @@ def _parse_poi(payload: Dict[str, Any]) -> CandidatePOIV2:
         expected_information_gain=float(payload.get("expected_information_gain", 0.0)),
         expected_interaction_type=str(payload.get("expected_interaction_type", "unknown")),
         evidence_count=int(payload.get("evidence_count", 0)),
+        observation_count=int(payload.get("observation_count", payload.get("evidence_count", 0))),
+        first_seen_episode=payload.get("first_seen_episode"),
+        last_seen_episode=payload.get("last_seen_episode"),
+        last_seen_step=payload.get("last_seen_step"),
         first_seen_ref=payload.get("first_seen_ref"),
         last_seen_ref=payload.get("last_seen_ref"),
         type_confidence=float(payload.get("type_confidence", 0.5)),
@@ -127,20 +133,7 @@ def _parse_object(payload: Dict[str, Any]) -> ObjectRecordV2:
 
 
 def _blackboard_from_dict(payload: Dict[str, Any]) -> BlackboardStateV2:
-    return BlackboardStateV2(
-        schema_version=str(payload.get("schema_version", SCHEMA_VERSION)),
-        game_id=str(payload["game_id"]),
-        round_id=int(payload["round_id"]),
-        palette=payload.get("palette", []),
-        poi_table=[_parse_poi(p) for p in payload.get("poi_table", [])],
-        reachability_table=[_parse_reachability(r) for r in payload.get("reachability_table", [])],
-        consequence_table=[_parse_consequence(c) for c in payload.get("consequence_table", [])],
-        avatar_hypotheses=[_parse_object(o) for o in payload.get("avatar_hypotheses", [])],
-        traversable_map=payload.get("traversable_map"),
-        unresolved_hypotheses=payload.get("unresolved_hypotheses", []),
-        falsified_hypotheses=payload.get("falsified_hypotheses", []),
-        metadata=payload.get("metadata", {}),
-    )
+    return BlackboardStateV2.from_dict(payload)
 
 
 def cmd_init(args: argparse.Namespace) -> None:
@@ -160,7 +153,8 @@ def cmd_import_analyze(args: argparse.Namespace) -> None:
         raise SystemExit("trajectory_path is required (flag or config.dataset_or_rollout_source.trajectory_path).")
     episodes = import_legacy_from_path(trajectory_path, game_id_override=cfg.game_id)
     analyzed = analyze_episodes(episodes, cfg.analyst)
-    blackboard = analyze_trajectories(analyzed, cfg.trajectory_analysis, round_id=args.round_id)
+    prior = load_blackboard(storage, cfg.game_id) if args.round_id > 0 else None
+    blackboard = analyze_trajectories(analyzed, cfg.trajectory_analysis, round_id=args.round_id, prior_blackboard=prior)
 
     _save_jsonl(os.path.join(paths["normalized_trajectories"], "episodes.jsonl"), [ep.to_dict() for ep in analyzed])
     _save_json(os.path.join(paths["blackboard_snapshots"], "blackboard.json"), blackboard.to_dict())
@@ -183,7 +177,7 @@ def cmd_directed_round(args: argparse.Namespace) -> None:
     prior = load_blackboard(storage, cfg.game_id)
     if prior is None:
         raise SystemExit("No blackboard state found. Run import/analyze first.")
-    blackboard = _blackboard_from_dict(prior)
+    blackboard = prior
 
     instruction = select_instruction(blackboard, cfg.controller, cfg.scoring, args.round_id)
     trajectory_path = args.trajectory_path or cfg.dataset_or_rollout_source.trajectory_path
@@ -193,7 +187,11 @@ def cmd_directed_round(args: argparse.Namespace) -> None:
     analyzed = analyze_episodes(episodes, cfg.analyst)
     outcome = execute_instruction_offline(analyzed, instruction, cfg.executor)
 
-    updated_blackboard = analyze_trajectories(analyzed, cfg.trajectory_analysis, round_id=args.round_id)
+    updated_blackboard = analyze_trajectories(analyzed, cfg.trajectory_analysis, round_id=args.round_id, prior_blackboard=blackboard)
+    updated_blackboard = replace(
+        updated_blackboard,
+        consequence_table=list(updated_blackboard.consequence_table) + list(outcome.consequence_records),
+    )
     _save_jsonl(os.path.join(paths["normalized_trajectories"], "episodes.jsonl"), [ep.to_dict() for ep in analyzed])
     _save_json(os.path.join(paths["controller_decisions"], "instruction.json"), instruction.to_dict())
     _save_json(os.path.join(paths["executor_outcomes"], "outcome.json"), outcome.to_dict())
@@ -209,6 +207,8 @@ def cmd_directed_round(args: argparse.Namespace) -> None:
         [instruction.mode],
         len(updated_blackboard.avatar_hypotheses),
         outcome.target_progress,
+        blackboard=updated_blackboard,
+        executor_outcomes=[outcome],
     )
     report = {
         "round_id": args.round_id,
@@ -239,10 +239,14 @@ def cmd_loop(args: argparse.Namespace) -> None:
             prior = load_blackboard(storage, cfg.game_id)
             if prior is None:
                 raise SystemExit("Missing blackboard state")
-            blackboard = _blackboard_from_dict(prior)
+            blackboard = prior
             instruction = select_instruction(blackboard, cfg.controller, cfg.scoring, round_id)
             outcome = execute_instruction_offline(analyzed, instruction, cfg.executor)
-            blackboard = analyze_trajectories(analyzed, cfg.trajectory_analysis, round_id=round_id)
+            blackboard = analyze_trajectories(analyzed, cfg.trajectory_analysis, round_id=round_id, prior_blackboard=blackboard)
+            blackboard = replace(
+                blackboard,
+                consequence_table=list(blackboard.consequence_table) + list(outcome.consequence_records),
+            )
             _save_json(os.path.join(paths["controller_decisions"], "instruction.json"), instruction.to_dict())
             _save_json(os.path.join(paths["executor_outcomes"], "outcome.json"), outcome.to_dict())
             _save_json(os.path.join(paths["blackboard_snapshots"], "blackboard.json"), blackboard.to_dict())
@@ -346,10 +350,80 @@ def cmd_analyze_trajectories(args: argparse.Namespace) -> None:
         "--round-id",
         str(args.round_id),
     ]
+    if getattr(args, "prior_blackboard", None):
+        argv.extend(["--prior-blackboard", args.prior_blackboard])
     prev = sys.argv[:]
     try:
         sys.argv = argv
         analyze_trajectories.main()
+    finally:
+        sys.argv = prev
+
+
+def cmd_analyze_causal_world(args: argparse.Namespace) -> None:
+    import sys
+    from codex_baseline_v2.cli import analyze_causal_world
+
+    argv = [
+        "analyze_causal_world",
+        "--config",
+        args.config,
+    ]
+    prev = sys.argv[:]
+    try:
+        sys.argv = argv
+        analyze_causal_world.main()
+    finally:
+        sys.argv = prev
+
+
+def cmd_plan_with_options(args: argparse.Namespace) -> None:
+    import sys
+    from codex_baseline_v2.cli import plan_with_options
+
+    argv = [
+        "plan_with_options",
+        "--config",
+        args.config,
+    ]
+    prev = sys.argv[:]
+    try:
+        sys.argv = argv
+        plan_with_options.main()
+    finally:
+        sys.argv = prev
+
+
+def cmd_build_visual_prototypes(args: argparse.Namespace) -> None:
+    import sys
+    from codex_baseline_v2.cli import build_visual_prototypes
+
+    argv = [
+        "build_visual_prototypes",
+        "--config",
+        args.config,
+    ]
+    prev = sys.argv[:]
+    try:
+        sys.argv = argv
+        build_visual_prototypes.main()
+    finally:
+        sys.argv = prev
+
+
+def cmd_train_rankers(args: argparse.Namespace) -> None:
+    import sys
+    from codex_baseline_v2.cli import train_rankers
+
+    argv = [
+        "train_rankers",
+        "--config",
+        args.config,
+    ]
+    prev = sys.argv[:]
+    try:
+        sys.argv = argv
+        train_rankers.main()
     finally:
         sys.argv = prev
 
@@ -406,7 +480,20 @@ def build_parser() -> argparse.ArgumentParser:
     analyze_cmd = sub.add_parser("analyze_trajectories")
     analyze_cmd.add_argument("--trajectory-path", required=True)
     analyze_cmd.add_argument("--round-id", type=int, default=0)
+    analyze_cmd.add_argument("--prior-blackboard", default=None)
     analyze_cmd.set_defaults(func=cmd_analyze_trajectories)
+
+    causal_cmd = sub.add_parser("analyze_causal_world")
+    causal_cmd.set_defaults(func=cmd_analyze_causal_world)
+
+    plan_cmd = sub.add_parser("plan_with_options")
+    plan_cmd.set_defaults(func=cmd_plan_with_options)
+
+    vision_cmd = sub.add_parser("build_visual_prototypes")
+    vision_cmd.set_defaults(func=cmd_build_visual_prototypes)
+
+    train_cmd = sub.add_parser("train_rankers")
+    train_cmd.set_defaults(func=cmd_train_rankers)
 
     return parser
 

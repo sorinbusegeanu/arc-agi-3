@@ -1,0 +1,536 @@
+BASELINE V2.2 ADDED IMPLEMENTATION SPEC
+
+Apply the changes below to the existing package at `src/codex_baseline_v2`.
+This is an additive delta on top of v2.1.
+Do not remove or rename any v2.1 dataclass, table, file, CLI entry point, or persisted artifact.
+Use compact JSON only.
+Every persisted record must include `schema_version`.
+Prefer typed dataclasses over dict blobs.
+Do not change anything outside `src/codex_baseline_v2` except config templates already inside that package.
+
+================================================================================
+1. Shared schema additions
+================================================================================
+
+File: `src/codex_baseline_v2/shared/schemas.py`
+
+Add the following new dataclasses.
+
+1. `TriggerZoneV2`
+Fields:
+- `schema_version: str`
+- `game_id: str`
+- `trigger_zone_id: str`
+- `area_id: Optional[str]`
+- `source_kind: str`
+- `condition_type: str`
+- `cells: List[Tuple[int, int]]`
+- `bbox: Optional[BBox]`
+- `anchor_poi_id: Optional[str]`
+- `entry_count: int`
+- `dwell_count: int`
+- `crossing_count: int`
+- `per_action_counts: List[Tuple[int, int]]`
+- `activation_count: int`
+- `null_count: int`
+- `contradiction_count: int`
+- `last_triggered_round: Optional[int]`
+- `hidden_trigger_confidence: float`
+- `evidence_refs: List[str]`
+
+2. `SpatialInterventionCellV2`
+Fields:
+- `schema_version: str`
+- `game_id: str`
+- `area_id: Optional[str]`
+- `cell: Tuple[int, int]`
+- `visit_count: int`
+- `dwell_count: int`
+- `crossing_count: int`
+- `action_counts: List[Tuple[int, int]]`
+- `post_event_count: int`
+- `post_delayed_event_count: int`
+- `post_transition_event_count: int`
+- `null_probe_count: int`
+- `hidden_trigger_score: float`
+- `last_updated_round: int`
+
+3. `ProbeOutcomeV2`
+Fields:
+- `schema_version: str`
+- `game_id: str`
+- `probe_outcome_id: str`
+- `intervention_id: str`
+- `probe_mode: str`
+- `target_trigger_zone_id: Optional[str]`
+- `target_poi_id: Optional[str]`
+- `start_step_idx: int`
+- `end_step_idx: int`
+- `entered_target_region: bool`
+- `dwelled_in_target_region: bool`
+- `executed_action_in_target_region: bool`
+- `crossed_target_boundary: bool`
+- `side_contact_label: Optional[str]`
+- `null_effect: bool`
+- `event_ids: List[str]`
+- `confidence: float`
+
+4. `EventEdgeV2`
+Fields:
+- `schema_version: str`
+- `game_id: str`
+- `edge_id: str`
+- `src_event_id: str`
+- `dst_event_id: str`
+- `edge_type: str`
+- `delay_steps: int`
+- `same_area: bool`
+- `crosses_transition: bool`
+- `support_count: int`
+- `contradiction_count: int`
+- `confidence: float`
+
+5. `EventSequenceElementV2`
+Fields:
+- `schema_version: str`
+- `event_type: str`
+- `locality: str`
+- `area_relation: str`
+- `delay_bucket: str`
+- `topology_effect_type: Optional[str]`
+
+6. `EventSequencePatternV2`
+Fields:
+- `schema_version: str`
+- `game_id: str`
+- `pattern_id: str`
+- `elements: List[EventSequenceElementV2]`
+- `source_intervention_ids: List[str]`
+- `source_event_ids: List[str]`
+- `support_count: int`
+- `contradiction_count: int`
+- `confidence: float`
+- `status: str`
+
+7. `CausalChainHypothesisV2`
+Fields:
+- `schema_version: str`
+- `game_id: str`
+- `chain_id: str`
+- `trigger_kind: str`
+- `trigger_poi_id: Optional[str]`
+- `trigger_zone_id: Optional[str]`
+- `trigger_condition_type: str`
+- `anchor_intervention_ids: List[str]`
+- `ordered_event_ids: List[str]`
+- `sequence_pattern_id: Optional[str]`
+- `same_area_supported: bool`
+- `cross_area_supported: bool`
+- `min_chain_length: int`
+- `max_chain_length: int`
+- `delay_profile: List[int]`
+- `support_count: int`
+- `contradiction_count: int`
+- `confidence: float`
+- `status: str`
+
+8. `HiddenTriggerHypothesisV2`
+Fields:
+- `schema_version: str`
+- `game_id: str`
+- `hidden_hypothesis_id: str`
+- `trigger_zone_id: str`
+- `condition_type: str`
+- `required_action_id: Optional[int]`
+- `required_dwell_steps: Optional[int]`
+- `required_entry_side: Optional[str]`
+- `required_preceding_zone_ids: List[str]`
+- `effect_signature_id: Optional[str]`
+- `support_intervention_ids: List[str]`
+- `null_intervention_ids: List[str]`
+- `contradiction_intervention_ids: List[str]`
+- `confidence: float`
+- `status: str`
+
+9. `CounterfactualTraceV2`
+Fields:
+- `schema_version: str`
+- `game_id: str`
+- `counterfactual_id: str`
+- `reference_intervention_id: str`
+- `trace_type: str`
+- `target_poi_id: Optional[str]`
+- `target_trigger_zone_id: Optional[str]`
+- `matched_event_ids: List[str]`
+- `supports_reference: bool`
+- `confidence: float`
+
+10. `EffectSignatureV2`
+Fields:
+- `schema_version: str`
+- `game_id: str`
+- `effect_signature_id: str`
+- `event_type: str`
+- `locality: str`
+- `area_relation: str`
+- `topology_effect_type: Optional[str]`
+- `object_delta_types: List[str]`
+- `delay_bucket: str`
+- `confidence: float`
+
+Extend the following existing dataclasses.
+
+`InterventionRecordV2`
+Add fields:
+- `target_trigger_zone_id: Optional[str] = None`
+- `intent_class: str = "poi_interaction_probe"`
+- `probe_mode: Optional[str] = None`
+- `probe_outcome_ids: List[str] = field(default_factory=list)`
+- `immediate_event_ids: List[str] = field(default_factory=list)`
+- `delayed_event_ids: List[str] = field(default_factory=list)`
+- `post_transition_event_ids: List[str] = field(default_factory=list)`
+- `null_effect: bool = False`
+
+`ChangeEventV2`
+Add fields:
+- `trigger_zone_id: Optional[str] = None`
+- `trigger_condition_type: Optional[str] = None`
+- `parent_event_ids: List[str] = field(default_factory=list)`
+- `child_event_ids: List[str] = field(default_factory=list)`
+- `effect_signature_id: Optional[str] = None`
+
+`MechanicHypothesisV2`
+Add fields:
+- `chain_hypothesis_ids: List[str] = field(default_factory=list)`
+- `hidden_trigger_hypothesis_ids: List[str] = field(default_factory=list)`
+- `event_sequence_pattern_ids: List[str] = field(default_factory=list)`
+
+`DecisionRecordV2`
+Add fields:
+- `selected_trigger_zone_id: Optional[str] = None`
+- `selected_chain_id: Optional[str] = None`
+- `selected_hidden_hypothesis_id: Optional[str] = None`
+
+`GameHypothesisStateV2`
+Add fields:
+- `trigger_zone_table: List[TriggerZoneV2] = field(default_factory=list)`
+- `spatial_intervention_field: List[SpatialInterventionCellV2] = field(default_factory=list)`
+- `probe_outcome_table: List[ProbeOutcomeV2] = field(default_factory=list)`
+- `event_edge_table: List[EventEdgeV2] = field(default_factory=list)`
+- `event_sequence_patterns: List[EventSequencePatternV2] = field(default_factory=list)`
+- `causal_chain_hypotheses: List[CausalChainHypothesisV2] = field(default_factory=list)`
+- `hidden_trigger_hypotheses: List[HiddenTriggerHypothesisV2] = field(default_factory=list)`
+- `counterfactual_traces: List[CounterfactualTraceV2] = field(default_factory=list)`
+- `effect_signature_table: List[EffectSignatureV2] = field(default_factory=list)`
+
+`BlackboardStateV2`
+If it wraps `GameHypothesisStateV2`, extend it with the same new fields and maintain backward-compatible serialization.
+
+Add `from_dict()` constructors for every new persisted dataclass.
+Do not remove any existing field.
+
+================================================================================
+2. Config additions
+================================================================================
+
+File: `src/codex_baseline_v2/shared/config.py`
+
+Add the following config groups.
+
+1. `HiddenTriggerConfigV2`
+Fields:
+- `min_region_visits_for_candidate: int = 3`
+- `min_boundary_crossings_for_candidate: int = 2`
+- `dwell_step_thresholds: List[int] = [2, 4, 6]`
+- `min_activation_support: int = 2`
+- `null_penalty: float = 0.25`
+- `contradiction_penalty: float = 0.5`
+- `promotion_threshold: float = 0.72`
+- `merge_iou_threshold: float = 0.5`
+- `merge_cell_overlap_threshold: float = 0.6`
+
+2. `CausalChainConfigV2`
+Fields:
+- `immediate_delay_max: int = 2`
+- `delayed_delay_max: int = 8`
+- `post_transition_delay_max: int = 16`
+- `max_chain_hops: int = 4`
+- `min_sequence_support: int = 2`
+- `sequence_match_threshold: float = 0.7`
+- `partial_match_weight: float = 0.35`
+- `contradiction_penalty: float = 0.5`
+- `promotion_threshold: float = 0.75`
+
+3. `ProbeModeConfigV2`
+Fields:
+- `max_step_on_region_steps: int = 6`
+- `max_dwell_probe_steps: int = 8`
+- `max_action_in_region_steps: int = 6`
+- `max_boundary_cross_steps: int = 6`
+- `max_side_contact_steps: int = 6`
+- `counterfactual_probe_budget: int = 10`
+
+4. `SequenceMiningConfigV2`
+Fields:
+- `min_pattern_length: int = 2`
+- `max_pattern_length: int = 5`
+- `delay_bucket_edges: List[int] = [0, 2, 8, 16]`
+- `same_area_bonus: float = 0.15`
+- `cross_area_bonus: float = 0.2`
+- `topology_bonus: float = 0.2`
+
+5. `ControllerExplorationConfigV2`
+Fields:
+- `hidden_trigger_probe_weight: float = 1.0`
+- `causal_chain_verification_weight: float = 0.9`
+- `counterfactual_probe_weight: float = 0.7`
+- `null_result_penalty: float = 0.4`
+- `fragment_novelty_weight: float = 0.8`
+
+6. `DebugConfigV2`
+Add fields:
+- `export_trigger_zones: bool = False`
+- `export_event_graph: bool = False`
+- `export_event_sequence_patterns: bool = False`
+- `export_hidden_trigger_hypotheses: bool = False`
+- `export_causal_chain_hypotheses: bool = False`
+- `export_counterfactual_traces: bool = False`
+
+Extend `V2Config` and `load_config()` to include all new groups.
+Update config templates under the package with the new sections and default values.
+Do not change anything else.
+
+================================================================================
+3. New analysis and reasoning modules
+================================================================================
+
+Create the following new files.
+
+1. `src/codex_baseline_v2/trajectory_analysis/trigger_zones.py`
+Implement:
+- `build_trigger_zone_candidates(episodes, blackboard, cfg) -> list[TriggerZoneV2]`
+- `merge_trigger_zones(existing_zones, new_zones, cfg) -> list[TriggerZoneV2]`
+Behavior:
+- Propose trigger zones from visible POIs, repeated dwell cells, repeated boundary crossings, repeated action-at-location cells, and repeated unexplained pre-effect regions.
+- Permit `source_kind` values: `visible_poi`, `floor_region`, `boundary_edge`, `action_region`, `path_fragment`, `unknown_hidden`.
+- Do not require a visible object anchor.
+
+2. `src/codex_baseline_v2/trajectory_analysis/spatial_intervention.py`
+Implement:
+- `update_spatial_intervention_field(existing_field, episodes, interventions, events, cfg) -> list[SpatialInterventionCellV2]`
+Behavior:
+- Aggregate per-cell and per-region visits, dwell, crossings, actions, and post-event counts.
+- Increase hidden-trigger score for repeated effect-bearing traces.
+- Decrease hidden-trigger score for repeated null probes.
+
+3. `src/codex_baseline_v2/trajectory_analysis/event_graph.py`
+Implement:
+- `build_event_edges(events, interventions, cfg) -> list[EventEdgeV2]`
+- `attach_parent_child_event_ids(events, edges) -> list[ChangeEventV2]`
+Behavior:
+- Create event-to-event edges within intervention windows and post-transition windows.
+- Support edge types: `direct_trigger`, `enables`, `precedes_consistently`, `conditional_on_transition`, `ambiguous`, `competes_with`.
+- Only create strong edges when ordered repetition exists or when a direct intervention window clearly supports the edge.
+
+4. `src/codex_baseline_v2/trajectory_analysis/effect_signatures.py`
+Implement:
+- `build_effect_signatures(events, topology_deltas, cfg) -> list[EffectSignatureV2]`
+Behavior:
+- Normalize event effects by event type, locality, area relation, topology-effect type, object delta types, and delay bucket.
+- Do not use absolute coordinates as primary identity.
+
+5. `src/codex_baseline_v2/trajectory_analysis/sequence_mining.py`
+Implement:
+- `mine_event_sequence_patterns(interventions, events, event_edges, effect_signatures, cfg) -> list[EventSequencePatternV2]`
+Behavior:
+- Build normalized event sequences from intervention windows.
+- Mine repeated subsequences of length 2 to max configured length.
+- Match on event type, locality, area relation, topology effect, and delay bucket.
+
+6. `src/codex_baseline_v2/trajectory_analysis/causal_chains.py`
+Implement:
+- `induce_causal_chain_hypotheses(interventions, trigger_zones, event_patterns, event_edges, cfg) -> list[CausalChainHypothesisV2]`
+Behavior:
+- Build multi-hop chain hypotheses.
+- Keep direct one-hop links separate from chain hypotheses.
+- Support both visible and hidden trigger starts.
+- Keep same-area and cross-area support flags separate.
+
+7. `src/codex_baseline_v2/trajectory_analysis/hidden_triggers.py`
+Implement:
+- `induce_hidden_trigger_hypotheses(trigger_zones, interventions, spatial_field, events, cfg) -> list[HiddenTriggerHypothesisV2]`
+Behavior:
+- Infer hidden triggers from repeated region entry, dwell, action-at-location, and boundary-crossing patterns.
+- Require repeated support and contradiction-aware scoring.
+- Do not collapse to nearest visible POI.
+
+8. `src/codex_baseline_v2/trajectory_analysis/counterfactuals.py`
+Implement:
+- `build_counterfactual_traces(interventions, events, hidden_hypotheses, chain_hypotheses, cfg) -> list[CounterfactualTraceV2]`
+Behavior:
+- Build negative and contrastive traces such as: target reached without effect, same zone traversed without action, same effect observed without target contact.
+
+9. `src/codex_baseline_v2/trajectory_analysis/probe_outcomes.py`
+Implement:
+- `derive_probe_outcomes(interventions, steps, events, cfg) -> list[ProbeOutcomeV2]`
+Behavior:
+- Convert executor traces into exact region-entry/dwell/action/boundary/null-effect outcomes.
+
+================================================================================
+4. Existing analysis pipeline integration
+================================================================================
+
+File: `src/codex_baseline_v2/trajectory_analysis/analyze_trajectories.py` or the current analyzer entry file
+
+Extend the trajectory analysis pipeline in this order:
+1. keep the current v2.1 analysis steps intact
+2. build or merge trigger zones
+3. update spatial intervention field
+4. derive probe outcomes
+5. build event edges
+6. build effect signatures
+7. mine event sequence patterns
+8. induce causal chain hypotheses
+9. induce hidden trigger hypotheses
+10. build counterfactual traces
+11. merge all new tables into the blackboard
+
+Rules:
+- analysis must be cumulative when a prior blackboard exists
+- do not replace prior tables with only current-round tables
+- merge by stable ids where possible
+- preserve contradictory evidence and null traces
+
+================================================================================
+5. Controller changes
+================================================================================
+
+File: `src/codex_baseline_v2/controller/...` for the current controller module(s)
+
+Extend the controller to support these `intent_class` values:
+- `poi_interaction_probe`
+- `hidden_trigger_probe`
+- `causal_chain_verification`
+- `counterfactual_disambiguation_probe`
+
+Add selection logic:
+1. hidden trigger probe selection
+- choose trigger zones with high hidden-trigger score, insufficient support, and manageable route cost
+
+2. chain verification selection
+- choose chain hypotheses with medium support and high information gain from one more verification attempt
+
+3. counterfactual disambiguation selection
+- choose probes that most reduce ambiguity between competing hidden-trigger or chain hypotheses
+
+4. fallback selection
+- if none are suitable, fall back to the existing v2.1 visible-POI ranking
+
+Persist all selections into `DecisionRecordV2`.
+Do not change the controller public API unless the current code already allows extension fields.
+
+================================================================================
+6. Executor changes
+================================================================================
+
+File: `src/codex_baseline_v2/executor/...` for the current executor module(s)
+
+Add support for these probe modes:
+- `move_to_visible_poi`
+- `step_on_region`
+- `dwell_on_region`
+- `action_in_region`
+- `cross_boundary_edge`
+- `side_specific_contact`
+- `repeat_route_fragment`
+- `counterfactual_avoid_contact`
+
+Required behavior:
+1. `step_on_region`
+- move into any target zone cell and hold long enough to confirm entry
+
+2. `dwell_on_region`
+- remain inside target zone for a configured dwell budget
+
+3. `action_in_region`
+- execute selected action while in target region
+
+4. `cross_boundary_edge`
+- intentionally cross a nominated edge or threshold region
+
+5. `side_specific_contact`
+- attempt contact from a requested side when target access profile supports it
+
+6. `counterfactual_avoid_contact`
+- navigate near the target while explicitly avoiding the full trigger condition if possible
+
+Executor output requirements:
+- populate `ProbeOutcomeV2`
+- set `InterventionRecordV2.null_effect`
+- attach event ids by window: immediate, delayed, post-transition
+
+Do not replace the existing executor modes. Extend them.
+
+================================================================================
+7. Memory changes
+================================================================================
+
+File: `src/codex_baseline_v2/memory/store.py` and related memory modules
+
+Persist and reload all new v2.2 tables:
+- trigger_zone_table
+- spatial_intervention_field
+- probe_outcome_table
+- event_edge_table
+- event_sequence_patterns
+- causal_chain_hypotheses
+- hidden_trigger_hypotheses
+- counterfactual_traces
+- effect_signature_table
+
+Rules:
+- memory remains append-plus-recompute, not last-snapshot-only
+- round archives must include the new tables
+- loading old v2.1 artifacts must still work with sensible defaults
+
+================================================================================
+8. CLI and reporting changes
+================================================================================
+
+Extend existing CLI/reporting code to optionally export:
+- trigger zones
+- spatial intervention field
+- event graph edges
+- sequence patterns
+- hidden trigger hypotheses
+- causal chain hypotheses
+- counterfactual traces
+
+Do not change command names.
+Only add optional outputs and debug exports.
+
+================================================================================
+9. Acceptance constraints
+================================================================================
+
+The v2.2 implementation is correct only if all of the following are true.
+
+1. Hidden trigger support
+- the system can persist trigger zones with no visible object anchor
+- the controller can choose a hidden trigger probe
+- the executor can perform a non-POI probe mode
+
+2. Multi-step chain support
+- the system can persist event-to-event edges
+- the system can mine repeated event sequences longer than one event
+- the system can persist at least one chain hypothesis distinct from direct links
+
+3. Counterfactual support
+- null-effect interventions are persisted
+- repeated null probes reduce hidden-trigger confidence or chain confidence
+
+4. Backward compatibility
+- old v2.1 blackboards and archives still load
+- existing CLI entry points still run
+
+Do not change anything else.

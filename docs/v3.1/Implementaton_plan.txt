@@ -1,0 +1,304 @@
+1. Freeze scaffolding. Do not add new packages, new service shells, new wrapper layers, or new Ray plumbing until semantic migration of the core layers is complete.
+
+2. Define four mandatory semantic migration phases and execute them in this order only:
+
+* analysis parity
+* world/blackboard parity
+* planner parity
+* execution/orchestrator parity
+
+3. In the analysis parity phase, upgrade these files first:
+
+* `src/v3_1/analysis/observation_summary.py`
+* `src/v3_1/analysis/object_extraction.py`
+* `src/v3_1/analysis/avatar_tracking.py`
+* `src/v3_1/analysis/poi_detection.py`
+* `src/v3_1/analysis/motion_analysis.py`
+* `src/v3_1/analysis/area_assignment.py`
+* `src/v3_1/analysis/episode_analysis.py`
+
+4. For `observation_summary.py`, implement full per-frame symbolic summaries:
+
+* width/height
+* palette
+* background estimate
+* connected-component/object summaries
+* avatar candidates
+* active/change regions if derivable
+* stable state identity inputs needed later by analysis and planning
+
+5. For `object_extraction.py`, replace the single coarse scene object logic with:
+
+* connected-component extraction
+* bbox/centroid/area computation
+* per-object color statistics
+* stable object descriptors/signatures
+* object type hints needed by POI and avatar logic
+
+6. For `avatar_tracking.py`, replace first-object selection with a real avatar hypothesis system:
+
+* score multiple candidates
+* track across steps
+* maintain confidence/history
+* expose one main sprite track plus alternates if uncertain
+
+7. For `poi_detection.py`, replace generic object-to-POI conversion with:
+
+* persistence-aware POI extraction
+* utility/novelty estimation
+* demotion/rejection rules for weak or redundant POIs
+* canonical POI descriptors for blackboard merge
+
+8. For `motion_analysis.py`, replace visit-only tracking with:
+
+* per-step avatar movement
+* blocked/noop detection
+* local change summary
+* motion regions
+* action-effect cues needed by consequences and topology
+
+9. For `area_assignment.py`, replace synthetic area assignment with:
+
+* canonical area signatures
+* area matching against prior observations
+* stable area identifiers suitable for cumulative merge
+
+10. For `episode_analysis.py`, rebuild the final `AnalyzedEpisode` so it contains rich episode-local symbolic evidence and explicit blackboard-ready deltas, not only simplified summaries.
+
+11. Do not proceed past the analysis phase until the v3.1 analyzed episode contains enough information to drive world merge, planner queries, and avatar visit export without fallback placeholders.
+
+12. In the world/blackboard parity phase, upgrade these files next:
+
+* `src/v3_1/world/entities.py`
+* `src/v3_1/world/areas.py`
+* `src/v3_1/world/topology.py`
+* `src/v3_1/world/reachability.py`
+* `src/v3_1/world/consequences.py`
+* `src/v3_1/world/trigger_zones.py`
+* `src/v3_1/world/indexes.py`
+* `src/v3_1/world/queries.py`
+* `src/v3_1/world/merge.py`
+
+13. For `entities.py`, replace last-write merging with:
+
+* deduplication by spatial overlap and descriptor/signature
+* stable entity identity maintenance
+* lifecycle handling across observations
+* merge/update rules that preserve history and evidence
+
+14. For `areas.py`, replace simple signatures with:
+
+* canonical area-table behavior
+* area deduplication
+* stable area identity
+* topology-facing area metadata
+
+15. For `topology.py`, replace avatar-cell-only graph construction with:
+
+* navigation graph updates from movement evidence
+* transition typing
+* blocked/uncertain transitions
+* action-conditioned edge evidence
+* bidirectional consistency rules where supported
+
+16. For `reachability.py`, replace centroid-on-visited-cell logic with:
+
+* target reachability estimation
+* route-access profiles
+* frontier reasoning
+* planner-facing reachable-now vs reachable-later structure
+
+17. For `consequences.py`, replace simple merge with:
+
+* event extraction from analyzed episodes
+* action/state-effect summaries
+* causal/effect evidence accumulation
+* contrast-ready consequence records for planning and later mechanic induction
+
+18. For `trigger_zones.py`, replace simple merge with:
+
+* trigger-zone proposal accumulation
+* spatial intervention evidence
+* confidence updates from repeated outcomes
+
+19. For `indexes.py`, replace basic counts/indexes with planner-usable structures:
+
+* entities by area
+* POIs by area/type/state
+* reachable targets
+* blocked targets
+* frontier candidates
+* consequence/evidence indexes
+* topology lookup indexes
+
+20. For `queries.py`, build blackboard query functions specifically for planner use:
+
+* target candidate queries
+* area-local POI queries
+* reachable/unreachable target queries
+* novelty and retry-aware target lookup
+* movement/frontier query support
+
+21. For `merge.py`, rebuild cumulative merge semantics so analyzed episode deltas are integrated with blackboard-owned identity, evidence, deduplication, and index rebuild/update rules.
+
+22. Do not proceed past the world/blackboard phase until the planner can consume v3.1 blackboard queries directly without placeholder target synthesis.
+
+23. In the planner parity phase, upgrade these files next:
+
+* `src/v3_1/planning/belief_builder.py`
+* `src/v3_1/planning/candidate_generation.py`
+* `src/v3_1/planning/candidate_filters.py`
+* `src/v3_1/planning/candidate_scoring.py`
+* `src/v3_1/planning/reranking.py`
+* `src/v3_1/planning/decision.py`
+* `src/v3_1/planning/fallbacks.py`
+* `src/v3_1/planning/helper_modes.py`
+* `src/v3_1/planning/route_features.py`
+* `src/v3_1/planning/planner_service.py`
+
+24. For `belief_builder.py`, rebuild planner input state from blackboard and memory snapshots:
+
+* reachable targets
+* frontier targets
+* cooldown/exhaustion state
+* prior failures/retries
+* area/topology context
+* candidate-supporting consequence and trigger evidence
+
+25. For `candidate_generation.py`, replace direct skill rows with:
+
+* target-derived candidates
+* movement/frontier candidates
+* route-derived candidates
+* subgoal expansion where needed
+* recovery candidates
+
+26. For `candidate_filters.py`, implement real blocking:
+
+* cooldown blocking
+* exhaustion blocking
+* invalid-target suppression
+* unreachable/blocked filtering
+* neighborhood or repeated-failure suppression where supported by memory
+
+27. For `candidate_scoring.py`, replace simple confidence scoring with planner heuristics:
+
+* novelty
+* reachability
+* progress potential
+* retry penalties
+* cooldown/exhaustion penalties
+* POI utility
+* route risk/cost
+* consequence/trigger evidence bonuses or penalties
+
+28. For `reranking.py`, implement a real reranking pass over survivors using helper outputs and planner-specific tie-breaking, not a flat score bump.
+
+29. For `decision.py`, implement final decision packaging with selected plan, selected candidate, selected skill/action payload, fallback set, and planner stats.
+
+30. For `fallbacks.py`, replace noop-only fallback with structured fallback selection from remaining valid candidate classes.
+
+31. For `helper_modes.py`, implement the actual helper modes required by the design:
+
+* candidate expansion
+* route analysis
+* score feature computation
+* hypothesis proposal
+* pruning suggestion
+
+32. For `route_features.py`, implement route cost/risk/progress features that can be consumed by scoring and reranking.
+
+33. For `planner_service.py`, keep final decision centralized but upgrade it to execute the full native planner flow:
+
+* belief build
+* candidate generation
+* filtering
+* scoring
+* reranking
+* fallback selection
+* final decision
+
+34. Do not proceed past the planner phase until the planner is selecting constrained, evidence-backed actions rather than generic highest-score placeholders.
+
+35. In the execution/orchestrator parity phase, upgrade these files next:
+
+* `src/v3_1/execution/env_factory.py`
+* `src/v3_1/execution/outcomes.py`
+* `src/v3_1/execution/option_execution.py`
+* `src/v3_1/execution/route_execution.py`
+* `src/v3_1/execution/env_worker.py`
+* `src/v3_1/execution/executor_service.py`
+* `src/v3_1/runtime/orchestrator.py`
+
+36. For `env_factory.py`, implement a standardized environment adapter layer so v3.1 workers receive normalized env interactions and metadata.
+
+37. For `option_execution.py`, replace action passthrough with symbolic directed execution semantics for planner-selected options/skills.
+
+38. For `route_execution.py`, implement actual directed routing behavior using planner-selected targets and route information.
+
+39. For `outcomes.py`, replace generic reward/done summaries with richer execution outcomes:
+
+* progress
+* blocked/stalled/noop detection
+* route success/failure
+* consequence-ready execution summaries
+
+40. For `env_worker.py`, replace generic step loops with:
+
+* real probe episode policy
+* directed execution handling
+* persistent worker-owned env state
+* correct typed outputs for both probe and directed runs
+
+41. For `executor_service.py`, keep request construction but extend it so execution requests carry the full directed-execution information needed by env workers.
+
+42. For `orchestrator.py`, replace the simplified loop with the full native stage order and session control:
+
+* probe dispatch
+* analysis dispatch
+* blackboard merge
+* memory reconcile
+* planning context creation
+* helper dispatch
+* final plan request
+* directed execution
+* directed analysis
+* directed merge
+* directed reconcile
+* persistence
+* repeat with real stop logic, budgets, and retry handling
+
+43. Do not begin real Ray actorization until all four semantic phases above are complete and working in-process with native v3.1 state.
+
+44. After semantic parity is complete, implement Ray-native runtime behavior in this order:
+
+* `src/v3_1/runtime/bootstrap.py`
+* `src/v3_1/agents/env_worker_agent.py`
+* `src/v3_1/agents/analysis_worker.py`
+* `src/v3_1/agents/blackboard_agent.py`
+* `src/v3_1/agents/memory_agent.py`
+* `src/v3_1/agents/planner_agent.py`
+* `src/v3_1/agents/storage_agent.py`
+* `src/v3_1/agents/planning_helper_worker.py`
+* `src/v3_1/agents/ranker_agent.py`
+
+45. In `bootstrap.py`, replace local native service construction with real Ray init, actor creation, worker pools, resource configuration, and placement policy.
+
+46. Convert each agent file from thin ownership classes into real Ray actors/workers with native v3.1 state, message handling, and lifecycle.
+
+47. Keep `snapshot_registry.py`, `task_registry.py`, and `invalidation.py`, but upgrade them only after actorization so they support cross-actor snapshot handles, task tracking, and invalidation at the correct granularity.
+
+48. Leave storage, learning, visualization, and config as secondary layers until the four semantic phases and Ray actorization are complete; only extend them as required to support the core solver.
+
+49. Validate completion phase by phase. Do not start the next phase until the current phase is functionally usable by the next one.
+
+50. Final execution order for the recovery plan is:
+
+* analysis parity
+* world/blackboard parity
+* planner parity
+* execution/orchestrator parity
+* Ray actorization
+* storage/config/learning refinement
+* visualization/report refinement
+

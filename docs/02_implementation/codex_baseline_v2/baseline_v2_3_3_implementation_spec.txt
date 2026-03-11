@@ -1,0 +1,141 @@
+BASELINE V2.3.3 IMPLEMENTATION SPEC
+
+Version: v2.3.3
+Goal: Add abstract visual generalization for object/event matching and cross-area re-identification.
+
+1. FILES TO ADD
+
+Add:
+- vision/object_crop_encoder.py
+- vision/event_crop_encoder.py
+- vision/reid_matcher.py
+- vision/prototype_memory.py
+- vision/training_pairs.py
+- shared/vision_records.py
+- cli/build_visual_prototypes.py
+
+2. NEW SCHEMAS
+
+2.1 ObjectEmbeddingRecordV1
+Fields:
+- schema_version: literal "v2.3.3"
+- embedding_id
+- object_id
+- area_id
+- source_frame_ref
+- embedding_path
+- structured_signature_ref
+- confidence
+
+2.2 EventEmbeddingRecordV1
+Fields:
+- schema_version
+- embedding_id
+- event_id
+- area_id
+- before_crop_ref
+- after_crop_ref
+- embedding_path
+- event_type
+- confidence
+
+2.3 PrototypeRecordV1
+Fields:
+- schema_version
+- prototype_id
+- prototype_type
+- centroid_embedding_path
+- member_embedding_ids: list[str]
+- support_count: int
+- confidence: float
+- candidate_role_labels: list[str]
+
+2.4 ReIDLinkRecordV1
+Fields:
+- schema_version
+- link_id
+- lhs_ref_id
+- rhs_ref_id
+- lhs_type
+- rhs_type
+- similarity_score
+- structural_score
+- combined_score
+- decision
+- evidence_refs: list[str]
+
+3. MODEL REQUIREMENTS
+
+Use a small CNN encoder.
+Do not add a large VLM.
+Do not integrate remote APIs.
+
+Initial implementation:
+- one encoder for object crops
+- one encoder for event before/after crops, or one shared encoder with a deterministic merge function
+- output fixed-size embeddings to local files
+
+4. TRAINING PAIRS
+
+Implement vision/training_pairs.py.
+
+Generate weak/self-supervised pairs:
+- same tracked object across adjacent frames -> positive
+- same event type from repeated verified mechanic executions -> positive
+- unrelated objects from distant areas -> negative
+- unrelated events of different type -> negative
+
+Persist pair metadata for optional offline training.
+
+5. PROTOTYPE MEMORY
+
+Implement vision/prototype_memory.py.
+
+Responsibilities:
+- cluster embeddings
+- create/update prototype records
+- expose nearest prototypes for object/event records
+- store candidate functional roles if structural evidence supports them
+
+Persist:
+- object_embeddings.json
+- event_embeddings.json
+- prototypes.json
+- reid_links.json
+
+6. REID MATCHER
+
+Implement vision/reid_matcher.py.
+
+Combined score must include:
+- embedding similarity
+- structured feature similarity
+- area/context compatibility
+- causal/mechanic role compatibility
+
+Do not use embedding similarity alone.
+
+7. WORLD MODEL INTEGRATION
+
+Use ReIDLinkRecordV1 to improve:
+- POI merging across areas
+- object class grouping
+- mechanic hypothesis matching
+- event matching across rooms
+
+Do not replace the existing deterministic signatures. Add the embedding-based layer as additional evidence.
+
+8. TRAINING / INFERENCE BOUNDARY
+
+v2.3.3 must support:
+- pure inference with pretrained local weights if present
+- fallback mode where embeddings are omitted and system remains functional
+- offline dataset generation for later training
+
+9. ACCEPTANCE TARGET
+
+After v2.3.3 the system must:
+- produce object embeddings and event embeddings
+- build prototype memory
+- produce re-identification links
+- use these links as additional evidence in cross-area object/event matching

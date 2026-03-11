@@ -20,14 +20,32 @@ class SessionManagerV2:
     def __init__(self, storage_root: str) -> None:
         self.storage = StoragePathsV2(storage_root)
 
+    def _reset_game_root(self, game_root: str) -> None:
+        preserved_files = {
+            "option_ranker_weights.json",
+            "mechanic_ranker_weights.json",
+            "ranking_samples.json",
+        }
+        for entry in os.listdir(game_root):
+            path = os.path.join(game_root, entry)
+            if entry in preserved_files:
+                continue
+            if os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+                continue
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+
     def init_or_resume(self, game_id: str, resume_if_exists: bool = True) -> SessionStateV2:
         game_root = self.storage.game_root(game_id)
         if not os.path.exists(game_root):
             os.makedirs(game_root, exist_ok=True)
             return SessionStateV2(game_id=game_id, round_id=0, storage_root=self.storage.root)
         if not resume_if_exists:
-            shutil.rmtree(game_root, ignore_errors=True)
             os.makedirs(game_root, exist_ok=True)
+            self._reset_game_root(game_root)
             return SessionStateV2(game_id=game_id, round_id=0, storage_root=self.storage.root)
         # resume from latest round
         rounds = [d for d in os.listdir(game_root) if d.startswith("round_")]

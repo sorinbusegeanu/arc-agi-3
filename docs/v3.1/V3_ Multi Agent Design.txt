@@ -1,0 +1,308 @@
+V2.5 Multi-Agent ARC-AGI-3 Design with Ray
+Objective
+
+Turn the current v2.5 symbolic round-based solver into a simple multi-agent runtime without replacing its logic.
+
+Keep:
+
+trajectory collection
+
+episode analysis
+
+cumulative blackboard
+
+skill induction
+
+planner
+
+executor
+
+plan/skill memory
+
+ranker artifacts
+
+file/SQLite persistence
+
+Change:
+
+move from one mostly serial coordinator with local multiprocessing to Ray-based autonomous agents with shared services
+
+ewritten component summaries
+1. Coordinator
+
+Owns the game loop. It starts rounds, dispatches work, gathers results, triggers replanning, and enforces budgets and ordering. In v2.5 this is mostly the round orchestrator; in the new system it becomes the central control actor. 
+
+v2.5_codex_implementation
+
+2. Environment Workers
+
+Autonomous workers that each own a live environment instance and execute either exploration episodes or planner-selected directed episodes. They are the only components that interact with the game step loop directly. v2.5 already has episode collection and directed execution paths for this behavior.
+
+3. Episode Analysis Workers
+
+Parallel workers that transform raw episodes into enriched symbolic trajectories: objects, avatar hypotheses, POIs, motion, and area-related summaries. This is the perceptual preprocessing layer.
+
+4. Blackboard Service
+
+The single authoritative world model for one game. It merges analyzed trajectories into cumulative state: POIs, reachability, consequences, areas, triggers, causal links, and topology. This stays centralized because v2.5’s cumulative merge is one of the main serial invariants.
+
+5. Skill and Plan Memory Service
+
+Stores persistent tactical memory across rounds: skills, skill executions, retries, cooldowns, exhaustion, and plan-memory ledgers. This service keeps the planner stateful without mixing memory logic into the planner itself.
+
+6. Planner Service
+
+Builds belief state from the latest blackboard and memory, generates candidate skills, scores them, filters them, reranks them, and selects one final action plan. It remains the final decision authority.
+
+7. Planning Helper Agents
+
+Background speculative workers that do partial planning work on snapshots: candidate expansion, route precomputation, local scoring features, hypothesis proposals, and pruning suggestions. They do not commit state or choose the final plan. This is the safe way to parallelize planning.
+
+8. Ranker Service
+
+Maintains learned or reconstructed ranking state for options and mechanics and returns score features to the planner. In v2.5 it is lightweight and often fallback-based, so it should stay optional and separable. 
+
+v2.5_codex_implementation
+
+9. Storage Service
+
+Persists blackboard snapshots, plans, reports, skills, executions, rankings, and trajectory artifacts. It serializes writes so cross-file consistency does not depend on many workers writing independently.
+
+2. Description of each component
+Coordinator
+
+This is the top-level runtime brain. It does not analyze frames, reason about routes, or choose targets itself. Its job is orchestration: which workers run now, which snapshot version is current, when replanning happens, and when outputs are committed. It replaces the mostly synchronous v2.5 control flow with an actor-based controller while preserving the same round semantics.
+
+Environment Workers
+
+Each worker owns one env instance and stays alive. That avoids repeated process and env creation overhead. A worker can receive one of two task classes:
+
+exploratory rollout
+
+directed execution of a selected skill/instruction
+
+The worker returns a raw TrajectoryEpisodeV2 plus metadata. It does not update memory or blackboard. That separation is important.
+
+Episode Analysis Workers
+
+These are symbolic perception workers. They take raw episodes and produce enriched episodes with ObservationSummaryV2 and derived fields. This includes connected components, object extraction, background estimation, motion regions, avatar candidate scoring, POI mining, and area-id assignment. This is already a natural worker-pool stage in v2.5.
+
+Blackboard Service
+
+This service owns the cumulative state of the current game. It merges newly analyzed evidence into canonical state tables. Because v2.5 has many deduplication and cumulative merge rules, this should remain a single-writer service. It is the system’s source of truth, not a cache. All planning and memory updates consume snapshots from here.
+
+Skill and Plan Memory Service
+
+This service records what has already been tried, what failed, what is on cooldown, what clusters are exhausted, and which skill identities already exist. That allows the system to avoid repeating bad actions and to preserve same-round feedback. In v2.5 these rules are implicit across files and planner logic; separating them into one service makes them cleaner and safer.
+
+Planner Service
+
+The planner consumes:
+
+latest blackboard snapshot
+
+latest skill/plan memory snapshot
+
+optional ranking state
+
+It then performs the current v2.5 flow: belief build, candidate generation, plan node creation, scoring, hard blocking, reranking, and final selection. It should remain centralized because the current pipeline depends on exact ordering and finalized export invariants.
+
+Planning Helper Agents
+
+These are speculative planning workers. They operate on immutable snapshots and return proposals, not decisions. Examples:
+
+generate movement candidates from current reachable targets
+
+compute route feasibility or risk
+
+score novelty/retry/suppression features
+
+propose hidden-trigger or consequence hypotheses
+
+prune weak candidates early
+
+They allow overlap with execution and blackboard updates without violating central invariants.
+
+Ranker Service
+
+This service provides planner-side numeric support: learned scores, reconstructed scores, or suppression features. Since v2.5 often falls back to symbolic logic, this service should assist the planner rather than own planning. That keeps the system robust even when the learner is weak.
+
+Storage Service
+
+This service owns durable state transitions. It writes run-scoped and round-scoped artifacts in one place. In v2.5, file consistency depends on careful coordinator ordering; this service makes that explicit. It should also gradually move hot internal state to SQLite or another DB while still exporting the existing JSON views for compatibility.
+
+3. How they integrate
+Control flow
+
+Coordinator requests exploratory or directed work from Environment Workers.
+
+Workers return raw episodes.
+
+Episode Analysis Workers enrich those episodes.
+
+Blackboard Service merges analyzed evidence into the cumulative world model.
+
+Skill and Plan Memory Service updates tactical memory using new execution outcomes.
+
+Planner Service reads the latest blackboard snapshot plus memory snapshot.
+
+Planning Helper Agents may already have prepared candidate expansions, route features, and scoring proposals on the same snapshot.
+
+Planner finalizes one selected plan.
+
+Coordinator dispatches that plan to an Environment Worker for execution.
+
+Storage Service persists artifacts for the round/pass.
+
+Integration rules
+Rule 1
+
+Only the Blackboard Service can commit world-state updates.
+Reason: cumulative analysis is a serial invariant in v2.5.
+
+Rule 2
+
+Only the Planner Service can select the final plan.
+Reason: v2.5 requires final selection from finalized surviving nodes. 
+
+v2.5_codex_implementation
+
+Rule 3
+
+Only the Storage Service writes durable authoritative artifacts.
+Reason: cross-file consistency is already fragile in v2.5.
+
+Rule 4
+
+Planning helpers operate only on immutable snapshot versions.
+Reason: they are speculative workers, not owners of truth. 
+
+v2.5_codex_implementation
+
+Rule 5
+
+Environment workers never mutate blackboard or memory directly.
+Reason: execution should remain isolated from shared-state reconciliation. This preserves same-round correctness. 
+
+v2.5_codex_implementation
+
+4. How they should be built starting from v2.5
+Phase 1 — Wrap existing modules, do not redesign logic
+
+Build Ray actors around the current v2.5 modules:
+
+RoundCoordinatorActor wrapping current round orchestration logic
+
+EnvWorkerActor wrapping collection and directed execution paths
+
+EpisodeAnalysisPool wrapping analyst.py
+
+BlackboardActor wrapping cumulative analyze_trajectories(...)
+
+SkillMemoryActor wrapping skill library + plan memory reconciliation
+
+PlannerActor wrapping belief build + hierarchical_planner
+
+RankerActor wrapping ranking artifact state
+
+StorageActor wrapping file/SQLite persistence
+
+At this phase, keep the existing schemas and outputs unchanged.
+
+Phase 2 — Separate authoritative state from worker outputs
+
+Refactor the runtime so workers return:
+
+raw episodes
+
+analyzed episodes
+
+planning proposals
+
+execution outcomes
+
+And only services commit:
+
+blackboard merges
+
+memory updates
+
+finalized plans
+
+artifact writes
+
+This is the key architectural cleanup. It converts v2.5 from direct function-calling with shared files into a service-based model without changing the symbolic reasoning itself.
+
+Phase 3 — Add speculative planning helpers
+
+After the central services work, add background planning helpers for:
+
+candidate generation
+
+route precomputation
+
+score feature computation
+
+hidden-trigger / consequence proposal generation
+
+pruning suggestions
+
+Each helper receives (blackboard_version, memory_version, policy_version) and returns proposals tagged to that snapshot. The planner may use them only if still valid.
+
+Phase 4 — Reduce serialization and file pressure
+
+Move hot internal indexes to SQLite or a small DB:
+
+trajectory metadata
+
+candidate caches
+
+plan ledgers
+
+ranking samples
+
+snapshot registry
+
+Keep JSON exports as compatibility outputs, not as the main runtime bus. v2.5 already shows that artifact volume and repeated JSON serialization are bottlenecks.
+
+Phase 5 — Extend from one game to many games
+
+When stable, scale to many ARC-AGI-3 games by using:
+
+one Coordinator per game
+
+one Blackboard per game
+
+one Skill/Plan Memory service per game
+
+shared worker pools for environment and analysis
+
+optionally shared ranker/learner across games
+
+This preserves local reasoning while allowing shared learning later. 
+
+v2.5_codex_implementation
+
+Recommended final component set
+
+For the first real implementation, use exactly these:
+
+Coordinator
+
+Environment Workers
+
+Episode Analysis Workers
+
+Blackboard Service
+
+Skill and Plan Memory Service
+
+Planner Service
+
+Planning Helper Agents
+
+Ranker Service
+
+Storage Service
+
+That is the simplest clean multi-agent architecture that stays aligned with v2.5.

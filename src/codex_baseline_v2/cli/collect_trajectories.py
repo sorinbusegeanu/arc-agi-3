@@ -52,6 +52,11 @@ def main() -> None:
             max_steps_per_instruction=cfg.executor.max_steps,
             seed=cfg.controller.random_seed,
             keep_invalid_steps_for_debug=cfg.debug.keep_invalid_steps_for_debug,
+            write_raw_copy=bool(cfg.storage.keep_raw_env_payloads),
+            keep_observations_in_artifacts=bool(cfg.storage.keep_raw_frames),
+            keep_raw_info_in_artifacts=bool(cfg.storage.keep_raw_env_payloads),
+            keep_observation_summaries_in_artifacts=bool(cfg.storage.keep_raw_frames),
+            storage_backend=getattr(cfg.storage, "backend", "files"),
         ),
     )
     if args.workers > 1 and args.env_factory:

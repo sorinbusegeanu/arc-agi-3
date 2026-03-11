@@ -1,0 +1,966 @@
+BASELINE V2.1 COMPLETE IMPLEMENTATION SPEC
+
+Apply the changes below to the existing package at `src/codex_baseline_v2`.
+
+Global rules
+- Preserve the existing package layout.
+- Extend the current V2 implementation. Do not replace it with a new framework.
+- Keep all existing public CLI entry points working.
+- Keep all existing dataclasses and add fields or new dataclasses as needed; do not remove fields that current code may still read.
+- Use compact JSON only. Do not write JSON with indentation.
+- Every persisted record must include `schema_version`.
+- Prefer typed dataclasses over free-form dict payloads.
+- Do not change anything outside `src/codex_baseline_v2` except config templates that already live under that package.
+
+================================================================================
+1. Shared schema expansion
+================================================================================
+
+File: `src/codex_baseline_v2/shared/schemas.py`
+
+Add the following new dataclasses. Keep current dataclasses intact and extend them.
+
+1. `ActionSemanticsStatsV2`
+Fields:
+- `schema_version: str`
+- `game_id: str`
+- `action_id: int`
+- `sample_count: int`
+- `success_count: int`
+- `blocked_count: int`
+- `noop_count: int`
+- `interaction_like_count: int`
+- `transition_like_count: int`
+- `mean_dx: float`
+- `mean_dy: float`
+- `std_dx: float`
+- `std_dy: float`
+- `dominant_motion_class: str`
+- `confidence: float`
+- `last_updated_round: int`
+
+2. `ActionContextStatsV2`
+Fields:
+- `schema_version: str`
+- `game_id: str`
+- `action_id: int`
+- `context_key: str`
+- `sample_count: int`
+- `mean_dx: float`
+- `mean_dy: float`
+- `success_rate: float`
+- `blocked_rate: float`
+- `transition_rate: float`
+- `confidence: float`
+
+3. `AvatarTrackHypothesisV2`
+Fields:
+- `schema_version: str`
+- `game_id: str`
+- `track_id: str`
+- `status: str`
+- `bbox: BBox`
+- `centroid: Tuple[float, float]`
+- `predicted_centroid: Tuple[float, float]`
+- `velocity: Tuple[float, float]`
+- `appearance_signature_id: Optional[str]`
+- `shape_signature_id: Optional[str]`
+- `motion_signature_id: Optional[str]`
+- `posterior: float`
+- `support_count: int`
+- `missing_count: int`
+- `last_seen_episode_id: Optional[str]`
+- `last_seen_step_idx: Optional[int]`
+- `evidence_refs: List[str]`
+
+4. `AvatarAppearanceSignatureV2`
+Fields:
+- `schema_version: str`
+- `game_id: str`
+- `signature_id: str`
+- `palette: List[int]`
+- `bbox_width_range: Tuple[int, int]`
+- `bbox_height_range: Tuple[int, int]`
+- `aspect_ratio_mean: float`
+- `mask_area_mean: float`
+- `animation_variants: int`
+- `confidence: float`
+
+5. `NavigationEdgeV2`
+Fields:
+- `schema_version: str`
+- `game_id: str`
+- `edge_id: str`
+- `src_cell: Tuple[int, int]`
+- `dst_cell: Tuple[int, int]`
+- `action_id: Optional[int]`
+- `transition_type: str`
+- `success_count: int`
+- `blocked_count: int`
+- `uncertain_count: int`
+- `bidirectional_confidence: float`
+- `confidence: float`
+- `evidence_refs: List[str]`
+
+6. `NavigationStateCellV2`
+Fields:
+- `schema_version: str`
+- `game_id: str`
+- `cell: Tuple[int, int]`
+- `status: str`
+- `visit_count: int`
+- `blocked_count: int`
+- `last_seen_round: int`
+- `confidence: float`
+
+7. `TargetAccessProfileV2`
+Fields:
+- `schema_version: str`
+- `game_id: str`
+- `poi_id: str`
+- `contact_mode: str`
+- `access_cells: List[Tuple[int, int]]`
+- `blocked_sides: List[str]`
+- `preferred_sides: List[str]`
+- `stand_off_distance: int`
+- `confidence: float`
+
+8. `InterventionRecordV2`
+Fields:
+- `schema_version: str`
+- `game_id: str`
+- `round_id: int`
+- `instruction_id: str`
+- `target_poi_id: Optional[str]`
+- `target_area_id: Optional[str]`
+- `intended_contact_mode: str`
+- `start_episode_id: str`
+- `start_step_idx: int`
+- `contact_step_idx: Optional[int]`
+- `end_step_idx: int`
+- `route_edge_ids: List[str]`
+- `reached: bool`
+- `contact: bool`
+- `blocked: bool`
+- `progress_confidence: float`
+- `effect_event_ids: List[str]`
+- `notes: List[str]`
+
+9. `EventRegionDeltaV2`
+Fields:
+- `schema_version: str`
+- `region_role: str`
+- `bbox: BBox`
+- `pixel_change_ratio: float`
+- `object_births: int`
+- `object_deaths: int`
+- `object_moves: int`
+- `object_state_changes: int`
+
+10. `ObjectStateDeltaV2`
+Fields:
+- `schema_version: str`
+- `game_id: str`
+- `event_id: str`
+- `pre_object_id: Optional[str]`
+- `post_object_id: Optional[str]`
+- `delta_type: str`
+- `pre_bbox: Optional[BBox]`
+- `post_bbox: Optional[BBox]`
+- `pre_palette: List[int]`
+- `post_palette: List[int]`
+- `confidence: float`
+
+11. `ChangeEventV2`
+Fields:
+- `schema_version: str`
+- `game_id: str`
+- `event_id: str`
+- `episode_id: str`
+- `start_step_idx: int`
+- `peak_step_idx: int`
+- `end_step_idx: int`
+- `event_type: str`
+- `locality: str`
+- `trigger_context: str`
+- `trigger_instruction_id: Optional[str]`
+- `trigger_target_poi_id: Optional[str]`
+- `trigger_area_id: Optional[str]`
+- `pre_area_id: Optional[str]`
+- `post_area_id: Optional[str]`
+- `region_deltas: List[EventRegionDeltaV2]`
+- `object_state_deltas: List[ObjectStateDeltaV2]`
+- `reward_delta: Optional[float]`
+- `terminal_flag_changed: bool`
+- `confidence: float`
+
+12. `CauseEffectLinkV2`
+Fields:
+- `schema_version: str`
+- `game_id: str`
+- `link_id: str`
+- `intervention_id: str`
+- `cause_type: str`
+- `cause_poi_id: Optional[str]`
+- `effect_event_id: str`
+- `delay_steps: int`
+- `spatial_relation: str`
+- `same_area: bool`
+- `repeatability_count: int`
+- `contradiction_count: int`
+- `confidence: float`
+- `competing_link_ids: List[str]`
+
+13. `AreaStateV2`
+Fields:
+- `schema_version: str`
+- `game_id: str`
+- `area_id: str`
+- `canonical_observation_hash: Optional[str]`
+- `palette: List[int]`
+- `width: int`
+- `height: int`
+- `entry_cells: List[Tuple[int, int]]`
+- `exit_cells: List[Tuple[int, int]]`
+- `stable_object_ids: List[str]`
+- `dynamic_object_ids: List[str]`
+- `topology_signature_id: Optional[str]`
+- `visit_count: int`
+- `confidence: float`
+
+14. `TopologyDeltaV2`
+Fields:
+- `schema_version: str`
+- `game_id: str`
+- `delta_id: str`
+- `event_id: str`
+- `pre_area_id: Optional[str]`
+- `post_area_id: Optional[str]`
+- `new_edges: List[Tuple[Tuple[int, int], Tuple[int, int]]]`
+- `removed_edges: List[Tuple[Tuple[int, int], Tuple[int, int]]]`
+- `opened_chokepoints: List[Tuple[int, int]]`
+- `closed_chokepoints: List[Tuple[int, int]]`
+- `connectivity_changed: bool`
+- `path_length_delta: Optional[float]`
+- `confidence: float`
+
+15. `MechanicHypothesisV2`
+Fields:
+- `schema_version: str`
+- `game_id: str`
+- `hypothesis_id: str`
+- `trigger_type: str`
+- `trigger_object_class: Optional[str]`
+- `trigger_contact_mode: Optional[str]`
+- `effect_type: str`
+- `effect_object_class: Optional[str]`
+- `effect_locality: str`
+- `topology_effect_type: Optional[str]`
+- `delay_min: int`
+- `delay_max: int`
+- `same_area_supported: bool`
+- `cross_area_supported: bool`
+- `support_event_ids: List[str]`
+- `falsification_event_ids: List[str]`
+- `confidence: float`
+- `status: str`
+
+16. `EvidenceLedgerEntryV2`
+Fields:
+- `schema_version: str`
+- `game_id: str`
+- `entry_id: str`
+- `subject_type: str`
+- `subject_id: str`
+- `claim_type: str`
+- `positive_refs: List[str]`
+- `negative_refs: List[str]`
+- `positive_count: int`
+- `negative_count: int`
+- `confidence: float`
+- `last_updated_round: int`
+
+17. `DecisionRecordV2`
+Fields:
+- `schema_version: str`
+- `game_id: str`
+- `round_id: int`
+- `instruction_id: str`
+- `selected_target_poi_id: Optional[str]`
+- `selected_area_id: Optional[str]`
+- `mode: str`
+- `rationale_codes: List[str]`
+- `ranked_candidate_ids: List[str]`
+- `outcome_summary: Optional[str]`
+- `progress_score: Optional[float]`
+- `target_invalidated: bool`
+
+18. `ContrastCaseV2`
+Fields:
+- `schema_version: str`
+- `game_id: str`
+- `contrast_id: str`
+- `intervention_id: str`
+- `contrast_type: str`
+- `matched_target_poi_id: Optional[str]`
+- `matched_area_id: Optional[str]`
+- `event_ids: List[str]`
+- `supports_causality: bool`
+- `confidence: float`
+
+Extend existing dataclasses as follows.
+
+`CandidatePOIV2`
+Add fields:
+- `area_id: Optional[str] = None`
+- `stable_entity_id: Optional[str] = None`
+- `access_profile_id: Optional[str] = None`
+- `last_interaction_round: Optional[int] = None`
+- `interaction_count: int = 0`
+- `linked_event_ids: List[str] = field(default_factory=list)`
+- `linked_mechanic_hypothesis_ids: List[str] = field(default_factory=list)`
+
+`ReachabilityRecordV2`
+Add fields:
+- `area_id: Optional[str] = None`
+- `route_edge_ids: List[str] = field(default_factory=list)`
+- `access_profile_id: Optional[str] = None`
+- `progress_confidence: float = 0.0`
+
+`ConsequenceRecordV2`
+Add fields:
+- `event_ids: List[str] = field(default_factory=list)`
+- `cause_effect_link_ids: List[str] = field(default_factory=list)`
+- `area_id: Optional[str] = None`
+- `topology_delta_id: Optional[str] = None`
+
+`ObservationSummaryV2`
+Add typed fields:
+- `area_id: Optional[str] = None`
+- `avatar_track_hypotheses: List[AvatarTrackHypothesisV2] = field(default_factory=list)`
+- `state_signature_id: Optional[str] = None`
+- `navigation_context_key: Optional[str] = None`
+
+`TrajectoryStepV2`
+Add fields:
+- `area_id: Optional[str] = None`
+- `avatar_track_id: Optional[str] = None`
+- `predicted_avatar_centroid: Optional[Tuple[float, float]] = None`
+- `actual_avatar_centroid: Optional[Tuple[float, float]] = None`
+- `event_ids: List[str] = field(default_factory=list)`
+- `intervention_id: Optional[str] = None`
+- `action_context_key: Optional[str] = None`
+
+`GameHypothesisStateV2`
+Add fields:
+- `action_semantics_table: List[ActionSemanticsStatsV2] = field(default_factory=list)`
+- `action_context_table: List[ActionContextStatsV2] = field(default_factory=list)`
+- `avatar_track_table: List[AvatarTrackHypothesisV2] = field(default_factory=list)`
+- `target_access_table: List[TargetAccessProfileV2] = field(default_factory=list)`
+- `navigation_cells: List[NavigationStateCellV2] = field(default_factory=list)`
+- `navigation_edges: List[NavigationEdgeV2] = field(default_factory=list)`
+- `area_table: List[AreaStateV2] = field(default_factory=list)`
+- `event_table: List[ChangeEventV2] = field(default_factory=list)`
+- `intervention_table: List[InterventionRecordV2] = field(default_factory=list)`
+- `cause_effect_table: List[CauseEffectLinkV2] = field(default_factory=list)`
+- `topology_delta_table: List[TopologyDeltaV2] = field(default_factory=list)`
+- `mechanic_hypotheses: List[MechanicHypothesisV2] = field(default_factory=list)`
+- `evidence_ledger: List[EvidenceLedgerEntryV2] = field(default_factory=list)`
+- `decision_history: List[DecisionRecordV2] = field(default_factory=list)`
+- `contrast_cases: List[ContrastCaseV2] = field(default_factory=list)`
+
+`BlackboardStateV2`
+If it currently aliases or wraps `GameHypothesisStateV2`, extend it with the same new persistent tables and keep backward compatibility in `to_dict()` / `from_dict()`.
+
+Add `from_dict()` constructors for every persisted dataclass that is read back from memory.
+Do not change anything else.
+
+================================================================================
+2. Config expansion
+================================================================================
+
+File: `src/codex_baseline_v2/shared/config.py`
+
+Add the following config groups.
+
+1. `ActionSemanticsConfigV2`
+Fields:
+- `min_samples_per_action: int = 6`
+- `min_samples_per_context: int = 3`
+- `blocked_motion_threshold: float = 0.5`
+- `noop_motion_threshold: float = 0.1`
+- `interaction_change_threshold: float = 0.15`
+- `transition_change_threshold: float = 0.6`
+- `smoothing: float = 1.0`
+
+2. `AvatarTrackingConfigV2`
+Fields:
+- `max_hypotheses: int = 5`
+- `prediction_weight: float = 1.5`
+- `appearance_weight: float = 1.0`
+- `motion_weight: float = 1.2`
+- `route_consistency_weight: float = 1.0`
+- `missing_tolerance: int = 3`
+- `track_confirm_threshold: float = 0.7`
+- `track_prune_threshold: float = 0.2`
+
+3. `EventExtractionConfigV2`
+Fields:
+- `min_region_change_ratio: float = 0.08`
+- `local_radius: int = 3`
+- `remote_min_distance: int = 6`
+- `transition_frame_change_ratio: float = 0.55`
+- `event_merge_gap: int = 2`
+- `delayed_window_steps: int = 6`
+- `max_post_contact_window: int = 10`
+
+4. `CausalityConfigV2`
+Fields:
+- `immediate_window_steps: int = 2`
+- `delayed_window_steps: int = 6`
+- `cross_area_window_steps: int = 12`
+- `same_area_bonus: float = 0.2`
+- `repeatability_bonus: float = 0.3`
+- `contradiction_penalty: float = 0.5`
+- `min_link_confidence: float = 0.45`
+
+5. `AreaModelConfigV2`
+Fields:
+- `area_match_iou_threshold: float = 0.5`
+- `area_palette_overlap_threshold: float = 0.7`
+- `topology_similarity_threshold: float = 0.6`
+- `new_area_change_threshold: float = 0.5`
+
+6. `MechanicInductionConfigV2`
+Fields:
+- `min_support_events: int = 2`
+- `min_cross_area_support_events: int = 2`
+- `mechanic_match_threshold: float = 0.65`
+- `falsification_penalty: float = 0.4`
+- `promotion_threshold: float = 0.75`
+
+7. `MemoryConfigV2`
+Add fields:
+- `persist_round_archives: bool = True`
+- `persist_world_model: bool = True`
+- `persist_interventions: bool = True`
+- `persist_events: bool = True`
+- `persist_navigation_graph: bool = True`
+
+8. `RoutingConfigV2`
+Add fields:
+- `use_action_semantics: bool = True`
+- `route_replan_every_step: bool = True`
+- `target_access_bias: float = 1.0`
+- `blocked_edge_penalty: float = 2.0`
+- `unknown_edge_penalty: float = 0.5`
+- `transition_edge_penalty: float = 1.0`
+
+9. `ExecutorConfigV2`
+Add fields:
+- `contact_hold_steps: int = 2`
+- `relocalize_every_step: bool = True`
+- `post_contact_observation_steps: int = 6`
+- `max_local_probe_steps: int = 5`
+
+10. `TargetScoringConfigV2`
+Add fields:
+- `accessibility_weight: float = 1.0`
+- `stale_route_penalty: float = 0.4`
+- `event_novelty_weight: float = 1.0`
+- `cross_area_mechanic_weight: float = 0.8`
+
+11. `DebugConfigV2`
+Add fields:
+- `export_action_semantics: bool = False`
+- `export_avatar_tracks: bool = False`
+- `export_event_table: bool = False`
+- `export_causal_links: bool = False`
+- `export_area_table: bool = False`
+- `export_mechanic_hypotheses: bool = False`
+
+Extend `V2Config` and `load_config()` to include all new groups.
+Update `v2_config_template.json` and `v2_config_01.json` with the new sections and default values.
+Do not change anything else.
+
+================================================================================
+3. New analysis modules
+================================================================================
+
+Create the following new files.
+
+1. `src/codex_baseline_v2/trajectory_analysis/action_semantics.py`
+Implement:
+- `infer_action_semantics_from_episodes(episodes, cfg, existing_table=None, existing_context_table=None) -> tuple[list[ActionSemanticsStatsV2], list[ActionContextStatsV2]]`
+- Build per-action motion statistics from step-to-step avatar displacement.
+- Build context-conditioned stats keyed by a compact `context_key` derived from local occupancy pattern, area_id, and target proximity bucket.
+- Classify actions into `move_like`, `blocked_like`, `noop_like`, `interaction_like`, `transition_like`, `ambiguous`.
+- Use only observed transitions. Do not invent semantics for unseen actions.
+
+2. `src/codex_baseline_v2/trajectory_analysis/avatar_tracking.py`
+Implement:
+- `update_avatar_tracks_from_observation_summaries(...) -> tuple[list[AvatarTrackHypothesisV2], list[AvatarAppearanceSignatureV2]]`
+- `relocalize_avatar_live(...) -> tuple[Optional[AvatarTrackHypothesisV2], list[AvatarTrackHypothesisV2]]`
+- Maintain multi-hypothesis tracks across steps and episodes.
+- Use action-conditioned predicted position, appearance similarity, motion-region overlap, and route consistency.
+- Keep multiple hypotheses until confidence separates them.
+
+3. `src/codex_baseline_v2/trajectory_analysis/navigation_graph.py`
+Implement:
+- `build_navigation_graph_from_episodes(...) -> tuple[list[NavigationStateCellV2], list[NavigationEdgeV2]]`
+- `merge_navigation_graph(existing_cells, existing_edges, new_cells, new_edges) -> tuple[...]`
+- Build cells and directed edges from confirmed avatar motion.
+- Record success, blocked, uncertain, and transition-like edges.
+
+4. `src/codex_baseline_v2/trajectory_analysis/target_access.py`
+Implement:
+- `infer_target_access_profiles(pois, navigation_cells, navigation_edges, avatar_tracks, cfg) -> list[TargetAccessProfileV2]`
+- Infer which adjacent cells are plausible approach/contact positions.
+- Distinguish `overlap_contact`, `adjacent_contact`, `stand_on`, `proximity_only`, `unknown`.
+
+5. `src/codex_baseline_v2/trajectory_analysis/event_extraction.py`
+Implement:
+- `extract_change_events_from_episodes(episodes, cfg, area_table, avatar_tracks, prior_events=None) -> list[ChangeEventV2]`
+- Group step-level changes into event envelopes.
+- Produce `EventRegionDeltaV2` and `ObjectStateDeltaV2` entries.
+- Classify event locality as `local`, `remote_same_area`, `cross_area_transition`, `global_same_area`, `hud_only`, `unknown`.
+- Classify event type as `object_state_change`, `movement_change`, `transition`, `reward_like`, `terminal_like`, `mixed`.
+
+6. `src/codex_baseline_v2/trajectory_analysis/area_model.py`
+Implement:
+- `infer_areas_from_episodes(...) -> list[AreaStateV2]`
+- `assign_area_id_to_summary(...) -> Optional[str]`
+- `merge_area_table(existing_areas, new_areas) -> list[AreaStateV2]`
+- Detect and merge stable room/area identities using observation signature, palette overlap, stable object sets, and topology similarity.
+
+7. `src/codex_baseline_v2/trajectory_analysis/topology_deltas.py`
+Implement:
+- `infer_topology_deltas(events, navigation_before, navigation_after, areas, cfg) -> list[TopologyDeltaV2]`
+- Represent path-opening/path-closing consequences.
+
+8. `src/codex_baseline_v2/trajectory_analysis/interventions.py`
+Implement:
+- `build_intervention_records(execution_episodes, executor_outcomes, cfg) -> list[InterventionRecordV2]`
+- Build one intervention per instructed execution attempt.
+- Include route edges, contact time, post-contact window, and linked effect events.
+
+9. `src/codex_baseline_v2/trajectory_analysis/causal_links.py`
+Implement:
+- `link_interventions_to_events(interventions, events, contrast_cases, cfg) -> list[CauseEffectLinkV2]`
+- Score immediate, delayed, same-area, and cross-area effects.
+- Penalize contradictions and competing causes.
+
+10. `src/codex_baseline_v2/trajectory_analysis/contrast_cases.py`
+Implement:
+- `build_contrast_cases(interventions, events, history, cfg) -> list[ContrastCaseV2]`
+- Create explicit non-effect / mismatched-effect / no-contact comparisons.
+
+11. `src/codex_baseline_v2/trajectory_analysis/mechanic_induction.py`
+Implement:
+- `induce_mechanic_hypotheses(causal_links, events, pois, areas, cfg, existing=None) -> list[MechanicHypothesisV2]`
+- Group repeated trigger-effect relations into candidate mechanics.
+- Support both same-area and cross-area effects.
+
+12. `src/codex_baseline_v2/trajectory_analysis/evidence_ledger.py`
+Implement:
+- `update_evidence_ledger(existing_entries, new_subject_evidence, round_id) -> list[EvidenceLedgerEntryV2]`
+- Maintain positive and negative evidence counts per subject claim.
+
+Do not change anything else.
+
+================================================================================
+4. Shared utility support
+================================================================================
+
+File: `src/codex_baseline_v2/shared/utils.py`
+
+Add helper functions:
+- `bbox_distance(b1, b2) -> float`
+- `point_manhattan(a, b) -> int`
+- `point_neighbors4(pt) -> list[tuple[int, int]]`
+- `normalize_palette(values) -> list[int]`
+- `stable_tuple_key(value) -> tuple`
+- `compact_context_key(area_id, local_occupancy_code, target_bucket, action_id=None) -> str`
+- `merge_ranges(a, b) -> tuple[int, int]`
+
+Keep existing helpers intact.
+Do not change anything else.
+
+================================================================================
+5. Analyst changes
+================================================================================
+
+Files:
+- `src/codex_baseline_v2/analyst/frame_analyst.py`
+- `src/codex_baseline_v2/analyst/poi_miner.py`
+- `src/codex_baseline_v2/analyst/analyst.py`
+
+Implement the following.
+
+1. Frame summaries must assign `area_id` whenever possible.
+2. Frame summaries must emit `navigation_context_key`.
+3. Avatar candidates must remain, but the analyst must also call the new tracking layer and store `avatar_track_hypotheses` in each `ObservationSummaryV2`.
+4. POI mining must create stable entity grouping candidates, not only raw bbox POIs.
+5. POI mining must set `stable_entity_id` when an object can be linked across steps/episodes.
+6. POI mining must set `access_profile_id` only after the trajectory analysis phase has inferred an access profile. Leave it `None` at first-pass analyst time.
+7. HUD-likely objects must remain in summaries for debugging, but should be marked via rejection or demotion reasons rather than silently discarded.
+8. `analyze_episodes(...)` must return summaries that already contain:
+- `area_id`
+- `avatar_track_hypotheses`
+- `state_signature_id`
+- `navigation_context_key`
+
+Do not change anything else.
+
+================================================================================
+6. Trajectory analyzer rewrite
+================================================================================
+
+File: `src/codex_baseline_v2/trajectory_analysis/analyzer.py`
+
+Replace the current shallow aggregation with a cumulative world-model update pipeline.
+
+Implement this exact high-level flow inside `analyze_trajectories(...)`.
+
+1. Accept an additional optional argument:
+- `prior_blackboard: Optional[BlackboardStateV2] = None`
+
+2. Keep current signature compatibility by making the new argument optional.
+
+3. Pipeline order:
+- gather summaries from episodes
+- merge or infer area table
+- update avatar track table and appearance signatures
+- infer action semantics tables
+- build or merge navigation graph
+- merge POIs across time using stable entity ids and IoU fallback, not exact bbox keys only
+- infer target access profiles
+- compute reachability using navigation graph plus access profiles
+- extract change events from the episodes
+- build intervention records for execution episodes in the batch
+- build contrast cases
+- infer cause-effect links
+- infer topology deltas
+- induce mechanic hypotheses
+- update evidence ledger
+- merge prior and new decision history
+- produce one cumulative `BlackboardStateV2`
+
+4. Remove the current synthetic consequence creation based only on active-region overlap and fixed values.
+5. Consequences must now be derived from event extraction and intervention linkage.
+6. `traversable_map` may remain for backward compatibility, but it must be derived from the new navigation graph.
+7. If `prior_blackboard` exists, merge into it; do not discard prior persistent tables.
+8. The returned `BlackboardStateV2.round_id` must be the current round id, but all persistent tables must be cumulative.
+9. Populate `metadata` with compact typed summaries only. Do not store raw observation arrays inside metadata.
+
+Do not change anything else.
+
+================================================================================
+7. Reachability rewrite
+================================================================================
+
+File: `src/codex_baseline_v2/trajectory_analysis/reachability.py`
+
+Replace point-cloud-only reachability with graph-based reachability.
+
+Implement:
+- `classify_reachability(pois, avatar_tracks, navigation_cells, navigation_edges, access_profiles, cfg) -> list[ReachabilityRecordV2]`
+
+Requirements:
+- Use the highest-confidence live avatar track or confirmed historical track anchor as the route source.
+- Route to target access cells, not to the POI centroid.
+- Compute status as `reachable`, `uncertain`, `blocked`, `cross_area_only`, `unreachable`.
+- Populate `route_edge_ids`, `distance_estimate`, `access_profile_id`, `progress_confidence`, and `reason_code`.
+
+Do not change anything else.
+
+================================================================================
+8. Runtime round orchestration changes
+================================================================================
+
+File: `src/codex_baseline_v2/runtime/round_orchestrator.py`
+
+Implement the following.
+
+1. For round 0:
+- collect initial probe episodes
+- analyze them with `prior_blackboard=None`
+- save cumulative blackboard
+- append round report
+
+2. For round > 0:
+- load latest blackboard from memory
+- parse it back into `BlackboardStateV2`
+- do not replace it with `analyze_trajectories([])`
+- pass the loaded cumulative blackboard into controller selection
+- execute the chosen instruction online
+- analyze the execution episode with `prior_blackboard=loaded_blackboard`
+- save the updated cumulative blackboard
+- append a round report that includes decision, execution outcome, linked events, linked causal links, and any promoted mechanic hypotheses
+
+3. Every round report must also persist a `DecisionRecordV2` entry inside blackboard decision history.
+4. Preserve current smoke-test behavior.
+5. Preserve CLI compatibility.
+
+Do not change anything else.
+
+================================================================================
+9. Controller changes
+================================================================================
+
+File: `src/codex_baseline_v2/controller/controller.py`
+
+Update target selection to use the new representations.
+
+Implement:
+- score by reachability route confidence
+- score by target access confidence
+- score by event novelty
+- score by unresolved causal hypotheses
+- score by cross-area mechanic potential
+- penalize stale repeated failures from decision history
+- penalize blocked routes
+- penalize likely HUD-only targets
+
+When building `ControllerInstructionV2`:
+- set `target_region` and `target_geometry` from the chosen target access profile or POI bbox as fallback
+- include rationale codes in `ranked_alternatives` or new metadata-compatible fields if the schema already supports only strings
+- choose mode among `unguided_probe`, `poi_approach`, `poi_interaction`, `exploit`, `discriminating_probe`
+- `discriminating_probe` must be selected when there are competing mechanic hypotheses or competing cause-effect links with similar confidence
+
+Do not change anything else.
+
+================================================================================
+10. Route planner rewrite
+================================================================================
+
+File: `src/codex_baseline_v2/executor/route_planner.py`
+
+Replace the current incorrect distance logic.
+
+Implement:
+- `plan_route(blackboard, target_poi, current_cell, prev_distance=None) -> RoutePlanV2`
+
+Requirements:
+- Route over `navigation_edges`, not raw centroid distances.
+- Route to `TargetAccessProfileV2.access_cells` when available.
+- If multiple access cells exist, choose the minimum-cost one.
+- Edge cost must use blocked/unknown/transition penalties from config.
+- Return:
+  - `next_subgoal`
+  - `distance_estimate`
+  - `distance_prev`
+  - `distance_delta`
+  - `progress_valid`
+  - `progress_reason`
+  - `fallback_mode`
+  - `route_edge_ids`
+- `next_subgoal` must be the first real next cell on the chosen path, not the current cell.
+- If path is unavailable, choose a bounded local probe subgoal near the most promising access side.
+
+Do not change anything else.
+
+================================================================================
+11. Trajectory policy rewrite
+================================================================================
+
+File: `src/codex_baseline_v2/runtime/trajectory_policy.py`
+
+Implement real discrete target-conditioned action selection.
+
+Requirements:
+- Keep coordinate-action support unchanged when the environment natively supports it.
+- For discrete environments, use `ActionSemanticsStatsV2` and `ActionContextStatsV2` to score actions.
+- Given current avatar cell and desired next subgoal cell, rank discrete actions by expected displacement toward the subgoal.
+- Prefer actions with higher success rates in the current context.
+- Penalize actions with high blocked or noop rates in the current context.
+- If contact mode is `adjacent_contact`, allow staying adjacent and probing interaction-like actions.
+- If contact mode is `stand_on`, prefer movement that ends on the target access cell.
+- If contact mode is `proximity_only`, permit stop once inside the configured reach radius.
+- Preserve fallback random behavior only when action semantics confidence is too low.
+
+Do not change anything else.
+
+================================================================================
+12. Online executor rewrite
+================================================================================
+
+File: `src/codex_baseline_v2/executor/online_executor.py`
+
+Replace stale-avatar execution with live relocalized execution.
+
+Requirements:
+- At each step, infer or relocalize the avatar from the current observation using the avatar tracking module.
+- Replan every step when `cfg.relocalize_every_step` or `routing.route_replan_every_step` is enabled.
+- Build one `InterventionRecordV2` for the execution attempt.
+- Record predicted avatar centroid and actual avatar centroid in every `TrajectoryStepV2`.
+- Mark `reached` based on target access cell distance or contact mode, not only centroid distance.
+- Mark `contact` only when the access/contact condition is met.
+- After contact, continue for `post_contact_observation_steps` to capture delayed effects unless the episode ends.
+- Detect stalls from repeated blocked edges or repeated unchanged avatar positions.
+- Do not create fake consequence records with zeroed change magnitudes during execution.
+- The returned `ExecutorOutcomeV2` may still include a compact summary, but event derivation must happen in the analyzer.
+
+Do not change anything else.
+
+================================================================================
+13. Memory persistence rewrite
+================================================================================
+
+File: `src/codex_baseline_v2/memory/store.py`
+
+Implement typed cumulative persistence.
+
+Requirements:
+- `save_blackboard(...)` must persist the full cumulative blackboard.
+- `load_blackboard(...)` must return a parsed `BlackboardStateV2`, not a raw dict.
+- Add helper functions:
+  - `save_world_model_archive(...)`
+  - `save_event_table(...)`
+  - `save_navigation_graph(...)`
+  - `save_interventions(...)`
+  - `save_mechanic_hypotheses(...)`
+- Archives must be compact JSON.
+- Keep `blackboard_latest.json` as the main resume source.
+- Preserve atomic writes.
+
+Do not change anything else.
+
+================================================================================
+14. Shared scoring update
+================================================================================
+
+File: `src/codex_baseline_v2/shared/scoring.py`
+
+Extend scoring helpers to support:
+- route confidence
+- target access confidence
+- event novelty
+- contradiction penalty
+- cross-area mechanic opportunity
+- stale target penalty from decision history
+
+Keep existing score helpers intact where possible.
+Do not change anything else.
+
+================================================================================
+15. Adapters changes
+================================================================================
+
+Files:
+- `src/codex_baseline_v2/adapters/observation_adapter.py`
+- `src/codex_baseline_v2/adapters/action_adapter.py`
+- `src/codex_baseline_v2/adapters/rollout_adapter.py`
+- `src/codex_baseline_v2/adapters/trajectory_import.py`
+
+Implement the following.
+
+1. Ensure imported trajectory steps can carry the new optional fields without breaking existing import paths.
+2. Preserve unknown environment payloads only inside existing raw payload channels; do not spread free-form dicts into core typed records.
+3. Add any small adapter helpers needed to compute compact action context keys and area ids.
+4. Keep existing public function signatures compatible.
+
+Do not change anything else.
+
+================================================================================
+16. Metrics update
+================================================================================
+
+Files:
+- `src/codex_baseline_v2/shared/metrics.py`
+- `src/codex_baseline_v2/metrics/v2_metrics.py`
+
+Add metrics for:
+- action semantics coverage
+- avatar track confirmation rate
+- route success rate
+- contact success rate
+- post-contact event capture rate
+- same-area causal link count
+- cross-area causal link count
+- mechanic hypothesis promotion count
+- contradiction rate
+- discriminating probe usage rate
+
+Keep existing metrics intact.
+Do not change anything else.
+
+================================================================================
+17. CLI changes
+================================================================================
+
+Files:
+- `src/codex_baseline_v2/cli/run_autonomous_game.py`
+- `src/codex_baseline_v2/cli/analyze_trajectories.py`
+- `src/codex_baseline_v2/cli/collect_trajectories.py`
+- `src/codex_baseline_v2/cli/main.py`
+
+Implement the following.
+
+1. Preserve current command names.
+2. Add optional flags only if they map cleanly to existing config fields.
+3. `analyze_trajectories` must be able to read a prior saved blackboard and update it cumulatively.
+4. `run_autonomous_game` must persist the expanded artifacts when the new persistence flags are enabled.
+
+Do not change anything else.
+
+================================================================================
+18. Smoke tests update
+================================================================================
+
+File: `src/codex_baseline_v2/smoke_tests.py`
+
+Extend smoke coverage with tests for:
+- schema round-trip for all new dataclasses
+- cumulative blackboard load/save
+- route planner returns a real next step when a path exists
+- discrete instructed action uses action semantics when confidence is sufficient
+- live relocalization updates avatar track over multiple steps
+- event extraction produces at least one typed event from a synthetic local change sequence
+- intervention-to-event linking creates a delayed causal link
+- area model merges repeated room observations
+- mechanic induction promotes a repeated switch-to-door style pattern into a hypothesis
+
+Keep current smoke tests intact.
+Do not change anything else.
+
+================================================================================
+19. Backward compatibility requirements
+================================================================================
+
+Apply these rules across all touched files.
+
+- Existing imports used by current V2 modules must keep resolving.
+- Existing CLI behavior must remain usable with old config files; missing new config sections must fall back to defaults.
+- Existing serialized blackboards without the new fields must still load. Use safe defaults in `from_dict()`.
+- `traversable_map` must remain present in blackboard output for compatibility, even though the new navigation graph is the authoritative source.
+- Existing consequence tables must still serialize, but future entries must be derived from typed events and causal links.
+
+Do not change anything else.
+
+================================================================================
+20. Implementation order
+================================================================================
+
+Implement in this order.
+
+1. `shared/schemas.py`
+2. `shared/config.py`
+3. `shared/utils.py`
+4. new `trajectory_analysis/*` modules
+5. `analyst/*`
+6. `trajectory_analysis/analyzer.py`
+7. `trajectory_analysis/reachability.py`
+8. `executor/route_planner.py`
+9. `runtime/trajectory_policy.py`
+10. `executor/online_executor.py`
+11. `memory/store.py`
+12. `controller/controller.py`
+13. `runtime/round_orchestrator.py`
+14. adapters
+15. metrics
+16. cli
+17. smoke tests
+18. config templates
+
+Do not change anything else.

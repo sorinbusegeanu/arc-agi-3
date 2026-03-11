@@ -60,7 +60,7 @@ class EnvironmentSessionV2:
             obs = step_out.frame
             reward = 0.0
             state = getattr(step_out, "state", None)
-            done = bool(state) and str(state) != "NOT_FINISHED"
+            done = self._is_terminal_state(state)
             info = step_out.model_dump() if hasattr(step_out, "model_dump") else {"raw": step_out}
         else:
             raise RuntimeError("Environment step did not return (obs, reward, done, info)")
@@ -74,7 +74,14 @@ class EnvironmentSessionV2:
         )
 
     def available_actions(self) -> Optional[List[int]]:
-        return self._extract_available_actions(self._last_info)
+        avail = self._extract_available_actions(self._last_info)
+        if avail:
+            return avail
+        action_space = getattr(self._env, "action_space", None)
+        n = getattr(action_space, "n", None)
+        if isinstance(n, int) and n > 0:
+            return [int(i) for i in range(n)]
+        return [0, 1, 2, 3, 4, 5, 6, 7]
 
     def progress_status(self) -> Dict[str, Any]:
         return {
@@ -98,6 +105,18 @@ class EnvironmentSessionV2:
             if isinstance(grid, list):
                 return [[int(v) for v in row] for row in grid]
         return None
+
+    def _is_terminal_state(self, state: Any) -> bool:
+        if state is None:
+            return False
+        value = getattr(state, "value", state)
+        name = getattr(state, "name", None)
+        state_str = str(value if value is not None else state)
+        state_name = str(name) if name is not None else ""
+        normalized = {state_str.upper(), state_name.upper(), str(state).upper()}
+        if {"NOT_FINISHED", "GAMESTATE.NOT_FINISHED"} & normalized:
+            return False
+        return True
 
     def _normalize_info(self, info: Any) -> Dict[str, Any]:
         if not isinstance(info, dict):

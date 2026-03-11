@@ -1,0 +1,2 @@
+"""Native cumulative world model."""
+

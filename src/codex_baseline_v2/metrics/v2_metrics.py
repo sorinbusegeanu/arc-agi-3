@@ -26,6 +26,16 @@ class V2MetricsReport:
     traversable_map_coverage: float
     blackboard_change_rate: float
     resume_success_count: int
+    action_semantics_coverage: float = 0.0
+    avatar_track_confirmation_rate: float = 0.0
+    route_success_rate: float = 0.0
+    contact_success_rate: float = 0.0
+    post_contact_event_capture_rate: float = 0.0
+    same_area_causal_link_count: int = 0
+    cross_area_causal_link_count: int = 0
+    mechanic_hypothesis_promotion_count: int = 0
+    contradiction_rate: float = 0.0
+    discriminating_probe_usage_rate: float = 0.0
 
     def to_dict(self) -> Dict[str, float]:
         return {
@@ -49,4 +59,14 @@ class V2MetricsReport:
             "traversable_map_coverage": float(self.traversable_map_coverage),
             "blackboard_change_rate": float(self.blackboard_change_rate),
             "resume_success_count": int(self.resume_success_count),
+            "action_semantics_coverage": float(self.action_semantics_coverage),
+            "avatar_track_confirmation_rate": float(self.avatar_track_confirmation_rate),
+            "route_success_rate": float(self.route_success_rate),
+            "contact_success_rate": float(self.contact_success_rate),
+            "post_contact_event_capture_rate": float(self.post_contact_event_capture_rate),
+            "same_area_causal_link_count": int(self.same_area_causal_link_count),
+            "cross_area_causal_link_count": int(self.cross_area_causal_link_count),
+            "mechanic_hypothesis_promotion_count": int(self.mechanic_hypothesis_promotion_count),
+            "contradiction_rate": float(self.contradiction_rate),
+            "discriminating_probe_usage_rate": float(self.discriminating_probe_usage_rate),
         }

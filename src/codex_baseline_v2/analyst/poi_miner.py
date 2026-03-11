@@ -77,6 +77,8 @@ def mine_pois(
     for obj in obj_pool:
         if obj.color in bg_colors:
             continue
+        if obj.object_class == "hud_like":
+            continue
         rejection_reasons: List[str] = []
         demotion_reasons: List[str] = []
         base_confidence = 0.45
@@ -86,10 +88,6 @@ def mine_pois(
             rejection_reasons.append("border_elongated")
             base_confidence *= 0.4
             type_confidence *= 0.5
-        if obj.object_class == "hud_like":
-            rejection_reasons.append("likely_hud")
-            base_confidence *= 0.3
-            type_confidence *= 0.4
         if obj.area <= 2:
             rejection_reasons.append("tiny_fragment")
             base_confidence *= 0.4
@@ -118,12 +116,17 @@ def mine_pois(
             expected_information_gain=min(1.0, utility_confidence + 0.1),
             expected_interaction_type="unknown",
             evidence_count=1,
+            observation_count=1,
+            first_seen_episode=episode_id,
+            last_seen_episode=episode_id,
+            last_seen_step=step_idx,
             first_seen_ref=f"{episode_id}:{step_idx}",
             last_seen_ref=f"{episode_id}:{step_idx}",
             type_confidence=type_confidence,
             utility_confidence=utility_confidence,
             rejection_reasons=rejection_reasons,
             demotion_reasons=demotion_reasons,
+            stable_entity_id=f"entity:{obj.color}:{obj.bbox.x1}:{obj.bbox.y1}:{obj.bbox.x2}:{obj.bbox.y2}",
         )
         poi_list.append(candidate)
         emitted.append(candidate)
@@ -144,6 +147,10 @@ def mine_pois(
                     expected_information_gain=0.6,
                     expected_interaction_type="probe",
                     evidence_count=1,
+                    observation_count=1,
+                    first_seen_episode=episode_id,
+                    last_seen_episode=episode_id,
+                    last_seen_step=step_idx,
                     first_seen_ref=f"{episode_id}:{step_idx}",
                     last_seen_ref=f"{episode_id}:{step_idx}",
                     type_confidence=0.5,

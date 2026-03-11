@@ -1,0 +1,223 @@
+BASELINE V2.3.1 IMPLEMENTATION SPEC
+
+Version: v2.3.1
+Goal: Add symbolic long-horizon causal structure on top of v2.2.
+
+1. FILES TO ADD
+
+Add these modules under src/codex_baseline_v2:
+
+- shared/latent_state.py
+- shared/mechanic_graph.py
+- shared/dependency_graph.py
+- inference/latent_state_inducer.py
+- inference/mechanic_graph_builder.py
+- inference/dependency_updater.py
+- memory/graph_store.py
+- cli/analyze_causal_world.py
+
+Do not remove existing v2.2 modules.
+
+2. NEW SCHEMAS
+
+2.1 LatentStateHypothesisV1
+Fields:
+- schema_version: literal "v2.3.1"
+- latent_state_id: str
+- state_type: str
+- scope_type: str
+- scope_id: str
+- candidate_values: list[str]
+- current_value: str | None
+- confidence: float
+- support_event_ids: list[str]
+- contradiction_event_ids: list[str]
+- source_intervention_ids: list[str]
+- first_seen_step: int | None
+- last_updated_step: int | None
+- notes: str | None
+
+2.2 MechanicNodeV1
+Fields:
+- schema_version
+- node_id
+- node_type
+- ref_id
+- area_id
+- payload_ref
+
+2.3 MechanicEdgeV1
+Fields:
+- schema_version
+- edge_id
+- src_node_id
+- dst_node_id
+- relation_type
+- confidence
+- support_count
+- contradiction_count
+- min_delay_steps
+- max_delay_steps
+- context_tags: list[str]
+- verification_status: str
+
+2.4 MechanicGraphStateV1
+Fields:
+- schema_version
+- graph_id
+- nodes: list[MechanicNodeV1]
+- edges: list[MechanicEdgeV1]
+- updated_round
+- updated_step
+
+2.5 SubgoalNodeV1
+Fields:
+- schema_version
+- subgoal_id
+- subgoal_type
+- status
+- related_node_ids: list[str]
+- prerequisite_ids: list[str]
+- unlocks_ids: list[str]
+- confidence
+- area_id
+
+2.6 DependencyGraphStateV1
+Fields:
+- schema_version
+- subgoals: list[SubgoalNodeV1]
+- updated_round
+- updated_step
+
+3. BLACKBOARD EXTENSIONS
+
+Extend BlackboardStateV2 to include:
+- latent_states: list[LatentStateHypothesisV1]
+- mechanic_graph: MechanicGraphStateV1 | None
+- dependency_graph: DependencyGraphStateV1 | None
+
+Do not replace existing fields.
+Do not use free-form dicts for these new core fields.
+
+4. LATENT STATE INDUCTION
+
+Implement inference/latent_state_inducer.py.
+
+Input:
+- event table
+- intervention traces
+- trigger-zone table
+- causal edge candidates
+- area states
+
+Output:
+- updated latent-state hypotheses
+
+Rules:
+- propose a latent state only after repeated unexplained but structured effect patterns
+- maintain both support and contradiction evidence
+- support examples:
+  - same trigger repeatedly precedes remote topology change
+  - same area alternates between two stable configurations
+  - same route becomes reachable only after repeated prior intervention
+- contradiction examples:
+  - expected effect absent after predicted prerequisite
+  - topology unchanged after trigger that previously implied unlock
+
+Initial supported latent_state types:
+- binary_gate
+- area_phase
+- route_enabled
+- object_group_state
+- transition_enabled
+
+5. MECHANIC GRAPH BUILDER
+
+Implement inference/mechanic_graph_builder.py.
+
+Build a graph over:
+- trigger nodes
+- event nodes
+- latent-state nodes
+- topology-delta nodes
+- area-transition nodes
+- subgoal nodes
+
+Edge creation rules:
+- if intervention consistently precedes event within allowed delay window -> causes or precedes_consistently
+- if latent state best explains repeated conditional event -> enables or requires
+- if topology delta changes reachability to target -> unlocks candidate subgoal
+- if evidence is mixed -> ambiguous_with
+
+Do not collapse evidence into one scalar only.
+Store support_count and contradiction_count separately.
+
+6. DEPENDENCY UPDATER
+
+Implement inference/dependency_updater.py.
+
+Purpose:
+- derive subgoal nodes from mechanic graph and reachability deltas
+
+Subgoal types to support:
+- reach_area
+- contact_trigger
+- verify_hidden_trigger
+- enable_route
+- cross_transition
+- verify_mechanic
+- reach_goal_region
+
+Rules:
+- create prerequisite edges when one verified mechanic must occur before another subgoal becomes reachable
+- update subgoal status:
+  - unknown
+  - candidate
+  - blocked
+  - enabled
+  - verified
+  - falsified
+
+7. MEMORY STORAGE
+
+Implement memory/graph_store.py.
+
+Persist:
+- latent_states.json
+- mechanic_graph.json
+- dependency_graph.json
+
+Requirements:
+- compact JSON only
+- atomic write
+- load latest versions when session resumes
+- append evidence without losing prior refs
+- include schema_version on every stored top-level object
+
+8. ANALYSIS ENTRYPOINT
+
+Add cli/analyze_causal_world.py.
+
+This CLI:
+- loads latest blackboard and trajectories
+- runs latent_state_inducer
+- runs mechanic_graph_builder
+- runs dependency_updater
+- writes updated blackboard and graph store outputs
+
+9. INTEGRATION
+
+In the post-analysis pipeline:
+- run existing v2.2 analysis first
+- then run v2.3.1 graph/latent updates
+- then save blackboard
+
+Do not alter primitive action executor in v2.3.1.
+
+10. ACCEPTANCE TARGET
+
+After v2.3.1 the system must:
+- persist explicit latent-state hypotheses
+- persist a mechanic graph
+- persist a subgoal/dependency graph
+- represent multi-hop chains symbolically, even before planner support exists

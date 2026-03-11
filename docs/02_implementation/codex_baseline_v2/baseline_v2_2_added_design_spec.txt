@@ -1,0 +1,300 @@
+BASELINE V2.2 ADDED DESIGN SPEC
+
+Scope
+- This is an additive design delta on top of baseline v2.1.
+- Do not replace v2.1 structures. Extend them.
+- v2.2 addresses two explicit weaknesses:
+  1. multi-step causal chains
+  2. hidden triggers
+- Keep the existing V2 package boundary at `src/codex_baseline_v2`.
+- Keep all current CLI entry points and round flow intact.
+- Keep the system deterministic and symbolic. Do not add any NN or CNN in v2.2.
+
+Primary design change
+- v2.1 made tracks, events, interventions, causal links, area states, topology deltas, and mechanic hypotheses first-class objects.
+- v2.2 makes the system explicitly chain-aware and hidden-trigger-aware.
+- The main reasoning unit is no longer only `POI -> consequence`.
+- The main reasoning unit becomes:
+  `intervention -> event sequence -> causal edges -> trigger hypothesis -> mechanic hypothesis`.
+
+=====================================================================
+1. New conceptual objects
+=====================================================================
+
+1. EventGraph
+- A per-game directed temporal graph over event nodes.
+- Nodes are typed change/contact/transition events.
+- Edges represent candidate causal or enabling relations.
+- The graph must support repeated subsequence detection across episodes and rounds.
+- The graph must support competing explanations, not only a single best path.
+
+2. TriggerZone
+- A trigger candidate is not required to correspond to a visible object.
+- A trigger zone is a spatial hypothesis over one or more cells or a boundary crossing pattern.
+- Trigger zones support both visible and hidden triggers.
+- Trigger zones can be promoted from:
+  - visible POIs
+  - stable floor cells
+  - dwell regions
+  - edge/boundary crossings
+  - action-at-location patterns
+  - repeated path fragments
+  - unexplained but repeated pre-effect regions
+
+3. InterventionEpisode
+- Every controller-directed attempt becomes a first-class causal episode.
+- It records:
+  - target or trigger-zone intent
+  - route and local probes
+  - whether contact/entry/action-at-location occurred
+  - immediate, delayed, and post-transition event windows
+  - negative outcomes and null results
+- It is the atomic unit for both causal-chain induction and hidden-trigger induction.
+
+4. EventSequencePattern
+- A normalized sequence abstraction over repeated event subsequences.
+- It should ignore absolute coordinates when possible.
+- It should retain event types, locality classes, topology-delta classes, and delay buckets.
+- It is used to discover repeated multi-step mechanics.
+
+5. CausalChainHypothesis
+- A mechanic may be multi-hop rather than direct.
+- A chain hypothesis stores:
+  - trigger signature
+  - ordered intermediate event signatures
+  - final effect signature
+  - delay profile
+  - same-area / cross-area support
+  - contradiction evidence
+- It is distinct from a single direct cause-effect link.
+
+6. HiddenTriggerHypothesis
+- A hidden trigger hypothesis stores:
+  - trigger zone signature
+  - trigger condition type
+  - effect signature
+  - supporting interventions
+  - null or contradictory interventions
+  - confidence
+- It may or may not be attached to a visible POI.
+
+7. SpatialInterventionField
+- A persistent area-indexed field over cells/regions.
+- For each cell or region, store:
+  - visits
+  - dwell counts
+  - per-action counts
+  - crossings
+  - post-visit event rates
+  - post-action event rates
+  - hidden-trigger confidence
+- This field is required for discovering invisible tiles and threshold triggers.
+
+=====================================================================
+2. Representation goals
+=====================================================================
+
+A. Multi-step causal chains
+The system must represent:
+- trigger event
+- zero or more intermediate events
+- final effect event
+- temporal delays between adjacent events
+- same-area vs cross-area transitions within the chain
+- evidence for and against the full chain
+
+The system must not collapse a multi-step chain into a single coarse consequence label.
+
+B. Hidden triggers
+The system must represent:
+- spatial trigger candidate independent of visible object detection
+- condition type independent of object identity
+- repeated support for the same cell/region/edge pattern
+- negative evidence when the region is traversed without effect
+
+The system must not force every unexplained effect onto the nearest visible POI.
+
+=====================================================================
+3. Trigger condition taxonomy
+=====================================================================
+
+Each trigger hypothesis must use one condition type from this initial taxonomy:
+- `enter_region`
+- `stand_on_region`
+- `dwell_in_region`
+- `action_in_region`
+- `contact_visible_object`
+- `cross_boundary_edge`
+- `cross_region_sequence`
+- `contact_from_side`
+- `state_dependent_region_entry`
+- `unknown_hidden`
+
+These are not cosmetic labels. They directly control executor probe modes.
+
+=====================================================================
+4. Event taxonomy extension
+=====================================================================
+
+Extend event interpretation to support chain reasoning.
+
+Core event families:
+- `avatar_contact`
+- `region_entry`
+- `region_exit`
+- `boundary_crossing`
+- `object_appeared`
+- `object_disappeared`
+- `object_moved`
+- `object_state_changed`
+- `topology_opened`
+- `topology_closed`
+- `transition_started`
+- `transition_completed`
+- `terminal_changed`
+- `reward_changed`
+- `global_scene_changed`
+- `no_effect_probe`
+
+The system should allow multiple event nodes to be derived from one raw frame transition.
+
+=====================================================================
+5. Causal reasoning model
+=====================================================================
+
+1. Direct links remain valid
+- Keep direct `cause -> effect` links from v2.1.
+- They remain useful for simple mechanics.
+
+2. Add event-to-event links
+- Support event-to-event edges, not only intervention-to-event links.
+- Edge types:
+  - `direct_trigger`
+  - `enables`
+  - `disables`
+  - `precedes_consistently`
+  - `conditional_on_transition`
+  - `competes_with`
+  - `ambiguous`
+
+3. Add chain-level scoring
+- A causal chain hypothesis must score support over full subsequences.
+- Support must increase only when the same ordered pattern repeats.
+- Partial repeats should support only partial chain fragments.
+- Contradictory traces must reduce confidence.
+
+4. Add null-effect reasoning
+- An intervention that produces no relevant event is evidence.
+- Repeated null-effect probes on the same trigger condition reduce hidden-trigger confidence.
+
+=====================================================================
+6. Area and cross-area reasoning
+=====================================================================
+
+- v2.2 must support chains that remain in one area and chains that cross areas.
+- Every event and trigger-zone must attach to an `area_id` when known.
+- Boundary crossings and room transitions must be explicit events.
+- Cross-area chains must preserve:
+  - source area
+  - destination area
+  - delay through transition
+  - effect locality in destination area
+
+=====================================================================
+7. Controller implications
+=====================================================================
+
+The controller is no longer allowed to select only visible POIs.
+It must support four explicit intent classes:
+- `poi_interaction_probe`
+- `hidden_trigger_probe`
+- `causal_chain_verification`
+- `counterfactual_disambiguation_probe`
+
+Controller target ranking must consider:
+- unresolved hidden-trigger confidence
+- chain fragment novelty
+- contradiction reduction value
+- topology-effect potential
+- repeatability need
+
+=====================================================================
+8. Executor implications
+=====================================================================
+
+The executor must support these probe modes:
+- move-to-visible-poi
+- step-on-region
+- dwell-on-region
+- action-at-region
+- cross-boundary-edge
+- side-specific-contact
+- repeat-route-fragment
+- counterfactual-avoid-contact
+
+The executor must emit exact probe outcomes, including null outcomes.
+
+=====================================================================
+9. Memory implications
+=====================================================================
+
+Persist all of the following per game:
+- event graph
+- trigger-zone table
+- spatial intervention field
+- intervention episodes
+- event-sequence patterns
+- causal-chain hypotheses
+- hidden-trigger hypotheses
+- contradiction evidence
+- null-effect traces
+
+Memory must remain append-plus-recompute.
+Do not store only the latest round snapshot.
+
+=====================================================================
+10. Matching and normalization rules
+=====================================================================
+
+1. Event sequence matching
+- Match by event type sequence, delay bucket sequence, locality sequence, and topology-effect sequence.
+- Do not require absolute coordinate equality.
+
+2. Hidden trigger matching
+- Match by trigger condition, area-local spatial signature, action context, and downstream effect signature.
+- Do not require a visible object match.
+
+3. Mechanic promotion rule
+- Promote only when repeated support exceeds contradiction-adjusted threshold.
+- Keep direct and chain-level hypotheses separate.
+
+=====================================================================
+11. Expected v2.2 capability increase
+=====================================================================
+
+v2.2 is intended to improve:
+- repeated delayed effects
+- remote same-room effects
+- some cross-area switch/door style mechanics
+- invisible floor triggers
+- boundary/threshold triggers
+- short multi-hop chains
+
+v2.2 is not intended to solve:
+- very long causal chains
+- highly stochastic mechanics
+- visually complex object semantics without stronger perception
+- fully general strategic planning
+
+=====================================================================
+12. Non-goals for v2.2
+=====================================================================
+
+Do not add in v2.2:
+- neural visual embeddings
+- learned policy networks
+- end-to-end RL replacement of the executor
+- broad redesign of the package structure
+- replacement of v2.1 direct-link reasoning
+
+v2.2 is an additive symbolic layer over v2.1.

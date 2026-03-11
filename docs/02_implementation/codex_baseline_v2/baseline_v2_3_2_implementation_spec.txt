@@ -1,0 +1,206 @@
+BASELINE V2.3.2 IMPLEMENTATION SPEC
+
+Version: v2.3.2
+Goal: Add reusable options/skills and symbolic hierarchical planning over the v2.3.1 causal world model.
+
+1. FILES TO ADD
+
+Add:
+- planning/skill_schema.py
+- planning/skill_library.py
+- planning/skill_inducer.py
+- planning/planner_state_builder.py
+- planning/hierarchical_planner.py
+- executor/option_executor.py
+- shared/plan_records.py
+- cli/plan_with_options.py
+
+Do not remove existing controller/executor modules. Extend them.
+
+2. NEW SCHEMAS
+
+2.1 SkillSpecV1
+Fields:
+- schema_version: literal "v2.3.2"
+- skill_id
+- skill_type
+- parameter_names: list[str]
+- precondition_ids: list[str]
+- expected_effect_node_ids: list[str]
+- average_duration_steps: float
+- success_rate: float
+- failure_mode_labels: list[str]
+- source_trace_ids: list[str]
+- active: bool
+
+Supported initial skill_type values:
+- go_to_region
+- contact_poi
+- probe_hidden_trigger
+- cross_transition
+- dwell_on_region
+- perform_action_at_region
+- verify_mechanic
+- return_to_anchor
+
+2.2 SkillExecutionRecordV1
+Fields:
+- schema_version
+- execution_id
+- skill_id
+- parameter_values: list[str]
+- start_step
+- end_step
+- success
+- termination_reason
+- observed_event_ids: list[str]
+- observed_topology_delta_ids: list[str]
+- updated_confidence_delta: float
+
+2.3 PlannerBeliefStateV1
+Fields:
+- schema_version
+- current_area_id
+- current_avatar_track_id
+- candidate_subgoal_ids: list[str]
+- active_latent_state_ids: list[str]
+- uncertain_latent_state_ids: list[str]
+- reachable_frontier_ids: list[str]
+- candidate_skill_ids: list[str]
+- plan_memory_refs: list[str]
+
+2.4 PlanNodeV1
+Fields:
+- schema_version
+- plan_node_id
+- parent_id: str | None
+- depth: int
+- subgoal_id: str | None
+- skill_id: str | None
+- estimated_cost: float
+- estimated_success: float
+- estimated_information_gain: float
+- estimated_goal_progress: float
+- blocked: bool
+- notes: str | None
+
+2.5 PlanResultV1
+Fields:
+- schema_version
+- plan_id
+- root_plan_node_id
+- selected_plan_node_id
+- selected_skill_id
+- selected_subgoal_id
+- planner_reason
+- alternative_plan_node_ids: list[str]
+
+3. SKILL INDUCTION
+
+Implement planning/skill_inducer.py.
+
+Source data:
+- intervention traces
+- successful route traces
+- repeated trigger verification traces
+- transition-crossing traces
+
+Rules:
+- create a skill only after repeated similar execution patterns
+- store preconditions and expected effects from repeated observations
+- do not infer neural policies in this stage
+- a skill is a symbolic option wrapper, not a learned controller
+
+4. SKILL LIBRARY
+
+Implement planning/skill_library.py.
+
+Responsibilities:
+- register skills
+- update success/failure counts
+- update average duration
+- attach evidence refs
+- retire clearly invalid skills
+- expose candidate skills for current belief state
+
+Persist to:
+- skills.json
+- skill_executions.json
+
+Compact JSON only.
+
+5. PLANNER STATE BUILDER
+
+Implement planning/planner_state_builder.py.
+
+Build PlannerBeliefStateV1 from:
+- blackboard
+- latest avatar state
+- mechanic graph
+- dependency graph
+- route graph
+- current reachable areas/frontiers
+- recent plan failures
+
+6. HIERARCHICAL PLANNER
+
+Implement planning/hierarchical_planner.py.
+
+Planner must operate over skills/options, not primitive actions.
+
+Supported search algorithms:
+- best-first search first
+- optional beam search if already present in code style
+
+Scoring function must include:
+- estimated_goal_progress
+- estimated_information_gain
+- estimated_cost
+- estimated_success
+- revisit penalty
+- contradiction penalty
+
+Do not add learned value models in v2.3.2.
+
+7. OPTION EXECUTOR
+
+Implement executor/option_executor.py.
+
+Responsibilities:
+- map selected skill to current primitive execution routine
+- monitor progress
+- stop on success/failure/timeout
+- log SkillExecutionRecordV1
+- hand results back to existing analysis pipeline
+
+Do not replace the existing primitive executor; wrap it.
+
+8. CONTROLLER INTEGRATION
+
+Modify controller path so that:
+- if v2.3.2 planner state is available, controller selects a skill/option plan
+- otherwise it falls back to v2.2 target selection
+
+The selected plan must be persisted in plan_records.
+
+9. PLAN MEMORY
+
+Add plan memory persistence:
+- plans.json
+- plan_failures.json
+
+Store:
+- chosen plan
+- why it was chosen
+- whether it failed
+- which assumption broke
+- what contradiction was observed
+
+10. ACCEPTANCE TARGET
+
+After v2.3.2 the system must:
+- expose a skill library
+- produce a planner belief state
+- choose among symbolic options with best-first or beam search
+- execute the chosen option via wrapper executor
+- persist plan memory

@@ -43,3 +43,11 @@ class StoragePathsV2:
             os.makedirs(path, exist_ok=True)
             paths[category] = path
         return paths
+
+
+def get_round_one_poi_heatmap_path(session_dir: str, game_id: str) -> str:
+    return os.path.join(session_dir, "postrun_exports", f"{game_id}_round_one_poi_heatmap.png")
+
+
+def get_final_avatar_visit_heatmap_path(session_dir: str, game_id: str) -> str:
+    return os.path.join(session_dir, "postrun_exports", f"{game_id}_final_avatar_visit_heatmap.png")

@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import List, Optional, Tuple
 
 from codex_baseline_v2.shared.config import ExecutorConfigV2
+from codex_baseline_v2.shared.metrics import normalize_consequence_class
 from codex_baseline_v2.shared.schemas import (
     ConsequenceRecordV2,
     ControllerInstructionV2,
@@ -87,7 +88,7 @@ def execute_instruction_offline(
                 terminal_flag_changed=False,
                 object_change_summary="offline_replay",
                 followup_poi_ids=[],
-                consequence_class="no_change" if not reached else "progress_like",
+                consequence_class=normalize_consequence_class("no_change" if not reached else "progress_like"),
             )
         )
 

@@ -1,0 +1,183 @@
+Ray supports this implementation at four levels:
+
+1. Execution model
+Actors
+
+Use Ray actors for all long-lived stateful components:
+
+Coordinator
+
+Blackboard
+
+Planner
+
+Skill/Plan Memory
+
+Ranker
+
+Storage
+
+Env Workers
+
+Ray actors are stateful workers; each actor runs in its own worker process and keeps mutable state across calls. That matches your design exactly.
+
+Tasks
+
+Use Ray tasks for stateless parallel work:
+
+episode analysis
+
+candidate generation
+
+route scoring
+
+ranking feature computation
+
+hypothesis proposal generation
+
+That fits the “helper agents” and analysis workers. Ray Core is built around tasks, actors, and objects for distributed applications.
+
+2. State sharing and messaging
+Object store
+
+Ray passes results through its distributed object store using object references. That is how workers can return:
+
+trajectories
+
+analyzed episodes
+
+candidate batches
+
+route-score tables
+
+without building your own messaging bus first.
+
+Named actors
+
+Ray named actors let any job in the same namespace retrieve central services like:
+
+blackboard_actor
+
+planner_actor
+
+storage_actor
+
+So shared services are easy to discover without hardwiring process addresses.
+
+3. Parallelism and scaling
+Single machine first
+
+Ray can run on one machine with ray.init() and the same code can later run on a multi-node cluster. That is useful for starting from v2.5 and scaling later to many games.
+
+Multi-node later
+
+Ray clusters use a head node plus worker nodes, and can scale workloads across them. That is the clean path for future many-game ARC-AGI-3 runs.
+
+Placement groups
+
+Ray placement groups let you reserve and place related actors/tasks together or spread them apart. You can use that for:
+
+packing one game’s Coordinator + Blackboard + Planner close together
+
+spreading heavy env workers across CPUs
+
+reserving GPU/CPU bundles later if vision or learned rankers are added
+
+4. Concurrency inside services
+Async actors
+
+Ray supports async actors. That is useful for services like:
+
+Coordinator
+
+Blackboard
+
+Storage
+
+They can handle multiple requests concurrently where safe, instead of blocking on one call at a time.
+
+How this maps to your system
+Central authoritative services → Ray actors
+
+Best fit:
+
+Blackboard: one actor per game
+
+Planner: one actor per game
+
+Skill Memory: one actor per game
+
+Storage: one actor per run or per game
+
+Coordinator: one actor per game
+
+Reason:
+these are long-lived, stateful, single-writer or authoritative components. Ray actors are the correct primitive for that.
+
+Parallel helpers → Ray tasks or worker actors
+
+Best fit:
+
+Episode analysis
+
+Candidate generation
+
+Route precompute
+
+Hypothesis generation
+
+Scoring feature computation
+
+Reason:
+these are parallel, mostly stateless, and snapshot-based. Ray tasks are the simple primitive here.
+
+Environment runners → Ray actors
+
+Best fit:
+
+persistent env workers
+
+Reason:
+they keep a live env instance in memory and avoid repeated startup. Actors are stateful workers and are the natural fit.
+
+What Ray gives you immediately
+
+a clean actor model for the multi-agent runtime
+
+built-in distributed execution for helper work
+
+built-in object passing via object refs
+
+easy growth from one machine to a cluster
+
+placement control for locality/resource packing
+
+observability via Ray system metrics for bottleneck tracking
+
+What Ray does not solve by itself
+
+Ray does not solve:
+
+blackboard merge logic
+
+stale snapshot invalidation
+
+planner invariants
+
+artifact schema consistency
+
+your symbolic reasoning design
+
+It gives the runtime substrate, not the game logic. The serial bottlenecks in your system still need architectural control above Ray.
+
+Bottom line
+
+For your design, Ray is supporting the implementation as:
+
+actors for authoritative agents
+
+tasks for parallel helper work
+
+object refs for message/result passing
+
+cluster runtime for scaling from one game to many games

@@ -1,0 +1,210 @@
+## Round Metrics Specification (Corrected)
+
+This specification defines the computation of the five retained round metrics.
+
+---
+
+# 1. unique_states
+
+### Definition
+
+Number of distinct environment states observed during the round.
+
+### State hash computation
+
+State hashes must be computed from frames **with the HUD masked out**.
+
+```text
+masked_frame = mask_hud(frame)
+state_hash = hash(masked_frame)
+```
+
+### Step hashes
+
+```text
+pre_state_hash  = state_hash(frame_before_action)
+post_state_hash = state_hash(frame_after_action)
+```
+
+### Metric formula
+
+```text
+unique_states =
+| { h | h = step.pre_state_hash OR step.post_state_hash, h ≠ None } |
+```
+
+---
+
+# 2. unique_pois
+
+### Definition
+
+Number of POIs stored in the round blackboard after analysis and deduplication.
+
+### Metric formula
+
+```text
+unique_pois = len(poi_table)
+```
+
+Where:
+
+```text
+poi_table = canonical POI registry in the blackboard
+```
+
+Each POI represents a unique spatial entity after POI deduplication.
+
+---
+
+# 3. route_success_rate
+
+### Definition
+
+Fraction of route attempts that successfully reached the intended target.
+
+### Route attempt
+
+A route attempt occurs when the controller issues one of the following modes:
+
+```text
+poi_approach
+poi_interaction
+exploit_route
+step_on_region
+dwell_on_region
+repeat_route_fragment
+counterfactual_avoid_contact
+```
+
+### Route attempt count
+
+```text
+route_attempt_count =
+| { m | m ∈ controller_modes AND m ∈ ROUTE_MODES } |
+```
+
+### Successful route
+
+A successful route occurs when a consequence record reports:
+
+```text
+c.reached = True
+```
+
+### Metric formula
+
+```text
+route_success_rate =
+target_reached_count / max(1, route_attempt_count)
+```
+
+Where:
+
+```text
+target_reached_count = | { c ∈ consequences | c.reached = True } |
+```
+
+---
+
+# 4. useful_change_rate
+
+### Definition
+
+Fraction of actions producing meaningful environment changes.
+
+### Consequence classification
+
+Each consequence record contains a class:
+
+```text
+consequence_class ∈ {
+    no_change,
+    local_change,
+    global_change,
+    progress_like,
+    terminal_like
+}
+```
+
+### Useful consequence
+
+A consequence is useful when:
+
+```text
+consequence_class ∈ {
+    local_change,
+    global_change,
+    progress_like,
+    terminal_like
+}
+```
+
+### Metric formula
+
+```text
+useful_change_rate =
+| { c ∈ consequences | c.consequence_class ∈ USEFUL_CLASSES } |
+/ max(1, len(consequences))
+```
+
+---
+
+# 5. contact_success_rate
+
+### Definition
+
+Fraction of interaction attempts that resulted in physical contact with a POI.
+
+### Interaction attempt
+
+An interaction attempt occurs when the controller mode is:
+
+```text
+poi_interaction
+```
+
+### Interaction attempt count
+
+```text
+interaction_attempt_count =
+| { m | m ∈ controller_modes AND m = poi_interaction } |
+```
+
+### Successful interaction
+
+A successful interaction occurs when a consequence record reports:
+
+```text
+c.contact = True
+```
+
+### Metric formula
+
+```text
+contact_success_rate =
+interaction_count / max(1, interaction_attempt_count)
+```
+
+Where:
+
+```text
+interaction_count = | { c ∈ consequences | c.contact = True } |
+```
+
+---
+
+# Resulting Metric Set
+
+The round report must output the following fields:
+
+```text
+unique_states
+unique_pois
+route_success_rate
+useful_change_rate
+contact_success_rate
+```
+
+
+

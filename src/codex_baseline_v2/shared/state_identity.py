@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import hashlib
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 STATE_SIGNATURE_VERSION = "v2_canonical_obs_v1"
 _INVALID_STATE_COUNTER = 0
+_STATE_IDENTITY_CACHE: Dict[Tuple[Tuple[int, ...], ...], str] = {}
+_STATE_IDENTITY_CACHE_MAX = 4096
 
 
 def canonical_state_identity(
@@ -58,8 +60,14 @@ def canonical_state_identity(
                 "valid": False,
                 "reason": "non_integer_values",
             }
-    payload_json = json.dumps(normalized, separators=(",", ":"), ensure_ascii=True)
-    digest = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+    key = tuple(tuple(row) for row in normalized)
+    digest = _STATE_IDENTITY_CACHE.get(key)
+    if digest is None:
+        payload_json = json.dumps(normalized, separators=(",", ":"), ensure_ascii=True)
+        digest = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+        if len(_STATE_IDENTITY_CACHE) >= _STATE_IDENTITY_CACHE_MAX:
+            _STATE_IDENTITY_CACHE.clear()
+        _STATE_IDENTITY_CACHE[key] = digest
     compact_payload = None
     if include_payload:
         compact_payload = {

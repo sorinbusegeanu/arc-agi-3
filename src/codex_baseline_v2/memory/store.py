@@ -49,7 +49,7 @@ def save_blackboard(cfg: MemoryConfigV2, storage: StoragePathsV2, blackboard: Bl
     return path
 
 
-def load_blackboard(storage: StoragePathsV2, game_id: str) -> Optional[Dict[str, Any]]:
+def load_blackboard_raw(storage: StoragePathsV2, game_id: str) -> Optional[Dict[str, Any]]:
     path = os.path.join(storage.game_root(game_id), "blackboard_latest.json")
     if not os.path.exists(path):
         return None
@@ -57,11 +57,49 @@ def load_blackboard(storage: StoragePathsV2, game_id: str) -> Optional[Dict[str,
         return json.load(handle)
 
 
-def load_blackboard_typed(storage: StoragePathsV2, game_id: str) -> Optional[BlackboardStateV2]:
-    payload = load_blackboard(storage, game_id)
+def load_blackboard(storage: StoragePathsV2, game_id: str) -> Optional[BlackboardStateV2]:
+    payload = load_blackboard_raw(storage, game_id)
     if payload is None:
         return None
     return BlackboardStateV2.from_dict(payload)
+
+
+def load_blackboard_typed(storage: StoragePathsV2, game_id: str) -> Optional[BlackboardStateV2]:
+    return load_blackboard(storage, game_id)
+
+
+def _save_archive(storage: StoragePathsV2, game_id: str, round_id: int, filename: str, payload: Any) -> str:
+    path = os.path.join(storage.category_path(game_id, round_id, "exports"), filename)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, sort_keys=True)
+    return path
+
+
+def save_world_model_archive(storage: StoragePathsV2, blackboard: BlackboardStateV2) -> str:
+    return _save_archive(storage, blackboard.game_id, blackboard.round_id, "world_model.json", blackboard.to_dict())
+
+
+def save_event_table(storage: StoragePathsV2, blackboard: BlackboardStateV2) -> str:
+    return _save_archive(storage, blackboard.game_id, blackboard.round_id, "event_table.json", [v.to_dict() for v in blackboard.event_table])
+
+
+def save_navigation_graph(storage: StoragePathsV2, blackboard: BlackboardStateV2) -> str:
+    return _save_archive(
+        storage,
+        blackboard.game_id,
+        blackboard.round_id,
+        "navigation_graph.json",
+        {"cells": [v.to_dict() for v in blackboard.navigation_cells], "edges": [v.to_dict() for v in blackboard.navigation_edges]},
+    )
+
+
+def save_interventions(storage: StoragePathsV2, blackboard: BlackboardStateV2) -> str:
+    return _save_archive(storage, blackboard.game_id, blackboard.round_id, "interventions.json", [v.to_dict() for v in blackboard.intervention_table])
+
+
+def save_mechanic_hypotheses(storage: StoragePathsV2, blackboard: BlackboardStateV2) -> str:
+    return _save_archive(storage, blackboard.game_id, blackboard.round_id, "mechanic_hypotheses.json", [v.to_dict() for v in blackboard.mechanic_hypotheses])
 
 
 def append_round_report(storage: StoragePathsV2, game_id: str, round_id: int, report: Dict[str, Any]) -> str:
@@ -70,3 +108,37 @@ def append_round_report(storage: StoragePathsV2, game_id: str, round_id: int, re
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(report, handle, sort_keys=True)
     return path
+
+
+def _persist_postrun_artifact_manifest(session_dir: str, artifact_key: str, artifact_path: str, artifact_type: str) -> str:
+    manifest_path = os.path.join(session_dir, "postrun_artifacts.json")
+    payload: Dict[str, Any] = {}
+    if os.path.exists(manifest_path):
+        with open(manifest_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    payload.setdefault("artifacts", {})
+    payload["artifacts"][artifact_key] = {
+        "artifact_type": artifact_type,
+        "path": artifact_path,
+    }
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, sort_keys=True)
+    return manifest_path
+
+
+def persist_round_one_poi_heatmap_artifact(session_dir: str, game_id: str, artifact_path: str) -> str:
+    return _persist_postrun_artifact_manifest(
+        session_dir,
+        "round_one_poi_heatmap",
+        artifact_path,
+        "round_one_poi_heatmap_png",
+    )
+
+
+def persist_final_avatar_visit_heatmap_artifact(session_dir: str, game_id: str, artifact_path: str) -> str:
+    return _persist_postrun_artifact_manifest(
+        session_dir,
+        "final_avatar_visit_heatmap",
+        artifact_path,
+        "final_avatar_visit_heatmap_png",
+    )

@@ -77,6 +77,85 @@ def bbox_distance(a: BBox, b: BBox) -> float:
     return (dx * dx + dy * dy) ** 0.5
 
 
+def point_manhattan(a: Tuple[int, int], b: Tuple[int, int]) -> int:
+    return abs(int(a[0]) - int(b[0])) + abs(int(a[1]) - int(b[1]))
+
+
+def point_neighbors4(pt: Tuple[int, int]) -> List[Tuple[int, int]]:
+    x, y = int(pt[0]), int(pt[1])
+    return [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)]
+
+
+def normalize_palette(values: Iterable[int]) -> List[int]:
+    out = []
+    seen = set()
+    for value in values:
+        iv = int(value)
+        if iv in seen:
+            continue
+        seen.add(iv)
+        out.append(iv)
+    out.sort()
+    return out
+
+
+def stable_tuple_key(value: Any) -> Tuple:
+    if isinstance(value, dict):
+        return tuple((k, stable_tuple_key(v)) for k, v in sorted(value.items()))
+    if isinstance(value, list):
+        return tuple(stable_tuple_key(v) for v in value)
+    if isinstance(value, tuple):
+        return tuple(stable_tuple_key(v) for v in value)
+    return (value,)
+
+
+def compact_context_key(area_id: Optional[str], local_occupancy_code: str, target_bucket: str, action_id: Optional[int] = None) -> str:
+    parts = [str(area_id or "none"), str(local_occupancy_code), str(target_bucket)]
+    if action_id is not None:
+        parts.append(str(int(action_id)))
+    return "|".join(parts)
+
+
+def merge_ranges(a: Tuple[int, int], b: Tuple[int, int]) -> Tuple[int, int]:
+    return (min(int(a[0]), int(b[0])), max(int(a[1]), int(b[1])))
+
+
+def point_manhattan(a: Tuple[int, int], b: Tuple[int, int]) -> int:
+    return abs(int(a[0]) - int(b[0])) + abs(int(a[1]) - int(b[1]))
+
+
+def point_neighbors4(pt: Tuple[int, int]) -> List[Tuple[int, int]]:
+    x, y = int(pt[0]), int(pt[1])
+    return [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)]
+
+
+def normalize_palette(values: Iterable[int]) -> List[int]:
+    return sorted({int(v) for v in values})
+
+
+def stable_tuple_key(value: Any) -> Tuple:
+    if isinstance(value, dict):
+        return tuple((k, stable_tuple_key(v)) for k, v in sorted(value.items()))
+    if isinstance(value, (list, tuple)):
+        return tuple(stable_tuple_key(v) for v in value)
+    return (value,)
+
+
+def compact_context_key(
+    area_id: Optional[str],
+    local_occupancy_code: Any,
+    target_bucket: Any,
+    action_id: Optional[int] = None,
+) -> str:
+    area = area_id or "none"
+    action_part = f":a{int(action_id)}" if action_id is not None else ""
+    return f"{area}:{local_occupancy_code}:{target_bucket}{action_part}"
+
+
+def merge_ranges(a: Tuple[int, int], b: Tuple[int, int]) -> Tuple[int, int]:
+    return (min(int(a[0]), int(b[0])), max(int(a[1]), int(b[1])))
+
+
 def merge_bboxes(bboxes: Iterable[BBox]) -> Optional[BBox]:
     xs1 = []
     ys1 = []

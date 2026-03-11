@@ -1,0 +1,112 @@
+BASELINE V2.3.4 IMPLEMENTATION SPEC
+
+Version: v2.3.4
+Goal: Add learned ranking/value guidance on top of the symbolic planner.
+
+1. FILES TO ADD
+
+Add:
+- learning/option_ranker.py
+- learning/mechanic_ranker.py
+- learning/plan_value_model.py
+- learning/ranking_dataset.py
+- learning/ranking_inference.py
+- shared/learning_records.py
+- cli/train_rankers.py
+
+2. NEW SCHEMAS
+
+2.1 RankingSampleV1
+Fields:
+- schema_version: literal "v2.3.4"
+- sample_id
+- sample_type
+- feature_ref
+- label_value
+- episode_ref
+- outcome_ref
+
+Supported sample_type values:
+- option_success
+- option_information_gain
+- mechanic_verification_value
+- latent_state_resolution_value
+- plan_return_proxy
+
+2.2 OptionRankingRecordV1
+Fields:
+- schema_version
+- ranking_id
+- planner_state_ref
+- candidate_skill_ids: list[str]
+- selected_skill_id
+- model_score_map_ref
+- fallback_used: bool
+
+2.3 MechanicRankingRecordV1
+Fields:
+- schema_version
+- ranking_id
+- candidate_mechanic_ids: list[str]
+- selected_mechanic_id
+- model_score_map_ref
+- fallback_used: bool
+
+3. MODEL SCOPE
+
+Do not replace the symbolic planner.
+Models are only ranking layers.
+
+Allowed learned roles:
+- score candidate skills for planner tie-breaking
+- rank which mechanic to verify next
+- rank which uncertain latent state is worth resolving
+- estimate option-level value proxies
+
+4. DATASET GENERATION
+
+Implement learning/ranking_dataset.py.
+
+Build datasets from:
+- plan memory
+- skill executions
+- mechanic verification traces
+- latent-state resolution outcomes
+
+Labels should be empirical outcomes such as:
+- success/failure
+- information gain observed
+- downstream unlock observed
+- route-cost reduction observed
+
+5. INFERENCE INTEGRATION
+
+Implement learning/ranking_inference.py.
+
+Planner flow:
+- build symbolic candidate set first
+- get model scores if weights exist
+- combine symbolic score and learned score
+- if model unavailable or invalid, use symbolic score only
+
+6. SAFETY RULE
+
+No learned model may suppress all symbolic alternatives.
+Always keep symbolic fallback.
+
+7. PERSISTENCE
+
+Persist:
+- ranking_samples.json
+- option_rankings.json
+- mechanic_rankings.json
+
+Compact JSON only.
+
+8. ACCEPTANCE TARGET
+
+After v2.3.4 the system must:
+- generate ranking datasets
+- run learned ranking if weights exist
+- keep symbolic fallback intact
+- improve prioritization without removing inspectability

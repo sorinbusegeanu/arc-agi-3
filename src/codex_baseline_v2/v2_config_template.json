@@ -16,7 +16,10 @@
     "min_poi_persistence": 2,
     "motion_hotspot_threshold": 0.2,
     "consequence_hotspot_threshold": 0.2,
-    "traversable_min_visits": 2
+    "traversable_min_visits": 2,
+    "episode_analysis_workers": null,
+    "episode_analysis_chunk_size": null,
+    "parallel_area_assign": true
   },
   "memory": {
     "storage_dir": "runs_v2",
@@ -85,7 +88,8 @@
     "root_dir": "runs_v2",
     "atomic_writes": true,
     "keep_raw_frames": true,
-    "keep_raw_env_payloads": false
+    "keep_raw_env_payloads": false,
+    "backend": "files"
   },
   "resume": {
     "reload_latest_blackboard": true,
@@ -99,6 +103,51 @@
     "stale_penalty": 0.2,
     "likely_hud_penalty": 0.5
   },
+  "hidden_trigger": {
+    "min_region_visits_for_candidate": 3,
+    "min_boundary_crossings_for_candidate": 2,
+    "dwell_step_thresholds": [2, 4, 6],
+    "min_activation_support": 2,
+    "null_penalty": 0.25,
+    "contradiction_penalty": 0.5,
+    "promotion_threshold": 0.72,
+    "merge_iou_threshold": 0.5,
+    "merge_cell_overlap_threshold": 0.6
+  },
+  "causal_chain": {
+    "immediate_delay_max": 2,
+    "delayed_delay_max": 8,
+    "post_transition_delay_max": 16,
+    "max_chain_hops": 4,
+    "min_sequence_support": 2,
+    "sequence_match_threshold": 0.7,
+    "partial_match_weight": 0.35,
+    "contradiction_penalty": 0.5,
+    "promotion_threshold": 0.75
+  },
+  "probe_mode": {
+    "max_step_on_region_steps": 6,
+    "max_dwell_probe_steps": 8,
+    "max_action_in_region_steps": 6,
+    "max_boundary_cross_steps": 6,
+    "max_side_contact_steps": 6,
+    "counterfactual_probe_budget": 10
+  },
+  "sequence_mining": {
+    "min_pattern_length": 2,
+    "max_pattern_length": 5,
+    "delay_bucket_edges": [0, 2, 8, 16],
+    "same_area_bonus": 0.15,
+    "cross_area_bonus": 0.2,
+    "topology_bonus": 0.2
+  },
+  "controller_exploration": {
+    "hidden_trigger_probe_weight": 1.0,
+    "causal_chain_verification_weight": 0.9,
+    "counterfactual_probe_weight": 0.7,
+    "null_result_penalty": 0.4,
+    "fragment_novelty_weight": 0.8
+  },
   "debug": {
     "strict_state_hash": false,
     "export_avatar_candidates": false,
@@ -106,6 +155,12 @@
     "export_target_linkage": false,
     "export_poi_rejections": false,
     "fail_on_missing_target_link": false,
-    "keep_invalid_steps_for_debug": false
+    "keep_invalid_steps_for_debug": false,
+    "export_trigger_zones": false,
+    "export_event_graph": false,
+    "export_event_sequence_patterns": false,
+    "export_hidden_trigger_hypotheses": false,
+    "export_causal_chain_hypotheses": false,
+    "export_counterfactual_traces": false
   }
 }

@@ -1,0 +1,552 @@
+Prompt 1
+
+File: `src/codex_baseline_v2/runtime_ray/messages.py`
+
+Create this new file.
+
+Define only the runtime transport dataclasses / typed payload records for:
+`RawStep`
+`RawEpisode`
+`AnalyzedEpisode`
+`BlackboardMergeRequest`
+`BlackboardMergeResult`
+`MemoryReconcileRequest`
+`MemoryReconcileResult`
+`PlanningContextSnapshot`
+`HelperTaskRequest`
+`CandidateBatch`
+`RouteAnalysisResult`
+`ScoreFeatureBatch`
+`HypothesisProposalBatch`
+`PlannerDecision`
+`ExecutorRequest`
+`ExecutorOutcome`
+`PersistenceRequest`
+`InvalidationEvent`
+
+Use exact field names and semantics from the runtime contract already provided.
+Keep the file pure schema/record definitions only.
+Do not add business logic.
+Do not change anything else.
+
+Prompt 2
+
+File: `src/codex_baseline_v2/runtime_ray/versions.py`
+
+Create this new file.
+
+Implement the versioning helpers for:
+
+* `blackboard_version`
+* `memory_version`
+* `policy_version`
+* `ranker_version`
+* `plan_context_id`
+
+Add small pure functions for:
+
+* creating a new blackboard version
+* creating a new memory version
+* creating a new plan context id from blackboard version, memory version, policy version, ranker version, session id, game id, round id
+* checking strict equality compatibility between helper outputs and the current planning context
+* packaging invalidation metadata
+
+Do not add storage or actor logic here.
+Do not change anything else.
+
+Prompt 3
+
+File: `src/codex_baseline_v2/runtime_ray/bootstrap.py`
+
+Create this new file.
+
+Implement Ray bootstrap helpers for:
+
+* initializing Ray for local single-node use
+* returning a runtime config object for actor counts and resource limits
+* constructing named actors for:
+  `CoordinatorActor`
+  `BlackboardActor`
+  `SkillMemoryActor`
+  `PlannerActor`
+  `StorageActor`
+  optional `RankerActor`
+* creating worker pools for:
+  `EnvWorkerActor`
+  `EpisodeAnalyzerWorker`
+  `PlanningHelperWorker`
+
+Keep bootstrap isolated from business logic.
+Do not move planner or analysis logic into this file.
+Do not change anything else.
+
+Prompt 4
+
+File: `src/codex_baseline_v2/runtime_ray/env_worker_actor.py`
+
+Create this new file.
+
+Implement `EnvWorkerActor`.
+
+This actor must:
+
+* own one live environment instance
+* initialize from env-factory inputs
+* expose one method for probe episode collection
+* expose one method for directed execution from `ExecutorRequest`
+* return `RawEpisode` and `ExecutorOutcome` payloads only
+* never write storage
+* never update blackboard
+* never update skill/plan memory
+
+Reuse existing logic by adapting the current collection and execution paths from:
+
+* `runtime/trajectory_collector.py`
+* `executor/online_executor.py`
+* `executor/option_executor.py`
+
+Keep the actor as a wrapper/adaptor around existing v2.5 logic.
+Do not rewrite symbolic execution behavior.
+Do not change anything else.
+
+Prompt 5
+
+File: `src/codex_baseline_v2/runtime_ray/analysis_pool.py`
+
+Create this new file.
+
+Implement `EpisodeAnalyzerWorker` as a Ray remote worker.
+
+This worker must:
+
+* accept `RawEpisode`
+* call the existing episode analysis path from `analyst/analyst.py`
+* return `AnalyzedEpisode`
+* remain stateless apart from cached config/resources
+* never update cumulative blackboard
+* never write storage
+
+Also add small helper functions for dispatching batches of analysis requests and collecting results.
+Do not change anything else.
+
+Prompt 6
+
+File: `src/codex_baseline_v2/runtime_ray/blackboard_actor.py`
+
+Create this new file.
+
+Implement `BlackboardActor`.
+
+This actor must:
+
+* own the authoritative cumulative blackboard state for one game session
+* accept `BlackboardMergeRequest`
+* call the existing cumulative analysis / merge logic from `trajectory_analysis/analyzer.py`
+* publish immutable snapshot handles
+* return `BlackboardMergeResult`
+* maintain internal snapshot registry
+* expose read-only snapshot/query methods for the planner and helper workers
+
+This actor is the single writer for cumulative world-state.
+Do not parallelize internal merge semantics in this file.
+Do not change anything else.
+
+Prompt 7
+
+File: `src/codex_baseline_v2/runtime_ray/skill_memory_actor.py`
+
+Create this new file.
+
+Implement `SkillMemoryActor`.
+
+This actor must:
+
+* own skills, skill executions, retries, cooldowns, exhaustion state, and plan-memory state
+* accept `MemoryReconcileRequest`
+* wrap and reuse:
+  `planning/skill_inducer.py`
+  `planning/skill_library.py`
+  `planning/plan_memory.py`
+* return `MemoryReconcileResult`
+* publish immutable memory snapshot handles
+* be the single writer for skill/plan memory state
+
+Do not move planner logic here.
+Do not write durable artifacts directly from this actor.
+Do not change anything else.
+
+Prompt 8
+
+File: `src/codex_baseline_v2/runtime_ray/planner_actor.py`
+
+Create this new file.
+
+Implement `PlannerActor`.
+
+This actor must:
+
+* accept a planning request plus `PlanningContextSnapshot`
+* read blackboard snapshot handles and memory snapshot handles
+* optionally read helper outputs and ranking features
+* reuse:
+  `planning/planner_state_builder.py`
+  `planning/hierarchical_planner.py`
+* keep final plan selection centralized
+* return `PlannerDecision`
+* never mutate blackboard state
+* never mutate skill/plan memory state
+* never write storage directly
+
+Keep this actor as a wrapper around current v2.5 planning stages.
+Do not change anything else.
+
+Prompt 9
+
+File: `src/codex_baseline_v2/runtime_ray/helper_pool.py`
+
+Create this new file.
+
+Implement `PlanningHelperWorker` as a Ray remote worker.
+
+Support helper modes for:
+
+* candidate generation
+* route analysis
+* score feature computation
+* hypothesis proposal
+* pruning suggestion
+
+Each helper task must:
+
+* accept `HelperTaskRequest`
+* accept `PlanningContextSnapshot`
+* return only version-tagged proposal outputs
+* never commit state
+* never choose the final plan
+* never write storage
+
+Keep route-related work aligned with existing execution / routing code where applicable.
+Do not change anything else.
+
+Prompt 10
+
+File: `src/codex_baseline_v2/runtime_ray/ranker_actor.py`
+
+Create this new file.
+
+Implement `RankerActor`.
+
+This actor must:
+
+* own ranking-related cached state
+* provide score batches and ranking summaries to the planner
+* optionally ingest outcome updates
+* stay advisory only
+* never choose the final plan
+* never mutate blackboard or memory directly
+
+Keep this actor optional behind runtime config so the system still works with symbolic fallback.
+Do not change anything else.
+
+Prompt 11
+
+File: `src/codex_baseline_v2/runtime_ray/storage_actor.py`
+
+Create this new file.
+
+Implement `StorageActor`.
+
+This actor must:
+
+* be the single writer for durable runtime artifacts in the Ray path
+* accept `PersistenceRequest`
+* wrap:
+  `memory/store.py`
+  `shared/storage.py`
+  `storage/sqlite_intermediates.py`
+* preserve existing artifact families and naming conventions as much as possible
+* serialize ordered writes
+* return persistence results and artifact manifests
+
+Do not add planner or blackboard semantics here.
+Do not change anything else.
+
+Prompt 12
+
+File: `src/codex_baseline_v2/runtime_ray/coordinator_actor.py`
+
+Create this new file.
+
+Implement `CoordinatorActor`.
+
+This actor must own the per-game round lifecycle for the Ray runtime.
+
+Implement the exact orchestration order:
+
+1. start or resume session state
+2. dispatch probe episode work to env workers
+3. dispatch episode analysis work
+4. request blackboard merge
+5. request memory reconciliation when appropriate
+6. create planning context from latest accepted versions
+7. optionally dispatch speculative helper tasks on that planning context
+8. request centralized final planning from `PlannerActor`
+9. dispatch selected directed execution to an env worker
+10. analyze directed episode
+11. request blackboard merge for directed evidence
+12. request memory reconciliation for execution outcome
+13. request persistence through `StorageActor`
+14. repeat according to current round/pass semantics
+
+Coordinator must:
+
+* own active task registry
+* own current accepted versions
+* broadcast invalidation events when a new accepted planning context supersedes helper outputs
+* never directly mutate blackboard internals
+* never directly mutate skill/plan memory internals
+* never directly write durable artifacts
+
+Reuse current lifecycle semantics from `runtime/round_orchestrator.py`.
+Do not change anything else.
+
+Prompt 13
+
+File: `src/codex_baseline_v2/cli/run_autonomous_game_ray.py`
+
+Create this new file.
+
+Implement a new CLI entrypoint for the Ray runtime.
+
+This CLI must:
+
+* load the same config family as the current autonomous runtime
+* initialize Ray through `runtime_ray/bootstrap.py`
+* create the named actors and worker pools
+* start one `CoordinatorActor`
+* run one full autonomous game session through the Ray path
+* preserve compatibility with current artifact directories and session layout as much as possible
+
+Do not remove or alter the current non-Ray CLI path.
+Do not change anything else.
+
+Prompt 14
+
+File: `src/codex_baseline_v2/cli/main.py`
+
+Modify this file only.
+
+Add one new subcommand:
+`run_autonomous_game_ray`
+
+Wire it to `src/codex_baseline_v2/cli/run_autonomous_game_ray.py`.
+
+Do not change existing subcommands or current non-Ray behavior.
+Do not change anything else.
+
+Prompt 15
+
+File: `src/codex_baseline_v2/runtime/round_orchestrator.py`
+
+Modify this file only.
+
+Extract the current round lifecycle into small reusable adapter-friendly functions so the new `CoordinatorActor` can call the existing orchestration logic without copying large blocks.
+
+Do not redesign the round semantics.
+Do not remove the current non-Ray path.
+Do not change anything else.
+
+Prompt 16
+
+File: `src/codex_baseline_v2/runtime/trajectory_collector.py`
+
+Modify this file only.
+
+Add adapter-friendly helper functions that let `EnvWorkerActor` call probe collection for a single worker-owned environment instance without needing the old multiprocessing entry path.
+
+Keep existing collection functions unchanged for the old runtime.
+Do not redesign collection behavior.
+Do not change anything else.
+
+Prompt 17
+
+File: `src/codex_baseline_v2/executor/online_executor.py`
+
+Modify this file only.
+
+Add adapter-friendly helper functions so `EnvWorkerActor` can execute one directed planner-selected request on a worker-owned live environment instance and package the result into the new runtime message format.
+
+Keep current execution semantics unchanged.
+Do not move storage or planning logic here.
+Do not change anything else.
+
+Prompt 18
+
+File: `src/codex_baseline_v2/executor/option_executor.py`
+
+Modify this file only.
+
+Add adapter-friendly conversion helpers between existing option/skill execution inputs and the new `ExecutorRequest` / `ExecutorOutcome` transport records.
+
+Do not change symbolic execution behavior.
+Do not change anything else.
+
+Prompt 19
+
+File: `src/codex_baseline_v2/analyst/analyst.py`
+
+Modify this file only.
+
+Add one adapter entry function that accepts a `RawEpisode` payload and returns an `AnalyzedEpisode` payload without changing existing analysis behavior.
+
+Do not redesign observation analysis.
+Do not change anything else.
+
+Prompt 20
+
+File: `src/codex_baseline_v2/trajectory_analysis/analyzer.py`
+
+Modify this file only.
+
+Add one adapter entry function that accepts `BlackboardMergeRequest` and returns `BlackboardMergeResult` while reusing the current cumulative analysis / merge logic.
+
+Preserve current blackboard semantics.
+Do not parallelize merge internals.
+Do not change anything else.
+
+Prompt 21
+
+File: `src/codex_baseline_v2/planning/plan_memory.py`
+
+Modify this file only.
+
+Add adapter-friendly snapshot export/import helpers so `SkillMemoryActor` can manage immutable memory snapshots and versioned reconciliation cleanly.
+
+Do not redesign plan-memory semantics.
+Do not change anything else.
+
+Prompt 22
+
+File: `src/codex_baseline_v2/planning/skill_library.py`
+
+Modify this file only.
+
+Add adapter-friendly helpers for snapshotting and reconciling the skill library state under `SkillMemoryActor`.
+
+Do not redesign the skill representation.
+Do not change anything else.
+
+Prompt 23
+
+File: `src/codex_baseline_v2/planning/skill_inducer.py`
+
+Modify this file only.
+
+Add one adapter entry function that lets `SkillMemoryActor` reconcile execution outcomes into skill updates using the new runtime message types.
+
+Do not redesign induction behavior.
+Do not change anything else.
+
+Prompt 24
+
+File: `src/codex_baseline_v2/planning/planner_state_builder.py`
+
+Modify this file only.
+
+Add one adapter entry function that builds planner input state from `PlanningContextSnapshot` plus blackboard and memory snapshot handles.
+
+Do not redesign belief construction.
+Do not change anything else.
+
+Prompt 25
+
+File: `src/codex_baseline_v2/planning/hierarchical_planner.py`
+
+Modify this file only.
+
+Add one adapter entry function that accepts:
+
+* planning context
+* planner input state
+* optional helper proposal batches
+* optional ranking inputs
+
+Return a `PlannerDecision` transport record while preserving current candidate generation, scoring, filtering, reranking, and final selection semantics.
+
+Do not decentralize final plan selection.
+Do not change anything else.
+
+Prompt 26
+
+File: `src/codex_baseline_v2/memory/store.py`
+
+Modify this file only.
+
+Add adapter-friendly persistence helpers so `StorageActor` can write the current artifact families from Ray runtime payloads without changing existing storage behavior.
+
+Do not redesign artifact content.
+Do not change anything else.
+
+Prompt 27
+
+File: `src/codex_baseline_v2/shared/storage.py`
+
+Modify this file only.
+
+Add adapter-friendly helpers for ordered durable writes and artifact manifest generation for the Ray runtime path.
+
+Do not change current file naming and directory layout logic unless required for the new CLI path.
+Do not change anything else.
+
+Prompt 28
+
+File: `src/codex_baseline_v2/storage/sqlite_intermediates.py`
+
+Modify this file only.
+
+Add optional support for storing:
+
+* runtime message indexes
+* snapshot registry entries
+* payload reference metadata
+
+This support must be non-breaking and optional for the new Ray runtime path only.
+Do not change anything else.
+
+Prompt 29
+
+File: `src/codex_baseline_v2/runtime_ray/__init__.py`
+
+Create this new file.
+
+Export the public runtime-Ray surface:
+
+* bootstrap helpers
+* actor classes
+* worker classes
+* message types
+* version helpers
+
+Do not add side effects.
+Do not change anything else.
+
+Prompt 30
+
+File: `src/codex_baseline_v2/shared/config.py`
+
+Modify this file only.
+
+Add a Ray runtime configuration section for:
+
+* enable/disable Ray runtime
+* env worker count
+* analysis worker count
+* helper worker count
+* use ranker actor flag
+* actor naming / namespace options
+* local single-node resource defaults
+* helper enable/disable flags
+
+Keep existing config compatibility intact.
+Do not change anything else.
+

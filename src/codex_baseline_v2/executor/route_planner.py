@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from collections import deque
-from dataclasses import dataclass
+import heapq
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from codex_baseline_v2.shared.schemas import BlackboardStateV2, CandidatePOIV2
-from codex_baseline_v2.shared.utils import BBox
+from codex_baseline_v2.shared.utils import point_neighbors4, point_manhattan
 
 
 @dataclass(frozen=True)
@@ -20,127 +20,135 @@ class RoutePlanV2:
     confidence: float
     stalled: bool
     blocked: bool
+    route_edge_ids: List[str] = field(default_factory=list)
 
 
-def _build_graph(traversable_map: Optional[Dict[str, object]]) -> Dict[Tuple[int, int], int]:
-    if not traversable_map:
-        return {}
-    points = traversable_map.get("points", [])
-    return {(int(p["x"]), int(p["y"])): int(p.get("visits", 1)) for p in points if "x" in p and "y" in p}
+def _edge_cost(edge, blackboard: BlackboardStateV2) -> float:
+    cfg = blackboard.metadata.get("routing_config", {}) if isinstance(blackboard.metadata, dict) else {}
+    blocked_penalty = float(cfg.get("blocked_edge_penalty", 2.0))
+    unknown_penalty = float(cfg.get("unknown_edge_penalty", 0.5))
+    transition_penalty = float(cfg.get("transition_edge_penalty", 1.0))
+    cost = 1.0
+    cost += blocked_penalty * float(edge.blocked_count > edge.success_count)
+    cost += unknown_penalty * float(edge.confidence < 0.4)
+    cost += transition_penalty * float(edge.transition_type == "transition")
+    return cost
 
 
-def _bfs_distance(start: Tuple[int, int], graph: Dict[Tuple[int, int], int]) -> Dict[Tuple[int, int], int]:
-    dist: Dict[Tuple[int, int], int] = {start: 0}
-    q: deque = deque([start])
-    while q:
-        x, y = q.popleft()
-        for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
-            if (nx, ny) not in graph or (nx, ny) in dist:
+def _access_cells(blackboard: BlackboardStateV2, target: CandidatePOIV2) -> List[Tuple[int, int]]:
+    for profile in blackboard.target_access_table:
+        if profile.poi_id == target.poi_id and profile.access_cells:
+            return list(profile.access_cells)
+    centroid = (int(round(target.centroid[0])), int(round(target.centroid[1])))
+    return point_neighbors4(centroid)
+
+
+def build_route_context(blackboard: BlackboardStateV2, target: CandidatePOIV2) -> Tuple[Dict[Tuple[int, int], List[Tuple[Tuple[int, int], float, str]]], List[Tuple[int, int]]]:
+    adjacency: Dict[Tuple[int, int], List[Tuple[Tuple[int, int], float, str]]] = {}
+    for edge in blackboard.navigation_edges:
+        adjacency.setdefault(edge.src_cell, []).append((edge.dst_cell, _edge_cost(edge, blackboard), edge.edge_id))
+    return adjacency, _access_cells(blackboard, target)
+
+
+def _shortest_path(
+    blackboard: BlackboardStateV2,
+    start: Tuple[int, int],
+    goals: List[Tuple[int, int]],
+    adjacency: Optional[Dict[Tuple[int, int], List[Tuple[Tuple[int, int], float, str]]]] = None,
+) -> Tuple[Optional[List[Tuple[int, int]]], List[str], Optional[float]]:
+    if adjacency is None:
+        adjacency = {}
+        for edge in blackboard.navigation_edges:
+            adjacency.setdefault(edge.src_cell, []).append((edge.dst_cell, _edge_cost(edge, blackboard), edge.edge_id))
+    goal_set = set(goals)
+    heap: List[Tuple[float, Tuple[int, int], List[Tuple[int, int]], List[str]]] = [(0.0, start, [start], [])]
+    best: Dict[Tuple[int, int], float] = {start: 0.0}
+    while heap:
+        cost, node, path, ids = heapq.heappop(heap)
+        if node in goal_set:
+            return path, ids, cost
+        if cost > best.get(node, float("inf")):
+            continue
+        for nxt, edge_cost_value, edge_id in adjacency.get(node, []):
+            new_cost = cost + edge_cost_value
+            if new_cost >= best.get(nxt, float("inf")):
                 continue
-            dist[(nx, ny)] = dist[(x, y)] + 1
-            q.append((nx, ny))
-    return dist
-
-
-def _target_cells(target: BBox) -> List[Tuple[int, int]]:
-    return [(x, y) for x in range(target.x1, target.x2 + 1) for y in range(target.y1, target.y2 + 1)]
-
-
-def _distance_to_bbox(point: Tuple[int, int], bbox: BBox) -> float:
-    x, y = point
-    if bbox.x1 <= x <= bbox.x2 and bbox.y1 <= y <= bbox.y2:
-        return 0.0
-    dx = max(bbox.x1 - x, 0, x - bbox.x2)
-    dy = max(bbox.y1 - y, 0, y - bbox.y2)
-    return float(dx + dy)
+            best[nxt] = new_cost
+            heapq.heappush(heap, (new_cost, nxt, path + [nxt], ids + [edge_id]))
+    return None, [], None
 
 
 def plan_route(
     blackboard: BlackboardStateV2,
     target: CandidatePOIV2,
-    current: Tuple[int, int],
-    prev_distance: Optional[float],
+    current_cell: Tuple[int, int],
+    prev_distance: Optional[float] = None,
+    route_context: Optional[Tuple[Dict[Tuple[int, int], List[Tuple[Tuple[int, int], float, str]]], List[Tuple[int, int]]]] = None,
 ) -> RoutePlanV2:
-    graph = _build_graph(blackboard.traversable_map)
-    if not graph or current not in graph:
-        distance = _distance_to_bbox(current, target.bbox)
-        delta = None if prev_distance is None else prev_distance - distance
-        return RoutePlanV2(
-            next_subgoal=None,
-            distance_estimate=distance,
-            distance_prev=distance,
-            distance_delta=delta,
-            progress_valid=False,
-            progress_reason="fallback_euclidean",
-            fallback_mode="euclidean",
-            confidence=0.2,
-            stalled=False,
-            blocked=True,
-        )
-
-    target_cells = _target_cells(target.bbox)
-    traversable_targets = [cell for cell in target_cells if cell in graph]
-    if traversable_targets:
-        anchor = min(traversable_targets, key=lambda cell: abs(cell[0] - current[0]) + abs(cell[1] - current[1]))
-        distance_map = _bfs_distance(anchor, graph)
-        progress_reason = "graph_to_target"
-        fallback_mode = None
+    if route_context is None:
+        adjacency, goals = build_route_context(blackboard, target)
     else:
-        anchor = min(graph.keys(), key=lambda cell: _distance_to_bbox(cell, target.bbox))
-        distance_map = _bfs_distance(anchor, graph)
-        progress_reason = "graph_to_anchor"
-        fallback_mode = "anchor"
-
-    if current not in distance_map:
+        adjacency, goals = route_context
+    path, edge_ids, distance = _shortest_path(blackboard, current_cell, goals, adjacency=adjacency)
+    if path and len(path) >= 2:
+        next_subgoal = path[1]
+        distance_prev = float(len(path) - 1)
+        distance_estimate = float(len(path) - 2)
+        delta = distance_prev - distance_estimate
         return RoutePlanV2(
-            next_subgoal=None,
-            distance_estimate=None,
-            distance_prev=None,
-            distance_delta=None,
+            next_subgoal=next_subgoal,
+            distance_estimate=distance_estimate,
+            distance_prev=distance_prev,
+            distance_delta=delta,
+            progress_valid=True,
+            progress_reason="navigation_path",
+            fallback_mode=None,
+            confidence=0.8,
+            stalled=delta <= 0.0,
+            blocked=False,
+            route_edge_ids=edge_ids,
+        )
+    if path and len(path) == 1:
+        return RoutePlanV2(
+            next_subgoal=current_cell,
+            distance_estimate=0.0,
+            distance_prev=0.0,
+            distance_delta=0.0 if prev_distance is None else prev_distance,
+            progress_valid=True,
+            progress_reason="already_at_access_cell",
+            fallback_mode=None,
+            confidence=0.9,
+            stalled=False,
+            blocked=False,
+            route_edge_ids=edge_ids,
+        )
+    fallback_candidates = sorted(goals, key=lambda cell: point_manhattan(current_cell, cell))
+    if fallback_candidates:
+        next_subgoal = fallback_candidates[0]
+        dist_prev = float(point_manhattan(current_cell, next_subgoal))
+        return RoutePlanV2(
+            next_subgoal=next_subgoal,
+            distance_estimate=max(0.0, dist_prev - 1.0),
+            distance_prev=dist_prev,
+            distance_delta=(prev_distance - max(0.0, dist_prev - 1.0)) if prev_distance is not None else None,
             progress_valid=False,
-            progress_reason="current_off_path",
-            fallback_mode=fallback_mode,
+            progress_reason="local_probe_subgoal",
+            fallback_mode="local_probe",
             confidence=0.3,
             stalled=False,
-            blocked=True,
+            blocked=False,
+            route_edge_ids=[],
         )
-
-    current_distance = float(distance_map[current])
-    best_neighbor: Optional[Tuple[int, int]] = None
-    best_distance: Optional[float] = None
-    for neighbor in ((current[0] - 1, current[1]), (current[0] + 1, current[1]), (current[0], current[1] - 1), (current[0], current[1] + 1)):
-        if neighbor not in distance_map:
-            continue
-        neighbor_distance = float(distance_map[neighbor])
-        if best_distance is None or neighbor_distance < best_distance:
-            best_neighbor = neighbor
-            best_distance = neighbor_distance
-
-    if best_neighbor is None:
-        return RoutePlanV2(
-            next_subgoal=None,
-            distance_estimate=None,
-            distance_prev=current_distance,
-            distance_delta=None,
-            progress_valid=False,
-            progress_reason="no_routed_neighbor",
-            fallback_mode=fallback_mode,
-            confidence=0.3,
-            stalled=False,
-            blocked=True,
-        )
-
-    distance_delta = current_distance - float(best_distance)
-    stalled = bool(distance_delta <= 0.0)
     return RoutePlanV2(
-        next_subgoal=best_neighbor,
-        distance_estimate=float(best_distance),
-        distance_prev=current_distance,
-        distance_delta=distance_delta,
-        progress_valid=True,
-        progress_reason=progress_reason,
-        fallback_mode=fallback_mode,
-        confidence=0.8 if not stalled else 0.4,
-        stalled=stalled,
-        blocked=False,
+        next_subgoal=None,
+        distance_estimate=None,
+        distance_prev=prev_distance,
+        distance_delta=None,
+        progress_valid=False,
+        progress_reason="no_route",
+        fallback_mode="none",
+        confidence=0.0,
+        stalled=True,
+        blocked=True,
+        route_edge_ids=[],
     )

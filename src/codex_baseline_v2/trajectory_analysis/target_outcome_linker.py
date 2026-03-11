@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import List, Optional, Tuple
 
+from codex_baseline_v2.shared.metrics import normalize_consequence_class
 from codex_baseline_v2.shared.schemas import ConsequenceRecordV2, ControllerInstructionV2, SCHEMA_VERSION, TrajectoryEpisodeV2
 from codex_baseline_v2.shared.utils import BBox, grid_diff
 
@@ -44,7 +45,7 @@ def link_outcomes(
                         terminal_flag_changed=bool(step.done),
                         object_change_summary="invalid_target_link",
                         followup_poi_ids=[],
-                        consequence_class="invalid_target_link" if targeted else "no_progress",
+                        consequence_class=normalize_consequence_class("invalid_target_link" if targeted else "no_progress"),
                     )
                 )
         return consequences
@@ -106,7 +107,7 @@ def link_outcomes(
                     terminal_flag_changed=bool(step.done),
                     object_change_summary="target_outcome",
                     followup_poi_ids=[],
-                    consequence_class=outcome_class,
+                    consequence_class=normalize_consequence_class(outcome_class),
                 )
             )
     return consequences

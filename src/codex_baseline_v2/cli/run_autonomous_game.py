@@ -5,7 +5,8 @@ import importlib
 import json
 from typing import Any, Callable
 
-from codex_baseline_v2.runtime.round_orchestrator import run_autonomous_rounds
+from codex_baseline_v2.runtime.postrun_exports import generate_postrun_session_heatmaps
+from codex_baseline_v2.runtime.round_orchestrator import export_postrun_heatmaps, run_autonomous_rounds
 from codex_baseline_v2.shared.config import load_config
 
 
@@ -52,9 +53,20 @@ def main() -> None:
         except TypeError:
             return env_factory()
 
-    print(f"[v2] autonomous_start game_id={game_id} storage_root={storage_root}", flush=True)
-    run_autonomous_rounds(cfg, factory_wrapper, env_factory_path=env_factory_path, workers=int(args.workers))
-    print(f"[v2] autonomous_done game_id={game_id}", flush=True)
+    offline_local = True
+    print(f"[v2] autonomous_start game_id={game_id} storage_root={storage_root} execution_mode=offline_local", flush=True)
+    summary = run_autonomous_rounds(cfg, factory_wrapper, env_factory_path=env_factory_path, workers=int(args.workers))
+    postrun_handles = export_postrun_heatmaps(cfg, summary)
+    if getattr(cfg.visualization, "generate_heatmaps_postrun_only", True):
+        generate_postrun_session_heatmaps(
+            postrun_handles["session_dir"],
+            postrun_handles["session_state_or_artifacts"],
+            cfg,
+        )
+    print(
+        f"[v2] autonomous_done game_id={game_id} wins={int(summary.get('wins', 0))} max_steps_per_game={int(summary.get('max_steps_per_game', 0))}",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

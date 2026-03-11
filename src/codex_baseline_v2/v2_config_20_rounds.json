@@ -1,0 +1,165 @@
+{
+  "analyst": {
+    "avatar_motion_threshold": 0.5,
+    "bg_border_weight": 0.35,
+    "bg_connected_weight": 0.2,
+    "bg_frequency_weight": 0.45,
+    "connectivity": 4,
+    "hud_height_ratio": 0.15,
+    "hud_width_ratio": 0.7,
+    "min_area": 1
+  },
+  "collection": {
+    "action_repeat_limit": 4,
+    "directed_probe_episodes": 150,
+    "initial_probe_episodes": 150,
+    "max_steps_per_episode": 200,
+    "max_steps_per_instruction": 200,
+    "seed": 0
+  },
+  "controller": {
+    "confidence_weight": 1.0,
+    "exploit_confidence_threshold": 0.7,
+    "info_gain_weight": 1.0,
+    "random_seed": 0,
+    "reachability_weight": 0.5,
+    "route_confidence_threshold": 0.6,
+    "unguided_probe_fraction": 0.2
+  },
+  "dataset_or_rollout_source": {
+    "episodes_per_round": 8,
+    "max_steps_per_episode": 200,
+    "mode": "collect",
+    "trajectory_path": "runs_v2/trajectory"
+  },
+  "env": {
+    "env_factory": "arc_agi_agent.envs.arc_env_factory:create_env",
+    "env_id": "ls20",
+    "env_root": "arc-agi/test_environment_files"
+  },
+  "executor": {
+    "blocked_repeat_limit": 4,
+    "max_steps": 200,
+    "target_reach_distance": 1.5
+  },
+  "game_id": "ls20",
+  "logging": {
+    "log_dir": "runs_v2/logs"
+  },
+  "memory": {
+    "atomic_writes": true,
+    "storage_dir": "runs_v2"
+  },
+  "resume": {
+    "reload_latest_blackboard": false,
+    "reload_unfinished_round": false
+  },
+  "rounds": 20,
+  "routing": {
+    "blocked_retry_limit": 6,
+    "local_probe_radius": 3,
+    "route_stall_limit": 8,
+    "use_graph_distance": true
+  },
+  "runtime": {
+    "fail_on_missing_live_env": true,
+    "max_rounds": 20,
+    "resume_if_exists": false
+  },
+  "hidden_trigger": {
+    "min_region_visits_for_candidate": 4,
+    "min_boundary_crossings_for_candidate": 3,
+    "dwell_step_thresholds": [2, 4, 6],
+    "min_activation_support": 3,
+    "null_penalty": 0.25,
+    "contradiction_penalty": 0.5,
+    "promotion_threshold": 0.78,
+    "merge_iou_threshold": 0.5,
+    "merge_cell_overlap_threshold": 0.6
+  },
+  "causal_chain": {
+    "immediate_delay_max": 2,
+    "delayed_delay_max": 8,
+    "post_transition_delay_max": 16,
+    "max_chain_hops": 4,
+    "min_sequence_support": 3,
+    "sequence_match_threshold": 0.7,
+    "partial_match_weight": 0.35,
+    "contradiction_penalty": 0.5,
+    "promotion_threshold": 0.8
+  },
+  "probe_mode": {
+    "max_step_on_region_steps": 8,
+    "max_dwell_probe_steps": 10,
+    "max_action_in_region_steps": 8,
+    "max_boundary_cross_steps": 8,
+    "max_side_contact_steps": 8,
+    "counterfactual_probe_budget": 20
+  },
+  "sequence_mining": {
+    "min_pattern_length": 2,
+    "max_pattern_length": 5,
+    "delay_bucket_edges": [0, 2, 8, 16],
+    "same_area_bonus": 0.15,
+    "cross_area_bonus": 0.2,
+    "topology_bonus": 0.2
+  },
+  "controller_exploration": {
+    "hidden_trigger_probe_weight": 1.0,
+    "causal_chain_verification_weight": 0.9,
+    "counterfactual_probe_weight": 0.7,
+    "null_result_penalty": 0.4,
+    "fragment_novelty_weight": 0.8
+  },
+  "scheduler": {
+    "discriminating_probe_fraction": 0.25,
+    "exploit_fraction": 0.05,
+    "poi_approach_fraction": 0.3,
+    "poi_interaction_fraction": 0.2,
+    "unguided_min_fraction": 0.2
+  },
+  "scoring": {
+    "consequence_weight_global": 1.0,
+    "consequence_weight_local": 0.7,
+    "controller_target_weight": 1.0,
+    "executor_progress_weight": 1.0,
+    "hypothesis_info_gain_weight": 1.0,
+    "poi_rank_weight_confidence": 1.0,
+    "poi_rank_weight_info_gain": 1.0,
+    "poi_rank_weight_reachability": 0.5
+  },
+  "storage": {
+    "atomic_writes": true,
+    "backend": "files",
+    "keep_raw_env_payloads": false,
+    "keep_raw_frames": true,
+    "root_dir": "runs_v2"
+  },
+  "target_scoring": {
+    "confidence_weight": 1.0,
+    "consequence_weight": 1.0,
+    "information_gain_weight": 1.0,
+    "likely_hud_penalty": 0.5,
+    "proximity_weight": 1.0,
+    "stale_penalty": 0.2
+  },
+  "trajectory_analysis": {
+    "consequence_hotspot_threshold": 0.2,
+    "episode_analysis_chunk_size": null,
+    "episode_analysis_workers": null,
+    "min_episodes": 12,
+    "min_poi_persistence": 2,
+    "motion_hotspot_threshold": 0.2,
+    "parallel_area_assign": true,
+    "traversable_min_visits": 2
+  },
+  "debug": {
+    "export_causal_chain_hypotheses": false,
+    "export_counterfactual_traces": false,
+    "export_event_graph": false,
+    "export_event_sequence_patterns": false,
+    "export_hidden_trigger_hypotheses": false,
+    "export_trigger_zones": false,
+    "keep_invalid_steps_for_debug": false
+  }
+}

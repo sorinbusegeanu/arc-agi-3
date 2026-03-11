@@ -4,7 +4,7 @@ import random
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-from codex_baseline_v2.shared.schemas import ActionDescriptorV2, ControllerInstructionV2, SCHEMA_VERSION
+from codex_baseline_v2.shared.schemas import ActionContextStatsV2, ActionDescriptorV2, ActionSemanticsStatsV2, ControllerInstructionV2, SCHEMA_VERSION
 
 
 @dataclass
@@ -18,6 +18,9 @@ class PolicyStateV2:
     action_motion_map: Dict[int, Tuple[int, int]] = field(default_factory=dict)
     recent_positions: List[Tuple[int, int]] = field(default_factory=list)
     recent_actions: List[int] = field(default_factory=list)
+    action_semantics_table: List[ActionSemanticsStatsV2] = field(default_factory=list)
+    action_context_table: List[ActionContextStatsV2] = field(default_factory=list)
+    action_context_key: Optional[str] = None
 
 
 class TrajectoryPolicyV2:
@@ -80,6 +83,8 @@ class TrajectoryPolicyV2:
             3: (0, 1),
         }
         scored: List[Tuple[float, int]] = []
+        semantics_by_action = {row.action_id: row for row in state.action_semantics_table}
+        context_by_action = {(row.action_id, row.context_key): row for row in state.action_context_table}
         for action_id in available_actions:
             motion = state.action_motion_map.get(action_id, semantic_map.get(action_id, (0, 0)))
             next_pos = cur if cur is not None else (0, 0)
@@ -97,6 +102,16 @@ class TrajectoryPolicyV2:
                 score += 2.5
             elif desired_dy != 0 and motion[1] == desired_dy:
                 score += 2.5
+            semantics = semantics_by_action.get(int(action_id))
+            if semantics is not None:
+                score += semantics.confidence * 2.0
+                score -= (semantics.blocked_count / float(max(1, semantics.sample_count))) * 2.0
+                score -= (semantics.noop_count / float(max(1, semantics.sample_count))) * 1.5
+            context_stats = context_by_action.get((int(action_id), state.action_context_key or ""))
+            if context_stats is not None:
+                score += context_stats.success_rate * 3.0
+                score -= context_stats.blocked_rate * 2.0
+                score -= context_stats.transition_rate * 0.5
             if state.last_action and state.last_action.action_id == action_id:
                 score -= 0.5
             if motion == (0, 0):

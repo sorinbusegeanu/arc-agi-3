@@ -6,7 +6,7 @@ import os
 
 from codex_baseline_v2.analyst.analyst import analyze_episodes
 from codex_baseline_v2.adapters.trajectory_import import import_legacy_from_path
-from codex_baseline_v2.memory.store import append_round_report, save_blackboard
+from codex_baseline_v2.memory.store import append_round_report, load_blackboard, save_blackboard
 from codex_baseline_v2.shared.config import load_config
 from codex_baseline_v2.shared.storage import StoragePathsV2
 from codex_baseline_v2.trajectory_analysis.analyzer import analyze_trajectories
@@ -18,6 +18,7 @@ def main() -> None:
     parser.add_argument("--config", required=True)
     parser.add_argument("--round-id", type=int, default=0)
     parser.add_argument("--trajectory-path", required=True)
+    parser.add_argument("--prior-blackboard", default=None)
     parser.add_argument("--debug-export", action="store_true")
     args = parser.parse_args()
 
@@ -30,7 +31,13 @@ def main() -> None:
 
     episodes = import_legacy_from_path(args.trajectory_path, game_id_override=cfg.game_id)
     analyzed = analyze_episodes(episodes, cfg.analyst)
-    blackboard = analyze_trajectories(analyzed, cfg.trajectory_analysis, round_id=args.round_id)
+    prior = None
+    if args.prior_blackboard:
+        with open(args.prior_blackboard, "r", encoding="utf-8") as handle:
+            prior = BlackboardStateV2.from_dict(json.load(handle))
+    elif args.round_id > 0:
+        prior = load_blackboard(storage, cfg.game_id)
+    blackboard = analyze_trajectories(analyzed, cfg.trajectory_analysis, round_id=args.round_id, prior_blackboard=prior)
     save_blackboard(cfg.memory, storage, blackboard)
 
     report = {"round_id": args.round_id, "game_id": cfg.game_id, "poi_count": len(blackboard.poi_table)}

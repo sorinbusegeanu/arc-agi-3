@@ -1,0 +1,1363 @@
+1. Multi-Agent Runtime Contract for V2.5
+1.1 Scope
+
+Build a Ray-based multi-agent runtime on top of the current src/codex_baseline_v2 implementation.
+
+The new runtime must:
+
+preserve current symbolic / heuristic logic
+
+preserve current round lifecycle
+
+preserve current artifact outputs
+
+preserve central blackboard semantics
+
+preserve central planner final-decision semantics
+
+The new runtime must not:
+
+redesign the symbolic planner
+
+redesign blackboard merge logic
+
+replace current skill induction or plan memory logic
+
+introduce peer-to-peer free-form agent chat
+
+make helper agents authoritative
+
+1.2 Components
+Coordinator
+
+Owns the round lifecycle for one game session.
+
+Responsibilities:
+
+start and stop rounds
+
+dispatch probe and directed execution work
+
+request analysis
+
+request blackboard merge
+
+request memory reconciliation
+
+request planning
+
+dispatch final selected plan for execution
+
+trigger persistence
+
+manage budgets, pass ordering, retries, and stop conditions
+
+Authority:
+
+orchestration only
+
+no world-state merge
+
+no final plan scoring logic
+
+no direct file writes
+
+Cardinality:
+
+one per game session
+
+EnvWorker
+
+Owns one live environment instance.
+
+Responsibilities:
+
+create/reset env
+
+run probe episodes
+
+run directed episodes from planner-selected requests
+
+return raw episode payloads and execution outcomes
+
+Authority:
+
+env stepping only
+
+no blackboard updates
+
+no memory updates
+
+no artifact writes
+
+Cardinality:
+
+N per game session or shared worker pool
+
+EpisodeAnalyzerWorker
+
+Transforms raw episodes into enriched symbolic episodes.
+
+Responsibilities:
+
+run observation analysis
+
+derive objects, avatar candidates, POIs, area summaries, motion summaries
+
+produce analyzed episodes and episode-level analysis outputs
+
+Authority:
+
+episode-local enrichment only
+
+no cumulative merge
+
+no final world-state commitment
+
+Cardinality:
+
+worker pool
+
+BlackboardService
+
+Owns the authoritative cumulative world state for one game.
+
+Responsibilities:
+
+accept analyzed episode outputs
+
+merge them into cumulative blackboard state
+
+maintain canonical tables and indexes
+
+publish immutable snapshots for planning and helper work
+
+Authority:
+
+single writer for world-state
+
+only service allowed to commit cumulative world-state changes
+
+Cardinality:
+
+one per game session
+
+SkillPlanMemoryService
+
+Owns tactical memory for one game.
+
+Responsibilities:
+
+maintain skills
+
+maintain skill execution history
+
+maintain retries, cooldowns, exhaustion, cluster state
+
+maintain plan-memory ledger
+
+reconcile memory after outcomes
+
+Authority:
+
+single writer for skill/plan memory
+
+Cardinality:
+
+one per game session
+
+PlannerService
+
+Owns final plan selection.
+
+Responsibilities:
+
+read latest blackboard snapshot
+
+read latest skill/plan memory snapshot
+
+build belief state
+
+generate candidate skills/options
+
+score, filter, rerank, and finalize candidates
+
+select one final plan decision
+
+Authority:
+
+only component allowed to produce final selected plan
+
+Cardinality:
+
+one per game session
+
+PlanningHelperWorker
+
+Performs speculative planning work on immutable snapshots.
+
+Responsibilities:
+
+candidate expansion
+
+route precomputation
+
+route risk / progress estimates
+
+ranking feature computation
+
+hypothesis proposals
+
+pruning suggestions
+
+Authority:
+
+proposal only
+
+never authoritative
+
+never commits state
+
+Cardinality:
+
+worker pool
+
+RankerService
+
+Provides ranking-related support.
+
+Responsibilities:
+
+maintain learned or reconstructed ranking state
+
+compute or serve ranking features/scores to planner
+
+update ranking state from outcomes if enabled
+
+Authority:
+
+advisory only
+
+no final plan ownership
+
+Cardinality:
+
+one per run or one per game
+
+StorageService
+
+Owns durable artifact persistence.
+
+Responsibilities:
+
+write blackboard snapshots
+
+write plans, plan failures, round reports, rankings, skills, executions
+
+write trajectory artifacts
+
+manage ordered durable writes
+
+optionally manage SQLite indexes and internal stores
+
+Authority:
+
+single writer for durable artifacts
+
+Cardinality:
+
+one per run or one per game
+
+1.3 Ownership rules
+Rule A
+
+BlackboardService is the only component allowed to commit cumulative world-state changes.
+
+Rule B
+
+SkillPlanMemoryService is the only component allowed to commit skill and plan memory changes.
+
+Rule C
+
+PlannerService is the only component allowed to choose the final plan.
+
+Rule D
+
+StorageService is the only component allowed to write authoritative durable artifacts.
+
+Rule E
+
+EnvWorkers never mutate blackboard, memory, ranking state, or durable artifacts.
+
+Rule F
+
+EpisodeAnalyzerWorkers never commit cumulative state.
+
+Rule G
+
+PlanningHelperWorkers return proposals only.
+
+Rule H
+
+All speculative outputs must carry snapshot version tags.
+
+Rule I
+
+Only results compatible with the latest accepted snapshot may be committed or used for final decision.
+
+1.4 Versioning and invalidation
+Version fields
+
+blackboard_version
+
+memory_version
+
+policy_version
+
+ranker_version
+
+plan_context_id
+
+Plan context
+
+A plan_context_id identifies one immutable planning context:
+
+blackboard snapshot version
+
+memory snapshot version
+
+policy/ranker version
+
+planner request metadata
+
+Validity rules
+
+A helper output is valid only if:
+
+its blackboard_version matches the planner’s accepted blackboard snapshot
+
+its memory_version matches the planner’s accepted memory snapshot
+
+its policy_version is compatible with current planner policy/ranker state
+
+Invalidation rules
+
+Invalidate helper outputs when:
+
+blackboard changes in a way that affects reachable targets, POIs, area relations, triggers, or consequences
+
+memory changes in a way that affects retries, cooldowns, exhaustion, or already-tried actions
+
+ranker/policy version changes materially
+
+planner explicitly marks a helper result stale
+
+Reuse rule
+
+If a new blackboard version is published but a helper output is unaffected by the changed regions/entities, the planner may reuse it only if explicit compatibility checks pass.
+
+1.5 Ray mapping
+Component	Ray primitive	Cardinality	State
+Coordinator	Actor	1 per game	long-lived
+EnvWorker	Actor	N	long-lived
+EpisodeAnalyzerWorker	Task or Actor pool	M	stateless or light state
+BlackboardService	Actor	1 per game	long-lived authoritative
+SkillPlanMemoryService	Actor	1 per game	long-lived authoritative
+PlannerService	Actor	1 per game	long-lived authoritative
+PlanningHelperWorker	Task or Actor pool	K	speculative
+RankerService	Actor	1 per run/game	long-lived advisory
+StorageService	Actor	1 per run/game	long-lived authoritative
+1.6 Non-goals
+
+no symbolic logic rewrite
+
+no artifact schema redesign unless needed for transport/versioning
+
+no replacement of current planner stages
+
+no decentralization of blackboard writes
+
+no peer-to-peer autonomous chat between agents
+
+no learned-policy-first redesign
+
+no RLlib dependency in first implementation
+
+1.7 Migration order
+
+add Ray runtime package and bootstrap
+
+wrap EnvWorker
+
+wrap EpisodeAnalyzer worker pool
+
+wrap BlackboardService
+
+wrap SkillPlanMemoryService
+
+wrap PlannerService
+
+wrap StorageService
+
+implement Coordinator over current modules
+
+route one full game through Ray runtime
+
+add PlanningHelperWorkers
+
+optimize payload sizes and storage paths
+
+2. Component Interface Spec
+2.1 Coordinator
+Inputs
+
+run config
+
+env factory reference
+
+current round state
+
+planner decisions
+
+execution outcomes
+
+merge completion notifications
+
+persistence completion notifications
+
+Outputs
+
+probe execution requests
+
+directed execution requests
+
+analysis requests
+
+blackboard merge requests
+
+memory reconciliation requests
+
+planner requests
+
+persistence requests
+
+invalidation broadcasts
+
+Owned state
+
+current round number
+
+current pass number
+
+active budgets
+
+active task registry
+
+current accepted snapshot ids
+
+current selected plan id
+
+stop status
+
+Must never mutate
+
+cumulative blackboard internals
+
+skill/plan memory internals
+
+planner scoring internals
+
+durable artifacts directly
+
+2.2 EnvWorker
+Inputs
+
+probe episode request
+
+directed execution request
+
+env bootstrap parameters
+
+Outputs
+
+raw episode
+
+executor outcome
+
+worker telemetry
+
+env error result
+
+Owned state
+
+live env instance
+
+worker-local cached env metadata
+
+worker-local transient episode state
+
+Must never mutate
+
+blackboard
+
+skill memory
+
+planner state
+
+rankings
+
+storage
+
+2.3 EpisodeAnalyzerWorker
+Inputs
+
+raw episode
+
+optional analysis config
+
+optional blackboard snapshot handle for contextual lookup if needed
+
+Outputs
+
+analyzed episode
+
+episode analysis summary
+
+episode-local POI/object/avatar/area candidates
+
+analysis error result
+
+Owned state
+
+none required
+
+optional cached model/config resources
+
+Must never mutate
+
+cumulative blackboard
+
+skill memory
+
+planner state
+
+storage
+
+2.4 BlackboardService
+Inputs
+
+analyzed episode batch
+
+merge request
+
+snapshot request
+
+query request
+
+invalidation-support query
+
+Outputs
+
+merge result
+
+new blackboard_version
+
+blackboard snapshot handle
+
+blackboard delta summary
+
+affected-entity/region summary
+
+Owned state
+
+authoritative cumulative blackboard state
+
+canonical indexes and lookup tables
+
+snapshot registry
+
+Must never mutate
+
+skill/plan memory
+
+planner selected decision
+
+storage directly except through StorageService
+
+2.5 SkillPlanMemoryService
+Inputs
+
+execution outcomes
+
+planner decision metadata
+
+reconciliation request
+
+snapshot request
+
+Outputs
+
+memory reconciliation result
+
+new memory_version
+
+memory snapshot handle
+
+retry/cooldown/exhaustion summaries
+
+Owned state
+
+skills
+
+skill executions
+
+plan memory ledger
+
+retry/cooldown/exhaustion state
+
+Must never mutate
+
+blackboard
+
+planner selected decision after commit
+
+storage directly
+
+2.6 PlannerService
+Inputs
+
+planning request
+
+blackboard snapshot handle
+
+memory snapshot handle
+
+optional helper proposal batches
+
+optional ranker snapshot or score service handle
+
+Outputs
+
+planner decision
+
+candidate list summary
+
+blocked/failure summary
+
+helper invalidation hints
+
+selected plan_context_id
+
+Owned state
+
+planner config
+
+temporary candidate state for current request
+
+optional planner cache keyed by snapshot versions
+
+Must never mutate
+
+blackboard authoritative state
+
+skill/plan memory authoritative state
+
+durable storage directly
+
+2.7 PlanningHelperWorker
+Inputs
+
+helper task request
+
+planning context snapshot
+
+helper mode
+
+Outputs
+
+candidate batch
+
+route analysis result
+
+score feature batch
+
+hypothesis proposal batch
+
+pruning suggestion batch
+
+Owned state
+
+optional cache keyed by snapshot version and helper mode
+
+Must never mutate
+
+blackboard
+
+memory
+
+planner final decision
+
+storage
+
+2.8 RankerService
+Inputs
+
+score request
+
+ranking update request
+
+ranking snapshot request
+
+Outputs
+
+score batch
+
+ranking state summary
+
+ranker_version
+
+Owned state
+
+ranking artifacts/state
+
+learned or reconstructed ranking caches
+
+Must never mutate
+
+blackboard
+
+memory
+
+final planner decision
+
+storage directly
+
+2.9 StorageService
+Inputs
+
+persistence request
+
+checkpoint request
+
+export request
+
+Outputs
+
+persistence result
+
+artifact manifest
+
+durable version or write marker
+
+storage error result
+
+Owned state
+
+write ordering state
+
+artifact index
+
+SQLite/internal storage handles
+
+export configuration
+
+Must never mutate
+
+blackboard semantics
+
+planner decisions
+
+memory semantics
+
+3. Message and Payload Schemas
+3.1 RawEpisode
+
+Fields:
+
+session_id
+
+game_id
+
+round_id
+
+episode_id
+
+episode_kind (probe or directed)
+
+worker_id
+
+env_seed
+
+steps
+
+terminal_status
+
+total_reward
+
+started_at
+
+finished_at
+
+trace_ref
+
+3.2 RawStep
+
+Fields:
+
+step_idx
+
+action
+
+action_metadata
+
+state_hash_before
+
+state_hash_after
+
+reward
+
+done
+
+info
+
+target_metadata
+
+observation_ref_before
+
+observation_ref_after
+
+3.3 AnalyzedEpisode
+
+Fields:
+
+raw_episode_ref
+
+analysis_id
+
+episode_summary
+
+analyzed_steps
+
+objects
+
+avatar_candidates
+
+pois
+
+area_candidates
+
+motion_summary
+
+analysis_errors
+
+3.4 BlackboardMergeRequest
+
+Fields:
+
+session_id
+
+game_id
+
+round_id
+
+analyzed_episode_refs
+
+base_blackboard_version
+
+merge_reason
+
+3.5 BlackboardMergeResult
+
+Fields:
+
+blackboard_version
+
+snapshot_handle
+
+delta_summary
+
+affected_entities
+
+affected_regions
+
+merge_stats
+
+3.6 MemoryReconcileRequest
+
+Fields:
+
+session_id
+
+game_id
+
+round_id
+
+execution_outcome_refs
+
+planner_decision_refs
+
+base_memory_version
+
+3.7 MemoryReconcileResult
+
+Fields:
+
+memory_version
+
+snapshot_handle
+
+new_skill_ids
+
+updated_retry_state
+
+updated_cooldowns
+
+updated_exhaustion
+
+reconcile_stats
+
+3.8 PlanningContextSnapshot
+
+Fields:
+
+plan_context_id
+
+session_id
+
+game_id
+
+round_id
+
+blackboard_version
+
+blackboard_snapshot_handle
+
+memory_version
+
+memory_snapshot_handle
+
+policy_version
+
+ranker_version
+
+request_reason
+
+3.9 HelperTaskRequest
+
+Fields:
+
+plan_context_id
+
+helper_mode
+
+task_id
+
+constraints
+
+budget
+
+priority
+
+3.10 CandidateBatch
+
+Fields:
+
+plan_context_id
+
+task_id
+
+candidate_type
+
+candidates
+
+generator_metadata
+
+3.11 RouteAnalysisResult
+
+Fields:
+
+plan_context_id
+
+task_id
+
+route_candidates
+
+route_scores
+
+blocking_explanations
+
+risk_flags
+
+3.12 ScoreFeatureBatch
+
+Fields:
+
+plan_context_id
+
+task_id
+
+candidate_scores
+
+feature_vectors
+
+scoring_metadata
+
+3.13 HypothesisProposalBatch
+
+Fields:
+
+plan_context_id
+
+task_id
+
+hypotheses
+
+proposal_confidence
+
+proposal_metadata
+
+3.14 PlannerDecision
+
+Fields:
+
+session_id
+
+game_id
+
+round_id
+
+plan_context_id
+
+decision_id
+
+selected_plan
+
+selected_candidate_id
+
+selected_skill_id
+
+decision_summary
+
+fallback_candidates
+
+planner_stats
+
+3.15 ExecutorRequest
+
+Fields:
+
+session_id
+
+game_id
+
+round_id
+
+decision_id
+
+selected_plan
+
+execution_budget
+
+executor_mode
+
+3.16 ExecutorOutcome
+
+Fields:
+
+session_id
+
+game_id
+
+round_id
+
+decision_id
+
+episode_id
+
+outcome_type
+
+outcome_summary
+
+progress_score
+
+reward_summary
+
+trace_ref
+
+3.17 PersistenceRequest
+
+Fields:
+
+session_id
+
+game_id
+
+round_id
+
+artifact_group
+
+artifact_payload_refs
+
+write_reason
+
+base_durable_marker
+
+3.18 InvalidationEvent
+
+Fields:
+
+session_id
+
+game_id
+
+round_id
+
+invalidated_plan_context_ids
+
+blackboard_version
+
+memory_version
+
+policy_version
+
+reason
+
+affected_entities
+
+affected_regions
+
+4. Migration / Build Plan Mapped to V2.5
+Phase 1: Add Ray runtime shell
+
+Create new package:
+
+src/codex_baseline_v2/runtime_ray/
+
+Create modules:
+
+bootstrap.py
+
+coordinator_actor.py
+
+env_worker_actor.py
+
+analysis_pool.py
+
+blackboard_actor.py
+
+skill_memory_actor.py
+
+planner_actor.py
+
+helper_pool.py
+
+ranker_actor.py
+
+storage_actor.py
+
+messages.py
+
+versions.py
+
+Do not change current symbolic logic yet.
+
+Phase 2: Wrap existing runtime modules
+Existing v2.5 modules to reuse
+
+runtime/round_orchestrator.py
+
+runtime/trajectory_collector.py
+
+analyst/analyst.py
+
+trajectory_analysis/analyzer.py
+
+planning/planner_state_builder.py
+
+planning/hierarchical_planner.py
+
+planning/skill_inducer.py
+
+planning/skill_library.py
+
+planning/plan_memory.py
+
+executor/online_executor.py
+
+executor/option_executor.py
+
+memory/store.py
+
+shared/storage.py
+
+storage/sqlite_intermediates.py
+
+Wrapping rule
+
+The new Ray layer must call into these modules as adapters.
+Do not rewrite their internal reasoning in the first pass.
+
+Phase 3: Coordinator integration
+
+Implement CoordinatorActor as the new owner of the round lifecycle currently handled in runtime/round_orchestrator.py.
+
+The first Ray end-to-end path should still follow the existing lifecycle:
+
+collect probe episodes
+
+analyze episodes
+
+merge cumulative blackboard
+
+reconcile skills/memory
+
+build plan
+
+execute directed episode
+
+re-analyze and merge
+
+persist artifacts
+
+Phase 4: Env worker integration
+
+Implement EnvWorkerActor by wrapping the current collection and execution paths:
+
+probe path from runtime/trajectory_collector.py
+
+directed execution path from executor/online_executor.py and executor/option_executor.py
+
+Workers must only return raw episodes and execution outcomes.
+
+Phase 5: Analysis worker integration
+
+Implement EpisodeAnalyzerWorker over analyst/analyst.py.
+
+Keep episode analysis stateless.
+It should accept RawEpisode and return AnalyzedEpisode.
+
+Phase 6: Blackboard actor integration
+
+Implement BlackboardActor over trajectory_analysis/analyzer.py.
+
+This actor must:
+
+own latest blackboard
+
+expose snapshot creation
+
+accept merge requests
+
+produce versioned merge results
+
+Do not parallelize internal merge semantics yet.
+
+Phase 7: Skill/memory actor integration
+
+Implement SkillMemoryActor over:
+
+planning/skill_inducer.py
+
+planning/skill_library.py
+
+planning/plan_memory.py
+
+This actor must own skill and plan memory writes.
+
+Phase 8: Planner actor integration
+
+Implement PlannerActor over:
+
+planning/planner_state_builder.py
+
+planning/hierarchical_planner.py
+
+Keep final decision centralized.
+
+Phase 9: Storage actor integration
+
+Implement StorageActor over:
+
+memory/store.py
+
+shared/storage.py
+
+storage/sqlite_intermediates.py
+
+Move all durable writes through this actor.
+
+Phase 10: Replace direct orchestration path
+
+Add a new CLI entrypoint parallel to current runtime:
+
+run_autonomous_game_ray
+
+Do not remove the current non-Ray path initially.
+
+The Ray path should produce the same artifact families as the current path.
+
+Phase 11: Add planning helper workers
+
+After the basic Ray runtime is stable, add PlanningHelperWorker modes:
+
+candidate generation
+
+route analysis
+
+score feature computation
+
+hypothesis proposal
+
+pruning suggestion
+
+Each helper must consume PlanningContextSnapshot and return version-tagged proposal outputs only.
+
+Phase 12: Optimize data movement and storage
+
+After functional correctness:
+
+move large internal indexes to SQLite
+
+avoid shipping full blackboards repeatedly
+
+use snapshot handles and payload refs
+
+batch persistence writes
+
+5. Implementation constraints for Codex
+
+keep current v2.5 logic as source of truth
+
+add orchestration layer first, not logic rewrite
+
+preserve artifact compatibility
+
+preserve current round semantics
+
+centralize authoritative writes
+
+version-tag all speculative outputs
+
+keep helper workers optional behind config
+
+keep non-Ray runtime available during migration
+
+6. Definition of done
+
+one full game can run through the Ray runtime
+
+probe and directed episodes both work
+
+blackboard remains single-writer
+
+skill/plan memory remains single-writer
+
+planner remains final decision authority
+
+storage remains single-writer for durable artifacts
+
+helper outputs are version-tagged and non-authoritative
+
+current artifact families are still produced
+
+old non-Ray path still exists during migration
