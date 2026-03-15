@@ -12,6 +12,7 @@ from v3_1.agents.ranker_agent import RankerAgent
 from v3_1.agents.storage_agent import StorageAgent
 from v3_1.config.runtime import runtime_resources
 from v3_1.learning.ranker_state import RankerState
+from v3_1.storage.paths import get_persistent_memory_db_path
 
 
 def _maybe_init_ray(config) -> None:
@@ -28,12 +29,20 @@ def _maybe_init_ray(config) -> None:
         ray.init(**init_kwargs)
 
 
-def bootstrap_services(config, *, session_id: str, game_id: str):
+def bootstrap_services(config, *, session_id: str, game_id: str, render_terminal: bool = False):
     _maybe_init_ray(config)
     resources = runtime_resources(config)
+    persistent_db_path = (
+        config.storage.persistent_memory_db_path_override
+        if config.storage.enable_persistent_memory and config.storage.persistent_memory_db_path_override
+        else str(get_persistent_memory_db_path(config.storage.root_dir)) if config.storage.enable_persistent_memory else None
+    )
 
     blackboard = BlackboardAgent.options(name=f"{session_id}:blackboard", lifetime="detached", num_cpus=config.ray.service_cpus).remote(session_id, game_id)
-    memory = MemoryAgent.options(name=f"{session_id}:memory", lifetime="detached", num_cpus=config.ray.service_cpus).remote(session_id)
+    memory = MemoryAgent.options(name=f"{session_id}:memory", lifetime="detached", num_cpus=config.ray.service_cpus).remote(
+        session_id,
+        load_persistent_priors_on_session_start=config.storage.load_persistent_priors_on_session_start,
+    )
     planner = PlannerAgent.options(name=f"{session_id}:planner", lifetime="detached", num_cpus=config.ray.service_cpus).remote(config.planning)
     ranker = (
         RankerAgent.options(name=f"{session_id}:ranker", lifetime="detached", num_cpus=config.ray.service_cpus).remote(RankerState())
@@ -44,6 +53,20 @@ def bootstrap_services(config, *, session_id: str, game_id: str):
     storage = StorageAgent.options(name=f"{session_id}:storage", lifetime="detached", num_cpus=config.ray.service_cpus).remote(
         root_dir=config.storage.root_dir,
         sqlite_path=sqlite_path,
+        persistent_memory_db_path=persistent_db_path,
+        persistence_flags={
+            "persist_skill_stats": config.storage.persist_skill_stats,
+            "persist_candidate_outcomes": config.storage.persist_candidate_outcomes,
+            "persist_failure_patterns": config.storage.persist_failure_patterns,
+            "persist_recovery_patterns": config.storage.persist_recovery_patterns,
+            "persist_poi_patterns": config.storage.persist_poi_patterns,
+            "persist_trigger_patterns": config.storage.persist_trigger_patterns,
+            "persist_consequence_patterns": config.storage.persist_consequence_patterns,
+            "persist_entity_signatures": config.storage.persist_entity_signatures,
+            "persist_area_signatures": config.storage.persist_area_signatures,
+            "persist_mechanic_hypotheses": config.storage.persist_mechanic_hypotheses,
+            "persist_ranker_state": config.storage.persist_ranker_state,
+        },
     )
 
     env_workers = [
@@ -53,6 +76,7 @@ def bootstrap_services(config, *, session_id: str, game_id: str):
             env_id=config.environment.env_id,
             env_root=config.environment.env_root,
             seed=config.environment.seed + idx,
+            render_terminal=render_terminal,
         )
         for idx in range(max(1, resources.env_workers))
     ]
@@ -74,4 +98,5 @@ def bootstrap_services(config, *, session_id: str, game_id: str):
         "env_workers": env_workers,
         "analysis_workers": analysis_workers,
         "helper_workers": helper_workers,
+        "persistent_memory_db_path": persistent_db_path,
     }

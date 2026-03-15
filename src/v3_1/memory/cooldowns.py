@@ -1,6 +1,14 @@
 from __future__ import annotations
 
 
+def session_cooldown_state(cooldowns: dict[str, dict | int] | None = None) -> dict[str, dict]:
+    return advance_cooldowns(cooldowns or {})
+
+
+def durable_cooldown_bias(priors: dict | None = None) -> dict[str, dict]:
+    return dict((priors or {}).get("cooldown_bias", {}))
+
+
 def advance_cooldowns(cooldowns: dict[str, dict | int]) -> dict[str, dict]:
     next_state: dict[str, dict] = {}
     for key, value in cooldowns.items():

@@ -10,6 +10,9 @@ def final_action_from_candidate(candidate: dict | None) -> dict | None:
     action = dict(candidate.get("action", {}))
     action["candidate_class"] = candidate.get("candidate_class")
     action["target_entity_id"] = candidate.get("target_entity_id")
+    action["target_area_id"] = candidate.get("target_area_id")
+    action["required_action_family"] = candidate.get("required_action_family")
+    action["skill_id"] = candidate.get("skill_id")
     return action
 
 
@@ -22,6 +25,7 @@ def package_decision(
     blocked_candidates: list[dict],
     helper_results: list[dict],
     belief: dict,
+    planner_trace: dict,
 ) -> PlannerDecision:
     selected_action = final_action_from_candidate(selected)
     planner_stats = {
@@ -31,6 +35,7 @@ def package_decision(
         "fallback_count": len(fallback_candidates),
         "reachable_target_count": len(belief.get("reachable_targets", [])),
         "frontier_target_count": len(belief.get("frontier_targets", [])),
+        "blocked_target_count": len(belief.get("blocked_targets", [])),
     }
     rationale = "selected_best_ranked_candidate" if selected is not None else "selected_fallback_candidate"
     return PlannerDecision(
@@ -58,5 +63,6 @@ def package_decision(
             "fallback_candidates": fallback_candidates,
             "blocked_candidates": blocked_candidates,
             "planner_stats": planner_stats,
+            "planner_trace": planner_trace,
         },
     )

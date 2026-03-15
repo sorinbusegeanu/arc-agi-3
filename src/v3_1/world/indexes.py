@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from v3_1.world.consequences import normalized_consequence_action_key
+
 
 def build_indexes(state: dict) -> dict:
     entities_by_area: dict[str, list[str]] = {}
@@ -39,7 +41,7 @@ def build_indexes(state: dict) -> dict:
             evidence_index.setdefault(str(evidence_ref), []).append(entity_id)
 
     for consequence_id, consequence in state.get("consequences", {}).items():
-        action_key = str(consequence.get("action"))
+        action_key = normalized_consequence_action_key(consequence)
         consequence_by_action.setdefault(action_key, []).append(consequence_id)
         for evidence_ref in consequence.get("evidence_refs", []):
             evidence_index.setdefault(str(evidence_ref), []).append(consequence_id)

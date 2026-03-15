@@ -14,15 +14,16 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default=None)
     parser.add_argument("--game-id", default="game")
+    parser.add_argument("--png", action="store_true")
+    parser.add_argument("--render-terminal", action="store_true")
     args = parser.parse_args()
     config = load_config(args.config)
     session_id = f"session:{uuid.uuid4().hex[:8]}"
     context = RunContext(session_id=session_id, run_id=f"run:{uuid.uuid4().hex[:8]}", game_id=args.game_id)
-    services = bootstrap_services(config, session_id=context.session_id, game_id=context.game_id)
-    result = Orchestrator(config=config, context=context, services=services, snapshot_registry=SnapshotRegistry()).run()
+    services = bootstrap_services(config, session_id=context.session_id, game_id=context.game_id, render_terminal=args.render_terminal)
+    result = Orchestrator(config=config, context=context, services=services, snapshot_registry=SnapshotRegistry()).run(export_png=args.png)
     print(result)
 
 
 if __name__ == "__main__":
     main()
-

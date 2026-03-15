@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from v3_1.config.schema import V31Config
 from v3_1.contracts.errors import InvalidConfigurationError
 
@@ -19,6 +21,29 @@ def validate_config(config: V31Config) -> None:
         raise InvalidConfigurationError("environment step budgets must be >= 1")
     if config.storage.root_dir.strip() == "":
         raise InvalidConfigurationError("storage.root_dir must not be empty")
+    if config.storage.persistent_memory_flush_every_n_rounds < 0:
+        raise InvalidConfigurationError("storage.persistent_memory_flush_every_n_rounds must be >= 0")
+    if config.storage.enable_persistent_memory and config.storage.persistent_memory_db_path_override:
+        db_parent = Path(config.storage.persistent_memory_db_path_override).expanduser().resolve().parent
+        if not db_parent.exists():
+            raise InvalidConfigurationError("storage.persistent_memory_db_path_override parent must exist")
+    if not config.storage.enable_persistent_memory and config.storage.load_persistent_priors_on_session_start:
+        raise InvalidConfigurationError("persistent priors cannot load when persistent memory is disabled")
+    durable_flags = [
+        config.storage.persist_skill_stats,
+        config.storage.persist_candidate_outcomes,
+        config.storage.persist_failure_patterns,
+        config.storage.persist_recovery_patterns,
+        config.storage.persist_poi_patterns,
+        config.storage.persist_trigger_patterns,
+        config.storage.persist_consequence_patterns,
+        config.storage.persist_entity_signatures,
+        config.storage.persist_area_signatures,
+        config.storage.persist_mechanic_hypotheses,
+        config.storage.persist_ranker_state,
+    ]
+    if config.storage.enable_persistent_memory and not any(durable_flags):
+        raise InvalidConfigurationError("at least one durable persistence family must be enabled when persistent memory is enabled")
     if config.planning.max_candidates < 1:
         raise InvalidConfigurationError("planning.max_candidates must be >= 1")
     if config.memory.retry_limit < 1:

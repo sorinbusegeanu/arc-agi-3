@@ -33,6 +33,18 @@ class MemorySnapshot:
     created_round_id: int
     created_pass_id: int
     state: dict[str, Any]
+    snapshot_kind: str = "working_memory"
+    durable_checkpoint_id: str | None = None
+
+
+@dataclass(frozen=True)
+class DurableMemoryCheckpoint:
+    checkpoint_handle: str
+    db_path: str
+    source_memory_version: str
+    created_round_id: int
+    created_pass_id: int
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -49,5 +61,5 @@ class PlanningContext:
     memory_version: str
     policy_version: str
     ranker_version: str
+    durable_memory_checkpoint_handle: str | None = None
     debug: dict[str, Any] = field(default_factory=dict)
-

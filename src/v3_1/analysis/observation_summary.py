@@ -131,6 +131,10 @@ def summarize_observation(observation: Any, previous_observation: Any | None = N
                 "score": min(1.0, score),
                 "type_hints": list(obj["type_hints"]),
                 "primary_color": obj["primary_color"],
+                "area": int(obj["area"]),
+                "width": int(obj["width"]),
+                "height": int(obj["height"]),
+                "touches_border": bool(obj["touches_border"]),
             }
         )
     avatar_candidates.sort(key=lambda row: (-float(row["score"]), row["object_id"]))

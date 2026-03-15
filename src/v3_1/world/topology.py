@@ -23,7 +23,7 @@ def build_topology_edges(episodes: list[dict]) -> tuple[dict[str, dict], dict[st
                 nodes[node_id]["uncertain_visits"] += 1
             if previous is not None:
                 transition_type = step.get("transition_type", "move")
-                action_key = stable_action_key(step.get("action"))
+                action_key = normalized_topology_action_key(step)
                 edge_id = f"{previous}->{node_id}:{action_key}:{transition_type}"
                 edges.setdefault(
                     edge_id,
@@ -45,10 +45,22 @@ def build_topology_edges(episodes: list[dict]) -> tuple[dict[str, dict], dict[st
                     edges[edge_id]["uncertain_count"] += 1
                 else:
                     edges[edge_id]["success_count"] += 1
+                for evidence_ref in list(step.get("evidence_refs", [])):
+                    edges[edge_id]["evidence_refs"].append(str(evidence_ref))
                 if step.get("evidence_ref"):
-                    edges[edge_id]["evidence_refs"].append(step["evidence_ref"])
+                    edges[edge_id]["evidence_refs"].append(str(step["evidence_ref"]))
             previous = node_id
     return nodes, edges
+
+
+def normalized_topology_action_key(step: dict) -> str:
+    action_family = str(step.get("action_family") or "").strip().lower()
+    if action_family and action_family != "unknown":
+        return action_family
+    action_name = str(step.get("action_name") or "").strip().lower()
+    if action_name:
+        return action_name
+    return stable_action_key(step.get("action"))
 
 
 def stable_action_key(action: object) -> str:
@@ -83,7 +95,7 @@ def merge_topology(existing_nodes: dict[str, dict], existing_edges: dict[str, di
         prior = merged_edges.get(edge_id, {})
         row = dict(prior)
         row.update(payload)
-        row["action_key"] = row.get("action_key") or stable_action_key(row.get("action"))
+        row["action_key"] = row.get("action_key") or normalized_topology_action_key(row)
         row["transition_type"] = row.get("transition_type", "move")
         row["success_count"] = int(prior.get("success_count", 0)) + int(payload.get("success_count", 0))
         row["blocked_count"] = int(prior.get("blocked_count", 0)) + int(payload.get("blocked_count", 0))

@@ -99,3 +99,5 @@ Notes:
 
 - The first v3.1 milestone is single-session, single-machine only.
 - Any row marked `deferred` must be ported into native v3.1 modules before that behavior becomes part of the authoritative runtime path.
+- Cross-run durable memory now lives in `src/v3_1/storage/persistent_memory.py` with SQLite ownership behind `src/v3_1/agents/storage_agent.py`.
+- v2.5 JSON session snapshots are no longer the intended mechanism for long-term learning in v3.1; v3.1 JSON memory snapshots are session artifacts only.

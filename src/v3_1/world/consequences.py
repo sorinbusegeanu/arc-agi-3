@@ -14,6 +14,19 @@ def consequence_key(row: dict) -> str:
     return f"consequence:{stable_digest(basis)}"
 
 
+def normalized_consequence_action_key(consequence: dict) -> str:
+    action_family = str(consequence.get("action_family") or "").strip().lower()
+    if action_family:
+        return action_family
+    action_name = str(consequence.get("action_name") or "").strip().lower()
+    if action_name:
+        return action_name
+    action_value = consequence.get("action")
+    if isinstance(action_value, str):
+        return action_value.strip().lower()
+    return "unknown"
+
+
 def extract_consequence_records(delta: dict) -> list[dict]:
     records = []
     metadata = dict(delta.get("metadata", {}))
@@ -23,11 +36,15 @@ def extract_consequence_records(delta: dict) -> list[dict]:
     for row in consequences:
         step_idx = row.get("step_idx")
         step = by_step.get(step_idx, {})
+        evidence_refs = list(row.get("evidence_refs", [])) or [f"{delta.get('episode_id')}:{step_idx}"] if step_idx is not None else []
         records.append(
             {
                 "consequence_id": row.get("consequence_id") or consequence_key(row),
                 "step_idx": step_idx,
-                "action": step.get("action"),
+                "action": step.get("action_name") or row.get("action"),
+                "action_id": step.get("action_id", row.get("action_id")),
+                "action_name": step.get("action_name", row.get("action_name")),
+                "action_family": step.get("action_family", row.get("action_family", "unknown")),
                 "state_hash_before": step_rows[step_idx - 1]["state_hash"] if isinstance(step_idx, int) and step_idx > 0 and step_idx - 1 < len(step_rows) else None,
                 "state_hash_after": step.get("state_hash"),
                 "change_signature": stable_digest(
@@ -44,7 +61,7 @@ def extract_consequence_records(delta: dict) -> list[dict]:
                 "local_change_area": row.get("local_change_area", 0),
                 "action_effect_near_avatar": row.get("action_effect_near_avatar", False),
                 "evidence_count": row.get("evidence_count", 1),
-                "evidence_refs": [f"{delta.get('episode_id')}:{step_idx}"],
+                "evidence_refs": evidence_refs,
             }
         )
     return records

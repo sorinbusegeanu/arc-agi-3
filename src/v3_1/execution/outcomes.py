@@ -31,20 +31,25 @@ def summarize_outcome(*, steps, request, routed_history: list[dict], rewards: li
     blocked = stalled and progress <= 0.0
     route_success = final_distance is not None and final_distance <= 0.5
     route_failure = bool(request.mode == "directed" and blocked and not route_success)
+    explicit_failure = next((row for row in routed_history if row.get("failed")), None)
     termination_reason = "done" if steps and steps[-1].done else "step_budget_exhausted"
-    if route_failure:
-        termination_reason = "route_failed"
+    if explicit_failure is not None:
+        termination_reason = str(explicit_failure.get("failure_reason", "execution_failed"))
+        route_failure = True
     elif blocked:
         termination_reason = "blocked"
     elif stalled:
         termination_reason = "stalled"
+    elif noop_steps > 0 and progress <= 0.0:
+        termination_reason = "noop"
     return {
-        "success": bool(steps and steps[-1].done),
+        "success": bool(steps and steps[-1].done and (request.mode != "directed" or route_success or float(sum(rewards)) > 0.0)),
         "reward_delta": float(sum(rewards)),
         "termination_reason": termination_reason,
         "progress": progress,
         "blocked": blocked,
         "stalled": stalled,
+        "noop": bool(noop_steps > 0),
         "noop_steps": noop_steps,
         "route_success": route_success,
         "route_failure": route_failure,

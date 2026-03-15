@@ -16,19 +16,53 @@ def _distance(lhs: list[float], rhs: list[float]) -> float:
     return abs(float(lhs[0]) - float(rhs[0])) + abs(float(lhs[1]) - float(rhs[1]))
 
 
+def _overlaps_active(candidate: dict, step_summary: dict) -> bool:
+    centroid = candidate.get("centroid")
+    if not isinstance(centroid, list) or len(centroid) != 2:
+        return False
+    for region in step_summary.get("active_regions", []):
+        bbox = region.get("bbox", {})
+        if bbox.get("x1", 0) <= centroid[0] <= bbox.get("x2", -1) and bbox.get("y1", 0) <= centroid[1] <= bbox.get("y2", -1):
+            return True
+    return False
+
+
 def _score_candidate(track: _TrackState, candidate: dict, step_summary: dict) -> float:
     score = float(candidate.get("score", 0.0))
     if candidate.get("signature") == track.signature:
-        score += 0.35
+        score += 0.2
     if track.history:
-        score += max(0.0, 0.35 - (_distance(track.history[-1]["centroid"], candidate["centroid"]) / 12.0))
-    if any(
-        region["bbox"]["x1"] <= candidate["centroid"][0] <= region["bbox"]["x2"]
-        and region["bbox"]["y1"] <= candidate["centroid"][1] <= region["bbox"]["y2"]
-        for region in step_summary.get("active_regions", [])
-    ):
-        score += 0.1
+        score += max(0.0, 0.4 - (_distance(track.history[-1]["centroid"], candidate["centroid"]) / 10.0))
+    if _overlaps_active(candidate, step_summary):
+        score += 0.6
+    elif step_summary.get("active_regions"):
+        score -= 0.25
+    if "tiny" in candidate.get("type_hints", []):
+        score -= 0.15
+    if "border_touching" in candidate.get("type_hints", []):
+        score -= 0.2
+    area = int(candidate.get("area", 0))
+    if area > 12:
+        score -= min(0.5, area / 80.0)
     return score
+
+
+def _track_rank(track: _TrackState) -> tuple[float, float, float, float, float, str]:
+    points = [tuple(int(round(value)) for value in entry["centroid"]) for entry in track.history if isinstance(entry.get("centroid"), list)]
+    unique_positions = len(set(points))
+    total_motion = sum(_distance(previous["centroid"], current["centroid"]) for previous, current in zip(track.history, track.history[1:]))
+    active_hits = sum(1 for entry in track.history if entry.get("active_overlap"))
+    tiny_hits = sum(1 for entry in track.history if entry.get("tiny"))
+    areas = [int(entry.get("area", 0)) for entry in track.history if int(entry.get("area", 0)) > 0]
+    average_area = sum(areas) / float(len(areas)) if areas else 999.0
+    return (
+        float(active_hits),
+        float(unique_positions),
+        -float(average_area),
+        float(total_motion),
+        float(track.confidence) - (0.15 * tiny_hits),
+        track.track_id,
+    )
 
 
 def track_avatar(step_summaries: list[dict]) -> dict:
@@ -66,6 +100,9 @@ def track_avatar(step_summaries: list[dict]) -> dict:
                     "centroid": list(best["centroid"]),
                     "bbox": dict(best["bbox"]),
                     "score": float(best_score),
+                    "active_overlap": _overlaps_active(best, summary),
+                    "tiny": "tiny" in best.get("type_hints", []),
+                    "area": int(best.get("area", 0)),
                 }
             )
             track.confidence = min(1.0, (0.55 * track.confidence) + (0.45 * min(1.0, best_score)))
@@ -83,6 +120,9 @@ def track_avatar(step_summaries: list[dict]) -> dict:
                         "centroid": list(candidate["centroid"]),
                         "bbox": dict(candidate["bbox"]),
                         "score": float(candidate.get("score", 0.0)),
+                        "active_overlap": _overlaps_active(candidate, summary),
+                        "tiny": "tiny" in candidate.get("type_hints", []),
+                        "area": int(candidate.get("area", 0)),
                     }
                 ],
                 confidence=max(0.2, float(candidate.get("score", 0.0))),
@@ -94,8 +134,11 @@ def track_avatar(step_summaries: list[dict]) -> dict:
         living_tracks = [track for track in tracks if track.missed_steps <= 2 and track.history]
         living_tracks.sort(
             key=lambda track: (
-                -float(track.confidence),
-                -len(track.history),
+                -_track_rank(track)[0],
+                -_track_rank(track)[1],
+                -_track_rank(track)[2],
+                -_track_rank(track)[3],
+                -_track_rank(track)[4],
                 track.track_id,
             )
         )
@@ -115,6 +158,7 @@ def track_avatar(step_summaries: list[dict]) -> dict:
 
     exported_tracks = []
     for track in tracks:
+        rank = _track_rank(track)
         exported_tracks.append(
             {
                 "track_id": track.track_id,
@@ -124,6 +168,13 @@ def track_avatar(step_summaries: list[dict]) -> dict:
                 "steps_seen": len(track.history),
                 "last_centroid": list(track.history[-1]["centroid"]) if track.history else None,
                 "is_main": track.track_id == main_track_id,
+                "track_rank": {
+                    "active_hits": rank[0],
+                    "unique_positions": rank[1],
+                    "average_area_bias": -rank[2],
+                    "motion": rank[3],
+                    "score": rank[4],
+                },
             }
         )
     exported_tracks.sort(key=lambda row: (-float(row["confidence"]), -int(row["steps_seen"]), row["track_id"]))

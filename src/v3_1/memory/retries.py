@@ -1,6 +1,22 @@
 from __future__ import annotations
 
 
+def aggregate_retry_patterns(retries: dict[str, dict]) -> dict[str, dict]:
+    aggregates: dict[str, dict] = {}
+    for key, row in retries.items():
+        scope = str(row.get("scope", "candidate"))
+        pattern_key = f"{scope}:{key}"
+        aggregates[pattern_key] = {
+            "pattern_key": pattern_key,
+            "scope": scope,
+            "attempts": int(row.get("attempts", 0)),
+            "failures": int(row.get("failures", 0)),
+            "recent_failures": int(row.get("recent_failures", 0)),
+            "reasons": dict(row.get("reasons", {})),
+        }
+    return aggregates
+
+
 def update_retry_ledgers(retries: dict[str, dict], *, candidate_id: str | None, target_entity_id: str | None, target_area_id: str | None, success: bool, termination_reason: str | None) -> dict[str, dict]:
     next_state = {key: dict(value) for key, value in retries.items()}
     if success:

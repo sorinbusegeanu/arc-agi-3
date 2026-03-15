@@ -21,11 +21,25 @@ def _merge_area_topology_metadata(areas: dict[str, dict], topology_nodes: dict[s
     return updated
 
 
+def _consequence_transport_complete(row: dict) -> bool:
+    if not isinstance(row, dict):
+        return False
+    action_name = str(row.get("action_name") or "").strip()
+    action_family = str(row.get("action_family") or "").strip()
+    evidence_refs = list(row.get("evidence_refs", []))
+    return bool(action_name and action_family and evidence_refs)
+
+
 def apply_delta(state: dict, delta: dict) -> tuple[dict, bool]:
     next_state = dict(state)
     merged_areas = merge_areas(state.get("areas", {}), delta.get("areas", ()))
     merged_entities = merge_entities(state.get("entities", {}), delta.get("entities", ()))
-    raw_consequences = list(delta.get("consequences", ())) or extract_consequence_records(delta)
+    prepopulated_consequences = list(delta.get("consequences", ()))
+    raw_consequences = (
+        prepopulated_consequences
+        if prepopulated_consequences and all(_consequence_transport_complete(row) for row in prepopulated_consequences)
+        else extract_consequence_records(delta)
+    )
     merged_consequences = merge_consequences(state.get("consequences", {}), raw_consequences)
     topology_nodes, topology_edges = merge_topology(
         state.get("topology_nodes", {}),

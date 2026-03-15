@@ -4,6 +4,47 @@ import importlib
 from dataclasses import dataclass, field
 from typing import Any
 
+ACTION_NAME_BY_ID = {
+    0: "reset",
+    1: "up",
+    2: "down",
+    3: "left",
+    4: "right",
+    5: "interact",
+    6: "click_at",
+    7: "undo",
+}
+
+ACTION_ID_BY_NAME = {
+    "reset": 0,
+    "restarts": 0,
+    "up": 1,
+    "down": 2,
+    "left": 3,
+    "right": 4,
+    "interact": 5,
+    "click_at": 6,
+    "undo": 7,
+    "action1": 1,
+    "action2": 2,
+    "action3": 3,
+    "action4": 4,
+    "action5": 5,
+    "action6": 6,
+    "action7": 7,
+}
+
+ACTION_FAMILY_BY_NAME = {
+    "up": "move",
+    "down": "move",
+    "left": "move",
+    "right": "move",
+    "interact": "interact",
+    "click_at": "click_at",
+    "undo": "undo",
+    "reset": "reset",
+}
+
 
 def _safe_scalar(value: Any) -> Any:
     if isinstance(value, (int, float, str, bool)) or value is None:
@@ -17,23 +58,57 @@ def _safe_scalar(value: Any) -> Any:
 
 def _discrete_actions(space: object) -> list[dict]:
     if space is None:
-        return [
-            {"id": 0, "name": "noop"},
-            {"id": 1, "name": "left"},
-            {"id": 2, "name": "right"},
-            {"id": 3, "name": "up"},
-            {"id": 4, "name": "down"},
-            {"id": 5, "name": "interact"},
-        ]
+        return [normalize_action_lookup(idx) for idx in range(0, 8)]
     if hasattr(space, "n"):
-        names = ["noop", "left", "right", "up", "down", "interact", "alt_0", "alt_1", "alt_2", "alt_3"]
-        return [{"id": idx, "name": names[idx] if idx < len(names) else f"action_{idx}"} for idx in range(int(space.n))]
+        return [normalize_action_lookup(idx) for idx in range(int(space.n))]
     if isinstance(space, (list, tuple)):
         out = []
         for idx, value in enumerate(space):
-            out.append({"id": idx, "name": str(value), "raw": value})
+            row = normalize_action_lookup(value, available_actions=space)
+            row["raw"] = value
+            if row["action_id"] is None:
+                row["action_id"] = idx
+            out.append({"id": row["action_id"], "name": row["action_name"], "family": row["action_family"], "raw": value})
         return out
-    return [{"id": 0, "name": "noop"}]
+    row = normalize_action_lookup(0)
+    return [{"id": row["action_id"], "name": row["action_name"], "family": row["action_family"]}]
+
+
+def normalize_action_lookup(action: object, available_actions: object | None = None) -> dict[str, Any]:
+    raw_id = None
+    raw_name = ""
+    if isinstance(action, dict):
+        if isinstance(action.get("id"), int):
+            raw_id = int(action["id"])
+        if action.get("name") is not None:
+            raw_name = str(action.get("name")).strip().lower()
+    elif isinstance(action, int):
+        raw_id = int(action)
+    elif isinstance(action, str):
+        raw_name = action.strip().lower()
+    else:
+        action_name = getattr(action, "name", None)
+        action_value = getattr(action, "value", None)
+        if action_name is not None:
+            raw_name = str(action_name).strip().lower()
+        if isinstance(action_value, int):
+            raw_id = int(action_value)
+    if raw_id is None and isinstance(available_actions, list):
+        for idx, row in enumerate(available_actions):
+            if isinstance(row, dict) and row.get("raw") == action:
+                raw_id = int(row.get("id", idx)) if isinstance(row.get("id"), int) else idx
+                if row.get("name") is not None:
+                    raw_name = str(row.get("name")).strip().lower()
+                break
+    if raw_id is None and raw_name in ACTION_ID_BY_NAME:
+        raw_id = ACTION_ID_BY_NAME[raw_name]
+    normalized_name = ACTION_NAME_BY_ID.get(raw_id, raw_name or ("reset" if raw_id == 0 else "unknown"))
+    normalized_family = ACTION_FAMILY_BY_NAME.get(normalized_name, "unknown")
+    return {
+        "action_id": raw_id,
+        "action_name": normalized_name if normalized_name else "unknown",
+        "action_family": normalized_family,
+    }
 
 
 @dataclass
@@ -124,12 +199,9 @@ class NormalizedEnvAdapter:
             if isinstance(actions, list):
                 normalized = []
                 for idx, action in enumerate(actions):
-                    if isinstance(action, dict):
-                        normalized.append(dict(action))
-                        continue
-                    action_id = int(getattr(action, "value", idx)) if isinstance(getattr(action, "value", None), int) else idx
-                    action_name = str(getattr(action, "name", action))
-                    normalized.append({"id": action_id, "name": action_name})
+                    row = normalize_action_lookup(action, available_actions=actions)
+                    action_id = row["action_id"] if isinstance(row.get("action_id"), int) else idx
+                    normalized.append({"id": action_id, "name": row["action_name"], "family": row["action_family"]})
                 return normalized
         return _discrete_actions(getattr(self.env, "action_space", None))
 
@@ -200,12 +272,11 @@ class NormalizedEnvAdapter:
         return info
 
     def _normalize_available_actions(self, actions: object) -> list[dict]:
-        if isinstance(actions, list) and actions and isinstance(actions[0], dict):
-            return [dict(action) for action in actions]
         if isinstance(actions, list):
             normalized = []
             for idx, action in enumerate(actions):
-                normalized.append(self._action_row_from_value(action, fallback_id=idx))
+                row = self._action_row_from_value(action, fallback_id=idx)
+                normalized.append(row)
             return normalized
         return self.available_actions()
 
@@ -250,30 +321,19 @@ class NormalizedEnvAdapter:
         return action
 
     def _action_row_from_value(self, action: object, *, fallback_id: int) -> dict[str, Any]:
-        try:
-            from arcengine import GameAction
-        except Exception:
-            GameAction = None
-        if GameAction is not None:
-            if isinstance(action, GameAction):
-                return {"id": int(action.value), "name": str(action.name).lower()}
-            if isinstance(action, int):
-                try:
-                    enum_action = GameAction.from_id(action)
-                    return {"id": int(enum_action.value), "name": str(enum_action.name).lower()}
-                except Exception:
-                    pass
-        return {"id": fallback_id if not isinstance(action, int) else action, "name": str(action).lower()}
+        row = normalize_action_lookup(action)
+        action_id = row["action_id"] if isinstance(row.get("action_id"), int) else fallback_id
+        return {"id": action_id, "name": row["action_name"], "family": row["action_family"]}
 
 
-def build_env(factory_path: str | None, *, env_id: str | None = None, env_root: str | None = None, seed: int | None = None) -> NormalizedEnvAdapter:
+def build_env(factory_path: str | None, *, env_id: str | None = None, env_root: str | None = None, seed: int | None = None, render_terminal: bool = False) -> NormalizedEnvAdapter:
     if factory_path is None:
         return NormalizedEnvAdapter(env=NullEnv(), env_id=env_id, env_root=env_root, metadata={"factory": "null"})
     module_name, func_name = factory_path.rsplit(":", 1)
     module = importlib.import_module(module_name)
     factory = getattr(module, func_name)
     try:
-        env = factory(env_id=env_id, env_root=env_root, seed=seed)
+        env = factory(env_id=env_id, env_root=env_root, seed=seed, render_terminal=render_terminal)
     except TypeError:
         env = factory()
-    return NormalizedEnvAdapter(env=env, env_id=env_id, env_root=env_root, metadata={"factory": factory_path, "seed": seed})
+    return NormalizedEnvAdapter(env=env, env_id=env_id, env_root=env_root, metadata={"factory": factory_path, "seed": seed, "render_terminal": render_terminal})

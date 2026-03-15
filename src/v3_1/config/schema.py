@@ -66,6 +66,9 @@ class ExecutionSection:
     target_reach_distance: float = 1.5
     stall_limit: int = 6
     blocked_repeat_limit: int = 4
+    move_terminal_distance_cells: int = 0
+    interact_terminal_distance_cells: int = 0
+    click_terminal_distance_cells: int = 0
 
 
 @dataclass(frozen=True)
@@ -80,6 +83,21 @@ class StorageSection:
     root_dir: str = "runs_v3_1"
     export_json: bool = True
     export_sqlite: bool = True
+    enable_persistent_memory: bool = True
+    persistent_memory_db_path_override: str | None = None
+    persistent_memory_flush_every_n_rounds: int = 0
+    load_persistent_priors_on_session_start: bool = True
+    persist_skill_stats: bool = True
+    persist_candidate_outcomes: bool = True
+    persist_failure_patterns: bool = True
+    persist_recovery_patterns: bool = True
+    persist_poi_patterns: bool = True
+    persist_trigger_patterns: bool = True
+    persist_consequence_patterns: bool = True
+    persist_entity_signatures: bool = True
+    persist_area_signatures: bool = True
+    persist_mechanic_hypotheses: bool = True
+    persist_ranker_state: bool = True
 
 
 @dataclass(frozen=True)

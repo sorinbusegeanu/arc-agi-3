@@ -15,6 +15,9 @@ class RawStep:
     action: Any
     reward: float | None
     done: bool
+    action_id: int | None = None
+    action_name: str | None = None
+    action_family: str = "unknown"
     truncated: bool = False
     info: dict[str, Any] = field(default_factory=dict)
 
@@ -142,6 +145,13 @@ class ExecutorRequest:
     action: dict[str, Any] | None
     max_steps: int
     mode: str
+    action_id: int | None = None
+    action_name: str | None = None
+    action_family: str = "unknown"
+    required_action_family: str = "unknown"
+    target_entity_id: str | None = None
+    target_centroid: list[float] | None = None
+    click_target_coordinates: list[float] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -189,6 +199,73 @@ class PersistenceResult:
 
 
 @dataclass(frozen=True)
+class DurableMemoryUpdateBatch:
+    session_id: str
+    run_id: str
+    game_id: str
+    round_id: int
+    pass_id: int
+    batch_id: str
+    source_memory_version: str
+    skills: tuple[dict[str, Any], ...] = ()
+    skill_stats: tuple[dict[str, Any], ...] = ()
+    candidate_outcomes: tuple[dict[str, Any], ...] = ()
+    failure_patterns: tuple[dict[str, Any], ...] = ()
+    recovery_patterns: tuple[dict[str, Any], ...] = ()
+    poi_patterns: tuple[dict[str, Any], ...] = ()
+    trigger_patterns: tuple[dict[str, Any], ...] = ()
+    consequence_patterns: tuple[dict[str, Any], ...] = ()
+    entity_signatures: tuple[dict[str, Any], ...] = ()
+    area_signatures: tuple[dict[str, Any], ...] = ()
+    mechanic_hypotheses: tuple[dict[str, Any], ...] = ()
+    ranker_state: tuple[dict[str, Any], ...] = ()
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class PersistentMemoryLoadRequest:
+    session_id: str
+    run_id: str
+    game_id: str
+    load_priors: bool = True
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class PersistentMemoryLoadResult:
+    session_id: str
+    run_id: str
+    game_id: str
+    db_path: str
+    loaded: bool
+    priors: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class PersistentMemoryFlushRequest:
+    session_id: str
+    run_id: str
+    game_id: str
+    flush_id: str
+    batch: DurableMemoryUpdateBatch
+    session_snapshot_path: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class PersistentMemoryFlushResult:
+    session_id: str
+    run_id: str
+    game_id: str
+    flush_id: str
+    db_path: str
+    source_memory_version: str
+    rows_written: dict[str, int] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class InvalidationEvent:
     session_id: str
     run_id: str
@@ -203,4 +280,3 @@ class InvalidationEvent:
     ranker_version: str
     reason: str
     metadata: dict[str, Any] = field(default_factory=dict)
-
