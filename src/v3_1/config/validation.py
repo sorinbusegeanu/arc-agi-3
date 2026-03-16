@@ -23,6 +23,8 @@ def validate_config(config: V31Config) -> None:
         raise InvalidConfigurationError("storage.root_dir must not be empty")
     if config.storage.persistent_memory_flush_every_n_rounds < 0:
         raise InvalidConfigurationError("storage.persistent_memory_flush_every_n_rounds must be >= 0")
+    if config.storage.max_blackboard_consequences < 1:
+        raise InvalidConfigurationError("storage.max_blackboard_consequences must be >= 1")
     if config.storage.enable_persistent_memory and config.storage.persistent_memory_db_path_override:
         db_parent = Path(config.storage.persistent_memory_db_path_override).expanduser().resolve().parent
         if not db_parent.exists():
@@ -46,7 +48,23 @@ def validate_config(config: V31Config) -> None:
         raise InvalidConfigurationError("at least one durable persistence family must be enabled when persistent memory is enabled")
     if config.planning.max_candidates < 1:
         raise InvalidConfigurationError("planning.max_candidates must be >= 1")
+    if config.planning.trace_level not in {"minimal", "debug", "full"}:
+        raise InvalidConfigurationError("planning.trace_level must be one of: minimal, debug, full")
     if config.memory.retry_limit < 1:
         raise InvalidConfigurationError("memory.retry_limit must be >= 1")
     if config.memory.cooldown_rounds < 0:
         raise InvalidConfigurationError("memory.cooldown_rounds must be >= 0")
+    if config.hypothesis_generation.deterministic_rule_window_steps < 1:
+        raise InvalidConfigurationError("hypothesis_generation.deterministic_rule_window_steps must be >= 1")
+    if config.hypothesis_generation.llm_call_budget_per_round < 0:
+        raise InvalidConfigurationError("hypothesis_generation.llm_call_budget_per_round must be >= 0")
+    if config.hypothesis_generation.llm_retry_limit < 0:
+        raise InvalidConfigurationError("hypothesis_generation.llm_retry_limit must be >= 0")
+    if config.hypothesis_generation.llm_max_output_tokens < 1:
+        raise InvalidConfigurationError("hypothesis_generation.llm_max_output_tokens must be >= 1")
+    if config.hypothesis_generation.llm_timeout_sec <= 0:
+        raise InvalidConfigurationError("hypothesis_generation.llm_timeout_sec must be > 0")
+    if not (0.0 <= config.hypothesis_generation.llm_temperature <= 1.0):
+        raise InvalidConfigurationError("hypothesis_generation.llm_temperature must be in [0,1]")
+    if not (0.0 <= config.hypothesis_generation.llm_confidence_cap <= 1.0):
+        raise InvalidConfigurationError("hypothesis_generation.llm_confidence_cap must be in [0,1]")

@@ -10,6 +10,7 @@ from v3_1.config.schema import (
     EnvironmentSection,
     ExecutionSection,
     FeatureFlagsSection,
+    HypothesisGenerationSection,
     MemorySection,
     PlanningSection,
     RaySection,
@@ -88,6 +89,7 @@ def load_config(path: str | None = None) -> V31Config:
         visualization=_section(VisualizationSection, payload.get("visualization")),
         debugging=_section(DebuggingSection, payload.get("debugging")),
         feature_flags=_section(FeatureFlagsSection, payload.get("feature_flags")),
+        hypothesis_generation=_section(HypothesisGenerationSection, payload.get("hypothesis_generation")),
     )
     validate_config(config)
     return config

@@ -7,8 +7,8 @@ from v3_1.world.blackboard import BlackboardState
 
 @ray.remote
 class BlackboardAgent:
-    def __init__(self, session_id: str, game_id: str) -> None:
-        self.state = BlackboardState(session_id=session_id, game_id=game_id)
+    def __init__(self, session_id: str, game_id: str, max_consequences: int = 100) -> None:
+        self.state = BlackboardState(session_id=session_id, game_id=game_id, max_consequences=max_consequences)
 
     def merge(self, *, round_id: int, pass_id: int, deltas: list[dict]):
         return self.state.merge(round_id=round_id, pass_id=pass_id, deltas=deltas)

@@ -9,3 +9,8 @@ from v3_1.planning.helper_modes import run_helper_mode
 class PlanningHelperWorker:
     def run(self, request):
         return run_helper_mode(request)
+
+
+@ray.remote
+def run_helper_task(request):
+    return run_helper_mode(request)

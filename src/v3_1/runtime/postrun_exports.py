@@ -43,6 +43,15 @@ def _persist_session_bytes(storage_agent, **kwargs) -> str:
     return storage_agent.persist_session_bytes(**kwargs)
 
 
+def _first_validated_round(proposals: dict, validation_state: dict) -> int | None:
+    validated_rounds = [
+        int(row.get("round_id", 0) or 0)
+        for row in dict(proposals or {}).values()
+        if str(dict(validation_state or {}).get(str(row.get("proposal_id")), "")) == "validated"
+    ]
+    return min(validated_rounds) if validated_rounds else None
+
+
 def _safe_rate(numerator: int | float, denominator: int | float) -> float:
     return float(numerator) / float(denominator) if denominator else 0.0
 
@@ -623,40 +632,67 @@ def _visit_debug_payload(episodes: list[dict], sequence: list[list[int]]) -> dic
     }
 
 
-def export_postrun(storage_agent, *, session_id: str, round_id: int, game_id: str, episodes: list[dict], blackboard_state: dict, won: bool, blackboard_version: str, memory_version: str, width: int, height: int, export_png: bool = False, first_observation: list[list[int]] | None = None, selected_target_entity_ids: list[str] | None = None, round_records: list[dict] | None = None) -> dict:
-    direct_events, _ = _collect_direct_memory_telemetry(list(round_records or []))
+def _target_effect_fallbacks(round_records: list[dict]) -> dict[str, dict]:
+    by_target: dict[str, dict] = {}
+    for record in list(round_records or []):
+        decision = dict(record.get("decision", {}))
+        metadata = dict(decision.get("metadata", {})) if isinstance(decision.get("metadata"), dict) else {}
+        selected = dict(metadata.get("selected_candidate", {})) if isinstance(metadata.get("selected_candidate"), dict) else {}
+        target_id = selected.get("target_entity_id") or selected.get("target")
+        if not target_id:
+            continue
+        analysis_summary = dict(record.get("analysis_summary", {}))
+        move_steps = int(analysis_summary.get("move_steps_count", 0) or 0)
+        movement_steps_with_change = int(analysis_summary.get("movement_steps_with_change", 0) or 0)
+        interact_steps = int(analysis_summary.get("interact_steps_count", 0) or 0)
+        interact_steps_with_change = int(analysis_summary.get("interact_steps_with_change", 0) or 0)
+        click_steps = int(analysis_summary.get("click_steps_count", 0) or 0)
+        click_steps_with_change = int(analysis_summary.get("click_steps_with_change", 0) or 0)
+        movement_score = (float(movement_steps_with_change) / float(move_steps)) if move_steps > 0 else 0.0
+        interact_score = (float(interact_steps_with_change) / float(interact_steps)) if interact_steps > 0 else 0.0
+        click_score = (float(click_steps_with_change) / float(click_steps)) if click_steps > 0 else 0.0
+        current = by_target.setdefault(
+            str(target_id),
+            {
+                "movement_effect_score": 0.0,
+                "interact_effect_score": 0.0,
+                "click_effect_score": 0.0,
+                "candidate_effect_score": 0.0,
+            },
+        )
+        current["movement_effect_score"] = max(float(current.get("movement_effect_score", 0.0)), movement_score)
+        current["interact_effect_score"] = max(float(current.get("interact_effect_score", 0.0)), interact_score)
+        current["click_effect_score"] = max(float(current.get("click_effect_score", 0.0)), click_score)
+        current["candidate_effect_score"] = max(
+            float(current.get("candidate_effect_score", 0.0)),
+            movement_score,
+            interact_score,
+            click_score,
+        )
+    return by_target
+
+
+def build_session_summary(*, round_id: int, won: bool, blackboard_version: str, memory_version: str, blackboard_state: dict, selected_target_entity_ids: list[str] | None, round_records: list[dict] | None = None) -> dict:
     target_ids = {str(target_id) for target_id in (selected_target_entity_ids or []) if target_id}
     total_entities = len(dict(blackboard_state.get("entities", {})))
     entities = dict(blackboard_state.get("entities", {}))
-    targeted_entities = [entities[target_id] for target_id in sorted(target_ids) if target_id in entities]
+    effect_fallbacks = _target_effect_fallbacks(list(round_records or []))
+    targeted_entities = []
+    for target_id in sorted(target_ids):
+        if target_id not in entities:
+            continue
+        row = dict(entities[target_id])
+        fallback = dict(effect_fallbacks.get(target_id, {}))
+        if fallback:
+            row["movement_effect_score"] = max(float(row.get("movement_effect_score", 0.0) or 0.0), float(fallback.get("movement_effect_score", 0.0) or 0.0))
+            row["interact_effect_score"] = max(float(row.get("interact_effect_score", 0.0) or 0.0), float(fallback.get("interact_effect_score", 0.0) or 0.0))
+            row["click_effect_score"] = max(float(row.get("click_effect_score", 0.0) or 0.0), float(fallback.get("click_effect_score", 0.0) or 0.0))
+            row["candidate_effect_score"] = max(float(row.get("candidate_effect_score", 0.0) or 0.0), float(fallback.get("candidate_effect_score", 0.0) or 0.0))
+        targeted_entities.append(row)
     effectful_targets = [row for row in targeted_entities if float(row.get("candidate_effect_score", 0.0)) > 0.0]
     movement_effectful_targets = [row for row in targeted_entities if float(row.get("movement_effect_score", 0.0)) > 0.0]
     interact_effectful_targets = [row for row in targeted_entities if float(row.get("interact_effect_score", 0.0)) > 0.0]
     click_effectful_targets = [row for row in targeted_entities if float(row.get("click_effect_score", 0.0)) > 0.0]
-    percentage_targets_with_effect = float(len(effectful_targets)) / float(len(targeted_entities)) if targeted_entities else 0.0
-    percentage_targets_with_movement_effect = float(len(movement_effectful_targets)) / float(len(targeted_entities)) if targeted_entities else 0.0
-    percentage_targets_with_interact_effect = float(len(interact_effectful_targets)) / float(len(targeted_entities)) if targeted_entities else 0.0
-    percentage_targets_with_click_effect = float(len(click_effectful_targets)) / float(len(targeted_entities)) if targeted_entities else 0.0
-    average_effect_strength = (
-        sum(float(row.get("candidate_effect_score", 0.0)) for row in targeted_entities) / float(len(targeted_entities))
-        if targeted_entities
-        else 0.0
-    )
-    average_movement_effect_strength = (
-        sum(float(row.get("movement_effect_score", 0.0)) for row in targeted_entities) / float(len(targeted_entities))
-        if targeted_entities
-        else 0.0
-    )
-    average_interact_effect_strength = (
-        sum(float(row.get("interact_effect_score", 0.0)) for row in targeted_entities) / float(len(targeted_entities))
-        if targeted_entities
-        else 0.0
-    )
-    average_click_effect_strength = (
-        sum(float(row.get("click_effect_score", 0.0)) for row in targeted_entities) / float(len(targeted_entities))
-        if targeted_entities
-        else 0.0
-    )
     summary = build_run_summary(
         rounds_completed=round_id,
         won=won,
@@ -665,37 +701,237 @@ def export_postrun(storage_agent, *, session_id: str, round_id: int, game_id: st
         unique_target_entity_ids=len(target_ids),
         total_number_of_entities=total_entities,
     )
-    summary["percentage_targets_with_effect"] = percentage_targets_with_effect
-    summary["average_effect_strength"] = average_effect_strength
-    summary["percentage_targets_with_movement_effect"] = percentage_targets_with_movement_effect
-    summary["percentage_targets_with_interact_effect"] = percentage_targets_with_interact_effect
-    summary["percentage_targets_with_click_effect"] = percentage_targets_with_click_effect
-    summary["average_movement_effect_strength"] = average_movement_effect_strength
-    summary["average_interact_effect_strength"] = average_interact_effect_strength
-    summary["average_click_effect_strength"] = average_click_effect_strength
+    summary["percentage_targets_with_effect"] = float(len(effectful_targets)) / float(len(targeted_entities)) if targeted_entities else 0.0
+    summary["average_effect_strength"] = (
+        sum(float(row.get("candidate_effect_score", 0.0)) for row in targeted_entities) / float(len(targeted_entities))
+        if targeted_entities
+        else 0.0
+    )
+    summary["percentage_targets_with_movement_effect"] = float(len(movement_effectful_targets)) / float(len(targeted_entities)) if targeted_entities else 0.0
+    summary["percentage_targets_with_interact_effect"] = float(len(interact_effectful_targets)) / float(len(targeted_entities)) if targeted_entities else 0.0
+    summary["percentage_targets_with_click_effect"] = float(len(click_effectful_targets)) / float(len(targeted_entities)) if targeted_entities else 0.0
+    summary["average_movement_effect_strength"] = (
+        sum(float(row.get("movement_effect_score", 0.0)) for row in targeted_entities) / float(len(targeted_entities))
+        if targeted_entities
+        else 0.0
+    )
+    summary["average_interact_effect_strength"] = (
+        sum(float(row.get("interact_effect_score", 0.0)) for row in targeted_entities) / float(len(targeted_entities))
+        if targeted_entities
+        else 0.0
+    )
+    summary["average_click_effect_strength"] = (
+        sum(float(row.get("click_effect_score", 0.0)) for row in targeted_entities) / float(len(targeted_entities))
+        if targeted_entities
+        else 0.0
+    )
+    return summary
+
+
+def build_heatmap_payloads(*, episodes: list[dict], blackboard_state: dict, width: int, height: int) -> dict:
     visit_bundle = build_visit_heatmap(episodes, width=width, height=height)
     poi_bundle = build_poi_heatmap(blackboard_state, width=width, height=height)
-    heatmap = visit_bundle["counts"]
-    poi_heatmap = poi_bundle["accepted_counts"]
+    return {
+        "visit_bundle": visit_bundle,
+        "poi_bundle": poi_bundle,
+        "visit_heatmap": visit_bundle["counts"],
+        "poi_heatmap": poi_bundle["accepted_counts"],
+        "visit_debug_payload": _visit_debug_payload(episodes, list(visit_bundle.get("sequence", []))),
+    }
+
+
+def _ledger_export_views(session_ledger) -> dict:
+    records = list(getattr(session_ledger, "records", []) or [])
+    stage_order: dict[int, list[str]] = {}
+    decision_outcome_links: list[dict] = []
+    version_transitions: list[dict] = []
+    durable_flush_chronology: list[dict] = []
+    stop_reason_chronology: list[dict] = []
+    planner_contract_tracking: list[dict] = []
+    evidence_provenance_summaries: list[dict] = []
+    durable_certification_summaries: list[dict] = []
+    for record in records:
+        round_id = int(getattr(record, "round_id", 0) or 0)
+        event_type = str(getattr(record, "event_type", "") or "")
+        payload = dict(getattr(record, "payload", {}) or {})
+        stage_order.setdefault(round_id, []).append(event_type)
+        version_transitions.append(
+            {
+                "round_id": round_id,
+                "pass_id": int(getattr(record, "pass_id", 0) or 0),
+                "event_type": event_type,
+                "blackboard_version": getattr(record, "blackboard_version", None),
+                "memory_version": getattr(record, "memory_version", None),
+                "plan_context_id": getattr(record, "plan_context_id", None),
+            }
+        )
+        if getattr(record, "decision_id", None) or getattr(record, "outcome_id", None):
+            decision_outcome_links.append(
+                {
+                    "round_id": round_id,
+                    "event_type": event_type,
+                    "decision_id": getattr(record, "decision_id", None),
+                    "outcome_id": getattr(record, "outcome_id", None),
+                    "episode_id": getattr(record, "episode_id", None),
+                }
+            )
+        if event_type in {"durable flush requested", "durable flush completed"}:
+            durable_flush_chronology.append(
+                {
+                    "round_id": round_id,
+                    "pass_id": int(getattr(record, "pass_id", 0) or 0),
+                    "event_type": event_type,
+                    "timestamp": getattr(record, "timestamp", None),
+                    "payload": payload,
+                }
+            )
+        if event_type == "stop decision made":
+            stop_reason_chronology.append(
+                {
+                    "round_id": round_id,
+                    "timestamp": getattr(record, "timestamp", None),
+                    "stop_reason": payload.get("stop_reason"),
+                    "payload": payload,
+                }
+            )
+        if event_type in {"probe plan selected", "directed plan selected"}:
+            planner_contract_tracking.append(
+                {
+                    "round_id": round_id,
+                    "event_type": event_type,
+                    "planner_contract_mode": payload.get("planner_contract_mode"),
+                }
+            )
+        if event_type in {"probe episode executed", "directed episode executed"}:
+            evidence_provenance_summaries.append(
+                {
+                    "round_id": round_id,
+                    "event_type": event_type,
+                    "outcome_id": getattr(record, "outcome_id", None),
+                    "outcome_evidence_provenance_summary": dict(payload.get("outcome_evidence_provenance_summary", {})),
+                }
+            )
+        if event_type in {"probe memory reconcile completed", "directed memory reconcile completed"}:
+            durable_certification_summaries.append(
+                {
+                    "round_id": round_id,
+                    "event_type": event_type,
+                    "durable_eligibility_summary": dict(payload.get("durable_eligibility_summary", {})),
+                }
+            )
+    return {
+        "per_round_stage_order": {str(key): value for key, value in sorted(stage_order.items())},
+        "decision_outcome_links": decision_outcome_links,
+        "version_transitions": version_transitions,
+        "durable_flush_chronology": durable_flush_chronology,
+        "stop_reason_chronology": stop_reason_chronology,
+        "planner_contract_tracking": planner_contract_tracking,
+        "evidence_provenance_summaries": evidence_provenance_summaries,
+        "durable_certification_summaries": durable_certification_summaries,
+    }
+
+
+def persist_postrun_outputs(
+    storage_agent,
+    *,
+    session_id: str,
+    round_id: int,
+    game_id: str,
+    summary: dict,
+    memory_events: list[dict],
+    memory_summary: dict,
+    heatmap_payloads: dict,
+    first_observation: list[list[int]] | None,
+    export_png: bool,
+    width: int,
+    height: int,
+    session_ledger_payload: dict | None = None,
+    mechanic_graph_payload: dict | None = None,
+    mechanic_paths_payload: dict | None = None,
+    mechanic_relations_summary: dict | None = None,
+    deterministic_hypotheses_payload: dict | None = None,
+    llm_hypotheses_payload: dict | None = None,
+    hypothesis_agreement_payload: dict | None = None,
+    hypothesis_validation_summary: dict | None = None,
+    path_to_victory_candidates: dict | None = None,
+    llm_usage_summary: dict | None = None,
+    hypothesis_lifecycle_summary: dict | None = None,
+    experiment_results_summary: dict | None = None,
+) -> dict:
     summary_path = _persist_session(storage_agent, session_id=session_id, kind="report", name="summary.json", payload=summary)
     memory_events_jsonl_path = _persist_session_bytes(
         storage_agent,
         session_id=session_id,
         kind="report",
         name="memory_events.jsonl",
-        payload=("".join(f"{dumps(row)}\n" for row in direct_events)).encode("utf-8"),
+        payload=("".join(f"{dumps(row)}\n" for row in memory_events)).encode("utf-8"),
     )
     memory_summary_path = _persist_session(
         storage_agent,
         session_id=session_id,
         kind="report",
         name="memory_summary.json",
-        payload=_build_memory_summary(round_records=list(round_records or []), latest_memory_version=memory_version),
+        payload=memory_summary,
     )
-    heatmap_path = _persist(storage_agent, session_id=session_id, round_id=round_id, kind="heatmap", name="visit_heatmap.json", payload=heatmap)
-    poi_heatmap_path = _persist(storage_agent, session_id=session_id, round_id=round_id, kind="heatmap", name="poi_heatmap.json", payload=poi_bundle)
-    visit_debug_path = _persist(storage_agent, session_id=session_id, round_id=round_id, kind="report", name="visit_heatmap_debug.json", payload=_visit_debug_payload(episodes, list(visit_bundle.get("sequence", []))))
-    exports = {"summary_path": summary_path, "memory_events_jsonl_path": memory_events_jsonl_path, "memory_summary_path": memory_summary_path, "heatmap_path": heatmap_path, "poi_heatmap_path": poi_heatmap_path, "visit_heatmap_debug_path": visit_debug_path}
+    heatmap_path = _persist(storage_agent, session_id=session_id, round_id=round_id, kind="heatmap", name="visit_heatmap.json", payload=heatmap_payloads["visit_heatmap"])
+    poi_heatmap_path = _persist(storage_agent, session_id=session_id, round_id=round_id, kind="heatmap", name="poi_heatmap.json", payload=heatmap_payloads["poi_bundle"])
+    visit_debug_path = _persist(storage_agent, session_id=session_id, round_id=round_id, kind="report", name="visit_heatmap_debug.json", payload=heatmap_payloads["visit_debug_payload"])
+    exports = {
+        "summary_path": summary_path,
+        "memory_events_jsonl_path": memory_events_jsonl_path,
+        "memory_summary_path": memory_summary_path,
+        "heatmap_path": heatmap_path,
+        "poi_heatmap_path": poi_heatmap_path,
+        "visit_heatmap_debug_path": visit_debug_path,
+    }
+    if mechanic_graph_payload is not None:
+        exports["mechanic_graph_path"] = _persist_session(
+            storage_agent,
+            session_id=session_id,
+            kind="report",
+            name="mechanic_graph.json",
+            payload=mechanic_graph_payload,
+        )
+    if mechanic_paths_payload is not None:
+        exports["mechanic_paths_to_exit_path"] = _persist_session(
+            storage_agent,
+            session_id=session_id,
+            kind="report",
+            name="mechanic_paths_to_exit.json",
+            payload=mechanic_paths_payload,
+        )
+    if mechanic_relations_summary is not None:
+        exports["mechanic_relations_summary_path"] = _persist_session(
+            storage_agent,
+            session_id=session_id,
+            kind="report",
+            name="mechanic_relations_summary.json",
+            payload=mechanic_relations_summary,
+        )
+    if deterministic_hypotheses_payload is not None:
+        exports["deterministic_hypotheses_path"] = _persist_session(storage_agent, session_id=session_id, kind="report", name="deterministic_hypotheses.json", payload=deterministic_hypotheses_payload)
+    if llm_hypotheses_payload is not None:
+        exports["llm_hypotheses_path"] = _persist_session(storage_agent, session_id=session_id, kind="report", name="llm_hypotheses.json", payload=llm_hypotheses_payload)
+    if hypothesis_agreement_payload is not None:
+        exports["hypothesis_agreement_path"] = _persist_session(storage_agent, session_id=session_id, kind="report", name="hypothesis_agreement.json", payload=hypothesis_agreement_payload)
+    if hypothesis_validation_summary is not None:
+        exports["hypothesis_validation_summary_path"] = _persist_session(storage_agent, session_id=session_id, kind="report", name="hypothesis_validation_summary.json", payload=hypothesis_validation_summary)
+    if path_to_victory_candidates is not None:
+        exports["path_to_victory_candidates_path"] = _persist_session(storage_agent, session_id=session_id, kind="report", name="path_to_victory_candidates.json", payload=path_to_victory_candidates)
+    if llm_usage_summary is not None:
+        exports["llm_usage_summary_path"] = _persist_session(storage_agent, session_id=session_id, kind="report", name="llm_usage_summary.json", payload=llm_usage_summary)
+    if hypothesis_lifecycle_summary is not None:
+        exports["hypothesis_lifecycle_summary_path"] = _persist_session(storage_agent, session_id=session_id, kind="report", name="hypothesis_lifecycle_summary.json", payload=hypothesis_lifecycle_summary)
+    if experiment_results_summary is not None:
+        exports["experiment_results_summary_path"] = _persist_session(storage_agent, session_id=session_id, kind="report", name="experiment_results_summary.json", payload=experiment_results_summary)
+    if session_ledger_payload is not None:
+        exports["session_ledger_path"] = _persist_session(
+            storage_agent,
+            session_id=session_id,
+            kind="report",
+            name="session_ledger.json",
+            payload=session_ledger_payload,
+        )
     if first_observation is not None:
         game_map_path = _persist_visualization(
             storage_agent,
@@ -711,31 +947,234 @@ def export_postrun(storage_agent, *, session_id: str, round_id: int, game_id: st
             session_id=session_id,
             kind="visualization",
             name="visit_heatmap.png",
-            payload=render_overlay_png(first_observation, heatmap, overlay_kind="visit", width=width, height=height, scale=15, start=visit_bundle.get("start"), end=visit_bundle.get("end")),
+            payload=render_overlay_png(first_observation, heatmap_payloads["visit_heatmap"], overlay_kind="visit", width=width, height=height, scale=15, start=heatmap_payloads["visit_bundle"].get("start"), end=heatmap_payloads["visit_bundle"].get("end")),
         )
         poi_png_path = _persist_visualization(
             storage_agent,
             session_id=session_id,
             kind="visualization",
             name="poi_heatmap.png",
-            payload=render_overlay_png(first_observation, poi_heatmap, overlay_kind="poi", width=width, height=height, scale=15),
+            payload=render_overlay_png(first_observation, heatmap_payloads["poi_heatmap"], overlay_kind="poi", width=width, height=height, scale=15),
         )
         poi_debug_png_path = _persist_visualization(
             storage_agent,
             session_id=session_id,
             kind="visualization",
             name="poi_heatmap_debug.png",
-            payload=render_heatmap_debug_png(poi_heatmap, overlay_kind="poi", width=width, height=height, scale=15),
+            payload=render_heatmap_debug_png(heatmap_payloads["poi_heatmap"], overlay_kind="poi", width=width, height=height, scale=15),
         )
         visit_debug_png_path = _persist_visualization(
             storage_agent,
             session_id=session_id,
             kind="visualization",
             name="visit_heatmap_debug.png",
-            payload=render_heatmap_debug_png(heatmap, overlay_kind="visit", width=width, height=height, scale=15, start=visit_bundle.get("start"), end=visit_bundle.get("end")),
+            payload=render_heatmap_debug_png(heatmap_payloads["visit_heatmap"], overlay_kind="visit", width=width, height=height, scale=15, start=heatmap_payloads["visit_bundle"].get("start"), end=heatmap_payloads["visit_bundle"].get("end")),
         )
         exports["heatmap_png_path"] = png_path
         exports["poi_heatmap_png_path"] = poi_png_path
         exports["poi_heatmap_debug_png_path"] = poi_debug_png_path
         exports["visit_heatmap_debug_png_path"] = visit_debug_png_path
     return exports
+
+
+def export_postrun(storage_agent, *, session_id: str, round_id: int, game_id: str, episodes: list[dict], blackboard_state: dict, won: bool, blackboard_version: str, memory_version: str, width: int, height: int, export_png: bool = False, first_observation: list[list[int]] | None = None, selected_target_entity_ids: list[str] | None = None, round_records: list[dict] | None = None, session_ledger=None, mechanic_graph_state: dict | None = None, mechanic_graph_version: str | None = None) -> dict:
+    direct_events, _ = _collect_direct_memory_telemetry(list(round_records or []))
+    ledger_views = _ledger_export_views(session_ledger) if session_ledger is not None else None
+    summary = build_session_summary(
+        round_id=round_id,
+        won=won,
+        blackboard_version=blackboard_version,
+        memory_version=memory_version,
+        blackboard_state=blackboard_state,
+        selected_target_entity_ids=selected_target_entity_ids,
+        round_records=list(round_records or []),
+    )
+    if ledger_views is not None:
+        summary["session_ledger_embedded"] = False
+        summary["source_of_truth"] = "session_ledger"
+        summary["fallback_fields_used"] = ["episodes_for_heatmaps", "round_records_for_memory_summary"]
+    heatmap_payloads = build_heatmap_payloads(
+        episodes=episodes,
+        blackboard_state=blackboard_state,
+        width=width,
+        height=height,
+    )
+    memory_summary = _build_memory_summary(round_records=list(round_records or []), latest_memory_version=memory_version)
+    if ledger_views is not None:
+        memory_summary["session_ledger_embedded"] = False
+        memory_summary["source_of_truth"] = "session_ledger"
+        memory_summary["fallback_fields_used"] = ["round_records_for_memory_summary"]
+    mechanic_graph_state = dict(mechanic_graph_state or {})
+    mechanic_edges = list(dict(mechanic_graph_state.get("edges_by_id", {})).values())
+    strongest_paths = sorted(mechanic_edges, key=lambda row: (-int(row.get("support_count", 0) or 0), -float(row.get("confidence", 0.0) or 0.0), str(row.get("edge_id", ""))))[:20]
+    relations_summary = {
+        "mechanic_graph_version": mechanic_graph_version,
+        "strongest_trigger_exit_chains": [row for row in strongest_paths if str(row.get("edge_kind") or "") in {"requires", "enables_exit", "opens"}],
+        "strongest_panel_gate_match_relations": [row for row in strongest_paths if str(row.get("edge_kind") or "") in {"matches", "controls_access", "displays"}],
+        "contradicted_mechanic_hypotheses": [row for row in mechanic_edges if int(row.get("contradiction_count", 0) or 0) > 0],
+        "graph_coverage_by_round": dict(Counter(int(round_id) for row in mechanic_edges for round_id in list(row.get("source_round_ids", []) or []))),
+        "percentage_targets_with_movement_effect": summary.get("percentage_targets_with_effect", 0.0),
+        "percentage_targets_with_interact_effect": _safe_rate(sum(1 for row in episodes if any(float(poi.get("interact_effect_score", 0.0) or 0.0) > 0.0 for poi in list(row.get("pois", []) or []))), max(1, len(list(episodes or [])))),
+        "percentage_targets_with_click_effect": _safe_rate(sum(1 for row in episodes if any(float(poi.get("click_effect_score", 0.0) or 0.0) > 0.0 for poi in list(row.get("pois", []) or []))), max(1, len(list(episodes or [])))),
+        "average_movement_effect_strength": _safe_rate(sum(float(poi.get("movement_effect_score", 0.0) or 0.0) for row in episodes for poi in list(row.get("pois", []) or [])), max(1, sum(len(list(row.get("pois", []) or [])) for row in episodes))),
+        "average_interact_effect_strength": _safe_rate(sum(float(poi.get("interact_effect_score", 0.0) or 0.0) for row in episodes for poi in list(row.get("pois", []) or [])), max(1, sum(len(list(row.get("pois", []) or [])) for row in episodes))),
+        "average_click_effect_strength": _safe_rate(sum(float(poi.get("click_effect_score", 0.0) or 0.0) for row in episodes for poi in list(row.get("pois", []) or [])), max(1, sum(len(list(row.get("pois", []) or [])) for row in episodes))),
+    }
+    latest_registry = dict((list(round_records or [])[-1].get("hypothesis_registry_snapshot", {}) if round_records else {}) or {})
+    deterministic_payload = {"proposals": list(dict(latest_registry.get("deterministic_proposals", {})).values())}
+    llm_payload = {"proposals": list(dict(latest_registry.get("llm_proposals", {})).values())}
+    agreement_payload = {
+        "deterministic_count": len(dict(latest_registry.get("deterministic_proposals", {}))),
+        "llm_count": len(dict(latest_registry.get("llm_proposals", {}))),
+        "validation_state": dict(latest_registry.get("validation_state", {})),
+    }
+    validation_summary = {
+        "proposals_by_source": {
+            "deterministic_hypothesis": len(dict(latest_registry.get("deterministic_proposals", {}))),
+            "llm_hypothesis": len(dict(latest_registry.get("llm_proposals", {}))),
+        },
+        "validated_proposals_by_source": {
+            "deterministic_hypothesis": sum(1 for proposal_id in dict(latest_registry.get("deterministic_proposals", {})) if str(dict(latest_registry.get("validation_state", {})).get(proposal_id, "")) == "validated"),
+            "llm_hypothesis": sum(1 for proposal_id in dict(latest_registry.get("llm_proposals", {})) if str(dict(latest_registry.get("validation_state", {})).get(proposal_id, "")) == "validated"),
+        },
+        "contradiction_rate_by_source": {
+            "deterministic_hypothesis": _safe_rate(sum(1 for row in dict(latest_registry.get("deterministic_proposals", {})).values() if len(list(row.get("contradiction_refs", []) or [])) > 0), max(1, len(dict(latest_registry.get("deterministic_proposals", {}))))),
+            "llm_hypothesis": _safe_rate(sum(1 for row in dict(latest_registry.get("llm_proposals", {})).values() if len(list(row.get("contradiction_refs", []) or [])) > 0), max(1, len(dict(latest_registry.get("llm_proposals", {}))))),
+        },
+        "first_correct_path_round_by_source": {
+            "deterministic_hypothesis": _first_validated_round(
+                dict(latest_registry.get("deterministic_proposals", {})),
+                dict(latest_registry.get("validation_state", {})),
+            ),
+            "llm_hypothesis": _first_validated_round(
+                dict(latest_registry.get("llm_proposals", {})),
+                dict(latest_registry.get("validation_state", {})),
+            ),
+        },
+        "source_agreement_on_final_winning_path": len(dict(latest_registry.get("deterministic_proposals", {}))) > 0 and len(dict(latest_registry.get("llm_proposals", {}))) > 0,
+    }
+    path_to_victory_payload = {
+        "candidates": [row for row in strongest_paths if str(row.get("edge_kind") or "") in {"requires", "enables_exit", "opens"}],
+    }
+    llm_proposals = dict(latest_registry.get("llm_proposals", {}))
+    deterministic_proposals = dict(latest_registry.get("deterministic_proposals", {}))
+    ledger_records = list(getattr(session_ledger, "records", []) or []) if session_ledger is not None else []
+    llm_event_payloads = [
+        dict(getattr(record, "payload", {}) or {})
+        for record in ledger_records
+        if str(getattr(record, "event_type", "")) in {"llm call skipped", "llm call attempted", "llm call failed", "llm call succeeded"}
+    ]
+    llm_task_roles = Counter(str(payload.get("gating_reason") or payload.get("provider_name") or "unknown") for payload in llm_event_payloads)
+    llm_prompt_modes = Counter(str(payload.get("prompt_mode") or "unknown") for payload in llm_event_payloads if payload)
+    llm_query_target_kinds = Counter()
+    prompt_char_counts = [int(payload.get("prompt_char_count", 0) or 0) for payload in llm_event_payloads if int(payload.get("prompt_char_count", 0) or 0) > 0]
+    if not prompt_char_counts:
+        prompt_char_counts = [
+            int(dict(row.get("metadata", {}) or {}).get("prompt_char_count", 0) or 0)
+            for row in llm_proposals.values()
+            if int(dict(row.get("metadata", {}) or {}).get("prompt_char_count", 0) or 0) > 0
+        ]
+    if not llm_prompt_modes:
+        llm_prompt_modes = Counter(
+            str(dict(row.get("metadata", {}) or {}).get("prompt_mode") or "unknown")
+            for row in llm_proposals.values()
+            if row
+        )
+    prompt_trim_count = sum(1 for payload in llm_event_payloads if bool(payload.get("prompt_trim_applied", False)))
+    prompt_budget_skip_count = sum(1 for payload in llm_event_payloads if str(payload.get("skip_reason") or payload.get("gating_reason") or "") in {"prompt_too_large_after_trimming", "prompt_budget_exceeded"})
+    for payload in llm_event_payloads:
+        query_target_id = str(payload.get("query_target_id") or "")
+        if not query_target_id:
+            llm_query_target_kinds["unknown"] += 1
+            continue
+        target_kind = query_target_id.split(":", 1)[0] if ":" in query_target_id else "unknown"
+        llm_query_target_kinds[target_kind] += 1
+    if not llm_query_target_kinds:
+        for row in llm_proposals.values():
+            query_target_id = str(dict(row.get("metadata", {}) or {}).get("query_target_id") or "")
+            if not query_target_id:
+                llm_query_target_kinds["unknown"] += 1
+                continue
+            target_kind = query_target_id.split(":", 1)[0] if ":" in query_target_id else "unknown"
+            llm_query_target_kinds[target_kind] += 1
+    accepted_llm_by_role = Counter(str(dict(row.get("metadata", {}) or {}).get("task_role") or "unknown") for row in llm_proposals.values())
+    llm_rejection_counts = Counter()
+    for row in llm_proposals.values():
+        llm_rejection_counts.update(dict(dict(row.get("metadata", {}) or {}).get("rejection_reason_counts", {}) or {}))
+    llm_usage_summary = {
+        "proposals_generated_by_source": {
+            "deterministic_hypothesis": len(deterministic_proposals),
+            "llm_hypothesis": len(llm_proposals),
+        },
+        "proposals_validated_by_source": {
+            "deterministic_hypothesis": sum(1 for proposal_id in deterministic_proposals if str(dict(latest_registry.get("validation_state", {})).get(proposal_id, "")) == "validated"),
+            "llm_hypothesis": sum(1 for proposal_id in llm_proposals if str(dict(latest_registry.get("validation_state", {})).get(proposal_id, "")) == "validated"),
+        },
+        "proposals_contradicted_by_source": {
+            "deterministic_hypothesis": sum(1 for proposal_id in deterministic_proposals if str(dict(latest_registry.get("validation_state", {})).get(proposal_id, "")) == "contradicted"),
+            "llm_hypothesis": sum(1 for proposal_id in llm_proposals if str(dict(latest_registry.get("validation_state", {})).get(proposal_id, "")) == "contradicted"),
+        },
+        "llm_call_attempt_count": sum(1 for record in list(getattr(session_ledger, "records", []) or []) if str(getattr(record, "event_type", "")) == "llm call attempted") if session_ledger is not None else 0,
+        "llm_call_success_count": sum(1 for record in list(getattr(session_ledger, "records", []) or []) if str(getattr(record, "event_type", "")) == "llm call succeeded") if session_ledger is not None else 0,
+        "parameter_preset_used": sorted({str(dict(row.get("metadata", {}) or {}).get("parameter_preset_used") or "") for row in llm_proposals.values() if dict(row.get("metadata", {}) or {}).get("parameter_preset_used")}),
+        "calls_by_task_role": dict(llm_task_roles),
+        "schema_valid_response_rate": _safe_rate(sum(1 for payload in llm_event_payloads if payload.get("error_code") in {None, ""}), max(1, len([payload for payload in llm_event_payloads if payload]))),
+        "think_rejection_count": int(llm_rejection_counts.get("think_content", 0)),
+        "prose_plus_json_rejection_count": int(llm_rejection_counts.get("non_json_wrapper_text", 0)),
+        "accepted_proposal_count_by_task_role": dict(accepted_llm_by_role),
+        "average_prompt_size": (sum(prompt_char_counts) / float(len(prompt_char_counts))) if prompt_char_counts else 0.0,
+        "max_prompt_size": max(prompt_char_counts) if prompt_char_counts else 0,
+        "prompt_trim_count": int(prompt_trim_count),
+        "prompt_budget_skip_count": int(prompt_budget_skip_count),
+        "calls_per_prompt_mode": dict(llm_prompt_modes),
+        "calls_per_query_target_kind": dict(llm_query_target_kinds),
+    }
+    hypothesis_lifecycle_summary = {
+        "proposal_lifecycle_state": dict(latest_registry.get("proposal_lifecycle_state", {})),
+        "first_support_round": dict(latest_registry.get("first_support_round", {})),
+        "first_contradiction_round": dict(latest_registry.get("first_contradiction_round", {})),
+        "first_validation_round": dict(latest_registry.get("first_validation_round", {})),
+        "source_agreement_groups": dict(latest_registry.get("source_agreement_groups", {})),
+        "first_supported_path_round": min([int(value) for value in dict(latest_registry.get("first_support_round", {})).values()]) if dict(latest_registry.get("first_support_round", {})) else None,
+        "first_validated_winning_path_round": min([int(value) for value in dict(latest_registry.get("first_validation_round", {})).values()]) if dict(latest_registry.get("first_validation_round", {})) else None,
+    }
+    experiment_results_summary = {
+        "experiments_run_by_source": {
+            "deterministic_hypothesis": sum(1 for row in deterministic_proposals.values() if str(row.get("proposal_kind", "")) == "test"),
+            "llm_hypothesis": sum(1 for row in llm_proposals.values() if str(row.get("proposal_kind", "")) == "test"),
+        },
+        "experiment_supports_by_source": {
+            "deterministic_hypothesis": sum(1 for row in deterministic_proposals.values() if list(dict(row.get("metadata", {}) or {}).get("experiment_supports_hypothesis_ids", []) or [])),
+            "llm_hypothesis": sum(1 for row in llm_proposals.values() if list(dict(row.get("metadata", {}) or {}).get("experiment_supports_hypothesis_ids", []) or [])),
+        },
+        "experiment_contradicts_by_source": {
+            "deterministic_hypothesis": sum(1 for row in deterministic_proposals.values() if list(dict(row.get("metadata", {}) or {}).get("experiment_contradicts_hypothesis_ids", []) or [])),
+            "llm_hypothesis": sum(1 for row in llm_proposals.values() if list(dict(row.get("metadata", {}) or {}).get("experiment_contradicts_hypothesis_ids", []) or [])),
+        },
+    }
+    return persist_postrun_outputs(
+        storage_agent,
+        session_id=session_id,
+        round_id=round_id,
+        game_id=game_id,
+        summary=summary,
+        memory_events=direct_events,
+        memory_summary=memory_summary,
+        heatmap_payloads=heatmap_payloads,
+        first_observation=first_observation,
+        export_png=export_png,
+        width=width,
+        height=height,
+        session_ledger_payload={"records": session_ledger.to_dicts(), "views": ledger_views} if session_ledger is not None else None,
+        mechanic_graph_payload={"mechanic_graph_version": mechanic_graph_version, **mechanic_graph_state},
+        mechanic_paths_payload={"mechanic_graph_version": mechanic_graph_version, "paths": strongest_paths},
+        mechanic_relations_summary=relations_summary,
+        deterministic_hypotheses_payload=deterministic_payload,
+        llm_hypotheses_payload=llm_payload,
+        hypothesis_agreement_payload=agreement_payload,
+        hypothesis_validation_summary=validation_summary,
+        path_to_victory_candidates=path_to_victory_payload,
+        llm_usage_summary=llm_usage_summary,
+        hypothesis_lifecycle_summary=hypothesis_lifecycle_summary,
+        experiment_results_summary=experiment_results_summary,
+    )

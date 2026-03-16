@@ -45,6 +45,13 @@ ACTION_FAMILY_BY_NAME = {
     "reset": "reset",
 }
 
+GRID_DELTA_BY_ACTION_NAME = {
+    "up": (0, -1),
+    "down": (0, 1),
+    "left": (-1, 0),
+    "right": (1, 0),
+}
+
 
 def _safe_scalar(value: Any) -> Any:
     if isinstance(value, (int, float, str, bool)) or value is None:
@@ -134,16 +141,13 @@ class NullEnv:
 
     def step(self, action):
         self.step_count += 1
-        action_id = int(action) if isinstance(action, int) else int(action.get("id", 0)) if isinstance(action, dict) else 0
+        normalized = normalize_action_lookup(action, available_actions=self.available_actions())
+        action_name = str(normalized.get("action_name") or "unknown").lower()
         x, y = self.avatar
-        if action_id == 1:
-            x -= 1
-        elif action_id == 2:
-            x += 1
-        elif action_id == 3:
-            y -= 1
-        elif action_id == 4:
-            y += 1
+        if action_name in GRID_DELTA_BY_ACTION_NAME:
+            dx, dy = GRID_DELTA_BY_ACTION_NAME[action_name]
+            x += dx
+            y += dy
         x = max(0, min(self.width - 1, x))
         y = max(0, min(self.height - 1, y))
         self.avatar = (x, y)

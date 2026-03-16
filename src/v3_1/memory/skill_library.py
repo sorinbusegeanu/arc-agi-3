@@ -107,7 +107,9 @@ def rebuild_skill_library(entities: dict[str, dict], triggers: dict[str, dict] |
 
 def update_skill_execution_stats(skill_library: dict[str, dict], *, decision: dict | None, outcome: dict | None) -> dict[str, dict]:
     updated = {skill_id: dict(skill) for skill_id, skill in skill_library.items()}
-    selected = dict(decision.get("metadata", {}).get("selected_candidate", {})) if isinstance(decision, dict) else {}
+    metadata = dict(decision.get("metadata", {})) if isinstance(decision, dict) else {}
+    selected_raw = metadata.get("selected_candidate", {})
+    selected = dict(selected_raw) if isinstance(selected_raw, dict) else {}
     selected_skill_id = selected.get("skill_id")
     target_entity_id = selected.get("target_entity_id")
     target_area_id = selected.get("target_area_id")

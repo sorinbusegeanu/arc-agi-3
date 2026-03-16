@@ -95,6 +95,12 @@ class StorageAgent:
 
     def flush_persistent_memory(self, request: PersistentMemoryFlushRequest) -> PersistentMemoryFlushResult:
         batch = request.batch
+        def _eligible(rows):
+            return tuple(
+                row
+                for row in rows
+                if bool(dict(row.get("metadata", {})).get("allowed_for_durable_write", True))
+            )
         filtered_request = PersistentMemoryFlushRequest(
             session_id=request.session_id,
             run_id=request.run_id,
@@ -110,18 +116,31 @@ class StorageAgent:
                 pass_id=batch.pass_id,
                 batch_id=batch.batch_id,
                 source_memory_version=batch.source_memory_version,
-                skills=batch.skills,
-                skill_stats=batch.skill_stats if self.persistence_flags.get("persist_skill_stats", True) else (),
-                candidate_outcomes=batch.candidate_outcomes if self.persistence_flags.get("persist_candidate_outcomes", True) else (),
-                failure_patterns=batch.failure_patterns if self.persistence_flags.get("persist_failure_patterns", True) else (),
-                recovery_patterns=batch.recovery_patterns if self.persistence_flags.get("persist_recovery_patterns", True) else (),
-                poi_patterns=batch.poi_patterns if self.persistence_flags.get("persist_poi_patterns", True) else (),
-                trigger_patterns=batch.trigger_patterns if self.persistence_flags.get("persist_trigger_patterns", True) else (),
-                consequence_patterns=batch.consequence_patterns if self.persistence_flags.get("persist_consequence_patterns", True) else (),
-                entity_signatures=batch.entity_signatures if self.persistence_flags.get("persist_entity_signatures", True) else (),
-                area_signatures=batch.area_signatures if self.persistence_flags.get("persist_area_signatures", True) else (),
-                mechanic_hypotheses=batch.mechanic_hypotheses if self.persistence_flags.get("persist_mechanic_hypotheses", True) else (),
-                ranker_state=batch.ranker_state if self.persistence_flags.get("persist_ranker_state", True) else (),
+                skills=_eligible(batch.skills),
+                skill_stats=_eligible(batch.skill_stats) if self.persistence_flags.get("persist_skill_stats", True) else (),
+                candidate_outcomes=_eligible(batch.candidate_outcomes) if self.persistence_flags.get("persist_candidate_outcomes", True) else (),
+                failure_patterns=_eligible(batch.failure_patterns) if self.persistence_flags.get("persist_failure_patterns", True) else (),
+                recovery_patterns=_eligible(batch.recovery_patterns) if self.persistence_flags.get("persist_recovery_patterns", True) else (),
+                poi_patterns=_eligible(batch.poi_patterns) if self.persistence_flags.get("persist_poi_patterns", True) else (),
+                trigger_patterns=_eligible(batch.trigger_patterns) if self.persistence_flags.get("persist_trigger_patterns", True) else (),
+                consequence_patterns=_eligible(batch.consequence_patterns) if self.persistence_flags.get("persist_consequence_patterns", True) else (),
+                entity_signatures=_eligible(batch.entity_signatures) if self.persistence_flags.get("persist_entity_signatures", True) else (),
+                area_signatures=_eligible(batch.area_signatures) if self.persistence_flags.get("persist_area_signatures", True) else (),
+                mechanic_hypotheses=_eligible(batch.mechanic_hypotheses) if self.persistence_flags.get("persist_mechanic_hypotheses", True) else (),
+                mechanic_graph_nodes=_eligible(batch.mechanic_graph_nodes),
+                mechanic_graph_edges=_eligible(batch.mechanic_graph_edges),
+                durable_dependency_paths=_eligible(batch.durable_dependency_paths),
+                deterministic_supported_paths=_eligible(batch.deterministic_supported_paths),
+                llm_supported_paths=_eligible(batch.llm_supported_paths),
+                deterministic_llm_agreements=_eligible(batch.deterministic_llm_agreements),
+                repeated_validated_hypotheses=_eligible(batch.repeated_validated_hypotheses),
+                contradicted_llm_proposals=_eligible(batch.contradicted_llm_proposals),
+                deterministic_hypothesis_proposals=_eligible(batch.deterministic_hypothesis_proposals),
+                llm_hypothesis_proposals=_eligible(batch.llm_hypothesis_proposals),
+                proposal_validation_state=_eligible(batch.proposal_validation_state),
+                proposal_agreement_groups=_eligible(batch.proposal_agreement_groups),
+                proposal_outcome_summaries=_eligible(batch.proposal_outcome_summaries),
+                ranker_state=_eligible(batch.ranker_state) if self.persistence_flags.get("persist_ranker_state", True) else (),
                 metadata=batch.metadata,
             ),
         )

@@ -65,10 +65,19 @@ def choose_directed_action(selected_action: dict | None, routed_action: dict | N
     del history
     if not available_actions:
         raise RuntimeError("directed execution requires at least one available action")
+    if routed_action is not None and routed_action.get("failed"):
+        raise RuntimeError(str(routed_action.get("failure_reason") or "directed_route_failed"))
     if routed_action is not None and routed_action.get("terminal"):
         desired = str(routed_action.get("desired_action_name", "")).lower()
         matched = _match_action(available_actions, desired)
         if matched is not None:
+            if desired == "click_at":
+                matched_row = dict(matched) if isinstance(matched, dict) else {"id": getattr(matched, "value", None), "name": getattr(matched, "name", "click_at")}
+                target_coordinates = routed_action.get("click_target_coordinates")
+                if isinstance(target_coordinates, (list, tuple)) and len(target_coordinates) == 2:
+                    matched_row["coordinates"] = [float(target_coordinates[0]), float(target_coordinates[1])]
+                    matched_row["click_target_coordinates"] = [float(target_coordinates[0]), float(target_coordinates[1])]
+                return matched_row
             return matched
         raise RuntimeError(f"directed terminal action unavailable: {desired}")
     if routed_action is not None and routed_action.get("movement"):

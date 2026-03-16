@@ -31,6 +31,36 @@ def _decode(payload: str | None, default: Any) -> Any:
     return json.loads(payload)
 
 
+_DURABLE_FIELD_DEFS = {
+    "mechanic_type": "text",
+    "maturity_stage": "text",
+    "evidence_basis": "text",
+    "observed_support_count": "integer not null default 0",
+    "hypothesis_support_count": "integer not null default 0",
+    "contradiction_count": "integer not null default 0",
+    "cross_round_stability": "integer not null default 0",
+    "last_evidence_tier": "text",
+}
+
+
+def _durable_value(payload: dict[str, Any], key: str):
+    if key in {"observed_support_count", "hypothesis_support_count", "contradiction_count", "cross_round_stability"}:
+        return int(payload.get(key, 0) or 0)
+    return payload.get(key)
+
+
+def _validate_durable_row(row: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(row)
+    metadata = dict(payload.get("metadata", {}) or {})
+    for key in _DURABLE_FIELD_DEFS:
+        if key not in payload and key in metadata:
+            payload[key] = metadata[key]
+    missing = [key for key in _DURABLE_FIELD_DEFS if key not in payload]
+    if missing:
+        raise ValueError(f"incomplete durable row; missing fields: {sorted(missing)}")
+    return payload
+
+
 @dataclass(frozen=True)
 class PersistentMemoryStore:
     db_path: str
@@ -189,9 +219,99 @@ class PersistentMemoryStore:
                     payload_json text not null default '{}',
                     updated_at text not null
                 );
+                create table if not exists mechanic_graph_nodes (
+                    node_id text not null,
+                    game_id text not null,
+                    observations integer not null default 0,
+                    metadata_json text not null default '{}',
+                    updated_at text not null,
+                    primary key (node_id, game_id)
+                );
+                create table if not exists mechanic_graph_edges (
+                    edge_id text not null,
+                    game_id text not null,
+                    observations integer not null default 0,
+                    metadata_json text not null default '{}',
+                    updated_at text not null,
+                    primary key (edge_id, game_id)
+                );
+                create table if not exists durable_dependency_paths (
+                    path_id text not null,
+                    game_id text not null,
+                    observations integer not null default 0,
+                    metadata_json text not null default '{}',
+                    updated_at text not null,
+                    primary key (path_id, game_id)
+                );
+                create table if not exists deterministic_hypothesis_proposals (
+                    proposal_id text not null,
+                    game_id text not null,
+                    observations integer not null default 0,
+                    metadata_json text not null default '{}',
+                    updated_at text not null,
+                    primary key (proposal_id, game_id)
+                );
+                create table if not exists llm_hypothesis_proposals (
+                    proposal_id text not null,
+                    game_id text not null,
+                    observations integer not null default 0,
+                    metadata_json text not null default '{}',
+                    updated_at text not null,
+                    primary key (proposal_id, game_id)
+                );
+                create table if not exists proposal_validation_state (
+                    proposal_id text not null,
+                    game_id text not null,
+                    observations integer not null default 0,
+                    metadata_json text not null default '{}',
+                    updated_at text not null,
+                    primary key (proposal_id, game_id)
+                );
+                create table if not exists proposal_agreement_groups (
+                    agreement_key text not null,
+                    game_id text not null,
+                    observations integer not null default 0,
+                    metadata_json text not null default '{}',
+                    updated_at text not null,
+                    primary key (agreement_key, game_id)
+                );
+                create table if not exists proposal_outcome_summaries (
+                    proposal_id text not null,
+                    game_id text not null,
+                    observations integer not null default 0,
+                    metadata_json text not null default '{}',
+                    updated_at text not null,
+                    primary key (proposal_id, game_id)
+                );
                 """
             )
+            self._ensure_columns(conn, "skills")
+            self._ensure_columns(conn, "skill_stats")
+            self._ensure_columns(conn, "candidate_outcomes")
+            self._ensure_columns(conn, "failure_patterns")
+            self._ensure_columns(conn, "recovery_patterns")
+            self._ensure_columns(conn, "poi_patterns")
+            self._ensure_columns(conn, "trigger_patterns")
+            self._ensure_columns(conn, "consequence_patterns")
+            self._ensure_columns(conn, "entity_signatures")
+            self._ensure_columns(conn, "area_signatures")
+            self._ensure_columns(conn, "mechanic_hypotheses")
+            self._ensure_columns(conn, "mechanic_graph_nodes")
+            self._ensure_columns(conn, "mechanic_graph_edges")
+            self._ensure_columns(conn, "durable_dependency_paths")
+            self._ensure_columns(conn, "deterministic_hypothesis_proposals")
+            self._ensure_columns(conn, "llm_hypothesis_proposals")
+            self._ensure_columns(conn, "proposal_validation_state")
+            self._ensure_columns(conn, "proposal_agreement_groups")
+            self._ensure_columns(conn, "proposal_outcome_summaries")
+            self._ensure_columns(conn, "ranker_state")
             conn.commit()
+
+    def _ensure_columns(self, conn: sqlite3.Connection, table: str) -> None:
+        existing = {str(row["name"]) for row in conn.execute(f"pragma table_info({table})").fetchall()}
+        for column, definition in _DURABLE_FIELD_DEFS.items():
+            if column not in existing:
+                conn.execute(f"alter table {table} add column {column} {definition}")
 
     def load_priors(self, request: PersistentMemoryLoadRequest) -> PersistentMemoryLoadResult:
         priors = {
@@ -205,6 +325,14 @@ class PersistentMemoryStore:
             "entity_signatures": self.query_table_rows("entity_signatures", "signature", request.game_id),
             "area_signatures": self.query_table_rows("area_signatures", "signature", request.game_id),
             "mechanic_hypotheses": self.query_table_rows("mechanic_hypotheses", "hypothesis_key", request.game_id),
+            "mechanic_graph_nodes": self.query_table_rows("mechanic_graph_nodes", "node_id", request.game_id),
+            "mechanic_graph_edges": self.query_table_rows("mechanic_graph_edges", "edge_id", request.game_id),
+            "durable_dependency_paths": self.query_table_rows("durable_dependency_paths", "path_id", request.game_id),
+            "deterministic_hypothesis_proposals": self.query_table_rows("deterministic_hypothesis_proposals", "proposal_id", request.game_id),
+            "llm_hypothesis_proposals": self.query_table_rows("llm_hypothesis_proposals", "proposal_id", request.game_id),
+            "proposal_validation_state": self.query_table_rows("proposal_validation_state", "proposal_id", request.game_id),
+            "proposal_agreement_groups": self.query_table_rows("proposal_agreement_groups", "agreement_key", request.game_id),
+            "proposal_outcome_summaries": self.query_table_rows("proposal_outcome_summaries", "proposal_id", request.game_id),
             "ranker_state": self.query_ranker_state(request.game_id),
         }
         metadata = {
@@ -276,6 +404,19 @@ class PersistentMemoryStore:
             counts["entity_signatures"] = self._merge_entity_rows(conn, "entity_signatures", batch.game_id, batch.entity_signatures, now)
             counts["area_signatures"] = self._merge_pattern_rows(conn, "area_signatures", batch.game_id, "signature", batch.area_signatures, count_column="observations", now=now)
             counts["mechanic_hypotheses"] = self._merge_pattern_rows(conn, "mechanic_hypotheses", batch.game_id, "hypothesis_key", batch.mechanic_hypotheses, count_column="evidence_count", now=now)
+            counts["mechanic_graph_nodes"] = self._merge_pattern_rows(conn, "mechanic_graph_nodes", batch.game_id, "node_id", batch.mechanic_graph_nodes, count_column="observations", now=now)
+            counts["mechanic_graph_edges"] = self._merge_pattern_rows(conn, "mechanic_graph_edges", batch.game_id, "edge_id", batch.mechanic_graph_edges, count_column="observations", now=now)
+            counts["durable_dependency_paths"] = self._merge_pattern_rows(conn, "durable_dependency_paths", batch.game_id, "path_id", batch.durable_dependency_paths, count_column="observations", now=now)
+            counts["deterministic_supported_paths"] = self._merge_pattern_rows(conn, "durable_dependency_paths", batch.game_id, "path_id", batch.deterministic_supported_paths, count_column="observations", now=now)
+            counts["llm_supported_paths"] = self._merge_pattern_rows(conn, "durable_dependency_paths", batch.game_id, "path_id", batch.llm_supported_paths, count_column="observations", now=now)
+            counts["deterministic_llm_agreements"] = self._merge_pattern_rows(conn, "proposal_agreement_groups", batch.game_id, "agreement_key", batch.deterministic_llm_agreements, count_column="observations", now=now)
+            counts["repeated_validated_hypotheses"] = self._merge_pattern_rows(conn, "proposal_validation_state", batch.game_id, "proposal_id", batch.repeated_validated_hypotheses, count_column="observations", now=now)
+            counts["contradicted_llm_proposals"] = self._merge_pattern_rows(conn, "proposal_validation_state", batch.game_id, "proposal_id", batch.contradicted_llm_proposals, count_column="observations", now=now)
+            counts["deterministic_hypothesis_proposals"] = self._merge_pattern_rows(conn, "deterministic_hypothesis_proposals", batch.game_id, "proposal_id", batch.deterministic_hypothesis_proposals, count_column="observations", now=now)
+            counts["llm_hypothesis_proposals"] = self._merge_pattern_rows(conn, "llm_hypothesis_proposals", batch.game_id, "proposal_id", batch.llm_hypothesis_proposals, count_column="observations", now=now)
+            counts["proposal_validation_state"] = self._merge_pattern_rows(conn, "proposal_validation_state", batch.game_id, "proposal_id", batch.proposal_validation_state, count_column="observations", now=now)
+            counts["proposal_agreement_groups"] = self._merge_pattern_rows(conn, "proposal_agreement_groups", batch.game_id, "agreement_key", batch.proposal_agreement_groups, count_column="observations", now=now)
+            counts["proposal_outcome_summaries"] = self._merge_pattern_rows(conn, "proposal_outcome_summaries", batch.game_id, "proposal_id", batch.proposal_outcome_summaries, count_column="observations", now=now)
             counts["ranker_state"] = self._upsert_ranker_state(conn, batch.game_id, batch.ranker_state, now)
             conn.commit()
         return PersistentMemoryFlushResult(
@@ -300,7 +441,7 @@ class PersistentMemoryStore:
     def query_skill_stats(self, game_id: str) -> dict[str, dict]:
         with self._connect() as conn:
             rows = conn.execute(
-                "select skill_stats.skill_id, skill_stats.attempts, skill_stats.successes, skill_stats.failures, skill_stats.usefulness_total, skill_stats.confidence_total, skill_stats.metadata_json, skills.skill_type, skills.usefulness, skills.confidence from skill_stats left join skills on skills.skill_id = skill_stats.skill_id and skills.game_id = skill_stats.game_id where skill_stats.game_id = ?",
+                "select skill_stats.skill_id, skill_stats.attempts, skill_stats.successes, skill_stats.failures, skill_stats.usefulness_total, skill_stats.confidence_total, skill_stats.metadata_json, skill_stats.mechanic_type, skill_stats.maturity_stage, skill_stats.evidence_basis, skill_stats.observed_support_count, skill_stats.hypothesis_support_count, skill_stats.contradiction_count, skill_stats.cross_round_stability, skill_stats.last_evidence_tier, skills.skill_type, skills.usefulness, skills.confidence from skill_stats left join skills on skills.skill_id = skill_stats.skill_id and skills.game_id = skill_stats.game_id where skill_stats.game_id = ?",
                 (game_id,),
             ).fetchall()
         result = {}
@@ -314,6 +455,14 @@ class PersistentMemoryStore:
                 "skill_type": row["skill_type"],
                 "usefulness": float(row["usefulness"] or 0.0),
                 "confidence": float(row["confidence"] or 0.0),
+                "mechanic_type": row["mechanic_type"],
+                "maturity_stage": row["maturity_stage"],
+                "evidence_basis": row["evidence_basis"],
+                "observed_support_count": int(row["observed_support_count"] or 0),
+                "hypothesis_support_count": int(row["hypothesis_support_count"] or 0),
+                "contradiction_count": int(row["contradiction_count"] or 0),
+                "cross_round_stability": int(row["cross_round_stability"] or 0),
+                "last_evidence_tier": row["last_evidence_tier"],
                 **_decode(row["metadata_json"], {}),
             }
         return result
@@ -328,6 +477,14 @@ class PersistentMemoryStore:
                 "failures": int(row["failures"]),
                 "progress_total": float(row["progress_total"]),
                 "route_failures": int(row["route_failures"]),
+                "mechanic_type": row["mechanic_type"],
+                "maturity_stage": row["maturity_stage"],
+                "evidence_basis": row["evidence_basis"],
+                "observed_support_count": int(row["observed_support_count"] or 0),
+                "hypothesis_support_count": int(row["hypothesis_support_count"] or 0),
+                "contradiction_count": int(row["contradiction_count"] or 0),
+                "cross_round_stability": int(row["cross_round_stability"] or 0),
+                "last_evidence_tier": row["last_evidence_tier"],
                 **_decode(row["metadata_json"], {}),
             }
             for row in rows
@@ -353,6 +510,14 @@ class PersistentMemoryStore:
             return {}
         return {
             "ranker_version": row["ranker_version"],
+            "mechanic_type": row["mechanic_type"],
+            "maturity_stage": row["maturity_stage"],
+            "evidence_basis": row["evidence_basis"],
+            "observed_support_count": int(row["observed_support_count"] or 0),
+            "hypothesis_support_count": int(row["hypothesis_support_count"] or 0),
+            "contradiction_count": int(row["contradiction_count"] or 0),
+            "cross_round_stability": int(row["cross_round_stability"] or 0),
+            "last_evidence_tier": row["last_evidence_tier"],
             **_decode(row["payload_json"], {}),
         }
 
@@ -384,17 +549,21 @@ class PersistentMemoryStore:
         if not rows:
             return 0
         now = _utc_now()
+        durable_columns = tuple(_DURABLE_FIELD_DEFS.keys())
+        all_columns = tuple(columns) + durable_columns
+        durable_merge = ", ".join(f"{column} = excluded.{column}" for column in durable_columns)
         for row in rows:
-            payload = dict(row)
+            payload = _validate_durable_row(row)
             payload.setdefault("metadata_json", _json(payload.get("metadata", {})))
             payload["updated_at"] = now
             values = [payload.get(column) for column in columns]
+            values.extend(_durable_value(payload, column) for column in durable_columns)
             conn.execute(
                 f"""
-                insert into {table}({key_column}, game_id, {', '.join(columns[1:])})
-                values (?, ?, {', '.join('?' for _ in columns[1:])})
+                insert into {table}({key_column}, game_id, {', '.join(all_columns[1:])})
+                values (?, ?, {', '.join('?' for _ in all_columns[1:])})
                 on conflict({key_column}, game_id) do update set
-                    {merge_sql}
+                    {merge_sql}, {durable_merge}
                 """,
                 [payload.get(key_column), game_id, *values[1:]],
             )
@@ -403,18 +572,20 @@ class PersistentMemoryStore:
     def _merge_pattern_rows(self, conn: sqlite3.Connection, table: str, game_id: str, key_column: str, rows: tuple[dict[str, Any], ...], *, count_column: str, now: str, real_sums: tuple[str, ...] = ()) -> int:
         if not rows:
             return 0
-        extra_columns = [count_column, *real_sums, "metadata_json", "updated_at"]
+        extra_columns = [count_column, *real_sums, "metadata_json", "updated_at", *_DURABLE_FIELD_DEFS.keys()]
         merge_parts = [f"{count_column} = {table}.{count_column} + excluded.{count_column}"]
         for column in real_sums:
             merge_parts.append(f"{column} = {table}.{column} + excluded.{column}")
         merge_parts.append("metadata_json = excluded.metadata_json")
         merge_parts.append("updated_at = excluded.updated_at")
+        merge_parts.extend(f"{column} = excluded.{column}" for column in _DURABLE_FIELD_DEFS)
         for row in rows:
-            payload = dict(row)
+            payload = _validate_durable_row(row)
             metadata_json = _json(payload.get("metadata", {}))
             values = [int(payload.get(count_column, 0))]
             values.extend(float(payload.get(column, 0.0)) for column in real_sums)
             values.extend([metadata_json, now])
+            values.extend(_durable_value(payload, column) for column in _DURABLE_FIELD_DEFS)
             conn.execute(
                 f"""
                 insert into {table}({key_column}, game_id, {', '.join(extra_columns)})
@@ -430,17 +601,25 @@ class PersistentMemoryStore:
         if not rows:
             return 0
         for row in rows:
-            payload = dict(row)
+            payload = _validate_durable_row(row)
             conn.execute(
                 """
-                insert into recovery_patterns(pattern_key, game_id, attempts, successes, failures, metadata_json, updated_at)
-                values (?, ?, ?, ?, ?, ?, ?)
+                insert into recovery_patterns(pattern_key, game_id, attempts, successes, failures, metadata_json, updated_at, mechanic_type, maturity_stage, evidence_basis, observed_support_count, hypothesis_support_count, contradiction_count, cross_round_stability, last_evidence_tier)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 on conflict(pattern_key, game_id) do update set
                     attempts = recovery_patterns.attempts + excluded.attempts,
                     successes = recovery_patterns.successes + excluded.successes,
                     failures = recovery_patterns.failures + excluded.failures,
                     metadata_json = excluded.metadata_json,
-                    updated_at = excluded.updated_at
+                    updated_at = excluded.updated_at,
+                    mechanic_type = excluded.mechanic_type,
+                    maturity_stage = excluded.maturity_stage,
+                    evidence_basis = excluded.evidence_basis,
+                    observed_support_count = excluded.observed_support_count,
+                    hypothesis_support_count = excluded.hypothesis_support_count,
+                    contradiction_count = excluded.contradiction_count,
+                    cross_round_stability = excluded.cross_round_stability,
+                    last_evidence_tier = excluded.last_evidence_tier
                 """,
                 (
                     payload.get("pattern_key"),
@@ -450,6 +629,14 @@ class PersistentMemoryStore:
                     int(payload.get("failures", 0)),
                     _json(payload.get("metadata", {})),
                     now,
+                    payload.get("mechanic_type"),
+                    payload.get("maturity_stage"),
+                    payload.get("evidence_basis"),
+                    int(payload.get("observed_support_count", 0)),
+                    int(payload.get("hypothesis_support_count", 0)),
+                    int(payload.get("contradiction_count", 0)),
+                    int(payload.get("cross_round_stability", 0)),
+                    payload.get("last_evidence_tier"),
                 ),
             )
         return len(rows)
@@ -458,17 +645,25 @@ class PersistentMemoryStore:
         if not rows:
             return 0
         for row in rows:
-            payload = dict(row)
+            payload = _validate_durable_row(row)
             conn.execute(
                 f"""
-                insert into {table}(signature, game_id, observations, success_signals, failure_signals, metadata_json, updated_at)
-                values (?, ?, ?, ?, ?, ?, ?)
+                insert into {table}(signature, game_id, observations, success_signals, failure_signals, metadata_json, updated_at, mechanic_type, maturity_stage, evidence_basis, observed_support_count, hypothesis_support_count, contradiction_count, cross_round_stability, last_evidence_tier)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 on conflict(signature, game_id) do update set
                     observations = {table}.observations + excluded.observations,
                     success_signals = {table}.success_signals + excluded.success_signals,
                     failure_signals = {table}.failure_signals + excluded.failure_signals,
                     metadata_json = excluded.metadata_json,
-                    updated_at = excluded.updated_at
+                    updated_at = excluded.updated_at,
+                    mechanic_type = excluded.mechanic_type,
+                    maturity_stage = excluded.maturity_stage,
+                    evidence_basis = excluded.evidence_basis,
+                    observed_support_count = excluded.observed_support_count,
+                    hypothesis_support_count = excluded.hypothesis_support_count,
+                    contradiction_count = excluded.contradiction_count,
+                    cross_round_stability = excluded.cross_round_stability,
+                    last_evidence_tier = excluded.last_evidence_tier
                 """,
                 (
                     payload.get("signature"),
@@ -478,6 +673,14 @@ class PersistentMemoryStore:
                     int(payload.get("failure_signals", 0)),
                     _json(payload.get("metadata", {})),
                     now,
+                    payload.get("mechanic_type"),
+                    payload.get("maturity_stage"),
+                    payload.get("evidence_basis"),
+                    int(payload.get("observed_support_count", 0)),
+                    int(payload.get("hypothesis_support_count", 0)),
+                    int(payload.get("contradiction_count", 0)),
+                    int(payload.get("cross_round_stability", 0)),
+                    payload.get("last_evidence_tier"),
                 ),
             )
         return len(rows)
@@ -485,16 +688,37 @@ class PersistentMemoryStore:
     def _upsert_ranker_state(self, conn: sqlite3.Connection, game_id: str, rows: tuple[dict[str, Any], ...], now: str) -> int:
         if not rows:
             return 0
-        payload = dict(rows[-1])
+        payload = _validate_durable_row(rows[-1])
         conn.execute(
             """
-            insert into ranker_state(game_id, ranker_version, payload_json, updated_at)
-            values (?, ?, ?, ?)
+            insert into ranker_state(game_id, ranker_version, payload_json, updated_at, mechanic_type, maturity_stage, evidence_basis, observed_support_count, hypothesis_support_count, contradiction_count, cross_round_stability, last_evidence_tier)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             on conflict(game_id) do update set
                 ranker_version = excluded.ranker_version,
                 payload_json = excluded.payload_json,
-                updated_at = excluded.updated_at
+                updated_at = excluded.updated_at,
+                mechanic_type = excluded.mechanic_type,
+                maturity_stage = excluded.maturity_stage,
+                evidence_basis = excluded.evidence_basis,
+                observed_support_count = excluded.observed_support_count,
+                hypothesis_support_count = excluded.hypothesis_support_count,
+                contradiction_count = excluded.contradiction_count,
+                cross_round_stability = excluded.cross_round_stability,
+                last_evidence_tier = excluded.last_evidence_tier
             """,
-            (game_id, payload.get("ranker_version"), _json(payload.get("payload", payload)), now),
+            (
+                game_id,
+                payload.get("ranker_version"),
+                _json(payload.get("payload", payload)),
+                now,
+                payload.get("mechanic_type"),
+                payload.get("maturity_stage"),
+                payload.get("evidence_basis"),
+                int(payload.get("observed_support_count", 0)),
+                int(payload.get("hypothesis_support_count", 0)),
+                int(payload.get("contradiction_count", 0)),
+                int(payload.get("cross_round_stability", 0)),
+                payload.get("last_evidence_tier"),
+            ),
         )
         return 1

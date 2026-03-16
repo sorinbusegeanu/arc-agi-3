@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from v3_1.config.hypothesis_generation import HypothesisGenerationSection
 
 
 @dataclass(frozen=True)
@@ -14,6 +15,7 @@ class RuntimeSection:
 
 @dataclass(frozen=True)
 class RaySection:
+    address: str | None = None
     namespace: str = "v3_1"
     temp_dir: str | None = None
     local_mode: bool = False
@@ -48,6 +50,9 @@ class AnalysisSection:
 @dataclass(frozen=True)
 class PlanningSection:
     max_candidates: int = 16
+    trace_level: str = "debug"
+    probe_branch_count: int = 1
+    directed_trial_count: int = 1
     novelty_weight: float = 0.6
     reward_weight: float = 0.4
     risk_penalty: float = 0.5
@@ -57,8 +62,17 @@ class PlanningSection:
     retry_penalty_weight: float = 0.18
     route_cost_weight: float = 0.12
     route_risk_weight: float = 0.35
+    route_uncertainty_weight: float = 0.09
     consequence_bonus_weight: float = 0.05
     trigger_bonus_weight: float = 0.08
+    trigger_uncertainty_weight: float = 0.07
+    progress_type_weight: float = 0.12
+    support_freshness_weight: float = 0.08
+    contradiction_penalty_weight: float = 1.0
+    local_failure_risk_weight: float = 0.14
+    durable_prior_strength_weight: float = 0.06
+    exploration_bias_weight: float = 0.12
+    recovery_bias_weight: float = 0.1
 
 
 @dataclass(frozen=True)
@@ -83,6 +97,7 @@ class StorageSection:
     root_dir: str = "runs_v3_1"
     export_json: bool = True
     export_sqlite: bool = True
+    max_blackboard_consequences: int = 100
     enable_persistent_memory: bool = True
     persistent_memory_db_path_override: str | None = None
     persistent_memory_flush_every_n_rounds: int = 0
@@ -138,3 +153,4 @@ class V31Config:
     visualization: VisualizationSection = field(default_factory=VisualizationSection)
     debugging: DebuggingSection = field(default_factory=DebuggingSection)
     feature_flags: FeatureFlagsSection = field(default_factory=FeatureFlagsSection)
+    hypothesis_generation: HypothesisGenerationSection = field(default_factory=HypothesisGenerationSection)

@@ -1,160 +1,167 @@
 from __future__ import annotations
 
 FILTER_REASON_TAXONOMY = {
-    "hard_cooldown_active": {"severity": "hard", "provenance": "memory"},
-    "hard_exhausted_scope": {"severity": "hard", "provenance": "memory"},
-    "hard_unreachable_target": {"severity": "hard", "provenance": "blackboard"},
-    "hard_invalid_target": {"severity": "hard", "provenance": "blackboard"},
-    "hard_contradiction_current_evidence": {"severity": "hard", "provenance": "blackboard"},
-    "soft_repeated_failure": {"severity": "soft", "provenance": "memory"},
-    "soft_target_repeated_failure": {"severity": "soft", "provenance": "memory"},
-    "soft_local_class_repeat": {"severity": "soft", "provenance": "local_context"},
-    "soft_local_target_repeat": {"severity": "soft", "provenance": "local_context"},
-    "soft_route_repeat": {"severity": "soft", "provenance": "local_context"},
-    "soft_trigger_repeat": {"severity": "soft", "provenance": "local_context"},
-    "soft_area_repeated_failure": {"severity": "soft", "provenance": "local_context"},
-    "soft_stale_support_decay": {"severity": "soft", "provenance": "blackboard"},
-    "soft_uncertain_contradiction": {"severity": "soft", "provenance": "blackboard"},
+    "hard.cooldown.active": {"severity": "hard", "provenance": "tactical_memory"},
+    "hard.exhaustion.scope": {"severity": "hard", "provenance": "tactical_memory"},
+    "hard.target.unreachable": {"severity": "hard", "provenance": "observed_world"},
+    "hard.target.invalid": {"severity": "hard", "provenance": "observed_world"},
+    "hard.evidence.contradicted": {"severity": "hard", "provenance": "observed_world"},
+    "soft.repeat.candidate_area": {"severity": "soft", "provenance": "tactical_context"},
+    "soft.repeat.target_area": {"severity": "soft", "provenance": "tactical_context"},
+    "soft.repeat.route": {"severity": "soft", "provenance": "tactical_context"},
+    "soft.repeat.trigger": {"severity": "soft", "provenance": "tactical_context"},
+    "soft.support.stale": {"severity": "soft", "provenance": "uncertainty_context"},
+    "soft.contradiction.uncertain": {"severity": "soft", "provenance": "hypothesized_world"},
+}
+
+WEAKNESS_BY_OBJECTIVE = {
+    "interact": 2,
+    "gather_local_info": 2,
+    "explore_frontier": 2,
+    "probe_route": 2,
+    "test_trigger": 2,
+    "recover": 3,
+    "fallback": 99,
 }
 
 
-def filter_candidates(candidates: list[dict], belief: dict) -> tuple[list[dict], list[dict]]:
-    cooldowns = dict(belief.get("cooldowns", {}))
-    exhaustion_map = dict(belief.get("exhaustion_map", {}))
-    exhausted = set(belief.get("exhausted_keys", belief.get("exhausted", set())))
-    failed_candidates = dict(belief.get("failed_candidates", {}))
-    blocked_targets = {str(row["entity_id"]) for row in belief.get("blocked_targets", []) if row.get("entity_id") is not None}
-    localized_context = dict(belief.get("localized_context", {}))
-    local_context = dict(belief.get("local_context", {}))
-    evidence_index = dict(belief.get("indexes", {}).get("evidence_index", {}))
-    prior_failure_success_context = dict(belief.get("prior_failure_success_context", {}))
-    candidate_counts_before: dict[str, int] = {}
-    candidate_counts_after: dict[str, int] = {}
-    block_counts_by_reason: dict[str, int] = {}
-    downgrade_counts_by_reason: dict[str, int] = {}
-    survivors: list[dict] = []
-    blocked_rows: list[dict] = []
+def _target_ids(rows: list[dict]) -> set[str]:
+    return {str(row.get("entity_id") or row.get("target_entity_id") or "") for row in list(rows or []) if str(row.get("entity_id") or row.get("target_entity_id") or "")}
 
-    def _cooldown_row(key: str | None):
+
+def _row_lookup(rows: list[dict], *, key_name: str) -> dict[str, dict]:
+    lookup = {}
+    for row in list(rows or []):
+        key = str(row.get(key_name) or "")
+        if key:
+            lookup[key] = dict(row)
+    return lookup
+
+
+def _cooldown_active(cooldowns: dict, keys: list[str]) -> bool:
+    for key in keys:
         if not key:
-            return None
-        return cooldowns.get(str(key), 0)
-
-    def _cooldown_active(key: str | None, *, scopes: set[str] | None = None) -> bool:
-        row = _cooldown_row(key)
+            continue
+        row = cooldowns.get(str(key))
         if isinstance(row, dict):
-            if scopes is not None and str(row.get("scope", "candidate")) not in scopes:
-                return False
-            return int(row.get("remaining_rounds", 0)) > 0
-        return scopes is None and int(row or 0) > 0
+            if int(row.get("remaining_rounds", 0) or 0) > 0:
+                return True
+        elif int(row or 0) > 0:
+            return True
+    return False
 
-    def _exhausted_in_scope(key: str | None, scope: str) -> bool:
-        if not key:
-            return False
-        return str(key) in {str(value) for value in list(exhaustion_map.get(scope, []) or [])}
+
+def _mark_filter_usage(row: dict, *, observed: bool, hypothesis: bool, compatibility: bool) -> None:
+    row["used_observed_support"] = bool(row.get("used_observed_support")) or observed
+    row["used_hypothesis_support"] = bool(row.get("used_hypothesis_support")) or hypothesis
+    row["used_compatibility_fallback"] = bool(row.get("used_compatibility_fallback")) or compatibility
+    row["filter_input_mode"] = "split_world_native" if not row["used_compatibility_fallback"] else "compatibility_fallback"
+
+
+def _append_reason(row: dict, *, code: str, detail: dict | None = None, hard: bool) -> None:
+    key = "blocked_reasons" if hard else "soft_filter_reasons"
+    row[key].append(code)
+    row["blocked_reason_details"].append({"code": code, **dict(detail or {})})
+    row["filter_provenance"].append(dict(FILTER_REASON_TAXONOMY.get(code, {})))
+    audit_key = "block_counts_by_reason" if hard else "downgrade_counts_by_reason"
+    audit = row.setdefault("filter_audit", {})
+    counts = audit.setdefault(audit_key, {})
+    counts[code] = int(counts.get(code, 0) or 0) + 1
+
+
+def filter_candidates(
+    candidates: list[dict],
+    *,
+    observed_world: dict | None = None,
+    hypothesized_world: dict | None = None,
+    uncertainty_context: dict | None = None,
+    belief_fallback: dict | None = None,
+) -> tuple[list[dict], list[dict]]:
+    belief_fallback = dict(belief_fallback or {})
+    observed_world = dict(observed_world or belief_fallback.get("observed_world", {}) or {})
+    hypothesized_world = dict(hypothesized_world or belief_fallback.get("hypothesized_world", {}) or {})
+    uncertainty_context = dict(uncertainty_context or belief_fallback.get("uncertainty_context", {}) or {})
+    tactical_memory = dict(uncertainty_context.get("tactical_memory", {}) or belief_fallback.get("tactical_memory_view", {}) or {})
+    tactical_context = dict(tactical_memory.get("tactical_context", {}) or {})
+    cooldowns = dict(tactical_memory.get("cooldowns", {}) or {})
+    exhausted_keys = {str(key) for key in list(tactical_memory.get("exhausted_keys", []) or []) if key}
+    observed_blocked = _target_ids(list(observed_world.get("blocked_targets", [])))
+    observed_reachable = _target_ids(list(observed_world.get("reachable_targets", [])))
+    hypothesis_reachable = _target_ids(list(hypothesized_world.get("reachable_targets", [])))
+    observed_entities = _row_lookup(list(dict(observed_world.get("entities", {})).values()) + list(observed_world.get("reachable_targets", [])) + list(observed_world.get("promising_pois", [])) + list(observed_world.get("trigger_candidates", [])), key_name="entity_id")
+    hypothesized_entities = _row_lookup(list(dict(hypothesized_world.get("entities", {})).values()) + list(hypothesized_world.get("reachable_targets", [])) + list(hypothesized_world.get("promising_pois", [])) + list(hypothesized_world.get("trigger_candidates", [])), key_name="entity_id")
+    survivors: list[dict] = []
+    blocked: list[dict] = []
+    counts_before: dict[str, int] = {}
+    counts_after: dict[str, int] = {}
 
     for candidate in candidates:
         row = dict(candidate)
-        reason_details = list(row.get("blocked_reason_details", []))
-        candidate_id = str(row["candidate_id"])
+        row.setdefault("blocked_reasons", [])
+        row.setdefault("soft_filter_reasons", [])
+        row.setdefault("blocked_reason_details", [])
+        row.setdefault("filter_provenance", [])
+        row["used_observed_support"] = False
+        row["used_hypothesis_support"] = False
+        row["used_compatibility_fallback"] = str(row.get("seed_contract") or "") == "compatibility_fallback"
+        row["filter_input_mode"] = "compatibility_fallback" if row["used_compatibility_fallback"] else "split_world_native"
+        row["blocked"] = False
         candidate_class = str(row.get("candidate_class") or "unknown")
-        candidate_counts_before[candidate_class] = candidate_counts_before.get(candidate_class, 0) + 1
-        target_entity_id = row.get("target_entity_id")
-        target_area_id = row.get("target_area_id")
-        route_signature = row.get("route_signature")
-        trigger_zone_id = row.get("trigger_zone_id")
-        local_zone_key = f"{target_area_id or local_context.get('current_area_id') or 'global'}:{target_entity_id or candidate_id}"
-        local_zone = dict(localized_context.get("by_zone", {}).get(local_zone_key, {}))
-        local_area = dict(localized_context.get("by_area", {}).get(str(target_area_id or local_context.get("current_area_id") or "global"), {}))
-        target_history = list(prior_failure_success_context.get("recent_target_entity_ids", []))
-        contradiction_flags = dict(row.get("contradiction_flags", {}))
-        stale_support_flags = dict(row.get("stale_support_flags", {}))
-        hard_reasons: list[str] = []
-        soft_reasons: list[str] = []
-
-        if candidate_id in exhausted or (route_signature is not None and str(route_signature) in exhausted):
-            hard_reasons.append("hard_exhausted_scope")
-        if _cooldown_active(candidate_id, scopes={"candidate"}) or _cooldown_active(route_signature, scopes={"candidate"}):
-            hard_reasons.append("hard_cooldown_active")
-        if _exhausted_in_scope(target_entity_id, "target") or _exhausted_in_scope(target_area_id, "area"):
-            soft_reasons.append("soft_target_repeated_failure")
-        if _cooldown_active(target_entity_id, scopes={"target"}) or _cooldown_active(target_area_id, scopes={"area"}) or _cooldown_active(trigger_zone_id, scopes={"target", "area"}):
-            soft_reasons.append("soft_area_repeated_failure")
-        if target_entity_id in blocked_targets and not bool(row.get("reachable_later")):
-            hard_reasons.append("hard_unreachable_target")
-        if row.get("target_entity_id") is not None and row.get("target_entity_id") not in belief.get("indexes", {}).get("reachable_targets", []) and not row.get("reachable_later"):
-            hard_reasons.append("hard_invalid_target")
-        if int(failed_candidates.get(candidate_id, 0)) >= 2:
-            soft_reasons.append("soft_repeated_failure")
-        if int(failed_candidates.get(str(target_entity_id), 0)) >= 2:
-            soft_reasons.append("soft_target_repeated_failure")
-        if int(local_zone.get("failures", 0)) >= 2 and int(local_zone.get("successes", 0)) == 0:
-            soft_reasons.append("soft_local_target_repeat")
-        if int(local_area.get("failures", 0)) >= 3 and int(local_area.get("successes", 0)) == 0:
-            soft_reasons.append("soft_area_repeated_failure")
-        if route_signature and int(failed_candidates.get(str(route_signature), 0)) >= 2:
-            soft_reasons.append("soft_route_repeat")
-        if trigger_zone_id and int(failed_candidates.get(str(trigger_zone_id), 0)) >= 2:
-            soft_reasons.append("soft_trigger_repeat")
-        if target_entity_id and target_history.count(str(target_entity_id)) >= 2:
-            soft_reasons.append("soft_local_target_repeat")
-        if int(local_area.get("candidate_ids", []).count(candidate_id)) >= 2:
-            soft_reasons.append("soft_local_class_repeat")
-        supporting_refs = list(row.get("supporting_evidence_refs", []))
-        if supporting_refs and not any(str(ref) in evidence_index for ref in supporting_refs):
-            hard_reasons.append("hard_contradiction_current_evidence")
-        if contradiction_flags.get("stale_target") or contradiction_flags.get("topology_invalidation"):
-            soft_reasons.append("soft_uncertain_contradiction")
-        if stale_support_flags.get("support_refs_missing") or contradiction_flags.get("evidence_decay"):
-            soft_reasons.append("soft_stale_support_decay")
-
-        class_soft_limits = {
-            "fallback_action": 99,
-            "recovery_move": 3,
-            "frontier_move": 2,
-            "route_probe": 2,
-            "trigger_probe": 2,
-            "local_probe": 2,
-            "target": 2,
-            "click_target": 2,
+        counts_before[candidate_class] = int(counts_before.get(candidate_class, 0) or 0) + 1
+        counts_after.setdefault(candidate_class, counts_before[candidate_class])
+        row["filter_audit"] = {
+            "candidate_counts_by_class_before": dict(counts_before),
+            "candidate_counts_by_class_after": dict(counts_after),
+            "block_counts_by_reason": {},
+            "downgrade_counts_by_reason": {},
         }
-        dedup_soft = sorted(set(soft_reasons))
-        if len(dedup_soft) >= class_soft_limits.get(candidate_class, 2):
-            hard_reasons.append("soft_stale_support_decay" if "soft_stale_support_decay" in dedup_soft else dedup_soft[0])
-            dedup_soft = [reason for reason in dedup_soft if reason not in hard_reasons]
 
-        for reason in sorted(set(hard_reasons)):
-            detail = dict(FILTER_REASON_TAXONOMY.get(reason, {}))
-            detail["reason_code"] = reason
-            reason_details.append(detail)
-            block_counts_by_reason[reason] = block_counts_by_reason.get(reason, 0) + 1
-        for reason in dedup_soft:
-            detail = dict(FILTER_REASON_TAXONOMY.get(reason, {}))
-            detail["reason_code"] = reason
-            reason_details.append(detail)
-            downgrade_counts_by_reason[reason] = downgrade_counts_by_reason.get(reason, 0) + 1
+        target_entity_id = str(row.get("target_entity_id") or "")
+        target_area_id = str(row.get("target_area_id") or "")
+        route_signature = str(row.get("route_signature") or "")
+        trigger_zone_id = str(row.get("trigger_zone_id") or "")
+        local_area = str(row.get("candidate_context", {}).get("local_area") or target_area_id or uncertainty_context.get("current_area_id") or "global")
+        local_key = f"{candidate_class}:{local_area}"
+        target_local_key = f"{target_entity_id or 'none'}:{local_area}"
+        recent_local_outcomes = dict(tactical_context.get("recent_local_outcomes", {}))
+        repeat_patterns = dict(tactical_context.get("repeat_pattern_state", {}))
 
-        row["blocked_reasons"] = sorted(set(hard_reasons))
-        row["soft_filter_reasons"] = dedup_soft
-        row["blocked_reason_details"] = reason_details
-        row["filter_provenance"] = sorted(set(detail.get("provenance", "unknown") for detail in reason_details))
-        row["blocked"] = bool(row["blocked_reasons"])
-        if row["blocked"]:
-            blocked_rows.append(row)
+        _mark_filter_usage(row, observed=target_entity_id in observed_reachable or target_entity_id in observed_blocked, hypothesis=target_entity_id in hypothesis_reachable, compatibility=row["used_compatibility_fallback"])
+
+        if _cooldown_active(cooldowns, [str(row.get("candidate_id") or ""), target_entity_id, target_area_id, route_signature, trigger_zone_id]):
+            _append_reason(row, code="hard.cooldown.active", detail={"target_entity_id": target_entity_id}, hard=True)
+        if any(key in exhausted_keys for key in [str(row.get("candidate_id") or ""), target_entity_id, target_area_id, route_signature, trigger_zone_id] if key):
+            _append_reason(row, code="hard.exhaustion.scope", detail={"target_entity_id": target_entity_id}, hard=True)
+        if target_entity_id and target_entity_id in observed_blocked and not row.get("reachable_now") and not row.get("reachable_later"):
+            _append_reason(row, code="hard.target.unreachable", detail={"target_entity_id": target_entity_id}, hard=True)
+        if target_entity_id and not (target_entity_id in observed_entities or target_entity_id in hypothesized_entities or row.get("objective_type") in {"explore_frontier", "recover", "fallback"}):
+            _append_reason(row, code="hard.target.invalid", detail={"target_entity_id": target_entity_id}, hard=True)
+        if any(bool(value) for value in dict(row.get("contradiction_flags", {})).values()):
+            hard_contradiction = bool(dict(row.get("contradiction_flags", {})).get("hard_contradiction")) or bool(dict(row.get("contradiction_flags", {})).get("stale_target"))
+            _append_reason(row, code="hard.evidence.contradicted" if hard_contradiction else "soft.contradiction.uncertain", detail={"target_entity_id": target_entity_id}, hard=hard_contradiction)
+        if bool(dict(row.get("stale_support_flags", {})).get("support_refs_missing")) or bool(dict(row.get("stale_support_flags", {})).get("target_stale")):
+            _append_reason(row, code="soft.support.stale", detail={"target_entity_id": target_entity_id}, hard=False)
+
+        local_failures = int(dict(recent_local_outcomes.get(target_local_key, {})).get("failures", 0) or 0)
+        class_local_failures = int(dict(repeat_patterns.get("candidate_class_area", {})).get(local_key, 0) or 0)
+        if class_local_failures >= WEAKNESS_BY_OBJECTIVE.get(str(row.get("objective_type") or "fallback"), 99):
+            _append_reason(row, code="soft.repeat.candidate_area", detail={"count": class_local_failures}, hard=False)
+        if local_failures >= 2:
+            _append_reason(row, code="soft.repeat.target_area", detail={"count": local_failures}, hard=False)
+        if route_signature and int(dict(repeat_patterns.get("route_pattern_state", {})).get(route_signature, 0) or 0) >= 2:
+            _append_reason(row, code="soft.repeat.route", detail={"route_signature": route_signature}, hard=False)
+        if trigger_zone_id and int(dict(repeat_patterns.get("trigger_zone", {})).get(trigger_zone_id, 0) or 0) >= 2:
+            _append_reason(row, code="soft.repeat.trigger", detail={"trigger_zone_id": trigger_zone_id}, hard=False)
+
+        if row["blocked_reasons"]:
+            row["blocked"] = True
+            blocked.append(row)
+            counts_after[candidate_class] = max(0, int(counts_after.get(candidate_class, 1) or 1) - 1)
+            row["filter_audit"]["candidate_counts_by_class_after"] = dict(counts_after)
             continue
-        if row.get("soft_filter_reasons"):
-            row["score_penalty_soft_filters"] = 0.08 * len(row["soft_filter_reasons"])
-        candidate_counts_after[candidate_class] = candidate_counts_after.get(candidate_class, 0) + 1
+
+        row["score_penalty_soft_filters"] = 0.06 * len(list(row.get("soft_filter_reasons", [])))
+        row["filter_audit"]["candidate_counts_by_class_after"] = dict(counts_after)
         survivors.append(row)
 
-    audit = {
-        "candidate_counts_by_class_before": candidate_counts_before,
-        "candidate_counts_by_class_after": candidate_counts_after,
-        "block_counts_by_reason": block_counts_by_reason,
-        "downgrade_counts_by_reason": downgrade_counts_by_reason,
-    }
-    for row in survivors:
-        row["filter_audit"] = audit
-    for row in blocked_rows:
-        row["filter_audit"] = audit
-    return survivors, blocked_rows
+    return survivors, blocked

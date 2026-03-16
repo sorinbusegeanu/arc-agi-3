@@ -71,7 +71,13 @@ def merge_entities(existing: dict[str, dict], incoming: Iterable[dict]) -> dict[
         incoming_row = dict(row)
         match_id = None
         best_score = -1.0
+        hinted_id = str(incoming_row.get("stable_entity_id_hint") or "")
+        if hinted_id and hinted_id in merged:
+            match_id = hinted_id
+            best_score = 999.0
         for entity_id, candidate in merged.items():
+            if match_id is not None and best_score >= 999.0:
+                break
             score = _match_score(candidate, incoming_row)
             if score > best_score:
                 best_score = score
@@ -105,6 +111,20 @@ def merge_entities(existing: dict[str, dict], incoming: Iterable[dict]) -> dict[
         payload["evidence_refs"] = evidence[-32:]
         payload["merge_matches"] = int(prior.get("merge_matches", 0)) + (1 if prior else 0)
         payload["lifecycle_state"] = "active"
+        payload["movement_attempts"] = int(prior.get("movement_attempts", 0) or 0) + int(incoming_row.get("movement_attempts", 0) or 0)
+        payload["interact_attempts"] = int(prior.get("interact_attempts", 0) or 0) + int(incoming_row.get("interact_attempts", 0) or 0)
+        payload["click_attempts"] = int(prior.get("click_attempts", 0) or 0) + int(incoming_row.get("click_attempts", 0) or 0)
+        payload["movement_effect_sum"] = int(prior.get("movement_effect_sum", 0) or 0) + int(incoming_row.get("movement_effect_sum", 0) or 0)
+        payload["interact_effect_sum"] = int(prior.get("interact_effect_sum", 0) or 0) + int(incoming_row.get("interact_effect_sum", 0) or 0)
+        payload["click_effect_sum"] = int(prior.get("click_effect_sum", 0) or 0) + int(incoming_row.get("click_effect_sum", 0) or 0)
+        payload["movement_effect_score"] = max(float(prior.get("movement_effect_score", 0.0) or 0.0), float(incoming_row.get("movement_effect_score", 0.0) or 0.0))
+        payload["interact_effect_score"] = max(float(prior.get("interact_effect_score", 0.0) or 0.0), float(incoming_row.get("interact_effect_score", 0.0) or 0.0))
+        payload["click_effect_score"] = max(float(prior.get("click_effect_score", 0.0) or 0.0), float(incoming_row.get("click_effect_score", 0.0) or 0.0))
+        if float(incoming_row.get("candidate_effect_score", 0.0) or 0.0) >= float(prior.get("candidate_effect_score", 0.0) or 0.0):
+            payload["candidate_effect_mode"] = incoming_row.get("candidate_effect_mode", prior.get("candidate_effect_mode"))
+        else:
+            payload["candidate_effect_mode"] = prior.get("candidate_effect_mode", incoming_row.get("candidate_effect_mode"))
+        payload["candidate_effect_score"] = max(float(prior.get("candidate_effect_score", 0.0) or 0.0), float(incoming_row.get("candidate_effect_score", 0.0) or 0.0))
         merged[match_id] = payload
         seen_this_merge.add(match_id)
 

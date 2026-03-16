@@ -6,73 +6,433 @@ from v3_1.planning.candidate_filters import filter_candidates
 from v3_1.planning.candidate_generation import generate_candidates
 from v3_1.planning.candidate_scoring import score_candidates
 from v3_1.planning.decision import package_decision
-from v3_1.planning.fallbacks import fallback_candidates
 from v3_1.planning.reranking import rerank_candidates
 from v3_1.planning.route_features import compute_route_features
+from v3_1.planning.queries import (
+    query_best_mechanic_subgoal_chain,
+    query_panel_match_dependencies,
+    query_required_preconditions_for_target,
+    query_trigger_then_exit_candidates,
+    query_unlock_paths_for_exit,
+)
 
 
-def plan(context: PlanningContext, blackboard_snapshot: dict, memory_snapshot: dict, planning_cfg, helper_results: list[dict] | None = None):
-    helper_results = helper_results or []
-    belief = build_belief(blackboard_snapshot, memory_snapshot)
-    generated = generate_candidates(memory_snapshot.get("skill_library", {}), belief, planning_cfg.max_candidates)
-    survivors, blocked_candidates = filter_candidates(generated, belief)
-    route_features = compute_route_features(blackboard_snapshot, survivors)
-    scored = score_candidates(survivors, belief, route_features, planning_cfg)
-    reranked = rerank_candidates(scored, helper_results, belief)
-    fallback_set = fallback_candidates(reranked, blocked_candidates, belief)
-    selected = reranked[0] if reranked else (fallback_set[0] if fallback_set else None)
-    consistency_checks = {
-        "selected_candidate_not_blocked": bool(selected is None or not bool(selected.get("blocked"))),
-        "selected_candidate_supported_by_current_belief": bool(
-            selected is None
-            or not list(selected.get("supporting_evidence_refs", []))
-            or any(
-                str(ref) in dict(blackboard_snapshot.get("indexes", {}).get("evidence_index", {}))
-                for ref in list(selected.get("supporting_evidence_refs", []))
-            )
-        ),
-        "selected_candidate_action_family_executable": bool(
-            selected is None
-            or str(selected.get("required_action_family") or "move") in set(belief.get("available_action_families", []))
-            or str(selected.get("required_action_family") or "move") == "move"
-        ),
+def _prioritized_blackboard(blackboard_snapshot: dict) -> dict:
+    snapshot = dict(blackboard_snapshot or {})
+    observed_entities = dict(snapshot.get("observed_entities", {}))
+    hypothesized_entities = dict(snapshot.get("hypothesized_entities", {}))
+    observed_consequences = dict(snapshot.get("observed_consequences", {}))
+    hypothesized_consequences = dict(snapshot.get("hypothesized_consequences", {}))
+    observed_trigger_zones = dict(snapshot.get("observed_trigger_zones", {}))
+    hypothesized_trigger_zones = dict(snapshot.get("hypothesized_trigger_zones", {}))
+    observed_topology = dict(snapshot.get("observed_topology", {}))
+    hypothesized_topology = dict(snapshot.get("hypothesized_topology", {}))
+    snapshot["entities"] = {**hypothesized_entities, **observed_entities}
+    snapshot["consequences"] = {**hypothesized_consequences, **observed_consequences}
+    snapshot["trigger_zones"] = {**hypothesized_trigger_zones, **observed_trigger_zones}
+    snapshot["topology_nodes"] = {
+        **dict(hypothesized_topology.get("nodes", {})),
+        **dict(observed_topology.get("nodes", {})),
     }
-    planner_trace = {
-        "belief": belief,
-        "generated_candidates": generated,
-        "filtered_candidates": {
-            "survivors": survivors,
-            "blocked": blocked_candidates,
+    snapshot["topology_edges"] = {
+        **dict(hypothesized_topology.get("edges", {})),
+        **dict(observed_topology.get("edges", {})),
+    }
+    snapshot["_planning_priority"] = {
+        "entities": {"observed_count": len(observed_entities), "hypothesized_count": len(hypothesized_entities)},
+        "consequences": {"observed_count": len(observed_consequences), "hypothesized_count": len(hypothesized_consequences)},
+        "trigger_zones": {"observed_count": len(observed_trigger_zones), "hypothesized_count": len(hypothesized_trigger_zones)},
+        "topology": {
+            "observed_node_count": len(dict(observed_topology.get("nodes", {}))),
+            "observed_edge_count": len(dict(observed_topology.get("edges", {}))),
+            "hypothesized_node_count": len(dict(hypothesized_topology.get("nodes", {}))),
+            "hypothesized_edge_count": len(dict(hypothesized_topology.get("edges", {}))),
         },
-        "route_features": route_features,
-        "score_breakdown": {str(row.get("candidate_id")): dict(row.get("score_breakdown", {})) for row in scored},
+    }
+    return snapshot
+
+
+def _seed_support(candidate: dict, blackboard_snapshot: dict) -> tuple[str, int, bool]:
+    observed_entities = dict(blackboard_snapshot.get("observed_entities", {}))
+    hypothesized_entities = dict(blackboard_snapshot.get("hypothesized_entities", {}))
+    observed_trigger_zones = dict(blackboard_snapshot.get("observed_trigger_zones", {}))
+    hypothesized_trigger_zones = dict(blackboard_snapshot.get("hypothesized_trigger_zones", {}))
+    observed_topology = dict(blackboard_snapshot.get("observed_topology", {}))
+    hypothesized_topology = dict(blackboard_snapshot.get("hypothesized_topology", {}))
+    target_entity_id = str(candidate.get("target_entity_id") or "")
+    target_area_id = str(candidate.get("target_area_id") or "")
+    trigger_zone_id = str(candidate.get("trigger_zone_id") or "")
+    route_signature = str(candidate.get("route_signature") or "")
+
+    observed_count = 0
+    hypothesized_count = 0
+    if target_entity_id:
+        observed_count += 1 if target_entity_id in observed_entities else 0
+        hypothesized_count += 1 if target_entity_id in hypothesized_entities else 0
+    if target_area_id:
+        observed_count += sum(1 for row in observed_entities.values() if str(row.get("area_id") or "") == target_area_id)
+        hypothesized_count += sum(1 for row in hypothesized_entities.values() if str(row.get("area_id") or "") == target_area_id)
+    if trigger_zone_id:
+        observed_count += 1 if trigger_zone_id in observed_trigger_zones else 0
+        hypothesized_count += 1 if trigger_zone_id in hypothesized_trigger_zones else 0
+    if route_signature:
+        observed_count += sum(1 for row in dict(observed_topology.get("edges", {})).values() if str(row.get("route_signature") or row.get("edge_id") or "") == route_signature)
+        hypothesized_count += sum(1 for row in dict(hypothesized_topology.get("edges", {})).values() if str(row.get("route_signature") or row.get("edge_id") or "") == route_signature)
+    if observed_count > 0:
+        return "observed", observed_count + hypothesized_count, False
+    if hypothesized_count > 0:
+        return "hypothesized", hypothesized_count, True
+    return "unknown", 0, False
+
+
+def _annotate_seed_support(rows: list[dict], blackboard_snapshot: dict, *, penalty: float = 0.0) -> list[dict]:
+    annotated = []
+    for row in rows:
+        payload = dict(row)
+        seed_tier, seed_count, hypothesis_fallback = _seed_support(payload, blackboard_snapshot)
+        payload["seed_evidence_tier"] = seed_tier
+        payload["seed_source_count"] = int(seed_count)
+        payload["seed_is_fallback_from_hypothesis"] = bool(hypothesis_fallback)
+        if penalty and hypothesis_fallback:
+            payload["score"] = float(payload.get("score", 0.0) or 0.0) - penalty
+            breakdown = dict(payload.get("score_breakdown", {}))
+            breakdown["hypothesized_seed_penalty"] = float(penalty)
+            payload["score_breakdown"] = breakdown
+        annotated.append(payload)
+    return annotated
+
+
+def _split_world_contracts(*, blackboard_snapshot: dict, belief: dict) -> tuple[dict, dict, dict]:
+    seed_sets = dict(belief.get("candidate_seed_sets", {}))
+    observed_entities = dict(blackboard_snapshot.get("observed_entities", {}))
+    hypothesized_entities = dict(blackboard_snapshot.get("hypothesized_entities", {}))
+    observed_triggers = dict(blackboard_snapshot.get("observed_trigger_zones", {}))
+    hypothesized_triggers = dict(blackboard_snapshot.get("hypothesized_trigger_zones", {}))
+    observed_consequences = dict(blackboard_snapshot.get("observed_consequences", {}))
+    hypothesized_consequences = dict(blackboard_snapshot.get("hypothesized_consequences", {}))
+    observed_topology = dict(blackboard_snapshot.get("observed_topology", {}))
+    hypothesized_topology = dict(blackboard_snapshot.get("hypothesized_topology", {}))
+
+    def _filter_rows(rows: list[dict], *, tier: str) -> list[dict]:
+        target_store = observed_entities if tier == "observed" else hypothesized_entities
+        filtered = []
+        for row in list(rows or []):
+            entity_id = str(row.get("entity_id") or "")
+            if entity_id and entity_id in target_store:
+                filtered.append(dict(row))
+                continue
+            if str(row.get("evidence_tier") or "") == tier:
+                filtered.append(dict(row))
+        return filtered
+
+    observed_world = {
+        "reachable_targets": _filter_rows(seed_sets.get("reachable_targets", []), tier="observed"),
+        "frontier_targets": _filter_rows(seed_sets.get("frontier_targets", []), tier="observed"),
+        "blocked_targets": _filter_rows(seed_sets.get("blocked_targets", []), tier="observed"),
+        "promising_pois": _filter_rows(seed_sets.get("promising_pois", []), tier="observed"),
+        "trigger_candidates": [dict(row) for row in seed_sets.get("trigger_candidates", []) if str(row.get("entity_id") or "") in observed_triggers or str(row.get("evidence_tier") or "") == "observed"],
+        "recovery_candidates": _filter_rows(seed_sets.get("recovery_candidates", []), tier="observed"),
+        "entities": observed_entities,
+        "consequences": observed_consequences,
+        "trigger_zones": observed_triggers,
+        "topology": observed_topology,
+    }
+    hypothesized_world = {
+        "reachable_targets": _filter_rows(seed_sets.get("reachable_targets", []), tier="hypothesized"),
+        "frontier_targets": _filter_rows(seed_sets.get("frontier_targets", []), tier="hypothesized"),
+        "blocked_targets": _filter_rows(seed_sets.get("blocked_targets", []), tier="hypothesized"),
+        "promising_pois": _filter_rows(seed_sets.get("promising_pois", []), tier="hypothesized"),
+        "trigger_candidates": [dict(row) for row in seed_sets.get("trigger_candidates", []) if str(row.get("entity_id") or "") in hypothesized_triggers or str(row.get("evidence_tier") or "") == "hypothesized"],
+        "recovery_candidates": _filter_rows(seed_sets.get("recovery_candidates", []), tier="hypothesized"),
+        "entities": hypothesized_entities,
+        "consequences": hypothesized_consequences,
+        "trigger_zones": hypothesized_triggers,
+        "topology": hypothesized_topology,
+    }
+    uncertainty_context = {
+        "current_area_id": belief.get("current_area_id"),
+        "available_action_families": list(belief.get("available_action_families", [])),
+        "versions": dict(belief.get("versions", {})),
+        "tactical_memory": dict(belief.get("tactical_memory_view", {})),
+        "evidence_index": dict(dict(belief.get("support_view", {})).get("indexes", {}).get("evidence_index", {})),
+        "compatibility_alias_rows": {
+            "reachable_targets": len(list(seed_sets.get("reachable_targets", []))),
+            "frontier_targets": len(list(seed_sets.get("frontier_targets", []))),
+            "promising_pois": len(list(seed_sets.get("promising_pois", []))),
+        },
+    }
+    return observed_world, hypothesized_world, uncertainty_context
+
+
+def _sample_rows(rows: list[dict], *, limit: int = 3, keys: tuple[str, ...] = ("entity_id", "target_key", "target_area_id", "candidate_effect_mode", "utility", "confidence")) -> list[dict]:
+    sampled = []
+    for row in list(rows or [])[:limit]:
+        payload = dict(row)
+        sampled.append({key: payload.get(key) for key in keys if key in payload})
+    return sampled
+
+
+def _compact_belief_trace(belief: dict) -> dict:
+    world_view = dict(belief.get("world_view", {}))
+    candidate_seed_sets = dict(belief.get("candidate_seed_sets", {}))
+    tactical_memory = dict(belief.get("tactical_memory_view", {}))
+    support_view = dict(belief.get("support_view", {}))
+    durable_prior_view = dict(belief.get("durable_prior_view", {}))
+    indexes = dict(support_view.get("indexes", {}))
+    return {
+        "versions": dict(belief.get("versions", {})),
+        "current_area_id": belief.get("current_area_id"),
+        "available_action_families": list(belief.get("available_action_families", [])),
+        "world_view": {
+            "reachable_count": len(world_view.get("reachable_targets", [])),
+            "blocked_count": len(world_view.get("blocked_targets", [])),
+            "frontier_count": len(world_view.get("frontier_targets", [])),
+            "local_poi_count": len(world_view.get("local_pois", [])),
+            "topology_reachable_node_count": int(dict(world_view.get("topology", {})).get("reachable_node_count", 0)),
+            "topology": dict(world_view.get("topology", {})),
+        },
+        "candidate_seed_sets": {
+            "promising_poi_count": len(candidate_seed_sets.get("promising_pois", [])),
+            "trigger_candidate_count": len(candidate_seed_sets.get("trigger_candidates", [])),
+            "recovery_candidate_count": len(candidate_seed_sets.get("recovery_candidates", [])),
+            "frontier_target_count": len(candidate_seed_sets.get("frontier_targets", [])),
+            "blocked_target_count": len(candidate_seed_sets.get("blocked_targets", [])),
+            "reachable_target_count": len(candidate_seed_sets.get("reachable_targets", [])),
+            "promising_pois_sample": _sample_rows(candidate_seed_sets.get("promising_pois", [])),
+            "trigger_candidates_sample": _sample_rows(candidate_seed_sets.get("trigger_candidates", [])),
+            "recovery_candidates_sample": _sample_rows(candidate_seed_sets.get("recovery_candidates", [])),
+        },
+        "local_context_view": dict(belief.get("local_context_view", {})),
+        "tactical_memory_view": {
+            "cooldown_count": len(tactical_memory.get("cooldowns", {})),
+            "retry_count": len(tactical_memory.get("retries", {})),
+            "exhausted_count": len(tactical_memory.get("exhausted", [])),
+            "exhausted_key_count": len(tactical_memory.get("exhausted_keys", [])),
+            "failed_candidate_count": len(tactical_memory.get("failed_candidates", {})),
+            "tactical_context": dict(tactical_memory.get("tactical_context", {})),
+        },
+        "support_view": {
+            "consequence_action_count": len(support_view.get("consequence_support", {})),
+            "trigger_support_entity_count": len(support_view.get("trigger_support", {})),
+            "evidence_index_count": len(indexes.get("evidence_index", {})),
+            "consequence_by_action_count": len(indexes.get("consequence_by_action", {})),
+            "consequence_support": dict(support_view.get("consequence_support", {})),
+            "trigger_support": dict(support_view.get("trigger_support", {})),
+        },
+        "durable_prior_view": {
+            "version": durable_prior_view.get("version"),
+            "per_target_count": len(durable_prior_view.get("per_target", {})),
+            "per_poi_class_count": len(durable_prior_view.get("per_poi_class", {})),
+            "per_trigger_type_count": len(durable_prior_view.get("per_trigger_type", {})),
+            "candidate_outcome_count": len(durable_prior_view.get("candidate_outcomes", {})),
+            "poi_pattern_count": len(durable_prior_view.get("poi_patterns", {})),
+            "trigger_pattern_count": len(durable_prior_view.get("trigger_patterns", {})),
+            "recovery_pattern_count": len(durable_prior_view.get("recovery_patterns", {})),
+            "consequence_pattern_count": len(durable_prior_view.get("consequence_patterns", {})),
+        },
+    }
+
+
+def _trace_payload(level: str, *, belief: dict, generated: list[dict], survivors: list[dict], blocked_candidates: list[dict], route_features: dict[str, dict], scored: list[dict], selected: dict | None, consistency_checks: dict) -> dict:
+    base = {
         "selected_candidate": selected,
         "summary_metrics": {
             "candidates_generated_by_class": dict(generated[0].get("generation_diagnostics", {}).get("count_by_class", {})) if generated else {},
             "filtered_by_reason": dict(blocked_candidates[0].get("filter_audit", {}).get("block_counts_by_reason", {})) if blocked_candidates else {},
             "selected_by_class": str(selected.get("candidate_class")) if selected else None,
             "score_term_usage": sorted({key for row in scored for key in dict(row.get("score_breakdown", {})).keys()}),
-            "contradiction_block_count": sum(1 for row in blocked_candidates if "hard_contradiction_current_evidence" in list(row.get("blocked_reasons", []))),
-            "local_repeat_block_count": sum(
-                1
-                for row in blocked_candidates
-                if any(reason in {"soft_local_class_repeat", "soft_local_target_repeat", "soft_route_repeat", "soft_trigger_repeat"} for reason in list(row.get("soft_filter_reasons", [])) + list(row.get("blocked_reasons", [])))
-            ),
+            "contradiction_block_count": sum(1 for row in blocked_candidates if "hard.evidence.contradicted" in list(row.get("blocked_reasons", []))),
+            "local_repeat_block_count": sum(1 for row in blocked_candidates if any(reason.startswith("soft.repeat.") for reason in list(row.get("soft_filter_reasons", [])) + list(row.get("blocked_reasons", [])))),
         },
         "debug_exports": {
-            "promising_pois": belief.get("promising_pois", []),
-            "trigger_candidates": belief.get("trigger_candidates", []),
-            "recovery_candidates": belief.get("recovery_candidates", []),
-            "local_context": belief.get("local_context", {}),
-            "blocked_targets": belief.get("blocked_targets", []),
+            "promising_pois": _sample_rows(dict(belief.get("candidate_seed_sets", {})).get("promising_pois", [])),
+            "trigger_candidates": _sample_rows(dict(belief.get("candidate_seed_sets", {})).get("trigger_candidates", [])),
+            "recovery_candidates": _sample_rows(dict(belief.get("candidate_seed_sets", {})).get("recovery_candidates", [])),
+            "local_context": belief.get("local_context_view", {}),
+            "blocked_targets": _sample_rows(dict(belief.get("world_view", {})).get("blocked_targets", [])),
         },
         "consistency_checks": consistency_checks,
     }
+    if level == "minimal":
+        return base
+    if level == "debug":
+        return {
+            **base,
+            "belief": _compact_belief_trace(belief),
+            "generated_candidates": generated,
+            "filtered_candidates": {"survivors": survivors, "blocked": blocked_candidates},
+            "route_features": route_features,
+            "score_breakdown": {str(row.get("candidate_id")): dict(row.get("score_breakdown", {})) for row in scored},
+        }
+    return {
+        **base,
+        "belief": _compact_belief_trace(belief),
+        "generated_candidates": generated,
+        "filtered_candidates": {"survivors": survivors, "blocked": blocked_candidates},
+        "route_features": route_features,
+        "score_breakdown": {str(row.get("candidate_id")): dict(row.get("score_breakdown", {})) for row in scored},
+    }
+
+
+def plan(
+    context: PlanningContext,
+    blackboard_snapshot: dict,
+    memory_snapshot: dict,
+    planning_cfg,
+    helper_results: list[dict] | None = None,
+    mechanic_graph_snapshot: dict | None = None,
+    deterministic_hypotheses: dict | None = None,
+    llm_hypotheses: dict | None = None,
+    hypothesis_registry_snapshot: dict | None = None,
+):
+    helper_results = helper_results or []
+    planning_blackboard = _prioritized_blackboard(blackboard_snapshot)
+    belief = build_belief(planning_blackboard, memory_snapshot, mechanic_graph_snapshot)
+    belief["planning_input_priority"] = dict(planning_blackboard.get("_planning_priority", {}))
+    belief["planning_observed_state"] = {
+        "entities": dict(blackboard_snapshot.get("observed_entities", {})),
+        "consequences": dict(blackboard_snapshot.get("observed_consequences", {})),
+        "trigger_zones": dict(blackboard_snapshot.get("observed_trigger_zones", {})),
+        "topology": dict(blackboard_snapshot.get("observed_topology", {})),
+    }
+    belief["planning_hypothesized_backfill"] = {
+        "entities": dict(blackboard_snapshot.get("hypothesized_entities", {})),
+        "consequences": dict(blackboard_snapshot.get("hypothesized_consequences", {})),
+        "trigger_zones": dict(blackboard_snapshot.get("hypothesized_trigger_zones", {})),
+        "topology": dict(blackboard_snapshot.get("hypothesized_topology", {})),
+    }
+    observed_world, hypothesized_world, uncertainty_context = _split_world_contracts(blackboard_snapshot=blackboard_snapshot, belief=belief)
+    durable_prior_context = dict(belief.get("durable_prior_view", {}))
+    belief["observed_world"] = observed_world
+    belief["hypothesized_world"] = hypothesized_world
+    belief["uncertainty_context"] = uncertainty_context
+    belief["durable_prior_context"] = durable_prior_context
+    belief["planner_contract_mode"] = "split_world_native"
+    mechanic_graph_state = dict((mechanic_graph_snapshot or {}).get("state", mechanic_graph_snapshot or {}))
+    graph_paths_to_exit = [path.__dict__ for path in query_best_mechanic_subgoal_chain(mechanic_graph_state).paths]
+    trigger_nodes = list(dict(belief.get("mechanic_graph_view", {})).get("trigger_candidates", []))
+    panel_nodes = [row for row in list(dict(mechanic_graph_state).get("nodes_by_id", {}).values()) if str(row.get("node_kind") or "") == "panel"]
+    exit_nodes = [row for row in list(dict(mechanic_graph_state).get("nodes_by_id", {}).values()) if str(row.get("node_kind") or "") == "exit"]
+    belief["mechanic_graph_paths_to_exit"] = graph_paths_to_exit
+    belief["mechanic_graph_trigger_candidates"] = [
+        {
+            "trigger_node_id": row.get("node_id"),
+            "paths_to_exit": [path.__dict__ for path in query_trigger_then_exit_candidates(mechanic_graph_state, str(row.get("node_id"))).paths],
+        }
+        for row in trigger_nodes
+    ]
+    belief["mechanic_graph_gate_conditions"] = [
+        {
+            "exit_node_id": row.get("node_id"),
+            "prerequisite_paths": [path.__dict__ for path in query_unlock_paths_for_exit(mechanic_graph_state, str(row.get("node_id"))).paths],
+        }
+        for row in exit_nodes
+    ]
+    belief["mechanic_graph_match_relations"] = [
+        {
+            "panel_node_id": row.get("node_id"),
+            "match_edges": [edge for edge in query_panel_match_dependencies(mechanic_graph_state, str(row.get("node_id"))).edges],
+        }
+        for row in panel_nodes
+    ]
+    belief["mechanic_graph_prerequisite_paths"] = [
+        {
+            "target_node_id": row.get("node_id"),
+            "paths": [path.__dict__ for path in query_required_preconditions_for_target(mechanic_graph_state, str(row.get("node_id"))).paths],
+        }
+        for row in exit_nodes
+    ]
+    belief["deterministic_hypotheses"] = dict(deterministic_hypotheses or {})
+    belief["llm_hypotheses"] = dict(llm_hypotheses or {})
+    belief["hypothesis_registry_snapshot"] = dict(hypothesis_registry_snapshot or {})
+    generated = generate_candidates(
+        memory_snapshot.get("skill_library", {}),
+        belief,
+        planning_cfg.max_candidates,
+        observed_world=observed_world,
+        hypothesized_world=hypothesized_world,
+    )
+    generated = _annotate_seed_support(generated, blackboard_snapshot)
+    survivors, blocked_candidates = filter_candidates(
+        generated,
+        observed_world=observed_world,
+        hypothesized_world=hypothesized_world,
+        uncertainty_context=uncertainty_context,
+        belief_fallback=None,
+    )
+    blocked_candidates = _annotate_seed_support(blocked_candidates, blackboard_snapshot)
+    route_features = compute_route_features(planning_blackboard, survivors)
+    scored = score_candidates(
+        survivors,
+        route_features,
+        planning_cfg,
+        observed_world=observed_world,
+        hypothesized_world=hypothesized_world,
+        uncertainty_context=uncertainty_context,
+        durable_prior_context=durable_prior_context,
+        belief_fallback=None,
+    )
+    scored = _annotate_seed_support(scored, blackboard_snapshot, penalty=0.2)
+    reranked = rerank_candidates(
+        scored,
+        helper_results,
+        observed_world=observed_world,
+        hypothesized_world=hypothesized_world,
+        uncertainty_context=uncertainty_context,
+        durable_prior_context=durable_prior_context,
+        belief_fallback=None,
+    )
+    reranked = _annotate_seed_support(reranked, blackboard_snapshot)
+    selected = reranked[0] if reranked else None
+    consistency_checks = {
+        "selected_candidate_not_blocked": bool(selected is None or not bool(selected.get("blocked"))),
+        "selected_candidate_supported_by_current_belief": bool(selected is None or not list(selected.get("full_supporting_evidence_refs", [])) or any(str(ref) in dict(blackboard_snapshot.get("indexes", {}).get("evidence_index", {})) for ref in list(selected.get("full_supporting_evidence_refs", [])))),
+        "selected_candidate_action_family_executable": bool(selected is None or str(selected.get("execution_mode") or "move") in set(belief.get("available_action_families", [])) or str(selected.get("execution_mode") or "move") == "move"),
+    }
+    helper_summary = {
+        "remote_success_count": sum(1 for result in helper_results if str(dict(result.get("metadata", {})).get("execution_path", "")) == "remote"),
+        "local_fallback_count": sum(1 for result in helper_results if str(dict(result.get("metadata", {})).get("execution_path", "")) == "local_fallback"),
+        "helper_latency_ms": {str(result.get("helper_mode")): float(dict(result.get("metadata", {})).get("latency_ms", 0.0)) for result in helper_results},
+        "helper_contribution_rate": {str(result.get("helper_mode")): float(dict(result.get("metadata", {})).get("contribution_rate", 0.0)) for result in helper_results},
+    }
+    planner_trace = _trace_payload(
+        str(getattr(planning_cfg, "trace_level", "debug")),
+        belief=belief,
+        generated=generated,
+        survivors=survivors,
+        blocked_candidates=blocked_candidates,
+        route_features=route_features,
+        scored=reranked,
+        selected=selected,
+        consistency_checks=consistency_checks,
+    )
+    planner_trace["planner_contract_mode"] = "split_world_native"
+    pipeline_modes = {
+        "generation": all(str(row.get("seed_contract") or "") != "compatibility_fallback" for row in generated),
+        "filtering": all(str(row.get("filter_input_mode") or "") == "split_world_native" for row in survivors + blocked_candidates),
+        "scoring": all(str(row.get("score_contract_mode") or "") == "split_world_native" for row in scored),
+        "reranking": all(str(dict(row.get("rerank_diagnostics", {})).get("rerank_contract_mode") or "") == "split_world_native" for row in reranked),
+    }
+    planner_trace["planning_pipeline_contract_mode"] = "split_world_native_full" if all(pipeline_modes.values()) else "split_world_native_partial"
+    planner_trace["durable_prior_context"] = {
+        "version": durable_prior_context.get("version"),
+        "per_target_count": len(dict(durable_prior_context.get("per_target", {}))),
+        "candidate_outcome_count": len(dict(durable_prior_context.get("candidate_outcomes", {}))),
+    }
+    planner_trace["mechanic_graph_summary"] = {
+        "mechanic_graph_version": context.mechanic_graph_version,
+        "path_to_exit_count": len(graph_paths_to_exit),
+        "trigger_candidate_count": len(trigger_nodes),
+        "panel_match_relation_count": sum(len(list(row.get("match_edges", []))) for row in belief.get("mechanic_graph_match_relations", [])),
+    }
+    planner_trace["helper_summary"] = helper_summary
+    if str(getattr(planning_cfg, "trace_level", "debug")) != "minimal":
+        planner_trace["helper_results"] = helper_results
     return package_decision(
         context=context,
         selected=selected,
         ranked_candidates=reranked,
-        fallback_candidates=fallback_set,
+        fallback_candidates=[row for row in reranked if str(row.get("objective_type")) == "fallback"],
         blocked_candidates=blocked_candidates,
         helper_results=helper_results,
         belief=belief,

@@ -9,6 +9,9 @@ def final_action_from_candidate(candidate: dict | None) -> dict | None:
         return None
     action = dict(candidate.get("action", {}))
     action["candidate_class"] = candidate.get("candidate_class")
+    action["objective_type"] = candidate.get("objective_type")
+    action["execution_mode"] = candidate.get("execution_mode")
+    action["navigation_mode"] = candidate.get("navigation_mode")
     action["target_entity_id"] = candidate.get("target_entity_id")
     action["target_area_id"] = candidate.get("target_area_id")
     action["required_action_family"] = candidate.get("required_action_family")
@@ -33,9 +36,9 @@ def package_decision(
         "survivor_count": len(ranked_candidates),
         "blocked_count": len(blocked_candidates),
         "fallback_count": len(fallback_candidates),
-        "reachable_target_count": len(belief.get("reachable_targets", [])),
-        "frontier_target_count": len(belief.get("frontier_targets", [])),
-        "blocked_target_count": len(belief.get("blocked_targets", [])),
+        "reachable_target_count": len(dict(belief.get("world_view", {})).get("reachable_targets", [])),
+        "frontier_target_count": len(dict(belief.get("world_view", {})).get("frontier_targets", [])),
+        "blocked_target_count": len(dict(belief.get("world_view", {})).get("blocked_targets", [])),
     }
     rationale = "selected_best_ranked_candidate" if selected is not None else "selected_fallback_candidate"
     return PlannerDecision(

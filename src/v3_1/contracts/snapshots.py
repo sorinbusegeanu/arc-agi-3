@@ -57,8 +57,13 @@ class PlanningContext:
     plan_context_id: str
     blackboard_snapshot_handle: str
     memory_snapshot_handle: str
+    mechanic_graph_snapshot_handle: str | None
     blackboard_version: str
     memory_version: str
+    mechanic_graph_version: str | None
+    deterministic_hypotheses_handle: str | None
+    llm_hypotheses_handle: str | None
+    hypothesis_registry_snapshot_handle: str | None
     policy_version: str
     ranker_version: str
     durable_memory_checkpoint_handle: str | None = None

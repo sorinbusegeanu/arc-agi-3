@@ -57,7 +57,9 @@ def _reconcile_telemetry(
     prior_telemetry = dict(previous_working_memory.get("memory_telemetry", {}))
     events = list(prior_telemetry.get("events", []))
     outcomes = list(prior_telemetry.get("outcomes", []))
-    selected = dict(decision.get("metadata", {}).get("selected_candidate", {})) if isinstance(decision, dict) else {}
+    metadata = dict(decision.get("metadata", {})) if isinstance(decision, dict) else {}
+    selected_raw = metadata.get("selected_candidate", {})
+    selected = dict(selected_raw) if isinstance(selected_raw, dict) else {}
     outcome_payload = dict(outcome or {})
     if decision is None or outcome is None:
         return {"events": events[-512:], "outcomes": outcomes[-128:]}
@@ -322,9 +324,12 @@ class SkillMemoryState:
             persistent_priors=self.durable_priors.get("skill_stats", {}),
         )
 
-    def reconcile(self, *, round_id: int, pass_id: int, blackboard_state: dict, decision: dict | None, outcome: dict | None, retry_limit: int, cooldown_rounds: int, run_id: str | None = None, game_id: str | None = None) -> MemorySnapshot:
+    def reconcile(self, *, round_id: int, pass_id: int, blackboard_state: dict, mechanic_graph_state: dict | None = None, hypothesis_registry_snapshot: dict | None = None, decision: dict | None, outcome: dict | None, retry_limit: int, cooldown_rounds: int, run_id: str | None = None, game_id: str | None = None) -> MemorySnapshot:
         previous_working_memory = _copy_nested(self.working_memory)
-        selected = dict(decision.get("metadata", {}).get("selected_candidate", {})) if isinstance(decision, dict) else {}
+        outcome_mode = "directed" if int(pass_id) == 1 else "probe"
+        metadata = dict(decision.get("metadata", {})) if isinstance(decision, dict) else {}
+        selected_raw = metadata.get("selected_candidate", {})
+        selected = dict(selected_raw) if isinstance(selected_raw, dict) else {}
         candidate_class = str(selected.get("candidate_class") or "")
         target_entity_id = selected.get("target_entity_id")
         target_area_id = selected.get("target_area_id")
@@ -339,15 +344,18 @@ class SkillMemoryState:
             termination_reason = outcome.get("termination_reason") or outcome.get("outcome", {}).get("termination_reason")
 
         cooldowns = advance_cooldowns(self.working_memory.get("cooldowns", {})) if int(pass_id) == 1 else _copy_nested(self.working_memory.get("cooldowns", {}))
-        retries = update_retry_ledgers(
-            self.working_memory.get("retries", {}),
-            candidate_id=candidate_id or selected.get("candidate_id"),
-            target_entity_id=target_entity_id,
-            target_area_id=target_area_id,
-            success=success,
-            termination_reason=termination_reason,
-        )
-        if outcome is not None and not success:
+        if int(pass_id) == 1:
+            retries = update_retry_ledgers(
+                self.working_memory.get("retries", {}),
+                candidate_id=candidate_id or selected.get("candidate_id"),
+                target_entity_id=target_entity_id,
+                target_area_id=target_area_id,
+                success=success,
+                termination_reason=termination_reason,
+            )
+        else:
+            retries = _copy_nested(self.working_memory.get("retries", {}))
+        if int(pass_id) == 1 and outcome is not None and not success:
             cooldowns = apply_failure_cooldowns(
                 cooldowns,
                 candidate_id=candidate_id or selected.get("candidate_id"),
@@ -362,14 +370,18 @@ class SkillMemoryState:
             decision=decision,
             outcome=outcome,
             blackboard_state=blackboard_state,
+            mode=outcome_mode,
         )
-        skill_library = rebuild_skill_library(
-            blackboard_state.get("entities", {}),
-            blackboard_state.get("trigger_zones", {}),
-            self.working_memory.get("skill_library", {}),
-            persistent_priors=self.durable_priors.get("skill_stats", {}),
-        )
-        skill_library = update_skill_execution_stats(skill_library, decision=decision, outcome=outcome)
+        if int(pass_id) == 1:
+            skill_library = rebuild_skill_library(
+                blackboard_state.get("entities", {}),
+                blackboard_state.get("trigger_zones", {}),
+                self.working_memory.get("skill_library", {}),
+                persistent_priors=self.durable_priors.get("skill_stats", {}),
+            )
+            skill_library = update_skill_execution_stats(skill_library, decision=decision, outcome=outcome)
+        else:
+            skill_library = _copy_nested(self.working_memory.get("skill_library", {}))
         exhaustion_map = exhaustion_snapshot(retries, threshold=retry_limit)
 
         self.working_memory = {
@@ -400,8 +412,11 @@ class SkillMemoryState:
             working_memory=self.working_memory,
             durable_priors=self.durable_priors,
             blackboard_state=blackboard_state,
+            mechanic_graph_state=mechanic_graph_state,
+            hypothesis_registry_snapshot=hypothesis_registry_snapshot,
             decision=decision,
             outcome=outcome,
+            outcome_mode=outcome_mode,
         )
         self.pending_durable_updates.append(durable_batch)
         state = self._compose_state()
@@ -415,6 +430,45 @@ class SkillMemoryState:
             snapshot_kind="working_memory",
         )
         return snapshot
+
+    def pending_durable_status(self) -> dict:
+        pending_batch_count = len(self.pending_durable_updates)
+        eligible_row_count = 0
+        mature_family_count = 0
+        family_counts: dict[str, int] = {}
+        has_meaningful_delta = False
+        for batch in self.pending_durable_updates:
+            for family in (
+                "skills",
+                "skill_stats",
+                "candidate_outcomes",
+                "failure_patterns",
+                "recovery_patterns",
+                "poi_patterns",
+                "trigger_patterns",
+                "consequence_patterns",
+                "entity_signatures",
+                "area_signatures",
+                "mechanic_hypotheses",
+                "ranker_state",
+            ):
+                rows = list(getattr(batch, family))
+                eligible = [
+                    row for row in rows
+                    if bool(dict(row.get("metadata", {})).get("allowed_for_durable_write"))
+                ]
+                if eligible:
+                    family_counts[family] = family_counts.get(family, 0) + len(eligible)
+                    eligible_row_count += len(eligible)
+                    mature_family_count += 1
+                    has_meaningful_delta = True
+        return {
+            "pending_batch_count": pending_batch_count,
+            "eligible_row_count": eligible_row_count,
+            "mature_family_count": mature_family_count,
+            "family_counts": family_counts,
+            "has_meaningful_delta": has_meaningful_delta,
+        }
 
     def drain_durable_updates(self, *, run_id: str, game_id: str, round_id: int, pass_id: int) -> DurableMemoryUpdateBatch | None:
         if not self.pending_durable_updates:

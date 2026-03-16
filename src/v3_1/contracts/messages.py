@@ -55,6 +55,9 @@ class AnalyzedEpisode:
     areas: tuple[dict[str, Any], ...]
     motion: tuple[dict[str, Any], ...]
     blackboard_deltas: tuple["BlackboardDelta", ...]
+    mechanic_graph_delta: "MechanicGraphDelta | None" = None
+    deterministic_hypothesis_bundle: "HypothesisBundle | None" = None
+    llm_hypothesis_bundle: "HypothesisBundle | None" = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -75,6 +78,20 @@ class BlackboardDelta:
     topology_edges: tuple[dict[str, Any], ...] = ()
     evidence: tuple[str, ...] = ()
     material_change: bool = True
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class MechanicGraphDelta:
+    session_id: str
+    run_id: str
+    game_id: str
+    round_id: int
+    pass_id: int
+    episode_id: str
+    delta_id: str
+    nodes: tuple[dict[str, Any], ...] = ()
+    edges: tuple[dict[str, Any], ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -152,6 +169,11 @@ class ExecutorRequest:
     target_entity_id: str | None = None
     target_centroid: list[float] | None = None
     click_target_coordinates: list[float] | None = None
+    objective: dict[str, Any] = field(default_factory=dict)
+    navigation: dict[str, Any] = field(default_factory=dict)
+    terminal_action: dict[str, Any] = field(default_factory=dict)
+    constraints: dict[str, Any] = field(default_factory=dict)
+    stop_conditions: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -218,6 +240,19 @@ class DurableMemoryUpdateBatch:
     entity_signatures: tuple[dict[str, Any], ...] = ()
     area_signatures: tuple[dict[str, Any], ...] = ()
     mechanic_hypotheses: tuple[dict[str, Any], ...] = ()
+    mechanic_graph_nodes: tuple[dict[str, Any], ...] = ()
+    mechanic_graph_edges: tuple[dict[str, Any], ...] = ()
+    durable_dependency_paths: tuple[dict[str, Any], ...] = ()
+    deterministic_supported_paths: tuple[dict[str, Any], ...] = ()
+    llm_supported_paths: tuple[dict[str, Any], ...] = ()
+    deterministic_llm_agreements: tuple[dict[str, Any], ...] = ()
+    repeated_validated_hypotheses: tuple[dict[str, Any], ...] = ()
+    contradicted_llm_proposals: tuple[dict[str, Any], ...] = ()
+    deterministic_hypothesis_proposals: tuple[dict[str, Any], ...] = ()
+    llm_hypothesis_proposals: tuple[dict[str, Any], ...] = ()
+    proposal_validation_state: tuple[dict[str, Any], ...] = ()
+    proposal_agreement_groups: tuple[dict[str, Any], ...] = ()
+    proposal_outcome_summaries: tuple[dict[str, Any], ...] = ()
     ranker_state: tuple[dict[str, Any], ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict)
 

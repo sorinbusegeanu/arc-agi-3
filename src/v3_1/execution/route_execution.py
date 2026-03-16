@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from collections import deque
+
 from v3_1.config.defaults import DEFAULT_CONFIG
-from v3_1.execution.option_execution import MOVEMENT_ALIASES, action_alias
+from v3_1.execution.option_execution import action_alias
 
 
 ACTION_DELTAS = {
@@ -33,6 +35,40 @@ def _terminal_distance(required_action_family: str) -> float:
     return float(getattr(execution_cfg, "move_terminal_distance_cells", 0))
 
 
+def _passable_cells(observation):
+    if not isinstance(observation, list):
+        return set()
+    passable = set()
+    for y, row in enumerate(observation):
+        if not isinstance(row, list):
+            continue
+        for x, value in enumerate(row):
+            if int(value) in {0, 1, 2}:
+                passable.add((x, y))
+    return passable
+
+
+def _bounded_bfs_next_step(*, avatar: tuple[int, int], target: tuple[int, int], observation, max_depth: int = 12):
+    passable = _passable_cells(observation)
+    if not passable:
+        return None
+    queue = deque([(avatar, [])])
+    seen = {avatar}
+    while queue:
+        cell, path = queue.popleft()
+        if len(path) > max_depth:
+            continue
+        if cell == target and path:
+            return path[0]
+        for action_name, (dx, dy) in ACTION_DELTAS.items():
+            nxt = (cell[0] + dx, cell[1] + dy)
+            if nxt in seen or nxt not in passable:
+                continue
+            seen.add(nxt)
+            queue.append((nxt, path + [action_name]))
+    return None
+
+
 def route_instruction(decision_action: dict | None, *, current_observation, info: dict | None = None) -> dict | None:
     if decision_action is None:
         return None
@@ -45,11 +81,9 @@ def route_instruction(decision_action: dict | None, *, current_observation, info
         return {"failed": True, "failure_reason": "missing_avatar"}
     required_action_family = str(decision_action.get("required_action_family") or "unknown").lower()
     click_target_coordinates = decision_action.get("click_target_coordinates") or decision_action.get("coordinates") or target
-    tx, ty = float(target[0]), float(target[1])
-    ax, ay = float(avatar[0]), float(avatar[1])
-    dx = tx - ax
-    dy = ty - ay
-    current_distance = abs(dx) + abs(dy)
+    tx, ty = int(float(target[0])), int(float(target[1]))
+    ax, ay = int(float(avatar[0])), int(float(avatar[1]))
+    current_distance = abs(tx - ax) + abs(ty - ay)
     if required_action_family == "click_at":
         return {
             "terminal": True,
@@ -66,43 +100,45 @@ def route_instruction(decision_action: dict | None, *, current_observation, info
         if desired is None:
             return {"terminal": True, "stop": True, "distance": 0.0, "target_reached": True}
         return {"terminal": True, "desired_action_name": desired, "distance": 0.0, "target_reached": True}
-    candidates = []
+
     available_actions = list(info.get("available_actions", []))
-    if not available_actions:
-        if abs(dx) >= abs(dy):
-            desired = "right" if dx > 0 else "left"
-        else:
-            desired = "down" if dy > 0 else "up"
-        return {
-            "desired_action_name": desired,
-            "distance": current_distance,
-            "target_centroid": [tx, ty],
-            "avatar": [ax, ay],
-            "movement": True,
-        }
+    reducing = []
     for action in available_actions:
         alias = action_alias(action)
         if alias not in ACTION_DELTAS:
             continue
-        mx, my = ACTION_DELTAS[alias]
-        next_distance = abs(tx - (ax + mx)) + abs(ty - (ay + my))
+        dx, dy = ACTION_DELTAS[alias]
+        next_distance = abs(tx - (ax + dx)) + abs(ty - (ay + dy))
         if next_distance < current_distance:
-            candidates.append((next_distance, alias, action))
-    if not candidates:
+            reducing.append((next_distance, alias))
+    if reducing:
+        reducing.sort(key=lambda row: (row[0], row[1]))
         return {
-            "failed": True,
-            "failure_reason": "blocked" if available_actions else "unreachable",
+            "desired_action_name": reducing[0][1],
             "distance": current_distance,
-            "target_centroid": [tx, ty],
-            "avatar": [ax, ay],
+            "target_centroid": [float(tx), float(ty)],
+            "avatar": [float(ax), float(ay)],
+            "movement": True,
+            "required_action_family": required_action_family,
+            "routing_mode": "greedy_reducing",
         }
-    candidates.sort(key=lambda row: (row[0], row[1]))
-    desired = candidates[0][1]
+
+    next_step = _bounded_bfs_next_step(avatar=(ax, ay), target=(tx, ty), observation=current_observation)
+    if next_step is not None:
+        return {
+            "desired_action_name": next_step,
+            "distance": current_distance,
+            "target_centroid": [float(tx), float(ty)],
+            "avatar": [float(ax), float(ay)],
+            "movement": True,
+            "required_action_family": required_action_family,
+            "routing_mode": "bounded_bfs",
+            "temporary_distance_increase_allowed": True,
+        }
     return {
-        "desired_action_name": desired,
+        "failed": True,
+        "failure_reason": "blocked" if available_actions else "unreachable",
         "distance": current_distance,
-        "target_centroid": [tx, ty],
-        "avatar": [ax, ay],
-        "movement": True,
-        "required_action_family": required_action_family,
+        "target_centroid": [float(tx), float(ty)],
+        "avatar": [float(ax), float(ay)],
     }

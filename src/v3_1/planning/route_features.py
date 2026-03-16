@@ -25,10 +25,12 @@ def compute_route_features(blackboard_state: dict, candidates: list[dict]) -> di
         risk = mean_risk + (0.35 if candidate.get("candidate_class") == "recovery_move" else 0.0)
         if candidate.get("candidate_class") == "trigger_probe":
             progress_potential += 0.15
+        uncertainty = min(1.0, risk + (0.25 if candidate.get("navigation_mode") == "routed" and not reachable_now else 0.0))
         features[candidate["candidate_id"]] = {
             "reachable_now": reachable_now,
             "cost": cost,
             "risk": risk,
+            "uncertainty": uncertainty,
             "progress_potential": progress_potential,
             "target_cell": list(target_cell) if target_cell is not None else None,
         }

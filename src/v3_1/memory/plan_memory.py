@@ -31,7 +31,67 @@ def _decay_stat_rows(values: dict, *, factor: float = 0.9) -> dict:
     return decayed
 
 
-def update_plan_memory(plan_memory: dict, *, decision: dict | None, outcome: dict | None, blackboard_state: dict) -> dict:
+def _compact_selected_candidate(decision: dict) -> dict:
+    metadata = dict(decision.get("metadata", {})) if isinstance(decision, dict) else {}
+    selected = dict(metadata.get("selected_candidate", {})) if isinstance(metadata.get("selected_candidate"), dict) else {}
+    selected_action = dict(decision.get("selected_action", {})) if isinstance(decision.get("selected_action"), dict) else {}
+    return {
+        "candidate_id": selected.get("candidate_id") or decision.get("selected_candidate_id"),
+        "candidate_class": selected.get("candidate_class") or selected_action.get("candidate_class"),
+        "target_entity_id": selected.get("target_entity_id") or selected_action.get("target_entity_id") or selected_action.get("target"),
+        "target_area_id": selected.get("target_area_id") or selected_action.get("target_area_id"),
+        "required_action_family": selected.get("required_action_family") or selected_action.get("required_action_family") or selected_action.get("type"),
+        "route_signature": selected.get("route_signature"),
+        "trigger_zone_id": selected.get("trigger_zone_id"),
+        "objective_type": selected.get("objective_type"),
+        "skill_id": selected.get("skill_id") or selected_action.get("skill_id"),
+    }
+
+
+def _compact_decision(decision: dict | None) -> dict:
+    payload = dict(decision or {})
+    selected = _compact_selected_candidate(payload)
+    metadata = dict(payload.get("metadata", {})) if isinstance(payload.get("metadata"), dict) else {}
+    planner_stats = dict(metadata.get("planner_stats", {})) if isinstance(metadata.get("planner_stats"), dict) else {}
+    return {
+        "session_id": payload.get("session_id"),
+        "run_id": payload.get("run_id"),
+        "round_id": payload.get("round_id"),
+        "pass_id": payload.get("pass_id"),
+        "selected_candidate_id": payload.get("selected_candidate_id") or selected.get("candidate_id"),
+        "selected_action": {
+            "type": selected.get("required_action_family") or "move",
+            "candidate_class": selected.get("candidate_class"),
+            "target_entity_id": selected.get("target_entity_id"),
+            "target_area_id": selected.get("target_area_id"),
+            "skill_id": selected.get("skill_id"),
+        },
+        "metadata": {
+            "selected_candidate": selected,
+            "planner_stats": planner_stats,
+        },
+    }
+
+
+def _compact_outcome(outcome: dict | None) -> dict:
+    payload = dict(outcome or {})
+    outcome_row = dict(payload.get("outcome", {})) if isinstance(payload.get("outcome"), dict) else {}
+    return {
+        "success": bool(payload.get("success") or outcome_row.get("success")),
+        "termination_reason": payload.get("termination_reason") or outcome_row.get("termination_reason"),
+        "candidate_id": payload.get("candidate_id"),
+        "target_entity_id": payload.get("target_entity_id"),
+        "target_area_id": payload.get("target_area_id"),
+        "outcome": {
+            "success": bool(outcome_row.get("success")),
+            "progress": float(outcome_row.get("progress", 0.0) or 0.0),
+            "route_failed": bool(outcome_row.get("route_failed")),
+            "termination_reason": outcome_row.get("termination_reason"),
+        },
+    }
+
+
+def update_plan_memory(plan_memory: dict, *, decision: dict | None, outcome: dict | None, blackboard_state: dict, mode: str = "directed") -> dict:
     next_state = {
         "history": list(plan_memory.get("history", [])),
         "repeated_failures": _decay_count_map(plan_memory.get("repeated_failures", {})),
@@ -45,13 +105,15 @@ def update_plan_memory(plan_memory: dict, *, decision: dict | None, outcome: dic
     if decision is None:
         return next_state
 
-    selected = dict(decision.get("metadata", {}).get("selected_candidate", {}))
+    compact_decision = _compact_decision(decision)
+    compact_outcome = _compact_outcome(outcome)
+    selected = dict(compact_decision.get("metadata", {}).get("selected_candidate", {}))
     target_entity_id = selected.get("target_entity_id")
     target_area_id = selected.get("target_area_id")
     candidate_class = selected.get("candidate_class")
     entry = {
-        "decision": decision,
-        "outcome": outcome or {},
+        "decision": compact_decision,
+        "outcome": compact_outcome,
         "target_entity_id": target_entity_id,
         "target_area_id": target_area_id,
         "candidate_class": candidate_class,
@@ -65,6 +127,15 @@ def update_plan_memory(plan_memory: dict, *, decision: dict | None, outcome: dic
     progress = float(outcome_summary.get("progress", 0.0))
     termination_reason = outcome_payload.get("termination_reason") or outcome_summary.get("termination_reason")
     route_failed = bool(outcome_summary.get("route_failed")) or str(termination_reason or "").startswith("route")
+
+    if mode == "probe":
+        probe_key = str(target_area_id or target_entity_id or candidate_class or "probe")
+        if progress <= 0.0 and not success:
+            next_state["movement_memory"][probe_key] = int(next_state["movement_memory"].get(probe_key, 0)) + 1
+            next_state["no_progress_rounds"] += 1
+        else:
+            next_state["no_progress_rounds"] = 0
+        return next_state
 
     if not success:
         if target_entity_id:
