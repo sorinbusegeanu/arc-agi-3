@@ -30,6 +30,12 @@ EVENT_PAYLOAD_TYPES = {
     "directed blackboard merge completed": {"merge_completed"},
     "directed mechanic graph merge completed": {"mechanic_graph_merge_completed"},
     "directed memory reconcile completed": {"memory_reconcile_completed"},
+    "subgoal chain started": {"subgoal_chain_started"},
+    "subgoal chain step completed": {"subgoal_chain_step"},
+    "subgoal chain step failed": {"subgoal_chain_step"},
+    "subgoal chain advanced": {"subgoal_chain_advanced"},
+    "subgoal chain aborted": {"subgoal_chain_aborted"},
+    "subgoal chain completed": {"subgoal_chain_completed"},
     "durable flush requested": {"durable_flush"},
     "durable flush completed": {"durable_flush"},
     "stop decision made": {"stop_decision"},
@@ -79,6 +85,11 @@ class EpisodeExecutedPayload:
     mode: str
     reward_delta: float | None = None
     outcome_evidence_provenance_summary: dict[str, Any] = field(default_factory=dict)
+    avatar_cell: list[int] | None = None
+    avatar_confidence: float = 0.0
+    avatar_source: str = "unknown"
+    avatar_ambiguous: bool = False
+    avatar_tracker_status: str = "unknown"
 
 
 @dataclass(frozen=True)
@@ -150,6 +161,61 @@ class MemoryReconcilePayload:
 
 
 @dataclass(frozen=True)
+class SubgoalChainStartedPayload:
+    chain_id: str
+    current_step_id: str | None = None
+    step_kind: str | None = None
+    expected_evidence: tuple[str, ...] = ()
+    observed_evidence: tuple[str, ...] = ()
+    failure_reason: str | None = None
+    advancement_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class SubgoalChainStepPayload:
+    chain_id: str
+    current_step_id: str | None = None
+    step_kind: str | None = None
+    expected_evidence: tuple[str, ...] = ()
+    observed_evidence: tuple[str, ...] = ()
+    failure_reason: str | None = None
+    advancement_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class SubgoalChainAdvancedPayload:
+    chain_id: str
+    current_step_id: str | None = None
+    step_kind: str | None = None
+    expected_evidence: tuple[str, ...] = ()
+    observed_evidence: tuple[str, ...] = ()
+    failure_reason: str | None = None
+    advancement_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class SubgoalChainAbortedPayload:
+    chain_id: str
+    current_step_id: str | None = None
+    step_kind: str | None = None
+    expected_evidence: tuple[str, ...] = ()
+    observed_evidence: tuple[str, ...] = ()
+    failure_reason: str | None = None
+    advancement_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class SubgoalChainCompletedPayload:
+    chain_id: str
+    current_step_id: str | None = None
+    step_kind: str | None = None
+    expected_evidence: tuple[str, ...] = ()
+    observed_evidence: tuple[str, ...] = ()
+    failure_reason: str | None = None
+    advancement_reason: str | None = None
+
+
+@dataclass(frozen=True)
 class DurableFlushPayload:
     reason: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -215,6 +281,11 @@ class SessionLedger:
             HypothesisGenerationPayload: ("hypothesis_generation", "v1", "hypothesis_generation_payload", "v1"),
             LLMOperationPayload: ("llm_operation", "v1", "llm_operation_payload", "v1"),
             MemoryReconcilePayload: ("memory_reconcile_completed", "v1", "memory_reconcile_payload", "v1"),
+            SubgoalChainStartedPayload: ("subgoal_chain_started", "v1", "subgoal_chain_started_payload", "v1"),
+            SubgoalChainStepPayload: ("subgoal_chain_step", "v1", "subgoal_chain_step_payload", "v1"),
+            SubgoalChainAdvancedPayload: ("subgoal_chain_advanced", "v1", "subgoal_chain_advanced_payload", "v1"),
+            SubgoalChainAbortedPayload: ("subgoal_chain_aborted", "v1", "subgoal_chain_aborted_payload", "v1"),
+            SubgoalChainCompletedPayload: ("subgoal_chain_completed", "v1", "subgoal_chain_completed_payload", "v1"),
             DurableFlushPayload: ("durable_flush", "v1", "durable_flush_payload", "v1"),
             StopDecisionPayload: ("stop_decision", "v1", "stop_decision_payload", "v1"),
         }
@@ -251,6 +322,11 @@ class SessionLedger:
             "hypothesis_generation": (HypothesisGenerationPayload, "v1", "hypothesis_generation_payload", "v1"),
             "llm_operation": (LLMOperationPayload, "v1", "llm_operation_payload", "v1"),
             "memory_reconcile_completed": (MemoryReconcilePayload, "v1", "memory_reconcile_payload", "v1"),
+            "subgoal_chain_started": (SubgoalChainStartedPayload, "v1", "subgoal_chain_started_payload", "v1"),
+            "subgoal_chain_step": (SubgoalChainStepPayload, "v1", "subgoal_chain_step_payload", "v1"),
+            "subgoal_chain_advanced": (SubgoalChainAdvancedPayload, "v1", "subgoal_chain_advanced_payload", "v1"),
+            "subgoal_chain_aborted": (SubgoalChainAbortedPayload, "v1", "subgoal_chain_aborted_payload", "v1"),
+            "subgoal_chain_completed": (SubgoalChainCompletedPayload, "v1", "subgoal_chain_completed_payload", "v1"),
             "durable_flush": (DurableFlushPayload, "v1", "durable_flush_payload", "v1"),
             "stop_decision": (StopDecisionPayload, "v1", "stop_decision_payload", "v1"),
             "empty": (None, "v1", "empty_payload", "v1"),
@@ -330,6 +406,24 @@ class SessionLedger:
 
     def append_durable_flush_requested(self, **kwargs) -> SessionLedgerRecord:
         return self.append(event_type="durable flush requested", **kwargs)
+
+    def append_subgoal_chain_started(self, **kwargs) -> SessionLedgerRecord:
+        return self.append(event_type="subgoal chain started", **kwargs)
+
+    def append_subgoal_chain_step_completed(self, **kwargs) -> SessionLedgerRecord:
+        return self.append(event_type="subgoal chain step completed", **kwargs)
+
+    def append_subgoal_chain_step_failed(self, **kwargs) -> SessionLedgerRecord:
+        return self.append(event_type="subgoal chain step failed", **kwargs)
+
+    def append_subgoal_chain_advanced(self, **kwargs) -> SessionLedgerRecord:
+        return self.append(event_type="subgoal chain advanced", **kwargs)
+
+    def append_subgoal_chain_aborted(self, **kwargs) -> SessionLedgerRecord:
+        return self.append(event_type="subgoal chain aborted", **kwargs)
+
+    def append_subgoal_chain_completed(self, **kwargs) -> SessionLedgerRecord:
+        return self.append(event_type="subgoal chain completed", **kwargs)
 
     def append_durable_flush_completed(self, **kwargs) -> SessionLedgerRecord:
         return self.append(event_type="durable flush completed", **kwargs)

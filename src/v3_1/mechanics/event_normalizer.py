@@ -9,6 +9,7 @@ def normalize_events(raw_episode: RawEpisode, analyzed_episode: AnalyzedEpisode,
     graph_state = dict((mechanic_graph_snapshot or {}).get("state", mechanic_graph_snapshot or {}))
     nodes_by_id = dict(graph_state.get("nodes_by_id", {}))
     step_rows = list(dict(analyzed_episode.summary or {}).get("step_rows", []) or [])
+    analysis_mode = str(dict(analyzed_episode.summary or {}).get("analysis_mode") or dict(analyzed_episode.metadata or {}).get("analysis_mode") or "probe")
     events: list[dict] = []
     object_to_node = {}
     for node_id, node in nodes_by_id.items():
@@ -22,48 +23,60 @@ def normalize_events(raw_episode: RawEpisode, analyzed_episode: AnalyzedEpisode,
         target_node_id = object_to_node.get(target_entity_id, target_entity_id)
         action_family = str(step.get("action_family") or "")
         if action_family == "interact" and target_node_id:
-            events.append(_event("contact", round_id=raw_episode.round_id, episode_id=episode_id, step_index=step_idx, supporting_row_ids=[f"step:{step_idx}"], evidence_tier="observed", provenance="analysis", node_id=target_node_id))
+            events.append(_event("contact", round_id=raw_episode.round_id, episode_id=episode_id, step_index=step_idx, supporting_row_ids=[f"step:{step_idx}"], evidence_tier="observed", provenance="analysis", node_id=target_node_id, analysis_mode=analysis_mode, source_step_ids=[step_idx], target_step_ids=[step_idx]))
         if isinstance(step.get("avatar_cell"), list):
             region_id = f"region:{stable_digest((step.get('area_id'), step.get('avatar_cell')))}"
-            events.append(_event("enter_region", round_id=raw_episode.round_id, episode_id=episode_id, step_index=step_idx, supporting_row_ids=[f"step:{step_idx}"], evidence_tier="observed", provenance="analysis", node_id=region_id))
+            events.append(_event("enter_region", round_id=raw_episode.round_id, episode_id=episode_id, step_index=step_idx, supporting_row_ids=[f"step:{step_idx}"], evidence_tier="observed", provenance="analysis", node_id=region_id, analysis_mode=analysis_mode, source_step_ids=[step_idx], target_step_ids=[step_idx]))
         if int(step.get("changed_cells", 0) or 0) > 0:
             telemetry = dict(step.get("telemetry", {}) or {})
             effect_region = dict(telemetry.get("effect_region", {}) or {})
             effect_node_id = f"effect_region:{stable_digest(effect_region.get('bbox') or step_idx)}"
-            events.append(_event("remote_change", round_id=raw_episode.round_id, episode_id=episode_id, step_index=step_idx, supporting_row_ids=[f"step:{step_idx}"], evidence_tier="observed", provenance="analysis", node_id=effect_node_id))
+            events.append(_event("remote_change", round_id=raw_episode.round_id, episode_id=episode_id, step_index=step_idx, supporting_row_ids=[f"step:{step_idx}"], evidence_tier="observed", provenance="analysis", node_id=effect_node_id, analysis_mode=analysis_mode, source_step_ids=[step_idx], target_step_ids=[step_idx]))
+            if target_node_id and action_family == "interact":
+                events.append(_event("contact_then_remote_change", round_id=raw_episode.round_id, episode_id=episode_id, step_index=step_idx, supporting_row_ids=[f"step:{step_idx}"], evidence_tier="observed", provenance="analysis", node_id=target_node_id, other_node_id=effect_node_id, lag_steps=0, analysis_mode=analysis_mode, source_step_ids=[step_idx], target_step_ids=[step_idx]))
+                events.append(_event("repeated_remote_change_after_specific_trigger", round_id=raw_episode.round_id, episode_id=episode_id, step_index=step_idx, supporting_row_ids=[f"step:{step_idx}"], evidence_tier="observed", provenance="analysis", node_id=target_node_id, other_node_id=effect_node_id, lag_steps=0, analysis_mode=analysis_mode, source_step_ids=[step_idx], target_step_ids=[step_idx]))
             if "gate" in str(target_entity_id).lower():
-                events.append(_event("gate_state_change", round_id=raw_episode.round_id, episode_id=episode_id, step_index=step_idx, supporting_row_ids=[f"step:{step_idx}"], evidence_tier="observed", provenance="analysis", node_id=target_node_id or effect_node_id))
+                events.append(_event("gate_state_change", round_id=raw_episode.round_id, episode_id=episode_id, step_index=step_idx, supporting_row_ids=[f"step:{step_idx}"], evidence_tier="observed", provenance="analysis", node_id=target_node_id or effect_node_id, analysis_mode=analysis_mode, source_step_ids=[step_idx], target_step_ids=[step_idx]))
+                events.append(_event("gate_state_changed_after_trigger", round_id=raw_episode.round_id, episode_id=episode_id, step_index=step_idx, supporting_row_ids=[f"step:{step_idx}"], evidence_tier="observed", provenance="analysis", node_id=target_node_id or effect_node_id, analysis_mode=analysis_mode, source_step_ids=[step_idx], target_step_ids=[step_idx]))
         for node_id, node in nodes_by_id.items():
             pattern_id = str(node.get("pattern_id") or "")
             if pattern_id:
-                events.append(_event("pattern_observed", round_id=raw_episode.round_id, episode_id=episode_id, step_index=step_idx, supporting_row_ids=[f"step:{step_idx}"], evidence_tier=str(node.get("evidence_tier") or "hypothesized"), provenance="graph", node_id=str(node_id), pattern_id=pattern_id))
+                events.append(_event("pattern_observed", round_id=raw_episode.round_id, episode_id=episode_id, step_index=step_idx, supporting_row_ids=[f"step:{step_idx}"], evidence_tier=str(node.get("evidence_tier") or "hypothesized"), provenance="graph", node_id=str(node_id), pattern_id=pattern_id, analysis_mode=analysis_mode, source_step_ids=[step_idx], target_step_ids=[step_idx]))
+                if target_node_id and action_family == "interact":
+                    events.append(_event("panel_match_observed_after_trigger", round_id=raw_episode.round_id, episode_id=episode_id, step_index=step_idx, supporting_row_ids=[f"step:{step_idx}"], evidence_tier=str(node.get("evidence_tier") or "hypothesized"), provenance="analysis", node_id=target_node_id, other_node_id=str(node_id), pattern_id=pattern_id, analysis_mode=analysis_mode, source_step_ids=[step_idx], target_step_ids=[step_idx]))
+                elif analysis_mode == "directed_outcome":
+                    events.append(_event("expected_match_missing", round_id=raw_episode.round_id, episode_id=episode_id, step_index=step_idx, supporting_row_ids=[f"step:{step_idx}"], evidence_tier="hypothesized", provenance="analysis", node_id=str(node_id), pattern_id=pattern_id, analysis_mode=analysis_mode, source_step_ids=[step_idx], target_step_ids=[step_idx]))
         if bool(raw_episode.won):
             exit_node_id = next((str(node_id) for node_id, node in nodes_by_id.items() if str(node.get("node_kind") or "") == "exit"), "exit:unknown")
-            events.append(_event("exit_success", round_id=raw_episode.round_id, episode_id=episode_id, step_index=step_idx, supporting_row_ids=[f"step:{step_idx}"], evidence_tier="observed", provenance="env_native", node_id=exit_node_id))
+            events.append(_event("exit_success", round_id=raw_episode.round_id, episode_id=episode_id, step_index=step_idx, supporting_row_ids=[f"step:{step_idx}"], evidence_tier="observed", provenance="env_native", node_id=exit_node_id, analysis_mode=analysis_mode, source_step_ids=[step_idx], target_step_ids=[step_idx]))
         elif action_family in {"move", "interact"}:
             exit_node_id = next((str(node_id) for node_id, node in nodes_by_id.items() if str(node.get("node_kind") or "") == "exit"), "")
             if exit_node_id:
-                events.append(_event("exit_attempt", round_id=raw_episode.round_id, episode_id=episode_id, step_index=step_idx, supporting_row_ids=[f"step:{step_idx}"], evidence_tier="hypothesized", provenance="analysis", node_id=exit_node_id))
+                events.append(_event("exit_attempt", round_id=raw_episode.round_id, episode_id=episode_id, step_index=step_idx, supporting_row_ids=[f"step:{step_idx}"], evidence_tier="hypothesized", provenance="analysis", node_id=exit_node_id, analysis_mode=analysis_mode, source_step_ids=[step_idx], target_step_ids=[step_idx]))
+                if target_node_id:
+                    events.append(_event("exit_attempt_after_trigger", round_id=raw_episode.round_id, episode_id=episode_id, step_index=step_idx, supporting_row_ids=[f"step:{step_idx}"], evidence_tier="hypothesized", provenance="analysis", node_id=target_node_id, other_node_id=exit_node_id, analysis_mode=analysis_mode, source_step_ids=[step_idx], target_step_ids=[step_idx]))
     pattern_nodes = [dict(node, node_id=node_id) for node_id, node in nodes_by_id.items() if str(node.get("pattern_id") or "")]
     for idx, left in enumerate(pattern_nodes):
         for right in pattern_nodes[idx + 1:]:
             if str(left.get("pattern_id")) == str(right.get("pattern_id")):
-                events.append(_event("pattern_match", round_id=raw_episode.round_id, episode_id=raw_episode.episode_id, step_index=max(0, len(step_rows) - 1), supporting_row_ids=["pattern_match"], evidence_tier="hypothesized", provenance="graph", node_id=str(left["node_id"]), other_node_id=str(right["node_id"]), pattern_id=str(left.get("pattern_id"))))
+                events.append(_event("pattern_match", round_id=raw_episode.round_id, episode_id=raw_episode.episode_id, step_index=max(0, len(step_rows) - 1), supporting_row_ids=["pattern_match"], evidence_tier="hypothesized", provenance="graph", node_id=str(left["node_id"]), other_node_id=str(right["node_id"]), pattern_id=str(left.get("pattern_id")), analysis_mode=analysis_mode))
     exit_node_id = next((str(node_id) for node_id, node in nodes_by_id.items() if str(node.get("node_kind") or "") == "exit"), "")
     trigger_nodes = [str(node_id) for node_id, node in nodes_by_id.items() if str(node.get("node_kind") or "") == "trigger"]
     gate_nodes = [str(node_id) for node_id, node in nodes_by_id.items() if str(node.get("node_kind") or "") == "gate"]
     if exit_node_id:
         for trigger_node_id in trigger_nodes:
-            events.append(_event("trigger_before_exit", round_id=raw_episode.round_id, episode_id=raw_episode.episode_id, step_index=0, supporting_row_ids=["trigger_exit"], evidence_tier="hypothesized", provenance="graph", node_id=trigger_node_id, other_node_id=exit_node_id, lag_steps=1))
+            events.append(_event("trigger_before_exit", round_id=raw_episode.round_id, episode_id=raw_episode.episode_id, step_index=0, supporting_row_ids=["trigger_exit"], evidence_tier="hypothesized", provenance="graph", node_id=trigger_node_id, other_node_id=exit_node_id, lag_steps=1, analysis_mode=analysis_mode))
+            events.append(_event("exit_attempt_without_trigger", round_id=raw_episode.round_id, episode_id=raw_episode.episode_id, step_index=0, supporting_row_ids=["exit_without_trigger"], evidence_tier="hypothesized", provenance="graph", node_id=exit_node_id, other_node_id=trigger_node_id, lag_steps=1, analysis_mode=analysis_mode))
         for gate_node_id in gate_nodes:
             for trigger_node_id in trigger_nodes:
-                events.append(_event("trigger_before_gate", round_id=raw_episode.round_id, episode_id=raw_episode.episode_id, step_index=0, supporting_row_ids=["trigger_gate"], evidence_tier="hypothesized", provenance="graph", node_id=trigger_node_id, other_node_id=gate_node_id, lag_steps=1))
+                events.append(_event("trigger_before_gate", round_id=raw_episode.round_id, episode_id=raw_episode.episode_id, step_index=0, supporting_row_ids=["trigger_gate"], evidence_tier="hypothesized", provenance="graph", node_id=trigger_node_id, other_node_id=gate_node_id, lag_steps=1, analysis_mode=analysis_mode))
         if not raw_episode.won:
-            events.append(_event("exit_failure", round_id=raw_episode.round_id, episode_id=raw_episode.episode_id, step_index=max(0, len(step_rows) - 1), supporting_row_ids=["exit_failure"], evidence_tier="observed", provenance="env_native", node_id=exit_node_id))
+            events.append(_event("exit_failure", round_id=raw_episode.round_id, episode_id=raw_episode.episode_id, step_index=max(0, len(step_rows) - 1), supporting_row_ids=["exit_failure"], evidence_tier="observed", provenance="env_native", node_id=exit_node_id, analysis_mode=analysis_mode))
+            events.append(_event("counterfactual_failure", round_id=raw_episode.round_id, episode_id=raw_episode.episode_id, step_index=max(0, len(step_rows) - 1), supporting_row_ids=["counterfactual_failure"], evidence_tier="observed", provenance="env_native", node_id=exit_node_id, analysis_mode=analysis_mode))
     return events
 
 
-def _event(event_kind: str, *, round_id: int, episode_id: str, step_index: int, supporting_row_ids: list[str], evidence_tier: str, provenance: str, node_id: str, other_node_id: str | None = None, pattern_id: str | None = None, lag_steps: int | None = None) -> dict:
+def _event(event_kind: str, *, round_id: int, episode_id: str, step_index: int, supporting_row_ids: list[str], evidence_tier: str, provenance: str, node_id: str, other_node_id: str | None = None, pattern_id: str | None = None, lag_steps: int | None = None, analysis_mode: str = "probe", source_step_ids: list[int] | None = None, target_step_ids: list[int] | None = None) -> dict:
     payload = {
         "event_kind": event_kind,
         "step_index": int(step_index),
@@ -73,6 +86,9 @@ def _event(event_kind: str, *, round_id: int, episode_id: str, step_index: int, 
         "evidence_tier": str(evidence_tier),
         "provenance": str(provenance),
         "node_id": str(node_id),
+        "analysis_mode": str(analysis_mode),
+        "source_step_ids": list(source_step_ids or ([int(step_index)] if source_step_ids is None else [])),
+        "target_step_ids": list(target_step_ids or ([int(step_index)] if target_step_ids is None else [])),
     }
     if other_node_id is not None:
         payload["other_node_id"] = str(other_node_id)

@@ -20,6 +20,12 @@ class GraphPath:
     support_strength: float
     contradiction_count: int
     hypothesis_only: bool
+    ordered_step_plan: tuple[dict, ...] = ()
+    verification_nodes: tuple[str, ...] = ()
+    counterfactual_strength: float = 0.0
+    execution_feasibility_score: float = 0.0
+    first_step_executability_score: float = 0.0
+    evidence_diversity_score: float = 0.0
     metadata: dict = field(default_factory=dict)
 
 
@@ -84,6 +90,55 @@ def _path_strength(snapshot: dict, edge_ids: list[str]) -> tuple[float, int, boo
     return confidence, contradiction_count, hypothesis_only
 
 
+def _path_annotations(snapshot: dict, node_ids: list[str], edge_ids: list[str]) -> tuple[tuple[dict, ...], tuple[str, ...], float, float]:
+    edges = _edges(snapshot)
+    nodes = _nodes(snapshot)
+    verification_nodes = []
+    counterfactual_strength = 0.0
+    directed_support = 0.0
+    step_plan = []
+    for node_id in list(node_ids or []):
+        node = dict(nodes.get(str(node_id), {}))
+        node_kind = str(node.get("node_kind") or "poi")
+        step_kind = "go_to_trigger" if node_kind == "trigger" else "verify_panel" if node_kind in {"panel", "symbol_state"} else "verify_gate" if node_kind == "gate" else "attempt_exit" if node_kind == "exit" else "reobserve_region"
+        if step_kind in {"verify_panel", "verify_gate"}:
+            verification_nodes.append(str(node_id))
+        step_plan.append({"target_node_id": str(node_id), "step_kind": step_kind})
+    for edge_id in list(edge_ids or []):
+        edge = dict(edges.get(str(edge_id), {}))
+        counterfactual_strength += float(edge.get("counterfactual_support_count", 0) or 0)
+        directed_support += float(edge.get("directed_outcome_support_count", 0) or 0)
+    execution_feasibility_score = min(1.0, (0.4 if step_plan else 0.0) + (0.1 * len(step_plan)) + (0.08 * directed_support) - (0.06 * max(0, len(step_plan) - 4)))
+    return tuple(step_plan), tuple(dict.fromkeys(verification_nodes)), min(1.0, counterfactual_strength), max(0.0, execution_feasibility_score)
+
+
+def _path_quality(snapshot: dict, node_ids: list[str], edge_ids: list[str]) -> tuple[float, float]:
+    nodes = _nodes(snapshot)
+    edges = _edges(snapshot)
+    if not node_ids:
+        return 0.0, 0.0
+    first = dict(nodes.get(str(node_ids[0]), {}))
+    first_step = 0.2
+    if bool(first.get("object_backed", False)):
+        first_step += 0.25
+    if int(first.get("observed_support_count", 0) or 0) > 0:
+        first_step += 0.2
+    if int(first.get("support_round_count", 0) or 0) > 1:
+        first_step += 0.15
+    if int(first.get("exit_link_support_count", 0) or 0) > 0:
+        first_step += 0.1
+    if int(first.get("counterfactual_support_count", 0) or 0) > 0:
+        first_step += 0.05
+    if bool(first.get("synthetic_region_only", False)):
+        first_step -= 0.25
+    edge_kinds = {str(dict(edges.get(edge_id, {})).get("edge_kind") or "") for edge_id in edge_ids}
+    evidence_diversity = min(0.4, 0.12 * len(edge_kinds))
+    evidence_diversity += 0.2 if int(first.get("counterfactual_support_count", 0) or 0) > 0 else 0.0
+    evidence_diversity += 0.2 if int(first.get("exit_link_support_count", 0) or 0) > 0 else 0.0
+    evidence_diversity += 0.2 if int(first.get("observed_support_count", 0) or 0) > 0 else 0.0
+    return max(0.0, min(1.0, first_step)), max(0.0, min(1.0, evidence_diversity))
+
+
 def find_dependency_paths(snapshot: dict, start_node_id: str, max_hops: int = 4) -> GraphQueryResult:
     queue = [(str(start_node_id), [str(start_node_id)], [])]
     paths: list[GraphPath] = []
@@ -104,6 +159,12 @@ def find_dependency_paths(snapshot: dict, start_node_id: str, max_hops: int = 4)
                     support_strength=float(strength),
                     contradiction_count=int(contradiction_count),
                     hypothesis_only=bool(hypothesis_only),
+                    ordered_step_plan=_path_annotations(snapshot, next_nodes, next_edges)[0],
+                    verification_nodes=_path_annotations(snapshot, next_nodes, next_edges)[1],
+                    counterfactual_strength=_path_annotations(snapshot, next_nodes, next_edges)[2],
+                    execution_feasibility_score=_path_annotations(snapshot, next_nodes, next_edges)[3],
+                    first_step_executability_score=_path_quality(snapshot, next_nodes, next_edges)[0],
+                    evidence_diversity_score=_path_quality(snapshot, next_nodes, next_edges)[1],
                 )
             )
             queue.append((neighbor.neighbor_node_id, next_nodes, next_edges))
@@ -139,5 +200,5 @@ def best_supported_paths_to_exit(snapshot: dict, *, max_hops: int = 4) -> GraphQ
         if str(node.get("node_kind") or "") != "trigger":
             continue
         paths.extend(find_trigger_to_exit_paths(snapshot, str(node_id), max_hops=max_hops).paths)
-    ranked = sorted(paths, key=lambda row: (row.hypothesis_only, row.contradiction_count, -row.support_strength))
+    ranked = sorted(paths, key=lambda row: (row.hypothesis_only, row.contradiction_count, -row.first_step_executability_score, -row.execution_feasibility_score, -row.evidence_diversity_score, -row.counterfactual_strength, -row.support_strength))
     return GraphQueryResult(paths=tuple(ranked[:10]))

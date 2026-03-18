@@ -6,6 +6,7 @@ from v3_1.contracts.messages import PlannerDecision
 from v3_1.contracts.versions import CompatibilityStamp
 from v3_1.execution.executor_service import build_executor_request
 from v3_1.planning.decision import final_action_from_candidate
+from v3_1.planning.subgoal_chain_manager import SubgoalChainManager
 from v3_1.runtime.export_assembler import (
     actual_effect_mode,
     available_families_from_blackboard,
@@ -13,6 +14,7 @@ from v3_1.runtime.export_assembler import (
     decision_export_payload,
     episode_export_row,
 )
+from v3_1.world.blackboard import export_strict_snapshot
 from v3_1.runtime.invalidation import invalidate_if_needed
 from v3_1.runtime.session_ledger import (
     AnalysisCompletedPayload,
@@ -24,6 +26,11 @@ from v3_1.runtime.session_ledger import (
     MergeCompletedPayload,
     PlanSelectedPayload,
     RoundStartPayload,
+    SubgoalChainAbortedPayload,
+    SubgoalChainAdvancedPayload,
+    SubgoalChainCompletedPayload,
+    SubgoalChainStartedPayload,
+    SubgoalChainStepPayload,
 )
 from v3_1.visualization.heatmaps import build_poi_heatmap, build_visit_heatmap, render_heatmap_debug_png
 
@@ -238,6 +245,117 @@ class RoundRunner:
     call: object
     planning_context_builder: object
     session_ledger: object | None = None
+    subgoal_chain_manager: object | None = None
+
+    def _ensure_chain_manager(self) -> SubgoalChainManager:
+        if self.subgoal_chain_manager is None:
+            self.subgoal_chain_manager = SubgoalChainManager()
+        return self.subgoal_chain_manager
+
+    def _maybe_start_chain(self, *, decision, round_id: int, blackboard_version: str, memory_version: str, plan_context_id: str) -> None:
+        manager = self._ensure_chain_manager()
+        if manager.active_chain:
+            return
+        metadata = dict(getattr(decision, "metadata", {}) or {})
+        selected_chain = dict(metadata.get("selected_subgoal_chain", {}) or {}) if isinstance(metadata.get("selected_subgoal_chain"), dict) else {}
+        selected_candidate = dict(metadata.get("selected_candidate", {}) or {}) if isinstance(metadata.get("selected_candidate"), dict) else {}
+        if not selected_chain or not selected_candidate:
+            return
+        started = manager.start_chain(selected_candidate=selected_candidate, round_id=round_id)
+        if not started or self.session_ledger is None:
+            return
+        current_step = dict(manager.current_step() or {})
+        self.session_ledger.append_subgoal_chain_started(
+            round_id=round_id,
+            pass_id=1,
+            blackboard_version=blackboard_version,
+            memory_version=memory_version,
+            plan_context_id=plan_context_id,
+            decision_id=str(getattr(decision, "selected_candidate_id", None) or ""),
+            payload=SubgoalChainStartedPayload(
+                chain_id=str(started.get("chain_id") or ""),
+                current_step_id=str(current_step.get("step_id") or "") or None,
+                step_kind=str(current_step.get("step_kind") or "") or None,
+                expected_evidence=tuple(str(value) for value in list(current_step.get("expected_evidence", []) or []) if value),
+                observed_evidence=(),
+                advancement_reason="chain_planned",
+            ),
+        )
+
+    def _update_chain_from_outcome(self, *, round_id: int, pass_id: int, plan_context_id: str, blackboard_version: str, memory_version: str, outcome_payload: dict) -> None:
+        manager = self._ensure_chain_manager()
+        snapshot_before = manager.snapshot()
+        if not snapshot_before.get("active_chain"):
+            return
+        manager.update_from_outcome({**dict(outcome_payload or {}), "round_id": int(round_id)})
+        snapshot_after = manager.snapshot()
+        active_chain = dict(snapshot_before.get("active_chain", {}) or {})
+        active_step = dict(snapshot_before.get("active_step", {}) or {})
+        common_kwargs = {
+            "round_id": round_id,
+            "pass_id": pass_id,
+            "blackboard_version": blackboard_version,
+            "memory_version": memory_version,
+            "plan_context_id": plan_context_id,
+        }
+        if self.session_ledger is not None:
+            payload = SubgoalChainStepPayload(
+                chain_id=str(outcome_payload.get("chain_id") or active_chain.get("chain_id") or ""),
+                current_step_id=str(outcome_payload.get("step_id") or active_step.get("step_id") or "") or None,
+                step_kind=str(outcome_payload.get("step_kind") or active_step.get("step_kind") or "") or None,
+                expected_evidence=tuple(str(value) for value in list(active_step.get("expected_evidence", []) or []) if value),
+                observed_evidence=tuple(str(value) for value in list(outcome_payload.get("expected_evidence_seen", []) or []) if value),
+                failure_reason=str(outcome_payload.get("step_failure_reason") or "") or None,
+                advancement_reason="step_success" if bool(outcome_payload.get("step_success")) else None,
+            )
+            if bool(outcome_payload.get("step_success")):
+                self.session_ledger.append_subgoal_chain_step_completed(payload=payload, **common_kwargs)
+            else:
+                self.session_ledger.append_subgoal_chain_step_failed(payload=payload, **common_kwargs)
+            if snapshot_after.get("active_chain") and int(dict(snapshot_after.get("active_chain", {}) or {}).get("current_step_index", 0) or 0) != int(active_chain.get("current_step_index", 0) or 0):
+                next_step = dict(snapshot_after.get("active_step", {}) or {})
+                self.session_ledger.append_subgoal_chain_advanced(
+                    payload=SubgoalChainAdvancedPayload(
+                        chain_id=str(active_chain.get("chain_id") or ""),
+                        current_step_id=str(next_step.get("step_id") or "") or None,
+                        step_kind=str(next_step.get("step_kind") or "") or None,
+                        expected_evidence=tuple(str(value) for value in list(next_step.get("expected_evidence", []) or []) if value),
+                        observed_evidence=tuple(str(value) for value in list(outcome_payload.get("expected_evidence_seen", []) or []) if value),
+                        advancement_reason=str(outcome_payload.get("chain_completion_reason") or "advance_on_success"),
+                    ),
+                    **common_kwargs,
+                )
+            if str(dict(snapshot_after.get("active_chain", {}) or {}).get("status") or "") == "completed":
+                self.session_ledger.append_subgoal_chain_completed(
+                    payload=SubgoalChainCompletedPayload(
+                        chain_id=str(active_chain.get("chain_id") or ""),
+                        current_step_id=str(active_step.get("step_id") or "") or None,
+                        step_kind=str(active_step.get("step_kind") or "") or None,
+                        expected_evidence=tuple(str(value) for value in list(active_step.get("expected_evidence", []) or []) if value),
+                        observed_evidence=tuple(str(value) for value in list(outcome_payload.get("expected_evidence_seen", []) or []) if value),
+                        advancement_reason=str(outcome_payload.get("chain_completion_reason") or "all_steps_completed"),
+                    ),
+                    **common_kwargs,
+                )
+                manager.active_chain = None
+            elif str(dict(snapshot_after.get("active_chain", {}) or {}).get("status") or "") == "aborted":
+                self.session_ledger.append_subgoal_chain_aborted(
+                    payload=SubgoalChainAbortedPayload(
+                        chain_id=str(active_chain.get("chain_id") or ""),
+                        current_step_id=str(active_step.get("step_id") or "") or None,
+                        step_kind=str(active_step.get("step_kind") or "") or None,
+                        expected_evidence=tuple(str(value) for value in list(active_step.get("expected_evidence", []) or []) if value),
+                        observed_evidence=tuple(str(value) for value in list(outcome_payload.get("expected_evidence_seen", []) or []) if value),
+                        failure_reason=str(outcome_payload.get("step_failure_reason") or "") or None,
+                        advancement_reason=str(outcome_payload.get("chain_completion_reason") or "chain_aborted"),
+                    ),
+                    **common_kwargs,
+                )
+        terminal_status = str(dict(snapshot_after.get("active_chain", {}) or {}).get("status") or "")
+        if terminal_status in {"completed", "aborted"}:
+            manager.chain_history.append({"event": "cleared_terminal_chain", "chain_id": active_chain.get("chain_id"), "status": terminal_status})
+            manager.active_chain = None
+            manager._should_replan = terminal_status == "aborted"
 
     def _parallelism(self, pool_name: str, requested: int) -> int:
         return max(1, min(int(requested or 1), len(list(self.services.get(pool_name, []))) or 1))
@@ -555,6 +673,7 @@ class RoundRunner:
             )
         blackboard_state = self.snapshot_registry.get(latest_blackboard.snapshot_handle).state
         memory_state = self.snapshot_registry.get(latest_memory.snapshot_handle).state
+        memory_state = {**dict(memory_state or {}), "subgoal_chain_state": self._ensure_chain_manager().snapshot()}
         hypothesis_registry_snapshot = dict(hypothesis_registry_snapshot or self.services["hypothesis_registry"].snapshot())
         deterministic_hypotheses = dict(hypothesis_registry_snapshot.get("deterministic_proposals", {}))
         llm_hypotheses = dict(hypothesis_registry_snapshot.get("llm_proposals", {}))
@@ -603,6 +722,11 @@ class RoundRunner:
                         mode="probe",
                         reward_delta=float(getattr(outcome, "reward_delta", 0.0) or 0.0),
                         outcome_evidence_provenance_summary=self._outcome_evidence_provenance_summary(outcome),
+                        avatar_cell=dict(getattr(outcome, "outcome", {}) or {}).get("avatar_cell_after"),
+                        avatar_confidence=float(dict(getattr(outcome, "outcome", {}) or {}).get("avatar_confidence_after", 0.0) or 0.0),
+                        avatar_source=str(dict(getattr(outcome, "outcome", {}) or {}).get("avatar_source_after") or "unknown"),
+                        avatar_ambiguous=bool(dict(getattr(outcome, "outcome", {}) or {}).get("avatar_localization_ambiguous", False)),
+                        avatar_tracker_status="confident" if bool(dict(getattr(outcome, "outcome", {}) or {}).get("avatar_localization_confident", False)) else "uncertain",
                     ),
                 )
         if first_observation is None and probe_outcomes:
@@ -834,6 +958,7 @@ class RoundRunner:
 
         blackboard_state = self.snapshot_registry.get(latest_blackboard.snapshot_handle).state
         memory_state = self.snapshot_registry.get(latest_memory.snapshot_handle).state
+        memory_state = {**dict(memory_state or {}), "subgoal_chain_state": self._ensure_chain_manager().snapshot()}
         deterministic_hypotheses = dict(hypothesis_registry_snapshot.get("deterministic_proposals", {}))
         llm_hypotheses = dict(hypothesis_registry_snapshot.get("llm_proposals", {}))
         use_helpers = bool(self.config.feature_flags.enable_helper_workers)
@@ -867,6 +992,13 @@ class RoundRunner:
                         strict_memory_snapshot_ref=self._strict_memory_snapshot_ref(latest_memory),
                     ),
             )
+        self._maybe_start_chain(
+            decision=decision,
+            round_id=round_id,
+            blackboard_version=plan_context.blackboard_version,
+            memory_version=plan_context.memory_version,
+            plan_context_id=plan_context.plan_context_id,
+        )
 
         directed_trial_count = self._parallelism("env_workers", getattr(self.config.planning, "directed_trial_count", 1))
         directed_candidates = self._trial_candidates(decision, branch_count=directed_trial_count)
@@ -893,6 +1025,11 @@ class RoundRunner:
                         mode="directed",
                         reward_delta=float(getattr(outcome, "reward_delta", 0.0) or 0.0),
                         outcome_evidence_provenance_summary=self._outcome_evidence_provenance_summary(outcome),
+                        avatar_cell=dict(getattr(outcome, "outcome", {}) or {}).get("avatar_cell_after"),
+                        avatar_confidence=float(dict(getattr(outcome, "outcome", {}) or {}).get("avatar_confidence_after", 0.0) or 0.0),
+                        avatar_source=str(dict(getattr(outcome, "outcome", {}) or {}).get("avatar_source_after") or "unknown"),
+                        avatar_ambiguous=bool(dict(getattr(outcome, "outcome", {}) or {}).get("avatar_localization_ambiguous", False)),
+                        avatar_tracker_status="confident" if bool(dict(getattr(outcome, "outcome", {}) or {}).get("avatar_localization_confident", False)) else "uncertain",
                     ),
                 )
         directed_analyses = self._submit_analysis_batch(outcomes=directed_outcomes, round_id=round_id, mode="directed_outcome", blackboard_snapshot=latest_blackboard, mechanic_graph_snapshot=latest_mechanic_graph)
@@ -985,6 +1122,14 @@ class RoundRunner:
         decision = directed_decisions[directed_winner_idx]
         exec_outcome = directed_outcomes[directed_winner_idx]
         directed_analysis = directed_analyses[directed_winner_idx]
+        self._update_chain_from_outcome(
+            round_id=round_id,
+            pass_id=1,
+            plan_context_id=plan_context.plan_context_id,
+            blackboard_version=plan_context.blackboard_version,
+            memory_version=plan_context.memory_version,
+            outcome_payload=dict(getattr(exec_outcome, "outcome", {}) or {}),
+        )
         selected_target_entity_id = None
         if isinstance(decision.selected_action, dict):
             selected_target_entity_id = decision.selected_action.get("target_entity_id") or decision.selected_action.get("target")
@@ -1133,7 +1278,15 @@ class RoundRunner:
                     entity["candidate_effect_mode"] = effect_payload.get("candidate_effect_mode", entity.get("candidate_effect_mode"))
                     entities[selected_target_entity_id] = entity
 
-        self.call(self.services["storage"], "persist", session_id=self.context.session_id, round_id=round_id, kind="snapshot", name=f"blackboard_pass1_round{round_id:03d}.json", payload=latest_blackboard)
+        self.call(
+            self.services["storage"],
+            "persist",
+            session_id=self.context.session_id,
+            round_id=round_id,
+            kind="snapshot",
+            name=f"blackboard_pass1_round{round_id:03d}.json",
+            payload=export_strict_snapshot(latest_blackboard),
+        )
         memory_snapshot_path = self.call(self.services["storage"], "persist", session_id=self.context.session_id, round_id=round_id, kind="snapshot", name=f"memory_pass1_round{round_id:03d}.json", payload=latest_memory)
         mechanic_graph_snapshot_path = self.call(self.services["storage"], "persist", session_id=self.context.session_id, round_id=round_id, kind="snapshot", name=f"mechanic_graph_pass1_round{round_id:03d}.json", payload=latest_mechanic_graph)
         planned_effect_mode = str((decision.selected_action or {}).get("required_action_family") or "unknown") if isinstance(decision.selected_action, dict) else "unknown"
@@ -1169,7 +1322,15 @@ class RoundRunner:
                 target_entity_id=selected_target_entity_id,
                 effect_payload=_merge_effect_payload(effect_payload, round_effect_payload),
             )
-            self.call(self.services["storage"], "persist", session_id=self.context.session_id, round_id=round_id, kind="snapshot", name=f"blackboard_pass1_round{round_id:03d}.json", payload=latest_blackboard)
+            self.call(
+                self.services["storage"],
+                "persist",
+                session_id=self.context.session_id,
+                round_id=round_id,
+                kind="snapshot",
+                name=f"blackboard_pass1_round{round_id:03d}.json",
+                payload=export_strict_snapshot(latest_blackboard),
+            )
             self.call(self.services["storage"], "persist", session_id=self.context.session_id, round_id=round_id, kind="report", name=f"decision_round{round_id:03d}.json", payload=decision_export)
         round_record = {
             "round_id": int(round_id),

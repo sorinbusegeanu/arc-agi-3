@@ -5,25 +5,22 @@ import random
 
 from v3_1.contracts.messages import ExecutorRequest, ExecutorOutcome, RawEpisode, RawStep
 from v3_1.execution.env_factory import NormalizedEnvAdapter, build_env, normalize_action_lookup
+from v3_1.execution.live_avatar_tracker import LiveAvatarTracker
 from v3_1.execution.option_execution import choose_directed_action, choose_probe_action
 from v3_1.execution.outcomes import summarize_outcome
 from v3_1.execution.route_execution import route_instruction
 
 
-def _avatar_cell(info: dict | None, observation) -> list[int] | None:
-    payload = dict(info or {})
-    avatar = payload.get("avatar")
-    if isinstance(avatar, (list, tuple)) and len(avatar) == 2:
-        return [int(float(avatar[0])), int(float(avatar[1]))]
-    if not isinstance(observation, list):
-        return None
-    for y, row in enumerate(observation):
-        if not isinstance(row, list):
-            continue
-        for x, value in enumerate(row):
-            if int(value) == 1:
-                return [x, y]
-    return None
+def _avatar_fields_from_belief(belief) -> tuple[list[int] | None, float, str, bool, list[list[int]]]:
+    if belief is None:
+        return None, 0.0, "unknown", False, []
+    return (
+        list(belief.cell) if isinstance(getattr(belief, "cell", None), list) else None,
+        float(getattr(belief, "confidence", 0.0) or 0.0),
+        str(getattr(belief, "source", "unknown") or "unknown"),
+        bool(getattr(belief, "ambiguous", False)),
+            [list(cell) for cell in list(getattr(belief, "candidate_cells", ()) or []) if isinstance(cell, list)],
+    )
 
 
 def _changed_cells(previous_observation, current_observation) -> int:
@@ -107,6 +104,7 @@ class EnvWorker:
     reset_counter: int = 0
     last_observation: object | None = None
     last_info: dict = field(default_factory=dict)
+    avatar_tracker: LiveAvatarTracker = field(default_factory=LiveAvatarTracker)
 
     @classmethod
     def from_config(cls, worker_id: str, *, env_factory: str | None, env_id: str | None, env_root: str | None, seed: int | None, render_terminal: bool = False) -> "EnvWorker":
@@ -117,6 +115,7 @@ class EnvWorker:
         self.reset_counter += 1
         self.last_observation = observation
         self.last_info = dict(info)
+        self.avatar_tracker.reset(observation, info)
         return observation, dict(info)
 
     def _step(self, action) -> tuple[object, float, bool, bool, dict]:
@@ -142,9 +141,11 @@ class EnvWorker:
             action = choose_probe_action(available_actions, action_history, recent_no_change_actions=no_change_aliases[-4:], rng=rng)
             normalized_action = self._normalize_emitted_action(action, available_actions)
             previous_observation = observation
-            avatar_before = _avatar_cell(info, previous_observation)
+            avatar_before_belief = self.avatar_tracker.current_belief()
+            avatar_before, avatar_confidence_before, avatar_source_before, avatar_ambiguous_before, avatar_candidate_cells_before = _avatar_fields_from_belief(avatar_before_belief)
             observation, reward, done, truncated, info = self._step(action)
-            avatar_after = _avatar_cell(info, observation)
+            avatar_after_belief = self.avatar_tracker.update(previous_observation, observation, action, info=info, step_index=step_idx)
+            avatar_after = list(avatar_after_belief.best_cell) if avatar_after_belief.best_cell is not None else None
             changed_cells = _changed_cells(previous_observation, observation)
             effect_region = _effect_region(previous_observation, observation)
             rewards.append(float(reward or 0.0))
@@ -170,6 +171,26 @@ class EnvWorker:
                 terminal_action_marker=False,
                 effect_region=effect_region,
                 effect_changed_cells=changed_cells,
+            )
+            step_info.update(
+                {
+                    "avatar_cell": avatar_after,
+                    "avatar_confidence": float(avatar_after_belief.confidence or 0.0),
+                    "avatar_source": str(avatar_after_belief.source or "unknown"),
+                    "avatar_ambiguous": bool(avatar_after_belief.ambiguous),
+                    "avatar_status": str(avatar_after_belief.avatar_status or "unknown"),
+                    "avatar_mode_status": str(avatar_after_belief.mode_status or "unknown"),
+                    "avatar_candidate_cells": [list(cell) for cell in list(avatar_after_belief.candidate_cells or ())],
+                    "avatar_cell_before": avatar_before,
+                    "avatar_confidence_before": avatar_confidence_before,
+                    "avatar_source_before": avatar_source_before,
+                    "avatar_ambiguous_before": avatar_ambiguous_before,
+                    "avatar_candidate_cells_before": avatar_candidate_cells_before,
+                    "avatar_cell_after": avatar_after,
+                    "avatar_confidence_after": float(avatar_after_belief.confidence or 0.0),
+                    "avatar_source_after": str(avatar_after_belief.source or "unknown"),
+                    "avatar_ambiguous_after": bool(avatar_after_belief.ambiguous),
+                }
             )
             steps.append(
                 RawStep(
@@ -208,7 +229,21 @@ class EnvWorker:
 
         for step_idx in range(request.max_steps):
             available_actions = list(info.get("available_actions", self.env.available_actions()))
-            routed = route_instruction(request.action, current_observation=observation, info=info)
+            avatar_belief = self.avatar_tracker.current_belief()
+            route_info = dict(info or {})
+            avatar_cell, avatar_confidence, avatar_source, avatar_ambiguous, avatar_candidate_cells = _avatar_fields_from_belief(avatar_belief)
+            route_info.update(
+                {
+                    "avatar": avatar_cell,
+                    "avatar_confidence": avatar_confidence,
+                    "avatar_source": avatar_source,
+                    "avatar_ambiguous": avatar_ambiguous,
+                    "avatar_candidate_cells": avatar_candidate_cells,
+                    "avatar_status": str(getattr(avatar_belief, "avatar_status", "unknown") or "unknown"),
+                    "avatar_mode_status": str(getattr(avatar_belief, "mode_status", "unknown") or "unknown"),
+                }
+            )
+            routed = route_instruction(request.action, current_observation=observation, info=route_info)
             if routed is None:
                 routed_history.append({"mode": "directed", "failed": True, "failure_reason": "missing_route"})
                 break
@@ -216,8 +251,7 @@ class EnvWorker:
                 failure_reason = str(routed.get("failure_reason") or "execution_failed")
                 if failure_reason == "missing_avatar" and avatar_reacquire_attempts < 1 and bool(request.constraints.get("allow_avatar_reacquire_once", False)):
                     avatar_reacquire_attempts += 1
-                    patched_info = dict(info)
-                    patched_info["avatar"] = patched_info.get("avatar")
+                    patched_info = dict(route_info)
                     routed = route_instruction(request.action, current_observation=observation, info=patched_info)
                 elif failure_reason == "missing_target" and target_reacquire_attempts < 1 and bool(request.constraints.get("allow_target_reacquire_once", False)):
                     target_reacquire_attempts += 1
@@ -237,7 +271,7 @@ class EnvWorker:
                 routed_history.append(dict(routed, mode="directed"))
                 break
             previous_observation = observation
-            avatar_before = _avatar_cell(info, previous_observation)
+            avatar_before = avatar_cell
             target_before = list(routed.get("target_centroid", [])) if isinstance(routed.get("target_centroid"), list) else None
             try:
                 action = choose_directed_action(request.action, routed, available_actions, action_history)
@@ -246,7 +280,8 @@ class EnvWorker:
                 break
             normalized_action = self._normalize_emitted_action(action, available_actions)
             observation, reward, done, truncated, info = self._step(action)
-            avatar_after = _avatar_cell(info, observation)
+            avatar_after_belief = self.avatar_tracker.update(previous_observation, observation, action, info=info, step_index=step_idx)
+            avatar_after = list(avatar_after_belief.best_cell) if avatar_after_belief.best_cell is not None else None
             target_after = list(routed.get("target_centroid", [])) if isinstance(routed.get("target_centroid"), list) else None
             changed_cells = _changed_cells(previous_observation, observation)
             effect_region = _effect_region(previous_observation, observation)
@@ -284,6 +319,25 @@ class EnvWorker:
                 terminal_action_marker=bool(routed.get("terminal")),
                 effect_region=effect_region,
                 effect_changed_cells=changed_cells,
+            )
+            step_info.update(
+                {
+                    "avatar_cell": avatar_after,
+                    "avatar_confidence": float(avatar_after_belief.confidence or 0.0),
+                    "avatar_source": str(avatar_after_belief.source or "unknown"),
+                    "avatar_ambiguous": bool(avatar_after_belief.ambiguous),
+                    "avatar_status": str(avatar_after_belief.avatar_status or "unknown"),
+                    "avatar_mode_status": str(avatar_after_belief.mode_status or "unknown"),
+                    "avatar_candidate_cells": [list(cell) for cell in list(avatar_after_belief.candidate_cells or ())],
+                    "avatar_cell_before": avatar_before,
+                    "avatar_confidence_before": avatar_confidence,
+                    "avatar_source_before": avatar_source,
+                    "avatar_ambiguous_before": avatar_ambiguous,
+                    "avatar_cell_after": avatar_after,
+                    "avatar_confidence_after": float(avatar_after_belief.confidence or 0.0),
+                    "avatar_source_after": str(avatar_after_belief.source or "unknown"),
+                    "avatar_ambiguous_after": bool(avatar_after_belief.ambiguous),
+                }
             )
             steps.append(
                 RawStep(

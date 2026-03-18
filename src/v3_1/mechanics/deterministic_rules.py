@@ -145,11 +145,13 @@ def trigger_required_before_exit(events: list[dict]) -> list[HypothesisEdgePropo
 
 def trigger_changes_panel(events: list[dict]) -> list[HypothesisEdgeProposal]:
     contacts = [event for event in events if str(event.get("event_kind")) == "contact"]
-    patterns = [event for event in events if str(event.get("event_kind")) == "pattern_observed"]
+    patterns = [event for event in events if str(event.get("event_kind")) in {"pattern_observed", "panel_match_observed_after_trigger"}]
     proposals = []
     for contact in contacts:
         for pattern in patterns:
             if int(pattern.get("step_index", 0)) < int(contact.get("step_index", 0)):
+                continue
+            if int(pattern.get("step_index", 0)) - int(contact.get("step_index", 0)) > 4:
                 continue
             proposals.append(_edge("trigger_changes_panel", src_node_id=str(contact.get("node_id")), dst_node_id=str(pattern.get("node_id")), edge_kind="changes", round_id=int(contact.get("round_id", 0) or 0), episode_ids=(str(contact.get("episode_id")),), support_events=[contact, pattern], confidence=0.4))
     return proposals
@@ -161,8 +163,20 @@ def panel_matches_gate(events: list[dict]) -> list[HypothesisEdgeProposal]:
 
 def trigger_to_exit_dependency_path(events: list[dict]) -> list[HypothesisPathProposal]:
     proposals = []
-    for event in [row for row in events if str(row.get("event_kind")) == "trigger_before_exit"]:
-        proposals.append(_path("trigger_to_exit_dependency_path", src_node_id=str(event.get("node_id")), dst_node_id=str(event.get("other_node_id")), path_kind="trigger_then_exit", edge_kinds=("requires", "enables_exit"), round_id=int(event.get("round_id", 0) or 0), episode_ids=(str(event.get("episode_id")),), support_events=[event], confidence=0.5))
+    trigger_then_exit = [row for row in events if str(row.get("event_kind")) == "trigger_before_exit"]
+    panel_then_gate = [row for row in events if str(row.get("event_kind")) in {"panel_match_observed_after_trigger", "gate_state_changed_after_trigger"}]
+    for event in trigger_then_exit:
+        support_events = [event]
+        support_events.extend(
+            row for row in panel_then_gate
+            if str(row.get("node_id") or "") == str(event.get("node_id") or "")
+            and int(row.get("round_id", 0) or 0) == int(event.get("round_id", 0) or 0)
+        )
+        if len(support_events) < 1:
+            continue
+        proposals.append(_path("trigger_to_exit_dependency_path", src_node_id=str(event.get("node_id")), dst_node_id=str(event.get("other_node_id")), path_kind="trigger_then_exit", edge_kinds=("requires", "enables_exit"), round_id=int(event.get("round_id", 0) or 0), episode_ids=(str(event.get("episode_id")),), support_events=support_events, confidence=0.5 + min(0.2, 0.05 * max(0, len(support_events) - 1))))
+        if len(support_events) >= 3:
+            proposals.append(_path("multi_step_prerequisite_path", src_node_id=str(event.get("node_id")), dst_node_id=str(event.get("other_node_id")), path_kind="multi_step_prerequisite_path", edge_kinds=("changes", "matches", "controls_access", "requires"), round_id=int(event.get("round_id", 0) or 0), episode_ids=(str(event.get("episode_id")),), support_events=support_events, confidence=0.62))
     return proposals
 
 
@@ -207,17 +221,28 @@ def movement_change_dependency_path(events: list[dict]) -> list[HypothesisPathPr
 def exit_success_after_prerequisite(events: list[dict]) -> list[HypothesisPathProposal]:
     successes = [event for event in events if str(event.get("event_kind")) == "exit_success"]
     triggers = [event for event in events if str(event.get("event_kind")) == "trigger_before_exit"]
+    panel_matches = [event for event in events if str(event.get("event_kind")) == "panel_match_observed_after_trigger"]
+    gate_changes = [event for event in events if str(event.get("event_kind")) == "gate_state_changed_after_trigger"]
     proposals = []
     for success in successes:
         for trigger in triggers:
-            proposals.append(_path("exit_success_after_prerequisite", src_node_id=str(trigger.get("node_id")), dst_node_id=str(success.get("node_id")), path_kind="prerequisite_then_success", edge_kinds=("requires", "enables_exit"), round_id=int(success.get("round_id", 0) or 0), episode_ids=(str(success.get("episode_id")),), support_events=[trigger, success], confidence=0.7))
+            support_events = [trigger, success]
+            support_events.extend(row for row in panel_matches if int(row.get("round_id", 0) or 0) == int(success.get("round_id", 0) or 0))
+            support_events.extend(row for row in gate_changes if int(row.get("round_id", 0) or 0) == int(success.get("round_id", 0) or 0))
+            if len(support_events) < 3:
+                continue
+            proposals.append(_path("exit_success_after_prerequisite", src_node_id=str(trigger.get("node_id")), dst_node_id=str(success.get("node_id")), path_kind="prerequisite_then_success", edge_kinds=("requires", "enables_exit"), round_id=int(success.get("round_id", 0) or 0), episode_ids=(str(success.get("episode_id")),), support_events=support_events, confidence=0.7))
+            proposals.append(_path("prerequisite_chain_before_exit_success", src_node_id=str(trigger.get("node_id")), dst_node_id=str(success.get("node_id")), path_kind="prerequisite_chain_before_exit_success", edge_kinds=("changes", "matches", "controls_access", "enables_exit"), round_id=int(success.get("round_id", 0) or 0), episode_ids=(str(success.get("episode_id")),), support_events=support_events, confidence=0.74))
     return proposals
 
 
 def direct_exit_failure_without_prerequisite(events: list[dict]) -> list[HypothesisPathProposal]:
     failures = [event for event in events if str(event.get("event_kind")) == "exit_failure"]
     triggers = [event for event in events if str(event.get("event_kind")) == "trigger_before_exit"]
+    counterfactuals = [event for event in events if str(event.get("event_kind")) in {"counterfactual_failure", "exit_attempt_without_trigger"}]
     proposals = []
     for failure in failures:
-        proposals.append(_path("direct_exit_failure_without_prerequisite", src_node_id=str(failure.get("node_id")), dst_node_id=str(failure.get("node_id")), path_kind="direct_exit_failure_without_prerequisite", edge_kinds=("contradicts",), round_id=int(failure.get("round_id", 0) or 0), episode_ids=(str(failure.get("episode_id")),), support_events=[failure], contradiction_events=triggers, confidence=0.55))
+        support_events = [failure, *counterfactuals[:2]]
+        proposals.append(_path("direct_exit_failure_without_prerequisite", src_node_id=str(failure.get("node_id")), dst_node_id=str(failure.get("node_id")), path_kind="direct_exit_failure_without_prerequisite", edge_kinds=("contradicts",), round_id=int(failure.get("round_id", 0) or 0), episode_ids=(str(failure.get("episode_id")),), support_events=support_events, contradiction_events=triggers, confidence=0.55))
+        proposals.append(_path("counterfactual_exit_failure_without_chain", src_node_id=str(failure.get("node_id")), dst_node_id=str(failure.get("node_id")), path_kind="counterfactual_exit_failure_without_chain", edge_kinds=("contradicts",), round_id=int(failure.get("round_id", 0) or 0), episode_ids=(str(failure.get("episode_id")),), support_events=support_events, contradiction_events=triggers, confidence=0.6))
     return proposals

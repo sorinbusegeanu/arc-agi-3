@@ -4,6 +4,7 @@ from collections import Counter, defaultdict
 from math import sqrt
 from typing import Any
 
+from v3_1.analysis.pattern_identity import patch_crop, stable_descriptor, stable_pattern_id
 from v3_1.utils.ids import stable_digest
 
 
@@ -57,7 +58,10 @@ def _object_kind(*, bbox: dict[str, int], area: int, width: int, height: int, co
         return "hud_like", hints
     if area <= 2:
         hints.append("tiny")
-    if 1 <= area <= max(9, (width * height) // 16):
+    # Avatar candidates should be compact, local, and plausibly mobile.
+    # The previous threshold scaled with the full map and mislabeled many small
+    # world objects as avatar-like.
+    if 1 <= area <= 12 and bbox_width <= 4 and bbox_height <= 4 and not touches_border:
         hints.append("candidate_avatar")
     if density >= 0.8:
         hints.append("solid")
@@ -68,6 +72,13 @@ def _object_kind(*, bbox: dict[str, int], area: int, width: int, height: int, co
     if area >= max(12, (width * height) // 8):
         hints.append("large_structure")
         return "structure", hints
+    if not touches_border and 3 <= area <= 64 and bbox_width <= max(10, width // 3) and bbox_height <= max(10, height // 3):
+        if density >= 0.35:
+            hints.append("compact_structure_candidate")
+    if not touches_border and area >= 3 and bbox_width <= max(8, width // 4) and bbox_height <= max(8, height // 4):
+        hints.append("structural_candidate")
+    if not touches_border and 3 <= area <= 20 and density >= 0.45:
+        hints.append("symbol_candidate")
     if "candidate_avatar" in hints and not touches_border:
         return "mobile_candidate", hints
     return "world_object", hints
@@ -159,7 +170,23 @@ def extract_objects(observation: Any) -> list[dict]:
         mean_color = sum(color * count for color, count in histogram.items()) / float(max(1, color_mass))
         variance = sum(((float(color) - mean_color) ** 2) * count for color, count in histogram.items()) / float(max(1, color_mass))
         bbox = component["bbox"]
+        patch = patch_crop(observation, [bbox["x1"], bbox["y1"], bbox["x2"], bbox["y2"]])
+        descriptor = stable_descriptor(patch) if patch else {}
+        pattern_id = stable_pattern_id(patch) if patch else None
         aspect_ratio = component["bbox_width"] / float(max(1, component["bbox_height"]))
+        symbolic_structure_score = 0.0
+        if component["kind"] in {"world_object", "structure"}:
+            symbolic_structure_score += 0.2
+        if "structural_candidate" in component["type_hints"] or "compact_structure_candidate" in component["type_hints"]:
+            symbolic_structure_score += 0.25
+        if "symbol_candidate" in component["type_hints"]:
+            symbolic_structure_score += 0.2
+        if pattern_id:
+            symbolic_structure_score += 0.15
+        if component["touches_border"]:
+            symbolic_structure_score -= 0.1
+        if "candidate_avatar" in component["type_hints"] or component["kind"] == "mobile_candidate":
+            symbolic_structure_score -= 0.35
         object_payload = {
             "object_id": f"object:{component['signature']}:{index}",
             "component_id": component["component_id"],
@@ -186,8 +213,11 @@ def extract_objects(observation: Any) -> list[dict]:
                 "area": component["area"],
                 "density": component["descriptor"]["density"],
             },
+            "pattern_descriptor": descriptor,
+            "pattern_id": pattern_id,
             "signature": component["signature"],
             "type_hints": list(component["type_hints"]),
+            "symbolic_structure_score": max(0.0, min(1.0, symbolic_structure_score)),
             "confidence": min(1.0, 0.15 + (component["area"] / float(max(1, width * height))) + (0.1 if not component["touches_border"] else 0.0)),
             "observations": 1,
         }

@@ -13,17 +13,18 @@ ACTION_DELTAS = {
     "right": (1, 0),
 }
 
+HIGH_CONFIDENCE_THRESHOLD = 0.6
+MODERATE_CONFIDENCE_THRESHOLD = 0.35
 
-def _avatar_from_observation(observation):
-    if not isinstance(observation, list):
-        return None
-    for y, row in enumerate(observation):
-        if not isinstance(row, list):
-            continue
-        for x, value in enumerate(row):
-            if int(value) == 1:
-                return [x, y]
-    return None
+
+def _avatar_from_tracker(info: dict) -> tuple[list[int] | None, float, str, bool]:
+    avatar = info.get("avatar")
+    confidence = float(info.get("avatar_confidence", 0.0) or 0.0)
+    source = str(info.get("avatar_source") or "unknown")
+    ambiguous = bool(info.get("avatar_ambiguous", False))
+    if isinstance(avatar, (list, tuple)) and len(avatar) == 2:
+        return [int(float(avatar[0])), int(float(avatar[1]))], confidence, source, ambiguous
+    return None, confidence, source, ambiguous
 
 
 def _terminal_distance(required_action_family: str) -> float:
@@ -73,12 +74,33 @@ def route_instruction(decision_action: dict | None, *, current_observation, info
     if decision_action is None:
         return None
     info = dict(info or {})
+    action_type = str(decision_action.get("type") or "").lower()
+    if action_type in {"hold_position", "position_only"}:
+        return {"terminal": True, "stop": True, "distance": 0.0, "target_reached": True}
+    avatar_mode_status = str(info.get("avatar_mode_status") or "unknown")
+    avatar_status = str(info.get("avatar_status") or "unknown")
     target = decision_action.get("centroid")
-    avatar = info.get("avatar") or _avatar_from_observation(current_observation)
+    avatar, avatar_confidence, avatar_source, avatar_ambiguous = _avatar_from_tracker(info)
     if not isinstance(target, (list, tuple)) or len(target) != 2:
         return {"failed": True, "failure_reason": "missing_target"}
+    if avatar_mode_status != "movement_avatar" or avatar_status != "present":
+        return {
+            "failed": True,
+            "failure_reason": "avatar_mode_unsupported",
+            "avatar_mode_status": avatar_mode_status,
+            "avatar_status": avatar_status,
+        }
     if not isinstance(avatar, (list, tuple)) or len(avatar) != 2:
         return {"failed": True, "failure_reason": "missing_avatar"}
+    if avatar_confidence < MODERATE_CONFIDENCE_THRESHOLD:
+        return {
+            "failed": True,
+            "failure_reason": "avatar_localization_low_confidence",
+            "avatar": list(avatar),
+            "avatar_confidence": avatar_confidence,
+            "avatar_source": avatar_source,
+            "avatar_ambiguous": avatar_ambiguous,
+        }
     required_action_family = str(decision_action.get("required_action_family") or "unknown").lower()
     click_target_coordinates = decision_action.get("click_target_coordinates") or decision_action.get("coordinates") or target
     tx, ty = int(float(target[0])), int(float(target[1]))
@@ -91,6 +113,9 @@ def route_instruction(decision_action: dict | None, *, current_observation, info
             "click_target_coordinates": [float(click_target_coordinates[0]), float(click_target_coordinates[1])] if isinstance(click_target_coordinates, (list, tuple)) and len(click_target_coordinates) == 2 else None,
             "distance": current_distance,
             "target_reached": current_distance <= _terminal_distance(required_action_family),
+            "avatar_confidence": avatar_confidence,
+            "avatar_source": avatar_source,
+            "avatar_ambiguous": avatar_ambiguous,
         }
     if current_distance <= _terminal_distance(required_action_family):
         action_type = str(decision_action.get("type", "")).lower()
@@ -121,6 +146,9 @@ def route_instruction(decision_action: dict | None, *, current_observation, info
             "movement": True,
             "required_action_family": required_action_family,
             "routing_mode": "greedy_reducing",
+            "avatar_confidence": avatar_confidence,
+            "avatar_source": avatar_source,
+            "avatar_ambiguous": avatar_ambiguous,
         }
 
     next_step = _bounded_bfs_next_step(avatar=(ax, ay), target=(tx, ty), observation=current_observation)
@@ -134,6 +162,9 @@ def route_instruction(decision_action: dict | None, *, current_observation, info
             "required_action_family": required_action_family,
             "routing_mode": "bounded_bfs",
             "temporary_distance_increase_allowed": True,
+            "avatar_confidence": avatar_confidence,
+            "avatar_source": avatar_source,
+            "avatar_ambiguous": avatar_ambiguous,
         }
     return {
         "failed": True,
@@ -141,4 +172,7 @@ def route_instruction(decision_action: dict | None, *, current_observation, info
         "distance": current_distance,
         "target_centroid": [float(tx), float(ty)],
         "avatar": [float(ax), float(ay)],
+        "avatar_confidence": avatar_confidence,
+        "avatar_source": avatar_source,
+        "avatar_ambiguous": avatar_ambiguous,
     }

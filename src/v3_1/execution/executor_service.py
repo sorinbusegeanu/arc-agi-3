@@ -18,12 +18,23 @@ def build_executor_request(decision: PlannerDecision, *, max_steps: int, mode: s
     metadata = dict(decision.metadata) if isinstance(decision.metadata, dict) else {}
     selected_raw = metadata.get("selected_candidate", {})
     selected = dict(selected_raw) if isinstance(selected_raw, dict) else {}
+    selected_subgoal_chain = dict(metadata.get("selected_subgoal_chain", {}) or {}) if isinstance(metadata.get("selected_subgoal_chain"), dict) else {}
+    selected_subgoal_step = dict(metadata.get("selected_subgoal_step", {}) or {}) if isinstance(metadata.get("selected_subgoal_step"), dict) else {}
+    chain_steps = list(selected_subgoal_chain.get("steps", []) or [])
+    chain_status_before = str(selected_subgoal_chain.get("status") or "")
+    chain_step_index = int(selected_subgoal_chain.get("current_step_index", 0) or 0)
+    active_step = dict(selected_subgoal_step or (chain_steps[chain_step_index] if 0 <= chain_step_index < len(chain_steps) else {}))
     selected_action = dict(decision.selected_action or {})
     target_centroid = selected_action.get("centroid")
     click_target_coordinates = selected_action.get("click_target_coordinates") or selected_action.get("coordinates")
     objective_type = str(selected.get("objective_type") or "fallback")
     execution_mode = str(selected.get("execution_mode") or selected.get("required_action_family") or "unknown")
     navigation_mode = str(selected.get("navigation_mode") or ("hold" if objective_type == "fallback" else "direct"))
+    if objective_type == "fallback" or navigation_mode == "hold":
+        selected_action["type"] = "hold_position"
+        selected_action.pop("centroid", None)
+        selected_action.pop("target", None)
+        selected_action.pop("target_entity_id", None)
     route_required = bool(selected.get("route_required", navigation_mode in {"direct", "routed"}))
     route_signature = selected.get("route_signature")
     target_entity_id = selected.get("target_entity_id")
@@ -39,6 +50,8 @@ def build_executor_request(decision: PlannerDecision, *, max_steps: int, mode: s
         "supporting_graph_edge_ids": list(selected.get("supporting_graph_edge_ids", []) or []),
         "prerequisite_chain": list(selected.get("prerequisite_chain", []) or []),
         "hop_count": int(selected.get("hop_count", 0) or 0),
+        "selected_subgoal_chain": dict(selected_subgoal_chain or {}),
+        "selected_subgoal_step": dict(active_step or {}),
     }
     navigation_contract = {
         "route_required": route_required,
@@ -71,7 +84,7 @@ def build_executor_request(decision: PlannerDecision, *, max_steps: int, mode: s
         "stop_on_stall": True,
         "stop_on_blocked": True,
         "allowed_partial_success_modes": ["route_progress"],
-        "failure_modes": ["missing_target", "missing_avatar", "blocked", "unreachable", "stalled", "terminal_action_unavailable"],
+        "failure_modes": ["missing_target", "missing_avatar", "avatar_localization_low_confidence", "blocked", "unreachable", "stalled", "terminal_action_unavailable"],
         "reset_mode": "reset_each_episode",
         "stall_limit": int(getattr(DEFAULT_CONFIG.execution, "stall_limit", 3)),
     }
@@ -100,6 +113,18 @@ def build_executor_request(decision: PlannerDecision, *, max_steps: int, mode: s
         stop_conditions=stop_conditions_contract,
         metadata={
             "planner_candidate": selected,
+            "avatar_tracking_mode": "live_motion",
+            "avatar_localization_policy": "tracker_first",
+            "selected_subgoal_chain": dict(selected_subgoal_chain or {}),
+            "selected_subgoal_step": dict(active_step or {}),
+            "chain_id": selected_subgoal_chain.get("chain_id"),
+            "step_id": active_step.get("step_id"),
+            "step_kind": active_step.get("step_kind"),
+            "step_index": chain_step_index if active_step else None,
+            "chain_status_before": chain_status_before or None,
+            "chain_status_after": "executing_step" if active_step else chain_status_before or None,
+            "step_target_node_id": active_step.get("target_node_id"),
+            "expected_evidence": list(active_step.get("expected_evidence", []) or []),
             "fallback_candidates": list(metadata.get("fallback_candidates", []) or []),
             "seed": seed,
             "mechanic_subgoal": {

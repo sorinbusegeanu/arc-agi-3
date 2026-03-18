@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any
 
+from v3_1.analysis.entity_identity import assign_identity
 from v3_1.analysis.object_extraction import extract_connected_components, extract_objects
 from v3_1.utils.ids import stable_digest
 
@@ -87,7 +88,7 @@ def _change_regions(observation: list[list[int]], previous_observation: list[lis
     return sorted(regions, key=lambda row: (-int(row["area"]), row["bbox"]["y1"], row["bbox"]["x1"]))
 
 
-def summarize_observation(observation: Any, previous_observation: Any | None = None) -> dict:
+def summarize_observation(observation: Any, previous_observation: Any | None = None, prior_entities: list[dict] | None = None) -> dict:
     if not _is_grid(observation):
         return {
             "width": 0,
@@ -96,6 +97,7 @@ def summarize_observation(observation: Any, previous_observation: Any | None = N
             "background": {"color": 0, "confidence": 0.0, "counts": {}},
             "objects": [],
             "avatar_candidates": [],
+            "structure_candidates": [],
             "change_regions": [],
             "active_regions": [],
             "state_identity": {"stable_inputs": [], "state_hash": "empty", "background_color": 0},
@@ -110,7 +112,16 @@ def summarize_observation(observation: Any, previous_observation: Any | None = N
     change_regions = _change_regions(grid, previous_observation if _is_grid(previous_observation) else None)
     active_regions = [region for region in change_regions if region["area"] > 0]
     avatar_candidates = []
+    structure_candidates = []
+    prior_entity_rows = [dict(row) for row in list(prior_entities or [])]
     for obj in objects:
+        identity = assign_identity(obj, prior_entity_rows)
+        obj["identity_confidence"] = float(identity.get("identity_confidence", 0.0) or 0.0)
+        obj["identity_status"] = str(identity.get("identity_status") or "new_entity")
+        obj["candidate_prior_ids"] = list(identity.get("candidate_prior_ids", []) or [])
+        if identity.get("matched_prior_id"):
+            obj["matched_prior_id"] = identity.get("matched_prior_id")
+        identity_metrics = dict(identity.get("identity_metrics", {}) or {})
         score = 0.0
         if "candidate_avatar" in obj["type_hints"]:
             score += 0.45
@@ -135,9 +146,73 @@ def summarize_observation(observation: Any, previous_observation: Any | None = N
                 "width": int(obj["width"]),
                 "height": int(obj["height"]),
                 "touches_border": bool(obj["touches_border"]),
+                "identity_confidence": float(identity.get("identity_confidence", 0.0) or 0.0),
+                "identity_status": str(identity.get("identity_status") or "new_entity"),
+                "candidate_prior_ids": list(identity.get("candidate_prior_ids", []) or []),
             }
         )
+        structure_score = 0.0
+        if obj["kind"] == "world_object":
+            structure_score += 0.2
+        if obj["kind"] == "structure":
+            structure_score += 0.35
+        structure_score += 0.35 * float(obj.get("symbolic_structure_score", 0.0) or 0.0)
+        if "structural_candidate" in obj["type_hints"]:
+            structure_score += 0.25
+        if "compact_structure_candidate" in obj["type_hints"]:
+            structure_score += 0.15
+        if "symbol_candidate" in obj["type_hints"]:
+            structure_score += 0.15
+        if "candidate_avatar" in obj["type_hints"] or obj["kind"] == "mobile_candidate":
+            structure_score -= 0.35
+        if obj["touches_border"]:
+            structure_score -= 0.1
+        structure_score += 0.25 * float(identity.get("identity_confidence", 0.0) or 0.0)
+        if str(identity.get("identity_status") or "") == "match_existing":
+            structure_score += 0.15
+        if float(identity_metrics.get("appearance_features", 0.0) or 0.0) >= 0.55:
+            structure_score += 0.08
+        if float(identity_metrics.get("size_shape_continuity", 0.0) or 0.0) >= 0.7:
+            structure_score += 0.05
+        if obj.get("pattern_id"):
+            structure_score += 0.15
+        descriptor = dict(obj.get("pattern_descriptor", {}) or {})
+        if float(descriptor.get("symmetry_score", 0.0) or 0.0) >= 0.5:
+            structure_score += 0.05
+        if float(descriptor.get("density", 0.0) or 0.0) >= 0.3:
+            structure_score += 0.05
+        if obj["primary_color"] != background["color"]:
+            structure_score += 0.1
+        if obj["area"] <= 2 or obj["area"] > 18:
+            continue
+        if float(identity.get("identity_confidence", 0.0) or 0.0) < 0.45 and not obj.get("pattern_id"):
+            continue
+        if structure_score > 0.55:
+            structure_candidates.append(
+                {
+                    "object_id": obj["object_id"],
+                    "signature": obj["signature"],
+                    "centroid": list(obj["centroid"]),
+                    "bbox": dict(obj["bbox"]),
+                    "score": min(1.0, max(0.0, structure_score)),
+                    "type_hints": list(obj["type_hints"]),
+                    "primary_color": obj["primary_color"],
+                    "area": int(obj["area"]),
+                    "kind": obj["kind"],
+                    "identity_confidence": float(identity.get("identity_confidence", 0.0) or 0.0),
+                    "identity_status": str(identity.get("identity_status") or "new_entity"),
+                    "matched_prior_id": identity.get("matched_prior_id"),
+                    "candidate_prior_ids": list(identity.get("candidate_prior_ids", []) or []),
+                    "identity_metrics": identity_metrics,
+                    "stable_descriptor": dict(obj.get("stable_descriptor", {}) or {}),
+                    "pattern_id": obj.get("pattern_id"),
+                    "pattern_descriptor": descriptor,
+                    "symbolic_structure_score": float(obj.get("symbolic_structure_score", 0.0) or 0.0),
+                }
+            )
     avatar_candidates.sort(key=lambda row: (-float(row["score"]), row["object_id"]))
+    structure_candidates.sort(key=lambda row: (-float(row["score"]), -float(row["identity_confidence"]), row["object_id"]))
+    structure_candidates = structure_candidates[:12]
     stable_inputs = [
         background["color"],
         tuple(palette),
@@ -171,6 +246,7 @@ def summarize_observation(observation: Any, previous_observation: Any | None = N
         "background": background,
         "objects": objects,
         "avatar_candidates": avatar_candidates,
+        "structure_candidates": structure_candidates,
         "change_regions": change_regions,
         "active_regions": active_regions,
         "state_identity": state_identity,

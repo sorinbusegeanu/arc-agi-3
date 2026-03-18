@@ -45,6 +45,10 @@ class MechanicNode:
     semantic_key: str | None = None
     object_ref: str | None = None
     pattern_id: str | None = None
+    source_entity_id: str | None = None
+    identity_confidence: float = 0.0
+    identity_status: str = "unknown"
+    identity_history: tuple[dict[str, Any], ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

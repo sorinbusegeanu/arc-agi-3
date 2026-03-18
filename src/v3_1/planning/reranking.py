@@ -65,12 +65,18 @@ def rerank_candidates(
         validation_state = str(dict(candidate.get("score_breakdown", {})).get("validation_state") or "none")
         graph_support_strength = float(candidate.get("candidate_effect_score", 0.0) or 0.0)
         agreement_score = float(dict(candidate.get("score_breakdown", {})).get("agreement_score", 0.0) or 0.0)
+        chain_verification_count = len(list(candidate.get("candidate_verification_points", []) or []))
+        chain_counterfactual_strength = float(dict(candidate.get("score_breakdown", {})).get("chain_counterfactual_strength", 0.0) or 0.0)
+        chain_executability_score = float(dict(candidate.get("score_breakdown", {})).get("chain_step_executability_score", 0.0) or 0.0)
+        chain_evidence_diversity = float(min(1.0, len(set(list(candidate.get("supporting_graph_node_ids", []) or []) + list(candidate.get("supporting_graph_edge_ids", []) or []))) / 6.0))
+        chain_identity_stability = float(dict(candidate.get("score_breakdown", {})).get("chain_identity_stability", candidate.get("identity_confidence", 0.0)) or 0.0)
+        planner_usable_bonus = float(dict(candidate.get("score_breakdown", {})).get("planner_usable_hypothesis_bonus", 0.0) or 0.0)
         helper_boost = helper_boosts.get(candidate["candidate_id"], 0.0)
         helper_penalty = helper_penalties.get(candidate["candidate_id"], 0.0)
         prior_target = dict(durable_prior_context.get("per_target", {}).get(str(candidate.get("target_key") or ""), {}))
         prior_bonus = 0.02 * float(prior_target.get("success_rate", 0.0) or 0.0)
         uncertainty_penalty = 0.05 * float(candidate.get("score_uncertainty", 0.0) or 0.0)
-        final_score = float(candidate.get("score", 0.0)) + helper_boost - helper_penalty + prior_bonus - uncertainty_penalty + dependency_chain_bonus
+        final_score = float(candidate.get("score", 0.0)) + helper_boost - helper_penalty + prior_bonus - uncertainty_penalty + dependency_chain_bonus + (0.05 * chain_executability_score) + (0.03 * chain_evidence_diversity) + (0.03 * min(1.0, chain_counterfactual_strength)) + (0.03 * min(1.0, chain_identity_stability)) + planner_usable_bonus
         candidate["helper_boost"] = helper_boost
         candidate["helper_penalty"] = helper_penalty
         candidate["helper_warning_reason_codes"] = sorted(helper_warning_codes.get(candidate["candidate_id"], set()))
@@ -101,6 +107,12 @@ def rerank_candidates(
             "agreement_score": agreement_score,
             "validation_state": validation_state,
             "graph_support_strength": graph_support_strength,
+            "chain_executability_score": chain_executability_score,
+            "chain_verification_count": chain_verification_count,
+            "chain_counterfactual_strength": chain_counterfactual_strength,
+            "chain_evidence_diversity": chain_evidence_diversity,
+            "chain_identity_stability": chain_identity_stability,
+            "planner_usable_bonus": planner_usable_bonus,
             "uncertainty_versions": dict(uncertainty_context.get("versions", {})),
             "observed_world_counts": {
                 "reachable": len(list(observed_world.get("reachable_targets", []))),

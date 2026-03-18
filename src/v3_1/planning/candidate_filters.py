@@ -134,7 +134,21 @@ def filter_candidates(
             _append_reason(row, code="hard.exhaustion.scope", detail={"target_entity_id": target_entity_id}, hard=True)
         if target_entity_id and target_entity_id in observed_blocked and not row.get("reachable_now") and not row.get("reachable_later"):
             _append_reason(row, code="hard.target.unreachable", detail={"target_entity_id": target_entity_id}, hard=True)
-        if target_entity_id and not (target_entity_id in observed_entities or target_entity_id in hypothesized_entities or row.get("objective_type") in {"explore_frontier", "recover", "fallback"}):
+        graph_backed_target = bool(
+            target_entity_id
+            and (
+                str(target_entity_id).startswith("poi:")
+                or str(target_entity_id).startswith("trigger:")
+                or str(target_entity_id).startswith("mg:")
+            )
+            and (
+                list(row.get("candidate_step_plan", []) or [])
+                or list(row.get("supporting_graph_node_ids", []) or [])
+                or str(row.get("candidate_class") or "") in {"unlock_then_exit", "unlock_trigger", "verify_panel_state", "mechanic_chain_deterministic", "mechanic_chain_llm"}
+            )
+            and isinstance(dict(row.get("action", {}) or {}).get("centroid"), list)
+        )
+        if target_entity_id and not (target_entity_id in observed_entities or target_entity_id in hypothesized_entities or graph_backed_target or row.get("objective_type") in {"explore_frontier", "recover", "fallback"}):
             _append_reason(row, code="hard.target.invalid", detail={"target_entity_id": target_entity_id}, hard=True)
         if any(bool(value) for value in dict(row.get("contradiction_flags", {})).values()):
             hard_contradiction = bool(dict(row.get("contradiction_flags", {})).get("hard_contradiction")) or bool(dict(row.get("contradiction_flags", {})).get("stale_target"))
@@ -143,14 +157,17 @@ def filter_candidates(
             _append_reason(row, code="soft.support.stale", detail={"target_entity_id": target_entity_id}, hard=False)
 
         local_failures = int(dict(recent_local_outcomes.get(target_local_key, {})).get("failures", 0) or 0)
-        class_local_failures = int(dict(repeat_patterns.get("candidate_class_area", {})).get(local_key, 0) or 0)
+        class_local_state = dict(repeat_patterns.get("by_candidate_area", {})).get(local_key, {})
+        class_local_failures = int(dict(class_local_state).get("failures", 0) or 0)
         if class_local_failures >= WEAKNESS_BY_OBJECTIVE.get(str(row.get("objective_type") or "fallback"), 99):
             _append_reason(row, code="soft.repeat.candidate_area", detail={"count": class_local_failures}, hard=False)
         if local_failures >= 2:
             _append_reason(row, code="soft.repeat.target_area", detail={"count": local_failures}, hard=False)
-        if route_signature and int(dict(repeat_patterns.get("route_pattern_state", {})).get(route_signature, 0) or 0) >= 2:
+        route_repeat_state = dict(repeat_patterns.get("by_route_signature", {})).get(route_signature, {})
+        if route_signature and int(dict(route_repeat_state).get("failures", 0) or 0) >= 2:
             _append_reason(row, code="soft.repeat.route", detail={"route_signature": route_signature}, hard=False)
-        if trigger_zone_id and int(dict(repeat_patterns.get("trigger_zone", {})).get(trigger_zone_id, 0) or 0) >= 2:
+        trigger_repeat_state = dict(repeat_patterns.get("by_trigger_zone", {})).get(trigger_zone_id, {})
+        if trigger_zone_id and int(dict(trigger_repeat_state).get("failures", 0) or 0) >= 2:
             _append_reason(row, code="soft.repeat.trigger", detail={"trigger_zone_id": trigger_zone_id}, hard=False)
 
         if row["blocked_reasons"]:

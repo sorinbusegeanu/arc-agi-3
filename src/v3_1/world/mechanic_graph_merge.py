@@ -50,7 +50,13 @@ def _merge_node(existing: dict | None, incoming: dict, *, round_id: int) -> dict
         "contradiction_count": int(existing.get("contradiction_count", 0) or 0) + contradiction_increment,
         "first_seen_round": min(int(existing.get("first_seen_round", round_id) or round_id), int(incoming.get("first_seen_round", round_id) or round_id)),
         "last_seen_round": max(int(existing.get("last_seen_round", 0) or 0), int(incoming.get("last_seen_round", round_id) or round_id), int(round_id)),
+        "object_backed": bool(existing.get("object_backed", False) or incoming.get("object_backed", False)),
+        "synthetic_region_only": bool(existing.get("synthetic_region_only", False) and incoming.get("synthetic_region_only", False)) if existing else bool(incoming.get("synthetic_region_only", False)),
+        "observed_support_count": int(existing.get("observed_support_count", 0) or 0) + (support_increment if str(incoming.get("evidence_tier") or "") == "observed" else 0),
+        "exit_link_support_count": int(existing.get("exit_link_support_count", 0) or 0) + int(incoming.get("exit_link_support_count", 0) or 0),
+        "counterfactual_support_count": int(existing.get("counterfactual_support_count", 0) or 0) + int(incoming.get("counterfactual_support_count", 0) or 0),
     }
+    merged["support_round_count"] = len({int(value) for value in list(merged.get("source_round_ids", ())) if value is not None})
     return merged
 
 
@@ -72,6 +78,19 @@ def _merge_edge(existing: dict | None, incoming: dict, *, round_id: int) -> dict
         confidence = max(0.0, confidence - min(0.5, 0.08 * contradiction_increment))
     elif support_increment > 0:
         confidence = min(1.0, confidence + min(0.25, 0.03 * support_increment))
+    edge_kind = str(incoming.get("edge_kind") or existing.get("edge_kind") or "")
+    support_consistency_score = min(1.0, float(existing.get("support_consistency_score", 0.0) or 0.0) + (0.2 if support_increment > 0 else 0.0))
+    lag_consistency_score = max(float(existing.get("lag_consistency_score", 1.0) or 1.0), float(incoming.get("lag_consistency_score", 1.0) or 1.0))
+    counterfactual_support_count = int(existing.get("counterfactual_support_count", 0) or 0) + int(incoming.get("counterfactual_support_count", 0) or 0)
+    directed_outcome_support_count = int(existing.get("directed_outcome_support_count", 0) or 0) + int(incoming.get("directed_outcome_support_count", 0) or 0)
+    if edge_kind == "matches" and support_increment < 2:
+        confidence = min(confidence, 0.55)
+    if edge_kind == "requires" and counterfactual_support_count <= 0 and support_increment < 2:
+        confidence = min(confidence, 0.5)
+    if edge_kind == "controls_access" and directed_outcome_support_count <= 0:
+        confidence = min(confidence, 0.55)
+    if edge_kind == "causes_remote_change" and lag_consistency_score < 0.5:
+        confidence = min(confidence, 0.5)
     return {
         **existing,
         **incoming,
@@ -90,6 +109,10 @@ def _merge_edge(existing: dict | None, incoming: dict, *, round_id: int) -> dict
         "supporting_hypothesis_ids": list(dict.fromkeys([*list(existing.get("supporting_hypothesis_ids", []) or []), *list(incoming.get("supporting_hypothesis_ids", []) or [])])),
         "validated_from_hypothesis_id": existing.get("validated_from_hypothesis_id") or incoming.get("validated_from_hypothesis_id"),
         "validation_round_ids": sorted({int(value) for value in [*list(existing.get("validation_round_ids", []) or []), *list(incoming.get("validation_round_ids", []) or [])] if value is not None}),
+        "support_consistency_score": support_consistency_score,
+        "lag_consistency_score": lag_consistency_score,
+        "counterfactual_support_count": counterfactual_support_count,
+        "directed_outcome_support_count": directed_outcome_support_count,
     }
 
 
@@ -117,6 +140,20 @@ def _matching_hypothesis_ids(edge: dict, registry_snapshot: dict[str, Any] | Non
         ):
             llm.append(str(proposal_id))
     return deterministic, llm
+
+
+def _eligible_exit_link_feedback(src: dict, edge: dict) -> bool:
+    if not src:
+        return False
+    if str(edge.get("evidence_tier") or "") == "observed":
+        return True
+    if bool(src.get("object_backed", False)):
+        return True
+    if int(src.get("observed_support_count", 0) or 0) > 0:
+        return True
+    if not bool(src.get("synthetic_region_only", False)) and float(edge.get("confidence", 0.0) or 0.0) >= 0.75:
+        return True
+    return False
 
 
 def merge_mechanic_graph_delta(state: dict[str, Any], delta: dict[str, Any], registry_snapshot: dict[str, Any] | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -172,6 +209,21 @@ def merge_mechanic_graph_delta(state: dict[str, Any], delta: dict[str, Any], reg
         edges_by_id[str(merged["edge_id"])] = merged
         if existing_key and existing_key != str(merged["edge_id"]):
             edges_by_id.pop(existing_key, None)
+
+    for edge in edges_by_id.values():
+        src_id = str(edge.get("src_node_id") or "")
+        dst_id = str(edge.get("dst_node_id") or "")
+        src = dict(nodes_by_id.get(src_id, {}))
+        dst = dict(nodes_by_id.get(dst_id, {}))
+        if (
+            str(edge.get("edge_kind") or "") in {"requires", "controls_access"}
+            and str(dst.get("node_kind") or "") == "exit"
+            and src
+            and _eligible_exit_link_feedback(src, edge)
+        ):
+            src["exit_link_support_count"] = int(src.get("exit_link_support_count", 0) or 0) + int(edge.get("support_count", 0) or 0)
+            src["counterfactual_support_count"] = max(int(src.get("counterfactual_support_count", 0) or 0), int(edge.get("counterfactual_support_count", 0) or 0))
+            nodes_by_id[src_id] = src
 
     indexes = build_mechanic_graph_indexes(nodes_by_id, edges_by_id)
     next_state = {

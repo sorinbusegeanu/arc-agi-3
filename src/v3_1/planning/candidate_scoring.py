@@ -37,12 +37,14 @@ def score_candidates(
     hypothesized_triggers = dict(hypothesized_world.get("trigger_zones", {}))
     evidence_index = dict(uncertainty_context.get("evidence_index", {}) or {})
     durable_prior_view = dict(durable_prior_context or belief_fallback.get("durable_prior_context", {}) or {})
+    graph_node_lookup = dict(belief_fallback.get("mechanic_graph_node_lookup", {}) or {})
     candidate_outcome_priors = dict(durable_prior_view.get("candidate_outcomes", {}))
     poi_priors = dict(durable_prior_view.get("poi_patterns", {}))
     trigger_priors = dict(durable_prior_view.get("trigger_patterns", {}))
     consequence_priors = dict(durable_prior_view.get("consequence_patterns", {}))
     recovery_priors = dict(durable_prior_view.get("recovery_patterns", {}))
     versions = dict(uncertainty_context.get("versions", {}) or belief_fallback.get("versions", {}) or {})
+    planning_mode = str(belief_fallback.get("planning_mode") or uncertainty_context.get("planning_mode") or "default_progress")
 
     scored = []
     for row in candidates:
@@ -103,8 +105,39 @@ def score_candidates(
         graph_hypothesis_penalty = 0.18 if bool(candidate.get("depends_on_hypothesized_only_edges")) else 0.0
         graph_long_chain_penalty = 0.05 * max(0, graph_hop_count - 2)
         graph_stale_penalty = 0.05 if contradiction_count > 0 and graph_hop_count > 0 else 0.0
-        hypothesis_source = str(dict(candidate.get("action", {})).get("hypothesis_source") or candidate.get("hypothesis_source") or "")
+        chain_verification_count = len(list(candidate.get("candidate_verification_points", []) or []))
+        chain_has_explicit_steps = bool(list(candidate.get("candidate_step_plan", []) or []))
+        chain_counterfactual_strength = float(candidate.get("counterfactual_strength", dict(route_row).get("counterfactual_strength", 0.0)) or 0.0)
+        chain_step_executability_score = float(candidate.get("execution_feasibility_score", dict(route_row).get("execution_feasibility_score", 0.0)) or 0.0)
+        chain_directed_outcome_support = float(candidate.get("directed_outcome_support_count", dict(route_row).get("directed_outcome_support_count", 0.0)) or 0.0)
+        chain_has_exit_attempt_evidence = bool(candidate.get("target_exit_id")) or bool(list(candidate.get("expected_outcome_ids", []) or []))
+        chain_identity_stability = float(candidate.get("identity_confidence", 0.0) or 0.0)
+        first_graph_node = str((list(candidate.get("supporting_graph_node_ids", []) or []) or [""])[0] or "")
+        first_node = dict(graph_node_lookup.get(first_graph_node, {}) or {})
+        synthetic_region_only = bool(first_node.get("synthetic_region_only", False))
+        first_node_object_backed = bool(first_node.get("object_backed", False))
+        first_node_support_round_count = int(first_node.get("support_round_count", 0) or 0)
+        first_step_executability_score = float(candidate.get("first_step_executability_score", 0.0) or 0.0)
+        evidence_diversity_score = float(candidate.get("evidence_diversity_score", 0.0) or 0.0)
+        planner_usable_hypothesis_bonus = 0.0
         registry_snapshot = dict(belief_fallback.get("hypothesis_registry_snapshot", {}) or {})
+        supporting_hypothesis_ids = list(candidate.get("supporting_hypothesis_ids", []) or list(dict(candidate.get("action", {})).get("supporting_hypothesis_ids", []) or []))
+        if any(str(dict(registry_snapshot.get("planner_usable_state", {})).get(hypothesis_id, "")) == "planner_usable" for hypothesis_id in supporting_hypothesis_ids):
+            planner_usable_hypothesis_bonus = 0.08
+        chain_verification_bonus = 0.08 if chain_verification_count > 0 else 0.0
+        chain_counterfactual_bonus = 0.08 * min(1.0, chain_counterfactual_strength)
+        chain_directed_bonus = 0.05 * min(1.0, chain_directed_outcome_support)
+        chain_executability_bonus = 0.09 * min(1.0, chain_step_executability_score)
+        first_step_executability_bonus = 0.1 * min(1.0, first_step_executability_score)
+        chain_no_verification_penalty = 0.1 if chain_has_explicit_steps and chain_verification_count <= 0 else 0.0
+        chain_no_exit_attempt_penalty = 0.09 if str(candidate.get("candidate_class") or "") in {"unlock_then_exit", "mechanic_chain_deterministic", "mechanic_chain_llm"} and not chain_has_exit_attempt_evidence else 0.0
+        trigger_only_penalty = 0.08 if str(candidate.get("candidate_class") or "") in {"unlock_trigger", "trigger_probe"} and not bool(candidate.get("target_exit_id")) and graph_hop_count <= 1 else 0.0
+        panel_only_penalty = 0.08 if str(candidate.get("candidate_class") or "") == "verify_panel_state" and not bool(candidate.get("target_exit_id")) and graph_hop_count <= 1 else 0.0
+        synthetic_trigger_chain_penalty = 0.18 if synthetic_region_only and str(candidate.get("candidate_class") or "") in {"unlock_then_exit", "mechanic_chain_deterministic", "mechanic_chain_llm"} else 0.0
+        weak_first_step_penalty = 0.14 if chain_has_explicit_steps and first_step_executability_score < 0.45 else 0.0
+        low_support_round_penalty = 0.08 if chain_has_explicit_steps and first_node_support_round_count < 2 else 0.0
+        non_object_trigger_penalty = 0.08 if chain_has_explicit_steps and not first_node_object_backed else 0.0
+        hypothesis_source = str(dict(candidate.get("action", {})).get("hypothesis_source") or candidate.get("hypothesis_source") or "")
         validation_state = "validated" if any(str(registry_snapshot.get("validation_state", {}).get(hypothesis_id, "")) == "validated" for hypothesis_id in list(dict(candidate.get("action", {})).get("supporting_hypothesis_ids", []) or [])) else "new"
         agreement_groups = dict(registry_snapshot.get("agreement_groups", {}) or {})
         agreement_score = 0.2 if any(hypothesis_id in agreement_groups for hypothesis_id in list(dict(candidate.get("action", {})).get("supporting_hypothesis_ids", []) or [])) else 0.0
@@ -157,7 +190,7 @@ def score_candidates(
         directed_outcome_backed_bonus = 0.1 if float(candidate.get("support_strength", {}).get("direct_support", 0.0)) > 0.5 and objective_type in {"interact", "test_trigger", "recover"} else 0.0
         score_used_compatibility_fallback = bool(str(candidate.get("seed_contract") or "") == "compatibility_fallback")
 
-        score = (
+        progress_score = (
             novelty * float(getattr(planning_cfg, "novelty_weight", 0.6))
             + utility * float(getattr(planning_cfg, "utility_weight", 1.0))
             + float(getattr(planning_cfg, "reachability_weight", 0.55)) * reachability
@@ -180,6 +213,14 @@ def score_candidates(
             + deterministic_priority_bonus
             + validated_llm_bonus
             + agreement_score
+            + chain_verification_bonus
+            + chain_counterfactual_bonus
+            + chain_directed_bonus
+            + chain_executability_bonus
+            + first_step_executability_bonus
+            + (0.06 * min(1.0, chain_identity_stability))
+            + (0.06 * evidence_diversity_score)
+            + planner_usable_hypothesis_bonus
             - retry_penalty
             - cooldown_penalty
             - exhaustion_penalty
@@ -193,6 +234,15 @@ def score_candidates(
             - graph_hypothesis_penalty
             - graph_long_chain_penalty
             - graph_stale_penalty
+            - chain_no_verification_penalty
+            - chain_no_exit_attempt_penalty
+            - trigger_only_penalty
+            - panel_only_penalty
+            - synthetic_trigger_chain_penalty
+            - weak_first_step_penalty
+            - low_support_round_penalty
+            - non_object_trigger_penalty
+            - (0.08 if chain_has_explicit_steps and chain_identity_stability < 0.4 else 0.0)
             - llm_only_penalty
             - contradiction_hypothesis_penalty
             - seed_requires_hypothesis_penalty
@@ -202,9 +252,39 @@ def score_candidates(
             - 0.08 * prior_failure_rate
             - 0.07 * prior_route_failure_risk
             - (0.05 * hypothesized_consequence_count)
-            - float(candidate.get("score_penalty_soft_filters", 0.0))
-            - float(candidate.get("fallback_baseline_penalty", 0.0))
         )
+        information_gain_score = (
+            (0.55 * novelty)
+            + (0.25 * float(candidate.get("expected_outcomes", {}).get("expected_evidence_gain", 0.0)))
+            + (0.18 * evidence_diversity_score)
+            + direct_observed_support_bonus
+            + repeated_observed_support_bonus
+            - seed_requires_hypothesis_penalty
+            - zero_observed_support_penalty
+            - (0.08 * max(0.0, route_cost - 0.5))
+        )
+        validation_score = (
+            chain_verification_bonus
+            + chain_counterfactual_bonus
+            + chain_directed_bonus
+            + planner_usable_hypothesis_bonus
+            + direct_observed_support_bonus
+            - contradiction_seed_penalty
+            - contradiction_hypothesis_penalty
+            - chain_no_verification_penalty
+            - synthetic_trigger_chain_penalty
+        )
+        candidate_intent_mode = str(candidate.get("candidate_intent_mode") or "progress")
+        if planning_mode == "structure_acquisition":
+            if candidate_intent_mode == "information_gathering":
+                score = (0.35 * progress_score) + (1.0 * information_gain_score) + (0.45 * validation_score)
+            elif candidate_intent_mode == "validation":
+                score = (0.4 * progress_score) + (0.55 * information_gain_score) + (0.9 * validation_score)
+            else:
+                score = (0.8 * progress_score) + (0.35 * information_gain_score) + (0.35 * validation_score)
+        else:
+            score = (1.0 * progress_score) + (0.3 * information_gain_score) + (0.35 * validation_score)
+        score = score - float(candidate.get("score_penalty_soft_filters", 0.0)) - float(candidate.get("fallback_baseline_penalty", 0.0))
 
         uncertainty = min(1.0, max(route_uncertainty, trigger_uncertainty, (1.0 - support_freshness if full_support_refs else 0.5)))
         confidence = max(0.0, min(1.0, 0.5 + (0.25 * support_freshness) + (0.2 * prior_success_rate) - (0.2 * uncertainty)))
@@ -222,6 +302,11 @@ def score_candidates(
         candidate["score_used_compatibility_fallback"] = score_used_compatibility_fallback
         candidate["score_breakdown"] = {
             "schema_version": "v3_1_planner_score_v3",
+            "planning_mode": planning_mode,
+            "candidate_intent_mode": candidate_intent_mode,
+            "progress_score": progress_score,
+            "information_gain_score": information_gain_score,
+            "validation_score": validation_score,
             "objective_type": objective_type,
             "novelty": novelty,
             "reachability": reachability,
@@ -255,6 +340,26 @@ def score_candidates(
             "graph_hypothesis_penalty": graph_hypothesis_penalty,
             "graph_long_chain_penalty": graph_long_chain_penalty,
             "graph_stale_penalty": graph_stale_penalty,
+            "chain_verification_bonus": chain_verification_bonus,
+            "chain_counterfactual_bonus": chain_counterfactual_bonus,
+            "chain_directed_bonus": chain_directed_bonus,
+            "chain_executability_bonus": chain_executability_bonus,
+            "first_step_executability_bonus": first_step_executability_bonus,
+            "planner_usable_hypothesis_bonus": planner_usable_hypothesis_bonus,
+            "chain_no_verification_penalty": chain_no_verification_penalty,
+            "chain_no_exit_attempt_penalty": chain_no_exit_attempt_penalty,
+            "trigger_only_penalty": trigger_only_penalty,
+            "panel_only_penalty": panel_only_penalty,
+            "synthetic_trigger_chain_penalty": synthetic_trigger_chain_penalty,
+            "weak_first_step_penalty": weak_first_step_penalty,
+            "low_support_round_penalty": low_support_round_penalty,
+            "non_object_trigger_penalty": non_object_trigger_penalty,
+            "chain_verification_count": chain_verification_count,
+            "chain_counterfactual_strength": chain_counterfactual_strength,
+            "chain_identity_stability": chain_identity_stability,
+            "chain_step_executability_score": chain_step_executability_score,
+            "first_step_executability_score": first_step_executability_score,
+            "evidence_diversity_score": evidence_diversity_score,
             "hypothesis_source": hypothesis_source,
             "validation_state": validation_state,
             "agreement_score": agreement_score,

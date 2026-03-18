@@ -37,6 +37,72 @@ def is_compatibility_snapshot(snapshot) -> bool:
     return False
 
 
+def export_strict_snapshot(snapshot) -> dict:
+    state = {}
+    blackboard_version = None
+    created_round_id = None
+    created_pass_id = None
+    material_change = None
+    snapshot_handle = None
+    if isinstance(snapshot, BlackboardSnapshot):
+        state = dict(getattr(snapshot, "state", {}) or {})
+        blackboard_version = getattr(snapshot, "blackboard_version", None)
+        created_round_id = getattr(snapshot, "created_round_id", None)
+        created_pass_id = getattr(snapshot, "created_pass_id", None)
+        material_change = getattr(snapshot, "material_change", None)
+        snapshot_handle = getattr(snapshot, "snapshot_handle", None)
+    elif isinstance(snapshot, dict):
+        state = dict(snapshot.get("state", snapshot) or {})
+        blackboard_version = snapshot.get("blackboard_version")
+        created_round_id = snapshot.get("created_round_id")
+        created_pass_id = snapshot.get("created_pass_id")
+        material_change = snapshot.get("material_change")
+        snapshot_handle = snapshot.get("snapshot_handle")
+    observed_topology = dict(state.get("observed_topology", {}) or {})
+    hypothesized_topology = dict(state.get("hypothesized_topology", {}) or {})
+    payload = {
+        "snapshot_kind": "strict_split_world_export",
+        "compatibility_only": False,
+        "default_truth_surface": "strict_split_native",
+        "index_contract_mode": "strict_split_native",
+        "blackboard_version": blackboard_version,
+        "created_round_id": created_round_id,
+        "created_pass_id": created_pass_id,
+        "material_change": material_change,
+        "snapshot_handle": snapshot_handle,
+        "areas": dict(state.get("areas", {})),
+        "observed_entities": dict(state.get("observed_entities", {})),
+        "hypothesized_entities": dict(state.get("hypothesized_entities", {})),
+        "observed_consequences": dict(state.get("observed_consequences", {})),
+        "hypothesized_consequences": dict(state.get("hypothesized_consequences", {})),
+        "observed_trigger_zones": dict(state.get("observed_trigger_zones", {})),
+        "hypothesized_trigger_zones": dict(state.get("hypothesized_trigger_zones", {})),
+        "observed_topology": observed_topology,
+        "hypothesized_topology": hypothesized_topology,
+        "split_indexes": dict(state.get("split_indexes", {})),
+        "combined_views": {
+            "compatibility_only": True,
+            "entities": dict(state.get("entities", {})),
+            "consequences": dict(state.get("consequences", {})),
+            "trigger_zones": dict(state.get("trigger_zones", {})),
+            "topology_nodes": dict(state.get("topology_nodes", {})),
+            "topology_edges": dict(state.get("topology_edges", {})),
+            "indexes": dict(state.get("indexes", {})),
+        },
+        "summary": {
+            "observed_entity_count": len(dict(state.get("observed_entities", {}))),
+            "hypothesized_entity_count": len(dict(state.get("hypothesized_entities", {}))),
+            "observed_consequence_count": len(dict(state.get("observed_consequences", {}))),
+            "hypothesized_consequence_count": len(dict(state.get("hypothesized_consequences", {}))),
+            "observed_trigger_count": len(dict(state.get("observed_trigger_zones", {}))),
+            "hypothesized_trigger_count": len(dict(state.get("hypothesized_trigger_zones", {}))),
+            "observed_topology_node_count": len(dict(observed_topology.get("nodes", {}))),
+            "hypothesized_topology_node_count": len(dict(hypothesized_topology.get("nodes", {}))),
+        },
+    }
+    return payload
+
+
 def _build_strict_indexes(*, areas: dict, entities: dict, consequences: dict, trigger_zones: dict, topology: dict) -> dict:
     entities_by_area: dict[str, list[dict]] = {}
     pois_by_area: dict[str, list[dict]] = {}
@@ -156,7 +222,11 @@ class BlackboardState:
         return {
             "snapshot_kind": "observed_only",
             "compatibility_only": False,
-            "state": self.observed_view(),
+            "areas": dict(self.state.get("areas", {})),
+            "observed_entities": dict(self.state.get("observed_entities", {})),
+            "observed_consequences": dict(self.state.get("observed_consequences", {})),
+            "observed_trigger_zones": dict(self.state.get("observed_trigger_zones", {})),
+            "observed_topology": dict(self.state.get("observed_topology", {})),
             "split_indexes": dict(self.state.get("split_indexes", {}).get("observed", {})),
         }
 
@@ -164,7 +234,11 @@ class BlackboardState:
         return {
             "snapshot_kind": "hypothesized_only",
             "compatibility_only": False,
-            "state": self.hypothesized_view(),
+            "areas": dict(self.state.get("areas", {})),
+            "hypothesized_entities": dict(self.state.get("hypothesized_entities", {})),
+            "hypothesized_consequences": dict(self.state.get("hypothesized_consequences", {})),
+            "hypothesized_trigger_zones": dict(self.state.get("hypothesized_trigger_zones", {})),
+            "hypothesized_topology": dict(self.state.get("hypothesized_topology", {})),
             "split_indexes": dict(self.state.get("split_indexes", {}).get("hypothesized", {})),
         }
 
@@ -189,17 +263,15 @@ class BlackboardState:
             "snapshot_kind": "strict_split_world",
             "compatibility_only": False,
             "index_contract_mode": "strict_split_native",
-            "state": {
-                "areas": dict(self.state.get("areas", {})),
-                "observed_entities": dict(self.state.get("observed_entities", {})),
-                "hypothesized_entities": dict(self.state.get("hypothesized_entities", {})),
-                "observed_consequences": dict(self.state.get("observed_consequences", {})),
-                "hypothesized_consequences": dict(self.state.get("hypothesized_consequences", {})),
-                "observed_trigger_zones": dict(self.state.get("observed_trigger_zones", {})),
-                "hypothesized_trigger_zones": dict(self.state.get("hypothesized_trigger_zones", {})),
-                "observed_topology": dict(self.state.get("observed_topology", {})),
-                "hypothesized_topology": dict(self.state.get("hypothesized_topology", {})),
-            },
+            "areas": dict(self.state.get("areas", {})),
+            "observed_entities": dict(self.state.get("observed_entities", {})),
+            "hypothesized_entities": dict(self.state.get("hypothesized_entities", {})),
+            "observed_consequences": dict(self.state.get("observed_consequences", {})),
+            "hypothesized_consequences": dict(self.state.get("hypothesized_consequences", {})),
+            "observed_trigger_zones": dict(self.state.get("observed_trigger_zones", {})),
+            "hypothesized_trigger_zones": dict(self.state.get("hypothesized_trigger_zones", {})),
+            "observed_topology": dict(self.state.get("observed_topology", {})),
+            "hypothesized_topology": dict(self.state.get("hypothesized_topology", {})),
             "split_indexes": strict_indexes,
         }
 

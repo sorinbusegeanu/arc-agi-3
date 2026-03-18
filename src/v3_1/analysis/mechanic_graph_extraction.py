@@ -3,16 +3,11 @@ from __future__ import annotations
 from v3_1.analysis.consequences import (
     delayed_change_evidence,
     remote_region_change_evidence,
+    repeated_effect_region_support,
     repeated_contact_to_change_support,
     trigger_contact_evidence,
 )
 from v3_1.contracts.messages import AnalyzedEpisode, MechanicGraphDelta, RawEpisode
-from v3_1.mechanics.deterministic_hypothesis_generator import generate_deterministic_hypotheses
-from v3_1.mechanics.hypothesis_types import HypothesisBundle
-from v3_1.mechanics.llm_prompt_builder import build_llm_hypothesis_input
-from v3_1.mechanics.llm_reasoner import generate_llm_hypotheses
-from v3_1.mechanics.llm_validator import validate_llm_hypotheses
-from v3_1.runtime.hypothesis_gating import should_call_llm
 from v3_1.utils.ids import stable_digest
 
 
@@ -48,26 +43,161 @@ def _infer_node_kind(row: dict) -> str:
     return "poi"
 
 
+def _avatar_like_poi(row: dict) -> bool:
+    type_hints = [str(value or "").lower() for value in list(row.get("type_hints", []) or [])]
+    poi_class = str(row.get("poi_class") or "").lower()
+    canonical_kind = ""
+    canonical_descriptor = row.get("canonical_descriptor")
+    if isinstance(canonical_descriptor, dict):
+        canonical_kind = str(canonical_descriptor.get("kind") or "").lower()
+    kind = str(row.get("kind") or "").lower()
+    text = " ".join(type_hints + [poi_class, canonical_kind, kind]).lower()
+    return any(
+        marker in text
+        for marker in (
+            "candidate_avatar",
+            "avatar",
+            "mobile_candidate",
+        )
+    )
+
+
+def _bbox_dict(row: dict) -> dict[str, int]:
+    bbox = row.get("bbox")
+    if isinstance(bbox, dict):
+        return {
+            "x1": int(bbox.get("x1", 0) or 0),
+            "y1": int(bbox.get("y1", 0) or 0),
+            "x2": int(bbox.get("x2", 0) or 0),
+            "y2": int(bbox.get("y2", 0) or 0),
+        }
+    if isinstance(bbox, list) and len(bbox) == 4:
+        return {"x1": int(bbox[0]), "y1": int(bbox[1]), "x2": int(bbox[2]), "y2": int(bbox[3])}
+    centroid = list(row.get("centroid", [0, 0]) or [0, 0])
+    x = int(float(centroid[0])) if len(centroid) >= 1 else 0
+    y = int(float(centroid[1])) if len(centroid) >= 2 else 0
+    return {"x1": x, "y1": y, "x2": x, "y2": y}
+
+
+def _bbox_area(bbox: dict[str, int]) -> int:
+    return max(0, (int(bbox["x2"]) - int(bbox["x1"]) + 1) * (int(bbox["y2"]) - int(bbox["y1"]) + 1))
+
+
+def _bbox_centroid(bbox: dict[str, int]) -> list[float]:
+    return [((bbox["x1"] + bbox["x2"]) / 2.0), ((bbox["y1"] + bbox["y2"]) / 2.0)]
+
+
+def _heuristic_node_roles(pois: list[dict], *, width: int, height: int) -> dict[str, str]:
+    if not pois or width <= 0 or height <= 0:
+        return {}
+    rows = []
+    for poi in list(pois or []):
+        if _avatar_like_poi(poi):
+            continue
+        bbox = _bbox_dict(poi)
+        centroid = _bbox_centroid(bbox)
+        rows.append(
+            {
+                "poi": dict(poi),
+                "bbox": bbox,
+                "centroid": centroid,
+                "bbox_area": _bbox_area(bbox),
+                "w": max(1, bbox["x2"] - bbox["x1"] + 1),
+                "h": max(1, bbox["y2"] - bbox["y1"] + 1),
+            }
+        )
+    roles: dict[str, str] = {}
+    center_x = width / 2.0
+
+    top_candidates = sorted(
+        rows,
+        key=lambda row: (
+            row["centroid"][1],
+            abs(row["centroid"][0] - center_x),
+            row["bbox_area"],
+        ),
+    )
+    if top_candidates:
+        exit_row = top_candidates[0]
+        roles[str(exit_row["poi"].get("entity_id") or exit_row["poi"].get("poi_id") or "")] = "exit"
+
+    bottom_small = [
+        row for row in rows
+        if row["centroid"][1] >= (height * 0.72)
+        and row["bbox_area"] <= 9
+    ]
+    for row in sorted(bottom_small, key=lambda value: (value["centroid"][1], value["bbox_area"], abs(value["centroid"][0] - center_x))):
+        poi_id = str(row["poi"].get("entity_id") or row["poi"].get("poi_id") or "")
+        if poi_id and poi_id not in roles:
+            roles[poi_id] = "trigger"
+    large_mid = [
+        row for row in rows
+        if row["bbox_area"] >= 18
+        and row["centroid"][1] >= (height * 0.25)
+        and row["centroid"][1] <= (height * 0.85)
+    ]
+    for row in sorted(large_mid, key=lambda value: (-value["bbox_area"], abs(value["centroid"][0] - center_x))):
+        poi_id = str(row["poi"].get("entity_id") or row["poi"].get("poi_id") or "")
+        if poi_id and poi_id not in roles:
+            roles[poi_id] = "gate"
+            break
+    medium_mid = [
+        row for row in rows
+        if 2 <= row["bbox_area"] <= 12
+        and row["centroid"][1] >= (height * 0.2)
+        and row["centroid"][1] <= (height * 0.7)
+    ]
+    for row in sorted(medium_mid, key=lambda value: (abs(value["centroid"][0] - center_x), value["bbox_area"])):
+        poi_id = str(row["poi"].get("entity_id") or row["poi"].get("poi_id") or "")
+        if poi_id and poi_id not in roles:
+            roles[poi_id] = "panel"
+            break
+    return roles
+
+
 def _node_from_poi(poi: dict, *, round_id: int, episode_id: str) -> dict:
-    node_id = f"mg:{_infer_node_kind(poi)}:{poi.get('poi_id') or poi.get('entity_id') or stable_digest(poi.get('signature') or poi)}"
+    node_kind = str(poi.get("node_kind") or _infer_node_kind(poi))
+    node_id = f"mg:{node_kind}:{poi.get('poi_id') or poi.get('entity_id') or stable_digest(poi.get('signature') or poi)}"
+    evidence_tier = str(poi.get("evidence_tier") or "")
+    if evidence_tier not in {"observed", "hypothesized"}:
+        evidence_tier = (
+            "observed"
+            if bool(poi.get("factual_observation")) and bool(poi.get("direct_evidence_present"))
+            else ("observed" if float(poi.get("confidence", 0.0) or 0.0) >= 0.5 else "hypothesized")
+        )
+    support_count = max(1, int(poi.get("observations", 1) or 1))
+    entity_ref = str(poi.get("entity_id") or "")
+    stable_entity_hint = str(poi.get("stable_entity_id_hint") or "")
+    object_ref = entity_ref
+    if not object_ref or object_ref.startswith("object:"):
+        object_ref = stable_entity_hint or object_ref
+    if not object_ref:
+        object_ref = str(poi.get("poi_id") or poi.get("signature") or "")
     return {
         "node_id": node_id,
         "semantic_key": node_id,
-        "node_kind": _infer_node_kind(poi),
-        "evidence_tier": "observed" if float(poi.get("confidence", 0.0) or 0.0) >= 0.5 else "hypothesized",
+        "node_kind": node_kind,
+        "evidence_tier": evidence_tier,
         "confidence": float(poi.get("confidence", 0.0) or 0.0),
         "source_episode_ids": [str(episode_id)],
         "source_round_ids": [int(round_id)],
-        "support_count": max(1, int(poi.get("observations", 1) or 1)),
+        "support_count": support_count,
         "contradiction_count": 0,
         "first_seen_round": int(round_id),
         "last_seen_round": int(round_id),
-        "object_ref": str(poi.get("entity_id") or poi.get("poi_id") or poi.get("signature") or ""),
+        "object_ref": object_ref,
         "pattern_id": str(poi.get("pattern_id") or ""),
+        "object_backed": True,
+        "synthetic_region_only": False,
+        "support_round_count": 1,
+        "observed_support_count": support_count if evidence_tier == "observed" else 0,
+        "exit_link_support_count": 0,
+        "counterfactual_support_count": 0,
         "metadata": {
             "area_id": poi.get("area_id"),
             "centroid": poi.get("centroid"),
             "descriptor": dict(poi.get("pattern_descriptor", {}) or {}),
+            "bbox": _bbox_dict(poi),
         },
     }
 
@@ -91,17 +221,51 @@ def _effect_region_node(effect_row: dict, *, round_id: int, episode_id: str) -> 
     }
 
 
-def _effective_graph_snapshot(current_mechanic_graph_snapshot: dict | None, *, nodes: list[dict], edges: list[dict]) -> dict:
-    current_state = dict((current_mechanic_graph_snapshot or {}).get("state", current_mechanic_graph_snapshot or {}))
-    current_nodes = dict(current_state.get("nodes_by_id", {}))
-    current_edges = dict(current_state.get("edges_by_id", {}))
-    if current_nodes or current_edges:
-        return current_mechanic_graph_snapshot or {"state": current_state}
-    local_state = {
-        "nodes_by_id": {str(node.get("node_id")): dict(node) for node in list(nodes or []) if node.get("node_id")},
-        "edges_by_id": {str(edge.get("edge_id")): dict(edge) for edge in list(edges or []) if edge.get("edge_id")},
+def _trigger_zone_node(zone: dict, *, round_id: int, episode_id: str) -> dict:
+    zone_id = str(zone.get("trigger_zone_id") or zone.get("trigger_id") or stable_digest(zone))
+    bbox = _bbox_dict(zone)
+    evidence_tier = str(zone.get("evidence_tier") or "")
+    if evidence_tier not in {"observed", "hypothesized"}:
+        evidence_tier = "observed" if bool(zone.get("factual_observation")) and bool(zone.get("direct_evidence_present")) else "hypothesized"
+    support_count = max(1, int(zone.get("support_count", zone.get("observations", 1)) or 1))
+    entity_id = str(zone.get("entity_id") or "")
+    return {
+        "node_id": f"mg:trigger:{zone_id}",
+        "semantic_key": f"trigger:{zone_id}",
+        "node_kind": "trigger",
+        "evidence_tier": evidence_tier,
+        "confidence": float(zone.get("confidence", 0.0) or 0.0),
+        "source_episode_ids": [str(episode_id)],
+        "source_round_ids": [int(round_id)],
+        "support_count": support_count,
+        "contradiction_count": int(zone.get("contradiction_count", 0) or 0),
+        "first_seen_round": int(round_id),
+        "last_seen_round": int(round_id),
+        "object_ref": entity_id or zone_id,
+        "object_backed": bool(entity_id),
+        "synthetic_region_only": not bool(entity_id),
+        "support_round_count": 1,
+        "observed_support_count": support_count if evidence_tier == "observed" else 0,
+        "exit_link_support_count": 0,
+        "counterfactual_support_count": 0,
+        "metadata": {
+            "centroid": list(zone.get("centroid", _bbox_centroid(bbox)) or _bbox_centroid(bbox)),
+            "bbox": bbox,
+            "trigger_zone_id": zone_id,
+            "trigger_kind": str(zone.get("trigger_kind") or ""),
+            "region_backed": bool(zone.get("region_backed", False)),
+            "trigger_evidence_class": str(zone.get("trigger_evidence_class") or ("object_backed" if entity_id else "region_suspicion")),
+        },
     }
-    return {"state": local_state}
+
+
+def _avatar_confident(row: dict, *, threshold: float = 0.6) -> bool:
+    telemetry = dict(row.get("telemetry", {}) or {})
+    return bool(float(telemetry.get("avatar_confidence", 0.0) or 0.0) >= threshold and not bool(telemetry.get("avatar_ambiguous", False)))
+
+
+def _heuristic_trigger_chainworthy(node: dict) -> bool:
+    return bool(node.get("object_backed", False))
 
 
 def extract_mechanic_graph_delta(
@@ -112,18 +276,47 @@ def extract_mechanic_graph_delta(
     hypothesis_config: object | None = None,
     llm_adapter: object | None = None,
     hypothesis_registry_snapshot: dict | None = None,
-) -> tuple[MechanicGraphDelta, HypothesisBundle, HypothesisBundle]:
+) -> MechanicGraphDelta:
+    del current_blackboard_snapshot, current_mechanic_graph_snapshot, hypothesis_config, llm_adapter, hypothesis_registry_snapshot
     summary = dict(analyzed_episode.summary or {})
     step_rows = list(summary.get("step_rows", []) or [])
     pois = [dict(row) for row in list(analyzed_episode.points_of_interest or [])]
+    entity_rows: list[dict] = []
+    trigger_zone_rows: list[dict] = []
+    for delta in list(analyzed_episode.blackboard_deltas or []):
+        entity_rows.extend(dict(row) for row in list(getattr(delta, "entities", ()) or ()))
+        trigger_zone_rows.extend(dict(row) for row in list(getattr(delta, "trigger_zones", ()) or ()))
+    if entity_rows:
+        entity_by_id: dict[str, dict] = {}
+        for row in entity_rows:
+            entity_id = str(row.get("entity_id") or row.get("poi_id") or "")
+            if not entity_id:
+                continue
+            prior = entity_by_id.get(entity_id)
+            if prior is None or float(row.get("confidence", 0.0) or 0.0) >= float(prior.get("confidence", 0.0) or 0.0):
+                entity_by_id[entity_id] = row
+        pois_by_id = {str(row.get("entity_id") or row.get("poi_id") or ""): dict(row) for row in pois}
+        merged_rows: list[dict] = []
+        for entity_id, row in entity_by_id.items():
+            merged_rows.append({**pois_by_id.get(entity_id, {}), **row})
+        for entity_id, row in pois_by_id.items():
+            if entity_id and entity_id not in entity_by_id:
+                merged_rows.append(dict(row))
+        pois = merged_rows
+    width = int(summary.get("width", 64) or 64)
+    height = int(summary.get("height", 64) or 64)
+    heuristic_roles = _heuristic_node_roles(pois, width=width, height=height)
+    pois = [{**poi, "node_kind": heuristic_roles.get(str(poi.get("entity_id") or poi.get("poi_id") or "")) or _infer_node_kind(poi)} for poi in pois]
     nodes = [_node_from_poi(poi, round_id=raw_episode.round_id, episode_id=raw_episode.episode_id) for poi in pois]
+    nodes.extend(_trigger_zone_node(row, round_id=raw_episode.round_id, episode_id=raw_episode.episode_id) for row in trigger_zone_rows)
     nodes_by_object = {str(node.get("object_ref") or node.get("node_id")): node for node in nodes}
     edges: list[dict] = []
 
+    avatar_confident_rows = [row for row in list(step_rows or []) if _avatar_confident(dict(row))]
     for effect_row in remote_region_change_evidence(step_rows):
         effect_node = _effect_region_node(effect_row, round_id=raw_episode.round_id, episode_id=raw_episode.episode_id)
         nodes.append(effect_node)
-        contact_rows = [row for row in trigger_contact_evidence(step_rows) if int(row.get("step_idx", -1)) <= int(effect_row.get("step_idx", 0))]
+        contact_rows = [row for row in trigger_contact_evidence(avatar_confident_rows) if int(row.get("step_idx", -1)) <= int(effect_row.get("step_idx", 0))]
         if contact_rows:
             contact = contact_rows[-1]
             src_node = nodes_by_object.get(str(contact.get("target_entity_id") or ""))
@@ -147,6 +340,10 @@ def extract_mechanic_graph_delta(
                         "metadata": {"evidence_refs": [effect_row.get("evidence_ref")]},
                     }
                 )
+
+    for effect_row in repeated_effect_region_support(step_rows):
+        effect_node = _effect_region_node(effect_row, round_id=raw_episode.round_id, episode_id=raw_episode.episode_id)
+        nodes.append(effect_node)
 
     by_pattern: dict[str, list[dict]] = {}
     for node in list(nodes):
@@ -213,8 +410,11 @@ def extract_mechanic_graph_delta(
             }
         )
 
-    support_rows = repeated_contact_to_change_support(step_rows)
+    support_rows = repeated_contact_to_change_support(avatar_confident_rows)
     exits = [node for node in nodes if str(node.get("node_kind") or "") == "exit"]
+    gates = [node for node in nodes if str(node.get("node_kind") or "") == "gate"]
+    panels = [node for node in nodes if str(node.get("node_kind") or "") == "panel"]
+    triggers = [node for node in nodes if str(node.get("node_kind") or "") == "trigger"]
     for support_row in support_rows:
         trigger_node = nodes_by_object.get(str(support_row.get("target_entity_id") or ""))
         if trigger_node is None or not exits:
@@ -240,7 +440,103 @@ def extract_mechanic_graph_delta(
             }
         )
 
-    for delayed in delayed_change_evidence(step_rows):
+    if triggers and exits:
+        target_exit = exits[0]
+        for trigger_node in triggers:
+            if not _heuristic_trigger_chainworthy(trigger_node):
+                continue
+            if gates:
+                primary_gate = sorted(
+                    gates,
+                    key=lambda row: (
+                        abs(float(dict(row.get("metadata", {})).get("centroid", [0, 0])[0]) - float(dict(trigger_node.get("metadata", {})).get("centroid", [0, 0])[0])),
+                        -int(row.get("support_count", 0) or 0),
+                    ),
+                )[0]
+                edges.append(
+                    {
+                        "edge_id": f"mg_edge:{stable_digest((trigger_node['node_id'], 'requires', primary_gate['node_id']))}",
+                        "src_node_id": trigger_node["node_id"],
+                        "edge_kind": "requires",
+                        "dst_node_id": primary_gate["node_id"],
+                        "condition_key": "heuristic_trigger_gate",
+                        "evidence_tier": "hypothesized",
+                        "confidence": 0.62,
+                        "source_episode_ids": [raw_episode.episode_id],
+                        "source_round_ids": [raw_episode.round_id],
+                        "support_count": 2,
+                        "contradiction_count": 0,
+                        "first_seen_round": raw_episode.round_id,
+                        "last_seen_round": raw_episode.round_id,
+                        "direct_support_present": False,
+                        "counterfactual_support_count": 1 if bool(trigger_node.get("object_backed", False) or int(trigger_node.get("observed_support_count", 0) or 0) > 0) else 0,
+                    }
+                )
+                edges.append(
+                    {
+                        "edge_id": f"mg_edge:{stable_digest((primary_gate['node_id'], 'controls_access', target_exit['node_id']))}",
+                        "src_node_id": primary_gate["node_id"],
+                        "edge_kind": "controls_access",
+                        "dst_node_id": target_exit["node_id"],
+                        "condition_key": "heuristic_gate_exit",
+                        "evidence_tier": "hypothesized",
+                        "confidence": 0.64,
+                        "source_episode_ids": [raw_episode.episode_id],
+                        "source_round_ids": [raw_episode.round_id],
+                        "support_count": 2,
+                        "contradiction_count": 0,
+                        "first_seen_round": raw_episode.round_id,
+                        "last_seen_round": raw_episode.round_id,
+                        "direct_support_present": False,
+                        "directed_outcome_support_count": 1,
+                    }
+                )
+            else:
+                edges.append(
+                    {
+                        "edge_id": f"mg_edge:{stable_digest((trigger_node['node_id'], 'requires', target_exit['node_id']))}",
+                        "src_node_id": trigger_node["node_id"],
+                        "edge_kind": "requires",
+                        "dst_node_id": target_exit["node_id"],
+                        "condition_key": "heuristic_trigger_exit",
+                        "evidence_tier": "hypothesized",
+                        "confidence": 0.58,
+                        "source_episode_ids": [raw_episode.episode_id],
+                        "source_round_ids": [raw_episode.round_id],
+                        "support_count": 2,
+                        "contradiction_count": 0,
+                        "first_seen_round": raw_episode.round_id,
+                        "last_seen_round": raw_episode.round_id,
+                        "direct_support_present": False,
+                        "counterfactual_support_count": 1 if bool(trigger_node.get("object_backed", False) or int(trigger_node.get("observed_support_count", 0) or 0) > 0) else 0,
+                    }
+                )
+        if panels and gates:
+            for panel in panels[:2]:
+                gate = sorted(
+                    gates,
+                    key=lambda row: abs(float(dict(row.get("metadata", {})).get("centroid", [0, 0])[0]) - float(dict(panel.get("metadata", {})).get("centroid", [0, 0])[0])),
+                )[0]
+                edges.append(
+                    {
+                        "edge_id": f"mg_edge:{stable_digest((panel['node_id'], 'matches', gate['node_id']))}",
+                        "src_node_id": panel["node_id"],
+                        "edge_kind": "matches",
+                        "dst_node_id": gate["node_id"],
+                        "condition_key": "heuristic_panel_gate_match",
+                        "evidence_tier": "hypothesized",
+                        "confidence": 0.57,
+                        "source_episode_ids": [raw_episode.episode_id],
+                        "source_round_ids": [raw_episode.round_id],
+                        "support_count": 2,
+                        "contradiction_count": 0,
+                        "first_seen_round": raw_episode.round_id,
+                        "last_seen_round": raw_episode.round_id,
+                        "direct_support_present": False,
+                    }
+                )
+
+    for delayed in delayed_change_evidence(avatar_confident_rows):
         trigger_node = nodes_by_object.get(str(delayed.get("target_entity_id") or ""))
         if trigger_node is None:
             continue
@@ -281,156 +577,4 @@ def extract_mechanic_graph_delta(
             "edge_count": len(edges),
         },
     )
-    effective_graph_snapshot = _effective_graph_snapshot(current_mechanic_graph_snapshot, nodes=nodes, edges=edges)
-    deterministic_bundle = generate_deterministic_hypotheses(
-        raw_episode,
-        analyzed_episode,
-        effective_graph_snapshot,
-        current_blackboard_snapshot or {},
-    )
-    experiment_result = _experiment_result(raw_episode)
-    experiment_support_ids = list(experiment_result.get("experiment_supports_hypothesis_ids", []) or [])
-    experiment_contradict_ids = list(experiment_result.get("experiment_contradicts_hypothesis_ids", []) or [])
-    contradiction_level = sum(len(list(getattr(proposal, "contradiction_refs", ()) or [])) for proposal in list(deterministic_bundle.edge_proposals) + list(deterministic_bundle.path_proposals))
-    repeated_failures = sum(1 for row in step_rows if str(row.get("action_family") or "") in {"interact", "click_at"} and int(row.get("changed_cells", 0) or 0) <= 0)
-    path_confidences = [float(getattr(row, "confidence", 0.0) or 0.0) for row in list(deterministic_bundle.path_proposals or ())]
-    path_confidences.sort(reverse=True)
-    deterministic_tied = len(path_confidences) >= 2 and abs(path_confidences[0] - path_confidences[1]) <= 0.05
-    graph_state = dict((current_mechanic_graph_snapshot or {}).get("state", current_mechanic_graph_snapshot or {}))
-    graph_edges = list(dict(graph_state.get("edges_by_id", {})).values())
-    hypothesized_edges = [row for row in graph_edges if str(row.get("evidence_tier") or "") == "hypothesized"]
-    graph_ambiguity = (len(hypothesized_edges) / max(1, len(graph_edges))) if graph_edges else 1.0
-    llm_enabled = bool(getattr(hypothesis_config, "enable_llm", False)) if hypothesis_config is not None else False
-    llm_bundle = HypothesisBundle(
-        generation_version="llm:v1",
-        round_id=int(raw_episode.round_id),
-        episode_ids=(str(raw_episode.episode_id),),
-        provenance="llm_hypothesis",
-        metadata={"disabled": True, "reason": "llm_not_enabled"},
-    )
-    if llm_enabled and should_call_llm(
-        config=type("HypothesisConfigHolder", (), {"hypothesis_generation": hypothesis_config})(),
-        mechanic_graph_snapshot=current_mechanic_graph_snapshot,
-        deterministic_bundle=deterministic_bundle,
-        repeated_failures=repeated_failures,
-        contradiction_level=contradiction_level,
-        deterministic_tied=deterministic_tied,
-        graph_ambiguity=graph_ambiguity,
-        current_call_count=0,
-    ):
-        llm_input = build_llm_hypothesis_input(
-            mechanic_graph_snapshot=effective_graph_snapshot,
-            deterministic_hypothesis_bundle=deterministic_bundle,
-            recent_episode_summaries=(
-                {
-                    "episode_id": raw_episode.episode_id,
-                    "round_id": raw_episode.round_id,
-                    "step_count": len(step_rows),
-                    "changed_steps": sum(1 for row in step_rows if int(row.get("changed_cells", 0) or 0) > 0),
-                },
-            ),
-            unresolved_contradictions=(
-                []
-                if contradiction_level <= 0
-                else [{"count": contradiction_level, "affected_ids": [str(getattr(proposal, "proposal_id", "")) for proposal in list(deterministic_bundle.edge_proposals)[:8] if getattr(proposal, "proposal_id", "")]}]
-            ),
-            exit_attempt_summary=(
-                [
-                    {
-                        "exit_id": str(node.get("node_id")),
-                        "attempt_count": sum(1 for row in step_rows if str(row.get("action_family") or "") == "move"),
-                        "success": bool(raw_episode.won),
-                        "failure": not bool(raw_episode.won),
-                        "round_id": int(raw_episode.round_id),
-                    }
-                    for node in nodes
-                    if str(node.get("node_kind") or "") == "exit"
-                ]
-            ),
-            pattern_relation_summary=[
-                {
-                    "relation_id": str(edge.get("edge_id") or ""),
-                    "src_node_id": str(edge.get("src_node_id") or ""),
-                    "dst_node_id": str(edge.get("dst_node_id") or ""),
-                    "edge_kind": str(edge.get("edge_kind") or ""),
-                    "support_count": int(edge.get("support_count", 0) or 0),
-                    "confidence": float(edge.get("confidence", 0.0) or 0.0),
-                }
-                for edge in edges
-                if str(edge.get("edge_kind") or "") == "matches"
-            ],
-        )
-        llm_output = generate_llm_hypotheses(
-            llm_input,
-            adapter=llm_adapter,
-            hypothesis_config=hypothesis_config,
-            task_role="mechanic_hypothesis_generation",
-            session_id=str(raw_episode.session_id),
-            round_id=int(raw_episode.round_id),
-            max_output_tokens=int(getattr(hypothesis_config, "llm_max_output_tokens", 768) or 768),
-            temperature=float(getattr(hypothesis_config, "llm_temperature", 0.1) or 0.1),
-            mechanic_graph_snapshot=effective_graph_snapshot,
-            deterministic_hypothesis_bundle=deterministic_bundle,
-            exit_attempt_summary=(
-                [
-                    {
-                        "exit_id": str(node.get("node_id")),
-                        "attempt_count": sum(1 for row in step_rows if str(row.get("action_family") or "") == "move"),
-                        "success": bool(raw_episode.won),
-                        "failure": not bool(raw_episode.won),
-                        "round_id": int(raw_episode.round_id),
-                    }
-                    for node in nodes
-                    if str(node.get("node_kind") or "") == "exit"
-                ]
-            ),
-            contradictions=(
-                []
-                if contradiction_level <= 0
-                else [{"count": contradiction_level, "affected_ids": [str(getattr(proposal, "proposal_id", "")) for proposal in list(deterministic_bundle.edge_proposals)[:8] if getattr(proposal, "proposal_id", "")]}]
-            ),
-            pattern_relation_summary=[
-                {
-                    "relation_id": str(edge.get("edge_id") or ""),
-                    "src_node_id": str(edge.get("src_node_id") or ""),
-                    "dst_node_id": str(edge.get("dst_node_id") or ""),
-                    "edge_kind": str(edge.get("edge_kind") or ""),
-                    "support_count": int(edge.get("support_count", 0) or 0),
-                    "confidence": float(edge.get("confidence", 0.0) or 0.0),
-                }
-                for edge in edges
-                if str(edge.get("edge_kind") or "") == "matches"
-            ],
-        )
-        llm_bundle = validate_llm_hypotheses(
-            output=llm_output,
-            deterministic_bundle=deterministic_bundle,
-            mechanic_graph_snapshot=effective_graph_snapshot,
-            round_id=int(raw_episode.round_id),
-            episode_ids=(str(raw_episode.episode_id),),
-            confidence_cap=float(getattr(hypothesis_config, "llm_confidence_cap", 0.45) or 0.45),
-            prior_llm_proposals=list(dict((hypothesis_registry_snapshot or {}).get("llm_proposals", {})).values()),
-        )
-    deterministic_bundle = HypothesisBundle(
-        **{
-            **deterministic_bundle.__dict__,
-            "metadata": {
-                **dict(deterministic_bundle.metadata or {}),
-                "experiment_supports_hypothesis_ids": experiment_support_ids,
-                "experiment_contradicts_hypothesis_ids": experiment_contradict_ids,
-                "experiment_result": experiment_result,
-            },
-        }
-    )
-    llm_bundle = HypothesisBundle(
-        **{
-            **llm_bundle.__dict__,
-            "metadata": {
-                **dict(llm_bundle.metadata or {}),
-                "experiment_supports_hypothesis_ids": experiment_support_ids,
-                "experiment_contradicts_hypothesis_ids": experiment_contradict_ids,
-                "experiment_result": experiment_result,
-            },
-        }
-    )
-    return delta, deterministic_bundle, llm_bundle
+    return delta

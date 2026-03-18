@@ -17,6 +17,8 @@ class HypothesisRegistry:
     first_validation_round: dict[str, int] = field(default_factory=dict)
     last_touched_round: dict[str, int] = field(default_factory=dict)
     source_agreement_groups: dict[str, list[str]] = field(default_factory=dict)
+    planner_usable_state: dict[str, str] = field(default_factory=dict)
+    durable_ready_state: dict[str, str] = field(default_factory=dict)
 
     def register_bundle(self, bundle: HypothesisBundle) -> None:
         target = self.deterministic_proposals if str(bundle.provenance) == "deterministic_hypothesis" else self.llm_proposals
@@ -24,6 +26,8 @@ class HypothesisRegistry:
             target[str(proposal.proposal_id)] = proposal.__dict__
             self.validation_state.setdefault(str(proposal.proposal_id), "new")
             self.proposal_lifecycle_state.setdefault(str(proposal.proposal_id), "new")
+            self.planner_usable_state.setdefault(str(proposal.proposal_id), "not_usable")
+            self.durable_ready_state.setdefault(str(proposal.proposal_id), "not_ready")
             self.last_touched_round[str(proposal.proposal_id)] = int(getattr(proposal, "round_id", bundle.round_id) or bundle.round_id)
         edge_signatures: dict[tuple[str, str, str], list[str]] = {}
         for proposal in [*bundle.edge_proposals, *bundle.path_proposals]:
@@ -57,6 +61,8 @@ class HypothesisRegistry:
                 refs = self.promoted_graph_evidence_refs.setdefault(proposal_key, [])
                 if evidence_ref not in refs:
                     refs.append(str(evidence_ref))
+            if len(self.promoted_graph_evidence_refs.get(proposal_key, [])) >= 2:
+                self.planner_usable_state[proposal_key] = "planner_usable"
             changed += 1
         return {"supported_count": changed}
 
@@ -85,6 +91,8 @@ class HypothesisRegistry:
                 continue
             self.proposal_lifecycle_state[proposal_key] = "validated"
             self.validation_state[proposal_key] = "validated"
+            self.planner_usable_state[proposal_key] = "planner_usable"
+            self.durable_ready_state[proposal_key] = "durable_ready"
             self.first_validation_round.setdefault(proposal_key, int(round_id))
             self.last_touched_round[proposal_key] = int(round_id)
             changed += 1
@@ -115,4 +123,6 @@ class HypothesisRegistry:
             "first_validation_round": dict(self.first_validation_round),
             "last_touched_round": dict(self.last_touched_round),
             "source_agreement_groups": dict(self.source_agreement_groups),
+            "planner_usable_state": dict(self.planner_usable_state),
+            "durable_ready_state": dict(self.durable_ready_state),
         }

@@ -6,8 +6,10 @@ from v3_1.planning.candidate_filters import filter_candidates
 from v3_1.planning.candidate_generation import generate_candidates
 from v3_1.planning.candidate_scoring import score_candidates
 from v3_1.planning.decision import package_decision
+from v3_1.planning.fallbacks import fallback_candidates
 from v3_1.planning.reranking import rerank_candidates
 from v3_1.planning.route_features import compute_route_features
+from v3_1.planning.subgoal_chain import SubgoalStep, build_chain
 from v3_1.planning.queries import (
     query_best_mechanic_subgoal_chain,
     query_panel_match_dependencies,
@@ -15,6 +17,52 @@ from v3_1.planning.queries import (
     query_trigger_then_exit_candidates,
     query_unlock_paths_for_exit,
 )
+
+
+MECHANIC_CHAIN_CLASSES = {
+    "unlock_then_exit",
+    "trigger_then_target",
+    "verify_panel_state",
+    "mechanic_chain_deterministic",
+    "mechanic_chain_llm",
+}
+
+
+def _build_selected_subgoal_chain(selected: dict | None, *, round_id: int) -> dict | None:
+    candidate = dict(selected or {})
+    if str(candidate.get("candidate_class") or "") not in MECHANIC_CHAIN_CLASSES:
+        return None
+    step_rows = []
+    for row in list(candidate.get("candidate_step_plan", []) or []):
+        if not isinstance(row, dict):
+            continue
+        try:
+            step_rows.append(SubgoalStep(**dict(row)))
+        except TypeError:
+            continue
+    if not step_rows:
+        return None
+    chain = build_chain(
+        source_candidate_id=str(candidate.get("candidate_id") or ""),
+        source_path_id=str(candidate.get("source_path_id") or "") or None,
+        source_hypothesis_ids=list(candidate.get("supporting_hypothesis_ids", []) or []),
+        target_exit_id=str(candidate.get("target_exit_id") or "") or None,
+        expected_outcome_ids=list(candidate.get("expected_outcome_ids", []) or []),
+        fallback_policy=str(candidate.get("fallback_policy") or "replan"),
+        created_round_id=int(round_id),
+        steps=tuple(step_rows),
+    )
+    return chain.to_dict()
+
+
+def _active_chain_snapshot(belief: dict) -> tuple[dict | None, dict | None, bool]:
+    chain_summary = dict(belief.get("active_chain_summary", {}) or {})
+    progress = dict(belief.get("chain_progress_summary", {}) or {})
+    active_step = dict(progress.get("current_step", {}) or {})
+    should_replan = bool(progress.get("should_replan", False))
+    if not chain_summary:
+        return None, None, should_replan
+    return chain_summary, active_step, should_replan
 
 
 def _prioritized_blackboard(blackboard_snapshot: dict) -> dict:
@@ -151,6 +199,7 @@ def _split_world_contracts(*, blackboard_snapshot: dict, belief: dict) -> tuple[
     }
     uncertainty_context = {
         "current_area_id": belief.get("current_area_id"),
+        "planning_mode": belief.get("planning_mode"),
         "available_action_families": list(belief.get("available_action_families", [])),
         "versions": dict(belief.get("versions", {})),
         "tactical_memory": dict(belief.get("tactical_memory_view", {})),
@@ -182,6 +231,11 @@ def _compact_belief_trace(belief: dict) -> dict:
     return {
         "versions": dict(belief.get("versions", {})),
         "current_area_id": belief.get("current_area_id"),
+        "planning_mode": belief.get("planning_mode"),
+        "structure_recall_gap": belief.get("structure_recall_gap"),
+        "object_backed_node_count": belief.get("object_backed_node_count"),
+        "mechanic_object_backed_node_count": belief.get("mechanic_object_backed_node_count"),
+        "structure_candidate_count": belief.get("structure_candidate_count"),
         "available_action_families": list(belief.get("available_action_families", [])),
         "world_view": {
             "reachable_count": len(world_view.get("reachable_targets", [])),
@@ -342,9 +396,11 @@ def plan(
         }
         for row in exit_nodes
     ]
+    belief["mechanic_graph_node_lookup"] = {str(node_id): dict(row) for node_id, row in dict(mechanic_graph_state.get("nodes_by_id", {})).items()}
     belief["deterministic_hypotheses"] = dict(deterministic_hypotheses or {})
     belief["llm_hypotheses"] = dict(llm_hypotheses or {})
     belief["hypothesis_registry_snapshot"] = dict(hypothesis_registry_snapshot or {})
+    active_chain, active_step, chain_should_replan = _active_chain_snapshot(belief)
     generated = generate_candidates(
         memory_snapshot.get("skill_library", {}),
         belief,
@@ -383,7 +439,23 @@ def plan(
         belief_fallback=None,
     )
     reranked = _annotate_seed_support(reranked, blackboard_snapshot)
-    selected = reranked[0] if reranked else None
+    fallback_rows = (
+        [row for row in reranked if str(row.get("objective_type") or "") == "fallback"]
+        if reranked
+        else fallback_candidates(generated, blocked_candidates, belief)
+    )
+    selected = reranked[0] if reranked else (fallback_rows[0] if fallback_rows else None)
+    selected_subgoal_chain = None
+    if active_chain and not chain_should_replan:
+        selected_subgoal_chain = dict(active_chain)
+    elif selected is not None:
+        selected_subgoal_chain = _build_selected_subgoal_chain(selected, round_id=context.round_id)
+    selected_subgoal_step = dict(active_step or {})
+    if selected_subgoal_chain and not selected_subgoal_step:
+        chain_steps = list(dict(selected_subgoal_chain).get("steps", []) or [])
+        step_index = int(dict(selected_subgoal_chain).get("current_step_index", 0) or 0)
+        if 0 <= step_index < len(chain_steps):
+            selected_subgoal_step = dict(chain_steps[step_index] or {})
     consistency_checks = {
         "selected_candidate_not_blocked": bool(selected is None or not bool(selected.get("blocked"))),
         "selected_candidate_supported_by_current_belief": bool(selected is None or not list(selected.get("full_supporting_evidence_refs", [])) or any(str(ref) in dict(blackboard_snapshot.get("indexes", {}).get("evidence_index", {})) for ref in list(selected.get("full_supporting_evidence_refs", [])))),
@@ -425,16 +497,29 @@ def plan(
         "trigger_candidate_count": len(trigger_nodes),
         "panel_match_relation_count": sum(len(list(row.get("match_edges", []))) for row in belief.get("mechanic_graph_match_relations", [])),
     }
+    planner_trace["selected_subgoal_chain"] = selected_subgoal_chain
+    planner_trace["selected_subgoal_chain_id"] = str(dict(selected_subgoal_chain or {}).get("chain_id") or "") or None
+    planner_trace["selected_subgoal_chain_status"] = str(dict(selected_subgoal_chain or {}).get("status") or ("planned" if selected_subgoal_chain else "")) or None
+    planner_trace["selected_subgoal_step_id"] = str(dict(selected_subgoal_step or {}).get("step_id") or "") or None
+    planner_trace["selected_subgoal_step_kind"] = str(dict(selected_subgoal_step or {}).get("step_kind") or "") or None
     planner_trace["helper_summary"] = helper_summary
     if str(getattr(planning_cfg, "trace_level", "debug")) != "minimal":
         planner_trace["helper_results"] = helper_results
-    return package_decision(
+    decision = package_decision(
         context=context,
         selected=selected,
         ranked_candidates=reranked,
-        fallback_candidates=[row for row in reranked if str(row.get("objective_type")) == "fallback"],
+        fallback_candidates=fallback_rows,
         blocked_candidates=blocked_candidates,
         helper_results=helper_results,
         belief=belief,
         planner_trace=planner_trace,
     )
+    metadata = dict(getattr(decision, "metadata", {}) or {})
+    metadata["selected_subgoal_chain"] = selected_subgoal_chain
+    metadata["selected_subgoal_step"] = selected_subgoal_step
+    metadata["selected_subgoal_chain_id"] = str(dict(selected_subgoal_chain or {}).get("chain_id") or "") or None
+    metadata["selected_subgoal_chain_status"] = str(dict(selected_subgoal_chain or {}).get("status") or ("planned" if selected_subgoal_chain else "")) or None
+    metadata["selected_subgoal_step_id"] = str(dict(selected_subgoal_step or {}).get("step_id") or "") or None
+    metadata["selected_subgoal_step_kind"] = str(dict(selected_subgoal_step or {}).get("step_kind") or "") or None
+    return type(decision)(**{**decision.__dict__, "metadata": metadata})

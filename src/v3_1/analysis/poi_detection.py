@@ -34,6 +34,16 @@ def _motion_stats(signature_rows: list[dict]) -> tuple[float, float]:
     return motion_variance, motion_score
 
 
+def _avatar_like_candidate(*, signature: str, exemplar: dict, avatar_signatures: set[str]) -> bool:
+    type_hints = {str(value or "") for value in list(exemplar.get("type_hints", []) or [])}
+    kind = str(exemplar.get("kind") or "")
+    return (
+        signature in avatar_signatures
+        or "candidate_avatar" in type_hints
+        or kind == "mobile_candidate"
+    )
+
+
 def detect_pois(step_summaries: list[dict], avatar_tracking: dict, step_rows: list[dict] | None = None) -> list[dict]:
     step_objects = [list(summary.get("objects", [])) for summary in step_summaries]
     persistence = summarize_object_persistence(step_objects)
@@ -72,6 +82,7 @@ def detect_pois(step_summaries: list[dict], avatar_tracking: dict, step_rows: li
         poi_class = "interactive"
         signature_rows = _signature_objects(step_objects, signature)
         motion_variance, motion_score = _motion_stats(signature_rows)
+        poi_id = f"poi:{stable_digest({'signature': signature, 'centroid': exemplar['centroid']})}"
         movement_attempts = 0
         interact_attempts = 0
         click_attempts = 0
@@ -86,10 +97,30 @@ def detect_pois(step_summaries: list[dict], avatar_tracking: dict, step_rows: li
         centroid = list(exemplar.get("centroid", [0.0, 0.0]))
         distance_from_avatar = 0.0
         distance_score = 0.0
+        remote_effect_support = 0
+
+        for row in step_rows:
+            if row.get("target_entity_id") != poi_id:
+                continue
+            action_family = str(row.get("action_family") or "unknown")
+            changed_cells = int(row.get("changed_cells", 0) or 0)
+            telemetry = dict(row.get("telemetry", {}) or {})
+            if action_family == "move":
+                movement_attempts += 1
+                movement_effect_sum += changed_cells
+            elif action_family == "interact":
+                interact_attempts += 1
+                interact_effect_sum += changed_cells
+            elif action_family == "click_at":
+                click_attempts += 1
+                click_effect_sum += changed_cells
+            if isinstance(telemetry.get("effect_region"), dict) and telemetry.get("effect_region"):
+                remote_effect_support += 1
 
         if exemplar["kind"] == "hud_like":
             rejection_reasons.append("hud_like")
-        if signature in avatar_signatures:
+        avatar_like = _avatar_like_candidate(signature=signature, exemplar=exemplar, avatar_signatures=avatar_signatures)
+        if avatar_like:
             demotion_reasons.append("avatar_like")
         if stats["persistence"] < 0.2:
             rejection_reasons.append("low_persistence")
@@ -109,10 +140,33 @@ def detect_pois(step_summaries: list[dict], avatar_tracking: dict, step_rows: li
             demotion_reasons.append("border_touching")
         if exemplar["area"] <= 2:
             demotion_reasons.append("tiny")
+        if avatar_like and interact_attempts <= 0 and click_attempts <= 0 and remote_effect_support <= 0:
+            rejection_reasons.append("avatar_like_without_interaction_support")
         if exemplar["kind"] == "structure":
             poi_class = "structure"
         elif exemplar["kind"] == "mobile_candidate":
             poi_class = "mobile"
+        pattern_id = exemplar.get("pattern_id")
+        pattern_descriptor = dict(exemplar.get("pattern_descriptor", {}) or {})
+        symbolic_structure_score = float(exemplar.get("symbolic_structure_score", 0.0) or 0.0)
+        identity_confidence = float(exemplar.get("identity_confidence", 0.0) or 0.0)
+        identity_status = str(exemplar.get("identity_status") or "new_entity")
+
+        if pattern_id:
+            utility += 0.12
+        utility += 0.25 * symbolic_structure_score
+        if identity_status == "match_existing":
+            utility += 0.12
+        if identity_status == "ambiguous_match":
+            novelty += 0.04
+        utility += 0.18 * identity_confidence
+        if float(pattern_descriptor.get("symmetry_score", 0.0) or 0.0) >= 0.5:
+            utility += 0.04
+        if "compact_structure_candidate" in exemplar["type_hints"]:
+            utility += 0.05
+
+        if poi_class != "mobile" and pattern_id and identity_confidence >= 0.55:
+            poi_class = "structure"
 
         if avatar_cell is not None and len(centroid) == 2:
             dx = float(centroid[0]) - float(avatar_cell[0])
@@ -132,21 +186,6 @@ def detect_pois(step_summaries: list[dict], avatar_tracking: dict, step_rows: li
         if rejection_reasons:
             continue
 
-        poi_id = f"poi:{stable_digest({'signature': signature, 'centroid': exemplar['centroid']})}"
-        for row in step_rows:
-            if row.get("target_entity_id") != poi_id:
-                continue
-            action_family = str(row.get("action_family") or "unknown")
-            changed_cells = int(row.get("changed_cells", 0) or 0)
-            if action_family == "move":
-                movement_attempts += 1
-                movement_effect_sum += changed_cells
-            elif action_family == "interact":
-                interact_attempts += 1
-                interact_effect_sum += changed_cells
-            elif action_family == "click_at":
-                click_attempts += 1
-                click_effect_sum += changed_cells
         if movement_attempts > 0:
             movement_effect_score = movement_effect_sum / float(movement_attempts)
         if interact_attempts > 0:
@@ -208,6 +247,11 @@ def detect_pois(step_summaries: list[dict], avatar_tracking: dict, step_rows: li
                     "primary_color": exemplar["primary_color"],
                     "bbox_size": [exemplar["width"], exemplar["height"]],
                 },
+                "pattern_id": pattern_id,
+                "pattern_descriptor": pattern_descriptor,
+                "identity_confidence": identity_confidence,
+                "identity_status": identity_status,
+                "symbolic_structure_score": symbolic_structure_score,
             }
         )
     pois.sort(key=lambda row: (-float(row["confidence"]), -float(row["utility"]), row["entity_id"]))

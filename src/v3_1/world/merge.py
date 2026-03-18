@@ -96,7 +96,12 @@ def _validate_observed_entity(row: dict) -> tuple[bool, str]:
 
 
 def _validate_observed_consequence(row: dict) -> tuple[bool, str]:
-    ok, reason = _base_observed_checks("consequences", row, required_fields={"consequence_id", "action_name"}, allowed_objectives={"terminal_attribution"})
+    ok, reason = _base_observed_checks(
+        "consequences",
+        row,
+        required_fields={"consequence_id", "action_name"},
+        allowed_objectives={"terminal_attribution", "broad_trigger_suspicion", "discovery"},
+    )
     if not ok:
         return ok, reason
     valid = bool(row.get("reward") not in {None, ""} or row.get("done") is not None or int(row.get("local_change_area", 0) or 0) > 0)

@@ -194,6 +194,7 @@ def _durable_prior_view(durable_priors: dict, *, reachable: list[dict], local_po
 def build_belief(blackboard_snapshot: dict, memory_snapshot: dict, mechanic_graph_snapshot: dict | None = None) -> dict:
     working_memory = dict(memory_snapshot.get("working_memory", memory_snapshot))
     durable_priors = dict(memory_snapshot.get("durable_priors", {}))
+    subgoal_chain_state = dict(memory_snapshot.get("subgoal_chain_state", {}) or {})
     indexes = dict(blackboard_snapshot.get("indexes", {}))
     topology_nodes = dict(blackboard_snapshot.get("topology_nodes", {}))
     topology_edges = dict(blackboard_snapshot.get("topology_edges", {}))
@@ -209,6 +210,15 @@ def build_belief(blackboard_snapshot: dict, memory_snapshot: dict, mechanic_grap
     raw_plan_memory = working_memory.get("plan_memory", {})
     plan_memory = list(raw_plan_memory.get("history", [])) if isinstance(raw_plan_memory, dict) else list(raw_plan_memory)
     compact_plan_memory = [_compact_history_row(row) for row in plan_memory]
+    avatar_mode_counts: dict[str, int] = {}
+    avatar_status_counts: dict[str, int] = {}
+    for row in plan_memory[-6:]:
+        outcome = dict(row.get("outcome", {}))
+        outcome_payload = dict(outcome.get("outcome", {})) if isinstance(outcome.get("outcome"), dict) else {}
+        mode_status = str(outcome_payload.get("avatar_mode_status") or "unknown")
+        status = str(outcome_payload.get("avatar_status") or "unknown")
+        avatar_mode_counts[mode_status] = avatar_mode_counts.get(mode_status, 0) + 1
+        avatar_status_counts[status] = avatar_status_counts.get(status, 0) + 1
 
     current_area_id = None
     if compact_plan_memory:
@@ -243,6 +253,7 @@ def build_belief(blackboard_snapshot: dict, memory_snapshot: dict, mechanic_grap
     graph_supported_triggers = [dict(row) for row in find_nodes_by_kind(mechanic_graph_state, "trigger").nodes]
     graph_match_relations = [dict(row) for row in find_edges_by_kind(mechanic_graph_state, "matches").edges]
     graph_paths_to_exit = [path.__dict__ for path in best_supported_paths_to_exit(mechanic_graph_state).paths]
+    graph_nodes_by_id = dict(mechanic_graph_state.get("nodes_by_id", {}))
 
     reachable_split = {"directly_reachable_now": [], "reachable_with_route": [], "reachable_high_risk": []}
     for row in reachable:
@@ -320,10 +331,57 @@ def build_belief(blackboard_snapshot: dict, memory_snapshot: dict, mechanic_grap
         "match_relations": graph_match_relations,
     }
     durable_prior_view = _durable_prior_view(durable_priors, reachable=reachable, local_pois=local_pois, trigger_support=trigger_support, current_area_id=str(current_area_id) if current_area_id is not None else None)
+    active_chain_summary = dict(subgoal_chain_state.get("active_chain", {}) or {})
+    active_step_summary = dict(subgoal_chain_state.get("active_step", {}) or {})
+    contradicted_paths = [path for path in graph_paths_to_exit if int(path.get("contradiction_count", 0) or 0) > 0]
+    strongest_executable_paths = sorted(
+        [dict(path) for path in graph_paths_to_exit],
+        key=lambda row: (
+            -float(row.get("execution_feasibility_score", row.get("support_strength", 0.0)) or 0.0),
+            -float(row.get("counterfactual_strength", 0.0) or 0.0),
+            int(row.get("contradiction_count", 0) or 0),
+        ),
+    )[:8]
+    pending_verification_nodes = list(dict.fromkeys(
+        str(value)
+        for value in list(active_step_summary.get("verification_points", []) or [])
+        + [str(node_id) for path in strongest_executable_paths for node_id in list(path.get("verification_nodes", []) or [])]
+        if value
+    ))
+    registry_snapshot = dict(memory_snapshot.get("hypothesis_registry_snapshot", {}) or {})
+    planner_usable_hypothesis_summary = {
+        "planner_usable_count": sum(1 for state in dict(registry_snapshot.get("planner_usable_state", {})).values() if str(state or "") == "planner_usable"),
+        "durable_ready_count": sum(1 for state in dict(registry_snapshot.get("durable_ready_state", {})).values() if str(state or "") == "durable_ready"),
+        "validated_count": sum(1 for state in dict(registry_snapshot.get("validation_state", {})).values() if str(state or "") == "validated"),
+    }
 
     promising_pois = sorted(list(local_pois) + [row for row in reachable if row not in local_pois], key=lambda row: (-float(row.get("utility", 0.0)), -float(row.get("confidence", 0.0)), row.get("entity_id", "")))[:12]
     trigger_candidates = sorted([row for row in reachable if str(row.get("entity_id")) in trigger_support], key=lambda row: (-len(trigger_support.get(str(row.get("entity_id")), [])), -float(row.get("utility", 0.0)), row.get("entity_id", "")))
     recovery_candidates = sorted([row for row in blocked_rows if bool(row.get("reachable_later")) or float(row.get("distance_score", 0.0)) > 0.0], key=lambda row: (-float(row.get("distance_score", 0.0)), -float(row.get("motion_score", 0.0)), row.get("entity_id", "")))
+    structure_candidate_count = sum(
+        1 for row in list(local_pois) + list(promising_pois)
+        if str(row.get("poi_class") or row.get("kind") or "") == "structure"
+    )
+    mechanic_object_backed_node_count = sum(
+        1
+        for row in graph_nodes_by_id.values()
+        if bool(dict(row).get("object_backed", False))
+        and (
+            str(dict(row).get("node_kind") or "") in {"trigger", "panel", "gate", "exit"}
+            or bool(dict(dict(row).get("metadata", {}) or {}).get("pattern_id"))
+        )
+    )
+    object_backed_node_count = sum(1 for row in graph_nodes_by_id.values() if bool(dict(row).get("object_backed", False)))
+    region_backed_trigger_count = sum(1 for row in graph_nodes_by_id.values() if str(dict(row).get("node_kind") or "") == "trigger" and bool(dict(row).get("synthetic_region_only", False)))
+    chainworthy_path_count = sum(
+        1
+        for row in strongest_executable_paths
+        if len(list(row.get("node_ids", []) or [])) >= 3
+        and float(row.get("execution_feasibility_score", 0.0) or 0.0) >= 0.5
+        and float(row.get("support_strength", 0.0) or 0.0) >= 0.45
+    )
+    structure_recall_gap = max(0.0, 1.0 - min(1.0, (0.2 * structure_candidate_count) + (0.35 * mechanic_object_backed_node_count) + (0.25 * chainworthy_path_count)))
+    planning_mode = "structure_acquisition" if mechanic_object_backed_node_count <= 12 or structure_candidate_count <= 4 or chainworthy_path_count <= 1 else "default_progress"
     candidate_seed_sets = {
         "promising_pois": promising_pois,
         "trigger_candidates": trigger_candidates,
@@ -331,6 +389,7 @@ def build_belief(blackboard_snapshot: dict, memory_snapshot: dict, mechanic_grap
         "frontier_targets": frontier,
         "blocked_targets": blocked_rows,
         "reachable_targets": world_view["reachable_targets"],
+        "structure_candidates": [row for row in promising_pois if str(row.get("poi_class") or row.get("kind") or "") == "structure"],
     }
 
     available_action_families = {"move"}
@@ -339,6 +398,26 @@ def build_belief(blackboard_snapshot: dict, memory_snapshot: dict, mechanic_grap
         available_action_families.add("interact")
     if any(float(target.get("click_effect_score", 0.0)) > 0.0 or int(target.get("click_attempts", 0) or 0) > 0 for target in targets_for_actions):
         available_action_families.add("click_at")
+    control_mode = "unknown"
+    directional_consequence_count = sum(
+        len(rows)
+        for action_key, rows in consequence_support.items()
+        if str(action_key or "").lower() in {"up", "down", "left", "right", "action1", "action2", "action3", "action4"}
+    )
+    move_consequence_count = sum(
+        1
+        for consequence in blackboard_snapshot.get("consequences", {}).values()
+        if str(consequence.get("action_family") or consequence.get("action_key") or "").lower() == "move"
+        or str(consequence.get("action_name") or "").lower() in {"up", "down", "left", "right"}
+    )
+    movement_capability_evidence = max(directional_consequence_count, move_consequence_count)
+    if avatar_mode_counts.get("movement_avatar", 0) > 0 or movement_capability_evidence >= 2:
+        control_mode = "movement_avatar"
+    elif avatar_mode_counts.get("cursor_or_click", 0) > 0:
+        control_mode = "cursor_or_click"
+    elif avatar_mode_counts.get("global_action_only", 0) > 0:
+        control_mode = "global_action_only"
+    avatar_runtime_status = "present" if avatar_status_counts.get("present", 0) > 0 or movement_capability_evidence >= 2 else "absent" if avatar_status_counts.get("absent", 0) > 0 else "unknown"
 
     return {
         "world_view": world_view,
@@ -348,6 +427,24 @@ def build_belief(blackboard_snapshot: dict, memory_snapshot: dict, mechanic_grap
         "local_context_view": local_context_view,
         "support_view": support_view,
         "mechanic_graph_view": mechanic_graph_view,
+        "planning_mode": planning_mode,
+        "structure_recall_gap": structure_recall_gap,
+        "object_backed_node_count": object_backed_node_count,
+        "mechanic_object_backed_node_count": mechanic_object_backed_node_count,
+        "region_backed_trigger_count": region_backed_trigger_count,
+        "structure_candidate_count": structure_candidate_count,
+        "active_chain_summary": active_chain_summary,
+        "chain_progress_summary": {
+            "active_chain_id": active_chain_summary.get("chain_id"),
+            "status": active_chain_summary.get("status"),
+            "current_step_index": active_chain_summary.get("current_step_index"),
+            "current_step": active_step_summary,
+            "should_replan": bool(subgoal_chain_state.get("should_replan", False)),
+        },
+        "strongest_executable_paths": strongest_executable_paths,
+        "contradicted_paths": contradicted_paths,
+        "pending_verification_nodes": pending_verification_nodes,
+        "planner_usable_hypothesis_summary": planner_usable_hypothesis_summary,
         "reachable_targets": world_view["reachable_targets"],
         "reachable_targets_split": world_view["reachable_targets_split"],
         "frontier_targets": world_view["frontier_targets"],
@@ -360,6 +457,8 @@ def build_belief(blackboard_snapshot: dict, memory_snapshot: dict, mechanic_grap
         "topology": world_view["topology"],
         "current_area_id": current_area_id,
         "available_action_families": sorted(available_action_families),
+        "control_mode": control_mode,
+        "avatar_runtime_status": avatar_runtime_status,
         "versions": versions,
         "precedence": {
             "blackboard_facts": 0,

@@ -5,13 +5,19 @@ from collections import Counter
 
 def score_deterministic_proposal(proposal) -> dict:
     episode_support_count = len({ref.ref_id.split(":")[0] for ref in proposal.support_refs})
-    round_support_count = 1 if proposal.round_id else 0
+    round_support_count = len({getattr(proposal, "round_id", 0)})
     observed_support_count = sum(1 for ref in proposal.support_refs if str(ref.evidence_tier) == "observed")
     directed_outcome_support_count = sum(1 for ref in proposal.support_refs if str(ref.provenance) in {"env_native", "analysis"})
     contradiction_count = len(tuple(proposal.contradiction_refs))
     contradiction_recency_score = 1.0 if contradiction_count > 0 else 0.0
-    lag_consistency_score = 1.0 if len(tuple(proposal.support_refs)) <= 1 else 0.8
-    support_consistency_score = min(1.0, 0.25 * len(tuple(proposal.support_refs)))
+    lag_consistency_score = 1.0 if len(tuple(proposal.support_refs)) <= 2 else 0.65
+    support_consistency_score = min(1.0, 0.2 * len(tuple(proposal.support_refs)))
+    probe_only_support = int(directed_outcome_support_count <= 0 and observed_support_count > 0)
+    one_episode_only_penalty = 0.15 if episode_support_count <= 1 else 0.0
+    unsupported_long_chain_penalty = 0.12 if len(tuple(getattr(proposal, "edge_kinds", ()))) >= 3 and observed_support_count <= 1 else 0.0
+    exit_attempt_evidence_bonus = 0.12 if any("exit" in str(ref.ref_kind or "") for ref in proposal.support_refs) else 0.0
+    counterfactual_bonus = 0.14 if any("counterfactual" in str(ref.ref_kind or "") for ref in proposal.support_refs) else 0.0
+    repeated_trigger_before_exit_bonus = 0.1 if any("trigger_before_exit" in str(ref.ref_kind or "") for ref in proposal.support_refs) and observed_support_count >= 2 else 0.0
     confidence = min(
         1.0,
         0.15
@@ -19,6 +25,12 @@ def score_deterministic_proposal(proposal) -> dict:
         + (0.08 * directed_outcome_support_count)
         + (0.08 * episode_support_count)
         + (0.08 * support_consistency_score)
+        + exit_attempt_evidence_bonus
+        + counterfactual_bonus
+        + repeated_trigger_before_exit_bonus
+        - one_episode_only_penalty
+        - (0.12 * probe_only_support)
+        - unsupported_long_chain_penalty
         - (0.15 * contradiction_count),
     )
     return {
@@ -30,6 +42,12 @@ def score_deterministic_proposal(proposal) -> dict:
         "contradiction_recency_score": contradiction_recency_score,
         "lag_consistency_score": lag_consistency_score,
         "support_consistency_score": support_consistency_score,
+        "probe_only_support": probe_only_support,
+        "one_episode_only_penalty": one_episode_only_penalty,
+        "unsupported_long_chain_penalty": unsupported_long_chain_penalty,
+        "exit_attempt_evidence_bonus": exit_attempt_evidence_bonus,
+        "counterfactual_bonus": counterfactual_bonus,
+        "repeated_trigger_before_exit_bonus": repeated_trigger_before_exit_bonus,
         "confidence": confidence,
     }
 

@@ -857,6 +857,15 @@ def persist_postrun_outputs(
     llm_usage_summary: dict | None = None,
     hypothesis_lifecycle_summary: dict | None = None,
     experiment_results_summary: dict | None = None,
+    subgoal_chains_payload: dict | None = None,
+    subgoal_chain_steps_payload: dict | None = None,
+    subgoal_chain_failures_payload: dict | None = None,
+    subgoal_chain_successes_payload: dict | None = None,
+    avatar_tracking_trace_payload: dict | None = None,
+    avatar_tracking_failures_payload: dict | None = None,
+    graph_edge_quality_summary: dict | None = None,
+    identity_stability_summary: dict | None = None,
+    planner_usable_vs_durable_summary: dict | None = None,
 ) -> dict:
     summary_path = _persist_session(storage_agent, session_id=session_id, kind="report", name="summary.json", payload=summary)
     memory_events_jsonl_path = _persist_session_bytes(
@@ -924,6 +933,24 @@ def persist_postrun_outputs(
         exports["hypothesis_lifecycle_summary_path"] = _persist_session(storage_agent, session_id=session_id, kind="report", name="hypothesis_lifecycle_summary.json", payload=hypothesis_lifecycle_summary)
     if experiment_results_summary is not None:
         exports["experiment_results_summary_path"] = _persist_session(storage_agent, session_id=session_id, kind="report", name="experiment_results_summary.json", payload=experiment_results_summary)
+    if subgoal_chains_payload is not None:
+        exports["subgoal_chains_path"] = _persist_session(storage_agent, session_id=session_id, kind="report", name="subgoal_chains.json", payload=subgoal_chains_payload)
+    if subgoal_chain_steps_payload is not None:
+        exports["subgoal_chain_steps_path"] = _persist_session(storage_agent, session_id=session_id, kind="report", name="subgoal_chain_steps.json", payload=subgoal_chain_steps_payload)
+    if subgoal_chain_failures_payload is not None:
+        exports["subgoal_chain_failures_path"] = _persist_session(storage_agent, session_id=session_id, kind="report", name="subgoal_chain_failures.json", payload=subgoal_chain_failures_payload)
+    if subgoal_chain_successes_payload is not None:
+        exports["subgoal_chain_successes_path"] = _persist_session(storage_agent, session_id=session_id, kind="report", name="subgoal_chain_successes.json", payload=subgoal_chain_successes_payload)
+    if avatar_tracking_trace_payload is not None:
+        exports["avatar_tracking_trace_path"] = _persist_session(storage_agent, session_id=session_id, kind="report", name="avatar_tracking_trace.json", payload=avatar_tracking_trace_payload)
+    if avatar_tracking_failures_payload is not None:
+        exports["avatar_tracking_failures_path"] = _persist_session(storage_agent, session_id=session_id, kind="report", name="avatar_tracking_failures.json", payload=avatar_tracking_failures_payload)
+    if graph_edge_quality_summary is not None:
+        exports["graph_edge_quality_summary_path"] = _persist_session(storage_agent, session_id=session_id, kind="report", name="graph_edge_quality_summary.json", payload=graph_edge_quality_summary)
+    if identity_stability_summary is not None:
+        exports["identity_stability_summary_path"] = _persist_session(storage_agent, session_id=session_id, kind="report", name="identity_stability_summary.json", payload=identity_stability_summary)
+    if planner_usable_vs_durable_summary is not None:
+        exports["planner_usable_vs_durable_summary_path"] = _persist_session(storage_agent, session_id=session_id, kind="report", name="planner_usable_vs_durable_summary.json", payload=planner_usable_vs_durable_summary)
     if session_ledger_payload is not None:
         exports["session_ledger_path"] = _persist_session(
             storage_agent,
@@ -1152,6 +1179,95 @@ def export_postrun(storage_agent, *, session_id: str, round_id: int, game_id: st
             "llm_hypothesis": sum(1 for row in llm_proposals.values() if list(dict(row.get("metadata", {}) or {}).get("experiment_contradicts_hypothesis_ids", []) or [])),
         },
     }
+    chain_event_payloads = [
+        {
+            "event_type": str(getattr(record, "event_type", "")),
+            "payload": dict(getattr(record, "payload", {}) or {}),
+            "round_id": int(getattr(record, "round_id", 0) or 0),
+        }
+        for record in ledger_records
+        if str(getattr(record, "event_type", "")).startswith("subgoal chain ")
+    ]
+    chain_started = [row for row in chain_event_payloads if row["event_type"] == "subgoal chain started"]
+    chain_completed = [row for row in chain_event_payloads if row["event_type"] == "subgoal chain completed"]
+    chain_aborted = [row for row in chain_event_payloads if row["event_type"] == "subgoal chain aborted"]
+    chain_step_rows = [row for row in chain_event_payloads if row["event_type"] in {"subgoal chain step completed", "subgoal chain step failed", "subgoal chain advanced"}]
+    subgoal_chains_payload = {
+        "first_chain_selected_per_round": {
+            str(row["round_id"]): dict(row["payload"])
+            for row in chain_started
+        },
+        "chain_completion_rate": _safe_rate(len(chain_completed), max(1, len(chain_started))),
+        "average_steps_completed_per_chain": _safe_rate(sum(1 for row in chain_step_rows if row["event_type"] == "subgoal chain step completed"), max(1, len(chain_started))),
+        "most_common_abort_reason": Counter(str(dict(row["payload"]).get("failure_reason") or "unknown") for row in chain_aborted).most_common(1)[0][0] if chain_aborted else None,
+        "winning_chains_by_source_and_path_type": dict(Counter(
+            f"{dict(row['payload']).get('step_kind') or 'unknown'}"
+            for row in chain_completed
+        )),
+        "events": chain_event_payloads,
+    }
+    subgoal_chain_steps_payload = {"steps": chain_step_rows}
+    subgoal_chain_failures_payload = {"failures": chain_aborted + [row for row in chain_step_rows if row["event_type"] == "subgoal chain step failed"]}
+    subgoal_chain_successes_payload = {"successes": chain_completed + [row for row in chain_step_rows if row["event_type"] == "subgoal chain step completed"]}
+    avatar_event_payloads = [
+        {
+            "event_type": str(getattr(record, "event_type", "")),
+            "round_id": int(getattr(record, "round_id", 0) or 0),
+            "pass_id": int(getattr(record, "pass_id", 0) or 0),
+            "payload": dict(getattr(record, "payload", {}) or {}),
+        }
+        for record in ledger_records
+        if str(getattr(record, "event_type", "")) in {"probe episode executed", "directed episode executed"}
+    ]
+    avatar_confidences = [float(row["payload"].get("avatar_confidence", 0.0) or 0.0) for row in avatar_event_payloads]
+    avatar_sources = Counter(str(row["payload"].get("avatar_source") or "unknown") for row in avatar_event_payloads)
+    avatar_failures = [
+        row for row in avatar_event_payloads
+        if bool(row["payload"].get("avatar_ambiguous", False))
+        or float(row["payload"].get("avatar_confidence", 0.0) or 0.0) < 0.6
+        or str(row["payload"].get("termination_reason") or "") == "avatar_localization_low_confidence"
+    ]
+    avatar_tracking_trace_payload = {
+        "confidence_by_round": {
+            str(row["round_id"]): float(row["payload"].get("avatar_confidence", 0.0) or 0.0)
+            for row in avatar_event_payloads
+            if row["event_type"] == "directed episode executed"
+        },
+        "confidence_by_action_family": {
+            "directed": [float(row["payload"].get("avatar_confidence", 0.0) or 0.0) for row in avatar_event_payloads if row["event_type"] == "directed episode executed"],
+            "probe": [float(row["payload"].get("avatar_confidence", 0.0) or 0.0) for row in avatar_event_payloads if row["event_type"] == "probe episode executed"],
+        },
+        "fallback_usage_count": int(avatar_sources.get("static_fallback", 0)),
+        "ambiguous_localization_count": sum(1 for row in avatar_event_payloads if bool(row["payload"].get("avatar_ambiguous", False))),
+        "route_failures_due_to_avatar_uncertainty": sum(1 for row in avatar_event_payloads if str(row["payload"].get("termination_reason") or "") == "avatar_localization_low_confidence"),
+        "trigger_exit_evidence_downgraded_count": sum(1 for row in avatar_event_payloads if float(row["payload"].get("avatar_confidence", 0.0) or 0.0) < 0.6),
+        "average_confidence": (sum(avatar_confidences) / float(len(avatar_confidences))) if avatar_confidences else 0.0,
+        "events": avatar_event_payloads,
+    }
+    avatar_tracking_failures_payload = {"failures": avatar_failures}
+    graph_edge_quality_summary = {
+        "edge_count_by_family": dict(Counter(str(row.get("edge_kind") or "unknown") for row in mechanic_edges)),
+        "repeated_support_edge_rate": _safe_rate(sum(1 for row in mechanic_edges if int(row.get("support_count", 0) or 0) >= 2), max(1, len(mechanic_edges))),
+        "contradiction_rate_by_edge_family": {
+            family: _safe_rate(sum(1 for row in mechanic_edges if str(row.get("edge_kind") or "") == family and int(row.get("contradiction_count", 0) or 0) > 0), max(1, sum(1 for row in mechanic_edges if str(row.get("edge_kind") or "") == family)))
+            for family in {str(row.get("edge_kind") or "unknown") for row in mechanic_edges}
+        },
+        "counterfactual_supported_edge_rate": _safe_rate(sum(1 for row in mechanic_edges if int(row.get("counterfactual_support_count", 0) or 0) > 0), max(1, len(mechanic_edges))),
+        "directed_outcome_supported_edge_rate": _safe_rate(sum(1 for row in mechanic_edges if int(row.get("directed_outcome_support_count", 0) or 0) > 0), max(1, len(mechanic_edges))),
+        "exit_attempt_supported_edge_rate": _safe_rate(sum(1 for row in mechanic_edges if int(row.get("exit_attempt_support_count", 0) or 0) > 0), max(1, len(mechanic_edges))),
+    }
+    identity_rows = [poi for row in episodes for poi in list(row.get("pois", []) or []) if isinstance(poi, dict)]
+    identity_stability_summary = {
+        "stable_identity_rate": _safe_rate(sum(1 for row in identity_rows if float(row.get("identity_confidence", 0.0) or 0.0) >= 0.75), max(1, len(identity_rows))),
+        "ambiguous_identity_rate": _safe_rate(sum(1 for row in identity_rows if str(row.get("identity_status") or "") == "ambiguous_match"), max(1, len(identity_rows))),
+        "new_entity_rate": _safe_rate(sum(1 for row in identity_rows if str(row.get("identity_status") or "") == "new_entity"), max(1, len(identity_rows))),
+        "identity_status_counts": dict(Counter(str(row.get("identity_status") or "unknown") for row in identity_rows)),
+    }
+    planner_usable_vs_durable_summary = {
+        "planner_usable_count": sum(1 for state in dict(latest_registry.get("planner_usable_state", {})).values() if str(state or "") == "planner_usable"),
+        "durable_ready_count": sum(1 for state in dict(latest_registry.get("durable_ready_state", {})).values() if str(state or "") == "durable_ready"),
+        "validated_count": sum(1 for state in dict(latest_registry.get("validation_state", {})).values() if str(state or "") == "validated"),
+    }
     return persist_postrun_outputs(
         storage_agent,
         session_id=session_id,
@@ -1177,4 +1293,13 @@ def export_postrun(storage_agent, *, session_id: str, round_id: int, game_id: st
         llm_usage_summary=llm_usage_summary,
         hypothesis_lifecycle_summary=hypothesis_lifecycle_summary,
         experiment_results_summary=experiment_results_summary,
+        subgoal_chains_payload=subgoal_chains_payload,
+        subgoal_chain_steps_payload=subgoal_chain_steps_payload,
+        subgoal_chain_failures_payload=subgoal_chain_failures_payload,
+        subgoal_chain_successes_payload=subgoal_chain_successes_payload,
+        avatar_tracking_trace_payload=avatar_tracking_trace_payload,
+        avatar_tracking_failures_payload=avatar_tracking_failures_payload,
+        graph_edge_quality_summary=graph_edge_quality_summary,
+        identity_stability_summary=identity_stability_summary,
+        planner_usable_vs_durable_summary=planner_usable_vs_durable_summary,
     )

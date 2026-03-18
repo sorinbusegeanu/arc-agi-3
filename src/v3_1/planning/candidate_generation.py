@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from v3_1.planning.subgoal_chain import build_step
 from v3_1.planning.belief_builder import normalized_route_signature, normalized_target_key, normalized_trigger_zone_key
 from v3_1.utils.ids import stable_digest
 
@@ -27,6 +28,10 @@ GENERATION_QUOTAS = {
 
 def _candidate_id(payload: dict) -> str:
     return f"candidate:{stable_digest(payload)}"
+
+
+def _movement_avatar_enabled(belief: dict) -> bool:
+    return str(belief.get("control_mode") or "unknown") == "movement_avatar" and str(belief.get("avatar_runtime_status") or "unknown") == "present"
 
 
 def _available_action_families(belief: dict) -> set[str]:
@@ -108,6 +113,8 @@ def _candidate_schema(*, target: dict | None, belief: dict, objective_type: str,
     target_entity_id = str(target.get("entity_id")) if target.get("entity_id") is not None else None
     target_area_id = str(target.get("area_id")) if target.get("area_id") is not None else belief.get("current_area_id")
     target_entity_class = str(target.get("kind") or target.get("poi_class") or "unknown")
+    identity_confidence = float(target.get("identity_confidence", 0.0) or 0.0)
+    identity_status = str(target.get("identity_status") or "unknown")
     route_signature = normalized_route_signature(
         objective_type=objective_type,
         navigation_mode=navigation_mode,
@@ -153,6 +160,11 @@ def _candidate_schema(*, target: dict | None, belief: dict, objective_type: str,
     prior_row = dict(belief.get("durable_prior_view", {}).get("per_target", {}).get(prior_key, {}))
     prior_support = min(1.0, float(prior_row.get("poi_pattern", {}).get("observations", 0) or 0) / 10.0) if prior_row else 0.0
     expected_progress_type = "state_change" if objective_type in {"interact", "test_trigger"} else "evidence_gain" if objective_type in {"gather_local_info", "probe_route"} else "route_progress" if objective_type in {"explore_frontier", "recover"} else "fallback"
+    candidate_intent_mode = (
+        "validation" if objective_type in {"test_trigger", "verify_panel_state", "verify_gate_match", "state_sync_probe"}
+        else "information_gathering" if objective_type in {"gather_local_info", "probe_route", "unlock_trigger"}
+        else "progress"
+    )
     return {
         "candidate_id": _candidate_id(stable_key),
         "candidate_class": candidate_class,
@@ -167,6 +179,7 @@ def _candidate_schema(*, target: dict | None, belief: dict, objective_type: str,
         "target_entity_class": target_entity_class,
         "required_action_family": execution_mode,
         "effect_action_family": str(target.get("candidate_effect_mode") or execution_mode),
+        "candidate_intent_mode": candidate_intent_mode,
         "candidate_context": {
             "avatar_area": belief.get("local_context_view", {}).get("current_area_id"),
             "local_area": belief.get("current_area_id"),
@@ -210,6 +223,8 @@ def _candidate_schema(*, target: dict | None, belief: dict, objective_type: str,
         "distance_score": float(target.get("distance_score", 0.0)),
         "motion_variance": float(target.get("motion_variance", 0.0)),
         "motion_score": float(target.get("motion_score", 0.0)),
+        "identity_confidence": identity_confidence,
+        "identity_status": identity_status,
         "reachable_now": bool(target.get("reachable_now")),
         "reachable_later": bool(target.get("reachable_later")),
         "rationale": rationale,
@@ -229,6 +244,132 @@ def _seeded_candidate(row: dict, *, seed_contract: str, observed_row_ids: list[s
     return payload
 
 
+def _node_step_kind(node_id: str) -> str:
+    text = str(node_id or "").lower()
+    if ":trigger" in text or "trigger" in text or "button" in text:
+        return "go_to_trigger"
+    if ":panel" in text or "panel" in text or "symbol" in text:
+        return "verify_panel"
+    if ":gate" in text or "gate" in text or "door" in text:
+        return "verify_gate"
+    if ":exit" in text or "exit" in text:
+        return "attempt_exit"
+    return "reobserve_region"
+
+
+def _is_executable_node_id(node_id: str) -> bool:
+    step_kind = _node_step_kind(node_id)
+    return step_kind in {"go_to_trigger", "verify_panel", "verify_gate", "attempt_exit"}
+
+
+def _executable_chain_nodes(node_ids: list[str]) -> list[str]:
+    return [str(node_id) for node_id in list(node_ids or []) if node_id and _is_executable_node_id(str(node_id))]
+
+
+def _step_expectations(step_kind: str, target_node_id: str) -> tuple[list[str], list[str], list[str]]:
+    if step_kind == "go_to_trigger":
+        return (["objective_contact_observed", f"node:{target_node_id}:contact"], ["contact_observed"], ["blocked", "missing_target"])
+    if step_kind == "verify_panel":
+        return ([f"node:{target_node_id}:pattern_seen", "target_presence_observed"], ["expected_match_seen", "panel_state_seen"], ["expected_match_missing", "missing_target"])
+    if step_kind == "verify_gate":
+        return ([f"node:{target_node_id}:gate_state", "target_presence_observed"], ["gate_state_changed_after_trigger", "gate_presence_seen"], ["missing_target", "contradiction_seen"])
+    if step_kind == "attempt_exit":
+        return ([f"node:{target_node_id}:exit_attempt", "done_observed"], ["objective_contact_observed", "done_observed"], ["blocked", "exit_failure"])
+    return ([f"node:{target_node_id}:reobserved"], ["target_presence_observed"], ["missing_target"])
+
+
+def _build_candidate_step_plan(*, chain_nodes: list[str], source_label: str) -> tuple[list[dict], list[str], list[str], list[str], list[str], float]:
+    steps = []
+    verification_points: list[str] = []
+    step_kinds: list[str] = []
+    aggregated_expected_evidence: list[str] = []
+    fallback_targets: list[str] = []
+    previous_step_ids: list[str] = []
+    for node_id in list(chain_nodes or []):
+        if not node_id:
+            continue
+        step_kind = _node_step_kind(str(node_id))
+        step_expected_evidence, success_conditions, failure_conditions = _step_expectations(step_kind, str(node_id))
+        fallback_target = chain_nodes[min(len(chain_nodes) - 1, len(previous_step_ids))] if chain_nodes else None
+        step = build_step(
+            step_kind=step_kind,
+            target_node_id=str(node_id),
+            expected_evidence=step_expected_evidence,
+            success_conditions=success_conditions,
+            failure_conditions=failure_conditions,
+            retry_budget=2 if step_kind in {"go_to_trigger", "retry_trigger", "reobserve_region"} else 1,
+            depends_on_step_ids=previous_step_ids,
+            verification_points=[f"{source_label}:{node_id}:{step_kind}"],
+            fallback_targets=[fallback_target] if fallback_target else [],
+        )
+        steps.append(step.to_dict())
+        previous_step_ids.append(step.step_id)
+        step_kinds.append(step_kind)
+        verification_points.extend(list(step.verification_points))
+        aggregated_expected_evidence.extend(list(step.expected_evidence))
+        if fallback_target:
+            fallback_targets.append(str(fallback_target))
+    execution_feasibility = min(1.0, (0.25 * len(steps)) + (0.08 * len(verification_points)) - (0.05 * max(0, len(steps) - 4)))
+    return steps, step_kinds, verification_points, list(dict.fromkeys(aggregated_expected_evidence)), list(dict.fromkeys(fallback_targets)), max(0.0, execution_feasibility)
+
+
+def _graph_target_from_node_id(belief: dict, node_id: str) -> dict:
+    lookup = dict(belief.get("mechanic_graph_node_lookup", {}) or {})
+    row = dict(lookup.get(str(node_id), {}) or {})
+    metadata = dict(row.get("metadata", {}) or {})
+    centroid = list(metadata.get("centroid", [0, 0]) or [0, 0])
+    bbox = dict(metadata.get("bbox", {}) or {})
+    object_ref = str(row.get("object_ref") or "") or str(node_id or "")
+    node_kind = str(row.get("node_kind") or "poi")
+    return {
+        "entity_id": object_ref,
+        "area_id": belief.get("current_area_id"),
+        "kind": node_kind,
+        "confidence": float(row.get("confidence", 0.0) or 0.0),
+        "utility": float(row.get("confidence", 0.0) or 0.0),
+        "centroid": centroid,
+        "bbox": bbox,
+        "target_label": node_kind,
+    }
+
+
+def _graph_target_exists_in_world(belief: dict, node_id: str) -> bool:
+    target = _graph_target_from_node_id(belief, node_id)
+    entity_id = str(target.get("entity_id") or "")
+    if not entity_id:
+        return False
+    observed_world = dict(belief.get("observed_world", {}) or {})
+    hypothesized_world = dict(belief.get("hypothesized_world", {}) or {})
+    observed_entities = dict(observed_world.get("entities", {}) or {})
+    hypothesized_entities = dict(hypothesized_world.get("entities", {}) or {})
+    return entity_id in observed_entities or entity_id in hypothesized_entities
+
+
+def _synthetic_trigger_only_node(belief: dict, node_id: str) -> bool:
+    lookup = dict(belief.get("mechanic_graph_node_lookup", {}) or {})
+    row = dict(lookup.get(str(node_id), {}) or {})
+    if str(row.get("node_kind") or "") != "trigger":
+        return False
+    object_ref = str(row.get("object_ref") or "")
+    evidence_tier = str(row.get("evidence_tier") or "hypothesized")
+    support_count = int(row.get("support_count", 0) or 0)
+    return object_ref.startswith("trigger:") and evidence_tier != "observed" and support_count <= 1
+
+
+def _strong_full_chain_seed(belief: dict, node_id: str) -> bool:
+    lookup = dict(belief.get("mechanic_graph_node_lookup", {}) or {})
+    row = dict(lookup.get(str(node_id), {}) or {})
+    if not row:
+        return False
+    if str(row.get("node_kind") or "") != "trigger":
+        return True
+    return bool(
+        row.get("object_backed", False)
+        and not bool(row.get("synthetic_region_only", False))
+        and int(row.get("observed_support_count", 0) or 0) > 0
+    )
+
+
 def generate_candidates(
     skill_library: dict[str, dict],
     belief: dict,
@@ -243,6 +384,8 @@ def generate_candidates(
     diagnostics = {"count_by_class": {}, "dropped_during_generation": 0, "unsupported_template_count": 0}
     class_counts: dict[str, int] = {}
     available_families = _available_action_families(belief)
+    movement_avatar_enabled = _movement_avatar_enabled(belief)
+    planning_mode = str(belief.get("planning_mode") or "default_progress")
 
     def _admit(row: dict | None) -> None:
         if row is None:
@@ -279,20 +422,65 @@ def generate_candidates(
     def _row_id(target: dict) -> str | None:
         return str(target.get("entity_id") or target.get("trigger_id") or target.get("node_id") or target.get("edge_id") or "") or None
 
-    mechanic_paths = list(belief.get("mechanic_graph_paths_to_exit", []) or [])
-    mechanic_match_relations = list(belief.get("mechanic_graph_match_relations", []) or [])
-    mechanic_trigger_candidates = list(belief.get("mechanic_graph_trigger_candidates", []) or [])
+    mechanic_graph_view = dict(belief.get("mechanic_graph_view", {}) or {})
+    mechanic_paths = list(belief.get("mechanic_graph_paths_to_exit", []) or mechanic_graph_view.get("paths_to_exit", []) or [])
+    mechanic_match_relations = list(belief.get("mechanic_graph_match_relations", []) or mechanic_graph_view.get("match_relations", []) or [])
+    mechanic_trigger_candidates = list(belief.get("mechanic_graph_trigger_candidates", []) or mechanic_graph_view.get("trigger_candidates", []) or [])
     deterministic_hypotheses = dict(belief.get("deterministic_hypotheses", {}) or {})
     llm_hypotheses = dict(belief.get("llm_hypotheses", {}) or {})
+    active_chain_summary = dict(belief.get("active_chain_summary", {}) or {})
+    chain_progress_summary = dict(belief.get("chain_progress_summary", {}) or {})
+
+    if active_chain_summary and movement_avatar_enabled:
+        active_step = dict(chain_progress_summary.get("current_step", {}) or {})
+        chain_steps = list(active_chain_summary.get("steps", []) or [])
+        target_node_id = str(active_step.get("target_node_id") or "") or None
+        candidate = _candidate_schema(
+            target={"entity_id": target_node_id, "area_id": belief.get("current_area_id"), "kind": "poi", "confidence": 0.8, "utility": 0.85},
+            belief=belief,
+            objective_type="unlock_then_exit" if str(active_step.get("step_kind") or "") == "attempt_exit" else "trigger_then_target",
+            execution_mode="interact" if str(active_step.get("step_kind") or "") in {"go_to_trigger", "retry_trigger"} and "interact" in available_families else "move",
+            navigation_mode="routed",
+            rationale="active_subgoal_chain_step",
+            generation_source="subgoal_chain.active_step",
+            supporting_graph_node_ids=[target_node_id] if target_node_id else [],
+            prerequisite_chain=[str(row.get("target_node_id") or "") for row in chain_steps if isinstance(row, dict) and row.get("target_node_id")],
+        )
+        candidate["candidate_step_plan"] = chain_steps
+        candidate["candidate_step_kinds"] = [str(row.get("step_kind") or "") for row in chain_steps if isinstance(row, dict)]
+        candidate["candidate_verification_points"] = list(active_step.get("verification_points", []) or [])
+        candidate["candidate_expected_evidence"] = list(active_step.get("expected_evidence", []) or [])
+        candidate["candidate_fallback_targets"] = list(active_step.get("fallback_targets", []) or [])
+        candidate["candidate_execution_feasibility"] = 1.0
+        candidate["source_path_id"] = str(active_chain_summary.get("source_path_id") or "") or None
+        candidate["target_exit_id"] = str(active_chain_summary.get("target_exit_id") or "") or None
+        candidate["expected_outcome_ids"] = list(active_chain_summary.get("expected_outcome_ids", []) or [])
+        candidate["fallback_policy"] = str(active_chain_summary.get("fallback_policy") or "replan")
+        _admit(candidate)
 
     for row in mechanic_paths:
+        if not movement_avatar_enabled:
+            continue
         node_ids = list(row.get("node_ids", []) or [])
         edge_ids = list(row.get("edge_ids", []) or [])
-        if not node_ids:
+        if node_ids and _synthetic_trigger_only_node(belief, str(node_ids[0])) and bool(row.get("hypothesis_only", True)):
             continue
-        target = {"entity_id": node_ids[0], "area_id": belief.get("current_area_id"), "kind": "poi", "confidence": row.get("support_strength", 0.0), "utility": row.get("support_strength", 0.0)}
-        _admit(
-            _candidate_schema(
+        if node_ids and not _strong_full_chain_seed(belief, str(node_ids[0])):
+            continue
+        executable_nodes = _executable_chain_nodes(node_ids)
+        if not executable_nodes:
+            continue
+        if not _graph_target_exists_in_world(belief, executable_nodes[0]):
+            diagnostics["dropped_during_generation"] += 1
+            continue
+        step_plan, step_kinds, verification_points, candidate_expected_evidence, candidate_fallback_targets, candidate_execution_feasibility = _build_candidate_step_plan(chain_nodes=executable_nodes, source_label="mechanic_path")
+        first_step_executability = float(row.get("first_step_executability_score", 0.0) or 0.0)
+        if first_step_executability < 0.45:
+            continue
+        target = _graph_target_from_node_id(belief, executable_nodes[0])
+        target["confidence"] = max(float(target.get("confidence", 0.0) or 0.0), float(row.get("support_strength", 0.0) or 0.0))
+        target["utility"] = max(float(target.get("utility", 0.0) or 0.0), float(row.get("support_strength", 0.0) or 0.0))
+        payload = _candidate_schema(
                 target=target,
                 belief=belief,
                 objective_type="unlock_then_exit",
@@ -300,20 +488,43 @@ def generate_candidates(
                 navigation_mode="routed",
                 rationale="mechanic_path_to_exit",
                 generation_source="mechanic_graph.paths_to_exit",
-                supporting_graph_node_ids=node_ids,
+                supporting_graph_node_ids=executable_nodes,
                 supporting_graph_edge_ids=edge_ids,
                 graph_hop_count=max(0, len(edge_ids)),
-                prerequisite_chain=node_ids,
+                prerequisite_chain=executable_nodes,
                 hypothesized_only_dependency=bool(row.get("hypothesis_only")),
             )
-        )
+        payload["candidate_step_plan"] = step_plan
+        payload["candidate_step_kinds"] = step_kinds
+        payload["candidate_verification_points"] = verification_points
+        payload["candidate_expected_evidence"] = candidate_expected_evidence
+        payload["candidate_fallback_targets"] = candidate_fallback_targets
+        payload["candidate_execution_feasibility"] = candidate_execution_feasibility
+        payload["first_step_executability_score"] = first_step_executability
+        payload["evidence_diversity_score"] = float(row.get("evidence_diversity_score", 0.0) or 0.0)
+        payload["counterfactual_strength"] = float(row.get("counterfactual_strength", 0.0) or 0.0)
+        payload["execution_feasibility_score"] = float(row.get("execution_feasibility_score", candidate_execution_feasibility) or candidate_execution_feasibility)
+        payload["source_path_id"] = str(row.get("path_id") or stable_digest((tuple(executable_nodes), tuple(edge_ids))))
+        payload["target_exit_id"] = str(executable_nodes[-1]) if executable_nodes else None
+        payload["expected_outcome_ids"] = [f"edge:{edge_id}" for edge_id in edge_ids]
+        payload["fallback_policy"] = "replan"
+        _admit(payload)
 
     for row in mechanic_trigger_candidates:
+        if not movement_avatar_enabled:
+            continue
         trigger_node_id = row.get("trigger_node_id")
         paths = list(row.get("paths_to_exit", []) or [])
-        target = {"entity_id": trigger_node_id, "area_id": belief.get("current_area_id"), "kind": "trigger", "confidence": 0.5, "utility": 0.6}
-        _admit(
-            _candidate_schema(
+        if not _is_executable_node_id(str(trigger_node_id or "")):
+            continue
+        if not _graph_target_exists_in_world(belief, str(trigger_node_id or "")):
+            diagnostics["dropped_during_generation"] += 1
+            continue
+        step_plan, step_kinds, verification_points, candidate_expected_evidence, candidate_fallback_targets, candidate_execution_feasibility = _build_candidate_step_plan(chain_nodes=[trigger_node_id], source_label="trigger_candidate")
+        target = _graph_target_from_node_id(belief, str(trigger_node_id))
+        target["confidence"] = max(float(target.get("confidence", 0.0) or 0.0), 0.5)
+        target["utility"] = max(float(target.get("utility", 0.0) or 0.0), 0.6)
+        payload = _candidate_schema(
                 target=target,
                 belief=belief,
                 objective_type="unlock_trigger",
@@ -327,16 +538,31 @@ def generate_candidates(
                 prerequisite_chain=[trigger_node_id],
                 hypothesized_only_dependency=all(bool(path.get("hypothesis_only")) for path in paths) if paths else False,
             )
-        )
+        payload["candidate_step_plan"] = step_plan
+        payload["candidate_step_kinds"] = step_kinds
+        payload["candidate_verification_points"] = verification_points
+        payload["candidate_expected_evidence"] = candidate_expected_evidence
+        payload["candidate_fallback_targets"] = candidate_fallback_targets
+        payload["candidate_execution_feasibility"] = candidate_execution_feasibility
+        payload["source_path_id"] = str(row.get("trigger_node_id") or "")
+        payload["target_exit_id"] = None
+        payload["expected_outcome_ids"] = [f"path:{idx}" for idx, _ in enumerate(paths)]
+        payload["fallback_policy"] = "retry_or_replan"
+        _admit(payload)
 
     for row in mechanic_match_relations:
+        if not movement_avatar_enabled:
+            continue
         panel_node_id = row.get("panel_node_id")
         edges = list(row.get("match_edges", []) or [])
         if not panel_node_id or not edges:
             continue
-        _admit(
-            _candidate_schema(
-                target={"entity_id": panel_node_id, "area_id": belief.get("current_area_id"), "kind": "panel", "confidence": 0.45, "utility": 0.5},
+        if not _graph_target_exists_in_world(belief, str(panel_node_id)):
+            diagnostics["dropped_during_generation"] += 1
+            continue
+        step_plan, step_kinds, verification_points, candidate_expected_evidence, candidate_fallback_targets, candidate_execution_feasibility = _build_candidate_step_plan(chain_nodes=[panel_node_id], source_label="match_relation")
+        payload = _candidate_schema(
+                target={**_graph_target_from_node_id(belief, str(panel_node_id)), "confidence": max(float(_graph_target_from_node_id(belief, str(panel_node_id)).get("confidence", 0.0) or 0.0), 0.45), "utility": max(float(_graph_target_from_node_id(belief, str(panel_node_id)).get("utility", 0.0) or 0.0), 0.5)},
                 belief=belief,
                 objective_type="verify_panel_state",
                 execution_mode="move",
@@ -349,33 +575,55 @@ def generate_candidates(
                 prerequisite_chain=[panel_node_id],
                 hypothesized_only_dependency=all(str(edge.get("evidence_tier") or "") != "observed" for edge in edges),
             )
-        )
+        payload["candidate_step_plan"] = step_plan
+        payload["candidate_step_kinds"] = step_kinds
+        payload["candidate_verification_points"] = verification_points
+        payload["candidate_expected_evidence"] = candidate_expected_evidence
+        payload["candidate_fallback_targets"] = candidate_fallback_targets
+        payload["candidate_execution_feasibility"] = candidate_execution_feasibility
+        payload["source_path_id"] = str(panel_node_id)
+        payload["target_exit_id"] = None
+        payload["expected_outcome_ids"] = [str(edge.get("edge_id") or "") for edge in edges if edge.get("edge_id")]
+        payload["fallback_policy"] = "reobserve"
+        _admit(payload)
 
     for proposal in deterministic_hypotheses.values():
+        if not movement_avatar_enabled:
+            continue
         proposal_kind = str(proposal.get("proposal_kind") or "")
         objective_type = "mechanic_test_deterministic" if proposal_kind == "test" else "mechanic_chain_deterministic"
         source_ids = [str(proposal.get("proposal_id") or "")]
         chain = [str(proposal.get("src_node_id") or ""), str(proposal.get("dst_node_id") or "")]
-        _admit(
-            _candidate_schema(
-                target={"entity_id": proposal.get("src_node_id"), "area_id": belief.get("current_area_id"), "kind": "poi", "confidence": proposal.get("confidence", 0.0), "utility": proposal.get("confidence", 0.0)},
+        executable_nodes = _executable_chain_nodes(chain)
+        if not executable_nodes:
+            diagnostics["dropped_during_generation"] += 1
+            continue
+        if not _graph_target_exists_in_world(belief, executable_nodes[0]):
+            diagnostics["dropped_during_generation"] += 1
+            continue
+        if not _strong_full_chain_seed(belief, executable_nodes[0]):
+            diagnostics["dropped_during_generation"] += 1
+            continue
+        step_plan, step_kinds, verification_points, candidate_expected_evidence, candidate_fallback_targets, candidate_execution_feasibility = _build_candidate_step_plan(chain_nodes=executable_nodes, source_label="deterministic")
+        payload = _candidate_schema(
+                target={**_graph_target_from_node_id(belief, executable_nodes[0]), "confidence": max(float(_graph_target_from_node_id(belief, executable_nodes[0]).get("confidence", 0.0) or 0.0), float(proposal.get("confidence", 0.0) or 0.0)), "utility": max(float(_graph_target_from_node_id(belief, executable_nodes[0]).get("utility", 0.0) or 0.0), float(proposal.get("confidence", 0.0) or 0.0))},
                 belief=belief,
                 objective_type=objective_type,
                 execution_mode="move",
                 navigation_mode="routed",
                 rationale="deterministic_hypothesis_candidate",
                 generation_source="hypothesis.deterministic",
-                supporting_graph_node_ids=chain,
+                supporting_graph_node_ids=executable_nodes,
                 supporting_graph_edge_ids=list(proposal.get("expected_edge_ids", []) or []),
-                graph_hop_count=max(0, len(chain) - 1),
-                prerequisite_chain=chain,
+                graph_hop_count=max(0, len(executable_nodes) - 1),
+                prerequisite_chain=executable_nodes,
                 hypothesized_only_dependency=True,
                 action_overrides={
                     "hypothesis_source": "deterministic",
                     "supporting_hypothesis_ids": source_ids,
                     "requires_validation": bool(proposal.get("requires_validation", True)),
                     "expected_information_gain": float(proposal.get("expected_information_gain", 0.4) or 0.4),
-                    "chain_length": max(0, len(chain) - 1),
+                    "chain_length": max(0, len(executable_nodes) - 1),
                     "dependency_path_ids": source_ids,
                     "test_proposal_id": str(proposal.get("test_id") or proposal.get("proposal_id") or "") if proposal_kind == "test" else None,
                     "target_node_ids": list(proposal.get("target_node_ids", []) or []),
@@ -383,9 +631,21 @@ def generate_candidates(
                     "discriminates_between_proposal_ids": list(proposal.get("discriminates_between_proposal_ids", []) or []),
                 },
             )
-        )
+        payload["candidate_step_plan"] = step_plan
+        payload["candidate_step_kinds"] = step_kinds
+        payload["candidate_verification_points"] = verification_points
+        payload["candidate_expected_evidence"] = candidate_expected_evidence
+        payload["candidate_fallback_targets"] = candidate_fallback_targets
+        payload["candidate_execution_feasibility"] = candidate_execution_feasibility
+        payload["source_path_id"] = str(proposal.get("proposal_id") or "")
+        payload["target_exit_id"] = str(executable_nodes[-1]) if executable_nodes else None
+        payload["expected_outcome_ids"] = list(proposal.get("expected_edge_ids", []) or [])
+        payload["fallback_policy"] = "replan"
+        _admit(payload)
 
     for proposal in llm_hypotheses.values():
+        if not movement_avatar_enabled:
+            continue
         proposal_kind = str(proposal.get("proposal_kind") or "")
         validation_state = str(dict(belief.get("hypothesis_registry_snapshot", {}) or {}).get("validation_state", {}).get(str(proposal.get("proposal_id") or ""), "new"))
         if proposal_kind == "test" and validation_state != "validated":
@@ -393,26 +653,36 @@ def generate_candidates(
         objective_type = "mechanic_test_llm" if proposal_kind == "test" else "mechanic_chain_llm"
         source_ids = [str(proposal.get("proposal_id") or "")]
         chain = [str(proposal.get("src_node_id") or ""), str(proposal.get("dst_node_id") or "")]
-        _admit(
-            _candidate_schema(
-                target={"entity_id": proposal.get("src_node_id"), "area_id": belief.get("current_area_id"), "kind": "poi", "confidence": proposal.get("confidence", 0.0), "utility": proposal.get("confidence", 0.0)},
+        executable_nodes = _executable_chain_nodes(chain)
+        if not executable_nodes:
+            diagnostics["dropped_during_generation"] += 1
+            continue
+        if not _graph_target_exists_in_world(belief, executable_nodes[0]):
+            diagnostics["dropped_during_generation"] += 1
+            continue
+        if not _strong_full_chain_seed(belief, executable_nodes[0]):
+            diagnostics["dropped_during_generation"] += 1
+            continue
+        step_plan, step_kinds, verification_points, candidate_expected_evidence, candidate_fallback_targets, candidate_execution_feasibility = _build_candidate_step_plan(chain_nodes=executable_nodes, source_label="llm")
+        payload = _candidate_schema(
+                target={**_graph_target_from_node_id(belief, executable_nodes[0]), "confidence": max(float(_graph_target_from_node_id(belief, executable_nodes[0]).get("confidence", 0.0) or 0.0), float(proposal.get("confidence", 0.0) or 0.0)), "utility": max(float(_graph_target_from_node_id(belief, executable_nodes[0]).get("utility", 0.0) or 0.0), float(proposal.get("confidence", 0.0) or 0.0))},
                 belief=belief,
                 objective_type=objective_type,
                 execution_mode="move",
                 navigation_mode="routed",
                 rationale="llm_hypothesis_candidate",
                 generation_source="hypothesis.llm",
-                supporting_graph_node_ids=chain,
+                supporting_graph_node_ids=executable_nodes,
                 supporting_graph_edge_ids=list(proposal.get("expected_edge_ids", []) or []),
-                graph_hop_count=max(0, len(chain) - 1),
-                prerequisite_chain=chain,
+                graph_hop_count=max(0, len(executable_nodes) - 1),
+                prerequisite_chain=executable_nodes,
                 hypothesized_only_dependency=True,
                 action_overrides={
                     "hypothesis_source": "llm",
                     "supporting_hypothesis_ids": source_ids,
                     "requires_validation": bool(proposal.get("requires_validation", True)),
                     "expected_information_gain": float(proposal.get("expected_information_gain", 0.3) or 0.3),
-                    "chain_length": max(0, len(chain) - 1),
+                    "chain_length": max(0, len(executable_nodes) - 1),
                     "dependency_path_ids": source_ids,
                     "test_proposal_id": str(proposal.get("test_id") or proposal.get("proposal_id") or "") if proposal_kind == "test" else None,
                     "target_node_ids": list(proposal.get("target_node_ids", []) or []),
@@ -420,7 +690,17 @@ def generate_candidates(
                     "discriminates_between_proposal_ids": list(proposal.get("discriminates_between_proposal_ids", []) or []),
                 },
             )
-        )
+        payload["candidate_step_plan"] = step_plan
+        payload["candidate_step_kinds"] = step_kinds
+        payload["candidate_verification_points"] = verification_points
+        payload["candidate_expected_evidence"] = candidate_expected_evidence
+        payload["candidate_fallback_targets"] = candidate_fallback_targets
+        payload["candidate_execution_feasibility"] = candidate_execution_feasibility
+        payload["source_path_id"] = str(proposal.get("proposal_id") or "")
+        payload["target_exit_id"] = str(executable_nodes[-1]) if executable_nodes else None
+        payload["expected_outcome_ids"] = list(proposal.get("expected_edge_ids", []) or [])
+        payload["fallback_policy"] = "replan"
+        _admit(payload)
 
     for target in observed_seeds["reachable_targets"]:
         if "interact" in available_families:
@@ -432,19 +712,24 @@ def generate_candidates(
         if target.get("area_id") != belief.get("current_area_id"):
             continue
         if "interact" in available_families:
-            _admit(_seeded_candidate(_candidate_schema(target=target, belief=belief, objective_type="gather_local_info", execution_mode="interact", navigation_mode="local", rationale="local_probe", generation_source="observed.promising_pois"), seed_contract="observed_only", observed_row_ids=[_row_id(target)]))
+            candidate = _seeded_candidate(_candidate_schema(target=target, belief=belief, objective_type="gather_local_info", execution_mode="interact", navigation_mode="local", rationale="local_probe", generation_source="observed.promising_pois"), seed_contract="observed_only", observed_row_ids=[_row_id(target)])
+            if planning_mode == "structure_acquisition" and str(target.get("poi_class") or target.get("kind") or "") == "structure":
+                candidate["candidate_intent_mode"] = "information_gathering"
+                candidate["utility"] = max(float(candidate.get("utility", 0.0) or 0.0), 0.65)
+                candidate["novelty"] = max(float(candidate.get("novelty", 0.0) or 0.0), 0.35)
+            _admit(candidate)
 
     for target in observed_seeds["frontier_targets"]:
-        if "move" in available_families:
+        if movement_avatar_enabled and "move" in available_families:
             _admit(_seeded_candidate(_candidate_schema(target=target, belief=belief, objective_type="explore_frontier", execution_mode="move", navigation_mode="routed" if not target.get("reachable_now") else "direct", rationale="frontier_target", generation_source="observed.frontier_targets"), seed_contract="observed_only", observed_row_ids=[_row_id(target)]))
 
     for target in observed_seeds["trigger_candidates"]:
-        if "interact" in available_families:
+        if movement_avatar_enabled and "interact" in available_families:
             trigger_zone_id = normalized_trigger_zone_key(entity_id=str(target.get("entity_id")), area_id=str(target.get("area_id")) if target.get("area_id") is not None else None)
             _admit(_seeded_candidate(_candidate_schema(target=target, belief=belief, objective_type="test_trigger", execution_mode="interact", navigation_mode="direct" if target.get("reachable_now") else "routed", rationale="trigger_supported", generation_source="observed.trigger_candidates", trigger_zone_id=trigger_zone_id), seed_contract="observed_only", observed_row_ids=[_row_id(target), trigger_zone_id]))
 
     for target in observed_seeds["recovery_candidates"]:
-        if "move" in available_families:
+        if movement_avatar_enabled and "move" in available_families:
             _admit(_seeded_candidate(_candidate_schema(target=target, belief=belief, objective_type="recover", execution_mode="move", navigation_mode="routed", rationale="recovery_target", generation_source="observed.recovery_candidates"), seed_contract="observed_only", observed_row_ids=[_row_id(target)]))
 
     for target in hypothesis_seeds["reachable_targets"]:
@@ -457,22 +742,27 @@ def generate_candidates(
         if target.get("area_id") != belief.get("current_area_id"):
             continue
         if "interact" in available_families:
-            _admit(_seeded_candidate(_candidate_schema(target=target, belief=belief, objective_type="gather_local_info", execution_mode="interact", navigation_mode="local", rationale="hypothesis_local_probe", generation_source="hypothesis.promising_pois"), seed_contract="hypothesis_backfill", hypothesis_row_ids=[_row_id(target)]))
+            candidate = _seeded_candidate(_candidate_schema(target=target, belief=belief, objective_type="gather_local_info", execution_mode="interact", navigation_mode="local", rationale="hypothesis_local_probe", generation_source="hypothesis.promising_pois"), seed_contract="hypothesis_backfill", hypothesis_row_ids=[_row_id(target)])
+            if planning_mode == "structure_acquisition" and str(target.get("poi_class") or target.get("kind") or "") == "structure":
+                candidate["candidate_intent_mode"] = "information_gathering"
+                candidate["utility"] = max(float(candidate.get("utility", 0.0) or 0.0), 0.5)
+                candidate["novelty"] = max(float(candidate.get("novelty", 0.0) or 0.0), 0.25)
+            _admit(candidate)
 
     for target in hypothesis_seeds["frontier_targets"]:
-        if "move" in available_families:
+        if movement_avatar_enabled and "move" in available_families:
             _admit(_seeded_candidate(_candidate_schema(target=target, belief=belief, objective_type="explore_frontier", execution_mode="move", navigation_mode="routed" if not target.get("reachable_now") else "direct", rationale="hypothesis_frontier_target", generation_source="hypothesis.frontier_targets"), seed_contract="hypothesis_backfill", hypothesis_row_ids=[_row_id(target)]))
 
     for target in hypothesis_seeds["trigger_candidates"]:
-        if "interact" in available_families:
+        if movement_avatar_enabled and "interact" in available_families:
             trigger_zone_id = normalized_trigger_zone_key(entity_id=str(target.get("entity_id")), area_id=str(target.get("area_id")) if target.get("area_id") is not None else None)
             _admit(_seeded_candidate(_candidate_schema(target=target, belief=belief, objective_type="test_trigger", execution_mode="interact", navigation_mode="direct" if target.get("reachable_now") else "routed", rationale="hypothesis_trigger_supported", generation_source="hypothesis.trigger_candidates", trigger_zone_id=trigger_zone_id), seed_contract="hypothesis_backfill", hypothesis_row_ids=[_row_id(target), trigger_zone_id]))
 
     for target in hypothesis_seeds["recovery_candidates"]:
-        if "move" in available_families:
+        if movement_avatar_enabled and "move" in available_families:
             _admit(_seeded_candidate(_candidate_schema(target=target, belief=belief, objective_type="recover", execution_mode="move", navigation_mode="routed", rationale="hypothesis_recovery_target", generation_source="hypothesis.recovery_candidates"), seed_contract="hypothesis_backfill", hypothesis_row_ids=[_row_id(target)]))
 
-    if "move" in available_families:
+    if movement_avatar_enabled and "move" in available_families:
         observed_consequences = list(observed_world.get("consequences", {}).values()) if isinstance(observed_world.get("consequences"), dict) else list(observed_world.get("consequences", []))
         hypothesized_consequences = list(hypothesized_world.get("consequences", {}).values()) if isinstance(hypothesized_world.get("consequences"), dict) else list(hypothesized_world.get("consequences", []))
         consequence_groups: dict[str, dict[str, list[dict]]] = {}
@@ -506,7 +796,28 @@ def generate_candidates(
             route_candidate["route_probe_observed_consequence_ids"] = observed_ids
             route_candidate["route_probe_hypothesis_consequence_ids"] = hypothesis_ids
             route_candidate["route_probe_used_compatibility_fallback"] = False
+            if planning_mode == "structure_acquisition":
+                route_candidate["candidate_intent_mode"] = "information_gathering"
             _admit(route_candidate)
+
+    if planning_mode == "structure_acquisition":
+        for target in observed_seeds["frontier_targets"][:4]:
+            if movement_avatar_enabled and "move" in available_families:
+                candidate = _seeded_candidate(
+                    _candidate_schema(
+                        target={**dict(target), "utility": max(float(target.get("utility", 0.0) or 0.0), 0.55), "novelty": max(float(target.get("novelty", 0.0) or 0.0), 0.4)},
+                        belief=belief,
+                        objective_type="explore_frontier",
+                        execution_mode="move",
+                        navigation_mode="routed" if not target.get("reachable_now") else "direct",
+                        rationale="structure_acquisition_frontier",
+                        generation_source="observed.frontier_targets.structure_acquisition",
+                    ),
+                    seed_contract="observed_only",
+                    observed_row_ids=[_row_id(target)],
+                )
+                candidate["candidate_intent_mode"] = "information_gathering"
+                _admit(candidate)
 
     _admit(
         _seeded_candidate(_candidate_schema(
@@ -519,7 +830,7 @@ def generate_candidates(
             generation_source="fallback.template",
             action_overrides={"type": "hold_position", "area_id": belief.get("current_area_id")},
             fallback_baseline_penalty=2.0,
-        ), seed_contract="compatibility_fallback", observed_row_ids=[], hypothesis_row_ids=[])
+        ), seed_contract="split_world_native_default", observed_row_ids=[], hypothesis_row_ids=[])
     )
 
     deduped: dict[tuple[str, str | None, str, str], dict] = {}

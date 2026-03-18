@@ -140,7 +140,17 @@ def decision_export_payload(decision, *, available_families: set[str], executed_
             executed_family=executed_family,
         )
         metadata["selected_candidate"] = normalized_selected
-        selected_action = dict(normalized_selected.get("action", {}))
+        selected_action = {
+            **dict(normalized_selected.get("action", {})),
+            "candidate_class": normalized_selected.get("candidate_class"),
+            "objective_type": normalized_selected.get("objective_type"),
+            "execution_mode": normalized_selected.get("execution_mode"),
+            "navigation_mode": normalized_selected.get("navigation_mode"),
+            "target_entity_id": normalized_selected.get("target_entity_id"),
+            "target_area_id": normalized_selected.get("target_area_id"),
+            "required_action_family": normalized_selected.get("required_action_family"),
+            "skill_id": normalized_selected.get("skill_id"),
+        }
     if selected_action is not None:
         selected_action["type"] = executed_family if executed_family in {"move", "interact", "click_at"} else str(selected_action.get("type") or "move")
         selected_action["required_action_family"] = selected_action["type"]
