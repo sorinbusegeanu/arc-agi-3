@@ -18,6 +18,12 @@ def score_deterministic_proposal(proposal) -> dict:
     exit_attempt_evidence_bonus = 0.12 if any("exit" in str(ref.ref_kind or "") for ref in proposal.support_refs) else 0.0
     counterfactual_bonus = 0.14 if any("counterfactual" in str(ref.ref_kind or "") for ref in proposal.support_refs) else 0.0
     repeated_trigger_before_exit_bonus = 0.1 if any("trigger_before_exit" in str(ref.ref_kind or "") for ref in proposal.support_refs) and observed_support_count >= 2 else 0.0
+    repeated_detector_poi_support_bonus = 0.12 if any("poi_visit" in str(ref.ref_kind or "") for ref in proposal.support_refs) and observed_support_count >= 2 else 0.0
+    post_visit_remote_change_bonus = 0.1 if any("poi_visit_then_remote_change" in str(ref.ref_kind or "") for ref in proposal.support_refs) else 0.0
+    post_visit_panel_gate_bonus = 0.1 if any(str(ref.ref_kind or "") in {"poi_visit_then_panel_change", "poi_visit_then_gate_change"} for ref in proposal.support_refs) else 0.0
+    post_visit_exit_shift_bonus = 0.1 if any("poi_visit_then_exit_attempt_change" in str(ref.ref_kind or "") for ref in proposal.support_refs) else 0.0
+    repeated_probe_no_effect_penalty = 0.16 if any("repeated_probe_without_new_effect" in str(ref.ref_kind or "") for ref in proposal.support_refs) else 0.0
+    no_downstream_link_penalty = 0.1 if any("poi_visit" in str(ref.ref_kind or "") for ref in proposal.support_refs) and not any("poi_visit_then_" in str(ref.ref_kind or "") for ref in proposal.support_refs) else 0.0
     confidence = min(
         1.0,
         0.15
@@ -28,9 +34,15 @@ def score_deterministic_proposal(proposal) -> dict:
         + exit_attempt_evidence_bonus
         + counterfactual_bonus
         + repeated_trigger_before_exit_bonus
+        + repeated_detector_poi_support_bonus
+        + post_visit_remote_change_bonus
+        + post_visit_panel_gate_bonus
+        + post_visit_exit_shift_bonus
         - one_episode_only_penalty
         - (0.12 * probe_only_support)
         - unsupported_long_chain_penalty
+        - repeated_probe_no_effect_penalty
+        - no_downstream_link_penalty
         - (0.15 * contradiction_count),
     )
     return {
@@ -48,6 +60,12 @@ def score_deterministic_proposal(proposal) -> dict:
         "exit_attempt_evidence_bonus": exit_attempt_evidence_bonus,
         "counterfactual_bonus": counterfactual_bonus,
         "repeated_trigger_before_exit_bonus": repeated_trigger_before_exit_bonus,
+        "repeated_detector_poi_support_bonus": repeated_detector_poi_support_bonus,
+        "post_visit_remote_change_bonus": post_visit_remote_change_bonus,
+        "post_visit_panel_gate_bonus": post_visit_panel_gate_bonus,
+        "post_visit_exit_shift_bonus": post_visit_exit_shift_bonus,
+        "repeated_probe_no_effect_penalty": repeated_probe_no_effect_penalty,
+        "no_downstream_link_penalty": no_downstream_link_penalty,
         "confidence": confidence,
     }
 

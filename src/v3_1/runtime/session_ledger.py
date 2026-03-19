@@ -36,6 +36,11 @@ EVENT_PAYLOAD_TYPES = {
     "subgoal chain advanced": {"subgoal_chain_advanced"},
     "subgoal chain aborted": {"subgoal_chain_aborted"},
     "subgoal chain completed": {"subgoal_chain_completed"},
+    "detector poi selected": {"detector_poi_escalation"},
+    "detector poi revisited": {"detector_poi_escalation"},
+    "detector poi escalated to verification": {"detector_poi_escalation"},
+    "detector poi escalated to chain": {"detector_poi_escalation"},
+    "detector poi marked stale": {"detector_poi_escalation"},
     "durable flush requested": {"durable_flush"},
     "durable flush completed": {"durable_flush"},
     "stop decision made": {"stop_decision"},
@@ -77,6 +82,9 @@ class PlanSelectedPayload:
     planner_contract_mode: str = "split_world_native"
     strict_blackboard_snapshot_ref: dict[str, Any] = field(default_factory=dict)
     strict_memory_snapshot_ref: dict[str, Any] = field(default_factory=dict)
+    exit_readiness_score: float = 0.0
+    missing_prerequisites: tuple[str, ...] = ()
+    premature_exit_penalty_applied: bool = False
 
 
 @dataclass(frozen=True)
@@ -90,6 +98,10 @@ class EpisodeExecutedPayload:
     avatar_source: str = "unknown"
     avatar_ambiguous: bool = False
     avatar_tracker_status: str = "unknown"
+    exit_readiness_score: float = 0.0
+    missing_prerequisites: tuple[str, ...] = ()
+    failed_without_new_support: bool = False
+    position_hold_detected: bool = False
 
 
 @dataclass(frozen=True)
@@ -169,6 +181,11 @@ class SubgoalChainStartedPayload:
     observed_evidence: tuple[str, ...] = ()
     failure_reason: str | None = None
     advancement_reason: str | None = None
+    exit_readiness_score: float = 0.0
+    missing_prerequisites: tuple[str, ...] = ()
+    premature_exit_penalty_applied: bool = False
+    failed_without_new_support: bool = False
+    position_hold_detected: bool = False
 
 
 @dataclass(frozen=True)
@@ -180,6 +197,11 @@ class SubgoalChainStepPayload:
     observed_evidence: tuple[str, ...] = ()
     failure_reason: str | None = None
     advancement_reason: str | None = None
+    exit_readiness_score: float = 0.0
+    missing_prerequisites: tuple[str, ...] = ()
+    premature_exit_penalty_applied: bool = False
+    failed_without_new_support: bool = False
+    position_hold_detected: bool = False
 
 
 @dataclass(frozen=True)
@@ -191,6 +213,11 @@ class SubgoalChainAdvancedPayload:
     observed_evidence: tuple[str, ...] = ()
     failure_reason: str | None = None
     advancement_reason: str | None = None
+    exit_readiness_score: float = 0.0
+    missing_prerequisites: tuple[str, ...] = ()
+    premature_exit_penalty_applied: bool = False
+    failed_without_new_support: bool = False
+    position_hold_detected: bool = False
 
 
 @dataclass(frozen=True)
@@ -202,6 +229,11 @@ class SubgoalChainAbortedPayload:
     observed_evidence: tuple[str, ...] = ()
     failure_reason: str | None = None
     advancement_reason: str | None = None
+    exit_readiness_score: float = 0.0
+    missing_prerequisites: tuple[str, ...] = ()
+    premature_exit_penalty_applied: bool = False
+    failed_without_new_support: bool = False
+    position_hold_detected: bool = False
 
 
 @dataclass(frozen=True)
@@ -213,6 +245,22 @@ class SubgoalChainCompletedPayload:
     observed_evidence: tuple[str, ...] = ()
     failure_reason: str | None = None
     advancement_reason: str | None = None
+    exit_readiness_score: float = 0.0
+    missing_prerequisites: tuple[str, ...] = ()
+    premature_exit_penalty_applied: bool = False
+    failed_without_new_support: bool = False
+    position_hold_detected: bool = False
+
+
+@dataclass(frozen=True)
+class DetectorPoiEscalationPayload:
+    poi_id: str
+    detector_strength: float = 0.0
+    selection_round: int = 0
+    revisit_count: int = 0
+    downstream_support_gained: dict[str, Any] = field(default_factory=dict)
+    escalation_target_candidate_id: str | None = None
+    stale_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -286,6 +334,7 @@ class SessionLedger:
             SubgoalChainAdvancedPayload: ("subgoal_chain_advanced", "v1", "subgoal_chain_advanced_payload", "v1"),
             SubgoalChainAbortedPayload: ("subgoal_chain_aborted", "v1", "subgoal_chain_aborted_payload", "v1"),
             SubgoalChainCompletedPayload: ("subgoal_chain_completed", "v1", "subgoal_chain_completed_payload", "v1"),
+            DetectorPoiEscalationPayload: ("detector_poi_escalation", "v1", "detector_poi_escalation_payload", "v1"),
             DurableFlushPayload: ("durable_flush", "v1", "durable_flush_payload", "v1"),
             StopDecisionPayload: ("stop_decision", "v1", "stop_decision_payload", "v1"),
         }
@@ -327,6 +376,7 @@ class SessionLedger:
             "subgoal_chain_advanced": (SubgoalChainAdvancedPayload, "v1", "subgoal_chain_advanced_payload", "v1"),
             "subgoal_chain_aborted": (SubgoalChainAbortedPayload, "v1", "subgoal_chain_aborted_payload", "v1"),
             "subgoal_chain_completed": (SubgoalChainCompletedPayload, "v1", "subgoal_chain_completed_payload", "v1"),
+            "detector_poi_escalation": (DetectorPoiEscalationPayload, "v1", "detector_poi_escalation_payload", "v1"),
             "durable_flush": (DurableFlushPayload, "v1", "durable_flush_payload", "v1"),
             "stop_decision": (StopDecisionPayload, "v1", "stop_decision_payload", "v1"),
             "empty": (None, "v1", "empty_payload", "v1"),
@@ -424,6 +474,21 @@ class SessionLedger:
 
     def append_subgoal_chain_completed(self, **kwargs) -> SessionLedgerRecord:
         return self.append(event_type="subgoal chain completed", **kwargs)
+
+    def append_detector_poi_selected(self, **kwargs) -> SessionLedgerRecord:
+        return self.append(event_type="detector poi selected", **kwargs)
+
+    def append_detector_poi_revisited(self, **kwargs) -> SessionLedgerRecord:
+        return self.append(event_type="detector poi revisited", **kwargs)
+
+    def append_detector_poi_escalated_to_verification(self, **kwargs) -> SessionLedgerRecord:
+        return self.append(event_type="detector poi escalated to verification", **kwargs)
+
+    def append_detector_poi_escalated_to_chain(self, **kwargs) -> SessionLedgerRecord:
+        return self.append(event_type="detector poi escalated to chain", **kwargs)
+
+    def append_detector_poi_marked_stale(self, **kwargs) -> SessionLedgerRecord:
+        return self.append(event_type="detector poi marked stale", **kwargs)
 
     def append_durable_flush_completed(self, **kwargs) -> SessionLedgerRecord:
         return self.append(event_type="durable flush completed", **kwargs)

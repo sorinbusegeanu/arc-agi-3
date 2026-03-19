@@ -45,6 +45,11 @@ def _compact_selected_candidate(decision: dict) -> dict:
         "trigger_zone_id": selected.get("trigger_zone_id"),
         "objective_type": selected.get("objective_type"),
         "skill_id": selected.get("skill_id") or selected_action.get("skill_id"),
+        "poi_source_provenance": list(selected.get("poi_source_provenance", []) or []),
+        "confidence": float(selected.get("confidence", 0.0) or 0.0),
+        "reachable_now": bool(selected.get("reachable_now", False)),
+        "reachable_later": bool(selected.get("reachable_later", False)),
+        "approachable_status": selected.get("approachable_status"),
     }
 
 
@@ -91,7 +96,51 @@ def _compact_outcome(outcome: dict | None) -> dict:
     }
 
 
-def update_plan_memory(plan_memory: dict, *, decision: dict | None, outcome: dict | None, blackboard_state: dict, mode: str = "directed") -> dict:
+def _poi_followthrough_metrics(*, target_entity_id: str | None, blackboard_state: dict, mechanic_graph_state: dict | None) -> dict:
+    target_entity_id = str(target_entity_id or "")
+    if not target_entity_id:
+        return {
+            "new_graph_edges": 0,
+            "new_hypothesis_support": 0,
+            "new_verification_candidates": 0,
+            "changed_exit_linked_evidence": 0,
+        }
+    entities = dict(dict(blackboard_state or {}).get("entities", {}) or {})
+    target_row = dict(entities.get(target_entity_id, {}) or {})
+    graph_state = dict(mechanic_graph_state or {})
+    nodes_by_id = dict(graph_state.get("nodes_by_id", {}) or {})
+    edges_by_id = dict(graph_state.get("edges_by_id", {}) or {})
+    linked_node_ids = [
+        str(node_id)
+        for node_id, row in nodes_by_id.items()
+        if str(dict(row).get("object_ref") or "") == target_entity_id
+    ]
+    linked_edges = [
+        dict(edge)
+        for edge in edges_by_id.values()
+        if str(edge.get("src_node_id") or "") in linked_node_ids or str(edge.get("dst_node_id") or "") in linked_node_ids
+    ]
+    new_graph_edges = len(linked_edges)
+    new_verification_candidates = sum(1 for edge in linked_edges if str(edge.get("edge_kind") or "") in {"changes", "matches", "controls_access", "requires", "causes_remote_change"})
+    changed_exit_linked_evidence = sum(
+        1
+        for edge in linked_edges
+        if str(edge.get("edge_kind") or "") in {"requires", "controls_access"}
+        or any(str(dict(nodes_by_id.get(node_id, {})).get("node_kind") or "") == "exit" for node_id in (edge.get("src_node_id"), edge.get("dst_node_id")))
+    )
+    new_hypothesis_support = sum(1 for edge in linked_edges if bool(edge.get("supporting_hypothesis_ids")))
+    return {
+        "new_graph_edges": new_graph_edges,
+        "new_hypothesis_support": new_hypothesis_support,
+        "new_verification_candidates": new_verification_candidates,
+        "changed_exit_linked_evidence": changed_exit_linked_evidence,
+        "detector_strength": float(target_row.get("confidence", 0.0) or 0.0),
+        "reachable": bool(target_row.get("reachable_now")) or bool(target_row.get("reachable_later")),
+        "approachable": str(target_row.get("approachable_status") or "") in {"approachable_now", "approachable_later"},
+    }
+
+
+def update_plan_memory(plan_memory: dict, *, decision: dict | None, outcome: dict | None, blackboard_state: dict, mechanic_graph_state: dict | None = None, mode: str = "directed") -> dict:
     next_state = {
         "history": list(plan_memory.get("history", [])),
         "repeated_failures": _decay_count_map(plan_memory.get("repeated_failures", {})),
@@ -101,6 +150,11 @@ def update_plan_memory(plan_memory: dict, *, decision: dict | None, outcome: dic
         "route_patterns": _decay_stat_rows(plan_memory.get("route_patterns", {}), factor=0.92),
         "candidate_class_performance": _decay_stat_rows(plan_memory.get("candidate_class_performance", {}), factor=0.95),
         "no_progress_rounds": int(plan_memory.get("no_progress_rounds", 0)),
+        "poi_followthrough": {
+            str(key): dict(value)
+            for key, value in dict(plan_memory.get("poi_followthrough", {})).items()
+            if isinstance(value, dict)
+        },
     }
     if decision is None:
         return next_state
@@ -191,6 +245,37 @@ def update_plan_memory(plan_memory: dict, *, decision: dict | None, outcome: dic
         perf["failures"] = int(perf.get("failures", 0)) + (0 if success else 1)
         perf["progress_total"] = float(perf.get("progress_total", 0.0)) + progress
         next_state["candidate_class_performance"][str(candidate_class)] = perf
+    selected_candidate = dict(compact_decision.get("metadata", {}).get("selected_candidate", {}) or {})
+    provenance = {str(value) for value in list(selected_candidate.get("poi_source_provenance", []) or []) if value}
+    if candidate_class == "route_probe" and target_entity_id and "detector" in provenance:
+        poi_id = str(target_entity_id)
+        previous = dict(next_state["poi_followthrough"].get(poi_id, {}) or {})
+        metrics = _poi_followthrough_metrics(target_entity_id=poi_id, blackboard_state=blackboard_state, mechanic_graph_state=mechanic_graph_state)
+        previous_edge_count = int(previous.get("new_graph_edges", 0) or 0)
+        previous_hypothesis_support = int(previous.get("new_hypothesis_support", 0) or 0)
+        previous_verification = int(previous.get("new_verification_candidates", 0) or 0)
+        previous_exit = int(previous.get("changed_exit_linked_evidence", 0) or 0)
+        selection_round = int(previous.get("selection_round", compact_decision.get("round_id") or 0) or 0)
+        selection_rounds = int(previous.get("selection_rounds", 0) or 0) + 1
+        revisit_count = max(0, selection_rounds - 1)
+        new_support_delta = (
+            max(0, int(metrics["new_graph_edges"]) - previous_edge_count)
+            + max(0, int(metrics["new_hypothesis_support"]) - previous_hypothesis_support)
+            + max(0, int(metrics["new_verification_candidates"]) - previous_verification)
+            + max(0, int(metrics["changed_exit_linked_evidence"]) - previous_exit)
+        )
+        next_state["poi_followthrough"][poi_id] = {
+            **previous,
+            **metrics,
+            "poi_id": poi_id,
+            "selection_round": selection_round,
+            "last_selection_round": int(compact_decision.get("round_id") or 0),
+            "selection_rounds": selection_rounds,
+            "revisit_count": revisit_count,
+            "detector_backed": True,
+            "new_support_delta": new_support_delta,
+            "probe_stale": revisit_count >= 1 and new_support_delta <= 0,
+        }
     return next_state
 
 

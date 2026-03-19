@@ -149,6 +149,65 @@ def _frontier_ranked_rows(frontier: list[dict]) -> list[dict]:
     return ranked
 
 
+def _suppress_redundant_poi_siblings(rows: list[dict]) -> list[dict]:
+    grouped: dict[str, list[dict]] = {}
+    for row in list(rows or []):
+        grouped.setdefault(str(row.get("parent_poi_id") or row.get("entity_id") or ""), []).append(row)
+    selected: list[dict] = []
+    for siblings in grouped.values():
+        children = [row for row in siblings if int(row.get("poi_hierarchy_level", 0) or 0) > 0]
+        if children:
+            children.sort(
+                key=lambda row: (
+                    not bool(row.get("reachable_now")),
+                    not bool(row.get("reachable_later")),
+                    -float(row.get("interact_effect_score", 0.0) or row.get("candidate_effect_score", 0.0) or 0.0),
+                    -float(row.get("utility", 0.0) or 0.0),
+                    -float(row.get("confidence", 0.0) or 0.0),
+                    str(row.get("entity_id", "")),
+                )
+            )
+            selected.append(children[0])
+            continue
+        siblings.sort(key=lambda row: (-float(row.get("utility", 0.0) or 0.0), -float(row.get("confidence", 0.0) or 0.0), str(row.get("entity_id", ""))))
+        if siblings:
+            selected.append(siblings[0])
+    return selected
+
+
+def _detector_backed_poi(row: dict) -> bool:
+    provenance = set(str(value) for value in list(row.get("poi_source_provenance", []) or []))
+    return str(row.get("kind") or "") == "poi" and "detector" in provenance and bool(row.get("planner_targetable", True))
+
+
+def _poi_persistence(row: dict) -> float:
+    return float(row.get("canonical_track_persistence", row.get("persistence", 0.0)) or 0.0)
+
+
+def _strong_detector_backed_poi(row: dict) -> bool:
+    return _detector_backed_poi(row) and _poi_persistence(row) >= 0.65 and float(row.get("confidence", 0.0) or 0.0) >= 0.5
+
+
+def _poi_seed_score(row: dict) -> float:
+    provenance_bonus = 0.2 if _detector_backed_poi(row) else 0.0
+    reachability_bonus = 0.25 if bool(row.get("reachable_now")) else 0.15 if bool(row.get("reachable_later")) else 0.12 if str(row.get("approachable_status") or "") in {"approachable_now", "approachable_later"} else 0.0
+    locality_bonus = 0.12 if bool(row.get("returned_by_area_local_pois")) else 0.0
+    return float(row.get("utility", 0.0) or 0.0) + float(row.get("confidence", 0.0) or 0.0) + min(0.4, _poi_persistence(row)) + provenance_bonus + reachability_bonus + locality_bonus
+
+
+def _annotate_poi_debug(row: dict, *, returned_by_area_local_pois: bool, current_area_id: str | None) -> dict:
+    payload = dict(row)
+    payload["returned_by_area_local_pois"] = bool(returned_by_area_local_pois)
+    payload["reachable_status"] = str(payload.get("reachable_status") or ("reachable_now" if payload.get("reachable_now") else "reachable_later" if payload.get("reachable_later") else "blocked"))
+    payload["approachable_status"] = str(payload.get("approachable_status") or "not_approachable")
+    payload["score_if_considered"] = _poi_seed_score(payload)
+    payload["displaced_by_frontier_entity_id"] = payload.get("displaced_by_frontier_entity_id")
+    payload["rejected_from_promising_reason"] = payload.get("rejected_from_promising_reason")
+    payload["mode_gate_reason"] = payload.get("mode_gate_reason")
+    payload["poi_debug_local_match"] = bool(returned_by_area_local_pois) or str(payload.get("area_id") or "") == str(current_area_id or "")
+    return payload
+
+
 def _durable_prior_view(durable_priors: dict, *, reachable: list[dict], local_pois: list[dict], trigger_support: dict[str, list[dict]], current_area_id: str | None) -> dict:
     candidate_outcomes = dict(durable_priors.get("candidate_outcomes", {}))
     poi_patterns = dict(durable_priors.get("poi_patterns", {}))
@@ -209,6 +268,7 @@ def build_belief(blackboard_snapshot: dict, memory_snapshot: dict, mechanic_grap
                 exhausted_keys.add(str(key))
     raw_plan_memory = working_memory.get("plan_memory", {})
     plan_memory = list(raw_plan_memory.get("history", [])) if isinstance(raw_plan_memory, dict) else list(raw_plan_memory)
+    poi_followthrough = dict(raw_plan_memory.get("poi_followthrough", {})) if isinstance(raw_plan_memory, dict) else {}
     compact_plan_memory = [_compact_history_row(row) for row in plan_memory]
     avatar_mode_counts: dict[str, int] = {}
     avatar_status_counts: dict[str, int] = {}
@@ -238,6 +298,7 @@ def build_belief(blackboard_snapshot: dict, memory_snapshot: dict, mechanic_grap
     frontier = _frontier_ranked_rows(frontier_candidates(blackboard_snapshot))
     blocked = unreachable_targets(blackboard_snapshot)
     local_pois = area_local_pois(blackboard_snapshot, current_area_id) if current_area_id is not None else []
+    local_poi_ids = {str(row.get("entity_id") or "") for row in local_pois}
 
     consequence_support: dict[str, list[dict]] = {}
     for consequence in blackboard_snapshot.get("consequences", {}).values():
@@ -355,7 +416,67 @@ def build_belief(blackboard_snapshot: dict, memory_snapshot: dict, mechanic_grap
         "validated_count": sum(1 for state in dict(registry_snapshot.get("validation_state", {})).values() if str(state or "") == "validated"),
     }
 
-    promising_pois = sorted(list(local_pois) + [row for row in reachable if row not in local_pois], key=lambda row: (-float(row.get("utility", 0.0)), -float(row.get("confidence", 0.0)), row.get("entity_id", "")))[:12]
+    all_targetable_pois = []
+    for row in blackboard_snapshot.get("entities", {}).values():
+        if str(row.get("kind") or "") != "poi":
+            continue
+        if not bool(row.get("planner_visible", True)) or not bool(row.get("planner_targetable", True)):
+            continue
+        entity_id = str(row.get("entity_id") or "")
+        if not entity_id:
+            continue
+        all_targetable_pois.append(_annotate_poi_debug(row, returned_by_area_local_pois=entity_id in local_poi_ids, current_area_id=current_area_id))
+    local_pois = [_annotate_poi_debug(row, returned_by_area_local_pois=True, current_area_id=current_area_id) for row in local_pois]
+    reachable_pois = []
+    approachable_pois = []
+    detector_backed_local_pois = []
+    detector_backed_global_fallback = []
+    for row in all_targetable_pois:
+        payload = dict(row)
+        if bool(payload.get("reachable_now")) or bool(payload.get("reachable_later")):
+            payload["mode_gate_reason"] = "reachable_poi"
+            reachable_pois.append(payload)
+        elif (
+            _strong_detector_backed_poi(payload)
+            and (
+                str(payload.get("approachable_status") or "") in {"approachable_now", "approachable_later"}
+                or bool(payload.get("returned_by_area_local_pois"))
+                or bool(dict(payload.get("access_profile", {}) or {}).get("frontier_adjacent"))
+            )
+        ):
+            payload["mode_gate_reason"] = "approachable_detector_backed"
+            if str(payload.get("approachable_status") or "") not in {"approachable_now", "approachable_later"}:
+                payload["approachable_status"] = "approachable_now" if bool(payload.get("returned_by_area_local_pois")) else "approachable_later"
+            approachable_pois.append(payload)
+        elif _strong_detector_backed_poi(payload) and bool(payload.get("returned_by_area_local_pois")):
+            payload["mode_gate_reason"] = "strong_local_detector_backed"
+            detector_backed_local_pois.append(payload)
+        elif _strong_detector_backed_poi(payload):
+            payload["mode_gate_reason"] = "global_detector_backed_fallback"
+            detector_backed_global_fallback.append(payload)
+        else:
+            if not _detector_backed_poi(payload):
+                payload["rejected_from_promising_reason"] = "not_detector_backed"
+            elif _poi_persistence(payload) < 0.65:
+                payload["rejected_from_promising_reason"] = "low_canonical_persistence"
+            elif not bool(payload.get("returned_by_area_local_pois")):
+                payload["rejected_from_promising_reason"] = "not_local_or_nearby"
+            else:
+                payload["rejected_from_promising_reason"] = "soft_reachability_missing"
+    promising_ordered = list(reachable_pois) + list(approachable_pois) + list(detector_backed_local_pois)
+    if not promising_ordered:
+        promising_ordered.extend(detector_backed_global_fallback)
+    promising_pois = sorted(
+        _suppress_redundant_poi_siblings(promising_ordered),
+        key=lambda row: (
+            not _detector_backed_poi(row),
+            not bool(row.get("reachable_now")),
+            not bool(row.get("reachable_later")),
+            not str(row.get("approachable_status") or "") in {"approachable_now", "approachable_later"},
+            -float(row.get("score_if_considered", 0.0) or 0.0),
+            str(row.get("entity_id", "")),
+        ),
+    )[:12]
     trigger_candidates = sorted([row for row in reachable if str(row.get("entity_id")) in trigger_support], key=lambda row: (-len(trigger_support.get(str(row.get("entity_id")), [])), -float(row.get("utility", 0.0)), row.get("entity_id", "")))
     recovery_candidates = sorted([row for row in blocked_rows if bool(row.get("reachable_later")) or float(row.get("distance_score", 0.0)) > 0.0], key=lambda row: (-float(row.get("distance_score", 0.0)), -float(row.get("motion_score", 0.0)), row.get("entity_id", "")))
     structure_candidate_count = sum(
@@ -381,9 +502,37 @@ def build_belief(blackboard_snapshot: dict, memory_snapshot: dict, mechanic_grap
         and float(row.get("support_strength", 0.0) or 0.0) >= 0.45
     )
     structure_recall_gap = max(0.0, 1.0 - min(1.0, (0.2 * structure_candidate_count) + (0.35 * mechanic_object_backed_node_count) + (0.25 * chainworthy_path_count)))
-    planning_mode = "structure_acquisition" if mechanic_object_backed_node_count <= 12 or structure_candidate_count <= 4 or chainworthy_path_count <= 1 else "default_progress"
+    stable_targetable_detector_pois = [
+        row for row in all_targetable_pois
+        if _strong_detector_backed_poi(row)
+        and (
+            int(row.get("last_seen_round", row.get("round_id", 0)) or 0) - int(row.get("first_seen_round", row.get("round_id", 0)) or 0) >= 1
+            or int(row.get("observations", 0) or 0) >= 20
+            or _poi_persistence(row) >= 0.9
+        )
+    ]
+    detector_poi_progress_ready = bool(stable_targetable_detector_pois) and any(
+        bool(row.get("reachable_now")) or bool(row.get("reachable_later")) or str(row.get("approachable_status") or "") in {"approachable_now", "approachable_later"} or bool(row.get("returned_by_area_local_pois"))
+        for row in stable_targetable_detector_pois
+    )
+    escalation_ready = any(
+        isinstance(row, dict)
+        and bool(row.get("detector_backed", False))
+        and int(row.get("selection_rounds", 0) or 0) >= 2
+        and (
+            int(row.get("new_graph_edges", 0) or 0) > 0
+            or int(row.get("new_hypothesis_support", 0) or 0) > 0
+            or int(row.get("new_verification_candidates", 0) or 0) > 0
+            or int(row.get("changed_exit_linked_evidence", 0) or 0) > 0
+            or bool(row.get("approachable", False))
+            or bool(row.get("reachable", False))
+        )
+        for row in poi_followthrough.values()
+    )
+    planning_mode = "default_progress" if (detector_poi_progress_ready or escalation_ready) else ("structure_acquisition" if mechanic_object_backed_node_count <= 12 or structure_candidate_count <= 4 or chainworthy_path_count <= 1 else "default_progress")
     candidate_seed_sets = {
         "promising_pois": promising_pois,
+        "approachable_pois": approachable_pois,
         "trigger_candidates": trigger_candidates,
         "recovery_candidates": recovery_candidates,
         "frontier_targets": frontier,
@@ -445,11 +594,13 @@ def build_belief(blackboard_snapshot: dict, memory_snapshot: dict, mechanic_grap
         "contradicted_paths": contradicted_paths,
         "pending_verification_nodes": pending_verification_nodes,
         "planner_usable_hypothesis_summary": planner_usable_hypothesis_summary,
+        "detector_poi_followthrough": poi_followthrough,
         "reachable_targets": world_view["reachable_targets"],
         "reachable_targets_split": world_view["reachable_targets_split"],
         "frontier_targets": world_view["frontier_targets"],
         "blocked_targets": world_view["blocked_targets"],
         "promising_pois": candidate_seed_sets["promising_pois"],
+        "approachable_pois": candidate_seed_sets["approachable_pois"],
         "trigger_candidates": candidate_seed_sets["trigger_candidates"],
         "recovery_candidates": candidate_seed_sets["recovery_candidates"],
         "local_context": local_context_view,

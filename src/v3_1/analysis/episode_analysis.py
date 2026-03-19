@@ -14,6 +14,7 @@ from v3_1.contracts.messages import AnalyzedEpisode, BlackboardDelta, RawEpisode
 from v3_1.execution.env_factory import normalize_action_lookup
 from v3_1.mechanics.hypothesis_orchestrator import orchestrate_hypotheses
 from v3_1.utils.ids import stable_digest
+from v3_1.world.entities import _match_score, _merge_bbox, _stable_entity_id
 
 
 def _degenerate_avatar_path(avatar_tracking: dict) -> bool:
@@ -600,15 +601,26 @@ def _attach_target_effects_to_pois(pois: list[dict], *, step_rows: list[dict], b
 
 
 def _structure_entity_id(candidate: dict, *, area_id: str | None) -> str:
-    matched_prior_id = str(candidate.get("matched_prior_id") or "")
-    if matched_prior_id and not matched_prior_id.startswith("object:"):
-        return matched_prior_id
+    bbox_payload = dict(candidate.get("bbox", {}) or {})
+    bbox = {
+        "x1": int(bbox_payload.get("x1", 0) or 0),
+        "y1": int(bbox_payload.get("y1", 0) or 0),
+        "x2": int(bbox_payload.get("x2", 0) or 0),
+        "y2": int(bbox_payload.get("y2", 0) or 0),
+    }
+    pattern_id = str(candidate.get("pattern_id") or "")
+    signature = str(candidate.get("signature") or "")
     stable_key = {
-        "area_id": area_id or "none",
-        "signature": str(candidate.get("signature") or ""),
+        "pattern_id": pattern_id,
+        "signature": signature,
         "kind": str(candidate.get("kind") or "structure"),
         "primary_color": int(candidate.get("primary_color", 0) or 0),
-        "bbox": dict(candidate.get("bbox", {}) or {}),
+        "bbox": {
+            "x1": int(round(bbox["x1"] / 2.0) * 2),
+            "y1": int(round(bbox["y1"] / 2.0) * 2),
+            "x2": int(round(bbox["x2"] / 2.0) * 2),
+            "y2": int(round(bbox["y2"] / 2.0) * 2),
+        },
     }
     return f"entity:{stable_digest(stable_key)}"
 
@@ -616,6 +628,22 @@ def _structure_entity_id(candidate: dict, *, area_id: str | None) -> str:
 def _supplemental_structure_entities(*, step_summaries: list[dict], normalized_observations: list[list[list[int]]], area_sequence: list[dict]) -> list[dict]:
     supplemental: list[dict] = []
     aggregated: dict[str, dict] = {}
+    spatial_groups: dict[tuple[str | None, str, int, int, int, int], str] = {}
+
+    def _canonical_group_key(*, area_id: str | None, candidate: dict, pattern_id: str) -> tuple[str, int, int, int, int]:
+        bbox_payload = dict(candidate.get("bbox", {}) or {})
+        x1 = int(bbox_payload.get("x1", 0) or 0)
+        y1 = int(bbox_payload.get("y1", 0) or 0)
+        x2 = int(bbox_payload.get("x2", 0) or 0)
+        y2 = int(bbox_payload.get("y2", 0) or 0)
+        return (
+            pattern_id or str(candidate.get("signature") or ""),
+            int(round(x1 / 2.0) * 2),
+            int(round(y1 / 2.0) * 2),
+            int(round(x2 / 2.0) * 2),
+            int(round(y2 / 2.0) * 2),
+        )
+
     for step_idx, summary in enumerate(list(step_summaries or [])):
         area_id = area_sequence[step_idx]["area_id"] if step_idx < len(area_sequence) else None
         for candidate in list(summary.get("structure_candidates", []) or []):
@@ -640,8 +668,10 @@ def _supplemental_structure_entities(*, step_summaries: list[dict], normalized_o
             observation = normalized_observations[step_idx] if step_idx < len(normalized_observations) else []
             patch = patch_crop(observation, bbox_list) if observation else []
             descriptor = stable_descriptor(patch) if patch else dict(candidate.get("stable_descriptor", {}) or {})
-            pattern_id = stable_pattern_id(patch) if patch else None
-            entity_id = _structure_entity_id(candidate, area_id=area_id)
+            pattern_id = stable_pattern_id(patch) if patch else str(candidate.get("pattern_id") or "") or None
+            entity_id = _structure_entity_id({**candidate, "pattern_id": pattern_id}, area_id=area_id)
+            group_key = _canonical_group_key(area_id=area_id, candidate={**candidate, "pattern_id": pattern_id}, pattern_id=str(pattern_id or ""))
+            entity_id = spatial_groups.setdefault(group_key, entity_id)
             existing = aggregated.get(entity_id)
             confidence = min(
                 1.0,
@@ -652,9 +682,11 @@ def _supplemental_structure_entities(*, step_summaries: list[dict], normalized_o
             )
             payload = {
                 "entity_id": entity_id,
-                "poi_id": entity_id,
-                "kind": "poi",
+                "kind": "entity",
+                "entity_class": "structure",
                 "poi_class": "structure",
+                "poi_bucket": "supplemental_structure",
+                "planner_visible": False,
                 "signature": str(candidate.get("signature") or ""),
                 "centroid": list(candidate.get("centroid", [0.0, 0.0]) or [0.0, 0.0]),
                 "bbox": bbox,
@@ -691,6 +723,7 @@ def _supplemental_structure_entities(*, step_summaries: list[dict], normalized_o
                 "candidate_effect_score": 0.0,
                 "candidate_effect_mode": "move",
                 "area_id": area_id,
+                "visit_count": 1,
             }
             if existing is None:
                 payload["supporting_steps"] = [step_idx]
@@ -700,6 +733,7 @@ def _supplemental_structure_entities(*, step_summaries: list[dict], normalized_o
             existing["utility"] = max(float(existing.get("utility", 0.0) or 0.0), float(payload.get("utility", 0.0) or 0.0))
             existing["identity_confidence"] = max(float(existing.get("identity_confidence", 0.0) or 0.0), float(payload.get("identity_confidence", 0.0) or 0.0))
             existing["observations"] = int(existing.get("observations", 0) or 0) + 1
+            existing["visit_count"] = int(existing.get("visit_count", 0) or 0) + 1
             existing["supporting_steps"] = list(dict.fromkeys(list(existing.get("supporting_steps", []) or []) + [step_idx]))
             existing["type_hints"] = sorted(set(list(existing.get("type_hints", []) or []) + list(payload.get("type_hints", []) or [])))
             if pattern_id and not existing.get("pattern_id"):
@@ -729,14 +763,31 @@ def _supplemental_structure_entities(*, step_summaries: list[dict], normalized_o
 
 
 def _merge_entity_candidates(base: list[dict], supplemental: list[dict]) -> list[dict]:
+    def _canonical_merge_key(row: dict) -> str:
+        bbox_payload = dict(row.get("bbox", {}) or {})
+        bbox_key = (
+            int(round(int(bbox_payload.get("x1", 0) or 0) / 2.0) * 2),
+            int(round(int(bbox_payload.get("y1", 0) or 0) / 2.0) * 2),
+            int(round(int(bbox_payload.get("x2", 0) or 0) / 2.0) * 2),
+            int(round(int(bbox_payload.get("y2", 0) or 0) / 2.0) * 2),
+        )
+        stable_key = {
+            "pattern_id": str(row.get("pattern_id") or ""),
+            "signature": str(row.get("signature") or ""),
+            "poi_class": str(row.get("poi_class") or ""),
+            "primary_color": int(row.get("primary_color", 0) or 0),
+            "bbox": bbox_key,
+        }
+        return stable_digest(stable_key)
+
     merged: dict[str, dict] = {}
     for row in list(base or []):
         payload = dict(row)
-        key = str(payload.get("entity_id") or payload.get("poi_id") or payload.get("signature") or stable_digest(payload))
+        key = _canonical_merge_key(payload)
         merged[key] = payload
     for row in list(supplemental or []):
         payload = dict(row)
-        key = str(payload.get("entity_id") or payload.get("poi_id") or payload.get("signature") or stable_digest(payload))
+        key = _canonical_merge_key(payload)
         existing = merged.get(key)
         if existing is None:
             merged[key] = payload
@@ -773,6 +824,579 @@ def _merge_entity_candidates(base: list[dict], supplemental: list[dict]) -> list
     rows = list(merged.values())
     rows.sort(key=lambda row: (-float(row.get("confidence", 0.0) or 0.0), -float(row.get("utility", 0.0) or 0.0), str(row.get("entity_id") or "")))
     return rows
+
+
+def _promote_structure_entities_to_pois(structure_entities: list[dict]) -> tuple[list[dict], dict]:
+    promoted: list[dict] = []
+    rejection_reason_counts: dict[str, int] = {}
+    bottom_strip_children: list[dict] = []
+    for row in list(structure_entities or []):
+        payload = dict(row)
+        observations = int(payload.get("observations", 0) or 0)
+        identity_confidence = float(payload.get("identity_confidence", 0.0) or 0.0)
+        pattern_id = str(payload.get("pattern_id") or "")
+        effect_score = max(
+            float(payload.get("interact_effect_score", 0.0) or 0.0),
+            float(payload.get("click_effect_score", 0.0) or 0.0),
+            float(payload.get("candidate_effect_score", 0.0) or 0.0),
+        )
+        if observations < 2:
+            rejection_reason_counts["insufficient_structure_observations"] = rejection_reason_counts.get("insufficient_structure_observations", 0) + 1
+            continue
+        if identity_confidence < 0.72:
+            rejection_reason_counts["identity_confidence_too_low"] = rejection_reason_counts.get("identity_confidence_too_low", 0) + 1
+            continue
+        if not pattern_id and effect_score < 0.2:
+            rejection_reason_counts["missing_pattern_and_effect_support"] = rejection_reason_counts.get("missing_pattern_and_effect_support", 0) + 1
+            continue
+        bbox = dict(payload.get("bbox", {}) or {})
+        bbox_width = max(1, int(bbox.get("x2", 0) or 0) - int(bbox.get("x1", 0) or 0) + 1)
+        bbox_height = max(1, int(bbox.get("y2", 0) or 0) - int(bbox.get("y1", 0) or 0) + 1)
+        low_visit = observations <= 3
+        weak_effect = effect_score < 0.1
+        bottom_strip = int(bbox.get("y1", 0) or 0) >= 50 and bbox_height <= 3
+        if bottom_strip and low_visit and weak_effect:
+            payload["strip_region_candidate"] = True
+            bottom_strip_children.append(payload)
+            continue
+        payload["kind"] = "poi"
+        payload["poi_id"] = str(payload.get("poi_id") or payload.get("entity_id") or "")
+        payload["poi_bucket"] = "structural"
+        payload["planner_visible"] = True
+        payload["planner_targetable"] = False
+        payload["promotion_source"] = "supplemental_structure_admission"
+        promoted.append(payload)
+    if bottom_strip_children:
+        merged_bbox = {
+            "x1": min(int(dict(row.get("bbox", {}) or {}).get("x1", 0)) for row in bottom_strip_children),
+            "y1": min(int(dict(row.get("bbox", {}) or {}).get("y1", 0)) for row in bottom_strip_children),
+            "x2": max(int(dict(row.get("bbox", {}) or {}).get("x2", 0)) for row in bottom_strip_children),
+            "y2": max(int(dict(row.get("bbox", {}) or {}).get("y2", 0)) for row in bottom_strip_children),
+        }
+        merged = dict(bottom_strip_children[0])
+        merged["entity_id"] = f"entity:{stable_digest({'strip_region': merged_bbox, 'area_id': merged.get('area_id')})}"
+        merged["poi_id"] = merged["entity_id"]
+        merged["kind"] = "poi"
+        merged["poi_bucket"] = "structural"
+        merged["planner_visible"] = True
+        merged["planner_targetable"] = False
+        merged["promotion_source"] = "supplemental_structure_admission"
+        merged["bbox"] = merged_bbox
+        merged["area"] = sum(int(row.get("area", 0) or 0) for row in bottom_strip_children)
+        merged["observations"] = max(int(row.get("observations", 0) or 0) for row in bottom_strip_children)
+        merged["visit_count"] = max(int(row.get("visit_count", 0) or 0) for row in bottom_strip_children)
+        merged["merged_input_poi_ids"] = [str(row.get("entity_id") or "") for row in bottom_strip_children]
+        merged["poi_source_provenance"] = ["structure_promotion"]
+        promoted.append(merged)
+        rejection_reason_counts["merged_bottom_strip_children"] = len(bottom_strip_children)
+    return promoted, {
+        "structure_entity_candidate_count": len(list(structure_entities or [])),
+        "structure_entity_promoted_count": len(promoted),
+        "structure_entity_rejection_reason_counts": dict(sorted(rejection_reason_counts.items())),
+        "promoted_structure_pois": [
+            {
+                "poi_id": str(row.get("poi_id") or row.get("entity_id") or ""),
+                "entity_id": str(row.get("entity_id") or ""),
+                "bbox": dict(row.get("bbox", {}) or {}),
+                "area": int(row.get("area", 0) or 0),
+                "confidence": float(row.get("confidence", 0.0) or 0.0),
+                "identity_confidence": float(row.get("identity_confidence", 0.0) or 0.0),
+                "pattern_id": row.get("pattern_id"),
+                "planner_targetable": bool(row.get("planner_targetable", False)),
+            }
+            for row in promoted
+        ],
+    }
+
+
+def _adopt_prior_poi_ids(pois: list[dict], blackboard_snapshot: dict | None) -> list[dict]:
+    if blackboard_snapshot is None:
+        return [dict(row) for row in list(pois or [])]
+    blackboard_state = dict((blackboard_snapshot or {}).get("state", {}) or {}) if isinstance(blackboard_snapshot, dict) else {}
+    prior_rows = [
+        dict(row)
+        for row in dict(blackboard_state.get("observed_entities", {}) or {}).values()
+        if isinstance(row, dict) and str(row.get("kind") or "") == "poi"
+    ]
+    adopted: list[dict] = []
+    for row in list(pois or []):
+        payload = dict(row)
+        best_match = None
+        best_score = 0.0
+        payload_sources = set(list(payload.get("poi_source_provenance", []) or []))
+        for prior in prior_rows:
+            prior_sources = set(list(prior.get("poi_source_provenance", []) or []))
+            if payload_sources and prior_sources and payload_sources != prior_sources:
+                continue
+            score = _match_score(prior, payload)
+            if score > best_score:
+                best_score = score
+                best_match = prior
+        if best_match is not None and best_score >= 0.65:
+            stable_id = str(best_match.get("entity_id") or best_match.get("poi_id") or "")
+            if stable_id:
+                payload["entity_id"] = stable_id
+                payload["poi_id"] = stable_id
+                payload["stable_entity_id_hint"] = stable_id
+        adopted.append(payload)
+    return adopted
+
+
+def _bbox_area_value(bbox: dict) -> int:
+    if not isinstance(bbox, dict) or not bbox:
+        return 0
+    return max(0, (int(bbox.get("x2", 0) or 0) - int(bbox.get("x1", 0) or 0) + 1) * (int(bbox.get("y2", 0) or 0) - int(bbox.get("y1", 0) or 0) + 1))
+
+
+def _bbox_iou(left: dict, right: dict) -> float:
+    if not left or not right:
+        return 0.0
+    x1 = max(int(left.get("x1", 0) or 0), int(right.get("x1", 0) or 0))
+    y1 = max(int(left.get("y1", 0) or 0), int(right.get("y1", 0) or 0))
+    x2 = min(int(left.get("x2", 0) or 0), int(right.get("x2", 0) or 0))
+    y2 = min(int(left.get("y2", 0) or 0), int(right.get("y2", 0) or 0))
+    if x2 < x1 or y2 < y1:
+        return 0.0
+    intersection = (x2 - x1 + 1) * (y2 - y1 + 1)
+    union = _bbox_area_value(left) + _bbox_area_value(right) - intersection
+    return float(intersection) / float(max(1, union))
+
+
+def _bbox_contains_ratio(outer: dict, inner: dict) -> float:
+    if not outer or not inner:
+        return 0.0
+    x1 = max(int(outer.get("x1", 0) or 0), int(inner.get("x1", 0) or 0))
+    y1 = max(int(outer.get("y1", 0) or 0), int(inner.get("y1", 0) or 0))
+    x2 = min(int(outer.get("x2", 0) or 0), int(inner.get("x2", 0) or 0))
+    y2 = min(int(outer.get("y2", 0) or 0), int(inner.get("y2", 0) or 0))
+    if x2 < x1 or y2 < y1:
+        return 0.0
+    intersection = (x2 - x1 + 1) * (y2 - y1 + 1)
+    return float(intersection) / float(max(1, _bbox_area_value(inner)))
+
+
+def _poi_semantic_label(row: dict) -> str:
+    return str(
+        row.get("semantic_label")
+        or row.get("mechanic_role")
+        or row.get("poi_class")
+        or row.get("kind")
+        or "unknown"
+    )
+
+
+def _poi_effect_profile(row: dict) -> tuple[float, float, float]:
+    return (
+        float(row.get("movement_effect_score", 0.0) or 0.0),
+        float(row.get("interact_effect_score", 0.0) or 0.0),
+        float(row.get("click_effect_score", 0.0) or 0.0),
+    )
+
+
+def _strongly_distinct_poi_role(left: dict, right: dict) -> bool:
+    left_bbox = dict(left.get("bbox", {}) or {})
+    right_bbox = dict(right.get("bbox", {}) or {})
+    if _poi_semantic_label(left) != _poi_semantic_label(right):
+        return True
+    if bool(left.get("pattern_id")) and bool(right.get("pattern_id")) and str(left.get("pattern_id")) != str(right.get("pattern_id")):
+        if _bbox_iou(left_bbox, right_bbox) < 0.55 and _bbox_contains_ratio(left_bbox, right_bbox) < 0.85 and _bbox_contains_ratio(right_bbox, left_bbox) < 0.85:
+            return True
+    if _poi_effect_profile(left) != _poi_effect_profile(right):
+        effect_gap = sum(abs(a - b) for a, b in zip(_poi_effect_profile(left), _poi_effect_profile(right)))
+        if effect_gap >= 0.35:
+            return True
+    if _bbox_iou(left_bbox, right_bbox) < 0.35 and _bbox_contains_ratio(left_bbox, right_bbox) < 0.8 and _bbox_contains_ratio(right_bbox, left_bbox) < 0.8:
+        return True
+    return False
+
+
+def _central_parent_child_canonicalize(rows: list[dict]) -> tuple[list[dict], list[dict]]:
+    working = [dict(row) for row in list(rows or [])]
+    decision_debug: list[dict] = []
+    for row in working:
+        row.setdefault("poi_hierarchy_level", 0)
+        row.setdefault("parent_poi_id", None)
+        row.setdefault("child_poi_ids", [])
+        row.setdefault("hierarchy_role", "parent_region")
+    detector_candidates = [
+        row for row in working
+        if "detector" in set(list(row.get("poi_source_provenance", []) or []))
+        and float(row.get("canonical_track_persistence", 0.0) or 0.0) >= 0.65
+        and _bbox_area_value(dict(row.get("bbox", {}) or {})) >= 12
+        and int(dict(row.get("bbox", {}) or {}).get("y1", 0) or 0) < 52
+    ]
+    consumed_ids: set[str] = set()
+    final_rows: list[dict] = []
+    for row in sorted(working, key=lambda item: (-_bbox_area_value(dict(item.get("bbox", {}) or {})), -float(item.get("confidence", 0.0) or 0.0), str(item.get("entity_id") or ""))):
+        row_id = str(row.get("entity_id") or row.get("poi_id") or "")
+        if row_id in consumed_ids:
+            continue
+        row_bbox = dict(row.get("bbox", {}) or {})
+        row_area = _bbox_area_value(row_bbox)
+        cluster = []
+        for other in detector_candidates:
+            other_id = str(other.get("entity_id") or other.get("poi_id") or "")
+            if other_id == row_id or other_id in consumed_ids:
+                continue
+            other_bbox = dict(other.get("bbox", {}) or {})
+            other_area = _bbox_area_value(other_bbox)
+            if row_area < 80 or other_area < 80:
+                continue
+            high_overlap = _bbox_iou(row_bbox, other_bbox) >= 0.55
+            contained = _bbox_contains_ratio(row_bbox, other_bbox) >= 0.85 or _bbox_contains_ratio(other_bbox, row_bbox) >= 0.85
+            if not (high_overlap or contained):
+                continue
+            if _strongly_distinct_poi_role(row, other):
+                continue
+            cluster.append(other)
+        if not cluster:
+            final_rows.append(row)
+            continue
+        peer_group = [row] + cluster
+        parent = max(
+            peer_group,
+            key=lambda item: (
+                _bbox_area_value(dict(item.get("bbox", {}) or {})),
+                float(item.get("canonical_track_persistence", 0.0) or 0.0),
+                float(item.get("confidence", 0.0) or 0.0),
+            ),
+        )
+        parent_id = str(parent.get("entity_id") or parent.get("poi_id") or "")
+        retained_children: list[dict] = []
+        merged_peers: list[str] = []
+        input_ids: list[str] = []
+        input_rows: list[dict] = []
+        for peer in peer_group:
+            peer_id = str(peer.get("entity_id") or peer.get("poi_id") or "")
+            input_ids.append(peer_id)
+            input_rows.append({"poi_id": peer_id, "bbox": dict(peer.get("bbox", {}) or {}), "provenance": list(peer.get("poi_source_provenance", []) or [])})
+            if peer_id == parent_id:
+                continue
+            distinct_subregion = _bbox_iou(dict(parent.get("bbox", {}) or {}), dict(peer.get("bbox", {}) or {})) < 0.35 and _bbox_contains_ratio(dict(parent.get("bbox", {}) or {}), dict(peer.get("bbox", {}) or {})) < 0.8
+            distinct_semantics = _strongly_distinct_poi_role(parent, peer)
+            if distinct_subregion or distinct_semantics:
+                child = dict(peer)
+                child["parent_poi_id"] = parent_id
+                child["poi_hierarchy_level"] = 1
+                child["hierarchy_role"] = "functional_child"
+                retained_children.append(child)
+            else:
+                merged_peers.append(peer_id)
+                consumed_ids.add(peer_id)
+        parent_payload = dict(parent)
+        parent_payload["entity_id"] = parent_id
+        parent_payload["poi_id"] = parent_id
+        parent_payload["poi_hierarchy_level"] = 0
+        parent_payload["parent_poi_id"] = None
+        parent_payload["child_poi_ids"] = [str(child.get("entity_id") or child.get("poi_id") or "") for child in retained_children]
+        parent_payload["hierarchy_role"] = "parent_region"
+        parent_payload["merged_input_poi_ids"] = list(dict.fromkeys(list(parent_payload.get("merged_input_poi_ids", []) or []) + input_ids))
+        final_rows.append(parent_payload)
+        final_rows.extend(retained_children)
+        for peer in peer_group:
+            peer_id = str(peer.get("entity_id") or peer.get("poi_id") or "")
+            if peer_id != parent_id:
+                consumed_ids.add(peer_id)
+        decision_debug.append(
+            {
+                "input_overlapping_pois": input_rows,
+                "overlap_scores": [
+                    {
+                        "left": parent_id,
+                        "right": str(peer.get("entity_id") or peer.get("poi_id") or ""),
+                        "iou": _bbox_iou(dict(parent.get("bbox", {}) or {}), dict(peer.get("bbox", {}) or {})),
+                        "containment": max(
+                            _bbox_contains_ratio(dict(parent.get("bbox", {}) or {}), dict(peer.get("bbox", {}) or {})),
+                            _bbox_contains_ratio(dict(peer.get("bbox", {}) or {}), dict(parent.get("bbox", {}) or {})),
+                        ),
+                    }
+                    for peer in peer_group
+                    if str(peer.get("entity_id") or peer.get("poi_id") or "") != parent_id
+                ],
+                "semantic_similarity": [
+                    {
+                        "left": parent_id,
+                        "right": str(peer.get("entity_id") or peer.get("poi_id") or ""),
+                        "same_semantic_label": _poi_semantic_label(parent) == _poi_semantic_label(peer),
+                        "same_pattern_id": bool(parent.get("pattern_id")) and str(parent.get("pattern_id")) == str(peer.get("pattern_id")),
+                    }
+                    for peer in peer_group
+                    if str(peer.get("entity_id") or peer.get("poi_id") or "") != parent_id
+                ],
+                "chosen_parent": parent_id,
+                "retained_children": [str(child.get("entity_id") or child.get("poi_id") or "") for child in retained_children],
+                "merged_peers": merged_peers,
+                "reason": "high_overlap_detector_backed_cluster",
+            }
+        )
+    collapsed_rows: list[dict] = []
+    for row in sorted(final_rows, key=lambda item: (-_bbox_area_value(dict(item.get("bbox", {}) or {})), -float(item.get("confidence", 0.0) or 0.0), str(item.get("entity_id") or ""))):
+        row_bbox = dict(row.get("bbox", {}) or {})
+        row_area = _bbox_area_value(row_bbox)
+        merged = False
+        for parent in collapsed_rows:
+            parent_bbox = dict(parent.get("bbox", {}) or {})
+            parent_area = _bbox_area_value(parent_bbox)
+            if row_area < 80 or parent_area < 80:
+                continue
+            if "detector" not in set(list(row.get("poi_source_provenance", []) or [])) or "detector" not in set(list(parent.get("poi_source_provenance", []) or [])):
+                continue
+            if float(row.get("canonical_track_persistence", 0.0) or 0.0) < 0.65 or float(parent.get("canonical_track_persistence", 0.0) or 0.0) < 0.65:
+                continue
+            same_band_geometry = (
+                abs(int(parent_bbox.get("x1", 0) or 0) - int(row_bbox.get("x1", 0) or 0)) <= 2
+                and abs(int(parent_bbox.get("x2", 0) or 0) - int(row_bbox.get("x2", 0) or 0)) <= 2
+                and abs(int(parent_bbox.get("y1", 0) or 0) - int(row_bbox.get("y1", 0) or 0)) <= 3
+                and abs(int(parent_bbox.get("y2", 0) or 0) - int(row_bbox.get("y2", 0) or 0)) <= 4
+            )
+            overlap_ok = (
+                _bbox_iou(parent_bbox, row_bbox) >= 0.55
+                or _bbox_contains_ratio(parent_bbox, row_bbox) >= 0.85
+                or _bbox_contains_ratio(row_bbox, parent_bbox) >= 0.85
+                or same_band_geometry
+            )
+            if not overlap_ok:
+                continue
+            if _strongly_distinct_poi_role(parent, row) and not same_band_geometry:
+                continue
+            parent["bbox"] = _merge_bbox(parent.get("bbox"), row.get("bbox"))
+            parent["merged_input_poi_ids"] = list(dict.fromkeys(list(parent.get("merged_input_poi_ids", []) or []) + list(row.get("merged_input_poi_ids", []) or []) + [str(row.get("entity_id") or row.get("poi_id") or "")]))
+            parent["poi_source_provenance"] = sorted(set(list(parent.get("poi_source_provenance", []) or []) + list(row.get("poi_source_provenance", []) or [])))
+            parent["child_poi_ids"] = list(dict.fromkeys(list(parent.get("child_poi_ids", []) or []) + list(row.get("child_poi_ids", []) or [])))
+            decision_debug.append(
+                {
+                    "input_overlapping_pois": [
+                        {"poi_id": str(parent.get("entity_id") or parent.get("poi_id") or ""), "bbox": dict(parent_bbox), "provenance": list(parent.get("poi_source_provenance", []) or [])},
+                        {"poi_id": str(row.get("entity_id") or row.get("poi_id") or ""), "bbox": dict(row_bbox), "provenance": list(row.get("poi_source_provenance", []) or [])},
+                    ],
+                    "overlap_scores": [
+                        {
+                            "left": str(parent.get("entity_id") or parent.get("poi_id") or ""),
+                            "right": str(row.get("entity_id") or row.get("poi_id") or ""),
+                            "iou": _bbox_iou(parent_bbox, row_bbox),
+                            "containment": max(_bbox_contains_ratio(parent_bbox, row_bbox), _bbox_contains_ratio(row_bbox, parent_bbox)),
+                        }
+                    ],
+                    "semantic_similarity": [
+                        {
+                            "left": str(parent.get("entity_id") or parent.get("poi_id") or ""),
+                            "right": str(row.get("entity_id") or row.get("poi_id") or ""),
+                            "same_pattern_id": bool(parent.get("pattern_id")) and str(parent.get("pattern_id")) == str(row.get("pattern_id")),
+                            "same_semantic_label": _poi_semantic_label(parent) == _poi_semantic_label(row),
+                        }
+                    ],
+                    "chosen_parent": str(parent.get("entity_id") or parent.get("poi_id") or ""),
+                    "retained_children": list(parent.get("child_poi_ids", []) or []),
+                    "merged_peers": [str(row.get("entity_id") or row.get("poi_id") or "")],
+                    "reason": "final_large_overlap_parent_collapse",
+                }
+            )
+            merged = True
+            break
+        if not merged:
+            collapsed_rows.append(row)
+    collapsed_rows.sort(key=lambda item: (int(item.get("poi_hierarchy_level", 0) or 0), -float(item.get("confidence", 0.0) or 0.0), str(item.get("entity_id") or "")))
+    return collapsed_rows, decision_debug
+
+
+def _collapse_same_level_central_parents(rows: list[dict]) -> tuple[list[dict], list[dict]]:
+    working = [dict(row) for row in list(rows or [])]
+    debug_rows: list[dict] = []
+    result: list[dict] = []
+    for row in sorted(working, key=lambda item: (-_bbox_area_value(dict(item.get("bbox", {}) or {})), -float(item.get("confidence", 0.0) or 0.0), str(item.get("entity_id") or ""))):
+        row_bbox = dict(row.get("bbox", {}) or {})
+        merged = False
+        for parent in result:
+            parent_bbox = dict(parent.get("bbox", {}) or {})
+            if not (
+                bool(row.get("planner_targetable", False))
+                and bool(parent.get("planner_targetable", False))
+                and int(row.get("poi_hierarchy_level", 0) or 0) == 0
+                and int(parent.get("poi_hierarchy_level", 0) or 0) == 0
+                and str(row.get("hierarchy_role") or "parent_region") == "parent_region"
+                and str(parent.get("hierarchy_role") or "parent_region") == "parent_region"
+            ):
+                continue
+            if "detector" not in set(list(row.get("poi_source_provenance", []) or [])) or "detector" not in set(list(parent.get("poi_source_provenance", []) or [])):
+                continue
+            if float(row.get("canonical_track_persistence", 0.0) or 0.0) < 0.65 or float(parent.get("canonical_track_persistence", 0.0) or 0.0) < 0.65:
+                continue
+            distinct_child_coverage = bool(row.get("child_poi_ids")) or bool(parent.get("child_poi_ids"))
+            if distinct_child_coverage:
+                continue
+            same_band_geometry = (
+                abs(int(parent_bbox.get("x1", 0) or 0) - int(row_bbox.get("x1", 0) or 0)) <= 2
+                and abs(int(parent_bbox.get("x2", 0) or 0) - int(row_bbox.get("x2", 0) or 0)) <= 2
+                and abs(int(parent_bbox.get("y1", 0) or 0) - int(row_bbox.get("y1", 0) or 0)) <= 3
+                and abs(int(parent_bbox.get("y2", 0) or 0) - int(row_bbox.get("y2", 0) or 0)) <= 4
+            )
+            iou = _bbox_iou(parent_bbox, row_bbox)
+            contain_pr = _bbox_contains_ratio(parent_bbox, row_bbox)
+            contain_rp = _bbox_contains_ratio(row_bbox, parent_bbox)
+            if not (iou >= 0.55 or contain_pr >= 0.85 or contain_rp >= 0.85 or same_band_geometry):
+                continue
+            if _strongly_distinct_poi_role(parent, row) and not same_band_geometry:
+                continue
+            parent["bbox"] = _merge_bbox(parent.get("bbox"), row.get("bbox"))
+            parent["merged_input_poi_ids"] = list(dict.fromkeys(list(parent.get("merged_input_poi_ids", []) or []) + list(row.get("merged_input_poi_ids", []) or []) + [str(row.get("entity_id") or row.get("poi_id") or "")]))
+            debug_rows.append(
+                {
+                    "input_overlapping_pois": [
+                        {"poi_id": str(parent.get("entity_id") or parent.get("poi_id") or ""), "bbox": dict(parent_bbox), "provenance": list(parent.get("poi_source_provenance", []) or [])},
+                        {"poi_id": str(row.get("entity_id") or row.get("poi_id") or ""), "bbox": dict(row_bbox), "provenance": list(row.get("poi_source_provenance", []) or [])},
+                    ],
+                    "overlap_scores": [
+                        {
+                            "left": str(parent.get("entity_id") or parent.get("poi_id") or ""),
+                            "right": str(row.get("entity_id") or row.get("poi_id") or ""),
+                            "iou": iou,
+                            "containment": max(contain_pr, contain_rp),
+                        }
+                    ],
+                    "semantic_similarity": [
+                        {
+                            "left": str(parent.get("entity_id") or parent.get("poi_id") or ""),
+                            "right": str(row.get("entity_id") or row.get("poi_id") or ""),
+                            "same_pattern_id": bool(parent.get("pattern_id")) and str(parent.get("pattern_id")) == str(row.get("pattern_id")),
+                            "same_semantic_label": _poi_semantic_label(parent) == _poi_semantic_label(row),
+                        }
+                    ],
+                    "chosen_parent": str(parent.get("entity_id") or parent.get("poi_id") or ""),
+                    "retained_children": list(parent.get("child_poi_ids", []) or []),
+                    "merged_peers": [str(row.get("entity_id") or row.get("poi_id") or "")],
+                    "reason": "same_level_central_parent_collapse",
+                }
+            )
+            merged = True
+            break
+        if not merged:
+            result.append(row)
+    return result, debug_rows
+
+
+def _collapsed_peer_ids(*decision_sets: list[dict]) -> set[str]:
+    collapsed: set[str] = set()
+    for decisions in decision_sets:
+        for row in list(decisions or []):
+            for peer_id in list(row.get("merged_peers", []) or []):
+                if peer_id:
+                    collapsed.add(str(peer_id))
+    return collapsed
+
+
+def _filter_collapsed_peers(rows: list[dict], collapsed_peer_ids: set[str]) -> list[dict]:
+    if not collapsed_peer_ids:
+        return [dict(row) for row in list(rows or [])]
+    filtered: list[dict] = []
+    for row in list(rows or []):
+        row_id = str(row.get("entity_id") or row.get("poi_id") or "")
+        if row_id in collapsed_peer_ids:
+            continue
+        filtered.append(dict(row))
+    return filtered
+
+
+def _assert_no_collapsed_peers(rows: list[dict], collapsed_peer_ids: set[str], *, stage: str) -> None:
+    if not collapsed_peer_ids:
+        return
+    remaining = sorted(
+        str(row.get("entity_id") or row.get("poi_id") or "")
+        for row in list(rows or [])
+        if str(row.get("entity_id") or row.get("poi_id") or "") in collapsed_peer_ids
+    )
+    if remaining:
+        raise AssertionError(f"{stage}: collapsed peers still present: {remaining}")
+
+
+def _cross_canonicalize_pois(detector_pois: list[dict], promoted_structure_pois: list[dict]) -> tuple[list[dict], dict]:
+    merged: dict[str, dict] = {}
+    collapse_debug: list[dict] = []
+
+    def _source_label(row: dict) -> str:
+        return "detector" if str(row.get("promotion_source") or "") != "supplemental_structure_admission" else "structure_promotion"
+
+    def _merge_row(row: dict) -> None:
+        incoming_row = dict(row)
+        incoming_row.setdefault("poi_source_provenance", [_source_label(incoming_row)])
+        incoming_row.setdefault("merged_input_poi_ids", [str(incoming_row.get("poi_id") or incoming_row.get("entity_id") or "")])
+        match_id = None
+        best_score = -1.0
+        hinted_id = str(incoming_row.get("stable_entity_id_hint") or "")
+        if hinted_id and hinted_id in merged:
+            match_id = hinted_id
+            best_score = 999.0
+        for entity_id, candidate in merged.items():
+            if match_id is not None and best_score >= 999.0:
+                break
+            score = _match_score(candidate, incoming_row)
+            if score > best_score:
+                best_score = score
+                match_id = entity_id
+        if match_id is None or best_score < 0.65:
+            match_id = _stable_entity_id(incoming_row)
+        prior = merged.get(match_id, {})
+        if prior:
+            prior_sources = list(prior.get("poi_source_provenance", []) or [])
+            new_sources = list(incoming_row.get("poi_source_provenance", []) or [])
+            collapse_type = "detector vs structure-promotion duplicate"
+            if set(prior_sources) == {"detector"} and set(new_sources) == {"detector"}:
+                collapse_type = "detector vs detector duplicate"
+            elif set(prior_sources) == {"structure_promotion"} and set(new_sources) == {"structure_promotion"}:
+                collapse_type = "structure-promotion vs structure-promotion duplicate"
+            collapse_debug.append(
+                {
+                    "kept_entity_id": match_id,
+                    "incoming_poi_id": str(incoming_row.get("poi_id") or incoming_row.get("entity_id") or ""),
+                    "prior_poi_ids": list(prior.get("merged_input_poi_ids", []) or []),
+                    "incoming_source": _source_label(incoming_row),
+                    "prior_sources": list(prior_sources),
+                    "collapse_type": collapse_type,
+                    "match_score": float(best_score),
+                }
+            )
+        payload = dict(prior)
+        payload.update(incoming_row)
+        payload["entity_id"] = match_id
+        payload["poi_id"] = match_id
+        payload["stable_entity_id"] = match_id
+        payload["bbox"] = _merge_bbox(prior.get("bbox"), incoming_row.get("bbox"))
+        payload["centroid"] = incoming_row.get("centroid") or prior.get("centroid")
+        payload["confidence"] = max(float(prior.get("confidence", 0.0) or 0.0), float(incoming_row.get("confidence", 0.0) or 0.0))
+        payload["observations"] = int(prior.get("observations", 0) or 0) + int(incoming_row.get("observations", 1) or 1)
+        payload["poi_source_provenance"] = sorted(set(list(prior.get("poi_source_provenance", []) or []) + list(incoming_row.get("poi_source_provenance", []) or [])))
+        payload["merged_input_poi_ids"] = list(dict.fromkeys(list(prior.get("merged_input_poi_ids", []) or []) + list(incoming_row.get("merged_input_poi_ids", []) or [])))
+        payload["canonical_track_persistence"] = max(float(prior.get("canonical_track_persistence", 0.0) or 0.0), float(incoming_row.get("canonical_track_persistence", 0.0) or 0.0))
+        merged[match_id] = payload
+
+    for row in list(detector_pois or []):
+        _merge_row(dict(row, poi_source_provenance=["detector"], planner_targetable=True))
+    for row in list(promoted_structure_pois or []):
+        _merge_row(dict(row, poi_source_provenance=["structure_promotion"], planner_targetable=bool(row.get("planner_targetable", False))))
+    rows = sorted(
+        merged.values(),
+        key=lambda row: (-float(row.get("confidence", 0.0) or 0.0), -float(row.get("utility", 0.0) or 0.0), str(row.get("entity_id") or "")),
+    )
+    for row in rows:
+        provenance = set(list(row.get("poi_source_provenance", []) or []))
+        detector_supported = "detector" in provenance
+        structure_only = provenance == {"structure_promotion"}
+        row["planner_targetable"] = bool(
+            detector_supported
+            or (
+                not structure_only
+                and bool(row.get("planner_targetable", False))
+            )
+        )
+        row.setdefault("poi_hierarchy_level", 0)
+        row.setdefault("parent_poi_id", None)
+        row.setdefault("child_poi_ids", [])
+        row.setdefault("hierarchy_role", "parent_region")
+    final_rows, hierarchy_debug = _central_parent_child_canonicalize(rows)
+    return final_rows, {
+        "cross_canonicalized_poi_count": len(final_rows),
+        "cross_canonicalization_collapses": list(collapse_debug),
+        "central_poi_hierarchy_decisions": list(hierarchy_debug),
+    }
 
 
 def _collapse_trigger_zones(rows: list[dict], *, analysis_mode: str) -> list[dict]:
@@ -900,16 +1524,27 @@ def analyze_episode(
     topology_nodes, topology_edges = _topology_from_steps(step_rows)
     topology_nodes, topology_edges = _mode_select_topology(topology_nodes, topology_edges, analysis_mode=analysis_mode)
     consequences = _mode_select_consequences(_consequences(raw_episode, motion, step_summaries, step_rows), analysis_mode=analysis_mode)
-    detected_pois = _mode_select_pois(detect_pois(step_summaries, avatar_tracking, step_rows), analysis_mode=analysis_mode)
+    detected_pois_raw, detector_debug = detect_pois(step_summaries, avatar_tracking, step_rows)
+    detected_pois = _mode_select_pois(detected_pois_raw, analysis_mode=analysis_mode)
     supplemental_structure = _supplemental_structure_entities(
         step_summaries=step_summaries,
         normalized_observations=normalized_observations,
         area_sequence=area_sequence,
     )
-    pois = _attach_target_effects_to_pois(
+    promoted_structure_pois, structure_promotion_debug = _promote_structure_entities_to_pois(supplemental_structure)
+    canonical_planner_pois, cross_canonicalization_debug = _cross_canonicalize_pois(detected_pois, promoted_structure_pois)
+    canonical_planner_pois = _adopt_prior_poi_ids(canonical_planner_pois, blackboard_snapshot)
+    canonical_planner_pois, same_level_parent_debug = _collapse_same_level_central_parents(canonical_planner_pois)
+    collapsed_peer_ids = _collapsed_peer_ids(
+        list(cross_canonicalization_debug.get("central_poi_hierarchy_decisions", [])),
+        list(same_level_parent_debug or []),
+    )
+    canonical_planner_pois = _filter_collapsed_peers(canonical_planner_pois, collapsed_peer_ids)
+    _assert_no_collapsed_peers(canonical_planner_pois, collapsed_peer_ids, stage="post_collapse_canonical_planner_pois")
+    planner_pois = _attach_target_effects_to_pois(
         _attach_identity_to_pois(
         _annotate_pattern_descriptors(
-        _merge_entity_candidates(detected_pois, supplemental_structure),
+        canonical_planner_pois,
         step_summaries=step_summaries,
         normalized_observations=normalized_observations,
         ),
@@ -918,10 +1553,86 @@ def analyze_episode(
         step_rows=step_rows,
         blackboard_snapshot=blackboard_snapshot,
     )
+    planner_pois = _filter_collapsed_peers(planner_pois, collapsed_peer_ids)
+    _assert_no_collapsed_peers(planner_pois, collapsed_peer_ids, stage="post_effect_planner_pois")
+    supplemental_entities = _attach_target_effects_to_pois(
+        _attach_identity_to_pois(
+        _annotate_pattern_descriptors(
+        supplemental_structure,
+        step_summaries=step_summaries,
+        normalized_observations=normalized_observations,
+        ),
+        step_summaries=step_summaries,
+        ),
+        step_rows=step_rows,
+        blackboard_snapshot=blackboard_snapshot,
+    )
+    entity_rows = _merge_entity_candidates(planner_pois, supplemental_entities)
+    entity_rows = _filter_collapsed_peers(entity_rows, collapsed_peer_ids)
+    _assert_no_collapsed_peers(entity_rows, collapsed_peer_ids, stage="entity_rows_before_delta")
     trigger_zones = _collapse_trigger_zones(
         _extract_trigger_zones(step_summaries=step_summaries, step_rows=step_rows, analysis_mode=analysis_mode),
         analysis_mode=analysis_mode,
     )
+    poi_detection_debug = dict(detector_debug or {})
+    if not poi_detection_debug:
+        poi_detection_debug = {
+            "raw_poi_candidates": [],
+            "rejected_tiny_candidates": [],
+            "merged_clusters": [],
+            "final_exported_canonical_pois": [],
+            "supplemental_structure_candidates": [],
+        }
+    poi_detection_debug["supplemental_structure_candidates"] = [
+        {
+            "entity_id": str(row.get("entity_id") or ""),
+            "bbox": dict(row.get("bbox", {}) or {}),
+            "area": int(row.get("area", 0) or 0),
+            "confidence": float(row.get("confidence", 0.0) or 0.0),
+            "identity_confidence": float(row.get("identity_confidence", 0.0) or 0.0),
+            "pattern_id": row.get("pattern_id"),
+        }
+        for row in list(supplemental_structure or [])
+    ]
+    poi_detection_debug["promoted_structure_pois"] = list(structure_promotion_debug.get("promoted_structure_pois", []))
+    poi_detection_debug["structure_entity_candidate_count"] = int(structure_promotion_debug.get("structure_entity_candidate_count", 0) or 0)
+    poi_detection_debug["structure_entity_promoted_count"] = int(structure_promotion_debug.get("structure_entity_promoted_count", 0) or 0)
+    poi_detection_debug["structure_entity_rejection_reason_counts"] = dict(structure_promotion_debug.get("structure_entity_rejection_reason_counts", {}) or {})
+    poi_detection_debug["cross_canonicalized_poi_count"] = int(cross_canonicalization_debug.get("cross_canonicalized_poi_count", 0) or 0)
+    poi_detection_debug["cross_canonicalization_collapses"] = list(cross_canonicalization_debug.get("cross_canonicalization_collapses", []))
+    poi_detection_debug["central_poi_hierarchy_decisions"] = list(cross_canonicalization_debug.get("central_poi_hierarchy_decisions", [])) + list(same_level_parent_debug or [])
+    poi_detection_debug["collapsed_peer_ids"] = sorted(collapsed_peer_ids)
+    poi_detection_debug["detector_only_poi_count"] = len(list(detected_pois or []))
+    poi_detection_debug["promoted_structure_poi_count"] = len(list(promoted_structure_pois or []))
+    canonical_exported_pois = [
+        row
+        for row in list(entity_rows or [])
+        if str(row.get("kind") or "") == "poi" and bool(row.get("planner_visible", True))
+    ]
+    canonical_exported_pois = _filter_collapsed_peers(canonical_exported_pois, collapsed_peer_ids)
+    _assert_no_collapsed_peers(canonical_exported_pois, collapsed_peer_ids, stage="final_exported_canonical_pois")
+    poi_detection_debug["final_exported_canonical_pois"] = [
+        {
+            "poi_id": str(row.get("poi_id") or row.get("entity_id") or ""),
+            "planner_visible": bool(row.get("planner_visible", True)),
+            "poi_bucket": str(row.get("poi_bucket") or ""),
+            "poi_class": str(row.get("poi_class") or row.get("kind") or ""),
+            "bbox": dict(row.get("bbox", {}) or {}),
+            "area": int(row.get("area", 0) or 0),
+            "confidence": float(row.get("confidence", 0.0) or 0.0),
+            "poi_source_provenance": list(row.get("poi_source_provenance", []) or []),
+            "merged_input_poi_ids": list(row.get("merged_input_poi_ids", []) or []),
+            "planner_targetable": bool(row.get("planner_targetable", False)),
+            "poi_hierarchy_level": int(row.get("poi_hierarchy_level", 0) or 0),
+            "parent_poi_id": row.get("parent_poi_id"),
+            "child_poi_ids": list(row.get("child_poi_ids", []) or []),
+            "hierarchy_role": str(row.get("hierarchy_role") or "parent_region"),
+        }
+        for row in canonical_exported_pois
+    ]
+    poi_detection_debug["final_exported_count"] = len(canonical_exported_pois)
+    poi_detection_debug["final_post_merge_observed_poi_count"] = len(canonical_exported_pois)
+    poi_detection_debug["debug_source"] = "canonical_export_pipeline"
 
     delta = BlackboardDelta(
         session_id=raw_episode.session_id,
@@ -978,7 +1689,7 @@ def analyze_episode(
                 contradiction_flag=bool(poi.get("rejected")),
                 observation_support_span=(0, max(0, int(poi.get("observations", 1) or 1) - 1)),
             )
-            for poi in pois
+            for poi in entity_rows
         ),
         consequences=tuple(
             _stamp_row(
@@ -1077,6 +1788,8 @@ def analyze_episode(
             "avatar_path": motion["avatar_path"],
             "step_rows": step_rows,
             "structure_candidates": supplemental_structure,
+            "poi_detection_debug": poi_detection_debug,
+            "collapsed_poi_ids": sorted(collapsed_peer_ids),
         },
     )
 
@@ -1107,7 +1820,7 @@ def analyze_episode(
             for obj in summary["objects"]
         ),
         avatar_tracks=tuple(avatar_tracking["tracks"]),
-        points_of_interest=tuple(pois),
+        points_of_interest=tuple(planner_pois),
         areas=tuple(
             {
                 "area_id": area["area_id"],
@@ -1133,6 +1846,7 @@ def analyze_episode(
             "avatar_tracking": avatar_tracking,
             "motion": motion,
             "structure_candidates": supplemental_structure,
+            "poi_detection_debug": poi_detection_debug,
         },
     )
     mechanic_graph_delta = extract_mechanic_graph_delta(

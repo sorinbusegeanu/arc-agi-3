@@ -246,3 +246,204 @@ def direct_exit_failure_without_prerequisite(events: list[dict]) -> list[Hypothe
         proposals.append(_path("direct_exit_failure_without_prerequisite", src_node_id=str(failure.get("node_id")), dst_node_id=str(failure.get("node_id")), path_kind="direct_exit_failure_without_prerequisite", edge_kinds=("contradicts",), round_id=int(failure.get("round_id", 0) or 0), episode_ids=(str(failure.get("episode_id")),), support_events=support_events, contradiction_events=triggers, confidence=0.55))
         proposals.append(_path("counterfactual_exit_failure_without_chain", src_node_id=str(failure.get("node_id")), dst_node_id=str(failure.get("node_id")), path_kind="counterfactual_exit_failure_without_chain", edge_kinds=("contradicts",), round_id=int(failure.get("round_id", 0) or 0), episode_ids=(str(failure.get("episode_id")),), support_events=support_events, contradiction_events=triggers, confidence=0.6))
     return proposals
+
+
+def visited_poi_then_remote_change(events: list[dict]) -> list[HypothesisEdgeProposal]:
+    return [
+        _edge(
+            "visited_poi_then_remote_change",
+            src_node_id=str(event.get("node_id") or ""),
+            dst_node_id=str(event.get("other_node_id") or ""),
+            edge_kind="causes_remote_change",
+            round_id=int(event.get("round_id", 0) or 0),
+            episode_ids=(str(event.get("episode_id") or ""),),
+            support_events=[event],
+            confidence=0.6,
+        )
+        for event in events
+        if str(event.get("event_kind") or "") == "poi_visit_then_remote_change"
+    ]
+
+
+def visited_poi_then_panel_or_gate_change(events: list[dict]) -> list[HypothesisEdgeProposal]:
+    proposals = []
+    for event in events:
+        kind = str(event.get("event_kind") or "")
+        if kind not in {"poi_visit_then_panel_change", "poi_visit_then_gate_change"}:
+            continue
+        proposals.append(
+            _edge(
+                "visited_poi_then_panel_or_gate_change",
+                src_node_id=str(event.get("node_id") or ""),
+                dst_node_id=str(event.get("other_node_id") or ""),
+                edge_kind="changes" if kind == "poi_visit_then_panel_change" else "controls_access",
+                round_id=int(event.get("round_id", 0) or 0),
+                episode_ids=(str(event.get("episode_id") or ""),),
+                support_events=[event],
+                confidence=0.58,
+            )
+        )
+    return proposals
+
+
+def visited_poi_then_exit_becomes_more_promising(events: list[dict]) -> list[HypothesisPathProposal]:
+    return [
+        _path(
+            "visited_poi_then_exit_becomes_more_promising",
+            src_node_id=str(event.get("node_id") or ""),
+            dst_node_id=str(event.get("other_node_id") or ""),
+            path_kind="visited_poi_then_exit_becomes_more_promising",
+            edge_kinds=("requires", "enables_exit"),
+            round_id=int(event.get("round_id", 0) or 0),
+            episode_ids=(str(event.get("episode_id") or ""),),
+            support_events=[event],
+            confidence=0.56,
+        )
+        for event in events
+        if str(event.get("event_kind") or "") == "poi_visit_then_exit_attempt_change"
+    ]
+
+
+def repeated_probe_without_effect_demotes_poi(events: list[dict]) -> list[HypothesisEdgeProposal]:
+    return [
+        _edge(
+            "repeated_probe_without_effect_demotes_poi",
+            src_node_id=str(event.get("node_id") or ""),
+            dst_node_id=str(event.get("node_id") or ""),
+            edge_kind="contradicts",
+            round_id=int(event.get("round_id", 0) or 0),
+            episode_ids=(str(event.get("episode_id") or ""),),
+            support_events=[event],
+            confidence=0.52,
+        )
+        for event in events
+        if str(event.get("event_kind") or "") == "repeated_probe_without_new_effect"
+    ]
+
+
+def trigger_candidate_from_detector_poi(events: list[dict]) -> list[HypothesisPathProposal]:
+    proposals = []
+    for event in events:
+        if str(event.get("event_kind") or "") not in {"poi_visit_then_remote_change", "poi_visit_then_panel_change", "poi_visit_then_gate_change"}:
+            continue
+        proposals.append(
+            _path(
+                "trigger_candidate_from_detector_poi",
+                src_node_id=str(event.get("node_id") or ""),
+                dst_node_id=str(event.get("other_node_id") or ""),
+                path_kind="trigger_candidate_from_detector_poi",
+                edge_kinds=("changes", "causes_remote_change"),
+                round_id=int(event.get("round_id", 0) or 0),
+                episode_ids=(str(event.get("episode_id") or ""),),
+                support_events=[event],
+                confidence=0.57,
+            )
+        )
+    return proposals
+
+
+def failed_exit_without_new_support_demotes_attempt_exit(events: list[dict]) -> list[HypothesisEdgeProposal]:
+    return [
+        _edge(
+            "failed_exit_without_new_support_demotes_attempt_exit",
+            src_node_id=str(event.get("node_id") or ""),
+            dst_node_id=str(event.get("node_id") or ""),
+            edge_kind="contradicts",
+            round_id=int(event.get("round_id", 0) or 0),
+            episode_ids=(str(event.get("episode_id") or ""),),
+            support_events=[event],
+            confidence=0.62,
+        )
+        for event in events
+        if str(event.get("event_kind") or "") == "exit_attempt_failed_without_new_support"
+    ]
+
+
+def position_hold_after_exit_attempt_requires_verification_first(events: list[dict]) -> list[HypothesisPathProposal]:
+    return [
+        _path(
+            "position_hold_after_exit_attempt_requires_verification_first",
+            src_node_id=str(event.get("node_id") or ""),
+            dst_node_id=str(event.get("node_id") or ""),
+            path_kind="position_hold_after_exit_attempt_requires_verification_first",
+            edge_kinds=("contradicts", "requires"),
+            round_id=int(event.get("round_id", 0) or 0),
+            episode_ids=(str(event.get("episode_id") or ""),),
+            support_events=[event],
+            confidence=0.58,
+        )
+        for event in events
+        if str(event.get("event_kind") or "") == "position_hold_after_exit_attempt"
+    ]
+
+
+def verification_missing_blocks_unlock_then_exit(events: list[dict]) -> list[HypothesisPathProposal]:
+    candidates = [event for event in events if str(event.get("event_kind") or "") in {"expected_match_missing", "repeated_probe_without_new_effect"}]
+    return [
+        _path(
+            "verification_missing_blocks_unlock_then_exit",
+            src_node_id=str(event.get("node_id") or ""),
+            dst_node_id=str(event.get("node_id") or ""),
+            path_kind="verification_missing_blocks_unlock_then_exit",
+            edge_kinds=("requires", "contradicts"),
+            round_id=int(event.get("round_id", 0) or 0),
+            episode_ids=(str(event.get("episode_id") or ""),),
+            support_events=[event],
+            confidence=0.54,
+        )
+        for event in candidates
+    ]
+
+
+def missing_trigger_confirmation_promotes_verify_trigger_contact(events: list[dict]) -> list[HypothesisPathProposal]:
+    return [
+        _path(
+            "missing_trigger_confirmation_promotes_verify_trigger_contact",
+            src_node_id=str(event.get("node_id") or ""),
+            dst_node_id=str(event.get("node_id") or ""),
+            path_kind="missing_trigger_confirmation_promotes_verify_trigger_contact",
+            edge_kinds=("requires",),
+            round_id=int(event.get("round_id", 0) or 0),
+            episode_ids=(str(event.get("episode_id") or ""),),
+            support_events=[event],
+            confidence=0.52,
+        )
+        for event in events
+        if str(event.get("event_kind") or "") == "repeated_probe_without_new_effect"
+    ]
+
+
+def missing_remote_effect_promotes_reobserve_remote_change(events: list[dict]) -> list[HypothesisPathProposal]:
+    return [
+        _path(
+            "missing_remote_effect_promotes_reobserve_remote_change",
+            src_node_id=str(event.get("node_id") or ""),
+            dst_node_id=str(event.get("node_id") or ""),
+            path_kind="missing_remote_effect_promotes_reobserve_remote_change",
+            edge_kinds=("causes_remote_change",),
+            round_id=int(event.get("round_id", 0) or 0),
+            episode_ids=(str(event.get("episode_id") or ""),),
+            support_events=[event],
+            confidence=0.53,
+        )
+        for event in events
+        if str(event.get("event_kind") or "") in {"repeated_probe_without_new_effect", "expected_match_missing"}
+    ]
+
+
+def missing_gate_or_panel_confirmation_promotes_verify_panel_or_gate(events: list[dict]) -> list[HypothesisPathProposal]:
+    return [
+        _path(
+            "missing_gate_or_panel_confirmation_promotes_verify_panel_or_gate",
+            src_node_id=str(event.get("node_id") or ""),
+            dst_node_id=str(event.get("node_id") or ""),
+            path_kind="missing_gate_or_panel_confirmation_promotes_verify_panel_or_gate",
+            edge_kinds=("matches", "controls_access"),
+            round_id=int(event.get("round_id", 0) or 0),
+            episode_ids=(str(event.get("episode_id") or ""),),
+            support_events=[event],
+            confidence=0.53,
+        )
+        for event in events
+        if str(event.get("event_kind") or "") in {"expected_match_missing", "position_hold_after_exit_attempt"}
+    ]

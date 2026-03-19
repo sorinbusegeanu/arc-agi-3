@@ -7,6 +7,7 @@ def run_subgoal_chain_eval(
     *,
     metadata_only_chain_events: list[dict],
     executable_subgoal_chain_events: list[dict],
+    verification_first_chain_events: list[dict] | None = None,
     games: list[str],
     seeds: list[int],
     round_budget: int,
@@ -22,5 +23,6 @@ def run_subgoal_chain_eval(
         "comparison": {
             "metadata_only_chain_mode": compute_subgoal_chain_metrics(metadata_only_chain_events, total_rounds=round_budget * max(1, len(games) * len(seeds))),
             "executable_subgoal_chain_mode": compute_subgoal_chain_metrics(executable_subgoal_chain_events, total_rounds=round_budget * max(1, len(games) * len(seeds))),
+            "verification_first_exit_gating_mode": compute_subgoal_chain_metrics(list(verification_first_chain_events or []), total_rounds=round_budget * max(1, len(games) * len(seeds))),
         },
     }

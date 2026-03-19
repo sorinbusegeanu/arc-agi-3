@@ -277,7 +277,7 @@ def extract_mechanic_graph_delta(
     llm_adapter: object | None = None,
     hypothesis_registry_snapshot: dict | None = None,
 ) -> MechanicGraphDelta:
-    del current_blackboard_snapshot, current_mechanic_graph_snapshot, hypothesis_config, llm_adapter, hypothesis_registry_snapshot
+    del current_mechanic_graph_snapshot, hypothesis_config, llm_adapter, hypothesis_registry_snapshot
     summary = dict(analyzed_episode.summary or {})
     step_rows = list(summary.get("step_rows", []) or [])
     pois = [dict(row) for row in list(analyzed_episode.points_of_interest or [])]
@@ -561,6 +561,69 @@ def extract_mechanic_graph_delta(
                 "direct_support_present": False,
             }
         )
+
+    current_entities = dict(dict(current_blackboard_snapshot or {}).get("entities", {}) or {})
+    for step in list(step_rows or []):
+        target_entity_id = str(step.get("target_entity_id") or "")
+        if not target_entity_id:
+            continue
+        target_row = dict(current_entities.get(target_entity_id, {}) or {})
+        provenance = {str(value) for value in list(target_row.get("poi_source_provenance", []) or []) if value}
+        if str(target_row.get("kind") or "") != "poi" or "detector" not in provenance:
+            continue
+        poi_node = nodes_by_object.get(target_entity_id)
+        if poi_node is None:
+            continue
+        changed_cells = int(step.get("changed_cells", 0) or 0)
+        if changed_cells > 0:
+            effect_node = _effect_region_node(dict(step.get("telemetry", {}) or {}).get("effect_region", {}) or {"step_idx": int(step.get("step_idx", 0) or 0), "changed_cells": changed_cells, "bbox": dict(dict(step.get("telemetry", {}) or {}).get("effect_region", {}) or {}).get("bbox", [])}, round_id=raw_episode.round_id, episode_id=raw_episode.episode_id)
+            nodes.append(effect_node)
+            edges.append(
+                {
+                    "edge_id": f"mg_edge:{stable_digest((poi_node['node_id'], 'causes_remote_change', effect_node['node_id'], 'poi_visit'))}",
+                    "src_node_id": poi_node["node_id"],
+                    "edge_kind": "causes_remote_change",
+                    "dst_node_id": effect_node["node_id"],
+                    "condition_key": f"poi_visit:{target_entity_id}",
+                    "evidence_tier": "hypothesized",
+                    "confidence": 0.56,
+                    "source_episode_ids": [raw_episode.episode_id],
+                    "source_round_ids": [raw_episode.round_id],
+                    "support_count": 1,
+                    "contradiction_count": 0,
+                    "first_seen_round": raw_episode.round_id,
+                    "last_seen_round": raw_episode.round_id,
+                    "direct_support_present": False,
+                    "poi_visit_support_count": 1,
+                    "post_visit_remote_change_count": 1,
+                    "directed_outcome_support_count": 1 if bool(step.get("trigger_contact_based_on_confident_avatar")) else 0,
+                }
+            )
+        exit_failed_without_new_support = bool(step.get("exit_attempt_failed_without_new_support", False))
+        if str(step.get("termination_reason") or "") in {"done", "blocked", "exit_failure"} and not exit_failed_without_new_support:
+            exit_node = next((node for node in nodes if str(node.get("node_kind") or "") == "exit"), None)
+            if exit_node is not None:
+                edges.append(
+                    {
+                        "edge_id": f"mg_edge:{stable_digest((poi_node['node_id'], 'requires', exit_node['node_id'], 'poi_visit_exit'))}",
+                        "src_node_id": poi_node["node_id"],
+                        "edge_kind": "requires",
+                        "dst_node_id": exit_node["node_id"],
+                        "condition_key": f"poi_exit:{target_entity_id}",
+                        "evidence_tier": "hypothesized",
+                        "confidence": 0.52,
+                        "source_episode_ids": [raw_episode.episode_id],
+                        "source_round_ids": [raw_episode.round_id],
+                        "support_count": 1,
+                        "contradiction_count": 0,
+                        "first_seen_round": raw_episode.round_id,
+                        "last_seen_round": raw_episode.round_id,
+                        "direct_support_present": False,
+                        "poi_visit_support_count": 1,
+                        "post_visit_exit_effect_count": 1,
+                        "directed_outcome_support_count": 1 if bool(step.get("new_support_since_previous_exit_attempt", False)) else 0,
+                    }
+                )
 
     delta = MechanicGraphDelta(
         session_id=raw_episode.session_id,

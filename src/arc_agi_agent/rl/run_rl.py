@@ -308,7 +308,7 @@ def _collect_with_progress(pool_obj: Any, payloads: List[Dict[str, Any]], iter_i
             st_count = sum(len(ep.get("steps", [])) for ep in part.get("episodes", []))
             done_episodes += ep_count
             done_steps += st_count
-            logger.debug(
+            logger.info(
                 "collect_batch_progress iter=%s workers_done=%s/%s episodes_done=%s/%s steps_done=%s",
                 iter_idx,
                 done_workers,
@@ -318,8 +318,8 @@ def _collect_with_progress(pool_obj: Any, payloads: List[Dict[str, Any]], iter_i
                 done_steps,
             )
         now = time.time()
-        if (not progressed) and now - last_emit >= 5.0:
-            logger.debug(
+        if (not progressed) and now - last_emit >= 30.0:
+            logger.info(
                 "collect_batch_wait iter=%s workers_done=%s/%s episodes_done=%s/%s",
                 iter_idx,
                 done_workers,

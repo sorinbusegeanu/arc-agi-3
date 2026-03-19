@@ -125,6 +125,7 @@ class RLConfig:
         default_factory=lambda: {
             "alpha_novel": 0.05,
             "beta_effect": 0.02,
+            "match_poi": 0.5,
             "negative_step": 0.5,
             "delta_loop": 0.05,
             "loop_window_N": 25,

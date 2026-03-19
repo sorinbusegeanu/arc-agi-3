@@ -334,7 +334,7 @@ class SkillMemoryState:
         target_entity_id = selected.get("target_entity_id")
         target_area_id = selected.get("target_area_id")
         candidate_id = outcome.get("candidate_id") if isinstance(outcome, dict) else None
-        if candidate_class == "fallback_hold":
+        if candidate_class in {"fallback_hold", "fallback_action"}:
             candidate_id = None
             target_entity_id = None
             target_area_id = None
@@ -345,22 +345,44 @@ class SkillMemoryState:
 
         cooldowns = advance_cooldowns(self.working_memory.get("cooldowns", {})) if int(pass_id) == 1 else _copy_nested(self.working_memory.get("cooldowns", {}))
         if int(pass_id) == 1:
+            retry_candidate_id = candidate_id or selected.get("candidate_id")
+            retry_target_entity_id = target_entity_id
+            retry_target_area_id = target_area_id
+            if candidate_class == "route_probe":
+                retry_candidate_id = None
+                retry_target_entity_id = None
+                retry_target_area_id = None
+            elif candidate_class in {"fallback_hold", "fallback_action"}:
+                retry_candidate_id = None
+                retry_target_entity_id = None
+                retry_target_area_id = None
             retries = update_retry_ledgers(
                 self.working_memory.get("retries", {}),
-                candidate_id=candidate_id or selected.get("candidate_id"),
-                target_entity_id=target_entity_id,
-                target_area_id=target_area_id,
+                candidate_id=retry_candidate_id,
+                target_entity_id=retry_target_entity_id,
+                target_area_id=retry_target_area_id,
                 success=success,
                 termination_reason=termination_reason,
             )
         else:
             retries = _copy_nested(self.working_memory.get("retries", {}))
         if int(pass_id) == 1 and outcome is not None and not success:
+            cooldown_candidate_id = candidate_id or selected.get("candidate_id")
+            cooldown_target_entity_id = target_entity_id
+            cooldown_target_area_id = target_area_id
+            if candidate_class == "route_probe":
+                cooldown_candidate_id = None
+                cooldown_target_entity_id = None
+                cooldown_target_area_id = None
+            elif candidate_class in {"fallback_hold", "fallback_action"}:
+                cooldown_candidate_id = None
+                cooldown_target_entity_id = None
+                cooldown_target_area_id = None
             cooldowns = apply_failure_cooldowns(
                 cooldowns,
-                candidate_id=candidate_id or selected.get("candidate_id"),
-                target_entity_id=target_entity_id,
-                target_area_id=target_area_id,
+                candidate_id=cooldown_candidate_id,
+                target_entity_id=cooldown_target_entity_id,
+                target_area_id=cooldown_target_area_id,
                 cooldown_rounds=cooldown_rounds,
                 reason=str(termination_reason or "failure"),
             )
@@ -370,6 +392,7 @@ class SkillMemoryState:
             decision=decision,
             outcome=outcome,
             blackboard_state=blackboard_state,
+            mechanic_graph_state=mechanic_graph_state,
             mode=outcome_mode,
         )
         if int(pass_id) == 1:

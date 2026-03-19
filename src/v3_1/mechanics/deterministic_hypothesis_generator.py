@@ -4,14 +4,25 @@ from v3_1.mechanics.deterministic_rules import (
     contact_then_remote_change,
     direct_exit_failure_without_prerequisite,
     exit_success_after_prerequisite,
+    failed_exit_without_new_support_demotes_attempt_exit,
     gate_controls_exit,
+    missing_gate_or_panel_confirmation_promotes_verify_panel_or_gate,
+    missing_remote_effect_promotes_reobserve_remote_change,
+    missing_trigger_confirmation_promotes_verify_trigger_contact,
     movement_change_dependency_path,
     movement_then_remote_change,
     panel_matches_gate,
     pattern_equality_match,
+    position_hold_after_exit_attempt_requires_verification_first,
+    repeated_probe_without_effect_demotes_poi,
     trigger_changes_panel,
+    trigger_candidate_from_detector_poi,
     trigger_required_before_exit,
     trigger_to_exit_dependency_path,
+    verification_missing_blocks_unlock_then_exit,
+    visited_poi_then_exit_becomes_more_promising,
+    visited_poi_then_panel_or_gate_change,
+    visited_poi_then_remote_change,
 )
 from v3_1.mechanics.deterministic_scoring import score_deterministic_proposal, summarize_support
 from v3_1.mechanics.deterministic_tests import generate_deterministic_tests
@@ -30,12 +41,23 @@ def generate_deterministic_hypotheses(raw_episode, analyzed_episode, mechanic_gr
         *trigger_required_before_exit(events),
         *trigger_changes_panel(events),
         *panel_matches_gate(events),
+        *visited_poi_then_remote_change(events),
+        *visited_poi_then_panel_or_gate_change(events),
+        *repeated_probe_without_effect_demotes_poi(events),
+        *failed_exit_without_new_support_demotes_attempt_exit(events),
     ]
     path_proposals = [
         *trigger_to_exit_dependency_path(events),
         *movement_change_dependency_path(events),
         *exit_success_after_prerequisite(events),
         *direct_exit_failure_without_prerequisite(events),
+        *visited_poi_then_exit_becomes_more_promising(events),
+        *trigger_candidate_from_detector_poi(events),
+        *position_hold_after_exit_attempt_requires_verification_first(events),
+        *verification_missing_blocks_unlock_then_exit(events),
+        *missing_trigger_confirmation_promotes_verify_trigger_contact(events),
+        *missing_remote_effect_promotes_reobserve_remote_change(events),
+        *missing_gate_or_panel_confirmation_promotes_verify_panel_or_gate(events),
     ]
     deduped_edges = {proposal.proposal_id: proposal for proposal in edge_proposals}
     deduped_paths = {proposal.proposal_id: proposal for proposal in path_proposals}

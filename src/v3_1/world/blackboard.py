@@ -7,6 +7,8 @@ from v3_1.contracts.versions import next_blackboard_version
 from v3_1.utils.ids import make_handle
 from v3_1.world.merge import apply_delta
 
+PLANNER_VISIBLE_POI_BUCKETS = {"structural", "interactable_object"}
+
 
 def _empty_blackboard_state() -> dict:
     return {
@@ -127,9 +129,11 @@ def _build_strict_indexes(*, areas: dict, entities: dict, consequences: dict, tr
         row = {"entity_id": str(entity_id), "area_id": area_id, "evidence_tier": str(entity.get("evidence_tier") or "hypothesized")}
         entities_by_area.setdefault(area_id, []).append(row)
         if entity.get("kind") == "poi":
-            pois_by_area.setdefault(area_id, []).append(row)
-            poi_type = str(entity.get("canonical_descriptor", {}).get("kind") or entity.get("kind") or "unknown")
-            pois_by_type.setdefault(poi_type, []).append(row)
+            poi_bucket = str(entity.get("poi_bucket") or "")
+            if bool(entity.get("planner_visible", True)) and bool(entity.get("planner_targetable", True)) and poi_bucket in PLANNER_VISIBLE_POI_BUCKETS:
+                pois_by_area.setdefault(area_id, []).append(row)
+                poi_type = str(entity.get("poi_class") or entity.get("canonical_descriptor", {}).get("kind") or entity.get("kind") or "unknown")
+                pois_by_type.setdefault(poi_type, []).append(row)
         if entity.get("reachable_now"):
             reachable_targets.append(row)
         elif entity.get("reachable_later"):

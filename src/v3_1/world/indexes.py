@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from v3_1.world.consequences import normalized_consequence_action_key
 
+PLANNER_VISIBLE_POI_BUCKETS = {"structural", "interactable_object"}
+
 
 def build_indexes(state: dict) -> dict:
     entities_by_area: dict[str, list[str]] = {}
@@ -24,13 +26,22 @@ def build_indexes(state: dict) -> dict:
             for cell in area["topology_cells"]:
                 topology_lookup["node_ids_by_cell"][f"{cell[0]}:{cell[1]}"] = f"cell:{cell[0]}:{cell[1]}"
 
+    def _poi_sort_key(entity_id: str) -> tuple[int, str]:
+        entity = dict(state.get("entities", {}).get(entity_id, {}) or {})
+        return (
+            int(entity.get("poi_hierarchy_level", 0) or 0),
+            str(entity_id),
+        )
+
     for entity_id, entity in state.get("entities", {}).items():
         area_id = str(entity.get("area_id") or "global")
         entities_by_area.setdefault(area_id, []).append(entity_id)
         if entity.get("kind") == "poi":
-            pois_by_area.setdefault(area_id, []).append(entity_id)
-            poi_type = str(entity.get("canonical_descriptor", {}).get("kind") or entity.get("kind"))
-            pois_by_type.setdefault(poi_type, []).append(entity_id)
+            poi_bucket = str(entity.get("poi_bucket") or "")
+            if bool(entity.get("planner_visible", True)) and bool(entity.get("planner_targetable", True)) and poi_bucket in PLANNER_VISIBLE_POI_BUCKETS:
+                pois_by_area.setdefault(area_id, []).append(entity_id)
+                poi_type = str(entity.get("poi_class") or entity.get("canonical_descriptor", {}).get("kind") or entity.get("kind"))
+                pois_by_type.setdefault(poi_type, []).append(entity_id)
         if entity.get("reachable_now"):
             reachable_targets.append(entity_id)
         elif entity.get("reachable_later"):
@@ -51,7 +62,7 @@ def build_indexes(state: dict) -> dict:
 
     return {
         "entities_by_area": {key: sorted(value) for key, value in entities_by_area.items()},
-        "pois_by_area": {key: sorted(value) for key, value in pois_by_area.items()},
+        "pois_by_area": {key: sorted(value, key=_poi_sort_key) for key, value in pois_by_area.items()},
         "pois_by_type": {key: sorted(value) for key, value in pois_by_type.items()},
         "reachable_targets": sorted(reachable_targets),
         "blocked_targets": sorted(blocked_targets),

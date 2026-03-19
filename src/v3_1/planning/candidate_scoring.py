@@ -6,6 +6,12 @@ DEFAULT_CLASS_WEIGHTS = {
     "explore_frontier": {"utility": 0.7, "progress": 1.05, "novelty": 1.0},
     "probe_route": {"utility": 0.65, "progress": 1.0, "novelty": 0.85},
     "test_trigger": {"utility": 1.0, "progress": 0.85, "novelty": 0.6},
+    "verify_trigger_contact": {"utility": 1.0, "progress": 0.95, "novelty": 0.55},
+    "reobserve_remote_change": {"utility": 0.95, "progress": 0.85, "novelty": 0.65},
+    "verify_panel_state": {"utility": 1.0, "progress": 0.9, "novelty": 0.55},
+    "verify_gate_match": {"utility": 1.0, "progress": 0.9, "novelty": 0.5},
+    "trigger_then_target": {"utility": 1.1, "progress": 1.0, "novelty": 0.45},
+    "unlock_then_exit": {"utility": 1.15, "progress": 1.05, "novelty": 0.35},
     "recover": {"utility": 0.6, "progress": 0.8, "novelty": 0.4},
     "fallback": {"utility": 0.1, "progress": 0.1, "novelty": 0.0},
 }
@@ -45,6 +51,13 @@ def score_candidates(
     recovery_priors = dict(durable_prior_view.get("recovery_patterns", {}))
     versions = dict(uncertainty_context.get("versions", {}) or belief_fallback.get("versions", {}) or {})
     planning_mode = str(belief_fallback.get("planning_mode") or uncertainty_context.get("planning_mode") or "default_progress")
+    promising_pois = list(belief_fallback.get("promising_pois", []) or [])
+    approachable_pois = list(belief_fallback.get("approachable_pois", []) or [])
+    poi_followthrough = {
+        str(key): dict(value)
+        for key, value in dict(belief_fallback.get("detector_poi_followthrough", {}) or {}).items()
+        if isinstance(value, dict)
+    }
 
     scored = []
     for row in candidates:
@@ -189,6 +202,79 @@ def score_candidates(
         repeated_observed_support_bonus = 0.08 if len(list(candidate.get("seed_observed_row_ids", []))) > 1 else 0.0
         directed_outcome_backed_bonus = 0.1 if float(candidate.get("support_strength", {}).get("direct_support", 0.0)) > 0.5 and objective_type in {"interact", "test_trigger", "recover"} else 0.0
         score_used_compatibility_fallback = bool(str(candidate.get("seed_contract") or "") == "compatibility_fallback")
+        candidate_provenance = set(str(value) for value in list(candidate.get("poi_source_provenance", []) or []))
+        detector_backed_bonus = 0.14 if "detector" in candidate_provenance and str(candidate.get("target_entity_class") or "") == "poi" else 0.0
+        target_followthrough = dict(poi_followthrough.get(str(target_entity_id or ""), {}) or {})
+        stronger_followup_exists = bool(
+            int(target_followthrough.get("new_graph_edges", 0) or 0) > 0
+            or int(target_followthrough.get("new_hypothesis_support", 0) or 0) > 0
+            or int(target_followthrough.get("new_verification_candidates", 0) or 0) > 0
+            or int(target_followthrough.get("changed_exit_linked_evidence", 0) or 0) > 0
+            or bool(target_followthrough.get("probe_stale", False))
+            or int(target_followthrough.get("revisit_count", 0) or 0) >= 2
+        )
+        repeated_probe_penalty = 0.0
+        probe_escalation_bonus = 0.0
+        if str(candidate.get("candidate_class") or "") == "route_probe":
+            repeated_probe_penalty += 0.08 * min(3, int(target_followthrough.get("revisit_count", 0) or 0))
+            if bool(target_followthrough.get("probe_stale", False)):
+                repeated_probe_penalty += 0.16
+            if stronger_followup_exists or bool(candidate.get("route_probe_should_defer_to_escalation")):
+                repeated_probe_penalty += 0.2
+            if int(target_followthrough.get("new_support_delta", 0) or 0) <= 0:
+                repeated_probe_penalty += 0.06 * min(2, int(target_followthrough.get("revisit_count", 0) or 0))
+        elif str(candidate.get("objective_type") or "") in {"verify_trigger_contact", "reobserve_remote_change", "verify_panel_state", "verify_gate_match", "trigger_then_target", "unlock_then_exit"}:
+            probe_escalation_bonus += 0.08 * min(3, int(target_followthrough.get("revisit_count", 0) or 0))
+            probe_escalation_bonus += 0.05 * min(4, int(target_followthrough.get("new_graph_edges", 0) or 0))
+            probe_escalation_bonus += 0.05 * min(4, int(target_followthrough.get("new_hypothesis_support", 0) or 0))
+            probe_escalation_bonus += 0.06 * min(4, int(target_followthrough.get("new_verification_candidates", 0) or 0))
+            probe_escalation_bonus += 0.06 * min(4, int(target_followthrough.get("changed_exit_linked_evidence", 0) or 0))
+            if bool(target_followthrough.get("probe_stale", False)):
+                probe_escalation_bonus += 0.12
+            if int(target_followthrough.get("revisit_count", 0) or 0) >= 2:
+                probe_escalation_bonus += 0.1
+        strong_detector_alternative_exists = any(
+            str(poi.get("target_area_id") or poi.get("area_id") or "") == str(candidate.get("target_area_id") or "")
+            or bool(poi.get("returned_by_area_local_pois"))
+            for poi in list(promising_pois) + list(approachable_pois)
+        )
+        frontier_detector_displacement_penalty = 0.12 if str(candidate.get("candidate_class") or "") == "frontier_move" and strong_detector_alternative_exists else 0.0
+        exit_readiness_score = float(candidate.get("exit_readiness_score", 0.0) or 0.0)
+        has_verified_trigger_contact = bool(candidate.get("has_verified_trigger_contact", False))
+        has_remote_change_support = bool(candidate.get("has_remote_change_support", False))
+        has_panel_or_gate_confirmation = bool(candidate.get("has_panel_or_gate_confirmation", False))
+        has_new_support_since_last_exit_attempt = bool(candidate.get("has_new_support_since_last_exit_attempt", False))
+        last_exit_attempt_failed_without_new_support = bool(candidate.get("last_exit_attempt_failed_without_new_support", False))
+        missing_prerequisites = list(candidate.get("missing_prerequisite_types", []) or [])
+        chain_hypothesis_only = bool(candidate.get("depends_on_hypothesized_only_edges")) and str(candidate.get("candidate_class") or "") in {"unlock_then_exit", "mechanic_chain_deterministic", "mechanic_chain_llm"}
+        recent_exit_failure_reason = str(target_followthrough.get("last_exit_failure_reason") or "")
+        prior_chain_position_hold = recent_exit_failure_reason == "position_hold"
+        premature_exit_penalty = 0.0
+        verification_preference_bonus = 0.0
+        if str(candidate.get("candidate_class") or "") in {"unlock_then_exit", "mechanic_chain_deterministic", "mechanic_chain_llm"}:
+            if not has_verified_trigger_contact:
+                premature_exit_penalty += 0.18
+            if not has_remote_change_support:
+                premature_exit_penalty += 0.16
+            if not has_panel_or_gate_confirmation:
+                premature_exit_penalty += 0.14
+            if last_exit_attempt_failed_without_new_support:
+                premature_exit_penalty += 0.24
+            if chain_hypothesis_only:
+                premature_exit_penalty += 0.18
+            if prior_chain_position_hold and not (has_verified_trigger_contact or has_remote_change_support or has_panel_or_gate_confirmation):
+                premature_exit_penalty += 0.32
+        if str(candidate.get("objective_type") or "") in {"verify_trigger_contact", "reobserve_remote_change", "verify_panel_state", "verify_gate_match"}:
+            if (
+                exit_readiness_score < 0.72
+                and (
+                    str(candidate.get("objective_type") or "") in missing_prerequisites
+                    or (str(candidate.get("objective_type") or "") in {"verify_panel_state", "verify_gate_match"} and "verify_panel_or_gate" in missing_prerequisites)
+                )
+            ):
+                verification_preference_bonus += 0.28
+            if last_exit_attempt_failed_without_new_support:
+                verification_preference_bonus += 0.12
 
         progress_score = (
             novelty * float(getattr(planning_cfg, "novelty_weight", 0.6))
@@ -207,6 +293,8 @@ def score_candidates(
             + direct_observed_support_bonus
             + repeated_observed_support_bonus
             + directed_outcome_backed_bonus
+            + detector_backed_bonus
+            + probe_escalation_bonus
             + graph_observed_bonus
             + graph_path_bonus
             + graph_pattern_bonus
@@ -249,6 +337,9 @@ def score_candidates(
             - zero_observed_support_penalty
             - contradiction_seed_penalty
             - compatibility_alias_penalty
+            - frontier_detector_displacement_penalty
+            - repeated_probe_penalty
+            - premature_exit_penalty
             - 0.08 * prior_failure_rate
             - 0.07 * prior_route_failure_risk
             - (0.05 * hypothesized_consequence_count)
@@ -259,7 +350,11 @@ def score_candidates(
             + (0.18 * evidence_diversity_score)
             + direct_observed_support_bonus
             + repeated_observed_support_bonus
+            + detector_backed_bonus
+            + probe_escalation_bonus
+            + verification_preference_bonus
             - seed_requires_hypothesis_penalty
+            - repeated_probe_penalty
             - zero_observed_support_penalty
             - (0.08 * max(0.0, route_cost - 0.5))
         )
@@ -269,7 +364,12 @@ def score_candidates(
             + chain_directed_bonus
             + planner_usable_hypothesis_bonus
             + direct_observed_support_bonus
+            + detector_backed_bonus
+            + probe_escalation_bonus
+            + verification_preference_bonus
             - contradiction_seed_penalty
+            - repeated_probe_penalty
+            - premature_exit_penalty
             - contradiction_hypothesis_penalty
             - chain_no_verification_penalty
             - synthetic_trigger_chain_penalty
@@ -334,6 +434,21 @@ def score_candidates(
             "direct_observed_support_bonus": direct_observed_support_bonus,
             "repeated_observed_support_bonus": repeated_observed_support_bonus,
             "directed_outcome_backed_bonus": directed_outcome_backed_bonus,
+            "detector_backed_bonus": detector_backed_bonus,
+            "repeated_probe_penalty": repeated_probe_penalty,
+            "probe_escalation_bonus": probe_escalation_bonus,
+            "probe_escalation_available": stronger_followup_exists or bool(candidate.get("probe_escalation_available")),
+            "frontier_detector_displacement_penalty": frontier_detector_displacement_penalty,
+            "exit_readiness_score": exit_readiness_score,
+            "premature_exit_penalty": premature_exit_penalty,
+            "verification_preference_bonus": verification_preference_bonus,
+            "has_verified_trigger_contact": has_verified_trigger_contact,
+            "has_remote_change_support": has_remote_change_support,
+            "has_panel_or_gate_confirmation": has_panel_or_gate_confirmation,
+            "has_new_support_since_last_exit_attempt": has_new_support_since_last_exit_attempt,
+            "last_exit_attempt_failed_without_new_support": last_exit_attempt_failed_without_new_support,
+            "missing_prerequisite_types": missing_prerequisites,
+            "prior_chain_position_hold": prior_chain_position_hold,
             "graph_observed_bonus": graph_observed_bonus,
             "graph_path_bonus": graph_path_bonus,
             "graph_pattern_bonus": graph_pattern_bonus,

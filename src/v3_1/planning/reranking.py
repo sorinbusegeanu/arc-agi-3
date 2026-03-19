@@ -4,11 +4,17 @@ from __future__ import annotations
 OBJECTIVE_PRIORITY = {
     "interact": 0,
     "test_trigger": 1,
-    "explore_frontier": 2,
-    "probe_route": 3,
-    "gather_local_info": 4,
-    "recover": 5,
-    "fallback": 6,
+    "verify_trigger_contact": 2,
+    "reobserve_remote_change": 3,
+    "verify_panel_state": 4,
+    "verify_gate_match": 5,
+    "trigger_then_target": 6,
+    "unlock_then_exit": 7,
+    "explore_frontier": 8,
+    "probe_route": 9,
+    "gather_local_info": 10,
+    "recover": 11,
+    "fallback": 12,
 }
 
 
@@ -27,6 +33,11 @@ def rerank_candidates(
     hypothesized_world = dict(hypothesized_world or belief_fallback.get("hypothesized_world", {}))
     uncertainty_context = dict(uncertainty_context or belief_fallback.get("uncertainty_context", {}))
     durable_prior_context = dict(durable_prior_context or belief_fallback.get("durable_prior_context", belief_fallback.get("durable_prior_view", {})))
+    poi_followthrough = {
+        str(key): dict(value)
+        for key, value in dict(belief_fallback.get("detector_poi_followthrough", {}) or {}).items()
+        if isinstance(value, dict)
+    }
     helper_boosts: dict[str, float] = {}
     helper_penalties: dict[str, float] = {}
     helper_warning_codes: dict[str, set[str]] = {}
@@ -73,10 +84,40 @@ def rerank_candidates(
         planner_usable_bonus = float(dict(candidate.get("score_breakdown", {})).get("planner_usable_hypothesis_bonus", 0.0) or 0.0)
         helper_boost = helper_boosts.get(candidate["candidate_id"], 0.0)
         helper_penalty = helper_penalties.get(candidate["candidate_id"], 0.0)
+        target_followthrough = dict(poi_followthrough.get(str(candidate.get("target_entity_id") or ""), {}) or {})
+        repeated_probe_penalty = 0.0
+        probe_escalation_available = bool(
+            int(target_followthrough.get("new_graph_edges", 0) or 0) > 0
+            or int(target_followthrough.get("new_hypothesis_support", 0) or 0) > 0
+            or int(target_followthrough.get("new_verification_candidates", 0) or 0) > 0
+            or int(target_followthrough.get("changed_exit_linked_evidence", 0) or 0) > 0
+            or bool(target_followthrough.get("probe_stale", False))
+            or int(target_followthrough.get("revisit_count", 0) or 0) >= 2
+        )
+        if str(candidate.get("candidate_class") or "") == "route_probe" and probe_escalation_available:
+            repeated_probe_penalty = 0.25 + (0.08 * min(3, int(target_followthrough.get("revisit_count", 0) or 0)))
+        escalation_bonus = 0.0
+        if probe_escalation_available and str(candidate.get("objective_type") or "") in {"verify_trigger_contact", "reobserve_remote_change", "verify_panel_state", "verify_gate_match", "trigger_then_target", "unlock_then_exit"}:
+            escalation_bonus = 0.18
+            if bool(target_followthrough.get("probe_stale", False)):
+                escalation_bonus += 0.12
+        exit_readiness_score = float(candidate.get("exit_readiness_score", 0.0) or 0.0)
+        last_failed_exit_without_new_support = bool(candidate.get("last_exit_attempt_failed_without_new_support", False))
+        premature_exit_penalty = 0.0
+        verification_candidate_promoted = False
+        if str(candidate.get("objective_type") or "") == "unlock_then_exit" and exit_readiness_score < 0.72:
+            premature_exit_penalty += 0.4
+            if last_failed_exit_without_new_support:
+                premature_exit_penalty += 0.18
+        if str(candidate.get("objective_type") or "") in {"verify_trigger_contact", "reobserve_remote_change", "verify_panel_state", "verify_gate_match", "trigger_then_target"} and probe_escalation_available:
+            verification_candidate_promoted = True
         prior_target = dict(durable_prior_context.get("per_target", {}).get(str(candidate.get("target_key") or ""), {}))
         prior_bonus = 0.02 * float(prior_target.get("success_rate", 0.0) or 0.0)
         uncertainty_penalty = 0.05 * float(candidate.get("score_uncertainty", 0.0) or 0.0)
-        final_score = float(candidate.get("score", 0.0)) + helper_boost - helper_penalty + prior_bonus - uncertainty_penalty + dependency_chain_bonus + (0.05 * chain_executability_score) + (0.03 * chain_evidence_diversity) + (0.03 * min(1.0, chain_counterfactual_strength)) + (0.03 * min(1.0, chain_identity_stability)) + planner_usable_bonus
+        escalated_candidate_ids = []
+        if probe_escalation_available:
+            escalated_candidate_ids = list(target_followthrough.get("escalated_candidate_ids", []) or [])
+        final_score = float(candidate.get("score", 0.0)) + helper_boost - helper_penalty + prior_bonus - uncertainty_penalty + dependency_chain_bonus + (0.05 * chain_executability_score) + (0.03 * chain_evidence_diversity) + (0.03 * min(1.0, chain_counterfactual_strength)) + (0.03 * min(1.0, chain_identity_stability)) + planner_usable_bonus + escalation_bonus - repeated_probe_penalty - premature_exit_penalty
         candidate["helper_boost"] = helper_boost
         candidate["helper_penalty"] = helper_penalty
         candidate["helper_warning_reason_codes"] = sorted(helper_warning_codes.get(candidate["candidate_id"], set()))
@@ -113,6 +154,13 @@ def rerank_candidates(
             "chain_evidence_diversity": chain_evidence_diversity,
             "chain_identity_stability": chain_identity_stability,
             "planner_usable_bonus": planner_usable_bonus,
+            "repeated_probe_penalty": repeated_probe_penalty,
+            "probe_escalation_available": probe_escalation_available,
+            "escalated_candidate_ids": escalated_candidate_ids,
+            "exit_readiness_score": exit_readiness_score,
+            "premature_exit_penalty": premature_exit_penalty,
+            "verification_candidate_promoted": verification_candidate_promoted,
+            "last_failed_exit_without_new_support": last_failed_exit_without_new_support,
             "uncertainty_versions": dict(uncertainty_context.get("versions", {})),
             "observed_world_counts": {
                 "reachable": len(list(observed_world.get("reachable_targets", []))),

@@ -12,7 +12,9 @@ from v3_1.planning.route_features import compute_route_features
 from v3_1.planning.subgoal_chain import SubgoalStep, build_chain
 from v3_1.planning.queries import (
     query_best_mechanic_subgoal_chain,
+    query_exit_readiness,
     query_panel_match_dependencies,
+    query_required_verification_before_exit,
     query_required_preconditions_for_target,
     query_trigger_then_exit_candidates,
     query_unlock_paths_for_exit,
@@ -22,10 +24,58 @@ from v3_1.planning.queries import (
 MECHANIC_CHAIN_CLASSES = {
     "unlock_then_exit",
     "trigger_then_target",
+    "verify_trigger_contact",
+    "reobserve_remote_change",
     "verify_panel_state",
+    "verify_gate_match",
     "mechanic_chain_deterministic",
     "mechanic_chain_llm",
 }
+
+POI_ESCALATION_OBJECTIVES = {
+    "verify_trigger_contact",
+    "reobserve_remote_change",
+    "verify_panel_state",
+    "verify_gate_match",
+    "trigger_then_target",
+    "unlock_then_exit",
+}
+
+
+def _apply_poi_probe_escalation(reranked: list[dict], belief: dict) -> list[dict]:
+    followthrough = {
+        str(key): dict(value)
+        for key, value in dict(belief.get("detector_poi_followthrough", {}) or {}).items()
+        if isinstance(value, dict)
+    }
+    adjusted = []
+    for row in list(reranked or []):
+        candidate = dict(row)
+        target_entity_id = str(candidate.get("target_entity_id") or "")
+        poi_state = dict(followthrough.get(target_entity_id, {}) or {})
+        stronger_support = bool(
+            int(poi_state.get("new_graph_edges", 0) or 0) > 0
+            or int(poi_state.get("new_hypothesis_support", 0) or 0) > 0
+            or int(poi_state.get("new_verification_candidates", 0) or 0) > 0
+            or int(poi_state.get("changed_exit_linked_evidence", 0) or 0) > 0
+        )
+        escalation_bonus = 0.0
+        if str(candidate.get("objective_type") or "") in POI_ESCALATION_OBJECTIVES and stronger_support:
+            escalation_bonus = 0.22 + (0.04 * min(3, int(poi_state.get("revisit_count", 0) or 0)))
+        if str(candidate.get("candidate_class") or "") == "route_probe" and stronger_support:
+            escalation_bonus = -0.3
+        candidate["final_score"] = float(candidate.get("final_score", candidate.get("score", 0.0)) or 0.0) + escalation_bonus
+        rerank_diag = dict(candidate.get("rerank_diagnostics", {}) or {})
+        rerank_diag["planner_service_probe_escalation_bonus"] = escalation_bonus
+        candidate["rerank_diagnostics"] = rerank_diag
+        adjusted.append(candidate)
+    adjusted.sort(
+        key=lambda item: (
+            -float(item.get("final_score", item.get("score", 0.0)) or 0.0),
+            str(item.get("candidate_id") or ""),
+        )
+    )
+    return adjusted
 
 
 def _build_selected_subgoal_chain(selected: dict | None, *, round_id: int) -> dict | None:
@@ -41,6 +91,35 @@ def _build_selected_subgoal_chain(selected: dict | None, *, round_id: int) -> di
         except TypeError:
             continue
     if not step_rows:
+        objective_type = str(candidate.get("objective_type") or "")
+        step_kind_map = {
+            "verify_trigger_contact": "verify_trigger_contact",
+            "reobserve_remote_change": "reobserve_region",
+            "verify_panel_state": "verify_panel",
+            "verify_gate_match": "verify_gate",
+            "trigger_then_target": "go_to_trigger",
+            "unlock_then_exit": "attempt_exit",
+        }
+        step_kind = step_kind_map.get(objective_type)
+        target_node_id = str(candidate.get("target_entity_id") or candidate.get("target_area_id") or "")
+        if step_kind and target_node_id:
+            step_rows.append(
+                SubgoalStep(
+                    step_id=f"step:{candidate.get('candidate_id') or target_node_id}:{step_kind}",
+                    step_kind=step_kind,
+                    target_node_id=target_node_id,
+                    expected_evidence=tuple(str(value) for value in list(candidate.get("candidate_expected_evidence", []) or []) if value),
+                    success_conditions=("expected_evidence_seen",),
+                    failure_conditions=("missing_expected_evidence",),
+                    retry_budget=2 if step_kind in {"go_to_trigger", "reobserve_region"} else 1,
+                    retry_count=0,
+                    depends_on_step_ids=(),
+                    step_status="planned",
+                    verification_points=tuple(str(value) for value in list(candidate.get("candidate_verification_points", []) or []) if value),
+                    fallback_targets=tuple(str(value) for value in list(candidate.get("candidate_fallback_targets", []) or []) if value),
+                )
+            )
+    if not step_rows:
         return None
     chain = build_chain(
         source_candidate_id=str(candidate.get("candidate_id") or ""),
@@ -50,9 +129,80 @@ def _build_selected_subgoal_chain(selected: dict | None, *, round_id: int) -> di
         expected_outcome_ids=list(candidate.get("expected_outcome_ids", []) or []),
         fallback_policy=str(candidate.get("fallback_policy") or "replan"),
         created_round_id=int(round_id),
+        exit_readiness_score_at_creation=float(candidate.get("exit_readiness_score", 0.0) or 0.0),
+        required_verification_steps=list(candidate.get("required_verification_steps", []) or []),
+        verification_steps_completed=list(candidate.get("verification_steps_completed", []) or []),
         steps=tuple(step_rows),
     )
     return chain.to_dict()
+
+
+def _recent_outcomes_from_memory(memory_snapshot: dict) -> list[dict]:
+    working_memory = dict(memory_snapshot.get("working_memory", memory_snapshot) or {})
+    raw_plan_memory = dict(working_memory.get("plan_memory", {}) or {})
+    history = list(raw_plan_memory.get("history", []) or [])
+    rows = []
+    for row in history[-12:]:
+        outcome = dict(dict(row or {}).get("outcome", {}) or {})
+        outcome_payload = dict(outcome.get("outcome", {}) or {})
+        decision = dict(dict(row or {}).get("decision", {}) or {})
+        selected = dict(dict(decision.get("metadata", {}) or {}).get("selected_candidate", {}) or {})
+        rows.append(
+            {
+                **outcome_payload,
+                "round_id": row.get("round_id") or decision.get("round_id"),
+                "candidate_class": selected.get("candidate_class"),
+                "objective_type": selected.get("objective_type"),
+            }
+        )
+    return rows
+
+
+def _verification_objectives_from_missing(missing: list[str]) -> list[str]:
+    ordered = []
+    for item in list(missing or []):
+        if str(item) == "verify_trigger_contact":
+            ordered.append("verify_trigger_contact")
+        elif str(item) == "reobserve_remote_change":
+            ordered.append("reobserve_remote_change")
+        elif str(item) == "verify_panel_or_gate":
+            ordered.extend(["verify_panel_state", "verify_gate_match"])
+    return list(dict.fromkeys(ordered))
+
+
+def _apply_exit_readiness_selection_guard(reranked: list[dict], *, planner_trace: dict) -> list[dict]:
+    rows = [dict(row) for row in list(reranked or [])]
+    if not rows:
+        planner_trace["selected_exit_readiness_score"] = None
+        planner_trace["selected_missing_prerequisites"] = []
+        planner_trace["selected_candidate_blocked_by_low_exit_readiness"] = False
+        return rows
+    selected = dict(rows[0])
+    if str(selected.get("objective_type") or "") != "unlock_then_exit":
+        planner_trace["selected_exit_readiness_score"] = float(selected.get("exit_readiness_score", 0.0) or 0.0)
+        planner_trace["selected_missing_prerequisites"] = list(selected.get("missing_prerequisite_types", []) or [])
+        planner_trace["selected_candidate_blocked_by_low_exit_readiness"] = False
+        return rows
+    readiness_score = float(selected.get("exit_readiness_score", 0.0) or 0.0)
+    stronger_verification = next(
+        (
+            row for row in rows[1:]
+            if str(row.get("objective_type") or "") in {"verify_trigger_contact", "reobserve_remote_change", "verify_panel_state", "verify_gate_match", "trigger_then_target"}
+            and float(row.get("final_score", row.get("score", 0.0)) or 0.0) >= float(selected.get("final_score", selected.get("score", 0.0)) or 0.0) - 0.4
+        ),
+        None,
+    )
+    if readiness_score < 0.72 and stronger_verification is not None:
+        replacement_id = str(stronger_verification.get("candidate_id") or "")
+        rows.sort(key=lambda row: 0 if str(row.get("candidate_id") or "") == replacement_id else 1)
+        planner_trace["selected_exit_readiness_score"] = readiness_score
+        planner_trace["selected_missing_prerequisites"] = list(selected.get("missing_prerequisite_types", []) or [])
+        planner_trace["selected_candidate_blocked_by_low_exit_readiness"] = True
+        return rows
+    planner_trace["selected_exit_readiness_score"] = readiness_score
+    planner_trace["selected_missing_prerequisites"] = list(selected.get("missing_prerequisite_types", []) or [])
+    planner_trace["selected_candidate_blocked_by_low_exit_readiness"] = False
+    return rows
 
 
 def _active_chain_snapshot(belief: dict) -> tuple[dict | None, dict | None, bool]:
@@ -178,6 +328,7 @@ def _split_world_contracts(*, blackboard_snapshot: dict, belief: dict) -> tuple[
         "frontier_targets": _filter_rows(seed_sets.get("frontier_targets", []), tier="observed"),
         "blocked_targets": _filter_rows(seed_sets.get("blocked_targets", []), tier="observed"),
         "promising_pois": _filter_rows(seed_sets.get("promising_pois", []), tier="observed"),
+        "approachable_pois": _filter_rows(seed_sets.get("approachable_pois", []), tier="observed"),
         "trigger_candidates": [dict(row) for row in seed_sets.get("trigger_candidates", []) if str(row.get("entity_id") or "") in observed_triggers or str(row.get("evidence_tier") or "") == "observed"],
         "recovery_candidates": _filter_rows(seed_sets.get("recovery_candidates", []), tier="observed"),
         "entities": observed_entities,
@@ -190,6 +341,7 @@ def _split_world_contracts(*, blackboard_snapshot: dict, belief: dict) -> tuple[
         "frontier_targets": _filter_rows(seed_sets.get("frontier_targets", []), tier="hypothesized"),
         "blocked_targets": _filter_rows(seed_sets.get("blocked_targets", []), tier="hypothesized"),
         "promising_pois": _filter_rows(seed_sets.get("promising_pois", []), tier="hypothesized"),
+        "approachable_pois": _filter_rows(seed_sets.get("approachable_pois", []), tier="hypothesized"),
         "trigger_candidates": [dict(row) for row in seed_sets.get("trigger_candidates", []) if str(row.get("entity_id") or "") in hypothesized_triggers or str(row.get("evidence_tier") or "") == "hypothesized"],
         "recovery_candidates": _filter_rows(seed_sets.get("recovery_candidates", []), tier="hypothesized"),
         "entities": hypothesized_entities,
@@ -208,12 +360,13 @@ def _split_world_contracts(*, blackboard_snapshot: dict, belief: dict) -> tuple[
             "reachable_targets": len(list(seed_sets.get("reachable_targets", []))),
             "frontier_targets": len(list(seed_sets.get("frontier_targets", []))),
             "promising_pois": len(list(seed_sets.get("promising_pois", []))),
+            "approachable_pois": len(list(seed_sets.get("approachable_pois", []))),
         },
     }
     return observed_world, hypothesized_world, uncertainty_context
 
 
-def _sample_rows(rows: list[dict], *, limit: int = 3, keys: tuple[str, ...] = ("entity_id", "target_key", "target_area_id", "candidate_effect_mode", "utility", "confidence")) -> list[dict]:
+def _sample_rows(rows: list[dict], *, limit: int = 3, keys: tuple[str, ...] = ("entity_id", "target_key", "target_area_id", "candidate_effect_mode", "utility", "confidence", "returned_by_area_local_pois", "reachable_status", "approachable_status", "rejected_from_promising_reason", "mode_gate_reason", "score_if_considered", "displaced_by_frontier_entity_id")) -> list[dict]:
     sampled = []
     for row in list(rows or [])[:limit]:
         payload = dict(row)
@@ -247,12 +400,14 @@ def _compact_belief_trace(belief: dict) -> dict:
         },
         "candidate_seed_sets": {
             "promising_poi_count": len(candidate_seed_sets.get("promising_pois", [])),
+            "approachable_poi_count": len(candidate_seed_sets.get("approachable_pois", [])),
             "trigger_candidate_count": len(candidate_seed_sets.get("trigger_candidates", [])),
             "recovery_candidate_count": len(candidate_seed_sets.get("recovery_candidates", [])),
             "frontier_target_count": len(candidate_seed_sets.get("frontier_targets", [])),
             "blocked_target_count": len(candidate_seed_sets.get("blocked_targets", [])),
             "reachable_target_count": len(candidate_seed_sets.get("reachable_targets", [])),
             "promising_pois_sample": _sample_rows(candidate_seed_sets.get("promising_pois", [])),
+            "approachable_pois_sample": _sample_rows(candidate_seed_sets.get("approachable_pois", [])),
             "trigger_candidates_sample": _sample_rows(candidate_seed_sets.get("trigger_candidates", [])),
             "recovery_candidates_sample": _sample_rows(candidate_seed_sets.get("recovery_candidates", [])),
         },
@@ -363,6 +518,7 @@ def plan(
     belief["durable_prior_context"] = durable_prior_context
     belief["planner_contract_mode"] = "split_world_native"
     mechanic_graph_state = dict((mechanic_graph_snapshot or {}).get("state", mechanic_graph_snapshot or {}))
+    recent_outcomes = _recent_outcomes_from_memory(memory_snapshot)
     graph_paths_to_exit = [path.__dict__ for path in query_best_mechanic_subgoal_chain(mechanic_graph_state).paths]
     trigger_nodes = list(dict(belief.get("mechanic_graph_view", {})).get("trigger_candidates", []))
     panel_nodes = [row for row in list(dict(mechanic_graph_state).get("nodes_by_id", {}).values()) if str(row.get("node_kind") or "") == "panel"]
@@ -379,6 +535,12 @@ def plan(
         {
             "exit_node_id": row.get("node_id"),
             "prerequisite_paths": [path.__dict__ for path in query_unlock_paths_for_exit(mechanic_graph_state, str(row.get("node_id"))).paths],
+            "exit_readiness": query_exit_readiness(
+                mechanic_graph_state,
+                str(row.get("node_id")),
+                hypothesis_registry_snapshot=hypothesis_registry_snapshot,
+                recent_outcomes=recent_outcomes,
+            ),
         }
         for row in exit_nodes
     ]
@@ -393,10 +555,32 @@ def plan(
         {
             "target_node_id": row.get("node_id"),
             "paths": [path.__dict__ for path in query_required_preconditions_for_target(mechanic_graph_state, str(row.get("node_id"))).paths],
+            "required_verification": query_required_verification_before_exit(
+                mechanic_graph_state,
+                str(row.get("node_id")),
+                hypothesis_registry_snapshot=hypothesis_registry_snapshot,
+                recent_outcomes=recent_outcomes,
+            ),
         }
         for row in exit_nodes
     ]
     belief["mechanic_graph_node_lookup"] = {str(node_id): dict(row) for node_id, row in dict(mechanic_graph_state.get("nodes_by_id", {})).items()}
+    exit_readiness_by_exit = {
+        str(row.get("node_id")): query_exit_readiness(
+            mechanic_graph_state,
+            str(row.get("node_id")),
+            hypothesis_registry_snapshot=hypothesis_registry_snapshot,
+            recent_outcomes=recent_outcomes,
+        )
+        for row in exit_nodes
+    }
+    belief["exit_readiness_by_exit"] = exit_readiness_by_exit
+    belief["best_exit_readiness"] = max(
+        list(exit_readiness_by_exit.values()),
+        key=lambda row: float(dict(row).get("readiness_score", 0.0) or 0.0),
+        default={},
+    )
+    belief["recent_exit_outcomes"] = recent_outcomes
     belief["deterministic_hypotheses"] = dict(deterministic_hypotheses or {})
     belief["llm_hypotheses"] = dict(llm_hypotheses or {})
     belief["hypothesis_registry_snapshot"] = dict(hypothesis_registry_snapshot or {})
@@ -426,7 +610,7 @@ def plan(
         hypothesized_world=hypothesized_world,
         uncertainty_context=uncertainty_context,
         durable_prior_context=durable_prior_context,
-        belief_fallback=None,
+        belief_fallback=belief,
     )
     scored = _annotate_seed_support(scored, blackboard_snapshot, penalty=0.2)
     reranked = rerank_candidates(
@@ -436,8 +620,11 @@ def plan(
         hypothesized_world=hypothesized_world,
         uncertainty_context=uncertainty_context,
         durable_prior_context=durable_prior_context,
-        belief_fallback=None,
+        belief_fallback=belief,
     )
+    reranked = _apply_poi_probe_escalation(reranked, belief)
+    planner_trace_stub: dict = {}
+    reranked = _apply_exit_readiness_selection_guard(reranked, planner_trace=planner_trace_stub)
     reranked = _annotate_seed_support(reranked, blackboard_snapshot)
     fallback_rows = (
         [row for row in reranked if str(row.get("objective_type") or "") == "fallback"]
@@ -478,6 +665,8 @@ def plan(
         selected=selected,
         consistency_checks=consistency_checks,
     )
+    planner_trace["planning_mode"] = belief.get("planning_mode")
+    planner_trace.update(planner_trace_stub)
     planner_trace["planner_contract_mode"] = "split_world_native"
     pipeline_modes = {
         "generation": all(str(row.get("seed_contract") or "") != "compatibility_fallback" for row in generated),

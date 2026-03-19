@@ -8,6 +8,7 @@ from v3_1.utils.ids import stable_digest
 
 STEP_KINDS = {
     "go_to_trigger",
+    "verify_trigger_contact",
     "verify_panel",
     "verify_gate",
     "attempt_exit",
@@ -68,6 +69,9 @@ class SubgoalChain:
     fallback_policy: str
     created_round_id: int
     last_updated_round_id: int
+    exit_readiness_score_at_creation: float = 0.0
+    required_verification_steps: tuple[str, ...] = ()
+    verification_steps_completed: tuple[str, ...] = ()
     completion_reason: str | None = None
     abort_reason: str | None = None
     steps: tuple[SubgoalStep, ...] = ()
@@ -145,6 +149,9 @@ def build_chain(
     last_updated_round_id: int | None = None,
     steps: list[SubgoalStep] | tuple[SubgoalStep, ...],
     status: str = "planned",
+    exit_readiness_score_at_creation: float = 0.0,
+    required_verification_steps: list[str] | tuple[str, ...] | None = None,
+    verification_steps_completed: list[str] | tuple[str, ...] | None = None,
     completion_reason: str | None = None,
     abort_reason: str | None = None,
 ) -> SubgoalChain:
@@ -167,6 +174,9 @@ def build_chain(
         fallback_policy=str(fallback_policy or "replan"),
         created_round_id=int(created_round_id),
         last_updated_round_id=int(last_updated_round_id if last_updated_round_id is not None else created_round_id),
+        exit_readiness_score_at_creation=float(exit_readiness_score_at_creation or 0.0),
+        required_verification_steps=tuple(dict.fromkeys(str(value) for value in list(required_verification_steps or []) if value)),
+        verification_steps_completed=tuple(dict.fromkeys(str(value) for value in list(verification_steps_completed or []) if value)),
         completion_reason=str(completion_reason) if completion_reason else None,
         abort_reason=str(abort_reason) if abort_reason else None,
         steps=tuple(steps or ()),

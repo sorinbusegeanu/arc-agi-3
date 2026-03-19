@@ -80,8 +80,9 @@
   "reward": {
     "movement_cell_thresh": 55,
     "noop_cell_thresh": 3,
+    "match_poi": 0.5,
     "r_effect_movement": 0.01,
-    "r_effect_screen": 0.3,
+    "r_effect_screen": 0.0,
     "revert_penalty": 0.2,
     "beta_potential": 0.0,
     "gamma": 0.995,

@@ -148,6 +148,7 @@ def summarize_outcome(*, steps, request, routed_history: list[dict], rewards: li
     origin_hypothesis_ids = list(dict(request.metadata or {}).get("origin_hypothesis_ids", []) or [])
     selected_chain = dict(dict(request.metadata or {}).get("selected_subgoal_chain", {}) or {})
     selected_step = dict(dict(request.metadata or {}).get("selected_subgoal_step", {}) or {})
+    planner_candidate = dict(dict(request.metadata or {}).get("planner_candidate", {}) or {})
     chain_id = str(dict(request.metadata or {}).get("chain_id") or selected_chain.get("chain_id") or "") or None
     step_id = str(dict(request.metadata or {}).get("step_id") or selected_step.get("step_id") or "") or None
     step_kind = str(dict(request.metadata or {}).get("step_kind") or selected_step.get("step_kind") or "") or None
@@ -172,7 +173,7 @@ def summarize_outcome(*, steps, request, routed_history: list[dict], rewards: li
     expected_evidence_missing = [key for key in expected_evidence if key not in expected_evidence_seen]
     step_success = bool(
         (step_kind == "attempt_exit" and environment_terminal_success)
-        or (step_kind in {"go_to_trigger", "retry_trigger"} and objective_contact_observed)
+        or (step_kind in {"go_to_trigger", "retry_trigger", "verify_trigger_contact"} and objective_contact_observed)
         or (step_kind in {"verify_panel", "verify_gate"} and (target_presence_observed or int(effect_changed_cells_observed or 0) > 0))
         or (step_kind == "reobserve_region" and target_presence_observed)
     ) if step_kind else False
@@ -189,7 +190,7 @@ def summarize_outcome(*, steps, request, routed_history: list[dict], rewards: li
         else:
             step_failure_reason = termination_reason
     chain_should_advance = bool(chain_id and step_success)
-    chain_should_retry = bool(chain_id and not step_success and step_kind in {"go_to_trigger", "verify_panel", "verify_gate", "reobserve_region"} and not blocked and not environment_terminal_success)
+    chain_should_retry = bool(chain_id and not step_success and step_kind in {"go_to_trigger", "verify_trigger_contact", "verify_panel", "verify_gate", "reobserve_region"} and not blocked and not environment_terminal_success)
     chain_should_abort = bool(chain_id and not chain_should_advance and not chain_should_retry and step_kind is not None)
     chain_completion_reason = None
     if chain_should_advance and step_kind == "attempt_exit" and environment_terminal_success:
@@ -198,6 +199,10 @@ def summarize_outcome(*, steps, request, routed_history: list[dict], rewards: li
         chain_completion_reason = "step_verified"
     elif chain_should_abort:
         chain_completion_reason = str(step_failure_reason or termination_reason or "chain_aborted")
+    exit_attempt_failed = bool(step_kind == "attempt_exit" and not environment_terminal_success)
+    position_hold_detected = bool(step_kind == "attempt_exit" and termination_reason == "position_hold")
+    new_support_since_previous_exit_attempt = bool(planner_candidate.get("has_new_support_since_last_exit_attempt", False))
+    exit_attempt_failed_without_new_support = bool(exit_attempt_failed and not new_support_since_previous_exit_attempt)
     return {
         "success": execution_success and objective_success,
         "execution_success": execution_success,
@@ -278,6 +283,13 @@ def summarize_outcome(*, steps, request, routed_history: list[dict], rewards: li
         "chain_should_retry": chain_should_retry,
         "chain_should_abort": chain_should_abort,
         "chain_completion_reason": chain_completion_reason,
+        "exit_attempt_failed": exit_attempt_failed,
+        "exit_attempt_failure_reason": step_failure_reason if exit_attempt_failed else None,
+        "exit_attempt_failed_without_new_support": exit_attempt_failed_without_new_support,
+        "position_hold_detected": position_hold_detected,
+        "new_support_since_previous_exit_attempt": new_support_since_previous_exit_attempt,
+        "exit_readiness_score": float(planner_candidate.get("exit_readiness_score", 0.0) or 0.0),
+        "missing_prerequisites": list(planner_candidate.get("missing_prerequisite_types", []) or []),
         "chain_status_before": dict(request.metadata or {}).get("chain_status_before"),
         "chain_status_after": "completed" if chain_should_advance and step_kind == "attempt_exit" and environment_terminal_success else "advanced" if chain_should_advance else "retrying" if chain_should_retry else "aborted" if chain_should_abort else dict(request.metadata or {}).get("chain_status_before"),
     }

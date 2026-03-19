@@ -77,6 +77,8 @@ def stable_descriptor(patch: list[list[int]]) -> dict[str, Any]:
         "palette": palette,
         "filled_cells": filled,
         "density": density,
+        "texture_like": bool(filled > 0 and density <= 0.22 and len(palette_counts) <= 2),
+        "micro_pattern": bool(width <= 2 and height <= 2),
         "canonical_rows": canonical,
         "row_signatures": row_signatures,
         "col_signatures": col_signatures,
@@ -84,6 +86,21 @@ def stable_descriptor(patch: list[list[int]]) -> dict[str, Any]:
         "edge_profile": edge_profile,
         "symmetry_score": symmetry_score,
     }
+
+
+def repeated_texture_marker(descriptor: dict[str, Any] | None) -> bool:
+    row = dict(descriptor or {})
+    width = int(row.get("width", 0) or 0)
+    height = int(row.get("height", 0) or 0)
+    density = float(row.get("density", 0.0) or 0.0)
+    palette_counts = dict(row.get("palette_counts", {}) or {})
+    non_zero_colors = [int(color) for color, count in palette_counts.items() if int(count or 0) > 0]
+    return bool(
+        row.get("texture_like")
+        or row.get("micro_pattern")
+        or (width <= 2 and height <= 2)
+        or (density <= 0.22 and len(non_zero_colors) <= 2)
+    )
 
 
 def stable_pattern_id(patch: list[list[int]]) -> str:

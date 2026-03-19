@@ -58,6 +58,13 @@ def build_round_analysis_summary(*, round_id: int, analyzed_episodes: list, cand
         if action_family == "click_at" and int(row.get("changed_cells", 0) or 0) > 0
     )
     unknown_action_type_count = sum(1 for action_family in normalized_action_families if action_family == "unknown")
+    poi_debug_artifact = {}
+    for episode in analyzed_episodes:
+        metadata = dict(getattr(episode, "metadata", {}) or {})
+        candidate = dict(metadata.get("poi_detection_debug", {}) or {})
+        if candidate:
+            poi_debug_artifact = candidate
+            break
     return {
         "round_id": int(round_id),
         "step_count": len(step_rows),
@@ -73,6 +80,7 @@ def build_round_analysis_summary(*, round_id: int, analyzed_episodes: list, cand
         "action_type_histogram": action_type_histogram,
         "unknown_action_type_count": unknown_action_type_count,
         "candidate_effect_mode_used": candidate_effect_mode_used,
+        "poi_detection_debug": poi_debug_artifact,
     }
 
 
@@ -124,7 +132,13 @@ def decision_export_payload(decision, *, available_families: set[str], executed_
     )
     selected_action = dict(payload.get("selected_action", {})) if isinstance(payload.get("selected_action"), dict) else None
     metadata = dict(payload.get("metadata", {})) if isinstance(payload.get("metadata"), dict) else {}
+    planner_trace = dict(metadata.get("planner_trace", {})) if isinstance(metadata.get("planner_trace"), dict) else {}
     selected_candidate = dict(metadata.get("selected_candidate", {})) if isinstance(metadata.get("selected_candidate"), dict) else {}
+    planning_mode = (
+        payload.get("planning_mode")
+        or metadata.get("planning_mode")
+        or planner_trace.get("planning_mode")
+    )
     metadata["fallback_candidates"] = [
         normalize_candidate_for_export(candidate, available_families=available_families)
         for candidate in list(metadata.get("fallback_candidates", []))
@@ -155,5 +169,8 @@ def decision_export_payload(decision, *, available_families: set[str], executed_
         selected_action["type"] = executed_family if executed_family in {"move", "interact", "click_at"} else str(selected_action.get("type") or "move")
         selected_action["required_action_family"] = selected_action["type"]
         payload["selected_action"] = selected_action
+    if planning_mode is not None:
+        payload["planning_mode"] = planning_mode
+        metadata["planning_mode"] = planning_mode
     payload["metadata"] = metadata
     return payload

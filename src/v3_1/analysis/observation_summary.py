@@ -5,6 +5,7 @@ from typing import Any
 
 from v3_1.analysis.entity_identity import assign_identity
 from v3_1.analysis.object_extraction import extract_connected_components, extract_objects
+from v3_1.analysis.pattern_identity import repeated_texture_marker
 from v3_1.utils.ids import stable_digest
 
 
@@ -115,6 +116,11 @@ def summarize_observation(observation: Any, previous_observation: Any | None = N
     structure_candidates = []
     prior_entity_rows = [dict(row) for row in list(prior_entities or [])]
     for obj in objects:
+        descriptor = dict(obj.get("pattern_descriptor", {}) or {})
+        if repeated_texture_marker(descriptor) and int(obj.get("decorative_child_count", 0) or 0) <= 0:
+            continue
+        if bool(obj.get("texture_suppressed")) and int(obj.get("area", 0) or 0) <= 3:
+            continue
         identity = assign_identity(obj, prior_entity_rows)
         obj["identity_confidence"] = float(identity.get("identity_confidence", 0.0) or 0.0)
         obj["identity_status"] = str(identity.get("identity_status") or "new_entity")
@@ -176,11 +182,12 @@ def summarize_observation(observation: Any, previous_observation: Any | None = N
             structure_score += 0.05
         if obj.get("pattern_id"):
             structure_score += 0.15
-        descriptor = dict(obj.get("pattern_descriptor", {}) or {})
         if float(descriptor.get("symmetry_score", 0.0) or 0.0) >= 0.5:
             structure_score += 0.05
         if float(descriptor.get("density", 0.0) or 0.0) >= 0.3:
             structure_score += 0.05
+        if repeated_texture_marker(descriptor):
+            structure_score -= 0.25
         if obj["primary_color"] != background["color"]:
             structure_score += 0.1
         if obj["area"] <= 2 or obj["area"] > 18:

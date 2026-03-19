@@ -26,13 +26,19 @@ from v3_1.runtime.session_ledger import (
     MergeCompletedPayload,
     PlanSelectedPayload,
     RoundStartPayload,
+    DetectorPoiEscalationPayload,
     SubgoalChainAbortedPayload,
     SubgoalChainAdvancedPayload,
     SubgoalChainCompletedPayload,
     SubgoalChainStartedPayload,
     SubgoalChainStepPayload,
 )
-from v3_1.visualization.heatmaps import build_poi_heatmap, build_visit_heatmap, render_heatmap_debug_png
+from v3_1.visualization.heatmaps import (
+    build_poi_heatmap,
+    build_visit_heatmap,
+    render_combined_overlay_png,
+    render_overlay_png,
+)
 
 
 def _target_effect_payload(step_rows: list[dict], target_entity_id: str | None) -> dict:
@@ -122,6 +128,56 @@ def _analysis_effect_payload(analyzed_episodes: list[object]) -> dict:
         "candidate_effect_mode": candidate_effect_mode,
         "candidate_effect_score": candidate_effect_score,
     }
+
+
+def _sync_analysis_poi_debug_with_observed_store(analysis_summary: dict, blackboard_state: dict) -> dict:
+    payload = dict(analysis_summary or {})
+    poi_debug = dict(payload.get("poi_detection_debug", {}) or {})
+    collapsed_peer_ids = {str(value) for value in list(poi_debug.get("collapsed_peer_ids", []) or []) if value}
+    observed_entities = dict(blackboard_state.get("observed_entities", {}) or {})
+    observed_pois = [
+        dict(row)
+        for row in observed_entities.values()
+        if isinstance(row, dict) and str(row.get("kind") or "") == "poi" and bool(row.get("planner_visible", True))
+    ]
+    remaining_collapsed = sorted(
+        str(row.get("entity_id") or row.get("poi_id") or "")
+        for row in observed_pois
+        if str(row.get("entity_id") or row.get("poi_id") or "") in collapsed_peer_ids
+    )
+    if remaining_collapsed:
+        raise AssertionError(f"collapsed peers still present in observed store: {remaining_collapsed}")
+    observed_pois.sort(
+        key=lambda row: (
+            -float(row.get("confidence", 0.0) or 0.0),
+            -float(row.get("utility", 0.0) or 0.0),
+            str(row.get("entity_id") or ""),
+        )
+    )
+    poi_debug["final_exported_canonical_pois"] = [
+        {
+            "poi_id": str(row.get("entity_id") or row.get("poi_id") or ""),
+            "entity_id": str(row.get("entity_id") or row.get("poi_id") or ""),
+            "planner_visible": bool(row.get("planner_visible", True)),
+            "poi_bucket": str(row.get("poi_bucket") or ""),
+            "poi_class": str(row.get("poi_class") or row.get("kind") or ""),
+            "bbox": dict(row.get("bbox", {}) or {}),
+            "area": int(row.get("area", 0) or 0),
+            "confidence": float(row.get("confidence", 0.0) or 0.0),
+            "poi_source_provenance": list(row.get("poi_source_provenance", []) or []),
+            "merged_input_poi_ids": list(row.get("merged_input_poi_ids", []) or []),
+            "planner_targetable": bool(row.get("planner_targetable", False)),
+            "poi_hierarchy_level": int(row.get("poi_hierarchy_level", 0) or 0),
+            "parent_poi_id": row.get("parent_poi_id"),
+            "child_poi_ids": list(row.get("child_poi_ids", []) or []),
+            "hierarchy_role": str(row.get("hierarchy_role") or "parent_region"),
+        }
+        for row in observed_pois
+    ]
+    poi_debug["final_exported_count"] = len(observed_pois)
+    poi_debug["final_post_merge_observed_poi_count"] = len(observed_pois)
+    payload["poi_detection_debug"] = poi_debug
+    return payload
 
 
 def _merge_effect_payload(primary: dict, fallback: dict) -> dict:
@@ -217,6 +273,117 @@ def _round_effect_payload(analysis_summary: dict, actual_mode: str) -> dict:
     }
 
 
+def _detector_backed_selected_poi(decision_export: dict) -> dict:
+    selected = dict(dict(decision_export.get("metadata", {}) or {}).get("selected_candidate", {}) or {})
+    provenance = {str(value) for value in list(selected.get("poi_source_provenance", []) or []) if value}
+    if str(selected.get("candidate_class") or "") != "route_probe":
+        return {}
+    if "detector" not in provenance:
+        return {}
+    return selected
+
+
+def _update_poi_followthrough_state(*, latest_memory, selected_candidate: dict, mg_counts: dict, hypothesis_registry_snapshot: dict, round_id: int, selected_subgoal_chain: dict | None = None) -> tuple[dict, list[tuple[str, DetectorPoiEscalationPayload]]]:
+    state = getattr(latest_memory, "state", None)
+    if not isinstance(state, dict):
+        return {}, []
+    working = dict(state.get("working_memory", {}) or {})
+    plan_memory = dict(working.get("plan_memory", {}) or {})
+    followthrough = {
+        str(key): dict(value)
+        for key, value in dict(plan_memory.get("poi_followthrough", {}) or {}).items()
+        if isinstance(value, dict)
+    }
+    poi_id = str(selected_candidate.get("target_entity_id") or "")
+    events: list[tuple[str, DetectorPoiEscalationPayload]] = []
+    if not poi_id:
+        plan_memory["poi_followthrough"] = followthrough
+        working["plan_memory"] = plan_memory
+        state["working_memory"] = working
+        return followthrough, events
+    row = dict(followthrough.get(poi_id, {}) or {})
+    first_selection_round = int(row.get("selection_round", round_id) or round_id)
+    revisit_count = int(row.get("revisit_count", 0) or 0) + (1 if row else 0)
+    selection_rounds = int(row.get("selection_rounds", 0) or 0) + 1
+    new_graph_edges = int(mg_counts.get("edge_count_added", 0) or 0)
+    validation_state = dict(hypothesis_registry_snapshot.get("validation_state", {}) or {})
+    new_hypothesis_support = sum(1 for state_value in validation_state.values() if str(state_value or "") in {"supported", "validated", "planner_usable"})
+    new_verification_candidates = int(mg_counts.get("observed_edge_count_added", 0) or 0)
+    changed_exit_linked_evidence = int(mg_counts.get("observed_edge_count_added", 0) or 0)
+    new_support_delta = new_graph_edges + new_hypothesis_support + new_verification_candidates
+    escalated_candidate_ids = list(dict(row).get("escalated_candidate_ids", []) or [])
+    if selected_subgoal_chain:
+        escalated_candidate_ids.append(str(dict(selected_subgoal_chain).get("source_candidate_id") or ""))
+    probe_stale = selection_rounds >= 2 and new_support_delta <= 0
+    next_row = {
+        **row,
+        "poi_id": poi_id,
+        "selection_round": first_selection_round,
+        "last_selection_round": int(round_id),
+        "selection_rounds": selection_rounds,
+        "revisit_count": revisit_count,
+        "new_graph_edges": new_graph_edges,
+        "new_hypothesis_support": new_hypothesis_support,
+        "new_verification_candidates": new_verification_candidates,
+        "changed_exit_linked_evidence": changed_exit_linked_evidence,
+        "new_support_delta": new_support_delta,
+        "probe_stale": probe_stale,
+        "detector_backed": True,
+        "detector_strength": float(selected_candidate.get("confidence", 0.0) or 0.0),
+        "reachable": bool(selected_candidate.get("reachable_now")) or bool(selected_candidate.get("reachable_later")),
+        "approachable": str(selected_candidate.get("approachable_status") or "") in {"approachable_now", "approachable_later"},
+        "supporting_refs": list(selected_candidate.get("supporting_evidence_refs", []) or []),
+        "escalated_candidate_ids": list(dict.fromkeys(str(value) for value in escalated_candidate_ids if value)),
+    }
+    followthrough[poi_id] = next_row
+    plan_memory["poi_followthrough"] = followthrough
+    working["plan_memory"] = plan_memory
+    state["working_memory"] = working
+    event_type = "detector poi revisited" if row else "detector poi selected"
+    events.append((event_type, DetectorPoiEscalationPayload(
+        poi_id=poi_id,
+        detector_strength=float(next_row.get("detector_strength", 0.0) or 0.0),
+        selection_round=int(first_selection_round),
+        revisit_count=int(next_row.get("revisit_count", 0) or 0),
+        downstream_support_gained={
+            "new_graph_edges": new_graph_edges,
+            "new_hypothesis_support": new_hypothesis_support,
+            "new_verification_candidates": new_verification_candidates,
+            "changed_exit_linked_evidence": changed_exit_linked_evidence,
+        },
+        escalation_target_candidate_id=(next_row.get("escalated_candidate_ids") or [None])[-1],
+        stale_reason="repeated_probe_without_new_effect" if probe_stale else None,
+    )))
+    if selected_subgoal_chain:
+        events.append(("detector poi escalated to chain", DetectorPoiEscalationPayload(
+            poi_id=poi_id,
+            detector_strength=float(next_row.get("detector_strength", 0.0) or 0.0),
+            selection_round=int(first_selection_round),
+            revisit_count=int(next_row.get("revisit_count", 0) or 0),
+            downstream_support_gained={"new_graph_edges": new_graph_edges, "new_hypothesis_support": new_hypothesis_support},
+            escalation_target_candidate_id=str(dict(selected_subgoal_chain).get("source_candidate_id") or "") or None,
+        )))
+    elif new_support_delta > 0:
+        events.append(("detector poi escalated to verification", DetectorPoiEscalationPayload(
+            poi_id=poi_id,
+            detector_strength=float(next_row.get("detector_strength", 0.0) or 0.0),
+            selection_round=int(first_selection_round),
+            revisit_count=int(next_row.get("revisit_count", 0) or 0),
+            downstream_support_gained={"new_graph_edges": new_graph_edges, "new_hypothesis_support": new_hypothesis_support, "new_verification_candidates": new_verification_candidates},
+            escalation_target_candidate_id=None,
+        )))
+    if probe_stale:
+        events.append(("detector poi marked stale", DetectorPoiEscalationPayload(
+            poi_id=poi_id,
+            detector_strength=float(next_row.get("detector_strength", 0.0) or 0.0),
+            selection_round=int(first_selection_round),
+            revisit_count=int(next_row.get("revisit_count", 0) or 0),
+            downstream_support_gained={"new_support_delta": new_support_delta},
+            stale_reason="no_new_support_after_repeated_probe",
+        )))
+    return followthrough, events
+
+
 @dataclass
 class RoundRunResult:
     latest_blackboard: object
@@ -279,6 +446,8 @@ class RoundRunner:
                 expected_evidence=tuple(str(value) for value in list(current_step.get("expected_evidence", []) or []) if value),
                 observed_evidence=(),
                 advancement_reason="chain_planned",
+                exit_readiness_score=float(started.get("exit_readiness_score_at_creation", 0.0) or 0.0),
+                missing_prerequisites=tuple(str(value) for value in list(started.get("required_verification_steps", []) or []) if value),
             ),
         )
 
@@ -307,6 +476,10 @@ class RoundRunner:
                 observed_evidence=tuple(str(value) for value in list(outcome_payload.get("expected_evidence_seen", []) or []) if value),
                 failure_reason=str(outcome_payload.get("step_failure_reason") or "") or None,
                 advancement_reason="step_success" if bool(outcome_payload.get("step_success")) else None,
+                exit_readiness_score=float(dict(active_chain).get("exit_readiness_score_at_creation", 0.0) or 0.0),
+                missing_prerequisites=tuple(str(value) for value in list(outcome_payload.get("missing_prerequisites", []) or []) if value),
+                failed_without_new_support=bool(outcome_payload.get("exit_attempt_failed_without_new_support", False)),
+                position_hold_detected=bool(outcome_payload.get("position_hold_detected", False)),
             )
             if bool(outcome_payload.get("step_success")):
                 self.session_ledger.append_subgoal_chain_step_completed(payload=payload, **common_kwargs)
@@ -322,6 +495,8 @@ class RoundRunner:
                         expected_evidence=tuple(str(value) for value in list(next_step.get("expected_evidence", []) or []) if value),
                         observed_evidence=tuple(str(value) for value in list(outcome_payload.get("expected_evidence_seen", []) or []) if value),
                         advancement_reason=str(outcome_payload.get("chain_completion_reason") or "advance_on_success"),
+                        exit_readiness_score=float(dict(active_chain).get("exit_readiness_score_at_creation", 0.0) or 0.0),
+                        missing_prerequisites=tuple(str(value) for value in list(snapshot_after.get("missing_verification_step_kind") and [snapshot_after.get("missing_verification_step_kind")] or []) if value),
                     ),
                     **common_kwargs,
                 )
@@ -334,6 +509,10 @@ class RoundRunner:
                         expected_evidence=tuple(str(value) for value in list(active_step.get("expected_evidence", []) or []) if value),
                         observed_evidence=tuple(str(value) for value in list(outcome_payload.get("expected_evidence_seen", []) or []) if value),
                         advancement_reason=str(outcome_payload.get("chain_completion_reason") or "all_steps_completed"),
+                        exit_readiness_score=float(dict(active_chain).get("exit_readiness_score_at_creation", 0.0) or 0.0),
+                        missing_prerequisites=tuple(str(value) for value in list(outcome_payload.get("missing_prerequisites", []) or []) if value),
+                        failed_without_new_support=bool(outcome_payload.get("exit_attempt_failed_without_new_support", False)),
+                        position_hold_detected=bool(outcome_payload.get("position_hold_detected", False)),
                     ),
                     **common_kwargs,
                 )
@@ -348,6 +527,10 @@ class RoundRunner:
                         observed_evidence=tuple(str(value) for value in list(outcome_payload.get("expected_evidence_seen", []) or []) if value),
                         failure_reason=str(outcome_payload.get("step_failure_reason") or "") or None,
                         advancement_reason=str(outcome_payload.get("chain_completion_reason") or "chain_aborted"),
+                        exit_readiness_score=float(dict(active_chain).get("exit_readiness_score_at_creation", 0.0) or 0.0),
+                        missing_prerequisites=tuple(str(value) for value in list(outcome_payload.get("missing_prerequisites", []) or []) if value),
+                        failed_without_new_support=bool(outcome_payload.get("exit_attempt_failed_without_new_support", False)),
+                        position_hold_detected=bool(outcome_payload.get("position_hold_detected", False)),
                     ),
                     **common_kwargs,
                 )
@@ -606,7 +789,14 @@ class RoundRunner:
                     payload=payload,
                 )
 
-    def export_round_debug_heatmaps(self, *, round_id: int, analyzed_rows: list[dict], blackboard_state: dict) -> None:
+    def export_round_debug_heatmaps(
+        self,
+        *,
+        round_id: int,
+        analyzed_rows: list[dict],
+        blackboard_state: dict,
+        first_observation: list[list[int]] | None,
+    ) -> None:
         visit_bundle = build_visit_heatmap(
             analyzed_rows,
             width=self.config.visualization.grid_width,
@@ -624,7 +814,8 @@ class RoundRunner:
             round_id=round_id,
             kind="visualization",
             name="visit_heatmap_debug.png",
-            payload=render_heatmap_debug_png(
+            payload=render_overlay_png(
+                first_observation,
                 visit_bundle["counts"],
                 overlay_kind="visit",
                 width=self.config.visualization.grid_width,
@@ -641,12 +832,31 @@ class RoundRunner:
             round_id=round_id,
             kind="visualization",
             name="poi_heatmap_debug.png",
-            payload=render_heatmap_debug_png(
+            payload=render_overlay_png(
+                first_observation,
                 poi_bundle["accepted_counts"],
                 overlay_kind="poi",
                 width=self.config.visualization.grid_width,
                 height=self.config.visualization.grid_height,
                 scale=15,
+            ),
+        )
+        self.call(
+            self.services["storage"],
+            "persist_bytes",
+            session_id=self.context.session_id,
+            round_id=round_id,
+            kind="visualization",
+            name="combined_heatmap_overlay.png",
+            payload=render_combined_overlay_png(
+                first_observation,
+                visit_bundle["counts"],
+                poi_bundle["accepted_counts"],
+                width=self.config.visualization.grid_width,
+                height=self.config.visualization.grid_height,
+                scale=15,
+                start=visit_bundle.get("start"),
+                end=visit_bundle.get("end"),
             ),
         )
 
@@ -695,6 +905,9 @@ class RoundRunner:
                         planner_contract_mode=str(dict(dict(getattr(probe_decision, "metadata", {}) or {}).get("planner_trace", {}) or {}).get("planning_pipeline_contract_mode") or "split_world_native_partial"),
                         strict_blackboard_snapshot_ref=self._strict_blackboard_snapshot_ref(latest_blackboard),
                         strict_memory_snapshot_ref=self._strict_memory_snapshot_ref(latest_memory),
+                        exit_readiness_score=float(dict(dict(getattr(probe_decision, "metadata", {}) or {}).get("planner_trace", {}) or {}).get("selected_exit_readiness_score", 0.0) or 0.0),
+                        missing_prerequisites=tuple(str(value) for value in list(dict(dict(getattr(probe_decision, "metadata", {}) or {}).get("planner_trace", {}) or {}).get("selected_missing_prerequisites", []) or []) if value),
+                        premature_exit_penalty_applied=bool(dict(dict(getattr(probe_decision, "metadata", {}) or {}).get("planner_trace", {}) or {}).get("selected_candidate_blocked_by_low_exit_readiness", False)),
                     ),
             )
         probe_branch_count = self._parallelism("env_workers", getattr(self.config.planning, "probe_branch_count", 1))
@@ -727,6 +940,10 @@ class RoundRunner:
                         avatar_source=str(dict(getattr(outcome, "outcome", {}) or {}).get("avatar_source_after") or "unknown"),
                         avatar_ambiguous=bool(dict(getattr(outcome, "outcome", {}) or {}).get("avatar_localization_ambiguous", False)),
                         avatar_tracker_status="confident" if bool(dict(getattr(outcome, "outcome", {}) or {}).get("avatar_localization_confident", False)) else "uncertain",
+                        exit_readiness_score=float(dict(getattr(outcome, "outcome", {}) or {}).get("exit_readiness_score", 0.0) or 0.0),
+                        missing_prerequisites=tuple(str(value) for value in list(dict(getattr(outcome, "outcome", {}) or {}).get("missing_prerequisites", []) or []) if value),
+                        failed_without_new_support=bool(dict(getattr(outcome, "outcome", {}) or {}).get("exit_attempt_failed_without_new_support", False)),
+                        position_hold_detected=bool(dict(getattr(outcome, "outcome", {}) or {}).get("position_hold_detected", False)),
                     ),
                 )
         if first_observation is None and probe_outcomes:
@@ -990,6 +1207,9 @@ class RoundRunner:
                         planner_contract_mode=str(dict(dict(getattr(decision, "metadata", {}) or {}).get("planner_trace", {}) or {}).get("planning_pipeline_contract_mode") or "split_world_native_partial"),
                         strict_blackboard_snapshot_ref=self._strict_blackboard_snapshot_ref(latest_blackboard),
                         strict_memory_snapshot_ref=self._strict_memory_snapshot_ref(latest_memory),
+                        exit_readiness_score=float(dict(dict(getattr(decision, "metadata", {}) or {}).get("planner_trace", {}) or {}).get("selected_exit_readiness_score", 0.0) or 0.0),
+                        missing_prerequisites=tuple(str(value) for value in list(dict(dict(getattr(decision, "metadata", {}) or {}).get("planner_trace", {}) or {}).get("selected_missing_prerequisites", []) or []) if value),
+                        premature_exit_penalty_applied=bool(dict(dict(getattr(decision, "metadata", {}) or {}).get("planner_trace", {}) or {}).get("selected_candidate_blocked_by_low_exit_readiness", False)),
                     ),
             )
         self._maybe_start_chain(
@@ -1030,6 +1250,10 @@ class RoundRunner:
                         avatar_source=str(dict(getattr(outcome, "outcome", {}) or {}).get("avatar_source_after") or "unknown"),
                         avatar_ambiguous=bool(dict(getattr(outcome, "outcome", {}) or {}).get("avatar_localization_ambiguous", False)),
                         avatar_tracker_status="confident" if bool(dict(getattr(outcome, "outcome", {}) or {}).get("avatar_localization_confident", False)) else "uncertain",
+                        exit_readiness_score=float(dict(getattr(outcome, "outcome", {}) or {}).get("exit_readiness_score", 0.0) or 0.0),
+                        missing_prerequisites=tuple(str(value) for value in list(dict(getattr(outcome, "outcome", {}) or {}).get("missing_prerequisites", []) or []) if value),
+                        failed_without_new_support=bool(dict(getattr(outcome, "outcome", {}) or {}).get("exit_attempt_failed_without_new_support", False)),
+                        position_hold_detected=bool(dict(getattr(outcome, "outcome", {}) or {}).get("position_hold_detected", False)),
                     ),
                 )
         directed_analyses = self._submit_analysis_batch(outcomes=directed_outcomes, round_id=round_id, mode="directed_outcome", blackboard_snapshot=latest_blackboard, mechanic_graph_snapshot=latest_mechanic_graph)
@@ -1237,6 +1461,18 @@ class RoundRunner:
         )
         latest_memory = self.resolve(f"memory:directed:{round_id}", mem_directed_ref)
         self.snapshot_registry.register(latest_memory.snapshot_handle, latest_memory)
+        selected_candidate_metadata = dict(getattr(decision, "metadata", {}) or {}).get("selected_candidate", {})
+        selected_candidate_metadata = dict(selected_candidate_metadata or {}) if isinstance(selected_candidate_metadata, dict) else {}
+        active_chain_snapshot = dict(getattr(decision, "metadata", {}) or {}).get("selected_subgoal_chain", {})
+        active_chain_snapshot = dict(active_chain_snapshot or {}) if isinstance(active_chain_snapshot, dict) else {}
+        _, poi_escalation_events = _update_poi_followthrough_state(
+            latest_memory=latest_memory,
+            selected_candidate=selected_candidate_metadata,
+            mg_counts=dict(mg_directed_result.get("counts", {}) or {}),
+            hypothesis_registry_snapshot=hypothesis_registry_snapshot,
+            round_id=round_id,
+            selected_subgoal_chain=active_chain_snapshot or None,
+        )
         directed_durable_status = self.call(self.services["memory"], "get_pending_durable_status")
         if self.session_ledger is not None:
             self.session_ledger.append_directed_memory_reconcile_completed(
@@ -1254,6 +1490,26 @@ class RoundRunner:
                     durable_eligibility_summary=dict(directed_durable_status or {}),
                 ),
             )
+            ledger_method_map = {
+                "detector poi selected": self.session_ledger.append_detector_poi_selected,
+                "detector poi revisited": self.session_ledger.append_detector_poi_revisited,
+                "detector poi escalated to verification": self.session_ledger.append_detector_poi_escalated_to_verification,
+                "detector poi escalated to chain": self.session_ledger.append_detector_poi_escalated_to_chain,
+                "detector poi marked stale": self.session_ledger.append_detector_poi_marked_stale,
+            }
+            for event_type, payload in poi_escalation_events:
+                ledger_method = ledger_method_map.get(str(event_type))
+                if ledger_method is None:
+                    continue
+                ledger_method(
+                    round_id=round_id,
+                    pass_id=1,
+                    blackboard_version=latest_blackboard.blackboard_version,
+                    memory_version=latest_memory.memory_version,
+                    plan_context_id=plan_context.plan_context_id,
+                    decision_id=str(getattr(decision, "selected_candidate_id", None) or f"directed-plan:{round_id}"),
+                    payload=payload,
+                )
 
         directed_step_rows = list(directed_analysis.summary.get("step_rows", []) or [])
         effect_payload = _merge_effect_payload(
@@ -1304,6 +1560,7 @@ class RoundRunner:
             analyzed_episodes=[*probe_analyses, *directed_analyses],
             candidate_effect_mode_used=actual_mode,
         )
+        analysis_summary = _sync_analysis_poi_debug_with_observed_store(analysis_summary, latest_blackboard.state)
         round_effect_payload = _round_effect_payload(analysis_summary, actual_mode)
         if selected_target_entity_id:
             state = getattr(latest_blackboard, "state", None)
@@ -1347,7 +1604,12 @@ class RoundRunner:
             "analysis_summary": analysis_summary,
         }
         self.call(self.services["storage"], "persist", session_id=self.context.session_id, round_id=round_id, kind="report", name="analysis_summary.json", payload=analysis_summary)
-        self.export_round_debug_heatmaps(round_id=round_id, analyzed_rows=new_analyzed_rows, blackboard_state=latest_blackboard.state)
+        self.export_round_debug_heatmaps(
+            round_id=round_id,
+            analyzed_rows=new_analyzed_rows,
+            blackboard_state=latest_blackboard.state,
+            first_observation=first_observation,
+        )
         selected_candidate_export = decision_export.get("metadata", {}).get("selected_candidate", {})
         stop_outcome = {
             "round_progress": round_progress,

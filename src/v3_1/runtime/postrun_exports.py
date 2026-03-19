@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from collections import Counter
+from pathlib import Path
 from v3_1.storage.serialization import dumps
 
 import ray
 
+from v3_1.storage.paths import round_root
 from v3_1.visualization.heatmaps import (
     build_poi_heatmap,
     build_visit_heatmap,
@@ -41,6 +43,49 @@ def _persist_session_bytes(storage_agent, **kwargs) -> str:
     if persist is not None and hasattr(persist, "remote"):
         return ray.get(persist.remote(**kwargs))
     return storage_agent.persist_session_bytes(**kwargs)
+
+
+def _storage_root_dir(storage_agent) -> str | None:
+    store = getattr(storage_agent, "store", None)
+    root_dir = getattr(store, "root_dir", None)
+    if root_dir:
+        return str(root_dir)
+    getter = getattr(storage_agent, "get_root_dir", None)
+    if getter is not None and hasattr(getter, "remote"):
+        try:
+            return str(ray.get(getter.remote()))
+        except Exception:
+            return None
+    if callable(getter):
+        try:
+            return str(getter())
+        except Exception:
+            return None
+    return None
+
+
+def _persist_round_visualization_copies(storage_agent, *, session_id: str, max_round_id: int) -> dict[str, str]:
+    root_dir = _storage_root_dir(storage_agent)
+    if not root_dir:
+        return {}
+    exports: dict[str, str] = {}
+    for current_round_id in range(1, int(max_round_id or 0) + 1):
+        round_dir = round_root(root_dir, session_id, current_round_id)
+        if not isinstance(round_dir, Path) or not round_dir.exists():
+            continue
+        for artifact_name in ("poi_heatmap_debug.png", "visit_heatmap_debug.png", "combined_heatmap_overlay.png"):
+            source_path = round_dir / artifact_name
+            if not source_path.exists():
+                continue
+            target_name = f"round_{current_round_id:03d}_{artifact_name}"
+            exports[target_name] = _persist_visualization(
+                storage_agent,
+                session_id=session_id,
+                kind="visualization",
+                name=target_name,
+                payload=source_path.read_bytes(),
+            )
+    return exports
 
 
 def _first_validated_round(proposals: dict, validation_state: dict) -> int | None:
@@ -863,6 +908,10 @@ def persist_postrun_outputs(
     subgoal_chain_successes_payload: dict | None = None,
     avatar_tracking_trace_payload: dict | None = None,
     avatar_tracking_failures_payload: dict | None = None,
+    detector_poi_followthrough_payload: dict | None = None,
+    probe_escalation_summary_payload: dict | None = None,
+    exit_readiness_summary_payload: dict | None = None,
+    premature_exit_attempts_payload: dict | None = None,
     graph_edge_quality_summary: dict | None = None,
     identity_stability_summary: dict | None = None,
     planner_usable_vs_durable_summary: dict | None = None,
@@ -945,6 +994,14 @@ def persist_postrun_outputs(
         exports["avatar_tracking_trace_path"] = _persist_session(storage_agent, session_id=session_id, kind="report", name="avatar_tracking_trace.json", payload=avatar_tracking_trace_payload)
     if avatar_tracking_failures_payload is not None:
         exports["avatar_tracking_failures_path"] = _persist_session(storage_agent, session_id=session_id, kind="report", name="avatar_tracking_failures.json", payload=avatar_tracking_failures_payload)
+    if detector_poi_followthrough_payload is not None:
+        exports["detector_poi_followthrough_path"] = _persist_session(storage_agent, session_id=session_id, kind="report", name="detector_poi_followthrough.json", payload=detector_poi_followthrough_payload)
+    if probe_escalation_summary_payload is not None:
+        exports["probe_escalation_summary_path"] = _persist_session(storage_agent, session_id=session_id, kind="report", name="probe_escalation_summary.json", payload=probe_escalation_summary_payload)
+    if exit_readiness_summary_payload is not None:
+        exports["exit_readiness_summary_path"] = _persist_session(storage_agent, session_id=session_id, kind="report", name="exit_readiness_summary.json", payload=exit_readiness_summary_payload)
+    if premature_exit_attempts_payload is not None:
+        exports["premature_exit_attempts_path"] = _persist_session(storage_agent, session_id=session_id, kind="report", name="premature_exit_attempts.json", payload=premature_exit_attempts_payload)
     if graph_edge_quality_summary is not None:
         exports["graph_edge_quality_summary_path"] = _persist_session(storage_agent, session_id=session_id, kind="report", name="graph_edge_quality_summary.json", payload=graph_edge_quality_summary)
     if identity_stability_summary is not None:
@@ -1001,6 +1058,13 @@ def persist_postrun_outputs(
         exports["poi_heatmap_png_path"] = poi_png_path
         exports["poi_heatmap_debug_png_path"] = poi_debug_png_path
         exports["visit_heatmap_debug_png_path"] = visit_debug_png_path
+        round_debug_exports = _persist_round_visualization_copies(
+            storage_agent,
+            session_id=session_id,
+            max_round_id=round_id,
+        )
+        if round_debug_exports:
+            exports["round_visualization_paths"] = round_debug_exports
     return exports
 
 
@@ -1245,6 +1309,69 @@ def export_postrun(storage_agent, *, session_id: str, round_id: int, game_id: st
         "events": avatar_event_payloads,
     }
     avatar_tracking_failures_payload = {"failures": avatar_failures}
+    poi_escalation_events = [
+        {
+            "event_type": str(getattr(record, "event_type", "")),
+            "round_id": int(getattr(record, "round_id", 0) or 0),
+            "payload": dict(getattr(record, "payload", {}) or {}),
+        }
+        for record in ledger_records
+        if str(getattr(record, "event_type", "")) in {
+            "detector poi selected",
+            "detector poi revisited",
+            "detector poi escalated to verification",
+            "detector poi escalated to chain",
+            "detector poi marked stale",
+        }
+    ]
+    detector_poi_followthrough_payload = {
+        "events": poi_escalation_events,
+        "selected_detector_pois_by_round": {
+            str(row["round_id"]): dict(row["payload"])
+            for row in poi_escalation_events
+            if row["event_type"] in {"detector poi selected", "detector poi revisited"}
+        },
+        "revisit_counts": dict(Counter(str(dict(row["payload"]).get("poi_id") or "") for row in poi_escalation_events if row["event_type"] == "detector poi revisited")),
+    }
+    probe_escalation_summary_payload = {
+        "selected_detector_backed_pois_by_round": detector_poi_followthrough_payload["selected_detector_pois_by_round"],
+        "revisit_counts": detector_poi_followthrough_payload["revisit_counts"],
+        "downstream_graph_support_gained": {
+            str(row["payload"].get("poi_id") or ""): dict(row["payload"].get("downstream_support_gained", {}) or {})
+            for row in poi_escalation_events
+        },
+        "escalated_to_verification_count": sum(1 for row in poi_escalation_events if row["event_type"] == "detector poi escalated to verification"),
+        "escalated_to_chain_count": sum(1 for row in poi_escalation_events if row["event_type"] == "detector poi escalated to chain"),
+        "stale_dead_end_count": sum(1 for row in poi_escalation_events if row["event_type"] == "detector poi marked stale"),
+    }
+    selected_rows = [
+        dict(dict(record.get("decision_export", {}) or {}).get("metadata", {}).get("selected_candidate", {}) or {})
+        for record in list(round_records or [])
+    ]
+    selected_rows = [row for row in selected_rows if row]
+    exit_terminal_rows = [row for row in selected_rows if str(row.get("candidate_class") or "") in {"unlock_then_exit", "mechanic_chain_deterministic", "mechanic_chain_llm"}]
+    round_outcomes = [dict(record.get("selected_outcome", {}) or {}) for record in list(round_records or [])]
+    premature_exit_attempts_payload = {
+        "rows": [
+            {
+                "round_id": int(record.get("round_id", 0) or 0),
+                "candidate_id": str(dict(dict(record.get("decision_export", {}) or {}).get("metadata", {}).get("selected_candidate", {}) or {}).get("candidate_id") or ""),
+                "exit_readiness_score": float(dict(record.get("selected_outcome", {}) or {}).get("exit_readiness_score", dict(dict(record.get("decision_export", {}) or {}).get("metadata", {}).get("selected_candidate", {}) or {}).get("exit_readiness_score", 0.0)) or 0.0),
+                "missing_prerequisites": list(dict(record.get("selected_outcome", {}) or {}).get("missing_prerequisites", dict(dict(record.get("decision_export", {}) or {}).get("metadata", {}).get("selected_candidate", {}) or {}).get("missing_prerequisite_types", [])) or []),
+                "failed_without_new_support": bool(dict(record.get("selected_outcome", {}) or {}).get("exit_attempt_failed_without_new_support", False)),
+                "position_hold_detected": bool(dict(record.get("selected_outcome", {}) or {}).get("position_hold_detected", False)),
+            }
+            for record in list(round_records or [])
+            if str(dict(dict(record.get("decision_export", {}) or {}).get("metadata", {}).get("selected_candidate", {}) or {}).get("candidate_class") or "") in {"unlock_then_exit", "mechanic_chain_deterministic", "mechanic_chain_llm"}
+        ]
+    }
+    exit_readiness_summary_payload = {
+        "exit_terminal_candidate_count": len(exit_terminal_rows),
+        "average_readiness_at_selection": _safe_rate(sum(float(row.get("exit_readiness_score", 0.0) or 0.0) for row in exit_terminal_rows), max(1, len(exit_terminal_rows))),
+        "failed_exit_attempts_without_new_support": sum(1 for row in round_outcomes if bool(row.get("exit_attempt_failed_without_new_support", False))),
+        "position_hold_failures": sum(1 for row in round_outcomes if bool(row.get("position_hold_detected", False))),
+        "verification_steps_skipped_before_exit_attempt": sum(1 for row in exit_terminal_rows if list(row.get("missing_prerequisite_types", []) or [])),
+    }
     graph_edge_quality_summary = {
         "edge_count_by_family": dict(Counter(str(row.get("edge_kind") or "unknown") for row in mechanic_edges)),
         "repeated_support_edge_rate": _safe_rate(sum(1 for row in mechanic_edges if int(row.get("support_count", 0) or 0) >= 2), max(1, len(mechanic_edges))),
@@ -1299,6 +1426,10 @@ def export_postrun(storage_agent, *, session_id: str, round_id: int, game_id: st
         subgoal_chain_successes_payload=subgoal_chain_successes_payload,
         avatar_tracking_trace_payload=avatar_tracking_trace_payload,
         avatar_tracking_failures_payload=avatar_tracking_failures_payload,
+        detector_poi_followthrough_payload=detector_poi_followthrough_payload,
+        probe_escalation_summary_payload=probe_escalation_summary_payload,
+        exit_readiness_summary_payload=exit_readiness_summary_payload,
+        premature_exit_attempts_payload=premature_exit_attempts_payload,
         graph_edge_quality_summary=graph_edge_quality_summary,
         identity_stability_summary=identity_stability_summary,
         planner_usable_vs_durable_summary=planner_usable_vs_durable_summary,

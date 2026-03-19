@@ -54,7 +54,8 @@ def build_poi_heatmap(
     rejected: list[dict] = []
     trigger_related: list[dict] = []
     targetable: list[dict] = []
-    entities = dict(blackboard_state.get("entities", {}))
+    poi_debug_artifact: dict[str, object] | None = None
+    entities = dict(blackboard_state.get("observed_entities", {}) or blackboard_state.get("entities", {}))
     trigger_entities = {str(trigger.get("entity_id")) for trigger in blackboard_state.get("trigger_zones", {}).values() if trigger.get("entity_id")}
     for entity_id, poi in entities.items():
         if poi.get("kind") != "poi":
@@ -64,9 +65,19 @@ def build_poi_heatmap(
         utility = float(poi.get("utility", 0.0))
         lifecycle = str(poi.get("lifecycle_state", "active"))
         explicitly_rejected = bool(poi.get("noise_rejected")) or utility < low_utility_threshold
+        planner_visible = bool(poi.get("planner_visible", True))
+        planner_targetable = bool(poi.get("planner_targetable", True))
+        poi_bucket = str(poi.get("poi_bucket") or "")
         stable_flag = confidence >= confidence_threshold and observations >= observation_threshold and not explicitly_rejected and lifecycle in {"active", "stale"}
+        export_flag = bool(stable_flag and planner_visible and planner_targetable)
+        if poi_debug_artifact is None and isinstance(poi.get("poi_detection_debug"), dict):
+            poi_debug_artifact = dict(poi.get("poi_detection_debug") or {})
         record = {
             "entity_id": entity_id,
+            "parent_poi_id": poi.get("parent_poi_id"),
+            "child_poi_ids": list(poi.get("child_poi_ids", []) or []),
+            "poi_hierarchy_level": int(poi.get("poi_hierarchy_level", 0) or 0),
+            "hierarchy_role": str(poi.get("hierarchy_role") or "parent_region"),
             "confidence": confidence,
             "observations": observations,
             "utility": utility,
@@ -79,8 +90,11 @@ def build_poi_heatmap(
             "motion_score": float(poi.get("motion_score", 0.0)),
             "lifecycle_state": lifecycle,
             "stable_poi": stable_flag,
-            "accepted_for_export": stable_flag,
+            "accepted_for_export": export_flag,
             "explicitly_rejected": explicitly_rejected,
+            "planner_visible": planner_visible,
+            "planner_targetable": planner_targetable,
+            "poi_bucket": poi_bucket,
         }
         layer = stable if stable_flag else rejected
         layer.append(record)
@@ -92,7 +106,7 @@ def build_poi_heatmap(
             trigger_related.append(record)
         if poi.get("reachable_now") or poi.get("reachable_later"):
             targetable.append(record)
-        if not stable_flag:
+        if not export_flag:
             continue
         _paint_poi(grid, poi, width=width, height=height)
     stable_count = max(1, len(stable))
@@ -104,6 +118,7 @@ def build_poi_heatmap(
         "rejected_pois": rejected,
         "trigger_related_pois": trigger_related,
         "targetable_pois": targetable,
+        "poi_debug_artifact": dict(poi_debug_artifact or {}),
         "avg_interaction_effect": sum(float(row.get("interaction_effect_score", 0.0)) for row in stable) / float(stable_count) if stable else 0.0,
         "avg_distance_score": sum(float(row.get("distance_score", 0.0)) for row in stable) / float(stable_count) if stable else 0.0,
         "avg_motion_score": sum(float(row.get("motion_score", 0.0)) for row in stable) / float(stable_count) if stable else 0.0,
@@ -159,6 +174,76 @@ def render_heatmap_debug_png(heatmap: list[list[int]], *, overlay_kind: str, wid
                 continue
             intensity = _normalized_intensity(value, max_value)
             row.append(_overlay_color(overlay_kind, intensity))
+        pixels.append(row)
+    _mark_point(pixels, start, color=bytes((80, 255, 120)))
+    _mark_point(pixels, end, color=bytes((255, 255, 255)))
+    return _render_rgb_matrix(pixels, scale=scale)
+
+
+def render_combined_heatmap_debug_png(
+    visit_heatmap: list[list[int]],
+    poi_heatmap: list[list[int]],
+    *,
+    width: int = 64,
+    height: int = 64,
+    scale: int = 15,
+    start: list[int] | None = None,
+    end: list[int] | None = None,
+) -> bytes:
+    visit = _normalize_heatmap(visit_heatmap, width=width, height=height)
+    poi = _normalize_heatmap(poi_heatmap, width=width, height=height)
+    max_visit = max(max(row) for row in visit) if visit else 0
+    max_poi = max(max(row) for row in poi) if poi else 0
+    pixels = []
+    for y in range(height):
+        row = []
+        for x in range(width):
+            visit_value = visit[y][x]
+            poi_value = poi[y][x]
+            if visit_value <= 0 and poi_value <= 0:
+                row.append(bytes((0, 0, 0)))
+                continue
+            visit_color = _overlay_color("visit", _normalized_intensity(visit_value, max_visit)) if visit_value > 0 and max_visit > 0 else bytes((0, 0, 0))
+            poi_color = _overlay_color("poi", _normalized_intensity(poi_value, max_poi)) if poi_value > 0 and max_poi > 0 else bytes((0, 0, 0))
+            row.append(bytes(max(visit_color[idx], poi_color[idx]) for idx in range(3)))
+        pixels.append(row)
+    _mark_point(pixels, start, color=bytes((80, 255, 120)))
+    _mark_point(pixels, end, color=bytes((255, 255, 255)))
+    return _render_rgb_matrix(pixels, scale=scale)
+
+
+def render_combined_overlay_png(
+    observation: list[list[int]] | None,
+    visit_heatmap: list[list[int]],
+    poi_heatmap: list[list[int]],
+    *,
+    width: int = 64,
+    height: int = 64,
+    scale: int = 15,
+    start: list[int] | None = None,
+    end: list[int] | None = None,
+) -> bytes:
+    base = _normalize_observation(observation, width=width, height=height)
+    visit = _normalize_heatmap(visit_heatmap, width=width, height=height)
+    poi = _normalize_heatmap(poi_heatmap, width=width, height=height)
+    max_visit = max(max(row) for row in visit) if visit else 0
+    max_poi = max(max(row) for row in poi) if poi else 0
+    pixels = []
+    for y in range(height):
+        row = []
+        for x in range(width):
+            base_color = _arc_color(base[y][x])
+            visit_value = visit[y][x]
+            poi_value = poi[y][x]
+            if visit_value <= 0 and poi_value <= 0:
+                row.append(base_color)
+                continue
+            blended = base_color
+            if visit_value > 0 and max_visit > 0:
+                blended = _blend(blended, _overlay_color("visit", _normalized_intensity(visit_value, max_visit)), 0.45)
+            if poi_value > 0 and max_poi > 0:
+                blended = _blend(blended, _overlay_color("poi", _normalized_intensity(poi_value, max_poi)), 0.55)
+            row.append(blended)
         pixels.append(row)
     _mark_point(pixels, start, color=bytes((80, 255, 120)))
     _mark_point(pixels, end, color=bytes((255, 255, 255)))

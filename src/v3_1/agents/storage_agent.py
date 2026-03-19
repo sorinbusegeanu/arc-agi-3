@@ -158,3 +158,6 @@ class StorageAgent:
 
     def manifests(self) -> list[dict]:
         return list(self.session_store.manifests)
+
+    def get_root_dir(self) -> str:
+        return str(self.store.root_dir)

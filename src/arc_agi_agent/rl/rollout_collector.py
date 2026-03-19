@@ -306,6 +306,7 @@ class RolloutCollector:
             steps: List[Dict[str, Any]] = []
             obs_norm_curr = normalize_obs_v1(obs, fp_report=fp_curr)
             grid_curr = canonical_grid(obs_norm_curr)
+            grid_prev_prev: Optional[np.ndarray] = None
             frame_buffer: Deque[Any] = deque(maxlen=frame_stack_len)
             frame_buffer.append(grid_curr.copy())
 
@@ -513,6 +514,7 @@ class RolloutCollector:
                     state_hash_t_minus_2=state_hash_t_minus_2,
                     cfg=cfg_eff.get("reward"),
                     ctx={
+                        "grid_prev_prev": grid_prev_prev,
                         "grid_prev": grid_curr,
                         "grid_curr": grid_next,
                         "game_id": game_id,
@@ -540,13 +542,14 @@ class RolloutCollector:
                     )
                     raise RuntimeError("reward_total out of expected range")
                 logger.info(
-                    "reward_step game_id=%s step=%s action_id=%s r_total=%.4f r_win=%.4f r_effect=%.4f r_revert=%.4f r_potential=%.4f m_noop=%s flash=%s delta_c=%s",
+                    "reward_step game_id=%s step=%s action_id=%s r_total=%.4f r_win=%.4f r_effect=%.4f r_match_poi=%.4f r_revert=%.4f r_potential=%.4f m_noop=%s flash=%s delta_c=%s",
                     game_id,
                     step_idx,
                     action_id,
                     reward_total,
                     float(reward_terms.get("r_win", 0.0)),
                     float(reward_terms.get("r_effect", 0.0)),
+                    float(reward_terms.get("r_match_poi", 0.0)),
                     float(reward_terms.get("r_revert", 0.0)),
                     float(reward_terms.get("r_potential", 0.0)),
                     int(reward_terms.get("m_noop", 1)),
@@ -662,6 +665,7 @@ class RolloutCollector:
                 obs_norm_curr = obs_norm_next
                 fp_prev = fp_curr
                 fp_curr = fp_next
+                grid_prev_prev = np.asarray(grid_curr, dtype=np.int64).copy()
                 grid_curr = grid_next
                 frame_buffer.append(grid_next.copy())
                 prev_action = action
@@ -674,6 +678,7 @@ class RolloutCollector:
             if steps:
                 r_win_sum = 0.0
                 r_effect_sum = 0.0
+                r_match_poi_sum = 0.0
                 r_revert_sum = 0.0
                 r_potential_sum = 0.0
                 r_total_sum = 0.0
@@ -681,17 +686,19 @@ class RolloutCollector:
                     terms = s.get("reward_terms", {}) if isinstance(s.get("reward_terms"), dict) else {}
                     r_win_sum += float(terms.get("r_win", 0.0))
                     r_effect_sum += float(terms.get("r_effect", 0.0))
+                    r_match_poi_sum += float(terms.get("r_match_poi", 0.0))
                     r_revert_sum += float(terms.get("r_revert", 0.0))
                     r_potential_sum += float(terms.get("r_potential", 0.0))
                     r_total_sum += float(s.get("reward", 0.0))
                 logger.info(
-                    "reward_breakdown game_id=%s seed=%s steps=%s r_total=%.4f r_win=%.4f r_effect=%.4f r_revert=%.4f r_potential=%.4f",
+                    "reward_breakdown game_id=%s seed=%s steps=%s r_total=%.4f r_win=%.4f r_effect=%.4f r_match_poi=%.4f r_revert=%.4f r_potential=%.4f",
                     game_id,
                     seed,
                     len(steps),
                     r_total_sum,
                     r_win_sum,
                     r_effect_sum,
+                    r_match_poi_sum,
                     r_revert_sum,
                     r_potential_sum,
                 )

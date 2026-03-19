@@ -192,6 +192,44 @@ def _combine_rows(*stores: dict[str, dict]) -> dict[str, dict]:
     return combined
 
 
+def _remove_collapsed_pois(store: dict[str, dict], collapsed_poi_ids: list[str] | set[str] | tuple[str, ...]) -> dict[str, dict]:
+    collapsed = {str(value) for value in list(collapsed_poi_ids or []) if value}
+    if not collapsed:
+        return {str(row_id): dict(row) for row_id, row in dict(store or {}).items()}
+    cleaned: dict[str, dict] = {}
+    for row_id, row in dict(store or {}).items():
+        payload = dict(row)
+        entity_id = str(payload.get("entity_id") or row_id or "")
+        poi_id = str(payload.get("poi_id") or "")
+        if entity_id in collapsed or poi_id in collapsed:
+            continue
+        cleaned[str(row_id)] = payload
+    return cleaned
+
+
+def _remove_subsumed_poi_rows(store: dict[str, dict]) -> dict[str, dict]:
+    rows = {str(row_id): dict(row) for row_id, row in dict(store or {}).items()}
+    subsumed_ids: set[str] = set()
+    for row_id, row in rows.items():
+        if str(row.get("kind") or "") != "poi":
+            continue
+        self_id = str(row.get("entity_id") or row_id or "")
+        for merged_id in list(row.get("merged_input_poi_ids", []) or []):
+            merged_id = str(merged_id or "")
+            if merged_id and merged_id != self_id and merged_id.startswith("entity:"):
+                subsumed_ids.add(merged_id)
+    if not subsumed_ids:
+        return rows
+    cleaned: dict[str, dict] = {}
+    for row_id, row in rows.items():
+        entity_id = str(row.get("entity_id") or row_id or "")
+        poi_id = str(row.get("poi_id") or "")
+        if entity_id in subsumed_ids or poi_id in subsumed_ids:
+            continue
+        cleaned[str(row_id)] = dict(row)
+    return cleaned
+
+
 def _apply_step_target_effects(entities: dict[str, dict], delta: dict) -> dict[str, dict]:
     updated = {entity_id: dict(row) for entity_id, row in dict(entities or {}).items()}
     metadata = dict(delta.get("metadata", {})) if isinstance(delta.get("metadata"), dict) else {}
@@ -440,14 +478,19 @@ def apply_delta(state: dict, delta: dict, *, max_consequences: int = 100) -> tup
     classified_topology_edges = [_classify_row("topology_edges", row, delta) for row in list(delta.get("topology_edges", ()) or [])]
 
     merged_areas = merge_areas(state.get("areas", {}), classified_areas)
+    collapsed_poi_ids = list(dict(delta.get("metadata", {})).get("collapsed_poi_ids", []) or [])
     observed_entities = merge_entities(
         state.get("observed_entities", {}),
         [row for row in classified_entities if row.get("evidence_tier") == "observed"],
     )
+    observed_entities = _remove_collapsed_pois(observed_entities, collapsed_poi_ids)
+    observed_entities = _remove_subsumed_poi_rows(observed_entities)
     hypothesized_entities = merge_entities(
         state.get("hypothesized_entities", {}),
         [row for row in classified_entities if row.get("evidence_tier") != "observed"],
     )
+    hypothesized_entities = _remove_collapsed_pois(hypothesized_entities, collapsed_poi_ids)
+    hypothesized_entities = _remove_subsumed_poi_rows(hypothesized_entities)
     observed_consequences = merge_consequences(
         state.get("observed_consequences", {}),
         [row for row in classified_consequences if row.get("evidence_tier") == "observed"],
