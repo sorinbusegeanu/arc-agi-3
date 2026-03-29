@@ -125,6 +125,7 @@ def summarize_observation(observation: Any, previous_observation: Any | None = N
         obj["identity_confidence"] = float(identity.get("identity_confidence", 0.0) or 0.0)
         obj["identity_status"] = str(identity.get("identity_status") or "new_entity")
         obj["candidate_prior_ids"] = list(identity.get("candidate_prior_ids", []) or [])
+        obj["identity_candidate_prior_ids"] = list(identity.get("candidate_prior_ids", []) or [])
         if identity.get("matched_prior_id"):
             obj["matched_prior_id"] = identity.get("matched_prior_id")
         identity_metrics = dict(identity.get("identity_metrics", {}) or {})
@@ -154,9 +155,10 @@ def summarize_observation(observation: Any, previous_observation: Any | None = N
                 "touches_border": bool(obj["touches_border"]),
                 "identity_confidence": float(identity.get("identity_confidence", 0.0) or 0.0),
                 "identity_status": str(identity.get("identity_status") or "new_entity"),
-                "candidate_prior_ids": list(identity.get("candidate_prior_ids", []) or []),
-            }
-        )
+                    "candidate_prior_ids": list(identity.get("candidate_prior_ids", []) or []),
+                    "identity_candidate_prior_ids": list(identity.get("candidate_prior_ids", []) or []),
+                }
+            )
         structure_score = 0.0
         if obj["kind"] == "world_object":
             structure_score += 0.2
@@ -210,6 +212,7 @@ def summarize_observation(observation: Any, previous_observation: Any | None = N
                     "identity_status": str(identity.get("identity_status") or "new_entity"),
                     "matched_prior_id": identity.get("matched_prior_id"),
                     "candidate_prior_ids": list(identity.get("candidate_prior_ids", []) or []),
+                    "identity_candidate_prior_ids": list(identity.get("candidate_prior_ids", []) or []),
                     "identity_metrics": identity_metrics,
                     "stable_descriptor": dict(obj.get("stable_descriptor", {}) or {}),
                     "pattern_id": obj.get("pattern_id"),

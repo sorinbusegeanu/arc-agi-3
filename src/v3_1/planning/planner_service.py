@@ -42,32 +42,87 @@ POI_ESCALATION_OBJECTIVES = {
 }
 
 
-def _apply_poi_probe_escalation(reranked: list[dict], belief: dict) -> list[dict]:
+def _apply_poi_probe_escalation(reranked: list[dict], belief: dict) -> tuple[list[dict], dict]:
     followthrough = {
         str(key): dict(value)
         for key, value in dict(belief.get("detector_poi_followthrough", {}) or {}).items()
         if isinstance(value, dict)
     }
     adjusted = []
+    trace_summary = {
+        "support_gain_since_last_visit": 0,
+        "identity_gain_since_last_visit": 0,
+        "durable_gain_since_last_visit": 0,
+        "escalation_gate_passed": False,
+        "escalation_block_reason_codes": [],
+    }
     for row in list(reranked or []):
         candidate = dict(row)
         target_entity_id = str(candidate.get("target_entity_id") or "")
         poi_state = dict(followthrough.get(target_entity_id, {}) or {})
+        graph_gain = int(poi_state.get("support_gain_since_last_visit", poi_state.get("graph_support_gain", 0)) or 0)
+        identity_gain = int(poi_state.get("identity_gain_since_last_visit", 0) or 0)
+        durable_gain = int(poi_state.get("durable_gain_since_last_visit", 0) or 0)
+        usable_trigger_gain = int(poi_state.get("usable_trigger_gain_since_last_visit", 0) or 0)
+        stale_dead_end_count = int(poi_state.get("stale_dead_end_count", 0) or 0)
+        chain_step_failure_count = int(poi_state.get("chain_step_failure_count", 0) or 0)
+        new_hypothesis_support = int(poi_state.get("new_hypothesis_support", 0) or 0)
         stronger_support = bool(
-            int(poi_state.get("new_graph_edges", 0) or 0) > 0
-            or int(poi_state.get("new_hypothesis_support", 0) or 0) > 0
-            or int(poi_state.get("new_verification_candidates", 0) or 0) > 0
-            or int(poi_state.get("changed_exit_linked_evidence", 0) or 0) > 0
+            graph_gain > 0
+            or identity_gain > 0
+            or durable_gain > 0
+            or usable_trigger_gain > 0
+            or new_hypothesis_support > 0
         )
+        repeated_zero_gain = bool(
+            int(poi_state.get("selection_rounds", 0) or 0) >= 2
+            and graph_gain <= 0
+            and identity_gain <= 0
+            and durable_gain <= 0
+            and usable_trigger_gain <= 0
+            and new_hypothesis_support <= 0
+        )
+        block_reason_codes: list[str] = []
+        if repeated_zero_gain:
+            block_reason_codes.append("zero_support_gain")
+        if stale_dead_end_count > 0:
+            block_reason_codes.append("stale_dead_end")
+        if chain_step_failure_count > 0:
+            block_reason_codes.append("prior_chain_step_failed")
+        escalation_gate_passed = stronger_support and not repeated_zero_gain and chain_step_failure_count <= 0
         escalation_bonus = 0.0
-        if str(candidate.get("objective_type") or "") in POI_ESCALATION_OBJECTIVES and stronger_support:
+        objective_type = str(candidate.get("objective_type") or "")
+        candidate_class = str(candidate.get("candidate_class") or "")
+        if objective_type in POI_ESCALATION_OBJECTIVES and escalation_gate_passed:
             escalation_bonus = 0.22 + (0.04 * min(3, int(poi_state.get("revisit_count", 0) or 0)))
-        if str(candidate.get("candidate_class") or "") == "route_probe" and stronger_support:
+        elif objective_type in POI_ESCALATION_OBJECTIVES and not escalation_gate_passed:
+            escalation_bonus = -2.5
+        if candidate_class == "route_probe" and escalation_gate_passed:
             escalation_bonus = -0.3
+        elif candidate_class == "route_probe" and repeated_zero_gain:
+            escalation_bonus = max(escalation_bonus, -0.18)
         candidate["final_score"] = float(candidate.get("final_score", candidate.get("score", 0.0)) or 0.0) + escalation_bonus
+        candidate["support_gain_since_last_visit"] = graph_gain
+        candidate["identity_gain_since_last_visit"] = identity_gain
+        candidate["durable_gain_since_last_visit"] = durable_gain
+        candidate["escalation_gate_passed"] = escalation_gate_passed
+        candidate["escalation_block_reason_codes"] = list(block_reason_codes)
         rerank_diag = dict(candidate.get("rerank_diagnostics", {}) or {})
         rerank_diag["planner_service_probe_escalation_bonus"] = escalation_bonus
+        rerank_diag["support_gain_since_last_visit"] = graph_gain
+        rerank_diag["identity_gain_since_last_visit"] = identity_gain
+        rerank_diag["durable_gain_since_last_visit"] = durable_gain
+        rerank_diag["escalation_gate_passed"] = escalation_gate_passed
+        rerank_diag["escalation_block_reason_codes"] = list(block_reason_codes)
         candidate["rerank_diagnostics"] = rerank_diag
+        if target_entity_id and candidate.get("target_entity_id") == target_entity_id:
+            trace_summary = {
+                "support_gain_since_last_visit": graph_gain,
+                "identity_gain_since_last_visit": identity_gain,
+                "durable_gain_since_last_visit": durable_gain,
+                "escalation_gate_passed": escalation_gate_passed,
+                "escalation_block_reason_codes": list(block_reason_codes),
+            }
         adjusted.append(candidate)
     adjusted.sort(
         key=lambda item: (
@@ -75,7 +130,16 @@ def _apply_poi_probe_escalation(reranked: list[dict], belief: dict) -> list[dict
             str(item.get("candidate_id") or ""),
         )
     )
-    return adjusted
+    if adjusted:
+        top = dict(adjusted[0])
+        trace_summary = {
+            "support_gain_since_last_visit": int(top.get("support_gain_since_last_visit", 0) or 0),
+            "identity_gain_since_last_visit": int(top.get("identity_gain_since_last_visit", 0) or 0),
+            "durable_gain_since_last_visit": int(top.get("durable_gain_since_last_visit", 0) or 0),
+            "escalation_gate_passed": bool(top.get("escalation_gate_passed", False)),
+            "escalation_block_reason_codes": list(top.get("escalation_block_reason_codes", []) or []),
+        }
+    return adjusted, trace_summary
 
 
 def _build_selected_subgoal_chain(selected: dict | None, *, round_id: int) -> dict | None:
@@ -205,6 +269,32 @@ def _apply_exit_readiness_selection_guard(reranked: list[dict], *, planner_trace
     return rows
 
 
+def _apply_probe_escalation_selection_guard(reranked: list[dict], *, planner_trace: dict) -> list[dict]:
+    rows = [dict(row) for row in list(reranked or [])]
+    if not rows:
+        return rows
+    selected = dict(rows[0])
+    objective_type = str(selected.get("objective_type") or "")
+    if objective_type not in POI_ESCALATION_OBJECTIVES:
+        return rows
+    if bool(selected.get("escalation_gate_passed", False)):
+        return rows
+    replacement = next(
+        (
+            dict(row)
+            for row in rows[1:]
+            if str(row.get("objective_type") or "") not in POI_ESCALATION_OBJECTIVES
+        ),
+        None,
+    )
+    if replacement is None:
+        return rows
+    replacement_id = str(replacement.get("candidate_id") or "")
+    rows.sort(key=lambda row: 0 if str(row.get("candidate_id") or "") == replacement_id else 1)
+    planner_trace["selected_candidate_blocked_by_probe_escalation_gate"] = True
+    return rows
+
+
 def _active_chain_snapshot(belief: dict) -> tuple[dict | None, dict | None, bool]:
     chain_summary = dict(belief.get("active_chain_summary", {}) or {})
     progress = dict(belief.get("chain_progress_summary", {}) or {})
@@ -300,6 +390,82 @@ def _annotate_seed_support(rows: list[dict], blackboard_snapshot: dict, *, penal
     return annotated
 
 
+def _annotate_candidate_usability(rows: list[dict], blackboard_snapshot: dict, registry_snapshot: dict | None = None) -> list[dict]:
+    entities = dict(blackboard_snapshot.get("entities", {}) or {})
+    registry_snapshot = dict(registry_snapshot or {})
+    registry_usable_ids = {str(value) for value in list(registry_snapshot.get("planner_usable_ids", []) or []) if value}
+    registry_durable_ids = {str(value) for value in list(registry_snapshot.get("durable_ready_ids", []) or []) if value}
+    registry_usable_reason_codes_by_id = {
+        str(key): list(value)
+        for key, value in dict(registry_snapshot.get("planner_usable_reason_codes_by_id", {}) or {}).items()
+    }
+    registry_durable_reason_codes_by_id = {
+        str(key): list(value)
+        for key, value in dict(registry_snapshot.get("durable_ready_reason_codes_by_id", {}) or {}).items()
+    }
+    annotated = []
+    for row in list(rows or []):
+        payload = dict(row)
+        target_entity_id = str(payload.get("target_entity_id") or "")
+        entity = dict(entities.get(target_entity_id, {}) or {}) if target_entity_id else {}
+        support_profile = dict(entity.get("evidence_support_profile", {}) or {})
+        if not support_profile and target_entity_id:
+            edge_profiles = dict(dict(blackboard_snapshot.get("indexes", {}) or {}).get("topology_edge_support_profile_rows", {}) or {})
+            for profile in edge_profiles.values():
+                candidate_profile = dict(profile.get("evidence_support_profile", {}) or {})
+                if any(int(value or 0) > 0 for value in candidate_profile.values()):
+                    support_profile = candidate_profile
+                    break
+        identity_profile = dict(entity.get("identity_strength_profile", {}) or {})
+        planner_usable = bool(
+            target_entity_id in registry_usable_ids
+            or
+            int(support_profile.get("directed_outcome", 0) or 0) > 0
+            or int(support_profile.get("counterfactual", 0) or 0) > 0
+            or int(support_profile.get("exit_attempt", 0) or 0) > 0
+            or str(identity_profile.get("identity_status") or "") in {"match_existing", "confirmed", "probable"}
+        )
+        durable_ready = bool(
+            target_entity_id in registry_durable_ids
+            or
+            int(support_profile.get("directed_outcome", 0) or 0) >= 2
+            or int(support_profile.get("exit_attempt", 0) or 0) >= 1
+        )
+        usable_reason_codes = list(registry_usable_reason_codes_by_id.get(target_entity_id, []) or [])
+        if int(support_profile.get("directed_outcome", 0) or 0) > 0:
+            usable_reason_codes.append("directed_support")
+        if int(support_profile.get("counterfactual", 0) or 0) > 0:
+            usable_reason_codes.append("counterfactual_support")
+        if int(support_profile.get("exit_attempt", 0) or 0) > 0:
+            usable_reason_codes.append("exit_attempt_support")
+        if str(identity_profile.get("identity_status") or "") in {"match_existing", "confirmed", "probable"}:
+            usable_reason_codes.append("identity_strength")
+        usable_reason_codes = list(dict.fromkeys(usable_reason_codes))
+        durable_reason_codes = list(dict.fromkeys(list(registry_durable_reason_codes_by_id.get(target_entity_id, []) or [])))
+        payload["candidate_planner_usable"] = planner_usable
+        payload["candidate_durable_ready"] = durable_ready
+        payload["candidate_usable_reason_codes"] = list(usable_reason_codes)
+        payload["candidate_durable_reason_codes"] = list(durable_reason_codes)
+        usability_bonus = 0.0
+        if planner_usable and str(payload.get("objective_type") or "") != "probe_route":
+            usability_bonus = 0.35
+        elif not planner_usable and str(payload.get("objective_type") or "") != "probe_route":
+            usability_bonus = -0.2
+        score_key = "final_score" if "final_score" in payload else "score"
+        payload[score_key] = float(payload.get(score_key, 0.0) or 0.0) + usability_bonus
+        if any(int(value or 0) > 0 for value in support_profile.values()) and not planner_usable:
+            payload["candidate_unusable_block_reason"] = "support_survived_but_not_marked_usable"
+        if (
+            bool(payload.get("candidate_planner_usable", False))
+            and target_entity_id
+            and target_entity_id not in registry_usable_ids
+        ):
+            payload["candidate_unusable_block_reason"] = "registry_promotion_missing"
+        payload["candidate_usable_bonus"] = usability_bonus
+        annotated.append(payload)
+    return annotated
+
+
 def _split_world_contracts(*, blackboard_snapshot: dict, belief: dict) -> tuple[dict, dict, dict]:
     seed_sets = dict(belief.get("candidate_seed_sets", {}))
     observed_entities = dict(blackboard_snapshot.get("observed_entities", {}))
@@ -352,9 +518,14 @@ def _split_world_contracts(*, blackboard_snapshot: dict, belief: dict) -> tuple[
     uncertainty_context = {
         "current_area_id": belief.get("current_area_id"),
         "planning_mode": belief.get("planning_mode"),
+        "previous_planning_mode": belief.get("previous_planning_mode"),
         "available_action_families": list(belief.get("available_action_families", [])),
         "versions": dict(belief.get("versions", {})),
         "tactical_memory": dict(belief.get("tactical_memory_view", {})),
+        "mode_persistence_summary": dict(belief.get("mode_persistence_summary", {})),
+        "structure_acquisition_score": float(belief.get("structure_acquisition_score", 0.0) or 0.0),
+        "default_progress_score": float(belief.get("default_progress_score", 0.0) or 0.0),
+        "mode_switch_block_reason": str(belief.get("mode_switch_block_reason") or ""),
         "evidence_index": dict(dict(belief.get("support_view", {})).get("indexes", {}).get("evidence_index", {})),
         "compatibility_alias_rows": {
             "reachable_targets": len(list(seed_sets.get("reachable_targets", []))),
@@ -385,6 +556,14 @@ def _compact_belief_trace(belief: dict) -> dict:
         "versions": dict(belief.get("versions", {})),
         "current_area_id": belief.get("current_area_id"),
         "planning_mode": belief.get("planning_mode"),
+        "previous_planning_mode": belief.get("previous_planning_mode"),
+        "mode_persistence_summary": dict(belief.get("mode_persistence_summary", {})),
+        "structure_acquisition_score": float(belief.get("structure_acquisition_score", 0.0) or 0.0),
+        "default_progress_score": float(belief.get("default_progress_score", 0.0) or 0.0),
+        "mode_switch_applied": bool(belief.get("mode_switch_applied", False)),
+        "mode_switch_reason": belief.get("last_mode_reason"),
+        "mode_switch_block_reason": belief.get("mode_switch_block_reason"),
+        "mode_persistence_hysteresis_applied": bool(belief.get("mode_persistence_hysteresis_applied", False)),
         "structure_recall_gap": belief.get("structure_recall_gap"),
         "object_backed_node_count": belief.get("object_backed_node_count"),
         "mechanic_object_backed_node_count": belief.get("mechanic_object_backed_node_count"),
@@ -613,6 +792,7 @@ def plan(
         belief_fallback=belief,
     )
     scored = _annotate_seed_support(scored, blackboard_snapshot, penalty=0.2)
+    scored = _annotate_candidate_usability(scored, blackboard_snapshot, hypothesis_registry_snapshot)
     reranked = rerank_candidates(
         scored,
         helper_results,
@@ -622,10 +802,12 @@ def plan(
         durable_prior_context=durable_prior_context,
         belief_fallback=belief,
     )
-    reranked = _apply_poi_probe_escalation(reranked, belief)
-    planner_trace_stub: dict = {}
+    reranked, probe_escalation_trace = _apply_poi_probe_escalation(reranked, belief)
+    planner_trace_stub: dict = dict(probe_escalation_trace or {})
     reranked = _apply_exit_readiness_selection_guard(reranked, planner_trace=planner_trace_stub)
+    reranked = _apply_probe_escalation_selection_guard(reranked, planner_trace=planner_trace_stub)
     reranked = _annotate_seed_support(reranked, blackboard_snapshot)
+    reranked = _annotate_candidate_usability(reranked, blackboard_snapshot, hypothesis_registry_snapshot)
     fallback_rows = (
         [row for row in reranked if str(row.get("objective_type") or "") == "fallback"]
         if reranked
@@ -665,7 +847,18 @@ def plan(
         selected=selected,
         consistency_checks=consistency_checks,
     )
-    planner_trace["planning_mode"] = belief.get("planning_mode")
+    planner_trace["planning_mode_before_hysteresis"] = belief.get("planning_mode_before_hysteresis")
+    planner_trace["planning_mode_after_hysteresis"] = belief.get("planning_mode_after_hysteresis")
+    planner_trace["planning_mode_committed"] = belief.get("planning_mode_committed")
+    planner_trace["planning_mode"] = belief.get("planning_mode_committed")
+    planner_trace["reasoning_previous_planning_mode"] = belief.get("previous_planning_mode")
+    planner_trace["mode_persistence_summary"] = dict(belief.get("mode_persistence_summary", {}))
+    planner_trace["structure_acquisition_score"] = float(belief.get("structure_acquisition_score", 0.0) or 0.0)
+    planner_trace["default_progress_score"] = float(belief.get("default_progress_score", 0.0) or 0.0)
+    planner_trace["mode_switch_applied"] = bool(belief.get("mode_switch_applied", False))
+    planner_trace["mode_switch_reason"] = belief.get("last_mode_reason")
+    planner_trace["mode_switch_block_reason"] = belief.get("mode_switch_block_reason")
+    planner_trace["mode_persistence_hysteresis_applied"] = bool(belief.get("mode_persistence_hysteresis_applied", False))
     planner_trace.update(planner_trace_stub)
     planner_trace["planner_contract_mode"] = "split_world_native"
     pipeline_modes = {

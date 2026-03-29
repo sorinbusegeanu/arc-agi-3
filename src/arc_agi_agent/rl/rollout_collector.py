@@ -5,6 +5,8 @@ import io
 import logging
 import os
 import random
+import shutil
+import subprocess
 from collections import deque
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
@@ -16,6 +18,7 @@ from ..fp_analyst import FPAnalyst
 from ..normalize import normalize_observation
 from ..transition_event_compiler import compile_transition_event, to_json as event_to_json
 from ..transition_event_compiler_config import TransitionEventCompilerConfig
+from ..viz import save_grid_image
 from .coord_proposer import CoordProposer
 from .module_control import ModuleDisabledError, module_enabled
 from .obs_norm_v1 import normalize_obs_v1
@@ -30,6 +33,45 @@ _REWARD_LOG_FIELDS = [
     "r_win", "r_effect", "r_revert", "r_potential", "r_step", "r_total",
     "m_noop", "flash", "effect_flag", "revert_flag", "cells_changed",
 ]
+
+
+def _write_video_frame(video_dir: str, frame_idx: int, grid: np.ndarray) -> None:
+    os.makedirs(video_dir, exist_ok=True)
+    frame_path = os.path.join(video_dir, f"frame_{frame_idx:04d}.png")
+    save_grid_image(frame_path, np.asarray(grid, dtype=np.int64))
+    try:
+        from PIL import Image
+        with Image.open(frame_path) as img:
+            upscaled = img.resize((img.width * 4, img.height * 4), resample=Image.Resampling.NEAREST)
+            upscaled.save(frame_path)
+    except Exception:
+        logger.exception("video_frame_upscale_failed frame_path=%s", frame_path)
+
+
+def _encode_video(video_dir: str) -> None:
+    try:
+        ffmpeg_bin = shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
+        subprocess.run(
+            [
+                ffmpeg_bin,
+                "-y",
+                "-framerate",
+                "4",
+                "-i",
+                "frame_%04d.png",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "out.mp4",
+            ],
+            cwd=video_dir,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        logger.exception("video_encode_failed video_dir=%s ffmpeg_bin=%s", video_dir, shutil.which("ffmpeg") or "/usr/bin/ffmpeg")
 
 
 def _write_reward_log(path: str, game_id: str, ep: int, step: int, terms: Dict[str, Any], r_total: float) -> None:
@@ -263,11 +305,15 @@ class RolloutCollector:
         save_full_batch = bool(cfg_eff.get("rl", {}).get("save_full_batch", False))
         frame_stack_len = max(1, int(cfg_eff.get("frame_stack", 4)))
         minimal_batch_mode = bool(rl_only_mode and (not trace_enabled) and (not save_full_batch))
+        video_dir_root = cfg_eff.get("video_dir")
 
         batch = {"schema_version": "TRAJECTORY_BATCH_V1", "episodes": [], "available_actions_mask_format": "bool_nd"}
 
         for ep_idx in range(episodes):
             env, game_id, seed = env_factory(ep_idx)
+            episode_video_dir = None
+            if video_dir_root:
+                episode_video_dir = os.path.join(str(video_dir_root), f"episode_{ep_idx:03d}_{str(game_id)}_{int(seed)}")
             obs = env.reset()
             fp_prev = None
             if self.analyst is None:
@@ -309,6 +355,10 @@ class RolloutCollector:
             grid_prev_prev: Optional[np.ndarray] = None
             frame_buffer: Deque[Any] = deque(maxlen=frame_stack_len)
             frame_buffer.append(grid_curr.copy())
+            frame_idx = 1
+            if episode_video_dir:
+                _write_video_frame(episode_video_dir, frame_idx, grid_curr)
+                frame_idx += 1
 
             height, width = _fp_grid_dims(fp_curr)
             action_schema = build_action_schema_from_env(env.action_space, width=width, height=height)
@@ -668,6 +718,9 @@ class RolloutCollector:
                 grid_prev_prev = np.asarray(grid_curr, dtype=np.int64).copy()
                 grid_curr = grid_next
                 frame_buffer.append(grid_next.copy())
+                if episode_video_dir:
+                    _write_video_frame(episode_video_dir, frame_idx, grid_next)
+                    frame_idx += 1
                 prev_action = action
                 prev_reward = reward_total
                 prev_done = done
@@ -712,5 +765,7 @@ class RolloutCollector:
                     "num_steps": len(steps),
                 }
             )
+            if episode_video_dir:
+                _encode_video(episode_video_dir)
 
         return batch

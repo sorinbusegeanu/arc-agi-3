@@ -14,7 +14,7 @@ def compute_entity_identity_metrics(entity_rows: list[dict]) -> dict:
         "stable_identity_rate": float(len(stable)) / float(total),
         "ambiguous_identity_rate": float(len(ambiguous)) / float(total),
         "forced_merge_rate": float(len(forced_merge)) / float(total),
+        "identity_drift_rate": float(len(drift)) / float(total),
+        "path_breakage_from_identity_instability": len(path_breakage),
         "new_entity_rate": float(len(new_entity)) / float(total),
-        "identity_drift_rate_across_rounds": float(len(drift)) / float(total),
-        "path_breakage_due_to_identity_instability": len(path_breakage),
     }

@@ -218,6 +218,7 @@ def _collect_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
     worker_id = str(payload.get("worker_id", "unknown"))
     iter_idx = int(payload.get("iter_idx", -1))
     debug_reward_log = payload.get("debug_reward_log") or None
+    video_dir = payload.get("video_dir") or None
     logger.info(
         "collect_worker_start iter=%s worker=%s seed_base=%s episodes=%s max_actions=%s stochastic=%s device=%s torch_threads=%s",
         iter_idx,
@@ -251,6 +252,7 @@ def _collect_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
             "mode": collect_mode,
             "hud_cache_dir": str(cfg.get("hud_cache_dir", "runs/cache")),
             "debug_reward_log": debug_reward_log,
+            "video_dir": video_dir,
         },
     )
     ep_count = len(batch.get("episodes", []))
@@ -352,6 +354,7 @@ def _collect_batch(
     render_terminal: bool = False,
     collect_mode: str = "train",
     debug_reward_log: Optional[str] = None,
+    video_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
     logger.info(
         "collect_batch_start iter=%s episodes=%s max_actions=%s workers=%s stochastic=%s games=%s",
@@ -379,6 +382,7 @@ def _collect_batch(
                 "mode": str(collect_mode),
                 "hud_cache_dir": str(agent.cfg.get("hud_cache_dir", "runs/cache")),
                 "debug_reward_log": debug_reward_log or None,
+                "video_dir": video_dir or None,
             },
         )
         ep_count = len(batch.get("episodes", []))
@@ -435,6 +439,7 @@ def _collect_batch(
                 "render_terminal": bool(render_terminal),
                 "collect_mode": str(collect_mode),
                 "debug_reward_log": debug_reward_log or None,
+                "video_dir": video_dir or None,
             }
         )
         start += c
@@ -845,10 +850,12 @@ def main() -> int:
     parser.add_argument("--eval-holdout", default=None)
     parser.add_argument("--eval-easy", default=None)
     parser.add_argument("--render-terminal", action="store_true", help="Render game in terminal during env steps")
+    parser.add_argument("--video", action="store_true", help="Save observation frames and encode episode videos")
     parser.add_argument("--debug", default=None, help="Write debug logs to this file path")
     parser.add_argument("--debug-reward", default=None, help="Write per-step reward breakdown to this file path (TSV)")
     parser.add_argument("--config", default=None)
     parser.add_argument("--outdir", required=True)
+    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
     args = parser.parse_args()
 
     # Ensure only selected INFO logs are emitted to stdout.
@@ -894,6 +901,7 @@ def main() -> int:
     run_dir = os.path.join(args.outdir, "rl", run_id)
     os.makedirs(run_dir, exist_ok=True)
     _setup_stdout_log_copy(os.path.join(run_dir, "log.log"))
+    video_dir = os.path.join(run_dir, "video") if bool(args.video) else None
 
     cfg = _default_cfg_dict()
     cfg = _load_config(args.config, cfg)
@@ -946,39 +954,43 @@ def main() -> int:
     agent = RLAgent(cfg=cfg)
     modules = agent._build_modules()
 
-    try:
-        import wandb  # type: ignore
-    except Exception as exc:
-        raise SystemExit(f"wandb is required by default but is not available: {exc}") from exc
+    wandb_run = None
+    if args.wandb:
+        try:
+            import wandb  # type: ignore
+        except Exception as exc:
+            raise SystemExit(f"wandb logging requested but wandb is not available: {exc}") from exc
 
-    ignore_globs = (
-        "*.log,**/*.log,debug.log,output.log,**/debug.log,**/output.log,"
-        "episodes.jsonl,**/episodes.jsonl,*episodes.jsonl,**/*episodes.jsonl,"
-        "seeds.jsonl,**/seeds.jsonl,traces/*.jsonl,**/traces/*.jsonl"
-    )
-    if os.environ.get("WANDB_IGNORE_GLOBS"):
-        os.environ["WANDB_IGNORE_GLOBS"] = f"{os.environ['WANDB_IGNORE_GLOBS']},{ignore_globs}"
+        ignore_globs = (
+            "*.log,**/*.log,debug.log,output.log,**/debug.log,**/output.log,"
+            "episodes.jsonl,**/episodes.jsonl,*episodes.jsonl,**/*episodes.jsonl,"
+            "seeds.jsonl,**/seeds.jsonl,traces/*.jsonl,**/traces/*.jsonl"
+        )
+        if os.environ.get("WANDB_IGNORE_GLOBS"):
+            os.environ["WANDB_IGNORE_GLOBS"] = f"{os.environ['WANDB_IGNORE_GLOBS']},{ignore_globs}"
+        else:
+            os.environ["WANDB_IGNORE_GLOBS"] = ignore_globs
+
+        wandb_run = wandb.init(
+            project=os.environ.get("WANDB_PROJECT", "arc-agi-rl"),
+            name=args.run_name,
+            mode=os.environ.get("WANDB_MODE", "online"),
+            config={
+                "mode": args.mode,
+                "games": args.games,
+                "seed": args.seed,
+                "max_actions": resolved_max_steps,
+                "episodes": args.episodes,
+                "iters": args.iters,
+                "workers": args.workers,
+                "phase": args.phase,
+                "op_mode": args.op_mode,
+            },
+            dir=run_dir,
+        )
+        logger.info("wandb_initialized run_name=%s run_dir=%s", args.run_name, run_dir)
     else:
-        os.environ["WANDB_IGNORE_GLOBS"] = ignore_globs
-
-    wandb_run = wandb.init(
-        project=os.environ.get("WANDB_PROJECT", "arc-agi-rl"),
-        name=args.run_name,
-        mode=os.environ.get("WANDB_MODE", "online"),
-        config={
-            "mode": args.mode,
-            "games": args.games,
-            "seed": args.seed,
-            "max_actions": resolved_max_steps,
-            "episodes": args.episodes,
-            "iters": args.iters,
-            "workers": args.workers,
-            "phase": args.phase,
-            "op_mode": args.op_mode,
-        },
-        dir=run_dir,
-    )
-    logger.info("wandb_initialized run_name=%s run_dir=%s", args.run_name, run_dir)
+        logger.info("wandb_disabled")
 
     optim: Any = build_optimizer(modules, cfg)
 
@@ -1022,6 +1034,7 @@ def main() -> int:
                     rollout_cfg_payload=rollout_cfg_payload,
                     render_terminal=bool(args.render_terminal),
                     debug_reward_log=args.debug_reward or None,
+                    video_dir=video_dir,
                 )
         _write_json(os.path.join(run_dir, "trajectories", "batch.json"), batch)
         logger.info(
@@ -1038,25 +1051,28 @@ def main() -> int:
         _append_jsonl(os.path.join(run_dir, "seeds.jsonl"), [{"split": args.mode, "game_id": r["game_id"], "seed": r["seed"]} for r in per_ep])
         _append_jsonl(os.path.join(run_dir, "metrics", "episodes.jsonl"), rows)
         if args.mode == "eval":
-            wandb_run.log(
-                {
-                    "eval/mean_return": float(metrics.get("MeanReturn", 0.0)),
-                    "eval/avg_reward": float(metrics.get("AvgReward", 0.0)),
-                    "eval/mean_episode_len": float(metrics.get("MeanEpisodeLen", 0.0)),
-                    "eval/win_rate": float(metrics.get("WinRate", 0.0)),
-                }
-            )
+            if wandb_run is not None:
+                wandb_run.log(
+                    {
+                        "eval/mean_return": float(metrics.get("MeanReturn", 0.0)),
+                        "eval/avg_reward": float(metrics.get("AvgReward", 0.0)),
+                        "eval/mean_episode_len": float(metrics.get("MeanEpisodeLen", 0.0)),
+                        "eval/win_rate": float(metrics.get("WinRate", 0.0)),
+                    }
+                )
         else:
-            wandb_run.log(
-                {
-                    "train/mean_return": float(metrics.get("MeanReturn", 0.0)),
-                    "train/avg_reward": float(metrics.get("AvgReward", 0.0)),
-                    "train/mean_episode_len": float(metrics.get("MeanEpisodeLen", 0.0)),
-                    "train/win_rate": float(metrics.get("WinRate", 0.0)),
-                }
-            )
+            if wandb_run is not None:
+                wandb_run.log(
+                    {
+                        "train/mean_return": float(metrics.get("MeanReturn", 0.0)),
+                        "train/avg_reward": float(metrics.get("AvgReward", 0.0)),
+                        "train/mean_episode_len": float(metrics.get("MeanEpisodeLen", 0.0)),
+                        "train/win_rate": float(metrics.get("WinRate", 0.0)),
+                    }
+                )
         logger.info("collect_eval_metrics_logged mode=%s keys=%s", args.mode, sorted(metrics.keys()))
-        wandb_run.finish()
+        if wandb_run is not None:
+            wandb_run.finish()
         logger.info("run_finish mode=%s", args.mode)
         return 0
 
@@ -1179,6 +1195,7 @@ def main() -> int:
                 rollout_cfg_payload=rollout_cfg_payload,
                 render_terminal=bool(args.render_terminal),
                 debug_reward_log=args.debug_reward or None,
+                video_dir=video_dir,
             )
             logger.info(
                 "iter_collect_done iter=%s episodes=%s steps=%s",
@@ -1310,7 +1327,8 @@ def main() -> int:
                         "train/adv_std": float(train_loss.get("losses", {}).get("adv_std", 0.0)),
                     }
                 )
-            wandb_run.log(train_log_payload, step=iter_idx)
+            if wandb_run is not None:
+                wandb_run.log(train_log_payload, step=iter_idx)
 
             if save_every > 0 and iter_idx % save_every == 0:
                 agent._save_checkpoint(
@@ -1351,6 +1369,7 @@ def main() -> int:
                     rollout_cfg_hash=str(rollout_cfg_hash),
                     rollout_cfg_payload=rollout_cfg_payload,
                     render_terminal=bool(args.render_terminal),
+                    video_dir=video_dir,
                 )
 
                 _append_jsonl(
@@ -1381,15 +1400,16 @@ def main() -> int:
                     ),
                     flush=True,
                 )
-                wandb_run.log(
-                    {
-                        "eval/mean_return": float(eval_metrics_agg.get("MeanReturn", 0.0)),
-                        "eval/avg_reward": float(eval_metrics_agg.get("AvgReward", 0.0)),
-                        "eval/mean_episode_len": float(eval_metrics_agg.get("MeanEpisodeLen", 0.0)),
-                        "eval/win_rate": float(eval_metrics_agg.get("WinRate", 0.0)),
-                    },
-                    step=iter_idx,
-                )
+                if wandb_run is not None:
+                    wandb_run.log(
+                        {
+                            "eval/mean_return": float(eval_metrics_agg.get("MeanReturn", 0.0)),
+                            "eval/avg_reward": float(eval_metrics_agg.get("AvgReward", 0.0)),
+                            "eval/mean_episode_len": float(eval_metrics_agg.get("MeanEpisodeLen", 0.0)),
+                            "eval/win_rate": float(eval_metrics_agg.get("WinRate", 0.0)),
+                        },
+                        step=iter_idx,
+                    )
                 _append_jsonl(
                     os.path.join(run_dir, "metrics", f"eval_iter_{iter_idx:06d}_episodes.jsonl"),
                     eval_per_ep,
@@ -1459,6 +1479,7 @@ def main() -> int:
                         rollout_cfg_hash=str(rollout_cfg_hash),
                         rollout_cfg_payload=rollout_cfg_payload,
                         render_terminal=bool(args.render_terminal),
+                        video_dir=video_dir,
                     )
                     easy_metrics, _ = _aggregate_metrics(easy_batch, cfg)
                     _write_json(
@@ -1482,7 +1503,8 @@ def main() -> int:
                 shared_pool.terminate()
             shared_pool.join()
             logger.info("shared_pool_closed completed=%s", run_completed)
-        wandb_run.finish()
+        if wandb_run is not None:
+            wandb_run.finish()
         logger.info("run_finish mode=%s completed=%s", args.mode, run_completed)
 
     return 0

@@ -1,0 +1,518 @@
+# codex_baseline_v2 Implementation
+
+This document describes the current `src/codex_baseline_v2` implementation as it exists in code today. It is an implementation snapshot, not a target-state spec. Where the code is heuristic, partially learned, compatibility-oriented, or effectively tooling-only, that is called out directly.
+
+## Scope
+
+`codex_baseline_v2` is a round-based symbolic exploration and planning stack for ARC-style environments. The package is broader than the newer `v3_1` runtime and combines:
+
+- live autonomous execution
+- offline trajectory import and analysis
+- cumulative blackboard/world-model construction
+- symbolic skill induction and planning
+- optional learned ranking/training hooks
+- visualization and report export
+
+The package is organized into these main surfaces:
+
+- `runtime/`: session bootstrap, round orchestration, environment sessions, collection, trajectory policy, postrun exports
+- `analyst/`: per-frame and per-episode observation analysis, avatar candidate scoring, POI mining
+- `trajectory_analysis/`: cumulative world analysis over analyzed episodes
+- `planning/`: skill induction, skill library, planner belief state, plan memory, hierarchical planner
+- `controller/`: direct instruction selection from the blackboard
+- `executor/`: route planning and online/offline execution
+- `memory/`: blackboard persistence and graph persistence
+- `inference/`: mechanic graph, dependency graph, latent-state updates
+- `learning/`: option and mechanic rankers plus ranking datasets/inference
+- `vision/`: crop encoders, prototype memory, training pairs, re-identification
+- `adapters/`: observation/action/trajectory/rollout/metrics adapters
+- `storage/`: SQLite intermediate-store backend for round artifacts
+- `shared/`: config, dataclasses, storage paths, scoring helpers, metrics, plan records, graph helpers
+- `visualization/`: heatmap generation
+- `cli/`: live runtime, offline analysis, planning, visualization, and training entry points
+
+## Top-Level Runtime
+
+The main live entry point is [run_autonomous_game.py](/home/zodrak/zod/src/codex_baseline_v2/cli/run_autonomous_game.py). It:
+
+1. loads JSON config
+2. resolves `game_id` and storage root
+3. loads `V2Config`
+4. resolves the environment factory
+5. runs [run_autonomous_rounds](/home/zodrak/zod/src/codex_baseline_v2/runtime/round_orchestrator.py)
+6. emits postrun heatmaps
+
+The central runtime files are:
+
+- [runtime/round_orchestrator.py](/home/zodrak/zod/src/codex_baseline_v2/runtime/round_orchestrator.py)
+- [runtime/session_manager.py](/home/zodrak/zod/src/codex_baseline_v2/runtime/session_manager.py)
+- [runtime/trajectory_collector.py](/home/zodrak/zod/src/codex_baseline_v2/runtime/trajectory_collector.py)
+- [runtime/environment_session.py](/home/zodrak/zod/src/codex_baseline_v2/runtime/environment_session.py)
+- [runtime/trajectory_policy.py](/home/zodrak/zod/src/codex_baseline_v2/runtime/trajectory_policy.py)
+- [runtime/postrun_exports.py](/home/zodrak/zod/src/codex_baseline_v2/runtime/postrun_exports.py)
+
+The runtime is still file-backed and mostly single-process coordinator driven, with multiprocessing used for collection and some analysis stages rather than actor-owned authoritative state.
+
+## Session And Round Lifecycle
+
+[SessionManagerV2](/home/zodrak/zod/src/codex_baseline_v2/runtime/session_manager.py) owns session directories and resume behavior.
+
+Its current behavior is simple:
+
+- create `game_<id>` storage roots on first run
+- optionally resume from the highest `round_*` directory
+- when `resume_if_exists` is false, wipe most session artifacts but preserve learned ranking weight files
+- write and load `resume_marker.json`
+- export a session `summary.json`
+
+The main session loop lives in [round_orchestrator.py](/home/zodrak/zod/src/codex_baseline_v2/runtime/round_orchestrator.py). At a high level the round algorithm is:
+
+1. initialize or resume the session
+2. load latest blackboard if present
+3. collect probe episodes or directed execution episodes
+4. analyze episodes into normalized per-step representations
+5. run cumulative trajectory analysis to update the blackboard
+6. induce or reconcile skills
+7. build planner belief state
+8. rank options and mechanics if models or reconstructed ranking are available
+9. run the hierarchical planner
+10. execute one selected option/instruction
+11. reconcile plan memory and skill memory
+12. persist round artifacts, reports, plans, rankings, and archives
+
+Important runtime characteristics:
+
+- the system is still round-based, not continuously reactive
+- round `0` is probe-heavy and establishes the first blackboard
+- later rounds use directed execution with replanning between episodes
+- the live path is described as `offline_local`, using local environment files and env factories
+- artifact integrity is enforced for planner exports; missing finalized fields in `plans.json` raise runtime errors
+- [controller/round_scheduler.py](/home/zodrak/zod/src/codex_baseline_v2/controller/round_scheduler.py) exists but is not meaningfully wired into the current autonomous runtime path
+
+## Collection And Environment Session
+
+Collection is handled by [runtime/trajectory_collector.py](/home/zodrak/zod/src/codex_baseline_v2/runtime/trajectory_collector.py), which supports:
+
+- `collect_round(...)`
+- `collect_round_parallel(...)`
+- `collect_round_parallel_iter(...)`
+
+Collection uses [EnvironmentSessionV2](/home/zodrak/zod/src/codex_baseline_v2/runtime/environment_session.py) and [TrajectoryPolicyV2](/home/zodrak/zod/src/codex_baseline_v2/runtime/trajectory_policy.py) to roll out episodes. Each step records:
+
+- observation state
+- action choice
+- reward and done flag
+- info payload
+- state identity hashes
+- optional target metadata
+
+The runtime can use multiprocessing pools for initial probe collection and other parallel paths, but state ownership remains file-based rather than actor-based.
+
+## Episode Analysis
+
+Per-episode analysis is centered on [analyst/analyst.py](/home/zodrak/zod/src/codex_baseline_v2/analyst/analyst.py). It is also compatibility-reexported through [trajectory_analysis/episode_analyzer.py](/home/zodrak/zod/src/codex_baseline_v2/trajectory_analysis/episode_analyzer.py).
+
+The analysis pipeline does the following:
+
+1. summarize observations into `ObservationSummaryV2`
+2. compute background candidates, connected components, palette summaries, and state identities
+3. classify extracted objects
+4. score avatar candidates using [frame_analyst.py](/home/zodrak/zod/src/codex_baseline_v2/analyst/frame_analyst.py)
+5. mine POIs using [poi_miner.py](/home/zodrak/zod/src/codex_baseline_v2/analyst/poi_miner.py)
+6. assign area ids through `trajectory_analysis.area_model`
+7. update avatar tracks through `trajectory_analysis.avatar_tracking`
+8. write back per-step area ids, avatar-track hypotheses, and navigation context keys
+
+Important analysis characteristics:
+
+- heavy caching exists for state signatures and connected components
+- avatar tracking is heuristic and track-ranking based, not a learned detector
+- object typing is coarse, with categories like `hud_like`, `world_object`, `obstacle`, and `unknown`
+- analyzed steps may use actual avatar centroids, predicted centroids, or summary-derived fallbacks
+
+## Cumulative Trajectory Analysis
+
+The cumulative world-analysis entry point is [trajectory_analysis/analyzer.py](/home/zodrak/zod/src/codex_baseline_v2/trajectory_analysis/analyzer.py).
+
+It builds or updates the blackboard by composing many sub-analyses:
+
+- action semantics from [action_semantics.py](/home/zodrak/zod/src/codex_baseline_v2/trajectory_analysis/action_semantics.py)
+- area inference and merging from [area_model.py](/home/zodrak/zod/src/codex_baseline_v2/trajectory_analysis/area_model.py)
+- avatar tracks from [avatar_tracking.py](/home/zodrak/zod/src/codex_baseline_v2/trajectory_analysis/avatar_tracking.py)
+- event extraction from [event_extraction.py](/home/zodrak/zod/src/codex_baseline_v2/trajectory_analysis/event_extraction.py)
+- intervention records from [interventions.py](/home/zodrak/zod/src/codex_baseline_v2/trajectory_analysis/interventions.py)
+- reachability from [reachability.py](/home/zodrak/zod/src/codex_baseline_v2/trajectory_analysis/reachability.py)
+- topology deltas from [topology_deltas.py](/home/zodrak/zod/src/codex_baseline_v2/trajectory_analysis/topology_deltas.py)
+- navigation graph construction from [navigation_graph.py](/home/zodrak/zod/src/codex_baseline_v2/trajectory_analysis/navigation_graph.py)
+- target access profiles from [target_access.py](/home/zodrak/zod/src/codex_baseline_v2/trajectory_analysis/target_access.py)
+- trigger zones from [trigger_zones.py](/home/zodrak/zod/src/codex_baseline_v2/trajectory_analysis/trigger_zones.py)
+- causal links from [causal_links.py](/home/zodrak/zod/src/codex_baseline_v2/trajectory_analysis/causal_links.py)
+- mechanic hypotheses from [mechanic_induction.py](/home/zodrak/zod/src/codex_baseline_v2/trajectory_analysis/mechanic_induction.py)
+- hidden-trigger hypotheses from [hidden_triggers.py](/home/zodrak/zod/src/codex_baseline_v2/trajectory_analysis/hidden_triggers.py)
+- causal-chain hypotheses from [causal_chains.py](/home/zodrak/zod/src/codex_baseline_v2/trajectory_analysis/causal_chains.py)
+- counterfactual traces from [counterfactuals.py](/home/zodrak/zod/src/codex_baseline_v2/trajectory_analysis/counterfactuals.py)
+- contrast cases from [contrast_cases.py](/home/zodrak/zod/src/codex_baseline_v2/trajectory_analysis/contrast_cases.py)
+- event graphs from [event_graph.py](/home/zodrak/zod/src/codex_baseline_v2/trajectory_analysis/event_graph.py)
+- event-sequence mining from [sequence_mining.py](/home/zodrak/zod/src/codex_baseline_v2/trajectory_analysis/sequence_mining.py)
+- effect signatures from [effect_signatures.py](/home/zodrak/zod/src/codex_baseline_v2/trajectory_analysis/effect_signatures.py)
+- evidence ledger updates from [evidence_ledger.py](/home/zodrak/zod/src/codex_baseline_v2/trajectory_analysis/evidence_ledger.py)
+- probe-outcome derivation from [probe_outcomes.py](/home/zodrak/zod/src/codex_baseline_v2/trajectory_analysis/probe_outcomes.py)
+- POI lifecycle from [poi_lifecycle.py](/home/zodrak/zod/src/codex_baseline_v2/trajectory_analysis/poi_lifecycle.py)
+- spatial intervention overlays from [spatial_intervention.py](/home/zodrak/zod/src/codex_baseline_v2/trajectory_analysis/spatial_intervention.py)
+
+This is the main world-modeling surface in the package. It is cumulative and merge-based rather than authoritative-snapshot based.
+
+### Current World Model
+
+The main world state dataclass is [BlackboardStateV2](/home/zodrak/zod/src/codex_baseline_v2/shared/schemas.py), which stores:
+
+- POI table
+- area table
+- avatar hypotheses and avatar appearance signatures
+- event table
+- intervention table
+- cause/effect links
+- mechanic hypotheses
+- navigation graph
+- reachability and target access tables
+- trigger-zone table
+- evidence ledger
+- decision history
+- latent states
+- mechanic graph
+- dependency graph
+- counterfactual traces and contrast cases
+- causal-chain and hidden-trigger hypotheses
+- metadata such as last observation
+
+Important cumulative-analysis behavior:
+
+- POIs are merged by IoU and merged bboxes
+- low-confidence or low-persistence POIs are filtered out
+- HUD-like objects and motion-only hotspots are deliberately suppressed
+- target access and reachability are inferred from navigation evidence, not hardcoded map priors
+- many analysis stages can chunk work across multiprocessing pools
+
+## Inference Surfaces
+
+The `inference/` package builds higher-level structure on top of the blackboard:
+
+- [mechanic_graph_builder.py](/home/zodrak/zod/src/codex_baseline_v2/inference/mechanic_graph_builder.py)
+- [dependency_updater.py](/home/zodrak/zod/src/codex_baseline_v2/inference/dependency_updater.py)
+- [latent_state_inducer.py](/home/zodrak/zod/src/codex_baseline_v2/inference/latent_state_inducer.py)
+
+The current mechanic graph is simpler than `v3_1`:
+
+- nodes are created for events, latent states, topology deltas, and causal-chain subgoals
+- trigger nodes are synthesized from cause/effect links
+- edges express relations like `causes`, `precedes_consistently`, `enables`, `ambiguous_with`, and `unlocks`
+- graph state is updated cumulatively from current causal links, latent states, topology deltas, and chain hypotheses
+
+The dependency updater produces subgoal-style structures that the planner later uses to synthesize verification skills.
+
+## Skill Induction And Skill Library
+
+Symbolic skill induction is implemented in:
+
+- [planning/skill_inducer.py](/home/zodrak/zod/src/codex_baseline_v2/planning/skill_inducer.py)
+- [planning/skill_library.py](/home/zodrak/zod/src/codex_baseline_v2/planning/skill_library.py)
+- [planning/skill_schema.py](/home/zodrak/zod/src/codex_baseline_v2/planning/skill_schema.py)
+
+`induce_skills(...)` derives target-bound skills from blackboard evidence. Current skill families include:
+
+- `go_to_region`
+- `contact_poi`
+- `probe_hidden_trigger`
+- `dwell_on_region`
+- `perform_action_at_region`
+- `cross_transition`
+- `verify_mechanic`
+- `return_to_anchor`
+
+Skill induction sources include:
+
+- intervention records
+- reachability table
+- trigger zones
+- dependency-graph subgoals
+- verification support already present in mechanic or causal evidence
+
+The skill library persists both `SkillSpecV1` rows and `SkillExecutionRecordV1` rows, then recomputes derived statistics such as:
+
+- attempts, successes, failures
+- success and failure rates
+- latest termination reasons
+- historical failure labels
+- current-round execution counts
+- target coordinates and cluster associations
+
+`candidate_skills(...)` selects active skills relevant to the current planner subgoal inventory.
+
+## Planner Belief And Plan Memory
+
+Belief-state construction lives in [planning/planner_state_builder.py](/home/zodrak/zod/src/codex_baseline_v2/planning/planner_state_builder.py).
+
+The belief builder:
+
+- deduplicates candidate dependency-graph subgoals
+- filters skills into concrete vs abstract inventories
+- diversifies movement clusters
+- widens the movement inventory when recovery mode is active
+- uses plan memory to avoid repeated local failures, exhausted clusters, recent failed row bands, and same-area movement traps
+- materializes synthetic recovery movement skills when the normal skill inventory is too narrow
+
+Plan memory is implemented in [planning/plan_memory.py](/home/zodrak/zod/src/codex_baseline_v2/planning/plan_memory.py). It records:
+
+- cluster ledgers
+- movement-cluster ledgers
+- failed cluster keys for the current round
+- recent failed clusters
+- excluded cluster cooldowns
+- failed movement area ids
+- recent failed movement clusters
+- execution history summaries
+
+This plan-memory layer is one of the most important heuristics in the baseline. It is what keeps the symbolic planner from repeatedly selecting the same failed local probe or movement cluster.
+
+## Hierarchical Planner
+
+The main planner is [planning/hierarchical_planner.py](/home/zodrak/zod/src/codex_baseline_v2/planning/hierarchical_planner.py).
+
+It is a symbolic reranking system over `SkillSpecV1` candidates. The implementation is large and heavily heuristic. Current score terms include:
+
+- observed failure penalties
+- same-round repeat penalties
+- route-stall and contact-no-reach penalties
+- target-repeat and no-progress penalties
+- probe retry penalties
+- cluster-memory and row-band penalties
+- route-family penalties
+- movement novelty and frontier bonuses
+- cross-area bonuses
+- recovery-mode movement biases
+- neighborhood exhaustion checks
+- probe locality and access signals
+- contact-history bonuses
+- estimated success, information gain, cost, and goal progress
+
+The planner builds `PlanNodeV1` rows, applies post-filters, finalizes export fields, asserts finalized-export invariants, and returns `PlanResultV1`.
+
+Important characteristics of the current planner:
+
+- it is not a learned policy
+- it explicitly tracks pre-filter and post-filter rank positions
+- it blocks selection when targets are invalid, geometry is missing, or verification evidence is insufficient
+- it uses movement-cluster diversification and recovery mode to escape dead loops
+- it exports detailed score breakdowns and blocking-reason codes to `plans.json`
+
+## Controller
+
+[controller/controller.py](/home/zodrak/zod/src/codex_baseline_v2/controller/controller.py) provides a direct instruction selector from the blackboard.
+
+This controller is not the full hierarchical planner. It is a lighter policy surface that:
+
+- ranks POIs
+- injects some failure penalties from recent consequences and decision history
+- selects `unguided_probe` on round `0` or by quota
+- escalates to hidden-trigger probes when trigger-zone confidence is high
+- chooses causal-chain verification or counterfactual disambiguation probes when those hypotheses are strong enough
+- otherwise picks between `poi_approach`, `poi_interaction`, `discriminating_probe`, or `exploit`
+
+This controller is used in some runtime paths and CLI flows, but the main autonomous loop relies more heavily on the planner-plus-option-executor stack.
+
+## Execution
+
+Execution is implemented in:
+
+- [executor/online_executor.py](/home/zodrak/zod/src/codex_baseline_v2/executor/online_executor.py)
+- [executor/option_executor.py](/home/zodrak/zod/src/codex_baseline_v2/executor/option_executor.py)
+- [executor/executor.py](/home/zodrak/zod/src/codex_baseline_v2/executor/executor.py)
+- [executor/route_planner.py](/home/zodrak/zod/src/codex_baseline_v2/executor/route_planner.py)
+
+`online_executor.py` is the live runtime executor. Its behavior includes:
+
+- validating targets before execution
+- invalidating targets recently marked bad in decision history
+- inferring a live avatar position from current observation and avatar hypotheses
+- route planning toward access cells around target POIs
+- action selection through `TrajectoryPolicyV2`
+- loop detection through repeated-action and repeated-state-cycle checks
+- relocalization and stall detection
+- early aborts for `invalid_target`, `unreachable_now`, and repeated no-progress conditions
+- setting `negative_planning_feedback` mainly for no-effect or flat-progress contact failures so later planning can apply backpressure
+
+`option_executor.py` bridges the planner and executor:
+
+- converts `SkillSpecV1 + PlanResultV1` into `ControllerInstructionV2`
+- executes the option
+- converts the outcome into `SkillExecutionRecordV1`
+
+Execution outcomes summarize:
+
+- actions issued
+- progress history
+- whether the target was reached or touched
+- blocked / no-progress / null-effect behavior
+- consequence records emitted during the run
+
+## Learning And Ranking
+
+The learning surfaces are:
+
+- [learning/option_ranker.py](/home/zodrak/zod/src/codex_baseline_v2/learning/option_ranker.py)
+- [learning/mechanic_ranker.py](/home/zodrak/zod/src/codex_baseline_v2/learning/mechanic_ranker.py)
+- [learning/plan_value_model.py](/home/zodrak/zod/src/codex_baseline_v2/learning/plan_value_model.py)
+- [learning/ranking_dataset.py](/home/zodrak/zod/src/codex_baseline_v2/learning/ranking_dataset.py)
+- [learning/ranking_inference.py](/home/zodrak/zod/src/codex_baseline_v2/learning/ranking_inference.py)
+
+This learning stack exists, but the runtime is still largely symbolic. The current autonomous flow frequently uses:
+
+- live reconstruction of option rankings
+- reconstructed or suppressed mechanic rankings
+- persisted ranking weights when available
+
+The ranking artifacts written by the runtime explicitly record whether a ranking was:
+
+- `applied`
+- `reconstructed`
+- `suppressed`
+- `inactive`
+
+So learned ranking is a real subsystem, but it is not the dominant source of control.
+
+## Vision Surfaces
+
+The `vision/` package is mostly auxiliary/offline:
+
+- [object_crop_encoder.py](/home/zodrak/zod/src/codex_baseline_v2/vision/object_crop_encoder.py)
+- [event_crop_encoder.py](/home/zodrak/zod/src/codex_baseline_v2/vision/event_crop_encoder.py)
+- [prototype_memory.py](/home/zodrak/zod/src/codex_baseline_v2/vision/prototype_memory.py)
+- [training_pairs.py](/home/zodrak/zod/src/codex_baseline_v2/vision/training_pairs.py)
+- [reid_matcher.py](/home/zodrak/zod/src/codex_baseline_v2/vision/reid_matcher.py)
+
+These files support:
+
+- crop-embedding generation
+- prototype storage
+- re-identification links across records
+- training-pair generation for downstream vision tasks
+
+They are not central to the live control loop, but they are part of the documented package surface and feed future or offline analysis paths.
+
+## Persistence And Storage
+
+Persistence is mostly file-backed through:
+
+- [memory/store.py](/home/zodrak/zod/src/codex_baseline_v2/memory/store.py)
+- [memory/graph_store.py](/home/zodrak/zod/src/codex_baseline_v2/memory/graph_store.py)
+- [shared/storage.py](/home/zodrak/zod/src/codex_baseline_v2/shared/storage.py)
+- [storage/sqlite_intermediates.py](/home/zodrak/zod/src/codex_baseline_v2/storage/sqlite_intermediates.py)
+
+The runtime persists:
+
+- blackboard snapshots and blackboard history
+- world-model archives
+- event tables
+- interventions
+- navigation graphs
+- mechanic hypotheses
+- graph state snapshots
+- round reports
+- `plans.json`
+- `plan_failures.json`
+- `option_rankings.json`
+- `mechanic_rankings.json`
+- `plan_memory_state.json`
+- normalized trajectories and execution outcomes
+
+When SQLite intermediates are enabled, round artifacts can also be mirrored into a per-round SQLite database.
+
+The SQLite backend is not a full payload warehouse. It mainly stores metadata tables such as:
+
+- episode metadata
+- step metadata
+- observation-summary metadata
+- area-assignment results
+- per-stage analysis stats
+
+## Shared Schemas And Config
+
+The core datamodel lives in:
+
+- [shared/schemas.py](/home/zodrak/zod/src/codex_baseline_v2/shared/schemas.py)
+- [shared/plan_records.py](/home/zodrak/zod/src/codex_baseline_v2/shared/plan_records.py)
+- [shared/learning_records.py](/home/zodrak/zod/src/codex_baseline_v2/shared/learning_records.py)
+- [shared/vision_records.py](/home/zodrak/zod/src/codex_baseline_v2/shared/vision_records.py)
+
+Configuration is defined in [shared/config.py](/home/zodrak/zod/src/codex_baseline_v2/shared/config.py). The current config surface is large and includes:
+
+- analyst settings
+- trajectory-analysis settings
+- memory/storage settings
+- controller and scoring settings
+- executor settings
+- runtime and collection settings
+- routing and scheduler settings
+- visualization and resume settings
+- target scoring
+- environment binding
+- debug exports
+- action-semantics, avatar-tracking, event-extraction, causality, area-model, mechanic-induction, hidden-trigger, causal-chain, sequence-mining, and probe-mode settings
+
+This config surface is a good indicator of how heuristic and subsystem-heavy the package is.
+
+## Visualization And Metrics
+
+Visualization is implemented in:
+
+- [visualization/heatmaps.py](/home/zodrak/zod/src/codex_baseline_v2/visualization/heatmaps.py)
+- [runtime/postrun_exports.py](/home/zodrak/zod/src/codex_baseline_v2/runtime/postrun_exports.py)
+
+The current postrun visualization outputs are mainly:
+
+- round-one POI heatmaps
+- final avatar-visit heatmaps
+
+The PNG renderer is intentionally simple: count-matrix based, linear or log normalization, and a custom dark-to-hot color ramp.
+
+Metrics live in [metrics/v2_metrics.py](/home/zodrak/zod/src/codex_baseline_v2/metrics/v2_metrics.py) and [shared/metrics.py](/home/zodrak/zod/src/codex_baseline_v2/shared/metrics.py). These compute round-level summaries and normalize consequence usefulness.
+
+## CLI And Offline Tooling
+
+The CLI surface in [cli/main.py](/home/zodrak/zod/src/codex_baseline_v2/cli/main.py) exposes many operations:
+
+- `init`
+- `import_analyze`
+- `directed_round`
+- `loop`
+- `print_blackboard`
+- `export_reports`
+- `run_autonomous_game`
+- `collect_trajectories`
+- `analyze_trajectories`
+- `analyze_causal_world`
+- `plan_with_options`
+- `build_visual_prototypes`
+- `train_rankers`
+
+This matters because `codex_baseline_v2` is not just a live runtime package. It is also the offline experimentation and tooling substrate around that runtime.
+
+## Current Characterization
+
+As implemented today, `codex_baseline_v2` is:
+
+- a symbolic / heuristic baseline with cumulative world modeling
+- file-backed rather than actor-owned
+- broad in scope, mixing live runtime with many offline analysis and training tools
+- more monolithic and compatibility-oriented than `v3_1`
+- still strongly dependent on handcrafted penalties, novelty bonuses, route-family memory, and verification heuristics
+
+The most important practical behaviors in the current code are:
+
+- cumulative blackboard construction from analyzed trajectories
+- symbolic skill induction from interventions and dependency evidence
+- plan-memory driven avoidance of repeated failed local probes or movement clusters
+- heuristic route-and-contact execution with live avatar relocalization
+- rich artifact export for plans, failures, rankings, blackboards, and analyses
+
+It is best understood as a large symbolic baseline research stack with a working autonomous loop, not as a narrow production runtime or a learned end-to-end agent.

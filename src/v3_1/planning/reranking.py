@@ -33,6 +33,10 @@ def rerank_candidates(
     hypothesized_world = dict(hypothesized_world or belief_fallback.get("hypothesized_world", {}))
     uncertainty_context = dict(uncertainty_context or belief_fallback.get("uncertainty_context", {}))
     durable_prior_context = dict(durable_prior_context or belief_fallback.get("durable_prior_context", belief_fallback.get("durable_prior_view", {})))
+    planning_mode = str(belief_fallback.get("planning_mode") or uncertainty_context.get("planning_mode") or "default_progress")
+    previous_planning_mode = str(belief_fallback.get("previous_planning_mode") or uncertainty_context.get("previous_planning_mode") or "")
+    mode_switch_applied = bool(belief_fallback.get("mode_switch_applied", False))
+    mode_switch_reason = str(belief_fallback.get("last_mode_reason") or belief_fallback.get("mode_switch_block_reason") or "")
     poi_followthrough = {
         str(key): dict(value)
         for key, value in dict(belief_fallback.get("detector_poi_followthrough", {}) or {}).items()
@@ -111,13 +115,27 @@ def rerank_candidates(
                 premature_exit_penalty += 0.18
         if str(candidate.get("objective_type") or "") in {"verify_trigger_contact", "reobserve_remote_change", "verify_panel_state", "verify_gate_match", "trigger_then_target"} and probe_escalation_available:
             verification_candidate_promoted = True
+        mode_consistency_bonus = 0.0
+        mode_consistency_penalty = 0.0
+        if planning_mode == "structure_acquisition":
+            if str(candidate.get("objective_type") or "") in {"verify_trigger_contact", "reobserve_remote_change", "verify_panel_state", "verify_gate_match", "trigger_then_target"}:
+                mode_consistency_bonus += 0.22
+            elif str(candidate.get("objective_type") or "") in {"probe_route", "explore_frontier"} or str(candidate.get("candidate_class") or "") in {"frontier_move", "fallback_action"}:
+                mode_consistency_penalty += 0.18
+        else:
+            if str(candidate.get("objective_type") or "") in {"probe_route", "explore_frontier"} and list(candidate.get("missing_prerequisite_types", []) or []):
+                mode_consistency_penalty += 0.12
         prior_target = dict(durable_prior_context.get("per_target", {}).get(str(candidate.get("target_key") or ""), {}))
         prior_bonus = 0.02 * float(prior_target.get("success_rate", 0.0) or 0.0)
         uncertainty_penalty = 0.05 * float(candidate.get("score_uncertainty", 0.0) or 0.0)
         escalated_candidate_ids = []
         if probe_escalation_available:
             escalated_candidate_ids = list(target_followthrough.get("escalated_candidate_ids", []) or [])
-        final_score = float(candidate.get("score", 0.0)) + helper_boost - helper_penalty + prior_bonus - uncertainty_penalty + dependency_chain_bonus + (0.05 * chain_executability_score) + (0.03 * chain_evidence_diversity) + (0.03 * min(1.0, chain_counterfactual_strength)) + (0.03 * min(1.0, chain_identity_stability)) + planner_usable_bonus + escalation_bonus - repeated_probe_penalty - premature_exit_penalty
+        final_score = float(candidate.get("score", 0.0)) + helper_boost - helper_penalty + prior_bonus - uncertainty_penalty + dependency_chain_bonus + (0.05 * chain_executability_score) + (0.03 * chain_evidence_diversity) + (0.03 * min(1.0, chain_counterfactual_strength)) + (0.03 * min(1.0, chain_identity_stability)) + planner_usable_bonus + escalation_bonus + mode_consistency_bonus - repeated_probe_penalty - premature_exit_penalty - mode_consistency_penalty
+        if bool(list(candidate.get("candidate_step_plan", []) or [])) and chain_verification_count > 0:
+            final_score += 0.12
+        if str(candidate.get("candidate_class") or "") in {"frontier_move", "local_probe"} and not bool(list(candidate.get("candidate_step_plan", []) or [])):
+            final_score -= 0.1
         candidate["helper_boost"] = helper_boost
         candidate["helper_penalty"] = helper_penalty
         candidate["helper_warning_reason_codes"] = sorted(helper_warning_codes.get(candidate["candidate_id"], set()))
@@ -161,6 +179,12 @@ def rerank_candidates(
             "premature_exit_penalty": premature_exit_penalty,
             "verification_candidate_promoted": verification_candidate_promoted,
             "last_failed_exit_without_new_support": last_failed_exit_without_new_support,
+            "mode_switch_applied": mode_switch_applied,
+            "mode_switch_reason": mode_switch_reason,
+            "mode_consistency_bonus": mode_consistency_bonus,
+            "mode_consistency_penalty": mode_consistency_penalty,
+            "planning_mode": planning_mode,
+            "previous_planning_mode": previous_planning_mode,
             "uncertainty_versions": dict(uncertainty_context.get("versions", {})),
             "observed_world_counts": {
                 "reachable": len(list(observed_world.get("reachable_targets", []))),

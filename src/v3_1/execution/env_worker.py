@@ -53,6 +53,41 @@ def _effect_region(previous_observation, current_observation) -> dict | None:
     return {"bbox": [min(xs), min(ys), max(xs), max(ys)], "changed_cells": len(xs)}
 
 
+def _movement_direction_from_action(normalized_action: dict) -> str | None:
+    action_name = str(normalized_action.get("action_name") or "").lower()
+    for direction in ("up", "down", "left", "right"):
+        if direction in action_name:
+            return direction
+    return None
+
+
+def _boundary_direction(cell: list[int] | None) -> str | None:
+    if not isinstance(cell, list) or len(cell) != 2:
+        return None
+    x = int(cell[0])
+    y = int(cell[1])
+    if x <= 1:
+        return "left"
+    if x >= 62:
+        return "right"
+    if y <= 1:
+        return "up"
+    if y >= 62:
+        return "down"
+    return None
+
+
+def _resolve_area_id(*, info: dict, request_metadata: dict, navigation: dict, objective: dict, fallback: str | None = None) -> str | None:
+    return (
+        str(info.get("area_id") or info.get("current_area_id") or "")
+        or str(request_metadata.get("expected_contact_region_or_boundary") or "")
+        or str(navigation.get("local_area") or navigation.get("avatar_area") or "")
+        or str(objective.get("target_area_id") or "")
+        or (str(fallback) if fallback else "")
+        or None
+    )
+
+
 def _step_telemetry(
     *,
     info: dict,
@@ -72,6 +107,18 @@ def _step_telemetry(
     terminal_action_marker: bool,
     effect_region: dict | None,
     effect_changed_cells: int,
+    attempted_movement_direction: str | None,
+    attempted_interaction_target_cell: list[int] | None,
+    attempted_interaction_target_object_id: str | None,
+    boundary_contact_observed: bool,
+    blocked_movement_observed: bool,
+    portal_like_contact_observed: bool,
+    terminal_affordance_contact_observed: bool,
+    pre_step_area_id: str | None,
+    post_step_area_id: str | None,
+    attempted_move_into_blocked_boundary: bool,
+    repeated_boundary_facing_movement: bool,
+    movement_stayed_in_place_after_attempted_boundary_move: bool,
 ) -> dict:
     payload = dict(info)
     payload.update(
@@ -92,6 +139,20 @@ def _step_telemetry(
             "terminal_action_marker": bool(terminal_action_marker),
             "effect_region": effect_region,
             "effect_changed_cells": int(effect_changed_cells or 0),
+            "attempted_movement_direction": attempted_movement_direction,
+            "attempted_interaction_target_cell": attempted_interaction_target_cell,
+            "attempted_interaction_target_object_id": attempted_interaction_target_object_id,
+            "boundary_contact_observed": bool(boundary_contact_observed),
+            "blocked_movement_observed": bool(blocked_movement_observed),
+            "portal_like_contact_observed": bool(portal_like_contact_observed),
+            "terminal_affordance_contact_observed": bool(terminal_affordance_contact_observed),
+            "pre_step_avatar_cell": avatar_before,
+            "post_step_avatar_cell": avatar_after,
+            "pre_step_area_id": pre_step_area_id,
+            "post_step_area_id": post_step_area_id,
+            "attempted_move_into_blocked_boundary": bool(attempted_move_into_blocked_boundary),
+            "repeated_boundary_facing_movement": bool(repeated_boundary_facing_movement),
+            "movement_stayed_in_place_after_attempted_boundary_move": bool(movement_stayed_in_place_after_attempted_boundary_move),
         }
     )
     return payload
@@ -130,6 +191,7 @@ class EnvWorker:
     def _run_probe(self, request: ExecutorRequest) -> ExecutorOutcome:
         observation, info = self._reset(seed=request.metadata.get("seed") if isinstance(request.metadata, dict) else None)
         initial_observation = observation
+        request_metadata = dict(request.metadata or {})
         steps = []
         rewards: list[float] = []
         action_history: list[object] = []
@@ -146,6 +208,23 @@ class EnvWorker:
             observation, reward, done, truncated, info = self._step(action)
             avatar_after_belief = self.avatar_tracker.update(previous_observation, observation, action, info=info, step_index=step_idx)
             avatar_after = list(avatar_after_belief.best_cell) if avatar_after_belief.best_cell is not None else None
+            pre_area_id = _resolve_area_id(info=self.last_info, request_metadata=request_metadata, navigation=dict(request.navigation or {}), objective=dict(request.objective or {}))
+            post_area_id = _resolve_area_id(info=info, request_metadata=request_metadata, navigation=dict(request.navigation or {}), objective=dict(request.objective or {}), fallback=pre_area_id)
+            attempted_movement_direction = _movement_direction_from_action(normalized_action)
+            attempted_interaction_target_cell = list(request.click_target_coordinates) if isinstance(request.click_target_coordinates, list) else None
+            attempted_interaction_target_object_id = str(request_metadata.get("expected_target_id") or request.target_entity_id or "") or None
+            blocked_movement_observed = bool(observation == previous_observation and str(normalized_action.get("action_family", "unknown")) == "move")
+            boundary_direction = _boundary_direction(avatar_before)
+            boundary_contact_observed = bool(blocked_movement_observed and boundary_direction is not None)
+            attempted_move_into_blocked_boundary = bool(boundary_contact_observed and attempted_movement_direction is not None and attempted_movement_direction == boundary_direction)
+            repeated_boundary_facing_movement = bool(
+                attempted_move_into_blocked_boundary
+                and no_change_aliases
+                and no_change_aliases[-1:] == [str(normalized_action.get("action_name", "")).lower()]
+            )
+            movement_stayed_in_place_after_attempted_boundary_move = bool(attempted_move_into_blocked_boundary and avatar_before == avatar_after)
+            portal_like_contact_observed = bool("portal" in str(request_metadata.get("expected_effect_relation") or "").lower())
+            terminal_affordance_contact_observed = bool("terminal" in str(request_metadata.get("expected_effect_relation") or "").lower())
             changed_cells = _changed_cells(previous_observation, observation)
             effect_region = _effect_region(previous_observation, observation)
             rewards.append(float(reward or 0.0))
@@ -161,8 +240,8 @@ class EnvWorker:
                 avatar_after=avatar_after,
                 target_before=None,
                 target_after=None,
-                boundary_hit=False,
-                invalid_move=bool(observation == previous_observation and str(normalized_action.get("action_family", "unknown")) == "move"),
+                boundary_hit=boundary_contact_observed,
+                invalid_move=blocked_movement_observed,
                 reward=float(reward or 0.0),
                 done=bool(done),
                 truncated=bool(truncated),
@@ -171,6 +250,18 @@ class EnvWorker:
                 terminal_action_marker=False,
                 effect_region=effect_region,
                 effect_changed_cells=changed_cells,
+                attempted_movement_direction=attempted_movement_direction,
+                attempted_interaction_target_cell=attempted_interaction_target_cell,
+                attempted_interaction_target_object_id=attempted_interaction_target_object_id,
+                boundary_contact_observed=boundary_contact_observed,
+                blocked_movement_observed=blocked_movement_observed,
+                portal_like_contact_observed=portal_like_contact_observed,
+                terminal_affordance_contact_observed=terminal_affordance_contact_observed,
+                pre_step_area_id=pre_area_id,
+                post_step_area_id=post_area_id,
+                attempted_move_into_blocked_boundary=attempted_move_into_blocked_boundary,
+                repeated_boundary_facing_movement=repeated_boundary_facing_movement,
+                movement_stayed_in_place_after_attempted_boundary_move=movement_stayed_in_place_after_attempted_boundary_move,
             )
             step_info.update(
                 {
@@ -217,6 +308,7 @@ class EnvWorker:
     def _run_directed(self, request: ExecutorRequest) -> ExecutorOutcome:
         observation, info = self._reset(seed=request.metadata.get("seed") if isinstance(request.metadata, dict) else None)
         initial_observation = observation
+        request_metadata = dict(request.metadata or {})
         steps = []
         rewards: list[float] = []
         action_history: list[object] = []
@@ -298,6 +390,35 @@ class EnvWorker:
                     and avatar_before == avatar_after
                 )
             )
+            attempted_movement_direction = _movement_direction_from_action(normalized_action)
+            attempted_interaction_target_cell = (
+                list(request.click_target_coordinates)
+                if isinstance(request.click_target_coordinates, list)
+                else list(target_after) if isinstance(target_after, list) else None
+            )
+            attempted_interaction_target_object_id = str(
+                request_metadata.get("expected_target_id")
+                or request_metadata.get("expected_trigger_target_id")
+                or request_metadata.get("expected_terminal_or_exit_target_id")
+                or request.target_entity_id
+                or routed.get("target_entity_id")
+                or ""
+            ) or None
+            pre_area_id = _resolve_area_id(info=route_info, request_metadata=request_metadata, navigation=dict(request.navigation or {}), objective=dict(request.objective or {}))
+            post_area_id = _resolve_area_id(info=info, request_metadata=request_metadata, navigation=dict(request.navigation or {}), objective=dict(request.objective or {}), fallback=pre_area_id)
+            portal_like_contact_observed = bool(
+                "portal" in str(request_metadata.get("expected_effect_relation") or "").lower()
+                or "portal" in str(request_metadata.get("expected_contact_region_or_boundary") or "").lower()
+            )
+            terminal_affordance_contact_observed = bool(
+                bool(routed.get("terminal"))
+                or "terminal" in str(request_metadata.get("expected_effect_relation") or "").lower()
+                or "exit" in str(request_metadata.get("expected_effect_relation") or "").lower()
+            )
+            boundary_direction = _boundary_direction(avatar_before)
+            attempted_move_into_blocked_boundary = bool(boundary_hit and attempted_movement_direction is not None and attempted_movement_direction == boundary_direction)
+            repeated_boundary_facing_movement = bool(attempted_move_into_blocked_boundary and no_progress_steps > 0)
+            movement_stayed_in_place_after_attempted_boundary_move = bool(attempted_move_into_blocked_boundary and avatar_before == avatar_after)
             rewards.append(float(reward or 0.0))
             action_history.append(action)
             routed_history.append(dict(routed or {}, chosen_action=action, mode="directed"))
@@ -319,6 +440,18 @@ class EnvWorker:
                 terminal_action_marker=bool(routed.get("terminal")),
                 effect_region=effect_region,
                 effect_changed_cells=changed_cells,
+                attempted_movement_direction=attempted_movement_direction,
+                attempted_interaction_target_cell=attempted_interaction_target_cell,
+                attempted_interaction_target_object_id=attempted_interaction_target_object_id,
+                boundary_contact_observed=boundary_hit,
+                blocked_movement_observed=invalid_move,
+                portal_like_contact_observed=portal_like_contact_observed,
+                terminal_affordance_contact_observed=terminal_affordance_contact_observed,
+                pre_step_area_id=pre_area_id,
+                post_step_area_id=post_area_id,
+                attempted_move_into_blocked_boundary=attempted_move_into_blocked_boundary,
+                repeated_boundary_facing_movement=repeated_boundary_facing_movement,
+                movement_stayed_in_place_after_attempted_boundary_move=movement_stayed_in_place_after_attempted_boundary_move,
             )
             step_info.update(
                 {
@@ -369,6 +502,7 @@ class EnvWorker:
         return self._build_outcome(request, steps, rewards, routed_history, initial_observation=initial_observation)
 
     def _build_outcome(self, request: ExecutorRequest, steps: list[RawStep], rewards: list[float], routed_history: list[dict], *, initial_observation: object | None) -> ExecutorOutcome:
+        summary = summarize_outcome(steps=steps, request=request, routed_history=routed_history, rewards=rewards)
         episode = RawEpisode(
             session_id=request.session_id,
             run_id=request.run_id,
@@ -385,15 +519,23 @@ class EnvWorker:
             metadata={
                 "env": self.env.env_metadata(),
                 "request_metadata": dict(request.metadata),
+                "execution_intent": {
+                    "expected_effect_type": request.metadata.get("expected_effect_type"),
+                    "expected_effect_relation": request.metadata.get("expected_effect_relation") or request.metadata.get("expected_relation_type"),
+                    "expected_target_id": request.metadata.get("expected_target_id"),
+                    "expected_trigger_target_id": request.metadata.get("expected_trigger_target_id"),
+                    "expected_terminal_or_exit_target_id": request.metadata.get("expected_terminal_or_exit_target_id"),
+                    "expected_contact_region_or_boundary": request.metadata.get("expected_contact_region_or_boundary"),
+                },
                 "objective": dict(request.objective),
                 "navigation": dict(request.navigation),
                 "terminal_action": dict(request.terminal_action),
                 "constraints": dict(request.constraints),
                 "stop_conditions": dict(request.stop_conditions),
                 "initial_observation": initial_observation,
+                "outcome_summary": dict(summary),
             },
         )
-        summary = summarize_outcome(steps=steps, request=request, routed_history=routed_history, rewards=rewards)
         return ExecutorOutcome(
             session_id=request.session_id,
             run_id=request.run_id,

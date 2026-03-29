@@ -31,3 +31,8 @@ Safety requirements:
 - retry budgets are enforced by the chain manager
 - replanning is requested on contradiction, repeated failure, or missing expected evidence
 - avatar-confidence-aware outcomes weaken spatial chain-step success when localization is weak
+
+Planning mode telemetry:
+- `previous_planning_mode` is a committed cross-round telemetry field
+- it must be sourced from the prior round committed mode only
+- it must not be synthesized from defaults or tentative local mode calculations

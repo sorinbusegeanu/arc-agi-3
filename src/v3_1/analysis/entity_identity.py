@@ -127,6 +127,15 @@ def assign_identity(current: dict[str, Any], priors: list[dict[str, Any]]) -> di
     second = scored[1] if len(scored) > 1 else None
     min_match_threshold = 0.34 if _structure_like(current) else 0.4
     if top is None or float(top.get("score", 0.0) or 0.0) < min_match_threshold:
+        if scored and len(scored) > 1 and float(scored[0].get("score", 0.0) or 0.0) >= 0.24:
+            return {
+                "identity_status": "split_candidate",
+                "identity_confidence": float(scored[0].get("score", 0.0) or 0.0),
+                "identity_candidate_prior_ids": [row["prior_id"] for row in scored[:3] if row.get("prior_id")],
+                "candidate_prior_ids": [row["prior_id"] for row in scored[:3] if row.get("prior_id")],
+                "matched_prior_id": None,
+                "identity_metrics": scored[0],
+            }
         return {
             "identity_status": "new_entity",
             "identity_confidence": float(top.get("score", 0.0) or 0.0) if top else 0.0,
@@ -137,8 +146,9 @@ def assign_identity(current: dict[str, Any], priors: list[dict[str, Any]]) -> di
         }
     ambiguity_gap = 0.06 if _structure_like(current) and float(top.get("appearance_features", 0.0) or 0.0) >= 0.55 else 0.1
     if second is not None and abs(float(top.get("score", 0.0) or 0.0) - float(second.get("score", 0.0) or 0.0)) < ambiguity_gap:
+        status = "merge_candidate" if float(top.get("score", 0.0) or 0.0) >= 0.5 else "ambiguous_match"
         return {
-            "identity_status": "ambiguous_match",
+            "identity_status": status,
             "identity_confidence": float(top.get("score", 0.0) or 0.0),
             "identity_candidate_prior_ids": [row["prior_id"] for row in scored[:3] if row.get("prior_id")],
             "candidate_prior_ids": [row["prior_id"] for row in scored[:3] if row.get("prior_id")],
@@ -147,7 +157,7 @@ def assign_identity(current: dict[str, Any], priors: list[dict[str, Any]]) -> di
         }
     if float(top.get("score", 0.0) or 0.0) < (0.5 if _structure_like(current) else 0.58) and second is not None:
         return {
-            "identity_status": "ambiguous_match",
+            "identity_status": "merge_candidate" if _structure_like(current) else "ambiguous_match",
             "identity_confidence": float(top.get("score", 0.0) or 0.0),
             "identity_candidate_prior_ids": [row["prior_id"] for row in scored[:3] if row.get("prior_id")],
             "candidate_prior_ids": [row["prior_id"] for row in scored[:3] if row.get("prior_id")],

@@ -28,7 +28,18 @@ def _empty_blackboard_state() -> dict:
         "hypothesized_topology": {"nodes": {}, "edges": {}},
         "indexes": {},
         "split_indexes": {"observed": {}, "hypothesized": {}},
+        "merge_support_family_diagnostics": {},
     }
+
+
+def _count_family_rows_in_delta(delta: dict, family: str) -> int:
+    count = 0
+    marker_field = f"supports_{family}_relation"
+    for row in list(dict(delta or {}).get("consequences", ()) or []):
+        payload = dict(row or {})
+        if bool(payload.get(marker_field, False)) or str(payload.get("support_family") or "") == family:
+            count += 1
+    return int(count)
 
 
 def is_compatibility_snapshot(snapshot) -> bool:
@@ -82,6 +93,7 @@ def export_strict_snapshot(snapshot) -> dict:
         "observed_topology": observed_topology,
         "hypothesized_topology": hypothesized_topology,
         "split_indexes": dict(state.get("split_indexes", {})),
+        "merge_support_family_diagnostics": dict(state.get("merge_support_family_diagnostics", {})),
         "combined_views": {
             "compatibility_only": True,
             "entities": dict(state.get("entities", {})),
@@ -100,6 +112,7 @@ def export_strict_snapshot(snapshot) -> dict:
             "hypothesized_trigger_count": len(dict(state.get("hypothesized_trigger_zones", {}))),
             "observed_topology_node_count": len(dict(observed_topology.get("nodes", {}))),
             "hypothesized_topology_node_count": len(dict(hypothesized_topology.get("nodes", {}))),
+            "identity_fillthrough_applied_count": int(state.get("identity_fillthrough_applied_count", 0) or 0),
         },
     }
     return payload
@@ -126,7 +139,18 @@ def _build_strict_indexes(*, areas: dict, entities: dict, consequences: dict, tr
                 topology_lookup["node_ids_by_cell"][f"{int(cell[0])}:{int(cell[1])}"] = f"cell:{int(cell[0])}:{int(cell[1])}"
     for entity_id, entity in dict(entities).items():
         area_id = str(entity.get("area_id") or "global")
-        row = {"entity_id": str(entity_id), "area_id": area_id, "evidence_tier": str(entity.get("evidence_tier") or "hypothesized")}
+        row = {
+            "entity_id": str(entity_id),
+            "area_id": area_id,
+            "evidence_tier": str(entity.get("evidence_tier") or "hypothesized"),
+            "identity_status": str(entity.get("identity_status") or "unknown"),
+            "identity_strength_profile": {
+                "identity_status": str(entity.get("identity_status") or "unknown"),
+                "support_count": int(entity.get("identity_support_count", 0) or 0),
+                "contradiction_count": int(entity.get("identity_contradiction_count", 0) or 0),
+                "cross_round_stability": int(entity.get("identity_cross_round_stability", 0) or 0),
+            },
+        }
         entities_by_area.setdefault(area_id, []).append(row)
         if entity.get("kind") == "poi":
             poi_bucket = str(entity.get("poi_bucket") or "")
@@ -148,6 +172,11 @@ def _build_strict_indexes(*, areas: dict, entities: dict, consequences: dict, tr
             "consequence_id": str(consequence_id),
             "action_key": action_key,
             "evidence_tier": str(consequence.get("evidence_tier") or "hypothesized"),
+            "evidence_support_profile": {
+                "counterfactual": int(consequence.get("counterfactual_support_count", 0) or 0),
+                "directed_outcome": int(consequence.get("directed_outcome_support_count", 0) or 0),
+                "exit_attempt": int(consequence.get("exit_attempt_support_count", 0) or 0),
+            },
         }
         consequence_by_action.setdefault(action_key, []).append(consequence_row)
         for evidence_ref in list(consequence.get("evidence_refs", []) or []):
@@ -173,6 +202,20 @@ def _build_strict_indexes(*, areas: dict, entities: dict, consequences: dict, tr
         "consequence_by_action_rows": {key: sorted(value, key=lambda row: row["consequence_id"]) for key, value in consequence_by_action.items()},
         "evidence_index_rows": {key: sorted(value, key=lambda row: row["row_id"]) for key, value in evidence_index.items()},
         "topology_lookup": topology_lookup,
+        "topology_edge_support_profile_rows": {
+            str(edge_id): {
+                "edge_id": str(edge_id),
+                "evidence_tier": str(dict(edge).get("evidence_tier") or "hypothesized"),
+                "evidence_support_profile": {
+                    "display": int(dict(edge).get("display_support_count", 0) or 0),
+                    "match": int(dict(edge).get("match_support_count", 0) or 0),
+                    "counterfactual": int(dict(edge).get("counterfactual_support_count", 0) or 0),
+                    "directed_outcome": int(dict(edge).get("directed_outcome_support_count", 0) or 0),
+                    "exit_attempt": int(dict(edge).get("exit_attempt_support_count", 0) or 0),
+                },
+            }
+            for edge_id, edge in dict(topology.get("edges", {})).items()
+        },
         "entity_count": len(dict(entities)),
         "area_count": len(dict(areas)),
         "topology_node_count": len(dict(topology.get("nodes", {}))),
@@ -277,6 +320,7 @@ class BlackboardState:
             "observed_topology": dict(self.state.get("observed_topology", {})),
             "hypothesized_topology": dict(self.state.get("hypothesized_topology", {})),
             "split_indexes": strict_indexes,
+            "merge_support_family_diagnostics": dict(self.state.get("merge_support_family_diagnostics", {})),
         }
 
     def snapshot(self, *, round_id: int, pass_id: int, material_change: bool) -> BlackboardSnapshot:
@@ -298,6 +342,15 @@ class BlackboardState:
         material_change = False
         next_state = self.state
         for delta in deltas:
+            diagnostics = dict(next_state.get("merge_support_family_diagnostics", {}) or {})
+            diagnostics["exit_attempt_rows_seen_on_blackboard_merge_call"] = int(
+                diagnostics.get("exit_attempt_rows_seen_on_blackboard_merge_call", 0) or 0
+            ) + _count_family_rows_in_delta(delta, "exit_attempt")
+            diagnostics["counterfactual_rows_seen_on_blackboard_merge_call"] = int(
+                diagnostics.get("counterfactual_rows_seen_on_blackboard_merge_call", 0) or 0
+            ) + _count_family_rows_in_delta(delta, "counterfactual")
+            next_state = dict(next_state)
+            next_state["merge_support_family_diagnostics"] = diagnostics
             next_state, changed = apply_delta(next_state, delta, max_consequences=self.max_consequences)
             material_change = material_change or changed
         self.revision += 1

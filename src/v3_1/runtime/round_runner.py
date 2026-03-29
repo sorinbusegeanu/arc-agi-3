@@ -10,6 +10,7 @@ from v3_1.planning.subgoal_chain_manager import SubgoalChainManager
 from v3_1.runtime.export_assembler import (
     actual_effect_mode,
     available_families_from_blackboard,
+    build_live_candidate_bridge_rows,
     build_round_analysis_summary,
     decision_export_payload,
     episode_export_row,
@@ -27,10 +28,13 @@ from v3_1.runtime.session_ledger import (
     PlanSelectedPayload,
     RoundStartPayload,
     DetectorPoiEscalationPayload,
+    SubgoalChainAbandonedPayload,
     SubgoalChainAbortedPayload,
     SubgoalChainAdvancedPayload,
     SubgoalChainCompletedPayload,
     SubgoalChainStartedPayload,
+    SubgoalChainStepActivatedPayload,
+    SubgoalChainStepProgressedPayload,
     SubgoalChainStepPayload,
 )
 from v3_1.visualization.heatmaps import (
@@ -128,6 +132,36 @@ def _analysis_effect_payload(analyzed_episodes: list[object]) -> dict:
         "candidate_effect_mode": candidate_effect_mode,
         "candidate_effect_score": candidate_effect_score,
     }
+
+
+def _episode_classifier_payload(outcome) -> dict:
+    payload = dict(getattr(outcome, "outcome", {}) or {})
+    return {
+        "counterfactual_evidence_observed": payload.get("counterfactual_evidence_observed"),
+        "exit_attempt_evidence_observed": payload.get("exit_attempt_evidence_observed"),
+        "expected_effect_type": payload.get("expected_effect_type"),
+        "expected_relation_type": payload.get("expected_relation_type") or payload.get("expected_effect_relation"),
+        "expected_target_id": payload.get("expected_target_id") or payload.get("expected_effect_target_id"),
+        "expected_trigger_contact_observed": payload.get("expected_trigger_contact_observed"),
+        "expected_region_reached": payload.get("expected_region_reached"),
+        "observed_effect_change": payload.get("observed_effect_change"),
+        "observed_effect_absent": payload.get("observed_effect_absent") if "observed_effect_absent" in payload else payload.get("expected_effect_absent"),
+        "attempted_boundary_contact": payload.get("attempted_boundary_contact"),
+        "attempted_portal_contact": payload.get("attempted_portal_contact"),
+        "attempted_terminal_affordance_contact": payload.get("attempted_terminal_affordance_contact"),
+        "attempted_escape_direction": payload.get("attempted_escape_direction"),
+        "exit_attempt_target_id": payload.get("exit_attempt_target_id"),
+    }
+
+
+def _count_exit_attempt_family_rows(deltas: list[dict]) -> int:
+    count = 0
+    for delta in list(deltas or []):
+        for row in list(dict(delta or {}).get("consequences", ()) or []):
+            payload = dict(row or {})
+            if bool(payload.get("supports_exit_attempt_relation", False)) or str(payload.get("support_family") or "") == "exit_attempt":
+                count += 1
+    return int(count)
 
 
 def _sync_analysis_poi_debug_with_observed_store(analysis_summary: dict, blackboard_state: dict) -> dict:
@@ -283,7 +317,7 @@ def _detector_backed_selected_poi(decision_export: dict) -> dict:
     return selected
 
 
-def _update_poi_followthrough_state(*, latest_memory, selected_candidate: dict, mg_counts: dict, hypothesis_registry_snapshot: dict, round_id: int, selected_subgoal_chain: dict | None = None) -> tuple[dict, list[tuple[str, DetectorPoiEscalationPayload]]]:
+def _update_poi_followthrough_state(*, latest_memory, selected_candidate: dict, mg_counts: dict, hypothesis_registry_snapshot: dict, round_id: int, selected_subgoal_chain: dict | None = None, chain_outcome_update: dict | None = None, selected_outcome: dict | None = None) -> tuple[dict, list[tuple[str, DetectorPoiEscalationPayload]]]:
     state = getattr(latest_memory, "state", None)
     if not isinstance(state, dict):
         return {}, []
@@ -306,14 +340,29 @@ def _update_poi_followthrough_state(*, latest_memory, selected_candidate: dict, 
     revisit_count = int(row.get("revisit_count", 0) or 0) + (1 if row else 0)
     selection_rounds = int(row.get("selection_rounds", 0) or 0) + 1
     new_graph_edges = int(mg_counts.get("edge_count_added", 0) or 0)
+    graph_support_gain = int(mg_counts.get("observed_edge_count_added", 0) or 0)
     validation_state = dict(hypothesis_registry_snapshot.get("validation_state", {}) or {})
     new_hypothesis_support = sum(1 for state_value in validation_state.values() if str(state_value or "") in {"supported", "validated", "planner_usable"})
     new_verification_candidates = int(mg_counts.get("observed_edge_count_added", 0) or 0)
     changed_exit_linked_evidence = int(mg_counts.get("observed_edge_count_added", 0) or 0)
-    new_support_delta = new_graph_edges + new_hypothesis_support + new_verification_candidates
+    identity_gain = int(mg_counts.get("node_count_added", 0) or 0)
+    usable_trigger_gain = int(mg_counts.get("observed_edge_count_added", 0) or 0)
+    durable_gain = sum(1 for state_value in validation_state.values() if str(state_value or "") in {"planner_usable", "durable_ready"})
+    contradiction_gain = 0
+    new_support_delta = graph_support_gain + identity_gain + usable_trigger_gain + durable_gain + new_hypothesis_support + new_verification_candidates
     escalated_candidate_ids = list(dict(row).get("escalated_candidate_ids", []) or [])
     if selected_subgoal_chain:
         escalated_candidate_ids.append(str(dict(selected_subgoal_chain).get("source_candidate_id") or ""))
+    chain_failure_count = int(row.get("chain_step_failure_count", 0) or 0)
+    last_chain_failure_round = int(row.get("last_chain_failure_round", 0) or 0)
+    stale_dead_end_count = int(row.get("stale_dead_end_count", 0) or 0)
+    chain_outcome_update = dict(chain_outcome_update or {})
+    selected_outcome = dict(selected_outcome or {})
+    if bool(chain_outcome_update.get("runtime_progress_updated", False)) and any(str(dict(evt).get("event_type") or "") in {"subgoal chain abandoned", "subgoal chain step failed"} for evt in list(chain_outcome_update.get("runtime_chain_rows", []) or [])):
+        chain_failure_count += 1
+        last_chain_failure_round = int(round_id)
+    if new_support_delta <= 0:
+        stale_dead_end_count += 1
     probe_stale = selection_rounds >= 2 and new_support_delta <= 0
     next_row = {
         **row,
@@ -323,11 +372,20 @@ def _update_poi_followthrough_state(*, latest_memory, selected_candidate: dict, 
         "selection_rounds": selection_rounds,
         "revisit_count": revisit_count,
         "new_graph_edges": new_graph_edges,
+        "graph_support_gain": graph_support_gain,
+        "support_gain_since_last_visit": new_support_delta,
+        "identity_gain_since_last_visit": identity_gain,
+        "contradiction_gain_since_last_visit": contradiction_gain,
+        "usable_trigger_gain_since_last_visit": usable_trigger_gain,
+        "durable_gain_since_last_visit": durable_gain,
         "new_hypothesis_support": new_hypothesis_support,
         "new_verification_candidates": new_verification_candidates,
         "changed_exit_linked_evidence": changed_exit_linked_evidence,
         "new_support_delta": new_support_delta,
         "probe_stale": probe_stale,
+        "stale_dead_end_count": stale_dead_end_count,
+        "last_chain_failure_round": last_chain_failure_round if last_chain_failure_round > 0 else None,
+        "chain_step_failure_count": chain_failure_count,
         "detector_backed": True,
         "detector_strength": float(selected_candidate.get("confidence", 0.0) or 0.0),
         "reachable": bool(selected_candidate.get("reachable_now")) or bool(selected_candidate.get("reachable_later")),
@@ -347,6 +405,9 @@ def _update_poi_followthrough_state(*, latest_memory, selected_candidate: dict, 
         revisit_count=int(next_row.get("revisit_count", 0) or 0),
         downstream_support_gained={
             "new_graph_edges": new_graph_edges,
+            "graph_support_gain": graph_support_gain,
+            "identity_gain_since_last_visit": identity_gain,
+            "durable_gain_since_last_visit": durable_gain,
             "new_hypothesis_support": new_hypothesis_support,
             "new_verification_candidates": new_verification_candidates,
             "changed_exit_linked_evidence": changed_exit_linked_evidence,
@@ -384,6 +445,134 @@ def _update_poi_followthrough_state(*, latest_memory, selected_candidate: dict, 
     return followthrough, events
 
 
+def _update_mode_persistence_state(*, latest_memory, decision, round_id: int, mg_counts: dict, selected_outcome: dict | None = None, prior_mode_state: dict | None = None) -> dict:
+    state = getattr(latest_memory, "state", None)
+    if not isinstance(state, dict):
+        return {}
+    working = dict(state.get("working_memory", {}) or {})
+    plan_memory = dict(working.get("plan_memory", {}) or {})
+    metadata = dict(getattr(decision, "metadata", {}) or {})
+    planner_trace = dict(metadata.get("planner_trace", {}) or {})
+    current_mode = str(planner_trace.get("planning_mode") or "default_progress")
+    previous_mode = str(planner_trace.get("previous_planning_mode") or plan_memory.get("mode_persistence", {}).get("last_planning_mode") or "")
+    prior = dict(plan_memory.get("mode_persistence", {}) or {})
+    if not prior:
+        prior = dict(prior_mode_state or {})
+    prior_history = list(prior.get("history", []) or [])
+    selected_candidate = dict(metadata.get("selected_candidate", {}) or {})
+    objective_type = str(selected_candidate.get("objective_type") or "")
+    structure_support_gain = float(int(dict(mg_counts or {}).get("edge_count_added", 0) or 0) > 0)
+    structure_support_gain += float(int(dict(mg_counts or {}).get("observed_edge_count_added", 0) or 0) > 0)
+    if objective_type in {"trigger_then_target", "verify_trigger_contact", "reobserve_remote_change", "verify_panel_state", "verify_gate_match"}:
+        structure_support_gain += 0.5
+    progress_support_gain = float(bool(dict(selected_outcome or {}).get("progress", 0.0)))
+    if objective_type in {"explore_frontier", "probe_route", "interact"}:
+        progress_support_gain += 0.25
+    last_structure_gain_round = int(prior.get("last_structure_support_gain_round", 0) or 0)
+    last_progress_gain_round = int(prior.get("last_progress_support_gain_round", 0) or 0)
+    if structure_support_gain > 0.0:
+        last_structure_gain_round = int(round_id)
+    if progress_support_gain > 0.0:
+        last_progress_gain_round = int(round_id)
+    switch_applied = bool(planner_trace.get("mode_switch_applied", False))
+    next_state = {
+        "last_planning_mode": current_mode,
+        "last_planning_mode_committed": current_mode,
+        "last_mode_reason": str(planner_trace.get("mode_switch_reason") or planner_trace.get("mode_switch_block_reason") or ""),
+        "last_mode_round_id": int(round_id),
+        "consecutive_structure_acquisition_rounds": int(planner_trace.get("mode_persistence_summary", {}).get("consecutive_structure_acquisition_rounds", prior.get("consecutive_structure_acquisition_rounds", 0)) or 0),
+        "consecutive_default_progress_rounds": int(planner_trace.get("mode_persistence_summary", {}).get("consecutive_default_progress_rounds", prior.get("consecutive_default_progress_rounds", 0)) or 0),
+        "recent_structure_support_gain": float(planner_trace.get("recent_structure_support_gain", structure_support_gain) or 0.0),
+        "recent_progress_evidence_gain": float(planner_trace.get("recent_progress_evidence_gain", progress_support_gain) or 0.0),
+        "last_structure_support_gain_round": last_structure_gain_round,
+        "last_progress_support_gain_round": last_progress_gain_round,
+        "mode_switch_applied_last_round": switch_applied,
+        "previous_planning_mode": previous_mode,
+        "history": [
+            *prior_history[-5:],
+            {
+                "round_id": int(round_id),
+                "planning_mode": current_mode,
+                "previous_planning_mode": previous_mode,
+                "mode_switch_applied": switch_applied,
+                "mode_switch_reason": str(planner_trace.get("mode_switch_reason") or planner_trace.get("mode_switch_block_reason") or ""),
+                "structure_support_gain": structure_support_gain,
+                "progress_support_gain": progress_support_gain,
+            },
+        ][-8:],
+    }
+    plan_memory["mode_persistence"] = next_state
+    working["plan_memory"] = plan_memory
+    state["working_memory"] = working
+    return next_state
+
+
+def _inject_mode_persistence(memory_state: dict, mode_state: dict | None) -> dict:
+    payload = dict(memory_state or {})
+    if not mode_state:
+        return payload
+    working = dict(payload.get("working_memory", {}) or {})
+    plan_memory = dict(working.get("plan_memory", {}) or {})
+    plan_memory["mode_persistence"] = dict(mode_state)
+    working["plan_memory"] = plan_memory
+    payload["working_memory"] = working
+    return payload
+
+
+def _with_committed_previous_mode(decision, prior_mode_state: dict | None):
+    committed_previous = dict(prior_mode_state or {}).get("last_planning_mode_committed")
+    metadata = dict(getattr(decision, "metadata", {}) or {})
+    planner_trace = dict(metadata.get("planner_trace", {}) or {})
+    if committed_previous is not None and planner_trace.get("previous_planning_mode") in {"", None}:
+        planner_trace["previous_planning_mode"] = committed_previous
+    metadata["planner_trace"] = planner_trace
+    metadata["previous_planning_mode"] = planner_trace.get("previous_planning_mode")
+    return type(decision)(**{**decision.__dict__, "metadata": metadata})
+
+
+def _build_final_mode_payload(*, round_id: int, decision, prior_committed_mode: str | None, prior_committed_mode_source: str) -> dict:
+    metadata = dict(getattr(decision, "metadata", {}) or {})
+    planner_trace = dict(metadata.get("planner_trace", {}) or {})
+    final_payload = {
+        "previous_planning_mode": planner_trace.get("previous_planning_mode"),
+        "planning_mode_before_hysteresis": str(planner_trace.get("planning_mode_before_hysteresis") or ""),
+        "planning_mode_after_hysteresis": str(planner_trace.get("planning_mode_after_hysteresis") or planner_trace.get("planning_mode") or ""),
+        "planning_mode_committed": str(planner_trace.get("planning_mode_committed") or planner_trace.get("planning_mode") or "default_progress"),
+        "payload_correction_applied": False,
+        "payload_correction_reason": "",
+        "prior_committed_mode_loaded": prior_committed_mode,
+        "prior_committed_mode_source": prior_committed_mode_source,
+        "final_mode_payload_built": True,
+    }
+    if int(round_id) > 1 and prior_committed_mode not in {"", None} and final_payload["previous_planning_mode"] in {"", None}:
+        final_payload["previous_planning_mode"] = prior_committed_mode
+        final_payload["payload_correction_applied"] = True
+        final_payload["payload_correction_reason"] = "missing_previous_committed_mode_before_persist"
+    return final_payload
+
+
+def _apply_final_mode_payload(decision, final_mode_payload: dict):
+    metadata = dict(getattr(decision, "metadata", {}) or {})
+    planner_trace = dict(metadata.get("planner_trace", {}) or {})
+    metadata["previous_planning_mode_committed_for_trace"] = final_mode_payload.get("previous_planning_mode")
+    for key, value in dict(final_mode_payload or {}).items():
+        if key in {
+            "previous_planning_mode",
+            "planning_mode_before_hysteresis",
+            "planning_mode_after_hysteresis",
+            "planning_mode_committed",
+            "payload_correction_applied",
+            "payload_correction_reason",
+            "prior_committed_mode_loaded",
+            "prior_committed_mode_source",
+            "final_mode_payload_built",
+        }:
+            planner_trace[key] = value
+            metadata[key] = value
+    metadata["planner_trace"] = planner_trace
+    return type(decision)(**{**decision.__dict__, "metadata": metadata})
+
+
 @dataclass
 class RoundRunResult:
     latest_blackboard: object
@@ -413,11 +602,131 @@ class RoundRunner:
     planning_context_builder: object
     session_ledger: object | None = None
     subgoal_chain_manager: object | None = None
+    last_planning_mode_committed: str | None = None
 
     def _ensure_chain_manager(self) -> SubgoalChainManager:
         if self.subgoal_chain_manager is None:
             self.subgoal_chain_manager = SubgoalChainManager()
         return self.subgoal_chain_manager
+
+    def _with_decision_metadata(self, decision, *, updates: dict) -> PlannerDecision:
+        payload = dict(decision.__dict__)
+        metadata = dict(payload.get("metadata", {}) or {})
+        metadata.update(dict(updates or {}))
+        payload["metadata"] = metadata
+        return PlannerDecision(**payload)
+
+    def _materialize_selected_chain_runtime(
+        self,
+        *,
+        decision,
+        round_id: int,
+        blackboard_version: str,
+        memory_version: str,
+        plan_context_id: str,
+    ) -> tuple[PlannerDecision, dict[str, object]]:
+        manager = self._ensure_chain_manager()
+        metadata = dict(getattr(decision, "metadata", {}) or {})
+        selected_chain = dict(metadata.get("selected_subgoal_chain", {}) or {}) if isinstance(metadata.get("selected_subgoal_chain"), dict) else {}
+        selected_step = dict(metadata.get("selected_subgoal_step", {}) or {}) if isinstance(metadata.get("selected_subgoal_step"), dict) else {}
+        selected_candidate = dict(metadata.get("selected_candidate", {}) or {}) if isinstance(metadata.get("selected_candidate"), dict) else {}
+        runtime_rows: list[dict] = []
+        materialized = False
+        runtime_chain_event_count = 0
+        runtime_step_event_count = 0
+        payload_correction_applied = False
+        if selected_chain:
+            current_active = dict(manager.current_chain() or {})
+            current_active_id = str(current_active.get("chain_id") or "")
+            selected_chain_id = str(selected_chain.get("chain_id") or "")
+            if not current_active or current_active_id != selected_chain_id:
+                manager.active_chain = dict(selected_chain)
+                manager.active_chain["status"] = str(manager.active_chain.get("status") or "planned")
+                manager.active_chain["last_updated_round_id"] = int(round_id)
+                manager.retry_counts = {}
+                manager._should_replan = False
+                manager.chain_history.append({"event": "runtime_materialized", "chain_id": selected_chain_id, "round_id": int(round_id)})
+                materialized = True
+                current_step = dict(selected_step or manager.current_step() or {})
+                if current_step:
+                    current_step["step_status"] = str(current_step.get("step_status") or "ready")
+                    manager._replace_current_step(current_step)
+                runtime_rows.append({"event_type": "subgoal chain started", "round_id": int(round_id), "payload": {"chain_id": selected_chain_id}})
+                runtime_chain_event_count += 1
+                if self.session_ledger is not None:
+                    self.session_ledger.append_subgoal_chain_started(
+                        round_id=round_id,
+                        pass_id=1,
+                        blackboard_version=blackboard_version,
+                        memory_version=memory_version,
+                        plan_context_id=plan_context_id,
+                        decision_id=str(getattr(decision, "selected_candidate_id", None) or ""),
+                        payload=SubgoalChainStartedPayload(
+                            chain_id=selected_chain_id,
+                            selected_subgoal_chain_id=selected_chain_id or None,
+                            selected_subgoal_step_id=str(current_step.get("step_id") or "") or None,
+                            current_step_id=str(current_step.get("step_id") or "") or None,
+                            step_kind=str(current_step.get("step_kind") or "") or None,
+                            expected_evidence=tuple(str(value) for value in list(current_step.get("expected_evidence", []) or []) if value),
+                            observed_evidence=(),
+                            advancement_reason="runtime_chain_materialized",
+                            exit_readiness_score=float(selected_chain.get("exit_readiness_score_at_creation", 0.0) or 0.0),
+                            missing_prerequisites=tuple(str(value) for value in list(selected_chain.get("required_verification_steps", []) or []) if value),
+                        ),
+                    )
+            current_step = dict(selected_step or manager.current_step() or {})
+            if current_step:
+                runtime_rows.append({"event_type": "subgoal chain step activated", "round_id": int(round_id), "payload": {"chain_id": str(selected_chain.get("chain_id") or ""), "step_id": str(current_step.get("step_id") or "")}})
+                runtime_step_event_count += 1
+                if self.session_ledger is not None:
+                    self.session_ledger.append_subgoal_chain_step_activated(
+                        round_id=round_id,
+                        pass_id=1,
+                        blackboard_version=blackboard_version,
+                        memory_version=memory_version,
+                        plan_context_id=plan_context_id,
+                        decision_id=str(getattr(decision, "selected_candidate_id", None) or ""),
+                        payload=SubgoalChainStepActivatedPayload(
+                            chain_id=str(selected_chain.get("chain_id") or ""),
+                            selected_subgoal_chain_id=str(selected_chain.get("chain_id") or "") or None,
+                            selected_subgoal_step_id=str(current_step.get("step_id") or "") or None,
+                            current_step_id=str(current_step.get("step_id") or "") or None,
+                            step_kind=str(current_step.get("step_kind") or "") or None,
+                            expected_evidence=tuple(str(value) for value in list(current_step.get("expected_evidence", []) or []) if value),
+                            observed_evidence=(),
+                            advancement_reason="step_activated_for_execution",
+                            exit_readiness_score=float(selected_chain.get("exit_readiness_score_at_creation", 0.0) or 0.0),
+                            missing_prerequisites=tuple(str(value) for value in list(selected_chain.get("required_verification_steps", []) or []) if value),
+                        ),
+                    )
+            runtime_state = manager.snapshot()
+            runtime_state["selected_candidate_id"] = str(getattr(decision, "selected_candidate_id", None) or "")
+            runtime_state["materialized_this_round"] = bool(materialized)
+            runtime_state["runtime_chain_event_count"] = int(runtime_chain_event_count)
+            runtime_state["runtime_step_event_count"] = int(runtime_step_event_count)
+            runtime_state["prior_runtime_source"] = "round_runner"
+            if selected_chain and not runtime_rows:
+                raise AssertionError("selected chain present in decision but no chain runtime row materialized")
+            if selected_step and runtime_step_event_count <= 0:
+                raise AssertionError("selected step present in decision but no chain step runtime row materialized")
+            decision = self._with_decision_metadata(
+                decision,
+                updates={
+                    "runtime_subgoal_chain_state": runtime_state,
+                    "selected_subgoal_chain": dict(runtime_state.get("active_chain", {}) or selected_chain),
+                    "selected_subgoal_step": dict(runtime_state.get("active_step", {}) or selected_step),
+                },
+            )
+        else:
+            runtime_state = manager.snapshot()
+            decision = self._with_decision_metadata(decision, updates={"runtime_subgoal_chain_state": runtime_state})
+        return decision, {
+            "runtime_subgoal_chain_state": runtime_state,
+            "runtime_chain_rows": runtime_rows,
+            "runtime_chain_event_count": int(runtime_chain_event_count),
+            "runtime_step_event_count": int(runtime_step_event_count),
+            "payload_correction_applied": bool(payload_correction_applied),
+        }
 
     def _maybe_start_chain(self, *, decision, round_id: int, blackboard_version: str, memory_version: str, plan_context_id: str) -> None:
         manager = self._ensure_chain_manager()
@@ -451,15 +760,18 @@ class RoundRunner:
             ),
         )
 
-    def _update_chain_from_outcome(self, *, round_id: int, pass_id: int, plan_context_id: str, blackboard_version: str, memory_version: str, outcome_payload: dict) -> None:
+    def _update_chain_from_outcome(self, *, round_id: int, pass_id: int, plan_context_id: str, blackboard_version: str, memory_version: str, outcome_payload: dict) -> dict[str, object]:
         manager = self._ensure_chain_manager()
         snapshot_before = manager.snapshot()
         if not snapshot_before.get("active_chain"):
-            return
+            return {"runtime_chain_rows": [], "runtime_chain_event_count": 0, "runtime_step_event_count": 0, "runtime_progress_updated": False}
         manager.update_from_outcome({**dict(outcome_payload or {}), "round_id": int(round_id)})
         snapshot_after = manager.snapshot()
         active_chain = dict(snapshot_before.get("active_chain", {}) or {})
         active_step = dict(snapshot_before.get("active_step", {}) or {})
+        runtime_rows: list[dict] = []
+        runtime_chain_event_count = 0
+        runtime_step_event_count = 0
         common_kwargs = {
             "round_id": round_id,
             "pass_id": pass_id,
@@ -470,6 +782,8 @@ class RoundRunner:
         if self.session_ledger is not None:
             payload = SubgoalChainStepPayload(
                 chain_id=str(outcome_payload.get("chain_id") or active_chain.get("chain_id") or ""),
+                selected_subgoal_chain_id=str(active_chain.get("chain_id") or "") or None,
+                selected_subgoal_step_id=str(outcome_payload.get("step_id") or active_step.get("step_id") or "") or None,
                 current_step_id=str(outcome_payload.get("step_id") or active_step.get("step_id") or "") or None,
                 step_kind=str(outcome_payload.get("step_kind") or active_step.get("step_kind") or "") or None,
                 expected_evidence=tuple(str(value) for value in list(active_step.get("expected_evidence", []) or []) if value),
@@ -481,15 +795,42 @@ class RoundRunner:
                 failed_without_new_support=bool(outcome_payload.get("exit_attempt_failed_without_new_support", False)),
                 position_hold_detected=bool(outcome_payload.get("position_hold_detected", False)),
             )
+            runtime_rows.append({"event_type": "subgoal chain step progressed", "round_id": int(round_id), "payload": {"chain_id": payload.chain_id, "step_id": payload.current_step_id, "step_success": bool(outcome_payload.get("step_success"))}})
+            runtime_step_event_count += 1
+            self.session_ledger.append_subgoal_chain_step_progressed(
+                payload=SubgoalChainStepProgressedPayload(
+                    chain_id=payload.chain_id,
+                    selected_subgoal_chain_id=payload.selected_subgoal_chain_id,
+                    selected_subgoal_step_id=payload.selected_subgoal_step_id,
+                    current_step_id=payload.current_step_id,
+                    step_kind=payload.step_kind,
+                    expected_evidence=payload.expected_evidence,
+                    observed_evidence=payload.observed_evidence,
+                    failure_reason=payload.failure_reason,
+                    advancement_reason=payload.advancement_reason,
+                    exit_readiness_score=payload.exit_readiness_score,
+                    missing_prerequisites=payload.missing_prerequisites,
+                    premature_exit_penalty_applied=payload.premature_exit_penalty_applied,
+                    failed_without_new_support=payload.failed_without_new_support,
+                    position_hold_detected=payload.position_hold_detected,
+                ),
+                decision_id=str(outcome_payload.get("candidate_id") or ""),
+                outcome_id=str(outcome_payload.get("candidate_id") or ""),
+                **common_kwargs,
+            )
             if bool(outcome_payload.get("step_success")):
                 self.session_ledger.append_subgoal_chain_step_completed(payload=payload, **common_kwargs)
             else:
                 self.session_ledger.append_subgoal_chain_step_failed(payload=payload, **common_kwargs)
             if snapshot_after.get("active_chain") and int(dict(snapshot_after.get("active_chain", {}) or {}).get("current_step_index", 0) or 0) != int(active_chain.get("current_step_index", 0) or 0):
                 next_step = dict(snapshot_after.get("active_step", {}) or {})
+                runtime_rows.append({"event_type": "subgoal chain advanced", "round_id": int(round_id), "payload": {"chain_id": str(active_chain.get("chain_id") or ""), "step_id": str(next_step.get("step_id") or "")}})
+                runtime_chain_event_count += 1
                 self.session_ledger.append_subgoal_chain_advanced(
                     payload=SubgoalChainAdvancedPayload(
                         chain_id=str(active_chain.get("chain_id") or ""),
+                        selected_subgoal_chain_id=str(active_chain.get("chain_id") or "") or None,
+                        selected_subgoal_step_id=str(next_step.get("step_id") or "") or None,
                         current_step_id=str(next_step.get("step_id") or "") or None,
                         step_kind=str(next_step.get("step_kind") or "") or None,
                         expected_evidence=tuple(str(value) for value in list(next_step.get("expected_evidence", []) or []) if value),
@@ -501,9 +842,13 @@ class RoundRunner:
                     **common_kwargs,
                 )
             if str(dict(snapshot_after.get("active_chain", {}) or {}).get("status") or "") == "completed":
+                runtime_rows.append({"event_type": "subgoal chain completed", "round_id": int(round_id), "payload": {"chain_id": str(active_chain.get("chain_id") or "")}})
+                runtime_chain_event_count += 1
                 self.session_ledger.append_subgoal_chain_completed(
                     payload=SubgoalChainCompletedPayload(
                         chain_id=str(active_chain.get("chain_id") or ""),
+                        selected_subgoal_chain_id=str(active_chain.get("chain_id") or "") or None,
+                        selected_subgoal_step_id=str(active_step.get("step_id") or "") or None,
                         current_step_id=str(active_step.get("step_id") or "") or None,
                         step_kind=str(active_step.get("step_kind") or "") or None,
                         expected_evidence=tuple(str(value) for value in list(active_step.get("expected_evidence", []) or []) if value),
@@ -518,9 +863,13 @@ class RoundRunner:
                 )
                 manager.active_chain = None
             elif str(dict(snapshot_after.get("active_chain", {}) or {}).get("status") or "") == "aborted":
+                runtime_rows.append({"event_type": "subgoal chain abandoned", "round_id": int(round_id), "payload": {"chain_id": str(active_chain.get("chain_id") or ""), "reason": str(outcome_payload.get("step_failure_reason") or "")}})
+                runtime_chain_event_count += 1
                 self.session_ledger.append_subgoal_chain_aborted(
                     payload=SubgoalChainAbortedPayload(
                         chain_id=str(active_chain.get("chain_id") or ""),
+                        selected_subgoal_chain_id=str(active_chain.get("chain_id") or "") or None,
+                        selected_subgoal_step_id=str(active_step.get("step_id") or "") or None,
                         current_step_id=str(active_step.get("step_id") or "") or None,
                         step_kind=str(active_step.get("step_kind") or "") or None,
                         expected_evidence=tuple(str(value) for value in list(active_step.get("expected_evidence", []) or []) if value),
@@ -534,11 +883,36 @@ class RoundRunner:
                     ),
                     **common_kwargs,
                 )
+                self.session_ledger.append_subgoal_chain_abandoned(
+                    payload=SubgoalChainAbandonedPayload(
+                        chain_id=str(active_chain.get("chain_id") or ""),
+                        selected_subgoal_chain_id=str(active_chain.get("chain_id") or "") or None,
+                        selected_subgoal_step_id=str(active_step.get("step_id") or "") or None,
+                        current_step_id=str(active_step.get("step_id") or "") or None,
+                        step_kind=str(active_step.get("step_kind") or "") or None,
+                        expected_evidence=tuple(str(value) for value in list(active_step.get("expected_evidence", []) or []) if value),
+                        observed_evidence=tuple(str(value) for value in list(outcome_payload.get("expected_evidence_seen", []) or []) if value),
+                        failure_reason=str(outcome_payload.get("step_failure_reason") or "") or None,
+                        advancement_reason=str(outcome_payload.get("chain_completion_reason") or "chain_abandoned"),
+                        exit_readiness_score=float(dict(active_chain).get("exit_readiness_score_at_creation", 0.0) or 0.0),
+                        missing_prerequisites=tuple(str(value) for value in list(outcome_payload.get("missing_prerequisites", []) or []) if value),
+                        failed_without_new_support=bool(outcome_payload.get("exit_attempt_failed_without_new_support", False)),
+                        position_hold_detected=bool(outcome_payload.get("position_hold_detected", False)),
+                    ),
+                    **common_kwargs,
+                )
         terminal_status = str(dict(snapshot_after.get("active_chain", {}) or {}).get("status") or "")
         if terminal_status in {"completed", "aborted"}:
             manager.chain_history.append({"event": "cleared_terminal_chain", "chain_id": active_chain.get("chain_id"), "status": terminal_status})
             manager.active_chain = None
             manager._should_replan = terminal_status == "aborted"
+        return {
+            "runtime_chain_rows": runtime_rows,
+            "runtime_chain_event_count": int(runtime_chain_event_count),
+            "runtime_step_event_count": int(runtime_step_event_count),
+            "runtime_progress_updated": bool(runtime_rows),
+            "runtime_subgoal_chain_state_after_outcome": manager.snapshot(),
+        }
 
     def _parallelism(self, pool_name: str, requested: int) -> int:
         return max(1, min(int(requested or 1), len(list(self.services.get(pool_name, []))) or 1))
@@ -663,6 +1037,7 @@ class RoundRunner:
         for idx, outcome in enumerate(outcomes):
             task_id = f"analysis:{mode}:{round_id}:{idx}"
             task = self.services["analysis_task"]
+            classifier_truth_surface = _episode_classifier_payload(outcome)
             ref = task.options(num_cpus=self.config.ray.worker_cpus).remote(
                 outcome.episode,
                 analysis_mode,
@@ -671,6 +1046,7 @@ class RoundRunner:
                 getattr(self.config, "hypothesis_generation", None),
                 self.services.get("llm_reasoner_adapter"),
                 self.services["hypothesis_registry"].snapshot(),
+                classifier_truth_surface,
             )
             self.task_registry.put(task_id, ref)
             submitted.append((task_id, ref))
@@ -883,7 +1259,21 @@ class RoundRunner:
             )
         blackboard_state = self.snapshot_registry.get(latest_blackboard.snapshot_handle).state
         memory_state = self.snapshot_registry.get(latest_memory.snapshot_handle).state
-        memory_state = {**dict(memory_state or {}), "subgoal_chain_state": self._ensure_chain_manager().snapshot()}
+        incoming_mode_persistence = dict(dict(dict(memory_state or {}).get("working_memory", {}) or {}).get("plan_memory", {}) or {}).get("mode_persistence", {})
+        prior_committed_mode = self.last_planning_mode_committed
+        prior_committed_mode_source = "round_runner.last_planning_mode_committed"
+        if prior_committed_mode in {"", None}:
+            prior_committed_mode = dict(incoming_mode_persistence or {}).get("last_planning_mode_committed")
+            prior_committed_mode_source = "working_memory.plan_memory.mode_persistence.last_planning_mode_committed"
+        if int(round_id) <= 1:
+            prior_committed_mode = None
+            prior_committed_mode_source = "initial_round"
+        memory_state = _inject_mode_persistence(memory_state, incoming_mode_persistence)
+        memory_state = {
+            **dict(memory_state or {}),
+            "subgoal_chain_state": self._ensure_chain_manager().snapshot(),
+            "previous_planning_mode_committed_for_trace": prior_committed_mode,
+        }
         hypothesis_registry_snapshot = dict(hypothesis_registry_snapshot or self.services["hypothesis_registry"].snapshot())
         deterministic_hypotheses = dict(hypothesis_registry_snapshot.get("deterministic_proposals", {}))
         llm_hypotheses = dict(hypothesis_registry_snapshot.get("llm_proposals", {}))
@@ -891,6 +1281,13 @@ class RoundRunner:
         probe_context = self.planning_context_builder(round_id=round_id, pass_id=0, blackboard_snapshot=latest_blackboard, memory_snapshot=latest_memory)
         probe_decision_ref = self.submit(self.services["planner"], "decide", probe_context, blackboard_state, memory_state, [], latest_mechanic_graph.state, deterministic_hypotheses, llm_hypotheses, hypothesis_registry_snapshot, task_id=f"planner:probe:{round_id}")
         probe_decision = self.resolve(f"planner:probe:{round_id}", probe_decision_ref)
+        probe_final_mode_payload = _build_final_mode_payload(
+            round_id=round_id,
+            decision=probe_decision,
+            prior_committed_mode=prior_committed_mode,
+            prior_committed_mode_source=prior_committed_mode_source,
+        )
+        probe_decision = _apply_final_mode_payload(probe_decision, probe_final_mode_payload)
         if self.session_ledger is not None:
             self.session_ledger.append_probe_plan_selected(
                 round_id=round_id,
@@ -899,12 +1296,29 @@ class RoundRunner:
                 memory_version=probe_context.memory_version,
                 plan_context_id=probe_context.plan_context_id,
                 decision_id=str(getattr(probe_decision, "selected_candidate_id", None) or f"probe-plan:{round_id}"),
+                    final_mode_payload=probe_final_mode_payload,
                     payload=PlanSelectedPayload(
                         selected_candidate_id=getattr(probe_decision, "selected_candidate_id", None),
                         selected_candidate_count=len(list(getattr(probe_decision, "ranked_candidates", ()) or [])),
                         planner_contract_mode=str(dict(dict(getattr(probe_decision, "metadata", {}) or {}).get("planner_trace", {}) or {}).get("planning_pipeline_contract_mode") or "split_world_native_partial"),
                         strict_blackboard_snapshot_ref=self._strict_blackboard_snapshot_ref(latest_blackboard),
                         strict_memory_snapshot_ref=self._strict_memory_snapshot_ref(latest_memory),
+                        planning_mode=str(dict(dict(getattr(probe_decision, "metadata", {}) or {}).get("planner_trace", {}) or {}).get("planning_mode") or "default_progress"),
+                        previous_planning_mode=str(probe_final_mode_payload.get("previous_planning_mode") or ""),
+                        planning_mode_before_hysteresis=str(probe_final_mode_payload.get("planning_mode_before_hysteresis") or ""),
+                        planning_mode_after_hysteresis=str(probe_final_mode_payload.get("planning_mode_after_hysteresis") or ""),
+                        planning_mode_committed=str(probe_final_mode_payload.get("planning_mode_committed") or "default_progress"),
+                        structure_acquisition_score=float(dict(dict(getattr(probe_decision, "metadata", {}) or {}).get("planner_trace", {}) or {}).get("structure_acquisition_score", 0.0) or 0.0),
+                        default_progress_score=float(dict(dict(getattr(probe_decision, "metadata", {}) or {}).get("planner_trace", {}) or {}).get("default_progress_score", 0.0) or 0.0),
+                        mode_switch_applied=bool(dict(dict(getattr(probe_decision, "metadata", {}) or {}).get("planner_trace", {}) or {}).get("mode_switch_applied", False)),
+                        mode_switch_reason=str(dict(dict(getattr(probe_decision, "metadata", {}) or {}).get("planner_trace", {}) or {}).get("mode_switch_reason") or ""),
+                        mode_persistence_hysteresis_applied=bool(dict(dict(getattr(probe_decision, "metadata", {}) or {}).get("planner_trace", {}) or {}).get("mode_persistence_hysteresis_applied", False)),
+                        mode_switch_block_reason=str(dict(dict(getattr(probe_decision, "metadata", {}) or {}).get("planner_trace", {}) or {}).get("mode_switch_block_reason") or ""),
+                        payload_correction_applied=bool(probe_final_mode_payload.get("payload_correction_applied", False)),
+                        payload_correction_reason=str(probe_final_mode_payload.get("payload_correction_reason") or ""),
+                        prior_committed_mode_loaded=probe_final_mode_payload.get("prior_committed_mode_loaded"),
+                        prior_committed_mode_source=str(probe_final_mode_payload.get("prior_committed_mode_source") or ""),
+                        final_mode_payload_built=bool(probe_final_mode_payload.get("final_mode_payload_built", False)),
                         exit_readiness_score=float(dict(dict(getattr(probe_decision, "metadata", {}) or {}).get("planner_trace", {}) or {}).get("selected_exit_readiness_score", 0.0) or 0.0),
                         missing_prerequisites=tuple(str(value) for value in list(dict(dict(getattr(probe_decision, "metadata", {}) or {}).get("planner_trace", {}) or {}).get("selected_missing_prerequisites", []) or []) if value),
                         premature_exit_penalty_applied=bool(dict(dict(getattr(probe_decision, "metadata", {}) or {}).get("planner_trace", {}) or {}).get("selected_candidate_blocked_by_low_exit_readiness", False)),
@@ -919,8 +1333,12 @@ class RoundRunner:
             mode="probe",
             round_id=round_id,
         )
+        probe_ledger_classifier_null_count = 0
         if self.session_ledger is not None:
             for idx, outcome in enumerate(probe_outcomes):
+                classifier_payload = _episode_classifier_payload(outcome)
+                if any(value is not None for value in classifier_payload.values()) and any(value is None for value in classifier_payload.values()):
+                    probe_ledger_classifier_null_count += 1
                 self.session_ledger.append_probe_episode_executed(
                     round_id=round_id,
                     pass_id=0,
@@ -944,6 +1362,7 @@ class RoundRunner:
                         missing_prerequisites=tuple(str(value) for value in list(dict(getattr(outcome, "outcome", {}) or {}).get("missing_prerequisites", []) or []) if value),
                         failed_without_new_support=bool(dict(getattr(outcome, "outcome", {}) or {}).get("exit_attempt_failed_without_new_support", False)),
                         position_hold_detected=bool(dict(getattr(outcome, "outcome", {}) or {}).get("position_hold_detected", False)),
+                        **classifier_payload,
                     ),
                 )
         if first_observation is None and probe_outcomes:
@@ -1042,12 +1461,14 @@ class RoundRunner:
         probe_winner_idx = self._choose_trial_winner(decisions=probe_decisions, outcomes=probe_outcomes, analyses=probe_analyses)
         probe_outcome = probe_outcomes[probe_winner_idx]
 
+        probe_analysis_deltas = [delta.__dict__ for analysis in probe_analyses for delta in analysis.blackboard_deltas]
+        probe_exit_attempt_rows_present_in_analysis_delta_count = _count_exit_attempt_family_rows(probe_analysis_deltas)
         bb_probe_ref = self.submit(
             self.services["blackboard"],
             "merge",
             round_id=round_id,
             pass_id=0,
-            deltas=[delta.__dict__ for analysis in probe_analyses for delta in analysis.blackboard_deltas],
+            deltas=probe_analysis_deltas,
             task_id=f"blackboard:probe:{round_id}",
         )
         latest_blackboard = self.resolve(f"blackboard:probe:{round_id}", bb_probe_ref)
@@ -1175,7 +1596,12 @@ class RoundRunner:
 
         blackboard_state = self.snapshot_registry.get(latest_blackboard.snapshot_handle).state
         memory_state = self.snapshot_registry.get(latest_memory.snapshot_handle).state
-        memory_state = {**dict(memory_state or {}), "subgoal_chain_state": self._ensure_chain_manager().snapshot()}
+        memory_state = _inject_mode_persistence(memory_state, incoming_mode_persistence)
+        memory_state = {
+            **dict(memory_state or {}),
+            "subgoal_chain_state": self._ensure_chain_manager().snapshot(),
+            "previous_planning_mode_committed_for_trace": prior_committed_mode,
+        }
         deterministic_hypotheses = dict(hypothesis_registry_snapshot.get("deterministic_proposals", {}))
         llm_hypotheses = dict(hypothesis_registry_snapshot.get("llm_proposals", {}))
         use_helpers = bool(self.config.feature_flags.enable_helper_workers)
@@ -1193,6 +1619,20 @@ class RoundRunner:
         else:
             final_decision_ref = self.submit(self.services["planner"], "decide", plan_context, blackboard_state, memory_state, [], latest_mechanic_graph.state, deterministic_hypotheses, llm_hypotheses, hypothesis_registry_snapshot, task_id=f"planner:final:{round_id}")
             decision = self.resolve(f"planner:final:{round_id}", final_decision_ref)
+        final_mode_payload = _build_final_mode_payload(
+            round_id=round_id,
+            decision=decision,
+            prior_committed_mode=prior_committed_mode,
+            prior_committed_mode_source=prior_committed_mode_source,
+        )
+        decision = _apply_final_mode_payload(decision, final_mode_payload)
+        decision, chain_runtime_materialization = self._materialize_selected_chain_runtime(
+            decision=decision,
+            round_id=round_id,
+            blackboard_version=plan_context.blackboard_version,
+            memory_version=plan_context.memory_version,
+            plan_context_id=plan_context.plan_context_id,
+        )
         if self.session_ledger is not None:
             self.session_ledger.append_directed_plan_selected(
                 round_id=round_id,
@@ -1201,24 +1641,34 @@ class RoundRunner:
                 memory_version=plan_context.memory_version,
                 plan_context_id=plan_context.plan_context_id,
                 decision_id=str(getattr(decision, "selected_candidate_id", None) or f"directed-plan:{round_id}"),
+                    final_mode_payload=final_mode_payload,
                     payload=PlanSelectedPayload(
                         selected_candidate_id=getattr(decision, "selected_candidate_id", None),
                         selected_candidate_count=len(list(getattr(decision, "ranked_candidates", ()) or [])),
                         planner_contract_mode=str(dict(dict(getattr(decision, "metadata", {}) or {}).get("planner_trace", {}) or {}).get("planning_pipeline_contract_mode") or "split_world_native_partial"),
                         strict_blackboard_snapshot_ref=self._strict_blackboard_snapshot_ref(latest_blackboard),
                         strict_memory_snapshot_ref=self._strict_memory_snapshot_ref(latest_memory),
+                        planning_mode=str(dict(dict(getattr(decision, "metadata", {}) or {}).get("planner_trace", {}) or {}).get("planning_mode") or "default_progress"),
+                        previous_planning_mode=str(final_mode_payload.get("previous_planning_mode") or ""),
+                        planning_mode_before_hysteresis=str(final_mode_payload.get("planning_mode_before_hysteresis") or ""),
+                        planning_mode_after_hysteresis=str(final_mode_payload.get("planning_mode_after_hysteresis") or ""),
+                        planning_mode_committed=str(final_mode_payload.get("planning_mode_committed") or "default_progress"),
+                        structure_acquisition_score=float(dict(dict(getattr(decision, "metadata", {}) or {}).get("planner_trace", {}) or {}).get("structure_acquisition_score", 0.0) or 0.0),
+                        default_progress_score=float(dict(dict(getattr(decision, "metadata", {}) or {}).get("planner_trace", {}) or {}).get("default_progress_score", 0.0) or 0.0),
+                        mode_switch_applied=bool(dict(dict(getattr(decision, "metadata", {}) or {}).get("planner_trace", {}) or {}).get("mode_switch_applied", False)),
+                        mode_switch_reason=str(dict(dict(getattr(decision, "metadata", {}) or {}).get("planner_trace", {}) or {}).get("mode_switch_reason") or ""),
+                        mode_persistence_hysteresis_applied=bool(dict(dict(getattr(decision, "metadata", {}) or {}).get("planner_trace", {}) or {}).get("mode_persistence_hysteresis_applied", False)),
+                        mode_switch_block_reason=str(dict(dict(getattr(decision, "metadata", {}) or {}).get("planner_trace", {}) or {}).get("mode_switch_block_reason") or ""),
+                        payload_correction_applied=bool(final_mode_payload.get("payload_correction_applied", False)),
+                        payload_correction_reason=str(final_mode_payload.get("payload_correction_reason") or ""),
+                        prior_committed_mode_loaded=final_mode_payload.get("prior_committed_mode_loaded"),
+                        prior_committed_mode_source=str(final_mode_payload.get("prior_committed_mode_source") or ""),
+                        final_mode_payload_built=bool(final_mode_payload.get("final_mode_payload_built", False)),
                         exit_readiness_score=float(dict(dict(getattr(decision, "metadata", {}) or {}).get("planner_trace", {}) or {}).get("selected_exit_readiness_score", 0.0) or 0.0),
                         missing_prerequisites=tuple(str(value) for value in list(dict(dict(getattr(decision, "metadata", {}) or {}).get("planner_trace", {}) or {}).get("selected_missing_prerequisites", []) or []) if value),
                         premature_exit_penalty_applied=bool(dict(dict(getattr(decision, "metadata", {}) or {}).get("planner_trace", {}) or {}).get("selected_candidate_blocked_by_low_exit_readiness", False)),
                     ),
             )
-        self._maybe_start_chain(
-            decision=decision,
-            round_id=round_id,
-            blackboard_version=plan_context.blackboard_version,
-            memory_version=plan_context.memory_version,
-            plan_context_id=plan_context.plan_context_id,
-        )
 
         directed_trial_count = self._parallelism("env_workers", getattr(self.config.planning, "directed_trial_count", 1))
         directed_candidates = self._trial_candidates(decision, branch_count=directed_trial_count)
@@ -1229,8 +1679,12 @@ class RoundRunner:
             mode="directed",
             round_id=round_id,
         )
+        directed_ledger_classifier_null_count = 0
         if self.session_ledger is not None:
             for idx, outcome in enumerate(directed_outcomes):
+                classifier_payload = _episode_classifier_payload(outcome)
+                if any(value is not None for value in classifier_payload.values()) and any(value is None for value in classifier_payload.values()):
+                    directed_ledger_classifier_null_count += 1
                 self.session_ledger.append_directed_episode_executed(
                     round_id=round_id,
                     pass_id=1,
@@ -1254,6 +1708,7 @@ class RoundRunner:
                         missing_prerequisites=tuple(str(value) for value in list(dict(getattr(outcome, "outcome", {}) or {}).get("missing_prerequisites", []) or []) if value),
                         failed_without_new_support=bool(dict(getattr(outcome, "outcome", {}) or {}).get("exit_attempt_failed_without_new_support", False)),
                         position_hold_detected=bool(dict(getattr(outcome, "outcome", {}) or {}).get("position_hold_detected", False)),
+                        **classifier_payload,
                     ),
                 )
         directed_analyses = self._submit_analysis_batch(outcomes=directed_outcomes, round_id=round_id, mode="directed_outcome", blackboard_snapshot=latest_blackboard, mechanic_graph_snapshot=latest_mechanic_graph)
@@ -1346,7 +1801,7 @@ class RoundRunner:
         decision = directed_decisions[directed_winner_idx]
         exec_outcome = directed_outcomes[directed_winner_idx]
         directed_analysis = directed_analyses[directed_winner_idx]
-        self._update_chain_from_outcome(
+        chain_outcome_update = self._update_chain_from_outcome(
             round_id=round_id,
             pass_id=1,
             plan_context_id=plan_context.plan_context_id,
@@ -1362,12 +1817,14 @@ class RoundRunner:
             selected_target_entity_id = selected_candidate.get("target_entity_id") or selected_candidate.get("target")
         round_progress += float(exec_outcome.outcome.get("progress", 0.0))
 
+        directed_analysis_deltas = [delta.__dict__ for analysis in directed_analyses for delta in analysis.blackboard_deltas]
+        directed_exit_attempt_rows_present_in_analysis_delta_count = _count_exit_attempt_family_rows(directed_analysis_deltas)
         bb_directed_ref = self.submit(
             self.services["blackboard"],
             "merge",
             round_id=round_id,
             pass_id=1,
-            deltas=[delta.__dict__ for analysis in directed_analyses for delta in analysis.blackboard_deltas],
+            deltas=directed_analysis_deltas,
             task_id=f"blackboard:directed:{round_id}",
         )
         latest_blackboard = self.resolve(f"blackboard:directed:{round_id}", bb_directed_ref)
@@ -1472,7 +1929,18 @@ class RoundRunner:
             hypothesis_registry_snapshot=hypothesis_registry_snapshot,
             round_id=round_id,
             selected_subgoal_chain=active_chain_snapshot or None,
+            chain_outcome_update=chain_outcome_update,
+            selected_outcome=dict(getattr(exec_outcome, "outcome", {}) or {}),
         )
+        mode_persistence_state = _update_mode_persistence_state(
+            latest_memory=latest_memory,
+            decision=decision,
+            round_id=round_id,
+            mg_counts=dict(mg_directed_result.get("counts", {}) or {}),
+            selected_outcome=dict(getattr(exec_outcome, "outcome", {}) or {}),
+            prior_mode_state=incoming_mode_persistence,
+        )
+        self.last_planning_mode_committed = str(final_mode_payload.get("planning_mode_committed") or "")
         directed_durable_status = self.call(self.services["memory"], "get_pending_durable_status")
         if self.session_ledger is not None:
             self.session_ledger.append_directed_memory_reconcile_completed(
@@ -1554,13 +2022,48 @@ class RoundRunner:
             target_entity_id=selected_target_entity_id,
             effect_payload=effect_payload,
         )
+        live_bridge_rows = build_live_candidate_bridge_rows(decision_export, round_id=round_id)
+        registry_promotion_input = {
+            str(row.get("stable_id") or ""): dict(row)
+            for row in live_bridge_rows
+            if str(row.get("stable_id") or "")
+        }
+        live_bridge_diagnostics = {
+            "live_bridge_row_count": len(live_bridge_rows),
+            "live_bridge_usable_row_count": sum(1 for row in live_bridge_rows if bool(row.get("planner_usable", False))),
+            "live_bridge_durable_row_count": sum(1 for row in live_bridge_rows if bool(row.get("durable_ready", False))),
+            "registry_promotion_input_row_count": len(registry_promotion_input),
+            "registry_promotion_input_usable_row_count": sum(1 for row in registry_promotion_input.values() if bool(row.get("planner_usable", False))),
+            "registry_promotion_input_durable_row_count": sum(1 for row in registry_promotion_input.values() if bool(row.get("durable_ready", False))),
+            "live_bridge_rows_missing_registry_input_count": max(0, len(live_bridge_rows) - len(registry_promotion_input)),
+        }
+        promotion_result = {}
+        if registry_promotion_input:
+            promotion_result = self.services["hypothesis_registry"].promote_target_usability(
+                target_rows=registry_promotion_input,
+                round_id=round_id,
+            )
+            hypothesis_registry_snapshot = self.services["hypothesis_registry"].snapshot()
         self.call(self.services["storage"], "persist", session_id=self.context.session_id, round_id=round_id, kind="report", name=f"decision_round{round_id:03d}.json", payload=decision_export)
         analysis_summary = build_round_analysis_summary(
             round_id=round_id,
             analyzed_episodes=[*probe_analyses, *directed_analyses],
             candidate_effect_mode_used=actual_mode,
         )
+        selected_outcome_payload = dict(getattr(exec_outcome, "outcome", {}) or {})
+        selected_ledger_classifier = _episode_classifier_payload(exec_outcome)
+        analysis_summary["executed_episode_ledger_classifier_diagnostics"] = {
+            "outcome_has_classifier_fields": any(value is not None for value in selected_ledger_classifier.values()),
+            "ledger_classifier_null_despite_outcome_count": int(probe_ledger_classifier_null_count + directed_ledger_classifier_null_count),
+        }
         analysis_summary = _sync_analysis_poi_debug_with_observed_store(analysis_summary, latest_blackboard.state)
+        analysis_summary["live_bridge_diagnostics"] = {**live_bridge_diagnostics, **dict(promotion_result or {})}
+        analysis_summary["family_handoff_diagnostics"] = {
+            "exit_attempt_rows_present_in_analysis_delta_count": int(locals().get("probe_exit_attempt_rows_present_in_analysis_delta_count", 0) or 0)
+            + int(locals().get("directed_exit_attempt_rows_present_in_analysis_delta_count", 0) or 0),
+            "exit_attempt_rows_present_in_merge_request_count": int(locals().get("probe_exit_attempt_rows_present_in_analysis_delta_count", 0) or 0)
+            + int(locals().get("directed_exit_attempt_rows_present_in_analysis_delta_count", 0) or 0),
+        }
         round_effect_payload = _round_effect_payload(analysis_summary, actual_mode)
         if selected_target_entity_id:
             state = getattr(latest_blackboard, "state", None)
@@ -1593,6 +2096,8 @@ class RoundRunner:
             "round_id": int(round_id),
             "decision": decision_export,
             "outcome": exec_outcome.__dict__,
+            "selected_outcome": dict(getattr(exec_outcome, "outcome", {}) or {}),
+            "family_handoff_diagnostics": dict(analysis_summary.get("family_handoff_diagnostics", {}) or {}),
             "pre_memory_version": plan_context.memory_version,
             "post_memory_version": latest_memory.memory_version,
             "mechanic_graph_version": latest_mechanic_graph.mechanic_graph_version,
@@ -1602,7 +2107,23 @@ class RoundRunner:
             "mechanic_graph_snapshot_path": mechanic_graph_snapshot_path,
             "hypothesis_registry_snapshot": hypothesis_registry_snapshot,
             "analysis_summary": analysis_summary,
+            "live_bridge_rows": [dict(row) for row in live_bridge_rows],
+            "live_bridge_diagnostics": dict(analysis_summary.get("live_bridge_diagnostics", {}) or {}),
+            "mode_persistence_state": mode_persistence_state,
+            "runtime_subgoal_chain_state": dict(chain_runtime_materialization.get("runtime_subgoal_chain_state", {}) or {}),
+            "runtime_subgoal_chain_state_after_outcome": dict(chain_outcome_update.get("runtime_subgoal_chain_state_after_outcome", {}) or {}),
+            "runtime_chain_rows": [dict(row) for row in list(chain_runtime_materialization.get("runtime_chain_rows", []) or [])] + [dict(row) for row in list(chain_outcome_update.get("runtime_chain_rows", []) or [])],
+            "runtime_chain_event_count": len([dict(row) for row in list(chain_runtime_materialization.get("runtime_chain_rows", []) or [])] + [dict(row) for row in list(chain_outcome_update.get("runtime_chain_rows", []) or [])]),
+            "runtime_chain_step_event_count": int(chain_runtime_materialization.get("runtime_step_event_count", 0) or 0) + int(chain_outcome_update.get("runtime_step_event_count", 0) or 0),
         }
+        selected_chain = dict(dict(decision_export.get("metadata", {}) or {}).get("selected_subgoal_chain", {}) or {})
+        selected_step = dict(dict(decision_export.get("metadata", {}) or {}).get("selected_subgoal_step", {}) or {})
+        if selected_chain and int(round_record.get("runtime_chain_event_count", 0) or 0) <= 0:
+            raise AssertionError("selected chain present in decision => no runtime chain row exists in this round")
+        if selected_step and int(round_record.get("runtime_chain_step_event_count", 0) or 0) <= 0:
+            raise AssertionError("selected step present in decision => no runtime chain step row exists in this round")
+        if selected_step and dict(getattr(exec_outcome, "outcome", {}) or {}).get("step_kind") and not bool(chain_outcome_update.get("runtime_progress_updated", False)):
+            raise AssertionError("executor outcome finished selected step without same-round runtime chain progress update")
         self.call(self.services["storage"], "persist", session_id=self.context.session_id, round_id=round_id, kind="report", name="analysis_summary.json", payload=analysis_summary)
         self.export_round_debug_heatmaps(
             round_id=round_id,

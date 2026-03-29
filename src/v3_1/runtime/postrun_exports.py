@@ -227,6 +227,61 @@ def _memory_telemetry(state: dict) -> dict:
     return dict(telemetry) if isinstance(telemetry, dict) else {}
 
 
+def _selected_candidate_path_diagnostics(round_records: list[dict]) -> list[dict]:
+    rows: list[dict] = []
+    for record in list(round_records or []):
+        decision = dict(record.get("decision", {}) or {})
+        selected = dict(dict(decision.get("metadata", {}) or {}).get("selected_candidate", {}) or {})
+        if not selected:
+            continue
+        objective_type = str(selected.get("objective_type") or "")
+        candidate_class = str(selected.get("candidate_class") or "")
+        outcome = dict(record.get("selected_outcome", {}) or {})
+        rows.append(
+            {
+                "round_id": int(record.get("round_id", 0) or 0),
+                "candidate_id": str(selected.get("candidate_id") or ""),
+                "candidate_class": candidate_class,
+                "objective_type": objective_type,
+                "expected_effect_metadata_present": bool(outcome.get("expected_effect_type") or outcome.get("expected_effect_relation") or outcome.get("expected_target_id")),
+                "expectation_basis_present": bool(outcome.get("counterfactual_expectation_basis_present")),
+                "expected_effect_type": outcome.get("expected_effect_type"),
+                "expected_relation_type": outcome.get("expected_relation_type"),
+                "expected_target_kind": outcome.get("counterfactual_expected_target_kind"),
+                "expected_target_value": outcome.get("counterfactual_expected_target_value"),
+                "attempt_context_present": bool(outcome.get("counterfactual_attempt_context_present")),
+                "post_attempt_window_present": int(outcome.get("counterfactual_post_attempt_window_steps", 0) or 0) > 0,
+                "matched_expected_effect": bool(outcome.get("counterfactual_matched_expected_effect")),
+                "observed_effect_candidate_count": int(outcome.get("counterfactual_observed_effect_candidate_count", 0) or 0),
+                "matching_effect_candidate_count": int(outcome.get("counterfactual_matching_effect_candidate_count", 0) or 0),
+                "match_reason_code": str(outcome.get("counterfactual_match_reason_code") or ""),
+                "non_effect_confirmed": bool(outcome.get("counterfactual_non_effect_confirmed")),
+                "counterfactual_classifier_fired": bool(outcome.get("counterfactual_evidence_observed")),
+                "boundary_or_portal_telemetry_present": bool(
+                    outcome.get("attempted_boundary_contact")
+                    or outcome.get("attempted_portal_contact")
+                    or outcome.get("attempted_terminal_affordance_contact")
+                    or outcome.get("attempted_escape_direction")
+                ),
+                "exit_attempt_classifier_fired": bool(outcome.get("exit_attempt_evidence_observed")),
+            }
+        )
+    return rows
+
+
+def _ledger_episode_payloads_by_round(ledger_records: list) -> dict[int, dict]:
+    by_round: dict[int, dict] = {}
+    for record in ledger_records:
+        event_type = str(getattr(record, "event_type", "") or "")
+        if event_type not in {"probe episode executed", "directed episode executed"}:
+            continue
+        round_id = int(getattr(record, "round_id", 0) or 0)
+        payload = dict(getattr(record, "payload", {}) or {})
+        if event_type == "directed episode executed" or round_id not in by_round:
+            by_round[round_id] = payload
+    return by_round
+
+
 def _collect_direct_memory_telemetry(round_records: list[dict]) -> tuple[list[dict], list[dict]]:
     events: list[dict] = []
     outcomes: list[dict] = []
@@ -912,6 +967,8 @@ def persist_postrun_outputs(
     probe_escalation_summary_payload: dict | None = None,
     exit_readiness_summary_payload: dict | None = None,
     premature_exit_attempts_payload: dict | None = None,
+    planning_mode_timeline_payload: dict | None = None,
+    planning_mode_switches_payload: dict | None = None,
     graph_edge_quality_summary: dict | None = None,
     identity_stability_summary: dict | None = None,
     planner_usable_vs_durable_summary: dict | None = None,
@@ -1002,6 +1059,10 @@ def persist_postrun_outputs(
         exports["exit_readiness_summary_path"] = _persist_session(storage_agent, session_id=session_id, kind="report", name="exit_readiness_summary.json", payload=exit_readiness_summary_payload)
     if premature_exit_attempts_payload is not None:
         exports["premature_exit_attempts_path"] = _persist_session(storage_agent, session_id=session_id, kind="report", name="premature_exit_attempts.json", payload=premature_exit_attempts_payload)
+    if planning_mode_timeline_payload is not None:
+        exports["planning_mode_timeline_path"] = _persist_session(storage_agent, session_id=session_id, kind="report", name="planning_mode_timeline.json", payload=planning_mode_timeline_payload)
+    if planning_mode_switches_payload is not None:
+        exports["planning_mode_switches_path"] = _persist_session(storage_agent, session_id=session_id, kind="report", name="planning_mode_switches.json", payload=planning_mode_switches_payload)
     if graph_edge_quality_summary is not None:
         exports["graph_edge_quality_summary_path"] = _persist_session(storage_agent, session_id=session_id, kind="report", name="graph_edge_quality_summary.json", payload=graph_edge_quality_summary)
     if identity_stability_summary is not None:
@@ -1243,7 +1304,7 @@ def export_postrun(storage_agent, *, session_id: str, round_id: int, game_id: st
             "llm_hypothesis": sum(1 for row in llm_proposals.values() if list(dict(row.get("metadata", {}) or {}).get("experiment_contradicts_hypothesis_ids", []) or [])),
         },
     }
-    chain_event_payloads = [
+    ledger_chain_event_payloads = [
         {
             "event_type": str(getattr(record, "event_type", "")),
             "payload": dict(getattr(record, "payload", {}) or {}),
@@ -1252,10 +1313,54 @@ def export_postrun(storage_agent, *, session_id: str, round_id: int, game_id: st
         for record in ledger_records
         if str(getattr(record, "event_type", "")).startswith("subgoal chain ")
     ]
+    runtime_chain_event_payloads = [
+        {
+            "event_type": str(dict(row).get("event_type") or ""),
+            "payload": dict(dict(row).get("payload", {}) or {}),
+            "round_id": int(dict(row).get("round_id", record.get("round_id", 0)) or 0),
+        }
+        for record in list(round_records or [])
+        for row in list(record.get("runtime_chain_rows", []) or [])
+        if str(dict(row).get("event_type") or "").startswith("subgoal chain ")
+    ]
+    chain_event_payloads = runtime_chain_event_payloads or ledger_chain_event_payloads
     chain_started = [row for row in chain_event_payloads if row["event_type"] == "subgoal chain started"]
     chain_completed = [row for row in chain_event_payloads if row["event_type"] == "subgoal chain completed"]
-    chain_aborted = [row for row in chain_event_payloads if row["event_type"] == "subgoal chain aborted"]
-    chain_step_rows = [row for row in chain_event_payloads if row["event_type"] in {"subgoal chain step completed", "subgoal chain step failed", "subgoal chain advanced"}]
+    chain_aborted = [row for row in chain_event_payloads if row["event_type"] in {"subgoal chain aborted", "subgoal chain abandoned"}]
+    chain_step_rows = [row for row in chain_event_payloads if row["event_type"] in {"subgoal chain step activated", "subgoal chain step progressed", "subgoal chain step completed", "subgoal chain step failed", "subgoal chain advanced"}]
+    decision_selected_chain_without_runtime_start_count = 0
+    decision_selected_step_without_runtime_step_event_count = 0
+    runtime_chain_event_without_decision_selection_count = 0
+    prior_selected_chain_id = None
+    for record in list(round_records or []):
+        decision_metadata = dict(dict(record.get("decision", {}) or {}).get("metadata", {}) or {})
+        selected_chain = dict(decision_metadata.get("selected_subgoal_chain", {}) or {})
+        selected_step = dict(decision_metadata.get("selected_subgoal_step", {}) or {})
+        runtime_rows = [dict(row) for row in list(record.get("runtime_chain_rows", []) or [])]
+        selected_chain_id = str(selected_chain.get("chain_id") or "")
+        chain_continues_from_prior_round = bool(selected_chain_id and selected_chain_id == prior_selected_chain_id)
+        if selected_chain and not chain_continues_from_prior_round and not any(str(row.get("event_type") or "") == "subgoal chain started" for row in runtime_rows):
+            decision_selected_chain_without_runtime_start_count += 1
+        if selected_step and not any(str(row.get("event_type") or "") in {"subgoal chain step activated", "subgoal chain step progressed", "subgoal chain step completed", "subgoal chain step failed"} for row in runtime_rows):
+            decision_selected_step_without_runtime_step_event_count += 1
+        if runtime_rows and not selected_chain:
+            runtime_chain_event_without_decision_selection_count += 1
+        prior_selected_chain_id = selected_chain_id or prior_selected_chain_id
+    selected_chain_round_count = sum(
+        1
+        for record in list(round_records or [])
+        if dict(dict(record.get("decision", {}) or {}).get("metadata", {}) or {}).get("selected_subgoal_chain")
+    )
+    selected_step_round_count = sum(
+        1
+        for record in list(round_records or [])
+        if dict(dict(record.get("decision", {}) or {}).get("metadata", {}) or {}).get("selected_subgoal_step")
+    )
+    runtime_progression_round_count = sum(
+        1
+        for record in list(round_records or [])
+        if any(str(dict(row).get("event_type") or "") in {"subgoal chain step progressed", "subgoal chain advanced", "subgoal chain completed", "subgoal chain abandoned"} for row in list(record.get("runtime_chain_rows", []) or []))
+    )
     subgoal_chains_payload = {
         "first_chain_selected_per_round": {
             str(row["round_id"]): dict(row["payload"])
@@ -1268,6 +1373,12 @@ def export_postrun(storage_agent, *, session_id: str, round_id: int, game_id: st
             f"{dict(row['payload']).get('step_kind') or 'unknown'}"
             for row in chain_completed
         )),
+        "selected_chain_materialization_rate": _safe_rate(selected_chain_round_count - decision_selected_chain_without_runtime_start_count, max(1, selected_chain_round_count)),
+        "selected_step_materialization_rate": _safe_rate(selected_step_round_count - decision_selected_step_without_runtime_step_event_count, max(1, selected_step_round_count)),
+        "runtime_chain_progression_rate": _safe_rate(runtime_progression_round_count, max(1, selected_chain_round_count)),
+        "decision_selected_chain_without_runtime_start_count": int(decision_selected_chain_without_runtime_start_count),
+        "decision_selected_step_without_runtime_step_event_count": int(decision_selected_step_without_runtime_step_event_count),
+        "runtime_chain_event_without_decision_selection_count": int(runtime_chain_event_without_decision_selection_count),
         "events": chain_event_payloads,
     }
     subgoal_chain_steps_payload = {"steps": chain_step_rows}
@@ -1345,7 +1456,7 @@ def export_postrun(storage_agent, *, session_id: str, round_id: int, game_id: st
         "stale_dead_end_count": sum(1 for row in poi_escalation_events if row["event_type"] == "detector poi marked stale"),
     }
     selected_rows = [
-        dict(dict(record.get("decision_export", {}) or {}).get("metadata", {}).get("selected_candidate", {}) or {})
+        dict(dict(record.get("decision", {}) or {}).get("metadata", {}).get("selected_candidate", {}) or {})
         for record in list(round_records or [])
     ]
     selected_rows = [row for row in selected_rows if row]
@@ -1355,14 +1466,14 @@ def export_postrun(storage_agent, *, session_id: str, round_id: int, game_id: st
         "rows": [
             {
                 "round_id": int(record.get("round_id", 0) or 0),
-                "candidate_id": str(dict(dict(record.get("decision_export", {}) or {}).get("metadata", {}).get("selected_candidate", {}) or {}).get("candidate_id") or ""),
-                "exit_readiness_score": float(dict(record.get("selected_outcome", {}) or {}).get("exit_readiness_score", dict(dict(record.get("decision_export", {}) or {}).get("metadata", {}).get("selected_candidate", {}) or {}).get("exit_readiness_score", 0.0)) or 0.0),
-                "missing_prerequisites": list(dict(record.get("selected_outcome", {}) or {}).get("missing_prerequisites", dict(dict(record.get("decision_export", {}) or {}).get("metadata", {}).get("selected_candidate", {}) or {}).get("missing_prerequisite_types", [])) or []),
+                "candidate_id": str(dict(dict(record.get("decision", {}) or {}).get("metadata", {}).get("selected_candidate", {}) or {}).get("candidate_id") or ""),
+                "exit_readiness_score": float(dict(record.get("selected_outcome", {}) or {}).get("exit_readiness_score", dict(dict(record.get("decision", {}) or {}).get("metadata", {}).get("selected_candidate", {}) or {}).get("exit_readiness_score", 0.0)) or 0.0),
+                "missing_prerequisites": list(dict(record.get("selected_outcome", {}) or {}).get("missing_prerequisites", dict(dict(record.get("decision", {}) or {}).get("metadata", {}).get("selected_candidate", {}) or {}).get("missing_prerequisite_types", [])) or []),
                 "failed_without_new_support": bool(dict(record.get("selected_outcome", {}) or {}).get("exit_attempt_failed_without_new_support", False)),
                 "position_hold_detected": bool(dict(record.get("selected_outcome", {}) or {}).get("position_hold_detected", False)),
             }
             for record in list(round_records or [])
-            if str(dict(dict(record.get("decision_export", {}) or {}).get("metadata", {}).get("selected_candidate", {}) or {}).get("candidate_class") or "") in {"unlock_then_exit", "mechanic_chain_deterministic", "mechanic_chain_llm"}
+            if str(dict(dict(record.get("decision", {}) or {}).get("metadata", {}).get("selected_candidate", {}) or {}).get("candidate_class") or "") in {"unlock_then_exit", "mechanic_chain_deterministic", "mechanic_chain_llm"}
         ]
     }
     exit_readiness_summary_payload = {
@@ -1372,29 +1483,581 @@ def export_postrun(storage_agent, *, session_id: str, round_id: int, game_id: st
         "position_hold_failures": sum(1 for row in round_outcomes if bool(row.get("position_hold_detected", False))),
         "verification_steps_skipped_before_exit_attempt": sum(1 for row in exit_terminal_rows if list(row.get("missing_prerequisite_types", []) or [])),
     }
-    graph_edge_quality_summary = {
-        "edge_count_by_family": dict(Counter(str(row.get("edge_kind") or "unknown") for row in mechanic_edges)),
-        "repeated_support_edge_rate": _safe_rate(sum(1 for row in mechanic_edges if int(row.get("support_count", 0) or 0) >= 2), max(1, len(mechanic_edges))),
-        "contradiction_rate_by_edge_family": {
-            family: _safe_rate(sum(1 for row in mechanic_edges if str(row.get("edge_kind") or "") == family and int(row.get("contradiction_count", 0) or 0) > 0), max(1, sum(1 for row in mechanic_edges if str(row.get("edge_kind") or "") == family)))
-            for family in {str(row.get("edge_kind") or "unknown") for row in mechanic_edges}
-        },
-        "counterfactual_supported_edge_rate": _safe_rate(sum(1 for row in mechanic_edges if int(row.get("counterfactual_support_count", 0) or 0) > 0), max(1, len(mechanic_edges))),
-        "directed_outcome_supported_edge_rate": _safe_rate(sum(1 for row in mechanic_edges if int(row.get("directed_outcome_support_count", 0) or 0) > 0), max(1, len(mechanic_edges))),
-        "exit_attempt_supported_edge_rate": _safe_rate(sum(1 for row in mechanic_edges if int(row.get("exit_attempt_support_count", 0) or 0) > 0), max(1, len(mechanic_edges))),
+    planning_mode_rows = []
+    previous_mode = None
+    consecutive_by_mode: dict[str, int] = {}
+    ledger_previous_mode_by_round: dict[int, str | None] = {}
+    for record in ledger_records:
+        if str(getattr(record, "event_type", "") or "") != "directed plan selected":
+            continue
+        payload = dict(getattr(record, "payload", {}) or {})
+        ledger_previous_mode_by_round[int(getattr(record, "round_id", 0) or 0)] = payload.get("previous_planning_mode")
+    for record in ledger_records:
+        round_key = int(getattr(record, "round_id", 0) or 0)
+        if round_key in ledger_previous_mode_by_round:
+            continue
+        if str(getattr(record, "event_type", "") or "") != "probe plan selected":
+            continue
+        payload = dict(getattr(record, "payload", {}) or {})
+        ledger_previous_mode_by_round[round_key] = payload.get("previous_planning_mode")
+    for record in list(round_records or []):
+        decision_export = dict(record.get("decision", {}) or {})
+        planner_trace = dict(dict(decision_export.get("metadata", {}) or {}).get("planner_trace", {}) or {})
+        mode = str(planner_trace.get("planning_mode") or "")
+        if not mode:
+            continue
+        previous_trace_mode = str(planner_trace.get("previous_planning_mode") or "")
+        round_key = int(record.get("round_id", 0) or 0)
+        ledger_previous_mode = ledger_previous_mode_by_round.get(round_key)
+        committed_mode = str(planner_trace.get("planning_mode_committed") or mode)
+        expected_previous_mode = planning_mode_rows[-1]["planning_mode_committed"] if planning_mode_rows else None
+        corrected_previous_mode = expected_previous_mode
+        mode_trace_correction_applied = str(previous_trace_mode or "none") != str(corrected_previous_mode or "none")
+        consecutive_by_mode[committed_mode] = (consecutive_by_mode.get(committed_mode, 0) + 1) if previous_mode == committed_mode else 1
+        planning_mode_rows.append(
+            {
+                "round_id": int(record.get("round_id", 0) or 0),
+                "planning_mode": committed_mode,
+                "planning_mode_committed": committed_mode,
+                "previous_planning_mode": corrected_previous_mode,
+                "chronology_previous_mode": corrected_previous_mode,
+                "trace_previous_mode": previous_trace_mode or None,
+                "ledger_previous_mode": ledger_previous_mode,
+                "trace_previous_mode_matches_committed": str(previous_trace_mode or "none") == str(corrected_previous_mode or "none"),
+                "ledger_previous_mode_matches_committed": str(ledger_previous_mode or "none") == str(corrected_previous_mode or "none"),
+                "mode_trace_correction_applied": mode_trace_correction_applied,
+                "structure_acquisition_score": float(planner_trace.get("structure_acquisition_score", 0.0) or 0.0),
+                "default_progress_score": float(planner_trace.get("default_progress_score", 0.0) or 0.0),
+                "mode_switch_applied": bool(planner_trace.get("mode_switch_applied", False)),
+                "mode_switch_reason": str(planner_trace.get("mode_switch_reason") or ""),
+                "mode_switch_block_reason": str(planner_trace.get("mode_switch_block_reason") or ""),
+                "mode_persistence_hysteresis_applied": bool(planner_trace.get("mode_persistence_hysteresis_applied", False)),
+                "recent_structure_support_gain": float(planner_trace.get("mode_persistence_summary", {}).get("recent_structure_support_gain", 0.0) or 0.0),
+                "recent_progress_evidence_gain": float(planner_trace.get("mode_persistence_summary", {}).get("recent_progress_evidence_gain", 0.0) or 0.0),
+                "selected_candidate_class": str(dict(dict(decision_export.get("metadata", {}) or {}).get("selected_candidate", {}) or {}).get("candidate_class") or ""),
+                "selected_objective_type": str(dict(dict(decision_export.get("metadata", {}) or {}).get("selected_candidate", {}) or {}).get("objective_type") or ""),
+                "consecutive_rounds_in_mode": consecutive_by_mode[committed_mode],
+            }
+        )
+        previous_mode = committed_mode
+    planning_mode_timeline_payload = {
+        "rows": planning_mode_rows,
+        "regressions_to_default_progress": [
+            row for row in planning_mode_rows
+            if str(row.get("planning_mode") or "") == "default_progress" and str(row.get("previous_planning_mode") or "") == "structure_acquisition"
+        ],
     }
-    identity_rows = [poi for row in episodes for poi in list(row.get("pois", []) or []) if isinstance(poi, dict)]
+    planning_mode_switches_payload = {
+        "rows": [
+            row for row in planning_mode_rows
+            if bool(row.get("mode_switch_applied", False)) or str(row.get("mode_switch_block_reason") or "")
+        ],
+        "mode_by_round": {str(row["round_id"]): str(row["planning_mode"]) for row in planning_mode_rows},
+        "switch_count": sum(1 for row in planning_mode_rows if bool(row.get("mode_switch_applied", False))),
+    }
+    support_family_emit_debug = {}
+    analysis_emit_debug_with_any_family_count = 0
+    classifier_truth_surface_with_any_family_count = 0
+    classifier_true_but_emit_debug_empty_count = 0
+    classifier_true_but_emit_attempt_not_counted_count = 0
+    emit_attempt_count_without_row_emission_count = 0
+    for record in list(round_records or []):
+        debug = dict(dict(record.get("analysis_summary", {}) or {}).get("support_family_emit_debug", {}) or {})
+        families = dict(debug.get("families", {}) or {})
+        if families:
+            analysis_emit_debug_with_any_family_count += 1
+        outcome = dict(record.get("selected_outcome", {}) or {})
+        classifier_truth = bool(outcome.get("counterfactual_evidence_observed")) or bool(outcome.get("exit_attempt_evidence_observed"))
+        if classifier_truth:
+            classifier_truth_surface_with_any_family_count += 1
+        if classifier_truth and not families:
+            classifier_true_but_emit_debug_empty_count += 1
+        if bool(outcome.get("counterfactual_evidence_observed")) and not int(debug.get("counterfactual_emit_attempt_count", 0) or 0):
+            classifier_true_but_emit_attempt_not_counted_count += 1
+        if bool(outcome.get("exit_attempt_evidence_observed")) and not int(debug.get("exit_attempt_emit_attempt_count", 0) or 0):
+            classifier_true_but_emit_attempt_not_counted_count += 1
+        if (int(debug.get("counterfactual_emit_attempt_count", 0) or 0) and not bool(dict(families.get("counterfactual", {}) or {}).get("row_emitted", False))) or (int(debug.get("exit_attempt_emit_attempt_count", 0) or 0) and not bool(dict(families.get("exit_attempt", {}) or {}).get("row_emitted", False))):
+            emit_attempt_count_without_row_emission_count += 1
+        for key, value in debug.items():
+            if isinstance(value, (int, float, bool)):
+                support_family_emit_debug[key] = int(support_family_emit_debug.get(key, 0) or 0) + int(value or 0)
+    final_topology_edges = list(dict(blackboard_state.get("topology_edges", {}) or {}).values())
+    final_consequences = list(dict(blackboard_state.get("consequences", {}) or {}).values())
+    merge_support_diagnostics = dict(blackboard_state.get("merge_support_family_diagnostics", {}) or {})
+    selected_candidate_path_diagnostics = _selected_candidate_path_diagnostics(round_records)
+    selected_candidate_path_diagnostics_skipped_route_probe_rounds = sum(
+        1 for record in list(round_records or [])
+        if str(dict(dict(dict(record.get("decision", {}) or {}).get("metadata", {}) or {}).get("selected_candidate", {}) or {}).get("objective_type") or "") == "probe_route"
+    )
+    exit_attempt_rows_present_in_analysis_delta_count = sum(
+        int(dict(record.get("family_handoff_diagnostics", {}) or {}).get("exit_attempt_rows_present_in_analysis_delta_count", 0) or 0)
+        for record in list(round_records or [])
+    )
+    exit_attempt_rows_present_in_merge_request_count = sum(
+        int(dict(record.get("family_handoff_diagnostics", {}) or {}).get("exit_attempt_rows_present_in_merge_request_count", 0) or 0)
+        for record in list(round_records or [])
+    )
+    counterfactual_support_emitted_count = int(support_family_emit_debug.get("counterfactual_emit_attempt_count", 0) or 0)
+    directed_support_emitted_count = sum(1 for row in final_topology_edges if int(row.get("directed_outcome_support_count", 0) or 0) > 0)
+    exit_attempt_support_emitted_count = int(support_family_emit_debug.get("exit_attempt_emit_attempt_count", 0) or 0)
+    counterfactual_support_merged_count = sum(1 for row in final_topology_edges if int(row.get("counterfactual_support_count", 0) or 0) > 0)
+    directed_support_merged_count = sum(1 for row in final_topology_edges if int(row.get("directed_outcome_support_count", 0) or 0) > 0)
+    exit_attempt_rows_seen_at_merge_ingress = int(merge_support_diagnostics.get("exit_attempt_rows_seen_at_merge_ingress", 0) or 0)
+    exit_attempt_rows_seen_on_raw_delta = int(merge_support_diagnostics.get("exit_attempt_rows_seen_on_raw_delta", 0) or 0)
+    exit_attempt_rows_preserved_after_normalization = int(merge_support_diagnostics.get("exit_attempt_rows_seen_after_row_normalization", 0) or 0)
+    counterfactual_rows_seen_on_raw_delta = int(merge_support_diagnostics.get("counterfactual_rows_seen_on_raw_delta", 0) or 0)
+    counterfactual_rows_preserved_after_normalization = int(merge_support_diagnostics.get("counterfactual_rows_seen_after_row_normalization", 0) or 0)
+    exit_attempt_rows_written_to_split_store_count = int(
+        sum(
+            1
+            for row in (
+                [*dict(blackboard_state.get("observed_consequences", {}) or {}).values()]
+                + [*dict(blackboard_state.get("hypothesized_consequences", {}) or {}).values()]
+                + [*dict(dict(blackboard_state.get("observed_topology", {}) or {}).get("edges", {}) or {}).values()]
+                + [*dict(dict(blackboard_state.get("hypothesized_topology", {}) or {}).get("edges", {}) or {}).values()]
+            )
+            if bool(dict(row).get("supports_exit_attempt_relation", False))
+            or str(dict(row).get("support_family") or "") == "exit_attempt"
+            or int(dict(row).get("exit_attempt_support_count", 0) or 0) > 0
+        )
+    )
+    exit_attempt_rows_surviving_combined_rebuild_count = int(
+        sum(
+            1
+            for row in [*final_consequences, *final_topology_edges]
+            if bool(dict(row).get("supports_exit_attempt_relation", False))
+            or str(dict(row).get("support_family") or "") == "exit_attempt"
+            or int(dict(row).get("exit_attempt_support_count", 0) or 0) > 0
+        )
+    )
+    exit_attempt_rows_visible_in_final_export_count = int(exit_attempt_rows_surviving_combined_rebuild_count)
+    exit_attempt_support_merged_count = int(exit_attempt_rows_surviving_combined_rebuild_count)
+    graph_edge_quality_summary = {
+        "edge_count_by_family": dict(Counter(str(row.get("edge_kind") or row.get("relation_type") or "unknown") for row in final_topology_edges)),
+        "repeated_support_edge_rate": _safe_rate(sum(1 for row in final_topology_edges if int(row.get("support_count", 0) or 0) >= 2), max(1, len(final_topology_edges))),
+        "contradiction_rate_by_edge_family": {
+            family: _safe_rate(sum(1 for row in final_topology_edges if str(row.get("edge_kind") or row.get("relation_type") or "") == family and int(row.get("contradiction_count", 0) or 0) > 0), max(1, sum(1 for row in final_topology_edges if str(row.get("edge_kind") or row.get("relation_type") or "") == family)))
+            for family in {str(row.get("edge_kind") or row.get("relation_type") or "unknown") for row in final_topology_edges}
+        },
+        "counterfactual_support_emitted_count": counterfactual_support_emitted_count,
+        "counterfactual_support_merged_count": counterfactual_support_merged_count,
+        "counterfactual_support_exported_count": counterfactual_support_merged_count,
+        "directed_outcome_support_emitted_count": directed_support_emitted_count,
+        "directed_outcome_support_merged_count": directed_support_merged_count,
+        "directed_outcome_support_exported_count": directed_support_merged_count,
+        "exit_attempt_support_emitted_count": exit_attempt_support_emitted_count,
+        "exit_attempt_support_merged_count": exit_attempt_support_merged_count,
+        "exit_attempt_support_exported_count": exit_attempt_support_merged_count,
+        "counterfactual_supported_edge_count": counterfactual_support_merged_count,
+        "directed_outcome_supported_edge_count": directed_support_merged_count,
+        "exit_attempt_supported_edge_count": exit_attempt_support_merged_count,
+        "counterfactual_supported_edge_rate": _safe_rate(sum(1 for row in final_topology_edges if int(row.get("counterfactual_support_count", 0) or 0) > 0), max(1, len(final_topology_edges))),
+        "directed_outcome_supported_edge_rate": _safe_rate(sum(1 for row in final_topology_edges if int(row.get("directed_outcome_support_count", 0) or 0) > 0), max(1, len(final_topology_edges))),
+        "exit_attempt_supported_edge_rate": _safe_rate(sum(1 for row in final_topology_edges if int(row.get("exit_attempt_support_count", 0) or 0) > 0), max(1, len(final_topology_edges))),
+        "graph_support_survival_rate_by_family": {
+            "counterfactual": _safe_rate(sum(1 for row in final_topology_edges if int(row.get("counterfactual_support_count", 0) or 0) > 0), max(1, sum(1 for row in final_topology_edges if bool(row.get("supports_counterfactual_relation", False)) or int(row.get("counterfactual_support_count", 0) or 0) > 0))),
+            "directed_outcome": _safe_rate(sum(1 for row in final_topology_edges if int(row.get("directed_outcome_support_count", 0) or 0) > 0), max(1, sum(1 for row in final_topology_edges if bool(row.get("supports_directed_outcome_relation", False)) or int(row.get("directed_outcome_support_count", 0) or 0) > 0))),
+            "exit_attempt": _safe_rate(sum(1 for row in final_topology_edges if int(row.get("exit_attempt_support_count", 0) or 0) > 0), max(1, sum(1 for row in final_topology_edges if bool(row.get("supports_exit_attempt_relation", False)) or int(row.get("exit_attempt_support_count", 0) or 0) > 0))),
+        },
+        "counterfactual_emit_attempt_count": int(support_family_emit_debug.get("counterfactual_emit_attempt_count", 0) or 0),
+        "counterfactual_emit_attempt_count_directed": int(support_family_emit_debug.get("counterfactual_emit_attempt_count_directed", 0) or 0),
+        "counterfactual_emit_attempt_count_probe": int(support_family_emit_debug.get("counterfactual_emit_attempt_count_probe", 0) or 0),
+        "counterfactual_classifier_true_count": sum(1 for record in list(round_records or []) if bool(dict(record.get("selected_outcome", {}) or {}).get("counterfactual_evidence_observed"))),
+        "counterfactual_row_emitted_count": sum(
+            1
+            for record in list(round_records or [])
+            if bool(
+                dict(dict(dict(record.get("analysis_summary", {}) or {}).get("support_family_emit_debug", {}) or {}).get("families", {}).get("counterfactual", {}) or {}).get("row_emitted", False)
+            )
+        ),
+        "counterfactual_emit_relation_resolution_failure_count": int(support_family_emit_debug.get("counterfactual_emit_relation_resolution_failure_count", 0) or 0),
+        "counterfactual_emit_suppressed_count": int(support_family_emit_debug.get("counterfactual_emit_suppressed_count", 0) or 0),
+        "counterfactual_classifier_to_emit_attempt_drop_count": max(0, sum(1 for record in list(round_records or []) if bool(dict(record.get("selected_outcome", {}) or {}).get("counterfactual_evidence_observed"))) - int(support_family_emit_debug.get("counterfactual_emit_attempt_count", 0) or 0)),
+        "counterfactual_emit_attempt_to_row_emission_drop_count": max(
+            0,
+            int(support_family_emit_debug.get("counterfactual_emit_attempt_count", 0) or 0)
+            - sum(
+                1
+                for record in list(round_records or [])
+                if bool(
+                    dict(dict(dict(record.get("analysis_summary", {}) or {}).get("support_family_emit_debug", {}) or {}).get("families", {}).get("counterfactual", {}) or {}).get("row_emitted", False)
+                )
+            ),
+        ),
+        "counterfactual_support_lost_between_emit_and_merge_count": max(0, counterfactual_support_emitted_count - counterfactual_support_merged_count),
+        "counterfactual_support_lost_between_merge_and_export_count": 0,
+        "incoming_counterfactual_support_lost_before_export_count": max(0, counterfactual_support_emitted_count - counterfactual_support_merged_count),
+        "incoming_directed_support_lost_before_export_count": max(0, directed_support_emitted_count - directed_support_merged_count),
+        "incoming_exit_attempt_support_lost_before_export_count": max(0, exit_attempt_support_emitted_count - exit_attempt_support_merged_count),
+        "exit_attempt_rows_seen_at_merge_ingress": exit_attempt_rows_seen_at_merge_ingress,
+        "exit_attempt_rows_present_in_analysis_delta_count": int(exit_attempt_rows_present_in_analysis_delta_count),
+        "exit_attempt_rows_present_in_merge_request_count": int(exit_attempt_rows_present_in_merge_request_count),
+        "exit_attempt_rows_seen_on_raw_delta_count": int(exit_attempt_rows_seen_on_raw_delta),
+        "exit_attempt_rows_preserved_after_normalization_count": int(exit_attempt_rows_preserved_after_normalization),
+        "counterfactual_rows_seen_on_raw_delta_count": int(counterfactual_rows_seen_on_raw_delta),
+        "counterfactual_rows_preserved_after_normalization_count": int(counterfactual_rows_preserved_after_normalization),
+        "exit_attempt_rows_lost_between_analysis_and_merge_request_count": max(0, int(exit_attempt_rows_present_in_analysis_delta_count) - int(exit_attempt_rows_present_in_merge_request_count)),
+        "exit_attempt_rows_seen_at_merge_ingress_count": int(exit_attempt_rows_seen_at_merge_ingress),
+        "exit_attempt_rows_lost_during_merge_normalization_count": max(0, int(exit_attempt_rows_present_in_merge_request_count) - int(exit_attempt_rows_preserved_after_normalization or exit_attempt_rows_seen_at_merge_ingress)),
+        "exit_attempt_rows_written_to_split_store_count": exit_attempt_rows_written_to_split_store_count,
+        "exit_attempt_rows_surviving_combined_rebuild_count": exit_attempt_rows_surviving_combined_rebuild_count,
+        "exit_attempt_rows_visible_in_final_export_count": exit_attempt_rows_visible_in_final_export_count,
+        "exit_attempt_lost_before_store_count": max(0, exit_attempt_rows_seen_at_merge_ingress - exit_attempt_rows_written_to_split_store_count),
+        "exit_attempt_lost_in_combined_rebuild_count": max(0, exit_attempt_rows_written_to_split_store_count - exit_attempt_rows_surviving_combined_rebuild_count),
+        "exit_attempt_lost_before_final_export_count": max(0, exit_attempt_rows_surviving_combined_rebuild_count - exit_attempt_rows_visible_in_final_export_count),
+        "directed_support_lost_between_emit_and_merge_count": max(0, directed_support_emitted_count - directed_support_merged_count),
+        "directed_support_lost_between_merge_and_export_count": 0,
+        "exit_attempt_emit_attempt_count": int(support_family_emit_debug.get("exit_attempt_emit_attempt_count", 0) or 0),
+        "exit_attempt_emit_attempt_count_directed": int(support_family_emit_debug.get("exit_attempt_emit_attempt_count_directed", 0) or 0),
+        "exit_attempt_emit_attempt_count_probe": int(support_family_emit_debug.get("exit_attempt_emit_attempt_count_probe", 0) or 0),
+        "exit_attempt_classifier_true_count": sum(1 for record in list(round_records or []) if bool(dict(record.get("selected_outcome", {}) or {}).get("exit_attempt_evidence_observed"))),
+        "exit_attempt_row_emitted_count": sum(
+            1
+            for record in list(round_records or [])
+            if bool(
+                dict(dict(dict(record.get("analysis_summary", {}) or {}).get("support_family_emit_debug", {}) or {}).get("families", {}).get("exit_attempt", {}) or {}).get("row_emitted", False)
+            )
+        ),
+        "exit_attempt_emit_relation_resolution_failure_count": int(support_family_emit_debug.get("exit_attempt_emit_relation_resolution_failure_count", 0) or 0),
+        "exit_attempt_emit_suppressed_count": int(support_family_emit_debug.get("exit_attempt_emit_suppressed_count", 0) or 0),
+        "exit_attempt_support_lost_between_emit_and_merge_count": max(0, exit_attempt_support_emitted_count - exit_attempt_support_merged_count),
+        "exit_attempt_support_lost_between_merge_and_export_count": 0,
+        "selected_candidate_path_diagnostics": selected_candidate_path_diagnostics,
+        "selected_candidate_path_diagnostics_skipped_route_probe_rounds": int(selected_candidate_path_diagnostics_skipped_route_probe_rounds),
+        "exit_attempt_classifier_to_emit_attempt_drop_count": max(0, sum(1 for record in list(round_records or []) if bool(dict(record.get("selected_outcome", {}) or {}).get("exit_attempt_evidence_observed"))) - int(support_family_emit_debug.get("exit_attempt_emit_attempt_count", 0) or 0)),
+        "exit_attempt_emit_attempt_to_row_emission_drop_count": max(
+            0,
+            int(support_family_emit_debug.get("exit_attempt_emit_attempt_count", 0) or 0)
+            - sum(
+                1
+                for record in list(round_records or [])
+                if bool(
+                    dict(dict(dict(record.get("analysis_summary", {}) or {}).get("support_family_emit_debug", {}) or {}).get("families", {}).get("exit_attempt", {}) or {}).get("row_emitted", False)
+                )
+            ),
+        ),
+    }
+    identity_rows = list(dict(blackboard_state.get("entities", {}) or {}).values())
+    observed_entity_sources = dict(blackboard_state.get("observed_entities", {}) or {})
+    hypothesized_entity_sources = dict(blackboard_state.get("hypothesized_entities", {}) or {})
+    identity_fields = ["identity_status", "identity_support_count", "identity_contradiction_count", "identity_cross_round_stability", "identity_last_confirmed_round"]
+    resolved_missing = 0
+    unresolved_missing = 0
+    for row_id, row in dict(blackboard_state.get("entities", {}) or {}).items():
+        payload = dict(row or {})
+        has_all = all(field in payload for field in identity_fields)
+        richer_source_exists = False
+        for store in (observed_entity_sources, hypothesized_entity_sources):
+            source = dict(store.get(str(row_id), {}) or {})
+            if source and all(field in source for field in identity_fields):
+                richer_source_exists = True
+                break
+        if not has_all:
+            if richer_source_exists:
+                resolved_missing += 1
+            else:
+                unresolved_missing += 1
     identity_stability_summary = {
-        "stable_identity_rate": _safe_rate(sum(1 for row in identity_rows if float(row.get("identity_confidence", 0.0) or 0.0) >= 0.75), max(1, len(identity_rows))),
+        "stable_identity_rate": _safe_rate(sum(1 for row in identity_rows if str(row.get("identity_status") or "") in {"match_existing", "confirmed"}), max(1, len(identity_rows))),
         "ambiguous_identity_rate": _safe_rate(sum(1 for row in identity_rows if str(row.get("identity_status") or "") == "ambiguous_match"), max(1, len(identity_rows))),
         "new_entity_rate": _safe_rate(sum(1 for row in identity_rows if str(row.get("identity_status") or "") == "new_entity"), max(1, len(identity_rows))),
         "identity_status_counts": dict(Counter(str(row.get("identity_status") or "unknown") for row in identity_rows)),
+        "identity_confirmed_entity_count": sum(1 for row in identity_rows if str(row.get("identity_status") or "") in {"match_existing", "confirmed"}),
+        "identity_probable_entity_count": sum(1 for row in identity_rows if str(row.get("identity_status") or "") in {"probable", "ambiguous_match", "merge_candidate", "split_candidate"}),
+        "identity_unknown_entity_count": sum(1 for row in identity_rows if str(row.get("identity_status") or "unknown") == "unknown"),
+        "resolved_entity_identity_fields_missing_count": resolved_missing,
+        "unresolved_entity_identity_fields_missing_count": unresolved_missing,
+        "entity_identity_fields_missing_in_final_rows_count": resolved_missing + unresolved_missing,
+        "identity_fillthrough_applied_count": int(blackboard_state.get("identity_fillthrough_applied_count", 0) or 0),
+        "resolved_entity_identity_propagation_rate": _safe_rate(sum(1 for row_id, row in dict(blackboard_state.get("entities", {}) or {}).items() if any(dict(store.get(str(row_id), {}) or {}) for store in (observed_entity_sources, hypothesized_entity_sources)) and all(field in dict(row) for field in identity_fields)), max(1, sum(1 for row_id in dict(blackboard_state.get("entities", {}) or {}) if any(dict(store.get(str(row_id), {}) or {}) for store in (observed_entity_sources, hypothesized_entity_sources))))),
+        "identity_field_propagation_rate": _safe_rate(sum(1 for row in identity_rows if all(field in dict(row) for field in identity_fields)), max(1, len(identity_rows))),
     }
+    planner_escalation_with_positive_support_gain_count = sum(
+        1 for row in selected_rows
+        if str(row.get("objective_type") or "") in {"trigger_then_target", "unlock_then_exit", "verify_trigger_contact", "reobserve_remote_change", "verify_panel_state", "verify_gate_match"}
+        and (
+            int(row.get("support_gain_since_last_visit", 0) or 0) > 0
+            or int(row.get("identity_gain_since_last_visit", 0) or 0) > 0
+            or int(row.get("durable_gain_since_last_visit", 0) or 0) > 0
+        )
+    )
+    planner_escalation_with_zero_support_gain_count = sum(
+        1 for row in selected_rows
+        if str(row.get("objective_type") or "") in {"trigger_then_target", "unlock_then_exit", "verify_trigger_contact", "reobserve_remote_change", "verify_panel_state", "verify_gate_match"}
+        and int(row.get("support_gain_since_last_visit", 0) or 0) <= 0
+        and int(row.get("identity_gain_since_last_visit", 0) or 0) <= 0
+        and int(row.get("durable_gain_since_last_visit", 0) or 0) <= 0
+    )
+    same_chain_step_retried_after_zero_gain_count = sum(
+        1
+        for idx in range(1, len(round_records))
+        if str(dict(dict(round_records[idx].get("decision", {}) or {}).get("metadata", {}).get("selected_subgoal_step", {}) or {}).get("step_id") or "")
+        and str(dict(dict(round_records[idx].get("decision", {}) or {}).get("metadata", {}).get("selected_subgoal_step", {}) or {}).get("step_id") or "") ==
+           str(dict(dict(round_records[idx - 1].get("decision", {}) or {}).get("metadata", {}).get("selected_subgoal_step", {}) or {}).get("step_id") or "")
+        and int(dict(dict(round_records[idx - 1].get("decision", {}) or {}).get("metadata", {}).get("selected_candidate", {}) or {}).get("support_gain_since_last_visit", 0) or 0) <= 0
+        and int(dict(dict(round_records[idx - 1].get("decision", {}) or {}).get("metadata", {}).get("selected_candidate", {}) or {}).get("identity_gain_since_last_visit", 0) or 0) <= 0
+        and int(dict(dict(round_records[idx - 1].get("decision", {}) or {}).get("metadata", {}).get("selected_candidate", {}) or {}).get("durable_gain_since_last_visit", 0) or 0) <= 0
+    )
+    chain_step_failed_without_new_support_count = sum(
+        1
+        for record in ledger_records
+        if str(getattr(record, "event_type", "")) == "subgoal chain step progressed"
+        and not bool(dict(getattr(record, "payload", {}) or {}).get("step_success", False))
+        and not bool(dict(getattr(record, "payload", {}) or {}).get("chain_should_advance", False))
+    )
+    probe_escalation_summary_payload["planner_escalation_with_positive_support_gain_count"] = planner_escalation_with_positive_support_gain_count
+    probe_escalation_summary_payload["planner_escalation_with_zero_support_gain_count"] = planner_escalation_with_zero_support_gain_count
+    probe_escalation_summary_payload["same_chain_step_retried_after_zero_gain_count"] = same_chain_step_retried_after_zero_gain_count
+    probe_escalation_summary_payload["chain_step_failed_without_new_support_count"] = chain_step_failed_without_new_support_count
+    planner_usable_bridge_rows = []
+    for row in selected_rows:
+        target_id = str(row.get("target_entity_id") or "")
+        entity = dict(dict(blackboard_state.get("entities", {}) or {}).get(target_id, {}) or {})
+        support_profile = dict(entity.get("evidence_support_profile", {}) or {})
+        identity_profile = dict(entity.get("identity_strength_profile", {}) or {})
+        planner_usable = bool(
+            int(support_profile.get("directed_outcome", 0) or 0) > 0
+            or int(support_profile.get("counterfactual", 0) or 0) > 0
+            or int(support_profile.get("exit_attempt", 0) or 0) > 0
+            or str(identity_profile.get("identity_status") or "") in {"match_existing", "confirmed", "probable"}
+        )
+        durable_ready = bool(
+            int(support_profile.get("directed_outcome", 0) or 0) >= 2
+            or int(support_profile.get("exit_attempt", 0) or 0) >= 1
+        )
+        reason_codes = []
+        if int(support_profile.get("directed_outcome", 0) or 0) > 0:
+            reason_codes.append("directed_support")
+        if int(support_profile.get("counterfactual", 0) or 0) > 0:
+            reason_codes.append("counterfactual_support")
+        if int(support_profile.get("exit_attempt", 0) or 0) > 0:
+            reason_codes.append("exit_attempt_support")
+        if str(identity_profile.get("identity_status") or "") in {"match_existing", "confirmed", "probable"}:
+            reason_codes.append("identity_strength")
+        block_reasons = [] if planner_usable else ["no_surviving_support_profile"]
+        planner_usable_bridge_rows.append({
+            "candidate_id": str(row.get("candidate_id") or ""),
+            "target_entity_id": target_id,
+            "candidate_class": str(row.get("candidate_class") or ""),
+            "objective_type": str(row.get("objective_type") or ""),
+            "surviving_support_profile": support_profile,
+            "surviving_identity_profile": identity_profile,
+            "planner_usable": planner_usable,
+            "planner_usable_reason_codes": reason_codes,
+            "durable_ready": durable_ready,
+            "durable_ready_reason_codes": ["support_threshold"] if durable_ready else [],
+            "block_reasons": block_reasons,
+        })
     planner_usable_vs_durable_summary = {
         "planner_usable_count": sum(1 for state in dict(latest_registry.get("planner_usable_state", {})).values() if str(state or "") == "planner_usable"),
         "durable_ready_count": sum(1 for state in dict(latest_registry.get("durable_ready_state", {})).values() if str(state or "") == "durable_ready"),
         "validated_count": sum(1 for state in dict(latest_registry.get("validation_state", {})).values() if str(state or "") == "validated"),
+        "rows": planner_usable_bridge_rows,
+        "supported_but_not_planner_usable_count": sum(1 for row in planner_usable_bridge_rows if any(int(v or 0) > 0 for v in dict(row.get("surviving_support_profile", {})).values()) and not bool(row.get("planner_usable", False))),
+        "identity_strengthened_but_not_planner_usable_count": sum(1 for row in planner_usable_bridge_rows if str(dict(row.get("surviving_identity_profile", {})).get("identity_status") or "") in {"match_existing", "confirmed", "probable"} and not bool(row.get("planner_usable", False))),
+        "planner_usable_from_graph_support_count": sum(1 for row in planner_usable_bridge_rows if bool(row.get("planner_usable", False)) and any(code in {"directed_support", "counterfactual_support", "exit_attempt_support"} for code in list(row.get("planner_usable_reason_codes", []) or []))),
+        "planner_usable_from_identity_gain_count": sum(1 for row in planner_usable_bridge_rows if bool(row.get("planner_usable", False)) and "identity_strength" in list(row.get("planner_usable_reason_codes", []) or [])),
+        "planner_usable_from_exit_attempt_support_count": sum(1 for row in planner_usable_bridge_rows if "exit_attempt_support" in list(row.get("planner_usable_reason_codes", []) or [])),
+        "planner_usable_from_counterfactual_support_count": sum(1 for row in planner_usable_bridge_rows if "counterfactual_support" in list(row.get("planner_usable_reason_codes", []) or [])),
+        "row_level_usable_without_registry_promotion_count": sum(1 for row in planner_usable_bridge_rows if bool(row.get("planner_usable", False)) and str(row.get("target_entity_id") or "") not in {str(value) for value in list(latest_registry.get("planner_usable_ids", []) or []) if value}),
+        "row_level_durable_without_registry_promotion_count": sum(1 for row in planner_usable_bridge_rows if bool(row.get("durable_ready", False)) and str(row.get("target_entity_id") or "") not in {str(value) for value in list(latest_registry.get("durable_ready_ids", []) or []) if value}),
+        "registry_usable_missing_export_row_count": sum(1 for value in list(latest_registry.get("planner_usable_ids", []) or []) if str(value) not in {str(row.get("target_entity_id") or "") for row in planner_usable_bridge_rows}),
+        "planner_usable_promotion_attempt_count": int(latest_registry.get("planner_usable_promotion_attempt_count", 0) or 0),
+        "planner_usable_promotion_success_count": int(latest_registry.get("planner_usable_promotion_success_count", 0) or 0),
+        "planner_usable_promotion_failure_count": int(latest_registry.get("planner_usable_promotion_failure_count", 0) or 0),
+        "durable_ready_promotion_attempt_count": int(latest_registry.get("durable_ready_promotion_attempt_count", 0) or 0),
+        "durable_ready_promotion_success_count": int(latest_registry.get("durable_ready_promotion_success_count", 0) or 0),
+        "durable_ready_promotion_failure_count": int(latest_registry.get("durable_ready_promotion_failure_count", 0) or 0),
     }
+    ledger_payloads_by_round = _ledger_episode_payloads_by_round(ledger_records)
+    outcome_counterfactual_field_present_count = 0
+    ledger_counterfactual_field_present_count = 0
+    outcome_exit_attempt_field_present_count = 0
+    ledger_exit_attempt_field_present_count = 0
+    outcome_to_ledger_counterfactual_drop_count = 0
+    outcome_to_ledger_exit_attempt_drop_count = 0
+    executed_episode_classifier_truth_surface_complete_count = 0
+    executed_episode_classifier_truth_surface_incomplete_count = 0
+    for record in list(round_records or []):
+        round_id = int(record.get("round_id", 0) or 0)
+        outcome = dict(record.get("selected_outcome", {}) or {})
+        ledger_payload = dict(ledger_payloads_by_round.get(round_id, {}) or {})
+        outcome_counterfactual = outcome.get("counterfactual_evidence_observed")
+        ledger_counterfactual = ledger_payload.get("counterfactual_evidence_observed")
+        outcome_exit = outcome.get("exit_attempt_evidence_observed")
+        ledger_exit = ledger_payload.get("exit_attempt_evidence_observed")
+        if outcome_counterfactual is not None:
+            outcome_counterfactual_field_present_count += 1
+        if ledger_counterfactual is not None:
+            ledger_counterfactual_field_present_count += 1
+        if outcome_exit is not None:
+            outcome_exit_attempt_field_present_count += 1
+        if ledger_exit is not None:
+            ledger_exit_attempt_field_present_count += 1
+        if outcome_counterfactual is not None and ledger_counterfactual is None:
+            outcome_to_ledger_counterfactual_drop_count += 1
+        if outcome_exit is not None and ledger_exit is None:
+            outcome_to_ledger_exit_attempt_drop_count += 1
+        classifier_keys = (
+            "counterfactual_evidence_observed",
+            "exit_attempt_evidence_observed",
+            "expected_effect_type",
+            "expected_relation_type",
+            "expected_target_id",
+            "attempted_boundary_contact",
+            "attempted_portal_contact",
+            "attempted_terminal_affordance_contact",
+        )
+        if all(key in ledger_payload for key in classifier_keys):
+            executed_episode_classifier_truth_surface_complete_count += 1
+        else:
+            executed_episode_classifier_truth_surface_incomplete_count += 1
+    counterfactual_classifier_missing_expected_effect_count = sum(
+        1 for row in selected_candidate_path_diagnostics
+        if not bool(row.get("expected_effect_metadata_present", False))
+    )
+    counterfactual_classifier_missing_contact_or_region_signal_count = sum(
+        1 for row in list(round_records or [])
+        if str(dict(dict(dict(row.get("decision", {}) or {}).get("metadata", {}) or {}).get("selected_candidate", {}) or {}).get("objective_type") or "") in {"trigger_then_target", "verify_trigger_contact", "reobserve_remote_change", "verify_panel_state", "verify_gate_match", "attempt_exit", "unlock_then_exit"}
+        and not bool(dict(row.get("selected_outcome", {}) or {}).get("expected_trigger_contact_observed"))
+        and not bool(dict(row.get("selected_outcome", {}) or {}).get("expected_region_reached"))
+    )
+    exit_attempt_classifier_missing_boundary_or_portal_signal_count = sum(
+        1 for row in selected_candidate_path_diagnostics
+        if not bool(row.get("boundary_or_portal_telemetry_present", False))
+    )
+    exit_attempt_classifier_missing_action_intent_count = sum(
+        1 for row in list(round_records or [])
+        if str(dict(dict(dict(row.get("decision", {}) or {}).get("metadata", {}) or {}).get("selected_candidate", {}) or {}).get("objective_type") or "") in {"attempt_exit", "unlock_then_exit", "trigger_then_target"}
+        and not (
+            dict(row.get("selected_outcome", {}) or {}).get("expected_effect_relation")
+            or dict(row.get("selected_outcome", {}) or {}).get("exit_attempt_action_type")
+            or dict(row.get("selected_outcome", {}) or {}).get("expected_target_id")
+        )
+    )
+    counterfactual_missing_expectation_basis_count = sum(
+        1 for row in list(round_records or [])
+        if not (
+            dict(row.get("selected_outcome", {}) or {}).get("expectation_basis")
+            or list(dict(row.get("selected_outcome", {}) or {}).get("weak_expectation_basis", []) or [])
+        )
+    )
+    counterfactual_missing_effect_absence_signal_count = sum(
+        1 for row in list(round_records or [])
+        if not bool(dict(row.get("selected_outcome", {}) or {}).get("observed_effect_absent"))
+    )
+    counterfactual_missing_target_or_region_resolution_count = sum(
+        1 for row in list(round_records or [])
+        if bool(dict(dict(dict(row.get("analysis_summary", {}) or {}).get("support_family_emit_debug", {}) or {}).get("families", {}).get("counterfactual", {}) or {}).get("classifier_flag"))
+        and "missing_target_resolution" in list(dict(dict(dict(row.get("analysis_summary", {}) or {}).get("support_family_emit_debug", {}) or {}).get("families", {}).get("counterfactual", {}) or {}).get("resolution_failure_reason_codes", []) or [])
+    )
+    counterfactual_classifier_probe_weak_expectation_count = sum(
+        1 for row in list(round_records or [])
+        if list(dict(row.get("selected_outcome", {}) or {}).get("weak_expectation_basis", []) or [])
+    )
+    counterfactual_expectation_basis_present_count = sum(
+        1 for row in list(round_records or [])
+        if bool(dict(row.get("selected_outcome", {}) or {}).get("counterfactual_expectation_basis_present"))
+    )
+    counterfactual_attempt_context_present_count = sum(
+        1 for row in list(round_records or [])
+        if bool(dict(row.get("selected_outcome", {}) or {}).get("counterfactual_attempt_context_present"))
+    )
+    counterfactual_non_effect_confirmed_count = sum(
+        1 for row in list(round_records or [])
+        if bool(dict(row.get("selected_outcome", {}) or {}).get("counterfactual_non_effect_confirmed"))
+    )
+    counterfactual_post_attempt_window_present_count = sum(
+        1 for row in list(round_records or [])
+        if int(dict(row.get("selected_outcome", {}) or {}).get("counterfactual_post_attempt_window_steps", 0) or 0) > 0
+    )
+    counterfactual_matched_expected_effect_count = sum(
+        1 for row in list(round_records or [])
+        if bool(dict(row.get("selected_outcome", {}) or {}).get("counterfactual_matched_expected_effect"))
+    )
+    counterfactual_attempt_present_but_non_effect_not_confirmed_count = sum(
+        1 for row in list(round_records or [])
+        if bool(dict(row.get("selected_outcome", {}) or {}).get("counterfactual_attempt_context_present"))
+        and not bool(dict(row.get("selected_outcome", {}) or {}).get("counterfactual_non_effect_confirmed"))
+    )
+    counterfactual_matched_wrong_target_count = sum(
+        1 for row in list(round_records or [])
+        if str(dict(row.get("selected_outcome", {}) or {}).get("counterfactual_match_reason_code") or "") == "observed_effect_wrong_target"
+    )
+    counterfactual_matched_wrong_relation_count = sum(
+        1 for row in list(round_records or [])
+        if str(dict(row.get("selected_outcome", {}) or {}).get("counterfactual_match_reason_code") or "") == "observed_effect_wrong_relation"
+    )
+    counterfactual_matched_wrong_effect_type_count = sum(
+        1 for row in list(round_records or [])
+        if str(dict(row.get("selected_outcome", {}) or {}).get("counterfactual_match_reason_code") or "") == "observed_effect_wrong_effect_type"
+    )
+    counterfactual_no_matching_effect_in_window_count = sum(
+        1 for row in list(round_records or [])
+        if str(dict(row.get("selected_outcome", {}) or {}).get("counterfactual_match_reason_code") or "") == "no_matching_effect_in_window"
+    )
+    counterfactual_generic_diff_without_matching_effect_count = sum(
+        1 for row in list(round_records or [])
+        if bool(dict(row.get("selected_outcome", {}) or {}).get("observed_effect_change"))
+        and str(dict(row.get("selected_outcome", {}) or {}).get("counterfactual_match_reason_code") or "") == "no_matching_effect_in_window"
+    )
+    counterfactual_region_level_target_count = sum(
+        1 for row in list(round_records or [])
+        if str(dict(row.get("selected_outcome", {}) or {}).get("counterfactual_target_scope") or "") == "region"
+    )
+    counterfactual_entity_level_target_count = sum(
+        1 for row in list(round_records or [])
+        if str(dict(row.get("selected_outcome", {}) or {}).get("counterfactual_target_scope") or "") == "entity"
+    )
+    counterfactual_blocked_no_expectation_basis_count = sum(
+        1 for row in list(round_records or [])
+        if "no_expectation_basis" in list(dict(row.get("selected_outcome", {}) or {}).get("counterfactual_classifier_block_reason_codes", []) or [])
+    )
+    counterfactual_blocked_no_attempt_context_count = sum(
+        1 for row in list(round_records or [])
+        if "no_attempt_context" in list(dict(row.get("selected_outcome", {}) or {}).get("counterfactual_classifier_block_reason_codes", []) or [])
+    )
+    counterfactual_blocked_non_effect_not_confirmed_count = sum(
+        1 for row in list(round_records or [])
+        if "attempt_present_but_non_effect_not_confirmed" in list(dict(row.get("selected_outcome", {}) or {}).get("counterfactual_classifier_block_reason_codes", []) or [])
+    )
+    graph_edge_quality_summary["counterfactual_classifier_missing_expected_effect_count"] = int(counterfactual_classifier_missing_expected_effect_count)
+    graph_edge_quality_summary["counterfactual_classifier_missing_contact_or_region_signal_count"] = int(counterfactual_classifier_missing_contact_or_region_signal_count)
+    graph_edge_quality_summary["counterfactual_missing_expectation_basis_count"] = int(counterfactual_missing_expectation_basis_count)
+    graph_edge_quality_summary["counterfactual_missing_effect_absence_signal_count"] = int(counterfactual_missing_effect_absence_signal_count)
+    graph_edge_quality_summary["counterfactual_missing_target_or_region_resolution_count"] = int(counterfactual_missing_target_or_region_resolution_count)
+    graph_edge_quality_summary["counterfactual_classifier_probe_weak_expectation_count"] = int(counterfactual_classifier_probe_weak_expectation_count)
+    graph_edge_quality_summary["counterfactual_expectation_basis_present_count"] = int(counterfactual_expectation_basis_present_count)
+    graph_edge_quality_summary["counterfactual_attempt_context_present_count"] = int(counterfactual_attempt_context_present_count)
+    graph_edge_quality_summary["counterfactual_non_effect_confirmed_count"] = int(counterfactual_non_effect_confirmed_count)
+    graph_edge_quality_summary["counterfactual_post_attempt_window_present_count"] = int(counterfactual_post_attempt_window_present_count)
+    graph_edge_quality_summary["counterfactual_matched_expected_effect_count"] = int(counterfactual_matched_expected_effect_count)
+    graph_edge_quality_summary["counterfactual_attempt_present_but_non_effect_not_confirmed_count"] = int(counterfactual_attempt_present_but_non_effect_not_confirmed_count)
+    graph_edge_quality_summary["counterfactual_matched_wrong_target_count"] = int(counterfactual_matched_wrong_target_count)
+    graph_edge_quality_summary["counterfactual_matched_wrong_relation_count"] = int(counterfactual_matched_wrong_relation_count)
+    graph_edge_quality_summary["counterfactual_matched_wrong_effect_type_count"] = int(counterfactual_matched_wrong_effect_type_count)
+    graph_edge_quality_summary["counterfactual_no_matching_effect_in_window_count"] = int(counterfactual_no_matching_effect_in_window_count)
+    graph_edge_quality_summary["counterfactual_generic_diff_without_matching_effect_count"] = int(counterfactual_generic_diff_without_matching_effect_count)
+    graph_edge_quality_summary["counterfactual_region_level_target_count"] = int(counterfactual_region_level_target_count)
+    graph_edge_quality_summary["counterfactual_entity_level_target_count"] = int(counterfactual_entity_level_target_count)
+    graph_edge_quality_summary["counterfactual_blocked_no_expectation_basis_count"] = int(counterfactual_blocked_no_expectation_basis_count)
+    graph_edge_quality_summary["counterfactual_blocked_no_attempt_context_count"] = int(counterfactual_blocked_no_attempt_context_count)
+    graph_edge_quality_summary["counterfactual_blocked_non_effect_not_confirmed_count"] = int(counterfactual_blocked_non_effect_not_confirmed_count)
+    graph_edge_quality_summary["exit_attempt_classifier_missing_boundary_or_portal_signal_count"] = int(exit_attempt_classifier_missing_boundary_or_portal_signal_count)
+    graph_edge_quality_summary["exit_attempt_classifier_missing_action_intent_count"] = int(exit_attempt_classifier_missing_action_intent_count)
+    graph_edge_quality_summary["outcome_counterfactual_field_present_count"] = int(outcome_counterfactual_field_present_count)
+    graph_edge_quality_summary["ledger_counterfactual_field_present_count"] = int(ledger_counterfactual_field_present_count)
+    graph_edge_quality_summary["outcome_exit_attempt_field_present_count"] = int(outcome_exit_attempt_field_present_count)
+    graph_edge_quality_summary["ledger_exit_attempt_field_present_count"] = int(ledger_exit_attempt_field_present_count)
+    graph_edge_quality_summary["outcome_to_ledger_counterfactual_drop_count"] = int(outcome_to_ledger_counterfactual_drop_count)
+    graph_edge_quality_summary["outcome_to_ledger_exit_attempt_drop_count"] = int(outcome_to_ledger_exit_attempt_drop_count)
+    graph_edge_quality_summary["executed_episode_classifier_truth_surface_complete_count"] = int(executed_episode_classifier_truth_surface_complete_count)
+    graph_edge_quality_summary["executed_episode_classifier_truth_surface_incomplete_count"] = int(executed_episode_classifier_truth_surface_incomplete_count)
+    graph_edge_quality_summary["classifier_truth_surface_with_any_family_count"] = int(classifier_truth_surface_with_any_family_count)
+    graph_edge_quality_summary["analysis_emit_debug_with_any_family_count"] = int(analysis_emit_debug_with_any_family_count)
+    graph_edge_quality_summary["classifier_true_but_emit_debug_empty_count"] = int(classifier_true_but_emit_debug_empty_count)
+    graph_edge_quality_summary["classifier_true_but_emit_attempt_not_counted_count"] = int(classifier_true_but_emit_attempt_not_counted_count)
+    graph_edge_quality_summary["emit_attempt_count_without_row_emission_count"] = int(emit_attempt_count_without_row_emission_count)
     return persist_postrun_outputs(
         storage_agent,
         session_id=session_id,
@@ -1430,6 +2093,8 @@ def export_postrun(storage_agent, *, session_id: str, round_id: int, game_id: st
         probe_escalation_summary_payload=probe_escalation_summary_payload,
         exit_readiness_summary_payload=exit_readiness_summary_payload,
         premature_exit_attempts_payload=premature_exit_attempts_payload,
+        planning_mode_timeline_payload=planning_mode_timeline_payload,
+        planning_mode_switches_payload=planning_mode_switches_payload,
         graph_edge_quality_summary=graph_edge_quality_summary,
         identity_stability_summary=identity_stability_summary,
         planner_usable_vs_durable_summary=planner_usable_vs_durable_summary,

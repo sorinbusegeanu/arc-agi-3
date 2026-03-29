@@ -18,6 +18,10 @@ def patch_crop(observation: list[list[int]], bbox: list[int]) -> list[list[int]]
     return rows
 
 
+def canonical_patch_crop(observation: list[list[int]], bbox: list[int]) -> list[list[int]]:
+    return canonicalize_patch(patch_crop(observation, bbox))
+
+
 def canonicalize_patch(patch: list[list[int]]) -> list[list[int]]:
     rows = [list(row) for row in list(patch or []) if isinstance(row, list)]
     while rows and not any(value != 0 for value in rows[0]):
@@ -162,10 +166,17 @@ def patterns_match(left: list[list[int]], right: list[list[int]], *, threshold: 
 
 def pattern_equality_decision(left: list[list[int]], right: list[list[int]], *, threshold: float = 0.9) -> dict[str, Any]:
     confidence = pattern_similarity(left, right)
+    left_desc = stable_descriptor(left)
+    right_desc = stable_descriptor(right)
+    adaptive_threshold = float(threshold)
+    if min(int(left_desc.get("width", 0) or 0), int(right_desc.get("width", 0) or 0)) <= 2 and min(int(left_desc.get("height", 0) or 0), int(right_desc.get("height", 0) or 0)) <= 2:
+        adaptive_threshold = max(0.84, adaptive_threshold - 0.04)
     return {
-        "matches": confidence >= float(threshold),
+        "matches": confidence >= adaptive_threshold,
         "confidence": confidence,
-        "threshold": float(threshold),
+        "threshold": adaptive_threshold,
         "left_pattern_id": stable_pattern_id(left) if left else None,
         "right_pattern_id": stable_pattern_id(right) if right else None,
+        "left_descriptor": left_desc,
+        "right_descriptor": right_desc,
     }

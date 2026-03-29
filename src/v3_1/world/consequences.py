@@ -62,6 +62,15 @@ def extract_consequence_records(delta: dict) -> list[dict]:
                 "action_effect_near_avatar": row.get("action_effect_near_avatar", False),
                 "evidence_count": row.get("evidence_count", 1),
                 "evidence_refs": evidence_refs,
+                "support_family": row.get("support_family"),
+                "supports_exit_attempt_relation": bool(row.get("supports_exit_attempt_relation", False)),
+                "exit_attempt_support_count": int(row.get("exit_attempt_support_count", 0) or 0),
+                "supports_counterfactual_relation": bool(row.get("supports_counterfactual_relation", False)),
+                "counterfactual_support_count": int(row.get("counterfactual_support_count", 0) or 0),
+                "supports_directed_outcome_relation": bool(row.get("supports_directed_outcome_relation", False)),
+                "directed_outcome_support_count": int(row.get("directed_outcome_support_count", 0) or 0),
+                "last_supported_round_by_family": dict(row.get("last_supported_round_by_family", {}) or {}),
+                "last_supported_pass_id_by_family": dict(row.get("last_supported_pass_id_by_family", {}) or {}),
             }
         )
     return records
@@ -78,6 +87,37 @@ def merge_consequences(existing: dict[str, dict], incoming: list[dict]) -> dict[
         payload["evidence_count"] = int(prior.get("evidence_count", 0)) + int(row.get("evidence_count", 1))
         payload["evidence_refs"] = sorted(set(prior.get("evidence_refs", [])) | set(row.get("evidence_refs", [])))[-32:]
         payload["occurrence_count"] = int(prior.get("occurrence_count", 0)) + 1
+        payload["supports_exit_attempt_relation"] = bool(prior.get("supports_exit_attempt_relation", False) or row.get("supports_exit_attempt_relation", False))
+        payload["supports_counterfactual_relation"] = bool(prior.get("supports_counterfactual_relation", False) or row.get("supports_counterfactual_relation", False))
+        payload["supports_directed_outcome_relation"] = bool(prior.get("supports_directed_outcome_relation", False) or row.get("supports_directed_outcome_relation", False))
+        payload["support_family"] = str(
+            row.get("support_family")
+            or prior.get("support_family")
+            or (
+                "exit_attempt" if payload["supports_exit_attempt_relation"]
+                else "counterfactual" if payload["supports_counterfactual_relation"]
+                else "directed_outcome" if payload["supports_directed_outcome_relation"]
+                else ""
+            )
+        )
+        payload["exit_attempt_support_count"] = int(prior.get("exit_attempt_support_count", 0) or 0) + int(row.get("exit_attempt_support_count", 0) or 0) + (1 if row.get("supports_exit_attempt_relation") and not row.get("exit_attempt_support_count") else 0)
+        payload["counterfactual_support_count"] = int(prior.get("counterfactual_support_count", 0) or 0) + int(row.get("counterfactual_support_count", 0) or 0) + (1 if row.get("supports_counterfactual_relation") and not row.get("counterfactual_support_count") else 0)
+        payload["directed_outcome_support_count"] = int(prior.get("directed_outcome_support_count", 0) or 0) + int(row.get("directed_outcome_support_count", 0) or 0) + (1 if row.get("supports_directed_outcome_relation") and not row.get("directed_outcome_support_count") else 0)
+        last_rounds = dict(prior.get("last_supported_round_by_family", {}) or {})
+        last_passes = dict(prior.get("last_supported_pass_id_by_family", {}) or {})
+        source_round = int(row.get("source_round_id", row.get("round_id", 0)) or 0)
+        source_pass = int(row.get("source_pass_id", 0) or 0)
+        if payload["supports_exit_attempt_relation"]:
+            last_rounds["exit_attempt"] = max(int(last_rounds.get("exit_attempt", 0) or 0), source_round)
+            last_passes["exit_attempt"] = max(int(last_passes.get("exit_attempt", 0) or 0), source_pass)
+        if payload["supports_counterfactual_relation"]:
+            last_rounds["counterfactual"] = max(int(last_rounds.get("counterfactual", 0) or 0), source_round)
+            last_passes["counterfactual"] = max(int(last_passes.get("counterfactual", 0) or 0), source_pass)
+        if payload["supports_directed_outcome_relation"]:
+            last_rounds["directed_outcome"] = max(int(last_rounds.get("directed_outcome", 0) or 0), source_round)
+            last_passes["directed_outcome"] = max(int(last_passes.get("directed_outcome", 0) or 0), source_pass)
+        payload["last_supported_round_by_family"] = last_rounds
+        payload["last_supported_pass_id_by_family"] = last_passes
         payload["mean_local_change_area"] = (
             float(prior.get("mean_local_change_area", row.get("local_change_area", 0.0))) * max(0, int(prior.get("occurrence_count", 0)))
             + float(row.get("local_change_area", 0.0))

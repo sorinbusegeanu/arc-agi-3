@@ -146,6 +146,8 @@ def score_candidates(
         chain_no_exit_attempt_penalty = 0.09 if str(candidate.get("candidate_class") or "") in {"unlock_then_exit", "mechanic_chain_deterministic", "mechanic_chain_llm"} and not chain_has_exit_attempt_evidence else 0.0
         trigger_only_penalty = 0.08 if str(candidate.get("candidate_class") or "") in {"unlock_trigger", "trigger_probe"} and not bool(candidate.get("target_exit_id")) and graph_hop_count <= 1 else 0.0
         panel_only_penalty = 0.08 if str(candidate.get("candidate_class") or "") == "verify_panel_state" and not bool(candidate.get("target_exit_id")) and graph_hop_count <= 1 else 0.0
+        shallow_attractive_target_penalty = 0.12 if str(candidate.get("candidate_class") or "") in {"frontier_move", "target_interaction", "local_probe"} and not chain_has_explicit_steps else 0.0
+        identity_weak_chain_penalty = 0.1 if chain_has_explicit_steps and chain_identity_stability < 0.45 else 0.0
         synthetic_trigger_chain_penalty = 0.18 if synthetic_region_only and str(candidate.get("candidate_class") or "") in {"unlock_then_exit", "mechanic_chain_deterministic", "mechanic_chain_llm"} else 0.0
         weak_first_step_penalty = 0.14 if chain_has_explicit_steps and first_step_executability_score < 0.45 else 0.0
         low_support_round_penalty = 0.08 if chain_has_explicit_steps and first_node_support_round_count < 2 else 0.0
@@ -275,6 +277,20 @@ def score_candidates(
                 verification_preference_bonus += 0.28
             if last_exit_attempt_failed_without_new_support:
                 verification_preference_bonus += 0.12
+        mode_consistency_bonus = 0.0
+        mode_consistency_penalty = 0.0
+        if planning_mode == "structure_acquisition":
+            if str(candidate.get("objective_type") or "") in {"trigger_then_target", "verify_trigger_contact", "reobserve_remote_change", "verify_panel_state", "verify_gate_match"}:
+                mode_consistency_bonus += 0.22
+            elif str(candidate.get("candidate_class") or "") in {"frontier_move", "fallback_action"} and not chain_has_explicit_steps:
+                mode_consistency_penalty += 0.18
+            elif str(candidate.get("objective_type") or "") in {"probe_route", "explore_frontier"} and not stronger_followup_exists:
+                mode_consistency_penalty += 0.1
+        else:
+            if str(candidate.get("objective_type") or "") in {"probe_route", "explore_frontier"} and (missing_prerequisites or chain_hypothesis_only):
+                mode_consistency_penalty += 0.14
+            if str(candidate.get("objective_type") or "") in {"trigger_then_target", "verify_trigger_contact", "reobserve_remote_change", "verify_panel_state", "verify_gate_match"} and (missing_prerequisites or not strong_detector_alternative_exists):
+                mode_consistency_bonus += 0.05
 
         progress_score = (
             novelty * float(getattr(planning_cfg, "novelty_weight", 0.6))
@@ -295,6 +311,7 @@ def score_candidates(
             + directed_outcome_backed_bonus
             + detector_backed_bonus
             + probe_escalation_bonus
+            + mode_consistency_bonus
             + graph_observed_bonus
             + graph_path_bonus
             + graph_pattern_bonus
@@ -326,6 +343,8 @@ def score_candidates(
             - chain_no_exit_attempt_penalty
             - trigger_only_penalty
             - panel_only_penalty
+            - shallow_attractive_target_penalty
+            - identity_weak_chain_penalty
             - synthetic_trigger_chain_penalty
             - weak_first_step_penalty
             - low_support_round_penalty
@@ -339,6 +358,7 @@ def score_candidates(
             - compatibility_alias_penalty
             - frontier_detector_displacement_penalty
             - repeated_probe_penalty
+            - mode_consistency_penalty
             - premature_exit_penalty
             - 0.08 * prior_failure_rate
             - 0.07 * prior_route_failure_risk
@@ -353,8 +373,10 @@ def score_candidates(
             + detector_backed_bonus
             + probe_escalation_bonus
             + verification_preference_bonus
+            + mode_consistency_bonus
             - seed_requires_hypothesis_penalty
             - repeated_probe_penalty
+            - mode_consistency_penalty
             - zero_observed_support_penalty
             - (0.08 * max(0.0, route_cost - 0.5))
         )
@@ -367,11 +389,15 @@ def score_candidates(
             + detector_backed_bonus
             + probe_escalation_bonus
             + verification_preference_bonus
+            + mode_consistency_bonus
             - contradiction_seed_penalty
             - repeated_probe_penalty
+            - mode_consistency_penalty
             - premature_exit_penalty
             - contradiction_hypothesis_penalty
             - chain_no_verification_penalty
+            - shallow_attractive_target_penalty
+            - identity_weak_chain_penalty
             - synthetic_trigger_chain_penalty
         )
         candidate_intent_mode = str(candidate.get("candidate_intent_mode") or "progress")
@@ -438,6 +464,8 @@ def score_candidates(
             "repeated_probe_penalty": repeated_probe_penalty,
             "probe_escalation_bonus": probe_escalation_bonus,
             "probe_escalation_available": stronger_followup_exists or bool(candidate.get("probe_escalation_available")),
+            "mode_consistency_bonus": mode_consistency_bonus,
+            "mode_consistency_penalty": mode_consistency_penalty,
             "frontier_detector_displacement_penalty": frontier_detector_displacement_penalty,
             "exit_readiness_score": exit_readiness_score,
             "premature_exit_penalty": premature_exit_penalty,
@@ -465,6 +493,8 @@ def score_candidates(
             "chain_no_exit_attempt_penalty": chain_no_exit_attempt_penalty,
             "trigger_only_penalty": trigger_only_penalty,
             "panel_only_penalty": panel_only_penalty,
+            "shallow_attractive_target_penalty": shallow_attractive_target_penalty,
+            "identity_weak_chain_penalty": identity_weak_chain_penalty,
             "synthetic_trigger_chain_penalty": synthetic_trigger_chain_penalty,
             "weak_first_step_penalty": weak_first_step_penalty,
             "low_support_round_penalty": low_support_round_penalty,

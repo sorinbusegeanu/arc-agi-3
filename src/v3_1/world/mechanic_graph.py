@@ -72,6 +72,11 @@ class MechanicEdge:
     last_seen_round: int = 0
     observed_support_count: int = 0
     hypothesized_support_count: int = 0
+    support_consistency_score: float = 0.0
+    lag_consistency_score: float = 1.0
+    counterfactual_support_count: int = 0
+    directed_outcome_support_count: int = 0
+    exit_attempt_support_count: int = 0
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

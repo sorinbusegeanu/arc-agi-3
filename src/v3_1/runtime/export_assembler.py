@@ -3,6 +3,27 @@ from __future__ import annotations
 from collections import Counter
 
 
+def _merge_support_family_emit_debug(existing: dict, incoming: dict) -> dict:
+    merged = dict(existing or {})
+    for key, value in dict(incoming or {}).items():
+        if isinstance(value, dict):
+            current = dict(merged.get(key, {}) or {})
+            merged[key] = _merge_support_family_emit_debug(current, value)
+        elif isinstance(value, list):
+            current = list(merged.get(key, []) or [])
+            for item in value:
+                if item not in current:
+                    current.append(item)
+            merged[key] = current
+        elif isinstance(value, bool):
+            merged[key] = bool(merged.get(key, False)) or value
+        elif isinstance(value, int):
+            merged[key] = int(merged.get(key, 0) or 0) + value
+        elif value is not None:
+            merged[key] = value
+    return merged
+
+
 def episode_export_row(analyzed_episode) -> dict:
     step_rows = list(analyzed_episode.summary.get("step_rows", []) or [])
     steps = []
@@ -59,12 +80,18 @@ def build_round_analysis_summary(*, round_id: int, analyzed_episodes: list, cand
     )
     unknown_action_type_count = sum(1 for action_family in normalized_action_families if action_family == "unknown")
     poi_debug_artifact = {}
+    support_family_emit_debug = {}
     for episode in analyzed_episodes:
         metadata = dict(getattr(episode, "metadata", {}) or {})
         candidate = dict(metadata.get("poi_detection_debug", {}) or {})
         if candidate:
             poi_debug_artifact = candidate
-            break
+        emit_candidate = dict(metadata.get("support_family_emit_debug", {}) or {})
+        if emit_candidate:
+            support_family_emit_debug = _merge_support_family_emit_debug(
+                support_family_emit_debug,
+                emit_candidate,
+            )
     return {
         "round_id": int(round_id),
         "step_count": len(step_rows),
@@ -81,7 +108,59 @@ def build_round_analysis_summary(*, round_id: int, analyzed_episodes: list, cand
         "unknown_action_type_count": unknown_action_type_count,
         "candidate_effect_mode_used": candidate_effect_mode_used,
         "poi_detection_debug": poi_debug_artifact,
+        "support_family_emit_debug": support_family_emit_debug,
     }
+
+
+def build_live_candidate_bridge_rows(decision_payload: dict, *, round_id: int) -> list[dict]:
+    payload = dict(decision_payload or {})
+    metadata = dict(payload.get("metadata", {}) or {})
+    rows = []
+    seen: set[str] = set()
+    for source_name in ("ranked_candidates",):
+        for row in list(payload.get(source_name, []) or []):
+            candidate = dict(row or {})
+            candidate_id = str(candidate.get("candidate_id") or "")
+            target_id = str(candidate.get("target_entity_id") or candidate.get("target_area_id") or "")
+            stable_id = target_id or candidate_id
+            if not stable_id or stable_id in seen:
+                continue
+            seen.add(stable_id)
+            rows.append(
+                {
+                    "stable_id": stable_id,
+                    "candidate_id": candidate_id or None,
+                    "target_entity_id": str(candidate.get("target_entity_id") or "") or None,
+                    "target_area_id": str(candidate.get("target_area_id") or "") or None,
+                    "planner_usable": bool(candidate.get("candidate_planner_usable", False)),
+                    "durable_ready": bool(candidate.get("candidate_durable_ready", False)),
+                    "planner_usable_reason_codes": list(candidate.get("candidate_usable_reason_codes", []) or []),
+                    "durable_ready_reason_codes": list(candidate.get("candidate_durable_reason_codes", []) or []),
+                    "support_profile": dict(candidate.get("evidence_support_profile", {}) or {}),
+                    "identity_profile": dict(candidate.get("identity_strength_profile", {}) or {}),
+                    "source_round_id": int(round_id),
+                }
+            )
+    selected = dict(metadata.get("selected_candidate", {}) or {})
+    if selected:
+        stable_id = str(selected.get("target_entity_id") or selected.get("target_area_id") or selected.get("candidate_id") or "")
+        if stable_id and stable_id not in seen:
+            rows.append(
+                {
+                    "stable_id": stable_id,
+                    "candidate_id": str(selected.get("candidate_id") or "") or None,
+                    "target_entity_id": str(selected.get("target_entity_id") or "") or None,
+                    "target_area_id": str(selected.get("target_area_id") or "") or None,
+                    "planner_usable": bool(selected.get("candidate_planner_usable", False)),
+                    "durable_ready": bool(selected.get("candidate_durable_ready", False)),
+                    "planner_usable_reason_codes": list(selected.get("candidate_usable_reason_codes", []) or []),
+                    "durable_ready_reason_codes": list(selected.get("candidate_durable_reason_codes", []) or []),
+                    "support_profile": dict(selected.get("evidence_support_profile", {}) or {}),
+                    "identity_profile": dict(selected.get("identity_strength_profile", {}) or {}),
+                    "source_round_id": int(round_id),
+                }
+            )
+    return rows
 
 
 def actual_effect_mode(step_rows: list[dict], fallback: str) -> str:

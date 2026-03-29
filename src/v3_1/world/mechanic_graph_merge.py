@@ -83,18 +83,24 @@ def _merge_edge(existing: dict | None, incoming: dict, *, round_id: int) -> dict
     lag_consistency_score = max(float(existing.get("lag_consistency_score", 1.0) or 1.0), float(incoming.get("lag_consistency_score", 1.0) or 1.0))
     counterfactual_support_count = int(existing.get("counterfactual_support_count", 0) or 0) + int(incoming.get("counterfactual_support_count", 0) or 0)
     directed_outcome_support_count = int(existing.get("directed_outcome_support_count", 0) or 0) + int(incoming.get("directed_outcome_support_count", 0) or 0)
+    exit_attempt_support_count = int(existing.get("exit_attempt_support_count", 0) or 0) + int(incoming.get("exit_attempt_support_count", 0) or 0)
     poi_visit_support_count = int(existing.get("poi_visit_support_count", 0) or 0) + int(incoming.get("poi_visit_support_count", 0) or 0)
     post_visit_remote_change_count = int(existing.get("post_visit_remote_change_count", 0) or 0) + int(incoming.get("post_visit_remote_change_count", 0) or 0)
     post_visit_panel_match_count = int(existing.get("post_visit_panel_match_count", 0) or 0) + int(incoming.get("post_visit_panel_match_count", 0) or 0)
     post_visit_exit_effect_count = int(existing.get("post_visit_exit_effect_count", 0) or 0) + int(incoming.get("post_visit_exit_effect_count", 0) or 0)
-    if edge_kind == "matches" and support_increment < 2:
+    if edge_kind == "matches" and observed_support < 2 and support_increment < 2:
         confidence = min(confidence, 0.55)
-    if edge_kind == "requires" and counterfactual_support_count <= 0 and support_increment < 2:
+    if edge_kind == "requires" and counterfactual_support_count <= 0 and exit_attempt_support_count <= 0 and support_increment < 2:
         confidence = min(confidence, 0.5)
-    if edge_kind == "controls_access" and directed_outcome_support_count <= 0:
+    if edge_kind == "controls_access" and directed_outcome_support_count <= 0 and exit_attempt_support_count <= 0:
         confidence = min(confidence, 0.55)
-    if edge_kind == "causes_remote_change" and lag_consistency_score < 0.5:
+    if edge_kind == "causes_remote_change" and (lag_consistency_score < 0.5 or post_visit_remote_change_count <= 0):
         confidence = min(confidence, 0.5)
+    src_identity_confidence = float(dict(existing.get("metadata", {}) or {}).get("identity_confidence", 1.0) or 1.0)
+    dst_identity_confidence = float(dict(incoming.get("metadata", {}) or {}).get("identity_confidence", 1.0) or 1.0)
+    identity_stability = min(src_identity_confidence, dst_identity_confidence)
+    if identity_stability < 0.45:
+        confidence = min(confidence, 0.55)
     return {
         **existing,
         **incoming,
@@ -117,6 +123,7 @@ def _merge_edge(existing: dict | None, incoming: dict, *, round_id: int) -> dict
         "lag_consistency_score": lag_consistency_score,
         "counterfactual_support_count": counterfactual_support_count,
         "directed_outcome_support_count": directed_outcome_support_count,
+        "exit_attempt_support_count": exit_attempt_support_count,
         "poi_visit_support_count": poi_visit_support_count,
         "post_visit_remote_change_count": post_visit_remote_change_count,
         "post_visit_panel_match_count": post_visit_panel_match_count,

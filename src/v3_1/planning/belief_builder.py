@@ -250,6 +250,49 @@ def _durable_prior_view(durable_priors: dict, *, reachable: list[dict], local_po
     }
 
 
+def _history_mode_entry(row: dict) -> dict | None:
+    decision = dict(row.get("decision", {}) or {})
+    metadata = dict(decision.get("metadata", {}) or {})
+    planner_trace = dict(metadata.get("planner_trace", {}) or {})
+    mode = str(planner_trace.get("planning_mode") or metadata.get("planning_mode") or "").strip()
+    if not mode:
+        return None
+    return {
+        "round_id": int(row.get("round_id", decision.get("round_id", 0)) or 0),
+        "planning_mode": mode,
+        "mode_reason": str(planner_trace.get("mode_switch_reason") or planner_trace.get("last_mode_reason") or metadata.get("mode_reason") or ""),
+        "structure_support_gain": float(planner_trace.get("recent_structure_support_gain", 0.0) or metadata.get("recent_structure_support_gain", 0.0) or 0.0),
+        "progress_support_gain": float(planner_trace.get("recent_progress_evidence_gain", 0.0) or metadata.get("recent_progress_evidence_gain", 0.0) or 0.0),
+        "mode_switch_applied": bool(planner_trace.get("mode_switch_applied", metadata.get("mode_switch_applied", False))),
+    }
+
+
+def _mode_history(plan_memory: list[dict]) -> list[dict]:
+    rows = []
+    for row in list(plan_memory or []):
+        entry = _history_mode_entry(dict(row))
+        if entry is not None:
+            rows.append(entry)
+    rows.sort(key=lambda item: (int(item.get("round_id", 0) or 0), str(item.get("planning_mode") or "")))
+    return rows
+
+
+def _consecutive_mode_rounds(history: list[dict], mode: str) -> int:
+    count = 0
+    for row in reversed(list(history or [])):
+        if str(row.get("planning_mode") or "") != str(mode):
+            break
+        count += 1
+    return count
+
+
+def _recent_support_gains(history: list[dict], *, window: int = 3) -> tuple[float, float]:
+    tail = list(history or [])[-max(1, int(window)) :]
+    structure_gain = sum(float(row.get("structure_support_gain", 0.0) or 0.0) for row in tail)
+    progress_gain = sum(float(row.get("progress_support_gain", 0.0) or 0.0) for row in tail)
+    return float(structure_gain), float(progress_gain)
+
+
 def build_belief(blackboard_snapshot: dict, memory_snapshot: dict, mechanic_graph_snapshot: dict | None = None) -> dict:
     working_memory = dict(memory_snapshot.get("working_memory", memory_snapshot))
     durable_priors = dict(memory_snapshot.get("durable_priors", {}))
@@ -529,7 +572,112 @@ def build_belief(blackboard_snapshot: dict, memory_snapshot: dict, mechanic_grap
         )
         for row in poi_followthrough.values()
     )
-    planning_mode = "default_progress" if (detector_poi_progress_ready or escalation_ready) else ("structure_acquisition" if mechanic_object_backed_node_count <= 12 or structure_candidate_count <= 4 or chainworthy_path_count <= 1 else "default_progress")
+    mode_history = _mode_history(plan_memory)
+    prior_mode_state = dict(raw_plan_memory.get("mode_persistence", {}) or {}) if isinstance(raw_plan_memory, dict) else {}
+    previous_planning_mode = prior_mode_state.get("last_planning_mode_committed")
+    if previous_planning_mode in {"", None}:
+        previous_planning_mode = None
+    last_mode_reason = str(prior_mode_state.get("last_mode_reason") or "")
+    last_mode_round_id = int(prior_mode_state.get("last_mode_round_id", 0) or 0)
+    consecutive_structure_acquisition_rounds = int(prior_mode_state.get("consecutive_structure_acquisition_rounds", _consecutive_mode_rounds(mode_history, "structure_acquisition")) or 0)
+    consecutive_default_progress_rounds = int(prior_mode_state.get("consecutive_default_progress_rounds", _consecutive_mode_rounds(mode_history, "default_progress")) or 0)
+    history_structure_gain, history_progress_gain = _recent_support_gains(mode_history, window=3)
+    recent_structure_support_gain = float(prior_mode_state.get("recent_structure_support_gain", history_structure_gain) or 0.0)
+    recent_progress_evidence_gain = float(prior_mode_state.get("recent_progress_evidence_gain", history_progress_gain) or 0.0)
+    active_structure_chain = bool(subgoal_chain_state.get("active_structure_chain", False))
+    structure_chain_pending_step_kind = str(subgoal_chain_state.get("structure_chain_pending_step_kind") or "")
+    structure_chain_blocks_default_progress = bool(subgoal_chain_state.get("structure_chain_blocks_default_progress", False))
+    unresolved_detector_backed_poi_count = len(stable_targetable_detector_pois)
+    unresolved_mechanic_targets = len(pending_verification_nodes) + sum(1 for row in poi_followthrough.values() if isinstance(row, dict) and not bool(row.get("probe_stale", False)))
+    contradiction_burden = int(mechanic_graph_view.get("contradiction_count", 0) or 0)
+    strong_progress_path_exists = any(
+        float(row.get("execution_feasibility_score", 0.0) or 0.0) >= 0.72
+        and float(row.get("support_strength", 0.0) or 0.0) >= 0.6
+        and int(row.get("contradiction_count", 0) or 0) <= 0
+        for row in strongest_executable_paths
+    )
+    low_exit_readiness = not strong_progress_path_exists
+    partial_prerequisite_evidence = bool(chainworthy_path_count > 0 and pending_verification_nodes)
+    verification_candidate_pending = bool(pending_verification_nodes) or active_structure_chain or escalation_ready
+    promising_detector_pois_exist = bool(promising_pois)
+    unresolved_detector_interpretation = bool(unresolved_detector_backed_poi_count > 0 and (verification_candidate_pending or not strong_progress_path_exists))
+    current_best_mechanic_is_verification = bool(
+        strongest_executable_paths
+        and any(str(path.get("path_kind") or "") in {"trigger_then_exit", "trigger_candidate_from_detector_poi", "visited_poi_then_exit_becomes_more_promising"} for path in strongest_executable_paths[:2])
+        and verification_candidate_pending
+    )
+    structure_entry_conditions = {
+        "unresolved_detector_poi": unresolved_detector_interpretation,
+        "promising_pois_low_exit_readiness": promising_detector_pois_exist and low_exit_readiness,
+        "partial_prerequisite_evidence": partial_prerequisite_evidence,
+        "recent_probe_followthrough_gain": recent_structure_support_gain > 0.0 or escalation_ready,
+        "best_mechanic_is_verification": current_best_mechanic_is_verification,
+    }
+    structure_exit_conditions = {
+        "progress_path_ready": strong_progress_path_exists,
+        "repeated_structure_no_gain": consecutive_structure_acquisition_rounds >= 2 and recent_structure_support_gain <= 0.0,
+        "targets_stale_or_contradicted": all(bool(dict(row).get("probe_stale", False)) for row in poi_followthrough.values()) if poi_followthrough else False,
+        "no_pending_verification_nodes": not pending_verification_nodes and not active_structure_chain,
+        "verified_progress_ready_chain": bool(active_chain_summary) and not active_structure_chain and str(active_chain_summary.get("status") or "") in {"active", "planned"} and bool(active_chain_summary.get("chain_id")),
+    }
+    structure_acquisition_score = (
+        (0.24 * unresolved_detector_backed_poi_count)
+        + (0.14 * len(pending_verification_nodes))
+        + (0.16 * min(3.0, recent_structure_support_gain))
+        + (0.12 if low_exit_readiness else 0.0)
+        + (0.14 if escalation_ready else 0.0)
+        + (0.12 * min(2.0, contradiction_burden))
+        + (0.18 if active_structure_chain else 0.0)
+        + (0.08 * min(3.0, unresolved_mechanic_targets))
+    )
+    default_progress_score = (
+        (0.42 if strong_progress_path_exists else 0.0)
+        + (0.16 if detector_poi_progress_ready else 0.0)
+        + (0.12 * min(3.0, recent_progress_evidence_gain))
+        + (0.18 if structure_exit_conditions["verified_progress_ready_chain"] else 0.0)
+        + (0.08 * max(0, chainworthy_path_count - 1))
+        - (0.12 if pending_verification_nodes else 0.0)
+        - (0.08 if contradiction_burden > 0 else 0.0)
+    )
+    should_enter_structure = any(structure_entry_conditions.values()) and structure_acquisition_score >= (default_progress_score - 0.05)
+    should_exit_structure = any(structure_exit_conditions.values()) and default_progress_score >= (structure_acquisition_score - 0.1)
+    planning_mode_before_hysteresis = "structure_acquisition" if should_enter_structure else "default_progress"
+    planning_mode = str(previous_planning_mode or "default_progress")
+    mode_switch_applied = False
+    mode_persistence_hysteresis_applied = False
+    mode_switch_block_reason = ""
+    current_mode_reason = last_mode_reason or "initial_default"
+    if previous_planning_mode == "structure_acquisition":
+        if structure_chain_blocks_default_progress:
+            planning_mode = "structure_acquisition"
+            mode_persistence_hysteresis_applied = True
+            mode_switch_block_reason = "active_structure_chain_blocks_default_progress"
+            current_mode_reason = mode_switch_block_reason
+        elif should_exit_structure:
+            planning_mode = "default_progress"
+            mode_switch_applied = True
+            current_mode_reason = next((key for key, value in structure_exit_conditions.items() if value), "structure_exit_condition")
+        else:
+            planning_mode = "structure_acquisition"
+            mode_persistence_hysteresis_applied = True
+            mode_switch_block_reason = "structure_hysteresis_kept_mode"
+            current_mode_reason = mode_switch_block_reason
+    else:
+        if should_enter_structure:
+            planning_mode = "structure_acquisition"
+            mode_switch_applied = previous_planning_mode != "structure_acquisition"
+            current_mode_reason = next((key for key, value in structure_entry_conditions.items() if value), "structure_entry_condition")
+        else:
+            planning_mode = "default_progress"
+            current_mode_reason = "progress_path_or_no_structure_need" if strong_progress_path_exists or detector_poi_progress_ready else "default_progress_fallback"
+    if planning_mode == "structure_acquisition" and previous_planning_mode == "default_progress" and not should_enter_structure:
+        planning_mode = previous_planning_mode
+        mode_persistence_hysteresis_applied = True
+        mode_switch_block_reason = "insufficient_structure_entry_support"
+        current_mode_reason = mode_switch_block_reason
+        mode_switch_applied = False
+    current_consecutive_structure = (consecutive_structure_acquisition_rounds + 1) if planning_mode == "structure_acquisition" and previous_planning_mode == "structure_acquisition" else (1 if planning_mode == "structure_acquisition" else 0)
+    current_consecutive_default = (consecutive_default_progress_rounds + 1) if planning_mode == "default_progress" and previous_planning_mode == "default_progress" else (1 if planning_mode == "default_progress" else 0)
     candidate_seed_sets = {
         "promising_pois": promising_pois,
         "approachable_pois": approachable_pois,
@@ -577,6 +725,38 @@ def build_belief(blackboard_snapshot: dict, memory_snapshot: dict, mechanic_grap
         "support_view": support_view,
         "mechanic_graph_view": mechanic_graph_view,
         "planning_mode": planning_mode,
+        "planning_mode_before_hysteresis": planning_mode_before_hysteresis,
+        "planning_mode_after_hysteresis": planning_mode,
+        "planning_mode_committed": planning_mode,
+        "previous_planning_mode": previous_planning_mode,
+        "last_planning_mode": previous_planning_mode,
+        "last_mode_reason": current_mode_reason,
+        "last_mode_round_id": last_mode_round_id,
+        "mode_switch_applied": mode_switch_applied,
+        "mode_persistence_hysteresis_applied": mode_persistence_hysteresis_applied,
+        "mode_switch_block_reason": mode_switch_block_reason,
+        "consecutive_structure_acquisition_rounds": current_consecutive_structure,
+        "consecutive_default_progress_rounds": current_consecutive_default,
+        "recent_structure_support_gain": recent_structure_support_gain,
+        "recent_progress_evidence_gain": recent_progress_evidence_gain,
+        "structure_acquisition_score": structure_acquisition_score,
+        "default_progress_score": default_progress_score,
+        "mode_persistence_summary": {
+            "current_planning_mode": planning_mode,
+            "previous_planning_mode": previous_planning_mode,
+            "last_planning_mode": previous_planning_mode,
+            "last_mode_reason": current_mode_reason,
+            "last_mode_round_id": last_mode_round_id,
+            "mode_switch_applied": mode_switch_applied,
+            "mode_persistence_hysteresis_applied": mode_persistence_hysteresis_applied,
+            "mode_switch_block_reason": mode_switch_block_reason,
+            "consecutive_structure_acquisition_rounds": current_consecutive_structure,
+            "consecutive_default_progress_rounds": current_consecutive_default,
+            "recent_structure_support_gain": recent_structure_support_gain,
+            "recent_progress_evidence_gain": recent_progress_evidence_gain,
+            "structure_entry_conditions": structure_entry_conditions,
+            "structure_exit_conditions": structure_exit_conditions,
+        },
         "structure_recall_gap": structure_recall_gap,
         "object_backed_node_count": object_backed_node_count,
         "mechanic_object_backed_node_count": mechanic_object_backed_node_count,
@@ -589,6 +769,9 @@ def build_belief(blackboard_snapshot: dict, memory_snapshot: dict, mechanic_grap
             "current_step_index": active_chain_summary.get("current_step_index"),
             "current_step": active_step_summary,
             "should_replan": bool(subgoal_chain_state.get("should_replan", False)),
+            "active_structure_chain": active_structure_chain,
+            "structure_chain_pending_step_kind": structure_chain_pending_step_kind or None,
+            "structure_chain_blocks_default_progress": structure_chain_blocks_default_progress,
         },
         "strongest_executable_paths": strongest_executable_paths,
         "contradicted_paths": contradicted_paths,

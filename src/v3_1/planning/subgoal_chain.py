@@ -9,6 +9,7 @@ from v3_1.utils.ids import stable_digest
 STEP_KINDS = {
     "go_to_trigger",
     "verify_trigger_contact",
+    "reobserve_remote_change",
     "verify_panel",
     "verify_gate",
     "attempt_exit",
@@ -83,6 +84,67 @@ class SubgoalChain:
         }
 
 
+def _normalized_step_kind(step_kind: str) -> str:
+    normalized = str(step_kind or "").strip()
+    if normalized == "reobserve_region":
+        return "reobserve_remote_change"
+    return normalized
+
+
+def _enforce_exit_chain_order(steps: list[SubgoalStep]) -> tuple[list[SubgoalStep], tuple[str, ...]]:
+    if not steps:
+        return [], ()
+    normalized = list(steps)
+    required_verification_steps: list[str] = []
+    has_exit = any(_normalized_step_kind(step.step_kind) == "attempt_exit" for step in normalized)
+    if not has_exit:
+        return normalized, tuple(required_verification_steps)
+    kinds = [_normalized_step_kind(step.step_kind) for step in normalized]
+    if "go_to_trigger" not in kinds and normalized:
+        first = normalized[0]
+        normalized.insert(
+            0,
+            build_step(
+                step_kind="go_to_trigger",
+                target_node_id=first.target_node_id,
+                expected_evidence=list(first.expected_evidence or ()) or ["objective_contact_observed"],
+                success_conditions=["expected_evidence_seen"],
+                failure_conditions=["expected_evidence_missing"],
+                retry_budget=2,
+            ),
+        )
+    if not any(kind in {"verify_trigger_contact", "reobserve_remote_change"} for kind in kinds):
+        anchor = normalized[min(1, len(normalized) - 1)]
+        normalized.insert(
+            min(1, len(normalized)),
+            build_step(
+                step_kind="verify_trigger_contact",
+                target_node_id=anchor.target_node_id,
+                expected_evidence=["objective_contact_observed"],
+                success_conditions=["expected_evidence_seen"],
+                failure_conditions=["expected_evidence_missing"],
+                retry_budget=1,
+            ),
+        )
+        required_verification_steps.append("verify_trigger_contact")
+    if not any(kind in {"verify_panel", "verify_gate"} for kind in [_normalized_step_kind(step.step_kind) for step in normalized]):
+        anchor = normalized[min(2, len(normalized) - 1)]
+        normalized.insert(
+            min(2, len(normalized)),
+            build_step(
+                step_kind="verify_panel",
+                target_node_id=anchor.target_node_id,
+                expected_evidence=["expected_match_seen"],
+                success_conditions=["expected_evidence_seen"],
+                failure_conditions=["expected_evidence_missing"],
+                retry_budget=1,
+            ),
+        )
+        required_verification_steps.append("verify_panel_state")
+    dedup_required = tuple(dict.fromkeys(required_verification_steps))
+    return normalized, dedup_required
+
+
 @dataclass(frozen=True)
 class SubgoalChainState:
     active_chain: dict[str, Any] | None = None
@@ -113,6 +175,8 @@ def build_step(
     fallback_targets: list[str] | tuple[str, ...] | None = None,
 ) -> SubgoalStep:
     normalized_kind = str(step_kind or "").strip()
+    if normalized_kind == "reobserve_region":
+        normalized_kind = "reobserve_remote_change"
     if normalized_kind not in STEP_KINDS:
         raise ValueError(f"invalid subgoal step kind: {step_kind!r}")
     fingerprint = (
@@ -155,10 +219,11 @@ def build_chain(
     completion_reason: str | None = None,
     abort_reason: str | None = None,
 ) -> SubgoalChain:
+    normalized_steps, inferred_required_verification = _enforce_exit_chain_order(list(steps or []))
     chain_key = (
         str(source_candidate_id),
         str(source_path_id or ""),
-        tuple(step.step_id for step in list(steps or [])),
+        tuple(step.step_id for step in list(normalized_steps or [])),
         tuple(str(value) for value in list(source_hypothesis_ids or []) if value),
         str(target_exit_id or ""),
     )
@@ -175,9 +240,9 @@ def build_chain(
         created_round_id=int(created_round_id),
         last_updated_round_id=int(last_updated_round_id if last_updated_round_id is not None else created_round_id),
         exit_readiness_score_at_creation=float(exit_readiness_score_at_creation or 0.0),
-        required_verification_steps=tuple(dict.fromkeys(str(value) for value in list(required_verification_steps or []) if value)),
+        required_verification_steps=tuple(dict.fromkeys([*(str(value) for value in list(required_verification_steps or []) if value), *inferred_required_verification])),
         verification_steps_completed=tuple(dict.fromkeys(str(value) for value in list(verification_steps_completed or []) if value)),
         completion_reason=str(completion_reason) if completion_reason else None,
         abort_reason=str(abort_reason) if abort_reason else None,
-        steps=tuple(steps or ()),
+        steps=tuple(normalized_steps or ()),
     )

@@ -62,14 +62,15 @@ def compute_planner_chain_preference_metrics(decision_rows: list[dict]) -> dict:
     return {
         "executable_chain_selection_rate": float(len(executable_chain)) / float(total),
         "shallow_target_selection_rate": float(len(shallow_targets)) / float(total),
-        "direct_exit_attempt_rate_without_prerequisites": float(len(direct_exit_without_prereq)) / float(total),
-        "trigger_only_candidate_selection_rate": float(len(trigger_only)) / float(total),
-        "completed_chain_before_exit_success_rate": float(len(completed_chain_before_exit)) / float(total),
+        "trigger_only_selection_rate": float(len(trigger_only)) / float(total),
+        "verification_candidate_selection_rate": float(len(verification_before_exit)) / float(total),
         "planner_usable_hypothesis_utilization_rate": float(len(planner_usable)) / float(total),
         "premature_exit_attempt_rate": float(len(premature_exit)) / float(total),
         "exit_attempt_without_trigger_verification_rate": float(len(without_trigger_verification)) / float(total),
         "exit_attempt_without_panel_or_gate_verification_rate": float(len(without_panel_gate_verification)) / float(total),
         "verification_before_exit_rate": float(len(verification_before_exit)) / float(total),
+        "completed_chain_before_exit_success_rate": float(len(completed_chain_before_exit)) / float(total),
+        "direct_exit_attempt_rate_without_prerequisites": float(len(direct_exit_without_prereq)) / float(total),
         "failed_exit_without_new_support_rate": float(len(failed_without_new_support)) / float(total),
         "chain_rewrite_to_verification_rate": float(len(rewritten_to_verification)) / float(total),
     }

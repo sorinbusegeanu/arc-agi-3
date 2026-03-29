@@ -16,11 +16,12 @@ class AnalysisWorker:
         hypothesis_config: object | None = None,
         llm_adapter: object | None = None,
         hypothesis_registry_snapshot: dict | None = None,
+        classifier_truth_surface: dict | None = None,
     ):
         normalized = str(analysis_mode or "").strip().lower()
         if normalized not in {"probe", "directed_outcome"}:
             raise ValueError(f"analysis_mode must be 'probe' or 'directed_outcome', got {analysis_mode!r}")
-        return analyze_episode(raw_episode, normalized, blackboard_snapshot, mechanic_graph_snapshot, hypothesis_config, llm_adapter, hypothesis_registry_snapshot)
+        return analyze_episode(raw_episode, normalized, blackboard_snapshot, mechanic_graph_snapshot, hypothesis_config, llm_adapter, hypothesis_registry_snapshot, classifier_truth_surface)
 
 
 @ray.remote
@@ -32,8 +33,9 @@ def analyze_episode_task(
     hypothesis_config: object | None = None,
     llm_adapter: object | None = None,
     hypothesis_registry_snapshot: dict | None = None,
+    classifier_truth_surface: dict | None = None,
 ):
     normalized = str(analysis_mode or "").strip().lower()
     if normalized not in {"probe", "directed_outcome"}:
         raise ValueError(f"analysis_mode must be 'probe' or 'directed_outcome', got {analysis_mode!r}")
-    return analyze_episode(raw_episode, normalized, blackboard_snapshot, mechanic_graph_snapshot, hypothesis_config, llm_adapter, hypothesis_registry_snapshot)
+    return analyze_episode(raw_episode, normalized, blackboard_snapshot, mechanic_graph_snapshot, hypothesis_config, llm_adapter, hypothesis_registry_snapshot, classifier_truth_surface)

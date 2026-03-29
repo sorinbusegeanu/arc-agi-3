@@ -19,6 +19,50 @@ def _latest_analysis_hint(steps, key: str):
     return None
 
 
+def _matches_expected_effect(expectation: dict, observed_rows: list[dict]) -> tuple[bool, str, int, int]:
+    expected_effect_type = str(expectation.get("expected_effect_type") or "").lower()
+    expected_relation_type = str(expectation.get("expected_relation_type") or "").lower()
+    expected_target_kind = str(expectation.get("expected_target_kind") or "region").lower()
+    expected_target_value = str(expectation.get("expected_target_value") or "").lower()
+    candidate_count = 0
+    matching_count = 0
+    saw_wrong_target = False
+    saw_wrong_relation = False
+    saw_wrong_effect_type = False
+    for row in list(observed_rows or []):
+        payload = dict(row or {})
+        effect_type = str(payload.get("effect_type") or "").lower()
+        relation_type = str(payload.get("relation_type") or "").lower()
+        target_kind = str(payload.get("target_kind") or "region").lower()
+        target_value = str(payload.get("target_value") or "").lower()
+        if not any([effect_type, relation_type, target_value, bool(payload.get("has_effect"))]):
+            continue
+        candidate_count += 1
+        effect_ok = not expected_effect_type or effect_type == expected_effect_type
+        relation_ok = not expected_relation_type or relation_type == expected_relation_type
+        target_ok = not expected_target_value or (target_kind == expected_target_kind and target_value == expected_target_value)
+        if effect_ok and relation_ok and target_ok:
+            matching_count += 1
+            return True, (
+                "matched_expected_target_relation"
+                if expected_target_kind == "entity"
+                else "matched_expected_target_region"
+            ), candidate_count, matching_count
+        if not target_ok and expected_target_value:
+            saw_wrong_target = True
+        elif not relation_ok and expected_relation_type:
+            saw_wrong_relation = True
+        elif not effect_ok and expected_effect_type:
+            saw_wrong_effect_type = True
+    if saw_wrong_target:
+        return False, "observed_effect_wrong_target", candidate_count, matching_count
+    if saw_wrong_relation:
+        return False, "observed_effect_wrong_relation", candidate_count, matching_count
+    if saw_wrong_effect_type:
+        return False, "observed_effect_wrong_effect_type", candidate_count, matching_count
+    return False, "no_matching_effect_in_window", candidate_count, matching_count
+
+
 def summarize_outcome(*, steps, request, routed_history: list[dict], rewards: list[float]) -> dict:
     last_routed = dict(routed_history[-1]) if routed_history else {}
     avatar_positions = [
@@ -111,6 +155,236 @@ def summarize_outcome(*, steps, request, routed_history: list[dict], rewards: li
     if analysis_effect_changed_cells is not None:
         effect_changed_cells_observed = int(analysis_effect_changed_cells or 0)
     target_approach_based_on_confident_avatar = bool(avatar_localization_confident and route_progress > 0.0)
+    objective = dict(request.objective or {})
+    metadata = dict(request.metadata or {})
+    execution_intent = dict(getattr(request, "metadata", {}) or {}).get("execution_intent", {})
+    execution_intent = dict(execution_intent or {}) if isinstance(execution_intent, dict) else {}
+    action = dict(request.action or {})
+    expected_effect_type = str(metadata.get("expected_effect_type") or execution_intent.get("expected_effect_type") or objective.get("expected_effect_type") or "")
+    expected_effect_relation = str(metadata.get("expected_effect_relation") or metadata.get("expected_relation_type") or execution_intent.get("expected_effect_relation") or objective.get("expected_effect_relation") or "")
+    directed_outcome_relation_supported = bool(route_progress > 0.0 or effect_changed_cells_observed > 0 or done_observed or terminal_reward_observed > 0.0)
+    target_entity_id = str(metadata.get("target_entity_id") or request.target_entity_id or objective.get("target_entity_id") or action.get("target_entity_id") or "") or None
+    expected_target_id = str(metadata.get("expected_target_id") or execution_intent.get("expected_target_id") or target_entity_id or "") or None
+    expected_effect_target_id = str(metadata.get("expected_effect_target_id") or execution_intent.get("expected_target_id") or expected_target_id or "") or None
+    exit_attempt_target_id = str(metadata.get("exit_target_id") or execution_intent.get("expected_terminal_or_exit_target_id") or expected_target_id or "") or None
+    step_kind_hint = str(metadata.get("step_kind") or "")
+    objective_type_hint = str(objective.get("objective_type") or metadata.get("objective_type") or "")
+    action_name_hint = str(request.action_name or action.get("type") or "")
+    attempted_boundary_contact = bool(
+        any(bool(dict(step.info).get("attempted_boundary_contact") or dict(step.info).get("boundary_contact_observed") or dict(step.info).get("boundary_hit")) for step in steps if isinstance(step.info, dict))
+    )
+    attempted_portal_contact = bool(any(bool(dict(step.info).get("attempted_portal_contact") or dict(step.info).get("portal_like_contact_observed")) for step in steps if isinstance(step.info, dict)))
+    attempted_terminal_affordance_contact = bool(any(bool(dict(step.info).get("attempted_terminal_affordance_contact") or dict(step.info).get("terminal_affordance_contact_observed") or dict(step.info).get("terminal_action_marker")) for step in steps if isinstance(step.info, dict)))
+    attempted_escape_direction = next(
+        (
+            dict(step.info).get("attempted_escape_direction")
+            for step in reversed(steps)
+            if isinstance(step.info, dict) and dict(step.info).get("attempted_escape_direction") is not None
+        ),
+        None,
+    )
+    exit_attempt_observed = bool(step_kind_hint == "attempt_exit")
+    exit_attempt_evidence_observed = bool(
+        exit_attempt_observed
+        or bool(metadata.get("candidate_class") in {"unlock_then_exit"})
+        or objective_type_hint in {"attempt_exit", "unlock_then_exit"}
+        or "exit" in action_name_hint.lower()
+        or str(expected_effect_relation or "").lower() in {"exit", "leave", "escape", "terminal"}
+    )
+    exit_attempt_boundary_contact = bool(
+        exit_attempt_evidence_observed
+        and (
+            bool(last_info.get("terminal_action_marker"))
+            or bool(last_info.get("boundary_hit"))
+            or bool(last_info.get("target_contact_observed"))
+            or bool(last_info.get("objective_contact_observed"))
+        )
+    )
+    exit_attempt_action_type = action_name_hint or str(request.action_family or "unknown")
+    trigger_contact_observed = bool(trigger_contact_based_on_confident_avatar or objective_contact_observed)
+    target_contact_observed = bool(target_presence_observed)
+    expected_trigger_contact_observed = bool(trigger_contact_observed or objective_contact_observed)
+    expected_region_reached = bool(
+        target_approach_based_on_confident_avatar
+        or target_contact_observed
+        or objective_contact_observed
+        or (final_distance is not None and final_distance <= 1.5)
+    )
+    observed_effect_change = bool(effect_changed_cells_observed > 0 or done_observed or terminal_reward_observed > 0.0)
+    weak_expectation_basis: list[str] = []
+    repeated_blocked_boundary = any(bool(dict(step.info).get("repeated_boundary_facing_movement")) for step in steps if isinstance(step.info, dict))
+    stationary_salient_attempt = any(
+        bool(
+            (
+                dict(step.info).get("movement_stayed_in_place_after_attempted_boundary_move")
+                or (
+                    dict(step.info).get("avatar_cell_before") == dict(step.info).get("avatar_cell_after")
+                    and (
+                        dict(step.info).get("attempted_boundary_contact")
+                        or dict(step.info).get("attempted_portal_contact")
+                        or dict(step.info).get("attempted_terminal_affordance_contact")
+                        or dict(step.info).get("objective_contact_observed")
+                        or dict(step.info).get("target_contact_observed")
+                    )
+                )
+            )
+        )
+        for step in steps
+        if isinstance(step.info, dict)
+    )
+    attempted_salient_contact = bool(attempted_portal_contact or attempted_terminal_affordance_contact or target_contact_observed or objective_contact_observed)
+    counterfactual_target_scope = None
+    expected_target_region_class = None
+    if not expected_effect_type and not expected_effect_relation:
+        if attempted_boundary_contact or any(bool(dict(step.info).get("attempted_move_into_blocked_boundary")) for step in steps if isinstance(step.info, dict)) or repeated_blocked_boundary:
+            weak_expectation_basis.append("boundary_crossing_attempt")
+            expected_effect_type = expected_effect_type or "boundary_transition"
+            expected_effect_relation = expected_effect_relation or "cross_boundary"
+            counterfactual_target_scope = counterfactual_target_scope or "region"
+            expected_target_region_class = expected_target_region_class or "boundary_region"
+        if attempted_portal_contact or attempted_terminal_affordance_contact or attempted_salient_contact:
+            weak_expectation_basis.append("salient_contact")
+            expected_effect_type = expected_effect_type or "contact_effect"
+            expected_effect_relation = expected_effect_relation or "activate_contact_target"
+            counterfactual_target_scope = counterfactual_target_scope or ("entity" if expected_target_id else "region")
+            expected_target_region_class = expected_target_region_class or (
+                "portal_region" if attempted_portal_contact else "terminal_affordance_region" if attempted_terminal_affordance_contact else "salient_area"
+            )
+        if trigger_contact_observed or objective_contact_observed or target_contact_observed:
+            weak_expectation_basis.append("trigger_zone_entry")
+            expected_effect_type = expected_effect_type or "trigger_effect"
+            expected_effect_relation = expected_effect_relation or "enter_trigger_zone"
+            counterfactual_target_scope = counterfactual_target_scope or ("entity" if expected_target_id else "region")
+            expected_target_region_class = expected_target_region_class or "trigger_zone"
+    expectation_basis = "directed_expectation" if (expected_effect_type or expected_effect_relation) else ("weak_probe_expectation" if weak_expectation_basis else None)
+    if counterfactual_target_scope is None:
+        counterfactual_target_scope = "entity" if (expected_target_id or expected_effect_target_id) else "region"
+    no_state_hash_change = bool(
+        len(step_rows := [
+            dict(step.info) for step in steps if isinstance(step.info, dict)
+        ]) > 0
+        and all(dict_info.get("state_hash_before") == dict_info.get("state_hash_after") for dict_info in step_rows if dict_info.get("state_hash_before") is not None and dict_info.get("state_hash_after") is not None)
+    )
+    repeated_noop_after_attempt = bool(
+        stationary_salient_attempt
+        or ((blocked or stalled or noop_steps > 0) and (attempted_boundary_contact or attempted_salient_contact or expected_region_reached))
+    )
+    counterfactual_expectation_basis_present = bool(expectation_basis)
+    counterfactual_attempt_context_present = bool(
+        expected_trigger_contact_observed
+        or expected_region_reached
+        or attempted_boundary_contact
+        or attempted_portal_contact
+        or attempted_terminal_affordance_contact
+        or attempted_salient_contact
+        or repeated_blocked_boundary
+    )
+    attempt_anchor_idx = None
+    for idx, step in enumerate(steps):
+        info = dict(step.info) if isinstance(step.info, dict) else {}
+        if bool(
+            info.get("attempted_boundary_contact")
+            or info.get("boundary_hit")
+            or info.get("attempted_portal_contact")
+            or info.get("attempted_terminal_affordance_contact")
+            or info.get("objective_contact_observed")
+            or info.get("target_contact_observed")
+            or info.get("attempted_move_into_blocked_boundary")
+        ):
+            attempt_anchor_idx = idx
+            break
+    if attempt_anchor_idx is None and counterfactual_attempt_context_present:
+        attempt_anchor_idx = 0 if steps else None
+    post_attempt_steps = list(steps[attempt_anchor_idx: min(len(steps), attempt_anchor_idx + 3)]) if attempt_anchor_idx is not None else []
+    counterfactual_post_attempt_window_steps = len(post_attempt_steps)
+    post_attempt_infos = [dict(step.info) for step in post_attempt_steps if isinstance(step.info, dict)]
+    observed_effect_candidates = []
+    for info in post_attempt_infos:
+        if bool(info.get("effect_region")):
+            observed_effect_candidates.append(
+                {
+                    "effect_type": "region_effect",
+                    "relation_type": "enter_trigger_zone" if str(expected_effect_relation or "").lower() == "enter_trigger_zone" else "activate_contact_target",
+                    "target_kind": "region",
+                    "target_value": str(expected_target_id or expected_effect_target_id or expected_target_region_class or "effect_region"),
+                    "has_effect": True,
+                }
+            )
+        if bool(info.get("terminal_action_marker")) or bool(info.get("done")):
+            observed_effect_candidates.append(
+                {
+                    "effect_type": "boundary_transition",
+                    "relation_type": "cross_boundary",
+                    "target_kind": "region",
+                    "target_value": str(expected_target_region_class or "boundary_region"),
+                    "has_effect": True,
+                }
+            )
+    expected_target_value = str(expected_target_id or expected_effect_target_id or expected_target_region_class or "").lower()
+    expected_target_kind = "entity" if (expected_target_id or expected_effect_target_id) else "region"
+    counterfactual_matched_expected_effect, counterfactual_match_reason_code, counterfactual_observed_effect_candidate_count, counterfactual_matching_effect_candidate_count = _matches_expected_effect(
+        {
+            "expected_effect_type": expected_effect_type,
+            "expected_relation_type": expected_effect_relation,
+            "expected_target_kind": expected_target_kind,
+            "expected_target_value": expected_target_value,
+        },
+        observed_effect_candidates,
+    )
+    observed_effect_absent = bool(
+        counterfactual_expectation_basis_present
+        and counterfactual_attempt_context_present
+        and counterfactual_post_attempt_window_steps > 0
+        and not counterfactual_matched_expected_effect
+        and (
+            stationary_salient_attempt
+            or repeated_blocked_boundary
+            or repeated_noop_after_attempt
+            or no_state_hash_change
+            or expected_region_reached
+            or expected_trigger_contact_observed
+        )
+    )
+    counterfactual_non_effect_confirmed = bool(counterfactual_expectation_basis_present and counterfactual_attempt_context_present and observed_effect_absent)
+    counterfactual_classifier_block_reason_codes: list[str] = []
+    if not counterfactual_expectation_basis_present:
+        counterfactual_classifier_block_reason_codes.append("no_expectation_basis")
+    if not counterfactual_attempt_context_present:
+        counterfactual_classifier_block_reason_codes.append("no_attempt_context")
+    if attempt_anchor_idx is None:
+        counterfactual_classifier_block_reason_codes.append("no_salient_attempt_anchor")
+    if counterfactual_post_attempt_window_steps <= 0:
+        counterfactual_classifier_block_reason_codes.append("no_post_attempt_window")
+    if not (expected_effect_type or expected_effect_relation or expectation_basis):
+        counterfactual_classifier_block_reason_codes.append("missing_expected_effect_context")
+    if counterfactual_matched_expected_effect:
+        counterfactual_classifier_block_reason_codes.append("matched_expected_effect")
+    if not observed_effect_absent:
+        counterfactual_classifier_block_reason_codes.append("attempt_present_but_non_effect_not_confirmed")
+    if not (expected_target_id or expected_effect_target_id or expected_region_reached or attempted_boundary_contact or attempted_salient_contact):
+        counterfactual_classifier_block_reason_codes.append("target_or_region_missing")
+    counterfactual_evidence_observed = bool(
+        counterfactual_non_effect_confirmed
+        and counterfactual_attempt_context_present
+    )
+    if attempted_escape_direction is None and isinstance(target, (list, tuple)) and len(target) == 2:
+        x = float(target[0]); y = float(target[1])
+        if x <= 1:
+            attempted_escape_direction = "left"
+        elif x >= 62:
+            attempted_escape_direction = "right"
+        elif y <= 1:
+            attempted_escape_direction = "up"
+        elif y >= 62:
+            attempted_escape_direction = "down"
+    exit_attempt_evidence_observed = bool(
+        exit_attempt_evidence_observed
+        or attempted_boundary_contact
+        or attempted_portal_contact
+        or attempted_terminal_affordance_contact
+        or attempted_escape_direction is not None
+        or any(bool(dict(step.info).get("repeated_boundary_facing_movement")) for step in steps if isinstance(step.info, dict))
+    )
     success_certainty = 0.0
     if done_observed:
         success_certainty += 0.45
@@ -136,6 +410,41 @@ def summarize_outcome(*, steps, request, routed_history: list[dict], rewards: li
         "blocked_by_unavailable_action_observed": _evidence_cell(blocked_by_unavailable_action_observed, "execution_derived" if blocked_by_unavailable_action_observed is not None else "unknown"),
         "effect_region_observed": _evidence_cell(effect_region_observed, "analysis_derived" if isinstance(analysis_effect_region, dict) else "execution_derived" if effect_region_observed is not None else "unknown"),
         "effect_changed_cells_observed": _evidence_cell(effect_changed_cells_observed, "analysis_derived" if analysis_effect_changed_cells is not None else "execution_derived" if steps else "unknown"),
+        "directed_outcome_relation_supported": _evidence_cell(directed_outcome_relation_supported, "execution_derived"),
+        "exit_attempt_observed": _evidence_cell(exit_attempt_observed, "execution_derived"),
+        "exit_attempt_evidence_observed": _evidence_cell(exit_attempt_evidence_observed, "execution_derived"),
+        "exit_attempt_target_id": _evidence_cell(exit_attempt_target_id, "execution_derived" if exit_attempt_target_id is not None else "unknown"),
+        "exit_attempt_boundary_contact": _evidence_cell(exit_attempt_boundary_contact, "execution_derived"),
+        "exit_attempt_action_type": _evidence_cell(exit_attempt_action_type, "execution_derived"),
+        "attempted_boundary_contact": _evidence_cell(attempted_boundary_contact, "execution_derived"),
+        "attempted_portal_contact": _evidence_cell(attempted_portal_contact, "execution_derived"),
+        "attempted_terminal_affordance_contact": _evidence_cell(attempted_terminal_affordance_contact, "execution_derived"),
+        "attempted_escape_direction": _evidence_cell(attempted_escape_direction, "execution_derived" if attempted_escape_direction is not None else "unknown"),
+        "counterfactual_evidence_observed": _evidence_cell(counterfactual_evidence_observed, "execution_derived"),
+        "counterfactual_expectation_basis_present": _evidence_cell(counterfactual_expectation_basis_present, "execution_derived"),
+        "counterfactual_attempt_context_present": _evidence_cell(counterfactual_attempt_context_present, "execution_derived"),
+        "counterfactual_non_effect_confirmed": _evidence_cell(counterfactual_non_effect_confirmed, "execution_derived"),
+        "counterfactual_matched_expected_effect": _evidence_cell(counterfactual_matched_expected_effect, "execution_derived"),
+        "counterfactual_match_reason_code": _evidence_cell(counterfactual_match_reason_code, "execution_derived"),
+        "counterfactual_observed_effect_candidate_count": _evidence_cell(counterfactual_observed_effect_candidate_count, "execution_derived"),
+        "counterfactual_matching_effect_candidate_count": _evidence_cell(counterfactual_matching_effect_candidate_count, "execution_derived"),
+        "counterfactual_expected_target_kind": _evidence_cell(expected_target_kind, "execution_derived"),
+        "counterfactual_expected_target_value": _evidence_cell(expected_target_value, "execution_derived"),
+        "counterfactual_post_attempt_window_steps": _evidence_cell(counterfactual_post_attempt_window_steps, "execution_derived"),
+        "counterfactual_classifier_block_reason_codes": _evidence_cell(list(counterfactual_classifier_block_reason_codes), "execution_derived"),
+        "expectation_basis": _evidence_cell(expectation_basis, "execution_derived" if expectation_basis is not None else "unknown"),
+        "expected_effect_absent": _evidence_cell(observed_effect_absent, "execution_derived"),
+        "observed_effect_absent": _evidence_cell(observed_effect_absent, "execution_derived"),
+        "expected_effect_target_id": _evidence_cell(expected_effect_target_id, "execution_derived" if expected_effect_target_id is not None else "unknown"),
+        "expected_effect_type": _evidence_cell(expected_effect_type, "execution_derived" if expected_effect_type else "unknown"),
+        "expected_effect_relation": _evidence_cell(expected_effect_relation, "execution_derived" if expected_effect_relation else "unknown"),
+        "expected_relation_type": _evidence_cell(expected_effect_relation, "execution_derived" if expected_effect_relation else "unknown"),
+        "expected_trigger_contact_observed": _evidence_cell(expected_trigger_contact_observed, "execution_derived"),
+        "expected_region_reached": _evidence_cell(expected_region_reached, "execution_derived"),
+        "observed_effect_change": _evidence_cell(observed_effect_change, "execution_derived"),
+        "trigger_contact_observed": _evidence_cell(trigger_contact_observed, "execution_derived"),
+        "target_contact_observed": _evidence_cell(target_contact_observed, "execution_derived"),
+        "weak_expectation_basis": _evidence_cell(list(weak_expectation_basis), "execution_derived" if weak_expectation_basis else "unknown"),
         "success_certainty": _evidence_cell(success_certainty if any(step.done for step in steps) or terminal_action_executed else min(success_certainty, 0.5), "execution_derived"),
     }
     env_native_support_count = sum(1 for cell in outcome_evidence.values() if str(cell.get("provenance")) == "env_native")
@@ -171,11 +480,12 @@ def summarize_outcome(*, steps, request, routed_history: list[dict], rewards: li
         )
     ]
     expected_evidence_missing = [key for key in expected_evidence if key not in expected_evidence_seen]
+    normalized_step_kind = "reobserve_remote_change" if step_kind == "reobserve_region" else step_kind
     step_success = bool(
         (step_kind == "attempt_exit" and environment_terminal_success)
         or (step_kind in {"go_to_trigger", "retry_trigger", "verify_trigger_contact"} and objective_contact_observed)
         or (step_kind in {"verify_panel", "verify_gate"} and (target_presence_observed or int(effect_changed_cells_observed or 0) > 0))
-        or (step_kind == "reobserve_region" and target_presence_observed)
+        or (normalized_step_kind == "reobserve_remote_change" and target_presence_observed)
     ) if step_kind else False
     step_failure_reason = None
     if step_kind and not step_success:
@@ -190,7 +500,7 @@ def summarize_outcome(*, steps, request, routed_history: list[dict], rewards: li
         else:
             step_failure_reason = termination_reason
     chain_should_advance = bool(chain_id and step_success)
-    chain_should_retry = bool(chain_id and not step_success and step_kind in {"go_to_trigger", "verify_trigger_contact", "verify_panel", "verify_gate", "reobserve_region"} and not blocked and not environment_terminal_success)
+    chain_should_retry = bool(chain_id and not step_success and normalized_step_kind in {"go_to_trigger", "verify_trigger_contact", "verify_panel", "verify_gate", "reobserve_remote_change"} and not blocked and not environment_terminal_success)
     chain_should_abort = bool(chain_id and not chain_should_advance and not chain_should_retry and step_kind is not None)
     chain_completion_reason = None
     if chain_should_advance and step_kind == "attempt_exit" and environment_terminal_success:
@@ -237,6 +547,43 @@ def summarize_outcome(*, steps, request, routed_history: list[dict], rewards: li
         "route_progress_based_on_confident_avatar": route_progress_based_on_confident_avatar,
         "trigger_contact_based_on_confident_avatar": trigger_contact_based_on_confident_avatar,
         "target_approach_based_on_confident_avatar": target_approach_based_on_confident_avatar,
+        "directed_outcome_relation_supported": directed_outcome_relation_supported,
+        "exit_attempt_observed": exit_attempt_observed,
+        "exit_attempt_evidence_observed": exit_attempt_evidence_observed,
+        "exit_attempt_target_id": exit_attempt_target_id,
+        "exit_attempt_boundary_contact": exit_attempt_boundary_contact,
+        "exit_attempt_action_type": exit_attempt_action_type,
+        "counterfactual_evidence_observed": counterfactual_evidence_observed,
+        "counterfactual_expectation_basis_present": counterfactual_expectation_basis_present,
+        "counterfactual_attempt_context_present": counterfactual_attempt_context_present,
+        "counterfactual_non_effect_confirmed": counterfactual_non_effect_confirmed,
+        "counterfactual_matched_expected_effect": counterfactual_matched_expected_effect,
+        "counterfactual_match_reason_code": counterfactual_match_reason_code,
+        "counterfactual_observed_effect_candidate_count": int(counterfactual_observed_effect_candidate_count),
+        "counterfactual_matching_effect_candidate_count": int(counterfactual_matching_effect_candidate_count),
+        "counterfactual_expected_target_kind": expected_target_kind,
+        "counterfactual_expected_target_value": expected_target_value or None,
+        "counterfactual_post_attempt_window_steps": int(counterfactual_post_attempt_window_steps),
+        "counterfactual_classifier_block_reason_codes": list(counterfactual_classifier_block_reason_codes),
+        "expectation_basis": expectation_basis,
+        "expected_effect_absent": observed_effect_absent,
+        "expected_effect_target_id": expected_effect_target_id,
+        "expected_effect_type": expected_effect_type or None,
+        "expected_effect_relation": expected_effect_relation or None,
+        "expected_relation_type": expected_effect_relation or None,
+        "expected_target_id": expected_target_id,
+        "counterfactual_target_scope": counterfactual_target_scope,
+        "expected_trigger_contact_observed": expected_trigger_contact_observed,
+        "expected_region_reached": expected_region_reached,
+        "observed_effect_change": observed_effect_change,
+        "observed_effect_absent": observed_effect_absent,
+        "weak_expectation_basis": list(weak_expectation_basis),
+        "attempted_boundary_contact": attempted_boundary_contact,
+        "attempted_portal_contact": attempted_portal_contact,
+        "attempted_terminal_affordance_contact": attempted_terminal_affordance_contact,
+        "attempted_escape_direction": attempted_escape_direction,
+        "trigger_contact_observed": trigger_contact_observed,
+        "target_contact_observed": target_contact_observed,
         "avatar_positions": avatar_positions,
         "routed_actions": routed_history,
         "telemetry": {
@@ -275,6 +622,16 @@ def summarize_outcome(*, steps, request, routed_history: list[dict], rewards: li
         "chain_id": chain_id,
         "step_id": step_id,
         "step_kind": step_kind,
+        "step_result": {
+            "step_kind": step_kind,
+            "step_success": step_success,
+            "step_failure_reason": step_failure_reason,
+            "expected_evidence_seen": expected_evidence_seen,
+            "expected_evidence_missing": expected_evidence_missing,
+            "chain_should_advance": chain_should_advance,
+            "chain_should_retry": chain_should_retry,
+            "chain_should_abort": chain_should_abort,
+        },
         "step_success": step_success,
         "step_failure_reason": step_failure_reason,
         "expected_evidence_seen": expected_evidence_seen,

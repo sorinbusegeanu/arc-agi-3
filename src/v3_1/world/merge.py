@@ -45,10 +45,137 @@ def _merge_area_topology_metadata(areas: dict[str, dict], topology_nodes: dict[s
 def _consequence_transport_complete(row: dict) -> bool:
     if not isinstance(row, dict):
         return False
+    if bool(row.get("supports_exit_attempt_relation", False)) or bool(row.get("supports_counterfactual_relation", False)) or str(row.get("support_family") or "") in {"exit_attempt", "counterfactual"}:
+        return True
     action_name = str(row.get("action_name") or "").strip()
     action_family = str(row.get("action_family") or "").strip()
     evidence_refs = list(row.get("evidence_refs", []))
     return bool(action_name and action_family and evidence_refs)
+
+
+def _normalize_consequence_rows(raw_rows: list[dict], delta: dict) -> tuple[list[dict], dict]:
+    metadata = dict(delta.get("metadata", {}) or {})
+    step_rows = list(metadata.get("step_rows", []) or [])
+    by_step = {int(dict(row).get("step_idx", -1) or -1): dict(row) for row in step_rows if isinstance(row, dict)}
+    normalized: list[dict] = []
+    diagnostics = {
+        "exit_attempt_family_markers_present_on_raw_delta_count": 0,
+        "exit_attempt_family_markers_present_after_normalization_count": 0,
+        "exit_attempt_family_markers_lost_in_normalization_count": 0,
+        "counterfactual_family_markers_present_on_raw_delta_count": 0,
+        "counterfactual_family_markers_present_after_normalization_count": 0,
+        "counterfactual_family_markers_lost_in_normalization_count": 0,
+        "normalization_drop_reason_codes": [],
+    }
+    allowed_keys = {
+        "consequence_id",
+        "step_idx",
+        "action",
+        "action_id",
+        "action_name",
+        "action_family",
+        "state_hash_before",
+        "state_hash_after",
+        "change_signature",
+        "reward",
+        "done",
+        "blocked",
+        "local_change_area",
+        "action_effect_near_avatar",
+        "evidence_count",
+        "evidence_refs",
+        "support_family",
+        "supports_exit_attempt_relation",
+        "exit_attempt_support_count",
+        "supports_counterfactual_relation",
+        "counterfactual_support_count",
+        "supports_directed_outcome_relation",
+        "directed_outcome_support_count",
+        "source_stage",
+        "source_pass_id",
+        "source_episode_id",
+        "source_round_id",
+        "analysis_mode",
+        "confidence",
+        "inference_method",
+        "factual_observation",
+        "direct_evidence_present",
+        "direct_evidence_fields",
+        "observation_support_span",
+        "analysis_objective",
+        "last_supported_round_by_family",
+        "last_supported_pass_id_by_family",
+        "target_entity_id",
+        "area_id",
+        "telemetry",
+    }
+    for row in list(raw_rows or []):
+        payload = dict(row or {})
+        family = str(payload.get("support_family") or "")
+        is_exit = bool(payload.get("supports_exit_attempt_relation", False) or family == "exit_attempt")
+        is_cf = bool(payload.get("supports_counterfactual_relation", False) or family == "counterfactual")
+        if is_exit:
+            diagnostics["exit_attempt_family_markers_present_on_raw_delta_count"] += 1
+        if is_cf:
+            diagnostics["counterfactual_family_markers_present_on_raw_delta_count"] += 1
+        step_idx = int(payload.get("step_idx", -1) or -1)
+        step = dict(by_step.get(step_idx, {}) or {})
+        normalized_row = {key: payload.get(key) for key in allowed_keys if key in payload}
+        normalized_row["step_idx"] = step_idx if step_idx >= 0 else None
+        normalized_row["action_name"] = str(normalized_row.get("action_name") or step.get("action_name") or step.get("action_type") or payload.get("action") or "")
+        normalized_row["action"] = normalized_row.get("action") or normalized_row["action_name"]
+        normalized_row["action_family"] = str(normalized_row.get("action_family") or step.get("action_family") or "unknown")
+        evidence_refs = list(normalized_row.get("evidence_refs", []) or [])
+        if not evidence_refs and step_idx >= 0:
+            evidence_refs = [f"{delta.get('episode_id')}:{step_idx}"]
+        normalized_row["evidence_refs"] = evidence_refs
+        normalized_row["consequence_id"] = str(normalized_row.get("consequence_id") or "") or ""
+        if family in {"exit_attempt", "counterfactual"} and not normalized_row["consequence_id"]:
+            normalized_row["consequence_id"] = f"{family}:{step_idx if step_idx >= 0 else 'unknown'}"
+        normalized_row["source_stage"] = str(normalized_row.get("source_stage") or "analysis")
+        normalized_row["source_pass_id"] = int(normalized_row.get("source_pass_id", delta.get("pass_id", 0)) or 0)
+        normalized_row["source_episode_id"] = str(normalized_row.get("source_episode_id") or delta.get("episode_id") or "")
+        normalized_row["analysis_mode"] = str(normalized_row.get("analysis_mode") or metadata.get("analysis_mode") or "")
+        if family == "exit_attempt":
+            normalized_row["support_family"] = "exit_attempt"
+            normalized_row["supports_exit_attempt_relation"] = True
+            normalized_row["exit_attempt_support_count"] = int(normalized_row.get("exit_attempt_support_count", 0) or 0) or 1
+        if family == "counterfactual":
+            normalized_row["support_family"] = "counterfactual"
+            normalized_row["supports_counterfactual_relation"] = True
+            normalized_row["counterfactual_support_count"] = int(normalized_row.get("counterfactual_support_count", 0) or 0) or 1
+        if family in {"exit_attempt", "counterfactual"} and not normalized_row.get("evidence_refs"):
+            diagnostics["normalization_drop_reason_codes"].append("normalized_row_missing_store_key_basis")
+            continue
+        if family in {"exit_attempt", "counterfactual"} and not (
+            normalized_row.get("action_name")
+            or normalized_row.get("target_entity_id")
+            or normalized_row.get("area_id")
+            or dict(normalized_row.get("telemetry", {}) or {}).get("attempted_escape_direction")
+            or dict(normalized_row.get("telemetry", {}) or {}).get("expected_target_id")
+        ):
+            diagnostics["normalization_drop_reason_codes"].append("normalized_row_missing_relation_signature")
+            continue
+        if is_exit and not (normalized_row.get("support_family") == "exit_attempt" or normalized_row.get("supports_exit_attempt_relation") is True):
+            diagnostics["normalization_drop_reason_codes"].append("family_fields_not_in_allowed_keys")
+        if is_cf and not (normalized_row.get("support_family") == "counterfactual" or normalized_row.get("supports_counterfactual_relation") is True):
+            diagnostics["normalization_drop_reason_codes"].append("family_fields_not_in_allowed_keys")
+        if is_exit and (normalized_row.get("support_family") == "exit_attempt" or normalized_row.get("supports_exit_attempt_relation") is True):
+            diagnostics["exit_attempt_family_markers_present_after_normalization_count"] += 1
+        if is_cf and (normalized_row.get("support_family") == "counterfactual" or normalized_row.get("supports_counterfactual_relation") is True):
+            diagnostics["counterfactual_family_markers_present_after_normalization_count"] += 1
+        normalized.append(normalized_row)
+    diagnostics["exit_attempt_family_markers_lost_in_normalization_count"] = max(
+        0,
+        int(diagnostics["exit_attempt_family_markers_present_on_raw_delta_count"])
+        - int(diagnostics["exit_attempt_family_markers_present_after_normalization_count"]),
+    )
+    diagnostics["counterfactual_family_markers_lost_in_normalization_count"] = max(
+        0,
+        int(diagnostics["counterfactual_family_markers_present_on_raw_delta_count"])
+        - int(diagnostics["counterfactual_family_markers_present_after_normalization_count"]),
+    )
+    return normalized, diagnostics
 
 
 def _has_direct_fields(row: dict, required_fields: set[str]) -> bool:
@@ -192,6 +319,335 @@ def _combine_rows(*stores: dict[str, dict]) -> dict[str, dict]:
     return combined
 
 
+def _accumulate_support_family_diagnostics(existing: dict, incoming: dict) -> dict:
+    merged = dict(existing or {})
+    for key, value in dict(incoming or {}).items():
+        if isinstance(value, int):
+            merged[key] = int(merged.get(key, 0) or 0) + value
+        elif isinstance(value, list):
+            current = list(merged.get(key, []) or [])
+            for item in value:
+                if item not in current:
+                    current.append(item)
+            merged[key] = current
+        else:
+            merged[key] = value
+    return merged
+
+
+def _fill_family_fields_from_sources(combined: dict[str, dict], *source_stores: dict[str, dict]) -> tuple[dict[str, dict], int]:
+    family_fields = {
+        "supports_exit_attempt_relation",
+        "exit_attempt_support_count",
+        "supports_counterfactual_relation",
+        "counterfactual_support_count",
+        "supports_directed_outcome_relation",
+        "directed_outcome_support_count",
+        "support_family",
+        "last_supported_round_by_family",
+        "last_supported_pass_id_by_family",
+    }
+    rich_sources: dict[str, dict] = {}
+    for store in source_stores:
+        for row_id, row in dict(store or {}).items():
+            payload = dict(row or {})
+            if any(field in payload for field in family_fields):
+                current = dict(rich_sources.get(str(row_id), {}) or {})
+                current.update({field: payload.get(field) for field in family_fields if field in payload})
+                rich_sources[str(row_id)] = current
+    fillthrough_applied = 0
+    next_rows: dict[str, dict] = {}
+    for row_id, row in dict(combined or {}).items():
+        payload = dict(row or {})
+        source = dict(rich_sources.get(str(row_id), {}) or {})
+        if source:
+            before = dict(payload)
+            for field in family_fields:
+                if field not in payload and field in source:
+                    payload[field] = source[field]
+            if payload != before:
+                fillthrough_applied += 1
+        next_rows[str(row_id)] = payload
+    return next_rows, fillthrough_applied
+
+
+def _fill_entity_identity_fields_from_sources(combined: dict[str, dict], *source_stores: dict[str, dict]) -> tuple[dict[str, dict], int]:
+    identity_fields = {
+        "identity_status",
+        "identity_support_count",
+        "identity_contradiction_count",
+        "identity_cross_round_stability",
+        "identity_last_confirmed_round",
+        "identity_match_provenance",
+        "identity_aliases",
+    }
+    rich_sources: dict[str, dict] = {}
+    for store in source_stores:
+        for row_id, row in dict(store or {}).items():
+            payload = dict(row or {})
+            if any(field in payload for field in identity_fields):
+                current = dict(rich_sources.get(str(row_id), {}) or {})
+                rich_sources[str(row_id)] = _merge_entity_identity_fields(current, payload)
+    fillthrough_applied = 0
+    next_rows: dict[str, dict] = {}
+    for row_id, row in dict(combined or {}).items():
+        payload = dict(row or {})
+        source = dict(rich_sources.get(str(row_id), {}) or {})
+        if source and any(field not in payload for field in identity_fields):
+            before_missing = any(field not in payload for field in identity_fields)
+            payload = _merge_entity_identity_fields(source, payload)
+            if before_missing:
+                fillthrough_applied += 1
+        next_rows[str(row_id)] = payload
+    return next_rows, fillthrough_applied
+
+
+def _stable_edge_identity(row: dict) -> str:
+    payload = dict(row or {})
+    src = str(payload.get("src") or payload.get("source_node_id") or payload.get("source_entity_id") or payload.get("source_area_id") or "")
+    dst = str(payload.get("dst") or payload.get("target_node_id") or payload.get("target_entity_id") or payload.get("target_area_id") or "")
+    relation = str(payload.get("edge_kind") or payload.get("relation_type") or payload.get("transition_type") or payload.get("action_key") or "")
+    directionality = str(payload.get("directionality") or ("directed" if src or dst else "unknown"))
+    return "|".join((src, dst, relation, directionality))
+
+
+def _stronger_identity_status(left: str, right: str) -> str:
+    ranking = {
+        "unknown": 0,
+        "new_entity": 1,
+        "ambiguous_match": 2,
+        "split_candidate": 2,
+        "merge_candidate": 2,
+        "probable": 3,
+        "match_existing": 4,
+        "confirmed": 5,
+    }
+    return left if ranking.get(str(left or "unknown"), 0) >= ranking.get(str(right or "unknown"), 0) else right
+
+
+def _merge_entity_identity_fields(existing_row: dict, incoming_row: dict) -> dict:
+    existing = dict(existing_row or {})
+    incoming = dict(incoming_row or {})
+    if not any(key in incoming for key in {
+        "identity_status",
+        "identity_support_count",
+        "identity_contradiction_count",
+        "identity_cross_round_stability",
+        "identity_last_confirmed_round",
+        "identity_match_provenance",
+        "identity_aliases",
+    }):
+        return existing
+    existing["identity_status"] = _stronger_identity_status(
+        str(existing.get("identity_status") or "unknown"),
+        str(incoming.get("identity_status") or "unknown"),
+    )
+    existing["identity_support_count"] = int(existing.get("identity_support_count", 0) or 0) + int(incoming.get("identity_support_count", 0) or 0)
+    existing["identity_contradiction_count"] = int(existing.get("identity_contradiction_count", 0) or 0) + int(incoming.get("identity_contradiction_count", 0) or 0)
+    existing["identity_cross_round_stability"] = max(
+        int(existing.get("identity_cross_round_stability", 0) or 0),
+        int(incoming.get("identity_cross_round_stability", 0) or 0),
+    )
+    existing["identity_last_confirmed_round"] = max(
+        int(existing.get("identity_last_confirmed_round", 0) or 0),
+        int(incoming.get("identity_last_confirmed_round", 0) or 0),
+    )
+    existing["identity_match_provenance"] = sorted(
+        set(list(existing.get("identity_match_provenance", []) or []) + list(incoming.get("identity_match_provenance", []) or []))
+    )
+    existing["identity_aliases"] = sorted(
+        set(list(existing.get("identity_aliases", []) or []) + list(incoming.get("identity_aliases", []) or []))
+    )
+    return existing
+
+
+def _merge_topology_edge_support(existing_row: dict, incoming_row: dict) -> dict:
+    existing = dict(existing_row or {})
+    incoming = dict(incoming_row or {})
+    merged = dict(existing)
+    merged.update({k: v for k, v in incoming.items() if k not in {
+        "display_support_count",
+        "match_support_count",
+        "counterfactual_support_count",
+        "directed_outcome_support_count",
+        "exit_attempt_support_count",
+        "last_supported_round_by_family",
+        "last_supported_pass_id_by_family",
+        "source_episode_ids",
+        "confidence",
+        "evidence_tier",
+    }})
+    family_markers = {
+        "display_support_count": bool(incoming.get("supports_display_relation", False)),
+        "match_support_count": bool(incoming.get("supports_match_relation", False)),
+        "counterfactual_support_count": bool(incoming.get("supports_counterfactual_relation", False)),
+        "directed_outcome_support_count": bool(incoming.get("supports_directed_outcome_relation", False)),
+        "exit_attempt_support_count": bool(incoming.get("supports_exit_attempt_relation", False)),
+    }
+    relation_kind = str(incoming.get("edge_kind") or incoming.get("relation_type") or "")
+    if not any(family_markers.values()):
+        if relation_kind == "displays":
+            family_markers["display_support_count"] = True
+        elif relation_kind == "matches":
+            family_markers["match_support_count"] = True
+    last_rounds = dict(existing.get("last_supported_round_by_family", {}) or {})
+    last_passes = dict(existing.get("last_supported_pass_id_by_family", {}) or {})
+    incoming_round = int(incoming.get("source_round_id", incoming.get("round_id", 0)) or 0)
+    incoming_pass = int(incoming.get("source_pass_id", 0) or 0)
+    for family in (
+        "display_support_count",
+        "match_support_count",
+        "counterfactual_support_count",
+        "directed_outcome_support_count",
+        "exit_attempt_support_count",
+    ):
+        existing_count = int(existing.get(family, 0) or 0)
+        incoming_count = int(incoming.get(family, 0) or 0)
+        increment = incoming_count
+        if increment <= 0 and family_markers.get(family, False):
+            increment = 1
+        merged[family] = existing_count + max(0, increment)
+        if max(0, increment) > 0:
+            family_name = family.removesuffix("_count")
+            last_rounds[family_name] = max(int(last_rounds.get(family_name, 0) or 0), incoming_round)
+            last_passes[family_name] = max(int(last_passes.get(family_name, 0) or 0), incoming_pass)
+    merged["last_supported_round_by_family"] = last_rounds
+    merged["last_supported_pass_id_by_family"] = last_passes
+    merged["source_episode_ids"] = sorted(set(list(existing.get("source_episode_ids", []) or []) + [str(incoming.get("source_episode_id") or "")] + list(incoming.get("source_episode_ids", []) or [])))
+    merged["confidence"] = max(float(existing.get("confidence", 0.0) or 0.0), float(incoming.get("confidence", 0.0) or 0.0))
+    merged["evidence_tier"] = "observed" if "observed" in {str(existing.get("evidence_tier") or ""), str(incoming.get("evidence_tier") or "")} else str(existing.get("evidence_tier") or incoming.get("evidence_tier") or "hypothesized")
+    merged["support_count"] = max(
+        int(existing.get("support_count", 0) or 0),
+        int(merged.get("display_support_count", 0) or 0)
+        + int(merged.get("match_support_count", 0) or 0)
+        + int(merged.get("counterfactual_support_count", 0) or 0)
+        + int(merged.get("directed_outcome_support_count", 0) or 0)
+        + int(merged.get("exit_attempt_support_count", 0) or 0),
+    )
+    return merged
+
+
+def _merge_consequence_family_support(existing_row: dict, incoming_row: dict) -> dict:
+    existing = dict(existing_row or {})
+    incoming = dict(incoming_row or {})
+    merged = dict(existing)
+    merged.update(incoming)
+    support_family = str(incoming.get("support_family") or existing.get("support_family") or "")
+    merged["supports_exit_attempt_relation"] = bool(existing.get("supports_exit_attempt_relation", False) or incoming.get("supports_exit_attempt_relation", False) or support_family == "exit_attempt")
+    merged["supports_counterfactual_relation"] = bool(existing.get("supports_counterfactual_relation", False) or incoming.get("supports_counterfactual_relation", False) or support_family == "counterfactual")
+    merged["supports_directed_outcome_relation"] = bool(existing.get("supports_directed_outcome_relation", False) or incoming.get("supports_directed_outcome_relation", False) or support_family == "directed_outcome")
+    for count_field, marker_field in (
+        ("exit_attempt_support_count", "supports_exit_attempt_relation"),
+        ("counterfactual_support_count", "supports_counterfactual_relation"),
+        ("directed_outcome_support_count", "supports_directed_outcome_relation"),
+    ):
+        increment = int(incoming.get(count_field, 0) or 0)
+        if increment <= 0 and bool(incoming.get(marker_field, False)):
+            increment = 1
+        merged[count_field] = int(existing.get(count_field, 0) or 0) + max(0, increment)
+    last_rounds = dict(existing.get("last_supported_round_by_family", {}) or {})
+    last_passes = dict(existing.get("last_supported_pass_id_by_family", {}) or {})
+    source_round = int(incoming.get("source_round_id", incoming.get("round_id", 0)) or 0)
+    source_pass = int(incoming.get("source_pass_id", 0) or 0)
+    for family_name, marker in (
+        ("exit_attempt", merged.get("supports_exit_attempt_relation")),
+        ("counterfactual", merged.get("supports_counterfactual_relation")),
+        ("directed_outcome", merged.get("supports_directed_outcome_relation")),
+    ):
+        if marker:
+            last_rounds[family_name] = max(int(last_rounds.get(family_name, 0) or 0), source_round)
+            last_passes[family_name] = max(int(last_passes.get(family_name, 0) or 0), source_pass)
+    merged["last_supported_round_by_family"] = last_rounds
+    merged["last_supported_pass_id_by_family"] = last_passes
+    if not support_family:
+        support_family = (
+            "exit_attempt" if merged.get("supports_exit_attempt_relation")
+            else "counterfactual" if merged.get("supports_counterfactual_relation")
+            else "directed_outcome" if merged.get("supports_directed_outcome_relation")
+            else ""
+        )
+    if support_family:
+        merged["support_family"] = support_family
+    return merged
+
+
+def _synthesize_family_consequences_from_delta(delta: dict) -> list[dict]:
+    metadata = dict(delta.get("metadata", {}) or {})
+    debug = dict(metadata.get("support_family_emit_debug", {}) or {})
+    families = dict(debug.get("families", {}) or {})
+    step_rows = list(metadata.get("step_rows", []) or [])
+    if not step_rows:
+        return []
+    first_step = dict(step_rows[0] or {})
+    telemetry = dict(first_step.get("telemetry", {}) or {})
+    synthesized: list[dict] = []
+    if bool(dict(families.get("exit_attempt", {}) or {}).get("row_emitted", False)):
+        synthesized.append(
+            {
+                "consequence_id": f"exit_attempt:{str(telemetry.get('exit_attempt_target_id') or first_step.get('area_id') or telemetry.get('attempted_escape_direction') or 'unknown')}",
+                "step_idx": int(first_step.get("step_idx", 0) or 0),
+                "action": str(first_step.get("action_name") or first_step.get("action_type") or "unknown"),
+                "action_id": first_step.get("action_id"),
+                "action_name": str(first_step.get("action_name") or first_step.get("action_type") or "unknown"),
+                "action_family": str(first_step.get("action_family") or "unknown"),
+                "reward": 0.0,
+                "done": False,
+                "blocked": bool(telemetry.get("attempted_boundary_contact")),
+                "local_change_area": 0,
+                "action_effect_near_avatar": False,
+                "evidence_count": 1,
+                "evidence_refs": [f"{delta.get('episode_id')}:{int(first_step.get('step_idx', 0) or 0)}:exit_attempt"],
+                "support_family": "exit_attempt",
+                "supports_exit_attempt_relation": True,
+                "exit_attempt_support_count": 1,
+                "last_supported_round_by_family": {"exit_attempt": int(delta.get("round_id", 0) or 0)},
+                "last_supported_pass_id_by_family": {"exit_attempt": int(delta.get("pass_id", 0) or 0)},
+                "source_stage": "analysis",
+                "source_pass_id": int(delta.get("pass_id", 0) or 0),
+                "source_episode_id": str(delta.get("episode_id") or ""),
+                "source_round_id": int(delta.get("round_id", 0) or 0),
+                "analysis_objective": "broad_trigger_suspicion",
+                "direct_evidence_present": False,
+                "direct_evidence_fields": ["supports_exit_attempt_relation"],
+                "factual_observation": False,
+                "confidence": 0.5,
+            }
+        )
+    if bool(dict(families.get("counterfactual", {}) or {}).get("row_emitted", False)):
+        synthesized.append(
+            {
+                "consequence_id": f"counterfactual:{str(telemetry.get('expected_target_id') or first_step.get('area_id') or 'unknown')}",
+                "step_idx": int(first_step.get("step_idx", 0) or 0),
+                "action": str(first_step.get("action_name") or first_step.get("action_type") or "unknown"),
+                "action_id": first_step.get("action_id"),
+                "action_name": str(first_step.get("action_name") or first_step.get("action_type") or "unknown"),
+                "action_family": str(first_step.get("action_family") or "unknown"),
+                "reward": 0.0,
+                "done": False,
+                "blocked": bool(telemetry.get("observed_effect_absent")),
+                "local_change_area": 0,
+                "action_effect_near_avatar": False,
+                "evidence_count": 1,
+                "evidence_refs": [f"{delta.get('episode_id')}:{int(first_step.get('step_idx', 0) or 0)}:counterfactual"],
+                "support_family": "counterfactual",
+                "supports_counterfactual_relation": True,
+                "counterfactual_support_count": 1,
+                "last_supported_round_by_family": {"counterfactual": int(delta.get("round_id", 0) or 0)},
+                "last_supported_pass_id_by_family": {"counterfactual": int(delta.get("pass_id", 0) or 0)},
+                "source_stage": "analysis",
+                "source_pass_id": int(delta.get("pass_id", 0) or 0),
+                "source_episode_id": str(delta.get("episode_id") or ""),
+                "source_round_id": int(delta.get("round_id", 0) or 0),
+                "analysis_objective": "broad_trigger_suspicion",
+                "direct_evidence_present": False,
+                "direct_evidence_fields": ["supports_counterfactual_relation"],
+                "factual_observation": False,
+                "confidence": 0.5,
+            }
+        )
+    return synthesized
+
+
 def _remove_collapsed_pois(store: dict[str, dict], collapsed_poi_ids: list[str] | set[str] | tuple[str, ...]) -> dict[str, dict]:
     collapsed = {str(value) for value in list(collapsed_poi_ids or []) if value}
     if not collapsed:
@@ -301,13 +757,53 @@ def _apply_step_target_effects(entities: dict[str, dict], delta: dict) -> dict[s
 
 
 def _merge_topology_store(existing: dict[str, dict], incoming_nodes: list[dict], incoming_edges: list[dict]) -> dict[str, dict]:
-    nodes, edges = merge_topology(
+    nodes, _ = merge_topology(
         dict(existing.get("nodes", {})),
         dict(existing.get("edges", {})),
         {row["node_id"]: row for row in incoming_nodes if row.get("node_id")},
-        {row["edge_id"]: row for row in incoming_edges if row.get("edge_id")},
+        {},
     )
+    edges = {str(edge_id): dict(row) for edge_id, row in dict(existing.get("edges", {})).items()}
+    edge_identity_to_id = {_stable_edge_identity(row): str(edge_id) for edge_id, row in edges.items()}
+    for row in list(incoming_edges or []):
+        incoming = dict(row)
+        stable_identity = _stable_edge_identity(incoming)
+        edge_id = edge_identity_to_id.get(stable_identity) or str(incoming.get("edge_id") or "")
+        existing_row = dict(edges.get(edge_id, {}) or {})
+        merged_edge = _merge_topology_edge_support(existing_row, incoming)
+        if not edge_id:
+            edge_id = str(merged_edge.get("edge_id") or stable_identity)
+        merged_edge["edge_id"] = edge_id
+        merged_edge["stable_edge_identity"] = stable_identity
+        edges[edge_id] = merged_edge
+        edge_identity_to_id[stable_identity] = edge_id
     return {"nodes": nodes, "edges": edges}
+
+
+def _merge_entity_store(existing: dict[str, dict], incoming_rows: list[dict]) -> dict[str, dict]:
+    merged = merge_entities(existing, incoming_rows)
+    incoming_by_id = {
+        str(row.get("entity_id") or row.get("poi_id") or ""): dict(row)
+        for row in list(incoming_rows or [])
+        if str(row.get("entity_id") or row.get("poi_id") or "")
+    }
+    updated: dict[str, dict] = {}
+    for row_id, row in dict(merged or {}).items():
+        payload = dict(row)
+        incoming = incoming_by_id.get(str(payload.get("entity_id") or row_id or ""), {})
+        payload = _merge_entity_identity_fields(payload, incoming)
+        updated[str(row_id)] = payload
+    return updated
+
+
+def _assert_rich_fields_preserved(*, split_store: dict[str, dict], combined_store: dict[str, dict], field_names: set[str], label: str) -> None:
+    for row_id, row in dict(split_store or {}).items():
+        if not any(field in row for field in field_names):
+            continue
+        combined = dict(combined_store.get(str(row_id), {}) or {})
+        missing = [field for field in field_names if field in row and field not in combined]
+        if missing:
+            raise AssertionError(f"{label}: fields {missing} present before rebuild and missing after rebuild for {row_id}")
 
 
 def _consequence_sort_key(row: dict) -> tuple:
@@ -321,8 +817,22 @@ def _consequence_sort_key(row: dict) -> tuple:
 def _prune_consequence_store(store: dict[str, dict], *, limit: int) -> dict[str, dict]:
     if limit <= 0 or len(store) <= limit:
         return {str(row_id): dict(row) for row_id, row in store.items()}
-    ordered = sorted((dict(row) for row in store.values()), key=_consequence_sort_key, reverse=True)
-    kept = ordered[:limit]
+    rows = [dict(row) for row in store.values()]
+    family_rows = [
+        row for row in rows
+        if str(row.get("support_family") or "") in {"exit_attempt", "counterfactual", "directed_outcome"}
+        or bool(row.get("supports_exit_attempt_relation", False))
+        or bool(row.get("supports_counterfactual_relation", False))
+        or bool(row.get("supports_directed_outcome_relation", False))
+    ]
+    family_ids = {str(row.get("consequence_id") or "") for row in family_rows if row.get("consequence_id")}
+    ordered = sorted(
+        (row for row in rows if str(row.get("consequence_id") or "") not in family_ids),
+        key=_consequence_sort_key,
+        reverse=True,
+    )
+    keep_budget = max(0, limit - len(family_rows))
+    kept = family_rows + ordered[:keep_budget]
     return {str(row.get("consequence_id")): row for row in kept if row.get("consequence_id")}
 
 
@@ -343,6 +853,13 @@ def _enrich_indexes_with_evidence_tiers(next_state: dict) -> dict:
             "entity_id": entity_id,
             "area_id": entity.get("area_id"),
             "evidence_tier": entity.get("evidence_tier", "hypothesized"),
+            "identity_status": str(entity.get("identity_status") or "unknown"),
+            "identity_strength_profile": {
+                "identity_status": str(entity.get("identity_status") or "unknown"),
+                "support_count": int(entity.get("identity_support_count", 0) or 0),
+                "contradiction_count": int(entity.get("identity_contradiction_count", 0) or 0),
+                "cross_round_stability": int(entity.get("identity_cross_round_stability", 0) or 0),
+            },
         }
 
     def consequence_row(consequence_id: str) -> dict:
@@ -385,6 +902,20 @@ def _enrich_indexes_with_evidence_tiers(next_state: dict) -> dict:
         ]
         for evidence_ref, row_ids in dict(indexes.get("evidence_index", {})).items()
     }
+    indexes["topology_edge_support_profile_rows"] = {
+        str(edge_id): {
+            "edge_id": str(edge_id),
+            "evidence_tier": str(dict(edge).get("evidence_tier") or "hypothesized"),
+            "evidence_support_profile": {
+                "display": int(dict(edge).get("display_support_count", 0) or 0),
+                "match": int(dict(edge).get("match_support_count", 0) or 0),
+                "counterfactual": int(dict(edge).get("counterfactual_support_count", 0) or 0),
+                "directed_outcome": int(dict(edge).get("directed_outcome_support_count", 0) or 0),
+                "exit_attempt": int(dict(edge).get("exit_attempt_support_count", 0) or 0),
+            },
+        }
+        for edge_id, edge in dict(next_state.get("topology_edges", {}) or {}).items()
+    }
     return indexes
 
 
@@ -405,7 +936,18 @@ def _build_strict_split_indexes(*, areas: dict, entities: dict, consequences: di
             if isinstance(cell, (list, tuple)) and len(cell) == 2:
                 topology_lookup["node_ids_by_cell"][f"{int(cell[0])}:{int(cell[1])}"] = f"cell:{int(cell[0])}:{int(cell[1])}"
     for entity_id, entity in dict(entities).items():
-        row = {"entity_id": str(entity_id), "area_id": str(entity.get("area_id") or "global"), "evidence_tier": str(entity.get("evidence_tier") or "hypothesized")}
+        row = {
+            "entity_id": str(entity_id),
+            "area_id": str(entity.get("area_id") or "global"),
+            "evidence_tier": str(entity.get("evidence_tier") or "hypothesized"),
+            "identity_status": str(entity.get("identity_status") or "unknown"),
+            "identity_strength_profile": {
+                "identity_status": str(entity.get("identity_status") or "unknown"),
+                "support_count": int(entity.get("identity_support_count", 0) or 0),
+                "contradiction_count": int(entity.get("identity_contradiction_count", 0) or 0),
+                "cross_round_stability": int(entity.get("identity_cross_round_stability", 0) or 0),
+            },
+        }
         entities_by_area_rows.setdefault(row["area_id"], []).append(row)
         if entity.get("kind") == "poi":
             pois_by_area_rows.setdefault(row["area_id"], []).append(row)
@@ -442,6 +984,20 @@ def _build_strict_split_indexes(*, areas: dict, entities: dict, consequences: di
         "consequence_by_action_rows": {key: sorted(value, key=lambda row: row["consequence_id"]) for key, value in consequence_by_action_rows.items()},
         "evidence_index_rows": {key: sorted(value, key=lambda row: row["row_id"]) for key, value in evidence_index_rows.items()},
         "topology_lookup": topology_lookup,
+        "topology_edge_support_profile_rows": {
+            str(edge_id): {
+                "edge_id": str(edge_id),
+                "evidence_tier": str(dict(edge).get("evidence_tier") or "hypothesized"),
+                "evidence_support_profile": {
+                    "display": int(dict(edge).get("display_support_count", 0) or 0),
+                    "match": int(dict(edge).get("match_support_count", 0) or 0),
+                    "counterfactual": int(dict(edge).get("counterfactual_support_count", 0) or 0),
+                    "directed_outcome": int(dict(edge).get("directed_outcome_support_count", 0) or 0),
+                    "exit_attempt": int(dict(edge).get("exit_attempt_support_count", 0) or 0),
+                },
+            }
+            for edge_id, edge in dict(topology_edges).items()
+        },
         "entity_count": len(dict(entities)),
         "area_count": len(dict(areas)),
         "topology_node_count": len(dict(topology_nodes)),
@@ -467,25 +1023,64 @@ def apply_delta(state: dict, delta: dict, *, max_consequences: int = 100) -> tup
     classified_areas = [_classify_row("areas", row, delta) for row in list(delta.get("areas", ()) or [])]
     classified_entities = [_classify_row("entities", row, delta) for row in list(delta.get("entities", ()) or [])]
     prepopulated_consequences = list(delta.get("consequences", ()))
-    raw_consequences = (
-        prepopulated_consequences
-        if prepopulated_consequences and all(_consequence_transport_complete(row) for row in prepopulated_consequences)
-        else extract_consequence_records(delta)
+    exit_attempt_rows_seen_on_raw_delta = int(
+        sum(
+            1
+            for row in prepopulated_consequences
+            if bool(dict(row).get("supports_exit_attempt_relation", False)) or str(dict(row).get("support_family") or "") == "exit_attempt"
+        )
+    )
+    raw_consequences = prepopulated_consequences if prepopulated_consequences else extract_consequence_records(delta)
+    raw_consequences, normalization_diagnostics = _normalize_consequence_rows(raw_consequences, delta)
+    if not raw_consequences and prepopulated_consequences and not all(_consequence_transport_complete(row) for row in prepopulated_consequences):
+        normalization_diagnostics["normalization_drop_reason_codes"] = list(normalization_diagnostics.get("normalization_drop_reason_codes", []) or []) + ["family_row_kind_unrecognized"]
+        raw_consequences, fallback_diagnostics = _normalize_consequence_rows(extract_consequence_records(delta), delta)
+        normalization_diagnostics = _accumulate_support_family_diagnostics(normalization_diagnostics, fallback_diagnostics)
+    exit_attempt_rows_seen_after_row_normalization = int(
+        normalization_diagnostics.get("exit_attempt_family_markers_present_after_normalization_count", 0) or 0
     )
     classified_consequences = [_classify_row("consequences", row, delta) for row in raw_consequences]
+    if not any(bool(dict(row).get("supports_exit_attempt_relation", False)) or str(dict(row).get("support_family") or "") == "exit_attempt" for row in classified_consequences):
+        synthesized_family_consequences = [
+            _classify_row("consequences", row, delta)
+            for row in _synthesize_family_consequences_from_delta(delta)
+        ]
+        classified_consequences.extend(synthesized_family_consequences)
     classified_trigger_zones = [_classify_row("trigger_zones", row, delta) for row in list(delta.get("trigger_zones", ()) or [])]
     classified_topology_nodes = [_classify_row("topology_nodes", row, delta) for row in list(delta.get("topology_nodes", ()) or [])]
     classified_topology_edges = [_classify_row("topology_edges", row, delta) for row in list(delta.get("topology_edges", ()) or [])]
 
+    exit_attempt_ingress_rows = [
+        dict(row) for row in classified_consequences
+        if bool(dict(row).get("supports_exit_attempt_relation", False)) or str(dict(row).get("support_family") or "") == "exit_attempt"
+    ]
+    exit_attempt_merge_diagnostics = {
+        "exit_attempt_rows_seen_on_raw_delta": int(exit_attempt_rows_seen_on_raw_delta),
+        "exit_attempt_rows_seen_after_row_normalization": int(exit_attempt_rows_seen_after_row_normalization),
+        "counterfactual_rows_seen_on_raw_delta": int(normalization_diagnostics.get("counterfactual_family_markers_present_on_raw_delta_count", 0) or 0),
+        "counterfactual_rows_seen_after_row_normalization": int(normalization_diagnostics.get("counterfactual_family_markers_present_after_normalization_count", 0) or 0),
+        "exit_attempt_family_markers_present_on_raw_delta_count": int(normalization_diagnostics.get("exit_attempt_family_markers_present_on_raw_delta_count", 0) or 0),
+        "exit_attempt_family_markers_present_after_normalization_count": int(normalization_diagnostics.get("exit_attempt_family_markers_present_after_normalization_count", 0) or 0),
+        "exit_attempt_family_markers_lost_in_normalization_count": int(normalization_diagnostics.get("exit_attempt_family_markers_lost_in_normalization_count", 0) or 0),
+        "counterfactual_family_markers_present_on_raw_delta_count": int(normalization_diagnostics.get("counterfactual_family_markers_present_on_raw_delta_count", 0) or 0),
+        "counterfactual_family_markers_present_after_normalization_count": int(normalization_diagnostics.get("counterfactual_family_markers_present_after_normalization_count", 0) or 0),
+        "counterfactual_family_markers_lost_in_normalization_count": int(normalization_diagnostics.get("counterfactual_family_markers_lost_in_normalization_count", 0) or 0),
+        "exit_attempt_rows_seen_at_merge_ingress": int(len(exit_attempt_ingress_rows)),
+        "exit_attempt_rows_classified_observed": int(sum(1 for row in exit_attempt_ingress_rows if str(row.get("evidence_tier") or "") == "observed")),
+        "exit_attempt_rows_classified_hypothesized": int(sum(1 for row in exit_attempt_ingress_rows if str(row.get("evidence_tier") or "") != "observed")),
+        "exit_attempt_rows_dropped_before_store": 0,
+        "exit_attempt_drop_reason_codes": list(normalization_diagnostics.get("normalization_drop_reason_codes", []) or []),
+    }
+
     merged_areas = merge_areas(state.get("areas", {}), classified_areas)
     collapsed_poi_ids = list(dict(delta.get("metadata", {})).get("collapsed_poi_ids", []) or [])
-    observed_entities = merge_entities(
+    observed_entities = _merge_entity_store(
         state.get("observed_entities", {}),
         [row for row in classified_entities if row.get("evidence_tier") == "observed"],
     )
     observed_entities = _remove_collapsed_pois(observed_entities, collapsed_poi_ids)
     observed_entities = _remove_subsumed_poi_rows(observed_entities)
-    hypothesized_entities = merge_entities(
+    hypothesized_entities = _merge_entity_store(
         state.get("hypothesized_entities", {}),
         [row for row in classified_entities if row.get("evidence_tier") != "observed"],
     )
@@ -513,11 +1108,46 @@ def apply_delta(state: dict, delta: dict, *, max_consequences: int = 100) -> tup
     )
 
     merged_entities = _combine_rows(hypothesized_entities, observed_entities)
+    merged_entities, identity_fillthrough_applied_count = _fill_entity_identity_fields_from_sources(
+        merged_entities,
+        hypothesized_entities,
+        observed_entities,
+    )
     merged_consequences = _combine_rows(hypothesized_consequences, observed_consequences)
+    merged_consequences, consequence_family_fillthrough_applied_count = _fill_family_fields_from_sources(
+        merged_consequences,
+        hypothesized_consequences,
+        observed_consequences,
+    )
     merged_consequences = _prune_consequence_store(merged_consequences, limit=max_consequences)
     merged_ids = set(merged_consequences.keys())
     observed_consequences = {row_id: row for row_id, row in observed_consequences.items() if row_id in merged_ids}
     hypothesized_consequences = {row_id: row for row_id, row in hypothesized_consequences.items() if row_id in merged_ids}
+    split_written_ids = {
+        str(row_id)
+        for store in (observed_consequences, hypothesized_consequences)
+        for row_id, row in dict(store or {}).items()
+        if bool(dict(row).get("supports_exit_attempt_relation", False)) or str(dict(row).get("support_family") or "") == "exit_attempt"
+    }
+    ingress_ids = {
+        str(row.get("consequence_id") or "")
+        for row in exit_attempt_ingress_rows
+        if str(row.get("consequence_id") or "")
+    }
+    missing_ingress_ids = sorted(ingress_ids - split_written_ids)
+    exit_attempt_merge_diagnostics["exit_attempt_rows_dropped_before_store"] = int(len(missing_ingress_ids))
+    if missing_ingress_ids:
+        exit_attempt_merge_diagnostics["exit_attempt_drop_reason_codes"] = ["store_key_resolution_failed"]
+    if exit_attempt_rows_seen_on_raw_delta > 0 and exit_attempt_rows_seen_after_row_normalization <= 0:
+        exit_attempt_merge_diagnostics["exit_attempt_drop_reason_codes"] = list(exit_attempt_merge_diagnostics.get("exit_attempt_drop_reason_codes", []) or []) + ["normalization_dropped_family_fields"]
+    elif exit_attempt_rows_seen_after_row_normalization > 0 and len(exit_attempt_ingress_rows) <= 0:
+        exit_attempt_merge_diagnostics["exit_attempt_drop_reason_codes"] = list(exit_attempt_merge_diagnostics.get("exit_attempt_drop_reason_codes", []) or []) + ["classification_rejected_family_row"]
+    elif exit_attempt_rows_seen_on_raw_delta <= 0 and bool(dict(delta.get("metadata", {}) or {}).get("support_family_emit_debug", {})):
+        exit_attempt_merge_diagnostics["exit_attempt_drop_reason_codes"] = list(exit_attempt_merge_diagnostics.get("exit_attempt_drop_reason_codes", []) or []) + ["missing_row_kind"]
+    if ingress_ids and not split_written_ids and not exit_attempt_merge_diagnostics["exit_attempt_drop_reason_codes"]:
+        exit_attempt_merge_diagnostics["exit_attempt_drop_reason_codes"] = ["silent_disappearance_prevented"]
+    if ingress_ids and not split_written_ids and not exit_attempt_merge_diagnostics["exit_attempt_rows_dropped_before_store"]:
+        raise AssertionError("exit_attempt ingress rows seen but neither written nor dropped with reason")
     topology_nodes = _combine_rows(
         dict(hypothesized_topology.get("nodes", {})),
         dict(observed_topology.get("nodes", {})),
@@ -550,9 +1180,15 @@ def apply_delta(state: dict, delta: dict, *, max_consequences: int = 100) -> tup
     next_state["observed_entities"] = observed_entities
     next_state["hypothesized_entities"] = hypothesized_entities
     next_state["entities"] = merged_entities
+    next_state["identity_fillthrough_applied_count"] = int(identity_fillthrough_applied_count)
     next_state["observed_consequences"] = observed_consequences
     next_state["hypothesized_consequences"] = hypothesized_consequences
     next_state["consequences"] = merged_consequences
+    next_state["consequence_family_fillthrough_applied_count"] = int(consequence_family_fillthrough_applied_count)
+    next_state["merge_support_family_diagnostics"] = _accumulate_support_family_diagnostics(
+        dict(state.get("merge_support_family_diagnostics", {}) or {}),
+        exit_attempt_merge_diagnostics,
+    )
     next_state["observed_trigger_zones"] = observed_trigger_zones
     next_state["hypothesized_trigger_zones"] = hypothesized_trigger_zones
     next_state["trigger_zones"] = merged_trigger_zones
@@ -560,6 +1196,44 @@ def apply_delta(state: dict, delta: dict, *, max_consequences: int = 100) -> tup
     next_state["hypothesized_topology"] = hypothesized_topology
     next_state["topology_nodes"] = topology_nodes
     next_state["topology_edges"] = topology_edges
+    _assert_rich_fields_preserved(
+        split_store=dict(observed_topology.get("edges", {})),
+        combined_store=topology_edges,
+        field_names={
+            "display_support_count",
+            "match_support_count",
+            "counterfactual_support_count",
+            "directed_outcome_support_count",
+            "exit_attempt_support_count",
+            "last_supported_round_by_family",
+            "last_supported_pass_id_by_family",
+        },
+        label="topology_edge_support_rebuild",
+    )
+    _assert_rich_fields_preserved(
+        split_store=observed_entities,
+        combined_store=merged_entities,
+        field_names={
+            "identity_status",
+            "identity_support_count",
+            "identity_contradiction_count",
+            "identity_cross_round_stability",
+            "identity_last_confirmed_round",
+        },
+        label="entity_identity_rebuild",
+    )
+    _assert_rich_fields_preserved(
+        split_store=observed_consequences,
+        combined_store=merged_consequences,
+        field_names={
+            "supports_exit_attempt_relation",
+            "exit_attempt_support_count",
+            "last_supported_round_by_family",
+            "last_supported_pass_id_by_family",
+            "support_family",
+        },
+        label="consequence_exit_attempt_rebuild",
+    )
     next_state["indexes"] = _enrich_indexes_with_evidence_tiers(next_state)
     next_state["split_indexes"] = {
         "observed": _split_index_state(

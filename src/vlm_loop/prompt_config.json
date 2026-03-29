@@ -1,0 +1,56 @@
+{
+  "llm_backend": "vllm",
+  "ollama_url": "http://192.168.0.51:11434",
+  "ollama_model": "qwen3-vl:8b",
+  "ollama_num_ctx": 24000,
+  "vllm_url": "http://192.168.0.51:8000",
+  "vllm_model": "Qwen/Qwen3-VL-8B-Thinking-FP8",
+  "greedy": false,
+  "top_p": 0.8,
+  "top_k": 20,
+  "temperature": 0.7,
+  "repetition_penalty": 1.0,
+  "presence_penalty": 1.5,
+  "out_seq_length": 512,
+  "default_system_prompt": "Return JSON only. No markdown. No extra text.",
+"stages": [
+  {
+    "stage_id": "start_poi",
+    "task_prompt": "Analyze the initial episode video from a 2D game. This video shows only the start of a new episode before any planned actions were executed. Identify the single moving or controllable world object as the sprite. Choose one likely reachable static world target as the main POI. Inspect HUD/UI separately and compare HUD patterns, symbols, colors, or shapes with world objects, exits, gates, tiles, or markers. If a HUD pattern appears to match a world object, treat that world object as a likely target. If a next-run hint is provided, use it as guidance only, not as certainty. If the current screen contradicts the hint, trust the current screen. Do not invent game semantics.",
+    "user_prompt_template": "{task_prompt}\nNext run hint: {next_run_hint}\nSchema: {json_contract}\nRules: this is the start of a new episode before any planned actions were executed; identify exactly one moving or controllable world object as the sprite; choose exactly one likely reachable static world POI as the target; do not list multiple target POIs; keep the target description brief; list HUD/UI separately; explicitly inspect HUD for visual pattern matches with world objects; if a strong HUD-to-world pattern match exists, prefer the matched world object as the selected POI unless stronger visual evidence suggests otherwise; use the next-run hint only as guidance; if the current screen conflicts with the hint, trust the current screen; do not merge nearby static and moving objects; do not invent mechanics not visually shown; JSON only.",
+    "json_contract": "{\"sprite\":{\"description\":\"...\",\"start_position\":\"...\",\"moves_across_frames\":true},\"poi\":{\"name\":\"...\",\"description\":\"...\",\"location\":\"...\",\"static_across_frames\":true,\"reachable\":true,\"confidence\":0.0},\"pattern_matches\":[{\"hud_description\":\"...\",\"world_object_description\":\"...\",\"world_object_location\":\"...\",\"match_confidence\":0.0,\"suggests_target\":true}],\"ui_elements\":[{\"description\":\"...\",\"location\":\"...\",\"confidence\":0.0}]}"
+  },
+  {
+    "stage_id": "start_poi_actions",
+    "task_prompt": "Using the previously identified sprite and POI, propose exactly one short action sequence from the start of the current episode that could move the controllable sprite toward that POI.",
+    "user_prompt_template": "{task_prompt}\nAction set: {action_set}\nPrior stage outputs:\n{prior_stage_outputs_json}\nSchema: {json_contract}\nRules: use only actions from the provided action set; assume the sprite starts from the first position shown in the video; propose exactly one action sequence toward the identified POI; the sequence must contain exactly 5 actions; include a short expected directional effect and confidence; do not invent mechanics not visually suggested; JSON only.",
+    "json_contract": "{\"actions\":[\"<action from action_set>\",\"<action from action_set>\",\"<action from action_set>\",\"<action from action_set>\",\"<action from action_set>\"],\"expected_effect\":\"...\",\"confidence\":0.0}",
+    "extract_candidate_sequences": {
+      "field": "actions"
+    }
+  },
+  {
+    "stage_id": "update_poi",
+    "task_prompt": "Analyze the current episode video after the previous short action sequence was executed. Identify the moving sprite, determine whether the previous target appears reached, summarize the visible screen changes, inspect HUD/UI for patterns, symbols, colors, or shapes that match world objects, exits, gates, tiles, or markers, and choose the single most important current POI for the next step. If a HUD pattern appears to match a world object, treat that world object as a likely target. Do not invent game semantics.",
+    "user_prompt_template": "{task_prompt}\nPrevious target: {previous_target_json}\nSchema: {json_contract}\nRules: identify exactly one moving world object as the sprite; decide whether the previous target appears reached based only on visible evidence from the video; choose exactly one current POI for the next step; the POI may be the same as the previous target or a new one; if the previous target appears reached or no longer appears to be the best target, retarget freely; describe visible screen changes briefly; list HUD/UI separately; explicitly inspect HUD for visual pattern matches with world objects; if a strong HUD-to-world pattern match exists, prefer the matched world object as the selected POI unless stronger visual evidence suggests otherwise; use the video motion as the main evidence for direction and progress; do not merge nearby static and moving objects; do not invent mechanics not visually shown; JSON only.",
+    "json_contract": "{\"sprite\":{\"description\":\"...\",\"current_position\":\"...\",\"moves_across_frames\":true},\"target_reached\":false,\"poi\":{\"name\":\"...\",\"description\":\"...\",\"location\":\"...\",\"static_across_frames\":true,\"reachable\":true,\"confidence\":0.0},\"pattern_matches\":[{\"hud_description\":\"...\",\"world_object_description\":\"...\",\"world_object_location\":\"...\",\"match_confidence\":0.0,\"suggests_target\":true}],\"screen_change_summary\":{\"description\":\"...\",\"confidence\":0.0},\"ui_elements\":[{\"description\":\"...\",\"location\":\"...\",\"confidence\":0.0}]}"
+  },
+  {
+    "stage_id": "update_poi_actions",
+    "task_prompt": "Using the previously identified sprite and POI, propose exactly one short action sequence from the current end state of the video that could move the controllable sprite toward that POI.",
+    "user_prompt_template": "{task_prompt}\nAction set: {action_set}\nPrior stage outputs:\n{prior_stage_outputs_json}\nSchema: {json_contract}\nRules: use only actions from the provided action set; assume the sprite starts from the last position shown in the video; propose exactly one action sequence toward the identified POI; the sequence must contain exactly 5 actions; include a short expected directional effect and confidence; do not invent mechanics not visually suggested; JSON only.",
+    "json_contract": "{\"actions\":[\"<action from action_set>\",\"<action from action_set>\",\"<action from action_set>\",\"<action from action_set>\",\"<action from action_set>\"],\"expected_effect\":\"...\",\"confidence\":0.0}",
+    "extract_candidate_sequences": {
+      "field": "actions"
+    }
+  },
+{
+ 
+  "stage_id": "episode_review",
+  "task_prompt": "Review the full episode video after the episode ended in game over or timeout. Infer the most likely useful target, HUD clue, or failure cause, and provide a short next-run hint object.",
+  "user_prompt_template": "{task_prompt}\nOutcome: {episode_outcome}\nSchema: {json_contract}\nRules: review the full episode as a whole; use the video as the main evidence for overall behavior, progress, direction, and failure; write a short sprite description, then focus on one likely target clue, one HUD clue if any, and one thing to avoid in the next run; keep the next_run_hint fields short and practical; do not propose multiple alternative plans; do not invent mechanics not visually suggested; JSON only.",
+  "json_contract": "{\"outcome_review\":{\"likely_goal_or_mechanic\":\"...\",\"key_observation\":\"...\",\"failure_reason_or_success_reason\":\"...\",\"next_run_hint\":{\"sprite_description\":\"...\",\"target\":\"...\",\"hud\":\"...\",\"avoid\":\"...\"}}}"
+}
+
+]
+}

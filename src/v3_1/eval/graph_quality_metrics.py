@@ -33,10 +33,10 @@ def compute_graph_quality_metrics(round_graph_snapshots: list[dict]) -> dict:
             if float(path.get("execution_feasibility_score", 0.0) or 0.0) >= 0.5 and int(path.get("contradiction_count", 0) or 0) <= 0:
                 usable_path_to_exit_count += 1
     return {
-        "graph_node_count_by_round": node_count_by_round,
-        "graph_edge_count_by_family": dict(edge_count_by_family),
+        "node_count_by_round": node_count_by_round,
+        "edge_count_by_family": dict(edge_count_by_family),
         "repeated_support_edge_rate": float(repeated_support_edge_count) / float(max(1, total_edges)),
-        "contradiction_rate_by_edge_family": {
+        "contradiction_rate_by_family": {
             family: float(count) / float(max(1, edge_count_by_family.get(family, 0)))
             for family, count in contradiction_count_by_family.items()
         },

@@ -53,6 +53,8 @@ class SubgoalChainManager:
     chain_rewritten_to_verification: bool = False
 
     def start_chain(self, *, selected_candidate: dict, round_id: int) -> dict[str, Any] | None:
+        if self.active_chain and str(dict(self.active_chain).get("status") or "") not in {"aborted", "completed"}:
+            return dict(self.active_chain)
         candidate = dict(selected_candidate or {})
         step_plan = list(candidate.get("candidate_step_plan", []) or [])
         if not step_plan:
@@ -241,6 +243,8 @@ class SubgoalChainManager:
 
     def snapshot(self) -> dict[str, Any]:
         current_step = self.current_step()
+        step_kind = str(dict(current_step or {}).get("step_kind") or "")
+        active_structure_chain = bool(current_step) and step_kind in {"verify_trigger_contact", "reobserve_region", "reobserve_remote_change", "verify_panel", "verify_gate"}
         payload = SubgoalChainState(
             active_chain=dict(self.active_chain) if self.active_chain else None,
             active_step=current_step,
@@ -253,11 +257,17 @@ class SubgoalChainManager:
         payload["attempt_exit_blocked_by_missing_verification"] = bool(self.attempt_exit_blocked_by_missing_verification)
         payload["missing_verification_step_kind"] = self.missing_verification_step_kind
         payload["chain_rewritten_to_verification"] = bool(self.chain_rewritten_to_verification)
+        payload["active_structure_chain"] = active_structure_chain
+        payload["structure_chain_pending_step_kind"] = step_kind or None
+        payload["structure_chain_blocks_default_progress"] = active_structure_chain and str(dict(self.active_chain or {}).get("status") or "") not in {"aborted", "completed"}
         return payload
 
     def _rewrite_attempt_exit_if_needed(self, *, round_id: int) -> bool:
         next_step = self.current_step()
-        if not self.active_chain or not next_step or str(next_step.get("step_kind") or "") != "attempt_exit":
+        current_kind = str(next_step.get("step_kind") or "")
+        if current_kind == "reobserve_region":
+            current_kind = "reobserve_remote_change"
+        if not self.active_chain or not next_step or current_kind != "attempt_exit":
             return False
         required = [str(value) for value in list(self.active_chain.get("required_verification_steps", []) or []) if value]
         completed = {str(value) for value in list(self.active_chain.get("verification_steps_completed", []) or []) if value}
@@ -288,6 +298,7 @@ def _verification_label_for_step(step_kind: str) -> str | None:
         "go_to_trigger": "verify_trigger_contact",
         "retry_trigger": "verify_trigger_contact",
         "reobserve_region": "reobserve_remote_change",
+        "reobserve_remote_change": "reobserve_remote_change",
         "verify_panel": "verify_panel_state",
         "verify_gate": "verify_gate_match",
     }.get(str(step_kind or ""))
@@ -296,13 +307,13 @@ def _verification_label_for_step(step_kind: str) -> str | None:
 def _replacement_step_from_attempt_exit(step: dict, replacement_kind: str) -> dict[str, Any]:
     next_kind = {
         "verify_trigger_contact": "verify_trigger_contact",
-        "reobserve_remote_change": "reobserve_region",
+        "reobserve_remote_change": "reobserve_remote_change",
         "verify_panel_state": "verify_panel",
         "verify_gate_match": "verify_gate",
-    }.get(str(replacement_kind or ""), "reobserve_region")
+    }.get(str(replacement_kind or ""), "reobserve_remote_change")
     expected_evidence = {
         "verify_trigger_contact": ["objective_contact_observed"],
-        "reobserve_region": ["remote_change_observed", "target_presence_observed"],
+        "reobserve_remote_change": ["remote_change_observed", "target_presence_observed"],
         "verify_panel": ["expected_match_seen"],
         "verify_gate": ["gate_state_seen"],
     }.get(next_kind, list(step.get("expected_evidence", []) or []))

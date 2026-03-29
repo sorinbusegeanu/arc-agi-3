@@ -105,6 +105,185 @@ def _topology_from_steps(step_rows: list[dict]) -> tuple[list[dict], list[dict]]
     return nodes, edges
 
 
+def _support_family_emit_inputs(classifier_truth_surface: dict | None) -> dict:
+    payload = dict(classifier_truth_surface or {})
+    return {
+        "counterfactual_evidence_observed": payload.get("counterfactual_evidence_observed"),
+        "exit_attempt_evidence_observed": payload.get("exit_attempt_evidence_observed"),
+        "expected_effect_type": payload.get("expected_effect_type"),
+        "expected_relation_type": payload.get("expected_relation_type") or payload.get("expected_effect_relation"),
+        "expected_target_id": payload.get("expected_target_id") or payload.get("expected_effect_target_id"),
+        "expected_trigger_contact_observed": payload.get("expected_trigger_contact_observed"),
+        "expected_region_reached": payload.get("expected_region_reached"),
+        "observed_effect_change": payload.get("observed_effect_change"),
+        "observed_effect_absent": payload.get("observed_effect_absent") if "observed_effect_absent" in payload else payload.get("expected_effect_absent"),
+        "attempted_boundary_contact": payload.get("attempted_boundary_contact"),
+        "attempted_portal_contact": payload.get("attempted_portal_contact"),
+        "attempted_terminal_affordance_contact": payload.get("attempted_terminal_affordance_contact"),
+        "attempted_escape_direction": payload.get("attempted_escape_direction"),
+        "exit_attempt_target_id": payload.get("exit_attempt_target_id"),
+    }
+
+
+def _family_debug_entry(*, classifier_flag: bool | None) -> dict:
+    return {
+        "classifier_flag": classifier_flag,
+        "emit_attempted": False,
+        "relation_resolved": False,
+        "row_emitted": False,
+        "suppressed": False,
+        "suppression_reason_codes": [],
+        "resolution_failure_reason_codes": [],
+    }
+
+
+def _resolve_family_target(step_rows: list[dict], emit_inputs: dict) -> tuple[str | None, str | None]:
+    target_entity_id = str(emit_inputs.get("expected_target_id") or emit_inputs.get("exit_attempt_target_id") or "") or None
+    target_area_id = None
+    if not target_entity_id:
+        for step in list(step_rows or []):
+            telemetry = dict(step.get("telemetry", {}) or {})
+            target_area_id = str(step.get("area_id") or telemetry.get("pre_step_area_id") or telemetry.get("post_step_area_id") or "") or None
+            if target_area_id:
+                break
+    return target_entity_id, target_area_id
+
+
+def _handle_counterfactual_support_family(*, emit_inputs: dict, step_rows: list[dict], consequences: list[dict], analysis_mode: str) -> tuple[list[dict], dict]:
+    debug = _family_debug_entry(classifier_flag=emit_inputs.get("counterfactual_evidence_observed"))
+    emitted: list[dict] = []
+    if emit_inputs.get("counterfactual_evidence_observed") is not True:
+        debug["suppressed"] = True
+        debug["suppression_reason_codes"].append("classifier_false")
+        return emitted, debug
+    debug["emit_attempted"] = True
+    target_entity_id, target_area_id = _resolve_family_target(step_rows, emit_inputs)
+    if not target_entity_id and not target_area_id:
+        debug["suppressed"] = True
+        debug["resolution_failure_reason_codes"].append("missing_target_resolution")
+        return emitted, debug
+    first_step = dict(step_rows[0] or {}) if step_rows else {}
+    step_idx = int(first_step.get("step_idx", 0) or 0)
+    action_name = str(first_step.get("action_name") or first_step.get("action_type") or "unknown")
+    action_family = str(first_step.get("action_family") or "unknown")
+    evidence_ref = f"{step_idx}:counterfactual"
+    debug["relation_resolved"] = True
+    emitted.append(
+        {
+            "consequence_id": f"counterfactual:{target_entity_id or target_area_id or 'unknown'}",
+            "step_idx": step_idx,
+            "action": action_name,
+            "action_name": action_name,
+            "action_id": first_step.get("action_id"),
+            "action_family": action_family,
+            "target_entity_id": target_entity_id,
+            "area_id": target_area_id,
+            "done": False,
+            "reward": 0.0,
+            "local_change_area": 0,
+            "blocked": bool(emit_inputs.get("observed_effect_absent")),
+            "evidence_count": 1,
+            "evidence_refs": [evidence_ref],
+            "telemetry": dict(emit_inputs),
+            "supports_counterfactual_relation": True,
+            "counterfactual_support_count": 1,
+            "support_family": "counterfactual",
+        }
+    )
+    debug["row_emitted"] = True
+    return emitted, debug
+
+
+def _handle_exit_attempt_support_family(*, emit_inputs: dict, step_rows: list[dict], consequences: list[dict], analysis_mode: str) -> tuple[list[dict], dict]:
+    debug = _family_debug_entry(classifier_flag=emit_inputs.get("exit_attempt_evidence_observed"))
+    emitted: list[dict] = []
+    if emit_inputs.get("exit_attempt_evidence_observed") is not True:
+        debug["suppressed"] = True
+        debug["suppression_reason_codes"].append("classifier_false")
+        return emitted, debug
+    debug["emit_attempted"] = True
+    target_entity_id, target_area_id = _resolve_family_target(step_rows, emit_inputs)
+    if not target_entity_id and not target_area_id and not emit_inputs.get("attempted_escape_direction"):
+        debug["suppressed"] = True
+        debug["resolution_failure_reason_codes"].append("missing_boundary_or_region_resolution")
+        return emitted, debug
+    first_step = dict(step_rows[0] or {}) if step_rows else {}
+    step_idx = int(first_step.get("step_idx", 0) or 0)
+    action_name = str(first_step.get("action_name") or first_step.get("action_type") or "unknown")
+    action_family = str(first_step.get("action_family") or "unknown")
+    evidence_ref = f"{step_idx}:exit_attempt"
+    debug["relation_resolved"] = True
+    emitted.append(
+        {
+            "consequence_id": f"exit_attempt:{target_entity_id or target_area_id or emit_inputs.get('attempted_escape_direction') or 'unknown'}",
+            "step_idx": step_idx,
+            "action": action_name,
+            "action_name": action_name,
+            "action_id": first_step.get("action_id"),
+            "action_family": action_family,
+            "target_entity_id": target_entity_id,
+            "area_id": target_area_id,
+            "done": False,
+            "reward": 0.0,
+            "local_change_area": 0,
+            "blocked": bool(emit_inputs.get("attempted_boundary_contact")),
+            "evidence_count": 1,
+            "evidence_refs": [evidence_ref],
+            "telemetry": dict(emit_inputs),
+            "supports_exit_attempt_relation": True,
+            "exit_attempt_support_count": 1,
+            "support_family": "exit_attempt",
+        }
+    )
+    debug["row_emitted"] = True
+    return emitted, debug
+
+
+def _annotate_directed_support(step_rows: list[dict], topology_edges: list[dict], consequences: list[dict], *, analysis_mode: str, classifier_truth_surface: dict | None = None) -> tuple[list[dict], list[dict], dict]:
+    edge_rows = [dict(row) for row in list(topology_edges or [])]
+    consequence_rows = [dict(row) for row in list(consequences or [])]
+    emit_inputs = _support_family_emit_inputs(classifier_truth_surface)
+    has_any_truth_surface = any(value is not None for value in emit_inputs.values())
+    counterfactual_rows, counterfactual_debug = _handle_counterfactual_support_family(
+        emit_inputs=emit_inputs,
+        step_rows=step_rows,
+        consequences=consequence_rows,
+        analysis_mode=analysis_mode,
+    )
+    exit_attempt_rows, exit_attempt_debug = _handle_exit_attempt_support_family(
+        emit_inputs=emit_inputs,
+        step_rows=step_rows,
+        consequences=consequence_rows,
+        analysis_mode=analysis_mode,
+    )
+    consequence_rows.extend(counterfactual_rows)
+    consequence_rows.extend(exit_attempt_rows)
+    emit_debug = {
+        "families": {
+            "counterfactual": counterfactual_debug,
+            "exit_attempt": exit_attempt_debug,
+        },
+        "counterfactual_emit_attempt_count": int(bool(counterfactual_debug.get("emit_attempted"))),
+        "counterfactual_emit_relation_resolution_failure_count": len(list(counterfactual_debug.get("resolution_failure_reason_codes", []) or [])),
+        "counterfactual_emit_suppressed_count": int(bool(counterfactual_debug.get("suppressed"))),
+        "exit_attempt_emit_attempt_count": int(bool(exit_attempt_debug.get("emit_attempted"))),
+        "exit_attempt_emit_relation_resolution_failure_count": len(list(exit_attempt_debug.get("resolution_failure_reason_codes", []) or [])),
+        "exit_attempt_emit_suppressed_count": int(bool(exit_attempt_debug.get("suppressed"))),
+        "counterfactual_emit_attempt_count_directed": int(bool(counterfactual_debug.get("emit_attempted")) and analysis_mode == "directed_outcome"),
+        "counterfactual_emit_attempt_count_probe": int(bool(counterfactual_debug.get("emit_attempted")) and analysis_mode != "directed_outcome"),
+        "exit_attempt_emit_attempt_count_directed": int(bool(exit_attempt_debug.get("emit_attempted")) and analysis_mode == "directed_outcome"),
+        "exit_attempt_emit_attempt_count_probe": int(bool(exit_attempt_debug.get("emit_attempted")) and analysis_mode != "directed_outcome"),
+    }
+    if has_any_truth_surface and not emit_debug["families"]:
+        emit_debug["invariant_failure"] = ["family_handler_not_invoked"]
+    for family_name in ("counterfactual", "exit_attempt"):
+        family = emit_debug["families"][family_name]
+        if family.get("classifier_flag") is True and not family.get("emit_attempted"):
+            family["suppression_reason_codes"].append("classifier_true_but_no_emit_attempt")
+            emit_debug.setdefault("invariant_failure", []).append(f"{family_name}:classifier_true_but_no_emit_attempt")
+    return edge_rows, consequence_rows, emit_debug
+
+
 def _consequences(raw_episode: RawEpisode, motion: dict, step_summaries: list[dict], step_rows: list[dict]) -> list[dict]:
     rows = []
     by_step = {row.get("step_idx"): row for row in step_rows}
@@ -1464,6 +1643,7 @@ def analyze_episode(
     hypothesis_config: object | None = None,
     llm_adapter: object | None = None,
     hypothesis_registry_snapshot: dict | None = None,
+    classifier_truth_surface: dict | None = None,
 ) -> AnalyzedEpisode:
     analysis_mode = _validate_analysis_mode(analysis_mode)
     normalized_observations = [normalize_observation(step.observation) for step in raw_episode.steps]
@@ -1492,6 +1672,34 @@ def analyze_episode(
     avatar_tracking = _fallback_avatar_tracking(step_summaries, track_avatar(step_summaries))
     motion = summarize_motion(raw_episode.steps, step_summaries, avatar_tracking)
     priorities = _analysis_priorities(analysis_mode=analysis_mode)
+    outcome_summary = dict(raw_episode.metadata.get("outcome_summary", {}) or {}) if isinstance(raw_episode.metadata, dict) else {}
+    classifier_truth_surface = dict(classifier_truth_surface or outcome_summary or {})
+    outcome_telemetry = {
+        key: outcome_summary.get(key)
+        for key in (
+            "counterfactual_evidence_observed",
+            "exit_attempt_evidence_observed",
+            "expected_effect_type",
+            "expected_relation_type",
+            "expected_effect_relation",
+            "expected_target_id",
+            "expected_trigger_contact_observed",
+            "expected_region_reached",
+            "observed_effect_change",
+            "observed_effect_absent",
+            "expected_effect_absent",
+            "attempted_boundary_contact",
+            "attempted_portal_contact",
+            "attempted_terminal_affordance_contact",
+            "attempted_escape_direction",
+            "exit_attempt_target_id",
+            "weak_expectation_basis",
+            "blocked",
+            "trigger_contact_observed",
+            "target_contact_observed",
+        )
+        if key in outcome_summary
+    }
     step_rows = []
     for step_idx, (raw_step, summary, area) in enumerate(zip(raw_episode.steps, step_summaries, area_sequence)):
         tracking_row = next((row for row in avatar_tracking["per_step"] if row["step_idx"] == step_idx), None)
@@ -1518,12 +1726,19 @@ def analyze_episode(
                 "changed_cells": sum(int(region.get("area", 0)) for region in summary.get("change_regions", [])),
                 "change_region_count": len(summary["change_regions"]),
                 "analysis_mode": analysis_mode,
-                "telemetry": dict(raw_step.info or {}),
+                "telemetry": {**dict(raw_step.info or {}), **outcome_telemetry},
             }
         )
     topology_nodes, topology_edges = _topology_from_steps(step_rows)
     topology_nodes, topology_edges = _mode_select_topology(topology_nodes, topology_edges, analysis_mode=analysis_mode)
     consequences = _mode_select_consequences(_consequences(raw_episode, motion, step_summaries, step_rows), analysis_mode=analysis_mode)
+    topology_edges, consequences, support_family_emit_debug = _annotate_directed_support(
+        step_rows,
+        topology_edges,
+        consequences,
+        analysis_mode=analysis_mode,
+        classifier_truth_surface=classifier_truth_surface,
+    )
     detected_pois_raw, detector_debug = detect_pois(step_summaries, avatar_tracking, step_rows)
     detected_pois = _mode_select_pois(detected_pois_raw, analysis_mode=analysis_mode)
     supplemental_structure = _supplemental_structure_entities(
@@ -1706,7 +1921,8 @@ def analyze_episode(
                 analysis_mode=analysis_mode,
                 row_kind="consequences",
                 direct_evidence_present=_consequence_is_directly_observed(row=row, analysis_mode=analysis_mode),
-                direct_evidence_fields=_consequence_direct_evidence_fields(row),
+                direct_evidence_fields=_consequence_direct_evidence_fields(row)
+                + [field for field in ["supports_directed_outcome_relation", "supports_exit_attempt_relation", "supports_counterfactual_relation"] if bool(row.get(field, False))],
                 contradiction_flag=bool(
                     row.get("blocked")
                     and not row.get("action_effect_near_avatar")
@@ -1773,7 +1989,8 @@ def analyze_episode(
                 analysis_mode=analysis_mode,
                 row_kind="topology_edges",
                 direct_evidence_present=True,
-                direct_evidence_fields=_topology_edge_direct_evidence_fields(row),
+                direct_evidence_fields=_topology_edge_direct_evidence_fields(row)
+                + [field for field in ["supports_directed_outcome_relation", "supports_exit_attempt_relation", "supports_counterfactual_relation"] if bool(row.get(field, False))],
                 observation_support_span=(0, max(0, len(step_rows) - 1)),
             )
             for row in topology_edges
@@ -1790,6 +2007,7 @@ def analyze_episode(
             "structure_candidates": supplemental_structure,
             "poi_detection_debug": poi_detection_debug,
             "collapsed_poi_ids": sorted(collapsed_peer_ids),
+            "support_family_emit_debug": support_family_emit_debug,
         },
     )
 
@@ -1847,6 +2065,7 @@ def analyze_episode(
             "motion": motion,
             "structure_candidates": supplemental_structure,
             "poi_detection_debug": poi_detection_debug,
+            "support_family_emit_debug": support_family_emit_debug,
         },
     )
     mechanic_graph_delta = extract_mechanic_graph_delta(

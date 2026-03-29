@@ -31,11 +31,14 @@ EVENT_PAYLOAD_TYPES = {
     "directed mechanic graph merge completed": {"mechanic_graph_merge_completed"},
     "directed memory reconcile completed": {"memory_reconcile_completed"},
     "subgoal chain started": {"subgoal_chain_started"},
+    "subgoal chain step activated": {"subgoal_chain_step_activated"},
+    "subgoal chain step progressed": {"subgoal_chain_step_progressed"},
     "subgoal chain step completed": {"subgoal_chain_step"},
     "subgoal chain step failed": {"subgoal_chain_step"},
     "subgoal chain advanced": {"subgoal_chain_advanced"},
     "subgoal chain aborted": {"subgoal_chain_aborted"},
     "subgoal chain completed": {"subgoal_chain_completed"},
+    "subgoal chain abandoned": {"subgoal_chain_abandoned"},
     "detector poi selected": {"detector_poi_escalation"},
     "detector poi revisited": {"detector_poi_escalation"},
     "detector poi escalated to verification": {"detector_poi_escalation"},
@@ -82,6 +85,22 @@ class PlanSelectedPayload:
     planner_contract_mode: str = "split_world_native"
     strict_blackboard_snapshot_ref: dict[str, Any] = field(default_factory=dict)
     strict_memory_snapshot_ref: dict[str, Any] = field(default_factory=dict)
+    planning_mode: str = "default_progress"
+    previous_planning_mode: str = ""
+    planning_mode_before_hysteresis: str = ""
+    planning_mode_after_hysteresis: str = ""
+    planning_mode_committed: str = ""
+    structure_acquisition_score: float = 0.0
+    default_progress_score: float = 0.0
+    mode_switch_applied: bool = False
+    mode_switch_reason: str = ""
+    mode_persistence_hysteresis_applied: bool = False
+    mode_switch_block_reason: str = ""
+    payload_correction_applied: bool = False
+    payload_correction_reason: str = ""
+    prior_committed_mode_loaded: str | None = None
+    prior_committed_mode_source: str = ""
+    final_mode_payload_built: bool = False
     exit_readiness_score: float = 0.0
     missing_prerequisites: tuple[str, ...] = ()
     premature_exit_penalty_applied: bool = False
@@ -102,6 +121,20 @@ class EpisodeExecutedPayload:
     missing_prerequisites: tuple[str, ...] = ()
     failed_without_new_support: bool = False
     position_hold_detected: bool = False
+    counterfactual_evidence_observed: bool | None = None
+    exit_attempt_evidence_observed: bool | None = None
+    expected_effect_type: str | None = None
+    expected_relation_type: str | None = None
+    expected_target_id: str | None = None
+    expected_trigger_contact_observed: bool | None = None
+    expected_region_reached: bool | None = None
+    observed_effect_change: bool | None = None
+    observed_effect_absent: bool | None = None
+    attempted_boundary_contact: bool | None = None
+    attempted_portal_contact: bool | None = None
+    attempted_terminal_affordance_contact: bool | None = None
+    attempted_escape_direction: str | None = None
+    exit_attempt_target_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -175,6 +208,8 @@ class MemoryReconcilePayload:
 @dataclass(frozen=True)
 class SubgoalChainStartedPayload:
     chain_id: str
+    selected_subgoal_chain_id: str | None = None
+    selected_subgoal_step_id: str | None = None
     current_step_id: str | None = None
     step_kind: str | None = None
     expected_evidence: tuple[str, ...] = ()
@@ -191,6 +226,8 @@ class SubgoalChainStartedPayload:
 @dataclass(frozen=True)
 class SubgoalChainStepPayload:
     chain_id: str
+    selected_subgoal_chain_id: str | None = None
+    selected_subgoal_step_id: str | None = None
     current_step_id: str | None = None
     step_kind: str | None = None
     expected_evidence: tuple[str, ...] = ()
@@ -207,6 +244,8 @@ class SubgoalChainStepPayload:
 @dataclass(frozen=True)
 class SubgoalChainAdvancedPayload:
     chain_id: str
+    selected_subgoal_chain_id: str | None = None
+    selected_subgoal_step_id: str | None = None
     current_step_id: str | None = None
     step_kind: str | None = None
     expected_evidence: tuple[str, ...] = ()
@@ -223,6 +262,8 @@ class SubgoalChainAdvancedPayload:
 @dataclass(frozen=True)
 class SubgoalChainAbortedPayload:
     chain_id: str
+    selected_subgoal_chain_id: str | None = None
+    selected_subgoal_step_id: str | None = None
     current_step_id: str | None = None
     step_kind: str | None = None
     expected_evidence: tuple[str, ...] = ()
@@ -239,6 +280,8 @@ class SubgoalChainAbortedPayload:
 @dataclass(frozen=True)
 class SubgoalChainCompletedPayload:
     chain_id: str
+    selected_subgoal_chain_id: str | None = None
+    selected_subgoal_step_id: str | None = None
     current_step_id: str | None = None
     step_kind: str | None = None
     expected_evidence: tuple[str, ...] = ()
@@ -275,6 +318,60 @@ class StopDecisionPayload:
     won: bool = False
     round_progress: float = 0.0
     termination_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class SubgoalChainStepActivatedPayload:
+    chain_id: str
+    selected_subgoal_chain_id: str | None = None
+    selected_subgoal_step_id: str | None = None
+    current_step_id: str | None = None
+    step_kind: str | None = None
+    expected_evidence: tuple[str, ...] = ()
+    observed_evidence: tuple[str, ...] = ()
+    failure_reason: str | None = None
+    advancement_reason: str | None = None
+    exit_readiness_score: float = 0.0
+    missing_prerequisites: tuple[str, ...] = ()
+    premature_exit_penalty_applied: bool = False
+    failed_without_new_support: bool = False
+    position_hold_detected: bool = False
+
+
+@dataclass(frozen=True)
+class SubgoalChainStepProgressedPayload:
+    chain_id: str
+    selected_subgoal_chain_id: str | None = None
+    selected_subgoal_step_id: str | None = None
+    current_step_id: str | None = None
+    step_kind: str | None = None
+    expected_evidence: tuple[str, ...] = ()
+    observed_evidence: tuple[str, ...] = ()
+    failure_reason: str | None = None
+    advancement_reason: str | None = None
+    exit_readiness_score: float = 0.0
+    missing_prerequisites: tuple[str, ...] = ()
+    premature_exit_penalty_applied: bool = False
+    failed_without_new_support: bool = False
+    position_hold_detected: bool = False
+
+
+@dataclass(frozen=True)
+class SubgoalChainAbandonedPayload:
+    chain_id: str
+    selected_subgoal_chain_id: str | None = None
+    selected_subgoal_step_id: str | None = None
+    current_step_id: str | None = None
+    step_kind: str | None = None
+    expected_evidence: tuple[str, ...] = ()
+    observed_evidence: tuple[str, ...] = ()
+    failure_reason: str | None = None
+    advancement_reason: str | None = None
+    exit_readiness_score: float = 0.0
+    missing_prerequisites: tuple[str, ...] = ()
+    premature_exit_penalty_applied: bool = False
+    failed_without_new_support: bool = False
+    position_hold_detected: bool = False
 
 
 @dataclass
@@ -330,10 +427,13 @@ class SessionLedger:
             LLMOperationPayload: ("llm_operation", "v1", "llm_operation_payload", "v1"),
             MemoryReconcilePayload: ("memory_reconcile_completed", "v1", "memory_reconcile_payload", "v1"),
             SubgoalChainStartedPayload: ("subgoal_chain_started", "v1", "subgoal_chain_started_payload", "v1"),
+            SubgoalChainStepActivatedPayload: ("subgoal_chain_step_activated", "v1", "subgoal_chain_step_activated_payload", "v1"),
+            SubgoalChainStepProgressedPayload: ("subgoal_chain_step_progressed", "v1", "subgoal_chain_step_progressed_payload", "v1"),
             SubgoalChainStepPayload: ("subgoal_chain_step", "v1", "subgoal_chain_step_payload", "v1"),
             SubgoalChainAdvancedPayload: ("subgoal_chain_advanced", "v1", "subgoal_chain_advanced_payload", "v1"),
             SubgoalChainAbortedPayload: ("subgoal_chain_aborted", "v1", "subgoal_chain_aborted_payload", "v1"),
             SubgoalChainCompletedPayload: ("subgoal_chain_completed", "v1", "subgoal_chain_completed_payload", "v1"),
+            SubgoalChainAbandonedPayload: ("subgoal_chain_abandoned", "v1", "subgoal_chain_abandoned_payload", "v1"),
             DetectorPoiEscalationPayload: ("detector_poi_escalation", "v1", "detector_poi_escalation_payload", "v1"),
             DurableFlushPayload: ("durable_flush", "v1", "durable_flush_payload", "v1"),
             StopDecisionPayload: ("stop_decision", "v1", "stop_decision_payload", "v1"),
@@ -372,10 +472,13 @@ class SessionLedger:
             "llm_operation": (LLMOperationPayload, "v1", "llm_operation_payload", "v1"),
             "memory_reconcile_completed": (MemoryReconcilePayload, "v1", "memory_reconcile_payload", "v1"),
             "subgoal_chain_started": (SubgoalChainStartedPayload, "v1", "subgoal_chain_started_payload", "v1"),
+            "subgoal_chain_step_activated": (SubgoalChainStepActivatedPayload, "v1", "subgoal_chain_step_activated_payload", "v1"),
+            "subgoal_chain_step_progressed": (SubgoalChainStepProgressedPayload, "v1", "subgoal_chain_step_progressed_payload", "v1"),
             "subgoal_chain_step": (SubgoalChainStepPayload, "v1", "subgoal_chain_step_payload", "v1"),
             "subgoal_chain_advanced": (SubgoalChainAdvancedPayload, "v1", "subgoal_chain_advanced_payload", "v1"),
             "subgoal_chain_aborted": (SubgoalChainAbortedPayload, "v1", "subgoal_chain_aborted_payload", "v1"),
             "subgoal_chain_completed": (SubgoalChainCompletedPayload, "v1", "subgoal_chain_completed_payload", "v1"),
+            "subgoal_chain_abandoned": (SubgoalChainAbandonedPayload, "v1", "subgoal_chain_abandoned_payload", "v1"),
             "detector_poi_escalation": (DetectorPoiEscalationPayload, "v1", "detector_poi_escalation_payload", "v1"),
             "durable_flush": (DurableFlushPayload, "v1", "durable_flush_payload", "v1"),
             "stop_decision": (StopDecisionPayload, "v1", "stop_decision_payload", "v1"),
@@ -398,6 +501,7 @@ class SessionLedger:
         return self.append(event_type="round start", **kwargs)
 
     def append_probe_plan_selected(self, **kwargs) -> SessionLedgerRecord:
+        kwargs = self._normalize_plan_selected_kwargs("probe", **kwargs)
         return self.append(event_type="probe plan selected", **kwargs)
 
     def append_probe_episode_executed(self, **kwargs) -> SessionLedgerRecord:
@@ -425,6 +529,7 @@ class SessionLedger:
         return self.append(event_type="hypothesis validation completed", **kwargs)
 
     def append_directed_plan_selected(self, **kwargs) -> SessionLedgerRecord:
+        kwargs = self._normalize_plan_selected_kwargs("directed", **kwargs)
         return self.append(event_type="directed plan selected", **kwargs)
 
     def append_directed_episode_executed(self, **kwargs) -> SessionLedgerRecord:
@@ -460,6 +565,12 @@ class SessionLedger:
     def append_subgoal_chain_started(self, **kwargs) -> SessionLedgerRecord:
         return self.append(event_type="subgoal chain started", **kwargs)
 
+    def append_subgoal_chain_step_activated(self, **kwargs) -> SessionLedgerRecord:
+        return self.append(event_type="subgoal chain step activated", **kwargs)
+
+    def append_subgoal_chain_step_progressed(self, **kwargs) -> SessionLedgerRecord:
+        return self.append(event_type="subgoal chain step progressed", **kwargs)
+
     def append_subgoal_chain_step_completed(self, **kwargs) -> SessionLedgerRecord:
         return self.append(event_type="subgoal chain step completed", **kwargs)
 
@@ -474,6 +585,9 @@ class SessionLedger:
 
     def append_subgoal_chain_completed(self, **kwargs) -> SessionLedgerRecord:
         return self.append(event_type="subgoal chain completed", **kwargs)
+
+    def append_subgoal_chain_abandoned(self, **kwargs) -> SessionLedgerRecord:
+        return self.append(event_type="subgoal chain abandoned", **kwargs)
 
     def append_detector_poi_selected(self, **kwargs) -> SessionLedgerRecord:
         return self.append(event_type="detector poi selected", **kwargs)
@@ -498,3 +612,36 @@ class SessionLedger:
 
     def to_dicts(self) -> list[dict[str, Any]]:
         return [record.to_dict() for record in self.records]
+
+    def _normalize_plan_selected_kwargs(self, mode: str, **kwargs) -> dict[str, Any]:
+        payload = kwargs.get("payload")
+        if not isinstance(payload, PlanSelectedPayload):
+            return kwargs
+        final_mode_payload = dict(kwargs.pop("final_mode_payload", {}) or {})
+        prior_committed_mode = final_mode_payload.get("prior_committed_mode_loaded")
+        if prior_committed_mode in {"", None} and int(kwargs.get("round_id", 0) or 0) > 1:
+            prior_committed_mode = None
+        payload_dict = asdict(payload)
+        if final_mode_payload:
+            for key in (
+                "previous_planning_mode",
+                "planning_mode_before_hysteresis",
+                "planning_mode_after_hysteresis",
+                "planning_mode_committed",
+                "payload_correction_applied",
+                "payload_correction_reason",
+                "prior_committed_mode_loaded",
+                "prior_committed_mode_source",
+                "final_mode_payload_built",
+            ):
+                if key in final_mode_payload:
+                    payload_dict[key] = final_mode_payload.get(key)
+        if int(kwargs.get("round_id", 0) or 0) > 1 and prior_committed_mode not in {"", None} and payload_dict.get("previous_planning_mode") in {"", None}:
+            payload_dict["previous_planning_mode"] = prior_committed_mode
+            payload_dict["payload_correction_applied"] = True
+            payload_dict["payload_correction_reason"] = "ledger_repaired_previous_committed_mode"
+            payload_dict["prior_committed_mode_loaded"] = prior_committed_mode
+            payload_dict["prior_committed_mode_source"] = str(payload_dict.get("prior_committed_mode_source") or f"round_runner_final_mode_payload:{mode}")
+            payload_dict["final_mode_payload_built"] = bool(payload_dict.get("final_mode_payload_built", False))
+        kwargs["payload"] = PlanSelectedPayload(**payload_dict)
+        return kwargs

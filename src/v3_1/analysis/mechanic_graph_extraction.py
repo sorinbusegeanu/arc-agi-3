@@ -187,6 +187,17 @@ def _node_from_poi(poi: dict, *, round_id: int, episode_id: str) -> dict:
         "last_seen_round": int(round_id),
         "object_ref": object_ref,
         "pattern_id": str(poi.get("pattern_id") or ""),
+        "source_entity_id": entity_ref or None,
+        "identity_confidence": float(poi.get("identity_confidence", 0.0) or 0.0),
+        "identity_status": str(poi.get("identity_status") or "unknown"),
+        "identity_history": tuple(
+            {
+                "matched_prior_id": poi.get("matched_prior_id"),
+                "candidate_prior_ids": list(poi.get("candidate_prior_ids", []) or []),
+                "round_id": int(round_id),
+            }
+            for _ in [0]
+        ),
         "object_backed": True,
         "synthetic_region_only": False,
         "support_round_count": 1,
@@ -198,6 +209,8 @@ def _node_from_poi(poi: dict, *, round_id: int, episode_id: str) -> dict:
             "centroid": poi.get("centroid"),
             "descriptor": dict(poi.get("pattern_descriptor", {}) or {}),
             "bbox": _bbox_dict(poi),
+            "identity_confidence": float(poi.get("identity_confidence", 0.0) or 0.0),
+            "identity_status": str(poi.get("identity_status") or "unknown"),
         },
     }
 
@@ -242,6 +255,10 @@ def _trigger_zone_node(zone: dict, *, round_id: int, episode_id: str) -> dict:
         "first_seen_round": int(round_id),
         "last_seen_round": int(round_id),
         "object_ref": entity_id or zone_id,
+        "source_entity_id": entity_id or None,
+        "identity_confidence": float(zone.get("identity_confidence", 0.0) or 0.0),
+        "identity_status": str(zone.get("identity_status") or ("match_existing" if entity_id else "unknown")),
+        "identity_history": tuple(),
         "object_backed": bool(entity_id),
         "synthetic_region_only": not bool(entity_id),
         "support_round_count": 1,
@@ -597,6 +614,8 @@ def extract_mechanic_graph_delta(
                     "poi_visit_support_count": 1,
                     "post_visit_remote_change_count": 1,
                     "directed_outcome_support_count": 1 if bool(step.get("trigger_contact_based_on_confident_avatar")) else 0,
+                    "lag_consistency_score": 1.0,
+                    "support_consistency_score": 0.6,
                 }
             )
         exit_failed_without_new_support = bool(step.get("exit_attempt_failed_without_new_support", False))
@@ -622,6 +641,8 @@ def extract_mechanic_graph_delta(
                         "poi_visit_support_count": 1,
                         "post_visit_exit_effect_count": 1,
                         "directed_outcome_support_count": 1 if bool(step.get("new_support_since_previous_exit_attempt", False)) else 0,
+                        "exit_attempt_support_count": 1,
+                        "support_consistency_score": 0.55,
                     }
                 )
 

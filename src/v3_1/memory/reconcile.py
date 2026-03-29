@@ -95,6 +95,24 @@ def build_durable_update_batch(
     hypothesis_trigger_count = max(0, len(triggers) - observed_trigger_count)
     observed_consequence_count = sum(1 for row in consequences.values() if str(row.get("evidence_tier") or "") == "observed")
     hypothesis_consequence_count = max(0, len(consequences) - observed_consequence_count)
+    runtime_chain_state = dict(metadata.get("runtime_subgoal_chain_state", {}) or {})
+    runtime_active_chain = dict(runtime_chain_state.get("active_chain", {}) or {})
+    runtime_active_step = dict(runtime_chain_state.get("active_step", {}) or {})
+    chain_id = str(runtime_active_chain.get("chain_id") or outcome_summary.get("chain_id") or "")
+    chain_selected = bool(chain_id)
+    chain_started = bool(chain_selected and runtime_chain_state)
+    chain_progressed = bool(outcome_summary.get("chain_should_advance") or outcome_summary.get("chain_should_retry") or outcome_summary.get("chain_should_abort"))
+    chain_completed = bool(str(outcome_summary.get("chain_status_after") or "") == "completed")
+    chain_abandoned = bool(str(outcome_summary.get("chain_status_after") or "") == "aborted")
+    chain_followthrough_state = (
+        "chain_abandoned_after_contradiction_or_no_support" if chain_abandoned else
+        "chain_completed" if chain_completed else
+        "chain_progressed" if chain_progressed else
+        "chain_started_but_no_progress" if chain_started else
+        "chain_selected_but_never_started" if chain_selected else
+        "no_chain"
+    )
+    abandonment_penalty = 1 if chain_abandoned else 0
 
     def annotate(
         row: dict,
@@ -488,6 +506,56 @@ def build_durable_update_batch(
     proposal_validation_state = tuple({"proposal_id": str(proposal_id), "state": str(state)} for proposal_id, state in validation_state.items())
     proposal_agreement_groups = tuple({"agreement_key": row.get("path_id"), "metadata": row.get("metadata", {})} for row in deterministic_llm_agreements)
     proposal_outcome_summaries = tuple({"proposal_id": str(proposal_id), "state": str(validation_state.get(proposal_id, "new"))} for proposal_id in {**deterministic_proposals, **llm_proposals})
+    planner_usable_targets = {}
+    for entity_id, entity in entities.items():
+        support_profile = {
+            "directed_outcome": int(entity.get("directed_outcome_support_count", 0) or 0),
+            "counterfactual": int(entity.get("counterfactual_support_count", 0) or 0),
+            "exit_attempt": int(entity.get("exit_attempt_support_count", 0) or 0),
+        }
+        identity_profile = {
+            "identity_status": str(entity.get("identity_status") or "unknown"),
+            "identity_cross_round_stability": int(entity.get("identity_cross_round_stability", 0) or 0),
+        }
+        planner_usable = bool(
+            support_profile["directed_outcome"] >= 1
+            or support_profile["counterfactual"] >= 1
+            or support_profile["exit_attempt"] >= 1
+            or identity_profile["identity_status"] in {"match_existing", "confirmed", "probable"}
+        )
+        durable_ready = bool(
+            support_profile["directed_outcome"] >= 2
+            or support_profile["counterfactual"] >= 2
+            or support_profile["exit_attempt"] >= 1
+            or (identity_profile["identity_status"] in {"match_existing", "confirmed"} and identity_profile["identity_cross_round_stability"] >= 2)
+        )
+        usable_reason_codes = []
+        if support_profile["directed_outcome"] >= 1:
+            usable_reason_codes.append("directed_support_threshold")
+        if support_profile["counterfactual"] >= 1:
+            usable_reason_codes.append("counterfactual_support_threshold")
+        if support_profile["exit_attempt"] >= 1:
+            usable_reason_codes.append("exit_attempt_support_threshold")
+        if identity_profile["identity_status"] in {"match_existing", "confirmed", "probable"}:
+            usable_reason_codes.append("identity_strength_threshold")
+        durable_reason_codes = []
+        if support_profile["directed_outcome"] >= 2:
+            durable_reason_codes.append("directed_repeatable")
+        if support_profile["counterfactual"] >= 2:
+            durable_reason_codes.append("counterfactual_repeatable")
+        if support_profile["exit_attempt"] >= 1:
+            durable_reason_codes.append("exit_attempt_observed")
+        if identity_profile["identity_status"] in {"match_existing", "confirmed"} and identity_profile["identity_cross_round_stability"] >= 2:
+            durable_reason_codes.append("identity_stable")
+        if planner_usable or durable_ready:
+            planner_usable_targets[str(entity_id)] = {
+                "planner_usable": planner_usable,
+                "planner_usable_reason_codes": usable_reason_codes,
+                "durable_ready": durable_ready,
+                "durable_ready_reason_codes": durable_reason_codes,
+                "usable_support_profile": support_profile,
+                "usable_identity_profile": identity_profile,
+            }
 
     return DurableMemoryUpdateBatch(
         session_id=session_id,
@@ -522,7 +590,21 @@ def build_durable_update_batch(
         proposal_agreement_groups=proposal_agreement_groups,
         proposal_outcome_summaries=proposal_outcome_summaries,
         ranker_state=ranker_state,
-        metadata={"source": "reconcile", "has_priors": bool(durable_priors), "source_mode": outcome_mode},
+        metadata={
+            "source": "reconcile",
+            "has_priors": bool(durable_priors),
+            "source_mode": outcome_mode,
+            "chain_followthrough_state": chain_followthrough_state,
+            "chain_id": chain_id or None,
+            "chain_step_id": str(runtime_active_step.get("step_id") or outcome_summary.get("step_id") or "") or None,
+            "chain_started": bool(chain_started),
+            "chain_progressed": bool(chain_progressed),
+            "chain_completed": bool(chain_completed),
+            "chain_abandoned": bool(chain_abandoned),
+            "chain_abandonment_penalty": int(abandonment_penalty),
+            "poi_support_gain_after_visit": dict(metadata.get("poi_support_gain_after_visit", {}) or {}),
+            "planner_usable_targets": planner_usable_targets,
+        },
     )
 
 

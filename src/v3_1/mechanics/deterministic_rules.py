@@ -127,11 +127,13 @@ def pattern_equality_match(events: list[dict]) -> list[HypothesisEdgeProposal]:
 
 def gate_controls_exit(events: list[dict]) -> list[HypothesisEdgeProposal]:
     gate_changes = [event for event in events if str(event.get("event_kind")) == "gate_state_change"]
-    exit_events = [event for event in events if str(event.get("event_kind")) in {"exit_success", "exit_failure", "exit_attempt"}]
+    exit_events = [event for event in events if str(event.get("event_kind")) in {"exit_success", "exit_failure", "exit_attempt", "exit_attempt_after_prerequisite"}]
     proposals = []
     for gate in gate_changes:
         for exit_event in exit_events:
-            proposals.append(_edge("gate_controls_exit", src_node_id=str(gate.get("node_id")), dst_node_id=str(exit_event.get("node_id")), edge_kind="controls_access", round_id=int(gate.get("round_id", 0) or 0), episode_ids=(str(gate.get("episode_id")),), support_events=[gate, exit_event], confidence=0.45))
+            if int(exit_event.get("round_id", 0) or 0) < int(gate.get("round_id", 0) or 0):
+                continue
+            proposals.append(_edge("gate_controls_exit", src_node_id=str(gate.get("node_id")), dst_node_id=str(exit_event.get("node_id")), edge_kind="controls_access", round_id=int(gate.get("round_id", 0) or 0), episode_ids=(str(gate.get("episode_id")), str(exit_event.get("episode_id"))), support_events=[gate, exit_event], confidence=0.52))
     return proposals
 
 
@@ -153,12 +155,19 @@ def trigger_changes_panel(events: list[dict]) -> list[HypothesisEdgeProposal]:
                 continue
             if int(pattern.get("step_index", 0)) - int(contact.get("step_index", 0)) > 4:
                 continue
-            proposals.append(_edge("trigger_changes_panel", src_node_id=str(contact.get("node_id")), dst_node_id=str(pattern.get("node_id")), edge_kind="changes", round_id=int(contact.get("round_id", 0) or 0), episode_ids=(str(contact.get("episode_id")),), support_events=[contact, pattern], confidence=0.4))
+            proposals.append(_edge("trigger_changes_panel", src_node_id=str(contact.get("node_id")), dst_node_id=str(pattern.get("node_id")), edge_kind="changes", round_id=int(contact.get("round_id", 0) or 0), episode_ids=(str(contact.get("episode_id")), str(pattern.get("episode_id"))), support_events=[contact, pattern], confidence=0.46))
     return proposals
 
 
 def panel_matches_gate(events: list[dict]) -> list[HypothesisEdgeProposal]:
-    return [proposal for proposal in pattern_equality_match(events) if proposal.edge_kind == "matches"]
+    proposals = [proposal for proposal in pattern_equality_match(events) if proposal.edge_kind == "matches"]
+    panel_events = [event for event in events if str(event.get("event_kind") or "") == "panel_match_observed_after_trigger"]
+    gate_events = [event for event in events if str(event.get("event_kind") or "") == "gate_state_changed_after_trigger"]
+    if panel_events and gate_events:
+        first_panel = panel_events[0]
+        first_gate = gate_events[0]
+        proposals.append(_edge("trigger_changes_panel_then_panel_matches_gate", src_node_id=str(first_panel.get("other_node_id") or first_panel.get("node_id") or ""), dst_node_id=str(first_gate.get("node_id") or ""), edge_kind="matches", round_id=int(first_panel.get("round_id", 0) or 0), episode_ids=(str(first_panel.get("episode_id") or ""), str(first_gate.get("episode_id") or "")), support_events=[first_panel, first_gate], confidence=0.6))
+    return proposals
 
 
 def trigger_to_exit_dependency_path(events: list[dict]) -> list[HypothesisPathProposal]:
@@ -336,7 +345,7 @@ def trigger_candidate_from_detector_poi(events: list[dict]) -> list[HypothesisPa
                 round_id=int(event.get("round_id", 0) or 0),
                 episode_ids=(str(event.get("episode_id") or ""),),
                 support_events=[event],
-                confidence=0.57,
+                confidence=0.61,
             )
         )
     return proposals
