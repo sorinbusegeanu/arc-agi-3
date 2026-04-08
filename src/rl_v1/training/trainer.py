@@ -67,7 +67,7 @@ class Trainer:
         if self.cfg.checkpoint.restore_path:
             self.checkpoints.load(self.cfg.checkpoint.restore_path, model=self.model, optimizer=self.optimizer, scheduler=self.scheduler, cfg=self.cfg)
 
-    def train(self, updates: int = 1):
+    def train(self, updates: int = 1, mode: str = "train_rl"):
         self.maybe_restore()
         self._ensure_envs()
         summary = {}
@@ -76,15 +76,19 @@ class Trainer:
             for _ in range(updates):
                 self.update_idx += 1
                 collection_start = time.perf_counter()
-                sequences = self._collect_sequences(deterministic=False, evaluation=False)
+                sequences = self._collect_sequences(
+                    deterministic=False,
+                    evaluation=False,
+                    collection_mode="world_pretrain" if mode == "world_pretrain" else "rl",
+                )
                 collection_seconds = time.perf_counter() - collection_start
                 collected_steps = sum(len(sequence.timesteps) for sequence in sequences)
                 collected_steps_total += collected_steps
-                summary = self._train_on_sequences(sequences)
+                summary = self._train_on_sequences(sequences, mode=mode)
                 summary["collection_seconds"] = float(collection_seconds)
                 _print_training_progress(self.update_idx, updates, summary.get("training_loss"))
                 if self.update_idx % self.cfg.logging.log_every_updates == 0:
-                    payload = build_run_summary(self.cfg, self.training_loss_meter.compute())
+                    payload = build_run_summary(self.cfg, self.training_loss_meter.compute() | {"mode": mode})
                     payload["update_idx"] = self.update_idx
                     payload["effective_training_episodes_per_game"] = {
                         str(game_id): _episodes_to_collect_for_game(self.cfg, str(game_id))
@@ -114,10 +118,18 @@ class Trainer:
                         cfg=self.cfg,
                         update_idx=self.update_idx,
                         model_variant=self.cfg.model.variant,
+                        training_mode=mode,
+                        seed=self.cfg.runtime.training_seed if mode != "world_pretrain" else self.cfg.runtime.world_pretrain_seed,
                     )
                 if self.update_idx % self.cfg.logging.eval_every_updates == 0:
                     eval_start = time.perf_counter()
-                    summary["evaluation"] = Evaluator(self.cfg, self.model, wandb_logger=self.wandb_logger, step=self.update_idx).evaluate()
+                    summary["evaluation"] = Evaluator(
+                        self.cfg,
+                        self.model,
+                        wandb_logger=self.wandb_logger,
+                        step=self.update_idx,
+                        parallel_rollout_manager=self.parallel_rollout_manager,
+                    ).evaluate()
                     summary["evaluation_seconds"] = float(time.perf_counter() - eval_start)
                     if self.cfg.checkpoint.enabled:
                         self.checkpoints.save(
@@ -128,6 +140,9 @@ class Trainer:
                             cfg=self.cfg,
                             update_idx=self.update_idx,
                             model_variant=self.cfg.model.variant,
+                            training_mode=mode,
+                            seed=self.cfg.runtime.training_seed if mode != "world_pretrain" else self.cfg.runtime.world_pretrain_seed,
+                            evaluation_deterministic=bool(self.cfg.evaluation.deterministic),
                         )
                     self._maybe_save_best_checkpoint(summary["evaluation"])
                 else:
@@ -140,7 +155,7 @@ class Trainer:
         finally:
             self.shutdown()
 
-    def _train_on_sequences(self, sequences):
+    def _train_on_sequences(self, sequences, mode: str = "train_rl"):
         self.model.train()
         if not sequences:
             return self.training_loss_meter.compute()
@@ -152,13 +167,13 @@ class Trainer:
         target_cache = []
         target_build_start = time.perf_counter()
         for seq_batch in seq_batches:
-            targets_padded, target_mask = _build_batched_targets_for_seq_batch(
+            targets_padded, target_mask, target_extras = _build_batched_targets_for_seq_batch(
                 self.target_builder,
                 seq_batch,
                 self.model,
                 self.fabric.device,
             )
-            target_cache.append((targets_padded, target_mask))
+            target_cache.append((targets_padded, target_mask, target_extras))
         target_build_seconds = float(time.perf_counter() - target_build_start)
         rows = []
         optimizer_batches = 0
@@ -201,7 +216,7 @@ class Trainer:
                         latents_valid,
                         chosen_actions_valid,
                     )
-                    target_padded, target_mask = target_cache[batch_idx]
+                    target_padded, target_mask, target_extras = target_cache[batch_idx]
                     if target_padded.shape[:2] != timestep_mask.shape:
                         raise ValueError(
                             "target latent/timestep mismatch for batched training: "
@@ -210,30 +225,96 @@ class Trainer:
                     if not torch.equal(target_mask, timestep_mask):
                         raise ValueError("target latent mask does not align with timestep mask")
                     transition_target = target_padded.reshape(-1, target_padded.shape[-1])[flat_valid]
+                    change_mask_target_valid = None
+                    next_frame_target_valid = None
+                    if "change_mask_target" in target_extras:
+                        change_mask_target_valid = target_extras["change_mask_target"].reshape(
+                            -1,
+                            *target_extras["change_mask_target"].shape[2:],
+                        )[flat_valid]
+                    if "next_frame_target" in target_extras:
+                        next_frame_target_valid = target_extras["next_frame_target"].reshape(
+                            -1,
+                            *target_extras["next_frame_target"].shape[2:],
+                        )[flat_valid]
+                else:
+                    change_mask_target_valid = None
+                    next_frame_target_valid = None
                 if self.cfg.ablations.disable_transition_loss:
                     transition_pred = None
                     transition_target = None
-                batch_total, parts = compute_losses(
-                    new_logprob=new_logprob,
-                    old_logprob=old_logprobs_valid,
-                    value_pred=values_valid,
-                    returns=returns_valid,
-                    advantages=advantages_valid,
-                    entropy=entropy,
-                    transition_pred=transition_pred,
-                    transition_target=transition_target,
-                    reward_pred=reward_pred,
-                    reward_target=reward_targets_valid,
-                    done_logit=done_logit,
-                    done_target=done_targets_valid,
-                    optimization_cfg=self.cfg.optimization,
-                    loss_weights_cfg=self.cfg.loss_weights,
-                )
+                change_mask_logits_valid = None
+                next_frame_logits_valid = None
+                if model_out.get("change_mask_logits", None) is not None:
+                    cm = model_out["change_mask_logits"]
+                    change_mask_logits_valid = cm.reshape(-1, *cm.shape[2:])[flat_valid]
+                if model_out.get("next_frame_logits", None) is not None:
+                    nf = model_out["next_frame_logits"]
+                    next_frame_logits_valid = nf.reshape(-1, *nf.shape[2:])[flat_valid]
+                if mode == "world_pretrain":
+                    batch_total, parts = compute_losses(
+                        new_logprob=new_logprob.detach() * 0.0,
+                        old_logprob=old_logprobs_valid.detach() * 0.0,
+                        value_pred=values_valid.detach() * 0.0,
+                        returns=returns_valid.detach() * 0.0,
+                        advantages=advantages_valid.detach() * 0.0,
+                        entropy=entropy.detach() * 0.0,
+                        transition_pred=transition_pred,
+                        transition_target=transition_target,
+                        reward_pred=reward_pred,
+                        reward_target=reward_targets_valid,
+                        done_logit=done_logit,
+                        done_target=done_targets_valid,
+                        change_mask_logits=change_mask_logits_valid,
+                        change_mask_target=change_mask_target_valid,
+                        next_frame_logits=next_frame_logits_valid,
+                        next_frame_target=next_frame_target_valid,
+                        optimization_cfg=self.cfg.optimization,
+                        loss_weights_cfg=self.cfg.loss_weights,
+                        mode="world_pretrain",
+                    )
+                else:
+                    batch_total, parts = compute_losses(
+                        new_logprob=new_logprob,
+                        old_logprob=old_logprobs_valid,
+                        value_pred=values_valid,
+                        returns=returns_valid,
+                        advantages=advantages_valid,
+                        entropy=entropy,
+                        transition_pred=transition_pred,
+                        transition_target=transition_target,
+                        reward_pred=reward_pred,
+                        reward_target=reward_targets_valid,
+                        done_logit=done_logit,
+                        done_target=done_targets_valid,
+                        change_mask_logits=change_mask_logits_valid,
+                        change_mask_target=change_mask_target_valid,
+                        next_frame_logits=next_frame_logits_valid,
+                        next_frame_target=next_frame_target_valid,
+                        optimization_cfg=self.cfg.optimization,
+                        loss_weights_cfg=self.cfg.loss_weights,
+                        mode="train_rl",
+                    )
                 if not torch.isfinite(batch_total).item():
                     raise ValueError(f"non-finite batch loss: {float(batch_total.detach().cpu())}, parts={parts}")
                 if not torch.isfinite(batch_total).item():
                     raise ValueError(f"non-finite batch_total before backward: {float(batch_total.detach().cpu())}")
                 self.fabric.backward(batch_total)
+                grad_total_sq = 0.0
+                grad_max_abs = 0.0
+                grad_nonfinite = 0
+                for parameter in self.model.parameters():
+                    if parameter.grad is None:
+                        continue
+                    grad = parameter.grad.detach()
+                    finite = torch.isfinite(grad)
+                    if not finite.all().item():
+                        grad_nonfinite += 1
+                    grad_total_sq += float((grad[finite] ** 2).sum().item()) if finite.any().item() else 0.0
+                    if grad.numel() > 0:
+                        grad_max_abs = max(grad_max_abs, float(grad.abs().max().item()))
+                if grad_nonfinite > 0:
+                    raise ValueError(f"non-finite gradients detected before optimizer step: count={grad_nonfinite}")
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.optimization.grad_clip_norm)
                 self.optimizer.step()
                 for name, parameter in self.model.named_parameters():
@@ -243,6 +324,13 @@ class Trainer:
                         raise ValueError(f"non-finite model parameter after optimizer step: {name}")
                 self.training_loss_meter.update(float(batch_total.detach().cpu()))
                 rows.append(parts)
+                rows.append(
+                    {
+                        "grad_total_norm": grad_total_sq ** 0.5,
+                        "grad_max_abs": grad_max_abs,
+                        "nonfinite_grad_params": float(grad_nonfinite),
+                    }
+                )
                 optimizer_batches += 1
                 valid_timesteps = int(flat_valid.sum().item())
                 valid_timesteps_per_update += valid_timesteps
@@ -274,7 +362,7 @@ class Trainer:
         if self._envs is None:
             self._envs = self.build_envs()
 
-    def _collect_sequences(self, *, deterministic: bool, evaluation: bool):
+    def _collect_sequences(self, *, deterministic: bool, evaluation: bool, collection_mode: str = "rl"):
         if self.cfg.env.execution_mode == "parallel_workers":
             game_episode_counts = {
                 str(game_id): _episodes_to_collect_for_game(self.cfg, str(game_id))
@@ -287,18 +375,20 @@ class Trainer:
                 game_episode_counts=game_episode_counts,
                 deterministic=deterministic,
                 evaluation=evaluation,
+                collection_mode=collection_mode,
             )
         sequences = []
         for env in self._envs or []:
             episodes_to_collect = _episodes_to_collect_for_game(self.cfg, env.game_id)
             sequences.extend(
-                self.collector.collect(
-                    self.model,
-                    env,
-                    episodes=episodes_to_collect,
-                    deterministic=deterministic,
-                    evaluation=evaluation,
-                )
+                    self.collector.collect(
+                        self.model,
+                        env,
+                        episodes=episodes_to_collect,
+                        deterministic=deterministic,
+                        evaluation=evaluation,
+                        collection_mode=collection_mode,
+                    )
             )
         return sequences
 
@@ -317,6 +407,9 @@ class Trainer:
             cfg=self.cfg,
             update_idx=self.update_idx,
             model_variant=self.cfg.model.variant,
+            training_mode="train_rl",
+            seed=self.cfg.runtime.training_seed,
+            evaluation_deterministic=bool(self.cfg.evaluation.deterministic),
         )
 
 
@@ -367,6 +460,14 @@ def _stack_observations(observations, device) -> dict[str, torch.Tensor]:
         "valid_pixel_mask": torch.stack([obs.valid_pixel_mask for obs in observations], dim=0).to(device),
         "game_id_index": torch.tensor([int(obs.game_id_index) for obs in observations], dtype=torch.long, device=device),
         "current_level_index": torch.tensor([int(obs.current_level_index) for obs in observations], dtype=torch.long, device=device),
+        "step_count": torch.tensor([int(getattr(obs, "step_count", 0)) for obs in observations], dtype=torch.long, device=device),
+        "changed_cell_mask": torch.stack(
+            [
+                (obs.changed_cell_mask if getattr(obs, "changed_cell_mask", None) is not None else torch.zeros_like(obs.current_frame))
+                for obs in observations
+            ],
+            dim=0,
+        ).to(device),
     }
 
 
@@ -381,6 +482,7 @@ def _pack_sequence_batch(seq_batch, device, optimization_cfg=None) -> dict[str, 
     previous_rewards = torch.zeros((batch_size, max_t), dtype=torch.float32, device=device)
     previous_done_flags = torch.zeros((batch_size, max_t), dtype=torch.float32, device=device)
     current_level_indices = torch.zeros((batch_size, max_t), dtype=torch.long, device=device)
+    step_counts = torch.zeros((batch_size, max_t), dtype=torch.long, device=device)
     chosen_action_ids = torch.zeros((batch_size, max_t), dtype=torch.long, device=device)
     old_action_logprobs = torch.zeros((batch_size, max_t), dtype=torch.float32, device=device)
     rewards = torch.zeros((batch_size, max_t), dtype=torch.float32, device=device)
@@ -407,6 +509,7 @@ def _pack_sequence_batch(seq_batch, device, optimization_cfg=None) -> dict[str, 
             "previous_frame_2": torch.zeros((batch_size, max_t, *frame_shape), dtype=current_obs_stacked["previous_frame_2"].dtype, device=device),
             "valid_action_mask": torch.zeros((batch_size, max_t, *action_shape), dtype=torch.bool, device=device),
             "valid_pixel_mask": torch.zeros((batch_size, max_t, *pixel_shape), dtype=torch.bool, device=device),
+            "changed_cell_mask": torch.zeros((batch_size, max_t, *frame_shape), dtype=torch.float32, device=device),
         }
         next_obs = {
             "current_frame": torch.zeros((batch_size, max_t, *frame_shape), dtype=next_obs_stacked["current_frame"].dtype, device=device),
@@ -414,6 +517,7 @@ def _pack_sequence_batch(seq_batch, device, optimization_cfg=None) -> dict[str, 
             "previous_frame_2": torch.zeros((batch_size, max_t, *frame_shape), dtype=next_obs_stacked["previous_frame_2"].dtype, device=device),
             "valid_action_mask": torch.zeros((batch_size, max_t, *action_shape), dtype=torch.bool, device=device),
             "valid_pixel_mask": torch.zeros((batch_size, max_t, *pixel_shape), dtype=torch.bool, device=device),
+            "changed_cell_mask": torch.zeros((batch_size, max_t, *frame_shape), dtype=torch.float32, device=device),
         }
     else:
         current_obs = {}
@@ -444,6 +548,7 @@ def _pack_sequence_batch(seq_batch, device, optimization_cfg=None) -> dict[str, 
             previous_rewards[b_idx, t_idx] = float(step.previous_reward)
             previous_done_flags[b_idx, t_idx] = 1.0 if step.previous_done else 0.0
             current_level_indices[b_idx, t_idx] = int(current_obs_stacked["current_level_index"][obs_idx].item())
+            step_counts[b_idx, t_idx] = int(current_obs_stacked["step_count"][obs_idx].item())
             chosen_action_ids[b_idx, t_idx] = int(step.chosen_action.action_id)
             old_action_logprobs[b_idx, t_idx] = float(step.action_logprob)
             rewards[b_idx, t_idx] = float(step.reward)
@@ -464,6 +569,7 @@ def _pack_sequence_batch(seq_batch, device, optimization_cfg=None) -> dict[str, 
         "previous_rewards": previous_rewards,
         "previous_done_flags": previous_done_flags,
         "current_level_indices": current_level_indices,
+        "step_counts": step_counts,
         "chosen_action_ids": chosen_action_ids,
         "old_action_logprobs": old_action_logprobs,
         "rewards": rewards,
@@ -476,7 +582,10 @@ def _pack_sequence_batch(seq_batch, device, optimization_cfg=None) -> dict[str, 
 
 def _build_batched_targets_for_seq_batch(target_builder, seq_batch, model, device):
     if hasattr(target_builder, "build_next_latents_for_sequence_batch"):
-        return target_builder.build_next_latents_for_sequence_batch(seq_batch, model, device)
+        built = target_builder.build_next_latents_for_sequence_batch(seq_batch, model, device)
+        if isinstance(built, tuple) and len(built) == 3:
+            return built
+        return built[0], built[1], {}
     batch_size = len(seq_batch)
     max_t = max((len(sequence.timesteps) for sequence in seq_batch), default=0)
     hidden_dim = int(getattr(model.cfg, "hidden_dim", getattr(model.cfg, "latent_dim", 0)))
@@ -495,7 +604,7 @@ def _build_batched_targets_for_seq_batch(target_builder, seq_batch, model, devic
             if length > 0:
                 targets_padded[b_idx, :length] = targets
                 timestep_mask[b_idx, :length] = True
-        return targets_padded, timestep_mask
+        return targets_padded, timestep_mask, {}
     if hasattr(target_builder, "build_next_latent_targets"):
         hidden_state_bundle = {
             sequence.sequence_id: sequence.initial_hidden_state
@@ -516,7 +625,7 @@ def _build_batched_targets_for_seq_batch(target_builder, seq_batch, model, devic
                 targets_padded[b_idx, :length] = targets[row_idx : row_idx + length]
                 timestep_mask[b_idx, :length] = True
                 row_idx += length
-        return targets_padded, timestep_mask
+        return targets_padded, timestep_mask, {}
     raise AttributeError("target_builder does not expose a supported target-latent construction method")
 
 
@@ -533,6 +642,8 @@ def _forward_sequence_batch_compat(model, packed):
             prev_rewards=packed["previous_rewards"],
             prev_dones=packed["previous_done_flags"],
             current_level_indices=packed["current_level_indices"],
+            step_counts=packed["step_counts"],
+            chosen_action_ids=packed["chosen_action_ids"],
             initial_hidden=packed["initial_hidden_states"],
         )
     batch_size, timesteps = packed["timestep_mask"].shape
@@ -555,6 +666,7 @@ def _forward_sequence_batch_compat(model, packed):
                 valid_pixel_mask=packed["current_obs"]["valid_pixel_mask"][b_idx, t_idx],
                 game_id_index=int(packed["game_id_indices"][b_idx, t_idx].item()),
                 current_level_index=int(packed["current_level_indices"][b_idx, t_idx].item()),
+                step_count=int(packed["step_counts"][b_idx, t_idx].item()),
             )
             encoded = model.encode_observation(
                 obs,
@@ -584,7 +696,11 @@ def _forward_sequence_batch_compat(model, packed):
 
 def _transition_batch_compat(model, latents: torch.Tensor, action_ids: torch.Tensor):
     if hasattr(model, "transition_batch"):
-        return model.transition_batch(latents, action_ids)
+        outputs = model.transition_batch(latents, action_ids)
+        if isinstance(outputs, tuple) and len(outputs) >= 5:
+            next_latent, _change_mask, _next_frame, reward_pred, done_logit = outputs[:5]
+            return next_latent, reward_pred, done_logit
+        return outputs
     next_latents = []
     rewards = []
     done_logits = []

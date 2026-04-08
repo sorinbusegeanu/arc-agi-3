@@ -22,10 +22,14 @@ class NextLatentTargetBuilder:
             return torch.zeros((0, model.cfg.hidden_dim), device=device)
         return torch.cat(outputs, dim=0)
 
-    def build_next_latents_for_sequence_batch(self, seq_batch, model, device) -> tuple[torch.Tensor, torch.Tensor]:
+    def build_next_latents_for_sequence_batch(self, seq_batch, model, device):
         if not seq_batch:
             hidden_dim = int(getattr(model.cfg, "hidden_dim", getattr(model.cfg, "latent_dim", 0)))
-            return torch.zeros((0, 0, hidden_dim), device=device), torch.zeros((0, 0), dtype=torch.bool, device=device)
+            return (
+                torch.zeros((0, 0, hidden_dim), device=device),
+                torch.zeros((0, 0), dtype=torch.bool, device=device),
+                {},
+            )
         max_t = max(len(sequence.timesteps) for sequence in seq_batch)
         batch_size = len(seq_batch)
         timestep_mask = torch.zeros((batch_size, max_t), dtype=torch.bool, device=device)
@@ -33,7 +37,7 @@ class NextLatentTargetBuilder:
         obs_tensors = _stack_observations(next_obs, device=device)
         if not obs_tensors:
             hidden_dim = int(getattr(model.cfg, "hidden_dim", getattr(model.cfg, "latent_dim", 0)))
-            return torch.zeros((batch_size, max_t, hidden_dim), device=device), timestep_mask
+            return torch.zeros((batch_size, max_t, hidden_dim), device=device), timestep_mask, {}
         frame_shape = obs_tensors["current_frame"].shape[1:]
         action_shape = obs_tensors["valid_action_mask"].shape[1:]
         pixel_shape = obs_tensors["valid_pixel_mask"].shape[1:]
@@ -48,8 +52,14 @@ class NextLatentTargetBuilder:
             "prev_rewards": torch.zeros((batch_size, max_t), dtype=torch.float32, device=device),
             "prev_dones": torch.zeros((batch_size, max_t), dtype=torch.float32, device=device),
             "current_level_indices": torch.zeros((batch_size, max_t), dtype=torch.long, device=device),
+            "step_counts": torch.zeros((batch_size, max_t), dtype=torch.long, device=device),
+            "chosen_action_ids": torch.zeros((batch_size, max_t), dtype=torch.long, device=device),
             "initial_hidden": torch.stack([sequence.initial_hidden_state.to(device) for sequence in seq_batch], dim=0).squeeze(1),
         }
+        change_mask_target = torch.zeros((batch_size, max_t, *frame_shape), dtype=torch.float32, device=device)
+        next_frame_target = torch.zeros((batch_size, max_t, *frame_shape), dtype=torch.float32, device=device)
+        reward_target = torch.zeros((batch_size, max_t), dtype=torch.float32, device=device)
+        done_target = torch.zeros((batch_size, max_t), dtype=torch.float32, device=device)
         obs_index = 0
         for b_idx, sequence in enumerate(seq_batch):
             for t_idx, step in enumerate(sequence.timesteps):
@@ -64,11 +74,26 @@ class NextLatentTargetBuilder:
                 packed["prev_rewards"][b_idx, t_idx] = float(step.reward)
                 packed["prev_dones"][b_idx, t_idx] = 1.0 if step.done else 0.0
                 packed["current_level_indices"][b_idx, t_idx] = int(obs_tensors["current_level_index"][obs_index].item())
+                packed["step_counts"][b_idx, t_idx] = int(obs_tensors["step_count"][obs_index].item())
+                packed["chosen_action_ids"][b_idx, t_idx] = int(step.chosen_action.action_id)
+                change_mask_target[b_idx, t_idx] = obs_tensors["changed_cell_mask"][obs_index].to(dtype=torch.float32)
+                next_frame_target[b_idx, t_idx] = obs_tensors["current_frame"][obs_index]
+                reward_target[b_idx, t_idx] = float(step.reward)
+                done_target[b_idx, t_idx] = 1.0 if step.done else 0.0
                 obs_index += 1
         with torch.no_grad():
             outputs = model.forward_sequence_batch(**packed)
             targets = outputs["latents"].detach()
-        return targets, timestep_mask
+        return (
+            targets,
+            timestep_mask,
+            {
+                "change_mask_target": change_mask_target.detach(),
+                "next_frame_target": next_frame_target.detach(),
+                "reward_target": reward_target.detach(),
+                "done_target": done_target.detach(),
+            },
+        )
 
     def build_next_latent_targets(self, batch, model, hidden_state_bundle):
         outputs = []
@@ -133,4 +158,12 @@ def _stack_observations(observations, device) -> dict[str, torch.Tensor]:
         "valid_pixel_mask": torch.stack([obs.valid_pixel_mask for obs in observations], dim=0).to(device),
         "game_id_index": torch.tensor([int(obs.game_id_index) for obs in observations], dtype=torch.long, device=device),
         "current_level_index": torch.tensor([int(obs.current_level_index) for obs in observations], dtype=torch.long, device=device),
+        "step_count": torch.tensor([int(getattr(obs, "step_count", 0)) for obs in observations], dtype=torch.long, device=device),
+        "changed_cell_mask": torch.stack(
+            [
+                (obs.changed_cell_mask if getattr(obs, "changed_cell_mask", None) is not None else torch.zeros_like(obs.current_frame))
+                for obs in observations
+            ],
+            dim=0,
+        ).to(device),
     }

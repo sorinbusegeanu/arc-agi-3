@@ -21,6 +21,7 @@ from rl_v1.configs.schema import (
     RuntimeConfig,
     V1Config,
     WandbConfig,
+    WorldPretrainConfig,
 )
 
 
@@ -77,6 +78,7 @@ def _from_dict(payload: dict[str, Any]) -> V1Config:
         wandb=WandbConfig(**payload.get("wandb", {})),
         checkpoint=CheckpointConfig(**payload.get("checkpoint", {})),
         evaluation=EvalConfig(**payload.get("evaluation", {})),
+        world_pretrain=WorldPretrainConfig(**payload.get("world_pretrain", {})),
     )
     cfg.model.slot_count = cfg.model.num_slots
     cfg.model.relation_layers = cfg.model.slot_transformer_layers

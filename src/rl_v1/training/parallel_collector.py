@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import multiprocessing as mp
+from multiprocessing.connection import wait
 
 import torch
 
@@ -26,12 +27,6 @@ class ParallelRolloutManager:
         except Exception:
             pass
         self._ctx = mp.get_context(self.cfg.env.mp_start_method)
-        # env.num_workers is deprecated for multiprocessing; runtime.rollout_processes is the active knob.
-        partitions = _build_worker_game_assignments(
-            self.cfg.env.game_ids,
-            self.cfg.env.game_episode_multipliers,
-            int(self.cfg.runtime.rollout_processes),
-        )
         try:
             for worker_id in range(int(self.cfg.runtime.rollout_processes)):
                 parent_conn, child_conn = self._ctx.Pipe()
@@ -42,16 +37,14 @@ class ParallelRolloutManager:
                 )
                 process.start()
                 child_conn.close()
-                assigned_game_ids = partitions[worker_id] if worker_id < len(partitions) else []
                 worker = {
                     "id": worker_id,
                     "process": process,
                     "conn": parent_conn,
-                    "game_ids": assigned_game_ids,
                 }
                 self._workers.append(worker)
                 self._worker_debug[worker_id] = {
-                    "assigned_game_ids": list(assigned_game_ids),
+                    "assigned_game_ids": [],
                     "init_succeeded": False,
                 }
                 worker["conn"].send(
@@ -60,7 +53,6 @@ class ParallelRolloutManager:
                         "payload": {
                             "config_dict": self.cfg.to_dict(),
                             "worker_id": int(worker_id),
-                            "game_ids": list(assigned_game_ids),
                         },
                     }
                 )
@@ -74,7 +66,15 @@ class ParallelRolloutManager:
             self.close()
             raise
 
-    def collect(self, model, game_episode_counts: dict[str, int], deterministic: bool, evaluation: bool, acting_mode: str | None = None) -> list:
+    def collect(
+        self,
+        model,
+        game_episode_counts: dict[str, int],
+        deterministic: bool,
+        evaluation: bool,
+        acting_mode: str | None = None,
+        collection_mode: str = "rl",
+    ) -> list:
         if not self._started:
             self.start()
         model_buffer = io.BytesIO()
@@ -86,31 +86,55 @@ class ParallelRolloutManager:
             if evaluation
             else {str(game_id): int(self._training_episode_cursor_by_game.get(str(game_id), 0)) for game_id in game_episode_counts}
         )
-        worker_loads = _split_episode_counts_across_workers(self._workers, game_episode_counts, base_offsets=base_offsets)
+        game_tasks = _build_game_tasks(game_episode_counts, base_offsets=base_offsets)
         if not evaluation:
             for game_id, total in game_episode_counts.items():
                 gid = str(game_id)
                 self._training_episode_cursor_by_game[gid] = int(self._training_episode_cursor_by_game.get(gid, 0)) + int(total)
         for worker in self._workers:
-            worker_plan = worker_loads.get(int(worker["id"]), {"counts": {}, "offsets": {}})
             worker["conn"].send(
                 {
-                    "type": "collect",
+                    "type": "set_model",
                     "payload": {
                         "model_state_bytes": model_state_bytes,
                         "model_signature": _build_model_signature(self.cfg),
-                        "per_game_episode_counts": worker_plan["counts"],
-                        "per_game_episode_offsets": worker_plan["offsets"],
-                        "deterministic": bool(deterministic),
-                        "evaluation": bool(evaluation),
                         "acting_mode": acting_mode,
                         "worker_id": int(worker["id"]),
                     },
                 }
             )
-        sequences = []
         for worker in self._workers:
             response = worker["conn"].recv()
+            if not response.get("ok"):
+                raise RuntimeError(f"parallel worker {worker['id']} set_model failed: {response.get('error')}")
+        tasks_queue = list(sorted(game_tasks, key=lambda t: int(t["episodes"]), reverse=True))
+        conn_to_worker = {worker["conn"]: worker for worker in self._workers}
+        in_flight = 0
+        for worker in self._workers:
+            if not tasks_queue:
+                break
+            task = tasks_queue.pop(0)
+            worker["conn"].send(
+                {
+                    "type": "collect_task",
+                    "payload": {
+                        "task": task,
+                        "deterministic": bool(deterministic),
+                        "evaluation": bool(evaluation),
+                        "collection_mode": str(collection_mode),
+                        "worker_id": int(worker["id"]),
+                    },
+                }
+            )
+            in_flight += 1
+        sequences = []
+        while in_flight > 0:
+            ready = wait(list(conn_to_worker.keys()))
+            if not ready:
+                continue
+            conn = ready[0]
+            worker = conn_to_worker[conn]
+            response = conn.recv()
             if not response.get("ok"):
                 raise RuntimeError(f"parallel worker {worker['id']} collect failed: {response.get('error')}")
             if "sequences_bytes" in response:
@@ -118,6 +142,22 @@ class ParallelRolloutManager:
                 sequences.extend(loaded)
             else:
                 sequences.extend(response.get("sequences", []))
+            if tasks_queue:
+                task = tasks_queue.pop(0)
+                conn.send(
+                    {
+                        "type": "collect_task",
+                        "payload": {
+                            "task": task,
+                            "deterministic": bool(deterministic),
+                            "evaluation": bool(evaluation),
+                            "collection_mode": str(collection_mode),
+                            "worker_id": int(worker["id"]),
+                        },
+                    }
+                )
+            else:
+                in_flight -= 1
         return sequences
 
     def close(self) -> None:
@@ -151,59 +191,19 @@ def _partition_game_ids(game_ids, process_count: int):
     return buckets
 
 
-def _build_worker_game_assignments(game_ids, multipliers, process_count: int):
-    count = max(1, int(process_count))
-    configured = [str(game_id) for game_id in game_ids]
-    if not configured:
-        return [[] for _ in range(count)]
-    buckets = [[] for _ in range(count)]
-    # First pass: guarantee coverage so every configured game is collected at least once.
-    for idx, game_id in enumerate(configured):
-        buckets[idx % count].append(game_id)
-
-    # Second pass: spread weighted replicas across workers without dropping any game.
-    extras = []
-    for game_id in configured:
-        weight = int((multipliers or {}).get(game_id, 1))
-        extras.extend([game_id] * max(0, weight - 1))
-    for game_id in extras:
-        worker_ids = sorted(range(count), key=lambda wid: (len(buckets[wid]), wid))
-        placed = False
-        for wid in worker_ids:
-            if game_id not in buckets[wid]:
-                buckets[wid].append(game_id)
-                placed = True
-                break
-        if not placed:
-            buckets[worker_ids[0]].append(game_id)
-    # Ensure each worker has unique game ids; duplicate game entries on one worker
-    # can cause repeated collection passes and episode-identity collisions.
-    for idx, worker_games in enumerate(buckets):
-        buckets[idx] = list(dict.fromkeys(worker_games))
-    return buckets
-
-
-def _split_episode_counts_across_workers(workers, game_episode_counts: dict[str, int], base_offsets: dict[str, int] | None = None) -> dict[int, dict]:
-    by_game_workers: dict[str, list[int]] = {}
-    for worker in workers:
-        wid = int(worker["id"])
-        for game_id in set(worker["game_ids"]):
-            by_game_workers.setdefault(str(game_id), []).append(wid)
-    result: dict[int, dict] = {
-        int(worker["id"]): {"counts": {}, "offsets": {}}
-        for worker in workers
-    }
+def _build_game_tasks(game_episode_counts: dict[str, int], base_offsets: dict[str, int] | None = None) -> list[dict]:
+    tasks: list[dict] = []
     for game_id, total in game_episode_counts.items():
-        ids = by_game_workers.get(str(game_id), [])
-        if not ids:
+        episodes = int(total)
+        if episodes <= 0:
             continue
-        total_count = int(total)
-        base = total_count // len(ids)
-        rem = total_count % len(ids)
-        offset = int((base_offsets or {}).get(str(game_id), 0))
-        for idx, wid in enumerate(ids):
-            share = base + (1 if idx < rem else 0)
-            result[wid]["counts"][str(game_id)] = int(share)
-            result[wid]["offsets"][str(game_id)] = int(offset)
-            offset += share
-    return result
+        start = int((base_offsets or {}).get(str(game_id), 0))
+        for local_idx in range(episodes):
+            tasks.append(
+                {
+                    "game_id": str(game_id),
+                    "episodes": 1,
+                    "episode_offset": int(start + local_idx),
+                }
+            )
+    return tasks

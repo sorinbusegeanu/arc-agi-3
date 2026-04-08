@@ -65,9 +65,21 @@ class LatentBeamPlanner:
                     reverse=True,
                 )[: self.action_topk]
                 for action_id in candidates:
-                    next_latent, predicted_reward, done_logit = model_interfaces["dynamics"](latent, torch.tensor([action_id], device=latent.device))
-                    predicted_done = bool(torch.sigmoid(done_logit).item() > 0.5)
-                    expanded.append((next_latent, path + [int(action_id)], reward_sum + discount * float(predicted_reward.item()), discount * self.discount, predicted_done))
+                    transition_out = model_interfaces["dynamics"](latent, torch.tensor([action_id], device=latent.device))
+                    if isinstance(transition_out, tuple) and len(transition_out) >= 5:
+                        next_latent, _change_mask, _next_frame, predicted_reward, done_logit = transition_out[:5]
+                    else:
+                        next_latent, predicted_reward, done_logit = transition_out
+                    predicted_done = bool(torch.sigmoid(done_logit.detach()).item() > 0.5)
+                    expanded.append(
+                        (
+                            next_latent,
+                            path + [int(action_id)],
+                            reward_sum + discount * float(predicted_reward.detach().item()),
+                            discount * self.discount,
+                            predicted_done,
+                        )
+                    )
             expanded.sort(key=lambda item: item[2], reverse=True)
             beam = expanded[: self.beam_width]
             if not beam:
@@ -76,7 +88,7 @@ class LatentBeamPlanner:
             if done:
                 score = reward_sum
             else:
-                score = reward_sum + discount * float(model_interfaces["value_head"](latent).item())
+                score = reward_sum + discount * float(model_interfaces["value_head"](latent).detach().item())
             branches.append((path, score))
         if not branches:
             fallback_logits, _ = apply_valid_action_mask(policy_logits, valid_action_mask, evaluation=True)

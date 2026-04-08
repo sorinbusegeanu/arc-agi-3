@@ -15,7 +15,12 @@ reward:
   level_complete_bonus: 1.0
   game_win_bonus: 5.0
   repeat_state_penalty_enabled: true
-  repeat_state_penalty: -0.05
+  repeat_state_penalty: -0.1
+  revisit_window_size: 8
+  revisit_penalty_mode: binary
+  revisit_penalty_decay: 1.0
+  same_action_streak_threshold: 4
+  same_action_streak_penalty: -0.05
 acting:
   mode: policy_only
 planner:
@@ -45,6 +50,18 @@ model:
   gru_hidden_size: 256
   action_embed_dim: 64
   latent_dim: 256
+  max_game_ids: 64
+  game_embed_dim: 32
+  max_level_index: 256
+  use_world_model_pretraining: true
+  predict_next_frame: false
+  predict_change_mask: true
+  predict_reward: true
+  predict_done: true
+  metadata_embed_dim: 64
+  action_condition_dim: 64
+  step_count_embed_dim: 32
+  max_step_count: 256
   pooling: attention
 rollout:
   unroll_length: 4
@@ -56,6 +73,13 @@ runtime:
   devices: 1
   precision: 32-true
   rollout_processes: 1
+  inference_device: "cpu"
+  training_seed: 0
+  evaluation_seed: 0
+  world_pretrain_seed: 0
+  deterministic_torch: false
+  cudnn_deterministic: false
+  cudnn_benchmark: true
 optimization:
   learning_rate: 0.0003
   weight_decay: 0.00001
@@ -69,6 +93,8 @@ optimization:
   value_coef: 0.5
 loss_weights:
   transition_coef: 1.0
+  change_mask_coef: 1.0
+  next_frame_coef: 0.0
   reward_coef: 0.5
   done_coef: 0.25
 logging:
@@ -93,3 +119,17 @@ checkpoint:
 evaluation:
   episodes: 1
   deterministic: true
+  compare_policy_vs_configured: false
+world_pretrain:
+  enabled: false
+  updates: 100
+  batch_size: 8
+  unroll_length: 8
+  learning_rate: 0.0003
+  weight_decay: 0.00001
+  grad_clip_norm: 1.0
+  eval_every_updates: 5
+  save_every_updates: 10
+  freeze_encoder: false
+  freeze_recurrent: false
+  teacher_forcing: true

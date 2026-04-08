@@ -4,7 +4,20 @@ import torch
 
 
 class CheckpointManager:
-    def save(self, path, *, model, optimizer, scheduler, cfg, update_idx: int, model_variant: str) -> None:
+    def save(
+        self,
+        path,
+        *,
+        model,
+        optimizer,
+        scheduler,
+        cfg,
+        update_idx: int,
+        model_variant: str,
+        training_mode: str = "train_rl",
+        seed: int | None = None,
+        evaluation_deterministic: bool | None = None,
+    ) -> None:
         torch.save(
             {
                 "model_state": model.state_dict(),
@@ -13,6 +26,15 @@ class CheckpointManager:
                 "config_snapshot": cfg.to_dict(),
                 "update_idx": int(update_idx),
                 "model_variant": model_variant,
+                "training_mode": str(training_mode),
+                "effective_game_ids": list(getattr(cfg.env, "game_ids", [])),
+                "seed": int(seed) if seed is not None else None,
+                "acting_mode": getattr(cfg.acting, "mode", None),
+                "evaluation_deterministic": (
+                    bool(evaluation_deterministic)
+                    if evaluation_deterministic is not None
+                    else None
+                ),
             },
             path,
         )
@@ -32,3 +54,16 @@ class CheckpointManager:
         if scheduler is not None and payload.get("scheduler_state") is not None:
             scheduler.load_state_dict(payload["scheduler_state"])
         return payload
+
+    def read_metadata(self, path):
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        return {
+            "model_variant": payload.get("model_variant"),
+            "config_snapshot": payload.get("config_snapshot", {}),
+            "training_mode": payload.get("training_mode"),
+            "update_idx": payload.get("update_idx"),
+            "effective_game_ids": payload.get("effective_game_ids"),
+            "seed": payload.get("seed"),
+            "acting_mode": payload.get("acting_mode"),
+            "evaluation_deterministic": payload.get("evaluation_deterministic"),
+        }

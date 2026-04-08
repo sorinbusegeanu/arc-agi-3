@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from typing import Any
 from uuid import uuid4
+from pathlib import Path
 
 import torch
 
@@ -38,6 +40,10 @@ class ArcEnvironmentAdapter:
         self._previous_levels_completed: int | None = None
         self._steps_in_current_level = 0
         self._previous_state_signature: str | None = None
+        self._recent_state_signatures = []
+        self._last_action_id = None
+        self._same_action_streak = 0
+        self._pending_action_id = None
         self._build_arcade()
         self._create_env(self._seed)
 
@@ -73,6 +79,10 @@ class ArcEnvironmentAdapter:
         self._previous_levels_completed = None
         self._steps_in_current_level = 0
         self._previous_state_signature = None
+        self._recent_state_signatures = []
+        self._last_action_id = None
+        self._same_action_streak = 0
+        self._pending_action_id = None
         obs = self._normalize(self._env.reset(), is_reset=True)
         self._last_obs = obs
         return obs
@@ -86,8 +96,19 @@ class ArcEnvironmentAdapter:
             if action.x is None or action.y is None:
                 raise ValueError("ACTION6 requires explicit x and y payload")
             payload = {"x": int(action.x), "y": int(action.y)}
-        raw = self._env.step(GameAction.from_id(int(action.action_id)), data=payload, reasoning=None)
-        obs = self._normalize(raw, is_reset=False)
+        self._pending_action_id = int(action.action_id)
+        try:
+            raw = self._env.step(GameAction.from_id(int(action.action_id)), data=payload, reasoning=None)
+            obs = self._normalize(raw, is_reset=False)
+        finally:
+            self._pending_action_id = None
+        if self._last_obs is not None:
+            changed = self._last_obs.current_frame.ne(obs.current_frame)
+            obs = replace(obs, changed_cell_mask=changed.to(dtype=torch.float32))
+            if isinstance(obs.raw_metadata, dict):
+                obs.raw_metadata["changed_cell_count"] = int(changed.sum().item())
+        elif obs.changed_cell_mask is None:
+            obs = replace(obs, changed_cell_mask=torch.zeros_like(obs.current_frame))
         self._last_obs = obs
         return obs
 
@@ -97,6 +118,7 @@ class ArcEnvironmentAdapter:
         self._env = None
 
     def _normalize(self, raw: Any, *, is_reset: bool) -> ObservationPackage:
+        _ensure_reward_tracking_state(self)
         current_frame, valid_mask = frame_to_model_tensor(raw, canvas_height=self.model_cfg.canvas_height, canvas_width=self.model_cfg.canvas_width)
         prev_1 = self._previous_frames[-1] if len(self._previous_frames) >= 1 else _zeros_like(current_frame)
         prev_2 = self._previous_frames[-2] if len(self._previous_frames) >= 2 else _zeros_like(current_frame)
@@ -158,16 +180,80 @@ class ArcEnvironmentAdapter:
             if self._steps_in_current_level < int(self.reward_cfg.zero_steps_penalty)
             else float(self.reward_cfg.step_penalty)
         )
-        # Optional repeat-state penalty applies only when enabled via reward config.
         reward = float(base_reward)
         if level_completed:
             reward += float(self.reward_cfg.level_complete_bonus)
         if game_won:
             reward += float(self.reward_cfg.game_win_bonus)
-        if bool(self.reward_cfg.repeat_state_penalty_enabled):
-            if self._previous_state_signature is not None and state_signature == self._previous_state_signature:
-                reward += float(self.reward_cfg.repeat_state_penalty)
+        if self._previous_level_index is not None and current_level_index != self._previous_level_index:
+            self._recent_state_signatures = []
+        revisit_window_size = int(self.reward_cfg.revisit_window_size)
+        revisit_match_count = 0
+        repeat_penalty_applied = 0.0
+        if bool(self.reward_cfg.repeat_state_penalty_enabled) and revisit_window_size > 0:
+            recent_window = self._recent_state_signatures[-revisit_window_size:]
+            matching_indices = [idx for idx, signature in enumerate(recent_window) if signature == state_signature]
+            revisit_match_count = len(matching_indices)
+            if revisit_match_count > 0:
+                penalty = float(self.reward_cfg.repeat_state_penalty)
+                mode = str(self.reward_cfg.revisit_penalty_mode)
+                if mode == "binary":
+                    repeat_penalty_applied = penalty
+                elif mode == "count":
+                    repeat_penalty_applied = penalty * revisit_match_count
+                elif mode == "decay":
+                    decay = float(self.reward_cfg.revisit_penalty_decay)
+                    recent_positions = [len(recent_window) - 1 - idx for idx in matching_indices]
+                    recent_positions.sort()
+                    repeat_penalty_applied = penalty * sum(decay**k for k in recent_positions)
+                else:
+                    raise ValueError(f"unsupported revisit_penalty_mode: {self.reward_cfg.revisit_penalty_mode}")
+                reward += float(repeat_penalty_applied)
+
+        same_action_penalty_applied = 0.0
+        if not is_reset and self._pending_action_id is not None:
+            current_action_id = int(self._pending_action_id)
+            if self._last_action_id is not None and current_action_id == int(self._last_action_id):
+                self._same_action_streak += 1
+            else:
+                self._same_action_streak = 1
+                self._last_action_id = current_action_id
+            if self._same_action_streak >= int(self.reward_cfg.same_action_streak_threshold):
+                same_action_penalty_applied = float(self.reward_cfg.same_action_streak_penalty)
+                reward += same_action_penalty_applied
+        elif is_reset:
+            self._same_action_streak = 0
+            self._last_action_id = None
+
+        self._recent_state_signatures.append(state_signature)
+        if revisit_window_size > 0:
+            self._recent_state_signatures = self._recent_state_signatures[-revisit_window_size:]
         self._previous_state_signature = state_signature
+        if not is_reset and self.env_cfg.debug_log_path:
+            _append_reward_debug_log(
+                self.env_cfg.debug_log_path,
+                episode_id=self._current_episode_id or "",
+                env_instance_id=self.env_instance_id,
+                game_id=self.game_id,
+                current_level_index=current_level_index,
+                zero_steps_penalty=int(self.reward_cfg.zero_steps_penalty),
+                steps_in_current_level=int(self._steps_in_current_level),
+                base_reward=float(base_reward),
+                step_penalty=float(self.reward_cfg.step_penalty),
+                level_completed=bool(level_completed),
+                level_complete_bonus=float(self.reward_cfg.level_complete_bonus),
+                game_won=bool(game_won),
+                game_win_bonus=float(self.reward_cfg.game_win_bonus),
+                repeat_state_penalty_enabled=bool(self.reward_cfg.repeat_state_penalty_enabled),
+                revisit_match_count=int(revisit_match_count),
+                repeat_state_penalty=float(self.reward_cfg.repeat_state_penalty),
+                repeat_penalty_applied=float(repeat_penalty_applied),
+                same_action_streak=int(self._same_action_streak),
+                same_action_streak_threshold=int(self.reward_cfg.same_action_streak_threshold),
+                same_action_streak_penalty=float(self.reward_cfg.same_action_streak_penalty),
+                same_action_penalty_applied=float(same_action_penalty_applied),
+                total_reward=float(reward),
+            )
 
         terminal = state not in {"NOT_FINISHED", "None", "UNKNOWN"}
         if game_won and not terminal:
@@ -199,6 +285,11 @@ class ArcEnvironmentAdapter:
             "available_actions": list(available),
             "frame_layers": len(getattr(raw, "frame", []) or []),
             "raw_type": type(raw).__name__,
+            "revisit_match_count": int(revisit_match_count),
+            "same_action_streak": int(self._same_action_streak),
+            "revisit_window_size": int(revisit_window_size),
+            "repeat_penalty_applied": float(repeat_penalty_applied),
+            "same_action_penalty_applied": float(same_action_penalty_applied),
         }
         obs = ObservationPackage(
             current_frame=current_frame,
@@ -217,6 +308,8 @@ class ArcEnvironmentAdapter:
             level_completed=bool(level_completed),
             game_won=bool(game_won),
             deepest_level_index=int(self._deepest_level_index),
+            step_count=int(self._steps_in_current_level),
+            changed_cell_mask=torch.zeros_like(current_frame),
             raw_response=raw,
         )
         self._previous_level_index = current_level_index
@@ -272,3 +365,61 @@ def _extract_current_level_index(raw: Any, env_wrapper: Any) -> int:
     if game is not None and hasattr(game, "level_index") and getattr(game, "level_index") is not None:
         return int(getattr(game, "level_index"))
     raise ValueError("raw environment response does not expose a usable current level index")
+
+
+def _ensure_reward_tracking_state(adapter: ArcEnvironmentAdapter) -> None:
+    if not hasattr(adapter, "_recent_state_signatures"):
+        adapter._recent_state_signatures = []
+    if not hasattr(adapter, "_last_action_id"):
+        adapter._last_action_id = None
+    if not hasattr(adapter, "_same_action_streak"):
+        adapter._same_action_streak = 0
+    if not hasattr(adapter, "_pending_action_id"):
+        adapter._pending_action_id = None
+    if not hasattr(adapter, "_game_id_index"):
+        adapter._game_id_index = 0
+    if not hasattr(adapter, "env_cfg"):
+        adapter.env_cfg = type("EnvCfgStub", (), {"debug_log_path": None})()
+
+
+def _append_reward_debug_log(
+    log_path: str,
+    *,
+    episode_id: str,
+    env_instance_id: str,
+    game_id: str,
+    current_level_index: int,
+    zero_steps_penalty: int,
+    steps_in_current_level: int,
+    base_reward: float,
+    step_penalty: float,
+    level_completed: bool,
+    level_complete_bonus: float,
+    game_won: bool,
+    game_win_bonus: float,
+    repeat_state_penalty_enabled: bool,
+    revisit_match_count: int,
+    repeat_state_penalty: float,
+    repeat_penalty_applied: float,
+    same_action_streak: int,
+    same_action_streak_threshold: int,
+    same_action_streak_penalty: float,
+    same_action_penalty_applied: float,
+    total_reward: float,
+) -> None:
+    path = Path(log_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = (
+        f"episode_id({episode_id}), env_id({env_instance_id}), game_id({game_id}), "
+        f"current_level_index({current_level_index}), steps_in_current_level({steps_in_current_level}), "
+        f"zero_steps_penalty({zero_steps_penalty}), step_penalty({step_penalty}), base_reward({base_reward}), "
+        f"level_completed({int(level_completed)}), level_complete_bonus({level_complete_bonus}), "
+        f"game_won({int(game_won)}), game_win_bonus({game_win_bonus}), "
+        f"repeat_state_penalty_enabled({int(repeat_state_penalty_enabled)}), revisit_match_count({revisit_match_count}), "
+        f"repeat_state_penalty({repeat_state_penalty}), repeat_penalty_applied({repeat_penalty_applied}), "
+        f"same_action_streak({same_action_streak}), same_action_streak_threshold({same_action_streak_threshold}), "
+        f"same_action_streak_penalty({same_action_streak_penalty}), same_action_penalty_applied({same_action_penalty_applied}), "
+        f"total_reward({total_reward})\n"
+    )
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(line)

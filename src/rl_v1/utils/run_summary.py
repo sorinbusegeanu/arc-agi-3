@@ -39,10 +39,24 @@ def build_run_summary(cfg, metrics: dict) -> dict:
     summary["wandb_entity"] = cfg.wandb.entity
     summary["wandb_run_name"] = cfg.wandb.run_name
     summary["wandb_mode"] = cfg.wandb.mode
+    summary["mode"] = metrics.get("mode")
+    summary["checkpoint_restore_path"] = cfg.checkpoint.restore_path
+    summary["effective_game_ids"] = list(cfg.env.game_ids)
+    summary["evaluation_episodes"] = cfg.evaluation.episodes
+    summary["evaluation_deterministic"] = cfg.evaluation.deterministic
+    summary["compare_policy_vs_configured"] = bool(getattr(cfg.evaluation, "compare_policy_vs_configured", False))
+    summary["training_seed"] = cfg.runtime.training_seed
+    summary["evaluation_seed"] = cfg.runtime.evaluation_seed
+    summary["world_pretrain_seed"] = cfg.runtime.world_pretrain_seed
     return summary
 
 
 def _resolve_worker_inference_device(cfg) -> str:
+    inference_device = str(getattr(cfg.runtime, "inference_device", "")).lower()
+    if inference_device in {"gpu", "cuda"}:
+        return "cuda"
+    if inference_device == "cpu":
+        return "cpu"
     accelerator = str(getattr(cfg.runtime, "accelerator", "auto")).lower()
     if accelerator == "gpu":
         accelerator = "cuda"

@@ -19,3 +19,15 @@ class ArtifactWriter:
         # Preserve per-step top-k action probability fields when present
         # (top1_action_id/top1_action_prob/top2_action_id/top2_action_prob).
         write_json(self.root / f"{name}_planner_trace.json", rows)
+
+    def write_effective_config(self, payload: dict) -> None:
+        write_json(self.root / "effective_config.json", payload)
+
+    def write_preflight_report(self, payload: dict) -> None:
+        write_json(self.root / "preflight_report.json", payload)
+
+    def write_smoke_test_report(self, payload: dict) -> None:
+        write_json(self.root / "smoke_test_report.json", payload)
+
+    def write_gradient_diagnostics_row(self, row: dict) -> None:
+        append_jsonl(self.root / "gradient_diagnostics.jsonl", [row])

@@ -24,6 +24,7 @@ class RolloutCollector:
         deterministic: bool = False,
         evaluation: bool = False,
         eval_episode_start_idx: int | None = None,
+        collection_mode: str = "rl",
     ) -> list[RolloutSequence]:
         sequences: list[RolloutSequence] = []
         sequence_counter = 0
@@ -70,16 +71,34 @@ class RolloutCollector:
                 initial_hidden_state=hidden.detach().cpu(),
             )
             for step_idx in range(max_steps):
-                action, policy_output, next_hidden, diagnostics, entropy = self._select_action(
-                    model=model,
-                    observation=obs,
-                    prev_action=prev_action,
-                    prev_reward=prev_reward,
-                    prev_done=prev_done,
-                    hidden=hidden,
-                    deterministic=deterministic,
-                    evaluation=evaluation,
-                )
+                if collection_mode == "world_pretrain":
+                    action = self._sample_random_valid_action(obs)
+                    with torch.no_grad():
+                        encoded = model.encode_observation(
+                            _observation_to_device(obs, hidden.device),
+                            prev_action_id=prev_action.action_id,
+                            prev_reward=prev_reward,
+                            prev_done=prev_done,
+                            hidden=hidden,
+                        )
+                    policy_output = type("PolicyLike", (), {})()
+                    policy_output.action_logprob = torch.tensor([0.0], device=hidden.device)
+                    policy_output.value = encoded.value
+                    policy_output.action_logits = encoded.policy_logits
+                    diagnostics = {"acting_mode": "world_pretrain_random"}
+                    entropy = torch.tensor(0.0, device=hidden.device)
+                    next_hidden = encoded.hidden
+                else:
+                    action, policy_output, next_hidden, diagnostics, entropy = self._select_action(
+                        model=model,
+                        observation=obs,
+                        prev_action=prev_action,
+                        prev_reward=prev_reward,
+                        prev_done=prev_done,
+                        hidden=hidden,
+                        deterministic=deterministic,
+                        evaluation=evaluation,
+                    )
                 next_obs = env.step(action)
                 timestep = RolloutTimestep(
                     observation=obs,
@@ -92,6 +111,8 @@ class RolloutCollector:
                     reward=float(next_obs.reward),
                     done=bool(next_obs.terminal),
                     next_observation=next_obs,
+                    step_count=int(next_obs.step_count),
+                    changed_cell_mask=next_obs.changed_cell_mask,
                     hidden_state=hidden.detach().cpu(),
                     extras={
                         "step_idx": step_idx,
@@ -106,8 +127,14 @@ class RolloutCollector:
                         "env_instance_id": env_instance_id,
                         "game_id": game_id,
                         "reset_seed": reset_seed,
+                        "board_changed": bool(next_obs.changed_cell_mask is not None and bool(next_obs.changed_cell_mask.sum().item() > 0)),
+                        "reward_nonzero": bool(abs(float(next_obs.reward)) > 1e-12),
+                        "done_true": bool(next_obs.terminal),
+                        "level_index": int(next_obs.current_level_index),
+                        "collection_mode": str(collection_mode),
                     },
                 )
+                self._validate_timestep_integrity(timestep, collection_mode=collection_mode)
                 active.timesteps.append(timestep)
                 prev_action = action
                 prev_reward = timestep.reward
@@ -159,6 +186,29 @@ class RolloutCollector:
                 sequences.append(active)
                 sequence_counter += 1
         return sequences
+
+    def _sample_random_valid_action(self, observation) -> V1Action:
+        valid_ids = [idx for idx, is_valid in enumerate(observation.valid_action_mask.tolist()) if bool(is_valid)]
+        if not valid_ids:
+            raise ValueError("empty valid-action mask during world_pretrain collection")
+        chosen = int(valid_ids[torch.randint(0, len(valid_ids), (1,)).item()])
+        return V1Action(action_id=chosen)
+
+    def _validate_timestep_integrity(self, step: RolloutTimestep, *, collection_mode: str) -> None:
+        required = [step.observation, step.chosen_action, step.next_observation]
+        if any(item is None for item in required):
+            raise ValueError("rollout integrity check failed: missing observation/action/next_observation")
+        if step.reward is None or step.done is None:
+            raise ValueError("rollout integrity check failed: missing reward/done")
+        if collection_mode == "world_pretrain":
+            if step.changed_cell_mask is None:
+                raise ValueError("world_pretrain integrity check failed: missing changed_cell_mask")
+            if step.step_count is None:
+                raise ValueError("world_pretrain integrity check failed: missing step_count")
+            if not getattr(step.next_observation, "game_id", ""):
+                raise ValueError("world_pretrain integrity check failed: missing game_id")
+            if getattr(step.next_observation, "current_level_index", None) is None:
+                raise ValueError("world_pretrain integrity check failed: missing current_level_index")
 
     def _select_action(
         self,

@@ -13,7 +13,7 @@ class EnvConfig:
     seed: int = 0
     save_recording: bool = False
     render_mode: str | None = None
-    num_workers: int = 1
+    debug_log_path: str | None = None
     execution_mode: str = "sequential_multi_env"
     mp_start_method: str = "spawn"
 
@@ -26,6 +26,11 @@ class RewardConfig:
     game_win_bonus: float = 5.0
     repeat_state_penalty_enabled: bool = False
     repeat_state_penalty: float = 0.0
+    revisit_window_size: int = 8
+    revisit_penalty_mode: str = "binary"
+    revisit_penalty_decay: float = 1.0
+    same_action_streak_threshold: int = 4
+    same_action_streak_penalty: float = -0.05
 
 
 @dataclass
@@ -70,6 +75,15 @@ class ModelConfig:
     max_game_ids: int = 64
     game_embed_dim: int = 32
     max_level_index: int = 256
+    use_world_model_pretraining: bool = True
+    predict_next_frame: bool = False
+    predict_change_mask: bool = True
+    predict_reward: bool = True
+    predict_done: bool = True
+    metadata_embed_dim: int = 64
+    action_condition_dim: int = 64
+    step_count_embed_dim: int = 32
+    max_step_count: int = 256
     pooling: str = "attention"
     # Compatibility aliases for already-implemented code paths.
     slot_count: int = 6
@@ -118,11 +132,20 @@ class RuntimeConfig:
     devices: int = 1
     precision: str = "32-true"
     rollout_processes: int = 1
+    inference_device: str = "gpu"
+    training_seed: int = 0
+    evaluation_seed: int = 0
+    world_pretrain_seed: int = 0
+    deterministic_torch: bool = False
+    cudnn_deterministic: bool = False
+    cudnn_benchmark: bool = True
 
 
 @dataclass
 class LossWeightsConfig:
     transition_coef: float = 1.0
+    change_mask_coef: float = 1.0
+    next_frame_coef: float = 1.0
     reward_coef: float = 0.5
     done_coef: float = 0.25
     # Compatibility aliases.
@@ -163,6 +186,23 @@ class CheckpointConfig:
 class EvalConfig:
     episodes: int = 2
     deterministic: bool = True
+    compare_policy_vs_configured: bool = False
+
+
+@dataclass
+class WorldPretrainConfig:
+    enabled: bool = False
+    updates: int = 1000
+    batch_size: int = 32
+    unroll_length: int = 16
+    learning_rate: float = 3e-4
+    weight_decay: float = 1e-5
+    grad_clip_norm: float = 1.0
+    eval_every_updates: int = 10
+    save_every_updates: int = 50
+    freeze_encoder: bool = False
+    freeze_recurrent: bool = False
+    teacher_forcing: bool = True
 
 
 @dataclass
@@ -181,6 +221,7 @@ class V1Config:
     wandb: WandbConfig = field(default_factory=WandbConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     evaluation: EvalConfig = field(default_factory=EvalConfig)
+    world_pretrain: WorldPretrainConfig = field(default_factory=WorldPretrainConfig)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

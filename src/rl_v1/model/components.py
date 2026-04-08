@@ -144,18 +144,12 @@ class RecurrentCore(nn.Module):
         self,
         scene_dim: int,
         hidden_dim: int,
-        action_vocab: int,
-        max_game_ids: int,
-        game_embed_dim: int,
-        max_level_index: int,
+        metadata_dim: int,
     ) -> None:
         super().__init__()
-        self.action_embedding = nn.Embedding(action_vocab, hidden_dim)
-        self.game_embedding = nn.Embedding(max_game_ids, game_embed_dim)
-        self.gru = nn.GRUCell(scene_dim + hidden_dim + game_embed_dim + 3, hidden_dim)
+        self.gru = nn.GRUCell(scene_dim + metadata_dim, hidden_dim)
         self.proj = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.Tanh())
         self.hidden_dim = hidden_dim
-        self.max_level_index = int(max_level_index)
 
     def initial_state(self, batch_size: int, device: torch.device) -> torch.Tensor:
         return torch.zeros(batch_size, self.hidden_dim, device=device)
@@ -163,30 +157,58 @@ class RecurrentCore(nn.Module):
     def forward(
         self,
         scene: torch.Tensor,
-        prev_action: torch.Tensor,
-        game_id_index: torch.Tensor,
-        prev_reward: torch.Tensor,
-        prev_done: torch.Tensor,
-        current_level_index: torch.Tensor,
+        metadata: torch.Tensor,
         hidden: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        embedded_action = self.action_embedding(prev_action)
-        embedded_game = self.game_embedding(game_id_index.long())
-        normalized_level = current_level_index.float() / float(max(1, self.max_level_index - 1))
-        x = torch.cat(
-            [
-                scene,
-                embedded_action,
-                embedded_game,
-                prev_reward.unsqueeze(-1),
-                prev_done.unsqueeze(-1),
-                normalized_level.unsqueeze(-1),
-            ],
-            dim=-1,
-        )
+        x = torch.cat([scene, metadata], dim=-1)
         next_hidden = self.gru(x, hidden)
         latent = self.proj(next_hidden)
         return next_hidden, latent
+
+
+class MetadataEncoder(nn.Module):
+    def __init__(
+        self,
+        *,
+        max_game_ids: int,
+        game_embed_dim: int,
+        action_vocab: int,
+        action_embed_dim: int,
+        step_count_embed_dim: int,
+        max_step_count: int,
+        metadata_embed_dim: int,
+        max_level_index: int,
+    ) -> None:
+        super().__init__()
+        self.game_embedding = nn.Embedding(max_game_ids, game_embed_dim)
+        self.action_embedding = nn.Embedding(action_vocab, action_embed_dim)
+        self.step_count_embedding = nn.Embedding(max_step_count, step_count_embed_dim)
+        fused_in = game_embed_dim + action_embed_dim + step_count_embed_dim + 3
+        self.fuse = nn.Sequential(
+            nn.Linear(fused_in, metadata_embed_dim),
+            nn.ReLU(),
+            nn.Linear(metadata_embed_dim, metadata_embed_dim),
+        )
+        self.max_level_index = int(max_level_index)
+        self.max_step_count = int(max_step_count)
+
+    def forward(
+        self,
+        *,
+        game_id_index: torch.Tensor,
+        current_level_index: torch.Tensor,
+        step_count: torch.Tensor,
+        prev_action: torch.Tensor,
+        prev_reward: torch.Tensor,
+        prev_done: torch.Tensor,
+    ) -> torch.Tensor:
+        game_emb = self.game_embedding(game_id_index.long())
+        action_emb = self.action_embedding(prev_action.long())
+        step_idx = torch.clamp(step_count.long(), min=0, max=max(0, self.max_step_count - 1))
+        step_emb = self.step_count_embedding(step_idx)
+        normalized_level = current_level_index.float() / float(max(1, self.max_level_index - 1))
+        scalars = torch.stack([normalized_level, prev_reward.float(), prev_done.float()], dim=-1)
+        return self.fuse(torch.cat([game_emb, step_emb, action_emb, scalars], dim=-1))
 
 
 class PolicyHead(nn.Module):
@@ -196,10 +218,6 @@ class PolicyHead(nn.Module):
 
     def forward(self, latent: torch.Tensor, action_mask: torch.Tensor) -> torch.Tensor:
         logits = self.net(latent)
-        action_mask = action_mask.clone()
-        empty_rows = action_mask.sum(dim=-1) == 0
-        if empty_rows.any():
-            action_mask[empty_rows, 1] = True
         invalid = ~action_mask
         return logits.masked_fill(invalid, -1e9)
 
@@ -228,7 +246,15 @@ class ValueHead(nn.Module):
 
 
 class DynamicsModel(nn.Module):
-    def __init__(self, hidden_dim: int, action_vocab: int) -> None:
+    def __init__(
+        self,
+        hidden_dim: int,
+        action_vocab: int,
+        *,
+        board_height: int,
+        board_width: int,
+        predict_next_frame: bool = False,
+    ) -> None:
         super().__init__()
         self.action_embedding = nn.Embedding(action_vocab, hidden_dim)
         self.trunk = nn.Sequential(
@@ -238,10 +264,25 @@ class DynamicsModel(nn.Module):
             nn.ReLU(),
         )
         self.next_latent = nn.Linear(hidden_dim, hidden_dim)
+        self.change_mask_head = nn.Linear(hidden_dim, board_height * board_width)
+        self.next_frame_head = nn.Linear(hidden_dim, board_height * board_width) if predict_next_frame else None
         self.reward_head = nn.Linear(hidden_dim, 1)
         self.done_head = nn.Linear(hidden_dim, 1)
+        self.board_height = int(board_height)
+        self.board_width = int(board_width)
 
-    def forward(self, latent: torch.Tensor, action_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, latent: torch.Tensor, action_ids: torch.Tensor):
         embedded = self.action_embedding(action_ids)
         trunk = self.trunk(torch.cat([latent, embedded], dim=-1))
-        return self.next_latent(trunk), self.reward_head(trunk).squeeze(-1), self.done_head(trunk).squeeze(-1)
+        next_latent = self.next_latent(trunk)
+        change_mask_logits = self.change_mask_head(trunk).view(-1, 1, self.board_height, self.board_width)
+        next_frame_logits = None
+        if self.next_frame_head is not None:
+            next_frame_logits = self.next_frame_head(trunk).view(-1, 1, self.board_height, self.board_width)
+        return (
+            next_latent,
+            change_mask_logits,
+            next_frame_logits,
+            self.reward_head(trunk).squeeze(-1),
+            self.done_head(trunk).squeeze(-1),
+        )

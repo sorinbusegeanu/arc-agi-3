@@ -35,6 +35,8 @@ class ObservationPackage:
     level_completed: bool = False
     game_won: bool = False
     deepest_level_index: int = 0
+    step_count: int = 0
+    changed_cell_mask: torch.Tensor | None = None
     raw_response: Any = None
 
     def stacked_frames(self) -> torch.Tensor:
@@ -65,7 +67,9 @@ class RolloutTimestep:
     reward: float
     done: bool
     next_observation: ObservationPackage
-    hidden_state: torch.Tensor | None
+    step_count: int = 0
+    changed_cell_mask: torch.Tensor | None = None
+    hidden_state: torch.Tensor | None = None
     extras: dict[str, Any] = field(default_factory=dict)
 
 
