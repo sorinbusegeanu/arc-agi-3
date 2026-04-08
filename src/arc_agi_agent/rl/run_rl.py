@@ -23,6 +23,33 @@ from .trainer import _rollout_cfg_hash
 logger = logging.getLogger(__name__)
 
 
+def _parse_action_list(raw: Optional[str]) -> Optional[List[str]]:
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    mapping = {
+        "U": "ACTION1",
+        "D": "ACTION2",
+        "L": "ACTION3",
+        "R": "ACTION4",
+    }
+    out: List[str] = []
+    compact = text.replace(",", "").replace(" ", "").upper()
+    if compact and all(ch in mapping for ch in compact):
+        return [mapping[ch] for ch in compact]
+    parts = [p.strip().upper() for p in text.replace(",", " ").split() if p.strip()]
+    for part in parts:
+        if part in mapping:
+            out.append(mapping[part])
+        elif part.startswith("ACTION") and part[6:].isdigit():
+            out.append(part)
+        else:
+            raise SystemExit(f"Unsupported --action-list token: {part}")
+    return out or None
+
+
 def _prepare_paths() -> None:
     base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
     arc_agi_path = os.path.join(base_dir, "other_repos", "arc-agi")
@@ -32,7 +59,9 @@ def _prepare_paths() -> None:
         if p not in sys.path:
             sys.path.insert(0, p)
     if "ENVIRONMENTS_DIR" not in os.environ:
-        os.environ["ENVIRONMENTS_DIR"] = os.path.join(base_dir, "environment_files")
+        preferred_env_dir = os.path.join(base_dir, "other_repos", "arc-interactive", "environment_files")
+        fallback_env_dir = os.path.join(base_dir, "environment_files")
+        os.environ["ENVIRONMENTS_DIR"] = preferred_env_dir if os.path.isdir(preferred_env_dir) else fallback_env_dir
 
 
 def _quiet_arcade_logger() -> logging.Logger:
@@ -99,14 +128,18 @@ def _resolve_games(selector: str, op_mode: str) -> List[str]:
 
 
 def _build_env_factory(games: List[str], seed_base: int, op_mode: str, render_terminal: bool = False):
-    from arc_agi import Arcade, OperationMode
-
-    arcade = Arcade(operation_mode=OperationMode(op_mode), logger=_quiet_arcade_logger())
+    from arc_agi_agent.envs.loader import make_env
 
     def factory(ep_idx: int):
         game_id = games[ep_idx % len(games)]
         env_seed = int(seed_base) + int(ep_idx)
-        env = arcade.make(game_id, seed=env_seed, render_mode=("terminal" if render_terminal else None))
+        env = make_env(
+            env_id=game_id,
+            env_root=os.environ.get("ENVIRONMENTS_DIR"),
+            seed=env_seed,
+            op_mode=op_mode,
+            render_mode=("terminal" if render_terminal else None),
+        )
         return env, game_id, env_seed
 
     return factory
@@ -219,6 +252,7 @@ def _collect_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
     iter_idx = int(payload.get("iter_idx", -1))
     debug_reward_log = payload.get("debug_reward_log") or None
     video_dir = payload.get("video_dir") or None
+    action_list = payload.get("action_list")
     logger.info(
         "collect_worker_start iter=%s worker=%s seed_base=%s episodes=%s max_actions=%s stochastic=%s device=%s torch_threads=%s",
         iter_idx,
@@ -253,6 +287,7 @@ def _collect_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
             "hud_cache_dir": str(cfg.get("hud_cache_dir", "runs/cache")),
             "debug_reward_log": debug_reward_log,
             "video_dir": video_dir,
+            "action_list": list(action_list) if isinstance(action_list, list) else None,
         },
     )
     ep_count = len(batch.get("episodes", []))
@@ -355,6 +390,7 @@ def _collect_batch(
     collect_mode: str = "train",
     debug_reward_log: Optional[str] = None,
     video_dir: Optional[str] = None,
+    action_list: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     logger.info(
         "collect_batch_start iter=%s episodes=%s max_actions=%s workers=%s stochastic=%s games=%s",
@@ -383,6 +419,7 @@ def _collect_batch(
                 "hud_cache_dir": str(agent.cfg.get("hud_cache_dir", "runs/cache")),
                 "debug_reward_log": debug_reward_log or None,
                 "video_dir": video_dir or None,
+                "action_list": list(action_list) if isinstance(action_list, list) else None,
             },
         )
         ep_count = len(batch.get("episodes", []))
@@ -440,6 +477,7 @@ def _collect_batch(
                 "collect_mode": str(collect_mode),
                 "debug_reward_log": debug_reward_log or None,
                 "video_dir": video_dir or None,
+                "action_list": list(action_list) if isinstance(action_list, list) else None,
             }
         )
         start += c
@@ -495,6 +533,7 @@ def _episode_stats(ep: Dict[str, Any], gamma: float, mode_names: List[str], loop
     steps = ep.get("steps", [])
     disc_return = 0.0
     total_reward = 0.0
+    levels_completed = 0
     seen: set[str] = set()
     recent: List[str] = []
     effect = 0
@@ -515,6 +554,8 @@ def _episode_stats(ep: Dict[str, Any], gamma: float, mode_names: List[str], loop
         r = float(s.get("reward", 0.0))
         disc_return += (gamma**i) * r
         total_reward += r
+        terms = s.get("reward_terms", {}) if isinstance(s.get("reward_terms"), dict) else {}
+        levels_completed += int(terms.get("delta_levels_completed", 0) or 0)
 
         ev = s.get("transition_event", {}) or {}
         gd = ev.get("grid_delta", {}) or {}
@@ -575,6 +616,7 @@ def _episode_stats(ep: Dict[str, Any], gamma: float, mode_names: List[str], loop
         "win": win_flag,
         "return": float(disc_return),
         "total_reward": float(total_reward),
+        "levels_completed": int(levels_completed),
         "steps": len(steps),
         "effect_rate": float(effect / n_steps),
         "novelty_rate": float(novelty / n_steps),
@@ -606,6 +648,7 @@ def _aggregate_metrics(batch: Dict[str, Any], cfg: Dict[str, Any]) -> Tuple[Dict
     if not per_ep:
         return {
             "WinRate": 0.0,
+            "AvgLevelRate": 0.0,
             "MeanReturn": 0.0,
             "AvgReward": 0.0,
             "MedianReturn": 0.0,
@@ -623,12 +666,14 @@ def _aggregate_metrics(batch: Dict[str, Any], cfg: Dict[str, Any]) -> Tuple[Dict
             "total_episodes": 0,
             "total_steps": 0,
             "wins": 0,
+            "total_levels_completed": 0,
         }, []
 
     returns = [e["return"] for e in per_ep]
     total_rewards = [float(e.get("total_reward", 0.0)) for e in per_ep]
     steps = [int(e["steps"]) for e in per_ep]
     wins = [1 if e["win"] else 0 for e in per_ep]
+    levels_completed = [int(e.get("levels_completed", 0)) for e in per_ep]
     effect_rates = [float(e["effect_rate"]) for e in per_ep]
     novelty_rates = [float(e["novelty_rate"]) for e in per_ep]
     loop_rates = [float(e["loop_rate"]) for e in per_ep]
@@ -657,6 +702,7 @@ def _aggregate_metrics(batch: Dict[str, Any], cfg: Dict[str, Any]) -> Tuple[Dict
 
     agg = {
         "WinRate": float(sum(wins) / max(1, len(wins))),
+        "AvgLevelRate": float(sum(levels_completed) / max(1, len(levels_completed))),
         "MeanReturn": float(sum(returns) / max(1, len(returns))),
         "MedianReturn": float(statistics.median(returns) if returns else 0.0),
         "AvgReward": float(sum(total_rewards) / max(1, len(total_rewards))),
@@ -674,6 +720,7 @@ def _aggregate_metrics(batch: Dict[str, Any], cfg: Dict[str, Any]) -> Tuple[Dict
         "total_episodes": int(len(per_ep)),
         "total_steps": int(sum(steps)),
         "wins": int(sum(wins)),
+        "total_levels_completed": int(sum(levels_completed)),
     }
     return agg, per_ep
 
@@ -851,6 +898,7 @@ def main() -> int:
     parser.add_argument("--eval-easy", default=None)
     parser.add_argument("--render-terminal", action="store_true", help="Render game in terminal during env steps")
     parser.add_argument("--video", action="store_true", help="Save observation frames and encode episode videos")
+    parser.add_argument("--action-list", default=None, help="Override policy with a fixed action sequence, e.g. LLUURRDD or ACTION3,ACTION3,ACTION1")
     parser.add_argument("--debug", default=None, help="Write debug logs to this file path")
     parser.add_argument("--debug-reward", default=None, help="Write per-step reward breakdown to this file path (TSV)")
     parser.add_argument("--config", default=None)
@@ -950,6 +998,7 @@ def main() -> int:
     train_episodes_per_iter = _resolve_train_episodes_per_iter()
     resolved_max_steps = _resolve_max_steps()
     resolved_eval_episodes = int(args.episodes) if (args.episodes is not None and int(args.episodes) > 0) else int(cfg["eval"]["episodes"])
+    forced_action_list = _parse_action_list(args.action_list)
 
     agent = RLAgent(cfg=cfg)
     modules = agent._build_modules()
@@ -985,6 +1034,7 @@ def main() -> int:
                 "workers": args.workers,
                 "phase": args.phase,
                 "op_mode": args.op_mode,
+                "action_list": forced_action_list,
             },
             dir=run_dir,
         )
@@ -1035,6 +1085,7 @@ def main() -> int:
                     render_terminal=bool(args.render_terminal),
                     debug_reward_log=args.debug_reward or None,
                     video_dir=video_dir,
+                    action_list=forced_action_list,
                 )
         _write_json(os.path.join(run_dir, "trajectories", "batch.json"), batch)
         logger.info(
@@ -1067,8 +1118,9 @@ def main() -> int:
                         "train/mean_return": float(metrics.get("MeanReturn", 0.0)),
                         "train/avg_reward": float(metrics.get("AvgReward", 0.0)),
                         "train/mean_episode_len": float(metrics.get("MeanEpisodeLen", 0.0)),
-                        "train/win_rate": float(metrics.get("WinRate", 0.0)),
-                    }
+                "train/win_rate": float(metrics.get("WinRate", 0.0)),
+                "train/avg_level_rate": float(metrics.get("AvgLevelRate", 0.0)),
+            }
                 )
         logger.info("collect_eval_metrics_logged mode=%s keys=%s", args.mode, sorted(metrics.keys()))
         if wandb_run is not None:
@@ -1269,10 +1321,11 @@ def main() -> int:
             coverage_summary = coverage_ledger.summary()
             avg_reward = float(train_metrics_agg.get("AvgReward", 0.0))
             logger.info(
-                "iter_train_done iter=%s loss_total=%.6f win_rate=%.6f mean_return=%.6f avg_reward=%.3f",
+                "iter_train_done iter=%s loss_total=%.6f win_rate=%.6f avg_level_rate=%.6f mean_return=%.6f avg_reward=%.3f",
                 iter_idx,
                 float(train_loss.get("losses", {}).get("total", 0.0)),
                 float(train_metrics_agg.get("WinRate", 0.0)),
+                float(train_metrics_agg.get("AvgLevelRate", 0.0)),
                 float(train_metrics_agg.get("MeanReturn", 0.0)),
                 avg_reward,
             )
@@ -1285,6 +1338,7 @@ def main() -> int:
                         "avg_reward": float(avg_reward),
                         "mean_return": float(train_metrics_agg.get("MeanReturn", 0.0)),
                         "win_rate": float(train_metrics_agg.get("WinRate", 0.0)),
+                        "avg_level_rate": float(train_metrics_agg.get("AvgLevelRate", 0.0)),
                     }
                     agent._save_checkpoint(
                         os.path.join(run_dir, "checkpoints", "best_total_reward.ckpt"),
@@ -1314,6 +1368,7 @@ def main() -> int:
                 "train/avg_reward": float(avg_reward),
                 "train/mean_episode_len": float(train_metrics_agg.get("MeanEpisodeLen", 0.0)),
                 "train/win_rate": float(train_metrics_agg.get("WinRate", 0.0)),
+                "train/avg_level_rate": float(train_metrics_agg.get("AvgLevelRate", 0.0)),
             }
             if algo == "ppo":
                 train_log_payload.update(
@@ -1380,9 +1435,10 @@ def main() -> int:
                 eval_metrics_agg, eval_per_ep = _aggregate_metrics(eval_batch, cfg)
                 trainer_phase = agent.trainer.update_phase_from_eval(eval_metrics_agg, cfg=cfg)
                 logger.info(
-                    "eval_done iter=%s win_rate=%.6f mean_return=%.6f trainer_stage=%s",
+                    "eval_done iter=%s win_rate=%.6f avg_level_rate=%.6f mean_return=%.6f trainer_stage=%s",
                     iter_idx,
                     float(eval_metrics_agg.get("WinRate", 0.0)),
+                    float(eval_metrics_agg.get("AvgLevelRate", 0.0)),
                     float(eval_metrics_agg.get("MeanReturn", 0.0)),
                     trainer_phase.get("stage"),
                 )
@@ -1392,6 +1448,7 @@ def main() -> int:
                     (
                         f"[eval] iter={iter_idx} "
                         f"win_rate={float(eval_metrics_agg.get('WinRate', 0.0)):.6f} "
+                        f"avg_level_rate={float(eval_metrics_agg.get('AvgLevelRate', 0.0)):.6f} "
                         f"mean_return={float(eval_metrics_agg.get('MeanReturn', 0.0)):.6f} "
                         f"median_return={float(eval_metrics_agg.get('MedianReturn', 0.0)):.6f} "
                         f"effect_rate={float(eval_metrics_agg.get('EffectRate', 0.0)):.6f} "
@@ -1407,6 +1464,7 @@ def main() -> int:
                             "eval/avg_reward": float(eval_metrics_agg.get("AvgReward", 0.0)),
                             "eval/mean_episode_len": float(eval_metrics_agg.get("MeanEpisodeLen", 0.0)),
                             "eval/win_rate": float(eval_metrics_agg.get("WinRate", 0.0)),
+                            "eval/avg_level_rate": float(eval_metrics_agg.get("AvgLevelRate", 0.0)),
                         },
                         step=iter_idx,
                     )
@@ -1487,9 +1545,10 @@ def main() -> int:
                         {"iter": iter_idx, **_prefixed(easy_metrics, "EvalEasy")},
                     )
                     logger.info(
-                        "eval_easy_done iter=%s win_rate=%.6f mean_return=%.6f",
+                        "eval_easy_done iter=%s win_rate=%.6f avg_level_rate=%.6f mean_return=%.6f",
                         iter_idx,
                         float(easy_metrics.get("WinRate", 0.0)),
+                        float(easy_metrics.get("AvgLevelRate", 0.0)),
                         float(easy_metrics.get("MeanReturn", 0.0)),
                     )
 

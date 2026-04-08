@@ -1,0 +1,72 @@
+{
+  "_file_purpose": "Configuration used by the active v4.5 runtime path.",
+  "bootstrap": {
+    "_purpose": "Controls movement bootstrap probing, media export, and optional HUD/POI analyzer calls.",
+    "primary_sequence": ["UP", "DOWN", "LEFT", "RIGHT"],
+    "_primary_sequence_purpose": "The first probe action sequence executed during movement bootstrap.",
+    "fallback_sequences": ["LEFT", "LEFT", "UP", "UP", "RIGHT", "RIGHT", "DOWN", "DOWN"],
+    "_fallback_sequences_purpose": "The fallback probe sequence executed only when primary avatar detection fails.",
+    "stop_after_unique_avatar_found": true,
+    "_stop_after_unique_avatar_found_purpose": "Stops bootstrap once avatar detection succeeds uniquely.",
+    "capture_raw_observations": true,
+    "_capture_raw_observations_purpose": "Keeps raw bootstrap observations so downstream analyzers can inspect them.",
+    "export_pngs": true,
+    "_export_pngs_purpose": "Exports bootstrap observations as PNGs for artifact review and video creation.",
+    "export_video": true,
+    "_export_video_purpose": "Builds one bootstrap MP4 from the exported PNG sequence.",
+    "png_scale_factor": 8,
+    "_png_scale_factor_purpose": "Pixel upscaling factor used when writing bootstrap PNG artifacts.",
+    "video_fps": 2,
+    "_video_fps_purpose": "Frame rate used for the bootstrap MP4 artifact.",
+    "enable_llm_hud_analysis": true,
+    "_enable_llm_hud_analysis_purpose": "Enables the TOON text-model HUD analyzer during bootstrap.",
+    "enable_vlm_hud_analysis": true,
+    "_enable_vlm_hud_analysis_purpose": "Enables the TOON video-model HUD analyzer during bootstrap.",
+    "enable_llm_poi_analysis": true,
+    "_enable_llm_poi_analysis_purpose": "Enables the TOON text-model POI analyzer during bootstrap.",
+    "enable_vlm_poi_analysis": true,
+    "_enable_vlm_poi_analysis_purpose": "Enables the TOON video-model POI analyzer during bootstrap.",
+    "prompts": {
+      "_purpose": "Prompt template paths used for bootstrap HUD and POI analyzers.",
+      "hud_text_prompt_path": "prompts/hud_text_prompt.txt",
+      "_hud_text_prompt_path_purpose": "Prompt file used for text-only HUD analysis.",
+      "hud_video_prompt_path": "prompts/hud_video_prompt.txt",
+      "_hud_video_prompt_path_purpose": "Prompt file used for video-based HUD analysis.",
+      "poi_text_prompt_path": "prompts/poi_text_prompt.txt",
+      "_poi_text_prompt_path_purpose": "Prompt file used for text-only POI analysis.",
+      "poi_video_prompt_path": "prompts/poi_video_prompt.txt",
+      "_poi_video_prompt_path_purpose": "Prompt file used for video-based POI analysis."
+    },
+    "toon": {
+      "_purpose": "TOON endpoint names used by bootstrap analyzers.",
+      "text_endpoint_name": "qwen3-vl:8b",
+      "_text_endpoint_name_purpose": "Endpoint name used for text HUD analysis calls.",
+      "video_endpoint_name": "qwen3-vl:8b",
+      "_video_endpoint_name_purpose": "Endpoint name used for video HUD analysis calls.",
+      "poi_text_endpoint_name": "qwen3-vl:8b",
+      "_poi_text_endpoint_name_purpose": "Endpoint name used for text POI analysis calls.",
+      "poi_video_endpoint_name": "qwen3-vl:8b",
+      "_poi_video_endpoint_name_purpose": "Endpoint name used for video POI analysis calls.",
+      "ollama_url": "http://192.168.0.51:11434",
+      "_ollama_url_purpose": "Base URL for the Ollama service used by the TOON transport.",
+      "ollama_model": "qwen3-vl:8b",
+      "_ollama_model_purpose": "Default Ollama model name for TOON-backed calls.",
+      "ollama_num_ctx": 24000,
+      "_ollama_num_ctx_purpose": "Context window size requested for Ollama model calls.",
+      "timeout_sec": 120.0,
+      "_timeout_sec_purpose": "Request timeout for TOON/Ollama model calls in seconds.",
+      "retry_count": 2,
+      "_retry_count_purpose": "Number of retry attempts allowed for TOON/Ollama calls."
+    }
+  },
+  "runtime": {
+    "_purpose": "Run-loop limits enforced by the live game runner.",
+    "max_actions_per_level": 150,
+    "_max_actions_per_level_purpose": "Hard per-level action budget for the v4.5 live runner."
+  },
+  "level_memory": {
+    "_purpose": "Storage location for the advisory SQLite level-memory database.",
+    "sqlite_path": "artifacts/v4_5/level_memory/level_memory.sqlite",
+    "_sqlite_path_purpose": "Filesystem path for the SQLite database holding advisory level memory."
+  }
+}

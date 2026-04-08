@@ -30,8 +30,8 @@ logger = logging.getLogger(__name__)
 
 _REWARD_LOG_FIELDS = [
     "game_id", "ep", "step",
-    "r_win", "r_effect", "r_revert", "r_potential", "r_step", "r_total",
-    "m_noop", "flash", "effect_flag", "revert_flag", "cells_changed",
+    "r_win", "r_new_level", "r_effect", "r_revert", "r_potential", "r_step", "r_total",
+    "m_noop", "flash", "effect_flag", "revert_flag", "cells_changed", "delta_levels_completed",
 ]
 
 
@@ -74,6 +74,26 @@ def _encode_video(video_dir: str) -> None:
         logger.exception("video_encode_failed video_dir=%s ffmpeg_bin=%s", video_dir, shutil.which("ffmpeg") or "/usr/bin/ffmpeg")
 
 
+def _reset_video_dir(video_dir: str) -> None:
+    try:
+        if not os.path.isdir(video_dir):
+            return
+        for name in os.listdir(video_dir):
+            if name.startswith("frame_") and name.endswith(".png"):
+                try:
+                    os.remove(os.path.join(video_dir, name))
+                except FileNotFoundError:
+                    pass
+        out_path = os.path.join(video_dir, "out.mp4")
+        if os.path.exists(out_path):
+            try:
+                os.remove(out_path)
+            except FileNotFoundError:
+                pass
+    except Exception:
+        logger.exception("video_reset_failed video_dir=%s", video_dir)
+
+
 def _write_reward_log(path: str, game_id: str, ep: int, step: int, terms: Dict[str, Any], r_total: float) -> None:
     try:
         os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
@@ -82,6 +102,7 @@ def _write_reward_log(path: str, game_id: str, ep: int, step: int, terms: Dict[s
         row = [
             game_id, ep, step,
             round(float(terms.get("r_win", 0.0)), 4),
+            round(float(terms.get("r_new_level", 0.0)), 4),
             round(float(terms.get("r_effect", 0.0)), 4),
             round(float(terms.get("r_revert", 0.0)), 4),
             round(float(terms.get("r_potential", 0.0)), 4),
@@ -92,6 +113,7 @@ def _write_reward_log(path: str, game_id: str, ep: int, step: int, terms: Dict[s
             int(bool(terms.get("effect_flag", False))),
             int(bool(terms.get("revert_flag", False))),
             int(terms.get("cells_changed", 0)),
+            int(terms.get("delta_levels_completed", 0)),
         ]
         buf = io.StringIO()
         w = csv.writer(buf)
@@ -298,7 +320,7 @@ class RolloutCollector:
         else:
             cfg_eff["rl"]["fast_collect"] = bool(cfg_eff["rl"].get("fast_collect", False))
         episodes = int(cfg_eff["episodes_per_batch"])
-        max_steps = int(cfg_eff["max_steps_per_episode"])
+        max_actions_per_level = int(cfg_eff["max_steps_per_episode"])
         stochastic = bool(cfg_eff.get("stochastic_actions_train", True))
         fast_collect = bool(cfg_eff.get("rl", {}).get("fast_collect", False))
         trace_enabled = bool(cfg_eff.get("log", {}).get("write_trace", False))
@@ -306,6 +328,7 @@ class RolloutCollector:
         frame_stack_len = max(1, int(cfg_eff.get("frame_stack", 4)))
         minimal_batch_mode = bool(rl_only_mode and (not trace_enabled) and (not save_full_batch))
         video_dir_root = cfg_eff.get("video_dir")
+        forced_action_list = cfg_eff.get("action_list") if isinstance(cfg_eff.get("action_list"), list) else None
 
         batch = {"schema_version": "TRAJECTORY_BATCH_V1", "episodes": [], "available_actions_mask_format": "bool_nd"}
 
@@ -315,6 +338,10 @@ class RolloutCollector:
             if video_dir_root:
                 episode_video_dir = os.path.join(str(video_dir_root), f"episode_{ep_idx:03d}_{str(game_id)}_{int(seed)}")
             obs = env.reset()
+            levels_completed_curr = int(getattr(obs, "levels_completed", 0) or 0)
+            level_step_idx = 0
+            step_idx = 0
+            forced_action_pos = 0
             fp_prev = None
             if self.analyst is None:
                 raise ModuleDisabledError("fp_analyst")
@@ -370,7 +397,9 @@ class RolloutCollector:
             if intrinsic_enabled and rnd_norm_state is None:
                 rnd_norm_state = RNDNormState()
 
-            for step_idx in range(max_steps):
+            while level_step_idx < max_actions_per_level:
+                if forced_action_list is not None and forced_action_pos >= len(forced_action_list):
+                    break
                 grid_embed_vec: Optional[list[float]] = None
                 rnd_err_raw = 0.0
                 rnd_phi = 0.0
@@ -445,7 +474,17 @@ class RolloutCollector:
                     env_mask_t = torch.tensor(available_actions_mask, dtype=torch.bool, device=h_core.device).unsqueeze(0)
                     pi_discrete_masked = actor["pi_discrete"] + (env_mask_t.float() - 1.0) * 1e9
 
-                    action_idx = _pick_discrete(pi_discrete_masked, stochastic=stochastic)
+                    forced_action_id = None
+                    if forced_action_list is not None:
+                        forced_action_id = str(forced_action_list[forced_action_pos]).upper()
+                        if forced_action_id not in aid_to_idx:
+                            raise RuntimeError(f"forced action {forced_action_id} not present in actor action ids")
+                        forced_idx = int(aid_to_idx[forced_action_id])
+                        if not bool(available_actions_mask[forced_idx]):
+                            raise RuntimeError(f"forced action {forced_action_id} not available at step {step_idx}")
+                        action_idx = forced_idx
+                    else:
+                        action_idx = _pick_discrete(pi_discrete_masked, stochastic=stochastic)
                     action_id = actor["action_ids"][action_idx]
                     policy_entropy = _entropy_from_logits(pi_discrete_masked)
                     mode_entropy = _entropy_from_logits(mode_logits)
@@ -569,6 +608,9 @@ class RolloutCollector:
                         "grid_curr": grid_next,
                         "game_id": game_id,
                         "effect_transition": effect_transition,
+                        "levels_completed_prev": levels_completed_curr,
+                        "levels_completed_curr": int(getattr(obs_next, "levels_completed", levels_completed_curr) or 0),
+                        "t_level": level_step_idx,
                     },
                 )
                 prev_rnd_phi = rnd_phi
@@ -579,32 +621,39 @@ class RolloutCollector:
                     raw_env_reward = event_json.get("reward")
                     if raw_env_reward is None:
                         raw_env_reward = event_json.get("env_reward")
-                if reward_total < -1.5 or reward_total > 2.0:
+                reward_cfg = (cfg_eff.get("reward", {}) or {})
+                max_reward_total = 2.0 + float(reward_cfg.get("r_new_level", 1.0)) + float(reward_cfg.get("r_win", 1.0))
+                if reward_total < -1.5 or reward_total > max_reward_total:
                     logger.error(
-                        "reward_out_of_range game_id=%s step=%s action_id=%s flash_event=%s env_reward=%s r_total=%.6f terms=%s",
+                        "reward_out_of_range game_id=%s step=%s action_id=%s flash_event=%s env_reward=%s r_total=%.6f max_expected=%.6f terms=%s",
                         game_id,
                         step_idx,
                         action_id,
                         bool(reward_terms.get("flash_event", False)),
                         raw_env_reward,
                         reward_total,
+                        max_reward_total,
                         reward_terms,
                     )
                     raise RuntimeError("reward_total out of expected range")
                 logger.info(
-                    "reward_step game_id=%s step=%s action_id=%s r_total=%.4f r_win=%.4f r_effect=%.4f r_match_poi=%.4f r_revert=%.4f r_potential=%.4f m_noop=%s flash=%s delta_c=%s",
+                    "reward_step game_id=%s step=%s action_id=%s r_total=%.4f r_win=%.4f r_new_level=%.4f r_effect=%.4f r_match_poi=%.4f r_revert=%.4f r_potential=%.4f r_step=%.4f r_noop=%.4f m_noop=%s flash=%s delta_c=%s delta_levels=%s",
                     game_id,
                     step_idx,
                     action_id,
                     reward_total,
                     float(reward_terms.get("r_win", 0.0)),
+                    float(reward_terms.get("r_new_level", 0.0)),
                     float(reward_terms.get("r_effect", 0.0)),
                     float(reward_terms.get("r_match_poi", 0.0)),
                     float(reward_terms.get("r_revert", 0.0)),
                     float(reward_terms.get("r_potential", 0.0)),
+                    float(reward_terms.get("r_step", 0.0)),
+                    float(reward_terms.get("r_noop", 0.0)),
                     int(reward_terms.get("m_noop", 1)),
                     int(bool(reward_terms.get("flash_event", False))),
                     int(reward_terms.get("delta_c", 0)),
+                    int(reward_terms.get("delta_levels_completed", 0)),
                 )
                 debug_reward_log = cfg_eff.get("debug_reward_log")
                 if debug_reward_log:
@@ -718,18 +767,33 @@ class RolloutCollector:
                 grid_prev_prev = np.asarray(grid_curr, dtype=np.int64).copy()
                 grid_curr = grid_next
                 frame_buffer.append(grid_next.copy())
-                if episode_video_dir:
-                    _write_video_frame(episode_video_dir, frame_idx, grid_next)
-                    frame_idx += 1
                 prev_action = action
                 prev_reward = reward_total
                 prev_done = done
+                if forced_action_list is not None:
+                    forced_action_pos += 1
+                next_levels_completed = int(getattr(obs_next, "levels_completed", levels_completed_curr) or 0)
+                if next_levels_completed > levels_completed_curr:
+                    level_step_idx = 0
+                    if episode_video_dir:
+                        _reset_video_dir(episode_video_dir)
+                        frame_idx = 1
+                        _write_video_frame(episode_video_dir, frame_idx, grid_next)
+                        frame_idx += 1
+                else:
+                    level_step_idx += 1
+                    if episode_video_dir:
+                        _write_video_frame(episode_video_dir, frame_idx, grid_next)
+                        frame_idx += 1
+                levels_completed_curr = next_levels_completed
 
                 if done:
                     break
+                step_idx += 1
 
             if steps:
                 r_win_sum = 0.0
+                r_new_level_sum = 0.0
                 r_effect_sum = 0.0
                 r_match_poi_sum = 0.0
                 r_revert_sum = 0.0
@@ -738,18 +802,20 @@ class RolloutCollector:
                 for s in steps:
                     terms = s.get("reward_terms", {}) if isinstance(s.get("reward_terms"), dict) else {}
                     r_win_sum += float(terms.get("r_win", 0.0))
+                    r_new_level_sum += float(terms.get("r_new_level", 0.0))
                     r_effect_sum += float(terms.get("r_effect", 0.0))
                     r_match_poi_sum += float(terms.get("r_match_poi", 0.0))
                     r_revert_sum += float(terms.get("r_revert", 0.0))
                     r_potential_sum += float(terms.get("r_potential", 0.0))
                     r_total_sum += float(s.get("reward", 0.0))
                 logger.info(
-                    "reward_breakdown game_id=%s seed=%s steps=%s r_total=%.4f r_win=%.4f r_effect=%.4f r_match_poi=%.4f r_revert=%.4f r_potential=%.4f",
+                    "reward_breakdown game_id=%s seed=%s steps=%s r_total=%.4f r_win=%.4f r_new_level=%.4f r_effect=%.4f r_match_poi=%.4f r_revert=%.4f r_potential=%.4f",
                     game_id,
                     seed,
                     len(steps),
                     r_total_sum,
                     r_win_sum,
+                    r_new_level_sum,
                     r_effect_sum,
                     r_match_poi_sum,
                     r_revert_sum,
@@ -763,6 +829,7 @@ class RolloutCollector:
                     "done": bool(steps and steps[-1].get("done", False)),
                     "win": bool(steps and any(s.get("win", False) for s in steps)),
                     "num_steps": len(steps),
+                    "action_list_exhausted": bool(forced_action_list is not None and forced_action_pos >= len(forced_action_list)),
                 }
             )
             if episode_video_dir:

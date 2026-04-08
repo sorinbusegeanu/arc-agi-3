@@ -37,3 +37,10 @@ Before Phase 3, the Stage 2 runtime must prove it rejects corrupted observations
 - hidden-state control
 - broader long-horizon planning
 - any Phase 3 or symbolic-runtime behavior
+
+## Separate Live Regression Runner
+
+- `tests/v4/live_regression/runner.py` provides a separate implemented-family live regression runner.
+- It is not part of the default unit or gate suite run by `tests/v4/run_suite.py`.
+- It summarizes implemented-family live outcomes as one stdout table plus one CSV and one JSON export.
+- The manual runner uses parallel Python worker processes and defaults to `14` jobs.

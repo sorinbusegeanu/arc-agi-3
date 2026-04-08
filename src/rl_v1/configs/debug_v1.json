@@ -1,0 +1,24 @@
+{
+  "env": {
+    "game_ids": ["ez01"]
+  },
+  "planner": {
+    "enabled": true,
+    "depth": 2,
+    "beam_width": 2,
+    "expansion_width": 2,
+    "acting_mode": "policy_only"
+  },
+  "rollout": {
+    "episodes_per_collect": 1,
+    "max_steps": 6,
+    "unroll_length": 4
+  },
+  "ppo": {
+    "batch_size": 2,
+    "epochs": 1
+  },
+  "logging": {
+    "run_name": "rl_v1_debug"
+  }
+}

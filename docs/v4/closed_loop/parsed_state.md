@@ -53,6 +53,44 @@ Allowed reference content:
 - chain objectives
 - durable memory
 
+## Step 3
+
+- Belief state is separate from authoritative state.
+- Parsed state now carries a belief snapshot reference.
+- Revealed and unknown counts may now come from belief state.
+- Belief state contains only observed facts, locally justified inferred facts, and unknown cells.
+- No generic hypotheses are part of Step 3.
+
+## Step 5
+
+- Parsed state now carries a hypothesis snapshot reference.
+- Hypotheses are separate from authoritative state and separate from belief state.
+- Step 5 stores only bounded competing mechanic or rule hypotheses.
+- No hypothesis may overwrite authority.
+- Step 5 does not yet perform explicit disambiguation actions.
+
+## Step 6
+
+- Parsed state still carries only `hypothesis_reference`, not full hypothesis content.
+- Step 6 uses the reference count to trigger disambiguation planning.
+- Hypothesis content remains outside authoritative state.
+
+## Step 7
+
+- Parsed state now carries a temporal snapshot reference.
+- Temporal state is separate from authoritative, belief, and hypothesis state.
+- Step 7 models resource values, hazard window, and safe horizon.
+- There is no stochastic planning.
+- There is no branching.
+
+## Step 8
+
+- Parsed state now carries a composition snapshot reference.
+- Composition state is separate from authoritative, memory, belief, hypothesis, and temporal state.
+- Step 8 models domain presence and cross-domain effect codes.
+- There is no stochastic planning.
+- There is no branching.
+
 ## Field Table
 
 | field name | source | authoritative yes/no | required yes/no | notes |
@@ -65,5 +103,8 @@ Allowed reference content:
 | `available_actions` | current observation | yes | yes | Current legal action ids |
 | `terminal_signal` | derived from raw state | yes | yes | Derived only from authoritative state |
 | `memory_reference` | local-memory snapshot summary | no | no | Small session-local reference only |
+| `belief_reference` | belief snapshot summary | no | no | Bounded belief-layer summary only |
+| `hypothesis_reference` | hypothesis snapshot summary | no | no | Bounded hypothesis-layer summary only |
+| `temporal_reference` | temporal snapshot summary | no | no | Bounded temporal-layer summary only |
+| `composition_reference` | composition snapshot summary | no | no | Bounded composition-layer summary only |
 | `derived_control` | parser output | no | yes | Short-horizon features only |
-

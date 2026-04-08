@@ -1,0 +1,13 @@
+{
+  "ollama_url": "http://192.168.0.51:11434",
+  "ollama_model": "qwen3-vl:8b",
+  "ollama_num_ctx": 24000,
+  "timeout_sec": 120.0,
+  "retry_count": 2,
+  "max_prompt_frames": 50,
+  "max_parallel_branches": 8,
+  "system_prompt": "Return plain text only. Do not use markdown fences. Follow the exact response format requested.",
+  "start_level_prompt": "Examine the video of a game where the actions are Up, Down, Left, Right. The action sequence played was [action_list]. Identify and describe:\n1. Spatial layout seen in the clip\n2. Player, correlated with the action sequence played\n3. Reasoning for why this entity is the player, correlated with the action sequence [action_list]\n4. Other objects (do not include player in them) with color and position\n5. HUD if any\nAnswer in exactly this format:\nlayout: Describe spatial layout\nplayer: Identify player\nreasoning: Correlate with action list [action_list]\nobjects{name,color,position}:\n  Name,Color,Position\nhud: Describe HUD or None\n",
+  "get_list_of_objects_actions_prompt": "Based on this description and the elements you identified before, write the set of actions to reach each object using L,R,U,D notation from the INITIAL player  [player] position\nActions{object,sequence LRUD}:\n  object_name,actions_list\n",
+  "in_loop_prompt": "Examine the video of a game, where the actions are Up, Down, Left, Right. The actions sequence played was  [action_list]. The player is [player]. Identify and describe: \n1. Spatial layout seen in clip\n2. Objects (specify color and position)\nBased on this description and the elements you identified before write the set of actions to reach each object using L,R,U,D notation from the LAST player position\nActions{object,sequence LRUD}:\n  object_name,actions_list\n"
+}

@@ -1,7 +1,7 @@
 Status: implemented and verified
 Scope: Documentation audit against implemented v4 source and tests
 Source of truth: `/home/zodrak/zod/src/v4/*`, `/home/zodrak/zod/tests/v4/*`, `/home/zodrak/zod/docs/v4/*`
-Last verified against: current repo state on 2026-03-29; /home/zodrak/zod/tests/v4/run_suite.py passed 311 tests
+Last verified against: current repo state on 2026-03-29; targeted movement tests for `pb02`, `pb03`, `fs02`, and `fs03`
 
 # Documentation Gap Checklist
 
@@ -9,7 +9,7 @@ Last verified against: current repo state on 2026-03-29; /home/zodrak/zod/tests/
 
 - `agent_contracts/*` covers the implemented Phase 1 contract surface.
 - `closed_loop/*` covers the implemented Stage 2 runtime, parsed state, local memory, and gates.
-- `movement/*` covers the implemented Phase 3 movement track and all six implemented movement families.
+- `movement/*` covers the implemented Phase 3 movement track, including dedicated docs for `pb02`, `pb03`, `fs02`, and `fs03`.
 - `click_perception/*` covers the implemented Phase 4 click/perception track and all six implemented click families.
 - `memory_hidden/*` covers the implemented Phase 5 memory-hidden package and `ms01`.
 - `rule_switch/*` covers the implemented Phase 6 rule-switch package and `rs01`.
@@ -29,7 +29,7 @@ Last verified against: current repo state on 2026-03-29; /home/zodrak/zod/tests/
 ## Docs That Mention Planned Features Not Yet Implemented
 
 - `reference/arc_interactive_games.md` lists many local game families that do not have corresponding implementations under the current `src/v4` package set.
-- `movement/family_coverage.md` mentions deferred movement work beyond the currently implemented six families.
+- `movement/family_coverage.md` mentions deferred movement work beyond the currently implemented ten-family movement slice.
 - `click_perception/family_coverage.md` mentions deferred click work beyond the current six-family slice.
 - `memory_hidden/family_coverage.md`, `rule_switch/family_coverage.md`, `time_reactive/family_coverage.md`, and `hybrid_construction/family_coverage.md` remain single-family docs because only one family is implemented in each package.
 

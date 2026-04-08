@@ -123,9 +123,17 @@ class RLConfig:
     save_trajectory_batches: bool = True
     reward: Dict[str, float] = field(
         default_factory=lambda: {
+            "r_win": 1.0,
+            "r_new_level": 1.0,
+            "r_match_poi": 0.5,
+            "r_effect_movement": 0.01,
+            "r_effect_screen": 0.1,
+            "r_revert_penalty": -0.2,
+            "r_step_penalty": -0.0005,
+            "step_penalty_cap": 0.1,
+            "r_noop_penalty": -0.1,
             "alpha_novel": 0.05,
             "beta_effect": 0.02,
-            "match_poi": 0.5,
             "negative_step": 0.5,
             "delta_loop": 0.05,
             "loop_window_N": 25,

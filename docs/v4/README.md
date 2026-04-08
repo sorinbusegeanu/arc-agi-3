@@ -1,7 +1,7 @@
 Status: implemented and verified
 Scope: Top-level v4 overview
 Source of truth: `/home/zodrak/zod/src/v4/*`, `/home/zodrak/zod/tests/v4/*`, `/home/zodrak/zod/docs/v4/*`
-Last verified against: current repo state on 2026-03-29; /home/zodrak/zod/tests/v4/run_suite.py passed 311 tests
+Last verified against: current repo state on 2026-03-29; targeted movement tests for `pb02`, `pb03`, `fs02`, and `fs03`
 
 # v4 Overview
 
@@ -23,7 +23,7 @@ Last verified against: current repo state on 2026-03-29; /home/zodrak/zod/tests/
 | --- | --- | --- | --- |
 | Phase 1 | `src/v4/agentContract` | implemented and verified | `tests/v4/agentContract/*` exists and is part of the passing v4 suite |
 | Stage 2 | `src/v4/runtime`, `src/v4/state`, `src/v4/memory`, `src/v4/policy` | implemented and verified | `tests/v4/closed_loop/*` and `tests/v4/easy_games/*` exist and are part of the passing v4 suite |
-| Phase 3 | `src/v4/movement` | implemented and verified for `ul01`, `fs01`, `tp01`, `ic01`, `va01`, `pb01` | `tests/v4/movement/*` exists and is part of the passing v4 suite |
+| Phase 3 | `src/v4/movement` | implemented and verified for `ul01`, `fs01`, `fs02`, `fs03`, `tp01`, `ic01`, `va01`, `pb01`, and `pb03`; `pb02` is partially implemented | `tests/v4/movement/*` includes dedicated gate and regression coverage for the current ten-family movement slice |
 | Phase 4 | `src/v4/click` | implemented and verified for `pt01`, `sy01`, `ff01`, `sq01`, `wm01`, `mm01` | `tests/v4/click/*` exists and is part of the passing v4 suite |
 | Phase 5 | `src/v4/memory_hidden` | implemented and verified for `ms01` | `tests/v4/memory_hidden/*` exists and its dedicated package suite passes |
 | Phase 6 | `src/v4/rule_switch` | implemented and verified for `rs01` | `tests/v4/rule_switch/*` exists and its dedicated package suite passes |
@@ -65,7 +65,8 @@ Last verified against: current repo state on 2026-03-29; /home/zodrak/zod/tests/
 
 - Phase 1 contract extraction and validation are implemented and exercised against real local environments.
 - Stage 2 runs real local sessions and records valid observations, transitions, step results, memory updates, and ledger entries.
-- Phase 3 exact movement solving is implemented and verified for `ul01`, `fs01`, `tp01`, `ic01`, `va01`, and `pb01`.
+- Phase 3 exact movement solving is implemented and verified for `ul01`, `fs01`, `fs02`, `fs03`, `tp01`, `ic01`, `va01`, `pb01`, and `pb03`.
+- `pb02` has env-backed typed-state extraction, exact transition/search coverage, and a real-env certifying plan replay; its current Stage 2 live replanning path still fails closed on hidden goal occupancy.
 - Phase 4 exact click/perception solving is implemented and verified for `pt01`, `sy01`, `ff01`, `sq01`, `wm01`, and `mm01`.
 - Phase 5 exact memory-hidden solving is implemented and verified for `ms01`.
 - Phase 6 exact rule-switch solving is implemented and verified for `rs01`.
@@ -75,7 +76,7 @@ Last verified against: current repo state on 2026-03-29; /home/zodrak/zod/tests/
 
 ## What Is Not Yet Implemented
 
-- No movement family beyond `ul01`, `fs01`, `tp01`, `ic01`, `va01`, and `pb01` is implemented under `src/v4/movement`.
+- No movement family beyond `ul01`, `fs01`, `fs02`, `fs03`, `tp01`, `ic01`, `va01`, `pb01`, `pb02`, and `pb03` is implemented under `src/v4/movement`.
 - No click/perception family beyond `pt01`, `sy01`, `ff01`, `sq01`, `wm01`, and `mm01` is implemented under `src/v4/click`.
 - No memory-hidden family beyond `ms01` is implemented under `src/v4/memory_hidden`.
 - No rule-switch family beyond `rs01` is implemented under `src/v4/rule_switch`.
@@ -99,6 +100,10 @@ Last verified against: current repo state on 2026-03-29; /home/zodrak/zod/tests/
 - [agent_contracts/README.md](agent_contracts/README.md): Phase 1 contract overview.
 - [closed_loop/stage2_overview.md](closed_loop/stage2_overview.md): Stage 2 closed-loop overview.
 - [movement/phase3_overview.md](movement/phase3_overview.md): Phase 3 movement overview.
+- [movement/fs02_mechanics.md](movement/fs02_mechanics.md): `fs02` mechanics.
+- [movement/fs03_mechanics.md](movement/fs03_mechanics.md): `fs03` mechanics.
+- [movement/pb02_mechanics.md](movement/pb02_mechanics.md): `pb02` mechanics.
+- [movement/pb03_mechanics.md](movement/pb03_mechanics.md): `pb03` mechanics.
 - [click_perception/phase4_overview.md](click_perception/phase4_overview.md): Phase 4 click/perception overview.
 - [memory_hidden/phase5_overview.md](memory_hidden/phase5_overview.md): Phase 5 memory-hidden overview.
 - [rule_switch/phase6_overview.md](rule_switch/phase6_overview.md): Phase 6 rule-switch overview.

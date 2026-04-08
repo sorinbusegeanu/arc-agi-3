@@ -1,0 +1,95 @@
+env:
+  game_ids: [ez01]
+  game_episode_multipliers:
+    ez01: 1
+  operation_mode: offline
+  environments_dir: null
+  seed: 0
+  save_recording: false
+  render_mode: null
+  execution_mode: "sequential_multi_env"
+  mp_start_method: "spawn"
+reward:
+  zero_steps_penalty: 10
+  step_penalty: -0.01
+  level_complete_bonus: 1.0
+  game_win_bonus: 5.0
+  repeat_state_penalty_enabled: true
+  repeat_state_penalty: -0.05
+acting:
+  mode: policy_only
+planner:
+  enabled: true
+  beam_width: 2
+  search_depth: 2
+  action_topk: 2
+  discount: 0.99
+  allow_click_action_in_planner: false
+ablations:
+  disable_slots: false
+  disable_recurrent_memory: false
+  disable_planner: false
+  disable_transition_loss: false
+  disable_click_head: false
+model:
+  variant: v1_full
+  canvas_height: 64
+  canvas_width: 64
+  encoder_channels: [32, 64, 128]
+  encoder_dim: 256
+  num_slots: 6
+  slot_dim: 256
+  slot_iters: 3
+  slot_transformer_layers: 2
+  slot_transformer_heads: 4
+  gru_hidden_size: 256
+  action_embed_dim: 64
+  latent_dim: 256
+  pooling: attention
+rollout:
+  unroll_length: 4
+  num_episodes_per_collect: 1
+  max_steps_per_level: 6
+  deterministic_eval: true
+runtime:
+  accelerator: cpu
+  devices: 1
+  precision: 32-true
+  rollout_processes: 1
+optimization:
+  learning_rate: 0.0003
+  weight_decay: 0.00001
+  grad_clip_norm: 1.0
+  batch_size: 2
+  ppo_epochs: 1
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_eps: 0.2
+  entropy_coef: 0.01
+  value_coef: 0.5
+loss_weights:
+  transition_coef: 1.0
+  reward_coef: 0.5
+  done_coef: 0.25
+logging:
+  run_name: rl_v1_debug
+  output_dir: runs/rl_v1
+  planner_trace_sample_rate: 0.25
+  log_every_updates: 1
+  eval_every_updates: 1
+wandb:
+  enabled: false
+  project: "arc_rl_v1"
+  entity: null
+  run_name: "debug"
+  tags: ["debug"]
+  mode: "offline"
+  log_every_updates: 1
+checkpoint:
+  enabled: true
+  save_every_updates: 1
+  keep_last_n: 2
+  restore_path: null
+evaluation:
+  episodes: 1
+  deterministic: true

@@ -29,13 +29,31 @@ class RuleSwitchSearchV4:
     def legal_actions(self, state: RuleSwitchTypedStateV4) -> tuple[int, ...]:
         safe_color = state.family.active_safe_color
         allowed_targets = set(state.common.goal_cells)
+        remaining_total = 0
         if safe_color is not None:
             for color, positions in state.family.remaining_targets_by_color:
+                remaining_total += len(positions)
                 if color == safe_color:
                     allowed_targets.update(positions)
+        if remaining_total == 0 and state.common.terminal_status == "success":
+            filtered = []
+            for action_id in sorted(int(value) for value in state.common.legal_action_ids):
+                try:
+                    successor, annotation = self.transition_model.apply(state, action_id)
+                except ValueError:
+                    continue
+                if annotation.blocked:
+                    continue
+                if successor.common.terminal_status == "failure":
+                    continue
+                filtered.append(action_id)
+            return tuple(filtered)
         filtered = []
         for action_id in sorted(int(value) for value in state.common.legal_action_ids):
-            successor, annotation = self.transition_model.apply(state, action_id)
+            try:
+                successor, annotation = self.transition_model.apply(state, action_id)
+            except ValueError:
+                continue
             if annotation.blocked:
                 continue
             if successor.common.terminal_status == "failure":
@@ -57,7 +75,10 @@ class RuleSwitchSearchV4:
             if max_depth is not None and len(plan) >= max_depth:
                 continue
             for action_id in self.legal_actions(state):
-                successor, _ = self.transition_model.apply(state, action_id)
+                try:
+                    successor, _ = self.transition_model.apply(state, action_id)
+                except ValueError:
+                    continue
                 next_plan = plan + (action_id,)
                 if goal_predicate(successor):
                     return RuleSwitchSearchOutcomeV4(status="found", plan=next_plan, explored_nodes=explored)

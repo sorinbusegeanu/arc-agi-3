@@ -1830,12 +1830,6 @@ class Trainer:
                 max_abs_logp_diff_pre_update = max(max_abs_logp_diff_pre_update, float((pre_old_action - pre_new_action).abs().max().detach().cpu().item()))
             max_abs_logp_diff_pre_update = max(max_abs_logp_diff_pre_update, max_abs_coord)
         coord_use_count = int(pre_eval.get("coord_use_count", 0)) if isinstance(pre_eval, dict) else 0
-        logger.info(
-            "approx_kl_pre_update=%.6f max_abs_logp_diff_pre_update=%.6f coord_use_count=%s",
-            approx_kl_pre_update,
-            max_abs_logp_diff_pre_update,
-            coord_use_count,
-        )
         if approx_kl_pre_update > preupdate_kl_max:
             if kl_metric == "mode":
                 diff = (pre_old_mode - pre_new_mode).abs()
@@ -1971,13 +1965,6 @@ class Trainer:
             if stop_early:
                 break
             epochs_ran += 1
-            logger.info(
-                "train_step_epoch_start iter=%s epoch=%s/%s elapsed_sec=%.1f",
-                iter_idx,
-                epoch + 1,
-                ppo_epochs,
-                time.time() - train_t0,
-            )
             gen = torch.Generator(device="cpu")
             gen.manual_seed(rng_seed + epoch)
             perm = torch.randperm(n, generator=gen, device="cpu")
@@ -2233,20 +2220,6 @@ class Trainer:
                     entropy_action_discrete_vals.append(torch.stack(ent_action_discrete).mean())
                 if ent_action_coord:
                     entropy_action_coord_vals.append(torch.stack(ent_action_coord).mean())
-
-                if heartbeat_enabled and (mb_done % heartbeat_every_minibatches == 0):
-                    approx_kl_now = float(approx_kl_now_t.detach().cpu().item())
-                    logger.info(
-                        "train_step_heartbeat iter=%s epoch=%s/%s minibatch=%s/%s elapsed_sec=%.1f approx_kl_pre_update=%.6f approx_kl_post_update=%.6f",
-                        iter_idx,
-                        epoch + 1,
-                        ppo_epochs,
-                        mb_done,
-                        ppo_epochs * total_mb_per_epoch,
-                        time.time() - train_t0,
-                        float(approx_kl_pre_update),
-                        approx_kl_now,
-                    )
 
                 approx_kl_mode_mb_t = torch.stack(approx_kl_mode_mb).mean() if approx_kl_mode_mb else torch.tensor(0.0, device=device)
                 approx_kl_action_mb_t = torch.stack(approx_kl_action_mb).mean() if approx_kl_action_mb else torch.tensor(0.0, device=device)

@@ -1,0 +1,103 @@
+env:
+  game_ids: [ ez01,ez02, ez03, ez04, tt01,ul01,fs01,tp01,pb01]
+  game_episode_multipliers:
+    ez01: 1
+    ez02: 1
+    ez03: 1
+    ez04: 1
+    tt01: 1
+    ul01: 2
+    fs01: 2
+    tp01: 3
+    pb01: 3
+  operation_mode: offline
+  environments_dir: null
+  seed: 0
+  save_recording: false
+  render_mode: null
+  execution_mode: "parallel_workers"
+  mp_start_method: "spawn"
+reward:
+  zero_steps_penalty: 10
+  step_penalty: -0.01
+  level_complete_bonus: 0.5
+  game_win_bonus: 1.0
+  repeat_state_penalty_enabled: true
+  repeat_state_penalty: -0.1
+acting:
+  mode: policy_only
+planner:
+  enabled: true
+  beam_width: 8
+  search_depth: 4
+  action_topk: 4
+  discount: 0.99
+  allow_click_action_in_planner: false
+ablations:
+  disable_slots: false
+  disable_recurrent_memory: false
+  disable_planner: false
+  disable_transition_loss: false
+  disable_click_head: false
+model:
+  variant: v1_full
+  canvas_height: 64
+  canvas_width: 64
+  encoder_channels: [32, 64, 128, 192]
+  encoder_dim: 384
+  num_slots: 10
+  slot_dim: 384
+  slot_iters: 4
+  slot_transformer_layers: 4
+  slot_transformer_heads: 6
+  gru_hidden_size: 512
+  action_embed_dim: 64
+  latent_dim: 384
+  pooling: attention
+rollout:
+  unroll_length: 16
+  num_episodes_per_collect: 4
+  max_steps_per_level: 70
+  deterministic_eval: true
+runtime:
+  accelerator: "gpu"
+  devices: 1
+  precision: 16-mixed
+  rollout_processes: 4
+optimization:
+  learning_rate: 0.0003
+  weight_decay: 0.00001
+  grad_clip_norm: 1.0
+  batch_size: 16
+  ppo_epochs: 2
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_eps: 0.2
+  entropy_coef: 0.01
+  value_coef: 0.5
+loss_weights:
+  transition_coef: 1.0
+  reward_coef: 0.5
+  done_coef: 0.25
+logging:
+  run_name: rl_v1_v2
+  output_dir: runs/rl_v1
+  planner_trace_sample_rate: 0.25
+  log_every_updates: 1
+  eval_every_updates: 1
+wandb:
+  enabled: false
+  project: "arc_rl_v1"
+  entity: null
+  run_name: null
+  tags: []
+  mode: "online"
+  log_every_updates: 1
+checkpoint:
+  enabled: true
+  save_every_updates: 10
+  keep_last_n: 3
+  restore_path: null
+evaluation:
+  episodes: 16
+  deterministic: true

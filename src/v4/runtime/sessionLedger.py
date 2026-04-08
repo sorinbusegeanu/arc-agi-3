@@ -14,7 +14,7 @@ class StepLedgerRecordV4:
     decision_summary: dict[str, Any]
     executed_action: V4Action | None
     transition_record: V4TransitionRecord | None
-    step_result: V4StepResult | None
+    step_result: V4StepResult | dict[str, Any] | None
     memory_update_summary: dict[str, Any]
     failure_bucket: str | None
     stop_condition_status: dict[str, Any]
@@ -28,6 +28,7 @@ class SessionSummaryV4:
     steps_executed: int
     stop_reason: str
     failures: tuple[str, ...] = ()
+    step8_trace_rows: tuple[dict[str, object], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

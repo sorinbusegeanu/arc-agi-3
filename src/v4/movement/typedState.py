@@ -70,8 +70,11 @@ class MovementFamilyFieldsV4:
     door_positions: tuple[GridPos, ...] = ()
     door_open: bool | None = None
     switch_positions: tuple[GridPos, ...] = ()
+    occupied_switch_bits: int | None = None
     activated_switch_bits: int | None = None
     door_state_bits: int | None = None
+    switch_logic_mode: str | None = None
+    switch_group_threshold: int | None = None
     teleporter_endpoint_positions: tuple[GridPos, ...] = ()
     teleporter_pairs: tuple[tuple[GridPos, GridPos], ...] = ()
     teleporter_pair_map: tuple[tuple[GridPos, GridPos], ...] = ()
@@ -79,8 +82,11 @@ class MovementFamilyFieldsV4:
     ice_cell_positions: tuple[GridPos, ...] = ()
     coverage_eligible_cells: tuple[GridPos, ...] = ()
     coverage_mask: tuple[GridPos, ...] = ()
+    push_variant: str | None = None
     pushable_block_positions: tuple[GridPos, ...] = ()
     push_target_cells: tuple[GridPos, ...] = ()
+    push_solved_goal_cells: tuple[GridPos, ...] = ()
+    push_decoy_lose_cells: tuple[GridPos, ...] = ()
     step_limit: int | None = None
 
     def __post_init__(self) -> None:
@@ -91,12 +97,30 @@ class MovementFamilyFieldsV4:
         if self.door_open is not None and not isinstance(self.door_open, bool):
             raise ValueError("door_open: must be a bool or null")
         _validate_pos_tuple("switch_positions", self.switch_positions)
+        if self.occupied_switch_bits is not None and (
+            not isinstance(self.occupied_switch_bits, int) or self.occupied_switch_bits < 0
+        ):
+            raise ValueError("occupied_switch_bits: must be a non-negative int or null")
         if self.activated_switch_bits is not None and (
             not isinstance(self.activated_switch_bits, int) or self.activated_switch_bits < 0
         ):
             raise ValueError("activated_switch_bits: must be a non-negative int or null")
         if self.door_state_bits is not None and (not isinstance(self.door_state_bits, int) or self.door_state_bits < 0):
             raise ValueError("door_state_bits: must be a non-negative int or null")
+        if self.switch_logic_mode is not None and self.switch_logic_mode not in {
+            "all_latching",
+            "any_latching",
+            "threshold_latching",
+        }:
+            raise ValueError("switch_logic_mode: unsupported value")
+        if self.switch_group_threshold is not None and (
+            not isinstance(self.switch_group_threshold, int) or self.switch_group_threshold <= 0
+        ):
+            raise ValueError("switch_group_threshold: must be a positive int or null")
+        if self.switch_positions and self.occupied_switch_bits is not None:
+            max_mask = (1 << len(self.switch_positions)) - 1
+            if self.occupied_switch_bits > max_mask:
+                raise ValueError("occupied_switch_bits: exceeds declared switch positions")
         if self.switch_positions and self.activated_switch_bits is not None:
             max_mask = (1 << len(self.switch_positions)) - 1
             if self.activated_switch_bits > max_mask:
@@ -125,8 +149,12 @@ class MovementFamilyFieldsV4:
         _validate_pos_tuple("ice_cell_positions", self.ice_cell_positions)
         _validate_pos_tuple("coverage_eligible_cells", self.coverage_eligible_cells)
         _validate_pos_tuple("coverage_mask", self.coverage_mask)
+        if self.push_variant is not None and self.push_variant not in {"single_goal", "multi_goal", "decoy_loss"}:
+            raise ValueError("push_variant: unsupported value")
         _validate_pos_tuple("pushable_block_positions", self.pushable_block_positions)
         _validate_pos_tuple("push_target_cells", self.push_target_cells)
+        _validate_pos_tuple("push_solved_goal_cells", self.push_solved_goal_cells)
+        _validate_pos_tuple("push_decoy_lose_cells", self.push_decoy_lose_cells)
         if self.step_limit is not None and (not isinstance(self.step_limit, int) or self.step_limit <= 0):
             raise ValueError("step_limit: must be a positive int or null")
 

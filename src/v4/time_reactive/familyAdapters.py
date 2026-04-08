@@ -74,11 +74,33 @@ def _avatar_position(grid: tuple[tuple[int, ...], ...]) -> GridPos:
     return found[0]
 
 
+def _avatar_position_from_frame(observation: V4Observation, bounds: GridPos) -> GridPos | None:
+    plane = observation.frame[0]
+    pixel_h = len(plane)
+    pixel_w = len(plane[0]) if pixel_h else 0
+    pixels = [(x, y) for y, row in enumerate(plane) for x, value in enumerate(row) if int(value) == 9]
+    if not pixels:
+        return None
+    xs = [x for x, _ in pixels]
+    ys = [y for _, y in pixels]
+    center_x = (min(xs) + max(xs)) / 2.0
+    center_y = (min(ys) + max(ys)) / 2.0
+    grid_x = min(bounds[0] - 1, max(0, int(center_x * bounds[0] / pixel_w)))
+    grid_y = min(bounds[1] - 1, max(0, int(center_y * bounds[1] / pixel_h)))
+    return (grid_x, grid_y)
+
+
 def build_sv01_time_reactive_state(parsed_state: ParsedStateV4) -> TimeReactiveTypedStateV4:
     level = _load_level(parsed_state)
     bounds = getattr(level, "grid_size", None)
     grid = _grid_from_observation(parsed_state.current_observation, bounds)
-    avatar_position = _avatar_position(grid)
+    try:
+        avatar_position = _avatar_position(grid)
+    except ValueError:
+        frame_avatar = _avatar_position_from_frame(parsed_state.current_observation, bounds)
+        if frame_avatar is None:
+            raise
+        avatar_position = frame_avatar
     hunger_value = min(100, _parse_bar_value(parsed_state.current_observation, 1, 14, scale=5))
     warmth_value = min(100, _parse_bar_value(parsed_state.current_observation, 2, 12, scale=5))
     survival_timer_remaining = min(60, _parse_bar_value(parsed_state.current_observation, 3, 3, scale=3))

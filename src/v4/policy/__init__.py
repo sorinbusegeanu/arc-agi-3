@@ -5,6 +5,7 @@ from .primitivePolicy import PrimitivePolicyV4
 from .shortPlanPolicy import ShortPlanPolicyV4
 
 __all__ = [
+    "CertifiedPlannerPolicyV4",
     "PolicyBaseV4",
     "PrimitivePolicyV4",
     "ShortPlanPolicyV4",
@@ -15,6 +16,10 @@ __all__ = [
 
 
 def __getattr__(name: str):
+    if name == "CertifiedPlannerPolicyV4":
+        from v4.policy.certifiedPlannerPolicy import CertifiedPlannerPolicyV4
+
+        return CertifiedPlannerPolicyV4
     if name == "MovementSolverPolicyV4":
         from v4.movement.solverPolicy import MovementSolverPolicyV4
 

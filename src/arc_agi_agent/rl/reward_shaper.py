@@ -50,14 +50,17 @@ def _default_cfg() -> Dict[str, Any]:
     return {
         "movement_cell_thresh": 55,
         "noop_cell_thresh": 10,
+        "r_win": 1.0,
+        "r_new_level": 1.0,
+        "r_match_poi": 0.5,
         "r_effect_movement": 0.01,
         "r_effect_screen": 0.1,
-        "match_poi": 0.5,
-        "revert_penalty": 0.2,
+        "r_revert_penalty": -0.2,
         "beta_potential": 0.05,
         "gamma": 0.995,
-        "step_penalty_rate": 0.0005,
+        "r_step_penalty": -0.0005,
         "step_penalty_cap": 0.1,
+        "r_noop_penalty": -0.1,
         "flash_changed_total_thresh": 0.5,
         "flash_changed_masked_thresh": 0.5,
         "flash_hist_l1_thresh": 0.15,
@@ -866,6 +869,8 @@ class RewardShaper:
         grid_curr = np.asarray(ctx.get("grid_curr"))
         grid_prev_prev_raw = ctx.get("grid_prev_prev")
         grid_prev_prev = np.asarray(grid_prev_prev_raw) if grid_prev_prev_raw is not None else None
+        levels_completed_prev = int(ctx.get("levels_completed_prev", 0) or 0)
+        levels_completed_curr = int(ctx.get("levels_completed_curr", 0) or 0)
 
         # --- Effect transition (cell diff + flash detection) ---
         pre = ctx.get("effect_transition")
@@ -898,7 +903,13 @@ class RewardShaper:
         m_noop = 0 if cells_changed < noop_cell_thresh else 1
 
         # --- r_win ---
-        r_win = 1.0 if bool(win) else 0.0
+        r_win = float(cfg_eff.get("r_win", 1.0)) if bool(win) else 0.0
+
+        # --- r_new_level ---
+        # This is a one-shot reward on the exact step where the environment
+        # increments levels_completed.
+        delta_levels_completed = max(0, levels_completed_curr - levels_completed_prev)
+        r_new_level = float(cfg_eff.get("r_new_level", 1.0)) * float(delta_levels_completed)
 
         # --- r_effect ---
         movement_thresh = int(cfg_eff.get("movement_cell_thresh", 55))
@@ -916,7 +927,7 @@ class RewardShaper:
         if not flash_event and cells_changed >= max(noop_cell_thresh, _MATCH_POI_MIN_BBOX_SIZE * _MATCH_POI_MIN_BBOX_SIZE):
             match_poi_info = _match_poi_blocks(grid_prev, grid_curr, grid_prev_prev=grid_prev_prev)
         r_match_poi = (
-            float(cfg_eff.get("match_poi", 0.5)) * float(match_poi_info.get("score", 0.0))
+            float(cfg_eff.get("r_match_poi", cfg_eff.get("match_poi", 0.5))) * float(match_poi_info.get("score", 0.0))
             if match_poi_info is not None
             else 0.0
         )
@@ -962,7 +973,7 @@ class RewardShaper:
             and state_hash_t_minus_2
             and state_hash == state_hash_t_minus_2
         )
-        r_revert = -float(cfg_eff.get("revert_penalty", 0.2)) if revert_flag else 0.0
+        r_revert = float(cfg_eff.get("r_revert_penalty", cfg_eff.get("revert_penalty", -0.2))) if revert_flag else 0.0
 
         # --- r_potential ---
         vc = visit_counts if visit_counts is not None else {}
@@ -981,22 +992,25 @@ class RewardShaper:
         if state_hash and visit_counts is not None and not flash_event:
             visit_counts[state_hash] = n_curr + 1
 
-        # --- r_step (unconditional growing time penalty) ---
-        rate = float(cfg_eff.get("step_penalty_rate", 0.0005))
+        # --- r_step (growing time penalty within the current level) ---
+        t_level = int(ctx.get("t_level", t) or 0)
+        rate = float(cfg_eff.get("r_step_penalty", cfg_eff.get("step_penalty_rate", -0.0005)))
         cap = float(cfg_eff.get("step_penalty_cap", 0.1))
-        r_step = -min(rate * float(t), cap)
+        raw_step = rate * float(t_level)
+        r_step = max(-cap, min(raw_step, cap))
 
         # --- r_noop penalty ---
-        r_noop = -float(cfg_eff.get("noop_penalty", 0.1)) if m_noop == 0 else 0.0
+        r_noop = float(cfg_eff.get("r_noop_penalty", cfg_eff.get("noop_penalty", -0.1))) if m_noop == 0 else 0.0
 
         # --- Total ---
-        r_total = r_win + float(m_noop) * (r_effect + r_match_poi + r_revert + r_potential) + r_step + r_noop
+        r_total = r_win + r_new_level + float(m_noop) * (r_effect + r_match_poi + r_revert + r_potential) + r_step + r_noop
 
         return {
             "schema_version": "REWARD_V1",
             "r_total": float(r_total),
             "terms": {
                 "r_win": float(r_win),
+                "r_new_level": float(r_new_level),
                 "r_effect": float(r_effect),
                 "r_match_poi": float(r_match_poi),
                 "r_revert": float(r_revert),
@@ -1011,6 +1025,10 @@ class RewardShaper:
                 "match_poi_info": match_poi_info,
                 "delta_c": int(cells_changed),
                 "cells_changed": int(cells_changed),
+                "delta_levels_completed": int(delta_levels_completed),
+                "levels_completed_prev": int(levels_completed_prev),
+                "levels_completed_curr": int(levels_completed_curr),
+                "t_level": int(t_level),
                 "state_hash": str(state_hash),
             },
             "aux": {

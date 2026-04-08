@@ -1,0 +1,6 @@
+This is the video of a game, 64x64 pixels, each one screen only. Identify HUD regions, life regions, and progress regions from the provided screens.
+Return deterministic structured text only.
+Use exactly this format:
+hud_regions: item1|item2
+life_regions: item1|item2
+progress_regions: item1|item2

@@ -320,7 +320,7 @@ def _load_ui_bar_from_rl_config_file() -> Dict[str, Any]:
     if _RL_UI_BAR_CFG_CACHE is not None:
         return dict(_RL_UI_BAR_CFG_CACHE)
     defaults = _default_ui_bar_cfg()
-    cfg_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "rl_config.json")
+    cfg_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "v4_5", "config", "agents_config.json")
     try:
         with open(cfg_path, "r", encoding="utf-8") as f:
             data = json.load(f)

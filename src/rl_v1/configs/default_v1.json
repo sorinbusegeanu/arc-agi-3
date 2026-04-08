@@ -1,0 +1,83 @@
+{
+  "env": {
+    "game_ids": ["ez01", "ez02", "ez03", "ez04", "tt01", "ul01"],
+    "operation_mode": "offline",
+    "seed": 0,
+    "save_recording": false,
+    "render_mode": null
+  },
+  "model": {
+    "canvas_height": 64,
+    "canvas_width": 64,
+    "encoder_channels": [32, 64, 128],
+    "encoder_dim": 256,
+    "slot_count": 6,
+    "slot_dim": 256,
+    "relation_layers": 2,
+    "relation_heads": 4,
+    "hidden_dim": 256,
+    "pooling": "attention",
+    "use_slots": true,
+    "use_recurrent_memory": true,
+    "use_click_branch": true,
+    "use_transition_model": true,
+    "baseline": false
+  },
+  "planner": {
+    "enabled": true,
+    "depth": 3,
+    "beam_width": 4,
+    "expansion_width": 4,
+    "discount": 0.99,
+    "acting_mode": "policy_only"
+  },
+  "rollout": {
+    "episodes_per_collect": 2,
+    "max_steps": 32,
+    "unroll_length": 16,
+    "deterministic_eval": true
+  },
+  "ppo": {
+    "gamma": 0.99,
+    "gae_lambda": 0.95,
+    "clip_epsilon": 0.2,
+    "value_coef": 0.5,
+    "entropy_coef": 0.01,
+    "batch_size": 4,
+    "epochs": 2,
+    "max_grad_norm": 1.0
+  },
+  "losses": {
+    "policy_weight": 1.0,
+    "value_weight": 0.5,
+    "entropy_weight": 0.01,
+    "transition_weight": 1.0,
+    "reward_weight": 0.5,
+    "done_weight": 0.25
+  },
+  "optimizer": {
+    "lr": 0.0003,
+    "weight_decay": 0.00001,
+    "precision": "32-true"
+  },
+  "logging": {
+    "run_name": "rl_v1_v1",
+    "output_dir": "runs/rl_v1",
+    "planner_trace_sample_rate": 0.25
+  },
+  "checkpointing": {
+    "enabled": true,
+    "save_every_updates": 10
+  },
+  "evaluation": {
+    "episodes": 2,
+    "deterministic": true,
+    "ablations": {
+      "slots": true,
+      "recurrent_memory": true,
+      "planner": true,
+      "transition_loss": true,
+      "click_branch": true
+    }
+  }
+}

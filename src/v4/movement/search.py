@@ -3,6 +3,7 @@ from __future__ import annotations
 import heapq
 from collections import deque
 from dataclasses import asdict, dataclass
+import json
 from typing import Callable
 
 from .heuristics import zero_heuristic
@@ -26,11 +27,18 @@ class MovementSearchV4:
         self.transition_model = transition_model if transition_model is not None else MovementTransitionModelV4()
 
     def _state_key(self, state: MovementTypedStateV4) -> str:
-        # The full typed-state key preserves family-specific successor effects,
-        # including teleporter-resolved avatar position, slide-resolved landing cells,
-        # explicit family maps and bits, coverage-state progression, and
-        # push-object positions for `pb01`.
-        return state.to_key()
+        payload = state.to_dict()
+        common = payload.get("common", {})
+        if isinstance(common, dict):
+            common.pop("step_depth", None)
+        family = payload.get("family", {})
+        push_positions = family.get("pushable_block_positions")
+        if isinstance(push_positions, (list, tuple)):
+            family["pushable_block_positions"] = tuple(sorted(tuple(pos) for pos in push_positions))
+        solved_goal_cells = family.get("push_solved_goal_cells")
+        if isinstance(solved_goal_cells, (list, tuple)):
+            family["push_solved_goal_cells"] = tuple(sorted(tuple(pos) for pos in solved_goal_cells))
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
     def search(
         self,

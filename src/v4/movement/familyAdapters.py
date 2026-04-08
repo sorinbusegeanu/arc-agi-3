@@ -24,6 +24,45 @@ def _find_cells_by_color(grid: tuple[tuple[int, ...], ...], color: int) -> tuple
     return tuple((x, y) for y, row in enumerate(grid) for x, value in enumerate(row) if value == color)
 
 
+def _avatar_cell_from_frame(observation: V4Observation, bounds: GridPos) -> GridPos | None:
+    plane = observation.frame[0]
+    height = len(plane)
+    width = len(plane[0]) if height else 0
+    if height <= 0 or width <= 0:
+        return None
+    visited: set[GridPos] = set()
+    best_cells: list[GridPos] | None = None
+    for y in range(height):
+        for x in range(width):
+            if (x, y) in visited or int(plane[y][x]) != 9:
+                continue
+            queue = deque([(x, y)])
+            visited.add((x, y))
+            cells: list[GridPos] = []
+            while queue:
+                cx, cy = queue.popleft()
+                cells.append((cx, cy))
+                for dx, dy in _MOVE_DELTAS.values():
+                    nx = cx + dx
+                    ny = cy + dy
+                    if 0 <= nx < width and 0 <= ny < height and (nx, ny) not in visited and int(plane[ny][nx]) == 9:
+                        visited.add((nx, ny))
+                        queue.append((nx, ny))
+            if best_cells is None or len(cells) > len(best_cells):
+                best_cells = cells
+            elif len(cells) == len(best_cells):
+                best_cells = None
+    if not best_cells:
+        return None
+    xs = [cell[0] for cell in best_cells]
+    ys = [cell[1] for cell in best_cells]
+    center_x = (min(xs) + max(xs)) / 2.0
+    center_y = (min(ys) + max(ys)) / 2.0
+    grid_x = min(bounds[0] - 1, max(0, int(center_x * bounds[0] / width)))
+    grid_y = min(bounds[1] - 1, max(0, int(center_y * bounds[1] / height)))
+    return (grid_x, grid_y)
+
+
 def _most_common_non_avatar_blob_size(observation: V4Observation) -> GridPos:
     plane = observation.frame[0]
     height = len(plane)
@@ -121,6 +160,136 @@ def _last_action_id(parsed_state: ParsedStateV4) -> int | None:
     return int(action_id) if isinstance(action_id, int) else None
 
 
+def _observed_push_blocks(grid: tuple[tuple[int, ...], ...], bounds: GridPos) -> tuple[GridPos, ...]:
+    return tuple(sorted(pos for pos in (_find_cells_by_color(grid, 15) + _find_cells_by_color(grid, 14)) if pos != (bounds[0] - 1, bounds[1] - 1)))
+
+
+def _infer_push_blocks_from_previous_observation(
+    parsed_state: ParsedStateV4,
+    family: str,
+    bounds: GridPos,
+    current_grid: tuple[tuple[int, ...], ...],
+    expected_count: int,
+    target_positions: tuple[GridPos, ...],
+    initial_block_positions: tuple[GridPos, ...] = (),
+) -> tuple[GridPos, ...]:
+    visible_blocks = set(_observed_push_blocks(current_grid, bounds))
+    if len(visible_blocks) == expected_count:
+        return tuple(sorted(visible_blocks))
+    previous_observation = parsed_state.previous_observation
+    if previous_observation is not None:
+        previous_level_index = previous_observation.raw_payload.get("levels_completed")
+        current_level_index = parsed_state.current_observation.levels_completed
+        if (
+            isinstance(previous_level_index, int)
+            and previous_level_index != current_level_index
+            and len(initial_block_positions) == expected_count
+        ):
+            if visible_blocks and not visible_blocks.issubset(set(initial_block_positions)):
+                raise ValueError(f"{family} reconstruction inconsistent: visible block evidence disagrees with configured level-start blocks")
+            return tuple(sorted(initial_block_positions))
+    previous_grid = _sample_previous_grid(parsed_state, bounds)
+    action_id = _last_action_id(parsed_state)
+    if previous_grid is None or action_id not in _MOVE_DELTAS:
+        return tuple(sorted(visible_blocks))
+    previous_blocks = set(_observed_push_blocks(previous_grid, bounds))
+    if len(previous_blocks) != expected_count:
+        return tuple(sorted(visible_blocks))
+    previous_avatar = _find_unique_color(previous_grid, 9, f"{family}_previous_avatar_position")
+    delta = _MOVE_DELTAS[action_id]
+    pushed_from = (previous_avatar[0] + delta[0], previous_avatar[1] + delta[1])
+    if pushed_from not in previous_blocks:
+        return tuple(sorted(visible_blocks))
+    pushed_to = (pushed_from[0] + delta[0], pushed_from[1] + delta[1])
+    inferred_blocks = set(previous_blocks)
+    inferred_blocks.remove(pushed_from)
+    inferred_blocks.add(pushed_to)
+    resolved_blocks = set(visible_blocks)
+    for pos in inferred_blocks:
+        if pos in visible_blocks or pos in target_positions:
+            resolved_blocks.add(pos)
+    return tuple(sorted(resolved_blocks))
+
+
+def _pb02_predicted_blocks_from_carry_state(
+    parsed_state: ParsedStateV4,
+    *,
+    carry_state: MovementTypedStateV4,
+    bounds: GridPos,
+    wall_positions: tuple[GridPos, ...],
+) -> tuple[GridPos, ...]:
+    if carry_state.common.game_family != "pb02":
+        raise ValueError("pb02 reconstruction requires prior pb02 carry state")
+    if len(carry_state.family.pushable_block_positions) != 2:
+        raise ValueError("pb02 reconstruction requires exactly two carry-state block positions")
+    action_id = _last_action_id(parsed_state)
+    if action_id not in _MOVE_DELTAS:
+        raise ValueError("pb02 reconstruction requires previous legal movement action")
+    delta = _MOVE_DELTAS[action_id]
+    avatar = carry_state.common.avatar_position
+    block_positions = set(carry_state.family.pushable_block_positions)
+    next_pos = (avatar[0] + delta[0], avatar[1] + delta[1])
+    if not (0 <= next_pos[0] < bounds[0] and 0 <= next_pos[1] < bounds[1]):
+        return tuple(sorted(block_positions))
+    if next_pos in set(wall_positions):
+        return tuple(sorted(block_positions))
+    if next_pos not in block_positions:
+        return tuple(sorted(block_positions))
+    push_dest = (next_pos[0] + delta[0], next_pos[1] + delta[1])
+    if not (0 <= push_dest[0] < bounds[0] and 0 <= push_dest[1] < bounds[1]):
+        return tuple(sorted(block_positions))
+    if push_dest in set(wall_positions) or push_dest in block_positions:
+        return tuple(sorted(block_positions))
+    block_positions.remove(next_pos)
+    block_positions.add(push_dest)
+    return tuple(sorted(block_positions))
+
+
+def _reconstruct_pb02_blocks_from_carry_state(
+    parsed_state: ParsedStateV4,
+    *,
+    bounds: GridPos,
+    grid: tuple[tuple[int, ...], ...],
+    wall_positions: tuple[GridPos, ...],
+    target_positions: tuple[GridPos, ...],
+    carry_state: MovementTypedStateV4 | None,
+) -> tuple[GridPos, ...]:
+    visible_blocks = tuple(sorted(set(_observed_push_blocks(grid, bounds)) - {(bounds[0] - 1, bounds[1] - 1)}))
+    if len(visible_blocks) == 2:
+        return visible_blocks
+    if carry_state is None:
+        return _infer_push_blocks_from_previous_observation(parsed_state, "pb02", bounds, grid, 2, target_positions)
+    predicted_blocks = _pb02_predicted_blocks_from_carry_state(
+        parsed_state,
+        carry_state=carry_state,
+        bounds=bounds,
+        wall_positions=wall_positions,
+    )
+    predicted_set = set(predicted_blocks)
+    visible_set = set(visible_blocks)
+    if not visible_set.issubset(predicted_set):
+        raise ValueError("pb02 reconstruction inconsistent: visible block evidence is not contained in predicted carry-state blocks")
+    if len(predicted_blocks) != 2:
+        raise ValueError("pb02 reconstruction inconsistent: predicted carry-state blocks must remain size two")
+    hidden_positions = tuple(sorted(predicted_set - visible_set))
+    if hidden_positions and any(pos not in set(target_positions) for pos in hidden_positions):
+        raise ValueError("pb02 reconstruction inconsistent: hidden carry-state block must remain on a target overlay cell")
+    return tuple(sorted(predicted_blocks))
+
+
+def _pb_level_start_blocks(parsed_state: ParsedStateV4, *, expected_count: int, configured_blocks: tuple[GridPos, ...]) -> tuple[GridPos, ...] | None:
+    previous_observation = parsed_state.previous_observation
+    if previous_observation is None:
+        return None
+    previous_level_index = previous_observation.raw_payload.get("levels_completed")
+    current_level_index = parsed_state.current_observation.levels_completed
+    if not isinstance(previous_level_index, int) or previous_level_index == current_level_index:
+        return None
+    if len(configured_blocks) != expected_count:
+        return None
+    return tuple(sorted(configured_blocks))
+
+
 def _neighbors(pos: GridPos, bounds: GridPos) -> tuple[GridPos, ...]:
     result: list[GridPos] = []
     for dx, dy in _MOVE_DELTAS.values():
@@ -155,8 +324,11 @@ def _avatar_position(parsed_state: ParsedStateV4, bounds: GridPos, family_layout
     found = _find_cells_by_color(grid, 9)
     if len(found) == 1:
         return found[0]
+    frame_avatar = _avatar_cell_from_frame(parsed_state.current_observation, bounds)
+    if frame_avatar is not None:
+        return frame_avatar
     previous_observation = parsed_state.previous_observation
-    if family_layout["family"] == "tp01" and len(found) == 0 and previous_observation is not None:
+    if len(found) == 0 and previous_observation is not None:
         previous_level_index = previous_observation.raw_payload.get("levels_completed")
         current_level_index = parsed_state.current_observation.levels_completed
         if (
@@ -175,7 +347,10 @@ def _avatar_position(parsed_state: ParsedStateV4, bounds: GridPos, family_layout
     delta = _MOVE_DELTAS[action_id]
     candidate = (previous_avatar[0] + delta[0], previous_avatar[1] + delta[1])
     family = family_layout["family"]
-    if family == "fs01":
+    if family == "ul01":
+        blocked = set(family_layout["wall_positions"]) | set(family_layout["door_positions"])
+        return previous_avatar if candidate in blocked or not (0 <= candidate[0] < bounds[0] and 0 <= candidate[1] < bounds[1]) else candidate
+    if family in {"fs01", "fs02", "fs03"}:
         blocked = set(family_layout["wall_positions"]) | set(family_layout["door_positions"])
         return previous_avatar if candidate in blocked or not (0 <= candidate[0] < bounds[0] and 0 <= candidate[1] < bounds[1]) else candidate
     if family == "tp01":
@@ -194,6 +369,29 @@ def _avatar_position(parsed_state: ParsedStateV4, bounds: GridPos, family_layout
             cursor = nxt
         return cursor
     raise ValueError("avatar_position: cannot infer hidden avatar for this family")
+
+
+def _avatar_position_from_carry_state(
+    parsed_state: ParsedStateV4,
+    *,
+    bounds: GridPos,
+    family_layout: dict,
+    carry_state: MovementTypedStateV4 | None,
+) -> GridPos:
+    if carry_state is None:
+        raise ValueError("avatar_position: carry state unavailable")
+    if carry_state.common.game_family != family_layout["family"]:
+        raise ValueError("avatar_position: carry state family mismatch")
+    action_id = _last_action_id(parsed_state)
+    if action_id not in _MOVE_DELTAS:
+        raise ValueError("avatar_position: cannot infer avatar without previous legal movement action")
+    previous_avatar = carry_state.common.avatar_position
+    delta = _MOVE_DELTAS[action_id]
+    candidate = (previous_avatar[0] + delta[0], previous_avatar[1] + delta[1])
+    blocked = set(family_layout.get("wall_positions", ())) | set(family_layout.get("door_positions", ()))
+    if candidate in blocked or not (0 <= candidate[0] < bounds[0] and 0 <= candidate[1] < bounds[1]):
+        return previous_avatar
+    return candidate
 
 
 def _choose_fs01_door_and_walls(blocked_cells: tuple[GridPos, ...], bounds: GridPos) -> tuple[tuple[GridPos, ...], tuple[GridPos, ...], bool]:
@@ -322,19 +520,92 @@ def extract_family_layout_from_parsed_state(parsed_state: ParsedStateV4, family:
         )
         return layout
     if family == "fs01":
-        switch_positions = tuple(sorted(_find_cells_by_color(grid, 10) + _find_cells_by_color(grid, 11)))
-        target_cells = _find_cells_by_color(grid, 14)
+        module = _load_game_module_from_environment_metadata(parsed_state, family)
+        level = _load_level_object_from_module(parsed_state, family, module)
+        switch_positions = tuple(sorted(_extract_sprite_positions(level, "switch")))
+        target_cells = tuple(sorted(_extract_sprite_positions(level, "target")))
+        configured_door_positions = tuple(sorted(_extract_sprite_positions(level, "door")))
+        wall_positions = tuple(sorted(_extract_sprite_positions(level, "wall")))
+        player_positions = _extract_sprite_positions(level, "player")
         if not switch_positions:
-            raise ValueError("fs01 switch state unavailable: no directly observed switch cells")
+            raise ValueError("fs01 config unavailable: no configured switch cells")
         if len(target_cells) != 1:
-            raise ValueError("fs01 target state unavailable: expected exactly one target cell")
-        door_positions, wall_positions, door_open = _choose_fs01_door_and_walls(_find_cells_by_color(grid, 3), bounds)
+            raise ValueError("fs01 target state unavailable: expected exactly one configured target cell")
+        if len(player_positions) != 1:
+            raise ValueError("fs01 config unavailable: expected exactly one player start")
+        observed_switch_values = {
+            pos: grid[pos[1]][pos[0]]
+            for pos in switch_positions
+        }
+        if any(value not in {9, 10, 11} for value in observed_switch_values.values()):
+            raise ValueError("fs01 switch state unavailable: configured switch cells are not directly observed in the frame")
+        observed_closed_doors = tuple(sorted(pos for pos in configured_door_positions if grid[pos[1]][pos[0]] == 3))
+        door_open = len(observed_closed_doors) == 0
         layout.update(
             switch_positions=switch_positions,
             target_cells=target_cells,
-            door_positions=door_positions,
+            door_positions=observed_closed_doors,
             wall_positions=wall_positions,
             door_open=door_open,
+            player_start_position=player_positions[0],
+            layout_evidence_source="direct_observation",
+        )
+        return layout
+    if family == "fs02":
+        module = _load_game_module_from_environment_metadata(parsed_state, family)
+        level = _load_level_object_from_module(parsed_state, family, module)
+        switch_positions = tuple(sorted(_extract_sprite_positions(level, "switch")))
+        door_positions = tuple(sorted(_extract_sprite_positions(level, "door")))
+        wall_positions = tuple(sorted(_extract_sprite_positions(level, "wall")))
+        target_cells = tuple(sorted(_extract_sprite_positions(level, "target")))
+        player_positions = _extract_sprite_positions(level, "player")
+        if len(player_positions) != 1:
+            raise ValueError("fs02 config unavailable: expected exactly one player start")
+        observed_closed_doors = tuple(sorted(pos for pos in door_positions if grid[pos[1]][pos[0]] == 3))
+        door_open = len(observed_closed_doors) == 0
+        layout.update(
+            layout_evidence_source="environment_metadata",
+            switch_positions=switch_positions,
+            target_cells=target_cells,
+            door_positions=observed_closed_doors,
+            configured_door_positions=door_positions,
+            wall_positions=wall_positions,
+            door_open=door_open,
+            switch_logic_mode="any_latching",
+            switch_group_threshold=1,
+            player_start_position=player_positions[0],
+        )
+        return layout
+    if family == "fs03":
+        module = _load_game_module_from_environment_metadata(parsed_state, family)
+        level = _load_level_object_from_module(parsed_state, family, module)
+        switch_positions = tuple(sorted(_extract_sprite_positions(level, "switch")))
+        door_positions = tuple(sorted(_extract_sprite_positions(level, "door")))
+        wall_positions = tuple(sorted(_extract_sprite_positions(level, "wall")))
+        target_cells = tuple(sorted(_extract_sprite_positions(level, "target")))
+        player_positions = _extract_sprite_positions(level, "player")
+        if len(player_positions) != 1:
+            raise ValueError("fs03 config unavailable: expected exactly one player start")
+        required_plates = level.get_data("required_plates") if hasattr(level, "get_data") else None
+        if not isinstance(required_plates, int) or required_plates <= 0:
+            raise ValueError("fs03 config unavailable: missing positive required_plates threshold")
+        observed_switches = {
+            pos: grid[pos[1]][pos[0]]
+            for pos in switch_positions
+        }
+        observed_closed_doors = tuple(sorted(pos for pos in door_positions if grid[pos[1]][pos[0]] == 3))
+        door_open = len(observed_closed_doors) == 0
+        layout.update(
+            layout_evidence_source="environment_metadata",
+            switch_positions=switch_positions,
+            target_cells=target_cells,
+            door_positions=observed_closed_doors,
+            configured_door_positions=door_positions,
+            wall_positions=wall_positions,
+            door_open=door_open,
+            switch_logic_mode="threshold_latching",
+            switch_group_threshold=required_plates,
+            player_start_position=player_positions[0],
         )
         return layout
     if family == "tp01":
@@ -411,25 +682,88 @@ def extract_family_layout_from_parsed_state(parsed_state: ParsedStateV4, family:
         target_positions = tuple(sorted(_extract_sprite_positions(level, "target")))
         wall_positions = tuple(sorted(_extract_sprite_positions(level, "wall")))
         step_limit = level.get_data("step_limit") if hasattr(level, "get_data") else None
+        player_positions = _extract_sprite_positions(level, "player")
+        block_start_positions = tuple(sorted(_extract_sprite_positions(level, "block")))
         if len(target_positions) != 1:
             raise ValueError(f"pb01 target state unavailable: expected exactly one configured target, found {len(target_positions)}")
         if not isinstance(step_limit, int) or step_limit <= 0:
             raise ValueError("pb01 config unavailable: missing positive step_limit")
-        block_positions = tuple(
-            sorted(
-                pos
-                for pos in (_find_cells_by_color(grid, 15) + _find_cells_by_color(grid, 14))
-                if pos != (bounds[0] - 1, bounds[1] - 1)
-            )
-        )
-        block_positions = tuple(sorted(set(block_positions) - set(target_positions)))
-        if len(block_positions) != 1:
-            raise ValueError(f"pushable_block_positions: expected exactly one directly observed block, found {len(block_positions)}")
+        if len(player_positions) != 1:
+            raise ValueError("pb01 config unavailable: expected exactly one player start")
+        block_positions = _infer_push_blocks_from_previous_observation(parsed_state, family, bounds, grid, 1, target_positions, block_start_positions)
+        if len(block_positions) > 1:
+            raise ValueError(f"pushable_block_positions: expected at most one supported block position, found {len(block_positions)}")
         layout.update(
             layout_evidence_source="environment_metadata",
             wall_positions=wall_positions,
             target_cells=target_positions,
             pushable_block_positions=block_positions,
+            initial_pushable_block_positions=block_start_positions,
+            player_start_position=player_positions[0],
+            step_limit=step_limit,
+        )
+        return layout
+    if family == "pb02":
+        module = _load_game_module_from_environment_metadata(parsed_state, family)
+        level = _load_level_object_from_module(parsed_state, family, module)
+        target_positions = tuple(sorted(_extract_sprite_positions(level, "target")))
+        wall_positions = tuple(sorted(_extract_sprite_positions(level, "wall")))
+        step_limit = level.get_data("step_limit") if hasattr(level, "get_data") else None
+        player_positions = _extract_sprite_positions(level, "player")
+        block_start_positions = tuple(sorted(_extract_sprite_positions(level, "block")))
+        if len(target_positions) != 2:
+            raise ValueError(f"pb02 target state unavailable: expected exactly two configured targets, found {len(target_positions)}")
+        if not isinstance(step_limit, int) or step_limit <= 0:
+            raise ValueError("pb02 config unavailable: missing positive step_limit")
+        if len(player_positions) != 1:
+            raise ValueError("pb02 config unavailable: expected exactly one player start")
+        block_positions = _infer_push_blocks_from_previous_observation(parsed_state, family, bounds, grid, 2, target_positions, block_start_positions)
+        if len(block_positions) > 2:
+            raise ValueError(f"pb02 pushable_block_positions: expected at most two supported block positions, found {len(block_positions)}")
+        solved_goal_cells = tuple(sorted(pos for pos in block_positions if pos in target_positions))
+        layout.update(
+            layout_evidence_source="environment_metadata",
+            wall_positions=wall_positions,
+            target_cells=target_positions,
+            pushable_block_positions=block_positions,
+            initial_pushable_block_positions=block_start_positions,
+            player_start_position=player_positions[0],
+            push_solved_goal_cells=solved_goal_cells,
+            push_variant="multi_goal",
+            step_limit=step_limit,
+        )
+        return layout
+    if family == "pb03":
+        module = _load_game_module_from_environment_metadata(parsed_state, family)
+        level = _load_level_object_from_module(parsed_state, family, module)
+        target_positions = tuple(sorted(_extract_sprite_positions(level, "target")))
+        wall_positions = tuple(sorted(_extract_sprite_positions(level, "wall")))
+        decoy_positions = tuple(sorted(_extract_sprite_positions(level, "decoy")))
+        step_limit = level.get_data("step_limit") if hasattr(level, "get_data") else None
+        player_positions = _extract_sprite_positions(level, "player")
+        block_start_positions = tuple(sorted(_extract_sprite_positions(level, "block")))
+        if len(target_positions) != 1:
+            raise ValueError(f"pb03 target state unavailable: expected exactly one configured target, found {len(target_positions)}")
+        if not decoy_positions:
+            raise ValueError("pb03 config unavailable: missing configured decoy cells")
+        if not isinstance(step_limit, int) or step_limit <= 0:
+            raise ValueError("pb03 config unavailable: missing positive step_limit")
+        if len(player_positions) != 1:
+            raise ValueError("pb03 config unavailable: expected exactly one player start")
+        block_positions = _infer_push_blocks_from_previous_observation(parsed_state, family, bounds, grid, 1, target_positions, block_start_positions)
+        if len(block_positions) > 1:
+            raise ValueError(f"pb03 pushable_block_positions: expected at most one supported block position, found {len(block_positions)}")
+        solved_goal_cells = tuple(sorted(pos for pos in block_positions if pos in target_positions))
+        layout.update(
+            layout_evidence_source="environment_metadata",
+            wall_positions=wall_positions,
+            target_cells=target_positions,
+            pushable_block_positions=block_positions,
+            initial_pushable_block_positions=block_start_positions,
+            player_start_position=player_positions[0],
+            push_solved_goal_cells=solved_goal_cells,
+            push_decoy_lose_cells=decoy_positions,
+            push_variant="decoy_loss",
             step_limit=step_limit,
         )
         return layout
@@ -444,14 +778,15 @@ def _base_common(
     blocked: tuple[GridPos, ...],
     targets: tuple[GridPos, ...],
     hazards: tuple[GridPos, ...],
+    avatar_position: GridPos | None = None,
 ) -> MovementCommonFieldsV4:
     bounds = layout["bounds"]
-    avatar_position = _avatar_position(parsed_state, bounds, layout)
+    resolved_avatar = avatar_position if avatar_position is not None else _avatar_position(parsed_state, bounds, layout)
     return MovementCommonFieldsV4(
         game_family=family,
         game_id=parsed_state.current_observation.game_id,
         level_index=parsed_state.current_observation.levels_completed,
-        avatar_position=avatar_position,
+        avatar_position=resolved_avatar,
         traversable_cells=tuple(sorted(traversable)),
         current_legal_actions=tuple(sorted(parsed_state.available_actions)),
         terminal_status=parsed_state.terminal_signal.status,
@@ -480,27 +815,139 @@ def build_ul01_movement_state(parsed_state: ParsedStateV4) -> MovementTypedState
     return MovementTypedStateV4(common=common, family=family, layout_evidence_source=str(layout["layout_evidence_source"]))
 
 
-def build_fs01_movement_state(parsed_state: ParsedStateV4) -> MovementTypedStateV4:
+def build_fs01_movement_state(parsed_state: ParsedStateV4, *, carry_state: MovementTypedStateV4 | None = None) -> MovementTypedStateV4:
     layout = extract_family_layout_from_parsed_state(parsed_state, "fs01")
     bounds = layout["bounds"]
-    avatar = _avatar_position(parsed_state, bounds, layout)
+    try:
+        avatar = _avatar_position(parsed_state, bounds, layout)
+    except ValueError as exc:
+        if "avatar_position" not in str(exc):
+            raise
+        avatar = _avatar_position_from_carry_state(parsed_state, bounds=bounds, family_layout=layout, carry_state=carry_state)
     activated_mask = 0
+    if carry_state is not None:
+        if carry_state.common.game_family != "fs01":
+            raise ValueError("fs01 switch state unavailable: carry state family mismatch")
+        if tuple(sorted(carry_state.family.switch_positions)) != tuple(sorted(layout["switch_positions"])):
+            raise ValueError("fs01 switch state unavailable: carry state switch layout mismatch")
+        activated_mask = int(carry_state.family.activated_switch_bits or 0)
     for index, pos in enumerate(layout["switch_positions"]):
         color = layout["grid"][pos[1]][pos[0]]
-        if color not in {10, 11} and avatar != pos:
-            raise ValueError(f"fs01 switch state unavailable at {pos}: observed color {color}")
         if color == 10 or avatar == pos:
+            activated_mask |= 1 << index
+            continue
+        if color == 11:
+            activated_mask &= ~(1 << index)
+            continue
+        if bool(layout["door_open"]):
+            activated_mask |= 1 << index
+            continue
+        if carry_state is not None and activated_mask & (1 << index):
+            continue
+        activated_mask &= ~(1 << index)
+    if bool(layout["door_open"]):
+        activated_mask = (1 << len(tuple(layout["switch_positions"]))) - 1
+    required_count = len(tuple(layout["switch_positions"]))
+    door_open = activated_mask.bit_count() >= required_count
+    door_positions = () if door_open else tuple(sorted(layout["door_positions"]))
+    blocked = tuple(sorted(tuple(layout["wall_positions"]) + door_positions))
+    traversable = tuple((x, y) for y in range(bounds[1]) for x in range(bounds[0]) if (x, y) not in set(blocked))
+    common = _base_common(parsed_state, "fs01", layout, traversable, blocked, tuple(layout["target_cells"]), (), avatar_position=avatar)
+    family = MovementFamilyFieldsV4(
+        door_positions=door_positions,
+        door_open=door_open,
+        switch_positions=tuple(sorted(layout["switch_positions"])),
+        occupied_switch_bits=0,
+        activated_switch_bits=activated_mask,
+        door_state_bits=1 if door_open else 0,
+        switch_logic_mode="all_latching",
+        switch_group_threshold=required_count,
+    )
+    return MovementTypedStateV4(common=common, family=family, layout_evidence_source=str(layout["layout_evidence_source"]))
+
+
+def build_fs02_movement_state(parsed_state: ParsedStateV4, *, carry_state: MovementTypedStateV4 | None = None) -> MovementTypedStateV4:
+    layout = extract_family_layout_from_parsed_state(parsed_state, "fs02")
+    bounds = layout["bounds"]
+    try:
+        avatar = _avatar_position(parsed_state, bounds, layout)
+    except ValueError as exc:
+        if "avatar_position" not in str(exc):
+            raise
+        avatar = _avatar_position_from_carry_state(parsed_state, bounds=bounds, family_layout=layout, carry_state=carry_state)
+    switch_positions = tuple(sorted(layout["switch_positions"]))
+    occupied_mask = 0
+    activated_mask = 0
+    for index, pos in enumerate(switch_positions):
+        if avatar == pos:
+            occupied_mask |= 1 << index
             activated_mask |= 1 << index
     door_positions = tuple(sorted(layout["door_positions"]))
     blocked = tuple(sorted(tuple(layout["wall_positions"]) + door_positions))
     traversable = tuple((x, y) for y in range(bounds[1]) for x in range(bounds[0]) if (x, y) not in set(blocked))
-    common = _base_common(parsed_state, "fs01", layout, traversable, blocked, tuple(layout["target_cells"]), ())
+    common = _base_common(parsed_state, "fs02", layout, traversable, blocked, tuple(layout["target_cells"]), (), avatar_position=avatar)
     family = MovementFamilyFieldsV4(
         door_positions=door_positions,
         door_open=bool(layout["door_open"]),
-        switch_positions=tuple(sorted(layout["switch_positions"])),
-        activated_switch_bits=activated_mask,
+        switch_positions=switch_positions,
+        occupied_switch_bits=occupied_mask,
+        activated_switch_bits=activated_mask if not bool(layout["door_open"]) else max(activated_mask, 1),
         door_state_bits=1 if bool(layout["door_open"]) else 0,
+        switch_logic_mode=str(layout["switch_logic_mode"]),
+        switch_group_threshold=int(layout["switch_group_threshold"]),
+    )
+    return MovementTypedStateV4(common=common, family=family, layout_evidence_source=str(layout["layout_evidence_source"]))
+
+
+def build_fs03_movement_state(parsed_state: ParsedStateV4, *, carry_state: MovementTypedStateV4 | None = None) -> MovementTypedStateV4:
+    layout = extract_family_layout_from_parsed_state(parsed_state, "fs03")
+    bounds = layout["bounds"]
+    try:
+        avatar = _avatar_position(parsed_state, bounds, layout)
+    except ValueError as exc:
+        if "avatar_position" not in str(exc):
+            raise
+        avatar = _avatar_position_from_carry_state(parsed_state, bounds=bounds, family_layout=layout, carry_state=carry_state)
+    switch_positions = tuple(sorted(layout["switch_positions"]))
+    occupied_mask = 0
+    activated_mask = 0
+    if carry_state is not None:
+        if carry_state.common.game_family != "fs03":
+            raise ValueError("fs03 switch state unavailable: carry state family mismatch")
+        if tuple(sorted(carry_state.family.switch_positions)) != switch_positions:
+            raise ValueError("fs03 switch state unavailable: carry state switch layout mismatch")
+        activated_mask = int(carry_state.family.activated_switch_bits or 0)
+    for index, pos in enumerate(switch_positions):
+        color = layout["grid"][pos[1]][pos[0]]
+        if avatar == pos:
+            occupied_mask |= 1 << index
+        if color == 10 or avatar == pos:
+            activated_mask |= 1 << index
+            continue
+        if color == 11:
+            continue
+        if carry_state is not None and activated_mask & (1 << index):
+            continue
+        if bool(layout["door_open"]):
+            activated_mask |= 1 << index
+            continue
+        if carry_state is None:
+            continue
+    threshold = int(layout["switch_group_threshold"])
+    door_open = activated_mask.bit_count() >= threshold
+    door_positions = () if door_open else tuple(sorted(layout["door_positions"]))
+    blocked = tuple(sorted(tuple(layout["wall_positions"]) + door_positions))
+    traversable = tuple((x, y) for y in range(bounds[1]) for x in range(bounds[0]) if (x, y) not in set(blocked))
+    common = _base_common(parsed_state, "fs03", layout, traversable, blocked, tuple(layout["target_cells"]), (), avatar_position=avatar)
+    family = MovementFamilyFieldsV4(
+        door_positions=door_positions,
+        door_open=door_open,
+        switch_positions=switch_positions,
+        occupied_switch_bits=occupied_mask,
+        activated_switch_bits=activated_mask,
+        door_state_bits=1 if door_open else 0,
+        switch_logic_mode=str(layout["switch_logic_mode"]),
+        switch_group_threshold=threshold,
     )
     return MovementTypedStateV4(common=common, family=family, layout_evidence_source=str(layout["layout_evidence_source"]))
 
@@ -540,7 +987,7 @@ def build_va01_movement_state(parsed_state: ParsedStateV4) -> MovementTypedState
     avatar = _avatar_position(parsed_state, bounds, layout)
     coverage = set(layout["coverage_cells"])
     coverage.add(avatar)
-    common = _base_common(parsed_state, "va01", layout, traversable, blocked, (), ())
+    common = _base_common(parsed_state, "va01", layout, traversable, blocked, (), (), avatar_position=avatar)
     family = MovementFamilyFieldsV4(
         coverage_eligible_cells=tuple(layout["coverage_eligible_cells"]),
         coverage_mask=tuple(sorted(coverage)),
@@ -548,15 +995,177 @@ def build_va01_movement_state(parsed_state: ParsedStateV4) -> MovementTypedState
     return MovementTypedStateV4(common=common, family=family, layout_evidence_source=str(layout["layout_evidence_source"]))
 
 
-def build_pb01_movement_state(parsed_state: ParsedStateV4) -> MovementTypedStateV4:
+def _pb01_or_pb03_predicted_block_from_carry_state(
+    parsed_state: ParsedStateV4,
+    *,
+    family: str,
+    carry_state: MovementTypedStateV4,
+    bounds: GridPos,
+    wall_positions: tuple[GridPos, ...],
+) -> tuple[GridPos, ...]:
+    if carry_state.common.game_family != family:
+        raise ValueError(f"{family} reconstruction requires prior {family} carry state")
+    if len(carry_state.family.pushable_block_positions) != 1:
+        raise ValueError(f"{family} reconstruction requires exactly one carry-state block position")
+    action_id = _last_action_id(parsed_state)
+    if action_id not in _MOVE_DELTAS:
+        raise ValueError(f"{family} reconstruction requires previous legal movement action")
+    delta = _MOVE_DELTAS[action_id]
+    avatar = carry_state.common.avatar_position
+    block_pos = carry_state.family.pushable_block_positions[0]
+    next_pos = (avatar[0] + delta[0], avatar[1] + delta[1])
+    if not (0 <= next_pos[0] < bounds[0] and 0 <= next_pos[1] < bounds[1]):
+        return (block_pos,)
+    if next_pos in set(wall_positions):
+        return (block_pos,)
+    if next_pos != block_pos:
+        return (block_pos,)
+    push_dest = (block_pos[0] + delta[0], block_pos[1] + delta[1])
+    if not (0 <= push_dest[0] < bounds[0] and 0 <= push_dest[1] < bounds[1]):
+        return (block_pos,)
+    if push_dest in set(wall_positions):
+        return (block_pos,)
+    return (push_dest,)
+
+
+def _reconstruct_single_push_block_from_carry_state(
+    parsed_state: ParsedStateV4,
+    *,
+    family: str,
+    bounds: GridPos,
+    wall_positions: tuple[GridPos, ...],
+    target_positions: tuple[GridPos, ...],
+    decoy_positions: tuple[GridPos, ...],
+    carry_state: MovementTypedStateV4 | None,
+    observed_block_positions: tuple[GridPos, ...],
+) -> tuple[GridPos, ...]:
+    visible_blocks = tuple(sorted(set(observed_block_positions)))
+    if len(visible_blocks) == 1:
+        return visible_blocks
+    if carry_state is None:
+        return visible_blocks
+    predicted_blocks = _pb01_or_pb03_predicted_block_from_carry_state(
+        parsed_state,
+        family=family,
+        carry_state=carry_state,
+        bounds=bounds,
+        wall_positions=wall_positions,
+    )
+    predicted_set = set(predicted_blocks)
+    visible_set = set(visible_blocks)
+    if not visible_set.issubset(predicted_set):
+        raise ValueError(f"{family} reconstruction inconsistent: visible block evidence is not contained in predicted carry-state block")
+    if len(predicted_blocks) != 1:
+        raise ValueError(f"{family} reconstruction inconsistent: predicted carry-state block must remain size one")
+    return tuple(sorted(predicted_blocks))
+
+
+def build_pb01_movement_state(parsed_state: ParsedStateV4, *, carry_state: MovementTypedStateV4 | None = None) -> MovementTypedStateV4:
     layout = extract_family_layout_from_parsed_state(parsed_state, "pb01")
     bounds = layout["bounds"]
+    reconstructed_blocks = _reconstruct_single_push_block_from_carry_state(
+        parsed_state,
+        family="pb01",
+        bounds=bounds,
+        wall_positions=tuple(layout["wall_positions"]),
+        target_positions=tuple(layout["target_cells"]),
+        decoy_positions=(),
+        carry_state=carry_state,
+        observed_block_positions=tuple(layout["pushable_block_positions"]),
+    )
+    if not reconstructed_blocks:
+        previous_level_index = None
+        if parsed_state.previous_observation is not None:
+            raw_previous_level_index = parsed_state.previous_observation.raw_payload.get("levels_completed")
+            if isinstance(raw_previous_level_index, int):
+                previous_level_index = raw_previous_level_index
+        level_advanced = (
+            previous_level_index is not None
+            and previous_level_index != parsed_state.current_observation.levels_completed
+        )
+        if carry_state is not None or level_advanced:
+            reconstructed_blocks = _pb_level_start_blocks(
+                parsed_state,
+                expected_count=1,
+                configured_blocks=tuple(layout.get("initial_pushable_block_positions", ())),
+            ) or ()
+        if not reconstructed_blocks:
+            raise ValueError("pushable_block_positions: expected one directly observed or carry-forward block position")
     blocked = tuple(sorted(layout["wall_positions"]))
     traversable = tuple((x, y) for y in range(bounds[1]) for x in range(bounds[0]) if (x, y) not in set(blocked))
     common = _base_common(parsed_state, "pb01", layout, traversable, blocked, tuple(layout["target_cells"]), ())
     family = MovementFamilyFieldsV4(
-        pushable_block_positions=tuple(layout["pushable_block_positions"]),
+        push_variant="single_goal",
+        pushable_block_positions=tuple(sorted(reconstructed_blocks)),
         push_target_cells=tuple(layout["target_cells"]),
+        push_solved_goal_cells=tuple(sorted(pos for pos in tuple(reconstructed_blocks) if pos in set(tuple(layout["target_cells"])))),
         step_limit=int(layout["step_limit"]),
     )
-    return MovementTypedStateV4(common=common, family=family, layout_evidence_source=str(layout["layout_evidence_source"]))
+    evidence_source = "local_memory" if carry_state is not None and len(tuple(layout["pushable_block_positions"])) < 1 else str(layout["layout_evidence_source"])
+    return MovementTypedStateV4(common=common, family=family, layout_evidence_source=evidence_source)
+
+
+def build_pb02_movement_state(parsed_state: ParsedStateV4, *, carry_state: MovementTypedStateV4 | None = None) -> MovementTypedStateV4:
+    layout = extract_family_layout_from_parsed_state(parsed_state, "pb02")
+    bounds = layout["bounds"]
+    reconstructed_blocks = _reconstruct_pb02_blocks_from_carry_state(
+        parsed_state,
+        bounds=bounds,
+        grid=layout["grid"],
+        wall_positions=tuple(layout["wall_positions"]),
+        target_positions=tuple(layout["target_cells"]),
+        carry_state=carry_state,
+    )
+    if len(reconstructed_blocks) < 2:
+        reconstructed_blocks = _pb_level_start_blocks(
+            parsed_state,
+            expected_count=2,
+            configured_blocks=tuple(layout.get("initial_pushable_block_positions", ())),
+        ) or reconstructed_blocks
+    solved_goal_cells = tuple(sorted(pos for pos in reconstructed_blocks if pos in set(tuple(layout["target_cells"]))))
+    blocked = tuple(sorted(layout["wall_positions"]))
+    traversable = tuple((x, y) for y in range(bounds[1]) for x in range(bounds[0]) if (x, y) not in set(blocked))
+    common = _base_common(parsed_state, "pb02", layout, traversable, blocked, tuple(layout["target_cells"]), ())
+    family = MovementFamilyFieldsV4(
+        push_variant=str(layout["push_variant"]),
+        pushable_block_positions=tuple(sorted(reconstructed_blocks)),
+        push_target_cells=tuple(sorted(layout["target_cells"])),
+        push_solved_goal_cells=tuple(sorted(solved_goal_cells)),
+        step_limit=int(layout["step_limit"]),
+    )
+    evidence_source = "local_memory" if carry_state is not None and len(tuple(layout["pushable_block_positions"])) < 2 else str(layout["layout_evidence_source"])
+    return MovementTypedStateV4(common=common, family=family, layout_evidence_source=evidence_source)
+
+
+def build_pb03_movement_state(parsed_state: ParsedStateV4, *, carry_state: MovementTypedStateV4 | None = None) -> MovementTypedStateV4:
+    layout = extract_family_layout_from_parsed_state(parsed_state, "pb03")
+    bounds = layout["bounds"]
+    reconstructed_blocks = _reconstruct_single_push_block_from_carry_state(
+        parsed_state,
+        family="pb03",
+        bounds=bounds,
+        wall_positions=tuple(layout["wall_positions"]),
+        target_positions=tuple(layout["target_cells"]),
+        decoy_positions=tuple(layout["push_decoy_lose_cells"]),
+        carry_state=carry_state,
+        observed_block_positions=tuple(layout["pushable_block_positions"]),
+    )
+    if not reconstructed_blocks:
+        reconstructed_blocks = _pb_level_start_blocks(
+            parsed_state,
+            expected_count=1,
+            configured_blocks=tuple(layout.get("initial_pushable_block_positions", ())),
+        ) or ()
+    blocked = tuple(sorted(layout["wall_positions"]))
+    traversable = tuple((x, y) for y in range(bounds[1]) for x in range(bounds[0]) if (x, y) not in set(blocked))
+    common = _base_common(parsed_state, "pb03", layout, traversable, blocked, tuple(layout["target_cells"]), ())
+    family = MovementFamilyFieldsV4(
+        push_variant=str(layout["push_variant"]),
+        pushable_block_positions=tuple(sorted(reconstructed_blocks)),
+        push_target_cells=tuple(sorted(layout["target_cells"])),
+        push_solved_goal_cells=tuple(sorted(pos for pos in tuple(reconstructed_blocks) if pos in set(tuple(layout["target_cells"])))),
+        push_decoy_lose_cells=tuple(sorted(layout["push_decoy_lose_cells"])),
+        step_limit=int(layout["step_limit"]),
+    )
+    evidence_source = "local_memory" if carry_state is not None and len(tuple(layout["pushable_block_positions"])) < 1 else str(layout["layout_evidence_source"])
+    return MovementTypedStateV4(common=common, family=family, layout_evidence_source=evidence_source)

@@ -1,0 +1,15 @@
+from __future__ import annotations
+
+from enum import Enum
+
+
+class Stage(str, Enum):
+    BOOTSTRAP = "BOOTSTRAP"
+    DISCOVERY = "DISCOVERY"
+    HYPOTHESIS = "HYPOTHESIS"
+    PLANNING = "PLANNING"
+    EXECUTION = "EXECUTION"
+    OUTCOME = "OUTCOME"
+    LEVEL_OPTIMIZATION = "LEVEL_OPTIMIZATION"
+    GAME_OPTIMIZATION = "GAME_OPTIMIZATION"
+    STOP = "STOP"

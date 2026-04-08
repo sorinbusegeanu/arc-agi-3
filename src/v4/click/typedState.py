@@ -78,6 +78,7 @@ class ClickCommonFieldsV4:
 
 @dataclass(frozen=True)
 class ClickFamilyFieldsV4:
+    pt01_phase: str = ""
     rotation_tiles: tuple[TypedTile, ...] = ()
     target_rotations_by_type: tuple[tuple[str, int], ...] = ()
     reflection_axis_x: int | None = None
@@ -99,6 +100,8 @@ class ClickFamilyFieldsV4:
     slot_geometry: tuple[int, int, int, int] | None = None
 
     def __post_init__(self) -> None:
+        if self.pt01_phase and self.pt01_phase not in {"pt01_active_board", "pt01_transition_frame", "pt01_new_level_board"}:
+            raise ValueError("pt01_phase: unsupported value")
         if not isinstance(self.rotation_tiles, tuple):
             raise ValueError("rotation_tiles: must be a tuple")
         for index, tile in enumerate(self.rotation_tiles):
@@ -206,4 +209,8 @@ class ClickTypedStateV4:
         )
 
     def to_key(self) -> str:
-        return json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
+        payload = self.to_dict()
+        common = payload.get("common", {})
+        if isinstance(common, dict):
+            common.pop("step_depth", None)
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"))

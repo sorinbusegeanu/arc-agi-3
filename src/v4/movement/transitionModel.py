@@ -38,7 +38,7 @@ def _terminal_for(state: MovementTypedStateV4) -> str:
         if not state.family.key_positions and not state.family.door_positions:
             return "success"
         return "non_terminal"
-    if family == "fs01":
+    if family in {"fs01", "fs02", "fs03"}:
         if state.family.door_open and state.common.avatar_position in state.common.target_cells:
             return "success"
         return "non_terminal"
@@ -46,10 +46,14 @@ def _terminal_for(state: MovementTypedStateV4) -> str:
         return "success" if state.common.avatar_position in state.common.target_cells else "non_terminal"
     if family == "va01":
         return "success" if set(state.family.coverage_mask) >= set(state.family.coverage_eligible_cells) else "non_terminal"
-    if family == "pb01":
+    if family in {"pb01", "pb02", "pb03"}:
         target_cells = state.family.push_target_cells or state.common.target_cells
-        if any(pos in target_cells for pos in state.family.pushable_block_positions):
+        if family == "pb02" and set(state.family.pushable_block_positions) >= set(target_cells):
             return "success"
+        if family in {"pb01", "pb03"} and any(pos in target_cells for pos in state.family.pushable_block_positions):
+            return "success"
+        if family == "pb03" and any(pos in state.family.push_decoy_lose_cells for pos in state.family.pushable_block_positions):
+            return "failure"
         if state.family.step_limit is not None and state.common.step_depth >= state.family.step_limit:
             return "failure"
         return "non_terminal"
@@ -67,16 +71,16 @@ class MovementTransitionModelV4:
         family = state.common.game_family
         if family == "ul01":
             successor, annotation = self._apply_ul01(state, action_id)
-        elif family == "fs01":
-            successor, annotation = self._apply_fs01(state, action_id)
+        elif family in {"fs01", "fs02", "fs03"}:
+            successor, annotation = self._apply_floor_switch(state, action_id)
         elif family == "tp01":
             successor, annotation = self._apply_tp01(state, action_id)
         elif family == "ic01":
             successor, annotation = self._apply_ic01(state, action_id)
         elif family == "va01":
             successor, annotation = self._apply_va01(state, action_id)
-        elif family == "pb01":
-            successor, annotation = self._apply_pb01(state, action_id)
+        elif family in {"pb01", "pb02", "pb03"}:
+            successor, annotation = self._apply_push_block(state, action_id)
         else:
             raise ValueError(f"unsupported movement family: {family}")
         successor = replace(successor, common=replace(successor.common, terminal_status=_terminal_for(successor)))
@@ -115,7 +119,7 @@ class MovementTransitionModelV4:
         )
         return successor, MovementTransitionAnnotationV4(action_id, True, False, event)
 
-    def _apply_fs01(self, state: MovementTypedStateV4, action_id: int) -> tuple[MovementTypedStateV4, MovementTransitionAnnotationV4]:
+    def _apply_floor_switch(self, state: MovementTypedStateV4, action_id: int) -> tuple[MovementTypedStateV4, MovementTransitionAnnotationV4]:
         delta = _DIRECTIONS[action_id]
         next_pos = _add(state.common.avatar_position, delta)
         if not _in_bounds(next_pos, state.common.static_bounds):
@@ -126,7 +130,7 @@ class MovementTransitionModelV4:
             return replace(state, common=self._advance_common(state)), MovementTransitionAnnotationV4(action_id, False, True, "wall")
         if next_pos in closed_doors:
             return replace(state, common=self._advance_common(state)), MovementTransitionAnnotationV4(action_id, False, True, "closed_door")
-        activated_mask, door_state_bits, door_positions, event = self.apply_fs01_switch_and_door_update(state, action_id, next_pos)
+        occupied_mask, activated_mask, door_state_bits, door_positions, event = self.apply_floor_switch_update(state, action_id, next_pos)
         door_open = bool(door_state_bits)
         blocked_cells = tuple(sorted(tuple(static_blockers) + door_positions))
         traversable = tuple((x, y) for y in range(state.common.static_bounds[1]) for x in range(state.common.static_bounds[0]) if (x, y) not in blocked_cells)
@@ -134,6 +138,7 @@ class MovementTransitionModelV4:
             common=replace(self._advance_common(state, avatar_position=next_pos), blocked_cells=blocked_cells, traversable_cells=traversable),
             family=replace(
                 state.family,
+                occupied_switch_bits=occupied_mask,
                 activated_switch_bits=activated_mask,
                 door_positions=door_positions,
                 door_open=door_open,
@@ -142,6 +147,21 @@ class MovementTransitionModelV4:
             layout_evidence_source=state.layout_evidence_source,
         )
         return successor, MovementTransitionAnnotationV4(action_id, True, False, event)
+
+    def apply_floor_switch_update(
+        self,
+        state: MovementTypedStateV4,
+        action_id: int,
+        next_pos: GridPos,
+    ) -> tuple[int, int | None, int, tuple[GridPos, ...], str]:
+        if state.common.game_family == "fs01":
+            activated_mask, door_state_bits, door_positions, event = self.apply_fs01_switch_and_door_update(state, action_id, next_pos)
+            return 0, activated_mask, door_state_bits, door_positions, event
+        if state.common.game_family == "fs02":
+            return self.apply_fs02_switch_and_door_update(state, action_id, next_pos)
+        if state.common.game_family == "fs03":
+            return self.apply_fs03_switch_and_door_update(state, action_id, next_pos)
+        raise ValueError(f"unsupported floor-switch family: {state.common.game_family}")
 
     def apply_fs01_switch_and_door_update(
         self,
@@ -173,6 +193,57 @@ class MovementTransitionModelV4:
                 door_state_bits = 1
         door_positions = () if door_state_bits == 1 else tuple(state.family.door_positions)
         return activated_mask, door_state_bits, door_positions, event
+
+    def apply_fs02_switch_and_door_update(
+        self,
+        state: MovementTypedStateV4,
+        action_id: int,
+        next_pos: GridPos,
+    ) -> tuple[int, int, int, tuple[GridPos, ...], str]:
+        del action_id
+        if not state.family.switch_positions:
+            raise ValueError("fs02 transition requires explicit switch_positions")
+        if state.family.occupied_switch_bits is None:
+            raise ValueError("fs02 transition requires explicit occupied_switch_bits")
+        occupied_mask = 0
+        event = "move"
+        for index, pos in enumerate(state.family.switch_positions):
+            if pos == next_pos:
+                occupied_mask |= 1 << index
+                event = "activate_switch"
+                break
+        door_state_bits = 1 if (state.family.door_state_bits == 1 or occupied_mask != 0) else 0
+        activated_mask = 1 if door_state_bits == 1 else 0
+        door_positions = () if door_state_bits == 1 else tuple(state.family.door_positions)
+        return occupied_mask, activated_mask, door_state_bits, door_positions, event
+
+    def apply_fs03_switch_and_door_update(
+        self,
+        state: MovementTypedStateV4,
+        action_id: int,
+        next_pos: GridPos,
+    ) -> tuple[int, int, int, tuple[GridPos, ...], str]:
+        del action_id
+        if not state.family.switch_positions:
+            raise ValueError("fs03 transition requires explicit switch_positions")
+        if state.family.activated_switch_bits is None:
+            raise ValueError("fs03 transition requires explicit activated_switch_bits")
+        if state.family.switch_group_threshold is None:
+            raise ValueError("fs03 transition requires explicit switch_group_threshold")
+        occupied_mask = 0
+        activated_mask = int(state.family.activated_switch_bits)
+        event = "move"
+        for index, pos in enumerate(state.family.switch_positions):
+            if pos == next_pos:
+                occupied_mask |= 1 << index
+                already_active = bool(activated_mask & (1 << index))
+                activated_mask |= 1 << index
+                event = "move" if already_active else "activate_switch"
+                break
+        required = int(state.family.switch_group_threshold)
+        door_state_bits = 1 if state.family.door_state_bits == 1 or activated_mask.bit_count() >= required else 0
+        door_positions = () if door_state_bits == 1 else tuple(state.family.door_positions)
+        return occupied_mask, activated_mask, door_state_bits, door_positions, event
 
     def _apply_tp01(self, state: MovementTypedStateV4, action_id: int) -> tuple[MovementTypedStateV4, MovementTransitionAnnotationV4]:
         delta = _DIRECTIONS[action_id]
@@ -263,25 +334,44 @@ class MovementTransitionModelV4:
         covered.add(next_pos)
         return tuple(sorted(covered)), event
 
-    def _apply_pb01(self, state: MovementTypedStateV4, action_id: int) -> tuple[MovementTypedStateV4, MovementTransitionAnnotationV4]:
+    def _apply_push_block(self, state: MovementTypedStateV4, action_id: int) -> tuple[MovementTypedStateV4, MovementTransitionAnnotationV4]:
         delta = _DIRECTIONS[action_id]
         next_pos = _add(state.common.avatar_position, delta)
         if not _in_bounds(next_pos, state.common.static_bounds):
             return replace(state, common=self._advance_common(state)), MovementTransitionAnnotationV4(action_id, False, True, "out_of_bounds")
         if next_pos in state.common.blocked_cells:
             return replace(state, common=self._advance_common(state)), MovementTransitionAnnotationV4(action_id, False, True, "wall")
-        avatar_position, push_positions, moved, blocked, event = self.apply_pb01_push_update(state, action_id, next_pos)
+        avatar_position, push_positions, moved, blocked, event, terminal_status = self.apply_push_update(state, action_id, next_pos)
         successor = MovementTypedStateV4(
             common=self._advance_common(state, avatar_position=avatar_position),
             family=replace(
                 state.family,
-                pushable_block_positions=push_positions,
+                pushable_block_positions=tuple(sorted(push_positions)),
                 push_target_cells=state.family.push_target_cells,
+                push_solved_goal_cells=tuple(sorted(pos for pos in push_positions if pos in set(state.family.push_target_cells))),
+                push_decoy_lose_cells=state.family.push_decoy_lose_cells,
                 step_limit=state.family.step_limit,
             ),
             layout_evidence_source=state.layout_evidence_source,
         )
+        if terminal_status is not None:
+            successor = replace(successor, common=replace(successor.common, terminal_status=terminal_status))
         return successor, MovementTransitionAnnotationV4(action_id, moved, blocked, event)
+
+    def apply_push_update(
+        self,
+        state: MovementTypedStateV4,
+        action_id: int,
+        next_pos: GridPos,
+    ) -> tuple[GridPos, tuple[GridPos, ...], bool, bool, str, str | None]:
+        if state.common.game_family == "pb01":
+            avatar_position, push_positions, moved, blocked, event = self.apply_pb01_push_update(state, action_id, next_pos)
+            return avatar_position, push_positions, moved, blocked, event, None
+        if state.common.game_family == "pb02":
+            return self.apply_pb02_push_update(state, action_id, next_pos)
+        if state.common.game_family == "pb03":
+            return self.apply_pb03_push_update(state, action_id, next_pos)
+        raise ValueError(f"unsupported push family: {state.common.game_family}")
 
     def apply_pb01_push_update(
         self,
@@ -304,3 +394,50 @@ class MovementTransitionModelV4:
         if push_dest in state.common.blocked_cells or push_dest in state.family.pushable_block_positions:
             return state.common.avatar_position, state.family.pushable_block_positions, False, True, "push_blocked"
         return next_pos, (push_dest,), True, False, "push"
+
+    def apply_pb02_push_update(
+        self,
+        state: MovementTypedStateV4,
+        action_id: int,
+        next_pos: GridPos,
+    ) -> tuple[GridPos, tuple[GridPos, ...], bool, bool, str, str | None]:
+        del action_id
+        if len(state.family.pushable_block_positions) != 2:
+            raise ValueError("pb02 transition requires exactly two pushable block positions")
+        block_positions = set(state.family.pushable_block_positions)
+        if next_pos not in block_positions:
+            return next_pos, tuple(sorted(block_positions)), True, False, "move", None
+        delta = (next_pos[0] - state.common.avatar_position[0], next_pos[1] - state.common.avatar_position[1])
+        push_dest = _add(next_pos, delta)
+        if not _in_bounds(push_dest, state.common.static_bounds):
+            return state.common.avatar_position, tuple(sorted(block_positions)), False, True, "push_out_of_bounds", None
+        if push_dest in state.common.blocked_cells:
+            return state.common.avatar_position, tuple(sorted(block_positions)), False, True, "push_blocked", None
+        if push_dest in block_positions:
+            return state.common.avatar_position, tuple(sorted(block_positions)), False, True, "push_blocked", None
+        next_blocks = set(block_positions)
+        next_blocks.remove(next_pos)
+        next_blocks.add(push_dest)
+        return next_pos, tuple(sorted(next_blocks)), True, False, "push", None
+
+    def apply_pb03_push_update(
+        self,
+        state: MovementTypedStateV4,
+        action_id: int,
+        next_pos: GridPos,
+    ) -> tuple[GridPos, tuple[GridPos, ...], bool, bool, str, str | None]:
+        del action_id
+        if len(state.family.pushable_block_positions) != 1:
+            raise ValueError("pb03 transition requires exactly one pushable block position")
+        block_pos = state.family.pushable_block_positions[0]
+        if next_pos != block_pos:
+            return next_pos, (block_pos,), True, False, "move", None
+        delta = (next_pos[0] - state.common.avatar_position[0], next_pos[1] - state.common.avatar_position[1])
+        push_dest = _add(block_pos, delta)
+        if not _in_bounds(push_dest, state.common.static_bounds):
+            return state.common.avatar_position, (block_pos,), False, True, "push_out_of_bounds", None
+        if push_dest in state.common.blocked_cells or push_dest in state.family.pushable_block_positions:
+            return state.common.avatar_position, (block_pos,), False, True, "push_blocked", None
+        if push_dest in state.family.push_decoy_lose_cells:
+            return state.common.avatar_position, (push_dest,), True, False, "push_decoy_loss", "failure"
+        return next_pos, (push_dest,), True, False, "push", None

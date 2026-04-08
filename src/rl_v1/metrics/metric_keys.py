@@ -1,0 +1,5 @@
+GAME_WIN_RATE = "game_win_rate"
+LEVEL_COMPLETION_RATE = "level_completion_rate"
+MEAN_LEVELS_REACHED = "mean_levels_reached"
+MEAN_STEPS_PER_COMPLETED_LEVEL = "mean_steps_per_completed_level"
+TRAINING_LOSS = "training_loss"

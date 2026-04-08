@@ -38,6 +38,110 @@ def _load_level(parsed_state: ParsedStateV4, family: str):
     raise ValueError(f"{family} config unavailable: invalid level index {level_index}")
 
 
+def _wm01_level_lookup(parsed_state: ParsedStateV4):
+    module = _load_game_module(parsed_state, "wm01")
+    levels = getattr(module, "levels", None)
+    if not isinstance(levels, list):
+        raise ValueError("wm01 config unavailable: level list missing")
+    current_level_index = _authoritative_level_index(parsed_state)
+    if 0 <= current_level_index < len(levels):
+        return module, levels[current_level_index], current_level_index, False
+    if len(levels) > 0 and current_level_index == len(levels):
+        selected_index = len(levels) - 1
+        return module, levels[selected_index], selected_index, True
+    previous_level_index = _previous_level_index(parsed_state)
+    if previous_level_index is not None and 0 <= previous_level_index < len(levels):
+        exc = ValueError(
+            f"wm01 config unavailable: current_level_index={current_level_index};selected_config_index={previous_level_index};"
+            "fallback_to_prior_config_attempted=yes"
+        )
+        setattr(exc, "missing_field", "wm01_level_index")
+        setattr(exc, "selected_config_index", str(previous_level_index))
+        setattr(exc, "wm01_current_level_index", str(current_level_index))
+        setattr(exc, "wm01_fallback_to_prior_config_attempted", True)
+        module._wm01_fallback_notice = exc
+        return module, levels[previous_level_index], previous_level_index, True
+    exc = ValueError(
+        f"wm01 config unavailable: current_level_index={current_level_index};selected_config_index=;"
+        "fallback_to_prior_config_attempted=no"
+    )
+    setattr(exc, "missing_field", "wm01_level_index")
+    setattr(exc, "selected_config_index", "")
+    setattr(exc, "wm01_current_level_index", str(current_level_index))
+    setattr(exc, "wm01_fallback_to_prior_config_attempted", False)
+    raise exc
+
+
+def _authoritative_level_index(parsed_state: ParsedStateV4) -> int:
+    level_index = int(parsed_state.current_observation.levels_completed)
+    authoritative_state = getattr(parsed_state, "authoritative_state", None)
+    authoritative_level = getattr(authoritative_state, "levels_completed", None)
+    if isinstance(authoritative_level, int) and authoritative_level >= level_index:
+        return authoritative_level
+    if isinstance(authoritative_state, dict):
+        raw_level = authoritative_state.get("levels_completed")
+        if isinstance(raw_level, int) and raw_level >= level_index:
+            return raw_level
+    return level_index
+
+
+def _level_advanced_this_step(parsed_state: ParsedStateV4) -> bool:
+    derived_control = getattr(parsed_state, "derived_control", None)
+    delta = getattr(derived_control, "levels_completed_delta", None)
+    if isinstance(delta, int) and delta > 0:
+        return True
+    if isinstance(derived_control, dict):
+        raw_delta = derived_control.get("levels_completed_delta")
+        if isinstance(raw_delta, int) and raw_delta > 0:
+            return True
+    previous_observation = getattr(parsed_state, "previous_observation", None)
+    if previous_observation is None:
+        return False
+    previous_level = getattr(previous_observation, "levels_completed", None)
+    if previous_level is None and hasattr(previous_observation, "raw_payload"):
+        raw_previous_level = previous_observation.raw_payload.get("levels_completed")
+        if isinstance(raw_previous_level, int):
+            previous_level = raw_previous_level
+    current_level = int(parsed_state.current_observation.levels_completed)
+    return isinstance(previous_level, int) and current_level > previous_level
+
+
+def _previous_level_index(parsed_state: ParsedStateV4) -> int | None:
+    previous_observation = getattr(parsed_state, "previous_observation", None)
+    if previous_observation is None:
+        return None
+    previous_level = getattr(previous_observation, "levels_completed", None)
+    if isinstance(previous_level, int):
+        return previous_level
+    if hasattr(previous_observation, "raw_payload"):
+        raw_previous_level = previous_observation.raw_payload.get("levels_completed")
+        if isinstance(raw_previous_level, int):
+            return raw_previous_level
+    return None
+
+
+def detect_pt01_phase(parsed_state: ParsedStateV4, *, cached_level_index: int | None = None) -> dict[str, object]:
+    current_level_index = int(parsed_state.current_observation.levels_completed)
+    authoritative_level_index = _authoritative_level_index(parsed_state)
+    previous_level_index = _previous_level_index(parsed_state)
+    level_advanced = _level_advanced_this_step(parsed_state)
+    transition_frame = authoritative_level_index != current_level_index
+    if transition_frame:
+        phase = "pt01_transition_frame"
+    elif level_advanced and previous_level_index is not None and authoritative_level_index != previous_level_index:
+        phase = "pt01_new_level_board"
+    else:
+        phase = "pt01_active_board"
+    cache_invalidated = cached_level_index is not None and cached_level_index != authoritative_level_index
+    return {
+        "phase": phase,
+        "current_level_index": authoritative_level_index,
+        "cached_level_index": cached_level_index,
+        "transition_frame_detected": transition_frame,
+        "cache_invalidated": cache_invalidated,
+    }
+
+
 def _sample_grid(parsed_state: ParsedStateV4, bounds: GridPos) -> tuple[tuple[int, ...], ...]:
     plane = parsed_state.current_observation.frame[0]
     pixel_h = len(plane)
@@ -85,13 +189,46 @@ def _grid_to_payload(bounds: GridPos, gx: int, gy: int) -> GridPos:
     return gx * scale + scale // 2 + x_pad, gy * scale + scale // 2 + y_pad
 
 
-def _build_common(parsed_state: ParsedStateV4, family: str, bounds: GridPos, clickable_cells: tuple[GridPos, ...]) -> ClickCommonFieldsV4:
+def build_pt01_transition_payload(parsed_state: ParsedStateV4) -> dict[str, object]:
+    module = _load_game_module(parsed_state, "pt01")
+    levels = getattr(module, "levels", None)
+    if not isinstance(levels, list):
+        raise ValueError("pt01 transition unavailable: module does not expose level list")
+    level_index = _authoritative_level_index(parsed_state)
+    if not (0 <= level_index < len(levels)):
+        raise ValueError(f"pt01 transition unavailable: invalid authoritative level index {level_index}")
+    level = levels[level_index]
+    bounds = tuple(level.grid_size)
+    sprites = getattr(level, "_sprites", None) or getattr(level, "sprites", None)
+    if not isinstance(sprites, list):
+        raise ValueError("pt01 transition unavailable: level sprites unavailable")
+    clickable_cells: list[GridPos] = []
+    for sprite in sprites:
+        tags = tuple(getattr(sprite, "tags", ()))
+        if "rotatable" not in tags:
+            continue
+        clickable_cells.append(_grid_to_payload(bounds, int(sprite.x) + 1, int(sprite.y) + 1))
+    if not clickable_cells:
+        raise ValueError("pt01 transition unavailable: no clickable cells on authoritative level")
+    payload = clickable_cells[0]
+    return {"x": payload[0], "y": payload[1], "game_id": parsed_state.current_observation.game_id}
+
+
+def _build_common(
+    parsed_state: ParsedStateV4,
+    family: str,
+    bounds: GridPos,
+    clickable_cells: tuple[GridPos, ...],
+    *,
+    level_index: int | None = None,
+    preserve_click_order: bool = False,
+) -> ClickCommonFieldsV4:
     return ClickCommonFieldsV4(
         game_family=family,
         game_id=parsed_state.current_observation.game_id,
-        level_index=parsed_state.current_observation.levels_completed,
+        level_index=int(parsed_state.current_observation.levels_completed if level_index is None else level_index),
         static_bounds=bounds,
-        clickable_cells=tuple(sorted(clickable_cells)),
+        clickable_cells=tuple(clickable_cells if preserve_click_order else sorted(clickable_cells)),
         legal_action_ids=tuple(int(action_id) for action_id in parsed_state.available_actions),
         terminal_status=parsed_state.terminal_signal.status,
         step_depth=parsed_state.step_index,
@@ -99,11 +236,81 @@ def _build_common(parsed_state: ParsedStateV4, family: str, bounds: GridPos, cli
     )
 
 
+def _best_rotation_match(module, sprite_type: str, patch: tuple[tuple[int, ...], ...]) -> int | None:
+    best_rotation: int | None = None
+    best_distance: int | None = None
+    tied = False
+    for candidate_rotation in (0, 90, 180, 270):
+        candidate = module.create_rotatable(sprite_type, candidate_rotation, 0, 0)
+        candidate_pixels = tuple(tuple(int(value) for value in row) for row in candidate.pixels)
+        distance = sum(
+            1
+            for row_index, row in enumerate(candidate_pixels)
+            for col_index, value in enumerate(row)
+            if patch[row_index][col_index] != value
+        )
+        if best_distance is None or distance < best_distance:
+            best_rotation = candidate_rotation
+            best_distance = distance
+            tied = False
+        elif distance == best_distance:
+            tied = True
+    if best_distance is None or tied or best_distance > 4:
+        return None
+    return best_rotation
+
+
 def build_pt01_click_state(parsed_state: ParsedStateV4) -> ClickTypedStateV4:
-    module, level = _load_level(parsed_state, "pt01")
+    module = _load_game_module(parsed_state, "pt01")
+    levels = getattr(module, "levels", None)
+    if not isinstance(levels, list):
+        raise ValueError("pt01 config unavailable: module does not expose level list")
+    resolved_level_index = _authoritative_level_index(parsed_state)
+    if not (0 <= resolved_level_index < len(levels)):
+        raise ValueError(f"pt01 config unavailable: invalid authoritative level index {resolved_level_index}")
+    level = levels[resolved_level_index]
     bounds = tuple(level.grid_size)
     if bounds != (64, 64):
         raise ValueError("pt01 config unavailable: expected a 64x64 click grid")
+    current_level_index = int(parsed_state.current_observation.levels_completed)
+    phase_info = detect_pt01_phase(parsed_state)
+    phase = str(phase_info["phase"])
+    if phase == "pt01_transition_frame":
+        raise ValueError("pt01 transition frame: awaiting stable new-level board")
+    if phase == "pt01_new_level_board":
+        rotation_tiles = []
+        clickable_cells = []
+        sprites = getattr(level, "_sprites", None) or getattr(level, "sprites", None)
+        if not isinstance(sprites, list):
+            raise ValueError("pt01 config unavailable: level sprites unavailable")
+        for sprite in sprites:
+            tags = tuple(getattr(sprite, "tags", ()))
+            if "rotatable" not in tags:
+                continue
+            sprite_type = next((tag[5:] for tag in tags if tag.startswith("type_")), None)
+            rotation_tag = next((tag for tag in tags if tag.startswith("rot_")), None)
+            if sprite_type is None or rotation_tag not in ROTATION_BY_TAG:
+                raise ValueError("pt01 config unavailable: rotatable tile missing stable type/rotation tag")
+            x = int(sprite.x)
+            y = int(sprite.y)
+            rotation_tiles.append(((x, y), sprite_type, int(ROTATION_BY_TAG[rotation_tag])))
+            clickable_cells.append(_grid_to_payload(bounds, x + 1, y + 1))
+        target_pattern = level.get_data("target_pattern")
+        rotations_by_color = target_pattern["rotations_by_color"]
+        target_by_type = []
+        for color, rotation in sorted(rotations_by_color.items()):
+            sprite_type = module.COLOR_TO_TYPE.get(int(color))
+            if sprite_type is None:
+                raise ValueError(f"pt01 config unavailable: unmapped target color {color}")
+            target_by_type.append((sprite_type, int(rotation)))
+        return ClickTypedStateV4(
+            common=_build_common(parsed_state, "pt01", bounds, tuple(clickable_cells), level_index=resolved_level_index),
+            family=ClickFamilyFieldsV4(
+                pt01_phase=phase,
+                rotation_tiles=tuple(rotation_tiles),
+                target_rotations_by_type=tuple(target_by_type),
+            ),
+        )
     visual_grid = _sample_grid(parsed_state, bounds)
     previous_visual_grid = None
     if parsed_state.previous_observation is not None:
@@ -130,22 +337,10 @@ def build_pt01_click_state(parsed_state: ParsedStateV4) -> ClickTypedStateV4:
         x = int(sprite.x)
         y = int(sprite.y)
         patch = tuple(tuple(visual_grid[y + dy][x + dx] for dx in range(3)) for dy in range(3))
-        matched_rotation = None
-        for candidate_rotation in (0, 90, 180, 270):
-            candidate = module.create_rotatable(sprite_type, candidate_rotation, 0, 0)
-            candidate_pixels = tuple(tuple(int(value) for value in row) for row in candidate.pixels)
-            if candidate_pixels == patch:
-                matched_rotation = candidate_rotation
-                break
+        matched_rotation = _best_rotation_match(module, sprite_type, patch)
         if matched_rotation is None and previous_visual_grid is not None:
             previous_patch = tuple(tuple(previous_visual_grid[y + dy][x + dx] for dx in range(3)) for dy in range(3))
-            previous_rotation = None
-            for candidate_rotation in (0, 90, 180, 270):
-                candidate = module.create_rotatable(sprite_type, candidate_rotation, 0, 0)
-                candidate_pixels = tuple(tuple(int(value) for value in row) for row in candidate.pixels)
-                if candidate_pixels == previous_patch:
-                    previous_rotation = candidate_rotation
-                    break
+            previous_rotation = _best_rotation_match(module, sprite_type, previous_patch)
             if previous_rotation is not None and last_click is not None and x <= last_click[0] < x + 3 and y <= last_click[1] < y + 3:
                 matched_rotation = (previous_rotation + 90) % 360
             elif previous_rotation is not None:
@@ -165,8 +360,9 @@ def build_pt01_click_state(parsed_state: ParsedStateV4) -> ClickTypedStateV4:
             raise ValueError(f"pt01 config unavailable: unmapped target color {color}")
         target_by_type.append((sprite_type, int(rotation)))
     return ClickTypedStateV4(
-        common=_build_common(parsed_state, "pt01", bounds, tuple(clickable_cells)),
+        common=_build_common(parsed_state, "pt01", bounds, tuple(clickable_cells), level_index=resolved_level_index),
         family=ClickFamilyFieldsV4(
+            pt01_phase=phase,
             rotation_tiles=tuple(rotation_tiles),
             target_rotations_by_type=tuple(target_by_type),
         ),
@@ -309,7 +505,8 @@ def _detect_active_moles(visual_grid: tuple[tuple[int, ...], ...], hole_position
 
 
 def build_wm01_click_state(parsed_state: ParsedStateV4) -> ClickTypedStateV4:
-    _, level = _load_level(parsed_state, "wm01")
+    module, level, resolved_level_index, used_prior_level = _wm01_level_lookup(parsed_state)
+    del module, used_prior_level
     bounds = tuple(level.grid_size)
     sprites = getattr(level, "_sprites", None) or getattr(level, "sprites", None)
     if not isinstance(sprites, list):
@@ -317,9 +514,19 @@ def build_wm01_click_state(parsed_state: ParsedStateV4) -> ClickTypedStateV4:
     hole_positions = tuple(sorted((int(sprite.x), int(sprite.y)) for sprite in sprites if "hole" in getattr(sprite, "tags", ())))
     visual_grid = _sample_grid(parsed_state, bounds)
     active_moles = _detect_active_moles(visual_grid, hole_positions)
-    clickable = tuple(_grid_to_payload(bounds, x + 2, y + 2) for x, y in (active_moles or hole_positions))
+    ordered_holes = tuple(
+        sorted(
+            hole_positions,
+            key=lambda pos: (
+                0 if pos in active_moles else 1,
+                pos[1],
+                pos[0],
+            ),
+        )
+    )
+    clickable = tuple(_grid_to_payload(bounds, x + 2, y + 2) for x, y in ordered_holes)
     return ClickTypedStateV4(
-        common=_build_common(parsed_state, "wm01", bounds, clickable),
+        common=_build_common(parsed_state, "wm01", bounds, clickable, level_index=resolved_level_index, preserve_click_order=True),
         family=ClickFamilyFieldsV4(
             active_mole_cells=active_moles,
             mole_click_radius=2,

@@ -9,7 +9,11 @@ from v4.agentContract.errors import V4ValidationError
 from v4.agentContract.extract import extract_v4_authoritative_state
 from v4.agentContract.types import V4Observation
 from v4.agentContract.validators import derive_terminal_signal, validate_v4_observation
+from v4.belief.beliefState import BeliefStateV4
+from v4.composition.domainState import ComposedDomainStateV4
+from v4.hypothesis.hypothesisRegistry import HypothesisStateV4
 from v4.memory.localMemory import LocalMemoryStateV4
+from v4.temporal.resourceState import TemporalResourceStateV4
 
 from .parsedState import (
     ChangedRegionSummaryV4,
@@ -70,6 +74,10 @@ class StateParserV4:
         previous_observation: V4Observation | None,
         environment_metadata: V4EnvironmentMetadata | None,
         local_memory_snapshot: LocalMemoryStateV4 | None,
+        belief_snapshot: BeliefStateV4 | None = None,
+        hypothesis_snapshot: HypothesisStateV4 | None = None,
+        temporal_snapshot: TemporalResourceStateV4 | None = None,
+        composition_snapshot: ComposedDomainStateV4 | None = None,
         step_index: int,
     ) -> ParsedStateV4:
         try:
@@ -88,14 +96,37 @@ class StateParserV4:
         revealed_count = 0
         unknown_count = 0
         memory_reference = None
+        belief_reference = None
+        hypothesis_reference = None
+        temporal_reference = None
+        composition_reference = None
+        if belief_snapshot is not None:
+            if not isinstance(belief_snapshot, BeliefStateV4):
+                raise V4ValidationError("belief_snapshot must be BeliefStateV4", source_field="belief_snapshot")
+            revealed_count = len(belief_snapshot.observed_cells)
+            unknown_count = len(belief_snapshot.unknown_cells)
+            belief_reference = belief_snapshot.snapshot_reference()
+        if hypothesis_snapshot is not None:
+            if not isinstance(hypothesis_snapshot, HypothesisStateV4):
+                raise V4ValidationError("hypothesis_snapshot must be HypothesisStateV4", source_field="hypothesis_snapshot")
+            hypothesis_reference = hypothesis_snapshot.snapshot_reference()
+        if temporal_snapshot is not None:
+            if not isinstance(temporal_snapshot, TemporalResourceStateV4):
+                raise V4ValidationError("temporal_snapshot must be TemporalResourceStateV4", source_field="temporal_snapshot")
+            temporal_reference = temporal_snapshot.snapshot_reference()
+        if composition_snapshot is not None:
+            if not isinstance(composition_snapshot, ComposedDomainStateV4):
+                raise V4ValidationError("composition_snapshot must be ComposedDomainStateV4", source_field="composition_snapshot")
+            composition_reference = composition_snapshot.snapshot_reference()
         if local_memory_snapshot is not None:
             if not isinstance(local_memory_snapshot, LocalMemoryStateV4):
                 raise V4ValidationError("local_memory_snapshot must be LocalMemoryStateV4", source_field="local_memory_snapshot")
             visited_before = current_hash in set(local_memory_snapshot.visited_state_hashes)
             retry_counts = dict(local_memory_snapshot.retry_counts)
             cooldown_keys = tuple(sorted(local_memory_snapshot.cooldown_markers))
-            revealed_count = len(local_memory_snapshot.revealed_cells)
-            unknown_count = len(local_memory_snapshot.unknown_cells)
+            if belief_snapshot is None:
+                revealed_count = len(local_memory_snapshot.revealed_cells)
+                unknown_count = len(local_memory_snapshot.unknown_cells)
             memory_reference = MemorySnapshotReferenceV4(
                 revision=local_memory_snapshot.revision,
                 recent_transition_count=len(local_memory_snapshot.recent_transition_refs),
@@ -131,5 +162,9 @@ class StateParserV4:
             available_actions=current_observation.available_actions,
             terminal_signal=terminal_signal,
             memory_reference=memory_reference,
+            belief_reference=belief_reference,
+            hypothesis_reference=hypothesis_reference,
+            temporal_reference=temporal_reference,
+            composition_reference=composition_reference,
             derived_control=derived_control,
         )

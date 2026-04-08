@@ -1,7 +1,7 @@
 Status: implemented and verified
 Scope: Compact navigation index for docs/v4
 Source of truth: `/home/zodrak/zod/docs/v4/*`
-Last verified against: current repo state on 2026-03-29; /home/zodrak/zod/tests/v4/run_suite.py passed 311 tests
+Last verified against: current repo state on 2026-03-29; targeted movement tests for `pb02`, `pb03`, `fs02`, and `fs03`
 
 # Navigation Index
 
@@ -35,6 +35,14 @@ Last verified against: current repo state on 2026-03-29; /home/zodrak/zod/tests/
 - [movement/transition_model.md](movement/transition_model.md): movement transition semantics.
 - [movement/search_policy.md](movement/search_policy.md): movement search and policy rules.
 - [movement/family_coverage.md](movement/family_coverage.md): movement family coverage summary.
+- [movement/fs02_mechanics.md](movement/fs02_mechanics.md): `fs02` family mechanics.
+- [movement/fs02_gate.md](movement/fs02_gate.md): `fs02` gate.
+- [movement/fs03_mechanics.md](movement/fs03_mechanics.md): `fs03` family mechanics.
+- [movement/fs03_gate.md](movement/fs03_gate.md): `fs03` gate.
+- [movement/pb02_mechanics.md](movement/pb02_mechanics.md): `pb02` family mechanics and current boundary.
+- [movement/pb02_gate.md](movement/pb02_gate.md): `pb02` gate.
+- [movement/pb03_mechanics.md](movement/pb03_mechanics.md): `pb03` family mechanics.
+- [movement/pb03_gate.md](movement/pb03_gate.md): `pb03` gate.
 
 ## Click/Perception
 
@@ -94,3 +102,4 @@ Last verified against: current repo state on 2026-03-29; /home/zodrak/zod/tests/
 - [source_to_doc_map.md](source_to_doc_map.md): source-package documentation coverage map.
 - [test_to_doc_map.md](test_to_doc_map.md): test-package documentation coverage map.
 - [documentation_gap_checklist.md](documentation_gap_checklist.md): missing and outdated documentation audit.
+- [tests/README_stage2_next_gate.md](tests/README_stage2_next_gate.md): historical Stage 2 note plus the separate live regression runner note.

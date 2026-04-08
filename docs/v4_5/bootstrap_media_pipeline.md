@@ -1,0 +1,27 @@
+Bootstrap media pipeline design
+
+- Bootstrap action sequences come from config, not hardcoded agent logic.
+- Bootstrap executes one configured primary sequence and any configured fallback sequences.
+- Fallback runs only if avatar detection fails after the primary sequence.
+- Bootstrap collects raw screen observations for every probe step.
+- Bootstrap exports one PNG per collected screen with a configurable scale factor.
+- Bootstrap exports one MP4 video from the generated PNG sequence at configurable FPS.
+- Bootstrap aborts on an invalid action.
+- Bootstrap continues if an action is blocked.
+- The current bootstrap is movement bootstrap only.
+- This bootstrap framework may be reused later for click bootstrap, but click bootstrap is not implemented in this change.
+- Bootstrap runs three HUD analyzers in parallel:
+  - deterministic analyzer
+  - LLM text analyzer
+  - VLM video analyzer
+- All three analysis results are gathered before bootstrap returns.
+- Selection logic is not implemented yet.
+- The default selected HUD result is always the deterministic result.
+- LLM and VLM communication uses TOON.
+- Model endpoints come from the main agent config.
+- Current default model endpoint values are taken from existing v4 config values.
+- `BootstrapProbePlan` explicitly produces:
+  - `BootstrapCaptureBundle`
+  - `AvatarDetectionResult`
+  - `HudAnalysisBundle`
+  - `PoiAnalysisBundle`

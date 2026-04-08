@@ -1,0 +1,14 @@
+Return a deterministic structured POI set from the bootstrap video.
+
+Use the video and any short textual context only.
+Extract only points of interest for movement planning.
+
+Output exactly one Python-style dictionary:
+{'pois': [{'bbox': [x1, y1, x2, y2], 'center': [cx, cy], 'colors': [c1, c2]}]}
+
+Rules:
+- Include only POIs.
+- Each POI must contain only bbox, center, and colors.
+- Do not output prose.
+- Do not output explanations.
+- Do not output hints.

@@ -1,7 +1,7 @@
-Status: implemented and verified
+Status: implemented; gate-covered, live regression still mixed
 Scope: movement doc: fs01 mechanics
 Source of truth: `/home/zodrak/zod/src/v4/movement/*`, `/home/zodrak/zod/tests/v4/movement/*`
-Last verified against: current repo state on 2026-03-29; /home/zodrak/zod/tests/v4/run_suite.py passed 279 tests
+Last verified against: current repo state on 2026-03-30; gate coverage plus targeted manual live regression for `fs01`
 
 # `fs01` Mechanics
 
@@ -20,6 +20,12 @@ This document is grounded only in the local implementation at `/home/zodrak/zod/
 - target rule: reaching the target advances the level only when the local door list is empty
 
 The v4 movement layer must not replace those observed rules with a generic switch-door abstraction or a hidden per-level lookup table.
+
+## Current Live Boundary
+
+- the manual live regression runner now surfaces `fs01` as a repeated non-progress cycle rather than a missing-state abort
+- family-local fallback ranking uses the exact switch/door typed state and biases away from immediately repeating the same no-progress move on identical decision states
+- `fs01` is still not live-verified end-to-end
 
 ## Mechanic Table
 

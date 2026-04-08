@@ -123,4 +123,8 @@ class MemoryHiddenTypedStateV4:
         )
 
     def to_key(self) -> str:
-        return json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
+        payload = self.to_dict()
+        common = payload.get("common", {})
+        if isinstance(common, dict):
+            common.pop("step_depth", None)
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"))

@@ -1,7 +1,7 @@
 Status: implemented and verified
 Scope: movement doc: family coverage
 Source of truth: `/home/zodrak/zod/src/v4/movement/*`, `/home/zodrak/zod/tests/v4/movement/*`
-Last verified against: current repo state on 2026-03-29; /home/zodrak/zod/tests/v4/run_suite.py passed 279 tests
+Last verified against: current repo state on 2026-03-29; targeted movement tests for `pb02`, `pb03`, `fs02`, and `fs03`
 
 # Family Coverage
 
@@ -23,6 +23,26 @@ Last verified against: current repo state on 2026-03-29; /home/zodrak/zod/tests/
 - expected search method: BFS
 - gate test expectations: exact switch semantics on checked local paths, augmented-state search proof, one real `fs01` level solved end to end in the Stage 2 loop
 - deferred: deeper multi-level optimization only
+
+## `fs02`
+
+- mechanic type: OR-switch door family implemented from the local `fs02` env, where any one orange plate removes the door permanently
+- required typed-state fields: switch positions, occupied-switch bits, door state, target cells, and explicit switch logic mode
+- required transition semantics: enter-any-switch opens the door, the opened door remains removed, and closed-door cells block motion before opening
+- required search-state representation: avatar position plus switch/door state
+- expected search method: BFS
+- gate test expectations: exact env-backed typed-state build, checked OR-door semantics, legal plan proof, and one real `fs02` level solved before the next-level controller boundary
+- deferred: no additional `fs02` semantics beyond the local env-backed permanent-door-removal rule
+
+## `fs03`
+
+- mechanic type: threshold switch-door family implemented from the local `fs03` env, with persistent distinct-switch activation and permanent door removal once the threshold is met
+- required typed-state fields: switch positions, occupied-switch bits, activated-switch bits, threshold `k`, door state, and target cells
+- required transition semantics: new distinct switch activations latch, the door opens when `activated >= k`, and closed-door cells block motion before opening
+- required search-state representation: avatar position plus activated-switch state and door state
+- expected search method: BFS
+- gate test expectations: exact env-backed threshold extraction, checked persistent activation semantics, legal plan proof, and one real `fs03` level solved before the next-level controller boundary
+- deferred: no generic boolean-expression engine or non-persistent threshold semantics
 
 ## `tp01`
 
@@ -63,3 +83,22 @@ Last verified against: current repo state on 2026-03-29; /home/zodrak/zod/tests/
 - expected search method: BFS
 - gate test expectations: exact env-backed typed-state build, checked push semantics, push-aware search proof, one real `pb01` level solved in the Stage 2 loop
 - deferred: stronger deadlock reasoning and larger push spaces
+
+## `pb02`
+
+- mechanic type: two-crate push puzzle with two real goals and success only when both crates are on goals
+- required typed-state fields: explicit crate set, explicit goal set, exact solved-goal occupancy, bounds, walls, and step limit
+- required transition semantics: single-crate push only, blocked push into walls or other crates, exact two-goal completion, and no multi-crate push
+- required search-state representation: avatar position plus canonicalized crate positions over fixed blockers and goals
+- expected search method: exact A* with an admissible push-goal heuristic
+- gate test expectations: exact two-crate parsing, checked multi-crate push legality, exact planner success, a real-env plan replay that wins level 0, and live replanning that reconstructs hidden goal occupancy only when the carry state remains fully consistent
+
+## `pb03`
+
+- mechanic type: one-crate push puzzle with one real goal and one decoy lose pad, implemented from the local `pb03` env
+- required typed-state fields: explicit crate position, true goal cells, decoy lose-pad cells, bounds, walls, and step limit
+- required transition semantics: single-crate push only, immediate terminal loss on crate-to-decoy push, exact success on crate-to-goal push
+- required search-state representation: avatar position plus crate position over fixed blockers, goals, and decoy cells
+- expected search method: exact A* with an admissible push-goal heuristic
+- gate test expectations: exact decoy parsing, checked decoy-loss semantics, exact planner success, and one real `pb03` level solved in the Stage 2 loop
+- deferred: no generic special-tile system beyond the explicit `pb03` decoy rule

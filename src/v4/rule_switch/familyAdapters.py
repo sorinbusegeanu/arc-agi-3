@@ -78,14 +78,55 @@ def _cells_by_color(grid: tuple[tuple[int, ...], ...], color: int) -> tuple[Grid
     return tuple((x, y) for y, row in enumerate(grid) for x, value in enumerate(row) if value == color)
 
 
-def _find_avatar(grid: tuple[tuple[int, ...], ...], level) -> GridPos:
+def _avatar_cell_from_frame(parsed_state: ParsedStateV4, bounds: GridPos) -> GridPos | None:
+    plane = parsed_state.current_observation.frame[0]
+    pixel_h = len(plane)
+    pixel_w = len(plane[0]) if pixel_h else 0
+    pixels = [(x, y) for y, row in enumerate(plane) for x, value in enumerate(row) if int(value) == 9]
+    if not pixels:
+        return None
+    xs = [x for x, _ in pixels]
+    ys = [y for _, y in pixels]
+    center_x = (min(xs) + max(xs)) / 2.0
+    center_y = (min(ys) + max(ys)) / 2.0
+    grid_x = min(bounds[0] - 1, max(0, int(center_x * bounds[0] / pixel_w)))
+    grid_y = min(bounds[1] - 1, max(0, int(center_y * bounds[1] / pixel_h)))
+    return (grid_x, grid_y)
+
+
+def _last_action_id(parsed_state: ParsedStateV4) -> int | None:
+    action_id = parsed_state.current_observation.action_input.get("id")
+    return int(action_id) if isinstance(action_id, int) else None
+
+
+def _find_avatar(parsed_state: ParsedStateV4, grid: tuple[tuple[int, ...], ...], bounds: GridPos, level, wall_cells: tuple[GridPos, ...]) -> GridPos:
     cells = _cells_by_color(grid, 9)
     target = tuple(int(v) for v in next(((sprite.x, sprite.y) for sprite in _iter_level_sprites(level) if "player" in getattr(sprite, "tags", ())), ()))
     if target and target in cells:
         return target  # prefer the known in-bounds player cell over HUD pixels
-    if len(cells) != 1:
+    if len(cells) == 1:
+        return cells[0]
+    frame_avatar = _avatar_cell_from_frame(parsed_state, bounds)
+    if frame_avatar is not None:
+        return frame_avatar
+    if len(cells) > 1:
         raise ValueError(f"avatar_position: expected exactly one avatar cell, found {len(cells)}")
-    return cells[0]
+    if parsed_state.previous_observation is None:
+        raise ValueError("avatar_position: current and previous observations do not expose a unique avatar cell")
+    previous_grid = _sample_grid(parsed_state.previous_observation, bounds)
+    previous_cells = _cells_by_color(previous_grid, 9)
+    if len(previous_cells) != 1:
+        raise ValueError(f"avatar_position: expected exactly one previous avatar cell, found {len(previous_cells)}")
+    action_id = _last_action_id(parsed_state)
+    if action_id not in _MOVE_ACTIONS:
+        raise ValueError("avatar_position: cannot infer avatar without previous legal movement action")
+    delta = {1: (0, -1), 2: (0, 1), 3: (-1, 0), 4: (1, 0)}[action_id]
+    previous_avatar = previous_cells[0]
+    candidate = (previous_avatar[0] + delta[0], previous_avatar[1] + delta[1])
+    blocked = set(wall_cells)
+    if candidate in blocked or not (0 <= candidate[0] < bounds[0] and 0 <= candidate[1] < bounds[1]):
+        return previous_avatar
+    return candidate
 
 
 def _extract_active_safe_color(observation: V4Observation, safe_colors: tuple[int, ...]) -> int:
@@ -114,8 +155,8 @@ def build_rs01_rule_switch_state(parsed_state: ParsedStateV4) -> RuleSwitchTyped
     level = _load_level(parsed_state, "rs01")
     bounds = _bounds(parsed_state)
     grid = _sample_grid(parsed_state.current_observation, bounds)
-    avatar = _find_avatar(grid, level)
     wall_cells = tuple(sorted(_cells_by_color(grid, 3)))
+    avatar = _find_avatar(parsed_state, grid, bounds, level, wall_cells)
     safe_colors = tuple(int(value) for value in (level.get_data("safe_colors") or ()))
     if not safe_colors:
         raise ValueError("rs01 state requires explicit safe_colors metadata")

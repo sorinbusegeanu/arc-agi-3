@@ -1,7 +1,7 @@
 Status: implemented and verified
 Scope: movement doc: phase3 checklist
 Source of truth: `/home/zodrak/zod/src/v4/movement/*`, `/home/zodrak/zod/tests/v4/movement/*`
-Last verified against: current repo state on 2026-03-29; /home/zodrak/zod/tests/v4/run_suite.py passed 279 tests
+Last verified against: current repo state on 2026-03-29; targeted movement tests for `pb02`, `pb03`, `fs02`, and `fs03`
 
 # Phase 3 Checklist
 
@@ -24,6 +24,20 @@ Last verified against: current repo state on 2026-03-29; /home/zodrak/zod/tests/
 - [x] `fs01` solver policy solves at least one verified real level
 - [x] `fs01` door semantics are represented explicitly in typed state, not hidden in transition-model assumptions
 - [x] `fs01` path uses no forbidden runtime dependencies
+- [x] `fs02` gate exists
+- [x] `fs02` OR-door typed-state fields implemented
+- [x] `fs02` adapter implemented from local env metadata and observation
+- [x] `fs02` transition semantics tested against the real env-backed permanent door-removal rule
+- [x] `fs02` search handles switch/door state explicitly
+- [x] `fs02` Stage 2 live loop solves at least one verified real level before the next-level controller boundary
+- [x] `fs02` path uses no forbidden runtime dependencies
+- [x] `fs03` gate exists
+- [x] `fs03` threshold typed-state fields implemented
+- [x] `fs03` adapter implemented from local env metadata and observation
+- [x] `fs03` transition semantics tested against the real env-backed persistent threshold rule
+- [x] `fs03` search handles activated-switch and door state explicitly
+- [x] `fs03` Stage 2 live loop solves at least one verified real level before the next-level controller boundary
+- [x] `fs03` path uses no forbidden runtime dependencies
 - [x] `tp01` gate passes
 - [x] `tp01` teleporter typed-state fields implemented
 - [x] `tp01` adapter implemented
@@ -52,6 +66,20 @@ Last verified against: current repo state on 2026-03-29; /home/zodrak/zod/tests/
 - [x] `pb01` search handles push-state progression correctly
 - [x] `pb01` solver policy solves at least one verified real level
 - [x] `pb01` path uses no forbidden runtime dependencies
+- [x] `pb02` gate exists
+- [x] `pb02` two-crate typed-state fields implemented
+- [x] `pb02` adapter implemented from local env metadata and observation
+- [x] `pb02` transition semantics tested against the real env
+- [x] `pb02` search handles canonicalized multi-crate push state
+- [x] `pb02` exact planner plan replays to a real level-0 win
+- [x] `pb02` path uses no forbidden runtime dependencies
+- [x] `pb03` gate exists
+- [x] `pb03` decoy typed-state fields implemented
+- [x] `pb03` adapter implemented from local env metadata and observation
+- [x] `pb03` transition semantics tested against the real env
+- [x] `pb03` search rejects decoy-loss placements and finds a certifying plan
+- [x] `pb03` solver policy solves at least one verified real level
+- [x] `pb03` path uses no forbidden runtime dependencies
 - [x] all family gates pass together
 - [x] full movement suite passes
 - [x] full isolated v4 suite passes

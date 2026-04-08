@@ -6,6 +6,10 @@ from typing import Any
 from v4.agentContract.environmentMetadata import V4EnvironmentMetadata
 from v4.agentContract.extract import extract_v4_authoritative_state
 from v4.agentContract.types import V4AuthoritativeState, V4Observation, V4TerminalSignal
+from v4.belief.beliefState import BeliefSnapshotReferenceV4
+from v4.composition.domainState import CompositionSnapshotReferenceV4
+from v4.hypothesis.hypothesisContracts import HypothesisSnapshotReferenceV4
+from v4.temporal.resourceState import TemporalSnapshotReferenceV4
 
 
 @dataclass(frozen=True)
@@ -55,6 +59,10 @@ class ParsedStateV4:
     available_actions: tuple[int, ...]
     terminal_signal: V4TerminalSignal
     memory_reference: MemorySnapshotReferenceV4 | None
+    belief_reference: BeliefSnapshotReferenceV4 | None = field(default=None, kw_only=True)
+    hypothesis_reference: HypothesisSnapshotReferenceV4 | None = field(default=None, kw_only=True)
+    temporal_reference: TemporalSnapshotReferenceV4 | None = field(default=None, kw_only=True)
+    composition_reference: CompositionSnapshotReferenceV4 | None = field(default=None, kw_only=True)
     derived_control: DerivedControlStateV4
 
     def to_dict(self) -> dict[str, Any]:
