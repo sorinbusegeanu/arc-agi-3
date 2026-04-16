@@ -26,9 +26,11 @@ from rl_v1.utils.run_summary import build_run_summary
 
 
 class Trainer:
-    def __init__(self, cfg, model=None, wandb_logger=None) -> None:
+    def __init__(self, cfg, model=None, wandb_logger=None, *, training_mode: str = "train_rl", log_gameplay_metrics_during_pretrain: bool = False) -> None:
         self.cfg = cfg
         self.wandb_logger = wandb_logger
+        self.training_mode = str(training_mode)
+        self.log_gameplay_metrics_during_pretrain = bool(log_gameplay_metrics_during_pretrain)
         accelerator = _resolve_runtime_accelerator(cfg.runtime.accelerator)
         self.fabric = build_fabric(
             accelerator=accelerator,
@@ -48,6 +50,8 @@ class Trainer:
         self.checkpoints = CheckpointManager()
         self.update_idx = 0
         self.best_level_completion_rate = float("-inf")
+        self.best_world_metric = float("-inf")
+        self.best_world_metric_name = "change_mask_f1"
         self._envs = None
         self.parallel_rollout_manager = None
         self._closed = False
@@ -68,6 +72,7 @@ class Trainer:
             self.checkpoints.load(self.cfg.checkpoint.restore_path, model=self.model, optimizer=self.optimizer, scheduler=self.scheduler, cfg=self.cfg)
 
     def train(self, updates: int = 1, mode: str = "train_rl"):
+        self.training_mode = str(mode)
         self.maybe_restore()
         self._ensure_envs()
         summary = {}
@@ -86,9 +91,10 @@ class Trainer:
                 collected_steps_total += collected_steps
                 summary = self._train_on_sequences(sequences, mode=mode)
                 summary["collection_seconds"] = float(collection_seconds)
-                _print_training_progress(self.update_idx, updates, summary.get("training_loss"))
+                _print_training_progress(self.update_idx, updates, summary, mode=self.training_mode)
                 if self.update_idx % self.cfg.logging.log_every_updates == 0:
-                    payload = build_run_summary(self.cfg, self.training_loss_meter.compute() | {"mode": mode})
+                    primary_metrics = summary if self.training_mode == "pretrain_world" else (self.training_loss_meter.compute() | summary)
+                    payload = build_run_summary(self.cfg, primary_metrics | {"mode": mode}, mode=self.training_mode)
                     payload["update_idx"] = self.update_idx
                     payload["effective_training_episodes_per_game"] = {
                         str(game_id): _episodes_to_collect_for_game(self.cfg, str(game_id))
@@ -106,9 +112,21 @@ class Trainer:
                         if key in summary:
                             payload[key] = summary[key]
                     self.artifacts.write_eval_summary(f"train_update_{self.update_idx:06d}", payload)
+                    if self.training_mode == "pretrain_world":
+                        self.artifacts.write_world_pretrain_update_rows(
+                            [
+                                {
+                                    "update_idx": int(self.update_idx),
+                                    "elapsed_seconds": float(summary.get("train_update_seconds", 0.0)),
+                                    "optimizer_batches": int(summary.get("optimizer_batches", 0)),
+                                    **{k: float(v) for k, v in summary.items() if isinstance(v, (int, float))},
+                                }
+                            ]
+                        )
                     if self.wandb_logger is not None and self.update_idx % self.cfg.wandb.log_every_updates == 0:
                         self.wandb_logger.log_metrics(_wandb_training_metrics(summary), step=self.update_idx)
-                    self.training_loss_meter.reset()
+                    if self.training_mode != "pretrain_world":
+                        self.training_loss_meter.reset()
                 if self.cfg.checkpoint.enabled and self.update_idx % self.cfg.checkpoint.save_every_updates == 0:
                     self.checkpoints.save(
                         self.run_dir / "last.pt",
@@ -123,13 +141,30 @@ class Trainer:
                     )
                 if self.update_idx % self.cfg.logging.eval_every_updates == 0:
                     eval_start = time.perf_counter()
-                    summary["evaluation"] = Evaluator(
+                    evaluator = Evaluator(
                         self.cfg,
                         self.model,
                         wandb_logger=self.wandb_logger,
                         step=self.update_idx,
                         parallel_rollout_manager=self.parallel_rollout_manager,
-                    ).evaluate()
+                        training_mode=self.training_mode,
+                        eval_kind="world" if self.training_mode == "pretrain_world" else "policy",
+                    )
+                    if self.training_mode == "pretrain_world":
+                        summary["evaluation"] = evaluator.evaluate_world_model(metrics_only=not self.log_gameplay_metrics_during_pretrain)
+                        if self.log_gameplay_metrics_during_pretrain:
+                            policy_diag = summary["evaluation"].get("policy_summary", {})
+                            mapping = {
+                                "game_win_rate": "diagnostic_game_win_rate",
+                                "level_completion_rate": "diagnostic_level_completion_rate",
+                                "mean_levels_reached": "diagnostic_mean_levels_reached",
+                                "mean_steps_per_completed_level": "diagnostic_mean_steps_per_completed_level",
+                            }
+                            for source, target in mapping.items():
+                                if source in policy_diag:
+                                    summary[target] = float(policy_diag[source])
+                    else:
+                        summary["evaluation"] = evaluator.evaluate_policy()
                     summary["evaluation_seconds"] = float(time.perf_counter() - eval_start)
                     if self.cfg.checkpoint.enabled:
                         self.checkpoints.save(
@@ -158,7 +193,7 @@ class Trainer:
     def _train_on_sequences(self, sequences, mode: str = "train_rl"):
         self.model.train()
         if not sequences:
-            return self.training_loss_meter.compute()
+            return {} if mode == "pretrain_world" else self.training_loss_meter.compute()
         # Previous implementation used nested per-sequence/per-timestep Python loops.
         # This path batches across sequences and valid timesteps to improve GPU utilization.
         shuffled_sequences = list(sequences)
@@ -176,6 +211,7 @@ class Trainer:
             target_cache.append((targets_padded, target_mask, target_extras))
         target_build_seconds = float(time.perf_counter() - target_build_start)
         rows = []
+        world_rows = []
         optimizer_batches = 0
         valid_timesteps_per_update = 0
         train_update_start = time.perf_counter()
@@ -322,8 +358,22 @@ class Trainer:
                         continue
                     if not torch.isfinite(parameter.detach()).all().item():
                         raise ValueError(f"non-finite model parameter after optimizer step: {name}")
-                self.training_loss_meter.update(float(batch_total.detach().cpu()))
+                if mode != "pretrain_world":
+                    self.training_loss_meter.update(float(batch_total.detach().cpu()))
                 rows.append(parts)
+                if mode == "world_pretrain":
+                    world_rows.append({k: v for k, v in parts.items() if k.startswith("world_") or k in {
+                        "transition_loss",
+                        "change_mask_loss",
+                        "next_frame_loss",
+                        "reward_prediction_loss",
+                        "done_prediction_loss",
+                        "change_mask_precision",
+                        "change_mask_recall",
+                        "change_mask_f1",
+                        "reward_prediction_mae",
+                        "done_accuracy",
+                    }})
                 rows.append(
                     {
                         "grad_total_norm": grad_total_sq ** 0.5,
@@ -335,7 +385,10 @@ class Trainer:
                 valid_timesteps = int(flat_valid.sum().item())
                 valid_timesteps_per_update += valid_timesteps
         train_update_seconds = float(time.perf_counter() - train_update_start)
-        summary = _mean_rows(rows) | self.training_loss_meter.compute()
+        if mode == "world_pretrain":
+            summary = _mean_rows(world_rows)
+        else:
+            summary = _mean_rows(rows) | self.training_loss_meter.compute()
         summary["target_build_seconds"] = target_build_seconds
         summary["train_update_seconds"] = train_update_seconds
         summary["optimizer_batches"] = optimizer_batches
@@ -395,6 +448,47 @@ class Trainer:
     def _maybe_save_best_checkpoint(self, evaluation_summary: dict) -> None:
         if not self.cfg.checkpoint.enabled:
             return
+        if self.training_mode == "pretrain_world":
+            metric_name = "change_mask_f1" if "change_mask_f1" in evaluation_summary else "world_total_loss"
+            if metric_name == "change_mask_f1":
+                metric_value = float(evaluation_summary.get(metric_name, float("-inf")))
+                is_better = metric_value > self.best_world_metric
+            else:
+                metric_value = float(evaluation_summary.get(metric_name, float("inf")))
+                # maximize negative loss equivalent for unified comparator
+                converted = -metric_value
+                is_better = converted > self.best_world_metric
+            if not is_better:
+                return
+            self.best_world_metric = metric_value if metric_name == "change_mask_f1" else -metric_value
+            self.best_world_metric_name = metric_name
+            self.checkpoints.save(
+                self.run_dir / "world_pretrain_best.pt",
+                model=self.model,
+                optimizer=self.optimizer,
+                scheduler=self.scheduler,
+                cfg=self.cfg,
+                update_idx=self.update_idx,
+                model_variant=self.cfg.model.variant,
+                training_mode="pretrain_world",
+                seed=self.cfg.runtime.world_pretrain_seed,
+                evaluation_deterministic=bool(self.cfg.evaluation.deterministic),
+                selection_metric_name=metric_name,
+                selection_metric_value=float(metric_value),
+            )
+            self.artifacts.write_preflight_report(
+                {
+                    "checkpoint_selection": "world_pretrain_best",
+                    "metric_name": metric_name,
+                    "metric_value": float(metric_value),
+                    "update_idx": int(self.update_idx),
+                    "eval_mode": "world",
+                    "eval_episodes": int(self.cfg.evaluation.episodes),
+                    "deterministic": bool(self.cfg.evaluation.deterministic),
+                    "game_filter": list(self.cfg.env.game_ids),
+                }
+            )
+            return
         metric = _extract_level_completion_rate(evaluation_summary)
         if metric is None or metric <= self.best_level_completion_rate:
             return
@@ -410,6 +504,8 @@ class Trainer:
             training_mode="train_rl",
             seed=self.cfg.runtime.training_seed,
             evaluation_deterministic=bool(self.cfg.evaluation.deterministic),
+            selection_metric_name="level_completion_rate",
+            selection_metric_value=float(metric),
         )
 
 
@@ -718,18 +814,45 @@ def _wandb_training_metrics(summary: dict) -> dict:
         "policy_loss": "policy_loss",
         "value_loss": "value_loss",
         "entropy_bonus": "entropy",
-        "latent_transition_loss": "transition_loss",
+        "transition_loss": "transition_loss",
         "reward_prediction_loss": "reward_loss",
         "done_prediction_loss": "done_loss",
+        "world_total_loss": "world_total_loss",
+        "change_mask_loss": "change_mask_loss",
+        "next_frame_loss": "next_frame_loss",
+        "change_mask_f1": "change_mask_f1",
+        "reward_prediction_mae": "reward_prediction_mae",
+        "done_accuracy": "done_accuracy",
     }
     return {target: summary[source] for source, target in mapping.items() if source in summary}
 
 
-def _print_training_progress(current_update: int, total_updates: int, training_loss) -> None:
+def _print_training_progress(current_update: int, total_updates: int, summary: dict, *, mode: str) -> None:
     width = 24
     completed = 0 if total_updates <= 0 else int(width * current_update / total_updates)
     bar = "#" * completed + "-" * (width - completed)
-    suffix = f" loss={float(training_loss):.4f}" if training_loss is not None else ""
+    if mode == "pretrain_world":
+        suffix_parts = []
+        if "world_total_loss" in summary:
+            suffix_parts.append(f"loss={float(summary['world_total_loss']):.4f}")
+        if "transition_loss" in summary:
+            suffix_parts.append(f"tr={float(summary['transition_loss']):.4f}")
+        if "change_mask_loss" in summary:
+            suffix_parts.append(f"cm={float(summary['change_mask_loss']):.4f}")
+        if "change_mask_f1" in summary:
+            suffix_parts.append(f"cm_f1={float(summary['change_mask_f1']):.4f}")
+        if "reward_prediction_loss" in summary:
+            suffix_parts.append(f"rw={float(summary['reward_prediction_loss']):.4f}")
+        if "done_prediction_loss" in summary:
+            suffix_parts.append(f"done={float(summary['done_prediction_loss']):.4f}")
+        elif "done_accuracy" in summary:
+            suffix_parts.append(f"done={float(summary['done_accuracy']):.4f}")
+        if "next_frame_loss" in summary:
+            suffix_parts.append(f"nf={float(summary['next_frame_loss']):.4f}")
+        suffix = " " + " ".join(suffix_parts) if suffix_parts else ""
+    else:
+        training_loss = summary.get("training_loss")
+        suffix = f" loss={float(training_loss):.4f}" if training_loss is not None else ""
     sys.stdout.write(f"\rtrain [{bar}] {current_update}/{total_updates}{suffix}")
     sys.stdout.flush()
 

@@ -100,10 +100,16 @@ def eval_main(
     model = build_model(cfg)
     if cfg.checkpoint.restore_path:
         CheckpointManager().load(cfg.checkpoint.restore_path, model=model, cfg=cfg)
-    evaluator = Evaluator(cfg, model, wandb_logger=wandb_logger)
+    evaluator = Evaluator(
+        cfg,
+        model,
+        wandb_logger=wandb_logger,
+        training_mode=mode,
+        eval_kind=eval_kind or "policy",
+    )
     try:
         if eval_kind == "world":
-            summary = evaluator.evaluate_world_model(metrics_only=bool(world_metrics_only))
+            summary = evaluator.evaluate_world_model(metrics_only=True, per_game=bool(per_game))
         else:
             summary = evaluator.evaluate_policy(per_game=bool(per_game))
         if smoke_test:

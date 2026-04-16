@@ -1,0 +1,84 @@
+1. Start the game session.
+
+2. Run initial exploration on Level 0:
+
+* capture the initial observation
+* run bootstrap probe actions
+* collect transition records
+* identify the avatar
+* detect POIs
+* detect HUD and hints
+* define candidate trajectories
+
+3. Before testing any trajectory, prepare the level start state for that trajectory:
+
+* reset the game
+* replay the required action prefix to reach the correct level and correct in-level state for that trajectory
+
+4. Try one trajectory on the current level:
+
+* execute the trajectory
+* evaluate the result
+* update POIs, HUD, hints, and trajectory understanding
+
+5. After the trajectory attempt, determine whether the level is:
+
+* completed
+* still not completed
+* invalid action / blocked path
+* no progress
+* partial progress
+
+6. If the level is still not completed:
+
+* update the trajectory set
+* before testing the next trajectory, reset again
+* replay the correct prefix again
+* test the next trajectory
+* repeat until the level is completed or the attempt budget is exhausted
+
+7. The replay prefix used after each reset depends on what is being tested:
+
+* for a Level 0 trajectory from the beginning: empty prefix
+* for another trajectory on the same unsolved level: prefix for all previously completed levels, plus any required partial in-level prefix
+* for a trajectory on Level 1: complete action sequence for Level 0
+* for another trajectory on Level 1 after some partial exploration inside Level 1: complete action sequence for Level 0, plus the required partial Level 1 prefix
+* for a trajectory on Level 2: complete action sequences for Level 0 and Level 1
+* for another trajectory on Level 2 after some partial exploration inside Level 2: complete action sequences for Level 0 and Level 1, plus the required partial Level 2 prefix
+
+8. If a level is completed:
+
+* save the `correct_action_sequence` to the database with:
+
+  * game id
+  * level id
+  * action sequence
+  * optimized yes/no
+  * date
+* save level artifacts
+
+9. Move to the next level:
+
+* capture the first observation of the new level
+* re-anchor the avatar
+* detect POIs
+* detect HUD and hints
+* define candidate trajectories
+
+10. For each trajectory on the new level:
+
+* reset before the trajectory
+* replay the prefix for all previously completed levels
+* replay any required partial prefix inside the current level
+* execute the trajectory
+* evaluate the result
+* update understanding
+* repeat until the level is completed or the attempt budget is exhausted
+
+11. Repeat the same process for each next level until all levels are completed.
+
+12. When the game is completed:
+
+* save final game artifacts
+* save final campaign artifacts
+

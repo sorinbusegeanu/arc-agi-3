@@ -17,6 +17,8 @@ class CheckpointManager:
         training_mode: str = "train_rl",
         seed: int | None = None,
         evaluation_deterministic: bool | None = None,
+        selection_metric_name: str | None = None,
+        selection_metric_value: float | None = None,
     ) -> None:
         torch.save(
             {
@@ -35,6 +37,8 @@ class CheckpointManager:
                     if evaluation_deterministic is not None
                     else None
                 ),
+                "selection_metric_name": selection_metric_name,
+                "selection_metric_value": selection_metric_value,
             },
             path,
         )
@@ -66,4 +70,6 @@ class CheckpointManager:
             "seed": payload.get("seed"),
             "acting_mode": payload.get("acting_mode"),
             "evaluation_deterministic": payload.get("evaluation_deterministic"),
+            "selection_metric_name": payload.get("selection_metric_name"),
+            "selection_metric_value": payload.get("selection_metric_value"),
         }

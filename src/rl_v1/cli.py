@@ -25,6 +25,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--freeze-encoder", action="store_true")
     parser.add_argument("--freeze-recurrent", action="store_true")
     parser.add_argument("--init-from-checkpoint", default=None)
+    parser.add_argument("--log-gameplay-metrics-during-pretrain", action="store_true")
     parser.add_argument("--game", action="append", dest="games", default=None, help="Override game list. Repeat for multiple games.")
     parser.add_argument("--workers", type=int, default=None, help="Deprecated alias: overrides runtime.rollout_processes.")
     parser.add_argument("--rollout-processes", type=int, default=None, help="Override runtime.rollout_processes.")
@@ -78,6 +79,7 @@ def main() -> int:
         "freeze_encoder": bool(args.freeze_encoder),
         "freeze_recurrent": bool(args.freeze_recurrent),
         "init_from_checkpoint": args.init_from_checkpoint,
+        "log_gameplay_metrics_during_pretrain": bool(args.log_gameplay_metrics_during_pretrain),
         "dry_run": bool(args.dry_run),
         "smoke_test": bool(args.smoke_test),
         "mode": mode,

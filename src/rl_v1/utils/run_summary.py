@@ -5,14 +5,37 @@ from rl_v1.metrics.metric_keys import GAME_WIN_RATE, LEVEL_COMPLETION_RATE, MEAN
 
 def with_metric_fields(summary: dict, metrics: dict) -> dict:
     output = dict(summary)
-    for key in (GAME_WIN_RATE, LEVEL_COMPLETION_RATE, MEAN_LEVELS_REACHED, MEAN_STEPS_PER_COMPLETED_LEVEL, TRAINING_LOSS):
+    for key in (
+        GAME_WIN_RATE,
+        LEVEL_COMPLETION_RATE,
+        MEAN_LEVELS_REACHED,
+        MEAN_STEPS_PER_COMPLETED_LEVEL,
+        TRAINING_LOSS,
+        "world_total_loss",
+        "change_mask_loss",
+        "next_frame_loss",
+        "reward_prediction_loss",
+        "done_prediction_loss",
+        "transition_loss",
+        "change_mask_precision",
+        "change_mask_recall",
+        "change_mask_f1",
+        "reward_prediction_mae",
+        "done_accuracy",
+        "diagnostic_game_win_rate",
+        "diagnostic_level_completion_rate",
+        "diagnostic_mean_levels_reached",
+        "diagnostic_mean_steps_per_completed_level",
+    ):
         if key in metrics:
             output[key] = metrics[key]
     return output
 
 
-def build_run_summary(cfg, metrics: dict) -> dict:
+def build_run_summary(cfg, metrics: dict, *, mode: str | None = None) -> dict:
+    resolved_mode = str(mode or metrics.get("mode") or "train_rl")
     summary = with_metric_fields({}, metrics)
+    summary["training_mode"] = resolved_mode
     summary["model_variant"] = cfg.model.variant
     summary["acting_mode"] = cfg.acting.mode
     summary["env_num_workers"] = cfg.runtime.rollout_processes
@@ -39,7 +62,7 @@ def build_run_summary(cfg, metrics: dict) -> dict:
     summary["wandb_entity"] = cfg.wandb.entity
     summary["wandb_run_name"] = cfg.wandb.run_name
     summary["wandb_mode"] = cfg.wandb.mode
-    summary["mode"] = metrics.get("mode")
+    summary["mode"] = metrics.get("mode", resolved_mode)
     summary["checkpoint_restore_path"] = cfg.checkpoint.restore_path
     summary["effective_game_ids"] = list(cfg.env.game_ids)
     summary["evaluation_episodes"] = cfg.evaluation.episodes
@@ -48,6 +71,15 @@ def build_run_summary(cfg, metrics: dict) -> dict:
     summary["training_seed"] = cfg.runtime.training_seed
     summary["evaluation_seed"] = cfg.runtime.evaluation_seed
     summary["world_pretrain_seed"] = cfg.runtime.world_pretrain_seed
+    if resolved_mode == "pretrain_world":
+        for gameplay_key in (
+            GAME_WIN_RATE,
+            LEVEL_COMPLETION_RATE,
+            MEAN_LEVELS_REACHED,
+            MEAN_STEPS_PER_COMPLETED_LEVEL,
+        ):
+            if gameplay_key in summary and f"diagnostic_{gameplay_key}" not in summary:
+                summary[f"diagnostic_{gameplay_key}"] = summary.pop(gameplay_key)
     return summary
 
 

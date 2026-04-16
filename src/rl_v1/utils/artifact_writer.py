@@ -31,3 +31,15 @@ class ArtifactWriter:
 
     def write_gradient_diagnostics_row(self, row: dict) -> None:
         append_jsonl(self.root / "gradient_diagnostics.jsonl", [row])
+
+    def write_world_pretrain_summary(self, payload: dict) -> None:
+        write_json(self.root / "world_pretrain_summary.json", payload)
+
+    def write_world_eval_summary(self, payload: dict) -> None:
+        write_json(self.root / "world_eval_summary.json", payload)
+
+    def write_world_eval_per_game(self, payload: dict) -> None:
+        write_json(self.root / "world_eval_per_game.json", payload)
+
+    def write_world_pretrain_update_rows(self, rows: list[dict]) -> None:
+        append_jsonl(self.root / "world_pretrain_updates.jsonl", rows)

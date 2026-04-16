@@ -17,11 +17,23 @@ from rl_v1.utils.run_summary import build_run_summary
 
 
 class Evaluator:
-    def __init__(self, cfg=None, model=None, wandb_logger=None, step: int = 0, parallel_rollout_manager=None) -> None:
+    def __init__(
+        self,
+        cfg=None,
+        model=None,
+        wandb_logger=None,
+        step: int = 0,
+        parallel_rollout_manager=None,
+        *,
+        training_mode: str = "eval_policy",
+        eval_kind: str = "policy",
+    ) -> None:
         self.cfg = cfg
         self.model = model
         self.wandb_logger = wandb_logger
         self.step = step
+        self.training_mode = str(training_mode)
+        self.eval_kind = str(eval_kind)
         self.parallel_rollout_manager = parallel_rollout_manager
         self._owns_parallel_rollout_manager = False
         if (
@@ -137,8 +149,6 @@ class Evaluator:
                 if self.wandb_logger is not None:
                     self.wandb_logger.log_metrics(_wandb_eval_metrics(summary), step=self.step)
                 _print_eval_summary(summary)
-                if per_game:
-                    summary["per_game"] = _per_game_metrics(episode_rows)
                 return summary
             summary = collect_mode("policy_only" if configured_mode == "policy_only" else "planner_act")
             if self.wandb_logger is not None:
@@ -148,24 +158,142 @@ class Evaluator:
         finally:
             self.shutdown()
 
-    def evaluate_world_model(self, *, metrics_only: bool = False) -> dict:
-        # Teacher-forced world-model validation placeholder:
-        # use existing rollout collection and compute lightweight prediction diagnostics when available.
-        policy_summary = self.evaluate_policy(episodes=None, per_game=False)
-        world_summary = {
-            "latent_transition_mse": 0.0,
-            "change_mask_loss": 0.0,
-            "reward_prediction_mse": 0.0,
-            "done_prediction_accuracy": 0.0,
-        }
-        if not metrics_only:
-            world_summary["policy_summary"] = policy_summary
-        return world_summary
+    def evaluate_world_model(self, *, metrics_only: bool = True, per_game: bool = False) -> dict:
+        try:
+            artifact_writer = ArtifactWriter(Path(self.cfg.logging.output_dir) / self.cfg.logging.run_name / "eval")
+            sequences = self._collect_sequences_for_mode("policy_only")
+            world_rows = []
+            by_game_rows: dict[str, list[dict[str, float]]] = {}
+            baseline_changed = []
+            baseline_reward = []
+            baseline_done = []
+            for sequence in sequences:
+                device = next(self.model.parameters()).device
+                hidden = sequence.initial_hidden_state.to(device)
+                for step in sequence.timesteps:
+                    obs = step.observation
+                    encoded = self.model.encode_observation(
+                        obs,
+                        prev_action_id=step.previous_action.action_id,
+                        prev_reward=step.previous_reward,
+                        prev_done=step.previous_done,
+                        hidden=hidden,
+                    )
+                    hidden = encoded.hidden.detach()
+                    world = self.model.transition(encoded.latent, step.chosen_action.action_id)
+                    if isinstance(world, tuple) and len(world) >= 5:
+                        next_latent_pred, change_mask_logits, next_frame_logits, reward_pred, done_logit = world[:5]
+                    else:
+                        next_latent_pred, reward_pred, done_logit = world
+                        change_mask_logits = None
+                        next_frame_logits = None
+                    row: dict[str, float] = {}
+                    if change_mask_logits is not None and step.changed_cell_mask is not None:
+                        target = step.changed_cell_mask.to(change_mask_logits.device).unsqueeze(0).to(dtype=torch.float32)
+                        cm_loss = torch.nn.functional.binary_cross_entropy_with_logits(change_mask_logits, target)
+                        pred = torch.sigmoid(change_mask_logits) >= 0.5
+                        tgt = target >= 0.5
+                        tp = (pred & tgt).sum().float()
+                        fp = (pred & ~tgt).sum().float()
+                        fn = (~pred & tgt).sum().float()
+                        precision = tp / (tp + fp + 1e-8)
+                        recall = tp / (tp + fn + 1e-8)
+                        f1 = (2.0 * precision * recall) / (precision + recall + 1e-8)
+                        row["change_mask_loss"] = float(cm_loss.detach().cpu())
+                        row["change_mask_f1"] = float(f1.detach().cpu())
+                        baseline_pred = torch.zeros_like(target, dtype=torch.bool)
+                        b_tp = (baseline_pred & tgt).sum().float()
+                        b_fp = (baseline_pred & ~tgt).sum().float()
+                        b_fn = (~baseline_pred & tgt).sum().float()
+                        b_prec = b_tp / (b_tp + b_fp + 1e-8)
+                        b_rec = b_tp / (b_tp + b_fn + 1e-8)
+                        b_f1 = (2.0 * b_prec * b_rec) / (b_prec + b_rec + 1e-8)
+                        baseline_changed.append(float(b_f1.detach().cpu()))
+                    if next_latent_pred is not None:
+                        row["transition_loss"] = float(((next_latent_pred - encoded.latent.detach()) ** 2).mean().detach().cpu())
+                    reward_t = torch.tensor([float(step.reward)], device=reward_pred.device, dtype=torch.float32)
+                    reward_loss = torch.nn.functional.mse_loss(reward_pred.view(-1), reward_t.view(-1))
+                    row["reward_prediction_loss"] = float(reward_loss.detach().cpu())
+                    baseline_reward.append(float((reward_t**2).mean().detach().cpu()))
+                    done_t = torch.tensor([1.0 if step.done else 0.0], device=done_logit.device, dtype=torch.float32)
+                    done_loss = torch.nn.functional.binary_cross_entropy_with_logits(done_logit.view(-1), done_t.view(-1))
+                    done_acc = float(((torch.sigmoid(done_logit.view(-1)) >= 0.5).float() == done_t.view(-1)).float().mean().detach().cpu())
+                    row["done_prediction_loss"] = float(done_loss.detach().cpu())
+                    row["done_accuracy"] = done_acc
+                    baseline_done.append(float((done_t == 0.0).float().mean().detach().cpu()))
+                    if next_frame_logits is not None:
+                        next_frame_t = step.next_observation.current_frame.to(next_frame_logits.device).unsqueeze(0).to(dtype=torch.float32)
+                        nf_loss = torch.nn.functional.mse_loss(next_frame_logits, next_frame_t)
+                        row["next_frame_loss"] = float(nf_loss.detach().cpu())
+                    world_rows.append(row)
+                    by_game_rows.setdefault(str(sequence.game_id), []).append(row)
+            summary = _mean_rows(world_rows)
+            world_total = 0.0
+            for key in ("transition_loss", "change_mask_loss", "next_frame_loss", "reward_prediction_loss", "done_prediction_loss"):
+                if key in summary:
+                    world_total += float(summary[key])
+            summary["world_total_loss"] = float(world_total)
+            summary["baseline_unchanged_board_change_mask_f1"] = float(sum(baseline_changed) / len(baseline_changed)) if baseline_changed else 0.0
+            summary["baseline_always_zero_reward_mse"] = float(sum(baseline_reward) / len(baseline_reward)) if baseline_reward else 0.0
+            summary["baseline_always_not_done_accuracy"] = float(sum(baseline_done) / len(baseline_done)) if baseline_done else 0.0
+            per_game_summary = {gid: _mean_rows(rows) for gid, rows in by_game_rows.items()}
+            if per_game:
+                summary["per_game"] = per_game_summary
+            artifact_writer.write_world_eval_summary(build_run_summary(self.cfg, summary | {"mode": self.training_mode}, mode=self.training_mode))
+            artifact_writer.write_world_eval_per_game(per_game_summary)
+            if self.wandb_logger is not None:
+                self.wandb_logger.log_metrics({k: v for k, v in summary.items() if isinstance(v, (int, float))}, step=self.step)
+            _print_world_eval_summary(summary)
+            if not metrics_only:
+                summary["policy_summary"] = self.evaluate_policy(episodes=None, per_game=False)
+            return summary
+        finally:
+            self.shutdown()
 
     def shutdown(self) -> None:
         if self.parallel_rollout_manager is not None and self._owns_parallel_rollout_manager:
             self.parallel_rollout_manager.close()
             self.parallel_rollout_manager = None
+
+    def _collect_sequences_for_mode(self, mode_name: str):
+        selector_cfg = copy.deepcopy(self.cfg)
+        selector_cfg.acting.mode = "planner_act" if mode_name == "planner_act" else "policy_only"
+        sequences = []
+        if self.cfg.env.execution_mode == "parallel_workers":
+            game_episode_counts = {str(game_id): int(self.cfg.evaluation.episodes) for game_id in self.cfg.env.game_ids}
+            if self.parallel_rollout_manager is None:
+                raise RuntimeError("parallel rollout manager is not initialized for evaluator")
+            sequences = self.parallel_rollout_manager.collect(
+                self.model,
+                game_episode_counts=game_episode_counts,
+                deterministic=self.cfg.evaluation.deterministic,
+                evaluation=True,
+                acting_mode=selector_cfg.acting.mode,
+                collection_mode="rl",
+            )
+        else:
+            selector = ActionSelector(selector_cfg)
+            collector = RolloutCollector(self.cfg.rollout, selector)
+            from rl_v1.env.adapter import ArcEnvironmentAdapter
+
+            for worker_game_ids in _partition_game_ids(self.cfg.env.game_ids, self.cfg.runtime.rollout_processes):
+                for game_id in worker_game_ids:
+                    env = ArcEnvironmentAdapter(self.cfg.env, self.cfg.model, game_id, reward_cfg=self.cfg.reward)
+                    try:
+                        sequences.extend(
+                            collector.collect(
+                                self.model,
+                                env,
+                                episodes=self.cfg.evaluation.episodes,
+                                deterministic=self.cfg.evaluation.deterministic,
+                                evaluation=True,
+                                collection_mode="rl",
+                            )
+                        )
+                    finally:
+                        if hasattr(env, "close"):
+                            env.close()
+        return sequences
 
 
 def _summarize_sequences(sequences, *, video_root: Path | None = None):
@@ -427,6 +555,24 @@ def _print_eval_summary(summary: dict) -> None:
     sys.stdout.flush()
 
 
+def _print_world_eval_summary(summary: dict) -> None:
+    label_map = {
+        "world_total_loss": "loss",
+        "transition_loss": "tr",
+        "change_mask_loss": "cm",
+        "change_mask_f1": "cm_f1",
+        "reward_prediction_loss": "rw",
+        "done_prediction_loss": "done",
+        "next_frame_loss": "nf",
+    }
+    parts = []
+    for key in ("world_total_loss", "transition_loss", "change_mask_loss", "change_mask_f1", "reward_prediction_loss", "done_prediction_loss", "next_frame_loss"):
+        if key in summary and isinstance(summary[key], (int, float)):
+            parts.append(f"{label_map[key]}={summary[key]:.4f}")
+    sys.stdout.write("eval " + " ".join(parts) + "\n")
+    sys.stdout.flush()
+
+
 def _extract_top2_action_probs(policy_logits) -> tuple[int | None, float, int | None, float]:
     if policy_logits is None:
         return None, 0.0, None, 0.0
@@ -446,6 +592,16 @@ def _extract_top2_action_probs(policy_logits) -> tuple[int | None, float, int | 
         top2_id = None
         top2_prob = 0.0
     return top1_id, top1_prob, top2_id, top2_prob
+
+
+def _mean_rows(rows: list[dict[str, float]]) -> dict[str, float]:
+    if not rows:
+        return {}
+    keys = set().union(*(row.keys() for row in rows))
+    return {
+        key: float(sum(float(row.get(key, 0.0)) for row in rows) / len(rows))
+        for key in keys
+    }
 
 
 def _per_game_metrics(episode_rows: list[dict]) -> dict[str, dict[str, float]]:

@@ -46,6 +46,7 @@ def train_main(
     freeze_encoder: bool = False,
     freeze_recurrent: bool = False,
     init_from_checkpoint: str | None = None,
+    log_gameplay_metrics_during_pretrain: bool = False,
     dry_run: bool = False,
     smoke_test: bool = False,
 ):
@@ -74,6 +75,7 @@ def train_main(
         freeze_encoder=freeze_encoder,
         freeze_recurrent=freeze_recurrent,
         init_from_checkpoint=init_from_checkpoint,
+        log_gameplay_metrics_during_pretrain=log_gameplay_metrics_during_pretrain,
     )
     cfg.logging.output_dir = "runs_rl_v1"
     cfg.logging.run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -98,7 +100,12 @@ def train_main(
         artifacts.write_smoke_test_report(smoke)
         return {"status": "smoke_test_ok", "mode": mode, "smoke": smoke}
     if mode == "pretrain_world":
-        return run_world_pretrain(cfg, model, artifacts=artifacts)
+        return run_world_pretrain(
+            cfg,
+            model,
+            artifacts=artifacts,
+            log_gameplay_metrics_during_pretrain=log_gameplay_metrics_during_pretrain,
+        )
     if mode == "train_rl":
         return run_rl_train(cfg, model, updates=updates, artifacts=artifacts)
     if mode == "eval_policy":
@@ -128,7 +135,7 @@ def train_main(
     raise ValueError(f"unsupported mode: {mode}")
 
 
-def run_world_pretrain(cfg, model, *, artifacts: ArtifactWriter):
+def run_world_pretrain(cfg, model, *, artifacts: ArtifactWriter, log_gameplay_metrics_during_pretrain: bool = False):
     set_global_seeds(
         cfg.runtime.world_pretrain_seed,
         deterministic_torch=cfg.runtime.deterministic_torch,
@@ -148,9 +155,22 @@ def run_world_pretrain(cfg, model, *, artifacts: ArtifactWriter):
     cfg.rollout.unroll_length = cfg.world_pretrain.unroll_length
     wandb_logger = WandbLogger(cfg)
     wandb_logger.log_config(cfg.to_dict())
-    trainer = Trainer(cfg, model, wandb_logger=wandb_logger)
+    print(
+        "pretrain metrics: world_total_loss transition_loss change_mask_loss "
+        "change_mask_f1 reward_prediction_loss done_prediction_loss "
+        + ("next_frame_loss" if bool(cfg.model.predict_next_frame) else "")
+    )
+    trainer = Trainer(
+        cfg,
+        model,
+        wandb_logger=wandb_logger,
+        training_mode="pretrain_world",
+        log_gameplay_metrics_during_pretrain=log_gameplay_metrics_during_pretrain,
+    )
     try:
         summary = trainer.train(updates=int(cfg.world_pretrain.updates), mode="world_pretrain")
+        artifacts.write_world_pretrain_summary(build_world_pretrain_summary(cfg, summary))
+        _print_final_world_summary(summary)
     finally:
         wandb_logger.finish()
     return {"mode": "pretrain_world", "summary": summary}
@@ -171,7 +191,7 @@ def run_rl_train(cfg, model, *, updates: int, artifacts: ArtifactWriter):
             parameter.requires_grad = False
     wandb_logger = WandbLogger(cfg)
     wandb_logger.log_config(cfg.to_dict())
-    trainer = Trainer(cfg, model, wandb_logger=wandb_logger)
+    trainer = Trainer(cfg, model, wandb_logger=wandb_logger, training_mode="train_rl")
     resume_state = "fresh"
     try:
         if cfg.checkpoint.restore_path:
@@ -216,6 +236,7 @@ def _load_and_apply_overrides(
     freeze_encoder,
     freeze_recurrent,
     init_from_checkpoint,
+    log_gameplay_metrics_during_pretrain,
 ):
     load_kwargs = {"preset": preset}
     if rollout_processes is not None:
@@ -315,3 +336,25 @@ def _print_resolved_line(cfg, *, mode: str) -> None:
         f"seed(train/eval/world)={cfg.runtime.training_seed}/{cfg.runtime.evaluation_seed}/{cfg.runtime.world_pretrain_seed}"
     )
     print(line)
+
+
+def build_world_pretrain_summary(cfg, summary: dict) -> dict:
+    from rl_v1.utils.run_summary import build_run_summary
+
+    return build_run_summary(cfg, summary | {"mode": "pretrain_world"}, mode="pretrain_world")
+
+
+def _print_final_world_summary(summary: dict) -> None:
+    parts = []
+    for key, label in (
+        ("world_total_loss", "loss"),
+        ("transition_loss", "tr"),
+        ("change_mask_loss", "cm"),
+        ("change_mask_f1", "cm_f1"),
+        ("reward_prediction_loss", "rw"),
+        ("done_prediction_loss", "done"),
+        ("next_frame_loss", "nf"),
+    ):
+        if key in summary and isinstance(summary[key], (int, float)):
+            parts.append(f"{label}={summary[key]:.4f}")
+    print("world_final " + " ".join(parts))

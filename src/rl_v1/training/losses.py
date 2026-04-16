@@ -51,13 +51,7 @@ def compute_world_model_losses(
     if device is None:
         device = torch.device("cpu")
     total_loss = torch.tensor(0.0, device=device)
-    parts = {
-        "latent_transition_loss": 0.0,
-        "change_mask_loss": 0.0,
-        "next_frame_loss": 0.0,
-        "reward_prediction_loss": 0.0,
-        "done_prediction_loss": 0.0,
-    }
+    parts: dict[str, float] = {}
     if transition_pred is not None and transition_target is not None:
         if transition_pred.shape != transition_target.shape or transition_pred.numel() == 0 or transition_target.numel() == 0:
             raise ValueError(
@@ -66,12 +60,24 @@ def compute_world_model_losses(
                 f"transition_target.shape={tuple(transition_target.shape)}"
             )
         latent_transition_loss = F.mse_loss(transition_pred, transition_target)
-        parts["latent_transition_loss"] = float(latent_transition_loss.detach().cpu())
+        parts["transition_loss"] = float(latent_transition_loss.detach().cpu())
         coef = 1.0 if loss_weights_cfg is None else float(loss_weights_cfg.transition_coef)
         total_loss = total_loss + coef * latent_transition_loss
     if change_mask_logits is not None and change_mask_target is not None:
         change_mask_loss = F.binary_cross_entropy_with_logits(change_mask_logits, change_mask_target)
         parts["change_mask_loss"] = float(change_mask_loss.detach().cpu())
+        probs = torch.sigmoid(change_mask_logits)
+        pred = probs >= 0.5
+        tgt = change_mask_target >= 0.5
+        tp = (pred & tgt).sum().float()
+        fp = (pred & ~tgt).sum().float()
+        fn = (~pred & tgt).sum().float()
+        precision = tp / (tp + fp + 1e-8)
+        recall = tp / (tp + fn + 1e-8)
+        f1 = (2.0 * precision * recall) / (precision + recall + 1e-8)
+        parts["change_mask_precision"] = float(precision.detach().cpu())
+        parts["change_mask_recall"] = float(recall.detach().cpu())
+        parts["change_mask_f1"] = float(f1.detach().cpu())
         coef = 1.0 if loss_weights_cfg is None else float(getattr(loss_weights_cfg, "change_mask_coef", 1.0))
         total_loss = total_loss + coef * change_mask_loss
     if next_frame_logits is not None and next_frame_target is not None:
@@ -82,14 +88,17 @@ def compute_world_model_losses(
     if reward_pred is not None and reward_target is not None:
         reward_prediction_loss = F.mse_loss(reward_pred, reward_target)
         parts["reward_prediction_loss"] = float(reward_prediction_loss.detach().cpu())
+        parts["reward_prediction_mae"] = float((reward_pred - reward_target).abs().mean().detach().cpu())
         coef = 1.0 if loss_weights_cfg is None else float(loss_weights_cfg.reward_coef)
         total_loss = total_loss + coef * reward_prediction_loss
     if done_logit is not None and done_target is not None:
         done_prediction_loss = F.binary_cross_entropy_with_logits(done_logit, done_target)
         parts["done_prediction_loss"] = float(done_prediction_loss.detach().cpu())
+        done_pred = (torch.sigmoid(done_logit) >= 0.5).to(done_target.dtype)
+        parts["done_accuracy"] = float((done_pred == done_target).float().mean().detach().cpu())
         coef = 1.0 if loss_weights_cfg is None else float(loss_weights_cfg.done_coef)
         total_loss = total_loss + coef * done_prediction_loss
-    parts["total_loss"] = float(total_loss.detach().cpu())
+    parts["world_total_loss"] = float(total_loss.detach().cpu())
     return total_loss, parts
 
 
@@ -146,7 +155,7 @@ def compute_rl_losses(
     total_loss = policy_loss + optimization_cfg.value_coef * value_loss - optimization_cfg.entropy_coef * entropy_bonus
     aux_total = torch.tensor(0.0, device=new_logprob.device)
     aux_parts = {
-        "latent_transition_loss": 0.0,
+        "transition_loss": 0.0,
         "reward_prediction_loss": 0.0,
         "done_prediction_loss": 0.0,
     }
@@ -161,14 +170,14 @@ def compute_rl_losses(
             loss_weights_cfg=loss_weights_cfg,
         )
         total_loss = total_loss + aux_total
-        aux_parts["latent_transition_loss"] = world_parts.get("latent_transition_loss", 0.0)
+        aux_parts["transition_loss"] = world_parts.get("transition_loss", 0.0)
         aux_parts["reward_prediction_loss"] = world_parts.get("reward_prediction_loss", 0.0)
         aux_parts["done_prediction_loss"] = world_parts.get("done_prediction_loss", 0.0)
     return total_loss, {
         "policy_loss": float(policy_loss.detach().cpu()),
         "value_loss": float(value_loss.detach().cpu()),
         "entropy_bonus": float(entropy_bonus.detach().cpu()),
-        "latent_transition_loss": aux_parts["latent_transition_loss"],
+        "transition_loss": aux_parts["transition_loss"],
         "reward_prediction_loss": aux_parts["reward_prediction_loss"],
         "done_prediction_loss": aux_parts["done_prediction_loss"],
         "total_loss": float(total_loss.detach().cpu()),
