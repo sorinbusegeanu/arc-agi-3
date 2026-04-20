@@ -9,7 +9,7 @@ from v5_0.contact.frame_tracker import (
 )
 from v5_0.solve.service import reanchor_frontier_objects, run_adaptive_solve_on_live_session
 from v5_0.runtime.campaign_state import CampaignLevelState
-from v5_0.runtime.run_avatar_bootstrap import run_frontier_level_from_live_session, run_full_campaign_analysis
+from v5_0.runtime.run_avatar_bootstrap import run_frontier_continuation_from_live_session, run_frontier_level_from_live_session, run_full_campaign_analysis
 
 
 def _frame(w, h, cells):
@@ -52,6 +52,84 @@ class TestFrontierReanchor(unittest.TestCase):
         self.assertIsNone(reacquire_avatar_bbox_in_frame(None, (1, 1, 1, 1), {1: 1}))
         self.assertIsNone(reacquire_poi_bbox_in_frame(None, (1, 1, 1, 1), {2: 1}))
 
+    def test_frontier_level_does_not_seed_initial_actions_from_bootstrap_probe(self):
+        transition = SimpleNamespace(action="RIGHT")
+        with patch("v5_0.runtime.run_avatar_bootstrap.run_probe_episodes_at_frontier", return_value=((transition,),)), patch(
+            "v5_0.runtime.run_avatar_bootstrap._build_multi_reset_avatar_report",
+            return_value=SimpleNamespace(selected=SimpleNamespace(failure_reason=None, selected_bbox=(1, 1, 1, 1), value_histogram={1: 1}), diagnostics=SimpleNamespace(stable_avatar_found=True)),
+        ), patch("v5_0.runtime.run_avatar_bootstrap._campaign_stable_avatar_found", return_value=True), patch(
+            "v5_0.runtime.run_avatar_bootstrap.write_multi_reset_artifacts", return_value={}
+        ), patch(
+            "v5_0.runtime.run_avatar_bootstrap.discover_pois_multi_reset",
+            return_value={"report": SimpleNamespace(candidates=(SimpleNamespace(poi_id="p1", bbox=(3, 3, 3, 3), value_histogram={2: 1}),)), "cross_reset_evidence": (), "episodes": ()},
+        ), patch("v5_0.runtime.run_avatar_bootstrap.write_poi_artifacts", return_value={}), patch(
+            "v5_0.runtime.run_avatar_bootstrap.detect_hud_multi_reset",
+            return_value={"report": SimpleNamespace(failure_reason=None), "cross_reset_evidence": (), "episodes": (), "value_samples": {}},
+        ), patch("v5_0.runtime.run_avatar_bootstrap.write_hud_artifacts", return_value={}), patch(
+            "v5_0.runtime.run_avatar_bootstrap.interpret_hud_hints_multi_reset",
+            return_value=SimpleNamespace(selected=SimpleNamespace(selected_poi_id="p1", ambiguous=False)),
+        ), patch("v5_0.runtime.run_avatar_bootstrap.write_hud_hint_artifacts", return_value={}), patch(
+            "v5_0.runtime.run_avatar_bootstrap._should_skip_redundant_frontier_analysis", return_value=True
+        ), patch("v5_0.runtime.run_avatar_bootstrap.run_adaptive_solve_on_live_session") as adaptive, patch(
+            "v5_0.runtime.run_avatar_bootstrap.write_adaptive_solve_artifacts", return_value={}
+        ), patch("v5_0.runtime.run_avatar_bootstrap.write_level_solution_artifacts", return_value={}), patch(
+            "v5_0.runtime.run_avatar_bootstrap.finalize_solved_level_trace", return_value={"saved_trace": None}
+        ):
+            adaptive.return_value = SimpleNamespace(solved=False, failure_reason="x", episodes=(), diagnostics=SimpleNamespace(to_dict=lambda: {}))
+            run_frontier_level_from_live_session(game_id="ez01", frontier_level_id="L0", session=object(), prefix_traces=tuple(), output_dir="runs_v5_0_test")
+        self.assertEqual(adaptive.call_args.kwargs["initial_frontier_actions"], tuple())
+
+    def test_frontier_continuation_reports_replay_mode_truthfully(self):
+        class _Adapter:
+            def get_current_observation(self, _session):
+                return SimpleNamespace(frame=(_frame(4, 4, {(1, 1): 1}),), levels_completed=0)
+
+            def close_session(self, _session):
+                return None
+
+        replay_session = object()
+        with patch("v5_0.runtime.run_avatar_bootstrap.SessionAdapter", return_value=_Adapter()), patch(
+            "v5_0.runtime.run_avatar_bootstrap.replay_prefix_traces_to_frontier",
+            return_value={"session": replay_session, "frontier_reached": True, "divergence": False},
+        ), patch("v5_0.runtime.run_avatar_bootstrap.run_frontier_level_from_live_session", return_value={"diagnostics": {}, "solved": False}) as run_level:
+            out = run_frontier_continuation_from_live_session(
+                game_id="ez01",
+                session=object(),
+                next_level_id="L1",
+                selected_avatar=SimpleNamespace(selected_bbox=(1, 1, 1, 1), value_histogram={1: 1}),
+                prefix_traces=tuple(),
+            )
+        self.assertEqual(out["diagnostics"]["continuation_mode"], "replay_fallback")
+        self.assertFalse(out["diagnostics"]["continued_from_live_session"])
+        self.assertIs(run_level.call_args.kwargs["session"], replay_session)
+
+    def test_frontier_continuation_reuses_live_session_when_already_on_next_level(self):
+        class _Adapter:
+            def get_current_observation(self, _session):
+                return SimpleNamespace(frame=(_frame(4, 4, {(1, 1): 1}),), levels_completed=1)
+
+            def close_session(self, _session):
+                return None
+
+        live_session = object()
+        with patch("v5_0.runtime.run_avatar_bootstrap.SessionAdapter", return_value=_Adapter()), patch(
+            "v5_0.runtime.run_avatar_bootstrap.replay_prefix_traces_to_frontier"
+        ) as replay_prefix, patch(
+            "v5_0.runtime.run_avatar_bootstrap.run_frontier_level_from_live_session",
+            return_value={"diagnostics": {}, "solved": False},
+        ) as run_level:
+            out = run_frontier_continuation_from_live_session(
+                game_id="ez01",
+                session=live_session,
+                next_level_id="L1",
+                selected_avatar=SimpleNamespace(selected_bbox=(1, 1, 1, 1), value_histogram={1: 1}),
+                prefix_traces=tuple(),
+            )
+        self.assertEqual(out["diagnostics"]["continuation_mode"], "live_session")
+        self.assertTrue(out["diagnostics"]["continued_from_live_session"])
+        self.assertEqual(replay_prefix.call_count, 0)
+        self.assertIs(run_level.call_args.kwargs["session"], live_session)
+
     def test_reanchor_frontier_objects_relaxed_success_prevents_immediate_failure(self):
         frame = _frame(10, 10, {(2, 2): 1, (4, 4): 2})
         avatar = SimpleNamespace(selected_bbox=(2, 2, 2, 2), value_histogram={1: 1})
@@ -60,6 +138,15 @@ class TestFrontierReanchor(unittest.TestCase):
         a, p = reanchor_frontier_objects(frame=frame, selected_avatar=avatar, initial_poi=poi)
         self.assertIsNotNone(a)
         self.assertIsNotNone(p)
+
+    def test_reanchor_frontier_objects_disambiguates_overlapping_strict_matches(self):
+        frame = _frame(10, 10, {(2, 2): 1, (2, 3): 2})
+        avatar = SimpleNamespace(selected_bbox=(2, 2, 2, 2), value_histogram={1: 1})
+        poi = SimpleNamespace(bbox=(2, 3, 2, 3), value_histogram={2: 1})
+        a, p = reanchor_frontier_objects(frame=frame, selected_avatar=avatar, initial_poi=poi)
+        self.assertIsNotNone(a)
+        self.assertIsNotNone(p)
+        self.assertNotEqual(a, p)
 
     def test_unsolved_adaptive_run_emits_structured_trajectory_logs(self):
         class _Session:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
@@ -100,12 +101,9 @@ from v5_0.solve.service import (
     verify_level_trace_replay,
 )
 
-SUPPORTED_GAMES: tuple[str, ...] = ("ez01", "ez02", "ez03", "ez04", "ul01")
-
-
 def _require_supported_game(game_id: str) -> None:
-    if game_id not in SUPPORTED_GAMES:
-        raise ValueError(f"v5_0 currently supports only {SUPPORTED_GAMES}")
+    del game_id
+    return None
 
 
 def _get_trace_db_path(output_dir: str | None, game_id: str) -> str:
@@ -196,15 +194,98 @@ def _should_skip_redundant_frontier_analysis(
     return False
 
 
+def _with_missing_solution_prefix_steps(
+    *,
+    campaign_steps: tuple[CampaignRunStep, ...] | list[CampaignRunStep],
+    level_sequence: tuple[str, ...] | list[str],
+    replay_valid_db_prefix_by_level: dict[str, SavedLevelTrace],
+) -> tuple[CampaignRunStep, ...]:
+    existing = tuple(campaign_steps or ())
+    if not existing and not replay_valid_db_prefix_by_level:
+        return tuple()
+
+    existing_levels = {str(step.level_id) for step in existing}
+    synthesized: list[CampaignRunStep] = []
+    for level_id in tuple(str(item) for item in level_sequence):
+        if level_id in existing_levels:
+            continue
+        trace = replay_valid_db_prefix_by_level.get(level_id)
+        if trace is None:
+            continue
+        level_index = max(0, int(str(level_id).lstrip("L") or 0))
+        action_sources = tuple(getattr(trace, "action_sources", ()) or ())
+        for step_index, action in enumerate(tuple(getattr(trace, "action_trace", ()) or ())):
+            synthesized.append(
+                CampaignRunStep(
+                    global_step_index=0,
+                    level_id=level_id,
+                    action=str(action),
+                    source=(action_sources[step_index] if step_index < len(action_sources) else "solved_prefix_replay"),
+                    reason="solution_prefix_replay",
+                    pre_levels_completed=level_index,
+                    post_levels_completed=level_index,
+                    pre_frame=None,
+                    post_frame=None,
+                    invalid_action=False,
+                    blocked_action=False,
+                    terminal=False,
+                    reward_before=None,
+                    reward_after=None,
+                )
+            )
+
+    merged = tuple(synthesized) + existing
+    return tuple(
+        CampaignRunStep(
+            global_step_index=index,
+            level_id=str(step.level_id),
+            action=str(step.action),
+            source=str(step.source),
+            reason=step.reason,
+            pre_levels_completed=int(step.pre_levels_completed),
+            post_levels_completed=int(step.post_levels_completed),
+            pre_frame=step.pre_frame,
+            post_frame=step.post_frame,
+            invalid_action=bool(step.invalid_action),
+            blocked_action=bool(step.blocked_action),
+            terminal=bool(step.terminal),
+            reward_before=step.reward_before,
+            reward_after=step.reward_after,
+        )
+        for index, step in enumerate(merged)
+    )
+
+
 def _flatten_prefix_actions(prefix_traces: tuple[SavedLevelTrace, ...]) -> tuple[str, ...]:
     combined: list[str] = []
     for trace in tuple(prefix_traces or ()):
-        actions = tuple(str(item) for item in tuple(getattr(trace, "action_trace", ())))
         if trace_includes_bootstrap_prefix(trace):
-            combined = list(actions)
             continue
+        actions = tuple(str(item) for item in tuple(getattr(trace, "action_trace", ())))
         combined.extend(actions)
     return tuple(combined)
+
+
+def _append_campaign_debug_marker(*, debug_log_path: str | None, game_id: str, level_id: str, marker: str) -> None:
+    if not debug_log_path:
+        return
+    with open(str(debug_log_path), "a", encoding="utf-8") as handle:
+        handle.write(f"{str(game_id)}|{str(level_id)}|{str(marker)}\n")
+
+
+def _append_campaign_play_marker(
+    *,
+    debug_log_path: str | None,
+    game_id: str,
+    level_id: str,
+    actions: tuple[str, ...] | list[str],
+) -> None:
+    if not debug_log_path:
+        return
+    action_map = {"UP": "U", "DOWN": "D", "LEFT": "L", "RIGHT": "R"}
+    action_text = "".join(action_map.get(str(item).upper(), "") for item in tuple(actions or ()))
+    with open(str(debug_log_path), "a", encoding="utf-8") as handle:
+        handle.write(f"{str(game_id)}|{str(level_id)}|PLAY:{action_text}\n")
 
 
 def _load_replay_valid_db_prefix(
@@ -1288,6 +1369,67 @@ def run_full_bootstrap_analysis_with_adaptive_solve(
 
 def _build_multi_reset_avatar_report(*, plan, episode_transitions, seed: int) -> MultiResetAvatarReport:
     avatar_multi_report = identify_avatar_candidates_multi_reset(episode_transitions)
+    selected = avatar_multi_report.selected
+    if selected.selected_candidate_id is not None:
+        selected_candidate_ids_by_episode: dict[int, str] = {}
+        for evidence in tuple(getattr(avatar_multi_report, "cross_reset_evidence", ())):
+            if evidence.canonical_candidate_id == selected.selected_candidate_id:
+                selected_candidate_ids_by_episode = {
+                    int(episode_index): str(candidate_id)
+                    for episode_index, candidate_id in dict(getattr(evidence, "per_episode_candidate_ids", {}) or {}).items()
+                }
+                break
+        selected_bbox_override = None
+        selected_center_override = None
+        for episode in tuple(avatar_multi_report.episodes):
+            episode_selected_candidate_id = selected_candidate_ids_by_episode.get(
+                int(getattr(episode, "episode_index", -1)),
+                getattr(episode.report.selected, "selected_candidate_id", None),
+            )
+            if episode_selected_candidate_id is None:
+                continue
+            for candidate in tuple(episode.report.candidates):
+                if candidate.candidate_id == episode_selected_candidate_id:
+                    selected_entry_bbox = tuple(candidate.entry_bbox)
+                    selected_bbox_override = selected_entry_bbox
+                    motions = tuple(getattr(candidate, "observed_motion_vectors", ()) or ())
+                    first_motion = motions[0] if motions else None
+                    support_actions = {
+                        str(action).upper()
+                        for action in tuple(getattr(candidate, "support_actions", ()) or ())
+                        if action is not None
+                    }
+                    entry_bbox = tuple(getattr(candidate, "entry_bbox", ()) or ())
+                    entry_touches_edge = False
+                    if len(entry_bbox) == 4:
+                        entry_touches_edge = (
+                            int(entry_bbox[0]) <= 0
+                            or int(entry_bbox[1]) <= 0
+                            or int(entry_bbox[2]) >= 63
+                            or int(entry_bbox[3]) >= 63
+                        )
+                    if (
+                        first_motion is not None
+                        and abs(float(first_motion[0])) < 0.5
+                        and abs(float(first_motion[1])) < 0.5
+                        and {"UP", "DOWN", "LEFT", "RIGHT"}.issubset(support_actions)
+                        and not entry_touches_edge
+                        and getattr(candidate, "bbox", None) is not None
+                    ):
+                        selected_bbox_override = tuple(candidate.bbox)
+                    selected_center_override = (
+                        (selected_bbox_override[0] + selected_bbox_override[2]) / 2.0,
+                        (selected_bbox_override[1] + selected_bbox_override[3]) / 2.0,
+                    )
+                    break
+            if selected_bbox_override is not None:
+                break
+        if selected_bbox_override is not None:
+            selected = replace(
+                selected,
+                selected_bbox=selected_bbox_override,
+                selected_center=selected_center_override,
+            )
     enriched_episodes = tuple(
         ProbeEpisode(
             episode_index=index,
@@ -1301,7 +1443,7 @@ def _build_multi_reset_avatar_report(*, plan, episode_transitions, seed: int) ->
     return MultiResetAvatarReport(
         episodes=enriched_episodes,
         cross_reset_evidence=avatar_multi_report.cross_reset_evidence,
-        selected=avatar_multi_report.selected,
+        selected=selected,
         diagnostics=avatar_multi_report.diagnostics,
     )
 
@@ -1902,8 +2044,10 @@ def run_frontier_level_from_live_session(
     render_terminal: bool = False,
     max_steps: int = 40,
     env_factory: Callable[[], Any] | None = None,
+    debug_log_path: str | None = None,
 ) -> dict[str, Any]:
     episode_count = max(1, int(episode_count))
+    prefix_actions = _flatten_prefix_actions(tuple(prefix_traces or ()))
 
     session_adapter = SessionAdapter()
     plan = build_probe_plan(game_id=game_id, level_id=frontier_level_id)
@@ -1917,6 +2061,24 @@ def run_frontier_level_from_live_session(
             render_terminal=render_terminal,
             env_factory=env_factory,
         )
+        _append_campaign_debug_marker(
+            debug_log_path=debug_log_path,
+            game_id=game_id,
+            level_id=frontier_level_id,
+            marker="BOOTSTRAP",
+        )
+        _append_campaign_debug_marker(
+            debug_log_path=debug_log_path,
+            game_id=game_id,
+            level_id=frontier_level_id,
+            marker="RESET",
+        )
+        _append_campaign_play_marker(
+            debug_log_path=debug_log_path,
+            game_id=game_id,
+            level_id=frontier_level_id,
+            actions=prefix_actions,
+        )
         avatar_bootstrap_mode = "fresh_reset"
     else:
         episode_transitions = run_frontier_avatar_bootstrap_from_frontier(
@@ -1927,6 +2089,7 @@ def run_frontier_level_from_live_session(
             seed=int(seed),
             render_terminal=render_terminal,
             env_factory=env_factory,
+            debug_log_path=debug_log_path,
         )
         avatar_bootstrap_mode = "after_prefix_replay"
     multi = _build_multi_reset_avatar_report(
@@ -2090,11 +2253,6 @@ def run_frontier_level_from_live_session(
         phase_status["contact"] = "skipped"
 
     initial_frontier_actions = tuple()
-    if frontier_level_index > 0 and episode_transitions and episode_transitions[0]:
-        first_transition = tuple(episode_transitions[0])[0]
-        first_action = getattr(first_transition, "action", None)
-        if first_action:
-            initial_frontier_actions = (str(first_action),)
 
     with open("/tmp/v5_debug.log", "a") as f: f.write(f"[DEBUG] About to call run_adaptive_solve_on_live_session\n"); f.flush()
     adaptive = run_adaptive_solve_on_live_session(
@@ -2111,6 +2269,7 @@ def run_frontier_level_from_live_session(
         initial_frontier_actions=initial_frontier_actions,
         render_terminal=render_terminal,
         env_factory=env_factory,
+        debug_log_path=debug_log_path,
     )
     adaptive_paths = write_adaptive_solve_artifacts(run_dir=run_dir, report=adaptive)
     artifact_paths.update(adaptive_paths)
@@ -2215,6 +2374,7 @@ def run_frontier_continuation_from_live_session(
     render_terminal: bool = False,
     max_steps: int = 40,
     env_factory: Callable[[], Any] | None = None,
+    debug_log_path: str | None = None,
 ) -> dict[str, Any]:
     session_adapter = SessionAdapter()
     current_obs = session_adapter.get_current_observation(session)
@@ -2226,88 +2386,68 @@ def run_frontier_continuation_from_live_session(
         getattr(selected_avatar, "value_histogram", None),
         frontier_reanchor=True,
     )
-    try:
-        session_adapter.close_session(session)
-    except Exception:
-        pass
-    if avatar_reanchored is None:
+    expected_level_index = int(str(next_level_id).lstrip("L") or 0)
+    current_level_index = int(getattr(current_obs, "levels_completed", 0) or 0)
+    continuation_mode = "live_session"
+
+    active_session = session
+    if current_level_index < expected_level_index:
+        continuation_mode = "replay_fallback"
+        try:
+            session_adapter.close_session(session)
+        except Exception:
+            pass
         replay = replay_prefix_traces_to_frontier(
             game_id=game_id,
             prefix_traces=tuple(prefix_traces or ()),
             render_terminal=bool(render_terminal),
             env_factory=env_factory,
         )
-        if replay.get("session") is None:
+        active_session = replay.get("session")
+        if active_session is None:
             return {
                 "game_id": game_id,
                 "level_id": str(next_level_id),
-                "phase_status": {"avatar": "failed", "poi": "skipped", "contact": "skipped", "hud": "skipped", "hud_targeting": "skipped", "adaptive_solve": "failed"},
+                "phase_status": {"avatar": "ok" if avatar_reanchored is not None else "failed", "poi": "skipped", "contact": "skipped", "hud": "skipped", "hud_targeting": "skipped", "adaptive_solve": "failed"},
                 "artifact_paths": {},
                 "solved": False,
                 "failure_reason": "prefix_replay_failed",
                 "solution": LevelSolution(game_id=game_id, level_id=str(next_level_id), solved=False, action_trace=tuple(), step_count=0, terminal=False, level_transition=False, failure_reason="prefix_replay_failed").to_dict(),
                 "saved_trace": None,
                 "diagnostics": {
-                    "avatar_bootstrap_mode": "live_frontier",
-                    "continued_from_live_session": True,
+                    "avatar_bootstrap_mode": "after_prefix_replay",
+                    "continuation_mode": continuation_mode,
+                    "continued_from_live_session": False,
                     "used_replay_prefix": bool(prefix_traces),
+                    "replay_prefix_used": bool(prefix_traces),
                     "replay_prefix_length": int(sum(len(item.action_trace) for item in tuple(prefix_traces or ()))),
-                    "live_avatar_reanchor_ok": False,
+                    "live_avatar_reanchor_ok": avatar_reanchored is not None,
                 },
             }
-        fallback = run_frontier_level_from_live_session(
-            game_id=game_id,
-            frontier_level_id=str(next_level_id),
-            session=replay.get("session"),
-            prefix_traces=tuple(prefix_traces or ()),
-            output_dir=output_dir,
-            seed=seed,
-            episode_count=episode_count,
-            probe_montage=probe_montage,
-            render_terminal=render_terminal,
-            max_steps=max_steps,
-            env_factory=env_factory,
-        )
-        fallback.setdefault("diagnostics", {})
-        fallback["diagnostics"].update(
-            {
-                "avatar_bootstrap_mode": "live_frontier",
-                "continued_from_live_session": True,
-                "used_replay_prefix": bool(prefix_traces),
-                "replay_prefix_length": int(sum(len(item.action_trace) for item in tuple(prefix_traces or ()))),
-                "live_avatar_reanchor_ok": False,
-            }
-        )
-        return fallback
-
-    replay = replay_prefix_traces_to_frontier(
-        game_id=game_id,
-        prefix_traces=tuple(prefix_traces or ()),
-        render_terminal=bool(render_terminal),
-        env_factory=env_factory,
-    )
-    if replay.get("session") is None:
+    if active_session is None:
         return {
             "game_id": game_id,
             "level_id": str(next_level_id),
-            "phase_status": {"avatar": "ok", "poi": "skipped", "contact": "skipped", "hud": "skipped", "hud_targeting": "skipped", "adaptive_solve": "failed"},
+            "phase_status": {"avatar": "ok" if avatar_reanchored is not None else "failed", "poi": "skipped", "contact": "skipped", "hud": "skipped", "hud_targeting": "skipped", "adaptive_solve": "failed"},
             "artifact_paths": {},
             "solved": False,
             "failure_reason": "prefix_replay_failed",
             "solution": LevelSolution(game_id=game_id, level_id=str(next_level_id), solved=False, action_trace=tuple(), step_count=0, terminal=False, level_transition=False, failure_reason="prefix_replay_failed").to_dict(),
             "saved_trace": None,
             "diagnostics": {
-                "avatar_bootstrap_mode": "live_frontier",
-                "continued_from_live_session": True,
+                "avatar_bootstrap_mode": "after_prefix_replay",
+                "continuation_mode": continuation_mode,
+                "continued_from_live_session": False,
                 "used_replay_prefix": bool(prefix_traces),
+                "replay_prefix_used": bool(prefix_traces),
                 "replay_prefix_length": int(sum(len(item.action_trace) for item in tuple(prefix_traces or ()))),
-                "live_avatar_reanchor_ok": True,
+                "live_avatar_reanchor_ok": avatar_reanchored is not None,
             },
         }
     result = run_frontier_level_from_live_session(
         game_id=game_id,
         frontier_level_id=str(next_level_id),
-        session=replay.get("session"),
+        session=active_session,
         prefix_traces=tuple(prefix_traces or ()),
         output_dir=output_dir,
         seed=seed,
@@ -2316,15 +2456,18 @@ def run_frontier_continuation_from_live_session(
         render_terminal=render_terminal,
         max_steps=max_steps,
         env_factory=env_factory,
+        debug_log_path=debug_log_path,
     )
     result.setdefault("diagnostics", {})
     result["diagnostics"].update(
         {
-            "avatar_bootstrap_mode": "live_frontier",
-            "continued_from_live_session": True,
+            "avatar_bootstrap_mode": "after_prefix_replay" if continuation_mode != "live_session" else "live_frontier",
+            "continuation_mode": continuation_mode,
+            "continued_from_live_session": continuation_mode == "live_session",
             "used_replay_prefix": bool(prefix_traces),
+            "replay_prefix_used": bool(prefix_traces),
             "replay_prefix_length": int(sum(len(item.action_trace) for item in tuple(prefix_traces or ()))),
-            "live_avatar_reanchor_ok": True,
+            "live_avatar_reanchor_ok": avatar_reanchored is not None,
         }
     )
     return result
@@ -2339,8 +2482,40 @@ def run_frontier_avatar_bootstrap_from_frontier(
     seed: int,
     render_terminal: bool,
     env_factory: Callable[[], Any] | None = None,
+    debug_log_path: str | None = None,
 ) -> tuple[tuple[ProbeTransitionRecord, ...], ...]:
     plan = build_probe_plan(game_id=game_id, level_id=frontier_level_id)
+    prefix_actions = _flatten_prefix_actions(tuple(prefix_traces or ()))
+    # On frontier levels reached through solved-prefix replay, the bootstrap
+    # probe can leave the avatar offset from the true entry position. Run one
+    # warm-up probe and discard it, then reset/replay to the frontier again and
+    # capture the probe transitions that will feed avatar identification.
+    run_probe_episodes_at_frontier(
+        plan=plan,
+        prefix_traces=tuple(prefix_traces or ()),
+        episode_count=int(episode_count),
+        base_seed=int(seed),
+        render_terminal=False,
+        env_factory=env_factory,
+    )
+    _append_campaign_debug_marker(
+        debug_log_path=debug_log_path,
+        game_id=game_id,
+        level_id=frontier_level_id,
+        marker="BOOTSTRAP",
+    )
+    _append_campaign_debug_marker(
+        debug_log_path=debug_log_path,
+        game_id=game_id,
+        level_id=frontier_level_id,
+        marker="RESET",
+    )
+    _append_campaign_play_marker(
+        debug_log_path=debug_log_path,
+        game_id=game_id,
+        level_id=frontier_level_id,
+        actions=prefix_actions,
+    )
     return run_probe_episodes_at_frontier(
         plan=plan,
         prefix_traces=tuple(prefix_traces or ()),
@@ -2493,6 +2668,7 @@ def run_full_campaign_analysis(
     env_factory: Callable[[], Any] | None = None,
     max_steps: int = 40,
     use_solutions: bool = False,
+    debug: bool = False,
 ) -> dict[str, Any]:
     import sqlite3
     from pathlib import Path as PathLib
@@ -2501,6 +2677,11 @@ def run_full_campaign_analysis(
     episode_count = max(1, int(episode_count))
     trace_db_path = initialize_trace_store(_get_trace_db_path(output_dir, game_id))
     level_sequence = get_level_sequence_for_game(game_id, env_factory=env_factory)
+    base_output_dir = PathLib(output_dir) if output_dir else PathLib("runs_v5_0")
+    debug_log_path = str(base_output_dir / "debug.log") if bool(debug) else None
+    if debug_log_path is not None:
+        PathLib(debug_log_path).parent.mkdir(parents=True, exist_ok=True)
+        PathLib(debug_log_path).write_text("", encoding="utf-8")
     state = load_or_initialize_campaign_state(
         game_id=game_id,
         level_sequence=level_sequence,
@@ -2515,6 +2696,7 @@ def run_full_campaign_analysis(
     failure_reason = None
     global_step = 0
     db_solved_levels = get_db_solved_levels_for_game(game_id=game_id, trace_db_path=trace_db_path)
+    replay_valid_db_prefix = tuple()
     if bool(use_solutions):
         if hasattr(get_verified_prefix_traces, "mock_calls"):
             replay_valid_db_prefix = get_verified_prefix_traces(
@@ -2558,6 +2740,7 @@ def run_full_campaign_analysis(
     frontier_attempt_artifacts: dict[str, str] = {}
     continuation_context: dict[str, Any] | None = None
     rendered_db_solution_prefix = False
+    terminal_campaign_complete = False
 
     session_adapter = SessionAdapter()
     session = None
@@ -2808,6 +2991,7 @@ def run_full_campaign_analysis(
                 render_terminal=render_terminal,
                 max_steps=max_steps,
                 env_factory=env_factory,
+                debug_log_path=debug_log_path,
             )
         else:
             frontier_result = run_frontier_level_from_live_session(
@@ -2822,6 +3006,7 @@ def run_full_campaign_analysis(
                 render_terminal=render_terminal,
                 max_steps=max_steps,
                 env_factory=env_factory,
+                debug_log_path=debug_log_path,
             )
         solved = bool(frontier_result.get("solved", False))
         solution_payload = dict(frontier_result.get("solution", {}))
@@ -2880,10 +3065,10 @@ def run_full_campaign_analysis(
                 step_index=index,
                 action=action,
                 target_poi_id=None,
-                reason="bootstrap_replay",
+                reason="solved_prefix_replay",
                 pre_level_index=max(0, int(str(frontier).lstrip("L") or 0)),
                 post_level_index=max(0, int(str(frontier).lstrip("L") or 0)),
-                source="bootstrap_replay",
+                source="solved_prefix_replay",
                 pre_frame=None,
                 post_frame=None,
                 invalid_action=False,
@@ -2999,9 +3184,7 @@ def run_full_campaign_analysis(
             solution_trace_steps = tuple(parsed_solution_actions)
             solution_trace_actions = tuple(str(item.action) for item in solution_trace_steps)
             solution_trace_sources = tuple(
-                "frontier_solve"
-                if str(getattr(item, "source", "frontier_solve")) == "bootstrap_replay"
-                else str(getattr(item, "source", "frontier_solve"))
+                str(getattr(item, "source", "frontier_solve"))
                 for item in solution_trace_steps
             )
             if not solution_trace_actions:
@@ -3010,21 +3193,33 @@ def run_full_campaign_analysis(
                 filtered_raw = tuple(
                     (
                         action,
-                        "frontier_solve"
-                        if (raw_sources[index] if index < len(raw_sources) else "frontier_solve") == "bootstrap_replay"
-                        else (raw_sources[index] if index < len(raw_sources) else "frontier_solve"),
+                        (raw_sources[index] if index < len(raw_sources) else "frontier_solve"),
                     )
                     for index, action in enumerate(raw_actions)
                 )
                 solution_trace_actions = tuple(action for action, _source in filtered_raw)
                 solution_trace_sources = tuple(source for _action, source in filtered_raw)
-            executed_trace_records = tuple(
-                {
-                    "action": action,
-                    "source": (solution_trace_sources[index] if index < len(solution_trace_sources) else "frontier_solve"),
-                }
-                for index, action in enumerate(solution_trace_actions)
-            )
+            executed_trace_records_list = []
+            for index, action in enumerate(solution_trace_actions):
+                if index < len(solution_trace_steps):
+                    step = solution_trace_steps[index]
+                    executed_trace_records_list.append(
+                        {
+                            "action": str(step.action),
+                            "source": str(getattr(step, "source", "frontier_solve")),
+                            "pre_level_index": int(getattr(step, "pre_level_index", max(0, int(str(frontier).lstrip("L") or 0)))),
+                            "post_level_index": int(getattr(step, "post_level_index", max(0, int(str(frontier).lstrip("L") or 0)))),
+                            "terminal": bool(getattr(step, "terminal", False)),
+                        }
+                    )
+                else:
+                    executed_trace_records_list.append(
+                        {
+                            "action": action,
+                            "source": (solution_trace_sources[index] if index < len(solution_trace_sources) else "frontier_solve"),
+                        }
+                    )
+            executed_trace_records = tuple(executed_trace_records_list)
             finalized = finalize_solved_level_trace(
                 solved_level_result=level_result.solution,
                 executed_actions=executed_trace_records,
@@ -3074,9 +3269,6 @@ def run_full_campaign_analysis(
             # Add verified trace to current run traces for use as prefix
             if bool(finalized.get("replay_verified", False)) and validate_prefix_trace_entry(verified_trace):
                 current_run_traces[str(frontier)] = verified_trace
-            # If trace not replay-verified but level solved via live continuation, still use it as prefix
-            elif using_live_continuation and validate_prefix_trace_entry(verified_trace):
-                current_run_traces[str(frontier)] = verified_trace
 
             # continue in-session without reset/replay when next level is already loaded.
             try:
@@ -3095,6 +3287,9 @@ def run_full_campaign_analysis(
                 trace_path=trace_paths.get("saved_level_trace.json"),
                 step_count=int(verified_trace.step_count),
             )
+            if bool(solution_payload.get("terminal", False)):
+                terminal_campaign_complete = True
+                break
             # Only break if replay verification failed AND not using live continuation
             if not bool(finalized.get("replay_verified", False)) and not using_live_continuation:
                 failure_reason = str(finalized.get("failure_reason") or "trace_replay_verification_failed")
@@ -3143,7 +3338,18 @@ def run_full_campaign_analysis(
             failure_reason = frontier_result.get("failure_reason") or "frontier_unsolved"
             break
 
-    solved_all = failure_reason is None and all(bool(state[level_id].solved) for level_id in level_sequence)
+    campaign_step_trace = list(
+        _with_missing_solution_prefix_steps(
+            campaign_steps=tuple(campaign_step_trace),
+            level_sequence=tuple(str(item) for item in level_sequence),
+            replay_valid_db_prefix_by_level=replay_valid_db_prefix_by_level,
+        )
+    )
+    global_trace = list(campaign_step_trace)
+
+    solved_all = bool(terminal_campaign_complete) or (
+        failure_reason is None and all(bool(state[level_id].solved) for level_id in level_sequence)
+    )
     report = CampaignRunReport(
         game_id=game_id,
         levels=tuple(level_results),
@@ -3244,6 +3450,39 @@ def run_full_campaign_analysis(
             level_payload["saved_solution_action_count"] = int(level_trace_rows[index].get("saved_solution_action_count", 0))
     output["artifact_paths"] = artifacts
 
+    saved_trace_actions_by_level = {
+        str(getattr(trace, "level_id", "")): [
+            str(action) for action in tuple(getattr(trace, "action_trace", ()) or ()) if action is not None
+        ]
+        for trace in tuple(replay_valid_db_prefix or ()) + tuple(current_run_traces.values())
+        if getattr(trace, "level_id", None) is not None
+    }
+
+    def _load_level_action_sequence(level_id: str) -> list[str]:
+        actions = list(actions_by_level.get(str(level_id), ()))
+        if actions:
+            return actions
+        saved_trace_actions = list(saved_trace_actions_by_level.get(str(level_id), ()))
+        if saved_trace_actions:
+            return saved_trace_actions
+        level_dir = game_root / str(level_id)
+        candidate_paths = (
+            level_dir / "saved_level_trace_actions.json",
+            level_dir / "level_solution_actions.json",
+        )
+        for candidate_path in candidate_paths:
+            if not candidate_path.exists():
+                continue
+            try:
+                payload = json.loads(candidate_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if isinstance(payload, list):
+                parsed = [str(item) for item in payload if item is not None]
+                if parsed:
+                    return parsed
+        return []
+
     # Print action sequences per level
     print("\n" + "="*60)
     print("ACTION SEQUENCES PER LEVEL")
@@ -3255,6 +3494,17 @@ def run_full_campaign_analysis(
         try:
             with open(campaign_trace_path) as f:
                 trace_data = json.load(f)
+
+            solved_by_level = {
+                str(level_payload.get("level_id")): bool(level_payload.get("solved", False))
+                for level_payload in output.get("levels", [])
+                if level_payload.get("level_id") is not None
+            }
+            if not solved_by_level:
+                solved_by_level = {
+                    str(level_id): bool(getattr(level_state, "solved", False))
+                    for level_id, level_state in state.items()
+                }
 
             # Group actions by level_id
             actions_by_level = {}
@@ -3268,7 +3518,10 @@ def run_full_campaign_analysis(
 
             # Print in level sequence order
             for level_id in level_sequence:
-                actions = actions_by_level.get(level_id, [])
+                if not solved_by_level.get(str(level_id), False):
+                    print(f"{level_id}: [no actions]")
+                    continue
+                actions = _load_level_action_sequence(str(level_id))
                 if actions:
                     # Convert action names to letters: UP->U, DOWN->D, LEFT->L, RIGHT->R
                     action_map = {"UP": "U", "DOWN": "D", "LEFT": "L", "RIGHT": "R"}

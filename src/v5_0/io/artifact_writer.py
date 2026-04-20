@@ -544,6 +544,7 @@ def write_adaptive_solve_artifacts(
     summary_path = run_dir / "adaptive_solve_summary.json"
     diagnostics_path = run_dir / "adaptive_solve_diagnostics.json"
     steps_path = run_dir / "adaptive_solve_steps.json"
+    partial_path = run_dir / "partial_successful_action_sequences.json"
 
     summary_path.write_text(
         json.dumps(
@@ -566,6 +567,8 @@ def write_adaptive_solve_artifacts(
             all_steps.append(payload)
     all_steps.sort(key=lambda item: (int(item.get("episode_index", 0)), int(item.get("step_index", 0))))
     steps_path.write_text(json.dumps(all_steps, indent=2), encoding="utf-8")
+    partial_sequences = tuple(getattr(report, "partial_successful_action_sequences", ()) or ())
+    partial_path.write_text(json.dumps(list(partial_sequences), indent=2), encoding="utf-8")
 
     for episode in report.episodes:
         episode_dir = run_dir / f"episode_{int(episode.episode_index):03d}"
@@ -579,6 +582,7 @@ def write_adaptive_solve_artifacts(
         "adaptive_solve_summary.json": str(summary_path),
         "adaptive_solve_diagnostics.json": str(diagnostics_path),
         "adaptive_solve_steps.json": str(steps_path),
+        "partial_successful_action_sequences.json": str(partial_path),
     }
 
 

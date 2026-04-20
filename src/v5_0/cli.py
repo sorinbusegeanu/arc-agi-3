@@ -8,7 +8,6 @@ from pathlib import Path
 from v5_0.io.artifact_writer import get_game_root_output_dir
 from v5_0.io.final_video_builder import build_final_game_video
 from v5_0.runtime.run_avatar_bootstrap import (
-    SUPPORTED_GAMES,
     replay_saved_level_solution,
     run_full_campaign_analysis,
     run_trace_analysis_for_game,
@@ -70,13 +69,14 @@ STDOUT_HIDE_KEYS: frozenset[str] = frozenset(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="v5.0 avatar bootstrap CLI")
-    parser.add_argument("--game-id", required=True, help=f"Supported: {', '.join(SUPPORTED_GAMES)}")
+    parser.add_argument("--game-id", required=True, help="Game identifier, or comma-separated game identifiers to run in sequence")
     parser.add_argument("--output-dir", default=None, help="Output root (defaults under runs_v5_0)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--probe-montage", action="store_true")
     parser.add_argument("--video", action="store_true")
     parser.add_argument("--video-debug-all", action="store_true")
     parser.add_argument("--render-terminal", action="store_true")
+    parser.add_argument("--debug", action="store_true")
     parser.add_argument("--multi-reset", action="store_true")
     parser.add_argument("--episode-count", type=int, default=1)
     parser.add_argument("--full-analysis", action="store_true")
@@ -197,8 +197,14 @@ def _print_json_stdout(payload) -> None:
     print(json.dumps(_sanitize_stdout_payload(payload), indent=2))
 
 
-def main() -> int:
-    args = build_parser().parse_args()
+def _split_game_ids(value: str) -> tuple[str, ...]:
+    game_ids = tuple(item.strip() for item in str(value).split(",") if item.strip())
+    if not game_ids:
+        raise SystemExit("--game-id must include at least one game identifier")
+    return game_ids
+
+
+def _run_single_game_with_payload(args: argparse.Namespace) -> tuple[int, dict | None]:
     campaign_mode = bool(args.campaign_solve)
     cli_episode_count = int(args.episode_count)
 
@@ -246,6 +252,7 @@ def main() -> int:
             render_terminal=bool(args.render_terminal),
             max_steps=int(args.max_steps),
             use_solutions=bool(args.use_solutions),
+            debug=bool(args.debug),
         )
         stdout_result = dict(result)
         stdout_result.pop("global_action_trace", None)
@@ -265,7 +272,7 @@ def main() -> int:
                 artifacts["final_run.mp4"] = str(video_artifacts.get("final_video_path"))
             stdout_result["artifact_paths"] = artifacts
         _print_json_stdout(stdout_result)
-        return 0 if bool(result.get("solved", False)) else 2
+        return (0 if bool(result.get("solved", False)) else 2, dict(result))
 
     if args.trace_analysis or args.optimize_traces:
         try:
@@ -276,19 +283,18 @@ def main() -> int:
             )
             payload["global_trace_store_path"] = get_global_trace_store_path()
             _print_json_stdout(payload)
-            return 0
+            return 0, dict(payload)
         except Exception as exc:
-            _print_json_stdout(
-                {
-                    "game_id": args.game_id,
-                    "global_trace_store_path": get_global_trace_store_path(),
-                    "solved_level_count": 0,
-                    "analyzed_level_count": 0,
-                    "reports": [],
-                    "failure_reason": str(exc),
-                }
-            )
-            return 2
+            payload = {
+                "game_id": args.game_id,
+                "global_trace_store_path": get_global_trace_store_path(),
+                "solved_level_count": 0,
+                "analyzed_level_count": 0,
+                "reports": [],
+                "failure_reason": str(exc),
+            }
+            _print_json_stdout(payload)
+            return 2, payload
 
     if args.replay_trace:
         trace_path = Path(str(args.trace_file))
@@ -306,7 +312,7 @@ def main() -> int:
             render_terminal=bool(args.render_terminal),
         )
         _print_json_stdout(result)
-        return 0 if bool(result.get("success", False)) and not bool(result.get("divergence", False)) else 2
+        return (0 if bool(result.get("success", False)) and not bool(result.get("divergence", False)) else 2, dict(result))
 
     if args.replay_solution:
         solution_path = Path(str(args.solution_file))
@@ -322,7 +328,7 @@ def main() -> int:
             render_terminal=bool(args.render_terminal),
         )
         _print_json_stdout(result)
-        return 0 if bool(result.get("solved", False)) else 2
+        return (0 if bool(result.get("solved", False)) else 2, dict(result))
 
     if args.all_levels:
         result = run_full_analysis_for_game_levels(
@@ -344,7 +350,7 @@ def main() -> int:
         )
         _print_json_stdout(result)
         solved = int(result.get("diagnostics", {}).get("solved_level_count", 0))
-        return 0 if solved > 0 else 2
+        return (0 if solved > 0 else 2, dict(result))
 
     if args.level_id and args.full_analysis:
         result = run_full_analysis_for_level(
@@ -365,7 +371,7 @@ def main() -> int:
             artifact_paths=dict(result.get("artifact_paths", {})),
         )
         _print_json_stdout(result)
-        return 0 if bool(result.get("solved", False)) else 2
+        return (0 if bool(result.get("solved", False)) else 2, dict(result))
 
     if args.full_analysis:
         if args.adaptive_solve:
@@ -394,7 +400,7 @@ def main() -> int:
                 artifact_paths=dict(result.get("artifact_paths", {})),
             )
             _print_json_stdout(payload)
-            return 0 if bool(result.get("adaptive_solve", {}).get("solved", False)) else 2
+            return (0 if bool(result.get("adaptive_solve", {}).get("solved", False)) else 2, dict(payload))
 
         if args.mechanic_aware_solve:
             result = run_full_bootstrap_analysis_with_mechanics(
@@ -422,7 +428,7 @@ def main() -> int:
                 artifact_paths=dict(result.get("artifact_paths", {})),
             )
             _print_json_stdout(payload)
-            return 0 if bool(result.get("solve", {}).get("solved", False)) else 2
+            return (0 if bool(result.get("solve", {}).get("solved", False)) else 2, dict(payload))
 
         if args.solve:
             result = run_full_bootstrap_analysis_with_solve(
@@ -450,7 +456,7 @@ def main() -> int:
                 artifact_paths=dict(result.get("artifact_paths", {})),
             )
             _print_json_stdout(payload)
-            return 0 if bool(result.get("solve", {}).get("solved", False)) else 2
+            return (0 if bool(result.get("solve", {}).get("solved", False)) else 2, dict(payload))
 
         if args.interpret_hud_target:
             result = run_full_bootstrap_analysis_with_hud_targeting(
@@ -480,7 +486,7 @@ def main() -> int:
             hud_targeting = dict(result.get("hud_targeting", {}))
             selected_poi_id = hud_targeting.get("selected_poi_id")
             ambiguous = bool(hud_targeting.get("ambiguous", True))
-            return 0 if selected_poi_id is not None and not ambiguous else 2
+            return (0 if selected_poi_id is not None and not ambiguous else 2, dict(payload))
 
         result = run_full_bootstrap_analysis(
             game_id=args.game_id,
@@ -506,7 +512,7 @@ def main() -> int:
             artifact_paths=dict(result.get("artifact_paths", {})),
         )
         _print_json_stdout(payload)
-        return 0 if result.get("phase_status", {}).get("avatar") == "ok" else 2
+        return (0 if result.get("phase_status", {}).get("avatar") == "ok" else 2, dict(payload))
 
     if args.run_contact_experiments:
         result = run_avatar_poi_contact_bootstrap_multi_reset(
@@ -527,7 +533,7 @@ def main() -> int:
         _print_json_stdout(result)
         stable_avatar = result.get("selected_avatar", {}).get("failure_reason") is None
         contact_ok = bool(result.get("artifact_paths", {}).get("contact_experiments_summary.json"))
-        return 0 if stable_avatar and contact_ok else 2
+        return (0 if stable_avatar and contact_ok else 2, dict(result))
 
     if args.discover_pois:
         result = run_avatar_and_poi_bootstrap_multi_reset(
@@ -548,7 +554,7 @@ def main() -> int:
         _print_json_stdout(result)
         stable_avatar = result.get("selected_avatar", {}).get("failure_reason") is None
         poi_ok = bool(result.get("artifact_paths", {}).get("poi_summary.json"))
-        return 0 if stable_avatar and poi_ok else 2
+        return (0 if stable_avatar and poi_ok else 2, dict(result))
 
     if args.detect_hud:
         result = run_avatar_poi_hud_bootstrap_multi_reset(
@@ -569,7 +575,7 @@ def main() -> int:
         _print_json_stdout(result)
         hud_ok = bool(result.get("artifact_paths", {}).get("hud_summary.json"))
         hud_failed = result.get("hud_diagnostics", {}).get("failure_reason") is not None
-        return 0 if hud_ok and not hud_failed else 2
+        return (0 if hud_ok and not hud_failed else 2, dict(result))
 
     if args.multi_reset:
         result = run_avatar_bootstrap_multi_reset(
@@ -588,7 +594,7 @@ def main() -> int:
             artifact_paths=dict(result.get("artifact_paths", {})),
         )
         _print_json_stdout(result)
-        return 0 if result.get("stable_avatar_found", False) else 2
+        return (0 if result.get("stable_avatar_found", False) else 2, dict(result))
 
     result = run_avatar_bootstrap(
         game_id=args.game_id,
@@ -606,8 +612,57 @@ def main() -> int:
     )
     _print_json_stdout(result)
     if not result.get("reliable_rank1", False):
-        return 2
-    return 0
+        return 2, dict(result)
+    return 0, dict(result)
+
+
+def _run_single_game(args: argparse.Namespace) -> int:
+    code, _payload = _run_single_game_with_payload(args)
+    return code
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    game_ids = _split_game_ids(args.game_id)
+    if len(game_ids) == 1:
+        args.game_id = game_ids[0]
+        return _run_single_game(args)
+
+    exit_code = 0
+    campaign_solved_levels = 0
+    campaign_total_levels = 0
+    campaign_game_count = 0
+    for game_id in game_ids:
+        per_game_args = argparse.Namespace(**{**vars(args), "game_id": game_id})
+        code, payload = _run_single_game_with_payload(per_game_args)
+        if code != 0 and exit_code == 0:
+            exit_code = code
+        if bool(args.campaign_solve) and isinstance(payload, dict):
+            diagnostics = dict(payload.get("diagnostics", {}) or {})
+            levels = tuple(payload.get("levels", ()) or ())
+            solved_from_levels = sum(1 for level in levels if bool(level.get("solved", False)))
+            solved_from_diagnostics = diagnostics.get("solved_level_count")
+            requested_from_diagnostics = diagnostics.get("requested_level_count")
+            solved_level_count = (
+                solved_from_levels
+                if levels
+                else (0 if solved_from_diagnostics is None else solved_from_diagnostics)
+            )
+            requested_level_count = (
+                requested_from_diagnostics
+                if requested_from_diagnostics is not None
+                else len(levels)
+            )
+            campaign_solved_levels += int(solved_level_count or 0)
+            campaign_total_levels += int(requested_level_count or 0)
+            campaign_game_count += 1
+    if bool(args.campaign_solve) and campaign_game_count > 1 and campaign_total_levels > 0:
+        _print_json_stdout(
+            {
+                "summary_text": f"{int(campaign_solved_levels)} levels out of {int(campaign_total_levels)} for {int(campaign_game_count)} games"
+            }
+        )
+    return exit_code
 
 
 if __name__ == "__main__":

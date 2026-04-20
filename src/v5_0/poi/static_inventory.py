@@ -26,8 +26,18 @@ def build_static_object_inventory(
         if not frame:
             continue
         background = _dominant_value(frame)
-        foreground = {(x, y) for y, row in enumerate(frame) for x, value in enumerate(row) if int(value) != background}
-        for component in _connected_components(foreground):
+        foreground_by_value: dict[int, set[tuple[int, int]]] = {}
+        for y, row in enumerate(frame):
+            for x, value in enumerate(row):
+                color = int(value)
+                if color == background:
+                    continue
+                foreground_by_value.setdefault(color, set()).add((x, y))
+        for component in tuple(
+            component
+            for cells in foreground_by_value.values()
+            for component in _connected_components(cells)
+        ):
             bbox = _bbox(component)
             area = len(component)
             if _bbox_iou(bbox, avatar_bbox) >= 0.2:

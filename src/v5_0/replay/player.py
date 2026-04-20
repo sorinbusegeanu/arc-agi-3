@@ -73,10 +73,10 @@ def replay_trace_at_frontier(
 ) -> dict[str, Any]:
     prefix_actions = _compose_prefix_actions(tuple(prefix_traces or ()))
     frontier_actions = _extract_actions(frontier_trace)
-    frontier_has_bootstrap = trace_includes_bootstrap_prefix(frontier_trace)
+    frontier_has_embedded_prefix = _trace_has_embedded_prefix(frontier_trace)
 
     expected_frontier = int(str(level_id).lstrip("L") or 0)
-    if not frontier_has_bootstrap:
+    if not frontier_has_embedded_prefix:
         prefix_result = replay_saved_trace(
             game_id=game_id,
             action_trace=tuple(prefix_actions),
@@ -103,7 +103,7 @@ def replay_trace_at_frontier(
                 "executed_action_count": int(prefix_result.get("executed_action_count", 0)),
             }
 
-    combined = frontier_actions if frontier_has_bootstrap else (tuple(prefix_actions) + frontier_actions)
+    combined = frontier_actions if frontier_has_embedded_prefix else (tuple(prefix_actions) + frontier_actions)
     result = replay_saved_trace(
         game_id=game_id,
         action_trace=combined,
@@ -236,21 +236,38 @@ def replay_prefix_to_frontier(
     }
 
 
+BOOTSTRAP_REPLAY_SOURCE = "bootstrap_replay"
+SOLVED_PREFIX_REPLAY_SOURCE = "solved_prefix_replay"
+FRONTIER_PREFIX_REPLAY_SOURCE = "frontier_prefix_replay"
+
+
+def is_bootstrap_replay_source(source: str | None) -> bool:
+    return str(source or "") == BOOTSTRAP_REPLAY_SOURCE
+
+
+def is_solved_prefix_replay_source(source: str | None) -> bool:
+    return str(source or "") == SOLVED_PREFIX_REPLAY_SOURCE
+
+
+def is_frontier_prefix_replay_source(source: str | None) -> bool:
+    return str(source or "") == FRONTIER_PREFIX_REPLAY_SOURCE
+
+
 def trace_includes_bootstrap_prefix(saved_trace) -> bool:
     if saved_trace is None:
         return False
     if isinstance(saved_trace, dict):
         sources = saved_trace.get("action_sources")
         if isinstance(sources, (list, tuple)):
-            return any(str(item) == "bootstrap_replay" for item in sources)
+            return any(is_bootstrap_replay_source(str(item)) for item in sources)
     sources = getattr(saved_trace, "action_sources", None)
     if isinstance(sources, (list, tuple)):
-        return any(str(item) == "bootstrap_replay" for item in tuple(sources))
+        return any(is_bootstrap_replay_source(str(item)) for item in tuple(sources))
     actions = getattr(saved_trace, "action_trace", None)
     if isinstance(actions, (list, tuple)) and actions:
         first = actions[0]
         if isinstance(first, dict):
-            return any(str(item.get("source", "")) == "bootstrap_replay" for item in actions if isinstance(item, dict))
+            return any(is_bootstrap_replay_source(str(item.get("source", ""))) for item in actions if isinstance(item, dict))
     return False
 
 
@@ -296,18 +313,35 @@ def load_prefix_traces_for_level(
 def _extract_actions(trace_like) -> tuple[str, ...]:
     if trace_like is None:
         return tuple()
+    if isinstance(trace_like, dict):
+        actions = tuple(str(item) for item in tuple(trace_like.get("action_trace", ()) or ()))
+        sources = tuple(str(item) for item in tuple(trace_like.get("action_sources", ()) or ()))
+        if sources and len(sources) == len(actions):
+            return tuple(action for action, source in zip(actions, sources) if not is_bootstrap_replay_source(source))
+        return actions
     if isinstance(trace_like, (list, tuple)):
         return tuple(str(item) for item in tuple(trace_like))
     actions = getattr(trace_like, "action_trace", ())
-    return tuple(str(item) for item in tuple(actions))
+    actions_tuple = tuple(str(item) for item in tuple(actions))
+    sources = tuple(str(item) for item in tuple(getattr(trace_like, "action_sources", ()) or ()))
+    if sources and len(sources) == len(actions_tuple):
+        return tuple(action for action, source in zip(actions_tuple, sources) if not is_bootstrap_replay_source(source))
+    return actions_tuple
+
+
+def _trace_has_embedded_prefix(trace_like) -> bool:
+    if trace_like is None:
+        return False
+    if isinstance(trace_like, dict):
+        sources = tuple(str(item) for item in tuple(trace_like.get("action_sources", ()) or ()))
+    else:
+        sources = tuple(str(item) for item in tuple(getattr(trace_like, "action_sources", ()) or ()))
+    return any(is_solved_prefix_replay_source(source) for source in sources)
 
 
 def _compose_prefix_actions(traces) -> tuple[str, ...]:
     combined: list[str] = []
     for trace in tuple(traces or ()):
         actions = _extract_actions(trace)
-        if trace_includes_bootstrap_prefix(trace):
-            combined = list(actions)
-            continue
         combined.extend(actions)
     return tuple(combined)

@@ -126,6 +126,7 @@ def discover_pois_multi_reset(
     clusters = _cluster_pois_across_resets(successful_reports)
     cross_evidence = _build_cross_reset_poi_evidence(clusters)
     hud_histograms = _extract_hud_candidate_histograms(successful_reports)
+    avatar_histograms = _extract_selected_avatar_histograms(avatar_multi_report)
 
     # Get frame dimensions from first episode's transitions
     frame_width, frame_height = 64, 64  # Default
@@ -138,6 +139,7 @@ def discover_pois_multi_reset(
     ranked_candidates = _rank_cross_reset_candidates(
         cross_evidence,
         hud_histograms=hud_histograms,
+        avatar_histograms=avatar_histograms,
         frame_width=frame_width,
         frame_height=frame_height,
     )
@@ -245,6 +247,7 @@ def _build_cross_reset_poi_evidence(
 def _rank_cross_reset_candidates(
     evidence: tuple[CrossResetPOIEvidence, ...],
     hud_histograms: tuple[dict[int, float], ...] = (),
+    avatar_histograms: tuple[dict[int, float], ...] = (),
     frame_width: int = 64,
     frame_height: int = 64,
 ) -> tuple[POICandidate, ...]:
@@ -253,14 +256,10 @@ def _rank_cross_reset_candidates(
         if not item.bbox_sequence:
             continue
 
-        # Border filtering: Skip POIs that are too close to edges (likely HUD)
-        # Only filter if POI is within 4 pixels of TOP edge (where HUD typically appears)
         bbox = item.bbox_sequence[-1]
-        x0, y0, x1, y1 = bbox
-        dist_to_top = y0
-
-        if dist_to_top < 4:
-            # Skip POIs in top border zone (HUD area)
+        if _is_frame_spanning_candidate(bbox, frame_width=frame_width, frame_height=frame_height):
+            continue
+        if _is_avatar_like_histogram(item.value_histogram_aggregate, avatar_histograms):
             continue
 
         candidate = POICandidate(
@@ -303,6 +302,25 @@ def _rank_cross_reset_candidates(
     return tuple(out)
 
 
+def _is_frame_spanning_candidate(
+    bbox: tuple[int, int, int, int],
+    *,
+    frame_width: int,
+    frame_height: int,
+) -> bool:
+    if int(frame_width) <= 0 or int(frame_height) <= 0:
+        return False
+    bw = max(0, int(bbox[2]) - int(bbox[0]) + 1)
+    bh = max(0, int(bbox[3]) - int(bbox[1]) + 1)
+    frame_area = max(1, int(frame_width) * int(frame_height))
+    bbox_area = int(bw) * int(bh)
+    return bool(
+        bbox_area / frame_area >= 0.45
+        and bw / max(1, int(frame_width)) >= 0.75
+        and bh / max(1, int(frame_height)) >= 0.75
+    )
+
+
 def _extract_hud_candidate_histograms(
     successful_reports: list[tuple[int, POIDiscoveryReport]],
 ) -> tuple[dict[int, float], ...]:
@@ -318,6 +336,46 @@ def _extract_hud_candidate_histograms(
                     if norm:
                         out.append(norm)
     return tuple(out)
+
+
+def _extract_selected_avatar_histograms(avatar_multi_report: MultiResetAvatarReport) -> tuple[dict[int, float], ...]:
+    out: list[dict[int, float]] = []
+    for episode in tuple(getattr(avatar_multi_report, "episodes", ()) or ()):
+        report = getattr(episode, "report", None)
+        selected = getattr(report, "selected", None)
+        selected_id = getattr(selected, "selected_candidate_id", None)
+        if selected_id is None:
+            continue
+        for candidate in tuple(getattr(report, "candidates", ()) or ()):
+            if str(getattr(candidate, "candidate_id", "")) != str(selected_id):
+                continue
+            norm = _normalize_histogram(getattr(candidate, "value_histogram_post", {}) or {})
+            if norm:
+                out.append(norm)
+            break
+        selected_bbox = getattr(selected, "selected_bbox", None)
+        for transition in tuple(getattr(episode, "transitions", ()) or ()):
+            for frame in (getattr(transition, "pre_frame", None), getattr(transition, "post_frame", None)):
+                hist = _histogram_from_bbox(frame, selected_bbox)
+                norm = _normalize_histogram(hist)
+                if norm:
+                    out.append(norm)
+    return tuple(out)
+
+
+def _histogram_from_bbox(frame, bbox) -> dict[int, int]:
+    if frame is None or bbox is None:
+        return {}
+    x0, y0, x1, y1 = (int(v) for v in tuple(bbox))
+    h = len(frame)
+    if h <= 0:
+        return {}
+    w = len(frame[0]) if frame[0] else 0
+    counts: Counter[int] = Counter()
+    for y in range(max(0, y0), min(h - 1, y1) + 1):
+        for x in range(max(0, x0), min(w - 1, x1) + 1):
+            counts[int(frame[y][x])] += 1
+    return dict(sorted(counts.items()))
 
 
 def _normalize_histogram(values: dict[int, int] | dict[str, int]) -> dict[int, float]:
@@ -360,6 +418,38 @@ def _hud_color_correlation_score(candidate_hist: dict[int, int], hud_histograms:
         if score > best:
             best = score
     return float(best)
+
+
+def _is_avatar_like_histogram(candidate_hist: dict[int, int], avatar_histograms: tuple[dict[int, float], ...]) -> bool:
+    if not avatar_histograms:
+        return False
+    candidate_norm = _normalize_histogram(candidate_hist)
+    if not candidate_norm:
+        return False
+    candidate_dom = set(_dominant_non_background_colors(candidate_norm))
+    candidate_primary = max(candidate_norm.items(), key=lambda item: item[1])[0] if candidate_norm else None
+    candidate_primary_share = float(candidate_norm.get(candidate_primary, 0.0)) if candidate_primary is not None else 0.0
+    for avatar_hist in avatar_histograms:
+        avatar_norm = _normalize_histogram(avatar_hist)
+        if not avatar_norm:
+            continue
+        avatar_dom = set(_dominant_non_background_colors(avatar_norm))
+        avatar_primary = max(avatar_norm.items(), key=lambda item: item[1])[0] if avatar_norm else None
+        overlap = _weighted_hist_overlap(candidate_norm, avatar_norm)
+        if (
+            candidate_primary is not None
+            and avatar_primary is not None
+            and candidate_primary == avatar_primary
+            and candidate_primary_share >= 0.6
+            and overlap >= 0.2
+        ):
+            return True
+        if candidate_dom and avatar_dom and (
+            (candidate_dom == avatar_dom and overlap >= 0.8)
+            or (candidate_dom <= avatar_dom and overlap >= 0.3)
+        ):
+            return True
+    return False
 
 
 def _bbox_contains(outer: tuple[int, int, int, int], inner: tuple[int, int, int, int]) -> bool:

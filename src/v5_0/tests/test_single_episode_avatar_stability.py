@@ -21,6 +21,7 @@ class TestSingleEpisodeAvatarStability(unittest.TestCase):
     def _candidate(self, cid: str, score: float = 0.9) -> AvatarCandidate:
         return AvatarCandidate(
             candidate_id=cid,
+            entry_bbox=(1, 1, 2, 2),
             bbox=(1, 1, 2, 2),
             center=(1.5, 1.5),
             score=float(score),

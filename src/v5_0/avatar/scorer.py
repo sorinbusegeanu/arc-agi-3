@@ -80,6 +80,7 @@ def rank_tracks(tracks: tuple[TrackCandidate, ...]) -> tuple[AvatarCandidate, ..
         ranked.append(
             AvatarCandidate(
                 candidate_id=f"candidate_{index:03d}",
+                entry_bbox=track.entry_bbox,
                 bbox=track.bbox,
                 center=track.center,
                 score=float(track.score),

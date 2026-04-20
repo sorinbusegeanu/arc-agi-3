@@ -5,6 +5,13 @@ from math import hypot
 from v5_0.avatar.scorer import aggregate_histograms
 from v5_0.contracts.avatar_types import ScoredStepCandidate, TrackCandidate
 
+_ACTION_DELTAS = {
+    "UP": (0, -1),
+    "DOWN": (0, 1),
+    "LEFT": (-1, 0),
+    "RIGHT": (1, 0),
+}
+
 
 def build_tracks(scored_per_step: tuple[tuple[ScoredStepCandidate, ...], ...]) -> tuple[TrackCandidate, ...]:
     nodes: list[tuple[int, ScoredStepCandidate]] = []
@@ -69,6 +76,7 @@ def _to_track(
         candidates,
         key=lambda item: (item.score, item.component.step_index, item.component.bbox),
     )
+    entry_bbox = _infer_entry_bbox(candidates[0])
     value_pre, value_post = aggregate_histograms(candidates)
 
     mean_step_score = sum(item.score for item in candidates) / max(len(candidates), 1)
@@ -85,6 +93,7 @@ def _to_track(
         support_step_indices=support_steps,
         support_actions=support_actions,
         observed_motion_vectors=motions,
+        entry_bbox=entry_bbox,
         bbox=representative.component.bbox,
         center=representative.component.post_center,
         value_histogram_pre=value_pre,
@@ -95,6 +104,57 @@ def _to_track(
         score=float(confidence),
         support_count=len(candidates),
     )
+
+
+def _infer_entry_bbox(candidate: ScoredStepCandidate) -> tuple[int, int, int, int]:
+    component = candidate.component
+    bbox = tuple(component.bbox)
+    if (
+        abs(float(component.observed_dx)) < 0.5
+        and abs(float(component.observed_dy)) < 0.5
+        and (
+            bool(component.blocked_action)
+            or (
+                abs(float(component.pre_center[0]) - float(component.post_center[0])) < 0.5
+                and abs(float(component.pre_center[1]) - float(component.post_center[1])) < 0.5
+            )
+        )
+    ):
+        return bbox
+    if component.pre_non_background_cells and not component.post_non_background_cells:
+        return bbox
+    if not component.pre_non_background_cells and component.post_non_background_cells:
+        if _is_edge_clamped_post_only_component(component, bbox):
+            return bbox
+    dx_sign, dy_sign = _ACTION_DELTAS.get(str(component.action), (0, 0))
+    width = max(1, int(bbox[2]) - int(bbox[0]) + 1)
+    height = max(1, int(bbox[3]) - int(bbox[1]) + 1)
+    shift_x = int(round(abs(float(component.observed_dx)))) or (width if dx_sign != 0 else 0)
+    shift_y = int(round(abs(float(component.observed_dy)))) or (height if dy_sign != 0 else 0)
+    return (
+        int(bbox[0]) - int(dx_sign * shift_x),
+        int(bbox[1]) - int(dy_sign * shift_y),
+        int(bbox[2]) - int(dx_sign * shift_x),
+        int(bbox[3]) - int(dy_sign * shift_y),
+    )
+
+
+def _is_edge_clamped_post_only_component(
+    component: ScoredStepCandidate.component.__class__,
+    bbox: tuple[int, int, int, int],
+) -> bool:
+    action = str(component.action)
+    frame_width = max(0, int(getattr(component, "frame_width", 0) or 0))
+    frame_height = max(0, int(getattr(component, "frame_height", 0) or 0))
+    if action == "UP":
+        return int(bbox[1]) <= 0
+    if action == "LEFT":
+        return int(bbox[0]) <= 0
+    if action == "DOWN" and frame_height > 0:
+        return int(bbox[3]) >= frame_height - 1
+    if action == "RIGHT" and frame_width > 0:
+        return int(bbox[2]) >= frame_width - 1
+    return False
 
 
 def _link_score(previous: ScoredStepCandidate, current: ScoredStepCandidate) -> float:

@@ -24,6 +24,11 @@ def extract_candidate_components(
             dropped_reasons["empty_frame"] += 1
             per_step.append(())
             continue
+        frame_height = min(len(transition.pre_frame), len(transition.post_frame))
+        frame_width = min(
+            len(transition.pre_frame[0]) if transition.pre_frame and transition.pre_frame[0] else 0,
+            len(transition.post_frame[0]) if transition.post_frame and transition.post_frame[0] else 0,
+        )
 
         changed = _changed_cells(transition.pre_frame, transition.post_frame)
         if not changed:
@@ -40,6 +45,7 @@ def extract_candidate_components(
             post_hist = Counter(int(transition.post_frame[y][x]) for x, y in cells_sorted)
             pre_non_bg = tuple((x, y) for x, y in cells_sorted if int(transition.pre_frame[y][x]) != pre_bg)
             post_non_bg = tuple((x, y) for x, y in cells_sorted if int(transition.post_frame[y][x]) != post_bg)
+            object_cells = post_non_bg or pre_non_bg or cells_sorted
             center_pre = _center(pre_non_bg or cells_sorted)
             center_post = _center(post_non_bg or cells_sorted)
             components.append(
@@ -47,8 +53,10 @@ def extract_candidate_components(
                     step_index=transition.step_index,
                     action=transition.action,
                     blocked_action=transition.blocked_action,
-                    bbox=_bbox(cells_sorted),
-                    area=len(cells_sorted),
+                    frame_width=frame_width,
+                    frame_height=frame_height,
+                    bbox=_bbox(object_cells),
+                    area=len(object_cells),
                     pre_center=center_pre,
                     post_center=center_post,
                     observed_dx=center_post[0] - center_pre[0],

@@ -46,7 +46,18 @@ def select_initial_target(
         if selected is not None:
             if getattr(selected, "selected_poi_id", None) is not None and not bool(getattr(selected, "ambiguous", True)):
                 candidate_id = str(selected.selected_poi_id)
-                if candidate_id in {item.poi_id for item in candidates} and no_effect_counts.get(candidate_id, 0) < 2:
+                contact_scores = _contact_scores(contact_experiment_report)
+                selected_contact_score = float(contact_scores.get(candidate_id, 0.0))
+                stronger_contact_exists = any(
+                    poi.poi_id != candidate_id
+                    and float(contact_scores.get(poi.poi_id, 0.0)) > (selected_contact_score + 0.05)
+                    for poi in candidates
+                )
+                if (
+                    candidate_id in {item.poi_id for item in candidates}
+                    and no_effect_counts.get(candidate_id, 0) < 2
+                    and not stronger_contact_exists
+                ):
                     selected_id = candidate_id
                     source = "hud_selected"
                     confidence = 1.0

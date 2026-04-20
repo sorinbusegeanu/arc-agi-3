@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from v5_0.contact.frame_tracker import track_avatar_bbox_in_frame
 from v5_0.route.trajectory_enumerator import (
     RouteCandidate,
     compute_action_space_delta,
@@ -55,18 +54,26 @@ def _build_candidate_solve_routes(
     if budget <= 0 or target_poi is None:
         return tuple()
 
-    avatar_bbox = track_avatar_bbox_in_frame(
-        current_frame,
-        getattr(selected_avatar_result, "selected_bbox", None),
-        None,
-    )
-    if avatar_bbox is None:
-        avatar_center = tuple(getattr(selected_avatar_result, "selected_center", (0.0, 0.0)) or (0.0, 0.0))
-    else:
+    # The live solver already refreshes avatar geometry before calling the policy
+    # builder. Re-tracking here without a histogram can drift back onto the wrong
+    # component and collapse the route set on refreshed frontier states.
+    avatar_bbox = getattr(selected_avatar_result, "selected_bbox", None)
+    avatar_center_value = getattr(selected_avatar_result, "selected_center", None)
+    if avatar_center_value is not None:
+        avatar_center = tuple(avatar_center_value)
+    elif avatar_bbox is not None:
         avatar_center = ((avatar_bbox[0] + avatar_bbox[2]) / 2.0, (avatar_bbox[1] + avatar_bbox[3]) / 2.0)
+    else:
+        avatar_center = (0.0, 0.0)
 
     target_center_value = getattr(target_poi, "center", None)
-    target_center = tuple(target_center_value) if target_center_value is not None else avatar_center
+    if target_center_value is not None:
+        target_center = tuple(target_center_value)
+    elif getattr(target_poi, "bbox", None) is not None:
+        bbox = getattr(target_poi, "bbox")
+        target_center = ((bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0)
+    else:
+        target_center = avatar_center
     avatar_bbox_for_scale = avatar_bbox or getattr(selected_avatar_result, "selected_bbox", None)
     target_bbox_for_scale = getattr(target_poi, "bbox", None)
     dx, dy, step_scale = compute_action_space_delta(
@@ -97,19 +104,11 @@ def _build_candidate_solve_routes(
     elif shortest > max(int(budget) + 1, 12):
         route_candidates = list(_exploratory_routes(budget, dx=dx, dy=dy))
     if not route_candidates:
-        return tuple()
-    hint_candidates: list[RouteCandidate] = []
-    for hint in tuple(route_hints or ()):
-        if not isinstance(hint, dict):
-            continue
-        actions = tuple(str(item) for item in tuple(hint.get("actions", ())))
-        suggested_prefix = int(hint.get("suggested_prefix_length", len(actions)))
-        if not actions:
-            continue
-        prefix = tuple(actions[: max(1, min(len(actions), suggested_prefix, budget))])
-        if prefix:
-            hint_candidates.append(_route_from_actions(route_id=f"hint:{hint.get('route_id', 'unknown')}", actions=prefix))
+        route_candidates = []
+    hint_candidates = list(_hint_prefix_routes(route_hints=route_hints, budget=budget, dx=dx, dy=dy))
     combined = tuple(hint_candidates) + tuple(route_candidates)
+    if not combined:
+        return tuple()
     seen: set[tuple[str, ...]] = set()
     ordered_routes: list[RouteCandidate] = []
     for route in combined:
@@ -118,13 +117,60 @@ def _build_candidate_solve_routes(
             continue
         seen.add(key)
         ordered_routes.append(route)
-    ordered_routes.sort(key=lambda route: (int(route.length), int(route.turn_count), tuple(route.actions)))
-
-    hint_keys = {tuple(route.actions) for route in hint_candidates}
-    hint_front = [route for route in ordered_routes if tuple(route.actions) in hint_keys]
-    non_hint = [route for route in ordered_routes if tuple(route.actions) not in hint_keys]
-    ordered_routes = hint_front + non_hint
+    ordered_routes.sort(
+        key=lambda route: (
+            _hint_priority(route, route_hints=route_hints),
+            0 if str(getattr(route, "route_id", "")).startswith("overlap:") else 1,
+            int(route.length),
+            int(route.turn_count),
+            tuple(route.actions),
+        )
+    )
     return tuple(ordered_routes)
+
+
+def _hint_priority(route: RouteCandidate, *, route_hints=None) -> int:
+    route_actions = tuple(str(item) for item in tuple(getattr(route, "actions", ())))
+    route_id = str(getattr(route, "route_id", ""))
+    for hint in tuple(route_hints or ()):
+        if not isinstance(hint, dict):
+            continue
+        hint_actions = tuple(str(item) for item in tuple(hint.get("actions", ())))
+        hint_route_id = str(hint.get("route_id", ""))
+        if hint_actions and route_actions == hint_actions:
+            return 0
+        if hint_route_id and (route_id == hint_route_id or route_id.endswith(f":{hint_route_id}")):
+            return 1
+    return 2
+
+
+def _hint_prefix_routes(*, route_hints=None, budget: int, dx: int, dy: int) -> tuple[RouteCandidate, ...]:
+    out: list[RouteCandidate] = []
+    for hint in tuple(route_hints or ()):
+        if not isinstance(hint, dict):
+            continue
+        hint_route_id = str(hint.get("route_id", ""))
+        actions = tuple(str(item) for item in tuple(hint.get("actions", ())))
+        if not actions:
+            continue
+        prefix_length = int(hint.get("suggested_prefix_length", len(actions)))
+        prefix_actions = actions[: max(0, min(len(actions), prefix_length, int(budget)))]
+        if not prefix_actions:
+            continue
+        candidate = _route_from_actions(
+            route_id=(f"hint:{hint_route_id}" if hint_route_id else "hint:route"),
+            actions=tuple(prefix_actions),
+        )
+        if _route_is_sane(candidate, dx=int(dx), dy=int(dy), budget=int(budget)):
+            out.append(candidate)
+        if int(dx) == 0 and int(dy) == 0 and actions:
+            continuation = _route_from_actions(
+                route_id=(f"hint:{hint_route_id}:continue" if hint_route_id else "hint:route:continue"),
+                actions=(str(actions[-1]),),
+            )
+            if _route_is_sane(continuation, dx=int(dx), dy=int(dy), budget=int(budget)):
+                out.append(continuation)
+    return tuple(out)
 
 
 def _route_from_actions(*, route_id: str, actions: tuple[str, ...]) -> RouteCandidate:
@@ -189,7 +235,7 @@ def _enumerate_interaction_routes(
             score = dict(route.score_components)
             score[f"interaction_{mode}"] = 1.0
             routes.append(replace(route, route_id=f"{mode}:{route.route_id}", score_components=score))
-    routes.sort(key=lambda route: (0 if str(route.route_id).startswith("touch:") else 1, int(route.length), int(route.turn_count), tuple(route.actions)))
+    routes.sort(key=lambda route: (0 if str(route.route_id).startswith("overlap:") else 1, int(route.length), int(route.turn_count), tuple(route.actions)))
     return tuple(routes)
 
 
@@ -200,25 +246,8 @@ def _interaction_targets(
     center_dx: int,
     center_dy: int,
 ) -> tuple[tuple[str, tuple[float, float]], ...]:
-    targets: list[tuple[str, int, int, tuple[float, float]]] = []
-    for ox, oy in ((-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)):
-        target = (float(target_action_center[0]) + ox, float(target_action_center[1]) + oy)
-        dx = int(round(target[0] - float(start_action_center[0])))
-        dy = int(round(target[1] - float(start_action_center[1])))
-        if (dx, dy) == (int(center_dx), int(center_dy)):
-            continue
-        targets.append(("touch", dx, dy, target))
-    targets.sort(key=lambda item: (abs(item[1]) + abs(item[2]), abs(item[1] - int(center_dx)) + abs(item[2] - int(center_dy)), item[1], item[2]))
-    targets.append(("overlap", int(center_dx), int(center_dy), target_action_center))
-    out: list[tuple[str, tuple[float, float]]] = []
-    seen: set[tuple[str, int, int]] = set()
-    for mode, dx, dy, target in targets:
-        key = (mode, dx, dy)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append((mode, target))
-    return tuple(out)
+    del start_action_center, center_dx, center_dy
+    return (("overlap", target_action_center),)
 
 
 def _route_is_sane(route: RouteCandidate, *, dx: int, dy: int, budget: int) -> bool:

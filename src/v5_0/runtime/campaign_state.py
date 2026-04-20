@@ -7,6 +7,7 @@ from v5_0.memory.trace_store import (
     get_solved_levels_for_game,
     get_verified_solved_levels_for_game,
 )
+from v5_0.replay.player import trace_includes_bootstrap_prefix
 
 
 def load_or_initialize_campaign_state(
@@ -171,6 +172,8 @@ def get_current_run_prefix_traces(
 
 def validate_prefix_trace_entry(trace: SavedLevelTrace | None) -> bool:
     if trace is None:
+        return False
+    if trace_includes_bootstrap_prefix(trace):
         return False
     if not bool(getattr(trace, "solved", False)):
         return False

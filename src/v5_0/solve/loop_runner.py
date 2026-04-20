@@ -220,6 +220,10 @@ def run_solve_episode(
                     solved = True
                     failure_reason = None
                     break
+                if level_transition:
+                    solved = True
+                    failure_reason = None
+                    break
                 if terminal and not terminal_success:
                     failure_reason = "terminal_failure"
                     break

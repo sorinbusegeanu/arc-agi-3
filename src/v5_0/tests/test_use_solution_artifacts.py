@@ -1,6 +1,8 @@
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,6 +18,76 @@ class TestUseSolutionArtifacts(unittest.TestCase):
             "L0": CampaignLevelState("ez01", "L0", "solved", True, None, 1, 1),
             "L1": CampaignLevelState("ez01", "L1", "pending", False, None, None, 0),
         }
+
+    @patch("v5_0.runtime.run_avatar_bootstrap.write_trace_store_index_artifacts", return_value={})
+    @patch("v5_0.runtime.run_avatar_bootstrap.rebuild_trace_store_index", return_value={})
+    @patch("v5_0.runtime.run_avatar_bootstrap.get_db_solved_levels_for_game", return_value=("L0",))
+    @patch("v5_0.runtime.run_avatar_bootstrap.get_verified_prefix_traces", return_value=(SavedLevelTrace("ez01", "L0", True, ("RIGHT", "DOWN"), 2, None, 1, True, action_sources=("db_solution", "db_solution"), trace_id="l0"),))
+    @patch("v5_0.runtime.run_avatar_bootstrap.get_frontier_level_id", side_effect=[None, None])
+    @patch("v5_0.runtime.run_avatar_bootstrap.load_or_initialize_campaign_state")
+    @patch("v5_0.runtime.run_avatar_bootstrap.get_level_sequence_for_game", return_value=("L0",))
+    @patch("v5_0.runtime.run_avatar_bootstrap.initialize_trace_store")
+    def test_use_solution_populates_campaign_action_trace_when_frontier_never_runs(
+        self,
+        init_store,
+        _seq,
+        load_state,
+        _frontier,
+        _prefix,
+        _db,
+        _rebuild,
+        _index,
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            init_store.return_value = str(Path(tmp) / "trace.sqlite")
+            load_state.return_value = {
+                "L0": CampaignLevelState("ez01", "L0", "solved", True, None, 2, 1),
+            }
+            run_full_campaign_analysis(game_id="ez01", output_dir=tmp, use_solutions=True)
+            trace_path = Path(tmp) / "ez01" / "campaign" / "campaign_action_trace.json"
+            self.assertTrue(trace_path.exists())
+            payload = json.loads(trace_path.read_text(encoding="utf-8"))
+            self.assertEqual([item["level_id"] for item in payload], ["L0", "L0"])
+            self.assertEqual([item["action"] for item in payload], ["RIGHT", "DOWN"])
+            self.assertEqual([item["source"] for item in payload], ["db_solution", "db_solution"])
+
+    @patch("v5_0.runtime.run_avatar_bootstrap.write_trace_store_index_artifacts", return_value={})
+    @patch("v5_0.runtime.run_avatar_bootstrap.rebuild_trace_store_index", return_value={})
+    @patch("v5_0.runtime.run_avatar_bootstrap.get_db_solved_levels_for_game", return_value=("L0", "L1"))
+    @patch(
+        "v5_0.runtime.run_avatar_bootstrap.get_verified_prefix_traces",
+        return_value=(
+            SavedLevelTrace("ez01", "L0", True, ("RIGHT", "DOWN"), 2, None, 1, True, action_sources=("db_solution", "db_solution"), trace_id="l0"),
+            SavedLevelTrace("ez01", "L1", True, ("UP",), 1, None, 2, True, action_sources=("db_solution",), trace_id="l1"),
+        ),
+    )
+    @patch("v5_0.runtime.run_avatar_bootstrap.get_frontier_level_id", side_effect=[None, None])
+    @patch("v5_0.runtime.run_avatar_bootstrap.load_or_initialize_campaign_state")
+    @patch("v5_0.runtime.run_avatar_bootstrap.get_level_sequence_for_game", return_value=("L0", "L1"))
+    @patch("v5_0.runtime.run_avatar_bootstrap.initialize_trace_store")
+    def test_use_solution_prints_saved_level_actions_for_pre_solved_levels(
+        self,
+        init_store,
+        _seq,
+        load_state,
+        _frontier,
+        _prefix,
+        _db,
+        _rebuild,
+        _index,
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            init_store.return_value = str(Path(tmp) / "trace.sqlite")
+            load_state.return_value = {
+                "L0": CampaignLevelState("ez01", "L0", "solved", True, None, 2, 1),
+                "L1": CampaignLevelState("ez01", "L1", "solved", True, None, 1, 2),
+            }
+            buf = StringIO()
+            with redirect_stdout(buf):
+                run_full_campaign_analysis(game_id="ez01", output_dir=tmp, use_solutions=True)
+            text = buf.getvalue()
+            self.assertIn("L0: RD", text)
+            self.assertIn("L1: U", text)
 
     @patch("v5_0.runtime.run_avatar_bootstrap.write_trace_store_index_artifacts", return_value={})
     @patch("v5_0.runtime.run_avatar_bootstrap.rebuild_trace_store_index", return_value={})

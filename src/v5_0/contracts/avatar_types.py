@@ -42,6 +42,8 @@ class CandidateComponent:
     step_index: int
     action: str
     blocked_action: bool
+    frame_width: int
+    frame_height: int
     bbox: tuple[int, int, int, int]
     area: int
     pre_center: tuple[float, float]
@@ -69,6 +71,7 @@ class TrackCandidate:
     support_step_indices: tuple[int, ...]
     support_actions: tuple[str, ...]
     observed_motion_vectors: tuple[tuple[float, float], ...]
+    entry_bbox: tuple[int, int, int, int]
     bbox: tuple[int, int, int, int]
     center: tuple[float, float]
     value_histogram_pre: dict[int, int]
@@ -83,6 +86,7 @@ class TrackCandidate:
 @dataclass(frozen=True)
 class AvatarCandidate:
     candidate_id: str
+    entry_bbox: tuple[int, int, int, int]
     bbox: tuple[int, int, int, int]
     center: tuple[float, float]
     score: float

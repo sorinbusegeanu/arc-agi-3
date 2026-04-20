@@ -88,28 +88,8 @@ def _interaction_route_targets(
     center_dx: int,
     center_dy: int,
 ) -> tuple[tuple[str, int, int, tuple[float, float]], ...]:
-    # Try adjacent/touch positions first. If touching is not sufficient, the
-    # runner will continue to the overlap route that steps onto the POI center.
-    offsets = ((-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0))
-    candidates: list[tuple[str, int, int, tuple[float, float]]] = []
-    for ox, oy in offsets:
-        target = (float(target_action_center[0]) + ox, float(target_action_center[1]) + oy)
-        dx = int(round(target[0] - float(start_action_center[0])))
-        dy = int(round(target[1] - float(start_action_center[1])))
-        if (dx, dy) == (int(center_dx), int(center_dy)):
-            continue
-        candidates.append(("touch", dx, dy, target))
-    candidates.sort(key=lambda item: (abs(item[1]) + abs(item[2]), abs(item[1] - int(center_dx)) + abs(item[2] - int(center_dy)), item[1], item[2]))
-    candidates.append(("overlap", int(center_dx), int(center_dy), target_action_center))
-    seen: set[tuple[str, int, int]] = set()
-    ordered: list[tuple[str, int, int, tuple[float, float]]] = []
-    for item in candidates:
-        key = (item[0], item[1], item[2])
-        if key in seen:
-            continue
-        seen.add(key)
-        ordered.append(item)
-    return tuple(ordered)
+    del start_action_center
+    return (("overlap", int(center_dx), int(center_dy), target_action_center),)
 
 
 def _dedupe_policies_by_actions(policies: list[ContactPolicy]) -> tuple[ContactPolicy, ...]:

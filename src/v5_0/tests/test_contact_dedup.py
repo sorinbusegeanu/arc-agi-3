@@ -243,6 +243,60 @@ class TestContactDedup(unittest.TestCase):
         self.assertEqual(build_traj.call_count, 2)
         self.assertEqual(len(result.episodes[0].tested_pois), 2)
 
+    @patch("v5_0.contact.service.classify_contact_outcome")
+    @patch("v5_0.contact.service.run_contact_policy")
+    @patch("v5_0.contact.service.build_candidate_contact_trajectories_for_poi")
+    def test_multi_reset_prefers_cross_reset_candidates_over_episode_local_pois(self, build_traj, run_policy, classify_outcome):
+        build_traj.return_value = (self._policy("a", ("RIGHT",)),)
+        classify_outcome.return_value = SimpleNamespace(
+            outcome_type="no_effect",
+            confidence=0.1,
+            contact_step_index=None,
+            level_transition=False,
+            terminal=False,
+            reward_change_step_indices=tuple(),
+            object_removed=False,
+            new_object_appeared=False,
+            hud_change_only=False,
+        )
+        run_policy.return_value = SimpleNamespace(
+            poi_id="cross_poi_000",
+            episode_index=0,
+            policy=self._policy("a", ("RIGHT",)),
+            steps=tuple(),
+            outcome=SimpleNamespace(),
+            initial_poi_bbox=(1, 1, 1, 1),
+            final_poi_bbox=(1, 1, 1, 1),
+            initial_avatar_bbox=(0, 0, 0, 0),
+            final_avatar_bbox=(0, 0, 0, 0),
+        )
+        selected_avatar = SimpleNamespace(failure_reason=None, selected_center=(0.0, 0.0), selected_bbox=(0, 0, 0, 0))
+        local_poi = SimpleNamespace(poi_id="poi_003", confidence=0.95, bbox=(1, 1, 1, 1), area=4, ambiguity_flags=())
+        cross_a = SimpleNamespace(poi_id="cross_poi_000", confidence=0.9, bbox=(2, 1, 2, 1), area=4, ambiguity_flags=())
+        cross_b = SimpleNamespace(poi_id="cross_poi_001", confidence=0.8, bbox=(3, 1, 3, 1), area=4, ambiguity_flags=())
+        avatar_multi_report = SimpleNamespace(
+            episodes=(SimpleNamespace(episode_index=0, report=SimpleNamespace(selected=selected_avatar), transitions=tuple()),),
+            selected=selected_avatar,
+            diagnostics=SimpleNamespace(stable_avatar_found=True),
+        )
+        poi_multi_bundle = {
+            "report": SimpleNamespace(candidates=(cross_a, cross_b)),
+            "episodes": (SimpleNamespace(episode_index=0, poi_report=SimpleNamespace(candidates=(local_poi,)), transitions=tuple()),),
+        }
+        result = run_controlled_contact_multi_reset(
+            avatar_multi_report=avatar_multi_report,
+            poi_multi_bundle=poi_multi_bundle,
+            plan=SimpleNamespace(level_id="L0"),
+            base_seed=0,
+            render_terminal=False,
+            env_factory=None,
+            max_pois_to_test=2,
+        )
+        tested_ids = tuple(item.poi_id for item in result.episodes[0].tested_pois)
+        self.assertEqual(tested_ids, ("cross_poi_000", "cross_poi_000"))
+        called_poi_ids = tuple(call.kwargs["poi_candidate"].poi_id for call in build_traj.call_args_list)
+        self.assertEqual(called_poi_ids, ("cross_poi_000", "cross_poi_001"))
+
 
 
     @patch("v5_0.runtime.run_avatar_bootstrap.run_adaptive_solve_on_live_session", return_value=SimpleNamespace(episodes=tuple(), solved=False, failure_reason="no_progress"))

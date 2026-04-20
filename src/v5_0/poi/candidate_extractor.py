@@ -29,11 +29,16 @@ def extract_poi_components(
             continue
 
         changed = _changed_cells(record.pre_frame, record.post_frame)
+        pre_bg = _dominant_value(record.pre_frame)
+        post_bg = _dominant_value(record.post_frame)
         for cells in _connected_components(changed):
-            bbox = _bbox(cells)
-            center = _center(cells)
-            histogram = Counter(int(record.post_frame[y][x]) for x, y in cells)
-            area = len(cells)
+            pre_non_bg = tuple((x, y) for x, y in cells if int(record.pre_frame[y][x]) != pre_bg)
+            post_non_bg = tuple((x, y) for x, y in cells if int(record.post_frame[y][x]) != post_bg)
+            object_cells = tuple(sorted(post_non_bg or pre_non_bg or cells))
+            bbox = _bbox(object_cells)
+            center = _center(object_cells)
+            histogram = Counter(int(record.post_frame[y][x]) for x, y in object_cells)
+            area = len(object_cells)
             frame_height = min(len(record.pre_frame), len(record.post_frame))
             frame_width = min(len(record.pre_frame[0]), len(record.post_frame[0])) if frame_height else 0
             if _is_border_locked_component(bbox, area, frame_width, frame_height):
@@ -110,6 +115,13 @@ def _changed_cells(pre: tuple[tuple[int, ...], ...], post: tuple[tuple[int, ...]
             if int(pre[y][x]) != int(post[y][x]):
                 changed.add((x, y))
     return changed
+
+
+def _dominant_value(frame: tuple[tuple[int, ...], ...]) -> int:
+    values = [int(value) for row in frame for value in row]
+    if not values:
+        return 0
+    return int(Counter(values).most_common(1)[0][0])
 
 
 def _connected_components(cells: set[tuple[int, int]]) -> tuple[tuple[tuple[int, int], ...], ...]:

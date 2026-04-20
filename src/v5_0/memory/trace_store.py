@@ -34,6 +34,7 @@ def initialize_trace_store(db_path: str | Path | None = None) -> str:
                 source_run_id TEXT,
                 created_at TEXT NOT NULL,
                 action_trace_json TEXT NOT NULL,
+                action_sources_json TEXT,
                 optimized INTEGER NOT NULL DEFAULT 0,
                 optimized_at TEXT,
                 parent_trace_id TEXT,
@@ -92,8 +93,8 @@ def save_level_trace(*, db_path: str | Path | None = None, trace: SavedLevelTrac
             """
             INSERT OR REPLACE INTO level_traces (
                 game_id, level_id, trace_id, trace_version, step_count, solved, replay_verified,
-                source_run_id, created_at, action_trace_json, optimized, optimized_at, parent_trace_id, notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                source_run_id, created_at, action_trace_json, action_sources_json, optimized, optimized_at, parent_trace_id, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 trace.game_id,
@@ -106,6 +107,7 @@ def save_level_trace(*, db_path: str | Path | None = None, trace: SavedLevelTrac
                 trace.source_run_id,
                 created_at,
                 json.dumps(list(trace.action_trace)),
+                json.dumps(list(getattr(trace, "action_sources", None) or [])) if getattr(trace, "action_sources", None) is not None else None,
                 1 if bool(getattr(trace, "optimized", False)) else 0,
                 getattr(trace, "optimized_at", None),
                 getattr(trace, "parent_trace_id", None),
@@ -125,8 +127,8 @@ def save_trace_history_row(*, db_path: str | Path | None = None, trace: SavedLev
             """
             INSERT OR REPLACE INTO level_traces (
                 game_id, level_id, trace_id, trace_version, step_count, solved, replay_verified,
-                source_run_id, created_at, action_trace_json, optimized, optimized_at, parent_trace_id, notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                source_run_id, created_at, action_trace_json, action_sources_json, optimized, optimized_at, parent_trace_id, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 trace.game_id,
@@ -139,6 +141,7 @@ def save_trace_history_row(*, db_path: str | Path | None = None, trace: SavedLev
                 trace.source_run_id,
                 created_at,
                 json.dumps(list(trace.action_trace)),
+                json.dumps(list(getattr(trace, "action_sources", None) or [])) if getattr(trace, "action_sources", None) is not None else None,
                 1 if bool(getattr(trace, "optimized", False)) else 0,
                 getattr(trace, "optimized_at", None),
                 getattr(trace, "parent_trace_id", None),
@@ -154,7 +157,7 @@ def get_best_trace_for_level(*, db_path: str | Path | None = None, game_id: str,
     with sqlite3.connect(resolved_db_path) as conn:
         row = conn.execute(
             """
-            SELECT game_id, level_id, trace_id, step_count, solved, replay_verified, source_run_id, trace_version, action_trace_json,
+            SELECT game_id, level_id, trace_id, step_count, solved, replay_verified, source_run_id, trace_version, action_trace_json, action_sources_json,
                    optimized, optimized_at, parent_trace_id
             FROM level_traces
             WHERE game_id = ? AND level_id = ? AND solved = 1 AND replay_verified = 1
@@ -173,7 +176,7 @@ def get_all_traces_for_game(*, db_path: str | Path | None = None, game_id: str) 
     with sqlite3.connect(resolved_db_path) as conn:
         rows = conn.execute(
             """
-            SELECT game_id, level_id, trace_id, step_count, solved, replay_verified, source_run_id, trace_version, action_trace_json,
+            SELECT game_id, level_id, trace_id, step_count, solved, replay_verified, source_run_id, trace_version, action_trace_json, action_sources_json,
                    optimized, optimized_at, parent_trace_id
             FROM level_traces
             WHERE game_id = ?
@@ -193,7 +196,7 @@ def get_verified_solved_levels_for_game(*, db_path: str | Path | None = None, ga
     with sqlite3.connect(resolved_db_path) as conn:
         rows = conn.execute(
             """
-            SELECT game_id, level_id, trace_id, step_count, solved, replay_verified, source_run_id, trace_version, action_trace_json,
+            SELECT game_id, level_id, trace_id, step_count, solved, replay_verified, source_run_id, trace_version, action_trace_json, action_sources_json,
                    optimized, optimized_at, parent_trace_id
             FROM level_traces
             WHERE game_id = ? AND solved = 1 AND replay_verified = 1
@@ -300,7 +303,7 @@ def rebuild_trace_store_index(
     with sqlite3.connect(resolved_db_path) as conn:
         rows = conn.execute(
             """
-            SELECT game_id, level_id, trace_id, step_count, solved, replay_verified, source_run_id, trace_version, action_trace_json,
+            SELECT game_id, level_id, trace_id, step_count, solved, replay_verified, source_run_id, trace_version, action_trace_json, action_sources_json,
                    optimized, optimized_at, parent_trace_id
             FROM level_traces
             WHERE game_id = ? AND solved = 1 AND replay_verified = 1
@@ -336,6 +339,9 @@ def validate_trace_for_best_use(trace: SavedLevelTrace) -> bool:
         return False
     if int(getattr(trace, "step_count", 0) or 0) != len(actions):
         return False
+    sources = tuple(getattr(trace, "action_sources", ()) or ())
+    if any(str(source) == "bootstrap_replay" for source in sources):
+        return False
     return True
 
 
@@ -350,11 +356,13 @@ def _row_to_trace(row) -> SavedLevelTrace:
         source_run_id,
         trace_version,
         action_trace_json,
+        action_sources_json,
         optimized,
         optimized_at,
         parent_trace_id,
     ) = row
     actions = json.loads(action_trace_json)
+    action_sources = json.loads(action_sources_json) if action_sources_json else None
     return SavedLevelTrace(
         game_id=str(game_id),
         level_id=str(level_id),
@@ -364,6 +372,7 @@ def _row_to_trace(row) -> SavedLevelTrace:
         source_run_id=source_run_id,
         trace_version=int(trace_version),
         replay_verified=bool(replay_verified),
+        action_sources=tuple(str(item) for item in action_sources) if action_sources is not None else None,
         trace_id=str(trace_id) if trace_id is not None else None,
         optimized=bool(optimized),
         optimized_at=str(optimized_at) if optimized_at is not None else None,
@@ -375,6 +384,8 @@ def _ensure_level_traces_schema_extensions(conn: sqlite3.Connection) -> None:
     columns = {str(item[1]) for item in conn.execute("PRAGMA table_info(level_traces)").fetchall()}
     if "optimized" not in columns:
         conn.execute("ALTER TABLE level_traces ADD COLUMN optimized INTEGER NOT NULL DEFAULT 0")
+    if "action_sources_json" not in columns:
+        conn.execute("ALTER TABLE level_traces ADD COLUMN action_sources_json TEXT")
     if "optimized_at" not in columns:
         conn.execute("ALTER TABLE level_traces ADD COLUMN optimized_at TEXT")
     if "parent_trace_id" not in columns:

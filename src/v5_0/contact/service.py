@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import replace
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from v4_5.adapters.actionAdapter import ActionAdapter
+from v4_5.runtime.sessionAdapter import SessionAdapter
+from v5_0.contact.frame_tracker import reacquire_avatar_bbox_in_frame, track_avatar_bbox_in_frame
 from v5_0.contact.outcome_classifier import build_route_hint_from_contact_outcome, classify_contact_outcome
 from v5_0.contact.policy import build_candidate_contact_trajectories_for_poi, dedupe_contact_trajectories
-from v5_0.contact.runner import run_contact_policy
+from v5_0.contact.runner import _extract_frame, _replay_bootstrap, run_contact_policy
 from v5_0.contracts.avatar_types import (
     ContactExperimentEpisode,
     ContactExperimentReport,
@@ -262,6 +266,169 @@ def run_controlled_contact_for_episode(
     return tuple(tested)
 
 
+def _normalize_contact_selected_avatar(selected_avatar, episode_report):
+    candidate_id = getattr(selected_avatar, "selected_candidate_id", None)
+    if candidate_id is None:
+        return selected_avatar
+    candidates = tuple(getattr(episode_report, "candidates", ()) or ())
+    matched = next((item for item in candidates if str(getattr(item, "candidate_id", "")) == str(candidate_id)), None)
+    if matched is None:
+        return selected_avatar
+    motions = tuple(getattr(matched, "observed_motion_vectors", ()) or ())
+    first_motion = motions[0] if motions else None
+    if (
+        first_motion is not None
+        and abs(float(first_motion[0])) < 0.5
+        and abs(float(first_motion[1])) < 0.5
+        and getattr(matched, "bbox", None) is not None
+    ):
+        entry_bbox = getattr(matched, "entry_bbox", None)
+        corner_clamped = False
+        if entry_bbox is not None:
+            try:
+                x0, y0, x1, y1 = tuple(int(v) for v in entry_bbox)
+                touches_horizontal_edge = x0 <= 0 or x1 >= 63
+                touches_vertical_edge = y0 <= 0 or y1 >= 63
+                corner_clamped = touches_horizontal_edge and touches_vertical_edge
+            except Exception:
+                corner_clamped = False
+        replacement_bbox = entry_bbox if corner_clamped and entry_bbox is not None else getattr(matched, "bbox", None)
+        try:
+            return replace(
+                selected_avatar,
+                selected_bbox=replacement_bbox,
+                selected_center=_bbox_center(replacement_bbox),
+            )
+        except Exception:
+            return selected_avatar
+    return selected_avatar
+
+
+def _bbox_center(bbox):
+    if bbox is None:
+        return None
+    try:
+        x0, y0, x1, y1 = bbox
+        return ((float(x0) + float(x1)) / 2.0, (float(y0) + float(y1)) / 2.0)
+    except Exception:
+        return None
+
+
+def _first_probe_episode_frame(probe_episode):
+    for transition in tuple(getattr(probe_episode, "transitions", ()) or ()):
+        pre_frame = getattr(transition, "pre_frame", None)
+        if pre_frame is not None:
+            return pre_frame
+        post_frame = getattr(transition, "post_frame", None)
+        if post_frame is not None:
+            return post_frame
+    return None
+
+
+def _reanchor_contact_selected_avatar_to_probe_frame(selected_avatar, probe_episode):
+    frame = _first_probe_episode_frame(probe_episode)
+    reference_bbox = getattr(selected_avatar, "selected_bbox", None)
+    if frame is None or reference_bbox is None:
+        return selected_avatar
+    avatar_hist = getattr(selected_avatar, "value_histogram", None)
+    tracked_bbox = track_avatar_bbox_in_frame(frame, reference_bbox, avatar_hist)
+    if tracked_bbox is None:
+        tracked_bbox = reacquire_avatar_bbox_in_frame(
+            frame,
+            reference_bbox,
+            avatar_hist,
+            preferred_center=getattr(selected_avatar, "selected_center", None) or _bbox_center(reference_bbox),
+            recent_bbox=reference_bbox,
+        )
+    if tracked_bbox is None:
+        return selected_avatar
+    tracked_center = _bbox_center(tracked_bbox)
+    if tracked_bbox == reference_bbox and tracked_center == getattr(selected_avatar, "selected_center", None):
+        return selected_avatar
+    try:
+        return replace(
+            selected_avatar,
+            selected_bbox=tracked_bbox,
+            selected_center=tracked_center,
+        )
+    except Exception:
+        return selected_avatar
+
+
+def _reanchor_contact_selected_avatar_to_live_frontier(
+    selected_avatar,
+    *,
+    plan,
+    seed: int,
+    render_terminal: bool,
+    env_factory,
+):
+    if plan is None or getattr(plan, "game_id", None) is None:
+        return selected_avatar
+    reference_bbox = getattr(selected_avatar, "selected_bbox", None)
+    if reference_bbox is None:
+        return selected_avatar
+    session_adapter = SessionAdapter()
+    action_adapter = ActionAdapter()
+    session = None
+    try:
+        session = session_adapter.create_session(
+            plan.game_id,
+            seed=seed,
+            render_terminal=render_terminal,
+            env_factory=env_factory,
+        )
+        _replay_bootstrap(plan, session, session_adapter, action_adapter)
+        observation = session_adapter.get_current_observation(session)
+        frame = _extract_frame(observation.frame)
+        if frame is None:
+            return selected_avatar
+        avatar_hist = getattr(selected_avatar, "value_histogram", None)
+        tracked_bbox = track_avatar_bbox_in_frame(frame, reference_bbox, avatar_hist)
+        if tracked_bbox is None:
+            tracked_bbox = reacquire_avatar_bbox_in_frame(
+                frame,
+                reference_bbox,
+                avatar_hist,
+                preferred_center=getattr(selected_avatar, "selected_center", None) or _bbox_center(reference_bbox),
+                recent_bbox=reference_bbox,
+            )
+        if tracked_bbox is None:
+            return selected_avatar
+        tracked_center = _bbox_center(tracked_bbox)
+        if tracked_bbox == reference_bbox and tracked_center == getattr(selected_avatar, "selected_center", None):
+            return selected_avatar
+        return replace(
+            selected_avatar,
+            selected_bbox=tracked_bbox,
+            selected_center=tracked_center,
+        )
+    except Exception:
+        return selected_avatar
+    finally:
+        if session is not None:
+            try:
+                session_adapter.close_session(session)
+            except Exception:
+                pass
+
+
+def _prepare_contact_selected_avatar(selected_avatar, episode_report, probe_episode, *, plan, seed, render_terminal, env_factory):
+    reanchored = _reanchor_contact_selected_avatar_to_live_frontier(
+        selected_avatar,
+        plan=plan,
+        seed=seed,
+        render_terminal=render_terminal,
+        env_factory=env_factory,
+    )
+    if getattr(reanchored, "selected_bbox", None) != getattr(selected_avatar, "selected_bbox", None):
+        return reanchored
+    reanchored = _reanchor_contact_selected_avatar_to_probe_frame(reanchored, probe_episode)
+    if getattr(reanchored, "selected_bbox", None) != getattr(selected_avatar, "selected_bbox", None):
+        return reanchored
+    return _normalize_contact_selected_avatar(reanchored, episode_report)
+
+
 def run_controlled_contact_multi_reset(
     *,
     avatar_multi_report: MultiResetAvatarReport,
@@ -273,6 +440,10 @@ def run_controlled_contact_multi_reset(
     max_pois_to_test: int = 2,
 ) -> ContactExperimentReport:
     poi_by_episode = {item.episode_index: item.poi_report for item in poi_multi_bundle.get("episodes", ())}
+    cross_reset_candidates = tuple(
+        candidate
+        for candidate in tuple(getattr(poi_multi_bundle.get("report"), "candidates", ()) or ())
+    )
     selected_poi_ids: list[str] = []
     for episode in avatar_multi_report.episodes:
         if episode.report.selected.failure_reason is not None:
@@ -280,7 +451,8 @@ def run_controlled_contact_multi_reset(
         poi_report = poi_by_episode.get(episode.episode_index)
         if poi_report is None:
             continue
-        eligible_pois = tuple(candidate for candidate in tuple(getattr(poi_report, "candidates", ())) if not _is_border_locked_poi(candidate))
+        candidate_pool = cross_reset_candidates or tuple(getattr(poi_report, "candidates", ()))
+        eligible_pois = tuple(candidate for candidate in candidate_pool if not _is_border_locked_poi(candidate))
         top_pois = tuple(sorted(eligible_pois, key=lambda item: (-item.confidence, item.poi_id)))[:max(0, int(max_pois_to_test))]
         if top_pois:
             selected_poi_ids.append(str(top_pois[0].poi_id))
@@ -293,6 +465,7 @@ def run_controlled_contact_multi_reset(
     shared_tested = None
     shared_poi_id = selected_poi_ids[0] if selected_poi_ids else None
     with open("/tmp/v5_debug.log", "a") as f: f.write(f"[DEBUG] run_controlled_contact_multi_reset: processing {len(avatar_multi_report.episodes)} episodes\n"); f.flush()
+    canonical_selected_avatar = getattr(avatar_multi_report, "selected", None)
     for episode in avatar_multi_report.episodes:
         if episode.report.selected.failure_reason is not None:
             episode_results.append(ContactExperimentEpisode(episode_index=episode.episode_index, tested_pois=()))
@@ -302,16 +475,38 @@ def run_controlled_contact_multi_reset(
             episode_results.append(ContactExperimentEpisode(episode_index=episode.episode_index, tested_pois=()))
             policy_failures["missing_poi_report"] += 1
             continue
-        skipped_border_locked_poi_count += sum(1 for candidate in poi_report.candidates if _is_border_locked_poi(candidate))
+        contact_candidates = cross_reset_candidates or tuple(getattr(poi_report, "candidates", ()))
+        skipped_border_locked_poi_count += sum(1 for candidate in contact_candidates if _is_border_locked_poi(candidate))
+        if cross_reset_candidates:
+            poi_report = type("ContactPOIReport", (), {"candidates": contact_candidates})()
         if collapse_same_selected_poi and shared_tested is not None:
             episode_results.append(ContactExperimentEpisode(episode_index=episode.episode_index, tested_pois=shared_tested))
             all_tested.extend(shared_tested)
             continue
+        selected_avatar = episode.report.selected
+        if canonical_selected_avatar is not None and getattr(canonical_selected_avatar, "selected_bbox", None) is not None:
+            try:
+                selected_avatar = replace(
+                    selected_avatar,
+                    selected_bbox=getattr(canonical_selected_avatar, "selected_bbox", None),
+                    selected_center=getattr(canonical_selected_avatar, "selected_center", None),
+                )
+            except Exception:
+                pass
+        selected_avatar = _prepare_contact_selected_avatar(
+            selected_avatar,
+            episode.report,
+            episode,
+            plan=plan,
+            seed=int(base_seed) + int(episode.episode_index),
+            render_terminal=render_terminal,
+            env_factory=env_factory,
+        )
         with open("/tmp/v5_debug.log", "a") as f: f.write(f"[DEBUG] Calling run_controlled_contact_for_episode for episode {episode.episode_index}\n"); f.flush()
         tested = run_controlled_contact_for_episode(
             probe_episode=episode,
             poi_report=poi_report,
-            selected_avatar=episode.report.selected,
+            selected_avatar=selected_avatar,
             plan=plan,
             seed=int(base_seed) + int(episode.episode_index),
             render_terminal=render_terminal,
