@@ -7,6 +7,8 @@ from collections import Counter
 from pathlib import Path
 
 from v6.environment.arc_adapter import ArcGridEnvironment
+from v6.contingency_memory import ContingencyMemoryConfig, run_contingency_memory_v06
+from v6.context_depth_compare_v07 import ContextDepthCompareConfig, run_context_depth_compare_v07
 from v6.evaluation.broad_game_validation import BroadValidationConfig, parse_game_selector, run_broad_validation_v05
 from v6.evaluation.failure_diagnostics import FailureDiagnosticsConfig, parse_v05b_games, run_failure_diagnostics_v05b
 from v6.evaluation.id_free_prefuture_validation import IdFreePrefutureConfig, run_id_free_prefuture_validation_v04d
@@ -28,8 +30,13 @@ from v6.evaluation.role_candidates import ROLE_DISCOVERY_GAMES, RoleCandidateRun
 from v6.evaluation.role_generalization import RoleGeneralizationConfig, run_role_generalization_v04b
 from v6.evaluation.role_validation import RoleValidationConfig, run_role_validation_v04
 from v6.main import V6Config, V6System
+from v6.m2_expand_v08c import M2ExpandV08cConfig, run_m2_expand_v08c
+from v6.role_candidates_v08 import RoleCandidatesV08Config, run_role_candidates_v08
+from v6.role_candidates_v08d import RoleCandidatesV08dConfig, run_role_candidates_v08d
+from v6.role_transfer_v09 import RoleTransferV09Config, run_role_transfer_v09
 from v6.storage.benchmark import run_storage_benchmark
 from v6.storage.migration import migrate_sqlite_to_parquet
+from v6.transformation_families_v07 import TransformationFamiliesV07Config, run_transformation_families_v07
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -207,6 +214,102 @@ def build_parser() -> argparse.ArgumentParser:
     sampling.add_argument("--compress", default="zstd")
     sampling.add_argument("--output-dir", default="runs/v6")
     sampling.add_argument("--env-root", default=None)
+    sampling.add_argument("--game-set-manifest", default=None)
+    sampling.add_argument("--game-set-name", default=None)
+    sampling.add_argument("--only-missing-from-parquet-root", action="store_true")
+    sampling.add_argument("--collect-only", action="store_true")
+
+    contingency_memory = subparsers.add_parser("contingency-memory-v06")
+    contingency_memory.add_argument("--parquet-root", required=True)
+    contingency_memory.add_argument("--games", default="tt01,pb02,fs02,tp02,gr01,va02,mo01")
+    contingency_memory.add_argument(
+        "--samplers",
+        default="random_baseline,action_balance,no_change_avoidance,low_confidence,novelty_delta,mixed,reset_aware_mixed",
+    )
+    contingency_memory.add_argument("--seeds", default="0,1,2")
+    contingency_memory.add_argument("--output-dir", default="runs/v6/v06")
+    contingency_memory.add_argument("--context-depth", type=int, default=1)
+    contingency_memory.add_argument("--min-support", type=int, default=5)
+    contingency_memory.add_argument("--prediction-threshold", type=float, default=0.75)
+    contingency_memory.add_argument("--v05c-report-json", default=None)
+    contingency_memory.add_argument("--max-files", type=int, default=0)
+    contingency_memory.add_argument("--max-rows", type=int, default=0)
+    contingency_memory.add_argument("--run-id-filter", default="")
+    contingency_memory.add_argument("--since", default="")
+    contingency_memory.add_argument("--until", default="")
+    contingency_memory.add_argument("--streaming", action="store_true")
+    contingency_memory.add_argument("--manifest-out", default="runs/v6/v06/input_manifest.json")
+    contingency_memory.add_argument("--manifest-in", default=None)
+    contingency_memory.add_argument("--progress-every", type=int, default=100000)
+    contingency_memory.add_argument("--example-limit", type=int, default=5)
+    contingency_memory.add_argument("--game-set-manifest", default=None)
+    contingency_memory.add_argument("--game-set-name", default=None)
+
+    transformation_families = subparsers.add_parser("transformation-families-v07")
+    transformation_families.add_argument("--input-dir", default="runs/v6/v06")
+    transformation_families.add_argument("--output-dir", default="runs/v6/v07")
+    transformation_families.add_argument("--min-family-support", type=int, default=5)
+    transformation_families.add_argument("--similarity-threshold", type=float, default=0.70)
+    transformation_families.add_argument("--game-set-manifest", default=None)
+    transformation_families.add_argument("--game-set-name", default=None)
+
+    m2_expand = subparsers.add_parser("m2-expand-v08c")
+    m2_expand.add_argument("--input-dir", default="runs/v6/v07_cd2_extended32")
+    m2_expand.add_argument("--m1-input-dir", default="runs/v6/v06_cd2_extended32")
+    m2_expand.add_argument("--output-dir", default="runs/v6/v07_cd2_extended32_expanded")
+    m2_expand.add_argument("--game-set-manifest", default=None)
+    m2_expand.add_argument("--game-set-name", default=None)
+    m2_expand.add_argument("--min-family-support", type=int, default=3)
+    m2_expand.add_argument("--max-family-share", type=float, default=0.25)
+    m2_expand.add_argument("--min-expanded-families", type=int, default=40)
+    m2_expand.add_argument("--target-expanded-families", type=int, default=60)
+
+    compare_context = subparsers.add_parser("compare-context-depth-v07")
+    compare_context.add_argument("--runs", required=True)
+    compare_context.add_argument("--labels", required=True)
+    compare_context.add_argument("--output-dir", default="runs/v6/v07_context_compare")
+
+    role_candidates_v08 = subparsers.add_parser("role-candidates-v08")
+    role_candidates_v08.add_argument("--input-dir", default="runs/v6/v07_cd2")
+    role_candidates_v08.add_argument("--m1-input-dir", default="runs/v6/v06_cd2")
+    role_candidates_v08.add_argument("--output-dir", default="runs/v6/v08_cd2")
+    role_candidates_v08.add_argument("--context-depth", type=int, default=2)
+    role_candidates_v08.add_argument("--min-role-support", type=int, default=3)
+    role_candidates_v08.add_argument("--role-similarity-threshold", type=float, default=0.70)
+    role_candidates_v08.add_argument("--workers", type=int, default=25)
+    role_candidates_v08.add_argument("--partition-by", default="family_pair,neighborhood_shard")
+    role_candidates_v08.add_argument("--game-set-manifest", default=None)
+    role_candidates_v08.add_argument("--game-set-name", default=None)
+
+    role_candidates_v08d = subparsers.add_parser("role-candidates-v08d")
+    role_candidates_v08d.add_argument("--input-dir", default="runs/v6/v07_cd2_extended32_expanded")
+    role_candidates_v08d.add_argument("--m1-input-dir", default="runs/v6/v06_cd2_extended32")
+    role_candidates_v08d.add_argument("--output-dir", default="runs/v6/v08_cd2_extended32_discriminative")
+    role_candidates_v08d.add_argument("--context-depth", type=int, default=2)
+    role_candidates_v08d.add_argument("--min-role-support", type=int, default=3)
+    role_candidates_v08d.add_argument("--role-similarity-threshold", type=float, default=0.70)
+    role_candidates_v08d.add_argument("--workers", type=int, default=25)
+    role_candidates_v08d.add_argument("--partition-by", default="family_pair,neighborhood_shard")
+    role_candidates_v08d.add_argument("--game-set-manifest", default=None)
+    role_candidates_v08d.add_argument("--game-set-name", default=None)
+    role_candidates_v08d.add_argument("--fingerprint-mode", default="discriminative")
+    role_candidates_v08d.add_argument("--weight-coarse", type=float, default=0.25)
+    role_candidates_v08d.add_argument("--weight-directional", type=float, default=0.20)
+    role_candidates_v08d.add_argument("--weight-future-option", type=float, default=0.25)
+    role_candidates_v08d.add_argument("--weight-local-motif", type=float, default=0.20)
+    role_candidates_v08d.add_argument("--weight-temporal-effect", type=float, default=0.10)
+
+    role_transfer_v09 = subparsers.add_parser("role-transfer-v09")
+    role_transfer_v09.add_argument("--m3-input-dir", default="runs/v6/v08_cd2_extended32_discriminative")
+    role_transfer_v09.add_argument("--m2-input-dir", default="runs/v6/v07_cd2_extended32_expanded")
+    role_transfer_v09.add_argument("--m1-input-dir", default="runs/v6/v06_cd2_extended32")
+    role_transfer_v09.add_argument("--output-dir", default="runs/v6/v09_role_transfer_extended32")
+    role_transfer_v09.add_argument("--game-set-manifest", default=None)
+    role_transfer_v09.add_argument("--game-set-name", default=None)
+    role_transfer_v09.add_argument("--split-mode", default="leave_family_out")
+    role_transfer_v09.add_argument("--min-source-role-support", type=int, default=3)
+    role_transfer_v09.add_argument("--min-target-family-support", type=int, default=3)
+    role_transfer_v09.add_argument("--workers", type=int, default=25)
 
     migrate = subparsers.add_parser("migrate-sqlite-to-parquet")
     migrate.add_argument("--sqlite", required=True)
@@ -478,9 +581,210 @@ def main() -> int:
                 compression=args.compress,
                 output_dir=args.output_dir,
                 env_root=args.env_root,
+                game_set_manifest=args.game_set_manifest,
+                game_set_name=args.game_set_name,
+                only_missing_from_parquet_root=bool(args.only_missing_from_parquet_root),
+                collect_only=bool(args.collect_only),
             )
         )
         print(json.dumps({"rows": len(rows), "output_dir": args.output_dir}, indent=2))
+        return 0
+
+    if args.command == "contingency-memory-v06":
+        payload = run_contingency_memory_v06(
+            ContingencyMemoryConfig(
+                parquet_root=args.parquet_root,
+                games=tuple(_parse_csv_str(args.games)),
+                samplers=tuple(_parse_csv_str(args.samplers)),
+                seeds=tuple(_parse_csv_int(args.seeds)),
+                output_dir=args.output_dir,
+                context_depth=args.context_depth,
+                min_support=args.min_support,
+                prediction_threshold=args.prediction_threshold,
+                v05c_report_json=args.v05c_report_json,
+                max_files=args.max_files,
+                max_rows=args.max_rows,
+                run_id_filter=args.run_id_filter,
+                since=args.since,
+                until=args.until,
+                streaming=bool(args.streaming),
+                manifest_out=args.manifest_out,
+                manifest_in=args.manifest_in,
+                progress_every=args.progress_every,
+                example_limit=args.example_limit,
+                game_set_manifest=args.game_set_manifest,
+                game_set_name=args.game_set_name,
+            )
+        )
+        print(
+            json.dumps(
+                {
+                    "output_dir": args.output_dir,
+                    "milestone_classification": payload["validation"]["milestone_classification"],
+                    "diagnostic_success": payload["validation"]["diagnostic_success"],
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    if args.command == "transformation-families-v07":
+        payload = run_transformation_families_v07(
+            TransformationFamiliesV07Config(
+                input_dir=args.input_dir,
+                output_dir=args.output_dir,
+                min_family_support=args.min_family_support,
+                similarity_threshold=args.similarity_threshold,
+                game_set_manifest=args.game_set_manifest,
+                game_set_name=args.game_set_name,
+            )
+        )
+        print(
+            json.dumps(
+                {
+                    "output_dir": args.output_dir,
+                    "scientific_conclusion": payload["validation"]["scientific_conclusion"],
+                    "stable_m2_families": payload["report"]["stable_m2_families"],
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    if args.command == "m2-expand-v08c":
+        payload = run_m2_expand_v08c(
+            M2ExpandV08cConfig(
+                input_dir=args.input_dir,
+                m1_input_dir=args.m1_input_dir,
+                output_dir=args.output_dir,
+                game_set_manifest=args.game_set_manifest,
+                game_set_name=args.game_set_name,
+                min_family_support=args.min_family_support,
+                max_family_share=args.max_family_share,
+                min_expanded_families=args.min_expanded_families,
+                target_expanded_families=args.target_expanded_families,
+            )
+        )
+        print(
+            json.dumps(
+                {
+                    "output_dir": args.output_dir,
+                    "expanded_m2_family_count": payload["report"]["expanded_m2_family_count"],
+                    "expansion_suitable_for_v08_retry": payload["validation"]["expansion_suitable_for_v08_retry"],
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    if args.command == "compare-context-depth-v07":
+        payload = run_context_depth_compare_v07(
+            ContextDepthCompareConfig(
+                runs=tuple(_parse_csv_str(args.runs)),
+                labels=tuple(_parse_csv_str(args.labels)),
+                output_dir=args.output_dir,
+            )
+        )
+        print(
+            json.dumps(
+                {
+                    "output_dir": args.output_dir,
+                    "best_context_depth": payload["best_context_depth"],
+                    "recommended_context_depth_for_v08": payload["recommended_context_depth_for_v08"],
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    if args.command == "role-candidates-v08":
+        payload = run_role_candidates_v08(
+            RoleCandidatesV08Config(
+                input_dir=args.input_dir,
+                m1_input_dir=args.m1_input_dir,
+                output_dir=args.output_dir,
+                context_depth=args.context_depth,
+                min_role_support=args.min_role_support,
+                role_similarity_threshold=args.role_similarity_threshold,
+                workers=args.workers,
+                partition_by=tuple(_parse_csv_str(args.partition_by)),
+                game_set_manifest=args.game_set_manifest,
+                game_set_name=args.game_set_name,
+            )
+        )
+        print(
+            json.dumps(
+                {
+                    "output_dir": args.output_dir,
+                    "scientific_conclusion": payload["validation"]["scientific_conclusion"],
+                    "stable_clusters": payload["report"]["stable_clusters"],
+                    "game_set_name": payload["report"]["game_set_name"],
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    if args.command == "role-candidates-v08d":
+        payload = run_role_candidates_v08d(
+            RoleCandidatesV08dConfig(
+                input_dir=args.input_dir,
+                m1_input_dir=args.m1_input_dir,
+                output_dir=args.output_dir,
+                context_depth=args.context_depth,
+                min_role_support=args.min_role_support,
+                role_similarity_threshold=args.role_similarity_threshold,
+                workers=args.workers,
+                partition_by=tuple(_parse_csv_str(args.partition_by)),
+                game_set_manifest=args.game_set_manifest,
+                game_set_name=args.game_set_name,
+                fingerprint_mode=args.fingerprint_mode,
+                weight_coarse=args.weight_coarse,
+                weight_directional=args.weight_directional,
+                weight_future_option=args.weight_future_option,
+                weight_local_motif=args.weight_local_motif,
+                weight_temporal_effect=args.weight_temporal_effect,
+            )
+        )
+        print(
+            json.dumps(
+                {
+                    "output_dir": args.output_dir,
+                    "scientific_conclusion": payload["validation"]["scientific_conclusion"],
+                    "stable_clusters": payload["report"]["stable_clusters"],
+                    "extended_validation_pass_level": payload["validation"]["extended_validation_pass_level"],
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    if args.command == "role-transfer-v09":
+        payload = run_role_transfer_v09(
+            RoleTransferV09Config(
+                m3_input_dir=args.m3_input_dir,
+                m2_input_dir=args.m2_input_dir,
+                m1_input_dir=args.m1_input_dir,
+                output_dir=args.output_dir,
+                game_set_manifest=args.game_set_manifest,
+                game_set_name=args.game_set_name,
+                split_mode=args.split_mode,
+                min_source_role_support=args.min_source_role_support,
+                min_target_family_support=args.min_target_family_support,
+                workers=args.workers,
+            )
+        )
+        print(
+            json.dumps(
+                {
+                    "output_dir": args.output_dir,
+                    "scientific_conclusion": payload["validation"]["scientific_conclusion"],
+                    "transfer_accuracy_role": payload["report"]["transfer_accuracy_role"],
+                    "supports_H2": payload["report"]["supports_H2"],
+                },
+                indent=2,
+            )
+        )
         return 0
 
     if args.command == "migrate-sqlite-to-parquet":

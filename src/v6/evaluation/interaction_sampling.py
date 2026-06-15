@@ -19,6 +19,7 @@ from v6.evaluation.failure_diagnostics import compute_run_diagnostics
 from v6.evaluation.future_effects import analyze_future_effects
 from v6.evaluation.id_free_prefuture_validation import ID_FREE_FEATURE_SETS, evaluate_id_free_config
 from v6.evaluation.prefuture_role_prediction import PREFUTURE_CLASSIFIERS, load_prefuture_examples
+from v6.game_sets import load_game_set_manifest, parquet_games_present
 from v6.main import V6Config, V6System
 from v6.sampling import make_sampler, sampler_registry
 from v6.storage.migration import migrate_sqlite_to_parquet
@@ -62,6 +63,10 @@ class InteractionSamplingConfig:
     compression: str = "zstd"
     output_dir: str = "runs/v6"
     env_root: str | None = None
+    game_set_manifest: str | None = None
+    game_set_name: str | None = None
+    only_missing_from_parquet_root: bool = False
+    collect_only: bool = False
 
 
 def parse_v05c_games(selector: str) -> tuple[str, ...]:
@@ -81,10 +86,16 @@ def parse_v05c_samplers(selector: str) -> tuple[str, ...]:
 
 
 def run_interaction_sampling_v05c(config: InteractionSamplingConfig) -> list[dict]:
+    config = resolve_interaction_sampling_scope(config)
     output = Path(config.output_dir)
     sampling_root = output / ("sampling_v05c_sqlite_tmp" if config.storage_backend == "parquet" else "sampling_v05c")
     sampling_root.mkdir(parents=True, exist_ok=True)
     _generate_sampling_dbs(config, sampling_root)
+    if config.collect_only:
+        if config.storage_backend == "parquet":
+            _export_sampling_sqlite_to_parquet(config, sampling_root)
+            shutil.rmtree(sampling_root, ignore_errors=True)
+        return []
     rows = _evaluate_sampling_runs(config, sampling_root)
     comparison = sampler_comparison_rows(rows)
     best = best_by_game(rows)
@@ -105,7 +116,59 @@ def run_interaction_sampling_v05c(config: InteractionSamplingConfig) -> list[dic
     return rows
 
 
+def resolve_interaction_sampling_scope(config: InteractionSamplingConfig) -> InteractionSamplingConfig:
+    selected_games = config.games
+    if config.game_set_manifest or config.game_set_name:
+        manifest = load_game_set_manifest(
+            manifest_path=config.game_set_manifest,
+            game_set_name=config.game_set_name,
+            fallback_games=config.games,
+        )
+        if manifest.games:
+            selected_games = manifest.games
+    if config.only_missing_from_parquet_root:
+        present = set(parquet_games_present(config.parquet_root))
+        selected_games = tuple(game for game in selected_games if game not in present)
+    return InteractionSamplingConfig(
+        **{
+            **config.__dict__,
+            "games": tuple(dict.fromkeys(selected_games)),
+        }
+    )
+
+
 def _generate_sampling_dbs(config: InteractionSamplingConfig, sampling_root: Path) -> None:
+    if config.collect_only and config.storage_backend == "parquet":
+        for game in config.games:
+            game_jobs = []
+            order = 0
+            for sampler_name in config.samplers:
+                for seed in config.seeds:
+                    db_path = sampling_db_path(sampling_root, game, sampler_name, config.steps, seed)
+                    if _sampling_db_ready(db_path):
+                        continue
+                    if db_path.exists():
+                        db_path.unlink()
+                    game_jobs.append(
+                        {
+                            "order": order,
+                            "game": game,
+                            "sampler_name": sampler_name,
+                            "seed": int(seed),
+                            "steps": int(config.steps),
+                            "horizon": int(config.horizon),
+                            "commit_steps": int(config.commit_steps),
+                            "db_path": str(db_path),
+                            "env_root": config.env_root,
+                        }
+                    )
+                    order += 1
+            if game_jobs:
+                _run_sampling_jobs(game_jobs, workers=config.workers)
+            _export_sampling_sqlite_to_parquet(config, sampling_root, games=(game,))
+            shutil.rmtree(sampling_root / game, ignore_errors=True)
+        return
+
     jobs = []
     order = 0
     for game in config.games:
@@ -132,7 +195,11 @@ def _generate_sampling_dbs(config: InteractionSamplingConfig, sampling_root: Pat
                 order += 1
     if not jobs:
         return
-    workers = max(1, min(int(config.workers), len(jobs)))
+    _run_sampling_jobs(jobs, workers=config.workers)
+
+
+def _run_sampling_jobs(jobs: list[dict], *, workers: int) -> None:
+    workers = max(1, min(int(workers), len(jobs)))
     print(f"running {len(jobs)} v0.5c sampling jobs with workers={workers}", file=sys.stderr, flush=True)
     with ProcessPoolExecutor(max_workers=workers, max_tasks_per_child=1) as executor:
         futures = {executor.submit(_run_sampling_job, job): job for job in jobs}
@@ -146,9 +213,10 @@ def _generate_sampling_dbs(config: InteractionSamplingConfig, sampling_root: Pat
             )
 
 
-def _export_sampling_sqlite_to_parquet(config: InteractionSamplingConfig, sampling_root: Path) -> None:
+def _export_sampling_sqlite_to_parquet(config: InteractionSamplingConfig, sampling_root: Path, *, games: tuple[str, ...] | None = None) -> None:
     parquet_root = Path(config.parquet_root)
-    for game in config.games:
+    selected_games = games or config.games
+    for game in selected_games:
         for sampler_name in config.samplers:
             for seed in config.seeds:
                 sqlite_path = sampling_db_path(sampling_root, game, sampler_name, config.steps, seed)
