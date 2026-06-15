@@ -36,6 +36,8 @@ from v6.role_candidates_v08d import RoleCandidatesV08dConfig, run_role_candidate
 from v6.role_transfer_v09 import RoleTransferV09Config, run_role_transfer_v09
 from v6.role_transfer_v09a import RoleTransferV09aConfig, run_role_transfer_v09a
 from v6.role_transfer_v09b import RoleTransferV09bConfig, run_role_transfer_v09b
+from v6.role_transfer_v09c import RoleTransferV09cConfig, run_role_transfer_v09c
+from v6.concept_candidates_v10 import ConceptCandidatesV10Config, run_concept_candidates_v10
 from v6.storage.benchmark import run_storage_benchmark
 from v6.storage.migration import migrate_sqlite_to_parquet
 from v6.transformation_families_v07 import TransformationFamiliesV07Config, run_transformation_families_v07
@@ -326,15 +328,38 @@ def build_parser() -> argparse.ArgumentParser:
     role_transfer_v09a.add_argument("--graph-source", default="hybrid")
 
     role_transfer_v09b = subparsers.add_parser("role-transfer-v09b")
-    role_transfer_v09b.add_argument("--m3-input-dir", default="runs/v6/v08_cd2_extended32_discriminative")
+    role_transfer_v09b.add_argument("--m3-input-dir", default=None)
     role_transfer_v09b.add_argument("--m2-input-dir", default="runs/v6/v07_cd2_extended32_expanded")
     role_transfer_v09b.add_argument("--m1-input-dir", default="runs/v6/v06_cd2_extended32")
-    role_transfer_v09b.add_argument("--previous-v09-dir", default="runs/v6/v09_role_transfer_extended32")
-    role_transfer_v09b.add_argument("--output-dir", default="runs/v6/v09b_role_transfer_refined_extended32")
+    role_transfer_v09b.add_argument("--previous-v09-dir", default=None)
+    role_transfer_v09b.add_argument("--previous-v09a-dir", default="runs/v6/v09a_role_transfer_sourceclean_extended32")
+    role_transfer_v09b.add_argument("--output-dir", default="runs/v6/v09b_role_transfer_refined_sourceclean_extended32")
     role_transfer_v09b.add_argument("--game-set-manifest", default=None)
     role_transfer_v09b.add_argument("--game-set-name", default=None)
     role_transfer_v09b.add_argument("--split-mode", default="leave_family_out")
     role_transfer_v09b.add_argument("--workers", type=int, default=25)
+    role_transfer_v09b.add_argument("--graph-source", default="hybrid")
+
+    role_transfer_v09c = subparsers.add_parser("role-transfer-v09c")
+    role_transfer_v09c.add_argument("--m2-input-dir", default="runs/v6/v07_cd2_extended32_expanded")
+    role_transfer_v09c.add_argument("--m1-input-dir", default="runs/v6/v06_cd2_extended32")
+    role_transfer_v09c.add_argument("--previous-v09b-dir", default="runs/v6/v09b_role_transfer_refined_sourceclean_extended32")
+    role_transfer_v09c.add_argument("--output-dir", default="runs/v6/v09c_transfer_hardened_extended32")
+    role_transfer_v09c.add_argument("--game-set-manifest", default=None)
+    role_transfer_v09c.add_argument("--game-set-name", default=None)
+    role_transfer_v09c.add_argument("--split-mode", default="leave_family_out")
+    role_transfer_v09c.add_argument("--workers", type=int, default=25)
+    role_transfer_v09c.add_argument("--graph-source", default="hybrid")
+
+    concept_candidates_v10 = subparsers.add_parser("concept-candidates-v10")
+    concept_candidates_v10.add_argument("--m3-input-dir", default="runs/v6/v08d_cd2_extended32_sourceclean")
+    concept_candidates_v10.add_argument("--transfer-input-dir", default="runs/v6/v09c_transfer_hardened_extended32")
+    concept_candidates_v10.add_argument("--m2-input-dir", default="runs/v6/v07_cd2_extended32_expanded")
+    concept_candidates_v10.add_argument("--m1-input-dir", default="runs/v6/v06_cd2_extended32")
+    concept_candidates_v10.add_argument("--output-dir", default="runs/v6/v10_m4_concepts_extended32")
+    concept_candidates_v10.add_argument("--game-set-manifest", default=None)
+    concept_candidates_v10.add_argument("--game-set-name", default=None)
+    concept_candidates_v10.add_argument("--workers", type=int, default=25)
 
     migrate = subparsers.add_parser("migrate-sqlite-to-parquet")
     migrate.add_argument("--sqlite", required=True)
@@ -847,11 +872,13 @@ def main() -> int:
                 m2_input_dir=args.m2_input_dir,
                 m1_input_dir=args.m1_input_dir,
                 previous_v09_dir=args.previous_v09_dir,
+                previous_v09a_dir=args.previous_v09a_dir,
                 output_dir=args.output_dir,
                 game_set_manifest=args.game_set_manifest,
                 game_set_name=args.game_set_name,
                 split_mode=args.split_mode,
                 workers=args.workers,
+                graph_source=args.graph_source,
             )
         )
         print(
@@ -861,6 +888,59 @@ def main() -> int:
                     "scientific_conclusion": payload["validation"]["scientific_conclusion"],
                     "best_strategy": payload["report"]["best_strategy"]["strategy_name"],
                     "positive_role_lift_families": payload["report"]["best_strategy"]["positive_role_lift_families"],
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    if args.command == "role-transfer-v09c":
+        payload = run_role_transfer_v09c(
+            RoleTransferV09cConfig(
+                m2_input_dir=args.m2_input_dir,
+                m1_input_dir=args.m1_input_dir,
+                previous_v09b_dir=args.previous_v09b_dir,
+                output_dir=args.output_dir,
+                game_set_manifest=args.game_set_manifest,
+                game_set_name=args.game_set_name,
+                split_mode=args.split_mode,
+                workers=args.workers,
+                graph_source=args.graph_source,
+            )
+        )
+        print(
+            json.dumps(
+                {
+                    "output_dir": args.output_dir,
+                    "scientific_conclusion": payload["validation"]["scientific_conclusion"],
+                    "lift_vs_surface_effect_hardened": payload["report"]["lift_vs_surface_effect_hardened"],
+                    "positive_lift_families_hardened": payload["report"]["positive_lift_families_hardened"],
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    if args.command == "concept-candidates-v10":
+        payload = run_concept_candidates_v10(
+            ConceptCandidatesV10Config(
+                m3_input_dir=args.m3_input_dir,
+                transfer_input_dir=args.transfer_input_dir,
+                m2_input_dir=args.m2_input_dir,
+                m1_input_dir=args.m1_input_dir,
+                output_dir=args.output_dir,
+                game_set_manifest=args.game_set_manifest,
+                game_set_name=args.game_set_name,
+                workers=args.workers,
+            )
+        )
+        print(
+            json.dumps(
+                {
+                    "output_dir": args.output_dir,
+                    "scientific_conclusion": payload["validation"]["scientific_conclusion"],
+                    "stable_concept_candidates": payload["report"]["stable_concept_candidates"],
+                    "transferable_concepts": payload["report"]["transferable_concepts"],
                 },
                 indent=2,
             )
