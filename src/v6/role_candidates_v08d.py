@@ -33,6 +33,8 @@ class RoleCandidatesV08dConfig:
     weight_future_option: float = 0.25
     weight_local_motif: float = 0.20
     weight_temporal_effect: float = 0.10
+    ablation: str = "none"
+    graph_source: str = "hybrid"
 
 
 @dataclass(frozen=True)
@@ -97,6 +99,18 @@ class DiscNeighborhood:
 
 
 @dataclass(frozen=True)
+class GraphBuildDiagnostics:
+    graph_source_used: str
+    predecessor_edges_from_m2_graph: int
+    successor_edges_from_m2_graph: int
+    predecessor_edges_from_episode_order: int
+    successor_edges_from_episode_order: int
+    approximate_edges_used: int
+    approximate_edge_ratio: float
+    graph_edge_coverage: float
+
+
+@dataclass(frozen=True)
 class PairResult:
     left_family_id: str
     right_family_id: str
@@ -138,6 +152,8 @@ def run_role_candidates_v08d(config: RoleCandidatesV08dConfig) -> dict[str, Any]
     game_set = load_game_set(config)
     m2_families = load_m2_families(input_dir)
     m1_support = load_m1_support(m1_input_dir)
+    episode_summaries = load_episode_summaries(m1_input_dir)
+    m2_graph_edges = load_m2_graph_edges(input_dir)
     available_games = {game for family in m2_families for game in family.games_present}
     selected_games = tuple(game for game in game_set.games if game in available_games) if game_set.games else tuple(sorted(available_games))
     selected_game_set = set(selected_games)
@@ -145,7 +161,15 @@ def run_role_candidates_v08d(config: RoleCandidatesV08dConfig) -> dict[str, Any]
     m1_support = {key: value for key, value in m1_support.items() if value.game_id in selected_game_set}
     game_family_map = build_game_family_map(game_set, selected_games)
 
-    neighborhoods = build_discriminative_neighborhoods(m2_families, m1_support, game_family_map)
+    neighborhoods, graph_diagnostics = build_discriminative_neighborhoods(
+        m2_families,
+        m1_support,
+        game_family_map,
+        graph_source=config.graph_source,
+        ablation=config.ablation,
+        m2_graph_edges=m2_graph_edges,
+        episode_summaries=episode_summaries,
+    )
     pair_results = evaluate_pairwise_similarity(neighborhoods, weights=weights, threshold=config.role_similarity_threshold, workers=config.workers)
     adjacency = build_similarity_adjacency(pair_results, config.role_similarity_threshold)
     clusters, rejected = cluster_role_candidates(adjacency, pair_results, neighborhoods, config.role_similarity_threshold)
@@ -169,6 +193,7 @@ def run_role_candidates_v08d(config: RoleCandidatesV08dConfig) -> dict[str, Any]
         pair_results=pair_results,
         roles=roles,
         rejected_clusters=rejected,
+        graph_diagnostics=graph_diagnostics,
     )
 
     write_outputs(
@@ -257,6 +282,24 @@ def load_m1_support(input_dir: Path) -> dict[str, M1SupportRecord]:
     return output
 
 
+def load_episode_summaries(input_dir: Path) -> list[dict[str, Any]]:
+    path = input_dir / "episode_summaries.parquet"
+    if not path.exists():
+        return []
+    import pandas as pd
+
+    return pd.read_parquet(path).to_dict(orient="records")
+
+
+def load_m2_graph_edges(input_dir: Path) -> list[dict[str, Any]]:
+    path = input_dir / "m2_graph_edges.parquet"
+    if not path.exists():
+        return []
+    import pandas as pd
+
+    return pd.read_parquet(path).to_dict(orient="records")
+
+
 def compute_action_baselines(rows: list[dict[str, Any]]) -> dict[tuple[str, int], float]:
     counts: dict[tuple[str, int], Counter[str]] = defaultdict(Counter)
     totals: Counter[tuple[str, int]] = Counter()
@@ -274,24 +317,25 @@ def build_discriminative_neighborhoods(
     families: list[M2FamilyRecord],
     m1_support: dict[str, M1SupportRecord],
     game_family_map: dict[str, str],
-) -> dict[str, DiscNeighborhood]:
+    *,
+    graph_source: str = "approximate",
+    ablation: str = "none",
+    m2_graph_edges: list[dict[str, Any]] | None = None,
+    episode_summaries: list[dict[str, Any]] | None = None,
+) -> tuple[dict[str, DiscNeighborhood], GraphBuildDiagnostics]:
+    m2_graph_edges = m2_graph_edges or []
+    episode_summaries = episode_summaries or []
     family_members = {
         family.family_id: [m1_support[item] for item in family.contingency_ids if item in m1_support]
         for family in families
     }
-    game_token_emitters: dict[str, dict[str, Counter[str]]] = defaultdict(lambda: defaultdict(Counter))
-    for family in families:
-        for member in family_members[family.family_id]:
-            game_token_emitters[member.game_id][emitted_token(member)][family.family_id] += 1
-
-    predecessor_counts: dict[str, Counter[str]] = defaultdict(Counter)
-    successor_counts: dict[str, Counter[str]] = defaultdict(Counter)
-    for family in families:
-        for member in family_members[family.family_id]:
-            for token in member.context_signature:
-                for predecessor_family_id, count in game_token_emitters[member.game_id].get(token, {}).items():
-                    predecessor_counts[family.family_id][predecessor_family_id] += count
-                    successor_counts[predecessor_family_id][family.family_id] += count
+    predecessor_counts, successor_counts, graph_diagnostics = build_graph_relationships(
+        families=families,
+        family_members=family_members,
+        m2_graph_edges=m2_graph_edges,
+        episode_summaries=episode_summaries,
+        graph_source=graph_source,
+    )
 
     max_step_by_game: dict[str, int] = defaultdict(int)
     for member in m1_support.values():
@@ -308,6 +352,7 @@ def build_discriminative_neighborhoods(
             family_index={item.family_id: item for item in families},
             game_family_map=game_family_map,
             max_step_by_game=max_step_by_game,
+            ablation=ablation,
         )
 
     normalized = normalize_feature_groups(precomputed)
@@ -338,7 +383,120 @@ def build_discriminative_neighborhoods(
             outgoing_edge_profile=dict(sorted(precomputed[family.family_id]["outgoing_edge_profile"].items())),
             examples=tuple(family.examples),
         )
-    return neighborhoods
+    return neighborhoods, graph_diagnostics
+
+
+def build_graph_relationships(
+    *,
+    families: list[M2FamilyRecord],
+    family_members: dict[str, list[M1SupportRecord]],
+    m2_graph_edges: list[dict[str, Any]],
+    episode_summaries: list[dict[str, Any]],
+    graph_source: str,
+) -> tuple[dict[str, Counter[str]], dict[str, Counter[str]], GraphBuildDiagnostics]:
+    family_ids = {family.family_id for family in families}
+    predecessor_counts: dict[str, Counter[str]] = defaultdict(Counter)
+    successor_counts: dict[str, Counter[str]] = defaultdict(Counter)
+
+    approx_pred, approx_succ, approx_edges = approximate_token_edges(families, family_members)
+    m2_pred, m2_succ, m2_edges_used = m2_explicit_edges(m2_graph_edges, family_ids)
+    ep_pred, ep_succ, ep_edges_used = episode_order_edges(family_members)
+
+    use_approx = graph_source in {"approximate", "hybrid"}
+    use_m2 = graph_source in {"m2_edges", "hybrid"}
+    use_episode = graph_source in {"episode_order", "hybrid"}
+
+    for source, target in (
+        (approx_pred, predecessor_counts) if use_approx else ({}, predecessor_counts),
+        (m2_pred, predecessor_counts) if use_m2 else ({}, predecessor_counts),
+        (ep_pred, predecessor_counts) if use_episode else ({}, predecessor_counts),
+    ):
+        for family_id, counter in source.items():
+            target[family_id].update(counter)
+    for source, target in (
+        (approx_succ, successor_counts) if use_approx else ({}, successor_counts),
+        (m2_succ, successor_counts) if use_m2 else ({}, successor_counts),
+        (ep_succ, successor_counts) if use_episode else ({}, successor_counts),
+    ):
+        for family_id, counter in source.items():
+            target[family_id].update(counter)
+
+    explicit_edges = (m2_edges_used if use_m2 else 0) + (ep_edges_used if use_episode else 0)
+    approximate_edges = approx_edges if use_approx else 0
+    total_edges = explicit_edges + approximate_edges
+    diagnostics = GraphBuildDiagnostics(
+        graph_source_used=graph_source,
+        predecessor_edges_from_m2_graph=m2_edges_used if use_m2 else 0,
+        successor_edges_from_m2_graph=m2_edges_used if use_m2 else 0,
+        predecessor_edges_from_episode_order=ep_edges_used if use_episode else 0,
+        successor_edges_from_episode_order=ep_edges_used if use_episode else 0,
+        approximate_edges_used=approximate_edges,
+        approximate_edge_ratio=approximate_edges / max(1, total_edges),
+        graph_edge_coverage=explicit_edges / max(1, total_edges),
+    )
+    return predecessor_counts, successor_counts, diagnostics
+
+
+def approximate_token_edges(
+    families: list[M2FamilyRecord],
+    family_members: dict[str, list[M1SupportRecord]],
+) -> tuple[dict[str, Counter[str]], dict[str, Counter[str]], int]:
+    game_token_emitters: dict[str, dict[str, Counter[str]]] = defaultdict(lambda: defaultdict(Counter))
+    for family in families:
+        for member in family_members[family.family_id]:
+            game_token_emitters[member.game_id][emitted_token(member)][family.family_id] += 1
+    predecessor_counts: dict[str, Counter[str]] = defaultdict(Counter)
+    successor_counts: dict[str, Counter[str]] = defaultdict(Counter)
+    edges = 0
+    for family in families:
+        for member in family_members[family.family_id]:
+            for token in member.context_signature:
+                for predecessor_family_id, count in game_token_emitters[member.game_id].get(token, {}).items():
+                    predecessor_counts[family.family_id][predecessor_family_id] += count
+                    successor_counts[predecessor_family_id][family.family_id] += count
+                    edges += int(count)
+    return predecessor_counts, successor_counts, edges
+
+
+def m2_explicit_edges(
+    m2_graph_edges: list[dict[str, Any]],
+    family_ids: set[str],
+) -> tuple[dict[str, Counter[str]], dict[str, Counter[str]], int]:
+    predecessor_counts: dict[str, Counter[str]] = defaultdict(Counter)
+    successor_counts: dict[str, Counter[str]] = defaultdict(Counter)
+    edges = 0
+    for row in m2_graph_edges:
+        source_id = str(row.get("source_id", ""))
+        target_id = str(row.get("target_id", ""))
+        edge_type = str(row.get("edge_type", ""))
+        if edge_type == "member_of":
+            continue
+        if source_id in family_ids and target_id in family_ids:
+            predecessor_counts[target_id][source_id] += 1
+            successor_counts[source_id][target_id] += 1
+            edges += 1
+    return predecessor_counts, successor_counts, edges
+
+
+def episode_order_edges(
+    family_members: dict[str, list[M1SupportRecord]],
+) -> tuple[dict[str, Counter[str]], dict[str, Counter[str]], int]:
+    game_rows: dict[str, list[tuple[int, int, str]]] = defaultdict(list)
+    for family_id, members in family_members.items():
+        for member in members:
+            game_rows[member.game_id].append((member.first_seen_step, member.last_seen_step, family_id))
+    predecessor_counts: dict[str, Counter[str]] = defaultdict(Counter)
+    successor_counts: dict[str, Counter[str]] = defaultdict(Counter)
+    edges = 0
+    for rows in game_rows.values():
+        rows = sorted(rows)
+        for (_, _, left_family), (_, _, right_family) in zip(rows, rows[1:], strict=False):
+            if left_family == right_family:
+                continue
+            predecessor_counts[right_family][left_family] += 1
+            successor_counts[left_family][right_family] += 1
+            edges += 1
+    return predecessor_counts, successor_counts, edges
 
 
 def precompute_family_profiles(
@@ -351,6 +509,7 @@ def precompute_family_profiles(
     family_index: dict[str, M2FamilyRecord],
     game_family_map: dict[str, str],
     max_step_by_game: dict[str, int],
+    ablation: str,
 ) -> dict[str, Any]:
     outcome_dist = normalized_counter(family.outcome_signature_distribution)
     motif_dist = normalized_counter(family.motif_candidate_distribution)
@@ -370,10 +529,16 @@ def precompute_family_profiles(
     terminal_rate = outcome_dist.get("terminal_transition", 0.0)
     large_change_rate = outcome_dist.get("large_change", 0.0)
     change_rate = outcome_dist.get("change", 0.0) + large_change_rate
-    discontinuous_position_rate = position_rate * (0.8 if family.family_label_candidate in {"teleport_like_family_candidate", "push_like_family_candidate"} else 0.25 + 0.5 * interactive_ratio)
-    coverage_change_rate = (
-        1.0 if family.family_label_candidate == "coverage_change_family_candidate" else min(1.0, large_change_rate + 0.5 * change_rate * max(0.0, family.mean_context_lift))
-    )
+    if ablation == "no_m2_labels":
+        discontinuous_position_rate = min(1.0, position_rate * (0.35 + 0.45 * interactive_ratio + 0.20 * float(unique_succ > unique_pred)))
+        coverage_change_rate = min(1.0, large_change_rate + 0.5 * change_rate * max(0.0, family.mean_context_lift) + 0.20 * float(unique_succ >= 2))
+        label_features = {}
+    else:
+        discontinuous_position_rate = position_rate * (0.8 if family.family_label_candidate in {"teleport_like_family_candidate", "push_like_family_candidate"} else 0.25 + 0.5 * interactive_ratio)
+        coverage_change_rate = (
+            1.0 if family.family_label_candidate == "coverage_change_family_candidate" else min(1.0, large_change_rate + 0.5 * change_rate * max(0.0, family.mean_context_lift))
+        )
+        label_features = label_one_hot(family.family_label_candidate)
     successor_terminal = mean_neighbor_metric(successors, family_index, lambda item: normalized_counter(item.outcome_signature_distribution).get("terminal_transition", 0.0))
     enable_score = max(0.0, (unique_succ - unique_pred) / max(1.0, unique_succ + unique_pred)) + max(0.0, family.mean_context_lift)
     block_score = no_change_rate + max(0.0, (unique_pred - unique_succ) / max(1.0, unique_succ + unique_pred))
@@ -406,7 +571,7 @@ def precompute_family_profiles(
         "context_dependency": context_dependency_score(context_depth_counts),
         "action_regularity": action_regularity_score(action_counts),
         "entropy_inverse": entropy_inverse(float(np.mean([member.entropy for member in members])) if members else 0.0),
-        **label_one_hot(family.family_label_candidate),
+        **label_features,
     }
     directional = {
         "predecessor_count": float(pred_total),
@@ -913,6 +1078,7 @@ def build_v08d_payload(
     pair_results: list[PairResult],
     roles: list[M3RoleCandidate],
     rejected_clusters: list[list[str]],
+    graph_diagnostics: GraphBuildDiagnostics,
 ) -> dict[str, Any]:
     stable_roles = [role for role in roles if role.status == "stable"]
     weak_roles = [role for role in roles if role.status == "weak"]
@@ -1007,6 +1173,15 @@ def build_v08d_payload(
         "trigger_status": role_status("trigger_candidate", roles),
         "movement_controller_status": role_status("movement_controller_candidate", roles),
         "coverage_expander_status": role_status("coverage_expander_candidate", roles),
+        "graph_source_used": graph_diagnostics.graph_source_used,
+        "predecessor_edges_from_m2_graph": graph_diagnostics.predecessor_edges_from_m2_graph,
+        "successor_edges_from_m2_graph": graph_diagnostics.successor_edges_from_m2_graph,
+        "predecessor_edges_from_episode_order": graph_diagnostics.predecessor_edges_from_episode_order,
+        "successor_edges_from_episode_order": graph_diagnostics.successor_edges_from_episode_order,
+        "approximate_edges_used": graph_diagnostics.approximate_edges_used,
+        "approximate_edge_ratio": graph_diagnostics.approximate_edge_ratio,
+        "graph_edge_coverage": graph_diagnostics.graph_edge_coverage,
+        "ablation": config.ablation,
         "scientific_conclusion": conclusion,
         "extended_validation_pass_level": pass_level,
         "proceed_to_v09_role_transfer_testing": conclusion in {
@@ -1039,6 +1214,8 @@ def build_v08d_payload(
             "workers": int(config.workers),
             "partition_by": list(config.partition_by),
             "fingerprint_mode": config.fingerprint_mode,
+            "ablation": config.ablation,
+            "graph_source": config.graph_source,
         },
         "report": report,
         "validation": validation,
@@ -1095,6 +1272,10 @@ def format_v08d_report(payload: dict[str, Any]) -> str:
         f"trigger_status={r['trigger_status']}",
         f"movement_controller_status={r['movement_controller_status']}",
         f"coverage_expander_status={r['coverage_expander_status']}",
+        f"graph_source_used={r['graph_source_used']}",
+        f"graph_edge_coverage={r['graph_edge_coverage']:.6f}",
+        f"approximate_edge_ratio={r['approximate_edge_ratio']:.6f}",
+        f"ablation={r['ablation']}",
         f"extended_validation_pass_level={r['extended_validation_pass_level']}",
         f"proceed_to_v09_role_transfer_testing={r['proceed_to_v09_role_transfer_testing']}",
         f"improvements_detected={','.join(r['improvements_detected'])}",

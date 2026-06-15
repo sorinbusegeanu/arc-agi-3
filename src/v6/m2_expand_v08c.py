@@ -282,7 +282,17 @@ def expand_family_groups(
             split_key_values={},
         )
     ]
-    splitters: list[tuple[str, SplitKey]] = [("manifest_family", lambda row, gf: gf.get(row.game_id, "unknown"))]
+    splitters: list[tuple[str, SplitKey]] = [
+        ("dominant_motif", lambda row, gf: str(row.future_option_motif_candidate)),
+        ("outcome_signature_profile", lambda row, gf: outcome_profile(row)),
+        ("terminal_frequency_band", lambda row, gf: terminal_band(row)),
+        ("no_change_frequency_band", lambda row, gf: no_change_band(row)),
+        ("position_change_frequency_band", lambda row, gf: position_change_band(row)),
+        ("context_lift_band", lambda row, gf: context_lift_band(row.context_lift)),
+        ("prediction_accuracy_band", lambda row, gf: prediction_band(row.prediction_accuracy)),
+        ("support_count_band", lambda row, gf: support_band(row.support_count)),
+        ("manifest_family", lambda row, gf: gf.get(row.game_id, "unknown")),
+    ]
     for split_name, splitter in splitters:
         next_groups: list[ExpandedGroup] = []
         changed = False
@@ -328,7 +338,17 @@ def secondary_expansion_pass(
     config: M2ExpandV08cConfig,
 ) -> list[ExpandedGroup]:
     expanded = list(groups)
-    for split_name, splitter in [("manifest_family", lambda row, gf: gf.get(row.game_id, "unknown"))]:
+    for split_name, splitter in [
+        ("dominant_motif", lambda row, gf: str(row.future_option_motif_candidate)),
+        ("outcome_signature_profile", lambda row, gf: outcome_profile(row)),
+        ("terminal_frequency_band", lambda row, gf: terminal_band(row)),
+        ("no_change_frequency_band", lambda row, gf: no_change_band(row)),
+        ("position_change_frequency_band", lambda row, gf: position_change_band(row)),
+        ("context_lift_band", lambda row, gf: context_lift_band(row.context_lift)),
+        ("prediction_accuracy_band", lambda row, gf: prediction_band(row.prediction_accuracy)),
+        ("support_count_band", lambda row, gf: support_band(row.support_count)),
+        ("manifest_family", lambda row, gf: gf.get(row.game_id, "unknown")),
+    ]:
         if len(expanded) >= config.min_expanded_families:
             break
         next_groups: list[ExpandedGroup] = []
@@ -650,6 +670,16 @@ def build_expansion_payload(
     expansion_rows: list[dict[str, Any]],
     total_contingencies: int,
 ) -> dict[str, Any]:
+    split_counter = Counter(row["split_reason"] for row in expansion_rows if row["split_reason"] != "unchanged")
+    structural_split_count = 0
+    manifest_split_count = 0
+    for reason, count in split_counter.items():
+        parts = [part for part in str(reason).split(",") if part]
+        if any(part != "manifest_family" for part in parts):
+            structural_split_count += count
+        elif parts:
+            manifest_split_count += count
+    total_split_count = structural_split_count + manifest_split_count
     expansion_succeeds = (
         diagnostics_after["m2_family_count"] >= config.min_expanded_families
         and diagnostics_after["largest_family_percent"] <= config.max_family_share
@@ -677,7 +707,10 @@ def build_expansion_payload(
             "diagnostics_before": diagnostics_before,
             "diagnostics_after": diagnostics_after,
             "overcompressed_families_detected": sorted({row["original_family_id"] for row in expansion_rows if row["split_reason"] != "unchanged"}),
-            "split_reasons": Counter(row["split_reason"] for row in expansion_rows if row["split_reason"] != "unchanged"),
+            "split_reasons": split_counter,
+            "splitters_used": sorted({part for row in expansion_rows for part in str(row["split_reason"]).split(",") if part and part != "unchanged"}),
+            "percent_splits_by_manifest_family": manifest_split_count / max(1, total_split_count),
+            "percent_splits_by_structural_features": structural_split_count / max(1, total_split_count),
             "target_40_to_60_useful_families_achieved": config.min_expanded_families <= diagnostics_after["m2_family_count"] <= config.target_expanded_families,
             "expansion_suitable_for_v08_retry": expansion_succeeds,
             "total_contingencies_loaded": total_contingencies,
@@ -727,6 +760,9 @@ def format_v07_expanded_report(payload: dict[str, Any]) -> str:
         f"largest_family_percent_after={report['largest_family_percent_after']:.6f}",
         f"overcompressed_families_detected={','.join(report['overcompressed_families_detected'])}",
         f"split_reasons={dict(split_reasons)}",
+        f"splitters_used={','.join(report['splitters_used'])}",
+        f"percent_splits_by_manifest_family={report['percent_splits_by_manifest_family']:.6f}",
+        f"percent_splits_by_structural_features={report['percent_splits_by_structural_features']:.6f}",
         f"singleton_family_count_after={after['singleton_family_count']}",
         f"tiny_family_count_after={after['tiny_family_count']}",
         f"target_40_to_60_useful_families_achieved={report['target_40_to_60_useful_families_achieved']}",

@@ -34,6 +34,8 @@ from v6.m2_expand_v08c import M2ExpandV08cConfig, run_m2_expand_v08c
 from v6.role_candidates_v08 import RoleCandidatesV08Config, run_role_candidates_v08
 from v6.role_candidates_v08d import RoleCandidatesV08dConfig, run_role_candidates_v08d
 from v6.role_transfer_v09 import RoleTransferV09Config, run_role_transfer_v09
+from v6.role_transfer_v09a import RoleTransferV09aConfig, run_role_transfer_v09a
+from v6.role_transfer_v09b import RoleTransferV09bConfig, run_role_transfer_v09b
 from v6.storage.benchmark import run_storage_benchmark
 from v6.storage.migration import migrate_sqlite_to_parquet
 from v6.transformation_families_v07 import TransformationFamiliesV07Config, run_transformation_families_v07
@@ -298,6 +300,8 @@ def build_parser() -> argparse.ArgumentParser:
     role_candidates_v08d.add_argument("--weight-future-option", type=float, default=0.25)
     role_candidates_v08d.add_argument("--weight-local-motif", type=float, default=0.20)
     role_candidates_v08d.add_argument("--weight-temporal-effect", type=float, default=0.10)
+    role_candidates_v08d.add_argument("--ablation", default="none")
+    role_candidates_v08d.add_argument("--graph-source", default="hybrid")
 
     role_transfer_v09 = subparsers.add_parser("role-transfer-v09")
     role_transfer_v09.add_argument("--m3-input-dir", default="runs/v6/v08_cd2_extended32_discriminative")
@@ -310,6 +314,27 @@ def build_parser() -> argparse.ArgumentParser:
     role_transfer_v09.add_argument("--min-source-role-support", type=int, default=3)
     role_transfer_v09.add_argument("--min-target-family-support", type=int, default=3)
     role_transfer_v09.add_argument("--workers", type=int, default=25)
+
+    role_transfer_v09a = subparsers.add_parser("role-transfer-v09a")
+    role_transfer_v09a.add_argument("--m2-input-dir", default="runs/v6/v07_cd2_extended32_expanded")
+    role_transfer_v09a.add_argument("--m1-input-dir", default="runs/v6/v06_cd2_extended32")
+    role_transfer_v09a.add_argument("--output-dir", default="runs/v6/v09a_role_transfer_sourceclean_extended32")
+    role_transfer_v09a.add_argument("--game-set-manifest", default=None)
+    role_transfer_v09a.add_argument("--game-set-name", default=None)
+    role_transfer_v09a.add_argument("--split-mode", default="leave_family_out")
+    role_transfer_v09a.add_argument("--workers", type=int, default=25)
+    role_transfer_v09a.add_argument("--graph-source", default="hybrid")
+
+    role_transfer_v09b = subparsers.add_parser("role-transfer-v09b")
+    role_transfer_v09b.add_argument("--m3-input-dir", default="runs/v6/v08_cd2_extended32_discriminative")
+    role_transfer_v09b.add_argument("--m2-input-dir", default="runs/v6/v07_cd2_extended32_expanded")
+    role_transfer_v09b.add_argument("--m1-input-dir", default="runs/v6/v06_cd2_extended32")
+    role_transfer_v09b.add_argument("--previous-v09-dir", default="runs/v6/v09_role_transfer_extended32")
+    role_transfer_v09b.add_argument("--output-dir", default="runs/v6/v09b_role_transfer_refined_extended32")
+    role_transfer_v09b.add_argument("--game-set-manifest", default=None)
+    role_transfer_v09b.add_argument("--game-set-name", default=None)
+    role_transfer_v09b.add_argument("--split-mode", default="leave_family_out")
+    role_transfer_v09b.add_argument("--workers", type=int, default=25)
 
     migrate = subparsers.add_parser("migrate-sqlite-to-parquet")
     migrate.add_argument("--sqlite", required=True)
@@ -744,6 +769,8 @@ def main() -> int:
                 weight_future_option=args.weight_future_option,
                 weight_local_motif=args.weight_local_motif,
                 weight_temporal_effect=args.weight_temporal_effect,
+                ablation=args.ablation,
+                graph_source=args.graph_source,
             )
         )
         print(
@@ -781,6 +808,59 @@ def main() -> int:
                     "scientific_conclusion": payload["validation"]["scientific_conclusion"],
                     "transfer_accuracy_role": payload["report"]["transfer_accuracy_role"],
                     "supports_H2": payload["report"]["supports_H2"],
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    if args.command == "role-transfer-v09a":
+        payload = run_role_transfer_v09a(
+            RoleTransferV09aConfig(
+                m2_input_dir=args.m2_input_dir,
+                m1_input_dir=args.m1_input_dir,
+                output_dir=args.output_dir,
+                game_set_manifest=args.game_set_manifest,
+                game_set_name=args.game_set_name,
+                split_mode=args.split_mode,
+                workers=args.workers,
+                graph_source=args.graph_source,
+            )
+        )
+        print(
+            json.dumps(
+                {
+                    "output_dir": args.output_dir,
+                    "scientific_conclusion": payload["validation"]["scientific_conclusion"],
+                    "transfer_accuracy_structural_role": payload["report"]["transfer_accuracy_structural_role"],
+                    "supports_H2": payload["report"]["supports_H2"],
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    if args.command == "role-transfer-v09b":
+        payload = run_role_transfer_v09b(
+            RoleTransferV09bConfig(
+                m3_input_dir=args.m3_input_dir,
+                m2_input_dir=args.m2_input_dir,
+                m1_input_dir=args.m1_input_dir,
+                previous_v09_dir=args.previous_v09_dir,
+                output_dir=args.output_dir,
+                game_set_manifest=args.game_set_manifest,
+                game_set_name=args.game_set_name,
+                split_mode=args.split_mode,
+                workers=args.workers,
+            )
+        )
+        print(
+            json.dumps(
+                {
+                    "output_dir": args.output_dir,
+                    "scientific_conclusion": payload["validation"]["scientific_conclusion"],
+                    "best_strategy": payload["report"]["best_strategy"]["strategy_name"],
+                    "positive_role_lift_families": payload["report"]["best_strategy"]["positive_role_lift_families"],
                 },
                 indent=2,
             )

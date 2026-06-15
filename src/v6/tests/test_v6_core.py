@@ -142,7 +142,18 @@ from v6.role_candidates_v08d import (
     role_status,
     run_role_candidates_v08d,
 )
-from v6.role_transfer_v09 import RoleTransferV09Config, build_source_role_prototypes, load_neighborhoods, load_roles, run_role_transfer_v09
+from v6.role_transfer_v09 import RoleTransferV09Config, all_features, build_source_role_prototypes, load_neighborhoods, load_roles, run_role_transfer_v09
+from v6.role_transfer_v09b import (
+    RoleTransferV09bConfig,
+    build_prototype_entry,
+    build_strategy_specs,
+    medoid_index,
+    rank_roles_for_target,
+    run_role_transfer_v09b,
+    select_best_strategy_payload,
+    StrategySpec,
+)
+from v6.role_transfer_v09a import RoleTransferV09aConfig, run_role_transfer_v09a
 from v6.sampling import (
     ActionBalanceSampler,
     LowConfidenceSampler,
@@ -2169,7 +2180,7 @@ def test_v08d_directional_and_future_option_profiles(tmp_path) -> None:
     )
     families = load_m2_families_v08d(expanded)
     support = load_m1_support_v08d(m1_dir)
-    neighborhoods = build_discriminative_neighborhoods(families, support, {"g1": "collection", "g2": "push_crate", "g3": "switch_unlock", "g4": "teleport_warp"})
+    neighborhoods, _ = build_discriminative_neighborhoods(families, support, {"g1": "collection", "g2": "push_crate", "g3": "switch_unlock", "g4": "teleport_warp"})
 
     record = next(iter(neighborhoods.values()))
     assert "predecessor_count" in record.directional_features
@@ -2298,6 +2309,218 @@ def test_cli_accepts_role_transfer_v09_options() -> None:
 
     assert args.command == "role-transfer-v09"
     assert args.split_mode == "leave_family_out"
+
+
+def test_v09b_medoid_prototype_selection(tmp_path) -> None:
+    m3_dir, _, _, _ = _write_v09_fixture(tmp_path)
+    neighborhoods = load_neighborhoods(m3_dir / "role_neighborhoods.parquet")
+    members = [neighborhoods["f1"], neighborhoods["f2"]]
+    idx = medoid_index([all_features(member) for member in members])
+
+    assert idx in {0, 1}
+
+
+def test_v09b_family_balanced_prototype_calculation(tmp_path) -> None:
+    m3_dir, _, _, _ = _write_v09_fixture(tmp_path)
+    neighborhoods = load_neighborhoods(m3_dir / "role_neighborhoods.parquet")
+    roles = load_roles(m3_dir / "m3_role_candidates.json")
+    role = next(row for row in roles if row.role_id == "r1")
+    entry = build_prototype_entry(StrategySpec("fb", "family_balanced"), role, [neighborhoods["f1"], neighborhoods["f2"]])
+
+    assert entry is not None
+    assert len(entry.vectors) == 1
+
+
+def test_v09b_top_k_assignment_and_confidence(tmp_path) -> None:
+    m3_dir, _, _, _ = _write_v09_fixture(tmp_path)
+    neighborhoods = load_neighborhoods(m3_dir / "role_neighborhoods.parquet")
+    roles = load_roles(m3_dir / "m3_role_candidates.json")
+    role = next(row for row in roles if row.role_id == "r1")
+    entry = build_prototype_entry(StrategySpec("topk", "topk", top_k=1), role, [neighborhoods["f1"], neighborhoods["f2"]])
+    ranked = rank_roles_for_target(neighborhoods["f1"], {"r1": entry}, mode="all", top_k=1)
+
+    assert ranked[0][0] == "r1"
+    assert ranked[0][1] > 0.9
+
+
+def test_v09b_subtype_mode_does_not_create_new_roles(tmp_path) -> None:
+    m3_dir, _, _, _ = _write_v09_fixture(tmp_path)
+    neighborhoods = load_neighborhoods(m3_dir / "role_neighborhoods.parquet")
+    roles = load_roles(m3_dir / "m3_role_candidates.json")
+    role = next(row for row in roles if row.role_id == "r2")
+    entry = build_prototype_entry(StrategySpec("subtype", "subtype"), role, [neighborhoods["f3"], neighborhoods["f4"]])
+
+    assert entry is not None
+    assert entry.role_id == "r2"
+
+
+def test_v09b_strategy_ranking(tmp_path) -> None:
+    payload_a = {"strategy_metrics": {"strategy_name": "a", "positive_role_lift_families": 3, "mean_role_lift_over_best_baseline": 0.1, "transfer_accuracy_role": 0.8, "successful_role_candidates": 5, "coverage_rate": 1.0, "low_confidence_assignment_rate": 0.0, "prototype_mode": "centroid"}}
+    payload_b = {"strategy_metrics": {"strategy_name": "b", "positive_role_lift_families": 6, "mean_role_lift_over_best_baseline": 0.08, "transfer_accuracy_role": 0.79, "successful_role_candidates": 5, "coverage_rate": 1.0, "low_confidence_assignment_rate": 0.0, "prototype_mode": "family_balanced"}}
+
+    best = select_best_strategy_payload([payload_a, payload_b])
+
+    assert best["strategy_metrics"]["strategy_name"] == "b"
+
+
+def test_v09b_runs_and_is_deterministic_on_fixture(tmp_path) -> None:
+    m3_dir, m2_dir, m1_dir, manifest = _write_v09_fixture(tmp_path)
+    prev = tmp_path / "v09"
+    run_role_transfer_v09(
+        RoleTransferV09Config(
+            m3_input_dir=str(m3_dir),
+            m2_input_dir=str(m2_dir),
+            m1_input_dir=str(m1_dir),
+            output_dir=str(prev),
+            game_set_manifest=str(manifest),
+            workers=1,
+            min_source_role_support=1,
+            min_target_family_support=1,
+        )
+    )
+    one = run_role_transfer_v09b(
+        RoleTransferV09bConfig(
+            m3_input_dir=str(m3_dir),
+            m2_input_dir=str(m2_dir),
+            m1_input_dir=str(m1_dir),
+            previous_v09_dir=str(prev),
+            output_dir=str(tmp_path / "v09b1"),
+            game_set_manifest=str(manifest),
+            workers=1,
+        )
+    )
+    many = run_role_transfer_v09b(
+        RoleTransferV09bConfig(
+            m3_input_dir=str(m3_dir),
+            m2_input_dir=str(m2_dir),
+            m1_input_dir=str(m1_dir),
+            previous_v09_dir=str(prev),
+            output_dir=str(tmp_path / "v09b25"),
+            game_set_manifest=str(manifest),
+            workers=25,
+        )
+    )
+
+    assert one["validation"]["scientific_conclusion"] == many["validation"]["scientific_conclusion"]
+    assert one["report"]["best_strategy"]["strategy_name"] == many["report"]["best_strategy"]["strategy_name"]
+
+
+def test_cli_accepts_role_transfer_v09b_options() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "role-transfer-v09b",
+            "--m3-input-dir",
+            "runs/v6/v08_cd2_extended32_discriminative",
+            "--m2-input-dir",
+            "runs/v6/v07_cd2_extended32_expanded",
+            "--m1-input-dir",
+            "runs/v6/v06_cd2_extended32",
+            "--previous-v09-dir",
+            "runs/v6/v09_role_transfer_extended32",
+            "--output-dir",
+            "runs/v6/v09b_role_transfer_refined_extended32",
+            "--split-mode",
+            "leave_family_out",
+            "--workers",
+            "25",
+        ]
+    )
+
+    assert args.command == "role-transfer-v09b"
+    assert args.split_mode == "leave_family_out"
+
+
+def test_v08d_no_label_ablation_removes_label_features(tmp_path) -> None:
+    import pandas as pd
+
+    input_dir, m1_dir = _write_v08_fixture(tmp_path)
+    payload = run_role_candidates_v08d(
+        RoleCandidatesV08dConfig(
+            input_dir=str(input_dir),
+            m1_input_dir=str(m1_dir),
+            output_dir=str(tmp_path / "out_no_label"),
+            workers=1,
+            game_set_manifest=str(tmp_path / "game_set.json"),
+            ablation="no_m2_labels",
+            graph_source="hybrid",
+        )
+    )
+
+    rows = pd.read_parquet(tmp_path / "out_no_label" / "role_neighborhoods.parquet").to_dict(orient="records")
+    assert all(not any(str(key).startswith("label::") for key in row["coarse_features"]) for row in rows)
+    assert payload["report"]["ablation"] == "no_m2_labels"
+
+
+def test_v09a_runs_sourceclean_and_uses_structural_metric(tmp_path) -> None:
+    m2_dir, m1_dir = _write_v08_fixture(tmp_path)
+    payload = run_role_transfer_v09a(
+        RoleTransferV09aConfig(
+            m2_input_dir=str(m2_dir),
+            m1_input_dir=str(m1_dir),
+            output_dir=str(tmp_path / "v09a"),
+            game_set_manifest=str(tmp_path / "game_set.json"),
+            workers=1,
+        )
+    )
+
+    assert "transfer_accuracy_structural_role" in payload["report"]
+    assert payload["validation"]["scientific_conclusion"] in {
+        "transfer_methodology_invalid",
+        "role_transfer_sourceclean_not_established",
+        "role_transfer_sourceclean_partial",
+        "role_transfer_sourceclean_weak",
+        "role_transfer_sourceclean_strong",
+    }
+
+
+def test_v09a_deterministic_on_fixture(tmp_path) -> None:
+    m2_dir, m1_dir = _write_v08_fixture(tmp_path)
+    one = run_role_transfer_v09a(
+        RoleTransferV09aConfig(
+            m2_input_dir=str(m2_dir),
+            m1_input_dir=str(m1_dir),
+            output_dir=str(tmp_path / "v09a1"),
+            game_set_manifest=str(tmp_path / "game_set.json"),
+            workers=1,
+        )
+    )
+    many = run_role_transfer_v09a(
+        RoleTransferV09aConfig(
+            m2_input_dir=str(m2_dir),
+            m1_input_dir=str(m1_dir),
+            output_dir=str(tmp_path / "v09a25"),
+            game_set_manifest=str(tmp_path / "game_set.json"),
+            workers=25,
+        )
+    )
+
+    assert one["validation"]["scientific_conclusion"] == many["validation"]["scientific_conclusion"]
+    assert one["report"]["transfer_accuracy_structural_role"] == many["report"]["transfer_accuracy_structural_role"]
+
+
+def test_cli_accepts_role_transfer_v09a_options() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "role-transfer-v09a",
+            "--m2-input-dir",
+            "runs/v6/v07_cd2_extended32_expanded",
+            "--m1-input-dir",
+            "runs/v6/v06_cd2_extended32",
+            "--output-dir",
+            "runs/v6/v09a_role_transfer_sourceclean_extended32",
+            "--split-mode",
+            "leave_family_out",
+            "--workers",
+            "25",
+            "--graph-source",
+            "hybrid",
+        ]
+    )
+
+    assert args.command == "role-transfer-v09a"
+    assert args.graph_source == "hybrid"
 
 
 def test_v05c_resolve_scope_can_select_only_missing_manifest_games(tmp_path) -> None:
