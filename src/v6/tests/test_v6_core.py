@@ -4,6 +4,7 @@ import json
 import numpy as np
 
 from v6.cli import build_parser
+from v6.game_sets import load_game_set_manifest
 from v6.contingency_memory import (
     ContingencyMemoryConfig,
     action_only_accuracy,
@@ -156,6 +157,7 @@ from v6.role_transfer_v09b import (
 )
 from v6.role_transfer_v09c import (
     RoleTransferV09cConfig,
+    choose_parallel_worker_count,
     future_option_behavior_features,
     graph_position_features,
     run_role_transfer_v09c,
@@ -178,6 +180,25 @@ from v6.concept_candidates_v10fix import (
     run_concept_candidates_v10fix,
     stable_concept_signature,
     strict_label_candidate,
+)
+from v6.concept_candidates_v10fixb import (
+    ConceptCandidatesV10FixBConfig,
+    RESIDUAL_PROFILE_KEYS,
+    average_role_fingerprint_similarity,
+    build_collision_rows as build_collision_rows_fixb,
+    build_effect_residual_profile_from_record,
+    build_effect_residual_profile_from_target_rows,
+    build_source_role_map as build_source_role_map_fixb,
+    canonical_role_fingerprint,
+    choose_effective_worker_count,
+    concepts_are_fuzzy_compatible,
+    evaluate_target_projection_by_family,
+    fuzzy_group_candidates,
+    generate_subcomposition_candidates,
+    load_source_manifest_family_map,
+    merge_exact_candidates,
+    resolve_manifest_families_for_record,
+    run_concept_candidates_v10fixb,
 )
 from v6.role_transfer_v09a import RoleTransferV09aConfig, run_role_transfer_v09a
 from v6.sampling import (
@@ -2842,6 +2863,279 @@ def test_cli_accepts_concept_candidates_v10fix_options() -> None:
     assert args.workers == 25
 
 
+def test_v10fixb_subcomposition_generation_produces_pairs_triples_and_subchains() -> None:
+    contexts = _build_v10fixb_fixture_contexts(include_four_role_manifest=True)
+    context = contexts[0]
+    source_role_map = build_source_role_map_fixb(context.source_roles)
+    manifest_items = [
+        {
+            "role_id": role["role_id"],
+            "role_label_candidate": role["role_label_candidate"],
+        }
+        for role in source_role_map.values()
+    ]
+    assert len(manifest_items) >= 4
+
+    items = []
+    for family_id, record in sorted(context.source_neighborhoods.items()):
+        role_info = source_role_map[family_id]
+        items.append(
+            {
+                "record": record,
+                "role_id": role_info["role_id"],
+                "role_label": role_info["role_label_candidate"],
+                **canonical_role_fingerprint(role_info["role_label_candidate"], record),
+            }
+        )
+    candidates = generate_subcomposition_candidates(
+        source_fold=context.heldout_family,
+        heldout_family=context.heldout_family,
+        manifest_family="srcA",
+        items=items,
+        max_role_count=5,
+    )
+    generators = {row["generator_type"] for row in candidates}
+    role_counts = {len(row["canonical_role_fingerprint_hashes"]) for row in candidates}
+
+    assert "role_pairs" in generators
+    assert "role_triples" in generators
+    assert "subchains" in generators
+    assert 2 in role_counts
+    assert 3 in role_counts
+
+
+def test_v10fixb_canonical_role_fingerprint_matches_across_fold_local_ids() -> None:
+    contexts = _build_v10fixb_fixture_contexts()
+    left = contexts[0].source_neighborhoods["sa_block"]
+    right = contexts[1].source_neighborhoods["sb_block"]
+
+    left_fp = canonical_role_fingerprint("blocker_candidate", left)
+    right_fp = canonical_role_fingerprint("blocker_candidate", right)
+
+    assert left_fp["canonical_role_fingerprint_hash"] == right_fp["canonical_role_fingerprint_hash"]
+
+
+def test_v10fixb_concept_identity_ignores_support_but_separates_structure() -> None:
+    contexts = _build_v10fixb_fixture_contexts()
+    context = contexts[0]
+    source_role_map = build_source_role_map_fixb(context.source_roles)
+    raw_rows, _ = run_v10fixb_raw_rows_for_context(context, source_role_map)
+    merged, _ = merge_exact_candidates(raw_rows, min_games=1, min_manifest_families=1, min_role_count=2)
+    same_rows = [row for row in merged if row["motif_type"] == "source_to_sink"][:2]
+    different = next(row for row in merged if row["motif_type"] != same_rows[0]["motif_type"])
+
+    adjusted = dict(same_rows[0])
+    adjusted["source_manifest_families_present"] = ["x", "y", "z"]
+    adjusted["source_games_present"] = ["g1", "g2", "g3", "g4"]
+
+    same_merged, _ = merge_exact_candidates([same_rows[0], adjusted], min_games=1, min_manifest_families=1, min_role_count=2)
+    assert same_rows[0]["concept_id"] == same_merged[0]["concept_id"]
+    assert same_rows[0]["concept_id"] != different["concept_id"]
+
+
+def test_v10fixb_premerge_collision_diagnostics_detect_collisions() -> None:
+    rows = [
+        {"concept_id": "m4-forced", "concept_signature_json": '{"a":1}'},
+        {"concept_id": "m4-forced", "concept_signature_json": '{"a":2}'},
+    ]
+    collisions = build_collision_rows_fixb(rows)
+    assert collisions[0]["collision_detected"] is True
+    assert collisions[0]["distinct_signature_count"] == 2
+
+
+def test_v10fixb_target_projection_uses_local_target_matches_not_aggregate_washout() -> None:
+    contexts = _build_v10fixb_fixture_contexts(two_target_families=True)
+    context = contexts[0]
+    source_role_map = build_source_role_map_fixb(context.source_roles)
+    raw_rows, _ = run_v10fixb_raw_rows_for_context(context, source_role_map)
+    merged, _ = merge_exact_candidates(raw_rows, min_games=1, min_manifest_families=1, min_role_count=2)
+    concept = merged[0]
+    transfer_rows = [
+        {"heldout_family": context.heldout_family, "target_family_id": "ta", "assigned_role_id": "x1", "surface_hardened_score": 0.15, "effect_residual_score": 0.18, "future_option_role_score": 0.78, "graph_position_role_score": 0.74},
+        {"heldout_family": context.heldout_family, "target_family_id": "ta2", "assigned_role_id": "x2", "surface_hardened_score": 0.15, "effect_residual_score": -0.18, "future_option_role_score": 0.10, "graph_position_role_score": 0.10},
+    ]
+    projection = evaluate_target_projection_by_family(concept, context, transfer_rows)
+
+    assert projection["target_best_match_score"] >= projection["target_full_mean_score"]
+    assert projection["target_top3_mean_score"] >= projection["target_full_mean_score"]
+
+
+def test_v10fixb_residual_profiles_use_shared_keys() -> None:
+    contexts = _build_v10fixb_fixture_contexts()
+    record = contexts[0].source_neighborhoods["sa_block"]
+    source_profile = build_effect_residual_profile_from_record(record)
+    target_profile = build_effect_residual_profile_from_target_rows([{"effect_residual_score": 0.2}])
+
+    assert tuple(sorted(source_profile)) == tuple(sorted(RESIDUAL_PROFILE_KEYS))
+    assert set(source_profile) == set(target_profile)
+
+
+def test_v10fixb_main_lift_uses_raw_role_baseline_not_discounted() -> None:
+    contexts = _build_v10fixb_fixture_contexts()
+    context = contexts[0]
+    source_role_map = build_source_role_map_fixb(context.source_roles)
+    raw_rows, _ = run_v10fixb_raw_rows_for_context(context, source_role_map)
+    merged, _ = merge_exact_candidates(raw_rows, min_games=1, min_manifest_families=1, min_role_count=2)
+    concept = merged[0]
+    projection = evaluate_target_projection_by_family(
+        concept,
+        context,
+        [{"heldout_family": context.heldout_family, "target_family_id": "ta", "assigned_role_id": "x1", "surface_hardened_score": 0.12, "effect_residual_score": 0.22, "future_option_role_score": 0.80, "graph_position_role_score": 0.72}],
+    )
+
+    assert projection["best_individual_role_baseline_raw"] >= projection["best_individual_role_baseline_discounted"]
+    assert projection["target_mean_concept_lift_vs_role_raw"] != projection["target_mean_concept_lift_vs_role_discounted"]
+
+
+def test_v10fixb_fuzzy_grouping_merges_structurally_similar_concepts() -> None:
+    contexts = _build_v10fixb_fixture_contexts()
+    source_role_map = build_source_role_map_fixb(contexts[0].source_roles)
+    raw_a, _ = run_v10fixb_raw_rows_for_context(contexts[0], source_role_map)
+    raw_b, _ = run_v10fixb_raw_rows_for_context(contexts[1], source_role_map)
+    merged, _ = merge_exact_candidates(raw_a + raw_b, min_games=1, min_manifest_families=1, min_role_count=2)
+
+    fuzzy_rows, _, mapping = fuzzy_group_candidates(merged, role_threshold=0.75, concept_threshold=0.70)
+
+    assert len(fuzzy_rows) <= len(merged)
+    assert len(set(mapping.values())) == len(fuzzy_rows)
+
+
+def test_v10fixb_unknown_labels_can_survive_transferability() -> None:
+    row = {
+        "manifest_family_count": 3,
+        "game_count": 4,
+        "concept_stability_score": 0.6,
+        "target_projection_coverage": 1.0,
+        "target_mean_concept_lift_vs_role_raw": 0.1,
+        "target_mean_concept_lift_vs_surface_raw": 0.08,
+        "transfer_stability_score": 0.08,
+        "concept_label_candidate": "unknown_concept_candidate",
+    }
+    assert row["concept_label_candidate"] == "unknown_concept_candidate"
+    assert row["target_mean_concept_lift_vs_role_raw"] > 0
+    assert row["target_mean_concept_lift_vs_surface_raw"] > 0
+
+
+def test_v10fixb_worker_cap_uses_largest_task_and_shared_state(monkeypatch) -> None:
+    import v6.concept_candidates_v10fixb as mod
+
+    tasks = [("t1",), ("t2",), ("t3",), ("t4",)]
+    sizes = {
+        tasks[0]: 64 * 1024 * 1024,
+        tasks[1]: 64 * 1024 * 1024,
+        tasks[2]: 64 * 1024 * 1024,
+        tasks[3]: 1024 * 1024 * 1024,
+    }
+    monkeypatch.setattr(mod, "estimate_task_payload_bytes", lambda task: sizes[task])
+    monkeypatch.setattr(mod, "detect_available_memory_bytes", lambda: 16 * 1024 * 1024 * 1024)
+
+    workers = choose_effective_worker_count(tasks, requested_workers=8, shared_state_bytes=1024 * 1024 * 1024)
+
+    assert workers == 1
+
+
+def test_v09c_parallel_worker_cap_respects_memory_budget(monkeypatch) -> None:
+    import v6.role_transfer_v09c as mod
+
+    monkeypatch.setattr(mod, "detect_available_memory_bytes", lambda: 16 * 1024 * 1024 * 1024)
+
+    workers = choose_parallel_worker_count(requested_workers=25, task_count=16)
+
+    assert workers == 1
+
+
+def test_v10fixb_invalid_role_overlap_is_diagnostic_only() -> None:
+    contexts = _build_v10fixb_fixture_contexts()
+    context = contexts[0]
+    source_role_map = build_source_role_map_fixb(context.source_roles)
+    raw_rows, _ = run_v10fixb_raw_rows_for_context(context, source_role_map)
+    merged, _ = merge_exact_candidates(raw_rows, min_games=1, min_manifest_families=1, min_role_count=2)
+    concept = merged[0]
+    with_overlap = evaluate_target_projection_by_family(
+        concept,
+        context,
+        [{"heldout_family": context.heldout_family, "target_family_id": "ta", "assigned_role_id": "role_block", "surface_hardened_score": 0.15, "effect_residual_score": 0.2, "future_option_role_score": 0.8, "graph_position_role_score": 0.7}],
+    )
+    no_overlap = evaluate_target_projection_by_family(
+        concept,
+        context,
+        [{"heldout_family": context.heldout_family, "target_family_id": "ta", "assigned_role_id": "different_role", "surface_hardened_score": 0.15, "effect_residual_score": 0.2, "future_option_role_score": 0.8, "graph_position_role_score": 0.7}],
+    )
+
+    assert with_overlap["target_concept_prediction_score"] == no_overlap["target_concept_prediction_score"]
+    assert with_overlap["role_id_overlap_diagnostic"] != no_overlap["role_id_overlap_diagnostic"]
+
+
+def test_v10fixb_runs_deterministically_and_cli_accepts_options(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+    import v6.concept_candidates_v10fixb as mod
+
+    transfer_dir, manifest = _write_v10fixb_fixture(tmp_path)
+    contexts = _build_v10fixb_fixture_contexts()
+    monkeypatch.setattr(mod, "prepare_family_contexts", lambda config: contexts)
+
+    one = run_concept_candidates_v10fixb(
+        ConceptCandidatesV10FixBConfig(
+            transfer_input_dir=str(transfer_dir),
+            output_dir=str(tmp_path / "v10fixb1"),
+            game_set_manifest=str(manifest),
+            workers=1,
+            min_games=2,
+            min_manifest_families=2,
+        )
+    )
+    many = run_concept_candidates_v10fixb(
+        ConceptCandidatesV10FixBConfig(
+            transfer_input_dir=str(transfer_dir),
+            output_dir=str(tmp_path / "v10fixb2"),
+            game_set_manifest=str(manifest),
+            workers=2,
+            min_games=2,
+            min_manifest_families=2,
+        )
+    )
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "concept-candidates-v10fix-b",
+            "--m3-input-dir",
+            "runs/v6/v08d_cd2_extended32_sourceclean",
+            "--transfer-input-dir",
+            "runs/v6/v09c_transfer_hardened_extended32",
+            "--m2-input-dir",
+            "runs/v6/v07_cd2_extended32_expanded",
+            "--m1-input-dir",
+            "runs/v6/v06_cd2_extended32",
+            "--output-dir",
+            "runs/v6/v10_m4_concepts_fixb_extended32",
+            "--workers",
+            "25",
+        ]
+    )
+
+    assert one["validation"]["scientific_conclusion"] == many["validation"]["scientific_conclusion"]
+    assert one["report"]["concept_id_collision_check_passed"] is True
+    assert one["report"]["target_role_id_overlap_removed_from_main_score"] is True
+    assert args.command == "concept-candidates-v10fix-b"
+    assert args.workers == 25
+    scores = pd.read_parquet(tmp_path / "v10fixb1" / "concept_transfer_scores_fixb.parquet")
+    assert "target_best_match_score" in scores.columns
+    assert "target_top3_mean_score" in scores.columns
+
+
+def test_game_set_manifest_auto_resolves_extended32_from_available_games() -> None:
+    from pathlib import Path
+
+    m2_families = load_m2_families_v08d(Path("runs/v6/v07_cd2_extended32_expanded"))
+    manifest = load_game_set_manifest(
+        fallback_games=tuple(sorted({game for family in m2_families for game in family.games_present}))
+    )
+
+    assert manifest.name == "extended32_v08"
+    assert len(manifest.families) == 16
+    assert manifest.families["collection"] == ("tt01", "tt02")
+
+
 def test_v08d_no_label_ablation_removes_label_features(tmp_path) -> None:
     import pandas as pd
 
@@ -4218,6 +4512,207 @@ def _write_v10fix_fixture(tmp_path):
     manifest = tmp_path / "v10fix_manifest.json"
     manifest.write_text(json.dumps({"name": "v10fix_fixture", "games": ["g1", "g2", "g3", "g4", "h1", "h2"], "families": {"srcA": ["g1", "g2"], "srcB": ["g3", "g4"], "holdA": ["h1"], "holdB": ["h2"]}}), encoding="utf-8")
     return transfer_dir, manifest
+
+
+def _build_v10fixb_fixture_contexts(include_four_role_manifest: bool = False, two_target_families: bool = False):
+    from types import SimpleNamespace
+
+    from v6.role_transfer_v09c import FamilyContext
+    from v6.role_candidates_v08d import DiscNeighborhood
+    from v6.role_transfer_v09 import appearance_features, mean_vector
+
+    def disc(fid, gid, fam, sign, label, outcome, motif, support=8, block=0.0, enable=0.0, preserve=0.3):
+        return DiscNeighborhood(
+            family_id=fid,
+            family_label_candidate=label,
+            game_ids=(gid,),
+            game_family_ids=(fam,),
+            support_count=support,
+            family_coherence=0.9,
+            mean_prediction_accuracy=0.88,
+            mean_context_lift=0.2,
+            dominant_outcome_signature=outcome,
+            dominant_motif_candidate=motif,
+            coarse_features={"c1": sign, "support_density": abs(sign)},
+            directional_features={
+                "predecessor_count": 0.2 if sign > 0 else 1.8,
+                "successor_count": 1.8 if sign > 0 else 0.2,
+                "source_like_score": max(sign, 0.0),
+                "sink_like_score": max(-sign, 0.0),
+                "bridge_like_score": abs(sign) * 0.4,
+                "bottleneck_like_score": abs(sign) * 0.3,
+                "branch_in_score": max(-sign, 0.0) * 0.4,
+                "branch_out_score": max(sign, 0.0) * 0.4,
+                "loop_score": 0.1 if preserve < 0.4 else 0.6,
+                "directional_asymmetry_score": sign,
+            },
+            future_option_features={
+                "reachable_before_rate": 0.2 if sign > 0 else 0.7,
+                "reachable_after_rate": 0.8 if sign > 0 else 0.3,
+                "reachable_delta_mean": 0.6 if sign > 0 else -0.6,
+                "enable_score": enable,
+                "block_score": block,
+                "preserve_score": preserve,
+                "terminate_score": max(-sign, 0.0) * 0.2,
+                "reversibility_score": 0.7 if preserve > 0.4 else 0.2,
+            },
+            local_motif_features={"cross_game_family_presence": 0.75, "motif_entropy": 0.2, "local_branching_score": abs(sign) * 0.4, "local_loop_score": 0.1 if preserve < 0.4 else 0.6},
+            temporal_effect_features={"early_episode_frequency": 0.3, "mid_episode_frequency": 0.4, "late_episode_frequency": 0.3, "reversible_effect_rate": 0.2 if preserve < 0.4 else 0.7, "no_change_rate": max(sign, 0.0), "position_change_rate": max(-sign, 0.0)},
+            incoming_edge_profile={label: 1},
+            outgoing_edge_profile={label: 2},
+            examples=(),
+        )
+
+    source_members = [
+        disc("sa_block", "g1", "srcA", 1.0, "blocked_no_change_family_candidate", "blocked_no_change", "block_candidate", block=0.7),
+        disc("sa_move", "g2", "srcA", -1.0, "position_like_change_family_candidate", "position_like_change", "change_candidate", enable=0.6),
+        disc("sb_block", "g3", "srcB", 1.0, "blocked_no_change_family_candidate", "blocked_no_change", "block_candidate", block=0.7),
+        disc("sb_move", "g4", "srcB", -1.0, "position_like_change_family_candidate", "position_like_change", "change_candidate", enable=0.6),
+    ]
+    if include_four_role_manifest:
+        source_members.extend(
+            [
+                disc("sa_cover", "g5", "srcA", 0.6, "coverage_like_family_candidate", "coverage_gain", "cover_candidate", enable=0.5),
+                disc("sa_link", "g6", "srcA", 0.4, "connector_family_candidate", "link_path", "link_candidate", preserve=0.6),
+            ]
+        )
+    source_neighborhoods = {item.family_id: item for item in source_members}
+
+    def entry(role_id, label, members):
+        return {
+            "role_id": role_id,
+            "role_label_candidate": label,
+            "member_family_ids": tuple(item.family_id for item in members),
+            "all_features": {
+                **{f"coarse:{k}": float(v) for k, v in mean_vector([item.coarse_features for item in members]).items()},
+                **{f"directional:{k}": float(v) for k, v in mean_vector([item.directional_features for item in members]).items()},
+                **{f"future:{k}": float(v) for k, v in mean_vector([item.future_option_features for item in members]).items()},
+                **{f"motif:{k}": float(v) for k, v in mean_vector([item.local_motif_features for item in members]).items()},
+                **{f"effect:{k}": float(v) for k, v in mean_vector([item.temporal_effect_features for item in members]).items()},
+            },
+            "coarse_features": mean_vector([item.coarse_features for item in members]),
+            "appearance_features": mean_vector([appearance_features(item) for item in members]),
+        }
+
+    role_defs = {
+        "role_block": ("blocker_candidate", [source_neighborhoods["sa_block"], source_neighborhoods["sb_block"]]),
+        "role_move": ("movement_controller_candidate", [source_neighborhoods["sa_move"], source_neighborhoods["sb_move"]]),
+    }
+    if include_four_role_manifest:
+        role_defs["role_cover"] = ("coverage_expander_candidate", [source_neighborhoods["sa_cover"]])
+        role_defs["role_link"] = ("connector_candidate", [source_neighborhoods["sa_link"]])
+    source_roles = {role_id: entry(role_id, label, members) for role_id, (label, members) in role_defs.items()}
+
+    target_a = disc("ta", "h1", "holdA", 0.98, "blocked_no_change_family_candidate", "blocked_no_change", "block_candidate", block=0.7)
+    target_b = disc("tb", "h2", "holdB", -0.98, "position_like_change_family_candidate", "position_like_change", "change_candidate", enable=0.6)
+    target_a2 = disc("ta2", "h3", "holdA", -0.2, "misc_family_candidate", "misc", "misc_candidate", preserve=0.2)
+
+    first_targets = (SimpleNamespace(family_id="ta", games_present=("h1",), support_count=8),)
+    full_neighborhoods = {"ta": target_a}
+    full_no_label = {"ta": target_a}
+    if two_target_families:
+        first_targets = (
+            SimpleNamespace(family_id="ta", games_present=("h1",), support_count=8),
+            SimpleNamespace(family_id="ta2", games_present=("h3",), support_count=8),
+        )
+        full_neighborhoods = {"ta": target_a, "ta2": target_a2}
+        full_no_label = {"ta": target_a, "ta2": target_a2}
+
+    return [
+        FamilyContext(
+            heldout_family="holdA",
+            heldout_games=("h1",),
+            source_neighborhoods=source_neighborhoods,
+            source_roles=source_roles,
+            source_no_label_roles=source_roles,
+            target_families=first_targets,
+            full_neighborhoods=full_neighborhoods,
+            full_no_label_neighborhoods=full_no_label,
+            graph_source_used="hybrid",
+            graph_edge_coverage=1.0,
+        ),
+        FamilyContext(
+            heldout_family="holdB",
+            heldout_games=("h2",),
+            source_neighborhoods=source_neighborhoods,
+            source_roles=source_roles,
+            source_no_label_roles=source_roles,
+            target_families=(SimpleNamespace(family_id="tb", games_present=("h2",), support_count=8),),
+            full_neighborhoods={"tb": target_b},
+            full_no_label_neighborhoods={"tb": target_b},
+            graph_source_used="hybrid",
+            graph_edge_coverage=1.0,
+        ),
+    ]
+
+
+def run_v10fixb_raw_rows_for_context(context, source_role_map):
+    import v6.concept_candidates_v10fixb as mod
+
+    return mod.discover_source_only_candidates(
+        context,
+        source_role_map,
+        {},
+        ConceptCandidatesV10FixBConfig(workers=1, min_games=1, min_manifest_families=1),
+    )
+
+
+def _write_v10fixb_fixture(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    transfer_dir = tmp_path / "v09c_fixb"
+    transfer_dir.mkdir()
+    rows = [
+        {"heldout_family": "holdA", "target_family_id": "ta", "assigned_role_id": "role_block", "surface_hardened_score": 0.18, "effect_residual_score": 0.22, "future_option_role_score": 0.80, "graph_position_role_score": 0.72},
+        {"heldout_family": "holdA", "target_family_id": "ta", "assigned_role_id": "role_move", "surface_hardened_score": 0.18, "effect_residual_score": 0.20, "future_option_role_score": 0.78, "graph_position_role_score": 0.70},
+        {"heldout_family": "holdB", "target_family_id": "tb", "assigned_role_id": "role_block", "surface_hardened_score": 0.16, "effect_residual_score": 0.21, "future_option_role_score": 0.81, "graph_position_role_score": 0.73},
+        {"heldout_family": "holdB", "target_family_id": "tb", "assigned_role_id": "role_move", "surface_hardened_score": 0.16, "effect_residual_score": 0.19, "future_option_role_score": 0.79, "graph_position_role_score": 0.71},
+    ]
+    pq.write_table(pa.Table.from_pylist(rows), transfer_dir / "v09c_hardened_assignments.parquet", compression="zstd")
+    (transfer_dir / "v09c_report.json").write_text(
+        json.dumps({"report": {"scientific_conclusion": "hardened_transfer_strong", "supports_H2": True, "v10_gate_cleared": True}}, indent=2),
+        encoding="utf-8",
+    )
+    manifest = tmp_path / "v10fixb_manifest.json"
+    manifest.write_text(json.dumps({"name": "v10fixb_fixture", "games": ["g1", "g2", "g3", "g4", "h1", "h2"], "families": {"srcA": ["g1", "g2"], "srcB": ["g3", "g4"], "holdA": ["h1"], "holdB": ["h2"]}}), encoding="utf-8")
+    return transfer_dir, manifest
+
+
+def test_v10fixb_loads_manifest_family_map_from_m3_neighborhoods(tmp_path) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    m3_dir = tmp_path / "m3"
+    m3_dir.mkdir()
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {"family_id": "m2x-0001", "game_families_present": ["srcA"]},
+                {"family_id": "m2x-0002", "game_families_present": ["srcB", "srcA"]},
+            ]
+        ),
+        m3_dir / "role_neighborhoods.parquet",
+        compression="zstd",
+    )
+
+    mapping = load_source_manifest_family_map(m3_dir)
+
+    assert mapping["m2x-0001"] == ("srcA",)
+    assert mapping["m2x-0002"] == ("srcA", "srcB")
+
+
+def test_v10fixb_manifest_family_resolution_prefers_m3_mapping() -> None:
+    contexts = _build_v10fixb_fixture_contexts()
+    record = contexts[0].source_neighborhoods["sa_block"]
+
+    resolved = resolve_manifest_families_for_record(
+        family_id="sa_block",
+        record=record,
+        source_manifest_family_map={"sa_block": ("mapped_src",)},
+    )
+
+    assert resolved == ("mapped_src",)
 
 
 def _build_context_compare_fixture(tmp_path, tie_break: bool = False, cd3_useful: bool = False, extended: bool = False) -> dict[str, Path]:

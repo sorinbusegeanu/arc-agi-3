@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
@@ -64,16 +65,50 @@ DEFAULT_BEST_STRATEGY = StrategySpec(
 )
 
 
+def detect_available_memory_bytes() -> int | None:
+    meminfo = Path("/proc/meminfo")
+    if not meminfo.exists():
+        return None
+    try:
+        for line in meminfo.read_text(encoding="utf-8").splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024
+    except OSError:
+        return None
+    return None
+
+
+def choose_parallel_worker_count(requested_workers: int, task_count: int) -> int:
+    if requested_workers <= 1 or task_count <= 1:
+        return 1
+
+    cpu_limit = os.cpu_count() or 1
+    worker_cap = max(1, min(requested_workers, task_count, cpu_limit))
+    available_memory = detect_available_memory_bytes()
+    if available_memory is None:
+        return worker_cap
+
+    # Empirically, extended32 family preparation/evaluation can transiently hold
+    # much larger pandas-backed state than the serialized task suggests.
+    baseline_worker_bytes = 16 * 1024 * 1024 * 1024
+    safe_budget = int(available_memory * 0.15)
+    if safe_budget <= 0:
+        return 1
+    memory_cap = max(1, safe_budget // baseline_worker_bytes)
+    return max(1, min(worker_cap, memory_cap))
+
+
 def run_role_transfer_v09c(config: RoleTransferV09cConfig) -> dict[str, Any]:
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     best_strategy = load_best_v09b_strategy(Path(config.previous_v09b_dir))
     family_contexts = prepare_family_contexts(config)
-    if config.workers <= 1 or len(family_contexts) <= 1:
+    effective_workers = choose_parallel_worker_count(config.workers, len(family_contexts))
+    if effective_workers <= 1 or len(family_contexts) <= 1:
         family_results = [_evaluate_hardened_family(context, best_strategy, config) for context in family_contexts]
     else:
-        with ProcessPoolExecutor(max_workers=config.workers) as executor:
+        with ProcessPoolExecutor(max_workers=effective_workers) as executor:
             futures = [executor.submit(_evaluate_hardened_family, context, best_strategy, config) for context in family_contexts]
             family_results = [future.result() for future in futures]
     family_results = sorted(family_results, key=lambda item: item["heldout_family"])
@@ -91,12 +126,12 @@ def run_role_transfer_v09c(config: RoleTransferV09cConfig) -> dict[str, Any]:
 
 
 def prepare_family_contexts(config: RoleTransferV09cConfig) -> list[FamilyContext]:
+    m2_families = load_m2_families(Path(config.m2_input_dir))
     game_set = load_game_set_manifest(
         manifest_path=config.game_set_manifest,
         game_set_name=config.game_set_name,
-        fallback_games=(),
+        fallback_games=tuple(sorted({game for family in m2_families for game in family.games_present})),
     )
-    m2_families = load_m2_families(Path(config.m2_input_dir))
     m1_support = load_m1_support(Path(config.m1_input_dir))
     episode_summaries = load_episode_summaries(Path(config.m1_input_dir))
     m2_graph_edges = load_m2_graph_edges(Path(config.m2_input_dir))
@@ -137,9 +172,10 @@ def prepare_family_contexts(config: RoleTransferV09cConfig) -> list[FamilyContex
         )
         for family_name in sorted(game_set.families)
     ]
-    if config.workers <= 1 or len(tasks) <= 1:
+    effective_workers = choose_parallel_worker_count(config.workers, len(tasks))
+    if effective_workers <= 1 or len(tasks) <= 1:
         return [_prepare_family_context(*task) for task in tasks]
-    with ProcessPoolExecutor(max_workers=config.workers) as executor:
+    with ProcessPoolExecutor(max_workers=effective_workers) as executor:
         futures = [executor.submit(_prepare_family_context, *task) for task in tasks]
         return sorted([future.result() for future in futures], key=lambda item: item.heldout_family)
 

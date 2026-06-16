@@ -143,12 +143,12 @@ def run_role_transfer_v09b(config: RoleTransferV09bConfig) -> dict[str, Any]:
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    m2_families = load_m2_families(Path(config.m2_input_dir))
     game_set = load_game_set_manifest(
         manifest_path=config.game_set_manifest,
         game_set_name=config.game_set_name,
-        fallback_games=(),
+        fallback_games=tuple(sorted({game for family in m2_families for game in family.games_present})),
     )
-    m2_families = load_m2_families(Path(config.m2_input_dir))
     m1_support = load_m1_support(Path(config.m1_input_dir))
     episode_summaries = load_episode_summaries(Path(config.m1_input_dir))
     m2_graph_edges = load_m2_graph_edges(Path(config.m2_input_dir))
