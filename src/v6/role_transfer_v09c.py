@@ -65,6 +65,18 @@ DEFAULT_BEST_STRATEGY = StrategySpec(
 )
 
 
+@dataclass(frozen=True)
+class SingleFamilyContext:
+    heldout_family: str
+    heldout_games: tuple[str, ...]
+    source_neighborhoods: dict[str, DiscNeighborhood]
+    source_roles: dict[str, dict[str, Any]]
+    target_families: tuple[Any, ...]
+    target_neighborhoods: dict[str, DiscNeighborhood]
+    graph_source_used: str
+    graph_edge_coverage: float
+
+
 def detect_available_memory_bytes() -> int | None:
     meminfo = Path("/proc/meminfo")
     if not meminfo.exists():
@@ -140,6 +152,69 @@ def prepare_family_context_stream(config: RoleTransferV09cConfig):
     state = _build_family_context_state(config)
     for task in state["tasks"]:
         yield _prepare_family_context(*task)
+
+
+def list_heldout_families(config: RoleTransferV09cConfig) -> list[str]:
+    state = _build_family_context_state(config)
+    return [task[0] for task in state["tasks"]]
+
+
+def build_single_family_context(config: RoleTransferV09cConfig, heldout_family: str) -> SingleFamilyContext:
+    m2_families = load_m2_families(Path(config.m2_input_dir))
+    game_set = load_game_set_manifest(
+        manifest_path=config.game_set_manifest,
+        game_set_name=config.game_set_name,
+        fallback_games=tuple(sorted({game for family in m2_families for game in family.games_present})),
+    )
+    if heldout_family not in game_set.families:
+        raise KeyError(f"unknown heldout family: {heldout_family}")
+
+    m1_support = load_m1_support(Path(config.m1_input_dir))
+    episode_summaries = load_episode_summaries(Path(config.m1_input_dir))
+    m2_graph_edges = load_m2_graph_edges(Path(config.m2_input_dir))
+    selected_games = set(game_set.games) if game_set.games else {game for family in m2_families for game in family.games_present}
+    m2_families = [family for family in m2_families if selected_games.intersection(family.games_present)]
+    m1_support = {key: value for key, value in m1_support.items() if value.game_id in selected_games}
+    game_family_map = build_game_family_map(game_set, tuple(sorted(selected_games)))
+
+    heldout_games = tuple(game_set.families[heldout_family])
+    heldout_games_set = set(heldout_games)
+    source_families = [family for family in m2_families if not heldout_games_set.intersection(family.games_present)]
+    target_families = [family for family in m2_families if heldout_games_set.intersection(family.games_present)]
+    source_game_set = {game for family in source_families for game in family.games_present}
+    source_support = {key: value for key, value in m1_support.items() if value.game_id in source_game_set}
+
+    source_neighborhoods, graph_diag = build_discriminative_neighborhoods(
+        source_families,
+        source_support,
+        game_family_map,
+        graph_source=config.graph_source,
+        ablation="none",
+        m2_graph_edges=m2_graph_edges,
+        episode_summaries=episode_summaries,
+    )
+    target_game_set = {game for family in target_families for game in family.games_present}
+    target_support = {key: value for key, value in m1_support.items() if value.game_id in target_game_set}
+    target_neighborhoods, _ = build_discriminative_neighborhoods(
+        target_families,
+        target_support,
+        game_family_map,
+        graph_source=config.graph_source,
+        ablation="none",
+        m2_graph_edges=m2_graph_edges,
+        episode_summaries=episode_summaries,
+    )
+
+    return SingleFamilyContext(
+        heldout_family=heldout_family,
+        heldout_games=heldout_games,
+        source_neighborhoods=source_neighborhoods,
+        source_roles=build_source_only_roles(source_families, source_neighborhoods),
+        target_families=tuple(sorted(target_families, key=lambda item: item.family_id)),
+        target_neighborhoods=target_neighborhoods,
+        graph_source_used=graph_diag.graph_source_used,
+        graph_edge_coverage=float(graph_diag.graph_edge_coverage),
+    )
 
 
 def _build_family_context_state(config: RoleTransferV09cConfig) -> dict[str, Any]:

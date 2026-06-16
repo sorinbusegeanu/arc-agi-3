@@ -157,6 +157,8 @@ from v6.role_transfer_v09b import (
 )
 from v6.role_transfer_v09c import (
     RoleTransferV09cConfig,
+    SingleFamilyContext,
+    build_single_family_context,
     choose_parallel_worker_count,
     future_option_behavior_features,
     graph_position_features,
@@ -207,6 +209,13 @@ from v6.concept_candidates_v10fixc import (
     evaluate_target_projection_by_family_fixc,
     run_concept_candidates_v10fixc,
     validate_completed_fixc_run,
+)
+from v6.concept_candidates_v10fixd import (
+    ConceptCandidatesV10FixDConfig,
+    collect_source_items_and_manifest_groups,
+    family_fixd_paths,
+    run_concept_candidates_v10fixd,
+    run_single_family_fixd,
 )
 from v6.role_transfer_v09a import RoleTransferV09aConfig, run_role_transfer_v09a
 from v6.sampling import (
@@ -3324,6 +3333,438 @@ def test_v10fixc_completed_run_validator_accepts_fixture_run(tmp_path, monkeypat
 
     assert validation["valid"] is True
     assert validation["checks"]["transfer_rows_no_nested_target_family_payloads"] is True
+
+
+def test_v10fixd_single_family_context_builder_omits_full_neighborhoods(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    import v6.role_transfer_v09c as mod
+
+    family = SimpleNamespace(family_id="srcA", games_present=("g1",), support_count=2)
+    heldout = SimpleNamespace(family_id="holdA", games_present=("h1",), support_count=2)
+    graph_diag = SimpleNamespace(graph_source_used="hybrid", graph_edge_coverage=1.0)
+
+    monkeypatch.setattr(mod, "load_m2_families", lambda path: [family, heldout])
+    monkeypatch.setattr(
+        mod,
+        "load_game_set_manifest",
+        lambda **kwargs: SimpleNamespace(games=("g1", "h1"), families={"srcA": ("g1",), "holdA": ("h1",)}),
+    )
+    monkeypatch.setattr(mod, "load_m1_support", lambda path: {})
+    monkeypatch.setattr(mod, "load_episode_summaries", lambda path: {})
+    monkeypatch.setattr(mod, "load_m2_graph_edges", lambda path: {})
+    monkeypatch.setattr(mod, "build_game_family_map", lambda game_set, games: {"g1": "srcA", "h1": "holdA"})
+    monkeypatch.setattr(
+        mod,
+        "build_discriminative_neighborhoods",
+        lambda families, *args, **kwargs: ({f"{families[0].family_id}_n": SimpleNamespace(family_id=f"{families[0].family_id}_n")}, graph_diag),
+    )
+    monkeypatch.setattr(mod, "build_source_only_roles", lambda families, neighborhoods: {"role": {"member_family_ids": tuple(neighborhoods)}})
+
+    context = build_single_family_context(
+        RoleTransferV09cConfig(m2_input_dir="unused", m1_input_dir="unused", game_set_manifest="unused"),
+        "holdA",
+    )
+
+    assert isinstance(context, SingleFamilyContext)
+    assert hasattr(context, "source_neighborhoods")
+    assert hasattr(context, "target_neighborhoods")
+    assert not hasattr(context, "full_neighborhoods")
+    assert context.heldout_family == "holdA"
+
+
+def test_v10fixd_diagnostics_shards_written_before_candidate_generation_exception(tmp_path, monkeypatch) -> None:
+    import v6.concept_candidates_v10fixd as mod
+
+    contexts = _build_v10fixb_fixture_contexts()
+    fixture = contexts[0]
+    single = SingleFamilyContext(
+        heldout_family=fixture.heldout_family,
+        heldout_games=fixture.heldout_games,
+        source_neighborhoods=fixture.source_neighborhoods,
+        source_roles=fixture.source_roles,
+        target_families=fixture.target_families,
+        target_neighborhoods=fixture.full_neighborhoods,
+        graph_source_used=fixture.graph_source_used,
+        graph_edge_coverage=fixture.graph_edge_coverage,
+    )
+    monkeypatch.setattr(mod, "build_single_family_context", lambda config, heldout_family: single)
+    monkeypatch.setattr(mod, "generate_candidate_chunks_for_group", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    shards_dir = tmp_path / "shards"
+    shards_dir.mkdir()
+    try:
+        run_single_family_fixd(
+            heldout_family="holdA",
+            config=ConceptCandidatesV10FixDConfig(output_dir=str(tmp_path), game_set_manifest=str(tmp_path / "manifest.json")),
+            source_manifest_family_map={},
+            transfer_rows=[],
+            game_to_manifest_family={"g1": "srcA", "g2": "srcA", "g3": "srcB", "g4": "srcB"},
+            shards_dir=shards_dir,
+        )
+    except RuntimeError as exc:
+        assert str(exc) == "boom"
+    else:
+        raise AssertionError("expected candidate generation failure")
+
+    paths = family_fixd_paths(shards_dir, "holdA")
+    assert paths["source_diag"].exists()
+    assert paths["manifest_diag"].exists()
+    assert paths["memory_stage0"].exists()
+
+
+def test_v10fixd_empty_source_roles_generates_fallback_manifest_groups() -> None:
+    contexts = _build_v10fixb_fixture_contexts()
+    fixture = contexts[0]
+    single = SingleFamilyContext(
+        heldout_family=fixture.heldout_family,
+        heldout_games=fixture.heldout_games,
+        source_neighborhoods=fixture.source_neighborhoods,
+        source_roles={},
+        target_families=fixture.target_families,
+        target_neighborhoods=fixture.full_neighborhoods,
+        graph_source_used=fixture.graph_source_used,
+        graph_edge_coverage=fixture.graph_edge_coverage,
+    )
+
+    _, source_diag, _, manifest_groups = collect_source_items_and_manifest_groups(
+        context=single,
+        source_role_map={},
+        source_manifest_family_map={},
+        game_to_manifest_family={"g1": "srcA", "g2": "srcA", "g3": "srcB", "g4": "srcB"},
+    )
+
+    assert source_diag["failure_mode_if_zero_structures"] == "no_source_roles"
+    assert source_diag["fallback_items_available"] > 0
+    assert manifest_groups
+    assert all(item["candidate_source"] == "fallback_neighborhood" for items in manifest_groups.values() for item in items)
+
+
+def test_v10fixd_role_map_mismatch_reports_failure_mode_but_fallback_runs() -> None:
+    contexts = _build_v10fixb_fixture_contexts()
+    fixture = contexts[0]
+    single = SingleFamilyContext(
+        heldout_family=fixture.heldout_family,
+        heldout_games=fixture.heldout_games,
+        source_neighborhoods=fixture.source_neighborhoods,
+        source_roles=fixture.source_roles,
+        target_families=fixture.target_families,
+        target_neighborhoods=fixture.full_neighborhoods,
+        graph_source_used=fixture.graph_source_used,
+        graph_edge_coverage=fixture.graph_edge_coverage,
+    )
+
+    _, source_diag, _, manifest_groups = collect_source_items_and_manifest_groups(
+        context=single,
+        source_role_map={"mismatch": {"role_id": "r", "role_label_candidate": "x", "all_features": {}}},
+        source_manifest_family_map={},
+        game_to_manifest_family={"g1": "srcA", "g2": "srcA", "g3": "srcB", "g4": "srcB"},
+    )
+
+    assert source_diag["failure_mode_if_zero_structures"] == "source_role_map_family_id_mismatch"
+    assert manifest_groups
+    assert any(item["candidate_source"] == "fallback_neighborhood" for items in manifest_groups.values() for item in items)
+
+
+def test_v10fixd_unknown_manifest_records_are_grouped_not_dropped() -> None:
+    from types import SimpleNamespace
+
+    contexts = _build_v10fixb_fixture_contexts()
+    fixture = contexts[0]
+    unknown_record = SimpleNamespace(**fixture.source_neighborhoods["sa_block"].__dict__)
+    unknown_record.family_id = "unknown_one"
+    unknown_record.game_ids = ("ux1",)
+    unknown_record.game_family_ids = ()
+    source_neighborhoods = {**fixture.source_neighborhoods, unknown_record.family_id: unknown_record}
+    source_roles = dict(fixture.source_roles)
+    single = SingleFamilyContext(
+        heldout_family=fixture.heldout_family,
+        heldout_games=fixture.heldout_games,
+        source_neighborhoods=source_neighborhoods,
+        source_roles=source_roles,
+        target_families=fixture.target_families,
+        target_neighborhoods=fixture.full_neighborhoods,
+        graph_source_used=fixture.graph_source_used,
+        graph_edge_coverage=fixture.graph_edge_coverage,
+    )
+
+    _, _, manifest_rows, manifest_groups = collect_source_items_and_manifest_groups(
+        context=single,
+        source_role_map=build_source_role_map_fixb(source_roles),
+        source_manifest_family_map={},
+        game_to_manifest_family={},
+    )
+
+    assert "unknown_manifest_family" in manifest_groups
+    assert any(row["family_id"] == "unknown_one" and row["final_manifest_resolution"] == ["unknown_manifest_family"] for row in manifest_rows)
+
+
+def test_v10fixd_large_manifest_group_writes_multiple_raw_candidate_part_files(tmp_path, monkeypatch) -> None:
+    import v6.concept_candidates_v10fixd as mod
+
+    contexts = _build_v10fixb_fixture_contexts()
+    fixture = contexts[0]
+    single = SingleFamilyContext(
+        heldout_family=fixture.heldout_family,
+        heldout_games=fixture.heldout_games,
+        source_neighborhoods=fixture.source_neighborhoods,
+        source_roles=fixture.source_roles,
+        target_families=fixture.target_families,
+        target_neighborhoods=fixture.full_neighborhoods,
+        graph_source_used=fixture.graph_source_used,
+        graph_edge_coverage=fixture.graph_edge_coverage,
+    )
+    monkeypatch.setattr(mod, "build_single_family_context", lambda config, heldout_family: single)
+
+    chunk1 = [{"concept_id": "m4-a", "candidate_source": "stable_role", "canonical_role_fingerprint_hashes": ["r1"], "source_fold": "holdA", "heldout_family": "holdA", "fold_local_role_ids": ["ra"]}]
+    chunk2 = [{"concept_id": "m4-b", "candidate_source": "fallback_neighborhood", "canonical_role_fingerprint_hashes": ["r2"], "source_fold": "holdA", "heldout_family": "holdA", "fold_local_role_ids": ["rb"]}]
+    monkeypatch.setattr(mod, "generate_candidate_chunks_for_group", lambda **kwargs: iter([chunk1, chunk2]))
+    monkeypatch.setattr(
+        mod,
+        "score_candidate_chunk",
+        lambda raw_chunk, context, target_rows: (
+            [
+                {
+                    "heldout_family": "holdA",
+                    "concept_id": raw_chunk[0]["concept_id"],
+                    "projection_used": True,
+                    "target_concept_prediction_score": 0.5,
+                }
+            ],
+            [{"heldout_family": "holdA", "concept_id": raw_chunk[0]["concept_id"], "target_family_id": "ta", "target_family_score": 0.5}],
+            [],
+            [{"heldout_family": "holdA", "concept_id": raw_chunk[0]["concept_id"], "canonical_role_fingerprint_hash": raw_chunk[0]["canonical_role_fingerprint_hashes"][0]}],
+        ),
+    )
+
+    shards_dir = tmp_path / "shards"
+    shards_dir.mkdir()
+    run_single_family_fixd(
+        heldout_family="holdA",
+        config=ConceptCandidatesV10FixDConfig(output_dir=str(tmp_path), game_set_manifest=str(tmp_path / "manifest.json")),
+        source_manifest_family_map={},
+        transfer_rows=[],
+        game_to_manifest_family={"g1": "srcA", "g2": "srcA", "g3": "srcB", "g4": "srcB"},
+        shards_dir=shards_dir,
+    )
+
+    assert (shards_dir / "raw_concept_candidates_premerge__holdA__part-0001.parquet").exists()
+    assert (shards_dir / "raw_concept_candidates_premerge__holdA__part-0002.parquet").exists()
+
+
+def test_v10fixd_transfer_rows_do_not_embed_nested_target_payloads(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+    import v6.concept_candidates_v10fixd as mod
+
+    contexts = _build_v10fixb_fixture_contexts()
+    fixture = contexts[0]
+    single = SingleFamilyContext(
+        heldout_family=fixture.heldout_family,
+        heldout_games=fixture.heldout_games,
+        source_neighborhoods=fixture.source_neighborhoods,
+        source_roles=fixture.source_roles,
+        target_families=fixture.target_families,
+        target_neighborhoods=fixture.full_neighborhoods,
+        graph_source_used=fixture.graph_source_used,
+        graph_edge_coverage=fixture.graph_edge_coverage,
+    )
+    monkeypatch.setattr(mod, "build_single_family_context", lambda config, heldout_family: single)
+    monkeypatch.setattr(
+        mod,
+        "generate_candidate_chunks_for_group",
+        lambda **kwargs: iter(
+            [[{"concept_id": "m4-a", "candidate_source": "stable_role", "canonical_role_fingerprint_hashes": ["r1"], "source_fold": "holdA", "heldout_family": "holdA", "fold_local_role_ids": ["ra"]}]]
+        ),
+    )
+    monkeypatch.setattr(
+        mod,
+        "score_candidate_chunk",
+        lambda raw_chunk, context, target_rows: (
+            [{"heldout_family": "holdA", "concept_id": "m4-a", "projection_used": True, "target_concept_prediction_score": 0.5}],
+            [{"heldout_family": "holdA", "concept_id": "m4-a", "target_family_id": "ta", "target_family_score": 0.5}],
+            [],
+            [{"heldout_family": "holdA", "concept_id": "m4-a", "canonical_role_fingerprint_hash": "r1"}],
+        ),
+    )
+
+    shards_dir = tmp_path / "shards"
+    shards_dir.mkdir()
+    run_single_family_fixd(
+        heldout_family="holdA",
+        config=ConceptCandidatesV10FixDConfig(output_dir=str(tmp_path), game_set_manifest=str(tmp_path / "manifest.json")),
+        source_manifest_family_map={},
+        transfer_rows=[],
+        game_to_manifest_family={"g1": "srcA", "g2": "srcA", "g3": "srcB", "g4": "srcB"},
+        shards_dir=shards_dir,
+    )
+
+    transfer = pd.read_parquet(shards_dir / "concept_transfer_scores__holdA__part-0001.parquet")
+    assert "target_family_rows" not in transfer.columns
+    assert "record" not in transfer.columns
+
+
+def test_v10fixd_resume_from_shards_skips_completed_family(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+    import v6.concept_candidates_v10fixd as mod
+
+    transfer_dir, manifest = _write_v10fixb_fixture(tmp_path)
+    output_dir = tmp_path / "v10fixd_resume"
+    shards_dir = output_dir / "shards"
+    shards_dir.mkdir(parents=True)
+    paths = family_fixd_paths(shards_dir, "holdA")
+    paths["complete"].write_text(json.dumps({"heldout_family": "holdA"}), encoding="utf-8")
+    for path, rows in (
+        (paths["summary"], [{"heldout_family": "holdA", "positive_concept_lift": 0}]),
+        (paths["source_diag"], [{"heldout_family": "holdA", "failure_mode_if_zero_structures": "no_source_roles"}]),
+        (paths["manifest_diag"], [{"heldout_family": "holdA", "family_id": "x", "final_manifest_resolution": ["unknown_manifest_family"]}]),
+        (paths["attrition"], [{"heldout_family": "holdA", "raw_candidate_count_premerge": 0}]),
+        (paths["memory_all"], [{"heldout_family": "holdA", "stage": "end", "rss_mb": 1.0}]),
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(rows).to_parquet(path, index=False)
+
+    monkeypatch.setattr(mod, "list_heldout_families", lambda config: ["holdA"])
+    monkeypatch.setattr(mod, "load_source_manifest_family_map", lambda path: {})
+    monkeypatch.setattr(mod, "run_single_family_fixd", lambda **kwargs: (_ for _ in ()).throw(AssertionError("should skip completed shard family")))
+    monkeypatch.setattr(
+        mod,
+        "finalize_fixd_run",
+        lambda **kwargs: {"report": {"corrected_concept_candidate_count": 0, "target_family_score_count": 0}, "validation": {"scientific_conclusion": "m4_concepts_fixd_pipeline_not_diagnostic"}},
+    )
+
+    payload = run_concept_candidates_v10fixd(
+        ConceptCandidatesV10FixDConfig(
+            transfer_input_dir=str(transfer_dir),
+            output_dir=str(output_dir),
+            game_set_manifest=str(manifest),
+            resume_from_shards=True,
+        )
+    )
+
+    assert payload["validation"]["scientific_conclusion"] == "m4_concepts_fixd_pipeline_not_diagnostic"
+
+
+def test_v10fixd_memory_diagnostics_include_expected_stages(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+    import v6.concept_candidates_v10fixd as mod
+
+    contexts = _build_v10fixb_fixture_contexts()
+    fixture = contexts[0]
+    single = SingleFamilyContext(
+        heldout_family=fixture.heldout_family,
+        heldout_games=fixture.heldout_games,
+        source_neighborhoods=fixture.source_neighborhoods,
+        source_roles=fixture.source_roles,
+        target_families=fixture.target_families,
+        target_neighborhoods=fixture.full_neighborhoods,
+        graph_source_used=fixture.graph_source_used,
+        graph_edge_coverage=fixture.graph_edge_coverage,
+    )
+    monkeypatch.setattr(mod, "build_single_family_context", lambda config, heldout_family: single)
+    monkeypatch.setattr(
+        mod,
+        "generate_candidate_chunks_for_group",
+        lambda **kwargs: iter(
+            [[{"concept_id": "m4-a", "candidate_source": "stable_role", "canonical_role_fingerprint_hashes": ["r1"], "source_fold": "holdA", "heldout_family": "holdA", "fold_local_role_ids": ["ra"]}]]
+        ),
+    )
+    monkeypatch.setattr(
+        mod,
+        "score_candidate_chunk",
+        lambda raw_chunk, context, target_rows: (
+            [{"heldout_family": "holdA", "concept_id": "m4-a", "projection_used": True, "target_concept_prediction_score": 0.5}],
+            [{"heldout_family": "holdA", "concept_id": "m4-a", "target_family_id": "ta", "target_family_score": 0.5}],
+            [],
+            [{"heldout_family": "holdA", "concept_id": "m4-a", "canonical_role_fingerprint_hash": "r1"}],
+        ),
+    )
+
+    shards_dir = tmp_path / "shards"
+    shards_dir.mkdir()
+    run_single_family_fixd(
+        heldout_family="holdA",
+        config=ConceptCandidatesV10FixDConfig(output_dir=str(tmp_path), game_set_manifest=str(tmp_path / "manifest.json")),
+        source_manifest_family_map={},
+        transfer_rows=[],
+        game_to_manifest_family={"g1": "srcA", "g2": "srcA", "g3": "srcB", "g4": "srcB"},
+        shards_dir=shards_dir,
+    )
+
+    memory = pd.read_parquet(shards_dir / "memory_diagnostics__holdA.parquet")
+    stages = set(memory["stage"])
+    assert {"start", "after_load_single_family_context", "after_source_role_map", "after_manifest_groups", "after_diagnostics_write", "after_candidate_chunk", "after_projection_chunk", "after_gc", "end"} <= stages
+    assert (memory["rss_mb"] >= 0).all()
+
+
+def test_v10fixd_runs_deterministically_on_small_fixture(tmp_path, monkeypatch) -> None:
+    import v6.concept_candidates_v10fixd as mod
+
+    transfer_dir, manifest = _write_v10fixb_fixture(tmp_path)
+    contexts = _build_v10fixb_fixture_contexts()
+    single_contexts = {
+        context.heldout_family: SingleFamilyContext(
+            heldout_family=context.heldout_family,
+            heldout_games=context.heldout_games,
+            source_neighborhoods=context.source_neighborhoods,
+            source_roles=context.source_roles,
+            target_families=context.target_families,
+            target_neighborhoods=context.full_neighborhoods,
+            graph_source_used=context.graph_source_used,
+            graph_edge_coverage=context.graph_edge_coverage,
+        )
+        for context in contexts
+    }
+    monkeypatch.setattr(mod, "list_heldout_families", lambda config: ["holdA", "holdB"])
+    monkeypatch.setattr(mod, "build_single_family_context", lambda config, heldout_family: single_contexts[heldout_family])
+    monkeypatch.setattr(mod, "load_source_manifest_family_map", lambda path: {})
+    monkeypatch.setattr(mod, "choose_fixd_worker_count", lambda requested_workers, task_count: 1)
+
+    one = run_concept_candidates_v10fixd(
+        ConceptCandidatesV10FixDConfig(
+            transfer_input_dir=str(transfer_dir),
+            output_dir=str(tmp_path / "v10fixd1"),
+            game_set_manifest=str(manifest),
+            workers=1,
+            min_games=1,
+            min_manifest_families=1,
+        )
+    )
+    many = run_concept_candidates_v10fixd(
+        ConceptCandidatesV10FixDConfig(
+            transfer_input_dir=str(transfer_dir),
+            output_dir=str(tmp_path / "v10fixd2"),
+            game_set_manifest=str(manifest),
+            workers=2,
+            min_games=1,
+            min_manifest_families=1,
+        )
+    )
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "concept-candidates-v10fix-d",
+            "--m3-input-dir",
+            "runs/v6/v08d_cd2_extended32_sourceclean",
+            "--transfer-input-dir",
+            "runs/v6/v09c_transfer_hardened_extended32",
+            "--m2-input-dir",
+            "runs/v6/v07_cd2_extended32_expanded",
+            "--m1-input-dir",
+            "runs/v6/v06_cd2_extended32",
+            "--output-dir",
+            "runs/v6/v10_m4_concepts_fixd_extended32",
+            "--workers",
+            "1",
+            "--streaming",
+            "true",
+            "--memory-safe",
+            "true",
+        ]
+    )
+
+    assert one["validation"]["scientific_conclusion"] == many["validation"]["scientific_conclusion"]
+    assert one["report"]["target_family_score_count"] == many["report"]["target_family_score_count"]
+    assert args.command == "concept-candidates-v10fix-d"
 
 
 def test_v08d_no_label_ablation_removes_label_features(tmp_path) -> None:
