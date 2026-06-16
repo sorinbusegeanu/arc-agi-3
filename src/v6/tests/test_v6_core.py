@@ -3774,14 +3774,34 @@ def test_v10fixd_runs_deterministically_on_small_fixture(tmp_path, monkeypatch) 
     assert args.command == "concept-candidates-v10fix-d"
 
 
+def _build_v10e_single_contexts(include_four_role_manifest: bool = False, two_target_families: bool = False):
+    contexts = _build_v10fixb_fixture_contexts(
+        include_four_role_manifest=include_four_role_manifest,
+        two_target_families=two_target_families,
+    )
+    return {
+        context.heldout_family: SingleFamilyContext(
+            heldout_family=context.heldout_family,
+            heldout_games=context.heldout_games,
+            source_neighborhoods=context.source_neighborhoods,
+            source_roles=context.source_roles,
+            target_families=context.target_families,
+            target_neighborhoods=context.full_neighborhoods,
+            graph_source_used=context.graph_source_used,
+            graph_edge_coverage=context.graph_edge_coverage,
+        )
+        for context in contexts
+    }
+
+
 def test_v10e_source_clean_split_excludes_heldout_games(tmp_path, monkeypatch) -> None:
     import pandas as pd
     import v6.m4_role_concepts_v10e as mod
 
     transfer_dir, manifest = _write_v10fixb_fixture(tmp_path)
-    contexts = _build_v10fixb_fixture_contexts()
-    monkeypatch.setattr(mod, "prepare_family_contexts", lambda config: contexts)
-    monkeypatch.setattr(mod, "choose_effective_worker_count", lambda tasks, requested_workers, shared_state_bytes=0: 1)
+    single_contexts = _build_v10e_single_contexts()
+    monkeypatch.setattr(mod, "list_heldout_families", lambda config: ["holdA", "holdB"])
+    monkeypatch.setattr(mod, "build_single_family_context", lambda config, heldout_family: single_contexts[heldout_family])
 
     run_m4_role_concepts_v10e(
         M4RoleConceptsV10eConfig(
@@ -3832,26 +3852,37 @@ def test_v10e_manifest_labels_not_used_for_grouping() -> None:
 def test_v10e_fallback_candidates_do_not_affect_conclusion(tmp_path, monkeypatch) -> None:
     import v6.m4_role_concepts_v10e as mod
 
-    contexts = _build_v10fixb_fixture_contexts()
-    fallback_only = []
-    for context in contexts:
-        fallback_only.append(
-            context.__class__(
-                heldout_family=context.heldout_family,
-                heldout_games=context.heldout_games,
-                source_neighborhoods=context.source_neighborhoods,
-                source_roles={},
-                source_no_label_roles={},
-                target_families=context.target_families,
-                full_neighborhoods=context.full_neighborhoods,
-                full_no_label_neighborhoods=context.full_no_label_neighborhoods,
-                graph_source_used=context.graph_source_used,
-                graph_edge_coverage=context.graph_edge_coverage,
-            )
+    fallback_only = {}
+    for heldout_family, context in _build_v10e_single_contexts().items():
+        fallback_only[heldout_family] = SingleFamilyContext(
+            heldout_family=context.heldout_family,
+            heldout_games=context.heldout_games,
+            source_neighborhoods=context.source_neighborhoods,
+            source_roles={},
+            target_families=context.target_families,
+            target_neighborhoods=context.target_neighborhoods,
+            graph_source_used=context.graph_source_used,
+            graph_edge_coverage=context.graph_edge_coverage,
         )
     transfer_dir, manifest = _write_v10fixb_fixture(tmp_path)
-    monkeypatch.setattr(mod, "prepare_family_contexts", lambda config: fallback_only)
-    monkeypatch.setattr(mod, "choose_effective_worker_count", lambda tasks, requested_workers, shared_state_bytes=0: 1)
+    monkeypatch.setattr(mod, "list_heldout_families", lambda config: ["holdA", "holdB"])
+    monkeypatch.setattr(mod, "build_single_family_context", lambda config, heldout_family: fallback_only[heldout_family])
+    monkeypatch.setattr(
+        mod,
+        "score_fallback_rows",
+        lambda context, fallback_rows, target_rows: [
+            {
+                "heldout_family": context.heldout_family,
+                "candidate_source": "fallback_diagnostic_only",
+                "concept_id": row["concept_id"],
+                "target_family_id": context.target_families[0].family_id,
+                "target_family_score": 0.9,
+                "best_individual_role_baseline_raw": 0.1,
+                "best_surface_raw_baseline": 0.1,
+            }
+            for row in fallback_rows
+        ],
+    )
 
     payload = run_m4_role_concepts_v10e(
         M4RoleConceptsV10eConfig(
@@ -3864,7 +3895,7 @@ def test_v10e_fallback_candidates_do_not_affect_conclusion(tmp_path, monkeypatch
     )
 
     assert payload["report"]["fallback_diagnostic_candidate_count"] > 0
-    assert payload["validation"]["scientific_conclusion"] == "m4_role_based_not_established"
+    assert payload["validation"]["scientific_conclusion"] == "m4_fallback_signal_only_m3_bottleneck"
 
 
 def test_v10e_target_assigned_role_id_does_not_affect_score() -> None:
@@ -3906,14 +3937,177 @@ def test_v10e_target_assigned_role_id_does_not_affect_score() -> None:
 
 def test_v10e_compression_gain_is_required() -> None:
     row = {
+        "candidate_source": "stable_role",
         "canonical_role_fingerprint_hashes": ["a", "b"],
         "target_mean_concept_lift_vs_role_raw": 0.1,
         "target_mean_concept_lift_vs_role_bag": 0.1,
+        "target_mean_concept_lift_vs_surface_raw": 0.1,
         "target_mean_future_option_prediction_lift": 0.1,
         "mean_compression_gain": 0.0,
+        "positive_lift_family_count": 2,
+        "explained_m2_family_count": 2,
     }
 
     assert is_transferable_role_based_concept(row) is False
+
+
+def test_v10e_graph_no_label_baseline_is_source_clean() -> None:
+    import v6.m4_role_concepts_v10e as mod
+
+    contexts = _build_v10fixb_fixture_contexts()
+    context = contexts[0]
+    target = context.full_neighborhoods["ta"]
+    source_only = score_role_based_concept_against_target_family(
+        build_role_based_candidate_row(
+            source_fold="holdA",
+            heldout_family="holdA",
+            local_candidate_id="a",
+            items=[
+                {
+                    "source_fold": "holdA",
+                    "family_id": "sa_block",
+                    "record": context.source_neighborhoods["sa_block"],
+                    "role_id": "role_block",
+                    "role_label": "blocker_candidate",
+                    **canonical_role_fingerprint("blocker_candidate", context.source_neighborhoods["sa_block"]),
+                    "source_manifest_families": ["srcA"],
+                },
+                {
+                    "source_fold": "holdA",
+                    "family_id": "sb_move",
+                    "record": context.source_neighborhoods["sb_move"],
+                    "role_id": "role_move",
+                    "role_label": "movement_controller_candidate",
+                    **canonical_role_fingerprint("movement_controller_candidate", context.source_neighborhoods["sb_move"]),
+                    "source_manifest_families": ["srcB"],
+                },
+            ],
+        ),
+        context,
+        "ta",
+        target,
+        [],
+    )
+    expected = max(
+        mod.cosine_similarity(graph_position_features(target), graph_position_features(record))
+        for record in context.source_neighborhoods.values()
+    )
+
+    assert abs(source_only["graph_no_label_baseline"] - expected) < 1e-9
+
+
+def test_v10e_weak_gate_requires_surface_compression_future_and_family_count() -> None:
+    row = {
+        "candidate_source": "stable_role",
+        "canonical_role_fingerprint_hashes": ["a", "b"],
+        "target_mean_concept_lift_vs_role_raw": 0.1,
+        "target_mean_concept_lift_vs_role_bag": 0.1,
+        "target_mean_concept_lift_vs_surface_raw": 0.0,
+        "target_mean_future_option_prediction_lift": 0.1,
+        "mean_compression_gain": 0.1,
+        "positive_lift_family_count": 6,
+        "explained_m2_family_count": 2,
+    }
+
+    assert is_transferable_role_based_concept(row) is False
+
+
+def test_v10e_report_cannot_claim_weak_with_one_transferable(tmp_path, monkeypatch) -> None:
+    import v6.m4_role_concepts_v10e as mod
+
+    transfer_dir, manifest = _write_v10fixb_fixture(tmp_path)
+    single_contexts = _build_v10e_single_contexts()
+    monkeypatch.setattr(mod, "list_heldout_families", lambda config: ["holdA", "holdB"])
+    monkeypatch.setattr(mod, "build_single_family_context", lambda config, heldout_family: single_contexts[heldout_family])
+    original = mod.evaluate_role_based_projection_by_family
+
+    def one_transferable(concept, context, target_rows):
+        projection, rows = original(concept, context, target_rows)
+        if concept["local_candidate_id"].endswith("0001"):
+            projection["target_mean_concept_lift_vs_role_raw"] = 0.1
+            projection["target_mean_concept_lift_vs_role_bag"] = 0.1
+            projection["target_mean_concept_lift_vs_surface_raw"] = 0.1
+            projection["target_mean_future_option_prediction_lift"] = 0.1
+            projection["mean_compression_gain"] = 0.1
+            projection["positive_lift_family_count"] = 6
+            projection["explained_m2_family_count"] = 2
+        else:
+            projection["target_mean_concept_lift_vs_role_raw"] = -0.1
+            projection["target_mean_concept_lift_vs_role_bag"] = -0.1
+            projection["target_mean_concept_lift_vs_surface_raw"] = -0.1
+            projection["target_mean_future_option_prediction_lift"] = -0.1
+            projection["mean_compression_gain"] = -0.1
+            projection["positive_lift_family_count"] = 0
+            projection["explained_m2_family_count"] = 0
+        projection["passes_role_based_gate"] = mod.is_transferable_role_based_concept({**concept, **projection})
+        return projection, rows
+
+    monkeypatch.setattr(mod, "evaluate_role_based_projection_by_family", one_transferable)
+
+    payload = run_m4_role_concepts_v10e(
+        M4RoleConceptsV10eConfig(
+            transfer_input_dir=str(transfer_dir),
+            output_dir=str(tmp_path / "v10e_one_transferable"),
+            game_set_manifest=str(manifest),
+            min_games=1,
+            min_manifest_families=1,
+        )
+    )
+
+    assert payload["validation"]["scientific_conclusion"] == "m4_role_based_not_established"
+
+
+def test_v10e_mixed_candidates_do_not_affect_role_based_proof() -> None:
+    row = {
+        "candidate_source": "mixed",
+        "canonical_role_fingerprint_hashes": ["a", "b"],
+        "target_mean_concept_lift_vs_role_raw": 0.1,
+        "target_mean_concept_lift_vs_role_bag": 0.1,
+        "target_mean_concept_lift_vs_surface_raw": 0.1,
+        "target_mean_future_option_prediction_lift": 0.1,
+        "mean_compression_gain": 0.1,
+        "positive_lift_family_count": 6,
+        "explained_m2_family_count": 2,
+    }
+
+    assert is_transferable_role_based_concept(row) is False
+
+
+def test_v10e_required_output_files_are_produced(tmp_path, monkeypatch) -> None:
+    import v6.m4_role_concepts_v10e as mod
+
+    transfer_dir, manifest = _write_v10fixb_fixture(tmp_path)
+    single_contexts = _build_v10e_single_contexts()
+    monkeypatch.setattr(mod, "list_heldout_families", lambda config: ["holdA", "holdB"])
+    monkeypatch.setattr(mod, "build_single_family_context", lambda config, heldout_family: single_contexts[heldout_family])
+
+    run_m4_role_concepts_v10e(
+        M4RoleConceptsV10eConfig(
+            transfer_input_dir=str(transfer_dir),
+            output_dir=str(tmp_path / "v10e_outputs"),
+            game_set_manifest=str(manifest),
+            min_games=1,
+            min_manifest_families=1,
+        )
+    )
+    output_dir = tmp_path / "v10e_outputs"
+    expected = {
+        "v10e_report.json",
+        "v10e_report.txt",
+        "role_based_m4_concepts.parquet",
+        "role_based_m4_concepts.json",
+        "role_based_concept_transfer_scores.parquet",
+        "role_based_concept_by_family.parquet",
+        "role_based_concept_compression_scores.parquet",
+        "role_based_future_option_prediction_scores.parquet",
+        "role_based_baseline_comparison.parquet",
+        "fallback_diagnostic_candidates.parquet",
+        "fallback_diagnostic_scores.parquet",
+        "rejected_candidate_diagnostics.parquet",
+        "concept_identity_diagnostics.parquet",
+    }
+
+    assert expected <= {path.name for path in output_dir.iterdir()}
 
 
 def test_v10e_deterministic_concept_ids_and_cli_accepts_options(tmp_path, monkeypatch) -> None:
@@ -3921,9 +4115,9 @@ def test_v10e_deterministic_concept_ids_and_cli_accepts_options(tmp_path, monkey
     import v6.m4_role_concepts_v10e as mod
 
     transfer_dir, manifest = _write_v10fixb_fixture(tmp_path)
-    contexts = _build_v10fixb_fixture_contexts()
-    monkeypatch.setattr(mod, "prepare_family_contexts", lambda config: contexts)
-    monkeypatch.setattr(mod, "choose_effective_worker_count", lambda tasks, requested_workers, shared_state_bytes=0: 1)
+    single_contexts = _build_v10e_single_contexts()
+    monkeypatch.setattr(mod, "list_heldout_families", lambda config: ["holdA", "holdB"])
+    monkeypatch.setattr(mod, "build_single_family_context", lambda config, heldout_family: single_contexts[heldout_family])
 
     one = run_m4_role_concepts_v10e(
         M4RoleConceptsV10eConfig(
