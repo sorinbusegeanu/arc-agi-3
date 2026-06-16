@@ -217,6 +217,13 @@ from v6.concept_candidates_v10fixd import (
     run_concept_candidates_v10fixd,
     run_single_family_fixd,
 )
+from v6.m4_role_concepts_v10e import (
+    M4RoleConceptsV10eConfig,
+    build_role_based_candidate_row,
+    is_transferable_role_based_concept,
+    run_m4_role_concepts_v10e,
+    score_role_based_concept_against_target_family,
+)
 from v6.role_transfer_v09a import RoleTransferV09aConfig, run_role_transfer_v09a
 from v6.sampling import (
     ActionBalanceSampler,
@@ -3765,6 +3772,203 @@ def test_v10fixd_runs_deterministically_on_small_fixture(tmp_path, monkeypatch) 
     assert one["validation"]["scientific_conclusion"] == many["validation"]["scientific_conclusion"]
     assert one["report"]["target_family_score_count"] == many["report"]["target_family_score_count"]
     assert args.command == "concept-candidates-v10fix-d"
+
+
+def test_v10e_source_clean_split_excludes_heldout_games(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+    import v6.m4_role_concepts_v10e as mod
+
+    transfer_dir, manifest = _write_v10fixb_fixture(tmp_path)
+    contexts = _build_v10fixb_fixture_contexts()
+    monkeypatch.setattr(mod, "prepare_family_contexts", lambda config: contexts)
+    monkeypatch.setattr(mod, "choose_effective_worker_count", lambda tasks, requested_workers, shared_state_bytes=0: 1)
+
+    run_m4_role_concepts_v10e(
+        M4RoleConceptsV10eConfig(
+            transfer_input_dir=str(transfer_dir),
+            output_dir=str(tmp_path / "v10e1"),
+            game_set_manifest=str(manifest),
+            min_games=1,
+            min_manifest_families=1,
+        )
+    )
+    concepts = pd.read_parquet(tmp_path / "v10e1" / "role_based_m4_concepts.parquet").to_dict(orient="records")
+
+    assert concepts
+    assert all("h1" not in row["source_games_present"] and "h2" not in row["source_games_present"] for row in concepts)
+
+
+def test_v10e_manifest_labels_not_used_for_grouping() -> None:
+    contexts = _build_v10fixb_fixture_contexts()
+    context = contexts[0]
+    role_map = build_source_role_map_fixb(context.source_roles)
+    item_a = {
+        "source_fold": "holdA",
+        "family_id": "sa_block",
+        "record": context.source_neighborhoods["sa_block"],
+        "role_id": "role_block",
+        "role_label": "blocker_candidate",
+        **canonical_role_fingerprint("blocker_candidate", context.source_neighborhoods["sa_block"]),
+        "source_manifest_families": ["srcA"],
+    }
+    item_b = {
+        "source_fold": "holdA",
+        "family_id": "sb_move",
+        "record": context.source_neighborhoods["sb_move"],
+        "role_id": "role_move",
+        "role_label": "movement_controller_candidate",
+        **canonical_role_fingerprint("movement_controller_candidate", context.source_neighborhoods["sb_move"]),
+        "source_manifest_families": ["srcB"],
+    }
+    left = build_role_based_candidate_row(source_fold="holdA", heldout_family="holdA", local_candidate_id="a", items=[item_a, item_b])
+    item_a["source_manifest_families"] = ["altA"]
+    item_b["source_manifest_families"] = ["altB"]
+    right = build_role_based_candidate_row(source_fold="holdA", heldout_family="holdA", local_candidate_id="b", items=[item_a, item_b])
+
+    assert role_map["sa_block"]["role_id"] == "role_block"
+    assert left["concept_id"] == right["concept_id"]
+
+
+def test_v10e_fallback_candidates_do_not_affect_conclusion(tmp_path, monkeypatch) -> None:
+    import v6.m4_role_concepts_v10e as mod
+
+    contexts = _build_v10fixb_fixture_contexts()
+    fallback_only = []
+    for context in contexts:
+        fallback_only.append(
+            context.__class__(
+                heldout_family=context.heldout_family,
+                heldout_games=context.heldout_games,
+                source_neighborhoods=context.source_neighborhoods,
+                source_roles={},
+                source_no_label_roles={},
+                target_families=context.target_families,
+                full_neighborhoods=context.full_neighborhoods,
+                full_no_label_neighborhoods=context.full_no_label_neighborhoods,
+                graph_source_used=context.graph_source_used,
+                graph_edge_coverage=context.graph_edge_coverage,
+            )
+        )
+    transfer_dir, manifest = _write_v10fixb_fixture(tmp_path)
+    monkeypatch.setattr(mod, "prepare_family_contexts", lambda config: fallback_only)
+    monkeypatch.setattr(mod, "choose_effective_worker_count", lambda tasks, requested_workers, shared_state_bytes=0: 1)
+
+    payload = run_m4_role_concepts_v10e(
+        M4RoleConceptsV10eConfig(
+            transfer_input_dir=str(transfer_dir),
+            output_dir=str(tmp_path / "v10e_fallback"),
+            game_set_manifest=str(manifest),
+            min_games=1,
+            min_manifest_families=1,
+        )
+    )
+
+    assert payload["report"]["fallback_diagnostic_candidate_count"] > 0
+    assert payload["validation"]["scientific_conclusion"] == "m4_role_based_not_established"
+
+
+def test_v10e_target_assigned_role_id_does_not_affect_score() -> None:
+    contexts = _build_v10fixb_fixture_contexts()
+    context = contexts[0]
+    items = []
+    for role_id, role in sorted(context.source_roles.items()):
+        record = context.source_neighborhoods["sa_block" if role_id == "role_block" else "sa_move"]
+        items.append(
+            {
+                "source_fold": "holdA",
+                "family_id": record.family_id,
+                "record": record,
+                "role_id": role_id,
+                "role_label": role["role_label_candidate"],
+                **canonical_role_fingerprint(role["role_label_candidate"], record),
+                "source_manifest_families": ["srcA"],
+            }
+        )
+    concept = build_role_based_candidate_row(source_fold="holdA", heldout_family="holdA", local_candidate_id="a", items=items)
+    target = context.full_neighborhoods["ta"]
+    with_overlap = score_role_based_concept_against_target_family(
+        concept,
+        context,
+        "ta",
+        target,
+        [{"assigned_role_id": "role_block", "target_family_id": "ta", "surface_hardened_score": 0.2, "effect_residual_score": 0.2}],
+    )
+    no_overlap = score_role_based_concept_against_target_family(
+        concept,
+        context,
+        "ta",
+        target,
+        [{"assigned_role_id": "different_role", "target_family_id": "ta", "surface_hardened_score": 0.2, "effect_residual_score": 0.2}],
+    )
+
+    assert with_overlap["target_family_score"] == no_overlap["target_family_score"]
+
+
+def test_v10e_compression_gain_is_required() -> None:
+    row = {
+        "canonical_role_fingerprint_hashes": ["a", "b"],
+        "target_mean_concept_lift_vs_role_raw": 0.1,
+        "target_mean_concept_lift_vs_role_bag": 0.1,
+        "target_mean_future_option_prediction_lift": 0.1,
+        "mean_compression_gain": 0.0,
+    }
+
+    assert is_transferable_role_based_concept(row) is False
+
+
+def test_v10e_deterministic_concept_ids_and_cli_accepts_options(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+    import v6.m4_role_concepts_v10e as mod
+
+    transfer_dir, manifest = _write_v10fixb_fixture(tmp_path)
+    contexts = _build_v10fixb_fixture_contexts()
+    monkeypatch.setattr(mod, "prepare_family_contexts", lambda config: contexts)
+    monkeypatch.setattr(mod, "choose_effective_worker_count", lambda tasks, requested_workers, shared_state_bytes=0: 1)
+
+    one = run_m4_role_concepts_v10e(
+        M4RoleConceptsV10eConfig(
+            transfer_input_dir=str(transfer_dir),
+            output_dir=str(tmp_path / "v10e_one"),
+            game_set_manifest=str(manifest),
+            workers=1,
+            min_games=1,
+            min_manifest_families=1,
+        )
+    )
+    many = run_m4_role_concepts_v10e(
+        M4RoleConceptsV10eConfig(
+            transfer_input_dir=str(transfer_dir),
+            output_dir=str(tmp_path / "v10e_many"),
+            game_set_manifest=str(manifest),
+            workers=2,
+            min_games=1,
+            min_manifest_families=1,
+        )
+    )
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "m4-role-concepts-v10e",
+            "--m3-input-dir",
+            "runs/v6/v08d_cd2_extended32_sourceclean",
+            "--transfer-input-dir",
+            "runs/v6/v09c_transfer_hardened_extended32",
+            "--m2-input-dir",
+            "runs/v6/v07_cd2_extended32_expanded",
+            "--m1-input-dir",
+            "runs/v6/v06_cd2_extended32",
+            "--output-dir",
+            "runs/v6/v10e_role_based_m4_extended32",
+            "--workers",
+            "2",
+        ]
+    )
+    ids_one = sorted(pd.read_parquet(tmp_path / "v10e_one" / "role_based_m4_concepts.parquet")["concept_id"].tolist())
+    ids_many = sorted(pd.read_parquet(tmp_path / "v10e_many" / "role_based_m4_concepts.parquet")["concept_id"].tolist())
+
+    assert one["validation"]["scientific_conclusion"] == many["validation"]["scientific_conclusion"]
+    assert ids_one == ids_many
+    assert args.command == "m4-role-concepts-v10e"
 
 
 def test_v08d_no_label_ablation_removes_label_features(tmp_path) -> None:

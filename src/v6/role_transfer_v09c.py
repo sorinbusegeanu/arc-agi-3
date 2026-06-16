@@ -102,8 +102,8 @@ def choose_parallel_worker_count(requested_workers: int, task_count: int) -> int
 
     # Empirically, extended32 family preparation/evaluation can transiently hold
     # much larger pandas-backed state than the serialized task suggests.
-    baseline_worker_bytes = 16 * 1024 * 1024 * 1024
-    safe_budget = int(available_memory * 0.15)
+    baseline_worker_bytes = 8 * 1024 * 1024 * 1024
+    safe_budget = int(available_memory * 0.95)
     if safe_budget <= 0:
         return 1
     memory_cap = max(1, safe_budget // baseline_worker_bytes)

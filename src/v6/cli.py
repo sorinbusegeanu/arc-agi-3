@@ -42,6 +42,7 @@ from v6.concept_candidates_v10fix import ConceptCandidatesV10FixConfig, run_conc
 from v6.concept_candidates_v10fixb import ConceptCandidatesV10FixBConfig, run_concept_candidates_v10fixb
 from v6.concept_candidates_v10fixc import ConceptCandidatesV10FixCConfig, run_concept_candidates_v10fixc, validate_completed_fixc_run
 from v6.concept_candidates_v10fixd import ConceptCandidatesV10FixDConfig, run_concept_candidates_v10fixd
+from v6.m4_role_concepts_v10e import M4RoleConceptsV10eConfig, run_m4_role_concepts_v10e
 from v6.storage.benchmark import run_storage_benchmark
 from v6.storage.migration import migrate_sqlite_to_parquet
 from v6.transformation_families_v07 import TransformationFamiliesV07Config, run_transformation_families_v07
@@ -413,6 +414,16 @@ def build_parser() -> argparse.ArgumentParser:
     concept_candidates_v10fix_d.add_argument("--memory-safe", default="true")
     concept_candidates_v10fix_d.add_argument("--write-shards", default="true")
     concept_candidates_v10fix_d.add_argument("--resume-from-shards", default="false")
+
+    m4_role_concepts_v10e = subparsers.add_parser("m4-role-concepts-v10e")
+    m4_role_concepts_v10e.add_argument("--m3-input-dir", default="runs/v6/v08d_cd2_extended32_sourceclean")
+    m4_role_concepts_v10e.add_argument("--transfer-input-dir", default="runs/v6/v09c_transfer_hardened_extended32")
+    m4_role_concepts_v10e.add_argument("--m2-input-dir", default="runs/v6/v07_cd2_extended32_expanded")
+    m4_role_concepts_v10e.add_argument("--m1-input-dir", default="runs/v6/v06_cd2_extended32")
+    m4_role_concepts_v10e.add_argument("--output-dir", default="runs/v6/v10e_role_based_m4_extended32")
+    m4_role_concepts_v10e.add_argument("--game-set-manifest", default=None)
+    m4_role_concepts_v10e.add_argument("--game-set-name", default=None)
+    m4_role_concepts_v10e.add_argument("--workers", type=int, default=1)
 
     validate_concept_candidates_v10fix_c = subparsers.add_parser("validate-concept-candidates-v10fix-c-run")
     validate_concept_candidates_v10fix_c.add_argument("--run-dir", required=True)
@@ -1114,6 +1125,32 @@ def main() -> int:
                     "scientific_conclusion": payload["validation"]["scientific_conclusion"],
                     "corrected_concept_candidate_count": payload["report"].get("corrected_concept_candidate_count", 0),
                     "target_family_score_count": payload["report"].get("target_family_score_count", 0),
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    if args.command == "m4-role-concepts-v10e":
+        payload = run_m4_role_concepts_v10e(
+            M4RoleConceptsV10eConfig(
+                m3_input_dir=args.m3_input_dir,
+                transfer_input_dir=args.transfer_input_dir,
+                m2_input_dir=args.m2_input_dir,
+                m1_input_dir=args.m1_input_dir,
+                output_dir=args.output_dir,
+                game_set_manifest=args.game_set_manifest,
+                game_set_name=args.game_set_name,
+                workers=args.workers,
+            )
+        )
+        print(
+            json.dumps(
+                {
+                    "output_dir": args.output_dir,
+                    "scientific_conclusion": payload["validation"]["scientific_conclusion"],
+                    "role_based_candidate_count": payload["report"]["role_based_candidate_count"],
+                    "transferable_role_based_concepts": payload["report"]["transferable_role_based_concepts"],
                 },
                 indent=2,
             )
