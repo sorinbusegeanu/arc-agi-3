@@ -40,7 +40,7 @@ from v6.role_transfer_v09c import RoleTransferV09cConfig, run_role_transfer_v09c
 from v6.concept_candidates_v10 import ConceptCandidatesV10Config, run_concept_candidates_v10
 from v6.concept_candidates_v10fix import ConceptCandidatesV10FixConfig, run_concept_candidates_v10fix
 from v6.concept_candidates_v10fixb import ConceptCandidatesV10FixBConfig, run_concept_candidates_v10fixb
-from v6.concept_candidates_v10fixc import ConceptCandidatesV10FixCConfig, run_concept_candidates_v10fixc
+from v6.concept_candidates_v10fixc import ConceptCandidatesV10FixCConfig, run_concept_candidates_v10fixc, validate_completed_fixc_run
 from v6.storage.benchmark import run_storage_benchmark
 from v6.storage.migration import migrate_sqlite_to_parquet
 from v6.transformation_families_v07 import TransformationFamiliesV07Config, run_transformation_families_v07
@@ -398,6 +398,9 @@ def build_parser() -> argparse.ArgumentParser:
     concept_candidates_v10fix_c.add_argument("--memory-safe", default="true")
     concept_candidates_v10fix_c.add_argument("--write-shards", default="true")
     concept_candidates_v10fix_c.add_argument("--resume-from-shards", default="false")
+
+    validate_concept_candidates_v10fix_c = subparsers.add_parser("validate-concept-candidates-v10fix-c-run")
+    validate_concept_candidates_v10fix_c.add_argument("--run-dir", required=True)
 
     migrate = subparsers.add_parser("migrate-sqlite-to-parquet")
     migrate.add_argument("--sqlite", required=True)
@@ -1066,6 +1069,10 @@ def main() -> int:
                 indent=2,
             )
         )
+        return 0
+
+    if args.command == "validate-concept-candidates-v10fix-c-run":
+        print(json.dumps(validate_completed_fixc_run(args.run_dir), indent=2))
         return 0
 
     if args.command == "migrate-sqlite-to-parquet":

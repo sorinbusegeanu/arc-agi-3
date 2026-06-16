@@ -206,6 +206,7 @@ from v6.concept_candidates_v10fixc import (
     discover_source_only_candidates_fixc,
     evaluate_target_projection_by_family_fixc,
     run_concept_candidates_v10fixc,
+    validate_completed_fixc_run,
 )
 from v6.role_transfer_v09a import RoleTransferV09aConfig, run_role_transfer_v09a
 from v6.sampling import (
@@ -3300,6 +3301,29 @@ def test_v10fixc_runs_streaming_and_resumes_from_shards(tmp_path, monkeypatch) -
     details = pd.read_parquet(tmp_path / "v10fixc1" / "concept_target_family_scores_fixc.parquet")
     assert "target_family_rows" not in scores.columns
     assert "target_family_id" in details.columns
+
+
+def test_v10fixc_completed_run_validator_accepts_fixture_run(tmp_path, monkeypatch) -> None:
+    import v6.concept_candidates_v10fixc as mod
+
+    transfer_dir, manifest = _write_v10fixb_fixture(tmp_path)
+    contexts = _build_v10fixb_fixture_contexts()
+    monkeypatch.setattr(mod, "prepare_family_context_stream", lambda config: iter(contexts))
+
+    run_concept_candidates_v10fixc(
+        ConceptCandidatesV10FixCConfig(
+            transfer_input_dir=str(transfer_dir),
+            output_dir=str(tmp_path / "v10fixc_validate"),
+            game_set_manifest=str(manifest),
+            min_games=1,
+            min_manifest_families=1,
+            write_shards=True,
+        )
+    )
+    validation = validate_completed_fixc_run(tmp_path / "v10fixc_validate")
+
+    assert validation["valid"] is True
+    assert validation["checks"]["transfer_rows_no_nested_target_family_payloads"] is True
 
 
 def test_v08d_no_label_ablation_removes_label_features(tmp_path) -> None:

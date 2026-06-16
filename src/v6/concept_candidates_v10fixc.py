@@ -238,6 +238,60 @@ def run_concept_candidates_v10fixc(config: ConceptCandidatesV10FixCConfig) -> di
     return payload
 
 
+def validate_completed_fixc_run(run_dir: str | Path) -> dict[str, Any]:
+    run_path = Path(run_dir)
+    shards_dir = run_path / "shards"
+    required_files = [
+        run_path / "v10fixc_report.json",
+        run_path / "v10fixc_report.txt",
+        run_path / "concept_target_family_scores_fixc.parquet",
+        run_path / "concept_transfer_scores_fixc.parquet",
+        run_path / "source_role_map_diagnostics.parquet",
+        run_path / "source_manifest_resolution_diagnostics.parquet",
+        run_path / "memory_diagnostics.parquet",
+        run_path / "candidate_attrition_diagnostics.parquet",
+    ]
+    missing_files = [str(path) for path in required_files if not path.exists()]
+    shard_file_count = len(list(shards_dir.glob("*.parquet"))) if shards_dir.exists() else 0
+    shard_outputs_exist = shard_file_count > 0
+
+    transfer_rows = pd.read_parquet(run_path / "concept_transfer_scores_fixc.parquet") if (run_path / "concept_transfer_scores_fixc.parquet").exists() else pd.DataFrame()
+    source_diag = pd.read_parquet(run_path / "source_role_map_diagnostics.parquet") if (run_path / "source_role_map_diagnostics.parquet").exists() else pd.DataFrame()
+    attrition = pd.read_parquet(run_path / "candidate_attrition_diagnostics.parquet") if (run_path / "candidate_attrition_diagnostics.parquet").exists() else pd.DataFrame()
+    report_json = json.loads((run_path / "v10fixc_report.json").read_text(encoding="utf-8")) if (run_path / "v10fixc_report.json").exists() else {}
+    report = report_json.get("report", {})
+
+    nested_payload_columns = [col for col in transfer_rows.columns if "target_family_rows" in col or "nested" in col]
+    zero_candidate_reason_present = True
+    raw_candidate_count = int(report.get("raw_candidate_count_premerge", 0) or 0)
+    if raw_candidate_count == 0:
+        failure_mode = str(report.get("failure_mode_if_not_established", "") or "")
+        diag_modes = set(source_diag.get("failure_mode", [])) if not source_diag.empty and "failure_mode" in source_diag.columns else set()
+        zero_candidate_reason_present = bool(failure_mode) and (failure_mode in diag_modes or failure_mode == "unexpected_empty_pipeline")
+
+    checks = {
+        "report_files_exist": (run_path / "v10fixc_report.json").exists() and (run_path / "v10fixc_report.txt").exists(),
+        "shard_outputs_exist": shard_outputs_exist,
+        "concept_target_family_scores_exists": (run_path / "concept_target_family_scores_fixc.parquet").exists(),
+        "transfer_rows_no_nested_target_family_payloads": not nested_payload_columns,
+        "source_role_map_diagnostics_exist": (run_path / "source_role_map_diagnostics.parquet").exists(),
+        "manifest_resolution_diagnostics_exist": (run_path / "source_manifest_resolution_diagnostics.parquet").exists(),
+        "memory_diagnostics_exist": (run_path / "memory_diagnostics.parquet").exists(),
+        "zero_candidate_reason_present": zero_candidate_reason_present,
+    }
+    return {
+        "run_dir": str(run_path),
+        "valid": all(checks.values()) and not missing_files,
+        "checks": checks,
+        "missing_files": missing_files,
+        "shard_file_count": shard_file_count,
+        "nested_payload_columns": nested_payload_columns,
+        "raw_candidate_count_premerge": raw_candidate_count,
+        "failure_mode_if_not_established": report.get("failure_mode_if_not_established", ""),
+        "candidate_attrition_rows": len(attrition),
+    }
+
+
 def evaluate_family_fixc(
     *,
     context: FamilyContext,
