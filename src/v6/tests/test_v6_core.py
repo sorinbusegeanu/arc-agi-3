@@ -160,6 +160,7 @@ from v6.role_transfer_v09c import (
     choose_parallel_worker_count,
     future_option_behavior_features,
     graph_position_features,
+    prepare_family_context_stream,
     run_role_transfer_v09c,
     select_same_effect_different_role_case,
     select_same_role_different_effect_case,
@@ -199,6 +200,12 @@ from v6.concept_candidates_v10fixb import (
     merge_exact_candidates,
     resolve_manifest_families_for_record,
     run_concept_candidates_v10fixb,
+)
+from v6.concept_candidates_v10fixc import (
+    ConceptCandidatesV10FixCConfig,
+    discover_source_only_candidates_fixc,
+    evaluate_target_projection_by_family_fixc,
+    run_concept_candidates_v10fixc,
 )
 from v6.role_transfer_v09a import RoleTransferV09aConfig, run_role_transfer_v09a
 from v6.sampling import (
@@ -3134,6 +3141,165 @@ def test_game_set_manifest_auto_resolves_extended32_from_available_games() -> No
     assert manifest.name == "extended32_v08"
     assert len(manifest.families) == 16
     assert manifest.families["collection"] == ("tt01", "tt02")
+
+
+def test_v10fixc_source_role_map_diagnostics_no_source_roles_uses_fallback() -> None:
+    contexts = _build_v10fixb_fixture_contexts()
+    context = contexts[0]
+
+    raw_rows, attrition, source_diag, _ = discover_source_only_candidates_fixc(
+        context=context,
+        source_role_map={},
+        source_manifest_family_map={},
+        game_to_manifest_family={"g1": "srcA", "g2": "srcA", "g3": "srcB", "g4": "srcB"},
+        config=ConceptCandidatesV10FixCConfig(min_games=1, min_manifest_families=1),
+    )
+
+    assert source_diag["failure_mode"] == "no_source_roles"
+    assert raw_rows
+    assert attrition["fallback_candidate_count"] > 0
+    assert {row["candidate_source"] for row in raw_rows} == {"fallback_neighborhood"}
+
+
+def test_v10fixc_role_map_mismatch_still_generates_fallback_candidates() -> None:
+    contexts = _build_v10fixb_fixture_contexts()
+    context = contexts[0]
+    source_role_map = {
+        "mismatch_family": {
+            "role_id": "role_block",
+            "role_label_candidate": "blocker_candidate",
+            "all_features": {},
+        }
+    }
+
+    raw_rows, _, source_diag, _ = discover_source_only_candidates_fixc(
+        context=context,
+        source_role_map=source_role_map,
+        source_manifest_family_map={},
+        game_to_manifest_family={"g1": "srcA", "g2": "srcA", "g3": "srcB", "g4": "srcB"},
+        config=ConceptCandidatesV10FixCConfig(min_games=1, min_manifest_families=1),
+    )
+
+    assert source_diag["failure_mode"] == "source_role_map_family_id_mismatch"
+    assert raw_rows
+    assert source_diag["fallback_raw_candidate_count"] > 0
+
+
+def test_v10fixc_manifest_fallback_uses_record_and_unknown_bucket() -> None:
+    from types import SimpleNamespace
+
+    contexts = _build_v10fixb_fixture_contexts()
+    context = contexts[0]
+    source_role_map = build_source_role_map_fixb(context.source_roles)
+    record = context.source_neighborhoods["sa_block"]
+    unknown_record = SimpleNamespace(**record.__dict__)
+    unknown_record.game_family_ids = ()
+    unknown_record.game_ids = ("ux1",)
+    mixed_context = context.__class__(
+        heldout_family=context.heldout_family,
+        heldout_games=context.heldout_games,
+        source_neighborhoods={**context.source_neighborhoods, "unknown_one": unknown_record},
+        source_roles=context.source_roles,
+        source_no_label_roles=context.source_no_label_roles,
+        target_families=context.target_families,
+        full_neighborhoods=context.full_neighborhoods,
+        full_no_label_neighborhoods=context.full_no_label_neighborhoods,
+        graph_source_used=context.graph_source_used,
+        graph_edge_coverage=context.graph_edge_coverage,
+    )
+
+    _, _, source_diag, manifest_rows = discover_source_only_candidates_fixc(
+        context=mixed_context,
+        source_role_map=source_role_map,
+        source_manifest_family_map={},
+        game_to_manifest_family={},
+        config=ConceptCandidatesV10FixCConfig(min_games=1, min_manifest_families=1),
+    )
+
+    assert source_diag["manifest_groups_created"] > 0
+    assert any(row["final_manifest_resolution"] == ["unknown_manifest_family"] for row in manifest_rows)
+
+
+def test_v10fixc_mixed_candidates_generated() -> None:
+    contexts = _build_v10fixb_fixture_contexts(include_four_role_manifest=True)
+    context = contexts[0]
+    source_role_map = build_source_role_map_fixb(context.source_roles)
+    source_role_map.pop("sa_link")
+
+    raw_rows, attrition, _, _ = discover_source_only_candidates_fixc(
+        context=context,
+        source_role_map=source_role_map,
+        source_manifest_family_map={},
+        game_to_manifest_family={"g1": "srcA", "g2": "srcA", "g3": "srcB", "g4": "srcB"},
+        config=ConceptCandidatesV10FixCConfig(min_games=1, min_manifest_families=1),
+    )
+
+    assert raw_rows
+    assert attrition["mixed_candidates_generated"] > 0
+    assert "mixed" in {row["candidate_source"] for row in raw_rows}
+
+
+def test_v10fixc_projection_rows_do_not_embed_nested_target_rows() -> None:
+    contexts = _build_v10fixb_fixture_contexts(two_target_families=True)
+    context = contexts[0]
+    source_role_map = build_source_role_map_fixb(context.source_roles)
+    raw_rows, _, _, _ = discover_source_only_candidates_fixc(
+        context=context,
+        source_role_map=source_role_map,
+        source_manifest_family_map={},
+        game_to_manifest_family={"g1": "srcA", "g2": "srcA", "g3": "srcB", "g4": "srcB"},
+        config=ConceptCandidatesV10FixCConfig(min_games=1, min_manifest_families=1),
+    )
+    merged, _ = merge_exact_candidates(raw_rows, min_games=1, min_manifest_families=1, min_role_count=2)
+    projection, detail_rows = evaluate_target_projection_by_family_fixc(
+        merged[0],
+        context,
+        [{"heldout_family": context.heldout_family, "target_family_id": "ta", "assigned_role_id": "role_block", "surface_hardened_score": 0.15, "effect_residual_score": 0.2, "future_option_role_score": 0.8, "graph_position_role_score": 0.7}],
+    )
+
+    assert "target_family_rows" not in projection
+    assert detail_rows
+
+
+def test_v10fixc_runs_streaming_and_resumes_from_shards(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+    import v6.concept_candidates_v10fixc as mod
+
+    transfer_dir, manifest = _write_v10fixb_fixture(tmp_path)
+    contexts = _build_v10fixb_fixture_contexts()
+    monkeypatch.setattr(mod, "prepare_family_context_stream", lambda config: iter(contexts))
+
+    first = run_concept_candidates_v10fixc(
+        ConceptCandidatesV10FixCConfig(
+            transfer_input_dir=str(transfer_dir),
+            output_dir=str(tmp_path / "v10fixc1"),
+            game_set_manifest=str(manifest),
+            min_games=1,
+            min_manifest_families=1,
+            write_shards=True,
+        )
+    )
+    shard_dir = tmp_path / "v10fixc1" / "shards"
+    assert (shard_dir / "raw_concept_candidates_premerge__holdA.parquet").exists()
+
+    monkeypatch.setattr(mod, "evaluate_family_fixc", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should resume from shards")))
+    resumed = run_concept_candidates_v10fixc(
+        ConceptCandidatesV10FixCConfig(
+            transfer_input_dir=str(transfer_dir),
+            output_dir=str(tmp_path / "v10fixc1"),
+            game_set_manifest=str(manifest),
+            min_games=1,
+            min_manifest_families=1,
+            write_shards=True,
+            resume_from_shards=True,
+        )
+    )
+
+    assert first["validation"]["scientific_conclusion"] == resumed["validation"]["scientific_conclusion"]
+    scores = pd.read_parquet(tmp_path / "v10fixc1" / "concept_transfer_scores_fixc.parquet")
+    details = pd.read_parquet(tmp_path / "v10fixc1" / "concept_target_family_scores_fixc.parquet")
+    assert "target_family_rows" not in scores.columns
+    assert "target_family_id" in details.columns
 
 
 def test_v08d_no_label_ablation_removes_label_features(tmp_path) -> None:

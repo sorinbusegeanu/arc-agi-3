@@ -126,6 +126,23 @@ def run_role_transfer_v09c(config: RoleTransferV09cConfig) -> dict[str, Any]:
 
 
 def prepare_family_contexts(config: RoleTransferV09cConfig) -> list[FamilyContext]:
+    state = _build_family_context_state(config)
+    tasks = state["tasks"]
+    effective_workers = choose_parallel_worker_count(config.workers, len(tasks))
+    if effective_workers <= 1 or len(tasks) <= 1:
+        return [_prepare_family_context(*task) for task in tasks]
+    with ProcessPoolExecutor(max_workers=effective_workers) as executor:
+        futures = [executor.submit(_prepare_family_context, *task) for task in tasks]
+        return sorted([future.result() for future in futures], key=lambda item: item.heldout_family)
+
+
+def prepare_family_context_stream(config: RoleTransferV09cConfig):
+    state = _build_family_context_state(config)
+    for task in state["tasks"]:
+        yield _prepare_family_context(*task)
+
+
+def _build_family_context_state(config: RoleTransferV09cConfig) -> dict[str, Any]:
     m2_families = load_m2_families(Path(config.m2_input_dir))
     game_set = load_game_set_manifest(
         manifest_path=config.game_set_manifest,
@@ -172,12 +189,11 @@ def prepare_family_contexts(config: RoleTransferV09cConfig) -> list[FamilyContex
         )
         for family_name in sorted(game_set.families)
     ]
-    effective_workers = choose_parallel_worker_count(config.workers, len(tasks))
-    if effective_workers <= 1 or len(tasks) <= 1:
-        return [_prepare_family_context(*task) for task in tasks]
-    with ProcessPoolExecutor(max_workers=effective_workers) as executor:
-        futures = [executor.submit(_prepare_family_context, *task) for task in tasks]
-        return sorted([future.result() for future in futures], key=lambda item: item.heldout_family)
+    return {
+        "tasks": tasks,
+        "game_set": game_set,
+        "m2_families": m2_families,
+    }
 
 
 def _prepare_family_context(

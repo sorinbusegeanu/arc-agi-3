@@ -40,6 +40,7 @@ from v6.role_transfer_v09c import RoleTransferV09cConfig, run_role_transfer_v09c
 from v6.concept_candidates_v10 import ConceptCandidatesV10Config, run_concept_candidates_v10
 from v6.concept_candidates_v10fix import ConceptCandidatesV10FixConfig, run_concept_candidates_v10fix
 from v6.concept_candidates_v10fixb import ConceptCandidatesV10FixBConfig, run_concept_candidates_v10fixb
+from v6.concept_candidates_v10fixc import ConceptCandidatesV10FixCConfig, run_concept_candidates_v10fixc
 from v6.storage.benchmark import run_storage_benchmark
 from v6.storage.migration import migrate_sqlite_to_parquet
 from v6.transformation_families_v07 import TransformationFamiliesV07Config, run_transformation_families_v07
@@ -382,6 +383,21 @@ def build_parser() -> argparse.ArgumentParser:
     concept_candidates_v10fix_b.add_argument("--game-set-manifest", default=None)
     concept_candidates_v10fix_b.add_argument("--game-set-name", default=None)
     concept_candidates_v10fix_b.add_argument("--workers", type=int, default=25)
+
+    concept_candidates_v10fix_c = subparsers.add_parser("concept-candidates-v10fix-c")
+    concept_candidates_v10fix_c.add_argument("--m3-input-dir", default="runs/v6/v08d_cd2_extended32_sourceclean")
+    concept_candidates_v10fix_c.add_argument("--transfer-input-dir", default="runs/v6/v09c_transfer_hardened_extended32")
+    concept_candidates_v10fix_c.add_argument("--m2-input-dir", default="runs/v6/v07_cd2_extended32_expanded")
+    concept_candidates_v10fix_c.add_argument("--m1-input-dir", default="runs/v6/v06_cd2_extended32")
+    concept_candidates_v10fix_c.add_argument("--output-dir", default="runs/v6/v10_m4_concepts_fixc_extended32")
+    concept_candidates_v10fix_c.add_argument("--game-set-manifest", default=None)
+    concept_candidates_v10fix_c.add_argument("--game-set-name", default=None)
+    concept_candidates_v10fix_c.add_argument("--workers", type=int, default=1)
+    concept_candidates_v10fix_c.add_argument("--streaming", default="true")
+    concept_candidates_v10fix_c.add_argument("--max-workers-for-context-build", type=int, default=1)
+    concept_candidates_v10fix_c.add_argument("--memory-safe", default="true")
+    concept_candidates_v10fix_c.add_argument("--write-shards", default="true")
+    concept_candidates_v10fix_c.add_argument("--resume-from-shards", default="false")
 
     migrate = subparsers.add_parser("migrate-sqlite-to-parquet")
     migrate.add_argument("--sqlite", required=True)
@@ -1006,6 +1022,37 @@ def main() -> int:
                 game_set_manifest=args.game_set_manifest,
                 game_set_name=args.game_set_name,
                 workers=args.workers,
+            )
+        )
+        print(
+            json.dumps(
+                {
+                    "output_dir": args.output_dir,
+                    "scientific_conclusion": payload["validation"]["scientific_conclusion"],
+                    "corrected_concept_candidate_count": payload["report"]["corrected_concept_candidate_count"],
+                    "corrected_transferable_concepts": payload["report"]["corrected_transferable_concepts"],
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    if args.command == "concept-candidates-v10fix-c":
+        payload = run_concept_candidates_v10fixc(
+            ConceptCandidatesV10FixCConfig(
+                m3_input_dir=args.m3_input_dir,
+                transfer_input_dir=args.transfer_input_dir,
+                m2_input_dir=args.m2_input_dir,
+                m1_input_dir=args.m1_input_dir,
+                output_dir=args.output_dir,
+                game_set_manifest=args.game_set_manifest,
+                game_set_name=args.game_set_name,
+                workers=args.workers,
+                streaming=str(args.streaming).lower() == "true",
+                max_workers_for_context_build=args.max_workers_for_context_build,
+                memory_safe=str(args.memory_safe).lower() == "true",
+                write_shards=str(args.write_shards).lower() == "true",
+                resume_from_shards=str(args.resume_from_shards).lower() == "true",
             )
         )
         print(
