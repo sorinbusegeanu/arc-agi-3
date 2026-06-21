@@ -546,7 +546,7 @@ def test_context_contradiction_tracker_repeated_contradictions_suggest_expansion
 
 
 def test_extract_carrier_signature_uses_position() -> None:
-    sig = extract_carrier_signature(
+    sig, source = extract_carrier_signature(
         before_observation=None,
         after_observation=None,
         delta={"position": [3, 4]},
@@ -557,10 +557,11 @@ def test_extract_carrier_signature_uses_position() -> None:
     assert sig is not None
     assert "3" in sig
     assert "4" in sig
+    assert source == "cell"
 
 
 def test_extract_carrier_signature_falls_back_to_context_action() -> None:
-    sig = extract_carrier_signature(
+    sig, source = extract_carrier_signature(
         before_observation=None,
         after_observation=None,
         delta={},
@@ -569,6 +570,7 @@ def test_extract_carrier_signature_falls_back_to_context_action() -> None:
     )
 
     assert sig == "context_action:ctx1|a1"
+    assert source == "context_action_fallback"
 
 
 def test_carrier_tracker_records_event() -> None:
@@ -582,10 +584,12 @@ def test_carrier_tracker_records_event() -> None:
         family_id="f1",
         delta_signature="d1",
         prediction_correct=True,
+        carrier_source="cell",
     )
 
     assert event is not None
     assert len(tracker.events) == 1
+    assert event.carrier_source == "cell"
 
 
 def test_carrier_tracker_emergent_threshold() -> None:
@@ -604,6 +608,7 @@ def test_carrier_tracker_emergent_threshold() -> None:
         family_id="f1",
         delta_signature="d1",
         prediction_correct=True,
+        carrier_source="cell",
     )
     tracker.record_interaction(
         interaction_id="i2",
@@ -613,6 +618,7 @@ def test_carrier_tracker_emergent_threshold() -> None:
         family_id="f1",
         delta_signature="d2",
         prediction_correct=True,
+        carrier_source="cell",
     )
     tracker.record_interaction(
         interaction_id="i3",
@@ -622,6 +628,7 @@ def test_carrier_tracker_emergent_threshold() -> None:
         family_id="f1",
         delta_signature="d3",
         prediction_correct=True,
+        carrier_source="cell",
     )
 
     assert any(candidate.status == "emergent_carrier" for candidate in tracker.build_candidates())
@@ -642,6 +649,59 @@ def test_carrier_tracker_ignores_missing_signature() -> None:
 
     assert event is None
     assert len(tracker.events) == 0
+
+
+def test_carrier_tracker_context_action_fallback_cannot_become_emergent() -> None:
+    tracker = CarrierEmergenceTracker(
+        min_support=2,
+        min_distinct_contexts=1,
+        min_prediction_lift=0.0,
+        min_compression_gain=0.0,
+    )
+
+    for index in range(3):
+        tracker.record_interaction(
+            interaction_id=f"i{index}",
+            carrier_signature="context_action:ctx|a1",
+            context_signature=f"ctx{index}",
+            action_signature="a1",
+            family_id="f1",
+            delta_signature=f"d{index}",
+            prediction_correct=True,
+            carrier_source="context_action_fallback",
+        )
+
+    candidates = tracker.build_candidates()
+
+    assert candidates[0].status == "contextual_fallback_candidate"
+    assert candidates[0].carrier_source == "context_action_fallback"
+    assert not any(candidate.status == "emergent_carrier" for candidate in candidates)
+
+
+def test_carrier_tracker_cell_source_can_still_become_emergent() -> None:
+    tracker = CarrierEmergenceTracker(
+        min_support=2,
+        min_distinct_contexts=1,
+        min_prediction_lift=0.0,
+        min_compression_gain=0.0,
+    )
+
+    for index in range(3):
+        tracker.record_interaction(
+            interaction_id=f"i{index}",
+            carrier_signature="position:1,2",
+            context_signature=f"ctx{index}",
+            action_signature="a1",
+            family_id="f1",
+            delta_signature=f"d{index}",
+            prediction_correct=True,
+            carrier_source="cell",
+        )
+
+    candidates = tracker.build_candidates()
+
+    assert any(candidate.status == "emergent_carrier" for candidate in candidates)
+    assert any(candidate.carrier_source == "cell" for candidate in candidates)
 
 
 def test_memory_lifecycle_high_isf_becomes_protected() -> None:
@@ -1047,6 +1107,45 @@ def test_v05c_future_option_delta_lookup_missing_future_effects_table(tmp_path) 
         connection.commit()
 
     assert _future_option_deltas_by_interaction_id(db_path, horizon=2) == {}
+
+
+def test_carrier_source_is_stored_in_sqlite_stores(tmp_path) -> None:
+    db_path = tmp_path / "carrier_source.sqlite"
+    with sqlite3.connect(db_path) as connection:
+        interaction_store = InteractionStore(connection)
+        contingency_store = ContingencyStore(connection)
+        interaction_store.add(
+            Interaction(
+                id=1,
+                timestamp=1,
+                observation_before=np.zeros((2, 2), dtype=int),
+                action=1,
+                observation_after=np.ones((2, 2), dtype=int),
+                delta_id=1,
+                carrier_signature="position:1,2",
+                carrier_source="cell",
+            )
+        )
+        contingency_store.add_prediction_result(
+            interaction_id=1,
+            context_signature=(1,),
+            action=1,
+            predicted_family=1,
+            actual_family=1,
+            carrier_signature="position:1,2",
+            carrier_source="cell",
+        )
+        interaction_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(interactions)").fetchall()}
+        prediction_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(prediction_results)").fetchall()}
+        interaction_source = connection.execute("SELECT carrier_source FROM interactions WHERE id = 1").fetchone()[0]
+        prediction_source = connection.execute(
+            "SELECT carrier_source FROM prediction_results WHERE interaction_id = 1"
+        ).fetchone()[0]
+
+    assert "carrier_source" in interaction_columns
+    assert "carrier_source" in prediction_columns
+    assert interaction_source == "cell"
+    assert prediction_source == "cell"
 
 
 def test_interaction_significance_learning_value_drops_with_high_prior_counts() -> None:
@@ -6081,6 +6180,14 @@ def test_v05c_run_sampling_job_uses_context_depth_for_v6_config(tmp_path, monkey
     assert captured["metadata"]["context_length"] == 4
     assert "carrier_candidate_count" in captured["metadata"]
     assert "emergent_carrier_count" in captured["metadata"]
+    assert "carrier_spatial_candidate_count" in captured["metadata"]
+    assert "carrier_object_candidate_count" in captured["metadata"]
+    assert "carrier_cell_candidate_count" in captured["metadata"]
+    assert "carrier_context_action_fallback_candidate_count" in captured["metadata"]
+    assert "emergent_spatial_carrier_count" in captured["metadata"]
+    assert "emergent_object_carrier_count" in captured["metadata"]
+    assert "emergent_cell_carrier_count" in captured["metadata"]
+    assert "emergent_context_action_fallback_count" in captured["metadata"]
     assert "carrier_event_count" in captured["metadata"]
     assert "carrier_max_support" in captured["metadata"]
     assert "memory_record_count" in captured["metadata"]

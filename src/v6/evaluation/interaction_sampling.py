@@ -340,6 +340,28 @@ def _run_sampling_job(job: dict) -> dict:
         repeated_contradiction_count=int(contradiction_summary.get("repeated_contradiction_count", 0) or 0),
         carrier_candidate_count=len(carrier_candidates),
         emergent_carrier_count=sum(1 for item in carrier_candidates if getattr(item, "status", "") == "emergent_carrier"),
+        carrier_spatial_candidate_count=sum(1 for item in carrier_candidates if getattr(item, "carrier_source", "") == "spatial"),
+        carrier_object_candidate_count=sum(1 for item in carrier_candidates if getattr(item, "carrier_source", "") == "object"),
+        carrier_cell_candidate_count=sum(1 for item in carrier_candidates if getattr(item, "carrier_source", "") == "cell"),
+        carrier_context_action_fallback_candidate_count=sum(
+            1 for item in carrier_candidates if getattr(item, "carrier_source", "") == "context_action_fallback"
+        ),
+        emergent_spatial_carrier_count=sum(
+            1
+            for item in carrier_candidates
+            if getattr(item, "status", "") == "emergent_carrier" and getattr(item, "carrier_source", "") == "spatial"
+        ),
+        emergent_object_carrier_count=sum(
+            1
+            for item in carrier_candidates
+            if getattr(item, "status", "") == "emergent_carrier" and getattr(item, "carrier_source", "") == "object"
+        ),
+        emergent_cell_carrier_count=sum(
+            1
+            for item in carrier_candidates
+            if getattr(item, "status", "") == "emergent_carrier" and getattr(item, "carrier_source", "") == "cell"
+        ),
+        emergent_context_action_fallback_count=0,
         carrier_event_count=sum(int(getattr(item, "support_count", 0) or 0) for item in carrier_candidates),
         carrier_max_support=max((int(getattr(item, "support_count", 0) or 0) for item in carrier_candidates), default=0),
         carrier_mean_support=float(np.mean([float(getattr(item, "support_count", 0) or 0.0) for item in carrier_candidates])) if carrier_candidates else 0.0,
@@ -409,11 +431,11 @@ def _evaluate_sampling_runs(config: InteractionSamplingConfig, sampling_root: Pa
 
 def _run_metrics(path: Path, game: str, sampler_name: str, seed: int, config: InteractionSamplingConfig) -> dict:
     diagnostics = compute_run_diagnostics(path, game=game, seed=seed, steps=config.steps, horizon=config.horizon)
-    metadata = _read_sampling_metadata(path)
-    diagnostics.update(metadata)
     diagnostics.update(_read_isf_metrics(path))
     diagnostics.update(_read_context_contradiction_metrics(path))
     diagnostics.update(_read_memory_lifecycle_metrics(path))
+    metadata = _read_sampling_metadata(path)
+    diagnostics.update(metadata)
     diagnostics.update(_read_efficiency_metrics(path))
     diagnostics["sampler_name"] = sampler_name
     return diagnostics
@@ -504,6 +526,14 @@ def _aggregate_seed_rows(seed_rows: list[dict], config: InteractionSamplingConfi
             "context_expansion_suggested_count",
             "carrier_candidate_count",
             "emergent_carrier_count",
+            "carrier_spatial_candidate_count",
+            "carrier_object_candidate_count",
+            "carrier_cell_candidate_count",
+            "carrier_context_action_fallback_candidate_count",
+            "emergent_spatial_carrier_count",
+            "emergent_object_carrier_count",
+            "emergent_cell_carrier_count",
+            "emergent_context_action_fallback_count",
             "carrier_event_count",
             "carrier_max_support",
             "memory_record_count",
@@ -572,6 +602,14 @@ def _aggregate_seed_rows(seed_rows: list[dict], config: InteractionSamplingConfi
         "max_suggested_context_depth": float(max((row.get("max_suggested_context_depth", 0.0) or 0.0 for row in seed_rows))),
         "carrier_candidate_count": sums["carrier_candidate_count"],
         "emergent_carrier_count": sums["emergent_carrier_count"],
+        "carrier_spatial_candidate_count": sums["carrier_spatial_candidate_count"],
+        "carrier_object_candidate_count": sums["carrier_object_candidate_count"],
+        "carrier_cell_candidate_count": sums["carrier_cell_candidate_count"],
+        "carrier_context_action_fallback_candidate_count": sums["carrier_context_action_fallback_candidate_count"],
+        "emergent_spatial_carrier_count": sums["emergent_spatial_carrier_count"],
+        "emergent_object_carrier_count": sums["emergent_object_carrier_count"],
+        "emergent_cell_carrier_count": sums["emergent_cell_carrier_count"],
+        "emergent_context_action_fallback_count": sums["emergent_context_action_fallback_count"],
         "carrier_event_count": sums["carrier_event_count"],
         "carrier_max_support": sums["carrier_max_support"],
         "carrier_mean_support": float(np.mean([row.get("carrier_mean_support", 0.0) or 0.0 for row in seed_rows])),
@@ -725,6 +763,14 @@ def validation_summary(rows: list[dict], comparison: list[dict], best_rows: list
             "max_suggested_context_depth": None,
             "carrier_candidate_count": 0,
             "emergent_carrier_count": 0,
+            "carrier_spatial_candidate_count": 0,
+            "carrier_object_candidate_count": 0,
+            "carrier_cell_candidate_count": 0,
+            "carrier_context_action_fallback_candidate_count": 0,
+            "emergent_spatial_carrier_count": 0,
+            "emergent_object_carrier_count": 0,
+            "emergent_cell_carrier_count": 0,
+            "emergent_context_action_fallback_count": 0,
             "carrier_event_count": 0,
             "carrier_max_support": 0,
             "carrier_mean_support": None,
@@ -814,6 +860,18 @@ def validation_summary(rows: list[dict], comparison: list[dict], best_rows: list
         "max_suggested_context_depth": float(max((row.get("max_suggested_context_depth", 0.0) or 0.0 for row in ok_rows))) if ok_rows else None,
         "carrier_candidate_count": int(sum(int(row.get("carrier_candidate_count", 0) or 0) for row in ok_rows)),
         "emergent_carrier_count": int(sum(int(row.get("emergent_carrier_count", 0) or 0) for row in ok_rows)),
+        "carrier_spatial_candidate_count": int(sum(int(row.get("carrier_spatial_candidate_count", 0) or 0) for row in ok_rows)),
+        "carrier_object_candidate_count": int(sum(int(row.get("carrier_object_candidate_count", 0) or 0) for row in ok_rows)),
+        "carrier_cell_candidate_count": int(sum(int(row.get("carrier_cell_candidate_count", 0) or 0) for row in ok_rows)),
+        "carrier_context_action_fallback_candidate_count": int(
+            sum(int(row.get("carrier_context_action_fallback_candidate_count", 0) or 0) for row in ok_rows)
+        ),
+        "emergent_spatial_carrier_count": int(sum(int(row.get("emergent_spatial_carrier_count", 0) or 0) for row in ok_rows)),
+        "emergent_object_carrier_count": int(sum(int(row.get("emergent_object_carrier_count", 0) or 0) for row in ok_rows)),
+        "emergent_cell_carrier_count": int(sum(int(row.get("emergent_cell_carrier_count", 0) or 0) for row in ok_rows)),
+        "emergent_context_action_fallback_count": int(
+            sum(int(row.get("emergent_context_action_fallback_count", 0) or 0) for row in ok_rows)
+        ),
         "carrier_event_count": int(sum(int(row.get("carrier_event_count", 0) or 0) for row in ok_rows)),
         "carrier_max_support": int(max((row.get("carrier_max_support", 0) or 0) for row in ok_rows)) if ok_rows else 0,
         "carrier_mean_support": float(np.mean([row.get("carrier_mean_support", 0.0) or 0.0 for row in ok_rows])) if ok_rows else None,
@@ -1008,6 +1066,14 @@ def _default_isf_metrics() -> dict:
         "max_suggested_context_depth": 0.0,
         "carrier_candidate_count": 0,
         "emergent_carrier_count": 0,
+        "carrier_spatial_candidate_count": 0,
+        "carrier_object_candidate_count": 0,
+        "carrier_cell_candidate_count": 0,
+        "carrier_context_action_fallback_candidate_count": 0,
+        "emergent_spatial_carrier_count": 0,
+        "emergent_object_carrier_count": 0,
+        "emergent_cell_carrier_count": 0,
+        "emergent_context_action_fallback_count": 0,
         "carrier_event_count": 0,
         "carrier_max_support": 0,
         "carrier_mean_support": 0.0,
@@ -1059,6 +1125,14 @@ def _read_context_contradiction_metrics(path: Path) -> dict:
         "max_suggested_context_depth": 0.0,
         "carrier_candidate_count": 0,
         "emergent_carrier_count": 0,
+        "carrier_spatial_candidate_count": 0,
+        "carrier_object_candidate_count": 0,
+        "carrier_cell_candidate_count": 0,
+        "carrier_context_action_fallback_candidate_count": 0,
+        "emergent_spatial_carrier_count": 0,
+        "emergent_object_carrier_count": 0,
+        "emergent_cell_carrier_count": 0,
+        "emergent_context_action_fallback_count": 0,
         "carrier_event_count": 0,
         "carrier_max_support": 0,
         "carrier_mean_support": 0.0,
@@ -1399,6 +1473,14 @@ def _failed_row(game: str, sampler_name: str, config: InteractionSamplingConfig,
         "max_suggested_context_depth": 0.0,
         "carrier_candidate_count": 0,
         "emergent_carrier_count": 0,
+        "carrier_spatial_candidate_count": 0,
+        "carrier_object_candidate_count": 0,
+        "carrier_cell_candidate_count": 0,
+        "carrier_context_action_fallback_candidate_count": 0,
+        "emergent_spatial_carrier_count": 0,
+        "emergent_object_carrier_count": 0,
+        "emergent_cell_carrier_count": 0,
+        "emergent_context_action_fallback_count": 0,
         "carrier_event_count": 0,
         "carrier_max_support": 0,
         "carrier_mean_support": 0.0,

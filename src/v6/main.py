@@ -218,7 +218,7 @@ class V6System:
             memory_counts=memory_counts,
             graph_counts=isf_graph_counts,
         )
-        carrier_signature = extract_carrier_signature(
+        carrier_signature, carrier_source = extract_carrier_signature(
             before_observation=observation_before,
             after_observation=observation_after,
             delta=delta,
@@ -233,12 +233,14 @@ class V6System:
             family_id=actual_family_id,
             delta_signature=getattr(delta, "signature", None) or getattr(delta, "delta_id", None) or str(delta),
             prediction_correct=prediction_correct,
+            carrier_source=carrier_source,
         )
         carrier_stats = (
             self.carrier_tracker.stats_for_carrier(carrier_signature)
             if carrier_signature is not None
             else {
                 "carrier_signature": None,
+                "carrier_source": carrier_source,
                 "carrier_support_count": None,
                 "carrier_distinct_family_count": None,
                 "carrier_distinct_context_count": None,
@@ -326,6 +328,7 @@ class V6System:
             suggested_context_depth=suggested_context_depth,
             context_contradiction_reason=context_contradiction_reason,
             carrier_signature=carrier_signature,
+            carrier_source=carrier_source,
             carrier_event_recorded=carrier_event is not None,
             carrier_support_count=carrier_stats["carrier_support_count"],
             carrier_distinct_family_count=carrier_stats["carrier_distinct_family_count"],
@@ -363,6 +366,7 @@ class V6System:
             isf_explanatory_potential=isf_score.explanatory_potential,
             isf_weights_json=json.dumps(isf_score.weights, sort_keys=True),
             carrier_signature=carrier_signature,
+            carrier_source=carrier_source,
             carrier_event_recorded=carrier_event is not None,
             carrier_support_count=carrier_stats["carrier_support_count"],
             carrier_distinct_family_count=carrier_stats["carrier_distinct_family_count"],
@@ -397,6 +401,7 @@ class V6System:
                 isf_explanatory_potential = ?,
                 isf_weights_json = ?,
                 carrier_signature = ?,
+                carrier_source = ?,
                 carrier_event_recorded = ?,
                 carrier_support_count = ?,
                 carrier_distinct_family_count = ?,
@@ -429,6 +434,7 @@ class V6System:
                 interaction.isf_explanatory_potential,
                 interaction.isf_weights_json,
                 interaction.carrier_signature,
+                interaction.carrier_source,
                 int(bool(interaction.carrier_event_recorded)),
                 interaction.carrier_support_count,
                 interaction.carrier_distinct_family_count,

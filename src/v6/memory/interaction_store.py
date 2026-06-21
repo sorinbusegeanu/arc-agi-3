@@ -24,6 +24,7 @@ class Interaction:
     isf_explanatory_potential: float | None = None
     isf_weights_json: str | None = None
     carrier_signature: str | None = None
+    carrier_source: str = "unknown"
     carrier_event_recorded: bool = False
     carrier_support_count: int | None = None
     carrier_distinct_family_count: int | None = None
@@ -81,6 +82,7 @@ class InteractionStore:
                 isf_explanatory_potential REAL,
                 isf_weights_json TEXT,
                 carrier_signature TEXT,
+                carrier_source TEXT,
                 carrier_event_recorded INTEGER,
                 carrier_support_count INTEGER,
                 carrier_distinct_family_count INTEGER,
@@ -113,6 +115,7 @@ class InteractionStore:
         self._ensure_column("isf_explanatory_potential", "REAL")
         self._ensure_column("isf_weights_json", "TEXT")
         self._ensure_column("carrier_signature", "TEXT")
+        self._ensure_column("carrier_source", "TEXT NOT NULL DEFAULT 'unknown'")
         self._ensure_column("carrier_event_recorded", "INTEGER")
         self._ensure_column("carrier_support_count", "INTEGER")
         self._ensure_column("carrier_distinct_family_count", "INTEGER")
@@ -164,6 +167,7 @@ class InteractionStore:
                 isf_explanatory_potential,
                 isf_weights_json,
                 carrier_signature,
+                carrier_source,
                 carrier_event_recorded,
                 carrier_support_count,
                 carrier_distinct_family_count,
@@ -185,7 +189,7 @@ class InteractionStore:
                 efficiency_equivalent_outcome_cost_gap,
                 efficiency_future_option_gain_per_cost
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 int(interaction.id),
@@ -203,6 +207,7 @@ class InteractionStore:
                 None if interaction.isf_explanatory_potential is None else float(interaction.isf_explanatory_potential),
                 interaction.isf_weights_json,
                 interaction.carrier_signature,
+                str(interaction.carrier_source or "unknown"),
                 int(bool(interaction.carrier_event_recorded)),
                 None if interaction.carrier_support_count is None else int(interaction.carrier_support_count),
                 None if interaction.carrier_distinct_family_count is None else int(interaction.carrier_distinct_family_count),
@@ -247,6 +252,7 @@ class InteractionStore:
                 isf_explanatory_potential,
                 isf_weights_json,
                 carrier_signature,
+                carrier_source,
                 carrier_event_recorded,
                 carrier_support_count,
                 carrier_distinct_family_count,
@@ -290,26 +296,27 @@ class InteractionStore:
             isf_explanatory_potential=None if row[12] is None else float(row[12]),
             isf_weights_json=None if row[13] is None else str(row[13]),
             carrier_signature=None if row[14] is None else str(row[14]),
-            carrier_event_recorded=bool(row[15]) if row[15] is not None else False,
-            carrier_support_count=None if row[16] is None else int(row[16]),
-            carrier_distinct_family_count=None if row[17] is None else int(row[17]),
-            carrier_distinct_context_count=None if row[18] is None else int(row[18]),
-            memory_status=None if row[19] is None else str(row[19]),
-            memory_retention_reason=None if row[20] is None else str(row[20]),
-            memory_replay_priority=0.0 if row[21] is None else float(row[21]),
-            memory_replay_candidate=bool(row[22]) if row[22] is not None else False,
-            memory_replay_count=0 if row[23] is None else int(row[23]),
-            efficiency_action_cost=None if row[24] is None else float(row[24]),
-            efficiency_cumulative_cost=None if row[25] is None else float(row[25]),
-            efficiency_repeated_state=bool(row[26]) if row[26] is not None else False,
-            efficiency_repeated_context_action=bool(row[27]) if row[27] is not None else False,
-            efficiency_no_effect_action=bool(row[28]) if row[28] is not None else False,
-            efficiency_terminal_outcome=bool(row[29]) if row[29] is not None else False,
-            efficiency_outcome_signature=None if row[30] is None else str(row[30]),
-            efficiency_best_known_cost_for_outcome=None if row[31] is None else float(row[31]),
-            efficiency_normalized_solve_efficiency=None if row[32] is None else float(row[32]),
-            efficiency_equivalent_outcome_cost_gap=None if row[33] is None else float(row[33]),
-            efficiency_future_option_gain_per_cost=None if row[34] is None else float(row[34]),
+            carrier_source="unknown" if row[15] is None else str(row[15]),
+            carrier_event_recorded=bool(row[16]) if row[16] is not None else False,
+            carrier_support_count=None if row[17] is None else int(row[17]),
+            carrier_distinct_family_count=None if row[18] is None else int(row[18]),
+            carrier_distinct_context_count=None if row[19] is None else int(row[19]),
+            memory_status=None if row[20] is None else str(row[20]),
+            memory_retention_reason=None if row[21] is None else str(row[21]),
+            memory_replay_priority=0.0 if row[22] is None else float(row[22]),
+            memory_replay_candidate=bool(row[23]) if row[23] is not None else False,
+            memory_replay_count=0 if row[24] is None else int(row[24]),
+            efficiency_action_cost=None if row[25] is None else float(row[25]),
+            efficiency_cumulative_cost=None if row[26] is None else float(row[26]),
+            efficiency_repeated_state=bool(row[27]) if row[27] is not None else False,
+            efficiency_repeated_context_action=bool(row[28]) if row[28] is not None else False,
+            efficiency_no_effect_action=bool(row[29]) if row[29] is not None else False,
+            efficiency_terminal_outcome=bool(row[30]) if row[30] is not None else False,
+            efficiency_outcome_signature=None if row[31] is None else str(row[31]),
+            efficiency_best_known_cost_for_outcome=None if row[32] is None else float(row[32]),
+            efficiency_normalized_solve_efficiency=None if row[33] is None else float(row[33]),
+            efficiency_equivalent_outcome_cost_gap=None if row[34] is None else float(row[34]),
+            efficiency_future_option_gain_per_cost=None if row[35] is None else float(row[35]),
         )
 
     def count(self) -> int:

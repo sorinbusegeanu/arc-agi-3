@@ -52,6 +52,7 @@ class ContingencyStore:
                 suggested_context_depth INTEGER,
                 context_contradiction_reason TEXT,
                 carrier_signature TEXT,
+                carrier_source TEXT,
                 carrier_event_recorded INTEGER,
                 carrier_support_count INTEGER,
                 carrier_distinct_family_count INTEGER,
@@ -92,6 +93,7 @@ class ContingencyStore:
         self._ensure_column("prediction_results", "suggested_context_depth", "INTEGER")
         self._ensure_column("prediction_results", "context_contradiction_reason", "TEXT")
         self._ensure_column("prediction_results", "carrier_signature", "TEXT")
+        self._ensure_column("prediction_results", "carrier_source", "TEXT NOT NULL DEFAULT 'unknown'")
         self._ensure_column("prediction_results", "carrier_event_recorded", "INTEGER")
         self._ensure_column("prediction_results", "carrier_support_count", "INTEGER")
         self._ensure_column("prediction_results", "carrier_distinct_family_count", "INTEGER")
@@ -178,6 +180,7 @@ class ContingencyStore:
         suggested_context_depth: int | None = None,
         context_contradiction_reason: str | None = None,
         carrier_signature: str | None = None,
+        carrier_source: str = "unknown",
         carrier_event_recorded: bool = False,
         carrier_support_count: int | None = None,
         carrier_distinct_family_count: int | None = None,
@@ -229,6 +232,7 @@ class ContingencyStore:
                 suggested_context_depth,
                 context_contradiction_reason,
                 carrier_signature,
+                carrier_source,
                 carrier_event_recorded,
                 carrier_support_count,
                 carrier_distinct_family_count,
@@ -250,7 +254,7 @@ class ContingencyStore:
                 efficiency_equivalent_outcome_cost_gap,
                 efficiency_future_option_gain_per_cost
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 int(interaction_id),
@@ -275,6 +279,7 @@ class ContingencyStore:
                 None if suggested_context_depth is None else int(suggested_context_depth),
                 context_contradiction_reason,
                 carrier_signature,
+                str(carrier_source or "unknown"),
                 int(bool(carrier_event_recorded)),
                 None if carrier_support_count is None else int(carrier_support_count),
                 None if carrier_distinct_family_count is None else int(carrier_distinct_family_count),

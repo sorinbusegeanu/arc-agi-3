@@ -9,6 +9,7 @@ from typing import Any, Iterable, Mapping
 class CarrierCandidate:
     carrier_id: str
     carrier_signature: str
+    carrier_source: str
     context_signature: str | None
     action_signature: str | None
     family_id: str | None
@@ -28,6 +29,7 @@ class CarrierCandidate:
 class CarrierEvidenceEvent:
     interaction_id: str
     carrier_signature: str
+    carrier_source: str
     context_signature: str | None
     action_signature: str | None
     family_id: str | None
@@ -69,12 +71,14 @@ class CarrierEmergenceTracker:
         family_id: str | None,
         delta_signature: str | None,
         prediction_correct: bool | None,
+        carrier_source: str = "unknown",
     ) -> CarrierEvidenceEvent | None:
         if carrier_signature is None:
             return None
         event = CarrierEvidenceEvent(
             interaction_id=str(interaction_id),
             carrier_signature=str(carrier_signature),
+            carrier_source=str(carrier_source),
             context_signature=None if context_signature is None else str(context_signature),
             action_signature=None if action_signature is None else str(action_signature),
             family_id=None if family_id is None else str(family_id),
@@ -101,6 +105,7 @@ class CarrierEmergenceTracker:
         candidate = self._build_candidate(str(carrier_signature))
         return {
             "carrier_signature": candidate.carrier_signature,
+            "carrier_source": candidate.carrier_source,
             "carrier_support_count": candidate.support_count,
             "carrier_distinct_family_count": candidate.distinct_family_count,
             "carrier_distinct_context_count": candidate.distinct_context_count,
@@ -117,6 +122,8 @@ class CarrierEmergenceTracker:
         family_id = family_counter.most_common(1)[0][0] if family_counter else None
         distinct_family_count = len(family_counter)
         distinct_context_count = len(context_counter)
+        source_counter = Counter(event.carrier_source for event in events)
+        carrier_source = source_counter.most_common(1)[0][0] if source_counter else "unknown"
         carrier_predictions = max(1, int(self.prediction_with_carrier.get(str(carrier_signature), 0)))
         carrier_accuracy = float(self.correct_with_carrier.get(str(carrier_signature), 0)) / carrier_predictions
         family_predictions = max(1, int(self.prediction_without_carrier.get(str(family_id), 0))) if family_id is not None else 1
@@ -124,7 +131,9 @@ class CarrierEmergenceTracker:
         prediction_lift = carrier_accuracy - family_accuracy
         compression_gain = max(0.0, 1.0 - (float(distinct_family_count) / max(1, support_count)))
         status = "candidate"
-        if (
+        if carrier_source == "context_action_fallback":
+            status = "contextual_fallback_candidate"
+        elif (
             support_count >= self.min_support
             and distinct_context_count >= self.min_distinct_contexts
             and prediction_lift >= self.min_prediction_lift
@@ -135,6 +144,7 @@ class CarrierEmergenceTracker:
         return CarrierCandidate(
             carrier_id=f"carrier:{carrier_signature}",
             carrier_signature=str(carrier_signature),
+            carrier_source=carrier_source,
             context_signature=None if first is None else first.context_signature,
             action_signature=None if first is None else first.action_signature,
             family_id=family_id,
@@ -155,24 +165,27 @@ def extract_carrier_signature(
     delta: Any,
     context_signature: str | None,
     action_signature: str | None,
-) -> str | None:
+) -> tuple[str | None, str]:
     del before_observation, after_observation
-    for key in ("object_id", "entity_id", "cell_id"):
+    for key in ("object_id", "entity_id"):
         value = _lookup(delta, key)
         if value is not None:
-            return f"{key}:{value}"
+            return f"{key}:{value}", "object"
+    value = _lookup(delta, "cell_id")
+    if value is not None:
+        return f"cell_id:{value}", "cell"
     for key in ("position", "source_position", "target_position", "changed_position"):
         value = _lookup(delta, key)
         position = _position_signature(value)
         if position is not None:
-            return f"{key}:{position}"
+            return f"{key}:{position}", "cell"
     positions = _positions_from_delta(delta)
     if positions:
         limited = positions[:8]
-        return "cells:" + ";".join(f"({y},{x})" for y, x in limited)
+        return "cells:" + ";".join(f"({y},{x})" for y, x in limited), "spatial"
     if context_signature is not None or action_signature is not None:
-        return f"context_action:{context_signature}|{action_signature}"
-    return None
+        return f"context_action:{context_signature}|{action_signature}", "context_action_fallback"
+    return None, "unknown"
 
 
 def _lookup(value: Any, key: str) -> Any:
