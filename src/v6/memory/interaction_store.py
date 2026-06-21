@@ -34,6 +34,9 @@ class Interaction:
     memory_replay_priority: float = 0.0
     memory_replay_candidate: bool = False
     memory_replay_count: int = 0
+    context_depth_used: int | None = None
+    adaptive_context_expansion_applied: bool = False
+    adaptive_context_depth_after: int | None = None
     efficiency_action_cost: float | None = None
     efficiency_cumulative_cost: float | None = None
     efficiency_repeated_state: bool = False
@@ -92,6 +95,9 @@ class InteractionStore:
                 memory_replay_priority REAL,
                 memory_replay_candidate INTEGER,
                 memory_replay_count INTEGER,
+                context_depth_used INTEGER,
+                adaptive_context_expansion_applied INTEGER,
+                adaptive_context_depth_after INTEGER,
                 efficiency_action_cost REAL,
                 efficiency_cumulative_cost REAL,
                 efficiency_repeated_state INTEGER,
@@ -125,6 +131,9 @@ class InteractionStore:
         self._ensure_column("memory_replay_priority", "REAL")
         self._ensure_column("memory_replay_candidate", "INTEGER")
         self._ensure_column("memory_replay_count", "INTEGER")
+        self._ensure_column("context_depth_used", "INTEGER")
+        self._ensure_column("adaptive_context_expansion_applied", "INTEGER")
+        self._ensure_column("adaptive_context_depth_after", "INTEGER")
         self._ensure_column("efficiency_action_cost", "REAL")
         self._ensure_column("efficiency_cumulative_cost", "REAL")
         self._ensure_column("efficiency_repeated_state", "INTEGER")
@@ -177,6 +186,9 @@ class InteractionStore:
                 memory_replay_priority,
                 memory_replay_candidate,
                 memory_replay_count,
+                context_depth_used,
+                adaptive_context_expansion_applied,
+                adaptive_context_depth_after,
                 efficiency_action_cost,
                 efficiency_cumulative_cost,
                 efficiency_repeated_state,
@@ -189,7 +201,7 @@ class InteractionStore:
                 efficiency_equivalent_outcome_cost_gap,
                 efficiency_future_option_gain_per_cost
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 int(interaction.id),
@@ -217,6 +229,9 @@ class InteractionStore:
                 float(interaction.memory_replay_priority),
                 int(bool(interaction.memory_replay_candidate)),
                 int(interaction.memory_replay_count),
+                None if interaction.context_depth_used is None else int(interaction.context_depth_used),
+                int(bool(interaction.adaptive_context_expansion_applied)),
+                None if interaction.adaptive_context_depth_after is None else int(interaction.adaptive_context_depth_after),
                 None if interaction.efficiency_action_cost is None else float(interaction.efficiency_action_cost),
                 None if interaction.efficiency_cumulative_cost is None else float(interaction.efficiency_cumulative_cost),
                 int(bool(interaction.efficiency_repeated_state)),
@@ -262,6 +277,9 @@ class InteractionStore:
                 memory_replay_priority,
                 memory_replay_candidate,
                 memory_replay_count,
+                context_depth_used,
+                adaptive_context_expansion_applied,
+                adaptive_context_depth_after,
                 efficiency_action_cost,
                 efficiency_cumulative_cost,
                 efficiency_repeated_state,
@@ -306,17 +324,20 @@ class InteractionStore:
             memory_replay_priority=0.0 if row[22] is None else float(row[22]),
             memory_replay_candidate=bool(row[23]) if row[23] is not None else False,
             memory_replay_count=0 if row[24] is None else int(row[24]),
-            efficiency_action_cost=None if row[25] is None else float(row[25]),
-            efficiency_cumulative_cost=None if row[26] is None else float(row[26]),
-            efficiency_repeated_state=bool(row[27]) if row[27] is not None else False,
-            efficiency_repeated_context_action=bool(row[28]) if row[28] is not None else False,
-            efficiency_no_effect_action=bool(row[29]) if row[29] is not None else False,
-            efficiency_terminal_outcome=bool(row[30]) if row[30] is not None else False,
-            efficiency_outcome_signature=None if row[31] is None else str(row[31]),
-            efficiency_best_known_cost_for_outcome=None if row[32] is None else float(row[32]),
-            efficiency_normalized_solve_efficiency=None if row[33] is None else float(row[33]),
-            efficiency_equivalent_outcome_cost_gap=None if row[34] is None else float(row[34]),
-            efficiency_future_option_gain_per_cost=None if row[35] is None else float(row[35]),
+            context_depth_used=None if row[25] is None else int(row[25]),
+            adaptive_context_expansion_applied=bool(row[26]) if row[26] is not None else False,
+            adaptive_context_depth_after=None if row[27] is None else int(row[27]),
+            efficiency_action_cost=None if row[28] is None else float(row[28]),
+            efficiency_cumulative_cost=None if row[29] is None else float(row[29]),
+            efficiency_repeated_state=bool(row[30]) if row[30] is not None else False,
+            efficiency_repeated_context_action=bool(row[31]) if row[31] is not None else False,
+            efficiency_no_effect_action=bool(row[32]) if row[32] is not None else False,
+            efficiency_terminal_outcome=bool(row[33]) if row[33] is not None else False,
+            efficiency_outcome_signature=None if row[34] is None else str(row[34]),
+            efficiency_best_known_cost_for_outcome=None if row[35] is None else float(row[35]),
+            efficiency_normalized_solve_efficiency=None if row[36] is None else float(row[36]),
+            efficiency_equivalent_outcome_cost_gap=None if row[37] is None else float(row[37]),
+            efficiency_future_option_gain_per_cost=None if row[38] is None else float(row[38]),
         )
 
     def count(self) -> int:

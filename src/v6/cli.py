@@ -48,6 +48,15 @@ from v6.storage.migration import migrate_sqlite_to_parquet
 from v6.transformation_families_v07 import TransformationFamiliesV07Config, run_transformation_families_v07
 
 
+def _parse_bool(value: str) -> bool:
+    lowered = str(value).strip().lower()
+    if lowered in {"true", "1", "yes", "y"}:
+        return True
+    if lowered in {"false", "0", "no", "n"}:
+        return False
+    raise argparse.ArgumentTypeError(f"invalid boolean value: {value}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run ARC-AGI3 v6 v0.1")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -214,6 +223,8 @@ def build_parser() -> argparse.ArgumentParser:
     sampling.add_argument("--steps", type=int, default=30000)
     sampling.add_argument("--horizon", type=int, default=10)
     sampling.add_argument("--context-depth", type=int, default=1)
+    sampling.add_argument("--adaptive-context-expansion", type=_parse_bool, default=False)
+    sampling.add_argument("--max-context-depth", type=int, default=None)
     sampling.add_argument("--workers", type=int, default=60)
     sampling.add_argument("--commit-steps", type=int, default=1000)
     sampling.add_argument("--storage-backend", choices=("sqlite", "parquet"), default="sqlite")
@@ -694,6 +705,8 @@ def main() -> int:
                 steps=args.steps,
                 horizon=args.horizon,
                 context_depth=args.context_depth,
+                adaptive_context_expansion=bool(args.adaptive_context_expansion),
+                max_context_depth=args.max_context_depth,
                 workers=args.workers,
                 commit_steps=args.commit_steps,
                 storage_backend=args.storage_backend,

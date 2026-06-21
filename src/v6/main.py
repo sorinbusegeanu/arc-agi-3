@@ -37,6 +37,7 @@ class V6Config:
     context_contradiction_min_confidence: float = 0.5
     context_contradiction_min_repeats: int = 2
     max_context_depth: int | None = None
+    adaptive_context_expansion: bool = False
     carrier_min_support: int = 3
     carrier_min_distinct_contexts: int = 2
     carrier_min_prediction_lift: float = 0.05
@@ -77,7 +78,13 @@ class V6System:
             min_cluster_size=self.config.min_cluster_size,
             recluster_every=self.config.recluster_every,
         )
-        self.context_builder = ContextBuilder(context_length=self.config.context_length)
+        self.base_context_depth = int(self.config.context_length)
+        self.max_context_depth = int(self.config.max_context_depth or self.config.context_length)
+        self.max_context_depth = max(self.base_context_depth, self.max_context_depth)
+        self.context_builder = ContextBuilder(context_length=self.max_context_depth)
+        self._adaptive_action_depths: dict[int, int] = {}
+        self._adaptive_context_expansion_count = 0
+        self._adaptive_context_expansion_events: list[dict] = []
         self.contingency_learner = ContingencyLearner(
             support_threshold=self.config.contingency_support_threshold,
             confidence_threshold=self.config.contingency_confidence_threshold,
@@ -123,7 +130,8 @@ class V6System:
                 self.action_sampler.before_step(self)
             observation_before = self.env.observe()
             action = self.choose_action()
-            context_signatures = self.context_builder.multi_scale_signatures(action, max_level=self.config.context_length)
+            active_context_depth = self._context_depth_for_action(action)
+            context_signatures = self.context_builder.multi_scale_signatures(action, max_level=active_context_depth)
             selected_contingency = self.contingency_learner.best_stable_for_action(context_signatures, action)
             prediction_context_level = None if selected_contingency is None else int(selected_contingency.context_level)
             predicted_family = self.predictor.predict_multi_scale(context_signatures, action)
@@ -177,8 +185,10 @@ class V6System:
             prediction_correct = int(predicted_family) == int(actual_family)
         prediction_context_signature = context_signatures.get(
             prediction_context_level,
-            context_signatures.get(self.config.context_length, self.context_builder.signature()),
+            context_signatures.get(active_context_depth),
         )
+        if prediction_context_signature is None:
+            prediction_context_signature = context_signatures.get(0, (int(action),))
         serialized_context_signature = json.dumps(list(prediction_context_signature))
         action_signature = f"a{int(action)}"
         actual_family_id = None if actual_family is None else str(actual_family)
@@ -270,13 +280,15 @@ class V6System:
             actual_family_id=actual_family_id,
             prediction_correct=prediction_correct,
             prediction_confidence=prediction_confidence,
-            context_depth=int(self.config.context_length),
-            max_context_depth=self.config.max_context_depth,
+            context_depth=int(active_context_depth),
+            max_context_depth=self.max_context_depth,
         )
         context_expansion_suggested = False
         suggested_context_depth: int | None = None
         context_contradiction_reason: str | None = None
         context_contradiction_key: str | None = None
+        adaptive_context_depth_after = active_context_depth
+        adaptive_context_expansion_applied = False
         if contradiction_event is not None:
             context_contradiction_key = contradiction_event.contradiction_key
             suggested_context_depth = int(contradiction_event.suggested_context_depth)
@@ -284,6 +296,13 @@ class V6System:
             context_expansion_suggested = self.context_contradictions.should_expand_context(
                 serialized_context_signature,
                 action_signature,
+            )
+            adaptive_context_depth_after, adaptive_context_expansion_applied = self._apply_adaptive_context_expansion(
+                action=action,
+                old_depth=active_context_depth,
+                suggested_depth=suggested_context_depth,
+                reason=context_contradiction_reason,
+                contradiction_key=context_contradiction_key,
             )
             self.graph.add_contradicts(
                 f"Context:{serialized_context_signature}",
@@ -327,6 +346,9 @@ class V6System:
             context_expansion_suggested=context_expansion_suggested,
             suggested_context_depth=suggested_context_depth,
             context_contradiction_reason=context_contradiction_reason,
+            context_depth_used=active_context_depth,
+            adaptive_context_expansion_applied=adaptive_context_expansion_applied,
+            adaptive_context_depth_after=adaptive_context_depth_after,
             carrier_signature=carrier_signature,
             carrier_source=carrier_source,
             carrier_event_recorded=carrier_event is not None,
@@ -376,6 +398,9 @@ class V6System:
             memory_replay_priority=0.0 if replay_candidate is None else float(replay_candidate.replay_priority),
             memory_replay_candidate=replay_candidate is not None,
             memory_replay_count=int(memory_record.replay_count),
+            context_depth_used=active_context_depth,
+            adaptive_context_expansion_applied=adaptive_context_expansion_applied,
+            adaptive_context_depth_after=adaptive_context_depth_after,
             efficiency_action_cost=float(efficiency_event.action_cost),
             efficiency_cumulative_cost=float(efficiency_event.cumulative_cost),
             efficiency_repeated_state=bool(efficiency_event.repeated_state),
@@ -411,6 +436,9 @@ class V6System:
                 memory_replay_priority = ?,
                 memory_replay_candidate = ?,
                 memory_replay_count = ?,
+                context_depth_used = ?,
+                adaptive_context_expansion_applied = ?,
+                adaptive_context_depth_after = ?,
                 efficiency_action_cost = ?,
                 efficiency_cumulative_cost = ?,
                 efficiency_repeated_state = ?,
@@ -444,6 +472,9 @@ class V6System:
                 interaction.memory_replay_priority,
                 int(bool(interaction.memory_replay_candidate)),
                 interaction.memory_replay_count,
+                interaction.context_depth_used,
+                int(bool(interaction.adaptive_context_expansion_applied)),
+                interaction.adaptive_context_depth_after,
                 interaction.efficiency_action_cost,
                 interaction.efficiency_cumulative_cost,
                 int(bool(interaction.efficiency_repeated_state)),
@@ -524,6 +555,54 @@ class V6System:
             contingencies=self.contingency_learner.stable_contingencies(),
             connection=self.connection,
         )
+
+    def _context_depth_for_action(self, action: int) -> int:
+        if not bool(self.config.adaptive_context_expansion):
+            depth = self.base_context_depth
+        else:
+            depth = int(self._adaptive_action_depths.get(int(action), self.base_context_depth))
+        return max(0, min(self.max_context_depth, int(depth)))
+
+    def _apply_adaptive_context_expansion(
+        self,
+        *,
+        action: int,
+        old_depth: int,
+        suggested_depth: int | None,
+        reason: str | None,
+        contradiction_key: str | None,
+    ) -> tuple[int, bool]:
+        if not bool(self.config.adaptive_context_expansion):
+            return int(old_depth), False
+        if suggested_depth is None:
+            return int(old_depth), False
+        new_depth = min(self.max_context_depth, max(int(old_depth), int(suggested_depth)))
+        if new_depth <= int(old_depth):
+            return int(old_depth), False
+        self._adaptive_action_depths[int(action)] = int(new_depth)
+        self._adaptive_context_expansion_count += 1
+        self._adaptive_context_expansion_events.append(
+            {
+                "action": int(action),
+                "old_depth": int(old_depth),
+                "new_depth": int(new_depth),
+                "reason": reason,
+                "contradiction_key": contradiction_key,
+            }
+        )
+        return int(new_depth), True
+
+    def adaptive_context_summary(self) -> dict:
+        action_depths = {int(action): int(depth) for action, depth in sorted(self._adaptive_action_depths.items())}
+        return {
+            "adaptive_context_expansion_enabled": bool(self.config.adaptive_context_expansion),
+            "base_context_depth": int(self.base_context_depth),
+            "max_context_depth": int(self.max_context_depth),
+            "adaptive_context_expansion_count": int(self._adaptive_context_expansion_count),
+            "adaptive_context_active_action_count": len(action_depths),
+            "adaptive_context_max_depth_reached": max([self.base_context_depth, *action_depths.values()]) if action_depths else int(self.base_context_depth),
+            "adaptive_context_action_depths": action_depths,
+        }
 
     def close(self) -> None:
         self.connection.commit()

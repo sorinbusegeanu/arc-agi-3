@@ -371,6 +371,101 @@ def test_v6_system_records_interactions_predictions_and_metrics() -> None:
     assert metrics.prediction_accuracy is not None
 
 
+def test_v6_system_context_builder_retains_max_depth_for_adaptive_expansion() -> None:
+    system = V6System(
+        env=ToggleEnv(),
+        config=V6Config(
+            context_length=1,
+            max_context_depth=3,
+            adaptive_context_expansion=True,
+            random_seed=0,
+        ),
+    )
+    try:
+        assert system.context_builder.context_length == 3
+        system.context_builder.update(1, 1)
+        system.context_builder.update(2, 2)
+        system.context_builder.update(3, 1)
+        signatures = system.context_builder.multi_scale_signatures(1, max_level=3)
+        assert 3 in signatures
+        assert any(value is not None for value in signatures[3][:-1])
+    finally:
+        system.close()
+
+
+def test_v6_system_adaptive_context_expansion_disabled() -> None:
+    system = V6System(
+        env=ToggleEnv(),
+        config=V6Config(
+            context_length=1,
+            max_context_depth=3,
+            adaptive_context_expansion=False,
+            random_seed=0,
+        ),
+    )
+    try:
+        depth, applied = system._apply_adaptive_context_expansion(
+            action=1,
+            old_depth=1,
+            suggested_depth=2,
+            reason="r",
+            contradiction_key="k",
+        )
+        assert depth == 1
+        assert applied is False
+    finally:
+        system.close()
+
+
+def test_v6_system_adaptive_context_expansion_enabled() -> None:
+    system = V6System(
+        env=ToggleEnv(),
+        config=V6Config(
+            context_length=1,
+            max_context_depth=3,
+            adaptive_context_expansion=True,
+            random_seed=0,
+        ),
+    )
+    try:
+        depth, applied = system._apply_adaptive_context_expansion(
+            action=1,
+            old_depth=1,
+            suggested_depth=2,
+            reason="r",
+            contradiction_key="k",
+        )
+        assert depth == 2
+        assert applied is True
+        assert system._context_depth_for_action(1) == 2
+    finally:
+        system.close()
+
+
+def test_v6_system_adaptive_context_expansion_clamps_to_max_depth() -> None:
+    system = V6System(
+        env=ToggleEnv(),
+        config=V6Config(
+            context_length=1,
+            max_context_depth=2,
+            adaptive_context_expansion=True,
+            random_seed=0,
+        ),
+    )
+    try:
+        depth, applied = system._apply_adaptive_context_expansion(
+            action=1,
+            old_depth=1,
+            suggested_depth=5,
+            reason="r",
+            contradiction_key="k",
+        )
+        assert depth == 2
+        assert applied is True
+    finally:
+        system.close()
+
+
 def test_v6_system_batched_database_commit_persists_on_close(tmp_path) -> None:
     db_path = tmp_path / "batched.sqlite"
     system = V6System(
@@ -1146,6 +1241,37 @@ def test_carrier_source_is_stored_in_sqlite_stores(tmp_path) -> None:
     assert "carrier_source" in prediction_columns
     assert interaction_source == "cell"
     assert prediction_source == "cell"
+
+
+def test_adaptive_context_fields_are_stored_in_sqlite_stores(tmp_path) -> None:
+    db_path = tmp_path / "adaptive_context.sqlite"
+    system = V6System(
+        env=ToggleEnv(),
+        config=V6Config(
+            database_path=str(db_path),
+            context_length=1,
+            max_context_depth=3,
+            adaptive_context_expansion=True,
+            contingency_support_threshold=1,
+            contingency_confidence_threshold=0.0,
+            random_seed=0,
+        ),
+    )
+    try:
+        system.run_step()
+    finally:
+        system.close()
+
+    with sqlite3.connect(db_path) as connection:
+        interaction_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(interactions)").fetchall()}
+        prediction_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(prediction_results)").fetchall()}
+
+    assert "context_depth_used" in interaction_columns
+    assert "adaptive_context_expansion_applied" in interaction_columns
+    assert "adaptive_context_depth_after" in interaction_columns
+    assert "context_depth_used" in prediction_columns
+    assert "adaptive_context_expansion_applied" in prediction_columns
+    assert "adaptive_context_depth_after" in prediction_columns
 
 
 def test_interaction_significance_learning_value_drops_with_high_prior_counts() -> None:
@@ -2177,6 +2303,14 @@ def test_v05c_report_generation(tmp_path) -> None:
             "steps": 10,
             "horizon": 2,
             "context_depth": 1,
+            "adaptive_context_expansion_enabled": True,
+            "base_context_depth": 1,
+            "max_context_depth": 3,
+            "adaptive_context_expansion_count": 2,
+            "adaptive_context_active_action_count": 1,
+            "adaptive_context_max_depth_reached": 3,
+            "adaptive_context_depth_used_count": 10,
+            "adaptive_context_expansion_applied_count": 2,
             "run_status": "ok",
             "pass_status": False,
             "non_preserve_count": 1,
@@ -2198,6 +2332,14 @@ def test_v05c_report_generation(tmp_path) -> None:
             "steps": 10,
             "horizon": 2,
             "context_depth": 1,
+            "adaptive_context_expansion_enabled": True,
+            "base_context_depth": 1,
+            "max_context_depth": 3,
+            "adaptive_context_expansion_count": 3,
+            "adaptive_context_active_action_count": 1,
+            "adaptive_context_max_depth_reached": 3,
+            "adaptive_context_depth_used_count": 10,
+            "adaptive_context_expansion_applied_count": 3,
             "run_status": "ok",
             "pass_status": True,
             "non_preserve_count": 4,
@@ -2232,6 +2374,15 @@ def test_v05c_report_generation(tmp_path) -> None:
     assert (tmp_path / "interaction_sampling_v05c_best_by_game.csv").exists()
     assert (tmp_path / "interaction_sampling_v05c_summary_by_family.csv").exists()
     assert (tmp_path / "interaction_sampling_v05c_recommended_next_steps.txt").exists()
+    report = json.loads((tmp_path / "interaction_sampling_v05c_report.json").read_text())
+    assert "adaptive_context_expansion_enabled" in report["runs"][0]
+    assert "base_context_depth" in report["runs"][0]
+    assert "max_context_depth" in report["runs"][0]
+    assert "adaptive_context_expansion_count" in report["runs"][0]
+    assert "adaptive_context_active_action_count" in report["runs"][0]
+    assert "adaptive_context_max_depth_reached" in report["runs"][0]
+    assert "adaptive_context_depth_used_count" in report["runs"][0]
+    assert "adaptive_context_expansion_applied_count" in report["runs"][0]
 
 
 def test_v05c_validation_summary_reports_operational_failure() -> None:
@@ -6093,6 +6244,23 @@ def test_cli_accepts_interaction_sampling_collect_only_option() -> None:
     assert args.collect_only is True
 
 
+def test_cli_accepts_interaction_sampling_adaptive_context_options() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "interaction-sampling-v05c",
+            "--adaptive-context-expansion",
+            "true",
+            "--max-context-depth",
+            "4",
+        ]
+    )
+
+    assert args.command == "interaction-sampling-v05c"
+    assert args.adaptive_context_expansion is True
+    assert args.max_context_depth == 4
+
+
 def test_v05c_generate_sampling_dbs_passes_context_depth_into_jobs(tmp_path, monkeypatch) -> None:
     captured: list[dict] = []
 
@@ -6104,6 +6272,8 @@ def test_v05c_generate_sampling_dbs_passes_context_depth_into_jobs(tmp_path, mon
     interaction_sampling._generate_sampling_dbs(
         InteractionSamplingConfig(
             context_depth=2,
+            adaptive_context_expansion=True,
+            max_context_depth=4,
             games=("tt01",),
             samplers=("random_baseline",),
             seeds=(0,),
@@ -6115,6 +6285,8 @@ def test_v05c_generate_sampling_dbs_passes_context_depth_into_jobs(tmp_path, mon
 
     assert len(captured) == 1
     assert captured[0]["context_depth"] == 2
+    assert captured[0]["adaptive_context_expansion"] is True
+    assert captured[0]["max_context_depth"] == 4
 
 
 def test_v05c_run_sampling_job_uses_context_depth_for_v6_config(tmp_path, monkeypatch) -> None:
@@ -6143,6 +6315,17 @@ def test_v05c_run_sampling_job_uses_context_depth_for_v6_config(tmp_path, monkey
         def close(self) -> None:
             captured["closed"] = True
 
+        def adaptive_context_summary(self) -> dict:
+            return {
+                "adaptive_context_expansion_enabled": bool(captured["config"].adaptive_context_expansion),
+                "base_context_depth": int(captured["config"].context_length),
+                "max_context_depth": int(captured["config"].max_context_depth or captured["config"].context_length),
+                "adaptive_context_expansion_count": 1,
+                "adaptive_context_active_action_count": 1,
+                "adaptive_context_max_depth_reached": int(captured["config"].max_context_depth or captured["config"].context_length),
+                "adaptive_context_action_depths": {1: int(captured["config"].max_context_depth or captured["config"].context_length)},
+            }
+
     def fake_make_sampler(name: str, seed: int) -> DummySampler:
         captured["sampler_init"] = {"name": name, "seed": seed}
         return DummySampler()
@@ -6169,6 +6352,8 @@ def test_v05c_run_sampling_job_uses_context_depth_for_v6_config(tmp_path, monkey
             "steps": 10,
             "horizon": 3,
             "context_depth": 4,
+            "adaptive_context_expansion": True,
+            "max_context_depth": 6,
             "commit_steps": 5,
             "db_path": str(tmp_path / "seed_0.sqlite"),
             "env_root": None,
@@ -6176,8 +6361,16 @@ def test_v05c_run_sampling_job_uses_context_depth_for_v6_config(tmp_path, monkey
     )
 
     assert captured["config"].context_length == 4
+    assert captured["config"].adaptive_context_expansion is True
+    assert captured["config"].max_context_depth == 6
     assert captured["metadata"]["context_depth"] == 4
     assert captured["metadata"]["context_length"] == 4
+    assert captured["metadata"]["adaptive_context_expansion_enabled"] is True
+    assert captured["metadata"]["base_context_depth"] == 4
+    assert captured["metadata"]["max_context_depth"] == 6
+    assert "adaptive_context_expansion_count" in captured["metadata"]
+    assert "adaptive_context_active_action_count" in captured["metadata"]
+    assert "adaptive_context_max_depth_reached" in captured["metadata"]
     assert "carrier_candidate_count" in captured["metadata"]
     assert "emergent_carrier_count" in captured["metadata"]
     assert "carrier_spatial_candidate_count" in captured["metadata"]

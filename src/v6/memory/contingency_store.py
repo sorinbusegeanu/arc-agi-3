@@ -62,6 +62,9 @@ class ContingencyStore:
                 memory_replay_priority REAL,
                 memory_replay_candidate INTEGER,
                 memory_replay_count INTEGER,
+                context_depth_used INTEGER,
+                adaptive_context_expansion_applied INTEGER,
+                adaptive_context_depth_after INTEGER,
                 efficiency_action_cost REAL,
                 efficiency_cumulative_cost REAL,
                 efficiency_repeated_state INTEGER,
@@ -103,6 +106,9 @@ class ContingencyStore:
         self._ensure_column("prediction_results", "memory_replay_priority", "REAL")
         self._ensure_column("prediction_results", "memory_replay_candidate", "INTEGER")
         self._ensure_column("prediction_results", "memory_replay_count", "INTEGER")
+        self._ensure_column("prediction_results", "context_depth_used", "INTEGER")
+        self._ensure_column("prediction_results", "adaptive_context_expansion_applied", "INTEGER")
+        self._ensure_column("prediction_results", "adaptive_context_depth_after", "INTEGER")
         self._ensure_column("prediction_results", "efficiency_action_cost", "REAL")
         self._ensure_column("prediction_results", "efficiency_cumulative_cost", "REAL")
         self._ensure_column("prediction_results", "efficiency_repeated_state", "INTEGER")
@@ -190,6 +196,9 @@ class ContingencyStore:
         memory_replay_priority: float = 0.0,
         memory_replay_candidate: bool = False,
         memory_replay_count: int = 0,
+        context_depth_used: int | None = None,
+        adaptive_context_expansion_applied: bool = False,
+        adaptive_context_depth_after: int | None = None,
         efficiency_action_cost: float | None = None,
         efficiency_cumulative_cost: float | None = None,
         efficiency_repeated_state: bool = False,
@@ -242,6 +251,9 @@ class ContingencyStore:
                 memory_replay_priority,
                 memory_replay_candidate,
                 memory_replay_count,
+                context_depth_used,
+                adaptive_context_expansion_applied,
+                adaptive_context_depth_after,
                 efficiency_action_cost,
                 efficiency_cumulative_cost,
                 efficiency_repeated_state,
@@ -254,7 +266,7 @@ class ContingencyStore:
                 efficiency_equivalent_outcome_cost_gap,
                 efficiency_future_option_gain_per_cost
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 int(interaction_id),
@@ -289,6 +301,9 @@ class ContingencyStore:
                 float(memory_replay_priority),
                 int(bool(memory_replay_candidate)),
                 int(memory_replay_count),
+                None if context_depth_used is None else int(context_depth_used),
+                int(bool(adaptive_context_expansion_applied)),
+                None if adaptive_context_depth_after is None else int(adaptive_context_depth_after),
                 None if efficiency_action_cost is None else float(efficiency_action_cost),
                 None if efficiency_cumulative_cost is None else float(efficiency_cumulative_cost),
                 int(bool(efficiency_repeated_state)),

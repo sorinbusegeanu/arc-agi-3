@@ -54,6 +54,8 @@ class InteractionSamplingConfig:
     steps: int = 30000
     horizon: int = 10
     context_depth: int = 1
+    adaptive_context_expansion: bool = False
+    max_context_depth: int | None = None
     workers: int = 60
     commit_steps: int = 1000
     storage_backend: str = "sqlite"
@@ -179,6 +181,8 @@ def _generate_sampling_dbs(config: InteractionSamplingConfig, sampling_root: Pat
                             "steps": int(config.steps),
                             "horizon": int(config.horizon),
                             "context_depth": int(config.context_depth),
+                            "adaptive_context_expansion": bool(config.adaptive_context_expansion),
+                            "max_context_depth": config.max_context_depth,
                             "commit_steps": int(config.commit_steps),
                             "db_path": str(db_path),
                             "env_root": config.env_root,
@@ -210,6 +214,8 @@ def _generate_sampling_dbs(config: InteractionSamplingConfig, sampling_root: Pat
                         "steps": int(config.steps),
                         "horizon": int(config.horizon),
                         "context_depth": int(config.context_depth),
+                        "adaptive_context_expansion": bool(config.adaptive_context_expansion),
+                        "max_context_depth": config.max_context_depth,
                         "commit_steps": int(config.commit_steps),
                         "db_path": str(db_path),
                         "env_root": config.env_root,
@@ -276,6 +282,8 @@ def _run_sampling_job(job: dict) -> dict:
             database_path=str(db_path),
             random_seed=seed,
             context_length=int(job.get("context_depth", 3)),
+            max_context_depth=job.get("max_context_depth"),
+            adaptive_context_expansion=bool(job.get("adaptive_context_expansion", False)),
             database_commit_every=int(job.get("commit_steps", 1000)),
         ),
         action_sampler=sampler,
@@ -286,6 +294,7 @@ def _run_sampling_job(job: dict) -> dict:
     memory_summary: dict[str, object] = {}
     replay_candidates: list[dict] = []
     efficiency_summary: dict[str, object] = {}
+    adaptive_context_summary: dict[str, object] = {}
     try:
         system.run(steps=int(job["steps"]))
         graph = getattr(system, "graph", None)
@@ -308,6 +317,8 @@ def _run_sampling_job(job: dict) -> dict:
         efficiency_tracker = getattr(system, "efficiency_tracker", None)
         if efficiency_tracker is not None and hasattr(efficiency_tracker, "summary"):
             efficiency_summary = efficiency_tracker.summary()
+        if hasattr(system, "adaptive_context_summary"):
+            adaptive_context_summary = system.adaptive_context_summary()
     finally:
         system.close()
     effects = analyze_future_effects(
@@ -331,6 +342,12 @@ def _run_sampling_job(job: dict) -> dict:
         horizon=int(job["horizon"]),
         context_depth=int(job.get("context_depth", 3)),
         context_length=int(job.get("context_depth", 3)),
+        adaptive_context_expansion_enabled=bool(adaptive_context_summary.get("adaptive_context_expansion_enabled", False)),
+        base_context_depth=int(adaptive_context_summary.get("base_context_depth", job.get("context_depth", 3)) or 0),
+        max_context_depth=int(adaptive_context_summary.get("max_context_depth", job.get("max_context_depth", job.get("context_depth", 3))) or 0),
+        adaptive_context_expansion_count=int(adaptive_context_summary.get("adaptive_context_expansion_count", 0) or 0),
+        adaptive_context_active_action_count=int(adaptive_context_summary.get("adaptive_context_active_action_count", 0) or 0),
+        adaptive_context_max_depth_reached=int(adaptive_context_summary.get("adaptive_context_max_depth_reached", job.get("context_depth", 3)) or 0),
         reset_count=int(getattr(env, "reset_count", 0)) + int(getattr(sampler, "reset_count", 0)),
         terminal_count=int(getattr(env, "skipped_terminal_steps", 0)),
         reset_unavailable=bool(getattr(sampler, "reset_unavailable", False)),
@@ -434,6 +451,7 @@ def _run_metrics(path: Path, game: str, sampler_name: str, seed: int, config: In
     diagnostics.update(_read_isf_metrics(path))
     diagnostics.update(_read_context_contradiction_metrics(path))
     diagnostics.update(_read_memory_lifecycle_metrics(path))
+    diagnostics.update(_read_adaptive_context_metrics(path))
     metadata = _read_sampling_metadata(path)
     diagnostics.update(metadata)
     diagnostics.update(_read_efficiency_metrics(path))
@@ -442,12 +460,17 @@ def _run_metrics(path: Path, game: str, sampler_name: str, seed: int, config: In
 
 
 def _best_validation_row(game: str, sampler_name: str, config: InteractionSamplingConfig, sampling_root: Path) -> dict:
+    validation_context_depth = (
+        int(config.max_context_depth)
+        if bool(config.adaptive_context_expansion) and config.max_context_depth is not None
+        else int(config.context_depth)
+    )
     train = []
     for seed in config.train_seeds:
         examples = load_prefuture_examples(sampling_db_path(sampling_root, game, sampler_name, config.steps, seed))
-        train.extend([item for item in examples if int(item.features["context_level"]) <= int(config.context_depth)])
+        train.extend([item for item in examples if int(item.features["context_level"]) <= validation_context_depth])
     test = load_prefuture_examples(sampling_db_path(sampling_root, game, sampler_name, config.steps, config.test_seed))
-    test = [item for item in test if int(item.features["context_level"]) <= int(config.context_depth)]
+    test = [item for item in test if int(item.features["context_level"]) <= validation_context_depth]
     if not train or not test:
         raise ValueError("insufficient train/test stable contingencies")
     candidates = []
@@ -524,6 +547,10 @@ def _aggregate_seed_rows(seed_rows: list[dict], config: InteractionSamplingConfi
             "contradicted_context_action_count",
             "repeated_contradiction_count",
             "context_expansion_suggested_count",
+            "adaptive_context_expansion_count",
+            "adaptive_context_active_action_count",
+            "adaptive_context_depth_used_count",
+            "adaptive_context_expansion_applied_count",
             "carrier_candidate_count",
             "emergent_carrier_count",
             "carrier_spatial_candidate_count",
@@ -598,6 +625,14 @@ def _aggregate_seed_rows(seed_rows: list[dict], config: InteractionSamplingConfi
         "contradicted_context_action_count": sums["contradicted_context_action_count"],
         "repeated_contradiction_count": sums["repeated_contradiction_count"],
         "context_expansion_suggested_count": sums["context_expansion_suggested_count"],
+        "adaptive_context_expansion_enabled": bool(first.get("adaptive_context_expansion_enabled", False)),
+        "base_context_depth": int(first.get("base_context_depth", config.context_depth)),
+        "max_context_depth": int(first.get("max_context_depth", config.max_context_depth or config.context_depth)),
+        "adaptive_context_expansion_count": sums["adaptive_context_expansion_count"],
+        "adaptive_context_active_action_count": sums["adaptive_context_active_action_count"],
+        "adaptive_context_max_depth_reached": max(int(row.get("adaptive_context_max_depth_reached", 0) or 0) for row in seed_rows),
+        "adaptive_context_depth_used_count": sums["adaptive_context_depth_used_count"],
+        "adaptive_context_expansion_applied_count": sums["adaptive_context_expansion_applied_count"],
         "mean_suggested_context_depth": float(np.mean([row.get("mean_suggested_context_depth", 0.0) or 0.0 for row in seed_rows])),
         "max_suggested_context_depth": float(max((row.get("max_suggested_context_depth", 0.0) or 0.0 for row in seed_rows))),
         "carrier_candidate_count": sums["carrier_candidate_count"],
@@ -759,6 +794,14 @@ def validation_summary(rows: list[dict], comparison: list[dict], best_rows: list
             "contradicted_context_action_count": 0,
             "repeated_contradiction_count": 0,
             "context_expansion_suggested_count": 0,
+            "adaptive_context_expansion_enabled": False,
+            "base_context_depth": None,
+            "max_context_depth": None,
+            "adaptive_context_expansion_count": 0,
+            "adaptive_context_active_action_count": 0,
+            "adaptive_context_max_depth_reached": None,
+            "adaptive_context_depth_used_count": 0,
+            "adaptive_context_expansion_applied_count": 0,
             "mean_suggested_context_depth": None,
             "max_suggested_context_depth": None,
             "carrier_candidate_count": 0,
@@ -856,6 +899,16 @@ def validation_summary(rows: list[dict], comparison: list[dict], best_rows: list
         "contradicted_context_action_count": int(sum(int(row.get("contradicted_context_action_count", 0) or 0) for row in ok_rows)),
         "repeated_contradiction_count": int(sum(int(row.get("repeated_contradiction_count", 0) or 0) for row in ok_rows)),
         "context_expansion_suggested_count": int(sum(int(row.get("context_expansion_suggested_count", 0) or 0) for row in ok_rows)),
+        "adaptive_context_expansion_enabled": any(bool(row.get("adaptive_context_expansion_enabled")) for row in ok_rows),
+        "base_context_depth": _max_or_none(row.get("base_context_depth") for row in ok_rows),
+        "max_context_depth": _max_or_none(row.get("max_context_depth") for row in ok_rows),
+        "adaptive_context_expansion_count": int(sum(int(row.get("adaptive_context_expansion_count", 0) or 0) for row in ok_rows)),
+        "adaptive_context_active_action_count": int(sum(int(row.get("adaptive_context_active_action_count", 0) or 0) for row in ok_rows)),
+        "adaptive_context_max_depth_reached": _max_or_none(row.get("adaptive_context_max_depth_reached") for row in ok_rows),
+        "adaptive_context_depth_used_count": int(sum(int(row.get("adaptive_context_depth_used_count", 0) or 0) for row in ok_rows)),
+        "adaptive_context_expansion_applied_count": int(
+            sum(int(row.get("adaptive_context_expansion_applied_count", 0) or 0) for row in ok_rows)
+        ),
         "mean_suggested_context_depth": float(np.mean([row.get("mean_suggested_context_depth", 0.0) or 0.0 for row in ok_rows])) if ok_rows else None,
         "max_suggested_context_depth": float(max((row.get("max_suggested_context_depth", 0.0) or 0.0 for row in ok_rows))) if ok_rows else None,
         "carrier_candidate_count": int(sum(int(row.get("carrier_candidate_count", 0) or 0) for row in ok_rows)),
@@ -1250,6 +1303,34 @@ def _read_memory_lifecycle_metrics(path: Path) -> dict:
     }
 
 
+def _read_adaptive_context_metrics(path: Path) -> dict:
+    default = {
+        "adaptive_context_depth_used_count": 0,
+        "adaptive_context_expansion_applied_count": 0,
+    }
+    with sqlite3.connect(path) as connection:
+        try:
+            columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(interactions)").fetchall()}
+        except sqlite3.DatabaseError:
+            return default
+        required = {"context_depth_used", "adaptive_context_expansion_applied", "adaptive_context_depth_after"}
+        if not required.issubset(columns):
+            return default
+        row = connection.execute(
+            """
+            SELECT
+                SUM(CASE WHEN context_depth_used IS NOT NULL THEN 1 ELSE 0 END),
+                SUM(CASE WHEN adaptive_context_expansion_applied = 1 THEN 1 ELSE 0 END)
+            FROM interactions
+            """
+        ).fetchone()
+    return {
+        **default,
+        "adaptive_context_depth_used_count": int(row[0] or 0),
+        "adaptive_context_expansion_applied_count": int(row[1] or 0),
+    }
+
+
 def _read_efficiency_metrics(path: Path) -> dict:
     default = {
         "efficiency_event_count": 0,
@@ -1434,6 +1515,9 @@ def _failed_row(game: str, sampler_name: str, config: InteractionSamplingConfig,
         "horizon": config.horizon,
         "context_depth": config.context_depth,
         "context_length": config.context_depth,
+        "adaptive_context_expansion_enabled": bool(config.adaptive_context_expansion),
+        "base_context_depth": config.context_depth,
+        "max_context_depth": config.max_context_depth if config.max_context_depth is not None else config.context_depth,
         "train_seeds": list(config.train_seeds),
         "test_seed": config.test_seed,
         "run_status": "failed",
@@ -1469,6 +1553,11 @@ def _failed_row(game: str, sampler_name: str, config: InteractionSamplingConfig,
         "contradicted_context_action_count": 0,
         "repeated_contradiction_count": 0,
         "context_expansion_suggested_count": 0,
+        "adaptive_context_expansion_count": 0,
+        "adaptive_context_active_action_count": 0,
+        "adaptive_context_max_depth_reached": 0,
+        "adaptive_context_depth_used_count": 0,
+        "adaptive_context_expansion_applied_count": 0,
         "mean_suggested_context_depth": 0.0,
         "max_suggested_context_depth": 0.0,
         "carrier_candidate_count": 0,
