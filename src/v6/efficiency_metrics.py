@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter, deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any, Mapping
 
 
@@ -221,6 +221,21 @@ class EfficiencyTracker:
             mean_future_option_gain_per_cost=(sum(gains) / len(gains)) if gains else None,
         )
         return summary.to_dict()
+
+    def apply_future_option_deltas(self, deltas_by_interaction_id: dict[str, float]) -> None:
+        if not deltas_by_interaction_id:
+            return
+        updated_events: list[EfficiencyEvent] = []
+        for event in self.events:
+            delta = deltas_by_interaction_id.get(event.interaction_id)
+            if delta is None:
+                updated_events.append(event)
+                continue
+            gain_per_cost = None
+            if float(event.action_cost) > 0.0:
+                gain_per_cost = float(delta) / float(event.action_cost)
+            updated_events.append(replace(event, future_option_gain_per_cost=gain_per_cost))
+        self.events = updated_events
 
 
 def _largest_signed_number(values: Any) -> float:

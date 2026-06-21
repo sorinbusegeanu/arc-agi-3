@@ -113,6 +113,7 @@ def run_interaction_sampling_v05c(config: InteractionSamplingConfig) -> list[dic
         "efficiency_used_for_m2": False,
         "efficiency_used_for_m3": False,
         "efficiency_used_for_m4": False,
+        "future_option_efficiency_posthoc_only": True,
     }
     write_interaction_sampling_reports(payload, output)
     if config.storage_backend == "parquet":
@@ -316,6 +317,8 @@ def _run_sampling_job(job: dict) -> dict:
         steps=int(job["steps"]),
         horizon=int(job["horizon"]),
     )
+    deltas_by_interaction_id = _future_option_deltas_by_interaction_id(db_path)
+    _apply_future_option_efficiency_diagnostics(db_path, deltas_by_interaction_id)
     _write_sampling_metadata(
         db_path,
         game=str(job["game"]),
@@ -403,12 +406,12 @@ def _evaluate_sampling_runs(config: InteractionSamplingConfig, sampling_root: Pa
 
 def _run_metrics(path: Path, game: str, sampler_name: str, seed: int, config: InteractionSamplingConfig) -> dict:
     diagnostics = compute_run_diagnostics(path, game=game, seed=seed, steps=config.steps, horizon=config.horizon)
+    metadata = _read_sampling_metadata(path)
+    diagnostics.update(metadata)
     diagnostics.update(_read_isf_metrics(path))
     diagnostics.update(_read_context_contradiction_metrics(path))
     diagnostics.update(_read_memory_lifecycle_metrics(path))
     diagnostics.update(_read_efficiency_metrics(path))
-    metadata = _read_sampling_metadata(path)
-    diagnostics.update(metadata)
     diagnostics["sampler_name"] = sampler_name
     return diagnostics
 
@@ -512,7 +515,8 @@ def _aggregate_seed_rows(seed_rows: list[dict], config: InteractionSamplingConfi
             "efficiency_repeated_state_count",
             "efficiency_repeated_context_action_count",
             "efficiency_terminal_outcome_count",
-            "efficiency_distinct_outcome_count",
+        "efficiency_distinct_outcome_count",
+        "efficiency_future_option_gain_per_cost_count",
         ):
             sums[key] += int(row.get(key, 0) or 0)
     future_count = max(1, sums["future_effect_count"])
@@ -592,6 +596,7 @@ def _aggregate_seed_rows(seed_rows: list[dict], config: InteractionSamplingConfi
         "efficiency_repeated_context_action_ratio": sums["efficiency_repeated_context_action_count"] / max(1, sums["efficiency_event_count"]),
         "efficiency_terminal_outcome_count": sums["efficiency_terminal_outcome_count"],
         "efficiency_distinct_outcome_count": sums["efficiency_distinct_outcome_count"],
+        "efficiency_future_option_gain_per_cost_count": sums["efficiency_future_option_gain_per_cost_count"],
         "efficiency_mean_normalized_solve_efficiency": _mean_or_none(
             row.get("efficiency_mean_normalized_solve_efficiency") for row in seed_rows
         ),
@@ -606,6 +611,12 @@ def _aggregate_seed_rows(seed_rows: list[dict], config: InteractionSamplingConfi
         ),
         "efficiency_mean_future_option_gain_per_cost": _mean_or_none(
             row.get("efficiency_mean_future_option_gain_per_cost") for row in seed_rows
+        ),
+        "efficiency_max_future_option_gain_per_cost": _max_or_none(
+            row.get("efficiency_max_future_option_gain_per_cost") for row in seed_rows
+        ),
+        "efficiency_min_future_option_gain_per_cost": _min_or_none(
+            row.get("efficiency_min_future_option_gain_per_cost") for row in seed_rows
         ),
         "future_effect_count": sums["future_effect_count"],
         "preserve_count": sums["preserve_count"],
@@ -737,11 +748,14 @@ def validation_summary(rows: list[dict], comparison: list[dict], best_rows: list
             "efficiency_repeated_context_action_ratio": 0.0,
             "efficiency_terminal_outcome_count": 0,
             "efficiency_distinct_outcome_count": 0,
+            "efficiency_future_option_gain_per_cost_count": 0,
             "efficiency_mean_normalized_solve_efficiency": None,
             "efficiency_max_normalized_solve_efficiency": None,
             "efficiency_mean_equivalent_outcome_cost_gap": None,
             "efficiency_max_equivalent_outcome_cost_gap": None,
             "efficiency_mean_future_option_gain_per_cost": None,
+            "efficiency_max_future_option_gain_per_cost": None,
+            "efficiency_min_future_option_gain_per_cost": None,
         }
     failed_games = set(FAILED_REPRESENTATIVES)
     weak_games = set()
@@ -831,6 +845,9 @@ def validation_summary(rows: list[dict], comparison: list[dict], best_rows: list
         ),
         "efficiency_terminal_outcome_count": int(sum(int(row.get("efficiency_terminal_outcome_count", 0) or 0) for row in ok_rows)),
         "efficiency_distinct_outcome_count": int(sum(int(row.get("efficiency_distinct_outcome_count", 0) or 0) for row in ok_rows)),
+        "efficiency_future_option_gain_per_cost_count": int(
+            sum(int(row.get("efficiency_future_option_gain_per_cost_count", 0) or 0) for row in ok_rows)
+        ),
         "efficiency_mean_normalized_solve_efficiency": _mean_or_none(
             row.get("efficiency_mean_normalized_solve_efficiency") for row in ok_rows
         ),
@@ -845,6 +862,12 @@ def validation_summary(rows: list[dict], comparison: list[dict], best_rows: list
         ),
         "efficiency_mean_future_option_gain_per_cost": _mean_or_none(
             row.get("efficiency_mean_future_option_gain_per_cost") for row in ok_rows
+        ),
+        "efficiency_max_future_option_gain_per_cost": _max_or_none(
+            row.get("efficiency_max_future_option_gain_per_cost") for row in ok_rows
+        ),
+        "efficiency_min_future_option_gain_per_cost": _min_or_none(
+            row.get("efficiency_min_future_option_gain_per_cost") for row in ok_rows
         ),
     }
 
@@ -1004,11 +1027,14 @@ def _default_isf_metrics() -> dict:
         "efficiency_repeated_context_action_ratio": 0.0,
         "efficiency_terminal_outcome_count": 0,
         "efficiency_distinct_outcome_count": 0,
+        "efficiency_future_option_gain_per_cost_count": 0,
         "efficiency_mean_normalized_solve_efficiency": 0.0,
         "efficiency_max_normalized_solve_efficiency": 0.0,
         "efficiency_mean_equivalent_outcome_cost_gap": 0.0,
         "efficiency_max_equivalent_outcome_cost_gap": 0.0,
         "efficiency_mean_future_option_gain_per_cost": 0.0,
+        "efficiency_max_future_option_gain_per_cost": 0.0,
+        "efficiency_min_future_option_gain_per_cost": 0.0,
     }
 
 
@@ -1051,11 +1077,14 @@ def _read_context_contradiction_metrics(path: Path) -> dict:
         "efficiency_repeated_context_action_ratio": 0.0,
         "efficiency_terminal_outcome_count": 0,
         "efficiency_distinct_outcome_count": 0,
+        "efficiency_future_option_gain_per_cost_count": 0,
         "efficiency_mean_normalized_solve_efficiency": 0.0,
         "efficiency_max_normalized_solve_efficiency": 0.0,
         "efficiency_mean_equivalent_outcome_cost_gap": 0.0,
         "efficiency_max_equivalent_outcome_cost_gap": 0.0,
         "efficiency_mean_future_option_gain_per_cost": 0.0,
+        "efficiency_max_future_option_gain_per_cost": 0.0,
+        "efficiency_min_future_option_gain_per_cost": 0.0,
     }
     with sqlite3.connect(path) as connection:
         try:
@@ -1148,11 +1177,14 @@ def _read_efficiency_metrics(path: Path) -> dict:
         "efficiency_repeated_context_action_ratio": 0.0,
         "efficiency_terminal_outcome_count": 0,
         "efficiency_distinct_outcome_count": 0,
+        "efficiency_future_option_gain_per_cost_count": 0,
         "efficiency_mean_normalized_solve_efficiency": 0.0,
         "efficiency_max_normalized_solve_efficiency": 0.0,
         "efficiency_mean_equivalent_outcome_cost_gap": 0.0,
         "efficiency_max_equivalent_outcome_cost_gap": 0.0,
         "efficiency_mean_future_option_gain_per_cost": 0.0,
+        "efficiency_max_future_option_gain_per_cost": 0.0,
+        "efficiency_min_future_option_gain_per_cost": 0.0,
     }
     with sqlite3.connect(path) as connection:
         try:
@@ -1184,7 +1216,10 @@ def _read_efficiency_metrics(path: Path) -> dict:
                 MAX(efficiency_normalized_solve_efficiency),
                 AVG(efficiency_equivalent_outcome_cost_gap),
                 MAX(efficiency_equivalent_outcome_cost_gap),
-                AVG(efficiency_future_option_gain_per_cost)
+                COUNT(efficiency_future_option_gain_per_cost),
+                AVG(efficiency_future_option_gain_per_cost),
+                MAX(efficiency_future_option_gain_per_cost),
+                MIN(efficiency_future_option_gain_per_cost)
             FROM interactions
             """
         ).fetchone()
@@ -1209,7 +1244,10 @@ def _read_efficiency_metrics(path: Path) -> dict:
         "efficiency_max_normalized_solve_efficiency": float(row[9] or 0.0),
         "efficiency_mean_equivalent_outcome_cost_gap": float(row[10] or 0.0),
         "efficiency_max_equivalent_outcome_cost_gap": float(row[11] or 0.0),
-        "efficiency_mean_future_option_gain_per_cost": float(row[12] or 0.0),
+        "efficiency_future_option_gain_per_cost_count": int(row[12] or 0),
+        "efficiency_mean_future_option_gain_per_cost": float(row[13] or 0.0),
+        "efficiency_max_future_option_gain_per_cost": float(row[14] or 0.0),
+        "efficiency_min_future_option_gain_per_cost": float(row[15] or 0.0),
     }
 
 
@@ -1221,6 +1259,109 @@ def _mean_or_none(values) -> float | None:
 def _max_or_none(values) -> float | None:
     items = [float(value) for value in values if value is not None]
     return float(max(items)) if items else None
+
+
+def _min_or_none(values) -> float | None:
+    items = [float(value) for value in values if value is not None]
+    return float(min(items)) if items else None
+
+
+def _future_option_deltas_by_interaction_id(db_path: Path) -> dict[str, float]:
+    try:
+        with sqlite3.connect(db_path) as connection:
+            tables = {str(row[0]) for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            if not {"future_effects", "prediction_results"}.issubset(tables):
+                return {}
+            future_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(future_effects)").fetchall()}
+            prediction_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(prediction_results)").fetchall()}
+            required_future = {"contingency_id", "action", "transformation_family", "context_level", "mean_delta_fo"}
+            required_prediction = {"interaction_id", "contingency_id", "action", "actual_family", "context_level"}
+            if not required_future.issubset(future_columns) or not required_prediction.issubset(prediction_columns):
+                return {}
+            rows = connection.execute(
+                """
+                SELECT pr.interaction_id, fe.mean_delta_fo
+                FROM prediction_results AS pr
+                JOIN future_effects AS fe
+                  ON fe.contingency_id = pr.contingency_id
+                 AND fe.action = pr.action
+                 AND fe.transformation_family = pr.actual_family
+                 AND fe.context_level = pr.context_level
+                WHERE pr.interaction_id IS NOT NULL
+                  AND fe.mean_delta_fo IS NOT NULL
+                """
+            ).fetchall()
+    except sqlite3.DatabaseError:
+        return {}
+    return {str(row[0]): float(row[1]) for row in rows}
+
+
+def _apply_future_option_efficiency_diagnostics(db_path: Path, deltas_by_interaction_id: dict[str, float]) -> None:
+    if not deltas_by_interaction_id:
+        return
+    with sqlite3.connect(db_path) as connection:
+        interaction_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(interactions)").fetchall()}
+        prediction_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(prediction_results)").fetchall()}
+        if not {
+            "id",
+            "efficiency_action_cost",
+            "efficiency_future_option_gain_per_cost",
+        }.issubset(interaction_columns):
+            return
+        if not {
+            "interaction_id",
+            "efficiency_action_cost",
+            "efficiency_future_option_gain_per_cost",
+        }.issubset(prediction_columns):
+            return
+        rows = [
+            (
+                float(delta) / float(cost),
+                str(interaction_id),
+            )
+            for interaction_id, delta, cost in connection.execute(
+                f"""
+                SELECT interaction_id, mean_delta_fo, efficiency_action_cost
+                FROM (
+                    SELECT
+                        pr.interaction_id AS interaction_id,
+                        fe.mean_delta_fo AS mean_delta_fo,
+                        pr.efficiency_action_cost AS efficiency_action_cost
+                    FROM prediction_results AS pr
+                    JOIN future_effects AS fe
+                      ON fe.contingency_id = pr.contingency_id
+                     AND fe.action = pr.action
+                     AND fe.transformation_family = pr.actual_family
+                     AND fe.context_level = pr.context_level
+                    WHERE pr.interaction_id IN ({",".join("?" for _ in deltas_by_interaction_id)})
+                      AND pr.efficiency_action_cost IS NOT NULL
+                      AND pr.efficiency_action_cost > 0
+                      AND fe.mean_delta_fo IS NOT NULL
+                )
+                """,
+                tuple(str(key) for key in deltas_by_interaction_id),
+            ).fetchall()
+            if cost is not None and float(cost) > 0.0
+        ]
+        if not rows:
+            return
+        connection.executemany(
+            """
+            UPDATE prediction_results
+            SET efficiency_future_option_gain_per_cost = ?
+            WHERE interaction_id = ?
+            """,
+            rows,
+        )
+        connection.executemany(
+            """
+            UPDATE interactions
+            SET efficiency_future_option_gain_per_cost = ?
+            WHERE id = ?
+            """,
+            rows,
+        )
+        connection.commit()
 
 
 def _group_ok_by_game(rows: list[dict]) -> dict[str, list[dict]]:
@@ -1307,11 +1448,14 @@ def _failed_row(game: str, sampler_name: str, config: InteractionSamplingConfig,
         "efficiency_repeated_context_action_ratio": 0.0,
         "efficiency_terminal_outcome_count": 0,
         "efficiency_distinct_outcome_count": 0,
+        "efficiency_future_option_gain_per_cost_count": 0,
         "efficiency_mean_normalized_solve_efficiency": 0.0,
         "efficiency_max_normalized_solve_efficiency": 0.0,
         "efficiency_mean_equivalent_outcome_cost_gap": 0.0,
         "efficiency_max_equivalent_outcome_cost_gap": 0.0,
         "efficiency_mean_future_option_gain_per_cost": 0.0,
+        "efficiency_max_future_option_gain_per_cost": 0.0,
+        "efficiency_min_future_option_gain_per_cost": 0.0,
     }
 
 
@@ -1332,6 +1476,7 @@ def _format_text(payload: dict) -> str:
     lines = [
         "ARC-AGI3 v0.5c Interaction Sampling Repair",
         f"validation={validation}",
+        f"future_option_efficiency_posthoc_only={payload.get('future_option_efficiency_posthoc_only')}",
         "",
     ]
     if not validation.get("diagnostic_success", False):

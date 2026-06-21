@@ -257,6 +257,7 @@ class V6System:
             reward=reward,
             terminated=terminated,
             truncated=truncated,
+            # Future-option deltas are post-run diagnostics only here; do not use future horizon data during sampling.
             future_option_delta=None,
         )
         contradiction_event = self.context_contradictions.record_prediction_result(

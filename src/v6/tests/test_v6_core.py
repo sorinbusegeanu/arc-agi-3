@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 import numpy as np
 import v6.evaluation.interaction_sampling as interaction_sampling
@@ -68,6 +69,8 @@ from v6.evaluation.id_free_prefuture_validation import (
 )
 from v6.evaluation.interaction_sampling import (
     InteractionSamplingConfig,
+    _apply_future_option_efficiency_diagnostics,
+    _future_option_deltas_by_interaction_id,
     best_by_game as sampling_best_by_game,
     parse_v05c_games,
     parse_v05c_samplers,
@@ -931,6 +934,117 @@ def test_efficiency_tracker_summary_contains_requested_fields() -> None:
     assert "repeated_state_count" in summary
     assert "repeated_context_action_count" in summary
     assert "distinct_outcome_count" in summary
+
+
+def test_efficiency_tracker_apply_future_option_deltas() -> None:
+    tracker = EfficiencyTracker()
+    tracker.record_interaction(
+        interaction_id="i1",
+        before_observation={"x": 1},
+        after_observation={"x": 2},
+        delta={"position": [1, 2]},
+        context_signature="ctx",
+        action_signature="a",
+        reward=0,
+        terminated=False,
+        truncated=False,
+        action_cost=1.0,
+    )
+    tracker.record_interaction(
+        interaction_id="i2",
+        before_observation={"x": 2},
+        after_observation={"x": 3},
+        delta={"position": [1, 3]},
+        context_signature="ctx",
+        action_signature="b",
+        reward=0,
+        terminated=False,
+        truncated=False,
+        action_cost=2.0,
+    )
+
+    tracker.apply_future_option_deltas({"i1": 2.0})
+
+    assert tracker.events[0].future_option_gain_per_cost == 2.0
+    assert tracker.events[1].future_option_gain_per_cost is None
+    assert tracker.summary()["mean_future_option_gain_per_cost"] == 2.0
+
+
+def test_v05c_post_run_future_option_efficiency_enrichment(tmp_path) -> None:
+    db_path = tmp_path / "future_option.sqlite"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE interactions (
+                id INTEGER PRIMARY KEY,
+                efficiency_action_cost REAL,
+                efficiency_future_option_gain_per_cost REAL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE prediction_results (
+                interaction_id INTEGER,
+                contingency_id INTEGER,
+                action INTEGER,
+                actual_family INTEGER,
+                context_level INTEGER,
+                efficiency_action_cost REAL,
+                efficiency_future_option_gain_per_cost REAL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE future_effects (
+                contingency_id INTEGER,
+                context_level INTEGER,
+                action INTEGER,
+                transformation_family INTEGER,
+                mean_delta_fo REAL
+            )
+            """
+        )
+        connection.execute("INSERT INTO interactions (id, efficiency_action_cost) VALUES (1, 2.0)")
+        connection.execute(
+            """
+            INSERT INTO prediction_results (
+                interaction_id, contingency_id, action, actual_family, context_level, efficiency_action_cost
+            ) VALUES (1, 10, 3, 7, 2, 2.0)
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO future_effects (
+                contingency_id, context_level, action, transformation_family, mean_delta_fo
+            ) VALUES (10, 2, 3, 7, 4.0)
+            """
+        )
+        connection.commit()
+
+    deltas = _future_option_deltas_by_interaction_id(db_path)
+    _apply_future_option_efficiency_diagnostics(db_path, deltas)
+
+    assert deltas == {"1": 4.0}
+    with sqlite3.connect(db_path) as connection:
+        interaction_value = connection.execute(
+            "SELECT efficiency_future_option_gain_per_cost FROM interactions WHERE id = 1"
+        ).fetchone()[0]
+        prediction_value = connection.execute(
+            "SELECT efficiency_future_option_gain_per_cost FROM prediction_results WHERE interaction_id = 1"
+        ).fetchone()[0]
+    assert interaction_value == 2.0
+    assert prediction_value == 2.0
+
+
+def test_v05c_future_option_delta_lookup_missing_future_effects_table(tmp_path) -> None:
+    db_path = tmp_path / "missing_future_effects.sqlite"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("CREATE TABLE prediction_results (interaction_id INTEGER)")
+        connection.commit()
+
+    assert _future_option_deltas_by_interaction_id(db_path) == {}
 
 
 def test_interaction_significance_learning_value_drops_with_high_prior_counts() -> None:
