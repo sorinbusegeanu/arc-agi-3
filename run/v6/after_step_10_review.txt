@@ -1,0 +1,38 @@
+After Step 10 review
+
+Scope checked
+- context-depth propagation works
+- previous_v09b_dir is configurable
+- zero-concept reports explain why
+- fallback/mixed/unknown candidates are diagnostic-only
+- ISF fields exist and are non-null
+- graph has explains/contradicts/depends_on edges
+- context contradictions are tracked
+- carrier candidates are produced
+- memory lifecycle fields exist
+- efficiency diagnostics exist
+
+Result
+- PASS: context-depth propagation. Smoke metadata in runs/v6/smoke_efficiency_v01/.../seed_0.sqlite has context_depth=2 and context_length=2. Unit coverage also checks job propagation and V6Config.context_length wiring.
+- PASS: previous_v09b_dir is configurable. CLI/config wiring is present in src/v6/cli.py, src/v6/m4_role_concepts_v10e.py, src/v6/concept_candidates_v10fixc.py, and src/v6/concept_candidates_v10fixd.py. Tests assert --previous-v09b-dir parses and propagates.
+- PASS: zero-concept reports explain why. M4 report builders now emit m4_failure_diagnostics plus m4_failure_diagnostics.json with failure buckets and attrition totals.
+- PASS: fallback/mixed/unknown candidates are diagnostic-only. fixc/fixd report candidate_evidence_lanes and diagnostic_only_policy, and accepted concept filtering is restricted to eligible_stable candidates.
+- PASS: ISF fields exist and are non-null. Smoke DB interactions rows contain non-null isf_total, isf_prediction_error, and isf_learning_value.
+- PASS: graph edges exist. Unit tests cover explains and contradicts edge creation. Smoke metadata shows graph_edge_depends_on_count=2.
+- PASS: context contradictions are tracked. context_contradictions.json is produced and prediction_results contains context_contradiction/context_expansion_suggested/suggested_context_depth fields. This smoke run had zero contradiction events, which is valid for the sampled seed.
+- PASS: carrier candidates are produced. Smoke metadata shows carrier_candidate_count=24 and carrier_candidates.json exists.
+- PASS: memory lifecycle fields exist. interactions/prediction_results contain memory_status, memory_retention_reason, memory_replay_priority, memory_replay_candidate, and memory_replay_count. Smoke metadata shows memory_record_count=100.
+- PASS: efficiency diagnostics exist. interactions/prediction_results contain efficiency_* fields, efficiency_summary.json exists, and interaction_sampling_v05c_report.json now includes the late-only top-level flags:
+  efficiency_diagnostics_enabled=true
+  efficiency_used_for_sampling=false
+  efficiency_used_for_m2=false
+  efficiency_used_for_m3=false
+  efficiency_used_for_m4=false
+
+Caveat
+- The tiny interaction-sampling smoke report row is still marked run_status=failed because the existing evaluation path hits OperationalError: no such table: future_effects. That failure is pre-existing and separate from Steps 9/10. The Step 9/10 data is still present in the SQLite DB and sidecar JSON files.
+
+Validation run
+- python -m py_compile src/v6/memory_lifecycle.py src/v6/efficiency_metrics.py src/v6/main.py src/v6/evaluation/interaction_sampling.py
+- PYTHONPATH=src pytest -q src/v6/tests
+- PYTHONPATH=src python -m v6.cli interaction-sampling-v05c --games tt01 --samplers random_baseline --seeds 0 --steps 100 --horizon 3 --context-depth 2 --workers 1 --output-dir runs/v6/smoke_efficiency_v01

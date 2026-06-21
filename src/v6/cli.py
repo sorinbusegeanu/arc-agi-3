@@ -391,6 +391,7 @@ def build_parser() -> argparse.ArgumentParser:
     concept_candidates_v10fix_c.add_argument("--transfer-input-dir", default="runs/v6/v09c_transfer_hardened_extended32")
     concept_candidates_v10fix_c.add_argument("--m2-input-dir", default="runs/v6/v07_cd2_extended32_expanded")
     concept_candidates_v10fix_c.add_argument("--m1-input-dir", default="runs/v6/v06_cd2_extended32")
+    concept_candidates_v10fix_c.add_argument("--previous-v09b-dir", default="runs/v6/v09b_role_transfer_refined_sourceclean_extended32")
     concept_candidates_v10fix_c.add_argument("--output-dir", default="runs/v6/v10_m4_concepts_fixc_extended32")
     concept_candidates_v10fix_c.add_argument("--game-set-manifest", default=None)
     concept_candidates_v10fix_c.add_argument("--game-set-name", default=None)
@@ -406,6 +407,7 @@ def build_parser() -> argparse.ArgumentParser:
     concept_candidates_v10fix_d.add_argument("--transfer-input-dir", default="runs/v6/v09c_transfer_hardened_extended32")
     concept_candidates_v10fix_d.add_argument("--m2-input-dir", default="runs/v6/v07_cd2_extended32_expanded")
     concept_candidates_v10fix_d.add_argument("--m1-input-dir", default="runs/v6/v06_cd2_extended32")
+    concept_candidates_v10fix_d.add_argument("--previous-v09b-dir", default="runs/v6/v09b_role_transfer_refined_sourceclean_extended32")
     concept_candidates_v10fix_d.add_argument("--output-dir", default="runs/v6/v10_m4_concepts_fixd_extended32")
     concept_candidates_v10fix_d.add_argument("--game-set-manifest", default=None)
     concept_candidates_v10fix_d.add_argument("--game-set-name", default=None)
@@ -420,6 +422,7 @@ def build_parser() -> argparse.ArgumentParser:
     m4_role_concepts_v10e.add_argument("--transfer-input-dir", default="runs/v6/v09c_transfer_hardened_extended32")
     m4_role_concepts_v10e.add_argument("--m2-input-dir", default="runs/v6/v07_cd2_extended32_expanded")
     m4_role_concepts_v10e.add_argument("--m1-input-dir", default="runs/v6/v06_cd2_extended32")
+    m4_role_concepts_v10e.add_argument("--previous-v09b-dir", default="runs/v6/v09b_role_transfer_refined_sourceclean_extended32")
     m4_role_concepts_v10e.add_argument("--output-dir", default="runs/v6/v10e_role_based_m4_extended32")
     m4_role_concepts_v10e.add_argument("--game-set-manifest", default=None)
     m4_role_concepts_v10e.add_argument("--game-set-name", default=None)
@@ -679,13 +682,15 @@ def main() -> int:
 
     if args.command == "interaction-sampling-v05c":
         seeds = tuple(_parse_csv_int(args.seeds))
+        test_seed = int(seeds[-1]) if seeds else 2
+        train_seeds = tuple(seed for seed in seeds if seed != test_seed)[:2] or ((test_seed,) if seeds else (0, 1))
         rows = run_interaction_sampling_v05c(
             InteractionSamplingConfig(
                 games=parse_v05c_games(args.games),
                 samplers=parse_v05c_samplers(args.samplers),
                 seeds=seeds,
-                train_seeds=tuple(seed for seed in seeds if seed != 2)[:2] or (0, 1),
-                test_seed=2,
+                train_seeds=train_seeds,
+                test_seed=test_seed,
                 steps=args.steps,
                 horizon=args.horizon,
                 context_depth=args.context_depth,
@@ -995,6 +1000,7 @@ def main() -> int:
                 transfer_input_dir=args.transfer_input_dir,
                 m2_input_dir=args.m2_input_dir,
                 m1_input_dir=args.m1_input_dir,
+                previous_v09b_dir=args.previous_v09b_dir,
                 output_dir=args.output_dir,
                 game_set_manifest=args.game_set_manifest,
                 game_set_name=args.game_set_name,
@@ -1021,6 +1027,7 @@ def main() -> int:
                 transfer_input_dir=args.transfer_input_dir,
                 m2_input_dir=args.m2_input_dir,
                 m1_input_dir=args.m1_input_dir,
+                previous_v09b_dir=args.previous_v09b_dir,
                 output_dir=args.output_dir,
                 game_set_manifest=args.game_set_manifest,
                 game_set_name=args.game_set_name,
@@ -1047,6 +1054,7 @@ def main() -> int:
                 transfer_input_dir=args.transfer_input_dir,
                 m2_input_dir=args.m2_input_dir,
                 m1_input_dir=args.m1_input_dir,
+                previous_v09b_dir=args.previous_v09b_dir,
                 output_dir=args.output_dir,
                 game_set_manifest=args.game_set_manifest,
                 game_set_name=args.game_set_name,

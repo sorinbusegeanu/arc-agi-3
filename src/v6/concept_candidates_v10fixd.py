@@ -41,6 +41,10 @@ from v6.concept_candidates_v10fixb import (
     role_graph_sort_key,
     score_concept_against_target_family,
 )
+from v6.concept_candidates_v10fixc import (
+    apply_candidate_evidence_policy,
+)
+from v6.m4_failure_diagnostics import count_by_reason, ensure_failure_buckets, merge_reason_counts
 from v6.role_transfer_v09 import _write_parquet
 from v6.role_transfer_v09c import (
     RoleTransferV09cConfig,
@@ -56,6 +60,7 @@ class ConceptCandidatesV10FixDConfig:
     transfer_input_dir: str = "runs/v6/v09c_transfer_hardened_extended32"
     m2_input_dir: str = "runs/v6/v07_cd2_extended32_expanded"
     m1_input_dir: str = "runs/v6/v06_cd2_extended32"
+    previous_v09b_dir: str = "runs/v6/v09b_role_transfer_refined_sourceclean_extended32"
     output_dir: str = "runs/v6/v10_m4_concepts_fixd_extended32"
     game_set_manifest: str | None = None
     game_set_name: str | None = None
@@ -96,7 +101,7 @@ def run_concept_candidates_v10fixd(config: ConceptCandidatesV10FixDConfig) -> di
         RoleTransferV09cConfig(
             m2_input_dir=config.m2_input_dir,
             m1_input_dir=config.m1_input_dir,
-            previous_v09b_dir="runs/v6/v09b_role_transfer_refined_sourceclean_extended32",
+            previous_v09b_dir=config.previous_v09b_dir,
             output_dir=config.output_dir,
             game_set_manifest=config.game_set_manifest,
             game_set_name=config.game_set_name,
@@ -192,6 +197,10 @@ def run_concept_candidates_v10fixd(config: ConceptCandidatesV10FixDConfig) -> di
             memory_rows=memory_rows,
             error=str(exc),
         )
+        (output_dir / "m4_failure_diagnostics.json").write_text(
+            json.dumps({"m4_failure_diagnostics": payload.get("m4_failure_diagnostics", {})}, indent=2),
+            encoding="utf-8",
+        )
         (output_dir / "v10fixd_report.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
         (output_dir / "v10fixd_report.txt").write_text(format_report_fixd(payload), encoding="utf-8")
         _write_parquet(output_dir / "source_role_map_diagnostics.parquet", source_diag_rows)
@@ -200,6 +209,10 @@ def run_concept_candidates_v10fixd(config: ConceptCandidatesV10FixDConfig) -> di
         _write_parquet(output_dir / "memory_diagnostics.parquet", memory_rows)
         return payload
 
+    (output_dir / "m4_failure_diagnostics.json").write_text(
+        json.dumps({"m4_failure_diagnostics": payload.get("m4_failure_diagnostics", {})}, indent=2),
+        encoding="utf-8",
+    )
     (output_dir / "v10fixd_report.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
     (output_dir / "v10fixd_report.txt").write_text(format_report_fixd(payload), encoding="utf-8")
     return payload
@@ -222,7 +235,7 @@ def run_single_family_fixd(
         RoleTransferV09cConfig(
             m2_input_dir=config.m2_input_dir,
             m1_input_dir=config.m1_input_dir,
-            previous_v09b_dir="runs/v6/v09b_role_transfer_refined_sourceclean_extended32",
+            previous_v09b_dir=config.previous_v09b_dir,
             output_dir=config.output_dir,
             game_set_manifest=config.game_set_manifest,
             game_set_name=config.game_set_name,
@@ -554,12 +567,15 @@ def generate_candidate_chunks_for_group(
     for candidate in candidates:
         fold_local_role_ids = [str(role_id) for role_id in candidate.get("fold_local_role_ids", ())]
         candidate_sources = {source_by_role_id.get(role_id, "fallback_neighborhood") for role_id in fold_local_role_ids}
+        candidate["member_candidate_sources"] = sorted(candidate_sources)
         if candidate_sources == {"stable_role"}:
             candidate["candidate_source"] = "stable_role"
         elif candidate_sources == {"fallback_neighborhood"}:
             candidate["candidate_source"] = "fallback_neighborhood"
         else:
             candidate["candidate_source"] = "mixed"
+        candidate["manifest_family_ids"] = list(candidate.get("source_manifest_families_present", [manifest_family]))
+        candidate["manifest_resolution_status"] = "resolved" if manifest_family != "unknown_manifest_family" else "unknown_manifest"
     capped = candidates[: min(config.max_candidates_per_manifest_group, config.max_total_candidates_per_heldout)]
     for start in range(0, len(capped), config.candidate_chunk_size):
         yield capped[start : start + config.candidate_chunk_size]
@@ -774,8 +790,16 @@ def finalize_fixd_run(
     mapped_failure_rows = remap_concept_ids(failure_rows, exact_to_final)
     concept_rows = apply_target_metrics(final_concept_rows, mapped_transfer_rows)
     concept_rows = annotate_projection_outcomes(concept_rows, mapped_transfer_rows)
-    stable_concepts = [row for row in concept_rows if is_stable_candidate(row)]
-    transferable_concepts = [row for row in stable_concepts if is_transferable_candidate(row)]
+    policy = apply_candidate_evidence_policy(
+        concept_rows,
+        stable_predicate=is_stable_candidate,
+        transferable_predicate=is_transferable_candidate,
+    )
+    lane_counts = policy["lane_counts"]
+    eligible_candidates = policy["eligible_candidates"]
+    diagnostic_only_candidates = policy["diagnostic_only_candidates"]
+    stable_concepts = policy["stable_concepts"]
+    transferable_concepts = policy["transferable_concepts"]
 
     family_counts = Counter()
     for row in raw_candidate_rows:
@@ -799,6 +823,9 @@ def finalize_fixd_run(
     _write_parquet(output_dir / "concept_by_family_fixd.parquet", concept_by_family_rows)
     _write_parquet(output_dir / "concept_by_role_composition_fixd.parquet", composition_rows)
     _write_parquet(output_dir / "concept_graph_edges_fixd.parquet", graph_edges)
+    _write_parquet(output_dir / "eligible_concept_candidates.parquet", eligible_candidates)
+    _write_parquet(output_dir / "diagnostic_only_candidates.parquet", diagnostic_only_candidates)
+    _write_parquet(output_dir / "concept_candidates_accepted.parquet", transferable_concepts)
     if concept_rows:
         _write_parquet(output_dir / "m4_concept_candidates_fixd.parquet", concept_rows)
         (output_dir / "m4_concept_candidates_fixd.json").write_text(json.dumps(concept_rows, indent=2), encoding="utf-8")
@@ -823,8 +850,109 @@ def finalize_fixd_run(
         memory_rows=memory_rows,
         exact_filter_diag=exact_filter_diag,
         target_detail_rows=mapped_target_rows,
+        mapped_transfer_rows=mapped_transfer_rows,
+        lane_counts=lane_counts,
+        eligible_candidate_count=len(eligible_candidates),
+        diagnostic_only_candidate_count=len(diagnostic_only_candidates),
+        accepted_candidate_count=len(transferable_concepts),
     )
     return payload
+
+
+def build_fixd_failure_diagnostics(
+    *,
+    family_summaries: list[dict[str, Any]],
+    source_diag_rows: list[dict[str, Any]],
+    attrition_rows: list[dict[str, Any]],
+    stable_concepts: list[dict[str, Any]],
+    transferable_concepts: list[dict[str, Any]],
+    mapped_transfer_rows: list[dict[str, Any]],
+    exact_filter_diag: dict[str, int],
+) -> dict[str, Any]:
+    def _clean(counts: dict[str, int]) -> dict[str, int]:
+        return {key: value for key, value in counts.items() if key not in {"", "none", "unexpected_empty_pipeline"}}
+
+    family_ids = sorted(
+        {
+            str(row.get("heldout_family", ""))
+            for row in family_summaries + source_diag_rows + attrition_rows + stable_concepts + transferable_concepts + mapped_transfer_rows
+            if row.get("heldout_family") and row.get("heldout_family") != "__all__"
+        }
+    )
+    summaries = {str(row["heldout_family"]): row for row in family_summaries if row.get("heldout_family") != "__all__"}
+    source_diag = {str(row["heldout_family"]): row for row in source_diag_rows if row.get("heldout_family") != "__all__"}
+    attrition = {str(row["heldout_family"]): row for row in attrition_rows if row.get("heldout_family") != "__all__"}
+    stable_by_family = defaultdict(list)
+    for row in stable_concepts:
+        stable_by_family[str(row.get("heldout_family", ""))].append(row)
+    transferable_by_family = defaultdict(list)
+    for row in transferable_concepts:
+        transferable_by_family[str(row.get("heldout_family", ""))].append(row)
+    transfer_by_family = defaultdict(list)
+    for row in mapped_transfer_rows:
+        transfer_by_family[str(row.get("heldout_family", ""))].append(row)
+
+    per_family = []
+    for family_id in family_ids:
+        diag = source_diag.get(family_id, {})
+        attr = attrition.get(family_id, {})
+        summary = summaries.get(family_id, {})
+        transfer_rows = transfer_by_family.get(family_id, [])
+        stable_rows = stable_by_family.get(family_id, [])
+        transferable_rows = transferable_by_family.get(family_id, [])
+        reason_counts = merge_reason_counts(
+            _clean(count_by_reason([diag], "failure_mode_if_zero_structures")),
+            _clean(count_by_reason([summary], "zero_candidate_reason")),
+        )
+        projection_failures = sum(1 for row in transfer_rows if not row.get("projection_used"))
+        if projection_failures:
+            reason_counts = merge_reason_counts(reason_counts, {"no_target_projection": projection_failures})
+        family_row = {
+            "heldout_family_id": family_id,
+            "source_neighborhoods_available": bool(diag.get("source_neighborhood_count", 0)),
+            "source_roles_available": bool(diag.get("source_role_count", 0)),
+            "source_role_overlap_ok": bool(diag.get("source_role_map_overlap_count", 0)),
+            "stable_role_items_count": int(diag.get("stable_items_available", 0)),
+            "raw_candidates_count": int(attr.get("raw_candidate_count_premerge", 0)),
+            "fallback_candidate_count": int(attr.get("fallback_raw_candidate_count", 0)),
+            "mixed_candidate_count": int(attr.get("mixed_candidates_generated", 0)),
+            "unknown_manifest_candidate_count": 0,
+            "rejected_candidate_count": max(0, int(attr.get("raw_candidate_count_premerge", 0)) - len(stable_rows)),
+            "stable_candidate_count": len(stable_rows),
+            "transferable_candidate_count": len(transferable_rows),
+            "failure_reason_counts": ensure_failure_buckets(reason_counts),
+        }
+        per_family.append(family_row)
+
+    total_reason_counts = merge_reason_counts(*(row["failure_reason_counts"] for row in per_family))
+    total_reason_counts = merge_reason_counts(
+        total_reason_counts,
+        {
+            "insufficient_games": int(exact_filter_diag.get("rejected_due_to_min_games", 0)),
+            "insufficient_manifest_families": int(exact_filter_diag.get("rejected_due_to_min_families", 0)),
+        },
+    )
+    attrition_totals = {
+        "families_loaded": len(per_family),
+        "families_with_source_neighborhoods": sum(1 for row in per_family if row["source_neighborhoods_available"]),
+        "families_with_source_roles": sum(1 for row in per_family if row["source_roles_available"]),
+        "families_with_source_role_overlap": sum(1 for row in per_family if row["source_role_overlap_ok"]),
+        "stable_role_items_total": sum(row["stable_role_items_count"] for row in per_family),
+        "raw_candidates_total": sum(row["raw_candidates_count"] for row in per_family),
+        "projected_target_families_total": sum(int(row.get("target_family_count", 0)) for row in mapped_transfer_rows if row.get("projection_used")),
+        "projection_used_total": sum(1 for row in mapped_transfer_rows if row.get("projection_used")),
+        "rejected_candidate_total": sum(row["rejected_candidate_count"] for row in per_family),
+        "stable_candidate_total": sum(row["stable_candidate_count"] for row in per_family),
+        "transferable_candidate_total": sum(row["transferable_candidate_count"] for row in per_family),
+        "fallback_candidate_total": sum(row["fallback_candidate_count"] for row in per_family),
+        "mixed_candidate_total": sum(row["mixed_candidate_count"] for row in per_family),
+        "unknown_manifest_candidate_total": sum(row["unknown_manifest_candidate_count"] for row in per_family),
+    }
+    return {
+        "per_family": per_family,
+        "total_failure_reason_counts": ensure_failure_buckets(total_reason_counts),
+        "attrition_totals": attrition_totals,
+    }
 
 
 def build_report_payload_fixd(
@@ -848,11 +976,25 @@ def build_report_payload_fixd(
     memory_rows: list[dict[str, Any]],
     exact_filter_diag: dict[str, int],
     target_detail_rows: list[dict[str, Any]],
+    mapped_transfer_rows: list[dict[str, Any]],
+    lane_counts: dict[str, int],
+    eligible_candidate_count: int,
+    diagnostic_only_candidate_count: int,
+    accepted_candidate_count: int,
 ) -> dict[str, Any]:
     aggregate_source = next((row for row in source_diag_rows if row["heldout_family"] == "__all__"), aggregate_source_role_map_diagnostics(source_diag_rows))
     aggregate_attrition = next((row for row in attrition_rows if row["heldout_family"] == "__all__"), aggregate_attrition_rows(attrition_rows))
     peak_rss = max((row.get("rss_mb", 0.0) for row in memory_rows), default=0.0)
     positive_families = sum(1 for row in family_summaries if row["positive_concept_lift"])
+    failure_diagnostics = build_fixd_failure_diagnostics(
+        family_summaries=family_summaries,
+        source_diag_rows=source_diag_rows,
+        attrition_rows=attrition_rows,
+        stable_concepts=stable_concepts,
+        transferable_concepts=transferable_concepts,
+        mapped_transfer_rows=mapped_transfer_rows,
+        exact_filter_diag=exact_filter_diag,
+    )
 
     if aggregate_attrition.get("source_manifest_structures_total", 0) == 0:
         conclusion = "m4_concepts_fixd_pipeline_not_diagnostic"
@@ -886,6 +1028,16 @@ def build_report_payload_fixd(
         "corrected_concept_candidate_count": len(concept_rows),
         "corrected_stable_concepts": len(stable_concepts),
         "corrected_transferable_concepts": len(transferable_concepts),
+        "candidate_evidence_lanes": lane_counts,
+        "eligible_candidate_count": eligible_candidate_count,
+        "diagnostic_only_candidate_count": diagnostic_only_candidate_count,
+        "accepted_candidate_count": accepted_candidate_count,
+        "diagnostic_only_policy": {
+            "fallback_candidates_promoted": False,
+            "mixed_candidates_promoted": False,
+            "unknown_manifest_candidates_promoted": False,
+            "unresolved_manifest_candidates_promoted": False,
+        },
         "target_mean_concept_lift_vs_role_raw": mean_metric(transferable_concepts, "target_mean_concept_lift_vs_role_raw"),
         "target_mean_concept_lift_vs_m2": mean_metric(transferable_concepts, "target_mean_concept_lift_vs_m2"),
         "target_mean_concept_lift_vs_surface_raw": mean_metric(transferable_concepts, "target_mean_concept_lift_vs_surface_raw"),
@@ -906,11 +1058,13 @@ def build_report_payload_fixd(
         "config": {
             "output_dir": config.output_dir,
             "workers": config.workers,
+            "previous_v09b_dir": config.previous_v09b_dir,
             "streaming": config.streaming,
             "memory_safe": config.memory_safe,
             "resume_from_shards": config.resume_from_shards,
         },
         "report": report,
+        "m4_failure_diagnostics": failure_diagnostics,
         "validation": {
             "diagnostic_success": bool(source_diag_rows),
             "scientific_conclusion": conclusion,
@@ -930,8 +1084,21 @@ def build_operational_incomplete_payload(
 ) -> dict[str, Any]:
     aggregate_source = next((row for row in source_diag_rows if row["heldout_family"] == "__all__"), aggregate_source_role_map_diagnostics(source_diag_rows))
     aggregate_attrition = next((row for row in attrition_rows if row["heldout_family"] == "__all__"), aggregate_attrition_rows(attrition_rows))
+    failure_diagnostics = build_fixd_failure_diagnostics(
+        family_summaries=[],
+        source_diag_rows=source_diag_rows,
+        attrition_rows=attrition_rows,
+        stable_concepts=[],
+        transferable_concepts=[],
+        mapped_transfer_rows=[],
+        exact_filter_diag={},
+    )
     return {
-        "config": {"output_dir": config.output_dir, "workers": config.workers},
+        "config": {
+            "output_dir": config.output_dir,
+            "workers": config.workers,
+            "previous_v09b_dir": config.previous_v09b_dir,
+        },
         "report": {
             "original_v10fixb_summary": (original_v10fixb or {}).get("report", {}),
             "source_role_map_diag_summary": aggregate_source,
@@ -942,6 +1109,7 @@ def build_operational_incomplete_payload(
             "v10a_can_proceed": False,
             "operational_error": error,
         },
+        "m4_failure_diagnostics": failure_diagnostics,
         "validation": {
             "diagnostic_success": bool(source_diag_rows),
             "scientific_conclusion": "m4_concepts_fixd_operational_incomplete",

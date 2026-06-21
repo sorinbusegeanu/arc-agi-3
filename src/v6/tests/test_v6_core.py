@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import numpy as np
+import v6.evaluation.interaction_sampling as interaction_sampling
 
 from v6.cli import build_parser
+from v6.carrier_emergence import CarrierEmergenceTracker, extract_carrier_signature
 from v6.game_sets import load_game_set_manifest
+from v6.efficiency_metrics import EfficiencyTracker, is_no_effect_delta
 from v6.contingency_memory import (
     ContingencyMemoryConfig,
     action_only_accuracy,
@@ -21,6 +25,7 @@ from v6.contingency_memory import (
     print_progress,
     run_contingency_memory_v06,
 )
+from v6.context.contradiction_tracker import ContextContradictionTracker
 from v6.context_depth_compare_v07 import (
     ContextDepthCompareConfig,
     format_context_depth_comparison,
@@ -118,7 +123,10 @@ from v6.evaluation.role_validation import (
     validate_role_predictor,
 )
 from v6.evaluation.validation_report import build_validation_report
+from v6.graph.graph_manager import GraphManager
+from v6.interaction_significance import compute_interaction_significance
 from v6.main import V6Config, V6System
+from v6.memory_lifecycle import MemoryLifecycleManager
 from v6.memory_types import M3RoleCandidate
 from v6.m2_expand_v08c import M2ExpandV08cConfig, run_m2_expand_v08c
 from v6.memory.interaction_store import encode_array
@@ -219,6 +227,9 @@ from v6.concept_candidates_v10fixd import (
 )
 from v6.m4_role_concepts_v10e import (
     M4RoleConceptsV10eConfig,
+    build_baseline_dominance_rows,
+    build_projection_audit_rows,
+    build_v10e_report,
     build_role_based_candidate_row,
     is_transferable_role_based_concept,
     run_m4_role_concepts_v10e,
@@ -379,6 +390,925 @@ def test_v6_system_batched_database_commit_persists_on_close(tmp_path) -> None:
         assert connection.execute("SELECT COUNT(*) FROM interactions").fetchone()[0] == 3
         assert connection.execute("SELECT COUNT(*) FROM deltas").fetchone()[0] == 3
         assert connection.execute("SELECT COUNT(*) FROM prediction_results").fetchone()[0] == 3
+    finally:
+        connection.close()
+
+
+def test_graph_manager_add_typed_edge_creates_typed_edge() -> None:
+    graph = GraphManager()
+
+    graph.add_typed_edge("A", "B", "explains", weight=0.8, evidence={"x": 1})
+
+    assert graph.count_edges_of_type("explains") == 1
+    assert graph.edge_type_counts()["explains"] == 1
+
+
+def test_graph_manager_duplicate_typed_edge_updates_in_place() -> None:
+    graph = GraphManager()
+
+    graph.add_typed_edge("A", "B", "explains", weight=0.3, evidence={"a": 1})
+    graph.add_typed_edge("A", "B", "explains", weight=0.9, evidence={"b": 2})
+
+    assert graph.count_edges_of_type("explains") == 1
+    edges = list(graph.graph.edges(data=True, keys=True))
+    assert len(edges) == 1
+    _, _, _, attrs = edges[0]
+    assert attrs["weight"] == 0.9
+    assert attrs["evidence"]["a"] == 1
+    assert attrs["evidence"]["b"] == 2
+
+
+def test_graph_manager_symmetric_edges_are_added_both_directions() -> None:
+    graph = GraphManager()
+
+    graph.add_reversible_with("A", "B")
+    graph.add_similar_role_to("Role:A", "Role:B")
+
+    assert graph.count_edges_of_type("reversible_with") == 2
+    assert graph.count_edges_of_type("similar_role_to") == 2
+
+
+def test_graph_manager_edge_counts_include_zero_buckets() -> None:
+    graph = GraphManager()
+
+    counts = graph.edge_type_counts()
+
+    assert counts["enables"] == 0
+    assert counts["blocks"] == 0
+    assert counts["contradicts"] == 0
+
+
+def test_interaction_significance_prediction_error_rewards_confident_misses() -> None:
+    score = compute_interaction_significance(
+        reward=0,
+        terminated=False,
+        truncated=False,
+        prediction_correct=False,
+        prediction_confidence=0.9,
+        actual_family_id="f1",
+        delta_id="d1",
+        context_signature="c1",
+        memory_counts={},
+        graph_counts={},
+    )
+
+    assert score.prediction_error >= 0.9
+    assert score.total > 0
+
+
+def test_context_contradiction_tracker_ignores_correct_predictions() -> None:
+    tracker = ContextContradictionTracker()
+
+    event = tracker.record_prediction_result(
+        interaction_id="i1",
+        context_signature="ctx1",
+        action_signature="a1",
+        predicted_family_id="f1",
+        actual_family_id="f1",
+        prediction_correct=True,
+        prediction_confidence=0.9,
+        context_depth=2,
+    )
+
+    assert event is None
+    assert tracker.summary()["context_contradiction_count"] == 0
+
+
+def test_context_contradiction_tracker_creates_event_for_confident_wrong_prediction() -> None:
+    tracker = ContextContradictionTracker()
+
+    event = tracker.record_prediction_result(
+        interaction_id="i1",
+        context_signature="ctx1",
+        action_signature="a1",
+        predicted_family_id="f1",
+        actual_family_id="f2",
+        prediction_correct=False,
+        prediction_confidence=0.9,
+        context_depth=2,
+        max_context_depth=5,
+    )
+
+    assert event is not None
+    assert event.contradiction_key == "ctx1|a1|f1->f2"
+    assert event.suggested_context_depth == 3
+    assert tracker.summary()["context_contradiction_count"] == 1
+
+
+def test_context_contradiction_tracker_ignores_low_confidence_wrong_prediction() -> None:
+    tracker = ContextContradictionTracker(min_confidence=0.7)
+
+    event = tracker.record_prediction_result(
+        interaction_id="i1",
+        context_signature="ctx1",
+        action_signature="a1",
+        predicted_family_id="f1",
+        actual_family_id="f2",
+        prediction_correct=False,
+        prediction_confidence=0.3,
+        context_depth=2,
+    )
+
+    assert event is None
+
+
+def test_context_contradiction_tracker_repeated_contradictions_suggest_expansion() -> None:
+    tracker = ContextContradictionTracker(min_repeats_for_expansion=2)
+
+    tracker.record_prediction_result(
+        interaction_id="i1",
+        context_signature="ctx1",
+        action_signature="a1",
+        predicted_family_id="f1",
+        actual_family_id="f2",
+        prediction_correct=False,
+        prediction_confidence=0.9,
+        context_depth=2,
+    )
+    tracker.record_prediction_result(
+        interaction_id="i2",
+        context_signature="ctx1",
+        action_signature="a1",
+        predicted_family_id="f1",
+        actual_family_id="f2",
+        prediction_correct=False,
+        prediction_confidence=0.9,
+        context_depth=2,
+    )
+
+    assert tracker.should_expand_context("ctx1", "a1") is True
+    assert tracker.summary()["repeated_contradiction_count"] >= 1
+
+
+def test_extract_carrier_signature_uses_position() -> None:
+    sig = extract_carrier_signature(
+        before_observation=None,
+        after_observation=None,
+        delta={"position": [3, 4]},
+        context_signature="ctx",
+        action_signature="act",
+    )
+
+    assert sig is not None
+    assert "3" in sig
+    assert "4" in sig
+
+
+def test_extract_carrier_signature_falls_back_to_context_action() -> None:
+    sig = extract_carrier_signature(
+        before_observation=None,
+        after_observation=None,
+        delta={},
+        context_signature="ctx1",
+        action_signature="a1",
+    )
+
+    assert sig == "context_action:ctx1|a1"
+
+
+def test_carrier_tracker_records_event() -> None:
+    tracker = CarrierEmergenceTracker()
+
+    event = tracker.record_interaction(
+        interaction_id="i1",
+        carrier_signature="cell:1,2",
+        context_signature="ctx1",
+        action_signature="a1",
+        family_id="f1",
+        delta_signature="d1",
+        prediction_correct=True,
+    )
+
+    assert event is not None
+    assert len(tracker.events) == 1
+
+
+def test_carrier_tracker_emergent_threshold() -> None:
+    tracker = CarrierEmergenceTracker(
+        min_support=3,
+        min_distinct_contexts=2,
+        min_prediction_lift=0.0,
+        min_compression_gain=0.01,
+    )
+
+    tracker.record_interaction(
+        interaction_id="i1",
+        carrier_signature="cell:1,2",
+        context_signature="ctx1",
+        action_signature="a1",
+        family_id="f1",
+        delta_signature="d1",
+        prediction_correct=True,
+    )
+    tracker.record_interaction(
+        interaction_id="i2",
+        carrier_signature="cell:1,2",
+        context_signature="ctx2",
+        action_signature="a1",
+        family_id="f1",
+        delta_signature="d2",
+        prediction_correct=True,
+    )
+    tracker.record_interaction(
+        interaction_id="i3",
+        carrier_signature="cell:1,2",
+        context_signature="ctx2",
+        action_signature="a1",
+        family_id="f1",
+        delta_signature="d3",
+        prediction_correct=True,
+    )
+
+    assert any(candidate.status == "emergent_carrier" for candidate in tracker.build_candidates())
+
+
+def test_carrier_tracker_ignores_missing_signature() -> None:
+    tracker = CarrierEmergenceTracker()
+
+    event = tracker.record_interaction(
+        interaction_id="i1",
+        carrier_signature=None,
+        context_signature="ctx1",
+        action_signature="a1",
+        family_id="f1",
+        delta_signature="d1",
+        prediction_correct=True,
+    )
+
+    assert event is None
+    assert len(tracker.events) == 0
+
+
+def test_memory_lifecycle_high_isf_becomes_protected() -> None:
+    manager = MemoryLifecycleManager()
+
+    record = manager.register_interaction(
+        interaction_id="i1",
+        family_id="f1",
+        context_signature="ctx1",
+        action_signature="a1",
+        carrier_signature=None,
+        isf_total=0.9,
+        prediction_error=0.1,
+        learning_value=0.2,
+        transfer_potential=0.1,
+        explanatory_potential=0.1,
+        context_contradiction=False,
+        timestamp_step=1,
+    )
+
+    assert record.status == "protected"
+    assert record.retention_reason == "high_isf"
+
+
+def test_memory_lifecycle_prediction_error_enters_replay_queue() -> None:
+    manager = MemoryLifecycleManager()
+
+    manager.register_interaction(
+        interaction_id="i1",
+        family_id="f1",
+        context_signature="ctx1",
+        action_signature="a1",
+        carrier_signature=None,
+        isf_total=0.4,
+        prediction_error=0.9,
+        learning_value=0.1,
+        transfer_potential=0.1,
+        explanatory_potential=0.1,
+        context_contradiction=False,
+        timestamp_step=1,
+    )
+
+    assert "i1" in manager.replay_candidates
+    assert manager.replay_candidates["i1"].reason == "prediction_error"
+
+
+def test_memory_lifecycle_context_contradiction_enters_replay_queue() -> None:
+    manager = MemoryLifecycleManager()
+
+    manager.register_interaction(
+        interaction_id="i1",
+        family_id="f1",
+        context_signature="ctx1",
+        action_signature="a1",
+        carrier_signature=None,
+        isf_total=0.2,
+        prediction_error=0.1,
+        learning_value=0.1,
+        transfer_potential=0.1,
+        explanatory_potential=0.1,
+        context_contradiction=True,
+        timestamp_step=1,
+    )
+
+    assert "i1" in manager.replay_candidates
+
+
+def test_memory_lifecycle_replay_batch_returns_highest_priority_first() -> None:
+    manager = MemoryLifecycleManager()
+    manager.register_interaction(
+        interaction_id="i1",
+        family_id="f1",
+        context_signature="ctx1",
+        action_signature="a1",
+        carrier_signature=None,
+        isf_total=0.2,
+        prediction_error=0.5,
+        learning_value=0.1,
+        transfer_potential=0.1,
+        explanatory_potential=0.1,
+        context_contradiction=False,
+        timestamp_step=1,
+    )
+    manager.register_interaction(
+        interaction_id="i2",
+        family_id="f1",
+        context_signature="ctx2",
+        action_signature="a1",
+        carrier_signature=None,
+        isf_total=0.6,
+        prediction_error=0.9,
+        learning_value=0.1,
+        transfer_potential=0.1,
+        explanatory_potential=0.1,
+        context_contradiction=False,
+        timestamp_step=2,
+    )
+    manager.register_interaction(
+        interaction_id="i3",
+        family_id="f1",
+        context_signature="ctx3",
+        action_signature="a1",
+        carrier_signature=None,
+        isf_total=0.3,
+        prediction_error=0.5,
+        learning_value=0.6,
+        transfer_potential=0.1,
+        explanatory_potential=0.1,
+        context_contradiction=False,
+        timestamp_step=3,
+    )
+
+    batch = manager.get_replay_batch(limit=2)
+
+    assert len(batch) == 2
+    assert batch[0].replay_priority >= batch[1].replay_priority
+
+
+def test_memory_lifecycle_forgetting_does_not_remove_protected_records() -> None:
+    manager = MemoryLifecycleManager(
+        max_active_records=2,
+        min_records_before_forgetting=1,
+        forget_isf_threshold=0.2,
+    )
+
+    protected = manager.register_interaction(
+        interaction_id="protected",
+        family_id="f1",
+        context_signature="ctx1",
+        action_signature="a1",
+        carrier_signature=None,
+        isf_total=0.95,
+        prediction_error=0.1,
+        learning_value=0.1,
+        transfer_potential=0.1,
+        explanatory_potential=0.1,
+        context_contradiction=False,
+        timestamp_step=1,
+    )
+    for index in range(4):
+        manager.register_interaction(
+            interaction_id=f"low-{index}",
+            family_id="f1",
+            context_signature=f"ctx{index + 2}",
+            action_signature="a1",
+            carrier_signature=None,
+            isf_total=0.05,
+            prediction_error=0.05,
+            learning_value=0.05,
+            transfer_potential=0.05,
+            explanatory_potential=0.05,
+            context_contradiction=False,
+            timestamp_step=index + 2,
+        )
+
+    assert protected.status == "protected"
+    assert manager.records["protected"].status == "protected"
+    assert manager.summary()["memory_forgotten_count"] > 0
+
+
+def test_efficiency_no_effect_detection() -> None:
+    assert is_no_effect_delta(None) is True
+    assert is_no_effect_delta({"changed_cells": []}) is True
+
+
+def test_efficiency_tracker_detects_repeated_state() -> None:
+    tracker = EfficiencyTracker()
+
+    e1 = tracker.record_interaction(
+        interaction_id="i1",
+        before_observation={"x": 1},
+        after_observation={"x": 2},
+        delta={"position": [1, 2]},
+        context_signature="ctx",
+        action_signature="a",
+        reward=0,
+        terminated=False,
+        truncated=False,
+    )
+    e2 = tracker.record_interaction(
+        interaction_id="i2",
+        before_observation={"x": 1},
+        after_observation={"x": 3},
+        delta={"position": [1, 3]},
+        context_signature="ctx",
+        action_signature="b",
+        reward=0,
+        terminated=False,
+        truncated=False,
+    )
+
+    assert e1.repeated_state is False
+    assert e2.repeated_state is True
+
+
+def test_efficiency_tracker_detects_repeated_context_action() -> None:
+    tracker = EfficiencyTracker()
+    tracker.record_interaction(
+        interaction_id="i1",
+        before_observation={"x": 1},
+        after_observation={"x": 2},
+        delta={"position": [1, 2]},
+        context_signature="ctx",
+        action_signature="a",
+        reward=0,
+        terminated=False,
+        truncated=False,
+    )
+    event = tracker.record_interaction(
+        interaction_id="i2",
+        before_observation={"x": 2},
+        after_observation={"x": 3},
+        delta={"position": [1, 3]},
+        context_signature="ctx",
+        action_signature="a",
+        reward=0,
+        terminated=False,
+        truncated=False,
+    )
+
+    assert event.repeated_context_action is True
+
+
+def test_efficiency_tracker_terminal_outcome_has_efficiency_score() -> None:
+    tracker = EfficiencyTracker()
+
+    event = tracker.record_interaction(
+        interaction_id="i1",
+        before_observation={"x": 1},
+        after_observation={"x": 2},
+        delta={"position": [1, 2]},
+        context_signature="ctx",
+        action_signature="a",
+        reward=1,
+        terminated=True,
+        truncated=False,
+    )
+
+    assert event.terminal_outcome is True
+    assert event.normalized_solve_efficiency is not None
+
+
+def test_efficiency_tracker_equivalent_outcome_cost_gap_is_reported() -> None:
+    tracker = EfficiencyTracker()
+    tracker.record_interaction(
+        interaction_id="i1",
+        before_observation={"x": 1},
+        after_observation={"x": 2},
+        delta={"position": [1, 2]},
+        context_signature="ctx",
+        action_signature="a",
+        reward=0,
+        terminated=False,
+        truncated=False,
+        action_cost=1.0,
+    )
+    second = tracker.record_interaction(
+        interaction_id="i2",
+        before_observation={"x": 3},
+        after_observation={"x": 2},
+        delta={"position": [1, 2]},
+        context_signature="ctx2",
+        action_signature="b",
+        reward=0,
+        terminated=False,
+        truncated=False,
+        action_cost=2.0,
+    )
+
+    assert second.equivalent_outcome_cost_gap is not None
+    assert second.equivalent_outcome_cost_gap >= 0
+
+
+def test_efficiency_tracker_summary_contains_requested_fields() -> None:
+    tracker = EfficiencyTracker()
+    tracker.record_interaction(
+        interaction_id="i1",
+        before_observation={"x": 1},
+        after_observation={"x": 2},
+        delta={"changed_cells": []},
+        context_signature="ctx",
+        action_signature="a",
+        reward=0,
+        terminated=False,
+        truncated=False,
+    )
+
+    summary = tracker.summary()
+
+    assert "efficiency_event_count" in summary
+    assert "no_effect_action_count" in summary
+    assert "repeated_state_count" in summary
+    assert "repeated_context_action_count" in summary
+    assert "distinct_outcome_count" in summary
+
+
+def test_interaction_significance_learning_value_drops_with_high_prior_counts() -> None:
+    score_low = compute_interaction_significance(
+        reward=0,
+        terminated=False,
+        truncated=False,
+        prediction_correct=None,
+        prediction_confidence=None,
+        actual_family_id=None,
+        delta_id="d1",
+        context_signature=None,
+        memory_counts={"delta_id:d1": 0},
+        graph_counts={},
+    )
+    score_high = compute_interaction_significance(
+        reward=0,
+        terminated=False,
+        truncated=False,
+        prediction_correct=None,
+        prediction_confidence=None,
+        actual_family_id=None,
+        delta_id="d1",
+        context_signature=None,
+        memory_counts={"delta_id:d1": 100},
+        graph_counts={},
+    )
+
+    assert score_low.learning_value > score_high.learning_value
+
+
+def test_interaction_significance_terminal_signal_boosts_survival_impact() -> None:
+    score = compute_interaction_significance(
+        reward=0,
+        terminated=True,
+        truncated=False,
+        prediction_correct=None,
+        prediction_confidence=None,
+        actual_family_id="f1",
+        delta_id="d1",
+        context_signature="c1",
+        memory_counts={},
+        graph_counts={},
+    )
+
+    assert score.survival_impact >= 0.75
+
+
+def test_interaction_significance_graph_proxy_boosts_explanatory_potential() -> None:
+    score = compute_interaction_significance(
+        reward=0,
+        terminated=False,
+        truncated=False,
+        prediction_correct=None,
+        prediction_confidence=None,
+        actual_family_id="f1",
+        delta_id="d1",
+        context_signature="c1",
+        memory_counts={},
+        graph_counts={"new_contingency": 1},
+    )
+
+    assert score.explanatory_potential >= 0.5
+
+
+def test_v6_system_run_step_stores_isf_fields(tmp_path) -> None:
+    db_path = tmp_path / "isf.sqlite"
+    system = V6System(
+        env=ToggleEnv(),
+        config=V6Config(
+            database_path=str(db_path),
+            recluster_every=2,
+            min_cluster_size=2,
+            context_length=1,
+            contingency_support_threshold=1,
+            contingency_confidence_threshold=0.0,
+            random_seed=0,
+        ),
+    )
+
+    system.run(steps=3)
+    system.close()
+
+    connection = __import__("sqlite3").connect(db_path)
+    try:
+        row = connection.execute(
+            """
+            SELECT
+                isf_version,
+                isf_total,
+                isf_survival_impact,
+                isf_prediction_error,
+                isf_learning_value,
+                isf_transfer_potential,
+                isf_explanatory_potential,
+                isf_weights_json
+            FROM interactions
+            ORDER BY id
+            LIMIT 1
+            """
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "isf_v01"
+        assert all(value is not None for value in row[1:])
+    finally:
+        connection.close()
+
+
+def test_v6_system_prediction_edges_add_explains_and_depends_on() -> None:
+    system = V6System(env=ToggleEnv(), config=V6Config(database_path=":memory:", random_seed=0))
+
+    system._add_prediction_explanation_edges(
+        interaction_id=1,
+        prediction_correct=True,
+        prediction_confidence=0.8,
+        predicted_family=9,
+        actual_family=9,
+        actual_context_signature=("ctx",),
+        selected_contingency=type("ContingencyRef", (), {"id": 7})(),
+    )
+
+    assert system.graph.count_edges_of_type("explains") >= 1
+    assert system.graph.count_edges_of_type("depends_on") >= 1
+
+
+def test_v6_system_prediction_edges_add_contradicts() -> None:
+    system = V6System(env=ToggleEnv(), config=V6Config(database_path=":memory:", random_seed=0))
+
+    system._add_prediction_explanation_edges(
+        interaction_id=1,
+        prediction_correct=False,
+        prediction_confidence=0.6,
+        predicted_family=8,
+        actual_family=9,
+        actual_context_signature=("ctx",),
+        selected_contingency=type("ContingencyRef", (), {"id": 7})(),
+    )
+
+    assert system.graph.count_edges_of_type("contradicts") >= 1
+    assert system.graph.count_edges_of_type("depends_on") >= 1
+
+
+def test_v6_system_run_step_stores_context_contradiction_fields(tmp_path) -> None:
+    from v6.contingency.contingency_learner import Contingency
+
+    db_path = tmp_path / "contradictions.sqlite"
+    system = V6System(
+        env=ToggleEnv(),
+        config=V6Config(
+            database_path=str(db_path),
+            context_length=2,
+            max_context_depth=5,
+            random_seed=0,
+        ),
+    )
+
+    fake_contingency = Contingency(
+        id=7,
+        context_level=2,
+        context_signature=("ctx1",),
+        action=1,
+        transformation_family=1,
+        support_count=3,
+        confidence=0.9,
+    )
+    system.predictor.predict_multi_scale = lambda *_args, **_kwargs: 1
+    system._prediction_confidence = lambda **_kwargs: 0.9
+    system.contingency_learner.best_stable_for_action = lambda *_args, **_kwargs: fake_contingency
+    system.contingency_learner.update_multi_scale = lambda *_args, **_kwargs: fake_contingency
+    system.contingency_learner.stable_contingencies = lambda: [fake_contingency]
+    system.clusterer.family_for_delta = lambda _delta_id: 2
+    system.clusterer.families = {2: object()}
+
+    system.run_step()
+    system.close()
+
+    connection = __import__("sqlite3").connect(db_path)
+    try:
+        row = connection.execute(
+            """
+            SELECT
+                context_contradiction,
+                context_contradiction_key,
+                context_expansion_suggested,
+                suggested_context_depth,
+                context_contradiction_reason
+            FROM prediction_results
+            ORDER BY id
+            LIMIT 1
+            """
+        ).fetchone()
+        assert row is not None
+        assert row[0] == 1
+        assert "|a1|1->2" in str(row[1])
+        assert row[2] == 0
+        assert row[3] == 3
+        assert row[4] == "confident_wrong_prediction_same_context"
+    finally:
+        connection.close()
+
+    assert system.graph.count_edges_of_type("contradicts") >= 1
+    assert any(
+        str(source).startswith("Context:")
+        and str(attrs.get("type", attrs.get("edge_type"))) == "contradicts"
+        for source, _target, attrs in system.graph.graph.edges(data=True)
+    )
+
+
+def test_v6_system_run_step_stores_carrier_fields(tmp_path) -> None:
+    db_path = tmp_path / "carrier.sqlite"
+    system = V6System(
+        env=ToggleEnv(),
+        config=V6Config(
+            database_path=str(db_path),
+            context_length=2,
+            carrier_min_support=1,
+            carrier_min_distinct_contexts=1,
+            carrier_min_prediction_lift=0.0,
+            carrier_min_compression_gain=0.0,
+            random_seed=0,
+        ),
+    )
+
+    system.run_step()
+    system.close()
+
+    connection = __import__("sqlite3").connect(db_path)
+    try:
+        interaction_row = connection.execute(
+            """
+            SELECT
+                carrier_signature,
+                carrier_event_recorded,
+                carrier_support_count,
+                carrier_distinct_family_count,
+                carrier_distinct_context_count
+            FROM interactions
+            ORDER BY id
+            LIMIT 1
+            """
+        ).fetchone()
+        prediction_row = connection.execute(
+            """
+            SELECT
+                carrier_signature,
+                carrier_event_recorded,
+                carrier_support_count,
+                carrier_distinct_family_count,
+                carrier_distinct_context_count
+            FROM prediction_results
+            ORDER BY id
+            LIMIT 1
+            """
+        ).fetchone()
+        assert interaction_row is not None
+        assert prediction_row is not None
+        assert interaction_row[0] is not None
+        assert interaction_row[1] == 1
+        assert interaction_row[2] >= 1
+        assert prediction_row[0] is not None
+        assert prediction_row[1] == 1
+    finally:
+        connection.close()
+
+
+def test_v6_system_run_step_stores_memory_lifecycle_fields(tmp_path) -> None:
+    db_path = tmp_path / "memory.sqlite"
+    system = V6System(
+        env=ToggleEnv(),
+        config=V6Config(
+            database_path=str(db_path),
+            context_length=2,
+            random_seed=0,
+            memory_min_records_before_forgetting=1,
+            memory_max_active_records=10,
+        ),
+    )
+
+    system.run_step()
+    system.close()
+
+    connection = __import__("sqlite3").connect(db_path)
+    try:
+        interaction_row = connection.execute(
+            """
+            SELECT
+                memory_status,
+                memory_retention_reason,
+                memory_replay_priority,
+                memory_replay_candidate,
+                memory_replay_count
+            FROM interactions
+            ORDER BY id
+            LIMIT 1
+            """
+        ).fetchone()
+        prediction_row = connection.execute(
+            """
+            SELECT
+                memory_status,
+                memory_retention_reason,
+                memory_replay_priority,
+                memory_replay_candidate,
+                memory_replay_count
+            FROM prediction_results
+            ORDER BY id
+            LIMIT 1
+            """
+        ).fetchone()
+        assert interaction_row is not None
+        assert prediction_row is not None
+        assert interaction_row[0] in {"active", "protected", "compressed", "forgotten"}
+        assert interaction_row[1] is not None
+        assert interaction_row[2] is not None
+        assert prediction_row[0] in {"active", "protected", "compressed", "forgotten"}
+        assert prediction_row[1] is not None
+    finally:
+        connection.close()
+
+
+def test_v6_system_run_step_stores_efficiency_fields(tmp_path) -> None:
+    db_path = tmp_path / "efficiency.sqlite"
+    system = V6System(
+        env=ToggleEnv(),
+        config=V6Config(
+            database_path=str(db_path),
+            context_length=2,
+            random_seed=0,
+        ),
+    )
+
+    system.run_step()
+    system.close()
+
+    connection = __import__("sqlite3").connect(db_path)
+    try:
+        interaction_row = connection.execute(
+            """
+            SELECT
+                efficiency_action_cost,
+                efficiency_cumulative_cost,
+                efficiency_repeated_state,
+                efficiency_repeated_context_action,
+                efficiency_no_effect_action,
+                efficiency_terminal_outcome,
+                efficiency_normalized_solve_efficiency,
+                efficiency_equivalent_outcome_cost_gap
+            FROM interactions
+            ORDER BY id
+            LIMIT 1
+            """
+        ).fetchone()
+        prediction_row = connection.execute(
+            """
+            SELECT
+                efficiency_action_cost,
+                efficiency_cumulative_cost,
+                efficiency_repeated_state,
+                efficiency_repeated_context_action,
+                efficiency_no_effect_action,
+                efficiency_terminal_outcome,
+                efficiency_normalized_solve_efficiency,
+                efficiency_equivalent_outcome_cost_gap
+            FROM prediction_results
+            ORDER BY id
+            LIMIT 1
+            """
+        ).fetchone()
+        assert interaction_row is not None
+        assert prediction_row is not None
+        assert interaction_row[0] is not None
+        assert interaction_row[1] is not None
+        assert interaction_row[2] in {0, 1}
+        assert interaction_row[3] in {0, 1}
+        assert interaction_row[4] in {0, 1}
+        assert interaction_row[5] in {0, 1}
+        assert prediction_row[0] is not None
+        assert prediction_row[1] is not None
     finally:
         connection.close()
 
@@ -2628,6 +3558,89 @@ def test_cli_accepts_role_transfer_v09c_options() -> None:
     assert args.split_mode == "leave_family_out"
 
 
+def test_cli_accepts_concept_candidates_v10fix_c_previous_v09b_dir() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "concept-candidates-v10fix-c",
+            "--previous-v09b-dir",
+            "runs/custom_v09b",
+        ]
+    )
+
+    assert args.command == "concept-candidates-v10fix-c"
+    assert args.previous_v09b_dir == "runs/custom_v09b"
+
+
+def test_v10fixc_passes_configured_previous_v09b_dir(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+    import v6.concept_candidates_v10fixc as mod
+
+    transfer_dir = tmp_path / "transfer"
+    transfer_dir.mkdir()
+    (transfer_dir / "v09c_report.json").write_text(json.dumps({"report": {}, "validation": {}}), encoding="utf-8")
+    captured: dict[str, str] = {}
+
+    monkeypatch.setattr(mod, "_load_optional_json", lambda path: {})
+    monkeypatch.setattr(mod.pd, "read_parquet", lambda path: pd.DataFrame())
+    monkeypatch.setattr(mod, "load_source_manifest_family_map", lambda path: {})
+    monkeypatch.setattr(mod, "load_game_to_manifest_family", lambda config: {})
+
+    def fake_prepare_family_context_stream(role_config):
+        captured["previous_v09b_dir"] = role_config.previous_v09b_dir
+        return iter(())
+
+    monkeypatch.setattr(mod, "prepare_family_context_stream", fake_prepare_family_context_stream)
+    monkeypatch.setattr(mod, "load_shard_group", lambda shards_dir, pattern: [])
+    monkeypatch.setattr(mod, "build_collision_rows", lambda rows: [])
+    monkeypatch.setattr(mod, "merge_exact_candidates", lambda rows, **kwargs: ([], {}))
+    monkeypatch.setattr(mod, "fuzzy_group_candidates", lambda rows, **kwargs: ([], [], {}))
+    monkeypatch.setattr(mod, "remap_concept_ids", lambda rows, mapping: rows)
+    monkeypatch.setattr(mod, "apply_target_metrics", lambda rows, mapped_transfer_rows: [])
+    monkeypatch.setattr(mod, "annotate_projection_outcomes", lambda rows, mapped_transfer_rows: [])
+    monkeypatch.setattr(mod, "build_attrition_rows_fixc", lambda **kwargs: [])
+    monkeypatch.setattr(mod, "build_label_rows", lambda rows: [])
+    monkeypatch.setattr(mod, "build_role_composition_rows", lambda rows: [])
+    monkeypatch.setattr(mod, "build_graph_edges", lambda rows: [])
+    monkeypatch.setattr(mod, "build_surface_comparison_rows", lambda rows: [])
+    monkeypatch.setattr(mod, "build_target_projection_mode_rows", lambda rows: [])
+    monkeypatch.setattr(mod, "build_concept_by_family_rows", lambda concept_rows, mapped_transfer_rows: [])
+    monkeypatch.setattr(
+        mod,
+        "build_report_payload_fixc",
+        lambda **kwargs: {
+            "config": {"previous_v09b_dir": kwargs["config"].previous_v09b_dir},
+            "report": {},
+            "validation": {},
+        },
+    )
+    monkeypatch.setattr(mod, "_write_parquet", lambda path, rows: None)
+    monkeypatch.setattr(mod, "format_report_fixc", lambda payload: "")
+
+    payload = run_concept_candidates_v10fixc(
+        ConceptCandidatesV10FixCConfig(
+            transfer_input_dir=str(transfer_dir),
+            previous_v09b_dir="runs/custom_v09b",
+            output_dir=str(tmp_path / "out"),
+        )
+    )
+
+    assert captured["previous_v09b_dir"] == "runs/custom_v09b"
+    assert payload["config"]["previous_v09b_dir"] == "runs/custom_v09b"
+
+
+def test_v10_runtime_sources_only_keep_v09b_path_as_dataclass_default() -> None:
+    expected = "runs/v6/v09b_role_transfer_refined_sourceclean_extended32"
+    paths = [
+        Path("src/v6/m4_role_concepts_v10e.py"),
+        Path("src/v6/concept_candidates_v10fixc.py"),
+        Path("src/v6/concept_candidates_v10fixd.py"),
+    ]
+
+    for path in paths:
+        assert path.read_text(encoding="utf-8").count(expected) == 1
+
+
 def test_v10_concept_sequence_and_motif_extraction() -> None:
     motif = extract_role_graph_motif(
         [
@@ -3256,6 +4269,90 @@ def test_v10fixc_mixed_candidates_generated() -> None:
     assert "mixed" in {row["candidate_source"] for row in raw_rows}
 
 
+def test_v10fixc_fallback_candidate_is_diagnostic_only() -> None:
+    import v6.concept_candidates_v10fixc as mod
+
+    candidate = {
+        "candidate_source": "fallback",
+        "manifest_resolution_status": "resolved",
+    }
+
+    assert mod.classify_candidate_evidence_lane(candidate) == "diagnostic_fallback"
+    assert mod.is_candidate_concept_eligible(candidate) is False
+
+
+def test_v10fixc_mixed_candidate_is_diagnostic_only() -> None:
+    import v6.concept_candidates_v10fixc as mod
+
+    candidate = {
+        "candidate_source": "mixed",
+        "manifest_resolution_status": "resolved",
+    }
+
+    assert mod.classify_candidate_evidence_lane(candidate) == "diagnostic_mixed"
+    assert mod.is_candidate_concept_eligible(candidate) is False
+
+
+def test_v10fixc_unknown_manifest_candidate_is_diagnostic_only() -> None:
+    import v6.concept_candidates_v10fixc as mod
+
+    candidate = {
+        "candidate_source": "stable",
+        "manifest_resolution_status": "resolved",
+        "manifest_family_ids": ["unknown_manifest_family"],
+    }
+
+    assert mod.classify_candidate_evidence_lane(candidate) == "diagnostic_unknown_manifest"
+    assert mod.is_candidate_concept_eligible(candidate) is False
+
+
+def test_v10fixc_unresolved_manifest_candidate_is_diagnostic_only() -> None:
+    import v6.concept_candidates_v10fixc as mod
+
+    candidate = {
+        "candidate_source": "stable",
+        "manifest_resolution_status": "failed",
+    }
+
+    assert mod.classify_candidate_evidence_lane(candidate) == "diagnostic_unresolved_manifest"
+    assert mod.is_candidate_concept_eligible(candidate) is False
+
+
+def test_v10fixc_stable_resolved_candidate_is_eligible() -> None:
+    import v6.concept_candidates_v10fixc as mod
+
+    candidate = {
+        "candidate_source": "stable",
+        "manifest_resolution_status": "resolved",
+        "manifest_family_ids": ["family_a", "family_b"],
+    }
+
+    assert mod.classify_candidate_evidence_lane(candidate) == "eligible_stable"
+    assert mod.is_candidate_concept_eligible(candidate) is True
+
+
+def test_v10fixc_policy_excludes_diagnostic_only_candidates_from_accepted_counts() -> None:
+    import v6.concept_candidates_v10fixc as mod
+
+    candidates = [
+        {"concept_id": "stable", "candidate_source": "stable", "manifest_resolution_status": "resolved", "manifest_family_ids": ["family_a"]},
+        {"concept_id": "fallback", "candidate_source": "fallback", "manifest_resolution_status": "resolved"},
+        {"concept_id": "mixed", "candidate_source": "mixed", "manifest_resolution_status": "resolved"},
+        {"concept_id": "unknown", "candidate_source": "stable", "manifest_resolution_status": "resolved", "manifest_family_ids": ["unknown_manifest_family"]},
+    ]
+
+    policy = mod.apply_candidate_evidence_policy(
+        candidates,
+        stable_predicate=lambda candidate: True,
+        transferable_predicate=lambda candidate: True,
+    )
+
+    assert len(policy["stable_concepts"]) == 1
+    assert len(policy["transferable_concepts"]) == 1
+    assert len(policy["diagnostic_only_candidates"]) == 3
+    assert len(policy["eligible_candidates"]) == 1
+
+
 def test_v10fixc_projection_rows_do_not_embed_nested_target_rows() -> None:
     contexts = _build_v10fixb_fixture_contexts(two_target_families=True)
     context = contexts[0]
@@ -3758,6 +4855,8 @@ def test_v10fixd_runs_deterministically_on_small_fixture(tmp_path, monkeypatch) 
             "runs/v6/v07_cd2_extended32_expanded",
             "--m1-input-dir",
             "runs/v6/v06_cd2_extended32",
+            "--previous-v09b-dir",
+            "runs/custom_v09b",
             "--output-dir",
             "runs/v6/v10_m4_concepts_fixd_extended32",
             "--workers",
@@ -3772,6 +4871,7 @@ def test_v10fixd_runs_deterministically_on_small_fixture(tmp_path, monkeypatch) 
     assert one["validation"]["scientific_conclusion"] == many["validation"]["scientific_conclusion"]
     assert one["report"]["target_family_score_count"] == many["report"]["target_family_score_count"]
     assert args.command == "concept-candidates-v10fix-d"
+    assert args.previous_v09b_dir == "runs/custom_v09b"
 
 
 def _build_v10e_single_contexts(include_four_role_manifest: bool = False, two_target_families: bool = False):
@@ -4105,9 +5205,308 @@ def test_v10e_required_output_files_are_produced(tmp_path, monkeypatch) -> None:
         "fallback_diagnostic_scores.parquet",
         "rejected_candidate_diagnostics.parquet",
         "concept_identity_diagnostics.parquet",
+        "candidate_generator_diagnostics.parquet",
+        "multiprocessing_diagnostics.parquet",
+        "candidate_cap_diagnostics.parquet",
+        "v10e_failure_decomposition.parquet",
+        "v10e_generator_failure_summary.parquet",
+        "v10e_projection_audit.parquet",
+        "v10e_baseline_dominance_audit.parquet",
+        "v10e_representation_loss_audit.parquet",
+        "v10e_closest_candidates.parquet",
+        "m4_failure_diagnostics.json",
     }
 
     assert expected <= {path.name for path in output_dir.iterdir()}
+    assert (output_dir / "shards").is_dir()
+    assert (output_dir / "shards" / "role_based_candidates__holdA.parquet").exists()
+    assert (output_dir / "shards" / "family_summary__holdB.parquet").exists()
+
+
+def test_v10e_failure_decomposition_records_failed_gates(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+    import v6.m4_role_concepts_v10e as mod
+
+    transfer_dir, manifest = _write_v10fixb_fixture(tmp_path)
+    single_contexts = _build_v10e_single_contexts()
+    monkeypatch.setattr(mod, "list_heldout_families", lambda config: ["holdA", "holdB"])
+    monkeypatch.setattr(mod, "build_single_family_context", lambda config, heldout_family: single_contexts[heldout_family])
+
+    payload = run_m4_role_concepts_v10e(
+        M4RoleConceptsV10eConfig(
+            transfer_input_dir=str(transfer_dir),
+            output_dir=str(tmp_path / "v10e_diag"),
+            game_set_manifest=str(manifest),
+            min_games=1,
+            min_manifest_families=1,
+        )
+    )
+    failure = pd.read_parquet(tmp_path / "v10e_diag" / "v10e_failure_decomposition.parquet")
+
+    assert payload["validation"]["scientific_conclusion"] == "m4_role_based_not_established"
+    assert bool(failure["surface_effect_failed"].any()) is True
+    assert bool(failure["future_option_failed"].any()) is True
+    assert bool(failure["raw_m2_failed"].any()) is True
+    assert bool(failure["graph_no_label_failed"].any()) is True
+    assert bool(failure["family_coverage_failed"].any()) is True
+
+
+def test_v10e_generator_summary_identifies_closest_generator(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+    import v6.m4_role_concepts_v10e as mod
+
+    transfer_dir, manifest = _write_v10fixb_fixture(tmp_path)
+    single_contexts = _build_v10e_single_contexts(include_four_role_manifest=True)
+    monkeypatch.setattr(mod, "list_heldout_families", lambda config: ["holdA", "holdB"])
+    monkeypatch.setattr(mod, "build_single_family_context", lambda config, heldout_family: single_contexts[heldout_family])
+
+    payload = run_m4_role_concepts_v10e(
+        M4RoleConceptsV10eConfig(
+            transfer_input_dir=str(transfer_dir),
+            output_dir=str(tmp_path / "v10e_gen"),
+            game_set_manifest=str(manifest),
+            min_games=1,
+            min_manifest_families=1,
+        )
+    )
+    summary = pd.read_parquet(tmp_path / "v10e_gen" / "v10e_generator_failure_summary.parquet")
+
+    assert not summary.empty
+    assert summary.iloc[0]["best_candidate_id"].startswith("m4-")
+    assert payload["report"]["best_generator_by_role_lift"] in set(summary["generator_type"])
+
+
+def test_v10e_projection_audit_detects_best_match_vs_mean_gap() -> None:
+    rows = build_projection_audit_rows(
+        [{"concept_id": "m4-a", "generator_type": "gen", "heldout_family": "holdA"}],
+        [
+            {"concept_id": "m4-a", "heldout_family": "holdA", "target_family_id": "t1", "target_family_score": 0.9},
+            {"concept_id": "m4-a", "heldout_family": "holdA", "target_family_id": "t2", "target_family_score": 0.1},
+        ],
+    )
+
+    assert rows[0]["best_target_family_id"] == "t1"
+    assert rows[0]["local_match_lost_by_averaging"] == 0.4
+
+
+def test_m4_failure_diagnostics_helpers() -> None:
+    from v6.m4_failure_diagnostics import count_by_reason, ensure_failure_buckets
+
+    counts = count_by_reason(
+        [
+            {"rejection_reason": "no_target_projection"},
+            {"rejection_reason": "no_target_projection"},
+            {"rejection_reason": "no_future_option_prediction_lift"},
+        ]
+    )
+    bucketed = ensure_failure_buckets({"no_target_projection": 2})
+
+    assert counts == {
+        "no_target_projection": 2,
+        "no_future_option_prediction_lift": 1,
+    }
+    assert bucketed["no_target_projection"] == 2
+    assert bucketed["no_source_roles"] == 0
+
+
+def test_v10e_zero_candidate_family_diagnostics() -> None:
+    import v6.m4_role_concepts_v10e as mod
+
+    class _Context:
+        heldout_family = "holdA"
+        source_neighborhoods = {"fam1": object()}
+        source_roles = {}
+
+    row = mod._build_v10e_family_failure_row(
+        heldout_family="holdA",
+        context=_Context(),
+        source_role_map={},
+        stable_items=[],
+        raw_candidate_rows=[],
+        projection_rows=[],
+        target_family_rows=[],
+        rejected_rows=[],
+        fallback_rows=[],
+        min_role_count=2,
+    )
+
+    assert row["source_neighborhoods_available"] is True
+    assert row["source_roles_available"] is False
+    assert row["stable_role_items_count"] == 0
+    assert row["raw_candidates_count"] == 0
+    assert row["failure_reason_counts"]["no_source_roles"] >= 1
+    assert row["failure_reason_counts"]["insufficient_stable_role_items"] >= 1
+
+
+def test_v10fixc_failure_mode_aggregation_from_synthetic_rows() -> None:
+    import v6.concept_candidates_v10fixc as mod
+
+    diagnostics = mod.build_fixc_failure_diagnostics(
+        by_family_rows=[{"heldout_family": "holdA", "zero_candidate_reason": "subcomposition_generation_failure"}],
+        source_role_map_diag_rows=[
+            {
+                "heldout_family": "holdA",
+                "source_neighborhood_count": 1,
+                "source_role_count": 1,
+                "source_role_map_overlap_count": 1,
+                "stable_role_candidate_count": 0,
+                "failure_mode": "manifest_resolution_failure",
+            }
+        ],
+        attrition_rows=[{"heldout_family": "holdA", "raw_candidate_count_premerge": 0}],
+        raw_candidate_rows=[
+            {"heldout_family": "holdA", "candidate_source": "fallback"},
+            {"heldout_family": "holdA", "candidate_source": "mixed"},
+        ],
+        stable_concepts=[],
+        transferable_concepts=[],
+        mapped_transfer_rows=[],
+    )
+    row = diagnostics["per_family"][0]
+
+    assert row["failure_reason_counts"]["manifest_resolution_failure"] == 1
+    assert row["failure_reason_counts"]["subcomposition_generation_failure"] == 1
+    assert row["fallback_candidate_count"] == 1
+    assert row["mixed_candidate_count"] == 1
+
+
+def test_v10e_baseline_dominance_audit_identifies_raw_m2_and_graph_no_label() -> None:
+    rows = build_baseline_dominance_rows(
+        [
+            {
+                "concept_id": "m4-a",
+                "target_family_id": "t1",
+                "lift_vs_raw_m2": -0.9,
+                "lift_vs_graph_no_label": -0.2,
+                "lift_vs_surface_effect": -0.1,
+                "future_option_prediction_lift": -0.05,
+                "lift_vs_best_role": 0.1,
+            },
+            {
+                "concept_id": "m4-b",
+                "target_family_id": "t2",
+                "lift_vs_raw_m2": -0.1,
+                "lift_vs_graph_no_label": -0.8,
+                "lift_vs_surface_effect": -0.2,
+                "future_option_prediction_lift": -0.05,
+                "lift_vs_best_role": 0.1,
+            },
+        ]
+    )
+
+    assert rows[0]["raw_m2_dominates"] is True
+    assert rows[1]["graph_no_label_dominates"] is True
+
+
+def _build_v10e_report_fixture(
+    *,
+    generator_failure_rows: list[dict[str, Any]] | None = None,
+    failure_rows: list[dict[str, Any]] | None = None,
+    projection_rows: list[dict[str, Any]] | None = None,
+    baseline_rows: list[dict[str, Any]] | None = None,
+    representation_rows: list[dict[str, Any]] | None = None,
+    closest_rows: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    return build_v10e_report(
+        config=M4RoleConceptsV10eConfig(output_dir="unused", workers=2),
+        transfer_report={},
+        concept_rows=[],
+        transferable_rows=[],
+        transfer_rows=[],
+        fallback_rows=[],
+        fallback_score_rows=[],
+        by_family_rows=[],
+        merge_diag={},
+        fallback_only_signal_detected=False,
+        requested_workers=2,
+        effective_workers=2,
+        multiprocessing_used=True,
+        generator_rows=[],
+        cap_rows=[],
+        failure_decomposition_rows=failure_rows or [],
+        generator_failure_rows=generator_failure_rows or [],
+        projection_audit_rows=projection_rows or [],
+        baseline_dominance_rows=baseline_rows or [],
+        closest_candidate_rows=closest_rows or [],
+        representation_loss_rows=representation_rows or [],
+        failure_diagnostics={"per_family": [], "total_failure_reason_counts": {}, "attrition_totals": {}},
+    )
+
+
+def test_v10e_report_best_generator_by_role_lift_not_empty_when_rows_exist() -> None:
+    payload = _build_v10e_report_fixture(
+        generator_failure_rows=[
+            {"generator_type": "g1", "max_lift_vs_best_role": 0.1},
+            {"generator_type": "g2", "max_lift_vs_best_role": 0.3},
+        ]
+    )
+
+    assert payload["report"]["best_generator_by_role_lift"] == "g2"
+
+
+def test_v10e_report_distinguishes_raw_m2_failure_from_raw_m2_dominance() -> None:
+    payload = _build_v10e_report_fixture(
+        failure_rows=[
+            {"failed_gates": ["raw_m2"], "future_option_failed": False, "surface_effect_failed": False, "family_coverage_failed": False},
+            {"failed_gates": ["raw_m2"], "future_option_failed": False, "surface_effect_failed": False, "family_coverage_failed": False},
+        ],
+        baseline_rows=[
+            {"raw_m2_dominates": False, "graph_no_label_dominates": True},
+            {"raw_m2_dominates": False, "graph_no_label_dominates": True},
+        ],
+    )
+
+    assert payload["report"]["raw_m2_failure_rate"] == 1.0
+    assert payload["report"]["raw_m2_dominance_rate"] == 0.0
+
+
+def test_v10e_family_coverage_failure_has_priority_in_diagnostic_conclusion() -> None:
+    payload = _build_v10e_report_fixture(
+        failure_rows=[
+            {"failed_gates": ["family_coverage", "raw_m2", "graph_no_label"], "future_option_failed": False, "surface_effect_failed": False, "family_coverage_failed": True},
+            {"failed_gates": ["family_coverage", "raw_m2", "graph_no_label"], "future_option_failed": False, "surface_effect_failed": False, "family_coverage_failed": True},
+        ],
+        baseline_rows=[
+            {"raw_m2_dominates": False, "graph_no_label_dominates": True},
+            {"raw_m2_dominates": False, "graph_no_label_dominates": True},
+        ],
+    )
+
+    assert payload["report"]["diagnostic_conclusion"] == "m4_failure_due_to_family_coverage"
+
+
+def test_v10e_report_includes_projection_averaging_summary() -> None:
+    payload = _build_v10e_report_fixture(
+        projection_rows=[
+            {"concept_id": "c1", "target_best_match_score": 0.9, "target_mean_score": 0.3, "best_target_family_id": "t1", "local_match_lost_by_averaging": 0.6},
+            {"concept_id": "c2", "target_best_match_score": 0.8, "target_mean_score": 0.5, "best_target_family_id": "t2", "local_match_lost_by_averaging": 0.3},
+        ]
+    )
+
+    assert abs(payload["report"]["mean_projection_averaging_loss"] - 0.45) < 1e-9
+    assert abs(payload["report"]["max_projection_averaging_loss"] - 0.6) < 1e-9
+    assert payload["report"]["worst_projection_averaging_candidate"] == "c1"
+    assert payload["report"]["best_local_match_candidate"] == "c1"
+    assert payload["report"]["best_local_match_score"] == 0.9
+    assert payload["report"]["best_local_match_target_family"] == "t1"
+
+
+def test_v10e_report_includes_diagnostic_row_counts() -> None:
+    payload = _build_v10e_report_fixture(
+        failure_rows=[{"failed_gates": []}] * 3,
+        generator_failure_rows=[{"generator_type": "g", "max_lift_vs_best_role": 0.1}] * 2,
+        projection_rows=[{"concept_id": "c", "target_best_match_score": 0.2, "target_mean_score": 0.1, "best_target_family_id": "t", "local_match_lost_by_averaging": 0.1}] * 4,
+        baseline_rows=[{"raw_m2_dominates": False, "graph_no_label_dominates": False}] * 5,
+        representation_rows=[{"concept_id": "x"}] * 6,
+        closest_rows=[{"concept_id": "y"}] * 7,
+    )
+
+    assert payload["report"]["failure_decomposition_rows"] == 3
+    assert payload["report"]["generator_failure_summary_rows"] == 2
+    assert payload["report"]["projection_audit_rows"] == 4
+    assert payload["report"]["baseline_dominance_rows"] == 5
+    assert payload["report"]["representation_loss_rows"] == 6
+    assert payload["report"]["closest_candidate_rows"] == 7
 
 
 def test_v10e_deterministic_concept_ids_and_cli_accepts_options(tmp_path, monkeypatch) -> None:
@@ -4118,6 +5517,29 @@ def test_v10e_deterministic_concept_ids_and_cli_accepts_options(tmp_path, monkey
     single_contexts = _build_v10e_single_contexts()
     monkeypatch.setattr(mod, "list_heldout_families", lambda config: ["holdA", "holdB"])
     monkeypatch.setattr(mod, "build_single_family_context", lambda config, heldout_family: single_contexts[heldout_family])
+    monkeypatch.setattr(mod, "choose_v10e_worker_count", lambda requested_workers, heldout_family_count, worker_memory_gib: min(requested_workers, heldout_family_count))
+
+    class _ImmediateFuture:
+        def __init__(self, value):
+            self._value = value
+
+        def result(self):
+            return self._value
+
+    class _FakeExecutor:
+        def __init__(self, max_workers):
+            self.max_workers = max_workers
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def submit(self, fn, *args, **kwargs):
+            return _ImmediateFuture(fn(*args, **kwargs))
+
+    monkeypatch.setattr(mod, "PROCESS_POOL_CLASS", _FakeExecutor)
 
     one = run_m4_role_concepts_v10e(
         M4RoleConceptsV10eConfig(
@@ -4151,6 +5573,8 @@ def test_v10e_deterministic_concept_ids_and_cli_accepts_options(tmp_path, monkey
             "runs/v6/v07_cd2_extended32_expanded",
             "--m1-input-dir",
             "runs/v6/v06_cd2_extended32",
+            "--previous-v09b-dir",
+            "runs/custom_v09b",
             "--output-dir",
             "runs/v6/v10e_role_based_m4_extended32",
             "--workers",
@@ -4162,7 +5586,139 @@ def test_v10e_deterministic_concept_ids_and_cli_accepts_options(tmp_path, monkey
 
     assert one["validation"]["scientific_conclusion"] == many["validation"]["scientific_conclusion"]
     assert ids_one == ids_many
+    assert many["report"]["effective_workers"] == 2
+    assert one["report"]["diagnostic_conclusion"] == many["report"]["diagnostic_conclusion"]
     assert args.command == "m4-role-concepts-v10e"
+    assert args.previous_v09b_dir == "runs/custom_v09b"
+
+
+def test_v10e_passes_configured_previous_v09b_dir(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+    import v6.m4_role_concepts_v10e as mod
+
+    transfer_dir = tmp_path / "transfer"
+    transfer_dir.mkdir()
+    (transfer_dir / "v09c_report.json").write_text(json.dumps({"report": {}, "validation": {}}), encoding="utf-8")
+    captured: dict[str, str] = {}
+
+    monkeypatch.setattr(mod.pd, "read_parquet", lambda path: pd.DataFrame())
+
+    def fake_list_heldout_families(role_config):
+        captured["previous_v09b_dir"] = role_config.previous_v09b_dir
+        return []
+
+    monkeypatch.setattr(mod, "list_heldout_families", fake_list_heldout_families)
+    monkeypatch.setattr(mod, "load_v10e_shards", lambda shards_dir, prefix: [])
+    monkeypatch.setattr(mod, "merge_exact_candidates", lambda rows, **kwargs: ([], {}))
+    monkeypatch.setattr(mod, "apply_target_metrics", lambda rows, transfer_rows: [])
+    monkeypatch.setattr(mod, "annotate_projection_outcomes", lambda rows, transfer_rows: [])
+    monkeypatch.setattr(mod, "apply_role_based_gates", lambda rows, transfer_rows: [])
+    monkeypatch.setattr(mod, "build_rejected_candidate_rows", lambda rows: [])
+    monkeypatch.setattr(mod, "build_concept_identity_rows", lambda rows: [])
+    monkeypatch.setattr(mod, "build_compression_rows", lambda rows: [])
+    monkeypatch.setattr(mod, "build_future_option_rows", lambda rows: [])
+    monkeypatch.setattr(mod, "build_baseline_rows", lambda rows: [])
+    monkeypatch.setattr(mod, "build_failure_decomposition_rows", lambda concept_rows, target_family_rows: [])
+    monkeypatch.setattr(mod, "build_generator_failure_summary_rows", lambda rows: [])
+    monkeypatch.setattr(mod, "build_projection_audit_rows", lambda concept_rows, target_family_rows: [])
+    monkeypatch.setattr(mod, "build_baseline_dominance_rows", lambda rows: [])
+    monkeypatch.setattr(mod, "build_representation_loss_rows", lambda rows: [])
+    monkeypatch.setattr(mod, "build_closest_candidate_rows", lambda rows: [])
+    monkeypatch.setattr(mod, "build_candidate_generator_rows", lambda rows: [])
+    monkeypatch.setattr(mod, "build_multiprocessing_rows", lambda family_results, **kwargs: [])
+    monkeypatch.setattr(mod, "build_candidate_cap_rows", lambda rows: [])
+    monkeypatch.setattr(
+        mod,
+        "build_v10e_report",
+        lambda **kwargs: {
+            "config": {"previous_v09b_dir": kwargs["config"].previous_v09b_dir},
+            "report": {},
+            "validation": {},
+        },
+    )
+    monkeypatch.setattr(mod, "_write_parquet", lambda path, rows: None)
+    monkeypatch.setattr(mod, "format_v10e_report", lambda payload: "")
+
+    payload = run_m4_role_concepts_v10e(
+        M4RoleConceptsV10eConfig(
+            transfer_input_dir=str(transfer_dir),
+            previous_v09b_dir="runs/custom_v09b",
+            output_dir=str(tmp_path / "out"),
+        )
+    )
+
+    assert captured["previous_v09b_dir"] == "runs/custom_v09b"
+    assert payload["config"]["previous_v09b_dir"] == "runs/custom_v09b"
+
+
+def test_v10e_workers_2_uses_executor_and_builds_context_inside_worker(tmp_path, monkeypatch) -> None:
+    import v6.m4_role_concepts_v10e as mod
+
+    transfer_dir, manifest = _write_v10fixb_fixture(tmp_path)
+    single_contexts = _build_v10e_single_contexts()
+    built = []
+    submitted = []
+    monkeypatch.setattr(mod, "list_heldout_families", lambda config: ["holdA", "holdB"])
+    monkeypatch.setattr(mod, "choose_v10e_worker_count", lambda requested_workers, heldout_family_count, worker_memory_gib: 2)
+    monkeypatch.setattr(
+        mod,
+        "build_single_family_context",
+        lambda config, heldout_family: built.append(heldout_family) or single_contexts[heldout_family],
+    )
+
+    class _ImmediateFuture:
+        def __init__(self, value):
+            self._value = value
+
+        def result(self):
+            return self._value
+
+    class _FakeExecutor:
+        def __init__(self, max_workers):
+            self.max_workers = max_workers
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def submit(self, fn, *args, **kwargs):
+            submitted.append((fn, args, kwargs))
+            return _ImmediateFuture(fn(*args, **kwargs))
+
+    monkeypatch.setattr(mod, "PROCESS_POOL_CLASS", _FakeExecutor)
+
+    payload = run_m4_role_concepts_v10e(
+        M4RoleConceptsV10eConfig(
+            transfer_input_dir=str(transfer_dir),
+            output_dir=str(tmp_path / "v10e_mp"),
+            game_set_manifest=str(manifest),
+            workers=2,
+            min_games=1,
+            min_manifest_families=1,
+        )
+    )
+
+    assert payload["report"]["multiprocessing_used"] is True
+    assert payload["report"]["effective_workers"] == 2
+    assert built == ["holdA", "holdB"]
+    assert len(submitted) == 2
+    assert all(isinstance(args[0], str) for _, args, _ in submitted)
+    assert all(not any(isinstance(arg, SingleFamilyContext) for arg in args) for _, args, _ in submitted)
+
+
+def test_v10e_generators_produce_graph_future_and_motif_candidates() -> None:
+    import v6.m4_role_concepts_v10e as mod
+
+    context = _build_v10e_single_contexts(include_four_role_manifest=True)["holdA"]
+    stable_items = mod.build_stable_role_items(context, max_role_items=128)
+    rows, counts, _, _ = mod.generate_role_based_candidates(context, stable_items, max_role_count=3, max_candidates=250000)
+
+    assert rows
+    assert counts["adjacent_graph_pair"] > 0
+    assert counts["future_option_pair"] > 0
+    assert counts["graph_motif_bridge"] > 0
 
 
 def test_v08d_no_label_ablation_removes_label_features(tmp_path) -> None:
@@ -4320,6 +5876,126 @@ def test_cli_accepts_interaction_sampling_collect_only_option() -> None:
 
     assert args.command == "interaction-sampling-v05c"
     assert args.collect_only is True
+
+
+def test_v05c_generate_sampling_dbs_passes_context_depth_into_jobs(tmp_path, monkeypatch) -> None:
+    captured: list[dict] = []
+
+    def fake_run_sampling_jobs(jobs: list[dict], *, workers: int) -> None:
+        captured.extend(jobs)
+
+    monkeypatch.setattr(interaction_sampling, "_run_sampling_jobs", fake_run_sampling_jobs)
+
+    interaction_sampling._generate_sampling_dbs(
+        InteractionSamplingConfig(
+            context_depth=2,
+            games=("tt01",),
+            samplers=("random_baseline",),
+            seeds=(0,),
+            steps=10,
+            workers=1,
+        ),
+        tmp_path,
+    )
+
+    assert len(captured) == 1
+    assert captured[0]["context_depth"] == 2
+
+
+def test_v05c_run_sampling_job_uses_context_depth_for_v6_config(tmp_path, monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class DummySampler:
+        reset_count = 0
+        reset_unavailable = False
+
+    class DummyEnv:
+        reset_count = 0
+        skipped_terminal_steps = 0
+
+        def __init__(self, game_id: str, seed: int, env_root: str | None = None) -> None:
+            captured["env_init"] = {"game_id": game_id, "seed": seed, "env_root": env_root}
+
+    class DummySystem:
+        def __init__(self, env, config, action_sampler) -> None:
+            captured["env"] = env
+            captured["config"] = config
+            captured["action_sampler"] = action_sampler
+
+        def run(self, steps: int) -> None:
+            captured["steps"] = steps
+
+        def close(self) -> None:
+            captured["closed"] = True
+
+    def fake_make_sampler(name: str, seed: int) -> DummySampler:
+        captured["sampler_init"] = {"name": name, "seed": seed}
+        return DummySampler()
+
+    def fake_analyze_future_effects(**kwargs) -> list[dict]:
+        captured["effects_call"] = kwargs
+        return []
+
+    def fake_write_sampling_metadata(path, **values) -> None:
+        captured["metadata_path"] = path
+        captured["metadata"] = values
+
+    monkeypatch.setattr(interaction_sampling, "make_sampler", fake_make_sampler)
+    monkeypatch.setattr(interaction_sampling, "ArcGridEnvironment", DummyEnv)
+    monkeypatch.setattr(interaction_sampling, "V6System", DummySystem)
+    monkeypatch.setattr(interaction_sampling, "analyze_future_effects", fake_analyze_future_effects)
+    monkeypatch.setattr(interaction_sampling, "_write_sampling_metadata", fake_write_sampling_metadata)
+
+    interaction_sampling._run_sampling_job(
+        {
+            "game": "tt01",
+            "sampler_name": "random_baseline",
+            "seed": 0,
+            "steps": 10,
+            "horizon": 3,
+            "context_depth": 4,
+            "commit_steps": 5,
+            "db_path": str(tmp_path / "seed_0.sqlite"),
+            "env_root": None,
+        }
+    )
+
+    assert captured["config"].context_length == 4
+    assert captured["metadata"]["context_depth"] == 4
+    assert captured["metadata"]["context_length"] == 4
+    assert "carrier_candidate_count" in captured["metadata"]
+    assert "emergent_carrier_count" in captured["metadata"]
+    assert "carrier_event_count" in captured["metadata"]
+    assert "carrier_max_support" in captured["metadata"]
+    assert "memory_record_count" in captured["metadata"]
+    assert "memory_active_count" in captured["metadata"]
+    assert "memory_protected_count" in captured["metadata"]
+    assert "memory_compressed_count" in captured["metadata"]
+    assert "memory_forgotten_count" in captured["metadata"]
+    assert "memory_replay_candidate_count" in captured["metadata"]
+    assert "efficiency_event_count" in captured["metadata"]
+    assert "efficiency_total_action_cost" in captured["metadata"]
+    assert "efficiency_mean_action_cost" in captured["metadata"]
+    assert "efficiency_no_effect_action_count" in captured["metadata"]
+
+
+def test_v05c_resolve_scope_clamps_train_and_test_seeds_to_available_set() -> None:
+    config = interaction_sampling.resolve_interaction_sampling_scope(
+        InteractionSamplingConfig(
+            games=("tt01",),
+            samplers=("random_baseline",),
+            seeds=(0,),
+            train_seeds=(0, 1),
+            test_seed=2,
+            steps=10,
+            horizon=3,
+            context_depth=2,
+            workers=1,
+        )
+    )
+
+    assert config.train_seeds == (0,)
+    assert config.test_seed == 0
 
 
 def _build_v06_fixture(root) -> str:
