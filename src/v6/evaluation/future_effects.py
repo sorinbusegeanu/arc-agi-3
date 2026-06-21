@@ -206,6 +206,39 @@ def analyze_future_effects(
         return effects
 
 
+def interaction_future_option_deltas(
+    connection: sqlite3.Connection,
+    *,
+    horizon: int,
+) -> dict[int, float]:
+    ensure_future_effects_schema(connection)
+    store = ContingencyStore(connection)
+    contingencies = store.all_contingencies()
+    events = load_interaction_events(connection)
+    max_level = max((contingency.context_level for contingency in contingencies), default=0)
+    occurrences = match_contingency_occurrences(events, contingencies, max_context_level=max_level)
+    by_contingency = {int(contingency.id): contingency for contingency in contingencies}
+    selected: dict[int, tuple[int, int, float, float]] = {}
+    for contingency_id, occurrence_indices in occurrences.items():
+        contingency = by_contingency.get(int(contingency_id))
+        if contingency is None:
+            continue
+        rank = (
+            int(contingency.context_level),
+            int(contingency.support_count),
+            float(contingency.confidence),
+        )
+        for index in occurrence_indices:
+            measurement = future_effect_for_occurrence(events, index=int(index), horizon=horizon)
+            if measurement is None:
+                continue
+            interaction_id = int(events[int(index)].interaction_id)
+            current = selected.get(interaction_id)
+            if current is None or rank > current[:3]:
+                selected[interaction_id] = (*rank, float(measurement[2]))
+    return {interaction_id: payload[3] for interaction_id, payload in selected.items()}
+
+
 def load_interaction_events(connection: sqlite3.Connection) -> list[InteractionEvent]:
     _ensure_column(connection, "prediction_results", "episode_id", "INTEGER NOT NULL DEFAULT 0")
     rows = connection.execute(
