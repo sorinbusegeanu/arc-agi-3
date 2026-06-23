@@ -29,6 +29,16 @@ from v6.evaluation.prefuture_role_prediction import PrefutureConfig, run_prefutu
 from v6.evaluation.role_candidates import ROLE_DISCOVERY_GAMES, RoleCandidateRunConfig, run_role_candidate_v03
 from v6.evaluation.role_generalization import RoleGeneralizationConfig, run_role_generalization_v04b
 from v6.evaluation.role_validation import RoleValidationConfig, run_role_validation_v04
+from v6.hypothesis_h02_report import (
+    evaluate_h02_prediction_violation_attention,
+    find_h02_ready_runs,
+    run_h02_on_best_ready_run,
+)
+from v6.hypothesis_h03_report import (
+    evaluate_h03_transformation_family_formation,
+    find_h03_ready_runs,
+    run_h03_on_best_ready_run,
+)
 from v6.main import V6Config, V6System
 from v6.m2_expand_v08c import M2ExpandV08cConfig, run_m2_expand_v08c
 from v6.role_candidates_v08 import RoleCandidatesV08Config, run_role_candidates_v08
@@ -455,6 +465,46 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark = subparsers.add_parser("storage-benchmark")
     benchmark.add_argument("--rows", type=int, default=100000)
     benchmark.add_argument("--output-dir", default="runs/v6/storage_benchmark")
+
+    hypothesis_h02 = subparsers.add_parser("hypothesis-h02-report")
+    hypothesis_h02.add_argument("--run-dir", required=True)
+    hypothesis_h02.add_argument("--output-dir", required=True)
+    hypothesis_h02.add_argument("--max-rows", type=int, default=1000000)
+    hypothesis_h02.add_argument("--max-db-files", type=int, default=20)
+    hypothesis_h02.add_argument("--prefer-db", default=None)
+    hypothesis_h02.add_argument("--scan-all-dbs", action="store_true")
+
+    find_h02_ready = subparsers.add_parser("find-h02-ready-runs")
+    find_h02_ready.add_argument("--runs-root", required=True)
+    find_h02_ready.add_argument("--output-dir", required=True)
+    find_h02_ready.add_argument("--run-best", action="store_true")
+    find_h02_ready.add_argument("--max-db-files", type=int, default=20)
+    find_h02_ready.add_argument("--max-rows", type=int, default=1000000)
+    find_h02_ready.add_argument("--prefer-db", default=None)
+    find_h02_ready.add_argument("--scan-all-dbs", action="store_true")
+
+    hypothesis_h03 = subparsers.add_parser("hypothesis-h03-report")
+    hypothesis_h03.add_argument("--run-dir", required=True)
+    hypothesis_h03.add_argument("--output-dir", required=True)
+    hypothesis_h03.add_argument("--max-db-files", type=int, default=1000)
+    hypothesis_h03.add_argument("--max-rows", type=int, default=1000000)
+    hypothesis_h03.add_argument("--prefer-db", default=None)
+    hypothesis_h03.add_argument("--scan-all-dbs", dest="scan_all_dbs", action="store_true")
+    hypothesis_h03.add_argument("--no-scan-all-dbs", dest="scan_all_dbs", action="store_false")
+    hypothesis_h03.set_defaults(scan_all_dbs=True)
+    hypothesis_h03.add_argument("--min-family-support", type=int, default=2)
+
+    find_h03_ready = subparsers.add_parser("find-h03-ready-runs")
+    find_h03_ready.add_argument("--runs-root", required=True)
+    find_h03_ready.add_argument("--output-dir", required=True)
+    find_h03_ready.add_argument("--run-best", action="store_true")
+    find_h03_ready.add_argument("--max-db-files", type=int, default=1000)
+    find_h03_ready.add_argument("--max-rows", type=int, default=1000000)
+    find_h03_ready.add_argument("--prefer-db", default=None)
+    find_h03_ready.add_argument("--scan-all-dbs", dest="scan_all_dbs", action="store_true")
+    find_h03_ready.add_argument("--no-scan-all-dbs", dest="scan_all_dbs", action="store_false")
+    find_h03_ready.set_defaults(scan_all_dbs=True)
+    find_h03_ready.add_argument("--min-family-support", type=int, default=2)
     return parser
 
 
@@ -1194,6 +1244,70 @@ def main() -> int:
 
     if args.command == "storage-benchmark":
         result = run_storage_benchmark(rows=args.rows, output_dir=args.output_dir)
+        print(json.dumps(result, indent=2))
+        return 0
+
+    if args.command == "hypothesis-h02-report":
+        result = evaluate_h02_prediction_violation_attention(
+            run_dir=Path(args.run_dir),
+            output_dir=Path(args.output_dir),
+            max_rows=int(args.max_rows),
+            max_db_files=int(args.max_db_files),
+            prefer_db=args.prefer_db,
+            scan_all_dbs=bool(args.scan_all_dbs),
+        )
+        print(json.dumps(result, indent=2))
+        return 0
+
+    if args.command == "find-h02-ready-runs":
+        if args.run_best:
+            result = run_h02_on_best_ready_run(
+                runs_root=Path(args.runs_root),
+                output_dir=Path(args.output_dir),
+                max_rows=int(args.max_rows),
+                max_db_files=int(args.max_db_files),
+                prefer_db=args.prefer_db,
+                scan_all_dbs=bool(args.scan_all_dbs),
+            )
+        else:
+            result = find_h02_ready_runs(
+                runs_root=Path(args.runs_root),
+                output_dir=Path(args.output_dir),
+            )
+        print(json.dumps(result, indent=2))
+        return 0
+
+    if args.command == "hypothesis-h03-report":
+        result = evaluate_h03_transformation_family_formation(
+            run_dir=Path(args.run_dir),
+            output_dir=Path(args.output_dir),
+            max_db_files=int(args.max_db_files),
+            max_rows=int(args.max_rows),
+            scan_all_dbs=bool(args.scan_all_dbs),
+            prefer_db=None if args.prefer_db is None else Path(args.prefer_db),
+            min_family_support=int(args.min_family_support),
+        )
+        print(json.dumps(result, indent=2))
+        return 0
+
+    if args.command == "find-h03-ready-runs":
+        if args.run_best:
+            result = run_h03_on_best_ready_run(
+                runs_root=Path(args.runs_root),
+                output_dir=Path(args.output_dir),
+                max_db_files=int(args.max_db_files),
+                max_rows=int(args.max_rows),
+                scan_all_dbs=bool(args.scan_all_dbs),
+                prefer_db=None if args.prefer_db is None else Path(args.prefer_db),
+                min_family_support=int(args.min_family_support),
+            )
+        else:
+            result = find_h03_ready_runs(
+                runs_root=Path(args.runs_root),
+                output_dir=Path(args.output_dir),
+                max_db_files=int(args.max_db_files),
+                prefer_db=None if args.prefer_db is None else Path(args.prefer_db),
+            )
         print(json.dumps(result, indent=2))
         return 0
     return 0
