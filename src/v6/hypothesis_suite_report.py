@@ -8,6 +8,7 @@ from typing import Any
 from v6.hypothesis_h01_report import evaluate_h01_contingency_emergence
 from v6.hypothesis_h02_report import evaluate_h02_prediction_violation_attention
 from v6.hypothesis_h03_report import evaluate_h03_transformation_family_formation
+from v6.hypothesis_h04_report import evaluate_h04_carrier_emergence
 
 
 SUITE_JSON_NAME = "hypothesis_suite_summary.json"
@@ -40,10 +41,11 @@ def run_hypothesis_suite_report(
     h01_dir = output_dir / "h01"
     h02_dir = output_dir / "h02"
     h03_dir = output_dir / "h03"
-    h01 = evaluate_h01_contingency_emergence(run_dir=run_dir, output_dir=h01_dir)
+    h01 = evaluate_h01_contingency_emergence(run_dir=run_dir, output_dir=h01_dir, memory_dir=memory_dir)
     h02 = evaluate_h02_prediction_violation_attention(
         run_dir=run_dir,
         output_dir=h02_dir,
+        memory_dir=memory_dir,
         max_rows=int(max_rows),
         max_db_files=int(max_db_files),
         scan_all_dbs=bool(scan_all_dbs),
@@ -51,11 +53,16 @@ def run_hypothesis_suite_report(
     h03 = evaluate_h03_transformation_family_formation(
         run_dir=run_dir,
         output_dir=h03_dir,
+        memory_dir=memory_dir,
         max_db_files=int(max_db_files),
         max_rows=int(max_rows),
         scan_all_dbs=bool(scan_all_dbs),
     )
-    h04 = evaluate_h04_carrier_emergence(memory_dir=memory_dir, run_dir=run_dir, output_dir=output_dir / "h04")
+    h04 = (
+        evaluate_h04_carrier_emergence(memory_dir=memory_dir, run_dir=run_dir, output_dir=output_dir / "h04")
+        if memory_dir is not None
+        else {"hypothesis_id": "H04", "decision": "NOT_IMPLEMENTED", "core_metrics": {}, "missing_evidence": ["memory_dir not provided"]}
+    )
     summary = build_hypothesis_suite_summary(
         run_dir=run_dir,
         memory_dir=memory_dir,
@@ -73,29 +80,6 @@ def run_hypothesis_suite_report(
     )
     _write_suite_summary(summary, output_dir)
     return summary
-
-
-def evaluate_h04_carrier_emergence(*, memory_dir: Path | None, run_dir: Path, output_dir: Path) -> dict[str, Any]:
-    del run_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
-    if memory_dir is None:
-        return {
-            "hypothesis_id": "H04",
-            "decision": "NOT_IMPLEMENTED",
-            "core_metrics": {},
-            "missing_evidence": ["memory_dir not provided"],
-        }
-    summary_path = Path(memory_dir) / "memory_summary.json"
-    payload = _load_json(summary_path) or {}
-    return {
-        "hypothesis_id": "H04",
-        "decision": "NOT_IMPLEMENTED",
-        "core_metrics": {
-            "carrier_candidate_count": payload.get("carrier_candidate_count"),
-            "stable_carrier_count": payload.get("emergent_carrier_count", 0),
-        },
-        "missing_evidence": ["H04 report module not implemented in this checkout"],
-    }
 
 
 def build_hypothesis_suite_summary(

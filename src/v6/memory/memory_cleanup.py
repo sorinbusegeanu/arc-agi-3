@@ -16,8 +16,7 @@ def cleanup_epoch_artifacts(*, epoch_dir: str | Path, memory_dir: str | Path) ->
     status_dir = epoch_path / "status"
     cleanup_dir.mkdir(parents=True, exist_ok=True)
     status_dir.mkdir(parents=True, exist_ok=True)
-    if not reports_dir.exists():
-        raise RuntimeError("cleanup refused because reports directory is missing")
+    validate_cleanup_safe(epoch_path, Path(memory_dir), required_reports=True)
 
     disk_before = _tree_size(epoch_path)
     raw_files = [path for path in raw_dir.rglob("*") if path.is_file()] if raw_dir.exists() else []
@@ -77,6 +76,33 @@ def cleanup_epoch_artifacts(*, epoch_dir: str | Path, memory_dir: str | Path) ->
     }
     (cleanup_dir / "cleanup_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return summary
+
+
+def validate_cleanup_safe(epoch_dir: str | Path, memory_dir: str | Path, required_reports: bool = True) -> None:
+    epoch_path = Path(epoch_dir)
+    memory_path = Path(memory_dir)
+    reports_dir = epoch_path / "reports"
+    if required_reports and not reports_dir.exists():
+        raise RuntimeError("cleanup refused because reports directory is missing")
+    required_report_files = [
+        reports_dir / "hypothesis_suite_summary.json",
+    ]
+    if required_reports and any(not path.exists() for path in required_report_files):
+        missing = [str(path) for path in required_report_files if not path.exists()]
+        raise RuntimeError(f"cleanup refused because required reports are missing: {missing}")
+    memory_files = [
+        memory_path / "current_state.sqlite",
+        memory_path / "graph.sqlite",
+        memory_path / "replay_queue.sqlite",
+        memory_path / "memory_summary.json",
+    ]
+    missing_memory = [str(path) for path in memory_files if not path.exists()]
+    if missing_memory:
+        raise RuntimeError(f"cleanup refused because compact memory is incomplete: {missing_memory}")
+    summary_payload = json.loads((memory_path / "memory_summary.json").read_text(encoding="utf-8"))
+    fold_summary = summary_payload.get("fold_summary")
+    if not fold_summary:
+        raise RuntimeError("cleanup refused because fold summary is missing from memory_summary.json")
 
 
 def disk_usage_snapshot(path: str | Path) -> dict[str, Any]:

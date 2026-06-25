@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import networkx as nx
 
 from v6.contingency.contingency_learner import Contingency
@@ -156,6 +158,65 @@ class GraphManager:
     def count_edges_of_type(self, edge_type: str) -> int:
         return int(self.edge_type_counts().get(str(edge_type), 0))
 
+    def import_node(self, node_id: str, node_type: str, canonical_key: str | None, attrs: dict | None = None) -> None:
+        merged = dict(attrs or {})
+        merged.setdefault("node_type", str(node_type))
+        if canonical_key is not None:
+            merged.setdefault("canonical_key", str(canonical_key))
+        self.graph.add_node(str(node_id), **merged)
+
+    def import_edge(
+        self,
+        source_node_id: str,
+        target_node_id: str,
+        edge_type: str,
+        weight: float = 1.0,
+        evidence: dict | None = None,
+        support_count: int | None = None,
+    ) -> None:
+        self.add_typed_edge(
+            str(source_node_id),
+            str(target_node_id),
+            str(edge_type),
+            weight=float(weight),
+            evidence=evidence,
+        )
+        edge_data = self.graph.get_edge_data(str(source_node_id), str(target_node_id), default={})
+        for attrs in edge_data.values():
+            if str(attrs.get("type", attrs.get("edge_type", ""))) != str(edge_type):
+                continue
+            if support_count is not None:
+                attrs["support_count"] = max(int(attrs.get("support_count", 0) or 0), int(support_count))
+            break
+
+    def export_compact_rows(self) -> dict[str, list[dict[str, object]]]:
+        nodes: list[dict[str, object]] = []
+        for node_id, attrs in self.graph.nodes(data=True):
+            serializable = {key: _to_jsonable(value) for key, value in attrs.items()}
+            nodes.append(
+                {
+                    "node_id": str(node_id),
+                    "node_type": str(attrs.get("node_type", "Unknown")),
+                    "canonical_key": None if attrs.get("canonical_key") is None else str(attrs.get("canonical_key")),
+                    "support_count": attrs.get("support_count"),
+                    "attrs_json": json.dumps(serializable, sort_keys=True),
+                }
+            )
+        edges: list[dict[str, object]] = []
+        for source, target, attrs in self.graph.edges(data=True):
+            evidence = attrs.get("evidence") if isinstance(attrs.get("evidence"), dict) else {}
+            edges.append(
+                {
+                    "source_node_id": str(source),
+                    "target_node_id": str(target),
+                    "edge_type": str(attrs.get("type", attrs.get("edge_type", ""))),
+                    "weight": float(attrs.get("weight", 1.0) or 1.0),
+                    "support_count": attrs.get("support_count"),
+                    "evidence_json": json.dumps(_to_jsonable(evidence), sort_keys=True),
+                }
+            )
+        return {"nodes": nodes, "edges": edges}
+
     def _ensure_unknown_node(self, node_id: str) -> None:
         if self.graph.has_node(node_id):
             return
@@ -176,3 +237,13 @@ def _family_node(identifier: int) -> str:
 
 def _contingency_node(identifier: int) -> str:
     return f"contingency:{int(identifier)}"
+
+
+def _to_jsonable(value: object) -> object:
+    if isinstance(value, dict):
+        return {str(key): _to_jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_jsonable(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)

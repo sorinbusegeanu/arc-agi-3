@@ -198,6 +198,7 @@ H03_DEFAULTS: dict[str, Any] = {
 def evaluate_h03_transformation_family_formation(
     run_dir: Path,
     output_dir: Path,
+    memory_dir: Path | None = None,
     max_db_files: int = DEFAULT_MAX_DB_FILES,
     max_rows: int = DEFAULT_MAX_ROWS,
     scan_all_dbs: bool = True,
@@ -217,11 +218,24 @@ def evaluate_h03_transformation_family_formation(
     result["input_report_found"] = input_report is not None
     result["db_found"] = bool(sqlite_paths)
     result["db_paths_total"] = len(sqlite_paths)
+    result["evidence_source"] = "raw_epoch_db"
 
     report_metrics = _extract_report_metrics(input_report)
     for field, value in report_metrics.items():
         result[field] = value
 
+    if input_report is None and memory_dir is not None:
+        compact = _extract_h03_compact_metrics(Path(memory_dir))
+        result.update(compact)
+        result["evidence_source"] = "compact_memory"
+        result["decision"] = "PARTIALLY_VALID" if _gt(result.get("transformation_family_count"), 0) else "INCONCLUSIVE"
+        result["scientific_conclusion"] = (
+            "H03 evaluated from compact memory after raw cleanup."
+            if _gt(result.get("transformation_family_count"), 0)
+            else "H03 remains inconclusive because compact memory lacks family evidence."
+        )
+        _finalize_h03_result(result, output_dir)
+        return result
     if input_report is None:
         result["missing_evidence"].append(f"Required input report missing: {INPUT_REPORT_NAME}")
         result["scientific_conclusion"] = "H03 cannot be evaluated because the required interaction-sampling report is missing."
@@ -237,6 +251,12 @@ def evaluate_h03_transformation_family_formation(
         min_family_support=min_family_support,
     )
     result.update(direct_metrics)
+    if memory_dir is not None and not sqlite_paths:
+        compact = _extract_h03_compact_metrics(Path(memory_dir))
+        for key, value in compact.items():
+            if result.get(key) is None:
+                result[key] = value
+        result["evidence_source"] = "mixed"
     if result.get("memory_record_count") is None:
         result["memory_record_count"] = report_metrics.get("memory_record_count")
 
@@ -358,6 +378,41 @@ def evaluate_h03_transformation_family_formation(
     _populate_h03_evidence_lists(result)
     _finalize_h03_result(result, output_dir)
     return result
+
+
+def _extract_h03_compact_metrics(memory_dir: Path) -> dict[str, Any]:
+    current_state = memory_dir / "current_state.sqlite"
+    graph_db = memory_dir / "graph.sqlite"
+    if not current_state.exists():
+        return {}
+    with sqlite3.connect(current_state) as state_conn:
+        family_count = int(state_conn.execute("SELECT COUNT(*) FROM transformation_families").fetchone()[0])
+        singleton_count = int(state_conn.execute("SELECT COUNT(*) FROM transformation_families WHERE member_count <= 1").fetchone()[0])
+        member_total = int(state_conn.execute("SELECT COALESCE(SUM(member_count), 0) FROM transformation_families").fetchone()[0])
+    graph_metrics = {"family_cross_context_count": None, "family_cross_game_count": None, "family_cross_sampler_count": None}
+    if graph_db.exists():
+        with sqlite3.connect(graph_db) as graph_conn:
+            graph_metrics = {
+                "family_cross_context_count": int(
+                    graph_conn.execute("SELECT COUNT(*) FROM graph_edges WHERE edge_type = 'explains_effect'").fetchone()[0]
+                ),
+                "family_cross_game_count": int(
+                    graph_conn.execute("SELECT COUNT(*) FROM graph_edges WHERE edge_type = 'observed_in'").fetchone()[0]
+                ),
+                "family_cross_sampler_count": int(
+                    graph_conn.execute("SELECT COUNT(*) FROM graph_edges WHERE edge_type = 'sampled_by'").fetchone()[0]
+                ),
+            }
+    return {
+        "transformation_family_count": family_count,
+        "stable_transformation_family_count": family_count,
+        "family_member_count_total": member_total,
+        "singleton_family_count": singleton_count,
+        "singleton_family_ratio": (singleton_count / family_count) if family_count else None,
+        "compression_ratio": (member_total / family_count) if family_count else None,
+        "compression_gain": ((member_total / family_count) - 1.0) if family_count else None,
+        **graph_metrics,
+    }
 
 
 def compute_h03_family_metrics_from_existing_artifacts(

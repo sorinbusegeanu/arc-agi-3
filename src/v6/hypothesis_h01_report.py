@@ -62,7 +62,7 @@ H01_DEFAULTS: dict[str, Any] = {
 }
 
 
-def evaluate_h01_contingency_emergence(run_dir: Path, output_dir: Path) -> dict:
+def evaluate_h01_contingency_emergence(run_dir: Path, output_dir: Path, *, memory_dir: Path | None = None) -> dict:
     run_dir = Path(run_dir)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -78,7 +78,20 @@ def evaluate_h01_contingency_emergence(run_dir: Path, output_dir: Path) -> dict:
     result["input_report_txt_found"] = report_txt_path.exists()
     result["db_found"] = bool(sqlite_paths)
     result["db_paths_total"] = len(sqlite_paths)
+    result["evidence_source"] = "raw_epoch_db"
 
+    if report is None and memory_dir is not None:
+        compact_metrics = _extract_compact_memory_metrics(Path(memory_dir))
+        result.update(compact_metrics)
+        result["evidence_source"] = "compact_memory"
+        result["decision"] = "PARTIALLY_VALID" if _gt(compact_metrics.get("stable_contingency_count"), 0) else "INCONCLUSIVE"
+        result["scientific_conclusion"] = (
+            "H01 evaluated from compact memory after raw cleanup."
+            if _gt(compact_metrics.get("stable_contingency_count"), 0)
+            else "H01 remains inconclusive because compact memory lacks stable contingency evidence."
+        )
+        _finalize_h01_result(result, output_dir)
+        return result
     if report is None:
         result["missing_evidence"].append(f"Required input report missing: {INPUT_REPORT_JSON_NAME}")
         result["scientific_conclusion"] = "H01 cannot be evaluated because the required interaction-sampling report is missing."
@@ -94,6 +107,12 @@ def evaluate_h01_contingency_emergence(run_dir: Path, output_dir: Path) -> dict:
     )
     db_metrics = _extract_db_metrics(sqlite_paths) if sqlite_paths and needs_db_fallback else {}
     result.update(report_metrics)
+    if memory_dir is not None and not sqlite_paths:
+        compact_metrics = _extract_compact_memory_metrics(Path(memory_dir))
+        for key, value in compact_metrics.items():
+            if result.get(key) is None or result.get(key) == {}:
+                result[key] = value
+        result["evidence_source"] = "mixed" if report is not None else "compact_memory"
 
     for key in (
         "total_interaction_count",
@@ -223,6 +242,37 @@ def evaluate_h01_contingency_emergence(run_dir: Path, output_dir: Path) -> dict:
 
     _finalize_h01_result(result, output_dir)
     return result
+
+
+def _extract_compact_memory_metrics(memory_dir: Path) -> dict[str, Any]:
+    current_state = memory_dir / "current_state.sqlite"
+    if not current_state.exists():
+        return {}
+    with sqlite3.connect(current_state) as connection:
+        per_game = dict(connection.execute("SELECT COALESCE(game, 'unknown'), COUNT(*) FROM stable_contingencies GROUP BY COALESCE(game, 'unknown')").fetchall())
+        per_sampler = dict(connection.execute("SELECT COALESCE(sampler, 'unknown'), COUNT(*) FROM stable_contingencies GROUP BY COALESCE(sampler, 'unknown')").fetchall())
+        stable_count = int(connection.execute("SELECT COUNT(*) FROM stable_contingencies WHERE support_count >= 20").fetchone()[0])
+        summary_row = connection.execute(
+            "SELECT value_json FROM memory_summary WHERE key = 'total_interactions_seen'"
+        ).fetchone()
+        interaction_count = 0
+        if summary_row is not None and summary_row[0] is not None:
+            try:
+                interaction_count = int(json.loads(summary_row[0]))
+            except Exception:
+                try:
+                    interaction_count = int(summary_row[0])
+                except Exception:
+                    interaction_count = 0
+        return {
+            "total_interaction_count": interaction_count if interaction_count > 0 else None,
+            "stable_contingency_count": stable_count,
+            "contingency_candidate_count": int(connection.execute("SELECT COUNT(*) FROM stable_contingencies").fetchone()[0]),
+            "discovered_contingency_count": int(connection.execute("SELECT COUNT(*) FROM stable_contingencies").fetchone()[0]),
+            "per_game_contingency_counts": {str(key): int(value) for key, value in per_game.items()},
+            "per_sampler_contingency_counts": {str(key): int(value) for key, value in per_sampler.items()},
+            "mean_prediction_accuracy": None,
+        }
 
 
 def find_h01_ready_runs(runs_root: Path, output_dir: Path) -> dict:

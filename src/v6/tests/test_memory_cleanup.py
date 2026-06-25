@@ -153,6 +153,7 @@ def test_cleanup_deletes_raw_files_but_keeps_reports_and_memory(tmp_path: Path) 
     (reports_dir / "hypothesis_suite_summary.json").write_text("{}", encoding="utf-8")
     (status_dir / "epoch_status.json").write_text("{}", encoding="utf-8")
     memory_paths = ensure_memory_layout(tmp_path / "memory")
+    (memory_paths.summary_json).write_text(json.dumps({"fold_summary": {"stable_contingencies_added": 1}}, indent=2), encoding="utf-8")
 
     summary = cleanup_epoch_artifacts(epoch_dir=epoch_dir, memory_dir=memory_paths.root)
 
@@ -162,6 +163,21 @@ def test_cleanup_deletes_raw_files_but_keeps_reports_and_memory(tmp_path: Path) 
     assert status_dir.exists()
     assert memory_paths.current_state.exists()
     assert (cleanup_dir / "cleanup_summary.json").exists()
+
+
+def test_cleanup_refuses_without_compact_memory_update(tmp_path: Path) -> None:
+    epoch_dir = tmp_path / "epoch_0001"
+    (epoch_dir / "raw").mkdir(parents=True)
+    (epoch_dir / "reports").mkdir()
+    (epoch_dir / "reports" / "hypothesis_suite_summary.json").write_text("{}", encoding="utf-8")
+    memory_paths = ensure_memory_layout(tmp_path / "memory")
+
+    try:
+        cleanup_epoch_artifacts(epoch_dir=epoch_dir, memory_dir=memory_paths.root)
+    except RuntimeError as exc:
+        assert "fold summary" in str(exc)
+    else:
+        raise AssertionError("cleanup should have refused without fold summary")
 
 
 def test_stop_due_to_disk_triggers_at_threshold(tmp_path: Path, monkeypatch) -> None:

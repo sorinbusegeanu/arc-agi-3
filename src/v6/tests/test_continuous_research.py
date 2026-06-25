@@ -245,7 +245,7 @@ def test_no_new_contingencies_stop_works(tmp_path: Path, monkeypatch) -> None:
     assert manifest["stop_reason"] == "no new stable contingencies for configured consecutive epochs"
 
 
-def test_epoch_status_and_suite_summary_exist_and_h04_is_not_implemented(tmp_path: Path, monkeypatch) -> None:
+def test_epoch_status_and_suite_summary_exist_and_memory_continuity_is_written(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(
         continuous_research,
         "run_interaction_sampling_v05c",
@@ -268,10 +268,12 @@ def test_epoch_status_and_suite_summary_exist_and_h04_is_not_implemented(tmp_pat
 
     status = json.loads((root / "epochs" / "epoch_0001" / "status" / "epoch_status.json").read_text(encoding="utf-8"))
     summary = json.loads((root / "epochs" / "epoch_0001" / "reports" / "hypothesis_suite_summary.json").read_text(encoding="utf-8"))
+    continuity = json.loads((root / "epochs" / "epoch_0001" / "reports" / "epoch_memory_continuity.json").read_text(encoding="utf-8"))
     assert status["H01"] is not None
     assert status["H02"] is not None
     assert status["H03"] is not None
-    assert summary["H04 decision"] == "NOT_IMPLEMENTED"
+    assert summary["H04 decision"] in {"INCONCLUSIVE", "PARTIALLY_VALID", "VALID", "INVALID"}
+    assert continuity["continuity_valid"] is True
 
 
 def test_disk_stop_triggers_and_default_is_90(tmp_path: Path, monkeypatch) -> None:
@@ -296,3 +298,45 @@ def test_disk_stop_triggers_and_default_is_90(tmp_path: Path, monkeypatch) -> No
 
     assert manifest["stop_if_disk_above_percent"] == 90.0
     assert manifest["stop_reason"] == "disk usage exceeded configured limit"
+
+
+def test_resume_true_fails_if_memory_files_missing(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        continuous_research,
+        "run_interaction_sampling_v05c",
+        lambda config: _write_sampling_fixture(Path(config.output_dir), global_step_offset=int(config.global_step_offset), stable_support=25),
+    )
+    root = tmp_path / "continuous"
+    run_continuous_research(
+        ContinuousResearchConfig(
+            experiment_name="exp",
+            games="tt01",
+            samplers="mixed",
+            seeds="0",
+            steps_per_epoch=5000,
+            max_epochs=1,
+            horizon=10,
+            context_depth=1,
+            output_dir=str(root),
+        )
+    )
+    (root / "memory" / "current_state.sqlite").unlink()
+    try:
+        run_continuous_research(
+            ContinuousResearchConfig(
+                experiment_name="exp",
+                games="tt01",
+                samplers="mixed",
+                seeds="0",
+                steps_per_epoch=5000,
+                max_epochs=2,
+                horizon=10,
+                context_depth=1,
+                output_dir=str(root),
+                resume=True,
+            )
+        )
+    except RuntimeError as exc:
+        assert "resume requested" in str(exc)
+    else:
+        raise AssertionError("expected resume failure when memory files are missing")

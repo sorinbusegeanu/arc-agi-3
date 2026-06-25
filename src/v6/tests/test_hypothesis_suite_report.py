@@ -5,7 +5,11 @@ import sqlite3
 from pathlib import Path
 
 from v6.cli import main
+from v6.hypothesis_h01_report import evaluate_h01_contingency_emergence
+from v6.hypothesis_h02_report import evaluate_h02_prediction_violation_attention
+from v6.hypothesis_h03_report import evaluate_h03_transformation_family_formation
 from v6.hypothesis_suite_report import SUITE_JSON_NAME, build_hypothesis_suite_summary
+from v6.memory.compact_memory import ensure_memory_layout
 
 
 def _write_suite_input_report(run_dir: Path) -> None:
@@ -216,3 +220,59 @@ def test_suite_summary_allows_temporal_milestone_nulls(tmp_path: Path) -> None:
 
     row = summary["temporal_order_diagnostics"]["per_case"][0]
     assert row["h02_before_h03"] is None
+
+
+def test_hypothesis_reports_can_read_from_compact_memory_after_raw_cleanup(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    out_dir = tmp_path / "out"
+    run_dir.mkdir()
+    memory = ensure_memory_layout(tmp_path / "memory")
+    with sqlite3.connect(memory.current_state) as connection:
+        connection.execute(
+            """
+            INSERT INTO stable_contingencies (
+                contingency_id, canonical_key, game, sampler, action, effect_signature, support_count,
+                first_seen_global_step, last_seen_global_step, stability_score, mean_prediction_error,
+                mean_replay_priority, representative_example_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (1, '["ctx"]|a0|efamily:a', "tt01", "mixed", 0, "family:a", 25, 1, 10, 1.0, 0.0, 0.9, 1),
+        )
+        connection.execute(
+            """
+            INSERT INTO transformation_families (
+                family_id, canonical_signature, relaxed_signature, effect_type, action_group, polarity,
+                support_count, member_count, first_seen_global_step, last_seen_global_step, stability_score
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (1, "family:a", "family:a", "unknown", "unknown", "unknown", 10, 3, 1, 10, 1.0),
+        )
+        connection.execute(
+            """
+            INSERT INTO contradiction_clusters (
+                cluster_id, canonical_key, support_count, first_seen_global_step, last_seen_global_step,
+                max_prediction_error, mean_replay_priority
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("ctx-a", "ctx-a", 2, 1, 10, 1.0, 0.9),
+        )
+        connection.commit()
+    with sqlite3.connect(memory.replay_queue) as connection:
+        connection.execute(
+            """
+            INSERT INTO replay_queue (
+                replay_id, owner_type, owner_id, priority_score, reason, first_seen_global_step, last_seen_global_step, compact_payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("1", "interaction", "1", 0.9, "contradiction_linked", 1, 10, "{}"),
+        )
+        connection.commit()
+    memory.summary_json.write_text(json.dumps({"fold_summary": {"stable_contingencies_added": 1}, "total_interactions_seen": 10}, indent=2), encoding="utf-8")
+
+    h01 = evaluate_h01_contingency_emergence(run_dir=run_dir, output_dir=out_dir / "h01", memory_dir=memory.root)
+    h02 = evaluate_h02_prediction_violation_attention(run_dir=run_dir, output_dir=out_dir / "h02", memory_dir=memory.root)
+    h03 = evaluate_h03_transformation_family_formation(run_dir=run_dir, output_dir=out_dir / "h03", memory_dir=memory.root)
+
+    assert h01["evidence_source"] == "compact_memory"
+    assert h02["evidence_source"] == "compact_memory"
+    assert h03["evidence_source"] == "compact_memory"

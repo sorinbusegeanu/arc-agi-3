@@ -101,6 +101,45 @@ class CarrierEmergenceTracker:
     def build_candidates(self) -> list[CarrierCandidate]:
         return [self._build_candidate(carrier_signature) for carrier_signature in sorted(self.by_carrier)]
 
+    def import_candidate(
+        self,
+        *,
+        carrier_signature: str,
+        carrier_source: str,
+        support_count: int,
+        linked_family_count: int,
+        first_seen_global_step: int | None,
+        last_seen_global_step: int | None,
+        stability_score: float,
+        is_emergent: bool,
+    ) -> None:
+        normalized_source = str(carrier_source)
+        normalized_emergent = bool(is_emergent) and normalized_source != "context_action_fallback"
+        context_count = max(self.min_distinct_contexts if normalized_emergent else 1, int(linked_family_count or 0), 1)
+        family_count = max(1, int(linked_family_count or 0))
+        event_count = max(1, int(support_count or 0))
+        base_family_id = f"restored-family:{carrier_signature}"
+        for index in range(event_count):
+            family_id = base_family_id if family_count <= 1 else f"{base_family_id}:{index % family_count}"
+            context_signature = f"restored-context:{carrier_signature}:{index % context_count}"
+            prediction_correct = True if normalized_emergent else (index % 2 == 0)
+            self.record_interaction(
+                interaction_id=f"restored:{carrier_signature}:{index}",
+                carrier_signature=str(carrier_signature),
+                context_signature=context_signature,
+                action_signature=None,
+                family_id=family_id,
+                delta_signature=f"restored-delta:{carrier_signature}:{index}",
+                prediction_correct=prediction_correct,
+                carrier_source=normalized_source,
+            )
+        # Force the imported candidate to carry forward the stronger persisted metrics.
+        if str(carrier_signature) in self.by_carrier:
+            candidate = self._build_candidate(str(carrier_signature))
+            target_prediction_lift = max(float(candidate.prediction_lift), float(stability_score or 0.0))
+            if target_prediction_lift > float(candidate.prediction_lift):
+                self.correct_with_carrier[str(carrier_signature)] = int(round(target_prediction_lift * max(1, self.prediction_with_carrier[str(carrier_signature)])))
+
     def stats_for_carrier(self, carrier_signature: str) -> dict[str, Any]:
         candidate = self._build_candidate(str(carrier_signature))
         return {

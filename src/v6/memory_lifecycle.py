@@ -219,6 +219,22 @@ class MemoryLifecycleManager:
             ],
         }
 
+    def import_record(self, record: MemoryRecord) -> None:
+        self.records[str(record.interaction_id)] = record
+        self._recompute_counters()
+
+    def import_replay_candidate(self, candidate: ReplayCandidate) -> None:
+        self.replay_candidates[str(candidate.interaction_id)] = ReplayCandidate(
+            interaction_id=str(candidate.interaction_id),
+            replay_priority=float(candidate.replay_priority),
+            reason=str(candidate.reason),
+            family_id=None if candidate.family_id is None else str(candidate.family_id),
+            context_signature=None if candidate.context_signature is None else str(candidate.context_signature),
+            status=str(candidate.status),
+        )
+        self._trim_replay_queue()
+        self._recompute_counters()
+
     def _should_enter_replay(self, record: MemoryRecord) -> bool:
         return (
             float(record.prediction_error) >= 0.50

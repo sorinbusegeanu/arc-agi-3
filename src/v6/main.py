@@ -4,6 +4,7 @@ import json
 import random
 import sqlite3
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from v6.carrier_emergence import CarrierEmergenceTracker, extract_carrier_signature
@@ -18,6 +19,8 @@ from v6.graph.graph_manager import GraphManager
 from v6.interaction_significance import compute_interaction_significance
 from v6.memory_lifecycle import MemoryLifecycleManager
 from v6.memory.contingency_store import ContingencyStore
+from v6.memory.compact_memory import fold_live_system_into_compact_memory
+from v6.memory.compact_memory_restore import load_compact_memory_into_system
 from v6.memory.interaction_store import Interaction, InteractionStore
 from v6.memory.transformation_store import TransformationStore
 from v6.prediction.predictor import Predictor
@@ -27,6 +30,10 @@ from v6.transformation.transformation_clusterer import TransformationClusterer
 @dataclass(frozen=True)
 class V6Config:
     database_path: str = ":memory:"
+    memory_input_dir: str | None = None
+    memory_output_dir: str | None = None
+    restore_compact_memory: bool = False
+    persist_compact_memory_on_close: bool = False
     global_step_offset: int = 0
     recluster_every: int = 100
     min_cluster_size: int = 5
@@ -116,6 +123,19 @@ class V6System:
         self.episode_id = 0
         self.step_count = 0
         self._isf_counts: dict[str, int] = {}
+        self.compact_memory_restore_summary: dict[str, Any] = {
+            "stable_contingencies_restored": 0,
+            "transformation_families_restored": 0,
+            "family_members_restored": 0,
+            "carrier_candidates_restored": 0,
+            "replay_candidates_restored": 0,
+            "graph_nodes_restored": 0,
+            "graph_edges_restored": 0,
+            "memory_summary_loaded": False,
+            "restore_warnings": [],
+        }
+        if bool(self.config.restore_compact_memory) and self.config.memory_input_dir:
+            self.compact_memory_restore_summary = load_compact_memory_into_system(self, Path(self.config.memory_input_dir))
 
     def choose_action(self) -> int:
         actions = self.env.available_actions()
@@ -609,6 +629,8 @@ class V6System:
         }
 
     def close(self) -> None:
+        if bool(self.config.persist_compact_memory_on_close) and self.config.memory_output_dir:
+            fold_live_system_into_compact_memory(self, Path(self.config.memory_output_dir))
         self.connection.commit()
         self.connection.close()
 

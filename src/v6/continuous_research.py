@@ -9,7 +9,7 @@ from typing import Any
 from v6.evaluation.interaction_sampling import InteractionSamplingConfig, parse_v05c_games, parse_v05c_samplers, run_interaction_sampling_v05c
 from v6.hypothesis_suite_report import run_hypothesis_suite_report
 from v6.memory.compact_memory import CompactMemoryFoldConfig, build_memory_summary, ensure_memory_layout, fold_epoch_raw_into_compact_memory, load_memory_summary
-from v6.memory.memory_cleanup import cleanup_epoch_artifacts, disk_usage_snapshot, stop_due_to_disk
+from v6.memory.memory_cleanup import cleanup_epoch_artifacts, disk_usage_snapshot, stop_due_to_disk, validate_cleanup_safe
 
 
 @dataclass(frozen=True)
@@ -74,6 +74,7 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
         global_step_end = global_step_start + int(config.steps_per_epoch) - 1
         memory_before = build_memory_summary(memory_paths)
         memory_size_before = _tree_size(memory_dir)
+        previous_summary_snapshot = load_memory_summary(memory_paths.summary_json)
 
         sampling_rows = run_interaction_sampling_v05c(
             InteractionSamplingConfig(
@@ -117,10 +118,20 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
             memory_size_before_bytes=memory_size_before,
             memory_size_after_bytes=_tree_size(memory_dir),
         )
+        memory_after = build_memory_summary(memory_paths)
+        continuity_report = _write_memory_continuity_report(
+            reports_dir=reports_dir,
+            epoch_id=epoch_id,
+            previous_memory_summary=previous_summary_snapshot,
+            restored_memory_summary=memory_before,
+            after_epoch_memory_summary=memory_after,
+            memory_loaded_from_previous_epoch=epoch_number > 1,
+        )
+        validate_cleanup_safe(epoch_dir, memory_dir, required_reports=True)
         cleanup_summary = cleanup_epoch_artifacts(epoch_dir=epoch_dir, memory_dir=memory_dir) if bool(config.cleanup) else _no_cleanup_summary(epoch_dir, memory_dir)
         disk_after = disk_usage_snapshot(root)
 
-        deltas = _compute_epoch_deltas(memory_before, build_memory_summary(memory_paths), suite_summary, latest_status)
+        deltas = _compute_epoch_deltas(memory_before, memory_after, suite_summary, latest_status)
         if int(deltas["stable_contingency_count_delta"]) <= 0:
             consecutive_no_new += 1
         else:
@@ -150,6 +161,7 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
             "carrier_candidates": h04_metrics.get("carrier_candidate_count"),
             "stable_carriers": h04_metrics.get("stable_carrier_count"),
             "cleanup": cleanup_summary,
+            "memory_continuity": continuity_report,
             "deltas": deltas,
             "next_action": f"continue {f'epoch_{epoch_number + 1:04d}'}",
         }
@@ -344,6 +356,37 @@ def _no_cleanup_summary(epoch_dir: Path, memory_dir: Path) -> dict[str, Any]:
     }
     (epoch_dir / "cleanup" / "cleanup_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return summary
+
+
+def _write_memory_continuity_report(
+    *,
+    reports_dir: Path,
+    epoch_id: str,
+    previous_memory_summary: dict[str, Any],
+    restored_memory_summary: dict[str, Any],
+    after_epoch_memory_summary: dict[str, Any],
+    memory_loaded_from_previous_epoch: bool,
+) -> dict[str, Any]:
+    continuity_failures: list[str] = []
+    continuity_valid = True
+    if memory_loaded_from_previous_epoch:
+        for key in ("stable_contingency_count", "transformation_family_count", "graph_node_count", "graph_edge_count"):
+            if int(restored_memory_summary.get(key, 0) or 0) < int(previous_memory_summary.get(key, 0) or 0):
+                continuity_failures.append(f"{key} decreased before epoch start")
+        if int(previous_memory_summary.get("replay_queue_size", 0) or 0) > 0 and int(restored_memory_summary.get("replay_queue_size", 0) or 0) <= 0:
+            continuity_failures.append("replay_queue_size was not restored")
+        continuity_valid = not continuity_failures
+    report = {
+        "epoch_id": epoch_id,
+        "memory_loaded_from_previous_epoch": memory_loaded_from_previous_epoch,
+        "previous_memory_summary": previous_memory_summary,
+        "restored_memory_summary": restored_memory_summary,
+        "after_epoch_memory_summary": after_epoch_memory_summary,
+        "continuity_valid": continuity_valid,
+        "continuity_failures": continuity_failures,
+    }
+    (reports_dir / "epoch_memory_continuity.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return report
 
 
 def _write_manifest(path: Path, manifest: dict[str, Any]) -> None:

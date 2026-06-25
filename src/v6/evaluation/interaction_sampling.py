@@ -334,6 +334,10 @@ def _run_sampling_job(job: dict) -> dict:
         env=env,
         config=V6Config(
             database_path=str(db_path),
+            memory_input_dir=job.get("memory_input_dir"),
+            memory_output_dir=job.get("memory_output_dir"),
+            restore_compact_memory=bool(job.get("memory_input_dir")),
+            persist_compact_memory_on_close=False,
             global_step_offset=int(job.get("global_step_offset", 0) or 0),
             random_seed=seed,
             context_length=int(job.get("context_depth", 3)),
@@ -355,6 +359,11 @@ def _run_sampling_job(job: dict) -> dict:
         graph = getattr(system, "graph", None)
         if graph is not None and hasattr(graph, "edge_type_counts"):
             edge_counts = graph.edge_type_counts()
+        if graph is not None and hasattr(graph, "export_compact_rows"):
+            db_path.with_name("live_graph_compact.json").write_text(
+                json.dumps(graph.export_compact_rows(), indent=2),
+                encoding="utf-8",
+            )
         tracker = getattr(system, "context_contradictions", None)
         if tracker is not None and hasattr(tracker, "summary"):
             contradiction_summary = tracker.summary()
@@ -402,6 +411,8 @@ def _run_sampling_job(job: dict) -> dict:
         global_step_end=int(job.get("global_step_offset", 0) or 0) + int(job["steps"]),
         memory_input_dir=job.get("memory_input_dir"),
         memory_output_dir=job.get("memory_output_dir"),
+        compact_memory_loaded=bool(job.get("memory_input_dir")),
+        compact_memory_restore_summary=getattr(system, "compact_memory_restore_summary", {}),
         adaptive_context_expansion_enabled=bool(adaptive_context_summary.get("adaptive_context_expansion_enabled", False)),
         base_context_depth=int(adaptive_context_summary.get("base_context_depth", job.get("context_depth", 3)) or 0),
         max_context_depth=int(adaptive_context_summary.get("max_context_depth", job.get("max_context_depth", job.get("context_depth", 3))) or 0),

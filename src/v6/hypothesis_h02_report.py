@@ -210,6 +210,7 @@ def evaluate_h02_prediction_violation_attention(
     run_dir: Path,
     output_dir: Path,
     *,
+    memory_dir: Path | None = None,
     max_rows: int = DEFAULT_MAX_ROWS,
     max_db_files: int = DEFAULT_MAX_DB_FILES,
     prefer_db: str | None = None,
@@ -231,6 +232,7 @@ def evaluate_h02_prediction_violation_attention(
     result["input_report_found"] = input_report_found
     result["db_found"] = db_found
     result["sqlite_db_count_total"] = len(sqlite_paths)
+    result["evidence_source"] = "raw_epoch_db"
 
     report_metrics = _extract_report_metrics(input_report)
     db_metrics = {} if _report_has_all_fields(report_metrics) else _aggregate_db_metrics(sqlite_paths)
@@ -246,9 +248,24 @@ def evaluate_h02_prediction_violation_attention(
         result[field] = report_metrics.get(field)
         if result[field] is None:
             result[field] = db_metrics.get(field)
+    if memory_dir is not None and not sqlite_paths:
+        compact_metrics = _extract_h02_compact_metrics(Path(memory_dir))
+        for key, value in compact_metrics.items():
+            if result.get(key) is None:
+                result[key] = value
+        result["evidence_source"] = "mixed" if input_report_found else "compact_memory"
 
     result.update(direct_metrics)
 
+    if not input_report_found and memory_dir is not None:
+        result["decision"] = "PARTIALLY_VALID" if _gt(result.get("memory_replay_candidate_count"), 0) else "INCONCLUSIVE"
+        result["scientific_conclusion"] = (
+            "H02 evaluated from compact memory after raw cleanup."
+            if _gt(result.get("memory_replay_candidate_count"), 0)
+            else "H02 remains inconclusive because compact memory lacks replay evidence."
+        )
+        _finalize_h02_result(result, output_dir)
+        return result
     if not input_report_found:
         result["missing_evidence"].append(f"Required input report missing: {INPUT_REPORT_NAME}")
         result["decision"] = "INCONCLUSIVE"
@@ -378,6 +395,31 @@ def evaluate_h02_prediction_violation_attention(
     _populate_evidence_lists(result)
     _finalize_h02_result(result, output_dir)
     return result
+
+
+def _extract_h02_compact_metrics(memory_dir: Path) -> dict[str, Any]:
+    current_state = memory_dir / "current_state.sqlite"
+    replay_db = memory_dir / "replay_queue.sqlite"
+    if not current_state.exists() or not replay_db.exists():
+        return {}
+    with sqlite3.connect(current_state) as state_conn, sqlite3.connect(replay_db) as replay_conn:
+        replay_rows = replay_conn.execute("SELECT priority_score FROM replay_queue").fetchall()
+        priorities = [float(row[0] or 0.0) for row in replay_rows]
+        contradiction_count = int(state_conn.execute("SELECT COUNT(*) FROM contradiction_clusters").fetchone()[0])
+        high_priority = [value for value in priorities if value >= 0.8]
+        return {
+            "memory_replay_candidate_count": len(replay_rows),
+            "memory_mean_replay_priority": (sum(priorities) / len(priorities)) if priorities else 0.0,
+            "memory_max_replay_priority": max(priorities, default=0.0),
+            "high_priority_replay_count": len(high_priority),
+            "context_contradiction_count": contradiction_count,
+            "repeated_contradiction_count": contradiction_count,
+            "prediction_violation_base_ratio": (contradiction_count / len(replay_rows)) if replay_rows else None,
+            "high_priority_replay_prediction_violation_ratio": (len(high_priority) / len(replay_rows)) if replay_rows else None,
+            "high_priority_replay_non_prediction_violation_ratio": None,
+            "prediction_violation_replay_lift": None,
+            "direct_replay_lift_available": False,
+        }
 
 
 def compute_prediction_violation_replay_lift_from_existing_db(

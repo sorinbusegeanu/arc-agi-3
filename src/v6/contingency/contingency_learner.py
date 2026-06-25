@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from typing import Iterable
 
 
 @dataclass(frozen=True)
@@ -126,3 +127,37 @@ class ContingencyLearner:
 
     def stable_contingencies(self) -> list[Contingency]:
         return sorted(self.contingencies.values(), key=lambda item: (item.context_level, item.action, item.id))
+
+    def import_contingency(self, contingency: Contingency) -> None:
+        key = (
+            int(contingency.context_level),
+            tuple(contingency.context_signature),
+            int(contingency.action),
+            int(contingency.transformation_family),
+        )
+        total_key = (int(contingency.context_level), tuple(contingency.context_signature), int(contingency.action))
+        support_count = int(contingency.support_count)
+        if support_count > int(self.counts.get(key, 0)):
+            self.counts[key] = support_count
+        implied_total = int(round(support_count / max(float(contingency.confidence), 1e-9)))
+        implied_total = max(support_count, implied_total)
+        if implied_total > int(self.context_action_totals.get(total_key, 0)):
+            self.context_action_totals[total_key] = implied_total
+        existing = self.contingencies.get(key)
+        contingency_id = int(contingency.id)
+        if existing is not None:
+            contingency_id = max(int(existing.id), contingency_id)
+        self.contingencies[key] = Contingency(
+            id=contingency_id,
+            context_level=int(contingency.context_level),
+            context_signature=tuple(contingency.context_signature),
+            action=int(contingency.action),
+            transformation_family=int(contingency.transformation_family),
+            support_count=support_count,
+            confidence=float(contingency.confidence),
+        )
+        self._next_contingency_id = max(self._next_contingency_id, contingency_id + 1)
+
+    def import_contingencies(self, contingencies: Iterable[Contingency]) -> None:
+        for contingency in contingencies:
+            self.import_contingency(contingency)

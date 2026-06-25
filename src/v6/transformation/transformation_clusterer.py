@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha1
 from typing import Iterable
 
 import numpy as np
@@ -109,6 +110,30 @@ class TransformationClusterer:
         self._next_family_id += 1
         self._signature_to_family_id[signature] = family_id
         return int(family_id)
+
+    def import_family(self, family: TransformationFamily) -> None:
+        self.families[int(family.id)] = TransformationFamily(
+            id=int(family.id),
+            centroid_vector=np.asarray(family.centroid_vector, dtype=float),
+            support_count=int(family.support_count),
+            member_delta_ids=[int(value) for value in family.member_delta_ids],
+        )
+        self._next_family_id = max(self._next_family_id, int(family.id) + 1)
+        self._signature_to_family_id[_centroid_signature(np.asarray(family.centroid_vector, dtype=float))] = int(family.id)
+
+    def import_delta_to_family(self, delta_key: str, family_id: int | str) -> None:
+        try:
+            normalized_delta_id = int(str(delta_key).split(":")[-1])
+        except ValueError:
+            return
+        self.delta_to_family[normalized_delta_id] = _stable_family_int_id(family_id)
+
+
+def _stable_family_int_id(value: int | str) -> int:
+    if isinstance(value, int):
+        return int(value)
+    raw = str(value).encode("utf-8")
+    return int.from_bytes(sha1(raw).digest()[:8], "big") % 2_147_483_647
 
 
 def _centroid_signature(centroid_vector: np.ndarray) -> tuple[int, int, int, int, int]:
