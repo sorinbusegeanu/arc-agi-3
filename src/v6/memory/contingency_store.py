@@ -31,6 +31,7 @@ class ContingencyStore:
             CREATE TABLE IF NOT EXISTS prediction_results (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 interaction_id INTEGER NOT NULL,
+                global_step INTEGER,
                 context_level INTEGER,
                 context_signature TEXT NOT NULL,
                 action INTEGER NOT NULL,
@@ -80,6 +81,7 @@ class ContingencyStore:
             """
         )
         self._ensure_column("contingencies", "context_level", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("prediction_results", "global_step", "INTEGER")
         self._ensure_column("prediction_results", "context_level", "INTEGER")
         self._ensure_column("prediction_results", "episode_id", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("prediction_results", "isf_version", "TEXT")
@@ -166,6 +168,7 @@ class ContingencyStore:
         self,
         *,
         interaction_id: int,
+        global_step: int | None = None,
         context_level: int | None = None,
         context_signature: tuple,
         action: int,
@@ -220,6 +223,7 @@ class ContingencyStore:
             """
             INSERT INTO prediction_results (
                 interaction_id,
+                global_step,
                 context_level,
                 context_signature,
                 action,
@@ -266,10 +270,11 @@ class ContingencyStore:
                 efficiency_equivalent_outcome_cost_gap,
                 efficiency_future_option_gain_per_cost
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 int(interaction_id),
+                None if global_step is None else int(global_step),
                 None if context_level is None else int(context_level),
                 json.dumps(context_signature),
                 int(action),

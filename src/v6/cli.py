@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
+import sys
 from collections import Counter
 from pathlib import Path
 
 from v6.environment.arc_adapter import ArcGridEnvironment
+from v6.continuous_research import ContinuousResearchConfig, run_continuous_research
 from v6.contingency_memory import ContingencyMemoryConfig, run_contingency_memory_v06
 from v6.context_depth_compare_v07 import ContextDepthCompareConfig, run_context_depth_compare_v07
 from v6.evaluation.broad_game_validation import BroadValidationConfig, parse_game_selector, run_broad_validation_v05
@@ -29,6 +31,7 @@ from v6.evaluation.prefuture_role_prediction import PrefutureConfig, run_prefutu
 from v6.evaluation.role_candidates import ROLE_DISCOVERY_GAMES, RoleCandidateRunConfig, run_role_candidate_v03
 from v6.evaluation.role_generalization import RoleGeneralizationConfig, run_role_generalization_v04b
 from v6.evaluation.role_validation import RoleValidationConfig, run_role_validation_v04
+from v6.hypothesis_h01_report import evaluate_h01_contingency_emergence, find_h01_ready_runs
 from v6.hypothesis_h02_report import (
     evaluate_h02_prediction_violation_attention,
     find_h02_ready_runs,
@@ -39,6 +42,7 @@ from v6.hypothesis_h03_report import (
     find_h03_ready_runs,
     run_h03_on_best_ready_run,
 )
+from v6.hypothesis_suite_report import run_hypothesis_suite_report
 from v6.main import V6Config, V6System
 from v6.m2_expand_v08c import M2ExpandV08cConfig, run_m2_expand_v08c
 from v6.role_candidates_v08 import RoleCandidatesV08Config, run_role_candidates_v08
@@ -56,6 +60,18 @@ from v6.m4_role_concepts_v10e import M4RoleConceptsV10eConfig, run_m4_role_conce
 from v6.storage.benchmark import run_storage_benchmark
 from v6.storage.migration import migrate_sqlite_to_parquet
 from v6.transformation_families_v07 import TransformationFamiliesV07Config, run_transformation_families_v07
+
+
+INTERACTION_SAMPLING_EXPERIMENT_PRESETS = {
+    "broad_hypothesis_probe": {
+        "games": "all",
+        "samplers": "random_baseline,low_confidence,novelty_delta,mixed,reset_aware_mixed",
+        "seeds": "0",
+        "steps": 5000,
+        "horizon": 10,
+        "context_depth": 1,
+    }
+}
 
 
 def _parse_bool(value: str) -> bool:
@@ -248,6 +264,10 @@ def build_parser() -> argparse.ArgumentParser:
     sampling.add_argument("--game-set-name", default=None)
     sampling.add_argument("--only-missing-from-parquet-root", action="store_true")
     sampling.add_argument("--collect-only", action="store_true")
+    sampling.add_argument("--experiment-preset", choices=tuple(sorted(INTERACTION_SAMPLING_EXPERIMENT_PRESETS)))
+    sampling.add_argument("--memory-input-dir", default=None)
+    sampling.add_argument("--memory-output-dir", default=None)
+    sampling.add_argument("--global-step-offset", type=int, default=0)
 
     contingency_memory = subparsers.add_parser("contingency-memory-v06")
     contingency_memory.add_argument("--parquet-root", required=True)
@@ -466,6 +486,14 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark.add_argument("--rows", type=int, default=100000)
     benchmark.add_argument("--output-dir", default="runs/v6/storage_benchmark")
 
+    hypothesis_h01 = subparsers.add_parser("hypothesis-h01-report")
+    hypothesis_h01.add_argument("--run-dir", required=True)
+    hypothesis_h01.add_argument("--output-dir", required=True)
+
+    find_h01_ready = subparsers.add_parser("find-h01-ready-runs")
+    find_h01_ready.add_argument("--runs-root", required=True)
+    find_h01_ready.add_argument("--output-dir", required=True)
+
     hypothesis_h02 = subparsers.add_parser("hypothesis-h02-report")
     hypothesis_h02.add_argument("--run-dir", required=True)
     hypothesis_h02.add_argument("--output-dir", required=True)
@@ -505,11 +533,42 @@ def build_parser() -> argparse.ArgumentParser:
     find_h03_ready.add_argument("--no-scan-all-dbs", dest="scan_all_dbs", action="store_false")
     find_h03_ready.set_defaults(scan_all_dbs=True)
     find_h03_ready.add_argument("--min-family-support", type=int, default=2)
+
+    hypothesis_suite = subparsers.add_parser("hypothesis-suite-report")
+    hypothesis_suite.add_argument("--run-dir", required=True)
+    hypothesis_suite.add_argument("--memory-dir", default=None)
+    hypothesis_suite.add_argument("--output-dir", required=True)
+    hypothesis_suite.add_argument("--scan-all-dbs", action="store_true")
+    hypothesis_suite.add_argument("--max-db-files", type=int, default=1000)
+    hypothesis_suite.add_argument("--max-rows", type=int, default=1000000)
+
+    continuous = subparsers.add_parser("continuous-research-run")
+    continuous.add_argument("--experiment-name", required=True)
+    continuous.add_argument("--games", default="all")
+    continuous.add_argument("--samplers", default="random_baseline,low_confidence,novelty_delta,mixed,reset_aware_mixed")
+    continuous.add_argument("--seeds", default="0")
+    continuous.add_argument("--steps-per-epoch", type=int, default=5000)
+    continuous.add_argument("--max-epochs", type=int, default=5)
+    continuous.add_argument("--horizon", type=int, default=10)
+    continuous.add_argument("--context-depth", type=int, default=1)
+    continuous.add_argument("--output-dir", required=True)
+    continuous.add_argument("--stop-if-disk-above-percent", type=float, default=90.0)
+    continuous.add_argument("--stop-if-no-new-stable-contingencies-for", type=int, default=2)
+    continuous.add_argument("--scan-all-dbs", action="store_true")
+    continuous.add_argument("--max-db-files", type=int, default=1000)
+    continuous.add_argument("--max-rows", type=int, default=1000000)
+    continuous.add_argument("--resume", type=_parse_bool, default=True)
+    continuous.add_argument("--cleanup", type=_parse_bool, default=True)
+    continuous.add_argument("--max-replay-queue-size", type=int, default=50000)
+    continuous.add_argument("--replay-retention-percent", type=int, default=5)
+    continuous.add_argument("--env-root", default=None)
     return parser
 
 
-def main() -> int:
-    args = build_parser().parse_args()
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    args = build_parser().parse_args(argv)
+    args = _apply_interaction_sampling_experiment_preset(args, argv)
     if args.command == "run":
         Path(args.db).parent.mkdir(parents=True, exist_ok=True)
         env = ArcGridEnvironment(
@@ -745,10 +804,15 @@ def main() -> int:
         seeds = tuple(_parse_csv_int(args.seeds))
         test_seed = int(seeds[-1]) if seeds else 2
         train_seeds = tuple(seed for seed in seeds if seed != test_seed)[:2] or ((test_seed,) if seeds else (0, 1))
+        try:
+            games = parse_v05c_games(args.games, env_root=args.env_root)
+            samplers = parse_v05c_samplers(args.samplers)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
         rows = run_interaction_sampling_v05c(
             InteractionSamplingConfig(
-                games=parse_v05c_games(args.games),
-                samplers=parse_v05c_samplers(args.samplers),
+                games=games,
+                samplers=samplers,
                 seeds=seeds,
                 train_seeds=train_seeds,
                 test_seed=test_seed,
@@ -770,6 +834,9 @@ def main() -> int:
                 game_set_name=args.game_set_name,
                 only_missing_from_parquet_root=bool(args.only_missing_from_parquet_root),
                 collect_only=bool(args.collect_only),
+                memory_input_dir=args.memory_input_dir,
+                memory_output_dir=args.memory_output_dir,
+                global_step_offset=int(args.global_step_offset),
             )
         )
         print(json.dumps({"rows": len(rows), "output_dir": args.output_dir}, indent=2))
@@ -1247,6 +1314,22 @@ def main() -> int:
         print(json.dumps(result, indent=2))
         return 0
 
+    if args.command == "hypothesis-h01-report":
+        result = evaluate_h01_contingency_emergence(
+            run_dir=Path(args.run_dir),
+            output_dir=Path(args.output_dir),
+        )
+        print(json.dumps(result, indent=2))
+        return 0
+
+    if args.command == "find-h01-ready-runs":
+        result = find_h01_ready_runs(
+            runs_root=Path(args.runs_root),
+            output_dir=Path(args.output_dir),
+        )
+        print(json.dumps(result, indent=2))
+        return 0
+
     if args.command == "hypothesis-h02-report":
         result = evaluate_h02_prediction_violation_attention(
             run_dir=Path(args.run_dir),
@@ -1310,7 +1393,69 @@ def main() -> int:
             )
         print(json.dumps(result, indent=2))
         return 0
+
+    if args.command == "hypothesis-suite-report":
+        result = run_hypothesis_suite_report(
+            run_dir=Path(args.run_dir),
+            memory_dir=None if args.memory_dir is None else Path(args.memory_dir),
+            output_dir=Path(args.output_dir),
+            scan_all_dbs=bool(args.scan_all_dbs),
+            max_db_files=int(args.max_db_files),
+            max_rows=int(args.max_rows),
+        )
+        print(json.dumps(result, indent=2))
+        return 0
+
+    if args.command == "continuous-research-run":
+        result = run_continuous_research(
+            ContinuousResearchConfig(
+                experiment_name=args.experiment_name,
+                games=args.games,
+                samplers=args.samplers,
+                seeds=args.seeds,
+                steps_per_epoch=int(args.steps_per_epoch),
+                max_epochs=int(args.max_epochs),
+                horizon=int(args.horizon),
+                context_depth=int(args.context_depth),
+                output_dir=args.output_dir,
+                stop_if_disk_above_percent=float(args.stop_if_disk_above_percent),
+                stop_if_no_new_stable_contingencies_for=int(args.stop_if_no_new_stable_contingencies_for),
+                scan_all_dbs=bool(args.scan_all_dbs),
+                max_db_files=int(args.max_db_files),
+                max_rows=int(args.max_rows),
+                resume=bool(args.resume),
+                cleanup=bool(args.cleanup),
+                max_replay_queue_size=int(args.max_replay_queue_size),
+                replay_retention_percent=int(args.replay_retention_percent),
+                env_root=args.env_root,
+            )
+        )
+        print(json.dumps(result, indent=2))
+        return 0
     return 0
+
+
+def _apply_interaction_sampling_experiment_preset(args: argparse.Namespace, argv: list[str]) -> argparse.Namespace:
+    if getattr(args, "command", None) != "interaction-sampling-v05c":
+        return args
+    preset_name = getattr(args, "experiment_preset", None)
+    if not preset_name:
+        return args
+    preset = INTERACTION_SAMPLING_EXPERIMENT_PRESETS[str(preset_name)]
+    explicit = set(argv)
+    option_map = {
+        "games": {"--games"},
+        "samplers": {"--samplers"},
+        "seeds": {"--seeds"},
+        "steps": {"--steps"},
+        "horizon": {"--horizon"},
+        "context_depth": {"--context-depth"},
+    }
+    for field, options in option_map.items():
+        if explicit.intersection(options):
+            continue
+        setattr(args, field, preset[field])
+    return args
 
 
 def inspect_database(db_path: str, *, top: int = 20) -> str:

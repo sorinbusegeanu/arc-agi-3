@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -86,6 +87,46 @@ def _ensure_arc_paths() -> None:
         path = str(repo_root / relative)
         if path not in sys.path:
             sys.path.insert(0, path)
+
+
+def registered_game_ids(env_root: str | None = None) -> tuple[str, ...]:
+    game_ids: set[str] = set()
+    for root in _candidate_environment_roots(env_root):
+        if not root.exists() or not root.is_dir():
+            continue
+        for game_dir in root.iterdir():
+            if not game_dir.is_dir():
+                continue
+            if any(game_dir.glob("*/metadata.json")):
+                game_ids.add(game_dir.name)
+    return tuple(sorted(game_ids))
+
+
+def _candidate_environment_roots(env_root: str | None = None) -> tuple[Path, ...]:
+    roots: list[Path] = []
+    if env_root:
+        roots.append(Path(env_root))
+    current = os.environ.get("ENVIRONMENTS_DIR")
+    if current:
+        roots.append(Path(current))
+    roots.extend(_default_environment_roots())
+    unique: list[Path] = []
+    seen: set[Path] = set()
+    for root in roots:
+        resolved = root.expanduser()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique.append(resolved)
+    return tuple(unique)
+
+
+def _default_environment_roots() -> tuple[Path, ...]:
+    repo_root = Path(__file__).resolve().parents[3]
+    return (
+        repo_root / "other_repos" / "arc-interactive" / "environment_files",
+        repo_root / "environment_files",
+    )
 
 
 def _grid_from_raw(raw: Any) -> np.ndarray:

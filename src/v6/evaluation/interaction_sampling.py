@@ -12,7 +12,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+from tqdm.auto import tqdm
 
+from v6.environment.arc_adapter import registered_game_ids
 from v6.environment.arc_adapter import ArcGridEnvironment
 from v6.evaluation.broad_game_validation import family_for_game, game_passes, parse_game_selector
 from v6.evaluation.failure_diagnostics import compute_run_diagnostics
@@ -42,6 +44,8 @@ V05C_GAME_PRESETS = {
     "passing_references": PASSING_REFERENCES,
     "broad": DEFAULT_V05C_GAMES,
 }
+DEFAULT_HIGH_REPLAY_PRIORITY_THRESHOLD = 0.70
+DEFAULT_STABLE_TRANSFORMATION_FAMILY_SUPPORT = 5
 
 
 @dataclass(frozen=True)
@@ -69,13 +73,39 @@ class InteractionSamplingConfig:
     game_set_name: str | None = None
     only_missing_from_parquet_root: bool = False
     collect_only: bool = False
+    memory_input_dir: str | None = None
+    memory_output_dir: str | None = None
+    global_step_offset: int = 0
 
 
-def parse_v05c_games(selector: str) -> tuple[str, ...]:
+def resolve_game_ids(games_arg: str, env_root: str | None = None) -> list[str]:
+    value = str(games_arg).strip()
+    available = tuple(sorted(registered_game_ids(env_root)))
+    if value == "all":
+        if not available:
+            raise ValueError("no registered game ids were found in the project environment registry")
+        return list(available)
+    selected = [item.strip() for item in value.split(",") if item.strip()]
+    if not selected:
+        raise ValueError("games selection is empty; pass 'all' or a comma-separated list of valid game ids")
+    if not available:
+        return selected
+    invalid = sorted({item for item in selected if item not in available})
+    if invalid:
+        raise ValueError(
+            "invalid game id(s): "
+            f"{', '.join(invalid)}. Valid game ids: {', '.join(available)}"
+        )
+    return selected
+
+
+def parse_v05c_games(selector: str, env_root: str | None = None) -> tuple[str, ...]:
     value = selector.strip()
     if value in V05C_GAME_PRESETS:
         return tuple(dict.fromkeys(V05C_GAME_PRESETS[value]))
-    return parse_game_selector(value)
+    if value == "all":
+        return tuple(resolve_game_ids(value, env_root))
+    return tuple(resolve_game_ids(value, env_root))
 
 
 def parse_v05c_samplers(selector: str) -> tuple[str, ...]:
@@ -102,13 +132,25 @@ def run_interaction_sampling_v05c(config: InteractionSamplingConfig) -> list[dic
     comparison = sampler_comparison_rows(rows)
     best = best_by_game(rows)
     family_summary = summary_by_family(best)
+    temporal_milestones = _collect_temporal_milestones(config, sampling_root)
     payload = {
         "runs": rows,
         "sampler_comparison": comparison,
         "best_by_game": best,
         "summary_by_family": family_summary,
         "validation": validation_summary(rows, comparison, best),
+        "games": list(config.games),
         "samplers": list(config.samplers),
+        "seeds": [int(seed) for seed in config.seeds],
+        "steps": int(config.steps),
+        "horizon": int(config.horizon),
+        "context_depth": int(config.context_depth),
+        "global_step_offset": int(config.global_step_offset),
+        "global_step_start": int(config.global_step_offset) + 1,
+        "global_step_end": int(config.global_step_offset) + int(config.steps),
+        "memory_input_dir": config.memory_input_dir,
+        "memory_output_dir": config.memory_output_dir,
+        "temporal_milestones": temporal_milestones,
         "forbidden_features_used_during_sampling": False,
         "efficiency_diagnostics_enabled": True,
         "efficiency_used_for_sampling": False,
@@ -184,6 +226,9 @@ def _generate_sampling_dbs(config: InteractionSamplingConfig, sampling_root: Pat
                             "adaptive_context_expansion": bool(config.adaptive_context_expansion),
                             "max_context_depth": config.max_context_depth,
                             "commit_steps": int(config.commit_steps),
+                            "memory_input_dir": config.memory_input_dir,
+                            "memory_output_dir": config.memory_output_dir,
+                            "global_step_offset": int(config.global_step_offset),
                             "db_path": str(db_path),
                             "env_root": config.env_root,
                         }
@@ -217,6 +262,9 @@ def _generate_sampling_dbs(config: InteractionSamplingConfig, sampling_root: Pat
                         "adaptive_context_expansion": bool(config.adaptive_context_expansion),
                         "max_context_depth": config.max_context_depth,
                         "commit_steps": int(config.commit_steps),
+                        "memory_input_dir": config.memory_input_dir,
+                        "memory_output_dir": config.memory_output_dir,
+                        "global_step_offset": int(config.global_step_offset),
                         "db_path": str(db_path),
                         "env_root": config.env_root,
                     }
@@ -230,16 +278,22 @@ def _generate_sampling_dbs(config: InteractionSamplingConfig, sampling_root: Pat
 def _run_sampling_jobs(jobs: list[dict], *, workers: int) -> None:
     workers = max(1, min(int(workers), len(jobs)))
     print(f"running {len(jobs)} v0.5c sampling jobs with workers={workers}", file=sys.stderr, flush=True)
-    with ProcessPoolExecutor(max_workers=workers, max_tasks_per_child=1) as executor:
-        futures = {executor.submit(_run_sampling_job, job): job for job in jobs}
-        for future in as_completed(futures):
-            job = futures[future]
-            future.result()
-            print(
-                f"completed {job['game']} sampler={job['sampler_name']} seed={job['seed']} steps={job['steps']}",
-                file=sys.stderr,
-                flush=True,
-            )
+    progress = tqdm(
+        total=len(jobs),
+        desc="epoch sampling",
+        unit="job",
+        file=sys.stderr,
+        dynamic_ncols=True,
+        leave=True,
+    )
+    try:
+        with ProcessPoolExecutor(max_workers=workers, max_tasks_per_child=1) as executor:
+            futures = {executor.submit(_run_sampling_job, job): job for job in jobs}
+            for future in as_completed(futures):
+                future.result()
+                progress.update(1)
+    finally:
+        progress.close()
 
 
 def _export_sampling_sqlite_to_parquet(config: InteractionSamplingConfig, sampling_root: Path, *, games: tuple[str, ...] | None = None) -> None:
@@ -280,6 +334,7 @@ def _run_sampling_job(job: dict) -> dict:
         env=env,
         config=V6Config(
             database_path=str(db_path),
+            global_step_offset=int(job.get("global_step_offset", 0) or 0),
             random_seed=seed,
             context_length=int(job.get("context_depth", 3)),
             max_context_depth=job.get("max_context_depth"),
@@ -342,12 +397,20 @@ def _run_sampling_job(job: dict) -> dict:
         horizon=int(job["horizon"]),
         context_depth=int(job.get("context_depth", 3)),
         context_length=int(job.get("context_depth", 3)),
+        global_step_offset=int(job.get("global_step_offset", 0) or 0),
+        global_step_start=int(job.get("global_step_offset", 0) or 0) + 1,
+        global_step_end=int(job.get("global_step_offset", 0) or 0) + int(job["steps"]),
+        memory_input_dir=job.get("memory_input_dir"),
+        memory_output_dir=job.get("memory_output_dir"),
         adaptive_context_expansion_enabled=bool(adaptive_context_summary.get("adaptive_context_expansion_enabled", False)),
         base_context_depth=int(adaptive_context_summary.get("base_context_depth", job.get("context_depth", 3)) or 0),
         max_context_depth=int(adaptive_context_summary.get("max_context_depth", job.get("max_context_depth", job.get("context_depth", 3))) or 0),
         adaptive_context_expansion_count=int(adaptive_context_summary.get("adaptive_context_expansion_count", 0) or 0),
         adaptive_context_active_action_count=int(adaptive_context_summary.get("adaptive_context_active_action_count", 0) or 0),
         adaptive_context_max_depth_reached=int(adaptive_context_summary.get("adaptive_context_max_depth_reached", job.get("context_depth", 3)) or 0),
+        contingency_support_threshold=int(system.config.contingency_support_threshold),
+        contingency_confidence_threshold=float(system.config.contingency_confidence_threshold),
+        transformation_family_stable_support=int(system.config.min_cluster_size),
         reset_count=int(getattr(env, "reset_count", 0)) + int(getattr(sampler, "reset_count", 0)),
         terminal_count=int(getattr(env, "skipped_terminal_steps", 0)),
         reset_unavailable=bool(getattr(sampler, "reset_unavailable", False)),
@@ -444,6 +507,184 @@ def _evaluate_sampling_runs(config: InteractionSamplingConfig, sampling_root: Pa
             except Exception as exc:
                 rows.append(_failed_row(game, sampler_name, config, f"{type(exc).__name__}: {exc}"))
     return rows
+
+
+def _collect_temporal_milestones(config: InteractionSamplingConfig, sampling_root: Path) -> dict:
+    rows: list[dict[str, object]] = []
+    for game in config.games:
+        for sampler_name in config.samplers:
+            for seed in config.seeds:
+                path = sampling_db_path(sampling_root, game, sampler_name, config.steps, seed)
+                if not _sampling_db_ready(path):
+                    continue
+                rows.append(
+                    _temporal_milestones_for_db(
+                        path,
+                        game=game,
+                        sampler_name=sampler_name,
+                        seed=int(seed),
+                    )
+                )
+    return {"by_game_sampler_seed": rows}
+
+
+def _temporal_milestones_for_db(path: Path, *, game: str, sampler_name: str, seed: int) -> dict[str, object]:
+    offset = 0
+    default = {
+        "game": game,
+        "sampler": sampler_name,
+        "seed": int(seed),
+        "first_interaction_step": None,
+        "first_contingency_candidate_step": None,
+        "first_stable_contingency_step": None,
+        "first_prediction_violation_step": None,
+        "first_high_replay_priority_step": None,
+        "first_transformation_family_step": None,
+        "first_stable_transformation_family_step": None,
+        "first_carrier_candidate_step": None,
+        "first_emergent_carrier_step": None,
+    }
+    try:
+        with sqlite3.connect(path) as connection:
+            offset = int(_json_metadata_value(connection, "global_step_offset", fallback=0))
+            default["first_interaction_step"] = _first_value(
+                connection,
+                "SELECT MIN(COALESCE(global_step, id + ?)) FROM interactions",
+                parameters=(offset,),
+            )
+            default["first_contingency_candidate_step"] = _first_value(
+                connection,
+                """
+                SELECT MIN(COALESCE(global_step, interaction_id + ?))
+                FROM prediction_results
+                WHERE actual_family IS NOT NULL
+                """,
+                parameters=(offset,),
+            )
+            default["first_prediction_violation_step"] = _first_value(
+                connection,
+                """
+                SELECT MIN(COALESCE(global_step, interaction_id + ?))
+                FROM prediction_results
+                WHERE COALESCE(prediction_error, 0) = 1
+                   OR COALESCE(context_contradiction, 0) = 1
+                   OR COALESCE(isf_prediction_error, 0.0) > 0.0
+                """,
+                parameters=(offset,),
+            )
+            default["first_high_replay_priority_step"] = _first_value(
+                connection,
+                f"""
+                SELECT MIN(COALESCE(global_step, id + ?))
+                FROM interactions
+                WHERE COALESCE(memory_replay_priority, 0.0) >= {DEFAULT_HIGH_REPLAY_PRIORITY_THRESHOLD}
+                """,
+                parameters=(offset,),
+            )
+            default["first_transformation_family_step"] = _first_value(
+                connection,
+                """
+                SELECT MIN(COALESCE(global_step, interaction_id + ?))
+                FROM prediction_results
+                WHERE actual_family IS NOT NULL
+                """,
+                parameters=(offset,),
+            )
+            default["first_stable_transformation_family_step"] = _stable_transformation_family_step(connection)
+            default["first_stable_contingency_step"] = _stable_contingency_step(connection)
+            default["first_carrier_candidate_step"] = _first_value(
+                connection,
+                """
+                SELECT MIN(COALESCE(global_step, id + ?))
+                FROM interactions
+                WHERE COALESCE(carrier_event_recorded, 0) = 1
+                   OR carrier_signature IS NOT NULL
+                """,
+                parameters=(offset,),
+            )
+    except sqlite3.DatabaseError:
+        return default
+    return default
+
+
+def _stable_contingency_step(connection: sqlite3.Connection) -> int | None:
+    tables = {str(row[0]) for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    if not {"prediction_results", "sampling_metadata"}.issubset(tables):
+        return None
+    support_threshold = int(_json_metadata_value(connection, "contingency_support_threshold", fallback=20))
+    confidence_threshold = float(_json_metadata_value(connection, "contingency_confidence_threshold", fallback=0.8))
+    offset = int(_json_metadata_value(connection, "global_step_offset", fallback=0))
+    try:
+        rows = connection.execute(
+            """
+            SELECT COALESCE(global_step, interaction_id + ?), context_level, context_signature, action, actual_family
+            FROM prediction_results
+            WHERE actual_family IS NOT NULL
+            ORDER BY interaction_id ASC
+            """,
+            (offset,),
+        ).fetchall()
+    except sqlite3.DatabaseError:
+        return None
+    by_key: Counter[tuple[int, str, int, int]] = Counter()
+    totals: Counter[tuple[int, str, int]] = Counter()
+    for interaction_id, context_level, context_signature, action, actual_family in rows:
+        level = int(context_level or 0)
+        key = (level, str(context_signature), int(action), int(actual_family))
+        context_key = (level, str(context_signature), int(action))
+        by_key[key] += 1
+        totals[context_key] += 1
+        support = by_key[key]
+        confidence = support / max(1, totals[context_key])
+        if support >= support_threshold and confidence >= confidence_threshold:
+            return int(interaction_id)
+    return None
+
+
+def _stable_transformation_family_step(connection: sqlite3.Connection) -> int | None:
+    support_threshold = int(_json_metadata_value(connection, "transformation_family_stable_support", fallback=DEFAULT_STABLE_TRANSFORMATION_FAMILY_SUPPORT))
+    offset = int(_json_metadata_value(connection, "global_step_offset", fallback=0))
+    try:
+        rows = connection.execute(
+            """
+            SELECT COALESCE(global_step, interaction_id + ?), actual_family
+            FROM prediction_results
+            WHERE actual_family IS NOT NULL
+            ORDER BY interaction_id ASC
+            """,
+            (offset,),
+        ).fetchall()
+    except sqlite3.DatabaseError:
+        return None
+    counts: Counter[int] = Counter()
+    for interaction_id, actual_family in rows:
+        family = int(actual_family)
+        counts[family] += 1
+        if counts[family] >= support_threshold:
+            return int(interaction_id)
+    return None
+
+
+def _first_value(connection: sqlite3.Connection, query: str, *, parameters: tuple[object, ...] = ()) -> int | None:
+    try:
+        row = connection.execute(query, parameters).fetchone()
+    except sqlite3.DatabaseError:
+        return None
+    value = None if row is None else row[0]
+    return None if value is None else int(value)
+
+
+def _json_metadata_value(connection: sqlite3.Connection, key: str, *, fallback: int | float) -> int | float:
+    try:
+        row = connection.execute("SELECT value FROM sampling_metadata WHERE key = ?", (key,)).fetchone()
+    except sqlite3.DatabaseError:
+        return fallback
+    if row is None or row[0] is None:
+        return fallback
+    try:
+        return json.loads(row[0])
+    except (TypeError, json.JSONDecodeError):
+        return fallback
 
 
 def _run_metrics(path: Path, game: str, sampler_name: str, seed: int, config: InteractionSamplingConfig) -> dict:

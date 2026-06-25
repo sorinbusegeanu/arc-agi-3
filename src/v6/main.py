@@ -27,6 +27,7 @@ from v6.transformation.transformation_clusterer import TransformationClusterer
 @dataclass(frozen=True)
 class V6Config:
     database_path: str = ":memory:"
+    global_step_offset: int = 0
     recluster_every: int = 100
     min_cluster_size: int = 5
     context_length: int = 3
@@ -156,6 +157,7 @@ class V6System:
         interaction = Interaction(
             id=interaction_id,
             timestamp=interaction_id,
+            global_step=int(self.config.global_step_offset) + int(interaction_id),
             observation_before=observation_before,
             action=action,
             observation_after=observation_after,
@@ -327,6 +329,7 @@ class V6System:
         replay_candidate = self.memory_lifecycle.replay_candidates.get(str(interaction.id))
         prediction_error = self.contingency_store.add_prediction_result(
             interaction_id=interaction.id,
+            global_step=int(self.config.global_step_offset) + int(interaction.id),
             context_level=prediction_context_level,
             context_signature=prediction_context_signature,
             action=action,
@@ -375,6 +378,7 @@ class V6System:
         interaction = Interaction(
             id=interaction_id,
             timestamp=interaction_id,
+            global_step=int(self.config.global_step_offset) + int(interaction_id),
             observation_before=observation_before,
             action=action,
             observation_after=observation_after,

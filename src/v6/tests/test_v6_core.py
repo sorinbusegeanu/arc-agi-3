@@ -7,6 +7,7 @@ import numpy as np
 import v6.evaluation.interaction_sampling as interaction_sampling
 
 from v6.cli import build_parser
+from v6.cli import _apply_interaction_sampling_experiment_preset
 from v6.carrier_emergence import CarrierEmergenceTracker, extract_carrier_signature
 from v6.game_sets import load_game_set_manifest
 from v6.efficiency_metrics import EfficiencyTracker, is_no_effect_delta
@@ -74,6 +75,7 @@ from v6.evaluation.interaction_sampling import (
     best_by_game as sampling_best_by_game,
     parse_v05c_games,
     parse_v05c_samplers,
+    resolve_game_ids,
     resolve_interaction_sampling_scope,
     sampler_comparison_rows,
     sampling_db_path,
@@ -2242,6 +2244,35 @@ def test_v05c_sampler_registry_and_aliases() -> None:
     assert parse_v05c_samplers("random_baseline,reset_aware_mixed") == ("random_baseline", "reset_aware_mixed")
     assert "tt01" in parse_v05c_games("failed_representatives")
     assert InteractionSamplingConfig().commit_steps == 1000
+
+
+def test_v05c_games_all_expands_to_registered_games(monkeypatch) -> None:
+    monkeypatch.setattr(interaction_sampling, "registered_game_ids", lambda env_root=None: ("pb02", "tt01", "ab01"))
+
+    assert resolve_game_ids("all") == ["ab01", "pb02", "tt01"]
+    assert parse_v05c_games("all") == ("ab01", "pb02", "tt01")
+
+
+def test_v05c_games_comma_separated_still_works(monkeypatch) -> None:
+    monkeypatch.setattr(interaction_sampling, "registered_game_ids", lambda env_root=None: ("pb02", "tt01", "ab01"))
+
+    assert resolve_game_ids("tt01,pb02") == ["tt01", "pb02"]
+    assert parse_v05c_games("tt01,pb02") == ("tt01", "pb02")
+
+
+def test_v05c_invalid_game_id_errors_clearly(monkeypatch) -> None:
+    monkeypatch.setattr(interaction_sampling, "registered_game_ids", lambda env_root=None: ("pb02", "tt01"))
+
+    try:
+        resolve_game_ids("tt01,nope99")
+    except ValueError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+    assert "invalid game id(s): nope99" in message
+    assert "pb02" in message
+    assert "tt01" in message
 
 
 def test_v05c_action_balance_and_no_change_scores() -> None:
@@ -6242,6 +6273,45 @@ def test_cli_accepts_interaction_sampling_collect_only_option() -> None:
 
     assert args.command == "interaction-sampling-v05c"
     assert args.collect_only is True
+
+
+def test_interaction_sampling_preset_fills_defaults() -> None:
+    parser = build_parser()
+    argv = [
+        "interaction-sampling-v05c",
+        "--experiment-preset",
+        "broad_hypothesis_probe",
+        "--output-dir",
+        "runs/out",
+    ]
+    args = _apply_interaction_sampling_experiment_preset(parser.parse_args(argv), argv)
+
+    assert args.games == "all"
+    assert args.samplers == "random_baseline,low_confidence,novelty_delta,mixed,reset_aware_mixed"
+    assert args.seeds == "0"
+    assert args.steps == 5000
+    assert args.horizon == 10
+    assert args.context_depth == 1
+
+
+def test_interaction_sampling_explicit_args_override_preset_defaults() -> None:
+    parser = build_parser()
+    argv = [
+        "interaction-sampling-v05c",
+        "--experiment-preset",
+        "broad_hypothesis_probe",
+        "--games",
+        "tt01,pb02",
+        "--steps",
+        "7000",
+        "--context-depth",
+        "3",
+    ]
+    args = _apply_interaction_sampling_experiment_preset(parser.parse_args(argv), argv)
+
+    assert args.games == "tt01,pb02"
+    assert args.steps == 7000
+    assert args.context_depth == 3
 
 
 def test_cli_accepts_interaction_sampling_adaptive_context_options() -> None:

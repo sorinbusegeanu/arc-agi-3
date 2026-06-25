@@ -75,7 +75,7 @@ SUPPORT_COLUMNS = ("support", "support_count", "member_count", "occurrence_count
 COMPRESSION_COLUMNS = ("compression_gain", "family_compression_gain", "compression_ratio", "compressed_count", "original_count")
 PREDICTION_LIFT_COLUMNS = ("prediction_lift", "family_prediction_lift", "accuracy_lift", "context_lift", "confidence")
 STABILITY_COLUMNS = ("stable", "is_stable", "stability_score")
-SIGNATURE_COLUMNS = ("effect_signature", "delta_signature", "changed_cells_signature", "outcome_signature")
+SIGNATURE_COLUMNS = ("effect_signature", "delta_signature", "changed_cells_signature", "outcome_signature", "centroid_vector")
 CONTEXT_COLUMNS = ("context_action", "context_signature", "interaction_signature", "prediction_key")
 GAME_COLUMNS = ("game_id", "game", "game_name")
 SAMPLER_COLUMNS = ("sampler", "sampler_name", "sampler_scope")
@@ -105,10 +105,43 @@ H03_DEFAULTS: dict[str, Any] = {
     "db_paths_total": 0,
     "db_paths_inspected": 0,
     "db_scan_truncated": False,
+    "row_count_available": None,
+    "row_count_used": 0,
+    "max_rows_applied": False,
     "selected_db_paths": [],
     "tables_seen": [],
     "candidate_tables_used": [],
     "artifact_paths_used": [],
+    "global_family_merge_enabled": True,
+    "global_family_count_before_merge": 0,
+    "global_family_count_after_merge": 0,
+    "families_merged_across_shards": 0,
+    "families_merged_across_games": 0,
+    "families_merged_across_samplers": 0,
+    "top_global_families": [],
+    "top_singleton_family_signatures": [],
+    "singleton_families_by_game": {},
+    "singleton_families_by_sampler": {},
+    "singleton_families_by_action": {},
+    "singleton_families_by_effect_type": {},
+    "singleton_family_diagnostics": {
+        "genuine_rare_count": 0,
+        "over_specific_count": 0,
+        "uncertain_count": 0,
+    },
+    "relaxed_canonicalization_diagnostics": {},
+    "singleton_ratio_strict": None,
+    "singleton_ratio_relaxed": None,
+    "singleton_family_count_relaxed": None,
+    "transformation_family_count_relaxed": None,
+    "relaxed_family_count": None,
+    "relaxed_singleton_family_count": None,
+    "relaxed_singleton_family_ratio": None,
+    "over_specific_singleton_count": None,
+    "over_specific_singleton_ratio": None,
+    "merge_safety_passed": None,
+    "unsafe_relaxed_merge_count": None,
+    "relaxed_decision_candidate": None,
     "memory_record_count": None,
     "interaction_count": None,
     "contingency_candidate_count": None,
@@ -287,7 +320,7 @@ def evaluate_h03_transformation_family_formation(
     ):
         result["decision"] = "VALID"
         result["scientific_conclusion"] = (
-            "H03 is supported in this run. Repeated contingencies compress into non-singleton transformation families with positive compression gain, and this family structure is present before object carriers emerge."
+            "H03 is supported in this run. Repeated contingencies compress into non-singleton transformation families with positive compression gain while no object-carrier emergence is detected."
         )
     elif contingencies_present and families_present and non_singleton_present and compression_partial:
         result["decision"] = "PARTIALLY_VALID"
@@ -299,6 +332,10 @@ def evaluate_h03_transformation_family_formation(
             result["scientific_conclusion"] = (
                 "H03 is partially supported in this run. Transformation-family compression is present, but singleton-ratio or stability evidence remains incomplete or approximate."
             )
+        elif result.get("family_cross_game_count") is None or result.get("family_cross_sampler_count") is None:
+            result["scientific_conclusion"] = (
+                "H03 is partially supported in this run. Transformation-family compression is present, but cross-game or cross-sampler family identity is not fully exposed by the current artifacts."
+            )
         elif pre_object is False:
             result["decision"] = "INVALID"
             result["scientific_conclusion"] = (
@@ -307,6 +344,10 @@ def evaluate_h03_transformation_family_formation(
         else:
             result["scientific_conclusion"] = (
                 "H03 is partially supported in this run. Repeated contingencies compress into transformation families, but the available evidence is not complete enough for robust validation."
+            )
+        if result.get("relaxed_decision_candidate") == "VALID":
+            result["scientific_conclusion"] += (
+                " H03 remains PARTIALLY_VALID under strict canonicalization. Relaxed canonicalization suggests H03 would become VALID if over-specific centroid signatures are safely collapsed; this requires merge-safety validation."
             )
     else:
         result["decision"] = "INCONCLUSIVE"
@@ -338,10 +379,20 @@ def compute_h03_family_metrics_from_existing_artifacts(
         "db_paths_total": len(sqlite_paths),
         "db_paths_inspected": 0,
         "db_scan_truncated": len(limited_paths) < len(ranked_paths),
+        "row_count_available": None,
+        "row_count_used": 0,
+        "max_rows_applied": False,
         "selected_db_paths": [],
         "tables_seen": [],
         "candidate_tables_used": [],
         "artifact_paths_used": [],
+        "global_family_merge_enabled": True,
+        "global_family_count_before_merge": 0,
+        "global_family_count_after_merge": 0,
+        "families_merged_across_shards": 0,
+        "families_merged_across_games": 0,
+        "families_merged_across_samplers": 0,
+        "top_global_families": [],
         "interaction_count": None,
         "contingency_candidate_count": None,
         "discovered_contingency_count": None,
@@ -401,7 +452,11 @@ def compute_h03_family_metrics_from_existing_artifacts(
             continue
 
     if db_candidates:
-        aggregate_candidate = _aggregate_h03_db_candidates(db_candidates, min_family_support=min_family_support)
+        aggregate_candidate = _aggregate_h03_db_candidates(
+            db_candidates,
+            min_family_support=min_family_support,
+            max_rows=max_rows,
+        )
         _merge_h03_candidate(result, aggregate_candidate)
 
     if not result["usable_direct_family_evidence"]:
@@ -525,11 +580,24 @@ def _compute_h03_db_candidate(
     max_rows: int,
     min_family_support: int,
 ) -> dict[str, Any] | None:
-    del max_rows
     table_order = sorted(table_map, key=lambda name: (0 if name in CANDIDATE_TABLE_NAMES else 1, name))
     interactions_count = _count_rows(connection, "interactions") if "interactions" in table_map else None
     for table_name in table_order:
         columns = table_map[table_name]
+        if table_name == "contingencies" and "transformation_family" in columns:
+            candidate = _compute_contingency_join_family_candidate(
+                connection,
+                sqlite_path=sqlite_path,
+                run_dir=run_dir,
+                table_map=table_map,
+                table_name=table_name,
+                columns=columns,
+                max_rows=max_rows,
+                min_family_support=min_family_support,
+                interaction_count=interactions_count,
+            )
+            if candidate is not None:
+                return candidate
         if table_name in FAMILY_TABLE_NAMES or _first_matching(columns, FAMILY_ID_COLUMNS) is not None:
             candidate = _compute_family_table_candidate(
                 connection,
@@ -537,6 +605,7 @@ def _compute_h03_db_candidate(
                 run_dir=run_dir,
                 table_name=table_name,
                 columns=columns,
+                max_rows=max_rows,
                 min_family_support=min_family_support,
                 interaction_count=interactions_count,
             )
@@ -548,12 +617,93 @@ def _compute_h03_db_candidate(
             run_dir=run_dir,
             table_name=table_name,
             columns=columns,
+            max_rows=max_rows,
             min_family_support=min_family_support,
             interaction_count=interactions_count,
         )
         if candidate is not None:
             return candidate
     return None
+
+
+def _compute_contingency_join_family_candidate(
+    connection: sqlite3.Connection,
+    *,
+    sqlite_path: Path,
+    run_dir: Path,
+    table_map: dict[str, set[str]],
+    table_name: str,
+    columns: set[str],
+    max_rows: int,
+    min_family_support: int,
+    interaction_count: int | None,
+) -> dict[str, Any] | None:
+    family_columns = table_map.get("transformation_families")
+    if not family_columns or "id" not in family_columns or "centroid_vector" not in family_columns:
+        return None
+    selected_sql = """
+        SELECT
+            c.id AS contingency_id,
+            c.context_signature,
+            c.action,
+            c.support_count,
+            tf.centroid_vector AS centroid_vector
+        FROM contingencies AS c
+        LEFT JOIN transformation_families AS tf
+          ON c.transformation_family = tf.id
+        WHERE tf.centroid_vector IS NOT NULL
+        LIMIT ?
+    """
+    row_count_available = _count_rows(connection, table_name)
+    try:
+        fetched = connection.execute(selected_sql, (max(1, int(max_rows)),)).fetchall()
+    except sqlite3.DatabaseError:
+        return None
+    rows = [
+        {
+            "contingency_id": item[0],
+            "context_signature": item[1],
+            "action": item[2],
+            "support_count": item[3],
+            "centroid_vector": item[4],
+        }
+        for item in fetched
+    ]
+    observations = _family_observations_from_rows(
+        rows,
+        sqlite_path=sqlite_path,
+        run_dir=run_dir,
+        family_column=None,
+        semantic_column="centroid_vector",
+        contingency_column="contingency_id",
+        support_column="support_count",
+        compression_column=None,
+        ratio_column=None,
+        original_count_column=None,
+        compressed_count_column=None,
+        prediction_lift_column=None,
+        stability_column=None,
+        context_column="context_signature",
+        game_column=None,
+        sampler_column=None,
+        action_column="action",
+        min_family_support=min_family_support,
+    )
+    if not observations:
+        return None
+    return {
+        "selected_db_paths": [str(sqlite_path)],
+        "tables_seen": [table_name, "transformation_families"],
+        "candidate_tables_used": [table_name, "transformation_families"],
+        "interaction_count": interaction_count,
+        "row_count_available": row_count_available,
+        "row_count_used": len(rows),
+        "max_rows_applied": row_count_available is not None and len(rows) < row_count_available,
+        "family_observations": observations,
+        "global_family_count_before_merge": len({item["canonical_signature"] for item in observations}),
+        "usable_direct_family_evidence": True,
+        "stability_approximated": True,
+    }
 
 
 def _compute_family_table_candidate(
@@ -563,11 +713,13 @@ def _compute_family_table_candidate(
     run_dir: Path,
     table_name: str,
     columns: set[str],
+    max_rows: int,
     min_family_support: int,
     interaction_count: int | None,
 ) -> dict[str, Any] | None:
     family_column = _first_matching(columns, FAMILY_ID_COLUMNS)
-    if family_column is None:
+    semantic_column = _first_matching(columns, SIGNATURE_COLUMNS)
+    if family_column is None and semantic_column is None:
         return None
     contingency_column = _first_matching(columns, CONTINGENCY_ID_COLUMNS)
     support_column = _first_matching(columns, SUPPORT_COLUMNS)
@@ -580,133 +732,59 @@ def _compute_family_table_candidate(
     context_column = _first_matching(columns, CONTEXT_COLUMNS)
     game_column = _first_matching(columns, GAME_COLUMNS)
     sampler_column = _first_matching(columns, SAMPLER_COLUMNS)
-
-    table_ref = _quote_ident(table_name)
-    family_ref = _quote_ident(family_column)
-    contingency_expr = _quote_ident(contingency_column) if contingency_column is not None else "rowid"
-    support_expr = _quote_ident(support_column) if support_column is not None else "1"
-    context_expr = _quote_ident(context_column) if context_column is not None else "NULL"
-    game_expr = _quote_ident(game_column) if game_column is not None else "NULL"
-    sampler_expr = _quote_ident(sampler_column) if sampler_column is not None else "NULL"
-    compression_expr = _quote_ident(compression_column) if compression_column is not None else None
-    ratio_expr = _quote_ident(ratio_column) if ratio_column is not None else None
-    prediction_lift_expr = _quote_ident(prediction_lift_column) if prediction_lift_column is not None else None
-
-    if stability_column is not None:
-        stable_expr = _stable_expr(stability_column)
-        stability_approximated = False
-    else:
-        stable_expr = f"CASE WHEN CAST({support_expr} AS REAL) >= {int(min_family_support)} THEN 1 ELSE 0 END"
-        stability_approximated = True
-
-    row = connection.execute(
-        f"""
-        WITH grouped AS (
-            SELECT
-                CAST({family_ref} AS TEXT) AS family_id,
-                COUNT(DISTINCT CAST({contingency_expr} AS TEXT)) AS member_count,
-                MAX(CAST({support_expr} AS REAL)) AS support_value,
-                SUM(CASE WHEN {context_expr} IS NOT NULL THEN 1 ELSE 0 END) AS context_rows,
-                COUNT(DISTINCT CASE WHEN {context_expr} IS NOT NULL THEN CAST({context_expr} AS TEXT) END) AS distinct_contexts,
-                COUNT(DISTINCT CASE WHEN {game_expr} IS NOT NULL THEN CAST({game_expr} AS TEXT) END) AS distinct_games,
-                COUNT(DISTINCT CASE WHEN {sampler_expr} IS NOT NULL THEN CAST({sampler_expr} AS TEXT) END) AS distinct_samplers,
-                MAX({stable_expr}) AS stable_flag
-                {', AVG(CAST(' + compression_expr + ' AS REAL)) AS compression_gain_value' if compression_expr else ''}
-                {', AVG(CAST(' + ratio_expr + ' AS REAL)) AS compression_ratio_value' if ratio_expr else ''}
-                {', AVG(CAST(' + prediction_lift_expr + ' AS REAL)) AS prediction_lift_value' if prediction_lift_expr else ''}
-            FROM {table_ref}
-            WHERE {family_ref} IS NOT NULL
-            GROUP BY CAST({family_ref} AS TEXT)
-        )
-        SELECT
-            COUNT(*),
-            SUM(member_count),
-            SUM(CASE WHEN stable_flag = 1 THEN 1 ELSE 0 END),
-            SUM(CASE WHEN member_count <= 1 THEN 1 ELSE 0 END),
-            AVG(member_count),
-            MAX(member_count),
-            AVG(CASE WHEN member_count >= 2 THEN 1.0 - (1.0 / member_count) ELSE 0.0 END),
-            MAX(CASE WHEN member_count >= 2 THEN 1.0 - (1.0 / member_count) ELSE 0.0 END),
-            SUM(CASE WHEN distinct_contexts > 1 THEN 1 ELSE 0 END),
-            SUM(CASE WHEN distinct_games > 1 THEN 1 ELSE 0 END),
-            SUM(CASE WHEN distinct_samplers > 1 THEN 1 ELSE 0 END)
-            {', AVG(compression_gain_value)' if compression_expr else ''}
-            {', AVG(compression_ratio_value)' if ratio_expr else ''}
-            {', AVG(prediction_lift_value), MAX(prediction_lift_value)' if prediction_lift_expr else ''}
-        FROM grouped
-        """
-    ).fetchone()
-    family_count = int(row[0] or 0)
-    if family_count <= 0:
+    selected_columns = [name for name in {
+        family_column,
+        semantic_column,
+        contingency_column,
+        support_column,
+        compression_column,
+        ratio_column,
+        original_count_column,
+        compressed_count_column,
+        prediction_lift_column,
+        stability_column,
+        context_column,
+        game_column,
+        sampler_column,
+        "action" if "action" in columns else None,
+    } if name is not None]
+    rows, row_count_available, row_count_used = _select_rows(connection, table_name, selected_columns, max_rows=max_rows)
+    if not rows:
         return None
-
-    discovered = int(row[1] or 0)
-    stable_families = int(row[2] or 0)
-    singleton_count = int(row[3] or 0)
-    family_mean_member_count = float(row[4] or 0.0)
-    family_max_member_count = int(row[5] or 0)
-    mean_family_compression_gain = float(row[6] or 0.0)
-    max_family_compression_gain = float(row[7] or 0.0)
-    cross_context_count = int(row[8] or 0)
-    cross_game_count = int(row[9] or 0)
-    cross_sampler_count = int(row[10] or 0)
-
-    offset = 11
-    direct_compression_gain = None
-    direct_compression_ratio = None
-    family_prediction_lift_mean = None
-    family_prediction_lift_max = None
-    if compression_expr:
-        direct_compression_gain = float(row[offset] or 0.0)
-        offset += 1
-    if ratio_expr:
-        direct_compression_ratio = float(row[offset] or 0.0)
-        offset += 1
-    if prediction_lift_expr:
-        family_prediction_lift_mean = float(row[offset] or 0.0)
-        family_prediction_lift_max = float(row[offset + 1] or 0.0)
-
-    compression_ratio = direct_compression_ratio
-    if compression_ratio is None:
-        if original_count_column and compressed_count_column:
-            compression_ratio = _family_ratio_from_counts(connection, table_name, original_count_column, compressed_count_column)
-        elif family_count > 0:
-            compression_ratio = discovered / family_count
-
-    compression_gain = direct_compression_gain
-    if compression_gain is None and family_count > 0 and discovered > 0:
-        compression_gain = 1.0 - (family_count / discovered)
-
-    member_counts = _family_member_counts(connection, table_name, family_column, contingency_column)
+    observations = _family_observations_from_rows(
+        rows,
+        sqlite_path=sqlite_path,
+        run_dir=run_dir,
+        family_column=family_column,
+        semantic_column=semantic_column,
+        contingency_column=contingency_column,
+        support_column=support_column,
+        compression_column=compression_column,
+        ratio_column=ratio_column,
+        original_count_column=original_count_column,
+        compressed_count_column=compressed_count_column,
+        prediction_lift_column=prediction_lift_column,
+        stability_column=stability_column,
+        context_column=context_column,
+        game_column=game_column,
+        sampler_column=sampler_column,
+        action_column="action" if "action" in columns else None,
+        min_family_support=min_family_support,
+    )
+    if not observations:
+        return None
     candidate = {
         "selected_db_paths": [str(sqlite_path)],
         "tables_seen": [table_name],
         "candidate_tables_used": [table_name],
         "interaction_count": interaction_count,
-        "contingency_candidate_count": discovered,
-        "discovered_contingency_count": discovered,
-        "stable_contingency_count": stable_families,
-        "transformation_family_candidate_count": family_count,
-        "transformation_family_count": family_count,
-        "stable_transformation_family_count": stable_families,
-        "family_member_count_total": discovered,
-        "family_mean_member_count": family_mean_member_count,
-        "family_median_member_count": float(median(member_counts)) if member_counts else None,
-        "family_max_member_count": family_max_member_count,
-        "singleton_family_count": singleton_count,
-        "singleton_family_ratio": (singleton_count / family_count) if family_count > 0 else None,
-        "compression_ratio": compression_ratio,
-        "compression_gain": compression_gain,
-        "mean_family_compression_gain": direct_compression_gain if direct_compression_gain is not None else mean_family_compression_gain,
-        "max_family_compression_gain": direct_compression_gain if direct_compression_gain is not None else max_family_compression_gain,
-        "family_prediction_lift_mean": family_prediction_lift_mean,
-        "family_prediction_lift_median": family_prediction_lift_mean,
-        "family_prediction_lift_max": family_prediction_lift_max,
-        "family_cross_context_count": cross_context_count if context_column is not None else None,
-        "family_cross_game_count": cross_game_count if game_column is not None else None,
-        "family_cross_sampler_count": cross_sampler_count if sampler_column is not None else None,
+        "row_count_available": row_count_available,
+        "row_count_used": row_count_used,
+        "max_rows_applied": row_count_available is not None and row_count_used < row_count_available,
+        "family_observations": observations,
+        "global_family_count_before_merge": len({item["canonical_signature"] for item in observations}),
         "usable_direct_family_evidence": True,
-        "stability_approximated": stability_approximated,
+        "stability_approximated": stability_column is None,
     }
     return candidate
 
@@ -718,10 +796,10 @@ def _compute_derivable_family_candidate(
     run_dir: Path,
     table_name: str,
     columns: set[str],
+    max_rows: int,
     min_family_support: int,
     interaction_count: int | None,
 ) -> dict[str, Any] | None:
-    del run_dir
     signature_column = _first_matching(columns, SIGNATURE_COLUMNS)
     if signature_column is None:
         return None
@@ -730,125 +808,336 @@ def _compute_derivable_family_candidate(
     if context_column is None and action_column is None:
         return None
     support_column = _first_matching(columns, SUPPORT_COLUMNS)
-    table_ref = _quote_ident(table_name)
-    family_ref = _quote_ident(signature_column)
-    context_expr = _quote_ident(context_column) if context_column is not None else "''"
-    action_expr = f"CAST({_quote_ident(action_column)} AS TEXT)" if action_column is not None else "''"
-    support_expr = _quote_ident(support_column) if support_column is not None else "1"
-
-    row = connection.execute(
-        f"""
-        WITH base AS (
-            SELECT
-                CAST({family_ref} AS TEXT) AS family_key,
-                CAST({context_expr} AS TEXT) || '|' || CAST({action_expr} AS TEXT) AS contingency_key,
-                CAST({support_expr} AS REAL) AS support_value
-            FROM {table_ref}
-            WHERE {family_ref} IS NOT NULL
-        ),
-        grouped AS (
-            SELECT
-                family_key,
-                COUNT(DISTINCT contingency_key) AS member_count,
-                MAX(support_value) AS support_value
-            FROM base
-            GROUP BY family_key
-        )
-        SELECT
-            COUNT(*),
-            SUM(member_count),
-            SUM(CASE WHEN support_value >= {int(min_family_support)} THEN 1 ELSE 0 END),
-            SUM(CASE WHEN member_count <= 1 THEN 1 ELSE 0 END),
-            AVG(member_count),
-            MAX(member_count)
-        FROM grouped
-        """
-    ).fetchone()
-    family_count = int(row[0] or 0)
-    if family_count <= 0:
+    game_column = _first_matching(columns, GAME_COLUMNS)
+    sampler_column = _first_matching(columns, SAMPLER_COLUMNS)
+    selected_columns = [name for name in {
+        signature_column,
+        context_column,
+        action_column,
+        support_column,
+        game_column,
+        sampler_column,
+    } if name is not None]
+    rows, row_count_available, row_count_used = _select_rows(connection, table_name, selected_columns, max_rows=max_rows)
+    if not rows:
         return None
-    discovered = int(row[1] or 0)
-    stable_families = int(row[2] or 0)
-    singleton_count = int(row[3] or 0)
-    member_mean = float(row[4] or 0.0)
-    member_max = int(row[5] or 0)
-    member_counts = _derived_family_member_counts(connection, table_name, signature_column, context_column, action_column)
-    family_presence = _derived_family_presence(connection, sqlite_path, table_name, signature_column, run_dir)
+    observations = _family_observations_from_rows(
+        rows,
+        sqlite_path=sqlite_path,
+        run_dir=run_dir,
+        family_column=None,
+        semantic_column=signature_column,
+        contingency_column=None,
+        support_column=support_column,
+        compression_column=None,
+        ratio_column=None,
+        original_count_column=None,
+        compressed_count_column=None,
+        prediction_lift_column=None,
+        stability_column=None,
+        context_column=context_column,
+        game_column=game_column,
+        sampler_column=sampler_column,
+        action_column=action_column,
+        min_family_support=min_family_support,
+    )
+    if not observations:
+        return None
     return {
         "selected_db_paths": [str(sqlite_path)],
         "tables_seen": [table_name],
         "candidate_tables_used": [table_name],
         "interaction_count": interaction_count,
-        "contingency_candidate_count": discovered,
-        "discovered_contingency_count": discovered,
-        "stable_contingency_count": stable_families,
-        "transformation_family_candidate_count": family_count,
-        "transformation_family_count": family_count,
-        "stable_transformation_family_count": stable_families,
-        "family_member_count_total": discovered,
-        "family_mean_member_count": member_mean,
-        "family_median_member_count": float(median(member_counts)) if member_counts else None,
-        "family_max_member_count": member_max,
-        "singleton_family_count": singleton_count,
-        "singleton_family_ratio": singleton_count / family_count if family_count > 0 else None,
-        "compression_ratio": discovered / family_count if family_count > 0 else None,
-        "compression_gain": 1.0 - (family_count / discovered) if discovered > 0 else None,
-        "mean_family_compression_gain": float(mean([max(0.0, 1.0 - (1.0 / count)) for count in member_counts])) if member_counts else None,
-        "max_family_compression_gain": max((max(0.0, 1.0 - (1.0 / count)) for count in member_counts), default=None),
-        "family_prediction_lift_mean": None,
-        "family_prediction_lift_median": None,
-        "family_prediction_lift_max": None,
-        "family_cross_context_count": sum(1 for item in family_presence.values() if len(item["contexts"]) > 1),
-        "family_cross_game_count": sum(1 for item in family_presence.values() if len(item["games"]) > 1),
-        "family_cross_sampler_count": sum(1 for item in family_presence.values() if len(item["samplers"]) > 1),
+        "row_count_available": row_count_available,
+        "row_count_used": row_count_used,
+        "max_rows_applied": row_count_available is not None and row_count_used < row_count_available,
+        "family_observations": observations,
+        "global_family_count_before_merge": len({item["canonical_signature"] for item in observations}),
         "usable_direct_family_evidence": True,
         "stability_approximated": True,
     }
 
 
-def _aggregate_h03_db_candidates(candidates: list[dict[str, Any]], *, min_family_support: int) -> dict[str, Any]:
-    del min_family_support
+def _aggregate_h03_db_candidates(candidates: list[dict[str, Any]], *, min_family_support: int, max_rows: int) -> dict[str, Any]:
+    global_families: dict[str, dict[str, Any]] = {}
+    relaxed_families: dict[str, set[str]] = {}
+    raw_family_signatures = 0
+    row_count_available = 0
+    row_count_used = 0
+    max_rows_applied = False
+    explicit_game_sampler_coverage = False
+    for candidate in candidates:
+        row_count_available += int(candidate.get("row_count_available") or 0)
+        row_count_used += int(candidate.get("row_count_used") or 0)
+        max_rows_applied = max_rows_applied or bool(candidate.get("max_rows_applied", False))
+        observations = candidate.get("family_observations", [])
+        raw_family_signatures += len({item["canonical_signature"] for item in observations})
+        for item in observations:
+            relaxed_families.setdefault(item["relaxed_canonical_signature"], set()).add(item["strict_canonical_signature"])
+            family = global_families.setdefault(
+                item["canonical_signature"],
+                {
+                    "member_keys": set(),
+                    "games": set(),
+                    "samplers": set(),
+                    "contexts": set(),
+                    "support_total": 0.0,
+                    "source_db_paths": set(),
+                    "compression_values": [],
+                    "ratio_values": [],
+                    "prediction_lift_values": [],
+                    "stable_flags": [],
+                    "actions": set(),
+                    "effect_types": set(),
+                },
+            )
+            family["member_keys"].add(item["member_key"])
+            family["games"].update(item["games"])
+            family["samplers"].update(item["samplers"])
+            family["contexts"].update(item["contexts"])
+            family["support_total"] += float(item["support_value"] or 0.0)
+            family["source_db_paths"].add(item["source_db_path"])
+            if item.get("compression_gain") is not None:
+                family["compression_values"].append(float(item["compression_gain"]))
+            if item.get("compression_ratio") is not None:
+                family["ratio_values"].append(float(item["compression_ratio"]))
+            if item.get("prediction_lift") is not None:
+                family["prediction_lift_values"].append(float(item["prediction_lift"]))
+            if item.get("stable_flag") is not None:
+                family["stable_flags"].append(bool(item["stable_flag"]))
+            if item.get("action_value") is not None:
+                family["actions"].add(item["action_value"])
+            if item.get("effect_type") is not None:
+                family["effect_types"].add(item["effect_type"])
+            if item["games"] or item["samplers"]:
+                explicit_game_sampler_coverage = True
+
+    family_count = len(global_families)
+    member_counts = [len(item["member_keys"]) for item in global_families.values()]
+    family_member_count_total = sum(member_counts)
+    singleton_family_count = sum(1 for count in member_counts if count <= 1)
+    stable_family_count = sum(
+        1
+        for item in global_families.values()
+        if item["support_total"] >= float(min_family_support) or any(item["stable_flags"])
+    )
+    top_global_families = [
+        {
+            "canonical_signature": signature,
+            "member_count": len(item["member_keys"]),
+            "games": sorted(item["games"]),
+            "samplers": sorted(item["samplers"]),
+            "contexts": len(item["contexts"]),
+            "support_total": item["support_total"],
+            "source_db_count": len(item["source_db_paths"]),
+        }
+        for signature, item in sorted(
+            global_families.items(),
+            key=lambda pair: (-len(pair[1]["member_keys"]), -len(pair[1]["games"]), -len(pair[1]["samplers"]), pair[0]),
+        )[:10]
+    ]
+    relaxed_diagnostics = _relaxed_canonicalization_diagnostics(global_families, relaxed_families)
+    relaxed_family_count = relaxed_diagnostics["relaxed_family_count"]
+    relaxed_singleton_count = relaxed_diagnostics["relaxed_singleton_family_count"]
+    singleton_diagnostics = _singleton_diagnostics(global_families, relaxed_families)
+    strict_singleton_ratio = (singleton_family_count / family_count) if family_count > 0 else None
+    relaxed_singleton_ratio = (relaxed_singleton_count / relaxed_family_count) if relaxed_family_count > 0 else None
     out = {
         "selected_db_paths": sorted({path for candidate in candidates for path in candidate.get("selected_db_paths", [])}),
         "tables_seen": sorted({table for candidate in candidates for table in candidate.get("tables_seen", [])}),
         "candidate_tables_used": sorted({table for candidate in candidates for table in candidate.get("candidate_tables_used", [])}),
         "interaction_count": _sum_or_none(candidate.get("interaction_count") for candidate in candidates),
-        "contingency_candidate_count": _sum_or_none(candidate.get("contingency_candidate_count") for candidate in candidates),
-        "discovered_contingency_count": _sum_or_none(candidate.get("discovered_contingency_count") for candidate in candidates),
-        "stable_contingency_count": _sum_or_none(candidate.get("stable_contingency_count") for candidate in candidates),
-        "transformation_family_candidate_count": _sum_or_none(candidate.get("transformation_family_candidate_count") for candidate in candidates),
-        "transformation_family_count": _sum_or_none(candidate.get("transformation_family_count") for candidate in candidates),
-        "stable_transformation_family_count": _sum_or_none(candidate.get("stable_transformation_family_count") for candidate in candidates),
-        "family_member_count_total": _sum_or_none(candidate.get("family_member_count_total") for candidate in candidates),
-        "family_mean_member_count": None,
-        "family_median_member_count": None,
-        "family_max_member_count": _max_or_none(candidate.get("family_max_member_count") for candidate in candidates),
-        "singleton_family_count": _sum_or_none(candidate.get("singleton_family_count") for candidate in candidates),
-        "singleton_family_ratio": None,
-        "compression_ratio": None,
-        "compression_gain": None,
-        "mean_family_compression_gain": _mean_or_none(candidate.get("mean_family_compression_gain") for candidate in candidates),
-        "max_family_compression_gain": _max_or_none(candidate.get("max_family_compression_gain") for candidate in candidates),
-        "family_prediction_lift_mean": _mean_or_none(candidate.get("family_prediction_lift_mean") for candidate in candidates),
-        "family_prediction_lift_median": _mean_or_none(candidate.get("family_prediction_lift_median") for candidate in candidates),
-        "family_prediction_lift_max": _max_or_none(candidate.get("family_prediction_lift_max") for candidate in candidates),
-        "family_cross_context_count": _sum_or_none(candidate.get("family_cross_context_count") for candidate in candidates),
-        "family_cross_game_count": _sum_or_none(candidate.get("family_cross_game_count") for candidate in candidates),
-        "family_cross_sampler_count": _sum_or_none(candidate.get("family_cross_sampler_count") for candidate in candidates),
+        "contingency_candidate_count": family_member_count_total if global_families else None,
+        "discovered_contingency_count": family_member_count_total if global_families else None,
+        "stable_contingency_count": family_member_count_total if global_families else None,
+        "transformation_family_candidate_count": raw_family_signatures if global_families else None,
+        "transformation_family_count": family_count if global_families else None,
+        "stable_transformation_family_count": stable_family_count if global_families else None,
+        "family_member_count_total": family_member_count_total if global_families else None,
+        "family_mean_member_count": float(mean(member_counts)) if member_counts else None,
+        "family_median_member_count": float(median(member_counts)) if member_counts else None,
+        "family_max_member_count": max(member_counts) if member_counts else None,
+        "singleton_family_count": singleton_family_count if global_families else None,
+        "singleton_family_ratio": (singleton_family_count / family_count) if family_count > 0 else None,
+        "compression_ratio": (family_member_count_total / family_count) if family_count > 0 else None,
+        "compression_gain": (1.0 - (family_count / family_member_count_total)) if family_member_count_total > 0 else None,
+        "mean_family_compression_gain": _mean_or_none(
+            value for item in global_families.values() for value in item["compression_values"]
+        ),
+        "max_family_compression_gain": _max_or_none(
+            value for item in global_families.values() for value in item["compression_values"]
+        ),
+        "family_prediction_lift_mean": _mean_or_none(
+            value for item in global_families.values() for value in item["prediction_lift_values"]
+        ),
+        "family_prediction_lift_median": _median_or_none(
+            value for item in global_families.values() for value in item["prediction_lift_values"]
+        ),
+        "family_prediction_lift_max": _max_or_none(
+            value for item in global_families.values() for value in item["prediction_lift_values"]
+        ),
+        "family_cross_context_count": sum(1 for item in global_families.values() if len(item["contexts"]) > 1),
+        "family_cross_game_count": (
+            sum(1 for item in global_families.values() if len(item["games"]) > 1)
+            if explicit_game_sampler_coverage
+            else None
+        ),
+        "family_cross_sampler_count": (
+            sum(1 for item in global_families.values() if len(item["samplers"]) > 1)
+            if explicit_game_sampler_coverage
+            else None
+        ),
+        "row_count_available": row_count_available or None,
+        "row_count_used": row_count_used,
+        "max_rows_applied": max_rows_applied,
+        "global_family_count_before_merge": raw_family_signatures,
+        "global_family_count_after_merge": family_count,
+        "families_merged_across_shards": max(0, raw_family_signatures - family_count),
+        "families_merged_across_games": sum(1 for item in global_families.values() if len(item["games"]) > 1),
+        "families_merged_across_samplers": sum(1 for item in global_families.values() if len(item["samplers"]) > 1),
+        "top_global_families": top_global_families,
+        "top_singleton_family_signatures": singleton_diagnostics["top_singletons"],
+        "singleton_families_by_game": singleton_diagnostics["by_game"],
+        "singleton_families_by_sampler": singleton_diagnostics["by_sampler"],
+        "singleton_families_by_action": singleton_diagnostics["by_action"],
+        "singleton_families_by_effect_type": singleton_diagnostics["by_effect_type"],
+        "singleton_family_diagnostics": singleton_diagnostics["diagnostics"],
+        "relaxed_canonicalization_diagnostics": relaxed_diagnostics,
+        "singleton_ratio_strict": strict_singleton_ratio,
+        "singleton_ratio_relaxed": relaxed_singleton_ratio,
+        "singleton_family_count_relaxed": relaxed_singleton_count if relaxed_families else None,
+        "transformation_family_count_relaxed": relaxed_family_count if relaxed_families else None,
+        "relaxed_family_count": relaxed_family_count if relaxed_families else None,
+        "relaxed_singleton_family_count": relaxed_singleton_count if relaxed_families else None,
+        "relaxed_singleton_family_ratio": relaxed_singleton_ratio,
+        "over_specific_singleton_count": singleton_diagnostics["diagnostics"]["over_specific_count"],
+        "over_specific_singleton_ratio": (
+            singleton_diagnostics["diagnostics"]["over_specific_count"] / singleton_family_count
+            if singleton_family_count > 0
+            else None
+        ),
+        "merge_safety_passed": relaxed_diagnostics["merge_safety_passed"],
+        "unsafe_relaxed_merge_count": relaxed_diagnostics["unsafe_relaxed_merge_count"],
+        "relaxed_decision_candidate": (
+            "VALID"
+            if (
+                relaxed_singleton_ratio is not None
+                and relaxed_singleton_ratio <= 0.50
+                and family_member_count_total > family_count
+                and (1.0 - (family_count / family_member_count_total)) > 0.0
+                and relaxed_diagnostics["merge_safety_passed"] is True
+                and relaxed_diagnostics["unsafe_relaxed_merge_count"] == 0
+            )
+            else None
+        ),
         "usable_direct_family_evidence": any(candidate.get("usable_direct_family_evidence", False) for candidate in candidates),
         "stability_approximated": any(candidate.get("stability_approximated", False) for candidate in candidates),
     }
-    family_total = out["transformation_family_count"]
-    contingency_total = out["discovered_contingency_count"]
-    if family_total and contingency_total:
-        out["compression_ratio"] = contingency_total / family_total
-        out["compression_gain"] = 1.0 - (family_total / contingency_total)
-    if family_total and out["singleton_family_count"] is not None:
-        out["singleton_family_ratio"] = out["singleton_family_count"] / family_total
-    if family_total and out["family_member_count_total"] is not None:
-        out["family_mean_member_count"] = out["family_member_count_total"] / family_total
-        out["family_median_member_count"] = out["family_mean_member_count"]
+    del max_rows
     return out
+
+
+def _singleton_diagnostics(
+    global_families: dict[str, dict[str, Any]],
+    relaxed_families: dict[str, set[str]],
+) -> dict[str, Any]:
+    singletons = [
+        (signature, item)
+        for signature, item in global_families.items()
+        if len(item["member_keys"]) <= 1
+    ]
+    by_game: dict[str, int] = {}
+    by_sampler: dict[str, int] = {}
+    by_action: dict[str, int] = {}
+    by_effect_type: dict[str, int] = {}
+    diagnostics = {
+        "genuine_rare_count": 0,
+        "over_specific_count": 0,
+        "uncertain_count": 0,
+    }
+    ranked: list[dict[str, Any]] = []
+    for signature, item in sorted(singletons, key=lambda pair: (-pair[1]["support_total"], pair[0])):
+        for name in item["games"] or {"unknown"}:
+            by_game[name] = by_game.get(name, 0) + 1
+        for name in item["samplers"] or {"unknown"}:
+            by_sampler[name] = by_sampler.get(name, 0) + 1
+        for name in item["actions"] or {"unknown"}:
+            by_action[name] = by_action.get(name, 0) + 1
+        for name in item["effect_types"] or {"unknown"}:
+            by_effect_type[name] = by_effect_type.get(name, 0) + 1
+        relaxed_signature = _relaxed_family_signature(signature)
+        relaxed_group_size = len(relaxed_families.get(relaxed_signature, set()))
+        if relaxed_group_size > 1:
+            diagnosis = "over_specific"
+            diagnostics["over_specific_count"] += 1
+        elif item["support_total"] >= 2.0 and len(item["contexts"]) <= 1:
+            diagnosis = "genuine_rare"
+            diagnostics["genuine_rare_count"] += 1
+        else:
+            diagnosis = "uncertain"
+            diagnostics["uncertain_count"] += 1
+        ranked.append(
+            {
+                "canonical_signature": signature,
+                "support_total": item["support_total"],
+                "games": sorted(item["games"]),
+                "samplers": sorted(item["samplers"]),
+                "actions": sorted(item["actions"]),
+                "effect_types": sorted(item["effect_types"]),
+                "source_db_count": len(item["source_db_paths"]),
+                "relaxed_group_size": relaxed_group_size,
+                "diagnosis": diagnosis,
+            }
+        )
+    return {
+        "top_singletons": ranked[:10],
+        "by_game": dict(sorted(by_game.items())),
+        "by_sampler": dict(sorted(by_sampler.items())),
+        "by_action": dict(sorted(by_action.items())),
+        "by_effect_type": dict(sorted(by_effect_type.items())),
+        "diagnostics": diagnostics,
+    }
+
+
+def _relaxed_canonicalization_diagnostics(
+    global_families: dict[str, dict[str, Any]],
+    relaxed_families: dict[str, set[str]],
+) -> dict[str, Any]:
+    groups: list[dict[str, Any]] = []
+    unsafe_count = 0
+    relaxed_singletons = 0
+    for relaxed_signature, strict_signatures in sorted(relaxed_families.items()):
+        members = [global_families[signature] for signature in strict_signatures if signature in global_families]
+        effect_types = sorted({effect for item in members for effect in item.get("effect_types", set())})
+        action_groups = sorted({ _action_group(action) for item in members for action in item.get("actions", set()) })
+        polarities = sorted({ _effect_polarity(effect) for effect in effect_types })
+        safe = (
+            len(effect_types) <= 1
+            and len(action_groups) <= 1
+            and len(polarities) <= 1
+            and not ("mixed" in polarities and len(polarities) > 1)
+        )
+        if not safe:
+            unsafe_count += 1
+        if len(strict_signatures) <= 1:
+            relaxed_singletons += 1
+        groups.append(
+            {
+                "relaxed_signature": relaxed_signature,
+                "strict_signature_count": len(strict_signatures),
+                "effect_types": effect_types,
+                "action_groups": action_groups,
+                "polarities": polarities,
+                "safe": safe,
+            }
+        )
+    return {
+        "groups": groups[:20],
+        "relaxed_family_count": len(relaxed_families),
+        "relaxed_singleton_family_count": relaxed_singletons,
+        "merge_safety_passed": unsafe_count == 0,
+        "unsafe_relaxed_merge_count": unsafe_count,
+    }
 
 
 def _read_h03_artifact_candidate(artifact_paths: list[Path], *, min_family_support: int) -> dict[str, Any] | None:
@@ -1163,70 +1452,330 @@ def _family_ratio_from_counts(
     return None if row is None or row[0] is None else float(row[0])
 
 
-def _family_member_counts(
+def _select_rows(
     connection: sqlite3.Connection,
     table_name: str,
-    family_column: str,
+    selected_columns: list[str],
+    *,
+    max_rows: int,
+) -> tuple[list[dict[str, Any]], int | None, int]:
+    table_ref = _quote_ident(table_name)
+    row_count_available = _count_rows(connection, table_name)
+    columns_sql = ", ".join(_quote_ident(name) for name in selected_columns) if selected_columns else "rowid"
+    limit_value = max(1, int(max_rows))
+    try:
+        fetched = connection.execute(
+            f"SELECT {columns_sql} FROM {table_ref} LIMIT {limit_value}"
+        ).fetchall()
+    except sqlite3.DatabaseError:
+        return [], row_count_available, 0
+    rows: list[dict[str, Any]] = []
+    for item in fetched:
+        row = {name: item[index] for index, name in enumerate(selected_columns)}
+        rows.append(row)
+    return rows, row_count_available, len(rows)
+
+
+def _family_observations_from_rows(
+    rows: list[dict[str, Any]],
+    *,
+    sqlite_path: Path,
+    run_dir: Path,
+    family_column: str | None,
+    semantic_column: str | None,
     contingency_column: str | None,
-) -> list[int]:
-    contingency_expr = _quote_ident(contingency_column) if contingency_column is not None else "rowid"
-    rows = connection.execute(
-        f"""
-        SELECT COUNT(DISTINCT CAST({contingency_expr} AS TEXT))
-        FROM {_quote_ident(table_name)}
-        WHERE {_quote_ident(family_column)} IS NOT NULL
-        GROUP BY CAST({_quote_ident(family_column)} AS TEXT)
-        """
-    ).fetchall()
-    return [int(row[0]) for row in rows if row and row[0] is not None]
+    support_column: str | None,
+    compression_column: str | None,
+    ratio_column: str | None,
+    original_count_column: str | None,
+    compressed_count_column: str | None,
+    prediction_lift_column: str | None,
+    stability_column: str | None,
+    context_column: str | None,
+    game_column: str | None,
+    sampler_column: str | None,
+    action_column: str | None,
+    min_family_support: int,
+) -> list[dict[str, Any]]:
+    path_game, path_sampler = _infer_game_sampler_from_path(run_dir, sqlite_path)
+    observations: list[dict[str, Any]] = []
+    for row in rows:
+        canonical_signature = _canonical_family_signature(
+            row,
+            family_column=family_column,
+            semantic_column=semantic_column,
+        )
+        if canonical_signature is None:
+            continue
+        support_value = _maybe_float(row.get(support_column)) if support_column is not None else None
+        if support_value is None:
+            support_value = 1.0
+        ratio_value = _maybe_float(row.get(ratio_column)) if ratio_column is not None else None
+        if ratio_value is None and original_count_column and compressed_count_column:
+            original_count = _maybe_float(row.get(original_count_column))
+            compressed_count = _maybe_float(row.get(compressed_count_column))
+            if original_count is not None and compressed_count not in (None, 0.0):
+                ratio_value = original_count / compressed_count
+        compression_gain = _maybe_float(row.get(compression_column)) if compression_column is not None else None
+        if compression_gain is None and ratio_value is not None and ratio_value > 0:
+            compression_gain = 1.0 - (1.0 / ratio_value)
+        game_value = _normalize_scalar(row.get(game_column)) if game_column is not None else None
+        sampler_value = _normalize_scalar(row.get(sampler_column)) if sampler_column is not None else None
+        context_value = _context_key(row, context_column=context_column, action_column=action_column)
+        observations.append(
+            {
+                "canonical_signature": canonical_signature,
+                "strict_canonical_signature": canonical_signature,
+                "relaxed_canonical_signature": _relaxed_family_signature(canonical_signature),
+                "member_key": _member_key(
+                    row,
+                    sqlite_path=sqlite_path,
+                    contingency_column=contingency_column,
+                    context_column=context_column,
+                    action_column=action_column,
+                    semantic_column=semantic_column,
+                ),
+                "games": {game_value} if game_value is not None else ({path_game} if path_game is not None else set()),
+                "samplers": {sampler_value} if sampler_value is not None else ({path_sampler} if path_sampler is not None else set()),
+                "contexts": {context_value} if context_value is not None else set(),
+                "support_value": support_value,
+                "source_db_path": str(sqlite_path),
+                "compression_gain": compression_gain,
+                "compression_ratio": ratio_value,
+                "prediction_lift": _maybe_float(row.get(prediction_lift_column)) if prediction_lift_column is not None else None,
+                "stable_flag": _stable_value(row.get(stability_column)) if stability_column is not None else (support_value >= float(min_family_support)),
+                "action_value": _normalize_scalar(row.get(action_column)) if action_column is not None else None,
+                "effect_type": _infer_effect_type(canonical_signature),
+            }
+        )
+    return observations
 
 
-def _derived_family_member_counts(
-    connection: sqlite3.Connection,
-    table_name: str,
-    signature_column: str,
+def _canonical_family_signature(
+    row: dict[str, Any],
+    *,
+    family_column: str | None,
+    semantic_column: str | None,
+) -> str | None:
+    semantic_value = _normalized_signature_value(row.get(semantic_column)) if semantic_column is not None else None
+    family_value = _normalized_signature_value(row.get(family_column)) if family_column is not None else None
+    if family_value is not None and not _looks_local_integer_id(family_value):
+        return family_value
+    if semantic_value is not None:
+        return semantic_value
+    return None
+
+
+def _normalized_signature_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, (dict, list)):
+        return _normalize_json_like(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        parsed = None
+    if parsed is not None and isinstance(parsed, (dict, list)):
+        return _normalize_json_like(parsed)
+    lowered = text.lower()
+    return lowered
+
+
+def _normalize_json_like(value: Any) -> str:
+    cleaned = _remove_volatile_fields(value)
+    return json.dumps(cleaned, sort_keys=True, separators=(",", ":"))
+
+
+def _remove_volatile_fields(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(key): _remove_volatile_fields(item)
+            for key, item in sorted(value.items())
+            if str(key) not in {"interaction_id", "rowid", "db_path", "seed", "timestamp"}
+        }
+    if isinstance(value, list):
+        return [_remove_volatile_fields(item) for item in value]
+    return value
+
+
+def _looks_local_integer_id(value: str) -> bool:
+    stripped = value.strip().lower()
+    if stripped.isdigit():
+        return True
+    if stripped.startswith("-") and stripped[1:].isdigit():
+        return True
+    return False
+
+
+def _relaxed_family_signature(signature: str) -> str:
+    try:
+        parsed = json.loads(signature)
+    except Exception:
+        parsed = None
+    if isinstance(parsed, list):
+        relaxed = [_bucket_numeric_value_abs(item) if isinstance(item, (int, float)) else item for item in parsed]
+        return json.dumps(relaxed, separators=(",", ":"))
+    if isinstance(parsed, dict):
+        relaxed = {
+            key: _bucket_numeric_value_abs(value) if isinstance(value, (int, float)) else value
+            for key, value in parsed.items()
+        }
+        return json.dumps(relaxed, sort_keys=True, separators=(",", ":"))
+    return _relax_text_signature(signature)
+
+
+def _bucket_numeric_value(value: float | int) -> int:
+    number = float(value)
+    if number == 0:
+        return 0
+    magnitude = abs(number)
+    if magnitude <= 1:
+        bucket = 1
+    elif magnitude <= 4:
+        bucket = 4
+    elif magnitude <= 16:
+        bucket = 16
+    elif magnitude <= 64:
+        bucket = 64
+    else:
+        bucket = 128
+    return int(bucket if number > 0 else -bucket)
+
+
+def _bucket_numeric_value_abs(value: float | int) -> int:
+    return abs(_bucket_numeric_value(value))
+
+
+def _relax_text_signature(signature: str) -> str:
+    lowered = signature.lower().strip()
+    pieces = []
+    current_digits = []
+    for char in lowered:
+        if char.isdigit() or char in ".-":
+            current_digits.append(char)
+            continue
+        if current_digits:
+            pieces.append(str(_bucket_numeric_value_abs(_safe_float("".join(current_digits)))))
+            current_digits = []
+        pieces.append(char)
+    if current_digits:
+        pieces.append(str(_bucket_numeric_value_abs(_safe_float("".join(current_digits)))))
+    return "".join(pieces)
+
+
+def _safe_float(value: str) -> float:
+    try:
+        return float(value)
+    except ValueError:
+        return 0.0
+
+
+def _infer_effect_type(signature: str) -> str:
+    lowered = signature.lower()
+    if lowered in {"[0,0,0,0,0]", "[0.0,0.0,0.0,0.0,0.0]", "preserve", "no_change"}:
+        return "preserve_like"
+    try:
+        parsed = json.loads(signature)
+    except Exception:
+        parsed = None
+    if isinstance(parsed, list) and parsed:
+        non_zero = [float(item) for item in parsed if isinstance(item, (int, float)) and float(item) != 0.0]
+        if not non_zero:
+            return "preserve_like"
+        positives = sum(1 for item in non_zero if item > 0)
+        negatives = sum(1 for item in non_zero if item < 0)
+        if positives and negatives:
+            return "mixed_change"
+        if positives:
+            return "positive_change"
+        if negatives:
+            return "negative_change"
+    if "expand" in lowered:
+        return "expand_like"
+    if "restrict" in lowered or "collapse" in lowered:
+        return "restrict_like"
+    return "signature_like"
+
+
+def _effect_polarity(effect_type: str) -> str:
+    if effect_type in {"positive_change", "expand_like"}:
+        return "positive"
+    if effect_type in {"negative_change", "restrict_like"}:
+        return "negative"
+    if effect_type == "mixed_change":
+        return "mixed"
+    return effect_type
+
+
+def _action_group(action_value: str) -> str:
+    try:
+        action = int(action_value)
+    except (TypeError, ValueError):
+        return "unknown"
+    if action in {1, 2, 3, 4}:
+        return "movement"
+    if action in {5, 6}:
+        return "interaction"
+    if action in {0, 7, 8, 9}:
+        return f"reset_terminal_{action}"
+    return f"other_{action}"
+
+
+def _member_key(
+    row: dict[str, Any],
+    *,
+    sqlite_path: Path,
+    contingency_column: str | None,
     context_column: str | None,
     action_column: str | None,
-) -> list[int]:
-    context_expr = _quote_ident(context_column) if context_column is not None else "''"
-    action_expr = f"CAST({_quote_ident(action_column)} AS TEXT)" if action_column is not None else "''"
-    rows = connection.execute(
-        f"""
-        WITH base AS (
-            SELECT
-                CAST({_quote_ident(signature_column)} AS TEXT) AS family_key,
-                CAST({context_expr} AS TEXT) || '|' || CAST({action_expr} AS TEXT) AS contingency_key
-            FROM {_quote_ident(table_name)}
-            WHERE {_quote_ident(signature_column)} IS NOT NULL
-        )
-        SELECT COUNT(DISTINCT contingency_key)
-        FROM base
-        GROUP BY family_key
-        """
-    ).fetchall()
-    return [int(row[0]) for row in rows if row and row[0] is not None]
+    semantic_column: str | None,
+) -> str:
+    context_value = _normalize_scalar(row.get(context_column)) if context_column is not None else None
+    action_value = _normalize_scalar(row.get(action_column)) if action_column is not None else None
+    semantic_value = _normalized_signature_value(row.get(semantic_column)) if semantic_column is not None else None
+    if context_value is not None and semantic_value is not None:
+        return f"{context_value}|{action_value or ''}|{semantic_value}"
+    if context_value is not None:
+        return f"{context_value}|{action_value or ''}"
+    local_id = _normalize_scalar(row.get(contingency_column)) if contingency_column is not None else None
+    if local_id is None:
+        local_id = _normalize_json_like(row)
+    return f"{sqlite_path}:{local_id}"
 
 
-def _derived_family_presence(
-    connection: sqlite3.Connection,
-    sqlite_path: Path,
-    table_name: str,
-    signature_column: str,
-    run_dir: Path,
-) -> dict[str, dict[str, set[str]]]:
-    game_name, sampler_name = _infer_game_sampler_from_path(run_dir, sqlite_path)
-    rows = connection.execute(
-        f"SELECT DISTINCT CAST({_quote_ident(signature_column)} AS TEXT) FROM {_quote_ident(table_name)} WHERE {_quote_ident(signature_column)} IS NOT NULL"
-    ).fetchall()
-    output: dict[str, dict[str, set[str]]] = {}
-    for row in rows:
-        family_key = str(row[0])
-        output[family_key] = {
-            "contexts": set(),
-            "games": {game_name} if game_name is not None else set(),
-            "samplers": {sampler_name} if sampler_name is not None else set(),
-        }
-    return output
+def _context_key(
+    row: dict[str, Any],
+    *,
+    context_column: str | None,
+    action_column: str | None,
+) -> str | None:
+    context_value = _normalize_scalar(row.get(context_column)) if context_column is not None else None
+    action_value = _normalize_scalar(row.get(action_column)) if action_column is not None else None
+    if context_value is None and action_value is None:
+        return None
+    return f"{context_value or ''}|{action_value or ''}"
+
+
+def _normalize_scalar(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text if text else None
+
+
+def _stable_value(value: Any) -> bool | None:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes"}:
+        return True
+    try:
+        return float(value) >= 1.0
+    except (TypeError, ValueError):
+        return None
 
 
 def _infer_game_sampler_from_path(run_dir: Path, sqlite_path: Path) -> tuple[str | None, str | None]:
@@ -1266,6 +1815,13 @@ def _mean_or_none(values: Any) -> float | None:
     if not items:
         return None
     return float(mean(items))
+
+
+def _median_or_none(values: Any) -> float | None:
+    items = [float(value) for value in values if value is not None]
+    if not items:
+        return None
+    return float(median(items))
 
 
 def _max_or_none(values: Any) -> int | float | None:
@@ -1406,9 +1962,13 @@ def _populate_h03_evidence_lists(result: dict[str, Any]) -> None:
     elif result.get("compression_gain") is not None:
         evidence_against.append(f"Compression gain is non-positive ({float(result['compression_gain']):.3f}).")
     if result.get("pre_object_condition_satisfied") is True:
-        evidence_for.append("Object carriers and context-action fallback carriers are absent in the aggregate report.")
+        evidence_for.append("No object-carrier emergence is detected in the aggregate report.")
     elif result.get("pre_object_condition_satisfied") is False:
         evidence_against.append("Object-carrier emergence is already present in the aggregate report.")
+    if _gt(result.get("families_merged_across_shards"), 0) is True:
+        evidence_for.append(
+            f"Global family merging reduced shard-local family inflation ({int(result['global_family_count_before_merge'])} -> {int(result['global_family_count_after_merge'])})."
+        )
     result["evidence_for"] = evidence_for
     result["evidence_against"] = evidence_against
     result["missing_evidence"] = missing_evidence
@@ -1433,16 +1993,34 @@ def _format_h03_text_report(result: dict[str, Any]) -> str:
         "Direct family evidence:",
         f"- artifacts used: {', '.join(result.get('artifact_paths_used', [])) or 'none'}",
         f"- DBs used: {', '.join(result.get('selected_db_paths', [])) or 'none'}",
+        f"- DB scan: total={_fmt_value(result.get('db_paths_total'))} inspected={_fmt_value(result.get('db_paths_inspected'))} truncated={_fmt_value(result.get('db_scan_truncated'))}",
+        f"- rows: available={_fmt_value(result.get('row_count_available'))} used={_fmt_value(result.get('row_count_used'))} max_rows_applied={_fmt_value(result.get('max_rows_applied'))}",
         f"- tables used: {', '.join(result.get('candidate_tables_used', [])) or 'none'}",
+        f"- global merge: enabled={_fmt_value(result.get('global_family_merge_enabled'))} before={_fmt_value(result.get('global_family_count_before_merge'))} after={_fmt_value(result.get('global_family_count_after_merge'))}",
+        f"- merged across shards/games/samplers: {_fmt_value(result.get('families_merged_across_shards'))} / {_fmt_value(result.get('families_merged_across_games'))} / {_fmt_value(result.get('families_merged_across_samplers'))}",
         f"- contingency count: {_fmt_value(result.get('discovered_contingency_count'))}",
         f"- family count: {_fmt_value(result.get('transformation_family_count'))}",
         f"- stable family count: {_fmt_value(result.get('stable_transformation_family_count'))}",
         f"- total family members: {_fmt_value(result.get('family_member_count_total'))}",
         f"- mean/median/max family size: {_fmt_value(result.get('family_mean_member_count'))} / {_fmt_value(result.get('family_median_member_count'))} / {_fmt_value(result.get('family_max_member_count'))}",
         f"- singleton family ratio: {_fmt_value(result.get('singleton_family_ratio'))}",
+        f"- singleton ratio strict/relaxed: {_fmt_value(result.get('singleton_ratio_strict'))} / {_fmt_value(result.get('singleton_ratio_relaxed'))}",
+        f"- relaxed family count / relaxed singleton count: {_fmt_value(result.get('transformation_family_count_relaxed'))} / {_fmt_value(result.get('singleton_family_count_relaxed'))}",
+        f"- relaxed merge safety passed: {_fmt_value(result.get('merge_safety_passed'))}",
+        f"- unsafe relaxed merge count: {_fmt_value(result.get('unsafe_relaxed_merge_count'))}",
+        f"- relaxed decision candidate: {_fmt_value(result.get('relaxed_decision_candidate'))}",
         f"- compression ratio: {_fmt_value(result.get('compression_ratio'))}",
         f"- compression gain: {_fmt_value(result.get('compression_gain'))}",
         f"- family prediction lift: {_fmt_value(result.get('family_prediction_lift_mean'))}",
+        f"- cross-context/game/sampler families: {_fmt_value(result.get('family_cross_context_count'))} / {_fmt_value(result.get('family_cross_game_count'))} / {_fmt_value(result.get('family_cross_sampler_count'))}",
+        f"- top global families: {json.dumps(result.get('top_global_families', []), sort_keys=True)}",
+        f"- top singleton family signatures: {json.dumps(result.get('top_singleton_family_signatures', []), sort_keys=True)}",
+        f"- singleton families by game: {json.dumps(result.get('singleton_families_by_game', {}), sort_keys=True)}",
+        f"- singleton families by sampler: {json.dumps(result.get('singleton_families_by_sampler', {}), sort_keys=True)}",
+        f"- singleton families by action: {json.dumps(result.get('singleton_families_by_action', {}), sort_keys=True)}",
+        f"- singleton families by effect type: {json.dumps(result.get('singleton_families_by_effect_type', {}), sort_keys=True)}",
+        f"- singleton diagnostics: {json.dumps(result.get('singleton_family_diagnostics', {}), sort_keys=True)}",
+        f"- relaxed canonicalization diagnostics: {json.dumps(result.get('relaxed_canonicalization_diagnostics', {}), sort_keys=True)}",
         "",
         "Pre-object evidence:",
         f"- emergent_object_carrier_count: {_fmt_value(result.get('emergent_object_carrier_count'))}",
@@ -1483,16 +2061,34 @@ def _format_h03_markdown_report(result: dict[str, Any]) -> str:
         "## Direct family evidence",
         f"- artifacts used: `{', '.join(result.get('artifact_paths_used', [])) or 'none'}`",
         f"- DBs used: `{', '.join(result.get('selected_db_paths', [])) or 'none'}`",
+        f"- DB scan: `total={_fmt_value(result.get('db_paths_total'))} inspected={_fmt_value(result.get('db_paths_inspected'))} truncated={_fmt_value(result.get('db_scan_truncated'))}`",
+        f"- rows: `available={_fmt_value(result.get('row_count_available'))} used={_fmt_value(result.get('row_count_used'))} max_rows_applied={_fmt_value(result.get('max_rows_applied'))}`",
         f"- tables used: `{', '.join(result.get('candidate_tables_used', [])) or 'none'}`",
+        f"- global merge: `enabled={_fmt_value(result.get('global_family_merge_enabled'))} before={_fmt_value(result.get('global_family_count_before_merge'))} after={_fmt_value(result.get('global_family_count_after_merge'))}`",
+        f"- merged across shards/games/samplers: `{_fmt_value(result.get('families_merged_across_shards'))} / {_fmt_value(result.get('families_merged_across_games'))} / {_fmt_value(result.get('families_merged_across_samplers'))}`",
         f"- contingency count: `{_fmt_value(result.get('discovered_contingency_count'))}`",
         f"- family count: `{_fmt_value(result.get('transformation_family_count'))}`",
         f"- stable family count: `{_fmt_value(result.get('stable_transformation_family_count'))}`",
         f"- total family members: `{_fmt_value(result.get('family_member_count_total'))}`",
         f"- mean/median/max family size: `{_fmt_value(result.get('family_mean_member_count'))} / {_fmt_value(result.get('family_median_member_count'))} / {_fmt_value(result.get('family_max_member_count'))}`",
         f"- singleton family ratio: `{_fmt_value(result.get('singleton_family_ratio'))}`",
+        f"- singleton ratio strict/relaxed: `{_fmt_value(result.get('singleton_ratio_strict'))} / {_fmt_value(result.get('singleton_ratio_relaxed'))}`",
+        f"- relaxed family count / relaxed singleton count: `{_fmt_value(result.get('transformation_family_count_relaxed'))} / {_fmt_value(result.get('singleton_family_count_relaxed'))}`",
+        f"- relaxed merge safety passed: `{_fmt_value(result.get('merge_safety_passed'))}`",
+        f"- unsafe relaxed merge count: `{_fmt_value(result.get('unsafe_relaxed_merge_count'))}`",
+        f"- relaxed decision candidate: `{_fmt_value(result.get('relaxed_decision_candidate'))}`",
         f"- compression ratio: `{_fmt_value(result.get('compression_ratio'))}`",
         f"- compression gain: `{_fmt_value(result.get('compression_gain'))}`",
         f"- family prediction lift: `{_fmt_value(result.get('family_prediction_lift_mean'))}`",
+        f"- cross-context/game/sampler families: `{_fmt_value(result.get('family_cross_context_count'))} / {_fmt_value(result.get('family_cross_game_count'))} / {_fmt_value(result.get('family_cross_sampler_count'))}`",
+        f"- top global families: `{json.dumps(result.get('top_global_families', []), sort_keys=True)}`",
+        f"- top singleton family signatures: `{json.dumps(result.get('top_singleton_family_signatures', []), sort_keys=True)}`",
+        f"- singleton families by game: `{json.dumps(result.get('singleton_families_by_game', {}), sort_keys=True)}`",
+        f"- singleton families by sampler: `{json.dumps(result.get('singleton_families_by_sampler', {}), sort_keys=True)}`",
+        f"- singleton families by action: `{json.dumps(result.get('singleton_families_by_action', {}), sort_keys=True)}`",
+        f"- singleton families by effect type: `{json.dumps(result.get('singleton_families_by_effect_type', {}), sort_keys=True)}`",
+        f"- singleton diagnostics: `{json.dumps(result.get('singleton_family_diagnostics', {}), sort_keys=True)}`",
+        f"- relaxed canonicalization diagnostics: `{json.dumps(result.get('relaxed_canonicalization_diagnostics', {}), sort_keys=True)}`",
         "",
         "## Pre-object evidence",
         f"- emergent_object_carrier_count: `{_fmt_value(result.get('emergent_object_carrier_count'))}`",

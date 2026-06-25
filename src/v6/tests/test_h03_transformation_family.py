@@ -44,6 +44,27 @@ def _write_contingency_db(path: Path, rows: list[tuple[int, str, str, int]]) -> 
         connection.commit()
 
 
+def _write_contingency_db_with_sampler_columns(
+    path: Path,
+    rows: list[tuple[int, str, int, str, str, str]],
+) -> None:
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE contingencies (
+                contingency_id INTEGER PRIMARY KEY,
+                context_signature TEXT,
+                action INTEGER,
+                effect_signature TEXT,
+                game TEXT,
+                sampler_name TEXT
+            )
+            """
+        )
+        connection.executemany("INSERT INTO contingencies VALUES (?, ?, ?, ?, ?, ?)", rows)
+        connection.commit()
+
+
 def _write_family_db(path: Path, rows: list[tuple[str, int, int, float]]) -> None:
     with sqlite3.connect(path) as connection:
         connection.execute(
@@ -208,3 +229,245 @@ def test_h03_direct_compression_gain_column_is_used(tmp_path: Path) -> None:
     assert (out_dir / H03_JSON_NAME).exists()
     assert (out_dir / H03_TXT_NAME).exists()
     assert (out_dir / H03_MD_NAME).exists()
+
+
+def test_h03_global_merge_merges_same_effect_signature_across_dbs(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    out_dir = tmp_path / "out"
+    run_dir.mkdir()
+    _write_v05c_report(run_dir)
+    _write_contingency_db(run_dir / "seed_0.sqlite", [(1, "ctxA|0", "eff-1", 3), (2, "ctxB|1", "eff-1", 3)])
+    _write_contingency_db(run_dir / "seed_1.sqlite", [(1, "ctxC|0", "eff-1", 3), (2, "ctxD|1", "eff-1", 3)])
+
+    result = evaluate_h03_transformation_family_formation(run_dir, out_dir)
+
+    assert result["global_family_count_before_merge"] == 2
+    assert result["global_family_count_after_merge"] == 1
+    assert result["transformation_family_count"] == 1
+    assert result["families_merged_across_shards"] == 1
+
+
+def test_h03_integer_family_ids_do_not_merge_when_semantics_differ(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    out_dir = tmp_path / "out"
+    run_dir.mkdir()
+    _write_v05c_report(run_dir)
+    with sqlite3.connect(run_dir / "seed_0.sqlite") as connection:
+        connection.execute(
+            "CREATE TABLE transformation_families (family_id INTEGER, effect_signature TEXT, member_count INTEGER, support_count INTEGER)"
+        )
+        connection.executemany("INSERT INTO transformation_families VALUES (?, ?, ?, ?)", [(1, "eff-a", 2, 2)])
+        connection.commit()
+    with sqlite3.connect(run_dir / "seed_1.sqlite") as connection:
+        connection.execute(
+            "CREATE TABLE transformation_families (family_id INTEGER, effect_signature TEXT, member_count INTEGER, support_count INTEGER)"
+        )
+        connection.executemany("INSERT INTO transformation_families VALUES (?, ?, ?, ?)", [(1, "eff-b", 2, 2)])
+        connection.commit()
+
+    result = evaluate_h03_transformation_family_formation(run_dir, out_dir)
+
+    assert result["transformation_family_count"] == 2
+    assert result["families_merged_across_shards"] == 0
+
+
+def test_h03_same_effect_signature_across_games_counts_cross_game(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    out_dir = tmp_path / "out"
+    (run_dir / "sampling_v05c" / "tt01" / "mixed" / "steps_1").mkdir(parents=True)
+    (run_dir / "sampling_v05c" / "pb02" / "mixed" / "steps_1").mkdir(parents=True)
+    _write_v05c_report(run_dir)
+    _write_contingency_db((run_dir / "sampling_v05c" / "tt01" / "mixed" / "steps_1" / "seed_0.sqlite"), [(1, "ctxA|0", "eff-1", 3)])
+    _write_contingency_db((run_dir / "sampling_v05c" / "pb02" / "mixed" / "steps_1" / "seed_1.sqlite"), [(1, "ctxB|1", "eff-1", 3)])
+
+    result = evaluate_h03_transformation_family_formation(run_dir, out_dir)
+
+    assert result["family_cross_game_count"] == 1
+    assert result["families_merged_across_games"] == 1
+
+
+def test_h03_same_effect_signature_across_samplers_counts_cross_sampler(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    out_dir = tmp_path / "out"
+    (run_dir / "sampling_v05c" / "tt01" / "mixed" / "steps_1").mkdir(parents=True)
+    (run_dir / "sampling_v05c" / "tt01" / "low_confidence" / "steps_1").mkdir(parents=True)
+    _write_v05c_report(run_dir)
+    _write_contingency_db((run_dir / "sampling_v05c" / "tt01" / "mixed" / "steps_1" / "seed_0.sqlite"), [(1, "ctxA|0", "eff-1", 3)])
+    _write_contingency_db((run_dir / "sampling_v05c" / "tt01" / "low_confidence" / "steps_1" / "seed_1.sqlite"), [(1, "ctxB|1", "eff-1", 3)])
+
+    result = evaluate_h03_transformation_family_formation(run_dir, out_dir)
+
+    assert result["family_cross_sampler_count"] == 1
+    assert result["families_merged_across_samplers"] == 1
+
+
+def test_h03_derived_families_populate_cross_context_count(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    out_dir = tmp_path / "out"
+    run_dir.mkdir()
+    _write_v05c_report(run_dir)
+    _write_contingency_db_with_sampler_columns(
+        run_dir / "seed_0.sqlite",
+        [
+            (1, "ctxA", 0, "eff-1", "tt01", "mixed"),
+            (2, "ctxB", 1, "eff-1", "tt01", "mixed"),
+        ],
+    )
+
+    result = evaluate_h03_transformation_family_formation(run_dir, out_dir)
+
+    assert result["family_cross_context_count"] == 1
+
+
+def test_h03_max_rows_reduces_row_count_used(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    out_dir = tmp_path / "out"
+    run_dir.mkdir()
+    _write_v05c_report(run_dir)
+    _write_contingency_db(
+        run_dir / "seed_0.sqlite",
+        [(index, f"ctx{index}", f"eff-{index % 2}", 3) for index in range(1, 11)],
+    )
+
+    result = evaluate_h03_transformation_family_formation(run_dir, out_dir, max_rows=3)
+
+    assert result["row_count_used"] == 3
+    assert result["max_rows_applied"] is True
+
+
+def test_h03_singleton_ratio_drops_after_global_merge(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    out_dir = tmp_path / "out"
+    run_dir.mkdir()
+    _write_v05c_report(run_dir)
+    _write_contingency_db(run_dir / "seed_0.sqlite", [(1, "ctxA|0", "eff-1", 3)])
+    _write_contingency_db(run_dir / "seed_1.sqlite", [(1, "ctxB|1", "eff-1", 3)])
+
+    result = evaluate_h03_transformation_family_formation(run_dir, out_dir)
+
+    assert result["global_family_count_before_merge"] == 2
+    assert result["transformation_family_count"] == 1
+    assert result["singleton_family_ratio"] == 0.0
+
+
+def test_h03_singleton_diagnostics_include_breakdowns_and_relaxed_ratio(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    out_dir = tmp_path / "out"
+    run_dir.mkdir()
+    _write_v05c_report(run_dir)
+    _write_contingency_db_with_sampler_columns(
+        run_dir / "seed_0.sqlite",
+        [
+            (1, "ctxA", 0, "eff-1", "tt01", "mixed"),
+            (2, "ctxB", 1, "eff-2", "tt01", "mixed"),
+            (3, "ctxC", 1, "eff-17", "tt01", "mixed"),
+        ],
+    )
+
+    result = evaluate_h03_transformation_family_formation(run_dir, out_dir)
+
+    assert result["top_singleton_family_signatures"]
+    assert result["singleton_families_by_game"]["tt01"] >= 1
+    assert result["singleton_families_by_sampler"]["mixed"] >= 1
+    assert result["singleton_families_by_action"]["1"] >= 1
+    assert result["singleton_families_by_effect_type"]
+    assert result["singleton_ratio_strict"] is not None
+    assert result["singleton_ratio_relaxed"] is not None
+
+
+def test_h03_safe_relaxed_merge_reduces_singleton_ratio(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    out_dir = tmp_path / "out"
+    run_dir.mkdir()
+    _write_v05c_report(run_dir)
+    _write_contingency_db_with_sampler_columns(
+        run_dir / "seed_0.sqlite",
+        [
+            (1, "ctxA", 3, "[127.83,-7.99,-0.008,0,0]", "gr01", "mixed"),
+            (2, "ctxB", 3, "[127.84,-7.99,-0.009,0,0]", "gr01", "mixed"),
+            (3, "ctxC", 3, "[127.85,-7.99,-0.010,0,0]", "gr01", "mixed"),
+        ],
+    )
+
+    result = evaluate_h03_transformation_family_formation(run_dir, out_dir)
+
+    assert result["singleton_ratio_relaxed"] < result["singleton_ratio_strict"]
+
+
+def test_h03_unsafe_relaxed_merge_is_rejected(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    out_dir = tmp_path / "out"
+    run_dir.mkdir()
+    _write_v05c_report(run_dir)
+    _write_contingency_db_with_sampler_columns(
+        run_dir / "seed_0.sqlite",
+        [
+            (1, "ctxA", 3, "[127.83,-7.99,-0.008,0,0]", "gr01", "mixed"),
+            (2, "ctxB", 5, "[127.84,-7.99,-0.009,0,0]", "gr01", "mixed"),
+        ],
+    )
+
+    result = evaluate_h03_transformation_family_formation(run_dir, out_dir)
+
+    assert result["merge_safety_passed"] is False
+    assert result["unsafe_relaxed_merge_count"] >= 1
+
+
+def test_h03_mixed_effect_types_increment_unsafe_relaxed_merge_count(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    out_dir = tmp_path / "out"
+    run_dir.mkdir()
+    _write_v05c_report(run_dir)
+    _write_contingency_db_with_sampler_columns(
+        run_dir / "seed_0.sqlite",
+        [
+            (1, "ctxA", 3, "[127.83,-7.99,-0.008,0,0]", "gr01", "mixed"),
+            (2, "ctxB", 3, "[127.84,7.99,0.009,0,0]", "gr01", "mixed"),
+        ],
+    )
+
+    result = evaluate_h03_transformation_family_formation(run_dir, out_dir)
+
+    assert result["unsafe_relaxed_merge_count"] >= 1
+
+
+def test_h03_official_decision_remains_strict(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    out_dir = tmp_path / "out"
+    run_dir.mkdir()
+    _write_v05c_report(run_dir)
+    _write_contingency_db_with_sampler_columns(
+        run_dir / "seed_0.sqlite",
+        [
+            (1, "ctxA", 3, "[127.83,-7.99,-0.008,0,0]", "gr01", "mixed"),
+            (2, "ctxB", 3, "[127.84,-7.99,-0.009,0,0]", "gr01", "mixed"),
+            (3, "ctxC", 3, "[127.85,-7.99,-0.010,0,0]", "gr01", "mixed"),
+        ],
+    )
+
+    result = evaluate_h03_transformation_family_formation(run_dir, out_dir)
+
+    assert result["decision"] in {"PARTIALLY_VALID", "INVALID", "INCONCLUSIVE"}
+
+
+def test_h03_relaxed_decision_candidate_can_be_valid_separately(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    out_dir = tmp_path / "out"
+    run_dir.mkdir()
+    _write_v05c_report(run_dir)
+    _write_contingency_db_with_sampler_columns(
+        run_dir / "seed_0.sqlite",
+        [
+            (1, "ctxA", 3, "[64.0,0.0,0.0,1.0,0.0]", "fs02", "mixed"),
+            (2, "ctxB", 3, "[64.0,0.0,0.0,1.0,0.0]", "fs02", "mixed"),
+            (3, "ctxA", 3, "[127.83,-7.99,-0.008,0,0]", "gr01", "mixed"),
+            (4, "ctxB", 3, "[127.84,-7.99,-0.009,0,0]", "gr01", "mixed"),
+            (5, "ctxC", 3, "[127.85,-7.99,-0.010,0,0]", "gr01", "mixed"),
+            (6, "ctxD", 3, "[127.86,-7.99,-0.011,0,0]", "gr01", "mixed"),
+        ],
+    )
+
+    result = evaluate_h03_transformation_family_formation(run_dir, out_dir)
+
+    assert result["decision"] == "PARTIALLY_VALID"
+    assert result["relaxed_decision_candidate"] == "VALID"
