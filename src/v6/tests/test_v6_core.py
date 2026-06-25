@@ -2247,7 +2247,7 @@ def test_v05c_sampler_registry_and_aliases() -> None:
 
 
 def test_v05c_games_all_expands_to_registered_games(monkeypatch) -> None:
-    monkeypatch.setattr(interaction_sampling, "registered_game_ids", lambda env_root=None: ("pb02", "tt01", "ab01"))
+    monkeypatch.setattr(interaction_sampling, "registered_game_ids", lambda env_root=None: ("pb02", "tt01", "ab01", "gc01"))
 
     assert resolve_game_ids("all") == ["ab01", "pb02", "tt01"]
     assert parse_v05c_games("all") == ("ab01", "pb02", "tt01")
@@ -6331,6 +6331,41 @@ def test_cli_accepts_interaction_sampling_adaptive_context_options() -> None:
     assert args.max_context_depth == 4
 
 
+def test_cli_accepts_fast_postprocessing_options() -> None:
+    parser = build_parser()
+    default_continuous_args = parser.parse_args(
+        [
+            "continuous-research-run",
+            "--experiment-name",
+            "exp",
+            "--output-dir",
+            "runs/out",
+        ]
+    )
+    sampling_args = parser.parse_args(
+        [
+            "interaction-sampling-v05c",
+            "--fast-postprocessing",
+            "true",
+        ]
+    )
+    continuous_args = parser.parse_args(
+        [
+            "continuous-research-run",
+            "--experiment-name",
+            "exp",
+            "--output-dir",
+            "runs/out",
+            "--fast-postprocessing",
+            "true",
+        ]
+    )
+
+    assert sampling_args.fast_postprocessing is True
+    assert default_continuous_args.fast_postprocessing is True
+    assert continuous_args.fast_postprocessing is True
+
+
 def test_v05c_generate_sampling_dbs_passes_context_depth_into_jobs(tmp_path, monkeypatch) -> None:
     captured: list[dict] = []
 
@@ -6463,6 +6498,137 @@ def test_v05c_run_sampling_job_uses_context_depth_for_v6_config(tmp_path, monkey
     assert "efficiency_total_action_cost" in captured["metadata"]
     assert "efficiency_mean_action_cost" in captured["metadata"]
     assert "efficiency_no_effect_action_count" in captured["metadata"]
+
+
+def test_v05c_run_sampling_job_fast_postprocessing_skips_expensive_outputs(tmp_path, monkeypatch) -> None:
+    captured: dict[str, object] = {"analyze_called": False, "delta_called": False, "apply_called": False}
+
+    class DummySampler:
+        reset_count = 0
+        reset_unavailable = False
+
+    class DummyEnv:
+        def __init__(self, game_id: str, seed: int, env_root=None) -> None:
+            self.game_id = game_id
+            self.seed = seed
+            self.env_root = env_root
+            self.reset_count = 0
+            self.skipped_terminal_steps = 0
+
+    class DummyGraph:
+        def edge_type_counts(self) -> dict[str, int]:
+            return {"supports": 1}
+
+        def export_compact_rows(self) -> dict[str, list[dict[str, object]]]:
+            return {"nodes": [], "edges": []}
+
+    class DummyMemoryLifecycle:
+        def summary(self) -> dict[str, object]:
+            return {"memory_record_count": 1, "memory_replay_candidate_count": 1}
+
+        def get_replay_batch(self, limit: int = 1000) -> list[dict[str, object]]:
+            return [{"replay_id": "r1", "priority_score": 0.9}]
+
+    class DummySystem:
+        def __init__(self, env, config, action_sampler=None) -> None:
+            self.env = env
+            self.config = config
+            self.action_sampler = action_sampler
+            self.graph = DummyGraph()
+            self.context_contradictions = type("Tracker", (), {"summary": lambda self: {"context_contradiction_count": 0}})()
+            self.carrier_tracker = type("Carrier", (), {"build_candidates": lambda self: []})()
+            self.memory_lifecycle = DummyMemoryLifecycle()
+            self.efficiency_tracker = type("Efficiency", (), {"summary": lambda self: {"efficiency_event_count": 2}})()
+            self.compact_memory_restore_summary = {}
+
+        def run(self, steps: int) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+        def adaptive_context_summary(self) -> dict[str, object]:
+            return {"adaptive_context_expansion_enabled": False, "base_context_depth": 1, "max_context_depth": 1}
+
+    def fake_make_sampler(name: str, seed: int) -> DummySampler:
+        return DummySampler()
+
+    def fake_analyze_future_effects(**kwargs) -> list[dict]:
+        captured["analyze_called"] = True
+        return []
+
+    def fake_future_option_deltas(db_path, *, horizon: int) -> dict[str, float]:
+        captured["delta_called"] = True
+        return {}
+
+    def fake_apply_future_option_efficiency_diagnostics(db_path, deltas_by_interaction_id: dict[str, float]) -> None:
+        captured["apply_called"] = True
+
+    def fake_write_sampling_metadata(path, **values) -> None:
+        captured["metadata"] = values
+
+    monkeypatch.setattr(interaction_sampling, "make_sampler", fake_make_sampler)
+    monkeypatch.setattr(interaction_sampling, "ArcGridEnvironment", DummyEnv)
+    monkeypatch.setattr(interaction_sampling, "V6System", DummySystem)
+    monkeypatch.setattr(interaction_sampling, "analyze_future_effects", fake_analyze_future_effects)
+    monkeypatch.setattr(interaction_sampling, "_future_option_deltas_by_interaction_id", fake_future_option_deltas)
+    monkeypatch.setattr(interaction_sampling, "_apply_future_option_efficiency_diagnostics", fake_apply_future_option_efficiency_diagnostics)
+    monkeypatch.setattr(interaction_sampling, "_write_sampling_metadata", fake_write_sampling_metadata)
+
+    db_path = tmp_path / "seed_0.sqlite"
+    result = interaction_sampling._run_sampling_job(
+        {
+            "game": "tt01",
+            "sampler_name": "random_baseline",
+            "seed": 0,
+            "steps": 10,
+            "horizon": 3,
+            "context_depth": 1,
+            "commit_steps": 5,
+            "db_path": str(db_path),
+            "env_root": None,
+            "fast_postprocessing": True,
+        }
+    )
+
+    assert result == {"effects": 0}
+    assert captured["analyze_called"] is False
+    assert captured["delta_called"] is False
+    assert captured["apply_called"] is False
+    assert captured["metadata"]["fast_postprocessing_enabled"] is True
+    assert captured["metadata"]["future_effects_postprocessing_skipped"] is True
+    assert db_path.with_name("live_graph_compact.json").exists()
+    assert db_path.with_name("carrier_candidates.json").exists()
+    assert db_path.with_name("memory_lifecycle_summary.json").exists()
+    assert not db_path.with_name("memory_replay_candidates.json").exists()
+    assert not db_path.with_name("efficiency_summary.json").exists()
+
+
+def test_v05c_sampling_db_ready_accepts_fast_postprocessing_without_future_effects(tmp_path) -> None:
+    db_path = tmp_path / "seed_0.sqlite"
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE interactions (id INTEGER PRIMARY KEY);
+            CREATE TABLE deltas (id INTEGER PRIMARY KEY);
+            CREATE TABLE contingencies (id INTEGER PRIMARY KEY);
+            CREATE TABLE prediction_results (id INTEGER PRIMARY KEY);
+            CREATE TABLE sampling_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            """
+        )
+        connection.executemany(
+            "INSERT INTO sampling_metadata (key, value) VALUES (?, ?)",
+            [
+                ("fast_postprocessing_enabled", "true"),
+                ("future_effects_postprocessing_skipped", "true"),
+            ],
+        )
+        connection.commit()
+
+    assert interaction_sampling._sampling_db_ready(db_path) is True
 
 
 def test_v05c_resolve_scope_clamps_train_and_test_seeds_to_available_set() -> None:

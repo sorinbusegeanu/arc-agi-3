@@ -32,6 +32,7 @@ class ContinuousResearchConfig:
     cleanup: bool = True
     max_replay_queue_size: int = 50_000
     replay_retention_percent: int = 5
+    fast_postprocessing: bool = True
     env_root: str | None = None
 
 
@@ -91,6 +92,7 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
                 memory_input_dir=str(memory_dir),
                 memory_output_dir=str(memory_dir),
                 global_step_offset=global_step_start - 1,
+                fast_postprocessing=bool(config.fast_postprocessing),
             )
         )
         fold_summary = fold_epoch_raw_into_compact_memory(
@@ -237,6 +239,7 @@ def _load_or_initialize_manifest(config: ContinuousResearchConfig, manifest_path
         "steps_per_epoch": int(config.steps_per_epoch),
         "horizon": int(config.horizon),
         "context_depth": int(config.context_depth),
+        "fast_postprocessing": bool(config.fast_postprocessing),
         "output_dir": str(config.output_dir),
         "stop_if_disk_above_percent": float(config.stop_if_disk_above_percent),
         "stop_if_no_new_stable_contingencies_for": int(config.stop_if_no_new_stable_contingencies_for),

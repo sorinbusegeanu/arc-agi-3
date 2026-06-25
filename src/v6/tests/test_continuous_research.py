@@ -276,6 +276,32 @@ def test_epoch_status_and_suite_summary_exist_and_memory_continuity_is_written(t
     assert continuity["continuity_valid"] is True
 
 
+def test_continuous_run_passes_fast_postprocessing_into_sampling(tmp_path: Path, monkeypatch) -> None:
+    seen_flags: list[bool] = []
+
+    def fake_run_sampling(config):
+        seen_flags.append(bool(config.fast_postprocessing))
+        return _write_sampling_fixture(Path(config.output_dir), global_step_offset=int(config.global_step_offset), stable_support=25)
+
+    monkeypatch.setattr(continuous_research, "run_interaction_sampling_v05c", fake_run_sampling)
+    run_continuous_research(
+        ContinuousResearchConfig(
+            experiment_name="exp",
+            games="tt01",
+            samplers="mixed",
+            seeds="0",
+            steps_per_epoch=5000,
+            max_epochs=1,
+            horizon=10,
+            context_depth=1,
+            output_dir=str(tmp_path / "continuous"),
+            fast_postprocessing=True,
+        )
+    )
+
+    assert seen_flags == [True]
+
+
 def test_disk_stop_triggers_and_default_is_90(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(
         continuous_research,

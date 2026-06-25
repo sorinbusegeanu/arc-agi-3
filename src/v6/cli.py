@@ -268,6 +268,7 @@ def build_parser() -> argparse.ArgumentParser:
     sampling.add_argument("--memory-input-dir", default=None)
     sampling.add_argument("--memory-output-dir", default=None)
     sampling.add_argument("--global-step-offset", type=int, default=0)
+    sampling.add_argument("--fast-postprocessing", type=_parse_bool, default=False)
 
     contingency_memory = subparsers.add_parser("contingency-memory-v06")
     contingency_memory.add_argument("--parquet-root", required=True)
@@ -561,6 +562,7 @@ def build_parser() -> argparse.ArgumentParser:
     continuous.add_argument("--cleanup", type=_parse_bool, default=True)
     continuous.add_argument("--max-replay-queue-size", type=int, default=50000)
     continuous.add_argument("--replay-retention-percent", type=int, default=5)
+    continuous.add_argument("--fast-postprocessing", type=_parse_bool, default=True)
     continuous.add_argument("--env-root", default=None)
     return parser
 
@@ -837,6 +839,7 @@ def main(argv: list[str] | None = None) -> int:
                 memory_input_dir=args.memory_input_dir,
                 memory_output_dir=args.memory_output_dir,
                 global_step_offset=int(args.global_step_offset),
+                fast_postprocessing=bool(args.fast_postprocessing),
             )
         )
         print(json.dumps({"rows": len(rows), "output_dir": args.output_dir}, indent=2))
@@ -1427,6 +1430,7 @@ def main(argv: list[str] | None = None) -> int:
                 cleanup=bool(args.cleanup),
                 max_replay_queue_size=int(args.max_replay_queue_size),
                 replay_retention_percent=int(args.replay_retention_percent),
+                fast_postprocessing=bool(args.fast_postprocessing),
                 env_root=args.env_root,
             )
         )

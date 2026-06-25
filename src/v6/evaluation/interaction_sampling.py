@@ -76,6 +76,7 @@ class InteractionSamplingConfig:
     memory_input_dir: str | None = None
     memory_output_dir: str | None = None
     global_step_offset: int = 0
+    fast_postprocessing: bool = False
 
 
 def resolve_game_ids(games_arg: str, env_root: str | None = None) -> list[str]:
@@ -84,7 +85,7 @@ def resolve_game_ids(games_arg: str, env_root: str | None = None) -> list[str]:
     if value == "all":
         if not available:
             raise ValueError("no registered game ids were found in the project environment registry")
-        return list(available)
+        return [game_id for game_id in available if game_id != "gc01"]
     selected = [item.strip() for item in value.split(",") if item.strip()]
     if not selected:
         raise ValueError("games selection is empty; pass 'all' or a comma-separated list of valid game ids")
@@ -152,12 +153,13 @@ def run_interaction_sampling_v05c(config: InteractionSamplingConfig) -> list[dic
         "memory_output_dir": config.memory_output_dir,
         "temporal_milestones": temporal_milestones,
         "forbidden_features_used_during_sampling": False,
-        "efficiency_diagnostics_enabled": True,
+        "efficiency_diagnostics_enabled": not bool(config.fast_postprocessing),
         "efficiency_used_for_sampling": False,
         "efficiency_used_for_m2": False,
         "efficiency_used_for_m3": False,
         "efficiency_used_for_m4": False,
-        "future_option_efficiency_posthoc_only": True,
+        "future_option_efficiency_posthoc_only": not bool(config.fast_postprocessing),
+        "fast_postprocessing": bool(config.fast_postprocessing),
     }
     write_interaction_sampling_reports(payload, output)
     if config.storage_backend == "parquet":
@@ -229,6 +231,7 @@ def _generate_sampling_dbs(config: InteractionSamplingConfig, sampling_root: Pat
                             "memory_input_dir": config.memory_input_dir,
                             "memory_output_dir": config.memory_output_dir,
                             "global_step_offset": int(config.global_step_offset),
+                            "fast_postprocessing": bool(config.fast_postprocessing),
                             "db_path": str(db_path),
                             "env_root": config.env_root,
                         }
@@ -265,6 +268,7 @@ def _generate_sampling_dbs(config: InteractionSamplingConfig, sampling_root: Pat
                         "memory_input_dir": config.memory_input_dir,
                         "memory_output_dir": config.memory_output_dir,
                         "global_step_offset": int(config.global_step_offset),
+                        "fast_postprocessing": bool(config.fast_postprocessing),
                         "db_path": str(db_path),
                         "env_root": config.env_root,
                     }
@@ -330,21 +334,22 @@ def _run_sampling_job(job: dict) -> dict:
     seed = int(job["seed"])
     sampler = make_sampler(sampler_name, seed=seed)
     env = ArcGridEnvironment(game_id=str(job["game"]), seed=seed, env_root=job["env_root"])
+    system_config = V6Config(
+        database_path=str(db_path),
+        memory_input_dir=job.get("memory_input_dir"),
+        memory_output_dir=job.get("memory_output_dir"),
+        restore_compact_memory=bool(job.get("memory_input_dir")),
+        persist_compact_memory_on_close=False,
+        global_step_offset=int(job.get("global_step_offset", 0) or 0),
+        random_seed=seed,
+        context_length=int(job.get("context_depth", 3)),
+        max_context_depth=job.get("max_context_depth"),
+        adaptive_context_expansion=bool(job.get("adaptive_context_expansion", False)),
+        database_commit_every=int(job.get("commit_steps", 1000)),
+    )
     system = V6System(
         env=env,
-        config=V6Config(
-            database_path=str(db_path),
-            memory_input_dir=job.get("memory_input_dir"),
-            memory_output_dir=job.get("memory_output_dir"),
-            restore_compact_memory=bool(job.get("memory_input_dir")),
-            persist_compact_memory_on_close=False,
-            global_step_offset=int(job.get("global_step_offset", 0) or 0),
-            random_seed=seed,
-            context_length=int(job.get("context_depth", 3)),
-            max_context_depth=job.get("max_context_depth"),
-            adaptive_context_expansion=bool(job.get("adaptive_context_expansion", False)),
-            database_commit_every=int(job.get("commit_steps", 1000)),
-        ),
+        config=system_config,
         action_sampler=sampler,
     )
     edge_counts: dict[str, int] = {}
@@ -354,6 +359,7 @@ def _run_sampling_job(job: dict) -> dict:
     replay_candidates: list[dict] = []
     efficiency_summary: dict[str, object] = {}
     adaptive_context_summary: dict[str, object] = {}
+    fast_postprocessing = bool(job.get("fast_postprocessing", False))
     try:
         system.run(steps=int(job["steps"]))
         graph = getattr(system, "graph", None)
@@ -385,18 +391,20 @@ def _run_sampling_job(job: dict) -> dict:
             adaptive_context_summary = system.adaptive_context_summary()
     finally:
         system.close()
-    effects = analyze_future_effects(
-        db_path=str(db_path),
-        game=str(job["game"]),
-        seed=seed,
-        steps=int(job["steps"]),
-        horizon=int(job["horizon"]),
-    )
-    deltas_by_interaction_id = _future_option_deltas_by_interaction_id(
-        db_path,
-        horizon=int(job["horizon"]),
-    )
-    _apply_future_option_efficiency_diagnostics(db_path, deltas_by_interaction_id)
+    effects: list[dict] = []
+    if not fast_postprocessing:
+        effects = analyze_future_effects(
+            db_path=str(db_path),
+            game=str(job["game"]),
+            seed=seed,
+            steps=int(job["steps"]),
+            horizon=int(job["horizon"]),
+        )
+        deltas_by_interaction_id = _future_option_deltas_by_interaction_id(
+            db_path,
+            horizon=int(job["horizon"]),
+        )
+        _apply_future_option_efficiency_diagnostics(db_path, deltas_by_interaction_id)
     _write_sampling_metadata(
         db_path,
         game=str(job["game"]),
@@ -413,15 +421,17 @@ def _run_sampling_job(job: dict) -> dict:
         memory_output_dir=job.get("memory_output_dir"),
         compact_memory_loaded=bool(job.get("memory_input_dir")),
         compact_memory_restore_summary=getattr(system, "compact_memory_restore_summary", {}),
+        fast_postprocessing_enabled=fast_postprocessing,
+        future_effects_postprocessing_skipped=fast_postprocessing,
         adaptive_context_expansion_enabled=bool(adaptive_context_summary.get("adaptive_context_expansion_enabled", False)),
         base_context_depth=int(adaptive_context_summary.get("base_context_depth", job.get("context_depth", 3)) or 0),
         max_context_depth=int(adaptive_context_summary.get("max_context_depth", job.get("max_context_depth", job.get("context_depth", 3))) or 0),
         adaptive_context_expansion_count=int(adaptive_context_summary.get("adaptive_context_expansion_count", 0) or 0),
         adaptive_context_active_action_count=int(adaptive_context_summary.get("adaptive_context_active_action_count", 0) or 0),
         adaptive_context_max_depth_reached=int(adaptive_context_summary.get("adaptive_context_max_depth_reached", job.get("context_depth", 3)) or 0),
-        contingency_support_threshold=int(system.config.contingency_support_threshold),
-        contingency_confidence_threshold=float(system.config.contingency_confidence_threshold),
-        transformation_family_stable_support=int(system.config.min_cluster_size),
+        contingency_support_threshold=int(system_config.contingency_support_threshold),
+        contingency_confidence_threshold=float(system_config.contingency_confidence_threshold),
+        transformation_family_stable_support=int(system_config.min_cluster_size),
         reset_count=int(getattr(env, "reset_count", 0)) + int(getattr(sampler, "reset_count", 0)),
         terminal_count=int(getattr(env, "skipped_terminal_steps", 0)),
         reset_unavailable=bool(getattr(sampler, "reset_unavailable", False)),
@@ -491,8 +501,9 @@ def _run_sampling_job(job: dict) -> dict:
         encoding="utf-8",
     )
     db_path.with_name("memory_lifecycle_summary.json").write_text(json.dumps(memory_summary, indent=2), encoding="utf-8")
-    db_path.with_name("memory_replay_candidates.json").write_text(json.dumps(replay_candidates, indent=2), encoding="utf-8")
-    db_path.with_name("efficiency_summary.json").write_text(json.dumps(efficiency_summary, indent=2), encoding="utf-8")
+    if not fast_postprocessing:
+        db_path.with_name("memory_replay_candidates.json").write_text(json.dumps(replay_candidates, indent=2), encoding="utf-8")
+        db_path.with_name("efficiency_summary.json").write_text(json.dumps(efficiency_summary, indent=2), encoding="utf-8")
     return {"effects": len(effects)}
 
 
@@ -1291,7 +1302,16 @@ def _sampling_db_ready(path: Path) -> bool:
     try:
         with sqlite3.connect(path) as connection:
             tables = {str(row[0]) for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-            return {"interactions", "deltas", "contingencies", "prediction_results", "future_effects", "sampling_metadata"}.issubset(tables)
+            required_tables = {"interactions", "deltas", "contingencies", "prediction_results", "sampling_metadata"}
+            if not required_tables.issubset(tables):
+                return False
+            if "future_effects" in tables:
+                return True
+            row = connection.execute(
+                "SELECT value FROM sampling_metadata WHERE key IN ('future_effects_postprocessing_skipped', 'fast_postprocessing_enabled')"
+            ).fetchall()
+            metadata = {json.loads(value) for (value,) in row}
+            return True in metadata
     except sqlite3.DatabaseError:
         return False
 
