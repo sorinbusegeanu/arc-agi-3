@@ -126,13 +126,21 @@ def fold_live_system_into_compact_memory(system: Any, memory_dir: str | Path) ->
     graph_rows = {}
     if getattr(system, "graph", None) is not None and hasattr(system.graph, "export_compact_rows"):
         graph_rows = system.graph.export_compact_rows()
+    family_id_to_signature = {
+        int(family.id): canonical_family_signature_from_family(family)
+        for family in getattr(system.clusterer, "families", {}).values()
+    }
+    semantic_family_fallback_count = 0
     with (
         sqlite3.connect(paths.current_state) as state_conn,
         sqlite3.connect(paths.graph) as graph_conn,
         sqlite3.connect(paths.replay_queue) as replay_conn,
     ):
         for contingency in getattr(system.contingency_learner, "stable_contingencies", lambda: [])():
-            canonical_signature = f"family_sig:{int(contingency.transformation_family)}"
+            canonical_signature = family_id_to_signature.get(int(contingency.transformation_family))
+            if canonical_signature is None:
+                canonical_signature = f"unknown_live_family:{int(contingency.transformation_family)}"
+                semantic_family_fallback_count += 1
             canonical_key = canonicalize_context_action_effect(
                 context_signature=json.dumps(list(contingency.context_signature)),
                 action=contingency.action,
@@ -141,13 +149,14 @@ def fold_live_system_into_compact_memory(system: Any, memory_dir: str | Path) ->
             state_conn.execute(
                 """
                 INSERT INTO stable_contingencies (
-                    contingency_id, canonical_key, game, sampler, action, effect_signature, support_count,
+                    contingency_id, canonical_key, game, sampler, context_level, action, effect_signature, support_count,
                     first_seen_global_step, last_seen_global_step, stability_score, mean_prediction_error,
                     mean_replay_priority, representative_example_count
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(canonical_key) DO UPDATE SET
                     support_count = MAX(stable_contingencies.support_count, excluded.support_count),
+                    context_level = MAX(stable_contingencies.context_level, excluded.context_level),
                     last_seen_global_step = MAX(stable_contingencies.last_seen_global_step, excluded.last_seen_global_step),
                     stability_score = MAX(stable_contingencies.stability_score, excluded.stability_score)
                 """,
@@ -156,6 +165,7 @@ def fold_live_system_into_compact_memory(system: Any, memory_dir: str | Path) ->
                     canonical_key,
                     None,
                     None,
+                    int(contingency.context_level),
                     int(contingency.action),
                     canonical_signature,
                     int(contingency.support_count),
@@ -166,6 +176,33 @@ def fold_live_system_into_compact_memory(system: Any, memory_dir: str | Path) ->
                     0.0,
                     0,
                 ),
+            )
+            state_conn.execute(
+                """
+                INSERT INTO family_members (
+                    family_signature, contingency_key, support_count, first_seen_global_step, last_seen_global_step
+                )
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(family_signature, contingency_key) DO UPDATE SET
+                    support_count = family_members.support_count + excluded.support_count,
+                    first_seen_global_step = MIN(family_members.first_seen_global_step, excluded.first_seen_global_step),
+                    last_seen_global_step = MAX(family_members.last_seen_global_step, excluded.last_seen_global_step)
+                """,
+                (canonical_signature, canonical_key, int(contingency.support_count), global_step_start, global_step_end),
+            )
+            _upsert_observation_graph(
+                graph_conn,
+                fold_config=CompactMemoryFoldConfig(global_step_start=global_step_start, global_step_end=global_step_end),
+                game=None,
+                sampler=None,
+                context_signature=json.dumps(list(contingency.context_signature)),
+                action=int(contingency.action),
+                effect_signature=canonical_signature,
+                contingency_key=canonical_key,
+                family_signature=canonical_signature,
+                carrier_signature=None,
+                contradiction_key=None,
+                replay_id=None,
             )
         for family in getattr(system.clusterer, "families", {}).values():
             signature = canonical_family_signature_from_family(family)
@@ -249,6 +286,44 @@ def fold_live_system_into_compact_memory(system: Any, memory_dir: str | Path) ->
                     int(candidate.status == "emergent_carrier" and candidate.carrier_source != "context_action_fallback"),
                 ),
             )
+            family_signature = None
+            if candidate.family_id is not None:
+                try:
+                    family_signature = family_id_to_signature.get(int(candidate.family_id))
+                except (TypeError, ValueError):
+                    family_signature = None
+            if family_signature is None and candidate.family_id is not None:
+                family_signature = f"unknown_live_family:{candidate.family_id}"
+                semantic_family_fallback_count += 1
+            _upsert_carrier_link(
+                state_conn,
+                carrier_signature=str(candidate.carrier_signature),
+                linked_type="family",
+                linked_key=family_signature,
+                fold_config=CompactMemoryFoldConfig(global_step_start=global_step_start, global_step_end=global_step_end),
+            )
+            _upsert_carrier_link(
+                state_conn,
+                carrier_signature=str(candidate.carrier_signature),
+                linked_type="context",
+                linked_key=None if candidate.context_signature is None else _normalize_jsonish(candidate.context_signature),
+                fold_config=CompactMemoryFoldConfig(global_step_start=global_step_start, global_step_end=global_step_end),
+            )
+            if family_signature is not None:
+                _upsert_observation_graph(
+                    graph_conn,
+                    fold_config=CompactMemoryFoldConfig(global_step_start=global_step_start, global_step_end=global_step_end),
+                    game=None,
+                    sampler=None,
+                    context_signature=candidate.context_signature,
+                    action=None,
+                    effect_signature=None,
+                    contingency_key=None,
+                    family_signature=family_signature,
+                    carrier_signature=candidate.carrier_signature,
+                    contradiction_key=None,
+                    replay_id=None,
+                )
         if graph_rows:
             temp_path = paths.root / "_live_graph_export_tmp.json"
             temp_path.write_text(json.dumps(graph_rows, indent=2), encoding="utf-8")
@@ -260,6 +335,7 @@ def fold_live_system_into_compact_memory(system: Any, memory_dir: str | Path) ->
             replay_conn=replay_conn,
             paths=paths,
         )
+        summary["semantic_family_fallback_count"] = semantic_family_fallback_count
         _write_memory_summary_table(state_conn, summary)
         paths.summary_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
         state_conn.commit()
@@ -343,6 +419,7 @@ def _fold_single_db(
         sampler = _path_segment(db_path, -3)
         seed = _seed_from_db_path(db_path)
         stable_threshold = 20
+        prediction_payload_by_interaction = _prediction_payload_by_interaction_id(raw_conn) if "prediction_results" in tables else {}
 
         family_members_by_signature: dict[str, set[str]] = {}
         if "contingencies" in tables:
@@ -363,6 +440,11 @@ def _fold_single_db(
                     contingency_id=int(payload.get("id") or payload.get("contingency_id") or 0),
                     game=game,
                     sampler=sampler,
+                    context_level=_context_level_from_raw(
+                        raw_conn,
+                        payload=payload,
+                        family_id=payload.get("transformation_family"),
+                    ),
                     action=int(payload.get("action") or 0),
                     effect_signature=family_signature,
                     support_count=support_count,
@@ -425,8 +507,9 @@ def _fold_single_db(
                 info["last_step"] = global_step if info["last_step"] is None else max(int(info["last_step"]), global_step)
                 info["mean_error_total"] += float(payload.get("isf_prediction_error") or payload.get("prediction_error") or 0.0)
                 info["mean_replay_total"] += float(payload.get("memory_replay_priority") or payload.get("replay_priority") or 0.0)
+                contradiction_key = None
                 if int(payload.get("context_contradiction") or payload.get("prediction_error") or 0):
-                    contradiction_key = str(payload.get("context_signature") or f"interaction:{payload.get('interaction_id')}")
+                    contradiction_key = str(payload.get("context_contradiction_key") or payload.get("context_signature") or f"interaction:{payload.get('interaction_id')}")
                     contradiction = contradiction_supports.setdefault(
                         contradiction_key,
                         {
@@ -442,6 +525,20 @@ def _fold_single_db(
                     contradiction["last_step"] = max(int(contradiction["last_step"]), global_step)
                     contradiction["max_prediction_error"] = max(float(contradiction["max_prediction_error"]), float(payload.get("isf_prediction_error") or payload.get("prediction_error") or 0.0))
                     contradiction["mean_replay_total"] += float(payload.get("memory_replay_priority") or 0.0)
+                _upsert_observation_graph(
+                    graph_conn,
+                    fold_config=fold_config,
+                    game=game,
+                    sampler=sampler,
+                    context_signature=payload.get("context_signature"),
+                    action=None if payload.get("action") is None else int(payload.get("action") or 0),
+                    effect_signature=family_signature,
+                    contingency_key=None,
+                    family_signature=family_signature,
+                    carrier_signature=None,
+                    contradiction_key=contradiction_key,
+                    replay_id=None,
+                )
             for family_signature, info in family_supports.items():
                 member_count = int(info["member_count"])
                 _upsert_transformation_family(
@@ -527,6 +624,16 @@ def _fold_single_db(
                 replay_id = str(payload.get("id"))
                 priority = float(payload.get("memory_replay_priority") or 0.0)
                 reason = "carrier_linked" if payload.get("carrier_signature") else "priority"
+                prediction_payload = dict(prediction_payload_by_interaction.get(replay_id, {}))
+                merged_payload = {**prediction_payload, **payload}
+                family_signature = None
+                family_id = prediction_payload.get("actual_family") or prediction_payload.get("predicted_family")
+                if family_id not in (None, ""):
+                    family_signature = canonical_family_signature_from_raw_db(raw_conn, family_id, prediction_payload)
+                    _upsert_family_identity_map(state_conn, family_signature, stable_family_int_id(family_signature))
+                contradiction_key = None
+                if int(prediction_payload.get("context_contradiction") or prediction_payload.get("prediction_error") or 0):
+                    contradiction_key = str(prediction_payload.get("context_contradiction_key") or prediction_payload.get("context_signature") or f"interaction:{replay_id}")
                 replay_conn.execute(
                     """
                     INSERT INTO replay_queue (
@@ -548,7 +655,7 @@ def _fold_single_db(
                         reason,
                         int(payload.get("global_step") or fold_config.global_step_start),
                         int(payload.get("global_step") or fold_config.global_step_end),
-                        json.dumps(_json_safe(payload), sort_keys=True),
+                        json.dumps(_json_safe(merged_payload), sort_keys=True),
                     ),
                 )
                 _upsert_observation_graph(
@@ -556,13 +663,13 @@ def _fold_single_db(
                     fold_config=fold_config,
                     game=game,
                     sampler=sampler,
-                    context_signature=None,
-                    action=None,
+                    context_signature=prediction_payload.get("context_signature") or payload.get("context_signature"),
+                    action=None if (prediction_payload.get("action") or payload.get("action")) is None else int(prediction_payload.get("action") or payload.get("action") or 0),
                     effect_signature=None,
                     contingency_key=None,
-                    family_signature=None,
+                    family_signature=family_signature,
                     carrier_signature=str(payload.get("carrier_signature") or "") or None,
-                    contradiction_key=None,
+                    contradiction_key=contradiction_key,
                     replay_id=replay_id,
                 )
         carrier_path = db_path.with_name("carrier_candidates.json")
@@ -604,7 +711,14 @@ def _fold_single_db(
                 family_signature = None
                 family_id = item.get("family_id")
                 if family_id not in (None, ""):
-                    family_signature = f"family_id:{family_id}"
+                    family_signature = canonical_family_signature_from_raw_db(raw_conn, family_id, item)
+                contingency_key = None
+                if item.get("context_signature") is not None and family_signature is not None:
+                    contingency_key = canonicalize_context_action_effect(
+                        context_signature=str(item.get("context_signature")),
+                        action=item.get("action", "carrier"),
+                        effect_signature=family_signature,
+                    )
                 _retain_example(
                     state_conn,
                     owner_type="carrier",
@@ -618,6 +732,27 @@ def _fold_single_db(
                     priority_score=float(item.get("prediction_lift", 0.0) or 0.0) + float(item.get("support_count", 0) or 0),
                     compact_payload_json=json.dumps(item, sort_keys=True),
                 )
+                _upsert_carrier_link(
+                    state_conn,
+                    carrier_signature=carrier_signature,
+                    linked_type="family",
+                    linked_key=family_signature,
+                    fold_config=fold_config,
+                )
+                _upsert_carrier_link(
+                    state_conn,
+                    carrier_signature=carrier_signature,
+                    linked_type="context",
+                    linked_key=None if item.get("context_signature") is None else _normalize_jsonish(item.get("context_signature")),
+                    fold_config=fold_config,
+                )
+                _upsert_carrier_link(
+                    state_conn,
+                    carrier_signature=carrier_signature,
+                    linked_type="contingency",
+                    linked_key=contingency_key,
+                    fold_config=fold_config,
+                )
                 _upsert_observation_graph(
                     graph_conn,
                     fold_config=fold_config,
@@ -626,7 +761,7 @@ def _fold_single_db(
                     context_signature=item.get("context_signature"),
                     action=None,
                     effect_signature=None,
-                    contingency_key=None,
+                    contingency_key=contingency_key,
                     family_signature=family_signature,
                     carrier_signature=carrier_signature,
                     contradiction_key=None,
@@ -653,6 +788,7 @@ def _upsert_stable_contingency(
     contingency_id: int,
     game: str,
     sampler: str,
+    context_level: int,
     action: int,
     effect_signature: str,
     support_count: int,
@@ -662,13 +798,14 @@ def _upsert_stable_contingency(
     connection.execute(
         """
         INSERT INTO stable_contingencies (
-            contingency_id, canonical_key, game, sampler, action, effect_signature, support_count,
+            contingency_id, canonical_key, game, sampler, context_level, action, effect_signature, support_count,
             first_seen_global_step, last_seen_global_step, stability_score, mean_prediction_error,
             mean_replay_priority, representative_example_count
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(canonical_key) DO UPDATE SET
             support_count = MAX(stable_contingencies.support_count, excluded.support_count),
+            context_level = MAX(stable_contingencies.context_level, excluded.context_level),
             first_seen_global_step = MIN(stable_contingencies.first_seen_global_step, excluded.first_seen_global_step),
             last_seen_global_step = MAX(stable_contingencies.last_seen_global_step, excluded.last_seen_global_step),
             stability_score = MAX(stable_contingencies.stability_score, excluded.stability_score)
@@ -678,6 +815,7 @@ def _upsert_stable_contingency(
             canonical_key,
             game,
             sampler,
+            int(context_level),
             action,
             effect_signature,
             support_count,
@@ -689,6 +827,80 @@ def _upsert_stable_contingency(
             0,
         ),
     )
+
+
+def _upsert_carrier_link(
+    connection: sqlite3.Connection,
+    *,
+    carrier_signature: str,
+    linked_type: str,
+    linked_key: str | None,
+    fold_config: CompactMemoryFoldConfig,
+) -> None:
+    if linked_key in (None, ""):
+        return
+    connection.execute(
+        """
+        INSERT INTO carrier_links (
+            carrier_signature, linked_type, linked_key, support_count, first_seen_global_step, last_seen_global_step
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(carrier_signature, linked_type, linked_key) DO UPDATE SET
+            support_count = carrier_links.support_count + excluded.support_count,
+            first_seen_global_step = MIN(carrier_links.first_seen_global_step, excluded.first_seen_global_step),
+            last_seen_global_step = MAX(carrier_links.last_seen_global_step, excluded.last_seen_global_step)
+        """,
+        (str(carrier_signature), str(linked_type), str(linked_key), 1, fold_config.global_step_start, fold_config.global_step_end),
+    )
+
+
+def _prediction_payload_by_interaction_id(raw_conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
+    rows = raw_conn.execute("SELECT * FROM prediction_results").fetchall()
+    by_interaction: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        payload = dict(row)
+        interaction_id = str(payload.get("interaction_id"))
+        if interaction_id in ("None", ""):
+            continue
+        existing = by_interaction.get(interaction_id)
+        if existing is None:
+            by_interaction[interaction_id] = payload
+            continue
+        current_error = float(payload.get("isf_prediction_error") or payload.get("prediction_error") or 0.0)
+        existing_error = float(existing.get("isf_prediction_error") or existing.get("prediction_error") or 0.0)
+        if current_error >= existing_error:
+            by_interaction[interaction_id] = payload
+    return by_interaction
+
+
+def _context_level_from_raw(raw_conn: sqlite3.Connection, *, payload: dict[str, Any], family_id: Any) -> int:
+    if payload.get("context_level") not in (None, ""):
+        return int(payload.get("context_level") or 0)
+    tables = {row[0] for row in raw_conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    if "prediction_results" not in tables:
+        return 0
+    prediction_columns = {row[1] for row in raw_conn.execute("PRAGMA table_info(prediction_results)").fetchall()}
+    if "context_level" not in prediction_columns:
+        return 0
+    row = raw_conn.execute(
+        """
+        SELECT MAX(COALESCE(context_level, 0))
+        FROM prediction_results
+        WHERE COALESCE(context_signature, '') = COALESCE(?, '')
+          AND COALESCE(action, -1) = COALESCE(?, -1)
+          AND (
+                COALESCE(actual_family, predicted_family) = ?
+             OR COALESCE(actual_family, predicted_family) = ?
+          )
+        """,
+        (
+            payload.get("context_signature") or payload.get("context_action"),
+            payload.get("action"),
+            family_id,
+            str(family_id) if family_id is not None else None,
+        ),
+    ).fetchone()
+    return int((row[0] or 0) if row is not None else 0)
 
 
 def _upsert_transformation_family(
@@ -803,6 +1015,11 @@ def _upsert_observation_graph(
             edges.append((f"family:{family_signature}", f"effect:{effect_signature}", "explains_effect"))
     if contradiction_key:
         nodes.append((f"contradiction:{contradiction_key}", "contradiction", contradiction_key))
+        if context_signature:
+            edges.append((f"context:{_normalize_jsonish(context_signature)}", f"contradiction:{contradiction_key}", "contradicts"))
+        if family_signature:
+            edges.append((f"family:{family_signature}", f"contradiction:{contradiction_key}", "contradicted_by"))
+            edges.append((f"contradiction:{contradiction_key}", f"family:{family_signature}", "challenges"))
     if replay_id:
         nodes.append((f"replay:{replay_id}", "replay", replay_id))
         if contradiction_key:
@@ -1124,6 +1341,7 @@ def _ensure_current_state_schema(path: Path) -> None:
                 canonical_key TEXT PRIMARY KEY,
                 game TEXT,
                 sampler TEXT,
+                context_level INTEGER DEFAULT 0,
                 action INTEGER,
                 effect_signature TEXT,
                 support_count INTEGER,
@@ -1170,6 +1388,15 @@ def _ensure_current_state_schema(path: Path) -> None:
                 stability_score REAL,
                 is_emergent INTEGER
             );
+            CREATE TABLE IF NOT EXISTS carrier_links (
+                carrier_signature TEXT,
+                linked_type TEXT,
+                linked_key TEXT,
+                support_count INTEGER,
+                first_seen_global_step INTEGER,
+                last_seen_global_step INTEGER,
+                PRIMARY KEY (carrier_signature, linked_type, linked_key)
+            );
             CREATE TABLE IF NOT EXISTS contradiction_clusters (
                 cluster_id TEXT,
                 canonical_key TEXT PRIMARY KEY,
@@ -1212,15 +1439,20 @@ def _ensure_current_state_schema(path: Path) -> None:
             );
             """
         )
-        existing_columns = {row[1] for row in connection.execute("PRAGMA table_info(family_members)").fetchall()}
-        if "family_signature" not in existing_columns:
-            connection.execute("ALTER TABLE family_members ADD COLUMN family_signature TEXT")
-        if "contingency_key" not in existing_columns:
-            connection.execute("ALTER TABLE family_members ADD COLUMN contingency_key TEXT")
-        if "first_seen_global_step" not in existing_columns:
-            connection.execute("ALTER TABLE family_members ADD COLUMN first_seen_global_step INTEGER")
-        if "last_seen_global_step" not in existing_columns:
-            connection.execute("ALTER TABLE family_members ADD COLUMN last_seen_global_step INTEGER")
+        _ensure_column(connection, "stable_contingencies", "context_level", "INTEGER DEFAULT 0")
+        _ensure_column(connection, "transformation_families", "canonical_signature", "TEXT")
+        _ensure_column(connection, "transformation_families", "relaxed_signature", "TEXT")
+        _ensure_column(connection, "transformation_families", "effect_type", "TEXT")
+        _ensure_column(connection, "transformation_families", "action_group", "TEXT")
+        _ensure_column(connection, "transformation_families", "polarity", "TEXT")
+        _ensure_column(connection, "transformation_families", "member_count", "INTEGER")
+        _ensure_column(connection, "transformation_families", "first_seen_global_step", "INTEGER")
+        _ensure_column(connection, "transformation_families", "last_seen_global_step", "INTEGER")
+        _ensure_column(connection, "transformation_families", "stability_score", "REAL")
+        _ensure_column(connection, "family_members", "family_signature", "TEXT")
+        _ensure_column(connection, "family_members", "contingency_key", "TEXT")
+        _ensure_column(connection, "family_members", "first_seen_global_step", "INTEGER")
+        _ensure_column(connection, "family_members", "last_seen_global_step", "INTEGER")
         connection.commit()
 
 
@@ -1268,3 +1500,9 @@ def _ensure_replay_schema(path: Path) -> None:
             """
         )
         connection.commit()
+
+
+def _ensure_column(connection: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    existing_columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in existing_columns:
+        connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")

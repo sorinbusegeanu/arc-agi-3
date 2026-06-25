@@ -31,16 +31,17 @@ def _seed_compact_memory(memory_dir: Path) -> str:
     family_signature = 'centroid:[2,1,0,0,0]'
     effect_signature = family_signature
     canonical_key = '["ctx",1]|a0|e' + effect_signature
+    stable_id = 424242
     with sqlite3.connect(paths.current_state) as connection:
         connection.execute(
             """
             INSERT INTO stable_contingencies (
-                contingency_id, canonical_key, game, sampler, action, effect_signature, support_count,
+                contingency_id, canonical_key, game, sampler, context_level, action, effect_signature, support_count,
                 first_seen_global_step, last_seen_global_step, stability_score, mean_prediction_error,
                 mean_replay_priority, representative_example_count
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (1, canonical_key, "tt01", "mixed", 0, effect_signature, 25, 1, 10, 1.0, 0.1, 0.9, 1),
+            (1, canonical_key, "tt01", "mixed", 2, 0, effect_signature, 25, 1, 10, 1.0, 0.1, 0.9, 1),
         )
         connection.execute(
             """
@@ -49,8 +50,9 @@ def _seed_compact_memory(memory_dir: Path) -> str:
                 support_count, member_count, first_seen_global_step, last_seen_global_step, stability_score
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (stable_family_int_id(family_signature), family_signature, family_signature, "unknown", "unknown", "unknown", 25, 5, 1, 10, 5.0),
+            (stable_id, family_signature, family_signature, "unknown", "unknown", "unknown", 25, 5, 1, 10, 5.0),
         )
+        connection.execute("INSERT INTO family_identity_map (canonical_signature, stable_family_id) VALUES (?, ?)", (family_signature, stable_id))
         connection.execute(
             """
             INSERT INTO family_members (
@@ -77,7 +79,7 @@ def _seed_compact_memory(memory_dir: Path) -> str:
                 replay_id, owner_type, owner_id, priority_score, reason, first_seen_global_step, last_seen_global_step, compact_payload_json
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            ("7", "interaction", "7", 0.95, "contradiction_linked", 5, 10, json.dumps({"context_signature": '["ctx",1]', "family_id": stable_family_int_id(family_signature)})),
+            ("7", "interaction", "7", 0.95, "contradiction_linked", 5, 10, json.dumps({"context_signature": '["ctx",1]', "family_id": stable_id})),
         )
         connection.commit()
     with sqlite3.connect(paths.graph) as connection:
@@ -103,8 +105,11 @@ def test_epoch_2_restores_compact_memory_into_live_system(tmp_path: Path) -> Non
         assert summary["carrier_candidates_restored"] == 1
         assert summary["replay_candidates_restored"] == 1
         assert summary["graph_nodes_restored"] >= 2
-        predicted = system.predictor.predict_multi_scale({0: ("ctx", 1)}, 0)
-        assert predicted == stable_family_int_id(family_signature)
+        predicted = system.predictor.predict_multi_scale({2: ("ctx", 1)}, 0)
+        assert predicted == 424242
+        stable = system.contingency_learner.stable_contingencies()[0]
+        assert stable.context_level == 2
+        assert system.contingency_learner.best_stable_for_action({2: ("ctx", 1)}, 0) is not None
         assert system.memory_lifecycle.replay_candidates
         assert system.carrier_tracker.build_candidates()
         assert system.graph.count_edges_of_type("explains") >= 1
@@ -120,7 +125,12 @@ def test_restore_function_populates_live_objects(tmp_path: Path) -> None:
         summary = load_compact_memory_into_system(system, memory_dir)
         assert summary["memory_summary_loaded"] is True
         assert len(system.contingency_learner.stable_contingencies()) == 1
+        assert system.contingency_learner.stable_contingencies()[0].context_level == 2
         assert len(system.clusterer.families) == 1
+        family_signature = next(iter(system.clusterer.semantic_family_members))
+        assert system.clusterer.semantic_family_members[family_signature]
+        restored_id = next(iter(system.clusterer.families))
+        assert restored_id == 424242
         assert len(system.memory_lifecycle.replay_candidates) == 1
     finally:
         system.close()

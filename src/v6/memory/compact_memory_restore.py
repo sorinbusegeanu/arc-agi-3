@@ -38,19 +38,23 @@ def load_compact_memory_into_system(system: Any, memory_dir: Path) -> dict[str, 
 
     with sqlite3.connect(paths["current_state"]) as state_conn:
         state_conn.row_factory = sqlite3.Row
+        family_id_map = {
+            str(row["canonical_signature"]): int(row["stable_family_id"])
+            for row in state_conn.execute("SELECT canonical_signature, stable_family_id FROM family_identity_map").fetchall()
+        }
         contingencies = []
         for row in state_conn.execute(
             """
-            SELECT canonical_key, action, effect_signature, support_count, stability_score
+            SELECT canonical_key, context_level, action, effect_signature, support_count, stability_score
             FROM stable_contingencies
             """
         ).fetchall():
             context_signature = _context_signature_from_canonical_key(str(row["canonical_key"]))
-            transformation_family = stable_family_int_id(str(row["effect_signature"]))
+            transformation_family = int(family_id_map.get(str(row["effect_signature"]), stable_family_int_id(str(row["effect_signature"]))))
             contingencies.append(
                 Contingency(
                     id=max(1, summary["stable_contingencies_restored"] + 1),
-                    context_level=0,
+                    context_level=int(row["context_level"] or 0),
                     context_signature=context_signature,
                     action=int(row["action"]),
                     transformation_family=transformation_family,
@@ -68,24 +72,30 @@ def load_compact_memory_into_system(system: Any, memory_dir: Path) -> dict[str, 
             """
         ).fetchall()
         summary["family_members_restored"] = len(family_member_rows)
-        family_rows = state_conn.execute(
-            """
-            SELECT canonical_signature, support_count, member_count
-            FROM transformation_families
-            """
-        ).fetchall()
+        family_columns = {row["name"] if isinstance(row, sqlite3.Row) else row[1] for row in state_conn.execute("PRAGMA table_info(transformation_families)").fetchall()}
+        family_rows = state_conn.execute("SELECT * FROM transformation_families").fetchall()
         for row in family_rows:
-            signature = str(row["canonical_signature"])
+            signature = str(
+                row["canonical_signature"]
+                if "canonical_signature" in family_columns
+                else row["family_id"]
+            )
+            stable_family_id = int(
+                family_id_map.get(
+                    signature,
+                    row["family_id"] if "family_id" in family_columns and row["family_id"] is not None else stable_family_int_id(signature),
+                )
+            )
             system.clusterer.import_family(
                 TransformationFamily(
-                    id=stable_family_int_id(signature),
+                    id=stable_family_id,
                     centroid_vector=_centroid_from_signature(signature),
-                    support_count=int(row["support_count"] or 0),
+                    support_count=int(row["support_count"] if "support_count" in family_columns and row["support_count"] is not None else 0),
                     member_delta_ids=[],
                 )
             )
         for row in family_member_rows:
-            system.clusterer.import_delta_to_family(str(row["contingency_key"]), stable_family_int_id(str(row["family_signature"])))
+            system.clusterer.import_family_member(str(row["family_signature"]), str(row["contingency_key"]))
         summary["transformation_families_restored"] = len(family_rows)
 
         if hasattr(system, "carrier_tracker") and isinstance(system.carrier_tracker, CarrierEmergenceTracker):

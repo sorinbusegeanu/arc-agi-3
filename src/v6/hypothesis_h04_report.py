@@ -43,25 +43,35 @@ def evaluate_h04_carrier_emergence(
             FROM temporal_milestones
             """
         ).fetchone()
+        carrier_links = state_conn.execute(
+            """
+            SELECT carrier_signature, linked_type, linked_key, support_count
+            FROM carrier_links
+            """
+        ).fetchall()
     graph_counts = {
         "carrier_explains_edge_count": 0,
         "carrier_anchors_edge_count": 0,
-        "carrier_cross_context_count": 0,
-        "carrier_cross_family_count": 0,
     }
     if graph_db.exists():
         with sqlite3.connect(graph_db) as graph_conn:
             graph_counts = {
                 "carrier_explains_edge_count": int(graph_conn.execute("SELECT COUNT(*) FROM graph_edges WHERE edge_type = 'explains'").fetchone()[0]),
                 "carrier_anchors_edge_count": int(graph_conn.execute("SELECT COUNT(*) FROM graph_edges WHERE edge_type = 'anchors'").fetchone()[0]),
-                "carrier_cross_context_count": int(graph_conn.execute("SELECT COUNT(DISTINCT source_node_id || '->' || target_node_id) FROM graph_edges WHERE edge_type = 'appears_in'").fetchone()[0]),
-                "carrier_cross_family_count": int(graph_conn.execute("SELECT COUNT(DISTINCT source_node_id || '->' || target_node_id) FROM graph_edges WHERE edge_type = 'explains'").fetchone()[0]),
             }
     stable = [row for row in carrier_rows if int(row["support_count"] or 0) >= 3]
     emergent = [row for row in carrier_rows if int(row["is_emergent"] or 0) == 1]
     fallback = [row for row in carrier_rows if str(row["carrier_source"] or "") == "context_action_fallback"]
     emergent_fallback = [row for row in emergent if str(row["carrier_source"] or "") == "context_action_fallback"]
-    linked_family_counts = [int(row["linked_family_count"] or 0) for row in carrier_rows]
+    links_by_carrier: dict[str, dict[str, set[str]]] = {}
+    for row in carrier_links:
+        carrier = str(row["carrier_signature"])
+        links_by_carrier.setdefault(carrier, {"family": set(), "context": set(), "contingency": set()})
+        linked_type = str(row["linked_type"])
+        if linked_type in links_by_carrier[carrier] and row["linked_key"] not in (None, ""):
+            links_by_carrier[carrier][linked_type].add(str(row["linked_key"]))
+    linked_family_counts = [len(values["family"]) for values in links_by_carrier.values()]
+    linked_context_counts = [len(values["context"]) for values in links_by_carrier.values()]
     first_stable_family_step = None if milestone is None else milestone[0]
     first_carrier_candidate_step = None if milestone is None else milestone[1]
     first_emergent_carrier_step = None if milestone is None else milestone[2]
@@ -78,6 +88,8 @@ def evaluate_h04_carrier_emergence(
         "emergent_context_action_fallback_count": len(emergent_fallback),
         "carrier_linked_family_count_mean": (sum(linked_family_counts) / len(linked_family_counts)) if linked_family_counts else None,
         "carrier_linked_family_count_max": max(linked_family_counts, default=0),
+        "carrier_cross_context_count": max(linked_context_counts, default=0),
+        "carrier_cross_family_count": max(linked_family_counts, default=0),
         "carrier_prediction_lift_available": any(float(row["stability_score"] or 0.0) > 0.0 for row in carrier_rows),
         "carrier_compression_gain_available": any(int(row["linked_family_count"] or 0) > 1 for row in carrier_rows),
         "first_stable_transformation_family_step": first_stable_family_step,
@@ -88,12 +100,21 @@ def evaluate_h04_carrier_emergence(
     }
     if not carrier_rows:
         decision = "INVALID" if first_stable_family_step is not None else "INCONCLUSIVE"
-    elif emergent and not emergent_fallback and graph_counts["carrier_explains_edge_count"] > 0 and graph_counts["carrier_anchors_edge_count"] > 0 and (h03_before_h04 is True or h03_before_h04 is None):
+    elif (
+        emergent
+        and not emergent_fallback
+        and (metrics["carrier_cross_family_count"] >= 2 or metrics["carrier_cross_context_count"] >= 2)
+        and graph_counts["carrier_explains_edge_count"] > 0
+        and graph_counts["carrier_anchors_edge_count"] > 0
+        and (h03_before_h04 is True or h03_before_h04 is None)
+    ):
         decision = "VALID"
     elif emergent_fallback and len(emergent_fallback) == len(emergent):
         decision = "INVALID"
-    else:
+    elif carrier_rows:
         decision = "PARTIALLY_VALID"
+    else:
+        decision = "INCONCLUSIVE"
     result = {
         "hypothesis_id": "H04",
         "decision": decision,

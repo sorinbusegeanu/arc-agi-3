@@ -25,6 +25,7 @@ class TransformationClusterer:
         self.recluster_every = int(recluster_every)
         self.families: dict[int, TransformationFamily] = {}
         self.delta_to_family: dict[int, int] = {}
+        self.semantic_family_members: dict[str, set[str]] = {}
         self._last_cluster_size = 0
         self._next_family_id = 1
         self._signature_to_family_id: dict[tuple[int, int, int, int, int], int] = {}
@@ -45,6 +46,7 @@ class TransformationClusterer:
         self._last_cluster_size = len(deltas_list)
         self.families = {}
         self.delta_to_family = {}
+        self.semantic_family_members = {}
         if len(deltas_list) < self.min_cluster_size:
             return {}
 
@@ -127,6 +129,9 @@ class TransformationClusterer:
         except ValueError:
             return
         self.delta_to_family[normalized_delta_id] = _stable_family_int_id(family_id)
+
+    def import_family_member(self, family_signature: str, contingency_key: str) -> None:
+        self.semantic_family_members.setdefault(str(family_signature), set()).add(str(contingency_key))
 
 
 def _stable_family_int_id(value: int | str) -> int:

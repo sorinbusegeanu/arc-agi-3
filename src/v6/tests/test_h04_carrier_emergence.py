@@ -40,6 +40,10 @@ def _build_memory(memory_dir: Path, *, fallback_only: bool = False) -> None:
             """,
             ("tt01", "mixed", 0, 1, 2, 3, 4, 5, 3, 6, 7, 8),
         )
+        connection.execute("INSERT INTO carrier_links VALUES (?, ?, ?, ?, ?, ?)", ("carrier-a", "family", "family-a", 1, 5, 10))
+        connection.execute("INSERT INTO carrier_links VALUES (?, ?, ?, ?, ?, ?)", ("carrier-a", "family", "family-b", 1, 5, 10))
+        connection.execute("INSERT INTO carrier_links VALUES (?, ?, ?, ?, ?, ?)", ("carrier-a", "context", "ctx-a", 1, 5, 10))
+        connection.execute("INSERT INTO carrier_links VALUES (?, ?, ?, ?, ?, ?)", ("carrier-a", "context", "ctx-b", 1, 5, 10))
         connection.commit()
     with sqlite3.connect(memory.graph) as connection:
         connection.execute("INSERT INTO graph_nodes VALUES (?, ?, ?, ?, ?, ?)", ("carrier:carrier-a", "carrier", "carrier-a", 5, 10, 4))
@@ -58,8 +62,10 @@ def test_h04_returns_partially_valid_or_valid_from_compact_memory(tmp_path: Path
 
     result = evaluate_h04_carrier_emergence(run_dir=None, memory_dir=memory_dir, output_dir=tmp_path / "out")
 
-    assert result["decision"] in {"PARTIALLY_VALID", "VALID"}
+    assert result["decision"] == "VALID"
     assert result["core_metrics"]["carrier_candidate_count"] == 1
+    assert result["core_metrics"]["carrier_cross_family_count"] >= 2
+    assert result["core_metrics"]["carrier_cross_context_count"] >= 2
     assert (tmp_path / "out" / "h04_carrier_emergence_report.json").exists()
 
 
@@ -71,3 +77,15 @@ def test_h04_rejects_context_action_fallback_as_emergent(tmp_path: Path) -> None
 
     assert result["decision"] == "INVALID"
     assert result["core_metrics"]["emergent_context_action_fallback_count"] == 1
+
+
+def test_h04_without_links_is_only_partially_valid(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _build_memory(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as connection:
+        connection.execute("DELETE FROM carrier_links")
+        connection.commit()
+
+    result = evaluate_h04_carrier_emergence(run_dir=None, memory_dir=memory_dir, output_dir=tmp_path / "out")
+
+    assert result["decision"] == "PARTIALLY_VALID"
