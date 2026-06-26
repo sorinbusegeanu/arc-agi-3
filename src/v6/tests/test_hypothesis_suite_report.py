@@ -189,7 +189,7 @@ def test_hypothesis_suite_report_creates_subdirectories_and_summary(tmp_path: Pa
     assert "H03 decision" in summary
     assert "h02a_replay_attention_decision" in summary["H02 core metrics"]
     assert "h02b_pre_carrier_timing_decision" in summary["H02 core metrics"]
-    assert summary["H04 decision"] == "NOT_IMPLEMENTED"
+    assert summary["H04 decision"] == "INCONCLUSIVE"
     assert summary["per_game_status_table"]
 
 

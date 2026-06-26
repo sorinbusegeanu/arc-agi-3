@@ -20,6 +20,7 @@ from v6.contingency_memory import (
     build_context_signature,
     classify_outcome,
     context_model_accuracy,
+    determine_manifest_path,
     discover_parquet_runs,
     format_v06_report,
     list_interaction_files,
@@ -287,6 +288,26 @@ class ToggleEnv:
 
     def available_actions(self) -> list[int]:
         return [1]
+
+
+class OutcomeEnv(ToggleEnv):
+    def __init__(self, *, outcome_state: str, outcome_polarity: str) -> None:
+        super().__init__()
+        self._configured_outcome_state = str(outcome_state)
+        self._configured_outcome_polarity = str(outcome_polarity)
+        self.last_outcome_state = "alive"
+        self.last_outcome_polarity = "neutral"
+        self.last_terminal_state = None
+        self.last_step_was_reset_boundary = False
+        self.last_reward = 0
+
+    def step(self, action: int) -> np.ndarray:
+        grid = super().step(action)
+        self.last_outcome_state = self._configured_outcome_state
+        self.last_outcome_polarity = self._configured_outcome_polarity
+        self.last_terminal_state = self._configured_outcome_state if self._configured_outcome_state in {"game_won", "dead", "end_game"} else None
+        self.last_step_was_reset_boundary = self._configured_outcome_state == "end_game"
+        return grid
 
 
 def test_delta_extractor_uses_cell_changes_without_components() -> None:
@@ -1322,6 +1343,107 @@ def test_interaction_significance_terminal_signal_boosts_survival_impact() -> No
     assert score.survival_impact >= 0.75
 
 
+def test_interaction_significance_game_won_uses_categorical_outcome_state() -> None:
+    score = compute_interaction_significance(
+        reward=0,
+        terminated=False,
+        truncated=False,
+        prediction_correct=None,
+        prediction_confidence=None,
+        actual_family_id=None,
+        delta_id=None,
+        context_signature="ctx",
+        memory_counts={"outcome_state:game_won": 0, "context_outcome:ctx|game_won": 0},
+        graph_counts={},
+        outcome_state="game_won",
+        outcome_polarity=None,
+    )
+
+    assert score.survival_impact == 1.0
+    assert score.outcome_polarity == "positive"
+    assert score.learning_value >= 0.99
+
+
+def test_interaction_significance_dead_uses_negative_outcome_polarity() -> None:
+    score = compute_interaction_significance(
+        reward=0,
+        terminated=False,
+        truncated=False,
+        prediction_correct=None,
+        prediction_confidence=None,
+        actual_family_id=None,
+        delta_id=None,
+        context_signature="ctx",
+        memory_counts={"outcome_state:dead": 0},
+        graph_counts={},
+        outcome_state="dead",
+        outcome_polarity=None,
+    )
+
+    assert score.survival_impact == 1.0
+    assert score.outcome_polarity == "negative"
+
+
+def test_interaction_significance_repeated_game_won_has_lower_learning_value() -> None:
+    score_low = compute_interaction_significance(
+        reward=0,
+        terminated=False,
+        truncated=False,
+        prediction_correct=None,
+        prediction_confidence=None,
+        actual_family_id=None,
+        delta_id=None,
+        context_signature="ctx",
+        memory_counts={
+            "outcome_state:game_won": 0,
+            "context_outcome:ctx|game_won": 0,
+            "context_signature:ctx": 0,
+        },
+        graph_counts={},
+        outcome_state="game_won",
+        outcome_polarity="positive",
+    )
+    score_high = compute_interaction_significance(
+        reward=0,
+        terminated=False,
+        truncated=False,
+        prediction_correct=None,
+        prediction_confidence=None,
+        actual_family_id=None,
+        delta_id=None,
+        context_signature="ctx",
+        memory_counts={
+            "outcome_state:game_won": 100,
+            "context_outcome:ctx|game_won": 100,
+            "context_signature:ctx": 100,
+        },
+        graph_counts={},
+        outcome_state="game_won",
+        outcome_polarity="positive",
+    )
+
+    assert score_low.learning_value > score_high.learning_value
+
+
+def test_interaction_significance_alive_keeps_low_survival_without_other_signal() -> None:
+    score = compute_interaction_significance(
+        reward=0,
+        terminated=False,
+        truncated=False,
+        prediction_correct=None,
+        prediction_confidence=None,
+        actual_family_id=None,
+        delta_id=None,
+        context_signature="ctx",
+        memory_counts={},
+        graph_counts={},
+        outcome_state="alive",
+        outcome_polarity="neutral",
+    )
+
+    assert score.survival_impact == 0.0
+
+
 def test_interaction_significance_graph_proxy_boosts_explanatory_potential() -> None:
     score = compute_interaction_significance(
         reward=0,
@@ -1380,6 +1502,49 @@ def test_v6_system_run_step_stores_isf_fields(tmp_path) -> None:
         assert all(value is not None for value in row[1:])
     finally:
         connection.close()
+
+
+def test_v6_system_run_step_stores_outcome_state_fields(tmp_path) -> None:
+    db_path = tmp_path / "outcomes.sqlite"
+    system = V6System(
+        env=OutcomeEnv(outcome_state="game_won", outcome_polarity="positive"),
+        config=V6Config(
+            database_path=str(db_path),
+            recluster_every=2,
+            min_cluster_size=2,
+            context_length=1,
+            contingency_support_threshold=1,
+            contingency_confidence_threshold=0.0,
+            random_seed=0,
+        ),
+    )
+
+    system.run_step()
+    system.close()
+
+    connection = sqlite3.connect(db_path)
+    try:
+        interaction_row = connection.execute(
+            """
+            SELECT outcome_state, outcome_polarity, is_terminal_outcome, is_success_outcome, is_failure_outcome
+            FROM interactions
+            ORDER BY id
+            LIMIT 1
+            """
+        ).fetchone()
+        prediction_row = connection.execute(
+            """
+            SELECT outcome_state, outcome_polarity, is_terminal_outcome, is_success_outcome, is_failure_outcome
+            FROM prediction_results
+            ORDER BY id
+            LIMIT 1
+            """
+        ).fetchone()
+    finally:
+        connection.close()
+
+    assert interaction_row == ("game_won", "positive", 1, 1, 0)
+    assert prediction_row == ("game_won", "positive", 1, 1, 0)
 
 
 def test_v6_system_prediction_edges_add_explains_and_depends_on() -> None:
@@ -2809,6 +2974,9 @@ def test_v06_builds_m0_episode_summaries(tmp_path) -> None:
     assert len(loaded["episodes"]) >= 2
     assert loaded["episodes"][0].steps_total > 0
     assert loaded["episodes"][0].trajectory_cost == loaded["episodes"][0].steps_total
+    assert loaded["episodes"][0].success_observed is True
+    assert loaded["episodes"][0].terminal_observed is True
+    assert loaded["episodes"][0].terminal_type == "game_won"
 
 
 def test_v06_groups_by_context_and_action() -> None:
@@ -2946,6 +3114,30 @@ def test_cli_accepts_contingency_memory_v06_options() -> None:
     assert args.max_files == 100
 
 
+def test_v06_cli_manifest_out_default_is_none() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "contingency-memory-v06",
+            "--parquet-root",
+            "runs/v6/p",
+        ]
+    )
+
+    assert args.manifest_out is None
+
+
+def test_v06_determine_manifest_path_variants(tmp_path) -> None:
+    output_dir = tmp_path / "out"
+    explicit = ContingencyMemoryConfig(parquet_root="runs/v6/p", manifest_out=str(tmp_path / "explicit.json"))
+    replayed = ContingencyMemoryConfig(parquet_root="runs/v6/p", manifest_in=str(tmp_path / "input.json"))
+    defaulted = ContingencyMemoryConfig(parquet_root="runs/v6/p")
+
+    assert determine_manifest_path(explicit, output_dir) == tmp_path / "explicit.json"
+    assert determine_manifest_path(replayed, output_dir) == output_dir / "input_manifest.replayed.json"
+    assert determine_manifest_path(defaulted, output_dir) == output_dir / "input_manifest.json"
+
+
 def test_v06_manifest_creation_filters_game_sampler_seed(tmp_path) -> None:
     root = _build_v06_manifest_fixture(tmp_path / "parquet")
     discovered = list_interaction_files(__import__("pathlib").Path(root))
@@ -2965,6 +3157,94 @@ def test_v06_manifest_creation_filters_game_sampler_seed(tmp_path) -> None:
     assert all("game=gr01" in path for path in manifest["selected_files"])
     assert all("sampler=no_change_avoidance" in path for path in manifest["selected_files"])
     assert all("seed=0" in path for path in manifest["selected_files"])
+
+
+def test_v06_streaming_schema_failure_marks_validation_invalid(tmp_path) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    root = Path(_build_v06_fixture(tmp_path / "parquet"))
+    interaction_path = next(root.glob("game=*/sampler=*/seed=*/steps=*/interactions*.parquet"))
+    delta_path = next(root.glob("game=*/sampler=*/seed=*/steps=*/deltas*.parquet"))
+
+    bad_interactions = pa.table(
+        {
+            "id": pa.array([1], type=pa.int64()),
+            "timestamp": pa.array([1], type=pa.int64()),
+            "observation_before": pa.array([encode_array(_obs(0))], type=pa.binary()),
+            "observation_after": pa.array([encode_array(_obs(1))], type=pa.binary()),
+            "delta_id": pa.array([1], type=pa.int64()),
+        }
+    )
+    pq.write_table(bad_interactions, interaction_path, compression="zstd")
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {
+                    "id": 1,
+                    "changed_cells": 1,
+                    "changed_positions": json.dumps([]),
+                    "colors_added": json.dumps([]),
+                    "colors_removed": json.dumps([]),
+                    "centroid_before_x": 0.0,
+                    "centroid_before_y": 0.0,
+                    "centroid_after_x": 1.0,
+                    "centroid_after_y": 0.0,
+                    "dx": 1.0,
+                    "dy": 0.0,
+                }
+            ]
+        ),
+        delta_path,
+        compression="zstd",
+    )
+
+    payload = run_contingency_memory_v06(
+        ContingencyMemoryConfig(
+            parquet_root=str(root),
+            games=("va02",),
+            output_dir=str(tmp_path / "out"),
+            context_depth=1,
+            min_support=2,
+            prediction_threshold=0.75,
+            streaming=True,
+        )
+    )
+
+    assert payload["validation"]["schema_valid"] is False
+    assert payload["validation"]["failed_load_count"] > 0
+
+
+def test_v06_empty_outputs_use_readable_parquet_schemas(tmp_path) -> None:
+    import pandas as pd
+
+    root = tmp_path / "empty_parquet"
+    root.mkdir(parents=True, exist_ok=True)
+    output_dir = tmp_path / "out"
+
+    payload = run_contingency_memory_v06(
+        ContingencyMemoryConfig(
+            parquet_root=str(root),
+            games=("va02",),
+            output_dir=str(output_dir),
+            context_depth=1,
+            min_support=2,
+            prediction_threshold=0.75,
+            streaming=True,
+        )
+    )
+
+    contingencies = pd.read_parquet(output_dir / "contingencies.parquet")
+    episodes = pd.read_parquet(output_dir / "episode_summaries.parquet")
+    edges = pd.read_parquet(output_dir / "m1_graph_edges.parquet")
+
+    assert payload["scan_summary"]["files_selected"] == 0
+    assert "_empty" not in contingencies.columns
+    assert "_empty" not in episodes.columns
+    assert "_empty" not in edges.columns
+    assert {"contingency_id", "game_id", "action", "discovered"}.issubset(contingencies.columns)
+    assert {"game_id", "sampler", "seed", "episode_id", "success_observed"}.issubset(episodes.columns)
+    assert {"edge_type", "game_id", "sampler", "seed", "source_interaction_id", "target_interaction_id"}.issubset(edges.columns)
 
 
 def test_v06_manifest_respects_max_files(tmp_path) -> None:
@@ -4557,16 +4837,32 @@ def test_v10fixb_runs_deterministically_and_cli_accepts_options(tmp_path, monkey
     assert "target_top3_mean_score" in scores.columns
 
 
-def test_game_set_manifest_auto_resolves_extended32_from_available_games() -> None:
-    from pathlib import Path
+def test_game_set_manifest_auto_resolves_extended32_from_available_games(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "runs" / "v6" / "game_sets"
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "extended32_v08.json").write_text(
+        json.dumps(
+            {
+                "name": "extended32_v08",
+                "games": ["tt01", "tt02", "pb02", "pb03"],
+                "families": {
+                    "collection": ["tt01", "tt02"],
+                    "push_crate": ["pb02", "pb03"],
+                },
+                "purpose": "test fixture",
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
 
-    m2_families = load_m2_families_v08d(Path("runs/v6/v07_cd2_extended32_expanded"))
     manifest = load_game_set_manifest(
-        fallback_games=tuple(sorted({game for family in m2_families for game in family.games_present}))
+        fallback_games=("pb02", "pb03", "tt01", "tt02")
     )
 
     assert manifest.name == "extended32_v08"
-    assert len(manifest.families) == 16
+    assert len(manifest.families) == 2
     assert manifest.families["collection"] == ("tt01", "tt02")
 
 
@@ -6655,14 +6951,14 @@ def _build_v06_fixture(root) -> str:
     interactions = []
     deltas = []
     rows = [
-        (_obs(0), _obs(1), 4),
-        (_obs(1), _obs(2), 4),
-        (_obs(2), _obs(2), 4),
-        (_obs(0), _obs(1), 4),
-        (_obs(1), _obs(2), 4),
-        (_obs(2), _obs(3), 4),
+        (_obs(0), _obs(1), 4, "alive", "neutral"),
+        (_obs(1), _obs(2), 4, "alive", "neutral"),
+        (_obs(2), _obs(2), 4, "game_won", "positive"),
+        (_obs(0), _obs(1), 4, "alive", "neutral"),
+        (_obs(1), _obs(2), 4, "alive", "neutral"),
+        (_obs(2), _obs(3), 4, "dead", "negative"),
     ]
-    for index, (before, after, action) in enumerate(rows, start=1):
+    for index, (before, after, action, outcome_state, outcome_polarity) in enumerate(rows, start=1):
         interactions.append(
             {
                 "id": index,
@@ -6671,6 +6967,11 @@ def _build_v06_fixture(root) -> str:
                 "action": action,
                 "observation_after": encode_array(after),
                 "delta_id": index,
+                "outcome_state": outcome_state,
+                "outcome_polarity": outcome_polarity,
+                "is_terminal_outcome": int(outcome_state in {"game_won", "dead", "end_game"}),
+                "is_success_outcome": int(outcome_state == "game_won"),
+                "is_failure_outcome": int(outcome_state == "dead"),
             }
         )
         deltas.append(
@@ -8206,7 +8507,7 @@ def _obs(value: int) -> np.ndarray:
     return np.full((2, 2), value, dtype=int)
 
 
-def _trace_event(*, step: int, action: int, context: tuple[str, ...], outcome: str):
+def _trace_event(*, step: int, action: int, context: tuple[str, ...], outcome: str, outcome_state: str | None = None, outcome_polarity: str | None = None):
     from v6.contingency_memory import TraceEvent
 
     non_preserve = outcome in {"position_like_change", "large_change", "change", "terminal_transition"}
@@ -8226,6 +8527,8 @@ def _trace_event(*, step: int, action: int, context: tuple[str, ...], outcome: s
         state_after_signature=f"s{step+1}",
         blocked_or_no_change=blocked,
         non_preserve=non_preserve,
-        terminal_observed=outcome == "terminal_transition",
+        terminal_observed=outcome == "terminal_transition" or outcome_state in {"game_won", "dead", "end_game"},
+        outcome_state=outcome_state,
+        outcome_polarity=outcome_polarity,
         delta_summary={},
     )

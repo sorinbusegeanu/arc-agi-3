@@ -100,6 +100,8 @@ class TraceEvent:
     non_preserve: bool
     terminal_observed: bool
     delta_summary: dict[str, Any]
+    outcome_state: str | None = None
+    outcome_polarity: str | None = None
 
 
 @dataclass
@@ -112,6 +114,8 @@ class EpisodeAccumulator:
     step_count: int = 0
     end_step: int = 0
     terminal_observed: bool = False
+    terminal_type: str | None = None
+    success_observed: bool | None = None
     blocked_or_no_change_count: int = 0
     non_preserve_count: int = 0
     action_counts: Counter[str] = field(default_factory=Counter)
@@ -122,6 +126,12 @@ class EpisodeAccumulator:
         self.step_count += 1
         self.end_step = event.step
         self.terminal_observed = self.terminal_observed or event.terminal_observed
+        if event.terminal_observed:
+            self.terminal_type = event.outcome_state or "terminal_transition"
+        if event.outcome_state == "game_won":
+            self.success_observed = True
+        elif self.success_observed is None and event.outcome_state in {"dead", "end_game"}:
+            self.success_observed = False
         self.blocked_or_no_change_count += int(event.blocked_or_no_change)
         self.non_preserve_count += int(event.non_preserve)
         self.action_counts[str(event.action)] += 1
@@ -142,8 +152,8 @@ class EpisodeAccumulator:
             end_step=self.end_step,
             steps_total=self.step_count,
             terminal_observed=self.terminal_observed,
-            terminal_type="terminal_transition" if self.terminal_observed else None,
-            success_observed=None,
+            terminal_type=self.terminal_type if self.terminal_observed else None,
+            success_observed=self.success_observed,
             unique_state_signatures=len(self.state_counts),
             repeated_state_count=repeated,
             blocked_or_no_change_count=self.blocked_or_no_change_count,
@@ -394,7 +404,7 @@ def determine_manifest_path(config: ContingencyMemoryConfig, output_dir: Path) -
     if config.manifest_out:
         return Path(config.manifest_out)
     if config.manifest_in:
-        return Path(config.manifest_in)
+        return output_dir / "input_manifest.replayed.json"
     return output_dir / "input_manifest.json"
 
 
@@ -612,14 +622,9 @@ def process_manifest_streaming(
             file_info = parse_selected_file_path(interaction_path)
             if file_info is None:
                 failed_loads.append({"file": str(interaction_path), "reason": "unparseable interaction path"})
+                schema_valid = False
                 continue
-            delta_map = load_delta_file_map(matching_delta_path(interaction_path))
             run_key = (file_info["game"], file_info["sampler"], int(file_info["seed"]), int(file_info["steps"]))
-            all_files_for_run = [
-                Path(path)
-                for path in manifest["selected_files"]
-                if str(run_key[0]) in path and f"sampler={run_key[1]}" in path and f"seed={run_key[2]}" in path and f"steps={run_key[3]}" in path
-            ]
             exact = selection_is_exact_for_run(run_key, manifest["selected_files"])
             state = run_states.setdefault(
                 run_key,
@@ -635,6 +640,7 @@ def process_manifest_streaming(
                 state.exact_reconstruction = False
 
             try:
+                delta_map = load_delta_file_map(matching_delta_path(interaction_path))
                 parquet = pq.ParquetFile(interaction_path)
                 file_rows = 0
                 file_had_schema = False
@@ -645,6 +651,7 @@ def process_manifest_streaming(
                     file_had_schema = True
                     if not INTERACTION_COLUMNS.issubset(rows[0]):
                         missing = sorted(INTERACTION_COLUMNS - set(rows[0].keys()))
+                        schema_valid = False
                         raise ValueError(f"missing interaction columns: {missing}")
                     rows.sort(key=lambda row: (int(row.get("timestamp", 0) or 0), int(row.get("id", 0) or 0)))
                     if config.max_rows > 0:
@@ -696,6 +703,7 @@ def process_manifest_streaming(
                 if config.max_rows > 0 and rows_processed >= int(config.max_rows):
                     break
             except Exception as exc:
+                schema_valid = False
                 failed_loads.append({"file": str(interaction_path), "reason": f"{type(exc).__name__}: {exc}"})
 
         for state in run_states.values():
@@ -759,6 +767,15 @@ def process_interaction_row(
 
     delta = normalized_delta(delta_map.get(int(row["delta_id"])))
     outcome_signature = classify_outcome(before, after, delta)
+    outcome_state = row.get("outcome_state")
+    if outcome_state not in {"alive", "dead", "end_game", "game_won"}:
+        outcome_state = "end_game" if bool(row.get("is_terminal_outcome")) else None
+    outcome_polarity = row.get("outcome_polarity")
+    terminal_observed = (
+        bool(row.get("is_terminal_outcome"))
+        or outcome_signature == "terminal_transition"
+        or outcome_state in {"game_won", "dead", "end_game"}
+    )
     event = TraceEvent(
         game_id=state.game_id,
         sampler=state.sampler,
@@ -774,7 +791,9 @@ def process_interaction_row(
         state_after_signature=state_signature(after),
         blocked_or_no_change=outcome_signature in {"blocked_no_change", "preserve_no_change"},
         non_preserve=outcome_signature in {"position_like_change", "large_change", "change", "terminal_transition"},
-        terminal_observed=outcome_signature == "terminal_transition",
+        terminal_observed=terminal_observed,
+        outcome_state=outcome_state,
+        outcome_polarity=outcome_polarity,
         delta_summary=delta,
     )
     if state.current_episode is None:
@@ -1391,8 +1410,83 @@ def _write_parquet(path: Path, records: list[dict[str, Any]]) -> None:
     import pyarrow.parquet as pq
 
     normalized = [_normalize_record(item) for item in records]
-    table = pa.Table.from_pylist(normalized) if normalized else pa.table({"_empty": pa.array([], type=pa.string())})
+    if normalized:
+        table = pa.Table.from_pylist(normalized)
+    else:
+        schema = _empty_parquet_schema(path.name)
+        table = pa.Table.from_pylist([], schema=schema) if schema is not None else pa.table({"_empty": pa.array([], type=pa.string())})
     pq.write_table(table, path, compression="zstd")
+
+
+def _empty_parquet_schema(filename: str):
+    import pyarrow as pa
+
+    if filename == "contingencies.parquet":
+        return pa.schema(
+            [
+                pa.field("contingency_id", pa.string()),
+                pa.field("game_id", pa.string()),
+                pa.field("sampler_scope", pa.string()),
+                pa.field("context_signature", pa.string()),
+                pa.field("action", pa.int64()),
+                pa.field("outcome_signature", pa.string()),
+                pa.field("support_count", pa.int64()),
+                pa.field("total_count", pa.int64()),
+                pa.field("prediction_accuracy", pa.float64()),
+                pa.field("prediction_error_rate", pa.float64()),
+                pa.field("entropy", pa.float64()),
+                pa.field("confidence", pa.float64()),
+                pa.field("first_seen_step", pa.int64()),
+                pa.field("last_seen_step", pa.int64()),
+                pa.field("example_episode_ids", pa.string()),
+                pa.field("terminal_effect_candidate", pa.bool_()),
+                pa.field("future_option_motif_candidate", pa.string()),
+                pa.field("discovered", pa.bool_()),
+                pa.field("notes", pa.string()),
+            ]
+        )
+    if filename == "episode_summaries.parquet":
+        return pa.schema(
+            [
+                pa.field("game_id", pa.string()),
+                pa.field("sampler", pa.string()),
+                pa.field("seed", pa.int64()),
+                pa.field("episode_id", pa.int64()),
+                pa.field("level_id", pa.string()),
+                pa.field("start_step", pa.int64()),
+                pa.field("end_step", pa.int64()),
+                pa.field("steps_total", pa.int64()),
+                pa.field("terminal_observed", pa.bool_()),
+                pa.field("terminal_type", pa.string()),
+                pa.field("success_observed", pa.bool_()),
+                pa.field("unique_state_signatures", pa.int64()),
+                pa.field("repeated_state_count", pa.int64()),
+                pa.field("blocked_or_no_change_count", pa.int64()),
+                pa.field("non_preserve_count", pa.int64()),
+                pa.field("action_counts", pa.string()),
+                pa.field("trajectory_cost", pa.int64()),
+                pa.field("loop_ratio", pa.float64()),
+                pa.field("wasted_action_ratio", pa.float64()),
+                pa.field("steps_to_terminal", pa.int64()),
+                pa.field("normalized_solve_efficiency", pa.float64()),
+                pa.field("equivalent_outcome_cost_gap", pa.float64()),
+                pa.field("diagnostic_only", pa.bool_()),
+                pa.field("notes", pa.string()),
+            ]
+        )
+    if filename == "m1_graph_edges.parquet":
+        return pa.schema(
+            [
+                pa.field("edge_type", pa.string()),
+                pa.field("game_id", pa.string()),
+                pa.field("sampler", pa.string()),
+                pa.field("seed", pa.int64()),
+                pa.field("episode_id", pa.int64()),
+                pa.field("source_interaction_id", pa.int64()),
+                pa.field("target_interaction_id", pa.int64()),
+            ]
+        )
+    return None
 
 
 def _normalize_record(record: dict[str, Any]) -> dict[str, Any]:

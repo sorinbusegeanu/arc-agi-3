@@ -20,6 +20,8 @@ class InteractionSignificanceScore:
     explanatory_potential: float
     total: float
     weights: dict[str, float]
+    outcome_state: str | None = None
+    outcome_polarity: str | None = None
     version: str = "isf_v01"
 
     def to_dict(self) -> dict[str, Any]:
@@ -73,6 +75,8 @@ def compute_interaction_significance(
     graph_counts: Mapping[str, int] | None = None,
     future_option_delta: float | None = None,
     explanatory_delta: float | None = None,
+    outcome_state: str | None = None,
+    outcome_polarity: str | None = None,
     weights: Mapping[str, float] | None = None,
 ) -> InteractionSignificanceScore:
     normalized_weights = _normalize_weights(weights)
@@ -83,6 +87,20 @@ def compute_interaction_significance(
     survival_impact = clamp01(abs(reward_value))
     if bool_scalar(terminated) or bool_scalar(truncated):
         survival_impact = max(survival_impact, 0.75)
+    normalized_outcome_state = None if outcome_state in (None, "") else str(outcome_state)
+    normalized_outcome_polarity = None if outcome_polarity in (None, "") else str(outcome_polarity)
+    if normalized_outcome_state == "game_won":
+        survival_impact = 1.0
+        normalized_outcome_polarity = "positive"
+    elif normalized_outcome_state == "dead":
+        survival_impact = 1.0
+        normalized_outcome_polarity = "negative"
+    elif normalized_outcome_state == "end_game":
+        survival_impact = max(survival_impact, 0.85)
+        normalized_outcome_polarity = normalized_outcome_polarity or "unknown"
+    elif normalized_outcome_state == "alive":
+        survival_impact = max(survival_impact, 0.0)
+        normalized_outcome_polarity = normalized_outcome_polarity or "neutral"
 
     if prediction_correct is True:
         prediction_error = 1.0 - clamp01(prediction_confidence or 0.0)
@@ -100,7 +118,14 @@ def compute_interaction_significance(
         novelty_scores.append(_novelty(memory_counts.get(f"context_signature:{context_signature}", 0)))
     if context_signature and actual_family_id:
         novelty_scores.append(_novelty(memory_counts.get(f"context_family:{context_signature}|{actual_family_id}", 0)))
+    if normalized_outcome_state:
+        novelty_scores.append(_novelty(memory_counts.get(f"outcome_state:{normalized_outcome_state}", 0)))
+    if context_signature and normalized_outcome_state:
+        novelty_scores.append(_novelty(memory_counts.get(f"context_outcome:{context_signature}|{normalized_outcome_state}", 0)))
     learning_value = max(novelty_scores) if novelty_scores else 0.5
+    if normalized_outcome_state in {"game_won", "dead", "end_game"}:
+        terminal_outcome_learning_value = _novelty(memory_counts.get(f"outcome_state:{normalized_outcome_state}", 0))
+        learning_value = max(learning_value, terminal_outcome_learning_value)
 
     if future_option_delta is not None:
         transfer_potential = clamp01(abs(future_option_delta))
@@ -133,6 +158,8 @@ def compute_interaction_significance(
         explanatory_potential=explanatory_potential,
         total=total,
         weights=normalized_weights,
+        outcome_state=normalized_outcome_state,
+        outcome_polarity=normalized_outcome_polarity,
     )
 
 

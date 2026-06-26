@@ -76,7 +76,12 @@ class ContingencyStore:
                 efficiency_best_known_cost_for_outcome REAL,
                 efficiency_normalized_solve_efficiency REAL,
                 efficiency_equivalent_outcome_cost_gap REAL,
-                efficiency_future_option_gain_per_cost REAL
+                efficiency_future_option_gain_per_cost REAL,
+                outcome_state TEXT,
+                outcome_polarity TEXT,
+                is_terminal_outcome INTEGER,
+                is_success_outcome INTEGER,
+                is_failure_outcome INTEGER
             )
             """
         )
@@ -122,6 +127,11 @@ class ContingencyStore:
         self._ensure_column("prediction_results", "efficiency_normalized_solve_efficiency", "REAL")
         self._ensure_column("prediction_results", "efficiency_equivalent_outcome_cost_gap", "REAL")
         self._ensure_column("prediction_results", "efficiency_future_option_gain_per_cost", "REAL")
+        self._ensure_column("prediction_results", "outcome_state", "TEXT")
+        self._ensure_column("prediction_results", "outcome_polarity", "TEXT")
+        self._ensure_column("prediction_results", "is_terminal_outcome", "INTEGER")
+        self._ensure_column("prediction_results", "is_success_outcome", "INTEGER")
+        self._ensure_column("prediction_results", "is_failure_outcome", "INTEGER")
         self.connection.commit()
 
     def _ensure_column(self, table: str, column: str, declaration: str) -> None:
@@ -213,6 +223,11 @@ class ContingencyStore:
         efficiency_normalized_solve_efficiency: float | None = None,
         efficiency_equivalent_outcome_cost_gap: float | None = None,
         efficiency_future_option_gain_per_cost: float | None = None,
+        outcome_state: str | None = None,
+        outcome_polarity: str | None = None,
+        is_terminal_outcome: bool = False,
+        is_success_outcome: bool = False,
+        is_failure_outcome: bool = False,
     ) -> int | None:
         prediction_error: int | None
         if predicted_family is None or actual_family is None:
@@ -268,9 +283,14 @@ class ContingencyStore:
                 efficiency_best_known_cost_for_outcome,
                 efficiency_normalized_solve_efficiency,
                 efficiency_equivalent_outcome_cost_gap,
-                efficiency_future_option_gain_per_cost
+                efficiency_future_option_gain_per_cost,
+                outcome_state,
+                outcome_polarity,
+                is_terminal_outcome,
+                is_success_outcome,
+                is_failure_outcome
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 int(interaction_id),
@@ -320,6 +340,11 @@ class ContingencyStore:
                 None if efficiency_normalized_solve_efficiency is None else float(efficiency_normalized_solve_efficiency),
                 None if efficiency_equivalent_outcome_cost_gap is None else float(efficiency_equivalent_outcome_cost_gap),
                 None if efficiency_future_option_gain_per_cost is None else float(efficiency_future_option_gain_per_cost),
+                outcome_state,
+                outcome_polarity,
+                int(bool(is_terminal_outcome)),
+                int(bool(is_success_outcome)),
+                int(bool(is_failure_outcome)),
             ),
         )
         if self.auto_commit:

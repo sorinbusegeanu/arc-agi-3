@@ -35,7 +35,14 @@ class ArcGridEnvironment:
         self.skipped_terminal_steps = 0
         self.last_step_was_reset_boundary = False
         self.last_terminal_state: str | None = None
+        self.last_outcome_state: str = "alive"
+        self.last_outcome_polarity: str = "neutral"
+        self.last_state_name: str | None = None
+        self.last_levels_completed: int = 0
+        self.last_win_levels: int = 0
+        self.last_full_game_id: str | None = None
         self._last_raw = self.env.reset()
+        self._update_progress_fields(self._last_raw)
         self._last_grid = _grid_from_raw(self._last_raw)
 
     def observe(self) -> np.ndarray:
@@ -43,10 +50,13 @@ class ArcGridEnvironment:
 
     def reset(self) -> np.ndarray:
         self._last_raw = self.env.reset()
+        self._update_progress_fields(self._last_raw)
         self._last_grid = _grid_from_raw(self._last_raw)
         self.reset_count += 1
         self.last_step_was_reset_boundary = True
         self.last_terminal_state = "explicit_reset"
+        self.last_outcome_state = "alive"
+        self.last_outcome_polarity = "neutral"
         return self._last_grid.copy()
 
     def step(self, action: int) -> np.ndarray:
@@ -55,6 +65,10 @@ class ArcGridEnvironment:
         self.last_step_was_reset_boundary = False
         self.last_terminal_state = None
         self._last_raw = self.env.step(GameAction.from_id(int(action)))
+        self._update_progress_fields(self._last_raw)
+        self.last_outcome_state, self.last_outcome_polarity = _infer_outcome_fields(self._last_raw, frame_available=_raw_has_usable_frame(self._last_raw))
+        if self.last_outcome_state != "alive":
+            self.last_terminal_state = self.last_state_name
         try:
             self._last_grid = _grid_from_raw(self._last_raw)
         except ValueError:
@@ -63,7 +77,11 @@ class ArcGridEnvironment:
             state = getattr(self._last_raw, "state", None)
             state_name = str(getattr(state, "value", state))
             self.last_terminal_state = state_name
+            if self.last_outcome_state == "alive":
+                self.last_outcome_state = "end_game"
+                self.last_outcome_polarity = "unknown"
             self._last_raw = self.env.reset()
+            self._update_progress_fields(self._last_raw)
             self.reset_count += 1
             self.skipped_terminal_steps += 1
             self.last_step_was_reset_boundary = True
@@ -139,3 +157,56 @@ def _grid_from_raw(raw: Any) -> np.ndarray:
     if array.ndim != 2:
         raise ValueError(f"expected 2D ARC grid frame, got shape {array.shape}")
     return array
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _state_name(raw: Any) -> str | None:
+    state = getattr(raw, "state", None)
+    if state is None:
+        return None
+    return str(getattr(state, "value", state))
+
+
+def _game_id(raw: Any) -> str | None:
+    value = getattr(raw, "game_id", None)
+    return None if value in (None, "") else str(value)
+
+
+def _update_progress_fields(self, raw: Any) -> None:
+    self.last_state_name = _state_name(raw)
+    self.last_levels_completed = _as_int(getattr(raw, "levels_completed", 0), default=self.last_levels_completed)
+    self.last_win_levels = _as_int(getattr(raw, "win_levels", 0), default=self.last_win_levels)
+    self.last_full_game_id = _game_id(raw)
+
+
+def _raw_has_usable_frame(raw: Any) -> bool:
+    frame = getattr(raw, "frame", raw)
+    if isinstance(frame, list):
+        if not frame:
+            return False
+        frame = frame[0]
+    try:
+        array = np.asarray(frame)
+    except Exception:
+        return False
+    return bool(array.ndim == 2 and array.size > 0)
+
+
+def _infer_outcome_fields(raw: Any, *, frame_available: bool) -> tuple[str, str]:
+    state_name = (_state_name(raw) or "").upper()
+    if state_name == "WIN":
+        return "game_won", "positive"
+    if state_name == "GAME_OVER":
+        return "dead", "negative"
+    if frame_available:
+        return "alive", "neutral"
+    return "end_game", "unknown"
+
+
+ArcGridEnvironment._update_progress_fields = _update_progress_fields

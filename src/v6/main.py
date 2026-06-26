@@ -214,10 +214,16 @@ class V6System:
         serialized_context_signature = json.dumps(list(prediction_context_signature))
         action_signature = f"a{int(action)}"
         actual_family_id = None if actual_family is None else str(actual_family)
+        outcome_state = str(getattr(self.env, "last_outcome_state", "alive") or "alive")
+        outcome_polarity = str(getattr(self.env, "last_outcome_polarity", "neutral") or "neutral")
+        is_terminal_outcome = outcome_state in {"game_won", "dead", "end_game"}
+        is_success_outcome = outcome_state == "game_won"
+        is_failure_outcome = outcome_state == "dead"
         memory_counts = self._build_isf_memory_counts(
             delta_id=str(delta.id),
             actual_family_id=actual_family_id,
             context_signature=serialized_context_signature,
+            outcome_state=outcome_state,
         )
         reward = getattr(self.env, "last_reward", None)
         terminated = bool(getattr(self.env, "last_terminal_state", None))
@@ -249,6 +255,8 @@ class V6System:
             context_signature=serialized_context_signature,
             memory_counts=memory_counts,
             graph_counts=isf_graph_counts,
+            outcome_state=outcome_state,
+            outcome_polarity=outcome_polarity,
         )
         carrier_signature, carrier_source = extract_carrier_signature(
             before_observation=observation_before,
@@ -394,6 +402,11 @@ class V6System:
             efficiency_normalized_solve_efficiency=efficiency_event.normalized_solve_efficiency,
             efficiency_equivalent_outcome_cost_gap=efficiency_event.equivalent_outcome_cost_gap,
             efficiency_future_option_gain_per_cost=efficiency_event.future_option_gain_per_cost,
+            outcome_state=outcome_state,
+            outcome_polarity=outcome_polarity,
+            is_terminal_outcome=is_terminal_outcome,
+            is_success_outcome=is_success_outcome,
+            is_failure_outcome=is_failure_outcome,
         )
         interaction = Interaction(
             id=interaction_id,
@@ -436,6 +449,11 @@ class V6System:
             efficiency_normalized_solve_efficiency=efficiency_event.normalized_solve_efficiency,
             efficiency_equivalent_outcome_cost_gap=efficiency_event.equivalent_outcome_cost_gap,
             efficiency_future_option_gain_per_cost=efficiency_event.future_option_gain_per_cost,
+            outcome_state=outcome_state,
+            outcome_polarity=outcome_polarity,
+            is_terminal_outcome=is_terminal_outcome,
+            is_success_outcome=is_success_outcome,
+            is_failure_outcome=is_failure_outcome,
         )
         self.connection.execute(
             """
@@ -473,7 +491,12 @@ class V6System:
                 efficiency_best_known_cost_for_outcome = ?,
                 efficiency_normalized_solve_efficiency = ?,
                 efficiency_equivalent_outcome_cost_gap = ?,
-                efficiency_future_option_gain_per_cost = ?
+                efficiency_future_option_gain_per_cost = ?,
+                outcome_state = ?,
+                outcome_polarity = ?,
+                is_terminal_outcome = ?,
+                is_success_outcome = ?,
+                is_failure_outcome = ?
             WHERE id = ?
             """,
             (
@@ -510,6 +533,11 @@ class V6System:
                 interaction.efficiency_normalized_solve_efficiency,
                 interaction.efficiency_equivalent_outcome_cost_gap,
                 interaction.efficiency_future_option_gain_per_cost,
+                interaction.outcome_state,
+                interaction.outcome_polarity,
+                int(bool(interaction.is_terminal_outcome)),
+                int(bool(interaction.is_success_outcome)),
+                int(bool(interaction.is_failure_outcome)),
                 interaction.id,
             ),
         )
@@ -517,6 +545,7 @@ class V6System:
             delta_id=str(delta.id),
             actual_family_id=actual_family_id,
             context_signature=serialized_context_signature,
+            outcome_state=outcome_state,
         )
         self._add_carrier_edges(
             interaction_id=interaction.id,
@@ -667,6 +696,7 @@ class V6System:
         delta_id: str | None,
         actual_family_id: str | None,
         context_signature: str | None,
+        outcome_state: str | None,
     ) -> dict[str, int]:
         counts: dict[str, int] = {}
         if delta_id:
@@ -678,6 +708,12 @@ class V6System:
         if context_signature and actual_family_id:
             key = f"context_family:{context_signature}|{actual_family_id}"
             counts[key] = int(self._isf_counts.get(key, 0))
+        if outcome_state:
+            key = f"outcome_state:{outcome_state}"
+            counts[key] = int(self._isf_counts.get(key, 0))
+        if context_signature and outcome_state:
+            key = f"context_outcome:{context_signature}|{outcome_state}"
+            counts[key] = int(self._isf_counts.get(key, 0))
         return counts
 
     def _update_isf_counts(
@@ -686,6 +722,7 @@ class V6System:
         delta_id: str | None,
         actual_family_id: str | None,
         context_signature: str | None,
+        outcome_state: str | None,
     ) -> None:
         if delta_id:
             key = f"delta_id:{delta_id}"
@@ -698,6 +735,12 @@ class V6System:
             self._isf_counts[key] = int(self._isf_counts.get(key, 0)) + 1
         if context_signature and actual_family_id:
             key = f"context_family:{context_signature}|{actual_family_id}"
+            self._isf_counts[key] = int(self._isf_counts.get(key, 0)) + 1
+        if outcome_state:
+            key = f"outcome_state:{outcome_state}"
+            self._isf_counts[key] = int(self._isf_counts.get(key, 0)) + 1
+        if context_signature and outcome_state:
+            key = f"context_outcome:{context_signature}|{outcome_state}"
             self._isf_counts[key] = int(self._isf_counts.get(key, 0)) + 1
 
     def _add_prediction_explanation_edges(

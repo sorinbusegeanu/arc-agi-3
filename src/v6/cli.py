@@ -289,7 +289,7 @@ def build_parser() -> argparse.ArgumentParser:
     contingency_memory.add_argument("--since", default="")
     contingency_memory.add_argument("--until", default="")
     contingency_memory.add_argument("--streaming", action="store_true")
-    contingency_memory.add_argument("--manifest-out", default="runs/v6/v06/input_manifest.json")
+    contingency_memory.add_argument("--manifest-out", default=None)
     contingency_memory.add_argument("--manifest-in", default=None)
     contingency_memory.add_argument("--progress-every", type=int, default=100000)
     contingency_memory.add_argument("--example-limit", type=int, default=5)

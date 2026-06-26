@@ -5,6 +5,7 @@ import sqlite3
 from pathlib import Path
 
 import v6.continuous_research as continuous_research
+import v6.evaluation.interaction_sampling as interaction_sampling
 from v6.continuous_research import ContinuousResearchConfig, run_continuous_research
 
 
@@ -157,6 +158,22 @@ def _write_sampling_fixture(
                 "ramp_event_count": 1,
                 "ramp_events": [{"target_workers": 3, "ram_used_percent": 43.0, "seconds_since_start": 20.0}],
             },
+                "level_completion_records": [
+                    {
+                        "game_id": "tt01",
+                        "level_id": "level_0001",
+                        "level_name": "level_0001",
+                        "completed": True,
+                        "success": True,
+                        "seed": 0,
+                        "sampler": "mixed",
+                        "steps_used": None,
+                    }
+                ],
+                "levels_successfully_completed_per_epoch": 1,
+                "games_solved_per_epoch": 0,
+                "solved_games": [],
+                "completed_levels_by_game": {"tt01": 1},
         },
             indent=2,
         ),
@@ -290,8 +307,98 @@ def test_epoch_status_and_suite_summary_exist_and_memory_continuity_is_written(t
     assert status["H01"] is not None
     assert status["H02"] is not None
     assert status["H03"] is not None
+    assert status["levels_successfully_completed_per_epoch"] == 1
+    assert status["games_solved_per_epoch"] == 0
+    assert status["solved_games"] == []
     assert summary["H04 decision"] in {"INCONCLUSIVE", "PARTIALLY_VALID", "VALID", "INVALID"}
+    assert summary["levels_successfully_completed_per_epoch"] == 1
+    assert summary["games_solved_per_epoch"] == 0
+    assert summary["solved_games"] == []
+    assert summary["completed_levels_by_game"] == {"tt01": 1}
     assert continuity["continuity_valid"] is True
+
+
+def test_compute_epoch_completion_counters_case_a_all_levels_completed(monkeypatch) -> None:
+    monkeypatch.setattr(interaction_sampling, "expected_levels_by_game", lambda: {"ga01": 3})
+    result = interaction_sampling.compute_epoch_completion_counters(
+        [
+            {"game_id": "ga01", "level_id": "level_0001", "completed": True},
+            {"game_id": "ga01", "level_id": "level_0002", "completed": True},
+            {"game_id": "ga01", "level_id": "level_0003", "completed": True},
+        ]
+    )
+    assert result["levels_successfully_completed_per_epoch"] == 3
+    assert result["games_solved_per_epoch"] == 1
+    assert result["solved_games"] == ["ga01"]
+    assert result["completed_levels_by_game"] == {"ga01": 3}
+
+
+def test_compute_epoch_completion_counters_case_b_partial_game(monkeypatch) -> None:
+    monkeypatch.setattr(interaction_sampling, "expected_levels_by_game", lambda: {"ga01": 3})
+    result = interaction_sampling.compute_epoch_completion_counters(
+        [
+            {"game_id": "ga01", "level_id": "level_0001", "completed": True},
+            {"game_id": "ga01", "level_id": "level_0002", "completed": True},
+        ]
+    )
+    assert result["levels_successfully_completed_per_epoch"] == 2
+    assert result["games_solved_per_epoch"] == 0
+    assert result["solved_games"] == []
+    assert result["completed_levels_by_game"] == {"ga01": 2}
+
+
+def test_compute_epoch_completion_counters_case_c_mixed_games(monkeypatch) -> None:
+    monkeypatch.setattr(interaction_sampling, "expected_levels_by_game", lambda: {"ga01": 2, "gb01": 2})
+    result = interaction_sampling.compute_epoch_completion_counters(
+        [
+            {"game_id": "ga01", "level_id": "level_0001", "completed": True},
+            {"game_id": "ga01", "level_id": "level_0002", "completed": True},
+            {"game_id": "gb01", "level_id": "level_0001", "completed": True},
+        ]
+    )
+    assert result["levels_successfully_completed_per_epoch"] == 3
+    assert result["games_solved_per_epoch"] == 1
+    assert result["solved_games"] == ["ga01"]
+    assert result["completed_levels_by_game"] == {"ga01": 2, "gb01": 1}
+
+
+def test_compute_epoch_completion_counters_case_d_deduplicates_duplicate_level_records(monkeypatch) -> None:
+    monkeypatch.setattr(interaction_sampling, "expected_levels_by_game", lambda: {"ga01": 2})
+    result = interaction_sampling.compute_epoch_completion_counters(
+        [
+            {"game_id": "ga01", "level_id": "level_0001", "completed": True, "sampler": "a"},
+            {"game_id": "ga01", "level_id": "level_0001", "completed": True, "sampler": "b"},
+            {"game_id": "ga01", "level_id": "level_0002", "success": True, "sampler": "a"},
+        ]
+    )
+    assert result["levels_successfully_completed_per_epoch"] == 2
+    assert result["games_solved_per_epoch"] == 1
+    assert result["solved_games"] == ["ga01"]
+    assert result["completed_levels_by_game"] == {"ga01": 2}
+
+
+def test_manifest_tracks_run_wide_completion_totals(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        continuous_research,
+        "run_interaction_sampling_v05c",
+        lambda config: _write_sampling_fixture(Path(config.output_dir), global_step_offset=int(config.global_step_offset), stable_support=25),
+    )
+    manifest = run_continuous_research(
+        ContinuousResearchConfig(
+            experiment_name="exp",
+            games="tt01",
+            samplers="mixed",
+            seeds="0",
+            steps_per_epoch=5000,
+            max_epochs=1,
+            horizon=10,
+            context_depth=1,
+            output_dir=str(tmp_path / "continuous"),
+        )
+    )
+    assert manifest["total_levels_successfully_completed"] == 1
+    assert manifest["total_games_solved"] == 0
+    assert manifest["games_solved_by_epoch"] == {"epoch_0001": []}
 
 
 def test_continuous_run_passes_fast_postprocessing_into_sampling(tmp_path: Path, monkeypatch) -> None:
@@ -387,18 +494,18 @@ def test_continuous_run_halves_previous_workers_and_records_ram_start(tmp_path: 
     )
 
     assert captured[0]["workers"] == 12
-    assert captured[0]["initial_workers"] == 6
-    assert captured[0]["initial_worker_ramp_delay_seconds"] == 20.0
+    assert captured[0]["initial_workers"] == 1
+    assert captured[0]["initial_worker_ramp_delay_seconds"] == 0.0
     assert captured[0]["per_worker_ramp_delay_seconds"] == 5.0
     assert captured[1]["workers"] == 12
-    assert captured[1]["initial_workers"] == 6
-    assert captured[1]["initial_worker_ramp_delay_seconds"] == 20.0
+    assert captured[1]["initial_workers"] == 1
+    assert captured[1]["initial_worker_ramp_delay_seconds"] == 0.0
     assert captured[1]["per_worker_ramp_delay_seconds"] == 5.0
     epoch_start = json.loads((root / "epochs" / "epoch_0002" / "status" / "epoch_start.json").read_text(encoding="utf-8"))
     assert epoch_start["requested_workers"] == 12
-    assert epoch_start["initial_epoch_workers"] == 6
+    assert epoch_start["initial_epoch_workers"] == 1
     assert epoch_start["ram_ramp_threshold_percent"] == 85.0
-    assert epoch_start["initial_worker_ramp_delay_seconds"] == 20.0
+    assert epoch_start["initial_worker_ramp_delay_seconds"] == 0.0
     assert epoch_start["per_worker_ramp_delay_seconds"] == 5.0
     assert "ram_used_percent" in epoch_start["ram_snapshot_at_epoch_start"]
 

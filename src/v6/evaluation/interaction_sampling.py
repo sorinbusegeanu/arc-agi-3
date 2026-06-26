@@ -4,6 +4,7 @@ import csv
 import inspect
 import json
 import os
+import re
 import sqlite3
 import sys
 import shutil
@@ -48,6 +49,11 @@ V05C_GAME_PRESETS = {
 }
 DEFAULT_HIGH_REPLAY_PRIORITY_THRESHOLD = 0.70
 DEFAULT_STABLE_TRANSFORMATION_FAMILY_SUPPORT = 5
+ROOT_DIR = Path(__file__).resolve().parents[3]
+GAMES_MD_CANDIDATES = (
+    ROOT_DIR / "GAMES.md",
+    ROOT_DIR / "other_repos" / "arc-interactive" / "GAMES.md",
+)
 
 
 @dataclass(frozen=True)
@@ -141,6 +147,8 @@ def run_interaction_sampling_v05c(config: InteractionSamplingConfig) -> list[dic
     best = best_by_game(rows)
     family_summary = summary_by_family(best)
     temporal_milestones = _collect_temporal_milestones(config, sampling_root)
+    level_completion_records = _collect_level_completion_records(config, sampling_root)
+    epoch_completion = compute_epoch_completion_counters(level_completion_records)
     payload = {
         "runs": rows,
         "sampler_comparison": comparison,
@@ -160,6 +168,8 @@ def run_interaction_sampling_v05c(config: InteractionSamplingConfig) -> list[dic
         "memory_output_dir": config.memory_output_dir,
         "worker_execution": worker_execution,
         "temporal_milestones": temporal_milestones,
+        "level_completion_records": level_completion_records,
+        **epoch_completion,
         "forbidden_features_used_during_sampling": False,
         "efficiency_diagnostics_enabled": not bool(config.fast_postprocessing),
         "efficiency_used_for_sampling": False,
@@ -652,6 +662,10 @@ def _run_sampling_job(job: dict) -> dict:
         efficiency_mean_future_option_gain_per_cost=efficiency_summary.get("mean_future_option_gain_per_cost"),
         **{f"graph_edge_{edge_type}_count": int(count) for edge_type, count in edge_counts.items()},
         graph_edge_total_count=int(sum(edge_counts.values())),
+        final_state=getattr(env, "last_state_name", None),
+        final_levels_completed=int(getattr(env, "last_levels_completed", 0) or 0),
+        final_win_levels=int(getattr(env, "last_win_levels", 0) or 0),
+        final_full_game_id=getattr(env, "last_full_game_id", None),
     )
     if contradiction_summary:
         db_path.with_name("context_contradictions.json").write_text(json.dumps(contradiction_summary, indent=2), encoding="utf-8")
@@ -1125,6 +1139,17 @@ def _aggregate_seed_rows(seed_rows: list[dict], config: InteractionSamplingConfi
         "collapse_count": sums["collapse_count"],
         "non_preserve_count": sums["non_preserve_count"],
         "non_preserve_ratio": sums["non_preserve_count"] / future_count,
+        "levels_successfully_completed": int(
+            max(
+                max(
+                    int(row.get("final_levels_completed", 0) or 0),
+                    int(row.get("final_win_levels", 0) or 0),
+                    1 if str(row.get("final_state") or "") == "WIN" else 0,
+                )
+                for row in seed_rows
+            )
+        ),
+        "game_completed": any(_metadata_indicates_game_completed(row) for row in seed_rows),
     }
 
 
@@ -1453,6 +1478,105 @@ def _read_sampling_metadata(path: Path) -> dict:
         except sqlite3.DatabaseError:
             return {}
     return {str(key): json.loads(value) for key, value in rows}
+
+
+def expected_levels_by_game() -> dict[str, int]:
+    for path in GAMES_MD_CANDIDATES:
+        counts = _parse_expected_levels_from_games_md(path)
+        if counts:
+            return counts
+    return {}
+
+
+def _parse_expected_levels_from_games_md(path: Path) -> dict[str, int]:
+    if not path.exists():
+        return {}
+    counts: dict[str, int] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.startswith("|"):
+            continue
+        parts = [item.strip() for item in line.split("|")[1:-1]]
+        if len(parts) < 4:
+            continue
+        game_id = parts[0]
+        if not re.fullmatch(r"[a-z]{2}\d{2}", game_id):
+            continue
+        try:
+            counts[game_id] = int(parts[3])
+        except ValueError:
+            continue
+    return counts
+
+
+def compute_epoch_completion_counters(records: list[dict[str, object]]) -> dict[str, object]:
+    expected_counts = expected_levels_by_game()
+    unique_records: dict[tuple[str, str], dict[str, object]] = {}
+    for record in records:
+        game_id = str(record.get("game_id") or "").strip()
+        level_id = str(record.get("level_id") or record.get("level_name") or "").strip()
+        if not game_id or not level_id:
+            continue
+        completed = record.get("completed")
+        if completed is None:
+            completed = record.get("success")
+        if not bool(completed):
+            continue
+        unique_records.setdefault((game_id, level_id), dict(record))
+    completed_levels_by_game: dict[str, int] = {}
+    for game_id, _level_id in sorted(unique_records):
+        completed_levels_by_game[game_id] = int(completed_levels_by_game.get(game_id, 0) + 1)
+    solved_games = sorted(
+        game_id
+        for game_id, completed_count in completed_levels_by_game.items()
+        if game_id in expected_counts and int(completed_count) >= int(expected_counts[game_id])
+    )
+    return {
+        "levels_successfully_completed_per_epoch": len(unique_records),
+        "games_solved_per_epoch": len(solved_games),
+        "solved_games": solved_games,
+        "completed_levels_by_game": completed_levels_by_game,
+    }
+
+
+def _metadata_indicates_game_completed(metadata: dict[str, object]) -> bool:
+    final_state = str(metadata.get("final_state") or "")
+    final_levels_completed = int(metadata.get("final_levels_completed", 0) or 0)
+    final_win_levels = int(metadata.get("final_win_levels", 0) or 0)
+    return final_state == "WIN" or (final_win_levels > 0 and final_levels_completed >= final_win_levels)
+
+
+def _collect_level_completion_records(config: InteractionSamplingConfig, sampling_root: Path) -> list[dict[str, object]]:
+    records: list[dict[str, object]] = []
+    for game in config.games:
+        for sampler_name in config.samplers:
+            for seed in config.seeds:
+                path = sampling_db_path(sampling_root, game, sampler_name, config.steps, seed)
+                if not _sampling_db_ready(path):
+                    continue
+                metadata = _read_sampling_metadata(path)
+                completed_count = max(
+                    int(metadata.get("final_levels_completed", 0) or 0),
+                    int(metadata.get("final_win_levels", 0) or 0),
+                    1 if str(metadata.get("final_state") or "") == "WIN" else 0,
+                )
+                final_state = str(metadata.get("final_state") or "")
+                for level_index in range(1, max(0, completed_count) + 1):
+                    level_name = f"level_{level_index:04d}"
+                    records.append(
+                        {
+                            "game_id": game,
+                            "level_id": level_name,
+                            "level_name": level_name,
+                            "completed": True,
+                            "success": True,
+                            "seed": int(seed),
+                            "sampler": sampler_name,
+                            "steps_used": None,
+                            "final_state": final_state,
+                            "source_run_db": str(path),
+                        }
+                    )
+    return records
 
 
 def _system_ram_snapshot() -> dict[str, float | int]:

@@ -185,6 +185,10 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
             "global_step_end": global_step_end,
             "games": suite_summary.get("game_count"),
             "interactions_this_epoch": suite_summary.get("interactions_this_epoch"),
+            "levels_successfully_completed_per_epoch": suite_summary.get("levels_successfully_completed_per_epoch"),
+            "games_solved_per_epoch": suite_summary.get("games_solved_per_epoch"),
+            "solved_games": suite_summary.get("solved_games"),
+            "completed_levels_by_game": suite_summary.get("completed_levels_by_game"),
             "disk_before_cleanup_bytes": cleanup_summary["disk_before_cleanup_bytes"],
             "disk_after_cleanup_bytes": cleanup_summary["disk_after_cleanup_bytes"],
             "disk_used_percent": disk_after["disk_used_percent"],
@@ -259,6 +263,13 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
         manifest["latest_status_path"] = str(status_dir / "epoch_status.json")
         manifest["consecutive_no_new_stable_contingencies"] = consecutive_no_new
         manifest["last_sampling_peak_workers"] = int(worker_execution.get("peak_workers", max_epoch_workers) or max_epoch_workers)
+        manifest["total_levels_successfully_completed"] = int(manifest.get("total_levels_successfully_completed", 0) or 0) + int(
+            suite_summary.get("levels_successfully_completed_per_epoch", 0) or 0
+        )
+        games_solved_by_epoch = dict(manifest.get("games_solved_by_epoch", {}) or {})
+        games_solved_by_epoch[epoch_id] = list(suite_summary.get("solved_games", []) or [])
+        manifest["games_solved_by_epoch"] = games_solved_by_epoch
+        manifest["total_games_solved"] = len({game for games in games_solved_by_epoch.values() for game in games})
         manifest.setdefault("epochs", []).append(
             {
                 "epoch_id": epoch_id,
@@ -345,6 +356,9 @@ def _load_or_initialize_manifest(config: ContinuousResearchConfig, manifest_path
         "epochs": [],
         "last_global_step_end": 0,
         "consecutive_no_new_stable_contingencies": 0,
+        "total_levels_successfully_completed": 0,
+        "total_games_solved": 0,
+        "games_solved_by_epoch": {},
     }
     _write_manifest(manifest_path, manifest)
     return manifest
@@ -416,6 +430,9 @@ def _format_epoch_status(status: dict[str, Any]) -> str:
         f"RAM at start: {float((status.get('ram_snapshot_at_epoch_start') or {}).get('ram_used_percent', 0.0) or 0.0):.2f}%\n"
         f"Games: {status.get('games')}\n"
         f"Interactions this epoch: {status.get('interactions_this_epoch')}\n"
+        f"Levels successfully completed this epoch: {status.get('levels_successfully_completed_per_epoch')}\n"
+        f"Games solved this epoch: {status.get('games_solved_per_epoch')}\n"
+        f"Solved games: {', '.join(status.get('solved_games', []) or [])}\n"
         f"Disk before cleanup: {cleanup.get('disk_before_cleanup_bytes', 0) / (1024 ** 3):.3f} GB\n"
         f"Disk after cleanup: {cleanup.get('disk_after_cleanup_bytes', 0) / (1024 ** 3):.3f} GB\n"
         f"Disk used percent: {status.get('disk_used_percent', 0.0):.2f}\n\n"
