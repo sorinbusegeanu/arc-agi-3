@@ -228,9 +228,15 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
             "emergent_future_option_motifs": h09_metrics.get("emergent_future_option_motif_count"),
             "option_attention_lift": h10_metrics.get("option_attention_lift"),
             "high_option_change_attention_rate": h10_metrics.get("high_option_change_attention_rate"),
+            "h10_replay_attention_count": h10_metrics.get("replay_attention_count"),
+            "h10_contradiction_attention_count": h10_metrics.get("contradiction_attention_count"),
             "future_option_transfer_links": h11_metrics.get("future_option_transfer_link_count"),
             "motifs_with_strong_transfer": h11_metrics.get("motifs_with_strong_transfer_count"),
             "motifs_with_promoted_concepts": h11_metrics.get("motifs_with_promoted_concept_count"),
+            "h11_emergent_motif_transfer_links": h11_metrics.get("emergent_motif_transfer_link_count"),
+            "h11_emergent_motifs_with_strong_transfer": h11_metrics.get("emergent_motifs_with_strong_transfer_count"),
+            "h11_emergent_motifs_with_promoted_concepts": h11_metrics.get("emergent_motifs_with_promoted_concept_count"),
+            "h11_non_emergent_motif_transfer_links": h11_metrics.get("non_emergent_motif_transfer_link_count"),
             "workers_requested": requested_workers,
             "workers_initial": initial_epoch_workers,
             "workers_max_epoch": max_epoch_workers,
@@ -452,10 +458,16 @@ def _format_epoch_status(status: dict[str, Any]) -> str:
         f"H10: {status.get('H10')}\n"
         f"option-attention lift: {status.get('option_attention_lift')}\n"
         f"high-option-change attention rate: {status.get('high_option_change_attention_rate')}\n\n"
+        f"replay attention count: {status.get('h10_replay_attention_count')}\n"
+        f"contradiction attention count: {status.get('h10_contradiction_attention_count')}\n\n"
         f"H11: {status.get('H11')}\n"
         f"future-option transfer links: {status.get('future_option_transfer_links')}\n"
         f"motifs with strong transfer: {status.get('motifs_with_strong_transfer')}\n"
         f"motifs with promoted concepts: {status.get('motifs_with_promoted_concepts')}\n\n"
+        f"emergent motif transfer links: {status.get('h11_emergent_motif_transfer_links')}\n"
+        f"emergent motifs with strong transfer: {status.get('h11_emergent_motifs_with_strong_transfer')}\n"
+        f"emergent motifs with promoted concepts: {status.get('h11_emergent_motifs_with_promoted_concepts')}\n"
+        f"non-emergent motif transfer links: {status.get('h11_non_emergent_motif_transfer_links')}\n\n"
         f"Cleanup:\n"
         f"deleted raw files: {cleanup.get('raw_files_deleted_count')}\n"
         f"freed: {cleanup.get('disk_freed_bytes', 0) / (1024 ** 3):.3f} GB\n\n"

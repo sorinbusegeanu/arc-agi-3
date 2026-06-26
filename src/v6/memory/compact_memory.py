@@ -2040,13 +2040,14 @@ def _ensure_current_state_schema(path: Path) -> None:
                 contradiction_score REAL,
                 high_option_change INTEGER,
                 high_attention INTEGER,
+                attention_signal_source TEXT,
                 first_seen_global_step INTEGER,
                 last_seen_global_step INTEGER
             );
             CREATE TABLE IF NOT EXISTS future_option_transfer_links (
                 motif_signature TEXT,
                 role_signature TEXT,
-                concept_signature TEXT,
+                concept_signature TEXT NOT NULL DEFAULT '__none__',
                 transfer_attempt_count INTEGER,
                 successful_transfer_count INTEGER,
                 strong_transfer_success_count INTEGER,
@@ -2105,6 +2106,7 @@ def _ensure_current_state_schema(path: Path) -> None:
         _ensure_column(connection, "role_transfer_attempts", "candidate_role_count", "INTEGER")
         _ensure_column(connection, "concept_candidates", "strong_transfer_success_count", "INTEGER")
         _ensure_column(connection, "world_model_components", "candidate_only", "INTEGER DEFAULT 0")
+        _ensure_column(connection, "future_option_attention_links", "attention_signal_source", "TEXT")
         connection.commit()
 
 

@@ -359,21 +359,75 @@ def test_h10_no_false_invalid_on_missing_low_group(tmp_path: Path) -> None:
     assert result["decision"] != "INVALID"
 
 
+def test_h10_memory_priority_diagnostic_does_not_create_attention(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_memory(memory_dir, [])
+    _seed_future_option_attention_rows(
+        memory_dir,
+        [
+            {"event_id": f"e{i}", "motif_signature": "m1", "option_delta_abs": 2.0, "replay_priority_score": 0.0, "memory_priority_score": 1.0, "contradiction_score": 0.0, "high_option_change": 1}
+            for i in range(5)
+        ],
+    )
+    result = evaluate_h10_future_option_attention(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h10", already_derived=True)
+    assert result["high_option_change_count"] == 5
+    assert result["high_attention_count"] == 0
+    assert result["decision"] in {"INCONCLUSIVE", "PARTIALLY_VALID"}
+    assert result["decision"] not in {"VALID", "INVALID"}
+
+
+def test_h10_attention_target_is_not_memory_priority(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_memory(memory_dir, [])
+    _seed_future_option_attention_rows(
+        memory_dir,
+        [
+            {"event_id": f"h{i}", "motif_signature": "mh", "option_delta_abs": 2.0, "replay_priority_score": 0.0, "memory_priority_score": 1.0, "contradiction_score": 0.0, "high_option_change": 1}
+            for i in range(5)
+        ] + [
+            {"event_id": f"l{i}", "motif_signature": "ml", "option_delta_abs": 0.0, "replay_priority_score": 0.8 if i == 0 else 0.0, "memory_priority_score": 0.0, "contradiction_score": 0.0, "high_option_change": 0}
+            for i in range(5)
+        ],
+    )
+    result = evaluate_h10_future_option_attention(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h10", already_derived=True)
+    assert result["option_attention_lift"] is None or (result["option_attention_lift"] or 0.0) <= 1.0
+    assert result["decision"] != "VALID"
+
+
+def test_h10_validates_from_replay_contradiction_attention(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_memory(memory_dir, [])
+    _seed_future_option_attention_rows(
+        memory_dir,
+        [
+            {"event_id": f"h{i}", "motif_signature": "mh", "option_delta_abs": 2.0, "replay_priority_score": 0.8, "memory_priority_score": 1.0, "contradiction_score": 0.0, "high_option_change": 1}
+            for i in range(5)
+        ] + [
+            {"event_id": f"l{i}", "motif_signature": "ml", "option_delta_abs": 0.0, "replay_priority_score": 0.8 if i == 0 else 0.0, "memory_priority_score": 0.0, "contradiction_score": 0.0, "high_option_change": 0}
+            for i in range(5)
+        ],
+    )
+    result = evaluate_h10_future_option_attention(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h10", already_derived=True)
+    assert result["high_option_change_attention_rate"] == 1.0
+    assert result["low_option_change_attention_rate"] == 0.2
+    assert (result["option_attention_lift"] or 0.0) >= 1.25
+    assert result["decision"] == "VALID"
+
+
 def test_h11_links_motifs_to_transfer_concepts(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
-    specs = _transfer_rich_specs() + [
-        {"carrier": "r_0_0", "game": "g1", "contexts": ["ctx_r_0_0_1", "ctx_r_0_0_2"], "effect": "reversible", "action": "toggle", "polarity": "neutral"},
-        {"carrier": "r_1_0", "game": "g2", "contexts": ["ctx_r_1_0_1", "ctx_r_1_0_2"], "effect": "reversible", "action": "toggle", "polarity": "neutral"},
-        {"carrier": "r_2_0", "game": "g3", "contexts": ["ctx_r_2_0_1", "ctx_r_2_0_2"], "effect": "reversible", "action": "toggle", "polarity": "neutral"},
-        {"carrier": "m_0_0", "game": "g1", "contexts": ["ctx_m_0_0_1", "ctx_m_0_0_2"], "effect": "merge", "action": "combine", "polarity": "negative"},
-        {"carrier": "m_1_0", "game": "g2", "contexts": ["ctx_m_1_0_1", "ctx_m_1_0_2"], "effect": "merge", "action": "combine", "polarity": "negative"},
-        {"carrier": "m_2_0", "game": "g3", "contexts": ["ctx_m_2_0_1", "ctx_m_2_0_2"], "effect": "merge", "action": "combine", "polarity": "negative"},
-    ]
-    _seed_memory(memory_dir, specs)
-    result = evaluate_h11_future_option_transfer_concepts(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h11")
+    _seed_memory(memory_dir, [])
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute("INSERT INTO future_option_motifs (motif_signature, motif_type, support_count, linked_event_count, linked_family_count, linked_carrier_count, linked_role_count, linked_concept_count, cross_context_count, cross_game_count, mean_option_delta, mean_abs_option_delta, mean_novelty_score, mean_reversibility_score, mean_branching_score, mean_termination_score, mean_replay_priority_score, first_seen_global_step, last_seen_global_step, motif_stability_score, is_emergent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ("m_em", "enable", 6, 6, 2, 2, 2, 1, 3, 2, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.8, 10, 20, 0.8, 1))
+        conn.execute("INSERT INTO concept_candidates (concept_signature, concept_type, support_count, linked_role_count, linked_carrier_count, linked_family_count, transfer_success_count, strong_transfer_success_count, cross_game_count, cross_context_count, compression_gain, explanatory_reach, promotion_score, first_seen_global_step, last_seen_global_step, is_promoted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ("concept:em", "x", 5, 1, 2, 2, 5, 5, 2, 2, 2.0, 4.0, 0.9, 10, 20, 1))
+        for idx in range(5):
+            conn.execute("INSERT INTO future_option_transfer_links (motif_signature, role_signature, concept_signature, transfer_attempt_count, successful_transfer_count, strong_transfer_success_count, promoted_concept_count, mean_transfer_score, mean_best_margin, first_seen_global_step, last_seen_global_step) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ("m_em", f"role:e{idx}", "concept:em", 5, 5, 5, 1, 0.9, 0.2, 10, 20))
+        conn.commit()
+    result = evaluate_h11_future_option_transfer_concepts(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h11", already_derived=True)
     assert result["future_option_transfer_link_count"] > 0
     assert result["motifs_with_strong_transfer_count"] >= 1
     assert result["motifs_with_promoted_concept_count"] >= 1
+    assert result["emergent_motif_transfer_link_count"] >= 5
     assert result["decision"] == "VALID"
 
 
@@ -386,6 +440,55 @@ def test_h11_no_valid_without_h09(tmp_path: Path) -> None:
     result = evaluate_h11_future_option_transfer_concepts(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h11")
     assert result["decision"] in {"INCONCLUSIVE", "PARTIALLY_VALID"}
     assert result["decision"] != "VALID"
+
+
+def test_h11_does_not_validate_from_non_emergent_motif_links(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_memory(memory_dir, [])
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute("INSERT INTO future_option_motifs (motif_signature, motif_type, support_count, linked_event_count, linked_family_count, linked_carrier_count, linked_role_count, linked_concept_count, cross_context_count, cross_game_count, mean_option_delta, mean_abs_option_delta, mean_novelty_score, mean_reversibility_score, mean_branching_score, mean_termination_score, mean_replay_priority_score, first_seen_global_step, last_seen_global_step, motif_stability_score, is_emergent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ("m_non", "enable", 5, 5, 1, 1, 1, 1, 2, 2, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.8, 10, 20, 0.8, 0))
+        for idx in range(5):
+            conn.execute("INSERT INTO future_option_transfer_links (motif_signature, role_signature, concept_signature, transfer_attempt_count, successful_transfer_count, strong_transfer_success_count, promoted_concept_count, mean_transfer_score, mean_best_margin, first_seen_global_step, last_seen_global_step) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ("m_non", f"role:{idx}", f"concept:{idx}", 5, 5, 5, 1, 0.9, 0.2, 10, 20))
+        conn.execute("INSERT INTO concept_candidates (concept_signature, concept_type, support_count, linked_role_count, linked_carrier_count, linked_family_count, transfer_success_count, strong_transfer_success_count, cross_game_count, cross_context_count, compression_gain, explanatory_reach, promotion_score, first_seen_global_step, last_seen_global_step, is_promoted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ("concept:0", "x", 5, 1, 2, 2, 5, 5, 2, 2, 2.0, 4.0, 0.9, 10, 20, 1))
+        conn.commit()
+    result = evaluate_h11_future_option_transfer_concepts(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h11", already_derived=True)
+    assert result["future_option_transfer_link_count"] > 0
+    assert result["non_emergent_motif_transfer_link_count"] > 0
+    assert result["emergent_motif_transfer_link_count"] == 0
+    assert result["decision"] != "VALID"
+    assert any("emergent future-option motifs" in item for item in result["missing_evidence"])
+
+
+def test_h11_validates_only_when_emergent_motif_has_transfer_concept_evidence(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_memory(memory_dir, [])
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute("INSERT INTO future_option_motifs (motif_signature, motif_type, support_count, linked_event_count, linked_family_count, linked_carrier_count, linked_role_count, linked_concept_count, cross_context_count, cross_game_count, mean_option_delta, mean_abs_option_delta, mean_novelty_score, mean_reversibility_score, mean_branching_score, mean_termination_score, mean_replay_priority_score, first_seen_global_step, last_seen_global_step, motif_stability_score, is_emergent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ("m_non", "enable", 5, 5, 1, 1, 1, 1, 2, 2, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.8, 10, 20, 0.8, 0))
+        conn.execute("INSERT INTO future_option_motifs (motif_signature, motif_type, support_count, linked_event_count, linked_family_count, linked_carrier_count, linked_role_count, linked_concept_count, cross_context_count, cross_game_count, mean_option_delta, mean_abs_option_delta, mean_novelty_score, mean_reversibility_score, mean_branching_score, mean_termination_score, mean_replay_priority_score, first_seen_global_step, last_seen_global_step, motif_stability_score, is_emergent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ("m_em", "enable", 5, 5, 1, 1, 1, 1, 2, 2, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.8, 10, 20, 0.8, 1))
+        conn.execute("INSERT INTO concept_candidates (concept_signature, concept_type, support_count, linked_role_count, linked_carrier_count, linked_family_count, transfer_success_count, strong_transfer_success_count, cross_game_count, cross_context_count, compression_gain, explanatory_reach, promotion_score, first_seen_global_step, last_seen_global_step, is_promoted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ("concept:em", "x", 5, 1, 2, 2, 5, 5, 2, 2, 2.0, 4.0, 0.9, 10, 20, 1))
+        conn.execute("INSERT INTO future_option_transfer_links (motif_signature, role_signature, concept_signature, transfer_attempt_count, successful_transfer_count, strong_transfer_success_count, promoted_concept_count, mean_transfer_score, mean_best_margin, first_seen_global_step, last_seen_global_step) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ("m_non", "role:n", "concept:n", 5, 5, 5, 1, 0.9, 0.2, 10, 20))
+        for idx in range(5):
+            conn.execute("INSERT INTO future_option_transfer_links (motif_signature, role_signature, concept_signature, transfer_attempt_count, successful_transfer_count, strong_transfer_success_count, promoted_concept_count, mean_transfer_score, mean_best_margin, first_seen_global_step, last_seen_global_step) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ("m_em", f"role:e{idx}", "concept:em", 5, 5, 5, 1, 0.9, 0.2, 10, 20))
+        conn.commit()
+    result = evaluate_h11_future_option_transfer_concepts(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h11", already_derived=True)
+    assert result["emergent_motif_transfer_link_count"] >= 5
+    assert result["emergent_motifs_with_strong_transfer_count"] >= 1
+    assert result["emergent_motifs_with_promoted_concept_count"] >= 1
+    assert result["decision"] == "VALID"
+
+
+def test_future_option_transfer_links_uses_sentinel_concept(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_memory(memory_dir, [
+        {"carrier": "s1", "game": "g1", "contexts": ["ctx1", "ctx2"], "effect": "enable", "action": "open", "polarity": "positive"},
+        {"carrier": "s2", "game": "g2", "contexts": ["ctx3", "ctx4"], "effect": "enable", "action": "open", "polarity": "positive"},
+    ])
+    evaluate_h11_future_option_transfer_concepts(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h11")
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        null_count = conn.execute("SELECT COUNT(*) FROM future_option_transfer_links WHERE concept_signature IS NULL").fetchone()[0]
+        sentinel_count = conn.execute("SELECT COUNT(*) FROM future_option_transfer_links WHERE concept_signature='__none__'").fetchone()[0]
+    assert null_count == 0
+    assert sentinel_count >= 0
 
 
 def test_suite_includes_h01_h11(tmp_path: Path) -> None:
@@ -616,10 +719,16 @@ def test_epoch_status_format_includes_h05_h08() -> None:
         "H10": "VALID",
         "option_attention_lift": 2.0,
         "high_option_change_attention_rate": 0.8,
+        "h10_replay_attention_count": 5,
+        "h10_contradiction_attention_count": 2,
         "H11": "VALID",
         "future_option_transfer_links": 4,
         "motifs_with_strong_transfer": 2,
         "motifs_with_promoted_concepts": 1,
+        "h11_emergent_motif_transfer_links": 3,
+        "h11_emergent_motifs_with_strong_transfer": 1,
+        "h11_emergent_motifs_with_promoted_concepts": 1,
+        "h11_non_emergent_motif_transfer_links": 1,
         "cleanup": {"disk_before_cleanup_bytes": 0, "disk_after_cleanup_bytes": 0, "raw_files_deleted_count": 0, "disk_freed_bytes": 0},
         "deltas": {"stable_contingency_count_delta": 1},
         "next_action": "continue epoch_0002",
@@ -641,6 +750,10 @@ def test_epoch_status_format_includes_h05_h08() -> None:
     assert "future-option events" in text
     assert "option-attention lift" in text
     assert "future-option transfer links" in text
+    assert "replay attention count" in text
+    assert "contradiction attention count" in text
+    assert "emergent motif transfer links" in text
+    assert "non-emergent motif transfer links" in text
 
 
 def _transfer_rich_specs() -> list[dict[str, object]]:
@@ -803,14 +916,25 @@ def _seed_future_option_attention_rows(memory_dir: Path, rows: list[dict[str, ob
     paths = ensure_memory_layout(memory_dir)
     with sqlite3.connect(paths.current_state) as conn:
         for row in rows:
+            replay_priority = float(row["replay_priority_score"])
+            contradiction_score = float(row["contradiction_score"])
+            high_attention = 1 if (replay_priority >= 0.50 or contradiction_score >= 0.50) else 0
+            if replay_priority >= 0.50 and contradiction_score >= 0.50:
+                attention_signal_source = "replay_priority+contradiction"
+            elif replay_priority >= 0.50:
+                attention_signal_source = "replay_priority"
+            elif contradiction_score >= 0.50:
+                attention_signal_source = "contradiction"
+            else:
+                attention_signal_source = "none"
             conn.execute(
                 """
                 INSERT INTO future_option_attention_links (
                     event_id, motif_signature, owner_type, owner_key, option_delta_abs, replay_priority_score,
                     memory_priority_score, contradiction_score, high_option_change, high_attention,
-                    first_seen_global_step, last_seen_global_step
+                    attention_signal_source, first_seen_global_step, last_seen_global_step
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(row["event_id"]),
@@ -818,11 +942,12 @@ def _seed_future_option_attention_rows(memory_dir: Path, rows: list[dict[str, ob
                     "synthetic",
                     str(row["event_id"]),
                     float(row["option_delta_abs"]),
-                    float(row["replay_priority_score"]),
+                    replay_priority,
                     float(row["memory_priority_score"]),
-                    float(row["contradiction_score"]),
+                    contradiction_score,
                     int(row["high_option_change"]),
-                    int(row["high_attention"]),
+                    high_attention,
+                    attention_signal_source,
                     10,
                     20,
                 ),

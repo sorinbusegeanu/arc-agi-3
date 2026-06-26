@@ -45,6 +45,7 @@ def evaluate_h10_future_option_attention(
     result = {
         "hypothesis_id": "H10",
         "evidence_source": "compact_memory",
+        "h10_attention_target_definition": "high_attention is based on replay_priority_score or contradiction_score only; derived memory_priority_score is diagnostic and is not used for validation.",
         "future_option_attention_link_count": len(rows),
         "high_option_change_count": len(high_rows),
         "high_attention_count": len(high_attention_rows),
@@ -58,6 +59,9 @@ def evaluate_h10_future_option_attention(
         "mean_replay_priority_low_option_change": _mean([row.get("replay_priority_score") for row in low_rows]),
         "mean_memory_priority_high_option_change": _mean([row.get("memory_priority_score") for row in high_rows]),
         "mean_memory_priority_low_option_change": _mean([row.get("memory_priority_score") for row in low_rows]),
+        "replay_attention_count": sum(1 for row in rows if float(row.get("replay_priority_score") or 0.0) >= 0.50),
+        "contradiction_attention_count": sum(1 for row in rows if float(row.get("contradiction_score") or 0.0) >= 0.50),
+        "replay_or_contradiction_attention_count": len(high_attention_rows),
         "missing_evidence": [],
     }
     if not rows:
@@ -87,6 +91,7 @@ def evaluate_h10_future_option_attention(
         key: result.get(key)
         for key in (
             "future_option_attention_link_count",
+            "h10_attention_target_definition",
             "high_option_change_count",
             "high_attention_count",
             "high_option_change_attention_count",
@@ -95,6 +100,9 @@ def evaluate_h10_future_option_attention(
             "low_option_change_attention_rate",
             "option_attention_lift",
             "option_attention_lift_unbounded",
+            "replay_attention_count",
+            "contradiction_attention_count",
+            "replay_or_contradiction_attention_count",
             "mean_replay_priority_high_option_change",
             "mean_replay_priority_low_option_change",
             "mean_memory_priority_high_option_change",
@@ -114,9 +122,12 @@ def _write(output_dir: Path, result: dict[str, Any]) -> None:
     (output_dir / "h10_future_option_attention_report.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     text = (
         f"H10 decision: {result.get('decision')}\n"
+        f"attention target: {result.get('h10_attention_target_definition')}\n"
         f"option-attention lift: {result.get('option_attention_lift')}\n"
         f"high-option-change attention rate: {result.get('high_option_change_attention_rate')}\n"
         f"low-option-change attention rate: {result.get('low_option_change_attention_rate')}\n"
+        f"replay attention count: {result.get('replay_attention_count')}\n"
+        f"contradiction attention count: {result.get('contradiction_attention_count')}\n"
     )
     (output_dir / "h10_future_option_attention_report.txt").write_text(text, encoding="utf-8")
     (output_dir / "h10_future_option_attention.md").write_text("```\n" + text + "```\n", encoding="utf-8")

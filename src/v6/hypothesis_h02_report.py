@@ -154,6 +154,10 @@ H02_DEFAULTS: dict[str, Any] = {
     "carrier_timing_note": "",
     "raw_h02_evidence_incomplete": False,
     "compact_h02_fallback_used": False,
+    "direct_replay_lift_pass": False,
+    "direct_replay_lift_invalid": False,
+    "aggregate_invalid_core": False,
+    "h02a_decision_source": "insufficient_evidence",
     "evidence_for": [],
     "evidence_against": [],
     "missing_evidence": [],
@@ -369,59 +373,26 @@ def evaluate_h02_prediction_violation_attention(
         and result.get("direct_replay_lift_available") is True
         and _gt(result.get("prediction_violation_replay_lift"), 1.0) is False
     )
+    result["direct_replay_lift_pass"] = bool(direct_replay_lift_pass)
+    result["direct_replay_lift_invalid"] = bool(direct_replay_lift_invalid)
+    result["aggregate_invalid_core"] = bool(invalid_core)
 
     compact_has_prediction_error = _gt(result.get("mean_isf_prediction_error"), 0.0) is True
     compact_has_contradiction = _gt(result.get("context_contradiction_count"), 0) is True
     compact_has_replay = _gt(result.get("memory_replay_candidate_count"), 0) is True
 
-    if raw_h02_incomplete and not compact_has_prediction_error and not compact_has_contradiction and not compact_has_replay:
-        result["h02a_replay_attention_decision"] = "INCONCLUSIVE"
-        result["h02a_replay_attention_conclusion"] = (
-            "H02A remains inconclusive because raw aggregate evidence is incomplete and compact memory does not provide enough replay/contradiction evidence."
-        )
-        result["missing_evidence"].append(
-            "H02 raw aggregate evidence incomplete and compact replay/contradiction evidence insufficient."
-        )
-    elif raw_h02_incomplete and compact_has_replay and not compact_has_prediction_error:
-        result["h02a_replay_attention_decision"] = "PARTIALLY_VALID"
-        result["h02a_replay_attention_conclusion"] = (
-            "H02A is partially supported from compact replay evidence, but direct prediction-violation linkage is unavailable."
-        )
-        result["missing_evidence"].append("Direct prediction-violation to replay-priority linkage unavailable.")
-    elif invalid_core or direct_replay_lift_invalid:
-        result["h02a_replay_attention_decision"] = "INVALID"
-        if invalid_core:
-            result["h02a_replay_attention_conclusion"] = (
-                "H02 is not supported in this run because prediction-violation signals or replayable memory pressure are absent."
-            )
-        else:
-            result["h02a_replay_attention_conclusion"] = (
-                "H02 is not supported in this run because direct replay-lift evidence is available but does not show higher "
-                "replay priority for prediction-violating interactions."
-            )
-    elif aggregate_signals_pass and direct_replay_lift_pass:
-        result["h02a_replay_attention_decision"] = "VALID"
-        result["h02a_replay_attention_conclusion"] = (
-            "H02A is supported in this run. Prediction-violating interactions receive substantially higher replay priority "
-            "than non-violating interactions."
-        )
-    elif aggregate_signals_pass and checks["replay_candidates_present"] is True and checks["high_priority_replay_present"] is True:
-        result["h02a_replay_attention_decision"] = "PARTIALLY_VALID"
-        result["h02a_replay_attention_conclusion"] = (
-            "H02A is partially supported in this run. Aggregate prediction-violation, contradiction, and replay-candidate "
-            "signals are present, but direct replay-lift evidence is unavailable or not strong enough for full validation."
-        )
-    elif not aggregate_signals_pass and result.get("direct_replay_lift_available") is not True:
-        result["h02a_replay_attention_decision"] = "INCONCLUSIVE"
-        result["h02a_replay_attention_conclusion"] = (
-            "H02A remains inconclusive because both the aggregate signals and the direct replay-lift evidence are unavailable."
-        )
-    else:
-        result["h02a_replay_attention_decision"] = "PARTIALLY_VALID"
-        result["h02a_replay_attention_conclusion"] = (
-            "H02A has some replay/attention evidence, but the aggregate contradiction or replay-priority signals do not fully "
-            "satisfy the stronger validation conditions."
-        )
+    _decide_h02a_from_checks(
+        result=result,
+        checks=checks,
+        raw_h02_incomplete=raw_h02_incomplete,
+        compact_has_prediction_error=compact_has_prediction_error,
+        compact_has_contradiction=compact_has_contradiction,
+        compact_has_replay=compact_has_replay,
+        aggregate_signals_pass=aggregate_signals_pass,
+        direct_replay_lift_pass=direct_replay_lift_pass,
+        direct_replay_lift_invalid=direct_replay_lift_invalid,
+        invalid_core=invalid_core,
+    )
 
     timing = _evaluate_h02b_pre_carrier_timing(result, temporal_rows)
     result["h02b_pre_carrier_timing_decision"] = timing["decision"]
@@ -481,6 +452,93 @@ def _raw_h02_evidence_is_empty_or_incomplete(
         if all(value in (None, 0, 0.0, False, "") for value in aggregate_fields):
             return True
     return False
+
+
+def _decide_h02a_from_checks(
+    *,
+    result: dict[str, Any],
+    checks: dict[str, Any],
+    raw_h02_incomplete: bool,
+    compact_has_prediction_error: bool,
+    compact_has_contradiction: bool,
+    compact_has_replay: bool,
+    aggregate_signals_pass: bool,
+    direct_replay_lift_pass: bool,
+    direct_replay_lift_invalid: bool,
+    invalid_core: bool,
+) -> dict[str, Any]:
+    result["direct_replay_lift_pass"] = bool(direct_replay_lift_pass)
+    result["direct_replay_lift_invalid"] = bool(direct_replay_lift_invalid)
+    result["aggregate_invalid_core"] = bool(invalid_core)
+    if raw_h02_incomplete and not compact_has_prediction_error and not compact_has_contradiction and not compact_has_replay:
+        result["h02a_replay_attention_decision"] = "INCONCLUSIVE"
+        result["h02a_replay_attention_conclusion"] = (
+            "H02A remains inconclusive because raw aggregate evidence is incomplete and compact memory does not provide enough replay/contradiction evidence."
+        )
+        result["h02a_decision_source"] = "insufficient_evidence"
+        _append_unique(
+            result.setdefault("missing_evidence", []),
+            "H02 raw aggregate evidence incomplete and compact replay/contradiction evidence insufficient.",
+        )
+    elif raw_h02_incomplete and compact_has_replay and not compact_has_prediction_error:
+        result["h02a_replay_attention_decision"] = "PARTIALLY_VALID"
+        result["h02a_replay_attention_conclusion"] = (
+            "H02A is partially supported from compact replay evidence, but direct prediction-violation linkage is unavailable."
+        )
+        result["h02a_decision_source"] = "compact_fallback"
+        _append_unique(result.setdefault("missing_evidence", []), "Direct prediction-violation to replay-priority linkage unavailable.")
+    elif direct_replay_lift_pass:
+        result["h02a_replay_attention_decision"] = "VALID"
+        result["h02a_replay_attention_conclusion"] = (
+            "H02A is supported in this run. Direct replay-lift evidence shows prediction-violating interactions receive substantially higher replay priority than non-violating interactions."
+        )
+        result["h02a_decision_source"] = "direct_replay_lift"
+        if invalid_core:
+            _append_unique(
+                result.setdefault("missing_evidence", []),
+                "Aggregate replay/contradiction counters are unavailable or zero despite direct replay-lift evidence.",
+            )
+    elif direct_replay_lift_invalid:
+        result["h02a_replay_attention_decision"] = "INVALID"
+        result["h02a_replay_attention_conclusion"] = (
+            "H02 is not supported in this run because direct replay-lift evidence is available but does not show higher replay priority for prediction-violating interactions."
+        )
+        result["h02a_decision_source"] = "direct_replay_lift_invalid"
+    elif aggregate_signals_pass and checks["replay_candidates_present"] is True and checks["high_priority_replay_present"] is True:
+        result["h02a_replay_attention_decision"] = "PARTIALLY_VALID"
+        result["h02a_replay_attention_conclusion"] = (
+            "H02A is partially supported in this run. Aggregate prediction-violation, contradiction, and replay-candidate signals are present, but direct replay-lift evidence is unavailable or not strong enough for full validation."
+        )
+        result["h02a_decision_source"] = "aggregate_signals"
+    elif invalid_core and result.get("direct_replay_lift_available") is not True:
+        result["h02a_replay_attention_decision"] = "INVALID"
+        result["h02a_replay_attention_conclusion"] = (
+            "H02 is not supported in this run because prediction-violation signals or replayable memory pressure are absent."
+        )
+        result["h02a_decision_source"] = "aggregate_invalid_core"
+    elif invalid_core and result.get("direct_replay_lift_available") is True:
+        result["h02a_replay_attention_decision"] = "PARTIALLY_VALID"
+        result["h02a_replay_attention_conclusion"] = (
+            "H02A has positive direct replay-lift evidence, but aggregate contradiction/replay counters are incomplete or inconsistent."
+        )
+        result["h02a_decision_source"] = "aggregate_signals"
+        _append_unique(
+            result.setdefault("missing_evidence", []),
+            "Aggregate replay/contradiction counters are unavailable or zero despite direct replay-lift evidence.",
+        )
+    elif not aggregate_signals_pass and result.get("direct_replay_lift_available") is not True:
+        result["h02a_replay_attention_decision"] = "INCONCLUSIVE"
+        result["h02a_replay_attention_conclusion"] = (
+            "H02A remains inconclusive because both the aggregate signals and the direct replay-lift evidence are unavailable."
+        )
+        result["h02a_decision_source"] = "insufficient_evidence"
+    else:
+        result["h02a_replay_attention_decision"] = "PARTIALLY_VALID"
+        result["h02a_replay_attention_conclusion"] = (
+            "H02A has some replay/attention evidence, but the aggregate contradiction or replay-priority signals do not fully satisfy the stronger validation conditions."
+        )
+        result["h02a_decision_source"] = "aggregate_signals"
+    return result
 
 
 def _extract_h02_compact_metrics(memory_dir: Path) -> dict[str, Any]:
@@ -1732,12 +1790,18 @@ def _populate_evidence_lists(result: dict[str, Any]) -> None:
 
     if _gt(result.get("memory_replay_candidate_count"), 0) is True:
         evidence_for.append(f"Replay/attention evidence: replay candidates exist in memory ({int(result['memory_replay_candidate_count'])} candidates).")
+    elif result.get("direct_replay_lift_pass") is True:
+        missing_evidence.append("Aggregate replay/contradiction counters are unavailable or zero despite direct replay-lift evidence.")
     else:
         evidence_against.append("Replay/attention evidence: no replay candidates are available to show memory centrality.")
 
     lift = result.get("prediction_violation_replay_lift")
     if lift is not None:
-        if float(lift) > 1.25:
+        if result.get("direct_replay_lift_pass") is True:
+            evidence_for.append(
+                "Direct replay-lift evidence supports H02: prediction-violating interactions receive higher replay priority."
+            )
+        elif float(lift) > 1.25:
             evidence_for.append(f"Replay/attention evidence: prediction-violating interactions have replay lift {float(lift):.3f} (> 1.25).")
         else:
             evidence_against.append(f"Replay/attention evidence: prediction-violating replay lift is weak ({float(lift):.3f}).")
@@ -1767,6 +1831,11 @@ def _populate_evidence_lists(result: dict[str, Any]) -> None:
     result["evidence_for"] = evidence_for
     result["evidence_against"] = evidence_against
     result["missing_evidence"] = missing_evidence
+
+
+def _append_unique(items: list[str], value: str) -> None:
+    if value not in items:
+        items.append(value)
 
 
 def _finalize_h02_result(result: dict[str, Any], output_dir: Path) -> None:

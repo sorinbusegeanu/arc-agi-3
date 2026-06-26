@@ -6,7 +6,7 @@ from pathlib import Path
 
 from v6.main import V6Config, V6System
 from v6.memory.compact_memory import ensure_memory_layout, stable_family_int_id
-from v6.memory.compact_memory_restore import load_compact_memory_into_system
+from v6.memory.compact_memory_restore import _connect_readonly_with_retry, load_compact_memory_into_system
 
 
 class _ToggleEnv:
@@ -134,3 +134,22 @@ def test_restore_function_populates_live_objects(tmp_path: Path) -> None:
         assert len(system.memory_lifecycle.replay_candidates) == 1
     finally:
         system.close()
+
+
+def test_restore_readonly_connection_retries_on_locked_database(tmp_path: Path, monkeypatch) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_compact_memory(memory_dir)
+    real_connect = sqlite3.connect
+    calls = {"count": 0}
+
+    def flaky_connect(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] < 3:
+            raise sqlite3.OperationalError("database is locked")
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr("v6.memory.compact_memory_restore.sqlite3.connect", flaky_connect)
+    with _connect_readonly_with_retry(memory_dir / "current_state.sqlite", attempts=3, base_delay_seconds=0.0) as conn:
+        row = conn.execute("SELECT COUNT(*) FROM stable_contingencies").fetchone()
+    assert row[0] == 1
+    assert calls["count"] == 3

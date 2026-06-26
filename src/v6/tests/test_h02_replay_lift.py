@@ -7,6 +7,8 @@ from pathlib import Path
 from v6.hypothesis_h02_report import (
     DIRECT_LINKAGE_SHARD_LIMIT_MESSAGE,
     DIRECT_LINKAGE_UNAVAILABLE_MESSAGE,
+    H02_DEFAULTS,
+    _decide_h02a_from_checks,
     compute_prediction_violation_replay_lift_from_existing_db,
     evaluate_h02_prediction_violation_attention,
 )
@@ -361,6 +363,122 @@ def test_h02_carriers_present_do_not_invalidate_replay_attention(tmp_path: Path)
     assert result["h02a_replay_attention_decision"] == "VALID"
     assert result["h02b_pre_carrier_timing_decision"] == "INCONCLUSIVE"
     assert result["decision"] != "INVALID"
+
+
+def test_h02_direct_replay_lift_overrides_missing_aggregate_counters() -> None:
+    result = dict(H02_DEFAULTS)
+    result.update(
+        {
+            "mean_isf_prediction_error": 0.303,
+            "context_contradiction_count": 0,
+            "repeated_contradiction_count": 0,
+            "memory_replay_candidate_count": 0,
+            "high_priority_replay_count": 0,
+            "direct_replay_lift_available": True,
+            "prediction_violation_replay_lift": 2.2528855050070864,
+            "prediction_violation_base_ratio": 0.834,
+            "high_priority_replay_prediction_violation_ratio": 1.0,
+        }
+    )
+    checks = {
+        "prediction_error_positive": True,
+        "contradictions_present": False,
+        "repeated_contradictions_present": False,
+        "context_expansion_suggested": False,
+        "replay_candidates_present": False,
+        "high_priority_replay_present": False,
+        "prediction_violation_replay_lift_gt_1_25": True,
+        "high_priority_ratio_above_base_ratio": True,
+        "object_carriers_absent": True,
+        "context_action_fallback_absent": True,
+    }
+    _decide_h02a_from_checks(
+        result=result,
+        checks=checks,
+        raw_h02_incomplete=False,
+        compact_has_prediction_error=True,
+        compact_has_contradiction=False,
+        compact_has_replay=False,
+        aggregate_signals_pass=False,
+        direct_replay_lift_pass=True,
+        direct_replay_lift_invalid=False,
+        invalid_core=True,
+    )
+    result["decision"] = result["h02a_replay_attention_decision"]
+    assert result["direct_replay_lift_pass"] is True
+    assert result["aggregate_invalid_core"] is True
+    assert result["h02a_replay_attention_decision"] == "VALID"
+    assert result["decision"] == "VALID"
+    assert result["h02a_decision_source"] == "direct_replay_lift"
+
+
+def test_h02_direct_replay_lift_failure_invalidates_when_aggregate_claims_pass() -> None:
+    result = dict(H02_DEFAULTS)
+    result.update(
+        {
+            "direct_replay_lift_available": True,
+            "prediction_violation_replay_lift": 1.0,
+            "prediction_violation_base_ratio": 0.8,
+            "high_priority_replay_prediction_violation_ratio": 0.8,
+        }
+    )
+    checks = {
+        "prediction_error_positive": True,
+        "contradictions_present": True,
+        "repeated_contradictions_present": True,
+        "context_expansion_suggested": True,
+        "replay_candidates_present": True,
+        "high_priority_replay_present": True,
+        "prediction_violation_replay_lift_gt_1_25": False,
+        "high_priority_ratio_above_base_ratio": False,
+        "object_carriers_absent": True,
+        "context_action_fallback_absent": True,
+    }
+    _decide_h02a_from_checks(
+        result=result,
+        checks=checks,
+        raw_h02_incomplete=False,
+        compact_has_prediction_error=True,
+        compact_has_contradiction=True,
+        compact_has_replay=True,
+        aggregate_signals_pass=True,
+        direct_replay_lift_pass=False,
+        direct_replay_lift_invalid=True,
+        invalid_core=False,
+    )
+    assert result["h02a_replay_attention_decision"] == "INVALID"
+    assert result["h02a_decision_source"] == "direct_replay_lift_invalid"
+
+
+def test_h02_missing_core_without_direct_evidence_not_direct_replay_lift() -> None:
+    result = dict(H02_DEFAULTS)
+    result.update({"direct_replay_lift_available": False, "mean_isf_prediction_error": 0.2})
+    checks = {
+        "prediction_error_positive": True,
+        "contradictions_present": False,
+        "repeated_contradictions_present": False,
+        "context_expansion_suggested": False,
+        "replay_candidates_present": False,
+        "high_priority_replay_present": False,
+        "prediction_violation_replay_lift_gt_1_25": None,
+        "high_priority_ratio_above_base_ratio": None,
+        "object_carriers_absent": True,
+        "context_action_fallback_absent": True,
+    }
+    _decide_h02a_from_checks(
+        result=result,
+        checks=checks,
+        raw_h02_incomplete=False,
+        compact_has_prediction_error=True,
+        compact_has_contradiction=False,
+        compact_has_replay=False,
+        aggregate_signals_pass=False,
+        direct_replay_lift_pass=False,
+        direct_replay_lift_invalid=False,
+        invalid_core=True,
+    )
+    assert result["h02a_replay_attention_decision"] in {"INVALID", "INCONCLUSIVE"}
+    assert result["h02a_decision_source"] != "direct_replay_lift"
 
 
 def test_h02_no_replay_candidates_is_invalid(tmp_path: Path) -> None:

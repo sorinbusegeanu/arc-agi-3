@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,11 @@ from v6.contingency.contingency_learner import Contingency
 from v6.memory.compact_memory import stable_family_int_id
 from v6.memory_lifecycle import MemoryRecord, ReplayCandidate
 from v6.transformation.transformation_clusterer import TransformationFamily
+
+
+READONLY_RETRY_ATTEMPTS = 5
+READONLY_RETRY_BASE_DELAY_SECONDS = 0.05
+READONLY_CONNECT_TIMEOUT_SECONDS = 1.0
 
 
 def load_compact_memory_into_system(system: Any, memory_dir: Path) -> dict[str, Any]:
@@ -36,7 +42,7 @@ def load_compact_memory_into_system(system: Any, memory_dir: Path) -> dict[str, 
         summary["restore_warnings"].append(f"missing current_state sqlite: {paths['current_state']}")
         return summary
 
-    with sqlite3.connect(paths["current_state"]) as state_conn:
+    with _connect_readonly_with_retry(paths["current_state"]) as state_conn:
         state_conn.row_factory = sqlite3.Row
         family_id_map = {
             str(row["canonical_signature"]): int(row["stable_family_id"])
@@ -125,7 +131,7 @@ def load_compact_memory_into_system(system: Any, memory_dir: Path) -> dict[str, 
                 continue
 
     if paths["replay_queue"].exists():
-        with sqlite3.connect(paths["replay_queue"]) as replay_conn:
+        with _connect_readonly_with_retry(paths["replay_queue"]) as replay_conn:
             replay_conn.row_factory = sqlite3.Row
             for row in replay_conn.execute(
                 """
@@ -167,7 +173,7 @@ def load_compact_memory_into_system(system: Any, memory_dir: Path) -> dict[str, 
                 summary["replay_candidates_restored"] += 1
 
     if paths["graph"].exists():
-        with sqlite3.connect(paths["graph"]) as graph_conn:
+        with _connect_readonly_with_retry(paths["graph"]) as graph_conn:
             graph_conn.row_factory = sqlite3.Row
             for row in graph_conn.execute(
                 """
@@ -200,6 +206,34 @@ def load_compact_memory_into_system(system: Any, memory_dir: Path) -> dict[str, 
     if paths["summary_json"].exists():
         summary["memory_summary_loaded"] = True
     return summary
+
+
+def _connect_readonly_with_retry(
+    path: Path,
+    *,
+    attempts: int = READONLY_RETRY_ATTEMPTS,
+    base_delay_seconds: float = READONLY_RETRY_BASE_DELAY_SECONDS,
+    timeout_seconds: float = READONLY_CONNECT_TIMEOUT_SECONDS,
+) -> sqlite3.Connection:
+    db_uri = f"{path.resolve().as_uri()}?mode=ro"
+    last_error: sqlite3.OperationalError | None = None
+    for attempt in range(max(1, int(attempts))):
+        try:
+            connection = sqlite3.connect(
+                db_uri,
+                uri=True,
+                timeout=float(timeout_seconds),
+            )
+            connection.execute(f"PRAGMA busy_timeout = {int(max(0.0, float(timeout_seconds)) * 1000)}")
+            return connection
+        except sqlite3.OperationalError as exc:
+            last_error = exc
+            if "locked" not in str(exc).lower() or attempt >= max(1, int(attempts)) - 1:
+                raise
+            time.sleep(float(base_delay_seconds) * (2 ** attempt))
+    if last_error is not None:
+        raise last_error
+    raise sqlite3.OperationalError(f"failed to open readonly sqlite database: {path}")
 
 
 def _parse_json(value: Any) -> dict[str, Any]:

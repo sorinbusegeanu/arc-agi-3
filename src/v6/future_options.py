@@ -464,15 +464,23 @@ def derive_future_option_attention_links(state_conn: sqlite3.Connection) -> dict
         replay_priority = float(row.get("replay_priority_score") or 0.0)
         memory_priority = float(row.get("memory_priority_score") or 0.0)
         contradiction_score = float(row.get("contradiction_score") or 0.0)
-        high_attention = int(replay_priority >= 0.50 or memory_priority >= 0.50 or contradiction_score >= 0.50)
+        high_attention = int(replay_priority >= 0.50 or contradiction_score >= 0.50)
+        if replay_priority >= 0.50 and contradiction_score >= 0.50:
+            attention_signal_source = "replay_priority+contradiction"
+        elif replay_priority >= 0.50:
+            attention_signal_source = "replay_priority"
+        elif contradiction_score >= 0.50:
+            attention_signal_source = "contradiction"
+        else:
+            attention_signal_source = "none"
         state_conn.execute(
             """
             INSERT INTO future_option_attention_links (
                 event_id, motif_signature, owner_type, owner_key, option_delta_abs, replay_priority_score,
                 memory_priority_score, contradiction_score, high_option_change, high_attention,
-                first_seen_global_step, last_seen_global_step
+                attention_signal_source, first_seen_global_step, last_seen_global_step
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 row["event_id"],
@@ -485,6 +493,7 @@ def derive_future_option_attention_links(state_conn: sqlite3.Connection) -> dict
                 contradiction_score,
                 high_option_change,
                 high_attention,
+                attention_signal_source,
                 row["first_seen_global_step"],
                 row["last_seen_global_step"],
             ),
@@ -521,6 +530,12 @@ def derive_future_option_attention_links(state_conn: sqlite3.Connection) -> dict
 
 def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[str, Any]:
     motif_links = _links_by_signature(state_conn, "future_option_links", "motif_signature")
+    motif_emergence = {
+        str(row["motif_signature"]): int(row["is_emergent"] or 0)
+        for row in state_conn.execute(
+            "SELECT motif_signature, is_emergent FROM future_option_motifs ORDER BY motif_signature ASC"
+        ).fetchall()
+    }
     concept_links = _links_by_signature(state_conn, "concept_links", "concept_signature")
     concepts_by_role: dict[str, set[str]] = defaultdict(set)
     for concept_signature, links in concept_links.items():
@@ -547,10 +562,18 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
     motifs_with_transfer = 0
     motifs_with_strong_transfer = 0
     motifs_with_promoted_concept = 0
+    emergent_link_count = 0
+    emergent_motifs_with_transfer = 0
+    emergent_motifs_with_strong_transfer = 0
+    emergent_motifs_with_promoted_concept = 0
     motif_success_numer = 0
     motif_success_denom = 0
     motif_strong_numer = 0
+    emergent_success_numer = 0
+    emergent_success_denom = 0
+    emergent_strong_numer = 0
     for motif_signature in sorted(motif_links):
+        is_emergent_motif = int(motif_emergence.get(motif_signature, 0)) == 1
         roles = sorted(motif_links[motif_signature].get("role", set()))
         if not roles:
             continue
@@ -558,7 +581,7 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
         motif_had_strong = False
         motif_had_promoted = False
         for role_signature in roles:
-            concepts = sorted(concepts_by_role.get(role_signature, set()) or {""})
+            concepts = sorted(concepts_by_role.get(role_signature, set()) or {"__none__"})
             role_transfer_rows = transfers_by_role.get(role_signature, [])
             for concept_signature in concepts:
                 transfer_attempt_count = len(role_transfer_rows)
@@ -572,7 +595,7 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
                     and float(row["similarity_score"] or 0.0) >= 0.60
                     and float(row["best_margin"] or 0.0) >= 0.10
                 )
-                promoted_concept_count = int(bool(concept_signature) and concept_signature in promoted_concepts)
+                promoted_concept_count = int(concept_signature != "__none__" and concept_signature in promoted_concepts)
                 if transfer_attempt_count <= 0 and promoted_concept_count <= 0:
                     continue
                 mean_transfer_score = _mean([row.get("transfer_score") for row in role_transfer_rows])
@@ -591,7 +614,7 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
                     (
                         motif_signature,
                         role_signature,
-                        concept_signature or None,
+                        concept_signature,
                         transfer_attempt_count,
                         successful_transfer_count,
                         strong_transfer_success_count,
@@ -609,9 +632,18 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
                 motif_success_numer += successful_transfer_count
                 motif_success_denom += transfer_attempt_count
                 motif_strong_numer += strong_transfer_success_count
+                if is_emergent_motif:
+                    emergent_link_count += 1
+                    emergent_success_numer += successful_transfer_count
+                    emergent_success_denom += transfer_attempt_count
+                    emergent_strong_numer += strong_transfer_success_count
         motifs_with_transfer += int(motif_had_transfer)
         motifs_with_strong_transfer += int(motif_had_strong)
         motifs_with_promoted_concept += int(motif_had_promoted)
+        if is_emergent_motif:
+            emergent_motifs_with_transfer += int(motif_had_transfer)
+            emergent_motifs_with_strong_transfer += int(motif_had_strong)
+            emergent_motifs_with_promoted_concept += int(motif_had_promoted)
     return {
         "future_option_transfer_link_count": inserted,
         "motifs_with_transfer_count": motifs_with_transfer,
@@ -620,6 +652,11 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
         "motif_transfer_success_rate": (motif_success_numer / motif_success_denom) if motif_success_denom else None,
         "motif_strong_transfer_success_rate": (motif_strong_numer / motif_success_denom) if motif_success_denom else None,
         "promoted_concept_motif_count": motifs_with_promoted_concept,
+        "emergent_future_option_transfer_link_count": emergent_link_count,
+        "emergent_motifs_with_strong_transfer_count": emergent_motifs_with_strong_transfer,
+        "emergent_motifs_with_promoted_concept_count": emergent_motifs_with_promoted_concept,
+        "emergent_motif_transfer_success_rate": (emergent_success_numer / emergent_success_denom) if emergent_success_denom else None,
+        "emergent_motif_strong_transfer_success_rate": (emergent_strong_numer / emergent_success_denom) if emergent_success_denom else None,
     }
 
 
@@ -853,6 +890,7 @@ def _safe_min(
     which: str,
 ) -> int | None:
     column = "MIN(first_seen_global_step)" if which == "first" else "MAX(last_seen_global_step)"
+    concept_arg = "" if concept_signature == "__none__" else concept_signature
     rows = state_conn.execute(
         f"""
         SELECT {column}
@@ -864,7 +902,7 @@ def _safe_min(
             SELECT first_seen_global_step, last_seen_global_step FROM concept_candidates WHERE concept_signature = ?
         )
         """,
-        (motif_signature, role_signature, concept_signature or ""),
+        (motif_signature, role_signature, concept_arg),
     ).fetchone()
     if not rows or rows[0] is None:
         return None
