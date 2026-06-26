@@ -10,10 +10,14 @@ from v6.hypothesis_h02_report import evaluate_h02_prediction_violation_attention
 from v6.hypothesis_h03_report import evaluate_h03_transformation_family_formation
 from v6.hypothesis_h04_report import evaluate_h04_carrier_emergence
 from v6.higher_order_substrate import derive_higher_order_memory
+from v6.future_options import derive_future_option_memory
 from v6.hypothesis_h05_report import evaluate_h05_role_emergence
 from v6.hypothesis_h06_report import evaluate_h06_role_transfer
 from v6.hypothesis_h07_report import evaluate_h07_concept_emergence
 from v6.hypothesis_h08_report import evaluate_h08_world_model_coherence
+from v6.hypothesis_h09_report import evaluate_h09_future_option_motifs
+from v6.hypothesis_h10_report import evaluate_h10_future_option_attention
+from v6.hypothesis_h11_report import evaluate_h11_future_option_transfer_concepts
 
 
 SUITE_JSON_NAME = "hypothesis_suite_summary.json"
@@ -51,6 +55,9 @@ def run_hypothesis_suite_report(
     h06_dir = output_dir / "h06"
     h07_dir = output_dir / "h07"
     h08_dir = output_dir / "h08"
+    h09_dir = output_dir / "h09"
+    h10_dir = output_dir / "h10"
+    h11_dir = output_dir / "h11"
     h01 = evaluate_h01_contingency_emergence(run_dir=run_dir, output_dir=h01_dir, memory_dir=memory_dir)
     h02 = evaluate_h02_prediction_violation_attention(
         run_dir=run_dir,
@@ -79,12 +86,48 @@ def run_hypothesis_suite_report(
         h06 = evaluate_h06_role_transfer(memory_dir=memory_dir, run_dir=run_dir, output_dir=h06_dir, already_derived=True)
         h07 = evaluate_h07_concept_emergence(memory_dir=memory_dir, run_dir=run_dir, output_dir=h07_dir, already_derived=True)
         h08 = evaluate_h08_world_model_coherence(memory_dir=memory_dir, run_dir=run_dir, output_dir=h08_dir, already_derived=True)
+        derive_future_option_memory(memory_dir=memory_dir, run_dir=run_dir)
+        h09 = evaluate_h09_future_option_motifs(memory_dir=memory_dir, run_dir=run_dir, output_dir=h09_dir, already_derived=True)
+        h10 = evaluate_h10_future_option_attention(memory_dir=memory_dir, run_dir=run_dir, output_dir=h10_dir, already_derived=True)
+        h11 = evaluate_h11_future_option_transfer_concepts(memory_dir=memory_dir, run_dir=run_dir, output_dir=h11_dir, already_derived=True)
     else:
         missing = ["memory_dir not provided"]
         h05 = {"hypothesis_id": "H05", "decision": "INCONCLUSIVE", "core_metrics": {}, "missing_evidence": missing, "evidence_source": "none"}
         h06 = {"hypothesis_id": "H06", "decision": "INCONCLUSIVE", "core_metrics": {}, "missing_evidence": missing, "evidence_source": "none"}
         h07 = {"hypothesis_id": "H07", "decision": "INCONCLUSIVE", "core_metrics": {}, "missing_evidence": missing, "evidence_source": "none"}
         h08 = {"hypothesis_id": "H08", "decision": "INCONCLUSIVE", "core_metrics": {}, "missing_evidence": missing, "evidence_source": "none"}
+        h09 = {"hypothesis_id": "H09", "decision": "INCONCLUSIVE", "core_metrics": {}, "missing_evidence": missing, "evidence_source": "none"}
+        h10 = {"hypothesis_id": "H10", "decision": "INCONCLUSIVE", "core_metrics": {}, "missing_evidence": missing, "evidence_source": "none"}
+        h11 = {"hypothesis_id": "H11", "decision": "INCONCLUSIVE", "core_metrics": {}, "missing_evidence": missing, "evidence_source": "none"}
+    input_report = _load_json(Path(run_dir) / INPUT_REPORT_NAME) or {}
+    runs = [dict(item) for item in input_report.get("runs", []) if isinstance(item, dict)]
+    games = sorted({str(row.get("game")) for row in runs if row.get("game")})
+    if not games:
+        games = [str(item) for item in input_report.get("games", []) if item]
+    samplers = sorted({str(row.get("sampler_name")) for row in runs if row.get("sampler_name")})
+    if not samplers:
+        samplers = [str(item) for item in input_report.get("samplers", []) if item]
+    total_interactions_resolved = _resolve_total_interactions(
+        runs=runs,
+        h01=h01,
+        interactions_this_epoch=interactions_this_epoch,
+        total_interactions_seen=total_interactions_seen,
+    )
+    h04, h05, h06, h07, h08, h09, h10, h11, maturity_notes = _apply_epoch_maturity_gates(
+        h04=h04,
+        h05=h05,
+        h06=h06,
+        h07=h07,
+        h08=h08,
+        h09=h09,
+        h10=h10,
+        h11=h11,
+        total_interactions=int(total_interactions_resolved["total_interactions"]),
+        interactions_this_epoch=interactions_this_epoch,
+        game_count=len(games),
+        sampler_count=len(samplers),
+    )
+    h05, h06, h07, h08, h09, h10, h11, dependency_notes = _apply_higher_order_dependency_gates(h05, h06, h07, h08, h09, h10, h11)
     summary = build_hypothesis_suite_summary(
         run_dir=run_dir,
         memory_dir=memory_dir,
@@ -96,6 +139,9 @@ def run_hypothesis_suite_report(
         h06=h06,
         h07=h07,
         h08=h08,
+        h09=h09,
+        h10=h10,
+        h11=h11,
         epoch_id=epoch_id,
         global_step_start=global_step_start,
         global_step_end=global_step_end,
@@ -103,6 +149,9 @@ def run_hypothesis_suite_report(
         total_interactions_seen=total_interactions_seen,
         memory_size_before_bytes=memory_size_before_bytes,
         memory_size_after_bytes=memory_size_after_bytes,
+        resolved_total_interactions=total_interactions_resolved,
+        higher_order_dependency_gate_notes=dependency_notes,
+        epoch_maturity_gate_notes=maturity_notes,
     )
     _write_suite_summary(summary, output_dir)
     return summary
@@ -120,6 +169,9 @@ def build_hypothesis_suite_summary(
     h06: dict[str, Any] | None = None,
     h07: dict[str, Any] | None = None,
     h08: dict[str, Any] | None = None,
+    h09: dict[str, Any] | None = None,
+    h10: dict[str, Any] | None = None,
+    h11: dict[str, Any] | None = None,
     epoch_id: str | None = None,
     global_step_start: int | None = None,
     global_step_end: int | None = None,
@@ -127,6 +179,9 @@ def build_hypothesis_suite_summary(
     total_interactions_seen: int | None = None,
     memory_size_before_bytes: int | None = None,
     memory_size_after_bytes: int | None = None,
+    resolved_total_interactions: dict[str, Any] | None = None,
+    higher_order_dependency_gate_notes: list[str] | None = None,
+    epoch_maturity_gate_notes: list[str] | None = None,
 ) -> dict[str, Any]:
     input_report = _load_json(Path(run_dir) / INPUT_REPORT_NAME) or {}
     runs = [dict(item) for item in input_report.get("runs", []) if isinstance(item, dict)]
@@ -144,7 +199,15 @@ def build_hypothesis_suite_summary(
     per_game = _per_game_diagnostics(runs)
     per_sampler = _per_sampler_diagnostics(runs)
     temporal = _temporal_order_diagnostics(temporal_rows)
-    total_interactions = int(sum(int(row.get("total_interactions", 0) or 0) for row in runs))
+    resolved_total_interactions = resolved_total_interactions or _resolve_total_interactions(
+        runs=runs,
+        h01=h01,
+        interactions_this_epoch=interactions_this_epoch,
+        total_interactions_seen=total_interactions_seen,
+    )
+    total_interactions = int(resolved_total_interactions["total_interactions"])
+    raw_total_interactions = int(resolved_total_interactions["raw_report_total_interactions"])
+    total_interactions_source = str(resolved_total_interactions["total_interactions_source"])
 
     missing_evidence = _merge_unique(
         list(h01.get("missing_evidence", [])),
@@ -155,12 +218,18 @@ def build_hypothesis_suite_summary(
         list((h06 or {}).get("missing_evidence", [])),
         list((h07 or {}).get("missing_evidence", [])),
         list((h08 or {}).get("missing_evidence", [])),
+        list((h09 or {}).get("missing_evidence", [])),
+        list((h10 or {}).get("missing_evidence", [])),
+        list((h11 or {}).get("missing_evidence", [])),
     )
     h04 = h04 or {"decision": "INCONCLUSIVE", "core_metrics": {}}
     h05 = h05 or {"decision": "INCONCLUSIVE", "core_metrics": {}}
     h06 = h06 or {"decision": "INCONCLUSIVE", "core_metrics": {}}
     h07 = h07 or {"decision": "INCONCLUSIVE", "core_metrics": {}}
     h08 = h08 or {"decision": "INCONCLUSIVE", "core_metrics": {}}
+    h09 = h09 or {"decision": "INCONCLUSIVE", "core_metrics": {}}
+    h10 = h10 or {"decision": "INCONCLUSIVE", "core_metrics": {}}
+    h11 = h11 or {"decision": "INCONCLUSIVE", "core_metrics": {}}
     summary = {
         "epoch_id": epoch_id,
         "global_step_start": global_step_start,
@@ -172,6 +241,8 @@ def build_hypothesis_suite_summary(
         "sampler_count": len(samplers),
         "seed_count": len(seeds),
         "total_interactions": total_interactions,
+        "raw_report_total_interactions": raw_total_interactions,
+        "total_interactions_source": total_interactions_source,
         "interactions_this_epoch": interactions_this_epoch,
         "total_interactions_seen": total_interactions_seen,
         "memory_size_before_bytes": memory_size_before_bytes,
@@ -184,6 +255,9 @@ def build_hypothesis_suite_summary(
         "H06 decision": h06.get("decision", "INCONCLUSIVE"),
         "H07 decision": h07.get("decision", "INCONCLUSIVE"),
         "H08 decision": h08.get("decision", "INCONCLUSIVE"),
+        "H09 decision": h09.get("decision", "INCONCLUSIVE"),
+        "H10 decision": h10.get("decision", "INCONCLUSIVE"),
+        "H11 decision": h11.get("decision", "INCONCLUSIVE"),
         "H01 core metrics": {
             "stable_contingency_count": h01.get("stable_contingency_count"),
             "interaction_count": h01.get("total_interaction_count"),
@@ -266,6 +340,40 @@ def build_hypothesis_suite_summary(
             "coherent_cross_context_component_count": h08.get("coherent_cross_context_component_count"),
             "coherent_cross_game_component_count": h08.get("coherent_cross_game_component_count"),
         },
+        "H09 core metrics": {
+            "future_option_event_count": h09.get("future_option_event_count"),
+            "future_option_motif_count": h09.get("future_option_motif_count"),
+            "emergent_future_option_motif_count": h09.get("emergent_future_option_motif_count"),
+            "motif_type_counts": h09.get("motif_type_counts"),
+            "cross_context_motif_count": h09.get("cross_context_motif_count"),
+            "cross_game_motif_count": h09.get("cross_game_motif_count"),
+            "mean_abs_option_delta": h09.get("mean_abs_option_delta"),
+            "max_abs_option_delta": h09.get("max_abs_option_delta"),
+            "mean_motif_stability_score": h09.get("mean_motif_stability_score"),
+        },
+        "H10 core metrics": {
+            "future_option_attention_link_count": h10.get("future_option_attention_link_count"),
+            "high_option_change_count": h10.get("high_option_change_count"),
+            "high_attention_count": h10.get("high_attention_count"),
+            "high_option_change_attention_count": h10.get("high_option_change_attention_count"),
+            "low_option_change_attention_count": h10.get("low_option_change_attention_count"),
+            "high_option_change_attention_rate": h10.get("high_option_change_attention_rate"),
+            "low_option_change_attention_rate": h10.get("low_option_change_attention_rate"),
+            "option_attention_lift": h10.get("option_attention_lift"),
+            "option_attention_lift_unbounded": h10.get("option_attention_lift_unbounded"),
+        },
+        "H11 core metrics": {
+            "future_option_transfer_link_count": h11.get("future_option_transfer_link_count"),
+            "motifs_with_transfer_count": h11.get("motifs_with_transfer_count"),
+            "motifs_with_strong_transfer_count": h11.get("motifs_with_strong_transfer_count"),
+            "motifs_with_promoted_concept_count": h11.get("motifs_with_promoted_concept_count"),
+            "motif_transfer_success_rate": h11.get("motif_transfer_success_rate"),
+            "motif_strong_transfer_success_rate": h11.get("motif_strong_transfer_success_rate"),
+            "promoted_concept_motif_count": h11.get("promoted_concept_motif_count"),
+            "emergent_future_option_motif_count": h11.get("emergent_future_option_motif_count"),
+            "successful_role_transfer_count": h11.get("successful_role_transfer_count"),
+            "promoted_concept_count": h11.get("promoted_concept_count"),
+        },
         "per_game_status_table": per_game,
         "per-game status table": per_game,
         "per_sampler_status_table": per_sampler,
@@ -273,8 +381,11 @@ def build_hypothesis_suite_summary(
         "temporal_order_diagnostics": temporal,
         "missing_evidence": missing_evidence,
         "missing evidence": missing_evidence,
-        "next_recommended_action": _next_recommended_action(h01, h02, h03, h04, h05, h06, h07, h08, missing_evidence),
-        "next recommended action": _next_recommended_action(h01, h02, h03, h04, h05, h06, h07, h08, missing_evidence),
+        "higher_order_dependency_gates_applied": True,
+        "higher_order_dependency_gate_notes": list(higher_order_dependency_gate_notes or []),
+        "epoch_maturity_gate_notes": list(epoch_maturity_gate_notes or []),
+        "next_recommended_action": _next_recommended_action(h01, h02, h03, h04, h05, h06, h07, h08, h09, h10, h11, missing_evidence),
+        "next recommended action": _next_recommended_action(h01, h02, h03, h04, h05, h06, h07, h08, h09, h10, h11, missing_evidence),
     }
     return summary
 
@@ -413,6 +524,120 @@ def _true_ratio(values: list[bool]) -> float | None:
     return float(sum(1 for value in values if value) / len(values))
 
 
+def _resolve_total_interactions(
+    *,
+    runs: list[dict[str, Any]],
+    h01: dict[str, Any],
+    interactions_this_epoch: int | None,
+    total_interactions_seen: int | None,
+) -> dict[str, Any]:
+    total_interactions = int(sum(int(row.get("total_interactions", 0) or 0) for row in runs))
+    raw_total_interactions = total_interactions
+    source = "raw_report_runs" if raw_total_interactions > 0 else "unavailable"
+    if total_interactions <= 0 and interactions_this_epoch is not None:
+        total_interactions = int(interactions_this_epoch or 0)
+        if total_interactions > 0:
+            source = "continuous_epoch_argument"
+    if total_interactions <= 0:
+        h01_interactions = h01.get("total_interaction_count")
+        if h01_interactions is not None:
+            total_interactions = int(h01_interactions or 0)
+            if total_interactions > 0:
+                source = "h01_total_interaction_count"
+    if total_interactions <= 0 and total_interactions_seen is not None:
+        total_interactions = int(total_interactions_seen or 0)
+        if total_interactions > 0:
+            source = "compact_memory_total_interactions_seen"
+    return {
+        "total_interactions": int(total_interactions),
+        "raw_report_total_interactions": int(raw_total_interactions),
+        "total_interactions_source": source if total_interactions > 0 or raw_total_interactions > 0 else "unavailable",
+    }
+
+
+def _apply_epoch_maturity_gates(
+    *,
+    h04: dict[str, Any],
+    h05: dict[str, Any],
+    h06: dict[str, Any],
+    h07: dict[str, Any],
+    h08: dict[str, Any],
+    h09: dict[str, Any],
+    h10: dict[str, Any],
+    h11: dict[str, Any],
+    total_interactions: int,
+    interactions_this_epoch: int | None,
+    game_count: int,
+    sampler_count: int,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], list[str]]:
+    maturity_threshold = max(1000, int(game_count) * int(sampler_count))
+    notes: list[str] = []
+    demote = total_interactions <= 0
+    if demote:
+        notes.append("Full H04-H11 validation blocked because total interaction count is unavailable.")
+    elif interactions_this_epoch is not None and int(interactions_this_epoch) < maturity_threshold:
+        demote = True
+        notes.append("Full H04-H11 validation blocked because epoch interaction budget is below maturity threshold.")
+
+    def _demote(payload: dict[str, Any]) -> dict[str, Any]:
+        updated = dict(payload)
+        if str(updated.get("decision")) == "VALID" and demote:
+            updated["original_decision_before_epoch_maturity_gate"] = "VALID"
+            updated["epoch_maturity_demoted"] = True
+            updated["epoch_maturity_threshold"] = maturity_threshold
+            updated["epoch_interactions_used_for_gate"] = interactions_this_epoch if interactions_this_epoch is not None else total_interactions
+            updated["decision"] = "PARTIALLY_VALID"
+            missing = list(updated.get("missing_evidence", []))
+            for note in notes:
+                if note not in missing:
+                    missing.append(note)
+            updated["missing_evidence"] = missing
+        return updated
+
+    return _demote(h04), _demote(h05), _demote(h06), _demote(h07), _demote(h08), _demote(h09), _demote(h10), _demote(h11), notes
+
+
+def _apply_higher_order_dependency_gates(
+    h05: dict[str, Any],
+    h06: dict[str, Any],
+    h07: dict[str, Any],
+    h08: dict[str, Any],
+    h09: dict[str, Any],
+    h10: dict[str, Any],
+    h11: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], list[str]]:
+    notes: list[str] = []
+
+    def _demote(payload: dict[str, Any], message: str) -> dict[str, Any]:
+        updated = dict(payload)
+        if str(updated.get("decision")) == "VALID":
+            updated["original_decision_before_dependency_gate"] = "VALID"
+            updated["dependency_demoted"] = True
+            updated["decision"] = "PARTIALLY_VALID"
+            missing = list(updated.get("missing_evidence", []))
+            if message not in missing:
+                missing.append(message)
+            updated["missing_evidence"] = missing
+            notes.append(message)
+        return updated
+
+    if str(h05.get("decision")) != "VALID" and str(h06.get("decision")) == "VALID":
+        h06 = _demote(h06, "H06 cannot be fully VALID until H05 role emergence is VALID.")
+    if str(h06.get("decision")) != "VALID" and str(h07.get("decision")) == "VALID":
+        h07 = _demote(h07, "H07 cannot be fully VALID until H06 role transfer is VALID.")
+    if str(h07.get("decision")) != "VALID" and str(h08.get("decision")) == "VALID":
+        h08 = _demote(h08, "H08 cannot be fully VALID until H07 concept emergence is VALID.")
+    if str(h06.get("decision")) != "VALID" and str(h08.get("decision")) == "VALID":
+        h08 = _demote(h08, "H08 cannot be fully VALID until H06 role transfer is VALID.")
+    if str(h09.get("decision")) != "VALID" and str(h10.get("decision")) == "VALID":
+        h10 = _demote(h10, "H10 cannot be fully VALID until H09 future-option motifs are VALID.")
+    if str(h09.get("decision")) != "VALID" and str(h11.get("decision")) == "VALID":
+        h11 = _demote(h11, "H11 cannot be fully VALID until H09 future-option motifs are VALID.")
+    if str(h06.get("decision")) in {"INCONCLUSIVE", "INVALID"} and str(h11.get("decision")) == "VALID":
+        h11 = _demote(h11, "H11 cannot be fully VALID until H06 role transfer is at least PARTIALLY_VALID.")
+    return h05, h06, h07, h08, h09, h10, h11, notes
+
+
 def _next_recommended_action(
     h01: dict[str, Any],
     h02: dict[str, Any],
@@ -422,8 +647,15 @@ def _next_recommended_action(
     h06: dict[str, Any],
     h07: dict[str, Any],
     h08: dict[str, Any],
+    h09: dict[str, Any],
+    h10: dict[str, Any],
+    h11: dict[str, Any],
     missing_evidence: list[str],
 ) -> str:
+    if str(h02.get("decision")) == "INVALID":
+        return "Inspect H02 replay/contradiction evidence and raw-to-compact fallback before interpreting higher-order results."
+    if any("maturity" in str(item).lower() or "cannot be fully valid until" in str(item).lower() for item in missing_evidence):
+        return "Continue more epochs before treating H04-H11 as full validations; current higher-order results are maturity-gated."
     decisions = {
         str(h01.get("decision")),
         str(h02.get("decision")),
@@ -433,14 +665,17 @@ def _next_recommended_action(
         str(h06.get("decision")),
         str(h07.get("decision")),
         str(h08.get("decision")),
+        str(h09.get("decision")),
+        str(h10.get("decision")),
+        str(h11.get("decision")),
     }
     if "INVALID" in decisions:
         return "Inspect invalidated hypothesis outputs and repair the shared compact-memory substrate before continuing higher-order evaluation."
     if "INCONCLUSIVE" in decisions or missing_evidence:
         return "Keep the shared run, fill the missing evidence paths, and rerun the suite summary before relying on higher-order conclusions."
     if "PARTIALLY_VALID" in decisions:
-        return "Use this shared dataset for targeted follow-up diagnostics, then rerun H05-H08 on the same compact memory."
-    return "Proceed with the existing compact memory and compare H01-H08 trends across subsequent epochs."
+        return "Use this shared dataset for targeted follow-up diagnostics, then rerun H05-H11 on the same compact memory."
+    return "Proceed with the existing compact memory and compare H01-H11 trends across subsequent epochs."
 
 
 def _write_suite_summary(summary: dict[str, Any], output_dir: Path) -> None:
@@ -461,6 +696,9 @@ def _format_text(summary: dict[str, Any]) -> str:
         f"H06: {summary['H06 decision']}",
         f"H07: {summary['H07 decision']}",
         f"H08: {summary['H08 decision']}",
+        f"H09: {summary['H09 decision']}",
+        f"H10: {summary['H10 decision']}",
+        f"H11: {summary['H11 decision']}",
         f"games: {summary['game_count']} samplers: {summary['sampler_count']} seeds: {summary['seed_count']}",
         f"total_interactions: {summary['total_interactions']}",
         f"next_recommended_action: {summary['next_recommended_action']}",
@@ -481,6 +719,9 @@ def _format_md(summary: dict[str, Any]) -> str:
         f"- H06: `{summary['H06 decision']}`",
         f"- H07: `{summary['H07 decision']}`",
         f"- H08: `{summary['H08 decision']}`",
+        f"- H09: `{summary['H09 decision']}`",
+        f"- H10: `{summary['H10 decision']}`",
+        f"- H11: `{summary['H11 decision']}`",
         f"- total interactions: `{summary['total_interactions']}`",
         "",
         "## Next Action",

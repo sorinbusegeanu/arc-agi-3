@@ -10,7 +10,17 @@ from v6.hypothesis_h05_report import evaluate_h05_role_emergence
 from v6.hypothesis_h06_report import evaluate_h06_role_transfer
 from v6.hypothesis_h07_report import evaluate_h07_concept_emergence
 from v6.hypothesis_h08_report import evaluate_h08_world_model_coherence
-from v6.hypothesis_suite_report import run_hypothesis_suite_report
+from v6.hypothesis_h09_report import evaluate_h09_future_option_motifs
+from v6.hypothesis_h10_report import evaluate_h10_future_option_attention
+from v6.hypothesis_h11_report import evaluate_h11_future_option_transfer_concepts
+from v6.hypothesis_h02_report import evaluate_h02_prediction_violation_attention
+from v6.hypothesis_h04_report import evaluate_h04_carrier_emergence
+from v6.hypothesis_suite_report import (
+    _apply_epoch_maturity_gates,
+    _apply_higher_order_dependency_gates,
+    build_hypothesis_suite_summary,
+    run_hypothesis_suite_report,
+)
 from v6.memory.compact_memory import ensure_memory_layout
 
 
@@ -283,7 +293,102 @@ def test_standalone_h05_h08_derive_safely(tmp_path: Path) -> None:
     assert h08["world_model_component_count"] >= 1
 
 
-def test_suite_includes_h01_h08(tmp_path: Path) -> None:
+def test_h09_detects_motifs(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_memory(memory_dir, [
+        {"carrier": "e1", "game": "g1", "contexts": ["ctx1", "ctx2"], "effect": "enable", "action": "open", "polarity": "positive"},
+        {"carrier": "b1", "game": "g2", "contexts": ["ctx3", "ctx4"], "effect": "block", "action": "close", "polarity": "negative"},
+        {"carrier": "t1", "game": "g3", "contexts": ["ctx5", "ctx6"], "effect": "terminate", "action": "consume", "polarity": "negative"},
+    ])
+    result = evaluate_h09_future_option_motifs(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h09")
+    assert result["future_option_event_count"] > 0
+    assert result["future_option_motif_count"] > 0
+    assert "enable" in result["motif_type_counts"]
+    assert "block" in result["motif_type_counts"]
+    assert result["decision"] in {"PARTIALLY_VALID", "VALID"}
+
+
+def test_h09_emergent_motif_across_contexts_games(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_memory(memory_dir, [
+        {"carrier": "e1", "game": "g1", "contexts": ["ctx1", "ctx2"], "effect": "enable", "action": "open", "polarity": "positive"},
+        {"carrier": "e2", "game": "g2", "contexts": ["ctx3", "ctx4"], "effect": "enable", "action": "open", "polarity": "positive"},
+        {"carrier": "e3", "game": "g3", "contexts": ["ctx5", "ctx6"], "effect": "enable", "action": "open", "polarity": "positive"},
+        {"carrier": "b1", "game": "g1", "contexts": ["ctx7", "ctx8"], "effect": "block", "action": "close", "polarity": "negative"},
+    ])
+    result = evaluate_h09_future_option_motifs(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h09")
+    assert result["emergent_future_option_motif_count"] >= 1
+    assert result["decision"] == "VALID"
+
+
+def test_h10_lift(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_memory(memory_dir, [])
+    _seed_future_option_attention_rows(
+        memory_dir,
+        [
+            {"event_id": "e1", "motif_signature": "m1", "option_delta_abs": 2.0, "replay_priority_score": 0.9, "memory_priority_score": 0.8, "contradiction_score": 0.7, "high_option_change": 1, "high_attention": 1},
+            {"event_id": "e2", "motif_signature": "m1", "option_delta_abs": 2.0, "replay_priority_score": 0.8, "memory_priority_score": 0.7, "contradiction_score": 0.6, "high_option_change": 1, "high_attention": 1},
+            {"event_id": "e3", "motif_signature": "m2", "option_delta_abs": 1.2, "replay_priority_score": 0.7, "memory_priority_score": 0.6, "contradiction_score": 0.5, "high_option_change": 1, "high_attention": 1},
+                {"event_id": "e4", "motif_signature": "m2", "option_delta_abs": 0.1, "replay_priority_score": 0.1, "memory_priority_score": 0.1, "contradiction_score": 0.0, "high_option_change": 0, "high_attention": 0},
+                {"event_id": "e5", "motif_signature": "m3", "option_delta_abs": 0.1, "replay_priority_score": 0.6, "memory_priority_score": 0.1, "contradiction_score": 0.0, "high_option_change": 0, "high_attention": 1},
+                {"event_id": "e6", "motif_signature": "m3", "option_delta_abs": 0.0, "replay_priority_score": 0.1, "memory_priority_score": 0.1, "contradiction_score": 0.0, "high_option_change": 0, "high_attention": 0},
+                {"event_id": "e7", "motif_signature": "m4", "option_delta_abs": 2.0, "replay_priority_score": 0.9, "memory_priority_score": 0.8, "contradiction_score": 0.8, "high_option_change": 1, "high_attention": 1},
+                {"event_id": "e8", "motif_signature": "m4", "option_delta_abs": 1.7, "replay_priority_score": 0.85, "memory_priority_score": 0.7, "contradiction_score": 0.5, "high_option_change": 1, "high_attention": 1},
+            ],
+        )
+    result = evaluate_h10_future_option_attention(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h10", already_derived=True)
+    assert (result["option_attention_lift"] or 0.0) >= 1.25
+    assert result["decision"] == "VALID"
+
+
+def test_h10_no_false_invalid_on_missing_low_group(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_memory(memory_dir, [])
+    _seed_future_option_attention_rows(
+        memory_dir,
+        [
+            {"event_id": "e1", "motif_signature": "m1", "option_delta_abs": 2.0, "replay_priority_score": 0.9, "memory_priority_score": 0.8, "contradiction_score": 0.7, "high_option_change": 1, "high_attention": 1},
+            {"event_id": "e2", "motif_signature": "m1", "option_delta_abs": 2.0, "replay_priority_score": 0.8, "memory_priority_score": 0.7, "contradiction_score": 0.6, "high_option_change": 1, "high_attention": 1},
+            {"event_id": "e3", "motif_signature": "m2", "option_delta_abs": 1.5, "replay_priority_score": 0.9, "memory_priority_score": 0.8, "contradiction_score": 0.5, "high_option_change": 1, "high_attention": 1},
+        ],
+    )
+    result = evaluate_h10_future_option_attention(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h10", already_derived=True)
+    assert result["option_attention_lift"] is None
+    assert result["decision"] in {"PARTIALLY_VALID", "INCONCLUSIVE"}
+    assert result["decision"] != "INVALID"
+
+
+def test_h11_links_motifs_to_transfer_concepts(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    specs = _transfer_rich_specs() + [
+        {"carrier": "r_0_0", "game": "g1", "contexts": ["ctx_r_0_0_1", "ctx_r_0_0_2"], "effect": "reversible", "action": "toggle", "polarity": "neutral"},
+        {"carrier": "r_1_0", "game": "g2", "contexts": ["ctx_r_1_0_1", "ctx_r_1_0_2"], "effect": "reversible", "action": "toggle", "polarity": "neutral"},
+        {"carrier": "r_2_0", "game": "g3", "contexts": ["ctx_r_2_0_1", "ctx_r_2_0_2"], "effect": "reversible", "action": "toggle", "polarity": "neutral"},
+        {"carrier": "m_0_0", "game": "g1", "contexts": ["ctx_m_0_0_1", "ctx_m_0_0_2"], "effect": "merge", "action": "combine", "polarity": "negative"},
+        {"carrier": "m_1_0", "game": "g2", "contexts": ["ctx_m_1_0_1", "ctx_m_1_0_2"], "effect": "merge", "action": "combine", "polarity": "negative"},
+        {"carrier": "m_2_0", "game": "g3", "contexts": ["ctx_m_2_0_1", "ctx_m_2_0_2"], "effect": "merge", "action": "combine", "polarity": "negative"},
+    ]
+    _seed_memory(memory_dir, specs)
+    result = evaluate_h11_future_option_transfer_concepts(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h11")
+    assert result["future_option_transfer_link_count"] > 0
+    assert result["motifs_with_strong_transfer_count"] >= 1
+    assert result["motifs_with_promoted_concept_count"] >= 1
+    assert result["decision"] == "VALID"
+
+
+def test_h11_no_valid_without_h09(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_memory(memory_dir, [
+        {"carrier": "s1", "game": "g1", "contexts": ["ctx1", "ctx2"], "effect": "unknown_effect", "action": "unknown_action", "polarity": "neutral"},
+        {"carrier": "s2", "game": "g2", "contexts": ["ctx3", "ctx4"], "effect": "unknown_effect", "action": "unknown_action", "polarity": "neutral"},
+    ])
+    result = evaluate_h11_future_option_transfer_concepts(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h11")
+    assert result["decision"] in {"INCONCLUSIVE", "PARTIALLY_VALID"}
+    assert result["decision"] != "VALID"
+
+
+def test_suite_includes_h01_h11(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
     run_dir = tmp_path / "run"
     run_dir.mkdir()
@@ -305,8 +410,158 @@ def test_suite_includes_h01_h08(tmp_path: Path) -> None:
         "H06 decision",
         "H07 decision",
         "H08 decision",
+        "H09 decision",
+        "H10 decision",
+        "H11 decision",
     ):
         assert key in summary
+    assert "H09 core metrics" in summary
+    assert "H10 core metrics" in summary
+    assert "H11 core metrics" in summary
+
+
+def test_suite_total_interactions_fallback(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "interaction_sampling_v05c_report.json").write_text(
+        json.dumps({"games": ["g1"], "samplers": ["s1"], "seeds": [0], "runs": []}),
+        encoding="utf-8",
+    )
+    summary = build_hypothesis_suite_summary(
+        run_dir=run_dir,
+        h01={"decision": "INCONCLUSIVE", "total_interaction_count": None},
+        h02={"decision": "INCONCLUSIVE"},
+        h03={"decision": "INCONCLUSIVE"},
+        interactions_this_epoch=500,
+        total_interactions_seen=None,
+    )
+    assert summary["total_interactions"] == 500
+    assert summary["raw_report_total_interactions"] == 0
+    assert summary["total_interactions_source"] == "continuous_epoch_argument"
+
+
+def test_h02_incomplete_raw_evidence_does_not_invalid(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "interaction_sampling_v05c_report.json").write_text(
+        json.dumps({"games": ["g1"], "samplers": ["s1"], "seeds": [0], "runs": []}),
+        encoding="utf-8",
+    )
+    memory_dir = tmp_path / "memory"
+    _seed_memory(memory_dir, [
+        {"carrier": "a1", "game": "g1", "contexts": ["ctx1", "ctx2"], "effect": "enable", "action": "open", "polarity": "positive"},
+    ])
+    result = evaluate_h02_prediction_violation_attention(run_dir=run_dir, output_dir=tmp_path / "h02", memory_dir=memory_dir)
+    assert result["decision"] in {"INCONCLUSIVE", "PARTIALLY_VALID"}
+    assert result["decision"] != "INVALID"
+    assert result["raw_h02_evidence_incomplete"] is True
+
+
+def test_h04_missing_timing_cannot_be_valid(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_memory(memory_dir, _transfer_rich_specs())
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute("DELETE FROM temporal_milestones")
+        conn.commit()
+    result = evaluate_h04_carrier_emergence(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h04")
+    assert result["decision"] == "PARTIALLY_VALID"
+    assert "explicit H03-before-H04 temporal evidence unavailable" in result["missing_evidence"]
+
+
+def test_h05_missing_timing_cannot_be_valid(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_memory(memory_dir, _transfer_rich_specs())
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute("DELETE FROM temporal_milestones")
+        conn.commit()
+    result = evaluate_h05_role_emergence(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h05")
+    assert result["decision"] == "PARTIALLY_VALID"
+    assert "explicit H04-before-H05 temporal evidence unavailable" in result["missing_evidence"]
+
+
+def test_dependency_gate_demotes_h07_h08() -> None:
+    h05 = {"decision": "VALID", "missing_evidence": []}
+    h06 = {"decision": "PARTIALLY_VALID", "missing_evidence": []}
+    h07 = {"decision": "VALID", "missing_evidence": []}
+    h08 = {"decision": "VALID", "missing_evidence": []}
+    h09 = {"decision": "VALID", "missing_evidence": []}
+    h10 = {"decision": "VALID", "missing_evidence": []}
+    h11 = {"decision": "VALID", "missing_evidence": []}
+    _h05, _h06, h07_out, h08_out, _h09, _h10, _h11, notes = _apply_higher_order_dependency_gates(h05, h06, h07, h08, h09, h10, h11)
+    assert h07_out["decision"] == "PARTIALLY_VALID"
+    assert h08_out["decision"] == "PARTIALLY_VALID"
+    assert notes
+
+
+def test_maturity_gate_demotes_early_h04_h08() -> None:
+    base = {"decision": "VALID", "missing_evidence": []}
+    h04, h05, h06, h07, h08, h09, h10, h11, notes = _apply_epoch_maturity_gates(
+        h04=dict(base),
+        h05=dict(base),
+        h06=dict(base),
+        h07=dict(base),
+        h08=dict(base),
+        h09=dict(base),
+        h10=dict(base),
+        h11=dict(base),
+        total_interactions=500,
+        interactions_this_epoch=500,
+        game_count=251,
+        sampler_count=7,
+    )
+    for item in (h04, h05, h06, h07, h08, h09, h10, h11):
+        assert item["decision"] == "PARTIALLY_VALID"
+        assert item["epoch_maturity_demoted"] is True
+    assert notes
+
+
+def test_no_maturity_demotion_after_enough_interactions() -> None:
+    base = {"decision": "VALID", "missing_evidence": []}
+    h04, h05, h06, h07, h08, h09, h10, h11, notes = _apply_epoch_maturity_gates(
+        h04=dict(base),
+        h05=dict(base),
+        h06=dict(base),
+        h07=dict(base),
+        h08=dict(base),
+        h09=dict(base),
+        h10=dict(base),
+        h11=dict(base),
+        total_interactions=5000,
+        interactions_this_epoch=5000,
+        game_count=251,
+        sampler_count=7,
+    )
+    for item in (h04, h05, h06, h07, h08, h09, h10, h11):
+        assert item["decision"] == "VALID"
+        assert "epoch_maturity_demoted" not in item
+    assert notes == []
+
+
+def test_dependency_gate_demotes_h10_if_h09_not_valid() -> None:
+    h05 = {"decision": "VALID", "missing_evidence": []}
+    h06 = {"decision": "VALID", "missing_evidence": []}
+    h07 = {"decision": "VALID", "missing_evidence": []}
+    h08 = {"decision": "VALID", "missing_evidence": []}
+    h09 = {"decision": "PARTIALLY_VALID", "missing_evidence": []}
+    h10 = {"decision": "VALID", "missing_evidence": []}
+    h11 = {"decision": "VALID", "missing_evidence": []}
+    _h05, _h06, _h07, _h08, _h09, h10_out, h11_out, notes = _apply_higher_order_dependency_gates(h05, h06, h07, h08, h09, h10, h11)
+    assert h10_out["decision"] == "PARTIALLY_VALID"
+    assert h11_out["decision"] == "PARTIALLY_VALID"
+    assert notes
+
+
+def test_dependency_gate_demotes_h11_if_h09_absent() -> None:
+    h05 = {"decision": "VALID", "missing_evidence": []}
+    h06 = {"decision": "PARTIALLY_VALID", "missing_evidence": []}
+    h07 = {"decision": "VALID", "missing_evidence": []}
+    h08 = {"decision": "VALID", "missing_evidence": []}
+    h09 = {"decision": "INCONCLUSIVE", "missing_evidence": []}
+    h10 = {"decision": "PARTIALLY_VALID", "missing_evidence": []}
+    h11 = {"decision": "VALID", "missing_evidence": []}
+    _h05, _h06, _h07, _h08, _h09, _h10, h11_out, notes = _apply_higher_order_dependency_gates(h05, h06, h07, h08, h09, h10, h11)
+    assert h11_out["decision"] == "PARTIALLY_VALID"
+    assert notes
 
 
 def test_epoch_status_format_includes_h05_h08() -> None:
@@ -354,6 +609,17 @@ def test_epoch_status_format_includes_h05_h08() -> None:
         "world_model_components": 1,
         "coherent_world_model_components": 1,
         "candidate_only_world_model_components": 0,
+        "H09": "VALID",
+        "future_option_events": 9,
+        "future_option_motifs": 3,
+        "emergent_future_option_motifs": 1,
+        "H10": "VALID",
+        "option_attention_lift": 2.0,
+        "high_option_change_attention_rate": 0.8,
+        "H11": "VALID",
+        "future_option_transfer_links": 4,
+        "motifs_with_strong_transfer": 2,
+        "motifs_with_promoted_concepts": 1,
         "cleanup": {"disk_before_cleanup_bytes": 0, "disk_after_cleanup_bytes": 0, "raw_files_deleted_count": 0, "disk_freed_bytes": 0},
         "deltas": {"stable_contingency_count_delta": 1},
         "next_action": "continue epoch_0002",
@@ -369,6 +635,12 @@ def test_epoch_status_format_includes_h05_h08() -> None:
     assert "role mismatch count" in text
     assert "strong transfer successes" in text
     assert "candidate-only components" in text
+    assert "H09" in text
+    assert "H10" in text
+    assert "H11" in text
+    assert "future-option events" in text
+    assert "option-attention lift" in text
+    assert "future-option transfer links" in text
 
 
 def _transfer_rich_specs() -> list[dict[str, object]]:
@@ -484,8 +756,10 @@ def _seed_memory(memory_dir: Path, specs: list[dict[str, object]]) -> Path:
                 _insert_edge(graph_conn, f"carrier:{carrier}", f"context:{context_key}", "appears_in")
             _insert_node(graph_conn, f"carrier:{carrier}", "carrier", carrier)
             _insert_node(graph_conn, f"family:{family_signature}", "family", family_signature)
+            _insert_node(graph_conn, f"contingency:cont_{carrier}", "contingency", f"cont_{carrier}")
             _insert_node(graph_conn, f"contradiction:{carrier}", "contradiction", carrier)
             _insert_edge(graph_conn, f"carrier:{carrier}", f"family:{family_signature}", "explains")
+            _insert_edge(graph_conn, f"carrier:{carrier}", f"contingency:cont_{carrier}", "anchors")
             _insert_edge(graph_conn, f"family:{family_signature}", f"contradiction:{carrier}", "contradicted_by")
             replay_conn.execute(
                 """
@@ -523,6 +797,37 @@ def _seed_memory(memory_dir: Path, specs: list[dict[str, object]]) -> Path:
         graph_conn.commit()
         replay_conn.commit()
     return memory_dir
+
+
+def _seed_future_option_attention_rows(memory_dir: Path, rows: list[dict[str, object]]) -> None:
+    paths = ensure_memory_layout(memory_dir)
+    with sqlite3.connect(paths.current_state) as conn:
+        for row in rows:
+            conn.execute(
+                """
+                INSERT INTO future_option_attention_links (
+                    event_id, motif_signature, owner_type, owner_key, option_delta_abs, replay_priority_score,
+                    memory_priority_score, contradiction_score, high_option_change, high_attention,
+                    first_seen_global_step, last_seen_global_step
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(row["event_id"]),
+                    str(row["motif_signature"]),
+                    "synthetic",
+                    str(row["event_id"]),
+                    float(row["option_delta_abs"]),
+                    float(row["replay_priority_score"]),
+                    float(row["memory_priority_score"]),
+                    float(row["contradiction_score"]),
+                    int(row["high_option_change"]),
+                    int(row["high_attention"]),
+                    10,
+                    20,
+                ),
+            )
+        conn.commit()
 
 
 def _insert_node(conn: sqlite3.Connection, node_id: str, node_type: str, canonical_key: str) -> None:

@@ -54,6 +54,11 @@ def evaluate_h05_role_emergence(
     singleton_role_ratio = float(singleton_role_count / role_candidate_count) if role_candidate_count else None
     first_role_candidate_step = milestone_map.get("first_role_candidate_step")
     first_emergent_role_step = milestone_map.get("first_emergent_role_step")
+    h04_before_h05 = (
+        None
+        if h04_first is None or first_emergent_role_step is None
+        else int(h04_first) <= int(first_emergent_role_step)
+    )
     h04_before_h05_cases = (
         0
         if h04_first is None or first_emergent_role_step is None or int(h04_first) > int(first_emergent_role_step)
@@ -74,6 +79,8 @@ def evaluate_h05_role_emergence(
         "first_role_candidate_step": first_role_candidate_step,
         "first_emergent_role_step": first_emergent_role_step,
         "h04_before_h05_cases": h04_before_h05_cases,
+        "h04_before_h05": h04_before_h05,
+        "temporal_order_required_for_valid": True,
     }
     if carrier_count <= 0:
         decision = "INCONCLUSIVE"
@@ -81,11 +88,29 @@ def evaluate_h05_role_emergence(
     elif emergent_carrier_count > 0 and role_candidate_count == 0:
         decision = "INVALID"
         missing = ["emergent carriers present but no role candidates"]
+    elif (
+        emergent_role_count >= 1
+        and multi_carrier_role_count >= 1
+        and (cross_context_role_count >= 1 or cross_game_role_count >= 1)
+        and (singleton_role_ratio is None or singleton_role_ratio <= 0.75)
+        and h04_before_h05 is False
+    ):
+        decision = "INVALID"
+        missing = []
     elif emergent_role_count >= 1 and multi_carrier_role_count >= 1 and (cross_context_role_count >= 1 or cross_game_role_count >= 1) and (singleton_role_ratio is None or singleton_role_ratio <= 0.75) and (
-        h04_first is None or first_emergent_role_step is None or int(h04_first) <= int(first_emergent_role_step)
+        h04_before_h05 is True
     ):
         decision = "VALID"
         missing = []
+    elif (
+        emergent_role_count >= 1
+        and multi_carrier_role_count >= 1
+        and (cross_context_role_count >= 1 or cross_game_role_count >= 1)
+        and (singleton_role_ratio is None or singleton_role_ratio <= 0.75)
+        and h04_before_h05 is None
+    ):
+        decision = "PARTIALLY_VALID"
+        missing = ["explicit H04-before-H05 temporal evidence unavailable"]
     elif role_candidate_count > 0 and not (singleton_role_count == role_candidate_count and emergent_carrier_count >= 5):
         decision = "PARTIALLY_VALID"
         missing = []

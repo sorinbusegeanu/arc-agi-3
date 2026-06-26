@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import os
 import json
 import sqlite3
+import tempfile
+import shutil
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from hashlib import sha1
 from pathlib import Path
@@ -83,6 +87,20 @@ def fold_epoch_raw_into_compact_memory(
         + int((report.get("validation") or {}).get("memory_record_count", 0) or 0),
     }
 
+    parallel_workers = _fold_parallel_worker_count(len(db_paths))
+    if parallel_workers > 1:
+        return _fold_epoch_raw_into_compact_memory_parallel(
+            paths=paths,
+            raw_dir=raw_dir,
+            db_paths=db_paths,
+            live_graph_paths=live_graph_paths,
+            temporal_rows=temporal_rows,
+            current_summary=current_summary,
+            totals=totals,
+            fold_config=fold_config,
+            parallel_workers=parallel_workers,
+        )
+
     with (
         sqlite3.connect(paths.current_state) as state_conn,
         sqlite3.connect(paths.graph) as graph_conn,
@@ -113,6 +131,147 @@ def fold_epoch_raw_into_compact_memory(
         summary["fold_summary"] = dict(totals)
         _write_memory_summary_table(state_conn, summary)
         paths.summary_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        state_conn.commit()
+        graph_conn.commit()
+        replay_conn.commit()
+    return totals
+
+
+def _fold_epoch_raw_into_compact_memory_parallel(
+    *,
+    paths: CompactMemoryPaths,
+    raw_dir: Path,
+    db_paths: list[Path],
+    live_graph_paths: list[Path],
+    temporal_rows: list[dict[str, Any]],
+    current_summary: dict[str, Any],
+    totals: dict[str, Any],
+    fold_config: CompactMemoryFoldConfig,
+    parallel_workers: int,
+) -> dict[str, Any]:
+    del raw_dir
+    chunk_count = min(parallel_workers, len(db_paths))
+    chunks = [db_paths[index::chunk_count] for index in range(chunk_count)]
+    chunks = [chunk for chunk in chunks if chunk]
+    temp_root = Path(tempfile.mkdtemp(prefix="compact_fold_", dir=str(paths.root)))
+    temp_dirs: list[Path] = []
+    chunk_totals: list[dict[str, Any]] = []
+    try:
+        with ProcessPoolExecutor(max_workers=len(chunks), max_tasks_per_child=1) as executor:
+            futures = []
+            for index, chunk in enumerate(chunks):
+                temp_dir = temp_root / f"chunk_{index:04d}"
+                temp_dirs.append(temp_dir)
+                futures.append(
+                    executor.submit(
+                        _fold_db_chunk_worker,
+                        [str(path) for path in chunk],
+                        str(temp_dir),
+                        fold_config,
+                    )
+                )
+            for future in futures:
+                chunk_totals.append(dict(future.result()))
+
+        with (
+            sqlite3.connect(paths.current_state) as state_conn,
+            sqlite3.connect(paths.graph) as graph_conn,
+            sqlite3.connect(paths.replay_queue) as replay_conn,
+        ):
+            for temp_dir in sorted(temp_dirs):
+                _merge_compact_memory_dir_into_main(
+                    temp_dir=temp_dir,
+                    state_conn=state_conn,
+                    graph_conn=graph_conn,
+                    replay_conn=replay_conn,
+                    fold_config=fold_config,
+                )
+            for graph_path in live_graph_paths:
+                _ingest_live_graph_export(graph_conn, graph_path, fold_config)
+                totals["graph_live_exports_ingested"] += 1
+            _upsert_temporal_milestones(state_conn, temporal_rows)
+            _trim_representative_examples(state_conn, fold_config)
+            _trim_replay_queue(replay_conn, fold_config)
+            summary = _build_memory_summary_from_connections(
+                state_conn=state_conn,
+                graph_conn=graph_conn,
+                replay_conn=replay_conn,
+                paths=paths,
+            )
+            for key in (
+                "stable_contingencies_added",
+                "transformation_families_added",
+                "carrier_candidates_added",
+                "contradiction_clusters_added",
+            ):
+                totals[key] = sum(int(item.get(key, 0) or 0) for item in chunk_totals)
+            totals["replay_queue_size"] = int(summary.get("replay_queue_size", 0) or 0)
+            totals["representative_examples_retained"] = int(summary.get("representative_example_count", 0) or 0)
+            totals["graph_node_count"] = int(summary.get("graph_node_count", 0) or 0)
+            totals["graph_edge_count"] = int(summary.get("graph_edge_count", 0) or 0)
+            totals["db_files_folded"] = len(db_paths)
+            summary.update(totals)
+            summary["fold_summary"] = dict(totals)
+            _write_memory_summary_table(state_conn, summary)
+            paths.summary_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+            state_conn.commit()
+            graph_conn.commit()
+            replay_conn.commit()
+        return totals
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def _fold_parallel_worker_count(db_count: int) -> int:
+    if db_count < 8:
+        return 1
+    cpu_count = os.cpu_count() or 1
+    return max(1, min(30, cpu_count, db_count))
+
+
+def _fold_db_chunk_worker(db_paths: list[str], temp_memory_dir: str, fold_config: CompactMemoryFoldConfig) -> dict[str, Any]:
+    temp_paths = ensure_memory_layout(temp_memory_dir)
+    totals = {
+        "stable_contingencies_added": 0,
+        "transformation_families_added": 0,
+        "carrier_candidates_added": 0,
+        "contradiction_clusters_added": 0,
+        "replay_queue_size": 0,
+        "representative_examples_retained": 0,
+        "graph_node_count": 0,
+        "graph_edge_count": 0,
+        "graph_live_exports_ingested": 0,
+        "db_files_folded": len(db_paths),
+        "total_interactions_seen": 0,
+    }
+    with (
+        sqlite3.connect(temp_paths.current_state) as state_conn,
+        sqlite3.connect(temp_paths.graph) as graph_conn,
+        sqlite3.connect(temp_paths.replay_queue) as replay_conn,
+    ):
+        for db_path in [Path(item) for item in db_paths]:
+            _fold_single_db(
+                db_path=db_path,
+                state_conn=state_conn,
+                graph_conn=graph_conn,
+                replay_conn=replay_conn,
+                fold_config=fold_config,
+                totals=totals,
+            )
+        summary = _build_memory_summary_from_connections(
+            state_conn=state_conn,
+            graph_conn=graph_conn,
+            replay_conn=replay_conn,
+            paths=temp_paths,
+        )
+        totals["replay_queue_size"] = int(summary.get("replay_queue_size", 0) or 0)
+        totals["representative_examples_retained"] = int(summary.get("representative_example_count", 0) or 0)
+        totals["graph_node_count"] = int(summary.get("graph_node_count", 0) or 0)
+        totals["graph_edge_count"] = int(summary.get("graph_edge_count", 0) or 0)
+        summary.update(totals)
+        summary["fold_summary"] = dict(totals)
+        _write_memory_summary_table(state_conn, summary)
+        temp_paths.summary_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
         state_conn.commit()
         graph_conn.commit()
         replay_conn.commit()
@@ -401,6 +560,190 @@ def canonical_family_signature_from_raw_db(raw_conn: sqlite3.Connection, family_
 
 def stable_family_int_id(canonical_signature: str) -> int:
     return int.from_bytes(sha1(str(canonical_signature).encode("utf-8")).digest()[:8], "big") % 2_147_483_647
+
+
+def _merge_compact_memory_dir_into_main(
+    *,
+    temp_dir: Path,
+    state_conn: sqlite3.Connection,
+    graph_conn: sqlite3.Connection,
+    replay_conn: sqlite3.Connection,
+    fold_config: CompactMemoryFoldConfig,
+) -> None:
+    temp_paths = ensure_memory_layout(temp_dir)
+    with (
+        sqlite3.connect(temp_paths.current_state) as temp_state,
+        sqlite3.connect(temp_paths.graph) as temp_graph,
+        sqlite3.connect(temp_paths.replay_queue) as temp_replay,
+    ):
+        temp_state.row_factory = sqlite3.Row
+        temp_graph.row_factory = sqlite3.Row
+        temp_replay.row_factory = sqlite3.Row
+        _merge_state_tables(temp_state, state_conn, fold_config)
+        _merge_graph_tables(temp_graph, graph_conn, fold_config)
+        _merge_replay_queue(temp_replay, replay_conn)
+
+
+def _merge_state_tables(temp_state: sqlite3.Connection, state_conn: sqlite3.Connection, fold_config: CompactMemoryFoldConfig) -> None:
+    for row in temp_state.execute("SELECT * FROM family_identity_map ORDER BY canonical_signature ASC").fetchall():
+        _upsert_family_identity_map(state_conn, str(row["canonical_signature"]), int(row["stable_family_id"]))
+    for row in temp_state.execute("SELECT * FROM stable_contingencies ORDER BY canonical_key ASC").fetchall():
+        state_conn.execute(
+            """
+            INSERT INTO stable_contingencies (
+                contingency_id, canonical_key, game, sampler, context_level, action, effect_signature, support_count,
+                first_seen_global_step, last_seen_global_step, stability_score, mean_prediction_error,
+                mean_replay_priority, representative_example_count
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(canonical_key) DO UPDATE SET
+                support_count = MAX(stable_contingencies.support_count, excluded.support_count),
+                context_level = MAX(stable_contingencies.context_level, excluded.context_level),
+                first_seen_global_step = MIN(stable_contingencies.first_seen_global_step, excluded.first_seen_global_step),
+                last_seen_global_step = MAX(stable_contingencies.last_seen_global_step, excluded.last_seen_global_step),
+                stability_score = MAX(stable_contingencies.stability_score, excluded.stability_score),
+                representative_example_count = MAX(stable_contingencies.representative_example_count, excluded.representative_example_count)
+            """,
+            tuple(row[column] for column in row.keys()),
+        )
+    for row in temp_state.execute("SELECT * FROM transformation_families ORDER BY canonical_signature ASC").fetchall():
+        state_conn.execute(
+            """
+            INSERT INTO transformation_families (
+                family_id, canonical_signature, relaxed_signature, effect_type, action_group, polarity,
+                support_count, member_count, first_seen_global_step, last_seen_global_step, stability_score
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(canonical_signature) DO UPDATE SET
+                support_count = transformation_families.support_count + excluded.support_count,
+                member_count = transformation_families.member_count + excluded.member_count,
+                first_seen_global_step = MIN(transformation_families.first_seen_global_step, excluded.first_seen_global_step),
+                last_seen_global_step = MAX(transformation_families.last_seen_global_step, excluded.last_seen_global_step),
+                stability_score = MAX(transformation_families.stability_score, excluded.stability_score)
+            """,
+            tuple(row[column] for column in row.keys()),
+        )
+    for row in temp_state.execute("SELECT * FROM family_members ORDER BY family_signature ASC, contingency_key ASC").fetchall():
+        state_conn.execute(
+            """
+            INSERT INTO family_members (
+                family_signature, contingency_key, support_count, first_seen_global_step, last_seen_global_step
+            )
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(family_signature, contingency_key) DO UPDATE SET
+                support_count = family_members.support_count + excluded.support_count,
+                first_seen_global_step = MIN(family_members.first_seen_global_step, excluded.first_seen_global_step),
+                last_seen_global_step = MAX(family_members.last_seen_global_step, excluded.last_seen_global_step)
+            """,
+            tuple(row[column] for column in row.keys()),
+        )
+    for row in temp_state.execute("SELECT * FROM carrier_candidates ORDER BY carrier_signature ASC").fetchall():
+        state_conn.execute(
+            """
+            INSERT INTO carrier_candidates (
+                carrier_id, carrier_signature, carrier_source, support_count, linked_family_count,
+                first_seen_global_step, last_seen_global_step, stability_score, is_emergent
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(carrier_signature) DO UPDATE SET
+                support_count = MAX(carrier_candidates.support_count, excluded.support_count),
+                linked_family_count = MAX(carrier_candidates.linked_family_count, excluded.linked_family_count),
+                first_seen_global_step = MIN(carrier_candidates.first_seen_global_step, excluded.first_seen_global_step),
+                last_seen_global_step = MAX(carrier_candidates.last_seen_global_step, excluded.last_seen_global_step),
+                stability_score = MAX(carrier_candidates.stability_score, excluded.stability_score),
+                is_emergent = MAX(carrier_candidates.is_emergent, excluded.is_emergent)
+            """,
+            tuple(row[column] for column in row.keys()),
+        )
+    for row in temp_state.execute("SELECT * FROM carrier_links ORDER BY carrier_signature ASC, linked_type ASC, linked_key ASC").fetchall():
+        _upsert_carrier_link(
+            state_conn,
+            carrier_signature=str(row["carrier_signature"]),
+            linked_type=str(row["linked_type"]),
+            linked_key=None if row["linked_key"] is None else str(row["linked_key"]),
+            fold_config=CompactMemoryFoldConfig(
+                global_step_start=int(row["first_seen_global_step"] or fold_config.global_step_start),
+                global_step_end=int(row["last_seen_global_step"] or fold_config.global_step_end),
+            ),
+        )
+    for row in temp_state.execute("SELECT * FROM contradiction_clusters ORDER BY canonical_key ASC").fetchall():
+        state_conn.execute(
+            """
+            INSERT INTO contradiction_clusters (
+                cluster_id, canonical_key, support_count, first_seen_global_step, last_seen_global_step,
+                max_prediction_error, mean_replay_priority
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(canonical_key) DO UPDATE SET
+                support_count = contradiction_clusters.support_count + excluded.support_count,
+                first_seen_global_step = MIN(contradiction_clusters.first_seen_global_step, excluded.first_seen_global_step),
+                last_seen_global_step = MAX(contradiction_clusters.last_seen_global_step, excluded.last_seen_global_step),
+                max_prediction_error = MAX(contradiction_clusters.max_prediction_error, excluded.max_prediction_error),
+                mean_replay_priority = MAX(contradiction_clusters.mean_replay_priority, excluded.mean_replay_priority)
+            """,
+            tuple(row[column] for column in row.keys()),
+        )
+    for row in temp_state.execute("SELECT * FROM representative_examples ORDER BY example_id ASC").fetchall():
+        state_conn.execute(
+            """
+            INSERT OR REPLACE INTO representative_examples (
+                example_id, owner_type, owner_id, game, sampler, seed, global_step, example_kind, compact_payload_json, priority_score
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            tuple(row[column] for column in row.keys()),
+        )
+    _upsert_temporal_milestones(
+        state_conn,
+        [dict(row) for row in temp_state.execute("SELECT * FROM temporal_milestones ORDER BY game ASC, sampler ASC, seed ASC").fetchall()],
+    )
+
+
+def _merge_graph_tables(temp_graph: sqlite3.Connection, graph_conn: sqlite3.Connection, fold_config: CompactMemoryFoldConfig) -> None:
+    for row in temp_graph.execute("SELECT * FROM graph_nodes ORDER BY node_id ASC").fetchall():
+        _upsert_graph_node(
+            graph_conn,
+            node_id=str(row["node_id"]),
+            node_type=str(row["node_type"] or "Unknown"),
+            canonical_key=None if row["canonical_key"] is None else str(row["canonical_key"]),
+            fold_config=CompactMemoryFoldConfig(
+                global_step_start=int(row["first_seen_global_step"] or fold_config.global_step_start),
+                global_step_end=int(row["last_seen_global_step"] or fold_config.global_step_end),
+            ),
+            support_count=int(row["support_count"] or 1),
+        )
+    for row in temp_graph.execute("SELECT * FROM graph_edges ORDER BY edge_id ASC").fetchall():
+        _upsert_graph_edge(
+            graph_conn,
+            source_node_id=str(row["source_node_id"]),
+            target_node_id=str(row["target_node_id"]),
+            edge_type=str(row["edge_type"] or "related_to"),
+            fold_config=CompactMemoryFoldConfig(
+                global_step_start=int(row["first_seen_global_step"] or fold_config.global_step_start),
+                global_step_end=int(row["last_seen_global_step"] or fold_config.global_step_end),
+            ),
+            support_count=int(row["support_count"] or 1),
+            weight=float(row["weight"] or 1.0),
+        )
+
+
+def _merge_replay_queue(temp_replay: sqlite3.Connection, replay_conn: sqlite3.Connection) -> None:
+    for row in temp_replay.execute("SELECT * FROM replay_queue ORDER BY replay_id ASC").fetchall():
+        replay_conn.execute(
+            """
+            INSERT INTO replay_queue (
+                replay_id, owner_type, owner_id, priority_score, reason,
+                first_seen_global_step, last_seen_global_step, compact_payload_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(replay_id) DO UPDATE SET
+                priority_score = MAX(replay_queue.priority_score, excluded.priority_score),
+                first_seen_global_step = MIN(replay_queue.first_seen_global_step, excluded.first_seen_global_step),
+                last_seen_global_step = MAX(replay_queue.last_seen_global_step, excluded.last_seen_global_step),
+                compact_payload_json = excluded.compact_payload_json
+            """,
+            tuple(row[column] for column in row.keys()),
+        )
 
 
 def _fold_single_db(
@@ -1270,6 +1613,14 @@ def _build_memory_summary_from_connections(
         state_conn,
         "SELECT COUNT(*) FROM world_model_components WHERE COALESCE(is_coherent, 0) = 1",
     )
+    future_option_event_count = _count_rows(state_conn, "future_option_events")
+    future_option_motif_count = _count_rows(state_conn, "future_option_motifs")
+    emergent_future_option_motif_count = _safe_scalar(
+        state_conn,
+        "SELECT COUNT(*) FROM future_option_motifs WHERE COALESCE(is_emergent, 0) = 1",
+    )
+    future_option_attention_link_count = _count_rows(state_conn, "future_option_attention_links")
+    future_option_transfer_link_count = _count_rows(state_conn, "future_option_transfer_links")
     contradiction_count = _count_rows(state_conn, "contradiction_clusters")
     example_count = _count_rows(state_conn, "representative_examples")
     emergent_carrier_count = int(
@@ -1288,6 +1639,11 @@ def _build_memory_summary_from_connections(
         "promoted_concept_count": promoted_concept_count,
         "world_model_component_count": world_model_component_count,
         "coherent_world_model_component_count": coherent_world_model_component_count,
+        "future_option_event_count": future_option_event_count,
+        "future_option_motif_count": future_option_motif_count,
+        "emergent_future_option_motif_count": emergent_future_option_motif_count,
+        "future_option_attention_link_count": future_option_attention_link_count,
+        "future_option_transfer_link_count": future_option_transfer_link_count,
         "contradiction_cluster_count": contradiction_count,
         "representative_example_count": example_count,
         "graph_node_count": _count_rows(graph_conn, "graph_nodes"),
@@ -1309,6 +1665,11 @@ def _build_memory_summary_from_connections(
         "promoted_concept_count",
         "world_model_component_count",
         "coherent_world_model_component_count",
+        "future_option_event_count",
+        "future_option_motif_count",
+        "emergent_future_option_motif_count",
+        "future_option_attention_link_count",
+        "future_option_transfer_link_count",
         "graph_node_count",
         "graph_edge_count",
         "replay_queue_size",
@@ -1611,6 +1972,91 @@ def _ensure_current_state_schema(path: Path) -> None:
                 first_global_step INTEGER,
                 evidence_key TEXT
             );
+            CREATE TABLE IF NOT EXISTS future_option_events (
+                event_id TEXT PRIMARY KEY,
+                owner_type TEXT,
+                owner_key TEXT,
+                game TEXT,
+                sampler TEXT,
+                context_key TEXT,
+                action_key TEXT,
+                source_kind TEXT,
+                motif_type TEXT,
+                option_delta REAL,
+                option_delta_bucket TEXT,
+                option_count_before REAL,
+                option_count_after REAL,
+                novelty_score REAL,
+                reversibility_score REAL,
+                branching_score REAL,
+                termination_score REAL,
+                contradiction_score REAL,
+                replay_priority_score REAL,
+                memory_priority_score REAL,
+                first_seen_global_step INTEGER,
+                last_seen_global_step INTEGER,
+                evidence_json TEXT
+            );
+            CREATE TABLE IF NOT EXISTS future_option_motifs (
+                motif_signature TEXT PRIMARY KEY,
+                motif_type TEXT,
+                support_count INTEGER,
+                linked_event_count INTEGER,
+                linked_family_count INTEGER,
+                linked_carrier_count INTEGER,
+                linked_role_count INTEGER,
+                linked_concept_count INTEGER,
+                cross_context_count INTEGER,
+                cross_game_count INTEGER,
+                mean_option_delta REAL,
+                mean_abs_option_delta REAL,
+                mean_novelty_score REAL,
+                mean_reversibility_score REAL,
+                mean_branching_score REAL,
+                mean_termination_score REAL,
+                mean_replay_priority_score REAL,
+                first_seen_global_step INTEGER,
+                last_seen_global_step INTEGER,
+                motif_stability_score REAL,
+                is_emergent INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS future_option_links (
+                motif_signature TEXT,
+                linked_type TEXT,
+                linked_key TEXT,
+                support_count INTEGER,
+                first_seen_global_step INTEGER,
+                last_seen_global_step INTEGER,
+                PRIMARY KEY (motif_signature, linked_type, linked_key)
+            );
+            CREATE TABLE IF NOT EXISTS future_option_attention_links (
+                event_id TEXT PRIMARY KEY,
+                motif_signature TEXT,
+                owner_type TEXT,
+                owner_key TEXT,
+                option_delta_abs REAL,
+                replay_priority_score REAL,
+                memory_priority_score REAL,
+                contradiction_score REAL,
+                high_option_change INTEGER,
+                high_attention INTEGER,
+                first_seen_global_step INTEGER,
+                last_seen_global_step INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS future_option_transfer_links (
+                motif_signature TEXT,
+                role_signature TEXT,
+                concept_signature TEXT,
+                transfer_attempt_count INTEGER,
+                successful_transfer_count INTEGER,
+                strong_transfer_success_count INTEGER,
+                promoted_concept_count INTEGER,
+                mean_transfer_score REAL,
+                mean_best_margin REAL,
+                first_seen_global_step INTEGER,
+                last_seen_global_step INTEGER,
+                PRIMARY KEY (motif_signature, role_signature, concept_signature)
+            );
             CREATE INDEX IF NOT EXISTS idx_role_links_type_key
             ON role_links(linked_type, linked_key);
             CREATE INDEX IF NOT EXISTS idx_role_transfer_role
@@ -1621,6 +2067,18 @@ def _ensure_current_state_schema(path: Path) -> None:
             ON concept_links(linked_type, linked_key);
             CREATE INDEX IF NOT EXISTS idx_world_model_links_type_key
             ON world_model_links(linked_type, linked_key);
+            CREATE INDEX IF NOT EXISTS idx_future_option_events_owner
+            ON future_option_events(owner_type, owner_key);
+            CREATE INDEX IF NOT EXISTS idx_future_option_events_motif
+            ON future_option_events(motif_type, option_delta_bucket);
+            CREATE INDEX IF NOT EXISTS idx_future_option_motifs_emergent
+            ON future_option_motifs(is_emergent, motif_type);
+            CREATE INDEX IF NOT EXISTS idx_future_option_links_type_key
+            ON future_option_links(linked_type, linked_key);
+            CREATE INDEX IF NOT EXISTS idx_future_option_attention_flags
+            ON future_option_attention_links(high_option_change, high_attention);
+            CREATE INDEX IF NOT EXISTS idx_future_option_transfer_motif
+            ON future_option_transfer_links(motif_signature);
             """
         )
         _ensure_column(connection, "stable_contingencies", "context_level", "INTEGER DEFAULT 0")

@@ -152,6 +152,8 @@ H02_DEFAULTS: dict[str, Any] = {
     "replay_priority_active": False,
     "object_carrier_absent_or_negligible": False,
     "carrier_timing_note": "",
+    "raw_h02_evidence_incomplete": False,
+    "compact_h02_fallback_used": False,
     "evidence_for": [],
     "evidence_against": [],
     "missing_evidence": [],
@@ -255,12 +257,30 @@ def evaluate_h02_prediction_violation_attention(
         result[field] = report_metrics.get(field)
         if result[field] is None:
             result[field] = db_metrics.get(field)
-    if memory_dir is not None and not sqlite_paths:
+    compact_metrics: dict[str, Any] = {}
+    raw_h02_incomplete = False
+    if memory_dir is not None:
         compact_metrics = _extract_h02_compact_metrics(Path(memory_dir))
-        for key, value in compact_metrics.items():
-            if result.get(key) is None:
-                result[key] = value
-        result["evidence_source"] = "mixed" if input_report_found else "compact_memory"
+        raw_h02_incomplete = _raw_h02_evidence_is_empty_or_incomplete(
+            input_report=input_report,
+            sqlite_paths=sqlite_paths,
+            report_metrics=report_metrics,
+            db_metrics=db_metrics,
+            direct_metrics=direct_metrics,
+        )
+        result["raw_h02_evidence_incomplete"] = raw_h02_incomplete
+        if raw_h02_incomplete:
+            for key, value in compact_metrics.items():
+                if value is not None:
+                    current_value = result.get(key)
+                    if current_value in (None, 0, 0.0, False, ""):
+                        result[key] = value
+            result["compact_h02_fallback_used"] = any(value is not None for value in compact_metrics.values())
+            result["evidence_source"] = "compact_memory" if not input_report_found else "mixed_compact_memory_fallback"
+        else:
+            for key, value in compact_metrics.items():
+                if result.get(key) is None and value is not None:
+                    result[key] = value
 
     result.update(direct_metrics)
 
@@ -350,7 +370,25 @@ def evaluate_h02_prediction_violation_attention(
         and _gt(result.get("prediction_violation_replay_lift"), 1.0) is False
     )
 
-    if invalid_core or direct_replay_lift_invalid:
+    compact_has_prediction_error = _gt(result.get("mean_isf_prediction_error"), 0.0) is True
+    compact_has_contradiction = _gt(result.get("context_contradiction_count"), 0) is True
+    compact_has_replay = _gt(result.get("memory_replay_candidate_count"), 0) is True
+
+    if raw_h02_incomplete and not compact_has_prediction_error and not compact_has_contradiction and not compact_has_replay:
+        result["h02a_replay_attention_decision"] = "INCONCLUSIVE"
+        result["h02a_replay_attention_conclusion"] = (
+            "H02A remains inconclusive because raw aggregate evidence is incomplete and compact memory does not provide enough replay/contradiction evidence."
+        )
+        result["missing_evidence"].append(
+            "H02 raw aggregate evidence incomplete and compact replay/contradiction evidence insufficient."
+        )
+    elif raw_h02_incomplete and compact_has_replay and not compact_has_prediction_error:
+        result["h02a_replay_attention_decision"] = "PARTIALLY_VALID"
+        result["h02a_replay_attention_conclusion"] = (
+            "H02A is partially supported from compact replay evidence, but direct prediction-violation linkage is unavailable."
+        )
+        result["missing_evidence"].append("Direct prediction-violation to replay-priority linkage unavailable.")
+    elif invalid_core or direct_replay_lift_invalid:
         result["h02a_replay_attention_decision"] = "INVALID"
         if invalid_core:
             result["h02a_replay_attention_conclusion"] = (
@@ -396,6 +434,53 @@ def evaluate_h02_prediction_violation_attention(
     _populate_evidence_lists(result)
     _finalize_h02_result(result, output_dir)
     return result
+
+
+def _raw_h02_evidence_is_empty_or_incomplete(
+    *,
+    input_report: dict[str, Any] | None,
+    sqlite_paths: list[Path],
+    report_metrics: dict[str, Any],
+    db_metrics: dict[str, Any],
+    direct_metrics: dict[str, Any],
+) -> bool:
+    if input_report is None:
+        return True
+    runs = input_report.get("runs")
+    if not isinstance(runs, list) or not runs:
+        return True
+    candidates = [
+        report_metrics.get("mean_isf_prediction_error"),
+        report_metrics.get("context_contradiction_count"),
+        report_metrics.get("repeated_contradiction_count"),
+        report_metrics.get("memory_replay_candidate_count"),
+        report_metrics.get("high_priority_replay_count"),
+        direct_metrics.get("prediction_violation_replay_lift"),
+        db_metrics.get("mean_isf_prediction_error"),
+        db_metrics.get("context_contradiction_count"),
+        db_metrics.get("repeated_contradiction_count"),
+        db_metrics.get("memory_replay_candidate_count"),
+        db_metrics.get("high_priority_replay_count"),
+    ]
+    positive_present = any(value not in (None, 0, 0.0, False, "") for value in candidates)
+    if not positive_present:
+        return True
+    if direct_metrics.get("direct_replay_lift_available") is not True:
+        aggregate_fields = (
+            report_metrics.get("mean_isf_prediction_error"),
+            report_metrics.get("context_contradiction_count"),
+            report_metrics.get("repeated_contradiction_count"),
+            report_metrics.get("memory_replay_candidate_count"),
+            report_metrics.get("high_priority_replay_count"),
+            db_metrics.get("mean_isf_prediction_error"),
+            db_metrics.get("context_contradiction_count"),
+            db_metrics.get("repeated_contradiction_count"),
+            db_metrics.get("memory_replay_candidate_count"),
+            db_metrics.get("high_priority_replay_count"),
+        )
+        if all(value in (None, 0, 0.0, False, "") for value in aggregate_fields):
+            return True
+    return False
 
 
 def _extract_h02_compact_metrics(memory_dir: Path) -> dict[str, Any]:

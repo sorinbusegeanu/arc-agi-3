@@ -96,8 +96,11 @@ def evaluate_h04_carrier_emergence(
         "first_carrier_candidate_step": first_carrier_candidate_step,
         "first_emergent_carrier_step": first_emergent_carrier_step,
         "h03_before_h04_cases": 0 if h03_before_h04 is None else 1,
+        "temporal_order_required_for_valid": True,
+        "h03_before_h04": h03_before_h04,
         **graph_counts,
     }
+    missing_evidence = [] if carrier_rows else ["no carrier candidates in compact memory"]
     if not carrier_rows:
         decision = "INVALID" if first_stable_family_step is not None else "INCONCLUSIVE"
     elif (
@@ -106,9 +109,28 @@ def evaluate_h04_carrier_emergence(
         and (metrics["carrier_cross_family_count"] >= 2 or metrics["carrier_cross_context_count"] >= 2)
         and graph_counts["carrier_explains_edge_count"] > 0
         and graph_counts["carrier_anchors_edge_count"] > 0
-        and (h03_before_h04 is True or h03_before_h04 is None)
+        and h03_before_h04 is False
+    ):
+        decision = "INVALID"
+    elif (
+        emergent
+        and not emergent_fallback
+        and (metrics["carrier_cross_family_count"] >= 2 or metrics["carrier_cross_context_count"] >= 2)
+        and graph_counts["carrier_explains_edge_count"] > 0
+        and graph_counts["carrier_anchors_edge_count"] > 0
+        and h03_before_h04 is True
     ):
         decision = "VALID"
+    elif (
+        emergent
+        and not emergent_fallback
+        and (metrics["carrier_cross_family_count"] >= 2 or metrics["carrier_cross_context_count"] >= 2)
+        and graph_counts["carrier_explains_edge_count"] > 0
+        and graph_counts["carrier_anchors_edge_count"] > 0
+        and h03_before_h04 is None
+    ):
+        decision = "PARTIALLY_VALID"
+        missing_evidence.append("explicit H03-before-H04 temporal evidence unavailable")
     elif emergent_fallback and len(emergent_fallback) == len(emergent):
         decision = "INVALID"
     elif carrier_rows:
@@ -119,7 +141,7 @@ def evaluate_h04_carrier_emergence(
         "hypothesis_id": "H04",
         "decision": decision,
         "core_metrics": metrics,
-        "missing_evidence": [] if carrier_rows else ["no carrier candidates in compact memory"],
+        "missing_evidence": missing_evidence,
         "evidence_source": "compact_memory",
     }
     _write_outputs(result, output_dir)

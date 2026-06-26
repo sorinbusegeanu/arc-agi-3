@@ -84,7 +84,8 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
         previous_peak_workers = int(manifest.get("last_sampling_peak_workers", config.workers) or config.workers)
         requested_workers = max(1, int(config.workers))
         max_epoch_workers = max(1, min(requested_workers, previous_peak_workers))
-        initial_epoch_workers = max(1, math.ceil(max_epoch_workers / 2.0))
+        initial_epoch_workers = 1
+        initial_worker_ramp_delay_seconds = 0.0
         ram_snapshot_at_epoch_start = _system_ram_snapshot()
         epoch_start_payload = {
             "epoch_id": epoch_id,
@@ -94,7 +95,7 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
             "max_epoch_workers": max_epoch_workers,
             "initial_epoch_workers": initial_epoch_workers,
             "ram_ramp_threshold_percent": float(config.ram_ramp_threshold_percent),
-            "initial_worker_ramp_delay_seconds": float(config.initial_worker_ramp_delay_seconds),
+            "initial_worker_ramp_delay_seconds": float(initial_worker_ramp_delay_seconds),
             "per_worker_ramp_delay_seconds": float(config.per_worker_ramp_delay_seconds),
             "ram_snapshot_at_epoch_start": ram_snapshot_at_epoch_start,
         }
@@ -121,7 +122,7 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
                 initial_workers=initial_epoch_workers,
                 enable_worker_ramp=True,
                 ram_ramp_threshold_percent=float(config.ram_ramp_threshold_percent),
-                initial_worker_ramp_delay_seconds=float(config.initial_worker_ramp_delay_seconds),
+                initial_worker_ramp_delay_seconds=float(initial_worker_ramp_delay_seconds),
                 per_worker_ramp_delay_seconds=float(config.per_worker_ramp_delay_seconds),
             )
         )
@@ -175,6 +176,9 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
         h06_metrics = suite_summary.get("H06 core metrics", {}) or {}
         h07_metrics = suite_summary.get("H07 core metrics", {}) or {}
         h08_metrics = suite_summary.get("H08 core metrics", {}) or {}
+        h09_metrics = suite_summary.get("H09 core metrics", {}) or {}
+        h10_metrics = suite_summary.get("H10 core metrics", {}) or {}
+        h11_metrics = suite_summary.get("H11 core metrics", {}) or {}
         status = {
             "epoch_id": epoch_id,
             "global_step_start": global_step_start,
@@ -194,6 +198,9 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
             "H06": suite_summary.get("H06 decision"),
             "H07": suite_summary.get("H07 decision"),
             "H08": suite_summary.get("H08 decision"),
+            "H09": suite_summary.get("H09 decision"),
+            "H10": suite_summary.get("H10 decision"),
+            "H11": suite_summary.get("H11 decision"),
             "stable_contingencies": (suite_summary.get("H01 core metrics") or {}).get("stable_contingency_count"),
             "games_with_stable_contingencies": (suite_summary.get("H01 core metrics") or {}).get("games_with_stable_contingencies"),
             "replay_lift": (suite_summary.get("H02 core metrics") or {}).get("prediction_violation_replay_lift"),
@@ -216,12 +223,20 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
             "world_model_components": h08_metrics.get("world_model_component_count"),
             "coherent_world_model_components": h08_metrics.get("coherent_world_model_component_count"),
             "candidate_only_world_model_components": h08_metrics.get("candidate_only_world_model_component_count"),
+            "future_option_events": h09_metrics.get("future_option_event_count"),
+            "future_option_motifs": h09_metrics.get("future_option_motif_count"),
+            "emergent_future_option_motifs": h09_metrics.get("emergent_future_option_motif_count"),
+            "option_attention_lift": h10_metrics.get("option_attention_lift"),
+            "high_option_change_attention_rate": h10_metrics.get("high_option_change_attention_rate"),
+            "future_option_transfer_links": h11_metrics.get("future_option_transfer_link_count"),
+            "motifs_with_strong_transfer": h11_metrics.get("motifs_with_strong_transfer_count"),
+            "motifs_with_promoted_concepts": h11_metrics.get("motifs_with_promoted_concept_count"),
             "workers_requested": requested_workers,
             "workers_initial": initial_epoch_workers,
             "workers_max_epoch": max_epoch_workers,
             "worker_execution": worker_execution,
             "ram_snapshot_at_epoch_start": ram_snapshot_at_epoch_start,
-            "initial_worker_ramp_delay_seconds": float(config.initial_worker_ramp_delay_seconds),
+            "initial_worker_ramp_delay_seconds": float(initial_worker_ramp_delay_seconds),
             "per_worker_ramp_delay_seconds": float(config.per_worker_ramp_delay_seconds),
             "cleanup": cleanup_summary,
             "memory_continuity": continuity_report,
@@ -255,7 +270,7 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
                 "workers_max_epoch": max_epoch_workers,
                 "worker_execution": worker_execution,
                 "ram_snapshot_at_epoch_start": ram_snapshot_at_epoch_start,
-                "initial_worker_ramp_delay_seconds": float(config.initial_worker_ramp_delay_seconds),
+                "initial_worker_ramp_delay_seconds": float(initial_worker_ramp_delay_seconds),
                 "per_worker_ramp_delay_seconds": float(config.per_worker_ramp_delay_seconds),
                 "deltas": deltas,
             }
@@ -430,6 +445,17 @@ def _format_epoch_status(status: dict[str, Any]) -> str:
         f"world model components: {status.get('world_model_components')}\n"
         f"coherent components: {status.get('coherent_world_model_components')}\n"
         f"candidate-only components: {status.get('candidate_only_world_model_components')}\n\n"
+        f"H09: {status.get('H09')}\n"
+        f"future-option events: {status.get('future_option_events')}\n"
+        f"future-option motifs: {status.get('future_option_motifs')}\n"
+        f"emergent motifs: {status.get('emergent_future_option_motifs')}\n\n"
+        f"H10: {status.get('H10')}\n"
+        f"option-attention lift: {status.get('option_attention_lift')}\n"
+        f"high-option-change attention rate: {status.get('high_option_change_attention_rate')}\n\n"
+        f"H11: {status.get('H11')}\n"
+        f"future-option transfer links: {status.get('future_option_transfer_links')}\n"
+        f"motifs with strong transfer: {status.get('motifs_with_strong_transfer')}\n"
+        f"motifs with promoted concepts: {status.get('motifs_with_promoted_concepts')}\n\n"
         f"Cleanup:\n"
         f"deleted raw files: {cleanup.get('raw_files_deleted_count')}\n"
         f"freed: {cleanup.get('disk_freed_bytes', 0) / (1024 ** 3):.3f} GB\n\n"
