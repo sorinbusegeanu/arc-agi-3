@@ -138,6 +138,7 @@ from v6.evaluation.validation_report import build_validation_report
 from v6.graph.graph_manager import GraphManager
 from v6.interaction_significance import compute_interaction_significance
 from v6.main import V6Config, V6System
+from v6.memory.compact_memory import CompactMemoryFoldConfig, ensure_memory_layout, fold_sampling_job_sidecars_into_compact_memory, load_memory_summary
 from v6.memory.contingency_store import ContingencyStore
 from v6.memory.interaction_store import Interaction, InteractionStore, encode_array
 from v6.memory_lifecycle import MemoryLifecycleManager
@@ -7043,6 +7044,69 @@ def test_v05c_sampling_db_ready_accepts_fast_postprocessing_without_future_effec
         connection.commit()
 
     assert interaction_sampling._sampling_db_ready(db_path) is True
+
+
+def test_incremental_sidecar_fold_deletes_large_json_sidecars(tmp_path) -> None:
+    raw_dir = tmp_path / "raw" / "sampling_v05c" / "tt01" / "mixed" / "steps_10"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    db_path = raw_dir / "seed_0.sqlite"
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE transformation_families (id INTEGER PRIMARY KEY, centroid_vector TEXT, support_count INTEGER);
+            INSERT INTO transformation_families (id, centroid_vector, support_count) VALUES (1, '[1,0,0]', 3);
+            """
+        )
+        connection.commit()
+    db_path.with_name("live_graph_compact.json").write_text(
+        json.dumps(
+            {
+                "nodes": [{"node_id": "carrier:c1", "node_type": "carrier", "canonical_key": "c1", "support_count": 1}],
+                "edges": [],
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    db_path.with_name("carrier_candidates.json").write_text(
+        json.dumps(
+            [
+                {
+                    "carrier_id": "c1",
+                    "carrier_signature": "c1",
+                    "carrier_source": "object",
+                    "support_count": 3,
+                    "distinct_family_count": 1,
+                    "family_id": 1,
+                    "context_signature": "[1,2]",
+                    "status": "emergent_carrier",
+                }
+            ],
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    db_path.with_name("context_contradictions.json").write_text("{}", encoding="utf-8")
+    db_path.with_name("memory_lifecycle_summary.json").write_text("{}", encoding="utf-8")
+
+    memory_dir = tmp_path / "memory"
+    ensure_memory_layout(memory_dir)
+    summary = fold_sampling_job_sidecars_into_compact_memory(
+        db_path=db_path,
+        memory_dir=memory_dir,
+        fold_config=CompactMemoryFoldConfig(global_step_start=1, global_step_end=10),
+        delete_after_merge=True,
+    )
+
+    assert summary["graph_live_exports_ingested"] == 1
+    assert summary["carrier_candidates_added"] == 1
+    assert not db_path.with_name("live_graph_compact.json").exists()
+    assert not db_path.with_name("carrier_candidates.json").exists()
+    assert not db_path.with_name("context_contradictions.json").exists()
+    assert not db_path.with_name("memory_lifecycle_summary.json").exists()
+    assert db_path.exists()
+    memory_summary = load_memory_summary(memory_dir / "memory_summary.json")
+    assert memory_summary["incremental_sidecar_fold"]["db_path"] == str(db_path)
 
 
 def test_v05c_resolve_scope_clamps_train_and_test_seeds_to_available_set() -> None:

@@ -137,6 +137,78 @@ def fold_epoch_raw_into_compact_memory(
     return totals
 
 
+def fold_sampling_job_sidecars_into_compact_memory(
+    *,
+    db_path: str | Path,
+    memory_dir: str | Path,
+    fold_config: CompactMemoryFoldConfig,
+    delete_after_merge: bool = True,
+) -> dict[str, Any]:
+    paths = ensure_memory_layout(memory_dir)
+    sqlite_path = Path(db_path)
+    live_graph_path = sqlite_path.with_name("live_graph_compact.json")
+    carrier_path = sqlite_path.with_name("carrier_candidates.json")
+    contradiction_path = sqlite_path.with_name("context_contradictions.json")
+    memory_summary_path = sqlite_path.with_name("memory_lifecycle_summary.json")
+    sidecars_present = any(path.exists() for path in (live_graph_path, carrier_path, contradiction_path, memory_summary_path))
+    totals = {
+        "graph_live_exports_ingested": 0,
+        "carrier_candidates_added": 0,
+        "deleted_sidecar_files": [],
+        "sidecar_files_present": int(sidecars_present),
+    }
+    if not sidecars_present:
+        return totals
+
+    with (
+        sqlite3.connect(paths.current_state) as state_conn,
+        sqlite3.connect(paths.graph) as graph_conn,
+        sqlite3.connect(paths.replay_queue) as replay_conn,
+        sqlite3.connect(sqlite_path) as raw_conn,
+    ):
+        raw_conn.row_factory = sqlite3.Row
+        if live_graph_path.exists():
+            _ingest_live_graph_export(graph_conn, live_graph_path, fold_config)
+            totals["graph_live_exports_ingested"] += 1
+        if carrier_path.exists():
+            _fold_carrier_candidates_sidecar(
+                raw_conn=raw_conn,
+                carrier_path=carrier_path,
+                state_conn=state_conn,
+                graph_conn=graph_conn,
+                fold_config=fold_config,
+                totals=totals,
+            )
+        summary = _build_memory_summary_from_connections(
+            state_conn=state_conn,
+            graph_conn=graph_conn,
+            replay_conn=replay_conn,
+            paths=paths,
+        )
+        summary.update({key: value for key, value in totals.items() if key not in {"deleted_sidecar_files"}})
+        summary["incremental_sidecar_fold"] = {
+            "db_path": str(sqlite_path),
+            "graph_live_exports_ingested": int(totals["graph_live_exports_ingested"]),
+            "carrier_candidates_added": int(totals["carrier_candidates_added"]),
+        }
+        _write_memory_summary_table(state_conn, summary)
+        paths.summary_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        state_conn.commit()
+        graph_conn.commit()
+        replay_conn.commit()
+
+    if delete_after_merge:
+        for path in (live_graph_path, carrier_path, contradiction_path, memory_summary_path):
+            if not path.exists():
+                continue
+            try:
+                path.unlink()
+                totals["deleted_sidecar_files"].append(str(path))
+            except OSError:
+                pass
+    return totals
+
+
 def _fold_epoch_raw_into_compact_memory_parallel(
     *,
     paths: CompactMemoryPaths,
@@ -1122,6 +1194,120 @@ def _upsert_family_identity_map(connection: sqlite3.Connection, canonical_signat
         """,
         (canonical_signature, int(stable_family_id)),
     )
+
+
+def _fold_carrier_candidates_sidecar(
+    *,
+    raw_conn: sqlite3.Connection,
+    carrier_path: Path,
+    state_conn: sqlite3.Connection,
+    graph_conn: sqlite3.Connection,
+    fold_config: CompactMemoryFoldConfig,
+    totals: dict[str, Any],
+) -> None:
+    db_parts = carrier_path.parts
+    game = db_parts[-4] if len(db_parts) >= 4 else "unknown"
+    sampler = db_parts[-3] if len(db_parts) >= 3 else "unknown"
+    seed = 0
+    for sqlite_candidate in sorted(carrier_path.parent.glob("seed_*.sqlite")):
+        try:
+            seed = int(sqlite_candidate.stem.split("_")[-1])
+            break
+        except (TypeError, ValueError):
+            continue
+    for item in json.loads(carrier_path.read_text(encoding="utf-8")):
+        carrier_signature = str(item.get("carrier_signature") or item.get("carrier_id") or "")
+        if not carrier_signature:
+            continue
+        carrier_source = str(item.get("carrier_source") or "unknown")
+        is_emergent = str(item.get("status") or "") == "emergent_carrier" and carrier_source != "context_action_fallback"
+        state_conn.execute(
+            """
+            INSERT INTO carrier_candidates (
+                carrier_id, carrier_signature, carrier_source, support_count, linked_family_count,
+                first_seen_global_step, last_seen_global_step, stability_score, is_emergent
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(carrier_signature) DO UPDATE SET
+                support_count = MAX(carrier_candidates.support_count, excluded.support_count),
+                linked_family_count = MAX(carrier_candidates.linked_family_count, excluded.linked_family_count),
+                first_seen_global_step = MIN(carrier_candidates.first_seen_global_step, excluded.first_seen_global_step),
+                last_seen_global_step = MAX(carrier_candidates.last_seen_global_step, excluded.last_seen_global_step),
+                stability_score = MAX(carrier_candidates.stability_score, excluded.stability_score),
+                is_emergent = MAX(carrier_candidates.is_emergent, excluded.is_emergent)
+            """,
+            (
+                str(item.get("carrier_id") or carrier_signature),
+                carrier_signature,
+                carrier_source,
+                int(item.get("support_count", 0) or 0),
+                int(item.get("distinct_family_count", 0) or item.get("linked_family_count", 0) or 0),
+                fold_config.global_step_start,
+                fold_config.global_step_end,
+                float(item.get("prediction_lift", 0.0) or item.get("stability_score", 0.0) or 0.0),
+                int(is_emergent),
+            ),
+        )
+        totals["carrier_candidates_added"] = int(totals.get("carrier_candidates_added", 0) or 0) + 1
+        family_signature = None
+        family_id = item.get("family_id")
+        if family_id not in (None, ""):
+            family_signature = canonical_family_signature_from_raw_db(raw_conn, family_id, item)
+        contingency_key = None
+        if item.get("context_signature") is not None and family_signature is not None:
+            contingency_key = canonicalize_context_action_effect(
+                context_signature=str(item.get("context_signature")),
+                action=item.get("action", "carrier"),
+                effect_signature=family_signature,
+            )
+        _retain_example(
+            state_conn,
+            owner_type="carrier",
+            owner_id=carrier_signature,
+            limit=fold_config.max_examples_per_carrier,
+            example_kind="support",
+            game=game,
+            sampler=sampler,
+            seed=seed,
+            global_step=fold_config.global_step_end,
+            priority_score=float(item.get("prediction_lift", 0.0) or 0.0) + float(item.get("support_count", 0) or 0),
+            compact_payload_json=json.dumps(item, sort_keys=True),
+        )
+        _upsert_carrier_link(
+            state_conn,
+            carrier_signature=carrier_signature,
+            linked_type="family",
+            linked_key=family_signature,
+            fold_config=fold_config,
+        )
+        _upsert_carrier_link(
+            state_conn,
+            carrier_signature=carrier_signature,
+            linked_type="context",
+            linked_key=None if item.get("context_signature") is None else _normalize_jsonish(item.get("context_signature")),
+            fold_config=fold_config,
+        )
+        _upsert_carrier_link(
+            state_conn,
+            carrier_signature=carrier_signature,
+            linked_type="contingency",
+            linked_key=contingency_key,
+            fold_config=fold_config,
+        )
+        _upsert_observation_graph(
+            graph_conn,
+            fold_config=fold_config,
+            game=game,
+            sampler=sampler,
+            context_signature=item.get("context_signature"),
+            action=None,
+            effect_signature=None,
+            contingency_key=contingency_key,
+            family_signature=family_signature,
+            carrier_signature=carrier_signature,
+            contradiction_key=None,
+            replay_id=None,
+        )
 
 
 def _upsert_stable_contingency(

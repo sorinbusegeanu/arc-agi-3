@@ -26,6 +26,7 @@ from v6.evaluation.id_free_prefuture_validation import ID_FREE_FEATURE_SETS, eva
 from v6.evaluation.prefuture_role_prediction import PREFUTURE_CLASSIFIERS, load_prefuture_examples
 from v6.game_sets import load_game_set_manifest, parquet_games_present
 from v6.main import V6Config, V6System
+from v6.memory.compact_memory import CompactMemoryFoldConfig, fold_sampling_job_sidecars_into_compact_memory
 from v6.sampling import make_sampler, sampler_registry
 from v6.storage.migration import migrate_sqlite_to_parquet
 
@@ -448,8 +449,19 @@ def _run_sampling_jobs(
                         _submit_until_target(executor)
                     continue
                 for future in done:
-                    future.result()
-                    active_futures.pop(future, None)
+                    result = future.result()
+                    job = active_futures.pop(future, None)
+                    if job is not None and job.get("memory_output_dir"):
+                        db_path = Path(str(job["db_path"]))
+                        fold_sampling_job_sidecars_into_compact_memory(
+                            db_path=db_path,
+                            memory_dir=str(job["memory_output_dir"]),
+                            fold_config=CompactMemoryFoldConfig(
+                                global_step_start=int(job.get("global_step_offset", 0) or 0) + 1,
+                                global_step_end=int(job.get("global_step_offset", 0) or 0) + int(job.get("steps", 0) or 0),
+                            ),
+                            delete_after_merge=True,
+                        )
                     progress.update(1)
                 _maybe_ramp()
                 _submit_until_target(executor)

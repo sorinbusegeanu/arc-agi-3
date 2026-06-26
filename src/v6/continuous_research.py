@@ -27,7 +27,7 @@ class ContinuousResearchConfig:
     stop_if_disk_above_percent: float = 90.0
     stop_if_no_new_stable_contingencies_for: int = 2
     scan_all_dbs: bool = False
-    max_db_files: int = 1000
+    max_db_files: int = 0
     max_rows: int = 1_000_000
     resume: bool = True
     cleanup: bool = True

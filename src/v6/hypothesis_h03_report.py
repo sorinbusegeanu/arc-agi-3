@@ -426,7 +426,10 @@ def compute_h03_family_metrics_from_existing_artifacts(
     run_dir = Path(run_dir)
     sqlite_paths = _find_sqlite_paths(run_dir)
     ranked_paths = _rank_sqlite_paths(run_dir, sqlite_paths, prefer_db=prefer_db)
-    limited_paths = ranked_paths[: max(1, int(max_db_files))]
+    if int(max_db_files) <= 0:
+        limited_paths = list(ranked_paths)
+    else:
+        limited_paths = ranked_paths[: max(1, int(max_db_files))]
     artifact_paths = _find_h03_artifact_paths(run_dir)
 
     result = {
@@ -539,7 +542,10 @@ def find_h03_ready_runs(
         source = _report_source(payload)
         sqlite_paths = _rank_sqlite_paths(run_dir, _find_sqlite_paths(run_dir), prefer_db=prefer_db)
         artifact_paths = _find_h03_artifact_paths(run_dir)
-        limited_paths = sqlite_paths[: max(1, int(max_db_files))]
+        if int(max_db_files) <= 0:
+            limited_paths = list(sqlite_paths)
+        else:
+            limited_paths = sqlite_paths[: max(1, int(max_db_files))]
         schema_info = _inspect_h03_schema_flags(limited_paths)
         missing_required = [field for field in H03_REQUIRED_CARRIER_FIELDS if source.get(field) is None]
         has_required = not missing_required

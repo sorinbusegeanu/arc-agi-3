@@ -764,7 +764,10 @@ def _compute_prediction_violation_replay_lift_from_existing_db(
 ) -> dict:
     sqlite_paths = _find_sqlite_paths(run_dir)
     ranked_sqlite_paths = _rank_sqlite_paths(run_dir, sqlite_paths, prefer_db=prefer_db)
-    limited_sqlite_paths = ranked_sqlite_paths[: max(1, int(max_db_files))]
+    if int(max_db_files) <= 0:
+        limited_sqlite_paths = list(ranked_sqlite_paths)
+    else:
+        limited_sqlite_paths = ranked_sqlite_paths[: max(1, int(max_db_files))]
     base_result = {
         "db_found": bool(sqlite_paths),
         "db_path": None,

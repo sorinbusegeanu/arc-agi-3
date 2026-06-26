@@ -540,7 +540,7 @@ def build_parser() -> argparse.ArgumentParser:
     hypothesis_suite.add_argument("--memory-dir", default=None)
     hypothesis_suite.add_argument("--output-dir", required=True)
     hypothesis_suite.add_argument("--scan-all-dbs", action="store_true")
-    hypothesis_suite.add_argument("--max-db-files", type=int, default=1000)
+    hypothesis_suite.add_argument("--max-db-files", type=int, default=0)
     hypothesis_suite.add_argument("--max-rows", type=int, default=1000000)
 
     continuous = subparsers.add_parser("continuous-research-run")
@@ -556,7 +556,7 @@ def build_parser() -> argparse.ArgumentParser:
     continuous.add_argument("--stop-if-disk-above-percent", type=float, default=90.0)
     continuous.add_argument("--stop-if-no-new-stable-contingencies-for", type=int, default=2)
     continuous.add_argument("--scan-all-dbs", action="store_true")
-    continuous.add_argument("--max-db-files", type=int, default=1000)
+    continuous.add_argument("--max-db-files", type=int, default=0)
     continuous.add_argument("--max-rows", type=int, default=1000000)
     continuous.add_argument("--resume", type=_parse_bool, default=True)
     continuous.add_argument("--cleanup", type=_parse_bool, default=True)
