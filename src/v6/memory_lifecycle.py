@@ -235,6 +235,33 @@ class MemoryLifecycleManager:
         self._trim_replay_queue()
         self._recompute_counters()
 
+    def apply_post_factum_credit(
+        self,
+        interaction_id: str,
+        *,
+        learning_credit: float,
+        reason: str,
+    ) -> None:
+        interaction_id = str(interaction_id)
+        record = self.records.get(interaction_id)
+        if record is None:
+            return
+        existing = self.replay_candidates.get(interaction_id)
+        replay_priority = max(
+            0.0 if existing is None else float(existing.replay_priority),
+            clamp01(float(learning_credit)),
+        )
+        self.replay_candidates[interaction_id] = ReplayCandidate(
+            interaction_id=interaction_id,
+            replay_priority=replay_priority,
+            reason=str(reason),
+            family_id=record.family_id,
+            context_signature=record.context_signature,
+            status=record.status,
+        )
+        self._trim_replay_queue()
+        self._recompute_counters()
+
     def _should_enter_replay(self, record: MemoryRecord) -> bool:
         return (
             float(record.prediction_error) >= 0.50

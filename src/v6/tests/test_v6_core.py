@@ -324,6 +324,40 @@ class OutcomeEnv(ToggleEnv):
         return grid
 
 
+class LevelCompletionSequenceEnv(ToggleEnv):
+    def __init__(self, *, completion_step: int = 4, terminal_state: str = "NOT_FINISHED") -> None:
+        super().__init__()
+        self.step_index = 0
+        self.completion_step = int(completion_step)
+        self.terminal_state = str(terminal_state)
+        self.last_outcome_state = "NOT_FINISHED"
+        self.last_outcome_polarity = "neutral"
+        self.last_terminal_state = None
+        self.last_step_was_reset_boundary = False
+        self.last_reward = 0
+        self.last_levels_completed = 0
+        self.level_completed_event = False
+
+    def step(self, action: int) -> np.ndarray:
+        grid = super().step(action)
+        self.step_index += 1
+        self.level_completed_event = self.step_index == self.completion_step and self.terminal_state == "NOT_FINISHED"
+        if self.level_completed_event:
+            self.last_levels_completed += 1
+        self.last_outcome_state = self.terminal_state if self.step_index >= self.completion_step and self.terminal_state != "NOT_FINISHED" else "NOT_FINISHED"
+        if self.last_outcome_state == "WIN":
+            self.last_outcome_polarity = "positive"
+        elif self.last_outcome_state == "GAME_OVER":
+            self.last_outcome_polarity = "negative"
+        elif self.level_completed_event:
+            self.last_outcome_polarity = "positive"
+        else:
+            self.last_outcome_polarity = "neutral"
+        self.last_terminal_state = self.last_outcome_state if self.last_outcome_state in {"WIN", "GAME_OVER"} else None
+        self.last_step_was_reset_boundary = False
+        return grid
+
+
 def test_delta_extractor_uses_cell_changes_without_components() -> None:
     before = np.zeros((4, 4), dtype=int)
     after = before.copy()
@@ -1639,6 +1673,27 @@ def test_interaction_significance_level_completed_event_has_positive_survival_si
     assert score.version == "isf_v02"
 
 
+def test_interaction_significance_level_completed_event_learning_value_is_high_when_novel() -> None:
+    score = compute_interaction_significance(
+        reward=0,
+        terminated=False,
+        truncated=False,
+        prediction_correct=None,
+        prediction_confidence=None,
+        actual_family_id=None,
+        delta_id=None,
+        context_signature="ctx",
+        memory_counts={"level_completed_event:true": 0, "context_level_completed:ctx|true": 0},
+        graph_counts={},
+        outcome_state="NOT_FINISHED",
+        outcome_polarity="positive",
+        level_completed_event=True,
+    )
+
+    assert score.survival_impact >= 0.75
+    assert score.learning_value >= 0.99
+
+
 def test_v6_system_run_step_stores_level_completed_event_fields(tmp_path) -> None:
     db_path = tmp_path / "outcomes.sqlite"
     system = V6System(
@@ -1680,6 +1735,95 @@ def test_v6_system_run_step_stores_level_completed_event_fields(tmp_path) -> Non
 
     assert interaction_row == ("NOT_FINISHED", "positive", 1)
     assert prediction_row == ("NOT_FINISHED", "positive", 1)
+
+
+def test_v6_system_applies_post_factum_level_completion_credit(tmp_path) -> None:
+    db_path = tmp_path / "post_factum.sqlite"
+    system = V6System(
+        env=LevelCompletionSequenceEnv(completion_step=4, terminal_state="NOT_FINISHED"),
+        config=V6Config(
+            database_path=str(db_path),
+            recluster_every=2,
+            min_cluster_size=2,
+            context_length=1,
+            contingency_support_threshold=1,
+            contingency_confidence_threshold=0.0,
+            random_seed=0,
+        ),
+    )
+
+    system.run(steps=4)
+    replay_candidates = dict(system.memory_lifecycle.replay_candidates)
+    system.close()
+
+    connection = sqlite3.connect(db_path)
+    try:
+        interaction_rows = connection.execute(
+            """
+            SELECT id, outcome_state, level_completed_event, post_factum_level_completion_credit, post_factum_credit_reason
+            FROM interactions
+            ORDER BY id
+            """
+        ).fetchall()
+        prediction_rows = connection.execute(
+            """
+            SELECT interaction_id, post_factum_level_completion_credit, post_factum_level_completion_decay, post_factum_level_completion_step, post_factum_credit_reason
+            FROM prediction_results
+            ORDER BY interaction_id
+            """
+        ).fetchall()
+    finally:
+        connection.close()
+
+    assert [row[0] for row in interaction_rows] == [1, 2, 3, 4]
+    credits = [float(row[3]) for row in interaction_rows]
+    assert credits[3] > credits[2] > credits[1] > credits[0] > 0.0
+    assert all(row[1] == "NOT_FINISHED" for row in interaction_rows)
+    assert [row[2] for row in interaction_rows] == [0, 0, 0, 1]
+    assert all(row[4] == "levels_completed_increment" for row in interaction_rows)
+    assert len(prediction_rows) == 4
+    assert [float(row[1]) for row in prediction_rows] == credits
+    assert all(row[3] == 4 for row in prediction_rows)
+    assert all(row[4] == "levels_completed_increment" for row in prediction_rows)
+    assert all(candidate.replay_priority > 0.0 for candidate in replay_candidates.values() if candidate.interaction_id in {"1", "2", "3", "4"})
+    assert all(candidate.reason == "post_factum_level_completion" for candidate in replay_candidates.values() if candidate.interaction_id in {"1", "2", "3", "4"})
+
+
+def test_v6_system_game_over_without_progress_gets_no_post_factum_credit(tmp_path) -> None:
+    db_path = tmp_path / "post_factum_game_over.sqlite"
+    system = V6System(
+        env=LevelCompletionSequenceEnv(completion_step=4, terminal_state="GAME_OVER"),
+        config=V6Config(
+            database_path=str(db_path),
+            recluster_every=2,
+            min_cluster_size=2,
+            context_length=1,
+            contingency_support_threshold=1,
+            contingency_confidence_threshold=0.0,
+            random_seed=0,
+        ),
+    )
+
+    system.run(steps=4)
+    replay_candidates = dict(system.memory_lifecycle.replay_candidates)
+    system.close()
+
+    connection = sqlite3.connect(db_path)
+    try:
+        rows = connection.execute(
+            """
+            SELECT id, outcome_state, level_completed_event, post_factum_level_completion_credit
+            FROM interactions
+            ORDER BY id
+            """
+        ).fetchall()
+    finally:
+        connection.close()
+
+    assert rows[-1][1] == "GAME_OVER"
+    assert all(int(row[2]) == 0 for row in rows)
+    assert all(float(row[3]) == 0.0 for row in rows)
+    assert not any(candidate.reason == "post_factum_level_completion" for candidate in replay_candidates.values())
 
 
 def test_v6_system_prediction_edges_add_explains_and_depends_on() -> None:

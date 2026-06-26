@@ -123,6 +123,7 @@ class V6System:
         self.episode_id = 0
         self.step_count = 0
         self._isf_counts: dict[str, int] = {}
+        self._current_level_interaction_ids: list[int] = []
         self.compact_memory_restore_summary: dict[str, Any] = {
             "stable_contingencies_restored": 0,
             "transformation_families_restored": 0,
@@ -575,6 +576,13 @@ class V6System:
         if self._auto_commit:
             self.connection.commit()
 
+        self._current_level_interaction_ids.append(int(interaction.id))
+
+        if level_completed_event:
+            self._apply_post_factum_level_completion_credit(completion_interaction_id=interaction.id)
+        elif outcome_state in {"GAME_OVER", "WIN"}:
+            self._current_level_interaction_ids.clear()
+
         if self.action_sampler is not None and hasattr(self.action_sampler, "record_result"):
             self.action_sampler.record_result(
                 action=action,
@@ -693,6 +701,59 @@ class V6System:
             if int(predicted_family) in distribution:
                 return float(distribution[int(predicted_family)])
         return None
+
+    def _apply_post_factum_level_completion_credit(self, *, completion_interaction_id: int) -> None:
+        ids = list(self._current_level_interaction_ids)
+        if int(completion_interaction_id) not in ids:
+            ids.append(int(completion_interaction_id))
+        horizon = len(ids)
+        if horizon <= 0:
+            return
+        reason = "levels_completed_increment"
+        for distance_from_completion, interaction_id in enumerate(reversed(ids)):
+            credit = 1.0 / (1.0 + float(distance_from_completion))
+            self.connection.execute(
+                """
+                UPDATE interactions
+                SET
+                    post_factum_level_completion_credit = MAX(COALESCE(post_factum_level_completion_credit, 0.0), ?),
+                    post_factum_level_completion_decay = ?,
+                    post_factum_level_completion_step = ?,
+                    post_factum_credit_reason = ?
+                WHERE id = ?
+                """,
+                (
+                    float(credit),
+                    float(credit),
+                    int(completion_interaction_id),
+                    reason,
+                    int(interaction_id),
+                ),
+            )
+            self.connection.execute(
+                """
+                UPDATE prediction_results
+                SET
+                    post_factum_level_completion_credit = MAX(COALESCE(post_factum_level_completion_credit, 0.0), ?),
+                    post_factum_level_completion_decay = ?,
+                    post_factum_level_completion_step = ?,
+                    post_factum_credit_reason = ?
+                WHERE interaction_id = ?
+                """,
+                (
+                    float(credit),
+                    float(credit),
+                    int(completion_interaction_id),
+                    reason,
+                    int(interaction_id),
+                ),
+            )
+            self.memory_lifecycle.apply_post_factum_credit(
+                str(interaction_id),
+                learning_credit=float(credit),
+                reason="post_factum_level_completion",
+            )
+        self._current_level_interaction_ids = []
 
     def _build_isf_memory_counts(
         self,

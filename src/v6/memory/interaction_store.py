@@ -52,6 +52,10 @@ class Interaction:
     outcome_state: str | None = None
     outcome_polarity: str | None = None
     level_completed_event: bool = False
+    post_factum_level_completion_credit: float = 0.0
+    post_factum_level_completion_decay: float | None = None
+    post_factum_level_completion_step: int | None = None
+    post_factum_credit_reason: str | None = None
 
 
 def encode_array(array: np.ndarray) -> bytes:
@@ -116,7 +120,11 @@ class InteractionStore:
                 efficiency_future_option_gain_per_cost REAL,
                 outcome_state TEXT,
                 outcome_polarity TEXT,
-                level_completed_event INTEGER
+                level_completed_event INTEGER,
+                post_factum_level_completion_credit REAL DEFAULT 0.0,
+                post_factum_level_completion_decay REAL,
+                post_factum_level_completion_step INTEGER,
+                post_factum_credit_reason TEXT
             )
             """
         )
@@ -157,6 +165,10 @@ class InteractionStore:
         self._ensure_column("outcome_state", "TEXT")
         self._ensure_column("outcome_polarity", "TEXT")
         self._ensure_column("level_completed_event", "INTEGER")
+        self._ensure_column("post_factum_level_completion_credit", "REAL DEFAULT 0.0")
+        self._ensure_column("post_factum_level_completion_decay", "REAL")
+        self._ensure_column("post_factum_level_completion_step", "INTEGER")
+        self._ensure_column("post_factum_credit_reason", "TEXT")
         self._ensure_column("level_advanced", "INTEGER")
         self.connection.commit()
 
@@ -216,9 +228,13 @@ class InteractionStore:
                 efficiency_future_option_gain_per_cost,
                 outcome_state,
                 outcome_polarity,
-                level_completed_event
+                level_completed_event,
+                post_factum_level_completion_credit,
+                post_factum_level_completion_decay,
+                post_factum_level_completion_step,
+                post_factum_credit_reason
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 int(interaction.id),
@@ -264,6 +280,10 @@ class InteractionStore:
                 interaction.outcome_state,
                 interaction.outcome_polarity,
                 int(bool(interaction.level_completed_event)),
+                float(interaction.post_factum_level_completion_credit),
+                None if interaction.post_factum_level_completion_decay is None else float(interaction.post_factum_level_completion_decay),
+                None if interaction.post_factum_level_completion_step is None else int(interaction.post_factum_level_completion_step),
+                interaction.post_factum_credit_reason,
             ),
         )
         if self.auto_commit:
@@ -315,7 +335,11 @@ class InteractionStore:
                 efficiency_future_option_gain_per_cost,
                 outcome_state,
                 outcome_polarity,
-                COALESCE(level_completed_event, level_advanced)
+                COALESCE(level_completed_event, level_advanced),
+                post_factum_level_completion_credit,
+                post_factum_level_completion_decay,
+                post_factum_level_completion_step,
+                post_factum_credit_reason
             FROM interactions
             WHERE id = ?
             """,
@@ -367,6 +391,10 @@ class InteractionStore:
             outcome_state=None if row[40] is None else str(row[40]),
             outcome_polarity=None if row[41] is None else str(row[41]),
             level_completed_event=bool(row[42]) if row[42] is not None else False,
+            post_factum_level_completion_credit=0.0 if row[43] is None else float(row[43]),
+            post_factum_level_completion_decay=None if row[44] is None else float(row[44]),
+            post_factum_level_completion_step=None if row[45] is None else int(row[45]),
+            post_factum_credit_reason=None if row[46] is None else str(row[46]),
         )
 
     def count(self) -> int:

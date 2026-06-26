@@ -79,7 +79,11 @@ class ContingencyStore:
                 efficiency_future_option_gain_per_cost REAL,
                 outcome_state TEXT,
                 outcome_polarity TEXT,
-                level_completed_event INTEGER
+                level_completed_event INTEGER,
+                post_factum_level_completion_credit REAL DEFAULT 0.0,
+                post_factum_level_completion_decay REAL,
+                post_factum_level_completion_step INTEGER,
+                post_factum_credit_reason TEXT
             )
             """
         )
@@ -128,6 +132,10 @@ class ContingencyStore:
         self._ensure_column("prediction_results", "outcome_state", "TEXT")
         self._ensure_column("prediction_results", "outcome_polarity", "TEXT")
         self._ensure_column("prediction_results", "level_completed_event", "INTEGER")
+        self._ensure_column("prediction_results", "post_factum_level_completion_credit", "REAL DEFAULT 0.0")
+        self._ensure_column("prediction_results", "post_factum_level_completion_decay", "REAL")
+        self._ensure_column("prediction_results", "post_factum_level_completion_step", "INTEGER")
+        self._ensure_column("prediction_results", "post_factum_credit_reason", "TEXT")
         self._ensure_column("prediction_results", "level_advanced", "INTEGER")
         self.connection.commit()
 
@@ -223,6 +231,10 @@ class ContingencyStore:
         outcome_state: str | None = None,
         outcome_polarity: str | None = None,
         level_completed_event: bool = False,
+        post_factum_level_completion_credit: float = 0.0,
+        post_factum_level_completion_decay: float | None = None,
+        post_factum_level_completion_step: int | None = None,
+        post_factum_credit_reason: str | None = None,
     ) -> int | None:
         prediction_error: int | None
         if predicted_family is None or actual_family is None:
@@ -281,9 +293,13 @@ class ContingencyStore:
                 efficiency_future_option_gain_per_cost,
                 outcome_state,
                 outcome_polarity,
-                level_completed_event
+                level_completed_event,
+                post_factum_level_completion_credit,
+                post_factum_level_completion_decay,
+                post_factum_level_completion_step,
+                post_factum_credit_reason
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 int(interaction_id),
@@ -336,6 +352,10 @@ class ContingencyStore:
                 outcome_state,
                 outcome_polarity,
                 int(bool(level_completed_event)),
+                float(post_factum_level_completion_credit),
+                None if post_factum_level_completion_decay is None else float(post_factum_level_completion_decay),
+                None if post_factum_level_completion_step is None else int(post_factum_level_completion_step),
+                post_factum_credit_reason,
             ),
         )
         if self.auto_commit:
