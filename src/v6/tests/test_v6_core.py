@@ -2907,7 +2907,7 @@ def test_phase5_exact_m1_contingency_predicts_family() -> None:
                 attrs={"context_signature": context_signature, "action": 1, "transformation_family": 4, "confidence": 0.9},
             )
         )
-        prediction = engine.predict_family({1: ("ctx",)}, 1)
+        prediction = engine.predict_family({1: ("ctx",)}, 1, record_query=False)
         assert prediction.predicted_family == 4
         assert prediction.source == "memory_contingency"
     finally:
@@ -2920,7 +2920,7 @@ def test_phase5_contingency_learner_fallback_still_works() -> None:
         substrate = MemorySubstrate(connection)
         learner = type("Learner", (), {"best_stable_for_action": lambda self, *_args, **_kwargs: type("Stable", (), {"transformation_family": 6, "confidence": 0.7})()})()
         engine = MemoryQueryEngine(substrate, contingency_learner=learner)
-        prediction = engine.predict_family({1: ("ctx",)}, 1)
+        prediction = engine.predict_family({1: ("ctx",)}, 1, record_query=False)
         assert prediction.predicted_family == 6
         assert prediction.source == "contingency_learner"
     finally:
@@ -2932,11 +2932,17 @@ def test_phase5_similar_role_can_predict_when_exact_contingency_missing() -> Non
     try:
         substrate = MemorySubstrate(connection)
         engine = MemoryQueryEngine(substrate)
+        context_signature = json.dumps(["ctx"])
+        context_node = "M0:context:" + __import__("hashlib").sha1(str(context_signature).encode("utf-8")).hexdigest()[:20]
         substrate.upsert_node(MemoryNode(node_id="carrierX", memory_level="M3", node_type="CarrierMemory", attrs={}))
         substrate.upsert_node(MemoryNode(node_id="roleX", memory_level="M3", node_type="FunctionalRoleMemory", attrs={"transfer_score": 0.6}))
+        substrate.upsert_node(MemoryNode(node_id=interaction_node_id(1), memory_level="M0", node_type="InteractionMemory"))
         substrate.upsert_edge(MemoryEdge("carrierX", "roleX", "plays_role"))
         substrate.upsert_edge(MemoryEdge("carrierX", family_node_id(7), "associated_with_family"))
-        prediction = engine.predict_family({1: ("ctx",)}, 1)
+        substrate.upsert_edge(MemoryEdge("carrierX", context_node, "appears_in_context"))
+        substrate.upsert_edge(MemoryEdge("carrierX", interaction_node_id(1), "carried_by"))
+        substrate.upsert_edge(MemoryEdge(interaction_node_id(1), action_node_id(1), "takes_action"))
+        prediction = engine.predict_family({1: ("ctx",)}, 1, record_query=False)
         assert prediction.predicted_family == 7
         assert prediction.source == "role_match"
     finally:
@@ -2948,13 +2954,20 @@ def test_phase5_concept_match_can_predict_when_role_exists() -> None:
     try:
         substrate = MemorySubstrate(connection)
         engine = MemoryQueryEngine(substrate)
+        context_signature = json.dumps(["ctx"])
+        context_node = "M0:context:" + __import__("hashlib").sha1(str(context_signature).encode("utf-8")).hexdigest()[:20]
         substrate.upsert_node(MemoryNode(node_id="carrierY", memory_level="M3", node_type="CarrierMemory", attrs={}))
         substrate.upsert_node(MemoryNode(node_id="roleY", memory_level="M3", node_type="FunctionalRoleMemory", attrs={}))
         substrate.upsert_node(MemoryNode(node_id="conceptY", memory_level="M4", node_type="ConceptMemory", attrs={"transfer_success_count": 3}))
+        substrate.upsert_node(MemoryNode(node_id=interaction_node_id(1), memory_level="M0", node_type="InteractionMemory"))
         substrate.upsert_edge(MemoryEdge("roleY", "conceptY", "transfers_to"))
         substrate.upsert_edge(MemoryEdge("roleY", "carrierY", "abstracts_from"))
+        substrate.upsert_edge(MemoryEdge("carrierY", "roleY", "plays_role"))
         substrate.upsert_edge(MemoryEdge("carrierY", family_node_id(8), "associated_with_family"))
-        prediction = engine.predict_family({1: ("ctx",)}, 1)
+        substrate.upsert_edge(MemoryEdge("carrierY", context_node, "appears_in_context"))
+        substrate.upsert_edge(MemoryEdge("carrierY", interaction_node_id(1), "carried_by"))
+        substrate.upsert_edge(MemoryEdge(interaction_node_id(1), action_node_id(1), "takes_action"))
+        prediction = engine.predict_family({1: ("ctx",)}, 1, record_query=False)
         assert prediction.predicted_family == 8
         assert prediction.source in {"role_match", "concept_match"}
     finally:
@@ -2974,6 +2987,97 @@ def test_phase5_action_ranking_prefers_positive_future_option_evidence() -> None
             substrate.upsert_score(MemoryScore(node_id=interaction_id, future_option_delta=delta))
         ranked = engine.rank_actions({1: ("ctx",)}, [1, 2])
         assert ranked[0].action == 1
+    finally:
+        connection.close()
+
+
+def test_memory_action_selection_uses_candidate_specific_context() -> None:
+    connection = sqlite3.connect(":memory:")
+    try:
+        substrate = MemorySubstrate(connection)
+        engine = MemoryQueryEngine(substrate)
+        substrate.upsert_node(
+            MemoryNode(
+                node_id="m1a1",
+                memory_level="M1",
+                node_type="ContingencyMemory",
+                attrs={"context_signature": json.dumps([1]), "action": 1, "transformation_family": 10, "confidence": 0.9},
+            )
+        )
+        substrate.upsert_node(
+            MemoryNode(
+                node_id="m1a2",
+                memory_level="M1",
+                node_type="ContingencyMemory",
+                attrs={"context_signature": json.dumps([2]), "action": 2, "transformation_family": 20, "confidence": 0.9},
+            )
+        )
+        score1 = engine.score_action({1: (1,)}, 1, [1, 2], record_query=False)
+        score2 = engine.score_action({1: (2,)}, 2, [1, 2], record_query=False)
+        assert score1.predicted_family == 10
+        assert score2.predicted_family == 20
+    finally:
+        connection.close()
+
+
+def test_phase5_query_scoring_has_no_selected_action_side_effects() -> None:
+    connection = sqlite3.connect(":memory:")
+    try:
+        substrate = MemorySubstrate(connection)
+        engine = MemoryQueryEngine(substrate)
+        engine.rank_actions({1: ("ctx",)}, [1, 2, 3])
+        assert not substrate.query_nodes(memory_level="M5", node_type="MemoryQueryEvent")
+        engine.record_selected_action_query(context_signatures={1: ("ctx",)}, action=2)
+        query_nodes = substrate.query_nodes(memory_level="M5", node_type="MemoryQueryEvent")
+        assert len(query_nodes) == 1
+        selected_edges = substrate.edges_from(query_nodes[0]["node_id"], "selected_action")
+        assert len(selected_edges) == 1
+        assert selected_edges[0]["target_node_id"] == action_node_id(2)
+    finally:
+        connection.close()
+
+
+def test_phase5_role_matching_is_action_sensitive() -> None:
+    connection = sqlite3.connect(":memory:")
+    try:
+        substrate = MemorySubstrate(connection)
+        engine = MemoryQueryEngine(substrate)
+        context_node = "M0:context:" + __import__("hashlib").sha1(str(json.dumps(["ctx"])).encode("utf-8")).hexdigest()[:20]
+        substrate.upsert_node(MemoryNode(node_id="carrierR", memory_level="M3", node_type="CarrierMemory"))
+        substrate.upsert_node(MemoryNode(node_id="roleR", memory_level="M3", node_type="FunctionalRoleMemory", attrs={"transfer_score": 0.5}))
+        substrate.upsert_node(MemoryNode(node_id=interaction_node_id(1), memory_level="M0", node_type="InteractionMemory"))
+        substrate.upsert_edge(MemoryEdge("carrierR", "roleR", "plays_role"))
+        substrate.upsert_edge(MemoryEdge("carrierR", context_node, "appears_in_context"))
+        substrate.upsert_edge(MemoryEdge("carrierR", interaction_node_id(1), "carried_by"))
+        substrate.upsert_edge(MemoryEdge(interaction_node_id(1), action_node_id(1), "takes_action"))
+        good = engine.find_similar_roles(json.dumps(["ctx"]), 1)
+        bad = engine.find_similar_roles(json.dumps(["ctx"]), 2)
+        assert good
+        assert good[0]["score"] > 0.5
+        assert not bad or good[0]["score"] > bad[0]["score"]
+    finally:
+        connection.close()
+
+
+def test_phase5_concept_matching_is_action_sensitive() -> None:
+    connection = sqlite3.connect(":memory:")
+    try:
+        substrate = MemorySubstrate(connection)
+        engine = MemoryQueryEngine(substrate)
+        context_node = "M0:context:" + __import__("hashlib").sha1(str(json.dumps(["ctx"])).encode("utf-8")).hexdigest()[:20]
+        substrate.upsert_node(MemoryNode(node_id="carrierC", memory_level="M3", node_type="CarrierMemory"))
+        substrate.upsert_node(MemoryNode(node_id="roleC", memory_level="M3", node_type="FunctionalRoleMemory", attrs={"transfer_score": 0.8}))
+        substrate.upsert_node(MemoryNode(node_id="conceptC", memory_level="M4", node_type="ConceptMemory", attrs={"transfer_success_count": 3}))
+        substrate.upsert_node(MemoryNode(node_id=interaction_node_id(1), memory_level="M0", node_type="InteractionMemory"))
+        substrate.upsert_edge(MemoryEdge("carrierC", "roleC", "plays_role"))
+        substrate.upsert_edge(MemoryEdge("roleC", "conceptC", "transfers_to"))
+        substrate.upsert_edge(MemoryEdge("roleC", "carrierC", "abstracts_from"))
+        substrate.upsert_edge(MemoryEdge("carrierC", family_node_id(8), "associated_with_family"))
+        substrate.upsert_edge(MemoryEdge("carrierC", context_node, "appears_in_context"))
+        substrate.upsert_edge(MemoryEdge("carrierC", interaction_node_id(1), "carried_by"))
+        substrate.upsert_edge(MemoryEdge(interaction_node_id(1), action_node_id(1), "takes_action"))
+        assert engine.find_concept_matches(json.dumps(["ctx"]), 1)
+        assert not engine.find_concept_matches(json.dumps(["ctx"]), 2)
     finally:
         connection.close()
 
@@ -3005,10 +3109,9 @@ def test_phase5_memory_action_selection_chooses_best_ranked_action(tmp_path) -> 
         env=MultiActionEnv(),
         config=V6Config(database_path=str(db_path), random_seed=0, memory_action_selection_enabled=True),
     )
-    system.memory_query.rank_actions = lambda *_args, **_kwargs: [
-        type("Rank", (), {"action": 2, "score": 0.9})(),
-        type("Rank", (), {"action": 1, "score": 0.1})(),
-    ]
+    system.memory_query.score_action = lambda _ctx, action, _available, record_query=False: type(
+        "Rank", (), {"action": action, "score": 0.9 if int(action) == 2 else 0.1}
+    )()
     assert system.choose_action() == 2
     system.close()
 
@@ -3026,13 +3129,150 @@ def test_phase5_query_event_writes_evidence_edges() -> None:
                 attrs={"context_signature": json.dumps(["ctx"]), "action": 1, "transformation_family": 4, "confidence": 0.9},
             )
         )
-        _prediction = engine.predict_family({1: ("ctx",)}, 1)
+        _prediction = engine.predict_family({1: ("ctx",)}, 1, record_query=True)
         query_nodes = substrate.query_nodes(memory_level="M5", node_type="MemoryQueryEvent")
         assert query_nodes
         used_edges = substrate.edges_from(query_nodes[0]["node_id"], "used_evidence")
         assert used_edges
     finally:
         connection.close()
+
+
+def test_phase5_real_m0_to_m1_promotion_uses_m0_interactions() -> None:
+    connection = sqlite3.connect(":memory:")
+    try:
+        substrate = MemorySubstrate(connection)
+        engine = MemoryPromotionEngine(substrate, MemoryPromotionConfig(min_contingency_support=3, min_contingency_confidence=0.6))
+        for idx in range(1, 4):
+            interaction_id = interaction_node_id(idx)
+            substrate.upsert_node(
+                MemoryNode(
+                    node_id=interaction_id,
+                    memory_level="M0",
+                    node_type="InteractionMemory",
+                    attrs={"context_signature": "ctxA"},
+                )
+            )
+            substrate.upsert_edge(MemoryEdge(interaction_id, action_node_id(1), "takes_action"))
+            substrate.upsert_edge(MemoryEdge(interaction_id, family_node_id(9), "supports"))
+        summary = engine.promote_m0_to_m1(step=1)
+        contingencies = substrate.query_nodes(memory_level="M1", node_type="ContingencyMemory")
+        promotions = connection.execute(
+            "SELECT source_node_id, target_node_id FROM memory_promotions WHERE promotion_type = 'M0_M1'"
+        ).fetchall()
+        assert summary["count"] >= 1
+        assert contingencies
+        assert promotions
+        assert str(promotions[0][0]).startswith("M0:interaction:")
+        assert str(promotions[0][1]).startswith("M1:contingency:")
+        assert promotions[0][0] != promotions[0][1]
+    finally:
+        connection.close()
+
+
+def test_phase5_future_option_role_promotion_uses_carried_interactions() -> None:
+    connection = sqlite3.connect(":memory:")
+    try:
+        substrate = MemorySubstrate(connection)
+        engine = MemoryPromotionEngine(substrate, MemoryPromotionConfig(min_role_support=1))
+        substrate.upsert_node(
+            MemoryNode(
+                node_id="carrierZ",
+                memory_level="M3",
+                node_type="CarrierMemory",
+                attrs={"promotion_status": "promoted"},
+            )
+        )
+        substrate.upsert_node(MemoryNode(node_id=interaction_node_id(1), memory_level="M0", node_type="InteractionMemory"))
+        substrate.upsert_edge(MemoryEdge("carrierZ", interaction_node_id(1), "carried_by"))
+        substrate.upsert_edge(MemoryEdge("carrierZ", family_node_id(1), "associated_with_family"))
+        substrate.upsert_edge(MemoryEdge(interaction_node_id(1), "outcome:1", "expands_future_options"))
+        summary = engine.promote_m3_carrier_to_role(step=5)
+        roles = substrate.query_nodes(memory_level="M3", node_type="FunctionalRoleMemory")
+        assert summary["count"] >= 1
+        assert roles
+        assert roles[0]["attrs"]["future_option_effect"] == "positive"
+    finally:
+        connection.close()
+
+
+def test_phase5_restore_complete_substrate(tmp_path) -> None:
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir(parents=True, exist_ok=True)
+    state_path = memory_dir / "current_state.sqlite"
+    graph_path = memory_dir / "graph.sqlite"
+    replay_path = memory_dir / "replay_queue.sqlite"
+    summary_path = memory_dir / "memory_summary.json"
+    connection = sqlite3.connect(state_path)
+    try:
+        substrate = MemorySubstrate(connection)
+        connection.execute("CREATE TABLE IF NOT EXISTS family_identity_map (canonical_signature TEXT PRIMARY KEY, stable_family_id INTEGER)")
+        connection.execute("CREATE TABLE IF NOT EXISTS stable_contingencies (canonical_key TEXT, context_level INTEGER, action INTEGER, effect_signature TEXT, support_count INTEGER, stability_score REAL)")
+        connection.execute("CREATE TABLE IF NOT EXISTS family_members (family_signature TEXT, contingency_key TEXT, support_count INTEGER)")
+        connection.execute("CREATE TABLE IF NOT EXISTS transformation_families (family_id INTEGER, canonical_signature TEXT, support_count INTEGER)")
+        connection.execute("CREATE TABLE IF NOT EXISTS carrier_candidates (carrier_signature TEXT, carrier_source TEXT, support_count INTEGER, linked_family_count INTEGER, first_seen_global_step INTEGER, last_seen_global_step INTEGER, stability_score REAL, is_emergent INTEGER)")
+        connection.execute("CREATE TABLE IF NOT EXISTS memory_summary (key TEXT, value_json TEXT)")
+        substrate.upsert_node(MemoryNode(node_id="node1", memory_level="M0", node_type="InteractionMemory"))
+        substrate.upsert_edge(MemoryEdge("node1", "node2", "follows"))
+        substrate.add_evidence(__import__("v6.memory.substrate", fromlist=["MemoryEvidence"]).MemoryEvidence("ev1", "node1", 1, "test"))
+        substrate.upsert_score(MemoryScore(node_id="node1", isf_total=0.5), step=1)
+        substrate.record_promotion(__import__("v6.memory.substrate", fromlist=["MemoryPromotion"]).MemoryPromotion("pr1", "node1", "node2", "M0_M1", 1, 0.5, "promoted"))
+        connection.commit()
+    finally:
+        connection.close()
+    graph_conn = sqlite3.connect(graph_path)
+    try:
+        graph_conn.execute("CREATE TABLE IF NOT EXISTS graph_nodes (node_id TEXT, node_type TEXT, canonical_key TEXT, support_count INTEGER)")
+        graph_conn.execute("CREATE TABLE IF NOT EXISTS graph_edges (source_node_id TEXT, target_node_id TEXT, edge_type TEXT, support_count INTEGER, weight REAL)")
+        graph_conn.commit()
+    finally:
+        graph_conn.close()
+    replay_conn = sqlite3.connect(replay_path)
+    try:
+        replay_conn.execute("CREATE TABLE IF NOT EXISTS replay_queue (replay_id TEXT, owner_type TEXT, owner_id TEXT, priority_score REAL, reason TEXT, first_seen_global_step INTEGER, last_seen_global_step INTEGER, compact_payload_json TEXT)")
+        replay_conn.commit()
+    finally:
+        replay_conn.close()
+    summary_path.write_text("{}", encoding="utf-8")
+    system = V6System(env=ToggleEnv(), config=V6Config(database_path=":memory:", memory_input_dir=str(memory_dir), restore_compact_memory=True, random_seed=0))
+    try:
+        summary = system.compact_memory_restore_summary
+        assert summary["memory_nodes_restored"] >= 1
+        assert summary["memory_edges_restored"] >= 1
+        assert summary["memory_evidence_restored"] >= 1
+        assert summary["memory_scores_restored"] >= 1
+        assert summary["memory_promotions_restored"] >= 1
+        assert system.connection.execute("SELECT COUNT(*) FROM memory_evidence").fetchone()[0] >= 1
+        assert system.connection.execute("SELECT COUNT(*) FROM memory_promotions").fetchone()[0] >= 1
+    finally:
+        system.close()
+
+
+def test_phase5_observation_canonical_key_is_hashed_and_future_option_links_match(tmp_path) -> None:
+    class ExpandingEnv(ToggleEnv):
+        def available_actions(self) -> list[int]:
+            return [1] if self.state == 0 else [1, 2]
+
+    db_path = tmp_path / "obs_hash.sqlite"
+    system = V6System(env=ExpandingEnv(), config=V6Config(database_path=str(db_path), future_options_enabled=True, random_seed=0))
+    result = system.run_step()
+    observation_nodes = system.memory.query_nodes(memory_level="M0", node_type="ObservationMemory")
+    assert observation_nodes
+    for node in observation_nodes:
+        assert node["canonical_key"] is not None
+        assert len(str(node["canonical_key"])) <= 40
+        assert "observation_hash" in node["attrs"]
+        assert "signature_len" in node["attrs"]
+    has_future = system.connection.execute(
+        "SELECT source_node_id FROM memory_edges WHERE edge_type = 'has_future_options' ORDER BY source_node_id ASC LIMIT 1"
+    ).fetchone()
+    assert has_future is not None
+    source_node = system.memory.get_node(str(has_future[0]))
+    assert source_node is not None
+    assert source_node["node_type"] == "ObservationMemory"
+    interaction_edges = system.memory.edges_from(interaction_node_id(result.interaction_id), "changes_future_options")
+    assert interaction_edges
+    system.close()
 
 def test_validation_report_classifies_k0_sufficient(tmp_path) -> None:
     db_path = tmp_path / "k0.sqlite"

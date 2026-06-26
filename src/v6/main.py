@@ -171,6 +171,9 @@ class V6System:
             "graph_edges_restored": 0,
             "memory_nodes_restored": 0,
             "memory_edges_restored": 0,
+            "memory_evidence_restored": 0,
+            "memory_scores_restored": 0,
+            "memory_promotions_restored": 0,
             "memory_summary_loaded": False,
             "restore_warnings": [],
         }
@@ -182,8 +185,22 @@ class V6System:
         if not actions:
             raise ValueError("environment returned no available actions")
         if bool(self.config.memory_action_selection_enabled) and self.action_sampler is None:
-            context_signatures = self.context_builder.multi_scale_signatures(0, max_level=self._context_depth_for_action(0))
-            ranked = self.memory_query.rank_actions(context_signatures, list(actions))
+            ranked = []
+            for candidate_action in actions:
+                candidate_depth = self._context_depth_for_action(int(candidate_action))
+                candidate_context_signatures = self.context_builder.multi_scale_signatures(
+                    int(candidate_action),
+                    max_level=candidate_depth,
+                )
+                ranked.append(
+                    self.memory_query.score_action(
+                        candidate_context_signatures,
+                        int(candidate_action),
+                        list(actions),
+                        record_query=False,
+                    )
+                )
+            ranked.sort(key=lambda item: (-float(item.score), int(item.action)))
             if ranked:
                 best_score = ranked[0].score
                 best = [item.action for item in ranked if float(item.score) == float(best_score)]
@@ -211,10 +228,11 @@ class V6System:
             selected_contingency = self.contingency_learner.best_stable_for_action(context_signatures, action)
             prediction_context_level = None if selected_contingency is None else int(selected_contingency.context_level)
             if bool(self.config.memory_query_enabled):
-                memory_prediction = self.memory_query.predict_family(context_signatures, action)
+                memory_prediction = self.memory_query.predict_family(context_signatures, action, record_query=False)
                 predicted_family = memory_prediction.predicted_family
                 prediction_confidence = float(memory_prediction.confidence)
             else:
+                memory_prediction = None
                 predicted_family = self.predictor.predict_multi_scale(context_signatures, action)
                 prediction_confidence = self._prediction_confidence(
                     context_signatures=context_signatures,
@@ -733,6 +751,13 @@ class V6System:
                 reset_boundary=bool(getattr(self.env, "last_step_was_reset_boundary", False)),
             )
 
+        if bool(self.config.memory_query_enabled) or bool(self.config.memory_action_selection_enabled):
+            self.memory_query.record_selected_action_query(
+                context_signatures=context_signatures,
+                action=action,
+                prediction=memory_prediction,
+            )
+
         self._commit_if_needed(interaction.id)
 
         return StepResult(
@@ -1109,6 +1134,8 @@ class V6System:
         interaction_node = interaction_node_id(interaction.id)
         before_signature = self._observation_signature(observation_before)
         after_signature = self._observation_signature(observation_after)
+        before_hash = sha1(before_signature.encode("utf-8")).hexdigest()
+        after_hash = sha1(after_signature.encode("utf-8")).hexdigest()
         before_node = observation_node_id(before_signature)
         after_node = observation_node_id(after_signature)
         action_node = action_node_id(interaction.action)
@@ -1135,8 +1162,13 @@ class V6System:
                 node_id=before_node,
                 memory_level="M0",
                 node_type="ObservationMemory",
-                canonical_key=before_signature,
-                attrs={"shape": list(observation_before.shape)},
+                canonical_key=before_hash,
+                attrs={
+                    "shape": list(observation_before.shape),
+                    "observation_hash": before_hash,
+                    "signature_len": len(before_signature),
+                    "signature_preview": before_signature[:256],
+                },
             ),
             step=step,
         )
@@ -1145,8 +1177,13 @@ class V6System:
                 node_id=after_node,
                 memory_level="M0",
                 node_type="ObservationMemory",
-                canonical_key=after_signature,
-                attrs={"shape": list(observation_after.shape)},
+                canonical_key=after_hash,
+                attrs={
+                    "shape": list(observation_after.shape),
+                    "observation_hash": after_hash,
+                    "signature_len": len(after_signature),
+                    "signature_preview": after_signature[:256],
+                },
             ),
             step=step,
         )

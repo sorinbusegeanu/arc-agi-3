@@ -33,7 +33,13 @@ class MemoryQueryEngine:
         self.contingency_learner = contingency_learner
         self.graph = graph
 
-    def predict_family(self, context_signatures: dict[int, tuple], action: int) -> MemoryPrediction:
+    def predict_family(
+        self,
+        context_signatures: dict[int, tuple],
+        action: int,
+        *,
+        record_query: bool = False,
+    ) -> MemoryPrediction:
         exact = self._exact_contingency_match(context_signatures, action)
         if exact is not None:
             prediction = MemoryPrediction(
@@ -42,7 +48,8 @@ class MemoryQueryEngine:
                 source="memory_contingency",
                 evidence_node_ids=[str(exact["node_id"])],
             )
-            self._record_query_event(action=action, prediction=prediction)
+            if record_query:
+                self._record_query_event(action=action, prediction=prediction)
             return prediction
         if self.contingency_learner is not None and hasattr(self.contingency_learner, "best_stable_for_action"):
             stable = self.contingency_learner.best_stable_for_action(context_signatures, action)
@@ -53,9 +60,11 @@ class MemoryQueryEngine:
                     source="contingency_learner",
                     evidence_node_ids=[],
                 )
-                self._record_query_event(action=action, prediction=prediction)
+                if record_query:
+                    self._record_query_event(action=action, prediction=prediction)
                 return prediction
-        role_matches = self.find_similar_roles(json.dumps(list(context_signatures.get(max(context_signatures), ()))), action)
+        best_context_signature = self._best_context_signature(context_signatures, action)
+        role_matches = self.find_similar_roles(best_context_signature, action)
         if role_matches and role_matches[0].get("family_id") is not None:
             prediction = MemoryPrediction(
                 predicted_family=role_matches[0].get("family_id"),
@@ -63,9 +72,10 @@ class MemoryQueryEngine:
                 source="role_match",
                 evidence_node_ids=[str(role_matches[0]["node_id"])],
             )
-            self._record_query_event(action=action, prediction=prediction)
+            if record_query:
+                self._record_query_event(action=action, prediction=prediction)
             return prediction
-        concept_matches = self.find_concept_matches(json.dumps(list(context_signatures.get(max(context_signatures), ()))), action)
+        concept_matches = self.find_concept_matches(best_context_signature, action)
         if concept_matches and concept_matches[0].get("family_id") is not None:
             prediction = MemoryPrediction(
                 predicted_family=concept_matches[0].get("family_id"),
@@ -73,18 +83,29 @@ class MemoryQueryEngine:
                 source="concept_match",
                 evidence_node_ids=[str(concept_matches[0]["node_id"])],
             )
-            self._record_query_event(action=action, prediction=prediction)
+            if record_query:
+                self._record_query_event(action=action, prediction=prediction)
             return prediction
         prediction = MemoryPrediction(predicted_family=None, confidence=0.0, source="none", evidence_node_ids=[])
-        self._record_query_event(action=action, prediction=prediction)
+        if record_query:
+            self._record_query_event(action=action, prediction=prediction)
         return prediction
 
-    def score_action(self, context_signatures: dict[int, tuple], action: int, available_actions: list[int]) -> MemoryActionScore:
-        prediction = self.predict_family(context_signatures, action)
-        future = self.find_future_option_evidence(json.dumps(list(context_signatures.get(max(context_signatures), ()))), action)
-        failure = self.find_failure_path_evidence(json.dumps(list(context_signatures.get(max(context_signatures), ()))), action)
-        role_matches = self.find_similar_roles(json.dumps(list(context_signatures.get(max(context_signatures), ()))), action)
-        concept_matches = self.find_concept_matches(json.dumps(list(context_signatures.get(max(context_signatures), ()))), action)
+    def score_action(
+        self,
+        context_signatures: dict[int, tuple],
+        action: int,
+        available_actions: list[int],
+        *,
+        record_query: bool = False,
+    ) -> MemoryActionScore:
+        del available_actions
+        prediction = self.predict_family(context_signatures, action, record_query=record_query)
+        best_context_signature = self._best_context_signature(context_signatures, action)
+        future = self.find_future_option_evidence(best_context_signature, action)
+        failure = self.find_failure_path_evidence(best_context_signature, action)
+        role_matches = self.find_similar_roles(best_context_signature, action)
+        concept_matches = self.find_concept_matches(best_context_signature, action)
         role_or_concept_transfer_score = max(
             float(role_matches[0].get("score", 0.0)) if role_matches else 0.0,
             float(concept_matches[0].get("score", 0.0)) if concept_matches else 0.0,
@@ -113,47 +134,92 @@ class MemoryQueryEngine:
         )
 
     def rank_actions(self, context_signatures: dict[int, tuple], available_actions: list[int]) -> list[MemoryActionScore]:
-        scores = [self.score_action(context_signatures, int(action), available_actions) for action in sorted(int(item) for item in available_actions)]
+        scores = [
+            self.score_action(context_signatures, int(action), available_actions, record_query=False)
+            for action in sorted(int(item) for item in available_actions)
+        ]
         return sorted(scores, key=lambda item: (-float(item.score), int(item.action)))
 
     def find_similar_roles(self, context_signature: str, action: int) -> list[dict]:
-        del context_signature, action
         matches: list[dict[str, Any]] = []
+        context_node_id = self._context_node_id(context_signature)
+        target_action_node = action_node_id(action)
         for role in self.memory.query_nodes(memory_level="M3", node_type="FunctionalRoleMemory"):
-            family_ids = [
-                int(family_edge["target_node_id"].split(":")[-1])
-                for edge in self.memory.edges_to(role["node_id"], "plays_role")
-                for family_edge in self.memory.edges_from(edge["source_node_id"], "associated_with_family")
-                if str(family_edge["target_node_id"]).startswith("M2:family:")
-            ]
+            base_transfer_score = float(role.get("attrs", {}).get("transfer_score", 0.0) or 0.0)
+            carrier_edges = self.memory.edges_to(role["node_id"], "plays_role")
+            action_match = False
+            context_match = False
+            family_ids: list[int] = []
+            for edge in carrier_edges:
+                carrier_id = str(edge["source_node_id"])
+                for family_edge in self.memory.edges_from(carrier_id, "associated_with_family"):
+                    if str(family_edge["target_node_id"]).startswith("M2:family:"):
+                        family_ids.append(int(str(family_edge["target_node_id"]).split(":")[-1]))
+                if any(str(item["target_node_id"]) == context_node_id for item in self.memory.edges_from(carrier_id, "appears_in_context")):
+                    context_match = True
+                for interaction_edge in self.memory.edges_from(carrier_id, "carried_by"):
+                    interaction_id = str(interaction_edge["target_node_id"])
+                    if any(str(item["target_node_id"]) == target_action_node for item in self.memory.edges_from(interaction_id, "takes_action")):
+                        action_match = True
+            score = base_transfer_score
+            if action_match:
+                score += 0.25
+            if context_match:
+                score += 0.25
+            if not action_match and not context_match:
+                score *= 0.25
+            score = max(0.0, min(1.0, float(score)))
+            if score <= 0.0:
+                continue
             matches.append(
                 {
                     "node_id": role["node_id"],
-                    "score": float(role.get("attrs", {}).get("transfer_score", 0.0) or 0.0),
+                    "score": score,
                     "family_id": family_ids[0] if family_ids else None,
+                    "action_match": action_match,
+                    "context_match": context_match,
                 }
             )
         return sorted(matches, key=lambda item: (-float(item["score"]), str(item["node_id"])))
 
     def find_concept_matches(self, context_signature: str, action: int) -> list[dict]:
-        del context_signature, action
         matches: list[dict[str, Any]] = []
         for concept in self.memory.query_nodes(memory_level="M4", node_type="ConceptMemory"):
             role_edges = self.memory.edges_to(concept["node_id"], "transfers_to")
+            best_role_score = 0.0
             family_ids: list[int] = []
             for role_edge in role_edges:
-                for carrier_edge in self.memory.edges_from(role_edge["source_node_id"], "abstracts_from"):
+                role_node_id_value = str(role_edge["source_node_id"])
+                role_matches = [item for item in self.find_similar_roles(context_signature, action) if str(item["node_id"]) == role_node_id_value]
+                if role_matches:
+                    if bool(role_matches[0].get("action_match")):
+                        best_role_score = max(best_role_score, float(role_matches[0].get("score", 0.0) or 0.0))
+                for carrier_edge in self.memory.edges_from(role_node_id_value, "abstracts_from"):
                     for family_edge in self.memory.edges_from(carrier_edge["target_node_id"], "associated_with_family"):
                         if str(family_edge["target_node_id"]).startswith("M2:family:"):
                             family_ids.append(int(str(family_edge["target_node_id"]).split(":")[-1]))
+            concept_transfer_score = min(1.0, float(concept.get("attrs", {}).get("transfer_success_count", 0) or 0) / 3.0)
+            score = max(0.0, min(1.0, best_role_score * concept_transfer_score))
+            if score <= 0.0:
+                continue
             matches.append(
                 {
                     "node_id": concept["node_id"],
-                    "score": min(1.0, float(concept.get("attrs", {}).get("transfer_success_count", 0) or 0) / 3.0),
+                    "score": score,
                     "family_id": family_ids[0] if family_ids else None,
                 }
             )
         return sorted(matches, key=lambda item: (-float(item["score"]), str(item["node_id"])))
+
+    def record_selected_action_query(
+        self,
+        *,
+        context_signatures: dict[int, tuple],
+        action: int,
+        prediction: MemoryPrediction | None = None,
+    ) -> None:
+        final_prediction = prediction or self.predict_family(context_signatures, action, record_query=False)
+        self._record_query_event(action=action, prediction=final_prediction, selected=True)
 
     def find_future_option_evidence(self, context_signature: str, action: int) -> dict[str, Any]:
         del context_signature
@@ -215,7 +281,7 @@ class MemoryQueryEngine:
             }
         return None
 
-    def _record_query_event(self, *, action: int, prediction: MemoryPrediction) -> None:
+    def _record_query_event(self, *, action: int, prediction: MemoryPrediction, selected: bool = False) -> None:
         query_key = json.dumps({"action": int(action), "source": prediction.source, "family": prediction.predicted_family}, sort_keys=True)
         query_node_id = "M5:query:" + sha1(query_key.encode("utf-8")).hexdigest()[:20]
         self.memory.upsert_node(
@@ -227,8 +293,19 @@ class MemoryQueryEngine:
                 attrs={"action": int(action), "source": prediction.source},
             ),
         )
-        self.memory.upsert_edge(MemoryEdge(query_node_id, action_node_id(action), "selected_action"))
+        self.memory.upsert_edge(MemoryEdge(query_node_id, action_node_id(action), "evaluated_action"))
+        if selected:
+            self.memory.upsert_edge(MemoryEdge(query_node_id, action_node_id(action), "selected_action"))
         if prediction.predicted_family is not None:
             self.memory.upsert_edge(MemoryEdge(query_node_id, family_node_id(prediction.predicted_family), "predicted_family"))
         for evidence_node_id in prediction.evidence_node_ids:
             self.memory.upsert_edge(MemoryEdge(query_node_id, evidence_node_id, "used_evidence"))
+
+    def _best_context_signature(self, context_signatures: dict[int, tuple], action: int) -> str:
+        if not context_signatures:
+            return json.dumps([int(action)])
+        max_level = max(int(level) for level in context_signatures)
+        return json.dumps(list(context_signatures.get(max_level, next(iter(context_signatures.values())))))
+
+    def _context_node_id(self, context_signature: str) -> str:
+        return "M0:context:" + sha1(str(context_signature).encode("utf-8")).hexdigest()[:20]

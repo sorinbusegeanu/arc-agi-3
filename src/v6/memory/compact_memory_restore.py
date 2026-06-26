@@ -12,7 +12,7 @@ from v6.carrier_emergence import CarrierEmergenceTracker
 from v6.contingency.contingency_learner import Contingency
 from v6.memory.compact_memory import stable_family_int_id
 from v6.memory_lifecycle import MemoryRecord, ReplayCandidate
-from v6.memory.substrate import MemoryEdge, MemoryNode, MemoryScore
+from v6.memory.substrate import MemoryEdge, MemoryEvidence, MemoryNode, MemoryPromotion, MemoryScore
 from v6.transformation.transformation_clusterer import TransformationFamily
 
 
@@ -38,6 +38,9 @@ def load_compact_memory_into_system(system: Any, memory_dir: Path) -> dict[str, 
         "graph_edges_restored": 0,
         "memory_nodes_restored": 0,
         "memory_edges_restored": 0,
+        "memory_evidence_restored": 0,
+        "memory_scores_restored": 0,
+        "memory_promotions_restored": 0,
         "memory_summary_loaded": False,
         "restore_warnings": [],
     }
@@ -192,6 +195,44 @@ def load_compact_memory_into_system(system: Any, memory_dir: Path) -> dict[str, 
                     ),
                     step=row["updated_step"],
                 )
+                summary["memory_scores_restored"] += 1
+            for row in state_conn.execute(
+                """
+                SELECT evidence_id, target_node_id, source_interaction_id, evidence_type, payload_json
+                FROM memory_evidence
+                ORDER BY evidence_id ASC
+                """
+            ).fetchall():
+                system.memory.add_evidence(
+                    MemoryEvidence(
+                        evidence_id=str(row["evidence_id"]),
+                        target_node_id=str(row["target_node_id"]),
+                        source_interaction_id=None if row["source_interaction_id"] is None else int(row["source_interaction_id"]),
+                        evidence_type=str(row["evidence_type"]),
+                        payload=_parse_json(row["payload_json"]),
+                    )
+                )
+                summary["memory_evidence_restored"] += 1
+            for row in state_conn.execute(
+                """
+                SELECT promotion_id, source_node_id, target_node_id, promotion_type,
+                       evidence_count, promotion_score, status
+                FROM memory_promotions
+                ORDER BY promotion_id ASC
+                """
+            ).fetchall():
+                system.memory.record_promotion(
+                    MemoryPromotion(
+                        promotion_id=str(row["promotion_id"]),
+                        source_node_id=str(row["source_node_id"]),
+                        target_node_id=str(row["target_node_id"]),
+                        promotion_type=str(row["promotion_type"]),
+                        evidence_count=int(row["evidence_count"] or 0),
+                        promotion_score=float(row["promotion_score"] or 0.0),
+                        status=str(row["status"]),
+                    )
+                )
+                summary["memory_promotions_restored"] += 1
 
     if paths["replay_queue"].exists():
         with _connect_readonly_with_retry(paths["replay_queue"]) as replay_conn:

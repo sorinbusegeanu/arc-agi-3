@@ -11,8 +11,10 @@ from v6.memory.substrate import (
     MemoryNode,
     MemoryPromotion,
     MemorySubstrate,
+    contingency_node_id,
     concept_node_id,
     family_node_id,
+    interaction_node_id,
     role_node_id,
     strategy_node_id,
     world_model_node_id,
@@ -51,6 +53,11 @@ class MemoryPromotionEngine:
         return summary
 
     def promote_m0_to_m1(self, *, step: int | None = None) -> dict[str, Any]:
+        promoted = self._promote_m0_evidence_to_m1(step=step)
+        promoted += self.validate_existing_m1_contingencies(step=step)["count"]
+        return {"count": promoted}
+
+    def validate_existing_m1_contingencies(self, *, step: int | None = None) -> dict[str, Any]:
         promoted = 0
         for node in self.memory.query_nodes(memory_level="M1", node_type="ContingencyMemory"):
             attrs = dict(node.get("attrs", {}))
@@ -69,6 +76,79 @@ class MemoryPromotionEngine:
             )
             promoted += 1
         return {"count": promoted}
+
+    def _promote_m0_evidence_to_m1(self, *, step: int | None = None) -> int:
+        aggregates: dict[tuple[str, str, str], dict[str, Any]] = {}
+        totals: dict[tuple[str, str], int] = defaultdict(int)
+        for interaction in self.memory.query_nodes(memory_level="M0", node_type="InteractionMemory"):
+            interaction_id = str(interaction["node_id"])
+            action_edges = self.memory.edges_from(interaction_id, "takes_action")
+            family_edges = [
+                edge
+                for edge in self.memory.edges_from(interaction_id, "supports")
+                if str(edge["target_node_id"]).startswith("M2:family:")
+            ]
+            if not action_edges or not family_edges:
+                continue
+            attrs = dict(interaction.get("attrs", {}))
+            context_signature = str(attrs.get("context_signature") or "**no_context**")
+            action = str(action_edges[0]["target_node_id"]).split(":")[-1]
+            for family_edge in family_edges:
+                family = str(family_edge["target_node_id"]).split(":")[-1]
+                key = (context_signature, action, family)
+                row = aggregates.setdefault(
+                    key,
+                    {
+                        "context_signature": context_signature,
+                        "action": int(action),
+                        "family": family,
+                        "source_ids": [],
+                    },
+                )
+                row["source_ids"].append(interaction_id)
+                totals[(context_signature, action)] += 1
+        promoted = 0
+        for (context_signature, action, family), item in sorted(aggregates.items()):
+            support_count = len(item["source_ids"])
+            if support_count < self.config.min_contingency_support:
+                continue
+            total_for_context_action = max(1, totals[(context_signature, str(action))])
+            confidence = float(support_count) / float(total_for_context_action)
+            if confidence < self.config.min_contingency_confidence:
+                continue
+            contingency_id = contingency_node_id(0, context_signature, action, family)
+            self.memory.upsert_node(
+                MemoryNode(
+                    node_id=contingency_id,
+                    memory_level="M1",
+                    node_type="ContingencyMemory",
+                    canonical_key=f"0|{context_signature}|{action}|{family}",
+                    attrs={
+                        "context_level": 0,
+                        "context_signature": context_signature,
+                        "action": int(action),
+                        "transformation_family": int(family),
+                        "support_count": support_count,
+                        "confidence": confidence,
+                        "promotion_status": "promoted",
+                    },
+                ),
+                step=step,
+                support_increment=support_count,
+            )
+            self.memory.upsert_edge(MemoryEdge(contingency_id, family_node_id(family), "predicts"))
+            for source_node_id in item["source_ids"]:
+                self.memory.upsert_edge(MemoryEdge(source_node_id, contingency_id, "supports"))
+                self.memory.upsert_edge(MemoryEdge(contingency_id, source_node_id, "derived_from"))
+            self._record(
+                source_node_id=str(item["source_ids"][0]),
+                target_node_id=contingency_id,
+                promotion_type="M0_M1",
+                evidence_count=support_count,
+                promotion_score=confidence,
+            )
+            promoted += 1
+        return promoted
 
     def promote_m1_to_m2(self, *, step: int | None = None) -> dict[str, Any]:
         by_family: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -131,6 +211,7 @@ class MemoryPromotionEngine:
 
     def promote_m3_carrier_to_role(self, *, step: int | None = None) -> dict[str, Any]:
         grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        grouped_payloads: dict[str, dict[str, Any]] = {}
         carrier_nodes = [
             node for node in self.memory.query_nodes(memory_level="M3", node_type="CarrierMemory")
             if str(node.get("attrs", {}).get("promotion_status", "")) == "promoted"
@@ -143,31 +224,56 @@ class MemoryPromotionEngine:
                 for edge in outgoing
                 if str(edge["edge_type"]) == "associated_with_family"
             )
-            outcome_targets = sorted(
-                edge["target_node_id"]
+            carried_interaction_ids = [
+                str(edge["target_node_id"])
                 for edge in outgoing
-                if str(edge["edge_type"]) in {"expands_future_options", "restricts_future_options", "preserves_future_options"}
-            )
-            future_option_effect = "neutral"
-            outgoing_types = {edge["edge_type"] for edge in outgoing}
-            if "expands_future_options" in outgoing_types:
+                if str(edge["edge_type"]) == "carried_by"
+            ]
+            interaction_edge_types: set[str] = set()
+            outcome_targets: set[str] = set()
+            expands_count = 0
+            restricts_count = 0
+            preserves_count = 0
+            for interaction_id in carried_interaction_ids:
+                for edge in self.memory.edges_from(interaction_id):
+                    interaction_edge_types.add(str(edge["edge_type"]))
+                    if str(edge["edge_type"]) == "expands_future_options":
+                        expands_count += 1
+                    elif str(edge["edge_type"]) == "restricts_future_options":
+                        restricts_count += 1
+                    elif str(edge["edge_type"]) == "preserves_future_options":
+                        preserves_count += 1
+                    elif str(edge["edge_type"]) == "has_outcome":
+                        outcome_targets.add(str(edge["target_node_id"]))
+            if expands_count > restricts_count:
                 future_option_effect = "positive"
-            elif "restricts_future_options" in outgoing_types:
+            elif restricts_count > expands_count:
                 future_option_effect = "negative"
+            else:
+                future_option_effect = "neutral"
             signature_payload = {
                 "outgoing": sorted({edge["edge_type"] for edge in outgoing}),
                 "incoming": sorted({edge["edge_type"] for edge in incoming}),
+                "carried_interaction_edge_types": sorted(interaction_edge_types),
                 "families": family_targets,
-                "outcomes": outcome_targets,
+                "outcomes": sorted(outcome_targets),
                 "future_option_effect": future_option_effect,
             }
             role_signature = sha1(json.dumps(signature_payload, sort_keys=True).encode("utf-8")).hexdigest()[:20]
             grouped[role_signature].append(carrier)
+            grouped_payloads[role_signature] = {
+                "future_option_effect": future_option_effect,
+                "expands_future_options_count": expands_count,
+                "restricts_future_options_count": restricts_count,
+                "preserves_future_options_count": preserves_count,
+                "carried_interaction_count": len(carried_interaction_ids),
+            }
         promoted = 0
         for role_signature, carriers in sorted(grouped.items()):
             if len(carriers) < self.config.min_role_support:
                 continue
             node_id = role_node_id(role_signature)
+            role_payload = dict(grouped_payloads.get(role_signature, {}))
             self.memory.upsert_node(
                 MemoryNode(
                     node_id=node_id,
@@ -178,6 +284,7 @@ class MemoryPromotionEngine:
                         "role_signature": role_signature,
                         "carrier_count": len(carriers),
                         "transfer_score": min(1.0, len(carriers) / 3.0),
+                        **role_payload,
                     },
                 ),
                 step=step,
