@@ -936,6 +936,30 @@ def test_memory_lifecycle_context_contradiction_enters_replay_queue() -> None:
     assert "i1" in manager.replay_candidates
 
 
+def test_memory_lifecycle_apply_post_factum_credit_merges_reasons() -> None:
+    manager = MemoryLifecycleManager()
+    manager.register_interaction(
+        interaction_id="i1",
+        family_id="f1",
+        context_signature="ctx1",
+        action_signature="a1",
+        carrier_signature=None,
+        isf_total=0.2,
+        prediction_error=0.1,
+        learning_value=0.1,
+        transfer_potential=0.1,
+        explanatory_potential=0.1,
+        context_contradiction=False,
+        timestamp_step=1,
+    )
+
+    manager.apply_post_factum_credit("i1", learning_credit=0.5, reason="post_factum_level_completion")
+    manager.apply_post_factum_credit("i1", learning_credit=0.8, reason="win_terminal_trajectory")
+
+    assert manager.replay_candidates["i1"].reason == "post_factum_level_completion+win_terminal_trajectory"
+    assert manager.replay_candidates["i1"].replay_priority == 0.8
+
+
 def test_memory_lifecycle_replay_batch_returns_highest_priority_first() -> None:
     manager = MemoryLifecycleManager()
     manager.register_interaction(
@@ -1768,9 +1792,17 @@ def test_v6_system_applies_post_factum_level_completion_credit(tmp_path) -> None
         ).fetchall()
         prediction_rows = connection.execute(
             """
-            SELECT interaction_id, post_factum_level_completion_credit, post_factum_level_completion_decay, post_factum_level_completion_step, post_factum_credit_reason
+            SELECT interaction_id, post_factum_level_completion_credit, post_factum_level_completion_decay, post_factum_level_completion_step, post_factum_credit_reason,
+                   memory_replay_candidate, memory_replay_priority, memory_retention_reason
             FROM prediction_results
             ORDER BY interaction_id
+            """
+        ).fetchall()
+        interaction_replay_rows = connection.execute(
+            """
+            SELECT id, memory_replay_candidate, memory_replay_priority, memory_retention_reason
+            FROM interactions
+            ORDER BY id
             """
         ).fetchall()
     finally:
@@ -1786,8 +1818,21 @@ def test_v6_system_applies_post_factum_level_completion_credit(tmp_path) -> None
     assert [float(row[1]) for row in prediction_rows] == credits
     assert all(row[3] == 4 for row in prediction_rows)
     assert all(row[4] == "levels_completed_increment" for row in prediction_rows)
-    assert all(candidate.replay_priority > 0.0 for candidate in replay_candidates.values() if candidate.interaction_id in {"1", "2", "3", "4"})
-    assert all(candidate.reason == "post_factum_level_completion" for candidate in replay_candidates.values() if candidate.interaction_id in {"1", "2", "3", "4"})
+    assert {"1", "2", "3", "4"}.issubset(set(replay_candidates))
+    assert all(replay_candidates[str(i)].replay_priority > 0.0 for i in range(1, 5))
+    for i in range(1, 5):
+        parts = replay_candidates[str(i)].reason.split("+")
+        assert "post_factum_level_completion" in parts
+    assert all(int(row[1]) == 1 for row in interaction_replay_rows)
+    assert all(float(row[2]) > 0.0 for row in interaction_replay_rows)
+    for row in interaction_replay_rows:
+        parts = str(row[3]).split("+")
+        assert "post_factum_level_completion" in parts
+    assert all(int(row[5]) == 1 for row in prediction_rows)
+    assert all(float(row[6]) > 0.0 for row in prediction_rows)
+    for row in prediction_rows:
+        parts = str(row[7]).split("+")
+        assert "post_factum_level_completion" in parts
 
 
 def test_v6_system_game_over_without_progress_gets_no_post_factum_credit(tmp_path) -> None:
@@ -1850,9 +1895,17 @@ def test_v6_system_applies_win_trajectory_credit(tmp_path) -> None:
         rows = connection.execute(
             """
             SELECT id, post_factum_trajectory_credit, post_factum_trajectory_credit_kind,
-                   post_factum_trajectory_credit_polarity, post_factum_trajectory_credit_reason
+                   post_factum_trajectory_credit_polarity, post_factum_trajectory_credit_reason,
+                   memory_replay_candidate, memory_replay_priority, memory_retention_reason
             FROM interactions
             ORDER BY id
+            """
+        ).fetchall()
+        prediction_rows = connection.execute(
+            """
+            SELECT interaction_id, memory_replay_candidate, memory_replay_priority, memory_retention_reason
+            FROM prediction_results
+            ORDER BY interaction_id
             """
         ).fetchall()
     finally:
@@ -1863,11 +1916,20 @@ def test_v6_system_applies_win_trajectory_credit(tmp_path) -> None:
     assert all(row[2] == "WIN" for row in rows)
     assert all(row[3] == "positive" for row in rows)
     assert all(row[4] == "win_terminal_trajectory" for row in rows)
-    assert all(
-        replay_candidates[str(i)].reason == "win_terminal_trajectory"
-        for i in range(1, 5)
-        if str(i) in replay_candidates
-    )
+    assert {"1", "2", "3", "4"}.issubset(set(replay_candidates))
+    for i in range(1, 5):
+        parts = replay_candidates[str(i)].reason.split("+")
+        assert "win_terminal_trajectory" in parts
+    assert all(int(row[5]) == 1 for row in rows)
+    assert all(float(row[6]) > 0.0 for row in rows)
+    for row in rows:
+        parts = str(row[7]).split("+")
+        assert "win_terminal_trajectory" in parts
+    assert all(int(row[1]) == 1 for row in prediction_rows)
+    assert all(float(row[2]) > 0.0 for row in prediction_rows)
+    for row in prediction_rows:
+        parts = str(row[3]).split("+")
+        assert "win_terminal_trajectory" in parts
 
 
 def test_v6_system_applies_game_over_trajectory_credit(tmp_path) -> None:
@@ -1893,9 +1955,17 @@ def test_v6_system_applies_game_over_trajectory_credit(tmp_path) -> None:
         rows = connection.execute(
             """
             SELECT id, post_factum_trajectory_credit, post_factum_trajectory_credit_kind,
-                   post_factum_trajectory_credit_polarity, post_factum_trajectory_credit_reason
+                   post_factum_trajectory_credit_polarity, post_factum_trajectory_credit_reason,
+                   memory_replay_candidate, memory_replay_priority, memory_retention_reason
             FROM interactions
             ORDER BY id
+            """
+        ).fetchall()
+        prediction_rows = connection.execute(
+            """
+            SELECT interaction_id, memory_replay_candidate, memory_replay_priority, memory_retention_reason
+            FROM prediction_results
+            ORDER BY interaction_id
             """
         ).fetchall()
     finally:
@@ -1906,11 +1976,20 @@ def test_v6_system_applies_game_over_trajectory_credit(tmp_path) -> None:
     assert all(row[2] == "GAME_OVER" for row in rows)
     assert all(row[3] == "negative" for row in rows)
     assert all(row[4] == "game_over_failure_path" for row in rows)
-    assert all(
-        replay_candidates[str(i)].reason == "game_over_failure_path"
-        for i in range(1, 5)
-        if str(i) in replay_candidates
-    )
+    assert {"1", "2", "3", "4"}.issubset(set(replay_candidates))
+    for i in range(1, 5):
+        parts = replay_candidates[str(i)].reason.split("+")
+        assert "game_over_failure_path" in parts
+    assert all(int(row[5]) == 1 for row in rows)
+    assert all(float(row[6]) > 0.0 for row in rows)
+    for row in rows:
+        parts = str(row[7]).split("+")
+        assert "game_over_failure_path" in parts
+    assert all(int(row[1]) == 1 for row in prediction_rows)
+    assert all(float(row[2]) > 0.0 for row in prediction_rows)
+    for row in prediction_rows:
+        parts = str(row[3]).split("+")
+        assert "game_over_failure_path" in parts
 
 
 def test_v6_system_not_finished_without_progress_has_no_trajectory_credit(tmp_path) -> None:
@@ -1956,15 +2035,24 @@ def test_v6_system_combined_level_completion_and_win_populates_both_credit_paths
         ),
     )
     system.run(steps=4)
+    replay_candidates = dict(system.memory_lifecycle.replay_candidates)
     system.close()
 
     connection = sqlite3.connect(db_path)
     try:
         rows = connection.execute(
             """
-            SELECT id, level_completed_event, post_factum_level_completion_credit, post_factum_trajectory_credit
+            SELECT id, level_completed_event, post_factum_level_completion_credit, post_factum_trajectory_credit,
+                   memory_replay_candidate, memory_replay_priority, memory_retention_reason
             FROM interactions
             ORDER BY id
+            """
+        ).fetchall()
+        prediction_rows = connection.execute(
+            """
+            SELECT interaction_id, memory_replay_candidate, memory_replay_priority, memory_retention_reason
+            FROM prediction_results
+            ORDER BY interaction_id
             """
         ).fetchall()
     finally:
@@ -1973,6 +2061,23 @@ def test_v6_system_combined_level_completion_and_win_populates_both_credit_paths
     assert rows[-1][1] == 1
     assert all(float(row[2]) > 0.0 for row in rows)
     assert all(float(row[3]) > 0.0 for row in rows)
+    assert {"1", "2", "3", "4"}.issubset(set(replay_candidates))
+    for i in range(1, 5):
+        reason = replay_candidates[str(i)].reason
+        assert "post_factum_level_completion" in reason.split("+")
+        assert "win_terminal_trajectory" in reason.split("+")
+    assert all(int(row[4]) == 1 for row in rows)
+    assert all(float(row[5]) > 0.0 for row in rows)
+    for row in rows:
+        parts = str(row[6]).split("+")
+        assert "post_factum_level_completion" in parts
+        assert "win_terminal_trajectory" in parts
+    assert all(int(row[1]) == 1 for row in prediction_rows)
+    assert all(float(row[2]) > 0.0 for row in prediction_rows)
+    for row in prediction_rows:
+        parts = str(row[3]).split("+")
+        assert "post_factum_level_completion" in parts
+        assert "win_terminal_trajectory" in parts
 
 
 def test_v6_system_prediction_edges_add_explains_and_depends_on() -> None:

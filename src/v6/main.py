@@ -768,6 +768,7 @@ class V6System:
                 learning_credit=float(credit),
                 reason="post_factum_level_completion",
             )
+            self._sync_post_factum_replay_fields(int(interaction_id))
         self._current_level_interaction_ids = []
 
     def _apply_post_factum_trajectory_credit(
@@ -831,7 +832,43 @@ class V6System:
                 learning_credit=float(credit),
                 reason=str(reason),
             )
+            self._sync_post_factum_replay_fields(int(interaction_id))
         self._current_level_interaction_ids = []
+
+    def _sync_post_factum_replay_fields(self, interaction_id: int) -> None:
+        candidate = self.memory_lifecycle.replay_candidates.get(str(interaction_id))
+        if candidate is None:
+            return
+        self.connection.execute(
+            """
+            UPDATE interactions
+            SET
+                memory_replay_priority = ?,
+                memory_replay_candidate = 1,
+                memory_retention_reason = ?
+            WHERE id = ?
+            """,
+            (
+                float(candidate.replay_priority),
+                str(candidate.reason),
+                int(interaction_id),
+            ),
+        )
+        self.connection.execute(
+            """
+            UPDATE prediction_results
+            SET
+                memory_replay_priority = ?,
+                memory_replay_candidate = 1,
+                memory_retention_reason = ?
+            WHERE interaction_id = ?
+            """,
+            (
+                float(candidate.replay_priority),
+                str(candidate.reason),
+                int(interaction_id),
+            ),
+        )
 
     def _build_isf_memory_counts(
         self,

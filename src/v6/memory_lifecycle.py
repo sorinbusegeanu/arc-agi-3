@@ -251,10 +251,11 @@ class MemoryLifecycleManager:
             0.0 if existing is None else float(existing.replay_priority),
             clamp01(float(learning_credit)),
         )
+        merged_reason = _merge_reasons(existing.reason if existing is not None else None, reason)
         self.replay_candidates[interaction_id] = ReplayCandidate(
             interaction_id=interaction_id,
             replay_priority=replay_priority,
-            reason=str(reason),
+            reason=merged_reason,
             family_id=record.family_id,
             context_signature=record.context_signature,
             status=record.status,
@@ -320,3 +321,14 @@ def _retention_reason(
     }
     reason, score = max(candidates.items(), key=lambda item: item[1])
     return reason if score > 0.0 else "default_active"
+
+
+def _merge_reasons(old: str | None, new: str) -> str:
+    parts: list[str] = []
+    for value in (old, new):
+        if not value:
+            continue
+        for part in str(value).split("+"):
+            if part and part not in parts:
+                parts.append(part)
+    return "+".join(parts)
