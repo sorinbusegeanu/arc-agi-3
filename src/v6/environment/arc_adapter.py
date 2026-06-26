@@ -37,20 +37,20 @@ class ArcGridEnvironment:
         self.last_terminal_state: str | None = None
         self.last_outcome_state: str = "alive"
         self.last_outcome_polarity: str = "neutral"
-        self.last_state_name: str | None = None
-        self.last_levels_completed: int = 0
-        self.last_win_levels: int = 0
-        self.last_full_game_id: str | None = None
+        self.last_level_number: int | None = None
+        self.level_advanced: bool = False
         self._last_raw = self.env.reset()
-        self._update_progress_fields(self._last_raw)
+        self.last_level_number = _level_number(self._last_raw)
         self._last_grid = _grid_from_raw(self._last_raw)
 
     def observe(self) -> np.ndarray:
         return self._last_grid.copy()
 
     def reset(self) -> np.ndarray:
-        self._last_raw = self.env.reset()
-        self._update_progress_fields(self._last_raw)
+        raw = self.env.reset()
+        self._last_raw = raw
+        self.last_level_number = _level_number(raw)
+        self.level_advanced = False
         self._last_grid = _grid_from_raw(self._last_raw)
         self.reset_count += 1
         self.last_step_was_reset_boundary = True
@@ -64,28 +64,51 @@ class ArcGridEnvironment:
 
         self.last_step_was_reset_boundary = False
         self.last_terminal_state = None
+        self.level_advanced = False
+        previous_level_number = self.last_level_number
         self._last_raw = self.env.step(GameAction.from_id(int(action)))
-        self._update_progress_fields(self._last_raw)
-        self.last_outcome_state, self.last_outcome_polarity = _infer_outcome_fields(self._last_raw, frame_available=_raw_has_usable_frame(self._last_raw))
-        if self.last_outcome_state != "alive":
-            self.last_terminal_state = self.last_state_name
+        current_level_number = _level_number(self._last_raw)
         try:
             self._last_grid = _grid_from_raw(self._last_raw)
+            frame_available = True
         except ValueError:
             if not self.auto_reset_on_empty_frame:
                 raise
-            state = getattr(self._last_raw, "state", None)
-            state_name = str(getattr(state, "value", state))
-            self.last_terminal_state = state_name
-            if self.last_outcome_state == "alive":
-                self.last_outcome_state = "end_game"
-                self.last_outcome_polarity = "unknown"
+            frame_available = False
+            self.last_outcome_state = "end_game"
+            self.last_outcome_polarity = "unknown"
+            self.last_terminal_state = "end_game"
+            raw_after_terminal = self._last_raw
             self._last_raw = self.env.reset()
-            self._update_progress_fields(self._last_raw)
+            self.last_level_number = _level_number(self._last_raw)
+            self.level_advanced = False
             self.reset_count += 1
             self.skipped_terminal_steps += 1
             self.last_step_was_reset_boundary = True
             self._last_grid = _grid_from_raw(self._last_raw)
+            self._last_raw = raw_after_terminal
+            return self._last_grid.copy()
+        state_name = (_state_name(self._last_raw) or "").upper()
+        if state_name in {"GAME_OVER", "DEAD"}:
+            self.last_outcome_state = "dead"
+            self.last_outcome_polarity = "negative"
+            self.last_terminal_state = state_name or "GAME_OVER"
+        elif state_name in {"WIN", "GAME_WON"}:
+            self.last_outcome_state = "game_won"
+            self.last_outcome_polarity = "positive"
+            self.last_terminal_state = state_name or "WIN"
+        elif previous_level_number is not None and current_level_number is not None and current_level_number != previous_level_number:
+            self.last_outcome_state = "level_advanced"
+            self.last_outcome_polarity = "positive"
+            self.level_advanced = True
+        elif not frame_available:
+            self.last_outcome_state = "end_game"
+            self.last_outcome_polarity = "unknown"
+            self.last_terminal_state = "end_game"
+        else:
+            self.last_outcome_state = "alive"
+            self.last_outcome_polarity = "neutral"
+        self.last_level_number = current_level_number
         return self._last_grid.copy()
 
     def available_actions(self) -> list[int]:
@@ -159,13 +182,6 @@ def _grid_from_raw(raw: Any) -> np.ndarray:
     return array
 
 
-def _as_int(value: Any, default: int = 0) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return int(default)
-
-
 def _state_name(raw: Any) -> str | None:
     state = getattr(raw, "state", None)
     if state is None:
@@ -173,16 +189,14 @@ def _state_name(raw: Any) -> str | None:
     return str(getattr(state, "value", state))
 
 
-def _game_id(raw: Any) -> str | None:
-    value = getattr(raw, "game_id", None)
-    return None if value in (None, "") else str(value)
-
-
-def _update_progress_fields(self, raw: Any) -> None:
-    self.last_state_name = _state_name(raw)
-    self.last_levels_completed = _as_int(getattr(raw, "levels_completed", 0), default=self.last_levels_completed)
-    self.last_win_levels = _as_int(getattr(raw, "win_levels", 0), default=self.last_win_levels)
-    self.last_full_game_id = _game_id(raw)
+def _level_number(raw: Any) -> int | None:
+    for name in ("level", "level_number", "level_id", "levels_completed"):
+        if hasattr(raw, name):
+            try:
+                return int(getattr(raw, name))
+            except (TypeError, ValueError):
+                pass
+    return None
 
 
 def _raw_has_usable_frame(raw: Any) -> bool:
@@ -207,6 +221,3 @@ def _infer_outcome_fields(raw: Any, *, frame_available: bool) -> tuple[str, str]
     if frame_available:
         return "alive", "neutral"
     return "end_game", "unknown"
-
-
-ArcGridEnvironment._update_progress_fields = _update_progress_fields

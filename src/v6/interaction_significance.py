@@ -22,7 +22,7 @@ class InteractionSignificanceScore:
     weights: dict[str, float]
     outcome_state: str | None = None
     outcome_polarity: str | None = None
-    version: str = "isf_v01"
+    version: str = "isf_v02"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -98,6 +98,9 @@ def compute_interaction_significance(
     elif normalized_outcome_state == "end_game":
         survival_impact = max(survival_impact, 0.85)
         normalized_outcome_polarity = normalized_outcome_polarity or "unknown"
+    elif normalized_outcome_state == "level_advanced":
+        survival_impact = max(survival_impact, 0.75)
+        normalized_outcome_polarity = "positive"
     elif normalized_outcome_state == "alive":
         survival_impact = max(survival_impact, 0.0)
         normalized_outcome_polarity = normalized_outcome_polarity or "neutral"
@@ -123,9 +126,9 @@ def compute_interaction_significance(
     if context_signature and normalized_outcome_state:
         novelty_scores.append(_novelty(memory_counts.get(f"context_outcome:{context_signature}|{normalized_outcome_state}", 0)))
     learning_value = max(novelty_scores) if novelty_scores else 0.5
-    if normalized_outcome_state in {"game_won", "dead", "end_game"}:
-        terminal_outcome_learning_value = _novelty(memory_counts.get(f"outcome_state:{normalized_outcome_state}", 0))
-        learning_value = max(learning_value, terminal_outcome_learning_value)
+    if normalized_outcome_state in {"game_won", "dead", "end_game", "level_advanced"}:
+        progress_outcome_learning_value = _novelty(memory_counts.get(f"outcome_state:{normalized_outcome_state}", 0))
+        learning_value = max(learning_value, progress_outcome_learning_value)
 
     if future_option_delta is not None:
         transfer_potential = clamp01(abs(future_option_delta))

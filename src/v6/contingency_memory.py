@@ -768,8 +768,12 @@ def process_interaction_row(
     delta = normalized_delta(delta_map.get(int(row["delta_id"])))
     outcome_signature = classify_outcome(before, after, delta)
     outcome_state = row.get("outcome_state")
-    if outcome_state not in {"alive", "dead", "end_game", "game_won"}:
+    if outcome_state not in {"alive", "dead", "end_game", "game_won", "level_advanced"}:
         outcome_state = "end_game" if bool(row.get("is_terminal_outcome")) else None
+    if outcome_state == "level_advanced":
+        outcome_signature = "progress:level_advanced"
+    elif outcome_state in {"game_won", "dead", "end_game"}:
+        outcome_signature = f"terminal:{outcome_state}"
     outcome_polarity = row.get("outcome_polarity")
     terminal_observed = (
         bool(row.get("is_terminal_outcome"))

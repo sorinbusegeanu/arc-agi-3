@@ -163,7 +163,11 @@ class V6System:
                 selected_contingency=selected_contingency,
             )
             observation_after = self.env.step(action)
-            if not bool(getattr(self.env, "last_step_was_reset_boundary", False)):
+            outcome_state_after_step = str(getattr(self.env, "last_outcome_state", "alive") or "alive")
+            if (
+                not bool(getattr(self.env, "last_step_was_reset_boundary", False))
+                or outcome_state_after_step in {"level_advanced", "dead", "end_game", "game_won"}
+            ):
                 break
             self.episode_id += 1
         else:
@@ -216,9 +220,7 @@ class V6System:
         actual_family_id = None if actual_family is None else str(actual_family)
         outcome_state = str(getattr(self.env, "last_outcome_state", "alive") or "alive")
         outcome_polarity = str(getattr(self.env, "last_outcome_polarity", "neutral") or "neutral")
-        is_terminal_outcome = outcome_state in {"game_won", "dead", "end_game"}
-        is_success_outcome = outcome_state == "game_won"
-        is_failure_outcome = outcome_state == "dead"
+        level_advanced = bool(getattr(self.env, "level_advanced", False))
         memory_counts = self._build_isf_memory_counts(
             delta_id=str(delta.id),
             actual_family_id=actual_family_id,
@@ -404,9 +406,7 @@ class V6System:
             efficiency_future_option_gain_per_cost=efficiency_event.future_option_gain_per_cost,
             outcome_state=outcome_state,
             outcome_polarity=outcome_polarity,
-            is_terminal_outcome=is_terminal_outcome,
-            is_success_outcome=is_success_outcome,
-            is_failure_outcome=is_failure_outcome,
+            level_advanced=level_advanced,
         )
         interaction = Interaction(
             id=interaction_id,
@@ -451,9 +451,7 @@ class V6System:
             efficiency_future_option_gain_per_cost=efficiency_event.future_option_gain_per_cost,
             outcome_state=outcome_state,
             outcome_polarity=outcome_polarity,
-            is_terminal_outcome=is_terminal_outcome,
-            is_success_outcome=is_success_outcome,
-            is_failure_outcome=is_failure_outcome,
+            level_advanced=level_advanced,
         )
         self.connection.execute(
             """
@@ -494,9 +492,7 @@ class V6System:
                 efficiency_future_option_gain_per_cost = ?,
                 outcome_state = ?,
                 outcome_polarity = ?,
-                is_terminal_outcome = ?,
-                is_success_outcome = ?,
-                is_failure_outcome = ?
+                level_advanced = ?
             WHERE id = ?
             """,
             (
@@ -535,9 +531,7 @@ class V6System:
                 interaction.efficiency_future_option_gain_per_cost,
                 interaction.outcome_state,
                 interaction.outcome_polarity,
-                int(bool(interaction.is_terminal_outcome)),
-                int(bool(interaction.is_success_outcome)),
-                int(bool(interaction.is_failure_outcome)),
+                int(bool(interaction.level_advanced)),
                 interaction.id,
             ),
         )

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import sys
+import types
 from pathlib import Path
 import numpy as np
 import v6.evaluation.interaction_sampling as interaction_sampling
@@ -13,6 +15,7 @@ from v6.game_sets import load_game_set_manifest
 from v6.efficiency_metrics import EfficiencyTracker, is_no_effect_delta
 from v6.contingency_memory import (
     ContingencyMemoryConfig,
+    RunStreamingState,
     action_only_accuracy,
     build_input_manifest,
     build_m1_contingencies,
@@ -26,6 +29,7 @@ from v6.contingency_memory import (
     list_interaction_files,
     load_partition_events,
     print_progress,
+    process_interaction_row,
     run_contingency_memory_v06,
 )
 from v6.context.contradiction_tracker import ContextContradictionTracker
@@ -36,6 +40,7 @@ from v6.context_depth_compare_v07 import (
 )
 from v6.contingency.contingency_learner import Contingency, ContingencyLearner
 from v6.delta.delta_extractor import Delta, extract_delta
+from v6.environment.arc_adapter import ArcGridEnvironment
 from v6.evaluation.broad_game_validation import (
     BroadValidationConfig,
     best_configs as broad_best_configs,
@@ -291,15 +296,20 @@ class ToggleEnv:
 
 
 class OutcomeEnv(ToggleEnv):
-    def __init__(self, *, outcome_state: str, outcome_polarity: str) -> None:
+    def __init__(self, *, outcome_state: str, outcome_polarity: str, starting_level: int = 1, next_level: int | None = None, state_name: str | None = None) -> None:
         super().__init__()
         self._configured_outcome_state = str(outcome_state)
         self._configured_outcome_polarity = str(outcome_polarity)
+        self._starting_level = int(starting_level)
+        self._next_level = self._starting_level if next_level is None else int(next_level)
+        self._state_name = state_name
         self.last_outcome_state = "alive"
         self.last_outcome_polarity = "neutral"
         self.last_terminal_state = None
         self.last_step_was_reset_boundary = False
         self.last_reward = 0
+        self.last_level_number = self._starting_level
+        self.level_advanced = False
 
     def step(self, action: int) -> np.ndarray:
         grid = super().step(action)
@@ -307,6 +317,9 @@ class OutcomeEnv(ToggleEnv):
         self.last_outcome_polarity = self._configured_outcome_polarity
         self.last_terminal_state = self._configured_outcome_state if self._configured_outcome_state in {"game_won", "dead", "end_game"} else None
         self.last_step_was_reset_boundary = self._configured_outcome_state == "end_game"
+        self.level_advanced = self._configured_outcome_state == "level_advanced"
+        self.last_level_number = self._next_level
+        self.state = self._state_name or self.state
         return grid
 
 
@@ -1498,16 +1511,89 @@ def test_v6_system_run_step_stores_isf_fields(tmp_path) -> None:
             """
         ).fetchone()
         assert row is not None
-        assert row[0] == "isf_v01"
+        assert row[0] == "isf_v02"
         assert all(value is not None for value in row[1:])
     finally:
         connection.close()
 
 
-def test_v6_system_run_step_stores_outcome_state_fields(tmp_path) -> None:
+def test_level_number_changes_with_unchanged_state_marks_level_advanced() -> None:
+    class Raw:
+        def __init__(self, frame, state="NOT_FINISHED", level=1):
+            self.frame = frame
+            self.state = state
+            self.level = level
+            self.available_actions = [1]
+
+    class FakeInnerEnv:
+        def __init__(self):
+            self.step_count = 0
+
+        def reset(self):
+            return Raw(np.zeros((2, 2), dtype=int), level=1)
+
+        def step(self, _action):
+            self.step_count += 1
+            return Raw(np.ones((2, 2), dtype=int), state="NOT_FINISHED", level=2)
+
+        def available_actions(self):
+            return [1]
+
+    previous = sys.modules.get("arcengine")
+    sys.modules["arcengine"] = types.SimpleNamespace(GameAction=types.SimpleNamespace(from_id=lambda value: value))
+    try:
+        env = object.__new__(ArcGridEnvironment)
+        env.env = FakeInnerEnv()
+        env.auto_reset_on_empty_frame = True
+        env.reset_count = 0
+        env.skipped_terminal_steps = 0
+        env.last_step_was_reset_boundary = False
+        env.last_terminal_state = None
+        env.last_outcome_state = "alive"
+        env.last_outcome_polarity = "neutral"
+        env.last_level_number = 1
+        env.level_advanced = False
+        env._last_raw = env.env.reset()
+        env._last_grid = np.zeros((2, 2), dtype=int)
+
+        env.step(1)
+
+        assert env.last_outcome_state == "level_advanced"
+        assert env.last_outcome_polarity == "positive"
+        assert env.level_advanced is True
+        assert env.last_level_number == 2
+    finally:
+        if previous is None:
+            sys.modules.pop("arcengine", None)
+        else:
+            sys.modules["arcengine"] = previous
+
+
+def test_interaction_significance_level_advanced_has_positive_survival_signal() -> None:
+    score = compute_interaction_significance(
+        reward=0,
+        terminated=False,
+        truncated=False,
+        prediction_correct=None,
+        prediction_confidence=None,
+        actual_family_id=None,
+        delta_id=None,
+        context_signature="ctx",
+        memory_counts={"outcome_state:level_advanced": 0, "context_outcome:ctx|level_advanced": 0},
+        graph_counts={},
+        outcome_state="level_advanced",
+        outcome_polarity=None,
+    )
+
+    assert score.survival_impact >= 0.75
+    assert score.outcome_polarity == "positive"
+    assert score.version == "isf_v02"
+
+
+def test_v6_system_run_step_stores_level_advanced_fields(tmp_path) -> None:
     db_path = tmp_path / "outcomes.sqlite"
     system = V6System(
-        env=OutcomeEnv(outcome_state="game_won", outcome_polarity="positive"),
+        env=OutcomeEnv(outcome_state="level_advanced", outcome_polarity="positive", starting_level=1, next_level=2),
         config=V6Config(
             database_path=str(db_path),
             recluster_every=2,
@@ -1526,7 +1612,7 @@ def test_v6_system_run_step_stores_outcome_state_fields(tmp_path) -> None:
     try:
         interaction_row = connection.execute(
             """
-            SELECT outcome_state, outcome_polarity, is_terminal_outcome, is_success_outcome, is_failure_outcome
+            SELECT outcome_state, outcome_polarity, level_advanced
             FROM interactions
             ORDER BY id
             LIMIT 1
@@ -1534,7 +1620,7 @@ def test_v6_system_run_step_stores_outcome_state_fields(tmp_path) -> None:
         ).fetchone()
         prediction_row = connection.execute(
             """
-            SELECT outcome_state, outcome_polarity, is_terminal_outcome, is_success_outcome, is_failure_outcome
+            SELECT outcome_state, outcome_polarity, level_advanced
             FROM prediction_results
             ORDER BY id
             LIMIT 1
@@ -1543,8 +1629,8 @@ def test_v6_system_run_step_stores_outcome_state_fields(tmp_path) -> None:
     finally:
         connection.close()
 
-    assert interaction_row == ("game_won", "positive", 1, 1, 0)
-    assert prediction_row == ("game_won", "positive", 1, 1, 0)
+    assert interaction_row == ("level_advanced", "positive", 1)
+    assert prediction_row == ("level_advanced", "positive", 1)
 
 
 def test_v6_system_prediction_edges_add_explains_and_depends_on() -> None:
@@ -2977,6 +3063,38 @@ def test_v06_builds_m0_episode_summaries(tmp_path) -> None:
     assert loaded["episodes"][0].success_observed is True
     assert loaded["episodes"][0].terminal_observed is True
     assert loaded["episodes"][0].terminal_type == "game_won"
+
+
+def test_v06_maps_level_advanced_and_terminal_outcomes() -> None:
+    state = RunStreamingState(game_id="va02", sampler="mixed", seed=0, context_depth=1, exact_reconstruction=False)
+    before = _obs(0)
+    after = _obs(1)
+    base_row = {
+        "id": 1,
+        "timestamp": 1,
+        "observation_before": encode_array(before),
+        "observation_after": encode_array(after),
+        "action": 4,
+        "delta_id": 1,
+    }
+    delta_map = {1: {"changed_cells": 1, "dx": 1.0, "dy": 0.0}}
+
+    event_level, _, _ = process_interaction_row(
+        {**base_row, "outcome_state": "level_advanced", "outcome_polarity": "positive", "level_advanced": 1},
+        state=state,
+        delta_map=delta_map,
+    )
+    assert event_level.outcome_signature == "progress:level_advanced"
+    assert event_level.terminal_observed is False
+
+    for outcome_state in ("dead", "game_won", "end_game"):
+        terminal_state = RunStreamingState(game_id="va02", sampler="mixed", seed=0, context_depth=1, exact_reconstruction=False)
+        event_terminal, _, _ = process_interaction_row(
+            {**base_row, "outcome_state": outcome_state, "outcome_polarity": "negative", "is_terminal_outcome": 1},
+            state=terminal_state,
+            delta_map=delta_map,
+        )
+        assert event_terminal.outcome_signature == f"terminal:{outcome_state}"
 
 
 def test_v06_groups_by_context_and_action() -> None:
