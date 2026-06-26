@@ -23,6 +23,7 @@ from v6.hypothesis_h11_report import evaluate_h11_future_option_transfer_concept
 SUITE_JSON_NAME = "hypothesis_suite_summary.json"
 SUITE_TXT_NAME = "hypothesis_suite_summary.txt"
 SUITE_MD_NAME = "hypothesis_suite_summary.md"
+SUITE_AGGREGATED_TXT_NAME = "hypothesis_suite_aggregated.txt"
 INPUT_REPORT_NAME = "interaction_sampling_v05c_report.json"
 
 
@@ -328,9 +329,15 @@ def build_hypothesis_suite_summary(
             "max_compression_gain": h07.get("max_compression_gain"),
             "concept_transfer_success_count": h07.get("concept_transfer_success_count"),
             "concept_strong_transfer_success_count": h07.get("concept_strong_transfer_success_count"),
+            "transfer_success_rate": h07.get("transfer_success_rate"),
             "max_promotion_score": h07.get("max_promotion_score"),
             "cross_context_concept_count": h07.get("cross_context_concept_count"),
             "cross_game_concept_count": h07.get("cross_game_concept_count"),
+            "concept_cross_game_count_max": h07.get("concept_cross_game_count_max"),
+            "concept_cross_context_count_max": h07.get("concept_cross_context_count_max"),
+            "source_role_count_mean": h07.get("source_role_count_mean"),
+            "source_carrier_count_mean": h07.get("source_carrier_count_mean"),
+            "concept_transfer_success_concentration": h07.get("concept_transfer_success_concentration"),
         },
         "H08 core metrics": {
             "world_model_component_count": h08.get("world_model_component_count"),
@@ -343,6 +350,14 @@ def build_hypothesis_suite_summary(
             "max_explanatory_coverage": h08.get("max_explanatory_coverage"),
             "coherent_cross_context_component_count": h08.get("coherent_cross_context_component_count"),
             "coherent_cross_game_component_count": h08.get("coherent_cross_game_component_count"),
+            "component_cross_context_count": h08.get("component_cross_context_count"),
+            "component_cross_game_count": h08.get("component_cross_game_count"),
+            "predicted_outcome_count": h08.get("predicted_outcome_count"),
+            "supported_context_count": h08.get("supported_context_count"),
+            "concept_link_count": h08.get("concept_link_count"),
+            "role_link_count": h08.get("role_link_count"),
+            "family_link_count": h08.get("family_link_count"),
+            "contradiction_coverage_count": h08.get("contradiction_coverage_count"),
         },
         "H09 core metrics": {
             "future_option_event_count": h09.get("future_option_event_count"),
@@ -358,7 +373,11 @@ def build_hypothesis_suite_summary(
         "H10 core metrics": {
             "future_option_attention_link_count": h10.get("future_option_attention_link_count"),
             "h10_attention_target_definition": h10.get("h10_attention_target_definition"),
+            "live_future_option_delta_count": h10.get("live_future_option_delta_count"),
+            "heuristic_future_option_delta_count": h10.get("heuristic_future_option_delta_count"),
+            "null_future_option_delta_count": h10.get("null_future_option_delta_count"),
             "high_option_change_count": h10.get("high_option_change_count"),
+            "high_option_change_source": h10.get("high_option_change_source"),
             "high_attention_count": h10.get("high_attention_count"),
             "high_option_change_attention_count": h10.get("high_option_change_attention_count"),
             "low_option_change_attention_count": h10.get("low_option_change_attention_count"),
@@ -700,6 +719,27 @@ def _write_suite_summary(summary: dict[str, Any], output_dir: Path) -> None:
     (output_dir / SUITE_JSON_NAME).write_text(json.dumps(summary, indent=2), encoding="utf-8")
     (output_dir / SUITE_TXT_NAME).write_text(_format_text(summary), encoding="utf-8")
     (output_dir / SUITE_MD_NAME).write_text(_format_md(summary), encoding="utf-8")
+    _write_aggregated_hypothesis_text(output_dir)
+
+
+def _write_aggregated_hypothesis_text(output_dir: Path) -> None:
+    sections: list[str] = []
+    for hypothesis_id in range(1, 12):
+        label = f"h{hypothesis_id:02d}"
+        subdir = output_dir / label
+        if not subdir.exists():
+            continue
+        txt_files = sorted(subdir.glob("*.txt"))
+        if not txt_files:
+            continue
+        text = txt_files[0].read_text(encoding="utf-8").strip()
+        if not text:
+            continue
+        sections.append(text)
+    aggregated = "\n\n".join(sections).strip()
+    if aggregated:
+        aggregated += "\n"
+    (output_dir / SUITE_AGGREGATED_TXT_NAME).write_text(aggregated, encoding="utf-8")
 
 
 def _format_text(summary: dict[str, Any]) -> str:

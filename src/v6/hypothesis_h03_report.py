@@ -1064,6 +1064,7 @@ def _aggregate_h03_db_candidates(candidates: list[dict[str, Any]], *, min_family
         "singleton_families_by_effect_type": singleton_diagnostics["by_effect_type"],
         "singleton_family_diagnostics": singleton_diagnostics["diagnostics"],
         "relaxed_canonicalization_diagnostics": relaxed_diagnostics,
+        "safe_merge_proposal_table": relaxed_diagnostics["safe_merge_proposal_table"],
         "singleton_ratio_strict": strict_singleton_ratio,
         "singleton_ratio_relaxed": relaxed_singleton_ratio,
         "singleton_family_count_relaxed": relaxed_singleton_count if relaxed_families else None,
@@ -1071,12 +1072,31 @@ def _aggregate_h03_db_candidates(candidates: list[dict[str, Any]], *, min_family
         "relaxed_family_count": relaxed_family_count if relaxed_families else None,
         "relaxed_singleton_family_count": relaxed_singleton_count if relaxed_families else None,
         "relaxed_singleton_family_ratio": relaxed_singleton_ratio,
-        "over_specific_singleton_count": singleton_diagnostics["diagnostics"]["over_specific_count"],
+        "over_specific_singleton_count": (
+            singleton_diagnostics["diagnostics"]["over_specific_context_count"]
+            + singleton_diagnostics["diagnostics"]["over_specific_action_count"]
+            + singleton_diagnostics["diagnostics"]["over_specific_delta_signature_count"]
+        ),
         "over_specific_singleton_ratio": (
-            singleton_diagnostics["diagnostics"]["over_specific_count"] / singleton_family_count
+            (
+                singleton_diagnostics["diagnostics"]["over_specific_context_count"]
+                + singleton_diagnostics["diagnostics"]["over_specific_action_count"]
+                + singleton_diagnostics["diagnostics"]["over_specific_delta_signature_count"]
+            ) / singleton_family_count
             if singleton_family_count > 0
             else None
         ),
+        "family_prediction_lift_before_merge": _mean_or_none(
+            entry.get("family_prediction_lift_before_merge")
+            for entry in relaxed_diagnostics["safe_merge_proposal_table"]
+            if entry.get("family_prediction_lift_before_merge") is not None
+        ),
+        "family_prediction_lift_after_safe_merge": _mean_or_none(
+            entry.get("family_prediction_lift_after_safe_merge")
+            for entry in relaxed_diagnostics["safe_merge_proposal_table"]
+            if entry.get("family_prediction_lift_after_safe_merge") is not None
+        ),
+        "singleton_ratio_after_safe_merge": relaxed_singleton_ratio,
         "merge_safety_passed": relaxed_diagnostics["merge_safety_passed"],
         "unsafe_relaxed_merge_count": relaxed_diagnostics["unsafe_relaxed_merge_count"],
         "relaxed_decision_candidate": (
@@ -1113,8 +1133,12 @@ def _singleton_diagnostics(
     by_effect_type: dict[str, int] = {}
     diagnostics = {
         "genuine_rare_count": 0,
-        "over_specific_count": 0,
-        "uncertain_count": 0,
+        "over_specific_context_count": 0,
+        "over_specific_action_count": 0,
+        "over_specific_delta_signature_count": 0,
+        "reset_terminal_artifact_count": 0,
+        "movement_alias_count": 0,
+        "unknown_count": 0,
     }
     ranked: list[dict[str, Any]] = []
     for signature, item in sorted(singletons, key=lambda pair: (-pair[1]["support_total"], pair[0])):
@@ -1128,15 +1152,30 @@ def _singleton_diagnostics(
             by_effect_type[name] = by_effect_type.get(name, 0) + 1
         relaxed_signature = _relaxed_family_signature(signature)
         relaxed_group_size = len(relaxed_families.get(relaxed_signature, set()))
-        if relaxed_group_size > 1:
-            diagnosis = "over_specific"
-            diagnostics["over_specific_count"] += 1
+        effect_text = " ".join(sorted(item.get("effect_types", set()))).lower()
+        action_count = len(item.get("actions", set()))
+        context_count = len(item.get("contexts", set()))
+        if "terminal" in effect_text or "reset" in effect_text:
+            diagnosis = "reset_terminal_artifact"
+            diagnostics["reset_terminal_artifact_count"] += 1
+        elif any(token in effect_text for token in ("move", "shift", "translate", "position")) and relaxed_group_size > 1:
+            diagnosis = "movement_alias"
+            diagnostics["movement_alias_count"] += 1
+        elif relaxed_group_size > 1 and context_count <= 1:
+            diagnosis = "over_specific_context"
+            diagnostics["over_specific_context_count"] += 1
+        elif relaxed_group_size > 1 and action_count <= 1:
+            diagnosis = "over_specific_action"
+            diagnostics["over_specific_action_count"] += 1
+        elif relaxed_group_size > 1:
+            diagnosis = "over_specific_delta_signature"
+            diagnostics["over_specific_delta_signature_count"] += 1
         elif item["support_total"] >= 2.0 and len(item["contexts"]) <= 1:
             diagnosis = "genuine_rare"
             diagnostics["genuine_rare_count"] += 1
         else:
-            diagnosis = "uncertain"
-            diagnostics["uncertain_count"] += 1
+            diagnosis = "unknown"
+            diagnostics["unknown_count"] += 1
         ranked.append(
             {
                 "canonical_signature": signature,
@@ -1167,6 +1206,7 @@ def _relaxed_canonicalization_diagnostics(
     groups: list[dict[str, Any]] = []
     unsafe_count = 0
     relaxed_singletons = 0
+    proposals: list[dict[str, Any]] = []
     for relaxed_signature, strict_signatures in sorted(relaxed_families.items()):
         members = [global_families[signature] for signature in strict_signatures if signature in global_families]
         effect_types = sorted({effect for item in members for effect in item.get("effect_types", set())})
@@ -1182,6 +1222,26 @@ def _relaxed_canonicalization_diagnostics(
             unsafe_count += 1
         if len(strict_signatures) <= 1:
             relaxed_singletons += 1
+        support_count = sum(float(item.get("support_total", 0.0) or 0.0) for item in members)
+        prediction_values = [value for item in members for value in item.get("prediction_lift_values", [])]
+        before_merge = _mean_or_none(prediction_values)
+        after_merge = before_merge if safe else None
+        proposals.append(
+            {
+                "strict_family_id": sorted(strict_signatures),
+                "relaxed_signature": relaxed_signature,
+                "action_group": action_groups[0] if len(action_groups) == 1 else "mixed",
+                "effect_type": effect_types[0] if len(effect_types) == 1 else "mixed",
+                "polarity": polarities[0] if len(polarities) == 1 else "mixed",
+                "source_game_count": len({game for item in members for game in item.get("games", set())}),
+                "source_sampler_count": len({sampler for item in members for sampler in item.get("samplers", set())}),
+                "support_count": support_count,
+                "merge_safety_status": "safe" if safe else "unsafe",
+                "unsafe_reason": None if safe else "signature_conflict",
+                "family_prediction_lift_before_merge": before_merge,
+                "family_prediction_lift_after_safe_merge": after_merge,
+            }
+        )
         groups.append(
             {
                 "relaxed_signature": relaxed_signature,
@@ -1198,6 +1258,7 @@ def _relaxed_canonicalization_diagnostics(
         "relaxed_singleton_family_count": relaxed_singletons,
         "merge_safety_passed": unsafe_count == 0,
         "unsafe_relaxed_merge_count": unsafe_count,
+        "safe_merge_proposal_table": proposals[:50],
     }
 
 

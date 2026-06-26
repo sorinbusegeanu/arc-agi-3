@@ -6,6 +6,7 @@ import sys
 import types
 from pathlib import Path
 import numpy as np
+import pytest
 import v6.evaluation.interaction_sampling as interaction_sampling
 
 from v6.cli import build_parser
@@ -136,6 +137,7 @@ from v6.evaluation.role_validation import (
 )
 from v6.evaluation.validation_report import build_validation_report
 from v6.graph.graph_manager import GraphManager
+from v6.hypothesis_suite_report import _write_aggregated_hypothesis_text
 from v6.interaction_significance import compute_interaction_significance
 from v6.main import V6Config, V6System
 from v6.future_options import FutureOptionEstimator
@@ -153,6 +155,7 @@ from v6.memory.interaction_store import Interaction, InteractionStore, encode_ar
 from v6.memory.promotion_engine import MemoryPromotionConfig, MemoryPromotionEngine
 from v6.memory.query_engine import MemoryQueryEngine
 from v6.memory.substrate import MemoryEdge, MemoryNode, MemoryScore, MemorySubstrate, action_node_id, delta_node_id, family_node_id, interaction_node_id, strategy_node_id
+from v6.memory.compact_memory_restore import _fetchall_readonly_with_retry
 from v6.memory_lifecycle import MemoryLifecycleManager
 from v6.memory_types import M3RoleCandidate
 from v6.m2_expand_v08c import M2ExpandV08cConfig, run_m2_expand_v08c
@@ -2316,6 +2319,85 @@ def test_memory_substrate_creates_all_tables() -> None:
         assert substrate.get_node("missing") is None
     finally:
         connection.close()
+
+
+def test_hypothesis_suite_aggregated_text_concatenates_hypothesis_reports(tmp_path: Path) -> None:
+    reports_dir = tmp_path / "reports"
+    expected_bodies: list[str] = []
+    for hypothesis_id in range(1, 12):
+        label = f"h{hypothesis_id:02d}"
+        body = f"H{hypothesis_id:02d} report body"
+        expected_bodies.append(body)
+        subdir = reports_dir / label
+        subdir.mkdir(parents=True, exist_ok=True)
+        (subdir / f"{label}_report.txt").write_text(body + "\n", encoding="utf-8")
+
+    _write_aggregated_hypothesis_text(reports_dir)
+
+    aggregated = (reports_dir / "hypothesis_suite_aggregated.txt").read_text(encoding="utf-8")
+    for body in expected_bodies:
+        assert body in aggregated
+    positions = [aggregated.index(body) for body in expected_bodies]
+    assert positions == sorted(positions)
+
+
+def test_hypothesis_suite_aggregated_text_on_epoch01_real_reports() -> None:
+    reports_dir = Path("runs/v6/continuous/full_breadth_continuous/epochs/epoch_0001/reports")
+    if not reports_dir.exists():
+        pytest.skip("epoch_0001 real reports directory not present")
+    _write_aggregated_hypothesis_text(reports_dir)
+    aggregated_path = reports_dir / "hypothesis_suite_aggregated.txt"
+    assert aggregated_path.exists()
+    aggregated = aggregated_path.read_text(encoding="utf-8")
+    expected_fragments = [
+        "H01",
+        "H02",
+        "H03",
+        "H04",
+        "H05",
+        "H06",
+        "H07",
+        "H08",
+        "H09",
+        "H10",
+        "H11",
+    ]
+    for fragment in expected_fragments:
+        assert fragment in aggregated
+    txt_paths = [
+        reports_dir / f"h{hypothesis_id:02d}" / next(
+            path.name
+            for path in sorted((reports_dir / f"h{hypothesis_id:02d}").glob("*.txt"))
+        )
+        for hypothesis_id in range(1, 12)
+    ]
+    first_lines = [path.read_text(encoding="utf-8").strip().splitlines()[0] for path in txt_paths]
+    positions = [aggregated.index(line) for line in first_lines]
+    assert positions == sorted(positions)
+
+
+def test_compact_memory_restore_retries_locked_query_reads() -> None:
+    class _FakeConnection:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def execute(self, query: str, params: tuple = ()) -> object:
+            del query, params
+            self.calls += 1
+            if self.calls == 1:
+                raise sqlite3.OperationalError("database is locked")
+
+            class _Cursor:
+                def fetchall(self_inner) -> list[tuple[str]]:
+                    del self_inner
+                    return [("ok",)]
+
+            return _Cursor()
+
+    fake = _FakeConnection()
+    rows = _fetchall_readonly_with_retry(fake, "SELECT 1", attempts=3, base_delay_seconds=0.0)
+    assert rows == [("ok",)]
+    assert fake.calls == 2
 
 
 def test_memory_substrate_upsert_node_increments_support_count() -> None:

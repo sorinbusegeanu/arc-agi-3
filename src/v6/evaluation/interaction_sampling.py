@@ -572,12 +572,15 @@ def _run_sampling_job(job: dict) -> dict:
         memory_output_dir=job.get("memory_output_dir"),
         restore_compact_memory=bool(job.get("memory_input_dir")),
         persist_compact_memory_on_close=False,
+        restore_compact_graph=False,
+        restore_compact_substrate=False,
         global_step_offset=int(job.get("global_step_offset", 0) or 0),
         random_seed=seed,
         context_length=int(job.get("context_depth", 3)),
         max_context_depth=job.get("max_context_depth"),
         adaptive_context_expansion=bool(job.get("adaptive_context_expansion", False)),
         database_commit_every=int(job.get("commit_steps", 1000)),
+        memory_promotion_every=max(1000, int(job.get("steps", 0) or 0) + 1),
     )
     system = V6System(
         env=env,

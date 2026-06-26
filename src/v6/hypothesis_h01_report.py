@@ -416,6 +416,12 @@ def _extract_db_metrics(sqlite_paths: list[Path]) -> dict[str, Any]:
     }
     total_interactions = 0
     contingency_rows = 0
+    memory_record_count = 0
+    memory_replay_candidate_count = 0
+    high_replay_priority_count = 0
+    protected_memory_count = 0
+    active_memory_count = 0
+    forgotten_memory_count = 0
     tables_seen: set[str] = set()
     per_game: dict[str, int] = {}
     per_sampler: dict[str, int] = {}
@@ -429,6 +435,30 @@ def _extract_db_metrics(sqlite_paths: list[Path]) -> dict[str, Any]:
                 contingencies = 0
                 if "interactions" in tables:
                     interactions = int(connection.execute("SELECT COUNT(*) FROM interactions").fetchone()[0])
+                    columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(interactions)").fetchall()}
+                    if {"memory_status", "memory_retention_reason", "memory_replay_priority"} & columns:
+                        row = connection.execute(
+                            """
+                            SELECT
+                                SUM(CASE
+                                    WHEN memory_status IS NOT NULL
+                                      OR memory_retention_reason IS NOT NULL
+                                      OR memory_replay_priority IS NOT NULL
+                                    THEN 1 ELSE 0 END),
+                                SUM(CASE WHEN COALESCE(memory_replay_candidate, 0) = 1 THEN 1 ELSE 0 END),
+                                SUM(CASE WHEN COALESCE(memory_replay_priority, 0.0) >= 0.70 THEN 1 ELSE 0 END),
+                                SUM(CASE WHEN memory_status = 'protected' THEN 1 ELSE 0 END),
+                                SUM(CASE WHEN memory_status = 'active' THEN 1 ELSE 0 END),
+                                SUM(CASE WHEN memory_status = 'forgotten' THEN 1 ELSE 0 END)
+                            FROM interactions
+                            """
+                        ).fetchone()
+                        memory_record_count += int(row[0] or 0)
+                        memory_replay_candidate_count += int(row[1] or 0)
+                        high_replay_priority_count += int(row[2] or 0)
+                        protected_memory_count += int(row[3] or 0)
+                        active_memory_count += int(row[4] or 0)
+                        forgotten_memory_count += int(row[5] or 0)
                 if "contingencies" in tables:
                     contingencies = int(connection.execute("SELECT COUNT(*) FROM contingencies").fetchone()[0])
                 total_interactions += interactions
@@ -450,6 +480,12 @@ def _extract_db_metrics(sqlite_paths: list[Path]) -> dict[str, Any]:
     result["contingency_candidate_count"] = contingency_rows if result["db_paths_inspected"] else None
     result["discovered_contingency_count"] = contingency_rows if result["db_paths_inspected"] else None
     result["stable_contingency_count"] = contingency_rows if result["db_paths_inspected"] else None
+    result["memory_record_count"] = memory_record_count if result["db_paths_inspected"] else None
+    result["memory_replay_candidate_count"] = memory_replay_candidate_count if result["db_paths_inspected"] else None
+    result["high_replay_priority_count"] = high_replay_priority_count if result["db_paths_inspected"] else None
+    result["protected_memory_count"] = protected_memory_count if result["db_paths_inspected"] else None
+    result["active_memory_count"] = active_memory_count if result["db_paths_inspected"] else None
+    result["forgotten_memory_count"] = forgotten_memory_count if result["db_paths_inspected"] else None
     result["per_game_contingency_counts"] = per_game
     result["per_sampler_contingency_counts"] = per_sampler
     result["stability_approximated"] = bool(result["db_paths_inspected"])

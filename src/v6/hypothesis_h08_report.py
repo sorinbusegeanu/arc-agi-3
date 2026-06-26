@@ -32,14 +32,21 @@ def evaluate_h08_world_model_coherence(
         component_rows = conn.execute(
             """
             SELECT component_signature, coherence_score, explanatory_coverage, cross_context_count, cross_game_count,
-                   is_coherent, candidate_only
+                   linked_concept_count, linked_role_count, linked_family_count, prediction_support_count,
+                   contradiction_coverage_count, is_coherent, candidate_only
             FROM world_model_components
             ORDER BY component_signature ASC
             """
         ).fetchall()
+        component_links = [dict(row) for row in conn.execute("SELECT component_signature, linked_type, linked_key FROM world_model_links ORDER BY component_signature ASC, linked_type ASC, linked_key ASC").fetchall()]
         milestone_map = dict(conn.execute("SELECT milestone_name, first_global_step FROM higher_order_milestones").fetchall())
+    link_map: dict[str, dict[str, set[str]]] = {}
+    for row in component_links:
+        groups = link_map.setdefault(str(row["component_signature"]), {})
+        groups.setdefault(str(row["linked_type"]), set()).add(str(row["linked_key"]))
     world_model_component_count = len(component_rows)
-    coherent_world_model_component_count = sum(1 for row in component_rows if int(row["is_coherent"] or 0) == 1)
+    coherent_rows = [row for row in component_rows if int(row["is_coherent"] or 0) == 1]
+    coherent_world_model_component_count = len(coherent_rows)
     mean_coherence_score = (
         sum(float(row["coherence_score"] or 0.0) for row in component_rows) / max(1, world_model_component_count)
         if component_rows
@@ -59,6 +66,14 @@ def evaluate_h08_world_model_coherence(
         1 for row in component_rows if int(row["is_coherent"] or 0) == 1 and int(row["cross_game_count"] or 0) >= 1
     )
     candidate_only_world_model_component_count = sum(1 for row in component_rows if int(row["candidate_only"] or 0) == 1)
+    component_cross_context_count = max((int(row["cross_context_count"] or 0) for row in component_rows), default=0)
+    component_cross_game_count = max((int(row["cross_game_count"] or 0) for row in component_rows), default=0)
+    predicted_outcome_count = max((int(row["prediction_support_count"] or 0) for row in component_rows), default=0)
+    supported_context_count = max((len(link_map.get(str(row["component_signature"]), {}).get("context", set())) for row in component_rows), default=0)
+    concept_link_count = max((len(link_map.get(str(row["component_signature"]), {}).get("concept", set())) for row in component_rows), default=0)
+    role_link_count = max((len(link_map.get(str(row["component_signature"]), {}).get("role", set())) for row in component_rows), default=0)
+    family_link_count = max((int(row["linked_family_count"] or 0) for row in component_rows), default=0)
+    contradiction_coverage_count = sum(int(row["contradiction_coverage_count"] or 0) for row in component_rows)
     metrics = {
         "world_model_component_count": world_model_component_count,
         "coherent_world_model_component_count": coherent_world_model_component_count,
@@ -70,6 +85,14 @@ def evaluate_h08_world_model_coherence(
         "max_explanatory_coverage": max_explanatory_coverage,
         "coherent_cross_context_component_count": coherent_cross_context_component_count,
         "coherent_cross_game_component_count": coherent_cross_game_component_count,
+        "component_cross_context_count": component_cross_context_count,
+        "component_cross_game_count": component_cross_game_count,
+        "predicted_outcome_count": predicted_outcome_count,
+        "supported_context_count": supported_context_count,
+        "concept_link_count": concept_link_count,
+        "role_link_count": role_link_count,
+        "family_link_count": family_link_count,
+        "contradiction_coverage_count": contradiction_coverage_count,
         "first_world_model_component_step": milestone_map.get("first_world_model_component_step"),
         "first_coherent_world_model_step": milestone_map.get("first_coherent_world_model_step"),
         "first_promoted_concept_step": milestone_map.get("first_promoted_concept_step"),
@@ -85,10 +108,14 @@ def evaluate_h08_world_model_coherence(
         missing = []
     elif (
         promoted_concept_count > 0
-        and coherent_world_model_component_count >= 1
+        and coherent_world_model_component_count >= 5
         and (max_coherence_score or 0.0) >= 0.45
         and (max_explanatory_coverage or 0.0) > 0.0
         and (coherent_cross_context_component_count >= 1 or coherent_cross_game_component_count >= 1)
+        and concept_link_count >= 2
+        and family_link_count >= 2
+        and supported_context_count >= 2
+        and predicted_outcome_count > 0
     ):
         decision = "VALID"
         missing = []

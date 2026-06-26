@@ -32,7 +32,7 @@ def evaluate_h07_concept_emergence(
         concept_rows = conn.execute(
             """
             SELECT concept_signature, compression_gain, promotion_score, transfer_success_count,
-                   strong_transfer_success_count,
+                   strong_transfer_success_count, linked_role_count, linked_carrier_count,
                    cross_context_count, cross_game_count, is_promoted
             FROM concept_candidates
             ORDER BY concept_signature ASC
@@ -40,7 +40,8 @@ def evaluate_h07_concept_emergence(
         ).fetchall()
         milestone_map = dict(conn.execute("SELECT milestone_name, first_global_step FROM higher_order_milestones").fetchall())
     concept_candidate_count = len(concept_rows)
-    promoted_concept_count = sum(1 for row in concept_rows if int(row["is_promoted"] or 0) == 1)
+    promoted_rows = [row for row in concept_rows if int(row["is_promoted"] or 0) == 1]
+    promoted_concept_count = len(promoted_rows)
     mean_compression_gain = (
         sum(float(row["compression_gain"] or 0.0) for row in concept_rows) / max(1, concept_candidate_count)
         if concept_rows
@@ -57,6 +58,29 @@ def evaluate_h07_concept_emergence(
     cross_game_concept_count = sum(1 for row in concept_rows if int(row["cross_game_count"] or 0) >= 1)
     concept_transfer_success_count = successful_transfers
     concept_strong_transfer_success_count = sum(int(row["strong_transfer_success_count"] or 0) for row in concept_rows)
+    source_role_count_mean = (
+        sum(float(row["linked_role_count"] or 0.0) for row in promoted_rows) / max(1, promoted_concept_count)
+        if promoted_rows
+        else None
+    )
+    source_carrier_count_mean = (
+        sum(float(row["linked_carrier_count"] or 0.0) for row in promoted_rows) / max(1, promoted_concept_count)
+        if promoted_rows
+        else None
+    )
+    concept_cross_game_count_max = max((int(row["cross_game_count"] or 0) for row in promoted_rows), default=0)
+    concept_cross_context_count_max = max((int(row["cross_context_count"] or 0) for row in promoted_rows), default=0)
+    strong_transfer_counts = [int(row["strong_transfer_success_count"] or 0) for row in promoted_rows]
+    concept_transfer_success_concentration = (
+        max(strong_transfer_counts) / max(1, sum(strong_transfer_counts))
+        if strong_transfer_counts and sum(strong_transfer_counts) > 0
+        else None
+    )
+    transfer_success_rate = (
+        float(concept_strong_transfer_success_count) / float(transfer_attempt_count)
+        if transfer_attempt_count > 0
+        else None
+    )
     metrics = {
         "concept_candidate_count": concept_candidate_count,
         "promoted_concept_count": promoted_concept_count,
@@ -66,8 +90,14 @@ def evaluate_h07_concept_emergence(
         "max_promotion_score": max_promotion_score,
         "concept_transfer_success_count": concept_transfer_success_count,
         "concept_strong_transfer_success_count": concept_strong_transfer_success_count,
+        "transfer_success_rate": transfer_success_rate,
         "cross_context_concept_count": cross_context_concept_count,
         "cross_game_concept_count": cross_game_concept_count,
+        "concept_cross_game_count_max": concept_cross_game_count_max,
+        "concept_cross_context_count_max": concept_cross_context_count_max,
+        "source_role_count_mean": source_role_count_mean,
+        "source_carrier_count_mean": source_carrier_count_mean,
+        "concept_transfer_success_concentration": concept_transfer_success_concentration,
         "first_concept_candidate_step": milestone_map.get("first_concept_candidate_step"),
         "first_promoted_concept_step": milestone_map.get("first_promoted_concept_step"),
         "first_role_transfer_success_step": milestone_map.get("first_role_transfer_success_step"),
@@ -79,19 +109,22 @@ def evaluate_h07_concept_emergence(
         decision = "INVALID"
         missing = []
     elif (
-        promoted_concept_count >= 1
+        promoted_concept_count >= 5
         and concept_strong_transfer_success_count >= 2
         and (max_compression_gain or 0.0) >= 1.50
         and (max_promotion_score or 0.0) >= 0.55
-        and (cross_context_concept_count >= 1 or cross_game_concept_count >= 1)
+        and (concept_cross_context_count_max >= 3 or concept_cross_game_count_max >= 2)
+        and (source_role_count_mean or 0.0) >= 2.0
+        and (transfer_success_rate or 0.0) > 0.0
+        and ((concept_transfer_success_concentration or 0.0) <= 0.80)
     ):
         decision = "VALID"
         missing = []
     elif concept_candidate_count > 0 and promoted_concept_count == 0:
         decision = "PARTIALLY_VALID"
         missing = []
-    elif transfer_attempt_count > 0 and promoted_concept_count == 0:
-        decision = "INVALID"
+    elif promoted_concept_count > 0:
+        decision = "PARTIALLY_VALID"
         missing = []
     else:
         decision = "PARTIALLY_VALID"
@@ -119,6 +152,11 @@ def _write_outputs(output_dir: Path, result: dict[str, Any]) -> None:
         f"concept candidates: {result.get('concept_candidate_count')}\n"
         f"promoted concepts: {result.get('promoted_concept_count')}\n"
         f"strong transfer successes: {result.get('concept_strong_transfer_success_count')}\n"
+        f"source role count mean: {result.get('source_role_count_mean')}\n"
+        f"source carrier count mean: {result.get('source_carrier_count_mean')}\n"
+        f"cross-game max: {result.get('concept_cross_game_count_max')}\n"
+        f"cross-context max: {result.get('concept_cross_context_count_max')}\n"
+        f"transfer success concentration: {result.get('concept_transfer_success_concentration')}\n"
         f"max compression gain: {result.get('max_compression_gain')}\n"
         f"max promotion score: {result.get('max_promotion_score')}\n"
     )

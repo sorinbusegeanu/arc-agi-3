@@ -47,7 +47,16 @@ def evaluate_h10_future_option_attention(
         "evidence_source": "compact_memory",
         "h10_attention_target_definition": "high_attention is based on replay_priority_score or contradiction_score only; derived memory_priority_score is diagnostic and is not used for validation.",
         "future_option_attention_link_count": len(rows),
+        "live_future_option_delta_count": sum(1 for row in rows if str(row.get("owner_type")) == "interaction"),
+        "heuristic_future_option_delta_count": sum(1 for row in rows if str(row.get("owner_type")) != "interaction"),
+        "null_future_option_delta_count": sum(1 for row in rows if float(row.get("option_delta_abs") or 0.0) <= 0.0 and int(row.get("high_option_change") or 0) == 0),
         "high_option_change_count": len(high_rows),
+        "high_option_change_source": (
+            "none" if not rows else
+            "live" if all(str(row.get("owner_type")) == "interaction" for row in rows) else
+            "heuristic" if all(str(row.get("owner_type")) != "interaction" for row in rows) else
+            "mixed"
+        ),
         "high_attention_count": len(high_attention_rows),
         "high_option_change_attention_count": len(high_both),
         "low_option_change_attention_count": len(low_attention),
@@ -92,7 +101,11 @@ def evaluate_h10_future_option_attention(
         for key in (
             "future_option_attention_link_count",
             "h10_attention_target_definition",
+            "live_future_option_delta_count",
+            "heuristic_future_option_delta_count",
+            "null_future_option_delta_count",
             "high_option_change_count",
+            "high_option_change_source",
             "high_attention_count",
             "high_option_change_attention_count",
             "low_option_change_attention_count",
@@ -123,6 +136,10 @@ def _write(output_dir: Path, result: dict[str, Any]) -> None:
     text = (
         f"H10 decision: {result.get('decision')}\n"
         f"attention target: {result.get('h10_attention_target_definition')}\n"
+        f"live future-option deltas: {result.get('live_future_option_delta_count')}\n"
+        f"heuristic future-option deltas: {result.get('heuristic_future_option_delta_count')}\n"
+        f"null future-option deltas: {result.get('null_future_option_delta_count')}\n"
+        f"high-option-change source: {result.get('high_option_change_source')}\n"
         f"option-attention lift: {result.get('option_attention_lift')}\n"
         f"high-option-change attention rate: {result.get('high_option_change_attention_rate')}\n"
         f"low-option-change attention rate: {result.get('low_option_change_attention_rate')}\n"

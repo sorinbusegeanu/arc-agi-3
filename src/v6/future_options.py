@@ -208,6 +208,7 @@ def derive_future_option_events(
                     "text_tokens_used": _tokenize_text_fragments([row["effect_signature"], row["canonical_key"]]),
                     "heuristic_note": "future-option counts are heuristic unless true reachable-state columns are available",
                 },
+                action_group=None if row["action"] is None else str(row["action"]),
             )
         )
     for row in state_conn.execute(
@@ -244,6 +245,8 @@ def derive_future_option_events(
                     ),
                     "heuristic_note": "future-option counts are heuristic unless true reachable-state columns are available",
                 },
+                effect_type=None if row["effect_type"] is None else str(row["effect_type"]),
+                action_group=None if row["action_group"] is None else str(row["action_group"]),
             )
         )
     for row in state_conn.execute(
@@ -528,26 +531,154 @@ def derive_future_option_attention_links(state_conn: sqlite3.Connection) -> dict
             """
         ).fetchall()
     }
-    rows = [dict(row) for row in state_conn.execute("SELECT * FROM future_option_events ORDER BY event_id ASC").fetchall()]
+    interaction_nodes = [
+        dict(row)
+        for row in state_conn.execute(
+            """
+            SELECT node_id, attrs_json
+            FROM memory_nodes
+            WHERE node_type = 'InteractionMemory'
+            ORDER BY node_id ASC
+            """
+        ).fetchall()
+    ]
+    score_rows = {
+        str(row["node_id"]): dict(row)
+        for row in state_conn.execute(
+            """
+            SELECT node_id, future_option_delta, replay_priority
+            FROM memory_scores
+            WHERE node_id LIKE 'M0:interaction:%'
+            ORDER BY node_id ASC
+            """
+        ).fetchall()
+    }
+    edge_rows = [
+        dict(row)
+        for row in state_conn.execute(
+            """
+            SELECT source_node_id, target_node_id, edge_type
+            FROM memory_edges
+            WHERE source_node_id LIKE 'M0:interaction:%'
+            ORDER BY source_node_id ASC, edge_type ASC, target_node_id ASC
+            """
+        ).fetchall()
+    ]
+    edges_by_source: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in edge_rows:
+        edges_by_source[str(row["source_node_id"])].append(row)
+    rows: list[dict[str, Any]] = []
+    live_future_option_delta_count = 0
+    null_future_option_delta_count = 0
+    for node in interaction_nodes:
+        node_id = str(node["node_id"])
+        attrs = _load_jsonish(node.get("attrs_json"))
+        score_row = score_rows.get(node_id, {})
+        future_option_delta = score_row.get("future_option_delta")
+        outgoing = edges_by_source.get(node_id, [])
+        edge_types = {str(edge["edge_type"]) for edge in outgoing}
+        has_live_signal = future_option_delta is not None or bool(
+            {"changes_future_options", "expands_future_options", "restricts_future_options", "preserves_future_options"} & edge_types
+        )
+        if not has_live_signal:
+            continue
+        if future_option_delta is None:
+            null_future_option_delta_count += 1
+        else:
+            live_future_option_delta_count += 1
+        contradiction_score = 1.0 if "violates_prediction" in edge_types else 0.0
+        replay_priority = float(score_row.get("replay_priority") or 0.0)
+        memory_priority = _clamp01(abs(float(future_option_delta or 0.0)) / 2.0)
+        high_option_change = int(
+            (future_option_delta is not None and abs(float(future_option_delta or 0.0)) >= 1.0)
+            or "expands_future_options" in edge_types
+            or "restricts_future_options" in edge_types
+        )
+        high_attention = int(
+            replay_priority >= 0.50
+            or "selected_for_replay" in edge_types
+            or "violates_prediction" in edge_types
+        )
+        if replay_priority >= 0.50 and "violates_prediction" in edge_types:
+            attention_signal_source = "replay_priority+contradiction"
+        elif replay_priority >= 0.50 or "selected_for_replay" in edge_types:
+            attention_signal_source = "replay_priority"
+        elif "violates_prediction" in edge_types:
+            attention_signal_source = "contradiction"
+        else:
+            attention_signal_source = "none"
+        option_delta_abs = abs(float(future_option_delta or 0.0))
+        rows.append(
+            {
+                "event_id": node_id,
+                "motif_signature": None,
+                "owner_type": "interaction",
+                "owner_key": node_id,
+                "option_delta_abs": option_delta_abs,
+                "replay_priority_score": replay_priority,
+                "memory_priority_score": memory_priority,
+                "contradiction_score": contradiction_score,
+                "high_option_change": high_option_change,
+                "high_attention": high_attention,
+                "attention_signal_source": attention_signal_source,
+                "first_seen_global_step": attrs.get("global_step"),
+                "last_seen_global_step": attrs.get("global_step"),
+                "source_label": "live",
+            }
+        )
+    heuristic_future_option_delta_count = 0
+    if live_future_option_delta_count <= 0:
+        for row in state_conn.execute("SELECT * FROM future_option_events ORDER BY event_id ASC").fetchall():
+            payload = dict(row)
+            heuristic_future_option_delta_count += 1
+            option_delta_abs = abs(float(payload.get("option_delta") or 0.0))
+            replay_priority = float(payload.get("replay_priority_score") or 0.0)
+            memory_priority = float(payload.get("memory_priority_score") or 0.0)
+            contradiction_score = float(payload.get("contradiction_score") or 0.0)
+            high_option_change = int(
+                option_delta_abs >= 1.0 or str(payload.get("option_delta_bucket") or "") in {"large_negative", "large_positive"}
+            )
+            high_attention = int(replay_priority >= 0.50 or contradiction_score >= 0.50)
+            if replay_priority >= 0.50 and contradiction_score >= 0.50:
+                attention_signal_source = "replay_priority+contradiction"
+            elif replay_priority >= 0.50:
+                attention_signal_source = "replay_priority"
+            elif contradiction_score >= 0.50:
+                attention_signal_source = "contradiction"
+            else:
+                attention_signal_source = "none"
+            rows.append(
+                {
+                    "event_id": payload["event_id"],
+                    "motif_signature": event_to_motif.get(str(payload["event_id"])),
+                    "owner_type": payload["owner_type"],
+                    "owner_key": payload["owner_key"],
+                    "option_delta_abs": option_delta_abs,
+                    "replay_priority_score": replay_priority,
+                    "memory_priority_score": memory_priority,
+                    "contradiction_score": contradiction_score,
+                    "high_option_change": high_option_change,
+                    "high_attention": high_attention,
+                    "attention_signal_source": attention_signal_source,
+                    "first_seen_global_step": payload["first_seen_global_step"],
+                    "last_seen_global_step": payload["last_seen_global_step"],
+                    "source_label": "heuristic",
+                }
+            )
     high_option_change_count = 0
     high_attention_count = 0
     high_both_count = 0
     low_attention_count = 0
+    sources_seen: set[str] = set()
     for row in rows:
-        option_delta_abs = abs(float(row.get("option_delta") or 0.0))
-        high_option_change = int(option_delta_abs >= 1.0 or str(row.get("option_delta_bucket") or "") in {"large_negative", "large_positive"})
+        option_delta_abs = abs(float(row.get("option_delta_abs") or 0.0))
         replay_priority = float(row.get("replay_priority_score") or 0.0)
         memory_priority = float(row.get("memory_priority_score") or 0.0)
         contradiction_score = float(row.get("contradiction_score") or 0.0)
-        high_attention = int(replay_priority >= 0.50 or contradiction_score >= 0.50)
-        if replay_priority >= 0.50 and contradiction_score >= 0.50:
-            attention_signal_source = "replay_priority+contradiction"
-        elif replay_priority >= 0.50:
-            attention_signal_source = "replay_priority"
-        elif contradiction_score >= 0.50:
-            attention_signal_source = "contradiction"
-        else:
-            attention_signal_source = "none"
+        high_option_change = int(row.get("high_option_change") or 0)
+        high_attention = int(row.get("high_attention") or 0)
+        attention_signal_source = str(row.get("attention_signal_source") or "none")
+        sources_seen.add(str(row.get("source_label") or "none"))
         state_conn.execute(
             """
             INSERT INTO future_option_attention_links (
@@ -559,7 +690,7 @@ def derive_future_option_attention_links(state_conn: sqlite3.Connection) -> dict
             """,
             (
                 row["event_id"],
-                event_to_motif.get(str(row["event_id"])),
+                row.get("motif_signature"),
                 row["owner_type"],
                 row["owner_key"],
                 option_delta_abs,
@@ -592,9 +723,21 @@ def derive_future_option_attention_links(state_conn: sqlite3.Connection) -> dict
                 lift_unbounded = True
         else:
             lift = high_rate / low_rate
+    if not rows:
+        high_option_change_source = "none"
+    elif sources_seen == {"live"}:
+        high_option_change_source = "live"
+    elif sources_seen == {"heuristic"}:
+        high_option_change_source = "heuristic"
+    else:
+        high_option_change_source = "mixed"
     return {
         "future_option_attention_link_count": len(rows),
+        "live_future_option_delta_count": live_future_option_delta_count,
+        "heuristic_future_option_delta_count": heuristic_future_option_delta_count,
+        "null_future_option_delta_count": null_future_option_delta_count,
         "high_option_change_count": high_option_change_count,
+        "high_option_change_source": high_option_change_source,
         "high_attention_count": high_attention_count,
         "high_option_change_attention_count": high_both_count,
         "low_option_change_attention_count": low_attention_count,
@@ -754,8 +897,21 @@ def _build_future_option_event(
     stability_score: float,
     event_id_seed: str,
     evidence_json: dict[str, Any],
+    effect_type: str | None = None,
+    action_group: str | None = None,
+    live_option_delta: float | None = None,
+    future_option_edge_type: str | None = None,
 ) -> dict[str, Any]:
-    motif_type, text_tokens = _detect_motif_type(text_fragments)
+    motif_type, text_tokens, motif_type_source = _detect_motif_type(
+        text_fragments,
+        owner_type=owner_type,
+        source_kind=source_kind,
+        effect_type=effect_type,
+        action_group=action_group,
+        polarity=polarity,
+        live_option_delta=live_option_delta,
+        future_option_edge_type=future_option_edge_type,
+    )
     option_delta = _base_option_delta(motif_type)
     polarity_text = str(polarity or "").lower()
     combined_text = " ".join(str(item or "") for item in text_fragments).lower()
@@ -779,6 +935,7 @@ def _build_future_option_event(
     evidence = dict(evidence_json)
     evidence["support_count"] = int(support_count)
     evidence["text_tokens_used"] = text_tokens
+    evidence["motif_type_source"] = motif_type_source
     return {
         "event_id": "foe:" + sha1(event_id_seed.encode("utf-8")).hexdigest(),
         "owner_type": owner_type,
@@ -812,8 +969,47 @@ def _context_key_from_canonical(canonical_key: str) -> str | None:
     return canonical_key.split("|a", 1)[0] or None
 
 
-def _detect_motif_type(text_fragments: list[Any]) -> tuple[str, list[str]]:
+def _detect_motif_type(
+    text_fragments: list[Any],
+    *,
+    owner_type: str,
+    source_kind: str,
+    effect_type: str | None = None,
+    action_group: str | None = None,
+    polarity: Any = None,
+    live_option_delta: float | None = None,
+    future_option_edge_type: str | None = None,
+) -> tuple[str, list[str], str]:
     text = " ".join(str(item or "") for item in text_fragments).lower()
+    effect_text = str(effect_type or "").lower()
+    action_text = str(action_group or "").lower()
+    polarity_text = str(polarity or "").lower()
+    if live_option_delta is not None:
+        delta = float(live_option_delta)
+        if delta >= 1.0:
+            return ("branch" if "branch" in action_text or "split" in text else "enable"), _tokenize_text_fragments(text_fragments), "live_delta"
+        if delta >= 0.25:
+            return "transform", _tokenize_text_fragments(text_fragments), "live_delta"
+        if delta > -0.25:
+            return "stabilize", _tokenize_text_fragments(text_fragments), "live_delta"
+        if delta > -1.0:
+            return ("merge" if "merge" in action_text or "combine" in text else "block"), _tokenize_text_fragments(text_fragments), "live_delta"
+        return ("terminate" if "terminal" in effect_text or "end" in text else "block"), _tokenize_text_fragments(text_fragments), "live_delta"
+    if future_option_edge_type:
+        edge_type = str(future_option_edge_type)
+        if edge_type == "expands_future_options":
+            return ("branch" if "branch" in action_text or source_kind == "role_candidate" else "enable"), _tokenize_text_fragments(text_fragments), "future_option_edge"
+        if edge_type == "restricts_future_options":
+            return ("terminate" if "terminal" in effect_text else "block"), _tokenize_text_fragments(text_fragments), "future_option_edge"
+        if edge_type == "preserves_future_options":
+            return "stabilize", _tokenize_text_fragments(text_fragments), "future_option_edge"
+    if effect_text:
+        if "positive_change" in effect_text or "mixed_change" in effect_text:
+            return "transform", _tokenize_text_fragments(text_fragments), "structured_effect"
+        if "preserve" in effect_text or "no_change" in effect_text:
+            return "stabilize", _tokenize_text_fragments(text_fragments), "structured_effect"
+        if "terminal_transition" in effect_text:
+            return "terminate", _tokenize_text_fragments(text_fragments), "structured_effect"
     motif_map = {
         "enable": ("enable", "open", "unlock", "add", "create", "reveal", "allow", "access", "expose", "make_available"),
         "block": ("block", "close", "obstacle", "wall", "prevent", "forbid", "stop", "restrict", "hide"),
@@ -826,8 +1022,12 @@ def _detect_motif_type(text_fragments: list[Any]) -> tuple[str, list[str]]:
     }
     for motif_type, keywords in motif_map.items():
         if any(keyword in text for keyword in keywords):
-            return motif_type, _tokenize_text_fragments(text_fragments)
-    return "unknown", _tokenize_text_fragments(text_fragments)
+            return motif_type, _tokenize_text_fragments(text_fragments), "text_keyword"
+    if "positive" in polarity_text and owner_type in {"carrier", "role"}:
+        return "enable", _tokenize_text_fragments(text_fragments), "structured_effect"
+    if "negative" in polarity_text and owner_type in {"carrier", "role"}:
+        return "block", _tokenize_text_fragments(text_fragments), "structured_effect"
+    return "unknown", _tokenize_text_fragments(text_fragments), "unknown"
 
 
 def _base_option_delta(motif_type: str) -> float:

@@ -120,6 +120,18 @@ class MemorySubstrate:
                 key TEXT PRIMARY KEY,
                 value TEXT
             );
+            CREATE INDEX IF NOT EXISTS idx_memory_nodes_level_type
+            ON memory_nodes(memory_level, node_type);
+            CREATE INDEX IF NOT EXISTS idx_memory_nodes_type
+            ON memory_nodes(node_type);
+            CREATE INDEX IF NOT EXISTS idx_memory_edges_source
+            ON memory_edges(source_node_id, edge_type);
+            CREATE INDEX IF NOT EXISTS idx_memory_edges_target
+            ON memory_edges(target_node_id, edge_type);
+            CREATE INDEX IF NOT EXISTS idx_memory_scores_replay
+            ON memory_scores(replay_priority);
+            CREATE INDEX IF NOT EXISTS idx_memory_promotions_type
+            ON memory_promotions(promotion_type);
             """
         )
         self.connection.execute(

@@ -53,6 +53,8 @@ class V6Config:
     memory_output_dir: str | None = None
     restore_compact_memory: bool = False
     persist_compact_memory_on_close: bool = False
+    restore_compact_graph: bool = True
+    restore_compact_substrate: bool = True
     global_step_offset: int = 0
     recluster_every: int = 100
     min_cluster_size: int = 5
@@ -178,7 +180,12 @@ class V6System:
             "restore_warnings": [],
         }
         if bool(self.config.restore_compact_memory) and self.config.memory_input_dir:
-            self.compact_memory_restore_summary = load_compact_memory_into_system(self, Path(self.config.memory_input_dir))
+            self.compact_memory_restore_summary = load_compact_memory_into_system(
+                self,
+                Path(self.config.memory_input_dir),
+                restore_graph=bool(self.config.restore_compact_graph),
+                restore_substrate=bool(self.config.restore_compact_substrate),
+            )
 
     def choose_action(self) -> int:
         actions = self.env.available_actions()

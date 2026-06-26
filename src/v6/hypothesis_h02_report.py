@@ -133,6 +133,14 @@ H02_DEFAULTS: dict[str, Any] = {
     "mean_isf_explanatory_potential": None,
     "high_isf_interaction_count": None,
     "context_contradiction_count": None,
+    "prediction_error_positive_count": None,
+    "predicted_family_available_count": None,
+    "actual_family_available_count": None,
+    "wrong_prediction_count": None,
+    "confident_wrong_prediction_count": None,
+    "contradiction_event_count": None,
+    "contradiction_suppressed_low_confidence_count": None,
+    "contradiction_suppressed_missing_prediction_count": None,
     "contradicted_context_count": None,
     "contradicted_context_action_count": None,
     "repeated_contradiction_count": None,
@@ -184,6 +192,14 @@ _REPORT_FIELD_NAMES = (
     "mean_isf_explanatory_potential",
     "high_isf_interaction_count",
     "context_contradiction_count",
+    "prediction_error_positive_count",
+    "predicted_family_available_count",
+    "actual_family_available_count",
+    "wrong_prediction_count",
+    "confident_wrong_prediction_count",
+    "contradiction_event_count",
+    "contradiction_suppressed_low_confidence_count",
+    "contradiction_suppressed_missing_prediction_count",
     "contradicted_context_count",
     "contradicted_context_action_count",
     "repeated_contradiction_count",
@@ -202,6 +218,14 @@ _REPORT_FIELD_NAMES = (
 _SUM_FIELDS = {
     "high_isf_interaction_count",
     "context_contradiction_count",
+    "prediction_error_positive_count",
+    "predicted_family_available_count",
+    "actual_family_available_count",
+    "wrong_prediction_count",
+    "confident_wrong_prediction_count",
+    "contradiction_event_count",
+    "contradiction_suppressed_low_confidence_count",
+    "contradiction_suppressed_missing_prediction_count",
     "contradicted_context_count",
     "contradicted_context_action_count",
     "repeated_contradiction_count",
@@ -1075,6 +1099,37 @@ def _append_prediction_metrics(connection: sqlite3.Connection, values: dict[str,
     ):
         if item is not None:
             values[name].append(item)
+    prediction_columns = set(columns)
+    confidence_expr = "COALESCE(prediction_confidence, 0.0)" if "prediction_confidence" in prediction_columns else "0.0"
+    family_row = connection.execute(
+        f"""
+        SELECT
+            SUM(CASE WHEN COALESCE(isf_prediction_error, 0.0) > 0 THEN 1 ELSE 0 END),
+            SUM(CASE WHEN predicted_family IS NOT NULL THEN 1 ELSE 0 END),
+            SUM(CASE WHEN actual_family IS NOT NULL THEN 1 ELSE 0 END),
+            SUM(CASE WHEN predicted_family IS NOT NULL AND actual_family IS NOT NULL AND predicted_family != actual_family THEN 1 ELSE 0 END),
+            SUM(CASE WHEN predicted_family IS NOT NULL AND actual_family IS NOT NULL AND predicted_family != actual_family AND {confidence_expr} >= 0.50 THEN 1 ELSE 0 END),
+            SUM(CASE WHEN context_contradiction = 1 THEN 1 ELSE 0 END),
+            SUM(CASE WHEN predicted_family IS NOT NULL AND actual_family IS NOT NULL AND predicted_family != actual_family AND {confidence_expr} < 0.50 THEN 1 ELSE 0 END),
+            SUM(CASE WHEN predicted_family IS NULL OR actual_family IS NULL THEN 1 ELSE 0 END)
+        FROM prediction_results
+        """
+    ).fetchone()
+    for name, item in zip(
+        (
+            "prediction_error_positive_count",
+            "predicted_family_available_count",
+            "actual_family_available_count",
+            "wrong_prediction_count",
+            "confident_wrong_prediction_count",
+            "contradiction_event_count",
+            "contradiction_suppressed_low_confidence_count",
+            "contradiction_suppressed_missing_prediction_count",
+        ),
+        family_row,
+    ):
+        if item is not None:
+            values[name].append(item)
 
 
 def _collect_db_candidates(
@@ -1776,6 +1831,10 @@ def _populate_evidence_lists(result: dict[str, Any]) -> None:
 
     if _gt(result.get("context_contradiction_count"), 0) is True:
         evidence_for.append(f"Contradictions are present ({int(result['context_contradiction_count'])} contradiction events).")
+    elif _gt(result.get("wrong_prediction_count"), 0) is True and _gt(result.get("confident_wrong_prediction_count"), 0) is True:
+        evidence_against.append("Confident wrong predictions are present, but contradiction events were not recorded.")
+    elif _gt(result.get("prediction_error_positive_count"), 0) is True and _gt(result.get("wrong_prediction_count"), 0) is not True:
+        missing_evidence.append("Prediction-error ISF exists, but family-level contradiction was not observable.")
     else:
         evidence_against.append("No contradiction evidence is present in the sampled interactions.")
 
@@ -1925,8 +1984,6 @@ def _format_direct_evidence_text(result: dict[str, Any]) -> list[str]:
         f"SQLite DB files inspected: {result.get('sqlite_db_count_inspected')}",
         f"SQLite DB scan truncated: {result.get('sqlite_db_inspection_truncated')}",
         f"SQLite DB files skipped: {result.get('sqlite_db_skipped_count')}",
-        f"Selected DB: {result.get('selected_db_path')}",
-        f"Inspected DB paths: {', '.join(result.get('inspected_db_paths', [])) or 'none'}",
     ]
     if result.get("direct_replay_lift_available") is not True:
         return lines + [_direct_linkage_missing_message(result)]
