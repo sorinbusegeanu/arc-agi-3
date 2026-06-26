@@ -70,7 +70,7 @@ class MemoryPromotionEngine:
             self._record(
                 source_node_id=node["node_id"],
                 target_node_id=node["node_id"],
-                promotion_type="M0_M1",
+                promotion_type="M1_VALIDATION",
                 evidence_count=int(attrs.get("support_count", 0) or 0),
                 promotion_score=float(attrs.get("confidence", 0.0) or 0.0),
             )
@@ -407,6 +407,11 @@ class MemoryPromotionEngine:
         evidence_count: int,
         promotion_score: float,
     ) -> None:
+        if promotion_type == "M0_M1":
+            if not str(source_node_id).startswith("M0:interaction:"):
+                return
+            if not str(target_node_id).startswith("M1:contingency:"):
+                return
         promotion_id = f"promotion:{promotion_type}:{sha1(f'{source_node_id}|{target_node_id}|{promotion_type}'.encode('utf-8')).hexdigest()[:20]}"
         self.memory.record_promotion(
             MemoryPromotion(

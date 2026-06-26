@@ -2985,7 +2985,7 @@ def test_phase5_action_ranking_prefers_positive_future_option_evidence() -> None
             substrate.upsert_node(MemoryNode(node_id=action_node_id(action), memory_level="M0", node_type="ActionMemory"))
             substrate.upsert_edge(MemoryEdge(interaction_id, action_node_id(action), "takes_action"))
             substrate.upsert_score(MemoryScore(node_id=interaction_id, future_option_delta=delta))
-        ranked = engine.rank_actions({1: ("ctx",)}, [1, 2])
+        ranked = engine.rank_actions({1: {1: ("ctx",)}, 2: {1: ("ctx",)}}, [1, 2])
         assert ranked[0].action == 1
     finally:
         connection.close()
@@ -3025,7 +3025,7 @@ def test_phase5_query_scoring_has_no_selected_action_side_effects() -> None:
     try:
         substrate = MemorySubstrate(connection)
         engine = MemoryQueryEngine(substrate)
-        engine.rank_actions({1: ("ctx",)}, [1, 2, 3])
+        engine.rank_actions({1: {1: ("ctx",)}, 2: {1: ("ctx",)}, 3: {1: ("ctx",)}}, [1, 2, 3])
         assert not substrate.query_nodes(memory_level="M5", node_type="MemoryQueryEvent")
         engine.record_selected_action_query(context_signatures={1: ("ctx",)}, action=2)
         query_nodes = substrate.query_nodes(memory_level="M5", node_type="MemoryQueryEvent")
@@ -3093,10 +3093,55 @@ def test_phase5_action_ranking_penalizes_failure_path_evidence() -> None:
             substrate.upsert_node(MemoryNode(node_id=action_node_id(action), memory_level="M0", node_type="ActionMemory"))
             substrate.upsert_edge(MemoryEdge(interaction_id, action_node_id(action), "takes_action"))
             substrate.upsert_score(MemoryScore(node_id=interaction_id, future_option_delta=delta))
-        ranked = engine.rank_actions({1: ("ctx",)}, [1, 2])
+        ranked = engine.rank_actions({1: {1: ("ctx",)}, 2: {1: ("ctx",)}}, [1, 2])
         assert ranked[0].action == 2
     finally:
         connection.close()
+
+
+def test_selected_action_query_recorded_once_per_executed_step(tmp_path) -> None:
+    class MultiActionEnv(ToggleEnv):
+        def available_actions(self) -> list[int]:
+            return [1, 2, 3]
+
+    db_path = tmp_path / "selected_action_once.sqlite"
+    system = V6System(
+        env=MultiActionEnv(),
+        config=V6Config(
+            database_path=str(db_path),
+            random_seed=0,
+            memory_query_enabled=True,
+        ),
+    )
+    result = system.run_step()
+    try:
+        rows = system.connection.execute(
+            "SELECT source_node_id, target_node_id FROM memory_edges WHERE edge_type = 'selected_action' ORDER BY source_node_id ASC"
+        ).fetchall()
+        assert len(rows) == 1
+        assert str(rows[0][1]) == action_node_id(result.action)
+    finally:
+        system.close()
+
+
+def test_m0_interaction_memory_stores_context_attrs(tmp_path) -> None:
+    db_path = tmp_path / "interaction_context.sqlite"
+    system = V6System(
+        env=ToggleEnv(),
+        config=V6Config(database_path=str(db_path), context_length=2, random_seed=0),
+    )
+    system.run_step()
+    try:
+        row = system.connection.execute(
+            "SELECT attrs_json FROM memory_nodes WHERE node_type = 'InteractionMemory' ORDER BY node_id ASC LIMIT 1"
+        ).fetchone()
+        assert row is not None
+        attrs = json.loads(str(row[0]))
+        assert "context_signature" in attrs
+        assert "context_level" in attrs
+        assert attrs["context_signature"] not in {None, "**no_context**"}
+    finally:
+        system.close()
 
 
 def test_phase5_memory_action_selection_chooses_best_ranked_action(tmp_path) -> None:
@@ -3168,6 +3213,91 @@ def test_phase5_real_m0_to_m1_promotion_uses_m0_interactions() -> None:
         assert promotions[0][0] != promotions[0][1]
     finally:
         connection.close()
+
+
+def test_m1_validation_does_not_record_fake_m0_m1_self_promotion() -> None:
+    connection = sqlite3.connect(":memory:")
+    try:
+        substrate = MemorySubstrate(connection)
+        engine = MemoryPromotionEngine(substrate, MemoryPromotionConfig(min_contingency_support=3, min_contingency_confidence=0.6))
+        substrate.upsert_node(
+            MemoryNode(
+                node_id="M1:contingency:test",
+                memory_level="M1",
+                node_type="ContingencyMemory",
+                attrs={"support_count": 4, "confidence": 0.9},
+            )
+        )
+        summary = engine.validate_existing_m1_contingencies(step=1)
+        rows = connection.execute(
+            "SELECT promotion_type, source_node_id, target_node_id FROM memory_promotions ORDER BY promotion_id ASC"
+        ).fetchall()
+        assert summary["count"] == 1
+        assert rows
+        assert all(str(row[0]) == "M1_VALIDATION" for row in rows)
+        assert not connection.execute(
+            "SELECT COUNT(*) FROM memory_promotions WHERE promotion_type = 'M0_M1' AND source_node_id = target_node_id"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+
+
+def test_rank_actions_uses_candidate_specific_contexts() -> None:
+    connection = sqlite3.connect(":memory:")
+    try:
+        substrate = MemorySubstrate(connection)
+        engine = MemoryQueryEngine(substrate)
+        substrate.upsert_node(
+            MemoryNode(
+                node_id="m1ctx1",
+                memory_level="M1",
+                node_type="ContingencyMemory",
+                attrs={"context_signature": json.dumps(["ctx1"]), "action": 1, "transformation_family": 10, "confidence": 0.9},
+            )
+        )
+        substrate.upsert_node(
+            MemoryNode(
+                node_id="m1ctx2",
+                memory_level="M1",
+                node_type="ContingencyMemory",
+                attrs={"context_signature": json.dumps(["ctx2"]), "action": 2, "transformation_family": 20, "confidence": 0.9},
+            )
+        )
+        ranked = engine.rank_actions({1: {1: ("ctx1",)}, 2: {1: ("ctx2",)}}, [1, 2])
+        by_action = {int(item.action): item for item in ranked}
+        assert by_action[1].predicted_family == 10
+        assert by_action[2].predicted_family == 20
+    finally:
+        connection.close()
+
+
+def test_choose_action_ranking_does_not_pollute_selected_action_edges_before_step(tmp_path) -> None:
+    class MultiActionEnv(ToggleEnv):
+        def available_actions(self) -> list[int]:
+            return [1, 2]
+
+    db_path = tmp_path / "no_query_pollution.sqlite"
+    system = V6System(
+        env=MultiActionEnv(),
+        config=V6Config(
+            database_path=str(db_path),
+            random_seed=0,
+            memory_action_selection_enabled=True,
+        ),
+    )
+    try:
+        _ = system.choose_action()
+        assert not system.connection.execute(
+            "SELECT COUNT(*) FROM memory_edges WHERE edge_type = 'selected_action'"
+        ).fetchone()[0]
+        result = system.run_step()
+        rows = system.connection.execute(
+            "SELECT target_node_id FROM memory_edges WHERE edge_type = 'selected_action'"
+        ).fetchall()
+        assert len(rows) == 1
+        assert str(rows[0][0]) == action_node_id(result.action)
+    finally:
+        system.close()
 
 
 def test_phase5_future_option_role_promotion_uses_carried_interactions() -> None:

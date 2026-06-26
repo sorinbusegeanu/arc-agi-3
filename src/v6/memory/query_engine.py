@@ -133,7 +133,23 @@ class MemoryQueryEngine:
             evidence_sources=[prediction.source, *future.get("sources", []), *failure.get("sources", [])],
         )
 
-    def rank_actions(self, context_signatures: dict[int, tuple], available_actions: list[int]) -> list[MemoryActionScore]:
+    def rank_actions(
+        self,
+        context_signatures_by_action: dict[int, dict[int, tuple]],
+        available_actions: list[int],
+    ) -> list[MemoryActionScore]:
+        scores = [
+            self.score_action(context_signatures_by_action[int(action)], int(action), available_actions, record_query=False)
+            for action in sorted(int(item) for item in available_actions)
+            if int(action) in context_signatures_by_action and context_signatures_by_action[int(action)] is not None
+        ]
+        return sorted(scores, key=lambda item: (-float(item.score), int(item.action)))
+
+    def rank_actions_with_shared_context(
+        self,
+        context_signatures: dict[int, tuple],
+        available_actions: list[int],
+    ) -> list[MemoryActionScore]:
         scores = [
             self.score_action(context_signatures, int(action), available_actions, record_query=False)
             for action in sorted(int(item) for item in available_actions)

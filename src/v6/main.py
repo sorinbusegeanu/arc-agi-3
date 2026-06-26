@@ -185,22 +185,14 @@ class V6System:
         if not actions:
             raise ValueError("environment returned no available actions")
         if bool(self.config.memory_action_selection_enabled) and self.action_sampler is None:
-            ranked = []
+            contexts_by_action: dict[int, dict[int, tuple]] = {}
             for candidate_action in actions:
                 candidate_depth = self._context_depth_for_action(int(candidate_action))
-                candidate_context_signatures = self.context_builder.multi_scale_signatures(
+                contexts_by_action[int(candidate_action)] = self.context_builder.multi_scale_signatures(
                     int(candidate_action),
                     max_level=candidate_depth,
                 )
-                ranked.append(
-                    self.memory_query.score_action(
-                        candidate_context_signatures,
-                        int(candidate_action),
-                        list(actions),
-                        record_query=False,
-                    )
-                )
-            ranked.sort(key=lambda item: (-float(item.score), int(item.action)))
+            ranked = self.memory_query.rank_actions(contexts_by_action, list(actions))
             if ranked:
                 best_score = ranked[0].score
                 best = [item.action for item in ranked if float(item.score) == float(best_score)]
@@ -289,18 +281,6 @@ class V6System:
         self.graph.add_delta(interaction.id, delta)
         if future_option_before is not None and future_option_after is not None:
             future_option_delta = self.future_option_estimator.compare(future_option_before, future_option_after, interaction.id)
-        self._write_m0_memory(
-            interaction=interaction,
-            observation_before=observation_before,
-            observation_after=observation_after_for_delta,
-        )
-        if future_option_before is not None and future_option_after is not None and future_option_delta is not None:
-            self._write_future_option_memory(
-                interaction_id=interaction.id,
-                before_option_set=future_option_before,
-                after_option_set=future_option_after,
-                option_delta=future_option_delta,
-            )
 
         interaction_count = self.interactions.count()
         clustered = False
@@ -326,6 +306,20 @@ class V6System:
         if prediction_context_signature is None:
             prediction_context_signature = context_signatures.get(0, (int(action),))
         serialized_context_signature = json.dumps(list(prediction_context_signature))
+        self._write_m0_memory(
+            interaction=interaction,
+            observation_before=observation_before,
+            observation_after=observation_after_for_delta,
+            context_signature=serialized_context_signature,
+            context_level=prediction_context_level if prediction_context_level is not None else active_context_depth,
+        )
+        if future_option_before is not None and future_option_after is not None and future_option_delta is not None:
+            self._write_future_option_memory(
+                interaction_id=interaction.id,
+                before_option_set=future_option_before,
+                after_option_set=future_option_after,
+                option_delta=future_option_delta,
+            )
         action_signature = f"a{int(action)}"
         actual_family_id = None if actual_family is None else str(actual_family)
         stable_delta_key = self._stable_delta_key(delta, outcome_state=outcome_state, level_completed_event=level_completed_event)
@@ -1130,6 +1124,8 @@ class V6System:
         interaction: Interaction,
         observation_before: Any,
         observation_after: Any,
+        context_signature: str | None = None,
+        context_level: int | None = None,
     ) -> None:
         interaction_node = interaction_node_id(interaction.id)
         before_signature = self._observation_signature(observation_before)
@@ -1153,6 +1149,8 @@ class V6System:
                     "action": int(interaction.action),
                     "delta_id": int(interaction.delta_id),
                     "global_step": None if interaction.global_step is None else int(interaction.global_step),
+                    "context_signature": context_signature,
+                    "context_level": None if context_level is None else int(context_level),
                 },
             ),
             step=step,
