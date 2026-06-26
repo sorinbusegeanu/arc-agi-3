@@ -323,6 +323,21 @@ def derive_role_transfer_attempts(
         for row in rows
     }
     carrier_signatures = sorted(role_rows)
+    target_attempt_specs: list[tuple[str, str, str]] = []
+    unique_scopes: set[tuple[str, str]] = set()
+    for carrier_signature in carrier_signatures:
+        for scope_key in sorted(carrier_games.get(carrier_signature, set())):
+            target_attempt_specs.append((carrier_signature, "cross_game", scope_key))
+            unique_scopes.add(("cross_game", scope_key))
+        for scope_key in sorted(carrier_contexts.get(carrier_signature, set())):
+            target_attempt_specs.append((carrier_signature, "cross_context", scope_key))
+            unique_scopes.add(("cross_context", scope_key))
+    profile_cache = _build_transfer_profile_cache(
+        role_rows=role_rows,
+        carrier_contexts=carrier_contexts,
+        carrier_games=carrier_games,
+        target_scopes=sorted(unique_scopes, key=lambda item: (0 if item[0] == "cross_game" else 1, item[1])),
+    )
     inserted = 0
     success_count = 0
     successful_roles: set[str] = set()
@@ -342,104 +357,87 @@ def derive_role_transfer_attempts(
     cross_context_attempt_count = 0
     cross_context_success_count = 0
 
-    for carrier_signature in carrier_signatures:
-        target = role_rows[carrier_signature]
-        scopes = [
-            ("cross_game", scope_key)
-            for scope_key in sorted(carrier_games.get(carrier_signature, set()))
-        ] + [
-            ("cross_context", scope_key)
-            for scope_key in sorted(carrier_contexts.get(carrier_signature, set()))
-        ]
-        for transfer_kind, target_scope_key in scopes:
-            if inserted >= int(max_transfer_attempts):
-                break
-            attempt = _predict_transfer_attempt(
-                state_conn=state_conn,
-                role_rows=role_rows,
-                carrier_contexts=carrier_contexts,
-                carrier_games=carrier_games,
-                target_carrier_signature=carrier_signature,
-                transfer_kind=transfer_kind,
-                target_scope_key=target_scope_key,
-            )
-            if attempt is None:
-                continue
-            state_conn.execute(
-                """
-                INSERT INTO role_transfer_attempts (
-                    attempt_id, role_signature, transfer_kind, source_scope_type, source_scope_key,
-                    target_scope_type, target_scope_key, target_carrier_signature, predicted_role_signature,
-                    observed_role_signature, similarity_score, transfer_score, reuse_success, failure_reason,
-                    best_margin, source_carrier_count, candidate_role_count, first_seen_global_step, last_seen_global_step
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    attempt["attempt_id"],
-                    attempt["role_signature"],
-                    attempt["transfer_kind"],
-                    attempt["source_scope_type"],
-                    attempt["source_scope_key"],
-                    attempt["target_scope_type"],
-                    attempt["target_scope_key"],
-                    attempt["target_carrier_signature"],
-                    attempt["predicted_role_signature"],
-                    attempt["observed_role_signature"],
-                    attempt["similarity_score"],
-                    attempt["transfer_score"],
-                    attempt["reuse_success"],
-                    attempt["failure_reason"],
-                    attempt["best_margin"],
-                    attempt["source_carrier_count"],
-                    attempt["candidate_role_count"],
-                    attempt["first_seen_global_step"],
-                    attempt["last_seen_global_step"],
-                ),
-            )
-            inserted += 1
-            transfer_score_sum += float(attempt["transfer_score"] or 0.0)
-            source_carrier_count_sum += int(attempt["source_carrier_count"] or 0)
-            candidate_role_count_sum += int(attempt["candidate_role_count"] or 0)
-            if attempt["best_margin"] is not None:
-                best_margin_sum += float(attempt["best_margin"])
-                best_margin_count += 1
-            if attempt["first_seen_global_step"] is not None:
-                first_attempt_step = (
-                    attempt["first_seen_global_step"]
-                    if first_attempt_step is None
-                    else min(first_attempt_step, int(attempt["first_seen_global_step"]))
-                )
-            if attempt["transfer_kind"] == "cross_game":
-                cross_game_attempt_count += 1
-            else:
-                cross_context_attempt_count += 1
-            failure_reason = str(attempt["failure_reason"])
-            if failure_reason == "role_mismatch":
-                role_mismatch_count += 1
-            elif failure_reason == "low_similarity":
-                low_similarity_count += 1
-            elif failure_reason == "insufficient_source_support":
-                insufficient_source_support_count += 1
-            elif failure_reason == "no_source_profile":
-                no_source_profile_count += 1
-            if int(attempt["reuse_success"]) == 1:
-                success_count += 1
-                successful_roles.add(str(attempt["observed_role_signature"]))
-                if attempt["transfer_kind"] == "cross_game":
-                    cross_game_success_count += 1
-                else:
-                    cross_context_success_count += 1
-                if attempt["first_seen_global_step"] is not None:
-                    first_success_step = (
-                        attempt["first_seen_global_step"]
-                        if first_success_step is None
-                        else min(first_success_step, int(attempt["first_seen_global_step"]))
-                    )
-            if inserted >= int(max_transfer_attempts):
-                break
+    for carrier_signature, transfer_kind, target_scope_key in target_attempt_specs:
         if inserted >= int(max_transfer_attempts):
             break
+        attempt = _predict_transfer_attempt(
+            profile_cache=profile_cache,
+            role_rows=role_rows,
+            target_carrier_signature=carrier_signature,
+            transfer_kind=transfer_kind,
+            target_scope_key=target_scope_key,
+        )
+        state_conn.execute(
+            """
+            INSERT INTO role_transfer_attempts (
+                attempt_id, role_signature, transfer_kind, source_scope_type, source_scope_key,
+                target_scope_type, target_scope_key, target_carrier_signature, predicted_role_signature,
+                observed_role_signature, similarity_score, transfer_score, reuse_success, failure_reason,
+                best_margin, source_carrier_count, candidate_role_count, first_seen_global_step, last_seen_global_step
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                attempt["attempt_id"],
+                attempt["role_signature"],
+                attempt["transfer_kind"],
+                attempt["source_scope_type"],
+                attempt["source_scope_key"],
+                attempt["target_scope_type"],
+                attempt["target_scope_key"],
+                attempt["target_carrier_signature"],
+                attempt["predicted_role_signature"],
+                attempt["observed_role_signature"],
+                attempt["similarity_score"],
+                attempt["transfer_score"],
+                attempt["reuse_success"],
+                attempt["failure_reason"],
+                attempt["best_margin"],
+                attempt["source_carrier_count"],
+                attempt["candidate_role_count"],
+                attempt["first_seen_global_step"],
+                attempt["last_seen_global_step"],
+            ),
+        )
+        inserted += 1
+        transfer_score_sum += float(attempt["transfer_score"] or 0.0)
+        source_carrier_count_sum += int(attempt["source_carrier_count"] or 0)
+        candidate_role_count_sum += int(attempt["candidate_role_count"] or 0)
+        if attempt["best_margin"] is not None:
+            best_margin_sum += float(attempt["best_margin"])
+            best_margin_count += 1
+        if attempt["first_seen_global_step"] is not None:
+            first_attempt_step = (
+                attempt["first_seen_global_step"]
+                if first_attempt_step is None
+                else min(first_attempt_step, int(attempt["first_seen_global_step"]))
+            )
+        if attempt["transfer_kind"] == "cross_game":
+            cross_game_attempt_count += 1
+        else:
+            cross_context_attempt_count += 1
+        failure_reason = str(attempt["failure_reason"])
+        if failure_reason == "role_mismatch":
+            role_mismatch_count += 1
+        elif failure_reason == "low_similarity":
+            low_similarity_count += 1
+        elif failure_reason == "insufficient_source_support":
+            insufficient_source_support_count += 1
+        elif failure_reason == "no_source_profile":
+            no_source_profile_count += 1
+        if int(attempt["reuse_success"]) == 1:
+            success_count += 1
+            successful_roles.add(str(attempt["observed_role_signature"]))
+            if attempt["transfer_kind"] == "cross_game":
+                cross_game_success_count += 1
+            else:
+                cross_context_success_count += 1
+            if attempt["first_seen_global_step"] is not None:
+                first_success_step = (
+                    attempt["first_seen_global_step"]
+                    if first_success_step is None
+                    else min(first_success_step, int(attempt["first_seen_global_step"]))
+                )
 
     _write_milestone(state_conn, "first_role_transfer_attempt_step", first_attempt_step, None)
     _write_milestone(state_conn, "first_role_transfer_success_step", first_success_step, None)
@@ -463,6 +461,8 @@ def derive_role_transfer_attempts(
         "mean_best_margin": (best_margin_sum / best_margin_count) if best_margin_count else None,
         "mean_source_carrier_count": (source_carrier_count_sum / inserted) if inserted else None,
         "candidate_role_count_mean": (candidate_role_count_sum / inserted) if inserted else None,
+        "transfer_profile_cache_scope_count": len(profile_cache),
+        "transfer_profile_cache_profile_count": sum(len(items) for items in profile_cache.values()),
     }
 
 
@@ -868,58 +868,46 @@ def _build_role_tokens(
 
 def _predict_transfer_attempt(
     *,
-    state_conn: sqlite3.Connection,
+    profile_cache: dict[tuple[str, str], list[dict[str, Any]]],
     role_rows: dict[str, dict[str, Any]],
-    carrier_contexts: dict[str, set[str]],
-    carrier_games: dict[str, set[str]],
     target_carrier_signature: str,
     transfer_kind: str,
     target_scope_key: str,
-) -> dict[str, Any] | None:
+) -> dict[str, Any]:
     target = role_rows[target_carrier_signature]
     target_tokens = set(target["tokens"])
-    excluded_scope = target_scope_key
-    grouped_sources: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for candidate_signature, candidate in role_rows.items():
-        if candidate_signature == target_carrier_signature:
-            continue
-        candidate_scopes = carrier_games.get(candidate_signature, set()) if transfer_kind == "cross_game" else carrier_contexts.get(candidate_signature, set())
-        if excluded_scope in candidate_scopes:
-            continue
-        grouped_sources[str(candidate["role_signature"])].append(candidate)
-    ordered_profiles: list[dict[str, Any]] = []
-    for role_signature in sorted(grouped_sources):
-        source_candidates = sorted(grouped_sources[role_signature], key=lambda item: str(item["carrier_signature"]))
-        profile_tokens = sorted({token for candidate in source_candidates for token in candidate["tokens"]})
-        source_context_count = len({context for candidate in source_candidates for context in carrier_contexts.get(str(candidate["carrier_signature"]), set())})
-        source_game_count = len({game for candidate in source_candidates for game in carrier_games.get(str(candidate["carrier_signature"]), set())})
-        similarity_score = _jaccard(set(profile_tokens), target_tokens)
-        ordered_profiles.append(
+    profiles = [
+        dict(profile)
+        for profile in profile_cache.get((transfer_kind, target_scope_key), [])
+        if not (
+            int(profile.get("source_carrier_count") or 0) == 1
+            and str(profile.get("role_signature") or "") == str(target["role_signature"])
+        )
+    ]
+    if not profiles:
+        return _no_source_profile_attempt(target, transfer_kind, target_scope_key)
+    scored_profiles: list[dict[str, Any]] = []
+    for profile in profiles:
+        scored_profiles.append(
             {
-                "role_signature": role_signature,
-                "tokens": profile_tokens,
-                "similarity_score": similarity_score,
-                "source_carrier_count": len(source_candidates),
-                "source_context_count": source_context_count,
-                "source_game_count": source_game_count,
+                **profile,
+                "similarity_score": _jaccard(set(profile["profile_tokens"]), target_tokens),
             }
         )
-    if not ordered_profiles:
-        return None
-    ordered_profiles.sort(
+    scored_profiles.sort(
         key=lambda item: (
             -float(item["similarity_score"]),
             -int(item["source_carrier_count"]),
             str(item["role_signature"]),
         )
     )
-    best = ordered_profiles[0]
-    second = ordered_profiles[1] if len(ordered_profiles) > 1 else None
+    best = scored_profiles[0]
+    second = scored_profiles[1] if len(scored_profiles) > 1 else None
     best_margin = None if second is None else float(best["similarity_score"]) - float(second["similarity_score"])
     predicted_role_signature = str(best["role_signature"])
     observed_role_signature = str(target["role_signature"])
     source_carrier_count = int(best["source_carrier_count"])
-    candidate_role_count = len(ordered_profiles)
+    candidate_role_count = len(scored_profiles)
     similarity_score = float(best["similarity_score"])
     reuse_success = int(
         predicted_role_signature == observed_role_signature
@@ -958,6 +946,77 @@ def _predict_transfer_attempt(
         "best_margin": best_margin,
         "source_carrier_count": source_carrier_count,
         "candidate_role_count": candidate_role_count,
+        "first_seen_global_step": target["first_seen_global_step"],
+        "last_seen_global_step": target["last_seen_global_step"],
+    }
+
+
+def _build_transfer_profile_cache(
+    *,
+    role_rows: dict[str, dict[str, Any]],
+    carrier_contexts: dict[str, set[str]],
+    carrier_games: dict[str, set[str]],
+    target_scopes: list[tuple[str, str]],
+) -> dict[tuple[str, str], list[dict[str, Any]]]:
+    cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    carrier_items = sorted(role_rows.items(), key=lambda item: item[0])
+    for transfer_kind, target_scope_key in target_scopes:
+        grouped_sources: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for candidate_signature, candidate in carrier_items:
+            candidate_scopes = carrier_games.get(candidate_signature, set()) if transfer_kind == "cross_game" else carrier_contexts.get(candidate_signature, set())
+            if target_scope_key in candidate_scopes:
+                continue
+            grouped_sources[str(candidate["role_signature"])].append(candidate)
+        profiles: list[dict[str, Any]] = []
+        for role_signature in sorted(grouped_sources):
+            source_candidates = grouped_sources[role_signature]
+            profiles.append(
+                {
+                    "role_signature": role_signature,
+                    "profile_tokens": sorted({token for candidate in source_candidates for token in candidate["tokens"]}),
+                    "source_carrier_count": len(source_candidates),
+                    "source_context_count": len(
+                        {
+                            context
+                            for candidate in source_candidates
+                            for context in carrier_contexts.get(str(candidate["carrier_signature"]), set())
+                        }
+                    ),
+                    "source_game_count": len(
+                        {
+                            game
+                            for candidate in source_candidates
+                            for game in carrier_games.get(str(candidate["carrier_signature"]), set())
+                        }
+                    ),
+                }
+            )
+        cache[(transfer_kind, target_scope_key)] = profiles
+    return cache
+
+
+def _no_source_profile_attempt(target: dict[str, Any], transfer_kind: str, target_scope_key: str) -> dict[str, Any]:
+    source_scope_type = "not_game" if transfer_kind == "cross_game" else "not_context"
+    target_scope_type = "game" if transfer_kind == "cross_game" else "context"
+    attempt_seed = "|".join((transfer_kind, target_scope_key, str(target["carrier_signature"]), "no_source_profile"))
+    return {
+        "attempt_id": sha1(attempt_seed.encode("utf-8")).hexdigest(),
+        "role_signature": str(target["role_signature"]),
+        "transfer_kind": transfer_kind,
+        "source_scope_type": source_scope_type,
+        "source_scope_key": target_scope_key,
+        "target_scope_type": target_scope_type,
+        "target_scope_key": target_scope_key,
+        "target_carrier_signature": str(target["carrier_signature"]),
+        "predicted_role_signature": None,
+        "observed_role_signature": str(target["role_signature"]),
+        "similarity_score": 0.0,
+        "transfer_score": 0.0,
+        "reuse_success": 0,
+        "failure_reason": "no_source_profile",
+        "best_margin": None,
+        "source_carrier_count": 0,
+        "candidate_role_count": 0,
         "first_seen_global_step": target["first_seen_global_step"],
         "last_seen_global_step": target["last_seen_global_step"],
     }

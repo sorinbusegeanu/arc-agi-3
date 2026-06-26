@@ -153,9 +153,16 @@ def test_h07_does_not_promote_from_weak_transfer(tmp_path: Path) -> None:
             """
         )
         conn.commit()
-    result = evaluate_h07_concept_emergence(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h07")
+        assert conn.execute("SELECT COUNT(*) FROM role_transfer_attempts WHERE attempt_id='weak1'").fetchone()[0] == 1
+    result = evaluate_h07_concept_emergence(
+        memory_dir=memory_dir,
+        run_dir=None,
+        output_dir=tmp_path / "h07",
+        already_derived=True,
+    )
     assert result["concept_strong_transfer_success_count"] == 0
     assert result["promoted_concept_count"] == 0
+    assert result["decision"] != "VALID"
 
 
 def test_h08_valid(tmp_path: Path) -> None:
@@ -196,6 +203,71 @@ def test_max_transfer_attempts_respected(tmp_path: Path) -> None:
     with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
         count = conn.execute("SELECT COUNT(*) FROM role_transfer_attempts").fetchone()[0]
     assert count <= 10
+
+
+def test_h06_profile_cache_bounds_prediction_work(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    specs = [
+        {
+            "carrier": "perf_000_unique",
+            "game": "g_unique",
+            "contexts": ["perf_ctx_unique_1", "perf_ctx_unique_2"],
+            "effect": "reversible",
+            "action": "toggle",
+            "polarity": "neutral",
+        }
+    ]
+    families = [
+        ("enable", "open", "positive"),
+        ("block", "close", "negative"),
+        ("transform", "shift", "neutral"),
+        ("terminate", "consume", "negative"),
+    ]
+    for index in range(80):
+        effect, action, polarity = families[index % len(families)]
+        specs.append(
+            {
+                "carrier": f"perf_{index}",
+                "game": f"g{index % 8}",
+                "contexts": [f"perf_ctx_{index}_1", f"perf_ctx_{index}_2"],
+                "effect": effect,
+                "action": action,
+                "polarity": polarity,
+            }
+        )
+    derive_higher_order_memory(memory_dir=_seed_memory(memory_dir, specs), max_transfer_attempts=25)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT attempt_id, reuse_success, failure_reason FROM role_transfer_attempts ORDER BY attempt_id ASC").fetchall()
+    assert len(rows) <= 25
+    assert len({str(row["attempt_id"]) for row in rows}) == len(rows)
+    assert any(int(row["reuse_success"] or 0) == 1 for row in rows)
+    assert any(str(row["failure_reason"]) != "success" for row in rows)
+
+
+def test_h06_records_no_source_profile_attempt(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_memory(memory_dir, [
+        {"carrier": "solo", "game": "g1", "contexts": ["ctx1", "ctx2"], "effect": "enable", "action": "open", "polarity": "positive"},
+    ])
+    derive_higher_order_memory(memory_dir=memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT reuse_success, failure_reason
+            FROM role_transfer_attempts
+            WHERE failure_reason = 'no_source_profile'
+            ORDER BY attempt_id ASC
+            """
+        ).fetchall()
+    assert rows
+    assert all(int(row["reuse_success"] or 0) == 0 for row in rows)
+    result = evaluate_h06_role_transfer(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h06")
+    assert result["transfer_attempt_count"] >= 1
+    assert result["no_source_profile_count"] >= 1
+    assert result["decision"] in {"INCONCLUSIVE", "PARTIALLY_VALID", "INVALID"}
+    assert result["decision"] != "VALID"
 
 
 def test_standalone_h05_h08_derive_safely(tmp_path: Path) -> None:
