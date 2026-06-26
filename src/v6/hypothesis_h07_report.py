@@ -5,15 +5,21 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+from v6.higher_order_substrate import derive_higher_order_memory
+from v6.memory.compact_memory import ensure_memory_layout
+
 
 def evaluate_h07_concept_emergence(
     *,
     memory_dir: Path,
     run_dir: Path | None,
     output_dir: Path,
+    already_derived: bool = False,
 ) -> dict[str, Any]:
-    del run_dir
     output_dir.mkdir(parents=True, exist_ok=True)
+    ensure_memory_layout(memory_dir)
+    if not already_derived:
+        derive_higher_order_memory(memory_dir=memory_dir, run_dir=run_dir)
     current_state = Path(memory_dir) / "current_state.sqlite"
     if not current_state.exists():
         result = _base_result("INCONCLUSIVE", ["compact memory missing current_state.sqlite"])
@@ -26,6 +32,7 @@ def evaluate_h07_concept_emergence(
         concept_rows = conn.execute(
             """
             SELECT concept_signature, compression_gain, promotion_score, transfer_success_count,
+                   strong_transfer_success_count,
                    cross_context_count, cross_game_count, is_promoted
             FROM concept_candidates
             ORDER BY concept_signature ASC
@@ -49,6 +56,7 @@ def evaluate_h07_concept_emergence(
     cross_context_concept_count = sum(1 for row in concept_rows if int(row["cross_context_count"] or 0) >= 1)
     cross_game_concept_count = sum(1 for row in concept_rows if int(row["cross_game_count"] or 0) >= 1)
     concept_transfer_success_count = successful_transfers
+    concept_strong_transfer_success_count = sum(int(row["strong_transfer_success_count"] or 0) for row in concept_rows)
     metrics = {
         "concept_candidate_count": concept_candidate_count,
         "promoted_concept_count": promoted_concept_count,
@@ -57,6 +65,7 @@ def evaluate_h07_concept_emergence(
         "mean_promotion_score": mean_promotion_score,
         "max_promotion_score": max_promotion_score,
         "concept_transfer_success_count": concept_transfer_success_count,
+        "concept_strong_transfer_success_count": concept_strong_transfer_success_count,
         "cross_context_concept_count": cross_context_concept_count,
         "cross_game_concept_count": cross_game_concept_count,
         "first_concept_candidate_step": milestone_map.get("first_concept_candidate_step"),
@@ -69,7 +78,13 @@ def evaluate_h07_concept_emergence(
     elif successful_transfers > 0 and concept_candidate_count == 0:
         decision = "INVALID"
         missing = []
-    elif promoted_concept_count >= 1 and concept_transfer_success_count >= 2 and (max_compression_gain or 0.0) >= 1.50 and (max_promotion_score or 0.0) >= 0.55 and (cross_context_concept_count >= 1 or cross_game_concept_count >= 1):
+    elif (
+        promoted_concept_count >= 1
+        and concept_strong_transfer_success_count >= 2
+        and (max_compression_gain or 0.0) >= 1.50
+        and (max_promotion_score or 0.0) >= 0.55
+        and (cross_context_concept_count >= 1 or cross_game_concept_count >= 1)
+    ):
         decision = "VALID"
         missing = []
     elif concept_candidate_count > 0 and promoted_concept_count == 0:
@@ -103,7 +118,9 @@ def _write_outputs(output_dir: Path, result: dict[str, Any]) -> None:
         f"H07 decision: {result.get('decision')}\n"
         f"concept candidates: {result.get('concept_candidate_count')}\n"
         f"promoted concepts: {result.get('promoted_concept_count')}\n"
+        f"strong transfer successes: {result.get('concept_strong_transfer_success_count')}\n"
         f"max compression gain: {result.get('max_compression_gain')}\n"
+        f"max promotion score: {result.get('max_promotion_score')}\n"
     )
     (output_dir / "h07_concept_emergence_report.txt").write_text(text, encoding="utf-8")
     (output_dir / "h07_concept_emergence.md").write_text("```\n" + text + "```\n", encoding="utf-8")

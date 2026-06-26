@@ -75,10 +75,10 @@ def run_hypothesis_suite_report(
     )
     if memory_dir is not None:
         derive_higher_order_memory(memory_dir=memory_dir, run_dir=run_dir)
-        h05 = evaluate_h05_role_emergence(memory_dir=memory_dir, run_dir=run_dir, output_dir=h05_dir)
-        h06 = evaluate_h06_role_transfer(memory_dir=memory_dir, run_dir=run_dir, output_dir=h06_dir)
-        h07 = evaluate_h07_concept_emergence(memory_dir=memory_dir, run_dir=run_dir, output_dir=h07_dir)
-        h08 = evaluate_h08_world_model_coherence(memory_dir=memory_dir, run_dir=run_dir, output_dir=h08_dir)
+        h05 = evaluate_h05_role_emergence(memory_dir=memory_dir, run_dir=run_dir, output_dir=h05_dir, already_derived=True)
+        h06 = evaluate_h06_role_transfer(memory_dir=memory_dir, run_dir=run_dir, output_dir=h06_dir, already_derived=True)
+        h07 = evaluate_h07_concept_emergence(memory_dir=memory_dir, run_dir=run_dir, output_dir=h07_dir, already_derived=True)
+        h08 = evaluate_h08_world_model_coherence(memory_dir=memory_dir, run_dir=run_dir, output_dir=h08_dir, already_derived=True)
     else:
         missing = ["memory_dir not provided"]
         h05 = {"hypothesis_id": "H05", "decision": "INCONCLUSIVE", "core_metrics": {}, "missing_evidence": missing, "evidence_source": "none"}
@@ -233,8 +233,15 @@ def build_hypothesis_suite_summary(
             "cross_game_success_count": h06.get("cross_game_success_count"),
             "cross_context_success_count": h06.get("cross_context_success_count"),
             "successful_role_count": h06.get("successful_role_count"),
+            "role_mismatch_count": h06.get("role_mismatch_count"),
+            "low_similarity_count": h06.get("low_similarity_count"),
+            "insufficient_source_support_count": h06.get("insufficient_source_support_count"),
+            "no_source_profile_count": h06.get("no_source_profile_count"),
             "mean_transfer_score": h06.get("mean_transfer_score"),
             "max_transfer_score": h06.get("max_transfer_score"),
+            "mean_best_margin": h06.get("mean_best_margin"),
+            "mean_source_carrier_count": h06.get("mean_source_carrier_count"),
+            "candidate_role_count_mean": h06.get("candidate_role_count_mean"),
         },
         "H07 core metrics": {
             "concept_candidate_count": h07.get("concept_candidate_count"),
@@ -242,6 +249,7 @@ def build_hypothesis_suite_summary(
             "mean_compression_gain": h07.get("mean_compression_gain"),
             "max_compression_gain": h07.get("max_compression_gain"),
             "concept_transfer_success_count": h07.get("concept_transfer_success_count"),
+            "concept_strong_transfer_success_count": h07.get("concept_strong_transfer_success_count"),
             "max_promotion_score": h07.get("max_promotion_score"),
             "cross_context_concept_count": h07.get("cross_context_concept_count"),
             "cross_game_concept_count": h07.get("cross_game_concept_count"),
@@ -249,6 +257,8 @@ def build_hypothesis_suite_summary(
         "H08 core metrics": {
             "world_model_component_count": h08.get("world_model_component_count"),
             "coherent_world_model_component_count": h08.get("coherent_world_model_component_count"),
+            "candidate_only_world_model_component_count": h08.get("candidate_only_world_model_component_count"),
+            "promoted_concept_count": h08.get("promoted_concept_count"),
             "mean_coherence_score": h08.get("mean_coherence_score"),
             "max_coherence_score": h08.get("max_coherence_score"),
             "mean_explanatory_coverage": h08.get("mean_explanatory_coverage"),

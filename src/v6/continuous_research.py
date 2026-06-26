@@ -208,10 +208,14 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
             "emergent_roles": h05_metrics.get("emergent_role_count"),
             "role_transfer_attempts": h06_metrics.get("transfer_attempt_count"),
             "role_transfer_success_rate": h06_metrics.get("transfer_success_rate"),
+            "h06_role_mismatch_count": h06_metrics.get("role_mismatch_count"),
+            "h06_mean_best_margin": h06_metrics.get("mean_best_margin"),
             "concept_candidates": h07_metrics.get("concept_candidate_count"),
             "promoted_concepts": h07_metrics.get("promoted_concept_count"),
+            "h07_strong_transfer_successes": h07_metrics.get("concept_strong_transfer_success_count"),
             "world_model_components": h08_metrics.get("world_model_component_count"),
             "coherent_world_model_components": h08_metrics.get("coherent_world_model_component_count"),
+            "candidate_only_world_model_components": h08_metrics.get("candidate_only_world_model_component_count"),
             "workers_requested": requested_workers,
             "workers_initial": initial_epoch_workers,
             "workers_max_epoch": max_epoch_workers,
@@ -415,13 +419,17 @@ def _format_epoch_status(status: dict[str, Any]) -> str:
         f"emergent roles: {status.get('emergent_roles')}\n\n"
         f"H06: {status.get('H06')}\n"
         f"transfer attempts: {status.get('role_transfer_attempts')}\n"
-        f"transfer success rate: {status.get('role_transfer_success_rate')}\n\n"
+        f"transfer success rate: {status.get('role_transfer_success_rate')}\n"
+        f"role mismatch count: {status.get('h06_role_mismatch_count')}\n"
+        f"mean best margin: {status.get('h06_mean_best_margin')}\n\n"
         f"H07: {status.get('H07')}\n"
         f"concept candidates: {status.get('concept_candidates')}\n"
-        f"promoted concepts: {status.get('promoted_concepts')}\n\n"
+        f"promoted concepts: {status.get('promoted_concepts')}\n"
+        f"strong transfer successes: {status.get('h07_strong_transfer_successes')}\n\n"
         f"H08: {status.get('H08')}\n"
         f"world model components: {status.get('world_model_components')}\n"
-        f"coherent components: {status.get('coherent_world_model_components')}\n\n"
+        f"coherent components: {status.get('coherent_world_model_components')}\n"
+        f"candidate-only components: {status.get('candidate_only_world_model_components')}\n\n"
         f"Cleanup:\n"
         f"deleted raw files: {cleanup.get('raw_files_deleted_count')}\n"
         f"freed: {cleanup.get('disk_freed_bytes', 0) / (1024 ** 3):.3f} GB\n\n"

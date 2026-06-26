@@ -5,15 +5,21 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+from v6.higher_order_substrate import derive_higher_order_memory
+from v6.memory.compact_memory import ensure_memory_layout
+
 
 def evaluate_h06_role_transfer(
     *,
     memory_dir: Path,
     run_dir: Path | None,
     output_dir: Path,
+    already_derived: bool = False,
 ) -> dict[str, Any]:
-    del run_dir
     output_dir.mkdir(parents=True, exist_ok=True)
+    ensure_memory_layout(memory_dir)
+    if not already_derived:
+        derive_higher_order_memory(memory_dir=memory_dir, run_dir=run_dir)
     current_state = Path(memory_dir) / "current_state.sqlite"
     if not current_state.exists():
         result = _base_result("INCONCLUSIVE", ["compact memory missing current_state.sqlite"])
@@ -24,7 +30,8 @@ def evaluate_h06_role_transfer(
         role_candidate_count = int(conn.execute("SELECT COUNT(*) FROM role_candidates").fetchone()[0])
         rows = conn.execute(
             """
-            SELECT role_signature, transfer_kind, similarity_score, transfer_score, reuse_success
+            SELECT role_signature, transfer_kind, similarity_score, transfer_score, reuse_success,
+                   failure_reason, best_margin, source_carrier_count, candidate_role_count
             FROM role_transfer_attempts
             ORDER BY role_signature ASC, target_scope_key ASC, target_carrier_signature ASC
             """
@@ -39,12 +46,19 @@ def evaluate_h06_role_transfer(
     successful_transfer_count = len(success_rows)
     transfer_success_rate = float(successful_transfer_count / transfer_attempt_count) if transfer_attempt_count else None
     successful_role_count = len({str(row["role_signature"]) for row in success_rows})
+    role_mismatch_count = sum(1 for row in rows if str(row["failure_reason"] or "") == "role_mismatch")
+    low_similarity_count = sum(1 for row in rows if str(row["failure_reason"] or "") == "low_similarity")
+    insufficient_source_support_count = sum(1 for row in rows if str(row["failure_reason"] or "") == "insufficient_source_support")
+    no_source_profile_count = sum(1 for row in rows if str(row["failure_reason"] or "") == "no_source_profile")
     mean_transfer_score = (
         sum(float(row["transfer_score"] or 0.0) for row in rows) / max(1, transfer_attempt_count)
         if rows
         else None
     )
     max_transfer_score = max((float(row["transfer_score"] or 0.0) for row in rows), default=None)
+    margins = [float(row["best_margin"]) for row in rows if row["best_margin"] is not None]
+    source_counts = [int(row["source_carrier_count"] or 0) for row in rows]
+    candidate_role_counts = [int(row["candidate_role_count"] or 0) for row in rows]
     metrics = {
         "transfer_attempt_count": transfer_attempt_count,
         "successful_transfer_count": successful_transfer_count,
@@ -54,8 +68,15 @@ def evaluate_h06_role_transfer(
         "cross_context_attempt_count": len(cross_context_rows),
         "cross_context_success_count": cross_context_success_count,
         "successful_role_count": successful_role_count,
+        "role_mismatch_count": role_mismatch_count,
+        "low_similarity_count": low_similarity_count,
+        "insufficient_source_support_count": insufficient_source_support_count,
+        "no_source_profile_count": no_source_profile_count,
         "mean_transfer_score": mean_transfer_score,
         "max_transfer_score": max_transfer_score,
+        "mean_best_margin": (sum(margins) / len(margins)) if margins else None,
+        "mean_source_carrier_count": (sum(source_counts) / len(source_counts)) if source_counts else None,
+        "candidate_role_count_mean": (sum(candidate_role_counts) / len(candidate_role_counts)) if candidate_role_counts else None,
         "first_role_candidate_step": milestone_map.get("first_role_candidate_step"),
         "first_role_transfer_attempt_step": milestone_map.get("first_role_transfer_attempt_step"),
         "first_role_transfer_success_step": milestone_map.get("first_role_transfer_success_step"),
@@ -66,10 +87,16 @@ def evaluate_h06_role_transfer(
     elif transfer_attempt_count <= 0:
         decision = "INCONCLUSIVE"
         missing = ["no role transfer attempts available"]
-    elif transfer_attempt_count >= 20 and (transfer_success_rate or 0.0) >= 0.60 and successful_role_count >= 3 and (cross_game_success_count >= 1 or cross_context_success_count >= 5):
+    elif (
+        transfer_attempt_count >= 20
+        and (transfer_success_rate or 0.0) >= 0.60
+        and successful_role_count >= 3
+        and (metrics["mean_best_margin"] or 0.0) >= 0.10
+        and (cross_game_success_count >= 1 or cross_context_success_count >= 5)
+    ):
         decision = "VALID"
         missing = []
-    elif transfer_attempt_count >= 5 and (transfer_success_rate or 0.0) >= 0.35:
+    elif transfer_attempt_count >= 5 and (transfer_success_rate or 0.0) >= 0.35 and successful_role_count >= 1:
         decision = "PARTIALLY_VALID"
         missing = []
     elif role_candidate_count > 0 and transfer_attempt_count >= 5 and (transfer_success_rate or 0.0) < 0.20:
@@ -101,6 +128,13 @@ def _write_outputs(output_dir: Path, result: dict[str, Any]) -> None:
         f"transfer attempts: {result.get('transfer_attempt_count')}\n"
         f"successful transfers: {result.get('successful_transfer_count')}\n"
         f"transfer success rate: {result.get('transfer_success_rate')}\n"
+        f"role mismatch count: {result.get('role_mismatch_count')}\n"
+        f"low similarity count: {result.get('low_similarity_count')}\n"
+        f"insufficient source support count: {result.get('insufficient_source_support_count')}\n"
+        f"no source profile count: {result.get('no_source_profile_count')}\n"
+        f"mean best margin: {result.get('mean_best_margin')}\n"
+        f"mean source carrier count: {result.get('mean_source_carrier_count')}\n"
+        f"candidate role count mean: {result.get('candidate_role_count_mean')}\n"
     )
     (output_dir / "h06_role_transfer_report.txt").write_text(text, encoding="utf-8")
     (output_dir / "h06_role_transfer.md").write_text("```\n" + text + "```\n", encoding="utf-8")

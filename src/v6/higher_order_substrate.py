@@ -35,7 +35,8 @@ class CarrierNeighborhood:
     last_seen_global_step: int | None
     role_signature: str
     role_type: str
-    tokens: tuple[str, ...]
+    signature_tokens: tuple[str, ...]
+    diagnostic_tokens: tuple[str, ...]
     families: tuple[str, ...]
     contexts: tuple[str, ...]
     contingencies: tuple[str, ...]
@@ -64,26 +65,28 @@ def derive_higher_order_memory(
         transfer_summary = derive_role_transfer_attempts(state_conn, graph_conn, max_transfer_attempts=max_transfer_attempts)
         concept_summary = derive_concept_candidates(state_conn)
         world_summary = derive_world_model_components(state_conn, graph_conn)
-        summary = {
-            **role_summary,
-            **transfer_summary,
-            **concept_summary,
-            **world_summary,
-        }
+        summary = {**role_summary, **transfer_summary, **concept_summary, **world_summary}
         state_conn.commit()
         graph_conn.commit()
         return summary
 
 
-def derive_role_candidates(state_conn: sqlite3.Connection, graph_conn: sqlite3.Connection, max_carriers: int, max_roles: int) -> dict[str, Any]:
-    family_rows = state_conn.execute(
-        """
-        SELECT canonical_signature, effect_type, action_group, polarity, support_count, member_count
-        FROM transformation_families
-        ORDER BY canonical_signature ASC
-        """
-    ).fetchall()
-    family_meta = {str(row["canonical_signature"]): dict(row) for row in family_rows}
+def derive_role_candidates(
+    state_conn: sqlite3.Connection,
+    graph_conn: sqlite3.Connection,
+    max_carriers: int,
+    max_roles: int,
+) -> dict[str, Any]:
+    family_meta = {
+        str(row["canonical_signature"]): dict(row)
+        for row in state_conn.execute(
+            """
+            SELECT canonical_signature, effect_type, action_group, polarity, support_count, member_count
+            FROM transformation_families
+            ORDER BY canonical_signature ASC
+            """
+        ).fetchall()
+    }
     carrier_rows = state_conn.execute(
         """
         SELECT carrier_signature, carrier_source, support_count, stability_score, is_emergent,
@@ -106,41 +109,25 @@ def derive_role_candidates(state_conn: sqlite3.Connection, graph_conn: sqlite3.C
             "role_neighborhood_count": 0,
         }
 
-    link_rows = state_conn.execute(
-        """
-        SELECT carrier_signature, linked_type, linked_key
-        FROM carrier_links
-        ORDER BY carrier_signature ASC, linked_type ASC, linked_key ASC
-        """
-    ).fetchall()
-    links_by_carrier: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
-    for row in link_rows:
-        carrier = str(row["carrier_signature"])
-        linked_type = str(row["linked_type"])
-        linked_key = row["linked_key"]
-        if linked_key not in (None, ""):
-            links_by_carrier[carrier][linked_type].add(str(linked_key))
-
-    graph_nodes = {
-        str(row["node_id"]): str(row["node_type"] or "")
-        for row in graph_conn.execute("SELECT node_id, node_type FROM graph_nodes").fetchall()
-    }
-    edge_out_rows = graph_conn.execute(
-        "SELECT source_node_id, target_node_id, edge_type FROM graph_edges ORDER BY source_node_id ASC, edge_type ASC, target_node_id ASC"
-    ).fetchall()
-    edge_in_rows = graph_conn.execute(
-        "SELECT target_node_id, source_node_id, edge_type FROM graph_edges ORDER BY target_node_id ASC, edge_type ASC, source_node_id ASC"
-    ).fetchall()
+    links_by_carrier = _carrier_links_by_carrier(state_conn)
+    carrier_signatures = [str(row["carrier_signature"]) for row in carrier_rows]
+    relevant_node_ids: set[str] = set()
+    context_node_ids: set[str] = set()
+    for carrier_signature in carrier_signatures:
+        relevant_node_ids.add(f"carrier:{carrier_signature}")
+        carrier_links = links_by_carrier.get(carrier_signature, {})
+        for family in carrier_links.get("family", set()):
+            relevant_node_ids.add(f"family:{family}")
+        for context in carrier_links.get("context", set()):
+            context_node_ids.add(f"context:{context}")
+            relevant_node_ids.add(f"context:{context}")
+    edge_rows = _fetch_edges_for_nodes(graph_conn, relevant_node_ids)
+    graph_nodes = _graph_nodes_for_ids(graph_conn, {node_id for row in edge_rows for node_id in (str(row["source_node_id"]), str(row["target_node_id"]))} | relevant_node_ids)
+    context_games = _context_games_for_context_nodes(graph_conn, context_node_ids)
     edges_out_by_source: dict[str, list[sqlite3.Row]] = defaultdict(list)
     edges_in_by_target: dict[str, list[sqlite3.Row]] = defaultdict(list)
-    context_games: dict[str, set[str]] = defaultdict(set)
-    for row in edge_out_rows:
-        source = str(row["source_node_id"])
-        target = str(row["target_node_id"])
-        edges_out_by_source[source].append(row)
-        if source.startswith("game:") and str(row["edge_type"]) == "observed_in" and target.startswith("context:"):
-            context_games[target[len("context:"):]].add(source[len("game:"):])
-    for row in edge_in_rows:
+    for row in edge_rows:
+        edges_out_by_source[str(row["source_node_id"])].append(row)
         edges_in_by_target[str(row["target_node_id"])].append(row)
 
     neighborhoods: list[CarrierNeighborhood] = []
@@ -150,36 +137,36 @@ def derive_role_candidates(state_conn: sqlite3.Connection, graph_conn: sqlite3.C
         families = tuple(sorted(carrier_links.get("family", set())))
         contexts = tuple(sorted(carrier_links.get("context", set())))
         contingencies = tuple(sorted(carrier_links.get("contingency", set())))
-        games = tuple(sorted({game for context_key in contexts for game in context_games.get(context_key, set())}))
+        games = tuple(sorted({game for context in contexts for game in context_games.get(f"context:{context}", set())}))
         carrier_node_id = f"carrier:{carrier_signature}"
         out_edges = list(edges_out_by_source.get(carrier_node_id, []))
         in_edges = list(edges_in_by_target.get(carrier_node_id, []))
-        tokens = sorted(
-            _build_role_tokens(
-                families=families,
-                contexts=contexts,
-                games=games,
-                out_edges=out_edges,
-                in_edges=in_edges,
-                graph_nodes=graph_nodes,
-                family_meta=family_meta,
-            )
+        signature_tokens, diagnostic_tokens = _build_role_tokens(
+            families=families,
+            contexts=contexts,
+            games=games,
+            out_edges=out_edges,
+            in_edges=in_edges,
+            graph_nodes=graph_nodes,
+            family_meta=family_meta,
         )
-        role_signature = _role_signature(tokens)
-        role_type = _role_type(tokens, len(families), len(contexts), len(games))
+        role_signature = _role_signature(signature_tokens)
+        role_type = _role_type(signature_tokens, len(families), len(contexts), len(games))
         state_conn.execute(
             """
             INSERT INTO role_neighborhood_signatures (
-                carrier_signature, role_signature, role_type, token_json, linked_family_count, linked_context_count,
-                linked_game_count, in_edge_count, out_edge_count, first_seen_global_step, last_seen_global_step, stability_score
+                carrier_signature, role_signature, role_type, token_json, diagnostic_token_json,
+                linked_family_count, linked_context_count, linked_game_count, in_edge_count, out_edge_count,
+                first_seen_global_step, last_seen_global_step, stability_score
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 carrier_signature,
                 role_signature,
                 role_type,
-                json.dumps(tokens, separators=(",", ":"), sort_keys=True),
+                json.dumps(signature_tokens, separators=(",", ":"), sort_keys=True),
+                json.dumps(diagnostic_tokens, separators=(",", ":"), sort_keys=True),
                 len(families),
                 len(contexts),
                 len(games),
@@ -201,7 +188,8 @@ def derive_role_candidates(state_conn: sqlite3.Connection, graph_conn: sqlite3.C
                 last_seen_global_step=None if row["last_seen_global_step"] is None else int(row["last_seen_global_step"]),
                 role_signature=role_signature,
                 role_type=role_type,
-                tokens=tuple(tokens),
+                signature_tokens=tuple(signature_tokens),
+                diagnostic_tokens=tuple(diagnostic_tokens),
                 families=families,
                 contexts=contexts,
                 contingencies=contingencies,
@@ -210,9 +198,10 @@ def derive_role_candidates(state_conn: sqlite3.Connection, graph_conn: sqlite3.C
         )
 
     grouped: dict[str, list[CarrierNeighborhood]] = defaultdict(list)
-    for entry in neighborhoods:
-        grouped[entry.role_signature].append(entry)
+    for item in neighborhoods:
+        grouped[item.role_signature].append(item)
     selected_role_signatures = sorted(grouped)[: int(max_roles)]
+
     emergent_role_count = 0
     stable_role_count = 0
     first_role_candidate_step: int | None = None
@@ -243,14 +232,17 @@ def derive_role_candidates(state_conn: sqlite3.Connection, graph_conn: sqlite3.C
             and role_stability_score >= 0.50
         )
         role_type = items[0].role_type
+        signature_token_set = sorted({token for item in items for token in item.signature_tokens})
+        diagnostic_token_set = sorted({token for item in items for token in item.diagnostic_tokens})
         state_conn.execute(
             """
             INSERT INTO role_candidates (
                 role_signature, role_type, support_count, linked_carrier_count, linked_family_count,
                 linked_context_count, cross_game_count, cross_context_count, first_seen_global_step,
-                last_seen_global_step, role_stability_score, is_emergent
+                last_seen_global_step, role_stability_score, is_emergent, role_signature_token_count,
+                diagnostic_token_count, exact_family_token_count, exact_identity_token_count
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 role_signature,
@@ -265,6 +257,14 @@ def derive_role_candidates(state_conn: sqlite3.Connection, graph_conn: sqlite3.C
                 last_seen,
                 role_stability_score,
                 is_emergent,
+                len(signature_token_set),
+                len(diagnostic_token_set),
+                sum(1 for token in diagnostic_token_set if token.startswith("family_cluster:")),
+                sum(
+                    1
+                    for token in signature_token_set
+                    if token.startswith(("carrier:", "context:", "game:"))
+                ),
             ),
         )
         if role_stability_score >= 0.50:
@@ -276,17 +276,7 @@ def derive_role_candidates(state_conn: sqlite3.Connection, graph_conn: sqlite3.C
             if is_emergent:
                 first_emergent_role_step = first_seen if first_emergent_role_step is None else min(first_emergent_role_step, first_seen)
         for item in items:
-            _insert_link(
-                state_conn,
-                table="role_links",
-                signature_column="role_signature",
-                signature=role_signature,
-                linked_type="carrier",
-                linked_key=item.carrier_signature,
-                support_count=1,
-                first_seen=first_seen,
-                last_seen=last_seen,
-            )
+            _insert_link(state_conn, "role_links", "role_signature", role_signature, "carrier", item.carrier_signature, 1, first_seen, last_seen)
         for family in families:
             _insert_link(state_conn, "role_links", "role_signature", role_signature, "family", family, 1, first_seen, last_seen)
         for context in contexts:
@@ -304,179 +294,175 @@ def derive_role_candidates(state_conn: sqlite3.Connection, graph_conn: sqlite3.C
     }
 
 
-def derive_role_transfer_attempts(state_conn: sqlite3.Connection, graph_conn: sqlite3.Connection, max_transfer_attempts: int) -> dict[str, Any]:
-    role_rows = state_conn.execute(
+def derive_role_transfer_attempts(
+    state_conn: sqlite3.Connection,
+    graph_conn: sqlite3.Connection,
+    max_transfer_attempts: int,
+) -> dict[str, Any]:
+    rows = state_conn.execute(
         """
         SELECT carrier_signature, role_signature, token_json, first_seen_global_step, last_seen_global_step
         FROM role_neighborhood_signatures
-        ORDER BY role_signature ASC, carrier_signature ASC
+        ORDER BY carrier_signature ASC
         """
     ).fetchall()
-    if not role_rows:
+    if not rows:
         _write_milestone(state_conn, "first_role_transfer_attempt_step", None, None)
         _write_milestone(state_conn, "first_role_transfer_success_step", None, None)
-        return {
-            "transfer_attempt_count": 0,
-            "successful_transfer_count": 0,
-            "successful_role_count": 0,
+        return _empty_transfer_summary()
+
+    carrier_contexts, carrier_games = _carrier_scope_maps(state_conn, graph_conn)
+    role_rows = {
+        str(row["carrier_signature"]): {
+            "carrier_signature": str(row["carrier_signature"]),
+            "role_signature": str(row["role_signature"]),
+            "tokens": tuple(_load_token_json(row["token_json"])),
+            "first_seen_global_step": None if row["first_seen_global_step"] is None else int(row["first_seen_global_step"]),
+            "last_seen_global_step": None if row["last_seen_global_step"] is None else int(row["last_seen_global_step"]),
         }
-    links = state_conn.execute(
-        """
-        SELECT role_signature, linked_type, linked_key
-        FROM role_links
-        ORDER BY role_signature ASC, linked_type ASC, linked_key ASC
-        """
-    ).fetchall()
-    role_scopes: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
-    for row in links:
-        if row["linked_key"] not in (None, ""):
-            role_scopes[str(row["role_signature"])][str(row["linked_type"])].add(str(row["linked_key"]))
-    carrier_to_role: dict[str, sqlite3.Row] = {str(row["carrier_signature"]): row for row in role_rows}
-    del carrier_to_role
-    carriers_by_role: dict[str, list[sqlite3.Row]] = defaultdict(list)
-    for row in role_rows:
-        carriers_by_role[str(row["role_signature"])].append(row)
-    carrier_link_rows = state_conn.execute(
-        """
-        SELECT carrier_signature, linked_type, linked_key
-        FROM carrier_links
-        ORDER BY carrier_signature ASC, linked_type ASC, linked_key ASC
-        """
-    ).fetchall()
-    carrier_contexts: dict[str, set[str]] = defaultdict(set)
-    for row in carrier_link_rows:
-        if str(row["linked_type"]) == "context" and row["linked_key"] not in (None, ""):
-            carrier_contexts[str(row["carrier_signature"])].add(str(row["linked_key"]))
-    graph_edge_rows = graph_conn.execute(
-        """
-        SELECT source_node_id, target_node_id, edge_type
-        FROM graph_edges
-        WHERE edge_type = 'observed_in'
-        ORDER BY source_node_id ASC, target_node_id ASC
-        """
-    ).fetchall()
-    context_games: dict[str, set[str]] = defaultdict(set)
-    for row in graph_edge_rows:
-        source = str(row["source_node_id"])
-        target = str(row["target_node_id"])
-        if source.startswith("game:") and target.startswith("context:"):
-            context_games[target[len("context:"):]].add(source[len("game:"):])
-    attempts: list[dict[str, Any]] = []
-    for role_signature in sorted(carriers_by_role):
-        carrier_rows = sorted(carriers_by_role[role_signature], key=lambda row: str(row["carrier_signature"]))
-        role_games = sorted(role_scopes.get(role_signature, {}).get("game", set()))
-        del role_games
-        role_contexts = sorted(role_scopes.get(role_signature, {}).get("context", set()))
-        del role_contexts
-        for carrier_row in carrier_rows:
-            target_carrier_signature = str(carrier_row["carrier_signature"])
-            target_tokens = set(_load_token_json(carrier_row["token_json"]))
-            target_context_values = sorted(carrier_contexts.get(target_carrier_signature, set()))
-            carrier_games = sorted({game for context in target_context_values for game in context_games.get(context, set())})
-            first_seen = None if carrier_row["first_seen_global_step"] is None else int(carrier_row["first_seen_global_step"])
-            last_seen = None if carrier_row["last_seen_global_step"] is None else int(carrier_row["last_seen_global_step"])
-            for target_game in carrier_games:
-                source_rows = [
-                    row for row in carrier_rows
-                    if target_game not in {game for context in carrier_contexts.get(str(row["carrier_signature"]), set()) for game in context_games.get(context, set())}
-                ]
-                source_rows = [row for row in source_rows if str(row["carrier_signature"]) != target_carrier_signature]
-                if source_rows:
-                    attempts.append(
-                        _build_transfer_attempt(
-                            role_signature=role_signature,
-                            transfer_kind="cross_game",
-                            source_scope_type="not_game",
-                            source_scope_key=target_game,
-                            target_scope_type="game",
-                            target_scope_key=target_game,
-                            target_carrier_signature=target_carrier_signature,
-                            target_tokens=target_tokens,
-                            source_rows=source_rows,
-                            observed_role_signature=role_signature,
-                            first_seen=first_seen,
-                            last_seen=last_seen,
-                        )
-                    )
-            for target_context in target_context_values:
-                source_rows = [
-                    row for row in carrier_rows
-                    if target_context not in carrier_contexts.get(str(row["carrier_signature"]), set())
-                ]
-                source_rows = [row for row in source_rows if str(row["carrier_signature"]) != target_carrier_signature]
-                if source_rows:
-                    attempts.append(
-                        _build_transfer_attempt(
-                            role_signature=role_signature,
-                            transfer_kind="cross_context",
-                            source_scope_type="not_context",
-                            source_scope_key=target_context,
-                            target_scope_type="context",
-                            target_scope_key=target_context,
-                            target_carrier_signature=target_carrier_signature,
-                            target_tokens=target_tokens,
-                            source_rows=source_rows,
-                            observed_role_signature=role_signature,
-                            first_seen=first_seen,
-                            last_seen=last_seen,
-                        )
-                    )
-    attempts = sorted(
-        attempts,
-        key=lambda item: (
-            str(item["role_signature"]),
-            str(item["target_scope_key"]),
-            str(item["target_carrier_signature"]),
-            str(item["transfer_kind"]),
-        ),
-    )[: int(max_transfer_attempts)]
+        for row in rows
+    }
+    carrier_signatures = sorted(role_rows)
+    inserted = 0
+    success_count = 0
     successful_roles: set[str] = set()
     first_attempt_step: int | None = None
     first_success_step: int | None = None
-    success_count = 0
-    for item in attempts:
-        state_conn.execute(
-            """
-            INSERT INTO role_transfer_attempts (
-                attempt_id, role_signature, transfer_kind, source_scope_type, source_scope_key,
-                target_scope_type, target_scope_key, target_carrier_signature, predicted_role_signature,
-                observed_role_signature, similarity_score, transfer_score, reuse_success, failure_reason,
-                first_seen_global_step, last_seen_global_step
+    role_mismatch_count = 0
+    low_similarity_count = 0
+    insufficient_source_support_count = 0
+    no_source_profile_count = 0
+    transfer_score_sum = 0.0
+    best_margin_sum = 0.0
+    best_margin_count = 0
+    source_carrier_count_sum = 0
+    candidate_role_count_sum = 0
+    cross_game_attempt_count = 0
+    cross_game_success_count = 0
+    cross_context_attempt_count = 0
+    cross_context_success_count = 0
+
+    for carrier_signature in carrier_signatures:
+        target = role_rows[carrier_signature]
+        scopes = [
+            ("cross_game", scope_key)
+            for scope_key in sorted(carrier_games.get(carrier_signature, set()))
+        ] + [
+            ("cross_context", scope_key)
+            for scope_key in sorted(carrier_contexts.get(carrier_signature, set()))
+        ]
+        for transfer_kind, target_scope_key in scopes:
+            if inserted >= int(max_transfer_attempts):
+                break
+            attempt = _predict_transfer_attempt(
+                state_conn=state_conn,
+                role_rows=role_rows,
+                carrier_contexts=carrier_contexts,
+                carrier_games=carrier_games,
+                target_carrier_signature=carrier_signature,
+                transfer_kind=transfer_kind,
+                target_scope_key=target_scope_key,
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                item["attempt_id"],
-                item["role_signature"],
-                item["transfer_kind"],
-                item["source_scope_type"],
-                item["source_scope_key"],
-                item["target_scope_type"],
-                item["target_scope_key"],
-                item["target_carrier_signature"],
-                item["predicted_role_signature"],
-                item["observed_role_signature"],
-                item["similarity_score"],
-                item["transfer_score"],
-                item["reuse_success"],
-                item["failure_reason"],
-                item["first_seen_global_step"],
-                item["last_seen_global_step"],
-            ),
-        )
-        if item["first_seen_global_step"] is not None:
-            first_attempt_step = item["first_seen_global_step"] if first_attempt_step is None else min(first_attempt_step, int(item["first_seen_global_step"]))
-        if int(item["reuse_success"]) == 1:
-            success_count += 1
-            successful_roles.add(str(item["role_signature"]))
-            if item["first_seen_global_step"] is not None:
-                first_success_step = item["first_seen_global_step"] if first_success_step is None else min(first_success_step, int(item["first_seen_global_step"]))
+            if attempt is None:
+                continue
+            state_conn.execute(
+                """
+                INSERT INTO role_transfer_attempts (
+                    attempt_id, role_signature, transfer_kind, source_scope_type, source_scope_key,
+                    target_scope_type, target_scope_key, target_carrier_signature, predicted_role_signature,
+                    observed_role_signature, similarity_score, transfer_score, reuse_success, failure_reason,
+                    best_margin, source_carrier_count, candidate_role_count, first_seen_global_step, last_seen_global_step
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    attempt["attempt_id"],
+                    attempt["role_signature"],
+                    attempt["transfer_kind"],
+                    attempt["source_scope_type"],
+                    attempt["source_scope_key"],
+                    attempt["target_scope_type"],
+                    attempt["target_scope_key"],
+                    attempt["target_carrier_signature"],
+                    attempt["predicted_role_signature"],
+                    attempt["observed_role_signature"],
+                    attempt["similarity_score"],
+                    attempt["transfer_score"],
+                    attempt["reuse_success"],
+                    attempt["failure_reason"],
+                    attempt["best_margin"],
+                    attempt["source_carrier_count"],
+                    attempt["candidate_role_count"],
+                    attempt["first_seen_global_step"],
+                    attempt["last_seen_global_step"],
+                ),
+            )
+            inserted += 1
+            transfer_score_sum += float(attempt["transfer_score"] or 0.0)
+            source_carrier_count_sum += int(attempt["source_carrier_count"] or 0)
+            candidate_role_count_sum += int(attempt["candidate_role_count"] or 0)
+            if attempt["best_margin"] is not None:
+                best_margin_sum += float(attempt["best_margin"])
+                best_margin_count += 1
+            if attempt["first_seen_global_step"] is not None:
+                first_attempt_step = (
+                    attempt["first_seen_global_step"]
+                    if first_attempt_step is None
+                    else min(first_attempt_step, int(attempt["first_seen_global_step"]))
+                )
+            if attempt["transfer_kind"] == "cross_game":
+                cross_game_attempt_count += 1
+            else:
+                cross_context_attempt_count += 1
+            failure_reason = str(attempt["failure_reason"])
+            if failure_reason == "role_mismatch":
+                role_mismatch_count += 1
+            elif failure_reason == "low_similarity":
+                low_similarity_count += 1
+            elif failure_reason == "insufficient_source_support":
+                insufficient_source_support_count += 1
+            elif failure_reason == "no_source_profile":
+                no_source_profile_count += 1
+            if int(attempt["reuse_success"]) == 1:
+                success_count += 1
+                successful_roles.add(str(attempt["observed_role_signature"]))
+                if attempt["transfer_kind"] == "cross_game":
+                    cross_game_success_count += 1
+                else:
+                    cross_context_success_count += 1
+                if attempt["first_seen_global_step"] is not None:
+                    first_success_step = (
+                        attempt["first_seen_global_step"]
+                        if first_success_step is None
+                        else min(first_success_step, int(attempt["first_seen_global_step"]))
+                    )
+            if inserted >= int(max_transfer_attempts):
+                break
+        if inserted >= int(max_transfer_attempts):
+            break
+
     _write_milestone(state_conn, "first_role_transfer_attempt_step", first_attempt_step, None)
     _write_milestone(state_conn, "first_role_transfer_success_step", first_success_step, None)
     return {
-        "transfer_attempt_count": len(attempts),
+        "transfer_attempt_count": inserted,
         "successful_transfer_count": success_count,
         "successful_role_count": len(successful_roles),
+        "role_mismatch_count": role_mismatch_count,
+        "low_similarity_count": low_similarity_count,
+        "insufficient_source_support_count": insufficient_source_support_count,
+        "no_source_profile_count": no_source_profile_count,
+        "cross_game_attempt_count": cross_game_attempt_count,
+        "cross_game_success_count": cross_game_success_count,
+        "cross_context_attempt_count": cross_context_attempt_count,
+        "cross_context_success_count": cross_context_success_count,
+        "mean_transfer_score": (transfer_score_sum / inserted) if inserted else None,
+        "max_transfer_score": _safe_scalar_float(
+            state_conn,
+            "SELECT MAX(COALESCE(transfer_score, 0.0)) FROM role_transfer_attempts",
+        ),
+        "mean_best_margin": (best_margin_sum / best_margin_count) if best_margin_count else None,
+        "mean_source_carrier_count": (source_carrier_count_sum / inserted) if inserted else None,
+        "candidate_role_count_mean": (candidate_role_count_sum / inserted) if inserted else None,
     }
 
 
@@ -494,31 +480,43 @@ def derive_concept_candidates(state_conn: sqlite3.Connection) -> dict[str, Any]:
     if not role_rows:
         _write_milestone(state_conn, "first_concept_candidate_step", None, None)
         _write_milestone(state_conn, "first_promoted_concept_step", None, None)
-        return {"concept_candidate_count": 0, "promoted_concept_count": 0}
-    role_link_rows = state_conn.execute(
-        "SELECT role_signature, linked_type, linked_key FROM role_links ORDER BY role_signature ASC, linked_type ASC, linked_key ASC"
-    ).fetchall()
-    role_links: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
-    for row in role_link_rows:
-        if row["linked_key"] not in (None, ""):
-            role_links[str(row["role_signature"])][str(row["linked_type"])].add(str(row["linked_key"]))
+        return {
+            "concept_candidate_count": 0,
+            "promoted_concept_count": 0,
+            "concept_strong_transfer_success_count": 0,
+        }
+    role_links = _links_by_signature(state_conn, "role_links", "role_signature")
     neighborhood_rows = state_conn.execute(
-        "SELECT role_signature, token_json FROM role_neighborhood_signatures ORDER BY role_signature ASC, carrier_signature ASC"
+        """
+        SELECT role_signature, token_json
+        FROM role_neighborhood_signatures
+        ORDER BY role_signature ASC, carrier_signature ASC
+        """
     ).fetchall()
     tokens_by_role: dict[str, set[str]] = defaultdict(set)
     for row in neighborhood_rows:
         tokens_by_role[str(row["role_signature"])].update(_load_token_json(row["token_json"]))
     transfer_rows = state_conn.execute(
         """
-        SELECT role_signature, reuse_success
+        SELECT role_signature, reuse_success, similarity_score, best_margin, source_carrier_count, candidate_role_count
         FROM role_transfer_attempts
         ORDER BY role_signature ASC, attempt_id ASC
         """
     ).fetchall()
     success_by_role: dict[str, int] = defaultdict(int)
+    strong_success_by_role: dict[str, int] = defaultdict(int)
     for row in transfer_rows:
+        role_signature = str(row["role_signature"])
         if int(row["reuse_success"] or 0) == 1:
-            success_by_role[str(row["role_signature"])] += 1
+            success_by_role[role_signature] += 1
+            if (
+                int(row["source_carrier_count"] or 0) >= 2
+                and int(row["candidate_role_count"] or 0) >= 2
+                and float(row["similarity_score"] or 0.0) >= 0.60
+                and float(row["best_margin"] or 0.0) >= 0.10
+            ):
+                strong_success_by_role[role_signature] += 1
+
     concept_groups: dict[str, dict[str, Any]] = {}
     for row in role_rows:
         role_signature = str(row["role_signature"])
@@ -539,6 +537,7 @@ def derive_concept_candidates(state_conn: sqlite3.Connection) -> dict[str, Any]:
                 "games": set(),
                 "support_count": 0,
                 "transfer_success_count": 0,
+                "strong_transfer_success_count": 0,
                 "first_seen": None,
                 "last_seen": None,
             },
@@ -550,13 +549,18 @@ def derive_concept_candidates(state_conn: sqlite3.Connection) -> dict[str, Any]:
         group["games"].update(links.get("game", set()))
         group["support_count"] += int(row["support_count"] or 0)
         group["transfer_success_count"] += int(success_by_role.get(role_signature, 0))
+        group["strong_transfer_success_count"] += int(strong_success_by_role.get(role_signature, 0))
         first_seen = None if row["first_seen_global_step"] is None else int(row["first_seen_global_step"])
         last_seen = None if row["last_seen_global_step"] is None else int(row["last_seen_global_step"])
-        group["first_seen"] = first_seen if group["first_seen"] is None else min(group["first_seen"], first_seen or group["first_seen"])
-        group["last_seen"] = last_seen if group["last_seen"] is None else max(group["last_seen"], last_seen or group["last_seen"])
+        if first_seen is not None:
+            group["first_seen"] = first_seen if group["first_seen"] is None else min(group["first_seen"], first_seen)
+        if last_seen is not None:
+            group["last_seen"] = last_seen if group["last_seen"] is None else max(group["last_seen"], last_seen)
+
     promoted_concepts = 0
     first_concept_candidate_step: int | None = None
     first_promoted_concept_step: int | None = None
+    strong_transfer_total = 0
     for concept_signature in sorted(concept_groups):
         group = concept_groups[concept_signature]
         linked_role_count = len(group["roles"])
@@ -565,17 +569,19 @@ def derive_concept_candidates(state_conn: sqlite3.Connection) -> dict[str, Any]:
         cross_context_count = len(group["contexts"])
         cross_game_count = len(group["games"])
         transfer_success_count = int(group["transfer_success_count"])
+        strong_transfer_success_count = int(group["strong_transfer_success_count"])
+        strong_transfer_total += strong_transfer_success_count
         compression_gain = float(linked_carrier_count / max(1, linked_role_count))
-        explanatory_reach = float(linked_family_count + cross_context_count + (2 * cross_game_count) + transfer_success_count)
+        explanatory_reach = float(linked_family_count + cross_context_count + (2 * cross_game_count) + strong_transfer_success_count)
         promotion_score = (
             0.25 * min(1.0, compression_gain / 2.0)
-            + 0.30 * min(1.0, transfer_success_count / 3.0)
+            + 0.30 * min(1.0, strong_transfer_success_count / 3.0)
             + 0.20 * min(1.0, cross_context_count / 3.0)
             + 0.15 * min(1.0, cross_game_count / 2.0)
             + 0.10 * min(1.0, linked_family_count / 3.0)
         )
         is_promoted = int(
-            transfer_success_count >= 2
+            strong_transfer_success_count >= 2
             and compression_gain >= 1.50
             and (cross_context_count >= 2 or cross_game_count >= 1)
             and promotion_score >= 0.55
@@ -592,11 +598,11 @@ def derive_concept_candidates(state_conn: sqlite3.Connection) -> dict[str, Any]:
             """
             INSERT INTO concept_candidates (
                 concept_signature, concept_type, support_count, linked_role_count, linked_carrier_count,
-                linked_family_count, transfer_success_count, cross_game_count, cross_context_count,
-                compression_gain, explanatory_reach, promotion_score, first_seen_global_step,
-                last_seen_global_step, is_promoted
+                linked_family_count, transfer_success_count, strong_transfer_success_count, cross_game_count,
+                cross_context_count, compression_gain, explanatory_reach, promotion_score,
+                first_seen_global_step, last_seen_global_step, is_promoted
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 concept_signature,
@@ -606,6 +612,7 @@ def derive_concept_candidates(state_conn: sqlite3.Connection) -> dict[str, Any]:
                 linked_carrier_count,
                 linked_family_count,
                 transfer_success_count,
+                strong_transfer_success_count,
                 cross_game_count,
                 cross_context_count,
                 compression_gain,
@@ -631,11 +638,12 @@ def derive_concept_candidates(state_conn: sqlite3.Connection) -> dict[str, Any]:
     return {
         "concept_candidate_count": len(concept_groups),
         "promoted_concept_count": promoted_concepts,
+        "concept_strong_transfer_success_count": strong_transfer_total,
     }
 
 
 def derive_world_model_components(state_conn: sqlite3.Connection, graph_conn: sqlite3.Connection) -> dict[str, Any]:
-    promoted_rows = state_conn.execute(
+    concept_rows = [dict(row) for row in state_conn.execute(
         """
         SELECT concept_signature, concept_type, linked_role_count, linked_carrier_count, linked_family_count,
                cross_context_count, cross_game_count, promotion_score, first_seen_global_step, last_seen_global_step,
@@ -643,41 +651,45 @@ def derive_world_model_components(state_conn: sqlite3.Connection, graph_conn: sq
         FROM concept_candidates
         ORDER BY COALESCE(is_promoted, 0) DESC, COALESCE(promotion_score, 0.0) DESC, concept_signature ASC
         """
-    ).fetchall()
-    if not promoted_rows:
+    ).fetchall()]
+    if not concept_rows:
         _write_milestone(state_conn, "first_world_model_component_step", None, None)
         _write_milestone(state_conn, "first_coherent_world_model_step", None, None)
-        return {"world_model_component_count": 0, "coherent_world_model_component_count": 0}
-    concept_link_rows = state_conn.execute(
-        "SELECT concept_signature, linked_type, linked_key FROM concept_links ORDER BY concept_signature ASC, linked_type ASC, linked_key ASC"
-    ).fetchall()
-    concept_links: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
-    for row in concept_link_rows:
-        if row["linked_key"] not in (None, ""):
-            concept_links[str(row["concept_signature"])][str(row["linked_type"])].add(str(row["linked_key"]))
-    role_link_rows = state_conn.execute(
-        "SELECT role_signature, linked_type, linked_key FROM role_links ORDER BY role_signature ASC, linked_type ASC, linked_key ASC"
-    ).fetchall()
-    role_links: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
-    for row in role_link_rows:
-        if row["linked_key"] not in (None, ""):
-            role_links[str(row["role_signature"])][str(row["linked_type"])].add(str(row["linked_key"]))
+        return {
+            "world_model_component_count": 0,
+            "coherent_world_model_component_count": 0,
+            "candidate_only_world_model_component_count": 0,
+        }
+    concept_links = _links_by_signature(state_conn, "concept_links", "concept_signature")
+    role_links = _links_by_signature(state_conn, "role_links", "role_signature")
     successful_transfer_by_role: dict[str, int] = defaultdict(int)
-    for row in state_conn.execute("SELECT role_signature, reuse_success FROM role_transfer_attempts ORDER BY role_signature ASC, attempt_id ASC").fetchall():
-        if int(row["reuse_success"] or 0) == 1:
+    for row in state_conn.execute(
+        """
+        SELECT role_signature, reuse_success, source_carrier_count, candidate_role_count, similarity_score, best_margin
+        FROM role_transfer_attempts
+        ORDER BY role_signature ASC, attempt_id ASC
+        """
+    ).fetchall():
+        if (
+            int(row["reuse_success"] or 0) == 1
+            and int(row["source_carrier_count"] or 0) >= 2
+            and int(row["candidate_role_count"] or 0) >= 2
+            and float(row["similarity_score"] or 0.0) >= 0.60
+            and float(row["best_margin"] or 0.0) >= 0.10
+        ):
             successful_transfer_by_role[str(row["role_signature"])] += 1
-    graph_edge_rows = graph_conn.execute(
-        "SELECT source_node_id, target_node_id, edge_type FROM graph_edges ORDER BY source_node_id ASC, edge_type ASC, target_node_id ASC"
-    ).fetchall()
-    contradiction_rows = state_conn.execute("SELECT canonical_key FROM contradiction_clusters ORDER BY canonical_key ASC").fetchall()
-    contradiction_keys = {str(row["canonical_key"]) for row in contradiction_rows}
-    concept_rows = [dict(row) for row in promoted_rows if int(row["is_promoted"] or 0) == 1]
-    if not concept_rows:
-        concept_rows = [dict(row) for row in promoted_rows[:20]]
+
+    contradiction_keys = {
+        str(row["canonical_key"])
+        for row in state_conn.execute("SELECT canonical_key FROM contradiction_clusters ORDER BY canonical_key ASC").fetchall()
+    }
+    promoted_rows = [row for row in concept_rows if int(row.get("is_promoted", 0) or 0) == 1]
+    candidate_rows = promoted_rows if promoted_rows else concept_rows[:20]
     coherent_count = 0
+    candidate_only_count = 0
     first_component_step: int | None = None
     first_coherent_step: int | None = None
-    for row in concept_rows:
+    for row in candidate_rows:
         concept_signature = str(row["concept_signature"])
         links = concept_links.get(concept_signature, {})
         roles = sorted(links.get("role", set()))
@@ -685,31 +697,30 @@ def derive_world_model_components(state_conn: sqlite3.Connection, graph_conn: sq
         families = sorted(links.get("family", set()))
         contexts = sorted(links.get("context", set()))
         games = sorted(links.get("game", set()))
-        nodes = {f"concept:{concept_signature}"}
-        nodes.update(f"role:{role}" for role in roles)
-        nodes.update(f"carrier:{carrier}" for carrier in carriers)
-        nodes.update(f"family:{family}" for family in families)
-        nodes.update(f"context:{context}" for context in contexts)
-        nodes.update(f"game:{game}" for game in games)
+        node_ids = {f"concept:{concept_signature}"}
+        node_ids.update(f"role:{role}" for role in roles)
+        node_ids.update(f"carrier:{carrier}" for carrier in carriers)
+        node_ids.update(f"family:{family}" for family in families)
+        node_ids.update(f"context:{context}" for context in contexts)
+        node_ids.update(f"game:{game}" for game in games)
+        edge_rows = _fetch_edges_for_nodes(graph_conn, node_ids)
         graph_edge_count = sum(
             1
-            for edge in graph_edge_rows
-            if str(edge["source_node_id"]) in nodes or str(edge["target_node_id"]) in nodes
+            for edge in edge_rows
+            if str(edge["source_node_id"]) in node_ids or str(edge["target_node_id"]) in node_ids
         )
         implicit_edge_count = len(roles) + len(carriers) + len(families) + len(contexts) + len(games)
         prediction_support_count = len(families) + sum(successful_transfer_by_role.get(role, 0) for role in roles)
         contradiction_coverage_count = 0
         family_nodes = {f"family:{family}" for family in families}
-        for edge in graph_edge_rows:
+        for edge in edge_rows:
             source = str(edge["source_node_id"])
             target = str(edge["target_node_id"])
-            if source in family_nodes and target.startswith("contradiction:"):
-                if target[len("contradiction:"):] in contradiction_keys:
-                    contradiction_coverage_count += 1
-            elif target in family_nodes and source.startswith("contradiction:"):
-                if source[len("contradiction:"):] in contradiction_keys:
-                    contradiction_coverage_count += 1
-        node_count = len(nodes)
+            if source in family_nodes and target.startswith("contradiction:") and target[len("contradiction:"):] in contradiction_keys:
+                contradiction_coverage_count += 1
+            elif target in family_nodes and source.startswith("contradiction:") and source[len("contradiction:"):] in contradiction_keys:
+                contradiction_coverage_count += 1
+        node_count = len(node_ids)
         edge_count = graph_edge_count + implicit_edge_count
         linked_role_count = len(roles)
         linked_family_count = len(families)
@@ -726,14 +737,17 @@ def derive_world_model_components(state_conn: sqlite3.Connection, graph_conn: sq
             + 0.15 * min(1.0, cross_context_count / 3.0)
             + 0.15 * min(1.0, cross_game_count / 2.0)
         )
+        is_promoted = int(row.get("is_promoted", 0) or 0) == 1
+        candidate_only = 0 if is_promoted else 1
         is_coherent = int(
-            len({concept_signature}) >= 1
+            is_promoted
             and linked_role_count >= 1
             and linked_family_count >= 2
             and linked_carrier_count >= 2
             and coherence_score >= 0.45
-            and int(row.get("is_promoted", 0) or 0) == 1
         )
+        if candidate_only:
+            candidate_only_count += 1
         if is_coherent:
             coherent_count += 1
         first_seen = None if row["first_seen_global_step"] is None else int(row["first_seen_global_step"])
@@ -743,16 +757,16 @@ def derive_world_model_components(state_conn: sqlite3.Connection, graph_conn: sq
             if is_coherent:
                 first_coherent_step = first_seen if first_coherent_step is None else min(first_coherent_step, first_seen)
         component_signature = f"wm:{sha1(concept_signature.encode('utf-8')).hexdigest()[:20]}"
-        component_type = "promoted_concept_component" if int(row.get("is_promoted", 0) or 0) == 1 else "candidate_concept_component"
+        component_type = "promoted_concept_component" if is_promoted else "candidate_concept_component"
         state_conn.execute(
             """
             INSERT INTO world_model_components (
                 component_signature, component_type, node_count, edge_count, linked_concept_count,
                 linked_role_count, linked_family_count, linked_carrier_count, cross_context_count,
                 cross_game_count, explanatory_coverage, prediction_support_count, contradiction_coverage_count,
-                coherence_score, first_seen_global_step, last_seen_global_step, is_coherent
+                coherence_score, candidate_only, first_seen_global_step, last_seen_global_step, is_coherent
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 component_signature,
@@ -769,6 +783,7 @@ def derive_world_model_components(state_conn: sqlite3.Connection, graph_conn: sq
                 prediction_support_count,
                 contradiction_coverage_count,
                 coherence_score,
+                candidate_only,
                 first_seen,
                 last_seen,
                 is_coherent,
@@ -777,6 +792,8 @@ def derive_world_model_components(state_conn: sqlite3.Connection, graph_conn: sq
         _insert_link(state_conn, "world_model_links", "component_signature", component_signature, "concept", concept_signature, 1, first_seen, last_seen)
         for role in roles:
             _insert_link(state_conn, "world_model_links", "component_signature", component_signature, "role", role, 1, first_seen, last_seen)
+            for carrier in sorted(role_links.get(role, {}).get("carrier", set())):
+                _insert_link(state_conn, "world_model_links", "component_signature", component_signature, "carrier", carrier, 1, first_seen, last_seen)
         for carrier in carriers:
             _insert_link(state_conn, "world_model_links", "component_signature", component_signature, "carrier", carrier, 1, first_seen, last_seen)
         for family in families:
@@ -785,11 +802,13 @@ def derive_world_model_components(state_conn: sqlite3.Connection, graph_conn: sq
             _insert_link(state_conn, "world_model_links", "component_signature", component_signature, "context", context, 1, first_seen, last_seen)
         for game in games:
             _insert_link(state_conn, "world_model_links", "component_signature", component_signature, "game", game, 1, first_seen, last_seen)
+
     _write_milestone(state_conn, "first_world_model_component_step", first_component_step, None)
     _write_milestone(state_conn, "first_coherent_world_model_step", first_coherent_step, None)
     return {
-        "world_model_component_count": len(concept_rows),
+        "world_model_component_count": len(candidate_rows),
         "coherent_world_model_component_count": coherent_count,
+        "candidate_only_world_model_component_count": candidate_only_count,
     }
 
 
@@ -802,22 +821,23 @@ def _build_role_tokens(
     in_edges: list[sqlite3.Row],
     graph_nodes: dict[str, str],
     family_meta: dict[str, dict[str, Any]],
-) -> set[str]:
-    tokens: set[str] = set()
-    tokens.add(f"family_count:{_bucket(len(families))}")
-    tokens.add(f"context_count:{_bucket(len(contexts))}")
-    tokens.add(f"game_count:{_bucket(len(games))}")
+) -> tuple[list[str], list[str]]:
+    signature_tokens: set[str] = set()
+    diagnostic_tokens: set[str] = set()
+    signature_tokens.add(f"family_count:{_bucket(len(families))}")
+    signature_tokens.add(f"context_count:{_bucket(len(contexts))}")
+    signature_tokens.add(f"game_count:{_bucket(len(games))}")
     motifs: set[str] = set()
     for family_signature in families:
         meta = family_meta.get(family_signature, {})
         effect_type = str(meta.get("effect_type") or "unknown")
         action_group = str(meta.get("action_group") or "unknown")
         polarity = str(meta.get("polarity") or "unknown")
-        tokens.add(f"fam_effect:{effect_type}")
-        tokens.add(f"fam_action:{action_group}")
-        tokens.add(f"fam_polarity:{polarity}")
+        signature_tokens.add(f"fam_effect:{effect_type}")
+        signature_tokens.add(f"fam_action:{action_group}")
+        signature_tokens.add(f"fam_polarity:{polarity}")
         if effect_type in {"unknown", "", "None"} or action_group in {"unknown", "", "None"} or polarity in {"unknown", "", "None"}:
-            tokens.add(f"family_cluster:{sha1(family_signature.encode('utf-8')).hexdigest()[:8]}")
+            diagnostic_tokens.add(f"family_cluster:{sha1(family_signature.encode('utf-8')).hexdigest()[:8]}")
         motifs.update(_motifs_for_text(" ".join([effect_type, action_group, polarity, family_signature]).lower()))
     out_type_counts: dict[str, int] = defaultdict(int)
     in_type_counts: dict[str, int] = defaultdict(int)
@@ -826,26 +846,245 @@ def _build_role_tokens(
     for row in out_edges:
         edge_type = str(row["edge_type"] or "related_to")
         out_type_counts[edge_type] += 1
-        target_type = graph_nodes.get(str(row["target_node_id"]), "unknown")
-        out_neighbor_types[target_type] += 1
+        out_neighbor_types[graph_nodes.get(str(row["target_node_id"]), "unknown")] += 1
     for row in in_edges:
         edge_type = str(row["edge_type"] or "related_to")
         in_type_counts[edge_type] += 1
-        source_type = graph_nodes.get(str(row["source_node_id"]), "unknown")
-        in_neighbor_types[source_type] += 1
+        in_neighbor_types[graph_nodes.get(str(row["source_node_id"]), "unknown")] += 1
     for edge_type, count in sorted(out_type_counts.items()):
-        tokens.add(f"edge_out:{edge_type}:{_bucket(count)}")
+        signature_tokens.add(f"edge_out:{edge_type}:{_bucket(count)}")
     for edge_type, count in sorted(in_type_counts.items()):
-        tokens.add(f"edge_in:{edge_type}:{_bucket(count)}")
+        signature_tokens.add(f"edge_in:{edge_type}:{_bucket(count)}")
     for node_type, count in sorted(out_neighbor_types.items()):
-        tokens.add(f"neighbor_out_type:{node_type}:{_bucket(count)}")
+        signature_tokens.add(f"neighbor_out_type:{node_type}:{_bucket(count)}")
     for node_type, count in sorted(in_neighbor_types.items()):
-        tokens.add(f"neighbor_in_type:{node_type}:{_bucket(count)}")
+        signature_tokens.add(f"neighbor_in_type:{node_type}:{_bucket(count)}")
     if not motifs:
         motifs.add("unknown")
     for motif in sorted(motifs):
-        tokens.add(f"future_motif:{motif}")
-    return tokens
+        signature_tokens.add(f"future_motif:{motif}")
+    return sorted(signature_tokens), sorted(diagnostic_tokens)
+
+
+def _predict_transfer_attempt(
+    *,
+    state_conn: sqlite3.Connection,
+    role_rows: dict[str, dict[str, Any]],
+    carrier_contexts: dict[str, set[str]],
+    carrier_games: dict[str, set[str]],
+    target_carrier_signature: str,
+    transfer_kind: str,
+    target_scope_key: str,
+) -> dict[str, Any] | None:
+    target = role_rows[target_carrier_signature]
+    target_tokens = set(target["tokens"])
+    excluded_scope = target_scope_key
+    grouped_sources: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for candidate_signature, candidate in role_rows.items():
+        if candidate_signature == target_carrier_signature:
+            continue
+        candidate_scopes = carrier_games.get(candidate_signature, set()) if transfer_kind == "cross_game" else carrier_contexts.get(candidate_signature, set())
+        if excluded_scope in candidate_scopes:
+            continue
+        grouped_sources[str(candidate["role_signature"])].append(candidate)
+    ordered_profiles: list[dict[str, Any]] = []
+    for role_signature in sorted(grouped_sources):
+        source_candidates = sorted(grouped_sources[role_signature], key=lambda item: str(item["carrier_signature"]))
+        profile_tokens = sorted({token for candidate in source_candidates for token in candidate["tokens"]})
+        source_context_count = len({context for candidate in source_candidates for context in carrier_contexts.get(str(candidate["carrier_signature"]), set())})
+        source_game_count = len({game for candidate in source_candidates for game in carrier_games.get(str(candidate["carrier_signature"]), set())})
+        similarity_score = _jaccard(set(profile_tokens), target_tokens)
+        ordered_profiles.append(
+            {
+                "role_signature": role_signature,
+                "tokens": profile_tokens,
+                "similarity_score": similarity_score,
+                "source_carrier_count": len(source_candidates),
+                "source_context_count": source_context_count,
+                "source_game_count": source_game_count,
+            }
+        )
+    if not ordered_profiles:
+        return None
+    ordered_profiles.sort(
+        key=lambda item: (
+            -float(item["similarity_score"]),
+            -int(item["source_carrier_count"]),
+            str(item["role_signature"]),
+        )
+    )
+    best = ordered_profiles[0]
+    second = ordered_profiles[1] if len(ordered_profiles) > 1 else None
+    best_margin = None if second is None else float(best["similarity_score"]) - float(second["similarity_score"])
+    predicted_role_signature = str(best["role_signature"])
+    observed_role_signature = str(target["role_signature"])
+    source_carrier_count = int(best["source_carrier_count"])
+    candidate_role_count = len(ordered_profiles)
+    similarity_score = float(best["similarity_score"])
+    reuse_success = int(
+        predicted_role_signature == observed_role_signature
+        and similarity_score >= 0.60
+        and source_carrier_count >= 2
+    )
+    if reuse_success:
+        failure_reason = "success"
+    elif source_carrier_count < 2:
+        failure_reason = "insufficient_source_support"
+    elif similarity_score < 0.60:
+        failure_reason = "low_similarity"
+    elif predicted_role_signature != observed_role_signature:
+        failure_reason = "role_mismatch"
+    else:
+        failure_reason = "no_source_profile"
+    source_scope_type = "not_game" if transfer_kind == "cross_game" else "not_context"
+    target_scope_type = "game" if transfer_kind == "cross_game" else "context"
+    transfer_score = similarity_score * min(1.0, source_carrier_count / 2.0)
+    attempt_seed = "|".join((transfer_kind, target_scope_key, target_carrier_signature))
+    return {
+        "attempt_id": sha1(attempt_seed.encode("utf-8")).hexdigest(),
+        "role_signature": observed_role_signature,
+        "transfer_kind": transfer_kind,
+        "source_scope_type": source_scope_type,
+        "source_scope_key": target_scope_key,
+        "target_scope_type": target_scope_type,
+        "target_scope_key": target_scope_key,
+        "target_carrier_signature": target_carrier_signature,
+        "predicted_role_signature": predicted_role_signature,
+        "observed_role_signature": observed_role_signature,
+        "similarity_score": similarity_score,
+        "transfer_score": transfer_score,
+        "reuse_success": reuse_success,
+        "failure_reason": failure_reason,
+        "best_margin": best_margin,
+        "source_carrier_count": source_carrier_count,
+        "candidate_role_count": candidate_role_count,
+        "first_seen_global_step": target["first_seen_global_step"],
+        "last_seen_global_step": target["last_seen_global_step"],
+    }
+
+
+def _carrier_links_by_carrier(state_conn: sqlite3.Connection) -> dict[str, dict[str, set[str]]]:
+    links: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
+    for row in state_conn.execute(
+        """
+        SELECT carrier_signature, linked_type, linked_key
+        FROM carrier_links
+        ORDER BY carrier_signature ASC, linked_type ASC, linked_key ASC
+        """
+    ).fetchall():
+        if row["linked_key"] not in (None, ""):
+            links[str(row["carrier_signature"])][str(row["linked_type"])].add(str(row["linked_key"]))
+    return links
+
+
+def _carrier_scope_maps(
+    state_conn: sqlite3.Connection,
+    graph_conn: sqlite3.Connection,
+) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+    links_by_carrier = _carrier_links_by_carrier(state_conn)
+    carrier_contexts = {carrier: set(link_types.get("context", set())) for carrier, link_types in links_by_carrier.items()}
+    carrier_games: dict[str, set[str]] = defaultdict(set)
+    context_node_ids = {f"context:{context}" for contexts in carrier_contexts.values() for context in contexts}
+    context_games = _context_games_for_context_nodes(graph_conn, context_node_ids)
+    for carrier_signature, contexts in carrier_contexts.items():
+        for context in contexts:
+            carrier_games[carrier_signature].update(context_games.get(f"context:{context}", set()))
+    return carrier_contexts, carrier_games
+
+
+def _links_by_signature(
+    state_conn: sqlite3.Connection,
+    table: str,
+    signature_column: str,
+) -> dict[str, dict[str, set[str]]]:
+    results: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
+    for row in state_conn.execute(
+        f"""
+        SELECT {signature_column} AS signature_value, linked_type, linked_key
+        FROM {table}
+        ORDER BY {signature_column} ASC, linked_type ASC, linked_key ASC
+        """
+    ).fetchall():
+        if row["linked_key"] not in (None, ""):
+            results[str(row["signature_value"])][str(row["linked_type"])].add(str(row["linked_key"]))
+    return results
+
+
+def _fetch_edges_for_nodes(graph_conn: sqlite3.Connection, node_ids: set[str], batch_size: int = 500) -> list[sqlite3.Row]:
+    if not node_ids:
+        return []
+    ordered = sorted(node_ids)
+    rows: list[sqlite3.Row] = []
+    for start in range(0, len(ordered), batch_size):
+        batch = ordered[start : start + batch_size]
+        placeholders = ",".join("?" for _ in batch)
+        rows.extend(
+            graph_conn.execute(
+                f"""
+                SELECT source_node_id, target_node_id, edge_type
+                FROM graph_edges
+                WHERE source_node_id IN ({placeholders})
+                   OR target_node_id IN ({placeholders})
+                ORDER BY source_node_id ASC, edge_type ASC, target_node_id ASC
+                """,
+                tuple(batch) + tuple(batch),
+            ).fetchall()
+        )
+    seen: set[tuple[str, str, str]] = set()
+    deduped: list[sqlite3.Row] = []
+    for row in rows:
+        key = (str(row["source_node_id"]), str(row["target_node_id"]), str(row["edge_type"]))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(row)
+    return deduped
+
+
+def _graph_nodes_for_ids(graph_conn: sqlite3.Connection, node_ids: set[str]) -> dict[str, str]:
+    if not node_ids:
+        return {}
+    ordered = sorted(node_ids)
+    results: dict[str, str] = {}
+    for start in range(0, len(ordered), 500):
+        batch = ordered[start : start + 500]
+        placeholders = ",".join("?" for _ in batch)
+        for row in graph_conn.execute(
+            f"""
+            SELECT node_id, node_type
+            FROM graph_nodes
+            WHERE node_id IN ({placeholders})
+            ORDER BY node_id ASC
+            """,
+            tuple(batch),
+        ).fetchall():
+            results[str(row["node_id"])] = str(row["node_type"] or "unknown")
+    return results
+
+
+def _context_games_for_context_nodes(graph_conn: sqlite3.Connection, context_node_ids: set[str]) -> dict[str, set[str]]:
+    context_games: dict[str, set[str]] = defaultdict(set)
+    if not context_node_ids:
+        return context_games
+    ordered = sorted(context_node_ids)
+    for start in range(0, len(ordered), 500):
+        batch = ordered[start : start + 500]
+        placeholders = ",".join("?" for _ in batch)
+        for row in graph_conn.execute(
+            f"""
+            SELECT source_node_id, target_node_id
+            FROM graph_edges
+            WHERE edge_type = 'observed_in'
+              AND target_node_id IN ({placeholders})
+            ORDER BY source_node_id ASC, target_node_id ASC
+            """,
+            tuple(batch),
+        ).fetchall():
+            source = str(row["source_node_id"])
+            target = str(row["target_node_id"])
+            if source.startswith("game:") and target.startswith("context:"):
+                context_games[target].add(source[len("game:"):])
+    return context_games
 
 
 def _motifs_for_text(text: str) -> set[str]:
@@ -856,8 +1095,7 @@ def _motifs_for_text(text: str) -> set[str]:
         "reversible": ("reverse", "restore", "toggle", "swap", "move_back", "undo"),
         "transform": ("transform", "recolor", "change", "convert", "shift"),
     }
-    motifs = {label for label, keywords in motif_map.items() if any(keyword in text for keyword in keywords)}
-    return motifs
+    return {label for label, keywords in motif_map.items() if any(keyword in text for keyword in keywords)}
 
 
 def _bucket(value: int) -> str:
@@ -897,60 +1135,10 @@ def _role_type(tokens: list[str], linked_family_count: int, linked_context_count
     return "contextual_anchor"
 
 
-def _build_transfer_attempt(
-    *,
-    role_signature: str,
-    transfer_kind: str,
-    source_scope_type: str,
-    source_scope_key: str,
-    target_scope_type: str,
-    target_scope_key: str,
-    target_carrier_signature: str,
-    target_tokens: set[str],
-    source_rows: list[sqlite3.Row],
-    observed_role_signature: str,
-    first_seen: int | None,
-    last_seen: int | None,
-) -> dict[str, Any]:
-    source_tokens = sorted({token for row in source_rows for token in _load_token_json(row["token_json"])})
-    similarity_score = _jaccard(set(source_tokens), target_tokens)
-    source_carrier_count = len(source_rows)
-    reuse_success = int(similarity_score >= 0.60 and role_signature == observed_role_signature)
-    transfer_score = similarity_score * min(1.0, source_carrier_count / 2.0)
-    failure_reason = "success" if reuse_success else ("low_similarity" if similarity_score < 0.60 else "role_mismatch")
-    attempt_seed = "|".join(
-        (
-            transfer_kind,
-            role_signature,
-            source_scope_key,
-            target_scope_key,
-            target_carrier_signature,
-        )
-    )
-    return {
-        "attempt_id": sha1(attempt_seed.encode("utf-8")).hexdigest(),
-        "role_signature": role_signature,
-        "transfer_kind": transfer_kind,
-        "source_scope_type": source_scope_type,
-        "source_scope_key": source_scope_key,
-        "target_scope_type": target_scope_type,
-        "target_scope_key": target_scope_key,
-        "target_carrier_signature": target_carrier_signature,
-        "predicted_role_signature": role_signature,
-        "observed_role_signature": observed_role_signature,
-        "similarity_score": similarity_score,
-        "transfer_score": transfer_score,
-        "reuse_success": reuse_success,
-        "failure_reason": failure_reason,
-        "first_seen_global_step": first_seen,
-        "last_seen_global_step": last_seen,
-    }
-
-
 def _concept_tokens(role_type: str, tokens: list[str]) -> list[str]:
     concept_tokens = {f"concept_type:{role_type}"}
     for token in tokens:
-        if token.startswith("future_motif:") or token.startswith("fam_effect:") or token.startswith("fam_action:"):
+        if token.startswith(("future_motif:", "fam_effect:", "fam_action:")):
             concept_tokens.add(token)
         elif token.startswith("edge_out:"):
             concept_tokens.add(":".join(token.split(":")[:2]))
@@ -982,43 +1170,81 @@ def _insert_link(
             {signature_column}, linked_type, linked_key, support_count, first_seen_global_step, last_seen_global_step
         )
         VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT({signature_column}, linked_type, linked_key) DO UPDATE SET
-            support_count = {table}.support_count + excluded.support_count,
-            first_seen_global_step = MIN({table}.first_seen_global_step, excluded.first_seen_global_step),
-            last_seen_global_step = MAX({table}.last_seen_global_step, excluded.last_seen_global_step)
+        ON CONFLICT({signature_column}, linked_type, linked_key)
+        DO UPDATE SET
+            support_count = COALESCE({table}.support_count, 0) + excluded.support_count,
+            first_seen_global_step = CASE
+                WHEN {table}.first_seen_global_step IS NULL THEN excluded.first_seen_global_step
+                WHEN excluded.first_seen_global_step IS NULL THEN {table}.first_seen_global_step
+                ELSE MIN({table}.first_seen_global_step, excluded.first_seen_global_step)
+            END,
+            last_seen_global_step = CASE
+                WHEN {table}.last_seen_global_step IS NULL THEN excluded.last_seen_global_step
+                WHEN excluded.last_seen_global_step IS NULL THEN {table}.last_seen_global_step
+                ELSE MAX({table}.last_seen_global_step, excluded.last_seen_global_step)
+            END
         """,
-        (signature, linked_type, linked_key, int(support_count), first_seen, last_seen),
+        (signature, linked_type, linked_key, support_count, first_seen, last_seen),
     )
 
 
-def _write_milestone(connection: sqlite3.Connection, milestone_name: str, first_global_step: int | None, evidence_key: str | None) -> None:
+def _write_milestone(connection: sqlite3.Connection, name: str, first_global_step: int | None, evidence_key: str | None) -> None:
     connection.execute(
         """
         INSERT INTO higher_order_milestones (milestone_name, first_global_step, evidence_key)
         VALUES (?, ?, ?)
+        ON CONFLICT(milestone_name)
+        DO UPDATE SET first_global_step = excluded.first_global_step, evidence_key = excluded.evidence_key
         """,
-        (milestone_name, first_global_step, evidence_key),
+        (name, first_global_step, evidence_key),
     )
 
 
 def _load_token_json(value: Any) -> list[str]:
     if value in (None, ""):
         return []
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         return [str(item) for item in value]
     try:
-        loaded = json.loads(str(value))
+        parsed = json.loads(str(value))
     except json.JSONDecodeError:
-        return []
-    if not isinstance(loaded, list):
-        return []
-    return [str(item) for item in loaded]
+        return [str(value)]
+    if isinstance(parsed, list):
+        return [str(item) for item in parsed]
+    return [str(parsed)]
 
 
 def _jaccard(left: set[str], right: set[str]) -> float:
     if not left and not right:
         return 1.0
-    union = left | right
-    if not union:
+    if not left or not right:
         return 0.0
-    return float(len(left & right) / len(union))
+    return len(left & right) / max(1, len(left | right))
+
+
+def _safe_scalar_float(connection: sqlite3.Connection, query: str) -> float | None:
+    row = connection.execute(query).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return float(row[0])
+
+
+def _empty_transfer_summary() -> dict[str, Any]:
+    return {
+        "transfer_attempt_count": 0,
+        "successful_transfer_count": 0,
+        "successful_role_count": 0,
+        "role_mismatch_count": 0,
+        "low_similarity_count": 0,
+        "insufficient_source_support_count": 0,
+        "no_source_profile_count": 0,
+        "cross_game_attempt_count": 0,
+        "cross_game_success_count": 0,
+        "cross_context_attempt_count": 0,
+        "cross_context_success_count": 0,
+        "mean_transfer_score": None,
+        "max_transfer_score": None,
+        "mean_best_margin": None,
+        "mean_source_carrier_count": None,
+        "candidate_role_count_mean": None,
+    }

@@ -1492,6 +1492,7 @@ def _ensure_current_state_schema(path: Path) -> None:
                 role_signature TEXT,
                 role_type TEXT,
                 token_json TEXT,
+                diagnostic_token_json TEXT,
                 linked_family_count INTEGER,
                 linked_context_count INTEGER,
                 linked_game_count INTEGER,
@@ -1513,7 +1514,11 @@ def _ensure_current_state_schema(path: Path) -> None:
                 first_seen_global_step INTEGER,
                 last_seen_global_step INTEGER,
                 role_stability_score REAL,
-                is_emergent INTEGER
+                is_emergent INTEGER,
+                role_signature_token_count INTEGER,
+                diagnostic_token_count INTEGER,
+                exact_family_token_count INTEGER,
+                exact_identity_token_count INTEGER
             );
             CREATE TABLE IF NOT EXISTS role_links (
                 role_signature TEXT,
@@ -1539,6 +1544,9 @@ def _ensure_current_state_schema(path: Path) -> None:
                 transfer_score REAL,
                 reuse_success INTEGER,
                 failure_reason TEXT,
+                best_margin REAL,
+                source_carrier_count INTEGER,
+                candidate_role_count INTEGER,
                 first_seen_global_step INTEGER,
                 last_seen_global_step INTEGER
             );
@@ -1550,6 +1558,7 @@ def _ensure_current_state_schema(path: Path) -> None:
                 linked_carrier_count INTEGER,
                 linked_family_count INTEGER,
                 transfer_success_count INTEGER,
+                strong_transfer_success_count INTEGER,
                 cross_game_count INTEGER,
                 cross_context_count INTEGER,
                 compression_gain REAL,
@@ -1583,6 +1592,7 @@ def _ensure_current_state_schema(path: Path) -> None:
                 prediction_support_count INTEGER,
                 contradiction_coverage_count INTEGER,
                 coherence_score REAL,
+                candidate_only INTEGER,
                 first_seen_global_step INTEGER,
                 last_seen_global_step INTEGER,
                 is_coherent INTEGER
@@ -1627,6 +1637,16 @@ def _ensure_current_state_schema(path: Path) -> None:
         _ensure_column(connection, "family_members", "contingency_key", "TEXT")
         _ensure_column(connection, "family_members", "first_seen_global_step", "INTEGER")
         _ensure_column(connection, "family_members", "last_seen_global_step", "INTEGER")
+        _ensure_column(connection, "role_neighborhood_signatures", "diagnostic_token_json", "TEXT")
+        _ensure_column(connection, "role_candidates", "role_signature_token_count", "INTEGER")
+        _ensure_column(connection, "role_candidates", "diagnostic_token_count", "INTEGER")
+        _ensure_column(connection, "role_candidates", "exact_family_token_count", "INTEGER")
+        _ensure_column(connection, "role_candidates", "exact_identity_token_count", "INTEGER")
+        _ensure_column(connection, "role_transfer_attempts", "best_margin", "REAL")
+        _ensure_column(connection, "role_transfer_attempts", "source_carrier_count", "INTEGER")
+        _ensure_column(connection, "role_transfer_attempts", "candidate_role_count", "INTEGER")
+        _ensure_column(connection, "concept_candidates", "strong_transfer_success_count", "INTEGER")
+        _ensure_column(connection, "world_model_components", "candidate_only", "INTEGER DEFAULT 0")
         connection.commit()
 
 

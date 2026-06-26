@@ -5,15 +5,21 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+from v6.higher_order_substrate import derive_higher_order_memory
+from v6.memory.compact_memory import ensure_memory_layout
+
 
 def evaluate_h08_world_model_coherence(
     *,
     memory_dir: Path,
     run_dir: Path | None,
     output_dir: Path,
+    already_derived: bool = False,
 ) -> dict[str, Any]:
-    del run_dir
     output_dir.mkdir(parents=True, exist_ok=True)
+    ensure_memory_layout(memory_dir)
+    if not already_derived:
+        derive_higher_order_memory(memory_dir=memory_dir, run_dir=run_dir)
     current_state = Path(memory_dir) / "current_state.sqlite"
     if not current_state.exists():
         result = _base_result("INCONCLUSIVE", ["compact memory missing current_state.sqlite"])
@@ -25,7 +31,8 @@ def evaluate_h08_world_model_coherence(
         promoted_concept_count = int(conn.execute("SELECT COUNT(*) FROM concept_candidates WHERE COALESCE(is_promoted, 0) = 1").fetchone()[0])
         component_rows = conn.execute(
             """
-            SELECT component_signature, coherence_score, explanatory_coverage, cross_context_count, cross_game_count, is_coherent
+            SELECT component_signature, coherence_score, explanatory_coverage, cross_context_count, cross_game_count,
+                   is_coherent, candidate_only
             FROM world_model_components
             ORDER BY component_signature ASC
             """
@@ -51,9 +58,12 @@ def evaluate_h08_world_model_coherence(
     coherent_cross_game_component_count = sum(
         1 for row in component_rows if int(row["is_coherent"] or 0) == 1 and int(row["cross_game_count"] or 0) >= 1
     )
+    candidate_only_world_model_component_count = sum(1 for row in component_rows if int(row["candidate_only"] or 0) == 1)
     metrics = {
         "world_model_component_count": world_model_component_count,
         "coherent_world_model_component_count": coherent_world_model_component_count,
+        "candidate_only_world_model_component_count": candidate_only_world_model_component_count,
+        "promoted_concept_count": promoted_concept_count,
         "mean_coherence_score": mean_coherence_score,
         "max_coherence_score": max_coherence_score,
         "mean_explanatory_coverage": mean_explanatory_coverage,
@@ -67,10 +77,19 @@ def evaluate_h08_world_model_coherence(
     if concept_candidate_count <= 0:
         decision = "INCONCLUSIVE"
         missing = ["no concept candidates available"]
+    elif concept_candidate_count > 0 and promoted_concept_count == 0:
+        decision = "PARTIALLY_VALID"
+        missing = []
     elif world_model_component_count > 0 and coherent_world_model_component_count == 0:
         decision = "PARTIALLY_VALID"
         missing = []
-    elif coherent_world_model_component_count >= 1 and (max_coherence_score or 0.0) >= 0.45 and (max_explanatory_coverage or 0.0) > 0.0 and (coherent_cross_context_component_count >= 1 or coherent_cross_game_component_count >= 1):
+    elif (
+        promoted_concept_count > 0
+        and coherent_world_model_component_count >= 1
+        and (max_coherence_score or 0.0) >= 0.45
+        and (max_explanatory_coverage or 0.0) > 0.0
+        and (coherent_cross_context_component_count >= 1 or coherent_cross_game_component_count >= 1)
+    ):
         decision = "VALID"
         missing = []
     elif promoted_concept_count > 0 and world_model_component_count == 0:
@@ -102,9 +121,12 @@ def _write_outputs(output_dir: Path, result: dict[str, Any]) -> None:
     (output_dir / "h08_world_model_coherence_report.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     text = (
         f"H08 decision: {result.get('decision')}\n"
+        f"promoted concepts: {result.get('promoted_concept_count')}\n"
         f"world model components: {result.get('world_model_component_count')}\n"
+        f"candidate-only components: {result.get('candidate_only_world_model_component_count')}\n"
         f"coherent world model components: {result.get('coherent_world_model_component_count')}\n"
         f"max coherence score: {result.get('max_coherence_score')}\n"
+        f"max explanatory coverage: {result.get('max_explanatory_coverage')}\n"
     )
     (output_dir / "h08_world_model_coherence_report.txt").write_text(text, encoding="utf-8")
     (output_dir / "h08_world_model_coherence.md").write_text("```\n" + text + "```\n", encoding="utf-8")
