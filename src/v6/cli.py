@@ -564,6 +564,7 @@ def build_parser() -> argparse.ArgumentParser:
     continuous.add_argument("--replay-retention-percent", type=int, default=5)
     continuous.add_argument("--fast-postprocessing", type=_parse_bool, default=True)
     continuous.add_argument("--workers", type=int, default=60)
+    continuous.add_argument("--initial-workers", type=int, default=None)
     continuous.add_argument("--ram-ramp-threshold-percent", type=float, default=85.0)
     continuous.add_argument("--initial-worker-ramp-delay-seconds", type=float, default=20.0)
     continuous.add_argument("--per-worker-ramp-delay-seconds", type=float, default=5.0)
@@ -1436,6 +1437,7 @@ def main(argv: list[str] | None = None) -> int:
                 replay_retention_percent=int(args.replay_retention_percent),
                 fast_postprocessing=bool(args.fast_postprocessing),
                 workers=int(args.workers),
+                initial_workers=None if args.initial_workers is None else int(args.initial_workers),
                 ram_ramp_threshold_percent=float(args.ram_ramp_threshold_percent),
                 initial_worker_ramp_delay_seconds=float(args.initial_worker_ramp_delay_seconds),
                 per_worker_ramp_delay_seconds=float(args.per_worker_ramp_delay_seconds),

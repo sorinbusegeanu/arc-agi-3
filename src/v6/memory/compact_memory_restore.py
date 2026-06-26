@@ -12,6 +12,7 @@ from v6.carrier_emergence import CarrierEmergenceTracker
 from v6.contingency.contingency_learner import Contingency
 from v6.memory.compact_memory import stable_family_int_id
 from v6.memory_lifecycle import MemoryRecord, ReplayCandidate
+from v6.memory.substrate import MemoryEdge, MemoryNode, MemoryScore
 from v6.transformation.transformation_clusterer import TransformationFamily
 
 
@@ -35,6 +36,8 @@ def load_compact_memory_into_system(system: Any, memory_dir: Path) -> dict[str, 
         "replay_candidates_restored": 0,
         "graph_nodes_restored": 0,
         "graph_edges_restored": 0,
+        "memory_nodes_restored": 0,
+        "memory_edges_restored": 0,
         "memory_summary_loaded": False,
         "restore_warnings": [],
     }
@@ -129,6 +132,66 @@ def load_compact_memory_into_system(system: Any, memory_dir: Path) -> dict[str, 
                 system._isf_counts[str(key)] = int(json.loads(value_json))
             except Exception:
                 continue
+        if hasattr(system, "memory"):
+            for row in state_conn.execute(
+                """
+                SELECT node_id, memory_level, node_type, canonical_key, attrs_json, first_seen_step, support_count
+                FROM memory_nodes
+                ORDER BY node_id ASC
+                """
+            ).fetchall():
+                system.memory.upsert_node(
+                    MemoryNode(
+                        node_id=str(row["node_id"]),
+                        memory_level=str(row["memory_level"]),
+                        node_type=str(row["node_type"]),
+                        canonical_key=None if row["canonical_key"] is None else str(row["canonical_key"]),
+                        attrs=_parse_json(row["attrs_json"]),
+                    ),
+                    step=row["first_seen_step"],
+                    support_increment=max(1, int(row["support_count"] or 1)),
+                )
+                summary["memory_nodes_restored"] += 1
+            for row in state_conn.execute(
+                """
+                SELECT source_node_id, target_node_id, edge_type, weight, support_count, evidence_json
+                FROM memory_edges
+                ORDER BY source_node_id ASC, target_node_id ASC, edge_type ASC
+                """
+            ).fetchall():
+                system.memory.upsert_edge(
+                    MemoryEdge(
+                        source_node_id=str(row["source_node_id"]),
+                        target_node_id=str(row["target_node_id"]),
+                        edge_type=str(row["edge_type"]),
+                        weight=float(row["weight"] or 1.0),
+                        evidence=_parse_json(row["evidence_json"]),
+                    ),
+                    support_increment=max(1, int(row["support_count"] or 1)),
+                )
+                summary["memory_edges_restored"] += 1
+            for row in state_conn.execute(
+                """
+                SELECT node_id, isf_total, prediction_lift, transfer_score, explanatory_reach,
+                       compression_gain, future_option_delta, replay_priority, retention_status, updated_step
+                FROM memory_scores
+                ORDER BY node_id ASC
+                """
+            ).fetchall():
+                system.memory.upsert_score(
+                    MemoryScore(
+                        node_id=str(row["node_id"]),
+                        isf_total=None if row["isf_total"] is None else float(row["isf_total"]),
+                        prediction_lift=None if row["prediction_lift"] is None else float(row["prediction_lift"]),
+                        transfer_score=None if row["transfer_score"] is None else float(row["transfer_score"]),
+                        explanatory_reach=None if row["explanatory_reach"] is None else float(row["explanatory_reach"]),
+                        compression_gain=None if row["compression_gain"] is None else float(row["compression_gain"]),
+                        future_option_delta=None if row["future_option_delta"] is None else float(row["future_option_delta"]),
+                        replay_priority=None if row["replay_priority"] is None else float(row["replay_priority"]),
+                        retention_status=None if row["retention_status"] is None else str(row["retention_status"]),
+                    ),
+                    step=row["updated_step"],
+                )
 
     if paths["replay_queue"].exists():
         with _connect_readonly_with_retry(paths["replay_queue"]) as replay_conn:

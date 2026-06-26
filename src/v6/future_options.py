@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 from hashlib import sha1
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,80 @@ FUTURE_OPTION_CLEAR_TABLES = (
     "future_option_attention_links",
     "future_option_transfer_links",
 )
+
+
+@dataclass(frozen=True)
+class FutureOptionSet:
+    option_set_id: str
+    state_signature: str
+    available_actions: tuple[int, ...]
+    reachable_signatures: tuple[str, ...]
+    estimated_branching_factor: int
+    depth: int
+
+
+@dataclass(frozen=True)
+class FutureOptionDelta:
+    interaction_id: int
+    before_option_set_id: str
+    after_option_set_id: str
+    added_options: tuple[str, ...]
+    removed_options: tuple[str, ...]
+    preserved_options: tuple[str, ...]
+    delta_score: float
+
+
+@dataclass(frozen=True)
+class TrajectoryOutcomeEquivalence:
+    outcome_signature: str
+    trajectory_ids: tuple[str, ...]
+    best_cost: float
+    equivalent_count: int
+
+
+class FutureOptionEstimator:
+    def estimate_option_set(self, env_or_state: Any, *, depth: int = 1, available_actions: list[int] | tuple[int, ...] | None = None) -> FutureOptionSet:
+        if hasattr(env_or_state, "tolist"):
+            state_signature = json.dumps(env_or_state.tolist(), separators=(",", ":"))
+        else:
+            state_signature = json.dumps(env_or_state, sort_keys=True, default=str, separators=(",", ":"))
+        actions = tuple(sorted(int(item) for item in (available_actions or ())))
+        reachable_signatures = tuple(
+            f"{state_signature}|a{action}|d{int(depth)}"
+            for action in actions
+        )
+        option_set_id = "fos:" + sha1(
+            json.dumps(
+                {"state": state_signature, "actions": actions, "depth": int(depth)},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()[:20]
+        return FutureOptionSet(
+            option_set_id=option_set_id,
+            state_signature=state_signature,
+            available_actions=actions,
+            reachable_signatures=reachable_signatures,
+            estimated_branching_factor=len(actions),
+            depth=int(depth),
+        )
+
+    def compare(self, before: FutureOptionSet, after: FutureOptionSet, interaction_id: int) -> FutureOptionDelta:
+        before_set = set(before.reachable_signatures)
+        after_set = set(after.reachable_signatures)
+        added = tuple(sorted(after_set - before_set))
+        removed = tuple(sorted(before_set - after_set))
+        preserved = tuple(sorted(before_set & after_set))
+        delta_score = float(len(added) - len(removed))
+        return FutureOptionDelta(
+            interaction_id=int(interaction_id),
+            before_option_set_id=before.option_set_id,
+            after_option_set_id=after.option_set_id,
+            added_options=added,
+            removed_options=removed,
+            preserved_options=preserved,
+            delta_score=delta_score,
+        )
 
 
 def derive_future_option_memory(

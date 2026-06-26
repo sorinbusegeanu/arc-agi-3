@@ -8,9 +8,10 @@ import re
 import sqlite3
 import sys
 import shutil
+import tempfile
 import time
 from collections import Counter, defaultdict
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, as_completed, wait
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -26,7 +27,12 @@ from v6.evaluation.id_free_prefuture_validation import ID_FREE_FEATURE_SETS, eva
 from v6.evaluation.prefuture_role_prediction import PREFUTURE_CLASSIFIERS, load_prefuture_examples
 from v6.game_sets import load_game_set_manifest, parquet_games_present
 from v6.main import V6Config, V6System
-from v6.memory.compact_memory import CompactMemoryFoldConfig, fold_sampling_job_sidecars_into_compact_memory
+from v6.memory.compact_memory import (
+    CompactMemoryFoldConfig,
+    fold_sampling_job_sidecars_into_compact_memory,
+    fold_sampling_job_sidecars_into_compact_memory_shard,
+    merge_compact_memory_shards_into_main,
+)
 from v6.sampling import make_sampler, sampler_registry
 from v6.storage.migration import migrate_sqlite_to_parquet
 
@@ -368,10 +374,12 @@ def _run_sampling_jobs(
 ) -> dict[str, object]:
     workers = max(1, min(int(workers), len(jobs)))
     initial = workers if initial_workers is None else max(1, min(int(initial_workers), workers))
+    fold_workers = max(1, workers // 2) if any(job.get("memory_output_dir") for job in jobs) else 0
     ram_at_start = _system_ram_snapshot()
     print(
         f"running {len(jobs)} v0.5c sampling jobs with workers={workers}"
         f" initial_workers={initial}"
+        f" fold_workers={fold_workers}"
         f" worker_ramp={'on' if enable_worker_ramp else 'off'}"
         f" initial_ramp_delay_s={float(initial_worker_ramp_delay_seconds):.1f}"
         f" per_worker_ramp_delay_s={float(per_worker_ramp_delay_seconds):.1f}"
@@ -394,6 +402,12 @@ def _run_sampling_jobs(
     ramp_events: list[dict[str, float | int]] = []
     ramp_start_time = time.monotonic()
     last_ramp_time = ramp_start_time
+    fold_futures = []
+    fold_shard_dirs: list[Path] = []
+    fold_temp_root: Path | None = None
+    main_memory_dir = next((str(job["memory_output_dir"]) for job in jobs if job.get("memory_output_dir")), None)
+    min_fold_step = None
+    max_fold_step = None
 
     def _maybe_ramp() -> bool:
         nonlocal target_workers, last_ramp_time
@@ -440,7 +454,11 @@ def _run_sampling_jobs(
         peak_workers = max(peak_workers, len(active_futures))
 
     try:
-        with ProcessPoolExecutor(max_workers=workers, max_tasks_per_child=1) as executor:
+        if fold_workers > 0 and main_memory_dir is not None:
+            memory_root = Path(str(main_memory_dir))
+            memory_root.mkdir(parents=True, exist_ok=True)
+            fold_temp_root = Path(tempfile.mkdtemp(prefix="sampling_sidecar_fold_", dir=str(memory_root)))
+        with ProcessPoolExecutor(max_workers=workers, max_tasks_per_child=1) as executor, ThreadPoolExecutor(max_workers=max(1, fold_workers or 1)) as fold_executor:
             _submit_until_target(executor)
             while active_futures:
                 done, _pending = wait(active_futures, timeout=0.5, return_when=FIRST_COMPLETED)
@@ -452,24 +470,55 @@ def _run_sampling_jobs(
                     result = future.result()
                     job = active_futures.pop(future, None)
                     if job is not None and job.get("memory_output_dir"):
-                        db_path = Path(str(job["db_path"]))
-                        fold_sampling_job_sidecars_into_compact_memory(
-                            db_path=db_path,
-                            memory_dir=str(job["memory_output_dir"]),
-                            fold_config=CompactMemoryFoldConfig(
-                                global_step_start=int(job.get("global_step_offset", 0) or 0) + 1,
-                                global_step_end=int(job.get("global_step_offset", 0) or 0) + int(job.get("steps", 0) or 0),
-                            ),
-                            delete_after_merge=True,
+                        fold_config = CompactMemoryFoldConfig(
+                            global_step_start=int(job.get("global_step_offset", 0) or 0) + 1,
+                            global_step_end=int(job.get("global_step_offset", 0) or 0) + int(job.get("steps", 0) or 0),
                         )
+                        min_fold_step = int(fold_config.global_step_start) if min_fold_step is None else min(int(min_fold_step), int(fold_config.global_step_start))
+                        max_fold_step = int(fold_config.global_step_end) if max_fold_step is None else max(int(max_fold_step), int(fold_config.global_step_end))
+                        if fold_temp_root is not None:
+                            db_path = Path(str(job["db_path"]))
+                            shard_dir = fold_temp_root / f"{job['game']}_{job['sampler_name']}_seed_{job['seed']}"
+                            fold_shard_dirs.append(shard_dir)
+                            fold_futures.append(
+                                fold_executor.submit(
+                                    fold_sampling_job_sidecars_into_compact_memory_shard,
+                                    db_path=db_path,
+                                    shard_memory_dir=shard_dir,
+                                    fold_config=fold_config,
+                                    delete_after_merge=True,
+                                )
+                            )
+                        else:
+                            db_path = Path(str(job["db_path"]))
+                            fold_sampling_job_sidecars_into_compact_memory(
+                                db_path=db_path,
+                                memory_dir=str(job["memory_output_dir"]),
+                                fold_config=fold_config,
+                                delete_after_merge=True,
+                            )
                     progress.update(1)
                 _maybe_ramp()
                 _submit_until_target(executor)
+            for fold_future in as_completed(fold_futures):
+                fold_future.result()
+        if fold_shard_dirs and main_memory_dir is not None:
+            merge_compact_memory_shards_into_main(
+                memory_dir=main_memory_dir,
+                shard_dirs=[str(path) for path in fold_shard_dirs],
+                fold_config=CompactMemoryFoldConfig(
+                    global_step_start=int(min_fold_step or 1),
+                    global_step_end=int(max_fold_step or max(1, int(min_fold_step or 1))),
+                ),
+            )
     finally:
         progress.close()
+        if fold_temp_root is not None:
+            shutil.rmtree(fold_temp_root, ignore_errors=True)
     return {
         "requested_workers": int(workers),
         "initial_workers": int(initial),
+        "fold_workers": int(fold_workers),
         "peak_workers": int(peak_workers),
         "worker_ramp_enabled": bool(enable_worker_ramp),
         "ram_ramp_threshold_percent": float(ram_ramp_threshold_percent),
@@ -478,6 +527,8 @@ def _run_sampling_jobs(
         "ram_used_percent_at_start": float(ram_at_start["ram_used_percent"]),
         "ramp_event_count": int(len(ramp_events)),
         "ramp_events": ramp_events,
+        "parallel_sidecar_fold_enabled": bool(fold_workers > 0),
+        "parallel_sidecar_fold_shard_count": int(len(fold_shard_dirs)),
     }
 
 

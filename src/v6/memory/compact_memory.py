@@ -209,6 +209,119 @@ def fold_sampling_job_sidecars_into_compact_memory(
     return totals
 
 
+def fold_sampling_job_sidecars_into_compact_memory_shard(
+    *,
+    db_path: str | Path,
+    shard_memory_dir: str | Path,
+    fold_config: CompactMemoryFoldConfig,
+    delete_after_merge: bool = True,
+) -> dict[str, Any]:
+    shard_paths = ensure_memory_layout(shard_memory_dir)
+    sqlite_path = Path(db_path)
+    live_graph_path = sqlite_path.with_name("live_graph_compact.json")
+    carrier_path = sqlite_path.with_name("carrier_candidates.json")
+    contradiction_path = sqlite_path.with_name("context_contradictions.json")
+    memory_summary_path = sqlite_path.with_name("memory_lifecycle_summary.json")
+    sidecars_present = any(path.exists() for path in (live_graph_path, carrier_path, contradiction_path, memory_summary_path))
+    totals = {
+        "graph_live_exports_ingested": 0,
+        "carrier_candidates_added": 0,
+        "deleted_sidecar_files": [],
+        "sidecar_files_present": int(sidecars_present),
+        "shard_memory_dir": str(shard_paths.root),
+    }
+    if not sidecars_present:
+        return totals
+
+    with (
+        sqlite3.connect(shard_paths.current_state) as state_conn,
+        sqlite3.connect(shard_paths.graph) as graph_conn,
+        sqlite3.connect(shard_paths.replay_queue) as replay_conn,
+        sqlite3.connect(sqlite_path) as raw_conn,
+    ):
+        raw_conn.row_factory = sqlite3.Row
+        if live_graph_path.exists():
+            _ingest_live_graph_export(graph_conn, live_graph_path, fold_config)
+            totals["graph_live_exports_ingested"] += 1
+        if carrier_path.exists():
+            _fold_carrier_candidates_sidecar(
+                raw_conn=raw_conn,
+                carrier_path=carrier_path,
+                state_conn=state_conn,
+                graph_conn=graph_conn,
+                fold_config=fold_config,
+                totals=totals,
+            )
+        summary = _build_memory_summary_from_connections(
+            state_conn=state_conn,
+            graph_conn=graph_conn,
+            replay_conn=replay_conn,
+            paths=shard_paths,
+        )
+        summary.update({key: value for key, value in totals.items() if key not in {"deleted_sidecar_files"}})
+        summary["incremental_sidecar_fold"] = {
+            "db_path": str(sqlite_path),
+            "graph_live_exports_ingested": int(totals["graph_live_exports_ingested"]),
+            "carrier_candidates_added": int(totals["carrier_candidates_added"]),
+            "shard_memory_dir": str(shard_paths.root),
+        }
+        _write_memory_summary_table(state_conn, summary)
+        shard_paths.summary_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        state_conn.commit()
+        graph_conn.commit()
+        replay_conn.commit()
+
+    if delete_after_merge:
+        for path in (live_graph_path, carrier_path, contradiction_path, memory_summary_path):
+            if not path.exists():
+                continue
+            try:
+                path.unlink()
+                totals["deleted_sidecar_files"].append(str(path))
+            except OSError:
+                pass
+    return totals
+
+
+def merge_compact_memory_shards_into_main(
+    *,
+    memory_dir: str | Path,
+    shard_dirs: list[str | Path],
+    fold_config: CompactMemoryFoldConfig,
+) -> dict[str, Any]:
+    paths = ensure_memory_layout(memory_dir)
+    merged_dirs = [Path(item) for item in shard_dirs if Path(item).exists()]
+    with (
+        sqlite3.connect(paths.current_state) as state_conn,
+        sqlite3.connect(paths.graph) as graph_conn,
+        sqlite3.connect(paths.replay_queue) as replay_conn,
+    ):
+        for shard_dir in sorted(merged_dirs):
+            _merge_compact_memory_dir_into_main(
+                temp_dir=shard_dir,
+                state_conn=state_conn,
+                graph_conn=graph_conn,
+                replay_conn=replay_conn,
+                fold_config=fold_config,
+            )
+        summary = _build_memory_summary_from_connections(
+            state_conn=state_conn,
+            graph_conn=graph_conn,
+            replay_conn=replay_conn,
+            paths=paths,
+        )
+        summary["parallel_sidecar_shard_merge"] = {
+            "merged_shard_count": len(merged_dirs),
+            "shard_dirs": [str(path) for path in merged_dirs],
+        }
+        _write_memory_summary_table(state_conn, summary)
+        paths.summary_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        state_conn.commit()
+        graph_conn.commit()
+        replay_conn.commit()
+    return summary
+
+
 def _fold_epoch_raw_into_compact_memory_parallel(
     *,
     paths: CompactMemoryPaths,
@@ -355,6 +468,7 @@ def fold_live_system_into_compact_memory(system: Any, memory_dir: str | Path) ->
     global_step_end = int(getattr(system, "step_count", 0) or 0) + int(getattr(system.config, "global_step_offset", 0) or 0)
     global_step_start = max(1, global_step_end)
     graph_rows = {}
+    live_connection = getattr(system, "connection", None)
     if getattr(system, "graph", None) is not None and hasattr(system.graph, "export_compact_rows"):
         graph_rows = system.graph.export_compact_rows()
     family_id_to_signature = {
@@ -554,6 +668,92 @@ def fold_live_system_into_compact_memory(system: Any, memory_dir: str | Path) ->
                     carrier_signature=candidate.carrier_signature,
                     contradiction_key=None,
                     replay_id=None,
+                )
+        if live_connection is not None:
+            live_connection.row_factory = sqlite3.Row
+            for row in live_connection.execute("SELECT * FROM memory_nodes ORDER BY node_id ASC").fetchall():
+                state_conn.execute(
+                    """
+                    INSERT INTO memory_nodes (
+                        node_id, memory_level, node_type, canonical_key, support_count, first_seen_step, last_seen_step, attrs_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(node_id) DO UPDATE SET
+                        memory_level = excluded.memory_level,
+                        node_type = excluded.node_type,
+                        canonical_key = COALESCE(memory_nodes.canonical_key, excluded.canonical_key),
+                        support_count = memory_nodes.support_count + excluded.support_count,
+                        first_seen_step = CASE
+                            WHEN memory_nodes.first_seen_step IS NULL THEN excluded.first_seen_step
+                            WHEN excluded.first_seen_step IS NULL THEN memory_nodes.first_seen_step
+                            ELSE MIN(memory_nodes.first_seen_step, excluded.first_seen_step)
+                        END,
+                        last_seen_step = CASE
+                            WHEN memory_nodes.last_seen_step IS NULL THEN excluded.last_seen_step
+                            WHEN excluded.last_seen_step IS NULL THEN memory_nodes.last_seen_step
+                            ELSE MAX(memory_nodes.last_seen_step, excluded.last_seen_step)
+                        END,
+                        attrs_json = excluded.attrs_json
+                    """,
+                    tuple(row[column] for column in row.keys()),
+                )
+            for row in live_connection.execute(
+                "SELECT source_node_id, target_node_id, edge_type, weight, support_count, evidence_json FROM memory_edges ORDER BY source_node_id ASC, target_node_id ASC, edge_type ASC"
+            ).fetchall():
+                state_conn.execute(
+                    """
+                    INSERT INTO memory_edges (
+                        source_node_id, target_node_id, edge_type, weight, support_count, evidence_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(source_node_id, target_node_id, edge_type) DO UPDATE SET
+                        weight = MAX(memory_edges.weight, excluded.weight),
+                        support_count = memory_edges.support_count + excluded.support_count,
+                        evidence_json = excluded.evidence_json
+                    """,
+                    tuple(row[column] for column in row.keys()),
+                )
+            for row in live_connection.execute("SELECT * FROM memory_evidence ORDER BY evidence_id ASC").fetchall():
+                state_conn.execute(
+                    """
+                    INSERT OR REPLACE INTO memory_evidence (
+                        evidence_id, target_node_id, source_interaction_id, evidence_type, payload_json
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    tuple(row[column] for column in row.keys()),
+                )
+            for row in live_connection.execute("SELECT * FROM memory_scores ORDER BY node_id ASC").fetchall():
+                state_conn.execute(
+                    """
+                    INSERT INTO memory_scores (
+                        node_id, isf_total, prediction_lift, transfer_score, explanatory_reach,
+                        compression_gain, future_option_delta, replay_priority, retention_status, updated_step
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(node_id) DO UPDATE SET
+                        isf_total = COALESCE(excluded.isf_total, memory_scores.isf_total),
+                        prediction_lift = COALESCE(excluded.prediction_lift, memory_scores.prediction_lift),
+                        transfer_score = COALESCE(excluded.transfer_score, memory_scores.transfer_score),
+                        explanatory_reach = COALESCE(excluded.explanatory_reach, memory_scores.explanatory_reach),
+                        compression_gain = COALESCE(excluded.compression_gain, memory_scores.compression_gain),
+                        future_option_delta = COALESCE(excluded.future_option_delta, memory_scores.future_option_delta),
+                        replay_priority = MAX(COALESCE(memory_scores.replay_priority, 0.0), COALESCE(excluded.replay_priority, 0.0)),
+                        retention_status = COALESCE(excluded.retention_status, memory_scores.retention_status),
+                        updated_step = COALESCE(excluded.updated_step, memory_scores.updated_step)
+                    """,
+                    tuple(row[column] for column in row.keys()),
+                )
+            for row in live_connection.execute("SELECT * FROM memory_promotions ORDER BY promotion_id ASC").fetchall():
+                state_conn.execute(
+                    """
+                    INSERT OR REPLACE INTO memory_promotions (
+                        promotion_id, source_node_id, target_node_id, promotion_type,
+                        evidence_count, promotion_score, status, payload_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    tuple(row[column] for column in row.keys()),
                 )
         if graph_rows:
             temp_path = paths.root / "_live_graph_export_tmp.json"
@@ -769,6 +969,90 @@ def _merge_state_tables(temp_state: sqlite3.Connection, state_conn: sqlite3.Conn
         state_conn,
         [dict(row) for row in temp_state.execute("SELECT * FROM temporal_milestones ORDER BY game ASC, sampler ASC, seed ASC").fetchall()],
     )
+    for row in temp_state.execute("SELECT * FROM memory_nodes ORDER BY node_id ASC").fetchall():
+        state_conn.execute(
+            """
+            INSERT INTO memory_nodes (
+                node_id, memory_level, node_type, canonical_key, support_count, first_seen_step, last_seen_step, attrs_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(node_id) DO UPDATE SET
+                memory_level = excluded.memory_level,
+                node_type = excluded.node_type,
+                canonical_key = COALESCE(memory_nodes.canonical_key, excluded.canonical_key),
+                support_count = memory_nodes.support_count + excluded.support_count,
+                first_seen_step = CASE
+                    WHEN memory_nodes.first_seen_step IS NULL THEN excluded.first_seen_step
+                    WHEN excluded.first_seen_step IS NULL THEN memory_nodes.first_seen_step
+                    ELSE MIN(memory_nodes.first_seen_step, excluded.first_seen_step)
+                END,
+                last_seen_step = CASE
+                    WHEN memory_nodes.last_seen_step IS NULL THEN excluded.last_seen_step
+                    WHEN excluded.last_seen_step IS NULL THEN memory_nodes.last_seen_step
+                    ELSE MAX(memory_nodes.last_seen_step, excluded.last_seen_step)
+                END,
+                attrs_json = excluded.attrs_json
+            """,
+            tuple(row[column] for column in row.keys()),
+        )
+    for row in temp_state.execute(
+        "SELECT source_node_id, target_node_id, edge_type, weight, support_count, evidence_json FROM memory_edges ORDER BY source_node_id ASC, target_node_id ASC, edge_type ASC"
+    ).fetchall():
+        state_conn.execute(
+            """
+            INSERT INTO memory_edges (
+                source_node_id, target_node_id, edge_type, weight, support_count, evidence_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source_node_id, target_node_id, edge_type) DO UPDATE SET
+                weight = MAX(memory_edges.weight, excluded.weight),
+                support_count = memory_edges.support_count + excluded.support_count,
+                evidence_json = excluded.evidence_json
+            """,
+            tuple(row[column] for column in row.keys()),
+        )
+    for row in temp_state.execute("SELECT * FROM memory_evidence ORDER BY evidence_id ASC").fetchall():
+        state_conn.execute(
+            """
+            INSERT OR REPLACE INTO memory_evidence (
+                evidence_id, target_node_id, source_interaction_id, evidence_type, payload_json
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            tuple(row[column] for column in row.keys()),
+        )
+    for row in temp_state.execute("SELECT * FROM memory_scores ORDER BY node_id ASC").fetchall():
+        state_conn.execute(
+            """
+            INSERT INTO memory_scores (
+                node_id, isf_total, prediction_lift, transfer_score, explanatory_reach,
+                compression_gain, future_option_delta, replay_priority, retention_status, updated_step
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(node_id) DO UPDATE SET
+                isf_total = COALESCE(excluded.isf_total, memory_scores.isf_total),
+                prediction_lift = COALESCE(excluded.prediction_lift, memory_scores.prediction_lift),
+                transfer_score = COALESCE(excluded.transfer_score, memory_scores.transfer_score),
+                explanatory_reach = COALESCE(excluded.explanatory_reach, memory_scores.explanatory_reach),
+                compression_gain = COALESCE(excluded.compression_gain, memory_scores.compression_gain),
+                future_option_delta = COALESCE(excluded.future_option_delta, memory_scores.future_option_delta),
+                replay_priority = MAX(COALESCE(memory_scores.replay_priority, 0.0), COALESCE(excluded.replay_priority, 0.0)),
+                retention_status = COALESCE(excluded.retention_status, memory_scores.retention_status),
+                updated_step = COALESCE(excluded.updated_step, memory_scores.updated_step)
+            """,
+            tuple(row[column] for column in row.keys()),
+        )
+    for row in temp_state.execute("SELECT * FROM memory_promotions ORDER BY promotion_id ASC").fetchall():
+        state_conn.execute(
+            """
+            INSERT OR REPLACE INTO memory_promotions (
+                promotion_id, source_node_id, target_node_id, promotion_type,
+                evidence_count, promotion_score, status, payload_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            tuple(row[column] for column in row.keys()),
+        )
 
 
 def _merge_graph_tables(temp_graph: sqlite3.Connection, graph_conn: sqlite3.Connection, fold_config: CompactMemoryFoldConfig) -> None:
@@ -895,6 +1179,95 @@ def _fold_single_db(
                     carrier_signature=None,
                     contradiction_key=None,
                     replay_id=None,
+                )
+        if "memory_nodes" in tables:
+            for row in raw_conn.execute("SELECT * FROM memory_nodes ORDER BY node_id ASC").fetchall():
+                state_conn.execute(
+                    """
+                    INSERT INTO memory_nodes (
+                        node_id, memory_level, node_type, canonical_key, support_count, first_seen_step, last_seen_step, attrs_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(node_id) DO UPDATE SET
+                        memory_level = excluded.memory_level,
+                        node_type = excluded.node_type,
+                        canonical_key = COALESCE(memory_nodes.canonical_key, excluded.canonical_key),
+                        support_count = memory_nodes.support_count + excluded.support_count,
+                        first_seen_step = CASE
+                            WHEN memory_nodes.first_seen_step IS NULL THEN excluded.first_seen_step
+                            WHEN excluded.first_seen_step IS NULL THEN memory_nodes.first_seen_step
+                            ELSE MIN(memory_nodes.first_seen_step, excluded.first_seen_step)
+                        END,
+                        last_seen_step = CASE
+                            WHEN memory_nodes.last_seen_step IS NULL THEN excluded.last_seen_step
+                            WHEN excluded.last_seen_step IS NULL THEN memory_nodes.last_seen_step
+                            ELSE MAX(memory_nodes.last_seen_step, excluded.last_seen_step)
+                        END,
+                        attrs_json = excluded.attrs_json
+                    """,
+                    tuple(row[column] for column in row.keys()),
+                )
+        if "memory_edges" in tables:
+            for row in raw_conn.execute(
+                "SELECT source_node_id, target_node_id, edge_type, weight, support_count, evidence_json FROM memory_edges ORDER BY source_node_id ASC, target_node_id ASC, edge_type ASC"
+            ).fetchall():
+                state_conn.execute(
+                    """
+                    INSERT INTO memory_edges (
+                        source_node_id, target_node_id, edge_type, weight, support_count, evidence_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(source_node_id, target_node_id, edge_type) DO UPDATE SET
+                        weight = MAX(memory_edges.weight, excluded.weight),
+                        support_count = memory_edges.support_count + excluded.support_count,
+                        evidence_json = excluded.evidence_json
+                    """,
+                    tuple(row[column] for column in row.keys()),
+                )
+        if "memory_evidence" in tables:
+            for row in raw_conn.execute("SELECT * FROM memory_evidence ORDER BY evidence_id ASC").fetchall():
+                state_conn.execute(
+                    """
+                    INSERT OR REPLACE INTO memory_evidence (
+                        evidence_id, target_node_id, source_interaction_id, evidence_type, payload_json
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    tuple(row[column] for column in row.keys()),
+                )
+        if "memory_scores" in tables:
+            for row in raw_conn.execute("SELECT * FROM memory_scores ORDER BY node_id ASC").fetchall():
+                state_conn.execute(
+                    """
+                    INSERT INTO memory_scores (
+                        node_id, isf_total, prediction_lift, transfer_score, explanatory_reach,
+                        compression_gain, future_option_delta, replay_priority, retention_status, updated_step
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(node_id) DO UPDATE SET
+                        isf_total = COALESCE(excluded.isf_total, memory_scores.isf_total),
+                        prediction_lift = COALESCE(excluded.prediction_lift, memory_scores.prediction_lift),
+                        transfer_score = COALESCE(excluded.transfer_score, memory_scores.transfer_score),
+                        explanatory_reach = COALESCE(excluded.explanatory_reach, memory_scores.explanatory_reach),
+                        compression_gain = COALESCE(excluded.compression_gain, memory_scores.compression_gain),
+                        future_option_delta = COALESCE(excluded.future_option_delta, memory_scores.future_option_delta),
+                        replay_priority = MAX(COALESCE(memory_scores.replay_priority, 0.0), COALESCE(excluded.replay_priority, 0.0)),
+                        retention_status = COALESCE(excluded.retention_status, memory_scores.retention_status),
+                        updated_step = COALESCE(excluded.updated_step, memory_scores.updated_step)
+                    """,
+                    tuple(row[column] for column in row.keys()),
+                )
+        if "memory_promotions" in tables:
+            for row in raw_conn.execute("SELECT * FROM memory_promotions ORDER BY promotion_id ASC").fetchall():
+                state_conn.execute(
+                    """
+                    INSERT OR REPLACE INTO memory_promotions (
+                        promotion_id, source_node_id, target_node_id, promotion_type,
+                        evidence_count, promotion_score, status, payload_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    tuple(row[column] for column in row.keys()),
                 )
         if "prediction_results" in tables:
             family_supports: dict[str, dict[str, Any]] = {}
@@ -1834,6 +2207,11 @@ def _build_memory_summary_from_connections(
         "representative_example_count": example_count,
         "graph_node_count": _count_rows(graph_conn, "graph_nodes"),
         "graph_edge_count": _count_rows(graph_conn, "graph_edges"),
+        "memory_substrate_node_count": _count_rows(state_conn, "memory_nodes"),
+        "memory_substrate_edge_count": _count_rows(state_conn, "memory_edges"),
+        "memory_substrate_evidence_count": _count_rows(state_conn, "memory_evidence"),
+        "memory_substrate_score_count": _count_rows(state_conn, "memory_scores"),
+        "memory_substrate_promotion_count": _count_rows(state_conn, "memory_promotions"),
         "replay_queue_size": _count_rows(replay_conn, "replay_queue"),
         "current_state_path": str(paths.current_state),
         "graph_path": str(paths.graph),
@@ -1858,6 +2236,11 @@ def _build_memory_summary_from_connections(
         "future_option_transfer_link_count",
         "graph_node_count",
         "graph_edge_count",
+        "memory_substrate_node_count",
+        "memory_substrate_edge_count",
+        "memory_substrate_evidence_count",
+        "memory_substrate_score_count",
+        "memory_substrate_promotion_count",
         "replay_queue_size",
     ):
         summary[key] = int(summary[key] or 0)
@@ -2033,6 +2416,55 @@ def _ensure_current_state_schema(path: Path) -> None:
             CREATE TABLE IF NOT EXISTS memory_summary (
                 key TEXT PRIMARY KEY,
                 value_json TEXT
+            );
+            CREATE TABLE IF NOT EXISTS memory_nodes (
+                node_id TEXT PRIMARY KEY,
+                memory_level TEXT NOT NULL,
+                node_type TEXT NOT NULL,
+                canonical_key TEXT,
+                support_count INTEGER DEFAULT 0,
+                first_seen_step INTEGER,
+                last_seen_step INTEGER,
+                attrs_json TEXT
+            );
+            CREATE TABLE IF NOT EXISTS memory_edges (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_node_id TEXT NOT NULL,
+                target_node_id TEXT NOT NULL,
+                edge_type TEXT NOT NULL,
+                weight REAL DEFAULT 1.0,
+                support_count INTEGER DEFAULT 1,
+                evidence_json TEXT,
+                UNIQUE(source_node_id, target_node_id, edge_type)
+            );
+            CREATE TABLE IF NOT EXISTS memory_evidence (
+                evidence_id TEXT PRIMARY KEY,
+                target_node_id TEXT NOT NULL,
+                source_interaction_id INTEGER,
+                evidence_type TEXT NOT NULL,
+                payload_json TEXT
+            );
+            CREATE TABLE IF NOT EXISTS memory_scores (
+                node_id TEXT PRIMARY KEY,
+                isf_total REAL,
+                prediction_lift REAL,
+                transfer_score REAL,
+                explanatory_reach REAL,
+                compression_gain REAL,
+                future_option_delta REAL,
+                replay_priority REAL,
+                retention_status TEXT,
+                updated_step INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS memory_promotions (
+                promotion_id TEXT PRIMARY KEY,
+                source_node_id TEXT NOT NULL,
+                target_node_id TEXT NOT NULL,
+                promotion_type TEXT NOT NULL,
+                evidence_count INTEGER NOT NULL,
+                promotion_score REAL NOT NULL,
+                status TEXT NOT NULL,
+                payload_json TEXT
             );
             CREATE TABLE IF NOT EXISTS role_neighborhood_signatures (
                 carrier_signature TEXT PRIMARY KEY,

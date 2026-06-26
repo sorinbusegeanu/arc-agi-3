@@ -138,9 +138,21 @@ from v6.evaluation.validation_report import build_validation_report
 from v6.graph.graph_manager import GraphManager
 from v6.interaction_significance import compute_interaction_significance
 from v6.main import V6Config, V6System
-from v6.memory.compact_memory import CompactMemoryFoldConfig, ensure_memory_layout, fold_sampling_job_sidecars_into_compact_memory, load_memory_summary
+from v6.future_options import FutureOptionEstimator
+from v6.memory.compact_memory import (
+    CompactMemoryFoldConfig,
+    ensure_memory_layout,
+    fold_live_system_into_compact_memory,
+    fold_sampling_job_sidecars_into_compact_memory,
+    fold_sampling_job_sidecars_into_compact_memory_shard,
+    load_memory_summary,
+    merge_compact_memory_shards_into_main,
+)
 from v6.memory.contingency_store import ContingencyStore
 from v6.memory.interaction_store import Interaction, InteractionStore, encode_array
+from v6.memory.promotion_engine import MemoryPromotionConfig, MemoryPromotionEngine
+from v6.memory.query_engine import MemoryQueryEngine
+from v6.memory.substrate import MemoryEdge, MemoryNode, MemoryScore, MemorySubstrate, action_node_id, delta_node_id, family_node_id, interaction_node_id, strategy_node_id
 from v6.memory_lifecycle import MemoryLifecycleManager
 from v6.memory_types import M3RoleCandidate
 from v6.m2_expand_v08c import M2ExpandV08cConfig, run_m2_expand_v08c
@@ -2292,6 +2304,143 @@ def test_v6_system_run_step_stores_memory_lifecycle_fields(tmp_path) -> None:
         connection.close()
 
 
+def test_memory_substrate_creates_all_tables() -> None:
+    connection = sqlite3.connect(":memory:")
+    try:
+        substrate = MemorySubstrate(connection)
+        tables = {
+            str(row[0])
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+        assert {"memory_nodes", "memory_edges", "memory_evidence", "memory_scores", "memory_promotions", "memory_versions"}.issubset(tables)
+        assert substrate.get_node("missing") is None
+    finally:
+        connection.close()
+
+
+def test_memory_substrate_upsert_node_increments_support_count() -> None:
+    connection = sqlite3.connect(":memory:")
+    try:
+        substrate = MemorySubstrate(connection)
+        substrate.upsert_node(
+            MemoryNode(node_id="M0:interaction:1", memory_level="M0", node_type="InteractionMemory", attrs={"a": 1}),
+            step=1,
+        )
+        substrate.upsert_node(
+            MemoryNode(node_id="M0:interaction:1", memory_level="M0", node_type="InteractionMemory", attrs={"a": 2}),
+            step=2,
+            support_increment=2,
+        )
+        row = substrate.get_node("M0:interaction:1")
+        assert row is not None
+        assert row["support_count"] == 3
+        assert row["attrs"]["a"] == 2
+        assert row["first_seen_step"] == 1
+        assert row["last_seen_step"] == 2
+    finally:
+        connection.close()
+
+
+def test_memory_substrate_upsert_edge_merges_duplicates() -> None:
+    connection = sqlite3.connect(":memory:")
+    try:
+        substrate = MemorySubstrate(connection)
+        substrate.upsert_edge(MemoryEdge("A", "B", "follows", weight=0.5, evidence={"x": 1}))
+        substrate.upsert_edge(MemoryEdge("A", "B", "follows", weight=0.8, evidence={"y": 2}), support_increment=2)
+        edges = substrate.edges_from("A", "follows")
+        assert len(edges) == 1
+        assert edges[0]["support_count"] == 3
+        assert edges[0]["weight"] == 0.8
+        assert edges[0]["evidence"]["y"] == 2
+    finally:
+        connection.close()
+
+
+def test_v6_system_run_step_writes_m0_memory_nodes_and_scores(tmp_path) -> None:
+    db_path = tmp_path / "memory_substrate.sqlite"
+    system = V6System(
+        env=ToggleEnv(),
+        config=V6Config(
+            database_path=str(db_path),
+            context_length=2,
+            random_seed=0,
+        ),
+    )
+
+    result = system.run_step()
+    system.close()
+
+    connection = sqlite3.connect(db_path)
+    try:
+        node_ids = {
+            str(row[0])
+            for row in connection.execute("SELECT node_id FROM memory_nodes").fetchall()
+        }
+        assert interaction_node_id(result.interaction_id) in node_ids
+        assert action_node_id(result.action) in node_ids
+        assert delta_node_id(result.delta_id) in node_ids
+        observation_nodes = [
+            str(row[0])
+            for row in connection.execute(
+                "SELECT node_id FROM memory_nodes WHERE node_type = 'ObservationMemory' ORDER BY node_id ASC"
+            ).fetchall()
+        ]
+        assert len(observation_nodes) >= 2
+        score_row = connection.execute(
+            """
+            SELECT isf_total, replay_priority, retention_status
+            FROM memory_scores
+            WHERE node_id = ?
+            """,
+            (interaction_node_id(result.interaction_id),),
+        ).fetchone()
+        assert score_row is not None
+        assert score_row[0] is not None
+        edge_types = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT edge_type FROM memory_edges WHERE source_node_id = ?",
+                (interaction_node_id(result.interaction_id),),
+            ).fetchall()
+        }
+        assert {"takes_action", "produces_delta", "observed_after"}.issubset(edge_types)
+    finally:
+        connection.close()
+
+
+def test_compact_memory_fold_and_restore_preserves_memory_substrate(tmp_path) -> None:
+    db_path = tmp_path / "live.sqlite"
+    memory_dir = tmp_path / "compact_memory"
+    system = V6System(
+        env=ToggleEnv(),
+        config=V6Config(
+            database_path=str(db_path),
+            context_length=2,
+            random_seed=0,
+        ),
+    )
+    result = system.run_step()
+    fold_live_system_into_compact_memory(system, memory_dir)
+    system.close()
+
+    restored = V6System(
+        env=ToggleEnv(),
+        config=V6Config(
+            database_path=":memory:",
+            memory_input_dir=str(memory_dir),
+            restore_compact_memory=True,
+            random_seed=0,
+        ),
+    )
+    try:
+        interaction_node = restored.memory.get_node(interaction_node_id(result.interaction_id))
+        assert interaction_node is not None
+        assert interaction_node["memory_level"] == "M0"
+        edges = restored.memory.edges_from(interaction_node_id(result.interaction_id))
+        assert any(edge["edge_type"] == "takes_action" for edge in edges)
+    finally:
+        restored.close()
+
 def test_v6_system_run_step_stores_efficiency_fields(tmp_path) -> None:
     db_path = tmp_path / "efficiency.sqlite"
     system = V6System(
@@ -2353,6 +2502,537 @@ def test_v6_system_run_step_stores_efficiency_fields(tmp_path) -> None:
     finally:
         connection.close()
 
+
+def test_phase2_stable_contingency_creates_m1_memory_node(tmp_path) -> None:
+    from v6.contingency.contingency_learner import Contingency
+
+    db_path = tmp_path / "phase2_contingency.sqlite"
+    system = V6System(
+        env=ToggleEnv(),
+        config=V6Config(database_path=str(db_path), context_length=2, random_seed=0),
+    )
+    fake_contingency = Contingency(
+        id=11,
+        context_level=2,
+        context_signature=("ctxA",),
+        action=1,
+        transformation_family=3,
+        support_count=5,
+        confidence=0.9,
+    )
+    system.contingency_learner.update_multi_scale = lambda *_args, **_kwargs: fake_contingency
+    system.contingency_learner.stable_contingencies = lambda: [fake_contingency]
+    system.clusterer.family_for_delta = lambda _delta_id: 3
+    system.run_step()
+    node = system.memory.query_nodes(memory_level="M1", node_type="ContingencyMemory")
+    assert node
+    assert node[0]["attrs"]["context_level"] == 2
+    system.close()
+
+
+def test_phase2_actual_family_creates_m2_memory_node(tmp_path) -> None:
+    db_path = tmp_path / "phase2_family.sqlite"
+    system = V6System(
+        env=ToggleEnv(),
+        config=V6Config(database_path=str(db_path), context_length=2, random_seed=0),
+    )
+    system.clusterer.family_for_delta = lambda _delta_id: 7
+    system.clusterer.families = {7: object()}
+    result = system.run_step()
+    family_node = system.memory.get_node(family_node_id(7))
+    assert family_node is not None
+    edges = system.memory.edges_from(interaction_node_id(result.interaction_id), "supports")
+    assert any(edge["target_node_id"] == family_node_id(7) for edge in edges)
+    system.close()
+
+
+def test_phase2_carrier_candidate_creates_m3_memory_node(tmp_path) -> None:
+    db_path = tmp_path / "phase2_carrier.sqlite"
+    system = V6System(
+        env=ToggleEnv(),
+        config=V6Config(
+            database_path=str(db_path),
+            context_length=2,
+            carrier_min_support=1,
+            carrier_min_distinct_contexts=1,
+            carrier_min_prediction_lift=0.0,
+            carrier_min_compression_gain=0.0,
+            random_seed=0,
+        ),
+    )
+    system.run_step()
+    carriers = system.memory.query_nodes(memory_level="M3", node_type="CarrierMemory")
+    assert carriers
+    system.close()
+
+
+def test_phase2_prediction_contradiction_creates_violation_memory_node(tmp_path) -> None:
+    from v6.contingency.contingency_learner import Contingency
+
+    db_path = tmp_path / "phase2_violation.sqlite"
+    system = V6System(
+        env=ToggleEnv(),
+        config=V6Config(database_path=str(db_path), context_length=2, max_context_depth=5, random_seed=0),
+    )
+    fake_contingency = Contingency(
+        id=7,
+        context_level=2,
+        context_signature=("ctx1",),
+        action=1,
+        transformation_family=1,
+        support_count=3,
+        confidence=0.9,
+    )
+    system.predictor.predict_multi_scale = lambda *_args, **_kwargs: 1
+    system._prediction_confidence = lambda **_kwargs: 0.9
+    system.contingency_learner.best_stable_for_action = lambda *_args, **_kwargs: fake_contingency
+    system.contingency_learner.update_multi_scale = lambda *_args, **_kwargs: fake_contingency
+    system.contingency_learner.stable_contingencies = lambda: [fake_contingency]
+    system.clusterer.family_for_delta = lambda _delta_id: 2
+    system.clusterer.families = {2: object()}
+    result = system.run_step()
+    outgoing = system.memory.edges_from(interaction_node_id(result.interaction_id), "violates_prediction")
+    assert outgoing
+    violation_node = system.memory.get_node(outgoing[0]["target_node_id"])
+    assert violation_node is not None
+    assert violation_node["node_type"] == "PredictionViolationMemory"
+    system.close()
+
+
+def test_phase2_replay_candidate_updates_memory_scores_and_replay_edge(tmp_path) -> None:
+    db_path = tmp_path / "phase2_replay.sqlite"
+    system = V6System(
+        env=OutcomeEnv(outcome_state="WIN", outcome_polarity="positive"),
+        config=V6Config(database_path=str(db_path), context_length=2, random_seed=0),
+    )
+    system.run_step()
+    interaction_node = interaction_node_id(1)
+    score_row = system.connection.execute(
+        "SELECT replay_priority, retention_status FROM memory_scores WHERE node_id = ?",
+        (interaction_node,),
+    ).fetchone()
+    assert score_row is not None
+    replay_edges = system.memory.edges_from(interaction_node, "selected_for_replay")
+    assert replay_edges
+    interaction_row = system.connection.execute(
+        "SELECT id FROM interactions ORDER BY id LIMIT 1"
+    ).fetchone()
+    assert interaction_row is not None
+    prediction_row = system.connection.execute(
+        "SELECT interaction_id FROM prediction_results ORDER BY id LIMIT 1"
+    ).fetchone()
+    assert prediction_row is not None
+    system.close()
+
+
+def test_phase3_repeated_context_action_family_promotes_m1_node() -> None:
+    connection = sqlite3.connect(":memory:")
+    try:
+        substrate = MemorySubstrate(connection)
+        engine = MemoryPromotionEngine(substrate, MemoryPromotionConfig(min_contingency_support=3, min_contingency_confidence=0.6))
+        substrate.upsert_node(
+            MemoryNode(
+                node_id="m1c",
+                memory_level="M1",
+                node_type="ContingencyMemory",
+                attrs={"support_count": 4, "confidence": 0.8, "transformation_family": 9},
+            ),
+            step=1,
+            support_increment=4,
+        )
+        summary = engine.promote_m0_to_m1(step=1)
+        node = substrate.get_node("m1c")
+        assert summary["count"] == 1
+        assert node is not None
+        assert node["attrs"]["promotion_status"] == "promoted"
+    finally:
+        connection.close()
+
+
+def test_phase3_family_support_promotes_m2_node() -> None:
+    connection = sqlite3.connect(":memory:")
+    try:
+        substrate = MemorySubstrate(connection)
+        engine = MemoryPromotionEngine(substrate, MemoryPromotionConfig(min_family_support=3))
+        for index in range(3):
+            substrate.upsert_node(
+                MemoryNode(
+                    node_id=f"c{index}",
+                    memory_level="M1",
+                    node_type="ContingencyMemory",
+                    attrs={"support_count": 1, "confidence": 0.9, "transformation_family": 5},
+                ),
+                step=index + 1,
+            )
+        summary = engine.promote_m1_to_m2(step=10)
+        assert summary["count"] >= 1
+        assert substrate.get_node(family_node_id(5)) is not None
+    finally:
+        connection.close()
+
+
+def test_phase3_carrier_with_support_lift_and_compression_promotes_m3_carrier() -> None:
+    connection = sqlite3.connect(":memory:")
+    try:
+        substrate = MemorySubstrate(connection)
+        engine = MemoryPromotionEngine(substrate, MemoryPromotionConfig())
+        substrate.upsert_node(
+            MemoryNode(
+                node_id="carrierA",
+                memory_level="M3",
+                node_type="CarrierMemory",
+                attrs={
+                    "carrier_source": "object",
+                    "support_count": 4,
+                    "prediction_lift": 0.2,
+                    "compression_gain": 0.2,
+                },
+            ),
+            step=1,
+        )
+        summary = engine.promote_m2_to_m3_carrier(step=1)
+        node = substrate.get_node("carrierA")
+        assert summary["count"] == 1
+        assert node is not None
+        assert node["attrs"]["promotion_status"] == "promoted"
+    finally:
+        connection.close()
+
+
+def test_phase3_two_carriers_with_similar_graph_position_promote_same_role() -> None:
+    connection = sqlite3.connect(":memory:")
+    try:
+        substrate = MemorySubstrate(connection)
+        engine = MemoryPromotionEngine(substrate, MemoryPromotionConfig(min_role_support=2))
+        for carrier in ("carrier1", "carrier2"):
+            substrate.upsert_node(
+                MemoryNode(
+                    node_id=carrier,
+                    memory_level="M3",
+                    node_type="CarrierMemory",
+                    attrs={"promotion_status": "promoted"},
+                ),
+                step=1,
+            )
+            substrate.upsert_edge(MemoryEdge(carrier, family_node_id(1), "associated_with_family"))
+            substrate.upsert_edge(MemoryEdge(carrier, "ctx", "appears_in_context"))
+        summary = engine.promote_m3_carrier_to_role(step=5)
+        roles = substrate.query_nodes(memory_level="M3", node_type="FunctionalRoleMemory")
+        assert summary["count"] >= 2
+        assert len(roles) == 1
+    finally:
+        connection.close()
+
+
+def test_phase3_role_transfer_evidence_can_promote_concept() -> None:
+    connection = sqlite3.connect(":memory:")
+    try:
+        substrate = MemorySubstrate(connection)
+        engine = MemoryPromotionEngine(
+            substrate,
+            MemoryPromotionConfig(min_concept_transfer_tests=2, min_concept_transfer_success_rate=0.5),
+        )
+        substrate.upsert_node(
+            MemoryNode(
+                node_id="roleA",
+                memory_level="M3",
+                node_type="FunctionalRoleMemory",
+                attrs={"role_signature": "r1", "carrier_count": 3},
+            ),
+            step=1,
+        )
+        summary = engine.promote_role_to_concept(step=10)
+        concepts = substrate.query_nodes(memory_level="M4", node_type="ConceptMemory")
+        assert summary["count"] == 1
+        assert concepts
+    finally:
+        connection.close()
+
+
+def test_phase3_equivalent_outcome_lower_cost_promotes_strategy() -> None:
+    connection = sqlite3.connect(":memory:")
+    try:
+        substrate = MemorySubstrate(connection)
+        engine = MemoryPromotionEngine(substrate)
+        node_id = strategy_node_id("same_outcome")
+        substrate.upsert_node(
+            MemoryNode(
+                node_id=node_id,
+                memory_level="M6",
+                node_type="EfficientStrategyMemory",
+                attrs={
+                    "outcome_signature": "o1",
+                    "best_known_cost": 2.0,
+                    "current_cost": 5.0,
+                    "normalized_solve_efficiency": 0.4,
+                    "equivalent_outcome_cost_gap": 3.0,
+                },
+            ),
+            step=1,
+        )
+        summary = engine.promote_strategy_memories(step=1)
+        promotion_count = connection.execute("SELECT COUNT(*) FROM memory_promotions").fetchone()[0]
+        assert summary["count"] == 1
+        assert promotion_count >= 1
+    finally:
+        connection.close()
+
+
+def test_phase4_future_option_estimator_creates_stable_option_sets() -> None:
+    estimator = FutureOptionEstimator()
+    observation = np.zeros((2, 2), dtype=int)
+    left = estimator.estimate_option_set(observation, depth=1, available_actions=[2, 1])
+    right = estimator.estimate_option_set(observation, depth=1, available_actions=[1, 2])
+    assert left.option_set_id == right.option_set_id
+    assert left.reachable_signatures == right.reachable_signatures
+
+
+def test_phase4_positive_future_option_delta_creates_expands_edge(tmp_path) -> None:
+    class ExpandingEnv(ToggleEnv):
+        def available_actions(self) -> list[int]:
+            return [1] if self.state == 0 else [1, 2]
+
+    db_path = tmp_path / "future_expand.sqlite"
+    system = V6System(env=ExpandingEnv(), config=V6Config(database_path=str(db_path), random_seed=0))
+    result = system.run_step()
+    edges = system.memory.edges_from(interaction_node_id(result.interaction_id), "expands_future_options")
+    assert edges
+    score = system.connection.execute(
+        "SELECT future_option_delta FROM memory_scores WHERE node_id = ?",
+        (interaction_node_id(result.interaction_id),),
+    ).fetchone()
+    assert score is not None
+    assert float(score[0]) > 0.0
+    system.close()
+
+
+def test_phase4_negative_future_option_delta_creates_restricts_edge(tmp_path) -> None:
+    class RestrictingEnv(ToggleEnv):
+        def __init__(self) -> None:
+            super().__init__()
+            self.state = 1
+
+        def available_actions(self) -> list[int]:
+            return [1, 2] if self.state == 1 else [1]
+
+    db_path = tmp_path / "future_restrict.sqlite"
+    system = V6System(env=RestrictingEnv(), config=V6Config(database_path=str(db_path), random_seed=0))
+    result = system.run_step()
+    edges = system.memory.edges_from(interaction_node_id(result.interaction_id), "restricts_future_options")
+    assert edges
+    system.close()
+
+
+def test_phase4_isf_changes_when_future_option_delta_is_passed() -> None:
+    without_delta = compute_interaction_significance(
+        reward=0,
+        terminated=False,
+        truncated=False,
+        prediction_correct=None,
+        prediction_confidence=None,
+        actual_family_id=None,
+        delta_id="d",
+        context_signature="ctx",
+        memory_counts={},
+        graph_counts={},
+        future_option_delta=None,
+        outcome_state="NOT_FINISHED",
+        outcome_polarity="neutral",
+        level_completed_event=False,
+    )
+    with_delta = compute_interaction_significance(
+        reward=0,
+        terminated=False,
+        truncated=False,
+        prediction_correct=None,
+        prediction_confidence=None,
+        actual_family_id=None,
+        delta_id="d",
+        context_signature="ctx",
+        memory_counts={},
+        graph_counts={},
+        future_option_delta=2.0,
+        outcome_state="NOT_FINISHED",
+        outcome_polarity="neutral",
+        level_completed_event=False,
+    )
+    assert with_delta.transfer_potential > without_delta.transfer_potential
+
+
+def test_phase4_compact_memory_preserves_future_option_nodes_and_edges(tmp_path) -> None:
+    class ExpandingEnv(ToggleEnv):
+        def available_actions(self) -> list[int]:
+            return [1] if self.state == 0 else [1, 2]
+
+    db_path = tmp_path / "future_compact.sqlite"
+    memory_dir = tmp_path / "future_compact_memory"
+    system = V6System(env=ExpandingEnv(), config=V6Config(database_path=str(db_path), random_seed=0))
+    result = system.run_step()
+    fold_live_system_into_compact_memory(system, memory_dir)
+    system.close()
+    restored = V6System(
+        env=ToggleEnv(),
+        config=V6Config(database_path=":memory:", memory_input_dir=str(memory_dir), restore_compact_memory=True, random_seed=0),
+    )
+    try:
+        future_delta_edges = restored.memory.edges_from(interaction_node_id(result.interaction_id), "changes_future_options")
+        assert future_delta_edges
+    finally:
+        restored.close()
+
+
+def test_phase5_memory_query_disabled_keeps_old_predictor_path(tmp_path) -> None:
+    db_path = tmp_path / "memory_query_disabled.sqlite"
+    system = V6System(
+        env=ToggleEnv(),
+        config=V6Config(database_path=str(db_path), random_seed=0, memory_query_enabled=False),
+    )
+    system.predictor.predict_multi_scale = lambda *_args, **_kwargs: 9
+    result = system.run_step()
+    assert result.predicted_family == 9
+    system.close()
+
+
+def test_phase5_exact_m1_contingency_predicts_family() -> None:
+    connection = sqlite3.connect(":memory:")
+    try:
+        substrate = MemorySubstrate(connection)
+        engine = MemoryQueryEngine(substrate)
+        context_signature = json.dumps(["ctx"])
+        substrate.upsert_node(
+            MemoryNode(
+                node_id="m1exact",
+                memory_level="M1",
+                node_type="ContingencyMemory",
+                attrs={"context_signature": context_signature, "action": 1, "transformation_family": 4, "confidence": 0.9},
+            )
+        )
+        prediction = engine.predict_family({1: ("ctx",)}, 1)
+        assert prediction.predicted_family == 4
+        assert prediction.source == "memory_contingency"
+    finally:
+        connection.close()
+
+
+def test_phase5_contingency_learner_fallback_still_works() -> None:
+    connection = sqlite3.connect(":memory:")
+    try:
+        substrate = MemorySubstrate(connection)
+        learner = type("Learner", (), {"best_stable_for_action": lambda self, *_args, **_kwargs: type("Stable", (), {"transformation_family": 6, "confidence": 0.7})()})()
+        engine = MemoryQueryEngine(substrate, contingency_learner=learner)
+        prediction = engine.predict_family({1: ("ctx",)}, 1)
+        assert prediction.predicted_family == 6
+        assert prediction.source == "contingency_learner"
+    finally:
+        connection.close()
+
+
+def test_phase5_similar_role_can_predict_when_exact_contingency_missing() -> None:
+    connection = sqlite3.connect(":memory:")
+    try:
+        substrate = MemorySubstrate(connection)
+        engine = MemoryQueryEngine(substrate)
+        substrate.upsert_node(MemoryNode(node_id="carrierX", memory_level="M3", node_type="CarrierMemory", attrs={}))
+        substrate.upsert_node(MemoryNode(node_id="roleX", memory_level="M3", node_type="FunctionalRoleMemory", attrs={"transfer_score": 0.6}))
+        substrate.upsert_edge(MemoryEdge("carrierX", "roleX", "plays_role"))
+        substrate.upsert_edge(MemoryEdge("carrierX", family_node_id(7), "associated_with_family"))
+        prediction = engine.predict_family({1: ("ctx",)}, 1)
+        assert prediction.predicted_family == 7
+        assert prediction.source == "role_match"
+    finally:
+        connection.close()
+
+
+def test_phase5_concept_match_can_predict_when_role_exists() -> None:
+    connection = sqlite3.connect(":memory:")
+    try:
+        substrate = MemorySubstrate(connection)
+        engine = MemoryQueryEngine(substrate)
+        substrate.upsert_node(MemoryNode(node_id="carrierY", memory_level="M3", node_type="CarrierMemory", attrs={}))
+        substrate.upsert_node(MemoryNode(node_id="roleY", memory_level="M3", node_type="FunctionalRoleMemory", attrs={}))
+        substrate.upsert_node(MemoryNode(node_id="conceptY", memory_level="M4", node_type="ConceptMemory", attrs={"transfer_success_count": 3}))
+        substrate.upsert_edge(MemoryEdge("roleY", "conceptY", "transfers_to"))
+        substrate.upsert_edge(MemoryEdge("roleY", "carrierY", "abstracts_from"))
+        substrate.upsert_edge(MemoryEdge("carrierY", family_node_id(8), "associated_with_family"))
+        prediction = engine.predict_family({1: ("ctx",)}, 1)
+        assert prediction.predicted_family == 8
+        assert prediction.source in {"role_match", "concept_match"}
+    finally:
+        connection.close()
+
+
+def test_phase5_action_ranking_prefers_positive_future_option_evidence() -> None:
+    connection = sqlite3.connect(":memory:")
+    try:
+        substrate = MemorySubstrate(connection)
+        engine = MemoryQueryEngine(substrate)
+        for action, delta in ((1, 1.0), (2, -1.0)):
+            interaction_id = interaction_node_id(action)
+            substrate.upsert_node(MemoryNode(node_id=interaction_id, memory_level="M0", node_type="InteractionMemory"))
+            substrate.upsert_node(MemoryNode(node_id=action_node_id(action), memory_level="M0", node_type="ActionMemory"))
+            substrate.upsert_edge(MemoryEdge(interaction_id, action_node_id(action), "takes_action"))
+            substrate.upsert_score(MemoryScore(node_id=interaction_id, future_option_delta=delta))
+        ranked = engine.rank_actions({1: ("ctx",)}, [1, 2])
+        assert ranked[0].action == 1
+    finally:
+        connection.close()
+
+
+def test_phase5_action_ranking_penalizes_failure_path_evidence() -> None:
+    connection = sqlite3.connect(":memory:")
+    try:
+        substrate = MemorySubstrate(connection)
+        engine = MemoryQueryEngine(substrate)
+        for action, delta in ((1, -1.0), (2, 0.5)):
+            interaction_id = interaction_node_id(100 + action)
+            substrate.upsert_node(MemoryNode(node_id=interaction_id, memory_level="M0", node_type="InteractionMemory"))
+            substrate.upsert_node(MemoryNode(node_id=action_node_id(action), memory_level="M0", node_type="ActionMemory"))
+            substrate.upsert_edge(MemoryEdge(interaction_id, action_node_id(action), "takes_action"))
+            substrate.upsert_score(MemoryScore(node_id=interaction_id, future_option_delta=delta))
+        ranked = engine.rank_actions({1: ("ctx",)}, [1, 2])
+        assert ranked[0].action == 2
+    finally:
+        connection.close()
+
+
+def test_phase5_memory_action_selection_chooses_best_ranked_action(tmp_path) -> None:
+    class MultiActionEnv(ToggleEnv):
+        def available_actions(self) -> list[int]:
+            return [1, 2]
+
+    db_path = tmp_path / "memory_action_selection.sqlite"
+    system = V6System(
+        env=MultiActionEnv(),
+        config=V6Config(database_path=str(db_path), random_seed=0, memory_action_selection_enabled=True),
+    )
+    system.memory_query.rank_actions = lambda *_args, **_kwargs: [
+        type("Rank", (), {"action": 2, "score": 0.9})(),
+        type("Rank", (), {"action": 1, "score": 0.1})(),
+    ]
+    assert system.choose_action() == 2
+    system.close()
+
+
+def test_phase5_query_event_writes_evidence_edges() -> None:
+    connection = sqlite3.connect(":memory:")
+    try:
+        substrate = MemorySubstrate(connection)
+        engine = MemoryQueryEngine(substrate)
+        substrate.upsert_node(
+            MemoryNode(
+                node_id="m1exact",
+                memory_level="M1",
+                node_type="ContingencyMemory",
+                attrs={"context_signature": json.dumps(["ctx"]), "action": 1, "transformation_family": 4, "confidence": 0.9},
+            )
+        )
+        _prediction = engine.predict_family({1: ("ctx",)}, 1)
+        query_nodes = substrate.query_nodes(memory_level="M5", node_type="MemoryQueryEvent")
+        assert query_nodes
+        used_edges = substrate.edges_from(query_nodes[0]["node_id"], "used_evidence")
+        assert used_edges
+    finally:
+        connection.close()
 
 def test_validation_report_classifies_k0_sufficient(tmp_path) -> None:
     db_path = tmp_path / "k0.sqlite"
@@ -7227,6 +7907,33 @@ def test_cli_accepts_fast_postprocessing_options() -> None:
     assert continuous_args.fast_postprocessing is True
 
 
+def test_cli_accepts_initial_workers_for_continuous_run() -> None:
+    parser = build_parser()
+    default_args = parser.parse_args(
+        [
+            "continuous-research-run",
+            "--experiment-name",
+            "exp",
+            "--output-dir",
+            "runs/out",
+        ]
+    )
+    explicit_args = parser.parse_args(
+        [
+            "continuous-research-run",
+            "--experiment-name",
+            "exp",
+            "--output-dir",
+            "runs/out",
+            "--initial-workers",
+            "3",
+        ]
+    )
+
+    assert default_args.initial_workers is None
+    assert explicit_args.initial_workers == 3
+
+
 def test_v05c_generate_sampling_dbs_passes_context_depth_into_jobs(tmp_path, monkeypatch) -> None:
     captured: list[dict] = []
 
@@ -7553,6 +8260,71 @@ def test_incremental_sidecar_fold_deletes_large_json_sidecars(tmp_path) -> None:
     assert db_path.exists()
     memory_summary = load_memory_summary(memory_dir / "memory_summary.json")
     assert memory_summary["incremental_sidecar_fold"]["db_path"] == str(db_path)
+
+
+def test_parallel_sidecar_fold_shards_then_merges_into_main_memory(tmp_path) -> None:
+    raw_dir = tmp_path / "raw" / "sampling_v05c" / "tt01" / "mixed" / "steps_10"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    db_path = raw_dir / "seed_0.sqlite"
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE transformation_families (id INTEGER PRIMARY KEY, centroid_vector TEXT, support_count INTEGER);
+            INSERT INTO transformation_families (id, centroid_vector, support_count) VALUES (1, '[1,0,0]', 3);
+            """
+        )
+        connection.commit()
+    db_path.with_name("live_graph_compact.json").write_text(
+        json.dumps(
+            {
+                "nodes": [{"node_id": "carrier:c1", "node_type": "carrier", "canonical_key": "c1", "support_count": 1}],
+                "edges": [],
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    db_path.with_name("carrier_candidates.json").write_text(
+        json.dumps(
+            [
+                {
+                    "carrier_id": "c1",
+                    "carrier_signature": "c1",
+                    "carrier_source": "object",
+                    "support_count": 3,
+                    "distinct_family_count": 1,
+                    "family_id": 1,
+                    "context_signature": "[1,2]",
+                    "status": "emergent_carrier",
+                }
+            ],
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    db_path.with_name("context_contradictions.json").write_text("{}", encoding="utf-8")
+    db_path.with_name("memory_lifecycle_summary.json").write_text("{}", encoding="utf-8")
+
+    shard_dir = tmp_path / "memory_shard"
+    shard_summary = fold_sampling_job_sidecars_into_compact_memory_shard(
+        db_path=db_path,
+        shard_memory_dir=shard_dir,
+        fold_config=CompactMemoryFoldConfig(global_step_start=1, global_step_end=10),
+        delete_after_merge=True,
+    )
+    assert shard_summary["graph_live_exports_ingested"] == 1
+    assert shard_summary["carrier_candidates_added"] == 1
+    assert not db_path.with_name("live_graph_compact.json").exists()
+    main_memory_dir = tmp_path / "memory_main"
+    ensure_memory_layout(main_memory_dir)
+    merged = merge_compact_memory_shards_into_main(
+        memory_dir=main_memory_dir,
+        shard_dirs=[shard_dir],
+        fold_config=CompactMemoryFoldConfig(global_step_start=1, global_step_end=10),
+    )
+    assert merged["carrier_candidate_count"] >= 1
+    memory_summary = load_memory_summary(main_memory_dir / "memory_summary.json")
+    assert memory_summary["parallel_sidecar_shard_merge"]["merged_shard_count"] == 1
 
 
 def test_v05c_resolve_scope_clamps_train_and_test_seeds_to_available_set() -> None:

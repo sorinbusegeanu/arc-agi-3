@@ -510,6 +510,59 @@ def test_continuous_run_halves_previous_workers_and_records_ram_start(tmp_path: 
     assert "ram_used_percent" in epoch_start["ram_snapshot_at_epoch_start"]
 
 
+def test_continuous_run_uses_configured_initial_workers(tmp_path: Path, monkeypatch) -> None:
+    captured: list[dict[str, object]] = []
+
+    def fake_run_sampling(config):
+        captured.append(
+            {
+                "workers": int(config.workers),
+                "initial_workers": int(config.initial_workers or 0),
+            }
+        )
+        return _write_sampling_fixture(
+            Path(config.output_dir),
+            global_step_offset=int(config.global_step_offset),
+            stable_support=25,
+            worker_execution={
+                "requested_workers": int(config.workers),
+                "initial_workers": int(config.initial_workers or 0),
+                "peak_workers": int(config.workers),
+                "worker_ramp_enabled": bool(config.enable_worker_ramp),
+                "ram_ramp_threshold_percent": float(config.ram_ramp_threshold_percent),
+                "initial_worker_ramp_delay_seconds": float(config.initial_worker_ramp_delay_seconds),
+                "per_worker_ramp_delay_seconds": float(config.per_worker_ramp_delay_seconds),
+                "ram_used_percent_at_start": 44.0,
+                "ramp_event_count": 0,
+                "ramp_events": [],
+            },
+        )
+
+    monkeypatch.setattr(continuous_research, "run_interaction_sampling_v05c", fake_run_sampling)
+    root = tmp_path / "continuous"
+    run_continuous_research(
+        ContinuousResearchConfig(
+            experiment_name="exp",
+            games="tt01",
+            samplers="mixed",
+            seeds="0",
+            steps_per_epoch=5000,
+            max_epochs=1,
+            horizon=10,
+            context_depth=1,
+            output_dir=str(root),
+            workers=12,
+            initial_workers=3,
+            ram_ramp_threshold_percent=85.0,
+        )
+    )
+
+    assert captured == [{"workers": 12, "initial_workers": 3}]
+    epoch_start = json.loads((root / "epochs" / "epoch_0001" / "status" / "epoch_start.json").read_text(encoding="utf-8"))
+    assert epoch_start["requested_workers"] == 12
+    assert epoch_start["initial_epoch_workers"] == 3
+
+
 def test_disk_stop_triggers_and_default_is_90(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(
         continuous_research,

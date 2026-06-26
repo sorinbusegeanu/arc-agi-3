@@ -35,6 +35,7 @@ class ContinuousResearchConfig:
     replay_retention_percent: int = 5
     fast_postprocessing: bool = True
     workers: int = 60
+    initial_workers: int | None = None
     ram_ramp_threshold_percent: float = 85.0
     initial_worker_ramp_delay_seconds: float = 20.0
     per_worker_ramp_delay_seconds: float = 5.0
@@ -84,7 +85,7 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
         previous_peak_workers = int(manifest.get("last_sampling_peak_workers", config.workers) or config.workers)
         requested_workers = max(1, int(config.workers))
         max_epoch_workers = max(1, min(requested_workers, previous_peak_workers))
-        initial_epoch_workers = 1
+        initial_epoch_workers = max(1, min(int(config.initial_workers or 1), max_epoch_workers))
         initial_worker_ramp_delay_seconds = 0.0
         ram_snapshot_at_epoch_start = _system_ram_snapshot()
         epoch_start_payload = {
