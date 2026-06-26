@@ -128,9 +128,9 @@ class EpisodeAccumulator:
         self.terminal_observed = self.terminal_observed or event.terminal_observed
         if event.terminal_observed:
             self.terminal_type = event.outcome_state or "terminal_transition"
-        if event.outcome_state == "game_won":
+        if event.outcome_state == "WIN":
             self.success_observed = True
-        elif self.success_observed is None and event.outcome_state in {"dead", "end_game"}:
+        elif self.success_observed is None and event.outcome_state == "GAME_OVER":
             self.success_observed = False
         self.blocked_or_no_change_count += int(event.blocked_or_no_change)
         self.non_preserve_count += int(event.non_preserve)
@@ -768,17 +768,24 @@ def process_interaction_row(
     delta = normalized_delta(delta_map.get(int(row["delta_id"])))
     outcome_signature = classify_outcome(before, after, delta)
     outcome_state = row.get("outcome_state")
-    if outcome_state not in {"alive", "dead", "end_game", "game_won", "level_advanced"}:
-        outcome_state = "end_game" if bool(row.get("is_terminal_outcome")) else None
-    if outcome_state == "level_advanced":
-        outcome_signature = "progress:level_advanced"
-    elif outcome_state in {"game_won", "dead", "end_game"}:
+    level_completed_event = bool(row.get("level_completed_event", row.get("level_advanced", 0)))
+    if outcome_state not in {"WIN", "GAME_OVER", "NOT_FINISHED"}:
+        outcome_state = "GAME_OVER" if bool(row.get("is_terminal_outcome")) else None
+    if outcome_state == "WIN":
+        outcome_signature = "terminal:WIN"
+    elif outcome_state == "GAME_OVER":
+        outcome_signature = "terminal:GAME_OVER"
+    elif outcome_state == "NOT_FINISHED" and level_completed_event:
+        outcome_signature = "progress:levels_completed"
+    else:
+        outcome_signature = classify_outcome(before, after, delta)
+    if outcome_state in {"WIN", "GAME_OVER"}:
         outcome_signature = f"terminal:{outcome_state}"
     outcome_polarity = row.get("outcome_polarity")
     terminal_observed = (
         bool(row.get("is_terminal_outcome"))
         or outcome_signature == "terminal_transition"
-        or outcome_state in {"game_won", "dead", "end_game"}
+        or outcome_state in {"WIN", "GAME_OVER"}
     )
     event = TraceEvent(
         game_id=state.game_id,
@@ -850,7 +857,10 @@ def build_m1_contingencies_from_accumulators(
                 first_seen_step=0 if accumulator.first_seen_step is None else int(accumulator.first_seen_step),
                 last_seen_step=0 if accumulator.last_seen_step is None else int(accumulator.last_seen_step),
                 example_episode_ids=list(accumulator.example_episode_ids),
-                terminal_effect_candidate=dominant_outcome == "terminal_transition",
+                terminal_effect_candidate=(
+                    dominant_outcome == "terminal_transition"
+                    or str(dominant_outcome).startswith("terminal:")
+                ),
                 future_option_motif_candidate=motif_candidate(dominant_outcome, accumulator.outcome_counts, accumulator.total_count),
                 discovered=dominant_count >= int(min_support) and accuracy >= float(prediction_threshold),
                 notes={

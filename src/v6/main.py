@@ -163,18 +163,27 @@ class V6System:
                 selected_contingency=selected_contingency,
             )
             observation_after = self.env.step(action)
-            outcome_state_after_step = str(getattr(self.env, "last_outcome_state", "alive") or "alive")
+            outcome_state_after_step = str(getattr(self.env, "last_outcome_state", "NOT_FINISHED") or "NOT_FINISHED")
             if (
                 not bool(getattr(self.env, "last_step_was_reset_boundary", False))
-                or outcome_state_after_step in {"level_advanced", "dead", "end_game", "game_won"}
+                or outcome_state_after_step in {"WIN", "GAME_OVER"}
             ):
                 break
             self.episode_id += 1
         else:
             raise RuntimeError("environment produced too many reset boundaries without an observable transition")
 
+        outcome_state = str(getattr(self.env, "last_outcome_state", "NOT_FINISHED") or "NOT_FINISHED")
+        outcome_polarity = str(getattr(self.env, "last_outcome_polarity", "neutral") or "neutral")
+        level_completed_event = bool(getattr(self.env, "level_completed_event", False))
+        terminal_reset_surrogate = (
+            bool(getattr(self.env, "last_step_was_reset_boundary", False))
+            and outcome_state in {"WIN", "GAME_OVER"}
+        )
+        observation_after_for_delta = observation_before.copy() if terminal_reset_surrogate else observation_after
+
         delta_id = self.transformations.next_delta_id()
-        delta = self.delta_extractor.extract(observation_before, observation_after, delta_id=delta_id)
+        delta = self.delta_extractor.extract(observation_before, observation_after_for_delta, delta_id=delta_id)
         self.transformations.add_delta(delta)
 
         interaction_id = self.interactions.next_id()
@@ -184,7 +193,7 @@ class V6System:
             global_step=int(self.config.global_step_offset) + int(interaction_id),
             observation_before=observation_before,
             action=action,
-            observation_after=observation_after,
+            observation_after=observation_after_for_delta,
             delta_id=delta.id,
         )
         self.step_count = int(interaction_id)
@@ -218,14 +227,13 @@ class V6System:
         serialized_context_signature = json.dumps(list(prediction_context_signature))
         action_signature = f"a{int(action)}"
         actual_family_id = None if actual_family is None else str(actual_family)
-        outcome_state = str(getattr(self.env, "last_outcome_state", "alive") or "alive")
-        outcome_polarity = str(getattr(self.env, "last_outcome_polarity", "neutral") or "neutral")
-        level_advanced = bool(getattr(self.env, "level_advanced", False))
+        stable_delta_key = self._stable_delta_key(delta, outcome_state=outcome_state, level_completed_event=level_completed_event)
         memory_counts = self._build_isf_memory_counts(
-            delta_id=str(delta.id),
+            delta_id=stable_delta_key,
             actual_family_id=actual_family_id,
             context_signature=serialized_context_signature,
             outcome_state=outcome_state,
+            level_completed_event=level_completed_event,
         )
         reward = getattr(self.env, "last_reward", None)
         terminated = bool(getattr(self.env, "last_terminal_state", None))
@@ -253,16 +261,17 @@ class V6System:
             prediction_correct=prediction_correct,
             prediction_confidence=prediction_confidence,
             actual_family_id=actual_family_id,
-            delta_id=str(delta.id),
+            delta_id=stable_delta_key,
             context_signature=serialized_context_signature,
             memory_counts=memory_counts,
             graph_counts=isf_graph_counts,
             outcome_state=outcome_state,
             outcome_polarity=outcome_polarity,
+            level_completed_event=level_completed_event,
         )
         carrier_signature, carrier_source = extract_carrier_signature(
             before_observation=observation_before,
-            after_observation=observation_after,
+            after_observation=observation_after_for_delta,
             delta=delta,
             context_signature=serialized_context_signature,
             action_signature=action_signature,
@@ -294,7 +303,7 @@ class V6System:
         efficiency_event = self.efficiency_tracker.record_interaction(
             interaction_id=str(interaction.id),
             before_observation=observation_before,
-            after_observation=observation_after,
+            after_observation=observation_after_for_delta,
             delta=delta,
             context_signature=serialized_context_signature,
             action_signature=action_signature,
@@ -406,7 +415,7 @@ class V6System:
             efficiency_future_option_gain_per_cost=efficiency_event.future_option_gain_per_cost,
             outcome_state=outcome_state,
             outcome_polarity=outcome_polarity,
-            level_advanced=level_advanced,
+            level_completed_event=level_completed_event,
         )
         interaction = Interaction(
             id=interaction_id,
@@ -414,7 +423,7 @@ class V6System:
             global_step=int(self.config.global_step_offset) + int(interaction_id),
             observation_before=observation_before,
             action=action,
-            observation_after=observation_after,
+            observation_after=observation_after_for_delta,
             delta_id=delta.id,
             isf_version=isf_score.version,
             isf_total=isf_score.total,
@@ -451,7 +460,7 @@ class V6System:
             efficiency_future_option_gain_per_cost=efficiency_event.future_option_gain_per_cost,
             outcome_state=outcome_state,
             outcome_polarity=outcome_polarity,
-            level_advanced=level_advanced,
+            level_completed_event=level_completed_event,
         )
         self.connection.execute(
             """
@@ -492,7 +501,7 @@ class V6System:
                 efficiency_future_option_gain_per_cost = ?,
                 outcome_state = ?,
                 outcome_polarity = ?,
-                level_advanced = ?
+                level_completed_event = ?
             WHERE id = ?
             """,
             (
@@ -531,15 +540,16 @@ class V6System:
                 interaction.efficiency_future_option_gain_per_cost,
                 interaction.outcome_state,
                 interaction.outcome_polarity,
-                int(bool(interaction.level_advanced)),
+                int(bool(interaction.level_completed_event)),
                 interaction.id,
             ),
         )
         self._update_isf_counts(
-            delta_id=str(delta.id),
+            delta_id=stable_delta_key,
             actual_family_id=actual_family_id,
             context_signature=serialized_context_signature,
             outcome_state=outcome_state,
+            level_completed_event=level_completed_event,
         )
         self._add_carrier_edges(
             interaction_id=interaction.id,
@@ -691,6 +701,7 @@ class V6System:
         actual_family_id: str | None,
         context_signature: str | None,
         outcome_state: str | None,
+        level_completed_event: bool = False,
     ) -> dict[str, int]:
         counts: dict[str, int] = {}
         if delta_id:
@@ -708,6 +719,11 @@ class V6System:
         if context_signature and outcome_state:
             key = f"context_outcome:{context_signature}|{outcome_state}"
             counts[key] = int(self._isf_counts.get(key, 0))
+        if level_completed_event:
+            counts["level_completed_event:true"] = int(self._isf_counts.get("level_completed_event:true", 0))
+        if context_signature and level_completed_event:
+            key = f"context_level_completed:{context_signature}|true"
+            counts[key] = int(self._isf_counts.get(key, 0))
         return counts
 
     def _update_isf_counts(
@@ -717,6 +733,7 @@ class V6System:
         actual_family_id: str | None,
         context_signature: str | None,
         outcome_state: str | None,
+        level_completed_event: bool = False,
     ) -> None:
         if delta_id:
             key = f"delta_id:{delta_id}"
@@ -736,6 +753,21 @@ class V6System:
         if context_signature and outcome_state:
             key = f"context_outcome:{context_signature}|{outcome_state}"
             self._isf_counts[key] = int(self._isf_counts.get(key, 0)) + 1
+        if level_completed_event:
+            key = "level_completed_event:true"
+            self._isf_counts[key] = int(self._isf_counts.get(key, 0)) + 1
+        if context_signature and level_completed_event:
+            key = f"context_level_completed:{context_signature}|true"
+            self._isf_counts[key] = int(self._isf_counts.get(key, 0)) + 1
+
+    def _stable_delta_key(self, delta: Any, outcome_state: str, level_completed_event: bool) -> str:
+        changed_cells = getattr(delta, "changed_cells", None)
+        dx = getattr(delta, "dx", None)
+        dy = getattr(delta, "dy", None)
+        return (
+            f"cells={changed_cells}|dx={dx}|dy={dy}|state={outcome_state}|"
+            f"level_completed={int(bool(level_completed_event))}"
+        )
 
     def _add_prediction_explanation_edges(
         self,

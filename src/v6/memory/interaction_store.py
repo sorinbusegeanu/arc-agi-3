@@ -51,7 +51,7 @@ class Interaction:
     efficiency_future_option_gain_per_cost: float | None = None
     outcome_state: str | None = None
     outcome_polarity: str | None = None
-    level_advanced: bool = False
+    level_completed_event: bool = False
 
 
 def encode_array(array: np.ndarray) -> bytes:
@@ -116,7 +116,7 @@ class InteractionStore:
                 efficiency_future_option_gain_per_cost REAL,
                 outcome_state TEXT,
                 outcome_polarity TEXT,
-                level_advanced INTEGER
+                level_completed_event INTEGER
             )
             """
         )
@@ -156,6 +156,7 @@ class InteractionStore:
         self._ensure_column("efficiency_future_option_gain_per_cost", "REAL")
         self._ensure_column("outcome_state", "TEXT")
         self._ensure_column("outcome_polarity", "TEXT")
+        self._ensure_column("level_completed_event", "INTEGER")
         self._ensure_column("level_advanced", "INTEGER")
         self.connection.commit()
 
@@ -215,7 +216,7 @@ class InteractionStore:
                 efficiency_future_option_gain_per_cost,
                 outcome_state,
                 outcome_polarity,
-                level_advanced
+                level_completed_event
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
@@ -262,7 +263,7 @@ class InteractionStore:
                 None if interaction.efficiency_future_option_gain_per_cost is None else float(interaction.efficiency_future_option_gain_per_cost),
                 interaction.outcome_state,
                 interaction.outcome_polarity,
-                int(bool(interaction.level_advanced)),
+                int(bool(interaction.level_completed_event)),
             ),
         )
         if self.auto_commit:
@@ -314,7 +315,7 @@ class InteractionStore:
                 efficiency_future_option_gain_per_cost,
                 outcome_state,
                 outcome_polarity,
-                level_advanced
+                COALESCE(level_completed_event, level_advanced)
             FROM interactions
             WHERE id = ?
             """,
@@ -365,7 +366,7 @@ class InteractionStore:
             efficiency_future_option_gain_per_cost=None if row[39] is None else float(row[39]),
             outcome_state=None if row[40] is None else str(row[40]),
             outcome_polarity=None if row[41] is None else str(row[41]),
-            level_advanced=bool(row[42]) if row[42] is not None else False,
+            level_completed_event=bool(row[42]) if row[42] is not None else False,
         )
 
     def count(self) -> int:

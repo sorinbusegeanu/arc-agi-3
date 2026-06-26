@@ -79,7 +79,7 @@ class ContingencyStore:
                 efficiency_future_option_gain_per_cost REAL,
                 outcome_state TEXT,
                 outcome_polarity TEXT,
-                level_advanced INTEGER
+                level_completed_event INTEGER
             )
             """
         )
@@ -127,6 +127,7 @@ class ContingencyStore:
         self._ensure_column("prediction_results", "efficiency_future_option_gain_per_cost", "REAL")
         self._ensure_column("prediction_results", "outcome_state", "TEXT")
         self._ensure_column("prediction_results", "outcome_polarity", "TEXT")
+        self._ensure_column("prediction_results", "level_completed_event", "INTEGER")
         self._ensure_column("prediction_results", "level_advanced", "INTEGER")
         self.connection.commit()
 
@@ -221,7 +222,7 @@ class ContingencyStore:
         efficiency_future_option_gain_per_cost: float | None = None,
         outcome_state: str | None = None,
         outcome_polarity: str | None = None,
-        level_advanced: bool = False,
+        level_completed_event: bool = False,
     ) -> int | None:
         prediction_error: int | None
         if predicted_family is None or actual_family is None:
@@ -280,7 +281,7 @@ class ContingencyStore:
                 efficiency_future_option_gain_per_cost,
                 outcome_state,
                 outcome_polarity,
-                level_advanced
+                level_completed_event
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
@@ -334,7 +335,7 @@ class ContingencyStore:
                 None if efficiency_future_option_gain_per_cost is None else float(efficiency_future_option_gain_per_cost),
                 outcome_state,
                 outcome_polarity,
-                int(bool(level_advanced)),
+                int(bool(level_completed_event)),
             ),
         )
         if self.auto_commit:

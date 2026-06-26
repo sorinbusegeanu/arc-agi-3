@@ -297,29 +297,29 @@ class ToggleEnv:
 
 
 class OutcomeEnv(ToggleEnv):
-    def __init__(self, *, outcome_state: str, outcome_polarity: str, starting_level: int = 1, next_level: int | None = None, state_name: str | None = None) -> None:
+    def __init__(self, *, outcome_state: str, outcome_polarity: str, starting_level: int = 0, next_level: int | None = None, state_name: str | None = None) -> None:
         super().__init__()
         self._configured_outcome_state = str(outcome_state)
         self._configured_outcome_polarity = str(outcome_polarity)
         self._starting_level = int(starting_level)
         self._next_level = self._starting_level if next_level is None else int(next_level)
         self._state_name = state_name
-        self.last_outcome_state = "alive"
+        self.last_outcome_state = "NOT_FINISHED"
         self.last_outcome_polarity = "neutral"
         self.last_terminal_state = None
         self.last_step_was_reset_boundary = False
         self.last_reward = 0
-        self.last_level_number = self._starting_level
-        self.level_advanced = False
+        self.last_levels_completed = self._starting_level
+        self.level_completed_event = False
 
     def step(self, action: int) -> np.ndarray:
         grid = super().step(action)
         self.last_outcome_state = self._configured_outcome_state
         self.last_outcome_polarity = self._configured_outcome_polarity
-        self.last_terminal_state = self._configured_outcome_state if self._configured_outcome_state in {"game_won", "dead", "end_game"} else None
-        self.last_step_was_reset_boundary = self._configured_outcome_state == "end_game"
-        self.level_advanced = self._configured_outcome_state == "level_advanced"
-        self.last_level_number = self._next_level
+        self.last_terminal_state = self._configured_outcome_state if self._configured_outcome_state in {"WIN", "GAME_OVER"} else None
+        self.last_step_was_reset_boundary = self._configured_outcome_state in {"WIN", "GAME_OVER"} and self._state_name is None
+        self.level_completed_event = self._next_level > self.last_levels_completed
+        self.last_levels_completed = self._next_level
         self.state = self._state_name or self.state
         return grid
 
@@ -1357,7 +1357,7 @@ def test_interaction_significance_terminal_signal_boosts_survival_impact() -> No
     assert score.survival_impact >= 0.75
 
 
-def test_interaction_significance_game_won_uses_categorical_outcome_state() -> None:
+def test_interaction_significance_win_uses_engine_outcome_state() -> None:
     score = compute_interaction_significance(
         reward=0,
         terminated=False,
@@ -1367,9 +1367,9 @@ def test_interaction_significance_game_won_uses_categorical_outcome_state() -> N
         actual_family_id=None,
         delta_id=None,
         context_signature="ctx",
-        memory_counts={"outcome_state:game_won": 0, "context_outcome:ctx|game_won": 0},
+        memory_counts={"outcome_state:WIN": 0, "context_outcome:ctx|WIN": 0},
         graph_counts={},
-        outcome_state="game_won",
+        outcome_state="WIN",
         outcome_polarity=None,
     )
 
@@ -1378,7 +1378,7 @@ def test_interaction_significance_game_won_uses_categorical_outcome_state() -> N
     assert score.learning_value >= 0.99
 
 
-def test_interaction_significance_dead_uses_negative_outcome_polarity() -> None:
+def test_interaction_significance_game_over_uses_negative_outcome_polarity() -> None:
     score = compute_interaction_significance(
         reward=0,
         terminated=False,
@@ -1388,9 +1388,9 @@ def test_interaction_significance_dead_uses_negative_outcome_polarity() -> None:
         actual_family_id=None,
         delta_id=None,
         context_signature="ctx",
-        memory_counts={"outcome_state:dead": 0},
+        memory_counts={"outcome_state:GAME_OVER": 0},
         graph_counts={},
-        outcome_state="dead",
+        outcome_state="GAME_OVER",
         outcome_polarity=None,
     )
 
@@ -1398,7 +1398,7 @@ def test_interaction_significance_dead_uses_negative_outcome_polarity() -> None:
     assert score.outcome_polarity == "negative"
 
 
-def test_interaction_significance_repeated_game_won_has_lower_learning_value() -> None:
+def test_interaction_significance_repeated_win_has_lower_learning_value() -> None:
     score_low = compute_interaction_significance(
         reward=0,
         terminated=False,
@@ -1409,12 +1409,12 @@ def test_interaction_significance_repeated_game_won_has_lower_learning_value() -
         delta_id=None,
         context_signature="ctx",
         memory_counts={
-            "outcome_state:game_won": 0,
-            "context_outcome:ctx|game_won": 0,
+            "outcome_state:WIN": 0,
+            "context_outcome:ctx|WIN": 0,
             "context_signature:ctx": 0,
         },
         graph_counts={},
-        outcome_state="game_won",
+        outcome_state="WIN",
         outcome_polarity="positive",
     )
     score_high = compute_interaction_significance(
@@ -1427,19 +1427,19 @@ def test_interaction_significance_repeated_game_won_has_lower_learning_value() -
         delta_id=None,
         context_signature="ctx",
         memory_counts={
-            "outcome_state:game_won": 100,
-            "context_outcome:ctx|game_won": 100,
+            "outcome_state:WIN": 100,
+            "context_outcome:ctx|WIN": 100,
             "context_signature:ctx": 100,
         },
         graph_counts={},
-        outcome_state="game_won",
+        outcome_state="WIN",
         outcome_polarity="positive",
     )
 
     assert score_low.learning_value > score_high.learning_value
 
 
-def test_interaction_significance_alive_keeps_low_survival_without_other_signal() -> None:
+def test_interaction_significance_not_finished_keeps_low_survival_without_other_signal() -> None:
     score = compute_interaction_significance(
         reward=0,
         terminated=False,
@@ -1451,7 +1451,7 @@ def test_interaction_significance_alive_keeps_low_survival_without_other_signal(
         context_signature="ctx",
         memory_counts={},
         graph_counts={},
-        outcome_state="alive",
+        outcome_state="NOT_FINISHED",
         outcome_polarity="neutral",
     )
 
@@ -1518,12 +1518,12 @@ def test_v6_system_run_step_stores_isf_fields(tmp_path) -> None:
         connection.close()
 
 
-def test_level_number_changes_with_unchanged_state_marks_level_advanced() -> None:
+def test_levels_completed_change_marks_level_completed_event_without_inventing_state() -> None:
     class Raw:
-        def __init__(self, frame, state="NOT_FINISHED", level=1):
+        def __init__(self, frame, state="NOT_FINISHED", levels_completed=0):
             self.frame = frame
             self.state = state
-            self.level = level
+            self.levels_completed = levels_completed
             self.available_actions = [1]
 
     class FakeInnerEnv:
@@ -1531,11 +1531,11 @@ def test_level_number_changes_with_unchanged_state_marks_level_advanced() -> Non
             self.step_count = 0
 
         def reset(self):
-            return Raw(np.zeros((2, 2), dtype=int), level=1)
+            return Raw(np.zeros((2, 2), dtype=int), levels_completed=0)
 
         def step(self, _action):
             self.step_count += 1
-            return Raw(np.ones((2, 2), dtype=int), state="NOT_FINISHED", level=2)
+            return Raw(np.ones((2, 2), dtype=int), state="NOT_FINISHED", levels_completed=1)
 
         def available_actions(self):
             return [1]
@@ -1550,19 +1550,19 @@ def test_level_number_changes_with_unchanged_state_marks_level_advanced() -> Non
         env.skipped_terminal_steps = 0
         env.last_step_was_reset_boundary = False
         env.last_terminal_state = None
-        env.last_outcome_state = "alive"
+        env.last_outcome_state = "NOT_FINISHED"
         env.last_outcome_polarity = "neutral"
-        env.last_level_number = 1
-        env.level_advanced = False
+        env.last_levels_completed = 0
+        env.level_completed_event = False
         env._last_raw = env.env.reset()
         env._last_grid = np.zeros((2, 2), dtype=int)
 
         env.step(1)
 
-        assert env.last_outcome_state == "level_advanced"
+        assert env.last_outcome_state == "NOT_FINISHED"
         assert env.last_outcome_polarity == "positive"
-        assert env.level_advanced is True
-        assert env.last_level_number == 2
+        assert env.level_completed_event is True
+        assert env.last_levels_completed == 1
     finally:
         if previous is None:
             sys.modules.pop("arcengine", None)
@@ -1570,7 +1570,54 @@ def test_level_number_changes_with_unchanged_state_marks_level_advanced() -> Non
             sys.modules["arcengine"] = previous
 
 
-def test_interaction_significance_level_advanced_has_positive_survival_signal() -> None:
+def test_adapter_preserves_engine_states_without_invented_labels() -> None:
+    class Raw:
+        def __init__(self, frame, state, levels_completed=0):
+            self.frame = frame
+            self.state = state
+            self.levels_completed = levels_completed
+            self.available_actions = [1]
+
+    class FakeInnerEnv:
+        def __init__(self, raw):
+            self._raw = raw
+
+        def reset(self):
+            return Raw(np.zeros((2, 2), dtype=int), "NOT_FINISHED", 0)
+
+        def step(self, _action):
+            return self._raw
+
+    previous = sys.modules.get("arcengine")
+    sys.modules["arcengine"] = types.SimpleNamespace(GameAction=types.SimpleNamespace(from_id=lambda value: value))
+    try:
+        for state_name, expected_polarity in (("WIN", "positive"), ("GAME_OVER", "negative"), ("NOT_FINISHED", "neutral")):
+            env = object.__new__(ArcGridEnvironment)
+            env.env = FakeInnerEnv(Raw(np.ones((2, 2), dtype=int), state_name, 0))
+            env.auto_reset_on_empty_frame = True
+            env.reset_count = 0
+            env.skipped_terminal_steps = 0
+            env.last_step_was_reset_boundary = False
+            env.last_terminal_state = None
+            env.last_outcome_state = "NOT_FINISHED"
+            env.last_outcome_polarity = "neutral"
+            env.last_levels_completed = 0
+            env.level_completed_event = False
+            env._last_raw = env.env.reset()
+            env._last_grid = np.zeros((2, 2), dtype=int)
+
+            env.step(1)
+
+            assert env.last_outcome_state == state_name
+            assert env.last_outcome_polarity == expected_polarity
+    finally:
+        if previous is None:
+            sys.modules.pop("arcengine", None)
+        else:
+            sys.modules["arcengine"] = previous
+
+
+def test_interaction_significance_level_completed_event_has_positive_survival_signal() -> None:
     score = compute_interaction_significance(
         reward=0,
         terminated=False,
@@ -1580,10 +1627,11 @@ def test_interaction_significance_level_advanced_has_positive_survival_signal() 
         actual_family_id=None,
         delta_id=None,
         context_signature="ctx",
-        memory_counts={"outcome_state:level_advanced": 0, "context_outcome:ctx|level_advanced": 0},
+        memory_counts={"level_completed_event:true": 0, "context_level_completed:ctx|true": 0},
         graph_counts={},
-        outcome_state="level_advanced",
+        outcome_state="NOT_FINISHED",
         outcome_polarity=None,
+        level_completed_event=True,
     )
 
     assert score.survival_impact >= 0.75
@@ -1591,10 +1639,10 @@ def test_interaction_significance_level_advanced_has_positive_survival_signal() 
     assert score.version == "isf_v02"
 
 
-def test_v6_system_run_step_stores_level_advanced_fields(tmp_path) -> None:
+def test_v6_system_run_step_stores_level_completed_event_fields(tmp_path) -> None:
     db_path = tmp_path / "outcomes.sqlite"
     system = V6System(
-        env=OutcomeEnv(outcome_state="level_advanced", outcome_polarity="positive", starting_level=1, next_level=2),
+        env=OutcomeEnv(outcome_state="NOT_FINISHED", outcome_polarity="positive", starting_level=0, next_level=1),
         config=V6Config(
             database_path=str(db_path),
             recluster_every=2,
@@ -1613,7 +1661,7 @@ def test_v6_system_run_step_stores_level_advanced_fields(tmp_path) -> None:
     try:
         interaction_row = connection.execute(
             """
-            SELECT outcome_state, outcome_polarity, level_advanced
+            SELECT outcome_state, outcome_polarity, level_completed_event
             FROM interactions
             ORDER BY id
             LIMIT 1
@@ -1621,7 +1669,7 @@ def test_v6_system_run_step_stores_level_advanced_fields(tmp_path) -> None:
         ).fetchone()
         prediction_row = connection.execute(
             """
-            SELECT outcome_state, outcome_polarity, level_advanced
+            SELECT outcome_state, outcome_polarity, level_completed_event
             FROM prediction_results
             ORDER BY id
             LIMIT 1
@@ -1630,8 +1678,8 @@ def test_v6_system_run_step_stores_level_advanced_fields(tmp_path) -> None:
     finally:
         connection.close()
 
-    assert interaction_row == ("level_advanced", "positive", 1)
-    assert prediction_row == ("level_advanced", "positive", 1)
+    assert interaction_row == ("NOT_FINISHED", "positive", 1)
+    assert prediction_row == ("NOT_FINISHED", "positive", 1)
 
 
 def test_v6_system_prediction_edges_add_explains_and_depends_on() -> None:
@@ -3063,10 +3111,10 @@ def test_v06_builds_m0_episode_summaries(tmp_path) -> None:
     assert loaded["episodes"][0].trajectory_cost == loaded["episodes"][0].steps_total
     assert loaded["episodes"][0].success_observed is True
     assert loaded["episodes"][0].terminal_observed is True
-    assert loaded["episodes"][0].terminal_type == "game_won"
+    assert loaded["episodes"][0].terminal_type == "WIN"
 
 
-def test_v06_maps_level_advanced_and_terminal_outcomes() -> None:
+def test_v06_maps_levels_completed_and_terminal_outcomes() -> None:
     state = RunStreamingState(game_id="va02", sampler="mixed", seed=0, context_depth=1, exact_reconstruction=False)
     before = _obs(0)
     after = _obs(1)
@@ -3081,14 +3129,14 @@ def test_v06_maps_level_advanced_and_terminal_outcomes() -> None:
     delta_map = {1: {"changed_cells": 1, "dx": 1.0, "dy": 0.0}}
 
     event_level, _, _ = process_interaction_row(
-        {**base_row, "outcome_state": "level_advanced", "outcome_polarity": "positive", "level_advanced": 1},
+        {**base_row, "outcome_state": "NOT_FINISHED", "outcome_polarity": "positive", "level_completed_event": 1},
         state=state,
         delta_map=delta_map,
     )
-    assert event_level.outcome_signature == "progress:level_advanced"
+    assert event_level.outcome_signature == "progress:levels_completed"
     assert event_level.terminal_observed is False
 
-    for outcome_state in ("dead", "game_won", "end_game"):
+    for outcome_state in ("GAME_OVER", "WIN"):
         terminal_state = RunStreamingState(game_id="va02", sampler="mixed", seed=0, context_depth=1, exact_reconstruction=False)
         event_terminal, _, _ = process_interaction_row(
             {**base_row, "outcome_state": outcome_state, "outcome_polarity": "negative", "is_terminal_outcome": 1},
@@ -7133,12 +7181,12 @@ def _build_v06_fixture(root) -> str:
     interactions = []
     deltas = []
     rows = [
-        (_obs(0), _obs(1), 4, "alive", "neutral"),
-        (_obs(1), _obs(2), 4, "alive", "neutral"),
-        (_obs(2), _obs(2), 4, "game_won", "positive"),
-        (_obs(0), _obs(1), 4, "alive", "neutral"),
-        (_obs(1), _obs(2), 4, "alive", "neutral"),
-        (_obs(2), _obs(3), 4, "dead", "negative"),
+        (_obs(0), _obs(1), 4, "NOT_FINISHED", "neutral"),
+        (_obs(1), _obs(2), 4, "NOT_FINISHED", "neutral"),
+        (_obs(2), _obs(2), 4, "WIN", "positive"),
+        (_obs(0), _obs(1), 4, "NOT_FINISHED", "neutral"),
+        (_obs(1), _obs(2), 4, "NOT_FINISHED", "neutral"),
+        (_obs(2), _obs(3), 4, "GAME_OVER", "negative"),
     ]
     for index, (before, after, action, outcome_state, outcome_polarity) in enumerate(rows, start=1):
         interactions.append(
@@ -7151,9 +7199,9 @@ def _build_v06_fixture(root) -> str:
                 "delta_id": index,
                 "outcome_state": outcome_state,
                 "outcome_polarity": outcome_polarity,
-                "is_terminal_outcome": int(outcome_state in {"game_won", "dead", "end_game"}),
-                "is_success_outcome": int(outcome_state == "game_won"),
-                "is_failure_outcome": int(outcome_state == "dead"),
+                "is_terminal_outcome": int(outcome_state in {"WIN", "GAME_OVER"}),
+                "is_success_outcome": int(outcome_state == "WIN"),
+                "is_failure_outcome": int(outcome_state == "GAME_OVER"),
             }
         )
         deltas.append(
@@ -8709,7 +8757,7 @@ def _trace_event(*, step: int, action: int, context: tuple[str, ...], outcome: s
         state_after_signature=f"s{step+1}",
         blocked_or_no_change=blocked,
         non_preserve=non_preserve,
-        terminal_observed=outcome == "terminal_transition" or outcome_state in {"game_won", "dead", "end_game"},
+        terminal_observed=outcome == "terminal_transition" or outcome_state in {"WIN", "GAME_OVER"},
         outcome_state=outcome_state,
         outcome_polarity=outcome_polarity,
         delta_summary={},

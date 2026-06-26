@@ -77,6 +77,7 @@ def compute_interaction_significance(
     explanatory_delta: float | None = None,
     outcome_state: str | None = None,
     outcome_polarity: str | None = None,
+    level_completed_event: bool = False,
     weights: Mapping[str, float] | None = None,
 ) -> InteractionSignificanceScore:
     normalized_weights = _normalize_weights(weights)
@@ -89,19 +90,16 @@ def compute_interaction_significance(
         survival_impact = max(survival_impact, 0.75)
     normalized_outcome_state = None if outcome_state in (None, "") else str(outcome_state)
     normalized_outcome_polarity = None if outcome_polarity in (None, "") else str(outcome_polarity)
-    if normalized_outcome_state == "game_won":
+    if normalized_outcome_state == "WIN":
         survival_impact = 1.0
         normalized_outcome_polarity = "positive"
-    elif normalized_outcome_state == "dead":
+    elif normalized_outcome_state == "GAME_OVER":
         survival_impact = 1.0
         normalized_outcome_polarity = "negative"
-    elif normalized_outcome_state == "end_game":
-        survival_impact = max(survival_impact, 0.85)
-        normalized_outcome_polarity = normalized_outcome_polarity or "unknown"
-    elif normalized_outcome_state == "level_advanced":
+    elif bool(level_completed_event):
         survival_impact = max(survival_impact, 0.75)
         normalized_outcome_polarity = "positive"
-    elif normalized_outcome_state == "alive":
+    elif normalized_outcome_state == "NOT_FINISHED":
         survival_impact = max(survival_impact, 0.0)
         normalized_outcome_polarity = normalized_outcome_polarity or "neutral"
 
@@ -125,10 +123,17 @@ def compute_interaction_significance(
         novelty_scores.append(_novelty(memory_counts.get(f"outcome_state:{normalized_outcome_state}", 0)))
     if context_signature and normalized_outcome_state:
         novelty_scores.append(_novelty(memory_counts.get(f"context_outcome:{context_signature}|{normalized_outcome_state}", 0)))
+    if bool(level_completed_event):
+        novelty_scores.append(_novelty(memory_counts.get("level_completed_event:true", 0)))
+    if context_signature and bool(level_completed_event):
+        novelty_scores.append(_novelty(memory_counts.get(f"context_level_completed:{context_signature}|true", 0)))
     learning_value = max(novelty_scores) if novelty_scores else 0.5
-    if normalized_outcome_state in {"game_won", "dead", "end_game", "level_advanced"}:
-        progress_outcome_learning_value = _novelty(memory_counts.get(f"outcome_state:{normalized_outcome_state}", 0))
-        learning_value = max(learning_value, progress_outcome_learning_value)
+    if normalized_outcome_state in {"WIN", "GAME_OVER"}:
+        terminal_outcome_learning_value = _novelty(memory_counts.get(f"outcome_state:{normalized_outcome_state}", 0))
+        learning_value = max(learning_value, terminal_outcome_learning_value)
+    if bool(level_completed_event):
+        progress_learning_value = _novelty(memory_counts.get("level_completed_event:true", 0))
+        learning_value = max(learning_value, progress_learning_value)
 
     if future_option_delta is not None:
         transfer_potential = clamp01(abs(future_option_delta))
