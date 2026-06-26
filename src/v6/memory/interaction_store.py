@@ -56,6 +56,11 @@ class Interaction:
     post_factum_level_completion_decay: float | None = None
     post_factum_level_completion_step: int | None = None
     post_factum_credit_reason: str | None = None
+    post_factum_trajectory_credit: float = 0.0
+    post_factum_trajectory_credit_kind: str | None = None
+    post_factum_trajectory_credit_polarity: str | None = None
+    post_factum_trajectory_credit_step: int | None = None
+    post_factum_trajectory_credit_reason: str | None = None
 
 
 def encode_array(array: np.ndarray) -> bytes:
@@ -124,7 +129,12 @@ class InteractionStore:
                 post_factum_level_completion_credit REAL DEFAULT 0.0,
                 post_factum_level_completion_decay REAL,
                 post_factum_level_completion_step INTEGER,
-                post_factum_credit_reason TEXT
+                post_factum_credit_reason TEXT,
+                post_factum_trajectory_credit REAL DEFAULT 0.0,
+                post_factum_trajectory_credit_kind TEXT,
+                post_factum_trajectory_credit_polarity TEXT,
+                post_factum_trajectory_credit_step INTEGER,
+                post_factum_trajectory_credit_reason TEXT
             )
             """
         )
@@ -169,6 +179,11 @@ class InteractionStore:
         self._ensure_column("post_factum_level_completion_decay", "REAL")
         self._ensure_column("post_factum_level_completion_step", "INTEGER")
         self._ensure_column("post_factum_credit_reason", "TEXT")
+        self._ensure_column("post_factum_trajectory_credit", "REAL DEFAULT 0.0")
+        self._ensure_column("post_factum_trajectory_credit_kind", "TEXT")
+        self._ensure_column("post_factum_trajectory_credit_polarity", "TEXT")
+        self._ensure_column("post_factum_trajectory_credit_step", "INTEGER")
+        self._ensure_column("post_factum_trajectory_credit_reason", "TEXT")
         self._ensure_column("level_advanced", "INTEGER")
         self.connection.commit()
 
@@ -232,9 +247,14 @@ class InteractionStore:
                 post_factum_level_completion_credit,
                 post_factum_level_completion_decay,
                 post_factum_level_completion_step,
-                post_factum_credit_reason
+                post_factum_credit_reason,
+                post_factum_trajectory_credit,
+                post_factum_trajectory_credit_kind,
+                post_factum_trajectory_credit_polarity,
+                post_factum_trajectory_credit_step,
+                post_factum_trajectory_credit_reason
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 int(interaction.id),
@@ -284,6 +304,11 @@ class InteractionStore:
                 None if interaction.post_factum_level_completion_decay is None else float(interaction.post_factum_level_completion_decay),
                 None if interaction.post_factum_level_completion_step is None else int(interaction.post_factum_level_completion_step),
                 interaction.post_factum_credit_reason,
+                float(interaction.post_factum_trajectory_credit),
+                interaction.post_factum_trajectory_credit_kind,
+                interaction.post_factum_trajectory_credit_polarity,
+                None if interaction.post_factum_trajectory_credit_step is None else int(interaction.post_factum_trajectory_credit_step),
+                interaction.post_factum_trajectory_credit_reason,
             ),
         )
         if self.auto_commit:
@@ -339,7 +364,12 @@ class InteractionStore:
                 post_factum_level_completion_credit,
                 post_factum_level_completion_decay,
                 post_factum_level_completion_step,
-                post_factum_credit_reason
+                post_factum_credit_reason,
+                post_factum_trajectory_credit,
+                post_factum_trajectory_credit_kind,
+                post_factum_trajectory_credit_polarity,
+                post_factum_trajectory_credit_step,
+                post_factum_trajectory_credit_reason
             FROM interactions
             WHERE id = ?
             """,
@@ -395,6 +425,11 @@ class InteractionStore:
             post_factum_level_completion_decay=None if row[44] is None else float(row[44]),
             post_factum_level_completion_step=None if row[45] is None else int(row[45]),
             post_factum_credit_reason=None if row[46] is None else str(row[46]),
+            post_factum_trajectory_credit=0.0 if row[47] is None else float(row[47]),
+            post_factum_trajectory_credit_kind=None if row[48] is None else str(row[48]),
+            post_factum_trajectory_credit_polarity=None if row[49] is None else str(row[49]),
+            post_factum_trajectory_credit_step=None if row[50] is None else int(row[50]),
+            post_factum_trajectory_credit_reason=None if row[51] is None else str(row[51]),
         )
 
     def count(self) -> int:

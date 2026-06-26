@@ -83,7 +83,12 @@ class ContingencyStore:
                 post_factum_level_completion_credit REAL DEFAULT 0.0,
                 post_factum_level_completion_decay REAL,
                 post_factum_level_completion_step INTEGER,
-                post_factum_credit_reason TEXT
+                post_factum_credit_reason TEXT,
+                post_factum_trajectory_credit REAL DEFAULT 0.0,
+                post_factum_trajectory_credit_kind TEXT,
+                post_factum_trajectory_credit_polarity TEXT,
+                post_factum_trajectory_credit_step INTEGER,
+                post_factum_trajectory_credit_reason TEXT
             )
             """
         )
@@ -136,6 +141,11 @@ class ContingencyStore:
         self._ensure_column("prediction_results", "post_factum_level_completion_decay", "REAL")
         self._ensure_column("prediction_results", "post_factum_level_completion_step", "INTEGER")
         self._ensure_column("prediction_results", "post_factum_credit_reason", "TEXT")
+        self._ensure_column("prediction_results", "post_factum_trajectory_credit", "REAL DEFAULT 0.0")
+        self._ensure_column("prediction_results", "post_factum_trajectory_credit_kind", "TEXT")
+        self._ensure_column("prediction_results", "post_factum_trajectory_credit_polarity", "TEXT")
+        self._ensure_column("prediction_results", "post_factum_trajectory_credit_step", "INTEGER")
+        self._ensure_column("prediction_results", "post_factum_trajectory_credit_reason", "TEXT")
         self._ensure_column("prediction_results", "level_advanced", "INTEGER")
         self.connection.commit()
 
@@ -235,6 +245,11 @@ class ContingencyStore:
         post_factum_level_completion_decay: float | None = None,
         post_factum_level_completion_step: int | None = None,
         post_factum_credit_reason: str | None = None,
+        post_factum_trajectory_credit: float = 0.0,
+        post_factum_trajectory_credit_kind: str | None = None,
+        post_factum_trajectory_credit_polarity: str | None = None,
+        post_factum_trajectory_credit_step: int | None = None,
+        post_factum_trajectory_credit_reason: str | None = None,
     ) -> int | None:
         prediction_error: int | None
         if predicted_family is None or actual_family is None:
@@ -297,9 +312,14 @@ class ContingencyStore:
                 post_factum_level_completion_credit,
                 post_factum_level_completion_decay,
                 post_factum_level_completion_step,
-                post_factum_credit_reason
+                post_factum_credit_reason,
+                post_factum_trajectory_credit,
+                post_factum_trajectory_credit_kind,
+                post_factum_trajectory_credit_polarity,
+                post_factum_trajectory_credit_step,
+                post_factum_trajectory_credit_reason
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 int(interaction_id),
@@ -356,6 +376,11 @@ class ContingencyStore:
                 None if post_factum_level_completion_decay is None else float(post_factum_level_completion_decay),
                 None if post_factum_level_completion_step is None else int(post_factum_level_completion_step),
                 post_factum_credit_reason,
+                float(post_factum_trajectory_credit),
+                post_factum_trajectory_credit_kind,
+                post_factum_trajectory_credit_polarity,
+                None if post_factum_trajectory_credit_step is None else int(post_factum_trajectory_credit_step),
+                post_factum_trajectory_credit_reason,
             ),
         )
         if self.auto_commit:

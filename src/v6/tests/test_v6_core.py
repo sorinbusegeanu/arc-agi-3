@@ -325,11 +325,12 @@ class OutcomeEnv(ToggleEnv):
 
 
 class LevelCompletionSequenceEnv(ToggleEnv):
-    def __init__(self, *, completion_step: int = 4, terminal_state: str = "NOT_FINISHED") -> None:
+    def __init__(self, *, completion_step: int = 4, terminal_state: str = "NOT_FINISHED", increment_levels: bool = False) -> None:
         super().__init__()
         self.step_index = 0
         self.completion_step = int(completion_step)
         self.terminal_state = str(terminal_state)
+        self.increment_levels = bool(increment_levels)
         self.last_outcome_state = "NOT_FINISHED"
         self.last_outcome_polarity = "neutral"
         self.last_terminal_state = None
@@ -341,7 +342,7 @@ class LevelCompletionSequenceEnv(ToggleEnv):
     def step(self, action: int) -> np.ndarray:
         grid = super().step(action)
         self.step_index += 1
-        self.level_completed_event = self.step_index == self.completion_step and self.terminal_state == "NOT_FINISHED"
+        self.level_completed_event = self.step_index == self.completion_step and self.increment_levels
         if self.level_completed_event:
             self.last_levels_completed += 1
         self.last_outcome_state = self.terminal_state if self.step_index >= self.completion_step and self.terminal_state != "NOT_FINISHED" else "NOT_FINISHED"
@@ -1740,7 +1741,7 @@ def test_v6_system_run_step_stores_level_completed_event_fields(tmp_path) -> Non
 def test_v6_system_applies_post_factum_level_completion_credit(tmp_path) -> None:
     db_path = tmp_path / "post_factum.sqlite"
     system = V6System(
-        env=LevelCompletionSequenceEnv(completion_step=4, terminal_state="NOT_FINISHED"),
+        env=LevelCompletionSequenceEnv(completion_step=4, terminal_state="NOT_FINISHED", increment_levels=True),
         config=V6Config(
             database_path=str(db_path),
             recluster_every=2,
@@ -1824,6 +1825,154 @@ def test_v6_system_game_over_without_progress_gets_no_post_factum_credit(tmp_pat
     assert all(int(row[2]) == 0 for row in rows)
     assert all(float(row[3]) == 0.0 for row in rows)
     assert not any(candidate.reason == "post_factum_level_completion" for candidate in replay_candidates.values())
+
+
+def test_v6_system_applies_win_trajectory_credit(tmp_path) -> None:
+    db_path = tmp_path / "trajectory_win.sqlite"
+    system = V6System(
+        env=LevelCompletionSequenceEnv(completion_step=4, terminal_state="WIN", increment_levels=False),
+        config=V6Config(
+            database_path=str(db_path),
+            recluster_every=2,
+            min_cluster_size=2,
+            context_length=1,
+            contingency_support_threshold=1,
+            contingency_confidence_threshold=0.0,
+            random_seed=0,
+        ),
+    )
+    system.run(steps=4)
+    replay_candidates = dict(system.memory_lifecycle.replay_candidates)
+    system.close()
+
+    connection = sqlite3.connect(db_path)
+    try:
+        rows = connection.execute(
+            """
+            SELECT id, post_factum_trajectory_credit, post_factum_trajectory_credit_kind,
+                   post_factum_trajectory_credit_polarity, post_factum_trajectory_credit_reason
+            FROM interactions
+            ORDER BY id
+            """
+        ).fetchall()
+    finally:
+        connection.close()
+
+    credits = [float(row[1]) for row in rows]
+    assert credits[3] > credits[2] > credits[1] > credits[0] > 0.0
+    assert all(row[2] == "WIN" for row in rows)
+    assert all(row[3] == "positive" for row in rows)
+    assert all(row[4] == "win_terminal_trajectory" for row in rows)
+    assert all(
+        replay_candidates[str(i)].reason == "win_terminal_trajectory"
+        for i in range(1, 5)
+        if str(i) in replay_candidates
+    )
+
+
+def test_v6_system_applies_game_over_trajectory_credit(tmp_path) -> None:
+    db_path = tmp_path / "trajectory_game_over.sqlite"
+    system = V6System(
+        env=LevelCompletionSequenceEnv(completion_step=4, terminal_state="GAME_OVER", increment_levels=False),
+        config=V6Config(
+            database_path=str(db_path),
+            recluster_every=2,
+            min_cluster_size=2,
+            context_length=1,
+            contingency_support_threshold=1,
+            contingency_confidence_threshold=0.0,
+            random_seed=0,
+        ),
+    )
+    system.run(steps=4)
+    replay_candidates = dict(system.memory_lifecycle.replay_candidates)
+    system.close()
+
+    connection = sqlite3.connect(db_path)
+    try:
+        rows = connection.execute(
+            """
+            SELECT id, post_factum_trajectory_credit, post_factum_trajectory_credit_kind,
+                   post_factum_trajectory_credit_polarity, post_factum_trajectory_credit_reason
+            FROM interactions
+            ORDER BY id
+            """
+        ).fetchall()
+    finally:
+        connection.close()
+
+    credits = [float(row[1]) for row in rows]
+    assert credits[3] > credits[2] > credits[1] > credits[0] > 0.0
+    assert all(row[2] == "GAME_OVER" for row in rows)
+    assert all(row[3] == "negative" for row in rows)
+    assert all(row[4] == "game_over_failure_path" for row in rows)
+    assert all(
+        replay_candidates[str(i)].reason == "game_over_failure_path"
+        for i in range(1, 5)
+        if str(i) in replay_candidates
+    )
+
+
+def test_v6_system_not_finished_without_progress_has_no_trajectory_credit(tmp_path) -> None:
+    db_path = tmp_path / "trajectory_none.sqlite"
+    system = V6System(
+        env=LevelCompletionSequenceEnv(completion_step=99, terminal_state="NOT_FINISHED", increment_levels=False),
+        config=V6Config(
+            database_path=str(db_path),
+            recluster_every=2,
+            min_cluster_size=2,
+            context_length=1,
+            contingency_support_threshold=1,
+            contingency_confidence_threshold=0.0,
+            random_seed=0,
+        ),
+    )
+    system.run(steps=4)
+    system.close()
+
+    connection = sqlite3.connect(db_path)
+    try:
+        rows = connection.execute(
+            "SELECT post_factum_trajectory_credit FROM interactions ORDER BY id"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    assert all(float(row[0]) == 0.0 for row in rows)
+
+
+def test_v6_system_combined_level_completion_and_win_populates_both_credit_paths(tmp_path) -> None:
+    db_path = tmp_path / "trajectory_combined.sqlite"
+    system = V6System(
+        env=LevelCompletionSequenceEnv(completion_step=4, terminal_state="WIN", increment_levels=True),
+        config=V6Config(
+            database_path=str(db_path),
+            recluster_every=2,
+            min_cluster_size=2,
+            context_length=1,
+            contingency_support_threshold=1,
+            contingency_confidence_threshold=0.0,
+            random_seed=0,
+        ),
+    )
+    system.run(steps=4)
+    system.close()
+
+    connection = sqlite3.connect(db_path)
+    try:
+        rows = connection.execute(
+            """
+            SELECT id, level_completed_event, post_factum_level_completion_credit, post_factum_trajectory_credit
+            FROM interactions
+            ORDER BY id
+            """
+        ).fetchall()
+    finally:
+        connection.close()
+
+    assert rows[-1][1] == 1
+    assert all(float(row[2]) > 0.0 for row in rows)
+    assert all(float(row[3]) > 0.0 for row in rows)
 
 
 def test_v6_system_prediction_edges_add_explains_and_depends_on() -> None:

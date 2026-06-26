@@ -577,11 +577,26 @@ class V6System:
             self.connection.commit()
 
         self._current_level_interaction_ids.append(int(interaction.id))
+        trajectory_ids_snapshot = list(self._current_level_interaction_ids)
 
         if level_completed_event:
             self._apply_post_factum_level_completion_credit(completion_interaction_id=interaction.id)
-        elif outcome_state in {"GAME_OVER", "WIN"}:
-            self._current_level_interaction_ids.clear()
+        if outcome_state == "WIN":
+            self._apply_post_factum_trajectory_credit(
+                terminal_interaction_id=interaction.id,
+                kind="WIN",
+                polarity="positive",
+                reason="win_terminal_trajectory",
+                interaction_ids=trajectory_ids_snapshot,
+            )
+        elif outcome_state == "GAME_OVER":
+            self._apply_post_factum_trajectory_credit(
+                terminal_interaction_id=interaction.id,
+                kind="GAME_OVER",
+                polarity="negative",
+                reason="game_over_failure_path",
+                interaction_ids=trajectory_ids_snapshot,
+            )
 
         if self.action_sampler is not None and hasattr(self.action_sampler, "record_result"):
             self.action_sampler.record_result(
@@ -752,6 +767,69 @@ class V6System:
                 str(interaction_id),
                 learning_credit=float(credit),
                 reason="post_factum_level_completion",
+            )
+        self._current_level_interaction_ids = []
+
+    def _apply_post_factum_trajectory_credit(
+        self,
+        *,
+        terminal_interaction_id: int,
+        kind: str,
+        polarity: str,
+        reason: str,
+        interaction_ids: list[int] | None = None,
+    ) -> None:
+        ids = list(self._current_level_interaction_ids if interaction_ids is None else interaction_ids)
+        if int(terminal_interaction_id) not in ids:
+            ids.append(int(terminal_interaction_id))
+        if not ids:
+            return
+        for distance_from_terminal, interaction_id in enumerate(reversed(ids)):
+            credit = 1.0 / (1.0 + float(distance_from_terminal))
+            self.connection.execute(
+                """
+                UPDATE interactions
+                SET
+                    post_factum_trajectory_credit = MAX(COALESCE(post_factum_trajectory_credit, 0.0), ?),
+                    post_factum_trajectory_credit_kind = ?,
+                    post_factum_trajectory_credit_polarity = ?,
+                    post_factum_trajectory_credit_step = ?,
+                    post_factum_trajectory_credit_reason = ?
+                WHERE id = ?
+                """,
+                (
+                    float(credit),
+                    str(kind),
+                    str(polarity),
+                    int(terminal_interaction_id),
+                    str(reason),
+                    int(interaction_id),
+                ),
+            )
+            self.connection.execute(
+                """
+                UPDATE prediction_results
+                SET
+                    post_factum_trajectory_credit = MAX(COALESCE(post_factum_trajectory_credit, 0.0), ?),
+                    post_factum_trajectory_credit_kind = ?,
+                    post_factum_trajectory_credit_polarity = ?,
+                    post_factum_trajectory_credit_step = ?,
+                    post_factum_trajectory_credit_reason = ?
+                WHERE interaction_id = ?
+                """,
+                (
+                    float(credit),
+                    str(kind),
+                    str(polarity),
+                    int(terminal_interaction_id),
+                    str(reason),
+                    int(interaction_id),
+                ),
+            )
+            self.memory_lifecycle.apply_post_factum_credit(
+                str(interaction_id),
+                learning_credit=float(credit),
+                reason=str(reason),
             )
         self._current_level_interaction_ids = []
 
