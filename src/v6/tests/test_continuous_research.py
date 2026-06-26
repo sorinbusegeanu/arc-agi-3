@@ -8,7 +8,13 @@ import v6.continuous_research as continuous_research
 from v6.continuous_research import ContinuousResearchConfig, run_continuous_research
 
 
-def _write_sampling_fixture(output_dir: Path, *, global_step_offset: int, stable_support: int) -> list[dict]:
+def _write_sampling_fixture(
+    output_dir: Path,
+    *,
+    global_step_offset: int,
+    stable_support: int,
+    worker_execution: dict | None = None,
+) -> list[dict]:
     output_dir.mkdir(parents=True, exist_ok=True)
     db_path = output_dir / "sampling_v05c" / "tt01" / "mixed" / "steps_5000" / "seed_0.sqlite"
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -139,7 +145,19 @@ def _write_sampling_fixture(output_dir: Path, *, global_step_offset: int, stable
                         }
                     ]
                 },
+                "worker_execution": worker_execution or {
+                    "requested_workers": 4,
+                    "initial_workers": 2,
+                    "peak_workers": 3,
+                "worker_ramp_enabled": True,
+                "ram_ramp_threshold_percent": 85.0,
+                "initial_worker_ramp_delay_seconds": 20.0,
+                "per_worker_ramp_delay_seconds": 5.0,
+                "ram_used_percent_at_start": 42.0,
+                "ramp_event_count": 1,
+                "ramp_events": [{"target_workers": 3, "ram_used_percent": 43.0, "seconds_since_start": 20.0}],
             },
+        },
             indent=2,
         ),
         encoding="utf-8",
@@ -300,6 +318,89 @@ def test_continuous_run_passes_fast_postprocessing_into_sampling(tmp_path: Path,
     )
 
     assert seen_flags == [True]
+
+
+def test_continuous_run_halves_previous_workers_and_records_ram_start(tmp_path: Path, monkeypatch) -> None:
+    captured: list[dict[str, object]] = []
+
+    def fake_run_sampling(config):
+        captured.append(
+            {
+                "workers": int(config.workers),
+                "initial_workers": int(config.initial_workers or 0),
+                "enable_worker_ramp": bool(config.enable_worker_ramp),
+                "ram_ramp_threshold_percent": float(config.ram_ramp_threshold_percent),
+                "initial_worker_ramp_delay_seconds": float(config.initial_worker_ramp_delay_seconds),
+                "per_worker_ramp_delay_seconds": float(config.per_worker_ramp_delay_seconds),
+            }
+        )
+        return _write_sampling_fixture(
+            Path(config.output_dir),
+            global_step_offset=int(config.global_step_offset),
+            stable_support=25,
+            worker_execution={
+                "requested_workers": int(config.workers),
+                "initial_workers": int(config.initial_workers or 0),
+                "peak_workers": int(config.workers),
+                "worker_ramp_enabled": bool(config.enable_worker_ramp),
+                "ram_ramp_threshold_percent": float(config.ram_ramp_threshold_percent),
+                "initial_worker_ramp_delay_seconds": float(config.initial_worker_ramp_delay_seconds),
+                "per_worker_ramp_delay_seconds": float(config.per_worker_ramp_delay_seconds),
+                "ram_used_percent_at_start": 44.0,
+                "ramp_event_count": 0,
+                "ramp_events": [],
+            },
+        )
+
+    monkeypatch.setattr(continuous_research, "run_interaction_sampling_v05c", fake_run_sampling)
+    root = tmp_path / "continuous"
+    run_continuous_research(
+        ContinuousResearchConfig(
+            experiment_name="exp",
+            games="tt01",
+            samplers="mixed",
+            seeds="0",
+            steps_per_epoch=5000,
+            max_epochs=1,
+            horizon=10,
+            context_depth=1,
+            output_dir=str(root),
+            workers=12,
+            ram_ramp_threshold_percent=85.0,
+        )
+    )
+    run_continuous_research(
+        ContinuousResearchConfig(
+            experiment_name="exp",
+            games="tt01",
+            samplers="mixed",
+            seeds="0",
+            steps_per_epoch=5000,
+            max_epochs=2,
+            horizon=10,
+            context_depth=1,
+            output_dir=str(root),
+            workers=12,
+            ram_ramp_threshold_percent=85.0,
+            resume=True,
+        )
+    )
+
+    assert captured[0]["workers"] == 12
+    assert captured[0]["initial_workers"] == 6
+    assert captured[0]["initial_worker_ramp_delay_seconds"] == 20.0
+    assert captured[0]["per_worker_ramp_delay_seconds"] == 5.0
+    assert captured[1]["workers"] == 12
+    assert captured[1]["initial_workers"] == 6
+    assert captured[1]["initial_worker_ramp_delay_seconds"] == 20.0
+    assert captured[1]["per_worker_ramp_delay_seconds"] == 5.0
+    epoch_start = json.loads((root / "epochs" / "epoch_0002" / "status" / "epoch_start.json").read_text(encoding="utf-8"))
+    assert epoch_start["requested_workers"] == 12
+    assert epoch_start["initial_epoch_workers"] == 6
+    assert epoch_start["ram_ramp_threshold_percent"] == 85.0
+    assert epoch_start["initial_worker_ramp_delay_seconds"] == 20.0
+    assert epoch_start["per_worker_ramp_delay_seconds"] == 5.0
+    assert "ram_used_percent" in epoch_start["ram_snapshot_at_epoch_start"]
 
 
 def test_disk_stop_triggers_and_default_is_90(tmp_path: Path, monkeypatch) -> None:

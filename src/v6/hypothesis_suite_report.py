@@ -9,6 +9,11 @@ from v6.hypothesis_h01_report import evaluate_h01_contingency_emergence
 from v6.hypothesis_h02_report import evaluate_h02_prediction_violation_attention
 from v6.hypothesis_h03_report import evaluate_h03_transformation_family_formation
 from v6.hypothesis_h04_report import evaluate_h04_carrier_emergence
+from v6.higher_order_substrate import derive_higher_order_memory
+from v6.hypothesis_h05_report import evaluate_h05_role_emergence
+from v6.hypothesis_h06_report import evaluate_h06_role_transfer
+from v6.hypothesis_h07_report import evaluate_h07_concept_emergence
+from v6.hypothesis_h08_report import evaluate_h08_world_model_coherence
 
 
 SUITE_JSON_NAME = "hypothesis_suite_summary.json"
@@ -41,6 +46,11 @@ def run_hypothesis_suite_report(
     h01_dir = output_dir / "h01"
     h02_dir = output_dir / "h02"
     h03_dir = output_dir / "h03"
+    h04_dir = output_dir / "h04"
+    h05_dir = output_dir / "h05"
+    h06_dir = output_dir / "h06"
+    h07_dir = output_dir / "h07"
+    h08_dir = output_dir / "h08"
     h01 = evaluate_h01_contingency_emergence(run_dir=run_dir, output_dir=h01_dir, memory_dir=memory_dir)
     h02 = evaluate_h02_prediction_violation_attention(
         run_dir=run_dir,
@@ -59,10 +69,22 @@ def run_hypothesis_suite_report(
         scan_all_dbs=bool(scan_all_dbs),
     )
     h04 = (
-        evaluate_h04_carrier_emergence(memory_dir=memory_dir, run_dir=run_dir, output_dir=output_dir / "h04")
+        evaluate_h04_carrier_emergence(memory_dir=memory_dir, run_dir=run_dir, output_dir=h04_dir)
         if memory_dir is not None
-        else {"hypothesis_id": "H04", "decision": "NOT_IMPLEMENTED", "core_metrics": {}, "missing_evidence": ["memory_dir not provided"]}
+        else {"hypothesis_id": "H04", "decision": "INCONCLUSIVE", "core_metrics": {}, "missing_evidence": ["memory_dir not provided"]}
     )
+    if memory_dir is not None:
+        derive_higher_order_memory(memory_dir=memory_dir, run_dir=run_dir)
+        h05 = evaluate_h05_role_emergence(memory_dir=memory_dir, run_dir=run_dir, output_dir=h05_dir)
+        h06 = evaluate_h06_role_transfer(memory_dir=memory_dir, run_dir=run_dir, output_dir=h06_dir)
+        h07 = evaluate_h07_concept_emergence(memory_dir=memory_dir, run_dir=run_dir, output_dir=h07_dir)
+        h08 = evaluate_h08_world_model_coherence(memory_dir=memory_dir, run_dir=run_dir, output_dir=h08_dir)
+    else:
+        missing = ["memory_dir not provided"]
+        h05 = {"hypothesis_id": "H05", "decision": "INCONCLUSIVE", "core_metrics": {}, "missing_evidence": missing, "evidence_source": "none"}
+        h06 = {"hypothesis_id": "H06", "decision": "INCONCLUSIVE", "core_metrics": {}, "missing_evidence": missing, "evidence_source": "none"}
+        h07 = {"hypothesis_id": "H07", "decision": "INCONCLUSIVE", "core_metrics": {}, "missing_evidence": missing, "evidence_source": "none"}
+        h08 = {"hypothesis_id": "H08", "decision": "INCONCLUSIVE", "core_metrics": {}, "missing_evidence": missing, "evidence_source": "none"}
     summary = build_hypothesis_suite_summary(
         run_dir=run_dir,
         memory_dir=memory_dir,
@@ -70,6 +92,10 @@ def run_hypothesis_suite_report(
         h02=h02,
         h03=h03,
         h04=h04,
+        h05=h05,
+        h06=h06,
+        h07=h07,
+        h08=h08,
         epoch_id=epoch_id,
         global_step_start=global_step_start,
         global_step_end=global_step_end,
@@ -90,6 +116,10 @@ def build_hypothesis_suite_summary(
     h02: dict[str, Any],
     h03: dict[str, Any],
     h04: dict[str, Any] | None = None,
+    h05: dict[str, Any] | None = None,
+    h06: dict[str, Any] | None = None,
+    h07: dict[str, Any] | None = None,
+    h08: dict[str, Any] | None = None,
     epoch_id: str | None = None,
     global_step_start: int | None = None,
     global_step_end: int | None = None,
@@ -121,8 +151,16 @@ def build_hypothesis_suite_summary(
         list(h02.get("missing_evidence", [])),
         list(h03.get("missing_evidence", [])),
         list((h04 or {}).get("missing_evidence", [])),
+        list((h05 or {}).get("missing_evidence", [])),
+        list((h06 or {}).get("missing_evidence", [])),
+        list((h07 or {}).get("missing_evidence", [])),
+        list((h08 or {}).get("missing_evidence", [])),
     )
-    h04 = h04 or {"decision": "NOT_IMPLEMENTED", "core_metrics": {}}
+    h04 = h04 or {"decision": "INCONCLUSIVE", "core_metrics": {}}
+    h05 = h05 or {"decision": "INCONCLUSIVE", "core_metrics": {}}
+    h06 = h06 or {"decision": "INCONCLUSIVE", "core_metrics": {}}
+    h07 = h07 or {"decision": "INCONCLUSIVE", "core_metrics": {}}
+    h08 = h08 or {"decision": "INCONCLUSIVE", "core_metrics": {}}
     summary = {
         "epoch_id": epoch_id,
         "global_step_start": global_step_start,
@@ -141,7 +179,11 @@ def build_hypothesis_suite_summary(
         "H01 decision": h01.get("decision"),
         "H02 decision": h02.get("decision"),
         "H03 decision": h03.get("decision"),
-        "H04 decision": h04.get("decision", "NOT_IMPLEMENTED"),
+        "H04 decision": h04.get("decision", "INCONCLUSIVE"),
+        "H05 decision": h05.get("decision", "INCONCLUSIVE"),
+        "H06 decision": h06.get("decision", "INCONCLUSIVE"),
+        "H07 decision": h07.get("decision", "INCONCLUSIVE"),
+        "H08 decision": h08.get("decision", "INCONCLUSIVE"),
         "H01 core metrics": {
             "stable_contingency_count": h01.get("stable_contingency_count"),
             "interaction_count": h01.get("total_interaction_count"),
@@ -150,6 +192,10 @@ def build_hypothesis_suite_summary(
             "samplers_with_stable_contingencies": _count_positive(h01.get("per_sampler_contingency_counts")),
         },
         "H02 core metrics": {
+            "h02a_replay_attention_decision": h02.get("h02a_replay_attention_decision"),
+            "h02b_pre_carrier_timing_decision": h02.get("h02b_pre_carrier_timing_decision"),
+            "h02_final_decision_basis": h02.get("h02_final_decision_basis"),
+            "carrier_timing_note": h02.get("carrier_timing_note"),
             "prediction_violation_replay_lift": h02.get("prediction_violation_replay_lift"),
             "prediction_violation_base_ratio": h02.get("prediction_violation_base_ratio"),
             "high_priority_replay_prediction_violation_ratio": h02.get("high_priority_replay_prediction_violation_ratio"),
@@ -169,6 +215,47 @@ def build_hypothesis_suite_summary(
             "merge_safety_passed": h03.get("merge_safety_passed"),
         },
         "H04 core metrics": dict(h04.get("core_metrics", {})),
+        "H05 core metrics": {
+            "role_candidate_count": h05.get("role_candidate_count"),
+            "emergent_role_count": h05.get("emergent_role_count"),
+            "stable_role_count": h05.get("stable_role_count"),
+            "singleton_role_ratio": h05.get("singleton_role_ratio"),
+            "multi_carrier_role_count": h05.get("multi_carrier_role_count"),
+            "cross_context_role_count": h05.get("cross_context_role_count"),
+            "cross_game_role_count": h05.get("cross_game_role_count"),
+            "mean_carriers_per_role": h05.get("mean_carriers_per_role"),
+            "max_carriers_per_role": h05.get("max_carriers_per_role"),
+        },
+        "H06 core metrics": {
+            "transfer_attempt_count": h06.get("transfer_attempt_count"),
+            "successful_transfer_count": h06.get("successful_transfer_count"),
+            "transfer_success_rate": h06.get("transfer_success_rate"),
+            "cross_game_success_count": h06.get("cross_game_success_count"),
+            "cross_context_success_count": h06.get("cross_context_success_count"),
+            "successful_role_count": h06.get("successful_role_count"),
+            "mean_transfer_score": h06.get("mean_transfer_score"),
+            "max_transfer_score": h06.get("max_transfer_score"),
+        },
+        "H07 core metrics": {
+            "concept_candidate_count": h07.get("concept_candidate_count"),
+            "promoted_concept_count": h07.get("promoted_concept_count"),
+            "mean_compression_gain": h07.get("mean_compression_gain"),
+            "max_compression_gain": h07.get("max_compression_gain"),
+            "concept_transfer_success_count": h07.get("concept_transfer_success_count"),
+            "max_promotion_score": h07.get("max_promotion_score"),
+            "cross_context_concept_count": h07.get("cross_context_concept_count"),
+            "cross_game_concept_count": h07.get("cross_game_concept_count"),
+        },
+        "H08 core metrics": {
+            "world_model_component_count": h08.get("world_model_component_count"),
+            "coherent_world_model_component_count": h08.get("coherent_world_model_component_count"),
+            "mean_coherence_score": h08.get("mean_coherence_score"),
+            "max_coherence_score": h08.get("max_coherence_score"),
+            "mean_explanatory_coverage": h08.get("mean_explanatory_coverage"),
+            "max_explanatory_coverage": h08.get("max_explanatory_coverage"),
+            "coherent_cross_context_component_count": h08.get("coherent_cross_context_component_count"),
+            "coherent_cross_game_component_count": h08.get("coherent_cross_game_component_count"),
+        },
         "per_game_status_table": per_game,
         "per-game status table": per_game,
         "per_sampler_status_table": per_sampler,
@@ -176,8 +263,8 @@ def build_hypothesis_suite_summary(
         "temporal_order_diagnostics": temporal,
         "missing_evidence": missing_evidence,
         "missing evidence": missing_evidence,
-        "next_recommended_action": _next_recommended_action(h01, h02, h03, missing_evidence),
-        "next recommended action": _next_recommended_action(h01, h02, h03, missing_evidence),
+        "next_recommended_action": _next_recommended_action(h01, h02, h03, h04, h05, h06, h07, h08, missing_evidence),
+        "next recommended action": _next_recommended_action(h01, h02, h03, h04, h05, h06, h07, h08, missing_evidence),
     }
     return summary
 
@@ -316,15 +403,34 @@ def _true_ratio(values: list[bool]) -> float | None:
     return float(sum(1 for value in values if value) / len(values))
 
 
-def _next_recommended_action(h01: dict[str, Any], h02: dict[str, Any], h03: dict[str, Any], missing_evidence: list[str]) -> str:
-    decisions = {str(h01.get("decision")), str(h02.get("decision")), str(h03.get("decision"))}
+def _next_recommended_action(
+    h01: dict[str, Any],
+    h02: dict[str, Any],
+    h03: dict[str, Any],
+    h04: dict[str, Any],
+    h05: dict[str, Any],
+    h06: dict[str, Any],
+    h07: dict[str, Any],
+    h08: dict[str, Any],
+    missing_evidence: list[str],
+) -> str:
+    decisions = {
+        str(h01.get("decision")),
+        str(h02.get("decision")),
+        str(h03.get("decision")),
+        str(h04.get("decision")),
+        str(h05.get("decision")),
+        str(h06.get("decision")),
+        str(h07.get("decision")),
+        str(h08.get("decision")),
+    }
     if "INVALID" in decisions:
-        return "Inspect invalidated hypothesis outputs and repair the shared sampling configuration before H04 work."
+        return "Inspect invalidated hypothesis outputs and repair the shared compact-memory substrate before continuing higher-order evaluation."
     if "INCONCLUSIVE" in decisions or missing_evidence:
-        return "Keep the shared broad run, fill the missing evidence paths, and rerun the suite summary before H04 analysis."
+        return "Keep the shared run, fill the missing evidence paths, and rerun the suite summary before relying on higher-order conclusions."
     if "PARTIALLY_VALID" in decisions:
-        return "Use this shared dataset for targeted follow-up diagnostics, then evaluate H04 carrier emergence on the same run artifacts."
-    return "Proceed to H04 carrier-emergence analysis using this shared interaction-memory dataset."
+        return "Use this shared dataset for targeted follow-up diagnostics, then rerun H05-H08 on the same compact memory."
+    return "Proceed with the existing compact memory and compare H01-H08 trends across subsequent epochs."
 
 
 def _write_suite_summary(summary: dict[str, Any], output_dir: Path) -> None:
@@ -340,6 +446,11 @@ def _format_text(summary: dict[str, Any]) -> str:
         f"H01: {summary['H01 decision']}",
         f"H02: {summary['H02 decision']}",
         f"H03: {summary['H03 decision']}",
+        f"H04: {summary['H04 decision']}",
+        f"H05: {summary['H05 decision']}",
+        f"H06: {summary['H06 decision']}",
+        f"H07: {summary['H07 decision']}",
+        f"H08: {summary['H08 decision']}",
         f"games: {summary['game_count']} samplers: {summary['sampler_count']} seeds: {summary['seed_count']}",
         f"total_interactions: {summary['total_interactions']}",
         f"next_recommended_action: {summary['next_recommended_action']}",
@@ -355,6 +466,11 @@ def _format_md(summary: dict[str, Any]) -> str:
         f"- H01: `{summary['H01 decision']}`",
         f"- H02: `{summary['H02 decision']}`",
         f"- H03: `{summary['H03 decision']}`",
+        f"- H04: `{summary['H04 decision']}`",
+        f"- H05: `{summary['H05 decision']}`",
+        f"- H06: `{summary['H06 decision']}`",
+        f"- H07: `{summary['H07 decision']}`",
+        f"- H08: `{summary['H08 decision']}`",
         f"- total interactions: `{summary['total_interactions']}`",
         "",
         "## Next Action",

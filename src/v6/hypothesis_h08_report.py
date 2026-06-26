@@ -1,0 +1,110 @@
+from __future__ import annotations
+
+import json
+import sqlite3
+from pathlib import Path
+from typing import Any
+
+
+def evaluate_h08_world_model_coherence(
+    *,
+    memory_dir: Path,
+    run_dir: Path | None,
+    output_dir: Path,
+) -> dict[str, Any]:
+    del run_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    current_state = Path(memory_dir) / "current_state.sqlite"
+    if not current_state.exists():
+        result = _base_result("INCONCLUSIVE", ["compact memory missing current_state.sqlite"])
+        _write_outputs(output_dir, result)
+        return result
+    with sqlite3.connect(current_state) as conn:
+        conn.row_factory = sqlite3.Row
+        concept_candidate_count = int(conn.execute("SELECT COUNT(*) FROM concept_candidates").fetchone()[0])
+        promoted_concept_count = int(conn.execute("SELECT COUNT(*) FROM concept_candidates WHERE COALESCE(is_promoted, 0) = 1").fetchone()[0])
+        component_rows = conn.execute(
+            """
+            SELECT component_signature, coherence_score, explanatory_coverage, cross_context_count, cross_game_count, is_coherent
+            FROM world_model_components
+            ORDER BY component_signature ASC
+            """
+        ).fetchall()
+        milestone_map = dict(conn.execute("SELECT milestone_name, first_global_step FROM higher_order_milestones").fetchall())
+    world_model_component_count = len(component_rows)
+    coherent_world_model_component_count = sum(1 for row in component_rows if int(row["is_coherent"] or 0) == 1)
+    mean_coherence_score = (
+        sum(float(row["coherence_score"] or 0.0) for row in component_rows) / max(1, world_model_component_count)
+        if component_rows
+        else None
+    )
+    max_coherence_score = max((float(row["coherence_score"] or 0.0) for row in component_rows), default=None)
+    mean_explanatory_coverage = (
+        sum(float(row["explanatory_coverage"] or 0.0) for row in component_rows) / max(1, world_model_component_count)
+        if component_rows
+        else None
+    )
+    max_explanatory_coverage = max((float(row["explanatory_coverage"] or 0.0) for row in component_rows), default=None)
+    coherent_cross_context_component_count = sum(
+        1 for row in component_rows if int(row["is_coherent"] or 0) == 1 and int(row["cross_context_count"] or 0) >= 1
+    )
+    coherent_cross_game_component_count = sum(
+        1 for row in component_rows if int(row["is_coherent"] or 0) == 1 and int(row["cross_game_count"] or 0) >= 1
+    )
+    metrics = {
+        "world_model_component_count": world_model_component_count,
+        "coherent_world_model_component_count": coherent_world_model_component_count,
+        "mean_coherence_score": mean_coherence_score,
+        "max_coherence_score": max_coherence_score,
+        "mean_explanatory_coverage": mean_explanatory_coverage,
+        "max_explanatory_coverage": max_explanatory_coverage,
+        "coherent_cross_context_component_count": coherent_cross_context_component_count,
+        "coherent_cross_game_component_count": coherent_cross_game_component_count,
+        "first_world_model_component_step": milestone_map.get("first_world_model_component_step"),
+        "first_coherent_world_model_step": milestone_map.get("first_coherent_world_model_step"),
+        "first_promoted_concept_step": milestone_map.get("first_promoted_concept_step"),
+    }
+    if concept_candidate_count <= 0:
+        decision = "INCONCLUSIVE"
+        missing = ["no concept candidates available"]
+    elif world_model_component_count > 0 and coherent_world_model_component_count == 0:
+        decision = "PARTIALLY_VALID"
+        missing = []
+    elif coherent_world_model_component_count >= 1 and (max_coherence_score or 0.0) >= 0.45 and (max_explanatory_coverage or 0.0) > 0.0 and (coherent_cross_context_component_count >= 1 or coherent_cross_game_component_count >= 1):
+        decision = "VALID"
+        missing = []
+    elif promoted_concept_count > 0 and world_model_component_count == 0:
+        decision = "INVALID"
+        missing = []
+    elif promoted_concept_count > 0 and component_rows and max((float(row["coherence_score"] or 0.0) for row in component_rows), default=0.0) < 0.20:
+        decision = "INVALID"
+        missing = []
+    else:
+        decision = "PARTIALLY_VALID"
+        missing = []
+    result = _base_result(decision, missing)
+    result.update(metrics)
+    result["core_metrics"] = dict(metrics)
+    _write_outputs(output_dir, result)
+    return result
+
+
+def _base_result(decision: str, missing_evidence: list[str]) -> dict[str, Any]:
+    return {
+        "hypothesis_id": "H08",
+        "decision": decision,
+        "missing_evidence": list(missing_evidence),
+        "evidence_source": "compact_memory",
+    }
+
+
+def _write_outputs(output_dir: Path, result: dict[str, Any]) -> None:
+    (output_dir / "h08_world_model_coherence_report.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    text = (
+        f"H08 decision: {result.get('decision')}\n"
+        f"world model components: {result.get('world_model_component_count')}\n"
+        f"coherent world model components: {result.get('coherent_world_model_component_count')}\n"
+        f"max coherence score: {result.get('max_coherence_score')}\n"
+    )
+    (output_dir / "h08_world_model_coherence_report.txt").write_text(text, encoding="utf-8")
+    (output_dir / "h08_world_model_coherence.md").write_text("```\n" + text + "```\n", encoding="utf-8")

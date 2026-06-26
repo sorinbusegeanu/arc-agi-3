@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,6 +34,10 @@ class ContinuousResearchConfig:
     max_replay_queue_size: int = 50_000
     replay_retention_percent: int = 5
     fast_postprocessing: bool = True
+    workers: int = 60
+    ram_ramp_threshold_percent: float = 85.0
+    initial_worker_ramp_delay_seconds: float = 20.0
+    per_worker_ramp_delay_seconds: float = 5.0
     env_root: str | None = None
 
 
@@ -76,6 +81,25 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
         memory_before = build_memory_summary(memory_paths)
         memory_size_before = _tree_size(memory_dir)
         previous_summary_snapshot = load_memory_summary(memory_paths.summary_json)
+        previous_peak_workers = int(manifest.get("last_sampling_peak_workers", config.workers) or config.workers)
+        requested_workers = max(1, int(config.workers))
+        max_epoch_workers = max(1, min(requested_workers, previous_peak_workers))
+        initial_epoch_workers = max(1, math.ceil(max_epoch_workers / 2.0))
+        ram_snapshot_at_epoch_start = _system_ram_snapshot()
+        epoch_start_payload = {
+            "epoch_id": epoch_id,
+            "global_step_start": global_step_start,
+            "global_step_end": global_step_end,
+            "requested_workers": requested_workers,
+            "max_epoch_workers": max_epoch_workers,
+            "initial_epoch_workers": initial_epoch_workers,
+            "ram_ramp_threshold_percent": float(config.ram_ramp_threshold_percent),
+            "initial_worker_ramp_delay_seconds": float(config.initial_worker_ramp_delay_seconds),
+            "per_worker_ramp_delay_seconds": float(config.per_worker_ramp_delay_seconds),
+            "ram_snapshot_at_epoch_start": ram_snapshot_at_epoch_start,
+        }
+        _write_epoch_start(status_dir, epoch_start_payload)
+        print(_format_epoch_start(epoch_start_payload))
 
         sampling_rows = run_interaction_sampling_v05c(
             InteractionSamplingConfig(
@@ -93,8 +117,15 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
                 memory_output_dir=str(memory_dir),
                 global_step_offset=global_step_start - 1,
                 fast_postprocessing=bool(config.fast_postprocessing),
+                workers=max_epoch_workers,
+                initial_workers=initial_epoch_workers,
+                enable_worker_ramp=True,
+                ram_ramp_threshold_percent=float(config.ram_ramp_threshold_percent),
+                initial_worker_ramp_delay_seconds=float(config.initial_worker_ramp_delay_seconds),
+                per_worker_ramp_delay_seconds=float(config.per_worker_ramp_delay_seconds),
             )
         )
+        worker_execution = _load_sampling_worker_execution(raw_dir)
         fold_summary = fold_epoch_raw_into_compact_memory(
             epoch_raw_dir=raw_dir,
             memory_dir=memory_dir,
@@ -140,6 +171,10 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
             consecutive_no_new = 0
 
         h04_metrics = suite_summary.get("H04 core metrics", {}) or {}
+        h05_metrics = suite_summary.get("H05 core metrics", {}) or {}
+        h06_metrics = suite_summary.get("H06 core metrics", {}) or {}
+        h07_metrics = suite_summary.get("H07 core metrics", {}) or {}
+        h08_metrics = suite_summary.get("H08 core metrics", {}) or {}
         status = {
             "epoch_id": epoch_id,
             "global_step_start": global_step_start,
@@ -151,17 +186,39 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
             "disk_used_percent": disk_after["disk_used_percent"],
             "H01": suite_summary.get("H01 decision"),
             "H02": suite_summary.get("H02 decision"),
+            "H02A": (suite_summary.get("H02 core metrics") or {}).get("h02a_replay_attention_decision"),
+            "H02B": (suite_summary.get("H02 core metrics") or {}).get("h02b_pre_carrier_timing_decision"),
             "H03": suite_summary.get("H03 decision"),
             "H04": suite_summary.get("H04 decision"),
+            "H05": suite_summary.get("H05 decision"),
+            "H06": suite_summary.get("H06 decision"),
+            "H07": suite_summary.get("H07 decision"),
+            "H08": suite_summary.get("H08 decision"),
             "stable_contingencies": (suite_summary.get("H01 core metrics") or {}).get("stable_contingency_count"),
             "games_with_stable_contingencies": (suite_summary.get("H01 core metrics") or {}).get("games_with_stable_contingencies"),
             "replay_lift": (suite_summary.get("H02 core metrics") or {}).get("prediction_violation_replay_lift"),
             "direct_replay_evidence": "available" if (suite_summary.get("H02 core metrics") or {}).get("direct_replay_lift_available") else "unavailable",
+            "h02_timing_note": h02_dir_note(suite_summary),
             "compression_ratio": (suite_summary.get("H03 core metrics") or {}).get("compression_ratio"),
             "singleton_ratio": (suite_summary.get("H03 core metrics") or {}).get("singleton_family_ratio"),
             "cross_context_families": (suite_summary.get("H03 core metrics") or {}).get("family_cross_context_count"),
             "carrier_candidates": h04_metrics.get("carrier_candidate_count"),
             "stable_carriers": h04_metrics.get("stable_carrier_count"),
+            "role_candidates": h05_metrics.get("role_candidate_count"),
+            "emergent_roles": h05_metrics.get("emergent_role_count"),
+            "role_transfer_attempts": h06_metrics.get("transfer_attempt_count"),
+            "role_transfer_success_rate": h06_metrics.get("transfer_success_rate"),
+            "concept_candidates": h07_metrics.get("concept_candidate_count"),
+            "promoted_concepts": h07_metrics.get("promoted_concept_count"),
+            "world_model_components": h08_metrics.get("world_model_component_count"),
+            "coherent_world_model_components": h08_metrics.get("coherent_world_model_component_count"),
+            "workers_requested": requested_workers,
+            "workers_initial": initial_epoch_workers,
+            "workers_max_epoch": max_epoch_workers,
+            "worker_execution": worker_execution,
+            "ram_snapshot_at_epoch_start": ram_snapshot_at_epoch_start,
+            "initial_worker_ramp_delay_seconds": float(config.initial_worker_ramp_delay_seconds),
+            "per_worker_ramp_delay_seconds": float(config.per_worker_ramp_delay_seconds),
             "cleanup": cleanup_summary,
             "memory_continuity": continuity_report,
             "deltas": deltas,
@@ -176,6 +233,7 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
         manifest["completed_epochs"] = int(manifest.get("completed_epochs", 0) or 0) + 1
         manifest["latest_status_path"] = str(status_dir / "epoch_status.json")
         manifest["consecutive_no_new_stable_contingencies"] = consecutive_no_new
+        manifest["last_sampling_peak_workers"] = int(worker_execution.get("peak_workers", max_epoch_workers) or max_epoch_workers)
         manifest.setdefault("epochs", []).append(
             {
                 "epoch_id": epoch_id,
@@ -188,6 +246,13 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
                 "started_at": _now(),
                 "finished_at": _now(),
                 "status": "complete",
+                "workers_requested": requested_workers,
+                "workers_initial": initial_epoch_workers,
+                "workers_max_epoch": max_epoch_workers,
+                "worker_execution": worker_execution,
+                "ram_snapshot_at_epoch_start": ram_snapshot_at_epoch_start,
+                "initial_worker_ramp_delay_seconds": float(config.initial_worker_ramp_delay_seconds),
+                "per_worker_ramp_delay_seconds": float(config.per_worker_ramp_delay_seconds),
                 "deltas": deltas,
             }
         )
@@ -240,6 +305,10 @@ def _load_or_initialize_manifest(config: ContinuousResearchConfig, manifest_path
         "horizon": int(config.horizon),
         "context_depth": int(config.context_depth),
         "fast_postprocessing": bool(config.fast_postprocessing),
+        "workers": int(config.workers),
+        "ram_ramp_threshold_percent": float(config.ram_ramp_threshold_percent),
+        "initial_worker_ramp_delay_seconds": float(config.initial_worker_ramp_delay_seconds),
+        "per_worker_ramp_delay_seconds": float(config.per_worker_ramp_delay_seconds),
         "output_dir": str(config.output_dir),
         "stop_if_disk_above_percent": float(config.stop_if_disk_above_percent),
         "stop_if_no_new_stable_contingencies_for": int(config.stop_if_no_new_stable_contingencies_for),
@@ -306,6 +375,11 @@ def _write_epoch_status(status_dir: Path, status: dict[str, Any]) -> None:
     (status_dir / "epoch_status.txt").write_text(_format_epoch_status(status), encoding="utf-8")
 
 
+def _write_epoch_start(status_dir: Path, payload: dict[str, Any]) -> None:
+    (status_dir / "epoch_start.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    (status_dir / "epoch_start.txt").write_text(_format_epoch_start(payload), encoding="utf-8")
+
+
 def _format_epoch_status(status: dict[str, Any]) -> str:
     cleanup = status.get("cleanup") or {}
     stable_count = status.get("stable_contingencies")
@@ -313,6 +387,8 @@ def _format_epoch_status(status: dict[str, Any]) -> str:
     return (
         f"Epoch {status['epoch_id'].split('_')[-1]} complete\n"
         f"Global steps: {status['global_step_start']}-{status['global_step_end']}\n"
+        f"Workers: requested={status.get('workers_requested')} initial={status.get('workers_initial')} max_epoch={status.get('workers_max_epoch')} peak={((status.get('worker_execution') or {}).get('peak_workers'))}\n"
+        f"RAM at start: {float((status.get('ram_snapshot_at_epoch_start') or {}).get('ram_used_percent', 0.0) or 0.0):.2f}%\n"
         f"Games: {status.get('games')}\n"
         f"Interactions this epoch: {status.get('interactions_this_epoch')}\n"
         f"Disk before cleanup: {cleanup.get('disk_before_cleanup_bytes', 0) / (1024 ** 3):.3f} GB\n"
@@ -322,8 +398,11 @@ def _format_epoch_status(status: dict[str, Any]) -> str:
         f"stable contingencies: {stable_count} ({stable_delta:+d})\n"
         f"games with stable contingencies: {status.get('games_with_stable_contingencies')}\n\n"
         f"H02: {status.get('H02')}\n"
+        f"H02A replay/attention: {status.get('H02A')}\n"
+        f"H02B pre-carrier timing: {status.get('H02B')}\n"
         f"replay lift: {status.get('replay_lift')}\n"
         f"direct replay evidence: {status.get('direct_replay_evidence')}\n\n"
+        f"timing note: {status.get('h02_timing_note')}\n\n"
         f"H03: {status.get('H03')}\n"
         f"compression ratio: {status.get('compression_ratio')}\n"
         f"singleton ratio: {status.get('singleton_ratio')}\n"
@@ -331,11 +410,36 @@ def _format_epoch_status(status: dict[str, Any]) -> str:
         f"H04: {status.get('H04')}\n"
         f"carrier candidates: {status.get('carrier_candidates')}\n"
         f"stable carriers: {status.get('stable_carriers')}\n\n"
+        f"H05: {status.get('H05')}\n"
+        f"role candidates: {status.get('role_candidates')}\n"
+        f"emergent roles: {status.get('emergent_roles')}\n\n"
+        f"H06: {status.get('H06')}\n"
+        f"transfer attempts: {status.get('role_transfer_attempts')}\n"
+        f"transfer success rate: {status.get('role_transfer_success_rate')}\n\n"
+        f"H07: {status.get('H07')}\n"
+        f"concept candidates: {status.get('concept_candidates')}\n"
+        f"promoted concepts: {status.get('promoted_concepts')}\n\n"
+        f"H08: {status.get('H08')}\n"
+        f"world model components: {status.get('world_model_components')}\n"
+        f"coherent components: {status.get('coherent_world_model_components')}\n\n"
         f"Cleanup:\n"
         f"deleted raw files: {cleanup.get('raw_files_deleted_count')}\n"
         f"freed: {cleanup.get('disk_freed_bytes', 0) / (1024 ** 3):.3f} GB\n\n"
         f"Next action:\n"
         f"{status.get('next_action')}\n"
+    )
+
+
+def _format_epoch_start(payload: dict[str, Any]) -> str:
+    ram = payload.get("ram_snapshot_at_epoch_start") or {}
+    return (
+        f"Epoch {payload['epoch_id'].split('_')[-1]} starting\n"
+        f"Global steps: {payload['global_step_start']}-{payload['global_step_end']}\n"
+        f"Workers: requested={payload.get('requested_workers')} initial={payload.get('initial_epoch_workers')} max_epoch={payload.get('max_epoch_workers')}\n"
+        f"RAM used percent at start: {float(ram.get('ram_used_percent', 0.0) or 0.0):.2f}\n"
+        f"RAM ramp threshold percent: {float(payload.get('ram_ramp_threshold_percent', 0.0) or 0.0):.2f}\n"
+        f"Initial worker ramp delay seconds: {float(payload.get('initial_worker_ramp_delay_seconds', 0.0) or 0.0):.1f}\n"
+        f"Per-worker ramp delay seconds: {float(payload.get('per_worker_ramp_delay_seconds', 0.0) or 0.0):.1f}\n"
     )
 
 
@@ -390,6 +494,49 @@ def _write_memory_continuity_report(
     }
     (reports_dir / "epoch_memory_continuity.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     return report
+
+
+def _system_ram_snapshot() -> dict[str, float | int]:
+    meminfo: dict[str, int] = {}
+    try:
+        with Path("/proc/meminfo").open("r", encoding="utf-8") as handle:
+            for line in handle:
+                key, _sep, remainder = line.partition(":")
+                value = remainder.strip().split()[0]
+                meminfo[key] = int(value) * 1024
+    except Exception:
+        return {
+            "ram_total_bytes": 0,
+            "ram_available_bytes": 0,
+            "ram_used_bytes": 0,
+            "ram_used_percent": 0.0,
+        }
+    total = int(meminfo.get("MemTotal", 0))
+    available = int(meminfo.get("MemAvailable", meminfo.get("MemFree", 0)))
+    used = max(0, total - available)
+    used_percent = (float(used) / float(total) * 100.0) if total > 0 else 0.0
+    return {
+        "ram_total_bytes": total,
+        "ram_available_bytes": available,
+        "ram_used_bytes": used,
+        "ram_used_percent": used_percent,
+    }
+
+
+def _load_sampling_worker_execution(raw_dir: Path) -> dict[str, Any]:
+    report_path = raw_dir / "interaction_sampling_v05c_report.json"
+    if not report_path.exists():
+        return {}
+    try:
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    worker_execution = payload.get("worker_execution")
+    return worker_execution if isinstance(worker_execution, dict) else {}
+
+
+def h02_dir_note(suite_summary: dict[str, Any]) -> str | None:
+    return ((suite_summary.get("H02 core metrics") or {}).get("carrier_timing_note"))
 
 
 def _write_manifest(path: Path, manifest: dict[str, Any]) -> None:

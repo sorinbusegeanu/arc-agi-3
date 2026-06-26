@@ -1256,6 +1256,20 @@ def _build_memory_summary_from_connections(
     stable_count = int(state_conn.execute("SELECT COUNT(*) FROM stable_contingencies WHERE support_count >= 20").fetchone()[0])
     family_count = _count_rows(state_conn, "transformation_families")
     carrier_count = _count_rows(state_conn, "carrier_candidates")
+    role_candidate_count = _count_rows(state_conn, "role_candidates")
+    emergent_role_count = _safe_scalar(state_conn, "SELECT COUNT(*) FROM role_candidates WHERE COALESCE(is_emergent, 0) = 1")
+    role_transfer_attempt_count = _count_rows(state_conn, "role_transfer_attempts")
+    successful_role_transfer_count = _safe_scalar(
+        state_conn,
+        "SELECT COUNT(*) FROM role_transfer_attempts WHERE COALESCE(reuse_success, 0) = 1",
+    )
+    concept_candidate_count = _count_rows(state_conn, "concept_candidates")
+    promoted_concept_count = _safe_scalar(state_conn, "SELECT COUNT(*) FROM concept_candidates WHERE COALESCE(is_promoted, 0) = 1")
+    world_model_component_count = _count_rows(state_conn, "world_model_components")
+    coherent_world_model_component_count = _safe_scalar(
+        state_conn,
+        "SELECT COUNT(*) FROM world_model_components WHERE COALESCE(is_coherent, 0) = 1",
+    )
     contradiction_count = _count_rows(state_conn, "contradiction_clusters")
     example_count = _count_rows(state_conn, "representative_examples")
     emergent_carrier_count = int(
@@ -1266,6 +1280,14 @@ def _build_memory_summary_from_connections(
         "transformation_family_count": family_count,
         "carrier_candidate_count": carrier_count,
         "emergent_carrier_count": emergent_carrier_count,
+        "role_candidate_count": role_candidate_count,
+        "emergent_role_count": emergent_role_count,
+        "role_transfer_attempt_count": role_transfer_attempt_count,
+        "successful_role_transfer_count": successful_role_transfer_count,
+        "concept_candidate_count": concept_candidate_count,
+        "promoted_concept_count": promoted_concept_count,
+        "world_model_component_count": world_model_component_count,
+        "coherent_world_model_component_count": coherent_world_model_component_count,
         "contradiction_cluster_count": contradiction_count,
         "representative_example_count": example_count,
         "graph_node_count": _count_rows(graph_conn, "graph_nodes"),
@@ -1275,13 +1297,41 @@ def _build_memory_summary_from_connections(
         "graph_path": str(paths.graph),
         "replay_queue_path": str(paths.replay_queue),
     }
-    for key in ("stable_contingency_count", "transformation_family_count", "carrier_candidate_count", "graph_node_count", "graph_edge_count", "replay_queue_size"):
+    for key in (
+        "stable_contingency_count",
+        "transformation_family_count",
+        "carrier_candidate_count",
+        "role_candidate_count",
+        "emergent_role_count",
+        "role_transfer_attempt_count",
+        "successful_role_transfer_count",
+        "concept_candidate_count",
+        "promoted_concept_count",
+        "world_model_component_count",
+        "coherent_world_model_component_count",
+        "graph_node_count",
+        "graph_edge_count",
+        "replay_queue_size",
+    ):
         summary[key] = int(summary[key] or 0)
     return summary
 
 
 def _count_rows(connection: sqlite3.Connection, table: str) -> int:
-    return int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+    try:
+        return int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+    except sqlite3.DatabaseError:
+        return 0
+
+
+def _safe_scalar(connection: sqlite3.Connection, query: str) -> int:
+    try:
+        row = connection.execute(query).fetchone()
+    except sqlite3.DatabaseError:
+        return 0
+    if row is None:
+        return 0
+    return int(row[0] or 0)
 
 
 def _load_json(path: Path) -> dict[str, Any] | None:
@@ -1437,6 +1487,130 @@ def _ensure_current_state_schema(path: Path) -> None:
                 key TEXT PRIMARY KEY,
                 value_json TEXT
             );
+            CREATE TABLE IF NOT EXISTS role_neighborhood_signatures (
+                carrier_signature TEXT PRIMARY KEY,
+                role_signature TEXT,
+                role_type TEXT,
+                token_json TEXT,
+                linked_family_count INTEGER,
+                linked_context_count INTEGER,
+                linked_game_count INTEGER,
+                in_edge_count INTEGER,
+                out_edge_count INTEGER,
+                first_seen_global_step INTEGER,
+                last_seen_global_step INTEGER,
+                stability_score REAL
+            );
+            CREATE TABLE IF NOT EXISTS role_candidates (
+                role_signature TEXT PRIMARY KEY,
+                role_type TEXT,
+                support_count INTEGER,
+                linked_carrier_count INTEGER,
+                linked_family_count INTEGER,
+                linked_context_count INTEGER,
+                cross_game_count INTEGER,
+                cross_context_count INTEGER,
+                first_seen_global_step INTEGER,
+                last_seen_global_step INTEGER,
+                role_stability_score REAL,
+                is_emergent INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS role_links (
+                role_signature TEXT,
+                linked_type TEXT,
+                linked_key TEXT,
+                support_count INTEGER,
+                first_seen_global_step INTEGER,
+                last_seen_global_step INTEGER,
+                PRIMARY KEY (role_signature, linked_type, linked_key)
+            );
+            CREATE TABLE IF NOT EXISTS role_transfer_attempts (
+                attempt_id TEXT PRIMARY KEY,
+                role_signature TEXT,
+                transfer_kind TEXT,
+                source_scope_type TEXT,
+                source_scope_key TEXT,
+                target_scope_type TEXT,
+                target_scope_key TEXT,
+                target_carrier_signature TEXT,
+                predicted_role_signature TEXT,
+                observed_role_signature TEXT,
+                similarity_score REAL,
+                transfer_score REAL,
+                reuse_success INTEGER,
+                failure_reason TEXT,
+                first_seen_global_step INTEGER,
+                last_seen_global_step INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS concept_candidates (
+                concept_signature TEXT PRIMARY KEY,
+                concept_type TEXT,
+                support_count INTEGER,
+                linked_role_count INTEGER,
+                linked_carrier_count INTEGER,
+                linked_family_count INTEGER,
+                transfer_success_count INTEGER,
+                cross_game_count INTEGER,
+                cross_context_count INTEGER,
+                compression_gain REAL,
+                explanatory_reach REAL,
+                promotion_score REAL,
+                first_seen_global_step INTEGER,
+                last_seen_global_step INTEGER,
+                is_promoted INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS concept_links (
+                concept_signature TEXT,
+                linked_type TEXT,
+                linked_key TEXT,
+                support_count INTEGER,
+                first_seen_global_step INTEGER,
+                last_seen_global_step INTEGER,
+                PRIMARY KEY (concept_signature, linked_type, linked_key)
+            );
+            CREATE TABLE IF NOT EXISTS world_model_components (
+                component_signature TEXT PRIMARY KEY,
+                component_type TEXT,
+                node_count INTEGER,
+                edge_count INTEGER,
+                linked_concept_count INTEGER,
+                linked_role_count INTEGER,
+                linked_family_count INTEGER,
+                linked_carrier_count INTEGER,
+                cross_context_count INTEGER,
+                cross_game_count INTEGER,
+                explanatory_coverage REAL,
+                prediction_support_count INTEGER,
+                contradiction_coverage_count INTEGER,
+                coherence_score REAL,
+                first_seen_global_step INTEGER,
+                last_seen_global_step INTEGER,
+                is_coherent INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS world_model_links (
+                component_signature TEXT,
+                linked_type TEXT,
+                linked_key TEXT,
+                support_count INTEGER,
+                first_seen_global_step INTEGER,
+                last_seen_global_step INTEGER,
+                PRIMARY KEY (component_signature, linked_type, linked_key)
+            );
+            CREATE TABLE IF NOT EXISTS higher_order_milestones (
+                milestone_name TEXT PRIMARY KEY,
+                first_global_step INTEGER,
+                evidence_key TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_role_links_type_key
+            ON role_links(linked_type, linked_key);
+            CREATE INDEX IF NOT EXISTS idx_role_transfer_role
+            ON role_transfer_attempts(role_signature);
+            CREATE INDEX IF NOT EXISTS idx_role_transfer_success
+            ON role_transfer_attempts(reuse_success, transfer_kind);
+            CREATE INDEX IF NOT EXISTS idx_concept_links_type_key
+            ON concept_links(linked_type, linked_key);
+            CREATE INDEX IF NOT EXISTS idx_world_model_links_type_key
+            ON world_model_links(linked_type, linked_key);
             """
         )
         _ensure_column(connection, "stable_contingencies", "context_level", "INTEGER DEFAULT 0")

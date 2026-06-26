@@ -91,6 +91,11 @@ H02_DEFAULTS: dict[str, Any] = {
     "hypothesis_id": "H02",
     "hypothesis_name": "Prediction violations drive attention and memory before object concepts",
     "decision": "INCONCLUSIVE",
+    "h02a_replay_attention_decision": "INCONCLUSIVE",
+    "h02b_pre_carrier_timing_decision": "INCONCLUSIVE",
+    "h02a_replay_attention_conclusion": "",
+    "h02b_pre_carrier_timing_conclusion": "",
+    "h02_final_decision_basis": "",
     "scientific_conclusion": "",
     "source_run_dir": "",
     "input_report_found": False,
@@ -146,6 +151,7 @@ H02_DEFAULTS: dict[str, Any] = {
     "context_expansion_pressure_active": False,
     "replay_priority_active": False,
     "object_carrier_absent_or_negligible": False,
+    "carrier_timing_note": "",
     "evidence_for": [],
     "evidence_against": [],
     "missing_evidence": [],
@@ -243,6 +249,7 @@ def evaluate_h02_prediction_violation_attention(
         prefer_db=prefer_db,
         scan_all_dbs=scan_all_dbs,
     )
+    temporal_rows = _load_h02_temporal_rows(input_report, memory_dir)
 
     for field in _REPORT_FIELD_NAMES:
         result[field] = report_metrics.get(field)
@@ -258,12 +265,17 @@ def evaluate_h02_prediction_violation_attention(
     result.update(direct_metrics)
 
     if not input_report_found and memory_dir is not None:
-        result["decision"] = "PARTIALLY_VALID" if _gt(result.get("memory_replay_candidate_count"), 0) else "INCONCLUSIVE"
-        result["scientific_conclusion"] = (
+        result["h02a_replay_attention_decision"] = "PARTIALLY_VALID" if _gt(result.get("memory_replay_candidate_count"), 0) else "INCONCLUSIVE"
+        result["h02b_pre_carrier_timing_decision"] = "INCONCLUSIVE"
+        result["h02a_replay_attention_conclusion"] = (
             "H02 evaluated from compact memory after raw cleanup."
             if _gt(result.get("memory_replay_candidate_count"), 0)
             else "H02 remains inconclusive because compact memory lacks replay evidence."
         )
+        result["h02b_pre_carrier_timing_conclusion"] = "Temporal pre-carrier timing cannot be evaluated from the available evidence."
+        result["h02_final_decision_basis"] = "Final H02 decision follows H02A replay/attention evidence for compatibility."
+        result["decision"] = result["h02a_replay_attention_decision"]
+        result["scientific_conclusion"] = result["h02a_replay_attention_conclusion"]
         _finalize_h02_result(result, output_dir)
         return result
     if not input_report_found:
@@ -325,18 +337,6 @@ def evaluate_h02_prediction_violation_attention(
             checks["high_priority_ratio_above_base_ratio"] is True,
         )
     )
-    pre_object_pass = all(
-        (
-            checks["object_carriers_absent"] is True,
-            checks["context_action_fallback_absent"] is True,
-        )
-    )
-    pre_object_missing = any(
-        (
-            result.get("emergent_object_carrier_count") is None,
-            result.get("emergent_context_action_fallback_count") is None,
-        )
-    )
     invalid_core = any(
         (
             checks["prediction_error_positive"] is not True,
@@ -351,46 +351,47 @@ def evaluate_h02_prediction_violation_attention(
     )
 
     if invalid_core or direct_replay_lift_invalid:
-        result["decision"] = "INVALID"
+        result["h02a_replay_attention_decision"] = "INVALID"
         if invalid_core:
-            result["scientific_conclusion"] = (
+            result["h02a_replay_attention_conclusion"] = (
                 "H02 is not supported in this run because prediction-violation signals or replayable memory pressure are absent."
             )
         else:
-            result["scientific_conclusion"] = (
+            result["h02a_replay_attention_conclusion"] = (
                 "H02 is not supported in this run because direct replay-lift evidence is available but does not show higher "
                 "replay priority for prediction-violating interactions."
             )
-    elif aggregate_signals_pass and direct_replay_lift_pass and pre_object_pass:
-        result["decision"] = "VALID"
-        result["scientific_conclusion"] = (
-            "H02 is supported in this run. Prediction-violating interactions receive substantially higher replay priority "
-            "than non-violating interactions, and the aggregate report shows that this occurs before object carriers emerge."
+    elif aggregate_signals_pass and direct_replay_lift_pass:
+        result["h02a_replay_attention_decision"] = "VALID"
+        result["h02a_replay_attention_conclusion"] = (
+            "H02A is supported in this run. Prediction-violating interactions receive substantially higher replay priority "
+            "than non-violating interactions."
         )
-    elif aggregate_signals_pass and direct_replay_lift_pass and pre_object_missing:
-        result["decision"] = "PARTIALLY_VALID"
-        result["scientific_conclusion"] = (
-            "H02 is partially supported in this run. Prediction-violating interactions receive substantially higher replay "
-            "priority than non-violating interactions, but pre-object timing cannot be fully validated because object-carrier "
-            "absence evidence is unavailable in the aggregate report."
-        )
-    elif aggregate_signals_pass and (pre_object_pass or pre_object_missing):
-        result["decision"] = "PARTIALLY_VALID"
-        result["scientific_conclusion"] = (
-            "H02 is partially supported in this run. Aggregate prediction-violation, contradiction, and replay-candidate "
+    elif aggregate_signals_pass and checks["replay_candidates_present"] is True and checks["high_priority_replay_present"] is True:
+        result["h02a_replay_attention_decision"] = "PARTIALLY_VALID"
+        result["h02a_replay_attention_conclusion"] = (
+            "H02A is partially supported in this run. Aggregate prediction-violation, contradiction, and replay-candidate "
             "signals are present, but direct replay-lift evidence is unavailable or not strong enough for full validation."
         )
     elif not aggregate_signals_pass and result.get("direct_replay_lift_available") is not True:
-        result["decision"] = "INCONCLUSIVE"
-        result["scientific_conclusion"] = (
-            "H02 remains inconclusive because both the aggregate signals and the direct replay-lift evidence are unavailable."
+        result["h02a_replay_attention_decision"] = "INCONCLUSIVE"
+        result["h02a_replay_attention_conclusion"] = (
+            "H02A remains inconclusive because both the aggregate signals and the direct replay-lift evidence are unavailable."
         )
     else:
-        result["decision"] = "INVALID"
-        result["scientific_conclusion"] = (
-            "H02 is not supported in this run because the aggregate contradiction, replay-priority, or pre-object timing "
-            "signals do not satisfy the hypothesis requirements."
+        result["h02a_replay_attention_decision"] = "PARTIALLY_VALID"
+        result["h02a_replay_attention_conclusion"] = (
+            "H02A has some replay/attention evidence, but the aggregate contradiction or replay-priority signals do not fully "
+            "satisfy the stronger validation conditions."
         )
+
+    timing = _evaluate_h02b_pre_carrier_timing(result, temporal_rows)
+    result["h02b_pre_carrier_timing_decision"] = timing["decision"]
+    result["h02b_pre_carrier_timing_conclusion"] = timing["conclusion"]
+    result["carrier_timing_note"] = timing["note"]
+    result["decision"] = result["h02a_replay_attention_decision"]
+    result["h02_final_decision_basis"] = "Final H02 decision follows H02A replay/attention evidence; H02B is reported as a separate timing qualifier."
+    result["scientific_conclusion"] = f"{result['h02a_replay_attention_conclusion']} {result['h02b_pre_carrier_timing_conclusion']}".strip()
 
     _populate_evidence_lists(result)
     _finalize_h02_result(result, output_dir)
@@ -420,6 +421,82 @@ def _extract_h02_compact_metrics(memory_dir: Path) -> dict[str, Any]:
             "prediction_violation_replay_lift": None,
             "direct_replay_lift_available": False,
         }
+
+
+def _load_h02_temporal_rows(input_report: dict[str, Any] | None, memory_dir: Path | None) -> list[dict[str, Any]]:
+    rows = list(((input_report or {}).get("temporal_milestones") or {}).get("by_game_sampler_seed", []) or [])
+    if rows:
+        return [dict(item) for item in rows if isinstance(item, dict)]
+    if memory_dir is None:
+        return []
+    current_state = Path(memory_dir) / "current_state.sqlite"
+    if not current_state.exists():
+        return []
+    try:
+        with sqlite3.connect(current_state) as connection:
+            connection.row_factory = sqlite3.Row
+            return [
+                dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT game, sampler, seed, first_prediction_violation_step, first_high_replay_priority_step,
+                           first_emergent_carrier_step
+                    FROM temporal_milestones
+                    """
+                ).fetchall()
+            ]
+    except sqlite3.DatabaseError:
+        return []
+
+
+def _evaluate_h02b_pre_carrier_timing(result: dict[str, Any], temporal_rows: list[dict[str, Any]]) -> dict[str, str]:
+    if temporal_rows:
+        saw_explicit_invalid = False
+        saw_explicit_valid = False
+        for row in temporal_rows:
+            replay_steps = [
+                int(value)
+                for value in (row.get("first_prediction_violation_step"), row.get("first_high_replay_priority_step"))
+                if value is not None
+            ]
+            carrier_step = row.get("first_emergent_carrier_step")
+            if carrier_step is None or not replay_steps:
+                continue
+            replay_step = min(replay_steps)
+            carrier_step_int = int(carrier_step)
+            if carrier_step_int < replay_step:
+                saw_explicit_invalid = True
+            elif carrier_step_int > replay_step:
+                saw_explicit_valid = True
+        if saw_explicit_invalid:
+            return {
+                "decision": "INVALID",
+                "conclusion": "H02B is not supported because explicit temporal evidence shows carrier emergence preceded replay/attention evidence.",
+                "note": "Temporal milestones show emergent carriers before the replay/attention signal.",
+            }
+        if saw_explicit_valid:
+            return {
+                "decision": "VALID",
+                "conclusion": "H02B is supported because replay/attention evidence appears before emergent carriers in the available temporal milestones.",
+                "note": "Temporal milestones show replay/attention before carrier emergence.",
+            }
+    if result.get("emergent_object_carrier_count") is None or result.get("emergent_context_action_fallback_count") is None:
+        return {
+            "decision": "INCONCLUSIVE",
+            "conclusion": "H02B remains inconclusive because carrier timing fields are unavailable.",
+            "note": "Carrier timing evidence is unavailable.",
+        }
+    if _eq(result.get("emergent_carrier_count"), 0) is True or _eq(result.get("emergent_object_carrier_count"), 0) is True:
+        return {
+            "decision": "VALID",
+            "conclusion": "H02B is supported at the current measurement point because no emergent carriers are present.",
+            "note": "No emergent carriers are present at the evaluated snapshot.",
+        }
+    return {
+        "decision": "INCONCLUSIVE",
+        "conclusion": "H02B remains inconclusive because carriers are present in the final memory snapshot, but no temporal evidence shows they emerged before replay/attention signals.",
+        "note": "Carriers present in final memory snapshot; no temporal evidence that carriers preceded replay signal.",
+    }
 
 
 def compute_prediction_violation_replay_lift_from_existing_db(
@@ -1569,16 +1646,16 @@ def _populate_evidence_lists(result: dict[str, Any]) -> None:
         evidence_against.append("Context expansion pressure is not demonstrated.")
 
     if _gt(result.get("memory_replay_candidate_count"), 0) is True:
-        evidence_for.append(f"Replay candidates exist in memory ({int(result['memory_replay_candidate_count'])} candidates).")
+        evidence_for.append(f"Replay/attention evidence: replay candidates exist in memory ({int(result['memory_replay_candidate_count'])} candidates).")
     else:
-        evidence_against.append("No replay candidates are available to show memory centrality.")
+        evidence_against.append("Replay/attention evidence: no replay candidates are available to show memory centrality.")
 
     lift = result.get("prediction_violation_replay_lift")
     if lift is not None:
         if float(lift) > 1.25:
-            evidence_for.append(f"Prediction-violating interactions have replay lift {float(lift):.3f} (> 1.25).")
+            evidence_for.append(f"Replay/attention evidence: prediction-violating interactions have replay lift {float(lift):.3f} (> 1.25).")
         else:
-            evidence_against.append(f"Prediction-violating replay lift is weak ({float(lift):.3f}).")
+            evidence_against.append(f"Replay/attention evidence: prediction-violating replay lift is weak ({float(lift):.3f}).")
     elif (
         DIRECT_LINKAGE_UNAVAILABLE_MESSAGE not in missing_evidence
         and DIRECT_LINKAGE_SHARD_LIMIT_MESSAGE not in missing_evidence
@@ -1587,17 +1664,20 @@ def _populate_evidence_lists(result: dict[str, Any]) -> None:
 
     object_carrier_check = _eq(result.get("emergent_object_carrier_count"), 0)
     if object_carrier_check is True:
-        evidence_for.append("No emergent object carriers are present in the sampled run.")
+        evidence_for.append("Temporal pre-carrier evidence: no emergent object carriers are present in the sampled run.")
     elif result.get("emergent_object_carrier_count") is None:
-        missing_evidence.append("Aggregate object-carrier absence evidence is unavailable.")
+        missing_evidence.append("Temporal pre-carrier evidence: aggregate object-carrier absence evidence is unavailable.")
     else:
-        evidence_against.append("Emergent object carriers are already present, weakening the pre-concept claim.")
+        evidence_for.append("Carrier emergence present in final memory snapshot; this does not invalidate replay/attention evidence without temporal ordering evidence.")
 
     fallback_check = _eq(result.get("emergent_context_action_fallback_count"), 0)
     if fallback_check is False:
-        evidence_against.append("Context-action fallback carriers emerged, which weakens the pre-object interpretation.")
+        evidence_against.append("Temporal pre-carrier evidence: context-action fallback carriers emerged, which weakens the pre-object interpretation.")
     elif result.get("emergent_context_action_fallback_count") is None:
-        missing_evidence.append("Aggregate context-action fallback evidence is unavailable.")
+        missing_evidence.append("Temporal pre-carrier evidence: aggregate context-action fallback evidence is unavailable.")
+
+    if result.get("carrier_timing_note"):
+        evidence_for.append(f"Temporal pre-carrier evidence: {result['carrier_timing_note']}")
 
     result["evidence_for"] = evidence_for
     result["evidence_against"] = evidence_against
@@ -1617,7 +1697,11 @@ def _format_text_report(result: dict[str, Any]) -> str:
         "Hypothesis statement:",
         "Prediction-violating interactions become central in memory before object concepts emerge.",
         "",
-        f"Decision: {result['decision']}",
+        f"Final Decision: {result['decision']}",
+        f"H02A replay/attention: {result['h02a_replay_attention_decision']}",
+        f"H02B pre-carrier timing: {result['h02b_pre_carrier_timing_decision']}",
+        f"Final decision basis: {result['h02_final_decision_basis']}",
+        f"Carrier timing note: {result.get('carrier_timing_note') or 'none'}",
         "",
         "Direct replay-lift evidence:",
         *_format_direct_evidence_text(result),
@@ -1649,7 +1733,11 @@ def _format_markdown_report(result: dict[str, Any]) -> str:
         "",
         "Prediction-violating interactions become central in memory before object concepts emerge.",
         "",
-        f"**Decision:** `{result['decision']}`",
+        f"**Final Decision:** `{result['decision']}`",
+        f"**H02A replay/attention:** `{result['h02a_replay_attention_decision']}`",
+        f"**H02B pre-carrier timing:** `{result['h02b_pre_carrier_timing_decision']}`",
+        f"**Final decision basis:** {result['h02_final_decision_basis']}",
+        f"**Carrier timing note:** {result.get('carrier_timing_note') or 'none'}",
         "",
         "## Direct replay-lift evidence",
         *_format_direct_evidence_markdown(result),
@@ -1697,7 +1785,7 @@ def _format_direct_evidence_text(result: dict[str, Any]) -> list[str]:
         f"replay lift: {_fmt_number(result.get('prediction_violation_replay_lift'))}",
         f"high-priority threshold method: {result.get('high_priority_threshold_method')}",
         f"high-priority violation ratio: {_fmt_number(result.get('high_priority_replay_prediction_violation_ratio'))}",
-        f"conclusion: {'direct replay-lift evidence supports H02' if _gt(result.get('prediction_violation_replay_lift'), 1.25) is True else 'direct replay-lift evidence is present but weak'}",
+        f"conclusion: {'direct replay-lift evidence supports H02A' if _gt(result.get('prediction_violation_replay_lift'), 1.25) is True else 'direct replay-lift evidence is present but weak'}",
     ]
 
 
@@ -1722,9 +1810,10 @@ def _format_direct_evidence_markdown(result: dict[str, Any]) -> list[str]:
         f"- mean priority violating: `{_fmt_number(result.get('mean_replay_priority_for_prediction_violating_interactions'))}`",
         f"- mean priority non-violating: `{_fmt_number(result.get('mean_replay_priority_for_non_prediction_violating_interactions'))}`",
         f"- replay lift: `{_fmt_number(result.get('prediction_violation_replay_lift'))}`",
+        f"- base violation ratio: `{_fmt_number(result.get('prediction_violation_base_ratio'))}`",
         f"- high-priority threshold method: `{result.get('high_priority_threshold_method')}`",
         f"- high-priority violation ratio: `{_fmt_number(result.get('high_priority_replay_prediction_violation_ratio'))}`",
-        f"- conclusion: {'direct replay-lift evidence supports H02' if _gt(result.get('prediction_violation_replay_lift'), 1.25) is True else 'direct replay-lift evidence is present but weak'}",
+        f"- conclusion: {'direct replay-lift evidence supports H02A' if _gt(result.get('prediction_violation_replay_lift'), 1.25) is True else 'direct replay-lift evidence is present but weak'}",
     ]
 
 

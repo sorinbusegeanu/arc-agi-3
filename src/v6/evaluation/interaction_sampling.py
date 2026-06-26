@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import csv
+import inspect
 import json
 import os
 import sqlite3
 import sys
 import shutil
+import time
 from collections import Counter, defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, as_completed, wait
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -77,6 +79,11 @@ class InteractionSamplingConfig:
     memory_output_dir: str | None = None
     global_step_offset: int = 0
     fast_postprocessing: bool = False
+    initial_workers: int | None = None
+    enable_worker_ramp: bool = False
+    ram_ramp_threshold_percent: float = 85.0
+    initial_worker_ramp_delay_seconds: float = 20.0
+    per_worker_ramp_delay_seconds: float = 5.0
 
 
 def resolve_game_ids(games_arg: str, env_root: str | None = None) -> list[str]:
@@ -123,7 +130,7 @@ def run_interaction_sampling_v05c(config: InteractionSamplingConfig) -> list[dic
     output = Path(config.output_dir)
     sampling_root = output / ("sampling_v05c_sqlite_tmp" if config.storage_backend == "parquet" else "sampling_v05c")
     sampling_root.mkdir(parents=True, exist_ok=True)
-    _generate_sampling_dbs(config, sampling_root)
+    worker_execution = _generate_sampling_dbs(config, sampling_root)
     if config.collect_only:
         if config.storage_backend == "parquet":
             _export_sampling_sqlite_to_parquet(config, sampling_root)
@@ -151,6 +158,7 @@ def run_interaction_sampling_v05c(config: InteractionSamplingConfig) -> list[dic
         "global_step_end": int(config.global_step_offset) + int(config.steps),
         "memory_input_dir": config.memory_input_dir,
         "memory_output_dir": config.memory_output_dir,
+        "worker_execution": worker_execution,
         "temporal_milestones": temporal_milestones,
         "forbidden_features_used_during_sampling": False,
         "efficiency_diagnostics_enabled": not bool(config.fast_postprocessing),
@@ -204,7 +212,8 @@ def resolve_interaction_sampling_scope(config: InteractionSamplingConfig) -> Int
     )
 
 
-def _generate_sampling_dbs(config: InteractionSamplingConfig, sampling_root: Path) -> None:
+def _generate_sampling_dbs(config: InteractionSamplingConfig, sampling_root: Path) -> dict[str, object]:
+    aggregated_worker_execution = _default_worker_execution_stats(config)
     if config.collect_only and config.storage_backend == "parquet":
         for game in config.games:
             game_jobs = []
@@ -238,10 +247,19 @@ def _generate_sampling_dbs(config: InteractionSamplingConfig, sampling_root: Pat
                     )
                     order += 1
             if game_jobs:
-                _run_sampling_jobs(game_jobs, workers=config.workers)
+                stats = _invoke_run_sampling_jobs(
+                    game_jobs,
+                    workers=config.workers,
+                    initial_workers=config.initial_workers,
+                    enable_worker_ramp=bool(config.enable_worker_ramp),
+                    ram_ramp_threshold_percent=float(config.ram_ramp_threshold_percent),
+                    initial_worker_ramp_delay_seconds=float(config.initial_worker_ramp_delay_seconds),
+                    per_worker_ramp_delay_seconds=float(config.per_worker_ramp_delay_seconds),
+                )
+                aggregated_worker_execution = _merge_worker_execution_stats(aggregated_worker_execution, stats)
             _export_sampling_sqlite_to_parquet(config, sampling_root, games=(game,))
             shutil.rmtree(sampling_root / game, ignore_errors=True)
-        return
+        return aggregated_worker_execution
 
     jobs = []
     order = 0
@@ -275,13 +293,81 @@ def _generate_sampling_dbs(config: InteractionSamplingConfig, sampling_root: Pat
                 )
                 order += 1
     if not jobs:
-        return
-    _run_sampling_jobs(jobs, workers=config.workers)
+        return aggregated_worker_execution
+    stats = _invoke_run_sampling_jobs(
+        jobs,
+        workers=config.workers,
+        initial_workers=config.initial_workers,
+        enable_worker_ramp=bool(config.enable_worker_ramp),
+        ram_ramp_threshold_percent=float(config.ram_ramp_threshold_percent),
+        initial_worker_ramp_delay_seconds=float(config.initial_worker_ramp_delay_seconds),
+        per_worker_ramp_delay_seconds=float(config.per_worker_ramp_delay_seconds),
+    )
+    return _merge_worker_execution_stats(aggregated_worker_execution, stats)
 
 
-def _run_sampling_jobs(jobs: list[dict], *, workers: int) -> None:
+def _invoke_run_sampling_jobs(
+    jobs: list[dict],
+    *,
+    workers: int,
+    initial_workers: int | None = None,
+    enable_worker_ramp: bool = False,
+    ram_ramp_threshold_percent: float = 85.0,
+    initial_worker_ramp_delay_seconds: float = 20.0,
+    per_worker_ramp_delay_seconds: float = 5.0,
+) -> dict[str, object]:
+    params = inspect.signature(_run_sampling_jobs).parameters
+    kwargs: dict[str, object] = {"workers": workers}
+    if "initial_workers" in params:
+        kwargs["initial_workers"] = initial_workers
+    if "enable_worker_ramp" in params:
+        kwargs["enable_worker_ramp"] = enable_worker_ramp
+    if "ram_ramp_threshold_percent" in params:
+        kwargs["ram_ramp_threshold_percent"] = ram_ramp_threshold_percent
+    if "initial_worker_ramp_delay_seconds" in params:
+        kwargs["initial_worker_ramp_delay_seconds"] = initial_worker_ramp_delay_seconds
+    if "per_worker_ramp_delay_seconds" in params:
+        kwargs["per_worker_ramp_delay_seconds"] = per_worker_ramp_delay_seconds
+    stats = _run_sampling_jobs(jobs, **kwargs)
+    if isinstance(stats, dict):
+        return stats
+    return {
+        "requested_workers": int(workers),
+        "initial_workers": int(initial_workers if initial_workers is not None else workers),
+        "peak_workers": 0,
+        "worker_ramp_enabled": bool(enable_worker_ramp),
+        "ram_ramp_threshold_percent": float(ram_ramp_threshold_percent),
+        "initial_worker_ramp_delay_seconds": float(initial_worker_ramp_delay_seconds),
+        "per_worker_ramp_delay_seconds": float(per_worker_ramp_delay_seconds),
+        "ram_used_percent_at_start": 0.0,
+        "ramp_event_count": 0,
+        "ramp_events": [],
+    }
+
+
+def _run_sampling_jobs(
+    jobs: list[dict],
+    *,
+    workers: int,
+    initial_workers: int | None = None,
+    enable_worker_ramp: bool = False,
+    ram_ramp_threshold_percent: float = 85.0,
+    initial_worker_ramp_delay_seconds: float = 20.0,
+    per_worker_ramp_delay_seconds: float = 5.0,
+) -> dict[str, object]:
     workers = max(1, min(int(workers), len(jobs)))
-    print(f"running {len(jobs)} v0.5c sampling jobs with workers={workers}", file=sys.stderr, flush=True)
+    initial = workers if initial_workers is None else max(1, min(int(initial_workers), workers))
+    ram_at_start = _system_ram_snapshot()
+    print(
+        f"running {len(jobs)} v0.5c sampling jobs with workers={workers}"
+        f" initial_workers={initial}"
+        f" worker_ramp={'on' if enable_worker_ramp else 'off'}"
+        f" initial_ramp_delay_s={float(initial_worker_ramp_delay_seconds):.1f}"
+        f" per_worker_ramp_delay_s={float(per_worker_ramp_delay_seconds):.1f}"
+        f" ram_used_percent={ram_at_start['ram_used_percent']:.2f}",
+        file=sys.stderr,
+        flush=True,
+    )
     progress = tqdm(
         total=len(jobs),
         desc="epoch sampling",
@@ -290,14 +376,87 @@ def _run_sampling_jobs(jobs: list[dict], *, workers: int) -> None:
         dynamic_ncols=True,
         leave=True,
     )
+    pending_jobs = iter(jobs)
+    active_futures = {}
+    target_workers = initial
+    peak_workers = 0
+    ramp_events: list[dict[str, float | int]] = []
+    ramp_start_time = time.monotonic()
+    last_ramp_time = ramp_start_time
+
+    def _maybe_ramp() -> bool:
+        nonlocal target_workers, last_ramp_time
+        if not enable_worker_ramp or target_workers >= workers:
+            return False
+        now = time.monotonic()
+        required_delay = (
+            float(initial_worker_ramp_delay_seconds)
+            if target_workers <= initial
+            else float(per_worker_ramp_delay_seconds)
+        )
+        if (now - last_ramp_time) < required_delay:
+            return False
+        snapshot = _system_ram_snapshot()
+        if float(snapshot["ram_used_percent"]) >= float(ram_ramp_threshold_percent):
+            return False
+        target_workers += 1
+        last_ramp_time = now
+        ramp_events.append(
+            {
+                "target_workers": int(target_workers),
+                "ram_used_percent": float(snapshot["ram_used_percent"]),
+                "seconds_since_start": float(now - ramp_start_time),
+            }
+        )
+        print(
+            f"ramped sampling workers to {target_workers}/{workers}"
+            f" at ram_used_percent={snapshot['ram_used_percent']:.2f}"
+            f" elapsed_s={now - ramp_start_time:.1f}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return True
+
+    def _submit_until_target(executor: ProcessPoolExecutor) -> None:
+        nonlocal peak_workers
+        while len(active_futures) < target_workers:
+            try:
+                job = next(pending_jobs)
+            except StopIteration:
+                break
+            future = executor.submit(_run_sampling_job, job)
+            active_futures[future] = job
+        peak_workers = max(peak_workers, len(active_futures))
+
     try:
         with ProcessPoolExecutor(max_workers=workers, max_tasks_per_child=1) as executor:
-            futures = {executor.submit(_run_sampling_job, job): job for job in jobs}
-            for future in as_completed(futures):
-                future.result()
-                progress.update(1)
+            _submit_until_target(executor)
+            while active_futures:
+                done, _pending = wait(active_futures, timeout=0.5, return_when=FIRST_COMPLETED)
+                if not done:
+                    if _maybe_ramp():
+                        _submit_until_target(executor)
+                    continue
+                for future in done:
+                    future.result()
+                    active_futures.pop(future, None)
+                    progress.update(1)
+                _maybe_ramp()
+                _submit_until_target(executor)
     finally:
         progress.close()
+    return {
+        "requested_workers": int(workers),
+        "initial_workers": int(initial),
+        "peak_workers": int(peak_workers),
+        "worker_ramp_enabled": bool(enable_worker_ramp),
+        "ram_ramp_threshold_percent": float(ram_ramp_threshold_percent),
+        "initial_worker_ramp_delay_seconds": float(initial_worker_ramp_delay_seconds),
+        "per_worker_ramp_delay_seconds": float(per_worker_ramp_delay_seconds),
+        "ram_used_percent_at_start": float(ram_at_start["ram_used_percent"]),
+        "ramp_event_count": int(len(ramp_events)),
+        "ramp_events": ramp_events,
+    }
 
 
 def _export_sampling_sqlite_to_parquet(config: InteractionSamplingConfig, sampling_root: Path, *, games: tuple[str, ...] | None = None) -> None:
@@ -1294,6 +1453,65 @@ def _read_sampling_metadata(path: Path) -> dict:
         except sqlite3.DatabaseError:
             return {}
     return {str(key): json.loads(value) for key, value in rows}
+
+
+def _system_ram_snapshot() -> dict[str, float | int]:
+    meminfo: dict[str, int] = {}
+    try:
+        with Path("/proc/meminfo").open("r", encoding="utf-8") as handle:
+            for line in handle:
+                key, _sep, remainder = line.partition(":")
+                value = remainder.strip().split()[0]
+                meminfo[key] = int(value) * 1024
+    except Exception:
+        return {
+            "ram_total_bytes": 0,
+            "ram_available_bytes": 0,
+            "ram_used_bytes": 0,
+            "ram_used_percent": 0.0,
+        }
+    total = int(meminfo.get("MemTotal", 0))
+    available = int(meminfo.get("MemAvailable", meminfo.get("MemFree", 0)))
+    used = max(0, total - available)
+    used_percent = (float(used) / float(total) * 100.0) if total > 0 else 0.0
+    return {
+        "ram_total_bytes": total,
+        "ram_available_bytes": available,
+        "ram_used_bytes": used,
+        "ram_used_percent": used_percent,
+    }
+
+
+def _default_worker_execution_stats(config: InteractionSamplingConfig) -> dict[str, object]:
+    return {
+        "requested_workers": int(config.workers),
+        "initial_workers": int(config.initial_workers if config.initial_workers is not None else config.workers),
+        "peak_workers": 0,
+        "worker_ramp_enabled": bool(config.enable_worker_ramp),
+        "ram_ramp_threshold_percent": float(config.ram_ramp_threshold_percent),
+        "initial_worker_ramp_delay_seconds": float(config.initial_worker_ramp_delay_seconds),
+        "per_worker_ramp_delay_seconds": float(config.per_worker_ramp_delay_seconds),
+        "ram_used_percent_at_start": 0.0,
+        "ramp_event_count": 0,
+        "ramp_events": [],
+    }
+
+
+def _merge_worker_execution_stats(left: dict[str, object], right: dict[str, object]) -> dict[str, object]:
+    left_events = list(left.get("ramp_events", []) or [])
+    right_events = list(right.get("ramp_events", []) or [])
+    return {
+        "requested_workers": int(max(int(left.get("requested_workers", 0) or 0), int(right.get("requested_workers", 0) or 0))),
+        "initial_workers": int(max(int(left.get("initial_workers", 0) or 0), int(right.get("initial_workers", 0) or 0))),
+        "peak_workers": int(max(int(left.get("peak_workers", 0) or 0), int(right.get("peak_workers", 0) or 0))),
+        "worker_ramp_enabled": bool(left.get("worker_ramp_enabled", False) or right.get("worker_ramp_enabled", False)),
+        "ram_ramp_threshold_percent": float(max(float(left.get("ram_ramp_threshold_percent", 0.0) or 0.0), float(right.get("ram_ramp_threshold_percent", 0.0) or 0.0))),
+        "initial_worker_ramp_delay_seconds": float(max(float(left.get("initial_worker_ramp_delay_seconds", 0.0) or 0.0), float(right.get("initial_worker_ramp_delay_seconds", 0.0) or 0.0))),
+        "per_worker_ramp_delay_seconds": float(max(float(left.get("per_worker_ramp_delay_seconds", 0.0) or 0.0), float(right.get("per_worker_ramp_delay_seconds", 0.0) or 0.0))),
+        "ram_used_percent_at_start": float(max(float(left.get("ram_used_percent_at_start", 0.0) or 0.0), float(right.get("ram_used_percent_at_start", 0.0) or 0.0))),
+        "ramp_event_count": int(len(left_events) + len(right_events)),
+        "ramp_events": [*left_events, *right_events],
+    }
 
 
 def _sampling_db_ready(path: Path) -> bool:

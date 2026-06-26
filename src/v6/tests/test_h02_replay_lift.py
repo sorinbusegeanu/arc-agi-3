@@ -12,7 +12,7 @@ from v6.hypothesis_h02_report import (
 )
 
 
-def _write_v05c_report(run_dir: Path, **validation_overrides) -> None:
+def _write_v05c_report(run_dir: Path, temporal_rows: list[dict] | None = None, **validation_overrides) -> None:
     validation = {
         "mean_isf_total": 1.8,
         "max_isf_total": 3.2,
@@ -37,7 +37,7 @@ def _write_v05c_report(run_dir: Path, **validation_overrides) -> None:
         "emergent_context_action_fallback_count": 0,
     }
     validation.update(validation_overrides)
-    payload = {"validation": validation}
+    payload = {"validation": validation, "temporal_milestones": {"by_game_sampler_seed": temporal_rows or []}}
     (run_dir / "interaction_sampling_v05c_report.json").write_text(json.dumps(payload), encoding="utf-8")
 
 
@@ -214,10 +214,9 @@ def test_strong_replay_lift_with_missing_object_fields_is_partially_valid(tmp_pa
 
     result = evaluate_h02_prediction_violation_attention(run_dir, output_dir)
 
-    assert result["decision"] == "PARTIALLY_VALID"
-    assert "partially supported" in result["scientific_conclusion"].lower()
-    assert "object-carrier absence evidence is unavailable" in result["scientific_conclusion"]
-    assert "Aggregate object-carrier absence evidence is unavailable." in result["missing_evidence"]
+    assert result["h02a_replay_attention_decision"] == "VALID"
+    assert result["h02b_pre_carrier_timing_decision"] == "INCONCLUSIVE"
+    assert result["decision"] == "VALID"
 
 
 def test_strong_replay_lift_with_object_fields_absent_is_valid(tmp_path: Path) -> None:
@@ -230,6 +229,8 @@ def test_strong_replay_lift_with_object_fields_absent_is_valid(tmp_path: Path) -
     result = evaluate_h02_prediction_violation_attention(run_dir, output_dir)
 
     assert result["decision"] == "VALID"
+    assert result["h02a_replay_attention_decision"] == "VALID"
+    assert result["h02b_pre_carrier_timing_decision"] == "VALID"
 
 
 def test_equal_priority_table_is_invalid_when_direct_lift_is_one(tmp_path: Path) -> None:
@@ -260,6 +261,7 @@ def test_equal_priority_table_is_invalid_when_direct_lift_is_one(tmp_path: Path)
 
     assert result["direct_replay_lift_available"] is True
     assert result["prediction_violation_replay_lift"] == 1.0
+    assert result["h02a_replay_attention_decision"] == "INVALID"
     assert result["decision"] == "INVALID"
 
 
@@ -343,7 +345,61 @@ def test_missing_db_keeps_valid_aggregate_json_partial(tmp_path: Path) -> None:
     assert result["db_found"] is False
     assert result["prediction_violation_replay_lift"] is None
     assert result["decision"] == "PARTIALLY_VALID"
+    assert result["h02a_replay_attention_decision"] == "PARTIALLY_VALID"
     assert DIRECT_LINKAGE_UNAVAILABLE_MESSAGE in result["missing_evidence"]
+
+
+def test_h02_carriers_present_do_not_invalidate_replay_attention(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    output_dir = tmp_path / "out"
+    run_dir.mkdir()
+    _write_v05c_report(run_dir, emergent_carrier_count=2, emergent_object_carrier_count=2)
+    _write_direct_linkage_db(run_dir / "strong.sqlite")
+
+    result = evaluate_h02_prediction_violation_attention(run_dir, output_dir)
+
+    assert result["h02a_replay_attention_decision"] == "VALID"
+    assert result["h02b_pre_carrier_timing_decision"] == "INCONCLUSIVE"
+    assert result["decision"] != "INVALID"
+
+
+def test_h02_no_replay_candidates_is_invalid(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    output_dir = tmp_path / "out"
+    run_dir.mkdir()
+    _write_v05c_report(run_dir, memory_replay_candidate_count=0, high_priority_replay_count=0)
+
+    result = evaluate_h02_prediction_violation_attention(run_dir, output_dir)
+
+    assert result["h02a_replay_attention_decision"] == "INVALID"
+
+
+def test_h02_explicit_carrier_before_replay_timing_is_invalid_only_for_h02b(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    output_dir = tmp_path / "out"
+    run_dir.mkdir()
+    _write_v05c_report(
+        run_dir,
+        temporal_rows=[
+            {
+                "game": "tt01",
+                "sampler": "mixed",
+                "seed": 0,
+                "first_prediction_violation_step": 10,
+                "first_high_replay_priority_step": 12,
+                "first_emergent_carrier_step": 5,
+            }
+        ],
+        emergent_carrier_count=1,
+        emergent_object_carrier_count=1,
+    )
+    _write_direct_linkage_db(run_dir / "strong.sqlite")
+
+    result = evaluate_h02_prediction_violation_attention(run_dir, output_dir)
+
+    assert result["h02a_replay_attention_decision"] == "VALID"
+    assert result["h02b_pre_carrier_timing_decision"] == "INVALID"
+    assert result["decision"] == "VALID"
 
 
 def test_missing_aggregate_report_is_inconclusive(tmp_path: Path) -> None:
