@@ -9,7 +9,8 @@ from typing import Any
 
 from v6.evaluation.interaction_sampling import InteractionSamplingConfig, parse_v05c_games, parse_v05c_samplers, run_interaction_sampling_v05c
 from v6.hypothesis_suite_report import run_hypothesis_suite_report
-from v6.memory.compact_memory import CompactMemoryFoldConfig, build_memory_summary, ensure_memory_layout, fold_epoch_raw_into_compact_memory, load_memory_summary
+from v6.memory.compact_memory import build_memory_summary, ensure_memory_layout, load_memory_summary
+from v6.memory.direct_streaming_fold import direct_streaming_manifest_has_failures
 from v6.memory.memory_cleanup import cleanup_epoch_artifacts, disk_usage_snapshot, stop_due_to_disk, validate_cleanup_safe
 
 
@@ -45,6 +46,8 @@ class ContinuousResearchConfig:
     live_memory_queue_maxsize: int = 100_000
     live_memory_batch_size: int = 1000
     live_memory_flush_seconds: float = 2.0
+    direct_streaming_fold: bool = True
+    delete_raw_after_direct_streaming_fold: bool = True
 
 
 def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
@@ -135,19 +138,21 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
                 live_memory_queue_maxsize=int(config.live_memory_queue_maxsize),
                 live_memory_batch_size=int(config.live_memory_batch_size),
                 live_memory_flush_seconds=float(config.live_memory_flush_seconds),
+                direct_streaming_fold_enabled=bool(config.direct_streaming_fold),
+                delete_raw_after_direct_streaming_fold=bool(config.delete_raw_after_direct_streaming_fold),
             )
         )
         worker_execution = _load_sampling_worker_execution(raw_dir)
-        fold_summary = fold_epoch_raw_into_compact_memory(
-            epoch_raw_dir=raw_dir,
-            memory_dir=memory_dir,
-            fold_config=CompactMemoryFoldConfig(
-                global_step_start=global_step_start,
-                global_step_end=global_step_end,
-                max_replay_queue_size=int(config.max_replay_queue_size),
-                replay_retention_percent=int(config.replay_retention_percent),
-            ),
-        )
+        if bool(config.direct_streaming_fold):
+            if direct_streaming_manifest_has_failures(memory_dir):
+                raise RuntimeError("direct streaming fold manifest reports failures; final raw fallback is disabled")
+            fold_summary = {
+                "direct_streaming_fold_enabled": True,
+                "final_raw_epoch_fold_skipped": True,
+                "legacy_sidecar_fold_removed": True,
+            }
+        else:
+            raise RuntimeError("direct streaming fold is now required for normal continuous runs")
         suite_summary = run_hypothesis_suite_report(
             run_dir=raw_dir,
             memory_dir=memory_dir,
@@ -252,6 +257,7 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
             "h11_emergent_motifs_with_strong_transfer": h11_metrics.get("emergent_motifs_with_strong_transfer_count"),
             "h11_emergent_motifs_with_promoted_concepts": h11_metrics.get("emergent_motifs_with_promoted_concept_count"),
             "h11_non_emergent_motif_transfer_links": h11_metrics.get("non_emergent_motif_transfer_link_count"),
+            "final_raw_epoch_fold_skipped": bool(fold_summary.get("final_raw_epoch_fold_skipped", False)),
             "workers_requested": requested_workers,
             "workers_initial": initial_epoch_workers,
             "workers_max_epoch": max_epoch_workers,
@@ -297,6 +303,7 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
                 "workers_initial": initial_epoch_workers,
                 "workers_max_epoch": max_epoch_workers,
                 "worker_execution": worker_execution,
+                "final_raw_epoch_fold_skipped": bool(fold_summary.get("final_raw_epoch_fold_skipped", False)),
                 "ram_snapshot_at_epoch_start": ram_snapshot_at_epoch_start,
                 "initial_worker_ramp_delay_seconds": float(initial_worker_ramp_delay_seconds),
                 "per_worker_ramp_delay_seconds": float(config.per_worker_ramp_delay_seconds),

@@ -259,6 +259,9 @@ def build_parser() -> argparse.ArgumentParser:
     sampling.add_argument("--live-memory-queue-maxsize", type=int, default=100000)
     sampling.add_argument("--live-memory-batch-size", type=int, default=1000)
     sampling.add_argument("--live-memory-flush-seconds", type=float, default=2.0)
+    sampling.add_argument("--direct-streaming-fold", dest="direct_streaming_fold", action="store_true", default=True)
+    sampling.add_argument("--delete-raw-after-direct-streaming-fold", dest="delete_raw_after_direct_streaming_fold", action="store_true", default=True)
+    sampling.add_argument("--keep-raw-after-direct-streaming-fold", dest="delete_raw_after_direct_streaming_fold", action="store_false")
 
     contingency_memory = subparsers.add_parser("contingency-memory-v06")
     contingency_memory.add_argument("--parquet-root", required=True)
@@ -564,11 +567,17 @@ def build_parser() -> argparse.ArgumentParser:
     continuous.add_argument("--live-memory-queue-maxsize", type=int, default=100000)
     continuous.add_argument("--live-memory-batch-size", type=int, default=1000)
     continuous.add_argument("--live-memory-flush-seconds", type=float, default=2.0)
+    continuous.add_argument("--direct-streaming-fold", dest="direct_streaming_fold", action="store_true", default=True)
+    continuous.add_argument("--delete-raw-after-direct-streaming-fold", dest="delete_raw_after_direct_streaming_fold", action="store_true", default=True)
+    continuous.add_argument("--keep-raw-after-direct-streaming-fold", dest="delete_raw_after_direct_streaming_fold", action="store_false")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    for legacy_flag in ("--sidecar-fold", "--streaming-fold-shards", "--fold-shards"):
+        if legacy_flag in argv:
+            raise SystemExit("Per-job sidecar shard folding was removed. Direct streaming fold is now the only normal fold mode.")
     args = build_parser().parse_args(argv)
     args = _apply_interaction_sampling_experiment_preset(args, argv)
     if args.command == "run":
@@ -825,6 +834,8 @@ def main(argv: list[str] | None = None) -> int:
                 live_memory_queue_maxsize=int(args.live_memory_queue_maxsize),
                 live_memory_batch_size=int(args.live_memory_batch_size),
                 live_memory_flush_seconds=float(args.live_memory_flush_seconds),
+                direct_streaming_fold_enabled=bool(args.direct_streaming_fold),
+                delete_raw_after_direct_streaming_fold=bool(args.delete_raw_after_direct_streaming_fold),
             )
         )
         print(json.dumps({"rows": len(rows), "output_dir": args.output_dir}, indent=2))
@@ -1427,6 +1438,8 @@ def main(argv: list[str] | None = None) -> int:
                 live_memory_queue_maxsize=int(args.live_memory_queue_maxsize),
                 live_memory_batch_size=int(args.live_memory_batch_size),
                 live_memory_flush_seconds=float(args.live_memory_flush_seconds),
+                direct_streaming_fold=bool(args.direct_streaming_fold),
+                delete_raw_after_direct_streaming_fold=bool(args.delete_raw_after_direct_streaming_fold),
             )
         )
         print(json.dumps(result, indent=2))

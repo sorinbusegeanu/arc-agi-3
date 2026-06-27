@@ -9,12 +9,12 @@ import re
 import sqlite3
 import sys
 import shutil
-import tempfile
 import time
 from collections import Counter, defaultdict
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, as_completed, wait
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 from tqdm.auto import tqdm
@@ -34,11 +34,13 @@ from v6.memory.live_memory_queue import (
     start_live_memory_writer,
     stop_live_memory_writer,
 )
-from v6.memory.compact_memory import (
-    CompactMemoryFoldConfig,
-    fold_sampling_job_sidecars_into_compact_memory,
-    fold_sampling_job_sidecars_into_compact_memory_shard,
-    merge_compact_memory_shards_into_main,
+from v6.memory.direct_streaming_fold import (
+    DirectStreamingFoldConfig,
+    DirectStreamingFoldJob,
+    DirectStreamingFoldWriter,
+    direct_streaming_manifest_exists,
+    load_direct_streamed_job_metrics,
+    load_direct_streamed_temporal_milestones,
 )
 from v6.sampling import make_sampler, sampler_registry
 from v6.storage.migration import migrate_sqlite_to_parquet
@@ -109,6 +111,9 @@ class InteractionSamplingConfig:
     live_memory_queue_maxsize: int = 100_000
     live_memory_batch_size: int = 1000
     live_memory_flush_seconds: float = 2.0
+    direct_streaming_fold_enabled: bool = True
+    direct_streaming_fold_workers: int = 1
+    delete_raw_after_direct_streaming_fold: bool = True
 
 
 def resolve_game_ids(games_arg: str, env_root: str | None = None) -> list[str]:
@@ -153,6 +158,13 @@ def parse_v05c_samplers(selector: str) -> tuple[str, ...]:
 def run_interaction_sampling_v05c(config: InteractionSamplingConfig) -> list[dict]:
     config = resolve_interaction_sampling_scope(config)
     output = Path(config.output_dir)
+    if bool(config.direct_streaming_fold_enabled) and not config.memory_output_dir:
+        config = InteractionSamplingConfig(
+            **{
+                **config.__dict__,
+                "memory_output_dir": str(output / "memory"),
+            }
+        )
     if str(config.shared_live_memory) != "none" and not config.memory_output_dir:
         config = InteractionSamplingConfig(
             **{
@@ -291,6 +303,9 @@ def _generate_sampling_dbs(config: InteractionSamplingConfig, sampling_root: Pat
                             "live_memory_queue_maxsize": int(config.live_memory_queue_maxsize),
                             "live_memory_batch_size": int(config.live_memory_batch_size),
                             "live_memory_flush_seconds": float(config.live_memory_flush_seconds),
+                            "direct_streaming_fold_enabled": bool(config.direct_streaming_fold_enabled),
+                            "direct_streaming_fold_workers": int(config.direct_streaming_fold_workers),
+                            "delete_raw_after_direct_streaming_fold": bool(config.delete_raw_after_direct_streaming_fold),
                             "db_path": str(db_path),
                             "env_root": config.env_root,
                         }
@@ -342,6 +357,9 @@ def _generate_sampling_dbs(config: InteractionSamplingConfig, sampling_root: Pat
                         "live_memory_queue_maxsize": int(config.live_memory_queue_maxsize),
                         "live_memory_batch_size": int(config.live_memory_batch_size),
                         "live_memory_flush_seconds": float(config.live_memory_flush_seconds),
+                        "direct_streaming_fold_enabled": bool(config.direct_streaming_fold_enabled),
+                        "direct_streaming_fold_workers": int(config.direct_streaming_fold_workers),
+                        "delete_raw_after_direct_streaming_fold": bool(config.delete_raw_after_direct_streaming_fold),
                         "db_path": str(db_path),
                         "env_root": config.env_root,
                     }
@@ -412,13 +430,13 @@ def _run_sampling_jobs(
 ) -> dict[str, object]:
     workers = max(1, min(int(workers), len(jobs)))
     initial = workers if initial_workers is None else max(1, min(int(initial_workers), workers))
-    fold_workers = max(1, workers // 2) if any(job.get("memory_output_dir") for job in jobs) else 0
     shared_live_memory_mode = str(jobs[0].get("shared_live_memory", "none") or "none") if jobs else "none"
+    direct_streaming_fold_enabled = bool(jobs and jobs[0].get("direct_streaming_fold_enabled", True) and any(job.get("memory_output_dir") for job in jobs))
     ram_at_start = _system_ram_snapshot()
     print(
         f"running {len(jobs)} v0.5c sampling jobs with workers={workers}"
         f" initial_workers={initial}"
-        f" fold_workers={fold_workers}"
+        f" direct_streaming_fold={'on' if direct_streaming_fold_enabled else 'off'}"
         f" worker_ramp={'on' if enable_worker_ramp else 'off'}"
         f" initial_ramp_delay_s={float(initial_worker_ramp_delay_seconds):.1f}"
         f" per_worker_ramp_delay_s={float(per_worker_ramp_delay_seconds):.1f}"
@@ -441,14 +459,19 @@ def _run_sampling_jobs(
     ramp_events: list[dict[str, float | int]] = []
     ramp_start_time = time.monotonic()
     last_ramp_time = ramp_start_time
-    fold_futures = []
-    fold_shard_dirs: list[Path] = []
-    fold_temp_root: Path | None = None
     main_memory_dir = next((str(job["memory_output_dir"]) for job in jobs if job.get("memory_output_dir")), None)
-    min_fold_step = None
-    max_fold_step = None
     live_memory_queue = None
     live_memory_writer = None
+    direct_fold_writer: DirectStreamingFoldWriter | None = None
+    direct_fold_summary: dict[str, Any] = {
+        "direct_streaming_fold_enabled": bool(direct_streaming_fold_enabled),
+        "direct_streaming_fold_job_count": 0,
+        "direct_streaming_fold_success_count": 0,
+        "direct_streaming_fold_failed_count": 0,
+        "direct_streaming_fold_deleted_raw_count": 0,
+        "direct_streaming_fold_manifest_path": str(Path(str(main_memory_dir or "")) / "direct_streaming_fold_manifest.sqlite") if main_memory_dir else None,
+        "direct_streaming_fold_legacy_temp_cleanup_count": 0,
+    }
     live_memory_writer_stop: dict[str, Any] = {
         "writer_exitcode": None,
         "writer_forced_terminated": False,
@@ -470,6 +493,18 @@ def _run_sampling_jobs(
         live_memory_summary_path = str(Path(str(main_memory_dir)) / "live_memory_summary.json")
         for job in jobs:
             job["live_memory_queue"] = live_memory_queue
+    if direct_streaming_fold_enabled and main_memory_dir is not None:
+        direct_fold_writer = DirectStreamingFoldWriter(
+            DirectStreamingFoldConfig(
+                memory_dir=str(main_memory_dir),
+                delete_raw_after_fold=bool(jobs[0].get("delete_raw_after_direct_streaming_fold", True)),
+            ),
+            sampling_config=SimpleNamespace(
+                steps=int(jobs[0].get("steps", 0) or 0),
+                horizon=int(jobs[0].get("horizon", 0) or 0),
+            ),
+        )
+        direct_fold_writer.start()
 
     def _maybe_ramp() -> bool:
         nonlocal target_workers, last_ramp_time
@@ -516,11 +551,7 @@ def _run_sampling_jobs(
         peak_workers = max(peak_workers, len(active_futures))
 
     try:
-        if fold_workers > 0 and main_memory_dir is not None:
-            memory_root = Path(str(main_memory_dir))
-            memory_root.mkdir(parents=True, exist_ok=True)
-            fold_temp_root = Path(tempfile.mkdtemp(prefix="sampling_sidecar_fold_", dir=str(memory_root)))
-        with ProcessPoolExecutor(max_workers=workers, max_tasks_per_child=1) as executor, ThreadPoolExecutor(max_workers=max(1, fold_workers or 1)) as fold_executor:
+        with ProcessPoolExecutor(max_workers=workers, max_tasks_per_child=1) as executor:
             _submit_until_target(executor)
             while active_futures:
                 done, _pending = wait(active_futures, timeout=0.5, return_when=FIRST_COMPLETED)
@@ -531,49 +562,26 @@ def _run_sampling_jobs(
                 for future in done:
                     result = future.result()
                     job = active_futures.pop(future, None)
-                    if job is not None and job.get("memory_output_dir"):
-                        fold_config = CompactMemoryFoldConfig(
-                            global_step_start=int(job.get("global_step_offset", 0) or 0) + 1,
-                            global_step_end=int(job.get("global_step_offset", 0) or 0) + int(job.get("steps", 0) or 0),
-                        )
-                        min_fold_step = int(fold_config.global_step_start) if min_fold_step is None else min(int(min_fold_step), int(fold_config.global_step_start))
-                        max_fold_step = int(fold_config.global_step_end) if max_fold_step is None else max(int(max_fold_step), int(fold_config.global_step_end))
-                        if fold_temp_root is not None:
-                            db_path = Path(str(job["db_path"]))
-                            shard_dir = fold_temp_root / f"{job['game']}_{job['sampler_name']}_seed_{job['seed']}"
-                            fold_shard_dirs.append(shard_dir)
-                            fold_futures.append(
-                                fold_executor.submit(
-                                    fold_sampling_job_sidecars_into_compact_memory_shard,
-                                    db_path=db_path,
-                                    shard_memory_dir=shard_dir,
-                                    fold_config=fold_config,
-                                    delete_after_merge=True,
-                                )
-                            )
-                        else:
-                            db_path = Path(str(job["db_path"]))
-                            fold_sampling_job_sidecars_into_compact_memory(
-                                db_path=db_path,
+                    if job is not None and direct_fold_writer is not None and job.get("memory_output_dir"):
+                        direct_fold_writer.submit(
+                            DirectStreamingFoldJob(
+                                job_id=f"{job['game']}:{job['sampler_name']}:seed{job['seed']}:steps{job['steps']}",
+                                db_path=str(job["db_path"]),
+                                game=str(job["game"]),
+                                sampler=str(job["sampler_name"]),
+                                seed=int(job["seed"]),
+                                steps=int(job["steps"]),
+                                horizon=int(job["horizon"]),
+                                context_depth=int(job.get("context_depth", 0) or 0),
+                                global_step_start=int(job.get("global_step_offset", 0) or 0) + 1,
+                                global_step_end=int(job.get("global_step_offset", 0) or 0) + int(job.get("steps", 0) or 0),
                                 memory_dir=str(job["memory_output_dir"]),
-                                fold_config=fold_config,
-                                delete_after_merge=True,
+                                delete_raw_after_fold=bool(job.get("delete_raw_after_direct_streaming_fold", True)),
                             )
+                        )
                     progress.update(1)
                 _maybe_ramp()
                 _submit_until_target(executor)
-            for fold_future in as_completed(fold_futures):
-                fold_future.result()
-        if fold_shard_dirs and main_memory_dir is not None:
-            merge_compact_memory_shards_into_main(
-                memory_dir=main_memory_dir,
-                shard_dirs=[str(path) for path in fold_shard_dirs],
-                fold_config=CompactMemoryFoldConfig(
-                    global_step_start=int(min_fold_step or 1),
-                    global_step_end=int(max_fold_step or max(1, int(min_fold_step or 1))),
-                ),
-                parallel_workers=fold_workers,
-            )
     finally:
         progress.close()
         if live_memory_queue is not None and live_memory_writer is not None:
@@ -586,12 +594,18 @@ def _run_sampling_jobs(
                     )
                 except Exception:
                     live_memory_writer_stop["live_memory_event_counts"] = None
-        if fold_temp_root is not None:
-            shutil.rmtree(fold_temp_root, ignore_errors=True)
+        if direct_fold_writer is not None:
+            direct_fold_summary = direct_fold_writer.close()
+            if int(direct_fold_summary.get("direct_streaming_fold_failed_count", 0) or 0) > 0:
+                raise RuntimeError(
+                    "direct streaming fold failed for "
+                    f"{int(direct_fold_summary.get('direct_streaming_fold_failed_count', 0) or 0)} job(s); "
+                    f"manifest={direct_fold_summary.get('direct_streaming_fold_manifest_path')}"
+                )
     return {
         "requested_workers": int(workers),
         "initial_workers": int(initial),
-        "fold_workers": int(fold_workers),
+        "fold_workers": 0,
         "peak_workers": int(peak_workers),
         "worker_ramp_enabled": bool(enable_worker_ramp),
         "ram_ramp_threshold_percent": float(ram_ramp_threshold_percent),
@@ -600,8 +614,17 @@ def _run_sampling_jobs(
         "ram_used_percent_at_start": float(ram_at_start["ram_used_percent"]),
         "ramp_event_count": int(len(ramp_events)),
         "ramp_events": ramp_events,
-        "parallel_sidecar_fold_enabled": bool(fold_workers > 0),
-        "parallel_sidecar_fold_shard_count": int(len(fold_shard_dirs)),
+        "parallel_sidecar_fold_enabled": False,
+        "parallel_sidecar_fold_shard_count": 0,
+        "direct_streaming_fold_enabled": bool(direct_streaming_fold_enabled),
+        "direct_streaming_fold_writer_count": 1 if direct_streaming_fold_enabled else 0,
+        "direct_streaming_fold_job_count": int(direct_fold_summary.get("direct_streaming_fold_job_count", 0) or 0),
+        "direct_streaming_fold_success_count": int(direct_fold_summary.get("direct_streaming_fold_success_count", 0) or 0),
+        "direct_streaming_fold_failed_count": int(direct_fold_summary.get("direct_streaming_fold_failed_count", 0) or 0),
+        "direct_streaming_fold_deleted_raw_count": int(direct_fold_summary.get("direct_streaming_fold_deleted_raw_count", 0) or 0),
+        "direct_streaming_fold_manifest_path": direct_fold_summary.get("direct_streaming_fold_manifest_path"),
+        "legacy_sidecar_fold_removed": True,
+        "no_backpressure": True,
         "shared_live_memory_enabled": bool(shared_live_memory_mode != "none"),
         "shared_live_memory_mode": shared_live_memory_mode,
         "live_memory_writer_started": bool(live_memory_writer is not None),
@@ -864,6 +887,42 @@ def _run_sampling_job(job: dict) -> dict:
 
 
 def _evaluate_sampling_runs(config: InteractionSamplingConfig, sampling_root: Path) -> list[dict]:
+    if config.memory_output_dir and direct_streaming_manifest_exists(config.memory_output_dir):
+        metric_rows = load_direct_streamed_job_metrics(config.memory_output_dir)
+        if not metric_rows:
+            raise RuntimeError("Direct streaming fold manifest missing job metrics; raw DB fallback is disabled for normal continuous sampling.")
+        grouped: dict[tuple[str, str], list[dict]] = defaultdict(list)
+        for row in metric_rows:
+            grouped[(str(row.get("game")), str(row.get("sampler_name")))].append(dict(row))
+        rows: list[dict] = []
+        for game in config.games:
+            for sampler_name in config.samplers:
+                seed_rows = grouped.get((str(game), str(sampler_name)), [])
+                if not seed_rows:
+                    rows.append(_failed_row(game, sampler_name, config, "missing direct-streamed job metrics"))
+                    continue
+                aggregate = _aggregate_seed_rows(seed_rows, config)
+                rows.append(
+                    {
+                        **aggregate,
+                        "feature_set": "manifest_only",
+                        "classifier": "manifest_only",
+                        "train_seeds": list(config.train_seeds),
+                        "test_seed": int(config.test_seed),
+                        "majority_baseline_accuracy": 0.0,
+                        "majority_baseline_macro_f1": 0.0,
+                        "id_free_accuracy": 0.0,
+                        "id_free_macro_f1": 0.0,
+                        "id_free_vs_majority_delta": 0.0,
+                        "non_preserve_recall_any": 0.0,
+                        "forbidden_future_feature_check_passed": True,
+                        "forbidden_id_feature_check_passed": True,
+                        "pass_status": False,
+                        "run_status": "ok",
+                        "failure_reason": "",
+                    }
+                )
+        return rows
     rows: list[dict] = []
     for game in config.games:
         for sampler_name in config.samplers:
@@ -888,6 +947,11 @@ def _evaluate_sampling_runs(config: InteractionSamplingConfig, sampling_root: Pa
 
 
 def _collect_temporal_milestones(config: InteractionSamplingConfig, sampling_root: Path) -> dict:
+    if config.memory_output_dir and direct_streaming_manifest_exists(config.memory_output_dir):
+        rows = load_direct_streamed_temporal_milestones(config.memory_output_dir)
+        if not rows:
+            raise RuntimeError("Direct streaming fold manifest missing; raw DB fallback is disabled for normal continuous sampling.")
+        return {"by_game_sampler_seed": rows}
     rows: list[dict[str, object]] = []
     for game in config.games:
         for sampler_name in config.samplers:
@@ -1742,6 +1806,35 @@ def _metadata_indicates_game_completed(metadata: dict[str, object]) -> bool:
 
 
 def _collect_level_completion_records(config: InteractionSamplingConfig, sampling_root: Path) -> list[dict[str, object]]:
+    if config.memory_output_dir and direct_streaming_manifest_exists(config.memory_output_dir):
+        records: list[dict[str, object]] = []
+        for metadata in load_direct_streamed_job_metrics(config.memory_output_dir):
+            game = str(metadata.get("game") or "")
+            sampler_name = str(metadata.get("sampler_name") or "")
+            seed = int(metadata.get("seed", 0) or 0)
+            completed_count = max(
+                int(metadata.get("final_levels_completed", 0) or 0),
+                int(metadata.get("final_win_levels", 0) or 0),
+                1 if str(metadata.get("final_state") or "") == "WIN" else 0,
+            )
+            final_state = str(metadata.get("final_state") or "")
+            for level_index in range(1, max(0, completed_count) + 1):
+                level_name = f"level_{level_index:04d}"
+                records.append(
+                    {
+                        "game_id": game,
+                        "level_id": level_name,
+                        "level_name": level_name,
+                        "completed": True,
+                        "success": True,
+                        "seed": seed,
+                        "sampler": sampler_name,
+                        "steps_used": None,
+                        "final_state": final_state,
+                        "source_run_db": None,
+                    }
+                )
+        return records
     records: list[dict[str, object]] = []
     for game in config.games:
         for sampler_name in config.samplers:
@@ -1817,6 +1910,15 @@ def _default_worker_execution_stats(config: InteractionSamplingConfig) -> dict[s
         "ramp_events": [],
         "parallel_sidecar_fold_enabled": False,
         "parallel_sidecar_fold_shard_count": 0,
+        "direct_streaming_fold_enabled": bool(config.direct_streaming_fold_enabled),
+        "direct_streaming_fold_writer_count": 1 if bool(config.direct_streaming_fold_enabled and config.memory_output_dir) else 0,
+        "direct_streaming_fold_job_count": 0,
+        "direct_streaming_fold_success_count": 0,
+        "direct_streaming_fold_failed_count": 0,
+        "direct_streaming_fold_deleted_raw_count": 0,
+        "direct_streaming_fold_manifest_path": None,
+        "legacy_sidecar_fold_removed": True,
+        "no_backpressure": True,
         "shared_live_memory_enabled": bool(str(config.shared_live_memory) != "none"),
         "shared_live_memory_mode": str(config.shared_live_memory),
         "live_memory_writer_started": False,
@@ -1847,6 +1949,15 @@ def _merge_worker_execution_stats(left: dict[str, object], right: dict[str, obje
         "ramp_events": [*left_events, *right_events],
         "parallel_sidecar_fold_enabled": bool(left.get("parallel_sidecar_fold_enabled", False) or right.get("parallel_sidecar_fold_enabled", False)),
         "parallel_sidecar_fold_shard_count": int(left.get("parallel_sidecar_fold_shard_count", 0) or 0) + int(right.get("parallel_sidecar_fold_shard_count", 0) or 0),
+        "direct_streaming_fold_enabled": bool(left.get("direct_streaming_fold_enabled", False) or right.get("direct_streaming_fold_enabled", False)),
+        "direct_streaming_fold_writer_count": int(max(int(left.get("direct_streaming_fold_writer_count", 0) or 0), int(right.get("direct_streaming_fold_writer_count", 0) or 0))),
+        "direct_streaming_fold_job_count": int(left.get("direct_streaming_fold_job_count", 0) or 0) + int(right.get("direct_streaming_fold_job_count", 0) or 0),
+        "direct_streaming_fold_success_count": int(left.get("direct_streaming_fold_success_count", 0) or 0) + int(right.get("direct_streaming_fold_success_count", 0) or 0),
+        "direct_streaming_fold_failed_count": int(left.get("direct_streaming_fold_failed_count", 0) or 0) + int(right.get("direct_streaming_fold_failed_count", 0) or 0),
+        "direct_streaming_fold_deleted_raw_count": int(left.get("direct_streaming_fold_deleted_raw_count", 0) or 0) + int(right.get("direct_streaming_fold_deleted_raw_count", 0) or 0),
+        "direct_streaming_fold_manifest_path": right.get("direct_streaming_fold_manifest_path") or left.get("direct_streaming_fold_manifest_path"),
+        "legacy_sidecar_fold_removed": bool(left.get("legacy_sidecar_fold_removed", False) or right.get("legacy_sidecar_fold_removed", False)),
+        "no_backpressure": bool(left.get("no_backpressure", False) or right.get("no_backpressure", False)),
         "shared_live_memory_enabled": bool(left.get("shared_live_memory_enabled", False) or right.get("shared_live_memory_enabled", False)),
         "shared_live_memory_mode": str(right.get("shared_live_memory_mode") or left.get("shared_live_memory_mode") or "none"),
         "live_memory_writer_started": bool(left.get("live_memory_writer_started", False) or right.get("live_memory_writer_started", False)),

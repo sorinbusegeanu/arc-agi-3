@@ -138,6 +138,66 @@ def fold_epoch_raw_into_compact_memory(
     return totals
 
 
+def fold_single_sampling_db_into_main_compact_memory(
+    *,
+    db_path: str | Path,
+    memory_dir: str | Path,
+    fold_config: CompactMemoryFoldConfig,
+) -> dict[str, Any]:
+    paths = ensure_memory_layout(memory_dir)
+    sqlite_path = Path(db_path)
+    totals = {
+        "stable_contingencies_added": 0,
+        "transformation_families_added": 0,
+        "carrier_candidates_added": 0,
+        "contradiction_clusters_added": 0,
+        "replay_queue_size": 0,
+        "representative_examples_retained": 0,
+        "graph_node_count": 0,
+        "graph_edge_count": 0,
+        "graph_live_exports_ingested": 0,
+        "db_files_folded": 1,
+    }
+    live_graph_path = sqlite_path.with_name("live_graph_compact.json")
+    with (
+        sqlite3.connect(paths.current_state) as state_conn,
+        sqlite3.connect(paths.graph) as graph_conn,
+        sqlite3.connect(paths.replay_queue) as replay_conn,
+    ):
+        _fold_single_db(
+            db_path=sqlite_path,
+            state_conn=state_conn,
+            graph_conn=graph_conn,
+            replay_conn=replay_conn,
+            fold_config=fold_config,
+            totals=totals,
+        )
+        if live_graph_path.exists():
+            _ingest_live_graph_export(graph_conn, live_graph_path, fold_config)
+            totals["graph_live_exports_ingested"] += 1
+        _trim_representative_examples(state_conn, fold_config)
+        _trim_replay_queue(replay_conn, fold_config)
+        summary = _build_memory_summary_from_connections(
+            state_conn=state_conn,
+            graph_conn=graph_conn,
+            replay_conn=replay_conn,
+            paths=paths,
+        )
+        summary.update(totals)
+        summary["fold_summary"] = dict(totals)
+        summary["direct_streaming_fold"] = {
+            "db_path": str(sqlite_path),
+            "global_step_start": int(fold_config.global_step_start),
+            "global_step_end": int(fold_config.global_step_end),
+        }
+        _write_memory_summary_table(state_conn, summary)
+        paths.summary_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        state_conn.commit()
+        graph_conn.commit()
+        replay_conn.commit()
+    return totals
+
+
 def fold_sampling_job_sidecars_into_compact_memory(
     *,
     db_path: str | Path,
