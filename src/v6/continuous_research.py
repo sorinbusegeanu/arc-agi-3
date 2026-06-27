@@ -48,6 +48,7 @@ class ContinuousResearchConfig:
     live_memory_batch_size: int = 1000
     live_memory_flush_seconds: float = 2.0
     direct_streaming_fold: bool = True
+    direct_streaming_fold_workers: int = 8
     delete_raw_after_direct_streaming_fold: bool = True
 
 
@@ -141,6 +142,7 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
                 live_memory_batch_size=int(config.live_memory_batch_size),
                 live_memory_flush_seconds=float(config.live_memory_flush_seconds),
                 direct_streaming_fold_enabled=bool(config.direct_streaming_fold),
+                direct_streaming_fold_workers=int(config.direct_streaming_fold_workers),
                 delete_raw_after_direct_streaming_fold=bool(config.delete_raw_after_direct_streaming_fold),
             )
         )

@@ -261,6 +261,7 @@ def build_parser() -> argparse.ArgumentParser:
     sampling.add_argument("--live-memory-batch-size", type=int, default=1000)
     sampling.add_argument("--live-memory-flush-seconds", type=float, default=2.0)
     sampling.add_argument("--direct-streaming-fold", dest="direct_streaming_fold", action="store_true", default=True)
+    sampling.add_argument("--direct-streaming-fold-workers", type=int, default=8)
     sampling.add_argument("--delete-raw-after-direct-streaming-fold", dest="delete_raw_after_direct_streaming_fold", action="store_true", default=True)
     sampling.add_argument("--keep-raw-after-direct-streaming-fold", dest="delete_raw_after_direct_streaming_fold", action="store_false")
 
@@ -570,6 +571,7 @@ def build_parser() -> argparse.ArgumentParser:
     continuous.add_argument("--live-memory-batch-size", type=int, default=1000)
     continuous.add_argument("--live-memory-flush-seconds", type=float, default=2.0)
     continuous.add_argument("--direct-streaming-fold", dest="direct_streaming_fold", action="store_true", default=True)
+    continuous.add_argument("--direct-streaming-fold-workers", type=int, default=8)
     continuous.add_argument("--delete-raw-after-direct-streaming-fold", dest="delete_raw_after_direct_streaming_fold", action="store_true", default=True)
     continuous.add_argument("--keep-raw-after-direct-streaming-fold", dest="delete_raw_after_direct_streaming_fold", action="store_false")
     return parser
@@ -838,6 +840,7 @@ def main(argv: list[str] | None = None) -> int:
                 live_memory_batch_size=int(args.live_memory_batch_size),
                 live_memory_flush_seconds=float(args.live_memory_flush_seconds),
                 direct_streaming_fold_enabled=bool(args.direct_streaming_fold),
+                direct_streaming_fold_workers=int(args.direct_streaming_fold_workers),
                 delete_raw_after_direct_streaming_fold=bool(args.delete_raw_after_direct_streaming_fold),
             )
         )
@@ -1443,6 +1446,7 @@ def main(argv: list[str] | None = None) -> int:
                 live_memory_batch_size=int(args.live_memory_batch_size),
                 live_memory_flush_seconds=float(args.live_memory_flush_seconds),
                 direct_streaming_fold=bool(args.direct_streaming_fold),
+                direct_streaming_fold_workers=int(args.direct_streaming_fold_workers),
                 delete_raw_after_direct_streaming_fold=bool(args.delete_raw_after_direct_streaming_fold),
             )
         )

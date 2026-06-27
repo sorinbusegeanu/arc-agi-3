@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from tqdm.auto import tqdm
 from v6.memory.substrate import interaction_node_id, scoped_interaction_key
 
 
@@ -399,6 +400,8 @@ def merge_compact_memory_shards_into_main(
     shard_dirs: list[str | Path],
     fold_config: CompactMemoryFoldConfig,
     parallel_workers: int | None = None,
+    progress: bool = False,
+    progress_desc: str = "merge fold shards",
 ) -> dict[str, Any]:
     paths = ensure_memory_layout(memory_dir)
     merged_dirs = [Path(item) for item in shard_dirs if Path(item).exists()]
@@ -418,7 +421,13 @@ def merge_compact_memory_shards_into_main(
             sqlite3.connect(paths.graph) as graph_conn,
             sqlite3.connect(paths.replay_queue) as replay_conn,
         ):
-            for shard_dir in sorted(merged_dirs):
+            configure_compact_sqlite_connection(state_conn, write=True)
+            configure_compact_sqlite_connection(graph_conn, write=True)
+            configure_compact_sqlite_connection(replay_conn, write=True)
+            iterator = sorted(merged_dirs)
+            if progress:
+                iterator = tqdm(iterator, desc=progress_desc, unit="shard", dynamic_ncols=True, leave=True)
+            for shard_dir in iterator:
                 _merge_compact_memory_dir_into_main(
                     temp_dir=shard_dir,
                     state_conn=state_conn,
@@ -481,7 +490,16 @@ def _reduce_compact_memory_shards_parallel(
                         fold_config,
                     )
                 )
-            for future in futures:
+            future_iterator = futures
+            if futures:
+                future_iterator = tqdm(
+                    futures,
+                    desc=f"reduce fold shards r{round_index}",
+                    unit="merge",
+                    dynamic_ncols=True,
+                    leave=True,
+                )
+            for future in future_iterator:
                 future.result()
         round_inputs = sorted(next_round)
         round_index += 1
@@ -499,6 +517,9 @@ def _merge_compact_memory_dirs_worker(
         sqlite3.connect(output_paths.graph) as graph_conn,
         sqlite3.connect(output_paths.replay_queue) as replay_conn,
     ):
+        configure_compact_sqlite_connection(state_conn, write=True)
+        configure_compact_sqlite_connection(graph_conn, write=True)
+        configure_compact_sqlite_connection(replay_conn, write=True)
         for shard_dir in sorted(Path(item) for item in shard_dirs):
             _merge_compact_memory_dir_into_main(
                 temp_dir=shard_dir,

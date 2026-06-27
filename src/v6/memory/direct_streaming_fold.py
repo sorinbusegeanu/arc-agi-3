@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
-import queue
+import os
+import shutil
 import sqlite3
-import threading
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+
+from tqdm.auto import tqdm
 
 from v6.evaluation.sampling_job_metrics import (
     compute_sampling_job_metrics,
@@ -18,6 +21,7 @@ from v6.memory.compact_memory import (
     CompactMemoryFoldConfig,
     finalize_main_compact_memory,
     fold_single_sampling_db_into_main_compact_memory,
+    merge_compact_memory_shards_into_main,
 )
 from v6.storage.migration import migrate_sqlite_to_parquet
 
@@ -48,6 +52,8 @@ class DirectStreamingFoldConfig:
     delete_raw_after_fold: bool = True
     cleanup_stale_legacy_temp_on_start: bool = True
     manifest_name: str = "direct_streaming_fold_manifest.sqlite"
+    fold_workers: int = 8
+    shard_root_name: str = "direct_streaming_fold_shards"
 
 
 @dataclass
@@ -319,6 +325,31 @@ def cleanup_stale_legacy_fold_dirs(memory_dir: str | Path) -> dict[str, Any]:
     return {"deleted": deleted, "count": len(deleted)}
 
 
+def _effective_fold_worker_count(requested_workers: int) -> int:
+    cpu_count = os.cpu_count() or 1
+    return max(1, min(int(requested_workers), int(cpu_count)))
+
+
+def _shard_root(config: DirectStreamingFoldConfig) -> Path:
+    return Path(config.memory_dir) / str(config.shard_root_name)
+
+
+def _make_shard_dirs(config: DirectStreamingFoldConfig, worker_count: int) -> list[Path]:
+    shard_root = _shard_root(config)
+    if shard_root.exists():
+        raise RuntimeError(
+            f"direct streaming fold shard root already exists: {shard_root}. "
+            "This usually means a previous shard merge failed; inspect it before rerunning."
+        )
+    shard_root.mkdir(parents=True, exist_ok=False)
+    shard_dirs: list[Path] = []
+    for index in range(max(1, int(worker_count))):
+        shard_dir = shard_root / f"shard_{index:04d}"
+        shard_dir.mkdir(parents=True, exist_ok=False)
+        shard_dirs.append(shard_dir)
+    return shard_dirs
+
+
 def _delete_raw_artifacts(db_path: Path) -> bool:
     targets = [
         db_path,
@@ -342,11 +373,12 @@ def _delete_raw_artifacts(db_path: Path) -> bool:
     return success
 
 
-def fold_one_completed_job_directly(
+def fold_one_completed_job_to_shard(
     *,
     job: DirectStreamingFoldJob,
     config: DirectStreamingFoldConfig,
     sampling_config: Any,
+    shard_dir: str | Path,
 ) -> DirectStreamingFoldResult:
     started_at = time.time()
     mark_fold_started(job, started_at=started_at)
@@ -398,7 +430,7 @@ def fold_one_completed_job_directly(
             parquet_exported = True
         fold_single_sampling_db_into_main_compact_memory(
             db_path=db_path,
-            memory_dir=config.memory_dir,
+            memory_dir=shard_dir,
             fold_config=CompactMemoryFoldConfig(
                 global_step_start=int(job.global_step_start),
                 global_step_end=int(job.global_step_end),
@@ -433,6 +465,23 @@ def fold_one_completed_job_directly(
         )
 
 
+def merge_direct_fold_shards(
+    *,
+    memory_dir: str | Path,
+    shard_dirs: list[Path],
+    fold_config: CompactMemoryFoldConfig,
+    workers: int,
+) -> dict[str, Any]:
+    return merge_compact_memory_shards_into_main(
+        memory_dir=memory_dir,
+        shard_dirs=[str(path) for path in shard_dirs],
+        fold_config=fold_config,
+        parallel_workers=max(1, int(workers)),
+        progress=True,
+        progress_desc="merge fold shards",
+    )
+
+
 class DirectStreamingFoldWriter:
     def __init__(
         self,
@@ -441,8 +490,14 @@ class DirectStreamingFoldWriter:
     ) -> None:
         self.config = config
         self.sampling_config = sampling_config
-        self._queue: queue.Queue[DirectStreamingFoldJob | None] = queue.Queue()
-        self._thread: threading.Thread | None = None
+        self._submitted_jobs = 0
+        self._completed_jobs = 0
+        self._futures: list[tuple[Any, DirectStreamingFoldJob]] = []
+        self._executor: ProcessPoolExecutor | None = None
+        self._progress = None
+        self._shard_dirs: list[Path] = []
+        self._next_shard_index = 0
+        self._effective_workers = 1
         self._summary = {
             "direct_streaming_fold_enabled": True,
             "direct_streaming_fold_job_count": 0,
@@ -451,36 +506,129 @@ class DirectStreamingFoldWriter:
             "direct_streaming_fold_deleted_raw_count": 0,
             "direct_streaming_fold_manifest_path": str(ensure_direct_streaming_fold_manifest(config.memory_dir)),
             "direct_streaming_fold_legacy_temp_cleanup_count": 0,
+            "direct_streaming_fold_worker_count": 0,
+            "direct_streaming_fold_shard_count": 0,
+            "direct_streaming_fold_shard_root": str(_shard_root(config)),
+            "direct_streaming_fold_shards_deleted": False,
+            "direct_streaming_fold_merge_started_at": None,
+            "direct_streaming_fold_merge_finished_at": None,
+            "direct_streaming_fold_merge_seconds": None,
+            "direct_streaming_fold_jobs_submitted": 0,
+            "direct_streaming_fold_jobs_completed": 0,
+            "direct_streaming_fold_jobs_failed": 0,
+            "direct_streaming_fold_raw_deleted_after_shard_fold_count": 0,
             "direct_streaming_fold_global_step_start": None,
             "direct_streaming_fold_global_step_end": None,
             "direct_streaming_fold_finalized_main_memory": False,
+            "direct_streaming_fold_failed_job_ids": [],
+            "direct_streaming_fold_failed_errors": [],
         }
 
     def start(self) -> None:
         if self.config.cleanup_stale_legacy_temp_on_start:
             cleanup = cleanup_stale_legacy_fold_dirs(self.config.memory_dir)
             self._summary["direct_streaming_fold_legacy_temp_cleanup_count"] = int(cleanup["count"])
-        if self._thread is not None:
+        if self._executor is not None:
             return
-        self._thread = threading.Thread(target=self._run, name="direct-streaming-fold-writer", daemon=True)
-        self._thread.start()
+        self._effective_workers = _effective_fold_worker_count(int(self.config.fold_workers))
+        self._shard_dirs = _make_shard_dirs(self.config, self._effective_workers)
+        self._executor = ProcessPoolExecutor(max_workers=self._effective_workers, max_tasks_per_child=1)
+        self._summary["direct_streaming_fold_worker_count"] = int(self._effective_workers)
+        self._summary["direct_streaming_fold_shard_count"] = int(len(self._shard_dirs))
 
     def submit(self, job: DirectStreamingFoldJob) -> None:
-        self._queue.put(job)
+        if self._executor is None or not self._shard_dirs:
+            raise RuntimeError("direct streaming fold writer was not started")
+        shard_dir = self._shard_dirs[self._next_shard_index % len(self._shard_dirs)]
+        self._next_shard_index += 1
+        future = self._executor.submit(
+            fold_one_completed_job_to_shard,
+            job=job,
+            config=self.config,
+            sampling_config=self.sampling_config,
+            shard_dir=str(shard_dir),
+        )
+        self._futures.append((future, job))
+        self._submitted_jobs += 1
+        self._summary["direct_streaming_fold_job_count"] = int(self._submitted_jobs)
+        self._summary["direct_streaming_fold_jobs_submitted"] = int(self._submitted_jobs)
 
     def close(self) -> dict[str, Any]:
-        self._queue.put(None)
-        if self._thread is not None:
-            self._thread.join()
-        if int(self._summary.get("direct_streaming_fold_success_count", 0) or 0) > 0:
-            finalize_main_compact_memory(
-                memory_dir=self.config.memory_dir,
-                fold_config=CompactMemoryFoldConfig(
-                    global_step_start=int(self._summary.get("direct_streaming_fold_global_step_start", 0) or 0),
-                    global_step_end=int(self._summary.get("direct_streaming_fold_global_step_end", 0) or 0),
-                ),
-            )
-            self._summary["direct_streaming_fold_finalized_main_memory"] = True
+        merge_error: Exception | None = None
+        self._progress = tqdm(
+            total=int(self._submitted_jobs),
+            desc="direct fold",
+            unit="job",
+            dynamic_ncols=True,
+            leave=True,
+        )
+        try:
+            future_jobs = {future: job for future, job in self._futures}
+            for future in as_completed(list(future_jobs)):
+                job = future_jobs[future]
+                result = future.result()
+                self._completed_jobs += 1
+                self._summary["direct_streaming_fold_jobs_completed"] = int(self._completed_jobs)
+                if self._progress is not None:
+                    self._progress.update(1)
+                self._record_result(job, result)
+            if self._summary["direct_streaming_fold_failed_count"] == 0 and self._summary["direct_streaming_fold_success_count"] > 0:
+                merge_started_at = time.time()
+                self._summary["direct_streaming_fold_merge_started_at"] = float(merge_started_at)
+                merge_direct_fold_shards(
+                    memory_dir=self.config.memory_dir,
+                    shard_dirs=self._shard_dirs,
+                    fold_config=CompactMemoryFoldConfig(
+                        global_step_start=int(self._summary.get("direct_streaming_fold_global_step_start", 0) or 0),
+                        global_step_end=int(self._summary.get("direct_streaming_fold_global_step_end", 0) or 0),
+                    ),
+                    workers=self._effective_workers,
+                )
+                finalize_main_compact_memory(
+                    memory_dir=self.config.memory_dir,
+                    fold_config=CompactMemoryFoldConfig(
+                        global_step_start=int(self._summary.get("direct_streaming_fold_global_step_start", 0) or 0),
+                        global_step_end=int(self._summary.get("direct_streaming_fold_global_step_end", 0) or 0),
+                    ),
+                )
+                merge_finished_at = time.time()
+                self._summary["direct_streaming_fold_merge_finished_at"] = float(merge_finished_at)
+                self._summary["direct_streaming_fold_merge_seconds"] = float(merge_finished_at - merge_started_at)
+                self._summary["direct_streaming_fold_finalized_main_memory"] = True
+                shutil.rmtree(_shard_root(self.config), ignore_errors=True)
+                self._summary["direct_streaming_fold_shards_deleted"] = True
+        except Exception as exc:
+            merge_error = exc
+        finally:
+            if self._progress is not None:
+                self._progress.close()
+            if self._executor is not None:
+                self._executor.shutdown(wait=True, cancel_futures=False)
+            self._write_summary()
+        if merge_error is not None:
+            raise RuntimeError(f"direct streaming fold merge failed: {merge_error}") from merge_error
+        return dict(self._summary)
+
+    def _record_result(self, job: DirectStreamingFoldJob, result: DirectStreamingFoldResult) -> None:
+        if result.status == "folded":
+            self._summary["direct_streaming_fold_success_count"] += 1
+            start = int(job.global_step_start)
+            end = int(job.global_step_end)
+            current_start = self._summary.get("direct_streaming_fold_global_step_start")
+            current_end = self._summary.get("direct_streaming_fold_global_step_end")
+            self._summary["direct_streaming_fold_global_step_start"] = start if current_start is None else min(int(current_start), start)
+            self._summary["direct_streaming_fold_global_step_end"] = end if current_end is None else max(int(current_end), end)
+            if result.deleted_raw:
+                self._summary["direct_streaming_fold_deleted_raw_count"] += 1
+                self._summary["direct_streaming_fold_raw_deleted_after_shard_fold_count"] += 1
+        else:
+            self._summary["direct_streaming_fold_failed_count"] += 1
+            self._summary["direct_streaming_fold_failed_job_ids"].append(str(job.job_id))
+            if result.error:
+                self._summary["direct_streaming_fold_failed_errors"].append(str(result.error))
+        self._summary["direct_streaming_fold_jobs_failed"] = int(self._summary["direct_streaming_fold_failed_count"])
+
+    def _write_summary(self) -> None:
         path = ensure_direct_streaming_fold_manifest(self.config.memory_dir)
         with _connect_manifest(path) as conn:
             for key, value in self._summary.items():
@@ -489,28 +637,3 @@ class DirectStreamingFoldWriter:
                     (str(key), json.dumps(value)),
                 )
             conn.commit()
-        return dict(self._summary)
-
-    def _run(self) -> None:
-        while True:
-            job = self._queue.get()
-            if job is None:
-                break
-            self._summary["direct_streaming_fold_job_count"] += 1
-            result = fold_one_completed_job_directly(
-                job=job,
-                config=self.config,
-                sampling_config=self.sampling_config,
-            )
-            if result.status == "folded":
-                self._summary["direct_streaming_fold_success_count"] += 1
-                start = int(job.global_step_start)
-                end = int(job.global_step_end)
-                current_start = self._summary.get("direct_streaming_fold_global_step_start")
-                current_end = self._summary.get("direct_streaming_fold_global_step_end")
-                self._summary["direct_streaming_fold_global_step_start"] = start if current_start is None else min(int(current_start), start)
-                self._summary["direct_streaming_fold_global_step_end"] = end if current_end is None else max(int(current_end), end)
-                if result.deleted_raw:
-                    self._summary["direct_streaming_fold_deleted_raw_count"] += 1
-            else:
-                self._summary["direct_streaming_fold_failed_count"] += 1
