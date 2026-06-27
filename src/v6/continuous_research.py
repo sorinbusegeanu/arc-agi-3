@@ -36,6 +36,7 @@ class ContinuousResearchConfig:
     replay_retention_percent: int = 5
     fast_postprocessing: bool = True
     workers: int = 60
+    max_tasks_per_child: int = 1
     initial_workers: int | None = None
     ram_ramp_threshold_percent: float = 85.0
     initial_worker_ramp_delay_seconds: float = 20.0
@@ -128,6 +129,7 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
                 global_step_offset=global_step_start - 1,
                 fast_postprocessing=bool(config.fast_postprocessing),
                 workers=max_epoch_workers,
+                max_tasks_per_child=int(config.max_tasks_per_child),
                 initial_workers=initial_epoch_workers,
                 enable_worker_ramp=True,
                 ram_ramp_threshold_percent=float(config.ram_ramp_threshold_percent),

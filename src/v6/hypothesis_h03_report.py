@@ -104,6 +104,8 @@ H03_DEFAULTS: dict[str, Any] = {
     "source_run_dir": "",
     "input_report_found": False,
     "db_found": False,
+    "raw_epoch_db_available": False,
+    "direct_streaming_compact_only": False,
     "db_paths_total": 0,
     "db_paths_inspected": 0,
     "db_scan_truncated": False,
@@ -179,6 +181,9 @@ H03_DEFAULTS: dict[str, Any] = {
     "compression_signal_active": False,
     "families_nontrivial": False,
     "families_stable": None,
+    "usable_h03_family_evidence": False,
+    "usable_direct_family_evidence": False,
+    "usable_compact_family_evidence": False,
     "pre_object_condition_satisfied": None,
     "evidence_for": [],
     "evidence_against": [],
@@ -195,6 +200,35 @@ H03_DEFAULTS: dict[str, Any] = {
         "context_action_fallback_absent": None,
     },
 }
+
+
+def _has_compact_h03_family_evidence(result: dict[str, Any]) -> bool:
+    return (
+        _gt(result.get("transformation_family_count"), 0) is True
+        or _gt(result.get("stable_transformation_family_count"), 0) is True
+        or _gt(result.get("family_member_count_total"), 0) is True
+    )
+
+
+def _has_compact_h03_contingency_evidence(result: dict[str, Any]) -> bool:
+    return (
+        _gt(result.get("stable_contingency_count"), 0) is True
+        or _gt(result.get("discovered_contingency_count"), 0) is True
+        or _gt(result.get("contingency_candidate_count"), 0) is True
+    )
+
+
+def _usable_h03_family_evidence(
+    *,
+    result: dict[str, Any],
+    direct_metrics: dict[str, Any],
+    streamed_compact_only: bool,
+) -> bool:
+    if bool(direct_metrics.get("usable_direct_family_evidence", False)):
+        return True
+    if not streamed_compact_only:
+        return False
+    return _has_compact_h03_family_evidence(result) and _has_compact_h03_contingency_evidence(result)
 
 
 def evaluate_h03_transformation_family_formation(
@@ -219,9 +253,11 @@ def evaluate_h03_transformation_family_formation(
     result["source_run_dir"] = str(run_dir)
     result["input_report_found"] = input_report is not None
     result["db_found"] = bool(sqlite_paths)
+    result["raw_epoch_db_available"] = bool(sqlite_paths)
     result["db_paths_total"] = len(sqlite_paths)
     result["evidence_source"] = "raw_epoch_db"
     streamed_compact_only = bool(memory_dir is not None and direct_streaming_manifest_exists(memory_dir) and not sqlite_paths)
+    result["direct_streaming_compact_only"] = bool(streamed_compact_only)
     if streamed_compact_only:
         result["evidence_source"] = "direct_streaming_manifest_and_compact_memory"
 
@@ -264,6 +300,18 @@ def evaluate_h03_transformation_family_formation(
         result["evidence_source"] = "direct_streaming_manifest_and_compact_memory" if streamed_compact_only else "mixed"
     if result.get("memory_record_count") is None:
         result["memory_record_count"] = report_metrics.get("memory_record_count")
+    usable_family_evidence = _usable_h03_family_evidence(
+        result=result,
+        direct_metrics=direct_metrics,
+        streamed_compact_only=streamed_compact_only,
+    )
+    result["usable_h03_family_evidence"] = bool(usable_family_evidence)
+    result["usable_direct_family_evidence"] = bool(direct_metrics.get("usable_direct_family_evidence", False))
+    result["usable_compact_family_evidence"] = bool(
+        streamed_compact_only
+        and _has_compact_h03_family_evidence(result)
+        and _has_compact_h03_contingency_evidence(result)
+    )
 
     checks = {
         "contingencies_present": _gt(result.get("discovered_contingency_count"), 0),
@@ -302,11 +350,19 @@ def evaluate_h03_transformation_family_formation(
     ratio_missing = result.get("singleton_family_ratio") is None
     stability_approx = bool(result.get("stability_approximated", False))
 
-    if not direct_metrics.get("usable_direct_family_evidence", False):
+    if not usable_family_evidence:
         result["decision"] = "INCONCLUSIVE"
-        result["scientific_conclusion"] = (
-            "H03 remains inconclusive because the current run artifacts do not expose enough direct family or contingency evidence."
-        )
+        if streamed_compact_only:
+            result["scientific_conclusion"] = (
+                "H03 remains inconclusive because direct streaming compact memory does not expose enough family or contingency evidence."
+            )
+            missing = "compact transformation-family or contingency evidence unavailable after direct streaming raw cleanup"
+            if missing not in result["missing_evidence"]:
+                result["missing_evidence"].append(missing)
+        else:
+            result["scientific_conclusion"] = (
+                "H03 remains inconclusive because the current run artifacts do not expose enough direct family or contingency evidence."
+            )
     elif contingencies_present and result.get("transformation_family_count") == 0:
         result["decision"] = "INVALID"
         result["scientific_conclusion"] = (
@@ -391,6 +447,7 @@ def _extract_h03_compact_metrics(memory_dir: Path) -> dict[str, Any]:
     if not current_state.exists():
         return {}
     with sqlite3.connect(current_state) as state_conn:
+        contingency_count = int(state_conn.execute("SELECT COUNT(*) FROM stable_contingencies").fetchone()[0])
         family_count = int(state_conn.execute("SELECT COUNT(*) FROM transformation_families").fetchone()[0])
         singleton_count = int(state_conn.execute("SELECT COUNT(*) FROM transformation_families WHERE member_count <= 1").fetchone()[0])
         member_total = int(state_conn.execute("SELECT COALESCE(SUM(member_count), 0) FROM transformation_families").fetchone()[0])
@@ -409,6 +466,9 @@ def _extract_h03_compact_metrics(memory_dir: Path) -> dict[str, Any]:
                 ),
             }
     return {
+        "contingency_candidate_count": contingency_count,
+        "discovered_contingency_count": contingency_count,
+        "stable_contingency_count": contingency_count,
         "transformation_family_count": family_count,
         "stable_transformation_family_count": family_count,
         "family_member_count_total": member_total,
@@ -2266,6 +2326,12 @@ def _populate_h03_evidence_lists(result: dict[str, Any]) -> None:
     evidence_for: list[str] = []
     evidence_against: list[str] = []
     missing_evidence: list[str] = list(result.get("missing_evidence", []))
+    if bool(result.get("usable_compact_family_evidence")):
+        missing_evidence = [
+            item
+            for item in missing_evidence
+            if item != DIRECT_FAMILY_UNAVAILABLE_MESSAGE
+        ]
     singleton_families_by_action = dict(result.get("singleton_families_by_action", {}) or {})
     singleton_count = int(result.get("singleton_family_count") or 0)
     diagnostics = result.get("singleton_family_diagnostics") or {}

@@ -86,6 +86,7 @@ class InteractionSamplingConfig:
     adaptive_context_expansion: bool = False
     max_context_depth: int | None = None
     workers: int = 60
+    max_tasks_per_child: int = 1
     commit_steps: int = 1000
     storage_backend: str = "sqlite"
     parquet_root: str = "runs/v6/storage_parquet"
@@ -306,6 +307,7 @@ def _generate_sampling_dbs(config: InteractionSamplingConfig, sampling_root: Pat
                             "live_memory_queue_maxsize": int(config.live_memory_queue_maxsize),
                             "live_memory_batch_size": int(config.live_memory_batch_size),
                             "live_memory_flush_seconds": float(config.live_memory_flush_seconds),
+                            "max_tasks_per_child": int(config.max_tasks_per_child),
                             "direct_streaming_fold_enabled": bool(config.direct_streaming_fold_enabled),
                             "direct_streaming_fold_workers": int(config.direct_streaming_fold_workers),
                             "delete_raw_after_direct_streaming_fold": bool(config.delete_raw_after_direct_streaming_fold),
@@ -366,6 +368,7 @@ def _generate_sampling_dbs(config: InteractionSamplingConfig, sampling_root: Pat
                         "live_memory_queue_maxsize": int(config.live_memory_queue_maxsize),
                         "live_memory_batch_size": int(config.live_memory_batch_size),
                         "live_memory_flush_seconds": float(config.live_memory_flush_seconds),
+                        "max_tasks_per_child": int(config.max_tasks_per_child),
                         "direct_streaming_fold_enabled": bool(config.direct_streaming_fold_enabled),
                         "direct_streaming_fold_workers": int(config.direct_streaming_fold_workers),
                         "delete_raw_after_direct_streaming_fold": bool(config.delete_raw_after_direct_streaming_fold),
@@ -492,6 +495,7 @@ def _run_sampling_jobs(
         "summary_path": None,
         "live_memory_event_counts": None,
     }
+    max_tasks_per_child = max(1, int(jobs[0].get("max_tasks_per_child", 1) or 1)) if jobs else 1
     live_memory_summary_path = None
     if shared_live_memory_mode != "none" and main_memory_dir is not None:
         live_memory_queue = make_live_memory_queue(int(jobs[0].get("live_memory_queue_maxsize", 100_000) or 100_000))
@@ -565,7 +569,7 @@ def _run_sampling_jobs(
         peak_workers = max(peak_workers, len(active_futures))
 
     try:
-        with ProcessPoolExecutor(max_workers=workers, max_tasks_per_child=1) as executor:
+        with ProcessPoolExecutor(max_workers=workers, max_tasks_per_child=max_tasks_per_child) as executor:
             _submit_until_target(executor)
             while active_futures:
                 done, _pending = wait(active_futures, timeout=0.5, return_when=FIRST_COMPLETED)
@@ -625,6 +629,7 @@ def _run_sampling_jobs(
         "initial_workers": int(initial),
         "fold_workers": 0,
         "peak_workers": int(peak_workers),
+        "max_tasks_per_child": int(max_tasks_per_child),
         "worker_ramp_enabled": bool(enable_worker_ramp),
         "ram_ramp_threshold_percent": float(ram_ramp_threshold_percent),
         "initial_worker_ramp_delay_seconds": float(initial_worker_ramp_delay_seconds),

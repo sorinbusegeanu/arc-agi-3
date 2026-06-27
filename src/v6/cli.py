@@ -237,6 +237,7 @@ def build_parser() -> argparse.ArgumentParser:
     sampling.add_argument("--adaptive-context-expansion", type=_parse_bool, default=False)
     sampling.add_argument("--max-context-depth", type=int, default=None)
     sampling.add_argument("--workers", type=int, default=60)
+    sampling.add_argument("--max-tasks-per-child", type=int, default=1)
     sampling.add_argument("--commit-steps", type=int, default=1000)
     sampling.add_argument("--storage-backend", choices=("sqlite", "parquet"), default="sqlite")
     sampling.add_argument("--parquet-root", default="runs/v6/storage_parquet")
@@ -557,6 +558,7 @@ def build_parser() -> argparse.ArgumentParser:
     continuous.add_argument("--replay-retention-percent", type=int, default=5)
     continuous.add_argument("--fast-postprocessing", type=_parse_bool, default=True)
     continuous.add_argument("--workers", type=int, default=60)
+    continuous.add_argument("--max-tasks-per-child", type=int, default=1)
     continuous.add_argument("--initial-workers", type=int, default=None)
     continuous.add_argument("--ram-ramp-threshold-percent", type=float, default=85.0)
     continuous.add_argument("--initial-worker-ramp-delay-seconds", type=float, default=20.0)
@@ -813,6 +815,7 @@ def main(argv: list[str] | None = None) -> int:
                 adaptive_context_expansion=bool(args.adaptive_context_expansion),
                 max_context_depth=args.max_context_depth,
                 workers=args.workers,
+                max_tasks_per_child=int(args.max_tasks_per_child),
                 commit_steps=args.commit_steps,
                 storage_backend=args.storage_backend,
                 parquet_root=args.parquet_root,
@@ -1428,6 +1431,7 @@ def main(argv: list[str] | None = None) -> int:
                 replay_retention_percent=int(args.replay_retention_percent),
                 fast_postprocessing=bool(args.fast_postprocessing),
                 workers=int(args.workers),
+                max_tasks_per_child=int(args.max_tasks_per_child),
                 initial_workers=None if args.initial_workers is None else int(args.initial_workers),
                 ram_ramp_threshold_percent=float(args.ram_ramp_threshold_percent),
                 initial_worker_ramp_delay_seconds=float(args.initial_worker_ramp_delay_seconds),
