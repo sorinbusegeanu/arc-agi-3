@@ -288,15 +288,108 @@ def merge_compact_memory_shards_into_main(
     memory_dir: str | Path,
     shard_dirs: list[str | Path],
     fold_config: CompactMemoryFoldConfig,
+    parallel_workers: int | None = None,
 ) -> dict[str, Any]:
     paths = ensure_memory_layout(memory_dir)
     merged_dirs = [Path(item) for item in shard_dirs if Path(item).exists()]
+    requested_parallel_workers = max(1, int(parallel_workers or 1))
+    effective_parallel_workers = min(requested_parallel_workers, max(1, len(merged_dirs)))
+    temp_root: Path | None = None
+    try:
+        if len(merged_dirs) > 1 and effective_parallel_workers > 1:
+            merged_dirs, temp_root = _reduce_compact_memory_shards_parallel(
+                shard_dirs=merged_dirs,
+                parent_memory_dir=paths.root,
+                fold_config=fold_config,
+                parallel_workers=effective_parallel_workers,
+            )
+        with (
+            sqlite3.connect(paths.current_state) as state_conn,
+            sqlite3.connect(paths.graph) as graph_conn,
+            sqlite3.connect(paths.replay_queue) as replay_conn,
+        ):
+            for shard_dir in sorted(merged_dirs):
+                _merge_compact_memory_dir_into_main(
+                    temp_dir=shard_dir,
+                    state_conn=state_conn,
+                    graph_conn=graph_conn,
+                    replay_conn=replay_conn,
+                    fold_config=fold_config,
+                )
+            summary = _build_memory_summary_from_connections(
+                state_conn=state_conn,
+                graph_conn=graph_conn,
+                replay_conn=replay_conn,
+                paths=paths,
+            )
+            summary["parallel_sidecar_shard_merge"] = {
+                "merged_shard_count": len(merged_dirs),
+                "shard_dirs": [str(path) for path in merged_dirs],
+                "parallel_workers": int(effective_parallel_workers),
+            }
+            _write_memory_summary_table(state_conn, summary)
+            paths.summary_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+            state_conn.commit()
+            graph_conn.commit()
+            replay_conn.commit()
+        return summary
+    finally:
+        if temp_root is not None:
+            shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def _reduce_compact_memory_shards_parallel(
+    *,
+    shard_dirs: list[Path],
+    parent_memory_dir: Path,
+    fold_config: CompactMemoryFoldConfig,
+    parallel_workers: int,
+) -> tuple[list[Path], Path]:
+    round_inputs = sorted(Path(path) for path in shard_dirs if Path(path).exists())
+    temp_root = Path(tempfile.mkdtemp(prefix="compact_merge_", dir=str(parent_memory_dir)))
+    round_index = 0
+    while len(round_inputs) > 1:
+        group_size = max(2, int(np.ceil(len(round_inputs) / max(1, parallel_workers))))
+        grouped_inputs = [
+            round_inputs[index:index + group_size]
+            for index in range(0, len(round_inputs), group_size)
+        ]
+        next_round: list[Path] = []
+        with ProcessPoolExecutor(max_workers=min(parallel_workers, len(grouped_inputs)), max_tasks_per_child=1) as executor:
+            futures = []
+            for group_index, group in enumerate(grouped_inputs):
+                if len(group) == 1:
+                    next_round.append(group[0])
+                    continue
+                output_dir = temp_root / f"round_{round_index:04d}" / f"group_{group_index:04d}"
+                next_round.append(output_dir)
+                futures.append(
+                    executor.submit(
+                        _merge_compact_memory_dirs_worker,
+                        [str(path) for path in group],
+                        str(output_dir),
+                        fold_config,
+                    )
+                )
+            for future in futures:
+                future.result()
+        round_inputs = sorted(next_round)
+        round_index += 1
+    return round_inputs, temp_root
+
+
+def _merge_compact_memory_dirs_worker(
+    shard_dirs: list[str],
+    output_dir: str,
+    fold_config: CompactMemoryFoldConfig,
+) -> dict[str, Any]:
+    output_paths = ensure_memory_layout(output_dir)
     with (
-        sqlite3.connect(paths.current_state) as state_conn,
-        sqlite3.connect(paths.graph) as graph_conn,
-        sqlite3.connect(paths.replay_queue) as replay_conn,
+        sqlite3.connect(output_paths.current_state) as state_conn,
+        sqlite3.connect(output_paths.graph) as graph_conn,
+        sqlite3.connect(output_paths.replay_queue) as replay_conn,
     ):
-        for shard_dir in sorted(merged_dirs):
+        for shard_dir in sorted(Path(item) for item in shard_dirs):
             _merge_compact_memory_dir_into_main(
                 temp_dir=shard_dir,
                 state_conn=state_conn,
@@ -308,14 +401,14 @@ def merge_compact_memory_shards_into_main(
             state_conn=state_conn,
             graph_conn=graph_conn,
             replay_conn=replay_conn,
-            paths=paths,
+            paths=output_paths,
         )
-        summary["parallel_sidecar_shard_merge"] = {
-            "merged_shard_count": len(merged_dirs),
-            "shard_dirs": [str(path) for path in merged_dirs],
+        summary["parallel_intermediate_shard_merge"] = {
+            "input_shard_count": len(shard_dirs),
+            "input_shard_dirs": [str(item) for item in shard_dirs],
         }
         _write_memory_summary_table(state_conn, summary)
-        paths.summary_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        output_paths.summary_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
         state_conn.commit()
         graph_conn.commit()
         replay_conn.commit()

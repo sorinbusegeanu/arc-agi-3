@@ -5,7 +5,6 @@ import json
 import math
 import sqlite3
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,7 +18,6 @@ from v6.evaluation.broad_game_validation import (
     game_passes,
     parse_game_selector,
 )
-from v6.evaluation.future_effects import FutureEffectRunConfig, _run_future_effect_job, run_future_effect_v02
 from v6.evaluation.id_free_prefuture_validation import (
     ID_FREE_FEATURE_SETS,
     evaluate_id_free_config,
@@ -141,14 +139,14 @@ def parse_v05b_games(selector: str) -> tuple[str, ...]:
 
 
 def run_failure_diagnostics_v05b(config: FailureDiagnosticsConfig) -> list[dict]:
+    if config.generate_missing:
+        raise RuntimeError(
+            "failure-diagnostics-v05b legacy future_effect generation was removed. "
+            "Use continuous hypothesis suite H09-H11 instead."
+        )
     output = Path(config.output_dir)
     db_dir = output / "future_effect_v02_dbs"
     db_dir.mkdir(parents=True, exist_ok=True)
-    if config.generate_missing and config.batch_by_family:
-        return _run_family_batched_diagnostics(config, db_dir, output)
-    if config.generate_missing:
-        _generate_missing(config, db_dir)
-
     diagnostic_rows, prediction_rows = _collect_diagnostics(config, db_dir, config.games)
     game_summary = _summarize_diagnostics(config, db_dir, diagnostic_rows, prediction_rows, output, config.games)
     return diagnostic_rows
@@ -285,44 +283,17 @@ def _summarize_diagnostics(
 
 def compute_run_diagnostics(db_path: Path, *, game: str, seed: int, steps: int, horizon: int) -> dict:
     with sqlite3.connect(db_path) as connection:
-        tables = {
-            str(row[0])
-            for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-        }
         interactions = connection.execute("SELECT id, action, delta_id FROM interactions").fetchall()
         deltas = connection.execute("SELECT changed_cells, colors_added, colors_removed, dx, dy, changed_positions FROM deltas").fetchall()
         families = connection.execute("SELECT id, centroid_vector, support_count FROM transformation_families").fetchall()
         contingencies = connection.execute("SELECT id, context_level, context_signature, action, transformation_family, support_count, confidence FROM contingencies").fetchall()
         predictions = connection.execute("SELECT context_level, action, actual_family, prediction_error, episode_id FROM prediction_results").fetchall()
-        metadata_rows = []
-        if "sampling_metadata" in tables:
-            metadata_rows = connection.execute(
-                "SELECT key, value FROM sampling_metadata WHERE key IN ('future_effects_postprocessing_skipped', 'fast_postprocessing_enabled')"
-            ).fetchall()
-        metadata: dict[str, object] = {}
-        for key, value in metadata_rows:
-            try:
-                metadata[str(key)] = json.loads(value)
-            except (TypeError, json.JSONDecodeError):
-                metadata[str(key)] = value
-        future_effects_skipped = bool(
-            metadata.get("future_effects_postprocessing_skipped", False)
-            or metadata.get("fast_postprocessing_enabled", False)
-        )
-        effects = []
-        if "future_effects" in tables:
-            effects = connection.execute("SELECT future_effect_class FROM future_effects").fetchall()
-        elif not future_effects_skipped:
-            raise sqlite3.OperationalError("no such table: future_effects")
 
     changed = [int(row[0]) for row in deltas]
     family_supports = [int(row[2]) for row in families]
     contingency_supports = [int(row[5]) for row in contingencies]
     contingency_confidences = [float(row[6]) for row in contingencies]
     errors = [int(row[3]) for row in predictions if row[3] is not None]
-    class_counts = Counter(str(row[0]) for row in effects)
-    non_preserve_count = class_counts["EXPAND"] + class_counts["RESTRICT"] + class_counts["COLLAPSE"]
-    future_count = sum(class_counts.values())
     action_counts = Counter(int(row[1]) for row in interactions)
     terminal_or_reset_count = len({int(row[4]) for row in predictions}) - 1 if predictions else 0
     return {
@@ -372,17 +343,19 @@ def compute_run_diagnostics(db_path: Path, *, game: str, seed: int, steps: int, 
         "unresolved_context_count": 0,
         "prediction_accuracy": 0.0 if not errors else sum(1 for value in errors if value == 0) / len(errors),
         "prediction_accuracy_by_context_depth": _prediction_accuracy_by_depth(predictions),
-        "future_effect_count": future_count,
-        "preserve_count": class_counts["PRESERVE"],
-        "expand_count": class_counts["EXPAND"],
-        "restrict_count": class_counts["RESTRICT"],
-        "collapse_count": class_counts["COLLAPSE"],
-        "non_preserve_count": non_preserve_count,
-        "non_preserve_ratio": _ratio(non_preserve_count, future_count),
-        "class_entropy": _entropy(class_counts),
-        "majority_class": class_counts.most_common(1)[0][0] if class_counts else None,
-        "majority_baseline_accuracy": 0.0 if not future_count else max(class_counts.values()) / future_count,
-        "majority_baseline_macro_f1": _majority_macro_f1(class_counts),
+        "legacy_future_effects_removed": True,
+        "future_effect_metrics_interpretable": False,
+        "future_effect_count": None,
+        "preserve_count": None,
+        "expand_count": None,
+        "restrict_count": None,
+        "collapse_count": None,
+        "non_preserve_count": None,
+        "non_preserve_ratio": None,
+        "class_entropy": None,
+        "majority_class": None,
+        "majority_baseline_accuracy": None,
+        "majority_baseline_macro_f1": None,
     }
 
 
@@ -449,12 +422,14 @@ def game_diagnostic_summary(config: FailureDiagnosticsConfig, diagnostic_rows: l
                 "best_context_depth": best_pred.get("context_depth"),
                 "stable_contingency_count": best_diag.get("stable_contingency_count", 0),
                 "prediction_accuracy": best_diag.get("prediction_accuracy", 0.0),
-                "non_preserve_count": best_diag.get("non_preserve_count", 0),
-                "non_preserve_ratio": best_diag.get("non_preserve_ratio", 0.0),
-                "majority_baseline_accuracy": best_pred.get("majority_baseline_accuracy", best_diag.get("majority_baseline_accuracy", 0.0)),
+                "non_preserve_count": best_diag.get("non_preserve_count"),
+                "non_preserve_ratio": best_diag.get("non_preserve_ratio"),
+                "majority_baseline_accuracy": best_pred.get("majority_baseline_accuracy", best_diag.get("majority_baseline_accuracy")),
                 "id_free_accuracy": best_pred.get("id_free_accuracy", 0.0),
                 "id_free_macro_f1": best_pred.get("id_free_macro_f1", 0.0),
                 "non_preserve_recall_any": best_pred.get("non_preserve_recall_any", 0.0),
+                "legacy_future_effects_removed": bool(best_diag.get("legacy_future_effects_removed", True)),
+                "future_effect_metrics_interpretable": bool(best_diag.get("future_effect_metrics_interpretable", False)),
                 "primary_failure_reason": reasons[0] if reasons else "",
                 "secondary_failure_reasons": reasons[1:],
             }
@@ -533,10 +508,15 @@ def classify_failure_reasons(best_diag: dict, best_pred: dict, game_pred: list[d
     if not best_diag:
         return ["MISSING_DIAGNOSTIC_DATA"]
     reasons: list[str] = []
-    if best_diag.get("non_preserve_ratio", 0.0) < FAILURE_THRESHOLDS["non_preserve_ratio_low"]:
-        reasons.append("PRESERVE_ONLY_OR_NEAR_PRESERVE_ONLY")
-    if best_diag.get("non_preserve_count", 0) < FAILURE_THRESHOLDS["non_preserve_count_min"]:
-        reasons.append("INSUFFICIENT_NON_PRESERVE_SAMPLES")
+    non_preserve_ratio = best_diag.get("non_preserve_ratio")
+    non_preserve_count = best_diag.get("non_preserve_count")
+    if non_preserve_ratio is None or non_preserve_count is None:
+        reasons.append("legacy_future_effects_removed_use_h09_h10_h11")
+    else:
+        if float(non_preserve_ratio) < FAILURE_THRESHOLDS["non_preserve_ratio_low"]:
+            reasons.append("PRESERVE_ONLY_OR_NEAR_PRESERVE_ONLY")
+        if int(non_preserve_count) < FAILURE_THRESHOLDS["non_preserve_count_min"]:
+            reasons.append("INSUFFICIENT_NON_PRESERVE_SAMPLES")
     if best_diag.get("stable_contingency_count", 0) < FAILURE_THRESHOLDS["stable_contingency_count_min"] or best_diag.get("prediction_accuracy", 0.0) < FAILURE_THRESHOLDS["prediction_accuracy_min"]:
         reasons.append("WEAK_CONTINGENCY_DISCOVERY")
     if best_diag.get("singleton_family_ratio", 0.0) > FAILURE_THRESHOLDS["singleton_family_ratio_high"] or best_diag.get("mean_family_support", 0.0) < FAILURE_THRESHOLDS["mean_family_support_min"]:
@@ -567,7 +547,7 @@ def family_diagnostic_summary(game_summary: list[dict]) -> list[dict]:
                 "games_passed_v05": len(passed),
                 "games_passing_after_more_steps": sum(1 for row in rows if "RANDOM_POLICY_UNDERSAMPLING" in [row["primary_failure_reason"], *row["secondary_failure_reasons"]]),
                 "dominant_failure_reason": reason_counts.most_common(1)[0][0] if reason_counts else "",
-                "mean_non_preserve_ratio": _mean(row.get("non_preserve_ratio", 0.0) for row in rows),
+                "mean_non_preserve_ratio": _mean_or_none(row.get("non_preserve_ratio") for row in rows),
                 "mean_stable_contingency_count": _mean(row.get("stable_contingency_count", 0.0) for row in rows),
                 "mean_prediction_accuracy": _mean(row.get("prediction_accuracy", 0.0) for row in rows),
                 "best_repair_feature_group": "",
@@ -584,9 +564,11 @@ def step_sensitivity_summary(config: FailureDiagnosticsConfig, prediction_rows: 
             preds = [item for item in prediction_rows if item["game"] == game and item["steps"] == steps]
             row[f"pass_at_{steps}"] = any(_prediction_passes(item) for item in preds)
             diags = [item for item in diagnostic_rows if item["game"] == game and item["steps"] == steps and item["run_status"] == "ok"]
-            row[f"non_preserve_count_{steps}"] = max((item["non_preserve_count"] for item in diags), default=0)
-        counts = [row.get(f"non_preserve_count_{steps}", 0) for steps in config.steps_list]
-        row["diagnosis_random_policy_undersampling"] = len(counts) >= 2 and max(counts) - counts[0] >= FAILURE_THRESHOLDS["non_preserve_count_min"]
+            non_preserve_values = [item["non_preserve_count"] for item in diags if item.get("non_preserve_count") is not None]
+            row[f"non_preserve_count_{steps}"] = max(non_preserve_values, default=None)
+        counts = [row.get(f"non_preserve_count_{steps}") for steps in config.steps_list]
+        usable_counts = [int(value) for value in counts if value is not None]
+        row["diagnosis_random_policy_undersampling"] = len(usable_counts) >= 2 and max(usable_counts) - usable_counts[0] >= FAILURE_THRESHOLDS["non_preserve_count_min"]
         rows.append(row)
     return rows
 
@@ -783,76 +765,19 @@ def _format_text(game_summary: list[dict], family_summary: list[dict], repair_ro
 
 
 def _generate_missing(config: FailureDiagnosticsConfig, db_dir: Path) -> None:
-    seeds = tuple(config.train_seeds) + (config.test_seed,)
-    workers = max(1, int(config.workers or 60))
-    for steps in config.steps_list:
-        for horizon in config.horizons:
-            missing_games = [
-                game
-                for game in config.games
-                if any(not _db_ready(_db_path(db_dir, game, seed, steps, horizon)) for seed in seeds)
-            ]
-            if not missing_games:
-                continue
-            for game in missing_games:
-                for seed in seeds:
-                    _remove_bad_db(_db_path(db_dir, game, seed, steps, horizon))
-            run_future_effect_v02(
-                FutureEffectRunConfig(
-                    games=tuple(missing_games),
-                    steps=steps,
-                    seeds=seeds,
-                    horizon=horizon,
-                    output_dir=config.output_dir,
-                    env_root=config.env_root,
-                    workers=workers,
-                )
-            )
+    del config, db_dir
+    raise RuntimeError(
+        "failure-diagnostics-v05b legacy future_effect generation was removed. "
+        "Use continuous hypothesis suite H09-H11 instead."
+    )
 
 
 def _generate_missing_family_batch(config: FailureDiagnosticsConfig, db_dir: Path) -> None:
-    seeds = tuple(config.train_seeds) + (config.test_seed,)
-    jobs: list[dict] = []
-    order = 0
-    for steps in config.steps_list:
-        for horizon in config.horizons:
-            for game in config.games:
-                for seed in seeds:
-                    db_path = _db_path(db_dir, game, seed, steps, horizon)
-                    if _db_ready(db_path):
-                        continue
-                    _remove_bad_db(db_path)
-                    jobs.append(
-                        {
-                            "order": order,
-                            "game": game,
-                            "seed": int(seed),
-                            "steps": int(steps),
-                            "horizon": int(horizon),
-                            "threshold": 1.0,
-                            "collapse_threshold": 0.5,
-                            "context_length": 3,
-                            "support_threshold": 20,
-                            "confidence_threshold": 0.8,
-                            "db_path": str(db_path),
-                            "env_root": config.env_root,
-                        }
-                    )
-                    order += 1
-    if not jobs:
-        return
-    workers = max(1, int(config.workers or 60))
-    print(f"running {len(jobs)} family future-effect jobs with workers={workers}", file=sys.stderr, flush=True)
-    with ProcessPoolExecutor(max_workers=workers, max_tasks_per_child=1) as executor:
-        futures = {executor.submit(_run_future_effect_job, job): job for job in jobs}
-        for future in as_completed(futures):
-            job = futures[future]
-            future.result()
-            print(
-                f"completed {job['game']} seed={job['seed']} steps={job['steps']} horizon={job['horizon']}",
-                file=sys.stderr,
-                flush=True,
-            )
+    del config, db_dir
+    raise RuntimeError(
+        "failure-diagnostics-v05b legacy future_effect generation was removed. "
+        "Use continuous hypothesis suite H09-H11 instead."
+    )
 
 
 def _cleanup_family_dbs(config: FailureDiagnosticsConfig, db_dir: Path) -> None:
@@ -884,11 +809,9 @@ def _db_ready(path: Path) -> bool:
                 "transformation_families",
                 "contingencies",
                 "prediction_results",
-                "future_effects",
             }
             if not required.issubset(tables):
                 return False
-            connection.execute("SELECT COUNT(*) FROM future_effects").fetchone()
             return True
     except sqlite3.DatabaseError:
         return False
@@ -900,7 +823,17 @@ def _remove_bad_db(path: Path) -> None:
 
 
 def _prediction_passes(row: dict) -> bool:
-    return bool(row) and row.get("id_free_accuracy", 0.0) > row.get("majority_baseline_accuracy", 0.0) and row.get("id_free_macro_f1", 0.0) > row.get("majority_baseline_macro_f1", 0.0) and row.get("non_preserve_recall_any", 0.0) > 0.0
+    if not row:
+        return False
+    majority_accuracy = row.get("majority_baseline_accuracy")
+    majority_macro = row.get("majority_baseline_macro_f1")
+    if majority_accuracy is None or majority_macro is None:
+        return False
+    return (
+        row.get("id_free_accuracy", 0.0) > majority_accuracy
+        and row.get("id_free_macro_f1", 0.0) > majority_macro
+        and row.get("non_preserve_recall_any", 0.0) > 0.0
+    )
 
 
 def _context_improves(rows: list[dict]) -> bool:
@@ -917,6 +850,7 @@ def _step_improves(diagnostic_rows: list[dict], game: str, prediction_rows: list
         row["steps"]: row["non_preserve_count"]
         for row in diagnostic_rows
         if row["game"] == game and row["run_status"] == "ok"
+        and row.get("non_preserve_count") is not None
     }
     if not counts:
         return False
@@ -977,6 +911,11 @@ def _ratio(numerator: int, denominator: int) -> float:
 def _mean(values) -> float:
     values = list(values)
     return 0.0 if not values else float(np.mean(values))
+
+
+def _mean_or_none(values) -> float | None:
+    filtered = [value for value in values if value is not None]
+    return None if not filtered else float(np.mean(filtered))
 
 
 def _median(values) -> float:

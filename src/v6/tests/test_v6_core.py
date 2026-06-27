@@ -1294,63 +1294,38 @@ def test_efficiency_tracker_apply_future_option_deltas() -> None:
     assert tracker.summary()["mean_future_option_gain_per_cost"] == 2.0
 
 
-def test_v05c_post_run_future_option_efficiency_enrichment(tmp_path) -> None:
+def test_v05c_post_run_future_option_efficiency_enrichment_is_legacy_removed(tmp_path) -> None:
     db_path = tmp_path / "future_option.sqlite"
     with sqlite3.connect(db_path) as connection:
         interaction_store = InteractionStore(connection)
         contingency_store = ContingencyStore(connection)
-        for interaction_id, action, actual_family in (
-            (1, 1, 10),
-            (2, 2, 20),
-            (3, 1, 10),
-            (4, 3, 30),
-            (5, 1, 20),
-        ):
-            interaction_store.add(
-                Interaction(
-                    id=interaction_id,
-                    timestamp=interaction_id,
-                    observation_before=np.zeros((2, 2), dtype=int),
-                    action=action,
-                    observation_after=np.full((2, 2), interaction_id, dtype=int),
-                    delta_id=interaction_id,
-                    efficiency_action_cost=2.0,
-                )
-            )
-            contingency_store.add_prediction_result(
-                interaction_id=interaction_id,
-                context_level=0,
-                context_signature=(action,),
-                action=action,
-                predicted_family=actual_family,
-                actual_family=actual_family,
-                episode_id=0,
+        interaction_store.add(
+            Interaction(
+                id=1,
+                timestamp=1,
+                observation_before=np.zeros((2, 2), dtype=int),
+                action=1,
+                observation_after=np.ones((2, 2), dtype=int),
+                delta_id=1,
                 efficiency_action_cost=2.0,
             )
-        contingency_store.upsert_contingency(
-            Contingency(
-                id=1,
-                context_level=0,
-                context_signature=(1,),
-                action=1,
-                transformation_family=10,
-                support_count=5,
-                confidence=0.95,
-            )
+        )
+        contingency_store.add_prediction_result(
+            interaction_id=1,
+            context_level=0,
+            context_signature=(1,),
+            action=1,
+            predicted_family=10,
+            actual_family=10,
+            episode_id=0,
+            efficiency_action_cost=2.0,
         )
         connection.commit()
 
-    analyze_future_effects(
-        db_path=str(db_path),
-        game="tt01",
-        seed=0,
-        steps=5,
-        horizon=2,
-    )
     deltas = _future_option_deltas_by_interaction_id(db_path, horizon=2)
     _apply_future_option_efficiency_diagnostics(db_path, deltas)
 
-    assert len(deltas) > 0
+    assert deltas == {}
     with sqlite3.connect(db_path) as connection:
         interaction_count = connection.execute(
             "SELECT COUNT(*) FROM interactions WHERE efficiency_future_option_gain_per_cost IS NOT NULL"
@@ -1358,8 +1333,8 @@ def test_v05c_post_run_future_option_efficiency_enrichment(tmp_path) -> None:
         prediction_count = connection.execute(
             "SELECT COUNT(*) FROM prediction_results WHERE efficiency_future_option_gain_per_cost IS NOT NULL"
         ).fetchone()[0]
-    assert interaction_count > 0
-    assert prediction_count > 0
+    assert interaction_count == 0
+    assert prediction_count == 0
 
 
 def test_v05c_future_option_delta_lookup_missing_future_effects_table(tmp_path) -> None:
@@ -4150,11 +4125,18 @@ def test_v05b_game_preset_parsing() -> None:
     assert parse_v05b_games("ez01,mo01") == ("ez01", "mo01")
 
 
+def test_cli_no_longer_registers_future_effect_v02_command() -> None:
+    parser = build_parser()
+    subparsers_action = next(action for action in parser._actions if getattr(action, "choices", None))
+
+    assert "future-effect-v02" not in subparsers_action.choices
+
+
 def test_v05b_failure_reason_assignment() -> None:
     reasons = classify_failure_reasons(
         {
-            "non_preserve_ratio": 0.0,
-            "non_preserve_count": 0,
+            "non_preserve_ratio": None,
+            "non_preserve_count": None,
             "stable_contingency_count": 5,
             "prediction_accuracy": 0.4,
             "singleton_family_ratio": 0.6,
@@ -4166,7 +4148,7 @@ def test_v05b_failure_reason_assignment() -> None:
         "toy",
     )
 
-    assert "PRESERVE_ONLY_OR_NEAR_PRESERVE_ONLY" in reasons
+    assert "legacy_future_effects_removed_use_h09_h10_h11" in reasons
     assert "WEAK_CONTINGENCY_DISCOVERY" in reasons
 
 
@@ -8631,10 +8613,6 @@ def test_v05c_run_sampling_job_uses_context_depth_for_v6_config(tmp_path, monkey
         captured["sampler_init"] = {"name": name, "seed": seed}
         return DummySampler()
 
-    def fake_analyze_future_effects(**kwargs) -> list[dict]:
-        captured["effects_call"] = kwargs
-        return []
-
     def fake_write_sampling_metadata(path, **values) -> None:
         captured["metadata_path"] = path
         captured["metadata"] = values
@@ -8642,7 +8620,6 @@ def test_v05c_run_sampling_job_uses_context_depth_for_v6_config(tmp_path, monkey
     monkeypatch.setattr(interaction_sampling, "make_sampler", fake_make_sampler)
     monkeypatch.setattr(interaction_sampling, "ArcGridEnvironment", DummyEnv)
     monkeypatch.setattr(interaction_sampling, "V6System", DummySystem)
-    monkeypatch.setattr(interaction_sampling, "analyze_future_effects", fake_analyze_future_effects)
     monkeypatch.setattr(interaction_sampling, "_write_sampling_metadata", fake_write_sampling_metadata)
 
     interaction_sampling._run_sampling_job(
@@ -8697,7 +8674,7 @@ def test_v05c_run_sampling_job_uses_context_depth_for_v6_config(tmp_path, monkey
 
 
 def test_v05c_run_sampling_job_fast_postprocessing_skips_expensive_outputs(tmp_path, monkeypatch) -> None:
-    captured: dict[str, object] = {"analyze_called": False, "delta_called": False, "apply_called": False}
+    captured: dict[str, object] = {"delta_called": False, "apply_called": False}
 
     class DummySampler:
         reset_count = 0
@@ -8749,10 +8726,6 @@ def test_v05c_run_sampling_job_fast_postprocessing_skips_expensive_outputs(tmp_p
     def fake_make_sampler(name: str, seed: int) -> DummySampler:
         return DummySampler()
 
-    def fake_analyze_future_effects(**kwargs) -> list[dict]:
-        captured["analyze_called"] = True
-        return []
-
     def fake_future_option_deltas(db_path, *, horizon: int) -> dict[str, float]:
         captured["delta_called"] = True
         return {}
@@ -8766,7 +8739,6 @@ def test_v05c_run_sampling_job_fast_postprocessing_skips_expensive_outputs(tmp_p
     monkeypatch.setattr(interaction_sampling, "make_sampler", fake_make_sampler)
     monkeypatch.setattr(interaction_sampling, "ArcGridEnvironment", DummyEnv)
     monkeypatch.setattr(interaction_sampling, "V6System", DummySystem)
-    monkeypatch.setattr(interaction_sampling, "analyze_future_effects", fake_analyze_future_effects)
     monkeypatch.setattr(interaction_sampling, "_future_option_deltas_by_interaction_id", fake_future_option_deltas)
     monkeypatch.setattr(interaction_sampling, "_apply_future_option_efficiency_diagnostics", fake_apply_future_option_efficiency_diagnostics)
     monkeypatch.setattr(interaction_sampling, "_write_sampling_metadata", fake_write_sampling_metadata)
@@ -8787,17 +8759,93 @@ def test_v05c_run_sampling_job_fast_postprocessing_skips_expensive_outputs(tmp_p
         }
     )
 
-    assert result == {"effects": 0}
-    assert captured["analyze_called"] is False
+    assert result == {"legacy_future_effects_removed": True}
     assert captured["delta_called"] is False
     assert captured["apply_called"] is False
     assert captured["metadata"]["fast_postprocessing_enabled"] is True
     assert captured["metadata"]["future_effects_postprocessing_skipped"] is True
+    assert captured["metadata"]["future_effects_legacy_removed"] is True
+    assert captured["metadata"]["future_option_memory_source"] == "memory_substrate"
     assert db_path.with_name("live_graph_compact.json").exists()
     assert db_path.with_name("carrier_candidates.json").exists()
     assert db_path.with_name("memory_lifecycle_summary.json").exists()
     assert not db_path.with_name("memory_replay_candidates.json").exists()
     assert not db_path.with_name("efficiency_summary.json").exists()
+
+
+def test_v05c_run_sampling_job_non_fast_mode_does_not_call_legacy_future_effects(tmp_path, monkeypatch) -> None:
+    captured: dict[str, object] = {"delta_called": False, "apply_called": False}
+
+    class DummySampler:
+        reset_count = 0
+        reset_unavailable = False
+
+    class DummyEnv:
+        def __init__(self, game_id: str, seed: int, env_root=None) -> None:
+            self.game_id = game_id
+            self.seed = seed
+            self.env_root = env_root
+            self.reset_count = 0
+            self.skipped_terminal_steps = 0
+
+    class DummyGraph:
+        def edge_type_counts(self) -> dict[str, int]:
+            return {}
+
+        def export_compact_rows(self) -> dict[str, list[dict[str, object]]]:
+            return {"nodes": [], "edges": []}
+
+    class DummySystem:
+        def __init__(self, env, config, action_sampler=None) -> None:
+            self.env = env
+            self.config = config
+            self.graph = DummyGraph()
+            self.context_contradictions = type("Tracker", (), {"summary": lambda self: {}})()
+            self.carrier_tracker = type("Carrier", (), {"build_candidates": lambda self: []})()
+            self.memory_lifecycle = type("Lifecycle", (), {"summary": lambda self: {}, "get_replay_batch": lambda self, limit=1000: []})()
+            self.efficiency_tracker = type("Efficiency", (), {"summary": lambda self: {}})()
+            self.compact_memory_restore_summary = {}
+
+        def run(self, steps: int) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+        def adaptive_context_summary(self) -> dict[str, object]:
+            return {"adaptive_context_expansion_enabled": False, "base_context_depth": 1, "max_context_depth": 1}
+
+    def fake_future_option_deltas(db_path, *, horizon: int) -> dict[str, float]:
+        captured["delta_called"] = True
+        return {}
+
+    def fake_apply_future_option_efficiency_diagnostics(db_path, deltas_by_interaction_id: dict[str, float]) -> None:
+        captured["apply_called"] = True
+
+    monkeypatch.setattr(interaction_sampling, "make_sampler", lambda name, seed: DummySampler())
+    monkeypatch.setattr(interaction_sampling, "ArcGridEnvironment", DummyEnv)
+    monkeypatch.setattr(interaction_sampling, "V6System", DummySystem)
+    monkeypatch.setattr(interaction_sampling, "_future_option_deltas_by_interaction_id", fake_future_option_deltas)
+    monkeypatch.setattr(interaction_sampling, "_apply_future_option_efficiency_diagnostics", fake_apply_future_option_efficiency_diagnostics)
+
+    result = interaction_sampling._run_sampling_job(
+        {
+            "game": "tt01",
+            "sampler_name": "random_baseline",
+            "seed": 0,
+            "steps": 10,
+            "horizon": 3,
+            "context_depth": 1,
+            "commit_steps": 5,
+            "db_path": str(tmp_path / "seed_0.sqlite"),
+            "env_root": None,
+            "fast_postprocessing": False,
+        }
+    )
+
+    assert result == {"legacy_future_effects_removed": True}
+    assert captured["delta_called"] is False
+    assert captured["apply_called"] is False
 
 
 def test_v05c_sampling_db_ready_accepts_fast_postprocessing_without_future_effects(tmp_path) -> None:
@@ -8904,8 +8952,10 @@ def test_compute_run_diagnostics_accepts_fast_postprocessing_without_future_effe
 
     assert result["run_status"] == "ok"
     assert result["failure_reason"] == ""
-    assert result["future_effect_count"] == 0
-    assert result["non_preserve_count"] == 0
+    assert result["legacy_future_effects_removed"] is True
+    assert result["future_effect_metrics_interpretable"] is False
+    assert result["future_effect_count"] is None
+    assert result["non_preserve_count"] is None
 
 
 def test_incremental_sidecar_fold_deletes_large_json_sidecars(tmp_path) -> None:
@@ -9034,6 +9084,50 @@ def test_parallel_sidecar_fold_shards_then_merges_into_main_memory(tmp_path) -> 
     assert merged["carrier_candidate_count"] >= 1
     memory_summary = load_memory_summary(main_memory_dir / "memory_summary.json")
     assert memory_summary["parallel_sidecar_shard_merge"]["merged_shard_count"] == 1
+
+
+def test_parallel_compact_memory_shard_merge_reduces_multiple_shards(tmp_path) -> None:
+    shard_a = tmp_path / "memory_shard_a"
+    shard_b = tmp_path / "memory_shard_b"
+    ensure_memory_layout(shard_a)
+    ensure_memory_layout(shard_b)
+
+    with sqlite3.connect(shard_a / "current_state.sqlite") as connection:
+        connection.execute(
+            """
+            INSERT INTO carrier_candidates (
+                carrier_id, carrier_signature, carrier_source, support_count, linked_family_count,
+                first_seen_global_step, last_seen_global_step, stability_score, is_emergent
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("ca", "carrier:a", "object", 3, 1, 1, 10, 0.5, 1),
+        )
+        connection.commit()
+    with sqlite3.connect(shard_b / "current_state.sqlite") as connection:
+        connection.execute(
+            """
+            INSERT INTO carrier_candidates (
+                carrier_id, carrier_signature, carrier_source, support_count, linked_family_count,
+                first_seen_global_step, last_seen_global_step, stability_score, is_emergent
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("cb", "carrier:b", "object", 4, 1, 1, 10, 0.6, 1),
+        )
+        connection.commit()
+
+    main_memory_dir = tmp_path / "memory_main_parallel"
+    ensure_memory_layout(main_memory_dir)
+    merged = merge_compact_memory_shards_into_main(
+        memory_dir=main_memory_dir,
+        shard_dirs=[shard_a, shard_b],
+        fold_config=CompactMemoryFoldConfig(global_step_start=1, global_step_end=10),
+        parallel_workers=2,
+    )
+
+    assert merged["carrier_candidate_count"] >= 2
+    memory_summary = load_memory_summary(main_memory_dir / "memory_summary.json")
+    assert memory_summary["parallel_sidecar_shard_merge"]["merged_shard_count"] == 1
+    assert memory_summary["parallel_sidecar_shard_merge"]["parallel_workers"] == 2
 
 
 def test_v05c_resolve_scope_clamps_train_and_test_seeds_to_available_set() -> None:

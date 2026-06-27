@@ -22,7 +22,6 @@ from v6.environment.arc_adapter import registered_game_ids
 from v6.environment.arc_adapter import ArcGridEnvironment
 from v6.evaluation.broad_game_validation import family_for_game, game_passes, parse_game_selector
 from v6.evaluation.failure_diagnostics import compute_run_diagnostics
-from v6.evaluation.future_effects import analyze_future_effects, interaction_future_option_deltas
 from v6.evaluation.id_free_prefuture_validation import ID_FREE_FEATURE_SETS, evaluate_id_free_config
 from v6.evaluation.prefuture_role_prediction import PREFUTURE_CLASSIFIERS, load_prefuture_examples
 from v6.game_sets import load_game_set_manifest, parquet_games_present
@@ -510,6 +509,7 @@ def _run_sampling_jobs(
                     global_step_start=int(min_fold_step or 1),
                     global_step_end=int(max_fold_step or max(1, int(min_fold_step or 1))),
                 ),
+                parallel_workers=fold_workers,
             )
     finally:
         progress.close()
@@ -626,20 +626,6 @@ def _run_sampling_job(job: dict) -> dict:
             adaptive_context_summary = system.adaptive_context_summary()
     finally:
         system.close()
-    effects: list[dict] = []
-    if not fast_postprocessing:
-        effects = analyze_future_effects(
-            db_path=str(db_path),
-            game=str(job["game"]),
-            seed=seed,
-            steps=int(job["steps"]),
-            horizon=int(job["horizon"]),
-        )
-        deltas_by_interaction_id = _future_option_deltas_by_interaction_id(
-            db_path,
-            horizon=int(job["horizon"]),
-        )
-        _apply_future_option_efficiency_diagnostics(db_path, deltas_by_interaction_id)
     _write_sampling_metadata(
         db_path,
         game=str(job["game"]),
@@ -657,7 +643,10 @@ def _run_sampling_job(job: dict) -> dict:
         compact_memory_loaded=bool(job.get("memory_input_dir")),
         compact_memory_restore_summary=getattr(system, "compact_memory_restore_summary", {}),
         fast_postprocessing_enabled=fast_postprocessing,
-        future_effects_postprocessing_skipped=fast_postprocessing,
+        future_effects_postprocessing_skipped=True,
+        future_effects_legacy_removed=True,
+        legacy_future_effects_removed=True,
+        future_option_memory_source="memory_substrate",
         adaptive_context_expansion_enabled=bool(adaptive_context_summary.get("adaptive_context_expansion_enabled", False)),
         base_context_depth=int(adaptive_context_summary.get("base_context_depth", job.get("context_depth", 3)) or 0),
         max_context_depth=int(adaptive_context_summary.get("max_context_depth", job.get("max_context_depth", job.get("context_depth", 3))) or 0),
@@ -754,7 +743,7 @@ def _run_sampling_job(job: dict) -> dict:
     if not fast_postprocessing:
         db_path.with_name("memory_replay_candidates.json").write_text(json.dumps(replay_candidates, indent=2), encoding="utf-8")
         db_path.with_name("efficiency_summary.json").write_text(json.dumps(efficiency_summary, indent=2), encoding="utf-8")
-    return {"effects": len(effects)}
+    return {"legacy_future_effects_removed": True}
 
 
 def _evaluate_sampling_runs(config: InteractionSamplingConfig, sampling_root: Path) -> list[dict]:
@@ -1031,12 +1020,6 @@ def _aggregate_seed_rows(seed_rows: list[dict], config: InteractionSamplingConfi
             "usable_interactions",
             "reset_count",
             "terminal_count",
-            "future_effect_count",
-            "preserve_count",
-            "expand_count",
-            "restrict_count",
-            "collapse_count",
-            "non_preserve_count",
             "stable_contingency_count",
             "transformation_family_count",
             "high_isf_interaction_count",
@@ -1093,7 +1076,6 @@ def _aggregate_seed_rows(seed_rows: list[dict], config: InteractionSamplingConfi
             "posthoc_future_option_delta_count",
         ):
             sums[key] += int(row.get(key, 0) or 0)
-    future_count = max(1, sums["future_effect_count"])
     return {
         "game": first["game"],
         "family": family_for_game(first["game"]),
@@ -1209,13 +1191,15 @@ def _aggregate_seed_rows(seed_rows: list[dict], config: InteractionSamplingConfi
         "efficiency_min_future_option_gain_per_cost": _min_or_none(
             row.get("efficiency_min_future_option_gain_per_cost") for row in seed_rows
         ),
-        "future_effect_count": sums["future_effect_count"],
-        "preserve_count": sums["preserve_count"],
-        "expand_count": sums["expand_count"],
-        "restrict_count": sums["restrict_count"],
-        "collapse_count": sums["collapse_count"],
-        "non_preserve_count": sums["non_preserve_count"],
-        "non_preserve_ratio": sums["non_preserve_count"] / future_count,
+        "legacy_future_effects_removed": True,
+        "future_effect_metrics_interpretable": False,
+        "future_effect_count": None,
+        "preserve_count": None,
+        "expand_count": None,
+        "restrict_count": None,
+        "collapse_count": None,
+        "non_preserve_count": None,
+        "non_preserve_ratio": None,
         "levels_successfully_completed": int(
             max(
                 max(
@@ -1241,13 +1225,25 @@ def sampler_comparison_rows(rows: list[dict]) -> list[dict]:
         if not baseline:
             continue
         for sampler_name, row in sorted(items.items()):
+            baseline_non_preserve_count = baseline.get("non_preserve_count")
+            candidate_non_preserve_count = row.get("non_preserve_count")
+            baseline_non_preserve_ratio = baseline.get("non_preserve_ratio")
+            candidate_non_preserve_ratio = row.get("non_preserve_ratio")
             output.append(
                 {
                     "game": game,
                     "family": family_for_game(game),
                     "sampler_name": sampler_name,
-                    "delta_non_preserve_count": int(row["non_preserve_count"]) - int(baseline["non_preserve_count"]),
-                    "delta_non_preserve_ratio": float(row["non_preserve_ratio"]) - float(baseline["non_preserve_ratio"]),
+                    "delta_non_preserve_count": (
+                        None
+                        if candidate_non_preserve_count is None or baseline_non_preserve_count is None
+                        else int(candidate_non_preserve_count) - int(baseline_non_preserve_count)
+                    ),
+                    "delta_non_preserve_ratio": (
+                        None
+                        if candidate_non_preserve_ratio is None or baseline_non_preserve_ratio is None
+                        else float(candidate_non_preserve_ratio) - float(baseline_non_preserve_ratio)
+                    ),
                     "delta_unique_transformation_families": int(row["unique_transformation_families"]) - int(baseline["unique_transformation_families"]),
                     "delta_stable_contingency_count": int(row["stable_contingency_count"]) - int(baseline["stable_contingency_count"]),
                     "delta_prediction_accuracy": float(row["prediction_accuracy"]) - float(baseline["prediction_accuracy"]),
@@ -1268,7 +1264,6 @@ def best_by_game(rows: list[dict]) -> list[dict]:
                 items,
                 key=lambda row: (
                     bool(row["pass_status"]),
-                    int(row["non_preserve_count"]),
                     float(row["id_free_macro_f1"]),
                     float(row["id_free_accuracy"]),
                     -float(row["no_change_ratio"]),
@@ -1287,8 +1282,8 @@ def summary_by_family(best_rows: list[dict]) -> list[dict]:
             "family": family,
             "games_tested": len(rows),
             "games_passed": sum(1 for row in rows if row["pass_status"]),
-            "mean_non_preserve_ratio": float(np.mean([row["non_preserve_ratio"] for row in rows])),
-            "mean_non_preserve_count": float(np.mean([row["non_preserve_count"] for row in rows])),
+            "mean_non_preserve_ratio": None,
+            "mean_non_preserve_count": None,
             "mean_id_free_macro_f1": float(np.mean([row["id_free_macro_f1"] for row in rows])),
             "best_sampler": Counter(row["sampler_name"] for row in rows).most_common(1)[0][0],
         }
@@ -1388,10 +1383,16 @@ def validation_summary(rows: list[dict], comparison: list[dict], best_rows: list
         candidate = by_game_sampler.get((game, row["sampler_name"]))
         if not baseline or not candidate:
             continue
-        base_count = max(1, int(baseline["non_preserve_count"]))
-        base_ratio = max(1e-9, float(baseline["non_preserve_ratio"]))
-        if int(candidate["non_preserve_count"]) >= 2 * base_count and float(candidate["non_preserve_ratio"]) >= 2 * base_ratio:
-            weak_games.add(game)
+        if (
+            baseline.get("non_preserve_count") is not None
+            and baseline.get("non_preserve_ratio") is not None
+            and candidate.get("non_preserve_count") is not None
+            and candidate.get("non_preserve_ratio") is not None
+        ):
+            base_count = max(1, int(baseline["non_preserve_count"]))
+            base_ratio = max(1e-9, float(baseline["non_preserve_ratio"]))
+            if int(candidate["non_preserve_count"]) >= 2 * base_count and float(candidate["non_preserve_ratio"]) >= 2 * base_ratio:
+                weak_games.add(game)
         if bool(candidate["pass_status"]) and not bool(baseline["pass_status"]):
             strong_games.add(game)
     ok_rows = [row for row in rows if row.get("run_status") == "ok"]
@@ -1410,6 +1411,7 @@ def validation_summary(rows: list[dict], comparison: list[dict], best_rows: list
             if row.get("run_status") == "ok"
         ),
         "scientific_conclusion": "sampling_repair" if len(strong_games) >= 2 else "diagnostic_only",
+        "legacy_future_effects_removed": True,
         "mean_isf_total": float(np.mean([row.get("mean_isf_total", 0.0) or 0.0 for row in ok_rows])) if ok_rows else None,
         "max_isf_total": float(max((row.get("max_isf_total", 0.0) or 0.0) for row in ok_rows)) if ok_rows else None,
         "mean_isf_survival_impact": float(np.mean([row.get("mean_isf_survival_impact", 0.0) or 0.0 for row in ok_rows])) if ok_rows else None,
@@ -2128,21 +2130,8 @@ def _min_or_none(values) -> float | None:
 
 
 def _future_option_deltas_by_interaction_id(db_path: Path, *, horizon: int) -> dict[str, float]:
-    try:
-        with sqlite3.connect(db_path) as connection:
-            tables = {str(row[0]) for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-            if not {"contingencies", "prediction_results"}.issubset(tables):
-                return {}
-            prediction_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(prediction_results)").fetchall()}
-            contingency_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(contingencies)").fetchall()}
-            required_prediction = {"interaction_id", "episode_id", "action", "actual_family"}
-            required_contingency = {"id", "context_level", "context_signature", "action", "transformation_family", "support_count", "confidence"}
-            if not required_prediction.issubset(prediction_columns) or not required_contingency.issubset(contingency_columns):
-                return {}
-            rows = interaction_future_option_deltas(connection, horizon=horizon)
-    except sqlite3.DatabaseError:
-        return {}
-    return {str(interaction_id): float(delta) for interaction_id, delta in rows.items()}
+    del db_path, horizon
+    return {}
 
 
 def _apply_future_option_efficiency_diagnostics(db_path: Path, deltas_by_interaction_id: dict[str, float]) -> None:
@@ -2325,9 +2314,12 @@ def _format_text(payload: dict) -> str:
         return "\n".join(lines) + "\n"
     lines.append("best by game:")
     for row in payload["best_by_game"]:
+        non_preserve_count = row.get("non_preserve_count")
+        non_preserve_ratio = row.get("non_preserve_ratio")
         lines.append(
             f"{row['game']} sampler={row['sampler_name']} pass={row['pass_status']} "
-            f"nonP={row['non_preserve_count']} ratio={row['non_preserve_ratio']:.3f} "
+            f"nonP={'n/a' if non_preserve_count is None else non_preserve_count} "
+            f"ratio={'n/a' if non_preserve_ratio is None else f'{float(non_preserve_ratio):.3f}'} "
             f"acc={row['id_free_accuracy']:.3f} macro_f1={row['id_free_macro_f1']:.3f}"
         )
     return "\n".join(lines) + "\n"

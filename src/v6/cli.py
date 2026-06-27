@@ -25,7 +25,6 @@ from v6.evaluation.validation_report import (
     format_validation_reports,
     validation_reports_to_json,
 )
-from v6.evaluation.future_effects import DEFAULT_GAMES, FutureEffectRunConfig, run_future_effect_v02
 from v6.evaluation.milestone_1_5 import MilestoneRunConfig, run_milestone_1_5
 from v6.evaluation.prefuture_role_prediction import PrefutureConfig, run_prefuture_role_prediction_v04c
 from v6.evaluation.role_candidates import ROLE_DISCOVERY_GAMES, RoleCandidateRunConfig, run_role_candidate_v03
@@ -119,20 +118,6 @@ def build_parser() -> argparse.ArgumentParser:
     milestone.add_argument("--output-dir", default="runs/v6")
     milestone.add_argument("--env-root", default=None)
     milestone.add_argument("--workers", type=int, default=None, help="Parallel milestone worker processes. Defaults to CPU count.")
-
-    future_effect = subparsers.add_parser("future-effect-v02")
-    future_effect.add_argument("--games", default=",".join(DEFAULT_GAMES))
-    future_effect.add_argument("--steps", type=int, default=10000)
-    future_effect.add_argument("--seeds", default="0,1,2")
-    future_effect.add_argument("--horizon", type=int, default=10)
-    future_effect.add_argument("--threshold", type=float, default=1.0)
-    future_effect.add_argument("--collapse-threshold", type=float, default=0.5)
-    future_effect.add_argument("--context-length", type=int, default=3)
-    future_effect.add_argument("--support-threshold", type=int, default=20)
-    future_effect.add_argument("--confidence-threshold", type=float, default=0.8)
-    future_effect.add_argument("--output-dir", default="runs/v6")
-    future_effect.add_argument("--env-root", default=None)
-    future_effect.add_argument("--workers", type=int, default=None, help="Parallel worker processes. Defaults to CPU count.")
 
     role_candidate = subparsers.add_parser("role-candidate-v03")
     role_candidate.add_argument("--games", default=",".join(ROLE_DISCOVERY_GAMES))
@@ -627,26 +612,6 @@ def main(argv: list[str] | None = None) -> int:
                 steps=tuple(_parse_csv_int(args.steps)),
                 seeds=tuple(_parse_csv_int(args.seeds)),
                 max_context_level=args.max_context_level,
-                support_threshold=args.support_threshold,
-                confidence_threshold=args.confidence_threshold,
-                output_dir=args.output_dir,
-                env_root=args.env_root,
-                workers=args.workers,
-            )
-        )
-        print(json.dumps({"rows": len(rows), "output_dir": args.output_dir}, indent=2))
-        return 0
-
-    if args.command == "future-effect-v02":
-        rows = run_future_effect_v02(
-            FutureEffectRunConfig(
-                games=tuple(_parse_csv_str(args.games)),
-                steps=args.steps,
-                seeds=tuple(_parse_csv_int(args.seeds)),
-                horizon=args.horizon,
-                threshold=args.threshold,
-                collapse_threshold=args.collapse_threshold,
-                context_length=args.context_length,
                 support_threshold=args.support_threshold,
                 confidence_threshold=args.confidence_threshold,
                 output_dir=args.output_dir,
