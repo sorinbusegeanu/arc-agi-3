@@ -8,6 +8,7 @@ from pathlib import Path
 from statistics import mean
 from typing import Any
 
+from v6.memory.direct_streaming_fold import direct_streaming_manifest_exists
 
 H02_JSON_NAME = "h02_prediction_violation_attention_report.json"
 H02_TXT_NAME = "h02_prediction_violation_attention_report.txt"
@@ -270,6 +271,9 @@ def evaluate_h02_prediction_violation_attention(
     result["db_found"] = db_found
     result["sqlite_db_count_total"] = len(sqlite_paths)
     result["evidence_source"] = "raw_epoch_db"
+    streamed_compact_only = bool(memory_dir is not None and direct_streaming_manifest_exists(memory_dir) and not sqlite_paths)
+    if streamed_compact_only:
+        result["evidence_source"] = "direct_streaming_manifest_and_compact_memory"
 
     report_metrics = _extract_report_metrics(input_report)
     db_metrics = {} if _report_has_all_fields(report_metrics) else _aggregate_db_metrics(sqlite_paths)
@@ -306,7 +310,11 @@ def evaluate_h02_prediction_violation_attention(
                         result[key] = value
                         result["compact_counter_fallback_used"] = True
             result["compact_h02_fallback_used"] = any(value is not None for value in compact_metrics.values())
-            result["evidence_source"] = "compact_memory" if not input_report_found else "mixed_compact_memory_fallback"
+            result["evidence_source"] = (
+                "direct_streaming_manifest_and_compact_memory"
+                if streamed_compact_only
+                else ("compact_memory" if not input_report_found else "mixed_compact_memory_fallback")
+            )
         else:
             for key, value in compact_metrics.items():
                 if value is None:
@@ -349,6 +357,10 @@ def evaluate_h02_prediction_violation_attention(
         result["scientific_conclusion"] = result["h02a_replay_attention_conclusion"]
         _finalize_h02_result(result, output_dir)
         return result
+    if streamed_compact_only and result.get("direct_replay_lift_available") is not True:
+        message = "raw per-interaction replay linkage unavailable after direct streaming raw cleanup"
+        if message not in result["missing_evidence"]:
+            result["missing_evidence"].append(message)
     if not input_report_found:
         result["missing_evidence"].append(f"Required input report missing: {INPUT_REPORT_NAME}")
         result["decision"] = "INCONCLUSIVE"

@@ -7,6 +7,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+from v6.memory.direct_streaming_fold import direct_streaming_manifest_exists
 
 def cleanup_epoch_artifacts(*, epoch_dir: str | Path, memory_dir: str | Path) -> dict[str, Any]:
     epoch_path = Path(epoch_dir)
@@ -87,9 +88,15 @@ def validate_cleanup_safe(epoch_dir: str | Path, memory_dir: str | Path, require
     required_report_files = [
         reports_dir / "hypothesis_suite_summary.json",
     ]
+    sampling_report_candidates = [
+        epoch_path / "interaction_sampling_v05c_report.json",
+        epoch_path / "raw" / "interaction_sampling_v05c_report.json",
+    ]
     if required_reports and any(not path.exists() for path in required_report_files):
         missing = [str(path) for path in required_report_files if not path.exists()]
         raise RuntimeError(f"cleanup refused because required reports are missing: {missing}")
+    if required_reports and not any(path.exists() for path in sampling_report_candidates):
+        raise RuntimeError("cleanup refused because interaction_sampling_v05c_report.json is missing")
     memory_files = [
         memory_path / "current_state.sqlite",
         memory_path / "graph.sqlite",
@@ -99,6 +106,19 @@ def validate_cleanup_safe(epoch_dir: str | Path, memory_dir: str | Path, require
     missing_memory = [str(path) for path in memory_files if not path.exists()]
     if missing_memory:
         raise RuntimeError(f"cleanup refused because compact memory is incomplete: {missing_memory}")
+    manifest_path = memory_path / "direct_streaming_fold_manifest.sqlite"
+    if direct_streaming_manifest_exists(memory_path):
+        if not manifest_path.exists():
+            raise RuntimeError("cleanup refused because direct streaming fold manifest is missing")
+        with sqlite3.connect(manifest_path) as conn:
+            failed = int(conn.execute("SELECT COUNT(*) FROM folded_jobs WHERE status = 'failed'").fetchone()[0] or 0)
+            metrics_count = int(conn.execute("SELECT COUNT(*) FROM job_metrics").fetchone()[0] or 0)
+            milestone_count = int(conn.execute("SELECT COUNT(*) FROM temporal_milestones").fetchone()[0] or 0)
+            validation_count = int(conn.execute("SELECT COUNT(*) FROM validation_payloads").fetchone()[0] or 0)
+        if failed > 0:
+            raise RuntimeError("cleanup refused because direct streaming fold manifest contains failed jobs")
+        if metrics_count <= 0 or milestone_count <= 0 or validation_count <= 0:
+            raise RuntimeError("cleanup refused because direct streaming fold manifest is incomplete")
     summary_payload = json.loads((memory_path / "memory_summary.json").read_text(encoding="utf-8"))
     fold_summary = summary_payload.get("fold_summary")
     if not fold_summary:

@@ -10,7 +10,7 @@ import numpy as np
 
 from v6.carrier_emergence import CarrierEmergenceTracker
 from v6.contingency.contingency_learner import Contingency
-from v6.memory.compact_memory import stable_family_int_id
+from v6.memory.compact_memory import configure_compact_sqlite_connection, stable_family_int_id
 from v6.memory_lifecycle import MemoryRecord, ReplayCandidate
 from v6.memory.substrate import MemoryEdge, MemoryEvidence, MemoryNode, MemoryPromotion, MemoryScore
 from v6.transformation.transformation_clusterer import TransformationFamily
@@ -354,7 +354,7 @@ def _connect_readonly_with_retry(
                 uri=True,
                 timeout=float(timeout_seconds),
             )
-            connection.execute(f"PRAGMA busy_timeout = {int(max(0.0, float(timeout_seconds)) * 1000)}")
+            configure_compact_sqlite_connection(connection, write=False)
             return connection
         except sqlite3.OperationalError as exc:
             last_error = exc

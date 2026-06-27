@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from v6.memory.direct_streaming_fold import direct_streaming_manifest_exists
+
 from v6.hypothesis_h01_report import evaluate_h01_contingency_emergence
 from v6.hypothesis_h02_report import evaluate_h02_prediction_violation_attention
 from v6.hypothesis_h03_report import evaluate_h03_transformation_family_formation
@@ -248,6 +250,10 @@ def build_hypothesis_suite_summary(
         "total_interactions_seen": total_interactions_seen,
         "memory_size_before_bytes": memory_size_before_bytes,
         "memory_size_after_bytes": memory_size_after_bytes,
+        "direct_streaming_fold_used": bool(memory_dir is not None and direct_streaming_manifest_exists(memory_dir)),
+        "raw_epoch_db_cleanup_used": bool(memory_dir is not None and direct_streaming_manifest_exists(memory_dir) and not list(Path(run_dir).rglob("*.sqlite"))),
+        "raw_db_fallback_disabled": bool(memory_dir is not None and direct_streaming_manifest_exists(memory_dir)),
+        "direct_streaming_fold_manifest_path": None if memory_dir is None else str(Path(memory_dir) / "direct_streaming_fold_manifest.sqlite"),
         "levels_successfully_completed_per_epoch": int(input_report.get("levels_successfully_completed_per_epoch", 0) or 0),
         "games_solved_per_epoch": int(input_report.get("games_solved_per_epoch", 0) or 0),
         "solved_games": list(input_report.get("solved_games", []) or []),

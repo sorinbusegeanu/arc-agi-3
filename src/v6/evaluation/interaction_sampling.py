@@ -24,7 +24,7 @@ from v6.environment.arc_adapter import ArcGridEnvironment
 from v6.evaluation.broad_game_validation import family_for_game, game_passes, parse_game_selector
 from v6.evaluation.failure_diagnostics import compute_run_diagnostics
 from v6.evaluation.id_free_prefuture_validation import ID_FREE_FEATURE_SETS, evaluate_id_free_config
-from v6.evaluation.prefuture_role_prediction import PREFUTURE_CLASSIFIERS, load_prefuture_examples
+from v6.evaluation.prefuture_role_prediction import PREFUTURE_CLASSIFIERS, PrefutureExample, load_prefuture_examples
 from v6.game_sets import load_game_set_manifest, parquet_games_present
 from v6.main import V6Config, V6System
 from v6.memory.live_memory_queue import (
@@ -41,6 +41,7 @@ from v6.memory.direct_streaming_fold import (
     direct_streaming_manifest_exists,
     load_direct_streamed_job_metrics,
     load_direct_streamed_temporal_milestones,
+    load_direct_streamed_validation_payloads,
 )
 from v6.sampling import make_sampler, sampler_registry
 from v6.storage.migration import migrate_sqlite_to_parquet
@@ -177,7 +178,8 @@ def run_interaction_sampling_v05c(config: InteractionSamplingConfig) -> list[dic
     worker_execution = _generate_sampling_dbs(config, sampling_root)
     if config.collect_only:
         if config.storage_backend == "parquet":
-            _export_sampling_sqlite_to_parquet(config, sampling_root)
+            if not bool(config.direct_streaming_fold_enabled):
+                _export_sampling_sqlite_to_parquet(config, sampling_root)
             shutil.rmtree(sampling_root, ignore_errors=True)
         return []
     rows = _evaluate_sampling_runs(config, sampling_root)
@@ -228,7 +230,8 @@ def run_interaction_sampling_v05c(config: InteractionSamplingConfig) -> list[dic
     }
     write_interaction_sampling_reports(payload, output)
     if config.storage_backend == "parquet":
-        _export_sampling_sqlite_to_parquet(config, sampling_root)
+        if not bool(config.direct_streaming_fold_enabled):
+            _export_sampling_sqlite_to_parquet(config, sampling_root)
         shutil.rmtree(sampling_root, ignore_errors=True)
     return rows
 
@@ -306,6 +309,11 @@ def _generate_sampling_dbs(config: InteractionSamplingConfig, sampling_root: Pat
                             "direct_streaming_fold_enabled": bool(config.direct_streaming_fold_enabled),
                             "direct_streaming_fold_workers": int(config.direct_streaming_fold_workers),
                             "delete_raw_after_direct_streaming_fold": bool(config.delete_raw_after_direct_streaming_fold),
+                            "collect_only": bool(config.collect_only),
+                            "storage_backend": str(config.storage_backend),
+                            "parquet_root": str(config.parquet_root),
+                            "storage_batch_size": int(config.storage_batch_size),
+                            "compression": str(config.compression),
                             "db_path": str(db_path),
                             "env_root": config.env_root,
                         }
@@ -322,7 +330,8 @@ def _generate_sampling_dbs(config: InteractionSamplingConfig, sampling_root: Pat
                     per_worker_ramp_delay_seconds=float(config.per_worker_ramp_delay_seconds),
                 )
                 aggregated_worker_execution = _merge_worker_execution_stats(aggregated_worker_execution, stats)
-            _export_sampling_sqlite_to_parquet(config, sampling_root, games=(game,))
+            if not bool(config.direct_streaming_fold_enabled):
+                _export_sampling_sqlite_to_parquet(config, sampling_root, games=(game,))
             shutil.rmtree(sampling_root / game, ignore_errors=True)
         return aggregated_worker_execution
 
@@ -360,6 +369,11 @@ def _generate_sampling_dbs(config: InteractionSamplingConfig, sampling_root: Pat
                         "direct_streaming_fold_enabled": bool(config.direct_streaming_fold_enabled),
                         "direct_streaming_fold_workers": int(config.direct_streaming_fold_workers),
                         "delete_raw_after_direct_streaming_fold": bool(config.delete_raw_after_direct_streaming_fold),
+                        "collect_only": bool(config.collect_only),
+                        "storage_backend": str(config.storage_backend),
+                        "parquet_root": str(config.parquet_root),
+                        "storage_batch_size": int(config.storage_batch_size),
+                        "compression": str(config.compression),
                         "db_path": str(db_path),
                         "env_root": config.env_root,
                     }
@@ -577,6 +591,10 @@ def _run_sampling_jobs(
                                 global_step_end=int(job.get("global_step_offset", 0) or 0) + int(job.get("steps", 0) or 0),
                                 memory_dir=str(job["memory_output_dir"]),
                                 delete_raw_after_fold=bool(job.get("delete_raw_after_direct_streaming_fold", True)),
+                                parquet_export_enabled=bool(job.get("collect_only", False) and str(job.get("storage_backend", "sqlite")) == "parquet"),
+                                parquet_root=None if not job.get("parquet_root") else str(job.get("parquet_root")),
+                                storage_batch_size=int(job.get("storage_batch_size", 1000) or 1000),
+                                compression=str(job.get("compression", "zstd") or "zstd"),
                             )
                         )
                     progress.update(1)
@@ -889,35 +907,31 @@ def _run_sampling_job(job: dict) -> dict:
 def _evaluate_sampling_runs(config: InteractionSamplingConfig, sampling_root: Path) -> list[dict]:
     if config.memory_output_dir and direct_streaming_manifest_exists(config.memory_output_dir):
         metric_rows = load_direct_streamed_job_metrics(config.memory_output_dir)
+        validation_payloads = load_direct_streamed_validation_payloads(config.memory_output_dir)
         if not metric_rows:
             raise RuntimeError("Direct streaming fold manifest missing job metrics; raw DB fallback is disabled for normal continuous sampling.")
+        if not validation_payloads:
+            raise RuntimeError("Direct streaming validation payloads missing; raw DB fallback is disabled.")
         grouped: dict[tuple[str, str], list[dict]] = defaultdict(list)
+        grouped_payloads: dict[tuple[str, str], list[dict]] = defaultdict(list)
         for row in metric_rows:
             grouped[(str(row.get("game")), str(row.get("sampler_name")))].append(dict(row))
+        for payload in validation_payloads:
+            grouped_payloads[(str(payload.get("game")), str(payload.get("sampler_name")))].append(dict(payload))
         rows: list[dict] = []
         for game in config.games:
             for sampler_name in config.samplers:
                 seed_rows = grouped.get((str(game), str(sampler_name)), [])
+                payload_rows = grouped_payloads.get((str(game), str(sampler_name)), [])
                 if not seed_rows:
                     rows.append(_failed_row(game, sampler_name, config, "missing direct-streamed job metrics"))
                     continue
                 aggregate = _aggregate_seed_rows(seed_rows, config)
+                eval_row = _best_validation_row_from_streamed_payloads(game, sampler_name, config, payload_rows)
                 rows.append(
                     {
                         **aggregate,
-                        "feature_set": "manifest_only",
-                        "classifier": "manifest_only",
-                        "train_seeds": list(config.train_seeds),
-                        "test_seed": int(config.test_seed),
-                        "majority_baseline_accuracy": 0.0,
-                        "majority_baseline_macro_f1": 0.0,
-                        "id_free_accuracy": 0.0,
-                        "id_free_macro_f1": 0.0,
-                        "id_free_vs_majority_delta": 0.0,
-                        "non_preserve_recall_any": 0.0,
-                        "forbidden_future_feature_check_passed": True,
-                        "forbidden_id_feature_check_passed": True,
-                        "pass_status": False,
+                        **eval_row,
                         "run_status": "ok",
                         "failure_reason": "",
                     }
@@ -1174,6 +1188,85 @@ def _best_validation_row(game: str, sampler_name: str, config: InteractionSampli
                 candidates.append(row)
     if not candidates:
         raise ValueError("no validation candidates")
+    best = max(candidates, key=lambda row: (game_passes({"run_status": "ok", **row}), row["id_free_macro_f1"], row["id_free_accuracy"], row["non_preserve_recall_any"]))
+    return {
+        "feature_set": best["feature_set"],
+        "classifier": best["classifier"],
+        "train_seeds": list(config.train_seeds),
+        "test_seed": int(config.test_seed),
+        "majority_baseline_accuracy": best["majority_baseline_accuracy"],
+        "majority_baseline_macro_f1": best["majority_baseline_macro_f1"],
+        "id_free_accuracy": best["id_free_accuracy"],
+        "id_free_macro_f1": best["id_free_macro_f1"],
+        "id_free_vs_majority_delta": best["id_free_vs_majority_delta"],
+        "non_preserve_recall_any": best["non_preserve_recall_any"],
+        "forbidden_future_feature_check_passed": best["forbidden_future_feature_check_passed"],
+        "forbidden_id_feature_check_passed": best["forbidden_id_feature_check_passed"],
+        "pass_status": game_passes({"run_status": "ok", **best}),
+    }
+
+
+def _prefuture_examples_from_payloads(payloads: list[dict]) -> list[PrefutureExample]:
+    examples: list[PrefutureExample] = []
+    for payload in payloads:
+        for item in payload.get("examples", []) or []:
+            contingency_key = item.get("contingency_key", [])
+            if isinstance(contingency_key, list):
+                normalized_key = tuple(
+                    tuple(part) if isinstance(part, list) else part
+                    for part in contingency_key
+                )
+            else:
+                normalized_key = tuple(contingency_key)
+            examples.append(
+                PrefutureExample(
+                    contingency_id=int(item.get("contingency_id", 0) or 0),
+                    contingency_key=normalized_key,
+                    features={str(key): float(value) for key, value in dict(item.get("features", {})).items()},
+                    label=str(item.get("label", "PRESERVE")),
+                )
+            )
+    return examples
+
+
+def _best_validation_row_from_streamed_payloads(
+    game: str,
+    sampler_name: str,
+    config: InteractionSamplingConfig,
+    payloads: list[dict],
+) -> dict:
+    validation_context_depth = (
+        int(config.max_context_depth)
+        if bool(config.adaptive_context_expansion) and config.max_context_depth is not None
+        else int(config.context_depth)
+    )
+    payloads_by_seed: dict[int, list[dict]] = defaultdict(list)
+    for payload in payloads:
+        payloads_by_seed[int(payload.get("seed", 0) or 0)].append(dict(payload))
+    train = _prefuture_examples_from_payloads([payload for seed in config.train_seeds for payload in payloads_by_seed.get(int(seed), [])])
+    train = [item for item in train if int(item.features["context_level"]) <= validation_context_depth]
+    test = _prefuture_examples_from_payloads(payloads_by_seed.get(int(config.test_seed), []))
+    test = [item for item in test if int(item.features["context_level"]) <= validation_context_depth]
+    if not train or not test:
+        raise RuntimeError("Direct streaming validation payloads missing; raw DB fallback is disabled.")
+    candidates = []
+    for feature_set in ID_FREE_FEATURE_SETS:
+        for classifier in PREFUTURE_CLASSIFIERS:
+            row = evaluate_id_free_config(
+                game=game,
+                feature_set=feature_set,
+                classifier=classifier,
+                train_seeds=config.train_seeds,
+                test_seed=config.test_seed,
+                steps=config.steps,
+                horizon=config.horizon,
+                train_examples=train,
+                test_examples=test,
+            )
+            if row is not None:
+                candidates.append(row)
+    if not candidates:
+        raise RuntimeError("Direct streaming validation payloads missing; raw DB fallback is disabled.")
     best = max(candidates, key=lambda row: (game_passes({"run_status": "ok", **row}), row["id_free_macro_f1"], row["id_free_accuracy"], row["non_preserve_recall_any"]))
     return {
         "feature_set": best["feature_set"],

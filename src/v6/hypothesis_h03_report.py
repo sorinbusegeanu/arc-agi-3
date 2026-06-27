@@ -9,6 +9,7 @@ from pathlib import Path
 from statistics import mean, median
 from typing import Any
 
+from v6.memory.direct_streaming_fold import direct_streaming_manifest_exists
 
 H03_JSON_NAME = "h03_transformation_family_report.json"
 H03_TXT_NAME = "h03_transformation_family_report.txt"
@@ -220,6 +221,9 @@ def evaluate_h03_transformation_family_formation(
     result["db_found"] = bool(sqlite_paths)
     result["db_paths_total"] = len(sqlite_paths)
     result["evidence_source"] = "raw_epoch_db"
+    streamed_compact_only = bool(memory_dir is not None and direct_streaming_manifest_exists(memory_dir) and not sqlite_paths)
+    if streamed_compact_only:
+        result["evidence_source"] = "direct_streaming_manifest_and_compact_memory"
 
     report_metrics = _extract_report_metrics(input_report)
     for field, value in report_metrics.items():
@@ -257,7 +261,7 @@ def evaluate_h03_transformation_family_formation(
         for key, value in compact.items():
             if result.get(key) is None:
                 result[key] = value
-        result["evidence_source"] = "mixed"
+        result["evidence_source"] = "direct_streaming_manifest_and_compact_memory" if streamed_compact_only else "mixed"
     if result.get("memory_record_count") is None:
         result["memory_record_count"] = report_metrics.get("memory_record_count")
 

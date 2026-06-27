@@ -42,6 +42,16 @@ class CompactMemoryFoldConfig:
     max_examples_per_contradiction_cluster: int = DEFAULT_MAX_EXAMPLES_PER_CONTRADICTION_CLUSTER
 
 
+def configure_compact_sqlite_connection(conn: sqlite3.Connection, *, write: bool) -> None:
+    conn.execute("PRAGMA busy_timeout=10000")
+    if write:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+    else:
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("PRAGMA busy_timeout=10000")
+
+
 def ensure_memory_layout(memory_dir: str | Path) -> CompactMemoryPaths:
     root = Path(memory_dir)
     root.mkdir(parents=True, exist_ok=True)
@@ -143,6 +153,7 @@ def fold_single_sampling_db_into_main_compact_memory(
     db_path: str | Path,
     memory_dir: str | Path,
     fold_config: CompactMemoryFoldConfig,
+    finalize_after_fold: bool = False,
 ) -> dict[str, Any]:
     paths = ensure_memory_layout(memory_dir)
     sqlite_path = Path(db_path)
@@ -164,6 +175,9 @@ def fold_single_sampling_db_into_main_compact_memory(
         sqlite3.connect(paths.graph) as graph_conn,
         sqlite3.connect(paths.replay_queue) as replay_conn,
     ):
+        configure_compact_sqlite_connection(state_conn, write=True)
+        configure_compact_sqlite_connection(graph_conn, write=True)
+        configure_compact_sqlite_connection(replay_conn, write=True)
         _fold_single_db(
             db_path=sqlite_path,
             state_conn=state_conn,
@@ -175,6 +189,44 @@ def fold_single_sampling_db_into_main_compact_memory(
         if live_graph_path.exists():
             _ingest_live_graph_export(graph_conn, live_graph_path, fold_config)
             totals["graph_live_exports_ingested"] += 1
+        if finalize_after_fold:
+            _trim_representative_examples(state_conn, fold_config)
+            _trim_replay_queue(replay_conn, fold_config)
+            summary = _build_memory_summary_from_connections(
+                state_conn=state_conn,
+                graph_conn=graph_conn,
+                replay_conn=replay_conn,
+                paths=paths,
+            )
+            summary.update(totals)
+            summary["fold_summary"] = dict(totals)
+            summary["direct_streaming_fold"] = {
+                "db_path": str(sqlite_path),
+                "global_step_start": int(fold_config.global_step_start),
+                "global_step_end": int(fold_config.global_step_end),
+            }
+            _write_memory_summary_table(state_conn, summary)
+            paths.summary_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        state_conn.commit()
+        graph_conn.commit()
+        replay_conn.commit()
+    return totals
+
+
+def finalize_main_compact_memory(
+    *,
+    memory_dir: str | Path,
+    fold_config: CompactMemoryFoldConfig,
+) -> dict[str, Any]:
+    paths = ensure_memory_layout(memory_dir)
+    with (
+        sqlite3.connect(paths.current_state) as state_conn,
+        sqlite3.connect(paths.graph) as graph_conn,
+        sqlite3.connect(paths.replay_queue) as replay_conn,
+    ):
+        configure_compact_sqlite_connection(state_conn, write=True)
+        configure_compact_sqlite_connection(graph_conn, write=True)
+        configure_compact_sqlite_connection(replay_conn, write=True)
         _trim_representative_examples(state_conn, fold_config)
         _trim_replay_queue(replay_conn, fold_config)
         summary = _build_memory_summary_from_connections(
@@ -183,10 +235,7 @@ def fold_single_sampling_db_into_main_compact_memory(
             replay_conn=replay_conn,
             paths=paths,
         )
-        summary.update(totals)
-        summary["fold_summary"] = dict(totals)
-        summary["direct_streaming_fold"] = {
-            "db_path": str(sqlite_path),
+        summary["fold_summary"] = {
             "global_step_start": int(fold_config.global_step_start),
             "global_step_end": int(fold_config.global_step_end),
         }
@@ -195,7 +244,7 @@ def fold_single_sampling_db_into_main_compact_memory(
         state_conn.commit()
         graph_conn.commit()
         replay_conn.commit()
-    return totals
+    return summary
 
 
 def fold_sampling_job_sidecars_into_compact_memory(
@@ -2742,8 +2791,18 @@ def _json_dumps_or_none(value: Any) -> Any:
     return json.dumps(value, sort_keys=True)
 
 
+def _coerce_float(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _ensure_current_state_schema(path: Path) -> None:
     with sqlite3.connect(path) as connection:
+        configure_compact_sqlite_connection(connection, write=True)
         connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS stable_contingencies (
@@ -3184,6 +3243,7 @@ def _ensure_current_state_schema(path: Path) -> None:
 
 def _ensure_graph_schema(path: Path) -> None:
     with sqlite3.connect(path) as connection:
+        configure_compact_sqlite_connection(connection, write=True)
         connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS graph_nodes (
@@ -3211,6 +3271,7 @@ def _ensure_graph_schema(path: Path) -> None:
 
 def _ensure_replay_schema(path: Path) -> None:
     with sqlite3.connect(path) as connection:
+        configure_compact_sqlite_connection(connection, write=True)
         connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS replay_queue (
