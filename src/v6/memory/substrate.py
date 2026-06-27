@@ -393,7 +393,30 @@ class MemorySubstrate:
 
 
 def interaction_node_id(identifier: int | str) -> str:
-    return f"M0:interaction:{int(identifier)}"
+    value = str(identifier)
+    if value.startswith("M0:interaction:"):
+        return value
+    return f"M0:interaction:{value}"
+
+
+def scoped_interaction_key(
+    *,
+    interaction_id: int | str,
+    global_step: int | None = None,
+    game: str | None = None,
+    sampler: str | None = None,
+    seed: int | str | None = None,
+) -> str:
+    if global_step is not None:
+        return f"g{int(global_step)}"
+    parts = [
+        "local",
+        str(game or "unknown_game"),
+        str(sampler or "unknown_sampler"),
+        str(seed or "unknown_seed"),
+        str(interaction_id),
+    ]
+    return ":".join(parts)
 
 
 def observation_node_id(signature: str) -> str:

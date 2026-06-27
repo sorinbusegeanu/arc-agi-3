@@ -1020,17 +1020,22 @@ def _build_future_option_event(
         live_option_delta=live_option_delta,
         future_option_edge_type=future_option_edge_type,
     )
-    option_delta = _base_option_delta(motif_type)
     polarity_text = str(polarity or "").lower()
     combined_text = " ".join(str(item or "") for item in text_fragments).lower()
-    if "positive" in polarity_text:
-        option_delta += 0.25
-    if "negative" in polarity_text:
-        option_delta -= 0.25
-    if "no_change" in combined_text:
-        option_delta -= 0.25
-    if support_count >= 20:
-        option_delta *= 1.10
+    if live_option_delta is not None:
+        option_delta = float(live_option_delta)
+        live_option_delta_used = True
+    else:
+        option_delta = _base_option_delta(motif_type)
+        live_option_delta_used = False
+        if "positive" in polarity_text:
+            option_delta += 0.25
+        if "negative" in polarity_text:
+            option_delta -= 0.25
+        if "no_change" in combined_text:
+            option_delta -= 0.25
+        if support_count >= 20:
+            option_delta *= 1.10
     option_count_before = 10.0
     option_count_after = max(0.0, option_count_before + option_delta)
     contradiction_score = _clamp01(mean_prediction_error if mean_prediction_error > 0.0 else 0.0)
@@ -1044,6 +1049,9 @@ def _build_future_option_event(
     evidence["support_count"] = int(support_count)
     evidence["text_tokens_used"] = text_tokens
     evidence["motif_type_source"] = motif_type_source
+    evidence["live_option_delta_used"] = bool(live_option_delta_used)
+    evidence["raw_live_option_delta"] = live_option_delta
+    evidence["future_option_edge_type"] = future_option_edge_type
     return {
         "event_id": "foe:" + sha1(event_id_seed.encode("utf-8")).hexdigest(),
         "owner_type": owner_type,

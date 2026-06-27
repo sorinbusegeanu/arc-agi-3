@@ -2063,6 +2063,15 @@ def _populate_h03_evidence_lists(result: dict[str, Any]) -> None:
     evidence_for: list[str] = []
     evidence_against: list[str] = []
     missing_evidence: list[str] = list(result.get("missing_evidence", []))
+    singleton_families_by_action = dict(result.get("singleton_families_by_action", {}) or {})
+    singleton_count = int(result.get("singleton_family_count") or 0)
+    diagnostics = result.get("singleton_family_diagnostics") or {}
+    result["family_prediction_lift_available"] = result.get("family_prediction_lift_mean") is not None
+    result["h03_row_cap_applied"] = bool(result.get("max_rows_applied"))
+    unknown_action_count = int(singleton_families_by_action.get("unknown", 0) or 0)
+    result["singleton_action_metadata_incomplete"] = bool(singleton_count and (unknown_action_count / singleton_count) > 0.20)
+    over_context = int(diagnostics.get("over_specific_context_count", 0) or 0)
+    result["singleton_context_overspecific"] = bool(singleton_count and (over_context / singleton_count) > 0.20)
     if _gt(result.get("discovered_contingency_count"), 0) is True:
         evidence_for.append(f"Contingencies are present ({int(result['discovered_contingency_count'])}).")
     else:
@@ -2091,9 +2100,19 @@ def _populate_h03_evidence_lists(result: dict[str, Any]) -> None:
         evidence_for.append(
             f"Global family merging reduced shard-local family inflation ({int(result['global_family_count_before_merge'])} -> {int(result['global_family_count_after_merge'])})."
         )
+    if result.get("family_prediction_lift_mean") is None:
+        missing_evidence.append("Family prediction lift is unavailable; H03 compression cannot yet be tied to predictive improvement.")
+    if result.get("max_rows_applied") is True:
+        missing_evidence.append("H03 DB scan hit max_rows; family metrics are sampled/capped.")
+    if _gt(result.get("singleton_family_ratio"), 0.50):
+        missing_evidence.append("Singleton family ratio remains above acceptance threshold.")
+    if result["singleton_action_metadata_incomplete"]:
+        missing_evidence.append("Many singleton families have unknown action metadata.")
+    if result["singleton_context_overspecific"]:
+        missing_evidence.append("Singleton families are dominated by over-specific context signatures.")
     result["evidence_for"] = evidence_for
     result["evidence_against"] = evidence_against
-    result["missing_evidence"] = missing_evidence
+    result["missing_evidence"] = list(dict.fromkeys(str(item) for item in missing_evidence))
 
 
 def _finalize_h03_result(result: dict[str, Any], output_dir: Path) -> None:
@@ -2133,6 +2152,10 @@ def _format_h03_text_report(result: dict[str, Any]) -> str:
         f"- compression ratio: {_fmt_value(result.get('compression_ratio'))}",
         f"- compression gain: {_fmt_value(result.get('compression_gain'))}",
         f"- family prediction lift: {_fmt_value(result.get('family_prediction_lift_mean'))}",
+        f"- family prediction lift available: {_fmt_value(result.get('family_prediction_lift_available'))}",
+        f"- H03 row cap applied: {_fmt_value(result.get('h03_row_cap_applied'))}",
+        f"- singleton action metadata incomplete: {_fmt_value(result.get('singleton_action_metadata_incomplete'))}",
+        f"- singleton context overspecific: {_fmt_value(result.get('singleton_context_overspecific'))}",
         f"- cross-context/game/sampler families: {_fmt_value(result.get('family_cross_context_count'))} / {_fmt_value(result.get('family_cross_game_count'))} / {_fmt_value(result.get('family_cross_sampler_count'))}",
         f"- top singleton family signatures: {json.dumps(result.get('top_singleton_family_signatures', []), sort_keys=True)}",
         f"- singleton families by game: {json.dumps(result.get('singleton_families_by_game', {}), sort_keys=True)}",
@@ -2198,6 +2221,10 @@ def _format_h03_markdown_report(result: dict[str, Any]) -> str:
         f"- compression ratio: `{_fmt_value(result.get('compression_ratio'))}`",
         f"- compression gain: `{_fmt_value(result.get('compression_gain'))}`",
         f"- family prediction lift: `{_fmt_value(result.get('family_prediction_lift_mean'))}`",
+        f"- family prediction lift available: `{_fmt_value(result.get('family_prediction_lift_available'))}`",
+        f"- H03 row cap applied: `{_fmt_value(result.get('h03_row_cap_applied'))}`",
+        f"- singleton action metadata incomplete: `{_fmt_value(result.get('singleton_action_metadata_incomplete'))}`",
+        f"- singleton context overspecific: `{_fmt_value(result.get('singleton_context_overspecific'))}`",
         f"- cross-context/game/sampler families: `{_fmt_value(result.get('family_cross_context_count'))} / {_fmt_value(result.get('family_cross_game_count'))} / {_fmt_value(result.get('family_cross_sampler_count'))}`",
         f"- top singleton family signatures: `{json.dumps(result.get('top_singleton_family_signatures', []), sort_keys=True)}`",
         f"- singleton families by game: `{json.dumps(result.get('singleton_families_by_game', {}), sort_keys=True)}`",

@@ -467,6 +467,14 @@ def derive_role_transfer_attempts(
 
 
 def derive_concept_candidates(state_conn: sqlite3.Connection) -> dict[str, Any]:
+    try:
+        state_conn.execute("ALTER TABLE concept_candidates ADD COLUMN transfer_success_concentration REAL")
+    except sqlite3.DatabaseError:
+        pass
+    try:
+        state_conn.execute("ALTER TABLE concept_candidates ADD COLUMN is_overconcentrated INTEGER DEFAULT 0")
+    except sqlite3.DatabaseError:
+        pass
     role_rows = state_conn.execute(
         """
         SELECT role_signature, role_type, support_count, linked_carrier_count, linked_family_count,
@@ -558,6 +566,8 @@ def derive_concept_candidates(state_conn: sqlite3.Connection) -> dict[str, Any]:
             group["last_seen"] = last_seen if group["last_seen"] is None else max(group["last_seen"], last_seen)
 
     promoted_concepts = 0
+    overconcentrated_concepts = 0
+    promoted_overconcentrated_concepts = 0
     first_concept_candidate_step: int | None = None
     first_promoted_concept_step: int | None = None
     strong_transfer_total = 0
@@ -573,6 +583,24 @@ def derive_concept_candidates(state_conn: sqlite3.Connection) -> dict[str, Any]:
         strong_transfer_success_count = int(group["strong_transfer_success_count"])
         strong_transfer_total += strong_transfer_success_count
         concept_strong_counts.append(strong_transfer_success_count)
+    for concept_signature in sorted(concept_groups):
+        group = concept_groups[concept_signature]
+        linked_role_count = len(group["roles"])
+        linked_carrier_count = len(group["carriers"])
+        linked_family_count = len(group["families"])
+        cross_context_count = len(group["contexts"])
+        cross_game_count = len(group["games"])
+        transfer_success_count = int(group["transfer_success_count"])
+        strong_transfer_success_count = int(group["strong_transfer_success_count"])
+        transfer_success_concentration = (
+            float(strong_transfer_success_count) / float(strong_transfer_total)
+            if strong_transfer_total > 0
+            else None
+        )
+        overconcentrated = bool(
+            transfer_success_concentration is not None
+            and transfer_success_concentration > 0.80
+        )
         compression_gain = float(linked_carrier_count / max(1, linked_role_count))
         explanatory_reach = float(linked_family_count + cross_context_count + (2 * cross_game_count) + strong_transfer_success_count)
         promotion_score = (
@@ -583,7 +611,8 @@ def derive_concept_candidates(state_conn: sqlite3.Connection) -> dict[str, Any]:
             + 0.10 * min(1.0, linked_family_count / 3.0)
         )
         is_promoted = int(
-            strong_transfer_success_count >= 2
+            not overconcentrated
+            and strong_transfer_success_count >= 2
             and linked_role_count >= 2
             and linked_carrier_count >= 2
             and linked_family_count >= 2
@@ -591,8 +620,12 @@ def derive_concept_candidates(state_conn: sqlite3.Connection) -> dict[str, Any]:
             and (cross_game_count >= 2 or cross_context_count >= 3)
             and promotion_score >= 0.55
         )
+        if overconcentrated:
+            overconcentrated_concepts += 1
         if is_promoted:
             promoted_concepts += 1
+            if overconcentrated:
+                promoted_overconcentrated_concepts += 1
         first_seen = group["first_seen"]
         last_seen = group["last_seen"]
         if first_seen is not None:
@@ -603,11 +636,12 @@ def derive_concept_candidates(state_conn: sqlite3.Connection) -> dict[str, Any]:
             """
             INSERT INTO concept_candidates (
                 concept_signature, concept_type, support_count, linked_role_count, linked_carrier_count,
-                linked_family_count, transfer_success_count, strong_transfer_success_count, cross_game_count,
-                cross_context_count, compression_gain, explanatory_reach, promotion_score,
-                first_seen_global_step, last_seen_global_step, is_promoted
+                   linked_family_count, transfer_success_count, strong_transfer_success_count, cross_game_count,
+                   cross_context_count, compression_gain, explanatory_reach, promotion_score,
+                   transfer_success_concentration, is_overconcentrated,
+                   first_seen_global_step, last_seen_global_step, is_promoted
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 concept_signature,
@@ -623,6 +657,8 @@ def derive_concept_candidates(state_conn: sqlite3.Connection) -> dict[str, Any]:
                 compression_gain,
                 explanatory_reach,
                 promotion_score,
+                transfer_success_concentration,
+                int(overconcentrated),
                 first_seen,
                 last_seen,
                 is_promoted,
@@ -644,6 +680,8 @@ def derive_concept_candidates(state_conn: sqlite3.Connection) -> dict[str, Any]:
         "concept_candidate_count": len(concept_groups),
         "promoted_concept_count": promoted_concepts,
         "concept_strong_transfer_success_count": strong_transfer_total,
+        "overconcentrated_concept_count": overconcentrated_concepts,
+        "promoted_overconcentrated_concept_count": promoted_overconcentrated_concepts,
         "concept_transfer_success_concentration": (
             max(concept_strong_counts) / strong_transfer_total
             if concept_strong_counts and strong_transfer_total > 0

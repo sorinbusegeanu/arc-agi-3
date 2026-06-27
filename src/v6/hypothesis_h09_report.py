@@ -43,6 +43,8 @@ def evaluate_h09_future_option_motifs(
         "emergent_future_option_motif_count": emergent_count,
         "motif_type_counts": dict(sorted(motif_type_counts.items())),
         "motif_type_source_counts": None,
+        "unknown_motif_source_count": None,
+        "unknown_motif_source_ratio": None,
         "cross_context_motif_count": cross_context_motif_count,
         "cross_game_motif_count": cross_game_motif_count,
         "mean_abs_option_delta": mean_abs_option_delta,
@@ -52,6 +54,10 @@ def evaluate_h09_future_option_motifs(
         "unknown_motif_ratio": None,
         "unknown_motif_event_count": None,
         "unknown_motif_event_ratio": None,
+        "live_delta_event_count": 0,
+        "structured_effect_event_count": 0,
+        "text_keyword_event_count": 0,
+        "future_option_edge_event_count": 0,
         "first_future_option_event_step": milestone_map.get("first_future_option_event_step"),
         "first_emergent_future_option_motif_step": milestone_map.get("first_emergent_future_option_motif_step"),
         "missing_evidence": [],
@@ -69,6 +75,12 @@ def evaluate_h09_future_option_motifs(
     result["unknown_motif_ratio"] = (unknown_motif_count / len(motifs)) if motifs else None
     result["unknown_motif_event_count"] = unknown_event_count
     result["unknown_motif_event_ratio"] = (unknown_event_count / len(events)) if events else None
+    result["unknown_motif_source_count"] = int(source_counts.get("unknown", 0))
+    result["unknown_motif_source_ratio"] = (result["unknown_motif_source_count"] / len(events)) if events else None
+    result["live_delta_event_count"] = int(source_counts.get("live_delta", 0))
+    result["structured_effect_event_count"] = int(source_counts.get("structured_effect", 0))
+    result["text_keyword_event_count"] = int(source_counts.get("text_keyword", 0))
+    result["future_option_edge_event_count"] = int(source_counts.get("future_option_edge", 0))
     non_unknown_types = [key for key, value in motif_type_counts.items() if key != "unknown" and value > 0]
     if not events:
         result["decision"] = "INCONCLUSIVE"
@@ -82,10 +94,14 @@ def evaluate_h09_future_option_motifs(
         and (cross_context_motif_count >= 1 or cross_game_motif_count >= 1)
         and (mean_abs_option_delta or 0.0) > 0.0
         and ((result.get("unknown_motif_ratio") or 0.0) <= 0.20)
+        and ((result.get("unknown_motif_event_ratio") or 0.0) <= 0.20)
+        and ((result.get("unknown_motif_source_ratio") or 0.0) <= 0.20)
     ):
         result["decision"] = "VALID"
     else:
         result["decision"] = "PARTIALLY_VALID"
+    if (result.get("unknown_motif_event_ratio") or 0.0) > 0.20:
+        result["missing_evidence"].append("Future-option event classification remains mostly unknown.")
     result["core_metrics"] = {
         key: result.get(key)
         for key in (

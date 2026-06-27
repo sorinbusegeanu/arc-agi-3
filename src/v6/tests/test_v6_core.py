@@ -2489,7 +2489,8 @@ def test_v6_system_run_step_writes_m0_memory_nodes_and_scores(tmp_path) -> None:
             str(row[0])
             for row in connection.execute("SELECT node_id FROM memory_nodes").fetchall()
         }
-        assert interaction_node_id(result.interaction_id) in node_ids
+        interaction_node = next(node for node in node_ids if node.startswith("M0:interaction:"))
+        assert interaction_node in node_ids
         assert action_node_id(result.action) in node_ids
         assert delta_node_id(result.delta_id) in node_ids
         observation_nodes = [
@@ -2505,7 +2506,7 @@ def test_v6_system_run_step_writes_m0_memory_nodes_and_scores(tmp_path) -> None:
             FROM memory_scores
             WHERE node_id = ?
             """,
-            (interaction_node_id(result.interaction_id),),
+            (interaction_node,),
         ).fetchone()
         assert score_row is not None
         assert score_row[0] is not None
@@ -2513,7 +2514,7 @@ def test_v6_system_run_step_writes_m0_memory_nodes_and_scores(tmp_path) -> None:
             str(row[0])
             for row in connection.execute(
                 "SELECT edge_type FROM memory_edges WHERE source_node_id = ?",
-                (interaction_node_id(result.interaction_id),),
+                (interaction_node,),
             ).fetchall()
         }
         assert {"takes_action", "produces_delta", "observed_after"}.issubset(edge_types)
@@ -2546,10 +2547,11 @@ def test_compact_memory_fold_and_restore_preserves_memory_substrate(tmp_path) ->
         ),
     )
     try:
-        interaction_node = restored.memory.get_node(interaction_node_id(result.interaction_id))
+        interaction_node_id_value = restored._interaction_memory_node_id(result.interaction_id)
+        interaction_node = restored.memory.get_node(interaction_node_id_value)
         assert interaction_node is not None
         assert interaction_node["memory_level"] == "M0"
-        edges = restored.memory.edges_from(interaction_node_id(result.interaction_id))
+        edges = restored.memory.edges_from(interaction_node_id_value)
         assert any(edge["edge_type"] == "takes_action" for edge in edges)
     finally:
         restored.close()
@@ -2684,7 +2686,7 @@ def test_phase2_actual_family_creates_m2_memory_node(tmp_path) -> None:
     result = system.run_step()
     family_node = system.memory.get_node(family_node_id(7))
     assert family_node is not None
-    edges = system.memory.edges_from(interaction_node_id(result.interaction_id), "supports")
+    edges = system.memory.edges_from(system._interaction_memory_node_id(result.interaction_id), "supports")
     assert any(edge["target_node_id"] == family_node_id(7) for edge in edges)
     system.close()
 
@@ -2734,7 +2736,7 @@ def test_phase2_prediction_contradiction_creates_violation_memory_node(tmp_path)
     system.clusterer.family_for_delta = lambda _delta_id: 2
     system.clusterer.families = {2: object()}
     result = system.run_step()
-    outgoing = system.memory.edges_from(interaction_node_id(result.interaction_id), "violates_prediction")
+    outgoing = system.memory.edges_from(system._interaction_memory_node_id(result.interaction_id), "violates_prediction")
     assert outgoing
     violation_node = system.memory.get_node(outgoing[0]["target_node_id"])
     assert violation_node is not None
@@ -2749,7 +2751,7 @@ def test_phase2_replay_candidate_updates_memory_scores_and_replay_edge(tmp_path)
         config=V6Config(database_path=str(db_path), context_length=2, random_seed=0),
     )
     system.run_step()
-    interaction_node = interaction_node_id(1)
+    interaction_node = system._interaction_memory_node_id(1)
     score_row = system.connection.execute(
         "SELECT replay_priority, retention_status FROM memory_scores WHERE node_id = ?",
         (interaction_node,),
@@ -2938,11 +2940,11 @@ def test_phase4_positive_future_option_delta_creates_expands_edge(tmp_path) -> N
     db_path = tmp_path / "future_expand.sqlite"
     system = V6System(env=ExpandingEnv(), config=V6Config(database_path=str(db_path), random_seed=0))
     result = system.run_step()
-    edges = system.memory.edges_from(interaction_node_id(result.interaction_id), "expands_future_options")
+    edges = system.memory.edges_from(system._interaction_memory_node_id(result.interaction_id), "expands_future_options")
     assert edges
     score = system.connection.execute(
         "SELECT future_option_delta FROM memory_scores WHERE node_id = ?",
-        (interaction_node_id(result.interaction_id),),
+        (system._interaction_memory_node_id(result.interaction_id),),
     ).fetchone()
     assert score is not None
     assert float(score[0]) > 0.0
@@ -2961,7 +2963,7 @@ def test_phase4_negative_future_option_delta_creates_restricts_edge(tmp_path) ->
     db_path = tmp_path / "future_restrict.sqlite"
     system = V6System(env=RestrictingEnv(), config=V6Config(database_path=str(db_path), random_seed=0))
     result = system.run_step()
-    edges = system.memory.edges_from(interaction_node_id(result.interaction_id), "restricts_future_options")
+    edges = system.memory.edges_from(system._interaction_memory_node_id(result.interaction_id), "restricts_future_options")
     assert edges
     system.close()
 
@@ -3018,7 +3020,7 @@ def test_phase4_compact_memory_preserves_future_option_nodes_and_edges(tmp_path)
         config=V6Config(database_path=":memory:", memory_input_dir=str(memory_dir), restore_compact_memory=True, random_seed=0),
     )
     try:
-        future_delta_edges = restored.memory.edges_from(interaction_node_id(result.interaction_id), "changes_future_options")
+        future_delta_edges = restored.memory.edges_from(restored._interaction_memory_node_id(result.interaction_id), "changes_future_options")
         assert future_delta_edges
     finally:
         restored.close()
@@ -3543,7 +3545,7 @@ def test_phase5_observation_canonical_key_is_hashed_and_future_option_links_matc
     source_node = system.memory.get_node(str(has_future[0]))
     assert source_node is not None
     assert source_node["node_type"] == "ObservationMemory"
-    interaction_edges = system.memory.edges_from(interaction_node_id(result.interaction_id), "changes_future_options")
+    interaction_edges = system.memory.edges_from(system._interaction_memory_node_id(result.interaction_id), "changes_future_options")
     assert interaction_edges
     system.close()
 
@@ -10735,3 +10737,278 @@ def _trace_event(*, step: int, action: int, context: tuple[str, ...], outcome: s
         outcome_polarity=outcome_polarity,
         delta_summary={},
     )
+
+
+def test_compact_fold_scopes_legacy_local_interaction_ids_across_raw_dbs(tmp_path: Path) -> None:
+    from v6.memory.compact_memory import CompactMemoryFoldConfig, ensure_memory_layout, fold_epoch_raw_into_compact_memory
+
+    raw_root = tmp_path / "epochs" / "epoch_0001" / "raw" / "sampling_v05c"
+    db1 = raw_root / "ga01" / "sampler_a" / "steps_500" / "seed_0.sqlite"
+    db2 = raw_root / "ga02" / "sampler_b" / "steps_500" / "seed_0.sqlite"
+    db1.parent.mkdir(parents=True, exist_ok=True)
+    db2.parent.mkdir(parents=True, exist_ok=True)
+    for db_path in (db1, db2):
+        with sqlite3.connect(db_path) as conn:
+            substrate = MemorySubstrate(conn)
+            substrate.upsert_node(MemoryNode(node_id="M0:interaction:1", memory_level="M0", node_type="InteractionMemory"))
+            substrate.upsert_score(MemoryScore(node_id="M0:interaction:1", replay_priority=0.7))
+            conn.commit()
+    memory_dir = tmp_path / "memory"
+    ensure_memory_layout(memory_dir)
+    fold_epoch_raw_into_compact_memory(
+        epoch_raw_dir=raw_root,
+        memory_dir=memory_dir,
+        fold_config=CompactMemoryFoldConfig(global_step_start=1, global_step_end=10),
+    )
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        nodes = [row[0] for row in conn.execute("SELECT node_id FROM memory_nodes WHERE node_type = 'InteractionMemory' ORDER BY node_id ASC").fetchall()]
+        scores = [row[0] for row in conn.execute("SELECT node_id FROM memory_scores WHERE node_id LIKE 'M0:interaction:%' ORDER BY node_id ASC").fetchall()]
+    assert len(nodes) == 2
+    assert len(scores) == 2
+    assert len(set(nodes)) == 2
+    assert all(":local:" in node for node in nodes)
+
+
+def test_h02b_generic_carriers_do_not_count_as_no_carriers() -> None:
+    from v6.hypothesis_h02_report import _evaluate_h02b_pre_carrier_timing
+
+    payload = _evaluate_h02b_pre_carrier_timing(
+        {
+            "emergent_carrier_count": 10,
+            "emergent_object_carrier_count": 0,
+            "emergent_context_action_fallback_count": 0,
+        },
+        [],
+    )
+    assert payload["decision"] == "PARTIALLY_VALID"
+    assert "Generic emergent carriers" in payload["note"]
+
+
+def test_h02b_zero_emergent_carriers_is_valid() -> None:
+    from v6.hypothesis_h02_report import _evaluate_h02b_pre_carrier_timing
+
+    payload = _evaluate_h02b_pre_carrier_timing(
+        {
+            "emergent_carrier_count": 0,
+            "emergent_object_carrier_count": 0,
+            "emergent_context_action_fallback_count": 0,
+        },
+        [],
+    )
+    assert payload["decision"] == "VALID"
+
+
+def test_h02b_object_carriers_without_temporal_rows_is_inconclusive() -> None:
+    from v6.hypothesis_h02_report import _evaluate_h02b_pre_carrier_timing
+
+    payload = _evaluate_h02b_pre_carrier_timing(
+        {
+            "emergent_carrier_count": 3,
+            "emergent_object_carrier_count": 2,
+            "emergent_context_action_fallback_count": 0,
+        },
+        [],
+    )
+    assert payload["decision"] == "INCONCLUSIVE"
+
+
+def test_h01_uses_compact_memory_record_count_when_raw_zero(tmp_path: Path) -> None:
+    from v6.hypothesis_h01_report import evaluate_h01_contingency_emergence
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "interaction_sampling_v05c_report.json").write_text(
+        json.dumps({"runs": [{"game": "g1", "sampler_name": "s1", "total_interactions": 10, "memory_record_count": 0}]}),
+        encoding="utf-8",
+    )
+    memory_dir = tmp_path / "memory"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute("INSERT INTO memory_nodes (node_id, memory_level, node_type, canonical_key, support_count, attrs_json) VALUES ('M0:interaction:g1', 'M0', 'InteractionMemory', 'g1', 1, '{}')")
+        conn.execute("INSERT INTO memory_nodes (node_id, memory_level, node_type, canonical_key, support_count, attrs_json) VALUES ('M0:interaction:g2', 'M0', 'InteractionMemory', 'g2', 1, '{}')")
+        conn.execute("INSERT INTO stable_contingencies (canonical_key, game, sampler, action, effect_signature, support_count) VALUES ('c1', 'g1', 's1', 1, 'f1', 20)")
+        conn.commit()
+    result = evaluate_h01_contingency_emergence(run_dir, tmp_path / "out_h01", memory_dir=memory_dir)
+    assert result["memory_record_count"] == 2
+
+
+def test_h02_uses_compact_replay_counter_when_raw_zero(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from v6.hypothesis_h02_report import evaluate_h02_prediction_violation_attention
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "interaction_sampling_v05c_report.json").write_text(
+        json.dumps({"runs": [{"game": "g1", "sampler_name": "s1", "memory_replay_candidate_count": 0, "high_priority_replay_count": 0}]}),
+        encoding="utf-8",
+    )
+    memory_dir = tmp_path / "memory"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "replay_queue.sqlite") as conn:
+        conn.execute(
+            "INSERT INTO replay_queue (replay_id, owner_type, owner_id, priority_score, reason, first_seen_global_step, last_seen_global_step, compact_payload_json) VALUES ('1', 'interaction', '1', 0.9, 'r', 1, 1, '{}')"
+        )
+        conn.commit()
+    monkeypatch.setattr(
+        "v6.hypothesis_h02_report._compute_prediction_violation_replay_lift_from_existing_db",
+        lambda *args, **kwargs: {"direct_replay_lift_available": False},
+    )
+    result = evaluate_h02_prediction_violation_attention(run_dir, tmp_path / "out_h02", memory_dir=memory_dir)
+    assert result["memory_replay_candidate_count"] == 1
+    assert result["acceptance_checks"]["replay_candidates_present"] is True
+    assert result["compact_counter_fallback_used"] is True
+
+
+def test_h09_unknown_event_ratio_blocks_valid(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute(
+            "INSERT INTO future_option_motifs (motif_signature, motif_type, support_count, linked_event_count, cross_context_count, cross_game_count, mean_option_delta, mean_abs_option_delta, motif_stability_score, is_emergent) VALUES ('m1', 'enable', 3, 3, 2, 1, 1.0, 1.0, 0.8, 1)"
+        )
+        for idx, source in enumerate(["unknown", "unknown", "unknown", "structured_effect"], start=1):
+            evidence = json.dumps({"motif_type_source": source})
+            conn.execute(
+                "INSERT INTO future_option_events (event_id, owner_type, owner_key, source_kind, motif_type, option_delta, option_delta_bucket, first_seen_global_step, last_seen_global_step, evidence_json) VALUES (?, 'interaction', ?, 'stable_contingency', ?, 1.0, 'positive', 1, 1, ?)",
+                (f"e{idx}", f"o{idx}", "unknown" if idx <= 3 else "enable", evidence),
+            )
+        conn.commit()
+    result = evaluate_h09_future_option_motifs(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h09", already_derived=True)
+    assert result["decision"] != "VALID"
+    assert result["unknown_motif_event_ratio"] > 0.20
+
+
+def test_h09_live_option_delta_is_used_exactly() -> None:
+    from v6.future_options import _build_future_option_event
+
+    row = _build_future_option_event(
+        owner_type="interaction",
+        owner_key="i1",
+        source_kind="stable_contingency",
+        game="g1",
+        sampler="s1",
+        context_key="ctx",
+        action_key="a1",
+        text_fragments=["irrelevant"],
+        support_count=50,
+        polarity="positive",
+        first_seen=1,
+        last_seen=1,
+        mean_prediction_error=0.0,
+        mean_replay_priority=0.0,
+        stability_score=0.0,
+        event_id_seed="seed",
+        evidence_json={},
+        live_option_delta=1.7,
+    )
+    assert row["option_delta"] == pytest.approx(1.7)
+    zero_row = _build_future_option_event(
+        owner_type="interaction",
+        owner_key="i2",
+        source_kind="stable_contingency",
+        game="g1",
+        sampler="s1",
+        context_key="ctx",
+        action_key="a1",
+        text_fragments=["irrelevant"],
+        support_count=50,
+        polarity="positive",
+        first_seen=1,
+        last_seen=1,
+        mean_prediction_error=0.0,
+        mean_replay_priority=0.0,
+        stability_score=0.0,
+        event_id_seed="seed2",
+        evidence_json={},
+        live_option_delta=0.0,
+    )
+    assert zero_row["option_delta"] == pytest.approx(0.0)
+    assert zero_row["motif_type"] == "stabilize"
+
+
+def test_h10_attention_saturation_is_partial(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        for idx in range(5):
+            conn.execute(
+                "INSERT INTO future_option_attention_links (event_id, motif_signature, owner_type, owner_key, option_delta_abs, replay_priority_score, memory_priority_score, contradiction_score, high_option_change, high_attention) VALUES (?, 'm', 'interaction', ?, 2.0, 0.9, 0.0, 0.0, 1, 1)",
+                (f"h{idx}", f"hi{idx}"),
+            )
+        for idx in range(5):
+            conn.execute(
+                "INSERT INTO future_option_attention_links (event_id, motif_signature, owner_type, owner_key, option_delta_abs, replay_priority_score, memory_priority_score, contradiction_score, high_option_change, high_attention) VALUES (?, 'm', 'interaction', ?, 0.1, 0.9, 0.0, 0.0, 0, 1)",
+                (f"l{idx}", f"lo{idx}"),
+            )
+        conn.commit()
+    result = evaluate_h10_future_option_attention(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h10", already_derived=True)
+    assert result["decision"] == "PARTIALLY_VALID"
+    assert result["attention_saturation"] is True
+
+
+def test_h03_missing_evidence_flags_are_exposed() -> None:
+    from v6.hypothesis_h03_report import _populate_h03_evidence_lists
+
+    result = {
+        "missing_evidence": [],
+        "discovered_contingency_count": 10,
+        "transformation_family_count": 5,
+        "family_max_member_count": 1,
+        "compression_ratio": 1.2,
+        "compression_gain": 0.1,
+        "pre_object_condition_satisfied": True,
+        "families_merged_across_shards": 0,
+        "family_prediction_lift_mean": None,
+        "max_rows_applied": True,
+        "singleton_family_ratio": 0.75,
+        "singleton_family_count": 10,
+        "singleton_families_by_action": {"unknown": 3},
+        "singleton_family_diagnostics": {"over_specific_context_count": 3},
+    }
+    _populate_h03_evidence_lists(result)
+    assert result["family_prediction_lift_available"] is False
+    assert result["h03_row_cap_applied"] is True
+    assert result["singleton_action_metadata_incomplete"] is True
+    assert result["singleton_context_overspecific"] is True
+    assert any("Family prediction lift is unavailable" in item for item in result["missing_evidence"])
+
+
+def test_suite_summary_exposes_individual_vs_gated_decisions() -> None:
+    from v6.hypothesis_suite_report import _apply_higher_order_dependency_gates, _format_text, _suite_gate_status
+
+    h05 = {"decision": "VALID"}
+    h06 = {"decision": "PARTIALLY_VALID"}
+    h07 = {"decision": "VALID", "missing_evidence": []}
+    h08 = {"decision": "VALID", "missing_evidence": []}
+    h09 = {"decision": "PARTIALLY_VALID"}
+    h10 = {"decision": "VALID", "missing_evidence": []}
+    h11 = {"decision": "VALID", "missing_evidence": []}
+    _, _, h07, h08, _, h10, h11, _ = _apply_higher_order_dependency_gates(h05, h06, h07, h08, h09, h10, h11)
+    assert h11["decision"] == "PARTIALLY_VALID"
+    assert h11["individual_decision_before_suite_gates"] == "VALID"
+    text = _format_text(
+        {
+            "source_run_dir": "run",
+            "H01 decision": "VALID",
+            "H02 decision": "VALID",
+            "H03 decision": "VALID",
+            "H04 decision": "VALID",
+            "H05 decision": "VALID",
+            "H06 decision": "PARTIALLY_VALID",
+            "H07 decision": "PARTIALLY_VALID",
+            "H08 decision": "PARTIALLY_VALID",
+            "H09 decision": "PARTIALLY_VALID",
+            "H10 decision": "PARTIALLY_VALID",
+            "H11 decision": "PARTIALLY_VALID",
+            "game_count": 1,
+            "sampler_count": 1,
+            "seed_count": 1,
+            "total_interactions": 1000,
+            "levels_successfully_completed_per_epoch": 0,
+            "games_solved_per_epoch": 0,
+            "solved_games": [],
+            "next_recommended_action": "x",
+            "H11 suite gating": _suite_gate_status(h11),
+        }
+    )
+    assert "H11 individual: VALID" in text
+    assert "H11 suite-gated: PARTIALLY_VALID" in text

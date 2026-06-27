@@ -27,13 +27,22 @@ def evaluate_h07_concept_emergence(
         return result
     with sqlite3.connect(current_state) as conn:
         conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("ALTER TABLE concept_candidates ADD COLUMN transfer_success_concentration REAL")
+        except sqlite3.DatabaseError:
+            pass
+        try:
+            conn.execute("ALTER TABLE concept_candidates ADD COLUMN is_overconcentrated INTEGER DEFAULT 0")
+        except sqlite3.DatabaseError:
+            pass
         transfer_attempt_count = int(conn.execute("SELECT COUNT(*) FROM role_transfer_attempts").fetchone()[0])
         successful_transfers = int(conn.execute("SELECT COUNT(*) FROM role_transfer_attempts WHERE COALESCE(reuse_success, 0) = 1").fetchone()[0])
         concept_rows = conn.execute(
             """
             SELECT concept_signature, compression_gain, promotion_score, transfer_success_count,
                    strong_transfer_success_count, linked_role_count, linked_carrier_count, linked_family_count,
-                   cross_context_count, cross_game_count, is_promoted
+                   cross_context_count, cross_game_count, is_promoted,
+                   transfer_success_concentration, is_overconcentrated
             FROM concept_candidates
             ORDER BY concept_signature ASC
             """
@@ -76,6 +85,11 @@ def evaluate_h07_concept_emergence(
         if strong_transfer_counts and sum(strong_transfer_counts) > 0
         else None
     )
+    overconcentrated_concept_count = sum(1 for row in concept_rows if int(row["is_overconcentrated"] or 0) == 1)
+    promoted_overconcentrated_concept_count = sum(
+        1 for row in concept_rows
+        if int(row["is_overconcentrated"] or 0) == 1 and int(row["is_promoted"] or 0) == 1
+    )
     transfer_success_rate = (
         float(concept_strong_transfer_success_count) / float(transfer_attempt_count)
         if transfer_attempt_count > 0
@@ -102,6 +116,8 @@ def evaluate_h07_concept_emergence(
         "max_source_role_count": max_source_role_count,
         "max_source_family_count": max_source_family_count,
         "concept_transfer_success_concentration": concept_transfer_success_concentration,
+        "overconcentrated_concept_count": overconcentrated_concept_count,
+        "promoted_overconcentrated_concept_count": promoted_overconcentrated_concept_count,
         "first_concept_candidate_step": milestone_map.get("first_concept_candidate_step"),
         "first_promoted_concept_step": milestone_map.get("first_promoted_concept_step"),
         "first_role_transfer_success_step": milestone_map.get("first_role_transfer_success_step"),
@@ -122,6 +138,7 @@ def evaluate_h07_concept_emergence(
         and max_source_family_count >= 2
         and (transfer_success_rate or 0.0) > 0.0
         and ((concept_transfer_success_concentration or 0.0) <= 0.80)
+        and promoted_overconcentrated_concept_count == 0
     ):
         decision = "VALID"
         missing = []

@@ -107,11 +107,28 @@ def evaluate_h01_contingency_emergence(run_dir: Path, output_dir: Path, *, memor
     )
     db_metrics = _extract_db_metrics(sqlite_paths) if sqlite_paths and needs_db_fallback else {}
     result.update(report_metrics)
-    if memory_dir is not None and not sqlite_paths:
+    if memory_dir is not None:
         compact_metrics = _extract_compact_memory_metrics(Path(memory_dir))
-        for key, value in compact_metrics.items():
-            if result.get(key) is None or result.get(key) == {}:
-                result[key] = value
+        for key in (
+            "memory_record_count",
+            "memory_replay_candidate_count",
+            "high_priority_replay_count",
+            "memory_mean_replay_priority",
+            "memory_max_replay_priority",
+            "context_contradiction_count",
+            "repeated_contradiction_count",
+            "prediction_error_positive_count",
+            "predicted_family_available_count",
+            "actual_family_available_count",
+            "wrong_prediction_count",
+            "confident_wrong_prediction_count",
+        ):
+            compact_value = compact_metrics.get(key)
+            if compact_value is None:
+                continue
+            current_value = result.get(key)
+            if current_value in (None, 0, 0.0):
+                result[key] = compact_value
         result["evidence_source"] = "mixed" if report is not None else "compact_memory"
 
     for key in (
@@ -246,12 +263,19 @@ def evaluate_h01_contingency_emergence(run_dir: Path, output_dir: Path, *, memor
 
 def _extract_compact_memory_metrics(memory_dir: Path) -> dict[str, Any]:
     current_state = memory_dir / "current_state.sqlite"
+    replay_queue = memory_dir / "replay_queue.sqlite"
     if not current_state.exists():
         return {}
     with sqlite3.connect(current_state) as connection:
         per_game = dict(connection.execute("SELECT COALESCE(game, 'unknown'), COUNT(*) FROM stable_contingencies GROUP BY COALESCE(game, 'unknown')").fetchall())
         per_sampler = dict(connection.execute("SELECT COALESCE(sampler, 'unknown'), COUNT(*) FROM stable_contingencies GROUP BY COALESCE(sampler, 'unknown')").fetchall())
         stable_count = int(connection.execute("SELECT COUNT(*) FROM stable_contingencies WHERE support_count >= 20").fetchone()[0])
+        memory_record_count = int(connection.execute("SELECT COUNT(*) FROM memory_nodes WHERE node_type = 'InteractionMemory'").fetchone()[0])
+        memory_score_record_count = int(connection.execute("SELECT COUNT(*) FROM memory_scores WHERE node_id LIKE 'M0:interaction:%'").fetchone()[0])
+        high_priority_replay_count = int(connection.execute("SELECT COUNT(*) FROM memory_scores WHERE node_id LIKE 'M0:interaction:%' AND COALESCE(replay_priority, 0.0) >= 0.50").fetchone()[0])
+        replay_priority_stats = connection.execute("SELECT AVG(replay_priority), MAX(replay_priority) FROM memory_scores WHERE node_id LIKE 'M0:interaction:%'").fetchone()
+        selected_for_replay_edge_count = int(connection.execute("SELECT COUNT(*) FROM memory_edges WHERE edge_type = 'selected_for_replay'").fetchone()[0])
+        contradiction_count = int(connection.execute("SELECT COUNT(*) FROM contradiction_clusters").fetchone()[0])
         summary_row = connection.execute(
             "SELECT value_json FROM memory_summary WHERE key = 'total_interactions_seen'"
         ).fetchone()
@@ -264,6 +288,10 @@ def _extract_compact_memory_metrics(memory_dir: Path) -> dict[str, Any]:
                     interaction_count = int(summary_row[0])
                 except Exception:
                     interaction_count = 0
+        replay_queue_count = None
+        if replay_queue.exists():
+            with sqlite3.connect(replay_queue) as replay_conn:
+                replay_queue_count = int(replay_conn.execute("SELECT COUNT(*) FROM replay_queue").fetchone()[0])
         return {
             "total_interaction_count": interaction_count if interaction_count > 0 else None,
             "stable_contingency_count": stable_count,
@@ -272,6 +300,19 @@ def _extract_compact_memory_metrics(memory_dir: Path) -> dict[str, Any]:
             "per_game_contingency_counts": {str(key): int(value) for key, value in per_game.items()},
             "per_sampler_contingency_counts": {str(key): int(value) for key, value in per_sampler.items()},
             "mean_prediction_accuracy": None,
+            "memory_record_count": memory_record_count or memory_score_record_count or None,
+            "memory_score_record_count": memory_score_record_count or None,
+            "memory_replay_candidate_count": replay_queue_count if replay_queue_count is not None else selected_for_replay_edge_count,
+            "high_priority_replay_count": high_priority_replay_count,
+            "memory_mean_replay_priority": None if replay_priority_stats is None else replay_priority_stats[0],
+            "memory_max_replay_priority": None if replay_priority_stats is None else replay_priority_stats[1],
+            "context_contradiction_count": contradiction_count,
+            "repeated_contradiction_count": contradiction_count,
+            "prediction_error_positive_count": contradiction_count if contradiction_count > 0 else None,
+            "predicted_family_available_count": memory_score_record_count or None,
+            "actual_family_available_count": memory_score_record_count or None,
+            "wrong_prediction_count": contradiction_count if contradiction_count > 0 else None,
+            "confident_wrong_prediction_count": contradiction_count if contradiction_count > 0 else None,
         }
 
 

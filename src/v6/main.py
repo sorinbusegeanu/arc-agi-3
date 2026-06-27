@@ -38,6 +38,7 @@ from v6.memory.substrate import (
     family_node_id,
     interaction_node_id,
     observation_node_id,
+    scoped_interaction_key,
     strategy_node_id,
     trajectory_node_id,
 )
@@ -163,6 +164,7 @@ class V6System:
         self._isf_counts: dict[str, int] = {}
         self._current_level_interaction_ids: list[int] = []
         self._last_memory_interaction_node_id: str | None = None
+        self._interaction_memory_node_ids: dict[int, str] = {}
         self.compact_memory_restore_summary: dict[str, Any] = {
             "stable_contingencies_restored": 0,
             "transformation_families_restored": 0,
@@ -701,7 +703,7 @@ class V6System:
         )
         self.memory.upsert_score(
             MemoryScore(
-                node_id=interaction_node_id(interaction.id),
+                node_id=self._interaction_memory_node_id(interaction.id),
                 isf_total=float(isf_score.total),
                 future_option_delta=None if future_option_delta is None else float(future_option_delta.delta_score),
                 replay_priority=0.0 if replay_candidate is None else float(replay_candidate.replay_priority),
@@ -1025,7 +1027,7 @@ class V6System:
         )
 
     def _apply_post_factum_future_option_score(self, interaction_id: int, future_option_delta: float) -> None:
-        node_id = interaction_node_id(interaction_id)
+        node_id = self._interaction_memory_node_id(interaction_id)
         row = self.connection.execute(
             "SELECT future_option_delta, replay_priority, retention_status FROM memory_scores WHERE node_id = ?",
             (node_id,),
@@ -1121,6 +1123,19 @@ class V6System:
             f"level_completed={int(bool(level_completed_event))}"
         )
 
+    def _interaction_memory_node_id(self, interaction_id: int) -> str:
+        return self._interaction_memory_node_ids.get(
+            int(interaction_id),
+            interaction_node_id(
+                scoped_interaction_key(
+                    interaction_id=interaction_id,
+                    global_step=int(self.config.global_step_offset) + int(interaction_id)
+                    if self.config.global_step_offset is not None
+                    else None,
+                )
+            ),
+        )
+
     def _observation_signature(self, observation: Any) -> str:
         encoded = json.dumps(observation.tolist(), separators=(",", ":"))
         return encoded
@@ -1134,7 +1149,12 @@ class V6System:
         context_signature: str | None = None,
         context_level: int | None = None,
     ) -> None:
-        interaction_node = interaction_node_id(interaction.id)
+        memory_key = scoped_interaction_key(
+            interaction_id=interaction.id,
+            global_step=interaction.global_step,
+        )
+        interaction_node = interaction_node_id(memory_key)
+        self._interaction_memory_node_ids[int(interaction.id)] = interaction_node
         before_signature = self._observation_signature(observation_before)
         after_signature = self._observation_signature(observation_after)
         before_hash = sha1(before_signature.encode("utf-8")).hexdigest()
@@ -1150,12 +1170,14 @@ class V6System:
                 node_id=interaction_node,
                 memory_level="M0",
                 node_type="InteractionMemory",
-                canonical_key=str(interaction.id),
+                canonical_key=memory_key,
                 attrs={
                     "interaction_id": int(interaction.id),
+                    "local_interaction_id": int(interaction.id),
                     "action": int(interaction.action),
                     "delta_id": int(interaction.delta_id),
                     "global_step": None if interaction.global_step is None else int(interaction.global_step),
+                    "memory_interaction_key": memory_key,
                     "context_signature": context_signature,
                     "context_level": None if context_level is None else int(context_level),
                 },
@@ -1270,7 +1292,7 @@ class V6System:
         )
         self.memory.upsert_edge(
             MemoryEdge(
-                interaction_node_id(interaction_id),
+                self._interaction_memory_node_id(interaction_id),
                 family_node,
                 "supports",
                 evidence={"interaction_id": int(interaction_id)},
@@ -1306,10 +1328,10 @@ class V6System:
             MemoryEdge(contingency_node, family_node, "predicts", evidence={"interaction_id": int(interaction_id)})
         )
         self.memory.upsert_edge(
-            MemoryEdge(interaction_node_id(interaction_id), contingency_node, "supports", evidence={"interaction_id": int(interaction_id)})
+            MemoryEdge(self._interaction_memory_node_id(interaction_id), contingency_node, "supports", evidence={"interaction_id": int(interaction_id)})
         )
         self.memory.upsert_edge(
-            MemoryEdge(contingency_node, interaction_node_id(interaction_id), "derived_from", evidence={"interaction_id": int(interaction_id)})
+            MemoryEdge(contingency_node, self._interaction_memory_node_id(interaction_id), "derived_from", evidence={"interaction_id": int(interaction_id)})
         )
 
     def _write_carrier_memory(
@@ -1345,7 +1367,7 @@ class V6System:
             step=int(interaction_id),
         )
         self.memory.upsert_edge(
-            MemoryEdge(carrier_node, interaction_node_id(interaction_id), "carried_by", evidence={"interaction_id": int(interaction_id)})
+            MemoryEdge(carrier_node, self._interaction_memory_node_id(interaction_id), "carried_by", evidence={"interaction_id": int(interaction_id)})
         )
         if actual_family_id is not None:
             self.memory.upsert_edge(
@@ -1392,7 +1414,7 @@ class V6System:
         )
         self.memory.upsert_edge(
             MemoryEdge(
-                interaction_node_id(interaction_id),
+                self._interaction_memory_node_id(interaction_id),
                 violation_node,
                 "violates_prediction",
                 evidence={"interaction_id": int(interaction_id)},
@@ -1447,7 +1469,7 @@ class V6System:
             step=int(interaction_id),
         )
         self.memory.upsert_edge(
-            MemoryEdge(trajectory_node, interaction_node_id(interaction_id), "contains", evidence={"interaction_id": int(interaction_id)})
+            MemoryEdge(trajectory_node, self._interaction_memory_node_id(interaction_id), "contains", evidence={"interaction_id": int(interaction_id)})
         )
         cost_node = self._cost_memory_node_id(interaction_id)
         self.memory.upsert_node(
@@ -1464,12 +1486,12 @@ class V6System:
             step=int(interaction_id),
         )
         self.memory.upsert_edge(
-            MemoryEdge(interaction_node_id(interaction_id), cost_node, "has_cost", evidence={"interaction_id": int(interaction_id)})
+            MemoryEdge(self._interaction_memory_node_id(interaction_id), cost_node, "has_cost", evidence={"interaction_id": int(interaction_id)})
         )
         if efficiency_event.repeated_state and efficiency_event.state_signature is not None:
             self.memory.upsert_edge(
                 MemoryEdge(
-                    interaction_node_id(interaction_id),
+                    self._interaction_memory_node_id(interaction_id),
                     self._state_memory_node_id(efficiency_event.state_signature),
                     "repeats_state",
                     evidence={"interaction_id": int(interaction_id)},
@@ -1480,7 +1502,7 @@ class V6System:
             if interaction is not None:
                 self.memory.upsert_edge(
                     MemoryEdge(
-                        interaction_node_id(interaction_id),
+                        self._interaction_memory_node_id(interaction_id),
                         delta_node_id(interaction.delta_id),
                         "no_effect",
                         evidence={"interaction_id": int(interaction_id)},
@@ -1543,7 +1565,7 @@ class V6System:
     ) -> None:
         self.memory.upsert_score(
             MemoryScore(
-                node_id=interaction_node_id(interaction_id),
+                node_id=self._interaction_memory_node_id(interaction_id),
                 isf_total=float(memory_record.isf_total),
                 replay_priority=0.0 if replay_candidate is None else float(replay_candidate.replay_priority),
                 retention_status=str(memory_record.status),
@@ -1568,7 +1590,7 @@ class V6System:
             )
             self.memory.upsert_edge(
                 MemoryEdge(
-                    interaction_node_id(interaction_id),
+                    self._interaction_memory_node_id(interaction_id),
                     replay_node,
                     "selected_for_replay",
                     evidence={"interaction_id": int(interaction_id)},
@@ -1585,7 +1607,8 @@ class V6System:
     ) -> None:
         before_node = f"M0:future_option_set:{before_option_set.option_set_id}"
         after_node = f"M0:future_option_set:{after_option_set.option_set_id}"
-        delta_node = f"M0:future_option_delta:{int(interaction_id)}"
+        scoped_key = self._interaction_memory_node_id(interaction_id).split("M0:interaction:", 1)[1]
+        delta_node = f"M0:future_option_delta:{scoped_key}"
         self.memory.upsert_node(
             MemoryNode(
                 node_id=before_node,
@@ -1623,7 +1646,7 @@ class V6System:
                 node_id=delta_node,
                 memory_level="M0",
                 node_type="FutureOptionDeltaMemory",
-                canonical_key=str(interaction_id),
+                canonical_key=scoped_key,
                 attrs={
                     "delta_score": float(option_delta.delta_score),
                     "added_options": list(option_delta.added_options),
@@ -1637,15 +1660,15 @@ class V6System:
         after_observation = observation_node_id(after_option_set.state_signature)
         self.memory.upsert_edge(MemoryEdge(before_observation, before_node, "has_future_options"))
         self.memory.upsert_edge(MemoryEdge(after_observation, after_node, "has_future_options"))
-        self.memory.upsert_edge(MemoryEdge(interaction_node_id(interaction_id), delta_node, "changes_future_options"))
+        self.memory.upsert_edge(MemoryEdge(self._interaction_memory_node_id(interaction_id), delta_node, "changes_future_options"))
         self.memory.upsert_edge(MemoryEdge(delta_node, before_node, "from_option_set"))
         self.memory.upsert_edge(MemoryEdge(delta_node, after_node, "to_option_set"))
         if float(option_delta.delta_score) > 0.0:
-            self.memory.upsert_edge(MemoryEdge(interaction_node_id(interaction_id), after_node, "expands_future_options"))
+            self.memory.upsert_edge(MemoryEdge(self._interaction_memory_node_id(interaction_id), after_node, "expands_future_options"))
         elif float(option_delta.delta_score) < 0.0:
-            self.memory.upsert_edge(MemoryEdge(interaction_node_id(interaction_id), after_node, "restricts_future_options"))
+            self.memory.upsert_edge(MemoryEdge(self._interaction_memory_node_id(interaction_id), after_node, "restricts_future_options"))
         else:
-            self.memory.upsert_edge(MemoryEdge(interaction_node_id(interaction_id), after_node, "preserves_future_options"))
+            self.memory.upsert_edge(MemoryEdge(self._interaction_memory_node_id(interaction_id), after_node, "preserves_future_options"))
 
     def _context_memory_node_id(self, context_signature: str) -> str:
         return f"M0:context:{sha1(str(context_signature).encode('utf-8')).hexdigest()[:20]}"
@@ -1654,10 +1677,12 @@ class V6System:
         return f"M1:violation:{sha1(str(contradiction_key).encode('utf-8')).hexdigest()[:20]}"
 
     def _replay_queue_memory_node_id(self, interaction_id: int) -> str:
-        return f"M0:replay:{int(interaction_id)}"
+        scoped_key = self._interaction_memory_node_id(interaction_id).split("M0:interaction:", 1)[1]
+        return f"M0:replay:{scoped_key}"
 
     def _cost_memory_node_id(self, interaction_id: int) -> str:
-        return f"M0:cost:{int(interaction_id)}"
+        scoped_key = self._interaction_memory_node_id(interaction_id).split("M0:interaction:", 1)[1]
+        return f"M0:cost:{scoped_key}"
 
     def _state_memory_node_id(self, state_signature: str) -> str:
         return f"M0:state:{sha1(str(state_signature).encode('utf-8')).hexdigest()[:20]}"

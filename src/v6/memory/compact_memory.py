@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from v6.memory.substrate import interaction_node_id, scoped_interaction_key
 
 
 DEFAULT_MAX_EXAMPLES_PER_CONTINGENCY = 4
@@ -1275,6 +1276,7 @@ def _fold_single_db(
                 )
         if "memory_nodes" in tables:
             for row in raw_conn.execute("SELECT * FROM memory_nodes ORDER BY node_id ASC").fetchall():
+                scoped_node_id = _scope_memory_node_id(str(row["node_id"]), db_path)
                 state_conn.execute(
                     """
                     INSERT INTO memory_nodes (
@@ -1298,12 +1300,23 @@ def _fold_single_db(
                         END,
                         attrs_json = excluded.attrs_json
                     """,
-                    tuple(row[column] for column in row.keys()),
+                    (
+                        scoped_node_id,
+                        row["memory_level"],
+                        row["node_type"],
+                        row["canonical_key"],
+                        row["support_count"],
+                        row["first_seen_step"],
+                        row["last_seen_step"],
+                        _json_dumps_or_none(_scope_payload_interaction_nodes(_json_loads_or_none(row["attrs_json"]), db_path)),
+                    ),
                 )
         if "memory_edges" in tables:
             for row in raw_conn.execute(
                 "SELECT source_node_id, target_node_id, edge_type, weight, support_count, evidence_json FROM memory_edges ORDER BY source_node_id ASC, target_node_id ASC, edge_type ASC"
             ).fetchall():
+                source_node_id = _scope_memory_node_id(str(row["source_node_id"]), db_path)
+                target_node_id = _scope_memory_node_id(str(row["target_node_id"]), db_path)
                 state_conn.execute(
                     """
                     INSERT INTO memory_edges (
@@ -1315,7 +1328,14 @@ def _fold_single_db(
                         support_count = memory_edges.support_count + excluded.support_count,
                         evidence_json = excluded.evidence_json
                     """,
-                    tuple(row[column] for column in row.keys()),
+                    (
+                        source_node_id,
+                        target_node_id,
+                        row["edge_type"],
+                        row["weight"],
+                        row["support_count"],
+                        _json_dumps_or_none(_scope_payload_interaction_nodes(_json_loads_or_none(row["evidence_json"]), db_path)),
+                    ),
                 )
         if "memory_evidence" in tables:
             for row in raw_conn.execute("SELECT * FROM memory_evidence ORDER BY evidence_id ASC").fetchall():
@@ -1326,10 +1346,17 @@ def _fold_single_db(
                     )
                     VALUES (?, ?, ?, ?, ?)
                     """,
-                    tuple(row[column] for column in row.keys()),
+                    (
+                        row["evidence_id"],
+                        _scope_memory_node_id(str(row["target_node_id"]), db_path),
+                        row["source_interaction_id"],
+                        row["evidence_type"],
+                        _json_dumps_or_none(_scope_payload_interaction_nodes(_json_loads_or_none(row["payload_json"]), db_path)),
+                    ),
                 )
         if "memory_scores" in tables:
             for row in raw_conn.execute("SELECT * FROM memory_scores ORDER BY node_id ASC").fetchall():
+                scoped_node_id = _scope_memory_node_id(str(row["node_id"]), db_path)
                 state_conn.execute(
                     """
                     INSERT INTO memory_scores (
@@ -1348,7 +1375,18 @@ def _fold_single_db(
                         retention_status = COALESCE(excluded.retention_status, memory_scores.retention_status),
                         updated_step = COALESCE(excluded.updated_step, memory_scores.updated_step)
                     """,
-                    tuple(row[column] for column in row.keys()),
+                    (
+                        scoped_node_id,
+                        row["isf_total"],
+                        row["prediction_lift"],
+                        row["transfer_score"],
+                        row["explanatory_reach"],
+                        row["compression_gain"],
+                        row["future_option_delta"],
+                        row["replay_priority"],
+                        row["retention_status"],
+                        row["updated_step"],
+                    ),
                 )
         if "memory_promotions" in tables:
             for row in raw_conn.execute("SELECT * FROM memory_promotions ORDER BY promotion_id ASC").fetchall():
@@ -1360,7 +1398,16 @@ def _fold_single_db(
                     )
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    tuple(row[column] for column in row.keys()),
+                    (
+                        row["promotion_id"],
+                        _scope_memory_node_id(str(row["source_node_id"]), db_path),
+                        _scope_memory_node_id(str(row["target_node_id"]), db_path),
+                        row["promotion_type"],
+                        row["evidence_count"],
+                        row["promotion_score"],
+                        row["status"],
+                        _json_dumps_or_none(_scope_payload_interaction_nodes(_json_loads_or_none(row["payload_json"]), db_path)),
+                    ),
                 )
         if "prediction_results" in tables:
             family_supports: dict[str, dict[str, Any]] = {}
@@ -2471,6 +2518,63 @@ def _seed_from_db_path(path: Path) -> int:
         return int(stem.split("_")[-1])
     except ValueError:
         return 0
+
+
+def _db_interaction_scope(db_path: Path) -> dict[str, Any]:
+    return {
+        "game": _path_segment(db_path, -4),
+        "sampler": _path_segment(db_path, -3),
+        "seed": _seed_from_db_path(db_path),
+    }
+
+
+def _scope_memory_node_id(node_id: str, db_path: Path) -> str:
+    for prefix in ("M0:interaction:", "M0:replay:", "M0:cost:", "M0:future_option_delta:"):
+        if not str(node_id).startswith(prefix):
+            continue
+        suffix = str(node_id).split(prefix, 1)[1]
+        if suffix.startswith("g") or suffix.startswith("local:"):
+            return str(node_id)
+        scope = _db_interaction_scope(db_path)
+        scoped_key = scoped_interaction_key(
+            interaction_id=suffix,
+            game=scope["game"],
+            sampler=scope["sampler"],
+            seed=scope["seed"],
+        )
+        if prefix == "M0:interaction:":
+            return interaction_node_id(scoped_key)
+        return f"{prefix}{scoped_key}"
+    return str(node_id)
+
+
+def _scope_payload_interaction_nodes(value: Any, db_path: Path) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _scope_payload_interaction_nodes(item, db_path) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_scope_payload_interaction_nodes(item, db_path) for item in value]
+    if isinstance(value, tuple):
+        return [_scope_payload_interaction_nodes(item, db_path) for item in value]
+    if isinstance(value, str) and value.startswith("M0:"):
+        return _scope_memory_node_id(value, db_path)
+    return value
+
+
+def _json_loads_or_none(value: Any) -> Any:
+    if value in (None, ""):
+        return None
+    try:
+        return json.loads(value)
+    except Exception:
+        return value
+
+
+def _json_dumps_or_none(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, sort_keys=True)
 
 
 def _ensure_current_state_schema(path: Path) -> None:

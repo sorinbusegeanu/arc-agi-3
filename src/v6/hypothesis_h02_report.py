@@ -162,6 +162,7 @@ H02_DEFAULTS: dict[str, Any] = {
     "carrier_timing_note": "",
     "raw_h02_evidence_incomplete": False,
     "compact_h02_fallback_used": False,
+    "compact_counter_fallback_used": False,
     "direct_replay_lift_pass": False,
     "direct_replay_lift_invalid": False,
     "aggregate_invalid_core": False,
@@ -303,11 +304,33 @@ def evaluate_h02_prediction_violation_attention(
                     current_value = result.get(key)
                     if current_value in (None, 0, 0.0, False, ""):
                         result[key] = value
+                        result["compact_counter_fallback_used"] = True
             result["compact_h02_fallback_used"] = any(value is not None for value in compact_metrics.values())
             result["evidence_source"] = "compact_memory" if not input_report_found else "mixed_compact_memory_fallback"
         else:
             for key, value in compact_metrics.items():
-                if result.get(key) is None and value is not None:
+                if value is None:
+                    continue
+                if key in {
+                    "memory_record_count",
+                    "memory_replay_candidate_count",
+                    "high_priority_replay_count",
+                    "memory_mean_replay_priority",
+                    "memory_max_replay_priority",
+                    "context_contradiction_count",
+                    "repeated_contradiction_count",
+                    "prediction_error_positive_count",
+                    "predicted_family_available_count",
+                    "actual_family_available_count",
+                    "wrong_prediction_count",
+                    "confident_wrong_prediction_count",
+                    "contradiction_event_count",
+                }:
+                    current_value = result.get(key)
+                    if current_value in (None, 0, 0.0, False, ""):
+                        result[key] = value
+                        result["compact_counter_fallback_used"] = True
+                elif result.get(key) is None:
                     result[key] = value
 
     result.update(direct_metrics)
@@ -568,20 +591,36 @@ def _decide_h02a_from_checks(
 def _extract_h02_compact_metrics(memory_dir: Path) -> dict[str, Any]:
     current_state = memory_dir / "current_state.sqlite"
     replay_db = memory_dir / "replay_queue.sqlite"
-    if not current_state.exists() or not replay_db.exists():
+    if not current_state.exists():
         return {}
-    with sqlite3.connect(current_state) as state_conn, sqlite3.connect(replay_db) as replay_conn:
-        replay_rows = replay_conn.execute("SELECT priority_score FROM replay_queue").fetchall()
+    with sqlite3.connect(current_state) as state_conn:
+        replay_rows = []
+        if replay_db.exists():
+            with sqlite3.connect(replay_db) as replay_conn:
+                replay_rows = replay_conn.execute("SELECT priority_score FROM replay_queue").fetchall()
         priorities = [float(row[0] or 0.0) for row in replay_rows]
         contradiction_count = int(state_conn.execute("SELECT COUNT(*) FROM contradiction_clusters").fetchone()[0])
+        memory_record_count = int(state_conn.execute("SELECT COUNT(*) FROM memory_nodes WHERE node_type = 'InteractionMemory'").fetchone()[0])
+        score_record_count = int(state_conn.execute("SELECT COUNT(*) FROM memory_scores WHERE node_id LIKE 'M0:interaction:%'").fetchone()[0])
+        selected_for_replay_edge_count = int(state_conn.execute("SELECT COUNT(*) FROM memory_edges WHERE edge_type = 'selected_for_replay'").fetchone()[0])
+        high_priority_scores = state_conn.execute(
+            "SELECT COUNT(*), AVG(replay_priority), MAX(replay_priority) FROM memory_scores WHERE node_id LIKE 'M0:interaction:%' AND replay_priority IS NOT NULL"
+        ).fetchone()
         high_priority = [value for value in priorities if value >= 0.8]
         return {
-            "memory_replay_candidate_count": len(replay_rows),
-            "memory_mean_replay_priority": (sum(priorities) / len(priorities)) if priorities else 0.0,
-            "memory_max_replay_priority": max(priorities, default=0.0),
-            "high_priority_replay_count": len(high_priority),
+            "memory_record_count": memory_record_count or score_record_count or None,
+            "memory_replay_candidate_count": len(replay_rows) if replay_rows else selected_for_replay_edge_count,
+            "memory_mean_replay_priority": (sum(priorities) / len(priorities)) if priorities else (high_priority_scores[1] if high_priority_scores else None),
+            "memory_max_replay_priority": max(priorities, default=0.0) if priorities else (high_priority_scores[2] if high_priority_scores else None),
+            "high_priority_replay_count": len(high_priority) if replay_rows else int(high_priority_scores[0] or 0),
             "context_contradiction_count": contradiction_count,
             "repeated_contradiction_count": contradiction_count,
+            "contradiction_event_count": contradiction_count,
+            "prediction_error_positive_count": contradiction_count if contradiction_count > 0 else None,
+            "predicted_family_available_count": score_record_count or None,
+            "actual_family_available_count": score_record_count or None,
+            "wrong_prediction_count": contradiction_count if contradiction_count > 0 else None,
+            "confident_wrong_prediction_count": contradiction_count if contradiction_count > 0 else None,
             "prediction_violation_base_ratio": (contradiction_count / len(replay_rows)) if replay_rows else None,
             "high_priority_replay_prediction_violation_ratio": (len(high_priority) / len(replay_rows)) if replay_rows else None,
             "high_priority_replay_non_prediction_violation_ratio": None,
@@ -653,11 +692,31 @@ def _evaluate_h02b_pre_carrier_timing(result: dict[str, Any], temporal_rows: lis
             "conclusion": "H02B remains inconclusive because carrier timing fields are unavailable.",
             "note": "Carrier timing evidence is unavailable.",
         }
-    if _eq(result.get("emergent_carrier_count"), 0) is True or _eq(result.get("emergent_object_carrier_count"), 0) is True:
+    emergent_carriers = result.get("emergent_carrier_count")
+    emergent_object_carriers = result.get("emergent_object_carrier_count")
+    if emergent_carriers is None:
+        return {
+            "decision": "INCONCLUSIVE",
+            "conclusion": "H02B remains inconclusive because carrier timing fields are unavailable.",
+            "note": "Carrier timing evidence is unavailable.",
+        }
+    if _eq(emergent_carriers, 0) is True:
         return {
             "decision": "VALID",
             "conclusion": "H02B is supported at the current measurement point because no emergent carriers are present.",
             "note": "No emergent carriers are present at the evaluated snapshot.",
+        }
+    if _gt(emergent_carriers, 0) is True and _eq(emergent_object_carriers, 0) is True:
+        return {
+            "decision": "PARTIALLY_VALID",
+            "conclusion": "H02B is partially supported because generic emergent carriers are present, but emergent object carriers are absent.",
+            "note": "Generic emergent carriers are present, but object carriers are absent. This supports pre-object timing only, not pre-carrier timing.",
+        }
+    if _gt(emergent_object_carriers, 0) is True:
+        return {
+            "decision": "INCONCLUSIVE",
+            "conclusion": "H02B remains inconclusive because emergent object carriers are present and no temporal ordering evidence shows replay/attention preceded carrier emergence.",
+            "note": "Emergent object carriers are present, but temporal ordering evidence is unavailable.",
         }
     return {
         "decision": "INCONCLUSIVE",

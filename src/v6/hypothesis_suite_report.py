@@ -263,6 +263,14 @@ def build_hypothesis_suite_summary(
         "H09 decision": h09.get("decision", "INCONCLUSIVE"),
         "H10 decision": h10.get("decision", "INCONCLUSIVE"),
         "H11 decision": h11.get("decision", "INCONCLUSIVE"),
+        "H04 suite gating": _suite_gate_status(h04),
+        "H05 suite gating": _suite_gate_status(h05),
+        "H06 suite gating": _suite_gate_status(h06),
+        "H07 suite gating": _suite_gate_status(h07),
+        "H08 suite gating": _suite_gate_status(h08),
+        "H09 suite gating": _suite_gate_status(h09),
+        "H10 suite gating": _suite_gate_status(h10),
+        "H11 suite gating": _suite_gate_status(h11),
         "H01 core metrics": {
             "stable_contingency_count": h01.get("stable_contingency_count"),
             "interaction_count": h01.get("total_interaction_count"),
@@ -340,6 +348,8 @@ def build_hypothesis_suite_summary(
             "max_source_role_count": h07.get("max_source_role_count"),
             "max_source_family_count": h07.get("max_source_family_count"),
             "concept_transfer_success_concentration": h07.get("concept_transfer_success_concentration"),
+            "overconcentrated_concept_count": h07.get("overconcentrated_concept_count"),
+            "promoted_overconcentrated_concept_count": h07.get("promoted_overconcentrated_concept_count"),
         },
         "H08 core metrics": {
             "world_model_component_count": h08.get("world_model_component_count"),
@@ -377,6 +387,12 @@ def build_hypothesis_suite_summary(
             "unknown_motif_ratio": h09.get("unknown_motif_ratio"),
             "unknown_motif_event_count": h09.get("unknown_motif_event_count"),
             "unknown_motif_event_ratio": h09.get("unknown_motif_event_ratio"),
+            "unknown_motif_source_count": h09.get("unknown_motif_source_count"),
+            "unknown_motif_source_ratio": h09.get("unknown_motif_source_ratio"),
+            "live_delta_event_count": h09.get("live_delta_event_count"),
+            "structured_effect_event_count": h09.get("structured_effect_event_count"),
+            "text_keyword_event_count": h09.get("text_keyword_event_count"),
+            "future_option_edge_event_count": h09.get("future_option_edge_event_count"),
         },
         "H10 core metrics": {
             "future_option_attention_link_count": h10.get("future_option_attention_link_count"),
@@ -396,6 +412,9 @@ def build_hypothesis_suite_summary(
             "replay_attention_count": h10.get("replay_attention_count"),
             "contradiction_attention_count": h10.get("contradiction_attention_count"),
             "replay_or_contradiction_attention_count": h10.get("replay_or_contradiction_attention_count"),
+            "attention_saturation": h10.get("attention_saturation"),
+            "replay_attention_saturation": h10.get("replay_attention_saturation"),
+            "contradiction_attention_saturation": h10.get("contradiction_attention_saturation"),
         },
         "H11 core metrics": {
             "future_option_transfer_link_count": h11.get("future_option_transfer_link_count"),
@@ -627,16 +646,23 @@ def _apply_epoch_maturity_gates(
     def _demote(payload: dict[str, Any]) -> dict[str, Any]:
         updated = dict(payload)
         if str(updated.get("decision")) == "VALID" and demote:
+            original = str(updated.get("decision"))
             updated["original_decision_before_epoch_maturity_gate"] = "VALID"
+            updated.setdefault("individual_decision_before_suite_gates", original)
             updated["epoch_maturity_demoted"] = True
             updated["epoch_maturity_threshold"] = maturity_threshold
             updated["epoch_interactions_used_for_gate"] = interactions_this_epoch if interactions_this_epoch is not None else total_interactions
             updated["decision"] = "PARTIALLY_VALID"
+            updated["suite_gated_decision"] = updated["decision"]
             missing = list(updated.get("missing_evidence", []))
+            gate_reasons = list(updated.get("suite_gate_reasons", []))
             for note in notes:
                 if note not in missing:
                     missing.append(note)
+                if note not in gate_reasons:
+                    gate_reasons.append(note)
             updated["missing_evidence"] = missing
+            updated["suite_gate_reasons"] = gate_reasons
         return updated
 
     return _demote(h04), _demote(h05), _demote(h06), _demote(h07), _demote(h08), _demote(h09), _demote(h10), _demote(h11), notes
@@ -656,13 +682,20 @@ def _apply_higher_order_dependency_gates(
     def _demote(payload: dict[str, Any], message: str) -> dict[str, Any]:
         updated = dict(payload)
         if str(updated.get("decision")) == "VALID":
+            original = str(updated.get("decision"))
             updated["original_decision_before_dependency_gate"] = "VALID"
+            updated.setdefault("individual_decision_before_suite_gates", original)
             updated["dependency_demoted"] = True
             updated["decision"] = "PARTIALLY_VALID"
+            updated["suite_gated_decision"] = updated["decision"]
             missing = list(updated.get("missing_evidence", []))
+            gate_reasons = list(updated.get("suite_gate_reasons", []))
             if message not in missing:
                 missing.append(message)
+            if message not in gate_reasons:
+                gate_reasons.append(message)
             updated["missing_evidence"] = missing
+            updated["suite_gate_reasons"] = gate_reasons
             notes.append(message)
         return updated
 
@@ -751,6 +784,19 @@ def _write_aggregated_hypothesis_text(output_dir: Path) -> None:
 
 
 def _format_text(summary: dict[str, Any]) -> str:
+    gate_lines: list[str] = []
+    for hypothesis_id in range(4, 12):
+        key = f"H{hypothesis_id:02d} suite gating"
+        payload = summary.get(key) or {}
+        if not payload or payload.get("individual_decision_before_suite_gates") in (None, payload.get("decision")):
+            continue
+        gate_lines.extend(
+            [
+                f"H{hypothesis_id:02d} individual: {payload.get('individual_decision_before_suite_gates')}",
+                f"H{hypothesis_id:02d} suite-gated: {payload.get('suite_gated_decision') or payload.get('decision')}",
+                f"H{hypothesis_id:02d} suite-gate reasons: {', '.join(payload.get('suite_gate_reasons') or [])}",
+            ]
+        )
     lines = [
         "Hypothesis Suite Summary",
         f"source_run_dir: {summary['source_run_dir']}",
@@ -771,12 +817,26 @@ def _format_text(summary: dict[str, Any]) -> str:
         f"- levels successfully completed: {summary.get('levels_successfully_completed_per_epoch', 0)}",
         f"- games solved: {summary.get('games_solved_per_epoch', 0)}",
         f"- solved games: {','.join(summary.get('solved_games', []) or [])}",
+        *gate_lines,
         f"next_recommended_action: {summary['next_recommended_action']}",
     ]
     return "\n".join(lines) + "\n"
 
 
 def _format_md(summary: dict[str, Any]) -> str:
+    gate_lines: list[str] = []
+    for hypothesis_id in range(4, 12):
+        key = f"H{hypothesis_id:02d} suite gating"
+        payload = summary.get(key) or {}
+        if not payload or payload.get("individual_decision_before_suite_gates") in (None, payload.get("decision")):
+            continue
+        gate_lines.extend(
+            [
+                f"- H{hypothesis_id:02d} individual: `{payload.get('individual_decision_before_suite_gates')}`",
+                f"- H{hypothesis_id:02d} suite-gated: `{payload.get('suite_gated_decision') or payload.get('decision')}`",
+                f"- H{hypothesis_id:02d} reasons: `{', '.join(payload.get('suite_gate_reasons') or [])}`",
+            ]
+        )
     lines = [
         "# Hypothesis Suite Summary",
         "",
@@ -796,6 +856,7 @@ def _format_md(summary: dict[str, Any]) -> str:
         f"- levels successfully completed: `{summary.get('levels_successfully_completed_per_epoch', 0)}`",
         f"- games solved: `{summary.get('games_solved_per_epoch', 0)}`",
         f"- solved games: `{', '.join(summary.get('solved_games', []) or [])}`",
+        *gate_lines,
         "",
         "## Next Action",
         "",
@@ -834,3 +895,14 @@ def _merge_unique(*groups: list[Any]) -> list[Any]:
             seen.add(key)
             output.append(item)
     return output
+
+
+def _suite_gate_status(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "decision": payload.get("decision"),
+        "individual_decision_before_suite_gates": payload.get("individual_decision_before_suite_gates"),
+        "suite_gated_decision": payload.get("suite_gated_decision", payload.get("decision")),
+        "suite_gate_reasons": list(payload.get("suite_gate_reasons", []) or []),
+        "epoch_maturity_demoted": bool(payload.get("epoch_maturity_demoted", False)),
+        "dependency_demoted": bool(payload.get("dependency_demoted", False)),
+    }
