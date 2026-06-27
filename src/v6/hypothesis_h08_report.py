@@ -33,7 +33,8 @@ def evaluate_h08_world_model_coherence(
             """
             SELECT component_signature, coherence_score, explanatory_coverage, cross_context_count, cross_game_count,
                    linked_concept_count, linked_role_count, linked_family_count, prediction_support_count,
-                   contradiction_coverage_count, is_coherent, candidate_only
+                   contradiction_coverage_count, predicted_outcome_count, predicted_outcome_count_is_proxy,
+                   is_coherent, candidate_only
             FROM world_model_components
             ORDER BY component_signature ASC
             """
@@ -68,7 +69,8 @@ def evaluate_h08_world_model_coherence(
     candidate_only_world_model_component_count = sum(1 for row in component_rows if int(row["candidate_only"] or 0) == 1)
     component_cross_context_count = max((int(row["cross_context_count"] or 0) for row in component_rows), default=0)
     component_cross_game_count = max((int(row["cross_game_count"] or 0) for row in component_rows), default=0)
-    predicted_outcome_count = max((int(row["prediction_support_count"] or 0) for row in component_rows), default=0)
+    predicted_outcome_count = max((int(row["predicted_outcome_count"] or 0) for row in component_rows), default=0)
+    predicted_outcome_count_is_proxy_count = sum(int(row["predicted_outcome_count_is_proxy"] or 0) for row in component_rows)
     supported_context_count = max((len(link_map.get(str(row["component_signature"]), {}).get("context", set())) for row in component_rows), default=0)
     concept_link_count = max((len(link_map.get(str(row["component_signature"]), {}).get("concept", set())) for row in component_rows), default=0)
     role_link_count = max((len(link_map.get(str(row["component_signature"]), {}).get("role", set())) for row in component_rows), default=0)
@@ -88,6 +90,7 @@ def evaluate_h08_world_model_coherence(
         "component_cross_context_count": component_cross_context_count,
         "component_cross_game_count": component_cross_game_count,
         "predicted_outcome_count": predicted_outcome_count,
+        "predicted_outcome_count_is_proxy_count": predicted_outcome_count_is_proxy_count,
         "supported_context_count": supported_context_count,
         "concept_link_count": concept_link_count,
         "role_link_count": role_link_count,
@@ -109,13 +112,15 @@ def evaluate_h08_world_model_coherence(
     elif (
         promoted_concept_count > 0
         and coherent_world_model_component_count >= 5
+        and world_model_component_count >= 5
         and (max_coherence_score or 0.0) >= 0.45
         and (max_explanatory_coverage or 0.0) > 0.0
-        and (coherent_cross_context_component_count >= 1 or coherent_cross_game_component_count >= 1)
-        and concept_link_count >= 2
+        and (component_cross_context_count >= 3 or component_cross_game_count >= 2)
+        and role_link_count >= 2
         and family_link_count >= 2
         and supported_context_count >= 2
         and predicted_outcome_count > 0
+        and (candidate_only_world_model_component_count == 0 or coherent_world_model_component_count >= candidate_only_world_model_component_count)
     ):
         decision = "VALID"
         missing = []

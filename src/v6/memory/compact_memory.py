@@ -2185,6 +2185,52 @@ def _build_memory_summary_from_connections(
     emergent_carrier_count = int(
         state_conn.execute("SELECT COUNT(*) FROM carrier_candidates WHERE COALESCE(is_emergent, 0) = 1").fetchone()[0]
     )
+    memory_record_count = _safe_scalar(
+        state_conn,
+        """
+        SELECT COUNT(*)
+        FROM memory_scores
+        WHERE node_id LIKE 'M0:interaction:%'
+          AND (
+            isf_total IS NOT NULL
+            OR retention_status IS NOT NULL
+            OR replay_priority IS NOT NULL
+          )
+        """,
+    )
+    if int(memory_record_count or 0) <= 0:
+        memory_record_count = _safe_scalar(
+            state_conn,
+            "SELECT COUNT(*) FROM memory_nodes WHERE node_type = 'InteractionMemory'",
+        )
+    memory_replay_candidate_count = _safe_scalar(
+        state_conn,
+        "SELECT COUNT(*) FROM memory_edges WHERE edge_type = 'selected_for_replay'",
+    )
+    high_replay_priority_count = _safe_scalar(
+        state_conn,
+        """
+        SELECT COUNT(*)
+        FROM memory_scores
+        WHERE node_id LIKE 'M0:interaction:%'
+          AND COALESCE(replay_priority, 0.0) >= 0.50
+        """,
+    )
+    retention_rows = _safe_rows(
+        state_conn,
+        """
+        SELECT retention_status, COUNT(*)
+        FROM memory_scores
+        WHERE node_id LIKE 'M0:interaction:%'
+          AND retention_status IS NOT NULL
+        GROUP BY retention_status
+        """,
+    )
+    retention_counts = {
+        str(row[0]): int(row[1] or 0)
+        for row in retention_rows
+        if row and row[0] not in (None, "")
+    }
     summary = {
         "stable_contingency_count": stable_count,
         "transformation_family_count": family_count,
@@ -2212,6 +2258,14 @@ def _build_memory_summary_from_connections(
         "memory_substrate_evidence_count": _count_rows(state_conn, "memory_evidence"),
         "memory_substrate_score_count": _count_rows(state_conn, "memory_scores"),
         "memory_substrate_promotion_count": _count_rows(state_conn, "memory_promotions"),
+        "memory_record_count": memory_record_count,
+        "memory_replay_candidate_count": memory_replay_candidate_count,
+        "high_replay_priority_count": high_replay_priority_count,
+        "memory_retention_status_counts": retention_counts,
+        "protected_memory_count": int(retention_counts.get("protected", 0)),
+        "active_memory_count": int(retention_counts.get("active", 0)),
+        "forgotten_memory_count": int(retention_counts.get("forgotten", 0)),
+        "compressed_memory_count": int(retention_counts.get("compressed", 0)),
         "replay_queue_size": _count_rows(replay_conn, "replay_queue"),
         "current_state_path": str(paths.current_state),
         "graph_path": str(paths.graph),
@@ -2241,10 +2295,24 @@ def _build_memory_summary_from_connections(
         "memory_substrate_evidence_count",
         "memory_substrate_score_count",
         "memory_substrate_promotion_count",
+        "memory_record_count",
+        "memory_replay_candidate_count",
+        "high_replay_priority_count",
+        "protected_memory_count",
+        "active_memory_count",
+        "forgotten_memory_count",
+        "compressed_memory_count",
         "replay_queue_size",
     ):
         summary[key] = int(summary[key] or 0)
     return summary
+
+
+def _safe_rows(connection: sqlite3.Connection, query: str) -> list[tuple[Any, ...]]:
+    try:
+        return list(connection.execute(query).fetchall())
+    except sqlite3.DatabaseError:
+        return []
 
 
 def _count_rows(connection: sqlite3.Connection, table: str) -> int:
@@ -2572,6 +2640,8 @@ def _ensure_current_state_schema(path: Path) -> None:
                 contradiction_coverage_count INTEGER,
                 coherence_score REAL,
                 candidate_only INTEGER,
+                predicted_outcome_count INTEGER,
+                predicted_outcome_count_is_proxy INTEGER,
                 first_seen_global_step INTEGER,
                 last_seen_global_step INTEGER,
                 is_coherent INTEGER
@@ -2724,6 +2794,8 @@ def _ensure_current_state_schema(path: Path) -> None:
         _ensure_column(connection, "role_transfer_attempts", "candidate_role_count", "INTEGER")
         _ensure_column(connection, "concept_candidates", "strong_transfer_success_count", "INTEGER")
         _ensure_column(connection, "world_model_components", "candidate_only", "INTEGER DEFAULT 0")
+        _ensure_column(connection, "world_model_components", "predicted_outcome_count", "INTEGER")
+        _ensure_column(connection, "world_model_components", "predicted_outcome_count_is_proxy", "INTEGER DEFAULT 0")
         _ensure_column(connection, "future_option_attention_links", "attention_signal_source", "TEXT")
         connection.commit()
 

@@ -57,6 +57,7 @@ from v6.evaluation.broad_game_validation import (
 from v6.evaluation.failure_diagnostics import (
     FailureDiagnosticsConfig,
     classify_failure_reasons,
+    compute_run_diagnostics,
     context_depth_sensitivity_summary,
     failure_reason_rows,
     family_diagnostic_summary,
@@ -138,6 +139,10 @@ from v6.evaluation.role_validation import (
 from v6.evaluation.validation_report import build_validation_report
 from v6.graph.graph_manager import GraphManager
 from v6.hypothesis_suite_report import _write_aggregated_hypothesis_text
+from v6.hypothesis_h07_report import evaluate_h07_concept_emergence
+from v6.hypothesis_h08_report import evaluate_h08_world_model_coherence
+from v6.hypothesis_h09_report import evaluate_h09_future_option_motifs
+from v6.hypothesis_h10_report import evaluate_h10_future_option_attention
 from v6.interaction_significance import compute_interaction_significance
 from v6.main import V6Config, V6System
 from v6.future_options import FutureOptionEstimator
@@ -697,6 +702,57 @@ def test_context_contradiction_tracker_ignores_low_confidence_wrong_prediction()
     )
 
     assert event is None
+    summary = tracker.summary()
+    assert summary["contradiction_suppressed_low_confidence_count"] == 1
+    assert summary["wrong_prediction_count"] == 1
+    assert summary["confident_wrong_prediction_count"] == 0
+
+
+def test_context_contradiction_tracker_tracks_missing_prediction_and_actual() -> None:
+    tracker = ContextContradictionTracker()
+
+    event_missing_prediction = tracker.record_prediction_result(
+        interaction_id="i1",
+        context_signature="ctx1",
+        action_signature="a1",
+        predicted_family_id=None,
+        actual_family_id="f2",
+        prediction_correct=False,
+        prediction_confidence=0.9,
+        context_depth=2,
+    )
+    event_missing_actual = tracker.record_prediction_result(
+        interaction_id="i2",
+        context_signature="ctx1",
+        action_signature="a1",
+        predicted_family_id="f1",
+        actual_family_id=None,
+        prediction_correct=False,
+        prediction_confidence=0.9,
+        context_depth=2,
+    )
+
+    assert event_missing_prediction is None
+    assert event_missing_actual is None
+    summary = tracker.summary()
+    assert summary["contradiction_suppressed_missing_prediction_count"] == 1
+    assert summary["contradiction_suppressed_missing_actual_count"] == 1
+
+
+def test_context_contradiction_tracker_tracks_correct_or_unknown_suppression() -> None:
+    tracker = ContextContradictionTracker()
+    event = tracker.record_prediction_result(
+        interaction_id="i1",
+        context_signature="ctx1",
+        action_signature="a1",
+        predicted_family_id="f1",
+        actual_family_id="f2",
+        prediction_correct=None,
+        prediction_confidence=0.9,
+        context_depth=2,
+    )
+    assert event is None
+    assert tracker.summary()["contradiction_suppressed_correct_or_unknown_count"] == 1
 
 
 def test_context_contradiction_tracker_repeated_contradictions_suggest_expansion() -> None:
@@ -2523,6 +2579,36 @@ def test_compact_memory_fold_and_restore_preserves_memory_substrate(tmp_path) ->
     finally:
         restored.close()
 
+
+def test_compact_memory_summary_exports_memory_record_and_replay_counts(tmp_path) -> None:
+    db_path = tmp_path / "live.sqlite"
+    memory_dir = tmp_path / "compact_memory"
+    system = V6System(
+        env=ToggleEnv(),
+        config=V6Config(
+            database_path=str(db_path),
+            context_length=2,
+            random_seed=0,
+        ),
+    )
+    system.run_step()
+    system.memory.upsert_score(
+        MemoryScore(
+            node_id=interaction_node_id(1),
+            replay_priority=0.8,
+            retention_status="protected",
+        ),
+        step=1,
+    )
+    system.memory.upsert_edge(MemoryEdge("replay:q1", interaction_node_id(1), "selected_for_replay"))
+    summary = fold_live_system_into_compact_memory(system, memory_dir)
+    system.close()
+
+    assert int(summary.get("memory_record_count") or 0) > 0
+    assert int(summary.get("memory_replay_candidate_count") or 0) > 0
+    assert int(summary.get("high_replay_priority_count") or 0) > 0
+    assert int(summary.get("protected_memory_count") or 0) > 0
+
 def test_v6_system_run_step_stores_efficiency_fields(tmp_path) -> None:
     db_path = tmp_path / "efficiency.sqlite"
     system = V6System(
@@ -3485,6 +3571,96 @@ def test_phase5_observation_canonical_key_is_hashed_and_future_option_links_matc
     interaction_edges = system.memory.edges_from(interaction_node_id(result.interaction_id), "changes_future_options")
     assert interaction_edges
     system.close()
+
+
+def test_h07_requires_at_least_five_promoted_concepts(tmp_path) -> None:
+    memory_dir = tmp_path / "memory_h07_small"
+    ensure_memory_layout(memory_dir)
+    conn = sqlite3.connect(memory_dir / "current_state.sqlite")
+    try:
+        for idx in range(2):
+            conn.execute(
+                """
+                INSERT INTO concept_candidates (
+                    concept_signature, concept_type, support_count, linked_role_count, linked_carrier_count,
+                    linked_family_count, transfer_success_count, strong_transfer_success_count, cross_game_count,
+                    cross_context_count, compression_gain, explanatory_reach, promotion_score,
+                    first_seen_global_step, last_seen_global_step, is_promoted
+                ) VALUES (?, 'x', 5, 2, 2, 2, 3, 3, 2, 3, 2.0, 4.0, 0.8, 1, 10, 1)
+                """,
+                (f"c{idx}",),
+            )
+        for idx in range(6):
+            conn.execute(
+                """
+                INSERT INTO role_transfer_attempts (
+                    attempt_id, role_signature, transfer_kind, source_scope_type, source_scope_key,
+                    target_scope_type, target_scope_key, target_carrier_signature, predicted_role_signature,
+                    observed_role_signature, similarity_score, transfer_score, reuse_success, failure_reason,
+                    first_seen_global_step, last_seen_global_step, best_margin, source_carrier_count, candidate_role_count
+                ) VALUES (?, ?, 'cross_game', 'not_game', 'g1', 'game', 'g2', ?, ?, ?, 0.9, 0.9, 1, 'success', 1, 10, 0.2, 2, 2)
+                """,
+                (f"a{idx}", f"r{idx%2}", f"car{idx}", f"r{idx%2}", f"r{idx%2}"),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    result = evaluate_h07_concept_emergence(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h07", already_derived=True)
+    assert result["promoted_concept_count"] == 2
+    assert result["decision"] == "PARTIALLY_VALID"
+
+
+def test_h08_requires_at_least_five_coherent_components(tmp_path) -> None:
+    memory_dir = tmp_path / "memory_h08_small"
+    ensure_memory_layout(memory_dir)
+    conn = sqlite3.connect(memory_dir / "current_state.sqlite")
+    try:
+        for idx in range(2):
+            conn.execute(
+                """
+                INSERT INTO world_model_components (
+                    component_signature, component_type, node_count, edge_count, linked_concept_count, linked_role_count,
+                    linked_family_count, linked_carrier_count, cross_context_count, cross_game_count,
+                    explanatory_coverage, prediction_support_count, contradiction_coverage_count, coherence_score,
+                    candidate_only, predicted_outcome_count, predicted_outcome_count_is_proxy,
+                    first_seen_global_step, last_seen_global_step, is_coherent
+                ) VALUES (?, 'promoted', 8, 20, 2, 2, 2, 2, 3, 2, 1.0, 3, 1, 0.7, 0, 3, 1, 1, 10, 1)
+                """,
+                (f"wm{idx}",),
+            )
+            for linked_type, linked_key in (("concept", f"c{idx}"), ("role", f"r{idx}"), ("family", f"f{idx}"), ("family", f"f{idx+10}"), ("context", f"ctx{idx}"), ("context", f"ctx{idx+10}")):
+                conn.execute(
+                    "INSERT INTO world_model_links (component_signature, linked_type, linked_key, support_count, first_seen_global_step, last_seen_global_step) VALUES (?, ?, ?, 1, 1, 10)",
+                    (f"wm{idx}", linked_type, linked_key),
+                )
+        conn.execute("INSERT INTO concept_candidates (concept_signature, concept_type, support_count, linked_role_count, linked_carrier_count, linked_family_count, transfer_success_count, strong_transfer_success_count, cross_game_count, cross_context_count, compression_gain, explanatory_reach, promotion_score, first_seen_global_step, last_seen_global_step, is_promoted) VALUES ('c0','x',1,2,2,2,2,2,2,3,2.0,4.0,0.8,1,10,1)")
+        conn.commit()
+    finally:
+        conn.close()
+    result = evaluate_h08_world_model_coherence(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h08", already_derived=True)
+    assert result["coherent_world_model_component_count"] == 2
+    assert result["decision"] == "PARTIALLY_VALID"
+
+
+def test_h09_and_h10_reports_include_live_future_option_diagnostics(tmp_path) -> None:
+    memory_dir = tmp_path / "memory_h09_h10"
+    ensure_memory_layout(memory_dir)
+    conn = sqlite3.connect(memory_dir / "current_state.sqlite")
+    try:
+        conn.execute("INSERT INTO memory_nodes (node_id, memory_level, node_type, canonical_key, support_count, attrs_json) VALUES ('M0:interaction:1', 'M0', 'InteractionMemory', 'i1', 1, '{}')")
+        conn.execute("INSERT INTO memory_scores (node_id, future_option_delta, replay_priority) VALUES ('M0:interaction:1', 2.0, 0.9)")
+        conn.execute("INSERT INTO memory_edges (source_node_id, target_node_id, edge_type, weight, support_count, evidence_json) VALUES ('M0:interaction:1', 'delta:1', 'expands_future_options', 1.0, 1, '{}')")
+        conn.execute("INSERT INTO memory_edges (source_node_id, target_node_id, edge_type, weight, support_count, evidence_json) VALUES ('M0:interaction:1', 'replay:1', 'selected_for_replay', 1.0, 1, '{}')")
+        conn.execute("INSERT INTO transformation_families (family_id, canonical_signature, effect_type, action_group, polarity, support_count, member_count, first_seen_global_step, last_seen_global_step, stability_score) VALUES (1, 'fam1', 'positive_change', 'move', 'positive', 5, 2, 1, 10, 0.9)")
+        conn.execute("INSERT INTO future_option_events (event_id, owner_type, owner_key, source_kind, motif_type, option_delta, option_delta_bucket, option_count_before, option_count_after, novelty_score, reversibility_score, branching_score, termination_score, contradiction_score, replay_priority_score, memory_priority_score, first_seen_global_step, last_seen_global_step, evidence_json) VALUES ('foe1', 'family', 'fam1', 'transformation_family', 'transform', 1.0, 'positive', 10.0, 11.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.9, 0.5, 1, 10, ?)", (json.dumps({"motif_type_source": "structured_effect"}),))
+        conn.execute("INSERT INTO future_option_motifs (motif_signature, motif_type, support_count, linked_event_count, linked_family_count, linked_carrier_count, linked_role_count, linked_concept_count, cross_context_count, cross_game_count, mean_option_delta, mean_abs_option_delta, mean_novelty_score, mean_reversibility_score, mean_branching_score, mean_termination_score, mean_replay_priority_score, first_seen_global_step, last_seen_global_step, motif_stability_score, is_emergent) VALUES ('m1','transform',3,3,1,0,0,0,2,2,1.0,1.0,0.5,0.0,0.0,0.0,0.9,1,10,0.7,1)")
+        conn.commit()
+    finally:
+        conn.close()
+    h09 = evaluate_h09_future_option_motifs(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h09", already_derived=False)
+    h10 = evaluate_h10_future_option_attention(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h10", already_derived=False)
+    assert "motif_type_source_counts" in h09
+    assert h10["high_option_change_source"] in {"live", "mixed"}
 
 def test_validation_report_classifies_k0_sufficient(tmp_path) -> None:
     db_path = tmp_path / "k0.sqlite"
@@ -8649,6 +8825,87 @@ def test_v05c_sampling_db_ready_accepts_fast_postprocessing_without_future_effec
         connection.commit()
 
     assert interaction_sampling._sampling_db_ready(db_path) is True
+
+
+def test_compute_run_diagnostics_accepts_fast_postprocessing_without_future_effects(tmp_path) -> None:
+    db_path = tmp_path / "seed_0.sqlite"
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE interactions (
+                id INTEGER PRIMARY KEY,
+                action INTEGER,
+                delta_id INTEGER
+            );
+            CREATE TABLE deltas (
+                id INTEGER PRIMARY KEY,
+                changed_cells INTEGER,
+                colors_added TEXT,
+                colors_removed TEXT,
+                dx REAL,
+                dy REAL,
+                changed_positions TEXT
+            );
+            CREATE TABLE transformation_families (
+                id INTEGER PRIMARY KEY,
+                centroid_vector TEXT,
+                support_count INTEGER
+            );
+            CREATE TABLE contingencies (
+                id INTEGER PRIMARY KEY,
+                context_level INTEGER,
+                context_signature TEXT,
+                action INTEGER,
+                transformation_family INTEGER,
+                support_count INTEGER,
+                confidence REAL
+            );
+            CREATE TABLE prediction_results (
+                interaction_id INTEGER PRIMARY KEY,
+                context_level INTEGER,
+                action INTEGER,
+                actual_family INTEGER,
+                prediction_error INTEGER,
+                episode_id INTEGER
+            );
+            CREATE TABLE sampling_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            """
+        )
+        connection.execute("INSERT INTO interactions (id, action, delta_id) VALUES (1, 2, 1)")
+        connection.execute(
+            "INSERT INTO deltas (id, changed_cells, colors_added, colors_removed, dx, dy, changed_positions) VALUES (1, 1, '[]', '[]', 0.0, 0.0, '[]')"
+        )
+        connection.execute(
+            "INSERT INTO transformation_families (id, centroid_vector, support_count) VALUES (7, '[1,0,0]', 3)"
+        )
+        connection.execute(
+            """
+            INSERT INTO contingencies (
+                id, context_level, context_signature, action, transformation_family, support_count, confidence
+            ) VALUES (1, 0, '[2]', 2, 7, 3, 0.9)
+            """
+        )
+        connection.execute(
+            "INSERT INTO prediction_results (interaction_id, context_level, action, actual_family, prediction_error, episode_id) VALUES (1, 0, 2, 7, 0, 0)"
+        )
+        connection.executemany(
+            "INSERT INTO sampling_metadata (key, value) VALUES (?, ?)",
+            [
+                ("fast_postprocessing_enabled", "true"),
+                ("future_effects_postprocessing_skipped", "true"),
+            ],
+        )
+        connection.commit()
+
+    result = compute_run_diagnostics(db_path, game="tt01", seed=0, steps=1, horizon=2)
+
+    assert result["run_status"] == "ok"
+    assert result["failure_reason"] == ""
+    assert result["future_effect_count"] == 0
+    assert result["non_preserve_count"] == 0
 
 
 def test_incremental_sidecar_fold_deletes_large_json_sidecars(tmp_path) -> None:

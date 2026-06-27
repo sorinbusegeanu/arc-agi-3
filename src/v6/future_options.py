@@ -124,7 +124,6 @@ def derive_future_option_events(
     graph_conn: sqlite3.Connection,
     max_events: int,
 ) -> dict[str, Any]:
-    del graph_conn
     inserted = 0
     first_event_step: int | None = None
 
@@ -175,6 +174,69 @@ def derive_future_option_events(
 
     carrier_links = _links_by_signature(state_conn, "carrier_links", "carrier_signature")
     role_links = _links_by_signature(state_conn, "role_links", "role_signature")
+    family_meta = {
+        str(row["canonical_signature"]): {
+            "effect_type": None if row["effect_type"] is None else str(row["effect_type"]),
+            "action_group": None if row["action_group"] is None else str(row["action_group"]),
+            "polarity": None if row["polarity"] is None else str(row["polarity"]),
+        }
+        for row in state_conn.execute(
+            """
+            SELECT canonical_signature, effect_type, action_group, polarity
+            FROM transformation_families
+            ORDER BY canonical_signature ASC
+            """
+        ).fetchall()
+    }
+    live_option_by_interaction = {
+        str(row["node_id"]): float(row["future_option_delta"])
+        for row in state_conn.execute(
+            """
+            SELECT node_id, future_option_delta
+            FROM memory_scores
+            WHERE node_id LIKE 'M0:interaction:%'
+              AND future_option_delta IS NOT NULL
+            ORDER BY node_id ASC
+            """
+        ).fetchall()
+    }
+    future_edge_by_interaction: dict[str, str] = {}
+    for row in state_conn.execute(
+        """
+        SELECT source_node_id, edge_type
+        FROM memory_edges
+        WHERE source_node_id LIKE 'M0:interaction:%'
+          AND edge_type IN (
+            'expands_future_options',
+            'restricts_future_options',
+            'preserves_future_options'
+          )
+        ORDER BY source_node_id ASC, edge_type ASC
+        """
+    ).fetchall():
+        future_edge_by_interaction.setdefault(str(row["source_node_id"]), str(row["edge_type"]))
+    interaction_ids_by_family: dict[str, set[str]] = defaultdict(set)
+    carrier_interaction_ids: dict[str, set[str]] = defaultdict(set)
+    carrier_family_ids: dict[str, set[str]] = defaultdict(set)
+    role_carrier_ids: dict[str, set[str]] = defaultdict(set)
+    for row in state_conn.execute(
+        """
+        SELECT source_node_id, target_node_id, edge_type
+        FROM memory_edges
+        ORDER BY source_node_id ASC, target_node_id ASC, edge_type ASC
+        """
+    ).fetchall():
+        source = str(row["source_node_id"])
+        target = str(row["target_node_id"])
+        edge_type = str(row["edge_type"])
+        if source.startswith("M0:interaction:") and edge_type == "supports" and target.startswith("M2:family:"):
+            interaction_ids_by_family[target.split("M2:family:", 1)[1]].add(source)
+        if source.startswith("M3:carrier:") and edge_type == "carried_by" and target.startswith("M0:interaction:"):
+            carrier_interaction_ids[source].add(target)
+        if source.startswith("M3:carrier:") and edge_type == "associated_with_family" and target.startswith("M2:family:"):
+            carrier_family_ids[source].add(target.split("M2:family:", 1)[1])
+        if source.startswith("M3:carrier:") and edge_type == "plays_role" and target.startswith("M3:role:"):
+            role_carrier_ids[target].add(source)
 
     for row in state_conn.execute(
         """
@@ -219,10 +281,11 @@ def derive_future_option_events(
         ORDER BY canonical_signature ASC
         """
     ).fetchall():
+        family_signature = str(row["canonical_signature"])
         add_event(
             _build_future_option_event(
                 owner_type="family",
-                owner_key=str(row["canonical_signature"]),
+                owner_key=family_signature,
                 source_kind="transformation_family",
                 game=None,
                 sampler=None,
@@ -247,6 +310,14 @@ def derive_future_option_events(
                 },
                 effect_type=None if row["effect_type"] is None else str(row["effect_type"]),
                 action_group=None if row["action_group"] is None else str(row["action_group"]),
+                live_option_delta=_mean_live_delta_for_interactions(
+                    interaction_ids_by_family.get(family_signature, set()),
+                    live_option_by_interaction,
+                ),
+                future_option_edge_type=_majority_edge_type_for_interactions(
+                    interaction_ids_by_family.get(family_signature, set()),
+                    future_edge_by_interaction,
+                ),
             )
         )
     for row in state_conn.execute(
@@ -260,6 +331,12 @@ def derive_future_option_events(
         links = carrier_links.get(str(row["carrier_signature"]), {})
         family_text = sorted(links.get("family", set()))
         contexts = sorted(links.get("context", set()))
+        carrier_node = f"M3:carrier:{sha1(str(row['carrier_signature']).encode('utf-8')).hexdigest()[:20]}"
+        carrier_family_meta = _majority_family_meta(
+            linked_families=family_text or sorted(carrier_family_ids.get(carrier_node, set())),
+            family_meta=family_meta,
+        )
+        carrier_interactions = carrier_interaction_ids.get(carrier_node, set())
         add_event(
             _build_future_option_event(
                 owner_type="carrier",
@@ -271,7 +348,7 @@ def derive_future_option_events(
                 action_key=None,
                 text_fragments=[row["carrier_source"], *family_text],
                 support_count=int(row["support_count"] or 0),
-                polarity=None,
+                polarity=carrier_family_meta.get("polarity"),
                 first_seen=row["first_seen_global_step"],
                 last_seen=row["last_seen_global_step"],
                 mean_prediction_error=0.0,
@@ -286,6 +363,10 @@ def derive_future_option_events(
                     "text_tokens_used": _tokenize_text_fragments([row["carrier_source"], *family_text]),
                     "heuristic_note": "future-option counts are heuristic unless true reachable-state columns are available",
                 },
+                effect_type=carrier_family_meta.get("effect_type"),
+                action_group=carrier_family_meta.get("action_group"),
+                live_option_delta=_mean_live_delta_for_interactions(carrier_interactions, live_option_by_interaction),
+                future_option_edge_type=_majority_edge_type_for_interactions(carrier_interactions, future_edge_by_interaction),
             )
         )
     for row in state_conn.execute(
@@ -299,6 +380,11 @@ def derive_future_option_events(
         families = sorted(links.get("family", set()))
         contexts = sorted(links.get("context", set()))
         games = sorted(links.get("game", set()))
+        role_node = f"M3:role:{sha1(str(row['role_signature']).encode('utf-8')).hexdigest()[:20]}"
+        role_family_meta = _majority_family_meta(linked_families=families, family_meta=family_meta)
+        role_interactions: set[str] = set()
+        for carrier_node in role_carrier_ids.get(role_node, set()):
+            role_interactions.update(carrier_interaction_ids.get(carrier_node, set()))
         add_event(
             _build_future_option_event(
                 owner_type="role",
@@ -310,7 +396,7 @@ def derive_future_option_events(
                 action_key=None,
                 text_fragments=[row["role_type"], *families],
                 support_count=int(row["support_count"] or 0),
-                polarity=None,
+                polarity=role_family_meta.get("polarity"),
                 first_seen=row["first_seen_global_step"],
                 last_seen=row["last_seen_global_step"],
                 mean_prediction_error=0.0,
@@ -326,6 +412,10 @@ def derive_future_option_events(
                     "text_tokens_used": _tokenize_text_fragments([row["role_type"], *families]),
                     "heuristic_note": "future-option counts are heuristic unless true reachable-state columns are available",
                 },
+                effect_type=role_family_meta.get("effect_type"),
+                action_group=role_family_meta.get("action_group"),
+                live_option_delta=_mean_live_delta_for_interactions(role_interactions, live_option_by_interaction),
+                future_option_edge_type=_majority_edge_type_for_interactions(role_interactions, future_edge_by_interaction),
             )
         )
     _write_future_milestone(state_conn, "first_future_option_event_step", first_event_step, None)
@@ -426,6 +516,9 @@ def derive_future_option_motifs(
     emergent_count = 0
     first_emergent_step: int | None = None
     motif_type_counts: Counter[str] = Counter()
+    motif_type_source_counts: Counter[str] = Counter()
+    unknown_motif_event_count = 0
+    total_future_option_event_count = len(rows)
     for motif_signature in selected:
         group = groups[motif_signature]
         events = group["events"]
@@ -443,6 +536,11 @@ def derive_future_option_motifs(
         mean_branching_score = _mean([row.get("branching_score") for row in events])
         mean_termination_score = _mean([row.get("termination_score") for row in events])
         mean_replay_priority_score = _mean([row.get("replay_priority_score") for row in events])
+        for row in events:
+            evidence = _load_jsonish(row.get("evidence_json"))
+            motif_type_source_counts[str(evidence.get("motif_type_source") or "unknown")] += 1
+            if str(row.get("motif_type") or "unknown") == "unknown":
+                unknown_motif_event_count += 1
         motif_stability_score = _clamp01(
             0.25 * min(1.0, linked_event_count / 5.0)
             + 0.20 * min(1.0, cross_context_count / 3.0)
@@ -511,10 +609,20 @@ def derive_future_option_motifs(
         for game in sorted(group["games"]):
             _insert_future_link(state_conn, motif_signature, "game", game, 1, group["first_seen"], group["last_seen"])
     _write_future_milestone(state_conn, "first_emergent_future_option_motif_step", first_emergent_step, None)
+    unknown_motif_count = int(motif_type_counts.get("unknown", 0))
     return {
         "future_option_motif_count": len(selected),
         "emergent_future_option_motif_count": emergent_count,
         "motif_type_counts": dict(sorted(motif_type_counts.items())),
+        "motif_type_source_counts": dict(sorted(motif_type_source_counts.items())),
+        "unknown_motif_count": unknown_motif_count,
+        "unknown_motif_ratio": (unknown_motif_count / len(selected)) if selected else None,
+        "unknown_motif_event_count": unknown_motif_event_count,
+        "unknown_motif_event_ratio": (
+            unknown_motif_event_count / total_future_option_event_count
+            if total_future_option_event_count > 0
+            else None
+        ),
         "first_emergent_future_option_motif_step": first_emergent_step,
     }
 
@@ -967,6 +1075,45 @@ def _context_key_from_canonical(canonical_key: str) -> str | None:
     if "|a" not in canonical_key:
         return None
     return canonical_key.split("|a", 1)[0] or None
+
+
+def _mean_live_delta_for_interactions(
+    interaction_ids: set[str],
+    live_option_by_interaction: dict[str, float],
+) -> float | None:
+    values = [float(live_option_by_interaction[interaction_id]) for interaction_id in sorted(interaction_ids) if interaction_id in live_option_by_interaction]
+    return _mean(values)
+
+
+def _majority_edge_type_for_interactions(
+    interaction_ids: set[str],
+    future_edge_by_interaction: dict[str, str],
+) -> str | None:
+    counts: Counter[str] = Counter(
+        str(future_edge_by_interaction[interaction_id])
+        for interaction_id in sorted(interaction_ids)
+        if interaction_id in future_edge_by_interaction
+    )
+    if not counts:
+        return None
+    return sorted(counts.items(), key=lambda item: (-int(item[1]), str(item[0])))[0][0]
+
+
+def _majority_family_meta(
+    *,
+    linked_families: list[str],
+    family_meta: dict[str, dict[str, str | None]],
+) -> dict[str, str | None]:
+    result: dict[str, str | None] = {"effect_type": None, "action_group": None, "polarity": None}
+    for field in ("effect_type", "action_group", "polarity"):
+        counts: Counter[str] = Counter()
+        for family_signature in linked_families:
+            value = family_meta.get(str(family_signature), {}).get(field)
+            if value not in (None, ""):
+                counts[str(value)] += 1
+        if counts:
+            result[field] = sorted(counts.items(), key=lambda item: (-int(item[1]), str(item[0])))[0][0]
+    return result
 
 
 def _detect_motif_type(

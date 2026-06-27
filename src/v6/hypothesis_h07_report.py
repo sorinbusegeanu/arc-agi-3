@@ -32,7 +32,7 @@ def evaluate_h07_concept_emergence(
         concept_rows = conn.execute(
             """
             SELECT concept_signature, compression_gain, promotion_score, transfer_success_count,
-                   strong_transfer_success_count, linked_role_count, linked_carrier_count,
+                   strong_transfer_success_count, linked_role_count, linked_carrier_count, linked_family_count,
                    cross_context_count, cross_game_count, is_promoted
             FROM concept_candidates
             ORDER BY concept_signature ASC
@@ -81,6 +81,8 @@ def evaluate_h07_concept_emergence(
         if transfer_attempt_count > 0
         else None
     )
+    max_source_role_count = max((int(row["linked_role_count"] or 0) for row in promoted_rows), default=0)
+    max_source_family_count = max((int(row["linked_family_count"] or 0) for row in promoted_rows), default=0)
     metrics = {
         "concept_candidate_count": concept_candidate_count,
         "promoted_concept_count": promoted_concept_count,
@@ -97,6 +99,8 @@ def evaluate_h07_concept_emergence(
         "concept_cross_context_count_max": concept_cross_context_count_max,
         "source_role_count_mean": source_role_count_mean,
         "source_carrier_count_mean": source_carrier_count_mean,
+        "max_source_role_count": max_source_role_count,
+        "max_source_family_count": max_source_family_count,
         "concept_transfer_success_concentration": concept_transfer_success_concentration,
         "first_concept_candidate_step": milestone_map.get("first_concept_candidate_step"),
         "first_promoted_concept_step": milestone_map.get("first_promoted_concept_step"),
@@ -114,7 +118,8 @@ def evaluate_h07_concept_emergence(
         and (max_compression_gain or 0.0) >= 1.50
         and (max_promotion_score or 0.0) >= 0.55
         and (concept_cross_context_count_max >= 3 or concept_cross_game_count_max >= 2)
-        and (source_role_count_mean or 0.0) >= 2.0
+        and max_source_role_count >= 2
+        and max_source_family_count >= 2
         and (transfer_success_rate or 0.0) > 0.0
         and ((concept_transfer_success_concentration or 0.0) <= 0.80)
     ):

@@ -42,15 +42,33 @@ def evaluate_h09_future_option_motifs(
         "future_option_motif_count": len(motifs),
         "emergent_future_option_motif_count": emergent_count,
         "motif_type_counts": dict(sorted(motif_type_counts.items())),
+        "motif_type_source_counts": None,
         "cross_context_motif_count": cross_context_motif_count,
         "cross_game_motif_count": cross_game_motif_count,
         "mean_abs_option_delta": mean_abs_option_delta,
         "max_abs_option_delta": max_abs_option_delta,
         "mean_motif_stability_score": mean_motif_stability_score,
+        "unknown_motif_count": None,
+        "unknown_motif_ratio": None,
+        "unknown_motif_event_count": None,
+        "unknown_motif_event_ratio": None,
         "first_future_option_event_step": milestone_map.get("first_future_option_event_step"),
         "first_emergent_future_option_motif_step": milestone_map.get("first_emergent_future_option_motif_step"),
         "missing_evidence": [],
     }
+    source_counts = Counter()
+    unknown_event_count = 0
+    for row in events:
+        evidence = json.loads(str(row.get("evidence_json") or "{}"))
+        source_counts[str(evidence.get("motif_type_source") or "unknown")] += 1
+        if str(row.get("motif_type") or "unknown") == "unknown":
+            unknown_event_count += 1
+    unknown_motif_count = int(motif_type_counts.get("unknown", 0))
+    result["motif_type_source_counts"] = dict(sorted(source_counts.items()))
+    result["unknown_motif_count"] = unknown_motif_count
+    result["unknown_motif_ratio"] = (unknown_motif_count / len(motifs)) if motifs else None
+    result["unknown_motif_event_count"] = unknown_event_count
+    result["unknown_motif_event_ratio"] = (unknown_event_count / len(events)) if events else None
     non_unknown_types = [key for key, value in motif_type_counts.items() if key != "unknown" and value > 0]
     if not events:
         result["decision"] = "INCONCLUSIVE"
@@ -63,6 +81,7 @@ def evaluate_h09_future_option_motifs(
         and len(non_unknown_types) >= 2
         and (cross_context_motif_count >= 1 or cross_game_motif_count >= 1)
         and (mean_abs_option_delta or 0.0) > 0.0
+        and ((result.get("unknown_motif_ratio") or 0.0) <= 0.20)
     ):
         result["decision"] = "VALID"
     else:
@@ -74,11 +93,16 @@ def evaluate_h09_future_option_motifs(
             "future_option_motif_count",
             "emergent_future_option_motif_count",
             "motif_type_counts",
+            "motif_type_source_counts",
             "cross_context_motif_count",
             "cross_game_motif_count",
             "mean_abs_option_delta",
             "max_abs_option_delta",
             "mean_motif_stability_score",
+            "unknown_motif_count",
+            "unknown_motif_ratio",
+            "unknown_motif_event_count",
+            "unknown_motif_event_ratio",
         )
     }
     _write(output_dir, result)
@@ -98,6 +122,8 @@ def _write(output_dir: Path, result: dict[str, Any]) -> None:
         f"future-option motifs: {result.get('future_option_motif_count')}\n"
         f"emergent motifs: {result.get('emergent_future_option_motif_count')}\n"
         f"motif types: {result.get('motif_type_counts')}\n"
+        f"motif type sources: {result.get('motif_type_source_counts')}\n"
+        f"unknown motif ratio: {result.get('unknown_motif_ratio')}\n"
     )
     (output_dir / "h09_future_option_motifs_report.txt").write_text(text, encoding="utf-8")
     (output_dir / "h09_future_option_motifs.md").write_text("```\n" + text + "```\n", encoding="utf-8")

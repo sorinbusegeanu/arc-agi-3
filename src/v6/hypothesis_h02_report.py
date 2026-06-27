@@ -1852,6 +1852,8 @@ def _populate_evidence_lists(result: dict[str, Any]) -> None:
 
     if _gt(result.get("memory_replay_candidate_count"), 0) is True:
         evidence_for.append(f"Replay/attention evidence: replay candidates exist in memory ({int(result['memory_replay_candidate_count'])} candidates).")
+    elif _gt(result.get("high_priority_replay_count"), 0) is True or _gt(result.get("memory_max_replay_priority"), 0.0) is True:
+        missing_evidence.append("Replay priority is present, but replay candidate counts were not exported consistently.")
     elif result.get("direct_replay_lift_pass") is True:
         missing_evidence.append("Aggregate replay/contradiction counters are unavailable or zero despite direct replay-lift evidence.")
     else:

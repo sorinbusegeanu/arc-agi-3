@@ -285,12 +285,35 @@ def _summarize_diagnostics(
 
 def compute_run_diagnostics(db_path: Path, *, game: str, seed: int, steps: int, horizon: int) -> dict:
     with sqlite3.connect(db_path) as connection:
+        tables = {
+            str(row[0])
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
         interactions = connection.execute("SELECT id, action, delta_id FROM interactions").fetchall()
         deltas = connection.execute("SELECT changed_cells, colors_added, colors_removed, dx, dy, changed_positions FROM deltas").fetchall()
         families = connection.execute("SELECT id, centroid_vector, support_count FROM transformation_families").fetchall()
         contingencies = connection.execute("SELECT id, context_level, context_signature, action, transformation_family, support_count, confidence FROM contingencies").fetchall()
         predictions = connection.execute("SELECT context_level, action, actual_family, prediction_error, episode_id FROM prediction_results").fetchall()
-        effects = connection.execute("SELECT future_effect_class FROM future_effects").fetchall()
+        metadata_rows = []
+        if "sampling_metadata" in tables:
+            metadata_rows = connection.execute(
+                "SELECT key, value FROM sampling_metadata WHERE key IN ('future_effects_postprocessing_skipped', 'fast_postprocessing_enabled')"
+            ).fetchall()
+        metadata: dict[str, object] = {}
+        for key, value in metadata_rows:
+            try:
+                metadata[str(key)] = json.loads(value)
+            except (TypeError, json.JSONDecodeError):
+                metadata[str(key)] = value
+        future_effects_skipped = bool(
+            metadata.get("future_effects_postprocessing_skipped", False)
+            or metadata.get("fast_postprocessing_enabled", False)
+        )
+        effects = []
+        if "future_effects" in tables:
+            effects = connection.execute("SELECT future_effect_class FROM future_effects").fetchall()
+        elif not future_effects_skipped:
+            raise sqlite3.OperationalError("no such table: future_effects")
 
     changed = [int(row[0]) for row in deltas]
     family_supports = [int(row[2]) for row in families]

@@ -561,6 +561,7 @@ def derive_concept_candidates(state_conn: sqlite3.Connection) -> dict[str, Any]:
     first_concept_candidate_step: int | None = None
     first_promoted_concept_step: int | None = None
     strong_transfer_total = 0
+    concept_strong_counts: list[int] = []
     for concept_signature in sorted(concept_groups):
         group = concept_groups[concept_signature]
         linked_role_count = len(group["roles"])
@@ -571,6 +572,7 @@ def derive_concept_candidates(state_conn: sqlite3.Connection) -> dict[str, Any]:
         transfer_success_count = int(group["transfer_success_count"])
         strong_transfer_success_count = int(group["strong_transfer_success_count"])
         strong_transfer_total += strong_transfer_success_count
+        concept_strong_counts.append(strong_transfer_success_count)
         compression_gain = float(linked_carrier_count / max(1, linked_role_count))
         explanatory_reach = float(linked_family_count + cross_context_count + (2 * cross_game_count) + strong_transfer_success_count)
         promotion_score = (
@@ -582,8 +584,11 @@ def derive_concept_candidates(state_conn: sqlite3.Connection) -> dict[str, Any]:
         )
         is_promoted = int(
             strong_transfer_success_count >= 2
+            and linked_role_count >= 2
+            and linked_carrier_count >= 2
+            and linked_family_count >= 2
             and compression_gain >= 1.50
-            and (cross_context_count >= 2 or cross_game_count >= 1)
+            and (cross_game_count >= 2 or cross_context_count >= 3)
             and promotion_score >= 0.55
         )
         if is_promoted:
@@ -639,6 +644,11 @@ def derive_concept_candidates(state_conn: sqlite3.Connection) -> dict[str, Any]:
         "concept_candidate_count": len(concept_groups),
         "promoted_concept_count": promoted_concepts,
         "concept_strong_transfer_success_count": strong_transfer_total,
+        "concept_transfer_success_concentration": (
+            max(concept_strong_counts) / strong_transfer_total
+            if concept_strong_counts and strong_transfer_total > 0
+            else None
+        ),
     }
 
 
@@ -739,12 +749,16 @@ def derive_world_model_components(state_conn: sqlite3.Connection, graph_conn: sq
         )
         is_promoted = int(row.get("is_promoted", 0) or 0) == 1
         candidate_only = 0 if is_promoted else 1
+        predicted_outcome_count = prediction_support_count
+        predicted_outcome_count_is_proxy = 1
         is_coherent = int(
             is_promoted
-            and linked_role_count >= 1
+            and linked_role_count >= 2
             and linked_family_count >= 2
             and linked_carrier_count >= 2
-            and coherence_score >= 0.45
+            and (cross_context_count >= 3 or cross_game_count >= 2)
+            and prediction_support_count > 0
+            and coherence_score >= 0.55
         )
         if candidate_only:
             candidate_only_count += 1
@@ -764,9 +778,10 @@ def derive_world_model_components(state_conn: sqlite3.Connection, graph_conn: sq
                 component_signature, component_type, node_count, edge_count, linked_concept_count,
                 linked_role_count, linked_family_count, linked_carrier_count, cross_context_count,
                 cross_game_count, explanatory_coverage, prediction_support_count, contradiction_coverage_count,
-                coherence_score, candidate_only, first_seen_global_step, last_seen_global_step, is_coherent
+                coherence_score, candidate_only, predicted_outcome_count, predicted_outcome_count_is_proxy,
+                first_seen_global_step, last_seen_global_step, is_coherent
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 component_signature,
@@ -784,6 +799,8 @@ def derive_world_model_components(state_conn: sqlite3.Connection, graph_conn: sq
                 contradiction_coverage_count,
                 coherence_score,
                 candidate_only,
+                predicted_outcome_count,
+                predicted_outcome_count_is_proxy,
                 first_seen,
                 last_seen,
                 is_coherent,
