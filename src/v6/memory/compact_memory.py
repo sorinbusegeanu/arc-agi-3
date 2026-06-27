@@ -590,14 +590,20 @@ def fold_live_system_into_compact_memory(system: Any, memory_dir: str | Path) ->
                 INSERT INTO stable_contingencies (
                     contingency_id, canonical_key, game, sampler, context_level, action, effect_signature, support_count,
                     first_seen_global_step, last_seen_global_step, stability_score, mean_prediction_error,
-                    mean_replay_priority, representative_example_count
+                    mean_replay_priority, representative_example_count, prediction_attempt_count,
+                    prediction_success_count, prediction_accuracy, prediction_error_before,
+                    prediction_error_after, normalized_contingency_key
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(canonical_key) DO UPDATE SET
                     support_count = MAX(stable_contingencies.support_count, excluded.support_count),
                     context_level = MAX(stable_contingencies.context_level, excluded.context_level),
                     last_seen_global_step = MAX(stable_contingencies.last_seen_global_step, excluded.last_seen_global_step),
-                    stability_score = MAX(stable_contingencies.stability_score, excluded.stability_score)
+                    stability_score = MAX(stable_contingencies.stability_score, excluded.stability_score),
+                    prediction_attempt_count = MAX(COALESCE(stable_contingencies.prediction_attempt_count, 0), COALESCE(excluded.prediction_attempt_count, 0)),
+                    prediction_success_count = MAX(COALESCE(stable_contingencies.prediction_success_count, 0), COALESCE(excluded.prediction_success_count, 0)),
+                    prediction_accuracy = MAX(COALESCE(stable_contingencies.prediction_accuracy, 0.0), COALESCE(excluded.prediction_accuracy, 0.0)),
+                    normalized_contingency_key = COALESCE(stable_contingencies.normalized_contingency_key, excluded.normalized_contingency_key)
                 """,
                 (
                     int(contingency.id),
@@ -614,6 +620,16 @@ def fold_live_system_into_compact_memory(system: Any, memory_dir: str | Path) ->
                     0.0,
                     0.0,
                     0,
+                    0,
+                    0,
+                    None,
+                    None,
+                    None,
+                    normalized_contingency_identity(
+                        context_level=int(contingency.context_level),
+                        action=int(contingency.action),
+                        effect_signature=canonical_signature,
+                    ),
                 ),
             )
             state_conn.execute(
@@ -898,6 +914,32 @@ def canonicalize_context_action_effect(context_signature: str, action: int | str
     return f"{normalized_context}|a{action}|e{effect_signature}"
 
 
+def normalized_contingency_identity(*, context_level: int | None, action: int | str | None, effect_signature: str | None) -> str:
+    effect_text = str(effect_signature or "unknown").lower()
+    if effect_text.startswith("effect_signature:"):
+        effect_bucket = "effect_signature"
+    elif effect_text.startswith("delta_signature:"):
+        effect_bucket = "delta_signature"
+    elif effect_text.startswith("changed_cells_signature:"):
+        effect_bucket = "changed_cells_signature"
+    elif effect_text.startswith("outcome_signature:"):
+        effect_bucket = "outcome_signature"
+    elif effect_text.startswith("centroid:"):
+        effect_bucket = "centroid"
+    elif effect_text.startswith("local_family:"):
+        effect_bucket = "local_family"
+    else:
+        effect_bucket = "unknown"
+    context_bucket = f"ctx{max(0, min(int(context_level or 0), 3))}"
+    action_bucket = f"a{action}" if action is not None else "aunknown"
+    payload = {
+        "action_bucket": action_bucket,
+        "effect_bucket": effect_bucket,
+        "context_bucket": context_bucket,
+    }
+    return "ncont:" + sha1(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:20]
+
+
 def canonical_family_signature_from_family(family: Any) -> str:
     centroid = getattr(family, "centroid_vector", None)
     if centroid is not None:
@@ -959,16 +1001,22 @@ def _merge_state_tables(temp_state: sqlite3.Connection, state_conn: sqlite3.Conn
             INSERT INTO stable_contingencies (
                 contingency_id, canonical_key, game, sampler, context_level, action, effect_signature, support_count,
                 first_seen_global_step, last_seen_global_step, stability_score, mean_prediction_error,
-                mean_replay_priority, representative_example_count
+                mean_replay_priority, representative_example_count, prediction_attempt_count,
+                prediction_success_count, prediction_accuracy, prediction_error_before,
+                prediction_error_after, normalized_contingency_key
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(canonical_key) DO UPDATE SET
                 support_count = MAX(stable_contingencies.support_count, excluded.support_count),
                 context_level = MAX(stable_contingencies.context_level, excluded.context_level),
                 first_seen_global_step = MIN(stable_contingencies.first_seen_global_step, excluded.first_seen_global_step),
                 last_seen_global_step = MAX(stable_contingencies.last_seen_global_step, excluded.last_seen_global_step),
                 stability_score = MAX(stable_contingencies.stability_score, excluded.stability_score),
-                representative_example_count = MAX(stable_contingencies.representative_example_count, excluded.representative_example_count)
+                representative_example_count = MAX(stable_contingencies.representative_example_count, excluded.representative_example_count),
+                prediction_attempt_count = MAX(COALESCE(stable_contingencies.prediction_attempt_count, 0), COALESCE(excluded.prediction_attempt_count, 0)),
+                prediction_success_count = MAX(COALESCE(stable_contingencies.prediction_success_count, 0), COALESCE(excluded.prediction_success_count, 0)),
+                prediction_accuracy = MAX(COALESCE(stable_contingencies.prediction_accuracy, 0.0), COALESCE(excluded.prediction_accuracy, 0.0)),
+                normalized_contingency_key = COALESCE(stable_contingencies.normalized_contingency_key, excluded.normalized_contingency_key)
             """,
             tuple(row[column] for column in row.keys()),
         )
@@ -1241,6 +1289,23 @@ def _fold_single_db(
                     action=int(payload.get("action") or 0),
                     effect_signature=family_signature,
                     support_count=support_count,
+                    prediction_attempt_count=int(payload.get("prediction_attempt_count") or 0),
+                    prediction_success_count=int(payload.get("prediction_success_count") or 0),
+                    prediction_accuracy=_coerce_float(payload.get("prediction_accuracy")),
+                    prediction_error_before=_coerce_float(payload.get("prediction_error_before")),
+                    prediction_error_after=_coerce_float(payload.get("prediction_error_after")),
+                    normalized_contingency_key=str(
+                        payload.get("normalized_contingency_key")
+                        or normalized_contingency_identity(
+                            context_level=_context_level_from_raw(
+                                raw_conn,
+                                payload=payload,
+                                family_id=payload.get("transformation_family"),
+                            ),
+                            action=int(payload.get("action") or 0),
+                            effect_signature=family_signature,
+                        )
+                    ),
                     fold_config=fold_config,
                     stable_threshold=stable_threshold,
                 )
@@ -1834,6 +1899,12 @@ def _upsert_stable_contingency(
     action: int,
     effect_signature: str,
     support_count: int,
+    prediction_attempt_count: int = 0,
+    prediction_success_count: int = 0,
+    prediction_accuracy: float | None = None,
+    prediction_error_before: float | None = None,
+    prediction_error_after: float | None = None,
+    normalized_contingency_key: str | None = None,
     fold_config: CompactMemoryFoldConfig,
     stable_threshold: int,
 ) -> None:
@@ -1842,15 +1913,21 @@ def _upsert_stable_contingency(
         INSERT INTO stable_contingencies (
             contingency_id, canonical_key, game, sampler, context_level, action, effect_signature, support_count,
             first_seen_global_step, last_seen_global_step, stability_score, mean_prediction_error,
-            mean_replay_priority, representative_example_count
+            mean_replay_priority, representative_example_count, prediction_attempt_count,
+            prediction_success_count, prediction_accuracy, prediction_error_before,
+            prediction_error_after, normalized_contingency_key
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(canonical_key) DO UPDATE SET
             support_count = MAX(stable_contingencies.support_count, excluded.support_count),
             context_level = MAX(stable_contingencies.context_level, excluded.context_level),
             first_seen_global_step = MIN(stable_contingencies.first_seen_global_step, excluded.first_seen_global_step),
             last_seen_global_step = MAX(stable_contingencies.last_seen_global_step, excluded.last_seen_global_step),
-            stability_score = MAX(stable_contingencies.stability_score, excluded.stability_score)
+            stability_score = MAX(stable_contingencies.stability_score, excluded.stability_score),
+            prediction_attempt_count = MAX(COALESCE(stable_contingencies.prediction_attempt_count, 0), COALESCE(excluded.prediction_attempt_count, 0)),
+            prediction_success_count = MAX(COALESCE(stable_contingencies.prediction_success_count, 0), COALESCE(excluded.prediction_success_count, 0)),
+            prediction_accuracy = MAX(COALESCE(stable_contingencies.prediction_accuracy, 0.0), COALESCE(excluded.prediction_accuracy, 0.0)),
+            normalized_contingency_key = COALESCE(stable_contingencies.normalized_contingency_key, excluded.normalized_contingency_key)
         """,
         (
             contingency_id,
@@ -1867,6 +1944,17 @@ def _upsert_stable_contingency(
             0.0,
             0.0,
             0,
+            int(prediction_attempt_count),
+            int(prediction_success_count),
+            None if prediction_accuracy is None else float(prediction_accuracy),
+            None if prediction_error_before is None else float(prediction_error_before),
+            None if prediction_error_after is None else float(prediction_error_after),
+            normalized_contingency_key
+            or normalized_contingency_identity(
+                context_level=int(context_level),
+                action=action,
+                effect_signature=effect_signature,
+            ),
         ),
     )
 
@@ -2612,7 +2700,13 @@ def _ensure_current_state_schema(path: Path) -> None:
                 stability_score REAL,
                 mean_prediction_error REAL,
                 mean_replay_priority REAL,
-                representative_example_count INTEGER
+                representative_example_count INTEGER,
+                prediction_attempt_count INTEGER DEFAULT 0,
+                prediction_success_count INTEGER DEFAULT 0,
+                prediction_accuracy REAL,
+                prediction_error_before REAL,
+                prediction_error_after REAL,
+                normalized_contingency_key TEXT
             );
             CREATE TABLE IF NOT EXISTS transformation_families (
                 family_id INTEGER,
@@ -2943,6 +3037,10 @@ def _ensure_current_state_schema(path: Path) -> None:
                 high_option_change INTEGER,
                 high_attention INTEGER,
                 attention_signal_source TEXT,
+                attention_score REAL,
+                attention_score_percentile REAL,
+                attention_threshold_method TEXT,
+                attention_calibration_degenerate INTEGER,
                 first_seen_global_step INTEGER,
                 last_seen_global_step INTEGER
             );
@@ -2985,6 +3083,12 @@ def _ensure_current_state_schema(path: Path) -> None:
             """
         )
         _ensure_column(connection, "stable_contingencies", "context_level", "INTEGER DEFAULT 0")
+        _ensure_column(connection, "stable_contingencies", "prediction_attempt_count", "INTEGER DEFAULT 0")
+        _ensure_column(connection, "stable_contingencies", "prediction_success_count", "INTEGER DEFAULT 0")
+        _ensure_column(connection, "stable_contingencies", "prediction_accuracy", "REAL")
+        _ensure_column(connection, "stable_contingencies", "prediction_error_before", "REAL")
+        _ensure_column(connection, "stable_contingencies", "prediction_error_after", "REAL")
+        _ensure_column(connection, "stable_contingencies", "normalized_contingency_key", "TEXT")
         _ensure_column(connection, "transformation_families", "canonical_signature", "TEXT")
         _ensure_column(connection, "transformation_families", "relaxed_signature", "TEXT")
         _ensure_column(connection, "transformation_families", "effect_type", "TEXT")
@@ -3011,6 +3115,10 @@ def _ensure_current_state_schema(path: Path) -> None:
         _ensure_column(connection, "world_model_components", "predicted_outcome_count", "INTEGER")
         _ensure_column(connection, "world_model_components", "predicted_outcome_count_is_proxy", "INTEGER DEFAULT 0")
         _ensure_column(connection, "future_option_attention_links", "attention_signal_source", "TEXT")
+        _ensure_column(connection, "future_option_attention_links", "attention_score", "REAL")
+        _ensure_column(connection, "future_option_attention_links", "attention_score_percentile", "REAL")
+        _ensure_column(connection, "future_option_attention_links", "attention_threshold_method", "TEXT")
+        _ensure_column(connection, "future_option_attention_links", "attention_calibration_degenerate", "INTEGER")
         connection.commit()
 
 

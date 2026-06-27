@@ -40,6 +40,11 @@ class ContinuousResearchConfig:
     initial_worker_ramp_delay_seconds: float = 20.0
     per_worker_ramp_delay_seconds: float = 5.0
     env_root: str | None = None
+    shared_live_memory: str = "none"
+    live_memory_refresh_steps: int = 250
+    live_memory_queue_maxsize: int = 100_000
+    live_memory_batch_size: int = 1000
+    live_memory_flush_seconds: float = 2.0
 
 
 def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
@@ -125,6 +130,11 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
                 ram_ramp_threshold_percent=float(config.ram_ramp_threshold_percent),
                 initial_worker_ramp_delay_seconds=float(initial_worker_ramp_delay_seconds),
                 per_worker_ramp_delay_seconds=float(config.per_worker_ramp_delay_seconds),
+                shared_live_memory=str(config.shared_live_memory),
+                live_memory_refresh_steps=int(config.live_memory_refresh_steps),
+                live_memory_queue_maxsize=int(config.live_memory_queue_maxsize),
+                live_memory_batch_size=int(config.live_memory_batch_size),
+                live_memory_flush_seconds=float(config.live_memory_flush_seconds),
             )
         )
         worker_execution = _load_sampling_worker_execution(raw_dir)
@@ -347,6 +357,11 @@ def _load_or_initialize_manifest(config: ContinuousResearchConfig, manifest_path
         "initial_worker_ramp_delay_seconds": float(config.initial_worker_ramp_delay_seconds),
         "per_worker_ramp_delay_seconds": float(config.per_worker_ramp_delay_seconds),
         "output_dir": str(config.output_dir),
+        "shared_live_memory": str(config.shared_live_memory),
+        "live_memory_refresh_steps": int(config.live_memory_refresh_steps),
+        "live_memory_queue_maxsize": int(config.live_memory_queue_maxsize),
+        "live_memory_batch_size": int(config.live_memory_batch_size),
+        "live_memory_flush_seconds": float(config.live_memory_flush_seconds),
         "stop_if_disk_above_percent": float(config.stop_if_disk_above_percent),
         "stop_if_no_new_stable_contingencies_for": int(config.stop_if_no_new_stable_contingencies_for),
         "completed_epochs": 0,

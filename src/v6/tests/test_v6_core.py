@@ -157,6 +157,13 @@ from v6.memory.compact_memory import (
 )
 from v6.memory.contingency_store import ContingencyStore
 from v6.memory.interaction_store import Interaction, InteractionStore, encode_array
+from v6.memory.live_memory_queue import (
+    LiveMemoryReadCache,
+    LiveMemoryWriterConfig,
+    make_live_memory_queue,
+    start_live_memory_writer,
+    stop_live_memory_writer,
+)
 from v6.memory.promotion_engine import MemoryPromotionConfig, MemoryPromotionEngine
 from v6.memory.query_engine import MemoryQueryEngine
 from v6.memory.substrate import MemoryEdge, MemoryEvidence, MemoryNode, MemoryPromotion, MemoryScore, MemorySubstrate, action_node_id, delta_node_id, family_node_id, interaction_node_id, strategy_node_id
@@ -632,7 +639,6 @@ def test_graph_manager_edge_counts_include_zero_buckets() -> None:
 
 def test_interaction_significance_prediction_error_rewards_confident_misses() -> None:
     score = compute_interaction_significance(
-        reward=0,
         terminated=False,
         truncated=False,
         prediction_correct=False,
@@ -646,6 +652,36 @@ def test_interaction_significance_prediction_error_rewards_confident_misses() ->
 
     assert score.prediction_error >= 0.9
     assert score.total > 0
+
+
+def test_interaction_significance_no_longer_accepts_reward_argument() -> None:
+    score = compute_interaction_significance(
+        terminated=False,
+        truncated=False,
+        prediction_correct=None,
+        prediction_confidence=None,
+        actual_family_id=None,
+        delta_id=None,
+        context_signature=None,
+        memory_counts={},
+        graph_counts={},
+    )
+
+    assert score.total >= 0.0
+
+    with pytest.raises(TypeError):
+        compute_interaction_significance(
+            reward=0,
+            terminated=False,
+            truncated=False,
+            prediction_correct=None,
+            prediction_confidence=None,
+            actual_family_id=None,
+            delta_id=None,
+            context_signature=None,
+            memory_counts={},
+            graph_counts={},
+        )
 
 
 def test_context_contradiction_tracker_ignores_correct_predictions() -> None:
@@ -1418,7 +1454,6 @@ def test_adaptive_context_fields_are_stored_in_sqlite_stores(tmp_path) -> None:
 
 def test_interaction_significance_learning_value_drops_with_high_prior_counts() -> None:
     score_low = compute_interaction_significance(
-        reward=0,
         terminated=False,
         truncated=False,
         prediction_correct=None,
@@ -1430,7 +1465,6 @@ def test_interaction_significance_learning_value_drops_with_high_prior_counts() 
         graph_counts={},
     )
     score_high = compute_interaction_significance(
-        reward=0,
         terminated=False,
         truncated=False,
         prediction_correct=None,
@@ -1447,7 +1481,6 @@ def test_interaction_significance_learning_value_drops_with_high_prior_counts() 
 
 def test_interaction_significance_terminal_signal_boosts_survival_impact() -> None:
     score = compute_interaction_significance(
-        reward=0,
         terminated=True,
         truncated=False,
         prediction_correct=None,
@@ -1459,12 +1492,11 @@ def test_interaction_significance_terminal_signal_boosts_survival_impact() -> No
         graph_counts={},
     )
 
-    assert score.survival_impact >= 0.75
+    assert score.survival_impact >= 0.50
 
 
 def test_interaction_significance_win_uses_engine_outcome_state() -> None:
     score = compute_interaction_significance(
-        reward=0,
         terminated=False,
         truncated=False,
         prediction_correct=None,
@@ -1478,14 +1510,13 @@ def test_interaction_significance_win_uses_engine_outcome_state() -> None:
         outcome_polarity=None,
     )
 
-    assert score.survival_impact == 1.0
+    assert score.survival_impact == 0.75
     assert score.outcome_polarity == "positive"
     assert score.learning_value >= 0.99
 
 
 def test_interaction_significance_game_over_uses_negative_outcome_polarity() -> None:
     score = compute_interaction_significance(
-        reward=0,
         terminated=False,
         truncated=False,
         prediction_correct=None,
@@ -1505,7 +1536,6 @@ def test_interaction_significance_game_over_uses_negative_outcome_polarity() -> 
 
 def test_interaction_significance_repeated_win_has_lower_learning_value() -> None:
     score_low = compute_interaction_significance(
-        reward=0,
         terminated=False,
         truncated=False,
         prediction_correct=None,
@@ -1523,7 +1553,6 @@ def test_interaction_significance_repeated_win_has_lower_learning_value() -> Non
         outcome_polarity="positive",
     )
     score_high = compute_interaction_significance(
-        reward=0,
         terminated=False,
         truncated=False,
         prediction_correct=None,
@@ -1546,7 +1575,6 @@ def test_interaction_significance_repeated_win_has_lower_learning_value() -> Non
 
 def test_interaction_significance_not_finished_keeps_low_survival_without_other_signal() -> None:
     score = compute_interaction_significance(
-        reward=0,
         terminated=False,
         truncated=False,
         prediction_correct=None,
@@ -1565,7 +1593,6 @@ def test_interaction_significance_not_finished_keeps_low_survival_without_other_
 
 def test_interaction_significance_graph_proxy_boosts_explanatory_potential() -> None:
     score = compute_interaction_significance(
-        reward=0,
         terminated=False,
         truncated=False,
         prediction_correct=None,
@@ -1724,7 +1751,6 @@ def test_adapter_preserves_engine_states_without_invented_labels() -> None:
 
 def test_interaction_significance_level_completed_event_has_positive_survival_signal() -> None:
     score = compute_interaction_significance(
-        reward=0,
         terminated=False,
         truncated=False,
         prediction_correct=None,
@@ -1739,14 +1765,13 @@ def test_interaction_significance_level_completed_event_has_positive_survival_si
         level_completed_event=True,
     )
 
-    assert score.survival_impact >= 0.75
+    assert score.survival_impact >= 0.50
     assert score.outcome_polarity == "positive"
     assert score.version == "isf_v02"
 
 
 def test_interaction_significance_level_completed_event_learning_value_is_high_when_novel() -> None:
     score = compute_interaction_significance(
-        reward=0,
         terminated=False,
         truncated=False,
         prediction_correct=None,
@@ -1761,7 +1786,7 @@ def test_interaction_significance_level_completed_event_learning_value_is_high_w
         level_completed_event=True,
     )
 
-    assert score.survival_impact >= 0.75
+    assert score.survival_impact >= 0.50
     assert score.learning_value >= 0.99
 
 
@@ -2970,7 +2995,6 @@ def test_phase4_negative_future_option_delta_creates_restricts_edge(tmp_path) ->
 
 def test_phase4_isf_changes_when_future_option_delta_is_passed() -> None:
     without_delta = compute_interaction_significance(
-        reward=0,
         terminated=False,
         truncated=False,
         prediction_correct=None,
@@ -2985,8 +3009,22 @@ def test_phase4_isf_changes_when_future_option_delta_is_passed() -> None:
         outcome_polarity="neutral",
         level_completed_event=False,
     )
+    with_negative_delta = compute_interaction_significance(
+        terminated=False,
+        truncated=False,
+        prediction_correct=None,
+        prediction_confidence=None,
+        actual_family_id=None,
+        delta_id="d",
+        context_signature="ctx",
+        memory_counts={},
+        graph_counts={},
+        future_option_delta=-0.8,
+        outcome_state="NOT_FINISHED",
+        outcome_polarity="neutral",
+        level_completed_event=False,
+    )
     with_delta = compute_interaction_significance(
-        reward=0,
         terminated=False,
         truncated=False,
         prediction_correct=None,
@@ -3001,7 +3039,9 @@ def test_phase4_isf_changes_when_future_option_delta_is_passed() -> None:
         outcome_polarity="neutral",
         level_completed_event=False,
     )
+    assert with_negative_delta.survival_impact >= 0.8
     assert with_delta.transfer_potential > without_delta.transfer_potential
+    assert with_delta.survival_impact == without_delta.survival_impact
 
 
 def test_phase4_compact_memory_preserves_future_option_nodes_and_edges(tmp_path) -> None:
@@ -8850,6 +8890,432 @@ def test_v05c_run_sampling_job_non_fast_mode_does_not_call_legacy_future_effects
     assert captured["apply_called"] is False
 
 
+def test_live_memory_writer_projects_events(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    queue = make_live_memory_queue(100)
+    writer = start_live_memory_writer(
+        LiveMemoryWriterConfig(memory_dir=str(memory_dir), queue_maxsize=100, batch_size=2, flush_seconds=0.1),
+        queue,
+    )
+    queue.put(
+        {
+            "event_type": "stable_contingency",
+            "event_id": "stable_contingency:c1",
+            "global_step": 1,
+            "worker_id": "w1",
+            "priority": 0.9,
+            "payload": {
+                "key": "c1",
+                "action": 1,
+                "context_signature": "[1,2]",
+                "context_level": 0,
+                "transformation_family": 7,
+                "support_count": 3,
+                "confidence": 0.9,
+            },
+        }
+    )
+    queue.put(
+        {
+            "event_type": "family_update",
+            "event_id": "family_update:f1",
+            "global_step": 1,
+            "worker_id": "w1",
+            "priority": 0.5,
+            "payload": {
+                "family_signature": "f1",
+                "family_id": 7,
+                "support_count": 5,
+            },
+        }
+    )
+    queue.put(
+        {
+            "event_type": "high_priority_replay",
+            "event_id": "high_priority_replay:1",
+            "global_step": 1,
+            "worker_id": "w1",
+            "priority": 0.95,
+            "payload": {
+                "interaction_id": "1",
+                "replay_priority": 0.95,
+                "reason": "test",
+                "family_id": "7",
+                "context_signature": "[1,2]",
+                "action_signature": "1",
+            },
+        }
+    )
+    queue.put(
+        {
+            "event_type": "contradiction_cluster",
+            "event_id": "contradiction_cluster:x1",
+            "global_step": 1,
+            "worker_id": "w1",
+            "priority": 0.8,
+            "payload": {
+                "contradiction_key": "x1",
+                "context_signature": "[1,2]",
+                "action_signature": "1",
+                "count": 2,
+            },
+        }
+    )
+    queue.put(
+        {
+            "event_type": "carrier_candidate",
+            "event_id": "carrier_candidate:k1",
+            "global_step": 1,
+            "worker_id": "w1",
+            "priority": 0.7,
+            "payload": {
+                "carrier_signature": "k1",
+                "carrier_source": "object",
+                "support_count": 4,
+                "linked_family_count": 1,
+            },
+        }
+    )
+    queue.put(
+        {
+            "event_type": "future_option_event",
+            "event_id": "future_option_event:1",
+            "global_step": 1,
+            "worker_id": "w1",
+            "priority": 0.6,
+            "payload": {
+                "event_id": "fo1",
+                "interaction_id": "1",
+                "option_delta": 1.0,
+                "motif_type": "enable",
+                "motif_type_source": "live_delta_rule",
+            },
+        }
+    )
+    stop_summary = stop_live_memory_writer(queue, writer)
+
+    assert stop_summary["writer_exitcode"] == 0
+    sqlite_path = memory_dir / "live_memory.sqlite"
+    assert sqlite_path.exists()
+    with sqlite3.connect(sqlite_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM live_memory_events").fetchone()[0] == 6
+        assert connection.execute("SELECT COUNT(*) FROM live_stable_contingencies").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM live_replay_candidates").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM live_contradiction_clusters").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM live_carrier_candidates").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM live_future_option_events").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM live_family_updates").fetchone()[0] == 1
+
+    summary = json.loads((memory_dir / "live_memory_summary.json").read_text(encoding="utf-8"))
+    assert summary["events_received"] == 7
+    assert summary["events_written"] == 6
+    assert summary["queue_stop_received"] is True
+    assert summary["event_type_counts"]["stable_contingency"] == 1
+
+
+def test_live_memory_emit_queue_full_does_not_block(tmp_path: Path) -> None:
+    queue = make_live_memory_queue(1)
+    queue.put({"event_type": "occupied"})
+    system = V6System(
+        ToggleEnv(),
+        V6Config(
+            database_path=str(tmp_path / "queue_full.sqlite"),
+            shared_live_memory_mode="write",
+        ),
+        live_memory_queue=queue,
+    )
+    try:
+        system._emit_live_memory_event(
+            "stable_contingency",
+            "stable_contingency:test",
+            1,
+            0.9,
+            {
+                "key": "test",
+                "action": 1,
+                "context_signature": "[1]",
+                "context_level": 0,
+                "transformation_family": 1,
+                "support_count": 3,
+                "confidence": 0.9,
+            },
+        )
+        assert system.live_memory_events_dropped_queue_full == 1
+    finally:
+        system.close()
+
+
+def test_live_memory_read_cache_missing_db(tmp_path: Path) -> None:
+    cache = LiveMemoryReadCache(memory_dir=tmp_path / "missing", refresh_steps=5)
+    assert cache.refresh(force=True) is False
+    assert cache.refresh_failed_count == 1
+
+
+def test_live_memory_read_cache_loads_rows(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    queue = make_live_memory_queue(10)
+    writer = start_live_memory_writer(
+        LiveMemoryWriterConfig(memory_dir=str(memory_dir), queue_maxsize=10, batch_size=1, flush_seconds=0.1),
+        queue,
+    )
+    queue.put(
+        {
+            "event_type": "stable_contingency",
+            "event_id": "stable_contingency:cache",
+            "global_step": 5,
+            "worker_id": "w1",
+            "priority": 0.9,
+            "payload": {
+                "key": "cache",
+                "action": 1,
+                "context_signature": "[1]",
+                "context_level": 0,
+                "transformation_family": 2,
+                "support_count": 4,
+                "confidence": 0.95,
+            },
+        }
+    )
+    queue.put(
+        {
+            "event_type": "high_priority_replay",
+            "event_id": "high_priority_replay:cache",
+            "global_step": 5,
+            "worker_id": "w1",
+            "priority": 0.85,
+            "payload": {
+                "interaction_id": "42",
+                "replay_priority": 0.85,
+                "reason": "shared",
+                "family_id": "2",
+                "context_signature": "[1]",
+                "action_signature": "1",
+            },
+        }
+    )
+    stop_live_memory_writer(queue, writer)
+
+    cache = LiveMemoryReadCache(memory_dir=memory_dir, refresh_steps=5)
+    assert cache.refresh(force=True) is True
+    assert len(cache.stable_contingencies) == 1
+    assert len(cache.replay_candidates) == 1
+
+
+def test_v6system_readwrite_imports_live_memory_once(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    queue = make_live_memory_queue(10)
+    writer = start_live_memory_writer(
+        LiveMemoryWriterConfig(memory_dir=str(memory_dir), queue_maxsize=10, batch_size=2, flush_seconds=0.1),
+        queue,
+    )
+    queue.put(
+        {
+            "event_type": "stable_contingency",
+            "event_id": "stable_contingency:imported",
+            "global_step": 7,
+            "worker_id": "w1",
+            "priority": 0.95,
+            "payload": {
+                "key": "imported",
+                "action": 1,
+                "context_signature": "[1]",
+                "context_level": 0,
+                "transformation_family": 3,
+                "support_count": 5,
+                "confidence": 0.95,
+            },
+        }
+    )
+    queue.put(
+        {
+            "event_type": "high_priority_replay",
+            "event_id": "high_priority_replay:imported",
+            "global_step": 7,
+            "worker_id": "w1",
+            "priority": 0.9,
+            "payload": {
+                "interaction_id": "77",
+                "replay_priority": 0.9,
+                "reason": "shared_live_memory",
+                "family_id": "3",
+                "context_signature": "[1]",
+                "action_signature": "1",
+            },
+        }
+    )
+    queue.put(
+        {
+            "event_type": "carrier_candidate",
+            "event_id": "carrier_candidate:imported",
+            "global_step": 7,
+            "worker_id": "w1",
+            "priority": 0.7,
+            "payload": {
+                "carrier_signature": "carrier:imported",
+                "carrier_source": "object",
+                "support_count": 4,
+                "linked_family_count": 1,
+            },
+        }
+    )
+    stop_live_memory_writer(queue, writer)
+
+    cache = LiveMemoryReadCache(memory_dir=memory_dir, refresh_steps=1)
+    assert cache.refresh(force=True) is True
+    system = V6System(
+        ToggleEnv(),
+        V6Config(
+            database_path=str(tmp_path / "live_import.sqlite"),
+            shared_live_memory_mode="readwrite",
+        ),
+        live_memory_cache=cache,
+    )
+    try:
+        system._apply_live_memory_cache()
+        stable_after_first = system.contingency_learner.stable_contingencies()
+        assert len(stable_after_first) == 1
+        assert system.live_memory_stable_contingencies_imported == 1
+        assert "77" in system.memory_lifecycle.replay_candidates
+        assert system.live_memory_replay_candidates_imported == 1
+        assert any(candidate.carrier_signature == "carrier:imported" for candidate in system.carrier_tracker.build_candidates())
+        assert system.live_memory_carrier_candidates_imported == 1
+
+        system._apply_live_memory_cache()
+        stable_after_second = system.contingency_learner.stable_contingencies()
+        assert len(stable_after_second) == 1
+        assert system.live_memory_stable_contingencies_imported == 1
+        assert system.live_memory_replay_candidates_imported == 1
+        assert system.live_memory_carrier_candidates_imported == 1
+    finally:
+        system.close()
+
+
+def test_interaction_sampling_shared_live_memory_default_is_none() -> None:
+    assert InteractionSamplingConfig().shared_live_memory == "none"
+
+
+def test_v05c_run_sampling_job_shared_live_memory_write_emits_summary(tmp_path: Path, monkeypatch) -> None:
+    captured: dict[str, object] = {}
+    memory_dir = tmp_path / "memory"
+    db_path = tmp_path / "raw" / "seed_0.sqlite"
+    queue = make_live_memory_queue(100)
+    writer = start_live_memory_writer(
+        LiveMemoryWriterConfig(memory_dir=str(memory_dir), queue_maxsize=100, batch_size=1, flush_seconds=0.1),
+        queue,
+    )
+
+    class DummySampler:
+        reset_count = 0
+        reset_unavailable = False
+
+    class DummyEnv:
+        def __init__(self, game_id: str, seed: int, env_root=None) -> None:
+            self.game_id = game_id
+            self.seed = seed
+            self.env_root = env_root
+            self.reset_count = 0
+            self.skipped_terminal_steps = 0
+
+    class DummyGraph:
+        def edge_type_counts(self) -> dict[str, int]:
+            return {}
+
+        def export_compact_rows(self) -> dict[str, list[dict[str, object]]]:
+            return {"nodes": [], "edges": []}
+
+    class DummySystem:
+        def __init__(self, env, config, action_sampler=None, live_memory_queue=None, live_memory_cache=None) -> None:
+            self.env = env
+            self.config = config
+            self.graph = DummyGraph()
+            self.context_contradictions = type("Tracker", (), {"summary": lambda self: {}})()
+            self.carrier_tracker = type("Carrier", (), {"build_candidates": lambda self: []})()
+            self.memory_lifecycle = type("Lifecycle", (), {"summary": lambda self: {}, "get_replay_batch": lambda self, limit=1000: []})()
+            self.efficiency_tracker = type("Efficiency", (), {"summary": lambda self: {}})()
+            self.compact_memory_restore_summary = {}
+            self.live_memory_queue = live_memory_queue
+            self.live_memory_events_emitted = 0
+            self.live_memory_events_dropped_queue_full = 0
+            self.live_memory_events_dropped_error = 0
+            self.live_memory_refresh_count = 0
+            self.live_memory_refresh_failed_count = 0
+            self.live_memory_stable_contingencies_imported = 0
+            self.live_memory_replay_candidates_imported = 0
+            self.live_memory_carrier_candidates_imported = 0
+            self.live_memory_family_updates_imported = 0
+            self.live_memory_contradiction_clusters_loaded = 0
+            self.live_memory_future_option_events_loaded = 0
+
+        def run(self, steps: int) -> None:
+            if self.live_memory_queue is not None:
+                self.live_memory_queue.put_nowait(
+                    {
+                        "event_type": "stable_contingency",
+                        "event_id": "stable_contingency:dummy",
+                        "global_step": 1,
+                        "worker_id": str(self.config.live_memory_worker_id or "worker"),
+                        "priority": 0.95,
+                        "payload": {
+                            "key": "dummy",
+                            "action": 1,
+                            "context_signature": "[1]",
+                            "context_level": 0,
+                            "transformation_family": 1,
+                            "support_count": 3,
+                            "confidence": 0.95,
+                        },
+                    }
+                )
+                self.live_memory_events_emitted = 1
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            with sqlite3.connect(db_path) as connection:
+                connection.execute("CREATE TABLE IF NOT EXISTS interactions (id INTEGER PRIMARY KEY)")
+                connection.commit()
+
+        def close(self) -> None:
+            pass
+
+        def adaptive_context_summary(self) -> dict[str, object]:
+            return {"adaptive_context_expansion_enabled": False, "base_context_depth": 1, "max_context_depth": 1}
+
+    def fake_write_sampling_metadata(path, **values) -> None:
+        captured["metadata"] = values
+
+    monkeypatch.setattr(interaction_sampling, "make_sampler", lambda name, seed: DummySampler())
+    monkeypatch.setattr(interaction_sampling, "ArcGridEnvironment", DummyEnv)
+    monkeypatch.setattr(interaction_sampling, "V6System", DummySystem)
+    monkeypatch.setattr(interaction_sampling, "_write_sampling_metadata", fake_write_sampling_metadata)
+
+    try:
+        result = interaction_sampling._run_sampling_job(
+            {
+                "game": "tt01",
+                "sampler_name": "random_baseline",
+                "seed": 0,
+                "steps": 10,
+                "horizon": 3,
+                "context_depth": 1,
+                "commit_steps": 5,
+                "db_path": str(db_path),
+                "env_root": None,
+                "memory_output_dir": str(memory_dir),
+                "shared_live_memory": "write",
+                "live_memory_queue": queue,
+            }
+        )
+    finally:
+        stop_summary = stop_live_memory_writer(queue, writer)
+
+    assert result == {"legacy_future_effects_removed": True}
+    assert stop_summary["writer_exitcode"] == 0
+    assert db_path.exists()
+    assert (memory_dir / "live_memory_summary.json").exists()
+    summary = json.loads((memory_dir / "live_memory_summary.json").read_text(encoding="utf-8"))
+    assert summary["events_written"] >= 1
+    assert captured["metadata"]["shared_live_memory_mode"] == "write"
+    assert captured["metadata"]["live_memory_events_emitted"] == 1
+
+
 def test_v05c_sampling_db_ready_accepts_fast_postprocessing_without_future_effects(tmp_path) -> None:
     db_path = tmp_path / "seed_0.sqlite"
     with sqlite3.connect(db_path) as connection:
@@ -10877,6 +11343,47 @@ def test_h01_uses_compact_memory_record_count_when_raw_zero(tmp_path: Path) -> N
     assert result["memory_record_count"] == 2
 
 
+def test_h01_derives_prediction_accuracy_and_context_lift_from_prediction_results(tmp_path: Path) -> None:
+    from v6.hypothesis_h01_report import evaluate_h01_contingency_emergence
+
+    run_dir = tmp_path / "run_h01_pred"
+    run_dir.mkdir()
+    (run_dir / "interaction_sampling_v05c_report.json").write_text(
+        json.dumps({"runs": [{"game": "g1", "sampler_name": "s1", "total_interactions": 8, "memory_record_count": 8}]}),
+        encoding="utf-8",
+    )
+    db_path = run_dir / "seed_0.sqlite"
+    with sqlite3.connect(db_path) as conn:
+        store = ContingencyStore(conn)
+        rows = [
+            ((1, 1), 1, 10, 0),
+            ((1, 1), 1, 10, 1),
+            ((1, 1), 1, 10, 2),
+            ((1, 1), 1, 10, 3),
+            ((2, 2), 1, 20, 4),
+            ((2, 2), 1, 20, 5),
+            ((3, 3), 2, 30, 6),
+            ((3, 3), 2, 40, 7),
+        ]
+        for context_signature, action, actual_family, interaction_id in rows:
+            store.add_prediction_result(
+                interaction_id=interaction_id,
+                context_level=1,
+                context_signature=context_signature,
+                action=action,
+                predicted_family=10,
+                actual_family=actual_family,
+            )
+        conn.commit()
+    result = evaluate_h01_contingency_emergence(run_dir, tmp_path / "out_h01_pred")
+    assert result["mean_prediction_accuracy"] is not None
+    assert result["mean_prediction_accuracy"] > 0.0
+    assert result["context_lift_available"] is True
+    assert result["mean_context_lift"] is not None
+    assert result["mean_context_lift"] > 0.0
+    assert result["positive_context_lift_count"] > 0
+
+
 def test_h02_uses_compact_replay_counter_when_raw_zero(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from v6.hypothesis_h02_report import evaluate_h02_prediction_violation_attention
 
@@ -10967,7 +11474,11 @@ def test_h09_live_option_delta_is_used_exactly() -> None:
         live_option_delta=0.0,
     )
     assert zero_row["option_delta"] == pytest.approx(0.0)
-    assert zero_row["motif_type"] == "stabilize"
+    assert zero_row["motif_type"] == "neutral"
+    zero_evidence = zero_row["evidence_json"]
+    if isinstance(zero_evidence, str):
+        zero_evidence = json.loads(zero_evidence)
+    assert zero_evidence["motif_type_source"] == "live_delta_rule"
 
 
 def test_h10_attention_saturation_is_partial(tmp_path: Path) -> None:
@@ -11011,6 +11522,128 @@ def test_h10_all_low_attention_saturation_is_partial(tmp_path: Path) -> None:
     assert result["attention_all_low_saturation"] is True
     assert result["attention_saturation"] is True
     assert "Attention signal is saturated all-low; selective attention is not demonstrated." in result["missing_evidence"]
+
+
+def test_h03_normalized_family_signature_reduces_numeric_singletons(tmp_path: Path) -> None:
+    from v6.hypothesis_h03_report import evaluate_h03_transformation_family_formation
+
+    run_dir = tmp_path / "run_h03_norm"
+    out_dir = tmp_path / "out_h03_norm"
+    run_dir.mkdir()
+    (run_dir / "interaction_sampling_v05c_report.json").write_text(
+        json.dumps(
+            {
+                "validation": {
+                    "memory_record_count": 10,
+                    "carrier_candidate_count": 0,
+                    "emergent_carrier_count": 0,
+                    "carrier_spatial_candidate_count": 0,
+                    "carrier_object_candidate_count": 0,
+                    "emergent_object_carrier_count": 0,
+                    "carrier_context_action_fallback_candidate_count": 0,
+                    "emergent_context_action_fallback_count": 0,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    db_path = run_dir / "seed_0.sqlite"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE transformation_families (
+                family_id TEXT,
+                effect_signature TEXT,
+                member_count INTEGER,
+                support_count INTEGER,
+                action INTEGER
+            )
+            """
+        )
+        conn.executemany(
+            "INSERT INTO transformation_families VALUES (?, ?, ?, ?, ?)",
+            [
+                ("f1", "[1.2,0.2,0.1,0,0]", 3, 3, 1),
+                ("f2", "[3.8,0.3,0.2,0,0]", 3, 3, 1),
+            ],
+        )
+        conn.commit()
+    result = evaluate_h03_transformation_family_formation(run_dir, out_dir)
+    assert result["transformation_family_count"] == 1
+    assert result["singleton_family_ratio"] == 0.0
+    assert result["over_specific_singleton_count"] == 0
+
+
+def test_h03_family_prediction_lift_available_and_non_negative(tmp_path: Path) -> None:
+    from v6.hypothesis_h03_report import evaluate_h03_transformation_family_formation
+
+    run_dir = tmp_path / "run_h03_lift"
+    out_dir = tmp_path / "out_h03_lift"
+    run_dir.mkdir()
+    (run_dir / "interaction_sampling_v05c_report.json").write_text(
+        json.dumps(
+            {
+                "validation": {
+                    "memory_record_count": 10,
+                    "carrier_candidate_count": 0,
+                    "emergent_carrier_count": 0,
+                    "carrier_spatial_candidate_count": 0,
+                    "carrier_object_candidate_count": 0,
+                    "emergent_object_carrier_count": 0,
+                    "carrier_context_action_fallback_candidate_count": 0,
+                    "emergent_context_action_fallback_count": 0,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    db_path = run_dir / "seed_0.sqlite"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE transformation_families (
+                family_id TEXT,
+                effect_signature TEXT,
+                member_count INTEGER,
+                support_count INTEGER,
+                action INTEGER
+            )
+            """
+        )
+        conn.executemany(
+            "INSERT INTO transformation_families VALUES (?, ?, ?, ?, ?)",
+            [
+                ("f1", "[1.2,0.2,0.1,0,0]", 4, 4, 1),
+                ("f2", "[3.8,0.3,0.2,0,0]", 4, 4, 1),
+            ],
+        )
+        conn.execute(
+            """
+            CREATE TABLE prediction_results (
+                interaction_id INTEGER,
+                context_signature TEXT,
+                action INTEGER,
+                predicted_family TEXT,
+                actual_family TEXT
+            )
+            """
+        )
+        rows = []
+        for idx in range(1, 3):
+            rows.append((idx, "ctx", 1, "f1", "f1"))
+        for idx in range(3, 5):
+            rows.append((idx, "ctx", 1, "f2", "f1"))
+        for idx in range(5, 7):
+            rows.append((idx, "ctx", 1, "f2", "f2"))
+        for idx in range(7, 9):
+            rows.append((idx, "ctx", 1, "f1", "f2"))
+        conn.executemany("INSERT INTO prediction_results VALUES (?, ?, ?, ?, ?)", rows)
+        conn.commit()
+    result = evaluate_h03_transformation_family_formation(run_dir, out_dir)
+    assert result["family_prediction_lift_available"] is True
+    assert result["family_prediction_lift_mean"] is not None
+    assert result["family_prediction_lift_mean"] >= 0.0
+    assert result["family_prediction_lift_mean"] > 0.0
 
 
 def test_h03_missing_evidence_flags_are_exposed() -> None:

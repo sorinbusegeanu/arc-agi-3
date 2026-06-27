@@ -77,7 +77,7 @@ def evaluate_h09_future_option_motifs(
     result["unknown_motif_event_ratio"] = (unknown_event_count / len(events)) if events else None
     result["unknown_motif_source_count"] = int(source_counts.get("unknown", 0))
     result["unknown_motif_source_ratio"] = (result["unknown_motif_source_count"] / len(events)) if events else None
-    result["live_delta_event_count"] = int(source_counts.get("live_delta", 0))
+    result["live_delta_event_count"] = int(source_counts.get("live_delta", 0)) + int(source_counts.get("live_delta_rule", 0))
     result["structured_effect_event_count"] = int(source_counts.get("structured_effect", 0))
     result["text_keyword_event_count"] = int(source_counts.get("text_keyword", 0))
     result["future_option_edge_event_count"] = int(source_counts.get("future_option_edge", 0))
@@ -119,6 +119,12 @@ def evaluate_h09_future_option_motifs(
             "unknown_motif_ratio",
             "unknown_motif_event_count",
             "unknown_motif_event_ratio",
+            "unknown_motif_source_count",
+            "unknown_motif_source_ratio",
+            "live_delta_event_count",
+            "structured_effect_event_count",
+            "text_keyword_event_count",
+            "future_option_edge_event_count",
         )
     }
     _write(output_dir, result)

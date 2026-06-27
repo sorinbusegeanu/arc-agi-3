@@ -254,6 +254,11 @@ def build_parser() -> argparse.ArgumentParser:
     sampling.add_argument("--memory-output-dir", default=None)
     sampling.add_argument("--global-step-offset", type=int, default=0)
     sampling.add_argument("--fast-postprocessing", type=_parse_bool, default=False)
+    sampling.add_argument("--shared-live-memory", choices=("none", "write", "readwrite"), default="none")
+    sampling.add_argument("--live-memory-refresh-steps", type=int, default=250)
+    sampling.add_argument("--live-memory-queue-maxsize", type=int, default=100000)
+    sampling.add_argument("--live-memory-batch-size", type=int, default=1000)
+    sampling.add_argument("--live-memory-flush-seconds", type=float, default=2.0)
 
     contingency_memory = subparsers.add_parser("contingency-memory-v06")
     contingency_memory.add_argument("--parquet-root", required=True)
@@ -554,6 +559,11 @@ def build_parser() -> argparse.ArgumentParser:
     continuous.add_argument("--initial-worker-ramp-delay-seconds", type=float, default=20.0)
     continuous.add_argument("--per-worker-ramp-delay-seconds", type=float, default=5.0)
     continuous.add_argument("--env-root", default=None)
+    continuous.add_argument("--shared-live-memory", choices=("none", "write", "readwrite"), default="none")
+    continuous.add_argument("--live-memory-refresh-steps", type=int, default=250)
+    continuous.add_argument("--live-memory-queue-maxsize", type=int, default=100000)
+    continuous.add_argument("--live-memory-batch-size", type=int, default=1000)
+    continuous.add_argument("--live-memory-flush-seconds", type=float, default=2.0)
     return parser
 
 
@@ -810,6 +820,11 @@ def main(argv: list[str] | None = None) -> int:
                 memory_output_dir=args.memory_output_dir,
                 global_step_offset=int(args.global_step_offset),
                 fast_postprocessing=bool(args.fast_postprocessing),
+                shared_live_memory=str(args.shared_live_memory),
+                live_memory_refresh_steps=int(args.live_memory_refresh_steps),
+                live_memory_queue_maxsize=int(args.live_memory_queue_maxsize),
+                live_memory_batch_size=int(args.live_memory_batch_size),
+                live_memory_flush_seconds=float(args.live_memory_flush_seconds),
             )
         )
         print(json.dumps({"rows": len(rows), "output_dir": args.output_dir}, indent=2))
@@ -1407,6 +1422,11 @@ def main(argv: list[str] | None = None) -> int:
                 initial_worker_ramp_delay_seconds=float(args.initial_worker_ramp_delay_seconds),
                 per_worker_ramp_delay_seconds=float(args.per_worker_ramp_delay_seconds),
                 env_root=args.env_root,
+                shared_live_memory=str(args.shared_live_memory),
+                live_memory_refresh_steps=int(args.live_memory_refresh_steps),
+                live_memory_queue_maxsize=int(args.live_memory_queue_maxsize),
+                live_memory_batch_size=int(args.live_memory_batch_size),
+                live_memory_flush_seconds=float(args.live_memory_flush_seconds),
             )
         )
         print(json.dumps(result, indent=2))

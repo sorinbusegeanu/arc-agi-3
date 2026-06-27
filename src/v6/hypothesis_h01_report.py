@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -39,12 +40,19 @@ H01_DEFAULTS: dict[str, Any] = {
     "mean_prediction_accuracy": None,
     "context_lift": None,
     "mean_context_lift": None,
+    "median_context_lift": None,
+    "positive_context_lift_count": None,
+    "context_lift_available": False,
     "contradiction_count": None,
     "repeated_contradiction_count": None,
     "context_expansion_suggested_count": None,
     "per_game_contingency_counts": {},
     "per_sampler_contingency_counts": {},
     "cross_game_contingency_presence": None,
+    "cross_game_contingency_count": None,
+    "cross_sampler_contingency_count": None,
+    "games_per_contingency_identity": {},
+    "samplers_per_contingency_identity": {},
     "percentage_games_with_stable_contingency": None,
     "percentage_samplers_with_stable_contingency": None,
     "stability_approximated": False,
@@ -104,8 +112,12 @@ def evaluate_h01_contingency_emergence(run_dir: Path, output_dir: Path, *, memor
         not report_has_runs
         or report_metrics.get("total_interaction_count") is None
         or report_metrics.get("stable_contingency_count") is None
+        or report_metrics.get("mean_prediction_accuracy") is None
+        or report_metrics.get("mean_context_lift") is None
+        or report_metrics.get("cross_game_contingency_presence") is None
     )
     db_metrics = _extract_db_metrics(sqlite_paths) if sqlite_paths and needs_db_fallback else {}
+    compact_metrics: dict[str, Any] = {}
     result.update(report_metrics)
     if memory_dir is not None:
         compact_metrics = _extract_compact_memory_metrics(Path(memory_dir))
@@ -141,16 +153,37 @@ def evaluate_h01_contingency_emergence(run_dir: Path, output_dir: Path, *, memor
         "mean_prediction_accuracy",
         "context_lift",
         "mean_context_lift",
+        "median_context_lift",
+        "positive_context_lift_count",
+        "context_lift_available",
+        "cross_game_contingency_count",
+        "cross_sampler_contingency_count",
     ):
         if result.get(key) is None:
             result[key] = db_metrics.get(key)
+    if not bool(result.get("context_lift_available")) and bool(db_metrics.get("context_lift_available")):
+        result["context_lift_available"] = True
 
     if not result["per_game_contingency_counts"]:
         result["per_game_contingency_counts"] = db_metrics.get("per_game_contingency_counts", {})
     if not result["per_sampler_contingency_counts"]:
         result["per_sampler_contingency_counts"] = db_metrics.get("per_sampler_contingency_counts", {})
 
-    result["cross_game_contingency_presence"] = db_metrics.get("cross_game_contingency_presence")
+    result["cross_game_contingency_presence"] = (
+        db_metrics.get("cross_game_contingency_presence")
+        if db_metrics.get("cross_game_contingency_presence") is not None
+        else compact_metrics.get("cross_game_contingency_presence")
+    )
+    result["cross_game_contingency_count"] = (
+        result.get("cross_game_contingency_count")
+        or compact_metrics.get("cross_game_contingency_count")
+    )
+    result["cross_sampler_contingency_count"] = (
+        result.get("cross_sampler_contingency_count")
+        or compact_metrics.get("cross_sampler_contingency_count")
+    )
+    result["games_per_contingency_identity"] = db_metrics.get("games_per_contingency_identity", {}) or compact_metrics.get("games_per_contingency_identity", {})
+    result["samplers_per_contingency_identity"] = db_metrics.get("samplers_per_contingency_identity", {}) or compact_metrics.get("samplers_per_contingency_identity", {})
     result["db_paths_inspected"] = db_metrics.get("db_paths_inspected", 0)
     result["selected_db_paths"] = db_metrics.get("selected_db_paths", [])
     result["tables_seen"] = db_metrics.get("tables_seen", [])
@@ -267,6 +300,7 @@ def _extract_compact_memory_metrics(memory_dir: Path) -> dict[str, Any]:
     if not current_state.exists():
         return {}
     with sqlite3.connect(current_state) as connection:
+        connection.row_factory = sqlite3.Row
         per_game = dict(connection.execute("SELECT COALESCE(game, 'unknown'), COUNT(*) FROM stable_contingencies GROUP BY COALESCE(game, 'unknown')").fetchall())
         per_sampler = dict(connection.execute("SELECT COALESCE(sampler, 'unknown'), COUNT(*) FROM stable_contingencies GROUP BY COALESCE(sampler, 'unknown')").fetchall())
         stable_count = int(connection.execute("SELECT COUNT(*) FROM stable_contingencies WHERE support_count >= 20").fetchone()[0])
@@ -292,6 +326,36 @@ def _extract_compact_memory_metrics(memory_dir: Path) -> dict[str, Any]:
         if replay_queue.exists():
             with sqlite3.connect(replay_queue) as replay_conn:
                 replay_queue_count = int(replay_conn.execute("SELECT COUNT(*) FROM replay_queue").fetchone()[0])
+        identity_rows = [
+            dict(row)
+            for row in connection.execute(
+                """
+                SELECT normalized_contingency_key, game, sampler, context_level, action, effect_signature, prediction_accuracy
+                FROM stable_contingencies
+                ORDER BY canonical_key ASC
+                """
+            ).fetchall()
+        ]
+        games_by_identity: dict[str, set[str]] = defaultdict(set)
+        samplers_by_identity: dict[str, set[str]] = defaultdict(set)
+        prediction_accuracy_values: list[float] = []
+        for row in identity_rows:
+            identity = str(
+                row.get("normalized_contingency_key")
+                or _normalized_contingency_identity_fallback(
+                    context_level=row.get("context_level"),
+                    action=row.get("action"),
+                    effect_signature=row.get("effect_signature"),
+                )
+            )
+            game = str(row.get("game") or "unknown")
+            sampler = str(row.get("sampler") or "unknown")
+            games_by_identity[identity].add(game)
+            samplers_by_identity[identity].add(sampler)
+            if row.get("prediction_accuracy") is not None:
+                prediction_accuracy_values.append(float(row["prediction_accuracy"]))
+        cross_game_contingency_count = sum(1 for values in games_by_identity.values() if len(values) >= 2)
+        cross_sampler_contingency_count = sum(1 for values in samplers_by_identity.values() if len(values) >= 2)
         return {
             "total_interaction_count": interaction_count if interaction_count > 0 else None,
             "stable_contingency_count": stable_count,
@@ -299,7 +363,7 @@ def _extract_compact_memory_metrics(memory_dir: Path) -> dict[str, Any]:
             "discovered_contingency_count": int(connection.execute("SELECT COUNT(*) FROM stable_contingencies").fetchone()[0]),
             "per_game_contingency_counts": {str(key): int(value) for key, value in per_game.items()},
             "per_sampler_contingency_counts": {str(key): int(value) for key, value in per_sampler.items()},
-            "mean_prediction_accuracy": None,
+            "mean_prediction_accuracy": _mean_or_none(prediction_accuracy_values),
             "memory_record_count": memory_record_count or memory_score_record_count or None,
             "memory_score_record_count": memory_score_record_count or None,
             "memory_replay_candidate_count": replay_queue_count if replay_queue_count is not None else selected_for_replay_edge_count,
@@ -313,6 +377,11 @@ def _extract_compact_memory_metrics(memory_dir: Path) -> dict[str, Any]:
             "actual_family_available_count": memory_score_record_count or None,
             "wrong_prediction_count": contradiction_count if contradiction_count > 0 else None,
             "confident_wrong_prediction_count": contradiction_count if contradiction_count > 0 else None,
+            "cross_game_contingency_presence": cross_game_contingency_count > 0 if identity_rows else None,
+            "cross_game_contingency_count": cross_game_contingency_count,
+            "cross_sampler_contingency_count": cross_sampler_contingency_count,
+            "games_per_contingency_identity": {key: len(value) for key, value in sorted(games_by_identity.items())},
+            "samplers_per_contingency_identity": {key: len(value) for key, value in sorted(samplers_by_identity.items())},
         }
 
 
@@ -466,14 +535,21 @@ def _extract_db_metrics(sqlite_paths: list[Path]) -> dict[str, Any]:
     tables_seen: set[str] = set()
     per_game: dict[str, int] = {}
     per_sampler: dict[str, int] = {}
+    prediction_accuracy_values: list[float] = []
+    context_lift_values: list[float] = []
+    positive_context_lift_values: list[float] = []
+    identity_games: dict[str, set[str]] = defaultdict(set)
+    identity_samplers: dict[str, set[str]] = defaultdict(set)
 
     for path in sqlite_paths:
         try:
             with sqlite3.connect(path) as connection:
+                connection.row_factory = sqlite3.Row
                 tables = {str(row[0]) for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 tables_seen.update(tables)
                 interactions = 0
                 contingencies = 0
+                game, sampler = _infer_game_sampler_from_path(path)
                 if "interactions" in tables:
                     interactions = int(connection.execute("SELECT COUNT(*) FROM interactions").fetchone()[0])
                     columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(interactions)").fetchall()}
@@ -502,6 +578,30 @@ def _extract_db_metrics(sqlite_paths: list[Path]) -> dict[str, Any]:
                         forgotten_memory_count += int(row[5] or 0)
                 if "contingencies" in tables:
                     contingencies = int(connection.execute("SELECT COUNT(*) FROM contingencies").fetchone()[0])
+                    contingency_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(contingencies)").fetchall()}
+                    for row in connection.execute("SELECT * FROM contingencies ORDER BY id ASC").fetchall():
+                        payload = dict(row)
+                        family_signature = _family_signature_for_h01(connection, payload)
+                        identity = str(
+                            payload.get("normalized_contingency_key")
+                            or _normalized_contingency_identity_fallback(
+                                context_level=payload.get("context_level"),
+                                action=payload.get("action"),
+                                effect_signature=family_signature,
+                            )
+                        )
+                        if game:
+                            identity_games[identity].add(game)
+                        if sampler:
+                            identity_samplers[identity].add(sampler)
+                        if "prediction_accuracy" in contingency_columns and payload.get("prediction_accuracy") is not None:
+                            prediction_accuracy_values.append(float(payload["prediction_accuracy"]))
+                if "prediction_results" in tables:
+                    prediction_metrics = _prediction_metrics_from_prediction_results(connection)
+                    if prediction_metrics["prediction_accuracy"] is not None:
+                        prediction_accuracy_values.append(float(prediction_metrics["prediction_accuracy"]))
+                    context_lift_values.extend(prediction_metrics["context_lift_values"])
+                    positive_context_lift_values.extend(prediction_metrics["positive_context_lift_values"])
                 total_interactions += interactions
                 contingency_rows += contingencies
         except sqlite3.DatabaseError:
@@ -509,7 +609,6 @@ def _extract_db_metrics(sqlite_paths: list[Path]) -> dict[str, Any]:
 
         result["db_paths_inspected"] += 1
         result["selected_db_paths"].append(str(path))
-        game, sampler = _infer_game_sampler_from_path(path)
         if contingencies:
             if game:
                 per_game[game] = per_game.get(game, 0) + contingencies
@@ -527,10 +626,24 @@ def _extract_db_metrics(sqlite_paths: list[Path]) -> dict[str, Any]:
     result["protected_memory_count"] = protected_memory_count if result["db_paths_inspected"] else None
     result["active_memory_count"] = active_memory_count if result["db_paths_inspected"] else None
     result["forgotten_memory_count"] = forgotten_memory_count if result["db_paths_inspected"] else None
+    result["prediction_accuracy"] = _mean_or_none(prediction_accuracy_values)
+    result["mean_prediction_accuracy"] = _mean_or_none(prediction_accuracy_values)
+    preferred_context_lifts = positive_context_lift_values or context_lift_values
+    result["context_lift"] = _mean_or_none(preferred_context_lifts)
+    result["mean_context_lift"] = _mean_or_none(preferred_context_lifts)
+    result["median_context_lift"] = _median_or_none(preferred_context_lifts)
+    result["positive_context_lift_count"] = sum(1 for value in context_lift_values if value > 0.0)
+    result["context_lift_available"] = bool(context_lift_values)
     result["per_game_contingency_counts"] = per_game
     result["per_sampler_contingency_counts"] = per_sampler
     result["stability_approximated"] = bool(result["db_paths_inspected"])
-    result["cross_game_contingency_presence"] = None
+    result["cross_game_contingency_count"] = sum(1 for values in identity_games.values() if len(values) >= 2)
+    result["cross_sampler_contingency_count"] = sum(1 for values in identity_samplers.values() if len(values) >= 2)
+    result["cross_game_contingency_presence"] = (
+        result["cross_game_contingency_count"] > 0 if identity_games else None
+    )
+    result["games_per_contingency_identity"] = {key: len(value) for key, value in sorted(identity_games.items())}
+    result["samplers_per_contingency_identity"] = {key: len(value) for key, value in sorted(identity_samplers.items())}
     return result
 
 
@@ -554,6 +667,80 @@ def _infer_game_sampler_from_path(path: Path) -> tuple[str | None, str | None]:
         game = parts[-4]
         sampler = parts[-3]
     return game, sampler
+
+
+def _normalized_contingency_identity_fallback(
+    *,
+    context_level: Any,
+    action: Any,
+    effect_signature: Any,
+) -> str:
+    effect_text = str(effect_signature or "unknown").lower()
+    if ":" in effect_text:
+        effect_bucket = effect_text.split(":", 1)[0]
+    else:
+        effect_bucket = "unknown"
+    payload = {
+        "action_bucket": f"a{action}" if action is not None else "aunknown",
+        "context_bucket": f"ctx{max(0, min(int(context_level or 0), 3))}",
+        "effect_bucket": effect_bucket,
+    }
+    return "ncont:" + json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _family_signature_for_h01(connection: sqlite3.Connection, payload: dict[str, Any]) -> str:
+    family_id = payload.get("transformation_family")
+    row = None
+    try:
+        row = connection.execute(
+            "SELECT centroid_vector FROM transformation_families WHERE id = ?",
+            (family_id,),
+        ).fetchone()
+    except sqlite3.DatabaseError:
+        row = None
+    if row and row[0]:
+        return f"centroid:{row[0]}"
+    return f"family:{family_id}"
+
+
+def _prediction_metrics_from_prediction_results(connection: sqlite3.Connection) -> dict[str, Any]:
+    rows = [
+        dict(row)
+        for row in connection.execute(
+            """
+            SELECT context_signature, action, predicted_family, actual_family
+            FROM prediction_results
+            WHERE predicted_family IS NOT NULL
+              AND actual_family IS NOT NULL
+            ORDER BY interaction_id ASC
+            """
+        ).fetchall()
+    ]
+    if not rows:
+        return {"prediction_accuracy": None, "context_lift_values": []}
+    action_groups: dict[int, list[float]] = defaultdict(list)
+    context_action_groups: dict[tuple[str, int], list[float]] = defaultdict(list)
+    prediction_values: list[float] = []
+    for row in rows:
+        correct = 1.0 if int(row["predicted_family"]) == int(row["actual_family"]) else 0.0
+        action = int(row["action"])
+        context_signature = str(row["context_signature"])
+        prediction_values.append(correct)
+        action_groups[action].append(correct)
+        context_action_groups[(context_signature, action)].append(correct)
+    action_accuracy = {action: (sum(values) / len(values)) for action, values in action_groups.items() if values}
+    context_lifts: list[float] = []
+    for (context_signature, action), values in context_action_groups.items():
+        baseline = action_accuracy.get(action)
+        if baseline is None or not values:
+            continue
+        context_accuracy = sum(values) / len(values)
+        context_lifts.append(context_accuracy - baseline)
+    return {
+        "prediction_accuracy": sum(prediction_values) / len(prediction_values),
+        "context_lift_values": context_lifts,
+        "positive_context_lift_values": [value for value in context_lifts if value > 0.0],
+    }
 
 
 def _finalize_h01_result(result: dict[str, Any], output_dir: Path) -> None:
@@ -582,6 +769,8 @@ def _format_h01_text(result: dict[str, Any]) -> str:
         f"- stable_contingency_count: {_fmt(result.get('stable_contingency_count'))}",
         f"- mean_prediction_accuracy: {_fmt(result.get('mean_prediction_accuracy'))}",
         f"- mean_context_lift: {_fmt(result.get('mean_context_lift'))}",
+        f"- median_context_lift: {_fmt(result.get('median_context_lift'))}",
+        f"- positive_context_lift_count: {_fmt(result.get('positive_context_lift_count'))}",
         f"- contradiction_count: {_fmt(result.get('contradiction_count'))}",
         f"- repeated_contradiction_count: {_fmt(result.get('repeated_contradiction_count'))}",
         f"- context_expansion_suggested_count: {_fmt(result.get('context_expansion_suggested_count'))}",
@@ -590,6 +779,8 @@ def _format_h01_text(result: dict[str, Any]) -> str:
         f"- per-game contingency counts: {json.dumps(result.get('per_game_contingency_counts', {}), sort_keys=True)}",
         f"- per-sampler contingency counts: {json.dumps(result.get('per_sampler_contingency_counts', {}), sort_keys=True)}",
         f"- cross-game contingency presence: {_fmt(result.get('cross_game_contingency_presence'))}",
+        f"- cross-game contingency count: {_fmt(result.get('cross_game_contingency_count'))}",
+        f"- cross-sampler contingency count: {_fmt(result.get('cross_sampler_contingency_count'))}",
         f"- percentage of games with at least one stable contingency: {_fmt(result.get('percentage_games_with_stable_contingency'))}",
         f"- percentage of samplers with at least one stable contingency: {_fmt(result.get('percentage_samplers_with_stable_contingency'))}",
         "",
@@ -668,6 +859,16 @@ def _mean_or_none(values: list[float]) -> float | None:
     if not values:
         return None
     return float(sum(values) / len(values))
+
+
+def _median_or_none(values: list[float]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(float(value) for value in values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2 == 1:
+        return float(ordered[middle])
+    return float((ordered[middle - 1] + ordered[middle]) / 2.0)
 
 
 def _fmt(value: Any) -> str:

@@ -45,7 +45,7 @@ def evaluate_h10_future_option_attention(
     result = {
         "hypothesis_id": "H10",
         "evidence_source": "compact_memory",
-        "h10_attention_target_definition": "high_attention is based on replay_priority_score or contradiction_score only; derived memory_priority_score is diagnostic and is not used for validation.",
+        "h10_attention_target_definition": "high_attention is calibrated from the per-epoch attention score percentile, where attention_score = max(replay_priority_score, contradiction_score, memory_priority_score).",
         "future_option_attention_link_count": len(rows),
         "live_future_option_delta_count": sum(1 for row in rows if str(row.get("owner_type")) == "interaction"),
         "heuristic_future_option_delta_count": sum(1 for row in rows if str(row.get("owner_type")) != "interaction"),
@@ -71,6 +71,8 @@ def evaluate_h10_future_option_attention(
         "replay_attention_count": sum(1 for row in rows if float(row.get("replay_priority_score") or 0.0) >= 0.50),
         "contradiction_attention_count": sum(1 for row in rows if float(row.get("contradiction_score") or 0.0) >= 0.50),
         "replay_or_contradiction_attention_count": len(high_attention_rows),
+        "attention_threshold_method": rows[0].get("attention_threshold_method") if rows else None,
+        "attention_calibration_degenerate": bool(rows) and any(int(row.get("attention_calibration_degenerate") or 0) == 1 for row in rows),
         "attention_all_high_saturation": bool(rows) and len(high_attention_rows) == len(rows),
         "attention_all_low_saturation": bool(rows) and len(high_attention_rows) == 0,
         "attention_saturation": bool(rows) and (len(high_attention_rows) == len(rows) or len(high_attention_rows) == 0),
@@ -92,6 +94,11 @@ def evaluate_h10_future_option_attention(
         result["missing_evidence"].append(
             "Attention signal is saturated all-low; selective attention is not demonstrated."
         )
+    elif result["attention_calibration_degenerate"]:
+        result["decision"] = "PARTIALLY_VALID"
+        result["missing_evidence"].append(
+            "Attention calibration is degenerate because attention scores do not separate the evaluated interactions."
+        )
     elif len(high_both) > 0 and lift is None:
         result["decision"] = "PARTIALLY_VALID"
     elif (
@@ -100,6 +107,7 @@ def evaluate_h10_future_option_attention(
         and lift is not None
         and lift >= 1.25
         and (high_rate or 0.0) > (low_rate or 0.0)
+        and not result["attention_saturation"]
     ):
         result["decision"] = "VALID"
     elif (
@@ -131,6 +139,8 @@ def evaluate_h10_future_option_attention(
             "replay_attention_count",
             "contradiction_attention_count",
             "replay_or_contradiction_attention_count",
+            "attention_threshold_method",
+            "attention_calibration_degenerate",
             "attention_all_high_saturation",
             "attention_all_low_saturation",
             "attention_saturation",
@@ -163,6 +173,8 @@ def _write(output_dir: Path, result: dict[str, Any]) -> None:
         f"option-attention lift: {result.get('option_attention_lift')}\n"
         f"high-option-change attention rate: {result.get('high_option_change_attention_rate')}\n"
         f"low-option-change attention rate: {result.get('low_option_change_attention_rate')}\n"
+        f"attention threshold method: {result.get('attention_threshold_method')}\n"
+        f"attention calibration degenerate: {result.get('attention_calibration_degenerate')}\n"
         f"attention all-high saturation: {result.get('attention_all_high_saturation')}\n"
         f"attention all-low saturation: {result.get('attention_all_low_saturation')}\n"
         f"attention saturation: {result.get('attention_saturation')}\n"

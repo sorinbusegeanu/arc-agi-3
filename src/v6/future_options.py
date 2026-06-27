@@ -200,6 +200,7 @@ def derive_future_option_events(
             """
         ).fetchall()
     }
+    live_delta_threshold = _future_option_live_delta_threshold(list(live_option_by_interaction.values()))
     future_edge_by_interaction: dict[str, str] = {}
     for row in state_conn.execute(
         """
@@ -318,6 +319,7 @@ def derive_future_option_events(
                     interaction_ids_by_family.get(family_signature, set()),
                     future_edge_by_interaction,
                 ),
+                live_delta_threshold=live_delta_threshold,
             )
         )
     for row in state_conn.execute(
@@ -367,6 +369,7 @@ def derive_future_option_events(
                 action_group=carrier_family_meta.get("action_group"),
                 live_option_delta=_mean_live_delta_for_interactions(carrier_interactions, live_option_by_interaction),
                 future_option_edge_type=_majority_edge_type_for_interactions(carrier_interactions, future_edge_by_interaction),
+                live_delta_threshold=live_delta_threshold,
             )
         )
     for row in state_conn.execute(
@@ -416,6 +419,7 @@ def derive_future_option_events(
                 action_group=role_family_meta.get("action_group"),
                 live_option_delta=_mean_live_delta_for_interactions(role_interactions, live_option_by_interaction),
                 future_option_edge_type=_majority_edge_type_for_interactions(role_interactions, future_edge_by_interaction),
+                live_delta_threshold=live_delta_threshold,
             )
         )
     _write_future_milestone(state_conn, "first_future_option_event_step", first_event_step, None)
@@ -773,6 +777,21 @@ def derive_future_option_attention_links(state_conn: sqlite3.Connection) -> dict
                     "source_label": "heuristic",
                 }
             )
+    attention_scores = [
+        max(
+            float(row.get("replay_priority_score") or 0.0),
+            float(row.get("contradiction_score") or 0.0),
+            float(row.get("memory_priority_score") or 0.0),
+        )
+        for row in rows
+    ]
+    attention_all_equal = bool(attention_scores) and max(attention_scores) == min(attention_scores)
+    percentile_80 = _percentile(attention_scores, 0.80) if attention_scores else None
+    percentile_50 = _percentile(attention_scores, 0.50) if attention_scores else None
+    attention_threshold_method = "p80_epoch" if attention_scores else "unavailable"
+    attention_calibration_degenerate = bool(attention_scores) and (
+        attention_all_equal or percentile_80 is None or float(percentile_80) <= 0.0
+    )
     high_option_change_count = 0
     high_attention_count = 0
     high_both_count = 0
@@ -784,7 +803,11 @@ def derive_future_option_attention_links(state_conn: sqlite3.Connection) -> dict
         memory_priority = float(row.get("memory_priority_score") or 0.0)
         contradiction_score = float(row.get("contradiction_score") or 0.0)
         high_option_change = int(row.get("high_option_change") or 0)
-        high_attention = int(row.get("high_attention") or 0)
+        attention_score = max(replay_priority, contradiction_score, memory_priority)
+        attention_score_percentile = _percentile_rank(attention_scores, attention_score) if attention_scores else None
+        high_attention = 0
+        if not attention_calibration_degenerate and percentile_80 is not None and float(percentile_80) > 0.0:
+            high_attention = int(attention_score >= float(percentile_80))
         attention_signal_source = str(row.get("attention_signal_source") or "none")
         sources_seen.add(str(row.get("source_label") or "none"))
         state_conn.execute(
@@ -792,9 +815,10 @@ def derive_future_option_attention_links(state_conn: sqlite3.Connection) -> dict
             INSERT INTO future_option_attention_links (
                 event_id, motif_signature, owner_type, owner_key, option_delta_abs, replay_priority_score,
                 memory_priority_score, contradiction_score, high_option_change, high_attention,
-                attention_signal_source, first_seen_global_step, last_seen_global_step
+                attention_signal_source, attention_score, attention_score_percentile, attention_threshold_method,
+                attention_calibration_degenerate, first_seen_global_step, last_seen_global_step
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 row["event_id"],
@@ -808,6 +832,10 @@ def derive_future_option_attention_links(state_conn: sqlite3.Connection) -> dict
                 high_option_change,
                 high_attention,
                 attention_signal_source,
+                attention_score,
+                attention_score_percentile,
+                attention_threshold_method,
+                int(bool(attention_calibration_degenerate)),
                 row["first_seen_global_step"],
                 row["last_seen_global_step"],
             ),
@@ -851,6 +879,10 @@ def derive_future_option_attention_links(state_conn: sqlite3.Connection) -> dict
         "low_option_change_attention_count": low_attention_count,
         "option_attention_lift": lift,
         "option_attention_lift_unbounded": lift_unbounded,
+        "attention_threshold_method": attention_threshold_method,
+        "attention_calibration_degenerate": attention_calibration_degenerate,
+        "attention_threshold_p80": percentile_80,
+        "attention_threshold_p50": percentile_50,
     }
 
 
@@ -1009,6 +1041,7 @@ def _build_future_option_event(
     action_group: str | None = None,
     live_option_delta: float | None = None,
     future_option_edge_type: str | None = None,
+    live_delta_threshold: float | None = None,
 ) -> dict[str, Any]:
     motif_type, text_tokens, motif_type_source = _detect_motif_type(
         text_fragments,
@@ -1019,6 +1052,7 @@ def _build_future_option_event(
         polarity=polarity,
         live_option_delta=live_option_delta,
         future_option_edge_type=future_option_edge_type,
+        live_delta_threshold=live_delta_threshold,
     )
     polarity_text = str(polarity or "").lower()
     combined_text = " ".join(str(item or "") for item in text_fragments).lower()
@@ -1134,6 +1168,7 @@ def _detect_motif_type(
     polarity: Any = None,
     live_option_delta: float | None = None,
     future_option_edge_type: str | None = None,
+    live_delta_threshold: float | None = None,
 ) -> tuple[str, list[str], str]:
     text = " ".join(str(item or "") for item in text_fragments).lower()
     effect_text = str(effect_type or "").lower()
@@ -1141,15 +1176,17 @@ def _detect_motif_type(
     polarity_text = str(polarity or "").lower()
     if live_option_delta is not None:
         delta = float(live_option_delta)
-        if delta >= 1.0:
-            return ("branch" if "branch" in action_text or "split" in text else "enable"), _tokenize_text_fragments(text_fragments), "live_delta"
-        if delta >= 0.25:
-            return "transform", _tokenize_text_fragments(text_fragments), "live_delta"
-        if delta > -0.25:
-            return "stabilize", _tokenize_text_fragments(text_fragments), "live_delta"
-        if delta > -1.0:
-            return ("merge" if "merge" in action_text or "combine" in text else "block"), _tokenize_text_fragments(text_fragments), "live_delta"
-        return ("terminate" if "terminal" in effect_text or "end" in text else "block"), _tokenize_text_fragments(text_fragments), "live_delta"
+        positive_threshold = max(0.01, float(live_delta_threshold or 0.01))
+        negative_threshold = -positive_threshold
+        if delta > positive_threshold:
+            if future_option_edge_type == "expands_future_options" or any(token in text for token in ("enable", "open", "unlock", "allow", "access", "branch", "split")):
+                return "enable", _tokenize_text_fragments(text_fragments), "live_delta_rule"
+            if any(token in effect_text for token in ("preserve", "no_change")) or "stabil" in text:
+                return "stabilize", _tokenize_text_fragments(text_fragments), "live_delta_rule"
+            return "transform", _tokenize_text_fragments(text_fragments), "live_delta_rule"
+        if delta < negative_threshold:
+            return "constrain", _tokenize_text_fragments(text_fragments), "live_delta_rule"
+        return "neutral", _tokenize_text_fragments(text_fragments), "live_delta_rule"
     if future_option_edge_type:
         edge_type = str(future_option_edge_type)
         if edge_type == "expands_future_options":
@@ -1192,7 +1229,9 @@ def _base_option_delta(motif_type: str) -> float:
         "transform": 1.0,
         "reversible": 0.5,
         "stabilize": 0.0,
+        "neutral": 0.0,
         "merge": -0.5,
+        "constrain": -1.0,
         "block": -1.0,
         "terminate": -2.0,
         "unknown": 0.0,
@@ -1283,6 +1322,36 @@ def _bucket(value: int) -> str:
 
 def _clamp01(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
+
+
+def _future_option_live_delta_threshold(values: list[float]) -> float:
+    cooked = [abs(float(value)) for value in values if value is not None]
+    if not cooked:
+        return 0.01
+    return max(0.01, float(_percentile(cooked, 0.60) or 0.01))
+
+
+def _percentile(values: list[float], fraction: float) -> float | None:
+    if not values:
+        return None
+    cooked = sorted(float(value) for value in values)
+    if len(cooked) == 1:
+        return cooked[0]
+    position = max(0.0, min(1.0, float(fraction))) * float(len(cooked) - 1)
+    low = int(position)
+    high = min(len(cooked) - 1, low + 1)
+    if low == high:
+        return cooked[low]
+    weight = position - float(low)
+    return cooked[low] * (1.0 - weight) + cooked[high] * weight
+
+
+def _percentile_rank(values: list[float], target: float) -> float | None:
+    if not values:
+        return None
+    cooked = sorted(float(value) for value in values)
+    less_equal = sum(1 for value in cooked if value <= float(target))
+    return float(less_equal) / float(len(cooked))
 
 
 def _mean(values: list[Any]) -> float | None:

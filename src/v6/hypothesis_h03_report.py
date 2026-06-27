@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -707,6 +708,7 @@ def _compute_contingency_join_family_candidate(
             c.id AS contingency_id,
             c.context_signature,
             c.action,
+            c.transformation_family AS family_id,
             c.support_count,
             tf.centroid_vector AS centroid_vector
         FROM contingencies AS c
@@ -725,8 +727,9 @@ def _compute_contingency_join_family_candidate(
             "contingency_id": item[0],
             "context_signature": item[1],
             "action": item[2],
-            "support_count": item[3],
-            "centroid_vector": item[4],
+            "family_id": item[3],
+            "support_count": item[4],
+            "centroid_vector": item[5],
         }
         for item in fetched
     ]
@@ -734,7 +737,7 @@ def _compute_contingency_join_family_candidate(
         rows,
         sqlite_path=sqlite_path,
         run_dir=run_dir,
-        family_column=None,
+        family_column="family_id",
         semantic_column="centroid_vector",
         contingency_column="contingency_id",
         support_column="support_count",
@@ -752,6 +755,10 @@ def _compute_contingency_join_family_candidate(
     )
     if not observations:
         return None
+    family_prediction_lift_by_signature = _compute_family_prediction_lift_from_prediction_results(
+        connection,
+        family_id_to_signature=_family_id_to_group_signature(observations),
+    )
     return {
         "selected_db_paths": [str(sqlite_path)],
         "tables_seen": [table_name, "transformation_families"],
@@ -761,6 +768,7 @@ def _compute_contingency_join_family_candidate(
         "row_count_used": len(rows),
         "max_rows_applied": row_count_available is not None and len(rows) < row_count_available,
         "family_observations": observations,
+        "family_prediction_lift_by_signature": family_prediction_lift_by_signature,
         "global_family_count_before_merge": len({item["canonical_signature"] for item in observations}),
         "usable_direct_family_evidence": True,
         "stability_approximated": True,
@@ -834,6 +842,10 @@ def _compute_family_table_candidate(
     )
     if not observations:
         return None
+    family_prediction_lift_by_signature = _compute_family_prediction_lift_from_prediction_results(
+        connection,
+        family_id_to_signature=_family_id_to_group_signature(observations),
+    )
     candidate = {
         "selected_db_paths": [str(sqlite_path)],
         "tables_seen": [table_name],
@@ -843,6 +855,7 @@ def _compute_family_table_candidate(
         "row_count_used": row_count_used,
         "max_rows_applied": row_count_available is not None and row_count_used < row_count_available,
         "family_observations": observations,
+        "family_prediction_lift_by_signature": family_prediction_lift_by_signature,
         "global_family_count_before_merge": len({item["canonical_signature"] for item in observations}),
         "usable_direct_family_evidence": True,
         "stability_approximated": stability_column is None,
@@ -913,6 +926,7 @@ def _compute_derivable_family_candidate(
         "row_count_used": row_count_used,
         "max_rows_applied": row_count_available is not None and row_count_used < row_count_available,
         "family_observations": observations,
+        "family_prediction_lift_by_signature": {},
         "global_family_count_before_merge": len({item["canonical_signature"] for item in observations}),
         "usable_direct_family_evidence": True,
         "stability_approximated": True,
@@ -939,6 +953,8 @@ def _aggregate_h03_db_candidates(candidates: list[dict[str, Any]], *, min_family
                 item["canonical_signature"],
                 {
                     "member_keys": set(),
+                    "member_count_hint_total": 0,
+                    "strict_signatures": set(),
                     "games": set(),
                     "samplers": set(),
                     "contexts": set(),
@@ -947,12 +963,17 @@ def _aggregate_h03_db_candidates(candidates: list[dict[str, Any]], *, min_family
                     "compression_values": [],
                     "ratio_values": [],
                     "prediction_lift_values": [],
+                    "baseline_prediction_correct": 0,
+                    "family_prediction_correct": 0,
+                    "family_prediction_total": 0,
                     "stable_flags": [],
                     "actions": set(),
                     "effect_types": set(),
                 },
             )
             family["member_keys"].add(item["member_key"])
+            family["member_count_hint_total"] += int(item.get("member_count_value") or 1)
+            family["strict_signatures"].add(item["strict_canonical_signature"])
             family["games"].update(item["games"])
             family["samplers"].update(item["samplers"])
             family["contexts"].update(item["contexts"])
@@ -972,9 +993,17 @@ def _aggregate_h03_db_candidates(candidates: list[dict[str, Any]], *, min_family
                 family["effect_types"].add(item["effect_type"])
             if item["games"] or item["samplers"]:
                 explicit_game_sampler_coverage = True
+        lift_by_signature = dict(candidate.get("family_prediction_lift_by_signature", {}) or {})
+        for signature, lift_info in lift_by_signature.items():
+            family = global_families.get(signature)
+            if family is None:
+                continue
+            family["baseline_prediction_correct"] += int(lift_info.get("baseline_correct_count") or 0)
+            family["family_prediction_correct"] += int(lift_info.get("family_correct_count") or 0)
+            family["family_prediction_total"] += int(lift_info.get("row_count") or 0)
 
     family_count = len(global_families)
-    member_counts = [len(item["member_keys"]) for item in global_families.values()]
+    member_counts = [max(len(item["member_keys"]), int(item.get("member_count_hint_total") or 0)) for item in global_families.values()]
     family_member_count_total = sum(member_counts)
     singleton_family_count = sum(1 for count in member_counts if count <= 1)
     stable_family_count = sum(
@@ -982,9 +1011,18 @@ def _aggregate_h03_db_candidates(candidates: list[dict[str, Any]], *, min_family
         for item in global_families.values()
         if item["support_total"] >= float(min_family_support) or any(item["stable_flags"])
     )
+    derived_lift_values = [
+        (
+            (float(item["family_prediction_correct"]) / float(item["family_prediction_total"]))
+            - (float(item["baseline_prediction_correct"]) / float(item["family_prediction_total"]))
+        )
+        for item in global_families.values()
+        if int(item["family_prediction_total"]) > 0
+    ]
     top_global_families = [
         {
             "canonical_signature": signature,
+            "strict_signature_count": len(item["strict_signatures"]),
             "member_count": len(item["member_keys"]),
             "games": sorted(item["games"]),
             "samplers": sorted(item["samplers"]),
@@ -1029,13 +1067,19 @@ def _aggregate_h03_db_candidates(candidates: list[dict[str, Any]], *, min_family
             value for item in global_families.values() for value in item["compression_values"]
         ),
         "family_prediction_lift_mean": _mean_or_none(
-            value for item in global_families.values() for value in item["prediction_lift_values"]
+            derived_lift_values
+            if derived_lift_values
+            else [value for item in global_families.values() for value in item["prediction_lift_values"]]
         ),
         "family_prediction_lift_median": _median_or_none(
-            value for item in global_families.values() for value in item["prediction_lift_values"]
+            derived_lift_values
+            if derived_lift_values
+            else [value for item in global_families.values() for value in item["prediction_lift_values"]]
         ),
         "family_prediction_lift_max": _max_or_none(
-            value for item in global_families.values() for value in item["prediction_lift_values"]
+            derived_lift_values
+            if derived_lift_values
+            else [value for item in global_families.values() for value in item["prediction_lift_values"]]
         ),
         "family_cross_context_count": sum(1 for item in global_families.values() if len(item["contexts"]) > 1),
         "family_cross_game_count": (
@@ -1125,7 +1169,7 @@ def _singleton_diagnostics(
     singletons = [
         (signature, item)
         for signature, item in global_families.items()
-        if len(item["member_keys"]) <= 1
+        if max(len(item["member_keys"]), int(item.get("member_count_hint_total") or 0)) <= 1
     ]
     by_game: dict[str, int] = {}
     by_sampler: dict[str, int] = {}
@@ -1622,13 +1666,15 @@ def _family_observations_from_rows(
     path_game, path_sampler = _infer_game_sampler_from_path(run_dir, sqlite_path)
     observations: list[dict[str, Any]] = []
     for row in rows:
-        canonical_signature = _canonical_family_signature(
+        strict_signature = _strict_family_signature(
             row,
             family_column=family_column,
             semantic_column=semantic_column,
         )
-        if canonical_signature is None:
+        if strict_signature is None:
             continue
+        action_value = _normalize_scalar(row.get(action_column)) if action_column is not None else None
+        canonical_signature = _normalized_family_group_signature(strict_signature, action_value)
         support_value = _maybe_float(row.get(support_column)) if support_column is not None else None
         if support_value is None:
             support_value = 1.0
@@ -1647,8 +1693,10 @@ def _family_observations_from_rows(
         observations.append(
             {
                 "canonical_signature": canonical_signature,
-                "strict_canonical_signature": canonical_signature,
+                "strict_canonical_signature": strict_signature,
                 "relaxed_canonical_signature": _relaxed_family_signature(canonical_signature),
+                "family_id_value": _normalize_scalar(row.get(family_column)) if family_column is not None else None,
+                "member_count_value": _maybe_int(row.get("member_count")) or 1,
                 "member_key": _member_key(
                     row,
                     sqlite_path=sqlite_path,
@@ -1666,14 +1714,14 @@ def _family_observations_from_rows(
                 "compression_ratio": ratio_value,
                 "prediction_lift": _maybe_float(row.get(prediction_lift_column)) if prediction_lift_column is not None else None,
                 "stable_flag": _stable_value(row.get(stability_column)) if stability_column is not None else (support_value >= float(min_family_support)),
-                "action_value": _normalize_scalar(row.get(action_column)) if action_column is not None else None,
-                "effect_type": _infer_effect_type(canonical_signature),
+                "action_value": action_value,
+                "effect_type": _infer_effect_type(strict_signature),
             }
         )
     return observations
 
 
-def _canonical_family_signature(
+def _strict_family_signature(
     row: dict[str, Any],
     *,
     family_column: str | None,
@@ -1686,6 +1734,90 @@ def _canonical_family_signature(
     if semantic_value is not None:
         return semantic_value
     return None
+
+
+def _family_id_to_group_signature(observations: list[dict[str, Any]]) -> dict[str, str]:
+    output: dict[str, str] = {}
+    for item in observations:
+        family_id_value = item.get("family_id_value")
+        if family_id_value in (None, ""):
+            continue
+        output[str(family_id_value)] = str(item["canonical_signature"])
+    return output
+
+
+def _compute_family_prediction_lift_from_prediction_results(
+    connection: sqlite3.Connection,
+    *,
+    family_id_to_signature: dict[str, str],
+) -> dict[str, dict[str, Any]]:
+    if not family_id_to_signature:
+        return {}
+    table_map = _load_table_map(connection)
+    columns = table_map.get("prediction_results", set())
+    if "prediction_results" not in table_map or "actual_family" not in columns or "predicted_family" not in columns:
+        return {}
+    try:
+        rows = connection.execute(
+            """
+            SELECT actual_family, predicted_family, COUNT(*) AS row_count
+            FROM prediction_results
+            WHERE actual_family IS NOT NULL
+              AND predicted_family IS NOT NULL
+            GROUP BY actual_family, predicted_family
+            ORDER BY actual_family ASC, predicted_family ASC
+            """
+        ).fetchall()
+    except sqlite3.DatabaseError:
+        return {}
+    stats: dict[str, dict[str, Any]] = {}
+    for actual_family, predicted_family, row_count in rows:
+        actual_key = str(actual_family)
+        predicted_key = str(predicted_family)
+        actual_signature = family_id_to_signature.get(actual_key)
+        if actual_signature is None:
+            continue
+        predicted_signature = family_id_to_signature.get(predicted_key)
+        info = stats.setdefault(
+            actual_signature,
+            {
+                "row_count": 0,
+                "baseline_correct_count": 0,
+                "family_correct_count": 0,
+                "baseline_prediction_accuracy": None,
+                "family_prediction_accuracy": None,
+                "family_prediction_lift": None,
+            },
+        )
+        count = int(row_count or 0)
+        info["row_count"] += count
+        if predicted_key == actual_key:
+            info["baseline_correct_count"] += count
+        if predicted_signature == actual_signature:
+            info["family_correct_count"] += count
+    for info in stats.values():
+        total = int(info["row_count"] or 0)
+        if total <= 0:
+            continue
+        baseline_accuracy = float(info["baseline_correct_count"]) / float(total)
+        family_accuracy = float(info["family_correct_count"]) / float(total)
+        info["baseline_prediction_accuracy"] = baseline_accuracy
+        info["family_prediction_accuracy"] = family_accuracy
+        info["family_prediction_lift"] = family_accuracy - baseline_accuracy
+    return stats
+
+
+def _normalized_family_group_signature(signature: str, action_value: str | None) -> str:
+    effect_type = _normalized_effect_bucket(signature)
+    changed_cells, dx, dy = _signature_motion_features(signature)
+    payload = {
+        "action_role": _action_role_bucket(action_value),
+        "effect_type": effect_type,
+        "delta_bucket": _delta_bucket(changed_cells),
+        "direction_bucket": _direction_bucket(dx, dy),
+        "terminal_bucket": _terminal_bucket(signature),
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
 def _normalized_signature_value(value: Any) -> str | None:
@@ -1747,6 +1879,73 @@ def _relaxed_family_signature(signature: str) -> str:
         }
         return json.dumps(relaxed, sort_keys=True, separators=(",", ":"))
     return _relax_text_signature(signature)
+
+
+def _normalized_effect_bucket(signature: str) -> str:
+    effect_type = _infer_effect_type(signature)
+    if effect_type in {"positive_change", "expand_like"}:
+        return "positive_change"
+    if effect_type in {"negative_change", "restrict_like"}:
+        return "negative_change"
+    if effect_type == "mixed_change":
+        return "mixed_change"
+    if effect_type == "preserve_like":
+        return "no_change"
+    return "mixed_change" if "mixed" in effect_type else "no_change"
+
+
+def _signature_motion_features(signature: str) -> tuple[float | None, float | None, float | None]:
+    try:
+        parsed = json.loads(signature)
+    except Exception:
+        parsed = None
+    if isinstance(parsed, list) and len(parsed) >= 3:
+        changed_cells = _maybe_float(parsed[0])
+        dx = _maybe_float(parsed[1])
+        dy = _maybe_float(parsed[2])
+        return changed_cells, dx, dy
+    numeric_tokens = [
+        _maybe_float(token)
+        for token in re.findall(r"-?\d+(?:\.\d+)?", str(signature))
+    ]
+    numeric_values = [value for value in numeric_tokens if value is not None]
+    changed_cells = numeric_values[0] if len(numeric_values) >= 1 else None
+    dx = numeric_values[1] if len(numeric_values) >= 2 else None
+    dy = numeric_values[2] if len(numeric_values) >= 3 else None
+    return changed_cells, dx, dy
+
+
+def _action_role_bucket(action_value: str | None) -> str:
+    if action_value not in (None, "", "unknown"):
+        return f"action:{action_value}"
+    return f"action_class:{_action_group(action_value or 'unknown')}"
+
+
+def _delta_bucket(changed_cells: float | None) -> str:
+    if changed_cells is None or changed_cells <= 0:
+        return "none"
+    if changed_cells <= 4:
+        return "small"
+    if changed_cells <= 16:
+        return "medium"
+    return "large"
+
+
+def _direction_bucket(dx: float | None, dy: float | None) -> str:
+    if dx is None or dy is None:
+        return "mixed"
+    if abs(dx) < 0.5 and abs(dy) < 0.5:
+        return "none"
+    if abs(dx) > abs(dy):
+        return "right" if dx > 0 else "left"
+    if abs(dy) > abs(dx):
+        return "down" if dy > 0 else "up"
+    return "mixed"
+
+
+def _terminal_bucket(signature: str) -> str:
+    lowered = str(signature).lower()
+    return "terminal" if any(token in lowered for token in ("terminal", "reset", "win", "game_over")) else "non_terminal"
 
 
 def _bucket_numeric_value(value: float | int) -> int:

@@ -37,20 +37,6 @@ DEFAULT_ISF_WEIGHTS = {
 }
 
 
-def scalarize_reward(value: Any) -> float:
-    if isinstance(value, bool):
-        return float(value)
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, dict):
-        numbers = [abs(float(item)) for item in value.values() if isinstance(item, (int, float)) and not isinstance(item, bool)]
-        return max(numbers, default=0.0)
-    if isinstance(value, (list, tuple)):
-        numbers = [abs(float(item)) for item in value if isinstance(item, (int, float)) and not isinstance(item, bool)]
-        return max(numbers, default=0.0)
-    return 0.0
-
-
 def bool_scalar(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -63,7 +49,6 @@ def bool_scalar(value: Any) -> bool:
 
 def compute_interaction_significance(
     *,
-    reward: Any,
     terminated: Any,
     truncated: Any,
     prediction_correct: bool | None,
@@ -84,24 +69,28 @@ def compute_interaction_significance(
     memory_counts = memory_counts or {}
     graph_counts = graph_counts or {}
 
-    reward_value = scalarize_reward(reward)
-    survival_impact = clamp01(abs(reward_value))
-    if bool_scalar(terminated) or bool_scalar(truncated):
-        survival_impact = max(survival_impact, 0.75)
+    # ISF is not reward, value, or utility.
+    # survival_impact means effect on continued agency/future-interaction possibility.
+    # High survival_impact means memory significance, not positive outcome.
+    survival_impact = 0.0
     normalized_outcome_state = None if outcome_state in (None, "") else str(outcome_state)
     normalized_outcome_polarity = None if outcome_polarity in (None, "") else str(outcome_polarity)
-    if normalized_outcome_state == "WIN":
-        survival_impact = 1.0
-        normalized_outcome_polarity = "positive"
-    elif normalized_outcome_state == "GAME_OVER":
+    if normalized_outcome_state == "GAME_OVER":
         survival_impact = 1.0
         normalized_outcome_polarity = "negative"
+    elif normalized_outcome_state == "WIN":
+        survival_impact = 0.75
+        normalized_outcome_polarity = "positive"
     elif bool(level_completed_event):
-        survival_impact = max(survival_impact, 0.75)
+        survival_impact = max(survival_impact, 0.50)
         normalized_outcome_polarity = "positive"
     elif normalized_outcome_state == "NOT_FINISHED":
         survival_impact = max(survival_impact, 0.0)
         normalized_outcome_polarity = normalized_outcome_polarity or "neutral"
+    if bool_scalar(terminated) or bool_scalar(truncated):
+        survival_impact = max(survival_impact, 0.50)
+    if future_option_delta is not None and float(future_option_delta) < 0.0:
+        survival_impact = max(survival_impact, clamp01(abs(float(future_option_delta))))
 
     if prediction_correct is True:
         prediction_error = 1.0 - clamp01(prediction_confidence or 0.0)

@@ -6,11 +6,14 @@ import sqlite3
 from dataclasses import dataclass
 from hashlib import sha1
 from pathlib import Path
+from queue import Full
 from typing import Any
+
+import numpy as np
 
 from v6.carrier_emergence import CarrierEmergenceTracker, extract_carrier_signature
 from v6.contingency.context_builder import ContextBuilder
-from v6.contingency.contingency_learner import ContingencyLearner
+from v6.contingency.contingency_learner import Contingency, ContingencyLearner
 from v6.context.contradiction_tracker import ContextContradictionTracker
 from v6.delta.delta_extractor import DeltaExtractor
 from v6.efficiency_metrics import EfficiencyTracker
@@ -19,9 +22,10 @@ from v6.evaluation.metrics import MetricsSnapshot, compute_metrics
 from v6.graph.graph_manager import GraphManager
 from v6.interaction_significance import compute_interaction_significance
 from v6.future_options import FutureOptionEstimator
-from v6.memory_lifecycle import MemoryLifecycleManager
+from v6.memory_lifecycle import MemoryLifecycleManager, MemoryRecord, ReplayCandidate
 from v6.memory.contingency_store import ContingencyStore
 from v6.memory.compact_memory import fold_live_system_into_compact_memory
+from v6.memory.live_memory_queue import LiveMemoryEvent, LiveMemoryReadCache
 from v6.memory.promotion_engine import MemoryPromotionConfig, MemoryPromotionEngine
 from v6.memory.query_engine import MemoryQueryEngine
 from v6.memory.compact_memory_restore import load_compact_memory_into_system
@@ -88,6 +92,9 @@ class V6Config:
     memory_query_use_concepts: bool = True
     memory_query_use_future_options: bool = True
     memory_query_failure_penalty: float = 0.25
+    shared_live_memory_mode: str = "none"
+    live_memory_worker_id: str | None = None
+    live_memory_refresh_steps: int = 250
 
 
 @dataclass(frozen=True)
@@ -102,11 +109,20 @@ class StepResult:
 
 
 class V6System:
-    def __init__(self, env: Environment, config: V6Config | None = None, action_sampler: Any | None = None) -> None:
+    def __init__(
+        self,
+        env: Environment,
+        config: V6Config | None = None,
+        action_sampler: Any | None = None,
+        live_memory_queue: Any | None = None,
+        live_memory_cache: LiveMemoryReadCache | None = None,
+    ) -> None:
         self.env = env
         self.config = config or V6Config()
         self.rng = random.Random(self.config.random_seed)
         self.action_sampler = action_sampler
+        self.live_memory_queue = live_memory_queue
+        self.live_memory_cache = live_memory_cache
         self.connection = sqlite3.connect(self.config.database_path)
         self._auto_commit = int(self.config.database_commit_every) <= 1
         self.memory = MemorySubstrate(self.connection, auto_commit=self._auto_commit)
@@ -165,6 +181,20 @@ class V6System:
         self._current_level_interaction_ids: list[int] = []
         self._last_memory_interaction_node_id: str | None = None
         self._interaction_memory_node_ids: dict[int, str] = {}
+        self._live_memory_imported_contingency_keys: set[str] = set()
+        self._live_memory_imported_replay_ids: set[str] = set()
+        self._live_memory_imported_carrier_signatures: set[str] = set()
+        self.live_memory_events_emitted = 0
+        self.live_memory_events_dropped_queue_full = 0
+        self.live_memory_events_dropped_error = 0
+        self.live_memory_refresh_count = 0
+        self.live_memory_refresh_failed_count = 0
+        self.live_memory_stable_contingencies_imported = 0
+        self.live_memory_replay_candidates_imported = 0
+        self.live_memory_carrier_candidates_imported = 0
+        self.live_memory_family_updates_imported = 0
+        self.live_memory_contradiction_clusters_loaded = 0
+        self.live_memory_future_option_events_loaded = 0
         self.compact_memory_restore_summary: dict[str, Any] = {
             "stable_contingencies_restored": 0,
             "transformation_families_restored": 0,
@@ -211,6 +241,7 @@ class V6System:
         return int(self.rng.choice(actions))
 
     def run_step(self) -> StepResult:
+        self._refresh_live_memory_if_due()
         for _attempt in range(100):
             if self.action_sampler is not None and hasattr(self.action_sampler, "before_step"):
                 self.action_sampler.before_step(self)
@@ -301,6 +332,19 @@ class V6System:
         if clustered:
             self.transformations.replace_families(self.clusterer.families)
             self.graph.replace_families(self.clusterer.families, self.clusterer.delta_to_family)
+            for family in self.clusterer.families.values():
+                family_signature = sha1(str(np.asarray(family.centroid_vector, dtype=float).tolist()).encode("utf-8")).hexdigest()[:20]
+                self._emit_live_memory_event(
+                    "family_update",
+                    f"family_update:{family_signature}",
+                    int(interaction.global_step),
+                    min(1.0, float(getattr(family, "support_count", 0) or 0) / 20.0),
+                    {
+                        "family_signature": family_signature,
+                        "family_id": int(family.id),
+                        "support_count": int(getattr(family, "support_count", 0) or 0),
+                    },
+                )
 
         actual_family = self.clusterer.family_for_delta(delta.id)
         if actual_family is None and self.clusterer.families:
@@ -329,6 +373,21 @@ class V6System:
                 after_option_set=future_option_after,
                 option_delta=future_option_delta,
             )
+            if abs(float(future_option_delta.delta_score)) > 0.0:
+                motif_type = "enable" if float(future_option_delta.delta_score) > 0.0 else "constrain"
+                self._emit_live_memory_event(
+                    "future_option_event",
+                    f"future_option_event:{interaction.id}",
+                    int(interaction.global_step),
+                    min(1.0, abs(float(future_option_delta.delta_score))),
+                    {
+                        "event_id": f"future_option_event:{interaction.id}",
+                        "interaction_id": str(interaction.id),
+                        "option_delta": float(future_option_delta.delta_score),
+                        "motif_type": motif_type,
+                        "motif_type_source": "live_delta_rule",
+                    },
+                )
         action_signature = f"a{int(action)}"
         actual_family_id = None if actual_family is None else str(actual_family)
         stable_delta_key = self._stable_delta_key(delta, outcome_state=outcome_state, level_completed_event=level_completed_event)
@@ -339,7 +398,6 @@ class V6System:
             outcome_state=outcome_state,
             level_completed_event=level_completed_event,
         )
-        reward = getattr(self.env, "last_reward", None)
         terminated = bool(getattr(self.env, "last_terminal_state", None))
         truncated = bool(getattr(self.env, "last_step_was_reset_boundary", False))
         isf_graph_counts = {
@@ -356,6 +414,33 @@ class V6System:
                 for stable in self.contingency_learner.stable_contingencies():
                     self.contingency_store.upsert_contingency(stable)
                     self.graph.add_contingency(stable)
+                    stable_key = sha1(
+                        json.dumps(
+                            {
+                                "context_level": int(stable.context_level),
+                                "context_signature": list(stable.context_signature),
+                                "action": int(stable.action),
+                                "family": int(stable.transformation_family),
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest()[:20]
+                    self._emit_live_memory_event(
+                        "stable_contingency",
+                        f"stable_contingency:{stable_key}",
+                        int(interaction.global_step),
+                        max(0.0, float(stable.confidence)),
+                        {
+                            "key": stable_key,
+                            "action": int(stable.action),
+                            "context_signature": json.dumps(list(stable.context_signature)),
+                            "context_level": int(stable.context_level),
+                            "transformation_family": int(stable.transformation_family),
+                            "support_count": int(stable.support_count),
+                            "confidence": float(stable.confidence),
+                        },
+                    )
             self.context_builder.update(actual_family, action)
             self._write_m1_m2_memory(
                 interaction_id=interaction.id,
@@ -365,7 +450,6 @@ class V6System:
             )
 
         isf_score = compute_interaction_significance(
-            reward=reward,
             terminated=terminated,
             truncated=truncated,
             prediction_correct=prediction_correct,
@@ -419,6 +503,27 @@ class V6System:
             context_signature=serialized_context_signature,
             actual_family_id=actual_family_id,
         )
+        if carrier_signature is not None and int(carrier_stats.get("carrier_support_count") or 0) >= int(self.config.carrier_min_support):
+            carrier_priority = min(
+                1.0,
+                max(
+                    float(carrier_stats.get("carrier_prediction_lift") or 0.0),
+                    float(carrier_stats.get("carrier_compression_gain") or 0.0),
+                    float(carrier_stats.get("carrier_support_count") or 0.0) / 100.0,
+                ),
+            )
+            self._emit_live_memory_event(
+                "carrier_candidate",
+                f"carrier_candidate:{carrier_signature}",
+                int(interaction.global_step),
+                carrier_priority,
+                {
+                    "carrier_signature": str(carrier_signature),
+                    "carrier_source": str(carrier_source),
+                    "support_count": int(carrier_stats.get("carrier_support_count") or 0),
+                    "linked_family_count": int(carrier_stats.get("carrier_distinct_family_count") or 0),
+                },
+            )
         efficiency_event = self.efficiency_tracker.record_interaction(
             interaction_id=str(interaction.id),
             before_observation=observation_before,
@@ -426,7 +531,7 @@ class V6System:
             delta=delta,
             context_signature=serialized_context_signature,
             action_signature=action_signature,
-            reward=reward,
+            reward=getattr(self.env, "last_reward", None),
             terminated=terminated,
             truncated=truncated,
             # Future-option deltas are post-run diagnostics only here; do not use future horizon data during sampling.
@@ -475,6 +580,19 @@ class V6System:
                 contradiction_event=contradiction_event,
                 actual_family_id=actual_family_id,
             )
+            if context_expansion_suggested or float(prediction_confidence or 0.0) >= 0.8:
+                self._emit_live_memory_event(
+                    "contradiction_cluster",
+                    f"contradiction_cluster:{contradiction_event.contradiction_key}",
+                    int(interaction.global_step),
+                    float(prediction_confidence or 1.0),
+                    {
+                        "contradiction_key": str(contradiction_event.contradiction_key),
+                        "context_signature": serialized_context_signature,
+                        "action_signature": action_signature,
+                        "count": int(self.context_contradictions.summary().get("repeated_contradiction_count", 1) or 1),
+                    },
+                )
         memory_record = self.memory_lifecycle.register_interaction(
             interaction_id=str(interaction.id),
             family_id=actual_family_id,
@@ -490,6 +608,21 @@ class V6System:
             timestamp_step=int(self.step_count),
         )
         replay_candidate = self.memory_lifecycle.replay_candidates.get(str(interaction.id))
+        if replay_candidate is not None and float(replay_candidate.replay_priority) >= 0.8:
+            self._emit_live_memory_event(
+                "high_priority_replay",
+                f"high_priority_replay:{interaction.id}",
+                int(interaction.global_step),
+                float(replay_candidate.replay_priority),
+                {
+                    "interaction_id": str(interaction.id),
+                    "replay_priority": float(replay_candidate.replay_priority),
+                    "reason": str(replay_candidate.reason),
+                    "family_id": actual_family_id,
+                    "context_signature": serialized_context_signature,
+                    "action_signature": action_signature,
+                },
+            )
         self._write_trajectory_and_efficiency_memory(
             interaction_id=interaction.id,
             efficiency_event=efficiency_event,
@@ -546,6 +679,18 @@ class V6System:
             outcome_polarity=outcome_polarity,
             level_completed_event=level_completed_event,
         )
+        if selected_contingency is not None and actual_family is not None and prediction_correct is not None:
+            self.contingency_store.record_contingency_prediction(
+                contingency_id=int(selected_contingency.id),
+                prediction_success=bool(prediction_correct),
+                prediction_error_before=None if prediction_confidence is None else max(0.0, 1.0 - float(prediction_confidence)),
+                prediction_error_after=0.0 if bool(prediction_correct) else 1.0,
+                normalized_contingency_key=self._normalized_contingency_key(
+                    context_level=prediction_context_level if prediction_context_level is not None else active_context_depth,
+                    action=action,
+                    actual_family_id=actual_family_id,
+                ),
+            )
         interaction = Interaction(
             id=interaction_id,
             timestamp=interaction_id,
@@ -789,6 +934,143 @@ class V6System:
             connection=self.connection,
         )
 
+    def _emit_live_memory_event(
+        self,
+        event_type: str,
+        event_id: str,
+        global_step: int,
+        priority: float,
+        payload: dict,
+    ) -> None:
+        if self.live_memory_queue is None:
+            return
+        if str(self.config.shared_live_memory_mode) not in {"write", "readwrite"}:
+            return
+        try:
+            self.live_memory_queue.put_nowait(
+                LiveMemoryEvent(
+                    event_type=str(event_type),
+                    event_id=str(event_id),
+                    global_step=int(global_step),
+                    worker_id=str(self.config.live_memory_worker_id or "unknown_worker"),
+                    priority=max(0.0, min(1.0, float(priority))),
+                    payload=dict(payload or {}),
+                )
+            )
+            self.live_memory_events_emitted += 1
+        except Full:
+            self.live_memory_events_dropped_queue_full += 1
+        except Exception:
+            self.live_memory_events_dropped_error += 1
+
+    def _refresh_live_memory_if_due(self) -> None:
+        if str(self.config.shared_live_memory_mode) != "readwrite" or self.live_memory_cache is None:
+            return
+        refreshed = self.live_memory_cache.refresh_if_due(int(self.step_count))
+        if refreshed:
+            self.live_memory_refresh_count += 1
+            self._apply_live_memory_cache()
+        elif int(getattr(self.live_memory_cache, "refresh_failed_count", 0) or 0) > self.live_memory_refresh_failed_count:
+            self.live_memory_refresh_failed_count = int(self.live_memory_cache.refresh_failed_count)
+
+    def _apply_live_memory_cache(self) -> None:
+        if self.live_memory_cache is None:
+            return
+        contingencies: list[Contingency] = []
+        for row in list(self.live_memory_cache.stable_contingencies):
+            key = str(row.get("key") or "")
+            if not key or key in self._live_memory_imported_contingency_keys:
+                continue
+            try:
+                context_signature = tuple(json.loads(str(row.get("context_signature") or "[]")))
+            except Exception:
+                continue
+            try:
+                contingency = Contingency(
+                    id=max(1, int.from_bytes(sha1(key.encode("utf-8")).digest()[:4], "big")),
+                    context_level=int(row.get("context_level") or 0),
+                    context_signature=context_signature,
+                    action=int(row.get("action") or 0),
+                    transformation_family=int(row.get("transformation_family") or 0),
+                    support_count=int(row.get("support_count") or 0),
+                    confidence=float(row.get("confidence") or 0.0),
+                )
+            except Exception:
+                continue
+            contingencies.append(contingency)
+            self._live_memory_imported_contingency_keys.add(key)
+        if contingencies:
+            self.contingency_learner.import_contingencies(contingencies)
+            self.live_memory_stable_contingencies_imported += len(contingencies)
+
+        for row in list(self.live_memory_cache.replay_candidates):
+            interaction_id = str(row.get("interaction_id") or "")
+            if not interaction_id:
+                continue
+            existing = self.memory_lifecycle.replay_candidates.get(interaction_id)
+            remote_priority = float(row.get("replay_priority") or 0.0)
+            if existing is not None and float(existing.replay_priority) >= remote_priority:
+                continue
+            if interaction_id not in self.memory_lifecycle.records:
+                self.memory_lifecycle.import_record(
+                    MemoryRecord(
+                        interaction_id=interaction_id,
+                        family_id=None if row.get("family_id") is None else str(row.get("family_id")),
+                        context_signature=None if row.get("context_signature") is None else str(row.get("context_signature")),
+                        action_signature=None if row.get("action_signature") is None else str(row.get("action_signature")),
+                        carrier_signature=None,
+                        isf_total=remote_priority,
+                        prediction_error=0.0,
+                        learning_value=remote_priority,
+                        transfer_potential=0.0,
+                        explanatory_potential=0.0,
+                        context_contradiction=False,
+                        timestamp_step=int(row.get("last_global_step") or self.step_count),
+                        replay_count=0,
+                        status="active",
+                        retention_reason=str(row.get("reason") or "shared_live_memory"),
+                    )
+                )
+            self.memory_lifecycle.import_replay_candidate(
+                ReplayCandidate(
+                    interaction_id=interaction_id,
+                    replay_priority=remote_priority,
+                    reason=str(row.get("reason") or "shared_live_memory"),
+                    family_id=None if row.get("family_id") is None else str(row.get("family_id")),
+                    context_signature=None if row.get("context_signature") is None else str(row.get("context_signature")),
+                    status="active",
+                )
+            )
+            if interaction_id not in self._live_memory_imported_replay_ids:
+                self.live_memory_replay_candidates_imported += 1
+                self._live_memory_imported_replay_ids.add(interaction_id)
+
+        for row in list(self.live_memory_cache.carrier_candidates):
+            carrier_signature = str(row.get("carrier_signature") or "")
+            if not carrier_signature or carrier_signature in self._live_memory_imported_carrier_signatures:
+                continue
+            self.carrier_tracker.import_candidate(
+                carrier_signature=carrier_signature,
+                carrier_source=str(row.get("carrier_source") or "unknown"),
+                support_count=int(row.get("support_count") or 0),
+                linked_family_count=int(row.get("linked_family_count") or 0),
+                first_seen_global_step=None,
+                last_seen_global_step=int(row.get("last_global_step") or self.step_count),
+                stability_score=float(row.get("priority") or 0.0),
+                is_emergent=str(row.get("carrier_source") or "") != "context_action_fallback",
+            )
+            self._live_memory_imported_carrier_signatures.add(carrier_signature)
+            self.live_memory_carrier_candidates_imported += 1
+
+        self.live_memory_contradiction_clusters_loaded = max(
+            self.live_memory_contradiction_clusters_loaded,
+            len(self.live_memory_cache.contradiction_clusters),
+        )
+        self.live_memory_future_option_events_loaded = max(
+            self.live_memory_future_option_events_loaded,
+            len(self.live_memory_cache.future_option_events),
+        )
+
     def _context_depth_for_action(self, action: int) -> int:
         if not bool(self.config.adaptive_context_expansion):
             depth = self.base_context_depth
@@ -869,6 +1151,24 @@ class V6System:
             if int(predicted_family) in distribution:
                 return float(distribution[int(predicted_family)])
         return None
+
+    def _normalized_contingency_key(
+        self,
+        *,
+        context_level: int | None,
+        action: int,
+        actual_family_id: str | None,
+    ) -> str | None:
+        if actual_family_id is None:
+            return None
+        payload = {
+            "action_bucket": f"a{int(action)}",
+            "context_bucket": f"ctx{max(0, min(int(context_level or 0), 3))}",
+            "family_bucket": str(actual_family_id),
+        }
+        return "raw_contingency:" + sha1(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()[:20]
 
     def _apply_post_factum_level_completion_credit(self, *, completion_interaction_id: int) -> None:
         ids = list(self._current_level_interaction_ids)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import inspect
 import json
+import multiprocessing
 import os
 import re
 import sqlite3
@@ -26,6 +27,13 @@ from v6.evaluation.id_free_prefuture_validation import ID_FREE_FEATURE_SETS, eva
 from v6.evaluation.prefuture_role_prediction import PREFUTURE_CLASSIFIERS, load_prefuture_examples
 from v6.game_sets import load_game_set_manifest, parquet_games_present
 from v6.main import V6Config, V6System
+from v6.memory.live_memory_queue import (
+    LiveMemoryReadCache,
+    LiveMemoryWriterConfig,
+    make_live_memory_queue,
+    start_live_memory_writer,
+    stop_live_memory_writer,
+)
 from v6.memory.compact_memory import (
     CompactMemoryFoldConfig,
     fold_sampling_job_sidecars_into_compact_memory,
@@ -96,6 +104,11 @@ class InteractionSamplingConfig:
     ram_ramp_threshold_percent: float = 85.0
     initial_worker_ramp_delay_seconds: float = 20.0
     per_worker_ramp_delay_seconds: float = 5.0
+    shared_live_memory: str = "none"
+    live_memory_refresh_steps: int = 250
+    live_memory_queue_maxsize: int = 100_000
+    live_memory_batch_size: int = 1000
+    live_memory_flush_seconds: float = 2.0
 
 
 def resolve_game_ids(games_arg: str, env_root: str | None = None) -> list[str]:
@@ -140,6 +153,13 @@ def parse_v05c_samplers(selector: str) -> tuple[str, ...]:
 def run_interaction_sampling_v05c(config: InteractionSamplingConfig) -> list[dict]:
     config = resolve_interaction_sampling_scope(config)
     output = Path(config.output_dir)
+    if str(config.shared_live_memory) != "none" and not config.memory_output_dir:
+        config = InteractionSamplingConfig(
+            **{
+                **config.__dict__,
+                "memory_output_dir": str(output / "memory"),
+            }
+        )
     sampling_root = output / ("sampling_v05c_sqlite_tmp" if config.storage_backend == "parquet" else "sampling_v05c")
     sampling_root.mkdir(parents=True, exist_ok=True)
     worker_execution = _generate_sampling_dbs(config, sampling_root)
@@ -173,6 +193,15 @@ def run_interaction_sampling_v05c(config: InteractionSamplingConfig) -> list[dic
         "memory_input_dir": config.memory_input_dir,
         "memory_output_dir": config.memory_output_dir,
         "worker_execution": worker_execution,
+        "shared_live_memory": {
+            "mode": str(config.shared_live_memory),
+            "enabled": str(config.shared_live_memory) != "none",
+            "writer_started": bool(worker_execution.get("live_memory_writer_started", False)),
+            "writer_exitcode": worker_execution.get("live_memory_writer_exitcode"),
+            "writer_forced_terminated": bool(worker_execution.get("live_memory_writer_forced_terminated", False)),
+            "summary_path": worker_execution.get("live_memory_summary_path"),
+            "live_memory_event_counts": worker_execution.get("live_memory_event_counts"),
+        },
         "temporal_milestones": temporal_milestones,
         "level_completion_records": level_completion_records,
         **epoch_completion,
@@ -257,6 +286,11 @@ def _generate_sampling_dbs(config: InteractionSamplingConfig, sampling_root: Pat
                             "memory_output_dir": config.memory_output_dir,
                             "global_step_offset": int(config.global_step_offset),
                             "fast_postprocessing": bool(config.fast_postprocessing),
+                            "shared_live_memory": str(config.shared_live_memory),
+                            "live_memory_refresh_steps": int(config.live_memory_refresh_steps),
+                            "live_memory_queue_maxsize": int(config.live_memory_queue_maxsize),
+                            "live_memory_batch_size": int(config.live_memory_batch_size),
+                            "live_memory_flush_seconds": float(config.live_memory_flush_seconds),
                             "db_path": str(db_path),
                             "env_root": config.env_root,
                         }
@@ -303,6 +337,11 @@ def _generate_sampling_dbs(config: InteractionSamplingConfig, sampling_root: Pat
                         "memory_output_dir": config.memory_output_dir,
                         "global_step_offset": int(config.global_step_offset),
                         "fast_postprocessing": bool(config.fast_postprocessing),
+                        "shared_live_memory": str(config.shared_live_memory),
+                        "live_memory_refresh_steps": int(config.live_memory_refresh_steps),
+                        "live_memory_queue_maxsize": int(config.live_memory_queue_maxsize),
+                        "live_memory_batch_size": int(config.live_memory_batch_size),
+                        "live_memory_flush_seconds": float(config.live_memory_flush_seconds),
                         "db_path": str(db_path),
                         "env_root": config.env_root,
                     }
@@ -374,6 +413,7 @@ def _run_sampling_jobs(
     workers = max(1, min(int(workers), len(jobs)))
     initial = workers if initial_workers is None else max(1, min(int(initial_workers), workers))
     fold_workers = max(1, workers // 2) if any(job.get("memory_output_dir") for job in jobs) else 0
+    shared_live_memory_mode = str(jobs[0].get("shared_live_memory", "none") or "none") if jobs else "none"
     ram_at_start = _system_ram_snapshot()
     print(
         f"running {len(jobs)} v0.5c sampling jobs with workers={workers}"
@@ -407,6 +447,29 @@ def _run_sampling_jobs(
     main_memory_dir = next((str(job["memory_output_dir"]) for job in jobs if job.get("memory_output_dir")), None)
     min_fold_step = None
     max_fold_step = None
+    live_memory_queue = None
+    live_memory_writer = None
+    live_memory_writer_stop: dict[str, Any] = {
+        "writer_exitcode": None,
+        "writer_forced_terminated": False,
+        "summary_path": None,
+        "live_memory_event_counts": None,
+    }
+    live_memory_summary_path = None
+    if shared_live_memory_mode != "none" and main_memory_dir is not None:
+        live_memory_queue = make_live_memory_queue(int(jobs[0].get("live_memory_queue_maxsize", 100_000) or 100_000))
+        live_memory_writer = start_live_memory_writer(
+            LiveMemoryWriterConfig(
+                memory_dir=str(main_memory_dir),
+                queue_maxsize=int(jobs[0].get("live_memory_queue_maxsize", 100_000) or 100_000),
+                batch_size=int(jobs[0].get("live_memory_batch_size", 1000) or 1000),
+                flush_seconds=float(jobs[0].get("live_memory_flush_seconds", 2.0) or 2.0),
+            ),
+            live_memory_queue,
+        )
+        live_memory_summary_path = str(Path(str(main_memory_dir)) / "live_memory_summary.json")
+        for job in jobs:
+            job["live_memory_queue"] = live_memory_queue
 
     def _maybe_ramp() -> bool:
         nonlocal target_workers, last_ramp_time
@@ -513,6 +576,16 @@ def _run_sampling_jobs(
             )
     finally:
         progress.close()
+        if live_memory_queue is not None and live_memory_writer is not None:
+            live_memory_writer_stop = stop_live_memory_writer(live_memory_queue, live_memory_writer)
+            live_memory_writer_stop["summary_path"] = live_memory_summary_path
+            if live_memory_summary_path and Path(live_memory_summary_path).exists():
+                try:
+                    live_memory_writer_stop["live_memory_event_counts"] = json.loads(
+                        Path(live_memory_summary_path).read_text(encoding="utf-8")
+                    )
+                except Exception:
+                    live_memory_writer_stop["live_memory_event_counts"] = None
         if fold_temp_root is not None:
             shutil.rmtree(fold_temp_root, ignore_errors=True)
     return {
@@ -529,6 +602,16 @@ def _run_sampling_jobs(
         "ramp_events": ramp_events,
         "parallel_sidecar_fold_enabled": bool(fold_workers > 0),
         "parallel_sidecar_fold_shard_count": int(len(fold_shard_dirs)),
+        "shared_live_memory_enabled": bool(shared_live_memory_mode != "none"),
+        "shared_live_memory_mode": shared_live_memory_mode,
+        "live_memory_writer_started": bool(live_memory_writer is not None),
+        "live_memory_writer_exitcode": live_memory_writer_stop.get("writer_exitcode"),
+        "live_memory_writer_forced_terminated": bool(live_memory_writer_stop.get("writer_forced_terminated", False)),
+        "live_memory_queue_maxsize": int(jobs[0].get("live_memory_queue_maxsize", 100_000) or 100_000) if jobs else 0,
+        "live_memory_batch_size": int(jobs[0].get("live_memory_batch_size", 1000) or 1000) if jobs else 0,
+        "live_memory_flush_seconds": float(jobs[0].get("live_memory_flush_seconds", 2.0) or 2.0) if jobs else 0.0,
+        "live_memory_summary_path": live_memory_summary_path,
+        "live_memory_event_counts": live_memory_writer_stop.get("live_memory_event_counts"),
     }
 
 
@@ -581,12 +664,33 @@ def _run_sampling_job(job: dict) -> dict:
         adaptive_context_expansion=bool(job.get("adaptive_context_expansion", False)),
         database_commit_every=int(job.get("commit_steps", 1000)),
         memory_promotion_every=max(1000, int(job.get("steps", 0) or 0) + 1),
+        shared_live_memory_mode=str(job.get("shared_live_memory", "none") or "none"),
+        live_memory_worker_id=f"{job['game']}:{sampler_name}:seed{seed}",
+        live_memory_refresh_steps=int(job.get("live_memory_refresh_steps", 250) or 250),
     )
-    system = V6System(
-        env=env,
-        config=system_config,
-        action_sampler=sampler,
-    )
+    live_memory_cache = None
+    if str(job.get("shared_live_memory", "none") or "none") == "readwrite" and job.get("memory_output_dir"):
+        live_memory_cache = LiveMemoryReadCache(
+            memory_dir=str(job["memory_output_dir"]),
+            refresh_steps=int(job.get("live_memory_refresh_steps", 250) or 250),
+        )
+    try:
+        system = V6System(
+            env=env,
+            config=system_config,
+            action_sampler=sampler,
+            live_memory_queue=job.get("live_memory_queue"),
+            live_memory_cache=live_memory_cache,
+        )
+    except TypeError as exc:
+        message = str(exc)
+        if "live_memory_queue" not in message and "live_memory_cache" not in message:
+            raise
+        system = V6System(
+            env=env,
+            config=system_config,
+            action_sampler=sampler,
+        )
     edge_counts: dict[str, int] = {}
     contradiction_summary: dict[str, object] = {}
     carrier_candidates: list[object] = []
@@ -732,6 +836,19 @@ def _run_sampling_job(job: dict) -> dict:
         final_levels_completed=int(getattr(env, "last_levels_completed", 0) or 0),
         final_win_levels=int(getattr(env, "last_win_levels", 0) or 0),
         final_full_game_id=getattr(env, "last_full_game_id", None),
+        shared_live_memory_mode=str(job.get("shared_live_memory", "none") or "none"),
+        live_memory_worker_id=str(system_config.live_memory_worker_id or ""),
+        live_memory_events_emitted=int(getattr(system, "live_memory_events_emitted", 0) or 0),
+        live_memory_events_dropped_queue_full=int(getattr(system, "live_memory_events_dropped_queue_full", 0) or 0),
+        live_memory_events_dropped_error=int(getattr(system, "live_memory_events_dropped_error", 0) or 0),
+        live_memory_refresh_count=int(getattr(system, "live_memory_refresh_count", 0) or 0),
+        live_memory_refresh_failed_count=int(getattr(system, "live_memory_refresh_failed_count", 0) or 0),
+        live_memory_stable_contingencies_imported=int(getattr(system, "live_memory_stable_contingencies_imported", 0) or 0),
+        live_memory_replay_candidates_imported=int(getattr(system, "live_memory_replay_candidates_imported", 0) or 0),
+        live_memory_carrier_candidates_imported=int(getattr(system, "live_memory_carrier_candidates_imported", 0) or 0),
+        live_memory_family_updates_imported=int(getattr(system, "live_memory_family_updates_imported", 0) or 0),
+        live_memory_contradiction_clusters_loaded=int(getattr(system, "live_memory_contradiction_clusters_loaded", 0) or 0),
+        live_memory_future_option_events_loaded=int(getattr(system, "live_memory_future_option_events_loaded", 0) or 0),
     )
     if contradiction_summary:
         db_path.with_name("context_contradictions.json").write_text(json.dumps(contradiction_summary, indent=2), encoding="utf-8")
@@ -1690,6 +1807,7 @@ def _default_worker_execution_stats(config: InteractionSamplingConfig) -> dict[s
         "requested_workers": int(config.workers),
         "initial_workers": int(config.initial_workers if config.initial_workers is not None else config.workers),
         "peak_workers": 0,
+        "fold_workers": 0,
         "worker_ramp_enabled": bool(config.enable_worker_ramp),
         "ram_ramp_threshold_percent": float(config.ram_ramp_threshold_percent),
         "initial_worker_ramp_delay_seconds": float(config.initial_worker_ramp_delay_seconds),
@@ -1697,6 +1815,18 @@ def _default_worker_execution_stats(config: InteractionSamplingConfig) -> dict[s
         "ram_used_percent_at_start": 0.0,
         "ramp_event_count": 0,
         "ramp_events": [],
+        "parallel_sidecar_fold_enabled": False,
+        "parallel_sidecar_fold_shard_count": 0,
+        "shared_live_memory_enabled": bool(str(config.shared_live_memory) != "none"),
+        "shared_live_memory_mode": str(config.shared_live_memory),
+        "live_memory_writer_started": False,
+        "live_memory_writer_exitcode": None,
+        "live_memory_writer_forced_terminated": False,
+        "live_memory_queue_maxsize": int(config.live_memory_queue_maxsize),
+        "live_memory_batch_size": int(config.live_memory_batch_size),
+        "live_memory_flush_seconds": float(config.live_memory_flush_seconds),
+        "live_memory_summary_path": None,
+        "live_memory_event_counts": None,
     }
 
 
@@ -1706,6 +1836,7 @@ def _merge_worker_execution_stats(left: dict[str, object], right: dict[str, obje
     return {
         "requested_workers": int(max(int(left.get("requested_workers", 0) or 0), int(right.get("requested_workers", 0) or 0))),
         "initial_workers": int(max(int(left.get("initial_workers", 0) or 0), int(right.get("initial_workers", 0) or 0))),
+        "fold_workers": int(max(int(left.get("fold_workers", 0) or 0), int(right.get("fold_workers", 0) or 0))),
         "peak_workers": int(max(int(left.get("peak_workers", 0) or 0), int(right.get("peak_workers", 0) or 0))),
         "worker_ramp_enabled": bool(left.get("worker_ramp_enabled", False) or right.get("worker_ramp_enabled", False)),
         "ram_ramp_threshold_percent": float(max(float(left.get("ram_ramp_threshold_percent", 0.0) or 0.0), float(right.get("ram_ramp_threshold_percent", 0.0) or 0.0))),
@@ -1714,6 +1845,18 @@ def _merge_worker_execution_stats(left: dict[str, object], right: dict[str, obje
         "ram_used_percent_at_start": float(max(float(left.get("ram_used_percent_at_start", 0.0) or 0.0), float(right.get("ram_used_percent_at_start", 0.0) or 0.0))),
         "ramp_event_count": int(len(left_events) + len(right_events)),
         "ramp_events": [*left_events, *right_events],
+        "parallel_sidecar_fold_enabled": bool(left.get("parallel_sidecar_fold_enabled", False) or right.get("parallel_sidecar_fold_enabled", False)),
+        "parallel_sidecar_fold_shard_count": int(left.get("parallel_sidecar_fold_shard_count", 0) or 0) + int(right.get("parallel_sidecar_fold_shard_count", 0) or 0),
+        "shared_live_memory_enabled": bool(left.get("shared_live_memory_enabled", False) or right.get("shared_live_memory_enabled", False)),
+        "shared_live_memory_mode": str(right.get("shared_live_memory_mode") or left.get("shared_live_memory_mode") or "none"),
+        "live_memory_writer_started": bool(left.get("live_memory_writer_started", False) or right.get("live_memory_writer_started", False)),
+        "live_memory_writer_exitcode": right.get("live_memory_writer_exitcode") if right.get("live_memory_writer_started") else left.get("live_memory_writer_exitcode"),
+        "live_memory_writer_forced_terminated": bool(left.get("live_memory_writer_forced_terminated", False) or right.get("live_memory_writer_forced_terminated", False)),
+        "live_memory_queue_maxsize": int(max(int(left.get("live_memory_queue_maxsize", 0) or 0), int(right.get("live_memory_queue_maxsize", 0) or 0))),
+        "live_memory_batch_size": int(max(int(left.get("live_memory_batch_size", 0) or 0), int(right.get("live_memory_batch_size", 0) or 0))),
+        "live_memory_flush_seconds": float(max(float(left.get("live_memory_flush_seconds", 0.0) or 0.0), float(right.get("live_memory_flush_seconds", 0.0) or 0.0))),
+        "live_memory_summary_path": right.get("live_memory_summary_path") or left.get("live_memory_summary_path"),
+        "live_memory_event_counts": right.get("live_memory_event_counts") or left.get("live_memory_event_counts"),
     }
 
 

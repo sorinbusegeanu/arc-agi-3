@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from hashlib import sha1
 
 from v6.contingency.contingency_learner import Contingency
 
@@ -22,7 +23,13 @@ class ContingencyStore:
                 action INTEGER NOT NULL,
                 transformation_family INTEGER NOT NULL,
                 support_count INTEGER NOT NULL,
-                confidence REAL NOT NULL
+                confidence REAL NOT NULL,
+                prediction_attempt_count INTEGER DEFAULT 0,
+                prediction_success_count INTEGER DEFAULT 0,
+                prediction_accuracy REAL,
+                prediction_error_before REAL,
+                prediction_error_after REAL,
+                normalized_contingency_key TEXT
             )
             """
         )
@@ -93,6 +100,12 @@ class ContingencyStore:
             """
         )
         self._ensure_column("contingencies", "context_level", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("contingencies", "prediction_attempt_count", "INTEGER DEFAULT 0")
+        self._ensure_column("contingencies", "prediction_success_count", "INTEGER DEFAULT 0")
+        self._ensure_column("contingencies", "prediction_accuracy", "REAL")
+        self._ensure_column("contingencies", "prediction_error_before", "REAL")
+        self._ensure_column("contingencies", "prediction_error_after", "REAL")
+        self._ensure_column("contingencies", "normalized_contingency_key", "TEXT")
         self._ensure_column("prediction_results", "global_step", "INTEGER")
         self._ensure_column("prediction_results", "context_level", "INTEGER")
         self._ensure_column("prediction_results", "episode_id", "INTEGER NOT NULL DEFAULT 0")
@@ -156,6 +169,11 @@ class ContingencyStore:
         self.connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
 
     def upsert_contingency(self, contingency: Contingency) -> None:
+        normalized_key = self._normalized_contingency_key(
+            context_level=int(contingency.context_level),
+            action=int(contingency.action),
+            transformation_family=int(contingency.transformation_family),
+        )
         self.connection.execute(
             """
             INSERT INTO contingencies (
@@ -165,16 +183,18 @@ class ContingencyStore:
                 action,
                 transformation_family,
                 support_count,
-                confidence
+                confidence,
+                normalized_contingency_key
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 context_level = excluded.context_level,
                 context_signature = excluded.context_signature,
                 action = excluded.action,
                 transformation_family = excluded.transformation_family,
                 support_count = excluded.support_count,
-                confidence = excluded.confidence
+                confidence = excluded.confidence,
+                normalized_contingency_key = excluded.normalized_contingency_key
             """,
             (
                 int(contingency.id),
@@ -184,10 +204,68 @@ class ContingencyStore:
                 int(contingency.transformation_family),
                 int(contingency.support_count),
                 float(contingency.confidence),
+                normalized_key,
             ),
         )
         if self.auto_commit:
             self.connection.commit()
+
+    def record_contingency_prediction(
+        self,
+        *,
+        contingency_id: int,
+        prediction_success: bool,
+        prediction_error_before: float | None = None,
+        prediction_error_after: float | None = None,
+        normalized_contingency_key: str | None = None,
+    ) -> None:
+        row = self.connection.execute(
+            """
+            SELECT prediction_attempt_count, prediction_success_count, normalized_contingency_key
+            FROM contingencies
+            WHERE id = ?
+            """,
+            (int(contingency_id),),
+        ).fetchone()
+        if row is None:
+            return
+        attempts = int(row[0] or 0) + 1
+        successes = int(row[1] or 0) + int(bool(prediction_success))
+        key = normalized_contingency_key or row[2]
+        self.connection.execute(
+            """
+            UPDATE contingencies
+            SET
+                prediction_attempt_count = ?,
+                prediction_success_count = ?,
+                prediction_accuracy = ?,
+                prediction_error_before = ?,
+                prediction_error_after = ?,
+                normalized_contingency_key = COALESCE(?, normalized_contingency_key)
+            WHERE id = ?
+            """,
+            (
+                attempts,
+                successes,
+                (float(successes) / float(attempts)) if attempts > 0 else None,
+                None if prediction_error_before is None else float(prediction_error_before),
+                None if prediction_error_after is None else float(prediction_error_after),
+                key,
+                int(contingency_id),
+            ),
+        )
+        if self.auto_commit:
+            self.connection.commit()
+
+    def _normalized_contingency_key(self, *, context_level: int, action: int, transformation_family: int) -> str:
+        payload = {
+            "action": int(action),
+            "context_level": int(context_level),
+            "family_bucket": int(transformation_family),
+        }
+        return "raw_contingency:" + sha1(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()[:20]
 
     def add_prediction_result(
         self,
