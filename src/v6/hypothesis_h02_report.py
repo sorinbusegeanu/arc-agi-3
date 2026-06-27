@@ -603,22 +603,31 @@ def _extract_h02_compact_metrics(memory_dir: Path) -> dict[str, Any]:
         memory_record_count = int(state_conn.execute("SELECT COUNT(*) FROM memory_nodes WHERE node_type = 'InteractionMemory'").fetchone()[0])
         score_record_count = int(state_conn.execute("SELECT COUNT(*) FROM memory_scores WHERE node_id LIKE 'M0:interaction:%'").fetchone()[0])
         selected_for_replay_edge_count = int(state_conn.execute("SELECT COUNT(*) FROM memory_edges WHERE edge_type = 'selected_for_replay'").fetchone()[0])
-        high_priority_scores = state_conn.execute(
-            "SELECT COUNT(*), AVG(replay_priority), MAX(replay_priority) FROM memory_scores WHERE node_id LIKE 'M0:interaction:%' AND replay_priority IS NOT NULL"
+        score_stats = state_conn.execute(
+            """
+            SELECT
+                COUNT(*) AS score_record_count_with_priority,
+                SUM(CASE WHEN replay_priority >= 0.8 THEN 1 ELSE 0 END) AS high_priority_score_count,
+                AVG(replay_priority),
+                MAX(replay_priority)
+            FROM memory_scores
+            WHERE node_id LIKE 'M0:interaction:%'
+              AND replay_priority IS NOT NULL
+            """
         ).fetchone()
         high_priority = [value for value in priorities if value >= 0.8]
         return {
             "memory_record_count": memory_record_count or score_record_count or None,
             "memory_replay_candidate_count": len(replay_rows) if replay_rows else selected_for_replay_edge_count,
-            "memory_mean_replay_priority": (sum(priorities) / len(priorities)) if priorities else (high_priority_scores[1] if high_priority_scores else None),
-            "memory_max_replay_priority": max(priorities, default=0.0) if priorities else (high_priority_scores[2] if high_priority_scores else None),
-            "high_priority_replay_count": len(high_priority) if replay_rows else int(high_priority_scores[0] or 0),
+            "memory_mean_replay_priority": (sum(priorities) / len(priorities)) if priorities else (score_stats[2] if score_stats else None),
+            "memory_max_replay_priority": max(priorities, default=0.0) if priorities else (score_stats[3] if score_stats else None),
+            "high_priority_replay_count": len(high_priority) if replay_rows else int((score_stats[1] if score_stats else 0) or 0),
             "context_contradiction_count": contradiction_count,
             "repeated_contradiction_count": contradiction_count,
             "contradiction_event_count": contradiction_count,
             "prediction_error_positive_count": contradiction_count if contradiction_count > 0 else None,
-            "predicted_family_available_count": score_record_count or None,
-            "actual_family_available_count": score_record_count or None,
+            "predicted_family_available_count": (score_stats[0] if score_stats and score_stats[0] else score_record_count) or None,
+            "actual_family_available_count": (score_stats[0] if score_stats and score_stats[0] else score_record_count) or None,
             "wrong_prediction_count": contradiction_count if contradiction_count > 0 else None,
             "confident_wrong_prediction_count": contradiction_count if contradiction_count > 0 else None,
             "prediction_violation_base_ratio": (contradiction_count / len(replay_rows)) if replay_rows else None,

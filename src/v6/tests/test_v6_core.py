@@ -159,7 +159,7 @@ from v6.memory.contingency_store import ContingencyStore
 from v6.memory.interaction_store import Interaction, InteractionStore, encode_array
 from v6.memory.promotion_engine import MemoryPromotionConfig, MemoryPromotionEngine
 from v6.memory.query_engine import MemoryQueryEngine
-from v6.memory.substrate import MemoryEdge, MemoryNode, MemoryScore, MemorySubstrate, action_node_id, delta_node_id, family_node_id, interaction_node_id, strategy_node_id
+from v6.memory.substrate import MemoryEdge, MemoryEvidence, MemoryNode, MemoryPromotion, MemoryScore, MemorySubstrate, action_node_id, delta_node_id, family_node_id, interaction_node_id, strategy_node_id
 from v6.memory.compact_memory_restore import _fetchall_readonly_with_retry
 from v6.memory_lifecycle import MemoryLifecycleManager
 from v6.memory_types import M3RoleCandidate
@@ -10750,8 +10750,28 @@ def test_compact_fold_scopes_legacy_local_interaction_ids_across_raw_dbs(tmp_pat
     for db_path in (db1, db2):
         with sqlite3.connect(db_path) as conn:
             substrate = MemorySubstrate(conn)
-            substrate.upsert_node(MemoryNode(node_id="M0:interaction:1", memory_level="M0", node_type="InteractionMemory"))
+            substrate.upsert_node(MemoryNode(node_id="M0:interaction:1", memory_level="M0", node_type="InteractionMemory", canonical_key="1"))
             substrate.upsert_score(MemoryScore(node_id="M0:interaction:1", replay_priority=0.7))
+            substrate.add_evidence(
+                MemoryEvidence(
+                    evidence_id="e1",
+                    target_node_id="M0:interaction:1",
+                    source_interaction_id=1,
+                    evidence_type="test",
+                    payload={},
+                )
+            )
+            substrate.record_promotion(
+                MemoryPromotion(
+                    promotion_id="p1",
+                    source_node_id="M0:interaction:1",
+                    target_node_id="M0:interaction:1",
+                    promotion_type="TEST",
+                    evidence_count=1,
+                    promotion_score=1.0,
+                    status="ok",
+                )
+            )
             conn.commit()
     memory_dir = tmp_path / "memory"
     ensure_memory_layout(memory_dir)
@@ -10762,11 +10782,36 @@ def test_compact_fold_scopes_legacy_local_interaction_ids_across_raw_dbs(tmp_pat
     )
     with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
         nodes = [row[0] for row in conn.execute("SELECT node_id FROM memory_nodes WHERE node_type = 'InteractionMemory' ORDER BY node_id ASC").fetchall()]
+        canonical_keys = [row[0] for row in conn.execute("SELECT canonical_key FROM memory_nodes WHERE node_type = 'InteractionMemory' ORDER BY canonical_key ASC").fetchall()]
         scores = [row[0] for row in conn.execute("SELECT node_id FROM memory_scores WHERE node_id LIKE 'M0:interaction:%' ORDER BY node_id ASC").fetchall()]
+        evidence_ids = [row[0] for row in conn.execute("SELECT evidence_id FROM memory_evidence ORDER BY evidence_id ASC").fetchall()]
+        promotion_ids = [row[0] for row in conn.execute("SELECT promotion_id FROM memory_promotions ORDER BY promotion_id ASC").fetchall()]
     assert len(nodes) == 2
     assert len(scores) == 2
+    assert len(evidence_ids) == 2
+    assert len(promotion_ids) == 2
     assert len(set(nodes)) == 2
+    assert len(set(canonical_keys)) == 2
+    assert len(set(evidence_ids)) == 2
+    assert len(set(promotion_ids)) == 2
     assert all(":local:" in node for node in nodes)
+    assert all(str(value).startswith("canonical:db:") for value in canonical_keys)
+
+
+def test_h02_compact_high_priority_threshold_uses_0_8_cutoff(tmp_path: Path) -> None:
+    from v6.hypothesis_h02_report import _extract_h02_compact_metrics
+
+    memory_dir = tmp_path / "memory"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        for idx, priority in enumerate((0.1, 0.79, 0.8, 1.0), start=1):
+            conn.execute(
+                "INSERT INTO memory_scores (node_id, replay_priority) VALUES (?, ?)",
+                (f"M0:interaction:g{idx}", priority),
+            )
+        conn.commit()
+    metrics = _extract_h02_compact_metrics(memory_dir)
+    assert metrics["high_priority_replay_count"] == 2
 
 
 def test_h02b_generic_carriers_do_not_count_as_no_carriers() -> None:
@@ -10942,7 +10987,30 @@ def test_h10_attention_saturation_is_partial(tmp_path: Path) -> None:
         conn.commit()
     result = evaluate_h10_future_option_attention(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h10", already_derived=True)
     assert result["decision"] == "PARTIALLY_VALID"
+    assert result["attention_all_high_saturation"] is True
     assert result["attention_saturation"] is True
+
+
+def test_h10_all_low_attention_saturation_is_partial(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        for idx in range(5):
+            conn.execute(
+                "INSERT INTO future_option_attention_links (event_id, motif_signature, owner_type, owner_key, option_delta_abs, replay_priority_score, memory_priority_score, contradiction_score, high_option_change, high_attention) VALUES (?, 'm', 'interaction', ?, 2.0, 0.0, 0.0, 0.0, 1, 0)",
+                (f"h{idx}", f"hi{idx}"),
+            )
+        for idx in range(5):
+            conn.execute(
+                "INSERT INTO future_option_attention_links (event_id, motif_signature, owner_type, owner_key, option_delta_abs, replay_priority_score, memory_priority_score, contradiction_score, high_option_change, high_attention) VALUES (?, 'm', 'interaction', ?, 0.1, 0.0, 0.0, 0.0, 0, 0)",
+                (f"l{idx}", f"lo{idx}"),
+            )
+        conn.commit()
+    result = evaluate_h10_future_option_attention(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h10_low", already_derived=True)
+    assert result["decision"] == "PARTIALLY_VALID"
+    assert result["attention_all_low_saturation"] is True
+    assert result["attention_saturation"] is True
+    assert "Attention signal is saturated all-low; selective attention is not demonstrated." in result["missing_evidence"]
 
 
 def test_h03_missing_evidence_flags_are_exposed() -> None:
@@ -10969,7 +11037,10 @@ def test_h03_missing_evidence_flags_are_exposed() -> None:
     assert result["h03_row_cap_applied"] is True
     assert result["singleton_action_metadata_incomplete"] is True
     assert result["singleton_context_overspecific"] is True
-    assert any("Family prediction lift is unavailable" in item for item in result["missing_evidence"])
+    assert "H03 family prediction-lift evidence is unavailable." in result["missing_evidence"]
+    assert "H03 direct family evidence was row-capped; inspect more rows or use scan-all/full max-rows." in result["missing_evidence"]
+    assert "H03 singleton action metadata contains unknown actions." in result["missing_evidence"]
+    assert "H03 singleton families include over-specific context signatures." in result["missing_evidence"]
 
 
 def test_suite_summary_exposes_individual_vs_gated_decisions() -> None:

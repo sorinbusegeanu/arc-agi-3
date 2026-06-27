@@ -71,7 +71,9 @@ def evaluate_h10_future_option_attention(
         "replay_attention_count": sum(1 for row in rows if float(row.get("replay_priority_score") or 0.0) >= 0.50),
         "contradiction_attention_count": sum(1 for row in rows if float(row.get("contradiction_score") or 0.0) >= 0.50),
         "replay_or_contradiction_attention_count": len(high_attention_rows),
-        "attention_saturation": bool(rows) and len(high_attention_rows) == len(rows),
+        "attention_all_high_saturation": bool(rows) and len(high_attention_rows) == len(rows),
+        "attention_all_low_saturation": bool(rows) and len(high_attention_rows) == 0,
+        "attention_saturation": bool(rows) and (len(high_attention_rows) == len(rows) or len(high_attention_rows) == 0),
         "replay_attention_saturation": bool(rows) and sum(1 for row in rows if float(row.get("replay_priority_score") or 0.0) >= 0.50) == len(rows),
         "contradiction_attention_saturation": bool(rows) and sum(1 for row in rows if float(row.get("contradiction_score") or 0.0) >= 0.50) == len(rows),
         "missing_evidence": [],
@@ -80,10 +82,15 @@ def evaluate_h10_future_option_attention(
         result["decision"] = "INCONCLUSIVE"
     elif not high_rows:
         result["decision"] = "INCONCLUSIVE"
-    elif result["attention_saturation"] and (high_rate or 0.0) == 1.0 and (low_rate or 0.0) == 1.0:
+    elif result["attention_all_high_saturation"] and (high_rate or 0.0) == 1.0 and (low_rate or 0.0) == 1.0:
         result["decision"] = "PARTIALLY_VALID"
         result["missing_evidence"].append(
-            "Attention signal is saturated across high and low future-option-change interactions; selective attention is not demonstrated."
+            "Attention signal is saturated all-high across high and low future-option-change interactions; selective attention is not demonstrated."
+        )
+    elif result["attention_all_low_saturation"]:
+        result["decision"] = "PARTIALLY_VALID"
+        result["missing_evidence"].append(
+            "Attention signal is saturated all-low; selective attention is not demonstrated."
         )
     elif len(high_both) > 0 and lift is None:
         result["decision"] = "PARTIALLY_VALID"
@@ -124,6 +131,8 @@ def evaluate_h10_future_option_attention(
             "replay_attention_count",
             "contradiction_attention_count",
             "replay_or_contradiction_attention_count",
+            "attention_all_high_saturation",
+            "attention_all_low_saturation",
             "attention_saturation",
             "replay_attention_saturation",
             "contradiction_attention_saturation",
@@ -154,6 +163,8 @@ def _write(output_dir: Path, result: dict[str, Any]) -> None:
         f"option-attention lift: {result.get('option_attention_lift')}\n"
         f"high-option-change attention rate: {result.get('high_option_change_attention_rate')}\n"
         f"low-option-change attention rate: {result.get('low_option_change_attention_rate')}\n"
+        f"attention all-high saturation: {result.get('attention_all_high_saturation')}\n"
+        f"attention all-low saturation: {result.get('attention_all_low_saturation')}\n"
         f"attention saturation: {result.get('attention_saturation')}\n"
         f"replay attention count: {result.get('replay_attention_count')}\n"
         f"contradiction attention count: {result.get('contradiction_attention_count')}\n"

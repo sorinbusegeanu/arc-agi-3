@@ -2101,15 +2101,15 @@ def _populate_h03_evidence_lists(result: dict[str, Any]) -> None:
             f"Global family merging reduced shard-local family inflation ({int(result['global_family_count_before_merge'])} -> {int(result['global_family_count_after_merge'])})."
         )
     if result.get("family_prediction_lift_mean") is None:
-        missing_evidence.append("Family prediction lift is unavailable; H03 compression cannot yet be tied to predictive improvement.")
+        missing_evidence.append("H03 family prediction-lift evidence is unavailable.")
     if result.get("max_rows_applied") is True:
-        missing_evidence.append("H03 DB scan hit max_rows; family metrics are sampled/capped.")
+        missing_evidence.append("H03 direct family evidence was row-capped; inspect more rows or use scan-all/full max-rows.")
     if _gt(result.get("singleton_family_ratio"), 0.50):
         missing_evidence.append("Singleton family ratio remains above acceptance threshold.")
-    if result["singleton_action_metadata_incomplete"]:
-        missing_evidence.append("Many singleton families have unknown action metadata.")
-    if result["singleton_context_overspecific"]:
-        missing_evidence.append("Singleton families are dominated by over-specific context signatures.")
+    if unknown_action_count > 0:
+        missing_evidence.append("H03 singleton action metadata contains unknown actions.")
+    if int(diagnostics.get("over_specific_context_count", 0) or 0) > 0:
+        missing_evidence.append("H03 singleton families include over-specific context signatures.")
     result["evidence_for"] = evidence_for
     result["evidence_against"] = evidence_against
     result["missing_evidence"] = list(dict.fromkeys(str(item) for item in missing_evidence))

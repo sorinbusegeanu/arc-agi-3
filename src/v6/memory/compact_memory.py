@@ -1304,7 +1304,7 @@ def _fold_single_db(
                         scoped_node_id,
                         row["memory_level"],
                         row["node_type"],
-                        row["canonical_key"],
+                        _scope_memory_canonical_key(str(row["node_id"]), row["node_type"], row["canonical_key"], db_path),
                         row["support_count"],
                         row["first_seen_step"],
                         row["last_seen_step"],
@@ -1347,7 +1347,7 @@ def _fold_single_db(
                     VALUES (?, ?, ?, ?, ?)
                     """,
                     (
-                        row["evidence_id"],
+                        _scope_raw_local_id("evidence", row["evidence_id"], db_path),
                         _scope_memory_node_id(str(row["target_node_id"]), db_path),
                         row["source_interaction_id"],
                         row["evidence_type"],
@@ -1399,7 +1399,7 @@ def _fold_single_db(
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        row["promotion_id"],
+                        _scope_raw_local_id("promotion", row["promotion_id"], db_path),
                         _scope_memory_node_id(str(row["source_node_id"]), db_path),
                         _scope_memory_node_id(str(row["target_node_id"]), db_path),
                         row["promotion_type"],
@@ -2528,6 +2528,15 @@ def _db_interaction_scope(db_path: Path) -> dict[str, Any]:
     }
 
 
+def _scope_raw_local_id(prefix: str, raw_id: Any, db_path: Path) -> str:
+    value = str(raw_id)
+    db_scope = sha1(str(Path(db_path).resolve()).encode("utf-8")).hexdigest()[:12]
+    scoped_prefix = f"{prefix}:db:{db_scope}:"
+    if value.startswith(f"{prefix}:"):
+        return value if scoped_prefix in value else f"{scoped_prefix}{value}"
+    return f"{scoped_prefix}{value}"
+
+
 def _scope_memory_node_id(node_id: str, db_path: Path) -> str:
     for prefix in ("M0:interaction:", "M0:replay:", "M0:cost:", "M0:future_option_delta:"):
         if not str(node_id).startswith(prefix):
@@ -2558,6 +2567,14 @@ def _scope_payload_interaction_nodes(value: Any, db_path: Path) -> Any:
     if isinstance(value, str) and value.startswith("M0:"):
         return _scope_memory_node_id(value, db_path)
     return value
+
+
+def _scope_memory_canonical_key(node_id: str, node_type: str | None, canonical_key: Any, db_path: Path) -> str | None:
+    if canonical_key is None:
+        return None
+    if str(node_type or "") == "InteractionMemory" or str(node_id).startswith("M0:interaction:"):
+        return _scope_raw_local_id("canonical", canonical_key, db_path)
+    return str(canonical_key)
 
 
 def _json_loads_or_none(value: Any) -> Any:
