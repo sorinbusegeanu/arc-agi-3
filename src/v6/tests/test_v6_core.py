@@ -2397,6 +2397,31 @@ def test_hypothesis_suite_aggregated_text_concatenates_hypothesis_reports(tmp_pa
     assert positions == sorted(positions)
 
 
+def test_hypothesis_suite_aggregated_text_uses_result_dicts_without_unavailable(tmp_path: Path) -> None:
+    reports_dir = tmp_path / "reports"
+    _write_aggregated_hypothesis_text(
+        reports_dir,
+        hypothesis_results={
+            "H01": {
+                "decision": "VALID",
+                "core_metrics": {"stable_contingency_count": 3},
+                "missing_evidence": [],
+                "evidence_diagnostics": {"source": "compact"},
+            },
+            "H02": {
+                "decision": "INSUFFICIENT_EVIDENCE",
+                "core_metrics": {"evidence_coverage_ratio": 0.4},
+                "missing_evidence": ["low coverage"],
+                "evidence_diagnostics": {"source": "manifest"},
+            },
+        },
+    )
+    aggregated = (reports_dir / "hypothesis_suite_aggregated.txt").read_text(encoding="utf-8")
+    assert "H01" in aggregated
+    assert "stable_contingency_count" in aggregated
+    assert "report unavailable" not in aggregated
+
+
 def test_hypothesis_suite_aggregated_text_on_epoch01_real_reports() -> None:
     reports_dir = Path("runs/v6/continuous/full_breadth_continuous/epochs/epoch_0001/reports")
     if not reports_dir.exists():
@@ -2430,6 +2455,123 @@ def test_hypothesis_suite_aggregated_text_on_epoch01_real_reports() -> None:
     first_lines = [path.read_text(encoding="utf-8").strip().splitlines()[0] for path in txt_paths]
     positions = [aggregated.index(line) for line in first_lines]
     assert positions == sorted(positions)
+
+
+def test_h01_txt_checklist_matches_json_checklist(tmp_path: Path) -> None:
+    from v6.hypothesis_h01_report import evaluate_h01_contingency_emergence
+
+    run_dir = tmp_path / "run_h01_txt"
+    run_dir.mkdir()
+    (run_dir / "interaction_sampling_v05c_report.json").write_text(
+        json.dumps(
+            {
+                "runs": [
+                    {
+                        "game": "g1",
+                        "sampler_name": "s1",
+                        "total_interactions": 10,
+                        "memory_record_count": 10,
+                        "stable_contingency_count": 3,
+                        "discovered_contingency_count": 3,
+                        "prediction_accuracy": 0.5,
+                        "context_lift": 0.2,
+                    },
+                    {
+                        "game": "g2",
+                        "sampler_name": "s2",
+                        "total_interactions": 12,
+                        "memory_record_count": 12,
+                        "stable_contingency_count": 2,
+                        "discovered_contingency_count": 2,
+                        "prediction_accuracy": 0.6,
+                        "context_lift": 0.1,
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    result = evaluate_h01_contingency_emergence(run_dir, tmp_path / "out_h01_txt")
+    txt = (tmp_path / "out_h01_txt" / "h01_contingency_emergence_report.txt").read_text(encoding="utf-8")
+    for key, value in result["acceptance_checks"].items():
+        assert f"- {key}: {value}" in txt
+
+
+def test_h01_compact_only_can_be_valid(tmp_path: Path) -> None:
+    from v6.hypothesis_h01_report import evaluate_h01_contingency_emergence
+
+    run_dir = tmp_path / "run_h01_compact"
+    run_dir.mkdir()
+    memory_dir = tmp_path / "memory_h01_compact"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute("INSERT INTO stable_contingencies (contingency_id, canonical_key, game, sampler, context_level, action, effect_signature, support_count, first_seen_global_step, last_seen_global_step, stability_score, mean_prediction_error, mean_replay_priority, representative_example_count, prediction_attempt_count, prediction_success_count, prediction_accuracy, prediction_error_before, prediction_error_after, normalized_contingency_key) VALUES (1,'c1','g1','s1',1,1,'e1',25,1,10,0.9,0.1,0.5,1,10,8,0.8,0.3,0.1,'k1')")
+        conn.execute("INSERT INTO stable_contingencies (contingency_id, canonical_key, game, sampler, context_level, action, effect_signature, support_count, first_seen_global_step, last_seen_global_step, stability_score, mean_prediction_error, mean_replay_priority, representative_example_count, prediction_attempt_count, prediction_success_count, prediction_accuracy, prediction_error_before, prediction_error_after, normalized_contingency_key) VALUES (2,'c2','g2','s2',1,1,'e1',25,1,10,0.9,0.1,0.5,1,10,7,0.7,0.3,0.1,'k1')")
+        conn.execute("INSERT INTO memory_nodes (node_id, memory_level, node_type, canonical_key, support_count, attrs_json) VALUES ('M0:interaction:g1','M0','InteractionMemory','i1',1,'{}')")
+        conn.execute("INSERT INTO memory_scores (node_id, replay_priority) VALUES ('M0:interaction:g1', 0.5)")
+        conn.execute("INSERT INTO memory_summary (key, value_json) VALUES ('total_interactions_seen', '100')")
+        conn.commit()
+    result = evaluate_h01_contingency_emergence(run_dir, tmp_path / "out_h01_compact", memory_dir=memory_dir)
+    assert result["decision"] == "VALID"
+
+
+def test_h02_low_coverage_demotes_decision_and_txt_prints_coverage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from v6.hypothesis_h02_report import evaluate_h02_prediction_violation_attention
+
+    run_dir = tmp_path / "run_h02_low_cov"
+    run_dir.mkdir()
+    (run_dir / "interaction_sampling_v05c_report.json").write_text(
+        json.dumps({"runs": [{"game": f"g{i}", "sampler_name": "s", "mean_isf_prediction_error": 0.5, "memory_replay_candidate_count": 1, "high_priority_replay_count": 1, "context_contradiction_count": 1, "repeated_contradiction_count": 1, "context_expansion_suggested_count": 1} for i in range(10)]}),
+        encoding="utf-8",
+    )
+    memory_dir = tmp_path / "memory_h02_low_cov"
+    ensure_memory_layout(memory_dir)
+    manifest_path = memory_dir / "direct_streaming_fold_manifest.sqlite"
+    with sqlite3.connect(manifest_path) as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS folded_jobs (job_id TEXT PRIMARY KEY, status TEXT)")
+        conn.execute("CREATE TABLE IF NOT EXISTS job_metrics (job_id TEXT PRIMARY KEY, game TEXT, sampler TEXT, seed INTEGER, metrics_json TEXT NOT NULL)")
+        for i in range(4):
+            conn.execute("INSERT INTO job_metrics (job_id, game, sampler, seed, metrics_json) VALUES (?, ?, ?, ?, ?)", (f'j{i}', f'g{i}', 's', 0, '{}'))
+        conn.commit()
+    monkeypatch.setattr(
+        "v6.hypothesis_h02_report._compute_prediction_violation_replay_lift_from_existing_db",
+        lambda *args, **kwargs: {"direct_replay_lift_available": True, "prediction_violation_replay_lift": 2.0, "sqlite_db_count_inspected": 1},
+    )
+    result = evaluate_h02_prediction_violation_attention(run_dir, tmp_path / "out_h02_low_cov", memory_dir=memory_dir)
+    assert result["h02a_replay_attention_decision"] == "PARTIALLY_VALID_WITH_LOW_COVERAGE"
+    txt = (tmp_path / "out_h02_low_cov" / "h02_prediction_violation_attention_report.txt").read_text(encoding="utf-8")
+    assert "total_jobs_expected:" in txt
+    assert "jobs_represented_in_compact_or_manifest_evidence:" in txt
+    assert "evidence_coverage_ratio:" in txt
+
+
+def test_h10_txt_prints_subtests(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory_h10_txt"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        for idx in range(5):
+            conn.execute(
+                "INSERT INTO future_option_attention_links (event_id, motif_signature, owner_type, owner_key, option_delta_abs, replay_priority_score, memory_priority_score, contradiction_score, high_option_change, high_attention) VALUES (?, 'm', 'interaction', ?, 2.0, 0.9, 0.7, 0.1, 1, 1)",
+                (f'h{idx}', f'hi{idx}'),
+            )
+            conn.execute(
+                "INSERT INTO future_option_attention_links (event_id, motif_signature, owner_type, owner_key, option_delta_abs, replay_priority_score, memory_priority_score, contradiction_score, high_option_change, high_attention) VALUES (?, 'm', 'interaction', ?, 0.1, 0.1, 0.1, 0.0, 0, 0)",
+                (f'l{idx}', f'lo{idx}'),
+            )
+        conn.commit()
+    evaluate_h10_future_option_attention(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h10_txt", already_derived=True)
+    txt = (tmp_path / "h10_txt" / "h10_future_option_attention_report.txt").read_text(encoding="utf-8")
+    assert "H10A:" in txt
+    assert "H10B:" in txt
+    assert "H10C:" in txt
+    assert "H10D:" in txt
+
+
+def test_h08_label_matches_world_model_coherence_implementation(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory_h08_label"
+    ensure_memory_layout(memory_dir)
+    result = evaluate_h08_world_model_coherence(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h08_label", already_derived=True)
+    assert "World-model coherence" in str(result.get("hypothesis_name"))
 
 
 def test_compact_memory_restore_retries_locked_query_reads() -> None:

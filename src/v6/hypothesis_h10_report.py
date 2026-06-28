@@ -230,6 +230,7 @@ def _percentile80(values: list[float]) -> float:
 
 
 def _write(output_dir: Path, result: dict[str, Any]) -> None:
+    subtests = result.get("h10_subtests") or {}
     (output_dir / "h10_future_option_attention_report.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     text = (
         f"H10 decision: {result.get('decision')}\n"
@@ -248,6 +249,10 @@ def _write(output_dir: Path, result: dict[str, Any]) -> None:
         f"attention saturation: {result.get('attention_saturation')}\n"
         f"replay attention count: {result.get('replay_attention_count')}\n"
         f"contradiction attention count: {result.get('contradiction_attention_count')}\n"
+        f"H10A: coverage={subtests.get('H10A_future_option_to_replay_priority', {}).get('coverage')} high_rate={subtests.get('H10A_future_option_to_replay_priority', {}).get('high_rate')} low_rate={subtests.get('H10A_future_option_to_replay_priority', {}).get('low_rate')} lift={subtests.get('H10A_future_option_to_replay_priority', {}).get('lift')} saturation={subtests.get('H10A_future_option_to_replay_priority', {}).get('saturation')} threshold={subtests.get('H10A_future_option_to_replay_priority', {}).get('threshold')}\n"
+        f"H10B: coverage={subtests.get('H10B_future_option_to_memory_priority', {}).get('coverage')} high_rate={subtests.get('H10B_future_option_to_memory_priority', {}).get('high_rate')} low_rate={subtests.get('H10B_future_option_to_memory_priority', {}).get('low_rate')} lift={subtests.get('H10B_future_option_to_memory_priority', {}).get('lift')} saturation={subtests.get('H10B_future_option_to_memory_priority', {}).get('saturation')} threshold={subtests.get('H10B_future_option_to_memory_priority', {}).get('threshold')}\n"
+        f"H10C: coverage={subtests.get('H10C_future_option_to_contradiction_independent_attention', {}).get('coverage')} high_rate={subtests.get('H10C_future_option_to_contradiction_independent_attention', {}).get('high_rate')} low_rate={subtests.get('H10C_future_option_to_contradiction_independent_attention', {}).get('low_rate')} lift={subtests.get('H10C_future_option_to_contradiction_independent_attention', {}).get('lift')} saturation={subtests.get('H10C_future_option_to_contradiction_independent_attention', {}).get('saturation')} threshold={subtests.get('H10C_future_option_to_contradiction_independent_attention', {}).get('threshold')}\n"
+        f"H10D: coverage={subtests.get('H10D_future_option_to_later_promotion_replay_survival', {}).get('coverage')} high_rate={subtests.get('H10D_future_option_to_later_promotion_replay_survival', {}).get('high_rate')} low_rate={subtests.get('H10D_future_option_to_later_promotion_replay_survival', {}).get('low_rate')} lift={subtests.get('H10D_future_option_to_later_promotion_replay_survival', {}).get('lift')} saturation={subtests.get('H10D_future_option_to_later_promotion_replay_survival', {}).get('saturation')} threshold={subtests.get('H10D_future_option_to_later_promotion_replay_survival', {}).get('threshold')}\n"
     )
     (output_dir / "h10_future_option_attention_report.txt").write_text(text, encoding="utf-8")
     (output_dir / "h10_future_option_attention.md").write_text("```\n" + text + "```\n", encoding="utf-8")

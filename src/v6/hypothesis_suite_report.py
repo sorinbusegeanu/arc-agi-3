@@ -161,7 +161,24 @@ def run_hypothesis_suite_report(
         higher_order_dependency_gate_notes=dependency_notes,
         epoch_maturity_gate_notes=maturity_notes,
     )
-    _write_suite_summary(summary, output_dir)
+    _write_suite_summary(
+        summary,
+        output_dir,
+        hypothesis_results={
+            "H01": h01,
+            "H02": h02,
+            "H03": h03,
+            "H04": h04,
+            "H05": h05,
+            "H06": h06,
+            "H07": h07,
+            "H08": h08,
+            "H09": h09,
+            "H10": h10,
+            "H11": h11,
+            "H12": h12,
+        },
+    )
     return summary
 
 
@@ -274,6 +291,7 @@ def build_hypothesis_suite_summary(
         "H06 decision": h06.get("decision", "INCONCLUSIVE"),
         "H07 decision": h07.get("decision", "INCONCLUSIVE"),
         "H08 decision": h08.get("decision", "INCONCLUSIVE"),
+        "H08 hypothesis name": h08.get("hypothesis_name", "World-model coherence from promoted concepts"),
         "H09 decision": h09.get("decision", "INCONCLUSIVE"),
         "H10 decision": h10.get("decision", "INCONCLUSIVE"),
         "H11 decision": h11.get("decision", "INCONCLUSIVE"),
@@ -795,17 +813,48 @@ def _next_recommended_action(
     return "Proceed with the existing compact memory and compare H01-H11 trends across subsequent epochs."
 
 
-def _write_suite_summary(summary: dict[str, Any], output_dir: Path) -> None:
+def _write_suite_summary(
+    summary: dict[str, Any],
+    output_dir: Path,
+    *,
+    hypothesis_results: dict[str, dict[str, Any]] | None = None,
+) -> None:
     (output_dir / SUITE_JSON_NAME).write_text(json.dumps(summary, indent=2), encoding="utf-8")
     (output_dir / SUITE_TXT_NAME).write_text(_format_text(summary), encoding="utf-8")
     (output_dir / SUITE_MD_NAME).write_text(_format_md(summary), encoding="utf-8")
-    _write_aggregated_hypothesis_text(output_dir)
+    _write_aggregated_hypothesis_text(output_dir, hypothesis_results=hypothesis_results)
 
 
-def _write_aggregated_hypothesis_text(output_dir: Path) -> None:
+def _format_aggregated_result_section(hypothesis_id: str, result: dict[str, Any]) -> str:
+    lines = [
+        f"{hypothesis_id}",
+        f"decision: {result.get('decision')}",
+        f"core_metrics: {json.dumps(result.get('core_metrics') or {}, sort_keys=True)}",
+        f"missing_evidence: {json.dumps(result.get('missing_evidence') or [], ensure_ascii=True)}",
+        f"evidence_diagnostics: {json.dumps(result.get('evidence_diagnostics') or {}, sort_keys=True)}",
+    ]
+    return "\n".join(lines).strip()
+
+
+def _write_aggregated_hypothesis_text(
+    output_dir: Path,
+    *,
+    hypothesis_results: dict[str, dict[str, Any]] | None = None,
+) -> None:
     sections: list[str] = []
     placeholders: dict[int, str] = {}
     for hypothesis_id in range(1, 13):
+        hypothesis_key = f"H{hypothesis_id:02d}"
+        result_payload = None if hypothesis_results is None else hypothesis_results.get(hypothesis_key)
+        if isinstance(result_payload, dict):
+            section = _format_aggregated_result_section(hypothesis_key, result_payload)
+            sections.append(section)
+            subdir = output_dir / f"h{hypothesis_id:02d}"
+            subdir.mkdir(parents=True, exist_ok=True)
+            target = subdir / f"h{hypothesis_id:02d}_report.txt"
+            if not target.exists():
+                target.write_text(section + "\n", encoding="utf-8")
+            continue
         label = f"h{hypothesis_id:02d}"
         subdir = output_dir / label
         if not subdir.exists():
@@ -866,7 +915,7 @@ def _format_text(summary: dict[str, Any]) -> str:
         f"H05: {summary['H05 decision']}",
         f"H06: {summary['H06 decision']}",
         f"H07: {summary['H07 decision']}",
-        f"H08: {summary['H08 decision']}",
+        f"H08 (world-model coherence): {summary['H08 decision']}",
         f"H09: {summary['H09 decision']}",
         f"H10: {summary['H10 decision']}",
         f"H11: {summary['H11 decision']}",
@@ -908,7 +957,7 @@ def _format_md(summary: dict[str, Any]) -> str:
         f"- H05: `{summary['H05 decision']}`",
         f"- H06: `{summary['H06 decision']}`",
         f"- H07: `{summary['H07 decision']}`",
-        f"- H08: `{summary['H08 decision']}`",
+        f"- H08 (world-model coherence): `{summary['H08 decision']}`",
         f"- H09: `{summary['H09 decision']}`",
         f"- H10: `{summary['H10 decision']}`",
         f"- H11: `{summary['H11 decision']}`",

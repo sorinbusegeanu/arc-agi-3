@@ -396,7 +396,7 @@ def evaluate_h02_prediction_violation_attention(
         )
         _finalize_h02_result(result, output_dir)
         return result
-    low_coverage = result.get("evidence_coverage_ratio") is not None and float(result["evidence_coverage_ratio"]) < 0.50
+    low_coverage = result.get("evidence_coverage_ratio") is not None and float(result["evidence_coverage_ratio"]) < 0.80
 
     checks = {
         "prediction_error_positive": _gt(result.get("mean_isf_prediction_error"), 0.0),
@@ -473,10 +473,15 @@ def evaluate_h02_prediction_violation_attention(
         direct_replay_lift_invalid=direct_replay_lift_invalid,
         invalid_core=invalid_core,
     )
-    if low_coverage:
+    if result.get("evidence_coverage_ratio") is None:
         if result["h02a_replay_attention_decision"] == "VALID":
             result["h02a_replay_attention_decision"] = "PARTIALLY_VALID_WITH_LOW_COVERAGE"
-        elif result["h02a_replay_attention_decision"] in {"PARTIALLY_VALID", "INVALID"}:
+        _append_unique(
+            result.setdefault("missing_evidence", []),
+            "H02 evidence coverage could not be computed; VALID is not allowed without explicit coverage.",
+        )
+    elif low_coverage:
+        if result["h02a_replay_attention_decision"] in {"VALID", "PARTIALLY_VALID", "INVALID"}:
             result["h02a_replay_attention_decision"] = "PARTIALLY_VALID_WITH_LOW_COVERAGE"
         else:
             result["h02a_replay_attention_decision"] = "INSUFFICIENT_EVIDENCE"
@@ -2035,6 +2040,15 @@ def _format_text_report(result: dict[str, Any]) -> str:
         "",
         "Direct replay-lift evidence:",
         *_format_direct_evidence_text(result),
+        "",
+        "Coverage:",
+        f"total_jobs_expected: {result.get('total_jobs_expected')}",
+        f"jobs_represented_in_compact_or_manifest_evidence: {result.get('jobs_represented_in_compact_or_manifest_evidence')}",
+        f"jobs_represented_in_raw_scan: {result.get('jobs_represented_in_raw_scan')}",
+        f"evidence_coverage_ratio: {_fmt_number(result.get('evidence_coverage_ratio'))}",
+        f"sqlite_db_count_total: {result.get('sqlite_db_count_total')}",
+        f"sqlite_db_count_inspected: {result.get('sqlite_db_count_inspected')}",
+        f"sqlite_db_skipped_count: {result.get('sqlite_db_skipped_count')}",
         "",
         "Evidence for:",
         *_format_bullets(result["evidence_for"]),

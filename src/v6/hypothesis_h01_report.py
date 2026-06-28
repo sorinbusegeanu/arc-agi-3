@@ -70,6 +70,49 @@ H01_DEFAULTS: dict[str, Any] = {
 }
 
 
+def _apply_h01_decision(
+    result: dict[str, Any],
+    *,
+    interactions_present: bool,
+    contingencies_present: bool,
+    stable_present: bool,
+    multi_game_support: bool,
+    multi_sampler_support: bool,
+    signal_present: bool,
+    report_has_runs: bool,
+) -> None:
+    if not interactions_present and not result["db_found"] and not report_has_runs:
+        result["decision"] = "INCONCLUSIVE"
+        result["scientific_conclusion"] = (
+            "H01 remains inconclusive because the current run does not expose enough interaction or contingency evidence."
+        )
+    elif interactions_present and not contingencies_present:
+        result["decision"] = "INVALID"
+        result["scientific_conclusion"] = (
+            "H01 is not supported in this run because interactions are present but no contingencies emerge."
+        )
+    elif interactions_present and stable_present and signal_present and (multi_game_support or multi_sampler_support):
+        result["decision"] = "VALID"
+        result["scientific_conclusion"] = (
+            "H01 is supported in this run. Stable contingencies emerge from interaction history across multiple games or samplers with non-zero prediction/context signal."
+        )
+    elif contingencies_present:
+        result["decision"] = "PARTIALLY_VALID"
+        if result["stability_approximated"]:
+            result["scientific_conclusion"] = (
+                "H01 is partially supported in this run. Contingencies emerge from interaction history, but stability evidence is approximate."
+            )
+        else:
+            result["scientific_conclusion"] = (
+                "H01 is partially supported in this run. Contingencies emerge from interaction history, but they remain sparse across games or samplers."
+            )
+    else:
+        result["decision"] = "INCONCLUSIVE"
+        result["scientific_conclusion"] = (
+            "H01 remains inconclusive because usable contingency evidence could not be established from the current artifacts."
+        )
+
+
 def evaluate_h01_contingency_emergence(run_dir: Path, output_dir: Path, *, memory_dir: Path | None = None) -> dict:
     run_dir = Path(run_dir)
     output_dir = Path(output_dir)
@@ -121,11 +164,15 @@ def evaluate_h01_contingency_emergence(run_dir: Path, output_dir: Path, *, memor
             result["evidence_for"].append("Cross-sampler contingency support is present in compact memory.")
         if not signal_present:
             result["evidence_against"].append("Prediction/context signal is unavailable in compact-only evidence.")
-        result["decision"] = "PARTIALLY_VALID" if stable_present else "INCONCLUSIVE"
-        result["scientific_conclusion"] = (
-            "H01 evaluated from compact memory after raw cleanup."
-            if stable_present
-            else "H01 remains inconclusive because compact memory lacks stable contingency evidence."
+        _apply_h01_decision(
+            result,
+            interactions_present=interactions_present,
+            contingencies_present=contingencies_present,
+            stable_present=stable_present,
+            multi_game_support=bool(multi_game_support),
+            multi_sampler_support=bool(multi_sampler_support),
+            signal_present=bool(signal_present),
+            report_has_runs=False,
         )
         _finalize_h01_result(result, output_dir)
         return result
@@ -288,36 +335,16 @@ def evaluate_h01_contingency_emergence(run_dir: Path, output_dir: Path, *, memor
     if not signal_present and contingencies_present:
         result["evidence_against"].append("Contingencies are present but prediction/context signal is weak or unavailable.")
 
-    if not interactions_present and not result["db_found"] and not report.get("runs"):
-        result["decision"] = "INCONCLUSIVE"
-        result["scientific_conclusion"] = (
-            "H01 remains inconclusive because the current run does not expose enough interaction or contingency evidence."
-        )
-    elif interactions_present and not contingencies_present:
-        result["decision"] = "INVALID"
-        result["scientific_conclusion"] = (
-            "H01 is not supported in this run because interactions are present but no contingencies emerge."
-        )
-    elif stable_present and signal_present and (multi_game_support or multi_sampler_support):
-        result["decision"] = "VALID"
-        result["scientific_conclusion"] = (
-            "H01 is supported in this run. Stable contingencies emerge from interaction history across multiple games or samplers with non-zero prediction/context signal."
-        )
-    elif contingencies_present:
-        result["decision"] = "PARTIALLY_VALID"
-        if result["stability_approximated"]:
-            result["scientific_conclusion"] = (
-                "H01 is partially supported in this run. Contingencies emerge from interaction history, but stability evidence is approximate."
-            )
-        else:
-            result["scientific_conclusion"] = (
-                "H01 is partially supported in this run. Contingencies emerge from interaction history, but they remain sparse across games or samplers."
-            )
-    else:
-        result["decision"] = "INCONCLUSIVE"
-        result["scientific_conclusion"] = (
-            "H01 remains inconclusive because usable contingency evidence could not be established from the current artifacts."
-        )
+    _apply_h01_decision(
+        result,
+        interactions_present=bool(interactions_present),
+        contingencies_present=bool(contingencies_present),
+        stable_present=bool(stable_present),
+        multi_game_support=bool(multi_game_support),
+        multi_sampler_support=bool(multi_sampler_support),
+        signal_present=bool(signal_present),
+        report_has_runs=bool(report.get("runs")),
+    )
 
     _finalize_h01_result(result, output_dir)
     return result

@@ -169,6 +169,7 @@ def evaluate_h08_world_model_coherence(
 def _base_result(decision: str, missing_evidence: list[str]) -> dict[str, Any]:
     return {
         "hypothesis_id": "H08",
+        "hypothesis_name": "World-model coherence from promoted concepts",
         "decision": decision,
         "missing_evidence": list(missing_evidence),
         "evidence_source": "compact_memory",
@@ -178,7 +179,8 @@ def _base_result(decision: str, missing_evidence: list[str]) -> dict[str, Any]:
 def _write_outputs(output_dir: Path, result: dict[str, Any]) -> None:
     (output_dir / "h08_world_model_coherence_report.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     text = (
-        f"H08 decision: {result.get('decision')}\n"
+        f"H08 world-model coherence decision: {result.get('decision')}\n"
+        f"hypothesis name: {result.get('hypothesis_name')}\n"
         f"promoted concepts: {result.get('promoted_concept_count')}\n"
         f"world model components: {result.get('world_model_component_count')}\n"
         f"candidate-only components: {result.get('candidate_only_world_model_component_count')}\n"
