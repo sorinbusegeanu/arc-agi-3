@@ -7,7 +7,7 @@ from pathlib import Path
 
 from v6.cli import build_parser
 from v6.continuous_research import ContinuousResearchConfig, run_continuous_research
-from v6.evaluation.interaction_sampling import InteractionSamplingConfig, _generate_sampling_dbs, run_interaction_sampling_v05c
+from v6.evaluation.interaction_sampling import InteractionSamplingConfig, _generate_sampling_dbs, _run_sampling_jobs, run_interaction_sampling_v05c
 from v6.memory.direct_streaming_fold import (
     DirectStreamingFoldConfig,
     DirectStreamingFoldJob,
@@ -533,6 +533,105 @@ def test_direct_streaming_fold_start_removes_stale_shard_root_when_manifest_clea
     finally:
         if writer._executor is not None:
             writer._executor.shutdown(wait=True, cancel_futures=True)
+
+
+def test_sampling_pool_refills_before_direct_fold_submit(monkeypatch, tmp_path: Path) -> None:
+    class FakeFuture:
+        def __init__(self, job):
+            self.job = job
+
+        def result(self):
+            return {"legacy_future_effects_removed": True}
+
+    class FakeExecutor:
+        last_instance = None
+
+        def __init__(self, max_workers=None, max_tasks_per_child=None):
+            self.submit_count = 0
+            FakeExecutor.last_instance = self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def submit(self, fn, job):
+            self.submit_count += 1
+            return FakeFuture(job)
+
+    class FakeWriter:
+        last_instance = None
+
+        def __init__(self, *args, **kwargs):
+            self.submit_counts: list[int] = []
+            FakeWriter.last_instance = self
+
+        def start(self) -> None:
+            pass
+
+        def submit(self, job) -> None:
+            self.submit_counts.append(int(FakeExecutor.last_instance.submit_count))
+
+        def close(self) -> dict[str, object]:
+            return {
+                "direct_streaming_fold_worker_count": 1,
+                "direct_streaming_fold_shard_count": 1,
+                "direct_streaming_fold_job_count": 64,
+                "direct_streaming_fold_success_count": 64,
+                "direct_streaming_fold_failed_count": 0,
+                "direct_streaming_fold_deleted_raw_count": 0,
+                "direct_streaming_fold_manifest_path": str(tmp_path / "memory" / "direct_streaming_fold_manifest.sqlite"),
+                "direct_streaming_fold_shards_deleted": True,
+                "direct_streaming_fold_merge_started_at": None,
+                "direct_streaming_fold_merge_finished_at": None,
+                "direct_streaming_fold_merge_seconds": None,
+                "direct_streaming_fold_jobs_submitted": 64,
+                "direct_streaming_fold_jobs_completed": 64,
+                "direct_streaming_fold_jobs_failed": 0,
+                "direct_streaming_fold_raw_deleted_after_shard_fold_count": 0,
+                "direct_streaming_fold_finalized_main_memory": True,
+                "direct_streaming_fold_total_raw_bytes": 0,
+                "direct_streaming_fold_total_shard_bytes_added": 0,
+                "direct_streaming_fold_mean_job_seconds": 0.0,
+                "direct_streaming_fold_mean_write_mb_per_second": 0.0,
+                "direct_streaming_shard_synchronous": "off",
+            }
+
+    def _fake_wait(futures, timeout=None, return_when=None):
+        return set(list(futures.keys())), set()
+
+    monkeypatch.setattr("v6.evaluation.interaction_sampling.ProcessPoolExecutor", FakeExecutor)
+    monkeypatch.setattr("v6.evaluation.interaction_sampling.wait", _fake_wait)
+    monkeypatch.setattr("v6.evaluation.interaction_sampling.DirectStreamingFoldWriter", FakeWriter)
+
+    jobs = [
+        {
+            "game": "tt01",
+            "sampler_name": "random_baseline",
+            "seed": idx,
+            "steps": 5,
+            "horizon": 2,
+            "context_depth": 1,
+            "global_step_offset": idx * 5,
+            "memory_output_dir": str(tmp_path / "memory"),
+            "direct_streaming_fold_enabled": True,
+            "delete_raw_after_direct_streaming_fold": False,
+            "direct_streaming_fold_workers": 2,
+            "direct_streaming_fold_submit_delay_seconds": 10.0,
+            "max_tasks_per_child": 1,
+            "db_path": str(tmp_path / f"seed_{idx}.sqlite"),
+        }
+        for idx in range(64)
+    ]
+    stats = _run_sampling_jobs(jobs, workers=32, initial_workers=32)
+    writer = FakeWriter.last_instance
+    assert writer is not None
+    assert len(writer.submit_counts) == 64
+    assert all(count == 64 for count in writer.submit_counts[:32])
+    assert stats["sampling_refill_count"] >= 2
+    assert stats["max_done_batch_size"] == 32
+    assert stats["seconds_spent_in_fold_submit_delay"] == 0.0
 
 
 def test_compact_sqlite_busy_timeout_wal(tmp_path: Path) -> None:

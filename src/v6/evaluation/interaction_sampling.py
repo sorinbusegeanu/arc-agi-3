@@ -121,7 +121,7 @@ class InteractionSamplingConfig:
     direct_streaming_fold_retry_attempts: int = 5
     direct_streaming_fold_retry_initial_delay_seconds: float = 5.0
     direct_streaming_fold_busy_timeout_ms: int = 60000
-    direct_streaming_fold_submit_delay_seconds: float = 1.0
+    direct_streaming_fold_submit_delay_seconds: float = 0.0
     direct_streaming_shard_synchronous: str = "off"
 
 
@@ -496,9 +496,14 @@ def _run_sampling_jobs(
     )
     pending_jobs = iter(jobs)
     active_futures = {}
+    pending_jobs_remaining = len(jobs)
     target_workers = initial
     peak_workers = 0
     ramp_events: list[dict[str, float | int]] = []
+    sampling_refill_count = 0
+    max_done_batch_size = 0
+    seconds_spent_in_fold_submit_delay = 0.0
+    sampling_pool_underfilled_seconds = 0.0
     ramp_start_time = time.monotonic()
     last_ramp_time = ramp_start_time
     main_memory_dir = next((str(job["memory_output_dir"]) for job in jobs if job.get("memory_output_dir")), None)
@@ -588,7 +593,8 @@ def _run_sampling_jobs(
         return True
 
     def _submit_until_target(executor: ProcessPoolExecutor) -> None:
-        nonlocal peak_workers
+        nonlocal peak_workers, pending_jobs_remaining, sampling_refill_count
+        submitted_now = 0
         while len(active_futures) < target_workers:
             try:
                 job = next(pending_jobs)
@@ -596,6 +602,10 @@ def _run_sampling_jobs(
                 break
             future = executor.submit(_run_sampling_job, job)
             active_futures[future] = job
+            pending_jobs_remaining = max(0, pending_jobs_remaining - 1)
+            submitted_now += 1
+        if submitted_now > 0:
+            sampling_refill_count += 1
         peak_workers = max(peak_workers, len(active_futures))
 
     try:
@@ -607,13 +617,25 @@ def _run_sampling_jobs(
                     if _maybe_ramp():
                         _submit_until_target(executor)
                     continue
+                done_jobs: list[dict[str, Any]] = []
+                done_count = len(done)
+                if done_count > max_done_batch_size:
+                    max_done_batch_size = done_count
+                underfilled_started_at = time.monotonic()
                 for future in done:
-                    result = future.result()
+                    _result = future.result()
                     job = active_futures.pop(future, None)
-                    if job is not None and direct_fold_writer is not None and job.get("memory_output_dir"):
-                        submit_delay_seconds = float(job.get("direct_streaming_fold_submit_delay_seconds", 1.0) or 0.0)
-                        if submit_delay_seconds > 0.0:
-                            time.sleep(submit_delay_seconds)
+                    if job is not None:
+                        done_jobs.append(job)
+                    progress.update(1)
+                _maybe_ramp()
+                _submit_until_target(executor)
+                if pending_jobs_remaining > 0 and len(active_futures) < target_workers:
+                    sampling_pool_underfilled_seconds += max(0.0, time.monotonic() - underfilled_started_at)
+                if direct_fold_writer is not None:
+                    for job in done_jobs:
+                        if not job.get("memory_output_dir"):
+                            continue
                         direct_fold_writer.submit(
                             DirectStreamingFoldJob(
                                 job_id=f"{job['game']}:{job['sampler_name']}:seed{job['seed']}:steps{job['steps']}",
@@ -634,9 +656,6 @@ def _run_sampling_jobs(
                                 compression=str(job.get("compression", "zstd") or "zstd"),
                             )
                         )
-                    progress.update(1)
-                _maybe_ramp()
-                _submit_until_target(executor)
     finally:
         progress.close()
         if live_memory_queue is not None and live_memory_writer is not None:
@@ -662,6 +681,10 @@ def _run_sampling_jobs(
         "initial_workers": int(initial),
         "fold_workers": int(direct_fold_summary.get("direct_streaming_fold_worker_count", 0) or 0),
         "peak_workers": int(peak_workers),
+        "sampling_refill_count": int(sampling_refill_count),
+        "max_done_batch_size": int(max_done_batch_size),
+        "seconds_spent_in_fold_submit_delay": float(seconds_spent_in_fold_submit_delay),
+        "sampling_pool_underfilled_seconds": float(sampling_pool_underfilled_seconds),
         "max_tasks_per_child": int(max_tasks_per_child),
         "worker_ramp_enabled": bool(enable_worker_ramp),
         "ram_ramp_threshold_percent": float(ram_ramp_threshold_percent),
