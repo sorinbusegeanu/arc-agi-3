@@ -124,6 +124,7 @@ class InteractionSamplingConfig:
     direct_streaming_fold_submit_delay_seconds: float = 0.0
     direct_streaming_shard_synchronous: str = "off"
     direct_streaming_checkpoint_every_merged_jobs: int = 25
+    direct_streaming_merge_batch_size: int = 25
     delete_sidecars_after_fold: bool = True
     max_live_shard_bytes: int | None = None
     write_debug_sidecars: bool = False
@@ -131,6 +132,10 @@ class InteractionSamplingConfig:
     max_examples_per_family: int = 1
     max_examples_per_carrier: int = 1
     max_examples_per_contradiction_cluster: int = 2
+    fold_memory_substrate: bool = True
+    fold_graph: bool = True
+    compact_finalize_mode: str = "full"
+    full_finalize_every_epochs: int = 5
     memory_query_enabled: bool = False
     memory_action_selection_enabled: bool = False
     restore_compact_graph: bool = False
@@ -350,12 +355,17 @@ def _generate_sampling_dbs(config: InteractionSamplingConfig, sampling_root: Pat
                             "compression": str(config.compression),
                             "write_debug_sidecars": bool(config.write_debug_sidecars),
                             "direct_streaming_checkpoint_every_merged_jobs": int(config.direct_streaming_checkpoint_every_merged_jobs),
+                            "direct_streaming_merge_batch_size": int(config.direct_streaming_merge_batch_size),
                             "delete_sidecars_after_fold": bool(config.delete_sidecars_after_fold),
                             "max_live_shard_bytes": config.max_live_shard_bytes,
                             "max_examples_per_contingency": int(config.max_examples_per_contingency),
                             "max_examples_per_family": int(config.max_examples_per_family),
                             "max_examples_per_carrier": int(config.max_examples_per_carrier),
                             "max_examples_per_contradiction_cluster": int(config.max_examples_per_contradiction_cluster),
+                            "fold_memory_substrate": bool(config.fold_memory_substrate),
+                            "fold_graph": bool(config.fold_graph),
+                            "compact_finalize_mode": str(config.compact_finalize_mode),
+                            "full_finalize_every_epochs": int(config.full_finalize_every_epochs),
                             "memory_query_enabled": bool(config.memory_query_enabled),
                             "memory_action_selection_enabled": bool(config.memory_action_selection_enabled),
                             "restore_compact_graph": bool(config.restore_compact_graph),
@@ -432,12 +442,17 @@ def _generate_sampling_dbs(config: InteractionSamplingConfig, sampling_root: Pat
                         "compression": str(config.compression),
                         "write_debug_sidecars": bool(config.write_debug_sidecars),
                         "direct_streaming_checkpoint_every_merged_jobs": int(config.direct_streaming_checkpoint_every_merged_jobs),
+                        "direct_streaming_merge_batch_size": int(config.direct_streaming_merge_batch_size),
                         "delete_sidecars_after_fold": bool(config.delete_sidecars_after_fold),
                         "max_live_shard_bytes": config.max_live_shard_bytes,
                         "max_examples_per_contingency": int(config.max_examples_per_contingency),
                         "max_examples_per_family": int(config.max_examples_per_family),
                         "max_examples_per_carrier": int(config.max_examples_per_carrier),
                         "max_examples_per_contradiction_cluster": int(config.max_examples_per_contradiction_cluster),
+                        "fold_memory_substrate": bool(config.fold_memory_substrate),
+                        "fold_graph": bool(config.fold_graph),
+                        "compact_finalize_mode": str(config.compact_finalize_mode),
+                        "full_finalize_every_epochs": int(config.full_finalize_every_epochs),
                         "memory_query_enabled": bool(config.memory_query_enabled),
                         "memory_action_selection_enabled": bool(config.memory_action_selection_enabled),
                         "restore_compact_graph": bool(config.restore_compact_graph),
@@ -593,12 +608,16 @@ def _run_sampling_jobs(
                 busy_timeout_ms=int(jobs[0].get("direct_streaming_fold_busy_timeout_ms", 60000) or 60000),
                 shard_synchronous=str(jobs[0].get("direct_streaming_shard_synchronous", "off") or "off"),
                 checkpoint_every_merged_jobs=int(jobs[0].get("direct_streaming_checkpoint_every_merged_jobs", 25) or 25),
+                merge_batch_size=int(jobs[0].get("direct_streaming_merge_batch_size", 25) or 25),
                 delete_sidecars_after_fold=bool(jobs[0].get("delete_sidecars_after_fold", True)),
                 max_live_shard_bytes=None if jobs[0].get("max_live_shard_bytes") in (None, "") else int(jobs[0].get("max_live_shard_bytes")),
                 max_examples_per_contingency=int(jobs[0].get("max_examples_per_contingency", 1) or 1),
                 max_examples_per_family=int(jobs[0].get("max_examples_per_family", 1) or 1),
                 max_examples_per_carrier=int(jobs[0].get("max_examples_per_carrier", 1) or 1),
                 max_examples_per_contradiction_cluster=int(jobs[0].get("max_examples_per_contradiction_cluster", 2) or 2),
+                fold_memory_substrate=bool(jobs[0].get("fold_memory_substrate", True)),
+                fold_graph=bool(jobs[0].get("fold_graph", True)),
+                compact_finalize_mode=str(jobs[0].get("compact_finalize_mode", "full") or "full"),
             ),
             sampling_config=SimpleNamespace(
                 steps=int(jobs[0].get("steps", 0) or 0),

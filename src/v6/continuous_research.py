@@ -63,12 +63,17 @@ class ContinuousResearchConfig:
     direct_streaming_fold_submit_delay_seconds: float = 1.0
     direct_streaming_shard_synchronous: str = "off"
     direct_streaming_checkpoint_every_merged_jobs: int = 25
+    direct_streaming_merge_batch_size: int = 25
     max_live_shard_bytes: int | None = None
     write_debug_sidecars: bool = False
     max_examples_per_contingency: int = 1
     max_examples_per_family: int = 1
     max_examples_per_carrier: int = 1
     max_examples_per_contradiction_cluster: int = 2
+    fold_memory_substrate: bool = True
+    fold_graph: bool = True
+    compact_finalize_mode: str = "summary_only"
+    full_finalize_every_epochs: int = 5
     memory_query_enabled: bool = False
     memory_action_selection_enabled: bool = False
     restore_compact_graph: bool = False
@@ -184,12 +189,21 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
                 direct_streaming_fold_submit_delay_seconds=float(config.direct_streaming_fold_submit_delay_seconds),
                 direct_streaming_shard_synchronous=str(config.direct_streaming_shard_synchronous),
                 direct_streaming_checkpoint_every_merged_jobs=int(config.direct_streaming_checkpoint_every_merged_jobs),
+                direct_streaming_merge_batch_size=int(config.direct_streaming_merge_batch_size),
                 max_live_shard_bytes=config.max_live_shard_bytes,
                 write_debug_sidecars=bool(config.write_debug_sidecars),
                 max_examples_per_contingency=int(config.max_examples_per_contingency),
                 max_examples_per_family=int(config.max_examples_per_family),
                 max_examples_per_carrier=int(config.max_examples_per_carrier),
                 max_examples_per_contradiction_cluster=int(config.max_examples_per_contradiction_cluster),
+                fold_memory_substrate=bool(config.fold_memory_substrate),
+                fold_graph=bool(config.fold_graph),
+                compact_finalize_mode=(
+                    "full"
+                    if int(epoch_number) % max(1, int(config.full_finalize_every_epochs or 5)) == 0
+                    else str(config.compact_finalize_mode)
+                ),
+                full_finalize_every_epochs=int(config.full_finalize_every_epochs),
                 memory_query_enabled=bool(config.memory_query_enabled),
                 memory_action_selection_enabled=bool(config.memory_action_selection_enabled),
                 restore_compact_graph=bool(config.restore_compact_graph),

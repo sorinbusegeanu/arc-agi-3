@@ -13,6 +13,7 @@ from v6.memory.compact_memory import (
     checkpoint_compact_memory,
     ensure_memory_layout,
     finalize_main_compact_memory,
+    fold_single_sampling_db_into_main_compact_memory,
 )
 from v6.memory.direct_streaming_fold import (
     DirectStreamingFoldConfig,
@@ -40,6 +41,130 @@ def _make_fake_raw_job(tmp_path: Path, name: str = "seed_0.sqlite") -> Path:
         "efficiency_summary.json",
     ):
         db_path.with_name(sidecar).write_text("{}", encoding="utf-8")
+    return db_path
+
+
+def _make_minimal_sqlite_with_memory_substrate(db_path: Path) -> Path:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE memory_nodes (
+                node_id TEXT PRIMARY KEY,
+                memory_level INTEGER,
+                node_type TEXT,
+                canonical_key TEXT,
+                support_count INTEGER,
+                first_seen_step INTEGER,
+                last_seen_step INTEGER,
+                attrs_json TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE memory_edges (
+                source_node_id TEXT,
+                target_node_id TEXT,
+                edge_type TEXT,
+                weight REAL,
+                support_count INTEGER,
+                evidence_json TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE memory_evidence (
+                evidence_id TEXT PRIMARY KEY,
+                target_node_id TEXT,
+                source_interaction_id TEXT,
+                evidence_type TEXT,
+                payload_json TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE memory_scores (
+                node_id TEXT PRIMARY KEY,
+                isf_total REAL,
+                prediction_lift REAL,
+                transfer_score REAL,
+                explanatory_reach REAL,
+                compression_gain REAL,
+                future_option_delta REAL,
+                replay_priority REAL,
+                retention_status TEXT,
+                memory_state TEXT,
+                stored_epoch INTEGER,
+                last_replayed_epoch INTEGER,
+                last_promoted_epoch INTEGER,
+                retention_score REAL,
+                forgetting_score REAL,
+                compressed_into_id TEXT,
+                superseded_by_id TEXT,
+                forgetting_reason TEXT,
+                updated_step INTEGER
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE memory_promotions (
+                promotion_id TEXT PRIMARY KEY,
+                source_node_id TEXT,
+                target_node_id TEXT,
+                promotion_type TEXT,
+                evidence_count INTEGER,
+                promotion_score REAL,
+                status TEXT,
+                payload_json TEXT
+            )
+            """
+        )
+        conn.execute("INSERT INTO memory_nodes VALUES ('M1:contingency:a', 1, 'ContingencyMemory', 'ck:a', 3, 1, 3, '{}')")
+        conn.execute("INSERT INTO memory_edges VALUES ('M1:contingency:a', 'M2:family:a', 'supports', 1.0, 3, '{}')")
+        conn.execute("INSERT INTO memory_evidence VALUES ('e1', 'M1:contingency:a', '1', 'observation', '{}')")
+        conn.execute(
+            """
+            INSERT INTO memory_scores VALUES
+            ('M1:contingency:a', 0.4, 0.1, 0.2, 0.3, 0.0, 0.0, 0.5, 'active', 'active', 1, NULL, NULL, 0.6, 0.1, NULL, NULL, NULL, 3)
+            """
+        )
+        conn.execute("INSERT INTO memory_promotions VALUES ('p1', 'M1:contingency:a', 'M2:family:a', 'family', 1, 0.5, 'pending', '{}')")
+        conn.commit()
+    return db_path
+
+
+def _make_minimal_sqlite_with_prediction_results(db_path: Path) -> Path:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE prediction_results (
+                interaction_id INTEGER,
+                global_step INTEGER,
+                context_level INTEGER,
+                context_signature TEXT,
+                action INTEGER,
+                predicted_family TEXT,
+                actual_family TEXT
+            )
+            """
+        )
+        conn.executemany(
+            """
+            INSERT INTO prediction_results (
+                interaction_id, global_step, context_level, context_signature, action, predicted_family, actual_family
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (1, 1, 1, '["ctx"]', 2, "famA", "famA"),
+                (2, 2, 1, '["ctx"]', 2, "famA", "famA"),
+            ],
+        )
+        conn.commit()
     return db_path
 
 
@@ -450,7 +575,7 @@ def test_direct_streaming_fold_finalizes_once(tmp_path: Path, monkeypatch) -> No
     monkeypatch.setattr("v6.memory.direct_streaming_fold.finalize_main_compact_memory", _finalize)
 
     writer = DirectStreamingFoldWriter(
-        DirectStreamingFoldConfig(memory_dir=str(memory_dir), fold_workers=2),
+        DirectStreamingFoldConfig(memory_dir=str(memory_dir), fold_workers=2, merge_batch_size=25),
         sampling_config=type("Cfg", (), {"steps": 5, "horizon": 2})(),
     )
     writer.start()
@@ -472,9 +597,254 @@ def test_direct_streaming_fold_finalizes_once(tmp_path: Path, monkeypatch) -> No
         )
     summary = writer.close()
     assert calls["fold"] == 2
-    assert calls["merge"] == 2
+    assert calls["merge"] == 1
     assert calls["finalize"] == 1
     assert summary["direct_streaming_fold_finalized_main_memory"] is True
+
+
+def test_fold_memory_substrate_false_skips_substrate_tables(tmp_path: Path) -> None:
+    raw_db = _make_minimal_sqlite_with_memory_substrate(
+        tmp_path / "sampling" / "tt01" / "random_baseline" / "seed_0.sqlite"
+    )
+    memory_dir = tmp_path / "memory"
+    fold_single_sampling_db_into_main_compact_memory(
+        db_path=raw_db,
+        memory_dir=memory_dir,
+        fold_config=CompactMemoryFoldConfig(
+            global_step_start=1,
+            global_step_end=3,
+            fold_memory_substrate=False,
+        ),
+    )
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        assert conn.execute("SELECT COUNT(*) FROM memory_nodes").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM memory_edges").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM memory_evidence").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM memory_scores").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM memory_promotions").fetchone()[0] == 0
+
+
+def test_fold_graph_false_skips_graph_writes(tmp_path: Path) -> None:
+    raw_db = _make_minimal_sqlite_with_prediction_results(
+        tmp_path / "sampling" / "tt01" / "random_baseline" / "seed_0.sqlite"
+    )
+    memory_dir = tmp_path / "memory"
+    fold_single_sampling_db_into_main_compact_memory(
+        db_path=raw_db,
+        memory_dir=memory_dir,
+        fold_config=CompactMemoryFoldConfig(
+            global_step_start=1,
+            global_step_end=2,
+            fold_graph=False,
+        ),
+    )
+    with sqlite3.connect(memory_dir / "graph.sqlite") as conn:
+        assert conn.execute("SELECT COUNT(*) FROM graph_nodes").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM graph_edges").fetchone()[0] == 0
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        assert conn.execute("SELECT COUNT(*) FROM stable_contingencies").fetchone()[0] > 0
+
+
+def test_checkpoint_interval_runs_after_batch_merges(tmp_path: Path, monkeypatch) -> None:
+    memory_dir = tmp_path / "memory"
+    _patch_writer_parallelism(monkeypatch)
+    checkpoint_calls = {"compact": 0, "manifest": 0}
+
+    monkeypatch.setattr(
+        "v6.memory.direct_streaming_fold.compute_sampling_job_metrics",
+        lambda *args, **kwargs: {"game": "tt01", "sampler_name": "random_baseline", "seed": 0, "steps": 5, "horizon": 2},
+    )
+    monkeypatch.setattr(
+        "v6.memory.direct_streaming_fold.compute_sampling_job_temporal_milestones",
+        lambda *args, **kwargs: {"game": "tt01", "sampler": "random_baseline", "seed": 0},
+    )
+    monkeypatch.setattr(
+        "v6.memory.direct_streaming_fold.compute_sampling_job_validation_payload",
+        lambda *args, **kwargs: {"game": "tt01", "sampler_name": "random_baseline", "seed": 0, "examples": []},
+    )
+    monkeypatch.setattr(
+        "v6.memory.direct_streaming_fold.fold_single_sampling_db_into_main_compact_memory",
+        lambda *args, **kwargs: {"db_files_folded": 1},
+    )
+    monkeypatch.setattr(
+        "v6.memory.direct_streaming_fold.merge_direct_fold_shards",
+        lambda *args, **kwargs: {"merged": True},
+    )
+    monkeypatch.setattr(
+        "v6.memory.direct_streaming_fold.finalize_main_compact_memory",
+        lambda *args, **kwargs: {"finalized": True},
+    )
+    monkeypatch.setattr(
+        "v6.memory.direct_streaming_fold._checkpoint_compact_memory",
+        lambda *args, **kwargs: checkpoint_calls.__setitem__("compact", checkpoint_calls["compact"] + 1) or {"ok": True},
+    )
+    monkeypatch.setattr(
+        "v6.memory.direct_streaming_fold.checkpoint_direct_streaming_manifest",
+        lambda *args, **kwargs: checkpoint_calls.__setitem__("manifest", checkpoint_calls["manifest"] + 1) or {"ok": True},
+    )
+
+    writer = DirectStreamingFoldWriter(
+        DirectStreamingFoldConfig(
+            memory_dir=str(memory_dir),
+            fold_workers=2,
+            merge_batch_size=2,
+            checkpoint_every_merged_jobs=2,
+        ),
+        sampling_config=type("Cfg", (), {"steps": 5, "horizon": 2})(),
+    )
+    writer.start()
+    for index in range(4):
+        db_path = _make_fake_raw_job(tmp_path / f"raw_{index}")
+        writer.submit(
+            DirectStreamingFoldJob(
+                job_id=f"tt01:random_baseline:seed{index}:steps5",
+                db_path=str(db_path),
+                game="tt01",
+                sampler="random_baseline",
+                seed=index,
+                steps=5,
+                horizon=2,
+                context_depth=1,
+                global_step_start=1,
+                global_step_end=5,
+                memory_dir=str(memory_dir),
+            )
+        )
+    writer.close()
+
+    assert checkpoint_calls["compact"] >= 3
+    assert checkpoint_calls["manifest"] >= 3
+
+
+def test_direct_streaming_batch_merge_deletes_raw_only_after_successful_batch_merge(tmp_path: Path, monkeypatch) -> None:
+    memory_dir = tmp_path / "memory"
+    db_path_a = _make_fake_raw_job(tmp_path / "raw_a", "seed_0.sqlite")
+    db_path_b = _make_fake_raw_job(tmp_path / "raw_b", "seed_1.sqlite")
+    _patch_writer_parallelism(monkeypatch)
+    monkeypatch.setattr(
+        "v6.memory.direct_streaming_fold.compute_sampling_job_metrics",
+        lambda *args, **kwargs: {"game": "tt01", "sampler_name": "random_baseline", "seed": 0, "steps": 5, "horizon": 2},
+    )
+    monkeypatch.setattr(
+        "v6.memory.direct_streaming_fold.compute_sampling_job_temporal_milestones",
+        lambda *args, **kwargs: {"game": "tt01", "sampler": "random_baseline", "seed": 0},
+    )
+    monkeypatch.setattr(
+        "v6.memory.direct_streaming_fold.compute_sampling_job_validation_payload",
+        lambda *args, **kwargs: {"game": "tt01", "sampler_name": "random_baseline", "seed": 0, "examples": []},
+    )
+    monkeypatch.setattr("v6.memory.direct_streaming_fold.fold_single_sampling_db_into_main_compact_memory", lambda *args, **kwargs: {"db_files_folded": 1})
+    seen_raw_during_merge: list[bool] = []
+
+    def _merge(*, shard_dirs, **kwargs):
+        del kwargs
+        seen_raw_during_merge.append(db_path_a.exists() and db_path_b.exists())
+        assert len(shard_dirs) == 2
+        return {"merged": True}
+
+    monkeypatch.setattr("v6.memory.direct_streaming_fold.merge_direct_fold_shards", _merge)
+    monkeypatch.setattr("v6.memory.direct_streaming_fold.finalize_main_compact_memory", lambda *args, **kwargs: {"finalized": True})
+
+    writer = DirectStreamingFoldWriter(
+        DirectStreamingFoldConfig(memory_dir=str(memory_dir), fold_workers=2, merge_batch_size=2),
+        sampling_config=type("Cfg", (), {"steps": 5, "horizon": 2})(),
+    )
+    writer.start()
+    for idx, db_path in enumerate((db_path_a, db_path_b)):
+        writer.submit(
+            DirectStreamingFoldJob(
+                job_id=f"tt01:random_baseline:seed{idx}:steps5",
+                db_path=str(db_path),
+                game="tt01",
+                sampler="random_baseline",
+                seed=idx,
+                steps=5,
+                horizon=2,
+                context_depth=1,
+                global_step_start=idx * 5 + 1,
+                global_step_end=idx * 5 + 5,
+                memory_dir=str(memory_dir),
+            )
+        )
+    summary = writer.close()
+
+    assert seen_raw_during_merge == [True]
+    assert summary["direct_streaming_fold_deleted_raw_count"] == 2
+    assert not db_path_a.exists()
+    assert not db_path_b.exists()
+
+
+def test_direct_streaming_failed_batch_merge_keeps_raw_and_shards(tmp_path: Path, monkeypatch) -> None:
+    memory_dir = tmp_path / "memory"
+    db_path_a = _make_fake_raw_job(tmp_path / "raw_a", "seed_0.sqlite")
+    db_path_b = _make_fake_raw_job(tmp_path / "raw_b", "seed_1.sqlite")
+    _patch_writer_parallelism(monkeypatch)
+    monkeypatch.setattr(
+        "v6.memory.direct_streaming_fold.compute_sampling_job_metrics",
+        lambda *args, **kwargs: {"game": "tt01", "sampler_name": "random_baseline", "seed": 0, "steps": 5, "horizon": 2},
+    )
+    monkeypatch.setattr(
+        "v6.memory.direct_streaming_fold.compute_sampling_job_temporal_milestones",
+        lambda *args, **kwargs: {"game": "tt01", "sampler": "random_baseline", "seed": 0},
+    )
+    monkeypatch.setattr(
+        "v6.memory.direct_streaming_fold.compute_sampling_job_validation_payload",
+        lambda *args, **kwargs: {"game": "tt01", "sampler_name": "random_baseline", "seed": 0, "examples": []},
+    )
+    monkeypatch.setattr("v6.memory.direct_streaming_fold.fold_single_sampling_db_into_main_compact_memory", lambda *args, **kwargs: {"db_files_folded": 1})
+    monkeypatch.setattr("v6.memory.direct_streaming_fold.merge_direct_fold_shards", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("batch fail")))
+    monkeypatch.setattr("v6.memory.direct_streaming_fold.finalize_main_compact_memory", lambda *args, **kwargs: {"finalized": True})
+
+    writer = DirectStreamingFoldWriter(
+        DirectStreamingFoldConfig(memory_dir=str(memory_dir), fold_workers=2, merge_batch_size=2),
+        sampling_config=type("Cfg", (), {"steps": 5, "horizon": 2})(),
+    )
+    writer.start()
+    for idx, db_path in enumerate((db_path_a, db_path_b)):
+        writer.submit(
+            DirectStreamingFoldJob(
+                job_id=f"tt01:random_baseline:seed{idx}:steps5",
+                db_path=str(db_path),
+                game="tt01",
+                sampler="random_baseline",
+                seed=idx,
+                steps=5,
+                horizon=2,
+                context_depth=1,
+                global_step_start=idx * 5 + 1,
+                global_step_end=idx * 5 + 5,
+                memory_dir=str(memory_dir),
+            )
+        )
+    summary = writer.close()
+
+    assert summary["direct_streaming_fold_failed_count"] == 2
+    assert db_path_a.exists() and db_path_b.exists()
+    assert any((memory_dir / "direct_streaming_fold_shards").iterdir())
+
+
+def test_finalize_main_compact_memory_summary_only_avoids_full_finalize_work(tmp_path: Path, monkeypatch) -> None:
+    memory_dir = tmp_path / "memory"
+    ensure_memory_layout(memory_dir)
+    calls = {"trim_examples": 0, "trim_replay": 0}
+
+    monkeypatch.setattr(
+        "v6.memory.compact_memory._trim_representative_examples",
+        lambda *args, **kwargs: calls.__setitem__("trim_examples", calls["trim_examples"] + 1),
+    )
+    monkeypatch.setattr(
+        "v6.memory.compact_memory._trim_replay_queue",
+        lambda *args, **kwargs: calls.__setitem__("trim_replay", calls["trim_replay"] + 1),
+    )
+
+    finalize_main_compact_memory(
+        memory_dir=memory_dir,
+        fold_config=CompactMemoryFoldConfig(global_step_start=1, global_step_end=1),
+        finalize_mode="summary_only",
+    )
+
+    assert calls["trim_examples"] == 0
+    assert calls["trim_replay"] == 0
 
 
 def test_retry_direct_streaming_fold_rebuilds_reports_after_success(tmp_path: Path, monkeypatch) -> None:

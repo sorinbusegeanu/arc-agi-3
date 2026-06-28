@@ -275,6 +275,7 @@ def build_parser() -> argparse.ArgumentParser:
     sampling.add_argument("--direct-streaming-fold-submit-delay-seconds", type=float, default=0.0)
     sampling.add_argument("--direct-streaming-shard-synchronous", choices=("normal", "off", "full"), default="off")
     sampling.add_argument("--direct-streaming-checkpoint-every-merged-jobs", type=int, default=25)
+    sampling.add_argument("--direct-streaming-merge-batch-size", type=int, default=25)
     sampling.add_argument("--max-live-shard-bytes", type=int, default=None)
     sampling.add_argument("--delete-raw-after-direct-streaming-fold", dest="delete_raw_after_direct_streaming_fold", action="store_true", default=True)
     sampling.add_argument("--keep-raw-after-direct-streaming-fold", dest="delete_raw_after_direct_streaming_fold", action="store_false")
@@ -285,6 +286,10 @@ def build_parser() -> argparse.ArgumentParser:
     sampling.add_argument("--max-examples-per-family", type=int, default=1)
     sampling.add_argument("--max-examples-per-carrier", type=int, default=1)
     sampling.add_argument("--max-examples-per-contradiction-cluster", type=int, default=2)
+    sampling.add_argument("--no-fold-memory-substrate", dest="fold_memory_substrate", action="store_false", default=True)
+    sampling.add_argument("--no-fold-graph", dest="fold_graph", action="store_false", default=True)
+    sampling.add_argument("--compact-finalize-mode", choices=("none", "summary_only", "full"), default="full")
+    sampling.add_argument("--full-finalize-every-epochs", type=int, default=5)
     sampling.add_argument("--memory-query-enabled", action="store_true")
     sampling.add_argument("--memory-action-selection-enabled", action="store_true")
     sampling.add_argument("--restore-compact-graph", action="store_true")
@@ -623,6 +628,7 @@ def build_parser() -> argparse.ArgumentParser:
     continuous.add_argument("--direct-streaming-fold-submit-delay-seconds", type=float, default=0.0)
     continuous.add_argument("--direct-streaming-shard-synchronous", choices=("normal", "off", "full"), default="off")
     continuous.add_argument("--direct-streaming-checkpoint-every-merged-jobs", type=int, default=25)
+    continuous.add_argument("--direct-streaming-merge-batch-size", type=int, default=25)
     continuous.add_argument("--max-live-shard-bytes", type=int, default=None)
     continuous.add_argument("--delete-raw-after-direct-streaming-fold", dest="delete_raw_after_direct_streaming_fold", action="store_true", default=True)
     continuous.add_argument("--keep-raw-after-direct-streaming-fold", dest="delete_raw_after_direct_streaming_fold", action="store_false")
@@ -633,6 +639,10 @@ def build_parser() -> argparse.ArgumentParser:
     continuous.add_argument("--max-examples-per-family", type=int, default=1)
     continuous.add_argument("--max-examples-per-carrier", type=int, default=1)
     continuous.add_argument("--max-examples-per-contradiction-cluster", type=int, default=2)
+    continuous.add_argument("--no-fold-memory-substrate", dest="fold_memory_substrate", action="store_false", default=True)
+    continuous.add_argument("--no-fold-graph", dest="fold_graph", action="store_false", default=True)
+    continuous.add_argument("--compact-finalize-mode", choices=("none", "summary_only", "full"), default="summary_only")
+    continuous.add_argument("--full-finalize-every-epochs", type=int, default=5)
     continuous.add_argument("--memory-query-enabled", action="store_true")
     continuous.add_argument("--memory-action-selection-enabled", action="store_true")
     continuous.add_argument("--restore-compact-graph", action="store_true")
@@ -913,6 +923,7 @@ def main(argv: list[str] | None = None) -> int:
                 direct_streaming_fold_submit_delay_seconds=float(args.direct_streaming_fold_submit_delay_seconds),
                 direct_streaming_shard_synchronous=str(args.direct_streaming_shard_synchronous),
                 direct_streaming_checkpoint_every_merged_jobs=int(args.direct_streaming_checkpoint_every_merged_jobs),
+                direct_streaming_merge_batch_size=int(args.direct_streaming_merge_batch_size),
                 delete_sidecars_after_fold=bool(args.delete_sidecars_after_fold),
                 max_live_shard_bytes=args.max_live_shard_bytes,
                 write_debug_sidecars=bool(args.write_debug_sidecars),
@@ -920,6 +931,10 @@ def main(argv: list[str] | None = None) -> int:
                 max_examples_per_family=int(args.max_examples_per_family),
                 max_examples_per_carrier=int(args.max_examples_per_carrier),
                 max_examples_per_contradiction_cluster=int(args.max_examples_per_contradiction_cluster),
+                fold_memory_substrate=bool(args.fold_memory_substrate),
+                fold_graph=bool(args.fold_graph),
+                compact_finalize_mode=str(args.compact_finalize_mode),
+                full_finalize_every_epochs=int(args.full_finalize_every_epochs),
                 memory_query_enabled=bool(args.memory_query_enabled),
                 memory_action_selection_enabled=bool(args.memory_action_selection_enabled),
                 restore_compact_graph=bool(args.restore_compact_graph),
@@ -1551,6 +1566,7 @@ def main(argv: list[str] | None = None) -> int:
             direct_streaming_fold_submit_delay_seconds=float(args.direct_streaming_fold_submit_delay_seconds),
             direct_streaming_shard_synchronous=str(args.direct_streaming_shard_synchronous),
             direct_streaming_checkpoint_every_merged_jobs=int(args.direct_streaming_checkpoint_every_merged_jobs),
+            direct_streaming_merge_batch_size=int(args.direct_streaming_merge_batch_size),
             delete_sidecars_after_fold=bool(args.delete_sidecars_after_fold),
             max_live_shard_bytes=args.max_live_shard_bytes,
             write_debug_sidecars=bool(args.write_debug_sidecars),
@@ -1558,6 +1574,10 @@ def main(argv: list[str] | None = None) -> int:
             max_examples_per_family=int(args.max_examples_per_family),
             max_examples_per_carrier=int(args.max_examples_per_carrier),
             max_examples_per_contradiction_cluster=int(args.max_examples_per_contradiction_cluster),
+            fold_memory_substrate=bool(args.fold_memory_substrate),
+            fold_graph=bool(args.fold_graph),
+            compact_finalize_mode=str(args.compact_finalize_mode),
+            full_finalize_every_epochs=int(args.full_finalize_every_epochs),
             memory_query_enabled=bool(args.memory_query_enabled),
             memory_action_selection_enabled=bool(args.memory_action_selection_enabled),
             restore_compact_graph=bool(args.restore_compact_graph),

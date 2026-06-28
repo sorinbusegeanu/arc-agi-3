@@ -62,12 +62,16 @@ class DirectStreamingFoldConfig:
     busy_timeout_ms: int = 60000
     shard_synchronous: str = "off"
     checkpoint_every_merged_jobs: int = 25
+    merge_batch_size: int = 25
     delete_sidecars_after_fold: bool = True
     max_live_shard_bytes: int | None = None
     max_examples_per_contingency: int = 1
     max_examples_per_family: int = 1
     max_examples_per_carrier: int = 1
     max_examples_per_contradiction_cluster: int = 2
+    fold_memory_substrate: bool = True
+    fold_graph: bool = True
+    compact_finalize_mode: str = "full"
 
 
 @dataclass
@@ -757,6 +761,8 @@ def _fold_one_completed_job_to_shard_once(
             max_examples_per_family=int(config.max_examples_per_family),
             max_examples_per_carrier=int(config.max_examples_per_carrier),
             max_examples_per_contradiction_cluster=int(config.max_examples_per_contradiction_cluster),
+            fold_memory_substrate=bool(config.fold_memory_substrate),
+            fold_graph=bool(config.fold_graph),
         ),
         finalize_after_fold=False,
         sqlite_synchronous=str(config.shard_synchronous),
@@ -976,6 +982,13 @@ class DirectStreamingFoldWriter:
             "direct_streaming_fold_raw_deleted_after_main_merge_count": 0,
             "direct_streaming_fold_max_live_shard_bytes": 0,
             "direct_streaming_fold_current_live_shard_bytes": 0,
+            "total_shard_fold_seconds": 0.0,
+            "total_batch_merge_seconds": 0.0,
+            "total_raw_delete_seconds": 0.0,
+            "total_shard_delete_seconds": 0.0,
+            "total_checkpoint_seconds": 0.0,
+            "finalization_seconds": 0.0,
+            "memory_summary_seconds": 0.0,
         }
 
     def start(self) -> None:
@@ -1016,6 +1029,7 @@ class DirectStreamingFoldWriter:
 
     def close(self) -> dict[str, Any]:
         merge_error: Exception | None = None
+        pending_merge_batch: list[tuple[DirectStreamingFoldJob, Path, DirectStreamingFoldResult]] = []
         self._progress = tqdm(
             total=int(self._submitted_jobs),
             desc="direct fold",
@@ -1062,12 +1076,18 @@ class DirectStreamingFoldWriter:
                     )
                     continue
                 if result.status == "folded":
-                    self._merge_completed_job_shard(job=job, shard_dir=shard_dir, result=result)
+                    pending_merge_batch.append((job, shard_dir, result))
+                    if len(pending_merge_batch) >= max(1, int(self.config.merge_batch_size or 25)):
+                        self._merge_completed_job_shard_batch(pending_merge_batch)
+                        pending_merge_batch = []
                 else:
                     self._record_failed_result(job, result)
+            if pending_merge_batch:
+                self._merge_completed_job_shard_batch(pending_merge_batch)
             if self._summary["direct_streaming_fold_success_count"] > 0:
                 merge_started_at = time.time()
                 self._summary["direct_streaming_fold_merge_started_at"] = float(merge_started_at)
+                finalize_started_at = time.time()
                 finalize_main_compact_memory(
                     memory_dir=self.config.memory_dir,
                     fold_config=CompactMemoryFoldConfig(
@@ -1077,13 +1097,23 @@ class DirectStreamingFoldWriter:
                         max_examples_per_family=int(self.config.max_examples_per_family),
                         max_examples_per_carrier=int(self.config.max_examples_per_carrier),
                         max_examples_per_contradiction_cluster=int(self.config.max_examples_per_contradiction_cluster),
+                        fold_memory_substrate=bool(self.config.fold_memory_substrate),
+                        fold_graph=bool(self.config.fold_graph),
                     ),
+                    finalize_mode=str(self.config.compact_finalize_mode),
                 )
+                finalize_seconds = float(time.time() - finalize_started_at)
+                self._summary["finalization_seconds"] = finalize_seconds
+                self._summary["memory_summary_seconds"] = finalize_seconds
                 merge_finished_at = time.time()
                 self._summary["direct_streaming_fold_merge_finished_at"] = float(merge_finished_at)
                 self._summary["direct_streaming_fold_merge_seconds"] = float(merge_finished_at - merge_started_at)
                 self._summary["direct_streaming_fold_finalized_main_memory"] = True
+                checkpoint_started_at = time.time()
                 _checkpoint_compact_memory(self.config.memory_dir, busy_timeout_ms=int(self.config.busy_timeout_ms))
+                self._summary["total_checkpoint_seconds"] = float(
+                    self._summary.get("total_checkpoint_seconds", 0.0) or 0.0
+                ) + float(time.time() - checkpoint_started_at)
                 if self._shard_root.exists() and not any(self._shard_root.iterdir()):
                     shutil.rmtree(self._shard_root, ignore_errors=True)
                 self._summary["direct_streaming_fold_shards_deleted"] = not self._shard_root.exists()
@@ -1146,35 +1176,103 @@ class DirectStreamingFoldWriter:
     def _maybe_checkpoint_after_merge(self) -> None:
         interval = max(1, int(self.config.checkpoint_every_merged_jobs or 25))
         if self._merged_jobs > 0 and (self._merged_jobs % interval) == 0:
+            checkpoint_started_at = time.time()
             _checkpoint_compact_memory(self.config.memory_dir, busy_timeout_ms=int(self.config.busy_timeout_ms))
             checkpoint_direct_streaming_manifest(self.config.memory_dir, truncate=True)
+            self._summary["total_checkpoint_seconds"] = float(
+                self._summary.get("total_checkpoint_seconds", 0.0) or 0.0
+            ) + float(time.time() - checkpoint_started_at)
 
-    def _merge_completed_job_shard(self, *, job: DirectStreamingFoldJob, shard_dir: Path, result: DirectStreamingFoldResult) -> None:
+    def _merge_completed_job_shard_batch(
+        self,
+        batch: list[tuple[DirectStreamingFoldJob, Path, DirectStreamingFoldResult]],
+    ) -> None:
+        if not batch:
+            return
         self._update_live_shard_bytes()
-        max_live_shard_bytes = self.config.max_live_shard_bytes
-        if max_live_shard_bytes is not None and int(self._summary["direct_streaming_fold_current_live_shard_bytes"]) > int(max_live_shard_bytes):
-            self._summary["direct_streaming_fold_current_live_shard_bytes"] = int(self._summary["direct_streaming_fold_current_live_shard_bytes"])
         if self._summary.get("direct_streaming_fold_merge_started_at") is None:
             self._summary["direct_streaming_fold_merge_started_at"] = float(time.time())
+        jobs = [item[0] for item in batch]
+        shard_dirs = [item[1] for item in batch]
+        results = [item[2] for item in batch]
+        merge_started_at = time.time()
         try:
             merge_direct_fold_shards(
                 memory_dir=self.config.memory_dir,
-                shard_dirs=[shard_dir],
+                shard_dirs=shard_dirs,
                 fold_config=CompactMemoryFoldConfig(
-                    global_step_start=int(job.global_step_start),
-                    global_step_end=int(job.global_step_end),
+                    global_step_start=min(int(job.global_step_start) for job in jobs),
+                    global_step_end=max(int(job.global_step_end) for job in jobs),
+                    fold_memory_substrate=bool(self.config.fold_memory_substrate),
+                    fold_graph=bool(self.config.fold_graph),
                 ),
                 workers=1,
                 progress=False,
             )
         except Exception as exc:
             error = f"merge_failed: {exc}"
+            for job, _shard_dir, result in batch:
+                write_fold_job_manifest_result(
+                    job,
+                    status="failed",
+                    fold_started_at=float(result.fold_started_at),
+                    fold_finished_at=float(time.time()),
+                    deleted_raw=False,
+                    parquet_exported=bool(getattr(result, "parquet_exported", False)),
+                    metrics=getattr(result, "metrics", None),
+                    milestones=getattr(result, "milestones", None),
+                    validation_payload=getattr(result, "validation_payload", None),
+                    retry_attempt_count=int(getattr(result, "retry_attempt_count", 0) or 0),
+                    retryable_error_count=int(getattr(result, "retryable_error_count", 0) or 0),
+                    last_retry_error=(getattr(result, "retry_error_history", None) or [None])[-1],
+                    retry_error_history=list(getattr(result, "retry_error_history", None) or []),
+                    busy_timeout_ms=int(self.config.busy_timeout_ms),
+                    error=error,
+                )
+                self._record_failed_result(
+                    job,
+                    DirectStreamingFoldResult(
+                        job_id=result.job_id,
+                        db_path=result.db_path,
+                        status="failed",
+                        fold_started_at=result.fold_started_at,
+                        fold_finished_at=time.time(),
+                        deleted_raw=False,
+                        error=error,
+                        retry_attempt_count=result.retry_attempt_count,
+                        retryable_error_count=result.retryable_error_count,
+                        retry_error_history=list(result.retry_error_history or []),
+                    ),
+                )
+            return
+        self._summary["total_batch_merge_seconds"] = float(
+            self._summary.get("total_batch_merge_seconds", 0.0) or 0.0
+        ) + float(time.time() - merge_started_at)
+        self._merged_jobs += len(batch)
+        for job, shard_dir, result in batch:
+            deleted_raw = False
+            raw_delete_started_at = time.time()
+            if bool(self.config.delete_raw_after_fold):
+                deleted_raw = _delete_fold_artifacts(
+                    Path(job.db_path),
+                    delete_raw_db=True,
+                    delete_sidecars=bool(self.config.delete_sidecars_after_fold),
+                )
+                if deleted_raw:
+                    self._summary["direct_streaming_fold_deleted_raw_count"] += 1
+                    self._summary["direct_streaming_fold_raw_deleted_after_shard_fold_count"] += 1
+                    self._summary["direct_streaming_fold_raw_deleted_after_main_merge_count"] += 1
+            elif bool(self.config.delete_sidecars_after_fold):
+                _delete_fold_artifacts(Path(job.db_path), delete_raw_db=False, delete_sidecars=True)
+            self._summary["total_raw_delete_seconds"] = float(
+                self._summary.get("total_raw_delete_seconds", 0.0) or 0.0
+            ) + float(time.time() - raw_delete_started_at)
             write_fold_job_manifest_result(
                 job,
-                status="failed",
+                status="folded",
                 fold_started_at=float(result.fold_started_at),
                 fold_finished_at=float(time.time()),
-                deleted_raw=False,
+                deleted_raw=bool(deleted_raw),
                 parquet_exported=bool(getattr(result, "parquet_exported", False)),
                 metrics=getattr(result, "metrics", None),
                 milestones=getattr(result, "milestones", None),
@@ -1184,59 +1282,21 @@ class DirectStreamingFoldWriter:
                 last_retry_error=(getattr(result, "retry_error_history", None) or [None])[-1],
                 retry_error_history=list(getattr(result, "retry_error_history", None) or []),
                 busy_timeout_ms=int(self.config.busy_timeout_ms),
-                error=error,
+                error=None,
             )
-            failed_result = DirectStreamingFoldResult(
-                job_id=result.job_id,
-                db_path=result.db_path,
-                status="failed",
-                fold_started_at=result.fold_started_at,
-                fold_finished_at=time.time(),
-                deleted_raw=False,
-                error=error,
-                retry_attempt_count=result.retry_attempt_count,
-                retryable_error_count=result.retryable_error_count,
-                retry_error_history=list(result.retry_error_history or []),
-            )
-            self._record_failed_result(job, failed_result)
-            return
-        self._merged_jobs += 1
+            shard_delete_started_at = time.time()
+            if shard_dir.exists():
+                shutil.rmtree(shard_dir, ignore_errors=True)
+            self._summary["total_shard_delete_seconds"] = float(
+                self._summary.get("total_shard_delete_seconds", 0.0) or 0.0
+            ) + float(time.time() - shard_delete_started_at)
+            self._job_shard_dirs.pop(job.job_id, None)
+            self._summary["direct_streaming_fold_job_shards_deleted_count"] += 1
+            self._record_success_result(job, result)
+            self._summary["total_shard_fold_seconds"] = float(
+                self._summary.get("total_shard_fold_seconds", 0.0) or 0.0
+            ) + float(result.fold_seconds or 0.0)
         self._maybe_checkpoint_after_merge()
-        deleted_raw = False
-        if bool(self.config.delete_raw_after_fold):
-            deleted_raw = _delete_fold_artifacts(
-                Path(job.db_path),
-                delete_raw_db=True,
-                delete_sidecars=bool(self.config.delete_sidecars_after_fold),
-            )
-            if deleted_raw:
-                self._summary["direct_streaming_fold_deleted_raw_count"] += 1
-                self._summary["direct_streaming_fold_raw_deleted_after_shard_fold_count"] += 1
-                self._summary["direct_streaming_fold_raw_deleted_after_main_merge_count"] += 1
-        elif bool(self.config.delete_sidecars_after_fold):
-            _delete_fold_artifacts(Path(job.db_path), delete_raw_db=False, delete_sidecars=True)
-        write_fold_job_manifest_result(
-            job,
-            status="folded",
-            fold_started_at=float(result.fold_started_at),
-            fold_finished_at=float(time.time()),
-            deleted_raw=bool(deleted_raw),
-            parquet_exported=bool(getattr(result, "parquet_exported", False)),
-            metrics=getattr(result, "metrics", None),
-            milestones=getattr(result, "milestones", None),
-            validation_payload=getattr(result, "validation_payload", None),
-            retry_attempt_count=int(getattr(result, "retry_attempt_count", 0) or 0),
-            retryable_error_count=int(getattr(result, "retryable_error_count", 0) or 0),
-            last_retry_error=(getattr(result, "retry_error_history", None) or [None])[-1],
-            retry_error_history=list(getattr(result, "retry_error_history", None) or []),
-            busy_timeout_ms=int(self.config.busy_timeout_ms),
-            error=None,
-        )
-        if shard_dir.exists():
-            shutil.rmtree(shard_dir, ignore_errors=True)
-        self._job_shard_dirs.pop(job.job_id, None)
-        self._summary["direct_streaming_fold_job_shards_deleted_count"] += 1
-        self._record_success_result(job, result)
         self._update_live_shard_bytes()
 
     def _write_summary(self) -> None:
