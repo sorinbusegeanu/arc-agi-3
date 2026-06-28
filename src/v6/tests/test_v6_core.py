@@ -284,6 +284,8 @@ from v6.role_transfer_v09a import RoleTransferV09aConfig, run_role_transfer_v09a
 from v6.sampling import (
     ActionBalanceSampler,
     LowConfidenceSampler,
+    MemoryGuidedExploreSampler,
+    MemoryGuidedSampler,
     MixedExplorerSampler,
     NoChangeAvoidanceSampler,
     NoveltyDeltaSampler,
@@ -4440,6 +4442,8 @@ def test_v05c_sampler_registry_and_aliases() -> None:
 
     assert "random_baseline" in registry
     assert make_sampler("mixed", seed=1).name == "mixed"
+    assert make_sampler("memory_guided", seed=1).name == "memory_guided"
+    assert make_sampler("memory_guided_explore", seed=1).name == "memory_guided_explore"
     assert parse_v05c_samplers("random_baseline,reset_aware_mixed") == ("random_baseline", "reset_aware_mixed")
     assert "tt01" in parse_v05c_games("failed_representatives")
     assert InteractionSamplingConfig().commit_steps == 5000
@@ -4504,6 +4508,112 @@ def test_v05c_mixed_probability_and_epsilon_fallback() -> None:
 
     assert sampler.choose_action(system, actions) in actions
     system.close()
+
+
+def test_memory_guided_sampler_chooses_higher_scored_memory_action() -> None:
+    class DummyContextBuilder:
+        def multi_scale_signatures(self, action: int, max_level: int = 1) -> dict[int, tuple]:
+            return {int(max_level): (f"ctx:{action}",)}
+
+    class DummyScore:
+        def __init__(self, action: int, score: float) -> None:
+            self.action = int(action)
+            self.score = float(score)
+            self.predicted_family = None
+            self.expected_future_option_delta = 0.0
+            self.failure_risk = 0.0
+
+    class DummyMemoryQuery:
+        def __init__(self) -> None:
+            self.selected: list[int] = []
+
+        def rank_actions(self, contexts_by_action, actions):
+            return [DummyScore(2, 0.9), DummyScore(1, 0.1)]
+
+        def record_selected_action_query(self, *, context_signatures, action: int, prediction=None) -> None:
+            del context_signatures, prediction
+            self.selected.append(int(action))
+
+    system = type(
+        "System",
+        (),
+        {
+            "context_builder": DummyContextBuilder(),
+            "_context_depth_for_action": lambda self, action: 1,
+            "memory_query": DummyMemoryQuery(),
+        },
+    )()
+    sampler = MemoryGuidedSampler(seed=0, epsilon=0.0)
+
+    chosen = sampler.choose_action(system, [1, 2])
+
+    assert chosen == 2
+    assert sampler.memory_guided_action_count == 1
+    assert system.memory_query.selected == [2]
+
+
+def test_memory_guided_sampler_falls_back_when_memory_scores_are_zero(monkeypatch) -> None:
+    class DummyContextBuilder:
+        def multi_scale_signatures(self, action: int, max_level: int = 1) -> dict[int, tuple]:
+            return {int(max_level): (f"ctx:{action}",)}
+
+    class DummyScore:
+        def __init__(self, action: int) -> None:
+            self.action = int(action)
+            self.score = 0.0
+            self.predicted_family = None
+            self.expected_future_option_delta = 0.0
+            self.failure_risk = 0.0
+
+    class DummyMemoryQuery:
+        def rank_actions(self, contexts_by_action, actions):
+            return [DummyScore(action) for action in actions]
+
+    system = type(
+        "System",
+        (),
+        {
+            "context_builder": DummyContextBuilder(),
+            "_context_depth_for_action": lambda self, action: 1,
+            "memory_query": DummyMemoryQuery(),
+        },
+    )()
+    sampler = MemoryGuidedSampler(seed=0, epsilon=0.0)
+    monkeypatch.setattr(sampler, "mixed_explorer_scores", lambda system, actions: [0.1, 0.9])
+
+    chosen = sampler.choose_action(system, [1, 2])
+
+    assert chosen == 2
+    assert sampler.memory_guided_fallback_count == 1
+    assert sampler.memory_guided_action_count == 0
+
+
+def test_memory_guided_explore_sampler_can_use_exploration_path(monkeypatch) -> None:
+    class DummyContextBuilder:
+        def multi_scale_signatures(self, action: int, max_level: int = 1) -> dict[int, tuple]:
+            return {int(max_level): (f"ctx:{action}",)}
+
+    class DummyMemoryQuery:
+        def rank_actions(self, contexts_by_action, actions):
+            raise AssertionError("memory-guided path should not be used in this branch")
+
+    system = type(
+        "System",
+        (),
+        {
+            "context_builder": DummyContextBuilder(),
+            "_context_depth_for_action": lambda self, action: 1,
+            "memory_query": DummyMemoryQuery(),
+        },
+    )()
+    sampler = MemoryGuidedExploreSampler(seed=0, epsilon=0.0)
+    monkeypatch.setattr(sampler.rng, "random", lambda: 0.95)
+    monkeypatch.setattr(sampler, "mixed_explorer_scores", lambda system, actions: [0.2, 0.8])
+
+    chosen = sampler.choose_action(system, [1, 2])
+
+    assert chosen == 2
+    assert sampler.memory_guided_action_count == 0
 
 
 def test_v05c_reset_aware_logic() -> None:
@@ -8984,6 +9094,151 @@ def test_v05c_run_sampling_job_fast_postprocessing_skips_expensive_outputs(tmp_p
     assert not db_path.with_name("efficiency_summary.json").exists()
 
 
+def test_v05c_run_sampling_job_passes_memory_flags_into_v6config(tmp_path, monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class DummySampler:
+        reset_count = 0
+        reset_unavailable = False
+
+        def memory_guided_summary(self) -> dict[str, float | int]:
+            return {
+                "memory_guided_action_count": 3,
+                "memory_guided_fallback_count": 1,
+                "mean_memory_action_score": 0.6,
+                "selected_action_memory_score_mean": 0.7,
+                "selected_action_failure_risk_mean": 0.2,
+                "selected_action_future_option_gain_mean": 0.3,
+            }
+
+    class DummyEnv:
+        def __init__(self, game_id: str, seed: int, env_root=None) -> None:
+            self.game_id = game_id
+            self.seed = seed
+            self.env_root = env_root
+            self.reset_count = 0
+            self.skipped_terminal_steps = 0
+
+    class DummyGraph:
+        def edge_type_counts(self) -> dict[str, int]:
+            return {}
+
+        def export_compact_rows(self) -> dict[str, list[dict[str, object]]]:
+            return {"nodes": [], "edges": []}
+
+    class DummySystem:
+        def __init__(self, env, config, action_sampler=None, live_memory_queue=None, live_memory_cache=None) -> None:
+            del live_memory_queue, live_memory_cache
+            captured["config"] = config
+            self.env = env
+            self.config = config
+            self.action_sampler = action_sampler
+            self.graph = DummyGraph()
+            self.context_contradictions = type("Tracker", (), {"summary": lambda self: {}})()
+            self.carrier_tracker = type("Carrier", (), {"build_candidates": lambda self: []})()
+            self.memory_lifecycle = type("Lifecycle", (), {"summary": lambda self: {}, "get_replay_batch": lambda self, limit=1000: []})()
+            self.efficiency_tracker = type("Efficiency", (), {"summary": lambda self: {}})()
+            self.compact_memory_restore_summary = {}
+
+        def run(self, steps: int) -> None:
+            del steps
+
+        def close(self) -> None:
+            pass
+
+        def adaptive_context_summary(self) -> dict[str, object]:
+            return {"adaptive_context_expansion_enabled": False, "base_context_depth": 1, "max_context_depth": 1}
+
+    def fake_write_sampling_metadata(path, **values) -> None:
+        del path
+        captured["metadata"] = values
+
+    monkeypatch.setattr(interaction_sampling, "make_sampler", lambda name, seed: DummySampler())
+    monkeypatch.setattr(interaction_sampling, "ArcGridEnvironment", DummyEnv)
+    monkeypatch.setattr(interaction_sampling, "V6System", DummySystem)
+    monkeypatch.setattr(interaction_sampling, "_write_sampling_metadata", fake_write_sampling_metadata)
+
+    interaction_sampling._run_sampling_job(
+        {
+            "game": "tt01",
+            "sampler_name": "memory_guided",
+            "seed": 0,
+            "steps": 10,
+            "horizon": 3,
+            "context_depth": 1,
+            "commit_steps": 5,
+            "db_path": str(tmp_path / "seed_0.sqlite"),
+            "env_root": None,
+            "memory_query_enabled": True,
+            "memory_action_selection_enabled": True,
+            "restore_compact_graph": True,
+            "restore_compact_substrate": True,
+        }
+    )
+
+    config = captured["config"]
+    metadata = captured["metadata"]
+    assert config.memory_query_enabled is True
+    assert config.memory_action_selection_enabled is True
+    assert config.restore_compact_graph is True
+    assert config.restore_compact_substrate is True
+    assert metadata["memory_query_enabled"] is True
+    assert metadata["memory_action_selection_enabled"] is True
+    assert metadata["restore_compact_graph"] is True
+    assert metadata["restore_compact_substrate"] is True
+    assert metadata["memory_guided_action_count"] == 3
+    assert metadata["memory_guided_fallback_count"] == 1
+
+
+def test_continuous_research_passes_memory_flags_into_interaction_sampling(tmp_path, monkeypatch) -> None:
+    import v6.continuous_research as continuous_research
+
+    captured: dict[str, object] = {}
+
+    def _capture_sampling_config(config):
+        captured["sampling_config"] = config
+        return []
+
+    monkeypatch.setattr(continuous_research, "run_interaction_sampling_v05c", _capture_sampling_config)
+    monkeypatch.setattr(
+        continuous_research,
+        "run_hypothesis_suite_report",
+        lambda **kwargs: {"H01 decision": "INSUFFICIENT_EVIDENCE", "H03 decision": "INSUFFICIENT_EVIDENCE", "H07 decision": "INSUFFICIENT_EVIDENCE", "H10 decision": "INSUFFICIENT_EVIDENCE"},
+    )
+    monkeypatch.setattr(continuous_research, "run_selective_forgetting_pass", lambda **kwargs: {})
+    monkeypatch.setattr(continuous_research, "evaluate_h10b_selective_forgetting", lambda **kwargs: {"decision": "INSUFFICIENT_EVIDENCE"})
+    monkeypatch.setattr(continuous_research, "build_memory_summary", lambda *args, **kwargs: {"stable_contingency_count": 0, "transformation_family_count": 0, "memory_node_count": 0})
+    monkeypatch.setattr(continuous_research, "load_memory_summary", lambda *args, **kwargs: {})
+    monkeypatch.setattr(continuous_research, "_write_memory_continuity_report", lambda *args, **kwargs: None)
+    monkeypatch.setattr(continuous_research, "validate_cleanup_safe", lambda *args, **kwargs: {"ok": True})
+    monkeypatch.setattr(continuous_research, "cleanup_epoch_artifacts", lambda *args, **kwargs: {"disk_before_cleanup_bytes": 0, "disk_after_cleanup_bytes": 0})
+
+    continuous_research.run_continuous_research(
+        continuous_research.ContinuousResearchConfig(
+            experiment_name="memory_flags",
+            games="tt01",
+            samplers="memory_guided",
+            seeds="0",
+            steps_per_epoch=1,
+            max_epochs=1,
+            horizon=2,
+            context_depth=1,
+            output_dir=str(tmp_path / "continuous"),
+            cleanup=True,
+            memory_query_enabled=True,
+            memory_action_selection_enabled=True,
+            restore_compact_graph=True,
+            restore_compact_substrate=True,
+        )
+    )
+
+    sampling_config = captured["sampling_config"]
+    assert sampling_config.memory_query_enabled is True
+    assert sampling_config.memory_action_selection_enabled is True
+    assert sampling_config.restore_compact_graph is True
+    assert sampling_config.restore_compact_substrate is True
+
+
 def test_v05c_run_sampling_job_non_fast_mode_does_not_call_legacy_future_effects(tmp_path, monkeypatch) -> None:
     captured: dict[str, object] = {"delta_called": False, "apply_called": False}
 
@@ -12750,3 +13005,215 @@ def test_direct_streaming_fold_writer_disables_child_recycling_when_zero(tmp_pat
     writer.start()
     assert seen["max_workers"] == 2
     assert "max_tasks_per_child" not in seen
+
+
+def test_sampling_executor_preserves_zero_max_tasks_per_child(monkeypatch, tmp_path: Path) -> None:
+    from v6.evaluation.interaction_sampling import _run_sampling_jobs
+
+    seen: dict[str, Any] = {}
+
+    class _FakeFuture:
+        def result(self):
+            return {"ok": True}
+
+    class _FakeExecutor:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def submit(self, fn, job):
+            return _FakeFuture()
+
+    monkeypatch.setattr("v6.evaluation.interaction_sampling.ProcessPoolExecutor", _FakeExecutor)
+    monkeypatch.setattr("v6.evaluation.interaction_sampling.wait", lambda futures, timeout, return_when: (set(futures.keys()), set()))
+    jobs = [
+        {
+            "game": "tt01",
+            "sampler_name": "mixed",
+            "seed": 0,
+            "steps": 1,
+            "horizon": 1,
+            "context_depth": 1,
+            "global_step_offset": 0,
+            "db_path": str(tmp_path / "seed_0.sqlite"),
+            "max_tasks_per_child": 0,
+            "memory_output_dir": None,
+            "direct_streaming_fold_enabled": False,
+            "shared_live_memory": "none",
+        }
+    ]
+    stats = _run_sampling_jobs(jobs, workers=1)
+    assert seen["max_workers"] == 1
+    assert "max_tasks_per_child" not in seen
+    assert stats["max_tasks_per_child"] == 0
+
+
+def test_sampling_executor_passes_positive_max_tasks_per_child(monkeypatch, tmp_path: Path) -> None:
+    from v6.evaluation.interaction_sampling import _run_sampling_jobs
+
+    seen: dict[str, Any] = {}
+
+    class _FakeFuture:
+        def result(self):
+            return {"ok": True}
+
+    class _FakeExecutor:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def submit(self, fn, job):
+            return _FakeFuture()
+
+    monkeypatch.setattr("v6.evaluation.interaction_sampling.ProcessPoolExecutor", _FakeExecutor)
+    monkeypatch.setattr("v6.evaluation.interaction_sampling.wait", lambda futures, timeout, return_when: (set(futures.keys()), set()))
+    jobs = [
+        {
+            "game": "tt01",
+            "sampler_name": "mixed",
+            "seed": 0,
+            "steps": 1,
+            "horizon": 1,
+            "context_depth": 1,
+            "global_step_offset": 0,
+            "db_path": str(tmp_path / "seed_0.sqlite"),
+            "max_tasks_per_child": 50,
+            "memory_output_dir": None,
+            "direct_streaming_fold_enabled": False,
+            "shared_live_memory": "none",
+        }
+    ]
+    stats = _run_sampling_jobs(jobs, workers=1)
+    assert seen["max_workers"] == 1
+    assert seen["max_tasks_per_child"] == 50
+    assert stats["max_tasks_per_child"] == 50
+
+
+def test_retry_direct_streaming_fold_preserves_zero_and_positive_max_tasks_per_child(tmp_path: Path, monkeypatch) -> None:
+    from v6.memory import direct_streaming_fold as dsf
+
+    manifest_path = tmp_path / "manifest.sqlite"
+    memory_dir = tmp_path / "memory_retry_cfg"
+    memory_dir.mkdir()
+    seen: list[int] = []
+
+    class _Sentinel(Exception):
+        pass
+
+    class _FakeConn:
+        def execute(self, sql, *args, **kwargs):
+            sql_text = str(sql)
+            if "FROM folded_jobs" in sql_text:
+                return SimpleNamespace(fetchall=lambda: [])
+            return SimpleNamespace(fetchone=lambda: (0,))
+
+        def commit(self) -> None:
+            return None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def _fake_config(*args, **kwargs):
+        seen.append(int(kwargs.get("max_tasks_per_child", -1)))
+        raise _Sentinel()
+
+    monkeypatch.setattr(dsf, "_connect_manifest", lambda *args, **kwargs: _FakeConn())
+    monkeypatch.setattr(dsf, "DirectStreamingFoldConfig", _fake_config)
+    try:
+        dsf.retry_direct_streaming_fold_failures(
+            manifest_path=manifest_path,
+            memory_dir=memory_dir,
+            max_tasks_per_child=0,
+        )
+    except _Sentinel:
+        pass
+    try:
+        dsf.retry_direct_streaming_fold_failures(
+            manifest_path=manifest_path,
+            memory_dir=memory_dir,
+            max_tasks_per_child=1000,
+        )
+    except _Sentinel:
+        pass
+    assert seen == [0, 1000]
+
+
+def test_cli_and_config_propagation_preserve_zero_max_tasks_per_child(monkeypatch, tmp_path: Path) -> None:
+    from v6.cli import build_parser
+    from v6.continuous_research import ContinuousResearchConfig
+    from v6.evaluation.interaction_sampling import InteractionSamplingConfig, _generate_sampling_dbs
+
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "continuous-research-run",
+            "--experiment-name",
+            "exp",
+            "--games",
+            "tt01",
+            "--samplers",
+            "mixed",
+            "--seeds",
+            "0",
+            "--steps-per-epoch",
+            "10",
+            "--max-epochs",
+            "1",
+            "--horizon",
+            "1",
+            "--context-depth",
+            "1",
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--max-tasks-per-child",
+            "0",
+        ]
+    )
+    assert int(args.max_tasks_per_child) == 0
+    continuous_config = ContinuousResearchConfig(
+        experiment_name=str(args.experiment_name),
+        games=str(args.games),
+        samplers=str(args.samplers),
+        seeds=str(args.seeds),
+        steps_per_epoch=int(args.steps_per_epoch),
+        max_epochs=int(args.max_epochs),
+        horizon=int(args.horizon),
+        context_depth=int(args.context_depth),
+        output_dir=str(args.output_dir),
+        max_tasks_per_child=int(args.max_tasks_per_child),
+    )
+    assert continuous_config.max_tasks_per_child == 0
+
+    seen_jobs: list[dict[str, Any]] = []
+
+    def _fake_invoke(jobs, **kwargs):
+        seen_jobs.extend(jobs)
+        return {"requested_workers": 1}
+
+    monkeypatch.setattr("v6.evaluation.interaction_sampling._invoke_run_sampling_jobs", _fake_invoke)
+    sampling_config = InteractionSamplingConfig(
+        games=("tt01",),
+        samplers=("mixed",),
+        seeds=(0,),
+        steps=10,
+        horizon=1,
+        context_depth=1,
+        output_dir=str(tmp_path / "sampling"),
+        max_tasks_per_child=int(continuous_config.max_tasks_per_child),
+    )
+    _generate_sampling_dbs(sampling_config, Path(sampling_config.output_dir) / "sampling_v05c")
+    assert seen_jobs
+    assert seen_jobs[0]["max_tasks_per_child"] == 0

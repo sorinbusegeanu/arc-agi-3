@@ -16,8 +16,6 @@ from v6.memory.memory_cleanup import cleanup_epoch_artifacts, disk_usage_snapsho
 from v6.memory.selective_forgetting import run_selective_forgetting_pass
 from v6.evaluation.h10b_selective_forgetting import evaluate_h10b_selective_forgetting
 
-_EPOCH_PHASE_LOG_PATH: Path | None = None
-
 
 @dataclass(frozen=True)
 class ContinuousResearchConfig:
@@ -57,37 +55,35 @@ class ContinuousResearchConfig:
     direct_streaming_fold: bool = True
     direct_streaming_fold_workers: int = 8
     delete_raw_after_direct_streaming_fold: bool = True
+    delete_sidecars_after_fold: bool = True
     retain_raw_for_hypothesis_suite: bool = False
     direct_streaming_fold_retry_attempts: int = 5
     direct_streaming_fold_retry_initial_delay_seconds: float = 5.0
     direct_streaming_fold_busy_timeout_ms: int = 60000
     direct_streaming_fold_submit_delay_seconds: float = 1.0
     direct_streaming_shard_synchronous: str = "off"
+    direct_streaming_checkpoint_every_merged_jobs: int = 25
+    max_live_shard_bytes: int | None = None
+    write_debug_sidecars: bool = False
+    max_examples_per_contingency: int = 1
+    max_examples_per_family: int = 1
+    max_examples_per_carrier: int = 1
+    max_examples_per_contradiction_cluster: int = 2
+    memory_query_enabled: bool = False
+    memory_action_selection_enabled: bool = False
+    restore_compact_graph: bool = False
+    restore_compact_substrate: bool = False
 
 
 def _log_epoch_phase(epoch_id: str, phase: str, status: str = "starting", extra: dict | None = None) -> None:
-    payload: dict[str, Any] = {
-        "epoch_id": epoch_id,
-        "phase": phase,
-        "status": status,
-        "time": time.time(),
-    }
-    if extra:
-        payload.update(extra)
     print(f"[epoch {epoch_id}] {phase}: {status}" + (f" {extra}" if extra else ""), flush=True)
-    if _EPOCH_PHASE_LOG_PATH is not None:
-        _EPOCH_PHASE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with _EPOCH_PHASE_LOG_PATH.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, sort_keys=True) + "\n")
 
 
 def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
-    global _EPOCH_PHASE_LOG_PATH
     root = Path(config.output_dir)
     root.mkdir(parents=True, exist_ok=True)
     root_status_dir = root / "status"
     root_status_dir.mkdir(parents=True, exist_ok=True)
-    _EPOCH_PHASE_LOG_PATH = root_status_dir / "epoch_phase_log.jsonl"
     manifest_path = root / "manifest.json"
     stop_file = root / "STOP"
     manifest = _load_or_initialize_manifest(config, manifest_path)
@@ -180,12 +176,24 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
                 direct_streaming_fold_enabled=bool(config.direct_streaming_fold),
                 direct_streaming_fold_workers=int(config.direct_streaming_fold_workers),
                 delete_raw_after_direct_streaming_fold=bool(config.delete_raw_after_direct_streaming_fold),
+                delete_sidecars_after_fold=bool(config.delete_sidecars_after_fold),
                 retain_raw_for_hypothesis_suite=bool(config.retain_raw_for_hypothesis_suite),
                 direct_streaming_fold_retry_attempts=int(config.direct_streaming_fold_retry_attempts),
                 direct_streaming_fold_retry_initial_delay_seconds=float(config.direct_streaming_fold_retry_initial_delay_seconds),
                 direct_streaming_fold_busy_timeout_ms=int(config.direct_streaming_fold_busy_timeout_ms),
                 direct_streaming_fold_submit_delay_seconds=float(config.direct_streaming_fold_submit_delay_seconds),
                 direct_streaming_shard_synchronous=str(config.direct_streaming_shard_synchronous),
+                direct_streaming_checkpoint_every_merged_jobs=int(config.direct_streaming_checkpoint_every_merged_jobs),
+                max_live_shard_bytes=config.max_live_shard_bytes,
+                write_debug_sidecars=bool(config.write_debug_sidecars),
+                max_examples_per_contingency=int(config.max_examples_per_contingency),
+                max_examples_per_family=int(config.max_examples_per_family),
+                max_examples_per_carrier=int(config.max_examples_per_carrier),
+                max_examples_per_contradiction_cluster=int(config.max_examples_per_contradiction_cluster),
+                memory_query_enabled=bool(config.memory_query_enabled),
+                memory_action_selection_enabled=bool(config.memory_action_selection_enabled),
+                restore_compact_graph=bool(config.restore_compact_graph),
+                restore_compact_substrate=bool(config.restore_compact_substrate),
             )
         )
         _log_epoch_phase(epoch_id, "sampling_and_direct_fold", "done")
@@ -393,7 +401,6 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
         _log_epoch_phase(epoch_id, "epoch_status_write", "starting")
         _write_epoch_status(status_dir, status)
         _log_epoch_phase(epoch_id, "epoch_status_write", "done")
-        print(_format_epoch_status(status))
 
         manifest["current_epoch"] = epoch_number
         manifest["updated_at"] = _now()
@@ -454,7 +461,6 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
             _log_epoch_phase(epoch_id, "epoch_status_write", "starting", {"stop_reason": stop_reason})
             _write_epoch_status(status_dir, status)
             _log_epoch_phase(epoch_id, "epoch_status_write", "done", {"stop_reason": stop_reason})
-            print(_format_epoch_status(status))
             break
         _write_manifest(manifest_path, manifest)
 

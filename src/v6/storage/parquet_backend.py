@@ -29,7 +29,7 @@ class ParquetStorageBackend(StorageBackend):
         sampler: str,
         seed: int,
         steps: int,
-        batch_size: int = 1000,
+        batch_size: int = 50000,
         compression: str = "zstd",
     ) -> None:
         self.root = Path(root)

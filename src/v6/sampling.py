@@ -28,6 +28,8 @@ def sampler_registry() -> dict[str, type["BaseSampler"]]:
         "novelty_delta_sampler": NoveltyDeltaSampler,
         "mixed": MixedExplorerSampler,
         "mixed_explorer": MixedExplorerSampler,
+        "memory_guided": MemoryGuidedSampler,
+        "memory_guided_explore": MemoryGuidedExploreSampler,
         "reset_aware_mixed": ResetAwareMixedExplorerSampler,
         "reset_aware_mixed_explorer": ResetAwareMixedExplorerSampler,
     }
@@ -61,6 +63,14 @@ class BaseSampler:
         self.recent_families: deque[int | None] = deque(maxlen=500)
         self.reset_count = 0
         self.reset_unavailable = False
+        self.memory_guided_action_count = 0
+        self.memory_guided_fallback_count = 0
+        self._memory_action_query_count = 0
+        self._memory_action_score_total = 0.0
+        self._selected_memory_action_count = 0
+        self._selected_memory_action_score_total = 0.0
+        self._selected_memory_failure_risk_total = 0.0
+        self._selected_memory_future_option_gain_total = 0.0
 
     def choose_action(self, system, actions: list[int]) -> int:
         return int(self.rng.choice(actions))
@@ -155,6 +165,86 @@ class BaseSampler:
         probabilities = weights / total
         return int(self.rng.choices(list(actions), weights=probabilities.tolist(), k=1)[0])
 
+    def mixed_explorer_scores(self, system, actions: list[int]) -> list[float]:
+        return [
+            0.20 * self.action_balance_score(action)
+            + 0.25 * self.no_change_avoidance_score(action)
+            + 0.25 * self.low_confidence_score(system, action)
+            + 0.30 * self.novelty_delta_score(system, action)
+            for action in actions
+        ]
+
+    def memory_guided_summary(self) -> dict[str, float | int]:
+        query_count = max(1, int(self._memory_action_query_count))
+        selected_count = max(1, int(self._selected_memory_action_count))
+        return {
+            "memory_guided_action_count": int(self.memory_guided_action_count),
+            "memory_guided_fallback_count": int(self.memory_guided_fallback_count),
+            "mean_memory_action_score": float(self._memory_action_score_total) / query_count if self._memory_action_query_count else 0.0,
+            "selected_action_memory_score_mean": float(self._selected_memory_action_score_total) / selected_count if self._selected_memory_action_count else 0.0,
+            "selected_action_failure_risk_mean": float(self._selected_memory_failure_risk_total) / selected_count if self._selected_memory_action_count else 0.0,
+            "selected_action_future_option_gain_mean": float(self._selected_memory_future_option_gain_total) / selected_count if self._selected_memory_action_count else 0.0,
+        }
+
+    def _record_memory_guided_selection(self, selected_score, ranked_actions: list) -> None:
+        if ranked_actions:
+            self._memory_action_query_count += 1
+            self._memory_action_score_total += float(sum(float(item.score) for item in ranked_actions) / len(ranked_actions))
+        if selected_score is None:
+            self.memory_guided_fallback_count += 1
+            return
+        self.memory_guided_action_count += 1
+        self._selected_memory_action_count += 1
+        self._selected_memory_action_score_total += float(selected_score.score)
+        self._selected_memory_failure_risk_total += float(getattr(selected_score, "failure_risk", 0.0) or 0.0)
+        self._selected_memory_future_option_gain_total += float(
+            getattr(selected_score, "expected_future_option_delta", 0.0) or 0.0
+        )
+
+    def _memory_guided_choice(self, system, actions: list[int]) -> tuple[int, object | None, bool]:
+        memory_query = getattr(system, "memory_query", None)
+        context_builder = getattr(system, "context_builder", None)
+        depth_fn = getattr(system, "_context_depth_for_action", None)
+        if memory_query is None or context_builder is None or not callable(depth_fn):
+            fallback = self.softmax_sample(actions, self.mixed_explorer_scores(system, actions))
+            self._record_memory_guided_selection(None, [])
+            return int(fallback), None, True
+        contexts_by_action: dict[int, dict[int, tuple]] = {}
+        for action in actions:
+            max_level = int(depth_fn(int(action)))
+            contexts_by_action[int(action)] = context_builder.multi_scale_signatures(int(action), max_level=max_level)
+        ranked_actions = []
+        if hasattr(memory_query, "rank_actions"):
+            ranked_actions = list(memory_query.rank_actions(contexts_by_action, actions) or [])
+        if not ranked_actions or all(float(getattr(item, "score", 0.0) or 0.0) <= 0.0 for item in ranked_actions):
+            fallback = self.softmax_sample(actions, self.mixed_explorer_scores(system, actions))
+            self._record_memory_guided_selection(None, ranked_actions)
+            if hasattr(memory_query, "record_selected_action_query"):
+                try:
+                    memory_query.record_selected_action_query(
+                        context_signatures=contexts_by_action[int(fallback)],
+                        action=int(fallback),
+                    )
+                except Exception:
+                    pass
+            return int(fallback), None, True
+        ranked_by_action = {int(item.action): item for item in ranked_actions}
+        chosen = self.softmax_sample(
+            [int(item.action) for item in ranked_actions],
+            [float(item.score) for item in ranked_actions],
+        )
+        selected_score = ranked_by_action.get(int(chosen))
+        self._record_memory_guided_selection(selected_score, ranked_actions)
+        if hasattr(memory_query, "record_selected_action_query"):
+            try:
+                memory_query.record_selected_action_query(
+                    context_signatures=contexts_by_action[int(chosen)],
+                    action=int(chosen),
+                )
+            except Exception:
+                pass
+        return int(chosen), selected_score, False
+
 
 class RandomBaselineSampler(BaseSampler):
     name = "random_baseline"
@@ -195,14 +285,25 @@ class MixedExplorerSampler(BaseSampler):
     name = "mixed"
 
     def choose_action(self, system, actions: list[int]) -> int:
-        scores = [
-            0.20 * self.action_balance_score(action)
-            + 0.25 * self.no_change_avoidance_score(action)
-            + 0.25 * self.low_confidence_score(system, action)
-            + 0.30 * self.novelty_delta_score(system, action)
-            for action in actions
-        ]
-        return self.softmax_sample(actions, scores)
+        return self.softmax_sample(actions, self.mixed_explorer_scores(system, actions))
+
+
+class MemoryGuidedSampler(BaseSampler):
+    name = "memory_guided"
+
+    def choose_action(self, system, actions: list[int]) -> int:
+        chosen, _selected_score, _fallback = self._memory_guided_choice(system, actions)
+        return int(chosen)
+
+
+class MemoryGuidedExploreSampler(BaseSampler):
+    name = "memory_guided_explore"
+
+    def choose_action(self, system, actions: list[int]) -> int:
+        if self.rng.random() < 0.70:
+            chosen, _selected_score, _fallback = self._memory_guided_choice(system, actions)
+            return int(chosen)
+        return self.softmax_sample(actions, self.mixed_explorer_scores(system, actions))
 
 
 class ResetAwareMixedExplorerSampler(MixedExplorerSampler):

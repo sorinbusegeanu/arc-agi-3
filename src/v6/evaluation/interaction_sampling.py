@@ -92,7 +92,7 @@ class InteractionSamplingConfig:
     storage_backend: str = "sqlite"
     parquet_root: str = "runs/v6/storage_parquet"
     duckdb_path: str = "runs/v6/arc_agi3.duckdb"
-    storage_batch_size: int = 1000
+    storage_batch_size: int = 50000
     compression: str = "zstd"
     output_dir: str = "runs/v6"
     env_root: str | None = None
@@ -123,6 +123,18 @@ class InteractionSamplingConfig:
     direct_streaming_fold_busy_timeout_ms: int = 60000
     direct_streaming_fold_submit_delay_seconds: float = 0.0
     direct_streaming_shard_synchronous: str = "off"
+    direct_streaming_checkpoint_every_merged_jobs: int = 25
+    delete_sidecars_after_fold: bool = True
+    max_live_shard_bytes: int | None = None
+    write_debug_sidecars: bool = False
+    max_examples_per_contingency: int = 1
+    max_examples_per_family: int = 1
+    max_examples_per_carrier: int = 1
+    max_examples_per_contradiction_cluster: int = 2
+    memory_query_enabled: bool = False
+    memory_action_selection_enabled: bool = False
+    restore_compact_graph: bool = False
+    restore_compact_substrate: bool = False
 
 
 def resolve_game_ids(games_arg: str, env_root: str | None = None) -> list[str]:
@@ -214,6 +226,10 @@ def run_interaction_sampling_v05c(config: InteractionSamplingConfig) -> list[dic
         "global_step_end": int(config.global_step_offset) + int(config.steps),
         "memory_input_dir": config.memory_input_dir,
         "memory_output_dir": config.memory_output_dir,
+        "memory_query_enabled": bool(config.memory_query_enabled),
+        "memory_action_selection_enabled": bool(config.memory_action_selection_enabled),
+        "restore_compact_graph": bool(config.restore_compact_graph),
+        "restore_compact_substrate": bool(config.restore_compact_substrate),
         "worker_execution": worker_execution,
         "shared_live_memory": {
             "mode": str(config.shared_live_memory),
@@ -332,6 +348,18 @@ def _generate_sampling_dbs(config: InteractionSamplingConfig, sampling_root: Pat
                             "parquet_root": str(config.parquet_root),
                             "storage_batch_size": int(config.storage_batch_size),
                             "compression": str(config.compression),
+                            "write_debug_sidecars": bool(config.write_debug_sidecars),
+                            "direct_streaming_checkpoint_every_merged_jobs": int(config.direct_streaming_checkpoint_every_merged_jobs),
+                            "delete_sidecars_after_fold": bool(config.delete_sidecars_after_fold),
+                            "max_live_shard_bytes": config.max_live_shard_bytes,
+                            "max_examples_per_contingency": int(config.max_examples_per_contingency),
+                            "max_examples_per_family": int(config.max_examples_per_family),
+                            "max_examples_per_carrier": int(config.max_examples_per_carrier),
+                            "max_examples_per_contradiction_cluster": int(config.max_examples_per_contradiction_cluster),
+                            "memory_query_enabled": bool(config.memory_query_enabled),
+                            "memory_action_selection_enabled": bool(config.memory_action_selection_enabled),
+                            "restore_compact_graph": bool(config.restore_compact_graph),
+                            "restore_compact_substrate": bool(config.restore_compact_substrate),
                             "db_path": str(db_path),
                             "env_root": config.env_root,
                         }
@@ -402,6 +430,18 @@ def _generate_sampling_dbs(config: InteractionSamplingConfig, sampling_root: Pat
                         "parquet_root": str(config.parquet_root),
                         "storage_batch_size": int(config.storage_batch_size),
                         "compression": str(config.compression),
+                        "write_debug_sidecars": bool(config.write_debug_sidecars),
+                        "direct_streaming_checkpoint_every_merged_jobs": int(config.direct_streaming_checkpoint_every_merged_jobs),
+                        "delete_sidecars_after_fold": bool(config.delete_sidecars_after_fold),
+                        "max_live_shard_bytes": config.max_live_shard_bytes,
+                        "max_examples_per_contingency": int(config.max_examples_per_contingency),
+                        "max_examples_per_family": int(config.max_examples_per_family),
+                        "max_examples_per_carrier": int(config.max_examples_per_carrier),
+                        "max_examples_per_contradiction_cluster": int(config.max_examples_per_contradiction_cluster),
+                        "memory_query_enabled": bool(config.memory_query_enabled),
+                        "memory_action_selection_enabled": bool(config.memory_action_selection_enabled),
+                        "restore_compact_graph": bool(config.restore_compact_graph),
+                        "restore_compact_substrate": bool(config.restore_compact_substrate),
                         "db_path": str(db_path),
                         "env_root": config.env_root,
                     }
@@ -525,7 +565,7 @@ def _run_sampling_jobs(
         "summary_path": None,
         "live_memory_event_counts": None,
     }
-    max_tasks_per_child = max(1, int(jobs[0].get("max_tasks_per_child", 1) or 1)) if jobs else 1
+    max_tasks_per_child = int(jobs[0].get("max_tasks_per_child", 0) or 0) if jobs else 0
     live_memory_summary_path = None
     if shared_live_memory_mode != "none" and main_memory_dir is not None:
         live_memory_queue = make_live_memory_queue(int(jobs[0].get("live_memory_queue_maxsize", 100_000) or 100_000))
@@ -552,6 +592,13 @@ def _run_sampling_jobs(
                 retry_initial_delay_seconds=float(jobs[0].get("direct_streaming_fold_retry_initial_delay_seconds", 5.0) or 5.0),
                 busy_timeout_ms=int(jobs[0].get("direct_streaming_fold_busy_timeout_ms", 60000) or 60000),
                 shard_synchronous=str(jobs[0].get("direct_streaming_shard_synchronous", "off") or "off"),
+                checkpoint_every_merged_jobs=int(jobs[0].get("direct_streaming_checkpoint_every_merged_jobs", 25) or 25),
+                delete_sidecars_after_fold=bool(jobs[0].get("delete_sidecars_after_fold", True)),
+                max_live_shard_bytes=None if jobs[0].get("max_live_shard_bytes") in (None, "") else int(jobs[0].get("max_live_shard_bytes")),
+                max_examples_per_contingency=int(jobs[0].get("max_examples_per_contingency", 1) or 1),
+                max_examples_per_family=int(jobs[0].get("max_examples_per_family", 1) or 1),
+                max_examples_per_carrier=int(jobs[0].get("max_examples_per_carrier", 1) or 1),
+                max_examples_per_contradiction_cluster=int(jobs[0].get("max_examples_per_contradiction_cluster", 2) or 2),
             ),
             sampling_config=SimpleNamespace(
                 steps=int(jobs[0].get("steps", 0) or 0),
@@ -610,7 +657,10 @@ def _run_sampling_jobs(
         peak_workers = max(peak_workers, len(active_futures))
 
     try:
-        with ProcessPoolExecutor(max_workers=workers, max_tasks_per_child=max_tasks_per_child) as executor:
+        executor_kwargs = {"max_workers": workers}
+        if max_tasks_per_child > 0:
+            executor_kwargs["max_tasks_per_child"] = max_tasks_per_child
+        with ProcessPoolExecutor(**executor_kwargs) as executor:
             _submit_until_target(executor)
             while active_futures:
                 done, _pending = wait(active_futures, timeout=0.5, return_when=FIRST_COMPLETED)
@@ -653,7 +703,7 @@ def _run_sampling_jobs(
                                 delete_raw_after_fold=bool(job.get("delete_raw_after_direct_streaming_fold", True)),
                                 parquet_export_enabled=bool(job.get("collect_only", False) and str(job.get("storage_backend", "sqlite")) == "parquet"),
                                 parquet_root=None if not job.get("parquet_root") else str(job.get("parquet_root")),
-                                storage_batch_size=int(job.get("storage_batch_size", 1000) or 1000),
+                                storage_batch_size=int(job.get("storage_batch_size", 50000) or 50000),
                                 compression=str(job.get("compression", "zstd") or "zstd"),
                             )
                         )
@@ -782,16 +832,18 @@ def _run_sampling_job(job: dict) -> dict:
         memory_output_dir=job.get("memory_output_dir"),
         restore_compact_memory=bool(job.get("memory_input_dir")),
         persist_compact_memory_on_close=False,
-        restore_compact_graph=False,
-        restore_compact_substrate=False,
+        restore_compact_graph=bool(job.get("restore_compact_graph", False)),
+        restore_compact_substrate=bool(job.get("restore_compact_substrate", False)),
         global_step_offset=int(job.get("global_step_offset", 0) or 0),
         random_seed=seed,
         context_length=int(job.get("context_depth", 3)),
         max_context_depth=job.get("max_context_depth"),
         adaptive_context_expansion=bool(job.get("adaptive_context_expansion", False)),
-        database_commit_every=int(job.get("commit_steps", 1000)),
+        database_commit_every=int(job.get("commit_steps", 5000)),
         sqlite_synchronous=str(job.get("sqlite_synchronous", "normal") or "normal"),
         memory_promotion_every=max(1000, int(job.get("steps", 0) or 0) + 1),
+        memory_query_enabled=bool(job.get("memory_query_enabled", False)),
+        memory_action_selection_enabled=bool(job.get("memory_action_selection_enabled", False)),
         shared_live_memory_mode=str(job.get("shared_live_memory", "none") or "none"),
         live_memory_worker_id=f"{job['game']}:{sampler_name}:seed{seed}",
         live_memory_refresh_steps=int(job.get("live_memory_refresh_steps", 250) or 250),
@@ -826,6 +878,7 @@ def _run_sampling_job(job: dict) -> dict:
     replay_candidates: list[dict] = []
     efficiency_summary: dict[str, object] = {}
     adaptive_context_summary: dict[str, object] = {}
+    sampler_memory_guided_summary: dict[str, object] = {}
     fast_postprocessing = bool(job.get("fast_postprocessing", False))
     try:
         system.run(steps=int(job["steps"]))
@@ -834,7 +887,7 @@ def _run_sampling_job(job: dict) -> dict:
             edge_counts = graph.edge_type_counts()
         if graph is not None and hasattr(graph, "export_compact_rows"):
             db_path.with_name("live_graph_compact.json").write_text(
-                json.dumps(graph.export_compact_rows(), indent=2),
+                json.dumps(graph.export_compact_rows(), separators=(",", ":"), sort_keys=True),
                 encoding="utf-8",
             )
         tracker = getattr(system, "context_contradictions", None)
@@ -856,6 +909,8 @@ def _run_sampling_job(job: dict) -> dict:
             efficiency_summary = efficiency_tracker.summary()
         if hasattr(system, "adaptive_context_summary"):
             adaptive_context_summary = system.adaptive_context_summary()
+        if hasattr(sampler, "memory_guided_summary"):
+            sampler_memory_guided_summary = dict(sampler.memory_guided_summary())
     finally:
         system.close()
     _write_sampling_metadata(
@@ -874,6 +929,10 @@ def _run_sampling_job(job: dict) -> dict:
         memory_output_dir=job.get("memory_output_dir"),
         compact_memory_loaded=bool(job.get("memory_input_dir")),
         compact_memory_restore_summary=getattr(system, "compact_memory_restore_summary", {}),
+        memory_query_enabled=bool(job.get("memory_query_enabled", False)),
+        memory_action_selection_enabled=bool(job.get("memory_action_selection_enabled", False)),
+        restore_compact_graph=bool(job.get("restore_compact_graph", False)),
+        restore_compact_substrate=bool(job.get("restore_compact_substrate", False)),
         fast_postprocessing_enabled=fast_postprocessing,
         future_effects_postprocessing_skipped=True,
         future_effects_legacy_removed=True,
@@ -977,17 +1036,41 @@ def _run_sampling_job(job: dict) -> dict:
         live_memory_family_updates_imported=int(getattr(system, "live_memory_family_updates_imported", 0) or 0),
         live_memory_contradiction_clusters_loaded=int(getattr(system, "live_memory_contradiction_clusters_loaded", 0) or 0),
         live_memory_future_option_events_loaded=int(getattr(system, "live_memory_future_option_events_loaded", 0) or 0),
+        memory_guided_action_count=int(sampler_memory_guided_summary.get("memory_guided_action_count", 0) or 0),
+        memory_guided_fallback_count=int(sampler_memory_guided_summary.get("memory_guided_fallback_count", 0) or 0),
+        mean_memory_action_score=float(sampler_memory_guided_summary.get("mean_memory_action_score", 0.0) or 0.0),
+        selected_action_memory_score_mean=float(
+            sampler_memory_guided_summary.get("selected_action_memory_score_mean", 0.0) or 0.0
+        ),
+        selected_action_failure_risk_mean=float(
+            sampler_memory_guided_summary.get("selected_action_failure_risk_mean", 0.0) or 0.0
+        ),
+        selected_action_future_option_gain_mean=float(
+            sampler_memory_guided_summary.get("selected_action_future_option_gain_mean", 0.0) or 0.0
+        ),
     )
     if contradiction_summary:
-        db_path.with_name("context_contradictions.json").write_text(json.dumps(contradiction_summary, indent=2), encoding="utf-8")
+        db_path.with_name("context_contradictions.json").write_text(
+            json.dumps(contradiction_summary, separators=(",", ":"), sort_keys=True),
+            encoding="utf-8",
+        )
     db_path.with_name("carrier_candidates.json").write_text(
-        json.dumps([item.to_dict() if hasattr(item, "to_dict") else item for item in carrier_candidates], indent=2),
+        json.dumps([item.to_dict() if hasattr(item, "to_dict") else item for item in carrier_candidates], separators=(",", ":"), sort_keys=True),
         encoding="utf-8",
     )
-    db_path.with_name("memory_lifecycle_summary.json").write_text(json.dumps(memory_summary, indent=2), encoding="utf-8")
-    if not fast_postprocessing:
-        db_path.with_name("memory_replay_candidates.json").write_text(json.dumps(replay_candidates, indent=2), encoding="utf-8")
-        db_path.with_name("efficiency_summary.json").write_text(json.dumps(efficiency_summary, indent=2), encoding="utf-8")
+    db_path.with_name("memory_lifecycle_summary.json").write_text(
+        json.dumps(memory_summary, separators=(",", ":"), sort_keys=True),
+        encoding="utf-8",
+    )
+    if bool(job.get("write_debug_sidecars", False)):
+        db_path.with_name("memory_replay_candidates.json").write_text(
+            json.dumps(replay_candidates, separators=(",", ":"), sort_keys=True),
+            encoding="utf-8",
+        )
+        db_path.with_name("efficiency_summary.json").write_text(
+            json.dumps(efficiency_summary, separators=(",", ":"), sort_keys=True),
+            encoding="utf-8",
+        )
     return {"legacy_future_effects_removed": True}
 
 
@@ -1484,6 +1567,10 @@ def _aggregate_seed_rows(seed_rows: list[dict], config: InteractionSamplingConfi
         "adaptive_context_expansion_enabled": bool(first.get("adaptive_context_expansion_enabled", False)),
         "base_context_depth": int(first.get("base_context_depth", config.context_depth)),
         "max_context_depth": int(first.get("max_context_depth", config.max_context_depth or config.context_depth)),
+        "memory_query_enabled": bool(first.get("memory_query_enabled", False)),
+        "memory_action_selection_enabled": bool(first.get("memory_action_selection_enabled", False)),
+        "restore_compact_graph": bool(first.get("restore_compact_graph", False)),
+        "restore_compact_substrate": bool(first.get("restore_compact_substrate", False)),
         "adaptive_context_expansion_count": sums["adaptive_context_expansion_count"],
         "adaptive_context_active_action_count": sums["adaptive_context_active_action_count"],
         "adaptive_context_max_depth_reached": max(int(row.get("adaptive_context_max_depth_reached", 0) or 0) for row in seed_rows),
@@ -1491,6 +1578,18 @@ def _aggregate_seed_rows(seed_rows: list[dict], config: InteractionSamplingConfi
         "adaptive_context_expansion_applied_count": sums["adaptive_context_expansion_applied_count"],
         "mean_suggested_context_depth": float(np.mean([row.get("mean_suggested_context_depth", 0.0) or 0.0 for row in seed_rows])),
         "max_suggested_context_depth": float(max((row.get("max_suggested_context_depth", 0.0) or 0.0 for row in seed_rows))),
+        "memory_guided_action_count": int(sum(int(row.get("memory_guided_action_count", 0) or 0) for row in seed_rows)),
+        "memory_guided_fallback_count": int(sum(int(row.get("memory_guided_fallback_count", 0) or 0) for row in seed_rows)),
+        "mean_memory_action_score": _mean_or_none(row.get("mean_memory_action_score") for row in seed_rows),
+        "selected_action_memory_score_mean": _mean_or_none(
+            row.get("selected_action_memory_score_mean") for row in seed_rows
+        ),
+        "selected_action_failure_risk_mean": _mean_or_none(
+            row.get("selected_action_failure_risk_mean") for row in seed_rows
+        ),
+        "selected_action_future_option_gain_mean": _mean_or_none(
+            row.get("selected_action_future_option_gain_mean") for row in seed_rows
+        ),
         "carrier_candidate_count": sums["carrier_candidate_count"],
         "emergent_carrier_count": sums["emergent_carrier_count"],
         "carrier_spatial_candidate_count": sums["carrier_spatial_candidate_count"],

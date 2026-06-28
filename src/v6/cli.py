@@ -238,13 +238,18 @@ def build_parser() -> argparse.ArgumentParser:
     sampling.add_argument("--adaptive-context-expansion", type=_parse_bool, default=False)
     sampling.add_argument("--max-context-depth", type=int, default=None)
     sampling.add_argument("--workers", type=int, default=60)
-    sampling.add_argument("--max-tasks-per-child", type=int, default=1)
+    sampling.add_argument(
+        "--max-tasks-per-child",
+        type=int,
+        default=1,
+        help="Number of jobs each sampling/direct-fold worker handles before restart. Use 0 to disable worker recycling.",
+    )
     sampling.add_argument("--commit-steps", type=int, default=5000)
     sampling.add_argument("--sqlite-synchronous", choices=("normal", "off", "full"), default="normal")
     sampling.add_argument("--storage-backend", choices=("sqlite", "parquet"), default="sqlite")
     sampling.add_argument("--parquet-root", default="runs/v6/storage_parquet")
     sampling.add_argument("--duckdb-path", default="runs/v6/arc_agi3.duckdb")
-    sampling.add_argument("--storage-batch-size", type=int, default=1000)
+    sampling.add_argument("--storage-batch-size", type=int, default=50000)
     sampling.add_argument("--compress", default="zstd")
     sampling.add_argument("--output-dir", default="runs/v6")
     sampling.add_argument("--env-root", default=None)
@@ -269,14 +274,32 @@ def build_parser() -> argparse.ArgumentParser:
     sampling.add_argument("--direct-streaming-fold-busy-timeout-ms", type=int, default=60000)
     sampling.add_argument("--direct-streaming-fold-submit-delay-seconds", type=float, default=0.0)
     sampling.add_argument("--direct-streaming-shard-synchronous", choices=("normal", "off", "full"), default="off")
+    sampling.add_argument("--direct-streaming-checkpoint-every-merged-jobs", type=int, default=25)
+    sampling.add_argument("--max-live-shard-bytes", type=int, default=None)
     sampling.add_argument("--delete-raw-after-direct-streaming-fold", dest="delete_raw_after_direct_streaming_fold", action="store_true", default=True)
     sampling.add_argument("--keep-raw-after-direct-streaming-fold", dest="delete_raw_after_direct_streaming_fold", action="store_false")
+    sampling.add_argument("--no-delete-sidecars-after-fold", dest="delete_sidecars_after_fold", action="store_false", default=True)
     sampling.add_argument("--retain-raw-for-hypothesis-suite", action="store_true")
+    sampling.add_argument("--write-debug-sidecars", action="store_true")
+    sampling.add_argument("--max-examples-per-contingency", type=int, default=1)
+    sampling.add_argument("--max-examples-per-family", type=int, default=1)
+    sampling.add_argument("--max-examples-per-carrier", type=int, default=1)
+    sampling.add_argument("--max-examples-per-contradiction-cluster", type=int, default=2)
+    sampling.add_argument("--memory-query-enabled", action="store_true")
+    sampling.add_argument("--memory-action-selection-enabled", action="store_true")
+    sampling.add_argument("--restore-compact-graph", action="store_true")
+    sampling.add_argument("--restore-compact-substrate", action="store_true")
 
     retry_fold = subparsers.add_parser("retry-direct-streaming-fold-failures")
     retry_fold.add_argument("--manifest-path", required=True)
     retry_fold.add_argument("--memory-dir", required=True)
     retry_fold.add_argument("--workers", type=int, default=2)
+    retry_fold.add_argument(
+        "--max-tasks-per-child",
+        type=int,
+        default=1,
+        help="Number of jobs each sampling/direct-fold worker handles before restart. Use 0 to disable worker recycling.",
+    )
     retry_fold.add_argument("--delete-raw-after-fold", type=_parse_bool, default=True)
     retry_fold.add_argument("--finalize-after-success", type=_parse_bool, default=False)
 
@@ -574,7 +597,12 @@ def build_parser() -> argparse.ArgumentParser:
     continuous.add_argument("--replay-retention-percent", type=int, default=5)
     continuous.add_argument("--fast-postprocessing", type=_parse_bool, default=True)
     continuous.add_argument("--workers", type=int, default=60)
-    continuous.add_argument("--max-tasks-per-child", type=int, default=1)
+    continuous.add_argument(
+        "--max-tasks-per-child",
+        type=int,
+        default=1,
+        help="Number of jobs each sampling/direct-fold worker handles before restart. Use 0 to disable worker recycling.",
+    )
     continuous.add_argument("--commit-steps", type=int, default=5000)
     continuous.add_argument("--sqlite-synchronous", choices=("normal", "off", "full"), default="normal")
     continuous.add_argument("--initial-workers", type=int, default=None)
@@ -594,9 +622,21 @@ def build_parser() -> argparse.ArgumentParser:
     continuous.add_argument("--direct-streaming-fold-busy-timeout-ms", type=int, default=60000)
     continuous.add_argument("--direct-streaming-fold-submit-delay-seconds", type=float, default=0.0)
     continuous.add_argument("--direct-streaming-shard-synchronous", choices=("normal", "off", "full"), default="off")
+    continuous.add_argument("--direct-streaming-checkpoint-every-merged-jobs", type=int, default=25)
+    continuous.add_argument("--max-live-shard-bytes", type=int, default=None)
     continuous.add_argument("--delete-raw-after-direct-streaming-fold", dest="delete_raw_after_direct_streaming_fold", action="store_true", default=True)
     continuous.add_argument("--keep-raw-after-direct-streaming-fold", dest="delete_raw_after_direct_streaming_fold", action="store_false")
+    continuous.add_argument("--no-delete-sidecars-after-fold", dest="delete_sidecars_after_fold", action="store_false", default=True)
     continuous.add_argument("--retain-raw-for-hypothesis-suite", action="store_true")
+    continuous.add_argument("--write-debug-sidecars", action="store_true")
+    continuous.add_argument("--max-examples-per-contingency", type=int, default=1)
+    continuous.add_argument("--max-examples-per-family", type=int, default=1)
+    continuous.add_argument("--max-examples-per-carrier", type=int, default=1)
+    continuous.add_argument("--max-examples-per-contradiction-cluster", type=int, default=2)
+    continuous.add_argument("--memory-query-enabled", action="store_true")
+    continuous.add_argument("--memory-action-selection-enabled", action="store_true")
+    continuous.add_argument("--restore-compact-graph", action="store_true")
+    continuous.add_argument("--restore-compact-substrate", action="store_true")
     return parser
 
 
@@ -872,6 +912,18 @@ def main(argv: list[str] | None = None) -> int:
                 direct_streaming_fold_busy_timeout_ms=int(args.direct_streaming_fold_busy_timeout_ms),
                 direct_streaming_fold_submit_delay_seconds=float(args.direct_streaming_fold_submit_delay_seconds),
                 direct_streaming_shard_synchronous=str(args.direct_streaming_shard_synchronous),
+                direct_streaming_checkpoint_every_merged_jobs=int(args.direct_streaming_checkpoint_every_merged_jobs),
+                delete_sidecars_after_fold=bool(args.delete_sidecars_after_fold),
+                max_live_shard_bytes=args.max_live_shard_bytes,
+                write_debug_sidecars=bool(args.write_debug_sidecars),
+                max_examples_per_contingency=int(args.max_examples_per_contingency),
+                max_examples_per_family=int(args.max_examples_per_family),
+                max_examples_per_carrier=int(args.max_examples_per_carrier),
+                max_examples_per_contradiction_cluster=int(args.max_examples_per_contradiction_cluster),
+                memory_query_enabled=bool(args.memory_query_enabled),
+                memory_action_selection_enabled=bool(args.memory_action_selection_enabled),
+                restore_compact_graph=bool(args.restore_compact_graph),
+                restore_compact_substrate=bool(args.restore_compact_substrate),
             )
         )
         print(json.dumps({"rows": len(rows), "output_dir": args.output_dir}, indent=2))
@@ -882,6 +934,7 @@ def main(argv: list[str] | None = None) -> int:
             manifest_path=args.manifest_path,
             memory_dir=args.memory_dir,
             workers=int(args.workers),
+            max_tasks_per_child=int(args.max_tasks_per_child),
             delete_raw_after_fold=bool(args.delete_raw_after_fold),
             finalize_after_success=bool(args.finalize_after_success),
         )
@@ -1474,10 +1527,10 @@ def main(argv: list[str] | None = None) -> int:
                 max_replay_queue_size=int(args.max_replay_queue_size),
                 replay_retention_percent=int(args.replay_retention_percent),
                 fast_postprocessing=bool(args.fast_postprocessing),
-                workers=int(args.workers),
-                max_tasks_per_child=int(args.max_tasks_per_child),
-                commit_steps=int(args.commit_steps),
-                sqlite_synchronous=str(args.sqlite_synchronous),
+            workers=int(args.workers),
+            max_tasks_per_child=int(args.max_tasks_per_child),
+            commit_steps=int(args.commit_steps),
+            sqlite_synchronous=str(args.sqlite_synchronous),
                 initial_workers=None if args.initial_workers is None else int(args.initial_workers),
                 ram_ramp_threshold_percent=float(args.ram_ramp_threshold_percent),
                 initial_worker_ramp_delay_seconds=float(args.initial_worker_ramp_delay_seconds),
@@ -1492,12 +1545,24 @@ def main(argv: list[str] | None = None) -> int:
                 direct_streaming_fold_workers=int(args.direct_streaming_fold_workers),
                 delete_raw_after_direct_streaming_fold=bool(args.delete_raw_after_direct_streaming_fold),
                 retain_raw_for_hypothesis_suite=bool(args.retain_raw_for_hypothesis_suite),
-                direct_streaming_fold_retry_attempts=int(args.direct_streaming_fold_retry_attempts),
-                direct_streaming_fold_retry_initial_delay_seconds=float(args.direct_streaming_fold_retry_initial_delay_seconds),
-                direct_streaming_fold_busy_timeout_ms=int(args.direct_streaming_fold_busy_timeout_ms),
-                direct_streaming_fold_submit_delay_seconds=float(args.direct_streaming_fold_submit_delay_seconds),
-                direct_streaming_shard_synchronous=str(args.direct_streaming_shard_synchronous),
-            )
+            direct_streaming_fold_retry_attempts=int(args.direct_streaming_fold_retry_attempts),
+            direct_streaming_fold_retry_initial_delay_seconds=float(args.direct_streaming_fold_retry_initial_delay_seconds),
+            direct_streaming_fold_busy_timeout_ms=int(args.direct_streaming_fold_busy_timeout_ms),
+            direct_streaming_fold_submit_delay_seconds=float(args.direct_streaming_fold_submit_delay_seconds),
+            direct_streaming_shard_synchronous=str(args.direct_streaming_shard_synchronous),
+            direct_streaming_checkpoint_every_merged_jobs=int(args.direct_streaming_checkpoint_every_merged_jobs),
+            delete_sidecars_after_fold=bool(args.delete_sidecars_after_fold),
+            max_live_shard_bytes=args.max_live_shard_bytes,
+            write_debug_sidecars=bool(args.write_debug_sidecars),
+            max_examples_per_contingency=int(args.max_examples_per_contingency),
+            max_examples_per_family=int(args.max_examples_per_family),
+            max_examples_per_carrier=int(args.max_examples_per_carrier),
+            max_examples_per_contradiction_cluster=int(args.max_examples_per_contradiction_cluster),
+            memory_query_enabled=bool(args.memory_query_enabled),
+            memory_action_selection_enabled=bool(args.memory_action_selection_enabled),
+            restore_compact_graph=bool(args.restore_compact_graph),
+            restore_compact_substrate=bool(args.restore_compact_substrate),
+        )
         )
         print(json.dumps(result, indent=2))
         return 0

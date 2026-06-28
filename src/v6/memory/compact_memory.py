@@ -85,6 +85,41 @@ def ensure_memory_layout(memory_dir: str | Path) -> CompactMemoryPaths:
     return paths
 
 
+def checkpoint_compact_memory(memory_dir: str | Path, truncate: bool = True) -> dict[str, Any]:
+    root = Path(memory_dir)
+    mode = "TRUNCATE" if truncate else "PASSIVE"
+    results: dict[str, Any] = {"mode": mode.lower(), "databases": {}}
+    for name in ("current_state.sqlite", "graph.sqlite", "replay_queue.sqlite"):
+        db_path = root / name
+        wal_path = root / f"{name}-wal"
+        shm_path = root / f"{name}-shm"
+        before = {
+            "db_bytes": int(db_path.stat().st_size) if db_path.exists() else 0,
+            "wal_bytes": int(wal_path.stat().st_size) if wal_path.exists() else 0,
+            "shm_bytes": int(shm_path.stat().st_size) if shm_path.exists() else 0,
+        }
+        if db_path.exists():
+            conn = sqlite3.connect(db_path, timeout=10.0)
+            try:
+                conn.execute("PRAGMA busy_timeout=10000")
+                checkpoint_row = conn.execute(f"PRAGMA wal_checkpoint({mode})").fetchone()
+            finally:
+                conn.close()
+        else:
+            checkpoint_row = None
+        after = {
+            "db_bytes": int(db_path.stat().st_size) if db_path.exists() else 0,
+            "wal_bytes": int(wal_path.stat().st_size) if wal_path.exists() else 0,
+            "shm_bytes": int(shm_path.stat().st_size) if shm_path.exists() else 0,
+        }
+        results["databases"][name] = {
+            "checkpoint_result": list(checkpoint_row) if checkpoint_row is not None else None,
+            "before": before,
+            "after": after,
+        }
+    return results
+
+
 def derive_missing_transformation_families_from_stable_contingencies(memory_dir: str | Path) -> dict[str, Any]:
     memory_dir = Path(memory_dir)
     paths = ensure_memory_layout(memory_dir)
@@ -1210,6 +1245,7 @@ def fold_live_system_into_compact_memory(system: Any, memory_dir: str | Path) ->
                 ),
             )
         for replay in getattr(system.memory_lifecycle, "replay_candidates", {}).values():
+            replay_payload = _build_minimal_replay_payload(replay.to_dict(), {})
             replay_conn.execute(
                 """
                 INSERT INTO replay_queue (
@@ -1230,7 +1266,7 @@ def fold_live_system_into_compact_memory(system: Any, memory_dir: str | Path) ->
                     str(replay.reason),
                     global_step_start,
                     global_step_end,
-                    json.dumps(replay.to_dict(), sort_keys=True),
+                    json.dumps(replay_payload, sort_keys=True),
                 ),
             )
         for candidate in getattr(system.carrier_tracker, "build_candidates", lambda: [])():
@@ -1798,6 +1834,36 @@ def _merge_replay_queue(temp_replay: sqlite3.Connection, replay_conn: sqlite3.Co
         )
 
 
+def _build_minimal_replay_payload(payload: dict[str, Any], prediction_payload: dict[str, Any]) -> dict[str, Any]:
+    context_signature = prediction_payload.get("context_signature") or payload.get("context_signature")
+    context_signature_text = None if context_signature in (None, "") else str(context_signature)
+    family_id = prediction_payload.get("actual_family") or prediction_payload.get("predicted_family")
+    contradiction_key = None
+    if int(prediction_payload.get("context_contradiction") or prediction_payload.get("prediction_error") or 0):
+        contradiction_key = prediction_payload.get("context_contradiction_key") or context_signature_text or f"interaction:{payload.get('id')}"
+    return _json_safe(
+        {
+            "replay_id": payload.get("id") or payload.get("interaction_id"),
+            "game": payload.get("game"),
+            "sampler": payload.get("sampler"),
+            "seed": payload.get("seed"),
+            "global_step": payload.get("global_step") or prediction_payload.get("global_step"),
+            "action": prediction_payload.get("action") if prediction_payload.get("action") is not None else payload.get("action"),
+            "context_signature": context_signature_text,
+            "context_signature_hash": None if context_signature_text is None else sha1(context_signature_text.encode("utf-8")).hexdigest()[:20],
+            "family_signature": None if family_id in (None, "") else str(family_id),
+            "carrier_signature": payload.get("carrier_signature"),
+            "contradiction_key": contradiction_key,
+            "prediction_error": prediction_payload.get("prediction_error"),
+            "isf_prediction_error": payload.get("isf_prediction_error") if payload.get("isf_prediction_error") is not None else prediction_payload.get("isf_prediction_error"),
+            "memory_replay_priority": payload.get("memory_replay_priority"),
+            "future_option_delta": payload.get("future_option_delta") if payload.get("future_option_delta") is not None else prediction_payload.get("future_option_delta"),
+            "terminal": payload.get("terminated") if payload.get("terminated") is not None else payload.get("terminal"),
+            "success": payload.get("success"),
+        }
+    )
+
+
 def _fold_single_db(
     *,
     db_path: Path,
@@ -2222,7 +2288,6 @@ def _fold_single_db(
                 priority = float(payload.get("memory_replay_priority") or 0.0)
                 reason = "carrier_linked" if payload.get("carrier_signature") else "priority"
                 prediction_payload = dict(prediction_payload_by_interaction.get(replay_id, {}))
-                merged_payload = {**prediction_payload, **payload}
                 family_signature = None
                 family_id = prediction_payload.get("actual_family") or prediction_payload.get("predicted_family")
                 if family_id not in (None, ""):
@@ -2252,7 +2317,7 @@ def _fold_single_db(
                         reason,
                         int(payload.get("global_step") or fold_config.global_step_start),
                         int(payload.get("global_step") or fold_config.global_step_end),
-                        json.dumps(_json_safe(merged_payload), sort_keys=True),
+                        json.dumps(_build_minimal_replay_payload(payload, prediction_payload), sort_keys=True),
                     ),
                 )
                 _upsert_observation_graph(

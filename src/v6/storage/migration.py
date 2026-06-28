@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from typing import Iterator
 
 from v6.storage.parquet_backend import ParquetStorageBackend
 
@@ -24,7 +25,7 @@ def migrate_sqlite_to_parquet(
     sampler: str,
     seed: int,
     steps: int,
-    batch_size: int = 1000,
+    batch_size: int = 50000,
     compression: str = "zstd",
     run_summary: dict | None = None,
 ) -> Path:
@@ -41,8 +42,8 @@ def migrate_sqlite_to_parquet(
         for table_name in MIGRATION_TABLES:
             if not _table_exists(connection, table_name):
                 continue
-            records = _read_table(connection, table_name)
-            _write_backend_table(backend, table_name, records)
+            for records in _iter_table_batches(connection, table_name, batch_size=max(1, int(batch_size))):
+                _write_backend_table(backend, table_name, records)
         summary = {
             "game": game,
             "sampler": sampler,
@@ -66,6 +67,16 @@ def _read_table(connection: sqlite3.Connection, table_name: str) -> list[dict]:
     cursor = connection.execute(f"SELECT * FROM {table_name}")
     columns = [item[0] for item in cursor.description]
     return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+
+def _iter_table_batches(connection: sqlite3.Connection, table_name: str, batch_size: int) -> Iterator[list[dict]]:
+    cursor = connection.execute(f"SELECT * FROM {table_name}")
+    columns = [item[0] for item in cursor.description]
+    while True:
+        rows = cursor.fetchmany(max(1, int(batch_size)))
+        if not rows:
+            break
+        yield [dict(zip(columns, row)) for row in rows]
 
 
 def _write_backend_table(backend: ParquetStorageBackend, table_name: str, records: list[dict]) -> None:
