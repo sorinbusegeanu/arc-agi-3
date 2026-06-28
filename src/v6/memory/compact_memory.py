@@ -1104,13 +1104,21 @@ def fold_live_system_into_compact_memory(system: Any, memory_dir: str | Path) ->
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(canonical_key) DO UPDATE SET
-                    support_count = MAX(stable_contingencies.support_count, excluded.support_count),
+                    support_count = COALESCE(stable_contingencies.support_count, 0) + COALESCE(excluded.support_count, 0),
                     context_level = MAX(stable_contingencies.context_level, excluded.context_level),
                     last_seen_global_step = MAX(stable_contingencies.last_seen_global_step, excluded.last_seen_global_step),
                     stability_score = MAX(stable_contingencies.stability_score, excluded.stability_score),
-                    prediction_attempt_count = MAX(COALESCE(stable_contingencies.prediction_attempt_count, 0), COALESCE(excluded.prediction_attempt_count, 0)),
-                    prediction_success_count = MAX(COALESCE(stable_contingencies.prediction_success_count, 0), COALESCE(excluded.prediction_success_count, 0)),
-                    prediction_accuracy = MAX(COALESCE(stable_contingencies.prediction_accuracy, 0.0), COALESCE(excluded.prediction_accuracy, 0.0)),
+                    prediction_attempt_count = COALESCE(stable_contingencies.prediction_attempt_count, 0) + COALESCE(excluded.prediction_attempt_count, 0),
+                    prediction_success_count = COALESCE(stable_contingencies.prediction_success_count, 0) + COALESCE(excluded.prediction_success_count, 0),
+                    prediction_accuracy = CASE
+                        WHEN (COALESCE(stable_contingencies.prediction_attempt_count, 0) + COALESCE(excluded.prediction_attempt_count, 0)) > 0
+                        THEN CAST(
+                            (COALESCE(stable_contingencies.prediction_success_count, 0) + COALESCE(excluded.prediction_success_count, 0)) AS REAL
+                        ) / CAST(
+                            (COALESCE(stable_contingencies.prediction_attempt_count, 0) + COALESCE(excluded.prediction_attempt_count, 0)) AS REAL
+                        )
+                        ELSE NULL
+                    END,
                     normalized_contingency_key = COALESCE(stable_contingencies.normalized_contingency_key, excluded.normalized_contingency_key)
                 """,
                 (
@@ -1527,15 +1535,23 @@ def _merge_state_tables(temp_state: sqlite3.Connection, state_conn: sqlite3.Conn
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(canonical_key) DO UPDATE SET
-                support_count = MAX(stable_contingencies.support_count, excluded.support_count),
+                support_count = COALESCE(stable_contingencies.support_count, 0) + COALESCE(excluded.support_count, 0),
                 context_level = MAX(stable_contingencies.context_level, excluded.context_level),
                 first_seen_global_step = MIN(stable_contingencies.first_seen_global_step, excluded.first_seen_global_step),
                 last_seen_global_step = MAX(stable_contingencies.last_seen_global_step, excluded.last_seen_global_step),
                 stability_score = MAX(stable_contingencies.stability_score, excluded.stability_score),
                 representative_example_count = MAX(stable_contingencies.representative_example_count, excluded.representative_example_count),
-                prediction_attempt_count = MAX(COALESCE(stable_contingencies.prediction_attempt_count, 0), COALESCE(excluded.prediction_attempt_count, 0)),
-                prediction_success_count = MAX(COALESCE(stable_contingencies.prediction_success_count, 0), COALESCE(excluded.prediction_success_count, 0)),
-                prediction_accuracy = MAX(COALESCE(stable_contingencies.prediction_accuracy, 0.0), COALESCE(excluded.prediction_accuracy, 0.0)),
+                prediction_attempt_count = COALESCE(stable_contingencies.prediction_attempt_count, 0) + COALESCE(excluded.prediction_attempt_count, 0),
+                prediction_success_count = COALESCE(stable_contingencies.prediction_success_count, 0) + COALESCE(excluded.prediction_success_count, 0),
+                prediction_accuracy = CASE
+                    WHEN (COALESCE(stable_contingencies.prediction_attempt_count, 0) + COALESCE(excluded.prediction_attempt_count, 0)) > 0
+                    THEN CAST(
+                        (COALESCE(stable_contingencies.prediction_success_count, 0) + COALESCE(excluded.prediction_success_count, 0)) AS REAL
+                    ) / CAST(
+                        (COALESCE(stable_contingencies.prediction_attempt_count, 0) + COALESCE(excluded.prediction_attempt_count, 0)) AS REAL
+                    )
+                    ELSE NULL
+                END,
                 normalized_contingency_key = COALESCE(stable_contingencies.normalized_contingency_key, excluded.normalized_contingency_key)
             """,
             tuple(row[column] for column in row.keys()),
@@ -2552,14 +2568,22 @@ def _upsert_stable_contingency(
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(canonical_key) DO UPDATE SET
-            support_count = MAX(stable_contingencies.support_count, excluded.support_count),
+            support_count = COALESCE(stable_contingencies.support_count, 0) + COALESCE(excluded.support_count, 0),
             context_level = MAX(stable_contingencies.context_level, excluded.context_level),
             first_seen_global_step = MIN(stable_contingencies.first_seen_global_step, excluded.first_seen_global_step),
             last_seen_global_step = MAX(stable_contingencies.last_seen_global_step, excluded.last_seen_global_step),
             stability_score = MAX(stable_contingencies.stability_score, excluded.stability_score),
-            prediction_attempt_count = MAX(COALESCE(stable_contingencies.prediction_attempt_count, 0), COALESCE(excluded.prediction_attempt_count, 0)),
-            prediction_success_count = MAX(COALESCE(stable_contingencies.prediction_success_count, 0), COALESCE(excluded.prediction_success_count, 0)),
-            prediction_accuracy = MAX(COALESCE(stable_contingencies.prediction_accuracy, 0.0), COALESCE(excluded.prediction_accuracy, 0.0)),
+            prediction_attempt_count = COALESCE(stable_contingencies.prediction_attempt_count, 0) + COALESCE(excluded.prediction_attempt_count, 0),
+            prediction_success_count = COALESCE(stable_contingencies.prediction_success_count, 0) + COALESCE(excluded.prediction_success_count, 0),
+            prediction_accuracy = CASE
+                WHEN (COALESCE(stable_contingencies.prediction_attempt_count, 0) + COALESCE(excluded.prediction_attempt_count, 0)) > 0
+                THEN CAST(
+                    (COALESCE(stable_contingencies.prediction_success_count, 0) + COALESCE(excluded.prediction_success_count, 0)) AS REAL
+                ) / CAST(
+                    (COALESCE(stable_contingencies.prediction_attempt_count, 0) + COALESCE(excluded.prediction_attempt_count, 0)) AS REAL
+                )
+                ELSE NULL
+            END,
             normalized_contingency_key = COALESCE(stable_contingencies.normalized_contingency_key, excluded.normalized_contingency_key)
         """,
         (

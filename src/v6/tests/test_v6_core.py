@@ -12339,6 +12339,47 @@ def test_finalize_main_compact_memory_preserves_fold_summary_counters(tmp_path: 
     assert persisted["fold_summary"]["stable_contingencies_inserted"] == 2
 
 
+def test_merge_compact_memory_shards_adds_stable_contingency_support_counts(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory_main_merge"
+    shard_a = tmp_path / "shard_a"
+    shard_b = tmp_path / "shard_b"
+    ensure_memory_layout(memory_dir)
+    ensure_memory_layout(shard_a)
+    ensure_memory_layout(shard_b)
+    for shard_dir in (shard_a, shard_b):
+        with sqlite3.connect(shard_dir / "current_state.sqlite") as conn:
+            conn.execute(
+                """
+                INSERT INTO stable_contingencies (
+                    contingency_id, canonical_key, game, sampler, context_level, action, effect_signature, support_count,
+                    first_seen_global_step, last_seen_global_step, stability_score, mean_prediction_error,
+                    mean_replay_priority, representative_example_count, prediction_attempt_count,
+                    prediction_success_count, prediction_accuracy, prediction_error_before,
+                    prediction_error_after, normalized_contingency_key
+                ) VALUES (1, 'same_key', 'g1', 's1', 1, 1, 'e1', 12, 1, 10, 0.6, 0.0, 0.0, 0, 12, 9, 0.75, NULL, NULL, 'nk1')
+                """
+            )
+            conn.commit()
+    merge_compact_memory_shards_into_main(
+        memory_dir=memory_dir,
+        shard_dirs=[shard_a, shard_b],
+        fold_config=CompactMemoryFoldConfig(global_step_start=1, global_step_end=10),
+        parallel_workers=1,
+    )
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        row = conn.execute(
+            "SELECT support_count, prediction_attempt_count, prediction_success_count, prediction_accuracy FROM stable_contingencies WHERE canonical_key = 'same_key'"
+        ).fetchone()
+        stable_count = conn.execute(
+            "SELECT COUNT(*) FROM stable_contingencies WHERE support_count >= 20"
+        ).fetchone()[0]
+    assert row[0] == 24
+    assert row[1] == 24
+    assert row[2] == 18
+    assert abs(float(row[3]) - 0.75) < 1e-9
+    assert stable_count == 1
+
+
 def test_h03_compact_fold_evidence_exposes_stable_contingencies_and_families(tmp_path: Path) -> None:
     from v6.hypothesis_h03_report import evaluate_h03_transformation_family_formation
     from v6.memory.direct_streaming_fold import ensure_direct_streaming_fold_manifest

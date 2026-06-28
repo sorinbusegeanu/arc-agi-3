@@ -671,10 +671,17 @@ def _run_sampling_jobs(
         if direct_fold_writer is not None:
             direct_fold_summary = direct_fold_writer.close()
             if int(direct_fold_summary.get("direct_streaming_fold_failed_count", 0) or 0) > 0:
+                failed_ids = list(direct_fold_summary.get("direct_streaming_fold_failed_job_ids", []))[:3]
+                failed_errors = list(direct_fold_summary.get("direct_streaming_fold_failed_errors", []))[:3]
+                failed_attempts = list(direct_fold_summary.get("direct_streaming_fold_failed_retry_attempt_counts", []))[:3]
+                details = ", ".join(
+                    f"{job_id} attempts={attempts} error={error}"
+                    for job_id, attempts, error in zip(failed_ids, failed_attempts, failed_errors)
+                )
                 raise RuntimeError(
                     "direct streaming fold failed for "
                     f"{int(direct_fold_summary.get('direct_streaming_fold_failed_count', 0) or 0)} job(s); "
-                    f"manifest={direct_fold_summary.get('direct_streaming_fold_manifest_path')}"
+                    f"manifest={direct_fold_summary.get('direct_streaming_fold_manifest_path')}; {details}"
                 )
     return {
         "requested_workers": int(workers),
