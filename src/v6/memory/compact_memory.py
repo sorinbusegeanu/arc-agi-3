@@ -86,8 +86,8 @@ def ensure_memory_layout(memory_dir: str | Path) -> CompactMemoryPaths:
 
 def derive_missing_transformation_families_from_stable_contingencies(memory_dir: str | Path) -> dict[str, Any]:
     memory_dir = Path(memory_dir)
+    paths = ensure_memory_layout(memory_dir)
     current_state_path = memory_dir / "current_state.sqlite"
-    graph_path = memory_dir / "graph.sqlite"
     if not current_state_path.exists():
         return {
             "compact_family_repair_used": False,
@@ -103,7 +103,6 @@ def derive_missing_transformation_families_from_stable_contingencies(memory_dir:
             "compact_family_repair_graph_edge_count": 0,
             "compact_family_repair_error": None,
         }
-    paths = ensure_memory_layout(memory_dir)
     summary = {
         "compact_family_repair_used": False,
         "compact_family_repair_reason": "unknown",

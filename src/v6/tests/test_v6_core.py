@@ -148,6 +148,7 @@ from v6.main import V6Config, V6System
 from v6.future_options import FutureOptionEstimator
 from v6.memory.compact_memory import (
     CompactMemoryFoldConfig,
+    derive_missing_transformation_families_from_stable_contingencies,
     ensure_memory_layout,
     fold_live_system_into_compact_memory,
     fold_sampling_job_sidecars_into_compact_memory,
@@ -11861,8 +11862,6 @@ def test_compact_family_repair_creates_transformation_families_and_members(tmp_p
 
 
 def test_compact_family_repair_is_idempotent(tmp_path: Path) -> None:
-    from v6.memory.compact_memory import derive_missing_transformation_families_from_stable_contingencies
-
     memory_dir = tmp_path / "memory_h03_repair_idempotent"
     ensure_memory_layout(memory_dir)
     with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
@@ -11883,7 +11882,6 @@ def test_compact_family_repair_is_idempotent(tmp_path: Path) -> None:
 
 def test_compact_family_repair_enables_role_links_with_family(tmp_path: Path) -> None:
     from v6.higher_order_substrate import derive_higher_order_memory
-    from v6.memory.compact_memory import derive_missing_transformation_families_from_stable_contingencies
 
     memory_dir = tmp_path / "memory_h03_role_repair"
     ensure_memory_layout(memory_dir)
@@ -11897,6 +11895,12 @@ def test_compact_family_repair_enables_role_links_with_family(tmp_path: Path) ->
     with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
         family_role_links = conn.execute("SELECT COUNT(*) FROM role_links WHERE linked_type = 'family'").fetchone()[0]
     assert family_role_links > 0
+
+
+def test_hypothesis_suite_report_imports_successfully() -> None:
+    import v6.hypothesis_suite_report as hypothesis_suite_report
+
+    assert callable(hypothesis_suite_report.run_hypothesis_suite_report)
 
 
 def test_h03_family_prediction_lift_available_and_non_negative(tmp_path: Path) -> None:
