@@ -475,14 +475,15 @@ def evaluate_h02_prediction_violation_attention(
         direct_replay_lift_invalid=direct_replay_lift_invalid,
         invalid_core=invalid_core,
     )
-    if result.get("evidence_coverage_ratio") is None:
+    coverage_required = jobs_expected > 1 or streamed_compact_only
+    if coverage_required and result.get("evidence_coverage_ratio") is None:
         if result["h02a_replay_attention_decision"] == "VALID":
             result["h02a_replay_attention_decision"] = "PARTIALLY_VALID_WITH_LOW_COVERAGE"
         _append_unique(
             result.setdefault("missing_evidence", []),
             "H02 evidence coverage could not be computed; VALID is not allowed without explicit coverage.",
         )
-    elif low_coverage:
+    elif coverage_required and low_coverage:
         if result["h02a_replay_attention_decision"] in {"VALID", "PARTIALLY_VALID", "INVALID"}:
             result["h02a_replay_attention_decision"] = "PARTIALLY_VALID_WITH_LOW_COVERAGE"
         else:

@@ -206,6 +206,12 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
             after_epoch_memory_summary=memory_after,
             memory_loaded_from_previous_epoch=epoch_number > 1,
         )
+        _ensure_fold_summary_present(
+            memory_paths=memory_paths,
+            global_step_start=global_step_start,
+            global_step_end=global_step_end,
+            worker_execution=worker_execution,
+        )
         validate_cleanup_safe(epoch_dir, memory_dir, required_reports=True)
         cleanup_summary = cleanup_epoch_artifacts(epoch_dir=epoch_dir, memory_dir=memory_dir) if bool(config.cleanup) else _no_cleanup_summary(epoch_dir, memory_dir)
         disk_after = disk_usage_snapshot(root)
@@ -382,6 +388,26 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
 
     _write_manifest(manifest_path, manifest)
     return manifest
+
+
+def _ensure_fold_summary_present(
+    *,
+    memory_paths: Any,
+    global_step_start: int,
+    global_step_end: int,
+    worker_execution: dict[str, Any] | None,
+) -> None:
+    summary = load_memory_summary(memory_paths.summary_json)
+    if summary.get("fold_summary"):
+        return
+    rebuilt = build_memory_summary(memory_paths)
+    rebuilt["fold_summary"] = {
+        "global_step_start": int(global_step_start),
+        "global_step_end": int(global_step_end),
+        "compatibility_stub": True,
+        "direct_streaming_fold_enabled": bool((worker_execution or {}).get("direct_streaming_fold_enabled", False)),
+    }
+    memory_paths.summary_json.write_text(json.dumps(rebuilt, indent=2), encoding="utf-8")
 
 
 def _load_or_initialize_manifest(config: ContinuousResearchConfig, manifest_path: Path) -> dict[str, Any]:

@@ -979,6 +979,7 @@ def _compute_contingency_join_family_candidate(
         sampler_column=None,
         action_column="action",
         min_family_support=min_family_support,
+        normalize_numeric_semantics=True,
     )
     if not observations:
         return None
@@ -1066,6 +1067,7 @@ def _compute_family_table_candidate(
         sampler_column=sampler_column,
         action_column="action" if "action" in columns else None,
         min_family_support=min_family_support,
+        normalize_numeric_semantics=(table_name in FAMILY_TABLE_NAMES and semantic_column is not None),
     )
     if not observations:
         return None
@@ -1141,6 +1143,7 @@ def _compute_derivable_family_candidate(
         sampler_column=sampler_column,
         action_column=action_column,
         min_family_support=min_family_support,
+        normalize_numeric_semantics=False,
     )
     if not observations:
         return None
@@ -1903,6 +1906,7 @@ def _family_observations_from_rows(
     sampler_column: str | None,
     action_column: str | None,
     min_family_support: int,
+    normalize_numeric_semantics: bool = False,
 ) -> list[dict[str, Any]]:
     path_game, path_sampler = _infer_game_sampler_from_path(run_dir, sqlite_path)
     observations: list[dict[str, Any]] = []
@@ -1915,7 +1919,11 @@ def _family_observations_from_rows(
         if strict_signature is None:
             continue
         action_value = _normalize_scalar(row.get(action_column)) if action_column is not None else None
-        canonical_signature = _normalized_family_group_signature(strict_signature, action_value)
+        canonical_signature = (
+            _normalized_family_group_signature(strict_signature, action_value)
+            if normalize_numeric_semantics and _is_numeric_vector_signature(strict_signature)
+            else strict_signature
+        )
         support_value = _maybe_float(row.get(support_column)) if support_column is not None else None
         if support_value is None:
             support_value = 1.0
@@ -1935,6 +1943,7 @@ def _family_observations_from_rows(
             {
                 "canonical_signature": canonical_signature,
                 "strict_canonical_signature": strict_signature,
+                "normalized_canonical_signature": _normalized_family_group_signature(strict_signature, action_value),
                 "relaxed_canonical_signature": _relaxed_family_signature(canonical_signature),
                 "family_id_value": _normalize_scalar(row.get(family_column)) if family_column is not None else None,
                 "member_count_value": _maybe_int(row.get("member_count")) or 1,
@@ -1970,11 +1979,21 @@ def _strict_family_signature(
 ) -> str | None:
     semantic_value = _normalized_signature_value(row.get(semantic_column)) if semantic_column is not None else None
     family_value = _normalized_signature_value(row.get(family_column)) if family_column is not None else None
-    if family_value is not None and not _looks_local_integer_id(family_value):
-        return family_value
     if semantic_value is not None:
         return semantic_value
+    if family_value is not None and not _looks_local_integer_id(family_value):
+        return family_value
     return None
+
+
+def _is_numeric_vector_signature(signature: str | None) -> bool:
+    if signature is None:
+        return False
+    try:
+        parsed = json.loads(signature)
+    except Exception:
+        return False
+    return isinstance(parsed, list) and bool(parsed) and all(isinstance(item, (int, float)) for item in parsed)
 
 
 def _family_id_to_group_signature(observations: list[dict[str, Any]]) -> dict[str, str]:

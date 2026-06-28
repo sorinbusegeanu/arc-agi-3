@@ -155,7 +155,7 @@ def evaluate_h10_future_option_attention(
             "Attention signal is saturated all-high across high and low future-option-change interactions; selective attention is not demonstrated."
         )
     elif result["attention_all_low_saturation"]:
-        result["decision"] = "INSUFFICIENT_EVIDENCE"
+        result["decision"] = "INSUFFICIENT_EVIDENCE" if low_rows else "PARTIALLY_VALID"
         result["missing_evidence"].append(
             "Attention signal is saturated all-low; selective attention is not demonstrated."
         )

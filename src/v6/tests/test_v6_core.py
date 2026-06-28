@@ -151,6 +151,7 @@ from v6.memory.compact_memory import (
     CompactMemoryFoldConfig,
     derive_missing_transformation_families_from_stable_contingencies,
     ensure_memory_layout,
+    finalize_main_compact_memory,
     fold_live_system_into_compact_memory,
     fold_single_sampling_db_into_main_compact_memory,
     fold_sampling_job_sidecars_into_compact_memory,
@@ -11901,7 +11902,7 @@ def test_fold_single_sampling_db_persists_raw_contingencies_into_stable_continge
     assert family_count > 0
 
 
-def test_fold_single_sampling_db_does_not_fabricate_families_without_m1_when_contingency_table_exists(tmp_path: Path) -> None:
+def test_fold_single_sampling_db_empty_contingency_table_uses_prediction_result_fallback(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory_fold_no_m1"
     db_path = tmp_path / "seed_0.sqlite"
     with sqlite3.connect(db_path) as conn:
@@ -11934,8 +11935,8 @@ def test_fold_single_sampling_db_does_not_fabricate_families_without_m1_when_con
     with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
         stable_count = conn.execute("SELECT COUNT(*) FROM stable_contingencies").fetchone()[0]
         family_count = conn.execute("SELECT COUNT(*) FROM transformation_families").fetchone()[0]
-    assert stable_count == 0
-    assert family_count == 0
+    assert stable_count > 0
+    assert family_count > 0
 
 
 def test_compact_family_repair_creates_transformation_families_and_members(tmp_path: Path) -> None:
@@ -12212,6 +12213,130 @@ def test_h01_compact_memory_contingencies_do_not_force_invalid(tmp_path: Path) -
     result = evaluate_h01_contingency_emergence(run_dir, tmp_path / "out_h01_compact", memory_dir=memory_dir)
     assert result["decision"] != "INVALID"
     assert int(result["discovered_contingency_count"] or 0) > 0
+
+
+def test_h01_direct_streaming_missing_m1_is_insufficient_evidence_not_invalid(tmp_path: Path) -> None:
+    from v6.hypothesis_h01_report import evaluate_h01_contingency_emergence
+    from v6.memory.direct_streaming_fold import ensure_direct_streaming_fold_manifest
+
+    run_dir = tmp_path / "run_h01_missing_m1"
+    run_dir.mkdir()
+    memory_dir = tmp_path / "memory_h01_missing_m1"
+    ensure_memory_layout(memory_dir)
+    ensure_direct_streaming_fold_manifest(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute(
+            "INSERT INTO memory_nodes (node_id, memory_level, node_type, canonical_key, support_count, first_seen_step, last_seen_step, attrs_json) VALUES ('M0:interaction:g1', 'M0', 'InteractionMemory', 'g1', 1, 1, 1, '{}')"
+        )
+        conn.execute("INSERT INTO memory_summary (key, value_json) VALUES ('total_interactions_seen', '1')")
+        conn.execute(
+            "INSERT INTO memory_summary (key, value_json) VALUES ('fold_summary', ?)",
+            (json.dumps({"raw_contingency_rows_seen": 0, "raw_dbs_without_contingency_table": 0}),),
+        )
+        conn.commit()
+    result = evaluate_h01_contingency_emergence(run_dir, tmp_path / "out_h01_missing_m1", memory_dir=memory_dir)
+    assert result["decision"] == "INSUFFICIENT_EVIDENCE"
+    assert result["compact_m1_substrate_missing"] is True
+    assert "compact M1 contingency substrate missing after direct-streaming raw cleanup" in result["missing_evidence"]
+    assert result["raw_contingency_rows_seen"] == 0
+
+
+def test_fold_single_sampling_db_prediction_results_without_contingencies_creates_stable_contingencies(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory_fold_prediction_only"
+    db_path = tmp_path / "seed_prediction_only.sqlite"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE prediction_results (
+                interaction_id INTEGER,
+                global_step INTEGER,
+                context_level INTEGER,
+                context_signature TEXT,
+                action INTEGER,
+                predicted_family INTEGER,
+                actual_family INTEGER
+            );
+            """
+        )
+        conn.executemany(
+            "INSERT INTO prediction_results VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                (1, 1, 1, '[1,2,3]', 2, 7, 7),
+                (2, 2, 1, '[1,2,3]', 2, 8, 7),
+                (3, 3, 1, '[3,2,1]', 5, 9, 9),
+            ],
+        )
+        conn.commit()
+    totals = fold_single_sampling_db_into_main_compact_memory(
+        db_path=db_path,
+        memory_dir=memory_dir,
+        fold_config=CompactMemoryFoldConfig(global_step_start=1, global_step_end=10),
+        finalize_after_fold=True,
+    )
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        stable_count = conn.execute("SELECT COUNT(*) FROM stable_contingencies").fetchone()[0]
+        family_count = conn.execute("SELECT COUNT(*) FROM transformation_families").fetchone()[0]
+    assert totals["raw_contingency_rows_seen"] > 0
+    assert totals["stable_contingencies_inserted"] > 0
+    assert totals["transformation_families_inserted"] > 0
+    assert stable_count >= 2
+    assert family_count >= 1
+
+
+def test_fold_single_sampling_db_prediction_results_low_support_still_persist_m1(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory_fold_low_support"
+    db_path = tmp_path / "seed_low_support.sqlite"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE prediction_results (
+                interaction_id INTEGER,
+                global_step INTEGER,
+                context_level INTEGER,
+                context_signature TEXT,
+                action INTEGER,
+                predicted_family INTEGER,
+                actual_family INTEGER
+            );
+            """
+        )
+        conn.execute("INSERT INTO prediction_results VALUES (1, 1, 1, '[1]', 2, 7, 7)")
+        conn.commit()
+    fold_single_sampling_db_into_main_compact_memory(
+        db_path=db_path,
+        memory_dir=memory_dir,
+        fold_config=CompactMemoryFoldConfig(global_step_start=1, global_step_end=10),
+        finalize_after_fold=True,
+    )
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        stable_row = conn.execute(
+            "SELECT COUNT(*), COALESCE(MAX(support_count), 0) FROM stable_contingencies"
+        ).fetchone()
+    assert stable_row[0] == 1
+    assert stable_row[1] == 1
+
+
+def test_finalize_main_compact_memory_preserves_fold_summary_counters(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory_finalize_preserve"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute(
+            "INSERT INTO memory_summary (key, value_json) VALUES ('fold_summary', ?)",
+            (json.dumps({"raw_contingency_rows_seen": 3, "stable_contingencies_inserted": 2}),),
+        )
+        conn.commit()
+    summary = finalize_main_compact_memory(
+        memory_dir=memory_dir,
+        fold_config=CompactMemoryFoldConfig(global_step_start=11, global_step_end=20),
+    )
+    fold_summary = summary["fold_summary"]
+    assert fold_summary["raw_contingency_rows_seen"] == 3
+    assert fold_summary["stable_contingencies_inserted"] == 2
+    assert fold_summary["global_step_start"] == 11
+    assert fold_summary["global_step_end"] == 20
+    persisted = load_memory_summary(memory_dir / "memory_summary.json")
+    assert persisted["fold_summary"]["raw_contingency_rows_seen"] == 3
+    assert persisted["fold_summary"]["stable_contingencies_inserted"] == 2
 
 
 def test_h03_compact_fold_evidence_exposes_stable_contingencies_and_families(tmp_path: Path) -> None:

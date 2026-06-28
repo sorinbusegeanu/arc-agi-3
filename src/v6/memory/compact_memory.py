@@ -231,12 +231,11 @@ def derive_missing_transformation_families_from_stable_contingencies(memory_dir:
                 if stability_values
                 else 0.0
             )
-            effect_text = str(members[0]["effect_signature"] or "unknown")
-            action_counts: dict[int, int] = {}
+            action_counts: dict[str, int] = {}
             for member in members:
-                action_key = int(member["action_value"] or 0)
+                action_key = str(member["action_value"] if member["action_value"] is not None else "unknown")
                 action_counts[action_key] = action_counts.get(action_key, 0) + 1
-            action_value = sorted(action_counts.items(), key=lambda item: (-int(item[1]), int(item[0])))[0][0] if action_counts else 0
+            action_value = sorted(action_counts.items(), key=lambda item: (-int(item[1]), str(item[0])))[0][0] if action_counts else "unknown"
             family_id = _stable_family_int_id(family_signature)
             effect_type = "compact_derived"
             action_group = str(action_value) if action_counts else "unknown"
@@ -546,8 +545,18 @@ def fold_single_sampling_db_into_main_compact_memory(
                 replay_conn=replay_conn,
                 paths=paths,
             )
+            existing_fold_summary: dict[str, Any] = {}
+            row = state_conn.execute("SELECT value_json FROM memory_summary WHERE key = 'fold_summary'").fetchone()
+            if row is not None and row[0] is not None:
+                try:
+                    payload = json.loads(row[0])
+                    if isinstance(payload, dict):
+                        existing_fold_summary = dict(payload)
+                except Exception:
+                    existing_fold_summary = {}
             summary.update(totals)
-            summary["fold_summary"] = dict(totals)
+            existing_fold_summary.update(dict(totals))
+            summary["fold_summary"] = existing_fold_summary
             summary["direct_streaming_fold"] = {
                 "db_path": str(sqlite_path),
                 "global_step_start": int(fold_config.global_step_start),
@@ -583,10 +592,22 @@ def finalize_main_compact_memory(
             replay_conn=replay_conn,
             paths=paths,
         )
-        summary["fold_summary"] = {
-            "global_step_start": int(fold_config.global_step_start),
-            "global_step_end": int(fold_config.global_step_end),
-        }
+        existing_fold_summary: dict[str, Any] = {}
+        row = state_conn.execute("SELECT value_json FROM memory_summary WHERE key = 'fold_summary'").fetchone()
+        if row is not None and row[0] is not None:
+            try:
+                payload = json.loads(row[0])
+                if isinstance(payload, dict):
+                    existing_fold_summary = dict(payload)
+            except Exception:
+                existing_fold_summary = {}
+        existing_fold_summary.update(
+            {
+                "global_step_start": int(fold_config.global_step_start),
+                "global_step_end": int(fold_config.global_step_end),
+            }
+        )
+        summary["fold_summary"] = existing_fold_summary
         _write_memory_summary_table(state_conn, summary)
         paths.summary_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
         state_conn.commit()
@@ -1857,6 +1878,20 @@ def _fold_single_db(
                     contradiction_key=None,
                     replay_id=None,
                 )
+        prediction_results_m1_fallback_rows = 0
+        if raw_contingency_rows_seen <= 0 and "prediction_results" in tables:
+            prediction_results_m1_fallback_rows = _fold_prediction_results_into_m1_substrate(
+                raw_conn=raw_conn,
+                state_conn=state_conn,
+                graph_conn=graph_conn,
+                fold_config=fold_config,
+                totals=totals,
+                game=game,
+                sampler=sampler,
+                seed=seed,
+                family_members_by_signature=family_members_by_signature,
+            )
+            raw_contingency_rows_seen += prediction_results_m1_fallback_rows
         totals["raw_contingency_rows_seen"] = int(totals.get("raw_contingency_rows_seen", 0) or 0) + raw_contingency_rows_seen
         if "memory_nodes" in tables:
             for row in raw_conn.execute("SELECT * FROM memory_nodes ORDER BY node_id ASC").fetchall():
@@ -2072,7 +2107,9 @@ def _fold_single_db(
                     contradiction_key=contradiction_key,
                     replay_id=None,
                 )
-            allow_prediction_family_fold = ("contingencies" not in tables) or raw_contingency_rows_seen > 0
+            allow_prediction_family_fold = prediction_results_m1_fallback_rows <= 0 and (
+                ("contingencies" not in tables) or raw_contingency_rows_seen > 0
+            )
             for family_signature, info in family_supports.items():
                 if not allow_prediction_family_fold:
                     continue
@@ -2597,6 +2634,149 @@ def _prediction_payload_by_interaction_id(raw_conn: sqlite3.Connection) -> dict[
         if current_error >= existing_error:
             by_interaction[interaction_id] = payload
     return by_interaction
+
+
+def _fold_prediction_results_into_m1_substrate(
+    *,
+    raw_conn: sqlite3.Connection,
+    state_conn: sqlite3.Connection,
+    graph_conn: sqlite3.Connection,
+    fold_config: CompactMemoryFoldConfig,
+    totals: dict[str, Any],
+    game: str,
+    sampler: str,
+    seed: int,
+    family_members_by_signature: dict[str, set[str]],
+) -> int:
+    rows = raw_conn.execute("SELECT * FROM prediction_results").fetchall()
+    if not rows:
+        return 0
+    grouped: dict[tuple[int, str, int, str], dict[str, Any]] = {}
+    for row in rows:
+        payload = dict(row)
+        actual_family = payload.get("actual_family")
+        if actual_family in (None, ""):
+            continue
+        family_signature = canonical_family_signature_from_raw_db(raw_conn, actual_family, payload)
+        context_level = int(payload.get("context_level") or 0)
+        context_signature = str(payload.get("context_signature") or payload.get("context_action") or "[]")
+        action = int(payload.get("action") or 0)
+        key = (context_level, context_signature, action, family_signature)
+        entry = grouped.setdefault(
+            key,
+            {
+                "support_count": 0,
+                "prediction_success_count": 0,
+                "first_step": None,
+                "last_step": None,
+            },
+        )
+        entry["support_count"] += 1
+        predicted_family = payload.get("predicted_family")
+        if predicted_family not in (None, ""):
+            predicted_signature = canonical_family_signature_from_raw_db(raw_conn, predicted_family, payload)
+            if predicted_signature == family_signature:
+                entry["prediction_success_count"] += 1
+        global_step = int(payload.get("global_step") or payload.get("interaction_id") or fold_config.global_step_end)
+        entry["first_step"] = global_step if entry["first_step"] is None else min(int(entry["first_step"]), global_step)
+        entry["last_step"] = global_step if entry["last_step"] is None else max(int(entry["last_step"]), global_step)
+    if not grouped:
+        return 0
+    contingency_rows_seen = 0
+    for index, ((context_level, context_signature, action, family_signature), info) in enumerate(sorted(grouped.items()), start=1):
+        support_count = int(info["support_count"] or 0)
+        prediction_attempt_count = support_count
+        prediction_success_count = int(info["prediction_success_count"] or 0)
+        prediction_accuracy = (
+            float(prediction_success_count) / float(prediction_attempt_count)
+            if prediction_attempt_count > 0
+            else None
+        )
+        canonical_key = canonicalize_context_action_effect(
+            context_signature=context_signature,
+            action=action,
+            effect_signature=family_signature,
+        )
+        _upsert_family_identity_map(state_conn, family_signature, stable_family_int_id(family_signature))
+        _upsert_stable_contingency(
+            state_conn,
+            canonical_key=canonical_key,
+            contingency_id=index,
+            game=game,
+            sampler=sampler,
+            context_level=context_level,
+            action=action,
+            effect_signature=family_signature,
+            support_count=support_count,
+            prediction_attempt_count=prediction_attempt_count,
+            prediction_success_count=prediction_success_count,
+            prediction_accuracy=prediction_accuracy,
+            prediction_error_before=None,
+            prediction_error_after=None,
+            normalized_contingency_key=normalized_contingency_identity(
+                context_level=context_level,
+                action=action,
+                effect_signature=family_signature,
+            ),
+            fold_config=fold_config,
+            stable_threshold=20,
+        )
+        totals["stable_contingencies_inserted"] = int(totals.get("stable_contingencies_inserted", 0) or 0) + 1
+        if support_count >= 20:
+            totals["stable_contingencies_added"] = int(totals.get("stable_contingencies_added", 0) or 0) + 1
+        family_members_by_signature.setdefault(family_signature, set()).add(canonical_key)
+        _upsert_transformation_family(
+            state_conn,
+            family_signature=family_signature,
+            support_count=support_count,
+            member_count=1,
+            first_seen=int(info["first_step"] or fold_config.global_step_start),
+            last_seen=int(info["last_step"] or fold_config.global_step_end),
+            stability_score=float(support_count) / 20.0,
+        )
+        totals["transformation_families_added"] = int(totals.get("transformation_families_added", 0) or 0) + 1
+        totals["transformation_families_inserted"] = int(totals.get("transformation_families_inserted", 0) or 0) + 1
+        _retain_example(
+            state_conn,
+            owner_type="contingency",
+            owner_id=canonical_key,
+            limit=fold_config.max_examples_per_contingency,
+            example_kind="first",
+            game=game,
+            sampler=sampler,
+            seed=seed,
+            global_step=int(info["last_step"] or fold_config.global_step_end),
+            priority_score=float(support_count),
+            compact_payload_json=json.dumps(
+                {
+                    "context_level": context_level,
+                    "context_signature": context_signature,
+                    "action": action,
+                    "family_signature": family_signature,
+                    "support_count": support_count,
+                    "prediction_attempt_count": prediction_attempt_count,
+                    "prediction_success_count": prediction_success_count,
+                    "prediction_accuracy": prediction_accuracy,
+                },
+                sort_keys=True,
+            ),
+        )
+        _upsert_observation_graph(
+            graph_conn,
+            fold_config=fold_config,
+            game=game,
+            sampler=sampler,
+            context_signature=context_signature,
+            action=action,
+            effect_signature=family_signature,
+            contingency_key=canonical_key,
+            family_signature=family_signature,
+            carrier_signature=None,
+            contradiction_key=None,
+            replay_id=None,
+        )
+        contingency_rows_seen += 1
+    return contingency_rows_seen
 
 
 def _context_level_from_raw(raw_conn: sqlite3.Connection, *, payload: dict[str, Any], family_id: Any) -> int:

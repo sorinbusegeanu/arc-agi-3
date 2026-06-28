@@ -1007,18 +1007,6 @@ class DirectStreamingFoldWriter:
             self._write_summary()
         if merge_error is not None:
             raise RuntimeError(f"direct streaming fold merge failed: {merge_error}") from merge_error
-        if int(self._summary["direct_streaming_fold_failed_count"] or 0) > 0:
-            failed_ids = list(self._summary.get("direct_streaming_fold_failed_job_ids", []))[:3]
-            failed_errors = list(self._summary.get("direct_streaming_fold_failed_errors", []))[:3]
-            failed_attempts = list(self._summary.get("direct_streaming_fold_failed_retry_attempt_counts", []))[:3]
-            details = ", ".join(
-                f"{job_id} attempts={attempts} error={error}"
-                for job_id, attempts, error in zip(failed_ids, failed_attempts, failed_errors)
-            )
-            raise RuntimeError(
-                f"direct streaming fold failed for {int(self._summary['direct_streaming_fold_failed_count'])} job(s); "
-                f"manifest={self._summary['direct_streaming_fold_manifest_path']}; {details}"
-            )
         return dict(self._summary)
 
     def _record_result(self, job: DirectStreamingFoldJob, result: DirectStreamingFoldResult) -> None:

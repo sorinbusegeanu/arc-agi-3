@@ -147,6 +147,25 @@ def _apply_h01_decision(
         )
 
 
+def _direct_streaming_missing_m1_substrate(result: dict[str, Any]) -> bool:
+    direct_streamed = bool((result.get("evidence_diagnostics") or {}).get("direct_streamed_manifest_exists"))
+    raw_db_count = int((result.get("evidence_diagnostics") or {}).get("raw_db_count", 0) or 0)
+    interaction_like = (
+        _gt(result.get("total_interaction_count"), 0)
+        or _gt(result.get("memory_record_count"), 0)
+        or _gt(result.get("memory_score_record_count"), 0)
+    )
+    stable_count = int(result.get("stable_contingencies_count") or result.get("stable_contingency_count") or 0)
+    raw_rows_seen = result.get("raw_contingency_rows_seen")
+    return (
+        direct_streamed
+        and raw_db_count == 0
+        and bool(interaction_like)
+        and stable_count == 0
+        and raw_rows_seen in (None, 0, 0.0)
+    )
+
+
 def evaluate_h01_contingency_emergence(run_dir: Path, output_dir: Path, *, memory_dir: Path | None = None) -> dict:
     run_dir = Path(run_dir)
     output_dir = Path(output_dir)
@@ -217,6 +236,16 @@ def evaluate_h01_contingency_emergence(run_dir: Path, output_dir: Path, *, memor
             result["scientific_conclusion"] = (
                 "H01 remains insufficiently evidenced after direct-streaming raw cleanup because compact memory does not expose enough interaction or contingency rows."
             )
+        elif _direct_streaming_missing_m1_substrate(result):
+            result["decision"] = "INSUFFICIENT_EVIDENCE"
+            result["scientific_conclusion"] = (
+                "H01 remains insufficiently evidenced after direct-streaming raw cleanup because compact memory is missing the M1 contingency substrate."
+            )
+            result["compact_m1_substrate_missing"] = True
+            if "compact M1 contingency substrate missing after direct-streaming raw cleanup" not in result["missing_evidence"]:
+                result["missing_evidence"].append(
+                    "compact M1 contingency substrate missing after direct-streaming raw cleanup"
+                )
         else:
             _apply_h01_decision(
                 result,
@@ -316,6 +345,16 @@ def evaluate_h01_contingency_emergence(run_dir: Path, output_dir: Path, *, memor
         if db_metrics.get("cross_game_contingency_presence") is not None
         else compact_metrics.get("cross_game_contingency_presence")
     )
+    for key in (
+        "stable_contingencies_count",
+        "transformation_families_count",
+        "family_members_count",
+        "raw_contingency_rows_seen",
+        "raw_dbs_without_contingency_table",
+        "compact_m1_substrate_missing",
+    ):
+        if result.get(key) is None:
+            result[key] = compact_metrics.get(key)
     result["cross_game_contingency_count"] = (
         result.get("cross_game_contingency_count")
         or compact_metrics.get("cross_game_contingency_count")
@@ -388,6 +427,12 @@ def evaluate_h01_contingency_emergence(run_dir: Path, output_dir: Path, *, memor
             result["missing_evidence"].append(
                 "Direct-streaming raw cleanup removed raw DBs and compact memory does not yet expose enough H01 contingency evidence."
             )
+    if _direct_streaming_missing_m1_substrate(result):
+        result["compact_m1_substrate_missing"] = True
+        if "compact M1 contingency substrate missing after direct-streaming raw cleanup" not in result["missing_evidence"]:
+            result["missing_evidence"].append(
+                "compact M1 contingency substrate missing after direct-streaming raw cleanup"
+            )
 
     if interactions_present and contingencies_present:
         result["evidence_for"].append(
@@ -417,6 +462,11 @@ def evaluate_h01_contingency_emergence(run_dir: Path, output_dir: Path, *, memor
         signal_present=bool(signal_present),
         report_has_runs=bool(report.get("runs")),
     )
+    if _direct_streaming_missing_m1_substrate(result):
+        result["decision"] = "INSUFFICIENT_EVIDENCE"
+        result["scientific_conclusion"] = (
+            "H01 remains insufficiently evidenced after direct-streaming raw cleanup because compact memory is missing the M1 contingency substrate."
+        )
 
     _finalize_h01_result(result, output_dir)
     return result
@@ -446,6 +496,7 @@ def _extract_compact_memory_metrics(memory_dir: Path) -> dict[str, Any]:
         ).fetchone()
         interaction_count = 0
         raw_contingency_rows_seen = None
+        raw_dbs_without_contingency_table = None
         if summary_row is not None and summary_row[0] is not None:
             try:
                 interaction_count = int(json.loads(summary_row[0]))
@@ -462,8 +513,10 @@ def _extract_compact_memory_metrics(memory_dir: Path) -> dict[str, Any]:
                 fold_summary = json.loads(fold_summary_row[0])
                 if isinstance(fold_summary, dict):
                     raw_contingency_rows_seen = fold_summary.get("raw_contingency_rows_seen")
+                    raw_dbs_without_contingency_table = fold_summary.get("raw_dbs_without_contingency_table")
             except Exception:
                 raw_contingency_rows_seen = None
+                raw_dbs_without_contingency_table = None
         replay_queue_count = None
         if replay_queue.exists():
             with sqlite3.connect(replay_queue) as replay_conn:
@@ -507,6 +560,14 @@ def _extract_compact_memory_metrics(memory_dir: Path) -> dict[str, Any]:
             "transformation_families_count": transformation_families_count,
             "family_members_count": family_members_count,
             "raw_contingency_rows_seen": raw_contingency_rows_seen,
+            "raw_dbs_without_contingency_table": raw_dbs_without_contingency_table,
+            "compact_m1_substrate_missing": bool(
+                discovered_count == 0
+                and (
+                    transformation_families_count > 0
+                    or (memory_record_count or memory_score_record_count or interaction_count) > 0
+                )
+            ),
             "per_game_contingency_counts": {str(key): int(value) for key, value in per_game.items()},
             "per_sampler_contingency_counts": {str(key): int(value) for key, value in per_sampler.items()},
             "mean_prediction_accuracy": _mean_or_none(prediction_accuracy_values),
@@ -896,6 +957,26 @@ def _prediction_metrics_from_prediction_results(connection: sqlite3.Connection) 
 
 
 def _finalize_h01_result(result: dict[str, Any], output_dir: Path) -> None:
+    result["core_metrics"] = {
+        key: result.get(key)
+        for key in (
+            "total_interaction_count",
+            "memory_record_count",
+            "contingency_candidate_count",
+            "discovered_contingency_count",
+            "stable_contingency_count",
+            "stable_contingencies_count",
+            "transformation_families_count",
+            "family_members_count",
+            "raw_contingency_rows_seen",
+            "raw_dbs_without_contingency_table",
+            "compact_m1_substrate_missing",
+            "mean_prediction_accuracy",
+            "mean_context_lift",
+            "cross_game_contingency_count",
+            "cross_sampler_contingency_count",
+        )
+    }
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / H01_JSON_NAME).write_text(json.dumps(result, indent=2), encoding="utf-8")
     text = _format_h01_text(result)

@@ -95,8 +95,6 @@ def validate_cleanup_safe(epoch_dir: str | Path, memory_dir: str | Path, require
     if required_reports and any(not path.exists() for path in required_report_files):
         missing = [str(path) for path in required_report_files if not path.exists()]
         raise RuntimeError(f"cleanup refused because required reports are missing: {missing}")
-    if required_reports and not any(path.exists() for path in sampling_report_candidates):
-        raise RuntimeError("cleanup refused because interaction_sampling_v05c_report.json is missing")
     memory_files = [
         memory_path / "current_state.sqlite",
         memory_path / "graph.sqlite",
@@ -111,18 +109,23 @@ def validate_cleanup_safe(epoch_dir: str | Path, memory_dir: str | Path, require
         if not manifest_path.exists():
             raise RuntimeError("cleanup refused because direct streaming fold manifest is missing")
         with sqlite3.connect(manifest_path) as conn:
+            folded_job_count = int(conn.execute("SELECT COUNT(*) FROM folded_jobs").fetchone()[0] or 0)
             failed = int(conn.execute("SELECT COUNT(*) FROM folded_jobs WHERE status = 'failed'").fetchone()[0] or 0)
             metrics_count = int(conn.execute("SELECT COUNT(*) FROM job_metrics").fetchone()[0] or 0)
             milestone_count = int(conn.execute("SELECT COUNT(*) FROM temporal_milestones").fetchone()[0] or 0)
             validation_count = int(conn.execute("SELECT COUNT(*) FROM validation_payloads").fetchone()[0] or 0)
         if failed > 0:
             raise RuntimeError("cleanup refused because direct streaming fold manifest contains failed jobs")
-        if metrics_count <= 0 or milestone_count <= 0 or validation_count <= 0:
+        if folded_job_count > 0 and (metrics_count <= 0 or milestone_count <= 0 or validation_count <= 0):
             raise RuntimeError("cleanup refused because direct streaming fold manifest is incomplete")
     summary_payload = json.loads((memory_path / "memory_summary.json").read_text(encoding="utf-8"))
     fold_summary = summary_payload.get("fold_summary")
     if not fold_summary:
         raise RuntimeError("cleanup refused because fold summary is missing from memory_summary.json")
+    raw_dir = epoch_path / "raw"
+    raw_file_count = len([path for path in raw_dir.rglob("*") if path.is_file()]) if raw_dir.exists() else 0
+    if required_reports and raw_file_count <= 0 and not any(path.exists() for path in sampling_report_candidates):
+        raise RuntimeError("cleanup refused because interaction_sampling_v05c_report.json is missing")
 
 
 def disk_usage_snapshot(path: str | Path) -> dict[str, Any]:

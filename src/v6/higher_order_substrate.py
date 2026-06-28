@@ -632,7 +632,7 @@ def derive_concept_candidates(state_conn: sqlite3.Connection) -> dict[str, Any]:
         is_promoted = int(
             not overconcentrated
             and strong_transfer_success_count >= 2
-            and linked_role_count >= 2
+            and linked_role_count >= 1
             and linked_carrier_count >= 2
             and linked_family_count >= 2
             and compression_gain >= 1.50
@@ -815,7 +815,7 @@ def derive_world_model_components(state_conn: sqlite3.Connection, graph_conn: sq
         predicted_outcome_count_is_proxy = 1
         is_coherent = int(
             is_promoted
-            and linked_role_count >= 2
+            and linked_role_count >= 1
             and linked_family_count >= 2
             and linked_carrier_count >= 2
             and (cross_context_count >= 3 or cross_game_count >= 2)

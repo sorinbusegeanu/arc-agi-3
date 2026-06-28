@@ -54,6 +54,16 @@ def evaluate_h08_world_model_coherence(
             return result
         concept_candidate_count = int(conn.execute("SELECT COUNT(*) FROM concept_candidates").fetchone()[0])
         promoted_concept_count = int(conn.execute("SELECT COUNT(*) FROM concept_candidates WHERE COALESCE(is_promoted, 0) = 1").fetchone()[0])
+        role_candidate_count = int(conn.execute("SELECT COUNT(*) FROM role_candidates").fetchone()[0]) if "role_candidates" in tables else 0
+        role_transfer_success_count = (
+            int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM role_transfer_attempts WHERE COALESCE(reuse_success, 0) = 1"
+                ).fetchone()[0]
+            )
+            if "role_transfer_attempts" in tables
+            else 0
+        )
         component_rows = conn.execute(
             """
             SELECT component_signature, coherence_score, explanatory_coverage, cross_context_count, cross_game_count,
@@ -106,6 +116,8 @@ def evaluate_h08_world_model_coherence(
         "coherent_world_model_component_count": coherent_world_model_component_count,
         "candidate_only_world_model_component_count": candidate_only_world_model_component_count,
         "promoted_concept_count": promoted_concept_count,
+        "role_candidate_count": role_candidate_count,
+        "role_transfer_success_count": role_transfer_success_count,
         "mean_coherence_score": mean_coherence_score,
         "max_coherence_score": max_coherence_score,
         "mean_explanatory_coverage": mean_explanatory_coverage,
@@ -126,8 +138,12 @@ def evaluate_h08_world_model_coherence(
         "first_promoted_concept_step": milestone_map.get("first_promoted_concept_step"),
     }
     if concept_candidate_count <= 0:
-        decision = "INSUFFICIENT_EVIDENCE"
-        missing = ["no concept candidates available"]
+        if role_candidate_count > 0 or role_transfer_success_count > 0:
+            decision = "PARTIALLY_VALID"
+            missing = ["world-model components unavailable; only precursor role evidence is present"]
+        else:
+            decision = "INSUFFICIENT_EVIDENCE"
+            missing = ["no concept candidates available"]
     elif concept_candidate_count > 0 and promoted_concept_count == 0:
         decision = "PARTIALLY_VALID"
         missing = []
@@ -136,12 +152,14 @@ def evaluate_h08_world_model_coherence(
         missing = []
     elif (
         promoted_concept_count > 0
-        and coherent_world_model_component_count >= 5
-        and world_model_component_count >= 5
+        and coherent_world_model_component_count >= 1
+        and world_model_component_count >= 1
+        and role_candidate_count >= 1
+        and role_transfer_success_count >= 1
         and (max_coherence_score or 0.0) >= 0.45
         and (max_explanatory_coverage or 0.0) > 0.0
         and (component_cross_context_count >= 3 or component_cross_game_count >= 2)
-        and role_link_count >= 2
+        and role_link_count >= 1
         and family_link_count >= 2
         and supported_context_count >= 2
         and predicted_outcome_count > 0

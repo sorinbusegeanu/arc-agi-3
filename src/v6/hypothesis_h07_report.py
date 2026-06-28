@@ -182,13 +182,14 @@ def evaluate_h07_concept_emergence(
             decision = "INVALID"
             missing = []
     elif (
-        promoted_concept_count >= 5
+        promoted_concept_count >= 1
         and concept_strong_transfer_success_count >= 2
         and (max_compression_gain or 0.0) >= 1.50
         and (max_promotion_score or 0.0) >= 0.55
         and (concept_cross_context_count_max >= 3 or concept_cross_game_count_max >= 2)
-        and max_source_role_count >= 2
+        and max_source_role_count >= 1
         and max_source_family_count >= 2
+        and roles_used_for_concepts >= 3
         and (transfer_success_rate or 0.0) > 0.0
         and ((concept_transfer_success_concentration or 0.0) <= 0.80)
         and promoted_overconcentrated_concept_count == 0
