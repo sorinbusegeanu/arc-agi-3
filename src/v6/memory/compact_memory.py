@@ -84,6 +84,269 @@ def ensure_memory_layout(memory_dir: str | Path) -> CompactMemoryPaths:
     return paths
 
 
+def derive_missing_transformation_families_from_stable_contingencies(memory_dir: str | Path) -> dict[str, Any]:
+    memory_dir = Path(memory_dir)
+    current_state_path = memory_dir / "current_state.sqlite"
+    graph_path = memory_dir / "graph.sqlite"
+    if not current_state_path.exists():
+        return {
+            "compact_family_repair_used": False,
+            "compact_family_repair_reason": "current_state_missing",
+            "stable_contingencies_count": 0,
+            "transformation_families_before": 0,
+            "transformation_families_after": 0,
+            "family_members_before": 0,
+            "family_members_after": 0,
+            "compact_family_repair_family_count": 0,
+            "compact_family_repair_member_count": 0,
+            "compact_family_repair_graph_node_count": 0,
+            "compact_family_repair_graph_edge_count": 0,
+            "compact_family_repair_error": None,
+        }
+    paths = ensure_memory_layout(memory_dir)
+    summary = {
+        "compact_family_repair_used": False,
+        "compact_family_repair_reason": "unknown",
+        "stable_contingencies_count": 0,
+        "transformation_families_before": 0,
+        "transformation_families_after": 0,
+        "family_members_before": 0,
+        "family_members_after": 0,
+        "compact_family_repair_family_count": 0,
+        "compact_family_repair_member_count": 0,
+        "compact_family_repair_graph_node_count": 0,
+        "compact_family_repair_graph_edge_count": 0,
+        "compact_family_repair_error": None,
+    }
+    with sqlite3.connect(paths.current_state) as state_conn:
+        configure_compact_sqlite_connection(state_conn, write=True)
+        state_conn.row_factory = sqlite3.Row
+        stable_count = int(state_conn.execute("SELECT COUNT(*) FROM stable_contingencies").fetchone()[0])
+        family_count = int(state_conn.execute("SELECT COUNT(*) FROM transformation_families").fetchone()[0])
+        family_members_before = int(state_conn.execute("SELECT COUNT(*) FROM family_members").fetchone()[0])
+        summary["stable_contingencies_count"] = stable_count
+        summary["transformation_families_before"] = family_count
+        summary["family_members_before"] = family_members_before
+        if stable_count <= 0:
+            summary["compact_family_repair_reason"] = "no_stable_contingencies"
+            summary["transformation_families_after"] = family_count
+            summary["family_members_after"] = family_members_before
+            _write_family_repair_summary(state_conn, summary)
+            state_conn.commit()
+            return summary
+        if family_count > 0 and family_members_before > 0:
+            summary["compact_family_repair_reason"] = "family_substrate_already_present"
+            summary["transformation_families_after"] = family_count
+            summary["family_members_after"] = family_members_before
+            _write_family_repair_summary(state_conn, summary)
+            state_conn.commit()
+            return summary
+        rows = state_conn.execute(
+            """
+            SELECT
+                canonical_key,
+                COALESCE(effect_signature, normalized_contingency_key, canonical_key) AS family_signature,
+                COALESCE(action, 0) AS action_value,
+                COALESCE(effect_signature, 'unknown') AS effect_signature,
+                COALESCE(game, 'unknown') AS game_name,
+                COALESCE(sampler, 'unknown') AS sampler_name,
+                COALESCE(support_count, 0) AS support_count,
+                COALESCE(first_seen_global_step, 0) AS first_seen_global_step,
+                COALESCE(last_seen_global_step, 0) AS last_seen_global_step,
+                COALESCE(stability_score, 0.0) AS stability_score
+            FROM stable_contingencies
+            ORDER BY canonical_key ASC
+            """
+        ).fetchall()
+        grouped: dict[str, list[sqlite3.Row]] = {}
+        for row in rows:
+            grouped.setdefault(str(row["family_signature"]), []).append(row)
+        inserted_families = 0
+        inserted_members = 0
+        for family_signature in sorted(grouped):
+            members = grouped[family_signature]
+            support_total = sum(int(row["support_count"] or 0) for row in members)
+            member_count = len(members)
+            first_seen = min(int(row["first_seen_global_step"] or 0) for row in members)
+            last_seen = max(int(row["last_seen_global_step"] or 0) for row in members)
+            stability_values = [float(row["stability_score"] or 0.0) for row in members]
+            stability_score = (
+                (sum(stability_values) / len(stability_values))
+                if stability_values
+                else 0.0
+            )
+            effect_text = str(members[0]["effect_signature"] or "unknown")
+            action_counts: dict[int, int] = {}
+            for member in members:
+                action_key = int(member["action_value"] or 0)
+                action_counts[action_key] = action_counts.get(action_key, 0) + 1
+            action_value = sorted(action_counts.items(), key=lambda item: (-int(item[1]), int(item[0])))[0][0] if action_counts else 0
+            family_id = _stable_family_int_id(family_signature)
+            effect_type = "compact_derived"
+            action_group = str(action_value) if action_counts else "unknown"
+            polarity = "unknown"
+            state_conn.execute(
+                """
+                INSERT INTO transformation_families (
+                    family_id, canonical_signature, relaxed_signature, effect_type, action_group, polarity,
+                    support_count, member_count, first_seen_global_step, last_seen_global_step, stability_score
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(canonical_signature) DO UPDATE SET
+                    support_count = MAX(transformation_families.support_count, excluded.support_count),
+                    member_count = MAX(transformation_families.member_count, excluded.member_count),
+                    first_seen_global_step = MIN(transformation_families.first_seen_global_step, excluded.first_seen_global_step),
+                    last_seen_global_step = MAX(transformation_families.last_seen_global_step, excluded.last_seen_global_step),
+                    stability_score = MAX(transformation_families.stability_score, excluded.stability_score)
+                """,
+                (
+                    family_id,
+                    family_signature,
+                    family_signature,
+                    effect_type,
+                    action_group,
+                    polarity,
+                    support_total,
+                    member_count,
+                    first_seen,
+                    last_seen,
+                    stability_score,
+                ),
+            )
+            inserted_families += 1
+            for member in members:
+                state_conn.execute(
+                    """
+                    INSERT INTO family_members (
+                        family_signature, contingency_key, support_count, first_seen_global_step, last_seen_global_step
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(family_signature, contingency_key) DO UPDATE SET
+                        support_count = MAX(family_members.support_count, excluded.support_count),
+                        first_seen_global_step = MIN(family_members.first_seen_global_step, excluded.first_seen_global_step),
+                        last_seen_global_step = MAX(family_members.last_seen_global_step, excluded.last_seen_global_step)
+                    """,
+                    (
+                        family_signature,
+                        str(member["canonical_key"]),
+                        int(member["support_count"] or 0),
+                        int(member["first_seen_global_step"] or 0),
+                        int(member["last_seen_global_step"] or 0),
+                    ),
+                )
+                inserted_members += 1
+        contingency_to_family = {
+            str(row["contingency_key"]): str(row["family_signature"])
+            for row in state_conn.execute(
+                "SELECT family_signature, contingency_key FROM family_members ORDER BY family_signature ASC, contingency_key ASC"
+            ).fetchall()
+        }
+        carrier_contingency_rows = state_conn.execute(
+            """
+            SELECT carrier_signature, linked_key, support_count, first_seen_global_step, last_seen_global_step
+            FROM carrier_links
+            WHERE linked_type = 'contingency'
+            ORDER BY carrier_signature ASC, linked_key ASC
+            """
+        ).fetchall()
+        for row in carrier_contingency_rows:
+            family_signature = contingency_to_family.get(str(row["linked_key"]))
+            if family_signature is None:
+                continue
+            state_conn.execute(
+                """
+                INSERT INTO carrier_links (
+                    carrier_signature, linked_type, linked_key, support_count, first_seen_global_step, last_seen_global_step
+                ) VALUES (?, 'family', ?, ?, ?, ?)
+                ON CONFLICT(carrier_signature, linked_type, linked_key) DO UPDATE SET
+                    support_count = MAX(carrier_links.support_count, excluded.support_count),
+                    first_seen_global_step = MIN(carrier_links.first_seen_global_step, excluded.first_seen_global_step),
+                    last_seen_global_step = MAX(carrier_links.last_seen_global_step, excluded.last_seen_global_step)
+                """,
+                (
+                    str(row["carrier_signature"]),
+                    family_signature,
+                    int(row["support_count"] or 0),
+                    int(row["first_seen_global_step"] or 0),
+                    int(row["last_seen_global_step"] or 0),
+                ),
+            )
+        transformation_families_after = int(state_conn.execute("SELECT COUNT(*) FROM transformation_families").fetchone()[0])
+        family_members_after = int(state_conn.execute("SELECT COUNT(*) FROM family_members").fetchone()[0])
+        summary.update(
+            {
+                "compact_family_repair_used": inserted_families > 0 or inserted_members > 0,
+                "compact_family_repair_reason": (
+                    "repaired_from_stable_contingencies"
+                    if inserted_families > 0 or inserted_members > 0
+                    else "family_substrate_already_present"
+                ),
+                "transformation_families_after": transformation_families_after,
+                "family_members_after": family_members_after,
+                "compact_family_repair_family_count": max(0, transformation_families_after - family_count),
+                "compact_family_repair_member_count": max(0, family_members_after - family_members_before),
+            }
+        )
+        _write_family_repair_summary(state_conn, summary)
+        state_conn.commit()
+    try:
+        with sqlite3.connect(paths.graph) as graph_conn:
+            configure_compact_sqlite_connection(graph_conn, write=True)
+            graph_conn.row_factory = sqlite3.Row
+            graph_node_count = 0
+            graph_edge_count = 0
+            for family_signature, members in grouped.items():
+                family_node = "M2:family:" + sha1(family_signature.encode("utf-8")).hexdigest()[:20]
+                graph_conn.execute(
+                    """
+                    INSERT INTO graph_nodes (
+                        node_id, node_type, canonical_key, first_seen_global_step, last_seen_global_step, support_count
+                    ) VALUES (?, 'TransformationFamily', ?, ?, ?, ?)
+                    ON CONFLICT(node_id) DO UPDATE SET
+                        first_seen_global_step = MIN(graph_nodes.first_seen_global_step, excluded.first_seen_global_step),
+                        last_seen_global_step = MAX(graph_nodes.last_seen_global_step, excluded.last_seen_global_step),
+                        support_count = MAX(graph_nodes.support_count, excluded.support_count)
+                    """,
+                    (
+                        family_node,
+                        family_signature,
+                        min(int(row["first_seen_global_step"] or 0) for row in members),
+                        max(int(row["last_seen_global_step"] or 0) for row in members),
+                        sum(int(row["support_count"] or 0) for row in members),
+                    ),
+                )
+                graph_node_count += 1
+                for member in members:
+                    contingency_key = str(member["canonical_key"])
+                    contingency_node = "M1:contingency:" + sha1(contingency_key.encode("utf-8")).hexdigest()[:20]
+                    edge_id = sha1(f"{contingency_node}|{family_node}|supports".encode("utf-8")).hexdigest()[:24]
+                    graph_conn.execute(
+                        """
+                        INSERT INTO graph_edges (
+                            edge_id, source_node_id, target_node_id, edge_type, first_seen_global_step, last_seen_global_step, support_count, weight
+                        ) VALUES (?, ?, ?, 'supports', ?, ?, ?, 1.0)
+                        ON CONFLICT(edge_id) DO UPDATE SET
+                            first_seen_global_step = MIN(graph_edges.first_seen_global_step, excluded.first_seen_global_step),
+                            last_seen_global_step = MAX(graph_edges.last_seen_global_step, excluded.last_seen_global_step),
+                            support_count = MAX(graph_edges.support_count, excluded.support_count),
+                            weight = MAX(graph_edges.weight, excluded.weight)
+                        """,
+                        (
+                            edge_id,
+                            contingency_node,
+                            family_node,
+                            int(member["first_seen_global_step"] or 0),
+                            int(member["last_seen_global_step"] or 0),
+                            int(member["support_count"] or 0),
+                        ),
+                    )
+                    graph_edge_count += 1
+            graph_conn.commit()
+            summary["compact_family_repair_graph_node_count"] = graph_node_count
+            summary["compact_family_repair_graph_edge_count"] = graph_edge_count
+    except Exception as exc:
+        summary["compact_family_repair_error"] = str(exc)
+    return summary
+
+
 def fold_epoch_raw_into_compact_memory(
     *,
     epoch_raw_dir: str | Path,
@@ -2789,6 +3052,42 @@ def _count_rows(connection: sqlite3.Connection, table: str) -> int:
         return int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
     except sqlite3.DatabaseError:
         return 0
+
+
+def _repair_family_effect_type(effect_text: str) -> str:
+    lowered = str(effect_text or "unknown").lower()
+    if any(token in lowered for token in ("negative", "restrict", "collapse", "game_over")):
+        return "negative_change"
+    if any(token in lowered for token in ("positive", "expand", "enable", "win")):
+        return "positive_change"
+    if any(token in lowered for token in ("preserve", "stable", "neutral", "no_change")):
+        return "no_change"
+    return "mixed_change"
+
+
+def _repair_family_polarity(effect_text: str) -> str:
+    lowered = str(effect_text or "unknown").lower()
+    if any(token in lowered for token in ("negative", "restrict", "collapse", "game_over")):
+        return "negative"
+    if any(token in lowered for token in ("positive", "expand", "enable", "win")):
+        return "positive"
+    return "mixed"
+
+
+def _write_family_repair_summary(connection: sqlite3.Connection, summary: dict[str, Any]) -> None:
+    for key, value in summary.items():
+        connection.execute(
+            """
+            INSERT INTO memory_summary (key, value_json)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json
+            """,
+            (str(key), json.dumps(value)),
+        )
+
+
+def _stable_family_int_id(canonical_signature: str) -> int:
+    return int(sha1(str(canonical_signature).encode("utf-8")).hexdigest()[:12], 16) % 2_000_000_000
 
 
 def _safe_scalar(connection: sqlite3.Connection, query: str) -> int:

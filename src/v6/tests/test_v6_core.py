@@ -11842,6 +11842,63 @@ def test_h03_compact_derives_family_counts_from_stable_contingencies(tmp_path: P
     assert result["transformation_families_count"] >= 1
 
 
+def test_compact_family_repair_creates_transformation_families_and_members(tmp_path: Path) -> None:
+    from v6.memory.compact_memory import derive_missing_transformation_families_from_stable_contingencies
+
+    memory_dir = tmp_path / "memory_h03_repair"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute("INSERT INTO stable_contingencies (canonical_key, game, sampler, context_level, action, effect_signature, support_count, first_seen_global_step, last_seen_global_step, stability_score) VALUES ('c1', 'g1', 's1', 1, 1, 'e1', 10, 1, 2, 0.8)")
+        conn.execute("INSERT INTO stable_contingencies (canonical_key, game, sampler, context_level, action, effect_signature, support_count, first_seen_global_step, last_seen_global_step, stability_score) VALUES ('c2', 'g1', 's1', 1, 1, 'e1', 12, 2, 3, 0.9)")
+        conn.commit()
+    summary = derive_missing_transformation_families_from_stable_contingencies(memory_dir)
+    assert summary["compact_family_repair_used"] is True
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        family_count = conn.execute("SELECT COUNT(*) FROM transformation_families").fetchone()[0]
+        member_count = conn.execute("SELECT COUNT(*) FROM family_members").fetchone()[0]
+    assert family_count >= 1
+    assert member_count == 2
+
+
+def test_compact_family_repair_is_idempotent(tmp_path: Path) -> None:
+    from v6.memory.compact_memory import derive_missing_transformation_families_from_stable_contingencies
+
+    memory_dir = tmp_path / "memory_h03_repair_idempotent"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute("INSERT INTO stable_contingencies (canonical_key, game, sampler, context_level, action, effect_signature, support_count, first_seen_global_step, last_seen_global_step, stability_score) VALUES ('c1', 'g1', 's1', 1, 1, 'e1', 10, 1, 2, 0.8)")
+        conn.execute("INSERT INTO stable_contingencies (canonical_key, game, sampler, context_level, action, effect_signature, support_count, first_seen_global_step, last_seen_global_step, stability_score) VALUES ('c2', 'g1', 's1', 1, 1, 'e1', 12, 2, 3, 0.9)")
+        conn.commit()
+    first = derive_missing_transformation_families_from_stable_contingencies(memory_dir)
+    second = derive_missing_transformation_families_from_stable_contingencies(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        family_count = conn.execute("SELECT COUNT(*) FROM transformation_families").fetchone()[0]
+        member_count = conn.execute("SELECT COUNT(*) FROM family_members").fetchone()[0]
+    assert first["compact_family_repair_used"] is True
+    assert second["compact_family_repair_used"] is False
+    assert second["compact_family_repair_reason"] == "family_substrate_already_present"
+    assert family_count >= 1
+    assert member_count == 2
+
+
+def test_compact_family_repair_enables_role_links_with_family(tmp_path: Path) -> None:
+    from v6.higher_order_substrate import derive_higher_order_memory
+    from v6.memory.compact_memory import derive_missing_transformation_families_from_stable_contingencies
+
+    memory_dir = tmp_path / "memory_h03_role_repair"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute("INSERT INTO stable_contingencies (canonical_key, game, sampler, context_level, action, effect_signature, support_count, first_seen_global_step, last_seen_global_step, stability_score) VALUES ('c1', 'g1', 's1', 1, 1, 'e1', 10, 1, 2, 0.8)")
+        conn.execute("INSERT INTO carrier_candidates (carrier_id, carrier_signature, carrier_source, support_count, linked_family_count, first_seen_global_step, last_seen_global_step, stability_score, is_emergent) VALUES ('id1', 'carrierA', 'object', 4, 0, 1, 2, 0.8, 1)")
+        conn.execute("INSERT INTO carrier_links (carrier_signature, linked_type, linked_key, support_count, first_seen_global_step, last_seen_global_step) VALUES ('carrierA', 'contingency', 'c1', 1, 1, 2)")
+        conn.commit()
+    derive_missing_transformation_families_from_stable_contingencies(memory_dir)
+    derive_higher_order_memory(memory_dir=memory_dir, run_dir=None)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        family_role_links = conn.execute("SELECT COUNT(*) FROM role_links WHERE linked_type = 'family'").fetchone()[0]
+    assert family_role_links > 0
+
+
 def test_h03_family_prediction_lift_available_and_non_negative(tmp_path: Path) -> None:
     from v6.hypothesis_h03_report import evaluate_h03_transformation_family_formation
 
@@ -11964,6 +12021,48 @@ def test_h07_reports_role_skip_reasons_when_concepts_zero(tmp_path: Path) -> Non
     assert result["concept_candidate_count"] == 0
     assert result["roles_skipped_missing_family_links"] > 0
     assert result["decision"] == "INSUFFICIENT_EVIDENCE"
+    txt = (tmp_path / "h07" / "h07_concept_emergence_report.txt").read_text(encoding="utf-8")
+    assert "roles skipped missing family links:" in txt
+
+
+def test_h07_after_compact_family_repair_reports_remaining_blocker_not_missing_family(tmp_path: Path) -> None:
+    from v6.hypothesis_h07_report import evaluate_h07_concept_emergence
+    from v6.memory.compact_memory import derive_missing_transformation_families_from_stable_contingencies
+
+    memory_dir = tmp_path / "memory_h07_repaired"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute("INSERT INTO stable_contingencies (canonical_key, game, sampler, context_level, action, effect_signature, support_count, first_seen_global_step, last_seen_global_step, stability_score) VALUES ('c1', 'g1', 's1', 1, 1, 'e1', 10, 1, 2, 0.8)")
+        conn.execute("INSERT INTO carrier_candidates (carrier_id, carrier_signature, carrier_source, support_count, linked_family_count, first_seen_global_step, last_seen_global_step, stability_score, is_emergent) VALUES ('id1', 'carrierA', 'object', 4, 0, 1, 2, 0.8, 1)")
+        conn.execute("INSERT INTO carrier_links (carrier_signature, linked_type, linked_key, support_count, first_seen_global_step, last_seen_global_step) VALUES ('carrierA', 'contingency', 'c1', 1, 1, 2)")
+        conn.execute("INSERT INTO role_transfer_attempts (attempt_id, role_signature, transfer_kind, source_scope_type, source_scope_key, target_scope_type, target_scope_key, target_carrier_signature, predicted_role_signature, observed_role_signature, similarity_score, transfer_score, reuse_success, failure_reason, best_margin, source_carrier_count, candidate_role_count, first_seen_global_step, last_seen_global_step) VALUES ('1', 'placeholder', 'k', 'game', 'g1', 'context', 'ctx', 'carrierA', 'r2', 'r2', 0.8, 0.8, 1, NULL, 0.2, 2, 2, 1, 2)")
+        conn.commit()
+    derive_missing_transformation_families_from_stable_contingencies(memory_dir)
+    result = evaluate_h07_concept_emergence(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h07_repaired", already_derived=False)
+    assert result["roles_skipped_missing_family_links"] == 0
+
+
+def test_h03_uses_repaired_compact_evidence_without_raw_dbs(tmp_path: Path) -> None:
+    from v6.hypothesis_h03_report import evaluate_h03_transformation_family_formation
+    from v6.memory.compact_memory import derive_missing_transformation_families_from_stable_contingencies
+    from v6.memory.direct_streaming_fold import ensure_direct_streaming_fold_manifest
+
+    run_dir = tmp_path / "run_h03_repaired_only"
+    run_dir.mkdir()
+    (run_dir / "interaction_sampling_v05c_report.json").write_text(
+        json.dumps({"runs": [{"game": "g1", "sampler_name": "s1"}]}),
+        encoding="utf-8",
+    )
+    memory_dir = tmp_path / "memory_h03_repaired_only"
+    ensure_memory_layout(memory_dir)
+    ensure_direct_streaming_fold_manifest(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute("INSERT INTO stable_contingencies (canonical_key, game, sampler, context_level, action, effect_signature, support_count, first_seen_global_step, last_seen_global_step, stability_score) VALUES ('c1', 'g1', 's1', 1, 1, 'e1', 10, 1, 2, 0.8)")
+        conn.commit()
+    derive_missing_transformation_families_from_stable_contingencies(memory_dir)
+    result = evaluate_h03_transformation_family_formation(run_dir, tmp_path / "out_h03_repaired_only", memory_dir=memory_dir)
+    assert result["decision"] != "INSUFFICIENT_EVIDENCE"
+    assert result["transformation_family_count"] > 0
 
 
 def test_suite_summary_exposes_individual_vs_gated_decisions() -> None:

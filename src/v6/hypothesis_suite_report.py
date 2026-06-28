@@ -13,6 +13,7 @@ from v6.hypothesis_h03_report import evaluate_h03_transformation_family_formatio
 from v6.hypothesis_h04_report import evaluate_h04_carrier_emergence
 from v6.higher_order_substrate import derive_higher_order_memory
 from v6.future_options import derive_future_option_memory
+from v6.memory.compact_memory import derive_missing_transformation_families_from_stable_contingencies
 from v6.hypothesis_h05_report import evaluate_h05_role_emergence
 from v6.hypothesis_h06_report import evaluate_h06_role_transfer
 from v6.hypothesis_h07_report import evaluate_h07_concept_emergence
@@ -63,6 +64,9 @@ def run_hypothesis_suite_report(
     h10_dir = output_dir / "h10"
     h11_dir = output_dir / "h11"
     h12_dir = output_dir / "h12"
+    family_repair_summary: dict[str, Any] = {}
+    if memory_dir is not None:
+        family_repair_summary = derive_missing_transformation_families_from_stable_contingencies(memory_dir)
     h01 = evaluate_h01_contingency_emergence(run_dir=run_dir, output_dir=h01_dir, memory_dir=memory_dir)
     h02 = evaluate_h02_prediction_violation_attention(
         run_dir=run_dir,
@@ -80,6 +84,8 @@ def run_hypothesis_suite_report(
         max_rows=int(max_rows),
         scan_all_dbs=bool(scan_all_dbs),
     )
+    if isinstance(h03, dict):
+        h03.update(family_repair_summary)
     h04 = (
         evaluate_h04_carrier_emergence(memory_dir=memory_dir, run_dir=run_dir, output_dir=h04_dir)
         if memory_dir is not None
@@ -279,6 +285,10 @@ def build_hypothesis_suite_summary(
         "raw_epoch_db_cleanup_used": bool(memory_dir is not None and direct_streaming_manifest_exists(memory_dir) and not list(Path(run_dir).rglob("*.sqlite"))),
         "raw_db_fallback_disabled": bool(memory_dir is not None and direct_streaming_manifest_exists(memory_dir)),
         "direct_streaming_fold_manifest_path": None if memory_dir is None else str(Path(memory_dir) / "direct_streaming_fold_manifest.sqlite"),
+        "compact_family_repair_used": h03.get("compact_family_repair_used"),
+        "compact_family_repair_reason": h03.get("compact_family_repair_reason"),
+        "compact_family_repair_family_count": h03.get("compact_family_repair_family_count"),
+        "compact_family_repair_member_count": h03.get("compact_family_repair_member_count"),
         "levels_successfully_completed_per_epoch": int(input_report.get("levels_successfully_completed_per_epoch", 0) or 0),
         "games_solved_per_epoch": int(input_report.get("games_solved_per_epoch", 0) or 0),
         "solved_games": list(input_report.get("solved_games", []) or []),
@@ -340,6 +350,10 @@ def build_hypothesis_suite_summary(
             "over_specific_singleton_count": h03.get("over_specific_singleton_count"),
             "over_specific_singleton_ratio": h03.get("over_specific_singleton_ratio"),
             "singleton_family_diagnostics": h03.get("singleton_family_diagnostics"),
+            "compact_family_repair_used": h03.get("compact_family_repair_used"),
+            "compact_family_repair_reason": h03.get("compact_family_repair_reason"),
+            "compact_family_repair_family_count": h03.get("compact_family_repair_family_count"),
+            "compact_family_repair_member_count": h03.get("compact_family_repair_member_count"),
         },
         "H04 core metrics": dict(h04.get("core_metrics", {})),
         "H05 core metrics": {

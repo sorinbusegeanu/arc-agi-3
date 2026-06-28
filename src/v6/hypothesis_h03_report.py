@@ -147,6 +147,14 @@ H03_DEFAULTS: dict[str, Any] = {
     "unsafe_relaxed_merge_count": None,
     "relaxed_decision_candidate": None,
     "memory_record_count": None,
+    "compact_family_repair_used": False,
+    "compact_family_repair_reason": None,
+    "compact_family_repair_family_count": 0,
+    "compact_family_repair_member_count": 0,
+    "transformation_families_before_repair": None,
+    "transformation_families_after_repair": None,
+    "family_members_before_repair": None,
+    "family_members_after_repair": None,
     "interaction_count": None,
     "contingency_candidate_count": None,
     "discovered_contingency_count": None,
@@ -543,6 +551,51 @@ def _extract_h03_compact_metrics(memory_dir: Path) -> dict[str, Any]:
             if family_prediction_lift_mean is None:
                 prediction_values = [row[5] for row in derived_family_rows if row[5] is not None]
                 family_prediction_lift_mean = (sum(prediction_values) / len(prediction_values)) if prediction_values else None
+        repair_used = False
+        repair_reason = None
+        repair_family_count = 0
+        repair_member_count = 0
+        transformation_families_before_repair = None
+        transformation_families_after_repair = None
+        family_members_before_repair = None
+        family_members_after_repair = None
+        try:
+            summary_rows = dict(
+                state_conn.execute(
+                    """
+                    SELECT key, value_json
+                    FROM memory_summary
+                    WHERE key IN (
+                        'compact_family_repair_used',
+                        'compact_family_repair_reason',
+                        'compact_family_repair_family_count',
+                        'compact_family_repair_member_count',
+                        'transformation_families_before',
+                        'transformation_families_after',
+                        'family_members_before',
+                        'family_members_after'
+                    )
+                    """
+                ).fetchall()
+            )
+            if "compact_family_repair_used" in summary_rows:
+                repair_used = bool(json.loads(summary_rows["compact_family_repair_used"]))
+            if "compact_family_repair_reason" in summary_rows:
+                repair_reason = json.loads(summary_rows["compact_family_repair_reason"])
+            if "compact_family_repair_family_count" in summary_rows:
+                repair_family_count = int(json.loads(summary_rows["compact_family_repair_family_count"]) or 0)
+            if "compact_family_repair_member_count" in summary_rows:
+                repair_member_count = int(json.loads(summary_rows["compact_family_repair_member_count"]) or 0)
+            if "transformation_families_before" in summary_rows:
+                transformation_families_before_repair = int(json.loads(summary_rows["transformation_families_before"]) or 0)
+            if "transformation_families_after" in summary_rows:
+                transformation_families_after_repair = int(json.loads(summary_rows["transformation_families_after"]) or 0)
+            if "family_members_before" in summary_rows:
+                family_members_before_repair = int(json.loads(summary_rows["family_members_before"]) or 0)
+            if "family_members_after" in summary_rows:
+                family_members_after_repair = int(json.loads(summary_rows["family_members_after"]) or 0)
+        except Exception:
+            repair_used = False
     graph_metrics = {"family_cross_context_count": None, "family_cross_game_count": None, "family_cross_sampler_count": None}
     if graph_db.exists():
         with sqlite3.connect(graph_db) as graph_conn:
@@ -574,6 +627,14 @@ def _extract_h03_compact_metrics(memory_dir: Path) -> dict[str, Any]:
         "carrier_candidates_count": carrier_candidates_count,
         "memory_edges_family_links_count": memory_edges_family_links_count,
         "compact_family_derivation_used": bool(family_count > 0 and contingency_count > 0 and memory_edges_family_links_count == 0),
+        "compact_family_repair_used": repair_used,
+        "compact_family_repair_reason": repair_reason,
+        "compact_family_repair_family_count": repair_family_count,
+        "compact_family_repair_member_count": repair_member_count,
+        "transformation_families_before_repair": transformation_families_before_repair,
+        "transformation_families_after_repair": transformation_families_after_repair,
+        "family_members_before_repair": family_members_before_repair,
+        "family_members_after_repair": family_members_after_repair,
         **graph_metrics,
     }
 

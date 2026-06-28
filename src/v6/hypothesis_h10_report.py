@@ -72,7 +72,7 @@ def evaluate_h10_future_option_attention(
     result = {
         "hypothesis_id": "H10",
         "evidence_source": "compact_memory",
-        "h10_attention_target_definition": "high_attention is calibrated from the per-epoch attention score percentile, where attention_score = max(replay_priority_score, contradiction_score, memory_priority_score).",
+        "h10_attention_target_definition": "high_attention is raw replay/contradiction attention; calibrated_high_attention is percentile-calibrated and reported separately.",
         "future_option_attention_link_count": len(rows),
         "live_future_option_delta_count": sum(1 for row in rows if str(row.get("source_label") or "") == "live"),
         "heuristic_future_option_delta_count": sum(1 for row in rows if str(row.get("source_label") or "") == "heuristic"),
@@ -266,6 +266,7 @@ def _write(output_dir: Path, result: dict[str, Any]) -> None:
         f"attention all-low saturation: {result.get('attention_all_low_saturation')}\n"
         f"attention saturation: {result.get('attention_saturation')}\n"
         f"replay attention count: {result.get('replay_attention_count')}\n"
+        f"replay attention saturation: {result.get('replay_attention_saturation')}\n"
         f"contradiction attention count: {result.get('contradiction_attention_count')}\n"
         f"H10A: coverage={subtests.get('H10A_future_option_to_replay_priority', {}).get('coverage')} high_rate={subtests.get('H10A_future_option_to_replay_priority', {}).get('high_rate')} low_rate={subtests.get('H10A_future_option_to_replay_priority', {}).get('low_rate')} lift={subtests.get('H10A_future_option_to_replay_priority', {}).get('lift')} saturation={subtests.get('H10A_future_option_to_replay_priority', {}).get('saturation')} threshold={subtests.get('H10A_future_option_to_replay_priority', {}).get('threshold')}\n"
         f"H10B: coverage={subtests.get('H10B_future_option_to_memory_priority', {}).get('coverage')} high_rate={subtests.get('H10B_future_option_to_memory_priority', {}).get('high_rate')} low_rate={subtests.get('H10B_future_option_to_memory_priority', {}).get('low_rate')} lift={subtests.get('H10B_future_option_to_memory_priority', {}).get('lift')} saturation={subtests.get('H10B_future_option_to_memory_priority', {}).get('saturation')} threshold={subtests.get('H10B_future_option_to_memory_priority', {}).get('threshold')}\n"

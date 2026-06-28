@@ -173,9 +173,11 @@ def evaluate_h07_concept_emergence(
     elif successful_transfers > 0 and concept_candidate_count == 0:
         if roles_skipped_missing_family_links > 0 or roles_skipped_missing_carrier_links > 0:
             decision = "INSUFFICIENT_EVIDENCE"
-            missing = [
-                "successful transfers exist, but concept derivation is blocked by missing role-family or role-carrier links",
-            ]
+            missing = []
+            if roles_skipped_missing_family_links > 0:
+                missing.append("concept derivation blocked by missing role-family links")
+            if roles_skipped_missing_carrier_links > 0:
+                missing.append("concept derivation blocked by missing role-carrier links")
         else:
             decision = "INVALID"
             missing = []
@@ -225,6 +227,11 @@ def _write_outputs(output_dir: Path, result: dict[str, Any]) -> None:
         f"concept candidates: {result.get('concept_candidate_count')}\n"
         f"promoted concepts: {result.get('promoted_concept_count')}\n"
         f"strong transfer successes: {result.get('concept_strong_transfer_success_count')}\n"
+        f"roles seen for concept derivation: {result.get('roles_seen_for_concept_derivation')}\n"
+        f"roles skipped missing carrier links: {result.get('roles_skipped_missing_carrier_links')}\n"
+        f"roles skipped missing family links: {result.get('roles_skipped_missing_family_links')}\n"
+        f"roles skipped missing transfer success: {result.get('roles_skipped_missing_transfer_success')}\n"
+        f"roles used for concepts: {result.get('roles_used_for_concepts')}\n"
         f"source role count mean: {result.get('source_role_count_mean')}\n"
         f"source carrier count mean: {result.get('source_carrier_count_mean')}\n"
         f"cross-game max: {result.get('concept_cross_game_count_max')}\n"
