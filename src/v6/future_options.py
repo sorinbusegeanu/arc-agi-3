@@ -632,6 +632,8 @@ def derive_future_option_motifs(
 
 
 def derive_future_option_attention_links(state_conn: sqlite3.Connection) -> dict[str, Any]:
+    original_row_factory = state_conn.row_factory
+    state_conn.row_factory = sqlite3.Row
     event_to_motif = {
         str(row["linked_key"]): str(row["motif_signature"])
         for row in state_conn.execute(
@@ -682,6 +684,8 @@ def derive_future_option_attention_links(state_conn: sqlite3.Connection) -> dict
     rows: list[dict[str, Any]] = []
     live_future_option_delta_count = 0
     null_future_option_delta_count = 0
+    live_high_option_change_count = 0
+    live_nonzero_option_delta_count = 0
     for node in interaction_nodes:
         node_id = str(node["node_id"])
         attrs = _load_jsonish(node.get("attrs_json"))
@@ -720,6 +724,14 @@ def derive_future_option_attention_links(state_conn: sqlite3.Connection) -> dict
         else:
             attention_signal_source = "none"
         option_delta_abs = abs(float(future_option_delta or 0.0))
+        if option_delta_abs > 0.0:
+            live_nonzero_option_delta_count += 1
+        raw_high_attention = int(
+            replay_priority >= 0.50
+            or "selected_for_replay" in edge_types
+            or "violates_prediction" in edge_types
+        )
+        live_high_option_change_count += high_option_change
         rows.append(
             {
                 "event_id": node_id,
@@ -731,7 +743,8 @@ def derive_future_option_attention_links(state_conn: sqlite3.Connection) -> dict
                 "memory_priority_score": memory_priority,
                 "contradiction_score": contradiction_score,
                 "high_option_change": high_option_change,
-                "high_attention": high_attention,
+                "high_attention": raw_high_attention,
+                "raw_high_attention": raw_high_attention,
                 "attention_signal_source": attention_signal_source,
                 "first_seen_global_step": attrs.get("global_step"),
                 "last_seen_global_step": attrs.get("global_step"),
@@ -739,7 +752,14 @@ def derive_future_option_attention_links(state_conn: sqlite3.Connection) -> dict
             }
         )
     heuristic_future_option_delta_count = 0
+    h10_fallback_reason = None
     if live_future_option_delta_count <= 0:
+        h10_fallback_reason = "no_live_future_option_deltas"
+    elif live_nonzero_option_delta_count <= 0:
+        h10_fallback_reason = "all_live_option_deltas_zero"
+    elif live_high_option_change_count <= 0:
+        h10_fallback_reason = "no_live_high_option_change"
+    if h10_fallback_reason is not None:
         for row in state_conn.execute("SELECT * FROM future_option_events ORDER BY event_id ASC").fetchall():
             payload = dict(row)
             heuristic_future_option_delta_count += 1
@@ -771,6 +791,7 @@ def derive_future_option_attention_links(state_conn: sqlite3.Connection) -> dict
                     "contradiction_score": contradiction_score,
                     "high_option_change": high_option_change,
                     "high_attention": high_attention,
+                    "raw_high_attention": high_attention,
                     "attention_signal_source": attention_signal_source,
                     "first_seen_global_step": payload["first_seen_global_step"],
                     "last_seen_global_step": payload["last_seen_global_step"],
@@ -805,9 +826,9 @@ def derive_future_option_attention_links(state_conn: sqlite3.Connection) -> dict
         high_option_change = int(row.get("high_option_change") or 0)
         attention_score = max(replay_priority, contradiction_score, memory_priority)
         attention_score_percentile = _percentile_rank(attention_scores, attention_score) if attention_scores else None
-        high_attention = 0
+        calibrated_high_attention = 0
         if not attention_calibration_degenerate and percentile_80 is not None and float(percentile_80) > 0.0:
-            high_attention = int(attention_score >= float(percentile_80))
+            calibrated_high_attention = int(attention_score >= float(percentile_80))
         attention_signal_source = str(row.get("attention_signal_source") or "none")
         sources_seen.add(str(row.get("source_label") or "none"))
         state_conn.execute(
@@ -815,10 +836,10 @@ def derive_future_option_attention_links(state_conn: sqlite3.Connection) -> dict
             INSERT INTO future_option_attention_links (
                 event_id, motif_signature, owner_type, owner_key, option_delta_abs, replay_priority_score,
                 memory_priority_score, contradiction_score, high_option_change, high_attention,
+                raw_high_attention, calibrated_high_attention, source_label,
                 attention_signal_source, attention_score, attention_score_percentile, attention_threshold_method,
                 attention_calibration_degenerate, first_seen_global_step, last_seen_global_step
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 row["event_id"],
@@ -830,7 +851,10 @@ def derive_future_option_attention_links(state_conn: sqlite3.Connection) -> dict
                 memory_priority,
                 contradiction_score,
                 high_option_change,
-                high_attention,
+                int(row.get("raw_high_attention") or row.get("high_attention") or 0),
+                int(row.get("raw_high_attention") or row.get("high_attention") or 0),
+                calibrated_high_attention,
+                row.get("source_label"),
                 attention_signal_source,
                 attention_score,
                 attention_score_percentile,
@@ -841,10 +865,11 @@ def derive_future_option_attention_links(state_conn: sqlite3.Connection) -> dict
             ),
         )
         high_option_change_count += high_option_change
-        high_attention_count += high_attention
-        if high_option_change and high_attention:
+        raw_high_attention = int(row.get("raw_high_attention") or row.get("high_attention") or 0)
+        high_attention_count += raw_high_attention
+        if high_option_change and raw_high_attention:
             high_both_count += 1
-        if not high_option_change and high_attention:
+        if not high_option_change and raw_high_attention:
             low_attention_count += 1
     low_option_change_count = max(0, len(rows) - high_option_change_count)
     high_rate = (high_both_count / high_option_change_count) if high_option_change_count else None
@@ -867,23 +892,29 @@ def derive_future_option_attention_links(state_conn: sqlite3.Connection) -> dict
         high_option_change_source = "heuristic"
     else:
         high_option_change_source = "mixed"
-    return {
-        "future_option_attention_link_count": len(rows),
-        "live_future_option_delta_count": live_future_option_delta_count,
-        "heuristic_future_option_delta_count": heuristic_future_option_delta_count,
-        "null_future_option_delta_count": null_future_option_delta_count,
-        "high_option_change_count": high_option_change_count,
-        "high_option_change_source": high_option_change_source,
-        "high_attention_count": high_attention_count,
-        "high_option_change_attention_count": high_both_count,
-        "low_option_change_attention_count": low_attention_count,
-        "option_attention_lift": lift,
-        "option_attention_lift_unbounded": lift_unbounded,
-        "attention_threshold_method": attention_threshold_method,
-        "attention_calibration_degenerate": attention_calibration_degenerate,
-        "attention_threshold_p80": percentile_80,
-        "attention_threshold_p50": percentile_50,
-    }
+    try:
+        return {
+            "future_option_attention_link_count": len(rows),
+            "live_future_option_delta_count": live_future_option_delta_count,
+            "heuristic_future_option_delta_count": heuristic_future_option_delta_count,
+            "null_future_option_delta_count": null_future_option_delta_count,
+            "high_option_change_count": high_option_change_count,
+            "high_option_change_source": high_option_change_source,
+            "high_attention_count": high_attention_count,
+            "high_option_change_attention_count": high_both_count,
+            "low_option_change_attention_count": low_attention_count,
+            "option_attention_lift": lift,
+            "option_attention_lift_unbounded": lift_unbounded,
+            "attention_threshold_method": attention_threshold_method,
+            "attention_calibration_degenerate": attention_calibration_degenerate,
+            "attention_threshold_p80": percentile_80,
+            "attention_threshold_p50": percentile_50,
+            "h10_live_rows_used": sum(1 for row in rows if str(row.get("source_label")) == "live"),
+            "h10_heuristic_rows_used": sum(1 for row in rows if str(row.get("source_label")) == "heuristic"),
+            "h10_fallback_reason": h10_fallback_reason,
+        }
+    finally:
+        state_conn.row_factory = original_row_factory
 
 
 def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[str, Any]:

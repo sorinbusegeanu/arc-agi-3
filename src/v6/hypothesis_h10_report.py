@@ -74,14 +74,29 @@ def evaluate_h10_future_option_attention(
         "evidence_source": "compact_memory",
         "h10_attention_target_definition": "high_attention is calibrated from the per-epoch attention score percentile, where attention_score = max(replay_priority_score, contradiction_score, memory_priority_score).",
         "future_option_attention_link_count": len(rows),
-        "live_future_option_delta_count": sum(1 for row in rows if str(row.get("owner_type")) == "interaction"),
-        "heuristic_future_option_delta_count": sum(1 for row in rows if str(row.get("owner_type")) != "interaction"),
+        "live_future_option_delta_count": sum(1 for row in rows if str(row.get("source_label") or "") == "live"),
+        "heuristic_future_option_delta_count": sum(1 for row in rows if str(row.get("source_label") or "") == "heuristic"),
         "null_future_option_delta_count": sum(1 for row in rows if float(row.get("option_delta_abs") or 0.0) <= 0.0 and int(row.get("high_option_change") or 0) == 0),
+        "h10_live_rows_used": sum(1 for row in rows if str(row.get("source_label") or "") == "live"),
+        "h10_heuristic_rows_used": sum(1 for row in rows if str(row.get("source_label") or "") == "heuristic"),
+        "h10_fallback_reason": (
+            "no_live_future_option_deltas"
+            if rows and all(str(row.get("source_label") or "") != "live" for row in rows)
+            else "no_live_high_option_change"
+            if rows and any(str(row.get("source_label") or "") == "heuristic" for row in rows) and sum(
+                1 for row in rows if str(row.get("source_label") or "") == "live" and int(row.get("high_option_change") or 0) == 1
+            ) == 0
+            else "all_live_option_deltas_zero"
+            if rows and any(str(row.get("source_label") or "") == "heuristic" for row in rows) and sum(
+                1 for row in rows if str(row.get("source_label") or "") == "live" and float(row.get("option_delta_abs") or 0.0) > 0.0
+            ) == 0
+            else None
+        ),
         "high_option_change_count": len(high_rows),
         "high_option_change_source": (
             "none" if not rows else
-            "live" if all(str(row.get("owner_type")) == "interaction" for row in rows) else
-            "heuristic" if all(str(row.get("owner_type")) != "interaction" for row in rows) else
+            "live" if all(str(row.get("source_label") or "") == "live" for row in rows) else
+            "heuristic" if all(str(row.get("source_label") or "") == "heuristic" for row in rows) else
             "mixed"
         ),
         "high_attention_count": len(high_attention_rows),
@@ -237,6 +252,9 @@ def _write(output_dir: Path, result: dict[str, Any]) -> None:
         f"attention target: {result.get('h10_attention_target_definition')}\n"
         f"live future-option deltas: {result.get('live_future_option_delta_count')}\n"
         f"heuristic future-option deltas: {result.get('heuristic_future_option_delta_count')}\n"
+        f"H10 live rows used: {result.get('h10_live_rows_used')}\n"
+        f"H10 heuristic rows used: {result.get('h10_heuristic_rows_used')}\n"
+        f"H10 fallback reason: {result.get('h10_fallback_reason')}\n"
         f"null future-option deltas: {result.get('null_future_option_delta_count')}\n"
         f"high-option-change source: {result.get('high_option_change_source')}\n"
         f"option-attention lift: {result.get('option_attention_lift')}\n"

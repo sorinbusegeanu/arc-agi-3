@@ -3330,6 +3330,9 @@ def _ensure_current_state_schema(path: Path) -> None:
                 contradiction_score REAL,
                 high_option_change INTEGER,
                 high_attention INTEGER,
+                raw_high_attention INTEGER,
+                calibrated_high_attention INTEGER,
+                source_label TEXT,
                 attention_signal_source TEXT,
                 attention_score REAL,
                 attention_score_percentile REAL,
@@ -3409,6 +3412,9 @@ def _ensure_current_state_schema(path: Path) -> None:
         _ensure_column(connection, "world_model_components", "predicted_outcome_count", "INTEGER")
         _ensure_column(connection, "world_model_components", "predicted_outcome_count_is_proxy", "INTEGER DEFAULT 0")
         _ensure_column(connection, "future_option_attention_links", "attention_signal_source", "TEXT")
+        _ensure_column(connection, "future_option_attention_links", "raw_high_attention", "INTEGER")
+        _ensure_column(connection, "future_option_attention_links", "calibrated_high_attention", "INTEGER")
+        _ensure_column(connection, "future_option_attention_links", "source_label", "TEXT")
         _ensure_column(connection, "future_option_attention_links", "attention_score", "REAL")
         _ensure_column(connection, "future_option_attention_links", "attention_score_percentile", "REAL")
         _ensure_column(connection, "future_option_attention_links", "attention_threshold_method", "TEXT")

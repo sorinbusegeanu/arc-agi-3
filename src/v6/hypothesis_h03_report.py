@@ -203,6 +203,11 @@ H03_DEFAULTS: dict[str, Any] = {
 }
 
 
+def _append_unique(items: list[str], value: str) -> None:
+    if value not in items:
+        items.append(value)
+
+
 def _h03_evidence_diagnostics(*, run_dir: Path, memory_dir: Path | None, sqlite_paths: list[Path], missing_target: str) -> dict[str, Any]:
     memory_dir = None if memory_dir is None else Path(memory_dir)
     return {
@@ -288,12 +293,17 @@ def evaluate_h03_transformation_family_formation(
         compact = _extract_h03_compact_metrics(Path(memory_dir))
         result.update(compact)
         result["evidence_source"] = "compact_memory"
-        result["decision"] = "PARTIALLY_VALID" if _gt(result.get("transformation_family_count"), 0) else "INCONCLUSIVE"
+        result["decision"] = "PARTIALLY_VALID" if _gt(result.get("transformation_family_count"), 0) else "INSUFFICIENT_EVIDENCE"
         result["scientific_conclusion"] = (
             "H03 evaluated from compact memory after raw cleanup."
             if _gt(result.get("transformation_family_count"), 0)
-            else "H03 remains inconclusive because compact memory lacks family evidence."
+            else "H03 remains insufficiently evidenced because compact memory lacks transformation-family rows after raw cleanup."
         )
+        if _gt(result.get("stable_contingency_count"), 0) and not _gt(result.get("transformation_family_count"), 0):
+            result["missing_evidence"].append(
+                "compact transformation_families table is empty despite stable contingencies being present"
+            )
+            result["evidence_diagnostics"]["missing_target"] = "transformation_families"
         _finalize_h03_result(result, output_dir)
         return result
     if input_report is None:
@@ -332,6 +342,12 @@ def evaluate_h03_transformation_family_formation(
         and _has_compact_h03_family_evidence(result)
         and _has_compact_h03_contingency_evidence(result)
     )
+    if streamed_compact_only and _gt(result.get("stable_contingency_count"), 0) and not _gt(result.get("transformation_family_count"), 0):
+        result["evidence_diagnostics"]["missing_target"] = "transformation_families"
+        _append_unique(
+            result.setdefault("missing_evidence", []),
+            "compact transformation_families table is empty despite stable contingencies being present",
+        )
 
     checks = {
         "contingencies_present": _gt(result.get("discovered_contingency_count"), 0),
@@ -371,7 +387,7 @@ def evaluate_h03_transformation_family_formation(
     stability_approx = bool(result.get("stability_approximated", False))
 
     if not usable_family_evidence:
-        result["decision"] = "INCONCLUSIVE"
+        result["decision"] = "INSUFFICIENT_EVIDENCE" if streamed_compact_only else "INCONCLUSIVE"
         if streamed_compact_only:
             result["scientific_conclusion"] = (
                 "H03 remains inconclusive because direct streaming compact memory does not expose enough family or contingency evidence."
@@ -471,8 +487,62 @@ def _extract_h03_compact_metrics(memory_dir: Path) -> dict[str, Any]:
     with sqlite3.connect(current_state) as state_conn:
         contingency_count = int(state_conn.execute("SELECT COUNT(*) FROM stable_contingencies").fetchone()[0])
         family_count = int(state_conn.execute("SELECT COUNT(*) FROM transformation_families").fetchone()[0])
-        singleton_count = int(state_conn.execute("SELECT COUNT(*) FROM transformation_families WHERE member_count <= 1").fetchone()[0])
-        member_total = int(state_conn.execute("SELECT COALESCE(SUM(member_count), 0) FROM transformation_families").fetchone()[0])
+        singleton_count = int(state_conn.execute("SELECT COUNT(*) FROM transformation_families WHERE member_count <= 1").fetchone()[0]) if family_count > 0 else 0
+        member_total = int(state_conn.execute("SELECT COALESCE(SUM(member_count), 0) FROM transformation_families").fetchone()[0]) if family_count > 0 else 0
+        family_prediction_lift_mean = None
+        carrier_candidates_count = 0
+        memory_edges_family_links_count = 0
+        try:
+            carrier_candidates_count = int(state_conn.execute("SELECT COUNT(*) FROM carrier_candidates").fetchone()[0])
+        except sqlite3.DatabaseError:
+            carrier_candidates_count = 0
+        try:
+            memory_edges_family_links_count = int(
+                state_conn.execute(
+                    "SELECT COUNT(*) FROM family_members"
+                ).fetchone()[0]
+            )
+        except sqlite3.DatabaseError:
+            memory_edges_family_links_count = 0
+        try:
+            row = state_conn.execute(
+                "SELECT AVG(prediction_lift) FROM transformation_families WHERE prediction_lift IS NOT NULL"
+            ).fetchone()
+            family_prediction_lift_mean = None if row is None or row[0] is None else float(row[0])
+        except sqlite3.DatabaseError:
+            family_prediction_lift_mean = None
+        derived_family_rows: list[tuple[str, int, int, int, int, float | None]] = []
+        if family_count <= 0 and contingency_count > 0:
+            derived_family_rows = [
+                (
+                    str(row[0]),
+                    int(row[1] or 0),
+                    int(row[2] or 0),
+                    int(row[3] or 0),
+                    int(row[4] or 0),
+                    None if row[5] is None else float(row[5]),
+                )
+                for row in state_conn.execute(
+                    """
+                    SELECT
+                        COALESCE(effect_signature, normalized_contingency_key, canonical_key) AS derived_signature,
+                        COUNT(*) AS member_count,
+                        COALESCE(SUM(support_count), 0) AS support_count,
+                        COUNT(DISTINCT COALESCE(game, 'unknown')) AS game_count,
+                        COUNT(DISTINCT COALESCE(sampler, 'unknown')) AS sampler_count,
+                        AVG(prediction_accuracy) AS avg_prediction_accuracy
+                    FROM stable_contingencies
+                    GROUP BY COALESCE(effect_signature, normalized_contingency_key, canonical_key)
+                    ORDER BY derived_signature ASC
+                    """
+                ).fetchall()
+            ]
+            family_count = len(derived_family_rows)
+            singleton_count = sum(1 for _, members, *_rest in derived_family_rows if members <= 1)
+            member_total = sum(int(members) for _, members, *_rest in derived_family_rows)
+            if family_prediction_lift_mean is None:
+                prediction_values = [row[5] for row in derived_family_rows if row[5] is not None]
+                family_prediction_lift_mean = (sum(prediction_values) / len(prediction_values)) if prediction_values else None
     graph_metrics = {"family_cross_context_count": None, "family_cross_game_count": None, "family_cross_sampler_count": None}
     if graph_db.exists():
         with sqlite3.connect(graph_db) as graph_conn:
@@ -493,11 +563,17 @@ def _extract_h03_compact_metrics(memory_dir: Path) -> dict[str, Any]:
         "stable_contingency_count": contingency_count,
         "transformation_family_count": family_count,
         "stable_transformation_family_count": family_count,
+        "transformation_families_count": family_count,
+        "stable_contingencies_count": contingency_count,
         "family_member_count_total": member_total,
         "singleton_family_count": singleton_count,
         "singleton_family_ratio": (singleton_count / family_count) if family_count else None,
         "compression_ratio": (member_total / family_count) if family_count else None,
         "compression_gain": ((member_total / family_count) - 1.0) if family_count else None,
+        "family_prediction_lift_mean": family_prediction_lift_mean,
+        "carrier_candidates_count": carrier_candidates_count,
+        "memory_edges_family_links_count": memory_edges_family_links_count,
+        "compact_family_derivation_used": bool(family_count > 0 and contingency_count > 0 and memory_edges_family_links_count == 0),
         **graph_metrics,
     }
 

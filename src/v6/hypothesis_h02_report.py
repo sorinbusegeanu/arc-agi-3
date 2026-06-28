@@ -166,6 +166,7 @@ H02_DEFAULTS: dict[str, Any] = {
     "object_carrier_absent_or_negligible": False,
     "carrier_timing_note": "",
     "raw_h02_evidence_incomplete": False,
+    "raw_cleanup_prevents_direct_linkage": False,
     "compact_h02_fallback_used": False,
     "compact_counter_fallback_used": False,
     "direct_replay_lift_pass": False,
@@ -378,6 +379,7 @@ def evaluate_h02_prediction_violation_attention(
         _finalize_h02_result(result, output_dir)
         return result
     if streamed_compact_only and result.get("direct_replay_lift_available") is not True:
+        result["raw_cleanup_prevents_direct_linkage"] = True
         message = "raw per-interaction replay linkage unavailable after direct streaming raw cleanup"
         if message not in result["missing_evidence"]:
             result["missing_evidence"].append(message)
@@ -567,7 +569,9 @@ def _decide_h02a_from_checks(
     result["direct_replay_lift_invalid"] = bool(direct_replay_lift_invalid)
     result["aggregate_invalid_core"] = bool(invalid_core)
     if raw_h02_incomplete and not compact_has_prediction_error and not compact_has_contradiction and not compact_has_replay:
-        result["h02a_replay_attention_decision"] = "INCONCLUSIVE"
+        result["h02a_replay_attention_decision"] = (
+            "INSUFFICIENT_EVIDENCE" if result.get("raw_cleanup_prevents_direct_linkage") else "INCONCLUSIVE"
+        )
         result["h02a_replay_attention_conclusion"] = (
             "H02A remains inconclusive because raw aggregate evidence is incomplete and compact memory does not provide enough replay/contradiction evidence."
         )
@@ -577,7 +581,9 @@ def _decide_h02a_from_checks(
             "H02 raw aggregate evidence incomplete and compact replay/contradiction evidence insufficient.",
         )
     elif raw_h02_incomplete and compact_has_replay and not compact_has_prediction_error:
-        result["h02a_replay_attention_decision"] = "PARTIALLY_VALID"
+        result["h02a_replay_attention_decision"] = (
+            "PARTIALLY_VALID_WITH_LOW_COVERAGE" if result.get("raw_cleanup_prevents_direct_linkage") else "PARTIALLY_VALID"
+        )
         result["h02a_replay_attention_conclusion"] = (
             "H02A is partially supported from compact replay evidence, but direct prediction-violation linkage is unavailable."
         )
@@ -601,17 +607,32 @@ def _decide_h02a_from_checks(
         )
         result["h02a_decision_source"] = "direct_replay_lift_invalid"
     elif aggregate_signals_pass and checks["replay_candidates_present"] is True and checks["high_priority_replay_present"] is True:
-        result["h02a_replay_attention_decision"] = "PARTIALLY_VALID"
+        result["h02a_replay_attention_decision"] = (
+            "PARTIALLY_VALID_WITH_LOW_COVERAGE"
+            if result.get("raw_cleanup_prevents_direct_linkage") and result.get("direct_replay_lift_available") is not True
+            else "PARTIALLY_VALID"
+        )
         result["h02a_replay_attention_conclusion"] = (
             "H02A is partially supported in this run. Aggregate prediction-violation, contradiction, and replay-candidate signals are present, but direct replay-lift evidence is unavailable or not strong enough for full validation."
         )
         result["h02a_decision_source"] = "aggregate_signals"
     elif invalid_core and result.get("direct_replay_lift_available") is not True:
-        result["h02a_replay_attention_decision"] = "INVALID"
-        result["h02a_replay_attention_conclusion"] = (
-            "H02 is not supported in this run because prediction-violation signals or replayable memory pressure are absent."
-        )
-        result["h02a_decision_source"] = "aggregate_invalid_core"
+        if result.get("raw_cleanup_prevents_direct_linkage"):
+            result["h02a_replay_attention_decision"] = (
+                "PARTIALLY_VALID_WITH_LOW_COVERAGE"
+                if compact_has_prediction_error or compact_has_contradiction or compact_has_replay
+                else "INSUFFICIENT_EVIDENCE"
+            )
+            result["h02a_replay_attention_conclusion"] = (
+                "H02A cannot be invalidated from raw-cleanup artifacts alone; compact evidence is incomplete for direct replay-linkage testing."
+            )
+            result["h02a_decision_source"] = "compact_fallback"
+        else:
+            result["h02a_replay_attention_decision"] = "INVALID"
+            result["h02a_replay_attention_conclusion"] = (
+                "H02 is not supported in this run because prediction-violation signals or replayable memory pressure are absent."
+            )
+            result["h02a_decision_source"] = "aggregate_invalid_core"
     elif invalid_core and result.get("direct_replay_lift_available") is True:
         result["h02a_replay_attention_decision"] = "PARTIALLY_VALID"
         result["h02a_replay_attention_conclusion"] = (
@@ -664,7 +685,40 @@ def _extract_h02_compact_metrics(memory_dir: Path) -> dict[str, Any]:
               AND replay_priority IS NOT NULL
             """
         ).fetchone()
+        violation_rows = state_conn.execute(
+            """
+            WITH score_base AS (
+                SELECT node_id, COALESCE(replay_priority, 0.0) AS replay_priority
+                FROM memory_scores
+                WHERE node_id LIKE 'M0:interaction:%'
+            ),
+            violation_base AS (
+                SELECT DISTINCT source_node_id AS node_id
+                FROM memory_edges
+                WHERE edge_type = 'violates_prediction'
+                  AND source_node_id LIKE 'M0:interaction:%'
+            )
+            SELECT
+                COUNT(*) AS total_rows,
+                SUM(CASE WHEN violation_base.node_id IS NOT NULL THEN 1 ELSE 0 END) AS violating_count,
+                AVG(CASE WHEN violation_base.node_id IS NOT NULL THEN score_base.replay_priority END) AS violating_mean,
+                AVG(CASE WHEN violation_base.node_id IS NULL THEN score_base.replay_priority END) AS non_violating_mean,
+                SUM(CASE WHEN score_base.replay_priority >= 0.8 AND violation_base.node_id IS NOT NULL THEN 1 ELSE 0 END) AS high_violating_count,
+                SUM(CASE WHEN score_base.replay_priority >= 0.8 THEN 1 ELSE 0 END) AS high_priority_count
+            FROM score_base
+            LEFT JOIN violation_base USING (node_id)
+            """
+        ).fetchone()
         high_priority = [value for value in priorities if value >= 0.8]
+        violating_count = int((violation_rows[1] if violation_rows else 0) or 0)
+        total_rows = int((violation_rows[0] if violation_rows else 0) or 0)
+        violating_mean = None if violation_rows is None or violation_rows[2] is None else float(violation_rows[2])
+        non_violating_mean = None if violation_rows is None or violation_rows[3] is None else float(violation_rows[3])
+        high_violating_count = int((violation_rows[4] if violation_rows else 0) or 0)
+        high_priority_count = int((violation_rows[5] if violation_rows else 0) or 0)
+        replay_lift = None
+        if violating_mean is not None and non_violating_mean is not None and non_violating_mean > 0.0:
+            replay_lift = violating_mean / non_violating_mean
         return {
             "memory_record_count": memory_record_count or score_record_count or None,
             "memory_replay_candidate_count": len(replay_rows) if replay_rows else selected_for_replay_edge_count,
@@ -679,11 +733,13 @@ def _extract_h02_compact_metrics(memory_dir: Path) -> dict[str, Any]:
             "actual_family_available_count": (score_stats[0] if score_stats and score_stats[0] else score_record_count) or None,
             "wrong_prediction_count": contradiction_count if contradiction_count > 0 else None,
             "confident_wrong_prediction_count": contradiction_count if contradiction_count > 0 else None,
-            "prediction_violation_base_ratio": (contradiction_count / len(replay_rows)) if replay_rows else None,
-            "high_priority_replay_prediction_violation_ratio": (len(high_priority) / len(replay_rows)) if replay_rows else None,
+            "prediction_violation_base_ratio": (violating_count / total_rows) if total_rows > 0 else None,
+            "high_priority_replay_prediction_violation_ratio": (high_violating_count / high_priority_count) if high_priority_count > 0 else None,
             "high_priority_replay_non_prediction_violation_ratio": None,
-            "prediction_violation_replay_lift": None,
-            "direct_replay_lift_available": False,
+            "prediction_violation_replay_lift": replay_lift,
+            "direct_replay_lift_available": replay_lift is not None and total_rows > 0 and violating_count > 0 and high_priority_count > 0,
+            "compact_prediction_violation_count": violating_count,
+            "compact_evidence_coverage_count": total_rows if total_rows > 0 else None,
         }
 
 

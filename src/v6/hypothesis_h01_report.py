@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from v6.memory.direct_streaming_fold import direct_streaming_manifest_exists
+
 
 H01_JSON_NAME = "h01_contingency_emergence_report.json"
 H01_TXT_NAME = "h01_contingency_emergence_report.txt"
@@ -59,6 +61,7 @@ H01_DEFAULTS: dict[str, Any] = {
     "evidence_for": [],
     "evidence_against": [],
     "missing_evidence": [],
+    "evidence_diagnostics": {},
     "acceptance_checks": {
         "interactions_present": None,
         "contingencies_present": None,
@@ -68,6 +71,33 @@ H01_DEFAULTS: dict[str, Any] = {
         "prediction_or_context_signal_present": None,
     },
 }
+
+
+def _h01_evidence_diagnostics(*, run_dir: Path, memory_dir: Path | None, sqlite_paths: list[Path]) -> dict[str, Any]:
+    memory_dir = None if memory_dir is None else Path(memory_dir)
+    compact_path = None if memory_dir is None else memory_dir / "current_state.sqlite"
+    replay_path = None if memory_dir is None else memory_dir / "replay_queue.sqlite"
+    diagnostics: dict[str, Any] = {
+        "expected_input_report_path": str(Path(run_dir) / INPUT_REPORT_JSON_NAME),
+        "compact_memory_exists": bool(compact_path is not None and compact_path.exists()),
+        "compact_current_state_path": None if compact_path is None else str(compact_path),
+        "compact_replay_queue_path": None if replay_path is None else str(replay_path),
+        "raw_db_evidence_exists": bool(sqlite_paths),
+        "raw_db_count": len(sqlite_paths),
+        "direct_streamed_manifest_exists": bool(memory_dir is not None and direct_streaming_manifest_exists(memory_dir)),
+    }
+    if compact_path is not None and compact_path.exists():
+        try:
+            with sqlite3.connect(compact_path) as connection:
+                diagnostics["compact_table_row_counts"] = {
+                    "memory_nodes": int(connection.execute("SELECT COUNT(*) FROM memory_nodes").fetchone()[0]),
+                    "stable_contingencies": int(connection.execute("SELECT COUNT(*) FROM stable_contingencies").fetchone()[0]),
+                    "transformation_families": int(connection.execute("SELECT COUNT(*) FROM transformation_families").fetchone()[0]),
+                    "memory_scores": int(connection.execute("SELECT COUNT(*) FROM memory_scores").fetchone()[0]),
+                }
+        except sqlite3.DatabaseError:
+            diagnostics["compact_table_row_counts"] = {}
+    return diagnostics
 
 
 def _apply_h01_decision(
@@ -130,11 +160,20 @@ def evaluate_h01_contingency_emergence(run_dir: Path, output_dir: Path, *, memor
     result["db_found"] = bool(sqlite_paths)
     result["db_paths_total"] = len(sqlite_paths)
     result["evidence_source"] = "raw_epoch_db"
+    result["evidence_diagnostics"] = _h01_evidence_diagnostics(
+        run_dir=run_dir,
+        memory_dir=memory_dir,
+        sqlite_paths=sqlite_paths,
+    )
 
     if report is None and memory_dir is not None:
         compact_metrics = _extract_compact_memory_metrics(Path(memory_dir))
         result.update(compact_metrics)
-        result["evidence_source"] = "compact_memory"
+        result["evidence_source"] = (
+            "direct_streaming_manifest_and_compact_memory"
+            if direct_streaming_manifest_exists(memory_dir)
+            else "compact_memory"
+        )
         interactions_present = _gt(result.get("total_interaction_count"), 0)
         contingencies_present = _gt(result.get("discovered_contingency_count"), 0) or _gt(result.get("stable_contingency_count"), 0)
         stable_present = _gt(result.get("stable_contingency_count"), 0)
@@ -164,16 +203,27 @@ def evaluate_h01_contingency_emergence(run_dir: Path, output_dir: Path, *, memor
             result["evidence_for"].append("Cross-sampler contingency support is present in compact memory.")
         if not signal_present:
             result["evidence_against"].append("Prediction/context signal is unavailable in compact-only evidence.")
-        _apply_h01_decision(
-            result,
-            interactions_present=interactions_present,
-            contingencies_present=contingencies_present,
-            stable_present=stable_present,
-            multi_game_support=bool(multi_game_support),
-            multi_sampler_support=bool(multi_sampler_support),
-            signal_present=bool(signal_present),
-            report_has_runs=False,
-        )
+        if (
+            direct_streaming_manifest_exists(memory_dir)
+            and not bool(sqlite_paths)
+            and not interactions_present
+            and not contingencies_present
+        ):
+            result["decision"] = "INSUFFICIENT_EVIDENCE"
+            result["scientific_conclusion"] = (
+                "H01 remains insufficiently evidenced after direct-streaming raw cleanup because compact memory does not expose enough interaction or contingency rows."
+            )
+        else:
+            _apply_h01_decision(
+                result,
+                interactions_present=interactions_present,
+                contingencies_present=contingencies_present,
+                stable_present=stable_present,
+                multi_game_support=bool(multi_game_support),
+                multi_sampler_support=bool(multi_sampler_support),
+                signal_present=bool(signal_present),
+                report_has_runs=False,
+            )
         _finalize_h01_result(result, output_dir)
         return result
     if report is None:
@@ -198,6 +248,15 @@ def evaluate_h01_contingency_emergence(run_dir: Path, output_dir: Path, *, memor
     if memory_dir is not None:
         compact_metrics = _extract_compact_memory_metrics(Path(memory_dir))
         for key in (
+            "total_interaction_count",
+            "contingency_candidate_count",
+            "discovered_contingency_count",
+            "stable_contingency_count",
+            "per_game_contingency_counts",
+            "per_sampler_contingency_counts",
+            "cross_game_contingency_count",
+            "cross_sampler_contingency_count",
+            "mean_prediction_accuracy",
             "memory_record_count",
             "memory_replay_candidate_count",
             "high_priority_replay_count",
@@ -215,9 +274,12 @@ def evaluate_h01_contingency_emergence(run_dir: Path, output_dir: Path, *, memor
             if compact_value is None:
                 continue
             current_value = result.get(key)
-            if current_value in (None, 0, 0.0):
+            if current_value in (None, 0, 0.0, {}, []):
                 result[key] = compact_value
-        result["evidence_source"] = "mixed" if report is not None else "compact_memory"
+        if direct_streaming_manifest_exists(memory_dir) and not sqlite_paths:
+            result["evidence_source"] = "direct_streaming_manifest_and_compact_memory"
+        else:
+            result["evidence_source"] = "mixed" if report is not None else "compact_memory"
 
     for key in (
         "total_interaction_count",
@@ -316,6 +378,12 @@ def evaluate_h01_contingency_emergence(run_dir: Path, output_dir: Path, *, memor
         result["missing_evidence"].append(f"Optional text report missing: {INPUT_REPORT_TXT_NAME}")
     if result.get("cross_game_contingency_presence") is None:
         result["missing_evidence"].append("Cross-game contingency identity is not derivable from current run artifacts.")
+    if memory_dir is not None and direct_streaming_manifest_exists(memory_dir) and not sqlite_paths:
+        result["raw_epoch_db_available"] = False
+        if not interactions_present and not contingencies_present:
+            result["missing_evidence"].append(
+                "Direct-streaming raw cleanup removed raw DBs and compact memory does not yet expose enough H01 contingency evidence."
+            )
 
     if interactions_present and contingencies_present:
         result["evidence_for"].append(
@@ -360,6 +428,7 @@ def _extract_compact_memory_metrics(memory_dir: Path) -> dict[str, Any]:
         per_game = dict(connection.execute("SELECT COALESCE(game, 'unknown'), COUNT(*) FROM stable_contingencies GROUP BY COALESCE(game, 'unknown')").fetchall())
         per_sampler = dict(connection.execute("SELECT COALESCE(sampler, 'unknown'), COUNT(*) FROM stable_contingencies GROUP BY COALESCE(sampler, 'unknown')").fetchall())
         stable_count = int(connection.execute("SELECT COUNT(*) FROM stable_contingencies WHERE support_count >= 20").fetchone()[0])
+        discovered_count = int(connection.execute("SELECT COUNT(*) FROM stable_contingencies").fetchone()[0])
         memory_record_count = int(connection.execute("SELECT COUNT(*) FROM memory_nodes WHERE node_type = 'InteractionMemory'").fetchone()[0])
         memory_score_record_count = int(connection.execute("SELECT COUNT(*) FROM memory_scores WHERE node_id LIKE 'M0:interaction:%'").fetchone()[0])
         high_priority_replay_count = int(connection.execute("SELECT COUNT(*) FROM memory_scores WHERE node_id LIKE 'M0:interaction:%' AND COALESCE(replay_priority, 0.0) >= 0.50").fetchone()[0])
@@ -413,10 +482,10 @@ def _extract_compact_memory_metrics(memory_dir: Path) -> dict[str, Any]:
         cross_game_contingency_count = sum(1 for values in games_by_identity.values() if len(values) >= 2)
         cross_sampler_contingency_count = sum(1 for values in samplers_by_identity.values() if len(values) >= 2)
         return {
-            "total_interaction_count": interaction_count if interaction_count > 0 else None,
+            "total_interaction_count": interaction_count if interaction_count > 0 else (memory_record_count or memory_score_record_count or None),
             "stable_contingency_count": stable_count,
-            "contingency_candidate_count": int(connection.execute("SELECT COUNT(*) FROM stable_contingencies").fetchone()[0]),
-            "discovered_contingency_count": int(connection.execute("SELECT COUNT(*) FROM stable_contingencies").fetchone()[0]),
+            "contingency_candidate_count": discovered_count,
+            "discovered_contingency_count": discovered_count,
             "per_game_contingency_counts": {str(key): int(value) for key, value in per_game.items()},
             "per_sampler_contingency_counts": {str(key): int(value) for key, value in per_sampler.items()},
             "mean_prediction_accuracy": _mean_or_none(prediction_accuracy_values),

@@ -2515,6 +2515,29 @@ def test_h01_compact_only_can_be_valid(tmp_path: Path) -> None:
     assert result["decision"] == "VALID"
 
 
+def test_h01_direct_streaming_raw_cleanup_uses_compact_evidence(tmp_path: Path) -> None:
+    from v6.hypothesis_h01_report import evaluate_h01_contingency_emergence
+    from v6.memory.direct_streaming_fold import ensure_direct_streaming_fold_manifest
+
+    run_dir = tmp_path / "run_h01_streamed"
+    run_dir.mkdir()
+    (run_dir / "interaction_sampling_v05c_report.json").write_text(
+        json.dumps({"runs": [{"game": "g1", "sampler_name": "s1"}]}),
+        encoding="utf-8",
+    )
+    memory_dir = tmp_path / "memory_h01_streamed"
+    ensure_memory_layout(memory_dir)
+    ensure_direct_streaming_fold_manifest(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute("INSERT INTO memory_nodes (node_id, memory_level, node_type, canonical_key, support_count, attrs_json) VALUES ('M0:interaction:g1','M0','InteractionMemory','i1',1,'{}')")
+        conn.execute("INSERT INTO stable_contingencies (contingency_id, canonical_key, game, sampler, context_level, action, effect_signature, support_count, first_seen_global_step, last_seen_global_step, stability_score, mean_prediction_error, mean_replay_priority, representative_example_count, prediction_attempt_count, prediction_success_count, prediction_accuracy, prediction_error_before, prediction_error_after, normalized_contingency_key) VALUES (1,'c1','g1','s1',1,1,'e1',25,1,10,0.9,0.1,0.5,1,10,8,0.8,0.3,0.1,'k1')")
+        conn.commit()
+    result = evaluate_h01_contingency_emergence(run_dir, tmp_path / "out_h01_streamed", memory_dir=memory_dir)
+    assert result["evidence_source"] == "direct_streaming_manifest_and_compact_memory"
+    assert result["decision"] != "INVALID"
+    assert result["stable_contingency_count"] > 0
+
+
 def test_h02_low_coverage_demotes_decision_and_txt_prints_coverage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from v6.hypothesis_h02_report import evaluate_h02_prediction_violation_attention
 
@@ -11571,6 +11594,33 @@ def test_h02_uses_compact_replay_counter_when_raw_zero(tmp_path: Path, monkeypat
     assert result["compact_counter_fallback_used"] is True
 
 
+def test_h02_raw_cleanup_without_direct_linkage_is_not_invalid(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from v6.hypothesis_h02_report import evaluate_h02_prediction_violation_attention
+    from v6.memory.direct_streaming_fold import ensure_direct_streaming_fold_manifest
+
+    run_dir = tmp_path / "run_h02_streamed"
+    run_dir.mkdir()
+    (run_dir / "interaction_sampling_v05c_report.json").write_text(
+        json.dumps({"runs": [{"game": "g1", "sampler_name": "s1"}]}),
+        encoding="utf-8",
+    )
+    memory_dir = tmp_path / "memory_h02_streamed"
+    ensure_memory_layout(memory_dir)
+    ensure_direct_streaming_fold_manifest(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute("INSERT INTO contradiction_clusters (cluster_id, canonical_key, support_count, first_seen_global_step, last_seen_global_step, max_prediction_error, mean_replay_priority) VALUES ('c1', 'k1', 2, 1, 2, 1.0, 0.9)")
+        conn.execute("INSERT INTO memory_nodes (node_id, memory_level, node_type, canonical_key, support_count, attrs_json) VALUES ('M0:interaction:g1', 'M0', 'InteractionMemory', 'g1', 1, '{}')")
+        conn.execute("INSERT INTO memory_scores (node_id, replay_priority) VALUES ('M0:interaction:g1', 0.9)")
+        conn.commit()
+    monkeypatch.setattr(
+        "v6.hypothesis_h02_report._compute_prediction_violation_replay_lift_from_existing_db",
+        lambda *args, **kwargs: {"direct_replay_lift_available": False},
+    )
+    result = evaluate_h02_prediction_violation_attention(run_dir, tmp_path / "out_h02_streamed", memory_dir=memory_dir)
+    assert result["raw_cleanup_prevents_direct_linkage"] is True
+    assert result["decision"] != "INVALID"
+
+
 def test_h09_unknown_event_ratio_blocks_valid(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
     ensure_memory_layout(memory_dir)
@@ -11685,6 +11735,40 @@ def test_h10_all_low_attention_saturation_is_partial(tmp_path: Path) -> None:
     assert "Attention signal is saturated all-low; selective attention is not demonstrated." in result["missing_evidence"]
 
 
+def test_h10_degenerate_calibration_keeps_raw_high_attention_not_all_low(tmp_path: Path) -> None:
+    from v6.future_options import derive_future_option_attention_links
+
+    memory_dir = tmp_path / "memory_h10_degenerate"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute("INSERT INTO memory_nodes (node_id, memory_level, node_type, canonical_key, support_count, attrs_json) VALUES ('M0:interaction:1', 'M0', 'InteractionMemory', '1', 1, '{\"global_step\":1}')")
+        conn.execute("INSERT INTO memory_scores (node_id, future_option_delta, replay_priority) VALUES ('M0:interaction:1', 0.0, 0.9)")
+        conn.commit()
+        derive_future_option_attention_links(conn)
+        row = conn.execute("SELECT high_attention, raw_high_attention, calibrated_high_attention, attention_calibration_degenerate FROM future_option_attention_links").fetchone()
+        assert row == (1, 1, 0, 1)
+    result = evaluate_h10_future_option_attention(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h10_deg", already_derived=True)
+    assert result["attention_all_low_saturation"] is False
+    assert result["attention_calibration_degenerate"] is True
+
+
+def test_h10_falls_back_to_heuristic_events_when_live_deltas_are_zero(tmp_path: Path) -> None:
+    from v6.future_options import derive_future_option_attention_links
+
+    memory_dir = tmp_path / "memory_h10_fallback"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute("INSERT INTO memory_nodes (node_id, memory_level, node_type, canonical_key, support_count, attrs_json) VALUES ('M0:interaction:1', 'M0', 'InteractionMemory', '1', 1, '{\"global_step\":1}')")
+        conn.execute("INSERT INTO memory_scores (node_id, future_option_delta, replay_priority) VALUES ('M0:interaction:1', 0.0, 0.0)")
+        conn.execute(
+            "INSERT INTO future_option_events (event_id, owner_type, owner_key, source_kind, motif_type, option_delta, option_delta_bucket, first_seen_global_step, last_seen_global_step, replay_priority_score, memory_priority_score, contradiction_score, evidence_json) VALUES ('e1', 'interaction', 'i1', 'stable_contingency', 'enable', 2.0, 'large_positive', 1, 1, 0.9, 0.0, 0.0, '{}')"
+        )
+        conn.commit()
+        summary = derive_future_option_attention_links(conn)
+    assert summary["h10_heuristic_rows_used"] > 0
+    assert summary["h10_fallback_reason"] == "all_live_option_deltas_zero"
+
+
 def test_h03_normalized_family_signature_reduces_numeric_singletons(tmp_path: Path) -> None:
     from v6.hypothesis_h03_report import evaluate_h03_transformation_family_formation
 
@@ -11733,6 +11817,29 @@ def test_h03_normalized_family_signature_reduces_numeric_singletons(tmp_path: Pa
     assert result["transformation_family_count"] == 1
     assert result["singleton_family_ratio"] == 0.0
     assert result["over_specific_singleton_count"] == 0
+
+
+def test_h03_compact_derives_family_counts_from_stable_contingencies(tmp_path: Path) -> None:
+    from v6.hypothesis_h03_report import evaluate_h03_transformation_family_formation
+    from v6.memory.direct_streaming_fold import ensure_direct_streaming_fold_manifest
+
+    run_dir = tmp_path / "run_h03_streamed"
+    run_dir.mkdir()
+    (run_dir / "interaction_sampling_v05c_report.json").write_text(
+        json.dumps({"runs": [{"game": "g1", "sampler_name": "s1"}]}),
+        encoding="utf-8",
+    )
+    memory_dir = tmp_path / "memory_h03_streamed"
+    ensure_memory_layout(memory_dir)
+    ensure_direct_streaming_fold_manifest(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute("INSERT INTO stable_contingencies (canonical_key, game, sampler, context_level, action, effect_signature, support_count) VALUES ('c1', 'g1', 's1', 1, 1, 'e1', 10)")
+        conn.execute("INSERT INTO stable_contingencies (canonical_key, game, sampler, context_level, action, effect_signature, support_count) VALUES ('c2', 'g1', 's1', 1, 1, 'e1', 12)")
+        conn.commit()
+    result = evaluate_h03_transformation_family_formation(run_dir, tmp_path / "out_h03_streamed", memory_dir=memory_dir)
+    assert result["evidence_source"] == "direct_streaming_manifest_and_compact_memory"
+    assert result["stable_contingencies_count"] == 2
+    assert result["transformation_families_count"] >= 1
 
 
 def test_h03_family_prediction_lift_available_and_non_negative(tmp_path: Path) -> None:
@@ -11835,6 +11942,28 @@ def test_h03_missing_evidence_flags_are_exposed() -> None:
     assert "H03 direct family evidence was row-capped; inspect more rows or use scan-all/full max-rows." in result["missing_evidence"]
     assert "H03 singleton action metadata contains unknown actions." in result["missing_evidence"]
     assert "H03 singleton families include over-specific context signatures." in result["missing_evidence"]
+
+
+def test_h07_reports_role_skip_reasons_when_concepts_zero(tmp_path: Path) -> None:
+    from v6.hypothesis_h07_report import evaluate_h07_concept_emergence
+
+    memory_dir = tmp_path / "memory_h07"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute(
+            "INSERT INTO role_candidates (role_signature, role_type, support_count, linked_carrier_count, linked_family_count, linked_context_count, cross_game_count, cross_context_count, first_seen_global_step, last_seen_global_step, role_stability_score, is_emergent) VALUES ('r1', 'role', 5, 1, 0, 1, 0, 1, 1, 2, 0.8, 1)"
+        )
+        conn.execute(
+            "INSERT INTO role_links (role_signature, linked_type, linked_key, support_count, first_seen_global_step, last_seen_global_step) VALUES ('r1', 'carrier', 'c1', 1, 1, 2)"
+        )
+        conn.execute(
+            "INSERT INTO role_transfer_attempts (attempt_id, role_signature, transfer_kind, source_scope_type, source_scope_key, target_scope_type, target_scope_key, target_carrier_signature, predicted_role_signature, observed_role_signature, similarity_score, transfer_score, reuse_success, failure_reason, best_margin, source_carrier_count, candidate_role_count, first_seen_global_step, last_seen_global_step) VALUES ('1', 'r1', 'k', 'game', 'g1', 'context', 'ctx', 'c2', 'r2', 'r2', 0.8, 0.8, 1, NULL, 0.2, 2, 2, 1, 2)"
+        )
+        conn.commit()
+    result = evaluate_h07_concept_emergence(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h07", already_derived=True)
+    assert result["concept_candidate_count"] == 0
+    assert result["roles_skipped_missing_family_links"] > 0
+    assert result["decision"] == "INSUFFICIENT_EVIDENCE"
 
 
 def test_suite_summary_exposes_individual_vs_gated_decisions() -> None:

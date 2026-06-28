@@ -492,6 +492,11 @@ def derive_concept_candidates(state_conn: sqlite3.Connection) -> dict[str, Any]:
             "concept_candidate_count": 0,
             "promoted_concept_count": 0,
             "concept_strong_transfer_success_count": 0,
+            "roles_seen_for_concept_derivation": 0,
+            "roles_skipped_missing_carrier_links": 0,
+            "roles_skipped_missing_family_links": 0,
+            "roles_skipped_missing_transfer_success": 0,
+            "roles_used_for_concepts": 0,
         }
     role_links = _links_by_signature(state_conn, "role_links", "role_signature")
     neighborhood_rows = state_conn.execute(
@@ -526,11 +531,25 @@ def derive_concept_candidates(state_conn: sqlite3.Connection) -> dict[str, Any]:
                 strong_success_by_role[role_signature] += 1
 
     concept_groups: dict[str, dict[str, Any]] = {}
+    roles_seen_for_concept_derivation = 0
+    roles_skipped_missing_carrier_links = 0
+    roles_skipped_missing_family_links = 0
+    roles_skipped_missing_transfer_success = 0
+    roles_used_for_concepts = 0
     for row in role_rows:
         role_signature = str(row["role_signature"])
+        roles_seen_for_concept_derivation += 1
         links = role_links.get(role_signature, {})
-        if not links.get("carrier") or not links.get("family"):
+        if not links.get("carrier"):
+            roles_skipped_missing_carrier_links += 1
             continue
+        if not links.get("family"):
+            roles_skipped_missing_family_links += 1
+            continue
+        if int(success_by_role.get(role_signature, 0)) <= 0:
+            roles_skipped_missing_transfer_success += 1
+            continue
+        roles_used_for_concepts += 1
         concept_tokens = _concept_tokens(str(row["role_type"] or "unknown"), sorted(tokens_by_role.get(role_signature, set())))
         concept_signature = _concept_signature(concept_tokens)
         group = concept_groups.setdefault(
@@ -682,6 +701,11 @@ def derive_concept_candidates(state_conn: sqlite3.Connection) -> dict[str, Any]:
         "concept_strong_transfer_success_count": strong_transfer_total,
         "overconcentrated_concept_count": overconcentrated_concepts,
         "promoted_overconcentrated_concept_count": promoted_overconcentrated_concepts,
+        "roles_seen_for_concept_derivation": roles_seen_for_concept_derivation,
+        "roles_skipped_missing_carrier_links": roles_skipped_missing_carrier_links,
+        "roles_skipped_missing_family_links": roles_skipped_missing_family_links,
+        "roles_skipped_missing_transfer_success": roles_skipped_missing_transfer_success,
+        "roles_used_for_concepts": roles_used_for_concepts,
         "concept_transfer_success_concentration": (
             max(concept_strong_counts) / strong_transfer_total
             if concept_strong_counts and strong_transfer_total > 0

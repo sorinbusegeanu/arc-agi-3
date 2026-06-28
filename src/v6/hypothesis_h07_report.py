@@ -37,6 +37,31 @@ def evaluate_h07_concept_emergence(
             pass
         transfer_attempt_count = int(conn.execute("SELECT COUNT(*) FROM role_transfer_attempts").fetchone()[0])
         successful_transfers = int(conn.execute("SELECT COUNT(*) FROM role_transfer_attempts WHERE COALESCE(reuse_success, 0) = 1").fetchone()[0])
+        roles_seen_for_concept_derivation = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM role_candidates
+                WHERE COALESCE(is_emergent, 0) = 1 OR COALESCE(role_stability_score, 0.0) >= 0.50
+                """
+            ).fetchone()[0]
+        )
+        role_link_rows = conn.execute(
+            "SELECT role_signature, linked_type FROM role_links ORDER BY role_signature ASC, linked_type ASC"
+        ).fetchall()
+        linked_types_by_role: dict[str, set[str]] = {}
+        for row in role_link_rows:
+            linked_types_by_role.setdefault(str(row["role_signature"]), set()).add(str(row["linked_type"]))
+        successful_roles = {
+            str(row["role_signature"])
+            for row in conn.execute(
+                """
+                SELECT DISTINCT role_signature
+                FROM role_transfer_attempts
+                WHERE COALESCE(reuse_success, 0) = 1
+                """
+            ).fetchall()
+        }
         concept_rows = conn.execute(
             """
             SELECT concept_signature, compression_gain, promotion_score, transfer_success_count,
@@ -48,6 +73,21 @@ def evaluate_h07_concept_emergence(
             """
         ).fetchall()
         milestone_map = dict(conn.execute("SELECT milestone_name, first_global_step FROM higher_order_milestones").fetchall())
+    roles_skipped_missing_carrier_links = 0
+    roles_skipped_missing_family_links = 0
+    roles_skipped_missing_transfer_success = 0
+    roles_used_for_concepts = 0
+    for role_signature, linked_types in linked_types_by_role.items():
+        if "carrier" not in linked_types:
+            roles_skipped_missing_carrier_links += 1
+            continue
+        if "family" not in linked_types:
+            roles_skipped_missing_family_links += 1
+            continue
+        if role_signature not in successful_roles:
+            roles_skipped_missing_transfer_success += 1
+            continue
+        roles_used_for_concepts += 1
     concept_candidate_count = len(concept_rows)
     promoted_rows = [row for row in concept_rows if int(row["is_promoted"] or 0) == 1]
     promoted_concept_count = len(promoted_rows)
@@ -121,13 +161,24 @@ def evaluate_h07_concept_emergence(
         "first_concept_candidate_step": milestone_map.get("first_concept_candidate_step"),
         "first_promoted_concept_step": milestone_map.get("first_promoted_concept_step"),
         "first_role_transfer_success_step": milestone_map.get("first_role_transfer_success_step"),
+        "roles_seen_for_concept_derivation": roles_seen_for_concept_derivation,
+        "roles_skipped_missing_carrier_links": roles_skipped_missing_carrier_links,
+        "roles_skipped_missing_family_links": roles_skipped_missing_family_links,
+        "roles_skipped_missing_transfer_success": roles_skipped_missing_transfer_success,
+        "roles_used_for_concepts": roles_used_for_concepts,
     }
     if transfer_attempt_count <= 0:
         decision = "INCONCLUSIVE"
         missing = ["no role transfer attempts available"]
     elif successful_transfers > 0 and concept_candidate_count == 0:
-        decision = "INVALID"
-        missing = []
+        if roles_skipped_missing_family_links > 0 or roles_skipped_missing_carrier_links > 0:
+            decision = "INSUFFICIENT_EVIDENCE"
+            missing = [
+                "successful transfers exist, but concept derivation is blocked by missing role-family or role-carrier links",
+            ]
+        else:
+            decision = "INVALID"
+            missing = []
     elif (
         promoted_concept_count >= 5
         and concept_strong_transfer_success_count >= 2
