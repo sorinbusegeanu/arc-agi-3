@@ -547,6 +547,7 @@ def _run_sampling_jobs(
                 memory_dir=str(main_memory_dir),
                 delete_raw_after_fold=bool(jobs[0].get("delete_raw_after_direct_streaming_fold", True)),
                 fold_workers=int(jobs[0].get("direct_streaming_fold_workers", 8) or 8),
+                max_tasks_per_child=int(jobs[0].get("max_tasks_per_child", 0) or 0),
                 retry_attempts=int(jobs[0].get("direct_streaming_fold_retry_attempts", 5) or 5),
                 retry_initial_delay_seconds=float(jobs[0].get("direct_streaming_fold_retry_initial_delay_seconds", 5.0) or 5.0),
                 busy_timeout_ms=int(jobs[0].get("direct_streaming_fold_busy_timeout_ms", 60000) or 60000),

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,6 +15,8 @@ from v6.memory.direct_streaming_fold import direct_streaming_manifest_has_failur
 from v6.memory.memory_cleanup import cleanup_epoch_artifacts, disk_usage_snapshot, stop_due_to_disk, validate_cleanup_safe
 from v6.memory.selective_forgetting import run_selective_forgetting_pass
 from v6.evaluation.h10b_selective_forgetting import evaluate_h10b_selective_forgetting
+
+_EPOCH_PHASE_LOG_PATH: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -62,9 +65,29 @@ class ContinuousResearchConfig:
     direct_streaming_shard_synchronous: str = "off"
 
 
+def _log_epoch_phase(epoch_id: str, phase: str, status: str = "starting", extra: dict | None = None) -> None:
+    payload: dict[str, Any] = {
+        "epoch_id": epoch_id,
+        "phase": phase,
+        "status": status,
+        "time": time.time(),
+    }
+    if extra:
+        payload.update(extra)
+    print(f"[epoch {epoch_id}] {phase}: {status}" + (f" {extra}" if extra else ""), flush=True)
+    if _EPOCH_PHASE_LOG_PATH is not None:
+        _EPOCH_PHASE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with _EPOCH_PHASE_LOG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, sort_keys=True) + "\n")
+
+
 def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
+    global _EPOCH_PHASE_LOG_PATH
     root = Path(config.output_dir)
     root.mkdir(parents=True, exist_ok=True)
+    root_status_dir = root / "status"
+    root_status_dir.mkdir(parents=True, exist_ok=True)
+    _EPOCH_PHASE_LOG_PATH = root_status_dir / "epoch_phase_log.jsonl"
     manifest_path = root / "manifest.json"
     stop_file = root / "STOP"
     manifest = _load_or_initialize_manifest(config, manifest_path)
@@ -123,6 +146,7 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
         _write_epoch_start(status_dir, epoch_start_payload)
         print(_format_epoch_start(epoch_start_payload))
 
+        _log_epoch_phase(epoch_id, "sampling_and_direct_fold", "starting")
         sampling_rows = run_interaction_sampling_v05c(
             InteractionSamplingConfig(
                 games=parse_v05c_games(config.games, env_root=config.env_root),
@@ -164,10 +188,13 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
                 direct_streaming_shard_synchronous=str(config.direct_streaming_shard_synchronous),
             )
         )
+        _log_epoch_phase(epoch_id, "sampling_and_direct_fold", "done")
         worker_execution = _load_sampling_worker_execution(raw_dir)
         if bool(config.direct_streaming_fold):
+            _log_epoch_phase(epoch_id, "direct_fold_manifest_check", "starting")
             if direct_streaming_manifest_has_failures(memory_dir):
                 raise RuntimeError("direct streaming fold manifest reports failures; final raw fallback is disabled")
+            _log_epoch_phase(epoch_id, "direct_fold_manifest_check", "done")
             fold_summary = {
                 "direct_streaming_fold_enabled": True,
                 "final_raw_epoch_fold_skipped": True,
@@ -175,6 +202,7 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
             }
         else:
             raise RuntimeError("direct streaming fold is now required for normal continuous runs")
+        _log_epoch_phase(epoch_id, "hypothesis_suite", "starting")
         suite_summary = run_hypothesis_suite_report(
             run_dir=raw_dir,
             memory_dir=memory_dir,
@@ -190,14 +218,41 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
             memory_size_before_bytes=memory_size_before,
             memory_size_after_bytes=_tree_size(memory_dir),
         )
+        _log_epoch_phase(
+            epoch_id,
+            "hypothesis_suite",
+            "done",
+            {
+                "H01": suite_summary.get("H01 decision"),
+                "H03": suite_summary.get("H03 decision"),
+                "H07": suite_summary.get("H07 decision"),
+                "H10": suite_summary.get("H10 decision"),
+            },
+        )
+        _log_epoch_phase(epoch_id, "selective_forgetting", "starting")
         forgetting_summary = run_selective_forgetting_pass(memory_dir=memory_dir, epoch=epoch_number)
+        _log_epoch_phase(epoch_id, "selective_forgetting", "done")
+        _log_epoch_phase(epoch_id, "h10b_selective_forgetting", "starting")
         h10b_summary = evaluate_h10b_selective_forgetting(
             memory_dir=memory_dir,
             run_dir=raw_dir,
             output_dir=reports_dir / "h10b",
             forgetting_summary=forgetting_summary,
         )
+        _log_epoch_phase(epoch_id, "h10b_selective_forgetting", "done", {"H10B": h10b_summary.get("decision")})
+        _log_epoch_phase(epoch_id, "memory_summary", "starting")
         memory_after = build_memory_summary(memory_paths)
+        _log_epoch_phase(
+            epoch_id,
+            "memory_summary",
+            "done",
+            {
+                "stable_contingencies": memory_after.get("stable_contingency_count"),
+                "transformation_families": memory_after.get("transformation_family_count"),
+                "memory_nodes": memory_after.get("memory_node_count"),
+            },
+        )
+        _log_epoch_phase(epoch_id, "memory_continuity_report", "starting")
         continuity_report = _write_memory_continuity_report(
             reports_dir=reports_dir,
             epoch_id=epoch_id,
@@ -206,14 +261,27 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
             after_epoch_memory_summary=memory_after,
             memory_loaded_from_previous_epoch=epoch_number > 1,
         )
+        _log_epoch_phase(epoch_id, "memory_continuity_report", "done")
         _ensure_fold_summary_present(
             memory_paths=memory_paths,
             global_step_start=global_step_start,
             global_step_end=global_step_end,
             worker_execution=worker_execution,
         )
+        _log_epoch_phase(epoch_id, "cleanup_validation", "starting")
         validate_cleanup_safe(epoch_dir, memory_dir, required_reports=True)
+        _log_epoch_phase(epoch_id, "cleanup_validation", "done")
+        _log_epoch_phase(epoch_id, "artifact_cleanup", "starting")
         cleanup_summary = cleanup_epoch_artifacts(epoch_dir=epoch_dir, memory_dir=memory_dir) if bool(config.cleanup) else _no_cleanup_summary(epoch_dir, memory_dir)
+        _log_epoch_phase(
+            epoch_id,
+            "artifact_cleanup",
+            "done",
+            {
+                "disk_before_cleanup_bytes": cleanup_summary.get("disk_before_cleanup_bytes"),
+                "disk_after_cleanup_bytes": cleanup_summary.get("disk_after_cleanup_bytes"),
+            },
+        )
         disk_after = disk_usage_snapshot(root)
 
         deltas = _compute_epoch_deltas(memory_before, memory_after, suite_summary, latest_status)
@@ -322,7 +390,9 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
             "deltas": deltas,
             "next_action": f"continue {f'epoch_{epoch_number + 1:04d}'}",
         }
+        _log_epoch_phase(epoch_id, "epoch_status_write", "starting")
         _write_epoch_status(status_dir, status)
+        _log_epoch_phase(epoch_id, "epoch_status_write", "done")
         print(_format_epoch_status(status))
 
         manifest["current_epoch"] = epoch_number
@@ -381,12 +451,15 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
             manifest["stopped"] = True
             manifest["stop_reason"] = stop_reason
             status["next_action"] = f"stopped: {stop_reason}"
+            _log_epoch_phase(epoch_id, "epoch_status_write", "starting", {"stop_reason": stop_reason})
             _write_epoch_status(status_dir, status)
+            _log_epoch_phase(epoch_id, "epoch_status_write", "done", {"stop_reason": stop_reason})
             print(_format_epoch_status(status))
             break
         _write_manifest(manifest_path, manifest)
 
     _write_manifest(manifest_path, manifest)
+    _EPOCH_PHASE_LOG_PATH = None
     return manifest
 
 

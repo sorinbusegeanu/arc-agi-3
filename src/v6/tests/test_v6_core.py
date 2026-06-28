@@ -12368,15 +12368,16 @@ def test_merge_compact_memory_shards_adds_stable_contingency_support_counts(tmp_
     )
     with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
         row = conn.execute(
-            "SELECT support_count, prediction_attempt_count, prediction_success_count, prediction_accuracy FROM stable_contingencies WHERE canonical_key = 'same_key'"
+            "SELECT support_count, stability_score, prediction_attempt_count, prediction_success_count, prediction_accuracy FROM stable_contingencies WHERE canonical_key = 'same_key'"
         ).fetchone()
         stable_count = conn.execute(
             "SELECT COUNT(*) FROM stable_contingencies WHERE support_count >= 20"
         ).fetchone()[0]
     assert row[0] == 24
-    assert row[1] == 24
-    assert row[2] == 18
-    assert abs(float(row[3]) - 0.75) < 1e-9
+    assert float(row[1]) >= 1.2
+    assert row[2] == 24
+    assert row[3] == 18
+    assert abs(float(row[4]) - 0.75) < 1e-9
     assert stable_count == 1
 
 
@@ -12699,3 +12700,53 @@ def test_successful_fold_with_one_retry_records_retry_attempt_count(tmp_path: Pa
     assert int(row[0]) == 2
     assert int(row[1]) == 1
     assert len(json.loads(row[2])) == 1
+
+
+def test_direct_streaming_fold_writer_uses_configured_max_tasks_per_child(tmp_path: Path, monkeypatch) -> None:
+    from v6.memory.direct_streaming_fold import DirectStreamingFoldConfig, DirectStreamingFoldWriter
+
+    memory_dir = tmp_path / "memory_fold_executor"
+    seen: dict[str, Any] = {}
+
+    class _FakeExecutor:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+
+        def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None:
+            return None
+
+    monkeypatch.setattr("v6.memory.direct_streaming_fold.ProcessPoolExecutor", _FakeExecutor)
+    monkeypatch.setattr("v6.memory.direct_streaming_fold._make_shard_dirs", lambda config, workers: [tmp_path / "shard0"])
+    monkeypatch.setattr("v6.memory.direct_streaming_fold._cleanup_stale_existing_shard_root", lambda config: False)
+    writer = DirectStreamingFoldWriter(
+        DirectStreamingFoldConfig(memory_dir=str(memory_dir), fold_workers=3, max_tasks_per_child=17),
+        sampling_config=SimpleNamespace(steps=1, horizon=1),
+    )
+    writer.start()
+    assert seen["max_workers"] == 3
+    assert seen["max_tasks_per_child"] == 17
+
+
+def test_direct_streaming_fold_writer_disables_child_recycling_when_zero(tmp_path: Path, monkeypatch) -> None:
+    from v6.memory.direct_streaming_fold import DirectStreamingFoldConfig, DirectStreamingFoldWriter
+
+    memory_dir = tmp_path / "memory_fold_executor_zero"
+    seen: dict[str, Any] = {}
+
+    class _FakeExecutor:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+
+        def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None:
+            return None
+
+    monkeypatch.setattr("v6.memory.direct_streaming_fold.ProcessPoolExecutor", _FakeExecutor)
+    monkeypatch.setattr("v6.memory.direct_streaming_fold._make_shard_dirs", lambda config, workers: [tmp_path / "shard0"])
+    monkeypatch.setattr("v6.memory.direct_streaming_fold._cleanup_stale_existing_shard_root", lambda config: False)
+    writer = DirectStreamingFoldWriter(
+        DirectStreamingFoldConfig(memory_dir=str(memory_dir), fold_workers=2, max_tasks_per_child=0),
+        sampling_config=SimpleNamespace(steps=1, horizon=1),
+    )
+    writer.start()
+    assert seen["max_workers"] == 2
+    assert "max_tasks_per_child" not in seen

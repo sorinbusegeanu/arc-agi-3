@@ -54,6 +54,7 @@ class DirectStreamingFoldConfig:
     cleanup_stale_legacy_temp_on_start: bool = True
     manifest_name: str = "direct_streaming_fold_manifest.sqlite"
     fold_workers: int = 8
+    max_tasks_per_child: int = 50
     shard_root_name: str = "direct_streaming_fold_shards"
     retry_attempts: int = 5
     retry_initial_delay_seconds: float = 5.0
@@ -909,7 +910,11 @@ class DirectStreamingFoldWriter:
         self._summary["direct_streaming_fold_stale_shard_root_removed"] = bool(_cleanup_stale_existing_shard_root(self.config))
         self._effective_workers = _effective_fold_worker_count(int(self.config.fold_workers))
         self._shard_dirs = _make_shard_dirs(self.config, self._effective_workers)
-        self._executor = ProcessPoolExecutor(max_workers=self._effective_workers, max_tasks_per_child=1)
+        max_tasks_per_child = int(self.config.max_tasks_per_child or 0)
+        executor_kwargs: dict[str, Any] = {"max_workers": self._effective_workers}
+        if max_tasks_per_child > 0:
+            executor_kwargs["max_tasks_per_child"] = max_tasks_per_child
+        self._executor = ProcessPoolExecutor(**executor_kwargs)
         self._summary["direct_streaming_fold_worker_count"] = int(self._effective_workers)
         self._summary["direct_streaming_fold_shard_count"] = int(len(self._shard_dirs))
 
@@ -940,6 +945,7 @@ class DirectStreamingFoldWriter:
             leave=True,
         )
         try:
+            print("[direct fold] waiting for fold futures", flush=True)
             future_jobs = {future: job for future, job in self._futures}
             for future in as_completed(list(future_jobs)):
                 job = future_jobs[future]
@@ -949,9 +955,11 @@ class DirectStreamingFoldWriter:
                 if self._progress is not None:
                     self._progress.update(1)
                 self._record_result(job, result)
+            print("[direct fold] fold futures complete", flush=True)
             if self._summary["direct_streaming_fold_failed_count"] == 0 and self._summary["direct_streaming_fold_success_count"] > 0:
                 merge_started_at = time.time()
                 self._summary["direct_streaming_fold_merge_started_at"] = float(merge_started_at)
+                print(f"[direct fold] merging {len(self._shard_dirs)} shards with {self._effective_workers} workers", flush=True)
                 merge_direct_fold_shards(
                     memory_dir=self.config.memory_dir,
                     shard_dirs=self._shard_dirs,
@@ -961,6 +969,8 @@ class DirectStreamingFoldWriter:
                     ),
                     workers=self._effective_workers,
                 )
+                print("[direct fold] shard merge done", flush=True)
+                print("[direct fold] finalizing main compact memory", flush=True)
                 finalize_main_compact_memory(
                     memory_dir=self.config.memory_dir,
                     fold_config=CompactMemoryFoldConfig(
@@ -968,12 +978,20 @@ class DirectStreamingFoldWriter:
                         global_step_end=int(self._summary.get("direct_streaming_fold_global_step_end", 0) or 0),
                     ),
                 )
+                print("[direct fold] finalize main compact memory done", flush=True)
                 merge_finished_at = time.time()
                 self._summary["direct_streaming_fold_merge_finished_at"] = float(merge_finished_at)
                 self._summary["direct_streaming_fold_merge_seconds"] = float(merge_finished_at - merge_started_at)
                 self._summary["direct_streaming_fold_finalized_main_memory"] = True
                 if bool(self.config.delete_raw_after_fold):
-                    for job, result in self._successful_jobs:
+                    print(f"[direct fold] deleting raw artifacts for {len(self._successful_jobs)} folded jobs", flush=True)
+                    for job, result in tqdm(
+                        self._successful_jobs,
+                        desc="delete folded raw",
+                        unit="job",
+                        dynamic_ncols=True,
+                        leave=True,
+                    ):
                         deleted_raw = _delete_raw_artifacts(Path(job.db_path))
                         result.deleted_raw = bool(deleted_raw)
                         if deleted_raw:
@@ -995,8 +1013,11 @@ class DirectStreamingFoldWriter:
                             retry_error_history=list(result.retry_error_history or []),
                             error=None,
                         )
+                    print("[direct fold] raw artifact deletion done", flush=True)
+                print("[direct fold] removing fold shard root", flush=True)
                 shutil.rmtree(_shard_root(self.config), ignore_errors=True)
                 self._summary["direct_streaming_fold_shards_deleted"] = True
+                print("[direct fold] fold shard root removed", flush=True)
         except Exception as exc:
             merge_error = exc
         finally:
@@ -1096,6 +1117,7 @@ def retry_direct_streaming_fold_failures(
         delete_raw_after_fold=bool(delete_raw_after_fold),
         cleanup_stale_legacy_temp_on_start=False,
         fold_workers=max(1, int(workers)),
+        max_tasks_per_child=50,
         shard_root_name=f"direct_streaming_fold_retry_shards_{timestamp}",
     )
     summary = {
@@ -1117,7 +1139,11 @@ def retry_direct_streaming_fold_failures(
     shard_dirs = _make_shard_dirs(retry_config, effective_workers)
     progress = tqdm(total=len(jobs), desc="retry direct fold", unit="job", dynamic_ncols=True, leave=True)
     try:
-        with ProcessPoolExecutor(max_workers=effective_workers, max_tasks_per_child=1) as executor:
+        max_tasks_per_child = int(retry_config.max_tasks_per_child or 0)
+        executor_kwargs: dict[str, Any] = {"max_workers": effective_workers}
+        if max_tasks_per_child > 0:
+            executor_kwargs["max_tasks_per_child"] = max_tasks_per_child
+        with ProcessPoolExecutor(**executor_kwargs) as executor:
             future_map = {}
             for index, job in enumerate(jobs):
                 shard_dir = shard_dirs[index % len(shard_dirs)]

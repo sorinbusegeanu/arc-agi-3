@@ -183,6 +183,129 @@ def _write_sampling_fixture(
     return [{"game": "tt01", "total_interactions": 4}]
 
 
+def test_log_epoch_phase_writes_jsonl_row(tmp_path: Path, monkeypatch) -> None:
+    phase_log_path = tmp_path / "status" / "epoch_phase_log.jsonl"
+    monkeypatch.setattr(continuous_research, "_EPOCH_PHASE_LOG_PATH", phase_log_path)
+    continuous_research._log_epoch_phase("epoch_0001", "hypothesis_suite", "done", {"H01": "VALID"})
+    rows = phase_log_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(rows) == 1
+    payload = json.loads(rows[0])
+    assert payload["epoch_id"] == "epoch_0001"
+    assert payload["phase"] == "hypothesis_suite"
+    assert payload["status"] == "done"
+    assert payload["H01"] == "VALID"
+
+
+def test_continuous_run_emits_post_fold_phase_names(tmp_path: Path, monkeypatch) -> None:
+    phase_events: list[tuple[str, str]] = []
+
+    def record_phase(epoch_id: str, phase: str, status: str = "starting", extra: dict | None = None) -> None:
+        phase_events.append((phase, status))
+
+    monkeypatch.setattr(continuous_research, "_log_epoch_phase", record_phase)
+    monkeypatch.setattr(
+        continuous_research,
+        "run_interaction_sampling_v05c",
+        lambda config: _write_sampling_fixture(Path(config.output_dir), global_step_offset=int(config.global_step_offset), stable_support=25),
+    )
+    monkeypatch.setattr(continuous_research, "direct_streaming_manifest_has_failures", lambda memory_dir: False)
+    monkeypatch.setattr(
+        continuous_research,
+        "run_hypothesis_suite_report",
+        lambda **kwargs: {
+            "game_count": 1,
+            "interactions_this_epoch": 4,
+            "levels_successfully_completed_per_epoch": 1,
+            "games_solved_per_epoch": 0,
+            "solved_games": [],
+            "completed_levels_by_game": {"tt01": 1},
+            "H01 decision": "PARTIALLY_VALID",
+            "H02 decision": "PARTIALLY_VALID",
+            "H03 decision": "PARTIALLY_VALID",
+            "H04 decision": "INCONCLUSIVE",
+            "H05 decision": "INCONCLUSIVE",
+            "H06 decision": "INCONCLUSIVE",
+            "H07 decision": "INCONCLUSIVE",
+            "H08 decision": "INCONCLUSIVE",
+            "H09 decision": "INCONCLUSIVE",
+            "H10 decision": "INCONCLUSIVE",
+            "H11 decision": "INCONCLUSIVE",
+            "H12 decision": "INSUFFICIENT_EVIDENCE",
+            "H01 core metrics": {"stable_contingency_count": 1, "games_with_stable_contingencies": 1},
+            "H02 core metrics": {"direct_replay_lift_available": False, "prediction_violation_replay_lift": None},
+            "H03 core metrics": {"compression_ratio": 1.1, "singleton_family_ratio": 0.5, "family_cross_context_count": 1},
+            "H04 core metrics": {},
+            "H05 core metrics": {},
+            "H06 core metrics": {},
+            "H07 core metrics": {},
+            "H08 core metrics": {},
+            "H09 core metrics": {},
+            "H10 core metrics": {},
+            "H11 core metrics": {},
+            "H12 core metrics": {},
+            "memory_size_before_bytes": 0,
+            "memory_size_after_bytes": 0,
+        },
+    )
+    monkeypatch.setattr(continuous_research, "run_selective_forgetting_pass", lambda **kwargs: {"changed": True})
+    monkeypatch.setattr(continuous_research, "evaluate_h10b_selective_forgetting", lambda **kwargs: {"decision": "PARTIALLY_VALID"})
+    monkeypatch.setattr(
+        continuous_research,
+        "build_memory_summary",
+        lambda memory_paths: {
+            "stable_contingency_count": 1,
+            "transformation_family_count": 1,
+            "memory_node_count": 2,
+            "graph_node_count": 0,
+            "graph_edge_count": 0,
+            "replay_queue_size": 0,
+        },
+    )
+    monkeypatch.setattr(continuous_research, "_write_memory_continuity_report", lambda **kwargs: {"continuity_valid": True})
+    monkeypatch.setattr(continuous_research, "validate_cleanup_safe", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        continuous_research,
+        "cleanup_epoch_artifacts",
+        lambda **kwargs: {
+            "disk_before_cleanup_bytes": 100,
+            "disk_after_cleanup_bytes": 50,
+            "disk_freed_bytes": 50,
+            "raw_files_deleted_count": 1,
+            "raw_bytes_deleted": 50,
+            "temp_files_deleted_count": 0,
+            "temp_bytes_deleted": 0,
+            "memory_db_size_bytes": 0,
+            "graph_db_size_bytes": 0,
+            "replay_queue_db_size_bytes": 0,
+            "reports_size_bytes": 0,
+            "kept_files": [],
+            "deleted_files_sample": [],
+            "deletion_errors": [],
+        },
+    )
+
+    run_continuous_research(
+        ContinuousResearchConfig(
+            experiment_name="exp",
+            games="tt01",
+            samplers="mixed",
+            seeds="0",
+            steps_per_epoch=5000,
+            max_epochs=1,
+            horizon=10,
+            context_depth=1,
+            output_dir=str(tmp_path / "continuous"),
+        )
+    )
+
+    done_phases = {phase for phase, status in phase_events if status == "done"}
+    assert "hypothesis_suite" in done_phases
+    assert "selective_forgetting" in done_phases
+    assert "h10b_selective_forgetting" in done_phases
+    assert "memory_summary" in done_phases
+    assert "artifact_cleanup" in done_phases
+
+
 def test_continuous_command_creates_manifest_epoch_and_memory(tmp_path: Path, monkeypatch) -> None:
     calls: list[int] = []
 

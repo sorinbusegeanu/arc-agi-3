@@ -1107,7 +1107,10 @@ def fold_live_system_into_compact_memory(system: Any, memory_dir: str | Path) ->
                     support_count = COALESCE(stable_contingencies.support_count, 0) + COALESCE(excluded.support_count, 0),
                     context_level = MAX(stable_contingencies.context_level, excluded.context_level),
                     last_seen_global_step = MAX(stable_contingencies.last_seen_global_step, excluded.last_seen_global_step),
-                    stability_score = MAX(stable_contingencies.stability_score, excluded.stability_score),
+                    stability_score = CAST(
+                        COALESCE(stable_contingencies.support_count, 0) + COALESCE(excluded.support_count, 0)
+                        AS REAL
+                    ) / 20.0,
                     prediction_attempt_count = COALESCE(stable_contingencies.prediction_attempt_count, 0) + COALESCE(excluded.prediction_attempt_count, 0),
                     prediction_success_count = COALESCE(stable_contingencies.prediction_success_count, 0) + COALESCE(excluded.prediction_success_count, 0),
                     prediction_accuracy = CASE
@@ -1539,7 +1542,10 @@ def _merge_state_tables(temp_state: sqlite3.Connection, state_conn: sqlite3.Conn
                 context_level = MAX(stable_contingencies.context_level, excluded.context_level),
                 first_seen_global_step = MIN(stable_contingencies.first_seen_global_step, excluded.first_seen_global_step),
                 last_seen_global_step = MAX(stable_contingencies.last_seen_global_step, excluded.last_seen_global_step),
-                stability_score = MAX(stable_contingencies.stability_score, excluded.stability_score),
+                stability_score = CAST(
+                    COALESCE(stable_contingencies.support_count, 0) + COALESCE(excluded.support_count, 0)
+                    AS REAL
+                ) / 20.0,
                 representative_example_count = MAX(stable_contingencies.representative_example_count, excluded.representative_example_count),
                 prediction_attempt_count = COALESCE(stable_contingencies.prediction_attempt_count, 0) + COALESCE(excluded.prediction_attempt_count, 0),
                 prediction_success_count = COALESCE(stable_contingencies.prediction_success_count, 0) + COALESCE(excluded.prediction_success_count, 0),
@@ -2572,7 +2578,10 @@ def _upsert_stable_contingency(
             context_level = MAX(stable_contingencies.context_level, excluded.context_level),
             first_seen_global_step = MIN(stable_contingencies.first_seen_global_step, excluded.first_seen_global_step),
             last_seen_global_step = MAX(stable_contingencies.last_seen_global_step, excluded.last_seen_global_step),
-            stability_score = MAX(stable_contingencies.stability_score, excluded.stability_score),
+            stability_score = CAST(
+                COALESCE(stable_contingencies.support_count, 0) + COALESCE(excluded.support_count, 0)
+                AS REAL
+            ) / 20.0,
             prediction_attempt_count = COALESCE(stable_contingencies.prediction_attempt_count, 0) + COALESCE(excluded.prediction_attempt_count, 0),
             prediction_success_count = COALESCE(stable_contingencies.prediction_success_count, 0) + COALESCE(excluded.prediction_success_count, 0),
             prediction_accuracy = CASE
