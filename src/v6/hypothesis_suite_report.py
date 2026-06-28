@@ -98,14 +98,14 @@ def run_hypothesis_suite_report(
         h12 = evaluate_h12_efficiency_emergence(memory_dir=memory_dir, run_dir=run_dir, output_dir=h12_dir)
     else:
         missing = ["memory_dir not provided"]
-        h05 = {"hypothesis_id": "H05", "decision": "INCONCLUSIVE", "core_metrics": {}, "missing_evidence": missing, "evidence_source": "none"}
-        h06 = {"hypothesis_id": "H06", "decision": "INCONCLUSIVE", "core_metrics": {}, "missing_evidence": missing, "evidence_source": "none"}
-        h07 = {"hypothesis_id": "H07", "decision": "INCONCLUSIVE", "core_metrics": {}, "missing_evidence": missing, "evidence_source": "none"}
-        h08 = {"hypothesis_id": "H08", "decision": "INCONCLUSIVE", "core_metrics": {}, "missing_evidence": missing, "evidence_source": "none"}
-        h09 = {"hypothesis_id": "H09", "decision": "INCONCLUSIVE", "core_metrics": {}, "missing_evidence": missing, "evidence_source": "none"}
-        h10 = {"hypothesis_id": "H10", "decision": "INCONCLUSIVE", "core_metrics": {}, "missing_evidence": missing, "evidence_source": "none"}
-        h11 = {"hypothesis_id": "H11", "decision": "INCONCLUSIVE", "core_metrics": {}, "missing_evidence": missing, "evidence_source": "none"}
-        h12 = {"hypothesis_id": "H12", "decision": "INCONCLUSIVE", "core_metrics": {}, "missing_evidence": missing, "evidence_source": "none"}
+        h05 = {"hypothesis_id": "H05", "decision": "INSUFFICIENT_EVIDENCE", "core_metrics": {}, "missing_evidence": missing, "evidence_source": "none"}
+        h06 = {"hypothesis_id": "H06", "decision": "INSUFFICIENT_EVIDENCE", "core_metrics": {}, "missing_evidence": missing, "evidence_source": "none"}
+        h07 = {"hypothesis_id": "H07", "decision": "INSUFFICIENT_EVIDENCE", "core_metrics": {}, "missing_evidence": missing, "evidence_source": "none"}
+        h08 = {"hypothesis_id": "H08", "decision": "INSUFFICIENT_EVIDENCE", "core_metrics": {}, "missing_evidence": missing, "evidence_source": "none"}
+        h09 = {"hypothesis_id": "H09", "decision": "INSUFFICIENT_EVIDENCE", "core_metrics": {}, "missing_evidence": missing, "evidence_source": "none"}
+        h10 = {"hypothesis_id": "H10", "decision": "INSUFFICIENT_EVIDENCE", "core_metrics": {}, "missing_evidence": missing, "evidence_source": "none"}
+        h11 = {"hypothesis_id": "H11", "decision": "INSUFFICIENT_EVIDENCE", "core_metrics": {}, "missing_evidence": missing, "evidence_source": "none"}
+        h12 = {"hypothesis_id": "H12", "decision": "INSUFFICIENT_EVIDENCE", "core_metrics": {}, "missing_evidence": missing, "evidence_source": "none"}
     input_report = _load_json(Path(run_dir) / INPUT_REPORT_NAME) or {}
     runs = [dict(item) for item in input_report.get("runs", []) if isinstance(item, dict)]
     games = sorted({str(row.get("game")) for row in runs if row.get("game")})

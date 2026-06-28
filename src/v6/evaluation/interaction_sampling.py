@@ -117,6 +117,7 @@ class InteractionSamplingConfig:
     direct_streaming_fold_enabled: bool = True
     direct_streaming_fold_workers: int = 8
     delete_raw_after_direct_streaming_fold: bool = True
+    retain_raw_for_hypothesis_suite: bool = False
     direct_streaming_fold_retry_attempts: int = 5
     direct_streaming_fold_retry_initial_delay_seconds: float = 5.0
     direct_streaming_fold_busy_timeout_ms: int = 60000
@@ -317,7 +318,10 @@ def _generate_sampling_dbs(config: InteractionSamplingConfig, sampling_root: Pat
                             "max_tasks_per_child": int(config.max_tasks_per_child),
                             "direct_streaming_fold_enabled": bool(config.direct_streaming_fold_enabled),
                             "direct_streaming_fold_workers": int(config.direct_streaming_fold_workers),
-                            "delete_raw_after_direct_streaming_fold": bool(config.delete_raw_after_direct_streaming_fold),
+                            "delete_raw_after_direct_streaming_fold": bool(
+                                config.delete_raw_after_direct_streaming_fold and not config.retain_raw_for_hypothesis_suite
+                            ),
+                            "retain_raw_for_hypothesis_suite": bool(config.retain_raw_for_hypothesis_suite),
                             "direct_streaming_fold_retry_attempts": int(config.direct_streaming_fold_retry_attempts),
                             "direct_streaming_fold_retry_initial_delay_seconds": float(config.direct_streaming_fold_retry_initial_delay_seconds),
                             "direct_streaming_fold_busy_timeout_ms": int(config.direct_streaming_fold_busy_timeout_ms),
@@ -384,7 +388,10 @@ def _generate_sampling_dbs(config: InteractionSamplingConfig, sampling_root: Pat
                         "max_tasks_per_child": int(config.max_tasks_per_child),
                         "direct_streaming_fold_enabled": bool(config.direct_streaming_fold_enabled),
                         "direct_streaming_fold_workers": int(config.direct_streaming_fold_workers),
-                        "delete_raw_after_direct_streaming_fold": bool(config.delete_raw_after_direct_streaming_fold),
+                        "delete_raw_after_direct_streaming_fold": bool(
+                            config.delete_raw_after_direct_streaming_fold and not config.retain_raw_for_hypothesis_suite
+                        ),
+                        "retain_raw_for_hypothesis_suite": bool(config.retain_raw_for_hypothesis_suite),
                         "direct_streaming_fold_retry_attempts": int(config.direct_streaming_fold_retry_attempts),
                         "direct_streaming_fold_retry_initial_delay_seconds": float(config.direct_streaming_fold_retry_initial_delay_seconds),
                         "direct_streaming_fold_busy_timeout_ms": int(config.direct_streaming_fold_busy_timeout_ms),

@@ -9,6 +9,18 @@ from v6.higher_order_substrate import derive_higher_order_memory
 from v6.memory.compact_memory import ensure_memory_layout
 
 
+def _evidence_diagnostics(memory_dir: Path, run_dir: Path | None, *, missing_target: str) -> dict[str, Any]:
+    current_state = Path(memory_dir) / "current_state.sqlite"
+    raw_db_exists = bool(run_dir is not None and any(Path(run_dir).rglob("*.sqlite")))
+    return {
+        "expected_current_state_path": str(current_state),
+        "compact_memory_exists": bool(current_state.exists()),
+        "raw_db_evidence_exists": bool(raw_db_exists),
+        "direct_streamed_manifest_exists": bool((Path(memory_dir) / "direct_streaming_fold_manifest.sqlite").exists()),
+        "missing_target": str(missing_target),
+    }
+
+
 def evaluate_h08_world_model_coherence(
     *,
     memory_dir: Path,
@@ -22,11 +34,24 @@ def evaluate_h08_world_model_coherence(
         derive_higher_order_memory(memory_dir=memory_dir, run_dir=run_dir)
     current_state = Path(memory_dir) / "current_state.sqlite"
     if not current_state.exists():
-        result = _base_result("INCONCLUSIVE", ["compact memory missing current_state.sqlite"])
+        result = _base_result("INSUFFICIENT_EVIDENCE", [f"Missing expected compact-memory file: {current_state}"])
+        result["evidence_diagnostics"] = _evidence_diagnostics(memory_dir, run_dir, missing_target="current_state.sqlite")
         _write_outputs(output_dir, result)
         return result
     with sqlite3.connect(current_state) as conn:
         conn.row_factory = sqlite3.Row
+        tables = {str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        missing_tables = [
+            name
+            for name in ("concept_candidates", "world_model_components", "world_model_links", "higher_order_milestones")
+            if name not in tables
+        ]
+        if missing_tables:
+            result = _base_result("INSUFFICIENT_EVIDENCE", [f"Missing expected compact-memory table(s): {', '.join(missing_tables)}"])
+            result["evidence_diagnostics"] = _evidence_diagnostics(memory_dir, run_dir, missing_target=",".join(missing_tables))
+            result["evidence_diagnostics"]["tables_seen"] = sorted(tables)
+            _write_outputs(output_dir, result)
+            return result
         concept_candidate_count = int(conn.execute("SELECT COUNT(*) FROM concept_candidates").fetchone()[0])
         promoted_concept_count = int(conn.execute("SELECT COUNT(*) FROM concept_candidates WHERE COALESCE(is_promoted, 0) = 1").fetchone()[0])
         component_rows = conn.execute(
@@ -101,7 +126,7 @@ def evaluate_h08_world_model_coherence(
         "first_promoted_concept_step": milestone_map.get("first_promoted_concept_step"),
     }
     if concept_candidate_count <= 0:
-        decision = "INCONCLUSIVE"
+        decision = "INSUFFICIENT_EVIDENCE"
         missing = ["no concept candidates available"]
     elif concept_candidate_count > 0 and promoted_concept_count == 0:
         decision = "PARTIALLY_VALID"
@@ -136,6 +161,7 @@ def evaluate_h08_world_model_coherence(
     result = _base_result(decision, missing)
     result.update(metrics)
     result["core_metrics"] = dict(metrics)
+    result["evidence_diagnostics"] = _evidence_diagnostics(memory_dir, run_dir, missing_target="none")
     _write_outputs(output_dir, result)
     return result
 

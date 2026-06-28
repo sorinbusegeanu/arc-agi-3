@@ -188,6 +188,7 @@ H03_DEFAULTS: dict[str, Any] = {
     "evidence_for": [],
     "evidence_against": [],
     "missing_evidence": [],
+    "evidence_diagnostics": {},
     "acceptance_checks": {
         "contingencies_present": None,
         "transformation_families_present": None,
@@ -200,6 +201,18 @@ H03_DEFAULTS: dict[str, Any] = {
         "context_action_fallback_absent": None,
     },
 }
+
+
+def _h03_evidence_diagnostics(*, run_dir: Path, memory_dir: Path | None, sqlite_paths: list[Path], missing_target: str) -> dict[str, Any]:
+    memory_dir = None if memory_dir is None else Path(memory_dir)
+    return {
+        "expected_input_report_path": str(Path(run_dir) / INPUT_REPORT_NAME),
+        "compact_memory_exists": bool(memory_dir is not None and (memory_dir / "current_state.sqlite").exists()),
+        "raw_db_evidence_exists": bool(sqlite_paths),
+        "direct_streamed_manifest_exists": bool(memory_dir is not None and direct_streaming_manifest_exists(memory_dir)),
+        "missing_target": str(missing_target),
+        "raw_db_count": len(sqlite_paths),
+    }
 
 
 def _has_compact_h03_family_evidence(result: dict[str, Any]) -> bool:
@@ -260,6 +273,12 @@ def evaluate_h03_transformation_family_formation(
     result["direct_streaming_compact_only"] = bool(streamed_compact_only)
     if streamed_compact_only:
         result["evidence_source"] = "direct_streaming_manifest_and_compact_memory"
+    result["evidence_diagnostics"] = _h03_evidence_diagnostics(
+        run_dir=run_dir,
+        memory_dir=memory_dir,
+        sqlite_paths=sqlite_paths,
+        missing_target="none",
+    )
 
     report_metrics = _extract_report_metrics(input_report)
     for field, value in report_metrics.items():
@@ -279,6 +298,7 @@ def evaluate_h03_transformation_family_formation(
         return result
     if input_report is None:
         result["missing_evidence"].append(f"Required input report missing: {INPUT_REPORT_NAME}")
+        result["evidence_diagnostics"]["missing_target"] = INPUT_REPORT_NAME
         result["scientific_conclusion"] = "H03 cannot be evaluated because the required interaction-sampling report is missing."
         _finalize_h03_result(result, output_dir)
         return result
@@ -359,10 +379,12 @@ def evaluate_h03_transformation_family_formation(
             missing = "compact transformation-family or contingency evidence unavailable after direct streaming raw cleanup"
             if missing not in result["missing_evidence"]:
                 result["missing_evidence"].append(missing)
+            result["evidence_diagnostics"]["missing_target"] = "compact transformation-family or contingency evidence"
         else:
             result["scientific_conclusion"] = (
                 "H03 remains inconclusive because the current run artifacts do not expose enough direct family or contingency evidence."
             )
+            result["evidence_diagnostics"]["missing_target"] = "direct family or contingency evidence"
     elif contingencies_present and result.get("transformation_family_count") == 0:
         result["decision"] = "INVALID"
         result["scientific_conclusion"] = (

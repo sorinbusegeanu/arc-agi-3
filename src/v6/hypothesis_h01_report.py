@@ -92,10 +92,39 @@ def evaluate_h01_contingency_emergence(run_dir: Path, output_dir: Path, *, memor
         compact_metrics = _extract_compact_memory_metrics(Path(memory_dir))
         result.update(compact_metrics)
         result["evidence_source"] = "compact_memory"
-        result["decision"] = "PARTIALLY_VALID" if _gt(compact_metrics.get("stable_contingency_count"), 0) else "INCONCLUSIVE"
+        interactions_present = _gt(result.get("total_interaction_count"), 0)
+        contingencies_present = _gt(result.get("discovered_contingency_count"), 0) or _gt(result.get("stable_contingency_count"), 0)
+        stable_present = _gt(result.get("stable_contingency_count"), 0)
+        multi_game_support = _gt(result.get("cross_game_contingency_count"), 0)
+        multi_sampler_support = _gt(result.get("cross_sampler_contingency_count"), 0)
+        signal_present = (
+            _gt(result.get("prediction_accuracy"), 0.0)
+            or _gt(result.get("mean_prediction_accuracy"), 0.0)
+            or _gt(result.get("context_lift"), 0.0)
+            or _gt(result.get("mean_context_lift"), 0.0)
+        )
+        result["acceptance_checks"] = {
+            "interactions_present": interactions_present,
+            "contingencies_present": contingencies_present,
+            "stable_contingencies_present": stable_present,
+            "multi_game_support": multi_game_support,
+            "multi_sampler_support": multi_sampler_support,
+            "prediction_or_context_signal_present": signal_present,
+        }
+        if stable_present:
+            result["evidence_for"].append(
+                f"Stable contingencies are present in compact memory ({int(result.get('stable_contingency_count') or 0)})."
+            )
+        if multi_game_support:
+            result["evidence_for"].append("Cross-game contingency support is present in compact memory.")
+        if multi_sampler_support:
+            result["evidence_for"].append("Cross-sampler contingency support is present in compact memory.")
+        if not signal_present:
+            result["evidence_against"].append("Prediction/context signal is unavailable in compact-only evidence.")
+        result["decision"] = "PARTIALLY_VALID" if stable_present else "INCONCLUSIVE"
         result["scientific_conclusion"] = (
             "H01 evaluated from compact memory after raw cleanup."
-            if _gt(compact_metrics.get("stable_contingency_count"), 0)
+            if stable_present
             else "H01 remains inconclusive because compact memory lacks stable contingency evidence."
         )
         _finalize_h01_result(result, output_dir)

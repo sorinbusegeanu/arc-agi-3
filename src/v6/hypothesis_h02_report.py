@@ -124,6 +124,10 @@ H02_DEFAULTS: dict[str, Any] = {
     "sqlite_db_count_inspected": 0,
     "sqlite_db_inspection_truncated": False,
     "sqlite_db_skipped_count": 0,
+    "total_jobs_expected": None,
+    "jobs_represented_in_compact_or_manifest_evidence": None,
+    "jobs_represented_in_raw_scan": None,
+    "evidence_coverage_ratio": None,
     "inspected_db_paths": [],
     "selected_db_path": None,
     "mean_isf_total": None,
@@ -274,6 +278,15 @@ def evaluate_h02_prediction_violation_attention(
     streamed_compact_only = bool(memory_dir is not None and direct_streaming_manifest_exists(memory_dir) and not sqlite_paths)
     if streamed_compact_only:
         result["evidence_source"] = "direct_streaming_manifest_and_compact_memory"
+    if input_report_found:
+        runs = [row for row in (input_report.get("runs") or []) if isinstance(row, dict)]
+        result["total_jobs_expected"] = len(runs) or None
+    if memory_dir is not None and direct_streaming_manifest_exists(memory_dir):
+        from v6.memory.direct_streaming_fold import load_direct_streamed_job_metrics
+        try:
+            result["jobs_represented_in_compact_or_manifest_evidence"] = len(load_direct_streamed_job_metrics(memory_dir))
+        except Exception:
+            result["jobs_represented_in_compact_or_manifest_evidence"] = None
 
     report_metrics = _extract_report_metrics(input_report)
     db_metrics = {} if _report_has_all_fields(report_metrics) else _aggregate_db_metrics(sqlite_paths)
@@ -342,6 +355,13 @@ def evaluate_h02_prediction_violation_attention(
                     result[key] = value
 
     result.update(direct_metrics)
+    result["jobs_represented_in_raw_scan"] = int(result.get("sqlite_db_count_inspected") or 0)
+    jobs_expected = int(result.get("total_jobs_expected") or 0)
+    represented = max(
+        int(result.get("jobs_represented_in_compact_or_manifest_evidence") or 0),
+        int(result.get("jobs_represented_in_raw_scan") or 0),
+    )
+    result["evidence_coverage_ratio"] = (represented / jobs_expected) if jobs_expected > 0 else None
 
     if not input_report_found and memory_dir is not None:
         result["h02a_replay_attention_decision"] = "PARTIALLY_VALID" if _gt(result.get("memory_replay_candidate_count"), 0) else "INCONCLUSIVE"
@@ -376,6 +396,7 @@ def evaluate_h02_prediction_violation_attention(
         )
         _finalize_h02_result(result, output_dir)
         return result
+    low_coverage = result.get("evidence_coverage_ratio") is not None and float(result["evidence_coverage_ratio"]) < 0.50
 
     checks = {
         "prediction_error_positive": _gt(result.get("mean_isf_prediction_error"), 0.0),
@@ -452,6 +473,17 @@ def evaluate_h02_prediction_violation_attention(
         direct_replay_lift_invalid=direct_replay_lift_invalid,
         invalid_core=invalid_core,
     )
+    if low_coverage:
+        if result["h02a_replay_attention_decision"] == "VALID":
+            result["h02a_replay_attention_decision"] = "PARTIALLY_VALID_WITH_LOW_COVERAGE"
+        elif result["h02a_replay_attention_decision"] in {"PARTIALLY_VALID", "INVALID"}:
+            result["h02a_replay_attention_decision"] = "PARTIALLY_VALID_WITH_LOW_COVERAGE"
+        else:
+            result["h02a_replay_attention_decision"] = "INSUFFICIENT_EVIDENCE"
+        _append_unique(
+            result.setdefault("missing_evidence", []),
+            f"H02 evidence coverage is low ({float(result['evidence_coverage_ratio']):.3f}); compact/manifest evidence does not yet represent enough jobs.",
+        )
 
     timing = _evaluate_h02b_pre_carrier_timing(result, temporal_rows)
     result["h02b_pre_carrier_timing_decision"] = timing["decision"]

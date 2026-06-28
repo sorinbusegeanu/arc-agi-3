@@ -271,6 +271,7 @@ def build_parser() -> argparse.ArgumentParser:
     sampling.add_argument("--direct-streaming-shard-synchronous", choices=("normal", "off", "full"), default="off")
     sampling.add_argument("--delete-raw-after-direct-streaming-fold", dest="delete_raw_after_direct_streaming_fold", action="store_true", default=True)
     sampling.add_argument("--keep-raw-after-direct-streaming-fold", dest="delete_raw_after_direct_streaming_fold", action="store_false")
+    sampling.add_argument("--retain-raw-for-hypothesis-suite", action="store_true")
 
     retry_fold = subparsers.add_parser("retry-direct-streaming-fold-failures")
     retry_fold.add_argument("--manifest-path", required=True)
@@ -595,6 +596,7 @@ def build_parser() -> argparse.ArgumentParser:
     continuous.add_argument("--direct-streaming-shard-synchronous", choices=("normal", "off", "full"), default="off")
     continuous.add_argument("--delete-raw-after-direct-streaming-fold", dest="delete_raw_after_direct_streaming_fold", action="store_true", default=True)
     continuous.add_argument("--keep-raw-after-direct-streaming-fold", dest="delete_raw_after_direct_streaming_fold", action="store_false")
+    continuous.add_argument("--retain-raw-for-hypothesis-suite", action="store_true")
     return parser
 
 
@@ -864,6 +866,7 @@ def main(argv: list[str] | None = None) -> int:
                 direct_streaming_fold_enabled=bool(args.direct_streaming_fold),
                 direct_streaming_fold_workers=int(args.direct_streaming_fold_workers),
                 delete_raw_after_direct_streaming_fold=bool(args.delete_raw_after_direct_streaming_fold),
+                retain_raw_for_hypothesis_suite=bool(args.retain_raw_for_hypothesis_suite),
                 direct_streaming_fold_retry_attempts=int(args.direct_streaming_fold_retry_attempts),
                 direct_streaming_fold_retry_initial_delay_seconds=float(args.direct_streaming_fold_retry_initial_delay_seconds),
                 direct_streaming_fold_busy_timeout_ms=int(args.direct_streaming_fold_busy_timeout_ms),
@@ -1488,6 +1491,7 @@ def main(argv: list[str] | None = None) -> int:
                 direct_streaming_fold=bool(args.direct_streaming_fold),
                 direct_streaming_fold_workers=int(args.direct_streaming_fold_workers),
                 delete_raw_after_direct_streaming_fold=bool(args.delete_raw_after_direct_streaming_fold),
+                retain_raw_for_hypothesis_suite=bool(args.retain_raw_for_hypothesis_suite),
                 direct_streaming_fold_retry_attempts=int(args.direct_streaming_fold_retry_attempts),
                 direct_streaming_fold_retry_initial_delay_seconds=float(args.direct_streaming_fold_retry_initial_delay_seconds),
                 direct_streaming_fold_busy_timeout_ms=int(args.direct_streaming_fold_busy_timeout_ms),

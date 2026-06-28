@@ -11497,7 +11497,7 @@ def test_h10_attention_saturation_is_partial(tmp_path: Path) -> None:
             )
         conn.commit()
     result = evaluate_h10_future_option_attention(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h10", already_derived=True)
-    assert result["decision"] == "PARTIALLY_VALID"
+    assert result["decision"] == "INSUFFICIENT_EVIDENCE"
     assert result["attention_all_high_saturation"] is True
     assert result["attention_saturation"] is True
 
@@ -11518,7 +11518,7 @@ def test_h10_all_low_attention_saturation_is_partial(tmp_path: Path) -> None:
             )
         conn.commit()
     result = evaluate_h10_future_option_attention(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h10_low", already_derived=True)
-    assert result["decision"] == "PARTIALLY_VALID"
+    assert result["decision"] == "INSUFFICIENT_EVIDENCE"
     assert result["attention_all_low_saturation"] is True
     assert result["attention_saturation"] is True
     assert "Attention signal is saturated all-low; selective attention is not demonstrated." in result["missing_evidence"]
@@ -11716,3 +11716,72 @@ def test_suite_summary_exposes_individual_vs_gated_decisions() -> None:
     )
     assert "H11 individual: VALID" in text
     assert "H11 suite-gated: PARTIALLY_VALID" in text
+
+
+def test_h06_reports_insufficient_evidence_with_explicit_missing_table(tmp_path: Path) -> None:
+    from v6.hypothesis_h06_report import evaluate_h06_role_transfer
+
+    memory_dir = tmp_path / "memory_h06_missing"
+    memory_dir.mkdir(parents=True, exist_ok=True)
+    result = evaluate_h06_role_transfer(memory_dir=memory_dir, run_dir=tmp_path / "run", output_dir=tmp_path / "h06", already_derived=True)
+    assert result["decision"] == "INSUFFICIENT_EVIDENCE"
+    assert "current_state.sqlite" in json.dumps(result.get("evidence_diagnostics", {}))
+
+
+def test_h08_reports_insufficient_evidence_with_explicit_missing_table(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory_h08_missing"
+    memory_dir.mkdir(parents=True, exist_ok=True)
+    result = evaluate_h08_world_model_coherence(memory_dir=memory_dir, run_dir=tmp_path / "run", output_dir=tmp_path / "h08", already_derived=True)
+    assert result["decision"] == "INSUFFICIENT_EVIDENCE"
+    assert "current_state.sqlite" in json.dumps(result.get("evidence_diagnostics", {}))
+
+
+def test_h02_reports_manifest_compact_coverage_ratio(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from v6.hypothesis_h02_report import evaluate_h02_prediction_violation_attention
+
+    run_dir = tmp_path / "run_h02_cov"
+    run_dir.mkdir()
+    (run_dir / "interaction_sampling_v05c_report.json").write_text(
+        json.dumps({"runs": [{"game": f"g{i}", "sampler_name": "s", "run_status": "ok"} for i in range(10)]}),
+        encoding="utf-8",
+    )
+    memory_dir = tmp_path / "memory_h02_cov"
+    ensure_memory_layout(memory_dir)
+    manifest_path = memory_dir / "direct_streaming_fold_manifest.sqlite"
+    with sqlite3.connect(manifest_path) as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS folded_jobs (job_id TEXT PRIMARY KEY, status TEXT)")
+        conn.execute("CREATE TABLE IF NOT EXISTS job_metrics (job_id TEXT PRIMARY KEY, game TEXT, sampler TEXT, seed INTEGER, metrics_json TEXT NOT NULL)")
+        for i in range(4):
+            conn.execute(
+                "INSERT INTO job_metrics (job_id, game, sampler, seed, metrics_json) VALUES (?, ?, ?, ?, ?)",
+                (f'j{i}', f'g{i}', 's', 0, '{}'),
+            )
+        conn.commit()
+    monkeypatch.setattr(
+        "v6.hypothesis_h02_report._compute_prediction_violation_replay_lift_from_existing_db",
+        lambda *args, **kwargs: {"direct_replay_lift_available": False, "sqlite_db_count_inspected": 0},
+    )
+    result = evaluate_h02_prediction_violation_attention(run_dir, tmp_path / "out_cov", memory_dir=memory_dir)
+    assert result["jobs_represented_in_compact_or_manifest_evidence"] == 4
+    assert result["total_jobs_expected"] == 10
+    assert result["evidence_coverage_ratio"] == 0.4
+
+
+def test_h12_stays_insufficient_evidence_without_successful_comparable_trajectories(tmp_path: Path) -> None:
+    from v6.evaluation.h12_efficiency_emergence import evaluate_h12_efficiency_emergence
+
+    memory_dir = tmp_path / "memory_h12"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute(
+            """
+            INSERT INTO trajectory_efficiency (
+                trajectory_id, game_id, level_id, sampler, seed, epoch, outcome_class, comparable_outcome_group_id,
+                efficiency_active, success, terminal, trajectory_length
+            ) VALUES ('t1', 'g', 'l', 's', 0, 1, 'non_success', '', 0, 0, 0, 5)
+            """
+        )
+        conn.commit()
+    result = evaluate_h12_efficiency_emergence(run_dir=tmp_path / "run_h12", memory_dir=memory_dir, output_dir=tmp_path / "h12")
+    assert result["decision"] == "INSUFFICIENT_EVIDENCE"
+    assert any("No success events" in item for item in result["missing_evidence"])

@@ -10,6 +10,33 @@ from v6.future_options import derive_future_option_memory
 from v6.memory.compact_memory import ensure_memory_layout
 
 
+def _lift(high_value: float | None, low_value: float | None) -> float | None:
+    if high_value is None or low_value is None:
+        return None
+    if low_value <= 0.0:
+        return None if high_value <= 0.0 else float("inf")
+    return float(high_value) / float(low_value)
+
+
+def _subtest_result(rows: list[dict[str, Any]], score_key: str, threshold: float) -> dict[str, Any]:
+    covered = [row for row in rows if row.get(score_key) is not None]
+    high_rows = [row for row in covered if int(row.get("high_option_change") or 0) == 1]
+    low_rows = [row for row in covered if int(row.get("high_option_change") or 0) == 0]
+    high_rate = (sum(1 for row in high_rows if float(row.get(score_key) or 0.0) >= threshold) / len(high_rows)) if high_rows else None
+    low_rate = (sum(1 for row in low_rows if float(row.get(score_key) or 0.0) >= threshold) / len(low_rows)) if low_rows else None
+    saturation = bool(covered) and (
+        sum(1 for row in covered if float(row.get(score_key) or 0.0) >= threshold) in {0, len(covered)}
+    )
+    return {
+        "coverage": len(covered),
+        "high_rate": high_rate,
+        "low_rate": low_rate,
+        "lift": _lift(high_rate, low_rate),
+        "saturation": saturation,
+        "threshold": threshold,
+    }
+
+
 def evaluate_h10_future_option_attention(
     *,
     memory_dir: Path,
@@ -80,17 +107,40 @@ def evaluate_h10_future_option_attention(
         "contradiction_attention_saturation": bool(rows) and sum(1 for row in rows if float(row.get("contradiction_score") or 0.0) >= 0.50) == len(rows),
         "missing_evidence": [],
     }
+    residual_rows: list[dict[str, Any]] = []
+    residual_scores: list[float] = []
+    for row in rows:
+        residual_score = max(
+            float(row.get("replay_priority_score") or 0.0),
+            float(row.get("memory_priority_score") or 0.0),
+        )
+        enriched = dict(row)
+        enriched["attention_residual_score"] = residual_score
+        residual_rows.append(enriched)
+        residual_scores.append(residual_score)
+    residual_threshold = _percentile80(residual_scores)
+    h10a = _subtest_result(rows, "replay_priority_score", 0.50)
+    h10b = _subtest_result(rows, "memory_priority_score", 0.50)
+    h10c = _subtest_result(residual_rows, "attention_residual_score", residual_threshold)
+    h10d = _subtest_result(rows, "memory_priority_score", 0.70)
+    result["h10_subtests"] = {
+        "H10A_future_option_to_replay_priority": h10a,
+        "H10B_future_option_to_memory_priority": h10b,
+        "H10C_future_option_to_contradiction_independent_attention": h10c,
+        "H10D_future_option_to_later_promotion_replay_survival": h10d,
+    }
+    result["residual_attention_percentile_threshold"] = residual_threshold
     if not rows:
-        result["decision"] = "INCONCLUSIVE"
+        result["decision"] = "INSUFFICIENT_EVIDENCE"
     elif not high_rows:
-        result["decision"] = "INCONCLUSIVE"
+        result["decision"] = "INSUFFICIENT_EVIDENCE"
     elif result["attention_all_high_saturation"] and (high_rate or 0.0) == 1.0 and (low_rate or 0.0) == 1.0:
-        result["decision"] = "PARTIALLY_VALID"
+        result["decision"] = "INSUFFICIENT_EVIDENCE"
         result["missing_evidence"].append(
             "Attention signal is saturated all-high across high and low future-option-change interactions; selective attention is not demonstrated."
         )
     elif result["attention_all_low_saturation"]:
-        result["decision"] = "PARTIALLY_VALID"
+        result["decision"] = "INSUFFICIENT_EVIDENCE"
         result["missing_evidence"].append(
             "Attention signal is saturated all-low; selective attention is not demonstrated."
         )
@@ -116,7 +166,14 @@ def evaluate_h10_future_option_attention(
         and lift is not None
         and lift <= 1.0
     ):
-        result["decision"] = "INVALID"
+        sufficient_subtests = [
+            payload for payload in (h10a, h10b, h10c, h10d)
+            if payload["coverage"] >= 5 and not payload["saturation"]
+        ]
+        if sufficient_subtests and all((item["lift"] or 0.0) <= 1.0 for item in sufficient_subtests):
+            result["decision"] = "INVALID"
+        else:
+            result["decision"] = "INSUFFICIENT_EVIDENCE"
     else:
         result["decision"] = "PARTIALLY_VALID"
     result["core_metrics"] = {
@@ -140,6 +197,7 @@ def evaluate_h10_future_option_attention(
             "contradiction_attention_count",
             "replay_or_contradiction_attention_count",
             "attention_threshold_method",
+            "residual_attention_percentile_threshold",
             "attention_calibration_degenerate",
             "attention_all_high_saturation",
             "attention_all_low_saturation",
@@ -150,6 +208,7 @@ def evaluate_h10_future_option_attention(
             "mean_replay_priority_low_option_change",
             "mean_memory_priority_high_option_change",
             "mean_memory_priority_low_option_change",
+            "h10_subtests",
         )
     }
     _write(output_dir, result)
@@ -159,6 +218,15 @@ def evaluate_h10_future_option_attention(
 def _mean(values: list[Any]) -> float | None:
     cooked = [float(value) for value in values if value is not None]
     return (sum(cooked) / len(cooked)) if cooked else None
+
+
+def _percentile80(values: list[float]) -> float:
+    cooked = sorted(float(value) for value in values)
+    if not cooked:
+        return 1.0
+    index = max(0, min(len(cooked) - 1, int(round(0.80 * (len(cooked) - 1)))))
+    threshold = float(cooked[index])
+    return threshold if threshold > 0.0 else 1.0
 
 
 def _write(output_dir: Path, result: dict[str, Any]) -> None:

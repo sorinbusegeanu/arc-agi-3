@@ -18,7 +18,7 @@ def evaluate_h12_efficiency_emergence(
     output_dir: Path,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    rows, evidence_source = _load_trajectory_rows(run_dir=run_dir, memory_dir=memory_dir)
+    rows, evidence_source, reconstruction = _load_trajectory_rows(run_dir=run_dir, memory_dir=memory_dir)
     rows = [dict(row) for row in rows]
     _write_parquet(output_dir / "h12_trajectory_metrics.parquet", rows)
     efficiency_root = ((memory_dir.parent / "efficiency") if memory_dir is not None else (run_dir / "efficiency"))
@@ -74,11 +74,21 @@ def evaluate_h12_efficiency_emergence(
             if previous_epoch_mean is None or current_mean_norm is None
             else float(current_mean_norm) > float(previous_epoch_mean)
         ),
+        "trajectory_reconstruction_diagnostics": reconstruction,
         "missing_evidence": [],
     }
     if len(successful_rows) < 2 or comparable_groups <= 0:
         result["decision"] = "INSUFFICIENT_EVIDENCE"
         result["missing_evidence"].append("Too few successful or comparable trajectories are available for H12.")
+        for key, message in (
+            ("no_success_events", "No success events were recorded."),
+            ("no_terminal_events", "No terminal events were recorded."),
+            ("no_episode_boundaries", "No episode boundaries were recoverable."),
+            ("missing_state_hashes", "State hashes are missing for trajectory reconstruction."),
+            ("missing_compact_trajectory_records", "Compact trajectory-efficiency records are missing."),
+        ):
+            if reconstruction.get(key):
+                result["missing_evidence"].append(message)
     elif result["trajectories_with_memory_bonus"] <= 0 and result["trajectories_with_replay_bonus"] <= 0:
         result["decision"] = "PARTIALLY_VALID"
         result["missing_evidence"].append("Trajectory efficiency is computed but not yet linked strongly to memory or replay bonuses.")
@@ -125,20 +135,50 @@ def evaluate_h12_efficiency_emergence(
     return result
 
 
-def _load_trajectory_rows(*, run_dir: Path, memory_dir: Path | None) -> tuple[list[dict[str, Any]], str]:
+def _load_trajectory_rows(*, run_dir: Path, memory_dir: Path | None) -> tuple[list[dict[str, Any]], str, dict[str, Any]]:
     sqlite_paths = sorted(run_dir.rglob("*.sqlite"))
     rows: list[dict[str, Any]] = []
+    diagnostics = {
+        "no_success_events": False,
+        "no_terminal_events": False,
+        "no_episode_boundaries": False,
+        "missing_state_hashes": False,
+        "missing_compact_trajectory_records": False,
+    }
+    saw_interactions = False
     for db_path in sqlite_paths:
         with sqlite3.connect(db_path) as conn:
             conn.row_factory = sqlite3.Row
             tables = {item[0] for item in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            if "interactions" in tables:
+                saw_interactions = True
+                try:
+                    row = conn.execute(
+                        """
+                        SELECT
+                            SUM(CASE WHEN outcome_state IN ('WIN', 'GAME_OVER') OR COALESCE(level_completed_event, 0) = 1 THEN 1 ELSE 0 END),
+                            SUM(CASE WHEN episode_id IS NOT NULL THEN 1 ELSE 0 END),
+                            SUM(CASE WHEN state_hash_before IS NOT NULL AND state_hash_after IS NOT NULL THEN 1 ELSE 0 END)
+                        FROM interactions
+                        """
+                    ).fetchone()
+                    success_terminal = int(row[0] or 0)
+                    episode_boundaries = int(row[1] or 0)
+                    hashed = int(row[2] or 0)
+                    diagnostics["no_terminal_events"] = diagnostics["no_terminal_events"] or success_terminal <= 0
+                    diagnostics["no_episode_boundaries"] = diagnostics["no_episode_boundaries"] or episode_boundaries <= 0
+                    diagnostics["missing_state_hashes"] = diagnostics["missing_state_hashes"] or hashed <= 0
+                except sqlite3.DatabaseError:
+                    pass
             if "trajectory_efficiency" not in tables:
                 continue
             rows.extend(dict(row) for row in conn.execute("SELECT * FROM trajectory_efficiency ORDER BY trajectory_id ASC").fetchall())
     if rows:
-        return rows, "raw_epoch_db"
+        diagnostics["no_success_events"] = all(int(row.get("success") or 0) != 1 for row in rows)
+        return rows, "raw_epoch_db", diagnostics
     if memory_dir is None:
-        return [], "none"
+        diagnostics["missing_compact_trajectory_records"] = True
+        return [], "none", diagnostics
     ensure_memory_layout(memory_dir)
     with sqlite3.connect(Path(memory_dir) / "current_state.sqlite") as conn:
         conn.row_factory = sqlite3.Row
@@ -147,10 +187,15 @@ def _load_trajectory_rows(*, run_dir: Path, memory_dir: Path | None) -> tuple[li
         if "trajectory_efficiency" in tables:
             rows = [dict(row) for row in conn.execute("SELECT * FROM trajectory_efficiency ORDER BY trajectory_id ASC").fetchall()]
             if rows:
+                diagnostics["no_success_events"] = all(int(row.get("success") or 0) != 1 for row in rows)
                 if direct_streaming_manifest_exists(memory_dir) and not sqlite_paths:
-                    return rows, "direct_streaming_manifest_and_compact_memory"
-                return rows, "compact_memory"
-    return [], "none"
+                    return rows, "direct_streaming_manifest_and_compact_memory", diagnostics
+                return rows, "compact_memory", diagnostics
+    diagnostics["missing_compact_trajectory_records"] = True
+    if not saw_interactions:
+        diagnostics["no_episode_boundaries"] = True
+        diagnostics["missing_state_hashes"] = True
+    return [], "none", diagnostics
 
 
 def _count_improvements(rows: list[dict[str, Any]]) -> int:
@@ -235,4 +280,3 @@ def _write_report(output_dir: Path, result: dict[str, Any]) -> None:
         f"mean blocked-action ratio: {result.get('mean_blocked_action_ratio')}\n"
     )
     (output_dir / "h12_efficiency_emergence_report.txt").write_text(text, encoding="utf-8")
-
