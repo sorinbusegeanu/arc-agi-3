@@ -38,6 +38,10 @@ H01_DEFAULTS: dict[str, Any] = {
     "contingency_candidate_count": None,
     "discovered_contingency_count": None,
     "stable_contingency_count": None,
+    "stable_contingencies_count": None,
+    "transformation_families_count": None,
+    "family_members_count": None,
+    "raw_contingency_rows_seen": None,
     "prediction_accuracy": None,
     "mean_prediction_accuracy": None,
     "context_lift": None,
@@ -429,6 +433,8 @@ def _extract_compact_memory_metrics(memory_dir: Path) -> dict[str, Any]:
         per_sampler = dict(connection.execute("SELECT COALESCE(sampler, 'unknown'), COUNT(*) FROM stable_contingencies GROUP BY COALESCE(sampler, 'unknown')").fetchall())
         stable_count = int(connection.execute("SELECT COUNT(*) FROM stable_contingencies WHERE support_count >= 20").fetchone()[0])
         discovered_count = int(connection.execute("SELECT COUNT(*) FROM stable_contingencies").fetchone()[0])
+        transformation_families_count = int(connection.execute("SELECT COUNT(*) FROM transformation_families").fetchone()[0])
+        family_members_count = int(connection.execute("SELECT COUNT(*) FROM family_members").fetchone()[0])
         memory_record_count = int(connection.execute("SELECT COUNT(*) FROM memory_nodes WHERE node_type = 'InteractionMemory'").fetchone()[0])
         memory_score_record_count = int(connection.execute("SELECT COUNT(*) FROM memory_scores WHERE node_id LIKE 'M0:interaction:%'").fetchone()[0])
         high_priority_replay_count = int(connection.execute("SELECT COUNT(*) FROM memory_scores WHERE node_id LIKE 'M0:interaction:%' AND COALESCE(replay_priority, 0.0) >= 0.50").fetchone()[0])
@@ -439,6 +445,7 @@ def _extract_compact_memory_metrics(memory_dir: Path) -> dict[str, Any]:
             "SELECT value_json FROM memory_summary WHERE key = 'total_interactions_seen'"
         ).fetchone()
         interaction_count = 0
+        raw_contingency_rows_seen = None
         if summary_row is not None and summary_row[0] is not None:
             try:
                 interaction_count = int(json.loads(summary_row[0]))
@@ -447,6 +454,16 @@ def _extract_compact_memory_metrics(memory_dir: Path) -> dict[str, Any]:
                     interaction_count = int(summary_row[0])
                 except Exception:
                     interaction_count = 0
+        fold_summary_row = connection.execute(
+            "SELECT value_json FROM memory_summary WHERE key = 'fold_summary'"
+        ).fetchone()
+        if fold_summary_row is not None and fold_summary_row[0] is not None:
+            try:
+                fold_summary = json.loads(fold_summary_row[0])
+                if isinstance(fold_summary, dict):
+                    raw_contingency_rows_seen = fold_summary.get("raw_contingency_rows_seen")
+            except Exception:
+                raw_contingency_rows_seen = None
         replay_queue_count = None
         if replay_queue.exists():
             with sqlite3.connect(replay_queue) as replay_conn:
@@ -484,8 +501,12 @@ def _extract_compact_memory_metrics(memory_dir: Path) -> dict[str, Any]:
         return {
             "total_interaction_count": interaction_count if interaction_count > 0 else (memory_record_count or memory_score_record_count or None),
             "stable_contingency_count": stable_count,
+            "stable_contingencies_count": discovered_count,
             "contingency_candidate_count": discovered_count,
             "discovered_contingency_count": discovered_count,
+            "transformation_families_count": transformation_families_count,
+            "family_members_count": family_members_count,
+            "raw_contingency_rows_seen": raw_contingency_rows_seen,
             "per_game_contingency_counts": {str(key): int(value) for key, value in per_game.items()},
             "per_sampler_contingency_counts": {str(key): int(value) for key, value in per_sampler.items()},
             "mean_prediction_accuracy": _mean_or_none(prediction_accuracy_values),

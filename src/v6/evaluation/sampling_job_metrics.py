@@ -22,10 +22,11 @@ def compute_sampling_job_metrics(
     sampler_name: str,
     seed: int,
     config: Any,
+    busy_timeout_ms: int = 60000,
 ) -> dict:
     from v6.evaluation import interaction_sampling as mod
 
-    with _patched_sqlite_busy_timeout(60000):
+    with _patched_sqlite_busy_timeout(int(busy_timeout_ms)):
         return mod._run_metrics(Path(db_path), game, sampler_name, int(seed), config)
 
 
@@ -35,10 +36,11 @@ def compute_sampling_job_temporal_milestones(
     game: str,
     sampler_name: str,
     seed: int,
+    busy_timeout_ms: int = 60000,
 ) -> dict:
     from v6.evaluation import interaction_sampling as mod
 
-    with _patched_sqlite_busy_timeout(60000):
+    with _patched_sqlite_busy_timeout(int(busy_timeout_ms)):
         return mod._temporal_milestones_for_db(
             Path(db_path),
             game=game,
@@ -54,8 +56,9 @@ def compute_sampling_job_validation_payload(
     sampler_name: str,
     seed: int,
     config: Any,
+    busy_timeout_ms: int = 60000,
 ) -> dict:
-    examples = _load_validation_examples(Path(db_path))
+    examples = _load_validation_examples(Path(db_path), busy_timeout_ms=int(busy_timeout_ms))
     return {
         "game": str(game),
         "sampler_name": str(sampler_name),
@@ -74,20 +77,21 @@ def compute_sampling_job_validation_payload(
     }
 
 
-def _load_validation_examples(db_path: Path) -> list[Any]:
+def _load_validation_examples(db_path: Path, *, busy_timeout_ms: int = 60000) -> list[Any]:
     from v6.evaluation.prefuture_role_prediction import load_prefuture_examples
 
-    with _connect_sampling_read_db(db_path) as connection:
+    with _connect_sampling_read_db(db_path, busy_timeout_ms=int(busy_timeout_ms)) as connection:
         tables = {str(row[0]) for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     if "future_effects" in tables:
-        return load_prefuture_examples(db_path)
-    return _load_validation_examples_from_current_schema(db_path)
+        with _patched_sqlite_busy_timeout(int(busy_timeout_ms)):
+            return load_prefuture_examples(db_path)
+    return _load_validation_examples_from_current_schema(db_path, busy_timeout_ms=int(busy_timeout_ms))
 
 
-def _load_validation_examples_from_current_schema(db_path: Path) -> list[Any]:
+def _load_validation_examples_from_current_schema(db_path: Path, *, busy_timeout_ms: int = 60000) -> list[Any]:
     from v6.evaluation.prefuture_role_prediction import PrefutureExample
 
-    with _connect_sampling_read_db(db_path) as connection:
+    with _connect_sampling_read_db(db_path, busy_timeout_ms=int(busy_timeout_ms)) as connection:
         connection.row_factory = sqlite3.Row
         prediction_rows = connection.execute(
             """

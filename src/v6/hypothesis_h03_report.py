@@ -151,6 +151,7 @@ H03_DEFAULTS: dict[str, Any] = {
     "compact_family_repair_reason": None,
     "compact_family_repair_family_count": 0,
     "compact_family_repair_member_count": 0,
+    "raw_contingency_rows_seen": None,
     "transformation_families_before_repair": None,
     "transformation_families_after_repair": None,
     "family_members_before_repair": None,
@@ -162,6 +163,7 @@ H03_DEFAULTS: dict[str, Any] = {
     "transformation_family_candidate_count": None,
     "transformation_family_count": None,
     "stable_transformation_family_count": None,
+    "family_members_count": None,
     "family_member_count_total": None,
     "family_mean_member_count": None,
     "family_median_member_count": None,
@@ -618,6 +620,7 @@ def _extract_h03_compact_metrics(memory_dir: Path) -> dict[str, Any]:
         "stable_transformation_family_count": family_count,
         "transformation_families_count": family_count,
         "stable_contingencies_count": contingency_count,
+        "family_members_count": member_total,
         "family_member_count_total": member_total,
         "singleton_family_count": singleton_count,
         "singleton_family_ratio": (singleton_count / family_count) if family_count else None,
@@ -635,6 +638,7 @@ def _extract_h03_compact_metrics(memory_dir: Path) -> dict[str, Any]:
         "transformation_families_after_repair": transformation_families_after_repair,
         "family_members_before_repair": family_members_before_repair,
         "family_members_after_repair": family_members_after_repair,
+        "raw_contingency_rows_seen": _summary_json_int(state_conn, "raw_contingency_rows_seen"),
         **graph_metrics,
     }
 
@@ -1699,6 +1703,20 @@ def _load_json(path: Path) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _summary_json_int(connection: sqlite3.Connection, key: str) -> int | None:
+    row = connection.execute("SELECT value_json FROM memory_summary WHERE key = ?", (str(key),)).fetchone()
+    if row is None or row[0] is None:
+        return None
+    try:
+        value = json.loads(row[0])
+    except Exception:
+        value = row[0]
+    try:
+        return int(value)
+    except Exception:
         return None
 
 

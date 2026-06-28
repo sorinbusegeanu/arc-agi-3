@@ -5,6 +5,7 @@ import sqlite3
 import sys
 import types
 from pathlib import Path
+from types import SimpleNamespace
 import numpy as np
 import pytest
 import v6.evaluation.interaction_sampling as interaction_sampling
@@ -151,6 +152,7 @@ from v6.memory.compact_memory import (
     derive_missing_transformation_families_from_stable_contingencies,
     ensure_memory_layout,
     fold_live_system_into_compact_memory,
+    fold_single_sampling_db_into_main_compact_memory,
     fold_sampling_job_sidecars_into_compact_memory,
     fold_sampling_job_sidecars_into_compact_memory_shard,
     load_memory_summary,
@@ -11843,6 +11845,99 @@ def test_h03_compact_derives_family_counts_from_stable_contingencies(tmp_path: P
     assert result["transformation_families_count"] >= 1
 
 
+def test_fold_single_sampling_db_persists_raw_contingencies_into_stable_contingencies(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory_fold_contingencies"
+    db_path = tmp_path / "seed_0.sqlite"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE contingencies (
+                id INTEGER PRIMARY KEY,
+                context_level INTEGER,
+                context_signature TEXT,
+                action INTEGER,
+                transformation_family INTEGER,
+                support_count INTEGER,
+                confidence REAL,
+                prediction_attempt_count INTEGER,
+                prediction_success_count INTEGER,
+                prediction_accuracy REAL
+            );
+            CREATE TABLE prediction_results (
+                interaction_id INTEGER PRIMARY KEY,
+                action INTEGER,
+                actual_family INTEGER
+            );
+            CREATE TABLE transformation_families (
+                id INTEGER PRIMARY KEY,
+                centroid_vector TEXT,
+                support_count INTEGER
+            );
+            """
+        )
+        conn.execute("INSERT INTO transformation_families (id, centroid_vector, support_count) VALUES (7, '[1,0,0]', 3)")
+        conn.execute(
+            """
+            INSERT INTO contingencies (
+                id, context_level, context_signature, action, transformation_family, support_count, confidence,
+                prediction_attempt_count, prediction_success_count, prediction_accuracy
+            ) VALUES (1, 1, '[1,2,3]', 2, 7, 3, 0.9, 4, 3, 0.75)
+            """
+        )
+        conn.execute("INSERT INTO prediction_results (interaction_id, action, actual_family) VALUES (1, 2, 7)")
+        conn.commit()
+    totals = fold_single_sampling_db_into_main_compact_memory(
+        db_path=db_path,
+        memory_dir=memory_dir,
+        fold_config=CompactMemoryFoldConfig(global_step_start=1, global_step_end=10),
+        finalize_after_fold=True,
+    )
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        stable_count = conn.execute("SELECT COUNT(*) FROM stable_contingencies").fetchone()[0]
+        family_count = conn.execute("SELECT COUNT(*) FROM transformation_families").fetchone()[0]
+    assert totals["raw_contingency_rows_seen"] == 1
+    assert totals["stable_contingencies_inserted"] == 1
+    assert stable_count > 0
+    assert family_count > 0
+
+
+def test_fold_single_sampling_db_does_not_fabricate_families_without_m1_when_contingency_table_exists(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory_fold_no_m1"
+    db_path = tmp_path / "seed_0.sqlite"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE contingencies (
+                id INTEGER PRIMARY KEY,
+                context_level INTEGER,
+                context_signature TEXT,
+                action INTEGER,
+                transformation_family INTEGER,
+                support_count INTEGER,
+                confidence REAL
+            );
+            CREATE TABLE prediction_results (
+                interaction_id INTEGER PRIMARY KEY,
+                action INTEGER,
+                actual_family INTEGER
+            );
+            """
+        )
+        conn.execute("INSERT INTO prediction_results (interaction_id, action, actual_family) VALUES (1, 2, 7)")
+        conn.commit()
+    fold_single_sampling_db_into_main_compact_memory(
+        db_path=db_path,
+        memory_dir=memory_dir,
+        fold_config=CompactMemoryFoldConfig(global_step_start=1, global_step_end=10),
+        finalize_after_fold=True,
+    )
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        stable_count = conn.execute("SELECT COUNT(*) FROM stable_contingencies").fetchone()[0]
+        family_count = conn.execute("SELECT COUNT(*) FROM transformation_families").fetchone()[0]
+    assert stable_count == 0
+    assert family_count == 0
+
+
 def test_compact_family_repair_creates_transformation_families_and_members(tmp_path: Path) -> None:
     from v6.memory.compact_memory import derive_missing_transformation_families_from_stable_contingencies
 
@@ -11878,6 +11973,30 @@ def test_compact_family_repair_is_idempotent(tmp_path: Path) -> None:
     assert second["compact_family_repair_reason"] == "family_substrate_already_present"
     assert family_count >= 1
     assert member_count == 2
+
+
+def test_compact_family_repair_reports_missing_m1_substrate_when_only_families_exist(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory_h03_missing_m1"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute(
+            """
+            INSERT INTO transformation_families (
+                family_id, canonical_signature, relaxed_signature, effect_type, action_group, polarity,
+                support_count, member_count, first_seen_global_step, last_seen_global_step, stability_score
+            ) VALUES (1, 'fam:a', 'fam:a', 'raw', '1', 'unknown', 3, 1, 1, 2, 0.5)
+            """
+        )
+        conn.execute(
+            "INSERT INTO family_members (family_signature, contingency_key, support_count, first_seen_global_step, last_seen_global_step) VALUES ('fam:a', 'c1', 1, 1, 2)"
+        )
+        conn.commit()
+    summary = derive_missing_transformation_families_from_stable_contingencies(memory_dir)
+    assert summary["stable_contingencies_count"] == 0
+    assert summary["transformation_families_count"] == 1
+    assert summary["family_members_count"] == 1
+    assert summary["compact_m1_substrate_missing"] is True
+    assert summary["compact_family_repair_reason"] == "missing_m1_substrate_with_existing_m2"
 
 
 def test_compact_family_repair_enables_role_links_with_family(tmp_path: Path) -> None:
@@ -12069,6 +12188,56 @@ def test_h03_uses_repaired_compact_evidence_without_raw_dbs(tmp_path: Path) -> N
     assert result["transformation_family_count"] > 0
 
 
+def test_h01_compact_memory_contingencies_do_not_force_invalid(tmp_path: Path) -> None:
+    from v6.hypothesis_h01_report import evaluate_h01_contingency_emergence
+    from v6.memory.direct_streaming_fold import ensure_direct_streaming_fold_manifest
+
+    run_dir = tmp_path / "run_h01_compact"
+    run_dir.mkdir()
+    memory_dir = tmp_path / "memory_h01_compact"
+    ensure_memory_layout(memory_dir)
+    ensure_direct_streaming_fold_manifest(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute(
+            "INSERT INTO stable_contingencies (canonical_key, game, sampler, context_level, action, effect_signature, support_count, prediction_accuracy, normalized_contingency_key) VALUES ('c1', 'g1', 's1', 1, 1, 'e1', 3, 0.75, 'k1')"
+        )
+        conn.execute(
+            "INSERT INTO stable_contingencies (canonical_key, game, sampler, context_level, action, effect_signature, support_count, prediction_accuracy, normalized_contingency_key) VALUES ('c2', 'g2', 's2', 1, 1, 'e1', 4, 0.80, 'k1')"
+        )
+        conn.execute(
+            "INSERT INTO memory_nodes (node_id, memory_level, node_type, canonical_key, support_count, first_seen_step, last_seen_step, attrs_json) VALUES ('M0:interaction:g1', 'M0', 'InteractionMemory', 'g1', 1, 1, 1, '{}')"
+        )
+        conn.execute("INSERT INTO memory_summary (key, value_json) VALUES ('total_interactions_seen', '2')")
+        conn.commit()
+    result = evaluate_h01_contingency_emergence(run_dir, tmp_path / "out_h01_compact", memory_dir=memory_dir)
+    assert result["decision"] != "INVALID"
+    assert int(result["discovered_contingency_count"] or 0) > 0
+
+
+def test_h03_compact_fold_evidence_exposes_stable_contingencies_and_families(tmp_path: Path) -> None:
+    from v6.hypothesis_h03_report import evaluate_h03_transformation_family_formation
+    from v6.memory.direct_streaming_fold import ensure_direct_streaming_fold_manifest
+
+    run_dir = tmp_path / "run_h03_compact_after_fold"
+    run_dir.mkdir()
+    (run_dir / "interaction_sampling_v05c_report.json").write_text(
+        json.dumps({"runs": [{"game": "g1", "sampler_name": "s1"}]}),
+        encoding="utf-8",
+    )
+    memory_dir = tmp_path / "memory_h03_compact_after_fold"
+    ensure_memory_layout(memory_dir)
+    ensure_direct_streaming_fold_manifest(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute("INSERT INTO stable_contingencies (canonical_key, game, sampler, context_level, action, effect_signature, support_count, first_seen_global_step, last_seen_global_step, stability_score) VALUES ('c1', 'g1', 's1', 1, 1, 'e1', 5, 1, 1, 0.5)")
+        conn.execute("INSERT INTO stable_contingencies (canonical_key, game, sampler, context_level, action, effect_signature, support_count, first_seen_global_step, last_seen_global_step, stability_score) VALUES ('c2', 'g1', 's1', 1, 1, 'e1', 6, 1, 2, 0.6)")
+        conn.commit()
+    derive_missing_transformation_families_from_stable_contingencies(memory_dir)
+    result = evaluate_h03_transformation_family_formation(run_dir, tmp_path / "out_h03_compact_after_fold", memory_dir=memory_dir)
+    assert int(result["stable_contingencies_count"] or 0) == 2
+    assert int(result["transformation_families_count"] or 0) >= 1
+    assert int(result["family_members_count"] or 0) >= 2
+
+
 def test_suite_summary_exposes_individual_vs_gated_decisions() -> None:
     from v6.hypothesis_suite_report import _apply_higher_order_dependency_gates, _format_text, _suite_gate_status
 
@@ -12178,3 +12347,189 @@ def test_h12_stays_insufficient_evidence_without_successful_comparable_trajector
     result = evaluate_h12_efficiency_emergence(run_dir=tmp_path / "run_h12", memory_dir=memory_dir, output_dir=tmp_path / "h12")
     assert result["decision"] == "INSUFFICIENT_EVIDENCE"
     assert any("No success events" in item for item in result["missing_evidence"])
+
+
+def test_is_retryable_fold_error_matches_locked_busy_variants() -> None:
+    from v6.memory.direct_streaming_fold import is_retryable_fold_error
+
+    assert is_retryable_fold_error(sqlite3.OperationalError("database is locked")) is True
+    assert is_retryable_fold_error(sqlite3.DatabaseError("database table is locked")) is True
+    assert is_retryable_fold_error(sqlite3.DatabaseError("database disk image is malformed")) is False
+
+
+def test_sampling_read_db_applies_busy_timeout(tmp_path: Path) -> None:
+    from v6.evaluation.sampling_job_metrics import _connect_sampling_read_db
+
+    db_path = tmp_path / "busy.sqlite"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE t (id INTEGER)")
+        conn.commit()
+    with _connect_sampling_read_db(db_path, busy_timeout_ms=54321) as conn:
+        timeout_ms = int(conn.execute("PRAGMA busy_timeout").fetchone()[0] or 0)
+    assert timeout_ms == 54321
+
+
+def test_direct_fold_passes_busy_timeout_to_metrics_and_shard_connections(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from v6.memory.direct_streaming_fold import DirectStreamingFoldConfig, DirectStreamingFoldJob, fold_one_completed_job_to_shard
+
+    db_path = tmp_path / "seed_0.sqlite"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE interactions (id INTEGER PRIMARY KEY)")
+        conn.commit()
+    memory_dir = tmp_path / "memory_busy_fold"
+    shard_dir = tmp_path / "shard_busy_fold"
+    shard_dir.mkdir()
+    seen: dict[str, Any] = {"metric_timeouts": [], "compact_busy_timeouts": []}
+
+    monkeypatch.setattr(
+        "v6.memory.direct_streaming_fold.compute_sampling_job_metrics",
+        lambda *args, **kwargs: seen["metric_timeouts"].append(kwargs.get("busy_timeout_ms")) or {},
+    )
+    monkeypatch.setattr(
+        "v6.memory.direct_streaming_fold.compute_sampling_job_temporal_milestones",
+        lambda *args, **kwargs: seen["metric_timeouts"].append(kwargs.get("busy_timeout_ms")) or {},
+    )
+    monkeypatch.setattr(
+        "v6.memory.direct_streaming_fold.compute_sampling_job_validation_payload",
+        lambda *args, **kwargs: seen["metric_timeouts"].append(kwargs.get("busy_timeout_ms")) or {"examples": []},
+    )
+    monkeypatch.setattr(
+        "v6.memory.direct_streaming_fold.fold_single_sampling_db_into_main_compact_memory",
+        lambda *args, **kwargs: seen["compact_busy_timeouts"].append(kwargs.get("busy_timeout_ms")) or {},
+    )
+    config = DirectStreamingFoldConfig(memory_dir=str(memory_dir), busy_timeout_ms=54321)
+    job = DirectStreamingFoldJob(
+        job_id="job1",
+        db_path=str(db_path),
+        game="g",
+        sampler="s",
+        seed=0,
+        steps=1,
+        horizon=1,
+        context_depth=1,
+        global_step_start=1,
+        global_step_end=1,
+        memory_dir=str(memory_dir),
+        delete_raw_after_fold=False,
+    )
+    result = fold_one_completed_job_to_shard(
+        job=job,
+        config=config,
+        sampling_config=SimpleNamespace(steps=1, horizon=1),
+        shard_dir=shard_dir,
+    )
+    assert result.status == "folded"
+    assert seen["metric_timeouts"] == [54321, 54321, 54321]
+    assert seen["compact_busy_timeouts"] == [54321]
+
+
+def test_failed_fold_manifest_records_retry_history(tmp_path: Path) -> None:
+    from v6.memory.direct_streaming_fold import DirectStreamingFoldConfig, DirectStreamingFoldJob, fold_one_completed_job_to_shard
+
+    db_path = tmp_path / "seed_0.sqlite"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE interactions (id INTEGER PRIMARY KEY)")
+        conn.commit()
+    memory_dir = tmp_path / "memory_retry_fail"
+    shard_dir = tmp_path / "shard_retry_fail"
+    shard_dir.mkdir()
+    config = DirectStreamingFoldConfig(memory_dir=str(memory_dir), retry_attempts=2, retry_initial_delay_seconds=0.0)
+    job = DirectStreamingFoldJob(
+        job_id="job_fail",
+        db_path=str(db_path),
+        game="g",
+        sampler="s",
+        seed=0,
+        steps=1,
+        horizon=1,
+        context_depth=1,
+        global_step_start=1,
+        global_step_end=1,
+        memory_dir=str(memory_dir),
+        delete_raw_after_fold=False,
+    )
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(
+            "v6.memory.direct_streaming_fold._fold_one_completed_job_to_shard_once",
+            lambda **kwargs: (_ for _ in ()).throw(sqlite3.OperationalError("database is locked")),
+        )
+        result = fold_one_completed_job_to_shard(
+            job=job,
+            config=config,
+            sampling_config=SimpleNamespace(steps=1, horizon=1),
+            shard_dir=shard_dir,
+        )
+    assert result.status == "failed"
+    manifest = memory_dir / "direct_streaming_fold_manifest.sqlite"
+    with sqlite3.connect(manifest) as conn:
+        row = conn.execute(
+            "SELECT retry_attempt_count, retryable_error_count, last_retry_error, retry_error_history_json FROM folded_jobs WHERE job_id = 'job_fail'"
+        ).fetchone()
+    assert int(row[0]) == 2
+    assert int(row[1]) == 2
+    assert "database is locked" in str(row[2]).lower()
+    assert len(json.loads(row[3])) == 2
+
+
+def test_successful_fold_with_one_retry_records_retry_attempt_count(tmp_path: Path) -> None:
+    from v6.memory.direct_streaming_fold import DirectStreamingFoldConfig, DirectStreamingFoldJob, DirectStreamingFoldResult, fold_one_completed_job_to_shard
+
+    db_path = tmp_path / "seed_0.sqlite"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE interactions (id INTEGER PRIMARY KEY)")
+        conn.commit()
+    memory_dir = tmp_path / "memory_retry_success"
+    shard_dir = tmp_path / "shard_retry_success"
+    shard_dir.mkdir()
+    config = DirectStreamingFoldConfig(memory_dir=str(memory_dir), retry_attempts=3, retry_initial_delay_seconds=0.0)
+    job = DirectStreamingFoldJob(
+        job_id="job_success",
+        db_path=str(db_path),
+        game="g",
+        sampler="s",
+        seed=0,
+        steps=1,
+        horizon=1,
+        context_depth=1,
+        global_step_start=1,
+        global_step_end=1,
+        memory_dir=str(memory_dir),
+        delete_raw_after_fold=False,
+    )
+    state = {"calls": 0}
+
+    def _fake_once(**kwargs):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return DirectStreamingFoldResult(
+            job_id=job.job_id,
+            db_path=str(job.db_path),
+            status="folded",
+            fold_started_at=1.0,
+            fold_finished_at=2.0,
+            deleted_raw=False,
+            metrics={"m": 1},
+            milestones={"t": 1},
+            validation_payload={"examples": []},
+        )
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("v6.memory.direct_streaming_fold._fold_one_completed_job_to_shard_once", _fake_once)
+        result = fold_one_completed_job_to_shard(
+            job=job,
+            config=config,
+            sampling_config=SimpleNamespace(steps=1, horizon=1),
+            shard_dir=shard_dir,
+        )
+    assert result.status == "folded"
+    assert result.retry_attempt_count == 2
+    assert result.retryable_error_count == 1
+    manifest = memory_dir / "direct_streaming_fold_manifest.sqlite"
+    with sqlite3.connect(manifest) as conn:
+        row = conn.execute(
+            "SELECT retry_attempt_count, retryable_error_count, retry_error_history_json FROM folded_jobs WHERE job_id = 'job_success'"
+        ).fetchone()
+    assert int(row[0]) == 2
+    assert int(row[1]) == 1
+    assert len(json.loads(row[2])) == 1

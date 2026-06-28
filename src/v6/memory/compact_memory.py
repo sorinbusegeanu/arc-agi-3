@@ -49,11 +49,12 @@ def configure_compact_sqlite_connection(
     write: bool,
     synchronous: str = "NORMAL",
     temporary_shard: bool = False,
+    busy_timeout_ms: int = 10000,
 ) -> None:
     mode = str(synchronous or "NORMAL").strip().upper()
     if mode not in {"OFF", "NORMAL", "FULL"}:
         mode = "NORMAL"
-    conn.execute("PRAGMA busy_timeout=10000")
+    conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
     if write:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute(f"PRAGMA synchronous={mode}")
@@ -63,7 +64,7 @@ def configure_compact_sqlite_connection(
             conn.execute("PRAGMA wal_autocheckpoint=0")
     else:
         conn.execute("PRAGMA query_only=ON")
-        conn.execute("PRAGMA busy_timeout=10000")
+        conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
 
 
 def ensure_memory_layout(memory_dir: str | Path) -> CompactMemoryPaths:
@@ -93,6 +94,12 @@ def derive_missing_transformation_families_from_stable_contingencies(memory_dir:
             "compact_family_repair_used": False,
             "compact_family_repair_reason": "current_state_missing",
             "stable_contingencies_count": 0,
+            "transformation_families_count": 0,
+            "family_members_count": 0,
+            "representative_contingency_example_count": 0,
+            "contingency_memory_node_count": 0,
+            "contingency_graph_edge_count": 0,
+            "compact_m1_substrate_missing": False,
             "transformation_families_before": 0,
             "transformation_families_after": 0,
             "family_members_before": 0,
@@ -107,6 +114,12 @@ def derive_missing_transformation_families_from_stable_contingencies(memory_dir:
         "compact_family_repair_used": False,
         "compact_family_repair_reason": "unknown",
         "stable_contingencies_count": 0,
+        "transformation_families_count": 0,
+        "family_members_count": 0,
+        "representative_contingency_example_count": 0,
+        "contingency_memory_node_count": 0,
+        "contingency_graph_edge_count": 0,
+        "compact_m1_substrate_missing": False,
         "transformation_families_before": 0,
         "transformation_families_after": 0,
         "family_members_before": 0,
@@ -123,13 +136,57 @@ def derive_missing_transformation_families_from_stable_contingencies(memory_dir:
         stable_count = int(state_conn.execute("SELECT COUNT(*) FROM stable_contingencies").fetchone()[0])
         family_count = int(state_conn.execute("SELECT COUNT(*) FROM transformation_families").fetchone()[0])
         family_members_before = int(state_conn.execute("SELECT COUNT(*) FROM family_members").fetchone()[0])
+        representative_contingency_example_count = _safe_scalar(
+            state_conn,
+            "SELECT COUNT(*) FROM representative_examples WHERE owner_type = 'contingency'",
+        )
+        contingency_memory_node_count = _safe_scalar(
+            state_conn,
+            """
+            SELECT COUNT(*)
+            FROM memory_nodes
+            WHERE node_type = 'ContingencyMemory'
+               OR node_id LIKE 'M1:contingency:%'
+            """,
+        )
         summary["stable_contingencies_count"] = stable_count
+        summary["transformation_families_count"] = family_count
+        summary["family_members_count"] = family_members_before
+        summary["representative_contingency_example_count"] = representative_contingency_example_count
+        summary["contingency_memory_node_count"] = contingency_memory_node_count
         summary["transformation_families_before"] = family_count
         summary["family_members_before"] = family_members_before
         if stable_count <= 0:
-            summary["compact_family_repair_reason"] = "no_stable_contingencies"
+            summary["compact_family_repair_reason"] = (
+                "missing_m1_substrate_with_existing_m2"
+                if family_count > 0
+                else "no_stable_contingencies"
+            )
             summary["transformation_families_after"] = family_count
             summary["family_members_after"] = family_members_before
+            try:
+                with sqlite3.connect(paths.graph) as graph_conn:
+                    configure_compact_sqlite_connection(graph_conn, write=False)
+                    summary["contingency_graph_edge_count"] = _safe_scalar(
+                        graph_conn,
+                        """
+                        SELECT COUNT(*)
+                        FROM graph_edges
+                        WHERE (
+                            source_node_id LIKE 'M1:contingency:%'
+                            OR source_node_id LIKE 'contingency:%'
+                        )
+                          AND (
+                            target_node_id LIKE 'M2:family:%'
+                            OR target_node_id LIKE 'family:%'
+                        )
+                        """,
+                    )
+            except Exception as exc:
+                summary["compact_family_repair_error"] = str(exc)
+            summary["compact_m1_substrate_missing"] = bool(
+                family_count > 0 and stable_count <= 0
+            )
             _write_family_repair_summary(state_conn, summary)
             state_conn.commit()
             return summary
@@ -341,6 +398,7 @@ def derive_missing_transformation_families_from_stable_contingencies(memory_dir:
             graph_conn.commit()
             summary["compact_family_repair_graph_node_count"] = graph_node_count
             summary["compact_family_repair_graph_edge_count"] = graph_edge_count
+            summary["contingency_graph_edge_count"] = graph_edge_count
     except Exception as exc:
         summary["compact_family_repair_error"] = str(exc)
     return summary
@@ -361,9 +419,14 @@ def fold_epoch_raw_into_compact_memory(
     current_summary = load_memory_summary(paths.summary_json)
     totals = {
         "stable_contingencies_added": 0,
+        "stable_contingencies_inserted": 0,
         "transformation_families_added": 0,
+        "transformation_families_inserted": 0,
+        "family_members_inserted": 0,
         "carrier_candidates_added": 0,
         "contradiction_clusters_added": 0,
+        "raw_contingency_rows_seen": 0,
+        "raw_dbs_without_contingency_table": 0,
         "replay_queue_size": 0,
         "representative_examples_retained": 0,
         "graph_node_count": 0,
@@ -432,14 +495,20 @@ def fold_single_sampling_db_into_main_compact_memory(
     finalize_after_fold: bool = False,
     sqlite_synchronous: str = "NORMAL",
     temporary_shard: bool = False,
+    busy_timeout_ms: int = 10000,
 ) -> dict[str, Any]:
     paths = ensure_memory_layout(memory_dir)
     sqlite_path = Path(db_path)
     totals = {
         "stable_contingencies_added": 0,
+        "stable_contingencies_inserted": 0,
         "transformation_families_added": 0,
+        "transformation_families_inserted": 0,
+        "family_members_inserted": 0,
         "carrier_candidates_added": 0,
         "contradiction_clusters_added": 0,
+        "raw_contingency_rows_seen": 0,
+        "raw_dbs_without_contingency_table": 0,
         "replay_queue_size": 0,
         "representative_examples_retained": 0,
         "graph_node_count": 0,
@@ -449,13 +518,13 @@ def fold_single_sampling_db_into_main_compact_memory(
     }
     live_graph_path = sqlite_path.with_name("live_graph_compact.json")
     with (
-        sqlite3.connect(paths.current_state) as state_conn,
-        sqlite3.connect(paths.graph) as graph_conn,
-        sqlite3.connect(paths.replay_queue) as replay_conn,
+        sqlite3.connect(paths.current_state, timeout=max(1.0, float(busy_timeout_ms) / 1000.0)) as state_conn,
+        sqlite3.connect(paths.graph, timeout=max(1.0, float(busy_timeout_ms) / 1000.0)) as graph_conn,
+        sqlite3.connect(paths.replay_queue, timeout=max(1.0, float(busy_timeout_ms) / 1000.0)) as replay_conn,
     ):
-        configure_compact_sqlite_connection(state_conn, write=True, synchronous=sqlite_synchronous, temporary_shard=temporary_shard)
-        configure_compact_sqlite_connection(graph_conn, write=True, synchronous=sqlite_synchronous, temporary_shard=temporary_shard)
-        configure_compact_sqlite_connection(replay_conn, write=True, synchronous=sqlite_synchronous, temporary_shard=temporary_shard)
+        configure_compact_sqlite_connection(state_conn, write=True, synchronous=sqlite_synchronous, temporary_shard=temporary_shard, busy_timeout_ms=busy_timeout_ms)
+        configure_compact_sqlite_connection(graph_conn, write=True, synchronous=sqlite_synchronous, temporary_shard=temporary_shard, busy_timeout_ms=busy_timeout_ms)
+        configure_compact_sqlite_connection(replay_conn, write=True, synchronous=sqlite_synchronous, temporary_shard=temporary_shard, busy_timeout_ms=busy_timeout_ms)
         _fold_single_db(
             db_path=sqlite_path,
             state_conn=state_conn,
@@ -463,6 +532,7 @@ def fold_single_sampling_db_into_main_compact_memory(
             replay_conn=replay_conn,
             fold_config=fold_config,
             totals=totals,
+            busy_timeout_ms=busy_timeout_ms,
         )
         if live_graph_path.exists():
             _ingest_live_graph_export(graph_conn, live_graph_path, fold_config)
@@ -886,9 +956,14 @@ def _fold_epoch_raw_into_compact_memory_parallel(
             )
             for key in (
                 "stable_contingencies_added",
+                "stable_contingencies_inserted",
                 "transformation_families_added",
+                "transformation_families_inserted",
+                "family_members_inserted",
                 "carrier_candidates_added",
                 "contradiction_clusters_added",
+                "raw_contingency_rows_seen",
+                "raw_dbs_without_contingency_table",
             ):
                 totals[key] = sum(int(item.get(key, 0) or 0) for item in chunk_totals)
             totals["replay_queue_size"] = int(summary.get("replay_queue_size", 0) or 0)
@@ -919,9 +994,14 @@ def _fold_db_chunk_worker(db_paths: list[str], temp_memory_dir: str, fold_config
     temp_paths = ensure_memory_layout(temp_memory_dir)
     totals = {
         "stable_contingencies_added": 0,
+        "stable_contingencies_inserted": 0,
         "transformation_families_added": 0,
+        "transformation_families_inserted": 0,
+        "family_members_inserted": 0,
         "carrier_candidates_added": 0,
         "contradiction_clusters_added": 0,
+        "raw_contingency_rows_seen": 0,
+        "raw_dbs_without_contingency_table": 0,
         "replay_queue_size": 0,
         "representative_examples_retained": 0,
         "graph_node_count": 0,
@@ -1683,8 +1763,10 @@ def _fold_single_db(
     replay_conn: sqlite3.Connection,
     fold_config: CompactMemoryFoldConfig,
     totals: dict[str, Any],
+    busy_timeout_ms: int = 10000,
 ) -> None:
-    with sqlite3.connect(db_path) as raw_conn:
+    with sqlite3.connect(db_path, timeout=max(1.0, float(busy_timeout_ms) / 1000.0)) as raw_conn:
+        raw_conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
         raw_conn.row_factory = sqlite3.Row
         tables = {str(row[0]) for row in raw_conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
         game = _path_segment(db_path, -4)
@@ -1692,10 +1774,14 @@ def _fold_single_db(
         seed = _seed_from_db_path(db_path)
         stable_threshold = 20
         prediction_payload_by_interaction = _prediction_payload_by_interaction_id(raw_conn) if "prediction_results" in tables else {}
+        if "contingencies" not in tables:
+            totals["raw_dbs_without_contingency_table"] = int(totals.get("raw_dbs_without_contingency_table", 0) or 0) + 1
 
         family_members_by_signature: dict[str, set[str]] = {}
+        raw_contingency_rows_seen = 0
         if "contingencies" in tables:
             for row in raw_conn.execute("SELECT * FROM contingencies").fetchall():
+                raw_contingency_rows_seen += 1
                 payload = dict(row)
                 family_signature = canonical_family_signature_from_raw_db(raw_conn, payload.get("transformation_family"), payload)
                 stable_family_id = stable_family_int_id(family_signature)
@@ -1740,8 +1826,9 @@ def _fold_single_db(
                     fold_config=fold_config,
                     stable_threshold=stable_threshold,
                 )
+                totals["stable_contingencies_inserted"] = int(totals.get("stable_contingencies_inserted", 0) or 0) + 1
                 if support_count >= stable_threshold:
-                    totals["stable_contingencies_added"] += 1
+                    totals["stable_contingencies_added"] = int(totals.get("stable_contingencies_added", 0) or 0) + 1
                 family_members_by_signature.setdefault(family_signature, set()).add(canonical_key)
                 _retain_example(
                     state_conn,
@@ -1770,6 +1857,7 @@ def _fold_single_db(
                     contradiction_key=None,
                     replay_id=None,
                 )
+        totals["raw_contingency_rows_seen"] = int(totals.get("raw_contingency_rows_seen", 0) or 0) + raw_contingency_rows_seen
         if "memory_nodes" in tables:
             for row in raw_conn.execute("SELECT * FROM memory_nodes ORDER BY node_id ASC").fetchall():
                 scoped_node_id = _scope_memory_node_id(str(row["node_id"]), db_path)
@@ -1984,7 +2072,10 @@ def _fold_single_db(
                     contradiction_key=contradiction_key,
                     replay_id=None,
                 )
+            allow_prediction_family_fold = ("contingencies" not in tables) or raw_contingency_rows_seen > 0
             for family_signature, info in family_supports.items():
+                if not allow_prediction_family_fold:
+                    continue
                 member_count = int(info["member_count"])
                 _upsert_transformation_family(
                     state_conn,
@@ -1995,7 +2086,8 @@ def _fold_single_db(
                     last_seen=int(info["last_step"] or fold_config.global_step_end),
                     stability_score=float(member_count),
                 )
-                totals["transformation_families_added"] += 1
+                totals["transformation_families_added"] = int(totals.get("transformation_families_added", 0) or 0) + 1
+                totals["transformation_families_inserted"] = int(totals.get("transformation_families_inserted", 0) or 0) + 1
                 _retain_example(
                     state_conn,
                     owner_type="family",
@@ -2063,6 +2155,7 @@ def _fold_single_db(
                     """,
                     (family_signature, contingency_key, 1, fold_config.global_step_start, fold_config.global_step_end),
                 )
+                totals["family_members_inserted"] = int(totals.get("family_members_inserted", 0) or 0) + 1
         if "interactions" in tables:
             for row in raw_conn.execute("SELECT * FROM interactions WHERE COALESCE(memory_replay_candidate, 0) = 1 OR COALESCE(memory_replay_priority, 0.0) > 0.0").fetchall():
                 payload = dict(row)
@@ -2887,7 +2980,9 @@ def _build_memory_summary_from_connections(
     paths: CompactMemoryPaths,
 ) -> dict[str, Any]:
     stable_count = int(state_conn.execute("SELECT COUNT(*) FROM stable_contingencies WHERE support_count >= 20").fetchone()[0])
+    stable_substrate_count = int(state_conn.execute("SELECT COUNT(*) FROM stable_contingencies").fetchone()[0])
     family_count = _count_rows(state_conn, "transformation_families")
+    family_members_count = _count_rows(state_conn, "family_members")
     carrier_count = _count_rows(state_conn, "carrier_candidates")
     role_candidate_count = _count_rows(state_conn, "role_candidates")
     emergent_role_count = _safe_scalar(state_conn, "SELECT COUNT(*) FROM role_candidates WHERE COALESCE(is_emergent, 0) = 1")
@@ -2964,7 +3059,10 @@ def _build_memory_summary_from_connections(
     }
     summary = {
         "stable_contingency_count": stable_count,
+        "stable_contingencies_count": stable_substrate_count,
         "transformation_family_count": family_count,
+        "transformation_families_count": family_count,
+        "family_members_count": family_members_count,
         "carrier_candidate_count": carrier_count,
         "emergent_carrier_count": emergent_carrier_count,
         "role_candidate_count": role_candidate_count,
