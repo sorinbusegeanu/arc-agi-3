@@ -13,6 +13,10 @@ from v6.memory.direct_streaming_fold import (
     DirectStreamingFoldJob,
     DirectStreamingFoldWriter,
     direct_streaming_manifest_exists,
+    ensure_direct_streaming_fold_manifest,
+    fold_one_completed_job_to_shard,
+    is_retryable_fold_error,
+    retry_direct_streaming_fold_failures,
 )
 
 
@@ -398,6 +402,139 @@ def test_direct_streaming_fold_finalizes_once(tmp_path: Path, monkeypatch) -> No
     assert summary["direct_streaming_fold_finalized_main_memory"] is True
 
 
+def test_retry_direct_streaming_fold_rebuilds_reports_after_success(tmp_path: Path, monkeypatch) -> None:
+    memory_dir = tmp_path / "memory"
+    manifest_path = ensure_direct_streaming_fold_manifest(memory_dir)
+    db_path = _make_fake_raw_job(
+        tmp_path / "epochs" / "epoch_0001" / "raw" / "sampling_v05c" / "tt01" / "random_baseline" / "steps_5",
+        "seed_0.sqlite",
+    )
+    with sqlite3.connect(manifest_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO folded_jobs (
+                job_id, db_path, game, sampler, seed, steps, horizon, context_depth,
+                global_step_start, global_step_end, status, fold_started_at, fold_finished_at,
+                deleted_raw, parquet_exported, error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "tt01:random_baseline:seed0:steps5",
+                str(db_path),
+                "tt01",
+                "random_baseline",
+                0,
+                5,
+                2,
+                1,
+                1,
+                5,
+                "failed",
+                0.0,
+                None,
+                0,
+                0,
+                "database is locked",
+            ),
+        )
+        conn.commit()
+
+    _patch_writer_parallelism(monkeypatch)
+    def _fake_fold(**kwargs):
+        with sqlite3.connect(manifest_path) as conn:
+            conn.execute(
+                "UPDATE folded_jobs SET status = 'folded', fold_finished_at = 1.0, deleted_raw = 1, error = NULL WHERE job_id = ?",
+                (kwargs["job"].job_id,),
+            )
+            conn.commit()
+        return type(
+            "Result",
+            (),
+            {
+                "job_id": kwargs["job"].job_id,
+                "db_path": kwargs["job"].db_path,
+                "status": "folded",
+                "fold_started_at": 0.0,
+                "fold_finished_at": 1.0,
+                "deleted_raw": True,
+            },
+        )()
+
+    monkeypatch.setattr("v6.memory.direct_streaming_fold.fold_one_completed_job_to_shard", _fake_fold)
+    monkeypatch.setattr("v6.memory.direct_streaming_fold.merge_direct_fold_shards", lambda **kwargs: {"merged": True})
+    monkeypatch.setattr("v6.memory.direct_streaming_fold.finalize_main_compact_memory", lambda **kwargs: {"finalized": True})
+    rebuilt: list[str] = []
+
+    def _fake_rebuild(*, memory_dir, jobs):
+        rebuilt.append(str(memory_dir))
+        return [str(tmp_path / "epochs" / "epoch_0001")]
+
+    monkeypatch.setattr("v6.memory.direct_streaming_fold._rerun_reports_for_retried_epochs", _fake_rebuild)
+
+    summary = retry_direct_streaming_fold_failures(
+        manifest_path=manifest_path,
+        memory_dir=memory_dir,
+        workers=1,
+        delete_raw_after_fold=False,
+        finalize_after_success=True,
+    )
+
+    assert summary["direct_streaming_fold_finalized_main_memory"] is True
+    assert summary["direct_streaming_fold_reports_rebuilt"] == [str(tmp_path / "epochs" / "epoch_0001")]
+    assert rebuilt == [str(memory_dir)]
+
+
+def test_direct_streaming_fold_start_removes_stale_shard_root_when_manifest_clean(tmp_path: Path, monkeypatch) -> None:
+    memory_dir = tmp_path / "memory"
+    manifest_path = ensure_direct_streaming_fold_manifest(memory_dir)
+    shard_root = memory_dir / "direct_streaming_fold_shards"
+    (shard_root / "shard_0000").mkdir(parents=True, exist_ok=False)
+
+    with sqlite3.connect(manifest_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO folded_jobs (
+                job_id, db_path, game, sampler, seed, steps, horizon, context_depth,
+                global_step_start, global_step_end, status, fold_started_at, fold_finished_at,
+                deleted_raw, parquet_exported, error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "tt01:random_baseline:seed0:steps5",
+                str(tmp_path / "seed_0.sqlite"),
+                "tt01",
+                "random_baseline",
+                0,
+                5,
+                2,
+                1,
+                1,
+                5,
+                "folded",
+                0.0,
+                1.0,
+                1,
+                0,
+                None,
+            ),
+        )
+        conn.commit()
+
+    _patch_writer_parallelism(monkeypatch)
+    writer = DirectStreamingFoldWriter(
+        DirectStreamingFoldConfig(memory_dir=str(memory_dir), fold_workers=2),
+        sampling_config=type("Cfg", (), {"steps": 5, "horizon": 2})(),
+    )
+    writer.start()
+    try:
+        assert writer._summary["direct_streaming_fold_stale_shard_root_removed"] is True
+        assert shard_root.exists()
+        assert len(writer._shard_dirs) == 2
+    finally:
+        if writer._executor is not None:
+            writer._executor.shutdown(wait=True, cancel_futures=True)
+
+
 def test_compact_sqlite_busy_timeout_wal(tmp_path: Path) -> None:
     output_dir = tmp_path / "sampling"
     memory_dir = output_dir / "memory"
@@ -498,6 +635,150 @@ def test_failed_validation_payload_keeps_raw(tmp_path: Path, monkeypatch) -> Non
     assert summary["direct_streaming_fold_failed_count"] == 1
     assert db_path.exists()
     assert db_path.with_name("carrier_candidates.json").exists()
+
+
+def test_is_retryable_fold_error() -> None:
+    assert is_retryable_fold_error(sqlite3.OperationalError("database is locked")) is True
+    assert is_retryable_fold_error(sqlite3.OperationalError("database is busy")) is True
+    assert is_retryable_fold_error(sqlite3.OperationalError("other sqlite issue")) is False
+    assert is_retryable_fold_error(RuntimeError("database is locked")) is False
+
+
+def test_retryable_locked_fold_is_retried_and_succeeds(tmp_path: Path, monkeypatch) -> None:
+    memory_dir = tmp_path / "memory"
+    db_path = _make_fake_raw_job(tmp_path / "raw")
+    attempts = {"fold": 0}
+    monkeypatch.setattr("v6.memory.direct_streaming_fold.time.sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "v6.memory.direct_streaming_fold.compute_sampling_job_metrics",
+        lambda *args, **kwargs: {"game": "tt01", "sampler_name": "random_baseline", "seed": 0},
+    )
+    monkeypatch.setattr(
+        "v6.memory.direct_streaming_fold.compute_sampling_job_temporal_milestones",
+        lambda *args, **kwargs: {"game": "tt01", "sampler": "random_baseline", "seed": 0},
+    )
+    monkeypatch.setattr(
+        "v6.memory.direct_streaming_fold.compute_sampling_job_validation_payload",
+        lambda *args, **kwargs: {"game": "tt01", "sampler_name": "random_baseline", "seed": 0, "examples": []},
+    )
+
+    def _fold(*args, **kwargs):
+        attempts["fold"] += 1
+        if attempts["fold"] < 2:
+            raise sqlite3.OperationalError("database is locked")
+        return {"db_files_folded": 1}
+
+    monkeypatch.setattr("v6.memory.direct_streaming_fold.fold_single_sampling_db_into_main_compact_memory", _fold)
+    result = fold_one_completed_job_to_shard(
+        job=DirectStreamingFoldJob(
+            job_id="tt01:random_baseline:seed0:steps5",
+            db_path=str(db_path),
+            game="tt01",
+            sampler="random_baseline",
+            seed=0,
+            steps=5,
+            horizon=2,
+            context_depth=1,
+            global_step_start=1,
+            global_step_end=5,
+            memory_dir=str(memory_dir),
+        ),
+        config=DirectStreamingFoldConfig(memory_dir=str(memory_dir), retry_attempts=5),
+        sampling_config=type("Cfg", (), {"steps": 5, "horizon": 2})(),
+        shard_dir=str(memory_dir / "retry_shard"),
+    )
+    assert result.status == "folded"
+    assert attempts["fold"] == 2
+
+
+def test_retryable_locked_fold_exhausts_and_fails(tmp_path: Path, monkeypatch) -> None:
+    memory_dir = tmp_path / "memory"
+    db_path = _make_fake_raw_job(tmp_path / "raw")
+    attempts = {"fold": 0}
+    monkeypatch.setattr("v6.memory.direct_streaming_fold.time.sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "v6.memory.direct_streaming_fold.compute_sampling_job_metrics",
+        lambda *args, **kwargs: {"game": "tt01", "sampler_name": "random_baseline", "seed": 0},
+    )
+    monkeypatch.setattr(
+        "v6.memory.direct_streaming_fold.compute_sampling_job_temporal_milestones",
+        lambda *args, **kwargs: {"game": "tt01", "sampler": "random_baseline", "seed": 0},
+    )
+    monkeypatch.setattr(
+        "v6.memory.direct_streaming_fold.compute_sampling_job_validation_payload",
+        lambda *args, **kwargs: {"game": "tt01", "sampler_name": "random_baseline", "seed": 0, "examples": []},
+    )
+
+    def _fold(*args, **kwargs):
+        attempts["fold"] += 1
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr("v6.memory.direct_streaming_fold.fold_single_sampling_db_into_main_compact_memory", _fold)
+    result = fold_one_completed_job_to_shard(
+        job=DirectStreamingFoldJob(
+            job_id="tt01:random_baseline:seed0:steps5",
+            db_path=str(db_path),
+            game="tt01",
+            sampler="random_baseline",
+            seed=0,
+            steps=5,
+            horizon=2,
+            context_depth=1,
+            global_step_start=1,
+            global_step_end=5,
+            memory_dir=str(memory_dir),
+        ),
+        config=DirectStreamingFoldConfig(memory_dir=str(memory_dir), retry_attempts=3),
+        sampling_config=type("Cfg", (), {"steps": 5, "horizon": 2})(),
+        shard_dir=str(memory_dir / "retry_shard"),
+    )
+    assert result.status == "failed"
+    assert attempts["fold"] == 3
+
+
+def test_non_retryable_fold_error_is_not_retried(tmp_path: Path, monkeypatch) -> None:
+    memory_dir = tmp_path / "memory"
+    db_path = _make_fake_raw_job(tmp_path / "raw")
+    attempts = {"fold": 0}
+    monkeypatch.setattr("v6.memory.direct_streaming_fold.time.sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "v6.memory.direct_streaming_fold.compute_sampling_job_metrics",
+        lambda *args, **kwargs: {"game": "tt01", "sampler_name": "random_baseline", "seed": 0},
+    )
+    monkeypatch.setattr(
+        "v6.memory.direct_streaming_fold.compute_sampling_job_temporal_milestones",
+        lambda *args, **kwargs: {"game": "tt01", "sampler": "random_baseline", "seed": 0},
+    )
+    monkeypatch.setattr(
+        "v6.memory.direct_streaming_fold.compute_sampling_job_validation_payload",
+        lambda *args, **kwargs: {"game": "tt01", "sampler_name": "random_baseline", "seed": 0, "examples": []},
+    )
+
+    def _fold(*args, **kwargs):
+        attempts["fold"] += 1
+        raise RuntimeError("broken fold")
+
+    monkeypatch.setattr("v6.memory.direct_streaming_fold.fold_single_sampling_db_into_main_compact_memory", _fold)
+    result = fold_one_completed_job_to_shard(
+        job=DirectStreamingFoldJob(
+            job_id="tt01:random_baseline:seed0:steps5",
+            db_path=str(db_path),
+            game="tt01",
+            sampler="random_baseline",
+            seed=0,
+            steps=5,
+            horizon=2,
+            context_depth=1,
+            global_step_start=1,
+            global_step_end=5,
+            memory_dir=str(memory_dir),
+        ),
+        config=DirectStreamingFoldConfig(memory_dir=str(memory_dir), retry_attempts=5),
+        sampling_config=type("Cfg", (), {"steps": 5, "horizon": 2})(),
+        shard_dir=str(memory_dir / "retry_shard"),
+    )
+    assert result.status == "failed"
+    assert attempts["fold"] == 1
 
 
 def test_cli_rejects_legacy_sidecar_flags() -> None:

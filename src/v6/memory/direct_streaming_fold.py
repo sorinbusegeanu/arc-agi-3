@@ -8,6 +8,7 @@ import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from tqdm.auto import tqdm
@@ -54,6 +55,10 @@ class DirectStreamingFoldConfig:
     manifest_name: str = "direct_streaming_fold_manifest.sqlite"
     fold_workers: int = 8
     shard_root_name: str = "direct_streaming_fold_shards"
+    retry_attempts: int = 5
+    retry_initial_delay_seconds: float = 5.0
+    busy_timeout_ms: int = 60000
+    shard_synchronous: str = "off"
 
 
 @dataclass
@@ -65,6 +70,12 @@ class DirectStreamingFoldResult:
     fold_finished_at: float | None
     deleted_raw: bool
     error: str | None = None
+    raw_db_size_bytes: int = 0
+    shard_size_before_bytes: int = 0
+    shard_size_after_bytes: int = 0
+    shard_bytes_added: int = 0
+    fold_seconds: float = 0.0
+    fold_write_mb_per_second: float = 0.0
 
 
 def ensure_direct_streaming_fold_manifest(memory_dir: str | Path) -> Path:
@@ -264,6 +275,91 @@ def write_validation_payload(job: DirectStreamingFoldJob, payload: dict[str, Any
         conn.commit()
 
 
+def write_fold_job_manifest_result(
+    job: DirectStreamingFoldJob,
+    *,
+    status: str,
+    fold_started_at: float,
+    fold_finished_at: float,
+    deleted_raw: bool,
+    parquet_exported: bool,
+    metrics: dict[str, Any] | None,
+    milestones: dict[str, Any] | None,
+    validation_payload: dict[str, Any] | None,
+    error: str | None = None,
+) -> None:
+    path = ensure_direct_streaming_fold_manifest(job.memory_dir)
+    with _connect_manifest(path) as conn:
+        conn.execute("BEGIN")
+        conn.execute(
+            """
+            INSERT INTO folded_jobs (
+                job_id, db_path, game, sampler, seed, steps, horizon, context_depth,
+                global_step_start, global_step_end, status, fold_started_at, fold_finished_at, deleted_raw, parquet_exported, error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(job_id) DO UPDATE SET
+                db_path = excluded.db_path,
+                game = excluded.game,
+                sampler = excluded.sampler,
+                seed = excluded.seed,
+                steps = excluded.steps,
+                horizon = excluded.horizon,
+                context_depth = excluded.context_depth,
+                global_step_start = excluded.global_step_start,
+                global_step_end = excluded.global_step_end,
+                status = excluded.status,
+                fold_started_at = excluded.fold_started_at,
+                fold_finished_at = excluded.fold_finished_at,
+                deleted_raw = excluded.deleted_raw,
+                parquet_exported = excluded.parquet_exported,
+                error = excluded.error
+            """,
+            (
+                job.job_id,
+                str(job.db_path),
+                job.game,
+                job.sampler,
+                int(job.seed),
+                int(job.steps),
+                int(job.horizon),
+                int(job.context_depth),
+                int(job.global_step_start),
+                int(job.global_step_end),
+                str(status),
+                float(fold_started_at),
+                float(fold_finished_at),
+                int(bool(deleted_raw)),
+                int(bool(parquet_exported)),
+                None if error is None else str(error),
+            ),
+        )
+        if metrics is not None:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO job_metrics (job_id, game, sampler, seed, metrics_json)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (job.job_id, job.game, job.sampler, int(job.seed), json.dumps(metrics, sort_keys=True)),
+            )
+        if milestones is not None:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO temporal_milestones (job_id, game, sampler, seed, milestones_json)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (job.job_id, job.game, job.sampler, int(job.seed), json.dumps(milestones, sort_keys=True)),
+            )
+        if validation_payload is not None:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO validation_payloads (job_id, game, sampler, seed, payload_json)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (job.job_id, job.game, job.sampler, int(job.seed), json.dumps(validation_payload, sort_keys=True)),
+            )
+        conn.commit()
+
+
 def load_direct_streamed_job_metrics(memory_dir: str | Path) -> list[dict]:
     path = ensure_direct_streaming_fold_manifest(memory_dir)
     with _connect_manifest(path) as conn:
@@ -297,8 +393,8 @@ def direct_streaming_manifest_has_failures(memory_dir: str | Path) -> bool:
 
 
 def _connect_manifest(path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(path)
-    conn.execute("PRAGMA busy_timeout=10000")
+    conn = sqlite3.connect(path, timeout=60.0)
+    conn.execute("PRAGMA busy_timeout=60000")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     return conn
@@ -334,6 +430,62 @@ def _shard_root(config: DirectStreamingFoldConfig) -> Path:
     return Path(config.memory_dir) / str(config.shard_root_name)
 
 
+def _epoch_dir_for_db_path(db_path: str | Path) -> Path | None:
+    path = Path(db_path)
+    parts = path.parts
+    try:
+        epochs_index = parts.index("epochs")
+    except ValueError:
+        return None
+    if epochs_index + 1 >= len(parts):
+        return None
+    return Path(*parts[: epochs_index + 2])
+
+
+def _rerun_reports_for_retried_epochs(*, memory_dir: str | Path, jobs: list[DirectStreamingFoldJob]) -> list[str]:
+    from v6.evaluation.h10b_selective_forgetting import evaluate_h10b_selective_forgetting
+    from v6.hypothesis_suite_report import run_hypothesis_suite_report
+    from v6.memory.selective_forgetting import run_selective_forgetting_pass
+
+    rebuilt: list[str] = []
+    seen: set[Path] = set()
+    for job in jobs:
+        epoch_dir = _epoch_dir_for_db_path(job.db_path)
+        if epoch_dir is None or epoch_dir in seen:
+            continue
+        seen.add(epoch_dir)
+        raw_dir = epoch_dir / "raw"
+        reports_dir = epoch_dir / "reports"
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        if not raw_dir.exists():
+            continue
+        run_hypothesis_suite_report(
+            run_dir=raw_dir,
+            memory_dir=Path(memory_dir),
+            output_dir=reports_dir,
+            scan_all_dbs=False,
+            max_db_files=0,
+            max_rows=0,
+            epoch_id=epoch_dir.name,
+        )
+        epoch_name = str(epoch_dir.name)
+        epoch_number = 0
+        if epoch_name.startswith("epoch_"):
+            try:
+                epoch_number = int(epoch_name.split("_", 1)[1])
+            except (IndexError, ValueError):
+                epoch_number = 0
+        forgetting_summary = run_selective_forgetting_pass(memory_dir=memory_dir, epoch=epoch_number)
+        evaluate_h10b_selective_forgetting(
+            memory_dir=Path(memory_dir),
+            run_dir=raw_dir,
+            output_dir=reports_dir / "h10b",
+            forgetting_summary=forgetting_summary,
+        )
+        rebuilt.append(str(epoch_dir))
+    return rebuilt
+
+
 def _make_shard_dirs(config: DirectStreamingFoldConfig, worker_count: int) -> list[Path]:
     shard_root = _shard_root(config)
     if shard_root.exists():
@@ -348,6 +500,23 @@ def _make_shard_dirs(config: DirectStreamingFoldConfig, worker_count: int) -> li
         shard_dir.mkdir(parents=True, exist_ok=False)
         shard_dirs.append(shard_dir)
     return shard_dirs
+
+
+def _cleanup_stale_existing_shard_root(config: DirectStreamingFoldConfig) -> bool:
+    shard_root = _shard_root(config)
+    if not shard_root.exists():
+        return False
+    manifest_path = ensure_direct_streaming_fold_manifest(config.memory_dir)
+    with _connect_manifest(manifest_path) as conn:
+        failed_count = int(conn.execute("SELECT COUNT(*) FROM folded_jobs WHERE status = 'failed'").fetchone()[0] or 0)
+        running_count = int(conn.execute("SELECT COUNT(*) FROM folded_jobs WHERE status = 'running'").fetchone()[0] or 0)
+    if failed_count > 0 or running_count > 0:
+        raise RuntimeError(
+            f"direct streaming fold shard root already exists: {shard_root}. "
+            "Manifest still reports failed or running fold jobs; resolve them before continuing."
+        )
+    shutil.rmtree(shard_root, ignore_errors=True)
+    return not shard_root.exists()
 
 
 def _delete_raw_artifacts(db_path: Path) -> bool:
@@ -373,7 +542,41 @@ def _delete_raw_artifacts(db_path: Path) -> bool:
     return success
 
 
-def fold_one_completed_job_to_shard(
+def _tree_size(path: Path) -> int:
+    if not path.exists():
+        return 0
+    if path.is_file():
+        try:
+            return int(path.stat().st_size)
+        except OSError:
+            return 0
+    total = 0
+    for child in path.rglob("*"):
+        if not child.is_file():
+            continue
+        try:
+            total += int(child.stat().st_size)
+        except OSError:
+            continue
+    return total
+
+
+def is_retryable_fold_error(exc: Exception) -> bool:
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    message = str(exc).lower()
+    return "database is locked" in message or "database is busy" in message
+
+
+def _retry_delay_seconds(config: DirectStreamingFoldConfig, attempt_index: int) -> float:
+    base = max(0.0, float(config.retry_initial_delay_seconds))
+    schedule = [base, base * 2.0, base * 4.0, base * 8.0, 60.0]
+    if attempt_index < len(schedule):
+        return float(min(schedule[attempt_index], 60.0))
+    return 60.0
+
+
+def _fold_one_completed_job_to_shard_once(
     *,
     job: DirectStreamingFoldJob,
     config: DirectStreamingFoldConfig,
@@ -382,87 +585,169 @@ def fold_one_completed_job_to_shard(
 ) -> DirectStreamingFoldResult:
     started_at = time.time()
     mark_fold_started(job, started_at=started_at)
-    try:
-        db_path = Path(job.db_path)
-        metrics = compute_sampling_job_metrics(
-            db_path,
+    db_path = Path(job.db_path)
+    raw_db_size_bytes = int(db_path.stat().st_size) if db_path.exists() else 0
+    shard_path = Path(shard_dir)
+    shard_size_before_bytes = _tree_size(shard_path)
+    metrics = compute_sampling_job_metrics(
+        db_path,
+        game=job.game,
+        sampler_name=job.sampler,
+        seed=int(job.seed),
+        config=sampling_config,
+    )
+    milestones = compute_sampling_job_temporal_milestones(
+        db_path,
+        game=job.game,
+        sampler_name=job.sampler,
+        seed=int(job.seed),
+    )
+    validation_payload = compute_sampling_job_validation_payload(
+        db_path,
+        game=job.game,
+        sampler_name=job.sampler,
+        seed=int(job.seed),
+        config=sampling_config,
+    )
+    parquet_exported = False
+    if bool(job.parquet_export_enabled):
+        if not job.parquet_root:
+            raise RuntimeError("parquet export enabled but parquet_root is missing")
+        migrate_sqlite_to_parquet(
+            sqlite_path=db_path,
+            parquet_root=Path(job.parquet_root),
             game=job.game,
-            sampler_name=job.sampler,
+            sampler=job.sampler,
             seed=int(job.seed),
-            config=sampling_config,
+            steps=int(job.steps),
+            batch_size=int(job.storage_batch_size),
+            compression=str(job.compression),
+            run_summary={
+                "horizon": int(job.horizon),
+                "context_depth": int(job.context_depth),
+                "global_step_start": int(job.global_step_start),
+                "global_step_end": int(job.global_step_end),
+            },
         )
-        milestones = compute_sampling_job_temporal_milestones(
-            db_path,
-            game=job.game,
-            sampler_name=job.sampler,
-            seed=int(job.seed),
-        )
-        validation_payload = compute_sampling_job_validation_payload(
-            db_path,
-            game=job.game,
-            sampler_name=job.sampler,
-            seed=int(job.seed),
-            config=sampling_config,
-        )
-        write_job_metrics(job, metrics)
-        write_temporal_milestones(job, milestones)
-        write_validation_payload(job, validation_payload)
-        parquet_exported = False
-        if bool(job.parquet_export_enabled):
-            if not job.parquet_root:
-                raise RuntimeError("parquet export enabled but parquet_root is missing")
-            migrate_sqlite_to_parquet(
-                sqlite_path=db_path,
-                parquet_root=Path(job.parquet_root),
-                game=job.game,
-                sampler=job.sampler,
-                seed=int(job.seed),
-                steps=int(job.steps),
-                batch_size=int(job.storage_batch_size),
-                compression=str(job.compression),
-                run_summary={
-                    "horizon": int(job.horizon),
-                    "context_depth": int(job.context_depth),
-                    "global_step_start": int(job.global_step_start),
-                    "global_step_end": int(job.global_step_end),
-                },
+        parquet_exported = True
+    fold_single_sampling_db_into_main_compact_memory(
+        db_path=db_path,
+        memory_dir=shard_dir,
+        fold_config=CompactMemoryFoldConfig(
+            global_step_start=int(job.global_step_start),
+            global_step_end=int(job.global_step_end),
+        ),
+        finalize_after_fold=False,
+        sqlite_synchronous=str(config.shard_synchronous),
+        temporary_shard=True,
+    )
+    deleted_raw = False
+    if bool(job.delete_raw_after_fold and config.delete_raw_after_fold):
+        deleted_raw = _delete_raw_artifacts(db_path)
+    finished_at = time.time()
+    write_fold_job_manifest_result(
+        job,
+        status="folded",
+        fold_started_at=started_at,
+        fold_finished_at=finished_at,
+        deleted_raw=deleted_raw,
+        parquet_exported=parquet_exported,
+        metrics=metrics,
+        milestones=milestones,
+        validation_payload=validation_payload,
+        error=None,
+    )
+    shard_size_after_bytes = _tree_size(shard_path)
+    shard_bytes_added = max(0, int(shard_size_after_bytes - shard_size_before_bytes))
+    fold_seconds = max(0.0, float(finished_at - started_at))
+    fold_write_mb_per_second = float(shard_bytes_added) / (1024.0 * 1024.0 * fold_seconds) if fold_seconds > 0.0 else 0.0
+    return DirectStreamingFoldResult(
+        job_id=job.job_id,
+        db_path=str(job.db_path),
+        status="folded",
+        fold_started_at=started_at,
+        fold_finished_at=finished_at,
+        deleted_raw=bool(deleted_raw),
+        error=None,
+        raw_db_size_bytes=int(raw_db_size_bytes),
+        shard_size_before_bytes=int(shard_size_before_bytes),
+        shard_size_after_bytes=int(shard_size_after_bytes),
+        shard_bytes_added=int(shard_bytes_added),
+        fold_seconds=float(fold_seconds),
+        fold_write_mb_per_second=float(fold_write_mb_per_second),
+    )
+
+
+def fold_one_completed_job_to_shard(
+    *,
+    job: DirectStreamingFoldJob,
+    config: DirectStreamingFoldConfig,
+    sampling_config: Any,
+    shard_dir: str | Path,
+) -> DirectStreamingFoldResult:
+    last_error: Exception | None = None
+    started_at = time.time()
+    attempts = max(1, int(config.retry_attempts))
+    for attempt_index in range(attempts):
+        if not Path(job.db_path).exists():
+            finished_at = time.time()
+            error = f"FileNotFoundError: raw sqlite db missing: {job.db_path}"
+            write_fold_job_manifest_result(
+                job,
+                status="failed",
+                fold_started_at=started_at,
+                fold_finished_at=finished_at,
+                deleted_raw=False,
+                parquet_exported=False,
+                metrics=None,
+                milestones=None,
+                validation_payload=None,
+                error=error,
             )
-            parquet_exported = True
-        fold_single_sampling_db_into_main_compact_memory(
-            db_path=db_path,
-            memory_dir=shard_dir,
-            fold_config=CompactMemoryFoldConfig(
-                global_step_start=int(job.global_step_start),
-                global_step_end=int(job.global_step_end),
-            ),
-            finalize_after_fold=False,
-        )
-        deleted_raw = False
-        if bool(job.delete_raw_after_fold and config.delete_raw_after_fold):
-            deleted_raw = _delete_raw_artifacts(db_path)
-        finished_at = time.time()
-        mark_fold_finished(job, finished_at=finished_at, deleted_raw=deleted_raw, parquet_exported=parquet_exported)
-        return DirectStreamingFoldResult(
-            job_id=job.job_id,
-            db_path=str(job.db_path),
-            status="folded",
-            fold_started_at=started_at,
-            fold_finished_at=finished_at,
-            deleted_raw=bool(deleted_raw),
-            error=None,
-        )
-    except Exception as exc:
-        finished_at = time.time()
-        mark_fold_failed(job, finished_at=finished_at, error=f"{type(exc).__name__}: {exc}")
-        return DirectStreamingFoldResult(
-            job_id=job.job_id,
-            db_path=str(job.db_path),
-            status="failed",
-            fold_started_at=started_at,
-            fold_finished_at=finished_at,
-            deleted_raw=False,
-            error=f"{type(exc).__name__}: {exc}",
-        )
+            return DirectStreamingFoldResult(
+                job_id=job.job_id,
+                db_path=str(job.db_path),
+                status="failed",
+                fold_started_at=started_at,
+                fold_finished_at=finished_at,
+                deleted_raw=False,
+                error=error,
+            )
+        try:
+            return _fold_one_completed_job_to_shard_once(
+                job=job,
+                config=config,
+                sampling_config=sampling_config,
+                shard_dir=shard_dir,
+            )
+        except Exception as exc:
+            last_error = exc
+            if not is_retryable_fold_error(exc) or attempt_index >= (attempts - 1):
+                break
+            time.sleep(_retry_delay_seconds(config, attempt_index))
+    finished_at = time.time()
+    error = f"{type(last_error).__name__}: {last_error}" if last_error is not None else "RuntimeError: unknown fold failure"
+    write_fold_job_manifest_result(
+        job,
+        status="failed",
+        fold_started_at=started_at,
+        fold_finished_at=finished_at,
+        deleted_raw=False,
+        parquet_exported=False,
+        metrics=None,
+        milestones=None,
+        validation_payload=None,
+        error=error,
+    )
+    return DirectStreamingFoldResult(
+        job_id=job.job_id,
+        db_path=str(job.db_path),
+        status="failed",
+        fold_started_at=started_at,
+        fold_finished_at=finished_at,
+        deleted_raw=False,
+        error=error,
+    )
 
 
 def merge_direct_fold_shards(
@@ -522,6 +807,12 @@ class DirectStreamingFoldWriter:
             "direct_streaming_fold_finalized_main_memory": False,
             "direct_streaming_fold_failed_job_ids": [],
             "direct_streaming_fold_failed_errors": [],
+            "direct_streaming_fold_total_raw_bytes": 0,
+            "direct_streaming_fold_total_shard_bytes_added": 0,
+            "direct_streaming_fold_mean_job_seconds": 0.0,
+            "direct_streaming_fold_mean_write_mb_per_second": 0.0,
+            "direct_streaming_shard_synchronous": str(config.shard_synchronous),
+            "direct_streaming_fold_stale_shard_root_removed": False,
         }
 
     def start(self) -> None:
@@ -530,6 +821,7 @@ class DirectStreamingFoldWriter:
             self._summary["direct_streaming_fold_legacy_temp_cleanup_count"] = int(cleanup["count"])
         if self._executor is not None:
             return
+        self._summary["direct_streaming_fold_stale_shard_root_removed"] = bool(_cleanup_stale_existing_shard_root(self.config))
         self._effective_workers = _effective_fold_worker_count(int(self.config.fold_workers))
         self._shard_dirs = _make_shard_dirs(self.config, self._effective_workers)
         self._executor = ProcessPoolExecutor(max_workers=self._effective_workers, max_tasks_per_child=1)
@@ -612,6 +904,7 @@ class DirectStreamingFoldWriter:
     def _record_result(self, job: DirectStreamingFoldJob, result: DirectStreamingFoldResult) -> None:
         if result.status == "folded":
             self._summary["direct_streaming_fold_success_count"] += 1
+            success_count = int(self._summary["direct_streaming_fold_success_count"] or 0)
             start = int(job.global_step_start)
             end = int(job.global_step_end)
             current_start = self._summary.get("direct_streaming_fold_global_step_start")
@@ -621,6 +914,12 @@ class DirectStreamingFoldWriter:
             if result.deleted_raw:
                 self._summary["direct_streaming_fold_deleted_raw_count"] += 1
                 self._summary["direct_streaming_fold_raw_deleted_after_shard_fold_count"] += 1
+            self._summary["direct_streaming_fold_total_raw_bytes"] += int(result.raw_db_size_bytes or 0)
+            self._summary["direct_streaming_fold_total_shard_bytes_added"] += int(result.shard_bytes_added or 0)
+            total_seconds = float(self._summary.get("direct_streaming_fold_mean_job_seconds", 0.0) or 0.0) * max(0, success_count - 1) + float(result.fold_seconds or 0.0)
+            total_rate = float(self._summary.get("direct_streaming_fold_mean_write_mb_per_second", 0.0) or 0.0) * max(0, success_count - 1) + float(result.fold_write_mb_per_second or 0.0)
+            self._summary["direct_streaming_fold_mean_job_seconds"] = float(total_seconds / success_count)
+            self._summary["direct_streaming_fold_mean_write_mb_per_second"] = float(total_rate / success_count)
         else:
             self._summary["direct_streaming_fold_failed_count"] += 1
             self._summary["direct_streaming_fold_failed_job_ids"].append(str(job.job_id))
@@ -637,3 +936,123 @@ class DirectStreamingFoldWriter:
                     (str(key), json.dumps(value)),
                 )
             conn.commit()
+
+
+def retry_direct_streaming_fold_failures(
+    *,
+    manifest_path: str | Path,
+    memory_dir: str | Path,
+    workers: int = 2,
+    delete_raw_after_fold: bool = True,
+    finalize_after_success: bool = False,
+) -> dict[str, Any]:
+    manifest = Path(manifest_path)
+    with _connect_manifest(manifest) as conn:
+        rows = conn.execute(
+            """
+            SELECT job_id, db_path, game, sampler, seed, steps, horizon, context_depth,
+                   global_step_start, global_step_end
+            FROM folded_jobs
+            WHERE status = 'failed'
+            ORDER BY game ASC, sampler ASC, seed ASC, global_step_start ASC
+            """
+        ).fetchall()
+    jobs: list[DirectStreamingFoldJob] = []
+    for row in rows:
+        db_path = Path(str(row[1]))
+        if not db_path.exists():
+            continue
+        jobs.append(
+            DirectStreamingFoldJob(
+                job_id=str(row[0]),
+                db_path=str(db_path),
+                game=str(row[2]),
+                sampler=str(row[3]),
+                seed=int(row[4]),
+                steps=int(row[5]),
+                horizon=int(row[6]),
+                context_depth=int(row[7]),
+                global_step_start=int(row[8]),
+                global_step_end=int(row[9]),
+                memory_dir=str(memory_dir),
+                delete_raw_after_fold=bool(delete_raw_after_fold),
+            )
+        )
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    retry_config = DirectStreamingFoldConfig(
+        memory_dir=str(memory_dir),
+        delete_raw_after_fold=bool(delete_raw_after_fold),
+        cleanup_stale_legacy_temp_on_start=False,
+        fold_workers=max(1, int(workers)),
+        shard_root_name=f"direct_streaming_fold_retry_shards_{timestamp}",
+    )
+    summary = {
+        "direct_streaming_fold_retry_count": int(len(jobs)),
+        "direct_streaming_fold_remaining_failed_count": 0,
+        "direct_streaming_fold_finalized_main_memory": False,
+        "direct_streaming_fold_retry_manifest_path": str(manifest),
+        "direct_streaming_fold_reports_rebuilt": [],
+    }
+    if not jobs:
+        with _connect_manifest(manifest) as conn:
+            remaining = int(conn.execute("SELECT COUNT(*) FROM folded_jobs WHERE status = 'failed'").fetchone()[0] or 0)
+            summary["direct_streaming_fold_remaining_failed_count"] = remaining
+            for key, value in summary.items():
+                conn.execute("INSERT OR REPLACE INTO fold_summary (key, value_json) VALUES (?, ?)", (str(key), json.dumps(value)))
+            conn.commit()
+        return summary
+    effective_workers = min(_effective_fold_worker_count(int(workers)), len(jobs))
+    shard_dirs = _make_shard_dirs(retry_config, effective_workers)
+    progress = tqdm(total=len(jobs), desc="retry direct fold", unit="job", dynamic_ncols=True, leave=True)
+    try:
+        with ProcessPoolExecutor(max_workers=effective_workers, max_tasks_per_child=1) as executor:
+            future_map = {}
+            for index, job in enumerate(jobs):
+                shard_dir = shard_dirs[index % len(shard_dirs)]
+                sampling_config = SimpleNamespace(steps=int(job.steps), horizon=int(job.horizon))
+                future = executor.submit(
+                    fold_one_completed_job_to_shard,
+                    job=job,
+                    config=retry_config,
+                    sampling_config=sampling_config,
+                    shard_dir=str(shard_dir),
+                )
+                future_map[future] = job
+            success_count = 0
+            for future in as_completed(list(future_map)):
+                result = future.result()
+                progress.update(1)
+                if result.status == "folded":
+                    success_count += 1
+        if success_count > 0:
+            min_step = min(int(job.global_step_start) for job in jobs)
+            max_step = max(int(job.global_step_end) for job in jobs)
+            merge_direct_fold_shards(
+                memory_dir=memory_dir,
+                shard_dirs=shard_dirs,
+                fold_config=CompactMemoryFoldConfig(global_step_start=min_step, global_step_end=max_step),
+                workers=effective_workers,
+            )
+            shutil.rmtree(_shard_root(retry_config), ignore_errors=True)
+        with _connect_manifest(manifest) as conn:
+            remaining = int(conn.execute("SELECT COUNT(*) FROM folded_jobs WHERE status = 'failed'").fetchone()[0] or 0)
+        summary["direct_streaming_fold_remaining_failed_count"] = remaining
+        if remaining == 0 and bool(finalize_after_success) and jobs:
+            min_step = min(int(job.global_step_start) for job in jobs)
+            max_step = max(int(job.global_step_end) for job in jobs)
+            finalize_main_compact_memory(
+                memory_dir=memory_dir,
+                fold_config=CompactMemoryFoldConfig(global_step_start=min_step, global_step_end=max_step),
+            )
+            summary["direct_streaming_fold_finalized_main_memory"] = True
+            summary["direct_streaming_fold_reports_rebuilt"] = _rerun_reports_for_retried_epochs(
+                memory_dir=memory_dir,
+                jobs=jobs,
+            )
+    finally:
+        progress.close()
+    with _connect_manifest(manifest) as conn:
+        for key, value in summary.items():
+            conn.execute("INSERT OR REPLACE INTO fold_summary (key, value_json) VALUES (?, ?)", (str(key), json.dumps(value)))
+        conn.commit()
+    return summary

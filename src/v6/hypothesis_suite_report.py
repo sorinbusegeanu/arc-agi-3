@@ -20,6 +20,7 @@ from v6.hypothesis_h08_report import evaluate_h08_world_model_coherence
 from v6.hypothesis_h09_report import evaluate_h09_future_option_motifs
 from v6.hypothesis_h10_report import evaluate_h10_future_option_attention
 from v6.hypothesis_h11_report import evaluate_h11_future_option_transfer_concepts
+from v6.evaluation.h12_efficiency_emergence import evaluate_h12_efficiency_emergence
 
 
 SUITE_JSON_NAME = "hypothesis_suite_summary.json"
@@ -61,6 +62,7 @@ def run_hypothesis_suite_report(
     h09_dir = output_dir / "h09"
     h10_dir = output_dir / "h10"
     h11_dir = output_dir / "h11"
+    h12_dir = output_dir / "h12"
     h01 = evaluate_h01_contingency_emergence(run_dir=run_dir, output_dir=h01_dir, memory_dir=memory_dir)
     h02 = evaluate_h02_prediction_violation_attention(
         run_dir=run_dir,
@@ -93,6 +95,7 @@ def run_hypothesis_suite_report(
         h09 = evaluate_h09_future_option_motifs(memory_dir=memory_dir, run_dir=run_dir, output_dir=h09_dir, already_derived=True)
         h10 = evaluate_h10_future_option_attention(memory_dir=memory_dir, run_dir=run_dir, output_dir=h10_dir, already_derived=True)
         h11 = evaluate_h11_future_option_transfer_concepts(memory_dir=memory_dir, run_dir=run_dir, output_dir=h11_dir, already_derived=True)
+        h12 = evaluate_h12_efficiency_emergence(memory_dir=memory_dir, run_dir=run_dir, output_dir=h12_dir)
     else:
         missing = ["memory_dir not provided"]
         h05 = {"hypothesis_id": "H05", "decision": "INCONCLUSIVE", "core_metrics": {}, "missing_evidence": missing, "evidence_source": "none"}
@@ -102,6 +105,7 @@ def run_hypothesis_suite_report(
         h09 = {"hypothesis_id": "H09", "decision": "INCONCLUSIVE", "core_metrics": {}, "missing_evidence": missing, "evidence_source": "none"}
         h10 = {"hypothesis_id": "H10", "decision": "INCONCLUSIVE", "core_metrics": {}, "missing_evidence": missing, "evidence_source": "none"}
         h11 = {"hypothesis_id": "H11", "decision": "INCONCLUSIVE", "core_metrics": {}, "missing_evidence": missing, "evidence_source": "none"}
+        h12 = {"hypothesis_id": "H12", "decision": "INCONCLUSIVE", "core_metrics": {}, "missing_evidence": missing, "evidence_source": "none"}
     input_report = _load_json(Path(run_dir) / INPUT_REPORT_NAME) or {}
     runs = [dict(item) for item in input_report.get("runs", []) if isinstance(item, dict)]
     games = sorted({str(row.get("game")) for row in runs if row.get("game")})
@@ -145,6 +149,7 @@ def run_hypothesis_suite_report(
         h09=h09,
         h10=h10,
         h11=h11,
+        h12=h12,
         epoch_id=epoch_id,
         global_step_start=global_step_start,
         global_step_end=global_step_end,
@@ -175,6 +180,7 @@ def build_hypothesis_suite_summary(
     h09: dict[str, Any] | None = None,
     h10: dict[str, Any] | None = None,
     h11: dict[str, Any] | None = None,
+    h12: dict[str, Any] | None = None,
     epoch_id: str | None = None,
     global_step_start: int | None = None,
     global_step_end: int | None = None,
@@ -224,6 +230,7 @@ def build_hypothesis_suite_summary(
         list((h09 or {}).get("missing_evidence", [])),
         list((h10 or {}).get("missing_evidence", [])),
         list((h11 or {}).get("missing_evidence", [])),
+        list((h12 or {}).get("missing_evidence", [])),
     )
     h04 = h04 or {"decision": "INCONCLUSIVE", "core_metrics": {}}
     h05 = h05 or {"decision": "INCONCLUSIVE", "core_metrics": {}}
@@ -233,6 +240,7 @@ def build_hypothesis_suite_summary(
     h09 = h09 or {"decision": "INCONCLUSIVE", "core_metrics": {}}
     h10 = h10 or {"decision": "INCONCLUSIVE", "core_metrics": {}}
     h11 = h11 or {"decision": "INCONCLUSIVE", "core_metrics": {}}
+    h12 = h12 or {"decision": "INCONCLUSIVE", "core_metrics": {}}
     summary = {
         "epoch_id": epoch_id,
         "global_step_start": global_step_start,
@@ -269,6 +277,7 @@ def build_hypothesis_suite_summary(
         "H09 decision": h09.get("decision", "INCONCLUSIVE"),
         "H10 decision": h10.get("decision", "INCONCLUSIVE"),
         "H11 decision": h11.get("decision", "INCONCLUSIVE"),
+        "H12 decision": h12.get("decision", "INCONCLUSIVE"),
         "H04 suite gating": _suite_gate_status(h04),
         "H05 suite gating": _suite_gate_status(h05),
         "H06 suite gating": _suite_gate_status(h06),
@@ -452,6 +461,21 @@ def build_hypothesis_suite_summary(
             "non_emergent_motifs_with_promoted_concept_count": h11.get("non_emergent_motifs_with_promoted_concept_count"),
             "successful_role_transfer_count": h11.get("successful_role_transfer_count"),
             "promoted_concept_count": h11.get("promoted_concept_count"),
+        },
+        "H12 core metrics": {
+            "successful_trajectories": h12.get("successful_trajectories"),
+            "comparable_trajectory_groups": h12.get("comparable_trajectory_groups"),
+            "efficiency_active_trajectory_count": h12.get("efficiency_active_trajectory_count"),
+            "trajectories_with_memory_bonus": h12.get("trajectories_with_memory_bonus"),
+            "trajectories_with_replay_bonus": h12.get("trajectories_with_replay_bonus"),
+            "mean_efficiency_memory_bonus": h12.get("mean_efficiency_memory_bonus"),
+            "mean_efficiency_replay_bonus": h12.get("mean_efficiency_replay_bonus"),
+            "best_known_solution_improvements": h12.get("best_known_solution_improvements"),
+            "median_steps_to_success": h12.get("median_steps_to_success"),
+            "mean_normalized_solve_efficiency": h12.get("mean_normalized_solve_efficiency"),
+            "mean_loop_ratio": h12.get("mean_loop_ratio"),
+            "mean_repeated_state_ratio": h12.get("mean_repeated_state_ratio"),
+            "mean_blocked_action_ratio": h12.get("mean_blocked_action_ratio"),
         },
         "per_game_status_table": per_game,
         "per-game status table": per_game,
@@ -780,18 +804,38 @@ def _write_suite_summary(summary: dict[str, Any], output_dir: Path) -> None:
 
 def _write_aggregated_hypothesis_text(output_dir: Path) -> None:
     sections: list[str] = []
-    for hypothesis_id in range(1, 12):
+    placeholders: dict[int, str] = {}
+    for hypothesis_id in range(1, 13):
         label = f"h{hypothesis_id:02d}"
         subdir = output_dir / label
         if not subdir.exists():
+            placeholders[hypothesis_id] = f"H{hypothesis_id:02d} report unavailable"
             continue
         txt_files = sorted(subdir.glob("*.txt"))
         if not txt_files:
+            placeholders[hypothesis_id] = f"H{hypothesis_id:02d} report unavailable"
             continue
         text = txt_files[0].read_text(encoding="utf-8").strip()
         if not text:
+            placeholders[hypothesis_id] = f"H{hypothesis_id:02d} report unavailable"
             continue
         sections.append(text)
+    if not sections:
+        summary_text = output_dir / SUITE_TXT_NAME
+        if summary_text.exists():
+            fallback = summary_text.read_text(encoding="utf-8").strip()
+            if fallback:
+                sections.append(fallback)
+    if not sections:
+        sections = [f"H{hypothesis_id:02d} report unavailable" for hypothesis_id in range(1, 12)]
+    for hypothesis_id, text in placeholders.items():
+        if hypothesis_id > 11:
+            continue
+        subdir = output_dir / f"h{hypothesis_id:02d}"
+        subdir.mkdir(parents=True, exist_ok=True)
+        target = subdir / f"h{hypothesis_id:02d}_report.txt"
+        if not target.exists():
+            target.write_text(text + "\n", encoding="utf-8")
     aggregated = "\n\n".join(sections).strip()
     if aggregated:
         aggregated += "\n"
@@ -826,6 +870,7 @@ def _format_text(summary: dict[str, Any]) -> str:
         f"H09: {summary['H09 decision']}",
         f"H10: {summary['H10 decision']}",
         f"H11: {summary['H11 decision']}",
+        f"H12: {summary.get('H12 decision', 'INCONCLUSIVE')}",
         f"games: {summary['game_count']} samplers: {summary['sampler_count']} seeds: {summary['seed_count']}",
         f"total_interactions: {summary['total_interactions']}",
         "Epoch completion:",
@@ -867,6 +912,7 @@ def _format_md(summary: dict[str, Any]) -> str:
         f"- H09: `{summary['H09 decision']}`",
         f"- H10: `{summary['H10 decision']}`",
         f"- H11: `{summary['H11 decision']}`",
+        f"- H12: `{summary.get('H12 decision', 'INCONCLUSIVE')}`",
         f"- total interactions: `{summary['total_interactions']}`",
         f"- levels successfully completed: `{summary.get('levels_successfully_completed_per_epoch', 0)}`",
         f"- games solved: `{summary.get('games_solved_per_epoch', 0)}`",

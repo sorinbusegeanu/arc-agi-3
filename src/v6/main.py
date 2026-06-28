@@ -22,7 +22,7 @@ from v6.evaluation.metrics import MetricsSnapshot, compute_metrics
 from v6.graph.graph_manager import GraphManager
 from v6.interaction_significance import compute_interaction_significance
 from v6.future_options import FutureOptionEstimator
-from v6.memory_lifecycle import MemoryLifecycleManager, MemoryRecord, ReplayCandidate
+from v6.memory_lifecycle import MemoryLifecycleManager, MemoryRecord, ReplayCandidate, compute_memory_fitness
 from v6.memory.contingency_store import ContingencyStore
 from v6.memory.compact_memory import fold_live_system_into_compact_memory
 from v6.memory.live_memory_queue import LiveMemoryEvent, LiveMemoryReadCache
@@ -30,6 +30,15 @@ from v6.memory.promotion_engine import MemoryPromotionConfig, MemoryPromotionEng
 from v6.memory.query_engine import MemoryQueryEngine
 from v6.memory.compact_memory_restore import load_compact_memory_into_system
 from v6.memory.interaction_store import Interaction, InteractionStore
+from v6.memory.trajectory_efficiency import (
+    TrajectoryEfficiencyRecord,
+    TrajectoryEfficiencyStore,
+    TrajectoryEfficiencyTracker,
+    TrajectoryStep,
+    compact_state_hash,
+    infer_epoch_from_path,
+    load_best_known_solution_lengths,
+)
 from v6.memory.substrate import (
     MemoryEdge,
     MemoryNode,
@@ -68,6 +77,7 @@ class V6Config:
     contingency_confidence_threshold: float = 0.8
     random_seed: int | None = None
     database_commit_every: int = 1
+    sqlite_synchronous: str = "normal"
     context_contradiction_min_confidence: float = 0.5
     context_contradiction_min_repeats: int = 2
     max_context_depth: int | None = None
@@ -92,6 +102,10 @@ class V6Config:
     memory_query_use_concepts: bool = True
     memory_query_use_future_options: bool = True
     memory_query_failure_penalty: float = 0.25
+    efficiency_weight: float = 0.05
+    efficiency_replay_weight: float = 0.05
+    efficiency_retention_weight: float = 0.05
+    efficiency_promotion_weight: float = 0.05
     shared_live_memory_mode: str = "none"
     live_memory_worker_id: str | None = None
     live_memory_refresh_steps: int = 250
@@ -124,11 +138,13 @@ class V6System:
         self.live_memory_queue = live_memory_queue
         self.live_memory_cache = live_memory_cache
         self.connection = sqlite3.connect(self.config.database_path)
+        self._configure_runtime_sqlite_connection()
         self._auto_commit = int(self.config.database_commit_every) <= 1
         self.memory = MemorySubstrate(self.connection, auto_commit=self._auto_commit)
         self.interactions = InteractionStore(self.connection, auto_commit=self._auto_commit)
         self.transformations = TransformationStore(self.connection, auto_commit=self._auto_commit)
         self.contingency_store = ContingencyStore(self.connection, auto_commit=self._auto_commit)
+        self.trajectory_efficiency_store = TrajectoryEfficiencyStore(self.connection, auto_commit=self._auto_commit)
         self.delta_extractor = DeltaExtractor()
         self.clusterer = TransformationClusterer(
             min_cluster_size=self.config.min_cluster_size,
@@ -169,6 +185,14 @@ class V6System:
             recent_window_size=self.config.efficiency_recent_window_size,
         )
         self.future_option_estimator = FutureOptionEstimator()
+        best_known_path = self._best_known_solution_lengths_path()
+        self.trajectory_efficiency = TrajectoryEfficiencyTracker(
+            best_known_solution_lengths=load_best_known_solution_lengths(best_known_path),
+            efficiency_weight=float(self.config.efficiency_weight),
+            efficiency_replay_weight=float(self.config.efficiency_replay_weight),
+            efficiency_retention_weight=float(self.config.efficiency_retention_weight),
+            efficiency_promotion_weight=float(self.config.efficiency_promotion_weight),
+        )
         self.promotion_engine = MemoryPromotionEngine(self.memory, MemoryPromotionConfig())
         self.memory_query = MemoryQueryEngine(
             self.memory,
@@ -179,6 +203,7 @@ class V6System:
         self.step_count = 0
         self._isf_counts: dict[str, int] = {}
         self._current_level_interaction_ids: list[int] = []
+        self._current_trajectory_steps: list[TrajectoryStep] = []
         self._last_memory_interaction_node_id: str | None = None
         self._interaction_memory_node_ids: dict[int, str] = {}
         self._live_memory_imported_contingency_keys: set[str] = set()
@@ -218,6 +243,16 @@ class V6System:
                 restore_graph=bool(self.config.restore_compact_graph),
                 restore_substrate=bool(self.config.restore_compact_substrate),
             )
+
+    def _configure_runtime_sqlite_connection(self) -> None:
+        mode = str(self.config.sqlite_synchronous or "normal").strip().upper()
+        if mode not in {"OFF", "NORMAL", "FULL"}:
+            mode = "NORMAL"
+        self.connection.execute("PRAGMA busy_timeout=10000")
+        self.connection.execute("PRAGMA journal_mode=WAL")
+        self.connection.execute(f"PRAGMA synchronous={mode}")
+        self.connection.execute("PRAGMA temp_store=MEMORY")
+        self.connection.execute("PRAGMA cache_size=-65536")
 
     def choose_action(self) -> int:
         actions = self.env.available_actions()
@@ -291,6 +326,8 @@ class V6System:
             and outcome_state in {"WIN", "GAME_OVER"}
         )
         observation_after_for_delta = observation_before.copy() if terminal_reset_surrogate else observation_after
+        state_hash_before = compact_state_hash(observation_before)
+        state_hash_after = compact_state_hash(observation_after_for_delta)
 
         delta_id = self.transformations.next_delta_id()
         delta = self.delta_extractor.extract(observation_before, observation_after_for_delta, delta_id=delta_id)
@@ -389,6 +426,9 @@ class V6System:
                     },
                 )
         action_signature = f"a{int(action)}"
+        game_id = str(getattr(self.env, "game_id", getattr(self.env, "env_id", "unknown_game")) or "unknown_game")
+        level_id = getattr(self.env, "last_full_game_id", None) or getattr(self.env, "level_id", None)
+        sampler_name = getattr(self.action_sampler, "name", None)
         actual_family_id = None if actual_family is None else str(actual_family)
         stable_delta_key = self._stable_delta_key(delta, outcome_state=outcome_state, level_completed_event=level_completed_event)
         memory_counts = self._build_isf_memory_counts(
@@ -607,7 +647,26 @@ class V6System:
             context_contradiction=bool(contradiction_event is not None),
             timestamp_step=int(self.step_count),
         )
+        base_memory_fitness = compute_memory_fitness(
+            isf_total=float(memory_record.isf_total),
+            prediction_error=float(memory_record.prediction_error),
+            learning_value=float(memory_record.learning_value),
+            transfer_potential=float(memory_record.transfer_potential),
+            explanatory_potential=float(memory_record.explanatory_potential),
+            context_contradiction=bool(memory_record.context_contradiction),
+            replay_count=int(memory_record.replay_count),
+        )
         replay_candidate = self.memory_lifecycle.replay_candidates.get(str(interaction.id))
+        base_replay_priority = 0.0 if replay_candidate is None else float(replay_candidate.replay_priority)
+        current_epoch = self._epoch_number()
+        initial_retention_score = self._initial_retention_score(
+            isf_total=float(isf_score.total),
+            replay_priority=float(base_replay_priority),
+            explanatory_reach=float(isf_score.explanatory_potential),
+            transfer_potential=float(isf_score.transfer_potential),
+            recurrence=0.0,
+            future_option_impact=abs(float(future_option_delta.delta_score)) if future_option_delta is not None else 0.0,
+        )
         if replay_candidate is not None and float(replay_candidate.replay_priority) >= 0.8:
             self._emit_live_memory_event(
                 "high_priority_replay",
@@ -678,6 +737,18 @@ class V6System:
             outcome_state=outcome_state,
             outcome_polarity=outcome_polarity,
             level_completed_event=level_completed_event,
+            game_id=game_id,
+            level_id=None if level_id is None else str(level_id),
+            sampler_name=None if sampler_name is None else str(sampler_name),
+            state_hash_before=state_hash_before,
+            state_hash_after=state_hash_after,
+            memory_fitness_base=float(base_memory_fitness),
+            memory_fitness=float(base_memory_fitness),
+            memory_replay_priority_base=float(base_replay_priority),
+            memory_state="active",
+            stored_epoch=current_epoch,
+            retention_score=float(initial_retention_score),
+            forgetting_score=float(max(0.0, 1.0 - initial_retention_score)),
         )
         if selected_contingency is not None and actual_family is not None and prediction_correct is not None:
             self.contingency_store.record_contingency_prediction(
@@ -775,7 +846,21 @@ class V6System:
                 efficiency_future_option_gain_per_cost = ?,
                 outcome_state = ?,
                 outcome_polarity = ?,
-                level_completed_event = ?
+                level_completed_event = ?,
+                game_id = ?,
+                level_id = ?,
+                sampler_name = ?,
+                episode_id = ?,
+                state_hash_before = ?,
+                state_hash_after = ?,
+                memory_fitness_base = ?,
+                memory_fitness = ?,
+                memory_replay_priority_base = ?,
+                memory_state = ?,
+                stored_epoch = ?,
+                retention_score = ?,
+                forgetting_score = ?,
+                forgetting_reason = ?
             WHERE id = ?
             """,
             (
@@ -815,6 +900,20 @@ class V6System:
                 interaction.outcome_state,
                 interaction.outcome_polarity,
                 int(bool(interaction.level_completed_event)),
+                game_id,
+                None if level_id is None else str(level_id),
+                None if sampler_name is None else str(sampler_name),
+                int(self.episode_id),
+                state_hash_before,
+                state_hash_after,
+                float(base_memory_fitness),
+                float(base_memory_fitness),
+                float(base_replay_priority),
+                "active",
+                None if current_epoch is None else int(current_epoch),
+                float(initial_retention_score),
+                float(max(0.0, 1.0 - initial_retention_score)),
+                None,
                 interaction.id,
             ),
         )
@@ -853,6 +952,10 @@ class V6System:
                 future_option_delta=None if future_option_delta is None else float(future_option_delta.delta_score),
                 replay_priority=0.0 if replay_candidate is None else float(replay_candidate.replay_priority),
                 retention_status=memory_record.status,
+                memory_state="active",
+                stored_epoch=current_epoch,
+                retention_score=float(initial_retention_score),
+                forgetting_score=float(max(0.0, 1.0 - initial_retention_score)),
             ),
             step=int(interaction.id),
         )
@@ -860,6 +963,23 @@ class V6System:
             interaction_id=interaction.id,
             memory_record=memory_record,
             replay_candidate=replay_candidate,
+        )
+        self._current_trajectory_steps.append(
+            TrajectoryStep(
+                interaction_id=int(interaction.id),
+                global_step=int(interaction.global_step or interaction.id),
+                state_hash_before=state_hash_before,
+                state_hash_after=state_hash_after,
+                future_option_delta=None if future_option_delta is None else float(future_option_delta.delta_score),
+                repeated_state=bool(efficiency_event.repeated_state),
+                repeated_context_action=bool(efficiency_event.repeated_context_action),
+                no_effect_action=bool(efficiency_event.no_effect_action),
+                outcome_state=outcome_state,
+                level_completed_event=bool(level_completed_event),
+                action_cost=float(efficiency_event.action_cost),
+                memory_fitness_base=float(base_memory_fitness),
+                memory_replay_priority_base=float(base_replay_priority),
+            )
         )
         promotion_every = max(1, int(self.config.memory_promotion_every))
         if int(interaction.id) % promotion_every == 0:
@@ -887,6 +1007,16 @@ class V6System:
                 polarity="negative",
                 reason="game_over_failure_path",
                 interaction_ids=trajectory_ids_snapshot,
+            )
+        if level_completed_event or outcome_state in {"WIN", "GAME_OVER"}:
+            self._finalize_completed_trajectory(
+                interaction_ids=trajectory_ids_snapshot,
+                game_id=game_id,
+                level_id=None if level_id is None else str(level_id),
+                sampler_name=None if sampler_name is None else str(sampler_name),
+                seed=int(getattr(self.env, "seed", 0) or 0),
+                outcome_state=outcome_state,
+                level_completed_event=bool(level_completed_event),
             )
 
         if self.action_sampler is not None and hasattr(self.action_sampler, "record_result"):
@@ -1347,6 +1477,224 @@ class V6System:
             ),
             step=int(interaction_id),
         )
+
+    def _best_known_solution_lengths_path(self) -> Path:
+        if self.config.memory_output_dir:
+            return Path(self.config.memory_output_dir).parent / "efficiency" / "best_known_solution_lengths.json"
+        return Path(self.config.database_path).with_name("best_known_solution_lengths.json")
+
+    def _epoch_number(self) -> int | None:
+        candidate = self.config.memory_output_dir or self.config.database_path
+        return infer_epoch_from_path(candidate)
+
+    def _initial_retention_score(
+        self,
+        *,
+        isf_total: float,
+        replay_priority: float,
+        explanatory_reach: float,
+        transfer_potential: float,
+        recurrence: float,
+        future_option_impact: float,
+        efficiency_bonus: float = 0.0,
+    ) -> float:
+        return max(
+            0.0,
+            min(
+                1.0,
+                0.25 * float(isf_total)
+                + 0.20 * float(replay_priority)
+                + 0.15 * float(explanatory_reach)
+                + 0.15 * float(transfer_potential)
+                + 0.10 * float(recurrence)
+                + 0.10 * float(future_option_impact)
+                + 0.05 * float(efficiency_bonus),
+            ),
+        )
+
+    def _trajectory_outcome_class(self, *, outcome_state: str, level_completed_event: bool) -> str:
+        if str(outcome_state) == "WIN":
+            return "WIN"
+        if bool(level_completed_event):
+            return "LEVEL_COMPLETE"
+        if str(outcome_state) == "GAME_OVER":
+            return "GAME_OVER"
+        return str(outcome_state or "NOT_FINISHED")
+
+    def _finalize_completed_trajectory(
+        self,
+        *,
+        interaction_ids: list[int],
+        game_id: str,
+        level_id: str | None,
+        sampler_name: str | None,
+        seed: int | None,
+        outcome_state: str,
+        level_completed_event: bool,
+    ) -> None:
+        if not interaction_ids or not self._current_trajectory_steps:
+            self._current_trajectory_steps = []
+            return
+        step_lookup = {int(step.interaction_id): step for step in self._current_trajectory_steps}
+        steps = [step_lookup[int(interaction_id)] for interaction_id in interaction_ids if int(interaction_id) in step_lookup]
+        if not steps:
+            self._current_trajectory_steps = []
+            return
+        trajectory_record = self.trajectory_efficiency.finalize_trajectory(
+            trajectory_id=f"{game_id}|{level_id or '__none__'}|{sampler_name or 'unknown'}|{seed if seed is not None else 0}|{self.episode_id}",
+            game_id=str(game_id),
+            level_id=level_id,
+            sampler=sampler_name,
+            seed=seed,
+            epoch=self._epoch_number(),
+            outcome_class=self._trajectory_outcome_class(outcome_state=outcome_state, level_completed_event=level_completed_event),
+            terminal=bool(outcome_state in {"WIN", "GAME_OVER"}),
+            steps=steps,
+        )
+        self.trajectory_efficiency_store.upsert(trajectory_record)
+        self._apply_trajectory_efficiency_bonus(trajectory_record=trajectory_record, interaction_ids=interaction_ids)
+        step_ids = {int(item) for item in interaction_ids}
+        self._current_trajectory_steps = [step for step in self._current_trajectory_steps if int(step.interaction_id) not in step_ids]
+
+    def _apply_trajectory_efficiency_bonus(
+        self,
+        *,
+        trajectory_record: TrajectoryEfficiencyRecord,
+        interaction_ids: list[int],
+    ) -> None:
+        efficiency_active = bool(trajectory_record.efficiency_active)
+        memory_bonus = float(trajectory_record.efficiency_memory_bonus if efficiency_active else 0.0)
+        replay_bonus = float(trajectory_record.efficiency_replay_bonus if efficiency_active else 0.0)
+        retention_bonus = float(trajectory_record.efficiency_retention_bonus if efficiency_active else 0.0)
+        promotion_bonus = float(trajectory_record.efficiency_promotion_bonus if efficiency_active else 0.0)
+        for interaction_id in interaction_ids:
+            row = self.connection.execute(
+                """
+                SELECT memory_fitness_base, memory_replay_priority_base, memory_replay_priority, memory_status
+                FROM interactions
+                WHERE id = ?
+                """,
+                (int(interaction_id),),
+            ).fetchone()
+            base_fitness = float((row[0] if row and row[0] is not None else 0.0) or 0.0)
+            base_replay = float((row[1] if row and row[1] is not None else 0.0) or 0.0)
+            current_replay = float((row[2] if row and row[2] is not None else base_replay) or base_replay)
+            memory_fitness = base_fitness + memory_bonus
+            replay_priority = max(current_replay, base_replay + replay_bonus)
+            retention_score_base = base_fitness
+            retention_score = retention_score_base + retention_bonus
+            if str(trajectory_record.outcome_class) not in {"WIN", "LEVEL_COMPLETE"} and float(trajectory_record.future_option_gain or 0.0) <= 0.0:
+                memory_fitness = base_fitness
+                replay_priority = max(current_replay, base_replay)
+                retention_score = retention_score_base
+            self.connection.execute(
+                """
+                UPDATE interactions
+                SET
+                    trajectory_efficiency_active = ?,
+                    trajectory_outcome_class = ?,
+                    comparable_outcome_group_id = ?,
+                    trajectory_efficiency_score = ?,
+                    efficiency_memory_bonus = ?,
+                    efficiency_replay_bonus = ?,
+                    efficiency_retention_bonus = ?,
+                    efficiency_promotion_bonus = ?,
+                    memory_fitness = ?,
+                    memory_replay_priority = MAX(COALESCE(memory_replay_priority, 0.0), ?),
+                    retention_score_base = ?,
+                    retention_score = ?
+                WHERE id = ?
+                """,
+                (
+                    int(efficiency_active),
+                    str(trajectory_record.outcome_class),
+                    str(trajectory_record.comparable_outcome_group_id),
+                    None if trajectory_record.efficiency_score is None else float(trajectory_record.efficiency_score),
+                    memory_bonus,
+                    replay_bonus,
+                    retention_bonus,
+                    promotion_bonus,
+                    float(memory_fitness),
+                    float(replay_priority),
+                    float(retention_score_base),
+                    float(retention_score),
+                    int(interaction_id),
+                ),
+            )
+            self.connection.execute(
+                """
+                UPDATE prediction_results
+                SET
+                    trajectory_efficiency_active = ?,
+                    trajectory_outcome_class = ?,
+                    comparable_outcome_group_id = ?,
+                    trajectory_efficiency_score = ?,
+                    efficiency_memory_bonus = ?,
+                    efficiency_replay_bonus = ?,
+                    efficiency_retention_bonus = ?,
+                    efficiency_promotion_bonus = ?,
+                    memory_fitness = ?,
+                    memory_replay_priority = MAX(COALESCE(memory_replay_priority, 0.0), ?),
+                    retention_score_base = ?,
+                    retention_score = ?
+                WHERE interaction_id = ?
+                """,
+                (
+                    int(efficiency_active),
+                    str(trajectory_record.outcome_class),
+                    str(trajectory_record.comparable_outcome_group_id),
+                    None if trajectory_record.efficiency_score is None else float(trajectory_record.efficiency_score),
+                    memory_bonus,
+                    replay_bonus,
+                    retention_bonus,
+                    promotion_bonus,
+                    float(memory_fitness),
+                    float(replay_priority),
+                    float(retention_score_base),
+                    float(retention_score),
+                    int(interaction_id),
+                ),
+            )
+            candidate = self.memory_lifecycle.replay_candidates.get(str(interaction_id))
+            if candidate is not None:
+                self.memory_lifecycle.replay_candidates[str(interaction_id)] = ReplayCandidate(
+                    interaction_id=candidate.interaction_id,
+                    replay_priority=float(replay_priority),
+                    reason=str(candidate.reason),
+                    family_id=candidate.family_id,
+                    context_signature=candidate.context_signature,
+                    status=candidate.status,
+                )
+                self._sync_post_factum_replay_fields(int(interaction_id))
+            updated_retention = self._initial_retention_score(
+                isf_total=float(self.connection.execute("SELECT COALESCE(isf_total, 0.0) FROM interactions WHERE id = ?", (int(interaction_id),)).fetchone()[0] or 0.0),
+                replay_priority=float(replay_priority),
+                explanatory_reach=float(self.connection.execute("SELECT COALESCE(isf_explanatory_potential, 0.0) FROM interactions WHERE id = ?", (int(interaction_id),)).fetchone()[0] or 0.0),
+                transfer_potential=float(self.connection.execute("SELECT COALESCE(isf_transfer_potential, 0.0) FROM interactions WHERE id = ?", (int(interaction_id),)).fetchone()[0] or 0.0),
+                recurrence=0.0,
+                future_option_impact=abs(float(self.connection.execute("SELECT COALESCE(efficiency_future_option_gain_per_cost, 0.0) FROM interactions WHERE id = ?", (int(interaction_id),)).fetchone()[0] or 0.0)),
+                efficiency_bonus=memory_bonus,
+            )
+            self.memory.upsert_score(
+                MemoryScore(
+                    node_id=self._interaction_memory_node_id(interaction_id),
+                    replay_priority=float(replay_priority),
+                    memory_state="active" if efficiency_active else None,
+                    retention_score=float(updated_retention),
+                    forgetting_score=float(max(0.0, 1.0 - updated_retention)),
+                ),
+                step=int(interaction_id),
+            )
+        trajectory_node = trajectory_node_id(self.episode_id)
+        attrs = {
+            "trajectory_efficiency_active": bool(efficiency_active),
+            "trajectory_efficiency_score": trajectory_record.efficiency_score,
+            "efficiency_memory_bonus": memory_bonus,
+            "efficiency_replay_bonus": replay_bonus,
+            "efficiency_retention_bonus": retention_bonus,
+            "efficiency_promotion_bonus": promotion_bonus,
+        }
+        self.memory.update_node_support_and_attrs(trajectory_node, attrs, support_increment=0)
 
     def _build_isf_memory_counts(
         self,

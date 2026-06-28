@@ -4273,7 +4273,7 @@ def test_v05c_sampler_registry_and_aliases() -> None:
     assert make_sampler("mixed", seed=1).name == "mixed"
     assert parse_v05c_samplers("random_baseline,reset_aware_mixed") == ("random_baseline", "reset_aware_mixed")
     assert "tt01" in parse_v05c_games("failed_representatives")
-    assert InteractionSamplingConfig().commit_steps == 1000
+    assert InteractionSamplingConfig().commit_steps == 5000
 
 
 def test_v05c_games_all_expands_to_registered_games(monkeypatch) -> None:

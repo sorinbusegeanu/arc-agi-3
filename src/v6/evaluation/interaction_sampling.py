@@ -87,7 +87,8 @@ class InteractionSamplingConfig:
     max_context_depth: int | None = None
     workers: int = 60
     max_tasks_per_child: int = 1
-    commit_steps: int = 1000
+    commit_steps: int = 5000
+    sqlite_synchronous: str = "normal"
     storage_backend: str = "sqlite"
     parquet_root: str = "runs/v6/storage_parquet"
     duckdb_path: str = "runs/v6/arc_agi3.duckdb"
@@ -116,6 +117,11 @@ class InteractionSamplingConfig:
     direct_streaming_fold_enabled: bool = True
     direct_streaming_fold_workers: int = 8
     delete_raw_after_direct_streaming_fold: bool = True
+    direct_streaming_fold_retry_attempts: int = 5
+    direct_streaming_fold_retry_initial_delay_seconds: float = 5.0
+    direct_streaming_fold_busy_timeout_ms: int = 60000
+    direct_streaming_fold_submit_delay_seconds: float = 1.0
+    direct_streaming_shard_synchronous: str = "off"
 
 
 def resolve_game_ids(games_arg: str, env_root: str | None = None) -> list[str]:
@@ -298,6 +304,7 @@ def _generate_sampling_dbs(config: InteractionSamplingConfig, sampling_root: Pat
                             "adaptive_context_expansion": bool(config.adaptive_context_expansion),
                             "max_context_depth": config.max_context_depth,
                             "commit_steps": int(config.commit_steps),
+                            "sqlite_synchronous": str(config.sqlite_synchronous),
                             "memory_input_dir": config.memory_input_dir,
                             "memory_output_dir": config.memory_output_dir,
                             "global_step_offset": int(config.global_step_offset),
@@ -311,6 +318,11 @@ def _generate_sampling_dbs(config: InteractionSamplingConfig, sampling_root: Pat
                             "direct_streaming_fold_enabled": bool(config.direct_streaming_fold_enabled),
                             "direct_streaming_fold_workers": int(config.direct_streaming_fold_workers),
                             "delete_raw_after_direct_streaming_fold": bool(config.delete_raw_after_direct_streaming_fold),
+                            "direct_streaming_fold_retry_attempts": int(config.direct_streaming_fold_retry_attempts),
+                            "direct_streaming_fold_retry_initial_delay_seconds": float(config.direct_streaming_fold_retry_initial_delay_seconds),
+                            "direct_streaming_fold_busy_timeout_ms": int(config.direct_streaming_fold_busy_timeout_ms),
+                            "direct_streaming_fold_submit_delay_seconds": float(config.direct_streaming_fold_submit_delay_seconds),
+                            "direct_streaming_shard_synchronous": str(config.direct_streaming_shard_synchronous),
                             "collect_only": bool(config.collect_only),
                             "storage_backend": str(config.storage_backend),
                             "parquet_root": str(config.parquet_root),
@@ -359,6 +371,7 @@ def _generate_sampling_dbs(config: InteractionSamplingConfig, sampling_root: Pat
                         "adaptive_context_expansion": bool(config.adaptive_context_expansion),
                         "max_context_depth": config.max_context_depth,
                         "commit_steps": int(config.commit_steps),
+                        "sqlite_synchronous": str(config.sqlite_synchronous),
                         "memory_input_dir": config.memory_input_dir,
                         "memory_output_dir": config.memory_output_dir,
                         "global_step_offset": int(config.global_step_offset),
@@ -372,6 +385,11 @@ def _generate_sampling_dbs(config: InteractionSamplingConfig, sampling_root: Pat
                         "direct_streaming_fold_enabled": bool(config.direct_streaming_fold_enabled),
                         "direct_streaming_fold_workers": int(config.direct_streaming_fold_workers),
                         "delete_raw_after_direct_streaming_fold": bool(config.delete_raw_after_direct_streaming_fold),
+                        "direct_streaming_fold_retry_attempts": int(config.direct_streaming_fold_retry_attempts),
+                        "direct_streaming_fold_retry_initial_delay_seconds": float(config.direct_streaming_fold_retry_initial_delay_seconds),
+                        "direct_streaming_fold_busy_timeout_ms": int(config.direct_streaming_fold_busy_timeout_ms),
+                        "direct_streaming_fold_submit_delay_seconds": float(config.direct_streaming_fold_submit_delay_seconds),
+                        "direct_streaming_shard_synchronous": str(config.direct_streaming_shard_synchronous),
                         "collect_only": bool(config.collect_only),
                         "storage_backend": str(config.storage_backend),
                         "parquet_root": str(config.parquet_root),
@@ -517,6 +535,10 @@ def _run_sampling_jobs(
                 memory_dir=str(main_memory_dir),
                 delete_raw_after_fold=bool(jobs[0].get("delete_raw_after_direct_streaming_fold", True)),
                 fold_workers=int(jobs[0].get("direct_streaming_fold_workers", 8) or 8),
+                retry_attempts=int(jobs[0].get("direct_streaming_fold_retry_attempts", 5) or 5),
+                retry_initial_delay_seconds=float(jobs[0].get("direct_streaming_fold_retry_initial_delay_seconds", 5.0) or 5.0),
+                busy_timeout_ms=int(jobs[0].get("direct_streaming_fold_busy_timeout_ms", 60000) or 60000),
+                shard_synchronous=str(jobs[0].get("direct_streaming_shard_synchronous", "off") or "off"),
             ),
             sampling_config=SimpleNamespace(
                 steps=int(jobs[0].get("steps", 0) or 0),
@@ -582,6 +604,9 @@ def _run_sampling_jobs(
                     result = future.result()
                     job = active_futures.pop(future, None)
                     if job is not None and direct_fold_writer is not None and job.get("memory_output_dir"):
+                        submit_delay_seconds = float(job.get("direct_streaming_fold_submit_delay_seconds", 1.0) or 0.0)
+                        if submit_delay_seconds > 0.0:
+                            time.sleep(submit_delay_seconds)
                         direct_fold_writer.submit(
                             DirectStreamingFoldJob(
                                 job_id=f"{job['game']}:{job['sampler_name']}:seed{job['seed']}:steps{job['steps']}",
@@ -659,6 +684,11 @@ def _run_sampling_jobs(
         "direct_streaming_fold_jobs_failed": int(direct_fold_summary.get("direct_streaming_fold_jobs_failed", 0) or 0),
         "direct_streaming_fold_raw_deleted_after_shard_fold_count": int(direct_fold_summary.get("direct_streaming_fold_raw_deleted_after_shard_fold_count", 0) or 0),
         "direct_streaming_fold_finalized_main_memory": bool(direct_fold_summary.get("direct_streaming_fold_finalized_main_memory", False)),
+        "direct_streaming_fold_total_raw_bytes": int(direct_fold_summary.get("direct_streaming_fold_total_raw_bytes", 0) or 0),
+        "direct_streaming_fold_total_shard_bytes_added": int(direct_fold_summary.get("direct_streaming_fold_total_shard_bytes_added", 0) or 0),
+        "direct_streaming_fold_mean_job_seconds": float(direct_fold_summary.get("direct_streaming_fold_mean_job_seconds", 0.0) or 0.0),
+        "direct_streaming_fold_mean_write_mb_per_second": float(direct_fold_summary.get("direct_streaming_fold_mean_write_mb_per_second", 0.0) or 0.0),
+        "direct_streaming_shard_synchronous": direct_fold_summary.get("direct_streaming_shard_synchronous"),
         "legacy_sidecar_fold_removed": True,
         "no_backpressure": True,
         "shared_live_memory_enabled": bool(shared_live_memory_mode != "none"),
@@ -722,6 +752,7 @@ def _run_sampling_job(job: dict) -> dict:
         max_context_depth=job.get("max_context_depth"),
         adaptive_context_expansion=bool(job.get("adaptive_context_expansion", False)),
         database_commit_every=int(job.get("commit_steps", 1000)),
+        sqlite_synchronous=str(job.get("sqlite_synchronous", "normal") or "normal"),
         memory_promotion_every=max(1000, int(job.get("steps", 0) or 0) + 1),
         shared_live_memory_mode=str(job.get("shared_live_memory", "none") or "none"),
         live_memory_worker_id=f"{job['game']}:{sampler_name}:seed{seed}",
@@ -2040,6 +2071,11 @@ def _default_worker_execution_stats(config: InteractionSamplingConfig) -> dict[s
         "direct_streaming_fold_jobs_failed": 0,
         "direct_streaming_fold_raw_deleted_after_shard_fold_count": 0,
         "direct_streaming_fold_finalized_main_memory": False,
+        "direct_streaming_fold_total_raw_bytes": 0,
+        "direct_streaming_fold_total_shard_bytes_added": 0,
+        "direct_streaming_fold_mean_job_seconds": 0.0,
+        "direct_streaming_fold_mean_write_mb_per_second": 0.0,
+        "direct_streaming_shard_synchronous": str(config.direct_streaming_shard_synchronous),
         "legacy_sidecar_fold_removed": True,
         "no_backpressure": True,
         "shared_live_memory_enabled": bool(str(config.shared_live_memory) != "none"),
@@ -2091,6 +2127,11 @@ def _merge_worker_execution_stats(left: dict[str, object], right: dict[str, obje
         "direct_streaming_fold_jobs_failed": int(left.get("direct_streaming_fold_jobs_failed", 0) or 0) + int(right.get("direct_streaming_fold_jobs_failed", 0) or 0),
         "direct_streaming_fold_raw_deleted_after_shard_fold_count": int(left.get("direct_streaming_fold_raw_deleted_after_shard_fold_count", 0) or 0) + int(right.get("direct_streaming_fold_raw_deleted_after_shard_fold_count", 0) or 0),
         "direct_streaming_fold_finalized_main_memory": bool(left.get("direct_streaming_fold_finalized_main_memory", False) or right.get("direct_streaming_fold_finalized_main_memory", False)),
+        "direct_streaming_fold_total_raw_bytes": int(left.get("direct_streaming_fold_total_raw_bytes", 0) or 0) + int(right.get("direct_streaming_fold_total_raw_bytes", 0) or 0),
+        "direct_streaming_fold_total_shard_bytes_added": int(left.get("direct_streaming_fold_total_shard_bytes_added", 0) or 0) + int(right.get("direct_streaming_fold_total_shard_bytes_added", 0) or 0),
+        "direct_streaming_fold_mean_job_seconds": float(max(float(left.get("direct_streaming_fold_mean_job_seconds", 0.0) or 0.0), float(right.get("direct_streaming_fold_mean_job_seconds", 0.0) or 0.0))),
+        "direct_streaming_fold_mean_write_mb_per_second": float(max(float(left.get("direct_streaming_fold_mean_write_mb_per_second", 0.0) or 0.0), float(right.get("direct_streaming_fold_mean_write_mb_per_second", 0.0) or 0.0))),
+        "direct_streaming_shard_synchronous": str(right.get("direct_streaming_shard_synchronous") or left.get("direct_streaming_shard_synchronous") or "off"),
         "legacy_sidecar_fold_removed": bool(left.get("legacy_sidecar_fold_removed", False) or right.get("legacy_sidecar_fold_removed", False)),
         "no_backpressure": bool(left.get("no_backpressure", False) or right.get("no_backpressure", False)),
         "shared_live_memory_enabled": bool(left.get("shared_live_memory_enabled", False) or right.get("shared_live_memory_enabled", False)),

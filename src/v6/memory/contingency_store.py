@@ -95,7 +95,25 @@ class ContingencyStore:
                 post_factum_trajectory_credit_kind TEXT,
                 post_factum_trajectory_credit_polarity TEXT,
                 post_factum_trajectory_credit_step INTEGER,
-                post_factum_trajectory_credit_reason TEXT
+                post_factum_trajectory_credit_reason TEXT,
+                game_id TEXT,
+                level_id TEXT,
+                sampler_name TEXT,
+                state_hash_before TEXT,
+                state_hash_after TEXT,
+                memory_fitness_base REAL,
+                memory_fitness REAL,
+                memory_replay_priority_base REAL,
+                retention_score_base REAL,
+                retention_score REAL,
+                trajectory_efficiency_active INTEGER,
+                trajectory_outcome_class TEXT,
+                comparable_outcome_group_id TEXT,
+                trajectory_efficiency_score REAL,
+                efficiency_memory_bonus REAL,
+                efficiency_replay_bonus REAL,
+                efficiency_retention_bonus REAL,
+                efficiency_promotion_bonus REAL
             )
             """
         )
@@ -159,6 +177,33 @@ class ContingencyStore:
         self._ensure_column("prediction_results", "post_factum_trajectory_credit_polarity", "TEXT")
         self._ensure_column("prediction_results", "post_factum_trajectory_credit_step", "INTEGER")
         self._ensure_column("prediction_results", "post_factum_trajectory_credit_reason", "TEXT")
+        self._ensure_column("prediction_results", "memory_state", "TEXT")
+        self._ensure_column("prediction_results", "stored_epoch", "INTEGER")
+        self._ensure_column("prediction_results", "last_replayed_epoch", "INTEGER")
+        self._ensure_column("prediction_results", "last_promoted_epoch", "INTEGER")
+        self._ensure_column("prediction_results", "retention_score", "REAL")
+        self._ensure_column("prediction_results", "forgetting_score", "REAL")
+        self._ensure_column("prediction_results", "compressed_into_id", "TEXT")
+        self._ensure_column("prediction_results", "superseded_by_id", "TEXT")
+        self._ensure_column("prediction_results", "forgetting_reason", "TEXT")
+        self._ensure_column("prediction_results", "game_id", "TEXT")
+        self._ensure_column("prediction_results", "level_id", "TEXT")
+        self._ensure_column("prediction_results", "sampler_name", "TEXT")
+        self._ensure_column("prediction_results", "state_hash_before", "TEXT")
+        self._ensure_column("prediction_results", "state_hash_after", "TEXT")
+        self._ensure_column("prediction_results", "memory_fitness_base", "REAL")
+        self._ensure_column("prediction_results", "memory_fitness", "REAL")
+        self._ensure_column("prediction_results", "memory_replay_priority_base", "REAL")
+        self._ensure_column("prediction_results", "retention_score_base", "REAL")
+        self._ensure_column("prediction_results", "retention_score", "REAL")
+        self._ensure_column("prediction_results", "trajectory_efficiency_active", "INTEGER")
+        self._ensure_column("prediction_results", "trajectory_outcome_class", "TEXT")
+        self._ensure_column("prediction_results", "comparable_outcome_group_id", "TEXT")
+        self._ensure_column("prediction_results", "trajectory_efficiency_score", "REAL")
+        self._ensure_column("prediction_results", "efficiency_memory_bonus", "REAL")
+        self._ensure_column("prediction_results", "efficiency_replay_bonus", "REAL")
+        self._ensure_column("prediction_results", "efficiency_retention_bonus", "REAL")
+        self._ensure_column("prediction_results", "efficiency_promotion_bonus", "REAL")
         self._ensure_column("prediction_results", "level_advanced", "INTEGER")
         self.connection.commit()
 
@@ -328,138 +373,119 @@ class ContingencyStore:
         post_factum_trajectory_credit_polarity: str | None = None,
         post_factum_trajectory_credit_step: int | None = None,
         post_factum_trajectory_credit_reason: str | None = None,
+        game_id: str | None = None,
+        level_id: str | None = None,
+        sampler_name: str | None = None,
+        state_hash_before: str | None = None,
+        state_hash_after: str | None = None,
+        memory_fitness_base: float | None = None,
+        memory_fitness: float | None = None,
+        memory_replay_priority_base: float | None = None,
+        retention_score_base: float | None = None,
+        retention_score: float | None = None,
+        memory_state: str | None = None,
+        stored_epoch: int | None = None,
+        last_replayed_epoch: int | None = None,
+        last_promoted_epoch: int | None = None,
+        forgetting_score: float | None = None,
+        compressed_into_id: str | None = None,
+        superseded_by_id: str | None = None,
+        forgetting_reason: str | None = None,
     ) -> int | None:
         prediction_error: int | None
         if predicted_family is None or actual_family is None:
             prediction_error = None
         else:
             prediction_error = 0 if int(predicted_family) == int(actual_family) else 1
+        row = {
+            "interaction_id": int(interaction_id),
+            "global_step": None if global_step is None else int(global_step),
+            "context_level": None if context_level is None else int(context_level),
+            "context_signature": json.dumps(context_signature),
+            "action": int(action),
+            "predicted_family": None if predicted_family is None else int(predicted_family),
+            "actual_family": None if actual_family is None else int(actual_family),
+            "prediction_error": prediction_error,
+            "episode_id": int(episode_id),
+            "isf_version": isf_version,
+            "isf_total": None if isf_total is None else float(isf_total),
+            "isf_survival_impact": None if isf_survival_impact is None else float(isf_survival_impact),
+            "isf_prediction_error": None if isf_prediction_error is None else float(isf_prediction_error),
+            "isf_learning_value": None if isf_learning_value is None else float(isf_learning_value),
+            "isf_transfer_potential": None if isf_transfer_potential is None else float(isf_transfer_potential),
+            "isf_explanatory_potential": None if isf_explanatory_potential is None else float(isf_explanatory_potential),
+            "isf_weights_json": isf_weights_json,
+            "context_contradiction": int(bool(context_contradiction)),
+            "context_contradiction_key": context_contradiction_key,
+            "context_expansion_suggested": int(bool(context_expansion_suggested)),
+            "suggested_context_depth": None if suggested_context_depth is None else int(suggested_context_depth),
+            "context_contradiction_reason": context_contradiction_reason,
+            "carrier_signature": carrier_signature,
+            "carrier_source": str(carrier_source or "unknown"),
+            "carrier_event_recorded": int(bool(carrier_event_recorded)),
+            "carrier_support_count": None if carrier_support_count is None else int(carrier_support_count),
+            "carrier_distinct_family_count": None if carrier_distinct_family_count is None else int(carrier_distinct_family_count),
+            "carrier_distinct_context_count": None if carrier_distinct_context_count is None else int(carrier_distinct_context_count),
+            "memory_status": memory_status,
+            "memory_retention_reason": memory_retention_reason,
+            "memory_replay_priority": float(memory_replay_priority),
+            "memory_replay_candidate": int(bool(memory_replay_candidate)),
+            "memory_replay_count": int(memory_replay_count),
+            "context_depth_used": None if context_depth_used is None else int(context_depth_used),
+            "adaptive_context_expansion_applied": int(bool(adaptive_context_expansion_applied)),
+            "adaptive_context_depth_after": None if adaptive_context_depth_after is None else int(adaptive_context_depth_after),
+            "efficiency_action_cost": None if efficiency_action_cost is None else float(efficiency_action_cost),
+            "efficiency_cumulative_cost": None if efficiency_cumulative_cost is None else float(efficiency_cumulative_cost),
+            "efficiency_repeated_state": int(bool(efficiency_repeated_state)),
+            "efficiency_repeated_context_action": int(bool(efficiency_repeated_context_action)),
+            "efficiency_no_effect_action": int(bool(efficiency_no_effect_action)),
+            "efficiency_terminal_outcome": int(bool(efficiency_terminal_outcome)),
+            "efficiency_outcome_signature": efficiency_outcome_signature,
+            "efficiency_best_known_cost_for_outcome": None if efficiency_best_known_cost_for_outcome is None else float(efficiency_best_known_cost_for_outcome),
+            "efficiency_normalized_solve_efficiency": None if efficiency_normalized_solve_efficiency is None else float(efficiency_normalized_solve_efficiency),
+            "efficiency_equivalent_outcome_cost_gap": None if efficiency_equivalent_outcome_cost_gap is None else float(efficiency_equivalent_outcome_cost_gap),
+            "efficiency_future_option_gain_per_cost": None if efficiency_future_option_gain_per_cost is None else float(efficiency_future_option_gain_per_cost),
+            "outcome_state": outcome_state,
+            "outcome_polarity": outcome_polarity,
+            "level_completed_event": int(bool(level_completed_event)),
+            "post_factum_level_completion_credit": float(post_factum_level_completion_credit),
+            "post_factum_level_completion_decay": None if post_factum_level_completion_decay is None else float(post_factum_level_completion_decay),
+            "post_factum_level_completion_step": None if post_factum_level_completion_step is None else int(post_factum_level_completion_step),
+            "post_factum_credit_reason": post_factum_credit_reason,
+            "post_factum_trajectory_credit": float(post_factum_trajectory_credit),
+            "post_factum_trajectory_credit_kind": post_factum_trajectory_credit_kind,
+            "post_factum_trajectory_credit_polarity": post_factum_trajectory_credit_polarity,
+            "post_factum_trajectory_credit_step": None if post_factum_trajectory_credit_step is None else int(post_factum_trajectory_credit_step),
+            "post_factum_trajectory_credit_reason": post_factum_trajectory_credit_reason,
+            "game_id": game_id,
+            "level_id": level_id,
+            "sampler_name": sampler_name,
+            "state_hash_before": state_hash_before,
+            "state_hash_after": state_hash_after,
+            "memory_fitness_base": None if memory_fitness_base is None else float(memory_fitness_base),
+            "memory_fitness": None if memory_fitness is None else float(memory_fitness),
+            "memory_replay_priority_base": None if memory_replay_priority_base is None else float(memory_replay_priority_base),
+            "retention_score_base": None if retention_score_base is None else float(retention_score_base),
+            "retention_score": None if retention_score is None else float(retention_score),
+            "memory_state": memory_state,
+            "stored_epoch": None if stored_epoch is None else int(stored_epoch),
+            "last_replayed_epoch": None if last_replayed_epoch is None else int(last_replayed_epoch),
+            "last_promoted_epoch": None if last_promoted_epoch is None else int(last_promoted_epoch),
+            "forgetting_score": None if forgetting_score is None else float(forgetting_score),
+            "compressed_into_id": compressed_into_id,
+            "superseded_by_id": superseded_by_id,
+            "forgetting_reason": forgetting_reason,
+        }
+        columns = list(row.keys())
+        values = tuple(row[column] for column in columns)
         self.connection.execute(
-            """
+            f"""
             INSERT INTO prediction_results (
-                interaction_id,
-                global_step,
-                context_level,
-                context_signature,
-                action,
-                predicted_family,
-                actual_family,
-                prediction_error,
-                episode_id,
-                isf_version,
-                isf_total,
-                isf_survival_impact,
-                isf_prediction_error,
-                isf_learning_value,
-                isf_transfer_potential,
-                isf_explanatory_potential,
-                isf_weights_json,
-                context_contradiction,
-                context_contradiction_key,
-                context_expansion_suggested,
-                suggested_context_depth,
-                context_contradiction_reason,
-                carrier_signature,
-                carrier_source,
-                carrier_event_recorded,
-                carrier_support_count,
-                carrier_distinct_family_count,
-                carrier_distinct_context_count,
-                memory_status,
-                memory_retention_reason,
-                memory_replay_priority,
-                memory_replay_candidate,
-                memory_replay_count,
-                context_depth_used,
-                adaptive_context_expansion_applied,
-                adaptive_context_depth_after,
-                efficiency_action_cost,
-                efficiency_cumulative_cost,
-                efficiency_repeated_state,
-                efficiency_repeated_context_action,
-                efficiency_no_effect_action,
-                efficiency_terminal_outcome,
-                efficiency_outcome_signature,
-                efficiency_best_known_cost_for_outcome,
-                efficiency_normalized_solve_efficiency,
-                efficiency_equivalent_outcome_cost_gap,
-                efficiency_future_option_gain_per_cost,
-                outcome_state,
-                outcome_polarity,
-                level_completed_event,
-                post_factum_level_completion_credit,
-                post_factum_level_completion_decay,
-                post_factum_level_completion_step,
-                post_factum_credit_reason,
-                post_factum_trajectory_credit,
-                post_factum_trajectory_credit_kind,
-                post_factum_trajectory_credit_polarity,
-                post_factum_trajectory_credit_step,
-                post_factum_trajectory_credit_reason
+                {", ".join(columns)}
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES ({", ".join("?" for _ in values)})
             """,
-            (
-                int(interaction_id),
-                None if global_step is None else int(global_step),
-                None if context_level is None else int(context_level),
-                json.dumps(context_signature),
-                int(action),
-                None if predicted_family is None else int(predicted_family),
-                None if actual_family is None else int(actual_family),
-                prediction_error,
-                int(episode_id),
-                isf_version,
-                None if isf_total is None else float(isf_total),
-                None if isf_survival_impact is None else float(isf_survival_impact),
-                None if isf_prediction_error is None else float(isf_prediction_error),
-                None if isf_learning_value is None else float(isf_learning_value),
-                None if isf_transfer_potential is None else float(isf_transfer_potential),
-                None if isf_explanatory_potential is None else float(isf_explanatory_potential),
-                isf_weights_json,
-                int(bool(context_contradiction)),
-                context_contradiction_key,
-                int(bool(context_expansion_suggested)),
-                None if suggested_context_depth is None else int(suggested_context_depth),
-                context_contradiction_reason,
-                carrier_signature,
-                str(carrier_source or "unknown"),
-                int(bool(carrier_event_recorded)),
-                None if carrier_support_count is None else int(carrier_support_count),
-                None if carrier_distinct_family_count is None else int(carrier_distinct_family_count),
-                None if carrier_distinct_context_count is None else int(carrier_distinct_context_count),
-                memory_status,
-                memory_retention_reason,
-                float(memory_replay_priority),
-                int(bool(memory_replay_candidate)),
-                int(memory_replay_count),
-                None if context_depth_used is None else int(context_depth_used),
-                int(bool(adaptive_context_expansion_applied)),
-                None if adaptive_context_depth_after is None else int(adaptive_context_depth_after),
-                None if efficiency_action_cost is None else float(efficiency_action_cost),
-                None if efficiency_cumulative_cost is None else float(efficiency_cumulative_cost),
-                int(bool(efficiency_repeated_state)),
-                int(bool(efficiency_repeated_context_action)),
-                int(bool(efficiency_no_effect_action)),
-                int(bool(efficiency_terminal_outcome)),
-                efficiency_outcome_signature,
-                None if efficiency_best_known_cost_for_outcome is None else float(efficiency_best_known_cost_for_outcome),
-                None if efficiency_normalized_solve_efficiency is None else float(efficiency_normalized_solve_efficiency),
-                None if efficiency_equivalent_outcome_cost_gap is None else float(efficiency_equivalent_outcome_cost_gap),
-                None if efficiency_future_option_gain_per_cost is None else float(efficiency_future_option_gain_per_cost),
-                outcome_state,
-                outcome_polarity,
-                int(bool(level_completed_event)),
-                float(post_factum_level_completion_credit),
-                None if post_factum_level_completion_decay is None else float(post_factum_level_completion_decay),
-                None if post_factum_level_completion_step is None else int(post_factum_level_completion_step),
-                post_factum_credit_reason,
-                float(post_factum_trajectory_credit),
-                post_factum_trajectory_credit_kind,
-                post_factum_trajectory_credit_polarity,
-                None if post_factum_trajectory_credit_step is None else int(post_factum_trajectory_credit_step),
-                post_factum_trajectory_credit_reason,
-            ),
+            values,
         )
         if self.auto_commit:
             self.connection.commit()

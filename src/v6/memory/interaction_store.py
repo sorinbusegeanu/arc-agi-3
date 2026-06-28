@@ -134,7 +134,26 @@ class InteractionStore:
                 post_factum_trajectory_credit_kind TEXT,
                 post_factum_trajectory_credit_polarity TEXT,
                 post_factum_trajectory_credit_step INTEGER,
-                post_factum_trajectory_credit_reason TEXT
+                post_factum_trajectory_credit_reason TEXT,
+                game_id TEXT,
+                level_id TEXT,
+                sampler_name TEXT,
+                episode_id INTEGER,
+                state_hash_before TEXT,
+                state_hash_after TEXT,
+                memory_fitness_base REAL,
+                memory_fitness REAL,
+                memory_replay_priority_base REAL,
+                retention_score_base REAL,
+                retention_score REAL,
+                trajectory_efficiency_active INTEGER,
+                trajectory_outcome_class TEXT,
+                comparable_outcome_group_id TEXT,
+                trajectory_efficiency_score REAL,
+                efficiency_memory_bonus REAL,
+                efficiency_replay_bonus REAL,
+                efficiency_retention_bonus REAL,
+                efficiency_promotion_bonus REAL
             )
             """
         )
@@ -184,6 +203,34 @@ class InteractionStore:
         self._ensure_column("post_factum_trajectory_credit_polarity", "TEXT")
         self._ensure_column("post_factum_trajectory_credit_step", "INTEGER")
         self._ensure_column("post_factum_trajectory_credit_reason", "TEXT")
+        self._ensure_column("memory_state", "TEXT")
+        self._ensure_column("stored_epoch", "INTEGER")
+        self._ensure_column("last_replayed_epoch", "INTEGER")
+        self._ensure_column("last_promoted_epoch", "INTEGER")
+        self._ensure_column("retention_score", "REAL")
+        self._ensure_column("forgetting_score", "REAL")
+        self._ensure_column("compressed_into_id", "TEXT")
+        self._ensure_column("superseded_by_id", "TEXT")
+        self._ensure_column("forgetting_reason", "TEXT")
+        self._ensure_column("game_id", "TEXT")
+        self._ensure_column("level_id", "TEXT")
+        self._ensure_column("sampler_name", "TEXT")
+        self._ensure_column("episode_id", "INTEGER")
+        self._ensure_column("state_hash_before", "TEXT")
+        self._ensure_column("state_hash_after", "TEXT")
+        self._ensure_column("memory_fitness_base", "REAL")
+        self._ensure_column("memory_fitness", "REAL")
+        self._ensure_column("memory_replay_priority_base", "REAL")
+        self._ensure_column("retention_score_base", "REAL")
+        self._ensure_column("retention_score", "REAL")
+        self._ensure_column("trajectory_efficiency_active", "INTEGER")
+        self._ensure_column("trajectory_outcome_class", "TEXT")
+        self._ensure_column("comparable_outcome_group_id", "TEXT")
+        self._ensure_column("trajectory_efficiency_score", "REAL")
+        self._ensure_column("efficiency_memory_bonus", "REAL")
+        self._ensure_column("efficiency_replay_bonus", "REAL")
+        self._ensure_column("efficiency_retention_bonus", "REAL")
+        self._ensure_column("efficiency_promotion_bonus", "REAL")
         self._ensure_column("level_advanced", "INTEGER")
         self.connection.commit()
 

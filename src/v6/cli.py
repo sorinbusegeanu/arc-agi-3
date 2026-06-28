@@ -43,6 +43,7 @@ from v6.hypothesis_h03_report import (
 )
 from v6.hypothesis_suite_report import run_hypothesis_suite_report
 from v6.main import V6Config, V6System
+from v6.memory.direct_streaming_fold import retry_direct_streaming_fold_failures
 from v6.m2_expand_v08c import M2ExpandV08cConfig, run_m2_expand_v08c
 from v6.role_candidates_v08 import RoleCandidatesV08Config, run_role_candidates_v08
 from v6.role_candidates_v08d import RoleCandidatesV08dConfig, run_role_candidates_v08d
@@ -238,7 +239,8 @@ def build_parser() -> argparse.ArgumentParser:
     sampling.add_argument("--max-context-depth", type=int, default=None)
     sampling.add_argument("--workers", type=int, default=60)
     sampling.add_argument("--max-tasks-per-child", type=int, default=1)
-    sampling.add_argument("--commit-steps", type=int, default=1000)
+    sampling.add_argument("--commit-steps", type=int, default=5000)
+    sampling.add_argument("--sqlite-synchronous", choices=("normal", "off", "full"), default="normal")
     sampling.add_argument("--storage-backend", choices=("sqlite", "parquet"), default="sqlite")
     sampling.add_argument("--parquet-root", default="runs/v6/storage_parquet")
     sampling.add_argument("--duckdb-path", default="runs/v6/arc_agi3.duckdb")
@@ -262,8 +264,20 @@ def build_parser() -> argparse.ArgumentParser:
     sampling.add_argument("--live-memory-flush-seconds", type=float, default=2.0)
     sampling.add_argument("--direct-streaming-fold", dest="direct_streaming_fold", action="store_true", default=True)
     sampling.add_argument("--direct-streaming-fold-workers", type=int, default=8)
+    sampling.add_argument("--direct-streaming-fold-retry-attempts", type=int, default=5)
+    sampling.add_argument("--direct-streaming-fold-retry-initial-delay-seconds", type=float, default=5.0)
+    sampling.add_argument("--direct-streaming-fold-busy-timeout-ms", type=int, default=60000)
+    sampling.add_argument("--direct-streaming-fold-submit-delay-seconds", type=float, default=1.0)
+    sampling.add_argument("--direct-streaming-shard-synchronous", choices=("normal", "off", "full"), default="off")
     sampling.add_argument("--delete-raw-after-direct-streaming-fold", dest="delete_raw_after_direct_streaming_fold", action="store_true", default=True)
     sampling.add_argument("--keep-raw-after-direct-streaming-fold", dest="delete_raw_after_direct_streaming_fold", action="store_false")
+
+    retry_fold = subparsers.add_parser("retry-direct-streaming-fold-failures")
+    retry_fold.add_argument("--manifest-path", required=True)
+    retry_fold.add_argument("--memory-dir", required=True)
+    retry_fold.add_argument("--workers", type=int, default=2)
+    retry_fold.add_argument("--delete-raw-after-fold", type=_parse_bool, default=True)
+    retry_fold.add_argument("--finalize-after-success", type=_parse_bool, default=False)
 
     contingency_memory = subparsers.add_parser("contingency-memory-v06")
     contingency_memory.add_argument("--parquet-root", required=True)
@@ -560,6 +574,8 @@ def build_parser() -> argparse.ArgumentParser:
     continuous.add_argument("--fast-postprocessing", type=_parse_bool, default=True)
     continuous.add_argument("--workers", type=int, default=60)
     continuous.add_argument("--max-tasks-per-child", type=int, default=1)
+    continuous.add_argument("--commit-steps", type=int, default=5000)
+    continuous.add_argument("--sqlite-synchronous", choices=("normal", "off", "full"), default="normal")
     continuous.add_argument("--initial-workers", type=int, default=None)
     continuous.add_argument("--ram-ramp-threshold-percent", type=float, default=85.0)
     continuous.add_argument("--initial-worker-ramp-delay-seconds", type=float, default=20.0)
@@ -572,6 +588,11 @@ def build_parser() -> argparse.ArgumentParser:
     continuous.add_argument("--live-memory-flush-seconds", type=float, default=2.0)
     continuous.add_argument("--direct-streaming-fold", dest="direct_streaming_fold", action="store_true", default=True)
     continuous.add_argument("--direct-streaming-fold-workers", type=int, default=8)
+    continuous.add_argument("--direct-streaming-fold-retry-attempts", type=int, default=5)
+    continuous.add_argument("--direct-streaming-fold-retry-initial-delay-seconds", type=float, default=5.0)
+    continuous.add_argument("--direct-streaming-fold-busy-timeout-ms", type=int, default=60000)
+    continuous.add_argument("--direct-streaming-fold-submit-delay-seconds", type=float, default=1.0)
+    continuous.add_argument("--direct-streaming-shard-synchronous", choices=("normal", "off", "full"), default="off")
     continuous.add_argument("--delete-raw-after-direct-streaming-fold", dest="delete_raw_after_direct_streaming_fold", action="store_true", default=True)
     continuous.add_argument("--keep-raw-after-direct-streaming-fold", dest="delete_raw_after_direct_streaming_fold", action="store_false")
     return parser
@@ -819,6 +840,7 @@ def main(argv: list[str] | None = None) -> int:
                 workers=args.workers,
                 max_tasks_per_child=int(args.max_tasks_per_child),
                 commit_steps=args.commit_steps,
+                sqlite_synchronous=str(args.sqlite_synchronous),
                 storage_backend=args.storage_backend,
                 parquet_root=args.parquet_root,
                 duckdb_path=args.duckdb_path,
@@ -842,9 +864,25 @@ def main(argv: list[str] | None = None) -> int:
                 direct_streaming_fold_enabled=bool(args.direct_streaming_fold),
                 direct_streaming_fold_workers=int(args.direct_streaming_fold_workers),
                 delete_raw_after_direct_streaming_fold=bool(args.delete_raw_after_direct_streaming_fold),
+                direct_streaming_fold_retry_attempts=int(args.direct_streaming_fold_retry_attempts),
+                direct_streaming_fold_retry_initial_delay_seconds=float(args.direct_streaming_fold_retry_initial_delay_seconds),
+                direct_streaming_fold_busy_timeout_ms=int(args.direct_streaming_fold_busy_timeout_ms),
+                direct_streaming_fold_submit_delay_seconds=float(args.direct_streaming_fold_submit_delay_seconds),
+                direct_streaming_shard_synchronous=str(args.direct_streaming_shard_synchronous),
             )
         )
         print(json.dumps({"rows": len(rows), "output_dir": args.output_dir}, indent=2))
+        return 0
+
+    if args.command == "retry-direct-streaming-fold-failures":
+        payload = retry_direct_streaming_fold_failures(
+            manifest_path=args.manifest_path,
+            memory_dir=args.memory_dir,
+            workers=int(args.workers),
+            delete_raw_after_fold=bool(args.delete_raw_after_fold),
+            finalize_after_success=bool(args.finalize_after_success),
+        )
+        print(json.dumps(payload, indent=2))
         return 0
 
     if args.command == "contingency-memory-v06":
@@ -1435,6 +1473,8 @@ def main(argv: list[str] | None = None) -> int:
                 fast_postprocessing=bool(args.fast_postprocessing),
                 workers=int(args.workers),
                 max_tasks_per_child=int(args.max_tasks_per_child),
+                commit_steps=int(args.commit_steps),
+                sqlite_synchronous=str(args.sqlite_synchronous),
                 initial_workers=None if args.initial_workers is None else int(args.initial_workers),
                 ram_ramp_threshold_percent=float(args.ram_ramp_threshold_percent),
                 initial_worker_ramp_delay_seconds=float(args.initial_worker_ramp_delay_seconds),
@@ -1448,6 +1488,11 @@ def main(argv: list[str] | None = None) -> int:
                 direct_streaming_fold=bool(args.direct_streaming_fold),
                 direct_streaming_fold_workers=int(args.direct_streaming_fold_workers),
                 delete_raw_after_direct_streaming_fold=bool(args.delete_raw_after_direct_streaming_fold),
+                direct_streaming_fold_retry_attempts=int(args.direct_streaming_fold_retry_attempts),
+                direct_streaming_fold_retry_initial_delay_seconds=float(args.direct_streaming_fold_retry_initial_delay_seconds),
+                direct_streaming_fold_busy_timeout_ms=int(args.direct_streaming_fold_busy_timeout_ms),
+                direct_streaming_fold_submit_delay_seconds=float(args.direct_streaming_fold_submit_delay_seconds),
+                direct_streaming_shard_synchronous=str(args.direct_streaming_shard_synchronous),
             )
         )
         print(json.dumps(result, indent=2))

@@ -43,11 +43,24 @@ class CompactMemoryFoldConfig:
     max_examples_per_contradiction_cluster: int = DEFAULT_MAX_EXAMPLES_PER_CONTRADICTION_CLUSTER
 
 
-def configure_compact_sqlite_connection(conn: sqlite3.Connection, *, write: bool) -> None:
+def configure_compact_sqlite_connection(
+    conn: sqlite3.Connection,
+    *,
+    write: bool,
+    synchronous: str = "NORMAL",
+    temporary_shard: bool = False,
+) -> None:
+    mode = str(synchronous or "NORMAL").strip().upper()
+    if mode not in {"OFF", "NORMAL", "FULL"}:
+        mode = "NORMAL"
     conn.execute("PRAGMA busy_timeout=10000")
     if write:
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute(f"PRAGMA synchronous={mode}")
+        if temporary_shard:
+            conn.execute("PRAGMA temp_store=MEMORY")
+            conn.execute("PRAGMA cache_size=-65536")
+            conn.execute("PRAGMA wal_autocheckpoint=0")
     else:
         conn.execute("PRAGMA query_only=ON")
         conn.execute("PRAGMA busy_timeout=10000")
@@ -155,6 +168,8 @@ def fold_single_sampling_db_into_main_compact_memory(
     memory_dir: str | Path,
     fold_config: CompactMemoryFoldConfig,
     finalize_after_fold: bool = False,
+    sqlite_synchronous: str = "NORMAL",
+    temporary_shard: bool = False,
 ) -> dict[str, Any]:
     paths = ensure_memory_layout(memory_dir)
     sqlite_path = Path(db_path)
@@ -176,9 +191,9 @@ def fold_single_sampling_db_into_main_compact_memory(
         sqlite3.connect(paths.graph) as graph_conn,
         sqlite3.connect(paths.replay_queue) as replay_conn,
     ):
-        configure_compact_sqlite_connection(state_conn, write=True)
-        configure_compact_sqlite_connection(graph_conn, write=True)
-        configure_compact_sqlite_connection(replay_conn, write=True)
+        configure_compact_sqlite_connection(state_conn, write=True, synchronous=sqlite_synchronous, temporary_shard=temporary_shard)
+        configure_compact_sqlite_connection(graph_conn, write=True, synchronous=sqlite_synchronous, temporary_shard=temporary_shard)
+        configure_compact_sqlite_connection(replay_conn, write=True, synchronous=sqlite_synchronous, temporary_shard=temporary_shard)
         _fold_single_db(
             db_path=sqlite_path,
             state_conn=state_conn,
@@ -968,9 +983,12 @@ def fold_live_system_into_compact_memory(system: Any, memory_dir: str | Path) ->
                     """
                     INSERT INTO memory_scores (
                         node_id, isf_total, prediction_lift, transfer_score, explanatory_reach,
-                        compression_gain, future_option_delta, replay_priority, retention_status, updated_step
+                        compression_gain, future_option_delta, replay_priority, retention_status,
+                        memory_state, stored_epoch, last_replayed_epoch, last_promoted_epoch,
+                        retention_score, forgetting_score, compressed_into_id, superseded_by_id,
+                        forgetting_reason, updated_step
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(node_id) DO UPDATE SET
                         isf_total = COALESCE(excluded.isf_total, memory_scores.isf_total),
                         prediction_lift = COALESCE(excluded.prediction_lift, memory_scores.prediction_lift),
@@ -980,6 +998,15 @@ def fold_live_system_into_compact_memory(system: Any, memory_dir: str | Path) ->
                         future_option_delta = COALESCE(excluded.future_option_delta, memory_scores.future_option_delta),
                         replay_priority = MAX(COALESCE(memory_scores.replay_priority, 0.0), COALESCE(excluded.replay_priority, 0.0)),
                         retention_status = COALESCE(excluded.retention_status, memory_scores.retention_status),
+                        memory_state = COALESCE(excluded.memory_state, memory_scores.memory_state),
+                        stored_epoch = COALESCE(excluded.stored_epoch, memory_scores.stored_epoch),
+                        last_replayed_epoch = COALESCE(excluded.last_replayed_epoch, memory_scores.last_replayed_epoch),
+                        last_promoted_epoch = COALESCE(excluded.last_promoted_epoch, memory_scores.last_promoted_epoch),
+                        retention_score = COALESCE(excluded.retention_score, memory_scores.retention_score),
+                        forgetting_score = COALESCE(excluded.forgetting_score, memory_scores.forgetting_score),
+                        compressed_into_id = COALESCE(excluded.compressed_into_id, memory_scores.compressed_into_id),
+                        superseded_by_id = COALESCE(excluded.superseded_by_id, memory_scores.superseded_by_id),
+                        forgetting_reason = COALESCE(excluded.forgetting_reason, memory_scores.forgetting_reason),
                         updated_step = COALESCE(excluded.updated_step, memory_scores.updated_step)
                     """,
                     tuple(row[column] for column in row.keys()),
@@ -1298,9 +1325,12 @@ def _merge_state_tables(temp_state: sqlite3.Connection, state_conn: sqlite3.Conn
             """
             INSERT INTO memory_scores (
                 node_id, isf_total, prediction_lift, transfer_score, explanatory_reach,
-                compression_gain, future_option_delta, replay_priority, retention_status, updated_step
+                compression_gain, future_option_delta, replay_priority, retention_status,
+                memory_state, stored_epoch, last_replayed_epoch, last_promoted_epoch,
+                retention_score, forgetting_score, compressed_into_id, superseded_by_id,
+                forgetting_reason, updated_step
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(node_id) DO UPDATE SET
                 isf_total = COALESCE(excluded.isf_total, memory_scores.isf_total),
                 prediction_lift = COALESCE(excluded.prediction_lift, memory_scores.prediction_lift),
@@ -1310,6 +1340,15 @@ def _merge_state_tables(temp_state: sqlite3.Connection, state_conn: sqlite3.Conn
                 future_option_delta = COALESCE(excluded.future_option_delta, memory_scores.future_option_delta),
                 replay_priority = MAX(COALESCE(memory_scores.replay_priority, 0.0), COALESCE(excluded.replay_priority, 0.0)),
                 retention_status = COALESCE(excluded.retention_status, memory_scores.retention_status),
+                memory_state = COALESCE(excluded.memory_state, memory_scores.memory_state),
+                stored_epoch = COALESCE(excluded.stored_epoch, memory_scores.stored_epoch),
+                last_replayed_epoch = COALESCE(excluded.last_replayed_epoch, memory_scores.last_replayed_epoch),
+                last_promoted_epoch = COALESCE(excluded.last_promoted_epoch, memory_scores.last_promoted_epoch),
+                retention_score = COALESCE(excluded.retention_score, memory_scores.retention_score),
+                forgetting_score = COALESCE(excluded.forgetting_score, memory_scores.forgetting_score),
+                compressed_into_id = COALESCE(excluded.compressed_into_id, memory_scores.compressed_into_id),
+                superseded_by_id = COALESCE(excluded.superseded_by_id, memory_scores.superseded_by_id),
+                forgetting_reason = COALESCE(excluded.forgetting_reason, memory_scores.forgetting_reason),
                 updated_step = COALESCE(excluded.updated_step, memory_scores.updated_step)
             """,
             tuple(row[column] for column in row.keys()),
@@ -1556,9 +1595,12 @@ def _fold_single_db(
                     """
                     INSERT INTO memory_scores (
                         node_id, isf_total, prediction_lift, transfer_score, explanatory_reach,
-                        compression_gain, future_option_delta, replay_priority, retention_status, updated_step
+                        compression_gain, future_option_delta, replay_priority, retention_status,
+                        memory_state, stored_epoch, last_replayed_epoch, last_promoted_epoch,
+                        retention_score, forgetting_score, compressed_into_id, superseded_by_id,
+                        forgetting_reason, updated_step
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(node_id) DO UPDATE SET
                         isf_total = COALESCE(excluded.isf_total, memory_scores.isf_total),
                         prediction_lift = COALESCE(excluded.prediction_lift, memory_scores.prediction_lift),
@@ -1568,6 +1610,15 @@ def _fold_single_db(
                         future_option_delta = COALESCE(excluded.future_option_delta, memory_scores.future_option_delta),
                         replay_priority = MAX(COALESCE(memory_scores.replay_priority, 0.0), COALESCE(excluded.replay_priority, 0.0)),
                         retention_status = COALESCE(excluded.retention_status, memory_scores.retention_status),
+                        memory_state = COALESCE(excluded.memory_state, memory_scores.memory_state),
+                        stored_epoch = COALESCE(excluded.stored_epoch, memory_scores.stored_epoch),
+                        last_replayed_epoch = COALESCE(excluded.last_replayed_epoch, memory_scores.last_replayed_epoch),
+                        last_promoted_epoch = COALESCE(excluded.last_promoted_epoch, memory_scores.last_promoted_epoch),
+                        retention_score = COALESCE(excluded.retention_score, memory_scores.retention_score),
+                        forgetting_score = COALESCE(excluded.forgetting_score, memory_scores.forgetting_score),
+                        compressed_into_id = COALESCE(excluded.compressed_into_id, memory_scores.compressed_into_id),
+                        superseded_by_id = COALESCE(excluded.superseded_by_id, memory_scores.superseded_by_id),
+                        forgetting_reason = COALESCE(excluded.forgetting_reason, memory_scores.forgetting_reason),
                         updated_step = COALESCE(excluded.updated_step, memory_scores.updated_step)
                     """,
                     (
@@ -1580,6 +1631,15 @@ def _fold_single_db(
                         row["future_option_delta"],
                         row["replay_priority"],
                         row["retention_status"],
+                        row["memory_state"] if "memory_state" in row.keys() else None,
+                        row["stored_epoch"] if "stored_epoch" in row.keys() else None,
+                        row["last_replayed_epoch"] if "last_replayed_epoch" in row.keys() else None,
+                        row["last_promoted_epoch"] if "last_promoted_epoch" in row.keys() else None,
+                        row["retention_score"] if "retention_score" in row.keys() else None,
+                        row["forgetting_score"] if "forgetting_score" in row.keys() else None,
+                        row["compressed_into_id"] if "compressed_into_id" in row.keys() else None,
+                        row["superseded_by_id"] if "superseded_by_id" in row.keys() else None,
+                        row["forgetting_reason"] if "forgetting_reason" in row.keys() else None,
                         row["updated_step"],
                     ),
                 )
@@ -1794,6 +1854,57 @@ def _fold_single_db(
                     carrier_signature=str(payload.get("carrier_signature") or "") or None,
                     contradiction_key=contradiction_key,
                     replay_id=replay_id,
+                )
+        if "trajectory_efficiency" in tables:
+            for row in raw_conn.execute("SELECT * FROM trajectory_efficiency ORDER BY trajectory_id ASC").fetchall():
+                state_conn.execute(
+                    """
+                    INSERT OR REPLACE INTO trajectory_efficiency (
+                        trajectory_id, game_id, level_id, sampler, seed, epoch, outcome_class,
+                        comparable_outcome_group_id, efficiency_active, success, terminal,
+                        trajectory_length, steps_to_success, best_known_solution_length,
+                        normalized_solve_efficiency, future_option_gain, future_option_gain_per_action,
+                        equivalent_outcome_cost_gap, loop_count, loop_ratio, repeated_state_count,
+                        repeated_state_ratio, blocked_action_count, blocked_action_ratio,
+                        wasted_action_count, wasted_action_ratio, unique_state_count, efficiency_score,
+                        efficiency_memory_bonus, efficiency_replay_bonus, efficiency_retention_bonus,
+                        efficiency_promotion_bonus
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        _scope_raw_local_id("trajectory", row["trajectory_id"], db_path),
+                        row["game_id"],
+                        row["level_id"],
+                        row["sampler"],
+                        row["seed"],
+                        row["epoch"],
+                        row["outcome_class"],
+                        row["comparable_outcome_group_id"],
+                        row["efficiency_active"],
+                        row["success"],
+                        row["terminal"],
+                        row["trajectory_length"],
+                        row["steps_to_success"],
+                        row["best_known_solution_length"],
+                        row["normalized_solve_efficiency"],
+                        row["future_option_gain"],
+                        row["future_option_gain_per_action"],
+                        row["equivalent_outcome_cost_gap"],
+                        row["loop_count"],
+                        row["loop_ratio"],
+                        row["repeated_state_count"],
+                        row["repeated_state_ratio"],
+                        row["blocked_action_count"],
+                        row["blocked_action_ratio"],
+                        row["wasted_action_count"],
+                        row["wasted_action_ratio"],
+                        row["unique_state_count"],
+                        row["efficiency_score"],
+                        row["efficiency_memory_bonus"],
+                        row["efficiency_replay_bonus"],
+                        row["efficiency_retention_bonus"],
+                        row["efficiency_promotion_bonus"],
+                    ),
                 )
         carrier_path = db_path.with_name("carrier_candidates.json")
         if carrier_path.exists():
@@ -2933,6 +3044,40 @@ def _ensure_current_state_schema(path: Path) -> None:
                 key TEXT PRIMARY KEY,
                 value_json TEXT
             );
+            CREATE TABLE IF NOT EXISTS trajectory_efficiency (
+                trajectory_id TEXT PRIMARY KEY,
+                game_id TEXT NOT NULL,
+                level_id TEXT,
+                sampler TEXT,
+                seed INTEGER,
+                epoch INTEGER,
+                outcome_class TEXT NOT NULL,
+                comparable_outcome_group_id TEXT NOT NULL,
+                efficiency_active INTEGER NOT NULL DEFAULT 0,
+                success INTEGER NOT NULL DEFAULT 0,
+                terminal INTEGER NOT NULL DEFAULT 0,
+                trajectory_length INTEGER NOT NULL,
+                steps_to_success INTEGER,
+                best_known_solution_length INTEGER,
+                normalized_solve_efficiency REAL,
+                future_option_gain REAL,
+                future_option_gain_per_action REAL,
+                equivalent_outcome_cost_gap REAL,
+                loop_count INTEGER,
+                loop_ratio REAL,
+                repeated_state_count INTEGER,
+                repeated_state_ratio REAL,
+                blocked_action_count INTEGER,
+                blocked_action_ratio REAL,
+                wasted_action_count INTEGER,
+                wasted_action_ratio REAL,
+                unique_state_count INTEGER,
+                efficiency_score REAL,
+                efficiency_memory_bonus REAL,
+                efficiency_replay_bonus REAL,
+                efficiency_retention_bonus REAL,
+                efficiency_promotion_bonus REAL
+            );
             CREATE TABLE IF NOT EXISTS memory_nodes (
                 node_id TEXT PRIMARY KEY,
                 memory_level TEXT NOT NULL,
@@ -2970,6 +3115,15 @@ def _ensure_current_state_schema(path: Path) -> None:
                 future_option_delta REAL,
                 replay_priority REAL,
                 retention_status TEXT,
+                memory_state TEXT,
+                stored_epoch INTEGER,
+                last_replayed_epoch INTEGER,
+                last_promoted_epoch INTEGER,
+                retention_score REAL,
+                forgetting_score REAL,
+                compressed_into_id TEXT,
+                superseded_by_id TEXT,
+                forgetting_reason TEXT,
                 updated_step INTEGER
             );
             CREATE TABLE IF NOT EXISTS memory_promotions (
@@ -3259,6 +3413,15 @@ def _ensure_current_state_schema(path: Path) -> None:
         _ensure_column(connection, "future_option_attention_links", "attention_score_percentile", "REAL")
         _ensure_column(connection, "future_option_attention_links", "attention_threshold_method", "TEXT")
         _ensure_column(connection, "future_option_attention_links", "attention_calibration_degenerate", "INTEGER")
+        _ensure_column(connection, "memory_scores", "memory_state", "TEXT")
+        _ensure_column(connection, "memory_scores", "stored_epoch", "INTEGER")
+        _ensure_column(connection, "memory_scores", "last_replayed_epoch", "INTEGER")
+        _ensure_column(connection, "memory_scores", "last_promoted_epoch", "INTEGER")
+        _ensure_column(connection, "memory_scores", "retention_score", "REAL")
+        _ensure_column(connection, "memory_scores", "forgetting_score", "REAL")
+        _ensure_column(connection, "memory_scores", "compressed_into_id", "TEXT")
+        _ensure_column(connection, "memory_scores", "superseded_by_id", "TEXT")
+        _ensure_column(connection, "memory_scores", "forgetting_reason", "TEXT")
         connection.commit()
 
 
@@ -3288,6 +3451,13 @@ def _ensure_graph_schema(path: Path) -> None:
             """
         )
         connection.commit()
+
+
+def _ensure_table_column(connection: sqlite3.Connection, table: str, column: str, declaration: str) -> None:
+    rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
+    if any(str(row[1]) == column for row in rows):
+        return
+    connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
 
 
 def _ensure_replay_schema(path: Path) -> None:

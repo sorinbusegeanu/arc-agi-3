@@ -45,6 +45,15 @@ class MemoryScore:
     future_option_delta: float | None = None
     replay_priority: float | None = None
     retention_status: str | None = None
+    memory_state: str | None = None
+    stored_epoch: int | None = None
+    last_replayed_epoch: int | None = None
+    last_promoted_epoch: int | None = None
+    retention_score: float | None = None
+    forgetting_score: float | None = None
+    compressed_into_id: str | None = None
+    superseded_by_id: str | None = None
+    forgetting_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -104,6 +113,15 @@ class MemorySubstrate:
                 future_option_delta REAL,
                 replay_priority REAL,
                 retention_status TEXT,
+                memory_state TEXT,
+                stored_epoch INTEGER,
+                last_replayed_epoch INTEGER,
+                last_promoted_epoch INTEGER,
+                retention_score REAL,
+                forgetting_score REAL,
+                compressed_into_id TEXT,
+                superseded_by_id TEXT,
+                forgetting_reason TEXT,
                 updated_step INTEGER
             );
             CREATE TABLE IF NOT EXISTS memory_promotions (
@@ -137,12 +155,27 @@ class MemorySubstrate:
         self.connection.execute(
             """
             INSERT INTO memory_versions (key, value)
-            VALUES ('memory_substrate_schema', 'phase1')
+            VALUES ('memory_substrate_schema', 'phase1_p10')
             ON CONFLICT(key) DO UPDATE SET value = excluded.value
             """
         )
+        self._ensure_score_column("memory_state", "TEXT")
+        self._ensure_score_column("stored_epoch", "INTEGER")
+        self._ensure_score_column("last_replayed_epoch", "INTEGER")
+        self._ensure_score_column("last_promoted_epoch", "INTEGER")
+        self._ensure_score_column("retention_score", "REAL")
+        self._ensure_score_column("forgetting_score", "REAL")
+        self._ensure_score_column("compressed_into_id", "TEXT")
+        self._ensure_score_column("superseded_by_id", "TEXT")
+        self._ensure_score_column("forgetting_reason", "TEXT")
         if self.auto_commit:
             self.connection.commit()
+
+    def _ensure_score_column(self, column: str, declaration: str) -> None:
+        rows = self.connection.execute("PRAGMA table_info(memory_scores)").fetchall()
+        if any(str(row[1]) == column for row in rows):
+            return
+        self.connection.execute(f"ALTER TABLE memory_scores ADD COLUMN {column} {declaration}")
 
     def upsert_node(self, node: MemoryNode, *, step: int | None = None, support_increment: int = 1) -> None:
         attrs_json = json.dumps(_json_safe(node.attrs), sort_keys=True)
@@ -260,9 +293,12 @@ class MemorySubstrate:
             """
             INSERT INTO memory_scores (
                 node_id, isf_total, prediction_lift, transfer_score, explanatory_reach,
-                compression_gain, future_option_delta, replay_priority, retention_status, updated_step
+                compression_gain, future_option_delta, replay_priority, retention_status,
+                memory_state, stored_epoch, last_replayed_epoch, last_promoted_epoch,
+                retention_score, forgetting_score, compressed_into_id, superseded_by_id,
+                forgetting_reason, updated_step
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(node_id) DO UPDATE SET
                 isf_total = COALESCE(excluded.isf_total, memory_scores.isf_total),
                 prediction_lift = COALESCE(excluded.prediction_lift, memory_scores.prediction_lift),
@@ -272,6 +308,15 @@ class MemorySubstrate:
                 future_option_delta = COALESCE(excluded.future_option_delta, memory_scores.future_option_delta),
                 replay_priority = COALESCE(excluded.replay_priority, memory_scores.replay_priority),
                 retention_status = COALESCE(excluded.retention_status, memory_scores.retention_status),
+                memory_state = COALESCE(excluded.memory_state, memory_scores.memory_state),
+                stored_epoch = COALESCE(excluded.stored_epoch, memory_scores.stored_epoch),
+                last_replayed_epoch = COALESCE(excluded.last_replayed_epoch, memory_scores.last_replayed_epoch),
+                last_promoted_epoch = COALESCE(excluded.last_promoted_epoch, memory_scores.last_promoted_epoch),
+                retention_score = COALESCE(excluded.retention_score, memory_scores.retention_score),
+                forgetting_score = COALESCE(excluded.forgetting_score, memory_scores.forgetting_score),
+                compressed_into_id = COALESCE(excluded.compressed_into_id, memory_scores.compressed_into_id),
+                superseded_by_id = COALESCE(excluded.superseded_by_id, memory_scores.superseded_by_id),
+                forgetting_reason = COALESCE(excluded.forgetting_reason, memory_scores.forgetting_reason),
                 updated_step = COALESCE(excluded.updated_step, memory_scores.updated_step)
             """,
             (
@@ -284,6 +329,15 @@ class MemorySubstrate:
                 _float_or_none(score.future_option_delta),
                 _float_or_none(score.replay_priority),
                 score.retention_status,
+                score.memory_state,
+                None if score.stored_epoch is None else int(score.stored_epoch),
+                None if score.last_replayed_epoch is None else int(score.last_replayed_epoch),
+                None if score.last_promoted_epoch is None else int(score.last_promoted_epoch),
+                _float_or_none(score.retention_score),
+                _float_or_none(score.forgetting_score),
+                score.compressed_into_id,
+                score.superseded_by_id,
+                score.forgetting_reason,
                 None if step is None else int(step),
             ),
         )

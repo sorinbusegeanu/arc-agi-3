@@ -193,7 +193,10 @@ def load_compact_memory_into_system(
                 state_conn,
                 """
                 SELECT node_id, isf_total, prediction_lift, transfer_score, explanatory_reach,
-                       compression_gain, future_option_delta, replay_priority, retention_status, updated_step
+                       compression_gain, future_option_delta, replay_priority, retention_status,
+                       memory_state, stored_epoch, last_replayed_epoch, last_promoted_epoch,
+                       retention_score, forgetting_score, compressed_into_id, superseded_by_id,
+                       forgetting_reason, updated_step
                 FROM memory_scores
                 ORDER BY node_id ASC
                 """,
@@ -209,6 +212,15 @@ def load_compact_memory_into_system(
                         future_option_delta=None if row["future_option_delta"] is None else float(row["future_option_delta"]),
                         replay_priority=None if row["replay_priority"] is None else float(row["replay_priority"]),
                         retention_status=None if row["retention_status"] is None else str(row["retention_status"]),
+                        memory_state=None if row["memory_state"] is None else str(row["memory_state"]),
+                        stored_epoch=None if row["stored_epoch"] is None else int(row["stored_epoch"]),
+                        last_replayed_epoch=None if row["last_replayed_epoch"] is None else int(row["last_replayed_epoch"]),
+                        last_promoted_epoch=None if row["last_promoted_epoch"] is None else int(row["last_promoted_epoch"]),
+                        retention_score=None if row["retention_score"] is None else float(row["retention_score"]),
+                        forgetting_score=None if row["forgetting_score"] is None else float(row["forgetting_score"]),
+                        compressed_into_id=None if row["compressed_into_id"] is None else str(row["compressed_into_id"]),
+                        superseded_by_id=None if row["superseded_by_id"] is None else str(row["superseded_by_id"]),
+                        forgetting_reason=None if row["forgetting_reason"] is None else str(row["forgetting_reason"]),
                     ),
                     step=row["updated_step"],
                 )

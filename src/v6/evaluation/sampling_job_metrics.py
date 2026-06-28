@@ -4,8 +4,15 @@ import json
 import math
 import sqlite3
 from collections import Counter, defaultdict
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+
+
+def _connect_sampling_read_db(db_path: Path, *, busy_timeout_ms: int = 60000) -> sqlite3.Connection:
+    connection = sqlite3.connect(db_path, timeout=max(1.0, float(busy_timeout_ms) / 1000.0))
+    connection.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
+    return connection
 
 
 def compute_sampling_job_metrics(
@@ -18,7 +25,8 @@ def compute_sampling_job_metrics(
 ) -> dict:
     from v6.evaluation import interaction_sampling as mod
 
-    return mod._run_metrics(Path(db_path), game, sampler_name, int(seed), config)
+    with _patched_sqlite_busy_timeout(60000):
+        return mod._run_metrics(Path(db_path), game, sampler_name, int(seed), config)
 
 
 def compute_sampling_job_temporal_milestones(
@@ -30,12 +38,13 @@ def compute_sampling_job_temporal_milestones(
 ) -> dict:
     from v6.evaluation import interaction_sampling as mod
 
-    return mod._temporal_milestones_for_db(
-        Path(db_path),
-        game=game,
-        sampler_name=sampler_name,
-        seed=int(seed),
-    )
+    with _patched_sqlite_busy_timeout(60000):
+        return mod._temporal_milestones_for_db(
+            Path(db_path),
+            game=game,
+            sampler_name=sampler_name,
+            seed=int(seed),
+        )
 
 
 def compute_sampling_job_validation_payload(
@@ -68,7 +77,7 @@ def compute_sampling_job_validation_payload(
 def _load_validation_examples(db_path: Path) -> list[Any]:
     from v6.evaluation.prefuture_role_prediction import load_prefuture_examples
 
-    with sqlite3.connect(db_path) as connection:
+    with _connect_sampling_read_db(db_path) as connection:
         tables = {str(row[0]) for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     if "future_effects" in tables:
         return load_prefuture_examples(db_path)
@@ -78,7 +87,7 @@ def _load_validation_examples(db_path: Path) -> list[Any]:
 def _load_validation_examples_from_current_schema(db_path: Path) -> list[Any]:
     from v6.evaluation.prefuture_role_prediction import PrefutureExample
 
-    with sqlite3.connect(db_path) as connection:
+    with _connect_sampling_read_db(db_path) as connection:
         connection.row_factory = sqlite3.Row
         prediction_rows = connection.execute(
             """
@@ -166,6 +175,24 @@ def _load_validation_examples_from_current_schema(db_path: Path) -> list[Any]:
             )
         )
     return examples
+
+
+@contextmanager
+def _patched_sqlite_busy_timeout(busy_timeout_ms: int):
+    original_connect = sqlite3.connect
+
+    def _connect_with_busy_timeout(*args, **kwargs):
+        kwargs = dict(kwargs)
+        kwargs.setdefault("timeout", max(1.0, float(busy_timeout_ms) / 1000.0))
+        connection = original_connect(*args, **kwargs)
+        connection.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
+        return connection
+
+    sqlite3.connect = _connect_with_busy_timeout
+    try:
+        yield
+    finally:
+        sqlite3.connect = original_connect
 
 
 def _derived_future_label(row: sqlite3.Row) -> str:

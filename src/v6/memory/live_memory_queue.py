@@ -31,6 +31,7 @@ class LiveMemoryWriterConfig:
     batch_size: int = 1000
     flush_seconds: float = 2.0
     min_priority: float = 0.0
+    summary_write_every_batches: int = 50
 
 
 class LiveMemoryWriter:
@@ -51,6 +52,7 @@ class LiveMemoryWriter:
             "event_type_counts": {},
             "queue_stop_received": False,
         }
+        self._batches_since_summary_write = 0
 
     def run(self) -> None:
         self.memory_dir.mkdir(parents=True, exist_ok=True)
@@ -114,7 +116,10 @@ class LiveMemoryWriter:
         connection.commit()
         self.summary["batches_written"] = int(self.summary["batches_written"]) + 1
         self.summary["last_flush_time"] = time.time()
-        self._write_summary()
+        self._batches_since_summary_write += 1
+        if self._batches_since_summary_write >= max(1, int(self.config.summary_write_every_batches)):
+            self._write_summary()
+            self._batches_since_summary_write = 0
 
     def _write_event(self, connection: sqlite3.Connection, event: dict[str, Any]) -> None:
         payload = dict(event.get("payload") or {})
@@ -503,4 +508,3 @@ def _apply_projection(connection: sqlite3.Connection, event: dict[str, Any], pay
 
 def _fetch_projection_rows(connection: sqlite3.Connection, query: str) -> list[dict[str, Any]]:
     return [dict(row) for row in connection.execute(query).fetchall()]
-

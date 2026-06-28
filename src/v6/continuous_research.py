@@ -12,6 +12,8 @@ from v6.hypothesis_suite_report import run_hypothesis_suite_report
 from v6.memory.compact_memory import build_memory_summary, ensure_memory_layout, load_memory_summary
 from v6.memory.direct_streaming_fold import direct_streaming_manifest_has_failures
 from v6.memory.memory_cleanup import cleanup_epoch_artifacts, disk_usage_snapshot, stop_due_to_disk, validate_cleanup_safe
+from v6.memory.selective_forgetting import run_selective_forgetting_pass
+from v6.evaluation.h10b_selective_forgetting import evaluate_h10b_selective_forgetting
 
 
 @dataclass(frozen=True)
@@ -37,6 +39,8 @@ class ContinuousResearchConfig:
     fast_postprocessing: bool = True
     workers: int = 60
     max_tasks_per_child: int = 1
+    commit_steps: int = 5000
+    sqlite_synchronous: str = "normal"
     initial_workers: int | None = None
     ram_ramp_threshold_percent: float = 85.0
     initial_worker_ramp_delay_seconds: float = 20.0
@@ -50,6 +54,11 @@ class ContinuousResearchConfig:
     direct_streaming_fold: bool = True
     direct_streaming_fold_workers: int = 8
     delete_raw_after_direct_streaming_fold: bool = True
+    direct_streaming_fold_retry_attempts: int = 5
+    direct_streaming_fold_retry_initial_delay_seconds: float = 5.0
+    direct_streaming_fold_busy_timeout_ms: int = 60000
+    direct_streaming_fold_submit_delay_seconds: float = 1.0
+    direct_streaming_shard_synchronous: str = "off"
 
 
 def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
@@ -131,6 +140,8 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
                 fast_postprocessing=bool(config.fast_postprocessing),
                 workers=max_epoch_workers,
                 max_tasks_per_child=int(config.max_tasks_per_child),
+                commit_steps=int(config.commit_steps),
+                sqlite_synchronous=str(config.sqlite_synchronous),
                 initial_workers=initial_epoch_workers,
                 enable_worker_ramp=True,
                 ram_ramp_threshold_percent=float(config.ram_ramp_threshold_percent),
@@ -144,6 +155,11 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
                 direct_streaming_fold_enabled=bool(config.direct_streaming_fold),
                 direct_streaming_fold_workers=int(config.direct_streaming_fold_workers),
                 delete_raw_after_direct_streaming_fold=bool(config.delete_raw_after_direct_streaming_fold),
+                direct_streaming_fold_retry_attempts=int(config.direct_streaming_fold_retry_attempts),
+                direct_streaming_fold_retry_initial_delay_seconds=float(config.direct_streaming_fold_retry_initial_delay_seconds),
+                direct_streaming_fold_busy_timeout_ms=int(config.direct_streaming_fold_busy_timeout_ms),
+                direct_streaming_fold_submit_delay_seconds=float(config.direct_streaming_fold_submit_delay_seconds),
+                direct_streaming_shard_synchronous=str(config.direct_streaming_shard_synchronous),
             )
         )
         worker_execution = _load_sampling_worker_execution(raw_dir)
@@ -172,6 +188,13 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
             memory_size_before_bytes=memory_size_before,
             memory_size_after_bytes=_tree_size(memory_dir),
         )
+        forgetting_summary = run_selective_forgetting_pass(memory_dir=memory_dir, epoch=epoch_number)
+        h10b_summary = evaluate_h10b_selective_forgetting(
+            memory_dir=memory_dir,
+            run_dir=raw_dir,
+            output_dir=reports_dir / "h10b",
+            forgetting_summary=forgetting_summary,
+        )
         memory_after = build_memory_summary(memory_paths)
         continuity_report = _write_memory_continuity_report(
             reports_dir=reports_dir,
@@ -199,6 +222,7 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
         h09_metrics = suite_summary.get("H09 core metrics", {}) or {}
         h10_metrics = suite_summary.get("H10 core metrics", {}) or {}
         h11_metrics = suite_summary.get("H11 core metrics", {}) or {}
+        h12_metrics = suite_summary.get("H12 core metrics", {}) or {}
         status = {
             "epoch_id": epoch_id,
             "global_step_start": global_step_start,
@@ -225,6 +249,8 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
             "H09": suite_summary.get("H09 decision"),
             "H10": suite_summary.get("H10 decision"),
             "H11": suite_summary.get("H11 decision"),
+            "H10B": h10b_summary.get("decision"),
+            "H12": suite_summary.get("H12 decision"),
             "stable_contingencies": (suite_summary.get("H01 core metrics") or {}).get("stable_contingency_count"),
             "games_with_stable_contingencies": (suite_summary.get("H01 core metrics") or {}).get("games_with_stable_contingencies"),
             "replay_lift": (suite_summary.get("H02 core metrics") or {}).get("prediction_violation_replay_lift"),
@@ -261,6 +287,20 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
             "h11_emergent_motifs_with_strong_transfer": h11_metrics.get("emergent_motifs_with_strong_transfer_count"),
             "h11_emergent_motifs_with_promoted_concepts": h11_metrics.get("emergent_motifs_with_promoted_concept_count"),
             "h11_non_emergent_motif_transfer_links": h11_metrics.get("non_emergent_motif_transfer_link_count"),
+            "h12_efficiency_active_trajectory_count": h12_metrics.get("efficiency_active_trajectory_count"),
+            "h12_trajectories_with_memory_bonus": h12_metrics.get("trajectories_with_memory_bonus"),
+            "h12_trajectories_with_replay_bonus": h12_metrics.get("trajectories_with_replay_bonus"),
+            "h12_mean_efficiency_memory_bonus": h12_metrics.get("mean_efficiency_memory_bonus"),
+            "h12_mean_efficiency_replay_bonus": h12_metrics.get("mean_efficiency_replay_bonus"),
+            "h12_best_known_solution_improvements": h12_metrics.get("best_known_solution_improvements"),
+            "h12_median_steps_to_success": h12_metrics.get("median_steps_to_success"),
+            "h12_mean_normalized_solve_efficiency": h12_metrics.get("mean_normalized_solve_efficiency"),
+            "h12_loop_ratio": h12_metrics.get("mean_loop_ratio"),
+            "h12_repeated_state_ratio": h12_metrics.get("mean_repeated_state_ratio"),
+            "h12_blocked_action_ratio": h12_metrics.get("mean_blocked_action_ratio"),
+            "h10b_memory_survival_ratio": h10b_summary.get("memory_survival_ratio"),
+            "h10b_high_vs_low_survival_lift": h10b_summary.get("high_vs_low_survival_lift"),
+            "h10b_redundancy_removed_count": h10b_summary.get("redundancy_removed_count"),
             "final_raw_epoch_fold_skipped": bool(fold_summary.get("final_raw_epoch_fold_skipped", False)),
             "workers_requested": requested_workers,
             "workers_initial": initial_epoch_workers,
