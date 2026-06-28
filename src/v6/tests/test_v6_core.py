@@ -11526,6 +11526,25 @@ def test_h01_derives_prediction_accuracy_and_context_lift_from_prediction_result
     assert result["positive_context_lift_count"] > 0
 
 
+def test_h01_handles_empty_prediction_results_without_context_lift_keyerror(tmp_path: Path) -> None:
+    from v6.hypothesis_h01_report import evaluate_h01_contingency_emergence
+
+    run_dir = tmp_path / "run_h01_empty_pred"
+    run_dir.mkdir()
+    (run_dir / "interaction_sampling_v05c_report.json").write_text(
+        json.dumps({"runs": [{"game": "g1", "sampler_name": "s1", "total_interactions": 2, "memory_record_count": 2}]}),
+        encoding="utf-8",
+    )
+    db_path = run_dir / "seed_0.sqlite"
+    with sqlite3.connect(db_path) as conn:
+        store = ContingencyStore(conn)
+        conn.commit()
+    result = evaluate_h01_contingency_emergence(run_dir, tmp_path / "out_h01_empty_pred")
+    assert result["decision"] in {"INCONCLUSIVE", "PARTIALLY_VALID", "INVALID", "VALID"}
+    assert result["context_lift_available"] is False
+    assert result["positive_context_lift_count"] == 0
+
+
 def test_h02_uses_compact_replay_counter_when_raw_zero(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from v6.hypothesis_h02_report import evaluate_h02_prediction_violation_attention
 

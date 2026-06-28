@@ -656,8 +656,10 @@ def _extract_db_metrics(sqlite_paths: list[Path]) -> dict[str, Any]:
                     prediction_metrics = _prediction_metrics_from_prediction_results(connection)
                     if prediction_metrics["prediction_accuracy"] is not None:
                         prediction_accuracy_values.append(float(prediction_metrics["prediction_accuracy"]))
-                    context_lift_values.extend(prediction_metrics["context_lift_values"])
-                    positive_context_lift_values.extend(prediction_metrics["positive_context_lift_values"])
+                    context_lift_values.extend(prediction_metrics.get("context_lift_values", []))
+                    positive_context_lift_values.extend(
+                        prediction_metrics.get("positive_context_lift_values", [])
+                    )
                 total_interactions += interactions
                 contingency_rows += contingencies
         except sqlite3.DatabaseError:
@@ -773,7 +775,11 @@ def _prediction_metrics_from_prediction_results(connection: sqlite3.Connection) 
         ).fetchall()
     ]
     if not rows:
-        return {"prediction_accuracy": None, "context_lift_values": []}
+        return {
+            "prediction_accuracy": None,
+            "context_lift_values": [],
+            "positive_context_lift_values": [],
+        }
     action_groups: dict[int, list[float]] = defaultdict(list)
     context_action_groups: dict[tuple[str, int], list[float]] = defaultdict(list)
     prediction_values: list[float] = []
