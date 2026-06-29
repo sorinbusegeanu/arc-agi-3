@@ -515,6 +515,23 @@ def _invoke_run_sampling_jobs(
     }
 
 
+def _direct_streaming_fold_job_id(job: dict[str, Any]) -> str:
+    db_path = Path(str(job.get("db_path", "")))
+    epoch_id = "epoch_unknown"
+    parts = db_path.parts
+    if "epochs" in parts:
+        try:
+            epoch_id = str(parts[parts.index("epochs") + 1])
+        except (IndexError, ValueError):
+            epoch_id = "epoch_unknown"
+    global_step_start = int(job.get("global_step_offset", 0) or 0) + 1
+    global_step_end = global_step_start + int(job.get("steps", 0) or 0) - 1
+    return (
+        f"{epoch_id}:{job['game']}:{job['sampler_name']}:seed{job['seed']}:steps{job['steps']}"
+        f":g{global_step_start}-{global_step_end}"
+    )
+
+
 def _run_sampling_jobs(
     jobs: list[dict],
     *,
@@ -708,7 +725,7 @@ def _run_sampling_jobs(
                             continue
                         direct_fold_writer.submit(
                             DirectStreamingFoldJob(
-                                job_id=f"{job['game']}:{job['sampler_name']}:seed{job['seed']}:steps{job['steps']}",
+                                job_id=_direct_streaming_fold_job_id(job),
                                 db_path=str(job["db_path"]),
                                 game=str(job["game"]),
                                 sampler=str(job["sampler_name"]),
@@ -757,7 +774,7 @@ def _run_sampling_jobs(
         "requested_workers": int(workers),
         "initial_workers": int(initial),
         "fold_workers": int(direct_fold_summary.get("direct_streaming_fold_worker_count", 0) or 0),
-        "peak_workers": int(peak_workers),
+            "peak_workers": int(peak_workers),
         "sampling_refill_count": int(sampling_refill_count),
         "max_done_batch_size": int(max_done_batch_size),
         "seconds_spent_in_fold_submit_delay": float(seconds_spent_in_fold_submit_delay),

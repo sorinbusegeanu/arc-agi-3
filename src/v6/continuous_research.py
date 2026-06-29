@@ -74,6 +74,17 @@ class ContinuousResearchConfig:
     fold_graph: bool = True
     compact_finalize_mode: str = "summary_only"
     full_finalize_every_epochs: int = 5
+    hypothesis_suite_mode: str = "fast"
+    full_hypothesis_suite_every_epochs: int = 5
+    higher_order_workers: int = 4
+    higher_order_transfer_chunk_size: int = 5_000
+    max_role_carriers: int = 25_000
+    max_roles: int = 10_000
+    max_role_transfer_attempts_per_epoch: int = 25_000
+    max_future_option_events_per_epoch: int = 50_000
+    max_future_option_motifs_per_epoch: int = 25_000
+    hypothesis_progress: bool = True
+    hypothesis_progress_log_every: int = 1000
     memory_query_enabled: bool = False
     memory_action_selection_enabled: bool = False
     restore_compact_graph: bool = False
@@ -82,6 +93,30 @@ class ContinuousResearchConfig:
 
 def _log_epoch_phase(epoch_id: str, phase: str, status: str = "starting", extra: dict | None = None) -> None:
     print(f"[epoch {epoch_id}] {phase}: {status}" + (f" {extra}" if extra else ""), flush=True)
+
+
+def _epoch_dir(root: Path, epoch_number: int) -> Path:
+    return root / "epochs" / f"epoch_{int(epoch_number):04d}"
+
+
+def _detect_incomplete_next_epoch(root: Path, current_epoch: int) -> dict[str, Any] | None:
+    next_epoch = int(current_epoch) + 1
+    epoch_dir = _epoch_dir(root, next_epoch)
+    if not epoch_dir.exists():
+        return None
+    status_dir = epoch_dir / "status"
+    epoch_start = status_dir / "epoch_start.json"
+    epoch_status = status_dir / "epoch_status.json"
+    if epoch_status.exists():
+        return None
+    if not epoch_start.exists():
+        return None
+    return {
+        "epoch_id": epoch_dir.name,
+        "epoch_dir": str(epoch_dir),
+        "epoch_start_path": str(epoch_start),
+        "epoch_status_path": str(epoch_status),
+    }
 
 
 def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
@@ -224,7 +259,12 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
             }
         else:
             raise RuntimeError("direct streaming fold is now required for normal continuous runs")
-        _log_epoch_phase(epoch_id, "hypothesis_suite", "starting")
+        resolved_suite_mode = (
+            "full"
+            if int(epoch_number) % max(1, int(config.full_hypothesis_suite_every_epochs or 5)) == 0
+            else str(config.hypothesis_suite_mode)
+        )
+        _log_epoch_phase(epoch_id, "hypothesis_suite", "starting", {"suite_mode": resolved_suite_mode})
         suite_summary = run_hypothesis_suite_report(
             run_dir=raw_dir,
             memory_dir=memory_dir,
@@ -239,6 +279,16 @@ def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
             total_interactions_seen=int(load_memory_summary(memory_paths.summary_json).get("total_interactions_seen", 0) or 0),
             memory_size_before_bytes=memory_size_before,
             memory_size_after_bytes=_tree_size(memory_dir),
+            suite_mode=resolved_suite_mode,
+            higher_order_workers=int(config.higher_order_workers),
+            higher_order_transfer_chunk_size=int(config.higher_order_transfer_chunk_size),
+            max_role_carriers=int(config.max_role_carriers),
+            max_roles=int(config.max_roles),
+            max_role_transfer_attempts=int(config.max_role_transfer_attempts_per_epoch),
+            max_future_option_events=int(config.max_future_option_events_per_epoch),
+            max_future_option_motifs=int(config.max_future_option_motifs_per_epoch),
+            hypothesis_progress=bool(config.hypothesis_progress),
+            hypothesis_progress_log_every=int(config.hypothesis_progress_log_every),
         )
         _log_epoch_phase(
             epoch_id,
@@ -510,6 +560,15 @@ def _load_or_initialize_manifest(config: ContinuousResearchConfig, manifest_path
         missing = [path for path in memory_paths.values() if not Path(path).exists()]
         if missing:
             raise RuntimeError(f"resume requested but required memory files are missing: {missing}")
+        interrupted = _detect_incomplete_next_epoch(manifest_path.parent, int(manifest.get("current_epoch", 0) or 0))
+        if interrupted is not None:
+            raise RuntimeError(
+                "resume found an incomplete next epoch; automatic mid-epoch resume is not supported and rerunning it "
+                "could duplicate direct-streaming folds. "
+                f"incomplete_epoch={interrupted['epoch_id']} "
+                f"epoch_start={interrupted['epoch_start_path']} "
+                f"expected_epoch_status={interrupted['epoch_status_path']}"
+            )
         return manifest
     manifest = {
         "experiment_name": config.experiment_name,

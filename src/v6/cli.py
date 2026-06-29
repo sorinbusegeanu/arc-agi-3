@@ -580,6 +580,18 @@ def build_parser() -> argparse.ArgumentParser:
     hypothesis_suite.add_argument("--scan-all-dbs", action="store_true")
     hypothesis_suite.add_argument("--max-db-files", type=int, default=0)
     hypothesis_suite.add_argument("--max-rows", type=int, default=1000000)
+    hypothesis_suite.add_argument("--hypothesis-suite-mode", choices=("fast", "full"), default="fast")
+    hypothesis_suite.add_argument("--full-hypothesis-suite-every-epochs", type=int, default=5)
+    hypothesis_suite.add_argument("--higher-order-workers", type=int, default=1)
+    hypothesis_suite.add_argument("--higher-order-transfer-chunk-size", type=int, default=5000)
+    hypothesis_suite.add_argument("--max-role-carriers", type=int, default=25000)
+    hypothesis_suite.add_argument("--max-roles", type=int, default=10000)
+    hypothesis_suite.add_argument("--max-role-transfer-attempts-per-epoch", type=int, default=25000)
+    hypothesis_suite.add_argument("--max-future-option-events-per-epoch", type=int, default=50000)
+    hypothesis_suite.add_argument("--max-future-option-motifs-per-epoch", type=int, default=25000)
+    hypothesis_suite.add_argument("--hypothesis-progress", dest="hypothesis_progress", action="store_true", default=True)
+    hypothesis_suite.add_argument("--no-hypothesis-progress", dest="hypothesis_progress", action="store_false")
+    hypothesis_suite.add_argument("--hypothesis-progress-log-every", type=int, default=1000)
 
     continuous = subparsers.add_parser("continuous-research-run")
     continuous.add_argument("--experiment-name", required=True)
@@ -643,6 +655,18 @@ def build_parser() -> argparse.ArgumentParser:
     continuous.add_argument("--no-fold-graph", dest="fold_graph", action="store_false", default=True)
     continuous.add_argument("--compact-finalize-mode", choices=("none", "summary_only", "full"), default="summary_only")
     continuous.add_argument("--full-finalize-every-epochs", type=int, default=5)
+    continuous.add_argument("--hypothesis-suite-mode", choices=("fast", "full"), default="fast")
+    continuous.add_argument("--full-hypothesis-suite-every-epochs", type=int, default=5)
+    continuous.add_argument("--higher-order-workers", type=int, default=4)
+    continuous.add_argument("--higher-order-transfer-chunk-size", type=int, default=5000)
+    continuous.add_argument("--max-role-carriers", type=int, default=25000)
+    continuous.add_argument("--max-roles", type=int, default=10000)
+    continuous.add_argument("--max-role-transfer-attempts-per-epoch", type=int, default=25000)
+    continuous.add_argument("--max-future-option-events-per-epoch", type=int, default=50000)
+    continuous.add_argument("--max-future-option-motifs-per-epoch", type=int, default=25000)
+    continuous.add_argument("--hypothesis-progress", dest="hypothesis_progress", action="store_true", default=True)
+    continuous.add_argument("--no-hypothesis-progress", dest="hypothesis_progress", action="store_false")
+    continuous.add_argument("--hypothesis-progress-log-every", type=int, default=1000)
     continuous.add_argument("--memory-query-enabled", action="store_true")
     continuous.add_argument("--memory-action-selection-enabled", action="store_true")
     continuous.add_argument("--restore-compact-graph", action="store_true")
@@ -1516,6 +1540,16 @@ def main(argv: list[str] | None = None) -> int:
             scan_all_dbs=bool(args.scan_all_dbs),
             max_db_files=int(args.max_db_files),
             max_rows=int(args.max_rows),
+            suite_mode=str(args.hypothesis_suite_mode),
+            higher_order_workers=int(args.higher_order_workers),
+            higher_order_transfer_chunk_size=int(args.higher_order_transfer_chunk_size),
+            max_role_carriers=int(args.max_role_carriers),
+            max_roles=int(args.max_roles),
+            max_role_transfer_attempts=int(args.max_role_transfer_attempts_per_epoch),
+            max_future_option_events=int(args.max_future_option_events_per_epoch),
+            max_future_option_motifs=int(args.max_future_option_motifs_per_epoch),
+            hypothesis_progress=args.hypothesis_progress,
+            hypothesis_progress_log_every=int(args.hypothesis_progress_log_every),
         )
         print(json.dumps(result, indent=2))
         return 0
@@ -1578,6 +1612,17 @@ def main(argv: list[str] | None = None) -> int:
             fold_graph=bool(args.fold_graph),
             compact_finalize_mode=str(args.compact_finalize_mode),
             full_finalize_every_epochs=int(args.full_finalize_every_epochs),
+            hypothesis_suite_mode=str(args.hypothesis_suite_mode),
+            full_hypothesis_suite_every_epochs=int(args.full_hypothesis_suite_every_epochs),
+            higher_order_workers=int(args.higher_order_workers),
+            higher_order_transfer_chunk_size=int(args.higher_order_transfer_chunk_size),
+            max_role_carriers=int(args.max_role_carriers),
+            max_roles=int(args.max_roles),
+            max_role_transfer_attempts_per_epoch=int(args.max_role_transfer_attempts_per_epoch),
+            max_future_option_events_per_epoch=int(args.max_future_option_events_per_epoch),
+            max_future_option_motifs_per_epoch=int(args.max_future_option_motifs_per_epoch),
+            hypothesis_progress=bool(args.hypothesis_progress),
+            hypothesis_progress_log_every=int(args.hypothesis_progress_log_every),
             memory_query_enabled=bool(args.memory_query_enabled),
             memory_action_selection_enabled=bool(args.memory_action_selection_enabled),
             restore_compact_graph=bool(args.restore_compact_graph),

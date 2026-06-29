@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from hashlib import sha1
@@ -101,6 +102,7 @@ def derive_future_option_memory(
     run_dir: Path | None = None,
     max_events: int = 500_000,
     max_motifs: int = 100_000,
+    progress_factory: Any | None = None,
 ) -> dict[str, Any]:
     del run_dir
     paths = ensure_memory_layout(memory_dir)
@@ -109,8 +111,12 @@ def derive_future_option_memory(
         graph_conn.row_factory = sqlite3.Row
         for table in FUTURE_OPTION_CLEAR_TABLES:
             state_conn.execute(f"DELETE FROM {table}")
-        events = derive_future_option_events(state_conn, graph_conn, max_events=max_events)
-        motifs = derive_future_option_motifs(state_conn, graph_conn, max_motifs=max_motifs)
+        t0 = time.time()
+        events = derive_future_option_events(state_conn, graph_conn, max_events=max_events, progress_factory=progress_factory)
+        events["derive_future_option_events_seconds"] = float(time.time() - t0)
+        t0 = time.time()
+        motifs = derive_future_option_motifs(state_conn, graph_conn, max_motifs=max_motifs, progress_factory=progress_factory)
+        motifs["derive_future_option_motifs_seconds"] = float(time.time() - t0)
         attention = derive_future_option_attention_links(state_conn)
         transfer = derive_future_option_transfer_links(state_conn)
         summary = {**events, **motifs, **attention, **transfer}
@@ -123,6 +129,7 @@ def derive_future_option_events(
     state_conn: sqlite3.Connection,
     graph_conn: sqlite3.Connection,
     max_events: int,
+    progress_factory: Any | None = None,
 ) -> dict[str, Any]:
     inserted = 0
     first_event_step: int | None = None
@@ -202,7 +209,7 @@ def derive_future_option_events(
     }
     live_delta_threshold = _future_option_live_delta_threshold(list(live_option_by_interaction.values()))
     future_edge_by_interaction: dict[str, str] = {}
-    for row in state_conn.execute(
+    future_edge_rows = state_conn.execute(
         """
         SELECT source_node_id, edge_type
         FROM memory_edges
@@ -211,22 +218,28 @@ def derive_future_option_events(
             'expands_future_options',
             'restricts_future_options',
             'preserves_future_options'
-          )
+        )
         ORDER BY source_node_id ASC, edge_type ASC
         """
-    ).fetchall():
+    ).fetchall()
+    edge_scan_tracker = progress_factory("derive_future_option_events memory_edges", len(future_edge_rows), "edge", False) if progress_factory else None
+    for row in future_edge_rows:
         future_edge_by_interaction.setdefault(str(row["source_node_id"]), str(row["edge_type"]))
+        if edge_scan_tracker is not None:
+            edge_scan_tracker.update(1)
+    _close_progress_tracker(edge_scan_tracker)
     interaction_ids_by_family: dict[str, set[str]] = defaultdict(set)
     carrier_interaction_ids: dict[str, set[str]] = defaultdict(set)
     carrier_family_ids: dict[str, set[str]] = defaultdict(set)
     role_carrier_ids: dict[str, set[str]] = defaultdict(set)
-    for row in state_conn.execute(
+    edge_rows = state_conn.execute(
         """
         SELECT source_node_id, target_node_id, edge_type
         FROM memory_edges
         ORDER BY source_node_id ASC, target_node_id ASC, edge_type ASC
         """
-    ).fetchall():
+    ).fetchall()
+    for row in edge_rows:
         source = str(row["source_node_id"])
         target = str(row["target_node_id"])
         edge_type = str(row["edge_type"])
@@ -239,14 +252,16 @@ def derive_future_option_events(
         if source.startswith("M3:carrier:") and edge_type == "plays_role" and target.startswith("M3:role:"):
             role_carrier_ids[target].add(source)
 
-    for row in state_conn.execute(
+    contingency_rows = state_conn.execute(
         """
         SELECT canonical_key, game, sampler, context_level, action, effect_signature, support_count,
                first_seen_global_step, last_seen_global_step, stability_score, mean_prediction_error, mean_replay_priority
         FROM stable_contingencies
         ORDER BY canonical_key ASC
         """
-    ).fetchall():
+    ).fetchall()
+    contingency_tracker = progress_factory("derive_future_option_events stable_contingencies", len(contingency_rows), "contingency", False) if progress_factory else None
+    for row in contingency_rows:
         add_event(
             _build_future_option_event(
                 owner_type="contingency",
@@ -274,14 +289,19 @@ def derive_future_option_events(
                 action_group=None if row["action"] is None else str(row["action"]),
             )
         )
-    for row in state_conn.execute(
+        if contingency_tracker is not None:
+            contingency_tracker.update(1)
+    _close_progress_tracker(contingency_tracker)
+    family_rows = state_conn.execute(
         """
         SELECT canonical_signature, effect_type, action_group, polarity, support_count, member_count,
                first_seen_global_step, last_seen_global_step, stability_score
         FROM transformation_families
         ORDER BY canonical_signature ASC
         """
-    ).fetchall():
+    ).fetchall()
+    family_tracker = progress_factory("derive_future_option_events transformation_families", len(family_rows), "family", False) if progress_factory else None
+    for row in family_rows:
         family_signature = str(row["canonical_signature"])
         add_event(
             _build_future_option_event(
@@ -322,14 +342,19 @@ def derive_future_option_events(
                 live_delta_threshold=live_delta_threshold,
             )
         )
-    for row in state_conn.execute(
+        if family_tracker is not None:
+            family_tracker.update(1)
+    _close_progress_tracker(family_tracker)
+    carrier_rows = state_conn.execute(
         """
         SELECT carrier_signature, carrier_source, support_count, linked_family_count,
                first_seen_global_step, last_seen_global_step, stability_score, is_emergent
         FROM carrier_candidates
         ORDER BY carrier_signature ASC
         """
-    ).fetchall():
+    ).fetchall()
+    carrier_tracker = progress_factory("derive_future_option_events carrier_candidates", len(carrier_rows), "carrier", False) if progress_factory else None
+    for row in carrier_rows:
         links = carrier_links.get(str(row["carrier_signature"]), {})
         family_text = sorted(links.get("family", set()))
         contexts = sorted(links.get("context", set()))
@@ -372,13 +397,18 @@ def derive_future_option_events(
                 live_delta_threshold=live_delta_threshold,
             )
         )
-    for row in state_conn.execute(
+        if carrier_tracker is not None:
+            carrier_tracker.update(1)
+    _close_progress_tracker(carrier_tracker)
+    role_rows = state_conn.execute(
         """
         SELECT role_signature, role_type, support_count, first_seen_global_step, last_seen_global_step, role_stability_score
         FROM role_candidates
         ORDER BY role_signature ASC
         """
-    ).fetchall():
+    ).fetchall()
+    role_tracker = progress_factory("derive_future_option_events role_candidates", len(role_rows), "role", False) if progress_factory else None
+    for row in role_rows:
         links = role_links.get(str(row["role_signature"]), {})
         families = sorted(links.get("family", set()))
         contexts = sorted(links.get("context", set()))
@@ -422,6 +452,9 @@ def derive_future_option_events(
                 live_delta_threshold=live_delta_threshold,
             )
         )
+        if role_tracker is not None:
+            role_tracker.update(1)
+    _close_progress_tracker(role_tracker)
     _write_future_milestone(state_conn, "first_future_option_event_step", first_event_step, None)
     return {"future_option_event_count": inserted, "first_future_option_event_step": first_event_step}
 
@@ -430,6 +463,7 @@ def derive_future_option_motifs(
     state_conn: sqlite3.Connection,
     graph_conn: sqlite3.Connection,
     max_motifs: int,
+    progress_factory: Any | None = None,
 ) -> dict[str, Any]:
     del graph_conn
     carrier_links = _links_by_signature(state_conn, "carrier_links", "carrier_signature")
@@ -442,6 +476,7 @@ def derive_future_option_motifs(
                 concepts_by_link[(linked_type, linked_key)].add(concept_signature)
     rows = [dict(row) for row in state_conn.execute("SELECT * FROM future_option_events ORDER BY event_id ASC").fetchall()]
     groups: dict[str, dict[str, Any]] = {}
+    row_tracker = progress_factory("derive_future_option_motifs events", len(rows), "event", False) if progress_factory else None
     for row in rows:
         evidence = _load_jsonish(row.get("evidence_json"))
         contexts = set(_coerce_list(evidence.get("linked_contexts")))
@@ -516,6 +551,9 @@ def derive_future_option_motifs(
         if row["last_seen_global_step"] is not None:
             step = int(row["last_seen_global_step"])
             group["last_seen"] = step if group["last_seen"] is None else max(group["last_seen"], step)
+        if row_tracker is not None:
+            row_tracker.update(1)
+    _close_progress_tracker(row_tracker)
     selected = sorted(groups)[: int(max_motifs)]
     emergent_count = 0
     first_emergent_step: int | None = None
@@ -523,6 +561,7 @@ def derive_future_option_motifs(
     motif_type_source_counts: Counter[str] = Counter()
     unknown_motif_event_count = 0
     total_future_option_event_count = len(rows)
+    motif_tracker = progress_factory("derive_future_option_motifs motifs", len(selected), "motif", False) if progress_factory else None
     for motif_signature in selected:
         group = groups[motif_signature]
         events = group["events"]
@@ -612,6 +651,9 @@ def derive_future_option_motifs(
             _insert_future_link(state_conn, motif_signature, "context", context, 1, group["first_seen"], group["last_seen"])
         for game in sorted(group["games"]):
             _insert_future_link(state_conn, motif_signature, "game", game, 1, group["first_seen"], group["last_seen"])
+        if motif_tracker is not None:
+            motif_tracker.update(1)
+    _close_progress_tracker(motif_tracker)
     _write_future_milestone(state_conn, "first_emergent_future_option_motif_step", first_emergent_step, None)
     unknown_motif_count = int(motif_type_counts.get("unknown", 0))
     return {
@@ -629,6 +671,14 @@ def derive_future_option_motifs(
         ),
         "first_emergent_future_option_motif_step": first_emergent_step,
     }
+
+
+def _close_progress_tracker(tracker: Any | None, *, extra: dict[str, Any] | None = None) -> None:
+    if tracker is None:
+        return
+    close = getattr(tracker, "close", None)
+    if callable(close):
+        close(extra=extra)
 
 
 def derive_future_option_attention_links(state_conn: sqlite3.Connection) -> dict[str, Any]:
@@ -760,7 +810,8 @@ def derive_future_option_attention_links(state_conn: sqlite3.Connection) -> dict
     elif live_high_option_change_count <= 0:
         h10_fallback_reason = "no_live_high_option_change"
     if h10_fallback_reason is not None:
-        for row in state_conn.execute("SELECT * FROM future_option_events ORDER BY event_id ASC").fetchall():
+        heuristic_rows = state_conn.execute("SELECT * FROM future_option_events ORDER BY event_id ASC").fetchall()
+        for row in heuristic_rows:
             payload = dict(row)
             heuristic_future_option_delta_count += 1
             option_delta_abs = abs(float(payload.get("option_delta") or 0.0))

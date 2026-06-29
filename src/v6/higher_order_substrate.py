@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from concurrent.futures import ProcessPoolExecutor
 from collections import defaultdict
 from dataclasses import dataclass
 from hashlib import sha1
@@ -21,6 +22,38 @@ ROLE_CLEAR_TABLES = (
     "world_model_components",
     "world_model_links",
     "higher_order_milestones",
+)
+
+ROLE_ONLY_CLEAR_TABLES = (
+    "role_neighborhood_signatures",
+    "role_candidates",
+    "role_links",
+    "role_transfer_attempts",
+    "concept_candidates",
+    "concept_links",
+    "world_model_components",
+    "world_model_links",
+    "higher_order_milestones",
+)
+
+ROLE_TRANSFER_ONLY_CLEAR_TABLES = (
+    "role_transfer_attempts",
+    "concept_candidates",
+    "concept_links",
+    "world_model_components",
+    "world_model_links",
+)
+
+CONCEPT_ONLY_CLEAR_TABLES = (
+    "concept_candidates",
+    "concept_links",
+    "world_model_components",
+    "world_model_links",
+)
+
+WORLD_MODEL_ONLY_CLEAR_TABLES = (
+    "world_model_components",
+    "world_model_links",
 )
 
 
@@ -47,9 +80,63 @@ def derive_higher_order_memory(
     *,
     memory_dir: Path,
     run_dir: Path | None = None,
-    max_carriers: int = 100_000,
-    max_roles: int = 50_000,
-    max_transfer_attempts: int = 250_000,
+    max_carriers: int = 25_000,
+    max_roles: int = 10_000,
+    max_transfer_attempts: int = 25_000,
+    workers: int = 1,
+    chunk_size: int = 5_000,
+    progress_factory: Any | None = None,
+) -> dict[str, Any]:
+    role_summary = derive_role_candidates_only(
+        memory_dir=memory_dir,
+        run_dir=run_dir,
+        max_carriers=max_carriers,
+        max_roles=max_roles,
+        progress_factory=progress_factory,
+    )
+    transfer_summary = derive_role_transfer_attempts_only(
+        memory_dir=memory_dir,
+        run_dir=run_dir,
+        max_transfer_attempts=max_transfer_attempts,
+        workers=workers,
+        chunk_size=chunk_size,
+        progress_factory=progress_factory,
+    )
+    concept_summary = derive_concept_candidates_only(memory_dir=memory_dir, run_dir=run_dir, progress_factory=progress_factory)
+    world_summary = derive_world_model_components_only(memory_dir=memory_dir, run_dir=run_dir, progress_factory=progress_factory)
+    return {**role_summary, **transfer_summary, **concept_summary, **world_summary}
+
+
+def derive_role_candidates_only(
+    *,
+    memory_dir: Path,
+    run_dir: Path | None = None,
+    max_carriers: int = 25_000,
+    max_roles: int = 10_000,
+    progress_factory: Any | None = None,
+) -> dict[str, Any]:
+    del run_dir
+    return _run_higher_order_stage(
+        memory_dir=memory_dir,
+        clear_tables=ROLE_ONLY_CLEAR_TABLES,
+        runner=lambda state_conn, graph_conn: derive_role_candidates(
+            state_conn,
+            graph_conn,
+            max_carriers=max_carriers,
+            max_roles=max_roles,
+            progress_factory=progress_factory,
+        ),
+    )
+
+
+def derive_role_transfer_attempts_only(
+    *,
+    memory_dir: Path,
+    run_dir: Path | None = None,
+    max_transfer_attempts: int = 25_000,
+    workers: int = 1,
+    chunk_size: int = 5_000,
+    progress_factory: Any | None = None,
 ) -> dict[str, Any]:
     del run_dir
     paths = ensure_memory_layout(memory_dir)
@@ -59,16 +146,47 @@ def derive_higher_order_memory(
     ):
         state_conn.row_factory = sqlite3.Row
         graph_conn.row_factory = sqlite3.Row
-        for table in ROLE_CLEAR_TABLES:
+        for table in ROLE_TRANSFER_ONLY_CLEAR_TABLES:
             state_conn.execute(f"DELETE FROM {table}")
-        role_summary = derive_role_candidates(state_conn, graph_conn, max_carriers=max_carriers, max_roles=max_roles)
-        transfer_summary = derive_role_transfer_attempts(state_conn, graph_conn, max_transfer_attempts=max_transfer_attempts)
-        concept_summary = derive_concept_candidates(state_conn)
-        world_summary = derive_world_model_components(state_conn, graph_conn)
-        summary = {**role_summary, **transfer_summary, **concept_summary, **world_summary}
+        summary = derive_role_transfer_attempts_parallel(
+            state_conn,
+            graph_conn,
+            max_transfer_attempts=max_transfer_attempts,
+            workers=workers,
+            chunk_size=chunk_size,
+            progress_factory=progress_factory,
+        )
         state_conn.commit()
         graph_conn.commit()
         return summary
+
+
+def derive_concept_candidates_only(
+    *,
+    memory_dir: Path,
+    run_dir: Path | None = None,
+    progress_factory: Any | None = None,
+) -> dict[str, Any]:
+    del run_dir
+    return _run_higher_order_stage(
+        memory_dir=memory_dir,
+        clear_tables=CONCEPT_ONLY_CLEAR_TABLES,
+        runner=lambda state_conn, graph_conn: derive_concept_candidates(state_conn, progress_factory=progress_factory),
+    )
+
+
+def derive_world_model_components_only(
+    *,
+    memory_dir: Path,
+    run_dir: Path | None = None,
+    progress_factory: Any | None = None,
+) -> dict[str, Any]:
+    del run_dir
+    return _run_higher_order_stage(
+        memory_dir=memory_dir,
+        clear_tables=WORLD_MODEL_ONLY_CLEAR_TABLES,
+        runner=lambda state_conn, graph_conn: derive_world_model_components(state_conn, graph_conn, progress_factory=progress_factory),
+    )
 
 
 def derive_role_candidates(
@@ -76,6 +194,7 @@ def derive_role_candidates(
     graph_conn: sqlite3.Connection,
     max_carriers: int,
     max_roles: int,
+    progress_factory: Any | None = None,
 ) -> dict[str, Any]:
     family_meta = {
         str(row["canonical_signature"]): dict(row)
@@ -121,9 +240,13 @@ def derive_role_candidates(
         for context in carrier_links.get("context", set()):
             context_node_ids.add(f"context:{context}")
             relevant_node_ids.add(f"context:{context}")
-    edge_rows = _fetch_edges_for_nodes(graph_conn, relevant_node_ids)
-    graph_nodes = _graph_nodes_for_ids(graph_conn, {node_id for row in edge_rows for node_id in (str(row["source_node_id"]), str(row["target_node_id"]))} | relevant_node_ids)
-    context_games = _context_games_for_context_nodes(graph_conn, context_node_ids)
+    edge_rows = _fetch_edges_for_nodes(graph_conn, relevant_node_ids, progress_factory=progress_factory)
+    graph_nodes = _graph_nodes_for_ids(
+        graph_conn,
+        {node_id for row in edge_rows for node_id in (str(row["source_node_id"]), str(row["target_node_id"]))} | relevant_node_ids,
+        progress_factory=progress_factory,
+    )
+    context_games = _context_games_for_context_nodes(graph_conn, context_node_ids, progress_factory=progress_factory)
     edges_out_by_source: dict[str, list[sqlite3.Row]] = defaultdict(list)
     edges_in_by_target: dict[str, list[sqlite3.Row]] = defaultdict(list)
     for row in edge_rows:
@@ -131,6 +254,7 @@ def derive_role_candidates(
         edges_in_by_target[str(row["target_node_id"])].append(row)
 
     neighborhoods: list[CarrierNeighborhood] = []
+    carrier_tracker = progress_factory("derive_role_candidates carriers", len(carrier_rows), "carrier", False) if progress_factory else None
     for row in carrier_rows:
         carrier_signature = str(row["carrier_signature"])
         carrier_links = links_by_carrier.get(carrier_signature, {})
@@ -196,6 +320,9 @@ def derive_role_candidates(
                 games=games,
             )
         )
+        if carrier_tracker is not None:
+            carrier_tracker.update(1)
+    _close_progress_tracker(carrier_tracker)
 
     grouped: dict[str, list[CarrierNeighborhood]] = defaultdict(list)
     for item in neighborhoods:
@@ -206,6 +333,7 @@ def derive_role_candidates(
     stable_role_count = 0
     first_role_candidate_step: int | None = None
     first_emergent_role_step: int | None = None
+    role_tracker = progress_factory("derive_role_candidates roles", len(selected_role_signatures), "role", False) if progress_factory else None
     for role_signature in selected_role_signatures:
         items = sorted(grouped[role_signature], key=lambda item: item.carrier_signature)
         families = sorted({family for item in items for family in item.families})
@@ -283,6 +411,9 @@ def derive_role_candidates(
             _insert_link(state_conn, "role_links", "role_signature", role_signature, "context", context, 1, first_seen, last_seen)
         for game in games:
             _insert_link(state_conn, "role_links", "role_signature", role_signature, "game", game, 1, first_seen, last_seen)
+        if role_tracker is not None:
+            role_tracker.update(1)
+    _close_progress_tracker(role_tracker)
 
     _write_milestone(state_conn, "first_role_candidate_step", first_role_candidate_step, None)
     _write_milestone(state_conn, "first_emergent_role_step", first_emergent_role_step, None)
@@ -298,6 +429,24 @@ def derive_role_transfer_attempts(
     state_conn: sqlite3.Connection,
     graph_conn: sqlite3.Connection,
     max_transfer_attempts: int,
+) -> dict[str, Any]:
+    return derive_role_transfer_attempts_parallel(
+        state_conn,
+        graph_conn,
+        max_transfer_attempts=max_transfer_attempts,
+        workers=1,
+        chunk_size=max(1, int(max_transfer_attempts or 1)),
+    )
+
+
+def derive_role_transfer_attempts_parallel(
+    state_conn: sqlite3.Connection,
+    graph_conn: sqlite3.Connection,
+    max_transfer_attempts: int,
+    *,
+    workers: int,
+    chunk_size: int,
+    progress_factory: Any | None = None,
 ) -> dict[str, Any]:
     rows = state_conn.execute(
         """
@@ -325,6 +474,7 @@ def derive_role_transfer_attempts(
     carrier_signatures = sorted(role_rows)
     target_attempt_specs: list[tuple[str, str, str]] = []
     unique_scopes: set[tuple[str, str]] = set()
+    target_tracker = progress_factory("derive_role_transfer_attempt_specs", len(carrier_signatures), "carrier", False) if progress_factory else None
     for carrier_signature in carrier_signatures:
         for scope_key in sorted(carrier_games.get(carrier_signature, set())):
             target_attempt_specs.append((carrier_signature, "cross_game", scope_key))
@@ -332,6 +482,9 @@ def derive_role_transfer_attempts(
         for scope_key in sorted(carrier_contexts.get(carrier_signature, set())):
             target_attempt_specs.append((carrier_signature, "cross_context", scope_key))
             unique_scopes.add(("cross_context", scope_key))
+        if target_tracker is not None:
+            target_tracker.update(1, extra={"target_attempt_specs": len(target_attempt_specs)})
+    _close_progress_tracker(target_tracker, extra={"target_attempt_specs": len(target_attempt_specs)})
     profile_cache = _build_transfer_profile_cache(
         role_rows=role_rows,
         carrier_contexts=carrier_contexts,
@@ -357,66 +510,81 @@ def derive_role_transfer_attempts(
     cross_context_attempt_count = 0
     cross_context_success_count = 0
 
-    for carrier_signature, transfer_kind, target_scope_key in target_attempt_specs:
-        if inserted >= int(max_transfer_attempts):
-            break
-        attempt = _predict_transfer_attempt(
-            profile_cache=profile_cache,
-            role_rows=role_rows,
-            target_carrier_signature=carrier_signature,
-            transfer_kind=transfer_kind,
-            target_scope_key=target_scope_key,
-        )
-        state_conn.execute(
-            """
-            INSERT INTO role_transfer_attempts (
-                attempt_id, role_signature, transfer_kind, source_scope_type, source_scope_key,
-                target_scope_type, target_scope_key, target_carrier_signature, predicted_role_signature,
-                observed_role_signature, similarity_score, transfer_score, reuse_success, failure_reason,
-                best_margin, source_carrier_count, candidate_role_count, first_seen_global_step, last_seen_global_step
+    target_attempt_specs = target_attempt_specs[: max(0, int(max_transfer_attempts))]
+    chunks = [
+        target_attempt_specs[index:index + max(1, int(chunk_size))]
+        for index in range(0, len(target_attempt_specs), max(1, int(chunk_size)))
+    ]
+    attempt_rows: list[tuple[Any, ...]] = []
+    if int(workers or 1) <= 1 or len(chunks) <= 1:
+        chunk_tracker = progress_factory("derive_role_transfer chunks", len(chunks), "chunk", False) if progress_factory else None
+        for chunk in chunks:
+            attempt_rows.extend(
+                _derive_role_transfer_attempts_chunk(
+                    chunk=chunk,
+                    role_rows=role_rows,
+                    profile_cache=profile_cache,
+                )
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                attempt["attempt_id"],
-                attempt["role_signature"],
-                attempt["transfer_kind"],
-                attempt["source_scope_type"],
-                attempt["source_scope_key"],
-                attempt["target_scope_type"],
-                attempt["target_scope_key"],
-                attempt["target_carrier_signature"],
-                attempt["predicted_role_signature"],
-                attempt["observed_role_signature"],
-                attempt["similarity_score"],
-                attempt["transfer_score"],
-                attempt["reuse_success"],
-                attempt["failure_reason"],
-                attempt["best_margin"],
-                attempt["source_carrier_count"],
-                attempt["candidate_role_count"],
-                attempt["first_seen_global_step"],
-                attempt["last_seen_global_step"],
-            ),
+            if chunk_tracker is not None:
+                chunk_tracker.update(1)
+        _close_progress_tracker(chunk_tracker)
+    else:
+        with ProcessPoolExecutor(max_workers=max(1, int(workers))) as executor:
+            futures = [
+                executor.submit(
+                    _derive_role_transfer_attempts_chunk,
+                    chunk=chunk,
+                    role_rows=role_rows,
+                    profile_cache=profile_cache,
+                )
+                for chunk in chunks
+            ]
+            chunk_tracker = progress_factory("derive_role_transfer chunks", len(futures), "chunk", False) if progress_factory else None
+            for future in futures:
+                attempt_rows.extend(list(future.result()))
+                if chunk_tracker is not None:
+                    chunk_tracker.update(1)
+            _close_progress_tracker(chunk_tracker)
+    state_conn.executemany(
+        """
+        INSERT INTO role_transfer_attempts (
+            attempt_id, role_signature, transfer_kind, source_scope_type, source_scope_key,
+            target_scope_type, target_scope_key, target_carrier_signature, predicted_role_signature,
+            observed_role_signature, similarity_score, transfer_score, reuse_success, failure_reason,
+            best_margin, source_carrier_count, candidate_role_count, first_seen_global_step, last_seen_global_step
         )
-        inserted += 1
-        transfer_score_sum += float(attempt["transfer_score"] or 0.0)
-        source_carrier_count_sum += int(attempt["source_carrier_count"] or 0)
-        candidate_role_count_sum += int(attempt["candidate_role_count"] or 0)
-        if attempt["best_margin"] is not None:
-            best_margin_sum += float(attempt["best_margin"])
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        attempt_rows,
+    )
+    inserted = len(attempt_rows)
+    for row in attempt_rows:
+        transfer_kind = str(row[2])
+        transfer_score = float(row[11] or 0.0)
+        reuse_success = int(row[12] or 0)
+        failure_reason = str(row[13] or "")
+        best_margin = row[14]
+        source_carrier_count = int(row[15] or 0)
+        candidate_role_count = int(row[16] or 0)
+        first_seen_global_step = row[17]
+        role_signature = str(row[1])
+        transfer_score_sum += transfer_score
+        source_carrier_count_sum += source_carrier_count
+        candidate_role_count_sum += candidate_role_count
+        if best_margin is not None:
+            best_margin_sum += float(best_margin)
             best_margin_count += 1
-        if attempt["first_seen_global_step"] is not None:
+        if first_seen_global_step is not None:
             first_attempt_step = (
-                attempt["first_seen_global_step"]
+                first_seen_global_step
                 if first_attempt_step is None
-                else min(first_attempt_step, int(attempt["first_seen_global_step"]))
+                else min(first_attempt_step, int(first_seen_global_step))
             )
-        if attempt["transfer_kind"] == "cross_game":
+        if transfer_kind == "cross_game":
             cross_game_attempt_count += 1
         else:
             cross_context_attempt_count += 1
-        failure_reason = str(attempt["failure_reason"])
         if failure_reason == "role_mismatch":
             role_mismatch_count += 1
         elif failure_reason == "low_similarity":
@@ -425,18 +593,18 @@ def derive_role_transfer_attempts(
             insufficient_source_support_count += 1
         elif failure_reason == "no_source_profile":
             no_source_profile_count += 1
-        if int(attempt["reuse_success"]) == 1:
+        if reuse_success == 1:
             success_count += 1
-            successful_roles.add(str(attempt["observed_role_signature"]))
-            if attempt["transfer_kind"] == "cross_game":
+            successful_roles.add(str(row[9]))
+            if transfer_kind == "cross_game":
                 cross_game_success_count += 1
             else:
                 cross_context_success_count += 1
-            if attempt["first_seen_global_step"] is not None:
+            if first_seen_global_step is not None:
                 first_success_step = (
-                    attempt["first_seen_global_step"]
+                    first_seen_global_step
                     if first_success_step is None
-                    else min(first_success_step, int(attempt["first_seen_global_step"]))
+                    else min(first_success_step, int(first_seen_global_step))
                 )
 
     _write_milestone(state_conn, "first_role_transfer_attempt_step", first_attempt_step, None)
@@ -466,7 +634,7 @@ def derive_role_transfer_attempts(
     }
 
 
-def derive_concept_candidates(state_conn: sqlite3.Connection) -> dict[str, Any]:
+def derive_concept_candidates(state_conn: sqlite3.Connection, progress_factory: Any | None = None) -> dict[str, Any]:
     try:
         state_conn.execute("ALTER TABLE concept_candidates ADD COLUMN transfer_success_concentration REAL")
     except sqlite3.DatabaseError:
@@ -536,6 +704,7 @@ def derive_concept_candidates(state_conn: sqlite3.Connection) -> dict[str, Any]:
     roles_skipped_missing_family_links = 0
     roles_skipped_missing_transfer_success = 0
     roles_used_for_concepts = 0
+    role_tracker = progress_factory("derive_concept_candidates roles", len(role_rows), "role", False) if progress_factory else None
     for row in role_rows:
         role_signature = str(row["role_signature"])
         roles_seen_for_concept_derivation += 1
@@ -583,6 +752,9 @@ def derive_concept_candidates(state_conn: sqlite3.Connection) -> dict[str, Any]:
             group["first_seen"] = first_seen if group["first_seen"] is None else min(group["first_seen"], first_seen)
         if last_seen is not None:
             group["last_seen"] = last_seen if group["last_seen"] is None else max(group["last_seen"], last_seen)
+        if role_tracker is not None:
+            role_tracker.update(1)
+    _close_progress_tracker(role_tracker)
 
     promoted_concepts = 0
     overconcentrated_concepts = 0
@@ -591,7 +763,9 @@ def derive_concept_candidates(state_conn: sqlite3.Connection) -> dict[str, Any]:
     first_promoted_concept_step: int | None = None
     strong_transfer_total = 0
     concept_strong_counts: list[int] = []
-    for concept_signature in sorted(concept_groups):
+    concept_items = sorted(concept_groups)
+    concept_tracker = progress_factory("derive_concept_candidates groups", len(concept_items), "group", False) if progress_factory else None
+    for concept_signature in concept_items:
         group = concept_groups[concept_signature]
         linked_role_count = len(group["roles"])
         linked_carrier_count = len(group["carriers"])
@@ -602,7 +776,7 @@ def derive_concept_candidates(state_conn: sqlite3.Connection) -> dict[str, Any]:
         strong_transfer_success_count = int(group["strong_transfer_success_count"])
         strong_transfer_total += strong_transfer_success_count
         concept_strong_counts.append(strong_transfer_success_count)
-    for concept_signature in sorted(concept_groups):
+    for concept_signature in concept_items:
         group = concept_groups[concept_signature]
         linked_role_count = len(group["roles"])
         linked_carrier_count = len(group["carriers"])
@@ -693,6 +867,9 @@ def derive_concept_candidates(state_conn: sqlite3.Connection) -> dict[str, Any]:
             _insert_link(state_conn, "concept_links", "concept_signature", concept_signature, "context", context_signature, 1, first_seen, last_seen)
         for game in sorted(group["games"]):
             _insert_link(state_conn, "concept_links", "concept_signature", concept_signature, "game", game, 1, first_seen, last_seen)
+        if concept_tracker is not None:
+            concept_tracker.update(1)
+    _close_progress_tracker(concept_tracker)
     _write_milestone(state_conn, "first_concept_candidate_step", first_concept_candidate_step, None)
     _write_milestone(state_conn, "first_promoted_concept_step", first_promoted_concept_step, None)
     return {
@@ -714,7 +891,11 @@ def derive_concept_candidates(state_conn: sqlite3.Connection) -> dict[str, Any]:
     }
 
 
-def derive_world_model_components(state_conn: sqlite3.Connection, graph_conn: sqlite3.Connection) -> dict[str, Any]:
+def derive_world_model_components(
+    state_conn: sqlite3.Connection,
+    graph_conn: sqlite3.Connection,
+    progress_factory: Any | None = None,
+) -> dict[str, Any]:
     concept_rows = [dict(row) for row in state_conn.execute(
         """
         SELECT concept_signature, concept_type, linked_role_count, linked_carrier_count, linked_family_count,
@@ -761,6 +942,7 @@ def derive_world_model_components(state_conn: sqlite3.Connection, graph_conn: sq
     candidate_only_count = 0
     first_component_step: int | None = None
     first_coherent_step: int | None = None
+    candidate_tracker = progress_factory("derive_world_model_components candidates", len(candidate_rows), "candidate", False) if progress_factory else None
     for row in candidate_rows:
         concept_signature = str(row["concept_signature"])
         links = concept_links.get(concept_signature, {})
@@ -881,6 +1063,9 @@ def derive_world_model_components(state_conn: sqlite3.Connection, graph_conn: sq
             _insert_link(state_conn, "world_model_links", "component_signature", component_signature, "context", context, 1, first_seen, last_seen)
         for game in games:
             _insert_link(state_conn, "world_model_links", "component_signature", component_signature, "game", game, 1, first_seen, last_seen)
+        if candidate_tracker is not None:
+            candidate_tracker.update(1)
+    _close_progress_tracker(candidate_tracker)
 
     _write_milestone(state_conn, "first_world_model_component_step", first_component_step, None)
     _write_milestone(state_conn, "first_coherent_world_model_step", first_coherent_step, None)
@@ -889,6 +1074,27 @@ def derive_world_model_components(state_conn: sqlite3.Connection, graph_conn: sq
         "coherent_world_model_component_count": coherent_count,
         "candidate_only_world_model_component_count": candidate_only_count,
     }
+
+
+def _run_higher_order_stage(
+    *,
+    memory_dir: Path,
+    clear_tables: tuple[str, ...],
+    runner: Any,
+) -> dict[str, Any]:
+    paths = ensure_memory_layout(memory_dir)
+    with (
+        sqlite3.connect(paths.current_state) as state_conn,
+        sqlite3.connect(paths.graph) as graph_conn,
+    ):
+        state_conn.row_factory = sqlite3.Row
+        graph_conn.row_factory = sqlite3.Row
+        for table in clear_tables:
+            state_conn.execute(f"DELETE FROM {table}")
+        summary = dict(runner(state_conn, graph_conn) or {})
+        state_conn.commit()
+        graph_conn.commit()
+        return summary
 
 
 def _build_role_tokens(
@@ -955,39 +1161,34 @@ def _predict_transfer_attempt(
 ) -> dict[str, Any]:
     target = role_rows[target_carrier_signature]
     target_tokens = set(target["tokens"])
-    profiles = [
-        dict(profile)
-        for profile in profile_cache.get((transfer_kind, target_scope_key), [])
-        if not (
+    best: dict[str, Any] | None = None
+    second: dict[str, Any] | None = None
+    best_similarity = -1.0
+    second_similarity = -1.0
+    candidate_role_count = 0
+    for profile in profile_cache.get((transfer_kind, target_scope_key), []):
+        if (
             int(profile.get("source_carrier_count") or 0) == 1
             and str(profile.get("role_signature") or "") == str(target["role_signature"])
-        )
-    ]
-    if not profiles:
+        ):
+            continue
+        candidate_role_count += 1
+        similarity_score = _jaccard(profile["profile_token_set"], target_tokens)
+        if _transfer_candidate_is_better(profile, similarity_score, best, best_similarity):
+            second = best
+            second_similarity = best_similarity
+            best = profile
+            best_similarity = similarity_score
+        elif _transfer_candidate_is_better(profile, similarity_score, second, second_similarity):
+            second = profile
+            second_similarity = similarity_score
+    if best is None:
         return _no_source_profile_attempt(target, transfer_kind, target_scope_key)
-    scored_profiles: list[dict[str, Any]] = []
-    for profile in profiles:
-        scored_profiles.append(
-            {
-                **profile,
-                "similarity_score": _jaccard(set(profile["profile_tokens"]), target_tokens),
-            }
-        )
-    scored_profiles.sort(
-        key=lambda item: (
-            -float(item["similarity_score"]),
-            -int(item["source_carrier_count"]),
-            str(item["role_signature"]),
-        )
-    )
-    best = scored_profiles[0]
-    second = scored_profiles[1] if len(scored_profiles) > 1 else None
-    best_margin = None if second is None else float(best["similarity_score"]) - float(second["similarity_score"])
+    best_margin = None if second is None else float(best_similarity) - float(second_similarity)
     predicted_role_signature = str(best["role_signature"])
     observed_role_signature = str(target["role_signature"])
     source_carrier_count = int(best["source_carrier_count"])
-    candidate_role_count = len(scored_profiles)
-    similarity_score = float(best["similarity_score"])
+    similarity_score = float(best_similarity)
     reuse_success = int(
         predicted_role_signature == observed_role_signature
         and similarity_score >= 0.60
@@ -1030,6 +1231,49 @@ def _predict_transfer_attempt(
     }
 
 
+def _attempt_to_insert_tuple(attempt: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        attempt["attempt_id"],
+        attempt["role_signature"],
+        attempt["transfer_kind"],
+        attempt["source_scope_type"],
+        attempt["source_scope_key"],
+        attempt["target_scope_type"],
+        attempt["target_scope_key"],
+        attempt["target_carrier_signature"],
+        attempt["predicted_role_signature"],
+        attempt["observed_role_signature"],
+        attempt["similarity_score"],
+        attempt["transfer_score"],
+        attempt["reuse_success"],
+        attempt["failure_reason"],
+        attempt["best_margin"],
+        attempt["source_carrier_count"],
+        attempt["candidate_role_count"],
+        attempt["first_seen_global_step"],
+        attempt["last_seen_global_step"],
+    )
+
+
+def _derive_role_transfer_attempts_chunk(
+    *,
+    chunk: list[tuple[str, str, str]],
+    role_rows: dict[str, dict[str, Any]],
+    profile_cache: dict[tuple[str, str], list[dict[str, Any]]],
+) -> list[tuple[Any, ...]]:
+    rows: list[tuple[Any, ...]] = []
+    for carrier_signature, transfer_kind, target_scope_key in chunk:
+        attempt = _predict_transfer_attempt(
+            profile_cache=profile_cache,
+            role_rows=role_rows,
+            target_carrier_signature=carrier_signature,
+            transfer_kind=transfer_kind,
+            target_scope_key=target_scope_key,
+        )
+        rows.append(_attempt_to_insert_tuple(attempt))
+    return rows
+
+
 def _build_transfer_profile_cache(
     *,
     role_rows: dict[str, dict[str, Any]],
@@ -1038,40 +1282,67 @@ def _build_transfer_profile_cache(
     target_scopes: list[tuple[str, str]],
 ) -> dict[tuple[str, str], list[dict[str, Any]]]:
     cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
-    carrier_items = sorted(role_rows.items(), key=lambda item: item[0])
-    for transfer_kind, target_scope_key in target_scopes:
-        grouped_sources: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for candidate_signature, candidate in carrier_items:
-            candidate_scopes = carrier_games.get(candidate_signature, set()) if transfer_kind == "cross_game" else carrier_contexts.get(candidate_signature, set())
-            if target_scope_key in candidate_scopes:
-                continue
-            grouped_sources[str(candidate["role_signature"])].append(candidate)
+    limited_target_scopes = list(target_scopes)
+    if len(limited_target_scopes) > 25000:
+        limited_target_scopes = limited_target_scopes[:25000]
+    role_to_carriers: dict[str, list[str]] = defaultdict(list)
+    carrier_to_tokens: dict[str, tuple[str, ...]] = {}
+    cross_game_excluded: dict[str, set[str]] = defaultdict(set)
+    cross_context_excluded: dict[str, set[str]] = defaultdict(set)
+    for candidate_signature, candidate in sorted(role_rows.items(), key=lambda item: item[0]):
+        role_to_carriers[str(candidate["role_signature"])].append(candidate_signature)
+        carrier_to_tokens[candidate_signature] = tuple(candidate["tokens"])
+        for scope_key in carrier_games.get(candidate_signature, set()):
+            cross_game_excluded[str(scope_key)].add(candidate_signature)
+        for scope_key in carrier_contexts.get(candidate_signature, set()):
+            cross_context_excluded[str(scope_key)].add(candidate_signature)
+    for transfer_kind, target_scope_key in limited_target_scopes:
+        excluded_carriers = (
+            cross_game_excluded.get(target_scope_key, set())
+            if transfer_kind == "cross_game"
+            else cross_context_excluded.get(target_scope_key, set())
+        )
         profiles: list[dict[str, Any]] = []
-        for role_signature in sorted(grouped_sources):
-            source_candidates = grouped_sources[role_signature]
+        for role_signature in sorted(role_to_carriers):
+            included_carriers = [carrier for carrier in role_to_carriers[role_signature] if carrier not in excluded_carriers]
+            if not included_carriers:
+                continue
+            token_set: set[str] = set()
+            context_set: set[str] = set()
+            game_set: set[str] = set()
+            for carrier_signature in included_carriers:
+                token_set.update(carrier_to_tokens.get(carrier_signature, ()))
+                context_set.update(carrier_contexts.get(carrier_signature, set()))
+                game_set.update(carrier_games.get(carrier_signature, set()))
             profiles.append(
                 {
                     "role_signature": role_signature,
-                    "profile_tokens": sorted({token for candidate in source_candidates for token in candidate["tokens"]}),
-                    "source_carrier_count": len(source_candidates),
-                    "source_context_count": len(
-                        {
-                            context
-                            for candidate in source_candidates
-                            for context in carrier_contexts.get(str(candidate["carrier_signature"]), set())
-                        }
-                    ),
-                    "source_game_count": len(
-                        {
-                            game
-                            for candidate in source_candidates
-                            for game in carrier_games.get(str(candidate["carrier_signature"]), set())
-                        }
-                    ),
+                    "profile_tokens": sorted(token_set),
+                    "profile_token_set": token_set,
+                    "source_carrier_count": len(included_carriers),
+                    "source_context_count": len(context_set),
+                    "source_game_count": len(game_set),
                 }
             )
         cache[(transfer_kind, target_scope_key)] = profiles
     return cache
+
+
+def _transfer_candidate_is_better(
+    profile: dict[str, Any],
+    similarity_score: float,
+    incumbent: dict[str, Any] | None,
+    incumbent_similarity: float,
+) -> bool:
+    if incumbent is None:
+        return True
+    if float(similarity_score) != float(incumbent_similarity):
+        return float(similarity_score) > float(incumbent_similarity)
+    profile_count = int(profile.get("source_carrier_count") or 0)
+    incumbent_count = int(incumbent.get("source_carrier_count") or 0)
+    if profile_count != incumbent_count:
+        return profile_count > incumbent_count
+    return str(profile.get("role_signature") or "") < str(incumbent.get("role_signature") or "")
 
 
 def _no_source_profile_attempt(target: dict[str, Any], transfer_kind: str, target_scope_key: str) -> dict[str, Any]:
@@ -1148,11 +1419,18 @@ def _links_by_signature(
     return results
 
 
-def _fetch_edges_for_nodes(graph_conn: sqlite3.Connection, node_ids: set[str], batch_size: int = 500) -> list[sqlite3.Row]:
+def _fetch_edges_for_nodes(
+    graph_conn: sqlite3.Connection,
+    node_ids: set[str],
+    batch_size: int = 500,
+    progress_factory: Any | None = None,
+) -> list[sqlite3.Row]:
     if not node_ids:
         return []
     ordered = sorted(node_ids)
     rows: list[sqlite3.Row] = []
+    batch_total = (len(ordered) + batch_size - 1) // batch_size
+    tracker = progress_factory("derive_role_candidates fetch_edges", batch_total, "batch", False) if progress_factory else None
     for start in range(0, len(ordered), batch_size):
         batch = ordered[start : start + batch_size]
         placeholders = ",".join("?" for _ in batch)
@@ -1168,6 +1446,9 @@ def _fetch_edges_for_nodes(graph_conn: sqlite3.Connection, node_ids: set[str], b
                 tuple(batch) + tuple(batch),
             ).fetchall()
         )
+        if tracker is not None:
+            tracker.update(1)
+    _close_progress_tracker(tracker)
     seen: set[tuple[str, str, str]] = set()
     deduped: list[sqlite3.Row] = []
     for row in rows:
@@ -1179,11 +1460,13 @@ def _fetch_edges_for_nodes(graph_conn: sqlite3.Connection, node_ids: set[str], b
     return deduped
 
 
-def _graph_nodes_for_ids(graph_conn: sqlite3.Connection, node_ids: set[str]) -> dict[str, str]:
+def _graph_nodes_for_ids(graph_conn: sqlite3.Connection, node_ids: set[str], progress_factory: Any | None = None) -> dict[str, str]:
     if not node_ids:
         return {}
     ordered = sorted(node_ids)
     results: dict[str, str] = {}
+    batch_total = (len(ordered) + 499) // 500
+    tracker = progress_factory("derive_role_candidates graph_nodes", batch_total, "batch", False) if progress_factory else None
     for start in range(0, len(ordered), 500):
         batch = ordered[start : start + 500]
         placeholders = ",".join("?" for _ in batch)
@@ -1197,14 +1480,23 @@ def _graph_nodes_for_ids(graph_conn: sqlite3.Connection, node_ids: set[str]) -> 
             tuple(batch),
         ).fetchall():
             results[str(row["node_id"])] = str(row["node_type"] or "unknown")
+        if tracker is not None:
+            tracker.update(1)
+    _close_progress_tracker(tracker)
     return results
 
 
-def _context_games_for_context_nodes(graph_conn: sqlite3.Connection, context_node_ids: set[str]) -> dict[str, set[str]]:
+def _context_games_for_context_nodes(
+    graph_conn: sqlite3.Connection,
+    context_node_ids: set[str],
+    progress_factory: Any | None = None,
+) -> dict[str, set[str]]:
     context_games: dict[str, set[str]] = defaultdict(set)
     if not context_node_ids:
         return context_games
     ordered = sorted(context_node_ids)
+    batch_total = (len(ordered) + 499) // 500
+    tracker = progress_factory("derive_role_candidates context_games", batch_total, "batch", False) if progress_factory else None
     for start in range(0, len(ordered), 500):
         batch = ordered[start : start + 500]
         placeholders = ",".join("?" for _ in batch)
@@ -1222,7 +1514,18 @@ def _context_games_for_context_nodes(graph_conn: sqlite3.Connection, context_nod
             target = str(row["target_node_id"])
             if source.startswith("game:") and target.startswith("context:"):
                 context_games[target].add(source[len("game:"):])
+        if tracker is not None:
+            tracker.update(1)
+    _close_progress_tracker(tracker)
     return context_games
+
+
+def _close_progress_tracker(tracker: Any | None, *, extra: dict[str, Any] | None = None) -> None:
+    if tracker is None:
+        return
+    close = getattr(tracker, "close", None)
+    if callable(close):
+        close(extra=extra)
 
 
 def _motifs_for_text(text: str) -> set[str]:

@@ -4063,6 +4063,14 @@ def _ensure_current_state_schema(path: Path) -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_role_links_type_key
             ON role_links(linked_type, linked_key);
+            CREATE INDEX IF NOT EXISTS idx_carrier_links_signature_type_key
+            ON carrier_links(carrier_signature, linked_type, linked_key);
+            CREATE INDEX IF NOT EXISTS idx_carrier_links_carrier_type_key
+            ON carrier_links(carrier_signature, linked_type, linked_key);
+            CREATE INDEX IF NOT EXISTS idx_role_neighborhood_carrier_signature
+            ON role_neighborhood_signatures(carrier_signature);
+            CREATE INDEX IF NOT EXISTS idx_role_neighborhood_carrier
+            ON role_neighborhood_signatures(carrier_signature);
             CREATE INDEX IF NOT EXISTS idx_role_transfer_role
             ON role_transfer_attempts(role_signature);
             CREATE INDEX IF NOT EXISTS idx_role_transfer_success
@@ -4160,6 +4168,16 @@ def _ensure_graph_schema(path: Path) -> None:
                 support_count INTEGER,
                 weight REAL
             );
+            CREATE INDEX IF NOT EXISTS idx_graph_edges_source_node
+            ON graph_edges(source_node_id);
+            CREATE INDEX IF NOT EXISTS idx_graph_edges_source
+            ON graph_edges(source_node_id);
+            CREATE INDEX IF NOT EXISTS idx_graph_edges_target_node
+            ON graph_edges(target_node_id);
+            CREATE INDEX IF NOT EXISTS idx_graph_edges_target
+            ON graph_edges(target_node_id);
+            CREATE INDEX IF NOT EXISTS idx_graph_edges_type_target
+            ON graph_edges(edge_type, target_node_id);
             """
         )
         connection.commit()

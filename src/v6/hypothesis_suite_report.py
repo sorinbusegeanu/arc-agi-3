@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import json
+import sys
+import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from tqdm.auto import tqdm
 
 from v6.memory.direct_streaming_fold import direct_streaming_manifest_exists
 
@@ -11,7 +16,12 @@ from v6.hypothesis_h01_report import evaluate_h01_contingency_emergence
 from v6.hypothesis_h02_report import evaluate_h02_prediction_violation_attention
 from v6.hypothesis_h03_report import evaluate_h03_transformation_family_formation
 from v6.hypothesis_h04_report import evaluate_h04_carrier_emergence
-from v6.higher_order_substrate import derive_higher_order_memory
+from v6.higher_order_substrate import (
+    derive_concept_candidates_only,
+    derive_role_candidates_only,
+    derive_role_transfer_attempts_only,
+    derive_world_model_components_only,
+)
 from v6.future_options import derive_future_option_memory
 from v6.memory.compact_memory import derive_missing_transformation_families_from_stable_contingencies
 from v6.hypothesis_h05_report import evaluate_h05_role_emergence
@@ -29,6 +39,164 @@ SUITE_TXT_NAME = "hypothesis_suite_summary.txt"
 SUITE_MD_NAME = "hypothesis_suite_summary.md"
 SUITE_AGGREGATED_TXT_NAME = "hypothesis_suite_aggregated.txt"
 INPUT_REPORT_NAME = "interaction_sampling_v05c_report.json"
+SUITE_PHASE_LOG_NAME = "hypothesis_phase_log.jsonl"
+SUITE_HIGHER_ORDER_MAX_CARRIERS = 25_000
+SUITE_HIGHER_ORDER_MAX_ROLES = 10_000
+
+
+def log_hypothesis_progress(
+    output_dir: Path,
+    phase: str,
+    status: str,
+    *,
+    epoch_id: str | None = None,
+    current: int | None = None,
+    total: int | None = None,
+    start_time: float | None = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    now = time.time()
+    payload: dict[str, Any] = {
+        "timestamp": now,
+        "epoch_id": epoch_id,
+        "phase": str(phase),
+        "status": str(status),
+        "current": None if current is None else int(current),
+        "total": None if total is None else int(total),
+    }
+    elapsed = None if start_time is None else max(0.0, now - float(start_time))
+    if elapsed is not None:
+        payload["seconds_elapsed"] = float(elapsed)
+        if current is not None and elapsed > 0.0:
+            rate = float(current) / elapsed
+            payload["rate_per_second"] = rate
+            if total is not None and rate > 0.0:
+                payload["eta_seconds"] = max(0.0, float(total - current) / rate)
+    if extra:
+        payload.update(dict(extra))
+    with (output_dir / SUITE_PHASE_LOG_NAME).open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, sort_keys=True) + "\n")
+    return payload
+
+
+class _HypothesisPhaseTracker:
+    def __init__(
+        self,
+        *,
+        output_dir: Path,
+        phase: str,
+        epoch_id: str | None,
+        total: int | None,
+        unit: str,
+        enabled: bool,
+        leave: bool,
+        log_every: int,
+        top_bar: Any | None = None,
+    ) -> None:
+        self.output_dir = output_dir
+        self.phase = phase
+        self.epoch_id = epoch_id
+        self.total = total
+        self.unit = unit
+        self.enabled = enabled
+        self.leave = leave
+        self.log_every = max(1, int(log_every))
+        self.top_bar = top_bar
+        self.current = 0
+        self.last_logged = 0
+        self.started_at = time.time()
+        self._bar = None
+
+    def __enter__(self) -> "_HypothesisPhaseTracker":
+        log_hypothesis_progress(
+            self.output_dir,
+            self.phase,
+            "starting",
+            epoch_id=self.epoch_id,
+            current=0,
+            total=self.total,
+        )
+        if self.top_bar is not None:
+            self.top_bar.set_postfix_str(f"current={self.phase}")
+        if self.enabled:
+            self._bar = tqdm(
+                total=self.total,
+                desc=self.phase,
+                unit=self.unit,
+                dynamic_ncols=True,
+                leave=self.leave,
+            )
+        return self
+
+    def update(self, n: int = 1, *, current: int | None = None, extra: dict[str, Any] | None = None) -> None:
+        if current is not None:
+            n = int(current) - int(self.current)
+            self.current = int(current)
+        else:
+            self.current += int(n)
+        if self._bar is not None and n:
+            self._bar.update(int(n))
+        if self.current >= self.log_every + self.last_logged or (self.total is not None and self.current >= int(self.total)):
+            self.last_logged = int(self.current)
+            log_hypothesis_progress(
+                self.output_dir,
+                self.phase,
+                "progress",
+                epoch_id=self.epoch_id,
+                current=self.current,
+                total=self.total,
+                start_time=self.started_at,
+                extra=extra,
+            )
+
+    def close(self, *, extra: dict[str, Any] | None = None) -> None:
+        if self._bar is not None:
+            self._bar.close()
+        log_hypothesis_progress(
+            self.output_dir,
+            self.phase,
+            "done",
+            epoch_id=self.epoch_id,
+            current=self.current if self.total is None else min(self.current, int(self.total)),
+            total=self.total,
+            start_time=self.started_at,
+            extra=extra,
+        )
+        if self.top_bar is not None:
+            self.top_bar.update(1)
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close(extra={"error": None if exc is None else f"{type(exc).__name__}: {exc}"})
+
+
+@contextmanager
+def hypothesis_phase(
+    output_dir: Path,
+    phase: str,
+    *,
+    epoch_id: str | None,
+    total: int | None,
+    unit: str,
+    enabled: bool,
+    leave: bool,
+    log_every: int,
+    top_bar: Any | None = None,
+):
+    tracker = _HypothesisPhaseTracker(
+        output_dir=output_dir,
+        phase=phase,
+        epoch_id=epoch_id,
+        total=total,
+        unit=unit,
+        enabled=enabled,
+        leave=leave,
+        log_every=log_every,
+        top_bar=top_bar,
+    )
+    try:
+        yield tracker.__enter__()
+    finally:
+        tracker.__exit__(None, None, None)
 
 
 def run_hypothesis_suite_report(
@@ -46,6 +214,16 @@ def run_hypothesis_suite_report(
     total_interactions_seen: int | None = None,
     memory_size_before_bytes: int | None = None,
     memory_size_after_bytes: int | None = None,
+    suite_mode: str = "fast",
+    higher_order_workers: int = 1,
+    higher_order_transfer_chunk_size: int = 5_000,
+    max_role_carriers: int = 25_000,
+    max_roles: int = 10_000,
+    max_role_transfer_attempts: int = 25_000,
+    max_future_option_events: int = 50_000,
+    max_future_option_motifs: int = 25_000,
+    hypothesis_progress: bool | None = None,
+    hypothesis_progress_log_every: int = 1000,
 ) -> dict[str, Any]:
     run_dir = Path(run_dir)
     memory_dir = None if memory_dir is None else Path(memory_dir)
@@ -64,44 +242,182 @@ def run_hypothesis_suite_report(
     h10_dir = output_dir / "h10"
     h11_dir = output_dir / "h11"
     h12_dir = output_dir / "h12"
+    suite_started_at = time.time()
+    resolved_suite_mode = str(suite_mode or "fast").strip().lower()
+    if resolved_suite_mode not in {"fast", "full"}:
+        resolved_suite_mode = "fast"
+    progress_enabled = bool(hypothesis_progress) if hypothesis_progress is not None else bool(sys.stderr.isatty())
+    phase_names = [
+        "family_repair", "H01", "H02", "H03", "H04",
+        "derive_role_candidates", "H05", "derive_role_transfer_attempts", "H06",
+        "derive_concept_candidates", "H07", "derive_world_model_components", "H08",
+        "derive_future_option_events", "derive_future_option_motifs", "H09", "H10", "H11", "H12", "summary_write",
+    ]
+    top_bar = tqdm(total=len(phase_names), desc="hypothesis suite", unit="phase", dynamic_ncols=True, leave=True, disable=not progress_enabled)
+    timings: dict[str, float] = {
+        "family_repair_seconds": 0.0,
+        "h01_seconds": 0.0,
+        "h02_seconds": 0.0,
+        "h03_seconds": 0.0,
+        "h04_seconds": 0.0,
+        "derive_role_candidates_seconds": 0.0,
+        "derive_role_transfer_attempts_seconds": 0.0,
+        "derive_concept_candidates_seconds": 0.0,
+        "derive_world_model_components_seconds": 0.0,
+        "h05_seconds": 0.0,
+        "h06_seconds": 0.0,
+        "h07_seconds": 0.0,
+        "h08_seconds": 0.0,
+        "derive_future_option_events_seconds": 0.0,
+        "derive_future_option_motifs_seconds": 0.0,
+        "h09_seconds": 0.0,
+        "h10_seconds": 0.0,
+        "h11_seconds": 0.0,
+        "h12_seconds": 0.0,
+        "suite_total_seconds": 0.0,
+    }
+
+    @contextmanager
+    def _phase(name: str):
+        with hypothesis_phase(
+            output_dir,
+            name,
+            epoch_id=epoch_id,
+            total=1,
+            unit="phase",
+            enabled=progress_enabled,
+            leave=False,
+            log_every=hypothesis_progress_log_every,
+            top_bar=top_bar,
+        ) as tracker:
+            yield tracker
+
+    def _progress_factory(phase: str, total: int | None, unit: str, leave: bool = False) -> _HypothesisPhaseTracker:
+        return _HypothesisPhaseTracker(
+            output_dir=output_dir,
+            phase=phase,
+            epoch_id=epoch_id,
+            total=total,
+            unit=unit,
+            enabled=progress_enabled,
+            leave=leave,
+            log_every=hypothesis_progress_log_every,
+        ).__enter__()
+
     family_repair_summary: dict[str, Any] = {}
-    if memory_dir is not None:
-        family_repair_summary = derive_missing_transformation_families_from_stable_contingencies(memory_dir)
-    h01 = evaluate_h01_contingency_emergence(run_dir=run_dir, output_dir=h01_dir, memory_dir=memory_dir)
-    h02 = evaluate_h02_prediction_violation_attention(
-        run_dir=run_dir,
-        output_dir=h02_dir,
-        memory_dir=memory_dir,
-        max_rows=int(max_rows),
-        max_db_files=int(max_db_files),
-        scan_all_dbs=bool(scan_all_dbs),
-    )
-    h03 = evaluate_h03_transformation_family_formation(
-        run_dir=run_dir,
-        output_dir=h03_dir,
-        memory_dir=memory_dir,
-        max_db_files=int(max_db_files),
-        max_rows=int(max_rows),
-        scan_all_dbs=bool(scan_all_dbs),
-    )
+    with _phase("family_repair"):
+        if memory_dir is not None:
+            t0 = time.time()
+            family_repair_summary = derive_missing_transformation_families_from_stable_contingencies(memory_dir)
+            timings["family_repair_seconds"] = float(time.time() - t0)
+    with _phase("H01"):
+        t0 = time.time()
+        h01 = evaluate_h01_contingency_emergence(run_dir=run_dir, output_dir=h01_dir, memory_dir=memory_dir)
+        timings["h01_seconds"] = float(time.time() - t0)
+    with _phase("H02"):
+        t0 = time.time()
+        h02 = evaluate_h02_prediction_violation_attention(
+            run_dir=run_dir,
+            output_dir=h02_dir,
+            memory_dir=memory_dir,
+            max_rows=int(max_rows),
+            max_db_files=int(max_db_files),
+            scan_all_dbs=bool(scan_all_dbs),
+        )
+        timings["h02_seconds"] = float(time.time() - t0)
+    with _phase("H03"):
+        t0 = time.time()
+        h03 = evaluate_h03_transformation_family_formation(
+            run_dir=run_dir,
+            output_dir=h03_dir,
+            memory_dir=memory_dir,
+            max_db_files=int(max_db_files),
+            max_rows=int(max_rows),
+            scan_all_dbs=bool(scan_all_dbs),
+        )
+        timings["h03_seconds"] = float(time.time() - t0)
     if isinstance(h03, dict):
         h03.update(family_repair_summary)
-    h04 = (
-        evaluate_h04_carrier_emergence(memory_dir=memory_dir, run_dir=run_dir, output_dir=h04_dir)
-        if memory_dir is not None
-        else {"hypothesis_id": "H04", "decision": "INCONCLUSIVE", "core_metrics": {}, "missing_evidence": ["memory_dir not provided"]}
-    )
+    with _phase("H04"):
+        t0 = time.time()
+        h04 = (
+            evaluate_h04_carrier_emergence(memory_dir=memory_dir, run_dir=run_dir, output_dir=h04_dir)
+            if memory_dir is not None
+            else {"hypothesis_id": "H04", "decision": "INCONCLUSIVE", "core_metrics": {}, "missing_evidence": ["memory_dir not provided"]}
+        )
+        timings["h04_seconds"] = float(time.time() - t0)
+
     if memory_dir is not None:
-        derive_higher_order_memory(memory_dir=memory_dir, run_dir=run_dir)
-        h05 = evaluate_h05_role_emergence(memory_dir=memory_dir, run_dir=run_dir, output_dir=h05_dir, already_derived=True)
-        h06 = evaluate_h06_role_transfer(memory_dir=memory_dir, run_dir=run_dir, output_dir=h06_dir, already_derived=True)
-        h07 = evaluate_h07_concept_emergence(memory_dir=memory_dir, run_dir=run_dir, output_dir=h07_dir, already_derived=True)
-        h08 = evaluate_h08_world_model_coherence(memory_dir=memory_dir, run_dir=run_dir, output_dir=h08_dir, already_derived=True)
-        derive_future_option_memory(memory_dir=memory_dir, run_dir=run_dir)
-        h09 = evaluate_h09_future_option_motifs(memory_dir=memory_dir, run_dir=run_dir, output_dir=h09_dir, already_derived=True)
-        h10 = evaluate_h10_future_option_attention(memory_dir=memory_dir, run_dir=run_dir, output_dir=h10_dir, already_derived=True)
-        h11 = evaluate_h11_future_option_transfer_concepts(memory_dir=memory_dir, run_dir=run_dir, output_dir=h11_dir, already_derived=True)
-        h12 = evaluate_h12_efficiency_emergence(memory_dir=memory_dir, run_dir=run_dir, output_dir=h12_dir)
+        with _phase("derive_role_candidates"):
+            t0 = time.time()
+            derive_role_candidates_only(memory_dir=memory_dir, run_dir=run_dir, max_carriers=int(max_role_carriers), max_roles=int(max_roles), progress_factory=_progress_factory)
+            timings["derive_role_candidates_seconds"] = float(time.time() - t0)
+        with _phase("H05"):
+            t0 = time.time()
+            h05 = evaluate_h05_role_emergence(memory_dir=memory_dir, run_dir=run_dir, output_dir=h05_dir, already_derived=True)
+            timings["h05_seconds"] = float(time.time() - t0)
+        with _phase("derive_role_transfer_attempts"):
+            t0 = time.time()
+            derive_role_transfer_attempts_only(memory_dir=memory_dir, run_dir=run_dir, max_transfer_attempts=int(max_role_transfer_attempts), workers=int(higher_order_workers), chunk_size=int(higher_order_transfer_chunk_size), progress_factory=_progress_factory)
+            timings["derive_role_transfer_attempts_seconds"] = float(time.time() - t0)
+        with _phase("H06"):
+            t0 = time.time()
+            h06 = evaluate_h06_role_transfer(memory_dir=memory_dir, run_dir=run_dir, output_dir=h06_dir, already_derived=True)
+            timings["h06_seconds"] = float(time.time() - t0)
+        with _phase("derive_concept_candidates"):
+            t0 = time.time()
+            derive_concept_candidates_only(memory_dir=memory_dir, run_dir=run_dir, progress_factory=_progress_factory)
+            timings["derive_concept_candidates_seconds"] = float(time.time() - t0)
+        with _phase("H07"):
+            t0 = time.time()
+            h07 = evaluate_h07_concept_emergence(memory_dir=memory_dir, run_dir=run_dir, output_dir=h07_dir, already_derived=True)
+            timings["h07_seconds"] = float(time.time() - t0)
+        with _phase("derive_world_model_components"):
+            t0 = time.time()
+            derive_world_model_components_only(memory_dir=memory_dir, run_dir=run_dir, progress_factory=_progress_factory)
+            timings["derive_world_model_components_seconds"] = float(time.time() - t0)
+        with _phase("H08"):
+            t0 = time.time()
+            h08 = evaluate_h08_world_model_coherence(memory_dir=memory_dir, run_dir=run_dir, output_dir=h08_dir, already_derived=True)
+            timings["h08_seconds"] = float(time.time() - t0)
+        if resolved_suite_mode == "full":
+            with _phase("derive_future_option_events"):
+                with _phase("derive_future_option_motifs"):
+                    future_t0 = time.time()
+                    future_summary = derive_future_option_memory(
+                        memory_dir=memory_dir,
+                        run_dir=run_dir,
+                        max_events=int(max_future_option_events),
+                        max_motifs=int(max_future_option_motifs),
+                        progress_factory=_progress_factory,
+                    )
+                    timings["derive_future_option_events_seconds"] = float(future_summary.get("derive_future_option_events_seconds", time.time() - future_t0))
+                    timings["derive_future_option_motifs_seconds"] = float(future_summary.get("derive_future_option_motifs_seconds", 0.0))
+        else:
+            with _phase("derive_future_option_events"):
+                pass
+            with _phase("derive_future_option_motifs"):
+                pass
+        with _phase("H09"):
+            t0 = time.time()
+            h09 = evaluate_h09_future_option_motifs(memory_dir=memory_dir, run_dir=run_dir, output_dir=h09_dir, already_derived=True)
+            timings["h09_seconds"] = float(time.time() - t0)
+        with _phase("H10"):
+            t0 = time.time()
+            h10 = evaluate_h10_future_option_attention(memory_dir=memory_dir, run_dir=run_dir, output_dir=h10_dir, already_derived=True)
+            timings["h10_seconds"] = float(time.time() - t0)
+        with _phase("H11"):
+            t0 = time.time()
+            h11 = evaluate_h11_future_option_transfer_concepts(memory_dir=memory_dir, run_dir=run_dir, output_dir=h11_dir, already_derived=True)
+            timings["h11_seconds"] = float(time.time() - t0)
+        with _phase("H12"):
+            t0 = time.time()
+            h12 = evaluate_h12_efficiency_emergence(memory_dir=memory_dir, run_dir=run_dir, output_dir=h12_dir)
+            timings["h12_seconds"] = float(time.time() - t0)
+        if resolved_suite_mode == "fast":
+            for result in (h05, h06, h07, h08, h09, h10, h11):
+                if isinstance(result, dict):
+                    result["evidence_source"] = "cached_derived_memory"
     else:
         missing = ["memory_dir not provided"]
         h05 = {"hypothesis_id": "H05", "decision": "INSUFFICIENT_EVIDENCE", "core_metrics": {}, "missing_evidence": missing, "evidence_source": "none"}
@@ -112,6 +428,9 @@ def run_hypothesis_suite_report(
         h10 = {"hypothesis_id": "H10", "decision": "INSUFFICIENT_EVIDENCE", "core_metrics": {}, "missing_evidence": missing, "evidence_source": "none"}
         h11 = {"hypothesis_id": "H11", "decision": "INSUFFICIENT_EVIDENCE", "core_metrics": {}, "missing_evidence": missing, "evidence_source": "none"}
         h12 = {"hypothesis_id": "H12", "decision": "INSUFFICIENT_EVIDENCE", "core_metrics": {}, "missing_evidence": missing, "evidence_source": "none"}
+        for phase_name in ("derive_role_candidates", "H05", "derive_role_transfer_attempts", "H06", "derive_concept_candidates", "H07", "derive_world_model_components", "H08", "derive_future_option_events", "derive_future_option_motifs", "H09", "H10", "H11", "H12"):
+            with _phase(phase_name):
+                pass
     input_report = _load_json(Path(run_dir) / INPUT_REPORT_NAME) or {}
     runs = [dict(item) for item in input_report.get("runs", []) if isinstance(item, dict)]
     games = sorted({str(row.get("game")) for row in runs if row.get("game")})
@@ -167,24 +486,42 @@ def run_hypothesis_suite_report(
         higher_order_dependency_gate_notes=dependency_notes,
         epoch_maturity_gate_notes=maturity_notes,
     )
-    _write_suite_summary(
-        summary,
+    timings["suite_total_seconds"] = float(time.time() - suite_started_at)
+    summary.update(timings)
+    summary["suite_mode"] = resolved_suite_mode
+    summary["max_role_transfer_attempts"] = int(max_role_transfer_attempts)
+    summary["max_future_option_events"] = int(max_future_option_events)
+    summary["max_future_option_motifs"] = int(max_future_option_motifs)
+    with hypothesis_phase(
         output_dir,
-        hypothesis_results={
-            "H01": h01,
-            "H02": h02,
-            "H03": h03,
-            "H04": h04,
-            "H05": h05,
-            "H06": h06,
-            "H07": h07,
-            "H08": h08,
-            "H09": h09,
-            "H10": h10,
-            "H11": h11,
-            "H12": h12,
-        },
-    )
+        "summary_write",
+        epoch_id=epoch_id,
+        total=1,
+        unit="phase",
+        enabled=progress_enabled,
+        leave=False,
+        log_every=hypothesis_progress_log_every,
+        top_bar=top_bar,
+    ):
+        _write_suite_summary(
+            summary,
+            output_dir,
+            hypothesis_results={
+                "H01": h01,
+                "H02": h02,
+                "H03": h03,
+                "H04": h04,
+                "H05": h05,
+                "H06": h06,
+                "H07": h07,
+                "H08": h08,
+                "H09": h09,
+                "H10": h10,
+                "H11": h11,
+                "H12": h12,
+            },
+        )
+    top_bar.close()
     return summary
 
 

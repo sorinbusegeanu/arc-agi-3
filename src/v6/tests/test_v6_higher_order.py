@@ -2,10 +2,18 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from v6.continuous_research import _format_epoch_status
-from v6.higher_order_substrate import derive_higher_order_memory
+from v6 import higher_order_substrate
+from v6.higher_order_substrate import (
+    _derive_role_transfer_attempts_chunk,
+    _predict_transfer_attempt,
+    derive_higher_order_memory,
+    derive_role_candidates_only,
+    derive_role_transfer_attempts_only,
+)
 from v6.hypothesis_h05_report import evaluate_h05_role_emergence
 from v6.hypothesis_h06_report import evaluate_h06_role_transfer
 from v6.hypothesis_h07_report import evaluate_h07_concept_emergence
@@ -22,6 +30,11 @@ from v6.hypothesis_suite_report import (
     run_hypothesis_suite_report,
 )
 from v6.memory.compact_memory import ensure_memory_layout
+
+
+class _ThreadPoolCompat(ThreadPoolExecutor):
+    def __init__(self, max_workers=None):
+        super().__init__(max_workers=max_workers)
 
 
 def test_h06_predicts_correct_role_across_held_out_game(tmp_path: Path) -> None:
@@ -521,6 +534,223 @@ def test_suite_includes_h01_h11(tmp_path: Path) -> None:
     assert "H09 core metrics" in summary
     assert "H10 core metrics" in summary
     assert "H11 core metrics" in summary
+
+
+def test_fast_suite_does_not_call_derivations(tmp_path: Path, monkeypatch) -> None:
+    memory_dir = tmp_path / "memory"
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _seed_memory(memory_dir, _transfer_rich_specs())
+    calls = {"future": 0}
+
+    monkeypatch.setattr(
+        "v6.hypothesis_suite_report.derive_role_candidates_only",
+        lambda **kwargs: {"role_candidate_count": 0},
+    )
+    monkeypatch.setattr(
+        "v6.hypothesis_suite_report.derive_role_transfer_attempts_only",
+        lambda **kwargs: {"transfer_attempt_count": 0},
+    )
+    monkeypatch.setattr(
+        "v6.hypothesis_suite_report.derive_concept_candidates_only",
+        lambda **kwargs: {"concept_candidate_count": 0},
+    )
+    monkeypatch.setattr(
+        "v6.hypothesis_suite_report.derive_world_model_components_only",
+        lambda **kwargs: {"world_model_component_count": 0},
+    )
+    monkeypatch.setattr("v6.hypothesis_suite_report.derive_future_option_memory", lambda **kwargs: calls.__setitem__("future", calls["future"] + 1) or {})
+
+    summary = run_hypothesis_suite_report(
+        run_dir=run_dir,
+        memory_dir=memory_dir,
+        output_dir=tmp_path / "reports",
+        scan_all_dbs=True,
+        max_db_files=10,
+        max_rows=1000,
+        suite_mode="fast",
+    )
+    assert calls["future"] == 0
+    assert summary["suite_mode"] == "fast"
+    assert "derive_higher_order_seconds" in summary
+    assert "suite_total_seconds" in summary
+
+
+def test_h05_written_after_role_candidates_only_without_later_derivations(tmp_path: Path, monkeypatch) -> None:
+    memory_dir = tmp_path / "memory"
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _seed_memory(memory_dir, _transfer_rich_specs())
+    state = {"role_done": False, "h05_seen": False}
+
+    def _derive_role(**kwargs):
+        state["role_done"] = True
+        return derive_role_candidates_only(**kwargs)
+
+    def _h05(**kwargs):
+        assert state["role_done"] is True
+        assert state["h05_seen"] is False
+        state["h05_seen"] = True
+        return evaluate_h05_role_emergence(**kwargs)
+
+    monkeypatch.setattr("v6.hypothesis_suite_report.derive_role_candidates_only", _derive_role)
+    monkeypatch.setattr("v6.hypothesis_suite_report.evaluate_h05_role_emergence", _h05)
+    monkeypatch.setattr("v6.hypothesis_suite_report.derive_role_transfer_attempts_only", lambda **kwargs: (_ for _ in ()).throw(AssertionError("transfer derivation should not run before H05")))
+    monkeypatch.setattr("v6.hypothesis_suite_report.derive_concept_candidates_only", lambda **kwargs: (_ for _ in ()).throw(AssertionError("concept derivation should not run before H05")))
+    monkeypatch.setattr("v6.hypothesis_suite_report.derive_world_model_components_only", lambda **kwargs: (_ for _ in ()).throw(AssertionError("world derivation should not run before H05")))
+
+    try:
+        run_hypothesis_suite_report(
+            run_dir=run_dir,
+            memory_dir=memory_dir,
+            output_dir=tmp_path / "reports",
+            scan_all_dbs=True,
+            max_db_files=10,
+            max_rows=1000,
+            suite_mode="fast",
+        )
+    except AssertionError as exc:
+        assert str(exc) == "transfer derivation should not run before H05"
+
+    assert state["h05_seen"] is True
+    assert (tmp_path / "reports" / "h05" / "h05_functional_role_emergence_report.json").exists()
+    phase_rows = [
+        json.loads(line)
+        for line in (tmp_path / "reports" / "hypothesis_phase_log.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert [row["phase"] for row in phase_rows[:4]] == ["derive_role_candidates", "derive_role_candidates", "h05", "h05"]
+
+
+def test_full_suite_calls_derivations_with_limits(tmp_path: Path, monkeypatch) -> None:
+    memory_dir = tmp_path / "memory"
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _seed_memory(memory_dir, _transfer_rich_specs())
+    captured: dict[str, Any] = {"order": []}
+
+    monkeypatch.setattr(
+        "v6.hypothesis_suite_report.derive_role_candidates_only",
+        lambda **kwargs: captured["order"].append("role") or {},
+    )
+    monkeypatch.setattr(
+        "v6.hypothesis_suite_report.derive_role_transfer_attempts_only",
+        lambda **kwargs: captured.update({"higher": int(kwargs["max_transfer_attempts"])}) or captured["order"].append("transfer") or {},
+    )
+    monkeypatch.setattr(
+        "v6.hypothesis_suite_report.derive_concept_candidates_only",
+        lambda **kwargs: captured["order"].append("concept") or {},
+    )
+    monkeypatch.setattr(
+        "v6.hypothesis_suite_report.derive_world_model_components_only",
+        lambda **kwargs: captured["order"].append("world") or {},
+    )
+    monkeypatch.setattr(
+        "v6.hypothesis_suite_report.derive_future_option_memory",
+        lambda **kwargs: captured.update(
+            {"events": int(kwargs["max_events"]), "motifs": int(kwargs["max_motifs"])}
+        ) or captured["order"].append("future") or {},
+    )
+
+    summary = run_hypothesis_suite_report(
+        run_dir=run_dir,
+        memory_dir=memory_dir,
+        output_dir=tmp_path / "reports",
+        scan_all_dbs=True,
+        max_db_files=10,
+        max_rows=1000,
+        suite_mode="full",
+        max_role_transfer_attempts=123,
+        max_future_option_events=456,
+        max_future_option_motifs=789,
+    )
+    assert captured["higher"] == 123
+    assert captured["events"] == 456
+    assert captured["motifs"] == 789
+    assert captured["order"] == ["role", "transfer", "concept", "world", "future"]
+    assert summary["suite_mode"] == "full"
+
+
+def test_derive_role_transfer_attempts_only_respects_max_attempts(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_memory(memory_dir, _transfer_rich_specs())
+    derive_role_candidates_only(memory_dir=memory_dir)
+    summary = derive_role_transfer_attempts_only(memory_dir=memory_dir, max_transfer_attempts=3, workers=1, chunk_size=2)
+    assert summary["transfer_attempt_count"] == 3
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        assert conn.execute("SELECT COUNT(*) FROM role_transfer_attempts").fetchone()[0] == 3
+
+
+def test_transfer_attempt_workers_one_and_four_match_counts(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(higher_order_substrate, "ProcessPoolExecutor", _ThreadPoolCompat)
+    memory_dir_a = tmp_path / "memory_a"
+    memory_dir_b = tmp_path / "memory_b"
+    specs = _transfer_rich_specs()
+    _seed_memory(memory_dir_a, specs)
+    _seed_memory(memory_dir_b, specs)
+    derive_role_candidates_only(memory_dir=memory_dir_a)
+    derive_role_candidates_only(memory_dir=memory_dir_b)
+    summary_a = derive_role_transfer_attempts_only(memory_dir=memory_dir_a, max_transfer_attempts=25, workers=1, chunk_size=5)
+    summary_b = derive_role_transfer_attempts_only(memory_dir=memory_dir_b, max_transfer_attempts=25, workers=4, chunk_size=5)
+    assert summary_a["transfer_attempt_count"] == summary_b["transfer_attempt_count"]
+    assert summary_a["successful_transfer_count"] == summary_b["successful_transfer_count"]
+    assert summary_a["successful_role_count"] == summary_b["successful_role_count"]
+
+
+def test_transfer_worker_chunk_does_not_open_sqlite(monkeypatch) -> None:
+    monkeypatch.setattr(higher_order_substrate.sqlite3, "connect", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("sqlite connect should not be called in worker chunk")))
+    rows = _derive_role_transfer_attempts_chunk(
+        chunk=[("carrier1", "cross_game", "g2")],
+        role_rows={
+            "carrier1": {
+                "carrier_signature": "carrier1",
+                "role_signature": "roleA",
+                "tokens": ("a", "b"),
+                "first_seen_global_step": 1,
+                "last_seen_global_step": 2,
+            }
+        },
+        profile_cache={
+            ("cross_game", "g2"): [
+                {
+                    "role_signature": "roleB",
+                    "profile_tokens": ["a", "b"],
+                    "profile_token_set": {"a", "b"},
+                    "source_carrier_count": 2,
+                    "source_context_count": 2,
+                    "source_game_count": 1,
+                }
+            ]
+        },
+    )
+    assert len(rows) == 1
+
+
+def test_predict_transfer_attempt_does_not_sort_candidates(monkeypatch) -> None:
+    import builtins
+
+    monkeypatch.setattr(builtins, "sorted", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("sorted should not be called")))
+    attempt = _predict_transfer_attempt(
+        profile_cache={
+            ("cross_game", "g2"): [
+                {"role_signature": "roleB", "profile_tokens": ["a", "b"], "profile_token_set": {"a", "b"}, "source_carrier_count": 2},
+                {"role_signature": "roleC", "profile_tokens": ["a"], "profile_token_set": {"a"}, "source_carrier_count": 3},
+            ]
+        },
+        role_rows={
+            "carrier1": {
+                "carrier_signature": "carrier1",
+                "role_signature": "roleA",
+                "tokens": ("a", "b"),
+                "first_seen_global_step": 1,
+                "last_seen_global_step": 2,
+            }
+        },
+        target_carrier_signature="carrier1",
+        transfer_kind="cross_game",
+        target_scope_key="g2",
+    )
+    assert attempt["predicted_role_signature"] == "roleB"
 
 
 def test_suite_total_interactions_fallback(tmp_path: Path) -> None:

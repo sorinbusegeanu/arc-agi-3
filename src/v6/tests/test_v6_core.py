@@ -9239,6 +9239,66 @@ def test_continuous_research_passes_memory_flags_into_interaction_sampling(tmp_p
     assert sampling_config.restore_compact_substrate is True
 
 
+def test_direct_streaming_fold_job_id_is_epoch_qualified() -> None:
+    job = {
+        "game": "tt01",
+        "sampler_name": "mixed",
+        "seed": 0,
+        "steps": 100,
+        "global_step_offset": 200,
+        "db_path": "runs/v6/continuous/x/epochs/epoch_0003/raw/sampling_v05c/tt01/mixed/steps_100/seed_0.sqlite",
+    }
+    job_id = interaction_sampling._direct_streaming_fold_job_id(job)
+    assert job_id.startswith("epoch_0003:tt01:mixed:seed0:steps100")
+    assert job_id.endswith(":g201-300")
+
+
+def test_resume_rejects_incomplete_next_epoch(tmp_path) -> None:
+    import v6.continuous_research as continuous_research
+
+    root = tmp_path / "continuous"
+    memory_dir = root / "memory"
+    memory_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("current_state.sqlite", "graph.sqlite", "replay_queue.sqlite", "memory_summary.json"):
+        (memory_dir / name).write_text("{}", encoding="utf-8")
+    manifest_path = root / "manifest.json"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "current_epoch": 2,
+                "memory_paths": {
+                    "current_state": str(memory_dir / "current_state.sqlite"),
+                    "graph": str(memory_dir / "graph.sqlite"),
+                    "replay_queue": str(memory_dir / "replay_queue.sqlite"),
+                    "memory_summary": str(memory_dir / "memory_summary.json"),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    status_dir = root / "epochs" / "epoch_0003" / "status"
+    status_dir.mkdir(parents=True, exist_ok=True)
+    (status_dir / "epoch_start.json").write_text(json.dumps({"epoch_id": "epoch_0003"}), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="incomplete next epoch"):
+        continuous_research._load_or_initialize_manifest(
+            continuous_research.ContinuousResearchConfig(
+                experiment_name="resume_guard",
+                games="tt01",
+                samplers="mixed",
+                seeds="0",
+                steps_per_epoch=100,
+                max_epochs=4,
+                horizon=2,
+                context_depth=1,
+                output_dir=str(root),
+                resume=True,
+            ),
+            manifest_path,
+        )
+
+
 def test_v05c_run_sampling_job_non_fast_mode_does_not_call_legacy_future_effects(tmp_path, monkeypatch) -> None:
     captured: dict[str, object] = {"delta_called": False, "apply_called": False}
 
@@ -12276,6 +12336,108 @@ def test_hypothesis_suite_report_imports_successfully() -> None:
     import v6.hypothesis_suite_report as hypothesis_suite_report
 
     assert callable(hypothesis_suite_report.run_hypothesis_suite_report)
+
+
+def test_hypothesis_suite_writes_phase_log(tmp_path: Path, monkeypatch) -> None:
+    import v6.hypothesis_suite_report as hypothesis_suite_report
+
+    run_dir = tmp_path / "run"
+    output_dir = tmp_path / "reports"
+    run_dir.mkdir()
+    (run_dir / "interaction_sampling_v05c_report.json").write_text(json.dumps({"runs": []}), encoding="utf-8")
+
+    stub = {"decision": "INSUFFICIENT_EVIDENCE", "core_metrics": {}, "missing_evidence": []}
+    monkeypatch.setattr(hypothesis_suite_report, "evaluate_h01_contingency_emergence", lambda **kwargs: dict(stub, hypothesis_id="H01"))
+    monkeypatch.setattr(hypothesis_suite_report, "evaluate_h02_prediction_violation_attention", lambda **kwargs: dict(stub, hypothesis_id="H02"))
+    monkeypatch.setattr(hypothesis_suite_report, "evaluate_h03_transformation_family_formation", lambda **kwargs: dict(stub, hypothesis_id="H03"))
+    monkeypatch.setattr(hypothesis_suite_report, "evaluate_h04_carrier_emergence", lambda **kwargs: dict(stub, hypothesis_id="H04"))
+    monkeypatch.setattr(hypothesis_suite_report, "evaluate_h12_efficiency_emergence", lambda **kwargs: dict(stub, hypothesis_id="H12"))
+
+    summary = hypothesis_suite_report.run_hypothesis_suite_report(
+        run_dir=run_dir,
+        memory_dir=None,
+        output_dir=output_dir,
+        scan_all_dbs=False,
+        max_db_files=0,
+        max_rows=10,
+        epoch_id="epoch_0001",
+        hypothesis_progress=False,
+        hypothesis_progress_log_every=1,
+    )
+    assert summary["suite_total_seconds"] >= 0.0
+    log_path = output_dir / "hypothesis_phase_log.jsonl"
+    assert log_path.exists()
+    lines = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert any(line["phase"] == "H01" and line["status"] == "starting" for line in lines)
+    assert any(line["phase"] == "summary_write" and line["status"] == "done" for line in lines)
+
+
+def test_hypothesis_suite_progress_can_be_disabled(tmp_path: Path, monkeypatch) -> None:
+    import v6.hypothesis_suite_report as hypothesis_suite_report
+
+    run_dir = tmp_path / "run_disable"
+    output_dir = tmp_path / "reports_disable"
+    run_dir.mkdir()
+    (run_dir / "interaction_sampling_v05c_report.json").write_text(json.dumps({"runs": []}), encoding="utf-8")
+    stub = {"decision": "INSUFFICIENT_EVIDENCE", "core_metrics": {}, "missing_evidence": []}
+    monkeypatch.setattr(hypothesis_suite_report, "evaluate_h01_contingency_emergence", lambda **kwargs: dict(stub, hypothesis_id="H01"))
+    monkeypatch.setattr(hypothesis_suite_report, "evaluate_h02_prediction_violation_attention", lambda **kwargs: dict(stub, hypothesis_id="H02"))
+    monkeypatch.setattr(hypothesis_suite_report, "evaluate_h03_transformation_family_formation", lambda **kwargs: dict(stub, hypothesis_id="H03"))
+    monkeypatch.setattr(hypothesis_suite_report, "evaluate_h04_carrier_emergence", lambda **kwargs: dict(stub, hypothesis_id="H04"))
+    monkeypatch.setattr(hypothesis_suite_report, "evaluate_h12_efficiency_emergence", lambda **kwargs: dict(stub, hypothesis_id="H12"))
+
+    seen: dict[str, object] = {}
+
+    class DummyTqdm:
+        def __init__(self, *args, **kwargs):
+            seen.setdefault("calls", []).append(kwargs)
+        def set_postfix_str(self, *args, **kwargs):
+            return None
+        def update(self, *args, **kwargs):
+            return None
+        def close(self):
+            return None
+
+    monkeypatch.setattr(hypothesis_suite_report, "tqdm", DummyTqdm)
+    hypothesis_suite_report.run_hypothesis_suite_report(
+        run_dir=run_dir,
+        memory_dir=None,
+        output_dir=output_dir,
+        scan_all_dbs=False,
+        max_db_files=0,
+        max_rows=10,
+        hypothesis_progress=False,
+    )
+    assert seen["calls"][0]["disable"] is True
+
+
+def test_higher_order_transfer_progress_updates_from_parent(tmp_path: Path, monkeypatch) -> None:
+    from v6.higher_order_substrate import derive_role_transfer_attempts_only
+
+    memory_dir = tmp_path / "memory_transfer_progress"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute("INSERT INTO role_neighborhood_signatures (carrier_signature, role_signature, role_type, token_json, diagnostic_token_json, linked_family_count, linked_context_count, linked_game_count, in_edge_count, out_edge_count, first_seen_global_step, last_seen_global_step, stability_score) VALUES ('c1','r1','t','[\"a\"]','[]',1,1,1,0,0,1,1,0.7)")
+        conn.execute("INSERT INTO role_neighborhood_signatures (carrier_signature, role_signature, role_type, token_json, diagnostic_token_json, linked_family_count, linked_context_count, linked_game_count, in_edge_count, out_edge_count, first_seen_global_step, last_seen_global_step, stability_score) VALUES ('c2','r2','t','[\"b\"]','[]',1,1,1,0,0,1,1,0.7)")
+        conn.commit()
+    progress_events: list[tuple[str, int | None]] = []
+
+    class Tracker:
+        def __init__(self, phase: str, total: int | None) -> None:
+            self.phase = phase
+            self.total = total
+        def update(self, n=1, current=None, extra=None):
+            progress_events.append((self.phase, current if current is not None else n))
+        def close(self, extra=None):
+            progress_events.append((self.phase, self.total))
+
+    derive_role_transfer_attempts_only(
+        memory_dir=memory_dir,
+        workers=1,
+        chunk_size=1,
+        progress_factory=lambda phase, total, unit, leave=False: Tracker(phase, total),
+    )
+    assert any(phase == "derive_role_transfer chunks" for phase, _ in progress_events)
 
 
 def test_h03_family_prediction_lift_available_and_non_negative(tmp_path: Path) -> None:
