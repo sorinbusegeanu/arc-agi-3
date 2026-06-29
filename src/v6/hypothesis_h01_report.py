@@ -35,6 +35,10 @@ H01_DEFAULTS: dict[str, Any] = {
     "tables_seen": [],
     "total_interaction_count": None,
     "memory_record_count": None,
+    "compact_memory_node_count": None,
+    "compact_memory_score_count": None,
+    "compact_interaction_memory_count": None,
+    "manifest_interaction_count": None,
     "contingency_candidate_count": None,
     "discovered_contingency_count": None,
     "stable_contingency_count": None,
@@ -66,6 +70,7 @@ H01_DEFAULTS: dict[str, Any] = {
     "evidence_against": [],
     "missing_evidence": [],
     "evidence_diagnostics": {},
+    "coverage_attribution_missing": False,
     "acceptance_checks": {
         "interactions_present": None,
         "contingencies_present": None,
@@ -152,8 +157,10 @@ def _direct_streaming_missing_m1_substrate(result: dict[str, Any]) -> bool:
     raw_db_count = int((result.get("evidence_diagnostics") or {}).get("raw_db_count", 0) or 0)
     interaction_like = (
         _gt(result.get("total_interaction_count"), 0)
+        or _gt(result.get("manifest_interaction_count"), 0)
+        or _gt(result.get("compact_interaction_memory_count"), 0)
+        or _gt(result.get("compact_memory_score_count"), 0)
         or _gt(result.get("memory_record_count"), 0)
-        or _gt(result.get("memory_score_record_count"), 0)
     )
     stable_count = int(result.get("stable_contingencies_count") or result.get("stable_contingency_count") or 0)
     raw_rows_seen = result.get("raw_contingency_rows_seen")
@@ -282,6 +289,7 @@ def evaluate_h01_contingency_emergence(run_dir: Path, output_dir: Path, *, memor
         compact_metrics = _extract_compact_memory_metrics(Path(memory_dir))
         for key in (
             "total_interaction_count",
+            "manifest_interaction_count",
             "contingency_candidate_count",
             "discovered_contingency_count",
             "stable_contingency_count",
@@ -291,6 +299,9 @@ def evaluate_h01_contingency_emergence(run_dir: Path, output_dir: Path, *, memor
             "cross_sampler_contingency_count",
             "mean_prediction_accuracy",
             "memory_record_count",
+            "compact_memory_node_count",
+            "compact_memory_score_count",
+            "compact_interaction_memory_count",
             "memory_replay_candidate_count",
             "high_priority_replay_count",
             "memory_mean_replay_priority",
@@ -485,7 +496,9 @@ def _extract_compact_memory_metrics(memory_dir: Path) -> dict[str, Any]:
         discovered_count = int(connection.execute("SELECT COUNT(*) FROM stable_contingencies").fetchone()[0])
         transformation_families_count = int(connection.execute("SELECT COUNT(*) FROM transformation_families").fetchone()[0])
         family_members_count = int(connection.execute("SELECT COUNT(*) FROM family_members").fetchone()[0])
-        memory_record_count = int(connection.execute("SELECT COUNT(*) FROM memory_nodes WHERE node_type = 'InteractionMemory'").fetchone()[0])
+        compact_memory_node_count = int(connection.execute("SELECT COUNT(*) FROM memory_nodes").fetchone()[0])
+        compact_interaction_memory_count = int(connection.execute("SELECT COUNT(*) FROM memory_nodes WHERE node_type = 'InteractionMemory'").fetchone()[0])
+        compact_memory_score_count = int(connection.execute("SELECT COUNT(*) FROM memory_scores").fetchone()[0])
         memory_score_record_count = int(connection.execute("SELECT COUNT(*) FROM memory_scores WHERE node_id LIKE 'M0:interaction:%'").fetchone()[0])
         high_priority_replay_count = int(connection.execute("SELECT COUNT(*) FROM memory_scores WHERE node_id LIKE 'M0:interaction:%' AND COALESCE(replay_priority, 0.0) >= 0.50").fetchone()[0])
         replay_priority_stats = connection.execute("SELECT AVG(replay_priority), MAX(replay_priority) FROM memory_scores WHERE node_id LIKE 'M0:interaction:%'").fetchone()
@@ -552,7 +565,8 @@ def _extract_compact_memory_metrics(memory_dir: Path) -> dict[str, Any]:
         cross_game_contingency_count = sum(1 for values in games_by_identity.values() if len(values) >= 2)
         cross_sampler_contingency_count = sum(1 for values in samplers_by_identity.values() if len(values) >= 2)
         return {
-            "total_interaction_count": interaction_count if interaction_count > 0 else (memory_record_count or memory_score_record_count or None),
+            "total_interaction_count": interaction_count if interaction_count > 0 else None,
+            "manifest_interaction_count": interaction_count if interaction_count > 0 else None,
             "stable_contingency_count": stable_count,
             "stable_contingencies_count": discovered_count,
             "contingency_candidate_count": discovered_count,
@@ -565,14 +579,17 @@ def _extract_compact_memory_metrics(memory_dir: Path) -> dict[str, Any]:
                 discovered_count == 0
                 and (
                     transformation_families_count > 0
-                    or (memory_record_count or memory_score_record_count or interaction_count) > 0
+                    or (compact_interaction_memory_count or memory_score_record_count or interaction_count) > 0
                 )
             ),
             "per_game_contingency_counts": {str(key): int(value) for key, value in per_game.items()},
             "per_sampler_contingency_counts": {str(key): int(value) for key, value in per_sampler.items()},
             "mean_prediction_accuracy": _mean_or_none(prediction_accuracy_values),
-            "memory_record_count": memory_record_count or memory_score_record_count or None,
+            "memory_record_count": compact_interaction_memory_count or memory_score_record_count or None,
             "memory_score_record_count": memory_score_record_count or None,
+            "compact_memory_node_count": compact_memory_node_count or None,
+            "compact_memory_score_count": compact_memory_score_count or None,
+            "compact_interaction_memory_count": compact_interaction_memory_count or None,
             "memory_replay_candidate_count": replay_queue_count if replay_queue_count is not None else selected_for_replay_edge_count,
             "high_priority_replay_count": high_priority_replay_count,
             "memory_mean_replay_priority": None if replay_priority_stats is None else replay_priority_stats[0],
@@ -664,6 +681,7 @@ def _extract_report_metrics(report: dict[str, Any] | None) -> dict[str, Any]:
     if not runs and validation:
         return {
             "memory_record_count": _coerce_int(validation.get("memory_record_count")),
+            "manifest_interaction_count": _coerce_int(validation.get("total_interaction_count")),
             "prediction_accuracy": _coerce_float(validation.get("prediction_accuracy")),
             "mean_prediction_accuracy": _coerce_float(validation.get("mean_prediction_accuracy")),
             "context_lift": _coerce_float(validation.get("context_lift")),
@@ -702,6 +720,7 @@ def _extract_report_metrics(report: dict[str, Any] | None) -> dict[str, Any]:
 
     return {
         "total_interaction_count": total_interaction_count if runs else _coerce_int(validation.get("total_interaction_count")),
+        "manifest_interaction_count": total_interaction_count if runs else _coerce_int(validation.get("total_interaction_count")),
         "memory_record_count": memory_record_count if runs else _coerce_int(validation.get("memory_record_count")),
         "contingency_candidate_count": _coerce_int(validation.get("contingency_candidate_count")),
         "discovered_contingency_count": (
@@ -826,6 +845,7 @@ def _extract_db_metrics(sqlite_paths: list[Path]) -> dict[str, Any]:
 
     result["tables_seen"] = sorted(tables_seen)
     result["total_interaction_count"] = total_interactions if result["db_paths_inspected"] else None
+    result["manifest_interaction_count"] = total_interactions if result["db_paths_inspected"] else None
     result["contingency_candidate_count"] = contingency_rows if result["db_paths_inspected"] else None
     result["discovered_contingency_count"] = contingency_rows if result["db_paths_inspected"] else None
     result["stable_contingency_count"] = contingency_rows if result["db_paths_inspected"] else None
@@ -957,11 +977,29 @@ def _prediction_metrics_from_prediction_results(connection: sqlite3.Connection) 
 
 
 def _finalize_h01_result(result: dict[str, Any], output_dir: Path) -> None:
+    per_game_counts = dict(result.get("per_game_contingency_counts") or {})
+    per_sampler_counts = dict(result.get("per_sampler_contingency_counts") or {})
+    stable_count = int(result.get("stable_contingency_count") or result.get("stable_contingencies_count") or 0)
+    coverage_attribution_missing = (
+        stable_count > 0
+        and sum(int(value or 0) for value in per_game_counts.values()) <= 0
+        and sum(int(value or 0) for value in per_sampler_counts.values()) <= 0
+    )
+    result["coverage_attribution_missing"] = bool(coverage_attribution_missing)
+    if coverage_attribution_missing:
+        result.setdefault("evidence_diagnostics", {})
+        result["evidence_diagnostics"]["coverage_attribution_missing"] = True
+        if "Contingency attribution by game/sampler is missing from current artifacts." not in result["missing_evidence"]:
+            result["missing_evidence"].append("Contingency attribution by game/sampler is missing from current artifacts.")
     result["core_metrics"] = {
         key: result.get(key)
         for key in (
             "total_interaction_count",
+            "manifest_interaction_count",
             "memory_record_count",
+            "compact_memory_node_count",
+            "compact_memory_score_count",
+            "compact_interaction_memory_count",
             "contingency_candidate_count",
             "discovered_contingency_count",
             "stable_contingency_count",
@@ -975,6 +1013,7 @@ def _finalize_h01_result(result: dict[str, Any], output_dir: Path) -> None:
             "mean_context_lift",
             "cross_game_contingency_count",
             "cross_sampler_contingency_count",
+            "coverage_attribution_missing",
         )
     }
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -996,7 +1035,11 @@ def _format_h01_text(result: dict[str, Any]) -> str:
         "",
         "Core metrics:",
         f"- total interaction count: {_fmt(result.get('total_interaction_count'))}",
+        f"- manifest_interaction_count: {_fmt(result.get('manifest_interaction_count'))}",
         f"- memory_record_count: {_fmt(result.get('memory_record_count'))}",
+        f"- compact_memory_node_count: {_fmt(result.get('compact_memory_node_count'))}",
+        f"- compact_memory_score_count: {_fmt(result.get('compact_memory_score_count'))}",
+        f"- compact_interaction_memory_count: {_fmt(result.get('compact_interaction_memory_count'))}",
         f"- contingency_candidate_count: {_fmt(result.get('contingency_candidate_count'))}",
         f"- discovered_contingency_count: {_fmt(result.get('discovered_contingency_count'))}",
         f"- stable_contingency_count: {_fmt(result.get('stable_contingency_count'))}",
@@ -1016,6 +1059,7 @@ def _format_h01_text(result: dict[str, Any]) -> str:
         f"- cross-sampler contingency count: {_fmt(result.get('cross_sampler_contingency_count'))}",
         f"- percentage of games with at least one stable contingency: {_fmt(result.get('percentage_games_with_stable_contingency'))}",
         f"- percentage of samplers with at least one stable contingency: {_fmt(result.get('percentage_samplers_with_stable_contingency'))}",
+        f"- coverage attribution missing: {_fmt(result.get('coverage_attribution_missing'))}",
         "",
         "Evidence for:",
     ]

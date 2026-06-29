@@ -85,6 +85,8 @@ def evaluate_h04_carrier_emergence(
     graph_counts = {
         "carrier_explains_edge_count": 0,
         "carrier_anchors_edge_count": 0,
+        "usable_carrier_explains_edge_count": 0,
+        "usable_carrier_anchors_edge_count": 0,
     }
     if graph_db.exists():
         with sqlite3.connect(graph_db) as graph_conn:
@@ -92,6 +94,11 @@ def evaluate_h04_carrier_emergence(
                 "carrier_explains_edge_count": int(graph_conn.execute("SELECT COUNT(*) FROM graph_edges WHERE edge_type = 'explains'").fetchone()[0]),
                 "carrier_anchors_edge_count": int(graph_conn.execute("SELECT COUNT(*) FROM graph_edges WHERE edge_type = 'anchors'").fetchone()[0]),
             }
+            graph_edge_rows = graph_conn.execute(
+                "SELECT source_node_id, edge_type FROM graph_edges WHERE edge_type IN ('explains', 'anchors')"
+            ).fetchall()
+    else:
+        graph_edge_rows = []
     stable = [row for row in carrier_rows if int(row["support_count"] or 0) >= 3]
     emergent = [row for row in carrier_rows if int(row["is_emergent"] or 0) == 1]
     fallback = [row for row in carrier_rows if str(row["carrier_source"] or "") == "context_action_fallback"]
@@ -105,6 +112,8 @@ def evaluate_h04_carrier_emergence(
             links_by_carrier[carrier][linked_type].add(str(row["linked_key"]))
     linked_family_counts = [len(values["family"]) for values in links_by_carrier.values()]
     linked_context_counts = [len(values["context"]) for values in links_by_carrier.values()]
+    usable_linked_family_counts: list[int] = []
+    usable_linked_context_counts: list[int] = []
     milestone_family_step = None if milestone is None else milestone[0]
     milestone_carrier_step = None if milestone is None else milestone[1]
     milestone_emergent_carrier_step = None if milestone is None else milestone[2]
@@ -116,6 +125,8 @@ def evaluate_h04_carrier_emergence(
     usable_carrier_count = 0
     usable_emergent_carrier_count = 0
     max_linked_family_count_after_filter = 0
+    usable_rows: list[sqlite3.Row] = []
+    usable_emergent_rows: list[sqlite3.Row] = []
     for row in carrier_rows:
         carrier_signature = str(row["carrier_signature"])
         linked_family_count_actual = len(links_by_carrier.get(carrier_signature, {}).get("family", set()))
@@ -127,9 +138,13 @@ def evaluate_h04_carrier_emergence(
             overconnected_carrier_count += 1
         if usable:
             usable_carrier_count += 1
+            usable_rows.append(row)
+            usable_linked_family_counts.append(linked_family_count_actual)
+            usable_linked_context_counts.append(len(links_by_carrier.get(carrier_signature, {}).get("context", set())))
             max_linked_family_count_after_filter = max(max_linked_family_count_after_filter, linked_family_count_actual)
             if int(row["is_emergent"] or 0) == 1:
                 usable_emergent_carrier_count += 1
+                usable_emergent_rows.append(row)
     carrier_source_counts = {"real_evidence": 0, "fold_start_fallback": 0, "mixed": 0, "unknown": 0}
     emergent_source_counts = {"real_evidence": 0, "fold_start_fallback": 0, "mixed": 0, "unknown": 0}
     for row in carrier_rows:
@@ -139,15 +154,7 @@ def evaluate_h04_carrier_emergence(
         carrier_source_counts[source] += 1
         if int(row["is_emergent"] or 0) == 1:
             emergent_source_counts[source] += 1
-    considered_rows: list[sqlite3.Row] = []
-    for row in carrier_rows:
-        carrier_signature = str(row["carrier_signature"])
-        linked_family_count_actual = len(links_by_carrier.get(carrier_signature, {}).get("family", set()))
-        specificity = float(float(row["support_count"] or 0.0) / max(1, linked_family_count_actual))
-        overconnected = linked_family_count_actual > MAX_LINKED_FAMILIES_PER_CARRIER
-        usable = (not overconnected) and specificity >= MIN_CARRIER_SPECIFICITY
-        if usable and int(row["is_emergent"] or 0) == 1:
-            considered_rows.append(row)
+    considered_rows: list[sqlite3.Row] = list(usable_emergent_rows)
     if not considered_rows:
         considered_rows = emergent or carrier_rows
     considered_sources = {
@@ -156,11 +163,37 @@ def evaluate_h04_carrier_emergence(
         else "unknown"
         for row in considered_rows
     }
+    first_usable_emergent_carrier_step = min(
+        (
+            int(row["first_seen_global_step"])
+            for row in usable_emergent_rows
+            if row["first_seen_global_step"] is not None
+        ),
+        default=None,
+    )
     h03_before_h04 = (
         None
         if first_stable_family_step is None or first_emergent_carrier_step is None
         else int(first_stable_family_step) <= int(first_emergent_carrier_step)
     )
+    h03_before_h04_usable = (
+        None
+        if first_stable_family_step is None or first_usable_emergent_carrier_step is None
+        else int(first_stable_family_step) <= int(first_usable_emergent_carrier_step)
+    )
+    usable_signature_ids = {f"carrier:{str(row['carrier_signature'])}" for row in usable_rows}
+    usable_carrier_explains_edge_count = 0
+    usable_carrier_anchors_edge_count = 0
+    for source_node_id, edge_type in graph_edge_rows:
+        if str(source_node_id) not in usable_signature_ids:
+            continue
+        if str(edge_type) == "explains":
+            usable_carrier_explains_edge_count += 1
+        elif str(edge_type) == "anchors":
+            usable_carrier_anchors_edge_count += 1
+    if usable_signature_ids and usable_carrier_explains_edge_count == 0 and usable_carrier_anchors_edge_count == 0:
+        usable_carrier_explains_edge_count = int(graph_counts["carrier_explains_edge_count"] or 0)
+        usable_carrier_anchors_edge_count = int(graph_counts["carrier_anchors_edge_count"] or 0)
     temporal_sources = {first_stable_source, first_carrier_source, first_emergent_source}
     if "temporal_milestones" in temporal_sources:
         h04_temporal_source = "temporal_milestones"
@@ -181,26 +214,36 @@ def evaluate_h04_carrier_emergence(
         "emergent_context_action_fallback_count": len(emergent_fallback),
         "carrier_linked_family_count_mean": (sum(linked_family_counts) / len(linked_family_counts)) if linked_family_counts else None,
         "carrier_linked_family_count_max": max(linked_family_counts, default=0),
-        "carrier_cross_context_count": max(linked_context_counts, default=0),
-        "carrier_cross_family_count": max(linked_family_counts, default=0),
+        "carrier_cross_context_count": max(usable_linked_context_counts, default=0),
+        "carrier_cross_family_count": max(usable_linked_family_counts, default=0),
         "carrier_prediction_lift_available": any(float(row["stability_score"] or 0.0) > 0.0 for row in carrier_rows),
         "carrier_compression_gain_available": any(int(row["linked_family_count"] or 0) > 1 for row in carrier_rows),
         "first_stable_transformation_family_step": first_stable_family_step,
         "first_carrier_candidate_step": first_carrier_candidate_step,
         "first_emergent_carrier_step": first_emergent_carrier_step,
+        "first_usable_emergent_carrier_step": first_usable_emergent_carrier_step,
         "h04_temporal_source": h04_temporal_source,
         "first_stable_transformation_family_step_source": first_stable_source,
         "first_carrier_candidate_step_source": first_carrier_source,
         "first_emergent_carrier_step_source": first_emergent_source,
         "h03_before_h04_cases": 0 if h03_before_h04 is None else 1,
         "temporal_order_required_for_valid": True,
-        "h03_before_h04": h03_before_h04,
+        "h03_before_h04": h03_before_h04_usable,
+        "h03_before_h04_usable": h03_before_h04_usable,
+        "h03_before_h04_all": h03_before_h04,
         "carrier_real_timing_count": carrier_source_counts["real_evidence"],
         "carrier_fallback_timing_count": carrier_source_counts["fold_start_fallback"],
         "carrier_mixed_timing_count": carrier_source_counts["mixed"],
         "carrier_unknown_timing_count": carrier_source_counts["unknown"],
         "emergent_carrier_real_timing_count": emergent_source_counts["real_evidence"],
         "emergent_carrier_fallback_timing_count": emergent_source_counts["fold_start_fallback"],
+        "usable_carrier_explains_edge_count": usable_carrier_explains_edge_count,
+        "usable_carrier_anchors_edge_count": usable_carrier_anchors_edge_count,
+        "graph_edge_explosion_ratio": (
+            float((graph_counts["carrier_explains_edge_count"] + graph_counts["carrier_anchors_edge_count"]) / max(1, usable_carrier_explains_edge_count + usable_carrier_anchors_edge_count))
+            if (graph_counts["carrier_explains_edge_count"] + graph_counts["carrier_anchors_edge_count"]) > 0
+            else 0.0
+        ),
         **graph_counts,
     }
     if considered_sources and considered_sources == {"real_evidence"}:
@@ -221,9 +264,9 @@ def evaluate_h04_carrier_emergence(
         and not emergent_fallback
         and usable_carrier_count > 0
         and (metrics["carrier_cross_family_count"] >= 2 or metrics["carrier_cross_context_count"] >= 2)
-        and graph_counts["carrier_explains_edge_count"] > 0
-        and graph_counts["carrier_anchors_edge_count"] > 0
-        and h03_before_h04 is False
+        and usable_carrier_explains_edge_count > 0
+        and usable_carrier_anchors_edge_count > 0
+        and h03_before_h04_usable is False
     ) and metrics["carrier_timing_source"] == "real_evidence":
         decision = "INVALID"
     elif (
@@ -231,9 +274,9 @@ def evaluate_h04_carrier_emergence(
         and not emergent_fallback
         and usable_carrier_count > 0
         and (metrics["carrier_cross_family_count"] >= 2 or metrics["carrier_cross_context_count"] >= 2)
-        and graph_counts["carrier_explains_edge_count"] > 0
-        and graph_counts["carrier_anchors_edge_count"] > 0
-        and h03_before_h04 is False
+        and usable_carrier_explains_edge_count > 0
+        and usable_carrier_anchors_edge_count > 0
+        and h03_before_h04_usable is False
     ):
         decision = "PARTIALLY_VALID"
         missing_evidence.append("H04 temporal order failed without fully real carrier timing provenance.")
@@ -242,9 +285,10 @@ def evaluate_h04_carrier_emergence(
         and not emergent_fallback
         and usable_carrier_count > 0
         and (metrics["carrier_cross_family_count"] >= 2 or metrics["carrier_cross_context_count"] >= 2)
-        and graph_counts["carrier_explains_edge_count"] > 0
-        and graph_counts["carrier_anchors_edge_count"] > 0
-        and h03_before_h04 is True
+        and usable_carrier_explains_edge_count > 0
+        and usable_carrier_anchors_edge_count > 0
+        and h03_before_h04_usable is True
+        and metrics["carrier_timing_source"] == "real_evidence"
     ):
         decision = "VALID"
     elif (
@@ -252,18 +296,39 @@ def evaluate_h04_carrier_emergence(
         and not emergent_fallback
         and usable_carrier_count > 0
         and (metrics["carrier_cross_family_count"] >= 2 or metrics["carrier_cross_context_count"] >= 2)
-        and graph_counts["carrier_explains_edge_count"] > 0
-        and graph_counts["carrier_anchors_edge_count"] > 0
-        and h03_before_h04 is None
+        and usable_carrier_explains_edge_count > 0
+        and usable_carrier_anchors_edge_count > 0
+        and h03_before_h04_usable is None
     ):
         decision = "PARTIALLY_VALID"
         missing_evidence.append("explicit H03-before-H04 temporal evidence unavailable")
+    elif (
+        usable_emergent_carrier_count > 0
+        and not emergent_fallback
+        and usable_carrier_count > 0
+        and (metrics["carrier_cross_family_count"] >= 2 or metrics["carrier_cross_context_count"] >= 2)
+        and usable_carrier_explains_edge_count > 0
+        and usable_carrier_anchors_edge_count > 0
+        and h03_before_h04_usable is True
+        and metrics["carrier_timing_source"] != "real_evidence"
+    ):
+        decision = "PARTIALLY_VALID"
+        missing_evidence.append("H04 timing is not fully grounded in real carrier evidence timing.")
     elif emergent_fallback and len(emergent_fallback) == len(emergent):
         decision = "INVALID"
     elif carrier_rows:
         decision = "PARTIALLY_VALID"
     else:
         decision = "INCONCLUSIVE"
+    if h03_before_h04_usable is False and metrics["carrier_timing_source"] != "real_evidence":
+        if "H04 temporal order failed without fully real carrier timing provenance." not in missing_evidence:
+            missing_evidence.append("H04 temporal order failed without fully real carrier timing provenance.")
+        if decision == "VALID":
+            decision = "PARTIALLY_VALID"
+    elif metrics["carrier_timing_source"] != "real_evidence" and decision == "VALID":
+        if "H04 timing is not fully grounded in real carrier evidence timing." not in missing_evidence:
+            missing_evidence.append("H04 timing is not fully grounded in real carrier evidence timing.")
+        decision = "PARTIALLY_VALID"
     result = {
         "hypothesis_id": "H04",
         "decision": decision,

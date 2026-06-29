@@ -11825,6 +11825,27 @@ def test_h01_uses_compact_memory_record_count_when_raw_zero(tmp_path: Path) -> N
         conn.commit()
     result = evaluate_h01_contingency_emergence(run_dir, tmp_path / "out_h01", memory_dir=memory_dir)
     assert result["memory_record_count"] == 2
+    assert result["compact_interaction_memory_count"] == 2
+    assert result["manifest_interaction_count"] == 10
+
+
+def test_h01_reports_coverage_attribution_missing_when_stable_exists_without_game_sampler_counts(tmp_path: Path) -> None:
+    from v6.hypothesis_h01_report import _finalize_h01_result
+
+    result = {
+        "hypothesis_id": "H01",
+        "hypothesis_statement": "x",
+        "decision": "PARTIALLY_VALID",
+        "stable_contingency_count": 3,
+        "stable_contingencies_count": 3,
+        "per_game_contingency_counts": {},
+        "per_sampler_contingency_counts": {},
+        "missing_evidence": [],
+        "evidence_diagnostics": {},
+    }
+    _finalize_h01_result(result, tmp_path / "h01_attr")
+    assert result["coverage_attribution_missing"] is True
+    assert "Contingency attribution by game/sampler is missing from current artifacts." in result["missing_evidence"]
 
 
 def test_h01_derives_prediction_accuracy_and_context_lift_from_prediction_results(tmp_path: Path) -> None:
@@ -12628,6 +12649,8 @@ def test_h04_uses_compact_temporal_fallback(tmp_path: Path) -> None:
     result = evaluate_h04_carrier_emergence(run_dir=None, memory_dir=memory_dir, output_dir=tmp_path / "h04")
     assert result["core_metrics"]["h04_temporal_source"] == "compact_table_fallback"
     assert result["core_metrics"]["h03_before_h04"] is True
+    assert result["core_metrics"]["h03_before_h04_usable"] is True
+    assert result["core_metrics"]["first_usable_emergent_carrier_step"] == 7
 
 
 def test_h04_blocker_reads_temporal_order_from_core_metrics() -> None:
@@ -12740,6 +12763,31 @@ def test_h04_overconnected_carrier_is_not_usable(tmp_path: Path) -> None:
     assert result["core_metrics"]["overconnected_carrier_count"] == 1
     assert result["core_metrics"]["usable_carrier_count"] == 0
     assert result["decision"] != "VALID"
+
+
+def test_h04_uses_usable_emergent_carrier_timing_for_decision(tmp_path: Path) -> None:
+    from v6.hypothesis_h04_report import evaluate_h04_carrier_emergence
+
+    memory_dir = tmp_path / "memory_h04_usable"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute("INSERT INTO transformation_families (family_id, canonical_signature, support_count, member_count, first_seen_global_step, last_seen_global_step, stability_score) VALUES (1,'fam1',4,2,10,12,0.7)")
+        conn.execute("INSERT INTO carrier_candidates (carrier_id, carrier_signature, carrier_source, support_count, linked_family_count, first_seen_global_step, last_seen_global_step, carrier_timing_source, stability_score, is_emergent) VALUES ('bad','carrier_bad','object',5,200,7,8,'real_evidence',0.8,1)")
+        conn.execute("INSERT INTO carrier_candidates (carrier_id, carrier_signature, carrier_source, support_count, linked_family_count, first_seen_global_step, last_seen_global_step, carrier_timing_source, stability_score, is_emergent) VALUES ('good','carrier_good','object',5,2,14,15,'real_evidence',0.8,1)")
+        for idx in range(200):
+            conn.execute("INSERT INTO carrier_links (carrier_signature, linked_type, linked_key, support_count, first_seen_global_step, last_seen_global_step) VALUES ('carrier_bad','family',?,1,7,8)", (f'fam{idx}',))
+        conn.execute("INSERT INTO carrier_links (carrier_signature, linked_type, linked_key, support_count, first_seen_global_step, last_seen_global_step) VALUES ('carrier_good','family','fam1',1,14,15)")
+        conn.execute("INSERT INTO carrier_links (carrier_signature, linked_type, linked_key, support_count, first_seen_global_step, last_seen_global_step) VALUES ('carrier_good','context','ctx1',1,14,15)")
+        conn.execute("INSERT INTO carrier_links (carrier_signature, linked_type, linked_key, support_count, first_seen_global_step, last_seen_global_step) VALUES ('carrier_good','context','ctx2',1,14,15)")
+        conn.commit()
+    with sqlite3.connect(memory_dir / "graph.sqlite") as conn:
+        conn.execute("INSERT INTO graph_edges (edge_id, source_node_id, target_node_id, edge_type, first_seen_global_step, last_seen_global_step, support_count, weight) VALUES ('g1','carrier:carrier_good','b','explains',1,1,1,1.0)")
+        conn.execute("INSERT INTO graph_edges (edge_id, source_node_id, target_node_id, edge_type, first_seen_global_step, last_seen_global_step, support_count, weight) VALUES ('g2','carrier:carrier_good','b','anchors',1,1,1,1.0)")
+        conn.commit()
+    result = evaluate_h04_carrier_emergence(run_dir=None, memory_dir=memory_dir, output_dir=tmp_path / "h04_usable")
+    assert result["h03_before_h04_all"] is False
+    assert result["h03_before_h04_usable"] is True
+    assert result["decision"] == "VALID"
 
 
 def test_h08_candidate_proxy_only_is_insufficient_evidence(tmp_path: Path) -> None:
@@ -13508,6 +13556,26 @@ def test_role_timing_fallback_cannot_make_h05_valid(tmp_path: Path) -> None:
     result = evaluate_h05_role_emergence(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h05_fallback_role", already_derived=True)
     assert result["role_timing_source"] == "fold_start_fallback"
     assert result["decision"] != "VALID"
+    assert "Role timing is not fully grounded in real carrier evidence timing." in result["missing_evidence"]
+
+
+def test_h05_overconnected_roles_do_not_make_validity(tmp_path: Path) -> None:
+    from v6.hypothesis_h05_report import evaluate_h05_role_emergence
+
+    memory_dir = tmp_path / "memory_h05_overconnected"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute("INSERT INTO carrier_candidates (carrier_id, carrier_signature, carrier_source, support_count, linked_family_count, first_seen_global_step, last_seen_global_step, carrier_timing_source, stability_score, is_emergent) VALUES ('c1','carrier1','object',5,2,7,8,'real_evidence',0.8,1)")
+        conn.execute("INSERT INTO temporal_milestones (game, sampler, seed, first_emergent_carrier_step) VALUES ('g','s',0,7)")
+        conn.execute("INSERT INTO role_candidates (role_signature, role_type, support_count, linked_carrier_count, linked_family_count, linked_context_count, cross_game_count, cross_context_count, first_seen_global_step, last_seen_global_step, role_stability_score, is_emergent) VALUES ('r1','role',5,101,1,2,1,2,11,12,0.8,1)")
+        conn.execute("INSERT INTO higher_order_milestones (milestone_name, first_global_step, evidence_key) VALUES ('first_role_candidate_step', 11, 'r1')")
+        conn.execute("INSERT INTO higher_order_milestones (milestone_name, first_global_step, evidence_key) VALUES ('first_emergent_role_step', 11, 'r1')")
+        conn.execute("INSERT INTO role_links (role_signature, linked_type, linked_key, support_count, first_seen_global_step, last_seen_global_step) VALUES ('r1', 'carrier', 'carrier1', 1, 11, 12)")
+        conn.commit()
+    result = evaluate_h05_role_emergence(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h05_overconnected", already_derived=True)
+    assert result["overconnected_role_count"] == 1
+    assert result["usable_emergent_role_count"] == 0
+    assert result["decision"] != "VALID"
 
 
 def test_h05_can_be_valid_only_with_real_role_timing_and_true_temporal_order(tmp_path: Path) -> None:
@@ -13561,6 +13629,38 @@ def test_h12_reconstructs_trajectory_rows_from_compact_events_after_raw_cleanup(
     assert result["compact_trajectory_rows"] == 4
     assert result["reconstructed_trajectory_rows"] == 2
     assert result["blocked_by_missing_trajectory_evidence"] is False
+
+
+def test_h12_sets_not_improving_flag_and_caps_decision(tmp_path: Path) -> None:
+    from v6.evaluation.h12_efficiency_emergence import evaluate_h12_efficiency_emergence
+
+    memory_dir = tmp_path / "memory_h12_not_improving"
+    ensure_memory_layout(memory_dir)
+    efficiency_root = tmp_path / "efficiency"
+    efficiency_root.mkdir(parents=True, exist_ok=True)
+    (efficiency_root / "trajectory_efficiency_state.json").write_text(
+        json.dumps({"mean_normalized_solve_efficiency": 0.9}),
+        encoding="utf-8",
+    )
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute(
+            """
+            INSERT INTO trajectory_efficiency (
+                trajectory_id, game_id, level_id, sampler, seed, epoch, outcome_class, comparable_outcome_group_id,
+                efficiency_active, success, terminal, trajectory_length, steps_to_success, best_known_solution_length,
+                normalized_solve_efficiency, future_option_gain, future_option_gain_per_action, equivalent_outcome_cost_gap,
+                loop_count, loop_ratio, repeated_state_count, repeated_state_ratio, blocked_action_count, blocked_action_ratio,
+                wasted_action_count, wasted_action_ratio, unique_state_count, efficiency_score,
+                efficiency_memory_bonus, efficiency_replay_bonus, efficiency_retention_bonus, efficiency_promotion_bonus
+            ) VALUES
+            ('t1','g','l','s',0,1,'WIN','grp',1,1,1,10,10,8,0.8,0.0,0.0,2.0,0,0.0,0,0.0,0,0.0,0,0.0,10,0.8,0.1,0.1,0.0,0.0),
+            ('t2','g','l','s',0,1,'WIN','grp',1,1,1,10,10,8,0.8,0.0,0.0,2.0,0,0.0,0,0.0,0,0.0,0,0.0,10,0.8,0.1,0.1,0.0,0.0)
+            """
+        )
+        conn.commit()
+    result = evaluate_h12_efficiency_emergence(run_dir=tmp_path / "run_h12_not_improving", memory_dir=memory_dir, output_dir=tmp_path / "h12_not_improving")
+    assert result["h12_efficiency_not_improving"] is True
+    assert result["decision"] == "PARTIALLY_VALID"
 
 
 def test_is_retryable_fold_error_matches_locked_busy_variants() -> None:

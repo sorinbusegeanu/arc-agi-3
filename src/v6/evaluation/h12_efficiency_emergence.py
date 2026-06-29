@@ -74,6 +74,11 @@ def evaluate_h12_efficiency_emergence(
             if previous_epoch_mean is None or current_mean_norm is None
             else float(current_mean_norm) > float(previous_epoch_mean)
         ),
+        "h12_efficiency_not_improving": (
+            previous_epoch_mean is not None
+            and current_mean_norm is not None
+            and not (float(current_mean_norm) > float(previous_epoch_mean))
+        ),
         "raw_trajectory_rows": int(reconstruction.get("raw_trajectory_rows", 0) or 0),
         "compact_trajectory_rows": int(reconstruction.get("compact_trajectory_rows", 0) or 0),
         "reconstructed_trajectory_rows": int(reconstruction.get("reconstructed_trajectory_rows", 0) or 0),
@@ -107,6 +112,15 @@ def evaluate_h12_efficiency_emergence(
         result["decision"] = "VALID"
     else:
         result["decision"] = "PARTIALLY_VALID"
+    if result["h12_efficiency_not_improving"] and result["decision"] == "VALID":
+        result["decision"] = "PARTIALLY_VALID"
+    if result["h12_efficiency_not_improving"]:
+        result["missing_evidence"] = list(
+            dict.fromkeys(
+                list(result.get("missing_evidence", []))
+                + ["Trajectory efficiency evidence exists but is not improving versus the previous epoch."]
+            )
+        )
     state_payload = {
         "mean_normalized_solve_efficiency": result.get("mean_normalized_solve_efficiency"),
         "best_known_solution_count": result.get("best_known_solution_count"),
@@ -137,6 +151,7 @@ def evaluate_h12_efficiency_emergence(
             "cost_gap_replay_priority_correlation",
             "future_option_gain_per_action_correlation",
             "efficiency_improved_vs_previous_epoch",
+            "h12_efficiency_not_improving",
             "raw_trajectory_rows",
             "compact_trajectory_rows",
             "reconstructed_trajectory_rows",

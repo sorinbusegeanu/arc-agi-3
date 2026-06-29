@@ -8,6 +8,8 @@ from typing import Any
 from v6.higher_order_substrate import derive_role_candidates_only
 from v6.memory.compact_memory import ensure_memory_layout
 
+MAX_CARRIERS_PER_ROLE_FOR_VALIDITY = 100
+
 def _resolve_temporal_value(primary: Any, fallback: Any) -> tuple[int | None, str]:
     if primary is not None:
         return int(primary), "temporal_milestones"
@@ -78,6 +80,14 @@ def evaluate_h05_role_emergence(
     )
     max_carriers_per_role = max((int(row["linked_carrier_count"] or 0) for row in role_rows), default=0)
     singleton_role_ratio = float(singleton_role_count / role_candidate_count) if role_candidate_count else None
+    overconnected_role_count = sum(1 for row in role_rows if int(row["linked_carrier_count"] or 0) > MAX_CARRIERS_PER_ROLE_FOR_VALIDITY)
+    usable_role_rows = [row for row in role_rows if int(row["linked_carrier_count"] or 0) <= MAX_CARRIERS_PER_ROLE_FOR_VALIDITY]
+    usable_emergent_role_rows = [row for row in usable_role_rows if int(row["is_emergent"] or 0) == 1]
+    usable_role_count = len(usable_role_rows)
+    usable_emergent_role_count = len(usable_emergent_role_rows)
+    usable_multi_carrier_role_count = sum(1 for row in usable_role_rows if int(row["linked_carrier_count"] or 0) >= 2)
+    usable_cross_context_role_count = sum(1 for row in usable_role_rows if int(row["cross_context_count"] or 0) >= 2)
+    usable_cross_game_role_count = sum(1 for row in usable_role_rows if int(row["cross_game_count"] or 0) >= 2)
     h04_first, first_emergent_carrier_step_source = _resolve_temporal_value(milestone_h04_first, fallback_h04_first)
     first_role_candidate_step, first_role_candidate_step_source = _resolve_temporal_value(
         milestone_map.get("first_role_candidate_step"),
@@ -106,7 +116,7 @@ def evaluate_h05_role_emergence(
         carrier_sources_by_role.setdefault(str(row["role_signature"]), []).append(source)
     role_source_counts = {"real_evidence": 0, "fold_start_fallback": 0, "mixed": 0, "unknown": 0}
     considered_role_sources: set[str] = set()
-    for row in role_rows:
+    for row in usable_emergent_role_rows:
         if int(row["is_emergent"] or 0) != 1:
             continue
         sources = carrier_sources_by_role.get(str(row["role_signature"]), [])
@@ -150,6 +160,9 @@ def evaluate_h05_role_emergence(
         "role_candidate_count": role_candidate_count,
         "emergent_role_count": emergent_role_count,
         "stable_role_count": stable_role_count,
+        "overconnected_role_count": overconnected_role_count,
+        "usable_role_count": usable_role_count,
+        "usable_emergent_role_count": usable_emergent_role_count,
         "singleton_role_count": singleton_role_count,
         "singleton_role_ratio": singleton_role_ratio,
         "multi_carrier_role_count": multi_carrier_role_count,
@@ -180,24 +193,24 @@ def evaluate_h05_role_emergence(
         decision = "INVALID"
         missing = ["emergent carriers present but no role candidates"]
     elif (
-        emergent_role_count >= 1
-        and multi_carrier_role_count >= 1
-        and (cross_context_role_count >= 1 or cross_game_role_count >= 1)
+        usable_emergent_role_count >= 1
+        and usable_multi_carrier_role_count >= 1
+        and (usable_cross_context_role_count >= 1 or usable_cross_game_role_count >= 1)
         and (singleton_role_ratio is None or singleton_role_ratio <= 0.75)
         and h04_before_h05 is False
         and role_timing_source == "real_evidence"
     ):
         decision = "INVALID"
         missing = []
-    elif emergent_role_count >= 1 and multi_carrier_role_count >= 1 and (cross_context_role_count >= 1 or cross_game_role_count >= 1) and (singleton_role_ratio is None or singleton_role_ratio <= 0.75) and (
+    elif usable_emergent_role_count >= 1 and usable_multi_carrier_role_count >= 1 and (usable_cross_context_role_count >= 1 or usable_cross_game_role_count >= 1) and (singleton_role_ratio is None or singleton_role_ratio <= 0.75) and (
         h04_before_h05 is True
     ) and role_timing_source == "real_evidence":
         decision = "VALID"
         missing = []
     elif (
-        emergent_role_count >= 1
-        and multi_carrier_role_count >= 1
-        and (cross_context_role_count >= 1 or cross_game_role_count >= 1)
+        usable_emergent_role_count >= 1
+        and usable_multi_carrier_role_count >= 1
+        and (usable_cross_context_role_count >= 1 or usable_cross_game_role_count >= 1)
         and (singleton_role_ratio is None or singleton_role_ratio <= 0.75)
         and h04_before_h05 is None
     ):
