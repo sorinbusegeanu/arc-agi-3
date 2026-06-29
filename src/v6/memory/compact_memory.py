@@ -4067,16 +4067,26 @@ def _ensure_current_state_schema(path: Path) -> None:
             ON carrier_links(carrier_signature, linked_type, linked_key);
             CREATE INDEX IF NOT EXISTS idx_carrier_links_carrier_type_key
             ON carrier_links(carrier_signature, linked_type, linked_key);
+            CREATE INDEX IF NOT EXISTS idx_carrier_links_type_key
+            ON carrier_links(linked_type, linked_key);
             CREATE INDEX IF NOT EXISTS idx_role_neighborhood_carrier_signature
             ON role_neighborhood_signatures(carrier_signature);
             CREATE INDEX IF NOT EXISTS idx_role_neighborhood_carrier
             ON role_neighborhood_signatures(carrier_signature);
+            CREATE INDEX IF NOT EXISTS idx_role_neighborhood_role
+            ON role_neighborhood_signatures(role_signature);
+            CREATE INDEX IF NOT EXISTS idx_role_links_signature_type_key
+            ON role_links(role_signature, linked_type, linked_key);
             CREATE INDEX IF NOT EXISTS idx_role_transfer_role
             ON role_transfer_attempts(role_signature);
+            CREATE INDEX IF NOT EXISTS idx_role_transfer_kind_scope
+            ON role_transfer_attempts(transfer_kind, target_scope_key);
             CREATE INDEX IF NOT EXISTS idx_role_transfer_success
             ON role_transfer_attempts(reuse_success, transfer_kind);
             CREATE INDEX IF NOT EXISTS idx_concept_links_type_key
             ON concept_links(linked_type, linked_key);
+            CREATE INDEX IF NOT EXISTS idx_concept_links_signature_type_key
+            ON concept_links(concept_signature, linked_type, linked_key);
             CREATE INDEX IF NOT EXISTS idx_world_model_links_type_key
             ON world_model_links(linked_type, linked_key);
             CREATE INDEX IF NOT EXISTS idx_future_option_events_owner
@@ -4087,10 +4097,14 @@ def _ensure_current_state_schema(path: Path) -> None:
             ON future_option_motifs(is_emergent, motif_type);
             CREATE INDEX IF NOT EXISTS idx_future_option_links_type_key
             ON future_option_links(linked_type, linked_key);
+            CREATE INDEX IF NOT EXISTS idx_future_option_links_motif_type_key
+            ON future_option_links(motif_signature, linked_type, linked_key);
             CREATE INDEX IF NOT EXISTS idx_future_option_attention_flags
             ON future_option_attention_links(high_option_change, high_attention);
             CREATE INDEX IF NOT EXISTS idx_future_option_transfer_motif
             ON future_option_transfer_links(motif_signature);
+            CREATE INDEX IF NOT EXISTS idx_trajectory_efficiency_scope
+            ON trajectory_efficiency(game_id, level_id, sampler, seed, epoch);
             """
         )
         _ensure_column(connection, "stable_contingencies", "context_level", "INTEGER DEFAULT 0")
@@ -4178,6 +4192,8 @@ def _ensure_graph_schema(path: Path) -> None:
             ON graph_edges(target_node_id);
             CREATE INDEX IF NOT EXISTS idx_graph_edges_type_target
             ON graph_edges(edge_type, target_node_id);
+            CREATE INDEX IF NOT EXISTS idx_graph_edges_type_source
+            ON graph_edges(edge_type, source_node_id);
             """
         )
         connection.commit()

@@ -58,6 +58,10 @@ def evaluate_h06_role_transfer(
             """
         ).fetchall()
         milestone_map = dict(conn.execute("SELECT milestone_name, first_global_step FROM higher_order_milestones").fetchall())
+        transfer_summary_row = conn.execute(
+            "SELECT value_json FROM memory_summary WHERE key = 'higher_order_transfer_summary'"
+        ).fetchone()
+        transfer_summary = json.loads(str(transfer_summary_row[0])) if transfer_summary_row and transfer_summary_row[0] else {}
     success_rows = [row for row in rows if int(row["reuse_success"] or 0) == 1]
     cross_game_rows = [row for row in rows if str(row["transfer_kind"]) == "cross_game"]
     cross_context_rows = [row for row in rows if str(row["transfer_kind"]) == "cross_context"]
@@ -82,6 +86,14 @@ def evaluate_h06_role_transfer(
     candidate_role_counts = [int(row["candidate_role_count"] or 0) for row in rows]
     metrics = {
         "transfer_attempt_count": transfer_attempt_count,
+        "total_possible_transfer_attempts": transfer_summary.get("total_possible_transfer_attempts", len(rows)),
+        "sampled_transfer_attempts": transfer_summary.get("sampled_transfer_attempts", transfer_attempt_count),
+        "skipped_by_cap_count": transfer_summary.get("skipped_by_cap_count", 0),
+        "sampled_cross_game_attempt_count": transfer_summary.get("sampled_cross_game_attempt_count", len(cross_game_rows)),
+        "sampled_cross_context_attempt_count": transfer_summary.get("sampled_cross_context_attempt_count", len(cross_context_rows)),
+        "transfer_sampling_strategy": transfer_summary.get("transfer_sampling_strategy", "persisted_role_transfer_attempts"),
+        "max_attempts_per_role": transfer_summary.get("max_attempts_per_role"),
+        "max_attempts_per_target_scope": transfer_summary.get("max_attempts_per_target_scope"),
         "successful_transfer_count": successful_transfer_count,
         "transfer_success_rate": transfer_success_rate,
         "cross_game_attempt_count": len(cross_game_rows),
@@ -148,6 +160,12 @@ def _write_outputs(output_dir: Path, result: dict[str, Any]) -> None:
     text = (
         f"H06 decision: {result.get('decision')}\n"
         f"transfer attempts: {result.get('transfer_attempt_count')}\n"
+        f"total possible transfer attempts: {result.get('total_possible_transfer_attempts')}\n"
+        f"sampled transfer attempts: {result.get('sampled_transfer_attempts')}\n"
+        f"skipped by cap count: {result.get('skipped_by_cap_count')}\n"
+        f"sampled cross-game attempts: {result.get('sampled_cross_game_attempt_count')}\n"
+        f"sampled cross-context attempts: {result.get('sampled_cross_context_attempt_count')}\n"
+        f"transfer sampling strategy: {result.get('transfer_sampling_strategy')}\n"
         f"successful transfers: {result.get('successful_transfer_count')}\n"
         f"transfer success rate: {result.get('transfer_success_rate')}\n"
         f"role mismatch count: {result.get('role_mismatch_count')}\n"

@@ -6,7 +6,6 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from v6.higher_order_substrate import derive_higher_order_memory
 from v6.future_options import derive_future_option_memory
 from v6.memory.compact_memory import ensure_memory_layout
 
@@ -21,13 +20,18 @@ def evaluate_h09_future_option_motifs(
     output_dir.mkdir(parents=True, exist_ok=True)
     ensure_memory_layout(memory_dir)
     if not already_derived:
-        derive_higher_order_memory(memory_dir=memory_dir, run_dir=run_dir)
         derive_future_option_memory(memory_dir=memory_dir, run_dir=run_dir)
     with sqlite3.connect(Path(memory_dir) / "current_state.sqlite") as conn:
         conn.row_factory = sqlite3.Row
         events = [dict(row) for row in conn.execute("SELECT * FROM future_option_events ORDER BY event_id ASC").fetchall()]
         motifs = [dict(row) for row in conn.execute("SELECT * FROM future_option_motifs ORDER BY motif_signature ASC").fetchall()]
         milestone_map = dict(conn.execute("SELECT milestone_name, first_global_step FROM higher_order_milestones").fetchall())
+        summary_row = conn.execute(
+            "SELECT value_json FROM memory_summary WHERE key = 'future_option_derivation_summary'"
+        ).fetchone()
+        derivation_summary = json.loads(str(summary_row[0])) if summary_row and summary_row[0] else {}
+        stable_contingencies_count = int(conn.execute("SELECT COUNT(*) FROM stable_contingencies").fetchone()[0])
+        transformation_families_count = int(conn.execute("SELECT COUNT(*) FROM transformation_families").fetchone()[0])
     motif_type_counts = Counter(str(row["motif_type"] or "unknown") for row in motifs)
     emergent_count = sum(1 for row in motifs if int(row["is_emergent"] or 0) == 1)
     cross_context_motif_count = sum(1 for row in motifs if int(row["cross_context_count"] or 0) >= 2)
@@ -60,6 +64,19 @@ def evaluate_h09_future_option_motifs(
         "future_option_edge_event_count": 0,
         "first_future_option_event_step": milestone_map.get("first_future_option_event_step"),
         "first_emergent_future_option_motif_step": milestone_map.get("first_emergent_future_option_motif_step"),
+        "stable_contingencies_count": stable_contingencies_count,
+        "transformation_families_count": transformation_families_count,
+        "stable_contingency_rows_seen": derivation_summary.get("stable_contingency_rows_seen"),
+        "stable_contingency_events_inserted": derivation_summary.get("stable_contingency_events_inserted"),
+        "transformation_family_rows_seen": derivation_summary.get("transformation_family_rows_seen"),
+        "transformation_family_events_inserted": derivation_summary.get("transformation_family_events_inserted"),
+        "carrier_rows_seen": derivation_summary.get("carrier_rows_seen"),
+        "carrier_events_inserted": derivation_summary.get("carrier_events_inserted"),
+        "role_rows_seen": derivation_summary.get("role_rows_seen"),
+        "role_events_inserted": derivation_summary.get("role_events_inserted"),
+        "future_option_events_inserted_total": derivation_summary.get("future_option_events_inserted_total"),
+        "future_option_motifs_inserted_total": derivation_summary.get("future_option_motifs_inserted_total"),
+        "future_option_derivation_error": derivation_summary.get("future_option_derivation_error"),
         "missing_evidence": [],
     }
     source_counts = Counter()
@@ -83,7 +100,11 @@ def evaluate_h09_future_option_motifs(
     result["future_option_edge_event_count"] = int(source_counts.get("future_option_edge", 0))
     non_unknown_types = [key for key, value in motif_type_counts.items() if key != "unknown" and value > 0]
     if not events:
-        result["decision"] = "INCONCLUSIVE"
+        if stable_contingencies_count > 0 or transformation_families_count > 0:
+            result["decision"] = "INSUFFICIENT_EVIDENCE"
+            result["missing_evidence"].append("Future-option derivation produced zero events despite available substrate.")
+        else:
+            result["decision"] = "INCONCLUSIVE"
     elif events and not motifs:
         result["decision"] = "INVALID"
     elif motifs and emergent_count == 0:
@@ -102,10 +123,27 @@ def evaluate_h09_future_option_motifs(
         result["decision"] = "PARTIALLY_VALID"
     if (result.get("unknown_motif_event_ratio") or 0.0) > 0.20:
         result["missing_evidence"].append("Future-option event classification remains mostly unknown.")
+    result["evidence_diagnostics"] = {
+        "stable_contingencies_count": stable_contingencies_count,
+        "transformation_families_count": transformation_families_count,
+        "future_option_event_count": len(events),
+        "future_option_motif_count": len(motifs),
+        "future_option_derivation_summary_present": bool(derivation_summary),
+    }
     result["core_metrics"] = {
         key: result.get(key)
         for key in (
             "future_option_event_count",
+            "stable_contingency_rows_seen",
+            "stable_contingency_events_inserted",
+            "transformation_family_rows_seen",
+            "transformation_family_events_inserted",
+            "carrier_rows_seen",
+            "carrier_events_inserted",
+            "role_rows_seen",
+            "role_events_inserted",
+            "future_option_events_inserted_total",
+            "future_option_motifs_inserted_total",
             "future_option_motif_count",
             "emergent_future_option_motif_count",
             "motif_type_counts",

@@ -12038,10 +12038,18 @@ def test_h10_all_low_attention_saturation_is_partial(tmp_path: Path) -> None:
     with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
         for idx in range(5):
             conn.execute(
+                "INSERT INTO future_option_events (event_id, owner_type, owner_key, source_kind, motif_type, option_delta, option_delta_bucket, first_seen_global_step, last_seen_global_step, replay_priority_score, memory_priority_score, contradiction_score, evidence_json) VALUES (?, 'interaction', ?, 'stable_contingency', 'enable', 2.0, 'large_positive', 1, 1, 0.0, 0.0, 0.0, '{}')",
+                (f"h{idx}", f"hi{idx}"),
+            )
+            conn.execute(
                 "INSERT INTO future_option_attention_links (event_id, motif_signature, owner_type, owner_key, option_delta_abs, replay_priority_score, memory_priority_score, contradiction_score, high_option_change, high_attention) VALUES (?, 'm', 'interaction', ?, 2.0, 0.0, 0.0, 0.0, 1, 0)",
                 (f"h{idx}", f"hi{idx}"),
             )
         for idx in range(5):
+            conn.execute(
+                "INSERT INTO future_option_events (event_id, owner_type, owner_key, source_kind, motif_type, option_delta, option_delta_bucket, first_seen_global_step, last_seen_global_step, replay_priority_score, memory_priority_score, contradiction_score, evidence_json) VALUES (?, 'interaction', ?, 'stable_contingency', 'enable', 0.1, 'small_positive', 1, 1, 0.0, 0.0, 0.0, '{}')",
+                (f"l{idx}", f"lo{idx}"),
+            )
             conn.execute(
                 "INSERT INTO future_option_attention_links (event_id, motif_signature, owner_type, owner_key, option_delta_abs, replay_priority_score, memory_priority_score, contradiction_score, high_option_change, high_attention) VALUES (?, 'm', 'interaction', ?, 0.1, 0.0, 0.0, 0.0, 0, 0)",
                 (f"l{idx}", f"lo{idx}"),
@@ -12540,6 +12548,217 @@ def test_h03_missing_evidence_flags_are_exposed() -> None:
     assert "H03 direct family evidence was row-capped; inspect more rows or use scan-all/full max-rows." in result["missing_evidence"]
     assert "H03 singleton action metadata contains unknown actions." in result["missing_evidence"]
     assert "H03 singleton families include over-specific context signatures." in result["missing_evidence"]
+
+
+def test_h03_missing_prediction_lift_is_not_valid(tmp_path: Path) -> None:
+    from v6.hypothesis_h03_report import evaluate_h03_transformation_family_formation
+    from v6.memory.direct_streaming_fold import ensure_direct_streaming_fold_manifest
+
+    run_dir = tmp_path / "run_h03_missing_lift"
+    out_dir = tmp_path / "out_h03_missing_lift"
+    run_dir.mkdir()
+    (run_dir / "interaction_sampling_v05c_report.json").write_text(
+        json.dumps({"validation": {"stable_contingency_count": 2, "unique_transformation_families": 1, "emergent_object_carrier_count": 0}, "runs": [{"game": "g1", "sampler_name": "s1"}]}),
+        encoding="utf-8",
+    )
+    memory_dir = tmp_path / "memory_h03_missing_lift"
+    ensure_memory_layout(memory_dir)
+    ensure_direct_streaming_fold_manifest(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute("INSERT INTO stable_contingencies (canonical_key, game, sampler, context_level, action, effect_signature, support_count, first_seen_global_step, last_seen_global_step, stability_score) VALUES ('c1','g1','s1',1,1,'e1',5,1,2,0.5)")
+        conn.execute("INSERT INTO stable_contingencies (canonical_key, game, sampler, context_level, action, effect_signature, support_count, first_seen_global_step, last_seen_global_step, stability_score) VALUES ('c2','g1','s1',1,1,'e1',5,1,2,0.5)")
+        conn.execute("INSERT INTO transformation_families (family_id, canonical_signature, support_count, member_count, first_seen_global_step, last_seen_global_step, stability_score) VALUES (1,'fam',10,2,1,2,0.8)")
+        conn.execute("INSERT INTO family_members (family_signature, contingency_key, support_count, first_seen_global_step, last_seen_global_step) VALUES ('fam','c1',5,1,2)")
+        conn.execute("INSERT INTO family_members (family_signature, contingency_key, support_count, first_seen_global_step, last_seen_global_step) VALUES ('fam','c2',5,1,2)")
+        conn.commit()
+    result = evaluate_h03_transformation_family_formation(run_dir, out_dir, memory_dir=memory_dir)
+    assert result["decision"] == "PARTIALLY_VALID"
+    assert "H03 family prediction-lift evidence is unavailable." in result["missing_evidence"]
+
+
+def test_h03_negative_prediction_lift_is_invalid(tmp_path: Path) -> None:
+    import v6.hypothesis_h03_report as h03_report
+
+    run_dir = tmp_path / "run_h03_negative_lift"
+    out_dir = tmp_path / "out_h03_negative_lift"
+    run_dir.mkdir()
+    (run_dir / "interaction_sampling_v05c_report.json").write_text(
+        json.dumps({"validation": {"stable_contingency_count": 2, "unique_transformation_families": 1, "emergent_object_carrier_count": 0}, "runs": []}),
+        encoding="utf-8",
+    )
+    original = h03_report.compute_h03_family_metrics_from_existing_artifacts
+    h03_report.compute_h03_family_metrics_from_existing_artifacts = lambda *args, **kwargs: {
+        "usable_direct_family_evidence": True,
+        "discovered_contingency_count": 4,
+        "transformation_family_count": 2,
+        "family_member_count_total": 6,
+        "family_max_member_count": 3,
+        "compression_ratio": 1.5,
+        "compression_gain": 1.0,
+        "singleton_family_ratio": 0.0,
+        "family_prediction_lift_mean": -0.1,
+        "emergent_object_carrier_count": 0,
+        "emergent_context_action_fallback_count": 0,
+        "singleton_family_count": 0,
+        "max_rows_applied": False,
+    }
+    try:
+        result = h03_report.evaluate_h03_transformation_family_formation(run_dir, out_dir)
+    finally:
+        h03_report.compute_h03_family_metrics_from_existing_artifacts = original
+    assert result["decision"] == "INVALID"
+    assert "H03 family prediction-lift is negative." in result["missing_evidence"]
+
+
+def test_h04_uses_compact_temporal_fallback(tmp_path: Path) -> None:
+    from v6.hypothesis_h04_report import evaluate_h04_carrier_emergence
+
+    memory_dir = tmp_path / "memory_h04_fallback"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute("INSERT INTO transformation_families (family_id, canonical_signature, support_count, member_count, first_seen_global_step, last_seen_global_step, stability_score) VALUES (1,'fam1',4,2,5,6,0.7)")
+        conn.execute("INSERT INTO carrier_candidates (carrier_id, carrier_signature, carrier_source, support_count, linked_family_count, first_seen_global_step, last_seen_global_step, stability_score, is_emergent) VALUES ('c1','carrier1','object',5,2,7,8,0.8,1)")
+        conn.execute("INSERT INTO carrier_links (carrier_signature, linked_type, linked_key, support_count, first_seen_global_step, last_seen_global_step) VALUES ('carrier1','family','fam1',1,7,8)")
+        conn.execute("INSERT INTO carrier_links (carrier_signature, linked_type, linked_key, support_count, first_seen_global_step, last_seen_global_step) VALUES ('carrier1','context','ctx1',1,7,8)")
+        conn.commit()
+    with sqlite3.connect(memory_dir / "graph.sqlite") as conn:
+        conn.execute("INSERT INTO graph_edges (edge_id, source_node_id, target_node_id, edge_type, first_seen_global_step, last_seen_global_step, support_count, weight) VALUES ('e1','a','b','explains',1,1,1,1.0)")
+        conn.execute("INSERT INTO graph_edges (edge_id, source_node_id, target_node_id, edge_type, first_seen_global_step, last_seen_global_step, support_count, weight) VALUES ('e2','a','b','anchors',1,1,1,1.0)")
+        conn.commit()
+    result = evaluate_h04_carrier_emergence(run_dir=None, memory_dir=memory_dir, output_dir=tmp_path / "h04")
+    assert result["core_metrics"]["h04_temporal_source"] == "compact_table_fallback"
+    assert result["core_metrics"]["h03_before_h04"] is True
+
+
+def test_h05_uses_compact_temporal_fallback_without_artificial_step_one(tmp_path: Path) -> None:
+    from v6.hypothesis_h05_report import evaluate_h05_role_emergence
+
+    memory_dir = tmp_path / "memory_h05_fallback"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute("INSERT INTO carrier_candidates (carrier_id, carrier_signature, carrier_source, support_count, linked_family_count, first_seen_global_step, last_seen_global_step, stability_score, is_emergent) VALUES ('c1','carrier1','object',5,2,7,8,0.8,1)")
+        conn.execute("INSERT INTO role_candidates (role_signature, role_type, support_count, linked_carrier_count, linked_family_count, linked_context_count, cross_game_count, cross_context_count, first_seen_global_step, last_seen_global_step, role_stability_score, is_emergent) VALUES ('r1','role',5,2,1,2,1,2,11,12,0.8,1)")
+        conn.commit()
+    result = evaluate_h05_role_emergence(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h05", already_derived=True)
+    assert result["h05_temporal_source"] == "compact_table_fallback"
+    assert result["first_emergent_role_step"] == 11
+    assert result["first_emergent_role_step"] != 1
+    assert result["h04_before_h05"] is True
+
+
+def test_h04_overconnected_carrier_is_not_usable(tmp_path: Path) -> None:
+    from v6.hypothesis_h04_report import evaluate_h04_carrier_emergence
+
+    memory_dir = tmp_path / "memory_h04_overconnected"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute("INSERT INTO transformation_families (family_id, canonical_signature, support_count, member_count, first_seen_global_step, last_seen_global_step, stability_score) VALUES (1,'fam0',4,2,1,2,0.7)")
+        conn.execute("INSERT INTO carrier_candidates (carrier_id, carrier_signature, carrier_source, support_count, linked_family_count, first_seen_global_step, last_seen_global_step, stability_score, is_emergent) VALUES ('c1','carrier1','object',5,51,2,3,0.8,1)")
+        for idx in range(51):
+            conn.execute(
+                "INSERT INTO carrier_links (carrier_signature, linked_type, linked_key, support_count, first_seen_global_step, last_seen_global_step) VALUES ('carrier1','family',?,1,2,3)",
+                (f"fam{idx}",),
+            )
+        conn.commit()
+    with sqlite3.connect(memory_dir / "graph.sqlite") as conn:
+        conn.execute("INSERT INTO graph_edges (edge_id, source_node_id, target_node_id, edge_type, first_seen_global_step, last_seen_global_step, support_count, weight) VALUES ('e1','a','b','explains',1,1,1,1.0)")
+        conn.execute("INSERT INTO graph_edges (edge_id, source_node_id, target_node_id, edge_type, first_seen_global_step, last_seen_global_step, support_count, weight) VALUES ('e2','a','b','anchors',1,1,1,1.0)")
+        conn.commit()
+    result = evaluate_h04_carrier_emergence(run_dir=None, memory_dir=memory_dir, output_dir=tmp_path / "h04_over")
+    assert result["core_metrics"]["overconnected_carrier_count"] == 1
+    assert result["core_metrics"]["usable_carrier_count"] == 0
+    assert result["decision"] != "VALID"
+
+
+def test_h08_candidate_proxy_only_is_insufficient_evidence(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory_h08_proxy_only"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute("INSERT INTO concept_candidates (concept_signature, concept_type, support_count, linked_role_count, linked_carrier_count, linked_family_count, transfer_success_count, strong_transfer_success_count, cross_game_count, cross_context_count, compression_gain, explanatory_reach, promotion_score, first_seen_global_step, last_seen_global_step, is_promoted) VALUES ('c1','x',2,1,1,1,1,0,1,1,1.0,1.0,0.1,1,2,0)")
+        conn.execute("INSERT INTO world_model_components (component_signature, component_type, node_count, edge_count, linked_concept_count, linked_role_count, linked_family_count, linked_carrier_count, cross_context_count, cross_game_count, explanatory_coverage, prediction_support_count, contradiction_coverage_count, coherence_score, candidate_only, predicted_outcome_count, predicted_outcome_count_is_proxy, first_seen_global_step, last_seen_global_step, is_coherent) VALUES ('w1','proxy',1,1,1,1,1,1,1,1,0.1,1,0,0.1,1,1,1,1,2,0)")
+        conn.commit()
+    result = evaluate_h08_world_model_coherence(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h08_proxy", already_derived=True)
+    assert result["decision"] == "INSUFFICIENT_EVIDENCE"
+    assert result["candidate_proxy_only"] is True
+
+
+def test_h09_zero_events_with_stable_substrate_reports_derivation_failure(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory_h09_zero_events"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute("INSERT INTO stable_contingencies (canonical_key, game, sampler, context_level, action, effect_signature, support_count, first_seen_global_step, last_seen_global_step, stability_score) VALUES ('c1','g1','s1',1,1,'e1',5,1,2,0.5)")
+        conn.execute("INSERT INTO memory_summary (key, value_json) VALUES ('future_option_derivation_summary', ?)", (json.dumps({"stable_contingency_rows_seen": 1, "stable_contingency_events_inserted": 0, "future_option_events_inserted_total": 0}),))
+        conn.commit()
+    result = evaluate_h09_future_option_motifs(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h09_zero", already_derived=True)
+    assert result["decision"] == "INSUFFICIENT_EVIDENCE"
+    assert "Future-option derivation produced zero events despite available substrate." in result["missing_evidence"]
+
+
+def test_h10_blocked_by_h09_when_future_option_events_absent(tmp_path: Path) -> None:
+    result = evaluate_h10_future_option_attention(memory_dir=tmp_path / "memory_h10_blocked", run_dir=None, output_dir=tmp_path / "h10_blocked", already_derived=True)
+    assert result["h10_blocked_by_h09"] is True
+    assert result["decision"] == "INSUFFICIENT_EVIDENCE"
+
+
+def test_h11_reports_blockers_when_motifs_or_promoted_concepts_absent(tmp_path: Path) -> None:
+    from v6.hypothesis_h11_report import evaluate_h11_future_option_transfer_concepts
+
+    memory_dir = tmp_path / "memory_h11_blockers"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute("INSERT INTO role_transfer_attempts (attempt_id, role_signature, transfer_kind, source_scope_type, source_scope_key, target_scope_type, target_scope_key, target_carrier_signature, predicted_role_signature, observed_role_signature, similarity_score, transfer_score, reuse_success, failure_reason, best_margin, source_carrier_count, candidate_role_count, first_seen_global_step, last_seen_global_step) VALUES ('1','r1','cross_game','game','g1','game','g2','c1','r2','r2',0.9,0.9,1,NULL,0.2,2,2,1,1)")
+        conn.commit()
+    result = evaluate_h11_future_option_transfer_concepts(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h11_blockers", already_derived=True)
+    assert result["h11_blocked_by_no_motifs"] is True
+    assert result["h11_blocked_by_no_promoted_concepts"] is True
+
+
+def test_hypothesis_suite_fast_mode_skips_expensive_hypotheses(tmp_path: Path, monkeypatch) -> None:
+    import v6.hypothesis_suite_report as hypothesis_suite_report
+
+    run_dir = tmp_path / "run_fast_suite"
+    output_dir = tmp_path / "out_fast_suite"
+    memory_dir = tmp_path / "memory_fast_suite"
+    run_dir.mkdir()
+    ensure_memory_layout(memory_dir)
+    (run_dir / "interaction_sampling_v05c_report.json").write_text(json.dumps({"runs": []}), encoding="utf-8")
+    called = {"transfer": 0}
+    stub = {"decision": "INSUFFICIENT_EVIDENCE", "core_metrics": {}, "missing_evidence": []}
+    monkeypatch.setattr(hypothesis_suite_report, "evaluate_h01_contingency_emergence", lambda **kwargs: dict(stub, hypothesis_id="H01"))
+    monkeypatch.setattr(hypothesis_suite_report, "evaluate_h02_prediction_violation_attention", lambda **kwargs: dict(stub, hypothesis_id="H02"))
+    monkeypatch.setattr(hypothesis_suite_report, "evaluate_h03_transformation_family_formation", lambda **kwargs: dict(stub, hypothesis_id="H03"))
+    monkeypatch.setattr(hypothesis_suite_report, "evaluate_h04_carrier_emergence", lambda **kwargs: dict(stub, hypothesis_id="H04"))
+    monkeypatch.setattr(hypothesis_suite_report, "evaluate_h05_role_emergence", lambda **kwargs: dict(stub, hypothesis_id="H05"))
+    monkeypatch.setattr(hypothesis_suite_report, "evaluate_h12_efficiency_emergence", lambda **kwargs: dict(stub, hypothesis_id="H12"))
+    monkeypatch.setattr(hypothesis_suite_report, "derive_role_candidates_only", lambda **kwargs: {})
+    monkeypatch.setattr(hypothesis_suite_report, "derive_role_transfer_attempts_only", lambda **kwargs: called.__setitem__("transfer", called["transfer"] + 1))
+    summary = hypothesis_suite_report.run_hypothesis_suite_report(
+        run_dir=run_dir,
+        memory_dir=memory_dir,
+        output_dir=output_dir,
+        scan_all_dbs=False,
+        max_db_files=0,
+        max_rows=100,
+        suite_mode="fast",
+        hypothesis_progress=False,
+    )
+    assert called["transfer"] == 0
+    assert summary["H06 decision"] == "SKIPPED_FAST_MODE"
+
+
+def test_compact_memory_creates_requested_indexes(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory_indexes"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'").fetchall()}
+    with sqlite3.connect(memory_dir / "graph.sqlite") as conn:
+        graph_names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'").fetchall()}
+    assert "idx_carrier_links_type_key" in names
+    assert "idx_role_links_signature_type_key" in names
+    assert "idx_role_transfer_kind_scope" in names
+    assert "idx_future_option_links_motif_type_key" in names
+    assert "idx_trajectory_efficiency_scope" in names
+    assert "idx_graph_edges_type_source" in graph_names
 
 
 def test_h07_reports_role_skip_reasons_when_concepts_zero(tmp_path: Path) -> None:

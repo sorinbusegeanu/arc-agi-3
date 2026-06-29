@@ -5,8 +5,15 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from v6.higher_order_substrate import derive_higher_order_memory
+from v6.higher_order_substrate import derive_role_candidates_only
 from v6.memory.compact_memory import ensure_memory_layout
+
+def _resolve_temporal_value(primary: Any, fallback: Any) -> tuple[int | None, str]:
+    if primary is not None:
+        return int(primary), "temporal_milestones"
+    if fallback is not None:
+        return int(fallback), "compact_table_fallback"
+    return None, "missing"
 
 
 def evaluate_h05_role_emergence(
@@ -19,7 +26,7 @@ def evaluate_h05_role_emergence(
     output_dir.mkdir(parents=True, exist_ok=True)
     ensure_memory_layout(memory_dir)
     if not already_derived:
-        derive_higher_order_memory(memory_dir=memory_dir, run_dir=run_dir)
+        derive_role_candidates_only(memory_dir=memory_dir, run_dir=run_dir)
     current_state = Path(memory_dir) / "current_state.sqlite"
     if not current_state.exists():
         result = _base_result("INCONCLUSIVE", ["compact memory missing current_state.sqlite"])
@@ -37,7 +44,16 @@ def evaluate_h05_role_emergence(
         carrier_count = int(conn.execute("SELECT COUNT(*) FROM carrier_candidates").fetchone()[0])
         emergent_carrier_count = int(conn.execute("SELECT COUNT(*) FROM carrier_candidates WHERE COALESCE(is_emergent, 0) = 1").fetchone()[0])
         milestone_map = dict(conn.execute("SELECT milestone_name, first_global_step FROM higher_order_milestones").fetchall())
-        h04_first = conn.execute("SELECT MIN(first_emergent_carrier_step) FROM temporal_milestones").fetchone()[0]
+        milestone_h04_first = conn.execute("SELECT MIN(first_emergent_carrier_step) FROM temporal_milestones").fetchone()[0]
+        fallback_h04_first = conn.execute(
+            "SELECT MIN(first_seen_global_step) FROM carrier_candidates WHERE COALESCE(is_emergent, 0) = 1"
+        ).fetchone()[0]
+        fallback_role_candidate_step = conn.execute(
+            "SELECT MIN(first_seen_global_step) FROM role_candidates"
+        ).fetchone()[0]
+        fallback_emergent_role_step = conn.execute(
+            "SELECT MIN(first_seen_global_step) FROM role_candidates WHERE COALESCE(is_emergent, 0) = 1"
+        ).fetchone()[0]
     role_candidate_count = len(role_rows)
     emergent_role_count = sum(1 for row in role_rows if int(row["is_emergent"] or 0) == 1)
     stable_role_count = sum(1 for row in role_rows if float(row["role_stability_score"] or 0.0) >= 0.50)
@@ -52,8 +68,26 @@ def evaluate_h05_role_emergence(
     )
     max_carriers_per_role = max((int(row["linked_carrier_count"] or 0) for row in role_rows), default=0)
     singleton_role_ratio = float(singleton_role_count / role_candidate_count) if role_candidate_count else None
-    first_role_candidate_step = milestone_map.get("first_role_candidate_step")
-    first_emergent_role_step = milestone_map.get("first_emergent_role_step")
+    h04_first, first_emergent_carrier_step_source = _resolve_temporal_value(milestone_h04_first, fallback_h04_first)
+    first_role_candidate_step, first_role_candidate_step_source = _resolve_temporal_value(
+        milestone_map.get("first_role_candidate_step"),
+        fallback_role_candidate_step,
+    )
+    first_emergent_role_step, first_emergent_role_step_source = _resolve_temporal_value(
+        milestone_map.get("first_emergent_role_step"),
+        fallback_emergent_role_step,
+    )
+    temporal_sources = {
+        first_emergent_carrier_step_source,
+        first_role_candidate_step_source,
+        first_emergent_role_step_source,
+    }
+    if "temporal_milestones" in temporal_sources:
+        h05_temporal_source = "temporal_milestones"
+    elif "compact_table_fallback" in temporal_sources:
+        h05_temporal_source = "compact_table_fallback"
+    else:
+        h05_temporal_source = "missing"
     h04_before_h05 = (
         None
         if h04_first is None or first_emergent_role_step is None
@@ -78,6 +112,10 @@ def evaluate_h05_role_emergence(
         "first_emergent_carrier_step": h04_first,
         "first_role_candidate_step": first_role_candidate_step,
         "first_emergent_role_step": first_emergent_role_step,
+        "h05_temporal_source": h05_temporal_source,
+        "first_emergent_carrier_step_source": first_emergent_carrier_step_source,
+        "first_role_candidate_step_source": first_role_candidate_step_source,
+        "first_emergent_role_step_source": first_emergent_role_step_source,
         "h04_before_h05_cases": h04_before_h05_cases,
         "h04_before_h05": h04_before_h05,
         "temporal_order_required_for_valid": True,

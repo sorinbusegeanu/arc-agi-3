@@ -4,7 +4,6 @@ import json
 import sqlite3
 from pathlib import Path
 
-from v6.higher_order_substrate import derive_higher_order_memory
 from v6.future_options import derive_future_option_memory
 from v6.memory.compact_memory import ensure_memory_layout
 
@@ -19,7 +18,6 @@ def evaluate_h11_future_option_transfer_concepts(
     output_dir.mkdir(parents=True, exist_ok=True)
     ensure_memory_layout(memory_dir)
     if not already_derived:
-        derive_higher_order_memory(memory_dir=memory_dir, run_dir=run_dir)
         derive_future_option_memory(memory_dir=memory_dir, run_dir=run_dir)
     with sqlite3.connect(Path(memory_dir) / "current_state.sqlite") as conn:
         conn.row_factory = sqlite3.Row
@@ -33,6 +31,7 @@ def evaluate_h11_future_option_transfer_concepts(
             """
         ).fetchall()]
         emergent_motifs = int(conn.execute("SELECT COUNT(*) FROM future_option_motifs WHERE COALESCE(is_emergent, 0) = 1").fetchone()[0])
+        future_option_motif_count = int(conn.execute("SELECT COUNT(*) FROM future_option_motifs").fetchone()[0])
         successful_role_transfer_count = int(conn.execute("SELECT COUNT(*) FROM role_transfer_attempts WHERE COALESCE(reuse_success, 0) = 1").fetchone()[0])
         promoted_concept_count = int(conn.execute("SELECT COUNT(*) FROM concept_candidates WHERE COALESCE(is_promoted, 0) = 1").fetchone()[0])
     motifs_with_transfer = len({str(row["motif_signature"]) for row in rows if int(row["transfer_attempt_count"] or 0) > 0})
@@ -55,6 +54,7 @@ def evaluate_h11_future_option_transfer_concepts(
         "hypothesis_id": "H11",
         "evidence_source": "compact_memory",
         "future_option_transfer_link_count": len(rows),
+        "future_option_motif_count": future_option_motif_count,
         "motifs_with_transfer_count": motifs_with_transfer,
         "motifs_with_strong_transfer_count": motifs_with_strong,
         "motifs_with_promoted_concept_count": motifs_with_promoted,
@@ -74,9 +74,14 @@ def evaluate_h11_future_option_transfer_concepts(
         "non_emergent_motifs_with_promoted_concept_count": non_emergent_motifs_with_promoted,
         "successful_role_transfer_count": successful_role_transfer_count,
         "promoted_concept_count": promoted_concept_count,
+        "h11_blocked_by_no_motifs": bool(future_option_motif_count == 0),
+        "h11_blocked_by_no_promoted_concepts": bool(promoted_concept_count == 0),
         "missing_evidence": [],
     }
-    if emergent_motifs == 0:
+    if future_option_motif_count == 0:
+        result["decision"] = "INSUFFICIENT_EVIDENCE"
+        result["missing_evidence"].append("H11 blocked because future-option motifs are absent.")
+    elif emergent_motifs == 0:
         result["decision"] = "INCONCLUSIVE"
     elif successful_role_transfer_count == 0 and promoted_concept_count == 0:
         result["decision"] = "INCONCLUSIVE"
@@ -100,10 +105,15 @@ def evaluate_h11_future_option_transfer_concepts(
         result["missing_evidence"].append("Transfer/concept evidence exists, but it is not attached to emergent future-option motifs.")
     elif len(emergent_rows) == 0 and "No transfer/concept links are attached to emergent future-option motifs." not in result["missing_evidence"]:
         result["missing_evidence"].append("No transfer/concept links are attached to emergent future-option motifs.")
+    if promoted_concept_count == 0 and "No promoted concepts available for motif-concept linkage." not in result["missing_evidence"]:
+        result["missing_evidence"].append("No promoted concepts available for motif-concept linkage.")
     result["core_metrics"] = {
         key: result.get(key)
         for key in (
             "future_option_transfer_link_count",
+            "future_option_motif_count",
+            "h11_blocked_by_no_motifs",
+            "h11_blocked_by_no_promoted_concepts",
             "motifs_with_transfer_count",
             "motifs_with_strong_transfer_count",
             "motifs_with_promoted_concept_count",

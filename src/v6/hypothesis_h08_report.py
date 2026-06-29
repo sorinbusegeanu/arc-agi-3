@@ -132,10 +132,16 @@ def evaluate_h08_world_model_coherence(
         "concept_link_count": concept_link_count,
         "role_link_count": role_link_count,
         "family_link_count": family_link_count,
+        "proxy_world_model_component_count": candidate_only_world_model_component_count,
+        "candidate_proxy_only": bool(promoted_concept_count == 0 and coherent_world_model_component_count == 0),
+        "overlinked_world_model_component_count": sum(1 for row in component_rows if int(row["linked_family_count"] or 0) > 50),
+        "max_family_link_count": max((int(row["linked_family_count"] or 0) for row in component_rows), default=0),
+        "family_link_count_is_proxy": bool(predicted_outcome_count_is_proxy_count > 0),
         "contradiction_coverage_count": contradiction_coverage_count,
         "first_world_model_component_step": milestone_map.get("first_world_model_component_step"),
         "first_coherent_world_model_step": milestone_map.get("first_coherent_world_model_step"),
         "first_promoted_concept_step": milestone_map.get("first_promoted_concept_step"),
+        "evidence_stage": None,
     }
     if concept_candidate_count <= 0:
         if role_candidate_count > 0 or role_transfer_success_count > 0:
@@ -144,9 +150,10 @@ def evaluate_h08_world_model_coherence(
         else:
             decision = "INSUFFICIENT_EVIDENCE"
             missing = ["no concept candidates available"]
-    elif concept_candidate_count > 0 and promoted_concept_count == 0:
-        decision = "PARTIALLY_VALID"
-        missing = []
+    elif promoted_concept_count == 0 and coherent_world_model_component_count == 0:
+        decision = "INSUFFICIENT_EVIDENCE"
+        metrics["evidence_stage"] = "candidate_proxy_only"
+        missing = ["No promoted concepts or coherent world-model components available."]
     elif world_model_component_count > 0 and coherent_world_model_component_count == 0:
         decision = "PARTIALLY_VALID"
         missing = []

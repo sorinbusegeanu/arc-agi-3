@@ -120,6 +120,14 @@ def derive_future_option_memory(
         attention = derive_future_option_attention_links(state_conn)
         transfer = derive_future_option_transfer_links(state_conn)
         summary = {**events, **motifs, **attention, **transfer}
+        state_conn.execute(
+            """
+            INSERT INTO memory_summary (key, value_json)
+            VALUES ('future_option_derivation_summary', ?)
+            ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json
+            """,
+            (json.dumps(summary, sort_keys=True),),
+        )
         state_conn.commit()
         graph_conn.commit()
         return summary
@@ -133,6 +141,14 @@ def derive_future_option_events(
 ) -> dict[str, Any]:
     inserted = 0
     first_event_step: int | None = None
+    stable_contingency_rows_seen = 0
+    stable_contingency_events_inserted = 0
+    transformation_family_rows_seen = 0
+    transformation_family_events_inserted = 0
+    carrier_rows_seen = 0
+    carrier_events_inserted = 0
+    role_rows_seen = 0
+    role_events_inserted = 0
 
     def add_event(payload: dict[str, Any]) -> None:
         nonlocal inserted, first_event_step
@@ -262,6 +278,8 @@ def derive_future_option_events(
     ).fetchall()
     contingency_tracker = progress_factory("derive_future_option_events stable_contingencies", len(contingency_rows), "contingency", False) if progress_factory else None
     for row in contingency_rows:
+        stable_contingency_rows_seen += 1
+        before_inserted = inserted
         add_event(
             _build_future_option_event(
                 owner_type="contingency",
@@ -289,6 +307,8 @@ def derive_future_option_events(
                 action_group=None if row["action"] is None else str(row["action"]),
             )
         )
+        if inserted > before_inserted:
+            stable_contingency_events_inserted += 1
         if contingency_tracker is not None:
             contingency_tracker.update(1)
     _close_progress_tracker(contingency_tracker)
@@ -302,7 +322,9 @@ def derive_future_option_events(
     ).fetchall()
     family_tracker = progress_factory("derive_future_option_events transformation_families", len(family_rows), "family", False) if progress_factory else None
     for row in family_rows:
+        transformation_family_rows_seen += 1
         family_signature = str(row["canonical_signature"])
+        before_inserted = inserted
         add_event(
             _build_future_option_event(
                 owner_type="family",
@@ -342,6 +364,8 @@ def derive_future_option_events(
                 live_delta_threshold=live_delta_threshold,
             )
         )
+        if inserted > before_inserted:
+            transformation_family_events_inserted += 1
         if family_tracker is not None:
             family_tracker.update(1)
     _close_progress_tracker(family_tracker)
@@ -355,6 +379,7 @@ def derive_future_option_events(
     ).fetchall()
     carrier_tracker = progress_factory("derive_future_option_events carrier_candidates", len(carrier_rows), "carrier", False) if progress_factory else None
     for row in carrier_rows:
+        carrier_rows_seen += 1
         links = carrier_links.get(str(row["carrier_signature"]), {})
         family_text = sorted(links.get("family", set()))
         contexts = sorted(links.get("context", set()))
@@ -364,6 +389,7 @@ def derive_future_option_events(
             family_meta=family_meta,
         )
         carrier_interactions = carrier_interaction_ids.get(carrier_node, set())
+        before_inserted = inserted
         add_event(
             _build_future_option_event(
                 owner_type="carrier",
@@ -397,6 +423,8 @@ def derive_future_option_events(
                 live_delta_threshold=live_delta_threshold,
             )
         )
+        if inserted > before_inserted:
+            carrier_events_inserted += 1
         if carrier_tracker is not None:
             carrier_tracker.update(1)
     _close_progress_tracker(carrier_tracker)
@@ -409,6 +437,7 @@ def derive_future_option_events(
     ).fetchall()
     role_tracker = progress_factory("derive_future_option_events role_candidates", len(role_rows), "role", False) if progress_factory else None
     for row in role_rows:
+        role_rows_seen += 1
         links = role_links.get(str(row["role_signature"]), {})
         families = sorted(links.get("family", set()))
         contexts = sorted(links.get("context", set()))
@@ -418,6 +447,7 @@ def derive_future_option_events(
         role_interactions: set[str] = set()
         for carrier_node in role_carrier_ids.get(role_node, set()):
             role_interactions.update(carrier_interaction_ids.get(carrier_node, set()))
+        before_inserted = inserted
         add_event(
             _build_future_option_event(
                 owner_type="role",
@@ -452,11 +482,25 @@ def derive_future_option_events(
                 live_delta_threshold=live_delta_threshold,
             )
         )
+        if inserted > before_inserted:
+            role_events_inserted += 1
         if role_tracker is not None:
             role_tracker.update(1)
     _close_progress_tracker(role_tracker)
     _write_future_milestone(state_conn, "first_future_option_event_step", first_event_step, None)
-    return {"future_option_event_count": inserted, "first_future_option_event_step": first_event_step}
+    return {
+        "future_option_event_count": inserted,
+        "future_option_events_inserted_total": inserted,
+        "stable_contingency_rows_seen": stable_contingency_rows_seen,
+        "stable_contingency_events_inserted": stable_contingency_events_inserted,
+        "transformation_family_rows_seen": transformation_family_rows_seen,
+        "transformation_family_events_inserted": transformation_family_events_inserted,
+        "carrier_rows_seen": carrier_rows_seen,
+        "carrier_events_inserted": carrier_events_inserted,
+        "role_rows_seen": role_rows_seen,
+        "role_events_inserted": role_events_inserted,
+        "first_future_option_event_step": first_event_step,
+    }
 
 
 def derive_future_option_motifs(
@@ -658,6 +702,7 @@ def derive_future_option_motifs(
     unknown_motif_count = int(motif_type_counts.get("unknown", 0))
     return {
         "future_option_motif_count": len(selected),
+        "future_option_motifs_inserted_total": len(selected),
         "emergent_future_option_motif_count": emergent_count,
         "motif_type_counts": dict(sorted(motif_type_counts.items())),
         "motif_type_source_counts": dict(sorted(motif_type_source_counts.items())),

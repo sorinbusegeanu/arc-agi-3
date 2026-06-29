@@ -5,7 +5,6 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from v6.higher_order_substrate import derive_higher_order_memory
 from v6.future_options import derive_future_option_memory
 from v6.memory.compact_memory import ensure_memory_layout
 
@@ -47,11 +46,11 @@ def evaluate_h10_future_option_attention(
     output_dir.mkdir(parents=True, exist_ok=True)
     ensure_memory_layout(memory_dir)
     if not already_derived:
-        derive_higher_order_memory(memory_dir=memory_dir, run_dir=run_dir)
         derive_future_option_memory(memory_dir=memory_dir, run_dir=run_dir)
     with sqlite3.connect(Path(memory_dir) / "current_state.sqlite") as conn:
         conn.row_factory = sqlite3.Row
         rows = [dict(row) for row in conn.execute("SELECT * FROM future_option_attention_links ORDER BY event_id ASC").fetchall()]
+        future_option_event_count = int(conn.execute("SELECT COUNT(*) FROM future_option_events").fetchone()[0])
     high_rows = [row for row in rows if int(row["high_option_change"] or 0) == 1]
     low_rows = [row for row in rows if int(row["high_option_change"] or 0) == 0]
     high_attention_rows = [row for row in rows if int(row["high_attention"] or 0) == 1]
@@ -74,6 +73,8 @@ def evaluate_h10_future_option_attention(
         "evidence_source": "compact_memory",
         "h10_attention_target_definition": "high_attention is raw replay/contradiction attention; calibrated_high_attention is percentile-calibrated and reported separately.",
         "future_option_attention_link_count": len(rows),
+        "future_option_event_count": future_option_event_count,
+        "h10_blocked_by_h09": bool(future_option_event_count == 0),
         "live_future_option_delta_count": sum(1 for row in rows if str(row.get("source_label") or "") == "live"),
         "heuristic_future_option_delta_count": sum(1 for row in rows if str(row.get("source_label") or "") == "heuristic"),
         "null_future_option_delta_count": sum(1 for row in rows if float(row.get("option_delta_abs") or 0.0) <= 0.0 and int(row.get("high_option_change") or 0) == 0),
@@ -145,7 +146,10 @@ def evaluate_h10_future_option_attention(
         "H10D_future_option_to_later_promotion_replay_survival": h10d,
     }
     result["residual_attention_percentile_threshold"] = residual_threshold
-    if not rows:
+    if future_option_event_count == 0:
+        result["decision"] = "INSUFFICIENT_EVIDENCE"
+        result["missing_evidence"].append("H10 blocked because H09 future-option events are absent.")
+    elif not rows:
         result["decision"] = "INSUFFICIENT_EVIDENCE"
     elif not high_rows:
         result["decision"] = "INSUFFICIENT_EVIDENCE"
@@ -195,6 +199,8 @@ def evaluate_h10_future_option_attention(
         key: result.get(key)
         for key in (
             "future_option_attention_link_count",
+            "future_option_event_count",
+            "h10_blocked_by_h09",
             "h10_attention_target_definition",
             "live_future_option_delta_count",
             "heuristic_future_option_delta_count",

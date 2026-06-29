@@ -74,6 +74,12 @@ def evaluate_h12_efficiency_emergence(
             if previous_epoch_mean is None or current_mean_norm is None
             else float(current_mean_norm) > float(previous_epoch_mean)
         ),
+        "raw_trajectory_rows": int(reconstruction.get("raw_trajectory_rows", 0) or 0),
+        "compact_trajectory_rows": int(reconstruction.get("compact_trajectory_rows", 0) or 0),
+        "reconstructed_trajectory_rows": int(reconstruction.get("reconstructed_trajectory_rows", 0) or 0),
+        "missing_episode_id_count": int(reconstruction.get("missing_episode_id_count", 0) or 0),
+        "missing_state_hash_count": int(reconstruction.get("missing_state_hash_count", 0) or 0),
+        "blocked_by_missing_trajectory_evidence": False,
         "trajectory_reconstruction_diagnostics": reconstruction,
         "missing_evidence": [],
     }
@@ -89,6 +95,8 @@ def evaluate_h12_efficiency_emergence(
         ):
             if reconstruction.get(key):
                 result["missing_evidence"].append(message)
+        if not rows:
+            result["blocked_by_missing_trajectory_evidence"] = True
     elif result["trajectories_with_memory_bonus"] <= 0 and result["trajectories_with_replay_bonus"] <= 0:
         result["decision"] = "PARTIALLY_VALID"
         result["missing_evidence"].append("Trajectory efficiency is computed but not yet linked strongly to memory or replay bonuses.")
@@ -129,6 +137,12 @@ def evaluate_h12_efficiency_emergence(
             "cost_gap_replay_priority_correlation",
             "future_option_gain_per_action_correlation",
             "efficiency_improved_vs_previous_epoch",
+            "raw_trajectory_rows",
+            "compact_trajectory_rows",
+            "reconstructed_trajectory_rows",
+            "missing_episode_id_count",
+            "missing_state_hash_count",
+            "blocked_by_missing_trajectory_evidence",
         )
     }
     _write_report(output_dir, result)
@@ -144,6 +158,11 @@ def _load_trajectory_rows(*, run_dir: Path, memory_dir: Path | None) -> tuple[li
         "no_episode_boundaries": False,
         "missing_state_hashes": False,
         "missing_compact_trajectory_records": False,
+        "raw_trajectory_rows": 0,
+        "compact_trajectory_rows": 0,
+        "reconstructed_trajectory_rows": 0,
+        "missing_episode_id_count": 0,
+        "missing_state_hash_count": 0,
     }
     saw_interactions = False
     for db_path in sqlite_paths:
@@ -165,14 +184,19 @@ def _load_trajectory_rows(*, run_dir: Path, memory_dir: Path | None) -> tuple[li
                     success_terminal = int(row[0] or 0)
                     episode_boundaries = int(row[1] or 0)
                     hashed = int(row[2] or 0)
+                    total_rows = int(conn.execute("SELECT COUNT(*) FROM interactions").fetchone()[0])
                     diagnostics["no_terminal_events"] = diagnostics["no_terminal_events"] or success_terminal <= 0
                     diagnostics["no_episode_boundaries"] = diagnostics["no_episode_boundaries"] or episode_boundaries <= 0
                     diagnostics["missing_state_hashes"] = diagnostics["missing_state_hashes"] or hashed <= 0
+                    diagnostics["missing_episode_id_count"] += max(0, total_rows - episode_boundaries)
+                    diagnostics["missing_state_hash_count"] += max(0, total_rows - hashed)
                 except sqlite3.DatabaseError:
                     pass
             if "trajectory_efficiency" not in tables:
                 continue
-            rows.extend(dict(row) for row in conn.execute("SELECT * FROM trajectory_efficiency ORDER BY trajectory_id ASC").fetchall())
+            batch = [dict(row) for row in conn.execute("SELECT * FROM trajectory_efficiency ORDER BY trajectory_id ASC").fetchall()]
+            rows.extend(batch)
+            diagnostics["raw_trajectory_rows"] += len(batch)
     if rows:
         diagnostics["no_success_events"] = all(int(row.get("success") or 0) != 1 for row in rows)
         return rows, "raw_epoch_db", diagnostics
@@ -187,6 +211,7 @@ def _load_trajectory_rows(*, run_dir: Path, memory_dir: Path | None) -> tuple[li
         if "trajectory_efficiency" in tables:
             rows = [dict(row) for row in conn.execute("SELECT * FROM trajectory_efficiency ORDER BY trajectory_id ASC").fetchall()]
             if rows:
+                diagnostics["compact_trajectory_rows"] = len(rows)
                 diagnostics["no_success_events"] = all(int(row.get("success") or 0) != 1 for row in rows)
                 if direct_streaming_manifest_exists(memory_dir) and not sqlite_paths:
                     return rows, "direct_streaming_manifest_and_compact_memory", diagnostics

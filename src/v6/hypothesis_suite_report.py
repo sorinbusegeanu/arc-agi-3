@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import sys
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -246,12 +245,13 @@ def run_hypothesis_suite_report(
     resolved_suite_mode = str(suite_mode or "fast").strip().lower()
     if resolved_suite_mode not in {"fast", "full"}:
         resolved_suite_mode = "fast"
-    progress_enabled = bool(hypothesis_progress) if hypothesis_progress is not None else bool(sys.stderr.isatty())
+    progress_enabled = True if hypothesis_progress is None else bool(hypothesis_progress)
     phase_names = [
         "family_repair", "H01", "H02", "H03", "H04",
         "derive_role_candidates", "H05", "derive_role_transfer_attempts", "H06",
         "derive_concept_candidates", "H07", "derive_world_model_components", "H08",
-        "derive_future_option_events", "derive_future_option_motifs", "H09", "H10", "H11", "H12", "summary_write",
+        "derive_future_option_events", "derive_future_option_motifs", "derive_future_option_attention_links",
+        "derive_future_option_transfer_links", "H09", "H10", "H11", "H12", "summary_write",
     ]
     top_bar = tqdm(total=len(phase_names), desc="hypothesis suite", unit="phase", dynamic_ncols=True, leave=True, disable=not progress_enabled)
     timings: dict[str, float] = {
@@ -270,6 +270,8 @@ def run_hypothesis_suite_report(
         "h08_seconds": 0.0,
         "derive_future_option_events_seconds": 0.0,
         "derive_future_option_motifs_seconds": 0.0,
+        "derive_future_option_attention_links_seconds": 0.0,
+        "derive_future_option_transfer_links_seconds": 0.0,
         "h09_seconds": 0.0,
         "h10_seconds": 0.0,
         "h11_seconds": 0.0,
@@ -356,68 +358,86 @@ def run_hypothesis_suite_report(
             t0 = time.time()
             h05 = evaluate_h05_role_emergence(memory_dir=memory_dir, run_dir=run_dir, output_dir=h05_dir, already_derived=True)
             timings["h05_seconds"] = float(time.time() - t0)
-        with _phase("derive_role_transfer_attempts"):
-            t0 = time.time()
-            derive_role_transfer_attempts_only(memory_dir=memory_dir, run_dir=run_dir, max_transfer_attempts=int(max_role_transfer_attempts), workers=int(higher_order_workers), chunk_size=int(higher_order_transfer_chunk_size), progress_factory=_progress_factory)
-            timings["derive_role_transfer_attempts_seconds"] = float(time.time() - t0)
-        with _phase("H06"):
-            t0 = time.time()
-            h06 = evaluate_h06_role_transfer(memory_dir=memory_dir, run_dir=run_dir, output_dir=h06_dir, already_derived=True)
-            timings["h06_seconds"] = float(time.time() - t0)
-        with _phase("derive_concept_candidates"):
-            t0 = time.time()
-            derive_concept_candidates_only(memory_dir=memory_dir, run_dir=run_dir, progress_factory=_progress_factory)
-            timings["derive_concept_candidates_seconds"] = float(time.time() - t0)
-        with _phase("H07"):
-            t0 = time.time()
-            h07 = evaluate_h07_concept_emergence(memory_dir=memory_dir, run_dir=run_dir, output_dir=h07_dir, already_derived=True)
-            timings["h07_seconds"] = float(time.time() - t0)
-        with _phase("derive_world_model_components"):
-            t0 = time.time()
-            derive_world_model_components_only(memory_dir=memory_dir, run_dir=run_dir, progress_factory=_progress_factory)
-            timings["derive_world_model_components_seconds"] = float(time.time() - t0)
-        with _phase("H08"):
-            t0 = time.time()
-            h08 = evaluate_h08_world_model_coherence(memory_dir=memory_dir, run_dir=run_dir, output_dir=h08_dir, already_derived=True)
-            timings["h08_seconds"] = float(time.time() - t0)
         if resolved_suite_mode == "full":
+            with _phase("derive_role_transfer_attempts"):
+                t0 = time.time()
+                derive_role_transfer_attempts_only(memory_dir=memory_dir, run_dir=run_dir, max_transfer_attempts=int(max_role_transfer_attempts), workers=int(higher_order_workers), chunk_size=int(higher_order_transfer_chunk_size), progress_factory=_progress_factory)
+                timings["derive_role_transfer_attempts_seconds"] = float(time.time() - t0)
+            with _phase("H06"):
+                t0 = time.time()
+                h06 = evaluate_h06_role_transfer(memory_dir=memory_dir, run_dir=run_dir, output_dir=h06_dir, already_derived=True)
+                timings["h06_seconds"] = float(time.time() - t0)
+            with _phase("derive_concept_candidates"):
+                t0 = time.time()
+                derive_concept_candidates_only(memory_dir=memory_dir, run_dir=run_dir, progress_factory=_progress_factory)
+                timings["derive_concept_candidates_seconds"] = float(time.time() - t0)
+            with _phase("H07"):
+                t0 = time.time()
+                h07 = evaluate_h07_concept_emergence(memory_dir=memory_dir, run_dir=run_dir, output_dir=h07_dir, already_derived=True)
+                timings["h07_seconds"] = float(time.time() - t0)
+            with _phase("derive_world_model_components"):
+                t0 = time.time()
+                derive_world_model_components_only(memory_dir=memory_dir, run_dir=run_dir, progress_factory=_progress_factory)
+                timings["derive_world_model_components_seconds"] = float(time.time() - t0)
+            with _phase("H08"):
+                t0 = time.time()
+                h08 = evaluate_h08_world_model_coherence(memory_dir=memory_dir, run_dir=run_dir, output_dir=h08_dir, already_derived=True)
+                timings["h08_seconds"] = float(time.time() - t0)
             with _phase("derive_future_option_events"):
                 with _phase("derive_future_option_motifs"):
-                    future_t0 = time.time()
-                    future_summary = derive_future_option_memory(
-                        memory_dir=memory_dir,
-                        run_dir=run_dir,
-                        max_events=int(max_future_option_events),
-                        max_motifs=int(max_future_option_motifs),
-                        progress_factory=_progress_factory,
-                    )
-                    timings["derive_future_option_events_seconds"] = float(future_summary.get("derive_future_option_events_seconds", time.time() - future_t0))
-                    timings["derive_future_option_motifs_seconds"] = float(future_summary.get("derive_future_option_motifs_seconds", 0.0))
+                    with _phase("derive_future_option_attention_links"):
+                        with _phase("derive_future_option_transfer_links"):
+                            future_t0 = time.time()
+                            future_summary = derive_future_option_memory(
+                                memory_dir=memory_dir,
+                                run_dir=run_dir,
+                                max_events=int(max_future_option_events),
+                                max_motifs=int(max_future_option_motifs),
+                                progress_factory=_progress_factory,
+                            )
+                            timings["derive_future_option_events_seconds"] = float(future_summary.get("derive_future_option_events_seconds", time.time() - future_t0))
+                            timings["derive_future_option_motifs_seconds"] = float(future_summary.get("derive_future_option_motifs_seconds", 0.0))
         else:
-            with _phase("derive_future_option_events"):
-                pass
-            with _phase("derive_future_option_motifs"):
-                pass
-        with _phase("H09"):
-            t0 = time.time()
-            h09 = evaluate_h09_future_option_motifs(memory_dir=memory_dir, run_dir=run_dir, output_dir=h09_dir, already_derived=True)
-            timings["h09_seconds"] = float(time.time() - t0)
-        with _phase("H10"):
-            t0 = time.time()
-            h10 = evaluate_h10_future_option_attention(memory_dir=memory_dir, run_dir=run_dir, output_dir=h10_dir, already_derived=True)
-            timings["h10_seconds"] = float(time.time() - t0)
-        with _phase("H11"):
-            t0 = time.time()
-            h11 = evaluate_h11_future_option_transfer_concepts(memory_dir=memory_dir, run_dir=run_dir, output_dir=h11_dir, already_derived=True)
-            timings["h11_seconds"] = float(time.time() - t0)
+            h06 = _skipped_fast_mode_result("H06")
+            h07 = _skipped_fast_mode_result("H07")
+            h08 = _skipped_fast_mode_result("H08")
+            h09 = _skipped_fast_mode_result("H09")
+            h10 = _skipped_fast_mode_result("H10")
+            h11 = _skipped_fast_mode_result("H11")
+            for phase_name in (
+                "derive_role_transfer_attempts",
+                "H06",
+                "derive_concept_candidates",
+                "H07",
+                "derive_world_model_components",
+                "H08",
+                "derive_future_option_events",
+                "derive_future_option_motifs",
+                "derive_future_option_attention_links",
+                "derive_future_option_transfer_links",
+                "H09",
+                "H10",
+                "H11",
+            ):
+                with _phase(phase_name):
+                    pass
+        if resolved_suite_mode == "full":
+            with _phase("H09"):
+                t0 = time.time()
+                h09 = evaluate_h09_future_option_motifs(memory_dir=memory_dir, run_dir=run_dir, output_dir=h09_dir, already_derived=True)
+                timings["h09_seconds"] = float(time.time() - t0)
+            with _phase("H10"):
+                t0 = time.time()
+                h10 = evaluate_h10_future_option_attention(memory_dir=memory_dir, run_dir=run_dir, output_dir=h10_dir, already_derived=True)
+                timings["h10_seconds"] = float(time.time() - t0)
+            with _phase("H11"):
+                t0 = time.time()
+                h11 = evaluate_h11_future_option_transfer_concepts(memory_dir=memory_dir, run_dir=run_dir, output_dir=h11_dir, already_derived=True)
+                timings["h11_seconds"] = float(time.time() - t0)
         with _phase("H12"):
             t0 = time.time()
             h12 = evaluate_h12_efficiency_emergence(memory_dir=memory_dir, run_dir=run_dir, output_dir=h12_dir)
             timings["h12_seconds"] = float(time.time() - t0)
-        if resolved_suite_mode == "fast":
-            for result in (h05, h06, h07, h08, h09, h10, h11):
-                if isinstance(result, dict):
-                    result["evidence_source"] = "cached_derived_memory"
     else:
         missing = ["memory_dir not provided"]
         h05 = {"hypothesis_id": "H05", "decision": "INSUFFICIENT_EVIDENCE", "core_metrics": {}, "missing_evidence": missing, "evidence_source": "none"}
@@ -428,7 +448,7 @@ def run_hypothesis_suite_report(
         h10 = {"hypothesis_id": "H10", "decision": "INSUFFICIENT_EVIDENCE", "core_metrics": {}, "missing_evidence": missing, "evidence_source": "none"}
         h11 = {"hypothesis_id": "H11", "decision": "INSUFFICIENT_EVIDENCE", "core_metrics": {}, "missing_evidence": missing, "evidence_source": "none"}
         h12 = {"hypothesis_id": "H12", "decision": "INSUFFICIENT_EVIDENCE", "core_metrics": {}, "missing_evidence": missing, "evidence_source": "none"}
-        for phase_name in ("derive_role_candidates", "H05", "derive_role_transfer_attempts", "H06", "derive_concept_candidates", "H07", "derive_world_model_components", "H08", "derive_future_option_events", "derive_future_option_motifs", "H09", "H10", "H11", "H12"):
+        for phase_name in ("derive_role_candidates", "H05", "derive_role_transfer_attempts", "H06", "derive_concept_candidates", "H07", "derive_world_model_components", "H08", "derive_future_option_events", "derive_future_option_motifs", "derive_future_option_attention_links", "derive_future_option_transfer_links", "H09", "H10", "H11", "H12"):
             with _phase(phase_name):
                 pass
     input_report = _load_json(Path(run_dir) / INPUT_REPORT_NAME) or {}
@@ -487,11 +507,31 @@ def run_hypothesis_suite_report(
         epoch_maturity_gate_notes=maturity_notes,
     )
     timings["suite_total_seconds"] = float(time.time() - suite_started_at)
+    for key, payload in {
+        "H01": h01,
+        "H02": h02,
+        "H03": h03,
+        "H04": h04,
+        "H05": h05,
+        "H06": h06,
+        "H07": h07,
+        "H08": h08,
+        "H09": h09,
+        "H10": h10,
+        "H11": h11,
+        "H12": h12,
+    }.items():
+        if isinstance(payload, dict):
+            payload["phase_seconds"] = {f"{key.lower()}_seconds": timings.get(f"{key.lower()}_seconds", 0.0)}
     summary.update(timings)
     summary["suite_mode"] = resolved_suite_mode
     summary["max_role_transfer_attempts"] = int(max_role_transfer_attempts)
     summary["max_future_option_events"] = int(max_future_option_events)
     summary["max_future_option_motifs"] = int(max_future_option_motifs)
+    consistency_warnings = _collect_hypothesis_consistency_warnings(
+        h03=h03, h04=h04, h05=h05, h07=h07, h08=h08, h09=h09, h10=h10, h12=h12
+    )
+    summary["hypothesis_consistency_warnings"] = list(consistency_warnings)
     with hypothesis_phase(
         output_dir,
         "summary_write",
@@ -1164,6 +1204,66 @@ def _next_recommended_action(
     return "Proceed with the existing compact memory and compare H01-H11 trends across subsequent epochs."
 
 
+def _skipped_fast_mode_result(hypothesis_id: str) -> dict[str, Any]:
+    return {
+        "hypothesis_id": hypothesis_id,
+        "decision": "SKIPPED_FAST_MODE",
+        "evidence_stage": "not_evaluated_this_epoch",
+        "missing_evidence": [],
+        "core_metrics": {},
+        "evidence_source": "cached_derived_memory",
+    }
+
+
+def _collect_hypothesis_consistency_warnings(
+    *,
+    h03: dict[str, Any],
+    h04: dict[str, Any],
+    h05: dict[str, Any],
+    h07: dict[str, Any],
+    h08: dict[str, Any],
+    h09: dict[str, Any],
+    h10: dict[str, Any],
+    h12: dict[str, Any],
+) -> list[str]:
+    warnings: list[str] = []
+    if str(h03.get("decision")) == "VALID" and h03.get("family_prediction_lift_mean") is None:
+        warnings.append("H03 inconsistency: VALID reported without family prediction-lift evidence.")
+    if str(h04.get("decision")) == "VALID" and h04.get("h03_before_h04") is None:
+        warnings.append("H04 inconsistency: VALID reported without H03-before-H04 temporal evidence.")
+    if str(h05.get("decision")) == "VALID" and h05.get("h04_before_h05") is None:
+        warnings.append("H05 inconsistency: VALID reported without H04-before-H05 temporal evidence.")
+    if str(h07.get("decision")) == "PARTIALLY_VALID" and int(h07.get("concept_candidate_count") or 0) <= 1 and int(h07.get("promoted_concept_count") or 0) == 0:
+        warnings.append("H07 inconsistency: PARTIALLY_VALID reported from precursor-only concept evidence.")
+    if str(h08.get("decision")) == "PARTIALLY_VALID" and int(h08.get("promoted_concept_count") or 0) == 0 and int(h08.get("coherent_world_model_component_count") or 0) == 0:
+        warnings.append("H08 inconsistency: PARTIALLY_VALID reported from candidate-only proxy world-model evidence.")
+    if int(h09.get("future_option_event_count") or 0) == 0 and (
+        int(h09.get("stable_contingencies_count") or 0) > 0 or int(h09.get("transformation_families_count") or 0) > 0
+    ):
+        warnings.append("H09 derivation warning: zero future-option events despite available stable substrate.")
+    if int(h10.get("future_option_event_count") or 0) == 0 and not bool(h10.get("h10_blocked_by_h09")):
+        warnings.append("H10 inconsistency: missing blocked_by_h09 despite zero future-option events.")
+    if not h12.get("trajectory_reconstruction_diagnostics") and bool(h12.get("blocked_by_missing_trajectory_evidence")):
+        warnings.append("H12 inconsistency: blocked by missing trajectory evidence without diagnostics.")
+    return warnings
+
+
+def _blocker_flags_for_result(hypothesis_id: str, result: dict[str, Any]) -> dict[str, bool]:
+    return {
+        "h02_missing_direct_linkage": hypothesis_id == "H02" and ("direct linkage" in " ".join(result.get("missing_evidence", [])).lower()),
+        "h03_missing_prediction_lift": hypothesis_id == "H03" and result.get("family_prediction_lift_mean") is None,
+        "h04_missing_temporal_order": hypothesis_id == "H04" and result.get("h03_before_h04") is None,
+        "h05_missing_temporal_order": hypothesis_id == "H05" and result.get("h04_before_h05") is None,
+        "h06_transfer_sampling_capped": hypothesis_id == "H06" and int(result.get("skipped_by_cap_count") or 0) > 0,
+        "h07_no_promoted_concepts": hypothesis_id == "H07" and int(result.get("promoted_concept_count") or 0) == 0,
+        "h08_proxy_only_world_model": hypothesis_id == "H08" and bool(result.get("candidate_proxy_only")),
+        "h09_no_future_option_events": hypothesis_id == "H09" and int(result.get("future_option_event_count") or 0) == 0,
+        "h10_blocked_by_h09": hypothesis_id == "H10" and bool(result.get("h10_blocked_by_h09")),
+        "h11_blocked_by_no_motifs": hypothesis_id == "H11" and bool(result.get("h11_blocked_by_no_motifs")),
+        "h12_missing_trajectory_evidence": hypothesis_id == "H12" and bool(result.get("blocked_by_missing_trajectory_evidence")),
+    }
+
+
 def _write_suite_summary(
     summary: dict[str, Any],
     output_dir: Path,
@@ -1173,6 +1273,10 @@ def _write_suite_summary(
     (output_dir / SUITE_JSON_NAME).write_text(json.dumps(summary, indent=2), encoding="utf-8")
     (output_dir / SUITE_TXT_NAME).write_text(_format_text(summary), encoding="utf-8")
     (output_dir / SUITE_MD_NAME).write_text(_format_md(summary), encoding="utf-8")
+    (output_dir / "hypothesis_consistency_warnings.json").write_text(
+        json.dumps(summary.get("hypothesis_consistency_warnings", []), indent=2),
+        encoding="utf-8",
+    )
     _write_aggregated_hypothesis_text(output_dir, hypothesis_results=hypothesis_results)
 
 
@@ -1180,6 +1284,9 @@ def _format_aggregated_result_section(hypothesis_id: str, result: dict[str, Any]
     lines = [
         f"{hypothesis_id}",
         f"decision: {result.get('decision')}",
+        f"evidence_stage: {result.get('evidence_stage')}",
+        f"blocker_flags: {json.dumps(_blocker_flags_for_result(hypothesis_id, result), sort_keys=True)}",
+        f"phase_seconds: {json.dumps(result.get('phase_seconds') or {}, sort_keys=True)}",
         f"core_metrics: {json.dumps(result.get('core_metrics') or {}, sort_keys=True)}",
         f"missing_evidence: {json.dumps(result.get('missing_evidence') or [], ensure_ascii=True)}",
         f"evidence_diagnostics: {json.dumps(result.get('evidence_diagnostics') or {}, sort_keys=True)}",

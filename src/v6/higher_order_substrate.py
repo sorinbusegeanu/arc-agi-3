@@ -156,6 +156,14 @@ def derive_role_transfer_attempts_only(
             chunk_size=chunk_size,
             progress_factory=progress_factory,
         )
+        state_conn.execute(
+            """
+            INSERT INTO memory_summary (key, value_json)
+            VALUES ('higher_order_transfer_summary', ?)
+            ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json
+            """,
+            (json.dumps(summary, sort_keys=True),),
+        )
         state_conn.commit()
         graph_conn.commit()
         return summary
@@ -448,6 +456,10 @@ def derive_role_transfer_attempts_parallel(
     chunk_size: int,
     progress_factory: Any | None = None,
 ) -> dict[str, Any]:
+    max_attempts_per_role = 1000
+    max_attempts_per_target_scope = 1000
+    cross_game_quota_ratio = 0.5
+    cross_context_quota_ratio = 0.5
     rows = state_conn.execute(
         """
         SELECT carrier_signature, role_signature, token_json, first_seen_global_step, last_seen_global_step
@@ -510,7 +522,18 @@ def derive_role_transfer_attempts_parallel(
     cross_context_attempt_count = 0
     cross_context_success_count = 0
 
-    target_attempt_specs = target_attempt_specs[: max(0, int(max_transfer_attempts))]
+    total_possible_transfer_attempts = len(target_attempt_specs)
+    target_attempt_specs = _sample_transfer_attempt_specs(
+        target_attempt_specs=target_attempt_specs,
+        role_rows=role_rows,
+        max_transfer_attempts=max_transfer_attempts,
+        max_attempts_per_role=max_attempts_per_role,
+        max_attempts_per_target_scope=max_attempts_per_target_scope,
+        cross_game_quota_ratio=cross_game_quota_ratio,
+        cross_context_quota_ratio=cross_context_quota_ratio,
+    )
+    sampled_cross_game_attempt_count = sum(1 for _, kind, _ in target_attempt_specs if kind == "cross_game")
+    sampled_cross_context_attempt_count = sum(1 for _, kind, _ in target_attempt_specs if kind == "cross_context")
     chunks = [
         target_attempt_specs[index:index + max(1, int(chunk_size))]
         for index in range(0, len(target_attempt_specs), max(1, int(chunk_size)))
@@ -611,6 +634,14 @@ def derive_role_transfer_attempts_parallel(
     _write_milestone(state_conn, "first_role_transfer_success_step", first_success_step, None)
     return {
         "transfer_attempt_count": inserted,
+        "total_possible_transfer_attempts": total_possible_transfer_attempts,
+        "sampled_transfer_attempts": len(target_attempt_specs),
+        "skipped_by_cap_count": max(0, total_possible_transfer_attempts - len(target_attempt_specs)),
+        "sampled_cross_game_attempt_count": sampled_cross_game_attempt_count,
+        "sampled_cross_context_attempt_count": sampled_cross_context_attempt_count,
+        "transfer_sampling_strategy": "stratified_balanced",
+        "max_attempts_per_role": max_attempts_per_role,
+        "max_attempts_per_target_scope": max_attempts_per_target_scope,
         "successful_transfer_count": success_count,
         "successful_role_count": len(successful_roles),
         "role_mismatch_count": role_mismatch_count,
@@ -631,7 +662,85 @@ def derive_role_transfer_attempts_parallel(
         "candidate_role_count_mean": (candidate_role_count_sum / inserted) if inserted else None,
         "transfer_profile_cache_scope_count": len(profile_cache),
         "transfer_profile_cache_profile_count": sum(len(items) for items in profile_cache.values()),
+}
+
+
+def _sample_transfer_attempt_specs(
+    *,
+    target_attempt_specs: list[tuple[str, str, str]],
+    role_rows: dict[str, dict[str, Any]],
+    max_transfer_attempts: int,
+    max_attempts_per_role: int,
+    max_attempts_per_target_scope: int,
+    cross_game_quota_ratio: float,
+    cross_context_quota_ratio: float,
+) -> list[tuple[str, str, str]]:
+    limit = max(0, int(max_transfer_attempts or 0))
+    if limit <= 0 or len(target_attempt_specs) <= limit:
+        return list(target_attempt_specs)
+
+    buckets = {
+        "cross_game": [spec for spec in target_attempt_specs if spec[1] == "cross_game"],
+        "cross_context": [spec for spec in target_attempt_specs if spec[1] == "cross_context"],
     }
+    quotas = {
+        "cross_game": min(len(buckets["cross_game"]), int(round(limit * float(cross_game_quota_ratio)))),
+        "cross_context": min(len(buckets["cross_context"]), int(round(limit * float(cross_context_quota_ratio)))),
+    }
+    assigned = quotas["cross_game"] + quotas["cross_context"]
+    if assigned < limit:
+        for kind in ("cross_game", "cross_context"):
+            available = len(buckets[kind]) - quotas[kind]
+            take = min(available, limit - assigned)
+            quotas[kind] += take
+            assigned += take
+            if assigned >= limit:
+                break
+
+    selected: list[tuple[str, str, str]] = []
+    selected_set: set[tuple[str, str, str]] = set()
+    role_counts: dict[str, int] = defaultdict(int)
+    scope_counts: dict[tuple[str, str], int] = defaultdict(int)
+
+    def _take(kind: str, quota: int) -> None:
+        for carrier_signature, transfer_kind, scope_key in buckets[kind]:
+            if len(selected) >= limit or quota <= 0:
+                break
+            role_signature = str(role_rows.get(carrier_signature, {}).get("role_signature") or carrier_signature)
+            scope_tuple = (transfer_kind, scope_key)
+            spec = (carrier_signature, transfer_kind, scope_key)
+            if spec in selected_set:
+                continue
+            if role_counts[role_signature] >= int(max_attempts_per_role):
+                continue
+            if scope_counts[scope_tuple] >= int(max_attempts_per_target_scope):
+                continue
+            selected.append(spec)
+            selected_set.add(spec)
+            role_counts[role_signature] += 1
+            scope_counts[scope_tuple] += 1
+            quota -= 1
+
+    _take("cross_game", quotas["cross_game"])
+    _take("cross_context", quotas["cross_context"])
+    if len(selected) < limit:
+        for spec in target_attempt_specs:
+            if len(selected) >= limit:
+                break
+            carrier_signature, transfer_kind, scope_key = spec
+            role_signature = str(role_rows.get(carrier_signature, {}).get("role_signature") or carrier_signature)
+            scope_tuple = (transfer_kind, scope_key)
+            if spec in selected_set:
+                continue
+            if role_counts[role_signature] >= int(max_attempts_per_role):
+                continue
+            if scope_counts[scope_tuple] >= int(max_attempts_per_target_scope):
+                continue
+            selected.append(spec)
+            selected_set.add(spec)
+            role_counts[role_signature] += 1
+            scope_counts[scope_tuple] += 1
+    return selected[:limit]
 
 
 def derive_concept_candidates(state_conn: sqlite3.Connection, progress_factory: Any | None = None) -> dict[str, Any]:

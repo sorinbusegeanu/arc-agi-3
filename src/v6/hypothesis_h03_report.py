@@ -446,6 +446,22 @@ def evaluate_h03_transformation_family_formation(
         and compression_good
         and checks["singleton_family_ratio_acceptable"] is True
         and pre_object is True
+        and result.get("family_prediction_lift_mean") is not None
+        and float(result.get("family_prediction_lift_mean") or 0.0) < 0.0
+    ):
+        result["decision"] = "INVALID"
+        result["scientific_conclusion"] = (
+            "H03 is not supported in this run because family prediction-lift is negative despite apparent family compression."
+        )
+    elif (
+        contingencies_present
+        and families_present
+        and non_singleton_present
+        and compression_good
+        and checks["singleton_family_ratio_acceptable"] is True
+        and pre_object is True
+        and result.get("family_prediction_lift_mean") is not None
+        and float(result.get("family_prediction_lift_mean") or 0.0) >= 0.0
     ):
         result["decision"] = "VALID"
         result["scientific_conclusion"] = (
@@ -474,6 +490,8 @@ def evaluate_h03_transformation_family_formation(
             result["scientific_conclusion"] = (
                 "H03 is partially supported in this run. Repeated contingencies compress into transformation families, but the available evidence is not complete enough for robust validation."
             )
+        if result.get("family_prediction_lift_mean") is None:
+            result["scientific_conclusion"] += " Family prediction-lift evidence is unavailable, so H03 cannot be fully VALID."
         if result.get("relaxed_decision_candidate") == "VALID":
             result["scientific_conclusion"] += (
                 " H03 remains PARTIALLY_VALID under strict canonicalization. Relaxed canonicalization suggests H03 would become VALID if over-specific centroid signatures are safely collapsed; this requires merge-safety validation."
@@ -2567,6 +2585,8 @@ def _populate_h03_evidence_lists(result: dict[str, Any]) -> None:
         )
     if result.get("family_prediction_lift_mean") is None:
         missing_evidence.append("H03 family prediction-lift evidence is unavailable.")
+    elif float(result.get("family_prediction_lift_mean") or 0.0) < 0.0:
+        missing_evidence.append("H03 family prediction-lift is negative.")
     if result.get("max_rows_applied") is True:
         missing_evidence.append("H03 direct family evidence was row-capped; inspect more rows or use scan-all/full max-rows.")
     if _gt(result.get("singleton_family_ratio"), 0.50):

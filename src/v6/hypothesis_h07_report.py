@@ -166,6 +166,7 @@ def evaluate_h07_concept_emergence(
         "roles_skipped_missing_family_links": roles_skipped_missing_family_links,
         "roles_skipped_missing_transfer_success": roles_skipped_missing_transfer_success,
         "roles_used_for_concepts": roles_used_for_concepts,
+        "evidence_stage": None,
     }
     if transfer_attempt_count <= 0:
         decision = "INCONCLUSIVE"
@@ -197,11 +198,19 @@ def evaluate_h07_concept_emergence(
         decision = "VALID"
         missing = []
     elif concept_candidate_count > 0 and promoted_concept_count == 0:
-        decision = "PARTIALLY_VALID"
-        missing = []
+        decision = "INSUFFICIENT_EVIDENCE"
+        metrics["evidence_stage"] = "concept_precursor_only"
+        missing = ["No promoted concept available."]
+        if overconcentrated_concept_count == concept_candidate_count:
+            missing.append("All concept candidates are overconcentrated.")
     elif promoted_concept_count > 0:
-        decision = "PARTIALLY_VALID"
-        missing = []
+        if promoted_overconcentrated_concept_count == promoted_concept_count and promoted_concept_count > 0:
+            decision = "INSUFFICIENT_EVIDENCE"
+            metrics["evidence_stage"] = "precursor_only"
+            missing = ["Promoted concepts are overconcentrated."]
+        else:
+            decision = "PARTIALLY_VALID"
+            missing = []
     else:
         decision = "PARTIALLY_VALID"
         missing = []
