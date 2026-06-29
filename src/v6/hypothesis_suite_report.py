@@ -479,7 +479,7 @@ def run_hypothesis_suite_report(
         game_count=len(games),
         sampler_count=len(samplers),
     )
-    h05, h06, h07, h08, h09, h10, h11, dependency_notes = _apply_higher_order_dependency_gates(h05, h06, h07, h08, h09, h10, h11)
+    h05, h06, h07, h08, h09, h10, h11, dependency_notes = _apply_higher_order_dependency_gates(h04, h05, h06, h07, h08, h09, h10, h11)
     summary = build_hypothesis_suite_summary(
         run_dir=run_dir,
         memory_dir=memory_dir,
@@ -1117,6 +1117,7 @@ def _apply_epoch_maturity_gates(
 
 
 def _apply_higher_order_dependency_gates(
+    h04: dict[str, Any],
     h05: dict[str, Any],
     h06: dict[str, Any],
     h07: dict[str, Any],
@@ -1147,6 +1148,9 @@ def _apply_higher_order_dependency_gates(
             notes.append(message)
         return updated
 
+    if str(h04.get("decision")) == "INVALID" and str(h05.get("decision")) == "VALID":
+        h05 = _demote(h05, "H05 depends on invalid H04 carrier emergence.")
+        h05["h05_depends_on_invalid_h04"] = True
     if str(h05.get("decision")) != "VALID" and str(h06.get("decision")) == "VALID":
         h06 = _demote(h06, "H06 cannot be fully VALID until H05 role emergence is VALID.")
     if str(h06.get("decision")) != "VALID" and str(h07.get("decision")) == "VALID":
@@ -1249,11 +1253,37 @@ def _collect_hypothesis_consistency_warnings(
 
 
 def _blocker_flags_for_result(hypothesis_id: str, result: dict[str, Any]) -> dict[str, bool]:
+    decision = str(result.get("decision") or "")
+    missing_evidence = list(result.get("missing_evidence") or [])
+    core_metrics = dict(result.get("core_metrics") or {})
+    h03_before_h04 = result.get("h03_before_h04", core_metrics.get("h03_before_h04"))
+    h04_before_h05 = result.get("h04_before_h05", core_metrics.get("h04_before_h05"))
+    if decision == "SKIPPED_FAST_MODE":
+        return {
+            "h02_missing_direct_linkage": False,
+            "h03_missing_prediction_lift": False,
+            "h04_missing_temporal_order": False,
+            "h04_temporal_order_failed": False,
+            "h05_missing_temporal_order": False,
+            "h06_transfer_sampling_capped": False,
+            "h07_no_promoted_concepts": False,
+            "h08_proxy_only_world_model": False,
+            "h09_no_future_option_events": False,
+            "h10_blocked_by_h09": False,
+            "h11_blocked_by_no_motifs": False,
+            "h12_missing_trajectory_evidence": False,
+            "skipped_fast_mode": True,
+        }
     return {
-        "h02_missing_direct_linkage": hypothesis_id == "H02" and ("direct linkage" in " ".join(result.get("missing_evidence", [])).lower()),
+        "h02_missing_direct_linkage": hypothesis_id == "H02" and (
+            result.get("direct_replay_lift_available") is not True
+            or result.get("raw_cleanup_prevents_direct_linkage") is True
+            or any("linkage unavailable" in str(msg).lower() for msg in missing_evidence)
+        ),
         "h03_missing_prediction_lift": hypothesis_id == "H03" and result.get("family_prediction_lift_mean") is None,
-        "h04_missing_temporal_order": hypothesis_id == "H04" and result.get("h03_before_h04") is None,
-        "h05_missing_temporal_order": hypothesis_id == "H05" and result.get("h04_before_h05") is None,
+        "h04_missing_temporal_order": hypothesis_id == "H04" and h03_before_h04 is None,
+        "h04_temporal_order_failed": hypothesis_id == "H04" and h03_before_h04 is False,
+        "h05_missing_temporal_order": hypothesis_id == "H05" and h04_before_h05 is None,
         "h06_transfer_sampling_capped": hypothesis_id == "H06" and int(result.get("skipped_by_cap_count") or 0) > 0,
         "h07_no_promoted_concepts": hypothesis_id == "H07" and int(result.get("promoted_concept_count") or 0) == 0,
         "h08_proxy_only_world_model": hypothesis_id == "H08" and bool(result.get("candidate_proxy_only")),
@@ -1261,6 +1291,7 @@ def _blocker_flags_for_result(hypothesis_id: str, result: dict[str, Any]) -> dic
         "h10_blocked_by_h09": hypothesis_id == "H10" and bool(result.get("h10_blocked_by_h09")),
         "h11_blocked_by_no_motifs": hypothesis_id == "H11" and bool(result.get("h11_blocked_by_no_motifs")),
         "h12_missing_trajectory_evidence": hypothesis_id == "H12" and bool(result.get("blocked_by_missing_trajectory_evidence")),
+        "skipped_fast_mode": False,
     }
 
 

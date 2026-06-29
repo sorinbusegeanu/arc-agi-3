@@ -12630,6 +12630,36 @@ def test_h04_uses_compact_temporal_fallback(tmp_path: Path) -> None:
     assert result["core_metrics"]["h03_before_h04"] is True
 
 
+def test_h04_blocker_reads_temporal_order_from_core_metrics() -> None:
+    from v6.hypothesis_suite_report import _blocker_flags_for_result
+
+    flags = _blocker_flags_for_result(
+        "H04",
+        {
+            "decision": "PARTIALLY_VALID",
+            "core_metrics": {"h03_before_h04": True},
+            "missing_evidence": [],
+        },
+    )
+    assert flags["h04_missing_temporal_order"] is False
+    assert flags["h04_temporal_order_failed"] is False
+
+
+def test_h04_temporal_failure_sets_failed_not_missing() -> None:
+    from v6.hypothesis_suite_report import _blocker_flags_for_result
+
+    flags = _blocker_flags_for_result(
+        "H04",
+        {
+            "decision": "PARTIALLY_VALID",
+            "core_metrics": {"h03_before_h04": False},
+            "missing_evidence": [],
+        },
+    )
+    assert flags["h04_missing_temporal_order"] is False
+    assert flags["h04_temporal_order_failed"] is True
+
+
 def test_h05_uses_compact_temporal_fallback_without_artificial_step_one(tmp_path: Path) -> None:
     from v6.hypothesis_h05_report import evaluate_h05_role_emergence
 
@@ -12644,6 +12674,48 @@ def test_h05_uses_compact_temporal_fallback_without_artificial_step_one(tmp_path
     assert result["first_emergent_role_step"] == 11
     assert result["first_emergent_role_step"] != 1
     assert result["h04_before_h05"] is True
+
+
+def test_h05_valid_is_demoted_when_h04_invalid() -> None:
+    from v6.hypothesis_suite_report import _apply_higher_order_dependency_gates
+
+    h04 = {"decision": "INVALID"}
+    h05 = {"decision": "VALID", "missing_evidence": []}
+    h06 = {"decision": "VALID", "missing_evidence": []}
+    h07 = {"decision": "PARTIALLY_VALID"}
+    h08 = {"decision": "PARTIALLY_VALID"}
+    h09 = {"decision": "PARTIALLY_VALID"}
+    h10 = {"decision": "PARTIALLY_VALID"}
+    h11 = {"decision": "PARTIALLY_VALID"}
+    h05, h06, *_rest = _apply_higher_order_dependency_gates(h04, h05, h06, h07, h08, h09, h10, h11)
+    assert h05["decision"] == "PARTIALLY_VALID"
+    assert h05["h05_depends_on_invalid_h04"] is True
+    assert "H05 depends on invalid H04 carrier emergence." in h05["missing_evidence"]
+    assert h06["decision"] == "PARTIALLY_VALID"
+
+
+def test_skipped_fast_mode_has_no_scientific_blockers() -> None:
+    from v6.hypothesis_suite_report import _blocker_flags_for_result
+
+    flags = _blocker_flags_for_result("H07", {"decision": "SKIPPED_FAST_MODE"})
+    assert flags["skipped_fast_mode"] is True
+    assert flags["h07_no_promoted_concepts"] is False
+    assert flags["h09_no_future_option_events"] is False
+
+
+def test_h02_missing_linkage_sets_blocker() -> None:
+    from v6.hypothesis_suite_report import _blocker_flags_for_result
+
+    flags = _blocker_flags_for_result(
+        "H02",
+        {
+            "decision": "INSUFFICIENT_EVIDENCE",
+            "direct_replay_lift_available": False,
+            "raw_cleanup_prevents_direct_linkage": True,
+            "missing_evidence": ["direct linkage unavailable after raw cleanup"],
+        },
+    )
+    assert flags["h02_missing_direct_linkage"] is True
 
 
 def test_h04_overconnected_carrier_is_not_usable(tmp_path: Path) -> None:
@@ -13044,6 +13116,7 @@ def test_h03_compact_fold_evidence_exposes_stable_contingencies_and_families(tmp
 def test_suite_summary_exposes_individual_vs_gated_decisions() -> None:
     from v6.hypothesis_suite_report import _apply_higher_order_dependency_gates, _format_text, _suite_gate_status
 
+    h04 = {"decision": "VALID"}
     h05 = {"decision": "VALID"}
     h06 = {"decision": "PARTIALLY_VALID"}
     h07 = {"decision": "VALID", "missing_evidence": []}
@@ -13051,7 +13124,7 @@ def test_suite_summary_exposes_individual_vs_gated_decisions() -> None:
     h09 = {"decision": "PARTIALLY_VALID"}
     h10 = {"decision": "VALID", "missing_evidence": []}
     h11 = {"decision": "VALID", "missing_evidence": []}
-    _, _, h07, h08, _, h10, h11, _ = _apply_higher_order_dependency_gates(h05, h06, h07, h08, h09, h10, h11)
+    _, _, h07, h08, _, h10, h11, _ = _apply_higher_order_dependency_gates(h04, h05, h06, h07, h08, h09, h10, h11)
     assert h11["decision"] == "PARTIALLY_VALID"
     assert h11["individual_decision_before_suite_gates"] == "VALID"
     text = _format_text(
@@ -13150,6 +13223,152 @@ def test_h12_stays_insufficient_evidence_without_successful_comparable_trajector
     result = evaluate_h12_efficiency_emergence(run_dir=tmp_path / "run_h12", memory_dir=memory_dir, output_dir=tmp_path / "h12")
     assert result["decision"] == "INSUFFICIENT_EVIDENCE"
     assert any("No success events" in item for item in result["missing_evidence"])
+
+
+def test_carrier_sidecar_with_real_timing_preserves_real_timing(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory_carrier_timing_real"
+    db_path = tmp_path / "seed_0.sqlite"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE interactions (id INTEGER PRIMARY KEY)")
+        conn.commit()
+    (tmp_path / "carrier_candidates.json").write_text(
+        json.dumps(
+            [
+                {
+                    "carrier_id": "c1",
+                    "carrier_signature": "carrier1",
+                    "carrier_source": "object",
+                    "context_signature": "ctx1",
+                    "support_count": 4,
+                    "distinct_family_count": 1,
+                    "status": "emergent_carrier",
+                    "first_seen_global_step": 11,
+                    "last_seen_global_step": 19,
+                    "first_emergent_global_step": 13,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    fold_sampling_job_sidecars_into_compact_memory(
+        db_path=db_path,
+        memory_dir=memory_dir,
+        fold_config=CompactMemoryFoldConfig(global_step_start=1, global_step_end=2),
+        delete_after_merge=False,
+    )
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        row = conn.execute(
+            "SELECT first_seen_global_step, last_seen_global_step FROM carrier_candidates WHERE carrier_signature = 'carrier1'"
+        ).fetchone()
+        timing_count = json.loads(
+            conn.execute("SELECT value_json FROM memory_summary WHERE key = 'carrier_sidecar_real_timing_count'").fetchone()[0]
+        )
+    assert row == (13, 19)
+    assert int(timing_count) == 1
+
+
+def test_fallback_carrier_timing_does_not_hard_invalidate_h04(tmp_path: Path) -> None:
+    from v6.hypothesis_h04_report import evaluate_h04_carrier_emergence
+
+    memory_dir = tmp_path / "memory_carrier_timing_fallback"
+    db_path = tmp_path / "seed_0.sqlite"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE interactions (id INTEGER PRIMARY KEY)")
+        conn.commit()
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute(
+            "INSERT INTO transformation_families (family_id, canonical_signature, support_count, member_count, first_seen_global_step, last_seen_global_step, stability_score) VALUES (1,'fam1',4,2,10,12,0.7)"
+        )
+        conn.commit()
+    (tmp_path / "carrier_candidates.json").write_text(
+        json.dumps(
+            [
+                {
+                    "carrier_id": "c1",
+                    "carrier_signature": "carrier1",
+                    "carrier_source": "object",
+                    "context_signature": "ctx1",
+                    "support_count": 5,
+                    "distinct_family_count": 1,
+                    "status": "emergent_carrier",
+                },
+                {
+                    "carrier_id": "c1",
+                    "carrier_signature": "carrier1",
+                    "carrier_source": "object",
+                    "context_signature": "ctx2",
+                    "support_count": 5,
+                    "distinct_family_count": 1,
+                    "status": "emergent_carrier",
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+    fold_sampling_job_sidecars_into_compact_memory(
+        db_path=db_path,
+        memory_dir=memory_dir,
+        fold_config=CompactMemoryFoldConfig(global_step_start=1, global_step_end=2),
+        delete_after_merge=False,
+    )
+    with sqlite3.connect(memory_dir / "graph.sqlite") as conn:
+        conn.execute("INSERT INTO graph_edges (edge_id, source_node_id, target_node_id, edge_type, first_seen_global_step, last_seen_global_step, support_count, weight) VALUES ('e1','a','b','explains',1,1,1,1.0)")
+        conn.execute("INSERT INTO graph_edges (edge_id, source_node_id, target_node_id, edge_type, first_seen_global_step, last_seen_global_step, support_count, weight) VALUES ('e2','a','b','anchors',1,1,1,1.0)")
+        conn.commit()
+    result = evaluate_h04_carrier_emergence(run_dir=None, memory_dir=memory_dir, output_dir=tmp_path / "h04_fallback")
+    assert result["carrier_timing_source"] == "fold_start_fallback"
+    assert result["decision"] == "PARTIALLY_VALID"
+    assert any("fold-start fallback carrier timestamps" in item for item in result["missing_evidence"])
+
+
+def test_role_timing_fallback_cannot_make_h05_valid(tmp_path: Path) -> None:
+    from v6.hypothesis_h05_report import evaluate_h05_role_emergence
+
+    memory_dir = tmp_path / "memory_h05_fallback_role"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute("INSERT INTO carrier_candidates (carrier_id, carrier_signature, carrier_source, support_count, linked_family_count, first_seen_global_step, last_seen_global_step, stability_score, is_emergent) VALUES ('c1','carrier1','object',5,2,1,2,0.8,1)")
+        conn.execute("INSERT INTO role_candidates (role_signature, role_type, support_count, linked_carrier_count, linked_family_count, linked_context_count, cross_game_count, cross_context_count, first_seen_global_step, last_seen_global_step, role_stability_score, is_emergent) VALUES ('r1','role',5,2,1,2,1,2,11,12,0.8,1)")
+        conn.commit()
+    result = evaluate_h05_role_emergence(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h05_fallback_role", already_derived=True)
+    assert result["role_timing_source"] == "fold_start_fallback"
+    assert result["decision"] != "VALID"
+
+
+def test_h12_reconstructs_trajectory_rows_from_compact_events_after_raw_cleanup(tmp_path: Path) -> None:
+    from v6.evaluation.h12_efficiency_emergence import evaluate_h12_efficiency_emergence
+    from v6.memory.direct_streaming_fold import ensure_direct_streaming_fold_manifest
+
+    memory_dir = tmp_path / "memory_h12_compact_reconstruct"
+    ensure_memory_layout(memory_dir)
+    ensure_direct_streaming_fold_manifest(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.executemany(
+            """
+            INSERT INTO compact_interaction_trajectory_events (
+                event_id, interaction_id, game_id, level_id, sampler, seed, epoch, episode_id,
+                global_step, outcome_state, level_completed_event, state_hash_before, state_hash_after,
+                action, no_effect_action, future_option_gain
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                ("e1", "i1", "g1", "l1", "mixed", 0, 1, 1, 1, "RUNNING", 0, "a", "b", 0, 0, 0.1),
+                ("e2", "i2", "g1", "l1", "mixed", 0, 1, 1, 2, "WIN", 1, "b", "c", 1, 0, 0.2),
+                ("e3", "i3", "g1", "l1", "mixed", 0, 1, 2, 3, "RUNNING", 0, "d", "e", 0, 0, 0.1),
+                ("e4", "i4", "g1", "l1", "mixed", 0, 1, 2, 4, "WIN", 1, "e", "f", 1, 0, 0.2),
+            ],
+        )
+        conn.commit()
+    result = evaluate_h12_efficiency_emergence(
+        run_dir=tmp_path / "run_h12_compact_reconstruct",
+        memory_dir=memory_dir,
+        output_dir=tmp_path / "h12_compact_reconstruct",
+    )
+    assert result["compact_trajectory_rows"] == 4
+    assert result["reconstructed_trajectory_rows"] == 2
+    assert result["blocked_by_missing_trajectory_evidence"] is False
 
 
 def test_is_retryable_fold_error_matches_locked_busy_variants() -> None:

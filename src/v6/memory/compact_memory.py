@@ -13,6 +13,7 @@ from typing import Any
 
 import numpy as np
 from tqdm.auto import tqdm
+from v6.memory.trajectory_efficiency import infer_epoch_from_path
 from v6.memory.substrate import interaction_node_id, scoped_interaction_key
 
 
@@ -1713,6 +1714,34 @@ def _merge_state_tables(temp_state: sqlite3.Connection, state_conn: sqlite3.Conn
         state_conn,
         [dict(row) for row in temp_state.execute("SELECT * FROM temporal_milestones ORDER BY game ASC, sampler ASC, seed ASC").fetchall()],
     )
+    for row in temp_state.execute("SELECT * FROM trajectory_efficiency ORDER BY trajectory_id ASC").fetchall():
+        state_conn.execute(
+            """
+            INSERT OR REPLACE INTO trajectory_efficiency (
+                trajectory_id, game_id, level_id, sampler, seed, epoch, outcome_class,
+                comparable_outcome_group_id, efficiency_active, success, terminal,
+                trajectory_length, steps_to_success, best_known_solution_length,
+                normalized_solve_efficiency, future_option_gain, future_option_gain_per_action,
+                equivalent_outcome_cost_gap, loop_count, loop_ratio, repeated_state_count,
+                repeated_state_ratio, blocked_action_count, blocked_action_ratio,
+                wasted_action_count, wasted_action_ratio, unique_state_count, efficiency_score,
+                efficiency_memory_bonus, efficiency_replay_bonus, efficiency_retention_bonus,
+                efficiency_promotion_bonus
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            tuple(row[column] for column in row.keys()),
+        )
+    for row in temp_state.execute("SELECT * FROM compact_interaction_trajectory_events ORDER BY event_id ASC").fetchall():
+        state_conn.execute(
+            """
+            INSERT OR REPLACE INTO compact_interaction_trajectory_events (
+                event_id, interaction_id, game_id, level_id, sampler, seed, epoch, episode_id,
+                global_step, outcome_state, level_completed_event, state_hash_before, state_hash_after,
+                action, no_effect_action, future_option_gain
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            tuple(row[column] for column in row.keys()),
+        )
     if bool(fold_config.fold_memory_substrate):
         for row in temp_state.execute("SELECT * FROM memory_nodes ORDER BY node_id ASC").fetchall():
             state_conn.execute(
@@ -2413,6 +2442,55 @@ def _fold_single_db(
                         row["efficiency_promotion_bonus"],
                     ),
                 )
+        if "interactions" in tables:
+            for row in raw_conn.execute(
+                """
+                SELECT
+                    id,
+                    game_id,
+                    level_id,
+                    sampler_name,
+                    episode_id,
+                    global_step,
+                    outcome_state,
+                    level_completed_event,
+                    state_hash_before,
+                    state_hash_after,
+                    action,
+                    efficiency_no_effect_action,
+                    efficiency_future_option_gain_per_cost
+                FROM interactions
+                ORDER BY COALESCE(global_step, id) ASC, id ASC
+                """
+            ).fetchall():
+                scoped_interaction_id = _scope_raw_local_id("interaction", row["id"], db_path)
+                state_conn.execute(
+                    """
+                    INSERT OR REPLACE INTO compact_interaction_trajectory_events (
+                        event_id, interaction_id, game_id, level_id, sampler, seed, epoch, episode_id,
+                        global_step, outcome_state, level_completed_event, state_hash_before, state_hash_after,
+                        action, no_effect_action, future_option_gain
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        f"event:{scoped_interaction_id}",
+                        scoped_interaction_id,
+                        row["game_id"],
+                        row["level_id"],
+                        row["sampler_name"],
+                        seed,
+                        infer_epoch_from_path(db_path),
+                        row["episode_id"],
+                        row["global_step"],
+                        row["outcome_state"],
+                        int(row["level_completed_event"] or 0),
+                        row["state_hash_before"],
+                        row["state_hash_after"],
+                        row["action"],
+                        int(row["efficiency_no_effect_action"] or 0),
+                        row["efficiency_future_option_gain_per_cost"],
+                    ),
+                )
         carrier_path = db_path.with_name("carrier_candidates.json")
         if carrier_path.exists():
             for item in json.loads(carrier_path.read_text(encoding="utf-8")):
@@ -2421,6 +2499,14 @@ def _fold_single_db(
                     continue
                 carrier_source = str(item.get("carrier_source") or "unknown")
                 is_emergent = str(item.get("status") or "") == "emergent_carrier" and carrier_source != "context_action_fallback"
+                first_seen_value = item.get("first_emergent_global_step") if is_emergent and item.get("first_emergent_global_step") is not None else item.get("first_seen_global_step")
+                last_seen_value = item.get("last_seen_global_step")
+                if first_seen_value is None and last_seen_value is None:
+                    totals["carrier_sidecar_missing_timing_count"] = int(totals.get("carrier_sidecar_missing_timing_count", 0) or 0) + 1
+                else:
+                    totals["carrier_sidecar_real_timing_count"] = int(totals.get("carrier_sidecar_real_timing_count", 0) or 0) + 1
+                first_seen_step = int(first_seen_value) if first_seen_value is not None else int(fold_config.global_step_start)
+                last_seen_step = int(last_seen_value) if last_seen_value is not None else int(fold_config.global_step_end)
                 state_conn.execute(
                     """
                     INSERT INTO carrier_candidates (
@@ -2442,8 +2528,8 @@ def _fold_single_db(
                         carrier_source,
                         int(item.get("support_count", 0) or 0),
                         int(item.get("distinct_family_count", 0) or item.get("linked_family_count", 0) or 0),
-                        fold_config.global_step_start,
-                        fold_config.global_step_end,
+                        first_seen_step,
+                        last_seen_step,
                         float(item.get("prediction_lift", 0.0) or item.get("stability_score", 0.0) or 0.0),
                         int(is_emergent),
                     ),
@@ -2469,7 +2555,7 @@ def _fold_single_db(
                     game=game,
                     sampler=sampler,
                     seed=seed,
-                    global_step=fold_config.global_step_end,
+                    global_step=last_seen_step,
                     priority_score=float(item.get("prediction_lift", 0.0) or 0.0) + float(item.get("support_count", 0) or 0),
                     compact_payload_json=json.dumps(item, sort_keys=True),
                 )
@@ -2547,6 +2633,14 @@ def _fold_carrier_candidates_sidecar(
             continue
         carrier_source = str(item.get("carrier_source") or "unknown")
         is_emergent = str(item.get("status") or "") == "emergent_carrier" and carrier_source != "context_action_fallback"
+        first_seen_value = item.get("first_emergent_global_step") if is_emergent and item.get("first_emergent_global_step") is not None else item.get("first_seen_global_step")
+        last_seen_value = item.get("last_seen_global_step")
+        if first_seen_value is None and last_seen_value is None:
+            totals["carrier_sidecar_missing_timing_count"] = int(totals.get("carrier_sidecar_missing_timing_count", 0) or 0) + 1
+        else:
+            totals["carrier_sidecar_real_timing_count"] = int(totals.get("carrier_sidecar_real_timing_count", 0) or 0) + 1
+        first_seen_step = int(first_seen_value) if first_seen_value is not None else int(fold_config.global_step_start)
+        last_seen_step = int(last_seen_value) if last_seen_value is not None else int(fold_config.global_step_end)
         state_conn.execute(
             """
             INSERT INTO carrier_candidates (
@@ -2568,8 +2662,8 @@ def _fold_carrier_candidates_sidecar(
                 carrier_source,
                 int(item.get("support_count", 0) or 0),
                 int(item.get("distinct_family_count", 0) or item.get("linked_family_count", 0) or 0),
-                fold_config.global_step_start,
-                fold_config.global_step_end,
+                first_seen_step,
+                last_seen_step,
                 float(item.get("prediction_lift", 0.0) or item.get("stability_score", 0.0) or 0.0),
                 int(is_emergent),
             ),
@@ -2595,7 +2689,7 @@ def _fold_carrier_candidates_sidecar(
             game=game,
             sampler=sampler,
             seed=seed,
-            global_step=fold_config.global_step_end,
+            global_step=last_seen_step,
             priority_score=float(item.get("prediction_lift", 0.0) or 0.0) + float(item.get("support_count", 0) or 0),
             compact_payload_json=json.dumps(item, sort_keys=True),
         )
@@ -3316,6 +3410,7 @@ def _build_memory_summary_from_connections(
     )
     future_option_attention_link_count = _count_rows(state_conn, "future_option_attention_links")
     future_option_transfer_link_count = _count_rows(state_conn, "future_option_transfer_links")
+    compact_trajectory_event_count = _count_rows(state_conn, "compact_interaction_trajectory_events")
     contradiction_count = _count_rows(state_conn, "contradiction_clusters")
     example_count = _count_rows(state_conn, "representative_examples")
     emergent_carrier_count = int(
@@ -3388,6 +3483,7 @@ def _build_memory_summary_from_connections(
         "emergent_future_option_motif_count": emergent_future_option_motif_count,
         "future_option_attention_link_count": future_option_attention_link_count,
         "future_option_transfer_link_count": future_option_transfer_link_count,
+        "compact_trajectory_event_count": compact_trajectory_event_count,
         "contradiction_cluster_count": contradiction_count,
         "representative_example_count": example_count,
         "graph_node_count": _count_rows(graph_conn, "graph_nodes"),
@@ -3427,6 +3523,7 @@ def _build_memory_summary_from_connections(
         "emergent_future_option_motif_count",
         "future_option_attention_link_count",
         "future_option_transfer_link_count",
+        "compact_trajectory_event_count",
         "graph_node_count",
         "graph_edge_count",
         "memory_substrate_node_count",
@@ -3784,6 +3881,24 @@ def _ensure_current_state_schema(path: Path) -> None:
                 efficiency_retention_bonus REAL,
                 efficiency_promotion_bonus REAL
             );
+            CREATE TABLE IF NOT EXISTS compact_interaction_trajectory_events (
+                event_id TEXT PRIMARY KEY,
+                interaction_id TEXT NOT NULL,
+                game_id TEXT,
+                level_id TEXT,
+                sampler TEXT,
+                seed INTEGER,
+                epoch INTEGER,
+                episode_id INTEGER,
+                global_step INTEGER,
+                outcome_state TEXT,
+                level_completed_event INTEGER,
+                state_hash_before TEXT,
+                state_hash_after TEXT,
+                action INTEGER,
+                no_effect_action INTEGER,
+                future_option_gain REAL
+            );
             CREATE TABLE IF NOT EXISTS memory_nodes (
                 node_id TEXT PRIMARY KEY,
                 memory_level TEXT NOT NULL,
@@ -4105,6 +4220,8 @@ def _ensure_current_state_schema(path: Path) -> None:
             ON future_option_transfer_links(motif_signature);
             CREATE INDEX IF NOT EXISTS idx_trajectory_efficiency_scope
             ON trajectory_efficiency(game_id, level_id, sampler, seed, epoch);
+            CREATE INDEX IF NOT EXISTS idx_compact_trajectory_events_scope
+            ON compact_interaction_trajectory_events(game_id, level_id, sampler, seed, epoch, episode_id, global_step);
             """
         )
         _ensure_column(connection, "stable_contingencies", "context_level", "INTEGER DEFAULT 0")

@@ -820,7 +820,8 @@ def test_dependency_gate_demotes_h07_h08() -> None:
     h09 = {"decision": "VALID", "missing_evidence": []}
     h10 = {"decision": "VALID", "missing_evidence": []}
     h11 = {"decision": "VALID", "missing_evidence": []}
-    _h05, _h06, h07_out, h08_out, _h09, _h10, _h11, notes = _apply_higher_order_dependency_gates(h05, h06, h07, h08, h09, h10, h11)
+    h04 = {"decision": "VALID"}
+    _h05, _h06, h07_out, h08_out, _h09, _h10, _h11, notes = _apply_higher_order_dependency_gates(h04, h05, h06, h07, h08, h09, h10, h11)
     assert h07_out["decision"] == "PARTIALLY_VALID"
     assert h08_out["decision"] == "PARTIALLY_VALID"
     assert notes
@@ -878,7 +879,8 @@ def test_dependency_gate_demotes_h10_if_h09_not_valid() -> None:
     h09 = {"decision": "PARTIALLY_VALID", "missing_evidence": []}
     h10 = {"decision": "VALID", "missing_evidence": []}
     h11 = {"decision": "VALID", "missing_evidence": []}
-    _h05, _h06, _h07, _h08, _h09, h10_out, h11_out, notes = _apply_higher_order_dependency_gates(h05, h06, h07, h08, h09, h10, h11)
+    h04 = {"decision": "VALID"}
+    _h05, _h06, _h07, _h08, _h09, h10_out, h11_out, notes = _apply_higher_order_dependency_gates(h04, h05, h06, h07, h08, h09, h10, h11)
     assert h10_out["decision"] == "PARTIALLY_VALID"
     assert h11_out["decision"] == "PARTIALLY_VALID"
     assert notes
@@ -892,7 +894,8 @@ def test_dependency_gate_demotes_h11_if_h09_absent() -> None:
     h09 = {"decision": "INCONCLUSIVE", "missing_evidence": []}
     h10 = {"decision": "PARTIALLY_VALID", "missing_evidence": []}
     h11 = {"decision": "VALID", "missing_evidence": []}
-    _h05, _h06, _h07, _h08, _h09, _h10, h11_out, notes = _apply_higher_order_dependency_gates(h05, h06, h07, h08, h09, h10, h11)
+    h04 = {"decision": "VALID"}
+    _h05, _h06, _h07, _h08, _h09, _h10, h11_out, notes = _apply_higher_order_dependency_gates(h04, h05, h06, h07, h08, h09, h10, h11)
     assert h11_out["decision"] == "PARTIALLY_VALID"
     assert notes
 

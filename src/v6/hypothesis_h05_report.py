@@ -88,6 +88,15 @@ def evaluate_h05_role_emergence(
         h05_temporal_source = "compact_table_fallback"
     else:
         h05_temporal_source = "missing"
+    role_timing_source = "real_evidence" if (
+        first_emergent_carrier_step_source == "temporal_milestones"
+        and first_role_candidate_step_source == "temporal_milestones"
+        and first_emergent_role_step_source == "temporal_milestones"
+    ) else ("fold_start_fallback" if (
+        first_emergent_carrier_step_source != "temporal_milestones"
+        or first_role_candidate_step_source != "temporal_milestones"
+        or first_emergent_role_step_source != "temporal_milestones"
+    ) else "mixed")
     h04_before_h05 = (
         None
         if h04_first is None or first_emergent_role_step is None
@@ -119,6 +128,7 @@ def evaluate_h05_role_emergence(
         "h04_before_h05_cases": h04_before_h05_cases,
         "h04_before_h05": h04_before_h05,
         "temporal_order_required_for_valid": True,
+        "role_timing_source": role_timing_source,
     }
     if carrier_count <= 0:
         decision = "INCONCLUSIVE"
@@ -137,7 +147,7 @@ def evaluate_h05_role_emergence(
         missing = []
     elif emergent_role_count >= 1 and multi_carrier_role_count >= 1 and (cross_context_role_count >= 1 or cross_game_role_count >= 1) and (singleton_role_ratio is None or singleton_role_ratio <= 0.75) and (
         h04_before_h05 is True
-    ):
+    ) and role_timing_source == "real_evidence":
         decision = "VALID"
         missing = []
     elif (
@@ -157,6 +167,9 @@ def evaluate_h05_role_emergence(
         missing = []
     result = _base_result(decision, missing)
     result.update(metrics)
+    if result["decision"] == "VALID" and role_timing_source != "real_evidence":
+        result["decision"] = "PARTIALLY_VALID"
+        result["missing_evidence"] = list(dict.fromkeys(list(result.get("missing_evidence", [])) + ["Role timing uses carrier fold-start fallback timestamps; full H05 validation unavailable."]))
     result["core_metrics"] = dict(metrics)
     _write_outputs(output_dir, result)
     return result

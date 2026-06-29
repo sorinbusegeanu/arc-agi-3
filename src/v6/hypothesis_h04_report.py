@@ -41,7 +41,15 @@ def evaluate_h04_carrier_emergence(
         state_conn.row_factory = sqlite3.Row
         carrier_rows = state_conn.execute(
             """
-            SELECT carrier_signature, carrier_source, support_count, linked_family_count, stability_score, is_emergent
+            SELECT
+                carrier_signature,
+                carrier_source,
+                support_count,
+                linked_family_count,
+                first_seen_global_step,
+                last_seen_global_step,
+                stability_score,
+                is_emergent
             FROM carrier_candidates
             """
         ).fetchall()
@@ -73,6 +81,22 @@ def evaluate_h04_carrier_emergence(
             FROM carrier_links
             """
         ).fetchall()
+        summary_rows = state_conn.execute(
+            """
+            SELECT key, value_json
+            FROM memory_summary
+            WHERE key IN ('fold_summary', 'carrier_sidecar_real_timing_count', 'carrier_sidecar_missing_timing_count')
+            """
+        ).fetchall()
+    fold_summary: dict[str, Any] = {}
+    summary_values: dict[str, Any] = {}
+    for row in summary_rows:
+        try:
+            summary_values[str(row[0])] = json.loads(row[1]) if row[1] is not None else None
+        except Exception:
+            summary_values[str(row[0])] = row[1]
+    if isinstance(summary_values.get("fold_summary"), dict):
+        fold_summary = dict(summary_values["fold_summary"])
     graph_counts = {
         "carrier_explains_edge_count": 0,
         "carrier_anchors_edge_count": 0,
@@ -162,6 +186,21 @@ def evaluate_h04_carrier_emergence(
         "h03_before_h04": h03_before_h04,
         **graph_counts,
     }
+    real_timing_count = int(summary_values.get("carrier_sidecar_real_timing_count", fold_summary.get("carrier_sidecar_real_timing_count", 0)) or 0)
+    missing_timing_count = int(summary_values.get("carrier_sidecar_missing_timing_count", fold_summary.get("carrier_sidecar_missing_timing_count", 0)) or 0)
+    carrier_timing_sources: list[str] = []
+    if real_timing_count > 0:
+        carrier_timing_sources.append("real_evidence")
+    if missing_timing_count > 0:
+        carrier_timing_sources.append("fold_start_fallback")
+    if carrier_timing_sources and all(item == "real_evidence" for item in carrier_timing_sources):
+        metrics["carrier_timing_source"] = "real_evidence"
+    elif carrier_timing_sources and all(item == "fold_start_fallback" for item in carrier_timing_sources):
+        metrics["carrier_timing_source"] = "fold_start_fallback"
+    elif carrier_timing_sources:
+        metrics["carrier_timing_source"] = "mixed"
+    else:
+        metrics["carrier_timing_source"] = "missing"
     missing_evidence = [] if carrier_rows else ["no carrier candidates in compact memory"]
     if not carrier_rows:
         decision = "INVALID" if first_stable_family_step is not None else "INCONCLUSIVE"
@@ -173,8 +212,19 @@ def evaluate_h04_carrier_emergence(
         and graph_counts["carrier_explains_edge_count"] > 0
         and graph_counts["carrier_anchors_edge_count"] > 0
         and h03_before_h04 is False
-    ):
+    ) and metrics["carrier_timing_source"] == "real_evidence":
         decision = "INVALID"
+    elif (
+        usable_emergent_carrier_count > 0
+        and not emergent_fallback
+        and usable_carrier_count > 0
+        and (metrics["carrier_cross_family_count"] >= 2 or metrics["carrier_cross_context_count"] >= 2)
+        and graph_counts["carrier_explains_edge_count"] > 0
+        and graph_counts["carrier_anchors_edge_count"] > 0
+        and h03_before_h04 is False
+    ):
+        decision = "PARTIALLY_VALID"
+        missing_evidence.append("H04 temporal order failed using fold-start fallback carrier timestamps; real carrier timing unavailable.")
     elif (
         usable_emergent_carrier_count > 0
         and not emergent_fallback
@@ -209,6 +259,7 @@ def evaluate_h04_carrier_emergence(
         "missing_evidence": missing_evidence,
         "evidence_source": "compact_memory",
     }
+    result.update(metrics)
     _write_outputs(result, output_dir)
     return result
 

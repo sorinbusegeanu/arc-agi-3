@@ -216,11 +216,186 @@ def _load_trajectory_rows(*, run_dir: Path, memory_dir: Path | None) -> tuple[li
                 if direct_streaming_manifest_exists(memory_dir) and not sqlite_paths:
                     return rows, "direct_streaming_manifest_and_compact_memory", diagnostics
                 return rows, "compact_memory", diagnostics
+        if "compact_interaction_trajectory_events" in tables:
+            event_rows = [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM compact_interaction_trajectory_events ORDER BY game_id ASC, level_id ASC, sampler ASC, seed ASC, episode_id ASC, global_step ASC, event_id ASC"
+                ).fetchall()
+            ]
+            if event_rows:
+                diagnostics["compact_trajectory_rows"] = len(event_rows)
+                rows = _reconstruct_trajectory_rows_from_compact_events(event_rows, diagnostics)
+                if rows:
+                    if direct_streaming_manifest_exists(memory_dir) and not sqlite_paths:
+                        return rows, "direct_streaming_manifest_and_compact_memory", diagnostics
+                    return rows, "compact_memory", diagnostics
     diagnostics["missing_compact_trajectory_records"] = True
     if not saw_interactions:
         diagnostics["no_episode_boundaries"] = True
         diagnostics["missing_state_hashes"] = True
     return [], "none", diagnostics
+
+
+def _reconstruct_trajectory_rows_from_compact_events(
+    event_rows: list[dict[str, Any]],
+    diagnostics: dict[str, Any],
+) -> list[dict[str, Any]]:
+    by_trajectory: dict[str, list[dict[str, Any]]] = {}
+    for row in event_rows:
+        game_id = str(row.get("game_id") or "unknown_game")
+        level_id = None if row.get("level_id") in (None, "") else str(row.get("level_id"))
+        sampler = None if row.get("sampler") in (None, "") else str(row.get("sampler"))
+        seed = int(row.get("seed") or 0)
+        episode_id = row.get("episode_id")
+        if episode_id in (None, ""):
+            diagnostics["missing_episode_id_count"] += 1
+            episode_key = f"no_episode:{row.get('event_id')}"
+        else:
+            episode_key = str(int(episode_id))
+        if row.get("state_hash_before") in (None, "") or row.get("state_hash_after") in (None, ""):
+            diagnostics["missing_state_hash_count"] += 1
+        trajectory_id = f"{game_id}|{level_id or '__none__'}|{sampler or 'unknown'}|{seed}|{episode_key}"
+        by_trajectory.setdefault(trajectory_id, []).append(row)
+    best_known_by_scope: dict[str, int] = {}
+    prepared: list[dict[str, Any]] = []
+    for trajectory_id, rows in sorted(by_trajectory.items()):
+        rows = sorted(rows, key=lambda item: (int(item.get("global_step") or 0), str(item.get("event_id") or "")))
+        last = rows[-1]
+        game_id = str(last.get("game_id") or "unknown_game")
+        level_id = None if last.get("level_id") in (None, "") else str(last.get("level_id"))
+        sampler = None if last.get("sampler") in (None, "") else str(last.get("sampler"))
+        seed = int(last.get("seed") or 0)
+        epoch = None if last.get("epoch") in (None, "") else int(last.get("epoch"))
+        length = len(rows)
+        success = bool(int(last.get("level_completed_event") or 0)) or str(last.get("outcome_state") or "") in {"WIN", "LEVEL_COMPLETE"}
+        terminal = success or str(last.get("outcome_state") or "") == "GAME_OVER"
+        if success:
+            outcome_class = "LEVEL_COMPLETE" if bool(int(last.get("level_completed_event") or 0)) else "WIN"
+        elif str(last.get("outcome_state") or "") == "GAME_OVER":
+            outcome_class = "GAME_OVER"
+        else:
+            outcome_class = str(last.get("outcome_state") or "NOT_FINISHED")
+        future_option_gain = sum(float(item.get("future_option_gain") or 0.0) for item in rows)
+        future_option_gain_per_action = (future_option_gain / float(length)) if length > 0 else None
+        state_hashes = [str(item.get("state_hash_after")) for item in rows if item.get("state_hash_after") not in (None, "")]
+        repeated_state_count = max(0, len(state_hashes) - len(set(state_hashes)))
+        loop_count = repeated_state_count
+        blocked_action_count = sum(1 for item in rows if int(item.get("no_effect_action") or 0) == 1)
+        wasted_action_count = blocked_action_count
+        unique_state_count = len(set(state_hashes))
+        scope_key = f"{game_id}|{level_id or '__none__'}"
+        steps_to_success = length if success else None
+        if success:
+            current_best = best_known_by_scope.get(scope_key)
+            best_known_by_scope[scope_key] = length if current_best is None else min(current_best, length)
+        prepared.append(
+            {
+                "trajectory_id": trajectory_id,
+                "game_id": game_id,
+                "level_id": level_id,
+                "sampler": sampler,
+                "seed": seed,
+                "epoch": epoch,
+                "outcome_class": outcome_class,
+                "terminal": int(terminal),
+                "success": int(success),
+                "trajectory_length": length,
+                "steps_to_success": steps_to_success,
+                "future_option_gain": future_option_gain,
+                "future_option_gain_per_action": future_option_gain_per_action,
+                "loop_count": loop_count,
+                "loop_ratio": (float(loop_count) / float(length)) if length > 0 else 0.0,
+                "repeated_state_count": repeated_state_count,
+                "repeated_state_ratio": (float(repeated_state_count) / float(length)) if length > 0 else 0.0,
+                "blocked_action_count": blocked_action_count,
+                "blocked_action_ratio": (float(blocked_action_count) / float(length)) if length > 0 else 0.0,
+                "wasted_action_count": wasted_action_count,
+                "wasted_action_ratio": (float(wasted_action_count) / float(length)) if length > 0 else 0.0,
+                "unique_state_count": unique_state_count,
+                "final_state_hash": state_hashes[-1] if state_hashes else None,
+                "_scope_key": scope_key,
+            }
+        )
+    group_counts: dict[str, int] = {}
+    for row in prepared:
+        if int(row.get("success") or 0) == 1:
+            group_id = f"{row['_scope_key']}|success"
+        elif row.get("final_state_hash"):
+            group_id = f"{row['_scope_key']}|{row['outcome_class']}|state:{row['final_state_hash']}"
+        elif row.get("future_option_gain_per_action") is not None:
+            bucket = round(float(row["future_option_gain_per_action"]), 3)
+            group_id = f"{row['_scope_key']}|{row['outcome_class']}|gain:{bucket}"
+        else:
+            group_id = ""
+        row["comparable_outcome_group_id"] = group_id
+        if group_id:
+            group_counts[group_id] = group_counts.get(group_id, 0) + 1
+    output: list[dict[str, Any]] = []
+    for row in prepared:
+        group_id = str(row.get("comparable_outcome_group_id") or "")
+        efficiency_active = bool(group_id) and int(group_counts.get(group_id, 0)) > 1
+        best_known = best_known_by_scope.get(str(row["_scope_key"]))
+        steps_to_success = row.get("steps_to_success")
+        normalized = (
+            float(best_known) / float(steps_to_success)
+            if efficiency_active and best_known is not None and steps_to_success not in (None, 0)
+            else None
+        )
+        equivalent_gap = (
+            float(int(row["trajectory_length"]) - int(best_known))
+            if best_known is not None and int(row.get("success") or 0) == 1
+            else None
+        )
+        if int(row.get("success") or 0) == 1 and efficiency_active:
+            efficiency_score = normalized
+        elif efficiency_active and row.get("future_option_gain_per_action") is not None:
+            efficiency_score = float(row["future_option_gain_per_action"])
+        else:
+            efficiency_score = None
+        output.append(
+            {
+                "trajectory_id": row["trajectory_id"],
+                "game_id": row["game_id"],
+                "level_id": row["level_id"],
+                "sampler": row["sampler"],
+                "seed": row["seed"],
+                "epoch": row["epoch"],
+                "outcome_class": row["outcome_class"],
+                "comparable_outcome_group_id": group_id,
+                "efficiency_active": int(efficiency_active),
+                "success": int(row["success"]),
+                "terminal": int(row["terminal"]),
+                "trajectory_length": int(row["trajectory_length"]),
+                "steps_to_success": steps_to_success,
+                "best_known_solution_length": best_known,
+                "normalized_solve_efficiency": normalized,
+                "future_option_gain": row["future_option_gain"],
+                "future_option_gain_per_action": row["future_option_gain_per_action"],
+                "equivalent_outcome_cost_gap": equivalent_gap,
+                "loop_count": int(row["loop_count"]),
+                "loop_ratio": float(row["loop_ratio"]),
+                "repeated_state_count": int(row["repeated_state_count"]),
+                "repeated_state_ratio": float(row["repeated_state_ratio"]),
+                "blocked_action_count": int(row["blocked_action_count"]),
+                "blocked_action_ratio": float(row["blocked_action_ratio"]),
+                "wasted_action_count": int(row["wasted_action_count"]),
+                "wasted_action_ratio": float(row["wasted_action_ratio"]),
+                "unique_state_count": int(row["unique_state_count"]),
+                "trajectory_efficiency_score": efficiency_score,
+                "efficiency_score": efficiency_score,
+                "efficiency_memory_bonus": 0.0,
+                "efficiency_replay_bonus": 0.0,
+                "efficiency_retention_bonus": 0.0,
+                "efficiency_promotion_bonus": 0.0,
+            }
+        )
+    diagnostics["reconstructed_trajectory_rows"] = len(output)
+    diagnostics["no_success_events"] = all(int(row.get("success") or 0) != 1 for row in output)
+    diagnostics["no_terminal_events"] = all(int(row.get("terminal") or 0) != 1 for row in output)
+    diagnostics["no_episode_boundaries"] = all("no_episode:" in str(row.get("trajectory_id") or "") for row in output)
+    diagnostics["missing_state_hashes"] = diagnostics["missing_state_hash_count"] > 0
+    return output
 
 
 def _count_improvements(rows: list[dict[str, Any]]) -> int:

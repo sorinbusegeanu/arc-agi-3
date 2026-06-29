@@ -520,6 +520,7 @@ class V6System:
             delta_signature=getattr(delta, "signature", None) or getattr(delta, "delta_id", None) or str(delta),
             prediction_correct=prediction_correct,
             carrier_source=carrier_source,
+            global_step=interaction.global_step,
         )
         carrier_stats = (
             self.carrier_tracker.stats_for_carrier(carrier_signature)

@@ -19,6 +19,9 @@ class CarrierCandidate:
     prediction_lift: float
     compression_gain: float
     evidence_interaction_ids: list[str]
+    first_seen_global_step: int | None = None
+    last_seen_global_step: int | None = None
+    first_emergent_global_step: int | None = None
     status: str = "candidate"
 
     def to_dict(self) -> dict[str, Any]:
@@ -34,6 +37,7 @@ class CarrierEvidenceEvent:
     action_signature: str | None
     family_id: str | None
     delta_signature: str | None
+    global_step: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -72,6 +76,7 @@ class CarrierEmergenceTracker:
         delta_signature: str | None,
         prediction_correct: bool | None,
         carrier_source: str = "unknown",
+        global_step: int | None = None,
     ) -> CarrierEvidenceEvent | None:
         if carrier_signature is None:
             return None
@@ -83,6 +88,7 @@ class CarrierEmergenceTracker:
             action_signature=None if action_signature is None else str(action_signature),
             family_id=None if family_id is None else str(family_id),
             delta_signature=None if delta_signature is None else str(delta_signature),
+            global_step=None if global_step is None else int(global_step),
         )
         self.events.append(event)
         self.by_carrier[event.carrier_signature].append(event)
@@ -180,6 +186,10 @@ class CarrierEmergenceTracker:
         ):
             status = "emergent_carrier"
         first = events[0] if events else None
+        real_steps = [int(event.global_step) for event in events if event.global_step is not None]
+        first_seen_global_step = min(real_steps) if real_steps else None
+        last_seen_global_step = max(real_steps) if real_steps else None
+        first_emergent_global_step = first_seen_global_step if status == "emergent_carrier" else None
         return CarrierCandidate(
             carrier_id=f"carrier:{carrier_signature}",
             carrier_signature=str(carrier_signature),
@@ -193,6 +203,9 @@ class CarrierEmergenceTracker:
             prediction_lift=prediction_lift,
             compression_gain=compression_gain,
             evidence_interaction_ids=[event.interaction_id for event in events[:20]],
+            first_seen_global_step=first_seen_global_step,
+            last_seen_global_step=last_seen_global_step,
+            first_emergent_global_step=first_emergent_global_step,
             status=status,
         )
 
