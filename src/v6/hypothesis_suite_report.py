@@ -221,6 +221,7 @@ def run_hypothesis_suite_report(
     max_role_transfer_attempts: int = 25_000,
     max_future_option_events: int = 50_000,
     max_future_option_motifs: int = 25_000,
+    allow_memory_repair: bool = False,
     hypothesis_progress: bool | None = None,
     hypothesis_progress_log_every: int = 1000,
 ) -> dict[str, Any]:
@@ -310,7 +311,8 @@ def run_hypothesis_suite_report(
     with _phase("family_repair"):
         if memory_dir is not None:
             t0 = time.time()
-            family_repair_summary = derive_missing_transformation_families_from_stable_contingencies(memory_dir)
+            if allow_memory_repair:
+                family_repair_summary = derive_missing_transformation_families_from_stable_contingencies(memory_dir)
             timings["family_repair_seconds"] = float(time.time() - t0)
     with _phase("H01"):
         t0 = time.time()
@@ -525,6 +527,7 @@ def run_hypothesis_suite_report(
             payload["phase_seconds"] = {f"{key.lower()}_seconds": timings.get(f"{key.lower()}_seconds", 0.0)}
     summary.update(timings)
     summary["suite_mode"] = resolved_suite_mode
+    summary["memory_repair_ran_during_report"] = bool(allow_memory_repair)
     summary["max_role_transfer_attempts"] = int(max_role_transfer_attempts)
     summary["max_future_option_events"] = int(max_future_option_events)
     summary["max_future_option_motifs"] = int(max_future_option_motifs)

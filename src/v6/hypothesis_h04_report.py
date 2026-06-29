@@ -11,6 +11,11 @@ MAX_GRAPH_EDGE_EXPLOSION_RATIO_FOR_VALID = 10.0
 MAX_OVERCONNECTED_CARRIER_RATIO_FOR_VALID = 0.25
 
 
+def _append_unique(items: list[str], message: str) -> None:
+    if message not in items:
+        items.append(message)
+
+
 def _resolve_temporal_value(primary: Any, fallback: Any) -> tuple[int | None, str]:
     if primary is not None:
         return int(primary), "temporal_milestones"
@@ -249,9 +254,12 @@ def evaluate_h04_carrier_emergence(
     overconnected_ratio = float(metrics.get("overconnected_carrier_count") or 0) / carrier_count
     graph_edge_explosion_ratio = float(metrics.get("graph_edge_explosion_ratio") or 0.0)
     metrics["overconnected_carrier_ratio"] = overconnected_ratio
-    metrics["h04_graph_quality_pass"] = not (
-        graph_edge_explosion_ratio > MAX_GRAPH_EDGE_EXPLOSION_RATIO_FOR_VALID
-        or overconnected_ratio > MAX_OVERCONNECTED_CARRIER_RATIO_FOR_VALID
+    metrics["h04_graph_quality_pass"] = (
+        graph_edge_explosion_ratio <= MAX_GRAPH_EDGE_EXPLOSION_RATIO_FOR_VALID
+        and overconnected_ratio <= MAX_OVERCONNECTED_CARRIER_RATIO_FOR_VALID
+        and usable_emergent_carrier_count > 0
+        and usable_carrier_explains_edge_count > 0
+        and usable_carrier_anchors_edge_count > 0
     )
     if considered_sources and considered_sources == {"real_evidence"}:
         metrics["carrier_timing_source"] = "real_evidence"
@@ -265,9 +273,16 @@ def evaluate_h04_carrier_emergence(
         metrics["carrier_timing_source"] = "unknown"
     missing_evidence = [] if carrier_rows else ["no carrier candidates in compact memory"]
     if usable_signature_ids and usable_carrier_explains_edge_count == 0 and usable_carrier_anchors_edge_count == 0:
-        missing_evidence.append(
-            "Usable carriers have no usable explains/anchors graph edges; carrier graph IDs may be mismatched or graph projection failed."
+        _append_unique(
+            missing_evidence,
+            "Usable carriers have no usable explains/anchors graph edges; carrier graph IDs may be mismatched or graph projection failed.",
         )
+    if usable_emergent_carrier_count <= 0:
+        _append_unique(missing_evidence, "H04 has no usable emergent carriers.")
+    if usable_carrier_explains_edge_count <= 0:
+        _append_unique(missing_evidence, "H04 has no usable carrier explains graph edges.")
+    if usable_carrier_anchors_edge_count <= 0:
+        _append_unique(missing_evidence, "H04 has no usable carrier anchors graph edges.")
     if not carrier_rows:
         decision = "INVALID" if first_stable_family_step is not None else "INCONCLUSIVE"
     elif (
@@ -290,7 +305,7 @@ def evaluate_h04_carrier_emergence(
         and h03_before_h04_usable is False
     ):
         decision = "PARTIALLY_VALID"
-        missing_evidence.append("H04 temporal order failed without fully real carrier timing provenance.")
+        _append_unique(missing_evidence, "H04 temporal order failed without fully real carrier timing provenance.")
     elif (
         usable_emergent_carrier_count > 0
         and not emergent_fallback
@@ -312,7 +327,7 @@ def evaluate_h04_carrier_emergence(
         and h03_before_h04_usable is None
     ):
         decision = "PARTIALLY_VALID"
-        missing_evidence.append("explicit H03-before-H04 temporal evidence unavailable")
+        _append_unique(missing_evidence, "explicit H03-before-H04 temporal evidence unavailable")
     elif (
         usable_emergent_carrier_count > 0
         and not emergent_fallback
@@ -324,7 +339,7 @@ def evaluate_h04_carrier_emergence(
         and metrics["carrier_timing_source"] != "real_evidence"
     ):
         decision = "PARTIALLY_VALID"
-        missing_evidence.append("H04 timing is not fully grounded in real carrier evidence timing.")
+        _append_unique(missing_evidence, "H04 timing is not fully grounded in real carrier evidence timing.")
     elif emergent_fallback and len(emergent_fallback) == len(emergent):
         decision = "INVALID"
     elif carrier_rows:
@@ -333,17 +348,18 @@ def evaluate_h04_carrier_emergence(
         decision = "INCONCLUSIVE"
     if h03_before_h04_usable is False and metrics["carrier_timing_source"] != "real_evidence":
         if "H04 temporal order failed without fully real carrier timing provenance." not in missing_evidence:
-            missing_evidence.append("H04 temporal order failed without fully real carrier timing provenance.")
+            _append_unique(missing_evidence, "H04 temporal order failed without fully real carrier timing provenance.")
         if decision == "VALID":
             decision = "PARTIALLY_VALID"
     elif metrics["carrier_timing_source"] != "real_evidence" and decision == "VALID":
         if "H04 timing is not fully grounded in real carrier evidence timing." not in missing_evidence:
-            missing_evidence.append("H04 timing is not fully grounded in real carrier evidence timing.")
+            _append_unique(missing_evidence, "H04 timing is not fully grounded in real carrier evidence timing.")
         decision = "PARTIALLY_VALID"
     if metrics["h04_graph_quality_pass"] is not True:
         if "H04 carrier graph is overconnected; remapping/edge explosion prevents robust VALID classification." not in missing_evidence:
-            missing_evidence.append(
-                "H04 carrier graph is overconnected; remapping/edge explosion prevents robust VALID classification."
+            _append_unique(
+                missing_evidence,
+                "H04 carrier graph is overconnected; remapping/edge explosion prevents robust VALID classification.",
             )
         if decision == "VALID":
             decision = "PARTIALLY_VALID"

@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any
 
 from v6.higher_order_substrate import derive_higher_order_memory
-from v6.memory.compact_memory import ensure_memory_layout
 
 
 def evaluate_h07_concept_emergence(
@@ -17,12 +16,11 @@ def evaluate_h07_concept_emergence(
     already_derived: bool = False,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    ensure_memory_layout(memory_dir)
-    if not already_derived:
-        derive_higher_order_memory(memory_dir=memory_dir, run_dir=run_dir)
     current_state = Path(memory_dir) / "current_state.sqlite"
+    if not already_derived and current_state.exists():
+        derive_higher_order_memory(memory_dir=memory_dir, run_dir=run_dir)
     if not current_state.exists():
-        result = _base_result("INCONCLUSIVE", ["compact memory missing current_state.sqlite"])
+        result = _base_result("INSUFFICIENT_EVIDENCE", [f"Missing expected compact-memory file: {current_state}"])
         _write_outputs(output_dir, result)
         return result
     with sqlite3.connect(current_state) as conn:

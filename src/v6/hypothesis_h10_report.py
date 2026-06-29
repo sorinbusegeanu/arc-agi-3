@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any
 
 from v6.future_options import derive_future_option_memory
-from v6.memory.compact_memory import ensure_memory_layout
 
 
 def _missing_tables(connection: sqlite3.Connection, required: tuple[str, ...]) -> list[str]:
@@ -52,10 +51,23 @@ def evaluate_h10_future_option_attention(
     already_derived: bool = False,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    ensure_memory_layout(memory_dir)
-    if not already_derived:
+    current_state = Path(memory_dir) / "current_state.sqlite"
+    if not already_derived and current_state.exists():
         derive_future_option_memory(memory_dir=memory_dir, run_dir=run_dir)
-    with sqlite3.connect(Path(memory_dir) / "current_state.sqlite") as conn:
+    if not current_state.exists():
+        result = {
+            "hypothesis_id": "H10",
+            "evidence_source": "compact_memory",
+            "decision": "INSUFFICIENT_EVIDENCE",
+            "missing_evidence": [f"Missing expected compact-memory file: {current_state}"],
+            "future_option_event_count": 0,
+            "future_option_attention_link_count": 0,
+            "h10_blocked_by_h09": True,
+            "core_metrics": {},
+        }
+        _write(output_dir, result)
+        return result
+    with sqlite3.connect(current_state) as conn:
         conn.row_factory = sqlite3.Row
         missing_tables = _missing_tables(conn, ("future_option_attention_links", "future_option_events"))
         if missing_tables:

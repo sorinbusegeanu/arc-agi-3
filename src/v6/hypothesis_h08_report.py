@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any
 
 from v6.higher_order_substrate import derive_higher_order_memory
-from v6.memory.compact_memory import ensure_memory_layout
 
 
 def _evidence_diagnostics(memory_dir: Path, run_dir: Path | None, *, missing_target: str) -> dict[str, Any]:
@@ -29,10 +28,9 @@ def evaluate_h08_world_model_coherence(
     already_derived: bool = False,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    ensure_memory_layout(memory_dir)
-    if not already_derived:
-        derive_higher_order_memory(memory_dir=memory_dir, run_dir=run_dir)
     current_state = Path(memory_dir) / "current_state.sqlite"
+    if not already_derived and current_state.exists():
+        derive_higher_order_memory(memory_dir=memory_dir, run_dir=run_dir)
     if not current_state.exists():
         result = _base_result("INSUFFICIENT_EVIDENCE", [f"Missing expected compact-memory file: {current_state}"])
         result["evidence_diagnostics"] = _evidence_diagnostics(memory_dir, run_dir, missing_target="current_state.sqlite")

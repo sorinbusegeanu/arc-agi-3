@@ -13048,8 +13048,6 @@ def test_h09_h10_h11_missing_tables_return_insufficient_evidence(tmp_path: Path,
     import v6.hypothesis_h10_report as h10_report
     import v6.hypothesis_h11_report as h11_report
 
-    for module in (h09_report, h10_report, h11_report):
-        monkeypatch.setattr(module, "ensure_memory_layout", lambda memory_dir: None)
     memory_dir = tmp_path / "memory_missing_tables"
     memory_dir.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
@@ -13064,6 +13062,90 @@ def test_h09_h10_h11_missing_tables_return_insufficient_evidence(tmp_path: Path,
     assert "Missing expected compact-memory table(s):" in h09["missing_evidence"][0]
     assert "Missing expected compact-memory table(s):" in h10["missing_evidence"][0]
     assert "Missing expected compact-memory table(s):" in h11["missing_evidence"][0]
+
+
+def test_h_reports_do_not_create_current_state_when_memory_missing(tmp_path: Path) -> None:
+    from v6.hypothesis_h07_report import evaluate_h07_concept_emergence
+    from v6.hypothesis_h08_report import evaluate_h08_world_model_coherence
+    from v6.hypothesis_h09_report import evaluate_h09_future_option_motifs
+    from v6.hypothesis_h10_report import evaluate_h10_future_option_attention
+    from v6.hypothesis_h11_report import evaluate_h11_future_option_transfer_concepts
+
+    memory_dir = tmp_path / "missing_memory"
+    assert not (memory_dir / "current_state.sqlite").exists()
+    evaluate_h07_concept_emergence(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h07_missing", already_derived=True)
+    evaluate_h08_world_model_coherence(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h08_missing", already_derived=True)
+    evaluate_h09_future_option_motifs(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h09_missing", already_derived=True)
+    evaluate_h10_future_option_attention(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h10_missing", already_derived=True)
+    evaluate_h11_future_option_transfer_concepts(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h11_missing", already_derived=True)
+    assert not (memory_dir / "current_state.sqlite").exists()
+
+
+def test_suite_does_not_run_family_repair_unless_allowed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import v6.hypothesis_suite_report as suite_report
+
+    run_dir = tmp_path / "run_suite_no_repair"
+    output_dir = tmp_path / "out_suite_no_repair"
+    memory_dir = tmp_path / "memory_suite_no_repair"
+    run_dir.mkdir()
+    ensure_memory_layout(memory_dir)
+    (run_dir / "interaction_sampling_v05c_report.json").write_text(json.dumps({"runs": []}), encoding="utf-8")
+    called = {"count": 0}
+    monkeypatch.setattr(suite_report, "derive_missing_transformation_families_from_stable_contingencies", lambda memory_dir: called.__setitem__("count", called["count"] + 1) or {"compact_family_repair_used": True})
+    stub = {"decision": "INSUFFICIENT_EVIDENCE", "core_metrics": {}, "missing_evidence": []}
+    monkeypatch.setattr(suite_report, "evaluate_h01_contingency_emergence", lambda **kwargs: dict(stub, hypothesis_id="H01"))
+    monkeypatch.setattr(suite_report, "evaluate_h02_prediction_violation_attention", lambda **kwargs: dict(stub, hypothesis_id="H02"))
+    monkeypatch.setattr(suite_report, "evaluate_h03_transformation_family_formation", lambda **kwargs: dict(stub, hypothesis_id="H03"))
+    monkeypatch.setattr(suite_report, "evaluate_h04_carrier_emergence", lambda **kwargs: dict(stub, hypothesis_id="H04"))
+    monkeypatch.setattr(suite_report, "evaluate_h05_role_emergence", lambda **kwargs: dict(stub, hypothesis_id="H05"))
+    monkeypatch.setattr(suite_report, "evaluate_h12_efficiency_emergence", lambda **kwargs: dict(stub, hypothesis_id="H12"))
+    summary = suite_report.run_hypothesis_suite_report(
+        run_dir=run_dir,
+        memory_dir=memory_dir,
+        output_dir=output_dir,
+        scan_all_dbs=False,
+        max_db_files=0,
+        max_rows=0,
+        allow_memory_repair=False,
+        hypothesis_progress=False,
+        suite_mode="fast",
+    )
+    assert called["count"] == 0
+    assert summary["memory_repair_ran_during_report"] is False
+
+
+def test_h04_graph_quality_false_without_usable_emergent_carriers(tmp_path: Path) -> None:
+    from v6.hypothesis_h04_report import evaluate_h04_carrier_emergence
+
+    memory_dir = tmp_path / "memory_h04_no_usable_emergent"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute("INSERT INTO transformation_families (family_id, canonical_signature, support_count, member_count, first_seen_global_step, last_seen_global_step, stability_score) VALUES (1,'fam1',4,2,10,12,0.7)")
+        conn.execute("INSERT INTO carrier_candidates (carrier_id, carrier_signature, carrier_source, support_count, linked_family_count, first_seen_global_step, last_seen_global_step, carrier_timing_source, stability_score, is_emergent) VALUES ('bad','carrier_bad','object',1,100,14,15,'real_evidence',0.8,1)")
+        for idx in range(60):
+            conn.execute("INSERT INTO carrier_links (carrier_signature, linked_type, linked_key, support_count, first_seen_global_step, last_seen_global_step) VALUES ('carrier_bad','family',?,1,14,15)", (f'fam{idx}',))
+        conn.commit()
+    result = evaluate_h04_carrier_emergence(run_dir=None, memory_dir=memory_dir, output_dir=tmp_path / "h04_no_usable_emergent")
+    assert result["usable_emergent_carrier_count"] == 0
+    assert result["h04_graph_quality_pass"] is False
+
+
+def test_h04_graph_quality_false_without_usable_graph_edges(tmp_path: Path) -> None:
+    from v6.hypothesis_h04_report import evaluate_h04_carrier_emergence
+
+    memory_dir = tmp_path / "memory_h04_no_edges"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute("INSERT INTO transformation_families (family_id, canonical_signature, support_count, member_count, first_seen_global_step, last_seen_global_step, stability_score) VALUES (1,'fam1',4,2,10,12,0.7)")
+        conn.execute("INSERT INTO carrier_candidates (carrier_id, carrier_signature, carrier_source, support_count, linked_family_count, first_seen_global_step, last_seen_global_step, carrier_timing_source, stability_score, is_emergent) VALUES ('good','carrier_good','object',5,1,14,15,'real_evidence',0.8,1)")
+        conn.execute("INSERT INTO carrier_links (carrier_signature, linked_type, linked_key, support_count, first_seen_global_step, last_seen_global_step) VALUES ('carrier_good','family','fam1',1,14,15)")
+        conn.execute("INSERT INTO carrier_links (carrier_signature, linked_type, linked_key, support_count, first_seen_global_step, last_seen_global_step) VALUES ('carrier_good','context','ctx1',1,14,15)")
+        conn.execute("INSERT INTO carrier_links (carrier_signature, linked_type, linked_key, support_count, first_seen_global_step, last_seen_global_step) VALUES ('carrier_good','context','ctx2',1,14,15)")
+        conn.commit()
+    result = evaluate_h04_carrier_emergence(run_dir=None, memory_dir=memory_dir, output_dir=tmp_path / "h04_no_edges")
+    assert result["usable_carrier_explains_edge_count"] == 0
+    assert result["usable_carrier_anchors_edge_count"] == 0
+    assert result["h04_graph_quality_pass"] is False
 
 
 def test_h10_unbounded_lift_can_be_valid(tmp_path: Path) -> None:
@@ -14076,6 +14158,136 @@ def test_h12_positive_cost_gap_correlation_is_flagged_bad(tmp_path: Path, monkey
     )
     assert result["cost_gap_replay_selection_bad"] is True
     assert "Replay preference is positively correlated with equivalent-outcome cost gap; inefficient trajectories are being preferentially selected." in result["missing_evidence"]
+
+
+def test_h12_efficiency_score_populates_correlations(tmp_path: Path) -> None:
+    from v6.evaluation.h12_efficiency_emergence import evaluate_h12_efficiency_emergence
+
+    memory_dir = tmp_path / "memory_h12_efficiency_score"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute(
+            """
+            INSERT INTO trajectory_efficiency (
+                trajectory_id, game_id, level_id, sampler, seed, epoch, outcome_class, comparable_outcome_group_id,
+                efficiency_active, success, terminal, trajectory_length, steps_to_success, best_known_solution_length,
+                normalized_solve_efficiency, equivalent_outcome_cost_gap, efficiency_score,
+                efficiency_memory_bonus, efficiency_replay_bonus
+            ) VALUES
+            ('t1','g','l','s',0,1,'WIN','grp',1,1,1,10,10,8,0.8,1.0,0.2,0.1,0.2),
+            ('t2','g','l','s',0,1,'WIN','grp',1,1,1,10,10,8,0.9,2.0,0.4,0.2,0.4)
+            """
+        )
+        conn.commit()
+    result = evaluate_h12_efficiency_emergence(run_dir=tmp_path / "run_h12_efficiency_score", memory_dir=memory_dir, output_dir=tmp_path / "out_h12_efficiency_score")
+    assert result["efficiency_memory_fitness_correlation"] is not None
+    assert result["efficiency_replay_priority_correlation"] is not None
+
+
+def test_h12_cannot_be_valid_when_efficiency_correlations_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import v6.evaluation.h12_efficiency_emergence as h12_report
+
+    memory_dir = tmp_path / "memory_h12_missing_corr"
+    ensure_memory_layout(memory_dir)
+    efficiency_root = tmp_path / "efficiency"
+    efficiency_root.mkdir(parents=True, exist_ok=True)
+    (efficiency_root / "trajectory_efficiency_state.json").write_text(
+        json.dumps({"epoch": 0, "mean_normalized_solve_efficiency": 0.1}),
+        encoding="utf-8",
+    )
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute(
+            """
+            INSERT INTO trajectory_efficiency (
+                trajectory_id, game_id, level_id, sampler, seed, epoch, outcome_class, comparable_outcome_group_id,
+                efficiency_active, success, terminal, trajectory_length, steps_to_success, best_known_solution_length,
+                normalized_solve_efficiency, equivalent_outcome_cost_gap, efficiency_score,
+                efficiency_memory_bonus, efficiency_replay_bonus
+            ) VALUES
+            ('t1','g','l','s',0,1,'WIN','grp',1,1,1,10,10,8,0.8,1.0,0.2,0.1,0.2),
+            ('t2','g','l','s',0,1,'WIN','grp',1,1,1,10,10,8,0.9,2.0,0.4,0.2,0.4)
+            """
+        )
+        conn.commit()
+    original = h12_report._correlation
+    def fake_correlation(rows, x, y):
+        if (x, y) in {
+            ("efficiency_score", "efficiency_memory_bonus"),
+            ("efficiency_score", "efficiency_replay_bonus"),
+        }:
+            return None
+        return original(rows, x, y)
+    monkeypatch.setattr(h12_report, "_correlation", fake_correlation)
+    result = h12_report.evaluate_h12_efficiency_emergence(
+        run_dir=tmp_path / "epochs" / "epoch_0001" / "raw",
+        memory_dir=memory_dir,
+        output_dir=tmp_path / "out_h12_missing_corr",
+    )
+    assert result["decision"] == "PARTIALLY_VALID"
+    assert "Trajectory efficiency improved, but memory/replay correlation evidence is unavailable." in result["missing_evidence"]
+
+
+def test_h12_rerunning_same_epoch_does_not_compare_against_itself(tmp_path: Path) -> None:
+    from v6.evaluation.h12_efficiency_emergence import evaluate_h12_efficiency_emergence
+
+    memory_dir = tmp_path / "memory_h12_same_epoch"
+    ensure_memory_layout(memory_dir)
+    efficiency_root = tmp_path / "epochs" / "epoch_0002" / "efficiency"
+    efficiency_root.mkdir(parents=True, exist_ok=True)
+    (efficiency_root / "trajectory_efficiency_state.json").write_text(
+        json.dumps({"epoch": 2, "mean_normalized_solve_efficiency": 0.95}),
+        encoding="utf-8",
+    )
+    run_dir = tmp_path / "epochs" / "epoch_0002" / "raw"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute(
+            """
+            INSERT INTO trajectory_efficiency (
+                trajectory_id, game_id, level_id, sampler, seed, epoch, outcome_class, comparable_outcome_group_id,
+                efficiency_active, success, terminal, trajectory_length, steps_to_success, best_known_solution_length,
+                normalized_solve_efficiency, equivalent_outcome_cost_gap, efficiency_score,
+                efficiency_memory_bonus, efficiency_replay_bonus
+            ) VALUES
+            ('t1','g','l','s',0,2,'WIN','grp',1,1,1,10,10,8,0.8,1.0,0.2,0.1,0.2),
+            ('t2','g','l','s',0,2,'WIN','grp',1,1,1,10,10,8,0.9,2.0,0.4,0.2,0.4)
+            """
+        )
+        conn.commit()
+    result = evaluate_h12_efficiency_emergence(run_dir=run_dir, memory_dir=memory_dir, output_dir=tmp_path / "out_h12_same_epoch")
+    assert result["efficiency_improved_vs_previous_epoch"] is None
+    assert result["h12_efficiency_not_improving"] is False
+
+
+def test_h12_preserves_best_known_solution_lengths_not_in_current_rows(tmp_path: Path) -> None:
+    from v6.evaluation.h12_efficiency_emergence import evaluate_h12_efficiency_emergence
+
+    memory_dir = tmp_path / "memory_h12_best_known"
+    ensure_memory_layout(memory_dir)
+    efficiency_root = tmp_path / "efficiency"
+    efficiency_root.mkdir(parents=True, exist_ok=True)
+    (efficiency_root / "best_known_solution_lengths.json").write_text(
+        json.dumps({"old_game|__none__": 7}),
+        encoding="utf-8",
+    )
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute(
+            """
+            INSERT INTO trajectory_efficiency (
+                trajectory_id, game_id, level_id, sampler, seed, epoch, outcome_class, comparable_outcome_group_id,
+                efficiency_active, success, terminal, trajectory_length, steps_to_success, best_known_solution_length,
+                normalized_solve_efficiency, equivalent_outcome_cost_gap, efficiency_score,
+                efficiency_memory_bonus, efficiency_replay_bonus
+            ) VALUES
+            ('t1','new_game','l','s',0,1,'WIN','grp',1,1,1,10,10,9,0.9,1.0,0.2,0.1,0.2),
+            ('t2','new_game','l','s',0,1,'WIN','grp',1,1,1,9,9,9,1.0,0.0,0.3,0.2,0.3)
+            """
+        )
+        conn.commit()
+    evaluate_h12_efficiency_emergence(run_dir=tmp_path / "run_h12_best_known", memory_dir=memory_dir, output_dir=tmp_path / "out_h12_best_known")
+    saved = json.loads((efficiency_root / "best_known_solution_lengths.json").read_text(encoding="utf-8"))
+    assert saved["old_game|__none__"] == 7
+    assert "new_game|l" in saved
 
 
 def test_is_retryable_fold_error_matches_locked_busy_variants() -> None:

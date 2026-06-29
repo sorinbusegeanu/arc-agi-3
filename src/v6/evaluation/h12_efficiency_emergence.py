@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import sqlite3
 from pathlib import Path
 from typing import Any
 
 from v6.memory.compact_memory import configure_compact_sqlite_connection, ensure_memory_layout
 from v6.memory.direct_streaming_fold import direct_streaming_manifest_exists
-from v6.memory.trajectory_efficiency import save_best_known_solution_lengths
+from v6.memory.trajectory_efficiency import load_best_known_solution_lengths, save_best_known_solution_lengths
 
 
 def evaluate_h12_efficiency_emergence(
@@ -20,14 +21,25 @@ def evaluate_h12_efficiency_emergence(
     output_dir.mkdir(parents=True, exist_ok=True)
     rows, evidence_source, reconstruction = _load_trajectory_rows(run_dir=run_dir, memory_dir=memory_dir)
     rows = [dict(row) for row in rows]
+    for row in rows:
+        if row.get("efficiency_score") is None and row.get("trajectory_efficiency_score") is not None:
+            row["efficiency_score"] = row.get("trajectory_efficiency_score")
+        if row.get("trajectory_efficiency_score") is None and row.get("efficiency_score") is not None:
+            row["trajectory_efficiency_score"] = row.get("efficiency_score")
     _write_parquet(output_dir / "h12_trajectory_metrics.parquet", rows)
     efficiency_root = ((memory_dir.parent / "efficiency") if memory_dir is not None else (run_dir / "efficiency"))
     efficiency_root.mkdir(parents=True, exist_ok=True)
     best_known_path = efficiency_root / "best_known_solution_lengths.json"
     state_path = efficiency_root / "trajectory_efficiency_state.json"
     previous_state = _load_json(state_path) or {}
-    previous_epoch_mean = previous_state.get("mean_normalized_solve_efficiency")
-    best_known_map: dict[str, int] = {}
+    current_epoch = _infer_current_epoch(rows, run_dir)
+    previous_epoch = previous_state.get("epoch")
+    previous_epoch_mean = None
+    if previous_epoch is not None and current_epoch is not None and int(previous_epoch) < int(current_epoch):
+        previous_epoch_mean = previous_state.get("mean_normalized_solve_efficiency")
+    elif previous_epoch is None:
+        previous_epoch_mean = previous_state.get("mean_normalized_solve_efficiency")
+    best_known_map: dict[str, int] = dict(load_best_known_solution_lengths(best_known_path))
     for row in rows:
         if int(row.get("success") or 0) != 1:
             continue
@@ -36,7 +48,9 @@ def evaluate_h12_efficiency_emergence(
         best = row.get("best_known_solution_length")
         if best is None:
             continue
-        best_known_map[f"{game_id}|{level_id}"] = int(best)
+        key = f"{game_id}|{level_id}"
+        existing = best_known_map.get(key)
+        best_known_map[key] = int(best) if existing is None else min(int(existing), int(best))
     save_best_known_solution_lengths(best_known_path, best_known_map)
     successful_rows = [row for row in rows if int(row.get("success") or 0) == 1]
     active_rows = [row for row in rows if int(row.get("efficiency_active") or 0) == 1]
@@ -65,10 +79,10 @@ def evaluate_h12_efficiency_emergence(
         "mean_loop_ratio": _mean(row.get("loop_ratio") for row in rows),
         "mean_repeated_state_ratio": _mean(row.get("repeated_state_ratio") for row in rows),
         "mean_blocked_action_ratio": _mean(row.get("blocked_action_ratio") for row in rows),
-        "efficiency_replay_priority_correlation": _correlation(rows, "trajectory_efficiency_score", "efficiency_replay_bonus"),
-        "efficiency_memory_fitness_correlation": _correlation(rows, "trajectory_efficiency_score", "efficiency_memory_bonus"),
+        "efficiency_replay_priority_correlation": _correlation(rows, "efficiency_score", "efficiency_replay_bonus"),
+        "efficiency_memory_fitness_correlation": _correlation(rows, "efficiency_score", "efficiency_memory_bonus"),
         "cost_gap_replay_priority_correlation": _correlation(successful_rows, "equivalent_outcome_cost_gap", "efficiency_replay_bonus"),
-        "future_option_gain_per_action_correlation": _correlation(rows, "future_option_gain_per_action", "trajectory_efficiency_score"),
+        "future_option_gain_per_action_correlation": _correlation(rows, "future_option_gain_per_action", "efficiency_score"),
         "efficiency_improved_vs_previous_epoch": (
             None
             if previous_epoch_mean is None or current_mean_norm is None
@@ -114,8 +128,20 @@ def evaluate_h12_efficiency_emergence(
     elif (result["efficiency_memory_fitness_correlation"] or 0.0) < 0.0 or (result["efficiency_replay_priority_correlation"] or 0.0) < 0.0:
         result["decision"] = "INVALID"
         result["missing_evidence"].append("Lower-cost equivalent trajectories are not receiving stronger memory or replay preference.")
-    elif result["efficiency_improved_vs_previous_epoch"] and (result["efficiency_memory_fitness_correlation"] or 0.0) >= 0.0:
-        result["decision"] = "VALID"
+    elif result["efficiency_improved_vs_previous_epoch"]:
+        memory_corr = result.get("efficiency_memory_fitness_correlation")
+        replay_corr = result.get("efficiency_replay_priority_correlation")
+        valid_efficiency_correlation = (
+            (memory_corr is not None and float(memory_corr) >= 0.0)
+            or (replay_corr is not None and float(replay_corr) >= 0.0)
+        )
+        if valid_efficiency_correlation:
+            result["decision"] = "VALID"
+        else:
+            result["decision"] = "PARTIALLY_VALID"
+            result["missing_evidence"].append(
+                "Trajectory efficiency improved, but memory/replay correlation evidence is unavailable."
+            )
     else:
         result["decision"] = "PARTIALLY_VALID"
     if result["h12_efficiency_not_improving"] and result["decision"] == "VALID":
@@ -137,11 +163,18 @@ def evaluate_h12_efficiency_emergence(
         if result["decision"] == "VALID":
             result["decision"] = "PARTIALLY_VALID"
     state_payload = {
+        "epoch": current_epoch,
         "mean_normalized_solve_efficiency": result.get("mean_normalized_solve_efficiency"),
         "best_known_solution_count": result.get("best_known_solution_count"),
         "last_decision": result.get("decision"),
     }
-    state_path.write_text(json.dumps(state_payload, indent=2), encoding="utf-8")
+    should_update_state = (
+        current_epoch is None
+        or previous_epoch is None
+        or int(current_epoch) >= int(previous_epoch)
+    )
+    if should_update_state:
+        state_path.write_text(json.dumps(state_payload, indent=2), encoding="utf-8")
     result["core_metrics"] = {
         key: result.get(key)
         for key in (
@@ -179,6 +212,22 @@ def evaluate_h12_efficiency_emergence(
     }
     _write_report(output_dir, result)
     return result
+
+
+def _infer_current_epoch(rows: list[dict[str, Any]], run_dir: Path) -> int | None:
+    epochs: list[int] = []
+    for row in rows:
+        value = row.get("epoch")
+        if value is None:
+            continue
+        try:
+            epochs.append(int(value))
+        except (TypeError, ValueError):
+            pass
+    if epochs:
+        return max(epochs)
+    match = re.search(r"epoch_(\d+)", str(run_dir))
+    return int(match.group(1)) if match else None
 
 
 def _load_trajectory_rows(*, run_dir: Path, memory_dir: Path | None) -> tuple[list[dict[str, Any]], str, dict[str, Any]]:
