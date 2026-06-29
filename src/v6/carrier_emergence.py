@@ -125,10 +125,21 @@ class CarrierEmergenceTracker:
         family_count = max(1, int(linked_family_count or 0))
         event_count = max(1, int(support_count or 0))
         base_family_id = f"restored-family:{carrier_signature}"
+        first_seen = None if first_seen_global_step is None else int(first_seen_global_step)
+        last_seen = None if last_seen_global_step is None else int(last_seen_global_step)
+        span = None if first_seen is None or last_seen is None else max(0, int(last_seen) - int(first_seen))
         for index in range(event_count):
             family_id = base_family_id if family_count <= 1 else f"{base_family_id}:{index % family_count}"
             context_signature = f"restored-context:{carrier_signature}:{index % context_count}"
             prediction_correct = True if normalized_emergent else (index % 2 == 0)
+            if first_seen is not None and last_seen is not None:
+                global_step = first_seen + int(span * index / max(1, event_count - 1))
+            elif first_seen is not None:
+                global_step = first_seen
+            elif last_seen is not None:
+                global_step = last_seen
+            else:
+                global_step = None
             self.record_interaction(
                 interaction_id=f"restored:{carrier_signature}:{index}",
                 carrier_signature=str(carrier_signature),
@@ -138,6 +149,7 @@ class CarrierEmergenceTracker:
                 delta_signature=f"restored-delta:{carrier_signature}:{index}",
                 prediction_correct=prediction_correct,
                 carrier_source=normalized_source,
+                global_step=global_step,
             )
         # Force the imported candidate to carry forward the stronger persisted metrics.
         if str(carrier_signature) in self.by_carrier:

@@ -48,6 +48,7 @@ def evaluate_h04_carrier_emergence(
                 linked_family_count,
                 first_seen_global_step,
                 last_seen_global_step,
+                carrier_timing_source,
                 stability_score,
                 is_emergent
             FROM carrier_candidates
@@ -81,22 +82,6 @@ def evaluate_h04_carrier_emergence(
             FROM carrier_links
             """
         ).fetchall()
-        summary_rows = state_conn.execute(
-            """
-            SELECT key, value_json
-            FROM memory_summary
-            WHERE key IN ('fold_summary', 'carrier_sidecar_real_timing_count', 'carrier_sidecar_missing_timing_count')
-            """
-        ).fetchall()
-    fold_summary: dict[str, Any] = {}
-    summary_values: dict[str, Any] = {}
-    for row in summary_rows:
-        try:
-            summary_values[str(row[0])] = json.loads(row[1]) if row[1] is not None else None
-        except Exception:
-            summary_values[str(row[0])] = row[1]
-    if isinstance(summary_values.get("fold_summary"), dict):
-        fold_summary = dict(summary_values["fold_summary"])
     graph_counts = {
         "carrier_explains_edge_count": 0,
         "carrier_anchors_edge_count": 0,
@@ -145,6 +130,32 @@ def evaluate_h04_carrier_emergence(
             max_linked_family_count_after_filter = max(max_linked_family_count_after_filter, linked_family_count_actual)
             if int(row["is_emergent"] or 0) == 1:
                 usable_emergent_carrier_count += 1
+    carrier_source_counts = {"real_evidence": 0, "fold_start_fallback": 0, "mixed": 0, "unknown": 0}
+    emergent_source_counts = {"real_evidence": 0, "fold_start_fallback": 0, "mixed": 0, "unknown": 0}
+    for row in carrier_rows:
+        source = str(row["carrier_timing_source"] or "unknown")
+        if source not in carrier_source_counts:
+            source = "unknown"
+        carrier_source_counts[source] += 1
+        if int(row["is_emergent"] or 0) == 1:
+            emergent_source_counts[source] += 1
+    considered_rows: list[sqlite3.Row] = []
+    for row in carrier_rows:
+        carrier_signature = str(row["carrier_signature"])
+        linked_family_count_actual = len(links_by_carrier.get(carrier_signature, {}).get("family", set()))
+        specificity = float(float(row["support_count"] or 0.0) / max(1, linked_family_count_actual))
+        overconnected = linked_family_count_actual > MAX_LINKED_FAMILIES_PER_CARRIER
+        usable = (not overconnected) and specificity >= MIN_CARRIER_SPECIFICITY
+        if usable and int(row["is_emergent"] or 0) == 1:
+            considered_rows.append(row)
+    if not considered_rows:
+        considered_rows = emergent or carrier_rows
+    considered_sources = {
+        str(row["carrier_timing_source"] or "unknown")
+        if str(row["carrier_timing_source"] or "unknown") in {"real_evidence", "fold_start_fallback", "mixed", "unknown"}
+        else "unknown"
+        for row in considered_rows
+    }
     h03_before_h04 = (
         None
         if first_stable_family_step is None or first_emergent_carrier_step is None
@@ -184,23 +195,24 @@ def evaluate_h04_carrier_emergence(
         "h03_before_h04_cases": 0 if h03_before_h04 is None else 1,
         "temporal_order_required_for_valid": True,
         "h03_before_h04": h03_before_h04,
+        "carrier_real_timing_count": carrier_source_counts["real_evidence"],
+        "carrier_fallback_timing_count": carrier_source_counts["fold_start_fallback"],
+        "carrier_mixed_timing_count": carrier_source_counts["mixed"],
+        "carrier_unknown_timing_count": carrier_source_counts["unknown"],
+        "emergent_carrier_real_timing_count": emergent_source_counts["real_evidence"],
+        "emergent_carrier_fallback_timing_count": emergent_source_counts["fold_start_fallback"],
         **graph_counts,
     }
-    real_timing_count = int(summary_values.get("carrier_sidecar_real_timing_count", fold_summary.get("carrier_sidecar_real_timing_count", 0)) or 0)
-    missing_timing_count = int(summary_values.get("carrier_sidecar_missing_timing_count", fold_summary.get("carrier_sidecar_missing_timing_count", 0)) or 0)
-    carrier_timing_sources: list[str] = []
-    if real_timing_count > 0:
-        carrier_timing_sources.append("real_evidence")
-    if missing_timing_count > 0:
-        carrier_timing_sources.append("fold_start_fallback")
-    if carrier_timing_sources and all(item == "real_evidence" for item in carrier_timing_sources):
+    if considered_sources and considered_sources == {"real_evidence"}:
         metrics["carrier_timing_source"] = "real_evidence"
-    elif carrier_timing_sources and all(item == "fold_start_fallback" for item in carrier_timing_sources):
+    elif considered_sources and "real_evidence" in considered_sources:
+        metrics["carrier_timing_source"] = "mixed"
+    elif considered_sources == {"fold_start_fallback"}:
         metrics["carrier_timing_source"] = "fold_start_fallback"
-    elif carrier_timing_sources:
+    elif considered_sources and ("mixed" in considered_sources or len(considered_sources) > 1):
         metrics["carrier_timing_source"] = "mixed"
     else:
-        metrics["carrier_timing_source"] = "missing"
+        metrics["carrier_timing_source"] = "unknown"
     missing_evidence = [] if carrier_rows else ["no carrier candidates in compact memory"]
     if not carrier_rows:
         decision = "INVALID" if first_stable_family_step is not None else "INCONCLUSIVE"
@@ -224,7 +236,7 @@ def evaluate_h04_carrier_emergence(
         and h03_before_h04 is False
     ):
         decision = "PARTIALLY_VALID"
-        missing_evidence.append("H04 temporal order failed using fold-start fallback carrier timestamps; real carrier timing unavailable.")
+        missing_evidence.append("H04 temporal order failed without fully real carrier timing provenance.")
     elif (
         usable_emergent_carrier_count > 0
         and not emergent_fallback

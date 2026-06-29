@@ -12830,7 +12830,16 @@ def test_compact_memory_creates_requested_indexes(tmp_path: Path) -> None:
     assert "idx_role_transfer_kind_scope" in names
     assert "idx_future_option_links_motif_type_key" in names
     assert "idx_trajectory_efficiency_scope" in names
+    assert "idx_carrier_candidates_timing_source" in names
     assert "idx_graph_edges_type_source" in graph_names
+
+
+def test_carrier_candidates_schema_has_timing_source_after_migration(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory_carrier_schema"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(carrier_candidates)").fetchall()}
+    assert "carrier_timing_source" in columns
 
 
 def test_h07_reports_role_skip_reasons_when_concepts_zero(tmp_path: Path) -> None:
@@ -13259,13 +13268,154 @@ def test_carrier_sidecar_with_real_timing_preserves_real_timing(tmp_path: Path) 
     )
     with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
         row = conn.execute(
-            "SELECT first_seen_global_step, last_seen_global_step FROM carrier_candidates WHERE carrier_signature = 'carrier1'"
+            "SELECT first_seen_global_step, last_seen_global_step, carrier_timing_source FROM carrier_candidates WHERE carrier_signature = 'carrier1'"
         ).fetchone()
         timing_count = json.loads(
             conn.execute("SELECT value_json FROM memory_summary WHERE key = 'carrier_sidecar_real_timing_count'").fetchone()[0]
         )
-    assert row == (13, 19)
+    assert row == (13, 19, "real_evidence")
     assert int(timing_count) == 1
+
+
+def test_carrier_sidecar_without_timing_uses_fallback_source(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory_carrier_timing_fallback_source"
+    db_path = tmp_path / "seed_0.sqlite"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE interactions (id INTEGER PRIMARY KEY)")
+        conn.commit()
+    (tmp_path / "carrier_candidates.json").write_text(
+        json.dumps(
+            [
+                {
+                    "carrier_id": "c1",
+                    "carrier_signature": "carrier1",
+                    "carrier_source": "object",
+                    "context_signature": "ctx1",
+                    "support_count": 4,
+                    "distinct_family_count": 1,
+                    "status": "emergent_carrier",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    fold_sampling_job_sidecars_into_compact_memory(
+        db_path=db_path,
+        memory_dir=memory_dir,
+        fold_config=CompactMemoryFoldConfig(global_step_start=21, global_step_end=22),
+        delete_after_merge=False,
+    )
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        row = conn.execute(
+            "SELECT first_seen_global_step, last_seen_global_step, carrier_timing_source FROM carrier_candidates WHERE carrier_signature = 'carrier1'"
+        ).fetchone()
+    assert row == (21, 22, "fold_start_fallback")
+
+
+def test_carrier_timing_source_merge_preserves_and_upgrades(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory_carrier_merge"
+    shard_a = tmp_path / "shard_a_carrier"
+    shard_b = tmp_path / "shard_b_carrier"
+    shard_c = tmp_path / "shard_c_carrier"
+    ensure_memory_layout(memory_dir)
+    ensure_memory_layout(shard_a)
+    ensure_memory_layout(shard_b)
+    ensure_memory_layout(shard_c)
+    with sqlite3.connect(shard_a / "current_state.sqlite") as conn:
+        conn.execute(
+            "INSERT INTO carrier_candidates (carrier_id, carrier_signature, carrier_source, support_count, linked_family_count, first_seen_global_step, last_seen_global_step, carrier_timing_source, stability_score, is_emergent) VALUES ('a','carrier_real','object',1,1,1,2,'fold_start_fallback',0.1,1)"
+        )
+        conn.execute(
+            "INSERT INTO carrier_candidates (carrier_id, carrier_signature, carrier_source, support_count, linked_family_count, first_seen_global_step, last_seen_global_step, carrier_timing_source, stability_score, is_emergent) VALUES ('b','carrier_unknown','object',1,1,1,2,'unknown',0.1,1)"
+        )
+        conn.execute(
+            "INSERT INTO carrier_candidates (carrier_id, carrier_signature, carrier_source, support_count, linked_family_count, first_seen_global_step, last_seen_global_step, carrier_timing_source, stability_score, is_emergent) VALUES ('c','carrier_mixed','object',1,1,1,2,'fold_start_fallback',0.1,1)"
+        )
+        conn.commit()
+    with sqlite3.connect(shard_b / "current_state.sqlite") as conn:
+        conn.execute(
+            "INSERT INTO carrier_candidates (carrier_id, carrier_signature, carrier_source, support_count, linked_family_count, first_seen_global_step, last_seen_global_step, carrier_timing_source, stability_score, is_emergent) VALUES ('a2','carrier_real','object',1,1,3,4,'real_evidence',0.2,1)"
+        )
+        conn.execute(
+            "INSERT INTO carrier_candidates (carrier_id, carrier_signature, carrier_source, support_count, linked_family_count, first_seen_global_step, last_seen_global_step, carrier_timing_source, stability_score, is_emergent) VALUES ('b2','carrier_unknown','object',1,1,3,4,'fold_start_fallback',0.2,1)"
+        )
+        conn.commit()
+    with sqlite3.connect(shard_c / "current_state.sqlite") as conn:
+        conn.execute(
+            "INSERT INTO carrier_candidates (carrier_id, carrier_signature, carrier_source, support_count, linked_family_count, first_seen_global_step, last_seen_global_step, carrier_timing_source, stability_score, is_emergent) VALUES ('c2','carrier_mixed','object',1,1,3,4,'mixed',0.2,1)"
+        )
+        conn.commit()
+    merge_compact_memory_shards_into_main(
+        memory_dir=memory_dir,
+        shard_dirs=[shard_a, shard_b, shard_c],
+        fold_config=CompactMemoryFoldConfig(global_step_start=1, global_step_end=4),
+        parallel_workers=1,
+    )
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        rows = dict(conn.execute("SELECT carrier_signature, carrier_timing_source FROM carrier_candidates").fetchall())
+    assert rows["carrier_real"] == "real_evidence"
+    assert rows["carrier_unknown"] == "fold_start_fallback"
+    assert rows["carrier_mixed"] == "mixed"
+
+
+def test_fold_live_system_preserves_candidate_timing(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory_live_timing"
+    system = SimpleNamespace(
+        step_count=50,
+        config=SimpleNamespace(memory_output_dir=str(memory_dir)),
+        contingency_learner=SimpleNamespace(stable_contingencies=lambda: []),
+        clusterer=SimpleNamespace(families={}),
+        memory_lifecycle=SimpleNamespace(replay_candidates={}),
+        carrier_tracker=SimpleNamespace(
+            build_candidates=lambda: [
+                SimpleNamespace(
+                    carrier_id="c1",
+                    carrier_signature="carrier1",
+                    carrier_source="object",
+                    support_count=3,
+                    distinct_family_count=1,
+                    prediction_lift=0.2,
+                    status="emergent_carrier",
+                    first_seen_global_step=31,
+                    last_seen_global_step=39,
+                    first_emergent_global_step=33,
+                    family_id=None,
+                    context_signature="ctx1",
+                )
+            ]
+        ),
+        memory=None,
+    )
+    summary = fold_live_system_into_compact_memory(system, memory_dir)
+    assert summary is not None
+    with sqlite3.connect(Path(memory_dir) / "current_state.sqlite") as conn:
+        row = conn.execute(
+            "SELECT first_seen_global_step, last_seen_global_step, carrier_timing_source FROM carrier_candidates WHERE carrier_signature = 'carrier1'"
+        ).fetchone()
+        link_row = conn.execute(
+            "SELECT first_seen_global_step, last_seen_global_step FROM carrier_links WHERE carrier_signature = 'carrier1' AND linked_type = 'context'"
+        ).fetchone()
+    assert row == (33, 39, "real_evidence")
+    assert link_row == (33, 39)
+
+
+def test_import_candidate_preserves_imported_timing_in_synthetic_events() -> None:
+    tracker = CarrierEmergenceTracker()
+    tracker.import_candidate(
+        carrier_signature="carrier1",
+        carrier_source="object",
+        support_count=3,
+        linked_family_count=1,
+        first_seen_global_step=10,
+        last_seen_global_step=20,
+        stability_score=0.5,
+        is_emergent=True,
+    )
+    steps = [event.global_step for event in tracker.by_carrier["carrier1"]]
+    assert steps[0] == 10
+    assert steps[-1] == 20
+    assert all(step is not None for step in steps)
 
 
 def test_fallback_carrier_timing_does_not_hard_invalidate_h04(tmp_path: Path) -> None:
@@ -13320,7 +13470,29 @@ def test_fallback_carrier_timing_does_not_hard_invalidate_h04(tmp_path: Path) ->
     result = evaluate_h04_carrier_emergence(run_dir=None, memory_dir=memory_dir, output_dir=tmp_path / "h04_fallback")
     assert result["carrier_timing_source"] == "fold_start_fallback"
     assert result["decision"] == "PARTIALLY_VALID"
-    assert any("fold-start fallback carrier timestamps" in item for item in result["missing_evidence"])
+    assert any("without fully real carrier timing provenance" in item for item in result["missing_evidence"])
+
+
+def test_h04_false_temporal_order_with_real_timing_is_invalid(tmp_path: Path) -> None:
+    from v6.hypothesis_h04_report import evaluate_h04_carrier_emergence
+
+    memory_dir = tmp_path / "memory_h04_real_invalid"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute("INSERT INTO transformation_families (family_id, canonical_signature, support_count, member_count, first_seen_global_step, last_seen_global_step, stability_score) VALUES (1,'fam1',4,2,10,12,0.7)")
+        conn.execute("INSERT INTO carrier_candidates (carrier_id, carrier_signature, carrier_source, support_count, linked_family_count, first_seen_global_step, last_seen_global_step, carrier_timing_source, stability_score, is_emergent) VALUES ('c1','carrier1','object',5,2,7,8,'real_evidence',0.8,1)")
+        conn.execute("INSERT INTO carrier_links (carrier_signature, linked_type, linked_key, support_count, first_seen_global_step, last_seen_global_step) VALUES ('carrier1','family','fam1',1,7,8)")
+        conn.execute("INSERT INTO carrier_links (carrier_signature, linked_type, linked_key, support_count, first_seen_global_step, last_seen_global_step) VALUES ('carrier1','context','ctx1',1,7,8)")
+        conn.execute("INSERT INTO carrier_links (carrier_signature, linked_type, linked_key, support_count, first_seen_global_step, last_seen_global_step) VALUES ('carrier1','context','ctx2',1,7,8)")
+        conn.commit()
+    with sqlite3.connect(memory_dir / "graph.sqlite") as conn:
+        conn.execute("INSERT INTO graph_edges (edge_id, source_node_id, target_node_id, edge_type, first_seen_global_step, last_seen_global_step, support_count, weight) VALUES ('e1','a','b','explains',1,1,1,1.0)")
+        conn.execute("INSERT INTO graph_edges (edge_id, source_node_id, target_node_id, edge_type, first_seen_global_step, last_seen_global_step, support_count, weight) VALUES ('e2','a','b','anchors',1,1,1,1.0)")
+        conn.commit()
+    result = evaluate_h04_carrier_emergence(run_dir=None, memory_dir=memory_dir, output_dir=tmp_path / "h04_real_invalid")
+    assert result["carrier_timing_source"] == "real_evidence"
+    assert result["h03_before_h04"] is False
+    assert result["decision"] == "INVALID"
 
 
 def test_role_timing_fallback_cannot_make_h05_valid(tmp_path: Path) -> None:
@@ -13329,12 +13501,32 @@ def test_role_timing_fallback_cannot_make_h05_valid(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory_h05_fallback_role"
     ensure_memory_layout(memory_dir)
     with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
-        conn.execute("INSERT INTO carrier_candidates (carrier_id, carrier_signature, carrier_source, support_count, linked_family_count, first_seen_global_step, last_seen_global_step, stability_score, is_emergent) VALUES ('c1','carrier1','object',5,2,1,2,0.8,1)")
+        conn.execute("INSERT INTO carrier_candidates (carrier_id, carrier_signature, carrier_source, support_count, linked_family_count, first_seen_global_step, last_seen_global_step, carrier_timing_source, stability_score, is_emergent) VALUES ('c1','carrier1','object',5,2,1,2,'fold_start_fallback',0.8,1)")
         conn.execute("INSERT INTO role_candidates (role_signature, role_type, support_count, linked_carrier_count, linked_family_count, linked_context_count, cross_game_count, cross_context_count, first_seen_global_step, last_seen_global_step, role_stability_score, is_emergent) VALUES ('r1','role',5,2,1,2,1,2,11,12,0.8,1)")
+        conn.execute("INSERT INTO role_links (role_signature, linked_type, linked_key, support_count, first_seen_global_step, last_seen_global_step) VALUES ('r1', 'carrier', 'carrier1', 1, 11, 12)")
         conn.commit()
     result = evaluate_h05_role_emergence(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h05_fallback_role", already_derived=True)
     assert result["role_timing_source"] == "fold_start_fallback"
     assert result["decision"] != "VALID"
+
+
+def test_h05_can_be_valid_only_with_real_role_timing_and_true_temporal_order(tmp_path: Path) -> None:
+    from v6.hypothesis_h05_report import evaluate_h05_role_emergence
+
+    memory_dir = tmp_path / "memory_h05_real_valid"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute("INSERT INTO carrier_candidates (carrier_id, carrier_signature, carrier_source, support_count, linked_family_count, first_seen_global_step, last_seen_global_step, carrier_timing_source, stability_score, is_emergent) VALUES ('c1','carrier1','object',5,2,7,8,'real_evidence',0.8,1)")
+        conn.execute("INSERT INTO temporal_milestones (game, sampler, seed, first_emergent_carrier_step) VALUES ('g','s',0,7)")
+        conn.execute("INSERT INTO role_candidates (role_signature, role_type, support_count, linked_carrier_count, linked_family_count, linked_context_count, cross_game_count, cross_context_count, first_seen_global_step, last_seen_global_step, role_stability_score, is_emergent) VALUES ('r1','role',5,2,1,2,1,2,11,12,0.8,1)")
+        conn.execute("INSERT INTO higher_order_milestones (milestone_name, first_global_step, evidence_key) VALUES ('first_role_candidate_step', 11, 'r1')")
+        conn.execute("INSERT INTO higher_order_milestones (milestone_name, first_global_step, evidence_key) VALUES ('first_emergent_role_step', 11, 'r1')")
+        conn.execute("INSERT INTO role_links (role_signature, linked_type, linked_key, support_count, first_seen_global_step, last_seen_global_step) VALUES ('r1', 'carrier', 'carrier1', 1, 11, 12)")
+        conn.commit()
+    result = evaluate_h05_role_emergence(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h05_real_valid", already_derived=True)
+    assert result["role_timing_source"] == "real_evidence"
+    assert result["h04_before_h05"] is True
+    assert result["decision"] == "VALID"
 
 
 def test_h12_reconstructs_trajectory_rows_from_compact_events_after_raw_cleanup(tmp_path: Path) -> None:

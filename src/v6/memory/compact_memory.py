@@ -1295,17 +1295,42 @@ def fold_live_system_into_compact_memory(system: Any, memory_dir: str | Path) ->
                 ),
             )
         for candidate in getattr(system.carrier_tracker, "build_candidates", lambda: [])():
+            is_emergent = int(candidate.status == "emergent_carrier" and candidate.carrier_source != "context_action_fallback")
+            first_seen_step_value = (
+                candidate.first_emergent_global_step
+                if is_emergent and candidate.first_emergent_global_step is not None
+                else candidate.first_seen_global_step
+            )
+            last_seen_step_value = candidate.last_seen_global_step
+            carrier_timing_source = "real_evidence" if (first_seen_step_value is not None or last_seen_step_value is not None) else "fold_start_fallback"
+            first_seen_step = int(first_seen_step_value) if first_seen_step_value is not None else global_step_start
+            last_seen_step = int(last_seen_step_value) if last_seen_step_value is not None else global_step_end
             state_conn.execute(
                 """
                 INSERT INTO carrier_candidates (
                     carrier_id, carrier_signature, carrier_source, support_count, linked_family_count,
-                    first_seen_global_step, last_seen_global_step, stability_score, is_emergent
+                    first_seen_global_step, last_seen_global_step, carrier_timing_source, stability_score, is_emergent
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(carrier_signature) DO UPDATE SET
                     support_count = MAX(carrier_candidates.support_count, excluded.support_count),
                     linked_family_count = MAX(carrier_candidates.linked_family_count, excluded.linked_family_count),
+                    first_seen_global_step = MIN(carrier_candidates.first_seen_global_step, excluded.first_seen_global_step),
                     last_seen_global_step = MAX(carrier_candidates.last_seen_global_step, excluded.last_seen_global_step),
+                    carrier_timing_source = CASE
+                        WHEN carrier_candidates.carrier_timing_source = 'real_evidence'
+                             OR excluded.carrier_timing_source = 'real_evidence'
+                        THEN 'real_evidence'
+                        WHEN COALESCE(carrier_candidates.carrier_timing_source, 'unknown') = COALESCE(excluded.carrier_timing_source, 'unknown')
+                        THEN COALESCE(excluded.carrier_timing_source, carrier_candidates.carrier_timing_source, 'unknown')
+                        WHEN carrier_candidates.carrier_timing_source = 'unknown'
+                             AND excluded.carrier_timing_source = 'fold_start_fallback'
+                        THEN 'fold_start_fallback'
+                        WHEN carrier_candidates.carrier_timing_source = 'fold_start_fallback'
+                             AND excluded.carrier_timing_source = 'unknown'
+                        THEN 'fold_start_fallback'
+                        ELSE 'mixed'
+                    END,
                     stability_score = MAX(carrier_candidates.stability_score, excluded.stability_score),
                     is_emergent = MAX(carrier_candidates.is_emergent, excluded.is_emergent)
                 """,
@@ -1315,10 +1340,11 @@ def fold_live_system_into_compact_memory(system: Any, memory_dir: str | Path) ->
                     candidate.carrier_source,
                     int(candidate.support_count),
                     int(candidate.distinct_family_count),
-                    global_step_start,
-                    global_step_end,
+                    first_seen_step,
+                    last_seen_step,
+                    carrier_timing_source,
                     float(candidate.prediction_lift),
-                    int(candidate.status == "emergent_carrier" and candidate.carrier_source != "context_action_fallback"),
+                    is_emergent,
                 ),
             )
             family_signature = None
@@ -1336,6 +1362,8 @@ def fold_live_system_into_compact_memory(system: Any, memory_dir: str | Path) ->
                 linked_type="family",
                 linked_key=family_signature,
                 fold_config=CompactMemoryFoldConfig(global_step_start=global_step_start, global_step_end=global_step_end),
+                first_seen_global_step=first_seen_step,
+                last_seen_global_step=last_seen_step,
             )
             _upsert_carrier_link(
                 state_conn,
@@ -1343,6 +1371,8 @@ def fold_live_system_into_compact_memory(system: Any, memory_dir: str | Path) ->
                 linked_type="context",
                 linked_key=None if candidate.context_signature is None else _normalize_jsonish(candidate.context_signature),
                 fold_config=CompactMemoryFoldConfig(global_step_start=global_step_start, global_step_end=global_step_end),
+                first_seen_global_step=first_seen_step,
+                last_seen_global_step=last_seen_step,
             )
             if family_signature is not None:
                 _upsert_observation_graph(
@@ -1659,14 +1689,28 @@ def _merge_state_tables(temp_state: sqlite3.Connection, state_conn: sqlite3.Conn
             """
             INSERT INTO carrier_candidates (
                 carrier_id, carrier_signature, carrier_source, support_count, linked_family_count,
-                first_seen_global_step, last_seen_global_step, stability_score, is_emergent
+                first_seen_global_step, last_seen_global_step, carrier_timing_source, stability_score, is_emergent
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(carrier_signature) DO UPDATE SET
                 support_count = MAX(carrier_candidates.support_count, excluded.support_count),
                 linked_family_count = MAX(carrier_candidates.linked_family_count, excluded.linked_family_count),
                 first_seen_global_step = MIN(carrier_candidates.first_seen_global_step, excluded.first_seen_global_step),
                 last_seen_global_step = MAX(carrier_candidates.last_seen_global_step, excluded.last_seen_global_step),
+                carrier_timing_source = CASE
+                    WHEN carrier_candidates.carrier_timing_source = 'real_evidence'
+                         OR excluded.carrier_timing_source = 'real_evidence'
+                    THEN 'real_evidence'
+                    WHEN COALESCE(carrier_candidates.carrier_timing_source, 'unknown') = COALESCE(excluded.carrier_timing_source, 'unknown')
+                    THEN COALESCE(excluded.carrier_timing_source, carrier_candidates.carrier_timing_source, 'unknown')
+                    WHEN carrier_candidates.carrier_timing_source = 'unknown'
+                         AND excluded.carrier_timing_source = 'fold_start_fallback'
+                    THEN 'fold_start_fallback'
+                    WHEN carrier_candidates.carrier_timing_source = 'fold_start_fallback'
+                         AND excluded.carrier_timing_source = 'unknown'
+                    THEN 'fold_start_fallback'
+                    ELSE 'mixed'
+                END,
                 stability_score = MAX(carrier_candidates.stability_score, excluded.stability_score),
                 is_emergent = MAX(carrier_candidates.is_emergent, excluded.is_emergent)
             """,
@@ -2501,6 +2545,7 @@ def _fold_single_db(
                 is_emergent = str(item.get("status") or "") == "emergent_carrier" and carrier_source != "context_action_fallback"
                 first_seen_value = item.get("first_emergent_global_step") if is_emergent and item.get("first_emergent_global_step") is not None else item.get("first_seen_global_step")
                 last_seen_value = item.get("last_seen_global_step")
+                carrier_timing_source = "real_evidence" if (first_seen_value is not None or last_seen_value is not None) else "fold_start_fallback"
                 if first_seen_value is None and last_seen_value is None:
                     totals["carrier_sidecar_missing_timing_count"] = int(totals.get("carrier_sidecar_missing_timing_count", 0) or 0) + 1
                 else:
@@ -2511,14 +2556,28 @@ def _fold_single_db(
                     """
                     INSERT INTO carrier_candidates (
                         carrier_id, carrier_signature, carrier_source, support_count, linked_family_count,
-                        first_seen_global_step, last_seen_global_step, stability_score, is_emergent
+                        first_seen_global_step, last_seen_global_step, carrier_timing_source, stability_score, is_emergent
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(carrier_signature) DO UPDATE SET
                         support_count = MAX(carrier_candidates.support_count, excluded.support_count),
                         linked_family_count = MAX(carrier_candidates.linked_family_count, excluded.linked_family_count),
                         first_seen_global_step = MIN(carrier_candidates.first_seen_global_step, excluded.first_seen_global_step),
                         last_seen_global_step = MAX(carrier_candidates.last_seen_global_step, excluded.last_seen_global_step),
+                        carrier_timing_source = CASE
+                            WHEN carrier_candidates.carrier_timing_source = 'real_evidence'
+                                 OR excluded.carrier_timing_source = 'real_evidence'
+                            THEN 'real_evidence'
+                            WHEN COALESCE(carrier_candidates.carrier_timing_source, 'unknown') = COALESCE(excluded.carrier_timing_source, 'unknown')
+                            THEN COALESCE(excluded.carrier_timing_source, carrier_candidates.carrier_timing_source, 'unknown')
+                            WHEN carrier_candidates.carrier_timing_source = 'unknown'
+                                 AND excluded.carrier_timing_source = 'fold_start_fallback'
+                            THEN 'fold_start_fallback'
+                            WHEN carrier_candidates.carrier_timing_source = 'fold_start_fallback'
+                                 AND excluded.carrier_timing_source = 'unknown'
+                            THEN 'fold_start_fallback'
+                            ELSE 'mixed'
+                        END,
                         stability_score = MAX(carrier_candidates.stability_score, excluded.stability_score),
                         is_emergent = MAX(carrier_candidates.is_emergent, excluded.is_emergent)
                     """,
@@ -2530,6 +2589,7 @@ def _fold_single_db(
                         int(item.get("distinct_family_count", 0) or item.get("linked_family_count", 0) or 0),
                         first_seen_step,
                         last_seen_step,
+                        carrier_timing_source,
                         float(item.get("prediction_lift", 0.0) or item.get("stability_score", 0.0) or 0.0),
                         int(is_emergent),
                     ),
@@ -2565,6 +2625,8 @@ def _fold_single_db(
                     linked_type="family",
                     linked_key=family_signature,
                     fold_config=fold_config,
+                    first_seen_global_step=first_seen_step,
+                    last_seen_global_step=last_seen_step,
                 )
                 _upsert_carrier_link(
                     state_conn,
@@ -2572,6 +2634,8 @@ def _fold_single_db(
                     linked_type="context",
                     linked_key=None if item.get("context_signature") is None else _normalize_jsonish(item.get("context_signature")),
                     fold_config=fold_config,
+                    first_seen_global_step=first_seen_step,
+                    last_seen_global_step=last_seen_step,
                 )
                 _upsert_carrier_link(
                     state_conn,
@@ -2579,6 +2643,8 @@ def _fold_single_db(
                     linked_type="contingency",
                     linked_key=contingency_key,
                     fold_config=fold_config,
+                    first_seen_global_step=first_seen_step,
+                    last_seen_global_step=last_seen_step,
                 )
                 _upsert_observation_graph(
                     graph_conn,
@@ -2635,6 +2701,7 @@ def _fold_carrier_candidates_sidecar(
         is_emergent = str(item.get("status") or "") == "emergent_carrier" and carrier_source != "context_action_fallback"
         first_seen_value = item.get("first_emergent_global_step") if is_emergent and item.get("first_emergent_global_step") is not None else item.get("first_seen_global_step")
         last_seen_value = item.get("last_seen_global_step")
+        carrier_timing_source = "real_evidence" if (first_seen_value is not None or last_seen_value is not None) else "fold_start_fallback"
         if first_seen_value is None and last_seen_value is None:
             totals["carrier_sidecar_missing_timing_count"] = int(totals.get("carrier_sidecar_missing_timing_count", 0) or 0) + 1
         else:
@@ -2645,14 +2712,28 @@ def _fold_carrier_candidates_sidecar(
             """
             INSERT INTO carrier_candidates (
                 carrier_id, carrier_signature, carrier_source, support_count, linked_family_count,
-                first_seen_global_step, last_seen_global_step, stability_score, is_emergent
+                first_seen_global_step, last_seen_global_step, carrier_timing_source, stability_score, is_emergent
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(carrier_signature) DO UPDATE SET
                 support_count = MAX(carrier_candidates.support_count, excluded.support_count),
                 linked_family_count = MAX(carrier_candidates.linked_family_count, excluded.linked_family_count),
                 first_seen_global_step = MIN(carrier_candidates.first_seen_global_step, excluded.first_seen_global_step),
                 last_seen_global_step = MAX(carrier_candidates.last_seen_global_step, excluded.last_seen_global_step),
+                carrier_timing_source = CASE
+                    WHEN carrier_candidates.carrier_timing_source = 'real_evidence'
+                         OR excluded.carrier_timing_source = 'real_evidence'
+                    THEN 'real_evidence'
+                    WHEN COALESCE(carrier_candidates.carrier_timing_source, 'unknown') = COALESCE(excluded.carrier_timing_source, 'unknown')
+                    THEN COALESCE(excluded.carrier_timing_source, carrier_candidates.carrier_timing_source, 'unknown')
+                    WHEN carrier_candidates.carrier_timing_source = 'unknown'
+                         AND excluded.carrier_timing_source = 'fold_start_fallback'
+                    THEN 'fold_start_fallback'
+                    WHEN carrier_candidates.carrier_timing_source = 'fold_start_fallback'
+                         AND excluded.carrier_timing_source = 'unknown'
+                    THEN 'fold_start_fallback'
+                    ELSE 'mixed'
+                END,
                 stability_score = MAX(carrier_candidates.stability_score, excluded.stability_score),
                 is_emergent = MAX(carrier_candidates.is_emergent, excluded.is_emergent)
             """,
@@ -2664,6 +2745,7 @@ def _fold_carrier_candidates_sidecar(
                 int(item.get("distinct_family_count", 0) or item.get("linked_family_count", 0) or 0),
                 first_seen_step,
                 last_seen_step,
+                carrier_timing_source,
                 float(item.get("prediction_lift", 0.0) or item.get("stability_score", 0.0) or 0.0),
                 int(is_emergent),
             ),
@@ -2699,6 +2781,8 @@ def _fold_carrier_candidates_sidecar(
             linked_type="family",
             linked_key=family_signature,
             fold_config=fold_config,
+            first_seen_global_step=first_seen_step,
+            last_seen_global_step=last_seen_step,
         )
         _upsert_carrier_link(
             state_conn,
@@ -2706,6 +2790,8 @@ def _fold_carrier_candidates_sidecar(
             linked_type="context",
             linked_key=None if item.get("context_signature") is None else _normalize_jsonish(item.get("context_signature")),
             fold_config=fold_config,
+            first_seen_global_step=first_seen_step,
+            last_seen_global_step=last_seen_step,
         )
         _upsert_carrier_link(
             state_conn,
@@ -2713,6 +2799,8 @@ def _fold_carrier_candidates_sidecar(
             linked_type="contingency",
             linked_key=contingency_key,
             fold_config=fold_config,
+            first_seen_global_step=first_seen_step,
+            last_seen_global_step=last_seen_step,
         )
         _upsert_observation_graph(
             graph_conn,
@@ -2819,6 +2907,8 @@ def _upsert_carrier_link(
     linked_type: str,
     linked_key: str | None,
     fold_config: CompactMemoryFoldConfig,
+    first_seen_global_step: int | None = None,
+    last_seen_global_step: int | None = None,
 ) -> None:
     if linked_key in (None, ""):
         return
@@ -2833,7 +2923,14 @@ def _upsert_carrier_link(
             first_seen_global_step = MIN(carrier_links.first_seen_global_step, excluded.first_seen_global_step),
             last_seen_global_step = MAX(carrier_links.last_seen_global_step, excluded.last_seen_global_step)
         """,
-        (str(carrier_signature), str(linked_type), str(linked_key), 1, fold_config.global_step_start, fold_config.global_step_end),
+        (
+            str(carrier_signature),
+            str(linked_type),
+            str(linked_key),
+            1,
+            int(first_seen_global_step) if first_seen_global_step is not None else fold_config.global_step_start,
+            int(last_seen_global_step) if last_seen_global_step is not None else fold_config.global_step_end,
+        ),
     )
 
 
@@ -3735,6 +3832,13 @@ def _coerce_float(value: Any) -> float | None:
         return None
 
 
+def _normalize_carrier_timing_source(value: Any) -> str:
+    text = str(value or "unknown").strip().lower()
+    if text in {"real_evidence", "fold_start_fallback", "mixed", "unknown"}:
+        return text
+    return "unknown"
+
+
 def _ensure_current_state_schema(path: Path) -> None:
     with sqlite3.connect(path) as connection:
         configure_compact_sqlite_connection(connection, write=True)
@@ -3795,6 +3899,7 @@ def _ensure_current_state_schema(path: Path) -> None:
                 linked_family_count INTEGER,
                 first_seen_global_step INTEGER,
                 last_seen_global_step INTEGER,
+                carrier_timing_source TEXT DEFAULT 'unknown',
                 stability_score REAL,
                 is_emergent INTEGER
             );
@@ -4220,6 +4325,8 @@ def _ensure_current_state_schema(path: Path) -> None:
             ON future_option_transfer_links(motif_signature);
             CREATE INDEX IF NOT EXISTS idx_trajectory_efficiency_scope
             ON trajectory_efficiency(game_id, level_id, sampler, seed, epoch);
+            CREATE INDEX IF NOT EXISTS idx_carrier_candidates_timing_source
+            ON carrier_candidates(carrier_timing_source);
             CREATE INDEX IF NOT EXISTS idx_compact_trajectory_events_scope
             ON compact_interaction_trajectory_events(game_id, level_id, sampler, seed, epoch, episode_id, global_step);
             """
@@ -4231,6 +4338,7 @@ def _ensure_current_state_schema(path: Path) -> None:
         _ensure_column(connection, "stable_contingencies", "prediction_error_before", "REAL")
         _ensure_column(connection, "stable_contingencies", "prediction_error_after", "REAL")
         _ensure_column(connection, "stable_contingencies", "normalized_contingency_key", "TEXT")
+        _ensure_column(connection, "carrier_candidates", "carrier_timing_source", "TEXT DEFAULT 'unknown'")
         _ensure_column(connection, "transformation_families", "canonical_signature", "TEXT")
         _ensure_column(connection, "transformation_families", "relaxed_signature", "TEXT")
         _ensure_column(connection, "transformation_families", "effect_type", "TEXT")
