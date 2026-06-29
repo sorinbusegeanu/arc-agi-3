@@ -1213,7 +1213,7 @@ def _skipped_fast_mode_result(hypothesis_id: str) -> dict[str, Any]:
         "hypothesis_id": hypothesis_id,
         "decision": "SKIPPED_FAST_MODE",
         "evidence_stage": "not_evaluated_this_epoch",
-        "missing_evidence": [],
+        "missing_evidence": ["Run with --hypothesis-suite-mode full to evaluate this hypothesis."],
         "core_metrics": {},
         "evidence_source": "cached_derived_memory",
     }

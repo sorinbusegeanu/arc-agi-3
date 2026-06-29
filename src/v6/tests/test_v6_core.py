@@ -11848,6 +11848,65 @@ def test_h01_reports_coverage_attribution_missing_when_stable_exists_without_gam
     assert "Contingency attribution by game/sampler is missing from current artifacts." in result["missing_evidence"]
 
 
+def test_h01_does_not_report_missing_attribution_when_compact_cross_counts_exist(tmp_path: Path) -> None:
+    from v6.hypothesis_h01_report import _finalize_h01_result
+
+    result = {
+        "hypothesis_id": "H01",
+        "hypothesis_statement": "x",
+        "decision": "PARTIALLY_VALID",
+        "stable_contingency_count": 3,
+        "cross_game_contingency_presence": None,
+        "cross_game_contingency_count": 2,
+        "cross_sampler_contingency_count": 0,
+        "per_game_contingency_counts": {},
+        "per_sampler_contingency_counts": {},
+        "missing_evidence": [],
+        "evidence_diagnostics": {},
+    }
+    _finalize_h01_result(result, tmp_path / "h01_attr_ok")
+    assert result["coverage_attribution_missing"] is False
+    assert "Contingency attribution by game/sampler is missing from current artifacts." not in result["missing_evidence"]
+
+
+def test_h02_preserves_compact_direct_linkage(tmp_path: Path) -> None:
+    from v6.hypothesis_h02_report import evaluate_h02_prediction_violation_attention
+    from v6.memory.direct_streaming_fold import ensure_direct_streaming_fold_manifest
+
+    run_dir = tmp_path / "run_h02_compact"
+    run_dir.mkdir()
+    (run_dir / "interaction_sampling_v05c_report.json").write_text(
+        json.dumps(
+            {
+                "runs": [{"game": "g1", "sampler_name": "s1", "total_interactions": 2}],
+                "validation": {
+                    "memory_record_count": 2,
+                    "memory_replay_candidate_count": 2,
+                    "high_priority_replay_count": 1,
+                    "context_contradiction_count": 1,
+                    "repeated_contradiction_count": 1,
+                    "prediction_error_positive_count": 1,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    memory_dir = tmp_path / "memory_h02_compact"
+    ensure_memory_layout(memory_dir)
+    ensure_direct_streaming_fold_manifest(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute("INSERT INTO memory_scores (node_id, replay_priority) VALUES ('M0:interaction:1', 0.9)")
+        conn.execute("INSERT INTO memory_scores (node_id, replay_priority) VALUES ('M0:interaction:2', 0.4)")
+        conn.execute(
+            "INSERT INTO memory_edges (source_node_id, target_node_id, edge_type, weight, support_count) VALUES ('M0:interaction:1', 'contradiction:c1', 'violates_prediction', 1.0, 1)"
+        )
+        conn.commit()
+    result = evaluate_h02_prediction_violation_attention(run_dir, tmp_path / "out_h02_compact", memory_dir=memory_dir)
+    assert result["direct_replay_lift_available"] is True
+    assert float(result["prediction_violation_replay_lift"]) > 1.25
+    assert "Direct per-interaction prediction-error to replay-priority linkage unavailable" not in " ".join(result["missing_evidence"])
+
+
 def test_h01_derives_prediction_accuracy_and_context_lift_from_prediction_results(tmp_path: Path) -> None:
     from v6.hypothesis_h01_report import evaluate_h01_contingency_emergence
 
@@ -12774,6 +12833,9 @@ def test_h04_uses_usable_emergent_carrier_timing_for_decision(tmp_path: Path) ->
         conn.execute("INSERT INTO transformation_families (family_id, canonical_signature, support_count, member_count, first_seen_global_step, last_seen_global_step, stability_score) VALUES (1,'fam1',4,2,10,12,0.7)")
         conn.execute("INSERT INTO carrier_candidates (carrier_id, carrier_signature, carrier_source, support_count, linked_family_count, first_seen_global_step, last_seen_global_step, carrier_timing_source, stability_score, is_emergent) VALUES ('bad','carrier_bad','object',5,200,7,8,'real_evidence',0.8,1)")
         conn.execute("INSERT INTO carrier_candidates (carrier_id, carrier_signature, carrier_source, support_count, linked_family_count, first_seen_global_step, last_seen_global_step, carrier_timing_source, stability_score, is_emergent) VALUES ('good','carrier_good','object',5,2,14,15,'real_evidence',0.8,1)")
+        conn.execute("INSERT INTO carrier_candidates (carrier_id, carrier_signature, carrier_source, support_count, linked_family_count, first_seen_global_step, last_seen_global_step, carrier_timing_source, stability_score, is_emergent) VALUES ('ok1','carrier_ok1','object',5,1,14,15,'real_evidence',0.8,0)")
+        conn.execute("INSERT INTO carrier_candidates (carrier_id, carrier_signature, carrier_source, support_count, linked_family_count, first_seen_global_step, last_seen_global_step, carrier_timing_source, stability_score, is_emergent) VALUES ('ok2','carrier_ok2','object',5,1,14,15,'real_evidence',0.8,0)")
+        conn.execute("INSERT INTO carrier_candidates (carrier_id, carrier_signature, carrier_source, support_count, linked_family_count, first_seen_global_step, last_seen_global_step, carrier_timing_source, stability_score, is_emergent) VALUES ('ok3','carrier_ok3','object',5,1,14,15,'real_evidence',0.8,0)")
         for idx in range(200):
             conn.execute("INSERT INTO carrier_links (carrier_signature, linked_type, linked_key, support_count, first_seen_global_step, last_seen_global_step) VALUES ('carrier_bad','family',?,1,7,8)", (f'fam{idx}',))
         conn.execute("INSERT INTO carrier_links (carrier_signature, linked_type, linked_key, support_count, first_seen_global_step, last_seen_global_step) VALUES ('carrier_good','family','fam1',1,14,15)")
@@ -12788,6 +12850,33 @@ def test_h04_uses_usable_emergent_carrier_timing_for_decision(tmp_path: Path) ->
     assert result["h03_before_h04_all"] is False
     assert result["h03_before_h04_usable"] is True
     assert result["decision"] == "VALID"
+
+
+def test_h04_valid_is_downgraded_by_graph_explosion(tmp_path: Path) -> None:
+    from v6.hypothesis_h04_report import evaluate_h04_carrier_emergence
+
+    memory_dir = tmp_path / "memory_h04_graph_explosion"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute("INSERT INTO transformation_families (family_id, canonical_signature, support_count, member_count, first_seen_global_step, last_seen_global_step, stability_score) VALUES (1,'fam1',4,2,10,12,0.7)")
+        conn.execute("INSERT INTO carrier_candidates (carrier_id, carrier_signature, carrier_source, support_count, linked_family_count, first_seen_global_step, last_seen_global_step, carrier_timing_source, stability_score, is_emergent) VALUES ('good','carrier_good','object',5,2,14,15,'real_evidence',0.8,1)")
+        conn.execute("INSERT INTO carrier_links (carrier_signature, linked_type, linked_key, support_count, first_seen_global_step, last_seen_global_step) VALUES ('carrier_good','family','fam1',1,14,15)")
+        conn.execute("INSERT INTO carrier_links (carrier_signature, linked_type, linked_key, support_count, first_seen_global_step, last_seen_global_step) VALUES ('carrier_good','context','ctx1',1,14,15)")
+        conn.execute("INSERT INTO carrier_links (carrier_signature, linked_type, linked_key, support_count, first_seen_global_step, last_seen_global_step) VALUES ('carrier_good','context','ctx2',1,14,15)")
+        conn.commit()
+    with sqlite3.connect(memory_dir / "graph.sqlite") as conn:
+        conn.execute("INSERT INTO graph_edges (edge_id, source_node_id, target_node_id, edge_type, first_seen_global_step, last_seen_global_step, support_count, weight) VALUES ('g1','carrier:carrier_good','b','explains',1,1,1,1.0)")
+        conn.execute("INSERT INTO graph_edges (edge_id, source_node_id, target_node_id, edge_type, first_seen_global_step, last_seen_global_step, support_count, weight) VALUES ('g2','carrier:carrier_good','b','anchors',1,1,1,1.0)")
+        for idx in range(30):
+            conn.execute(
+                "INSERT INTO graph_edges (edge_id, source_node_id, target_node_id, edge_type, first_seen_global_step, last_seen_global_step, support_count, weight) VALUES (?, 'other', 'b', 'explains',1,1,1,1.0)",
+                (f"extra{idx}",),
+            )
+        conn.commit()
+    result = evaluate_h04_carrier_emergence(run_dir=None, memory_dir=memory_dir, output_dir=tmp_path / "h04_graph_explosion")
+    assert result["h04_graph_quality_pass"] is False
+    assert result["decision"] == "PARTIALLY_VALID"
+    assert "H04 carrier graph is overconnected; remapping/edge explosion prevents robust VALID classification." in result["missing_evidence"]
 
 
 def test_h08_candidate_proxy_only_is_insufficient_evidence(tmp_path: Path) -> None:
@@ -13578,6 +13667,28 @@ def test_h05_overconnected_roles_do_not_make_validity(tmp_path: Path) -> None:
     assert result["decision"] != "VALID"
 
 
+def test_h05_singleton_role_ratio_downgrades_validity(tmp_path: Path) -> None:
+    from v6.hypothesis_h05_report import evaluate_h05_role_emergence
+
+    memory_dir = tmp_path / "memory_h05_noisy"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute("INSERT INTO carrier_candidates (carrier_id, carrier_signature, carrier_source, support_count, linked_family_count, first_seen_global_step, last_seen_global_step, carrier_timing_source, stability_score, is_emergent) VALUES ('c1','carrier1','object',5,2,7,8,'real_evidence',0.8,1)")
+        conn.execute("INSERT INTO temporal_milestones (game, sampler, seed, first_emergent_carrier_step) VALUES ('g','s',0,7)")
+        conn.execute("INSERT INTO role_candidates (role_signature, role_type, support_count, linked_carrier_count, linked_family_count, linked_context_count, cross_game_count, cross_context_count, first_seen_global_step, last_seen_global_step, role_stability_score, is_emergent) VALUES ('r1','role',5,2,1,2,1,2,11,12,0.8,1)")
+        conn.execute("INSERT INTO role_candidates (role_signature, role_type, support_count, linked_carrier_count, linked_family_count, linked_context_count, cross_game_count, cross_context_count, first_seen_global_step, last_seen_global_step, role_stability_score, is_emergent) VALUES ('r2','role',3,1,1,1,0,1,11,12,0.6,0)")
+        conn.execute("INSERT INTO role_candidates (role_signature, role_type, support_count, linked_carrier_count, linked_family_count, linked_context_count, cross_game_count, cross_context_count, first_seen_global_step, last_seen_global_step, role_stability_score, is_emergent) VALUES ('r3','role',3,1,1,1,0,1,11,12,0.6,0)")
+        conn.execute("INSERT INTO higher_order_milestones (milestone_name, first_global_step, evidence_key) VALUES ('first_role_candidate_step', 11, 'r1')")
+        conn.execute("INSERT INTO higher_order_milestones (milestone_name, first_global_step, evidence_key) VALUES ('first_emergent_role_step', 11, 'r1')")
+        conn.execute("INSERT INTO role_links (role_signature, linked_type, linked_key, support_count, first_seen_global_step, last_seen_global_step) VALUES ('r1', 'carrier', 'carrier1', 1, 11, 12)")
+        conn.commit()
+    result = evaluate_h05_role_emergence(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h05_noisy", already_derived=True)
+    assert float(result["singleton_role_ratio"]) > 0.50
+    assert result["h05_role_quality_pass"] is False
+    assert result["decision"] == "PARTIALLY_VALID"
+    assert "H05 role graph is noisy or overconnected; remapping quality prevents robust VALID classification." in result["missing_evidence"]
+
+
 def test_h05_can_be_valid_only_with_real_role_timing_and_true_temporal_order(tmp_path: Path) -> None:
     from v6.hypothesis_h05_report import evaluate_h05_role_emergence
 
@@ -13661,6 +13772,42 @@ def test_h12_sets_not_improving_flag_and_caps_decision(tmp_path: Path) -> None:
     result = evaluate_h12_efficiency_emergence(run_dir=tmp_path / "run_h12_not_improving", memory_dir=memory_dir, output_dir=tmp_path / "h12_not_improving")
     assert result["h12_efficiency_not_improving"] is True
     assert result["decision"] == "PARTIALLY_VALID"
+
+
+def test_h12_reports_negative_cost_gap_replay_selection(tmp_path: Path, monkeypatch) -> None:
+    import v6.evaluation.h12_efficiency_emergence as h12_report
+
+    memory_dir = tmp_path / "memory_h12_negative_gap"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute(
+            """
+            INSERT INTO trajectory_efficiency (
+                trajectory_id, game_id, level_id, sampler, seed, epoch, outcome_class, comparable_outcome_group_id,
+                efficiency_active, success, terminal, trajectory_length, steps_to_success, best_known_solution_length,
+                normalized_solve_efficiency, future_option_gain, future_option_gain_per_action, equivalent_outcome_cost_gap,
+                loop_count, loop_ratio, repeated_state_count, repeated_state_ratio, blocked_action_count, blocked_action_ratio,
+                wasted_action_count, wasted_action_ratio, unique_state_count, efficiency_score,
+                efficiency_memory_bonus, efficiency_replay_bonus, efficiency_retention_bonus, efficiency_promotion_bonus
+            ) VALUES
+            ('t1','g','l','s',0,1,'WIN','grp',1,1,1,10,10,8,0.8,0.0,0.0,1.0,0,0.0,0,0.0,0,0.0,0,0.0,10,0.8,0.1,0.4,0.0,0.0),
+            ('t2','g','l','s',0,1,'WIN','grp',1,1,1,10,10,8,0.9,0.0,0.0,3.0,0,0.0,0,0.0,0,0.0,0,0.0,10,0.9,0.1,0.1,0.0,0.0)
+            """
+        )
+        conn.commit()
+    original = h12_report._correlation
+    def fake_correlation(rows, x, y):
+        if x == "equivalent_outcome_cost_gap" and y == "efficiency_replay_bonus":
+            return -0.303
+        return original(rows, x, y)
+    monkeypatch.setattr(h12_report, "_correlation", fake_correlation)
+    result = h12_report.evaluate_h12_efficiency_emergence(
+        run_dir=tmp_path / "run_h12_negative_gap",
+        memory_dir=memory_dir,
+        output_dir=tmp_path / "h12_negative_gap",
+    )
+    assert result["negative_cost_gap_replay_selection"] is True
+    assert "Replay preference is negatively correlated with equivalent-outcome cost gap; efficient trajectories are not being preferentially selected." in result["missing_evidence"]
 
 
 def test_is_retryable_fold_error_matches_locked_busy_variants() -> None:

@@ -9,6 +9,9 @@ from v6.higher_order_substrate import derive_role_candidates_only
 from v6.memory.compact_memory import ensure_memory_layout
 
 MAX_CARRIERS_PER_ROLE_FOR_VALIDITY = 100
+MAX_SINGLETON_ROLE_RATIO_FOR_VALID = 0.50
+MAX_OVERCONNECTED_ROLE_RATIO_FOR_VALID = 0.10
+MAX_CARRIERS_PER_ROLE_HARD_INVALID = 4 * MAX_CARRIERS_PER_ROLE_FOR_VALIDITY
 
 def _resolve_temporal_value(primary: Any, fallback: Any) -> tuple[int | None, str]:
     if primary is not None:
@@ -156,6 +159,13 @@ def evaluate_h05_role_emergence(
         if h04_first is None or first_emergent_role_step is None or int(h04_first) > int(first_emergent_role_step)
         else 1
     )
+    role_count = max(1, int(role_candidate_count or 0))
+    overconnected_role_ratio = float(overconnected_role_count) / role_count
+    h05_role_quality_pass = (
+        (singleton_role_ratio is None or singleton_role_ratio <= MAX_SINGLETON_ROLE_RATIO_FOR_VALID)
+        and overconnected_role_ratio <= MAX_OVERCONNECTED_ROLE_RATIO_FOR_VALID
+        and max_carriers_per_role <= MAX_CARRIERS_PER_ROLE_HARD_INVALID
+    )
     metrics = {
         "role_candidate_count": role_candidate_count,
         "emergent_role_count": emergent_role_count,
@@ -170,6 +180,8 @@ def evaluate_h05_role_emergence(
         "cross_game_role_count": cross_game_role_count,
         "mean_carriers_per_role": mean_carriers_per_role,
         "max_carriers_per_role": max_carriers_per_role,
+        "overconnected_role_ratio": overconnected_role_ratio,
+        "h05_role_quality_pass": h05_role_quality_pass,
         "first_emergent_carrier_step": h04_first,
         "first_role_candidate_step": first_role_candidate_step,
         "first_emergent_role_step": first_emergent_role_step,
@@ -204,7 +216,7 @@ def evaluate_h05_role_emergence(
         missing = []
     elif usable_emergent_role_count >= 1 and usable_multi_carrier_role_count >= 1 and (usable_cross_context_role_count >= 1 or usable_cross_game_role_count >= 1) and (singleton_role_ratio is None or singleton_role_ratio <= 0.75) and (
         h04_before_h05 is True
-    ) and role_timing_source == "real_evidence":
+    ) and role_timing_source == "real_evidence" and h05_role_quality_pass is True:
         decision = "VALID"
         missing = []
     elif (
@@ -235,6 +247,15 @@ def evaluate_h05_role_emergence(
         result["decision"] = "PARTIALLY_VALID"
     elif result["decision"] == "INVALID" and role_timing_source != "real_evidence" and h04_before_h05 is False:
         result["decision"] = "PARTIALLY_VALID"
+    if h05_role_quality_pass is not True and result["decision"] in {"VALID", "PARTIALLY_VALID"}:
+        if result["decision"] == "VALID":
+            result["decision"] = "PARTIALLY_VALID"
+        result["missing_evidence"] = list(
+            dict.fromkeys(
+                list(result.get("missing_evidence", []))
+                + ["H05 role graph is noisy or overconnected; remapping quality prevents robust VALID classification."]
+            )
+        )
     result["core_metrics"] = dict(metrics)
     _write_outputs(output_dir, result)
     return result

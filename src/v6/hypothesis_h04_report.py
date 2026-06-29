@@ -7,6 +7,8 @@ from typing import Any
 
 MAX_LINKED_FAMILIES_PER_CARRIER = 50
 MIN_CARRIER_SPECIFICITY = 0.05
+MAX_GRAPH_EDGE_EXPLOSION_RATIO_FOR_VALID = 10.0
+MAX_OVERCONNECTED_CARRIER_RATIO_FOR_VALID = 0.25
 
 
 def _resolve_temporal_value(primary: Any, fallback: Any) -> tuple[int | None, str]:
@@ -246,6 +248,14 @@ def evaluate_h04_carrier_emergence(
         ),
         **graph_counts,
     }
+    carrier_count = max(1, int(metrics.get("carrier_candidate_count") or 0))
+    overconnected_ratio = float(metrics.get("overconnected_carrier_count") or 0) / carrier_count
+    graph_edge_explosion_ratio = float(metrics.get("graph_edge_explosion_ratio") or 0.0)
+    metrics["overconnected_carrier_ratio"] = overconnected_ratio
+    metrics["h04_graph_quality_pass"] = not (
+        graph_edge_explosion_ratio > MAX_GRAPH_EDGE_EXPLOSION_RATIO_FOR_VALID
+        or overconnected_ratio > MAX_OVERCONNECTED_CARRIER_RATIO_FOR_VALID
+    )
     if considered_sources and considered_sources == {"real_evidence"}:
         metrics["carrier_timing_source"] = "real_evidence"
     elif considered_sources and "real_evidence" in considered_sources:
@@ -329,6 +339,12 @@ def evaluate_h04_carrier_emergence(
         if "H04 timing is not fully grounded in real carrier evidence timing." not in missing_evidence:
             missing_evidence.append("H04 timing is not fully grounded in real carrier evidence timing.")
         decision = "PARTIALLY_VALID"
+    if decision == "VALID" and metrics["h04_graph_quality_pass"] is not True:
+        decision = "PARTIALLY_VALID"
+        if "H04 carrier graph is overconnected; remapping/edge explosion prevents robust VALID classification." not in missing_evidence:
+            missing_evidence.append(
+                "H04 carrier graph is overconnected; remapping/edge explosion prevents robust VALID classification."
+            )
     result = {
         "hypothesis_id": "H04",
         "decision": decision,

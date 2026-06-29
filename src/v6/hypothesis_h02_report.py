@@ -347,6 +347,13 @@ def evaluate_h02_prediction_violation_attention(
                     "wrong_prediction_count",
                     "confident_wrong_prediction_count",
                     "contradiction_event_count",
+                    "prediction_violation_replay_lift",
+                    "direct_replay_lift_available",
+                    "prediction_violation_base_ratio",
+                    "high_priority_replay_prediction_violation_ratio",
+                    "high_priority_replay_non_prediction_violation_ratio",
+                    "prediction_violation_row_count",
+                    "non_prediction_violation_row_count",
                 }:
                     current_value = result.get(key)
                     if current_value in (None, 0, 0.0, False, ""):
@@ -355,7 +362,13 @@ def evaluate_h02_prediction_violation_attention(
                 elif result.get(key) is None:
                     result[key] = value
 
-    result.update(direct_metrics)
+    _merge_direct_metrics_preserving_compact(result, direct_metrics)
+    if result.get("direct_replay_lift_available") is True:
+        result["missing_evidence"] = [
+            item
+            for item in list(result.get("missing_evidence", []))
+            if str(item) not in {DIRECT_LINKAGE_UNAVAILABLE_MESSAGE, DIRECT_LINKAGE_SHARD_LIMIT_MESSAGE}
+        ]
     result["jobs_represented_in_raw_scan"] = int(result.get("sqlite_db_count_inspected") or 0)
     jobs_expected = int(result.get("total_jobs_expected") or 0)
     represented = max(
@@ -504,6 +517,34 @@ def evaluate_h02_prediction_violation_attention(
     _populate_evidence_lists(result)
     _finalize_h02_result(result, output_dir)
     return result
+
+
+def _merge_direct_metrics_preserving_compact(result: dict[str, Any], direct_metrics: dict[str, Any]) -> None:
+    compact_direct_available = result.get("direct_replay_lift_available") is True
+    raw_direct_available = direct_metrics.get("direct_replay_lift_available") is True
+
+    protected_keys = {
+        "prediction_violation_replay_lift",
+        "direct_replay_lift_available",
+        "prediction_violation_base_ratio",
+        "high_priority_replay_prediction_violation_ratio",
+        "high_priority_replay_non_prediction_violation_ratio",
+        "prediction_violation_row_count",
+        "non_prediction_violation_row_count",
+    }
+    empty_values = (None, 0, 0.0, False, "", [], {})
+
+    for key, value in direct_metrics.items():
+        if value in empty_values:
+            if compact_direct_available and key in protected_keys:
+                continue
+
+        if key == "direct_replay_lift_available":
+            result[key] = bool(compact_direct_available or raw_direct_available)
+            continue
+
+        if result.get(key) in empty_values or raw_direct_available:
+            result[key] = value
 
 
 def _raw_h02_evidence_is_empty_or_incomplete(

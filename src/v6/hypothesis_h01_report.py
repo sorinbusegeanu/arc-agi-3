@@ -430,7 +430,11 @@ def evaluate_h01_contingency_emergence(run_dir: Path, output_dir: Path, *, memor
 
     if not result["input_report_txt_found"]:
         result["missing_evidence"].append(f"Optional text report missing: {INPUT_REPORT_TXT_NAME}")
-    if result.get("cross_game_contingency_presence") is None:
+    if (
+        result.get("cross_game_contingency_presence") is None
+        and not _gt(result.get("cross_game_contingency_count"), 0)
+        and not _gt(result.get("cross_sampler_contingency_count"), 0)
+    ):
         result["missing_evidence"].append("Cross-game contingency identity is not derivable from current run artifacts.")
     if memory_dir is not None and direct_streaming_manifest_exists(memory_dir) and not sqlite_paths:
         result["raw_epoch_db_available"] = False
@@ -980,10 +984,10 @@ def _finalize_h01_result(result: dict[str, Any], output_dir: Path) -> None:
     per_game_counts = dict(result.get("per_game_contingency_counts") or {})
     per_sampler_counts = dict(result.get("per_sampler_contingency_counts") or {})
     stable_count = int(result.get("stable_contingency_count") or result.get("stable_contingencies_count") or 0)
-    coverage_attribution_missing = (
-        stable_count > 0
-        and sum(int(value or 0) for value in per_game_counts.values()) <= 0
-        and sum(int(value or 0) for value in per_sampler_counts.values()) <= 0
+    coverage_attribution_missing = bool(
+        result.get("cross_game_contingency_presence") is None
+        and not _gt(result.get("cross_game_contingency_count"), 0)
+        and not _gt(result.get("cross_sampler_contingency_count"), 0)
     )
     result["coverage_attribution_missing"] = bool(coverage_attribution_missing)
     if coverage_attribution_missing:

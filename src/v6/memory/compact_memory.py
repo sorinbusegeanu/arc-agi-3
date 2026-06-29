@@ -247,7 +247,10 @@ def derive_missing_transformation_families_from_stable_contingencies(memory_dir:
                 COALESCE(support_count, 0) AS support_count,
                 COALESCE(first_seen_global_step, 0) AS first_seen_global_step,
                 COALESCE(last_seen_global_step, 0) AS last_seen_global_step,
-                COALESCE(stability_score, 0.0) AS stability_score
+                COALESCE(stability_score, 0.0) AS stability_score,
+                prediction_accuracy,
+                prediction_error_before,
+                prediction_error_after
             FROM stable_contingencies
             ORDER BY canonical_key ASC
             """
@@ -269,6 +272,42 @@ def derive_missing_transformation_families_from_stable_contingencies(memory_dir:
                 if stability_values
                 else 0.0
             )
+            prediction_accuracy_values = [
+                float(row["prediction_accuracy"])
+                for row in members
+                if row["prediction_accuracy"] is not None
+            ]
+            prediction_error_before_values = [
+                float(row["prediction_error_before"])
+                for row in members
+                if row["prediction_error_before"] is not None
+            ]
+            prediction_error_after_values = [
+                float(row["prediction_error_after"])
+                for row in members
+                if row["prediction_error_after"] is not None
+            ]
+            prediction_accuracy_mean = (
+                float(sum(prediction_accuracy_values) / len(prediction_accuracy_values))
+                if prediction_accuracy_values
+                else None
+            )
+            prediction_error_before_mean = (
+                float(sum(prediction_error_before_values) / len(prediction_error_before_values))
+                if prediction_error_before_values
+                else None
+            )
+            prediction_error_after_mean = (
+                float(sum(prediction_error_after_values) / len(prediction_error_after_values))
+                if prediction_error_after_values
+                else None
+            )
+            if prediction_error_before_mean is not None and prediction_error_after_mean is not None:
+                prediction_lift = float(prediction_error_before_mean - prediction_error_after_mean)
+            elif prediction_accuracy_mean is not None:
+                prediction_lift = float(prediction_accuracy_mean)
+            else:
+                prediction_lift = None
             action_counts: dict[str, int] = {}
             for member in members:
                 action_key = str(member["action_value"] if member["action_value"] is not None else "unknown")
@@ -282,14 +321,19 @@ def derive_missing_transformation_families_from_stable_contingencies(memory_dir:
                 """
                 INSERT INTO transformation_families (
                     family_id, canonical_signature, relaxed_signature, effect_type, action_group, polarity,
-                    support_count, member_count, first_seen_global_step, last_seen_global_step, stability_score
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    support_count, member_count, first_seen_global_step, last_seen_global_step, stability_score,
+                    prediction_lift, prediction_accuracy_mean, prediction_error_before_mean, prediction_error_after_mean
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(canonical_signature) DO UPDATE SET
                     support_count = MAX(transformation_families.support_count, excluded.support_count),
                     member_count = MAX(transformation_families.member_count, excluded.member_count),
                     first_seen_global_step = MIN(transformation_families.first_seen_global_step, excluded.first_seen_global_step),
                     last_seen_global_step = MAX(transformation_families.last_seen_global_step, excluded.last_seen_global_step),
-                    stability_score = MAX(transformation_families.stability_score, excluded.stability_score)
+                    stability_score = MAX(transformation_families.stability_score, excluded.stability_score),
+                    prediction_lift = COALESCE(excluded.prediction_lift, transformation_families.prediction_lift),
+                    prediction_accuracy_mean = COALESCE(excluded.prediction_accuracy_mean, transformation_families.prediction_accuracy_mean),
+                    prediction_error_before_mean = COALESCE(excluded.prediction_error_before_mean, transformation_families.prediction_error_before_mean),
+                    prediction_error_after_mean = COALESCE(excluded.prediction_error_after_mean, transformation_families.prediction_error_after_mean)
                 """,
                 (
                     family_id,
@@ -303,6 +347,10 @@ def derive_missing_transformation_families_from_stable_contingencies(memory_dir:
                     first_seen,
                     last_seen,
                     stability_score,
+                    prediction_lift,
+                    prediction_accuracy_mean,
+                    prediction_error_before_mean,
+                    prediction_error_after_mean,
                 ),
             )
             inserted_families += 1
@@ -1246,14 +1294,19 @@ def fold_live_system_into_compact_memory(system: Any, memory_dir: str | Path) ->
                 """
                 INSERT INTO transformation_families (
                     family_id, canonical_signature, relaxed_signature, effect_type, action_group, polarity,
-                    support_count, member_count, first_seen_global_step, last_seen_global_step, stability_score
+                    support_count, member_count, first_seen_global_step, last_seen_global_step, stability_score,
+                    prediction_lift, prediction_accuracy_mean, prediction_error_before_mean, prediction_error_after_mean
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(canonical_signature) DO UPDATE SET
                     support_count = MAX(transformation_families.support_count, excluded.support_count),
                     member_count = MAX(transformation_families.member_count, excluded.member_count),
                     last_seen_global_step = MAX(transformation_families.last_seen_global_step, excluded.last_seen_global_step),
-                    stability_score = MAX(transformation_families.stability_score, excluded.stability_score)
+                    stability_score = MAX(transformation_families.stability_score, excluded.stability_score),
+                    prediction_lift = COALESCE(excluded.prediction_lift, transformation_families.prediction_lift),
+                    prediction_accuracy_mean = COALESCE(excluded.prediction_accuracy_mean, transformation_families.prediction_accuracy_mean),
+                    prediction_error_before_mean = COALESCE(excluded.prediction_error_before_mean, transformation_families.prediction_error_before_mean),
+                    prediction_error_after_mean = COALESCE(excluded.prediction_error_after_mean, transformation_families.prediction_error_after_mean)
                 """,
                 (
                     stable_id,
@@ -1267,6 +1320,10 @@ def fold_live_system_into_compact_memory(system: Any, memory_dir: str | Path) ->
                     global_step_start,
                     global_step_end,
                     float(family.support_count),
+                    None,
+                    None,
+                    None,
+                    None,
                 ),
             )
         for replay in getattr(system.memory_lifecycle, "replay_candidates", {}).values():
@@ -1658,15 +1715,20 @@ def _merge_state_tables(temp_state: sqlite3.Connection, state_conn: sqlite3.Conn
             """
             INSERT INTO transformation_families (
                 family_id, canonical_signature, relaxed_signature, effect_type, action_group, polarity,
-                support_count, member_count, first_seen_global_step, last_seen_global_step, stability_score
+                support_count, member_count, first_seen_global_step, last_seen_global_step, stability_score,
+                prediction_lift, prediction_accuracy_mean, prediction_error_before_mean, prediction_error_after_mean
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(canonical_signature) DO UPDATE SET
                 support_count = transformation_families.support_count + excluded.support_count,
                 member_count = transformation_families.member_count + excluded.member_count,
                 first_seen_global_step = MIN(transformation_families.first_seen_global_step, excluded.first_seen_global_step),
                 last_seen_global_step = MAX(transformation_families.last_seen_global_step, excluded.last_seen_global_step),
-                stability_score = MAX(transformation_families.stability_score, excluded.stability_score)
+                stability_score = MAX(transformation_families.stability_score, excluded.stability_score),
+                prediction_lift = COALESCE(excluded.prediction_lift, transformation_families.prediction_lift),
+                prediction_accuracy_mean = COALESCE(excluded.prediction_accuracy_mean, transformation_families.prediction_accuracy_mean),
+                prediction_error_before_mean = COALESCE(excluded.prediction_error_before_mean, transformation_families.prediction_error_before_mean),
+                prediction_error_after_mean = COALESCE(excluded.prediction_error_after_mean, transformation_families.prediction_error_after_mean)
             """,
             tuple(row[column] for column in row.keys()),
         )
@@ -2255,6 +2317,9 @@ def _fold_single_db(
                         "last_step": None,
                         "mean_error_total": 0.0,
                         "mean_replay_total": 0.0,
+                        "prediction_success_count": 0,
+                        "prediction_error_before_values": [],
+                        "prediction_error_after_values": [],
                     },
                 )
                 info["member_count"] += 1
@@ -2264,6 +2329,14 @@ def _fold_single_db(
                 info["last_step"] = global_step if info["last_step"] is None else max(int(info["last_step"]), global_step)
                 info["mean_error_total"] += float(payload.get("isf_prediction_error") or payload.get("prediction_error") or 0.0)
                 info["mean_replay_total"] += float(payload.get("memory_replay_priority") or payload.get("replay_priority") or 0.0)
+                predicted_family = payload.get("predicted_family")
+                actual_family = payload.get("actual_family")
+                if predicted_family is not None and actual_family is not None and str(predicted_family) == str(actual_family):
+                    info["prediction_success_count"] += 1
+                if payload.get("prediction_error_before") is not None:
+                    info["prediction_error_before_values"].append(float(payload.get("prediction_error_before")))
+                if payload.get("prediction_error_after") is not None:
+                    info["prediction_error_after_values"].append(float(payload.get("prediction_error_after")))
                 contradiction_key = None
                 if int(payload.get("context_contradiction") or payload.get("prediction_error") or 0):
                     contradiction_key = str(payload.get("context_contradiction_key") or payload.get("context_signature") or f"interaction:{payload.get('interaction_id')}")
@@ -2303,6 +2376,31 @@ def _fold_single_db(
                 if not allow_prediction_family_fold:
                     continue
                 member_count = int(info["member_count"])
+                prediction_attempt_count = member_count
+                prediction_success_count = int(info.get("prediction_success_count") or 0)
+                prediction_accuracy_mean = (
+                    float(prediction_success_count) / float(prediction_attempt_count)
+                    if prediction_attempt_count > 0
+                    else None
+                )
+                prediction_error_before_values = [float(value) for value in info.get("prediction_error_before_values", [])]
+                prediction_error_after_values = [float(value) for value in info.get("prediction_error_after_values", [])]
+                prediction_error_before_mean = (
+                    float(sum(prediction_error_before_values) / len(prediction_error_before_values))
+                    if prediction_error_before_values
+                    else None
+                )
+                prediction_error_after_mean = (
+                    float(sum(prediction_error_after_values) / len(prediction_error_after_values))
+                    if prediction_error_after_values
+                    else None
+                )
+                if prediction_error_before_mean is not None and prediction_error_after_mean is not None:
+                    prediction_lift = float(prediction_error_before_mean - prediction_error_after_mean)
+                elif prediction_accuracy_mean is not None:
+                    prediction_lift = float(prediction_accuracy_mean)
+                else:
+                    prediction_lift = None
                 _upsert_transformation_family(
                     state_conn,
                     family_signature=family_signature,
@@ -2311,6 +2409,10 @@ def _fold_single_db(
                     first_seen=int(info["first_step"] or fold_config.global_step_start),
                     last_seen=int(info["last_step"] or fold_config.global_step_end),
                     stability_score=float(member_count),
+                    prediction_lift=prediction_lift,
+                    prediction_accuracy_mean=prediction_accuracy_mean,
+                    prediction_error_before_mean=prediction_error_before_mean,
+                    prediction_error_after_mean=prediction_error_after_mean,
                 )
                 totals["transformation_families_added"] = int(totals.get("transformation_families_added", 0) or 0) + 1
                 totals["transformation_families_inserted"] = int(totals.get("transformation_families_inserted", 0) or 0) + 1
@@ -3050,6 +3152,10 @@ def _fold_prediction_results_into_m1_substrate(
             first_seen=int(info["first_step"] or fold_config.global_step_start),
             last_seen=int(info["last_step"] or fold_config.global_step_end),
             stability_score=float(support_count) / 20.0,
+            prediction_lift=prediction_accuracy,
+            prediction_accuracy_mean=prediction_accuracy,
+            prediction_error_before_mean=None,
+            prediction_error_after_mean=None,
         )
         totals["transformation_families_added"] = int(totals.get("transformation_families_added", 0) or 0) + 1
         totals["transformation_families_inserted"] = int(totals.get("transformation_families_inserted", 0) or 0) + 1
@@ -3135,21 +3241,30 @@ def _upsert_transformation_family(
     first_seen: int,
     last_seen: int,
     stability_score: float,
+    prediction_lift: float | None = None,
+    prediction_accuracy_mean: float | None = None,
+    prediction_error_before_mean: float | None = None,
+    prediction_error_after_mean: float | None = None,
 ) -> None:
     stable_id = stable_family_int_id(family_signature)
     connection.execute(
         """
         INSERT INTO transformation_families (
             family_id, canonical_signature, relaxed_signature, effect_type, action_group, polarity,
-            support_count, member_count, first_seen_global_step, last_seen_global_step, stability_score
+            support_count, member_count, first_seen_global_step, last_seen_global_step, stability_score,
+            prediction_lift, prediction_accuracy_mean, prediction_error_before_mean, prediction_error_after_mean
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(canonical_signature) DO UPDATE SET
             support_count = transformation_families.support_count + excluded.support_count,
             member_count = transformation_families.member_count + excluded.member_count,
             first_seen_global_step = MIN(transformation_families.first_seen_global_step, excluded.first_seen_global_step),
             last_seen_global_step = MAX(transformation_families.last_seen_global_step, excluded.last_seen_global_step),
-            stability_score = MAX(transformation_families.stability_score, excluded.stability_score)
+            stability_score = MAX(transformation_families.stability_score, excluded.stability_score),
+            prediction_lift = COALESCE(excluded.prediction_lift, transformation_families.prediction_lift),
+            prediction_accuracy_mean = COALESCE(excluded.prediction_accuracy_mean, transformation_families.prediction_accuracy_mean),
+            prediction_error_before_mean = COALESCE(excluded.prediction_error_before_mean, transformation_families.prediction_error_before_mean),
+            prediction_error_after_mean = COALESCE(excluded.prediction_error_after_mean, transformation_families.prediction_error_after_mean)
         """,
         (
             stable_id,
@@ -3163,6 +3278,10 @@ def _upsert_transformation_family(
             int(first_seen),
             int(last_seen),
             float(stability_score),
+            None if prediction_lift is None else float(prediction_lift),
+            None if prediction_accuracy_mean is None else float(prediction_accuracy_mean),
+            None if prediction_error_before_mean is None else float(prediction_error_before_mean),
+            None if prediction_error_after_mean is None else float(prediction_error_after_mean),
         ),
     )
 
@@ -3877,7 +3996,11 @@ def _ensure_current_state_schema(path: Path) -> None:
                 member_count INTEGER,
                 first_seen_global_step INTEGER,
                 last_seen_global_step INTEGER,
-                stability_score REAL
+                stability_score REAL,
+                prediction_lift REAL,
+                prediction_accuracy_mean REAL,
+                prediction_error_before_mean REAL,
+                prediction_error_after_mean REAL
             );
             CREATE TABLE IF NOT EXISTS family_identity_map (
                 canonical_signature TEXT PRIMARY KEY,
@@ -4348,6 +4471,10 @@ def _ensure_current_state_schema(path: Path) -> None:
         _ensure_column(connection, "transformation_families", "first_seen_global_step", "INTEGER")
         _ensure_column(connection, "transformation_families", "last_seen_global_step", "INTEGER")
         _ensure_column(connection, "transformation_families", "stability_score", "REAL")
+        _ensure_column(connection, "transformation_families", "prediction_lift", "REAL")
+        _ensure_column(connection, "transformation_families", "prediction_accuracy_mean", "REAL")
+        _ensure_column(connection, "transformation_families", "prediction_error_before_mean", "REAL")
+        _ensure_column(connection, "transformation_families", "prediction_error_after_mean", "REAL")
         _ensure_column(connection, "family_members", "family_signature", "TEXT")
         _ensure_column(connection, "family_members", "contingency_key", "TEXT")
         _ensure_column(connection, "family_members", "first_seen_global_step", "INTEGER")

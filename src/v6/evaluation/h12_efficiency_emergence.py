@@ -88,6 +88,11 @@ def evaluate_h12_efficiency_emergence(
         "trajectory_reconstruction_diagnostics": reconstruction,
         "missing_evidence": [],
     }
+    negative_cost_gap_replay_selection = (
+        result.get("cost_gap_replay_priority_correlation") is not None
+        and float(result["cost_gap_replay_priority_correlation"]) < 0.0
+    )
+    result["negative_cost_gap_replay_selection"] = negative_cost_gap_replay_selection
     if len(successful_rows) < 2 or comparable_groups <= 0:
         result["decision"] = "INSUFFICIENT_EVIDENCE"
         result["missing_evidence"].append("Too few successful or comparable trajectories are available for H12.")
@@ -121,6 +126,15 @@ def evaluate_h12_efficiency_emergence(
                 + ["Trajectory efficiency evidence exists but is not improving versus the previous epoch."]
             )
         )
+    if negative_cost_gap_replay_selection:
+        result["missing_evidence"] = list(
+            dict.fromkeys(
+                list(result.get("missing_evidence", []))
+                + ["Replay preference is negatively correlated with equivalent-outcome cost gap; efficient trajectories are not being preferentially selected."]
+            )
+        )
+        if result["decision"] == "VALID":
+            result["decision"] = "PARTIALLY_VALID"
     state_payload = {
         "mean_normalized_solve_efficiency": result.get("mean_normalized_solve_efficiency"),
         "best_known_solution_count": result.get("best_known_solution_count"),
@@ -149,6 +163,7 @@ def evaluate_h12_efficiency_emergence(
             "efficiency_replay_priority_correlation",
             "efficiency_memory_fitness_correlation",
             "cost_gap_replay_priority_correlation",
+            "negative_cost_gap_replay_selection",
             "future_option_gain_per_action_correlation",
             "efficiency_improved_vs_previous_epoch",
             "h12_efficiency_not_improving",
