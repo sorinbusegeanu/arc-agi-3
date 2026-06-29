@@ -150,7 +150,10 @@ from v6.main import V6Config, V6System
 from v6.future_options import FutureOptionEstimator
 from v6.memory.compact_memory import (
     CompactMemoryFoldConfig,
+    _build_raw_db_fold_caches,
+    _context_level_from_raw,
     derive_missing_transformation_families_from_stable_contingencies,
+    canonical_family_signature_from_raw_db,
     ensure_memory_layout,
     finalize_main_compact_memory,
     fold_live_system_into_compact_memory,
@@ -159,6 +162,8 @@ from v6.memory.compact_memory import (
     fold_sampling_job_sidecars_into_compact_memory_shard,
     load_memory_summary,
     merge_compact_memory_shards_into_main,
+    normalized_contingency_identity,
+    normalized_contingency_identity_cached,
 )
 from v6.memory.contingency_store import ContingencyStore
 from v6.memory.interaction_store import Interaction, InteractionStore, encode_array
@@ -13546,6 +13551,272 @@ def test_merge_compact_memory_shards_adds_stable_contingency_support_counts(tmp_
     assert row[3] == 18
     assert abs(float(row[4]) - 0.75) < 1e-9
     assert stable_count == 1
+
+
+def test_graph_edge_fold_cap_stops_writes_after_limit(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory_graph_cap"
+    db_path = tmp_path / "seed_0.sqlite"
+    ensure_memory_layout(memory_dir)
+    sqlite3.connect(db_path).close()
+    (tmp_path / "live_graph_compact.json").write_text(
+        json.dumps(
+            {
+                "nodes": [{"node_id": f"n{i}", "node_type": "x", "canonical_key": f"k{i}"} for i in range(4)],
+                "edges": [
+                    {"source_node_id": "n0", "target_node_id": "n1", "edge_type": "related_to"},
+                    {"source_node_id": "n0", "target_node_id": "n2", "edge_type": "related_to"},
+                    {"source_node_id": "n0", "target_node_id": "n3", "edge_type": "related_to"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    fold_single_sampling_db_into_main_compact_memory(
+        db_path=db_path,
+        memory_dir=memory_dir,
+        fold_config=CompactMemoryFoldConfig(global_step_start=1, global_step_end=2, max_graph_edges_per_fold=2),
+        finalize_after_fold=True,
+    )
+    with sqlite3.connect(memory_dir / "graph.sqlite") as conn:
+        edge_count = conn.execute("SELECT COUNT(*) FROM graph_edges").fetchone()[0]
+    summary = load_memory_summary(memory_dir / "memory_summary.json")
+    assert edge_count == 2
+    assert summary["fold_summary"]["graph_edges_attempted"] == 3
+    assert summary["fold_summary"]["graph_edges_written"] == 2
+    assert summary["fold_summary"]["graph_edges_skipped_by_fold_cap"] == 1
+
+
+def test_graph_edge_source_and_carrier_caps_limit_writes(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory_graph_source_cap"
+    db_path = tmp_path / "seed_0.sqlite"
+    ensure_memory_layout(memory_dir)
+    sqlite3.connect(db_path).close()
+    (tmp_path / "live_graph_compact.json").write_text(
+        json.dumps(
+            {
+                "nodes": [{"node_id": "carrier:c1", "node_type": "carrier", "canonical_key": "c1"}],
+                "edges": [
+                    {"source_node_id": "carrier:c1", "target_node_id": "family:f1", "edge_type": "explains"},
+                    {"source_node_id": "carrier:c1", "target_node_id": "context:c1", "edge_type": "appears_in"},
+                    {"source_node_id": "carrier:c1", "target_node_id": "contingency:k1", "edge_type": "anchors"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    summary = fold_single_sampling_db_into_main_compact_memory(
+        db_path=db_path,
+        memory_dir=memory_dir,
+        fold_config=CompactMemoryFoldConfig(
+            global_step_start=1,
+            global_step_end=2,
+            max_edges_per_source_node=5,
+            max_edges_per_carrier=2,
+        ),
+        finalize_after_fold=True,
+    )
+    with sqlite3.connect(memory_dir / "graph.sqlite") as conn:
+        edge_count = conn.execute("SELECT COUNT(*) FROM graph_edges").fetchone()[0]
+    assert edge_count == 2
+    assert summary["graph_edges_skipped_by_carrier_cap"] == 1
+
+
+def test_graph_edge_source_cap_stops_excessive_single_source_edges(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory_graph_source_only_cap"
+    db_path = tmp_path / "seed_0.sqlite"
+    ensure_memory_layout(memory_dir)
+    sqlite3.connect(db_path).close()
+    (tmp_path / "live_graph_compact.json").write_text(
+        json.dumps(
+            {
+                "edges": [
+                    {"source_node_id": "context:a", "target_node_id": "n1", "edge_type": "related_to"},
+                    {"source_node_id": "context:a", "target_node_id": "n2", "edge_type": "related_to"},
+                    {"source_node_id": "context:a", "target_node_id": "n3", "edge_type": "related_to"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    summary = fold_single_sampling_db_into_main_compact_memory(
+        db_path=db_path,
+        memory_dir=memory_dir,
+        fold_config=CompactMemoryFoldConfig(global_step_start=1, global_step_end=2, max_edges_per_source_node=2),
+    )
+    assert summary["graph_edges_skipped_by_source_cap"] == 1
+
+
+def test_set_based_merge_matches_row_loop_counts_on_small_fixture(tmp_path: Path) -> None:
+    shard = tmp_path / "merge_fixture_shard"
+    ensure_memory_layout(shard)
+    with sqlite3.connect(shard / "current_state.sqlite") as conn:
+        conn.execute("INSERT INTO family_members (family_signature, contingency_key, support_count, first_seen_global_step, last_seen_global_step) VALUES ('fam', 'cont', 2, 1, 4)")
+        conn.execute("INSERT INTO memory_nodes (node_id, memory_level, node_type, canonical_key, support_count, first_seen_step, last_seen_step, attrs_json) VALUES ('n1', 'M1', 't', 'k', 1, 1, 1, '{}')")
+        conn.execute("INSERT INTO memory_nodes (node_id, memory_level, node_type, canonical_key, support_count, first_seen_step, last_seen_step, attrs_json) VALUES ('n2', 'M1', 't', 'k2', 1, 1, 1, '{}')")
+        conn.execute("INSERT INTO memory_edges (source_node_id, target_node_id, edge_type, weight, support_count, evidence_json) VALUES ('n1', 'n2', 'rel', 0.5, 2, '{}')")
+        conn.commit()
+    with sqlite3.connect(shard / "graph.sqlite") as conn:
+        conn.execute("INSERT INTO graph_nodes (node_id, node_type, canonical_key, first_seen_global_step, last_seen_global_step, support_count) VALUES ('g1', 't', 'k', 1, 1, 1)")
+        conn.execute("INSERT INTO graph_nodes (node_id, node_type, canonical_key, first_seen_global_step, last_seen_global_step, support_count) VALUES ('g2', 't', 'k2', 1, 1, 1)")
+        conn.execute("INSERT INTO graph_edges (edge_id, source_node_id, target_node_id, edge_type, first_seen_global_step, last_seen_global_step, support_count, weight) VALUES ('e', 'g1', 'g2', 'rel', 1, 1, 2, 0.7)")
+        conn.commit()
+    with sqlite3.connect(shard / "replay_queue.sqlite") as conn:
+        conn.execute("INSERT INTO replay_queue (replay_id, owner_type, owner_id, priority_score, reason, first_seen_global_step, last_seen_global_step, compact_payload_json) VALUES ('r1', 'interaction', '1', 0.8, 'x', 1, 2, '{}')")
+        conn.commit()
+    main_set = tmp_path / "main_set"
+    main_row = tmp_path / "main_row"
+    ensure_memory_layout(main_set)
+    ensure_memory_layout(main_row)
+    merge_compact_memory_shards_into_main(
+        memory_dir=main_set,
+        shard_dirs=[shard],
+        fold_config=CompactMemoryFoldConfig(global_step_start=1, global_step_end=4, use_set_based_merge=True),
+        parallel_workers=1,
+    )
+    merge_compact_memory_shards_into_main(
+        memory_dir=main_row,
+        shard_dirs=[shard],
+        fold_config=CompactMemoryFoldConfig(global_step_start=1, global_step_end=4, use_set_based_merge=False),
+        parallel_workers=1,
+    )
+    with sqlite3.connect(main_set / "current_state.sqlite") as conn:
+        set_counts = (
+            conn.execute("SELECT COUNT(*) FROM family_members").fetchone()[0],
+            conn.execute("SELECT COUNT(*) FROM memory_edges").fetchone()[0],
+        )
+    with sqlite3.connect(main_row / "current_state.sqlite") as conn:
+        row_counts = (
+            conn.execute("SELECT COUNT(*) FROM family_members").fetchone()[0],
+            conn.execute("SELECT COUNT(*) FROM memory_edges").fetchone()[0],
+        )
+    assert set_counts == row_counts == (1, 1)
+
+
+def test_set_based_merge_accumulates_memory_edge_support_and_replay_priority(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory_merge_set_based"
+    shard_a = tmp_path / "shard_set_a"
+    shard_b = tmp_path / "shard_set_b"
+    ensure_memory_layout(memory_dir)
+    ensure_memory_layout(shard_a)
+    ensure_memory_layout(shard_b)
+    for shard_dir, support, priority in ((shard_a, 2, 0.4), (shard_b, 3, 0.9)):
+        with sqlite3.connect(shard_dir / "current_state.sqlite") as conn:
+            conn.execute("INSERT INTO memory_nodes (node_id, memory_level, node_type, canonical_key, support_count, first_seen_step, last_seen_step, attrs_json) VALUES ('n1', 'M1', 't', 'k1', 1, 1, 1, '{}')")
+            conn.execute("INSERT INTO memory_nodes (node_id, memory_level, node_type, canonical_key, support_count, first_seen_step, last_seen_step, attrs_json) VALUES ('n2', 'M1', 't', 'k2', 1, 1, 1, '{}')")
+            conn.execute("INSERT INTO memory_edges (source_node_id, target_node_id, edge_type, weight, support_count, evidence_json) VALUES ('n1', 'n2', 'rel', 1.0, ?, '{}')", (support,))
+            conn.execute("INSERT INTO memory_scores (node_id, replay_priority) VALUES ('n1', ?)", (priority,))
+            conn.commit()
+        with sqlite3.connect(shard_dir / "replay_queue.sqlite") as conn:
+            conn.execute(
+                "INSERT INTO replay_queue (replay_id, owner_type, owner_id, priority_score, reason, first_seen_global_step, last_seen_global_step, compact_payload_json) VALUES ('r1', 'interaction', '1', ?, 'x', 1, 3, '{}')",
+                (priority,),
+            )
+            conn.commit()
+    merge_compact_memory_shards_into_main(
+        memory_dir=memory_dir,
+        shard_dirs=[shard_a, shard_b],
+        fold_config=CompactMemoryFoldConfig(global_step_start=1, global_step_end=3, use_set_based_merge=True),
+        parallel_workers=1,
+    )
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        support_count = conn.execute("SELECT support_count FROM memory_edges WHERE source_node_id = 'n1' AND target_node_id = 'n2' AND edge_type = 'rel'").fetchone()[0]
+        replay_priority = conn.execute("SELECT replay_priority FROM memory_scores WHERE node_id = 'n1'").fetchone()[0]
+    with sqlite3.connect(memory_dir / "replay_queue.sqlite") as conn:
+        queue_priority = conn.execute("SELECT priority_score FROM replay_queue WHERE replay_id = 'r1'").fetchone()[0]
+    assert support_count == 5
+    assert replay_priority == pytest.approx(0.9)
+    assert queue_priority == pytest.approx(0.9)
+
+
+def test_set_based_merge_keeps_graph_edge_update_semantics(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory_graph_merge_semantics"
+    shard_a = tmp_path / "graph_shard_a"
+    shard_b = tmp_path / "graph_shard_b"
+    ensure_memory_layout(memory_dir)
+    ensure_memory_layout(shard_a)
+    ensure_memory_layout(shard_b)
+    for shard_dir, support, weight in ((shard_a, 2, 0.5), (shard_b, 5, 0.9)):
+        with sqlite3.connect(shard_dir / "graph.sqlite") as conn:
+            conn.execute("INSERT INTO graph_nodes (node_id, node_type, canonical_key, first_seen_global_step, last_seen_global_step, support_count) VALUES ('a', 't', 'a', 1, 1, 1)")
+            conn.execute("INSERT INTO graph_nodes (node_id, node_type, canonical_key, first_seen_global_step, last_seen_global_step, support_count) VALUES ('b', 't', 'b', 1, 1, 1)")
+            conn.execute(
+                "INSERT INTO graph_edges (edge_id, source_node_id, target_node_id, edge_type, first_seen_global_step, last_seen_global_step, support_count, weight) VALUES ('a->rel->b', 'a', 'b', 'rel', 1, 2, ?, ?)",
+                (support, weight),
+            )
+            conn.commit()
+    merge_compact_memory_shards_into_main(
+        memory_dir=memory_dir,
+        shard_dirs=[shard_a, shard_b],
+        fold_config=CompactMemoryFoldConfig(global_step_start=1, global_step_end=2, use_set_based_merge=True),
+        parallel_workers=1,
+    )
+    with sqlite3.connect(memory_dir / "graph.sqlite") as conn:
+        row = conn.execute("SELECT support_count, weight FROM graph_edges WHERE edge_id = 'a->rel->b'").fetchone()
+    assert row == (5, 0.9)
+
+
+def test_raw_db_fold_cache_helpers_match_uncached_behavior(tmp_path: Path) -> None:
+    db_path = tmp_path / "raw_cache.sqlite"
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("CREATE TABLE transformation_families (id INTEGER PRIMARY KEY, centroid_vector TEXT, support_count INTEGER)")
+        conn.execute(
+            "CREATE TABLE prediction_results (context_signature TEXT, context_action TEXT, action INTEGER, actual_family TEXT, predicted_family TEXT, context_level INTEGER)"
+        )
+        conn.execute("INSERT INTO transformation_families (id, centroid_vector, support_count) VALUES (7, '[1,2,3]', 4)")
+        conn.execute(
+            "INSERT INTO prediction_results (context_signature, context_action, action, actual_family, predicted_family, context_level) VALUES ('ctx', NULL, 2, '7', '7', 3)"
+        )
+        conn.commit()
+        payload = {"effect_signature": None, "context_signature": "ctx", "action": 2}
+        uncached_signature = canonical_family_signature_from_raw_db(conn, 7, payload)
+        uncached_level = _context_level_from_raw(conn, payload=payload, family_id=7)
+        caches = _build_raw_db_fold_caches(conn, {"transformation_families", "prediction_results"})
+        cached_signature = canonical_family_signature_from_raw_db(conn, 7, payload, caches=caches)
+        cached_level = _context_level_from_raw(conn, payload=payload, family_id=7, caches=caches)
+    assert cached_signature == uncached_signature
+    assert cached_level == uncached_level == 3
+    assert normalized_contingency_identity_cached(context_level=3, action=2, effect_signature="fam", caches=caches) == normalized_contingency_identity(context_level=3, action=2, effect_signature="fam")
+
+
+def test_raw_db_fold_cache_avoids_repeated_family_lookup(tmp_path: Path) -> None:
+    class CountingConnection:
+        def __init__(self, conn: sqlite3.Connection) -> None:
+            self._conn = conn
+            self.select_count = 0
+
+        def execute(self, sql: str, params: tuple[Any, ...] = ()) -> sqlite3.Cursor:
+            if "SELECT centroid_vector, support_count FROM transformation_families" in sql:
+                self.select_count += 1
+            return self._conn.execute(sql, params)
+
+    db_path = tmp_path / "raw_cache_count.sqlite"
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE transformation_families (id INTEGER PRIMARY KEY, centroid_vector TEXT, support_count INTEGER)")
+    conn.execute("INSERT INTO transformation_families (id, centroid_vector, support_count) VALUES (3, '[9,9]', 2)")
+    conn.commit()
+    wrapper = CountingConnection(conn)
+    payload = {"effect_signature": None}
+    assert canonical_family_signature_from_raw_db(wrapper, 3, payload) == canonical_family_signature_from_raw_db(wrapper, 3, payload)
+    assert wrapper.select_count == 2
+    caches = _build_raw_db_fold_caches(conn, {"transformation_families"})
+    assert canonical_family_signature_from_raw_db(wrapper, 3, payload, caches=caches) == canonical_family_signature_from_raw_db(wrapper, 3, payload, caches=caches)
+    assert wrapper.select_count == 2
+    conn.close()
+
+
+def test_ensure_memory_layout_drops_duplicate_indexes(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory_indexes"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        current_names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'").fetchall()}
+    with sqlite3.connect(memory_dir / "graph.sqlite") as conn:
+        graph_names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'").fetchall()}
+    assert "idx_carrier_links_carrier_type_key" not in current_names
+    assert "idx_role_neighborhood_carrier" not in current_names
+    assert "idx_graph_edges_source" not in graph_names
+    assert "idx_graph_edges_target" not in graph_names
 
 
 def test_h03_compact_fold_evidence_exposes_stable_contingencies_and_families(tmp_path: Path) -> None:

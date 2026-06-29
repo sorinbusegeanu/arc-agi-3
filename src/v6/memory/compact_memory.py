@@ -44,6 +44,23 @@ class CompactMemoryFoldConfig:
     max_examples_per_contradiction_cluster: int = DEFAULT_MAX_EXAMPLES_PER_CONTRADICTION_CLUSTER
     fold_memory_substrate: bool = True
     fold_graph: bool = True
+    max_graph_edges_per_fold: int = 1_000_000
+    max_edges_per_source_node: int = 128
+    max_edges_per_carrier: int = 32
+    max_edges_per_family: int = 64
+    enable_graph_edge_caps: bool = True
+    use_set_based_merge: bool = True
+
+
+@dataclass
+class RawDbFoldCaches:
+    family_signature_by_family_id: dict[str, str]
+    family_signature_by_payload_key: dict[str, str]
+    context_level_by_key: dict[tuple[str, str, str], int]
+    normalized_jsonish: dict[str, str]
+    normalized_contingency_identity: dict[tuple[int, str, str], str]
+    transformation_family_rows: dict[str, sqlite3.Row]
+    prediction_context_level_lookup: dict[tuple[str, str, str], int]
 
 
 def configure_compact_sqlite_connection(
@@ -86,6 +103,17 @@ def ensure_memory_layout(memory_dir: str | Path) -> CompactMemoryPaths:
     if not paths.summary_json.exists():
         paths.summary_json.write_text(json.dumps({"initialized": True}, indent=2), encoding="utf-8")
     return paths
+
+
+def _graph_edge_total_fields() -> dict[str, int]:
+    return {
+        "graph_edges_skipped_by_fold_cap": 0,
+        "graph_edges_skipped_by_source_cap": 0,
+        "graph_edges_skipped_by_carrier_cap": 0,
+        "graph_edges_skipped_by_family_cap": 0,
+        "graph_edges_attempted": 0,
+        "graph_edges_written": 0,
+    }
 
 
 def checkpoint_compact_memory(memory_dir: str | Path, truncate: bool = True) -> dict[str, Any]:
@@ -625,6 +653,7 @@ def fold_epoch_raw_into_compact_memory(
         "db_files_folded": len(db_paths),
         "total_interactions_seen": int(current_summary.get("total_interactions_seen", 0) or 0)
         + int((report.get("validation") or {}).get("memory_record_count", 0) or 0),
+        **_graph_edge_total_fields(),
     }
 
     parallel_workers = _fold_parallel_worker_count(len(db_paths))
@@ -656,7 +685,7 @@ def fold_epoch_raw_into_compact_memory(
                 totals=totals,
             )
         for graph_path in live_graph_paths:
-            _ingest_live_graph_export(graph_conn, graph_path, fold_config)
+            _ingest_live_graph_export(graph_conn, graph_path, fold_config, totals=totals)
             totals["graph_live_exports_ingested"] += 1
         _upsert_temporal_milestones(state_conn, temporal_rows)
         _trim_representative_examples(state_conn, fold_config)
@@ -705,6 +734,7 @@ def fold_single_sampling_db_into_main_compact_memory(
         "graph_edge_count": 0,
         "graph_live_exports_ingested": 0,
         "db_files_folded": 1,
+        **_graph_edge_total_fields(),
     }
     live_graph_path = sqlite_path.with_name("live_graph_compact.json")
     with (
@@ -725,7 +755,7 @@ def fold_single_sampling_db_into_main_compact_memory(
             busy_timeout_ms=busy_timeout_ms,
         )
         if live_graph_path.exists():
-            _ingest_live_graph_export(graph_conn, live_graph_path, fold_config)
+            _ingest_live_graph_export(graph_conn, live_graph_path, fold_config, totals=totals)
             totals["graph_live_exports_ingested"] += 1
         if finalize_after_fold:
             _trim_representative_examples(state_conn, fold_config)
@@ -848,6 +878,7 @@ def fold_sampling_job_sidecars_into_compact_memory(
         "carrier_candidates_added": 0,
         "deleted_sidecar_files": [],
         "sidecar_files_present": int(sidecars_present),
+        **_graph_edge_total_fields(),
     }
     if not sidecars_present:
         return totals
@@ -860,7 +891,7 @@ def fold_sampling_job_sidecars_into_compact_memory(
     ):
         raw_conn.row_factory = sqlite3.Row
         if live_graph_path.exists():
-            _ingest_live_graph_export(graph_conn, live_graph_path, fold_config)
+            _ingest_live_graph_export(graph_conn, live_graph_path, fold_config, totals=totals)
             totals["graph_live_exports_ingested"] += 1
         if carrier_path.exists():
             _fold_carrier_candidates_sidecar(
@@ -921,6 +952,7 @@ def fold_sampling_job_sidecars_into_compact_memory_shard(
         "deleted_sidecar_files": [],
         "sidecar_files_present": int(sidecars_present),
         "shard_memory_dir": str(shard_paths.root),
+        **_graph_edge_total_fields(),
     }
     if not sidecars_present:
         return totals
@@ -933,7 +965,7 @@ def fold_sampling_job_sidecars_into_compact_memory_shard(
     ):
         raw_conn.row_factory = sqlite3.Row
         if live_graph_path.exists():
-            _ingest_live_graph_export(graph_conn, live_graph_path, fold_config)
+            _ingest_live_graph_export(graph_conn, live_graph_path, fold_config, totals=totals)
             totals["graph_live_exports_ingested"] += 1
         if carrier_path.exists():
             _fold_carrier_candidates_sidecar(
@@ -1177,7 +1209,7 @@ def _fold_epoch_raw_into_compact_memory_parallel(
                     fold_config=fold_config,
                 )
             for graph_path in live_graph_paths:
-                _ingest_live_graph_export(graph_conn, graph_path, fold_config)
+                _ingest_live_graph_export(graph_conn, graph_path, fold_config, totals=totals)
                 totals["graph_live_exports_ingested"] += 1
             _upsert_temporal_milestones(state_conn, temporal_rows)
             _trim_representative_examples(state_conn, fold_config)
@@ -1243,6 +1275,7 @@ def _fold_db_chunk_worker(db_paths: list[str], temp_memory_dir: str, fold_config
         "graph_live_exports_ingested": 0,
         "db_files_folded": len(db_paths),
         "total_interactions_seen": 0,
+        **_graph_edge_total_fields(),
     }
     with (
         sqlite3.connect(temp_paths.current_state) as state_conn,
@@ -1724,6 +1757,26 @@ def normalized_contingency_identity(*, context_level: int | None, action: int | 
     return "ncont:" + sha1(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:20]
 
 
+def normalized_contingency_identity_cached(
+    *,
+    context_level: int | None,
+    action: int | str | None,
+    effect_signature: str | None,
+    caches: RawDbFoldCaches | None = None,
+) -> str:
+    cache_key = (int(context_level or 0), str(action), str(effect_signature))
+    if caches is not None and cache_key in caches.normalized_contingency_identity:
+        return caches.normalized_contingency_identity[cache_key]
+    normalized = normalized_contingency_identity(
+        context_level=context_level,
+        action=action,
+        effect_signature=effect_signature,
+    )
+    if caches is not None:
+        caches.normalized_contingency_identity[cache_key] = normalized
+    return normalized
+
+
 def canonical_family_signature_from_family(family: Any) -> str:
     centroid = getattr(family, "centroid_vector", None)
     if centroid is not None:
@@ -1731,27 +1784,97 @@ def canonical_family_signature_from_family(family: Any) -> str:
     return f"family:{getattr(family, 'id', 'unknown')}"
 
 
-def canonical_family_signature_from_raw_db(raw_conn: sqlite3.Connection, family_id: Any, row_payload: dict[str, Any] | None) -> str:
+def canonical_family_signature_from_raw_db(
+    raw_conn: sqlite3.Connection,
+    family_id: Any,
+    row_payload: dict[str, Any] | None,
+    caches: RawDbFoldCaches | None = None,
+) -> str:
     payload = dict(row_payload or {})
-    transformation_tables = {row[0] for row in raw_conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-    if "transformation_families" in transformation_tables and family_id is not None:
-        row = raw_conn.execute(
-            "SELECT centroid_vector, support_count FROM transformation_families WHERE id = ?",
-            (family_id,),
-        ).fetchone()
-        if row and row[0]:
-            centroid = _normalize_jsonish(row[0])
-            return f"centroid:{centroid}"
+    family_key = "" if family_id is None else str(family_id)
+    if caches is not None and family_key in caches.family_signature_by_family_id:
+        return caches.family_signature_by_family_id[family_key]
+    if caches is not None and family_id is not None:
+        row = caches.transformation_family_rows.get(family_key)
+        if row is not None and row["centroid_vector"]:
+            centroid = _normalize_jsonish_cached(row["centroid_vector"], caches)
+            signature = f"centroid:{centroid}"
+            caches.family_signature_by_family_id[family_key] = signature
+            return signature
+    elif family_id is not None:
+        transformation_tables = {row[0] for row in raw_conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        if "transformation_families" in transformation_tables:
+            row = raw_conn.execute(
+                "SELECT centroid_vector, support_count FROM transformation_families WHERE id = ?",
+                (family_id,),
+            ).fetchone()
+            if row and row[0]:
+                centroid = _normalize_jsonish(row[0])
+                return f"centroid:{centroid}"
     for key in ("effect_signature", "delta_signature", "changed_cells_signature", "outcome_signature"):
         value = payload.get(key)
         if value not in (None, ""):
-            return f"{key}:{_normalize_jsonish(value)}"
+            signature = f"{key}:{_normalize_jsonish_cached(value, caches)}"
+            if caches is not None and family_id is not None:
+                caches.family_signature_by_family_id[family_key] = signature
+            return signature
     db_identity = str(raw_conn.execute("PRAGMA database_list").fetchone()[2])
-    return f"local_family:{db_identity}:{family_id}"
+    signature = f"local_family:{db_identity}:{family_id}"
+    if caches is not None and family_id is not None:
+        caches.family_signature_by_family_id[family_key] = signature
+    return signature
+
+
+def _build_raw_db_fold_caches(raw_conn: sqlite3.Connection, tables: set[str]) -> RawDbFoldCaches:
+    caches = RawDbFoldCaches(
+        family_signature_by_family_id={},
+        family_signature_by_payload_key={},
+        context_level_by_key={},
+        normalized_jsonish={},
+        normalized_contingency_identity={},
+        transformation_family_rows={},
+        prediction_context_level_lookup={},
+    )
+    if "transformation_families" in tables:
+        for row in raw_conn.execute("SELECT id, centroid_vector, support_count FROM transformation_families").fetchall():
+            key = str(row["id"])
+            caches.transformation_family_rows[key] = row
+            if row["centroid_vector"]:
+                caches.family_signature_by_family_id[key] = f"centroid:{_normalize_jsonish_cached(row['centroid_vector'], caches)}"
+    if "prediction_results" in tables:
+        prediction_columns = {row[1] for row in raw_conn.execute("PRAGMA table_info(prediction_results)").fetchall()}
+        if "context_level" in prediction_columns:
+            context_expr = "COALESCE(context_signature, context_action, '')" if "context_action" in prediction_columns else "COALESCE(context_signature, '')"
+            for row in raw_conn.execute(
+                f"""
+                SELECT
+                    {context_expr} AS context_key,
+                    COALESCE(action, -1) AS action_key,
+                    COALESCE(actual_family, predicted_family, '') AS family_key,
+                    MAX(COALESCE(context_level, 0)) AS max_context_level
+                FROM prediction_results
+                GROUP BY 1, 2, 3
+                """
+            ).fetchall():
+                caches.prediction_context_level_lookup[
+                    (str(row["context_key"]), str(row["action_key"]), str(row["family_key"]))
+                ] = int(row["max_context_level"] or 0)
+    return caches
 
 
 def stable_family_int_id(canonical_signature: str) -> int:
     return int.from_bytes(sha1(str(canonical_signature).encode("utf-8")).digest()[:8], "big") % 2_147_483_647
+
+
+def _attach_shard_database(conn: sqlite3.Connection, alias: str, path: Path) -> str:
+    safe_alias = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in alias)
+    conn.execute(f"ATTACH DATABASE ? AS {safe_alias}", (str(path),))
+    return safe_alias
+
+
+def _detach_shard_database(conn: sqlite3.Connection, alias: str) -> None:
+    conn.commit()
+    conn.execute(f"DETACH DATABASE {alias}")
 
 
 def _merge_compact_memory_dir_into_main(
@@ -1763,6 +1886,11 @@ def _merge_compact_memory_dir_into_main(
     fold_config: CompactMemoryFoldConfig,
 ) -> None:
     temp_paths = ensure_memory_layout(temp_dir)
+    if bool(fold_config.use_set_based_merge):
+        _merge_state_tables_set_based(temp_paths.current_state, state_conn, fold_config)
+        _merge_graph_tables_set_based(temp_paths.graph, graph_conn, fold_config)
+        _merge_replay_queue_set_based(temp_paths.replay_queue, replay_conn)
+        return
     with (
         sqlite3.connect(temp_paths.current_state) as temp_state,
         sqlite3.connect(temp_paths.graph) as temp_graph,
@@ -1774,6 +1902,418 @@ def _merge_compact_memory_dir_into_main(
         _merge_state_tables(temp_state, state_conn, fold_config)
         _merge_graph_tables(temp_graph, graph_conn, fold_config)
         _merge_replay_queue(temp_replay, replay_conn)
+
+
+def _merge_state_tables_set_based(temp_state_path: Path, state_conn: sqlite3.Connection, fold_config: CompactMemoryFoldConfig) -> None:
+    alias = _attach_shard_database(state_conn, "shard_state", temp_state_path)
+    try:
+        state_conn.execute(
+            f"""
+            INSERT INTO family_identity_map (canonical_signature, stable_family_id)
+            SELECT canonical_signature, stable_family_id
+            FROM {alias}.family_identity_map
+            WHERE 1=1
+            ON CONFLICT(canonical_signature) DO UPDATE SET
+                stable_family_id = excluded.stable_family_id
+            """
+        )
+        state_conn.execute(
+            f"""
+            INSERT INTO stable_contingencies (
+                contingency_id, canonical_key, game, sampler, context_level, action, effect_signature, support_count,
+                first_seen_global_step, last_seen_global_step, stability_score, mean_prediction_error,
+                mean_replay_priority, representative_example_count, prediction_attempt_count,
+                prediction_success_count, prediction_accuracy, prediction_error_before,
+                prediction_error_after, normalized_contingency_key
+            )
+            SELECT
+                contingency_id, canonical_key, game, sampler, context_level, action, effect_signature, support_count,
+                first_seen_global_step, last_seen_global_step, stability_score, mean_prediction_error,
+                mean_replay_priority, representative_example_count, prediction_attempt_count,
+                prediction_success_count, prediction_accuracy, prediction_error_before,
+                prediction_error_after, normalized_contingency_key
+            FROM {alias}.stable_contingencies
+            WHERE 1=1
+            ON CONFLICT(canonical_key) DO UPDATE SET
+                support_count = COALESCE(stable_contingencies.support_count, 0) + COALESCE(excluded.support_count, 0),
+                context_level = MAX(stable_contingencies.context_level, excluded.context_level),
+                first_seen_global_step = MIN(stable_contingencies.first_seen_global_step, excluded.first_seen_global_step),
+                last_seen_global_step = MAX(stable_contingencies.last_seen_global_step, excluded.last_seen_global_step),
+                stability_score = CAST(
+                    COALESCE(stable_contingencies.support_count, 0) + COALESCE(excluded.support_count, 0)
+                    AS REAL
+                ) / 20.0,
+                representative_example_count = MAX(stable_contingencies.representative_example_count, excluded.representative_example_count),
+                prediction_attempt_count = COALESCE(stable_contingencies.prediction_attempt_count, 0) + COALESCE(excluded.prediction_attempt_count, 0),
+                prediction_success_count = COALESCE(stable_contingencies.prediction_success_count, 0) + COALESCE(excluded.prediction_success_count, 0),
+                prediction_accuracy = CASE
+                    WHEN (COALESCE(stable_contingencies.prediction_attempt_count, 0) + COALESCE(excluded.prediction_attempt_count, 0)) > 0
+                    THEN CAST(
+                        (COALESCE(stable_contingencies.prediction_success_count, 0) + COALESCE(excluded.prediction_success_count, 0)) AS REAL
+                    ) / CAST(
+                        (COALESCE(stable_contingencies.prediction_attempt_count, 0) + COALESCE(excluded.prediction_attempt_count, 0)) AS REAL
+                    )
+                    ELSE NULL
+                END,
+                normalized_contingency_key = COALESCE(stable_contingencies.normalized_contingency_key, excluded.normalized_contingency_key)
+            """
+        )
+        state_conn.execute(
+            f"""
+            INSERT INTO transformation_families (
+                family_id, canonical_signature, relaxed_signature, effect_type, action_group, polarity,
+                support_count, member_count, first_seen_global_step, last_seen_global_step, stability_score,
+                prediction_lift, prediction_accuracy_mean, prediction_error_before_mean, prediction_error_after_mean
+            )
+            SELECT
+                family_id, canonical_signature, relaxed_signature, effect_type, action_group, polarity,
+                support_count, member_count, first_seen_global_step, last_seen_global_step, stability_score,
+                prediction_lift, prediction_accuracy_mean, prediction_error_before_mean, prediction_error_after_mean
+            FROM {alias}.transformation_families
+            WHERE 1=1
+            ON CONFLICT(canonical_signature) DO UPDATE SET
+                support_count = transformation_families.support_count + excluded.support_count,
+                member_count = transformation_families.member_count + excluded.member_count,
+                first_seen_global_step = MIN(transformation_families.first_seen_global_step, excluded.first_seen_global_step),
+                last_seen_global_step = MAX(transformation_families.last_seen_global_step, excluded.last_seen_global_step),
+                stability_score = MAX(transformation_families.stability_score, excluded.stability_score),
+                prediction_lift = COALESCE(excluded.prediction_lift, transformation_families.prediction_lift),
+                prediction_accuracy_mean = COALESCE(excluded.prediction_accuracy_mean, transformation_families.prediction_accuracy_mean),
+                prediction_error_before_mean = COALESCE(excluded.prediction_error_before_mean, transformation_families.prediction_error_before_mean),
+                prediction_error_after_mean = COALESCE(excluded.prediction_error_after_mean, transformation_families.prediction_error_after_mean)
+            """
+        )
+        state_conn.execute(
+            f"""
+            INSERT INTO family_members (
+                family_signature, contingency_key, support_count, first_seen_global_step, last_seen_global_step
+            )
+            SELECT
+                family_signature, contingency_key, support_count, first_seen_global_step, last_seen_global_step
+            FROM {alias}.family_members
+            WHERE 1=1
+            ON CONFLICT(family_signature, contingency_key) DO UPDATE SET
+                support_count = family_members.support_count + excluded.support_count,
+                first_seen_global_step = MIN(family_members.first_seen_global_step, excluded.first_seen_global_step),
+                last_seen_global_step = MAX(family_members.last_seen_global_step, excluded.last_seen_global_step)
+            """
+        )
+        state_conn.execute(
+            f"""
+            INSERT INTO carrier_candidates (
+                carrier_id, carrier_signature, carrier_source, support_count, linked_family_count,
+                first_seen_global_step, last_seen_global_step, carrier_timing_source, stability_score, is_emergent
+            )
+            SELECT
+                carrier_id, carrier_signature, carrier_source, support_count, linked_family_count,
+                first_seen_global_step, last_seen_global_step, carrier_timing_source, stability_score, is_emergent
+            FROM {alias}.carrier_candidates
+            WHERE 1=1
+            ON CONFLICT(carrier_signature) DO UPDATE SET
+                support_count = MAX(carrier_candidates.support_count, excluded.support_count),
+                linked_family_count = MAX(carrier_candidates.linked_family_count, excluded.linked_family_count),
+                first_seen_global_step = MIN(carrier_candidates.first_seen_global_step, excluded.first_seen_global_step),
+                last_seen_global_step = MAX(carrier_candidates.last_seen_global_step, excluded.last_seen_global_step),
+                carrier_timing_source = CASE
+                    WHEN carrier_candidates.carrier_timing_source = 'real_evidence'
+                         OR excluded.carrier_timing_source = 'real_evidence'
+                    THEN 'real_evidence'
+                    WHEN COALESCE(carrier_candidates.carrier_timing_source, 'unknown') = COALESCE(excluded.carrier_timing_source, 'unknown')
+                    THEN COALESCE(excluded.carrier_timing_source, carrier_candidates.carrier_timing_source, 'unknown')
+                    WHEN carrier_candidates.carrier_timing_source = 'unknown'
+                         AND excluded.carrier_timing_source = 'fold_start_fallback'
+                    THEN 'fold_start_fallback'
+                    WHEN carrier_candidates.carrier_timing_source = 'fold_start_fallback'
+                         AND excluded.carrier_timing_source = 'unknown'
+                    THEN 'fold_start_fallback'
+                    ELSE 'mixed'
+                END,
+                stability_score = MAX(carrier_candidates.stability_score, excluded.stability_score),
+                is_emergent = MAX(carrier_candidates.is_emergent, excluded.is_emergent)
+            """
+        )
+        state_conn.execute(
+            f"""
+            INSERT INTO carrier_links (
+                carrier_signature, linked_type, linked_key, support_count, first_seen_global_step, last_seen_global_step
+            )
+            SELECT
+                carrier_signature, linked_type, linked_key, support_count, first_seen_global_step, last_seen_global_step
+            FROM {alias}.carrier_links
+            WHERE 1=1
+            ON CONFLICT(carrier_signature, linked_type, linked_key) DO UPDATE SET
+                support_count = carrier_links.support_count + excluded.support_count,
+                first_seen_global_step = MIN(carrier_links.first_seen_global_step, excluded.first_seen_global_step),
+                last_seen_global_step = MAX(carrier_links.last_seen_global_step, excluded.last_seen_global_step)
+            """
+        )
+        state_conn.execute(
+            f"""
+            INSERT INTO contradiction_clusters (
+                cluster_id, canonical_key, support_count, first_seen_global_step, last_seen_global_step,
+                max_prediction_error, mean_replay_priority
+            )
+            SELECT
+                cluster_id, canonical_key, support_count, first_seen_global_step, last_seen_global_step,
+                max_prediction_error, mean_replay_priority
+            FROM {alias}.contradiction_clusters
+            WHERE 1=1
+            ON CONFLICT(canonical_key) DO UPDATE SET
+                support_count = contradiction_clusters.support_count + excluded.support_count,
+                first_seen_global_step = MIN(contradiction_clusters.first_seen_global_step, excluded.first_seen_global_step),
+                last_seen_global_step = MAX(contradiction_clusters.last_seen_global_step, excluded.last_seen_global_step),
+                max_prediction_error = MAX(contradiction_clusters.max_prediction_error, excluded.max_prediction_error),
+                mean_replay_priority = MAX(contradiction_clusters.mean_replay_priority, excluded.mean_replay_priority)
+            """
+        )
+        state_conn.execute(
+            f"""
+            INSERT OR REPLACE INTO representative_examples (
+                example_id, owner_type, owner_id, game, sampler, seed, global_step, example_kind, compact_payload_json, priority_score
+            )
+            SELECT
+                example_id, owner_type, owner_id, game, sampler, seed, global_step, example_kind, compact_payload_json, priority_score
+            FROM {alias}.representative_examples
+            """
+        )
+        state_conn.execute(
+            f"""
+            INSERT INTO temporal_milestones (
+                game, sampler, seed, first_interaction_step, first_contingency_candidate_step, first_stable_contingency_step,
+                first_prediction_violation_step, first_high_replay_priority_step, first_transformation_family_step,
+                first_stable_transformation_family_step, first_carrier_candidate_step, first_emergent_carrier_step
+            )
+            SELECT
+                game, sampler, seed, first_interaction_step, first_contingency_candidate_step, first_stable_contingency_step,
+                first_prediction_violation_step, first_high_replay_priority_step, first_transformation_family_step,
+                first_stable_transformation_family_step, first_carrier_candidate_step, first_emergent_carrier_step
+            FROM {alias}.temporal_milestones
+            WHERE 1=1
+            ON CONFLICT(game, sampler, seed) DO UPDATE SET
+                first_interaction_step = COALESCE(temporal_milestones.first_interaction_step, excluded.first_interaction_step),
+                first_contingency_candidate_step = COALESCE(temporal_milestones.first_contingency_candidate_step, excluded.first_contingency_candidate_step),
+                first_stable_contingency_step = COALESCE(temporal_milestones.first_stable_contingency_step, excluded.first_stable_contingency_step),
+                first_prediction_violation_step = COALESCE(temporal_milestones.first_prediction_violation_step, excluded.first_prediction_violation_step),
+                first_high_replay_priority_step = COALESCE(temporal_milestones.first_high_replay_priority_step, excluded.first_high_replay_priority_step),
+                first_transformation_family_step = COALESCE(temporal_milestones.first_transformation_family_step, excluded.first_transformation_family_step),
+                first_stable_transformation_family_step = COALESCE(temporal_milestones.first_stable_transformation_family_step, excluded.first_stable_transformation_family_step),
+                first_carrier_candidate_step = COALESCE(temporal_milestones.first_carrier_candidate_step, excluded.first_carrier_candidate_step),
+                first_emergent_carrier_step = COALESCE(temporal_milestones.first_emergent_carrier_step, excluded.first_emergent_carrier_step)
+            """
+        )
+        state_conn.execute(
+            f"""
+            INSERT OR REPLACE INTO trajectory_efficiency (
+                trajectory_id, game_id, level_id, sampler, seed, epoch, outcome_class,
+                comparable_outcome_group_id, efficiency_active, success, terminal,
+                trajectory_length, steps_to_success, best_known_solution_length,
+                normalized_solve_efficiency, future_option_gain, future_option_gain_per_action,
+                equivalent_outcome_cost_gap, loop_count, loop_ratio, repeated_state_count,
+                repeated_state_ratio, blocked_action_count, blocked_action_ratio,
+                wasted_action_count, wasted_action_ratio, unique_state_count, efficiency_score,
+                efficiency_memory_bonus, efficiency_replay_bonus, efficiency_retention_bonus,
+                efficiency_promotion_bonus
+            )
+            SELECT
+                trajectory_id, game_id, level_id, sampler, seed, epoch, outcome_class,
+                comparable_outcome_group_id, efficiency_active, success, terminal,
+                trajectory_length, steps_to_success, best_known_solution_length,
+                normalized_solve_efficiency, future_option_gain, future_option_gain_per_action,
+                equivalent_outcome_cost_gap, loop_count, loop_ratio, repeated_state_count,
+                repeated_state_ratio, blocked_action_count, blocked_action_ratio,
+                wasted_action_count, wasted_action_ratio, unique_state_count, efficiency_score,
+                efficiency_memory_bonus, efficiency_replay_bonus, efficiency_retention_bonus,
+                efficiency_promotion_bonus
+            FROM {alias}.trajectory_efficiency
+            """
+        )
+        state_conn.execute(
+            f"""
+            INSERT OR REPLACE INTO compact_interaction_trajectory_events (
+                event_id, interaction_id, game_id, level_id, sampler, seed, epoch, episode_id,
+                global_step, outcome_state, level_completed_event, state_hash_before, state_hash_after,
+                action, no_effect_action, future_option_gain
+            )
+            SELECT
+                event_id, interaction_id, game_id, level_id, sampler, seed, epoch, episode_id,
+                global_step, outcome_state, level_completed_event, state_hash_before, state_hash_after,
+                action, no_effect_action, future_option_gain
+            FROM {alias}.compact_interaction_trajectory_events
+            """
+        )
+        if bool(fold_config.fold_memory_substrate):
+            state_conn.execute(
+                f"""
+                INSERT INTO memory_nodes (
+                    node_id, memory_level, node_type, canonical_key, support_count, first_seen_step, last_seen_step, attrs_json
+                )
+                SELECT
+                    node_id, memory_level, node_type, canonical_key, support_count, first_seen_step, last_seen_step, attrs_json
+                FROM {alias}.memory_nodes
+                WHERE 1=1
+                ON CONFLICT(node_id) DO UPDATE SET
+                    memory_level = excluded.memory_level,
+                    node_type = excluded.node_type,
+                    canonical_key = COALESCE(memory_nodes.canonical_key, excluded.canonical_key),
+                    support_count = memory_nodes.support_count + excluded.support_count,
+                    first_seen_step = CASE
+                        WHEN memory_nodes.first_seen_step IS NULL THEN excluded.first_seen_step
+                        WHEN excluded.first_seen_step IS NULL THEN memory_nodes.first_seen_step
+                        ELSE MIN(memory_nodes.first_seen_step, excluded.first_seen_step)
+                    END,
+                    last_seen_step = CASE
+                        WHEN memory_nodes.last_seen_step IS NULL THEN excluded.last_seen_step
+                        WHEN excluded.last_seen_step IS NULL THEN memory_nodes.last_seen_step
+                        ELSE MAX(memory_nodes.last_seen_step, excluded.last_seen_step)
+                    END,
+                    attrs_json = excluded.attrs_json
+                """
+            )
+            state_conn.execute(
+                f"""
+                INSERT INTO memory_edges (
+                    source_node_id, target_node_id, edge_type, weight, support_count, evidence_json
+                )
+                SELECT
+                    source_node_id, target_node_id, edge_type, weight, support_count, evidence_json
+                FROM {alias}.memory_edges
+                WHERE 1=1
+                ON CONFLICT(source_node_id, target_node_id, edge_type) DO UPDATE SET
+                    weight = MAX(memory_edges.weight, excluded.weight),
+                    support_count = memory_edges.support_count + excluded.support_count,
+                    evidence_json = excluded.evidence_json
+                """
+            )
+            state_conn.execute(
+                f"""
+                INSERT OR REPLACE INTO memory_evidence (
+                    evidence_id, target_node_id, source_interaction_id, evidence_type, payload_json
+                )
+                SELECT
+                    evidence_id, target_node_id, source_interaction_id, evidence_type, payload_json
+                FROM {alias}.memory_evidence
+                """
+            )
+            state_conn.execute(
+                f"""
+                INSERT INTO memory_scores (
+                    node_id, isf_total, prediction_lift, transfer_score, explanatory_reach,
+                    compression_gain, future_option_delta, replay_priority, retention_status,
+                    memory_state, stored_epoch, last_replayed_epoch, last_promoted_epoch,
+                    retention_score, forgetting_score, compressed_into_id, superseded_by_id,
+                    forgetting_reason, updated_step
+                )
+                SELECT
+                    node_id, isf_total, prediction_lift, transfer_score, explanatory_reach,
+                    compression_gain, future_option_delta, replay_priority, retention_status,
+                    memory_state, stored_epoch, last_replayed_epoch, last_promoted_epoch,
+                    retention_score, forgetting_score, compressed_into_id, superseded_by_id,
+                    forgetting_reason, updated_step
+                FROM {alias}.memory_scores
+                WHERE 1=1
+                ON CONFLICT(node_id) DO UPDATE SET
+                    isf_total = COALESCE(excluded.isf_total, memory_scores.isf_total),
+                    prediction_lift = COALESCE(excluded.prediction_lift, memory_scores.prediction_lift),
+                    transfer_score = COALESCE(excluded.transfer_score, memory_scores.transfer_score),
+                    explanatory_reach = COALESCE(excluded.explanatory_reach, memory_scores.explanatory_reach),
+                    compression_gain = COALESCE(excluded.compression_gain, memory_scores.compression_gain),
+                    future_option_delta = COALESCE(excluded.future_option_delta, memory_scores.future_option_delta),
+                    replay_priority = MAX(COALESCE(memory_scores.replay_priority, 0.0), COALESCE(excluded.replay_priority, 0.0)),
+                    retention_status = COALESCE(excluded.retention_status, memory_scores.retention_status),
+                    memory_state = COALESCE(excluded.memory_state, memory_scores.memory_state),
+                    stored_epoch = COALESCE(excluded.stored_epoch, memory_scores.stored_epoch),
+                    last_replayed_epoch = COALESCE(excluded.last_replayed_epoch, memory_scores.last_replayed_epoch),
+                    last_promoted_epoch = COALESCE(excluded.last_promoted_epoch, memory_scores.last_promoted_epoch),
+                    retention_score = COALESCE(excluded.retention_score, memory_scores.retention_score),
+                    forgetting_score = COALESCE(excluded.forgetting_score, memory_scores.forgetting_score),
+                    compressed_into_id = COALESCE(excluded.compressed_into_id, memory_scores.compressed_into_id),
+                    superseded_by_id = COALESCE(excluded.superseded_by_id, memory_scores.superseded_by_id),
+                    forgetting_reason = COALESCE(excluded.forgetting_reason, memory_scores.forgetting_reason),
+                    updated_step = COALESCE(excluded.updated_step, memory_scores.updated_step)
+                """
+            )
+            state_conn.execute(
+                f"""
+                INSERT OR REPLACE INTO memory_promotions (
+                    promotion_id, source_node_id, target_node_id, promotion_type,
+                    evidence_count, promotion_score, status, payload_json
+                )
+                SELECT
+                    promotion_id, source_node_id, target_node_id, promotion_type,
+                    evidence_count, promotion_score, status, payload_json
+                FROM {alias}.memory_promotions
+                """
+            )
+    finally:
+        _detach_shard_database(state_conn, alias)
+
+
+def _merge_graph_tables_set_based(temp_graph_path: Path, graph_conn: sqlite3.Connection, fold_config: CompactMemoryFoldConfig) -> None:
+    if not bool(fold_config.fold_graph):
+        return
+    alias = _attach_shard_database(graph_conn, "shard_graph", temp_graph_path)
+    try:
+        graph_conn.execute(
+            f"""
+            INSERT INTO graph_nodes (
+                node_id, node_type, canonical_key, first_seen_global_step, last_seen_global_step, support_count
+            )
+            SELECT
+                node_id, node_type, canonical_key, first_seen_global_step, last_seen_global_step, support_count
+            FROM {alias}.graph_nodes
+            WHERE 1=1
+            ON CONFLICT(node_id) DO UPDATE SET
+                node_type = COALESCE(graph_nodes.node_type, excluded.node_type),
+                canonical_key = COALESCE(graph_nodes.canonical_key, excluded.canonical_key),
+                first_seen_global_step = MIN(graph_nodes.first_seen_global_step, excluded.first_seen_global_step),
+                last_seen_global_step = MAX(graph_nodes.last_seen_global_step, excluded.last_seen_global_step),
+                support_count = MAX(graph_nodes.support_count, excluded.support_count)
+            """
+        )
+        # Shard-level edge caps are applied before merge; this merge preserves shard rows as-is.
+        graph_conn.execute(
+            f"""
+            INSERT INTO graph_edges (
+                edge_id, source_node_id, target_node_id, edge_type, first_seen_global_step, last_seen_global_step, support_count, weight
+            )
+            SELECT
+                edge_id, source_node_id, target_node_id, edge_type, first_seen_global_step, last_seen_global_step, support_count, weight
+            FROM {alias}.graph_edges
+            WHERE 1=1
+            ON CONFLICT(edge_id) DO UPDATE SET
+                first_seen_global_step = MIN(graph_edges.first_seen_global_step, excluded.first_seen_global_step),
+                last_seen_global_step = MAX(graph_edges.last_seen_global_step, excluded.last_seen_global_step),
+                support_count = MAX(graph_edges.support_count, excluded.support_count),
+                weight = MAX(graph_edges.weight, excluded.weight)
+            """
+        )
+    finally:
+        _detach_shard_database(graph_conn, alias)
+
+
+def _merge_replay_queue_set_based(temp_replay_path: Path, replay_conn: sqlite3.Connection) -> None:
+    alias = _attach_shard_database(replay_conn, "shard_replay", temp_replay_path)
+    try:
+        replay_conn.execute(
+            f"""
+            INSERT INTO replay_queue (
+                replay_id, owner_type, owner_id, priority_score, reason,
+                first_seen_global_step, last_seen_global_step, compact_payload_json
+            )
+            SELECT
+                replay_id, owner_type, owner_id, priority_score, reason,
+                first_seen_global_step, last_seen_global_step, compact_payload_json
+            FROM {alias}.replay_queue
+            WHERE 1=1
+            ON CONFLICT(replay_id) DO UPDATE SET
+                priority_score = MAX(replay_queue.priority_score, excluded.priority_score),
+                first_seen_global_step = MIN(replay_queue.first_seen_global_step, excluded.first_seen_global_step),
+                last_seen_global_step = MAX(replay_queue.last_seen_global_step, excluded.last_seen_global_step),
+                compact_payload_json = excluded.compact_payload_json
+            """
+        )
+    finally:
+        _detach_shard_database(replay_conn, alias)
 
 
 def _merge_state_tables(temp_state: sqlite3.Connection, state_conn: sqlite3.Connection, fold_config: CompactMemoryFoldConfig) -> None:
@@ -2145,6 +2685,7 @@ def _fold_single_db(
         raw_conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
         raw_conn.row_factory = sqlite3.Row
         tables = {str(row[0]) for row in raw_conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        caches = _build_raw_db_fold_caches(raw_conn, tables)
         game = _path_segment(db_path, -4)
         sampler = _path_segment(db_path, -3)
         seed = _seed_from_db_path(db_path)
@@ -2159,7 +2700,12 @@ def _fold_single_db(
             for row in raw_conn.execute("SELECT * FROM contingencies").fetchall():
                 raw_contingency_rows_seen += 1
                 payload = dict(row)
-                family_signature = canonical_family_signature_from_raw_db(raw_conn, payload.get("transformation_family"), payload)
+                family_signature = canonical_family_signature_from_raw_db(
+                    raw_conn,
+                    payload.get("transformation_family"),
+                    payload,
+                    caches=caches,
+                )
                 stable_family_id = stable_family_int_id(family_signature)
                 canonical_key = canonicalize_context_action_effect(
                     context_signature=str(payload.get("context_signature") or payload.get("context_action") or "[]"),
@@ -2178,6 +2724,7 @@ def _fold_single_db(
                         raw_conn,
                         payload=payload,
                         family_id=payload.get("transformation_family"),
+                        caches=caches,
                     ),
                     action=int(payload.get("action") or 0),
                     effect_signature=family_signature,
@@ -2189,14 +2736,16 @@ def _fold_single_db(
                     prediction_error_after=_coerce_float(payload.get("prediction_error_after")),
                     normalized_contingency_key=str(
                         payload.get("normalized_contingency_key")
-                        or normalized_contingency_identity(
+                        or normalized_contingency_identity_cached(
                             context_level=_context_level_from_raw(
                                 raw_conn,
                                 payload=payload,
                                 family_id=payload.get("transformation_family"),
+                                caches=caches,
                             ),
                             action=int(payload.get("action") or 0),
                             effect_signature=family_signature,
+                            caches=caches,
                         )
                     ),
                     fold_config=fold_config,
@@ -2233,6 +2782,7 @@ def _fold_single_db(
                         carrier_signature=None,
                         contradiction_key=None,
                         replay_id=None,
+                        totals=totals,
                     )
         prediction_results_m1_fallback_rows = 0
         if raw_contingency_rows_seen <= 0 and "prediction_results" in tables:
@@ -2246,6 +2796,7 @@ def _fold_single_db(
                 sampler=sampler,
                 seed=seed,
                 family_members_by_signature=family_members_by_signature,
+                caches=caches,
             )
             raw_contingency_rows_seen += prediction_results_m1_fallback_rows
         totals["raw_contingency_rows_seen"] = int(totals.get("raw_contingency_rows_seen", 0) or 0) + raw_contingency_rows_seen
@@ -2410,7 +2961,12 @@ def _fold_single_db(
             contradiction_supports: dict[str, dict[str, Any]] = {}
             for row in raw_conn.execute("SELECT * FROM prediction_results").fetchall():
                 payload = dict(row)
-                family_signature = canonical_family_signature_from_raw_db(raw_conn, payload.get("actual_family") or payload.get("predicted_family"), payload)
+                family_signature = canonical_family_signature_from_raw_db(
+                    raw_conn,
+                    payload.get("actual_family") or payload.get("predicted_family"),
+                    payload,
+                    caches=caches,
+                )
                 stable_family_id = stable_family_int_id(family_signature)
                 _upsert_family_identity_map(state_conn, family_signature, stable_family_id)
                 info = family_supports.setdefault(
@@ -2473,6 +3029,7 @@ def _fold_single_db(
                     carrier_signature=None,
                     contradiction_key=contradiction_key,
                     replay_id=None,
+                    totals=totals,
                 )
             allow_prediction_family_fold = prediction_results_m1_fallback_rows <= 0 and (
                 ("contingencies" not in tables) or raw_contingency_rows_seen > 0
@@ -2599,7 +3156,7 @@ def _fold_single_db(
                 family_signature = None
                 family_id = prediction_payload.get("actual_family") or prediction_payload.get("predicted_family")
                 if family_id not in (None, ""):
-                    family_signature = canonical_family_signature_from_raw_db(raw_conn, family_id, prediction_payload)
+                    family_signature = canonical_family_signature_from_raw_db(raw_conn, family_id, prediction_payload, caches=caches)
                     _upsert_family_identity_map(state_conn, family_signature, stable_family_int_id(family_signature))
                 contradiction_key = None
                 if int(prediction_payload.get("context_contradiction") or prediction_payload.get("prediction_error") or 0):
@@ -2641,6 +3198,7 @@ def _fold_single_db(
                     carrier_signature=str(payload.get("carrier_signature") or "") or None,
                     contradiction_key=contradiction_key,
                     replay_id=replay_id,
+                    totals=totals,
                 )
         if "trajectory_efficiency" in tables:
             for row in raw_conn.execute("SELECT * FROM trajectory_efficiency ORDER BY trajectory_id ASC").fetchall():
@@ -2805,7 +3363,7 @@ def _fold_single_db(
                 family_signature = None
                 family_id = item.get("family_id")
                 if family_id not in (None, ""):
-                    family_signature = canonical_family_signature_from_raw_db(raw_conn, family_id, item)
+                    family_signature = canonical_family_signature_from_raw_db(raw_conn, family_id, item, caches=caches)
                 contingency_key = None
                 if item.get("context_signature") is not None and family_signature is not None:
                     contingency_key = canonicalize_context_action_effect(
@@ -2866,6 +3424,7 @@ def _fold_single_db(
                     carrier_signature=carrier_signature,
                     contradiction_key=None,
                     replay_id=None,
+                    totals=totals,
                 )
 
 
@@ -3022,6 +3581,7 @@ def _fold_carrier_candidates_sidecar(
             carrier_signature=carrier_signature,
             contradiction_key=None,
             replay_id=None,
+            totals=totals,
         )
 
 
@@ -3171,6 +3731,7 @@ def _fold_prediction_results_into_m1_substrate(
     sampler: str,
     seed: int,
     family_members_by_signature: dict[str, set[str]],
+    caches: RawDbFoldCaches | None = None,
 ) -> int:
     rows = raw_conn.execute("SELECT * FROM prediction_results").fetchall()
     if not rows:
@@ -3181,7 +3742,7 @@ def _fold_prediction_results_into_m1_substrate(
         actual_family = payload.get("actual_family")
         if actual_family in (None, ""):
             continue
-        family_signature = canonical_family_signature_from_raw_db(raw_conn, actual_family, payload)
+        family_signature = canonical_family_signature_from_raw_db(raw_conn, actual_family, payload, caches=caches)
         context_level = int(payload.get("context_level") or 0)
         context_signature = str(payload.get("context_signature") or payload.get("context_action") or "[]")
         action = int(payload.get("action") or 0)
@@ -3198,7 +3759,7 @@ def _fold_prediction_results_into_m1_substrate(
         entry["support_count"] += 1
         predicted_family = payload.get("predicted_family")
         if predicted_family not in (None, ""):
-            predicted_signature = canonical_family_signature_from_raw_db(raw_conn, predicted_family, payload)
+            predicted_signature = canonical_family_signature_from_raw_db(raw_conn, predicted_family, payload, caches=caches)
             if predicted_signature == family_signature:
                 entry["prediction_success_count"] += 1
         global_step = int(payload.get("global_step") or payload.get("interaction_id") or fold_config.global_step_end)
@@ -3237,10 +3798,11 @@ def _fold_prediction_results_into_m1_substrate(
             prediction_accuracy=prediction_accuracy,
             prediction_error_before=None,
             prediction_error_after=None,
-            normalized_contingency_key=normalized_contingency_identity(
+            normalized_contingency_key=normalized_contingency_identity_cached(
                 context_level=context_level,
                 action=action,
                 effect_signature=family_signature,
+                caches=caches,
             ),
             fold_config=fold_config,
             stable_threshold=20,
@@ -3302,25 +3864,44 @@ def _fold_prediction_results_into_m1_substrate(
             carrier_signature=None,
             contradiction_key=None,
             replay_id=None,
+            totals=totals,
         )
         contingency_rows_seen += 1
     return contingency_rows_seen
 
 
-def _context_level_from_raw(raw_conn: sqlite3.Connection, *, payload: dict[str, Any], family_id: Any) -> int:
+def _context_level_from_raw(
+    raw_conn: sqlite3.Connection,
+    *,
+    payload: dict[str, Any],
+    family_id: Any,
+    caches: RawDbFoldCaches | None = None,
+) -> int:
     if payload.get("context_level") not in (None, ""):
         return int(payload.get("context_level") or 0)
+    lookup_key = (
+        str(payload.get("context_signature") or payload.get("context_action") or ""),
+        str(payload.get("action") if payload.get("action") is not None else -1),
+        str(family_id if family_id is not None else ""),
+    )
+    if caches is not None and lookup_key in caches.prediction_context_level_lookup:
+        return int(caches.prediction_context_level_lookup[lookup_key] or 0)
     tables = {row[0] for row in raw_conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
     if "prediction_results" not in tables:
         return 0
     prediction_columns = {row[1] for row in raw_conn.execute("PRAGMA table_info(prediction_results)").fetchall()}
     if "context_level" not in prediction_columns:
         return 0
+    context_lookup_value = payload.get("context_signature") or payload.get("context_action")
+    if "context_action" in prediction_columns:
+        context_filter = "COALESCE(context_signature, context_action, '') = COALESCE(?, '')"
+    else:
+        context_filter = "COALESCE(context_signature, '') = COALESCE(?, '')"
     row = raw_conn.execute(
-        """
+        f"""
         SELECT MAX(COALESCE(context_level, 0))
         FROM prediction_results
-        WHERE COALESCE(context_signature, '') = COALESCE(?, '')
+        WHERE {context_filter}
           AND COALESCE(action, -1) = COALESCE(?, -1)
           AND (
                 COALESCE(actual_family, predicted_family) = ?
@@ -3328,7 +3909,7 @@ def _context_level_from_raw(raw_conn: sqlite3.Connection, *, payload: dict[str, 
           )
         """,
         (
-            payload.get("context_signature") or payload.get("context_action"),
+            context_lookup_value,
             payload.get("action"),
             family_id,
             str(family_id) if family_id is not None else None,
@@ -3391,7 +3972,57 @@ def _upsert_transformation_family(
     )
 
 
-def _ingest_live_graph_export(graph_conn: sqlite3.Connection, path: Path, fold_config: CompactMemoryFoldConfig) -> None:
+def _graph_edge_cap_exceeded(
+    graph_conn: sqlite3.Connection,
+    *,
+    source_node_id: str,
+    target_node_id: str,
+    edge_type: str,
+    fold_config: CompactMemoryFoldConfig,
+    totals: dict[str, Any] | None,
+) -> str | None:
+    del target_node_id, edge_type, totals
+    total_edges = int(graph_conn.execute("SELECT COUNT(*) FROM graph_edges").fetchone()[0] or 0)
+    if total_edges >= int(fold_config.max_graph_edges_per_fold):
+        return "fold_cap"
+    source_edges = int(
+        graph_conn.execute(
+            "SELECT COUNT(*) FROM graph_edges WHERE source_node_id = ?",
+            (source_node_id,),
+        ).fetchone()[0]
+        or 0
+    )
+    if source_edges >= int(fold_config.max_edges_per_source_node):
+        return "source_cap"
+    if source_node_id.startswith("carrier:"):
+        carrier_edges = int(
+            graph_conn.execute(
+                "SELECT COUNT(*) FROM graph_edges WHERE source_node_id = ? AND edge_type IN ('explains', 'anchors', 'appears_in')",
+                (source_node_id,),
+            ).fetchone()[0]
+            or 0
+        )
+        if carrier_edges >= int(fold_config.max_edges_per_carrier):
+            return "carrier_cap"
+    if source_node_id.startswith("family:"):
+        family_edges = int(
+            graph_conn.execute(
+                "SELECT COUNT(*) FROM graph_edges WHERE source_node_id = ?",
+                (source_node_id,),
+            ).fetchone()[0]
+            or 0
+        )
+        if family_edges >= int(fold_config.max_edges_per_family):
+            return "family_cap"
+    return None
+
+
+def _ingest_live_graph_export(
+    graph_conn: sqlite3.Connection,
+    path: Path,
+    fold_config: CompactMemoryFoldConfig,
+    totals: dict[str, Any] | None = None,
+) -> None:
     if not bool(fold_config.fold_graph):
         return
     payload = _load_json(path) or {}
@@ -3413,6 +4044,7 @@ def _ingest_live_graph_export(graph_conn: sqlite3.Connection, path: Path, fold_c
             fold_config=fold_config,
             support_count=int(row.get("support_count") or 1),
             weight=float(row.get("weight") or 1.0),
+            totals=totals,
         )
 
 
@@ -3430,6 +4062,7 @@ def _upsert_observation_graph(
     carrier_signature: str | None,
     contradiction_key: str | None,
     replay_id: str | None,
+    totals: dict[str, Any] | None = None,
 ) -> None:
     if not bool(fold_config.fold_graph):
         return
@@ -3492,7 +4125,14 @@ def _upsert_observation_graph(
     for node_id, node_type, canonical_key in nodes:
         _upsert_graph_node(graph_conn, node_id=node_id, node_type=node_type, canonical_key=canonical_key, fold_config=fold_config)
     for source, target, edge_type in edges:
-        _upsert_graph_edge(graph_conn, source_node_id=source, target_node_id=target, edge_type=edge_type, fold_config=fold_config)
+        _upsert_graph_edge(
+            graph_conn,
+            source_node_id=source,
+            target_node_id=target,
+            edge_type=edge_type,
+            fold_config=fold_config,
+            totals=totals,
+        )
 
 
 def _upsert_temporal_milestones(connection: sqlite3.Connection, rows: list[dict[str, Any]]) -> None:
@@ -3669,7 +4309,29 @@ def _upsert_graph_edge(
     fold_config: CompactMemoryFoldConfig,
     support_count: int = 1,
     weight: float = 1.0,
-) -> None:
+    totals: dict[str, Any] | None = None,
+) -> bool:
+    if totals is not None:
+        totals["graph_edges_attempted"] = int(totals.get("graph_edges_attempted", 0) or 0) + 1
+    if bool(fold_config.enable_graph_edge_caps):
+        reason = _graph_edge_cap_exceeded(
+            graph_conn,
+            source_node_id=source_node_id,
+            target_node_id=target_node_id,
+            edge_type=edge_type,
+            fold_config=fold_config,
+            totals=totals,
+        )
+        if reason is not None:
+            if totals is not None:
+                counter_name = {
+                    "fold_cap": "graph_edges_skipped_by_fold_cap",
+                    "source_cap": "graph_edges_skipped_by_source_cap",
+                    "carrier_cap": "graph_edges_skipped_by_carrier_cap",
+                    "family_cap": "graph_edges_skipped_by_family_cap",
+                }[reason]
+                totals[counter_name] = int(totals.get(counter_name, 0) or 0) + 1
+            return False
     edge_id = f"{source_node_id}->{edge_type}->{target_node_id}"
     graph_conn.execute(
         """
@@ -3683,6 +4345,9 @@ def _upsert_graph_edge(
         """,
         (edge_id, source_node_id, target_node_id, edge_type, fold_config.global_step_start, fold_config.global_step_end, int(support_count), float(weight)),
     )
+    if totals is not None:
+        totals["graph_edges_written"] = int(totals.get("graph_edges_written", 0) or 0) + 1
+    return True
 
 
 def _write_memory_summary_table(connection: sqlite3.Connection, summary: dict[str, Any]) -> None:
@@ -3955,6 +4620,16 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     return str(value)
+
+
+def _normalize_jsonish_cached(value: Any, caches: RawDbFoldCaches | None = None) -> str:
+    text = str(value)
+    if caches is not None and text in caches.normalized_jsonish:
+        return caches.normalized_jsonish[text]
+    normalized = _normalize_jsonish(value)
+    if caches is not None:
+        caches.normalized_jsonish[text] = normalized
+    return normalized
 
 
 def _path_segment(path: Path, index_from_end: int) -> str:
@@ -4513,13 +5188,9 @@ def _ensure_current_state_schema(path: Path) -> None:
             ON role_links(linked_type, linked_key);
             CREATE INDEX IF NOT EXISTS idx_carrier_links_signature_type_key
             ON carrier_links(carrier_signature, linked_type, linked_key);
-            CREATE INDEX IF NOT EXISTS idx_carrier_links_carrier_type_key
-            ON carrier_links(carrier_signature, linked_type, linked_key);
             CREATE INDEX IF NOT EXISTS idx_carrier_links_type_key
             ON carrier_links(linked_type, linked_key);
             CREATE INDEX IF NOT EXISTS idx_role_neighborhood_carrier_signature
-            ON role_neighborhood_signatures(carrier_signature);
-            CREATE INDEX IF NOT EXISTS idx_role_neighborhood_carrier
             ON role_neighborhood_signatures(carrier_signature);
             CREATE INDEX IF NOT EXISTS idx_role_neighborhood_role
             ON role_neighborhood_signatures(role_signature);
@@ -4615,6 +5286,8 @@ def _ensure_current_state_schema(path: Path) -> None:
         _ensure_column(connection, "memory_scores", "compressed_into_id", "TEXT")
         _ensure_column(connection, "memory_scores", "superseded_by_id", "TEXT")
         _ensure_column(connection, "memory_scores", "forgetting_reason", "TEXT")
+        connection.execute("DROP INDEX IF EXISTS idx_carrier_links_carrier_type_key")
+        connection.execute("DROP INDEX IF EXISTS idx_role_neighborhood_carrier")
         connection.commit()
 
 
@@ -4643,11 +5316,7 @@ def _ensure_graph_schema(path: Path) -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_graph_edges_source_node
             ON graph_edges(source_node_id);
-            CREATE INDEX IF NOT EXISTS idx_graph_edges_source
-            ON graph_edges(source_node_id);
             CREATE INDEX IF NOT EXISTS idx_graph_edges_target_node
-            ON graph_edges(target_node_id);
-            CREATE INDEX IF NOT EXISTS idx_graph_edges_target
             ON graph_edges(target_node_id);
             CREATE INDEX IF NOT EXISTS idx_graph_edges_type_target
             ON graph_edges(edge_type, target_node_id);
@@ -4655,6 +5324,8 @@ def _ensure_graph_schema(path: Path) -> None:
             ON graph_edges(edge_type, source_node_id);
             """
         )
+        connection.execute("DROP INDEX IF EXISTS idx_graph_edges_source")
+        connection.execute("DROP INDEX IF EXISTS idx_graph_edges_target")
         connection.commit()
 
 
