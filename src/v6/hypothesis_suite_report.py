@@ -1151,6 +1151,15 @@ def _apply_higher_order_dependency_gates(
     if str(h04.get("decision")) == "INVALID" and str(h05.get("decision")) == "VALID":
         h05 = _demote(h05, "H05 depends on invalid H04 carrier emergence.")
         h05["h05_depends_on_invalid_h04"] = True
+    if str(h05.get("decision")) == "VALID" and (
+        str(h04.get("decision")) != "VALID"
+        or h04.get("h04_graph_quality_pass") is not True
+        or int(h04.get("usable_emergent_carrier_count") or 0) <= 0
+    ):
+        h05 = _demote(
+            h05,
+            "H05 cannot be fully VALID until H04 has VALID usable carrier emergence with graph-quality pass.",
+        )
     if str(h05.get("decision")) != "VALID" and str(h06.get("decision")) == "VALID":
         h06 = _demote(h06, "H06 cannot be fully VALID until H05 role emergence is VALID.")
     if str(h06.get("decision")) != "VALID" and str(h07.get("decision")) == "VALID":

@@ -193,9 +193,6 @@ def evaluate_h04_carrier_emergence(
             usable_carrier_explains_edge_count += 1
         elif str(edge_type) == "anchors":
             usable_carrier_anchors_edge_count += 1
-    if usable_signature_ids and usable_carrier_explains_edge_count == 0 and usable_carrier_anchors_edge_count == 0:
-        usable_carrier_explains_edge_count = int(graph_counts["carrier_explains_edge_count"] or 0)
-        usable_carrier_anchors_edge_count = int(graph_counts["carrier_anchors_edge_count"] or 0)
     temporal_sources = {first_stable_source, first_carrier_source, first_emergent_source}
     if "temporal_milestones" in temporal_sources:
         h04_temporal_source = "temporal_milestones"
@@ -267,6 +264,10 @@ def evaluate_h04_carrier_emergence(
     else:
         metrics["carrier_timing_source"] = "unknown"
     missing_evidence = [] if carrier_rows else ["no carrier candidates in compact memory"]
+    if usable_signature_ids and usable_carrier_explains_edge_count == 0 and usable_carrier_anchors_edge_count == 0:
+        missing_evidence.append(
+            "Usable carriers have no usable explains/anchors graph edges; carrier graph IDs may be mismatched or graph projection failed."
+        )
     if not carrier_rows:
         decision = "INVALID" if first_stable_family_step is not None else "INCONCLUSIVE"
     elif (
@@ -339,12 +340,13 @@ def evaluate_h04_carrier_emergence(
         if "H04 timing is not fully grounded in real carrier evidence timing." not in missing_evidence:
             missing_evidence.append("H04 timing is not fully grounded in real carrier evidence timing.")
         decision = "PARTIALLY_VALID"
-    if decision == "VALID" and metrics["h04_graph_quality_pass"] is not True:
-        decision = "PARTIALLY_VALID"
+    if metrics["h04_graph_quality_pass"] is not True:
         if "H04 carrier graph is overconnected; remapping/edge explosion prevents robust VALID classification." not in missing_evidence:
             missing_evidence.append(
                 "H04 carrier graph is overconnected; remapping/edge explosion prevents robust VALID classification."
             )
+        if decision == "VALID":
+            decision = "PARTIALLY_VALID"
     result = {
         "hypothesis_id": "H04",
         "decision": decision,

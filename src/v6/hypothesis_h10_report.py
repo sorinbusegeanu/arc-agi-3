@@ -9,6 +9,14 @@ from v6.future_options import derive_future_option_memory
 from v6.memory.compact_memory import ensure_memory_layout
 
 
+def _missing_tables(connection: sqlite3.Connection, required: tuple[str, ...]) -> list[str]:
+    tables = {
+        str(row[0])
+        for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    }
+    return [name for name in required if name not in tables]
+
+
 def _lift(high_value: float | None, low_value: float | None) -> float | None:
     if high_value is None or low_value is None:
         return None
@@ -49,6 +57,17 @@ def evaluate_h10_future_option_attention(
         derive_future_option_memory(memory_dir=memory_dir, run_dir=run_dir)
     with sqlite3.connect(Path(memory_dir) / "current_state.sqlite") as conn:
         conn.row_factory = sqlite3.Row
+        missing_tables = _missing_tables(conn, ("future_option_attention_links", "future_option_events"))
+        if missing_tables:
+            result = {
+                "hypothesis_id": "H10",
+                "evidence_source": "compact_memory",
+                "decision": "INSUFFICIENT_EVIDENCE",
+                "missing_evidence": [f"Missing expected compact-memory table(s): {', '.join(missing_tables)}"],
+                "core_metrics": {},
+            }
+            _write(output_dir, result)
+            return result
         rows = [dict(row) for row in conn.execute("SELECT * FROM future_option_attention_links ORDER BY event_id ASC").fetchall()]
         future_option_event_count = int(conn.execute("SELECT COUNT(*) FROM future_option_events").fetchone()[0])
     high_rows = [row for row in rows if int(row["high_option_change"] or 0) == 1]
@@ -168,6 +187,13 @@ def evaluate_h10_future_option_attention(
         result["missing_evidence"].append(
             "Attention calibration is degenerate because attention scores do not separate the evaluated interactions."
         )
+    elif (
+        result["option_attention_lift_unbounded"] is True
+        and len(high_rows) >= 5
+        and len(high_attention_rows) >= 5
+        and not result["attention_saturation"]
+    ):
+        result["decision"] = "VALID"
     elif len(high_both) > 0 and lift is None:
         result["decision"] = "PARTIALLY_VALID"
     elif (

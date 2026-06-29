@@ -129,6 +129,9 @@ def evaluate_h06_role_transfer(
     ):
         decision = "VALID"
         missing = []
+    elif transfer_attempt_count < 5:
+        decision = "INSUFFICIENT_EVIDENCE"
+        missing = ["too few role transfer attempts for H06 evaluation"]
     elif transfer_attempt_count >= 5 and (transfer_success_rate or 0.0) >= 0.35 and successful_role_count >= 1:
         decision = "PARTIALLY_VALID"
         missing = []
@@ -139,6 +142,19 @@ def evaluate_h06_role_transfer(
         decision = "PARTIALLY_VALID"
         missing = []
     result = _base_result(decision, missing)
+    sampled = int(metrics.get("sampled_transfer_attempts") or 0)
+    possible = int(metrics.get("total_possible_transfer_attempts") or 0)
+    sample_fraction = (float(sampled) / float(possible)) if possible > 0 else None
+    if (
+        result["decision"] == "VALID"
+        and int(metrics.get("skipped_by_cap_count") or 0) > 0
+        and sample_fraction is not None
+        and sample_fraction < 0.5
+    ):
+        result["decision"] = "PARTIALLY_VALID"
+        result["missing_evidence"].append(
+            "H06 transfer sampling was capped; sampled attempts are insufficient for robust VALID classification."
+        )
     result.update(metrics)
     result["core_metrics"] = dict(metrics)
     result["evidence_diagnostics"] = _evidence_diagnostics(memory_dir, run_dir, missing_target="none")

@@ -88,11 +88,12 @@ def evaluate_h12_efficiency_emergence(
         "trajectory_reconstruction_diagnostics": reconstruction,
         "missing_evidence": [],
     }
-    negative_cost_gap_replay_selection = (
+    cost_gap_replay_selection_bad = (
         result.get("cost_gap_replay_priority_correlation") is not None
-        and float(result["cost_gap_replay_priority_correlation"]) < 0.0
+        and float(result["cost_gap_replay_priority_correlation"]) > 0.0
     )
-    result["negative_cost_gap_replay_selection"] = negative_cost_gap_replay_selection
+    result["cost_gap_replay_selection_bad"] = cost_gap_replay_selection_bad
+    result["negative_cost_gap_replay_selection"] = False
     if len(successful_rows) < 2 or comparable_groups <= 0:
         result["decision"] = "INSUFFICIENT_EVIDENCE"
         result["missing_evidence"].append("Too few successful or comparable trajectories are available for H12.")
@@ -126,11 +127,11 @@ def evaluate_h12_efficiency_emergence(
                 + ["Trajectory efficiency evidence exists but is not improving versus the previous epoch."]
             )
         )
-    if negative_cost_gap_replay_selection:
+    if cost_gap_replay_selection_bad:
         result["missing_evidence"] = list(
             dict.fromkeys(
                 list(result.get("missing_evidence", []))
-                + ["Replay preference is negatively correlated with equivalent-outcome cost gap; efficient trajectories are not being preferentially selected."]
+                + ["Replay preference is positively correlated with equivalent-outcome cost gap; inefficient trajectories are being preferentially selected."]
             )
         )
         if result["decision"] == "VALID":
@@ -163,6 +164,7 @@ def evaluate_h12_efficiency_emergence(
             "efficiency_replay_priority_correlation",
             "efficiency_memory_fitness_correlation",
             "cost_gap_replay_priority_correlation",
+            "cost_gap_replay_selection_bad",
             "negative_cost_gap_replay_selection",
             "future_option_gain_per_action_correlation",
             "efficiency_improved_vs_previous_epoch",

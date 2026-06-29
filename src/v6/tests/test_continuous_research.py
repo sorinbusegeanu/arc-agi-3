@@ -186,9 +186,115 @@ def _write_sampling_fixture(
 def test_log_epoch_phase_prints_without_jsonl_side_effect(tmp_path: Path, capsys) -> None:
     continuous_research._log_epoch_phase("epoch_0001", "hypothesis_suite", "done", {"H01": "VALID"})
     captured = capsys.readouterr()
-    assert "[epoch epoch_0001] hypothesis_suite: done" in captured.out
+    assert " hypothesis_suite: done" in captured.out
+    assert " E0001]" in captured.out
     assert "H01" in captured.out
     assert not any(tmp_path.rglob("epoch_phase_log.jsonl"))
+
+
+def test_continuous_stdout_is_written_to_overwritten_log_file(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "continuous_log"
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "log.txt").write_text("OLD CONTENT\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        continuous_research,
+        "run_interaction_sampling_v05c",
+        lambda config: _write_sampling_fixture(Path(config.output_dir), global_step_offset=int(config.global_step_offset), stable_support=25),
+    )
+    monkeypatch.setattr(continuous_research, "direct_streaming_manifest_has_failures", lambda memory_dir: False)
+    monkeypatch.setattr(
+        continuous_research,
+        "run_hypothesis_suite_report",
+        lambda **kwargs: {
+            "game_count": 1,
+            "interactions_this_epoch": 4,
+            "levels_successfully_completed_per_epoch": 1,
+            "games_solved_per_epoch": 0,
+            "solved_games": [],
+            "completed_levels_by_game": {"tt01": 1},
+            "H01 decision": "PARTIALLY_VALID",
+            "H02 decision": "PARTIALLY_VALID",
+            "H03 decision": "PARTIALLY_VALID",
+            "H04 decision": "INCONCLUSIVE",
+            "H05 decision": "INCONCLUSIVE",
+            "H06 decision": "INCONCLUSIVE",
+            "H07 decision": "INCONCLUSIVE",
+            "H08 decision": "INCONCLUSIVE",
+            "H09 decision": "INCONCLUSIVE",
+            "H10 decision": "INCONCLUSIVE",
+            "H11 decision": "INCONCLUSIVE",
+            "H12 decision": "INSUFFICIENT_EVIDENCE",
+            "H01 core metrics": {},
+            "H02 core metrics": {},
+            "H03 core metrics": {},
+            "H04 core metrics": {},
+            "H05 core metrics": {},
+            "H06 core metrics": {},
+            "H07 core metrics": {},
+            "H08 core metrics": {},
+            "H09 core metrics": {},
+            "H10 core metrics": {},
+            "H11 core metrics": {},
+            "H12 core metrics": {},
+            "memory_size_before_bytes": 0,
+            "memory_size_after_bytes": 0,
+        },
+    )
+    monkeypatch.setattr(continuous_research, "run_selective_forgetting_pass", lambda **kwargs: {"changed": True})
+    monkeypatch.setattr(continuous_research, "evaluate_h10b_selective_forgetting", lambda **kwargs: {"decision": "PARTIALLY_VALID"})
+    monkeypatch.setattr(
+        continuous_research,
+        "build_memory_summary",
+        lambda memory_paths: {
+            "stable_contingency_count": 1,
+            "transformation_family_count": 1,
+            "memory_node_count": 2,
+            "graph_node_count": 0,
+            "graph_edge_count": 0,
+            "replay_queue_size": 0,
+        },
+    )
+    monkeypatch.setattr(continuous_research, "_write_memory_continuity_report", lambda **kwargs: {"continuity_valid": True})
+    monkeypatch.setattr(continuous_research, "validate_cleanup_safe", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        continuous_research,
+        "cleanup_epoch_artifacts",
+        lambda **kwargs: {
+            "disk_before_cleanup_bytes": 100,
+            "disk_after_cleanup_bytes": 50,
+            "disk_freed_bytes": 50,
+            "raw_files_deleted_count": 1,
+            "raw_bytes_deleted": 50,
+            "temp_files_deleted_count": 0,
+            "temp_bytes_deleted": 0,
+            "memory_db_size_bytes": 0,
+            "graph_db_size_bytes": 0,
+            "replay_queue_db_size_bytes": 0,
+            "reports_size_bytes": 0,
+            "kept_files": [],
+            "deleted_files_sample": [],
+            "deletion_errors": [],
+        },
+    )
+
+    run_continuous_research(
+        ContinuousResearchConfig(
+            experiment_name="exp",
+            games="tt01",
+            samplers="mixed",
+            seeds="0",
+            steps_per_epoch=10,
+            max_epochs=1,
+            horizon=2,
+            context_depth=1,
+            output_dir=str(root),
+        )
+    )
+
+    log_text = (root / "log.txt").read_text(encoding="utf-8")
+    assert "OLD CONTENT" not in log_text
+    assert "Epoch 0001 starting" in log_text
 
 
 def test_continuous_run_emits_post_fold_phase_names(tmp_path: Path, monkeypatch) -> None:

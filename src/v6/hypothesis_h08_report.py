@@ -143,13 +143,12 @@ def evaluate_h08_world_model_coherence(
         "first_promoted_concept_step": milestone_map.get("first_promoted_concept_step"),
         "evidence_stage": None,
     }
-    if concept_candidate_count <= 0:
-        if role_candidate_count > 0 or role_transfer_success_count > 0:
-            decision = "PARTIALLY_VALID"
-            missing = ["world-model components unavailable; only precursor role evidence is present"]
-        else:
-            decision = "INSUFFICIENT_EVIDENCE"
-            missing = ["no concept candidates available"]
+    non_proxy_predicted_outcome_available = (
+        predicted_outcome_count > 0 and predicted_outcome_count_is_proxy_count <= 0
+    )
+    if world_model_component_count <= 0:
+        decision = "INSUFFICIENT_EVIDENCE"
+        missing = ["no world-model components available"]
     elif promoted_concept_count == 0 and coherent_world_model_component_count == 0:
         decision = "INSUFFICIENT_EVIDENCE"
         metrics["evidence_stage"] = "candidate_proxy_only"
@@ -169,7 +168,7 @@ def evaluate_h08_world_model_coherence(
         and role_link_count >= 1
         and family_link_count >= 2
         and supported_context_count >= 2
-        and predicted_outcome_count > 0
+        and non_proxy_predicted_outcome_available
         and (candidate_only_world_model_component_count == 0 or coherent_world_model_component_count >= candidate_only_world_model_component_count)
     ):
         decision = "VALID"

@@ -167,6 +167,8 @@ def derive_missing_transformation_families_from_stable_contingencies(memory_dir:
         "compact_family_repair_graph_node_count": 0,
         "compact_family_repair_graph_edge_count": 0,
         "compact_family_repair_error": None,
+        "compact_family_prediction_lift_backfill_used": False,
+        "compact_family_prediction_lift_backfill_count": 0,
     }
     with sqlite3.connect(paths.current_state) as state_conn:
         configure_compact_sqlite_connection(state_conn, write=True)
@@ -228,8 +230,25 @@ def derive_missing_transformation_families_from_stable_contingencies(memory_dir:
             _write_family_repair_summary(state_conn, summary)
             state_conn.commit()
             return summary
-        if family_count > 0 and family_members_before > 0:
+        missing_prediction_lift_count = int(
+            state_conn.execute(
+                "SELECT COUNT(*) FROM transformation_families WHERE prediction_lift IS NULL"
+            ).fetchone()[0]
+        )
+        if family_count > 0 and family_members_before > 0 and missing_prediction_lift_count <= 0:
             summary["compact_family_repair_reason"] = "family_substrate_already_present"
+            summary["transformation_families_after"] = family_count
+            summary["family_members_after"] = family_members_before
+            _write_family_repair_summary(state_conn, summary)
+            state_conn.commit()
+            return summary
+        if family_count > 0 and family_members_before > 0 and missing_prediction_lift_count > 0:
+            backfill_count = _backfill_transformation_family_prediction_lift(state_conn)
+            summary["compact_family_prediction_lift_backfill_used"] = backfill_count > 0
+            summary["compact_family_prediction_lift_backfill_count"] = backfill_count
+            summary["compact_family_repair_reason"] = (
+                "family_prediction_lift_backfilled" if backfill_count > 0 else "family_substrate_already_present"
+            )
             summary["transformation_families_after"] = family_count
             summary["family_members_after"] = family_members_before
             _write_family_repair_summary(state_conn, summary)
@@ -487,6 +506,92 @@ def derive_missing_transformation_families_from_stable_contingencies(memory_dir:
     except Exception as exc:
         summary["compact_family_repair_error"] = str(exc)
     return summary
+
+
+def _backfill_transformation_family_prediction_lift(state_conn: sqlite3.Connection) -> int:
+    rows = state_conn.execute(
+        """
+        SELECT
+            tf.canonical_signature,
+            sc.prediction_accuracy,
+            sc.prediction_error_before,
+            sc.prediction_error_after
+        FROM transformation_families tf
+        JOIN family_members fm
+          ON fm.family_signature = tf.canonical_signature
+        JOIN stable_contingencies sc
+          ON sc.canonical_key = fm.contingency_key
+        ORDER BY tf.canonical_signature ASC
+        """
+    ).fetchall()
+    grouped: dict[str, list[sqlite3.Row]] = {}
+    for row in rows:
+        grouped.setdefault(str(row["canonical_signature"]), []).append(row)
+    updated = 0
+    for canonical_signature, members in grouped.items():
+        prediction_accuracy_values = [
+            float(row["prediction_accuracy"])
+            for row in members
+            if row["prediction_accuracy"] is not None
+        ]
+        prediction_error_before_values = [
+            float(row["prediction_error_before"])
+            for row in members
+            if row["prediction_error_before"] is not None
+        ]
+        prediction_error_after_values = [
+            float(row["prediction_error_after"])
+            for row in members
+            if row["prediction_error_after"] is not None
+        ]
+        prediction_accuracy_mean = (
+            float(sum(prediction_accuracy_values) / len(prediction_accuracy_values))
+            if prediction_accuracy_values
+            else None
+        )
+        prediction_error_before_mean = (
+            float(sum(prediction_error_before_values) / len(prediction_error_before_values))
+            if prediction_error_before_values
+            else None
+        )
+        prediction_error_after_mean = (
+            float(sum(prediction_error_after_values) / len(prediction_error_after_values))
+            if prediction_error_after_values
+            else None
+        )
+        if prediction_error_before_mean is not None and prediction_error_after_mean is not None:
+            prediction_lift = float(prediction_error_before_mean - prediction_error_after_mean)
+        elif prediction_accuracy_mean is not None:
+            prediction_lift = float(prediction_accuracy_mean)
+        else:
+            prediction_lift = None
+        if (
+            prediction_lift is None
+            and prediction_accuracy_mean is None
+            and prediction_error_before_mean is None
+            and prediction_error_after_mean is None
+        ):
+            continue
+        state_conn.execute(
+            """
+            UPDATE transformation_families
+            SET
+                prediction_lift = ?,
+                prediction_accuracy_mean = ?,
+                prediction_error_before_mean = ?,
+                prediction_error_after_mean = ?
+            WHERE canonical_signature = ?
+            """,
+            (
+                prediction_lift,
+                prediction_accuracy_mean,
+                prediction_error_before_mean,
+                prediction_error_after_mean,
+                canonical_signature,
+            ),
+        )
+        updated += 1
+    return updated
 
 
 def fold_epoch_raw_into_compact_memory(
@@ -4488,6 +4593,8 @@ def _ensure_current_state_schema(path: Path) -> None:
         _ensure_column(connection, "role_transfer_attempts", "source_carrier_count", "INTEGER")
         _ensure_column(connection, "role_transfer_attempts", "candidate_role_count", "INTEGER")
         _ensure_column(connection, "concept_candidates", "strong_transfer_success_count", "INTEGER")
+        _ensure_column(connection, "concept_candidates", "transfer_success_concentration", "REAL")
+        _ensure_column(connection, "concept_candidates", "is_overconcentrated", "INTEGER DEFAULT 0")
         _ensure_column(connection, "world_model_components", "candidate_only", "INTEGER DEFAULT 0")
         _ensure_column(connection, "world_model_components", "predicted_outcome_count", "INTEGER")
         _ensure_column(connection, "world_model_components", "predicted_outcome_count_is_proxy", "INTEGER DEFAULT 0")

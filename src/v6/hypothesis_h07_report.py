@@ -27,14 +27,6 @@ def evaluate_h07_concept_emergence(
         return result
     with sqlite3.connect(current_state) as conn:
         conn.row_factory = sqlite3.Row
-        try:
-            conn.execute("ALTER TABLE concept_candidates ADD COLUMN transfer_success_concentration REAL")
-        except sqlite3.DatabaseError:
-            pass
-        try:
-            conn.execute("ALTER TABLE concept_candidates ADD COLUMN is_overconcentrated INTEGER DEFAULT 0")
-        except sqlite3.DatabaseError:
-            pass
         transfer_attempt_count = int(conn.execute("SELECT COUNT(*) FROM role_transfer_attempts").fetchone()[0])
         successful_transfers = int(conn.execute("SELECT COUNT(*) FROM role_transfer_attempts WHERE COALESCE(reuse_success, 0) = 1").fetchone()[0])
         roles_seen_for_concept_derivation = int(
@@ -168,7 +160,10 @@ def evaluate_h07_concept_emergence(
         "roles_used_for_concepts": roles_used_for_concepts,
         "evidence_stage": None,
     }
-    if transfer_attempt_count <= 0:
+    if successful_transfers == 0 and concept_candidate_count == 0:
+        decision = "INSUFFICIENT_EVIDENCE"
+        missing = ["no successful role transfers and no concept candidates available"]
+    elif transfer_attempt_count <= 0:
         decision = "INCONCLUSIVE"
         missing = ["no role transfer attempts available"]
     elif successful_transfers > 0 and concept_candidate_count == 0:

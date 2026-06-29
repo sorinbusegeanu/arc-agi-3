@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -92,7 +94,51 @@ class ContinuousResearchConfig:
 
 
 def _log_epoch_phase(epoch_id: str, phase: str, status: str = "starting", extra: dict | None = None) -> None:
-    print(f"[epoch {epoch_id}] {phase}: {status}" + (f" {extra}" if extra else ""), flush=True)
+    print(f"{_format_epoch_phase_prefix(epoch_id)} {phase}: {status}" + (f" {extra}" if extra else ""), flush=True)
+
+
+def _format_epoch_phase_prefix(epoch_id: str) -> str:
+    time_prefix = time.strftime("%H:%M")
+    epoch_text = str(epoch_id or "")
+    if epoch_text.startswith("epoch_"):
+        suffix = epoch_text.split("_", 1)[1]
+        if suffix.isdigit():
+            return f"[{time_prefix} E{suffix}]"
+    return f"[{time_prefix} {epoch_text}]"
+
+
+class _StdoutTee:
+    def __init__(self, primary: Any, secondary: Any) -> None:
+        self._primary = primary
+        self._secondary = secondary
+
+    def write(self, data: str) -> int:
+        self._primary.write(data)
+        self._secondary.write(data)
+        return len(data)
+
+    def flush(self) -> None:
+        self._primary.flush()
+        self._secondary.flush()
+
+    def isatty(self) -> bool:
+        try:
+            return bool(self._primary.isatty())
+        except Exception:
+            return False
+
+
+@contextmanager
+def _tee_stdout_to_log(log_path: Path):
+    original_stdout = sys.stdout
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("w", encoding="utf-8") as log_file:
+        sys.stdout = _StdoutTee(original_stdout, log_file)
+        try:
+            yield
+        finally:
+            sys.stdout.flush()
+            sys.stdout = original_stdout
 
 
 def _epoch_dir(root: Path, epoch_number: int) -> Path:
@@ -120,6 +166,13 @@ def _detect_incomplete_next_epoch(root: Path, current_epoch: int) -> dict[str, A
 
 
 def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
+    root = Path(config.output_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    with _tee_stdout_to_log(root / "log.txt"):
+        return _run_continuous_research_inner(config)
+
+
+def _run_continuous_research_inner(config: ContinuousResearchConfig) -> dict[str, Any]:
     root = Path(config.output_dir)
     root.mkdir(parents=True, exist_ok=True)
     root_status_dir = root / "status"

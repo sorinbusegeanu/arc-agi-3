@@ -8,6 +8,14 @@ from v6.future_options import derive_future_option_memory
 from v6.memory.compact_memory import ensure_memory_layout
 
 
+def _missing_tables(connection: sqlite3.Connection, required: tuple[str, ...]) -> list[str]:
+    tables = {
+        str(row[0])
+        for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    }
+    return [name for name in required if name not in tables]
+
+
 def evaluate_h11_future_option_transfer_concepts(
     *,
     memory_dir: Path,
@@ -21,6 +29,25 @@ def evaluate_h11_future_option_transfer_concepts(
         derive_future_option_memory(memory_dir=memory_dir, run_dir=run_dir)
     with sqlite3.connect(Path(memory_dir) / "current_state.sqlite") as conn:
         conn.row_factory = sqlite3.Row
+        missing_tables = _missing_tables(
+            conn,
+            (
+                "future_option_transfer_links",
+                "future_option_motifs",
+                "role_transfer_attempts",
+                "concept_candidates",
+            ),
+        )
+        if missing_tables:
+            result = {
+                "hypothesis_id": "H11",
+                "evidence_source": "compact_memory",
+                "decision": "INSUFFICIENT_EVIDENCE",
+                "missing_evidence": [f"Missing expected compact-memory table(s): {', '.join(missing_tables)}"],
+                "core_metrics": {},
+            }
+            _write(output_dir, result)
+            return result
         rows = [dict(row) for row in conn.execute(
             """
             SELECT l.*, m.is_emergent, m.motif_type, m.motif_stability_score

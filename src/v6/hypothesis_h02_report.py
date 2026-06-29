@@ -403,7 +403,10 @@ def evaluate_h02_prediction_violation_attention(
         _finalize_h02_result(result, output_dir)
         return result
 
-    if not any(result.get(field) is not None for field in _REPORT_FIELD_NAMES):
+    if (
+        not any(result.get(field) is not None for field in _REPORT_FIELD_NAMES)
+        and result.get("direct_replay_lift_available") is not True
+    ):
         result["missing_evidence"].append("No usable aggregate report fields are available in the current run artifacts.")
         result["decision"] = "INCONCLUSIVE"
         result["scientific_conclusion"] = (
@@ -759,8 +762,11 @@ def _extract_h02_compact_metrics(memory_dir: Path) -> dict[str, Any]:
         high_violating_count = int((violation_rows[4] if violation_rows else 0) or 0)
         high_priority_count = int((violation_rows[5] if violation_rows else 0) or 0)
         replay_lift = None
-        if violating_mean is not None and non_violating_mean is not None and non_violating_mean > 0.0:
-            replay_lift = violating_mean / non_violating_mean
+        if violating_mean is not None and non_violating_mean is not None:
+            if non_violating_mean > 0.0:
+                replay_lift = violating_mean / non_violating_mean
+            elif violating_mean > 0.0:
+                replay_lift = float("inf")
         return {
             "memory_record_count": memory_record_count or score_record_count or None,
             "memory_replay_candidate_count": len(replay_rows) if replay_rows else selected_for_replay_edge_count,
@@ -779,7 +785,7 @@ def _extract_h02_compact_metrics(memory_dir: Path) -> dict[str, Any]:
             "high_priority_replay_prediction_violation_ratio": (high_violating_count / high_priority_count) if high_priority_count > 0 else None,
             "high_priority_replay_non_prediction_violation_ratio": None,
             "prediction_violation_replay_lift": replay_lift,
-            "direct_replay_lift_available": replay_lift is not None and total_rows > 0 and violating_count > 0 and high_priority_count > 0,
+            "direct_replay_lift_available": replay_lift is not None and total_rows > 0 and violating_count > 0,
             "compact_prediction_violation_count": violating_count,
             "compact_evidence_coverage_count": total_rows if total_rows > 0 else None,
         }
