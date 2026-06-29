@@ -15,7 +15,18 @@ def _write_epoch_db(path: Path, *, replay_rows: int = 8, contingency_support: in
             """
             CREATE TABLE interactions (
                 id INTEGER PRIMARY KEY,
+                game_id TEXT,
+                level_id TEXT,
+                sampler_name TEXT,
+                episode_id INTEGER,
                 global_step INTEGER,
+                outcome_state TEXT,
+                level_completed_event INTEGER,
+                state_hash_before TEXT,
+                state_hash_after TEXT,
+                action INTEGER,
+                efficiency_no_effect_action INTEGER,
+                efficiency_future_option_gain_per_cost REAL,
                 memory_replay_priority REAL,
                 memory_replay_candidate INTEGER,
                 carrier_signature TEXT,
@@ -44,9 +55,34 @@ def _write_epoch_db(path: Path, *, replay_rows: int = 8, contingency_support: in
             """
         )
         connection.executemany(
-            "INSERT INTO interactions (id, global_step, memory_replay_priority, memory_replay_candidate, carrier_signature, context_depth_used) VALUES (?, ?, ?, ?, ?, ?)",
+            """
+            INSERT INTO interactions (
+                id, game_id, level_id, sampler_name, episode_id, global_step,
+                outcome_state, level_completed_event, state_hash_before, state_hash_after,
+                action, efficiency_no_effect_action, efficiency_future_option_gain_per_cost,
+                memory_replay_priority, memory_replay_candidate, carrier_signature, context_depth_used
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
             [
-                (index, index, 1.0 - index * 0.05, 1, "carrier-a" if index % 2 == 0 else "", 1)
+                (
+                    index,
+                    "tt01",
+                    "lvl1",
+                    "mixed",
+                    0,
+                    index,
+                    "RUNNING",
+                    0,
+                    f"s{index}",
+                    f"s{index+1}",
+                    index % 3,
+                    0,
+                    0.0,
+                    1.0 - index * 0.05,
+                    1,
+                    "carrier-a" if index % 2 == 0 else "",
+                    1,
+                )
                 for index in range(1, replay_rows + 1)
             ],
         )
@@ -163,6 +199,8 @@ def test_cleanup_deletes_raw_files_but_keeps_reports_and_memory(tmp_path: Path) 
     assert status_dir.exists()
     assert memory_paths.current_state.exists()
     assert (cleanup_dir / "cleanup_summary.json").exists()
+    assert summary["wal_checkpoint_mode"] == "TRUNCATE"
+    assert summary["vacuum_performed"] is False
 
 
 def test_cleanup_refuses_without_compact_memory_update(tmp_path: Path) -> None:
@@ -191,3 +229,27 @@ def test_stop_due_to_disk_triggers_at_threshold(tmp_path: Path, monkeypatch) -> 
 
     assert triggered is True
     assert snapshot["disk_stop_triggered"] is True
+
+
+def test_cleanup_runs_vacuum_only_every_tenth_epoch(tmp_path: Path, monkeypatch) -> None:
+    epoch_dir = tmp_path / "epoch_0010"
+    raw_dir = epoch_dir / "raw"
+    reports_dir = epoch_dir / "reports"
+    raw_dir.mkdir(parents=True)
+    reports_dir.mkdir()
+    (raw_dir / "seed_0.sqlite").write_text("raw", encoding="utf-8")
+    (reports_dir / "hypothesis_suite_summary.json").write_text("{}", encoding="utf-8")
+    memory_paths = ensure_memory_layout(tmp_path / "memory_vacuum")
+    memory_paths.summary_json.write_text(json.dumps({"fold_summary": {"stable_contingencies_added": 1}}, indent=2), encoding="utf-8")
+
+    calls: list[tuple[str, bool]] = []
+
+    def _record_cleanup(path: Path, *, vacuum: bool = False) -> None:
+        calls.append((path.name, vacuum))
+
+    monkeypatch.setattr("v6.memory.memory_cleanup._sqlite_cleanup", _record_cleanup)
+    summary = cleanup_epoch_artifacts(epoch_dir=epoch_dir, memory_dir=memory_paths.root)
+
+    assert summary["vacuum_performed"] is True
+    assert calls
+    assert all(vacuum is True for _name, vacuum in calls)

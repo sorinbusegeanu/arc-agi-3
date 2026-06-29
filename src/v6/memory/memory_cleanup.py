@@ -44,6 +44,8 @@ def cleanup_epoch_artifacts(*, epoch_dir: str | Path, memory_dir: str | Path) ->
         except OSError:
             pass
 
+    epoch_number = _epoch_number_from_dir(epoch_path)
+    vacuum_performed = bool(epoch_number is not None and epoch_number % 10 == 0)
     memory_paths = [
         Path(memory_dir) / "current_state.sqlite",
         Path(memory_dir) / "graph.sqlite",
@@ -51,7 +53,7 @@ def cleanup_epoch_artifacts(*, epoch_dir: str | Path, memory_dir: str | Path) ->
     ]
     for sqlite_path in memory_paths:
         if sqlite_path.exists():
-            _sqlite_cleanup(sqlite_path)
+            _sqlite_cleanup(sqlite_path, vacuum=vacuum_performed)
 
     disk_after = _tree_size(epoch_path)
     summary = {
@@ -67,6 +69,9 @@ def cleanup_epoch_artifacts(*, epoch_dir: str | Path, memory_dir: str | Path) ->
         "graph_db_size_bytes": _file_size(memory_paths[1]),
         "replay_queue_db_size_bytes": _file_size(memory_paths[2]),
         "reports_size_bytes": _tree_size(reports_dir),
+        "wal_checkpoint_mode": "TRUNCATE",
+        "vacuum_performed": vacuum_performed,
+        "vacuum_epoch_interval": 10,
         "kept_files": sorted(
             str(path.relative_to(epoch_path))
             for path in epoch_path.rglob("*")
@@ -147,11 +152,23 @@ def stop_due_to_disk(path: str | Path, *, threshold_percent: float) -> tuple[boo
     return triggered, snapshot
 
 
-def _sqlite_cleanup(path: Path) -> None:
+def _sqlite_cleanup(path: Path, *, vacuum: bool = False) -> None:
     with sqlite3.connect(path) as connection:
         connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        connection.execute("VACUUM")
+        if vacuum:
+            connection.execute("VACUUM")
         connection.commit()
+
+
+def _epoch_number_from_dir(path: Path) -> int | None:
+    name = str(path.name)
+    if not name.startswith("epoch_"):
+        return None
+    suffix = name.split("_", 1)[1]
+    try:
+        return int(suffix)
+    except ValueError:
+        return None
 
 
 def _tree_size(path: Path) -> int:
