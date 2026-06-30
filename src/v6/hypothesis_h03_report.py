@@ -314,12 +314,14 @@ def evaluate_h03_transformation_family_formation(
                 "compact transformation_families table is empty despite stable contingencies being present"
             )
             result["evidence_diagnostics"]["missing_target"] = "transformation_families"
+        _attach_h03_core_metrics(result)
         _finalize_h03_result(result, output_dir)
         return result
     if input_report is None:
         result["missing_evidence"].append(f"Required input report missing: {INPUT_REPORT_NAME}")
         result["evidence_diagnostics"]["missing_target"] = INPUT_REPORT_NAME
         result["scientific_conclusion"] = "H03 cannot be evaluated because the required interaction-sampling report is missing."
+        _attach_h03_core_metrics(result)
         _finalize_h03_result(result, output_dir)
         return result
 
@@ -503,6 +505,7 @@ def evaluate_h03_transformation_family_formation(
         )
 
     _populate_h03_evidence_lists(result)
+    _attach_h03_core_metrics(result)
     _finalize_h03_result(result, output_dir)
     return result
 
@@ -2600,12 +2603,16 @@ def _populate_h03_evidence_lists(result: dict[str, Any]) -> None:
     result["missing_evidence"] = list(dict.fromkeys(str(item) for item in missing_evidence))
 
 
-def _finalize_h03_result(result: dict[str, Any], output_dir: Path) -> None:
+def _attach_h03_core_metrics(result: dict[str, Any]) -> None:
     result["core_metrics"] = {
+        "stable_contingency_count": result.get("stable_contingency_count"),
+        "discovered_contingency_count": result.get("discovered_contingency_count"),
+        "contingency_candidate_count": result.get("contingency_candidate_count"),
         "transformation_family_count": result.get("transformation_family_count"),
         "stable_transformation_family_count": result.get("stable_transformation_family_count"),
         "family_members_count": result.get("family_members_count"),
         "family_member_count_total": result.get("family_member_count_total"),
+        "singleton_family_count": result.get("singleton_family_count"),
         "compression_ratio": result.get("compression_ratio"),
         "compression_gain": result.get("compression_gain"),
         "singleton_family_ratio": result.get("singleton_family_ratio"),
@@ -2613,23 +2620,29 @@ def _finalize_h03_result(result: dict[str, Any], output_dir: Path) -> None:
         "family_cross_sampler_count": result.get("family_cross_sampler_count"),
         "family_cross_context_count": result.get("family_cross_context_count"),
         "family_prediction_lift_mean": result.get("family_prediction_lift_mean"),
+        "usable_h03_family_evidence": result.get("usable_h03_family_evidence"),
+        "usable_direct_family_evidence": result.get("usable_direct_family_evidence"),
+        "usable_compact_family_evidence": result.get("usable_compact_family_evidence"),
         "compact_family_repair_used": result.get("compact_family_repair_used"),
         "compact_family_repair_reason": result.get("compact_family_repair_reason"),
     }
-    material_keys = (
-        "transformation_family_count",
-        "family_members_count",
-        "family_member_count_total",
-        "compression_ratio",
-        "compression_gain",
-        "family_prediction_lift_mean",
-    )
-    if result.get("decision") == "VALID" and not any(
-        result["core_metrics"].get(key) not in (None, "", [], {}, ())
-        for key in material_keys
-    ):
+    material_values = [
+        result["core_metrics"].get("transformation_family_count"),
+        result["core_metrics"].get("family_members_count"),
+        result["core_metrics"].get("family_member_count_total"),
+        result["core_metrics"].get("compression_ratio"),
+        result["core_metrics"].get("compression_gain"),
+        result["core_metrics"].get("family_prediction_lift_mean"),
+    ]
+    if all(value in (None, "", [], {}) for value in material_values) and result.get("decision") in {"VALID", "PARTIALLY_VALID", "INVALID"}:
         result["decision"] = "INSUFFICIENT_EVIDENCE"
         _append_unique(result.setdefault("missing_evidence", []), "H03 produced no core transformation-family metrics.")
+
+
+def _finalize_h03_result(result: dict[str, Any], output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if "core_metrics" not in result:
+        _attach_h03_core_metrics(result)
     (output_dir / H03_JSON_NAME).write_text(json.dumps(result, indent=2), encoding="utf-8")
     (output_dir / H03_TXT_NAME).write_text(_format_h03_text_report(result), encoding="utf-8")
     (output_dir / H03_MD_NAME).write_text(_format_h03_markdown_report(result), encoding="utf-8")

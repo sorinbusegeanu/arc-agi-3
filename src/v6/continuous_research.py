@@ -74,6 +74,12 @@ class ContinuousResearchConfig:
     max_examples_per_contradiction_cluster: int = 2
     fold_memory_substrate: bool = True
     fold_graph: bool = True
+    max_graph_edges_per_fold: int = 1_000_000
+    max_edges_per_source_node: int = 128
+    max_edges_per_carrier: int = 32
+    max_edges_per_family: int = 64
+    enable_graph_edge_caps: bool = True
+    use_set_based_merge: bool = True
     compact_finalize_mode: str = "summary_only"
     full_finalize_every_epochs: int = 5
     hypothesis_suite_mode: str = "fast"
@@ -286,6 +292,12 @@ def _run_continuous_research_inner(config: ContinuousResearchConfig) -> dict[str
                 max_examples_per_contradiction_cluster=int(config.max_examples_per_contradiction_cluster),
                 fold_memory_substrate=bool(config.fold_memory_substrate),
                 fold_graph=bool(config.fold_graph),
+                max_graph_edges_per_fold=int(config.max_graph_edges_per_fold),
+                max_edges_per_source_node=int(config.max_edges_per_source_node),
+                max_edges_per_carrier=int(config.max_edges_per_carrier),
+                max_edges_per_family=int(config.max_edges_per_family),
+                enable_graph_edge_caps=bool(config.enable_graph_edge_caps),
+                use_set_based_merge=bool(config.use_set_based_merge),
                 compact_finalize_mode=(
                     "full"
                     if int(epoch_number) % max(1, int(config.full_finalize_every_epochs or 5)) == 0

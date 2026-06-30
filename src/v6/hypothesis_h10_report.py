@@ -111,7 +111,10 @@ def evaluate_h10_future_option_attention(
     result = {
         "hypothesis_id": "H10",
         "evidence_source": "compact_memory",
-        "h10_attention_target_definition": "high_attention is raw replay/contradiction attention; calibrated_high_attention is percentile-calibrated and reported separately.",
+        "h10_attention_target_definition": (
+            "high_attention is the primary attention flag. It uses calibrated_high_attention when calibration is valid; "
+            "raw_high_attention is retained as a diagnostic fallback."
+        ),
         "future_option_attention_link_count": len(rows),
         "future_option_event_count": future_option_event_count,
         "h10_blocked_by_h09": bool(future_option_event_count == 0),

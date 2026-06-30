@@ -288,6 +288,12 @@ def build_parser() -> argparse.ArgumentParser:
     sampling.add_argument("--max-examples-per-contradiction-cluster", type=int, default=2)
     sampling.add_argument("--no-fold-memory-substrate", dest="fold_memory_substrate", action="store_false", default=True)
     sampling.add_argument("--no-fold-graph", dest="fold_graph", action="store_false", default=True)
+    sampling.add_argument("--max-graph-edges-per-fold", type=int, default=1_000_000)
+    sampling.add_argument("--max-edges-per-source-node", type=int, default=128)
+    sampling.add_argument("--max-edges-per-carrier", type=int, default=32)
+    sampling.add_argument("--max-edges-per-family", type=int, default=64)
+    sampling.add_argument("--enable-graph-edge-caps", type=_parse_bool, default=True)
+    sampling.add_argument("--use-set-based-merge", type=_parse_bool, default=True)
     sampling.add_argument("--compact-finalize-mode", choices=("none", "summary_only", "full"), default="full")
     sampling.add_argument("--full-finalize-every-epochs", type=int, default=5)
     sampling.add_argument("--memory-query-enabled", action="store_true")
@@ -653,6 +659,12 @@ def build_parser() -> argparse.ArgumentParser:
     continuous.add_argument("--max-examples-per-contradiction-cluster", type=int, default=2)
     continuous.add_argument("--no-fold-memory-substrate", dest="fold_memory_substrate", action="store_false", default=True)
     continuous.add_argument("--no-fold-graph", dest="fold_graph", action="store_false", default=True)
+    continuous.add_argument("--max-graph-edges-per-fold", type=int, default=1_000_000)
+    continuous.add_argument("--max-edges-per-source-node", type=int, default=128)
+    continuous.add_argument("--max-edges-per-carrier", type=int, default=32)
+    continuous.add_argument("--max-edges-per-family", type=int, default=64)
+    continuous.add_argument("--enable-graph-edge-caps", type=_parse_bool, default=True)
+    continuous.add_argument("--use-set-based-merge", type=_parse_bool, default=True)
     continuous.add_argument("--compact-finalize-mode", choices=("none", "summary_only", "full"), default="summary_only")
     continuous.add_argument("--full-finalize-every-epochs", type=int, default=5)
     continuous.add_argument("--hypothesis-suite-mode", choices=("fast", "full"), default="fast")
@@ -957,6 +969,12 @@ def main(argv: list[str] | None = None) -> int:
                 max_examples_per_contradiction_cluster=int(args.max_examples_per_contradiction_cluster),
                 fold_memory_substrate=bool(args.fold_memory_substrate),
                 fold_graph=bool(args.fold_graph),
+                max_graph_edges_per_fold=int(args.max_graph_edges_per_fold),
+                max_edges_per_source_node=int(args.max_edges_per_source_node),
+                max_edges_per_carrier=int(args.max_edges_per_carrier),
+                max_edges_per_family=int(args.max_edges_per_family),
+                enable_graph_edge_caps=bool(args.enable_graph_edge_caps),
+                use_set_based_merge=bool(args.use_set_based_merge),
                 compact_finalize_mode=str(args.compact_finalize_mode),
                 full_finalize_every_epochs=int(args.full_finalize_every_epochs),
                 memory_query_enabled=bool(args.memory_query_enabled),
@@ -1610,6 +1628,12 @@ def main(argv: list[str] | None = None) -> int:
             max_examples_per_contradiction_cluster=int(args.max_examples_per_contradiction_cluster),
             fold_memory_substrate=bool(args.fold_memory_substrate),
             fold_graph=bool(args.fold_graph),
+            max_graph_edges_per_fold=int(args.max_graph_edges_per_fold),
+            max_edges_per_source_node=int(args.max_edges_per_source_node),
+            max_edges_per_carrier=int(args.max_edges_per_carrier),
+            max_edges_per_family=int(args.max_edges_per_family),
+            enable_graph_edge_caps=bool(args.enable_graph_edge_caps),
+            use_set_based_merge=bool(args.use_set_based_merge),
             compact_finalize_mode=str(args.compact_finalize_mode),
             full_finalize_every_epochs=int(args.full_finalize_every_epochs),
             hypothesis_suite_mode=str(args.hypothesis_suite_mode),

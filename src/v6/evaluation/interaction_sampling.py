@@ -134,6 +134,12 @@ class InteractionSamplingConfig:
     max_examples_per_contradiction_cluster: int = 2
     fold_memory_substrate: bool = True
     fold_graph: bool = True
+    max_graph_edges_per_fold: int = 1_000_000
+    max_edges_per_source_node: int = 128
+    max_edges_per_carrier: int = 32
+    max_edges_per_family: int = 64
+    enable_graph_edge_caps: bool = True
+    use_set_based_merge: bool = True
     compact_finalize_mode: str = "full"
     full_finalize_every_epochs: int = 5
     memory_query_enabled: bool = False
@@ -364,6 +370,12 @@ def _generate_sampling_dbs(config: InteractionSamplingConfig, sampling_root: Pat
                             "max_examples_per_contradiction_cluster": int(config.max_examples_per_contradiction_cluster),
                             "fold_memory_substrate": bool(config.fold_memory_substrate),
                             "fold_graph": bool(config.fold_graph),
+                            "max_graph_edges_per_fold": int(config.max_graph_edges_per_fold),
+                            "max_edges_per_source_node": int(config.max_edges_per_source_node),
+                            "max_edges_per_carrier": int(config.max_edges_per_carrier),
+                            "max_edges_per_family": int(config.max_edges_per_family),
+                            "enable_graph_edge_caps": bool(config.enable_graph_edge_caps),
+                            "use_set_based_merge": bool(config.use_set_based_merge),
                             "compact_finalize_mode": str(config.compact_finalize_mode),
                             "full_finalize_every_epochs": int(config.full_finalize_every_epochs),
                             "memory_query_enabled": bool(config.memory_query_enabled),
@@ -451,6 +463,12 @@ def _generate_sampling_dbs(config: InteractionSamplingConfig, sampling_root: Pat
                         "max_examples_per_contradiction_cluster": int(config.max_examples_per_contradiction_cluster),
                         "fold_memory_substrate": bool(config.fold_memory_substrate),
                         "fold_graph": bool(config.fold_graph),
+                        "max_graph_edges_per_fold": int(config.max_graph_edges_per_fold),
+                        "max_edges_per_source_node": int(config.max_edges_per_source_node),
+                        "max_edges_per_carrier": int(config.max_edges_per_carrier),
+                        "max_edges_per_family": int(config.max_edges_per_family),
+                        "enable_graph_edge_caps": bool(config.enable_graph_edge_caps),
+                        "use_set_based_merge": bool(config.use_set_based_merge),
                         "compact_finalize_mode": str(config.compact_finalize_mode),
                         "full_finalize_every_epochs": int(config.full_finalize_every_epochs),
                         "memory_query_enabled": bool(config.memory_query_enabled),
@@ -634,6 +652,12 @@ def _run_sampling_jobs(
                 max_examples_per_contradiction_cluster=int(jobs[0].get("max_examples_per_contradiction_cluster", 2) or 2),
                 fold_memory_substrate=bool(jobs[0].get("fold_memory_substrate", True)),
                 fold_graph=bool(jobs[0].get("fold_graph", True)),
+                max_graph_edges_per_fold=int(jobs[0].get("max_graph_edges_per_fold", 1_000_000) or 1_000_000),
+                max_edges_per_source_node=int(jobs[0].get("max_edges_per_source_node", 128) or 128),
+                max_edges_per_carrier=int(jobs[0].get("max_edges_per_carrier", 32) or 32),
+                max_edges_per_family=int(jobs[0].get("max_edges_per_family", 64) or 64),
+                enable_graph_edge_caps=bool(jobs[0].get("enable_graph_edge_caps", True)),
+                use_set_based_merge=bool(jobs[0].get("use_set_based_merge", True)),
                 compact_finalize_mode=str(jobs[0].get("compact_finalize_mode", "full") or "full"),
             ),
             sampling_config=SimpleNamespace(

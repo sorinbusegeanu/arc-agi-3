@@ -519,9 +519,15 @@ def derive_future_option_motifs(
             for linked_key in link_groups.get(linked_type, set()):
                 concepts_by_link[(linked_type, linked_key)].add(concept_signature)
     rows = [dict(row) for row in state_conn.execute("SELECT * FROM future_option_events ORDER BY event_id ASC").fetchall()]
+    events_with_owner_type_role = 0
+    role_linked_event_count = 0
+    motifs_with_role_links = 0
+    emergent_motifs_with_role_links = 0
     groups: dict[str, dict[str, Any]] = {}
     row_tracker = progress_factory("derive_future_option_motifs events", len(rows), "event", False) if progress_factory else None
     for row in rows:
+        if str(row.get("owner_type") or "") == "role":
+            events_with_owner_type_role += 1
         evidence = _load_jsonish(row.get("evidence_json"))
         contexts = set(_coerce_list(evidence.get("linked_contexts")))
         if row.get("context_key") not in (None, ""):
@@ -603,17 +609,10 @@ def derive_future_option_motifs(
     selected = sorted(groups)[: int(max_motifs)]
     emergent_count = 0
     first_emergent_step: int | None = None
-    events_with_owner_type_role = 0
-    role_linked_event_count = 0
-    motifs_with_role_links = 0
-    emergent_motifs_with_role_links = 0
     motif_type_counts: Counter[str] = Counter()
     motif_type_source_counts: Counter[str] = Counter()
     unknown_motif_event_count = 0
     total_future_option_event_count = len(rows)
-    for row in rows:
-        if str(row.get("owner_type") or "") == "role":
-            events_with_owner_type_role += 1
     motif_tracker = progress_factory("derive_future_option_motifs motifs", len(selected), "motif", False) if progress_factory else None
     for motif_signature in selected:
         group = groups[motif_signature]

@@ -518,6 +518,36 @@ def evaluate_h02_prediction_violation_attention(
     result["scientific_conclusion"] = f"{result['h02a_replay_attention_conclusion']} {result['h02b_pre_carrier_timing_conclusion']}".strip()
 
     _populate_evidence_lists(result)
+    result["core_metrics"] = {
+        "h02a_replay_attention_decision": result.get("h02a_replay_attention_decision"),
+        "h02b_pre_carrier_timing_decision": result.get("h02b_pre_carrier_timing_decision"),
+        "h02_final_decision_basis": result.get("h02_final_decision_basis"),
+        "carrier_timing_note": result.get("carrier_timing_note"),
+        "prediction_violation_replay_lift": result.get("prediction_violation_replay_lift"),
+        "prediction_violation_base_ratio": result.get("prediction_violation_base_ratio"),
+        "high_priority_replay_prediction_violation_ratio": result.get("high_priority_replay_prediction_violation_ratio"),
+        "high_priority_replay_non_prediction_violation_ratio": result.get("high_priority_replay_non_prediction_violation_ratio"),
+        "mean_replay_priority_for_prediction_violating_interactions": result.get("mean_replay_priority_for_prediction_violating_interactions"),
+        "mean_replay_priority_for_non_prediction_violating_interactions": result.get("mean_replay_priority_for_non_prediction_violating_interactions"),
+        "direct_replay_lift_available": result.get("direct_replay_lift_available"),
+        "prediction_violation_row_count": result.get("prediction_violation_row_count"),
+        "non_prediction_violation_row_count": result.get("non_prediction_violation_row_count"),
+        "row_count_used": result.get("row_count_used"),
+        "row_count_available": result.get("row_count_available"),
+        "compact_evidence_coverage_count": result.get("compact_evidence_coverage_count"),
+        "evidence_coverage_ratio": result.get("evidence_coverage_ratio"),
+    }
+    material_values = [
+        result["core_metrics"].get("prediction_violation_replay_lift"),
+        result["core_metrics"].get("prediction_violation_base_ratio"),
+        result["core_metrics"].get("high_priority_replay_prediction_violation_ratio"),
+        result["core_metrics"].get("direct_replay_lift_available"),
+        result["core_metrics"].get("prediction_violation_row_count"),
+        result["core_metrics"].get("row_count_used"),
+    ]
+    if all(value in (None, "", [], {}) for value in material_values) and result.get("decision") in {"VALID", "PARTIALLY_VALID", "INVALID"}:
+        result["decision"] = "INSUFFICIENT_EVIDENCE"
+        _append_unique(result.setdefault("missing_evidence", []), "H02 produced no core replay/violation metrics.")
     _finalize_h02_result(result, output_dir)
     return result
 
@@ -2124,6 +2154,7 @@ def _append_unique(items: list[str], value: str) -> None:
 
 
 def _finalize_h02_result(result: dict[str, Any], output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
     result["core_metrics"] = {
         "h02a_replay_attention_decision": result.get("h02a_replay_attention_decision"),
         "h02b_pre_carrier_timing_decision": result.get("h02b_pre_carrier_timing_decision"),
@@ -2132,18 +2163,28 @@ def _finalize_h02_result(result: dict[str, Any], output_dir: Path) -> None:
         "prediction_violation_replay_lift": result.get("prediction_violation_replay_lift"),
         "prediction_violation_base_ratio": result.get("prediction_violation_base_ratio"),
         "high_priority_replay_prediction_violation_ratio": result.get("high_priority_replay_prediction_violation_ratio"),
+        "high_priority_replay_non_prediction_violation_ratio": result.get("high_priority_replay_non_prediction_violation_ratio"),
         "mean_replay_priority_for_prediction_violating_interactions": result.get("mean_replay_priority_for_prediction_violating_interactions"),
         "mean_replay_priority_for_non_prediction_violating_interactions": result.get("mean_replay_priority_for_non_prediction_violating_interactions"),
         "direct_replay_lift_available": result.get("direct_replay_lift_available"),
-        "compact_prediction_violation_count": result.get("compact_prediction_violation_count"),
+        "prediction_violation_row_count": result.get("prediction_violation_row_count"),
+        "non_prediction_violation_row_count": result.get("non_prediction_violation_row_count"),
+        "row_count_used": result.get("row_count_used"),
+        "row_count_available": result.get("row_count_available"),
         "compact_evidence_coverage_count": result.get("compact_evidence_coverage_count"),
+        "evidence_coverage_ratio": result.get("evidence_coverage_ratio"),
     }
-    if result.get("decision") in {"VALID", "PARTIALLY_VALID", "INVALID"} and not any(
-        value not in (None, "", [], {}, ())
-        for value in result["core_metrics"].values()
-    ):
+    material_values = [
+        result["core_metrics"].get("prediction_violation_replay_lift"),
+        result["core_metrics"].get("prediction_violation_base_ratio"),
+        result["core_metrics"].get("high_priority_replay_prediction_violation_ratio"),
+        result["core_metrics"].get("direct_replay_lift_available"),
+        result["core_metrics"].get("prediction_violation_row_count"),
+        result["core_metrics"].get("row_count_used"),
+    ]
+    if all(value in (None, "", [], {}) for value in material_values) and result.get("decision") in {"VALID", "PARTIALLY_VALID", "INVALID"}:
         result["decision"] = "INSUFFICIENT_EVIDENCE"
-        _append_unique(result.setdefault("missing_evidence", []), "H02 produced no core metrics.")
+        _append_unique(result.setdefault("missing_evidence", []), "H02 produced no core replay/violation metrics.")
     (output_dir / H02_JSON_NAME).write_text(json.dumps(result, indent=2), encoding="utf-8")
     (output_dir / H02_TXT_NAME).write_text(_format_text_report(result), encoding="utf-8")
     (output_dir / H02_MD_NAME).write_text(_format_markdown_report(result), encoding="utf-8")

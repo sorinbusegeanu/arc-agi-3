@@ -109,11 +109,13 @@ def evaluate_h04_carrier_emergence(
                 "carrier_explains_edge_count": int(graph_conn.execute("SELECT COUNT(*) FROM graph_edges WHERE edge_type = 'explains'").fetchone()[0]),
                 "carrier_anchors_edge_count": int(graph_conn.execute("SELECT COUNT(*) FROM graph_edges WHERE edge_type = 'anchors'").fetchone()[0]),
             }
-            graph_edge_rows = graph_conn.execute(
-                "SELECT source_node_id, edge_type FROM graph_edges WHERE edge_type IN ('explains', 'anchors')"
-            ).fetchall()
     else:
-        graph_edge_rows = []
+        graph_counts = {
+            "carrier_explains_edge_count": 0,
+            "carrier_anchors_edge_count": 0,
+            "usable_carrier_explains_edge_count": 0,
+            "usable_carrier_anchors_edge_count": 0,
+        }
     stable = [row for row in carrier_rows if int(row["support_count"] or 0) >= 3]
     emergent = [row for row in carrier_rows if int(row["is_emergent"] or 0) == 1]
     fallback = [row for row in carrier_rows if str(row["carrier_source"] or "") == "context_action_fallback"]
@@ -199,13 +201,26 @@ def evaluate_h04_carrier_emergence(
     usable_signature_ids = {f"carrier:{str(row['carrier_signature'])}" for row in usable_rows}
     usable_carrier_explains_edge_count = 0
     usable_carrier_anchors_edge_count = 0
-    for source_node_id, edge_type in graph_edge_rows:
-        if str(source_node_id) not in usable_signature_ids:
-            continue
-        if str(edge_type) == "explains":
-            usable_carrier_explains_edge_count += 1
-        elif str(edge_type) == "anchors":
-            usable_carrier_anchors_edge_count += 1
+    if graph_db.exists() and usable_signature_ids:
+        with sqlite3.connect(graph_db) as graph_conn:
+            graph_conn.execute("CREATE TEMP TABLE usable_carrier_ids (source_node_id TEXT PRIMARY KEY)")
+            graph_conn.executemany(
+                "INSERT OR IGNORE INTO usable_carrier_ids (source_node_id) VALUES (?)",
+                [(item,) for item in sorted(usable_signature_ids)],
+            )
+            row = graph_conn.execute(
+                """
+                SELECT
+                    SUM(CASE WHEN g.edge_type = 'explains' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN g.edge_type = 'anchors' THEN 1 ELSE 0 END)
+                FROM graph_edges g
+                JOIN usable_carrier_ids u
+                  ON g.source_node_id = u.source_node_id
+                WHERE g.edge_type IN ('explains', 'anchors')
+                """
+            ).fetchone()
+            usable_carrier_explains_edge_count = int((row[0] if row is not None else 0) or 0)
+            usable_carrier_anchors_edge_count = int((row[1] if row is not None else 0) or 0)
     temporal_sources = {first_stable_source, first_carrier_source, first_emergent_source}
     if "temporal_milestones" in temporal_sources:
         h04_temporal_source = "temporal_milestones"
@@ -262,6 +277,9 @@ def evaluate_h04_carrier_emergence(
         "latest_graph_epoch_edges_pruned_by_post_merge_source_cap": None if latest_graph_epoch_summary is None else int(latest_graph_epoch_summary["graph_edges_pruned_by_post_merge_source_cap"] or 0),
         "latest_graph_epoch_edges_pruned_by_post_merge_carrier_cap": None if latest_graph_epoch_summary is None else int(latest_graph_epoch_summary["graph_edges_pruned_by_post_merge_carrier_cap"] or 0),
         "latest_graph_epoch_edges_pruned_by_post_merge_family_cap": None if latest_graph_epoch_summary is None else int(latest_graph_epoch_summary["graph_edges_pruned_by_post_merge_family_cap"] or 0),
+        "latest_graph_epoch_edges_written_by_set_based_merge": None if latest_graph_epoch_summary is None else int(latest_graph_epoch_summary["graph_edges_written_by_set_based_merge"] or 0),
+        "latest_graph_epoch_edges_before_set_based_merge": None if latest_graph_epoch_summary is None else int(latest_graph_epoch_summary["graph_edges_before_set_based_merge"] or 0),
+        "latest_graph_epoch_edges_after_set_based_merge": None if latest_graph_epoch_summary is None else int(latest_graph_epoch_summary["graph_edges_after_set_based_merge"] or 0),
         "cumulative_graph_edge_count_from_epoch_summary": None if latest_graph_epoch_summary is None else int(latest_graph_epoch_summary["cumulative_graph_edge_count"] or 0),
         "h04_graph_scope": "cumulative",
         "h04_epoch_graph_summary_available": bool(latest_graph_epoch_summary is not None),

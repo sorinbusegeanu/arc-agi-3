@@ -153,6 +153,10 @@ from v6.memory.compact_memory import (
     _build_raw_db_fold_caches,
     _context_level_from_raw,
     _enforce_graph_caps_after_merge,
+    _fold_epoch_raw_into_compact_memory_parallel,
+    _graph_edge_total_fields,
+    _merge_compact_memory_dir_into_main,
+    _upsert_graph_edge,
     _write_graph_epoch_summary,
     derive_missing_transformation_families_from_stable_contingencies,
     canonical_family_signature_from_raw_db,
@@ -167,6 +171,7 @@ from v6.memory.compact_memory import (
     normalized_contingency_identity,
     normalized_contingency_identity_cached,
 )
+from v6.memory.direct_streaming_fold import DirectStreamingFoldConfig, _compact_fold_config_from_direct_config
 from v6.memory.contingency_store import ContingencyStore
 from v6.memory.interaction_store import Interaction, InteractionStore, encode_array
 from v6.memory.live_memory_queue import (
@@ -11917,6 +11922,25 @@ def test_h02_preserves_compact_direct_linkage(tmp_path: Path) -> None:
     assert result["core_metrics"]["prediction_violation_replay_lift"] is not None
 
 
+def test_h02_report_core_metrics_prevent_evidence_decision_without_material_values(tmp_path: Path) -> None:
+    from v6.hypothesis_h02_report import _finalize_h02_result
+
+    result = {
+        "decision": "PARTIALLY_VALID",
+        "missing_evidence": [],
+        "evidence_for": [],
+        "evidence_against": [],
+        "acceptance_checks": {},
+        "scientific_conclusion": "",
+        "h02a_replay_attention_decision": None,
+        "h02b_pre_carrier_timing_decision": None,
+        "h02_final_decision_basis": None,
+    }
+    _finalize_h02_result(result, tmp_path / "h02_core_guard")
+    assert result["decision"] == "INSUFFICIENT_EVIDENCE"
+    assert "H02 produced no core replay/violation metrics." in result["missing_evidence"]
+
+
 def test_h01_derives_prediction_accuracy_and_context_lift_from_prediction_results(tmp_path: Path) -> None:
     from v6.hypothesis_h01_report import evaluate_h01_contingency_emergence
 
@@ -12048,7 +12072,7 @@ def test_h02_non_evidence_decision_is_demoted_when_core_metrics_empty(tmp_path: 
     output_dir.mkdir()
     _finalize_h02_result(result, output_dir)
     assert result["decision"] == "INSUFFICIENT_EVIDENCE"
-    assert "H02 produced no core metrics." in result["missing_evidence"]
+    assert "H02 produced no core replay/violation metrics." in result["missing_evidence"]
 
 
 def test_h09_unknown_event_ratio_blocks_valid(tmp_path: Path) -> None:
@@ -12243,6 +12267,34 @@ def test_h10_prefers_calibrated_attention_when_present(tmp_path: Path) -> None:
     assert result["raw_high_attention_count"] == 10
     assert result["calibrated_high_attention_count"] == 5
     assert result["attention_all_high_saturation"] is False
+
+
+def test_h10_report_text_describes_primary_attention_flag(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory_h10_text"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute(
+            """
+            INSERT INTO future_option_events (
+                event_id, owner_type, owner_key, source_kind, motif_type, option_delta,
+                option_delta_bucket, first_seen_global_step, last_seen_global_step
+            ) VALUES ('e1', 'interaction', 'i1', 'stable_contingency', 'enable', 2.0, 'large_positive', 1, 1)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO future_option_attention_links (
+                event_id, motif_signature, owner_type, owner_key, option_delta_abs, replay_priority_score,
+                memory_priority_score, contradiction_score, high_option_change, high_attention,
+                raw_high_attention, calibrated_high_attention, attention_calibration_degenerate
+            ) VALUES ('e1', 'm', 'interaction', 'i1', 2.0, 0.9, 0.1, 0.0, 1, 1, 1, 1, 0)
+            """
+        )
+        conn.commit()
+    result = evaluate_h10_future_option_attention(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h10_text", already_derived=True)
+    assert "primary attention flag" in result["h10_attention_target_definition"]
+    text = (tmp_path / "h10_text" / "h10_future_option_attention_report.txt").read_text(encoding="utf-8")
+    assert "primary attention flag" in text
 
 
 def test_h10_falls_back_to_heuristic_events_when_live_deltas_are_zero(tmp_path: Path) -> None:
@@ -12866,6 +12918,55 @@ def test_h04_uses_compact_temporal_fallback(tmp_path: Path) -> None:
     assert result["core_metrics"]["latest_graph_epoch_edges_written"] == 2
 
 
+def test_h04_uses_sql_aggregation_not_full_graph_edge_scan(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import v6.hypothesis_h04_report as h04_report
+
+    memory_dir = tmp_path / "memory_h04_sql"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute("INSERT INTO transformation_families (family_id, canonical_signature, support_count, member_count, first_seen_global_step, last_seen_global_step, stability_score) VALUES (1,'fam1',4,2,5,6,0.7)")
+        conn.execute("INSERT INTO carrier_candidates (carrier_id, carrier_signature, carrier_source, support_count, linked_family_count, first_seen_global_step, last_seen_global_step, carrier_timing_source, stability_score, is_emergent) VALUES ('c1','carrier1','object',5,2,7,8,'real_evidence',0.8,1)")
+        conn.execute("INSERT INTO carrier_links (carrier_signature, linked_type, linked_key, support_count, first_seen_global_step, last_seen_global_step) VALUES ('carrier1','family','fam1',1,7,8)")
+        conn.execute("INSERT INTO carrier_links (carrier_signature, linked_type, linked_key, support_count, first_seen_global_step, last_seen_global_step) VALUES ('carrier1','context','ctx1',1,7,8)")
+        conn.commit()
+    with sqlite3.connect(memory_dir / "graph.sqlite") as conn:
+        conn.execute("INSERT INTO graph_edges (edge_id, source_node_id, target_node_id, edge_type, first_seen_global_step, last_seen_global_step, support_count, weight) VALUES ('e1','carrier:carrier1','b','explains',1,1,1,1.0)")
+        conn.execute("INSERT INTO graph_edges (edge_id, source_node_id, target_node_id, edge_type, first_seen_global_step, last_seen_global_step, support_count, weight) VALUES ('e2','carrier:carrier1','b','anchors',1,1,1,1.0)")
+        conn.commit()
+
+    real_connect = sqlite3.connect
+
+    class GuardConnection:
+        def __init__(self, conn: sqlite3.Connection):
+            self._conn = conn
+
+        def execute(self, sql: str, params: object = ()):
+            if "SELECT source_node_id, edge_type FROM graph_edges WHERE edge_type IN ('explains', 'anchors')" in sql:
+                raise AssertionError("full graph edge scan should not be used")
+            return self._conn.execute(sql, params)
+
+        def __getattr__(self, name: str):
+            return getattr(self._conn, name)
+
+        def __enter__(self):
+            self._conn.__enter__()
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return self._conn.__exit__(exc_type, exc, tb)
+
+    def guarded_connect(path: object, *args: object, **kwargs: object):
+        conn = real_connect(path, *args, **kwargs)
+        if str(path).endswith("graph.sqlite"):
+            return GuardConnection(conn)
+        return conn
+
+    monkeypatch.setattr(h04_report.sqlite3, "connect", guarded_connect)
+    result = h04_report.evaluate_h04_carrier_emergence(run_dir=None, memory_dir=memory_dir, output_dir=tmp_path / "h04_sql")
+    assert result["core_metrics"]["usable_carrier_explains_edge_count"] == 1
+    assert result["core_metrics"]["usable_carrier_anchors_edge_count"] == 1
+
+
 def test_graph_post_merge_caps_prune_total_and_source_and_record_epoch_summary(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory_graph_caps"
     ensure_memory_layout(memory_dir)
@@ -12966,6 +13067,293 @@ def test_graph_post_merge_caps_keep_highest_priority_edges(tmp_path: Path) -> No
         _enforce_graph_caps_after_merge(graph_conn, fold_config, totals={})
         kept = [row[0] for row in graph_conn.execute("SELECT edge_id FROM graph_edges ORDER BY edge_id ASC").fetchall()]
     assert kept == ["high", "mid"]
+
+
+def test_existing_graph_edge_updates_even_after_cap_reached(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory_existing_edge_cap"
+    ensure_memory_layout(memory_dir)
+    totals = _graph_edge_total_fields()
+    first_config = CompactMemoryFoldConfig(global_step_start=1, global_step_end=1, max_graph_edges_per_fold=1)
+    second_config = CompactMemoryFoldConfig(global_step_start=2, global_step_end=2, max_graph_edges_per_fold=1)
+    with sqlite3.connect(memory_dir / "graph.sqlite") as conn:
+        wrote_first = _upsert_graph_edge(
+            conn,
+            source_node_id="carrier:c1",
+            target_node_id="family:f1",
+            edge_type="explains",
+            fold_config=first_config,
+            support_count=1,
+            weight=1.0,
+            totals=totals,
+        )
+        wrote_update = _upsert_graph_edge(
+            conn,
+            source_node_id="carrier:c1",
+            target_node_id="family:f1",
+            edge_type="explains",
+            fold_config=second_config,
+            support_count=2,
+            weight=3.0,
+            totals=totals,
+        )
+        wrote_second = _upsert_graph_edge(
+            conn,
+            source_node_id="carrier:c1",
+            target_node_id="family:f2",
+            edge_type="explains",
+            fold_config=second_config,
+            support_count=1,
+            weight=1.0,
+            totals=totals,
+        )
+        row = conn.execute(
+            """
+            SELECT first_seen_global_step, last_seen_global_step, support_count, weight
+            FROM graph_edges
+            WHERE edge_id = 'carrier:c1->explains->family:f1'
+            """
+        ).fetchone()
+    assert wrote_first is True
+    assert wrote_update is True
+    assert wrote_second is False
+    assert row == (1, 2, 3, 3.0)
+    assert totals["graph_edges_skipped_by_fold_cap"] >= 1
+
+
+def test_parallel_fold_aggregates_graph_counters_without_overwriting_prune_counters(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import v6.memory.compact_memory as compact_memory
+
+    paths = ensure_memory_layout(tmp_path / "memory_parallel_graph")
+    db_paths = [tmp_path / "a.sqlite", tmp_path / "b.sqlite"]
+    for db_path in db_paths:
+        db_path.write_text("", encoding="utf-8")
+
+    class _FakeFuture:
+        def __init__(self, payload: dict[str, int]) -> None:
+            self._payload = payload
+
+        def result(self) -> dict[str, int]:
+            return dict(self._payload)
+
+    class _FakeExecutor:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        def submit(self, fn: object, *args: object, **kwargs: object):
+            payloads = [
+                {"graph_edges_attempted": 5, "graph_edges_written": 3, "graph_edges_skipped_by_fold_cap": 1},
+                {"graph_edges_attempted": 7, "graph_edges_written": 4, "graph_edges_skipped_by_source_cap": 2},
+            ]
+            return _FakeFuture(payloads.pop(0))
+
+    submitted_payloads = [
+        {"graph_edges_attempted": 5, "graph_edges_written": 3, "graph_edges_skipped_by_fold_cap": 1},
+        {"graph_edges_attempted": 7, "graph_edges_written": 4, "graph_edges_skipped_by_source_cap": 2},
+    ]
+
+    class _FakeExecutor2:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        def submit(self, fn: object, *args: object, **kwargs: object):
+            return _FakeFuture(submitted_payloads.pop(0))
+
+    monkeypatch.setattr(compact_memory, "ProcessPoolExecutor", _FakeExecutor2)
+    monkeypatch.setattr(compact_memory, "_merge_compact_memory_dir_into_main", lambda **kwargs: kwargs["totals"].update({
+        "graph_edges_pruned_by_post_merge_fold_cap": int(kwargs["totals"].get("graph_edges_pruned_by_post_merge_fold_cap", 0) or 0) + 2,
+        "graph_edges_pruned_by_post_merge_source_cap": int(kwargs["totals"].get("graph_edges_pruned_by_post_merge_source_cap", 0) or 0) + 1,
+    }))
+    monkeypatch.setattr(compact_memory, "_build_memory_summary_from_connections", lambda **kwargs: {"graph_node_count": 0, "graph_edge_count": 0, "replay_queue_size": 0, "representative_example_count": 0})
+    monkeypatch.setattr(compact_memory, "_upsert_temporal_milestones", lambda *args, **kwargs: None)
+    monkeypatch.setattr(compact_memory, "_trim_representative_examples", lambda *args, **kwargs: None)
+    monkeypatch.setattr(compact_memory, "_trim_replay_queue", lambda *args, **kwargs: None)
+
+    totals = {
+        **_graph_edge_total_fields(),
+        "graph_edges_pruned_by_post_merge_fold_cap": 0,
+        "graph_edges_pruned_by_post_merge_source_cap": 0,
+    }
+    result = _fold_epoch_raw_into_compact_memory_parallel(
+        paths=paths,
+        raw_dir=tmp_path,
+        db_paths=db_paths,
+        live_graph_paths=[],
+        temporal_rows=[],
+        current_summary={},
+        totals=totals,
+        fold_config=CompactMemoryFoldConfig(global_step_start=1, global_step_end=2),
+        parallel_workers=2,
+    )
+    assert result["graph_edges_attempted"] == 12
+    assert result["graph_edges_written"] == 7
+    assert result["graph_edges_skipped_by_fold_cap"] == 1
+    assert result["graph_edges_skipped_by_source_cap"] == 2
+    assert result["graph_edges_pruned_by_post_merge_fold_cap"] == 4
+    assert result["graph_edges_pruned_by_post_merge_source_cap"] == 2
+
+
+def test_direct_streaming_fold_config_propagates_graph_caps() -> None:
+    direct_config = DirectStreamingFoldConfig(
+        memory_dir="runs/tmp",
+        max_graph_edges_per_fold=123,
+        max_edges_per_source_node=7,
+        max_edges_per_carrier=8,
+        max_edges_per_family=9,
+        enable_graph_edge_caps=False,
+        use_set_based_merge=False,
+    )
+    fold_config = _compact_fold_config_from_direct_config(
+        direct_config,
+        global_step_start=11,
+        global_step_end=22,
+    )
+    assert fold_config.max_graph_edges_per_fold == 123
+    assert fold_config.max_edges_per_source_node == 7
+    assert fold_config.max_edges_per_carrier == 8
+    assert fold_config.max_edges_per_family == 9
+    assert fold_config.enable_graph_edge_caps is False
+    assert fold_config.use_set_based_merge is False
+
+
+def test_cli_exposes_direct_streaming_graph_cap_settings() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "interaction-sampling-v05c",
+            "--max-graph-edges-per-fold",
+            "123",
+            "--max-edges-per-source-node",
+            "7",
+            "--max-edges-per-carrier",
+            "8",
+            "--max-edges-per-family",
+            "9",
+            "--enable-graph-edge-caps",
+            "false",
+            "--use-set-based-merge",
+            "false",
+        ]
+    )
+    assert args.max_graph_edges_per_fold == 123
+    assert args.max_edges_per_source_node == 7
+    assert args.max_edges_per_carrier == 8
+    assert args.max_edges_per_family == 9
+    assert args.enable_graph_edge_caps is False
+    assert args.use_set_based_merge is False
+
+
+def test_intermediate_merge_does_not_prune_final_merge_does(tmp_path: Path) -> None:
+    main_dir = tmp_path / "main_merge_caps"
+    shard_dir = tmp_path / "shard_merge_caps"
+    ensure_memory_layout(main_dir)
+    ensure_memory_layout(shard_dir)
+    fold_config = CompactMemoryFoldConfig(
+        global_step_start=1,
+        global_step_end=10,
+        max_graph_edges_per_fold=2,
+        max_edges_per_source_node=10,
+        max_edges_per_carrier=10,
+        max_edges_per_family=10,
+        enable_graph_edge_caps=True,
+        use_set_based_merge=True,
+    )
+    with sqlite3.connect(shard_dir / "graph.sqlite") as conn:
+        conn.executemany(
+            """
+            INSERT INTO graph_edges (
+                edge_id, source_node_id, target_node_id, edge_type,
+                first_seen_global_step, last_seen_global_step, support_count, weight
+            ) VALUES (?, 'carrier:c1', ?, 'explains', 1, 1, ?, ?)
+            """,
+            [
+                ("e1", "t1", 10, 1.0),
+                ("e2", "t2", 9, 0.9),
+                ("e3", "t3", 8, 0.8),
+            ],
+        )
+        conn.commit()
+    with (
+        sqlite3.connect(main_dir / "current_state.sqlite") as state_conn,
+        sqlite3.connect(main_dir / "graph.sqlite") as graph_conn,
+        sqlite3.connect(main_dir / "replay_queue.sqlite") as replay_conn,
+    ):
+        _merge_compact_memory_dir_into_main(
+            temp_dir=shard_dir,
+            state_conn=state_conn,
+            graph_conn=graph_conn,
+            replay_conn=replay_conn,
+            fold_config=fold_config,
+            totals=_graph_edge_total_fields(),
+            enforce_graph_caps_after_merge=False,
+        )
+        count_without_prune = int(graph_conn.execute("SELECT COUNT(*) FROM graph_edges").fetchone()[0] or 0)
+        _enforce_graph_caps_after_merge(graph_conn, fold_config, totals={})
+        count_with_prune = int(graph_conn.execute("SELECT COUNT(*) FROM graph_edges").fetchone()[0] or 0)
+    assert count_without_prune == 3
+    assert count_with_prune == 2
+
+
+def test_set_based_graph_merge_counters_are_recorded(tmp_path: Path) -> None:
+    main_dir = tmp_path / "main_set_merge"
+    shard_dir = tmp_path / "shard_set_merge"
+    ensure_memory_layout(main_dir)
+    ensure_memory_layout(shard_dir)
+    fold_config = CompactMemoryFoldConfig(global_step_start=1, global_step_end=5, use_set_based_merge=True)
+    with sqlite3.connect(shard_dir / "graph.sqlite") as conn:
+        conn.execute(
+            """
+            INSERT INTO graph_edges (
+                edge_id, source_node_id, target_node_id, edge_type,
+                first_seen_global_step, last_seen_global_step, support_count, weight
+            ) VALUES ('e1', 'node:s', 'node:t', 'supports', 1, 1, 1, 1.0)
+            """
+        )
+        conn.commit()
+    totals = _graph_edge_total_fields()
+    with (
+        sqlite3.connect(main_dir / "current_state.sqlite") as state_conn,
+        sqlite3.connect(main_dir / "graph.sqlite") as graph_conn,
+        sqlite3.connect(main_dir / "replay_queue.sqlite") as replay_conn,
+    ):
+        _merge_compact_memory_dir_into_main(
+            temp_dir=shard_dir,
+            state_conn=state_conn,
+            graph_conn=graph_conn,
+            replay_conn=replay_conn,
+            fold_config=fold_config,
+            totals=totals,
+            enforce_graph_caps_after_merge=True,
+        )
+        _write_graph_epoch_summary(state_conn, graph_conn, fold_config, totals)
+        state_conn.commit()
+    assert totals["graph_edges_written"] == 0
+    assert totals["graph_edges_written_by_set_based_merge"] == 1
+    with sqlite3.connect(main_dir / "current_state.sqlite") as conn:
+        row = conn.execute(
+            """
+            SELECT graph_edges_written_by_set_based_merge,
+                   graph_edges_before_set_based_merge,
+                   graph_edges_after_set_based_merge
+            FROM graph_epoch_summary
+            WHERE epoch_key = '1:5'
+            """
+        ).fetchone()
+    assert row == (1, 0, 1)
 
 
 def test_h04_blocker_reads_temporal_order_from_core_metrics() -> None:
@@ -13489,6 +13877,37 @@ def test_h11_diagnostics_explain_missing_transfer_links_without_role_links(tmp_p
     result = evaluate_h11_future_option_transfer_concepts(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h11_diag", already_derived=True)
     assert result["motifs_skipped_no_role_links"] == 1
     assert "No future-option transfer links were produced because motifs lack role links." in result["missing_evidence"]
+
+
+def test_derive_future_option_motifs_counts_role_linked_events_without_unboundlocalerror(tmp_path: Path) -> None:
+    from v6.future_options import derive_future_option_motifs
+
+    memory_dir = tmp_path / "memory_h11_role_init"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as state_conn, sqlite3.connect(memory_dir / "graph.sqlite") as graph_conn:
+        state_conn.row_factory = sqlite3.Row
+        state_conn.execute(
+            """
+            INSERT INTO future_option_events (
+                event_id, owner_type, owner_key, game, sampler, context_key, action_key, source_kind, motif_type,
+                option_delta, option_delta_bucket, novelty_score, reversibility_score, branching_score,
+                termination_score, contradiction_score, replay_priority_score, memory_priority_score,
+                first_seen_global_step, last_seen_global_step, evidence_json
+            ) VALUES ('e1', 'role', 'r1', 'g1', 's1', 'ctx1', 'a1', 'stable_contingency', 'enable',
+                1.0, 'large_positive', 0.5, 0.0, 1.0, 0.0, 0.0, 0.8, 0.7, 1, 1, '{}')
+            """
+        )
+        state_conn.execute(
+            "INSERT INTO role_links (role_signature, linked_type, linked_key, support_count, first_seen_global_step, last_seen_global_step) VALUES ('r1', 'family', 'fam1', 1, 1, 1)"
+        )
+        state_conn.execute(
+            "INSERT INTO role_links (role_signature, linked_type, linked_key, support_count, first_seen_global_step, last_seen_global_step) VALUES ('r1', 'context', 'ctx1', 1, 1, 1)"
+        )
+        state_conn.commit()
+        summary = derive_future_option_motifs(state_conn, graph_conn, max_motifs=10)
+    assert summary["events_with_owner_type_role"] == 1
+    assert summary["role_linked_event_count"] > 0
+    assert summary["motifs_with_role_links"] > 0
 
 
 def test_h11_diagnostics_report_role_transfer_matches(tmp_path: Path) -> None:
@@ -14147,6 +14566,23 @@ def test_h03_compact_fold_evidence_exposes_stable_contingencies_and_families(tmp
     assert int(result["family_members_count"] or 0) >= 2
     assert result["core_metrics"]["transformation_family_count"] is not None
     assert result["core_metrics"]["family_members_count"] is not None
+
+
+def test_h03_report_core_metrics_prevent_evidence_decision_without_material_values(tmp_path: Path) -> None:
+    from v6.hypothesis_h03_report import _finalize_h03_result
+
+    result = {
+        "decision": "PARTIALLY_VALID",
+        "missing_evidence": [],
+        "evidence_for": [],
+        "evidence_against": [],
+        "acceptance_checks": {},
+        "scientific_conclusion": "",
+        "hypothesis_statement": "",
+    }
+    _finalize_h03_result(result, tmp_path / "h03_core_guard")
+    assert result["decision"] == "INSUFFICIENT_EVIDENCE"
+    assert "H03 produced no core transformation-family metrics." in result["missing_evidence"]
 
 
 def test_suite_summary_exposes_individual_vs_gated_decisions() -> None:

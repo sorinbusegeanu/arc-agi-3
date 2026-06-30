@@ -115,6 +115,9 @@ def _graph_edge_total_fields() -> dict[str, int]:
         "graph_edges_pruned_by_post_merge_source_cap": 0,
         "graph_edges_pruned_by_post_merge_carrier_cap": 0,
         "graph_edges_pruned_by_post_merge_family_cap": 0,
+        "graph_edges_written_by_set_based_merge": 0,
+        "graph_edges_before_set_based_merge": 0,
+        "graph_edges_after_set_based_merge": 0,
         "graph_edges_attempted": 0,
         "graph_edges_written": 0,
     }
@@ -1057,6 +1060,7 @@ def merge_compact_memory_shards_into_main(
                     replay_conn=replay_conn,
                     fold_config=fold_config,
                     totals=merge_totals,
+                    enforce_graph_caps_after_merge=True,
                 )
             summary = _build_memory_summary_from_connections(
                 state_conn=state_conn,
@@ -1154,6 +1158,7 @@ def _merge_compact_memory_dirs_worker(
                 replay_conn=replay_conn,
                 fold_config=fold_config,
                 totals=merge_totals,
+                enforce_graph_caps_after_merge=False,
             )
         summary = _build_memory_summary_from_connections(
             state_conn=state_conn,
@@ -1224,6 +1229,7 @@ def _fold_epoch_raw_into_compact_memory_parallel(
                     replay_conn=replay_conn,
                     fold_config=fold_config,
                     totals=totals,
+                    enforce_graph_caps_after_merge=True,
                 )
             for graph_path in live_graph_paths:
                 _ingest_live_graph_export(graph_conn, graph_path, fold_config, totals=totals)
@@ -1254,6 +1260,9 @@ def _fold_epoch_raw_into_compact_memory_parallel(
             totals["graph_node_count"] = int(summary.get("graph_node_count", 0) or 0)
             totals["graph_edge_count"] = int(summary.get("graph_edge_count", 0) or 0)
             totals["db_files_folded"] = len(db_paths)
+            for key in _graph_edge_total_fields().keys():
+                shard_value = sum(int(item.get(key, 0) or 0) for item in chunk_totals)
+                totals[key] = int(totals.get(key, 0) or 0) + shard_value
             summary.update(totals)
             summary["fold_summary"] = dict(totals)
             _write_graph_epoch_summary(state_conn, graph_conn, fold_config, totals)
@@ -2075,9 +2084,12 @@ def _write_graph_epoch_summary(
             graph_edges_pruned_by_post_merge_source_cap,
             graph_edges_pruned_by_post_merge_carrier_cap,
             graph_edges_pruned_by_post_merge_family_cap,
+            graph_edges_written_by_set_based_merge,
+            graph_edges_before_set_based_merge,
+            graph_edges_after_set_based_merge,
             cumulative_graph_node_count, cumulative_graph_edge_count, created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
         ON CONFLICT(epoch_key) DO UPDATE SET
             graph_edges_attempted = excluded.graph_edges_attempted,
             graph_edges_written = excluded.graph_edges_written,
@@ -2089,6 +2101,9 @@ def _write_graph_epoch_summary(
             graph_edges_pruned_by_post_merge_source_cap = excluded.graph_edges_pruned_by_post_merge_source_cap,
             graph_edges_pruned_by_post_merge_carrier_cap = excluded.graph_edges_pruned_by_post_merge_carrier_cap,
             graph_edges_pruned_by_post_merge_family_cap = excluded.graph_edges_pruned_by_post_merge_family_cap,
+            graph_edges_written_by_set_based_merge = excluded.graph_edges_written_by_set_based_merge,
+            graph_edges_before_set_based_merge = excluded.graph_edges_before_set_based_merge,
+            graph_edges_after_set_based_merge = excluded.graph_edges_after_set_based_merge,
             cumulative_graph_node_count = excluded.cumulative_graph_node_count,
             cumulative_graph_edge_count = excluded.cumulative_graph_edge_count,
             created_at = excluded.created_at
@@ -2107,6 +2122,9 @@ def _write_graph_epoch_summary(
             int(totals.get("graph_edges_pruned_by_post_merge_source_cap", 0) or 0),
             int(totals.get("graph_edges_pruned_by_post_merge_carrier_cap", 0) or 0),
             int(totals.get("graph_edges_pruned_by_post_merge_family_cap", 0) or 0),
+            int(totals.get("graph_edges_written_by_set_based_merge", 0) or 0),
+            int(totals.get("graph_edges_before_set_based_merge", 0) or 0),
+            int(totals.get("graph_edges_after_set_based_merge", 0) or 0),
             cumulative_nodes,
             cumulative_edges,
         ),
@@ -2121,12 +2139,23 @@ def _merge_compact_memory_dir_into_main(
     replay_conn: sqlite3.Connection,
     fold_config: CompactMemoryFoldConfig,
     totals: dict[str, Any] | None = None,
+    enforce_graph_caps_after_merge: bool = True,
 ) -> None:
     temp_paths = ensure_memory_layout(temp_dir)
     if bool(fold_config.use_set_based_merge):
+        before_graph_edges = int(graph_conn.execute("SELECT COUNT(*) FROM graph_edges").fetchone()[0] or 0)
         _merge_state_tables_set_based(temp_paths.current_state, state_conn, fold_config)
         _merge_graph_tables_set_based(temp_paths.graph, graph_conn, fold_config)
-        _enforce_graph_caps_after_merge(graph_conn, fold_config, totals=totals)
+        if enforce_graph_caps_after_merge:
+            _enforce_graph_caps_after_merge(graph_conn, fold_config, totals=totals)
+        after_graph_edges = int(graph_conn.execute("SELECT COUNT(*) FROM graph_edges").fetchone()[0] or 0)
+        if totals is not None:
+            totals["graph_edges_before_set_based_merge"] = before_graph_edges
+            totals["graph_edges_after_set_based_merge"] = after_graph_edges
+            totals["graph_edges_written_by_set_based_merge"] = (
+                int(totals.get("graph_edges_written_by_set_based_merge", 0) or 0)
+                + max(0, after_graph_edges - before_graph_edges)
+            )
         _merge_replay_queue_set_based(temp_paths.replay_queue, replay_conn)
         return
     with (
@@ -4551,7 +4580,12 @@ def _upsert_graph_edge(
 ) -> bool:
     if totals is not None:
         totals["graph_edges_attempted"] = int(totals.get("graph_edges_attempted", 0) or 0) + 1
-    if bool(fold_config.enable_graph_edge_caps):
+    edge_id = f"{source_node_id}->{edge_type}->{target_node_id}"
+    existing_edge = graph_conn.execute(
+        "SELECT 1 FROM graph_edges WHERE edge_id = ? LIMIT 1",
+        (edge_id,),
+    ).fetchone()
+    if bool(fold_config.enable_graph_edge_caps) and existing_edge is None:
         reason = _graph_edge_cap_exceeded(
             graph_conn,
             source_node_id=source_node_id,
@@ -4570,7 +4604,6 @@ def _upsert_graph_edge(
                 }[reason]
                 totals[counter_name] = int(totals.get(counter_name, 0) or 0) + 1
             return False
-    edge_id = f"{source_node_id}->{edge_type}->{target_node_id}"
     graph_conn.execute(
         """
         INSERT INTO graph_edges (edge_id, source_node_id, target_node_id, edge_type, first_seen_global_step, last_seen_global_step, support_count, weight)
@@ -4578,7 +4611,7 @@ def _upsert_graph_edge(
         ON CONFLICT(edge_id) DO UPDATE SET
             first_seen_global_step = MIN(graph_edges.first_seen_global_step, excluded.first_seen_global_step),
             last_seen_global_step = MAX(graph_edges.last_seen_global_step, excluded.last_seen_global_step),
-            support_count = MAX(graph_edges.support_count, excluded.support_count),
+            support_count = COALESCE(graph_edges.support_count, 0) + COALESCE(excluded.support_count, 0),
             weight = MAX(graph_edges.weight, excluded.weight)
         """,
         (edge_id, source_node_id, target_node_id, edge_type, fold_config.global_step_start, fold_config.global_step_end, int(support_count), float(weight)),
@@ -5436,6 +5469,9 @@ def _ensure_current_state_schema(path: Path) -> None:
                 graph_edges_pruned_by_post_merge_source_cap INTEGER DEFAULT 0,
                 graph_edges_pruned_by_post_merge_carrier_cap INTEGER DEFAULT 0,
                 graph_edges_pruned_by_post_merge_family_cap INTEGER DEFAULT 0,
+                graph_edges_written_by_set_based_merge INTEGER DEFAULT 0,
+                graph_edges_before_set_based_merge INTEGER DEFAULT 0,
+                graph_edges_after_set_based_merge INTEGER DEFAULT 0,
                 cumulative_graph_node_count INTEGER DEFAULT 0,
                 cumulative_graph_edge_count INTEGER DEFAULT 0,
                 created_at TEXT
@@ -5496,6 +5532,9 @@ def _ensure_current_state_schema(path: Path) -> None:
         _ensure_column(connection, "stable_contingencies", "prediction_error_after", "REAL")
         _ensure_column(connection, "stable_contingencies", "normalized_contingency_key", "TEXT")
         _ensure_column(connection, "carrier_candidates", "carrier_timing_source", "TEXT DEFAULT 'unknown'")
+        _ensure_column(connection, "graph_epoch_summary", "graph_edges_written_by_set_based_merge", "INTEGER DEFAULT 0")
+        _ensure_column(connection, "graph_epoch_summary", "graph_edges_before_set_based_merge", "INTEGER DEFAULT 0")
+        _ensure_column(connection, "graph_epoch_summary", "graph_edges_after_set_based_merge", "INTEGER DEFAULT 0")
         _ensure_column(connection, "transformation_families", "canonical_signature", "TEXT")
         _ensure_column(connection, "transformation_families", "relaxed_signature", "TEXT")
         _ensure_column(connection, "transformation_families", "effect_type", "TEXT")

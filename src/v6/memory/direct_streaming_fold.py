@@ -71,6 +71,12 @@ class DirectStreamingFoldConfig:
     max_examples_per_contradiction_cluster: int = 2
     fold_memory_substrate: bool = True
     fold_graph: bool = True
+    max_graph_edges_per_fold: int = 1_000_000
+    max_edges_per_source_node: int = 128
+    max_edges_per_carrier: int = 32
+    max_edges_per_family: int = 64
+    enable_graph_edge_caps: bool = True
+    use_set_based_merge: bool = True
     compact_finalize_mode: str = "full"
 
 
@@ -96,6 +102,30 @@ class DirectStreamingFoldResult:
     milestones: dict[str, Any] | None = None
     validation_payload: dict[str, Any] | None = None
     parquet_exported: bool = False
+
+
+def _compact_fold_config_from_direct_config(
+    config: DirectStreamingFoldConfig,
+    *,
+    global_step_start: int,
+    global_step_end: int,
+) -> CompactMemoryFoldConfig:
+    return CompactMemoryFoldConfig(
+        global_step_start=int(global_step_start),
+        global_step_end=int(global_step_end),
+        max_examples_per_contingency=int(config.max_examples_per_contingency),
+        max_examples_per_family=int(config.max_examples_per_family),
+        max_examples_per_carrier=int(config.max_examples_per_carrier),
+        max_examples_per_contradiction_cluster=int(config.max_examples_per_contradiction_cluster),
+        fold_memory_substrate=bool(config.fold_memory_substrate),
+        fold_graph=bool(config.fold_graph),
+        max_graph_edges_per_fold=int(config.max_graph_edges_per_fold),
+        max_edges_per_source_node=int(config.max_edges_per_source_node),
+        max_edges_per_carrier=int(config.max_edges_per_carrier),
+        max_edges_per_family=int(config.max_edges_per_family),
+        enable_graph_edge_caps=bool(config.enable_graph_edge_caps),
+        use_set_based_merge=bool(config.use_set_based_merge),
+    )
 
 
 def ensure_direct_streaming_fold_manifest(memory_dir: str | Path, *, busy_timeout_ms: int = 60000) -> Path:
@@ -754,15 +784,10 @@ def _fold_one_completed_job_to_shard_once(
     fold_single_sampling_db_into_main_compact_memory(
         db_path=db_path,
         memory_dir=shard_dir,
-        fold_config=CompactMemoryFoldConfig(
+        fold_config=_compact_fold_config_from_direct_config(
+            config,
             global_step_start=int(job.global_step_start),
             global_step_end=int(job.global_step_end),
-            max_examples_per_contingency=int(config.max_examples_per_contingency),
-            max_examples_per_family=int(config.max_examples_per_family),
-            max_examples_per_carrier=int(config.max_examples_per_carrier),
-            max_examples_per_contradiction_cluster=int(config.max_examples_per_contradiction_cluster),
-            fold_memory_substrate=bool(config.fold_memory_substrate),
-            fold_graph=bool(config.fold_graph),
         ),
         finalize_after_fold=False,
         sqlite_synchronous=str(config.shard_synchronous),
@@ -1090,15 +1115,10 @@ class DirectStreamingFoldWriter:
                 finalize_started_at = time.time()
                 finalize_main_compact_memory(
                     memory_dir=self.config.memory_dir,
-                    fold_config=CompactMemoryFoldConfig(
+                    fold_config=_compact_fold_config_from_direct_config(
+                        self.config,
                         global_step_start=int(self._summary.get("direct_streaming_fold_global_step_start", 0) or 0),
                         global_step_end=int(self._summary.get("direct_streaming_fold_global_step_end", 0) or 0),
-                        max_examples_per_contingency=int(self.config.max_examples_per_contingency),
-                        max_examples_per_family=int(self.config.max_examples_per_family),
-                        max_examples_per_carrier=int(self.config.max_examples_per_carrier),
-                        max_examples_per_contradiction_cluster=int(self.config.max_examples_per_contradiction_cluster),
-                        fold_memory_substrate=bool(self.config.fold_memory_substrate),
-                        fold_graph=bool(self.config.fold_graph),
                     ),
                     finalize_mode=str(self.config.compact_finalize_mode),
                 )
@@ -1200,11 +1220,10 @@ class DirectStreamingFoldWriter:
             merge_direct_fold_shards(
                 memory_dir=self.config.memory_dir,
                 shard_dirs=shard_dirs,
-                fold_config=CompactMemoryFoldConfig(
+                fold_config=_compact_fold_config_from_direct_config(
+                    self.config,
                     global_step_start=min(int(job.global_step_start) for job in jobs),
                     global_step_end=max(int(job.global_step_end) for job in jobs),
-                    fold_memory_substrate=bool(self.config.fold_memory_substrate),
-                    fold_graph=bool(self.config.fold_graph),
                 ),
                 workers=1,
                 progress=False,
@@ -1427,7 +1446,8 @@ def retry_direct_streaming_fold_failures(
                     merge_direct_fold_shards(
                         memory_dir=memory_dir,
                         shard_dirs=[shard_dir],
-                        fold_config=CompactMemoryFoldConfig(
+                        fold_config=_compact_fold_config_from_direct_config(
+                            retry_config,
                             global_step_start=int(job.global_step_start),
                             global_step_end=int(job.global_step_end),
                         ),
@@ -1496,13 +1516,10 @@ def retry_direct_streaming_fold_failures(
             max_step = max(int(job.global_step_end) for job in jobs)
             finalize_main_compact_memory(
                 memory_dir=memory_dir,
-                fold_config=CompactMemoryFoldConfig(
+                fold_config=_compact_fold_config_from_direct_config(
+                    retry_config,
                     global_step_start=min_step,
                     global_step_end=max_step,
-                    max_examples_per_contingency=int(retry_config.max_examples_per_contingency),
-                    max_examples_per_family=int(retry_config.max_examples_per_family),
-                    max_examples_per_carrier=int(retry_config.max_examples_per_carrier),
-                    max_examples_per_contradiction_cluster=int(retry_config.max_examples_per_contradiction_cluster),
                 ),
             )
             _checkpoint_compact_memory(memory_dir, busy_timeout_ms=int(retry_config.busy_timeout_ms))
