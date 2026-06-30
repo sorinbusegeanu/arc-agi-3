@@ -313,6 +313,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     retry_fold.add_argument("--delete-raw-after-fold", type=_parse_bool, default=True)
     retry_fold.add_argument("--finalize-after-success", type=_parse_bool, default=False)
+    retry_fold.add_argument("--max-graph-edges-per-fold", type=int, default=1_000_000)
+    retry_fold.add_argument("--max-edges-per-source-node", type=int, default=128)
+    retry_fold.add_argument("--max-edges-per-carrier", type=int, default=32)
+    retry_fold.add_argument("--max-edges-per-family", type=int, default=64)
+    retry_fold.add_argument("--enable-graph-edge-caps", type=_parse_bool, default=True)
+    retry_fold.add_argument("--use-set-based-merge", type=_parse_bool, default=True)
 
     contingency_memory = subparsers.add_parser("contingency-memory-v06")
     contingency_memory.add_argument("--parquet-root", required=True)
@@ -994,6 +1000,12 @@ def main(argv: list[str] | None = None) -> int:
             max_tasks_per_child=int(args.max_tasks_per_child),
             delete_raw_after_fold=bool(args.delete_raw_after_fold),
             finalize_after_success=bool(args.finalize_after_success),
+            max_graph_edges_per_fold=int(args.max_graph_edges_per_fold),
+            max_edges_per_source_node=int(args.max_edges_per_source_node),
+            max_edges_per_carrier=int(args.max_edges_per_carrier),
+            max_edges_per_family=int(args.max_edges_per_family),
+            enable_graph_edge_caps=bool(args.enable_graph_edge_caps),
+            use_set_based_merge=bool(args.use_set_based_merge),
         )
         print(json.dumps(payload, indent=2))
         return 0

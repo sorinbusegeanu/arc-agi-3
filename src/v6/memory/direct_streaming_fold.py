@@ -1337,6 +1337,12 @@ def retry_direct_streaming_fold_failures(
     delete_raw_after_fold: bool = True,
     finalize_after_success: bool = False,
     max_tasks_per_child: int = 0,
+    max_graph_edges_per_fold: int = 1_000_000,
+    max_edges_per_source_node: int = 128,
+    max_edges_per_carrier: int = 32,
+    max_edges_per_family: int = 64,
+    enable_graph_edge_caps: bool = True,
+    use_set_based_merge: bool = True,
 ) -> dict[str, Any]:
     manifest = Path(manifest_path)
     with _connect_manifest(manifest) as conn:
@@ -1377,6 +1383,12 @@ def retry_direct_streaming_fold_failures(
         cleanup_stale_legacy_temp_on_start=False,
         fold_workers=max(1, int(workers)),
         max_tasks_per_child=int(max_tasks_per_child or 0),
+        max_graph_edges_per_fold=int(max_graph_edges_per_fold),
+        max_edges_per_source_node=int(max_edges_per_source_node),
+        max_edges_per_carrier=int(max_edges_per_carrier),
+        max_edges_per_family=int(max_edges_per_family),
+        enable_graph_edge_caps=bool(enable_graph_edge_caps),
+        use_set_based_merge=bool(use_set_based_merge),
         shard_root_name=f"direct_streaming_fold_retry_shards_{timestamp}",
     )
     summary = {

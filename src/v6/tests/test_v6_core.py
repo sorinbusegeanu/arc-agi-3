@@ -13257,6 +13257,37 @@ def test_cli_exposes_direct_streaming_graph_cap_settings() -> None:
     assert args.use_set_based_merge is False
 
 
+def test_retry_direct_streaming_fold_cli_exposes_graph_cap_settings() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "retry-direct-streaming-fold-failures",
+            "--manifest-path",
+            "runs/v6/test/direct_streaming_fold_manifest.sqlite",
+            "--memory-dir",
+            "runs/v6/test/memory",
+            "--max-graph-edges-per-fold",
+            "123",
+            "--max-edges-per-source-node",
+            "7",
+            "--max-edges-per-carrier",
+            "8",
+            "--max-edges-per-family",
+            "9",
+            "--enable-graph-edge-caps",
+            "false",
+            "--use-set-based-merge",
+            "false",
+        ]
+    )
+    assert args.max_graph_edges_per_fold == 123
+    assert args.max_edges_per_source_node == 7
+    assert args.max_edges_per_carrier == 8
+    assert args.max_edges_per_family == 9
+    assert args.enable_graph_edge_caps is False
+    assert args.use_set_based_merge is False
+
+
 def test_intermediate_merge_does_not_prune_final_merge_does(tmp_path: Path) -> None:
     main_dir = tmp_path / "main_merge_caps"
     shard_dir = tmp_path / "shard_merge_caps"
@@ -15659,7 +15690,17 @@ def test_retry_direct_streaming_fold_preserves_zero_and_positive_max_tasks_per_c
             return False
 
     def _fake_config(*args, **kwargs):
-        seen.append(int(kwargs.get("max_tasks_per_child", -1)))
+        seen.append(
+            {
+                "max_tasks_per_child": int(kwargs.get("max_tasks_per_child", -1)),
+                "max_graph_edges_per_fold": int(kwargs.get("max_graph_edges_per_fold", -1)),
+                "max_edges_per_source_node": int(kwargs.get("max_edges_per_source_node", -1)),
+                "max_edges_per_carrier": int(kwargs.get("max_edges_per_carrier", -1)),
+                "max_edges_per_family": int(kwargs.get("max_edges_per_family", -1)),
+                "enable_graph_edge_caps": bool(kwargs.get("enable_graph_edge_caps", False)),
+                "use_set_based_merge": bool(kwargs.get("use_set_based_merge", False)),
+            }
+        )
         raise _Sentinel()
 
     monkeypatch.setattr(dsf, "_connect_manifest", lambda *args, **kwargs: _FakeConn())
@@ -15669,6 +15710,12 @@ def test_retry_direct_streaming_fold_preserves_zero_and_positive_max_tasks_per_c
             manifest_path=manifest_path,
             memory_dir=memory_dir,
             max_tasks_per_child=0,
+            max_graph_edges_per_fold=123,
+            max_edges_per_source_node=7,
+            max_edges_per_carrier=8,
+            max_edges_per_family=9,
+            enable_graph_edge_caps=False,
+            use_set_based_merge=False,
         )
     except _Sentinel:
         pass
@@ -15677,10 +15724,35 @@ def test_retry_direct_streaming_fold_preserves_zero_and_positive_max_tasks_per_c
             manifest_path=manifest_path,
             memory_dir=memory_dir,
             max_tasks_per_child=1000,
+            max_graph_edges_per_fold=222,
+            max_edges_per_source_node=17,
+            max_edges_per_carrier=18,
+            max_edges_per_family=19,
+            enable_graph_edge_caps=True,
+            use_set_based_merge=True,
         )
     except _Sentinel:
         pass
-    assert seen == [0, 1000]
+    assert seen == [
+        {
+            "max_tasks_per_child": 0,
+            "max_graph_edges_per_fold": 123,
+            "max_edges_per_source_node": 7,
+            "max_edges_per_carrier": 8,
+            "max_edges_per_family": 9,
+            "enable_graph_edge_caps": False,
+            "use_set_based_merge": False,
+        },
+        {
+            "max_tasks_per_child": 1000,
+            "max_graph_edges_per_fold": 222,
+            "max_edges_per_source_node": 17,
+            "max_edges_per_carrier": 18,
+            "max_edges_per_family": 19,
+            "enable_graph_edge_caps": True,
+            "use_set_based_merge": True,
+        },
+    ]
 
 
 def test_cli_and_config_propagation_preserve_zero_max_tasks_per_child(monkeypatch, tmp_path: Path) -> None:
