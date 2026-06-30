@@ -2124,6 +2124,26 @@ def _append_unique(items: list[str], value: str) -> None:
 
 
 def _finalize_h02_result(result: dict[str, Any], output_dir: Path) -> None:
+    result["core_metrics"] = {
+        "h02a_replay_attention_decision": result.get("h02a_replay_attention_decision"),
+        "h02b_pre_carrier_timing_decision": result.get("h02b_pre_carrier_timing_decision"),
+        "h02_final_decision_basis": result.get("h02_final_decision_basis"),
+        "carrier_timing_note": result.get("carrier_timing_note"),
+        "prediction_violation_replay_lift": result.get("prediction_violation_replay_lift"),
+        "prediction_violation_base_ratio": result.get("prediction_violation_base_ratio"),
+        "high_priority_replay_prediction_violation_ratio": result.get("high_priority_replay_prediction_violation_ratio"),
+        "mean_replay_priority_for_prediction_violating_interactions": result.get("mean_replay_priority_for_prediction_violating_interactions"),
+        "mean_replay_priority_for_non_prediction_violating_interactions": result.get("mean_replay_priority_for_non_prediction_violating_interactions"),
+        "direct_replay_lift_available": result.get("direct_replay_lift_available"),
+        "compact_prediction_violation_count": result.get("compact_prediction_violation_count"),
+        "compact_evidence_coverage_count": result.get("compact_evidence_coverage_count"),
+    }
+    if result.get("decision") in {"VALID", "PARTIALLY_VALID", "INVALID"} and not any(
+        value not in (None, "", [], {}, ())
+        for value in result["core_metrics"].values()
+    ):
+        result["decision"] = "INSUFFICIENT_EVIDENCE"
+        _append_unique(result.setdefault("missing_evidence", []), "H02 produced no core metrics.")
     (output_dir / H02_JSON_NAME).write_text(json.dumps(result, indent=2), encoding="utf-8")
     (output_dir / H02_TXT_NAME).write_text(_format_text_report(result), encoding="utf-8")
     (output_dir / H02_MD_NAME).write_text(_format_markdown_report(result), encoding="utf-8")

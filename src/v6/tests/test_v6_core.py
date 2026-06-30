@@ -152,6 +152,8 @@ from v6.memory.compact_memory import (
     CompactMemoryFoldConfig,
     _build_raw_db_fold_caches,
     _context_level_from_raw,
+    _enforce_graph_caps_after_merge,
+    _write_graph_epoch_summary,
     derive_missing_transformation_families_from_stable_contingencies,
     canonical_family_signature_from_raw_db,
     ensure_memory_layout,
@@ -11911,6 +11913,8 @@ def test_h02_preserves_compact_direct_linkage(tmp_path: Path) -> None:
     assert result["direct_replay_lift_available"] is True
     assert float(result["prediction_violation_replay_lift"]) > 1.25
     assert "Direct per-interaction prediction-error to replay-priority linkage unavailable" not in " ".join(result["missing_evidence"])
+    assert result["core_metrics"]["direct_replay_lift_available"] is True
+    assert result["core_metrics"]["prediction_violation_replay_lift"] is not None
 
 
 def test_h01_derives_prediction_accuracy_and_context_lift_from_prediction_results(tmp_path: Path) -> None:
@@ -12024,6 +12028,27 @@ def test_h02_raw_cleanup_without_direct_linkage_is_not_invalid(tmp_path: Path, m
     result = evaluate_h02_prediction_violation_attention(run_dir, tmp_path / "out_h02_streamed", memory_dir=memory_dir)
     assert result["raw_cleanup_prevents_direct_linkage"] is True
     assert result["decision"] != "INVALID"
+
+
+def test_h02_non_evidence_decision_is_demoted_when_core_metrics_empty(tmp_path: Path) -> None:
+    from v6.hypothesis_h02_report import _finalize_h02_result
+
+    result = {
+        "decision": "VALID",
+        "missing_evidence": [],
+        "evidence_for": [],
+        "evidence_against": [],
+        "acceptance_checks": {},
+        "scientific_conclusion": "",
+        "h02a_replay_attention_decision": None,
+        "h02b_pre_carrier_timing_decision": None,
+        "h02_final_decision_basis": None,
+    }
+    output_dir = tmp_path / "h02_empty_core"
+    output_dir.mkdir()
+    _finalize_h02_result(result, output_dir)
+    assert result["decision"] == "INSUFFICIENT_EVIDENCE"
+    assert "H02 produced no core metrics." in result["missing_evidence"]
 
 
 def test_h09_unknown_event_ratio_blocks_valid(tmp_path: Path) -> None:
@@ -12161,8 +12186,63 @@ def test_h10_degenerate_calibration_keeps_raw_high_attention_not_all_low(tmp_pat
         row = conn.execute("SELECT high_attention, raw_high_attention, calibrated_high_attention, attention_calibration_degenerate FROM future_option_attention_links").fetchone()
         assert row == (1, 1, 0, 1)
     result = evaluate_h10_future_option_attention(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h10_deg", already_derived=True)
-    assert result["attention_all_low_saturation"] is False
+    assert result["attention_all_low_saturation"] is True
     assert result["attention_calibration_degenerate"] is True
+    assert result["decision"] == "INSUFFICIENT_EVIDENCE"
+    assert result["attention_primary_signal"] == "raw_fallback"
+    assert result["raw_high_attention_count"] == 1
+
+
+def test_h10_prefers_calibrated_attention_when_present(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory_h10_calibrated"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        for idx in range(5):
+            conn.execute(
+                """
+                INSERT INTO future_option_events (
+                    event_id, owner_type, owner_key, source_kind, motif_type, option_delta,
+                    option_delta_bucket, first_seen_global_step, last_seen_global_step
+                ) VALUES (?, 'interaction', ?, 'stable_contingency', 'enable', 2.0, 'large_positive', 1, 1)
+                """,
+                (f"h{idx}", f"hi{idx}"),
+            )
+            conn.execute(
+                """
+                INSERT INTO future_option_attention_links (
+                    event_id, motif_signature, owner_type, owner_key, option_delta_abs, replay_priority_score,
+                    memory_priority_score, contradiction_score, high_option_change, high_attention,
+                    raw_high_attention, calibrated_high_attention, attention_calibration_degenerate
+                ) VALUES (?, 'm', 'interaction', ?, 2.0, 0.9, 0.1, 0.0, 1, 1, 1, 1, 0)
+                """,
+                (f"h{idx}", f"hi{idx}"),
+            )
+        for idx in range(5):
+            conn.execute(
+                """
+                INSERT INTO future_option_events (
+                    event_id, owner_type, owner_key, source_kind, motif_type, option_delta,
+                    option_delta_bucket, first_seen_global_step, last_seen_global_step
+                ) VALUES (?, 'interaction', ?, 'stable_contingency', 'enable', 0.1, 'small_positive', 1, 1)
+                """,
+                (f"l{idx}", f"lo{idx}"),
+            )
+            conn.execute(
+                """
+                INSERT INTO future_option_attention_links (
+                    event_id, motif_signature, owner_type, owner_key, option_delta_abs, replay_priority_score,
+                    memory_priority_score, contradiction_score, high_option_change, high_attention,
+                    raw_high_attention, calibrated_high_attention, attention_calibration_degenerate
+                ) VALUES (?, 'm', 'interaction', ?, 0.1, 0.9, 0.1, 0.0, 0, 1, 1, 0, 0)
+                """,
+                (f"l{idx}", f"lo{idx}"),
+            )
+        conn.commit()
+    result = evaluate_h10_future_option_attention(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h10_calibrated", already_derived=True)
+    assert result["attention_primary_signal"] == "calibrated"
+    assert result["raw_high_attention_count"] == 10
+    assert result["calibrated_high_attention_count"] == 5
+    assert result["attention_all_high_saturation"] is False
 
 
 def test_h10_falls_back_to_heuristic_events_when_live_deltas_are_zero(tmp_path: Path) -> None:
@@ -12662,6 +12742,25 @@ def test_h03_missing_prediction_lift_is_not_valid(tmp_path: Path) -> None:
     assert "H03 family prediction-lift evidence is unavailable." in result["missing_evidence"]
 
 
+def test_h03_valid_is_demoted_when_core_metrics_empty(tmp_path: Path) -> None:
+    from v6.hypothesis_h03_report import _finalize_h03_result
+
+    result = {
+        "decision": "VALID",
+        "missing_evidence": [],
+        "evidence_for": [],
+        "evidence_against": [],
+        "acceptance_checks": {},
+        "scientific_conclusion": "",
+        "hypothesis_statement": "",
+    }
+    output_dir = tmp_path / "h03_empty_core"
+    output_dir.mkdir()
+    _finalize_h03_result(result, output_dir)
+    assert result["decision"] == "INSUFFICIENT_EVIDENCE"
+    assert "H03 produced no core transformation-family metrics." in result["missing_evidence"]
+
+
 def test_h03_negative_prediction_lift_is_invalid(tmp_path: Path) -> None:
     import v6.hypothesis_h03_report as h03_report
 
@@ -12750,11 +12849,123 @@ def test_h04_uses_compact_temporal_fallback(tmp_path: Path) -> None:
         conn.execute("INSERT INTO graph_edges (edge_id, source_node_id, target_node_id, edge_type, first_seen_global_step, last_seen_global_step, support_count, weight) VALUES ('e1','carrier:carrier1','b','explains',1,1,1,1.0)")
         conn.execute("INSERT INTO graph_edges (edge_id, source_node_id, target_node_id, edge_type, first_seen_global_step, last_seen_global_step, support_count, weight) VALUES ('e2','carrier:carrier1','b','anchors',1,1,1,1.0)")
         conn.commit()
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as state_conn, sqlite3.connect(memory_dir / "graph.sqlite") as graph_conn:
+        _write_graph_epoch_summary(
+            state_conn,
+            graph_conn,
+            CompactMemoryFoldConfig(global_step_start=5, global_step_end=8),
+            {"graph_edges_attempted": 2, "graph_edges_written": 2},
+        )
+        state_conn.commit()
     result = evaluate_h04_carrier_emergence(run_dir=None, memory_dir=memory_dir, output_dir=tmp_path / "h04")
     assert result["core_metrics"]["h04_temporal_source"] == "compact_table_fallback"
     assert result["core_metrics"]["h03_before_h04"] is True
     assert result["core_metrics"]["h03_before_h04_usable"] is True
     assert result["core_metrics"]["first_usable_emergent_carrier_step"] == 7
+    assert result["core_metrics"]["h04_epoch_graph_summary_available"] is True
+    assert result["core_metrics"]["latest_graph_epoch_edges_written"] == 2
+
+
+def test_graph_post_merge_caps_prune_total_and_source_and_record_epoch_summary(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory_graph_caps"
+    ensure_memory_layout(memory_dir)
+    fold_config = CompactMemoryFoldConfig(
+        global_step_start=10,
+        global_step_end=20,
+        max_graph_edges_per_fold=3,
+        max_edges_per_source_node=2,
+        max_edges_per_carrier=1,
+        max_edges_per_family=1,
+        enable_graph_edge_caps=True,
+    )
+    totals = {
+        "graph_edges_attempted": 6,
+        "graph_edges_written": 6,
+        "graph_edges_skipped_by_fold_cap": 0,
+        "graph_edges_skipped_by_source_cap": 0,
+        "graph_edges_skipped_by_carrier_cap": 0,
+        "graph_edges_skipped_by_family_cap": 0,
+        "graph_edges_pruned_by_post_merge_fold_cap": 0,
+        "graph_edges_pruned_by_post_merge_source_cap": 0,
+        "graph_edges_pruned_by_post_merge_carrier_cap": 0,
+        "graph_edges_pruned_by_post_merge_family_cap": 0,
+    }
+    with sqlite3.connect(memory_dir / "graph.sqlite") as graph_conn:
+        graph_conn.executemany(
+            """
+            INSERT INTO graph_edges (
+                edge_id, source_node_id, target_node_id, edge_type,
+                first_seen_global_step, last_seen_global_step, support_count, weight
+            ) VALUES (?, ?, ?, ?, 1, 9, ?, ?)
+            """,
+            [
+                ("e1", "carrier:c1", "t1", "explains", 10, 1.0),
+                ("e2", "carrier:c1", "t2", "anchors", 9, 0.9),
+                ("e3", "carrier:c1", "t3", "appears_in", 8, 0.8),
+                ("e4", "family:f1", "t4", "supports", 7, 0.7),
+                ("e5", "family:f1", "t5", "supports", 6, 0.6),
+                ("e6", "node:x", "t6", "supports", 5, 0.5),
+            ],
+        )
+        graph_conn.commit()
+        _enforce_graph_caps_after_merge(graph_conn, fold_config, totals=totals)
+        graph_conn.commit()
+        remaining = {
+            row[0]: (row[1], row[2], row[3], row[4])
+            for row in graph_conn.execute(
+                "SELECT edge_id, source_node_id, target_node_id, support_count, weight FROM graph_edges ORDER BY edge_id ASC"
+            ).fetchall()
+        }
+    assert len(remaining) <= 3
+    assert "e1" in remaining
+    assert totals["graph_edges_pruned_by_post_merge_fold_cap"] >= 3
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as state_conn, sqlite3.connect(memory_dir / "graph.sqlite") as graph_conn:
+        _write_graph_epoch_summary(state_conn, graph_conn, fold_config, totals)
+        state_conn.commit()
+        row = state_conn.execute(
+            """
+            SELECT graph_edges_pruned_by_post_merge_fold_cap,
+                   graph_edges_pruned_by_post_merge_source_cap,
+                   graph_edges_pruned_by_post_merge_carrier_cap,
+                   graph_edges_pruned_by_post_merge_family_cap
+            FROM graph_epoch_summary
+            WHERE epoch_key = '10:20'
+            """
+        ).fetchone()
+    assert row is not None
+    assert int(row[0] or 0) == int(totals["graph_edges_pruned_by_post_merge_fold_cap"])
+
+
+def test_graph_post_merge_caps_keep_highest_priority_edges(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory_graph_order"
+    ensure_memory_layout(memory_dir)
+    fold_config = CompactMemoryFoldConfig(
+        global_step_start=1,
+        global_step_end=2,
+        max_graph_edges_per_fold=2,
+        max_edges_per_source_node=10,
+        max_edges_per_carrier=10,
+        max_edges_per_family=10,
+        enable_graph_edge_caps=True,
+    )
+    with sqlite3.connect(memory_dir / "graph.sqlite") as graph_conn:
+        graph_conn.executemany(
+            """
+            INSERT INTO graph_edges (
+                edge_id, source_node_id, target_node_id, edge_type,
+                first_seen_global_step, last_seen_global_step, support_count, weight
+            ) VALUES (?, 'node:s', ?, 'supports', 1, ?, ?, ?)
+            """,
+            [
+                ("low", "a", 1, 1, 0.1),
+                ("mid", "b", 2, 3, 0.2),
+                ("high", "c", 3, 5, 0.9),
+            ],
+        )
+        graph_conn.commit()
+        _enforce_graph_caps_after_merge(graph_conn, fold_config, totals={})
+        kept = [row[0] for row in graph_conn.execute("SELECT edge_id FROM graph_edges ORDER BY edge_id ASC").fetchall()]
+    assert kept == ["high", "mid"]
 
 
 def test_h04_blocker_reads_temporal_order_from_core_metrics() -> None:
@@ -13238,6 +13449,99 @@ def test_h11_reports_blockers_when_motifs_or_promoted_concepts_absent(tmp_path: 
     result = evaluate_h11_future_option_transfer_concepts(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h11_blockers", already_derived=True)
     assert result["h11_blocked_by_no_motifs"] is True
     assert result["h11_blocked_by_no_promoted_concepts"] is True
+
+
+def test_h11_diagnostics_explain_missing_transfer_links_without_role_links(tmp_path: Path) -> None:
+    from v6.hypothesis_h11_report import evaluate_h11_future_option_transfer_concepts
+
+    memory_dir = tmp_path / "memory_h11_diag"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute(
+            """
+            INSERT INTO future_option_motifs (
+                motif_signature, motif_type, support_count, linked_event_count, linked_family_count,
+                linked_carrier_count, linked_role_count, linked_concept_count, cross_context_count,
+                cross_game_count, mean_option_delta, mean_abs_option_delta, first_seen_global_step,
+                last_seen_global_step, motif_stability_score, is_emergent
+            ) VALUES ('m1', 'enable', 3, 3, 1, 0, 0, 0, 2, 1, 1.0, 1.0, 1, 2, 0.8, 1)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO memory_summary (key, value_json)
+            VALUES ('future_option_derivation_summary', ?)
+            """,
+            (
+                json.dumps(
+                    {
+                        "motifs_seen_for_transfer": 1,
+                        "motifs_skipped_no_role_links": 1,
+                        "motifs_with_role_links_for_transfer": 0,
+                        "roles_seen_from_motif_links": 0,
+                        "roles_with_transfer_attempts": 0,
+                        "roles_with_concepts": 0,
+                    }
+                ),
+            ),
+        )
+        conn.commit()
+    result = evaluate_h11_future_option_transfer_concepts(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h11_diag", already_derived=True)
+    assert result["motifs_skipped_no_role_links"] == 1
+    assert "No future-option transfer links were produced because motifs lack role links." in result["missing_evidence"]
+
+
+def test_h11_diagnostics_report_role_transfer_matches(tmp_path: Path) -> None:
+    from v6.hypothesis_h11_report import evaluate_h11_future_option_transfer_concepts
+
+    memory_dir = tmp_path / "memory_h11_roles"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute(
+            """
+            INSERT INTO future_option_motifs (
+                motif_signature, motif_type, support_count, linked_event_count, linked_family_count,
+                linked_carrier_count, linked_role_count, linked_concept_count, cross_context_count,
+                cross_game_count, mean_option_delta, mean_abs_option_delta, first_seen_global_step,
+                last_seen_global_step, motif_stability_score, is_emergent
+            ) VALUES ('m1', 'enable', 3, 3, 1, 1, 1, 0, 2, 1, 1.0, 1.0, 1, 2, 0.8, 1)
+            """
+        )
+        conn.execute(
+            "INSERT INTO future_option_links (motif_signature, linked_type, linked_key, support_count, first_seen_global_step, last_seen_global_step) VALUES ('m1', 'role', 'r1', 1, 1, 2)"
+        )
+        conn.execute(
+            """
+            INSERT INTO role_transfer_attempts (
+                attempt_id, role_signature, transfer_kind, source_scope_type, source_scope_key,
+                target_scope_type, target_scope_key, target_carrier_signature, predicted_role_signature,
+                observed_role_signature, similarity_score, transfer_score, reuse_success, failure_reason,
+                best_margin, source_carrier_count, candidate_role_count, first_seen_global_step, last_seen_global_step
+            ) VALUES ('a1', 'r1', 'cross_game', 'game', 'g1', 'game', 'g2', 'c1', 'r2', 'r2', 0.8, 0.9, 1, NULL, 0.2, 2, 2, 1, 2)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO memory_summary (key, value_json)
+            VALUES ('future_option_derivation_summary', ?)
+            """,
+            (
+                json.dumps(
+                    {
+                        "motifs_seen_for_transfer": 1,
+                        "motifs_skipped_no_role_links": 0,
+                        "motifs_with_role_links_for_transfer": 1,
+                        "roles_seen_from_motif_links": 1,
+                        "roles_with_transfer_attempts": 1,
+                        "roles_with_concepts": 0,
+                    }
+                ),
+            ),
+        )
+        conn.commit()
+    result = evaluate_h11_future_option_transfer_concepts(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h11_roles", already_derived=True)
+    assert result["roles_with_transfer_attempts"] == 1
+    assert "Role-transfer evidence exists, but roles are not linked to concepts." in result["missing_evidence"]
 
 
 def test_hypothesis_suite_fast_mode_skips_expensive_hypotheses(tmp_path: Path, monkeypatch) -> None:
@@ -13841,6 +14145,8 @@ def test_h03_compact_fold_evidence_exposes_stable_contingencies_and_families(tmp
     assert int(result["stable_contingencies_count"] or 0) == 2
     assert int(result["transformation_families_count"] or 0) >= 1
     assert int(result["family_members_count"] or 0) >= 2
+    assert result["core_metrics"]["transformation_family_count"] is not None
+    assert result["core_metrics"]["family_members_count"] is not None
 
 
 def test_suite_summary_exposes_individual_vs_gated_decisions() -> None:

@@ -551,6 +551,8 @@ def derive_future_option_motifs(
             concepts.update(concepts_by_link.get(("family", family_signature), set()))
         for carrier_signature in carriers:
             concepts.update(concepts_by_link.get(("carrier", carrier_signature), set()))
+        if roles:
+            role_linked_event_count += 1
         signature_tokens = sorted(
             {
                 f"motif_type:{row['motif_type']}",
@@ -601,10 +603,17 @@ def derive_future_option_motifs(
     selected = sorted(groups)[: int(max_motifs)]
     emergent_count = 0
     first_emergent_step: int | None = None
+    events_with_owner_type_role = 0
+    role_linked_event_count = 0
+    motifs_with_role_links = 0
+    emergent_motifs_with_role_links = 0
     motif_type_counts: Counter[str] = Counter()
     motif_type_source_counts: Counter[str] = Counter()
     unknown_motif_event_count = 0
     total_future_option_event_count = len(rows)
+    for row in rows:
+        if str(row.get("owner_type") or "") == "role":
+            events_with_owner_type_role += 1
     motif_tracker = progress_factory("derive_future_option_motifs motifs", len(selected), "motif", False) if progress_factory else None
     for motif_signature in selected:
         group = groups[motif_signature]
@@ -614,6 +623,8 @@ def derive_future_option_motifs(
         linked_carrier_count = len(group["carriers"])
         linked_role_count = len(group["roles"])
         linked_concept_count = len(group["concepts"])
+        if linked_role_count > 0:
+            motifs_with_role_links += 1
         cross_context_count = len(group["contexts"])
         cross_game_count = len(group["games"])
         mean_option_delta = _mean([row.get("option_delta") for row in events])
@@ -679,6 +690,8 @@ def derive_future_option_motifs(
         )
         if is_emergent:
             emergent_count += 1
+            if linked_role_count > 0:
+                emergent_motifs_with_role_links += 1
             if group["first_seen"] is not None:
                 first_emergent_step = group["first_seen"] if first_emergent_step is None else min(first_emergent_step, int(group["first_seen"]))
         for row in events:
@@ -715,6 +728,10 @@ def derive_future_option_motifs(
             else None
         ),
         "first_emergent_future_option_motif_step": first_emergent_step,
+        "events_with_owner_type_role": events_with_owner_type_role,
+        "role_linked_event_count": role_linked_event_count,
+        "motifs_with_role_links": motifs_with_role_links,
+        "emergent_motifs_with_role_links": emergent_motifs_with_role_links,
     }
 
 
@@ -911,6 +928,8 @@ def derive_future_option_attention_links(state_conn: sqlite3.Connection) -> dict
     )
     high_option_change_count = 0
     high_attention_count = 0
+    raw_high_attention_count = 0
+    calibrated_high_attention_count = 0
     high_both_count = 0
     low_attention_count = 0
     sources_seen: set[str] = set()
@@ -925,6 +944,11 @@ def derive_future_option_attention_links(state_conn: sqlite3.Connection) -> dict
         calibrated_high_attention = 0
         if not attention_calibration_degenerate and percentile_80 is not None and float(percentile_80) > 0.0:
             calibrated_high_attention = int(attention_score >= float(percentile_80))
+        primary_high_attention = (
+            calibrated_high_attention
+            if not attention_calibration_degenerate
+            else int(row.get("raw_high_attention") or row.get("high_attention") or 0)
+        )
         attention_signal_source = str(row.get("attention_signal_source") or "none")
         sources_seen.add(str(row.get("source_label") or "none"))
         state_conn.execute(
@@ -947,7 +971,7 @@ def derive_future_option_attention_links(state_conn: sqlite3.Connection) -> dict
                 memory_priority,
                 contradiction_score,
                 high_option_change,
-                int(row.get("raw_high_attention") or row.get("high_attention") or 0),
+                primary_high_attention,
                 int(row.get("raw_high_attention") or row.get("high_attention") or 0),
                 calibrated_high_attention,
                 row.get("source_label"),
@@ -962,10 +986,12 @@ def derive_future_option_attention_links(state_conn: sqlite3.Connection) -> dict
         )
         high_option_change_count += high_option_change
         raw_high_attention = int(row.get("raw_high_attention") or row.get("high_attention") or 0)
-        high_attention_count += raw_high_attention
-        if high_option_change and raw_high_attention:
+        raw_high_attention_count += raw_high_attention
+        calibrated_high_attention_count += int(calibrated_high_attention or 0)
+        high_attention_count += int(primary_high_attention or 0)
+        if high_option_change and int(primary_high_attention or 0):
             high_both_count += 1
-        if not high_option_change and raw_high_attention:
+        if not high_option_change and int(primary_high_attention or 0):
             low_attention_count += 1
     low_option_change_count = max(0, len(rows) - high_option_change_count)
     high_rate = (high_both_count / high_option_change_count) if high_option_change_count else None
@@ -1005,6 +1031,9 @@ def derive_future_option_attention_links(state_conn: sqlite3.Connection) -> dict
             "attention_calibration_degenerate": attention_calibration_degenerate,
             "attention_threshold_p80": percentile_80,
             "attention_threshold_p50": percentile_50,
+            "raw_high_attention_count": raw_high_attention_count,
+            "calibrated_high_attention_count": calibrated_high_attention_count,
+            "attention_primary_signal": "raw_fallback" if attention_calibration_degenerate else "calibrated",
             "h10_live_rows_used": sum(1 for row in rows if str(row.get("source_label")) == "live"),
             "h10_heuristic_rows_used": sum(1 for row in rows if str(row.get("source_label")) == "heuristic"),
             "h10_fallback_reason": h10_fallback_reason,
@@ -1057,17 +1086,31 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
     emergent_success_numer = 0
     emergent_success_denom = 0
     emergent_strong_numer = 0
+    motifs_seen_for_transfer = 0
+    motifs_skipped_no_role_links = 0
+    motifs_with_role_links_for_transfer = 0
+    roles_seen_from_motif_links = 0
+    roles_with_transfer_attempts = 0
+    roles_with_concepts = 0
     for motif_signature in sorted(motif_links):
+        motifs_seen_for_transfer += 1
         is_emergent_motif = int(motif_emergence.get(motif_signature, 0)) == 1
         roles = sorted(motif_links[motif_signature].get("role", set()))
         if not roles:
+            motifs_skipped_no_role_links += 1
             continue
+        motifs_with_role_links_for_transfer += 1
+        roles_seen_from_motif_links += len(roles)
         motif_had_transfer = False
         motif_had_strong = False
         motif_had_promoted = False
         for role_signature in roles:
             concepts = sorted(concepts_by_role.get(role_signature, set()) or {"__none__"})
             role_transfer_rows = transfers_by_role.get(role_signature, [])
+            if role_transfer_rows:
+                roles_with_transfer_attempts += 1
+            if role_signature in concepts_by_role:
+                roles_with_concepts += 1
             for concept_signature in concepts:
                 transfer_attempt_count = len(role_transfer_rows)
                 successful_transfer_count = sum(1 for row in role_transfer_rows if int(row["reuse_success"] or 0) == 1)
@@ -1142,6 +1185,12 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
         "emergent_motifs_with_promoted_concept_count": emergent_motifs_with_promoted_concept,
         "emergent_motif_transfer_success_rate": (emergent_success_numer / emergent_success_denom) if emergent_success_denom else None,
         "emergent_motif_strong_transfer_success_rate": (emergent_strong_numer / emergent_success_denom) if emergent_success_denom else None,
+        "motifs_seen_for_transfer": motifs_seen_for_transfer,
+        "motifs_skipped_no_role_links": motifs_skipped_no_role_links,
+        "motifs_with_role_links_for_transfer": motifs_with_role_links_for_transfer,
+        "roles_seen_from_motif_links": roles_seen_from_motif_links,
+        "roles_with_transfer_attempts": roles_with_transfer_attempts,
+        "roles_with_concepts": roles_with_concepts,
     }
 
 

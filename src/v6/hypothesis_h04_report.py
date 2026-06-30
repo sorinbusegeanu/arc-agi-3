@@ -89,6 +89,14 @@ def evaluate_h04_carrier_emergence(
             FROM carrier_links
             """
         ).fetchall()
+        latest_graph_epoch_summary = state_conn.execute(
+            """
+            SELECT *
+            FROM graph_epoch_summary
+            ORDER BY global_step_end DESC
+            LIMIT 1
+            """
+        ).fetchone()
     graph_counts = {
         "carrier_explains_edge_count": 0,
         "carrier_anchors_edge_count": 0,
@@ -248,6 +256,15 @@ def evaluate_h04_carrier_emergence(
             if (graph_counts["carrier_explains_edge_count"] + graph_counts["carrier_anchors_edge_count"]) > 0
             else 0.0
         ),
+        "latest_graph_epoch_edges_attempted": None if latest_graph_epoch_summary is None else int(latest_graph_epoch_summary["graph_edges_attempted"] or 0),
+        "latest_graph_epoch_edges_written": None if latest_graph_epoch_summary is None else int(latest_graph_epoch_summary["graph_edges_written"] or 0),
+        "latest_graph_epoch_edges_pruned_by_post_merge_fold_cap": None if latest_graph_epoch_summary is None else int(latest_graph_epoch_summary["graph_edges_pruned_by_post_merge_fold_cap"] or 0),
+        "latest_graph_epoch_edges_pruned_by_post_merge_source_cap": None if latest_graph_epoch_summary is None else int(latest_graph_epoch_summary["graph_edges_pruned_by_post_merge_source_cap"] or 0),
+        "latest_graph_epoch_edges_pruned_by_post_merge_carrier_cap": None if latest_graph_epoch_summary is None else int(latest_graph_epoch_summary["graph_edges_pruned_by_post_merge_carrier_cap"] or 0),
+        "latest_graph_epoch_edges_pruned_by_post_merge_family_cap": None if latest_graph_epoch_summary is None else int(latest_graph_epoch_summary["graph_edges_pruned_by_post_merge_family_cap"] or 0),
+        "cumulative_graph_edge_count_from_epoch_summary": None if latest_graph_epoch_summary is None else int(latest_graph_epoch_summary["cumulative_graph_edge_count"] or 0),
+        "h04_graph_scope": "cumulative",
+        "h04_epoch_graph_summary_available": bool(latest_graph_epoch_summary is not None),
         **graph_counts,
     }
     carrier_count = max(1, int(metrics.get("carrier_candidate_count") or 0))

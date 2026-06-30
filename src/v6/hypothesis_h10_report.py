@@ -43,6 +43,12 @@ def _subtest_result(rows: list[dict[str, Any]], score_key: str, threshold: float
     }
 
 
+def _attention_flag(row: dict[str, Any]) -> int:
+    if "calibrated_high_attention" in row and row.get("calibrated_high_attention") is not None:
+        return int(row.get("calibrated_high_attention") or 0)
+    return int(row.get("high_attention") or 0)
+
+
 def evaluate_h10_future_option_attention(
     *,
     memory_dir: Path,
@@ -84,11 +90,14 @@ def evaluate_h10_future_option_attention(
         future_option_event_count = int(conn.execute("SELECT COUNT(*) FROM future_option_events").fetchone()[0])
     high_rows = [row for row in rows if int(row["high_option_change"] or 0) == 1]
     low_rows = [row for row in rows if int(row["high_option_change"] or 0) == 0]
-    high_attention_rows = [row for row in rows if int(row["high_attention"] or 0) == 1]
-    high_both = [row for row in high_rows if int(row["high_attention"] or 0) == 1]
-    low_attention = [row for row in low_rows if int(row["high_attention"] or 0) == 1]
+    high_attention_rows = [row for row in rows if _attention_flag(row) == 1]
+    high_both = [row for row in high_rows if _attention_flag(row) == 1]
+    low_attention = [row for row in low_rows if _attention_flag(row) == 1]
     high_rate = (len(high_both) / len(high_rows)) if high_rows else None
     low_rate = (len(low_attention) / len(low_rows)) if low_rows else None
+    raw_high_attention_count = sum(1 for row in rows if int(row.get("raw_high_attention") or row.get("high_attention") or 0) == 1)
+    calibrated_high_attention_count = sum(1 for row in rows if int(row.get("calibrated_high_attention") or 0) == 1)
+    attention_primary_signal = "raw_fallback" if any(int(row.get("attention_calibration_degenerate") or 0) == 1 for row in rows) else "calibrated"
     lift_unbounded = False
     lift = None
     if high_rows:
@@ -132,6 +141,9 @@ def evaluate_h10_future_option_attention(
             "mixed"
         ),
         "high_attention_count": len(high_attention_rows),
+        "raw_high_attention_count": raw_high_attention_count,
+        "calibrated_high_attention_count": calibrated_high_attention_count,
+        "attention_primary_signal": attention_primary_signal,
         "high_option_change_attention_count": len(high_both),
         "low_option_change_attention_count": len(low_attention),
         "high_option_change_attention_rate": high_rate,
@@ -195,9 +207,9 @@ def evaluate_h10_future_option_attention(
             "Attention signal is saturated all-low; selective attention is not demonstrated."
         )
     elif result["attention_calibration_degenerate"]:
-        result["decision"] = "PARTIALLY_VALID"
+        result["decision"] = "INSUFFICIENT_EVIDENCE"
         result["missing_evidence"].append(
-            "Attention calibration is degenerate because attention scores do not separate the evaluated interactions."
+            "Calibrated attention is degenerate; selective future-option attention cannot be evaluated."
         )
     elif (
         result["option_attention_lift_unbounded"] is True
@@ -246,6 +258,9 @@ def evaluate_h10_future_option_attention(
             "high_option_change_count",
             "high_option_change_source",
             "high_attention_count",
+            "raw_high_attention_count",
+            "calibrated_high_attention_count",
+            "attention_primary_signal",
             "high_option_change_attention_count",
             "low_option_change_attention_count",
             "high_option_change_attention_rate",
@@ -301,6 +316,7 @@ def _write(output_dir: Path, result: dict[str, Any]) -> None:
         f"H10 fallback reason: {result.get('h10_fallback_reason')}\n"
         f"null future-option deltas: {result.get('null_future_option_delta_count')}\n"
         f"high-option-change source: {result.get('high_option_change_source')}\n"
+        f"attention primary signal: {result.get('attention_primary_signal')}\n"
         f"option-attention lift: {result.get('option_attention_lift')}\n"
         f"high-option-change attention rate: {result.get('high_option_change_attention_rate')}\n"
         f"low-option-change attention rate: {result.get('low_option_change_attention_rate')}\n"
@@ -309,6 +325,8 @@ def _write(output_dir: Path, result: dict[str, Any]) -> None:
         f"attention all-high saturation: {result.get('attention_all_high_saturation')}\n"
         f"attention all-low saturation: {result.get('attention_all_low_saturation')}\n"
         f"attention saturation: {result.get('attention_saturation')}\n"
+        f"raw high attention count: {result.get('raw_high_attention_count')}\n"
+        f"calibrated high attention count: {result.get('calibrated_high_attention_count')}\n"
         f"replay attention count: {result.get('replay_attention_count')}\n"
         f"replay attention saturation: {result.get('replay_attention_saturation')}\n"
         f"contradiction attention count: {result.get('contradiction_attention_count')}\n"

@@ -70,6 +70,10 @@ def evaluate_h11_future_option_transfer_concepts(
         future_option_motif_count = int(conn.execute("SELECT COUNT(*) FROM future_option_motifs").fetchone()[0])
         successful_role_transfer_count = int(conn.execute("SELECT COUNT(*) FROM role_transfer_attempts WHERE COALESCE(reuse_success, 0) = 1").fetchone()[0])
         promoted_concept_count = int(conn.execute("SELECT COUNT(*) FROM concept_candidates WHERE COALESCE(is_promoted, 0) = 1").fetchone()[0])
+        summary_row = conn.execute(
+            "SELECT value_json FROM memory_summary WHERE key = 'future_option_derivation_summary'"
+        ).fetchone()
+        derivation_summary = json.loads(str(summary_row[0])) if summary_row and summary_row[0] else {}
     motifs_with_transfer = len({str(row["motif_signature"]) for row in rows if int(row["transfer_attempt_count"] or 0) > 0})
     motifs_with_strong = len({str(row["motif_signature"]) for row in rows if int(row["strong_transfer_success_count"] or 0) > 0})
     motifs_with_promoted = len({str(row["motif_signature"]) for row in rows if int(row["promoted_concept_count"] or 0) > 0})
@@ -112,6 +116,16 @@ def evaluate_h11_future_option_transfer_concepts(
         "promoted_concept_count": promoted_concept_count,
         "h11_blocked_by_no_motifs": bool(future_option_motif_count == 0),
         "h11_blocked_by_no_promoted_concepts": bool(promoted_concept_count == 0),
+        "events_with_owner_type_role": derivation_summary.get("events_with_owner_type_role"),
+        "role_linked_event_count": derivation_summary.get("role_linked_event_count"),
+        "motifs_with_role_links": derivation_summary.get("motifs_with_role_links"),
+        "emergent_motifs_with_role_links": derivation_summary.get("emergent_motifs_with_role_links"),
+        "motifs_seen_for_transfer": derivation_summary.get("motifs_seen_for_transfer"),
+        "motifs_skipped_no_role_links": derivation_summary.get("motifs_skipped_no_role_links"),
+        "motifs_with_role_links_for_transfer": derivation_summary.get("motifs_with_role_links_for_transfer"),
+        "roles_seen_from_motif_links": derivation_summary.get("roles_seen_from_motif_links"),
+        "roles_with_transfer_attempts": derivation_summary.get("roles_with_transfer_attempts"),
+        "roles_with_concepts": derivation_summary.get("roles_with_concepts"),
         "missing_evidence": [],
     }
     if future_option_motif_count == 0:
@@ -143,6 +157,12 @@ def evaluate_h11_future_option_transfer_concepts(
         result["missing_evidence"].append("No transfer/concept links are attached to emergent future-option motifs.")
     if promoted_concept_count == 0 and "No promoted concepts available for motif-concept linkage." not in result["missing_evidence"]:
         result["missing_evidence"].append("No promoted concepts available for motif-concept linkage.")
+    if int(result.get("future_option_transfer_link_count") or 0) == 0 and int(result.get("motifs_skipped_no_role_links") or 0) > 0:
+        result["missing_evidence"].append("No future-option transfer links were produced because motifs lack role links.")
+    if int(result.get("roles_seen_from_motif_links") or 0) > 0 and int(result.get("roles_with_transfer_attempts") or 0) == 0:
+        result["missing_evidence"].append("Future-option motifs have role links, but no matching role-transfer attempts were found.")
+    if int(result.get("roles_with_transfer_attempts") or 0) > 0 and int(result.get("roles_with_concepts") or 0) == 0:
+        result["missing_evidence"].append("Role-transfer evidence exists, but roles are not linked to concepts.")
     result["core_metrics"] = {
         key: result.get(key)
         for key in (
@@ -169,6 +189,16 @@ def evaluate_h11_future_option_transfer_concepts(
             "non_emergent_motifs_with_promoted_concept_count",
             "successful_role_transfer_count",
             "promoted_concept_count",
+            "events_with_owner_type_role",
+            "role_linked_event_count",
+            "motifs_with_role_links",
+            "emergent_motifs_with_role_links",
+            "motifs_seen_for_transfer",
+            "motifs_skipped_no_role_links",
+            "motifs_with_role_links_for_transfer",
+            "roles_seen_from_motif_links",
+            "roles_with_transfer_attempts",
+            "roles_with_concepts",
         )
     }
     _write(output_dir, result)
@@ -186,6 +216,10 @@ def _write(output_dir: Path, result: dict[str, object]) -> None:
         f"motifs with promoted concepts: {result.get('motifs_with_promoted_concept_count')}\n"
         f"emergent motifs with promoted concepts: {result.get('emergent_motifs_with_promoted_concept_count')}\n"
         f"non-emergent motif transfer links: {result.get('non_emergent_motif_transfer_link_count')}\n"
+        f"motifs skipped no role links: {result.get('motifs_skipped_no_role_links')}\n"
+        f"roles seen from motif links: {result.get('roles_seen_from_motif_links')}\n"
+        f"roles with transfer attempts: {result.get('roles_with_transfer_attempts')}\n"
+        f"roles with concepts: {result.get('roles_with_concepts')}\n"
     )
     (output_dir / "h11_future_option_transfer_concepts_report.txt").write_text(text, encoding="utf-8")
     (output_dir / "h11_future_option_transfer_concepts.md").write_text("```\n" + text + "```\n", encoding="utf-8")

@@ -2601,6 +2601,35 @@ def _populate_h03_evidence_lists(result: dict[str, Any]) -> None:
 
 
 def _finalize_h03_result(result: dict[str, Any], output_dir: Path) -> None:
+    result["core_metrics"] = {
+        "transformation_family_count": result.get("transformation_family_count"),
+        "stable_transformation_family_count": result.get("stable_transformation_family_count"),
+        "family_members_count": result.get("family_members_count"),
+        "family_member_count_total": result.get("family_member_count_total"),
+        "compression_ratio": result.get("compression_ratio"),
+        "compression_gain": result.get("compression_gain"),
+        "singleton_family_ratio": result.get("singleton_family_ratio"),
+        "family_cross_game_count": result.get("family_cross_game_count"),
+        "family_cross_sampler_count": result.get("family_cross_sampler_count"),
+        "family_cross_context_count": result.get("family_cross_context_count"),
+        "family_prediction_lift_mean": result.get("family_prediction_lift_mean"),
+        "compact_family_repair_used": result.get("compact_family_repair_used"),
+        "compact_family_repair_reason": result.get("compact_family_repair_reason"),
+    }
+    material_keys = (
+        "transformation_family_count",
+        "family_members_count",
+        "family_member_count_total",
+        "compression_ratio",
+        "compression_gain",
+        "family_prediction_lift_mean",
+    )
+    if result.get("decision") == "VALID" and not any(
+        result["core_metrics"].get(key) not in (None, "", [], {}, ())
+        for key in material_keys
+    ):
+        result["decision"] = "INSUFFICIENT_EVIDENCE"
+        _append_unique(result.setdefault("missing_evidence", []), "H03 produced no core transformation-family metrics.")
     (output_dir / H03_JSON_NAME).write_text(json.dumps(result, indent=2), encoding="utf-8")
     (output_dir / H03_TXT_NAME).write_text(_format_h03_text_report(result), encoding="utf-8")
     (output_dir / H03_MD_NAME).write_text(_format_h03_markdown_report(result), encoding="utf-8")

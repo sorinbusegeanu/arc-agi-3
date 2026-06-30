@@ -111,6 +111,10 @@ def _graph_edge_total_fields() -> dict[str, int]:
         "graph_edges_skipped_by_source_cap": 0,
         "graph_edges_skipped_by_carrier_cap": 0,
         "graph_edges_skipped_by_family_cap": 0,
+        "graph_edges_pruned_by_post_merge_fold_cap": 0,
+        "graph_edges_pruned_by_post_merge_source_cap": 0,
+        "graph_edges_pruned_by_post_merge_carrier_cap": 0,
+        "graph_edges_pruned_by_post_merge_family_cap": 0,
         "graph_edges_attempted": 0,
         "graph_edges_written": 0,
     }
@@ -698,6 +702,7 @@ def fold_epoch_raw_into_compact_memory(
         )
         summary.update(totals)
         summary["fold_summary"] = dict(totals)
+        _write_graph_epoch_summary(state_conn, graph_conn, fold_config, totals)
         _write_memory_summary_table(state_conn, summary)
         paths.summary_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
         state_conn.commit()
@@ -783,6 +788,7 @@ def fold_single_sampling_db_into_main_compact_memory(
                 "global_step_start": int(fold_config.global_step_start),
                 "global_step_end": int(fold_config.global_step_end),
             }
+            _write_graph_epoch_summary(state_conn, graph_conn, fold_config, totals)
             _write_memory_summary_table(state_conn, summary)
             paths.summary_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
         state_conn.commit()
@@ -822,6 +828,7 @@ def finalize_main_compact_memory(
                     "finalize_mode": mode,
                 }
             )
+            _write_graph_epoch_summary(state_conn, graph_conn, fold_config, summary.get("fold_summary", {}))
             _write_memory_summary_table(state_conn, summary)
             paths.summary_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
             state_conn.commit()
@@ -851,6 +858,7 @@ def finalize_main_compact_memory(
             }
         )
         summary["fold_summary"] = existing_fold_summary
+        _write_graph_epoch_summary(state_conn, graph_conn, fold_config, existing_fold_summary)
         _write_memory_summary_table(state_conn, summary)
         paths.summary_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
         state_conn.commit()
@@ -1037,6 +1045,7 @@ def merge_compact_memory_shards_into_main(
             configure_compact_sqlite_connection(state_conn, write=True)
             configure_compact_sqlite_connection(graph_conn, write=True)
             configure_compact_sqlite_connection(replay_conn, write=True)
+            merge_totals = _graph_edge_total_fields()
             iterator = sorted(merged_dirs)
             if progress:
                 iterator = tqdm(iterator, desc=progress_desc, unit="shard", dynamic_ncols=True, leave=True)
@@ -1047,6 +1056,7 @@ def merge_compact_memory_shards_into_main(
                     graph_conn=graph_conn,
                     replay_conn=replay_conn,
                     fold_config=fold_config,
+                    totals=merge_totals,
                 )
             summary = _build_memory_summary_from_connections(
                 state_conn=state_conn,
@@ -1054,11 +1064,13 @@ def merge_compact_memory_shards_into_main(
                 replay_conn=replay_conn,
                 paths=paths,
             )
+            summary.update(merge_totals)
             summary["parallel_sidecar_shard_merge"] = {
                 "merged_shard_count": len(merged_dirs),
                 "shard_dirs": [str(path) for path in merged_dirs],
                 "parallel_workers": int(effective_parallel_workers),
             }
+            _write_graph_epoch_summary(state_conn, graph_conn, fold_config, merge_totals)
             _write_memory_summary_table(state_conn, summary)
             paths.summary_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
             state_conn.commit()
@@ -1133,6 +1145,7 @@ def _merge_compact_memory_dirs_worker(
         configure_compact_sqlite_connection(state_conn, write=True)
         configure_compact_sqlite_connection(graph_conn, write=True)
         configure_compact_sqlite_connection(replay_conn, write=True)
+        merge_totals = _graph_edge_total_fields()
         for shard_dir in sorted(Path(item) for item in shard_dirs):
             _merge_compact_memory_dir_into_main(
                 temp_dir=shard_dir,
@@ -1140,6 +1153,7 @@ def _merge_compact_memory_dirs_worker(
                 graph_conn=graph_conn,
                 replay_conn=replay_conn,
                 fold_config=fold_config,
+                totals=merge_totals,
             )
         summary = _build_memory_summary_from_connections(
             state_conn=state_conn,
@@ -1147,10 +1161,12 @@ def _merge_compact_memory_dirs_worker(
             replay_conn=replay_conn,
             paths=output_paths,
         )
+        summary.update(merge_totals)
         summary["parallel_intermediate_shard_merge"] = {
             "input_shard_count": len(shard_dirs),
             "input_shard_dirs": [str(item) for item in shard_dirs],
         }
+        _write_graph_epoch_summary(state_conn, graph_conn, fold_config, merge_totals)
         _write_memory_summary_table(state_conn, summary)
         output_paths.summary_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
         state_conn.commit()
@@ -1207,6 +1223,7 @@ def _fold_epoch_raw_into_compact_memory_parallel(
                     graph_conn=graph_conn,
                     replay_conn=replay_conn,
                     fold_config=fold_config,
+                    totals=totals,
                 )
             for graph_path in live_graph_paths:
                 _ingest_live_graph_export(graph_conn, graph_path, fold_config, totals=totals)
@@ -1239,6 +1256,7 @@ def _fold_epoch_raw_into_compact_memory_parallel(
             totals["db_files_folded"] = len(db_paths)
             summary.update(totals)
             summary["fold_summary"] = dict(totals)
+            _write_graph_epoch_summary(state_conn, graph_conn, fold_config, totals)
             _write_memory_summary_table(state_conn, summary)
             paths.summary_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
             state_conn.commit()
@@ -1303,6 +1321,7 @@ def _fold_db_chunk_worker(db_paths: list[str], temp_memory_dir: str, fold_config
         totals["graph_edge_count"] = int(summary.get("graph_edge_count", 0) or 0)
         summary.update(totals)
         summary["fold_summary"] = dict(totals)
+        _write_graph_epoch_summary(state_conn, graph_conn, fold_config, totals)
         _write_memory_summary_table(state_conn, summary)
         temp_paths.summary_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
         state_conn.commit()
@@ -1877,6 +1896,223 @@ def _detach_shard_database(conn: sqlite3.Connection, alias: str) -> None:
     conn.execute(f"DETACH DATABASE {alias}")
 
 
+def _delete_edges(graph_conn: sqlite3.Connection, edge_ids: list[str]) -> int:
+    if not edge_ids:
+        return 0
+    graph_conn.executemany(
+        "DELETE FROM graph_edges WHERE edge_id = ?",
+        [(edge_id,) for edge_id in edge_ids],
+    )
+    return len(edge_ids)
+
+
+def _prune_edges_per_source(
+    graph_conn: sqlite3.Connection,
+    *,
+    limit: int,
+    totals: dict[str, Any] | None,
+    counter_name: str,
+) -> None:
+    if limit <= 0:
+        return
+    sources = graph_conn.execute(
+        """
+        SELECT source_node_id
+        FROM graph_edges
+        GROUP BY source_node_id
+        HAVING COUNT(*) > ?
+        """,
+        (limit,),
+    ).fetchall()
+    pruned = 0
+    for (source_node_id,) in sources:
+        rows = graph_conn.execute(
+            """
+            SELECT edge_id
+            FROM graph_edges
+            WHERE source_node_id = ?
+            ORDER BY
+                support_count DESC,
+                weight DESC,
+                last_seen_global_step DESC,
+                edge_id ASC
+            LIMIT -1 OFFSET ?
+            """,
+            (source_node_id, limit),
+        ).fetchall()
+        pruned += _delete_edges(graph_conn, [str(row[0]) for row in rows])
+    if totals is not None:
+        totals[counter_name] = int(totals.get(counter_name, 0) or 0) + pruned
+
+
+def _prune_edges_by_source_prefix(
+    graph_conn: sqlite3.Connection,
+    *,
+    source_prefix: str,
+    limit: int,
+    edge_types: tuple[str, ...] | None,
+    totals: dict[str, Any] | None,
+    counter_name: str,
+) -> None:
+    if limit <= 0:
+        return
+    type_filter = ""
+    params: list[Any] = [f"{source_prefix}%"]
+    if edge_types:
+        placeholders = ",".join("?" for _ in edge_types)
+        type_filter = f"AND edge_type IN ({placeholders})"
+        params.extend(edge_types)
+    sources = graph_conn.execute(
+        f"""
+        SELECT source_node_id
+        FROM graph_edges
+        WHERE source_node_id LIKE ?
+        {type_filter}
+        GROUP BY source_node_id
+        HAVING COUNT(*) > ?
+        """,
+        tuple(params + [limit]),
+    ).fetchall()
+    pruned = 0
+    for (source_node_id,) in sources:
+        edge_params: list[Any] = [source_node_id]
+        edge_type_filter = ""
+        if edge_types:
+            placeholders = ",".join("?" for _ in edge_types)
+            edge_type_filter = f"AND edge_type IN ({placeholders})"
+            edge_params.extend(edge_types)
+        rows = graph_conn.execute(
+            f"""
+            SELECT edge_id
+            FROM graph_edges
+            WHERE source_node_id = ?
+            {edge_type_filter}
+            ORDER BY
+                support_count DESC,
+                weight DESC,
+                last_seen_global_step DESC,
+                edge_id ASC
+            LIMIT -1 OFFSET ?
+            """,
+            tuple(edge_params + [limit]),
+        ).fetchall()
+        pruned += _delete_edges(graph_conn, [str(row[0]) for row in rows])
+    if totals is not None:
+        totals[counter_name] = int(totals.get(counter_name, 0) or 0) + pruned
+
+
+def _enforce_graph_caps_after_merge(
+    graph_conn: sqlite3.Connection,
+    fold_config: CompactMemoryFoldConfig,
+    totals: dict[str, Any] | None = None,
+) -> None:
+    if not bool(fold_config.enable_graph_edge_caps):
+        return
+    max_total = int(fold_config.max_graph_edges_per_fold)
+    if max_total > 0:
+        rows = graph_conn.execute(
+            """
+            SELECT edge_id
+            FROM graph_edges
+            ORDER BY
+                support_count DESC,
+                weight DESC,
+                last_seen_global_step DESC,
+                edge_id ASC
+            LIMIT -1 OFFSET ?
+            """,
+            (max_total,),
+        ).fetchall()
+        delete_ids = [str(row[0]) for row in rows]
+        if delete_ids:
+            _delete_edges(graph_conn, delete_ids)
+            if totals is not None:
+                totals["graph_edges_pruned_by_post_merge_fold_cap"] = (
+                    int(totals.get("graph_edges_pruned_by_post_merge_fold_cap", 0) or 0)
+                    + len(delete_ids)
+                )
+    _prune_edges_per_source(
+        graph_conn,
+        limit=int(fold_config.max_edges_per_source_node),
+        totals=totals,
+        counter_name="graph_edges_pruned_by_post_merge_source_cap",
+    )
+    _prune_edges_by_source_prefix(
+        graph_conn,
+        source_prefix="carrier:",
+        limit=int(fold_config.max_edges_per_carrier),
+        edge_types=("explains", "anchors", "appears_in"),
+        totals=totals,
+        counter_name="graph_edges_pruned_by_post_merge_carrier_cap",
+    )
+    _prune_edges_by_source_prefix(
+        graph_conn,
+        source_prefix="family:",
+        limit=int(fold_config.max_edges_per_family),
+        edge_types=None,
+        totals=totals,
+        counter_name="graph_edges_pruned_by_post_merge_family_cap",
+    )
+
+
+def _write_graph_epoch_summary(
+    state_conn: sqlite3.Connection,
+    graph_conn: sqlite3.Connection,
+    fold_config: CompactMemoryFoldConfig,
+    totals: dict[str, Any],
+) -> None:
+    epoch_key = f"{int(fold_config.global_step_start)}:{int(fold_config.global_step_end)}"
+    cumulative_nodes = int(graph_conn.execute("SELECT COUNT(*) FROM graph_nodes").fetchone()[0] or 0)
+    cumulative_edges = int(graph_conn.execute("SELECT COUNT(*) FROM graph_edges").fetchone()[0] or 0)
+    state_conn.execute(
+        """
+        INSERT INTO graph_epoch_summary (
+            epoch_key, global_step_start, global_step_end,
+            graph_edges_attempted, graph_edges_written,
+            graph_edges_skipped_by_fold_cap, graph_edges_skipped_by_source_cap,
+            graph_edges_skipped_by_carrier_cap, graph_edges_skipped_by_family_cap,
+            graph_edges_pruned_by_post_merge_fold_cap,
+            graph_edges_pruned_by_post_merge_source_cap,
+            graph_edges_pruned_by_post_merge_carrier_cap,
+            graph_edges_pruned_by_post_merge_family_cap,
+            cumulative_graph_node_count, cumulative_graph_edge_count, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        ON CONFLICT(epoch_key) DO UPDATE SET
+            graph_edges_attempted = excluded.graph_edges_attempted,
+            graph_edges_written = excluded.graph_edges_written,
+            graph_edges_skipped_by_fold_cap = excluded.graph_edges_skipped_by_fold_cap,
+            graph_edges_skipped_by_source_cap = excluded.graph_edges_skipped_by_source_cap,
+            graph_edges_skipped_by_carrier_cap = excluded.graph_edges_skipped_by_carrier_cap,
+            graph_edges_skipped_by_family_cap = excluded.graph_edges_skipped_by_family_cap,
+            graph_edges_pruned_by_post_merge_fold_cap = excluded.graph_edges_pruned_by_post_merge_fold_cap,
+            graph_edges_pruned_by_post_merge_source_cap = excluded.graph_edges_pruned_by_post_merge_source_cap,
+            graph_edges_pruned_by_post_merge_carrier_cap = excluded.graph_edges_pruned_by_post_merge_carrier_cap,
+            graph_edges_pruned_by_post_merge_family_cap = excluded.graph_edges_pruned_by_post_merge_family_cap,
+            cumulative_graph_node_count = excluded.cumulative_graph_node_count,
+            cumulative_graph_edge_count = excluded.cumulative_graph_edge_count,
+            created_at = excluded.created_at
+        """,
+        (
+            epoch_key,
+            int(fold_config.global_step_start),
+            int(fold_config.global_step_end),
+            int(totals.get("graph_edges_attempted", 0) or 0),
+            int(totals.get("graph_edges_written", 0) or 0),
+            int(totals.get("graph_edges_skipped_by_fold_cap", 0) or 0),
+            int(totals.get("graph_edges_skipped_by_source_cap", 0) or 0),
+            int(totals.get("graph_edges_skipped_by_carrier_cap", 0) or 0),
+            int(totals.get("graph_edges_skipped_by_family_cap", 0) or 0),
+            int(totals.get("graph_edges_pruned_by_post_merge_fold_cap", 0) or 0),
+            int(totals.get("graph_edges_pruned_by_post_merge_source_cap", 0) or 0),
+            int(totals.get("graph_edges_pruned_by_post_merge_carrier_cap", 0) or 0),
+            int(totals.get("graph_edges_pruned_by_post_merge_family_cap", 0) or 0),
+            cumulative_nodes,
+            cumulative_edges,
+        ),
+    )
+
+
 def _merge_compact_memory_dir_into_main(
     *,
     temp_dir: Path,
@@ -1884,11 +2120,13 @@ def _merge_compact_memory_dir_into_main(
     graph_conn: sqlite3.Connection,
     replay_conn: sqlite3.Connection,
     fold_config: CompactMemoryFoldConfig,
+    totals: dict[str, Any] | None = None,
 ) -> None:
     temp_paths = ensure_memory_layout(temp_dir)
     if bool(fold_config.use_set_based_merge):
         _merge_state_tables_set_based(temp_paths.current_state, state_conn, fold_config)
         _merge_graph_tables_set_based(temp_paths.graph, graph_conn, fold_config)
+        _enforce_graph_caps_after_merge(graph_conn, fold_config, totals=totals)
         _merge_replay_queue_set_based(temp_paths.replay_queue, replay_conn)
         return
     with (
@@ -5184,6 +5422,24 @@ def _ensure_current_state_schema(path: Path) -> None:
                 last_seen_global_step INTEGER,
                 PRIMARY KEY (motif_signature, role_signature, concept_signature)
             );
+            CREATE TABLE IF NOT EXISTS graph_epoch_summary (
+                epoch_key TEXT PRIMARY KEY,
+                global_step_start INTEGER,
+                global_step_end INTEGER,
+                graph_edges_attempted INTEGER DEFAULT 0,
+                graph_edges_written INTEGER DEFAULT 0,
+                graph_edges_skipped_by_fold_cap INTEGER DEFAULT 0,
+                graph_edges_skipped_by_source_cap INTEGER DEFAULT 0,
+                graph_edges_skipped_by_carrier_cap INTEGER DEFAULT 0,
+                graph_edges_skipped_by_family_cap INTEGER DEFAULT 0,
+                graph_edges_pruned_by_post_merge_fold_cap INTEGER DEFAULT 0,
+                graph_edges_pruned_by_post_merge_source_cap INTEGER DEFAULT 0,
+                graph_edges_pruned_by_post_merge_carrier_cap INTEGER DEFAULT 0,
+                graph_edges_pruned_by_post_merge_family_cap INTEGER DEFAULT 0,
+                cumulative_graph_node_count INTEGER DEFAULT 0,
+                cumulative_graph_edge_count INTEGER DEFAULT 0,
+                created_at TEXT
+            );
             CREATE INDEX IF NOT EXISTS idx_role_links_type_key
             ON role_links(linked_type, linked_key);
             CREATE INDEX IF NOT EXISTS idx_carrier_links_signature_type_key
@@ -5218,6 +5474,8 @@ def _ensure_current_state_schema(path: Path) -> None:
             ON future_option_links(linked_type, linked_key);
             CREATE INDEX IF NOT EXISTS idx_future_option_links_motif_type_key
             ON future_option_links(motif_signature, linked_type, linked_key);
+            CREATE INDEX IF NOT EXISTS idx_graph_epoch_summary_steps
+            ON graph_epoch_summary(global_step_start, global_step_end);
             CREATE INDEX IF NOT EXISTS idx_future_option_attention_flags
             ON future_option_attention_links(high_option_change, high_attention);
             CREATE INDEX IF NOT EXISTS idx_future_option_transfer_motif
