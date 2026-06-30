@@ -3519,26 +3519,42 @@ def _fold_single_db(
                     ),
                 )
         if "interactions" in tables:
-            for row in raw_conn.execute(
-                """
+            interaction_columns = {str(row[1]) for row in raw_conn.execute("PRAGMA table_info(interactions)").fetchall()}
+            interaction_select_map = {
+                "id": "id",
+                "game_id": "game_id" if "game_id" in interaction_columns else f"'{game}' AS game_id",
+                "level_id": "level_id" if "level_id" in interaction_columns else "NULL AS level_id",
+                "sampler_name": "sampler_name" if "sampler_name" in interaction_columns else f"'{sampler}' AS sampler_name",
+                "episode_id": "episode_id" if "episode_id" in interaction_columns else "NULL AS episode_id",
+                "global_step": "global_step" if "global_step" in interaction_columns else "id AS global_step",
+                "outcome_state": "outcome_state" if "outcome_state" in interaction_columns else "NULL AS outcome_state",
+                "level_completed_event": (
+                    "level_completed_event" if "level_completed_event" in interaction_columns else "0 AS level_completed_event"
+                ),
+                "state_hash_before": "state_hash_before" if "state_hash_before" in interaction_columns else "NULL AS state_hash_before",
+                "state_hash_after": "state_hash_after" if "state_hash_after" in interaction_columns else "NULL AS state_hash_after",
+                "action": "action" if "action" in interaction_columns else "NULL AS action",
+                "efficiency_no_effect_action": (
+                    "efficiency_no_effect_action"
+                    if "efficiency_no_effect_action" in interaction_columns
+                    else "0 AS efficiency_no_effect_action"
+                ),
+                "efficiency_future_option_gain_per_cost": (
+                    "efficiency_future_option_gain_per_cost"
+                    if "efficiency_future_option_gain_per_cost" in interaction_columns
+                    else "NULL AS efficiency_future_option_gain_per_cost"
+                ),
+            }
+            interaction_select_sql = ",\n                    ".join(interaction_select_map.values())
+            interaction_rows = raw_conn.execute(
+                f"""
                 SELECT
-                    id,
-                    game_id,
-                    level_id,
-                    sampler_name,
-                    episode_id,
-                    global_step,
-                    outcome_state,
-                    level_completed_event,
-                    state_hash_before,
-                    state_hash_after,
-                    action,
-                    efficiency_no_effect_action,
-                    efficiency_future_option_gain_per_cost
+                    {interaction_select_sql}
                 FROM interactions
                 ORDER BY COALESCE(global_step, id) ASC, id ASC
                 """
-            ).fetchall():
+            ).fetchall()
+            for row in interaction_rows:
                 scoped_interaction_id = _scope_raw_local_id("interaction", row["id"], db_path)
                 state_conn.execute(
                     """

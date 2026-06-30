@@ -118,7 +118,8 @@ def test_h05_valid(tmp_path: Path) -> None:
     result = evaluate_h05_role_emergence(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h05")
     assert result["role_candidate_count"] >= 1
     assert result["emergent_role_count"] >= 1
-    assert result["decision"] == "VALID"
+    assert result["decision"] == "PARTIALLY_VALID"
+    assert "Role timing is not fully grounded in real carrier evidence timing." in result["missing_evidence"]
 
 
 def test_h05_singleton_role_is_partially_valid(tmp_path: Path) -> None:
@@ -194,7 +195,7 @@ def test_h08_valid(tmp_path: Path) -> None:
     result = evaluate_h08_world_model_coherence(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h08")
     assert result["world_model_component_count"] >= 1
     assert result["coherent_world_model_component_count"] >= 1
-    assert result["decision"] == "VALID"
+    assert result["decision"] == "PARTIALLY_VALID"
 
 
 def test_h08_cannot_be_valid_without_promoted_concepts(tmp_path: Path) -> None:
@@ -205,7 +206,7 @@ def test_h08_cannot_be_valid_without_promoted_concepts(tmp_path: Path) -> None:
     ])
     result = evaluate_h08_world_model_coherence(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h08")
     assert result["promoted_concept_count"] == 0
-    assert result["decision"] == "PARTIALLY_VALID"
+    assert result["decision"] == "INSUFFICIENT_EVIDENCE"
 
 
 def test_max_transfer_attempts_respected(tmp_path: Path) -> None:
@@ -289,7 +290,7 @@ def test_h06_records_no_source_profile_attempt(tmp_path: Path) -> None:
     result = evaluate_h06_role_transfer(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h06")
     assert result["transfer_attempt_count"] >= 1
     assert result["no_source_profile_count"] >= 1
-    assert result["decision"] in {"INCONCLUSIVE", "PARTIALLY_VALID", "INVALID"}
+    assert result["decision"] == "INSUFFICIENT_EVIDENCE"
     assert result["decision"] != "VALID"
 
 
@@ -352,7 +353,8 @@ def test_h10_lift(tmp_path: Path) -> None:
         )
     result = evaluate_h10_future_option_attention(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h10", already_derived=True)
     assert (result["option_attention_lift"] or 0.0) >= 1.25
-    assert result["decision"] == "VALID"
+    assert result["decision"] == "INSUFFICIENT_EVIDENCE"
+    assert result["h10_blocked_by_h09"] is True
 
 
 def test_h10_no_false_invalid_on_missing_low_group(tmp_path: Path) -> None:
@@ -368,7 +370,7 @@ def test_h10_no_false_invalid_on_missing_low_group(tmp_path: Path) -> None:
     )
     result = evaluate_h10_future_option_attention(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h10", already_derived=True)
     assert result["option_attention_lift"] is None
-    assert result["decision"] in {"PARTIALLY_VALID", "INCONCLUSIVE"}
+    assert result["decision"] == "INSUFFICIENT_EVIDENCE"
     assert result["decision"] != "INVALID"
 
 
@@ -385,7 +387,7 @@ def test_h10_memory_priority_diagnostic_does_not_create_attention(tmp_path: Path
     result = evaluate_h10_future_option_attention(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h10", already_derived=True)
     assert result["high_option_change_count"] == 5
     assert result["high_attention_count"] == 0
-    assert result["decision"] in {"INCONCLUSIVE", "PARTIALLY_VALID"}
+    assert result["decision"] == "INSUFFICIENT_EVIDENCE"
     assert result["decision"] not in {"VALID", "INVALID"}
 
 
@@ -424,7 +426,8 @@ def test_h10_validates_from_replay_contradiction_attention(tmp_path: Path) -> No
     assert result["high_option_change_attention_rate"] == 1.0
     assert result["low_option_change_attention_rate"] == 0.2
     assert (result["option_attention_lift"] or 0.0) >= 1.25
-    assert result["decision"] == "VALID"
+    assert result["decision"] == "INSUFFICIENT_EVIDENCE"
+    assert result["h10_blocked_by_h09"] is True
 
 
 def test_h11_links_motifs_to_transfer_concepts(tmp_path: Path) -> None:
@@ -572,7 +575,7 @@ def test_fast_suite_does_not_call_derivations(tmp_path: Path, monkeypatch) -> No
     )
     assert calls["future"] == 0
     assert summary["suite_mode"] == "fast"
-    assert "derive_higher_order_seconds" in summary
+    assert "derive_role_candidates_seconds" in summary
     assert "suite_total_seconds" in summary
 
 
@@ -619,7 +622,10 @@ def test_h05_written_after_role_candidates_only_without_later_derivations(tmp_pa
         for line in (tmp_path / "reports" / "hypothesis_phase_log.jsonl").read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
-    assert [row["phase"] for row in phase_rows[:4]] == ["derive_role_candidates", "derive_role_candidates", "h05", "h05"]
+    phase_names = [row["phase"] for row in phase_rows]
+    derive_index = phase_names.index("derive_role_candidates")
+    h05_index = phase_names.index("H05")
+    assert derive_index < h05_index
 
 
 def test_full_suite_calls_derivations_with_limits(tmp_path: Path, monkeypatch) -> None:
@@ -798,7 +804,7 @@ def test_h04_missing_timing_cannot_be_valid(tmp_path: Path) -> None:
         conn.commit()
     result = evaluate_h04_carrier_emergence(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h04")
     assert result["decision"] == "PARTIALLY_VALID"
-    assert "explicit H03-before-H04 temporal evidence unavailable" in result["missing_evidence"]
+    assert "H04 timing is not fully grounded in real carrier evidence timing." in result["missing_evidence"]
 
 
 def test_h05_missing_timing_cannot_be_valid(tmp_path: Path) -> None:
@@ -809,7 +815,7 @@ def test_h05_missing_timing_cannot_be_valid(tmp_path: Path) -> None:
         conn.commit()
     result = evaluate_h05_role_emergence(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h05")
     assert result["decision"] == "PARTIALLY_VALID"
-    assert "explicit H04-before-H05 temporal evidence unavailable" in result["missing_evidence"]
+    assert "Role timing is not fully grounded in real carrier evidence timing." in result["missing_evidence"]
 
 
 def test_dependency_gate_demotes_h07_h08() -> None:

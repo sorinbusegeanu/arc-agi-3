@@ -15,8 +15,8 @@ def _build_memory(memory_dir: Path, *, fallback_only: bool = False) -> None:
             """
             INSERT INTO carrier_candidates (
                 carrier_id, carrier_signature, carrier_source, support_count, linked_family_count,
-                first_seen_global_step, last_seen_global_step, stability_score, is_emergent
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                first_seen_global_step, last_seen_global_step, stability_score, is_emergent, carrier_timing_source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 "carrier-a",
@@ -24,10 +24,11 @@ def _build_memory(memory_dir: Path, *, fallback_only: bool = False) -> None:
                 "context_action_fallback" if fallback_only else "object",
                 4,
                 2,
-                5,
+                8,
                 10,
                 0.5,
                 1,
+                "real_evidence",
             ),
         )
         connection.execute(
@@ -66,6 +67,7 @@ def test_h04_returns_partially_valid_or_valid_from_compact_memory(tmp_path: Path
     assert result["core_metrics"]["carrier_candidate_count"] == 1
     assert result["core_metrics"]["carrier_cross_family_count"] >= 2
     assert result["core_metrics"]["carrier_cross_context_count"] >= 2
+    assert result["core_metrics"]["carrier_timing_source"] == "real_evidence"
     assert (tmp_path / "out" / "h04_carrier_emergence_report.json").exists()
 
 

@@ -102,7 +102,7 @@ def test_h03_report_exists_but_no_db_or_artifacts_is_inconclusive(tmp_path: Path
     assert result["decision"] == "INCONCLUSIVE"
 
 
-def test_h03_non_singleton_family_compression_can_be_valid(tmp_path: Path) -> None:
+def test_h03_non_singleton_family_compression_without_prediction_lift_is_partial(tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
     out_dir = tmp_path / "out"
     run_dir.mkdir()
@@ -123,7 +123,8 @@ def test_h03_non_singleton_family_compression_can_be_valid(tmp_path: Path) -> No
     assert result["transformation_family_count"] == 2
     assert result["compression_ratio"] > 1.0
     assert result["compression_gain"] > 0.0
-    assert result["decision"] == "VALID"
+    assert result["decision"] == "PARTIALLY_VALID"
+    assert "prediction-lift evidence is unavailable" in " ".join(result.get("missing_evidence", []))
 
 
 def test_h03_all_singleton_families_is_invalid(tmp_path: Path) -> None:
