@@ -3128,6 +3128,16 @@ def _predict_transfer_attempt(
     source_carriers = tuple(str(value) for value in best.get("source_carrier_signatures", ()))
     source_games = tuple(str(value) for value in best.get("source_game_keys", ()))
     source_contexts = tuple(str(value) for value in best.get("source_context_keys", ()))
+    # A profile can still match structurally while lacking the concrete scope
+    # required to make the requested transfer claim.  Treat it as an
+    # unusable source profile instead of manufacturing a source identity or
+    # letting the worker abort on the persistence validation below.
+    if transfer_kind == "cross_game" and not source_games:
+        return _no_source_profile_attempt(target, transfer_kind, target_scope_key)
+    if transfer_kind == "cross_context":
+        source_contexts = tuple(value for value in source_contexts if value != str(target_scope_key))
+        if not source_contexts:
+            return _no_source_profile_attempt(target, transfer_kind, target_scope_key)
     source_carrier_signature = source_carriers[0] if len(source_carriers) == 1 else None
     source_game_key = source_games[0] if len(source_games) == 1 else None
     source_context_key = source_contexts[0] if len(source_contexts) == 1 else None

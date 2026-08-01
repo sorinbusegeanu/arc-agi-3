@@ -1649,8 +1649,8 @@ def test_predict_transfer_attempt_does_not_sort_candidates(monkeypatch) -> None:
     attempt = _predict_transfer_attempt(
         profile_cache={
             ("cross_game", "g2"): [
-                {"role_signature": "roleB", "profile_tokens": ["a", "b"], "profile_token_set": {"a", "b"}, "source_carrier_count": 2},
-                {"role_signature": "roleC", "profile_tokens": ["a"], "profile_token_set": {"a"}, "source_carrier_count": 3},
+                    {"role_signature": "roleB", "profile_tokens": ["a", "b"], "profile_token_set": {"a", "b"}, "source_carrier_count": 2, "source_game_keys": ("g1",), "source_carrier_signatures": ("source-b",)},
+                    {"role_signature": "roleC", "profile_tokens": ["a"], "profile_token_set": {"a"}, "source_carrier_count": 3, "source_game_keys": ("g1",), "source_carrier_signatures": ("source-c",)},
             ]
         },
         role_rows={
@@ -1667,6 +1667,38 @@ def test_predict_transfer_attempt_does_not_sort_candidates(monkeypatch) -> None:
         target_scope_key="g2",
     )
     assert attempt["predicted_role_signature"] == "roleB"
+
+
+def test_predict_transfer_attempt_without_concrete_source_scope_is_missing_source() -> None:
+    attempt = _predict_transfer_attempt(
+        profile_cache={
+            ("cross_game", "g2"): [
+                {
+                    "role_signature": "roleB",
+                    "profile_tokens": ["a"],
+                    "profile_token_set": {"a"},
+                    "source_carrier_count": 2,
+                    "source_carrier_signatures": ("source-b",),
+                    "source_game_keys": (),
+                }
+            ]
+        },
+        role_rows={
+            "carrier1": {
+                "carrier_signature": "carrier1",
+                "role_signature": "roleA",
+                "tokens": ("a",),
+                "first_seen_global_step": 1,
+                "last_seen_global_step": 2,
+            }
+        },
+        target_carrier_signature="carrier1",
+        transfer_kind="cross_game",
+        target_scope_key="g2",
+    )
+    assert attempt["provenance_mode"] == "missing_source"
+    assert attempt["source_game_key"] is None
+    assert attempt["source_role_signature"] is None
 
 
 def test_suite_total_interactions_fallback(tmp_path: Path) -> None:
