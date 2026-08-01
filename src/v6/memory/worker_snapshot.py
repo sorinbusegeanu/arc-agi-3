@@ -456,6 +456,9 @@ class SnapshotMemoryQueryEngine:
     def _exact_contingency(self, contexts: dict[int, tuple], action: int) -> dict | None:
         for signature in contexts.values():
             target = tuple(signature)
+            overlay = self.overlay.contingencies.get((target, int(action)))
+            if overlay is not None:
+                return overlay
             candidates = self.snapshot.exact_contingencies_by_context_action.get((target, int(action)), ())
             if candidates:
                 return candidates[0]
@@ -480,7 +483,7 @@ class SnapshotMemoryQueryEngine:
         exact = self._exact_contingency(context_signatures, action)
         if exact is not None:
             result = MemoryPrediction(
-                predicted_family=int(exact.get("family", 0)),
+                predicted_family=int(exact.get("family", exact.get("transformation_family", 0))),
                 confidence=float(exact.get("confidence", 0.0) or 0.0),
                 source="memory_contingency",
                 evidence_node_ids=[str(exact.get("node_id", ""))],

@@ -22,6 +22,19 @@ class _Environment:
 def _system_with_memory() -> V6System:
     system = V6System(_Environment(), V6Config(database_path=":memory:"))
     system.contingency_learner.import_contingency(Contingency(1, 0, ("ctx",), 1, 7, 20, 0.9))
+    system.memory.upsert_node(
+        MemoryNode(
+            "M1:contingency:exact",
+            "M1",
+            "ContingencyMemory",
+            attrs={
+                "context_signature": '["ctx"]',
+                "action": 1,
+                "transformation_family": 7,
+                "confidence": 0.9,
+            },
+        )
+    )
     system.memory.upsert_node(MemoryNode("M0:source", "M0", "Source"))
     system.memory.upsert_node(MemoryNode(action_node_id(1), "M0", "Action"))
     system.memory.upsert_edge(MemoryEdge("M0:source", action_node_id(1), "takes_action"))
