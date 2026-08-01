@@ -13736,7 +13736,8 @@ def test_h06_too_few_transfer_attempts_is_insufficient_evidence(tmp_path: Path) 
         conn.commit()
     result = evaluate_h06_role_transfer(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h06_too_few", already_derived=True)
     assert result["decision"] == "INSUFFICIENT_EVIDENCE"
-    assert "too few role transfer attempts for H06 evaluation" in result["missing_evidence"]
+    assert "no role transfer attempts available" in result["missing_evidence"]
+    assert result["legacy_transfer_provenance_count"] == 3
 
 
 def test_h07_no_successful_transfers_and_no_concepts_is_insufficient_evidence(tmp_path: Path) -> None:

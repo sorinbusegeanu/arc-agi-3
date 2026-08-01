@@ -33,6 +33,7 @@ from v6.hypothesis_h09_report import evaluate_h09_future_option_motifs
 from v6.hypothesis_h10_report import evaluate_h10_future_option_attention
 from v6.hypothesis_h11_report import evaluate_h11_future_option_transfer_concepts
 from v6.evaluation.h12_efficiency_emergence import evaluate_h12_efficiency_emergence
+from v6.provenance_validation import validate_hypothesis_provenance
 
 
 SUITE_JSON_NAME = "hypothesis_suite_summary.json"
@@ -530,6 +531,11 @@ def run_hypothesis_suite_report(
         for phase_name in ("derive_role_candidates", "H05", "derive_role_transfer_attempts", "H06", "derive_concept_candidates", "H07", "derive_world_model_components", "H08", "derive_future_option_events", "derive_future_option_motifs", "derive_future_option_attention_links", "derive_future_option_transfer_links", "H09", "H10", "H11", "H12"):
             with _phase(phase_name):
                 pass
+    provenance_validation = validate_hypothesis_provenance(memory_dir=memory_dir, output_dir=output_dir)
+    _apply_global_provenance_gates(
+        provenance_validation,
+        {"H06": h06, "H07": h07, "H08": h08, "H09": h09, "H11": h11},
+    )
     input_report = _load_json(Path(run_dir) / INPUT_REPORT_NAME) or {}
     runs = [dict(item) for item in input_report.get("runs", []) if isinstance(item, dict)]
     games = sorted({str(row.get("game")) for row in runs if row.get("game")})
@@ -609,6 +615,7 @@ def run_hypothesis_suite_report(
     summary["max_future_option_events"] = int(max_future_option_events)
     summary["max_future_option_motifs"] = int(max_future_option_motifs)
     summary["incremental_promotion_validation"] = promotion_validation_summary
+    summary["provenance_validation"] = provenance_validation
     consistency_warnings = _collect_hypothesis_consistency_warnings(
         h03=h03, h04=h04, h05=h05, h07=h07, h08=h08, h09=h09, h10=h10, h12=h12
     )
@@ -644,6 +651,24 @@ def run_hypothesis_suite_report(
         )
     top_bar.close()
     return summary
+
+
+def _apply_global_provenance_gates(
+    validation: dict[str, Any],
+    hypotheses: dict[str, dict[str, Any]],
+) -> None:
+    """No VALID decision may survive a contradictory provenance claim."""
+    invalid_by_hypothesis = dict(validation.get("invalid_by_hypothesis") or {})
+    for hypothesis_id, result in hypotheses.items():
+        invalid_count = int(invalid_by_hypothesis.get(hypothesis_id, 0) or 0)
+        result["provenance_validation_invalid_claim_count"] = invalid_count
+        result["provenance_validation_report"] = "provenance_validation_report.json"
+        if invalid_count > 0 and result.get("decision") == "VALID":
+            result["decision"] = "INSUFFICIENT_EVIDENCE"
+            missing = result.setdefault("missing_evidence", [])
+            message = f"Global provenance validation found {invalid_count} invalid claim(s); VALID is not admissible."
+            if message not in missing:
+                missing.append(message)
 
 
 def build_hypothesis_suite_summary(

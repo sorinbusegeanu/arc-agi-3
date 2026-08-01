@@ -71,6 +71,7 @@ H01_DEFAULTS: dict[str, Any] = {
     "missing_evidence": [],
     "evidence_diagnostics": {},
     "coverage_attribution_missing": False,
+    "metric_evidence": [],
     "acceptance_checks": {
         "interactions_present": None,
         "contingencies_present": None,
@@ -223,6 +224,12 @@ def evaluate_h01_contingency_emergence(run_dir: Path, output_dir: Path, *, memor
             "multi_sampler_support": multi_sampler_support,
             "prediction_or_context_signal_present": signal_present,
         }
+        _attach_h01_metric_evidence(
+            result,
+            report_metrics={},
+            db_metrics={},
+            compact_metrics=compact_metrics,
+        )
         if stable_present:
             result["evidence_for"].append(
                 f"Stable contingencies are present in compact memory ({int(result.get('stable_contingency_count') or 0)})."
@@ -318,7 +325,10 @@ def evaluate_h01_contingency_emergence(run_dir: Path, output_dir: Path, *, memor
             if compact_value is None:
                 continue
             current_value = result.get(key)
-            if current_value in (None, 0, 0.0, {}, []):
+            # Zero and empty collections are measured observations.  Replacing
+            # them with compact values silently mixed populations and made a
+            # measured absence look like a fallback estimate.
+            if current_value is None:
                 result[key] = compact_value
         if direct_streaming_manifest_exists(memory_dir) and not sqlite_paths:
             result["evidence_source"] = "direct_streaming_manifest_and_compact_memory"
@@ -366,14 +376,10 @@ def evaluate_h01_contingency_emergence(run_dir: Path, output_dir: Path, *, memor
     ):
         if result.get(key) is None:
             result[key] = compact_metrics.get(key)
-    result["cross_game_contingency_count"] = (
-        result.get("cross_game_contingency_count")
-        or compact_metrics.get("cross_game_contingency_count")
-    )
-    result["cross_sampler_contingency_count"] = (
-        result.get("cross_sampler_contingency_count")
-        or compact_metrics.get("cross_sampler_contingency_count")
-    )
+    if result.get("cross_game_contingency_count") is None:
+        result["cross_game_contingency_count"] = compact_metrics.get("cross_game_contingency_count")
+    if result.get("cross_sampler_contingency_count") is None:
+        result["cross_sampler_contingency_count"] = compact_metrics.get("cross_sampler_contingency_count")
     result["games_per_contingency_identity"] = db_metrics.get("games_per_contingency_identity", {}) or compact_metrics.get("games_per_contingency_identity", {})
     result["samplers_per_contingency_identity"] = db_metrics.get("samplers_per_contingency_identity", {}) or compact_metrics.get("samplers_per_contingency_identity", {})
     result["db_paths_inspected"] = db_metrics.get("db_paths_inspected", 0)
@@ -427,6 +433,12 @@ def evaluate_h01_contingency_emergence(run_dir: Path, output_dir: Path, *, memor
         "multi_sampler_support": multi_sampler_support,
         "prediction_or_context_signal_present": signal_present,
     }
+    _attach_h01_metric_evidence(
+        result,
+        report_metrics=report_metrics,
+        db_metrics=db_metrics,
+        compact_metrics=compact_metrics,
+    )
 
     if not result["input_report_txt_found"]:
         result["missing_evidence"].append(f"Optional text report missing: {INPUT_REPORT_TXT_NAME}")
@@ -978,6 +990,43 @@ def _prediction_metrics_from_prediction_results(connection: sqlite3.Connection) 
         "context_lift_values": context_lifts,
         "positive_context_lift_values": [value for value in context_lifts if value > 0.0],
     }
+
+
+def _attach_h01_metric_evidence(
+    result: dict[str, Any],
+    *,
+    report_metrics: dict[str, Any],
+    db_metrics: dict[str, Any],
+    compact_metrics: dict[str, Any],
+) -> None:
+    """Record the source used for every metric that participates in H01 gates."""
+    metric_names = (
+        "total_interaction_count",
+        "discovered_contingency_count",
+        "stable_contingency_count",
+        "cross_game_contingency_count",
+        "cross_sampler_contingency_count",
+        "prediction_accuracy",
+        "mean_prediction_accuracy",
+        "context_lift",
+        "mean_context_lift",
+    )
+    evidence: list[dict[str, Any]] = []
+    for metric in metric_names:
+        value = result.get(metric)
+        if metric in report_metrics and report_metrics.get(metric) is not None:
+            source = "report"
+        elif metric in db_metrics and db_metrics.get(metric) is not None:
+            source = "raw_db"
+        elif metric in compact_metrics and compact_metrics.get(metric) is not None:
+            source = "compact_memory"
+        elif metric == "total_interaction_count" and result.get("manifest_interaction_count") is not None:
+            source = "manifest"
+            value = result.get("manifest_interaction_count")
+        else:
+            source = "report" if result.get("input_report_found") else "compact_memory"
+        evidence.append({"metric": metric, "value": value, "evidence_source": source})
+    result["metric_evidence"] = evidence
 
 
 def _finalize_h01_result(result: dict[str, Any], output_dir: Path) -> None:

@@ -45,17 +45,31 @@ def _seed_h06_diagnostics(memory_dir: Path, *, pair_count: int = 5) -> None:
             reason = reasons[index % len(reasons)]
             success = int(reason == "success")
             kind = "cross_context" if index % 2 else "cross_game"
+            source_game = f"g{index:03d}"
+            target_game = f"t{index:03d}" if kind == "cross_game" else source_game
+            source_context = f"ctx_s{index:03d}" if kind == "cross_context" else None
+            target_context = f"ctx_t{index:03d}" if kind == "cross_context" else None
             conn.execute(
                 """
                 INSERT INTO role_transfer_attempts (
                     attempt_id, role_signature, transfer_kind, source_scope_type, source_scope_key,
-                    target_scope_type, target_scope_key, similarity_score, transfer_score, reuse_success,
+                    target_scope_type, target_scope_key, source_game_key, target_game_key,
+                    source_context_key, target_context_key, source_carrier_signature, source_role_signature,
+                    predicted_target_role_signature, observed_target_role_signature, provenance_mode,
+                    similarity_score, transfer_score, reuse_success,
                     failure_reason, best_margin, source_carrier_count, candidate_role_count
-                ) VALUES (?, ?, ?, 'game', ?, 'game', ?, ?, 0.5, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'single_source', ?, 0.5, ?, ?, ?, ?, ?)
                 """,
                 (
                     f"attempt-{index:03d}", "role-a" if index % 2 == 0 else "role-b", kind,
-                    f"g{index:03d}", f"t{index:03d}", 0.85 if success else 0.25,
+                    "game" if kind == "cross_game" else "context",
+                    source_game if kind == "cross_game" else source_context,
+                    "game" if kind == "cross_game" else "context",
+                    target_game if kind == "cross_game" else target_context,
+                    source_game, target_game, source_context, target_context,
+                    f"carrier-source-{index}", "role-a" if index % 2 == 0 else "role-b",
+                    "role-a" if index % 2 == 0 else "role-b", "role-a" if index % 2 == 0 else "role-b",
+                    0.85 if success else 0.25,
                     success, reason, 0.25 if success else -0.05, 8 if success else 1, 4 if success else 1,
                 ),
             )
@@ -93,3 +107,33 @@ def test_h06_bounds_main_game_pair_rows_and_writes_complete_jsonl(tmp_path: Path
     assert len(result["transfer_by_game_pair"]) == 100
     rows = (output_dir / "h06_transfer_by_game_pair.jsonl").read_text(encoding="utf-8").splitlines()
     assert len(rows) == 105
+
+
+def test_h06_excludes_legacy_and_invalid_provenance_from_verified_rates(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_h06_diagnostics(memory_dir, pair_count=2)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute(
+            """
+            INSERT INTO role_transfer_attempts (
+                attempt_id, role_signature, transfer_kind, source_scope_type, source_scope_key,
+                target_scope_type, target_scope_key, reuse_success, failure_reason
+            ) VALUES ('legacy-row', 'role-a', 'cross_game', 'not_game', 'target', 'game', 'target', 1, 'success')
+            """
+        )
+        conn.execute(
+            """
+                INSERT INTO role_transfer_attempts (
+                    attempt_id, role_signature, transfer_kind, source_game_key, target_game_key,
+                    source_carrier_signature, source_role_signature, provenance_mode, reuse_success, failure_reason
+                ) VALUES ('invalid-row', 'role-a', 'cross_game', 'same', 'same', 'carrier-a', 'role-a', 'single_source', 1, 'success')
+            """
+        )
+        conn.commit()
+    result = evaluate_h06_role_transfer(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h06", already_derived=True)
+    assert result["legacy_transfer_provenance_count"] == 1
+    assert result["same_game_marked_cross_game_count"] == 1
+    assert result["invalid_provenance_attempt_count"] == 1
+    assert result["recorded_transfer_attempt_count"] == result["transfer_attempt_count"] + 2
+    assert "invalid_transfer_provenance" in result["consistency_warnings"]
+    assert all(row["source_game"] != "unknown" for row in result["transfer_by_source_game"])

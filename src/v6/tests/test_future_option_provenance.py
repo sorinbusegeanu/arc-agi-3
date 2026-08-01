@@ -69,8 +69,11 @@ def _provenance_memory(tmp_path: Path) -> tuple[Path, sqlite3.Connection, sqlite
     state_conn.execute(
         """INSERT INTO role_transfer_attempts (
             attempt_id, role_signature, transfer_kind, reuse_success, similarity_score,
-            transfer_score, best_margin, source_carrier_count, candidate_role_count
-        ) VALUES ('attempt-1', 'role-1', 'cross_game', 1, 0.9, 0.9, 0.2, 2, 2)"""
+            transfer_score, best_margin, source_carrier_count, candidate_role_count,
+            source_role_signature, predicted_target_role_signature, observed_target_role_signature,
+            source_game_key, target_game_key, source_carrier_signature, provenance_mode, provenance_status
+        ) VALUES ('attempt-1', 'role-1', 'cross_game', 1, 0.9, 0.9, 0.2, 2, 2,
+                  'role-1', 'role-1', 'role-1', 'g1', 'g2', 'carrier-1', 'single_source', 'verified')"""
     )
     state_conn.commit()
     return memory_dir, state_conn, graph_conn

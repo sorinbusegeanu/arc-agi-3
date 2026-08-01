@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from statistics import median
 from pathlib import Path
 from typing import Any
 
@@ -67,7 +68,9 @@ def evaluate_h08_world_model_coherence(
             SELECT component_signature, coherence_score, explanatory_coverage, cross_context_count, cross_game_count,
                    linked_concept_count, linked_role_count, linked_family_count, prediction_support_count,
                    contradiction_coverage_count, predicted_outcome_count, predicted_outcome_count_is_proxy,
-                   is_coherent, candidate_only
+                   is_coherent, candidate_only, validation_prediction_lift,
+                   validation_action_selection_lift, validation_transfer_lift,
+                   validation_contradiction_resolution, validation_explanatory_gain
             FROM world_model_components
             ORDER BY component_signature ASC
             """
@@ -79,8 +82,23 @@ def evaluate_h08_world_model_coherence(
         groups = link_map.setdefault(str(row["component_signature"]), {})
         groups.setdefault(str(row["linked_type"]), set()).add(str(row["linked_key"]))
     world_model_component_count = len(component_rows)
-    coherent_rows = [row for row in component_rows if int(row["is_coherent"] or 0) == 1]
+    structural_coherent_rows = [row for row in component_rows if int(row["is_coherent"] or 0) == 1]
+    def _has_heldout_gain(row: sqlite3.Row) -> bool:
+        return any(
+            value is not None and float(value) > 0.0
+            for value in (
+                row["validation_prediction_lift"],
+                row["validation_action_selection_lift"],
+                row["validation_transfer_lift"],
+                row["validation_contradiction_resolution"],
+                row["validation_explanatory_gain"],
+            )
+        )
+    # Structural linkage alone is not coherence evidence.  This reporting
+    # filter deliberately leaves persisted component state untouched.
+    coherent_rows = [row for row in structural_coherent_rows if _has_heldout_gain(row)]
     coherent_world_model_component_count = len(coherent_rows)
+    structural_coherent_world_model_component_count = len(structural_coherent_rows)
     mean_coherence_score = (
         sum(float(row["coherence_score"] or 0.0) for row in component_rows) / max(1, world_model_component_count)
         if component_rows
@@ -109,9 +127,31 @@ def evaluate_h08_world_model_coherence(
     role_link_count = max((len(link_map.get(str(row["component_signature"]), {}).get("role", set())) for row in component_rows), default=0)
     family_link_count = max((int(row["linked_family_count"] or 0) for row in component_rows), default=0)
     contradiction_coverage_count = sum(int(row["contradiction_coverage_count"] or 0) for row in component_rows)
+    component_statistics = {
+        "cross_context_count": _count_statistics([int(row["cross_context_count"] or 0) for row in component_rows]),
+        "cross_game_count": _count_statistics([int(row["cross_game_count"] or 0) for row in component_rows]),
+        "predicted_outcome_count": _count_statistics([int(row["predicted_outcome_count"] or 0) for row in component_rows]),
+        "supported_context_count": _count_statistics([len(link_map.get(str(row["component_signature"]), {}).get("context", set())) for row in component_rows]),
+        "concept_link_count": _count_statistics([len(link_map.get(str(row["component_signature"]), {}).get("concept", set())) for row in component_rows]),
+        "role_link_count": _count_statistics([len(link_map.get(str(row["component_signature"]), {}).get("role", set())) for row in component_rows]),
+        "family_link_count": _count_statistics([int(row["linked_family_count"] or 0) for row in component_rows]),
+    }
+    heldout_components = [
+        {
+            "component_signature": str(row["component_signature"]),
+            "heldout_prediction_gain": row["validation_prediction_lift"],
+            "heldout_behavior_gain": row["validation_action_selection_lift"],
+            "heldout_contradiction_resolution": row["validation_contradiction_resolution"],
+            "heldout_explanatory_gain": row["validation_explanatory_gain"],
+            "heldout_transfer_lift": row["validation_transfer_lift"],
+            "heldout_validation_pass": _has_heldout_gain(row),
+        }
+        for row in structural_coherent_rows
+    ]
     metrics = {
         "world_model_component_count": world_model_component_count,
         "coherent_world_model_component_count": coherent_world_model_component_count,
+        "structural_coherent_world_model_component_count": structural_coherent_world_model_component_count,
         "candidate_only_world_model_component_count": candidate_only_world_model_component_count,
         "promoted_concept_count": promoted_concept_count,
         "role_candidate_count": role_candidate_count,
@@ -136,6 +176,8 @@ def evaluate_h08_world_model_coherence(
         "max_family_link_count": max((int(row["linked_family_count"] or 0) for row in component_rows), default=0),
         "family_link_count_is_proxy": bool(predicted_outcome_count_is_proxy_count > 0),
         "contradiction_coverage_count": contradiction_coverage_count,
+        "component_aggregate_statistics": component_statistics,
+        "coherent_component_validation": heldout_components,
         "first_world_model_component_step": milestone_map.get("first_world_model_component_step"),
         "first_coherent_world_model_step": milestone_map.get("first_coherent_world_model_step"),
         "first_promoted_concept_step": milestone_map.get("first_promoted_concept_step"),
@@ -144,6 +186,13 @@ def evaluate_h08_world_model_coherence(
     non_proxy_predicted_outcome_available = (
         predicted_outcome_count > 0 and predicted_outcome_count_is_proxy_count <= 0
     )
+    h08_validity_gates = {
+        "promoted_concepts": {"required": 1, "actual": promoted_concept_count, "passed": promoted_concept_count > 0},
+        "heldout_coherent_components": {"required": 1, "actual": coherent_world_model_component_count, "passed": coherent_world_model_component_count >= 1},
+        "heldout_positive_gain": {"required": "> 0 in one held-out metric", "actual": sum(1 for row in heldout_components if row["heldout_validation_pass"]), "passed": bool(heldout_components and any(row["heldout_validation_pass"] for row in heldout_components))},
+        "cross_scope": {"required": "cross_context >= 3 OR cross_game >= 2", "actual": {"cross_context": component_cross_context_count, "cross_game": component_cross_game_count}, "passed": component_cross_context_count >= 3 or component_cross_game_count >= 2},
+        "prediction_evidence": {"required": 1, "actual": predicted_outcome_count, "passed": non_proxy_predicted_outcome_available},
+    }
     if world_model_component_count <= 0:
         decision = "INSUFFICIENT_EVIDENCE"
         missing = ["no world-model components available"]
@@ -153,7 +202,7 @@ def evaluate_h08_world_model_coherence(
         missing = ["No promoted concepts or coherent world-model components available."]
     elif world_model_component_count > 0 and coherent_world_model_component_count == 0:
         decision = "PARTIALLY_VALID"
-        missing = []
+        missing = ["Structural world-model components lack positive held-out predictive, behavioral, contradiction, or explanatory gain."]
     elif (
         promoted_concept_count > 0
         and coherent_world_model_component_count >= 1
@@ -170,7 +219,10 @@ def evaluate_h08_world_model_coherence(
         and (candidate_only_world_model_component_count == 0 or coherent_world_model_component_count >= candidate_only_world_model_component_count)
     ):
         decision = "VALID"
-        missing = []
+        missing = [
+            f"H08 gate failed: {name} (required={gate['required']}, actual={gate['actual']})."
+            for name, gate in h08_validity_gates.items() if not gate["passed"]
+        ]
     elif promoted_concept_count > 0 and world_model_component_count == 0:
         decision = "INVALID"
         missing = []
@@ -182,6 +234,7 @@ def evaluate_h08_world_model_coherence(
         missing = []
     result = _base_result(decision, missing)
     result.update(metrics)
+    result["h08_validity_gates"] = h08_validity_gates
     result["core_metrics"] = dict(metrics)
     result["evidence_diagnostics"] = _evidence_diagnostics(memory_dir, run_dir, missing_target="none")
     _write_outputs(output_dir, result)
@@ -195,6 +248,22 @@ def _base_result(decision: str, missing_evidence: list[str]) -> dict[str, Any]:
         "decision": decision,
         "missing_evidence": list(missing_evidence),
         "evidence_source": "compact_memory",
+    }
+
+
+def _count_statistics(values: list[int]) -> dict[str, Any]:
+    cooked = [int(value) for value in values]
+    distribution: dict[str, int] = {}
+    for value in sorted(cooked):
+        key = str(value)
+        distribution[key] = distribution.get(key, 0) + 1
+    return {
+        "total": sum(cooked),
+        "distinct": len(set(cooked)),
+        "mean": (sum(cooked) / len(cooked)) if cooked else 0.0,
+        "median": float(median(cooked)) if cooked else 0.0,
+        "maximum": max(cooked, default=0),
+        "distribution": distribution,
     }
 
 

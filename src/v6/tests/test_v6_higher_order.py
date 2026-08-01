@@ -148,21 +148,25 @@ def _seed_functional_candidate(
                 conn.execute(
                     """
                     INSERT INTO role_transfer_attempts (
-                        attempt_id, role_signature, target_scope_type, target_scope_key,
+                        attempt_id, role_signature, source_role_signature, predicted_target_role_signature,
+                        observed_target_role_signature, source_game_key, target_game_key,
+                        source_carrier_signature, provenance_mode, provenance_status,
                         reuse_success, last_seen_global_step
-                    ) VALUES (?, ?, 'game', 'target-game', 1, 5)
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'target-game', ?, 'single_source', 'verified', 1, 5)
                     """,
-                    (f"{role}-success-{attempt_index}", role),
+                    (f"{role}-success-{attempt_index}", role, role, role, role, f"source-{role}", f"carrier-{role}"),
                 )
             for attempt_index in range(failures):
                 conn.execute(
                     """
                     INSERT INTO role_transfer_attempts (
-                        attempt_id, role_signature, target_scope_type, target_scope_key,
+                        attempt_id, role_signature, source_role_signature, predicted_target_role_signature,
+                        observed_target_role_signature, source_game_key, target_game_key,
+                        source_carrier_signature, provenance_mode, provenance_status,
                         reuse_success, last_seen_global_step
-                    ) VALUES (?, ?, 'game', 'target-game', 0, 6)
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'target-game', ?, 'single_source', 'verified', 0, 6)
                     """,
-                    (f"{role}-failure-{attempt_index}", role),
+                    (f"{role}-failure-{attempt_index}", role, role, role, role, f"source-{role}", f"carrier-{role}"),
                 )
         conn.execute(
             """
@@ -182,9 +186,12 @@ def _seed_functional_candidate(
             conn.execute(
                 """
                 INSERT INTO role_transfer_attempts (
-                    attempt_id, role_signature, observed_role_signature, target_scope_type, target_scope_key,
+                    attempt_id, role_signature, source_role_signature, predicted_target_role_signature,
+                    observed_target_role_signature, source_game_key, target_game_key,
+                    source_carrier_signature, provenance_mode, provenance_status,
                     reuse_success, last_seen_global_step
-                ) VALUES ('heldout-functional', 'role-a', 'role-target', 'game', 'target-game', ?, 20)
+                ) VALUES ('heldout-functional', 'role-a', 'role-a', 'role-target', 'role-target',
+                          'source-role-a', 'target-game', 'carrier-role-a', 'single_source', 'verified', ?, 20)
                 """,
                 (heldout_success,),
             )
@@ -202,7 +209,19 @@ def _seed_functional_candidate(
                 INSERT INTO prediction_results VALUES (1, 21, 'ctx-functional', 'family-ok', 'family-ok', 1)
                 """
             )
-        conn.commit()
+            conn.execute(
+                """
+                UPDATE role_transfer_attempts
+                SET source_role_signature = role_signature,
+                    predicted_target_role_signature = COALESCE(predicted_target_role_signature, role_signature),
+                    observed_target_role_signature = COALESCE(observed_target_role_signature, observed_role_signature, role_signature),
+                    source_game_key = 'source-game', target_game_key = 'target-game',
+                    source_carrier_signature = 'carrier-source',
+                    provenance_mode = 'single_source', provenance_status = 'verified'
+                WHERE attempt_id = 'heldout-after-failure'
+                """
+            )
+            conn.commit()
 
 
 def test_functional_coverage_promotes_without_legacy_promotion_and_keeps_structural_overlap(tmp_path: Path) -> None:
@@ -441,32 +460,36 @@ def test_transfer_history_index_preserves_prior_rates_and_explanation_events() -
             "attempt_id": 1, "role_signature": "role-a", "reuse_success": 1,
             "last_seen_global_step": 2, "observed_role_signature": "target-a",
             "predicted_role_signature": None, "target_scope_type": "game", "target_scope_key": "g1",
+            "source_game_key": "s1", "source_context_key": None, "target_game_key": "g1", "target_context_key": None,
         },
         {
             "attempt_id": 2, "role_signature": "role-b", "reuse_success": 0,
             "last_seen_global_step": 3, "observed_role_signature": "target-b",
             "predicted_role_signature": None, "target_scope_type": "game", "target_scope_key": "g1",
+            "source_game_key": "s1", "source_context_key": None, "target_game_key": "g1", "target_context_key": None,
         },
         {
             "attempt_id": 3, "role_signature": "role-a", "reuse_success": 0,
             "last_seen_global_step": 5, "observed_role_signature": "target-c",
             "predicted_role_signature": None, "target_scope_type": "game", "target_scope_key": "g2",
+            "source_game_key": "s2", "source_context_key": None, "target_game_key": "g2", "target_context_key": None,
         },
         {
             "attempt_id": 4, "role_signature": "role-b", "reuse_success": 1,
             "last_seen_global_step": 6, "observed_role_signature": "target-d",
             "predicted_role_signature": None, "target_scope_type": "game", "target_scope_key": "g2",
+            "source_game_key": "s2", "source_context_key": None, "target_game_key": "g2", "target_context_key": None,
         },
     ]
     history = higher_order_substrate._build_transfer_history_index(transfer_rows)
-    for role, step, scope in (
-        ("role-a", 2, None), ("role-a", 5, ("game", "g1")),
-        ("role-b", 7, None), ("missing", 7, None),
+    for role, step, source_game, target_game in (
+        ("role-a", 2, None, None), ("role-a", 5, "s1", "g1"),
+        ("role-b", 7, None, None), ("missing", 7, None, None),
     ):
         assert higher_order_substrate._prior_role_success_rate(
-            transfer_rows, role=role, before_step=step, target_scope=scope,
+            transfer_rows, role=role, before_step=step, source_game_key=source_game, target_game_key=target_game,
         ) == higher_order_substrate._prior_role_success_rate(
-            transfer_rows, role=role, before_step=step, target_scope=scope, transfer_history=history,
+            transfer_rows, role=role, before_step=step, source_game_key=source_game, target_game_key=target_game, transfer_history=history,
         )
 
     expected = higher_order_substrate._transfer_explanation_events(
@@ -525,6 +548,18 @@ def test_incremental_validation_failure_count_is_epoch_idempotent_and_resets_on_
                 attempt_id, role_signature, observed_role_signature, target_scope_type, target_scope_key,
                 reuse_success, last_seen_global_step
             ) VALUES ('heldout-after-failure', 'role-a', 'role-target', 'game', 'target-game', 1, 20)
+            """
+        )
+        conn.execute(
+            """
+            UPDATE role_transfer_attempts
+            SET source_role_signature = role_signature,
+                predicted_target_role_signature = COALESCE(predicted_target_role_signature, role_signature),
+                observed_target_role_signature = COALESCE(observed_target_role_signature, observed_role_signature, role_signature),
+                source_game_key = 'source-game', target_game_key = 'target-game',
+                source_carrier_signature = 'carrier-source',
+                provenance_mode = 'single_source', provenance_status = 'verified'
+            WHERE attempt_id = 'heldout-after-failure'
             """
         )
         conn.commit()
@@ -613,6 +648,17 @@ def test_incremental_promotion_validation_uses_later_evidence_and_demotes_withou
         conn.execute(
             "INSERT INTO world_model_links (component_signature, linked_type, linked_key, support_count) VALUES ('wm-a', 'concept', 'concept-a', 1)"
         )
+        conn.execute(
+            """
+            UPDATE role_transfer_attempts
+            SET source_role_signature = role_signature,
+                predicted_target_role_signature = role_signature,
+                observed_target_role_signature = role_signature,
+                source_game_key = 'source-game', target_game_key = 'target-game',
+                source_carrier_signature = 'carrier-source',
+                provenance_mode = 'single_source', provenance_status = 'verified'
+            """
+        )
         conn.commit()
 
     config = IncrementalPromotionValidationConfig(enabled=True, demotion_failure_limit=1)
@@ -675,8 +721,15 @@ def test_incremental_promotion_validation_uses_later_evidence_and_demotes_withou
         conn.execute("DELETE FROM role_transfer_attempts WHERE last_seen_global_step > 10")
         for role in ("role-a", "role-b"):
             conn.execute(
-                "INSERT INTO role_transfer_attempts (attempt_id, role_signature, reuse_success, last_seen_global_step) VALUES (?, ?, 0, 20)",
-                (f"{role}-failed-heldout", role),
+                """
+                INSERT INTO role_transfer_attempts (
+                    attempt_id, role_signature, source_role_signature, predicted_target_role_signature,
+                    observed_target_role_signature, source_game_key, target_game_key,
+                    source_carrier_signature, provenance_mode, provenance_status,
+                    reuse_success, last_seen_global_step
+                ) VALUES (?, ?, ?, ?, ?, 'source-game', 'target-game', ?, 'single_source', 'verified', 0, 20)
+                """,
+                (f"{role}-failed-heldout", role, role, role, role, f"carrier-{role}"),
             )
         conn.commit()
     second = validate_incremental_promotions_only(
@@ -838,7 +891,8 @@ def test_h06_predicts_correct_role_across_held_out_game(tmp_path: Path) -> None:
     assert rows
     assert int(rows[0]["reuse_success"]) == 1
     assert rows[0]["predicted_role_signature"] == rows[0]["observed_role_signature"]
-    assert result["successful_transfer_count"] > 0
+    assert result["verified_cross_game_attempt_count"] == 0
+    assert result["multi_source_transfer_attempt_count"] > 0
 
 
 def test_h06_detects_role_mismatch(tmp_path: Path) -> None:
@@ -851,9 +905,8 @@ def test_h06_detects_role_mismatch(tmp_path: Path) -> None:
     ])
     derive_higher_order_memory(memory_dir=memory_dir)
     result = evaluate_h06_role_transfer(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h06")
-    assert result["successful_transfer_count"] < result["transfer_attempt_count"]
-    assert result["role_mismatch_count"] + result["low_similarity_count"] >= 1
-    assert result["transfer_success_rate"] < 1.0
+    assert result["verified_cross_game_attempt_count"] == 0
+    assert result["multi_source_transfer_attempt_count"] > 0
 
 
 def test_same_family_hash_not_required_for_role_match(tmp_path: Path) -> None:
@@ -914,10 +967,9 @@ def test_h06_valid(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
     _seed_memory(memory_dir, _transfer_rich_specs())
     result = evaluate_h06_role_transfer(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h06")
-    assert result["transfer_attempt_count"] >= 20
-    assert result["transfer_success_rate"] >= 0.60
-    assert result["mean_best_margin"] >= 0.10
-    assert result["decision"] == "VALID"
+    assert result["verified_cross_game_attempt_count"] == 0
+    assert result["multi_source_transfer_attempt_count"] >= 20
+    assert result["decision"] == "INSUFFICIENT_EVIDENCE"
 
 
 def test_h07_valid(tmp_path: Path) -> None:
@@ -1065,8 +1117,9 @@ def test_h06_records_no_source_profile_attempt(tmp_path: Path) -> None:
     assert rows
     assert all(int(row["reuse_success"] or 0) == 0 for row in rows)
     result = evaluate_h06_role_transfer(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h06")
-    assert result["transfer_attempt_count"] >= 1
-    assert result["no_source_profile_count"] >= 1
+    assert result["transfer_attempt_count"] == 0
+    assert result["invalid_provenance_attempt_count"] >= 1
+    assert result["no_source_profile_count"] == 0
     assert result["decision"] == "INSUFFICIENT_EVIDENCE"
     assert result["decision"] != "VALID"
 
@@ -1079,7 +1132,7 @@ def test_standalone_h05_h08_derive_safely(tmp_path: Path) -> None:
     h07 = evaluate_h07_concept_emergence(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h07")
     h08 = evaluate_h08_world_model_coherence(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h08")
     assert h05["role_candidate_count"] >= 1
-    assert h06["transfer_attempt_count"] >= 1
+    assert h06["multi_source_transfer_attempt_count"] >= 1
     assert h07["concept_candidate_count"] >= 1
     assert h08["world_model_component_count"] >= 1
 
@@ -1464,6 +1517,80 @@ def test_derive_role_transfer_attempts_only_respects_max_attempts(tmp_path: Path
         assert conn.execute("SELECT COUNT(*) FROM role_transfer_attempts").fetchone()[0] == 3
 
 
+def test_transfer_attempts_store_concrete_source_and_target_provenance(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_memory(memory_dir, _transfer_rich_specs())
+    derive_higher_order_memory(memory_dir=memory_dir, max_transfer_attempts=50)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.row_factory = sqlite3.Row
+        cross_game = conn.execute(
+            """
+            SELECT source_game_key, target_game_key, source_scope_key, target_scope_key,
+                   source_context_key, target_context_key, provenance_mode
+            FROM role_transfer_attempts WHERE transfer_kind = 'cross_game'
+            """
+        ).fetchall()
+        cross_context = conn.execute(
+            """
+            SELECT source_context_key, target_context_key, source_game_key, target_game_key
+            FROM role_transfer_attempts WHERE transfer_kind = 'cross_context'
+            """
+        ).fetchall()
+    assert cross_game
+    assert all(row["source_game_key"] and row["target_game_key"] for row in cross_game)
+    assert all(row["source_game_key"] != row["target_game_key"] for row in cross_game)
+    assert all(row["source_scope_key"] == row["source_game_key"] for row in cross_game)
+    assert all(row["source_scope_key"] != row["target_scope_key"] for row in cross_game)
+    assert cross_context
+    assert all(row["source_context_key"] != row["target_context_key"] for row in cross_context)
+    assert all(
+        not row["source_game_key"] or not row["target_game_key"] or row["source_game_key"] == row["target_game_key"]
+        for row in cross_context
+    )
+
+
+def test_transfer_provenance_expansion_uses_distinct_ids_for_source_games() -> None:
+    attempt = {
+        "attempt_id": "base", "transfer_kind": "cross_game", "source_scope_type": None,
+        "source_scope_key": None, "target_scope_type": "game", "target_scope_key": "target",
+        "source_game_key": None, "target_game_key": "target", "source_context_key": None,
+        "target_context_key": None, "source_carrier_signature": None,
+        "source_role_signature": "role-source", "source_carrier_signatures_json": '["carrier-a", "carrier-b"]',
+        "source_game_keys_json": '["game-a", "game-b"]', "source_context_keys_json": '[]',
+        "provenance_mode": "multi_source", "target_carrier_signature": "carrier-target",
+        "predicted_role_signature": "role-source", "role_signature": "role-target",
+        "observed_role_signature": "role-target", "similarity_score": 0.8, "transfer_score": 0.8,
+        "reuse_success": 1, "failure_reason": "success", "best_margin": 0.2,
+        "source_carrier_count": 2, "candidate_role_count": 2,
+        "first_seen_global_step": 1, "last_seen_global_step": 2,
+    }
+    rows = higher_order_substrate._expand_transfer_attempt_provenance(attempt)
+    assert [row["source_game_key"] for row in rows] == ["game-a", "game-b"]
+    assert len({row["attempt_id"] for row in rows}) == 2
+
+
+def test_no_source_profile_attempt_has_no_source_provenance() -> None:
+    attempt = higher_order_substrate._no_source_profile_attempt(
+        {
+            "carrier_signature": "target-carrier",
+            "role_signature": "target-role",
+            "first_seen_global_step": 1,
+            "last_seen_global_step": 2,
+        },
+        "cross_game",
+        "target-game",
+    )
+    assert attempt["provenance_mode"] == "missing_source"
+    assert attempt["provenance_status"] == "missing_source_profile"
+    assert all(
+        attempt[field] is None
+        for field in (
+            "source_scope_type", "source_scope_key", "source_game_key", "source_context_key",
+            "source_carrier_signature", "source_role_signature",
+        )
+    )
+
+
 def test_transfer_attempt_workers_one_and_four_match_counts(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(higher_order_substrate, "ProcessPoolExecutor", _ThreadPoolCompat)
     memory_dir_a = tmp_path / "memory_a"
@@ -1499,9 +1626,12 @@ def test_transfer_worker_chunk_does_not_open_sqlite(monkeypatch) -> None:
                     "role_signature": "roleB",
                     "profile_tokens": ["a", "b"],
                     "profile_token_set": {"a", "b"},
-                    "source_carrier_count": 2,
-                    "source_context_count": 2,
-                    "source_game_count": 1,
+                        "source_carrier_count": 2,
+                        "source_context_count": 2,
+                        "source_game_count": 1,
+                        "source_carrier_signatures": ("source1", "source2"),
+                        "source_game_keys": ("g1",),
+                        "source_context_keys": ("ctx1", "ctx2"),
                 }
             ]
         },

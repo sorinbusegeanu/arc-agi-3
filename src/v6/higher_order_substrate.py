@@ -26,6 +26,7 @@ ROLE_CLEAR_TABLES = (
     "concept_links",
     "world_model_components",
     "world_model_links",
+    "future_option_transfer_links",
     "higher_order_milestones",
 )
 
@@ -38,6 +39,7 @@ ROLE_ONLY_CLEAR_TABLES = (
     "concept_links",
     "world_model_components",
     "world_model_links",
+    "future_option_transfer_links",
     "higher_order_milestones",
 )
 
@@ -47,6 +49,7 @@ ROLE_TRANSFER_ONLY_CLEAR_TABLES = (
     "concept_links",
     "world_model_components",
     "world_model_links",
+    "future_option_transfer_links",
 )
 
 CONCEPT_ONLY_CLEAR_TABLES = (
@@ -123,7 +126,7 @@ class _TransferHistorySeries:
 @dataclass(frozen=True)
 class _TransferHistoryIndex:
     by_role: dict[str, _TransferHistorySeries]
-    by_role_scope: dict[tuple[str, str, str], _TransferHistorySeries]
+    by_source_target_scope: dict[tuple[str, str, str, str, str], _TransferHistorySeries]
     all_rows: _TransferHistorySeries
 
     def rate_before(
@@ -131,13 +134,13 @@ class _TransferHistoryIndex:
         *,
         role: str,
         step: int,
-        target_scope: tuple[str, str] | None = None,
+        source_game_key: str | None = None,
+        source_context_key: str | None = None,
+        target_game_key: str | None = None,
+        target_context_key: str | None = None,
     ) -> tuple[float, int]:
-        series = (
-            self.by_role_scope.get((role, target_scope[0], target_scope[1]))
-            if target_scope is not None
-            else self.by_role.get(role)
-        )
+        scope_key = (role, source_game_key or "", source_context_key or "", target_game_key or "", target_context_key or "")
+        series = self.by_source_target_scope.get(scope_key) if any(scope_key[1:]) else self.by_role.get(role)
         return series.rate_before(step) if series is not None else (0.0, 0)
 
     def max_step_before(self, *, role: str, step: int) -> int | None:
@@ -158,7 +161,7 @@ def _build_transfer_history_index(
     making each role/scope lookup logarithmic rather than linear in all
     transfer attempts.
     """
-    grouped: dict[tuple[str, str, str] | tuple[str], list[tuple[int, int]]] = defaultdict(list)
+    grouped: dict[tuple[str, str, str, str, str] | tuple[str], list[tuple[int, int]]] = defaultdict(list)
     all_values: list[tuple[int, int]] = []
     for row in transfer_rows:
         step = row["last_seen_global_step"]
@@ -167,7 +170,13 @@ def _build_transfer_history_index(
             continue
         value = (int(step), int(row["reuse_success"] or 0))
         grouped[(role,)].append(value)
-        grouped[(role, str(row["target_scope_type"] or ""), str(row["target_scope_key"] or ""))].append(value)
+        grouped[(
+            role,
+            str(row["source_game_key"] or ""),
+            str(row["source_context_key"] or ""),
+            str(row["target_game_key"] or ""),
+            str(row["target_context_key"] or ""),
+        )].append(value)
         all_values.append(value)
 
     def make_series(values: list[tuple[int, int]]) -> _TransferHistorySeries:
@@ -181,16 +190,16 @@ def _build_transfer_history_index(
         )
 
     by_role: dict[str, _TransferHistorySeries] = {}
-    by_role_scope: dict[tuple[str, str, str], _TransferHistorySeries] = {}
+    by_source_target_scope: dict[tuple[str, str, str, str, str], _TransferHistorySeries] = {}
     for key, values in grouped.items():
         series = make_series(values)
         if len(key) == 1:
             by_role[key[0]] = series
         else:
-            by_role_scope[(key[0], key[1], key[2])] = series
+            by_source_target_scope[(key[0], key[1], key[2], key[3], key[4])] = series
     return _TransferHistoryIndex(
         by_role=by_role,
-        by_role_scope=by_role_scope,
+        by_source_target_scope=by_source_target_scope,
         all_rows=make_series(all_values),
     )
 
@@ -611,7 +620,7 @@ def derive_role_transfer_attempts_parallel(
         _write_milestone(state_conn, "first_role_transfer_success_step", None, None)
         return _empty_transfer_summary()
 
-    carrier_contexts, carrier_games = _carrier_scope_maps(state_conn, graph_conn)
+    carrier_contexts, carrier_games, context_games = _carrier_scope_maps(state_conn, graph_conn)
     role_rows = {
         str(row["carrier_signature"]): {
             "carrier_signature": str(row["carrier_signature"]),
@@ -622,6 +631,14 @@ def derive_role_transfer_attempts_parallel(
         }
         for row in rows
     }
+    for carrier_signature, profile_row in role_rows.items():
+        contexts = tuple(sorted(carrier_contexts.get(carrier_signature, set())))
+        profile_row["contexts"] = contexts
+        profile_row["games"] = tuple(sorted(carrier_games.get(carrier_signature, set())))
+        profile_row["context_games"] = {
+            context: tuple(sorted(context_games.get(context, set())))
+            for context in contexts
+        }
     carrier_signatures = sorted(role_rows)
     target_attempt_specs: list[tuple[str, str, str]] = []
     unique_scopes: set[tuple[str, str]] = set()
@@ -640,6 +657,7 @@ def derive_role_transfer_attempts_parallel(
         role_rows=role_rows,
         carrier_contexts=carrier_contexts,
         carrier_games=carrier_games,
+        context_games=context_games,
         target_scopes=sorted(unique_scopes, key=lambda item: (0 if item[0] == "cross_game" else 1, item[1])),
     )
     inserted = 0
@@ -708,29 +726,42 @@ def derive_role_transfer_attempts_parallel(
                 if chunk_tracker is not None:
                     chunk_tracker.update(1)
             _close_progress_tracker(chunk_tracker)
+    # Expansion converts a selected aggregate profile into concrete
+    # source-target evidence.  Keep the configured cap over persisted rows,
+    # not merely the pre-expansion target requests.
+    attempt_ids = [str(row[0]) for row in attempt_rows]
+    if len(attempt_ids) != len(set(attempt_ids)):
+        raise ValueError("role transfer attempt identity collision before persistence")
+    attempt_rows.sort(key=lambda row: str(row[0]))
+    if len(attempt_rows) > int(max_transfer_attempts):
+        attempt_rows = attempt_rows[: int(max_transfer_attempts)]
     state_conn.executemany(
         """
         INSERT INTO role_transfer_attempts (
             attempt_id, role_signature, transfer_kind, source_scope_type, source_scope_key,
-            target_scope_type, target_scope_key, target_carrier_signature, predicted_role_signature,
+            target_scope_type, target_scope_key, source_game_key, target_game_key,
+            source_context_key, target_context_key, source_carrier_signature, source_role_signature,
+            predicted_target_role_signature, observed_target_role_signature,
+            source_carrier_signatures_json, source_game_keys_json, source_context_keys_json,
+            provenance_mode, provenance_status, target_carrier_signature, predicted_role_signature,
             observed_role_signature, similarity_score, transfer_score, reuse_success, failure_reason,
             best_margin, source_carrier_count, candidate_role_count, first_seen_global_step, last_seen_global_step
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         attempt_rows,
     )
     inserted = len(attempt_rows)
     for row in attempt_rows:
         transfer_kind = str(row[2])
-        transfer_score = float(row[11] or 0.0)
-        reuse_success = int(row[12] or 0)
-        failure_reason = str(row[13] or "")
-        best_margin = row[14]
-        source_carrier_count = int(row[15] or 0)
-        candidate_role_count = int(row[16] or 0)
-        first_seen_global_step = row[17]
-        role_signature = str(row[1])
+        transfer_score = float(row[24] or 0.0)
+        reuse_success = int(row[25] or 0)
+        failure_reason = str(row[26] or "")
+        best_margin = row[27]
+        source_carrier_count = int(row[28] or 0)
+        candidate_role_count = int(row[29] or 0)
+        first_seen_global_step = row[30]
+        role_signature = str(row[12] or "")
         transfer_score_sum += transfer_score
         source_carrier_count_sum += source_carrier_count
         candidate_role_count_sum += candidate_role_count
@@ -774,10 +805,10 @@ def derive_role_transfer_attempts_parallel(
     return {
         "transfer_attempt_count": inserted,
         "total_possible_transfer_attempts": total_possible_transfer_attempts,
-        "sampled_transfer_attempts": len(target_attempt_specs),
-        "skipped_by_cap_count": max(0, total_possible_transfer_attempts - len(target_attempt_specs)),
-        "sampled_cross_game_attempt_count": sampled_cross_game_attempt_count,
-        "sampled_cross_context_attempt_count": sampled_cross_context_attempt_count,
+        "sampled_transfer_attempts": inserted,
+        "skipped_by_cap_count": max(0, total_possible_transfer_attempts - inserted),
+        "sampled_cross_game_attempt_count": cross_game_attempt_count,
+        "sampled_cross_context_attempt_count": cross_context_attempt_count,
         "transfer_sampling_strategy": "stratified_balanced",
         "max_attempts_per_role": max_attempts_per_role,
         "max_attempts_per_target_scope": max_attempts_per_target_scope,
@@ -927,8 +958,9 @@ def derive_concept_candidates(state_conn: sqlite3.Connection, progress_factory: 
         tokens_by_role[str(row["role_signature"])].update(_load_token_json(row["token_json"]))
     transfer_rows = state_conn.execute(
         """
-        SELECT role_signature, reuse_success, similarity_score, best_margin, source_carrier_count, candidate_role_count
+        SELECT source_role_signature AS role_signature, reuse_success, similarity_score, best_margin, source_carrier_count, candidate_role_count
         FROM role_transfer_attempts
+        WHERE provenance_mode IN ('single_source', 'multi_source')
         ORDER BY role_signature ASC, attempt_id ASC
         """
     ).fetchall()
@@ -1168,8 +1200,9 @@ def derive_world_model_components(
     successful_transfer_by_role: dict[str, int] = defaultdict(int)
     for row in state_conn.execute(
         """
-        SELECT role_signature, reuse_success, source_carrier_count, candidate_role_count, similarity_score, best_margin
+        SELECT source_role_signature AS role_signature, reuse_success, source_carrier_count, candidate_role_count, similarity_score, best_margin
         FROM role_transfer_attempts
+        WHERE provenance_mode IN ('single_source', 'multi_source')
         ORDER BY role_signature ASC, attempt_id ASC
         """
     ).fetchall():
@@ -1405,10 +1438,13 @@ def _validate_incremental_promotions(
     }
     transfer_rows = state_conn.execute(
         """
-        SELECT attempt_id, role_signature, reuse_success, last_seen_global_step,
-               observed_role_signature, predicted_role_signature, target_carrier_signature,
-               source_scope_type, source_scope_key, target_scope_type, target_scope_key
+        SELECT attempt_id, source_role_signature AS role_signature, reuse_success, last_seen_global_step,
+               observed_target_role_signature AS observed_role_signature,
+               predicted_target_role_signature AS predicted_role_signature, target_carrier_signature,
+               source_game_key, target_game_key, source_context_key, target_context_key,
+               provenance_mode
         FROM role_transfer_attempts
+        WHERE provenance_mode = 'single_source'
         ORDER BY role_signature ASC, attempt_id ASC
         """
     ).fetchall()
@@ -1984,24 +2020,30 @@ def _prior_role_success_rate(
     *,
     role: str,
     before_step: int,
-    target_scope: tuple[str, str] | None = None,
+    source_game_key: str | None = None,
+    source_context_key: str | None = None,
+    target_game_key: str | None = None,
+    target_context_key: str | None = None,
     transfer_history: _TransferHistoryIndex | None = None,
 ) -> tuple[float, int]:
     if transfer_history is not None:
         return transfer_history.rate_before(
             role=role,
             step=before_step,
-            target_scope=target_scope,
+            source_game_key=source_game_key,
+            source_context_key=source_context_key,
+            target_game_key=target_game_key,
+            target_context_key=target_context_key,
         )
     matching = [
         row for row in transfer_rows
         if str(row["role_signature"] or "") == role
         and row["last_seen_global_step"] is not None
         and int(row["last_seen_global_step"]) < before_step
-        and (
-            target_scope is None
-            or (str(row["target_scope_type"] or ""), str(row["target_scope_key"] or "")) == target_scope
-        )
+        and (source_game_key is None or str(row["source_game_key"] or "") == source_game_key)
+        and (source_context_key is None or str(row["source_context_key"] or "") == source_context_key)
+        and (target_game_key is None or str(row["target_game_key"] or "") == target_game_key)
+        and (target_context_key is None or str(row["target_context_key"] or "") == target_context_key)
     ]
     if not matching:
         return 0.0, 0
@@ -2045,7 +2087,10 @@ def _transfer_explanation_events(
         if source_role not in source_role_set or step is None or int(step) <= first_seen_global_step:
             continue
         target_role = str(row["observed_role_signature"] or row["predicted_role_signature"] or "unknown")
-        scope = (str(row["target_scope_type"] or "unknown"), str(row["target_scope_key"] or "unknown"))
+        source_game_key = str(row["source_game_key"] or "")
+        source_context_key = str(row["source_context_key"] or "")
+        target_game_key = str(row["target_game_key"] or "")
+        target_context_key = str(row["target_context_key"] or "")
         generic_rates = [
             _prior_role_success_rate(
                 transfer_rows,
@@ -2062,7 +2107,10 @@ def _transfer_explanation_events(
                     transfer_rows,
                     role=role,
                     before_step=int(step),
-                    target_scope=scope,
+                    source_game_key=source_game_key,
+                    source_context_key=source_context_key,
+                    target_game_key=target_game_key,
+                    target_context_key=target_context_key,
                     transfer_history=transfer_history,
                 )
             ]
@@ -2075,7 +2123,10 @@ def _transfer_explanation_events(
         # scoped evidence cannot establish a multi-role profile.
         combination_rates = scoped_rates if len(scoped_rates) >= 2 else generic_rates
         concept_score = _combined_role_score(combination_rates) if len(combination_rates) >= 2 else baseline
-        event_id = f"transfer:{source_role}:{target_role}:{scope[0]}:{scope[1]}"
+        event_id = (
+            f"transfer:{source_role}:{target_role}:{source_game_key}:{source_context_key}:"
+            f"{target_game_key}:{target_context_key}"
+        )
         outcome = float(int(row["reuse_success"] or 0))
         feature_step = (
             max(
@@ -3072,18 +3123,57 @@ def _predict_transfer_attempt(
         failure_reason = "role_mismatch"
     else:
         failure_reason = "no_source_profile"
-    source_scope_type = "not_game" if transfer_kind == "cross_game" else "not_context"
     target_scope_type = "game" if transfer_kind == "cross_game" else "context"
     transfer_score = similarity_score * min(1.0, source_carrier_count / 2.0)
-    attempt_seed = "|".join((transfer_kind, target_scope_key, target_carrier_signature))
+    source_carriers = tuple(str(value) for value in best.get("source_carrier_signatures", ()))
+    source_games = tuple(str(value) for value in best.get("source_game_keys", ()))
+    source_contexts = tuple(str(value) for value in best.get("source_context_keys", ()))
+    source_carrier_signature = source_carriers[0] if len(source_carriers) == 1 else None
+    source_game_key = source_games[0] if len(source_games) == 1 else None
+    source_context_key = source_contexts[0] if len(source_contexts) == 1 else None
+    target_games = (
+        (str(target_scope_key),)
+        if transfer_kind == "cross_game"
+        else tuple(str(value) for value in target.get("context_games", {}).get(target_scope_key, ()))
+    )
+    target_game_key = target_games[0] if len(target_games) == 1 else None
+    target_context_key = target_scope_key if transfer_kind == "cross_context" else None
+    provenance_mode = "single_source" if len(source_carriers) == 1 else "multi_source"
+    # Include the complete concrete provenance identity.  A multi-carrier
+    # profile is explicit in the JSON fields rather than collapsed into an
+    # arbitrary carrier or a negative pseudo-scope.
+    attempt_seed = "|".join((
+        transfer_kind,
+        predicted_role_signature,
+        source_game_key or ",".join(source_games),
+        target_game_key or "",
+        source_context_key or ",".join(source_contexts),
+        target_context_key or "",
+        source_carrier_signature or ",".join(source_carriers),
+        target_carrier_signature,
+        predicted_role_signature,
+    ))
     return {
         "attempt_id": sha1(attempt_seed.encode("utf-8")).hexdigest(),
         "role_signature": observed_role_signature,
         "transfer_kind": transfer_kind,
-        "source_scope_type": source_scope_type,
-        "source_scope_key": target_scope_key,
+        "source_scope_type": "game" if transfer_kind == "cross_game" else "context",
+        "source_scope_key": source_game_key if transfer_kind == "cross_game" else source_context_key,
         "target_scope_type": target_scope_type,
         "target_scope_key": target_scope_key,
+        "source_game_key": source_game_key,
+        "target_game_key": target_game_key,
+        "source_context_key": source_context_key,
+        "target_context_key": target_context_key,
+        "source_carrier_signature": source_carrier_signature,
+        "source_role_signature": predicted_role_signature,
+        "predicted_target_role_signature": predicted_role_signature,
+        "observed_target_role_signature": observed_role_signature,
+        "source_carrier_signatures_json": json.dumps(source_carriers),
+        "source_game_keys_json": json.dumps(source_games),
+        "source_context_keys_json": json.dumps(source_contexts),
+        "provenance_mode": provenance_mode,
+        "provenance_status": "verified" if provenance_mode == "single_source" else "aggregate_source",
         "target_carrier_signature": target_carrier_signature,
         "predicted_role_signature": predicted_role_signature,
         "observed_role_signature": observed_role_signature,
@@ -3108,6 +3198,19 @@ def _attempt_to_insert_tuple(attempt: dict[str, Any]) -> tuple[Any, ...]:
         attempt["source_scope_key"],
         attempt["target_scope_type"],
         attempt["target_scope_key"],
+        attempt["source_game_key"],
+        attempt["target_game_key"],
+        attempt["source_context_key"],
+        attempt["target_context_key"],
+        attempt["source_carrier_signature"],
+        attempt["source_role_signature"],
+        attempt["predicted_target_role_signature"],
+        attempt["observed_target_role_signature"],
+        attempt["source_carrier_signatures_json"],
+        attempt["source_game_keys_json"],
+        attempt["source_context_keys_json"],
+        attempt["provenance_mode"],
+        attempt["provenance_status"],
         attempt["target_carrier_signature"],
         attempt["predicted_role_signature"],
         attempt["observed_role_signature"],
@@ -3121,6 +3224,88 @@ def _attempt_to_insert_tuple(attempt: dict[str, Any]) -> tuple[Any, ...]:
         attempt["first_seen_global_step"],
         attempt["last_seen_global_step"],
     )
+
+
+def _expand_transfer_attempt_provenance(attempt: dict[str, Any]) -> list[dict[str, Any]]:
+    """Expand a multi-scope source profile into concrete source-target attempts.
+
+    The transfer score remains the score of the selected profile; expansion
+    records every concrete source scope that contributed to that profile so no
+    target scope is ever stored as synthetic source provenance.
+    """
+    kind = str(attempt["transfer_kind"])
+    source_keys = (
+        tuple(json.loads(str(attempt["source_game_keys_json"] or "[]")))
+        if kind == "cross_game"
+        else tuple(json.loads(str(attempt["source_context_keys_json"] or "[]")))
+    )
+    if not source_keys:
+        return [attempt]
+    source_carriers = tuple(json.loads(str(attempt["source_carrier_signatures_json"] or "[]")))
+    source_games = tuple(json.loads(str(attempt["source_game_keys_json"] or "[]")))
+    target_games = (str(attempt["target_game_key"]),) if attempt.get("target_game_key") else ()
+    result: list[dict[str, Any]] = []
+    for source_key in sorted(str(value) for value in source_keys):
+        concrete = dict(attempt)
+        if kind == "cross_game":
+            concrete["source_scope_type"] = "game"
+            concrete["source_scope_key"] = source_key
+            concrete["source_game_key"] = source_key
+        else:
+            concrete["source_scope_type"] = "context"
+            concrete["source_scope_key"] = source_key
+            concrete["source_context_key"] = source_key
+            concrete["source_game_key"] = source_games[0] if len(source_games) == 1 else None
+        concrete["source_carrier_signature"] = source_carriers[0] if len(source_carriers) == 1 else None
+        concrete["provenance_mode"] = "single_source" if len(source_carriers) == 1 else "multi_source"
+        concrete["provenance_status"] = "verified" if concrete["provenance_mode"] == "single_source" else "aggregate_source"
+        seed = "|".join((
+            kind,
+            str(concrete.get("source_role_signature") or ""),
+            str(concrete.get("source_game_key") or ""),
+            str(concrete.get("target_game_key") or ""),
+            str(concrete.get("source_context_key") or ""),
+            str(concrete.get("target_context_key") or ""),
+            str(concrete.get("source_carrier_signature") or ",".join(source_carriers)),
+            str(concrete["target_carrier_signature"]),
+            str(concrete.get("predicted_role_signature") or ""),
+        ))
+        concrete["attempt_id"] = sha1(seed.encode("utf-8")).hexdigest()
+        result.append(concrete)
+    return result
+
+
+def _validate_transfer_attempt_provenance(attempt: dict[str, Any]) -> None:
+    """Reject malformed concrete provenance before it reaches SQLite."""
+    mode = str(attempt.get("provenance_mode") or "")
+    if mode == "missing_source":
+        if any(attempt.get(key) not in (None, "") for key in (
+            "source_scope_type", "source_scope_key", "source_game_key", "source_context_key",
+            "source_carrier_signature", "source_role_signature",
+        )):
+            raise ValueError("missing-source transfer attempt contains source provenance")
+        return
+    if mode not in {"single_source", "multi_source"}:
+        raise ValueError(f"unsupported transfer provenance mode: {mode}")
+    kind = str(attempt.get("transfer_kind") or "")
+    if kind == "cross_game":
+        if not attempt.get("source_game_key") or not attempt.get("target_game_key"):
+            raise ValueError("cross-game transfer attempt is missing game provenance")
+        if str(attempt["source_game_key"]) == str(attempt["target_game_key"]):
+            raise ValueError("cross-game transfer attempt has identical source and target games")
+    elif kind == "cross_context":
+        if not attempt.get("source_context_key") or not attempt.get("target_context_key"):
+            raise ValueError("cross-context transfer attempt is missing context provenance")
+        if str(attempt["source_context_key"]) == str(attempt["target_context_key"]):
+            raise ValueError("cross-context transfer attempt has identical source and target contexts")
+        if attempt.get("source_game_key") and attempt.get("target_game_key") and str(attempt["source_game_key"]) != str(attempt["target_game_key"]):
+            raise ValueError("cross-context transfer attempt crosses games")
+    else:
+        raise ValueError(f"unsupported transfer kind: {kind}")
+    if int(attempt.get("reuse_success") or 0) == 1 and not attempt.get("source_role_signature"):
+        raise ValueError("successful transfer attempt is missing a source role")
+    if mode == "single_source" and not attempt.get("source_carrier_signature"):
+        raise ValueError("single-source transfer attempt is missing a source carrier")
 
 
 def _derive_role_transfer_attempts_chunk(
@@ -3138,7 +3323,9 @@ def _derive_role_transfer_attempts_chunk(
             transfer_kind=transfer_kind,
             target_scope_key=target_scope_key,
         )
-        rows.append(_attempt_to_insert_tuple(attempt))
+        for item in _expand_transfer_attempt_provenance(attempt):
+            _validate_transfer_attempt_provenance(item)
+            rows.append(_attempt_to_insert_tuple(item))
     return rows
 
 
@@ -3147,6 +3334,7 @@ def _build_transfer_profile_cache(
     role_rows: dict[str, dict[str, Any]],
     carrier_contexts: dict[str, set[str]],
     carrier_games: dict[str, set[str]],
+    context_games: dict[str, set[str]],
     target_scopes: list[tuple[str, str]],
 ) -> dict[tuple[str, str], list[dict[str, Any]]]:
     cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
@@ -3175,19 +3363,39 @@ def _build_transfer_profile_cache(
             included_carriers = [carrier for carrier in role_to_carriers[role_signature] if carrier not in excluded_carriers]
             if not included_carriers:
                 continue
+            if transfer_kind == "cross_context":
+                target_games = set(context_games.get(target_scope_key, set()))
+                included_carriers = [
+                    carrier for carrier in included_carriers
+                    if not target_games or bool(carrier_games.get(carrier, set()) & target_games)
+                ]
+                if not included_carriers:
+                    continue
             token_set: set[str] = set()
             context_set: set[str] = set()
             game_set: set[str] = set()
+            source_carriers: list[str] = []
             for carrier_signature in included_carriers:
+                source_carriers.append(carrier_signature)
                 token_set.update(carrier_to_tokens.get(carrier_signature, ()))
                 context_set.update(carrier_contexts.get(carrier_signature, set()))
                 game_set.update(carrier_games.get(carrier_signature, set()))
+            if transfer_kind == "cross_game":
+                game_set.discard(target_scope_key)
+            elif target_games:
+                context_set = {
+                    context for context in context_set
+                    if context_games.get(context, set()) & target_games
+                }
             profiles.append(
                 {
                     "role_signature": role_signature,
                     "profile_tokens": sorted(token_set),
                     "profile_token_set": token_set,
-                    "source_carrier_count": len(included_carriers),
+                    "source_carrier_signatures": tuple(sorted(source_carriers)),
+                    "source_game_keys": tuple(sorted(game_set)),
+                    "source_context_keys": tuple(sorted(context_set)),
+                    "source_carrier_count": len(source_carriers),
                     "source_context_count": len(context_set),
                     "source_game_count": len(game_set),
                 }
@@ -3214,17 +3422,29 @@ def _transfer_candidate_is_better(
 
 
 def _no_source_profile_attempt(target: dict[str, Any], transfer_kind: str, target_scope_key: str) -> dict[str, Any]:
-    source_scope_type = "not_game" if transfer_kind == "cross_game" else "not_context"
     target_scope_type = "game" if transfer_kind == "cross_game" else "context"
     attempt_seed = "|".join((transfer_kind, target_scope_key, str(target["carrier_signature"]), "no_source_profile"))
     return {
         "attempt_id": sha1(attempt_seed.encode("utf-8")).hexdigest(),
         "role_signature": str(target["role_signature"]),
         "transfer_kind": transfer_kind,
-        "source_scope_type": source_scope_type,
-        "source_scope_key": target_scope_key,
+        "source_scope_type": None,
+        "source_scope_key": None,
         "target_scope_type": target_scope_type,
         "target_scope_key": target_scope_key,
+        "source_game_key": None,
+        "target_game_key": target_scope_key if transfer_kind == "cross_game" else None,
+        "source_context_key": None,
+        "target_context_key": target_scope_key if transfer_kind == "cross_context" else None,
+        "source_carrier_signature": None,
+        "source_role_signature": None,
+        "predicted_target_role_signature": None,
+        "observed_target_role_signature": str(target["role_signature"]),
+        "source_carrier_signatures_json": "[]",
+        "source_game_keys_json": "[]",
+        "source_context_keys_json": "[]",
+        "provenance_mode": "missing_source",
+        "provenance_status": "missing_source_profile",
         "target_carrier_signature": str(target["carrier_signature"]),
         "predicted_role_signature": None,
         "observed_role_signature": str(target["role_signature"]),
@@ -3257,7 +3477,7 @@ def _carrier_links_by_carrier(state_conn: sqlite3.Connection) -> dict[str, dict[
 def _carrier_scope_maps(
     state_conn: sqlite3.Connection,
     graph_conn: sqlite3.Connection,
-) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+) -> tuple[dict[str, set[str]], dict[str, set[str]], dict[str, set[str]]]:
     links_by_carrier = _carrier_links_by_carrier(state_conn)
     carrier_contexts = {carrier: set(link_types.get("context", set())) for carrier, link_types in links_by_carrier.items()}
     carrier_games: dict[str, set[str]] = defaultdict(set)
@@ -3266,7 +3486,7 @@ def _carrier_scope_maps(
     for carrier_signature, contexts in carrier_contexts.items():
         for context in contexts:
             carrier_games[carrier_signature].update(context_games.get(f"context:{context}", set()))
-    return carrier_contexts, carrier_games
+    return carrier_contexts, carrier_games, context_games
 
 
 def _links_by_signature(

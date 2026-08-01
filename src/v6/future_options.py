@@ -212,9 +212,10 @@ def derive_future_option_events(
                 source_context_signature, source_action, source_game_id, source_sampler,
                 future_option_development_stage, survival_delta, movement_freedom_delta,
                 environmental_influence_delta, graph_expansion_delta, role_discovery_delta,
-                concept_transfer_delta, developmental_option_value, motif_classification_reason, evidence_json
+                concept_transfer_delta, developmental_option_value, motif_classification_reason,
+                classification_source, classification_rule, classification_evidence_id, evidence_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 payload["event_id"],
@@ -257,6 +258,9 @@ def derive_future_option_events(
                 payload["concept_transfer_delta"],
                 payload["developmental_option_value"],
                 payload["motif_classification_reason"],
+                payload["classification_source"],
+                payload["classification_rule"],
+                payload["classification_evidence_id"],
                 json.dumps(payload["evidence_json"], sort_keys=True),
             ),
         )
@@ -744,6 +748,7 @@ def derive_future_option_motifs(
                 "source_concepts": set(),
                 "development_components": [],
                 "classification_reasons": Counter(),
+                "classification_sources": Counter(),
                 "contexts": set(),
                 "games": set(),
                 "support_count": 0,
@@ -764,6 +769,8 @@ def derive_future_option_motifs(
         group["development_components"].append(_development_components_from_row(row))
         event_classification_reason = str(row.get("motif_classification_reason") or "unknown")
         group["classification_reasons"][event_classification_reason] += 1
+        event_classification_source = str(row.get("classification_source") or evidence.get("classification_source") or "unknown")
+        group["classification_sources"][event_classification_source] += 1
         if event_classification_reason.startswith("structural"):
             structural_classification_counts[event_classification_reason] += 1
         group["contexts"].update(contexts)
@@ -825,6 +832,11 @@ def derive_future_option_motifs(
         mean_replay_priority_score = _mean([row.get("replay_priority_score") for row in events])
         component_means = _mean_development_components(group["development_components"])
         classification_reason = _majority_counter_value(group["classification_reasons"])
+        classification_source = _majority_counter_value(group["classification_sources"])
+        if str(group["motif_type"]) != "unknown" and classification_source == "unknown":
+            # This should be unreachable for newly derived rows; legacy rows
+            # are downgraded rather than silently classified from text.
+            group["motif_type"] = "unknown"
         if str(group["motif_type"]) == "unknown":
             unknown_reason_counts[classification_reason] += linked_event_count
         for row in events:
@@ -855,9 +867,11 @@ def derive_future_option_motifs(
                 mean_termination_score, mean_replay_priority_score, first_seen_global_step, last_seen_global_step,
                 motif_stability_score, is_emergent, source_interaction_ids_json, source_family_ids_json,
                 source_carrier_ids_json, source_role_ids_json, source_concept_ids_json,
-                future_option_development_stage, development_component_means_json, motif_classification_reason
+                future_option_development_stage, development_component_means_json, motif_classification_reason,
+                classification_source, classification_rule, classification_evidence_id,
+                source_game_keys_json, target_game_keys_json, source_context_keys_json, target_context_keys_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 motif_signature,
@@ -889,6 +903,13 @@ def derive_future_option_motifs(
                 development_stage.value,
                 json.dumps(component_means, sort_keys=True),
                 classification_reason,
+                classification_source,
+                classification_reason,
+                str(events[0]["event_id"]) if events else None,
+                json.dumps(sorted(group["games"])),
+                json.dumps([]),
+                json.dumps(sorted(group["contexts"])),
+                json.dumps([]),
             ),
         )
         if is_emergent:
@@ -1275,9 +1296,10 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
             "is_emergent": int(row["is_emergent"] or 0),
             "support_count": int(row["support_count"] or 0),
             "motif_stability_score": float(row["motif_stability_score"] or 0.0),
+            "source_interaction_ids_json": row["source_interaction_ids_json"],
         }
         for row in state_conn.execute(
-            "SELECT motif_signature, is_emergent, support_count, motif_stability_score "
+            "SELECT motif_signature, is_emergent, support_count, motif_stability_score, source_interaction_ids_json "
             "FROM future_option_motifs ORDER BY motif_signature ASC"
         ).fetchall()
     }
@@ -1288,21 +1310,27 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
             concepts_by_role[role_signature].add(concept_signature)
     transfer_rows = [dict(row) for row in state_conn.execute(
         """
-        SELECT role_signature, transfer_score, best_margin, reuse_success, similarity_score,
-               source_carrier_count, candidate_role_count
+        SELECT source_role_signature AS role_signature, transfer_score, best_margin, reuse_success, similarity_score,
+               source_carrier_count, candidate_role_count, source_game_key, target_game_key,
+               source_context_key, target_context_key, provenance_mode
         FROM role_transfer_attempts
-        ORDER BY role_signature ASC, attempt_id ASC
+        WHERE provenance_mode = 'single_source'
+        ORDER BY source_role_signature ASC, attempt_id ASC
         """
     ).fetchall()]
     transfers_by_role: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in transfer_rows:
         transfers_by_role[str(row["role_signature"])].append(row)
-    promoted_concepts = {
-        str(row["concept_signature"])
+    concept_validation_status = {
+        str(row["concept_signature"]): (
+            "verified" if int(row["is_promoted"] or 0) == 1 and str(row["promotion_status"] or "") in {"promoted", "validated"}
+            else "proxy"
+        )
         for row in state_conn.execute(
-            "SELECT concept_signature FROM concept_candidates WHERE COALESCE(is_promoted, 0) = 1 ORDER BY concept_signature ASC"
+            "SELECT concept_signature, is_promoted, promotion_status FROM concept_candidates ORDER BY concept_signature ASC"
         ).fetchall()
     }
+    promoted_concepts = {signature for signature, status in concept_validation_status.items() if status == "verified"}
     inserted = 0
     motifs_with_transfer = 0
     motifs_with_strong_transfer = 0
@@ -1330,6 +1358,7 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
     for motif_signature in sorted(motif_links):
         motifs_seen_for_transfer += 1
         quality = motif_quality.get(motif_signature, {})
+        motif_provenance_status = "verified" if _coerce_list_json(quality.get("source_interaction_ids_json")) else "missing"
         is_emergent_motif = int(quality.get("is_emergent", 0)) == 1
         roles = sorted(
             set(motif_links[motif_signature].get("role", set()))
@@ -1373,6 +1402,17 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
                     continue
                 mean_transfer_score = _mean([row.get("transfer_score") for row in role_transfer_rows])
                 mean_best_margin = _mean([row.get("best_margin") for row in role_transfer_rows if row.get("best_margin") is not None])
+                provenance_keys = {
+                    (
+                        row.get("source_game_key"), row.get("target_game_key"),
+                        row.get("source_context_key"), row.get("target_context_key"),
+                    )
+                    for row in role_transfer_rows
+                }
+                provenance = next(iter(provenance_keys)) if len(provenance_keys) == 1 else (None, None, None, None)
+                link_provenance_mode = "single_source" if len(provenance_keys) == 1 else "multi_source"
+                transfer_provenance_status = "verified" if link_provenance_mode == "single_source" else "proxy"
+                concept_status = concept_validation_status.get(concept_signature, "missing") if concept_signature != "__none__" else "missing"
                 first_seen = _safe_min(state_conn, motif_signature, role_signature, concept_signature, "first")
                 last_seen = _safe_min(state_conn, motif_signature, role_signature, concept_signature, "last")
                 state_conn.execute(
@@ -1380,9 +1420,12 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
                     INSERT INTO future_option_transfer_links (
                         motif_signature, role_signature, concept_signature, transfer_attempt_count,
                         successful_transfer_count, strong_transfer_success_count, promoted_concept_count,
-                        mean_transfer_score, mean_best_margin, first_seen_global_step, last_seen_global_step
+                        mean_transfer_score, mean_best_margin, source_role_signature, source_game_key,
+                        target_game_key, source_context_key, target_context_key, provenance_mode,
+                        motif_provenance_status, transfer_provenance_status, concept_validation_status,
+                        first_seen_global_step, last_seen_global_step
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(motif_signature, role_signature, concept_signature) DO UPDATE SET
                         transfer_attempt_count = excluded.transfer_attempt_count,
                         successful_transfer_count = excluded.successful_transfer_count,
@@ -1390,6 +1433,15 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
                         promoted_concept_count = excluded.promoted_concept_count,
                         mean_transfer_score = excluded.mean_transfer_score,
                         mean_best_margin = excluded.mean_best_margin,
+                        source_role_signature = excluded.source_role_signature,
+                        source_game_key = excluded.source_game_key,
+                        target_game_key = excluded.target_game_key,
+                        source_context_key = excluded.source_context_key,
+                        target_context_key = excluded.target_context_key,
+                        provenance_mode = excluded.provenance_mode,
+                        motif_provenance_status = excluded.motif_provenance_status,
+                        transfer_provenance_status = excluded.transfer_provenance_status,
+                        concept_validation_status = excluded.concept_validation_status,
                         first_seen_global_step = excluded.first_seen_global_step,
                         last_seen_global_step = excluded.last_seen_global_step
                     """,
@@ -1403,6 +1455,15 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
                         promoted_concept_count,
                         mean_transfer_score,
                         mean_best_margin,
+                        role_signature,
+                        provenance[0],
+                        provenance[1],
+                        provenance[2],
+                        provenance[3],
+                        link_provenance_mode,
+                        motif_provenance_status,
+                        transfer_provenance_status,
+                        concept_status,
                         first_seen,
                         last_seen,
                     ),
@@ -1509,6 +1570,13 @@ def _build_future_option_event(
         source_role_ids=source_role_ids,
         source_concept_ids=source_concept_ids,
     )
+    classification_source = _classification_source_from_rule(motif_classification_reason)
+    # Text/legacy fallbacks are useful diagnostics but are not verified motif
+    # classifications.  Keep the observation while preventing it from being
+    # counted as a scientific motif type.
+    if classification_source == "unknown" and motif_type != "unknown":
+        motif_type = "unknown"
+        motif_classification_reason = "unverified_fallback"
     motif_type_source = fallback_motif_type_source
     polarity_text = str(polarity or "").lower()
     combined_text = " ".join(str(item or "") for item in text_fragments).lower()
@@ -1567,8 +1635,12 @@ def _build_future_option_event(
     evidence["development_components"] = components
     evidence["developmental_option_value"] = developmental_option_value
     evidence["motif_classification_reason"] = motif_classification_reason
+    evidence["classification_source"] = classification_source
+    evidence["classification_rule"] = motif_classification_reason
+    event_id = "foe:" + sha1(event_id_seed.encode("utf-8")).hexdigest()
+    evidence["classification_evidence_id"] = event_id
     return {
-        "event_id": "foe:" + sha1(event_id_seed.encode("utf-8")).hexdigest(),
+        "event_id": event_id,
         "owner_type": owner_type,
         "owner_key": owner_key,
         "game": None if game in (None, "") else str(game),
@@ -1608,6 +1680,9 @@ def _build_future_option_event(
         "concept_transfer_delta": components["concept_transfer_delta"],
         "developmental_option_value": developmental_option_value,
         "motif_classification_reason": motif_classification_reason,
+        "classification_source": classification_source,
+        "classification_rule": motif_classification_reason,
+        "classification_evidence_id": event_id,
         "evidence_json": evidence,
     }
 
@@ -1825,6 +1900,17 @@ def _classify_structural_motif(
     if source_interaction_ids or source_family_ids or source_carrier_ids:
         return "transform", "structural_graph_effect"
     return fallback_motif_type, "fallback_" + ("unknown" if fallback_motif_type == "unknown" else "text_or_legacy")
+
+
+def _classification_source_from_rule(rule: str) -> str:
+    mapping = {
+        "structural_effect": "structured_effect",
+        "structural_option_delta": "option_delta",
+        "structural_graph_effect": "graph_effect",
+        "structural_role_effect": "role_effect",
+        "structural_concept_effect": "concept_effect",
+    }
+    return mapping.get(str(rule), "unknown")
 
 
 def _compute_development_components(
@@ -2148,6 +2234,14 @@ def _coerce_list(value: Any) -> list[str]:
     if isinstance(value, list):
         return [str(item) for item in value if item not in (None, "")]
     return [str(value)]
+
+
+def _coerce_list_json(value: Any) -> list[str]:
+    try:
+        parsed = json.loads(str(value or "[]"))
+    except (TypeError, ValueError):
+        return []
+    return _coerce_list(parsed)
 
 
 def _load_jsonish(value: Any) -> dict[str, Any]:

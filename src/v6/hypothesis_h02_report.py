@@ -119,6 +119,12 @@ H02_DEFAULTS: dict[str, Any] = {
     "high_priority_replay_prediction_violation_ratio": None,
     "high_priority_replay_non_prediction_violation_ratio": None,
     "direct_replay_lift_available": False,
+    "interaction_population_id": None,
+    "sampling_scope": None,
+    "prediction_population_size": None,
+    "replay_population_size": None,
+    "common_population_size": None,
+    "replay_population_consistent": None,
     "high_priority_threshold_method": None,
     "sqlite_db_count_total": 0,
     "sqlite_db_count_inspected": 0,
@@ -363,6 +369,7 @@ def evaluate_h02_prediction_violation_attention(
                     result[key] = value
 
     _merge_direct_metrics_preserving_compact(result, direct_metrics)
+    _apply_h02_population_consistency(result)
     if result.get("direct_replay_lift_available") is True:
         result["missing_evidence"] = [
             item
@@ -514,7 +521,11 @@ def evaluate_h02_prediction_violation_attention(
     result["h02b_pre_carrier_timing_conclusion"] = timing["conclusion"]
     result["carrier_timing_note"] = timing["note"]
     result["decision"] = result["h02a_replay_attention_decision"]
-    result["h02_final_decision_basis"] = "Final H02 decision follows H02A replay/attention evidence; H02B is reported as a separate timing qualifier."
+    result["h02_final_decision_basis"] = (
+        "aggregate_proxy"
+        if result.get("replay_population_consistent") is False
+        else "Final H02 decision follows H02A replay/attention evidence; H02B is reported as a separate timing qualifier."
+    )
     result["scientific_conclusion"] = f"{result['h02a_replay_attention_conclusion']} {result['h02b_pre_carrier_timing_conclusion']}".strip()
 
     _populate_evidence_lists(result)
@@ -564,6 +575,11 @@ def _merge_direct_metrics_preserving_compact(result: dict[str, Any], direct_metr
         "high_priority_replay_non_prediction_violation_ratio",
         "prediction_violation_row_count",
         "non_prediction_violation_row_count",
+        "interaction_population_id",
+        "sampling_scope",
+        "prediction_population_size",
+        "replay_population_size",
+        "common_population_size",
     }
     empty_values = (None, 0, 0.0, False, "", [], {})
 
@@ -578,6 +594,29 @@ def _merge_direct_metrics_preserving_compact(result: dict[str, Any], direct_metr
 
         if result.get(key) in empty_values or raw_direct_available:
             result[key] = value
+
+
+def _apply_h02_population_consistency(result: dict[str, Any]) -> None:
+    """Direct replay lift is admissible only for one explicit population."""
+    prediction_size = result.get("prediction_population_size")
+    replay_size = result.get("replay_population_size")
+    common_size = result.get("common_population_size")
+    if prediction_size is None or replay_size is None or common_size is None:
+        result["replay_population_consistent"] = False
+        result["direct_replay_lift_available"] = False
+        _append_unique(
+            result.setdefault("missing_evidence", []),
+            "Direct replay lift is unavailable because prediction and replay populations are not jointly identified.",
+        )
+        return
+    consistent = int(common_size) == int(prediction_size) == int(replay_size)
+    result["replay_population_consistent"] = consistent
+    if not consistent:
+        result["direct_replay_lift_available"] = False
+        _append_unique(
+            result.setdefault("missing_evidence", []),
+            "Direct replay lift downgraded to aggregate proxy because prediction and replay populations differ.",
+        )
 
 
 def _raw_h02_evidence_is_empty_or_incomplete(
@@ -816,6 +855,11 @@ def _extract_h02_compact_metrics(memory_dir: Path) -> dict[str, Any]:
             "high_priority_replay_non_prediction_violation_ratio": None,
             "prediction_violation_replay_lift": replay_lift,
             "direct_replay_lift_available": replay_lift is not None and total_rows > 0 and violating_count > 0,
+            "interaction_population_id": "compact_memory:interaction_scores_and_prediction_violations",
+            "sampling_scope": "compact_memory_joined_interactions",
+            "prediction_population_size": total_rows if total_rows > 0 else None,
+            "replay_population_size": total_rows if total_rows > 0 else None,
+            "common_population_size": total_rows if total_rows > 0 else None,
             "compact_prediction_violation_count": violating_count,
             "compact_evidence_coverage_count": total_rows if total_rows > 0 else None,
         }
@@ -1694,6 +1738,11 @@ def _finalize_direct_metrics(
         "high_priority_replay_prediction_violation_ratio": None,
         "high_priority_replay_non_prediction_violation_ratio": None,
         "direct_replay_lift_available": False,
+        "interaction_population_id": "raw_db:" + str(db_path) + ":" + ",".join(sorted(candidate_tables)),
+        "sampling_scope": "raw_sqlite_direct",
+        "prediction_population_size": None,
+        "replay_population_size": None,
+        "common_population_size": None,
         "missing_evidence": [],
     }
     if row_count_available <= 0:
@@ -1718,6 +1767,11 @@ def _finalize_direct_metrics(
     non_violating_mean = None if row[4] is None else float(row[4])
 
     metrics["row_count_used"] = row_count_used
+    # The base relation is the joined/direct interaction population used for
+    # both the violation and replay aggregates.
+    metrics["prediction_population_size"] = row_count_used
+    metrics["replay_population_size"] = row_count_used
+    metrics["common_population_size"] = row_count_used
     metrics["prediction_violation_row_count"] = violating_count
     metrics["non_prediction_violation_row_count"] = non_violating_count
     if row_count_used > 0 and violating_count is not None:
@@ -2173,6 +2227,12 @@ def _finalize_h02_result(result: dict[str, Any], output_dir: Path) -> None:
         "row_count_available": result.get("row_count_available"),
         "compact_evidence_coverage_count": result.get("compact_evidence_coverage_count"),
         "evidence_coverage_ratio": result.get("evidence_coverage_ratio"),
+        "interaction_population_id": result.get("interaction_population_id"),
+        "sampling_scope": result.get("sampling_scope"),
+        "prediction_population_size": result.get("prediction_population_size"),
+        "replay_population_size": result.get("replay_population_size"),
+        "common_population_size": result.get("common_population_size"),
+        "replay_population_consistent": result.get("replay_population_consistent"),
     }
     material_values = [
         result["core_metrics"].get("prediction_violation_replay_lift"),

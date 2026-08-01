@@ -5028,6 +5028,24 @@ def _normalize_carrier_timing_source(value: Any) -> str:
 def _ensure_current_state_schema(path: Path) -> None:
     with sqlite3.connect(path) as connection:
         configure_compact_sqlite_connection(connection, write=True)
+        existing_tables = {
+            str(row[0])
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+        }
+        legacy_transfer_provenance = False
+        if "role_transfer_attempts" in existing_tables:
+            attempt_columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(role_transfer_attempts)").fetchall()
+            }
+            legacy_transfer_provenance = (
+                (
+                    "source_game_key" not in attempt_columns
+                    or "predicted_target_role_signature" not in attempt_columns
+                    or "provenance_status" not in attempt_columns
+                )
+                and bool(connection.execute("SELECT 1 FROM role_transfer_attempts LIMIT 1").fetchone())
+            )
         connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS stable_contingencies (
@@ -5309,6 +5327,19 @@ def _ensure_current_state_schema(path: Path) -> None:
                 source_scope_key TEXT,
                 target_scope_type TEXT,
                 target_scope_key TEXT,
+                source_game_key TEXT,
+                target_game_key TEXT,
+                source_context_key TEXT,
+                target_context_key TEXT,
+                source_carrier_signature TEXT,
+                source_role_signature TEXT,
+                predicted_target_role_signature TEXT,
+                observed_target_role_signature TEXT,
+                source_carrier_signatures_json TEXT,
+                source_game_keys_json TEXT,
+                source_context_keys_json TEXT,
+                provenance_mode TEXT,
+                provenance_status TEXT,
                 target_carrier_signature TEXT,
                 predicted_role_signature TEXT,
                 observed_role_signature TEXT,
@@ -5348,6 +5379,8 @@ def _ensure_current_state_schema(path: Path) -> None:
                 validation_prediction_lift REAL,
                 validation_action_selection_lift REAL,
                 validation_transfer_lift REAL,
+                validation_contradiction_resolution REAL,
+                validation_explanatory_gain REAL,
                 validation_evidence_count INTEGER,
                 promotion_status TEXT,
                 promotion_failure_count INTEGER DEFAULT 0
@@ -5474,6 +5507,9 @@ def _ensure_current_state_schema(path: Path) -> None:
                 concept_transfer_delta REAL,
                 developmental_option_value REAL,
                 motif_classification_reason TEXT,
+                classification_source TEXT,
+                classification_rule TEXT,
+                classification_evidence_id TEXT,
                 evidence_json TEXT
             );
             CREATE TABLE IF NOT EXISTS future_option_motifs (
@@ -5505,7 +5541,14 @@ def _ensure_current_state_schema(path: Path) -> None:
                 source_concept_ids_json TEXT,
                 future_option_development_stage TEXT,
                 development_component_means_json TEXT,
-                motif_classification_reason TEXT
+                motif_classification_reason TEXT,
+                classification_source TEXT,
+                classification_rule TEXT,
+                classification_evidence_id TEXT,
+                source_game_keys_json TEXT,
+                target_game_keys_json TEXT,
+                source_context_keys_json TEXT,
+                target_context_keys_json TEXT
             );
             CREATE TABLE IF NOT EXISTS future_option_links (
                 motif_signature TEXT,
@@ -5548,6 +5591,15 @@ def _ensure_current_state_schema(path: Path) -> None:
                 promoted_concept_count INTEGER,
                 mean_transfer_score REAL,
                 mean_best_margin REAL,
+                source_role_signature TEXT,
+                source_game_key TEXT,
+                target_game_key TEXT,
+                source_context_key TEXT,
+                target_context_key TEXT,
+                provenance_mode TEXT,
+                motif_provenance_status TEXT,
+                transfer_provenance_status TEXT,
+                concept_validation_status TEXT,
                 first_seen_global_step INTEGER,
                 last_seen_global_step INTEGER,
                 PRIMARY KEY (motif_signature, role_signature, concept_signature)
@@ -5672,6 +5724,28 @@ def _ensure_current_state_schema(path: Path) -> None:
         _ensure_column(connection, "role_transfer_attempts", "best_margin", "REAL")
         _ensure_column(connection, "role_transfer_attempts", "source_carrier_count", "INTEGER")
         _ensure_column(connection, "role_transfer_attempts", "candidate_role_count", "INTEGER")
+        _ensure_column(connection, "role_transfer_attempts", "source_game_key", "TEXT")
+        _ensure_column(connection, "role_transfer_attempts", "target_game_key", "TEXT")
+        _ensure_column(connection, "role_transfer_attempts", "source_context_key", "TEXT")
+        _ensure_column(connection, "role_transfer_attempts", "target_context_key", "TEXT")
+        _ensure_column(connection, "role_transfer_attempts", "source_carrier_signature", "TEXT")
+        _ensure_column(connection, "role_transfer_attempts", "source_role_signature", "TEXT")
+        _ensure_column(connection, "role_transfer_attempts", "predicted_target_role_signature", "TEXT")
+        _ensure_column(connection, "role_transfer_attempts", "observed_target_role_signature", "TEXT")
+        _ensure_column(connection, "role_transfer_attempts", "source_carrier_signatures_json", "TEXT")
+        _ensure_column(connection, "role_transfer_attempts", "source_game_keys_json", "TEXT")
+        _ensure_column(connection, "role_transfer_attempts", "source_context_keys_json", "TEXT")
+        _ensure_column(connection, "role_transfer_attempts", "provenance_mode", "TEXT")
+        _ensure_column(connection, "role_transfer_attempts", "provenance_status", "TEXT")
+        _ensure_column(connection, "future_option_transfer_links", "source_role_signature", "TEXT")
+        _ensure_column(connection, "future_option_transfer_links", "source_game_key", "TEXT")
+        _ensure_column(connection, "future_option_transfer_links", "target_game_key", "TEXT")
+        _ensure_column(connection, "future_option_transfer_links", "source_context_key", "TEXT")
+        _ensure_column(connection, "future_option_transfer_links", "target_context_key", "TEXT")
+        _ensure_column(connection, "future_option_transfer_links", "provenance_mode", "TEXT")
+        _ensure_column(connection, "future_option_transfer_links", "motif_provenance_status", "TEXT")
+        _ensure_column(connection, "future_option_transfer_links", "transfer_provenance_status", "TEXT")
+        _ensure_column(connection, "future_option_transfer_links", "concept_validation_status", "TEXT")
         _ensure_column(connection, "concept_candidates", "strong_transfer_success_count", "INTEGER")
         _ensure_column(connection, "concept_candidates", "transfer_success_concentration", "REAL")
         _ensure_column(connection, "concept_candidates", "is_overconcentrated", "INTEGER DEFAULT 0")
@@ -5696,6 +5770,8 @@ def _ensure_current_state_schema(path: Path) -> None:
         _ensure_column(connection, "world_model_components", "validation_prediction_lift", "REAL")
         _ensure_column(connection, "world_model_components", "validation_action_selection_lift", "REAL")
         _ensure_column(connection, "world_model_components", "validation_transfer_lift", "REAL")
+        _ensure_column(connection, "world_model_components", "validation_contradiction_resolution", "REAL")
+        _ensure_column(connection, "world_model_components", "validation_explanatory_gain", "REAL")
         _ensure_column(connection, "world_model_components", "promotion_status", "TEXT")
         _ensure_column(connection, "world_model_components", "promotion_failure_count", "INTEGER DEFAULT 0")
         _ensure_column(connection, "future_option_attention_links", "attention_signal_source", "TEXT")
@@ -5724,6 +5800,9 @@ def _ensure_current_state_schema(path: Path) -> None:
         _ensure_column(connection, "future_option_events", "concept_transfer_delta", "REAL")
         _ensure_column(connection, "future_option_events", "developmental_option_value", "REAL")
         _ensure_column(connection, "future_option_events", "motif_classification_reason", "TEXT")
+        _ensure_column(connection, "future_option_events", "classification_source", "TEXT")
+        _ensure_column(connection, "future_option_events", "classification_rule", "TEXT")
+        _ensure_column(connection, "future_option_events", "classification_evidence_id", "TEXT")
         _ensure_column(connection, "future_option_motifs", "source_interaction_ids_json", "TEXT")
         _ensure_column(connection, "future_option_motifs", "source_family_ids_json", "TEXT")
         _ensure_column(connection, "future_option_motifs", "source_carrier_ids_json", "TEXT")
@@ -5732,6 +5811,13 @@ def _ensure_current_state_schema(path: Path) -> None:
         _ensure_column(connection, "future_option_motifs", "future_option_development_stage", "TEXT")
         _ensure_column(connection, "future_option_motifs", "development_component_means_json", "TEXT")
         _ensure_column(connection, "future_option_motifs", "motif_classification_reason", "TEXT")
+        _ensure_column(connection, "future_option_motifs", "classification_source", "TEXT")
+        _ensure_column(connection, "future_option_motifs", "classification_rule", "TEXT")
+        _ensure_column(connection, "future_option_motifs", "classification_evidence_id", "TEXT")
+        _ensure_column(connection, "future_option_motifs", "source_game_keys_json", "TEXT")
+        _ensure_column(connection, "future_option_motifs", "target_game_keys_json", "TEXT")
+        _ensure_column(connection, "future_option_motifs", "source_context_keys_json", "TEXT")
+        _ensure_column(connection, "future_option_motifs", "target_context_keys_json", "TEXT")
         _ensure_column(connection, "memory_scores", "memory_state", "TEXT")
         _ensure_column(connection, "memory_scores", "stored_epoch", "INTEGER")
         _ensure_column(connection, "memory_scores", "last_replayed_epoch", "INTEGER")
@@ -5741,6 +5827,36 @@ def _ensure_current_state_schema(path: Path) -> None:
         _ensure_column(connection, "memory_scores", "compressed_into_id", "TEXT")
         _ensure_column(connection, "memory_scores", "superseded_by_id", "TEXT")
         _ensure_column(connection, "memory_scores", "forgetting_reason", "TEXT")
+        if legacy_transfer_provenance:
+            # Preserve old rows for audit, but never let the former
+            # target-relative pseudo-scopes support verified transfer claims.
+            connection.execute(
+                """
+                UPDATE role_transfer_attempts
+                SET provenance_mode = 'legacy', provenance_status = 'legacy'
+                WHERE provenance_mode IS NULL OR provenance_mode = ''
+                """
+            )
+            # Invalidate all artifacts derived from the old attempts.  A fresh
+            # higher-order pass replaces the retained audit rows transactionally.
+            for table in (
+                "concept_candidates",
+                "concept_links",
+                "world_model_components",
+                "world_model_links",
+                "concept_promotion_validation_diagnostics",
+                "future_option_transfer_links",
+            ):
+                if table in existing_tables:
+                    connection.execute(f"DELETE FROM {table}")
+            connection.execute(
+                """
+                INSERT INTO memory_summary (key, value_json)
+                VALUES ('role_transfer_provenance_migration', ?)
+                ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json
+                """,
+                (json.dumps({"rebuild_required": True, "schema": "concrete_source_scope_v2"}, sort_keys=True),),
+            )
         connection.execute("DROP INDEX IF EXISTS idx_carrier_links_carrier_type_key")
         connection.execute("DROP INDEX IF EXISTS idx_role_neighborhood_carrier")
         connection.commit()

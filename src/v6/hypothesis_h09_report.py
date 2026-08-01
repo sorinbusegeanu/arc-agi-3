@@ -62,6 +62,9 @@ def evaluate_h09_future_option_motifs(
             return result
         events = [dict(row) for row in conn.execute("SELECT * FROM future_option_events ORDER BY event_id ASC").fetchall()]
         motifs = [dict(row) for row in conn.execute("SELECT * FROM future_option_motifs ORDER BY motif_signature ASC").fetchall()]
+        transfer_links = [dict(row) for row in conn.execute(
+            "SELECT motif_signature, source_game_key, target_game_key, source_context_key, target_context_key, provenance_mode FROM future_option_transfer_links"
+        ).fetchall()] if "future_option_transfer_links" in {str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()} else []
         milestone_map = dict(conn.execute("SELECT milestone_name, first_global_step FROM higher_order_milestones").fetchall())
         summary_row = conn.execute(
             "SELECT value_json FROM memory_summary WHERE key = 'future_option_derivation_summary'"
@@ -71,8 +74,24 @@ def evaluate_h09_future_option_motifs(
         transformation_families_count = int(conn.execute("SELECT COUNT(*) FROM transformation_families").fetchone()[0])
     motif_type_counts = Counter(str(row["motif_type"] or "unknown") for row in motifs)
     emergent_count = sum(1 for row in motifs if int(row["is_emergent"] or 0) == 1)
-    cross_context_motif_count = sum(1 for row in motifs if int(row["cross_context_count"] or 0) >= 2)
-    cross_game_motif_count = sum(1 for row in motifs if int(row["cross_game_count"] or 0) >= 2)
+    concrete_scopes: dict[str, dict[str, set[str]]] = {}
+    for link in transfer_links:
+        if str(link.get("provenance_mode") or "") != "single_source":
+            continue
+        scope = concrete_scopes.setdefault(str(link["motif_signature"]), {"source_games": set(), "target_games": set(), "source_contexts": set(), "target_contexts": set()})
+        for field, key in (("source_game_key", "source_games"), ("target_game_key", "target_games"), ("source_context_key", "source_contexts"), ("target_context_key", "target_contexts")):
+            if link.get(field) not in (None, ""):
+                scope[key].add(str(link[field]))
+    cross_context_motif_count = sum(
+        1 for scope in concrete_scopes.values()
+        if scope["source_contexts"] and scope["target_contexts"]
+        and any(source != target for source in scope["source_contexts"] for target in scope["target_contexts"])
+    )
+    cross_game_motif_count = sum(
+        1 for scope in concrete_scopes.values()
+        if scope["source_games"] and scope["target_games"]
+        and any(source != target for source in scope["source_games"] for target in scope["target_games"])
+    )
     mean_abs_option_delta = _mean([abs(float(row.get("option_delta") or 0.0)) for row in events])
     max_abs_option_delta = max((abs(float(row.get("option_delta") or 0.0)) for row in events), default=None)
     mean_motif_stability_score = _mean([row.get("motif_stability_score") for row in motifs])
@@ -142,6 +161,36 @@ def evaluate_h09_future_option_motifs(
     result["structured_effect_event_count"] = int(source_counts.get("structured_effect", 0))
     result["text_keyword_event_count"] = int(source_counts.get("text_keyword", 0))
     result["future_option_edge_event_count"] = int(source_counts.get("future_option_edge", 0))
+    allowed_sources = {"structured_effect", "option_delta", "graph_effect", "role_effect", "concept_effect"}
+    verified_motifs = [
+        row for row in motifs
+        if str(row.get("motif_type") or "unknown") != "unknown"
+        and str(row.get("classification_source") or "unknown") in allowed_sources
+        and bool(_json_list(row.get("source_interaction_ids_json")))
+    ]
+    proxy_motifs = [
+        row for row in motifs
+        if str(row.get("motif_type") or "unknown") != "unknown"
+        and row not in verified_motifs
+        and str(row.get("classification_source") or "unknown") in allowed_sources
+    ]
+    legacy_motifs = [row for row in motifs if str(row.get("classification_source") or "unknown") == "unknown"]
+    result["verified_motif_count"] = len(verified_motifs)
+    result["proxy_motif_count"] = len(proxy_motifs)
+    result["legacy_motif_count"] = len(legacy_motifs)
+    result["classified_without_provenance_count"] = len(proxy_motifs) + sum(
+        1 for row in legacy_motifs if str(row.get("motif_type") or "unknown") != "unknown"
+    )
+    result["motif_scope_provenance"] = [
+        {
+            "motif_signature": signature,
+            "source_game_keys": sorted(scope["source_games"]),
+            "target_game_keys": sorted(scope["target_games"]),
+            "source_context_keys": sorted(scope["source_contexts"]),
+            "target_context_keys": sorted(scope["target_contexts"]),
+        }
+        for signature, scope in sorted(concrete_scopes.items())
+    ]
     non_unknown_types = [key for key, value in motif_type_counts.items() if key != "unknown" and value > 0]
     if not events:
         if stable_contingencies_count > 0 or transformation_families_count > 0:
@@ -155,6 +204,7 @@ def evaluate_h09_future_option_motifs(
         result["decision"] = "PARTIALLY_VALID"
     elif (
         emergent_count >= 1
+        and len(verified_motifs) >= 1
         and len(non_unknown_types) >= 2
         and (cross_context_motif_count >= 1 or cross_game_motif_count >= 1)
         and (mean_abs_option_delta or 0.0) > 0.0
@@ -167,6 +217,8 @@ def evaluate_h09_future_option_motifs(
         result["decision"] = "PARTIALLY_VALID"
     if (result.get("unknown_motif_event_ratio") or 0.0) > 0.20:
         result["missing_evidence"].append("Future-option event classification remains mostly unknown.")
+    if result["classified_without_provenance_count"]:
+        result["missing_evidence"].append("Classified motifs without concrete event provenance are excluded from scientific conclusions.")
     result["evidence_diagnostics"] = {
         "stable_contingencies_count": stable_contingencies_count,
         "transformation_families_count": transformation_families_count,
@@ -214,6 +266,10 @@ def evaluate_h09_future_option_motifs(
             "structured_effect_event_count",
             "text_keyword_event_count",
             "future_option_edge_event_count",
+            "verified_motif_count",
+            "proxy_motif_count",
+            "legacy_motif_count",
+            "classified_without_provenance_count",
         )
     }
     _write(output_dir, result)
@@ -223,6 +279,14 @@ def evaluate_h09_future_option_motifs(
 def _mean(values: list[Any]) -> float | None:
     cooked = [float(value) for value in values if value is not None]
     return (sum(cooked) / len(cooked)) if cooked else None
+
+
+def _json_list(value: Any) -> list[str]:
+    try:
+        parsed = json.loads(str(value or "[]"))
+    except (TypeError, ValueError):
+        return []
+    return [str(item) for item in parsed] if isinstance(parsed, list) else []
 
 
 def _write(output_dir: Path, result: dict[str, Any]) -> None:
