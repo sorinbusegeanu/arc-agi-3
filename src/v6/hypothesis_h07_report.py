@@ -5,7 +5,10 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from v6.higher_order_substrate import derive_higher_order_memory
+from v6.higher_order_substrate import (
+    IncrementalPromotionValidationConfig,
+    derive_higher_order_memory,
+)
 
 
 def evaluate_h07_concept_emergence(
@@ -14,6 +17,7 @@ def evaluate_h07_concept_emergence(
     run_dir: Path | None,
     output_dir: Path,
     already_derived: bool = False,
+    incremental_promotion_validation: IncrementalPromotionValidationConfig | None = None,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     current_state = Path(memory_dir) / "current_state.sqlite"
@@ -21,6 +25,9 @@ def evaluate_h07_concept_emergence(
         derive_higher_order_memory(memory_dir=memory_dir, run_dir=run_dir)
     if not current_state.exists():
         result = _base_result("INSUFFICIENT_EVIDENCE", [f"Missing expected compact-memory file: {current_state}"])
+        result["incremental_promotion_validation"] = _empty_incremental_promotion_validation_report(
+            incremental_promotion_validation
+        )
         _write_outputs(output_dir, result)
         return result
     with sqlite3.connect(current_state) as conn:
@@ -62,6 +69,11 @@ def evaluate_h07_concept_emergence(
             ORDER BY concept_signature ASC
             """
         ).fetchall()
+        incremental_validation = _load_incremental_promotion_validation_report(
+            conn,
+            config=incremental_promotion_validation,
+            expected_candidate_count=len(concept_rows),
+        )
         milestone_map = dict(conn.execute("SELECT milestone_name, first_global_step FROM higher_order_milestones").fetchall())
     roles_skipped_missing_carrier_links = 0
     roles_skipped_missing_family_links = 0
@@ -158,6 +170,7 @@ def evaluate_h07_concept_emergence(
         "roles_used_for_concepts": roles_used_for_concepts,
         "evidence_stage": None,
     }
+    metrics.update(incremental_validation["summary"])
     if successful_transfers == 0 and concept_candidate_count == 0:
         decision = "INSUFFICIENT_EVIDENCE"
         missing = ["no successful role transfers and no concept candidates available"]
@@ -210,6 +223,7 @@ def evaluate_h07_concept_emergence(
     result = _base_result(decision, missing)
     result.update(metrics)
     result["core_metrics"] = dict(metrics)
+    result["incremental_promotion_validation"] = incremental_validation
     _write_outputs(output_dir, result)
     return result
 
@@ -223,8 +237,101 @@ def _base_result(decision: str, missing_evidence: list[str]) -> dict[str, Any]:
     }
 
 
+def _empty_incremental_promotion_validation_report(
+    config: IncrementalPromotionValidationConfig | None,
+) -> dict[str, Any]:
+    if config is None or not config.enabled:
+        return {"enabled": False, "summary": {}, "candidates": []}
+    return {
+        "enabled": True,
+        "thresholds": _incremental_promotion_thresholds(config),
+        "summary": {
+            "concept_candidates_evaluated": 0,
+            "concepts_promoted": 0,
+            "concepts_rejected_no_incremental_coverage": 0,
+            "concepts_rejected_insufficient_cross_scope": 0,
+            "concepts_rejected_no_predictive_or_behavioral_lift": 0,
+            "concepts_rejected_no_heldout_samples": 0,
+            "concepts_rejected_heldout_validation_failed": 0,
+            "concepts_rejected_below_threshold": 0,
+            "concepts_demoted": 0,
+        },
+        "candidates": [],
+    }
+
+
+def _incremental_promotion_thresholds(config: IncrementalPromotionValidationConfig) -> dict[str, int | float]:
+    return {
+        "min_incremental_coverage": float(config.min_incremental_coverage),
+        "min_cross_context_or_game_evidence": int(config.min_cross_context_or_game_evidence),
+        "min_behavioral_or_predictive_lift": float(config.min_behavioral_or_predictive_lift),
+        "demotion_failure_limit": int(config.demotion_failure_limit),
+    }
+
+
+def _load_incremental_promotion_validation_report(
+    conn: sqlite3.Connection,
+    *,
+    config: IncrementalPromotionValidationConfig | None,
+    expected_candidate_count: int,
+) -> dict[str, Any]:
+    report = _empty_incremental_promotion_validation_report(config)
+    if not report["enabled"]:
+        return report
+    table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'concept_promotion_validation_diagnostics'"
+    ).fetchone()
+    if table_exists is None:
+        raise AssertionError("incremental promotion validation diagnostics table is missing")
+    candidates: list[dict[str, Any]] = []
+    for row in conn.execute(
+        "SELECT payload_json FROM concept_promotion_validation_diagnostics ORDER BY concept_signature ASC"
+    ).fetchall():
+        payload = json.loads(str(row["payload_json"]))
+        if not isinstance(payload, dict):
+            raise AssertionError("invalid incremental promotion validation diagnostic payload")
+        candidates.append(payload)
+    summary = {
+        "concept_candidates_evaluated": len(candidates),
+        "concepts_promoted": sum(1 for item in candidates if bool(item.get("promoted"))),
+        "concepts_rejected_no_incremental_coverage": sum(
+            1 for item in candidates if "no_incremental_coverage" in item.get("rejection_reasons", [])
+        ),
+        "concepts_rejected_insufficient_cross_scope": sum(
+            1
+            for item in candidates
+            if "insufficient_cross_context_or_game_evidence" in item.get("rejection_reasons", [])
+        ),
+        "concepts_rejected_no_predictive_or_behavioral_lift": sum(
+            1 for item in candidates if "no_predictive_or_behavioral_lift" in item.get("rejection_reasons", [])
+        ),
+        "concepts_rejected_no_heldout_samples": sum(
+            1 for item in candidates if "no_heldout_samples" in item.get("rejection_reasons", [])
+        ),
+        "concepts_rejected_heldout_validation_failed": sum(
+            1 for item in candidates if "heldout_validation_failed" in item.get("rejection_reasons", [])
+        ),
+        "concepts_rejected_below_threshold": sum(
+            1 for item in candidates if "below_promotion_threshold" in item.get("rejection_reasons", [])
+        ),
+        "concepts_demoted": sum(1 for item in candidates if bool(item.get("demoted"))),
+    }
+    assert summary["concept_candidates_evaluated"] == expected_candidate_count
+    assert summary["concepts_promoted"] == sum(1 for item in candidates if bool(item.get("promoted")))
+    assert summary["concepts_demoted"] == sum(1 for item in candidates if bool(item.get("demoted")))
+    for candidate in candidates:
+        promoted = bool(candidate.get("promoted"))
+        reasons = list(candidate.get("rejection_reasons", []))
+        assert not reasons if promoted else bool(reasons)
+    report["summary"] = summary
+    report["candidates"] = candidates
+    return report
+
+
 def _write_outputs(output_dir: Path, result: dict[str, Any]) -> None:
     (output_dir / "h07_concept_emergence_report.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    validation = result.get("incremental_promotion_validation", {})
+    validation_summary = validation.get("summary", {}) if isinstance(validation, dict) else {}
     text = (
         f"H07 decision: {result.get('decision')}\n"
         f"concept candidates: {result.get('concept_candidate_count')}\n"
@@ -242,6 +349,33 @@ def _write_outputs(output_dir: Path, result: dict[str, Any]) -> None:
         f"transfer success concentration: {result.get('concept_transfer_success_concentration')}\n"
         f"max compression gain: {result.get('max_compression_gain')}\n"
         f"max promotion score: {result.get('max_promotion_score')}\n"
+        f"incremental promotion validation enabled: {bool(validation.get('enabled', False)) if isinstance(validation, dict) else False}\n"
+        f"concept candidates evaluated: {validation_summary.get('concept_candidates_evaluated')}\n"
+        f"concepts promoted: {validation_summary.get('concepts_promoted')}\n"
+        f"rejected no incremental coverage: {validation_summary.get('concepts_rejected_no_incremental_coverage')}\n"
+        f"rejected insufficient cross scope: {validation_summary.get('concepts_rejected_insufficient_cross_scope')}\n"
+        f"rejected no predictive or behavioral lift: {validation_summary.get('concepts_rejected_no_predictive_or_behavioral_lift')}\n"
+        f"rejected no heldout samples: {validation_summary.get('concepts_rejected_no_heldout_samples')}\n"
+        f"rejected heldout validation failed: {validation_summary.get('concepts_rejected_heldout_validation_failed')}\n"
+        f"rejected below threshold: {validation_summary.get('concepts_rejected_below_threshold')}\n"
+        f"concepts demoted: {validation_summary.get('concepts_demoted')}\n"
     )
+    if isinstance(validation, dict) and bool(validation.get("enabled", False)):
+        for candidate in validation.get("candidates", []):
+            if not isinstance(candidate, dict):
+                continue
+            reasons = ",".join(str(item) for item in candidate.get("rejection_reasons", [])) or "none"
+            text += (
+                "\n"
+                f"concept={candidate.get('concept_id')}\n"
+                f"promoted={str(bool(candidate.get('promoted'))).lower()}\n"
+                f"score={float(candidate.get('promotion_score', 0.0) or 0.0):.2f} "
+                f"threshold={float(candidate.get('promotion_threshold', 0.0) or 0.0):.2f}\n"
+                f"incremental_coverage={float(candidate.get('incremental_explanatory_coverage', 0.0) or 0.0):.2f}\n"
+                f"heldout_samples={int(candidate.get('validation_evidence_count', 0) or 0)}\n"
+                f"prediction_lift={float(candidate.get('prediction_lift', 0.0) or 0.0):.2f}\n"
+                f"behavioral_lift={float(candidate.get('heldout_action_selection_lift', 0.0) or 0.0):.2f}\n"
+                f"rejection_reasons={reasons}\n"
+            )
     (output_dir / "h07_concept_emergence_report.txt").write_text(text, encoding="utf-8")
     (output_dir / "h07_concept_emergence.md").write_text("```\n" + text + "```\n", encoding="utf-8")

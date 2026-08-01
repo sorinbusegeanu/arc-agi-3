@@ -408,7 +408,13 @@ def run_hypothesis_suite_report(
                     timings["validate_concept_promotions_seconds"] = float(time.time() - t0)
             with _phase("H07"):
                 t0 = time.time()
-                h07 = evaluate_h07_concept_emergence(memory_dir=memory_dir, run_dir=run_dir, output_dir=h07_dir, already_derived=True)
+                h07 = evaluate_h07_concept_emergence(
+                    memory_dir=memory_dir,
+                    run_dir=run_dir,
+                    output_dir=h07_dir,
+                    already_derived=True,
+                    incremental_promotion_validation=promotion_validation_config,
+                )
                 timings["h07_seconds"] = float(time.time() - t0)
             with _phase("derive_world_model_components"):
                 t0 = time.time()

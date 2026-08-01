@@ -5361,6 +5361,10 @@ def _ensure_current_state_schema(path: Path) -> None:
                 last_seen_global_step INTEGER,
                 PRIMARY KEY (concept_signature, linked_type, linked_key)
             );
+            CREATE TABLE IF NOT EXISTS concept_promotion_validation_diagnostics (
+                concept_signature TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS world_model_components (
                 component_signature TEXT PRIMARY KEY,
                 component_type TEXT,

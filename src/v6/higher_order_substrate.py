@@ -19,6 +19,7 @@ ROLE_CLEAR_TABLES = (
     "role_transfer_attempts",
     "concept_candidates",
     "concept_links",
+    "concept_promotion_validation_diagnostics",
     "world_model_components",
     "world_model_links",
     "higher_order_milestones",
@@ -31,6 +32,7 @@ ROLE_ONLY_CLEAR_TABLES = (
     "role_transfer_attempts",
     "concept_candidates",
     "concept_links",
+    "concept_promotion_validation_diagnostics",
     "world_model_components",
     "world_model_links",
     "higher_order_milestones",
@@ -40,6 +42,7 @@ ROLE_TRANSFER_ONLY_CLEAR_TABLES = (
     "role_transfer_attempts",
     "concept_candidates",
     "concept_links",
+    "concept_promotion_validation_diagnostics",
     "world_model_components",
     "world_model_links",
 )
@@ -47,6 +50,7 @@ ROLE_TRANSFER_ONLY_CLEAR_TABLES = (
 CONCEPT_ONLY_CLEAR_TABLES = (
     "concept_candidates",
     "concept_links",
+    "concept_promotion_validation_diagnostics",
     "world_model_components",
     "world_model_links",
 )
@@ -1463,7 +1467,7 @@ def _validate_incremental_promotions(
             has_heldout_lift = bool(heldout_lifts) and max(heldout_lifts) >= float(config.min_behavioral_or_predictive_lift)
             legacy_promoted = bool(int(row["is_promoted"] or 0))
             promoted = legacy_promoted and has_cross_evidence and has_incremental_gain and has_heldout_lift
-            status, failure_count, demoted = _update_promotion_validation_state(
+            status, failure_count, demoted_this_validation = _update_promotion_validation_state(
                 state_conn,
                 candidate_type="concept",
                 candidate_signature=concept_signature,
@@ -1499,6 +1503,56 @@ def _validate_incremental_promotions(
                     int(promoted), concept_signature,
                 ),
             )
+            demoted = status == "demoted"
+            rejection_reasons = _concept_promotion_rejection_reasons(
+                promoted=promoted,
+                legacy_promoted=legacy_promoted,
+                has_incremental_gain=has_incremental_gain,
+                has_cross_evidence=has_cross_evidence,
+                heldout_lifts=heldout_lifts,
+                has_heldout_lift=has_heldout_lift,
+                demoted=demoted,
+            )
+            if promoted:
+                assert not rejection_reasons
+            else:
+                assert rejection_reasons
+            diagnostic = {
+                "concept_id": concept_signature,
+                "candidate_signature": concept_signature,
+                "source_role_ids": roles,
+                "source_carrier_ids": sorted(links.get("carrier", set())),
+                "source_family_ids": sorted(links.get("family", set())),
+                "derivation_evidence_count": len(derivation_attempts),
+                "validation_evidence_count": validation_evidence_count,
+                "validation_scope": "later_global_step" if validation_evidence_count else "unavailable",
+                "incremental_explanatory_coverage": incremental_coverage,
+                "incremental_compression_gain": incremental_compression,
+                "prediction_lift": concept_prediction_lift,
+                "future_option_prediction_lift": future_lift,
+                "transfer_lift": cross_game_transfer_lift,
+                "heldout_prediction_lift": validation_prediction_lift,
+                "heldout_action_selection_lift": validation_action_selection_lift,
+                "heldout_transfer_lift": validation_transfer_lift,
+                "cross_context_evidence_count": int(row["cross_context_count"] or 0),
+                "cross_game_evidence_count": int(row["cross_game_count"] or 0),
+                "promotion_score": adjusted_promotion_score,
+                "promotion_threshold": 0.55,
+                "validation_pass": promoted,
+                "promoted": promoted,
+                "rejection_reasons": rejection_reasons,
+                "consecutive_validation_failures": failure_count,
+                "demoted": demoted,
+                "demotion_reason": "demoted_after_repeated_failure" if demoted else None,
+            }
+            state_conn.execute(
+                """
+                INSERT INTO concept_promotion_validation_diagnostics (concept_signature, payload_json)
+                VALUES (?, ?)
+                ON CONFLICT(concept_signature) DO UPDATE SET payload_json = excluded.payload_json
+                """,
+                (concept_signature, json.dumps(diagnostic, sort_keys=True)),
+            )
             summary["concept_candidates_evaluated"] += 1
             if not has_incremental_gain:
                 summary["concepts_rejected_no_incremental_gain"] += 1
@@ -1506,7 +1560,7 @@ def _validate_incremental_promotions(
                 summary["concepts_rejected_no_heldout_lift"] += 1
             if promoted:
                 summary["concepts_promoted_with_behavioral_lift"] += 1
-            if demoted:
+            if demoted_this_validation:
                 summary["concepts_demoted"] += 1
 
     if validate_world_models:
@@ -1578,6 +1632,35 @@ def _mean_metric(items: list[dict[str, float]], key: str) -> float:
 def _mean_row_metric(items: list[dict[str, Any]], key: str) -> float | None:
     values = [float(item[key]) for item in items if item.get(key) is not None]
     return (sum(values) / len(values)) if values else None
+
+
+def _concept_promotion_rejection_reasons(
+    *,
+    promoted: bool,
+    legacy_promoted: bool,
+    has_incremental_gain: bool,
+    has_cross_evidence: bool,
+    heldout_lifts: list[float],
+    has_heldout_lift: bool,
+    demoted: bool,
+) -> list[str]:
+    """Expose the exact Phase 3 gate outcomes without changing the gates."""
+    if promoted:
+        return []
+    reasons: list[str] = []
+    if not has_incremental_gain:
+        reasons.append("no_incremental_coverage")
+    if not has_cross_evidence:
+        reasons.append("insufficient_cross_context_or_game_evidence")
+    if not heldout_lifts:
+        reasons.append("no_heldout_samples")
+    elif not has_heldout_lift:
+        reasons.extend(("no_predictive_or_behavioral_lift", "heldout_validation_failed"))
+    if not legacy_promoted:
+        reasons.append("below_promotion_threshold")
+    if demoted:
+        reasons.append("demoted_after_repeated_failure")
+    return list(dict.fromkeys(reasons)) or ["below_promotion_threshold"]
 
 
 def _update_promotion_validation_state(

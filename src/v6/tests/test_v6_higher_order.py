@@ -111,6 +111,32 @@ def test_incremental_promotion_validation_uses_later_evidence_and_demotes_withou
         validate_world_models=False,
     )
     assert first["concepts_promoted_with_behavioral_lift"] == 1
+    h07_after_first_validation = evaluate_h07_concept_emergence(
+        memory_dir=memory_dir,
+        run_dir=None,
+        output_dir=tmp_path / "h07_after_first_validation",
+        already_derived=True,
+        incremental_promotion_validation=config,
+    )
+    validation_report = h07_after_first_validation["incremental_promotion_validation"]
+    assert validation_report["enabled"] is True
+    assert validation_report["thresholds"] == {
+        "min_incremental_coverage": 0.05,
+        "min_cross_context_or_game_evidence": 2,
+        "min_behavioral_or_predictive_lift": 0.01,
+        "demotion_failure_limit": 1,
+    }
+    assert validation_report["summary"]["concept_candidates_evaluated"] == 1
+    candidate = validation_report["candidates"][0]
+    assert candidate["concept_id"] == "concept-a"
+    assert candidate["promoted"] is True
+    assert candidate["validation_pass"] is True
+    assert candidate["rejection_reasons"] == []
+    assert candidate["validation_evidence_count"] == 2
+    assert candidate["heldout_transfer_lift"] == 1.0
+    assert (tmp_path / "h07_after_first_validation" / "h07_concept_emergence_report.txt").read_text(
+        encoding="utf-8"
+    ).count("concept=concept-a") == 1
     with sqlite3.connect(paths.current_state) as conn:
         promoted = conn.execute(
             "SELECT is_promoted, validation_scope, validation_transfer_lift FROM concept_candidates WHERE concept_signature='concept-a'"
@@ -155,6 +181,113 @@ def test_incremental_promotion_validation_uses_later_evidence_and_demotes_withou
         ).fetchone()
     assert concept == (0, "demoted")
     assert component == (0, 1)
+    h07_after_demotion = evaluate_h07_concept_emergence(
+        memory_dir=memory_dir,
+        run_dir=None,
+        output_dir=tmp_path / "h07_after_demotion",
+        already_derived=True,
+        incremental_promotion_validation=config,
+    )
+    demoted_candidate = h07_after_demotion["incremental_promotion_validation"]["candidates"][0]
+    assert demoted_candidate["demoted"] is True
+    assert demoted_candidate["demotion_reason"] == "demoted_after_repeated_failure"
+    assert "no_predictive_or_behavioral_lift" in demoted_candidate["rejection_reasons"]
+    assert "heldout_validation_failed" in demoted_candidate["rejection_reasons"]
+
+
+def test_h07_incremental_validation_reports_explicit_rejection_reasons(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    paths = ensure_memory_layout(memory_dir)
+    with sqlite3.connect(paths.current_state) as conn:
+        for role in ("role-coverage", "role-scope", "role-heldout"):
+            conn.execute(
+                """
+                INSERT INTO role_candidates (
+                    role_signature, linked_carrier_count, linked_family_count, linked_context_count,
+                    cross_game_count, support_count
+                ) VALUES (?, 2, 1, 1, 1, 8)
+                """,
+                (role,),
+            )
+            for linked_type, linked_key in (
+                ("carrier", f"carrier-{role}"),
+                ("family", f"family-{role}"),
+                ("context", f"context-{role}"),
+                ("game", f"game-{role}"),
+            ):
+                conn.execute(
+                    "INSERT INTO role_links (role_signature, linked_type, linked_key, support_count) VALUES (?, ?, ?, 1)",
+                    (role, linked_type, linked_key),
+                )
+            conn.execute(
+                "INSERT INTO transformation_families (canonical_signature, prediction_lift, last_seen_global_step) VALUES (?, 0.4, 5)",
+                (f"family-{role}",),
+            )
+        for signature, role, explanatory_reach, contexts, games in (
+            ("concept-coverage", "role-coverage", 0.0, 2, 2),
+            ("concept-scope", "role-scope", 8.0, 1, 1),
+            ("concept-heldout", "role-heldout", 8.0, 2, 2),
+        ):
+            conn.execute(
+                """
+                INSERT INTO concept_candidates (
+                    concept_signature, compression_gain, explanatory_reach, promotion_score,
+                    cross_context_count, cross_game_count, first_seen_global_step, is_promoted
+                ) VALUES (?, 2.0, ?, 0.9, ?, ?, 10, 1)
+                """,
+                (signature, explanatory_reach, contexts, games),
+            )
+            for linked_type, linked_key in (
+                ("role", role),
+                ("carrier", f"carrier-{role}"),
+                ("family", f"family-{role}"),
+            ):
+                conn.execute(
+                    "INSERT INTO concept_links (concept_signature, linked_type, linked_key, support_count) VALUES (?, ?, ?, 1)",
+                    (signature, linked_type, linked_key),
+                )
+        conn.commit()
+
+    config = IncrementalPromotionValidationConfig(enabled=True)
+    validate_incremental_promotions_only(
+        memory_dir=memory_dir,
+        config=config,
+        validate_roles_and_concepts=True,
+        validate_world_models=False,
+    )
+    result = evaluate_h07_concept_emergence(
+        memory_dir=memory_dir,
+        run_dir=None,
+        output_dir=tmp_path / "h07",
+        already_derived=True,
+        incremental_promotion_validation=config,
+    )
+    validation = result["incremental_promotion_validation"]
+    candidates = {item["concept_id"]: item for item in validation["candidates"]}
+    assert "no_incremental_coverage" in candidates["concept-coverage"]["rejection_reasons"]
+    assert "insufficient_cross_context_or_game_evidence" in candidates["concept-scope"]["rejection_reasons"]
+    assert "no_heldout_samples" in candidates["concept-heldout"]["rejection_reasons"]
+    assert validation["summary"]["concept_candidates_evaluated"] == len(candidates)
+    assert validation["summary"]["concepts_promoted"] == 0
+    assert validation["summary"]["concepts_rejected_no_incremental_coverage"] == 1
+    assert validation["summary"]["concepts_rejected_insufficient_cross_scope"] == 1
+    assert validation["summary"]["concepts_rejected_no_heldout_samples"] == 3
+
+
+def test_h07_incremental_validation_disabled_keeps_candidates_empty(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    ensure_memory_layout(memory_dir)
+    result = evaluate_h07_concept_emergence(
+        memory_dir=memory_dir,
+        run_dir=None,
+        output_dir=tmp_path / "h07",
+        already_derived=True,
+    )
+    assert result["incremental_promotion_validation"] == {
+        "enabled": False,
+        "summary": {},
+        "candidates": [],
+    }
 
 
 def test_h06_predicts_correct_role_across_held_out_game(tmp_path: Path) -> None:
