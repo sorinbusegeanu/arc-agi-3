@@ -112,45 +112,133 @@ def _coverage_diagnostic(memory_dir: Path, *, epoch_id: str) -> dict:
     return json.loads(payload_json)
 
 
-def test_set_based_incremental_coverage_and_phase3_promotion_ignore_legacy_flag(tmp_path: Path) -> None:
+def _seed_functional_candidate(
+    memory_dir: Path,
+    *,
+    concept_signature: str = "concept-functional",
+    legacy_promoted: int = 0,
+    historical_rates: tuple[tuple[int, int], tuple[int, int]] = ((1, 1), (1, 1)),
+    heldout_success: int | None = 1,
+    include_prediction: bool = False,
+) -> None:
+    paths = ensure_memory_layout(memory_dir)
+    with sqlite3.connect(paths.current_state) as conn:
+        for index, role in enumerate(("role-a", "role-b")):
+            conn.execute(
+                """
+                INSERT INTO role_candidates (
+                    role_signature, linked_carrier_count, linked_family_count, linked_context_count,
+                    cross_game_count, support_count
+                ) VALUES (?, 1, 1, 1, 1, 2)
+                """,
+                (role,),
+            )
+            for linked_type, linked_key in (
+                ("carrier", f"carrier-{role}"),
+                ("family", f"family-{role}"),
+                ("context", "ctx-functional"),
+                ("game", f"game-{role}"),
+            ):
+                conn.execute(
+                    "INSERT INTO role_links (role_signature, linked_type, linked_key, support_count) VALUES (?, ?, ?, 1)",
+                    (role, linked_type, linked_key),
+                )
+            successes, failures = historical_rates[index]
+            for attempt_index in range(successes):
+                conn.execute(
+                    """
+                    INSERT INTO role_transfer_attempts (
+                        attempt_id, role_signature, target_scope_type, target_scope_key,
+                        reuse_success, last_seen_global_step
+                    ) VALUES (?, ?, 'game', 'target-game', 1, 5)
+                    """,
+                    (f"{role}-success-{attempt_index}", role),
+                )
+            for attempt_index in range(failures):
+                conn.execute(
+                    """
+                    INSERT INTO role_transfer_attempts (
+                        attempt_id, role_signature, target_scope_type, target_scope_key,
+                        reuse_success, last_seen_global_step
+                    ) VALUES (?, ?, 'game', 'target-game', 0, 6)
+                    """,
+                    (f"{role}-failure-{attempt_index}", role),
+                )
+        conn.execute(
+            """
+            INSERT INTO concept_candidates (
+                concept_signature, compression_gain, explanatory_reach, promotion_score,
+                cross_context_count, cross_game_count, first_seen_global_step, is_promoted
+            ) VALUES (?, 0.0, 0.0, 0.9, 2, 2, 10, ?)
+            """,
+            (concept_signature, legacy_promoted),
+        )
+        for role in ("role-a", "role-b"):
+            conn.execute(
+                "INSERT INTO concept_links (concept_signature, linked_type, linked_key, support_count) VALUES (?, 'role', ?, 1)",
+                (concept_signature, role),
+            )
+        if heldout_success is not None:
+            conn.execute(
+                """
+                INSERT INTO role_transfer_attempts (
+                    attempt_id, role_signature, observed_role_signature, target_scope_type, target_scope_key,
+                    reuse_success, last_seen_global_step
+                ) VALUES ('heldout-functional', 'role-a', 'role-target', 'game', 'target-game', ?, 20)
+                """,
+                (heldout_success,),
+            )
+        if include_prediction:
+            conn.execute(
+                """
+                CREATE TABLE prediction_results (
+                    id INTEGER PRIMARY KEY, global_step INTEGER, context_signature TEXT,
+                    predicted_family TEXT, actual_family TEXT, context_contradiction INTEGER
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO prediction_results VALUES (1, 21, 'ctx-functional', 'family-ok', 'family-ok', 1)
+                """
+            )
+        conn.commit()
+
+
+def test_functional_coverage_promotes_without_legacy_promotion_and_keeps_structural_overlap(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
-    _seed_set_coverage_candidate(memory_dir, extra_family_count=2, legacy_promoted=0)
+    _seed_functional_candidate(memory_dir, legacy_promoted=0)
 
     diagnostic = _coverage_diagnostic(memory_dir, epoch_id="epoch_1")
 
     assert diagnostic["legacy_promoted"] is False
     assert diagnostic["incremental_validation_promoted"] is True
     assert diagnostic["promoted"] is True
-    assert diagnostic["concept_explained_structure_count"] == 10
-    assert diagnostic["source_role_explained_structure_count"] == 8
-    assert diagnostic["overlapping_structure_count"] == 8
-    assert diagnostic["newly_explained_structure_count"] == 2
-    assert diagnostic["coverage_denominator_count"] == 10
-    assert diagnostic["incremental_explanatory_coverage"] == 0.2
-    assert diagnostic["incremental_coverage_diagnostics"]["incremental_coverage"] == 0.2
+    assert diagnostic["structural_overlap_ratio"] == 1.0
+    assert diagnostic["eligible_explanation_event_count"] == 1
+    assert diagnostic["explained_event_count"] == 1
+    assert diagnostic["incremental_explanatory_coverage"] == 1.0
+    assert diagnostic["explained_event_type_counts"] == {"transfer": 1}
 
 
-def test_set_based_incremental_coverage_is_zero_for_identical_sets_and_non_negative(tmp_path: Path) -> None:
+def test_identical_provenance_without_functional_gain_has_zero_coverage(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
-    _seed_set_coverage_candidate(memory_dir, extra_family_count=0)
+    _seed_functional_candidate(memory_dir, historical_rates=((2, 0), (1, 1)))
 
     diagnostic = _coverage_diagnostic(memory_dir, epoch_id="epoch_1")
 
-    assert diagnostic["newly_explained_structure_count"] == 0
     assert diagnostic["incremental_explanatory_coverage"] == 0.0
     assert diagnostic["incremental_explanatory_coverage"] >= 0.0
-    assert "no_incremental_coverage" in diagnostic["rejection_reasons"]
+    assert diagnostic["structural_overlap_ratio"] == 1.0
+    assert "no_incremental_explanatory_gain" in diagnostic["rejection_reasons"]
 
 
-def test_set_based_coverage_ignores_support_and_transfer_count_without_target_structures(tmp_path: Path) -> None:
+def test_functional_coverage_ignores_provenance_support_counts(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
-    _seed_set_coverage_candidate(memory_dir, extra_family_count=2)
+    _seed_functional_candidate(memory_dir)
     first = _coverage_diagnostic(memory_dir, epoch_id="epoch_1")
     with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
-        conn.execute("UPDATE role_candidates SET support_count = 999 WHERE role_signature = 'role-source'")
-        conn.execute(
-            "INSERT INTO role_transfer_attempts (attempt_id, role_signature, reuse_success, last_seen_global_step) VALUES ('extra-no-target', 'role-source', 1, 21)"
-        )
+        conn.execute("UPDATE role_candidates SET support_count = 999")
         conn.commit()
 
     second = _coverage_diagnostic(memory_dir, epoch_id="epoch_2")
@@ -159,93 +247,72 @@ def test_set_based_coverage_ignores_support_and_transfer_count_without_target_st
     assert second["coverage_longitudinal_change"]["incremental_coverage_delta"] == 0.0
 
 
-def test_successful_transfer_target_structures_increase_set_based_coverage(tmp_path: Path) -> None:
+def test_prediction_and_contradiction_events_are_held_out_and_deterministic(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
-    _seed_set_coverage_candidate(memory_dir, extra_family_count=0)
-    first = _coverage_diagnostic(memory_dir, epoch_id="epoch_1")
-    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
-        conn.execute(
-            "INSERT INTO role_candidates (role_signature, linked_carrier_count, linked_family_count, linked_context_count, cross_game_count, support_count) VALUES ('role-target', 1, 1, 0, 0, 1)"
-        )
-        conn.execute(
-            "INSERT INTO role_links (role_signature, linked_type, linked_key, support_count) VALUES ('role-target', 'family', 'family-target-new', 1)"
-        )
-        conn.execute(
-            """
-            INSERT INTO role_transfer_attempts (
-                attempt_id, role_signature, observed_role_signature, reuse_success, last_seen_global_step
-            ) VALUES ('heldout-target', 'role-source', 'role-target', 1, 22)
-            """
-        )
-        conn.commit()
+    _seed_functional_candidate(memory_dir, include_prediction=True)
+    diagnostic = _coverage_diagnostic(memory_dir, epoch_id="epoch_1")
 
-    second = _coverage_diagnostic(memory_dir, epoch_id="epoch_2")
-
-    assert first["incremental_explanatory_coverage"] == 0.0
-    assert second["newly_explained_structure_count"] == 1
-    assert second["incremental_explanatory_coverage"] == 1.0 / 9.0
-    assert second["concept_explained_structure_type_counts"] == {"family": 9}
-
-
-def test_set_coverage_longitudinally_identifies_denominator_and_overlap_growth(tmp_path: Path) -> None:
-    memory_dir = tmp_path / "memory"
-    _seed_set_coverage_candidate(memory_dir, extra_family_count=2)
-    first = _coverage_diagnostic(memory_dir, epoch_id="epoch_1")
-    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
-        conn.execute(
-            "INSERT INTO role_links (role_signature, linked_type, linked_key, support_count) VALUES ('role-source', 'family', 'family-source-growth', 1)"
-        )
-        conn.commit()
-
-    second = _coverage_diagnostic(memory_dir, epoch_id="epoch_2")
-
-    assert second["candidate_signature"] == first["candidate_signature"]
-    assert second["coverage_longitudinal_change"]["previous_epoch"] == "epoch_1"
-    assert second["incremental_explanatory_coverage"] == 2.0 / 11.0
-    assert second["coverage_decline_classification"]["classification"] == "mixed"
-    assert "denominator_growth_exceeded_candidate_growth" in second["coverage_change_causes"]
-    assert "increased_overlap_with_existing_structures" in second["coverage_change_causes"]
-
-
-def test_set_coverage_reports_removed_explanation_structures(tmp_path: Path) -> None:
-    memory_dir = tmp_path / "memory"
-    _seed_set_coverage_candidate(memory_dir, extra_family_count=2)
-    _coverage_diagnostic(memory_dir, epoch_id="epoch_1")
-    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
-        conn.execute(
-            "DELETE FROM concept_links WHERE concept_signature = 'concept-set' AND linked_key LIKE 'family-concept-%'"
-        )
-        conn.commit()
-
-    second = _coverage_diagnostic(memory_dir, epoch_id="epoch_2")
-
-    assert second["incremental_explanatory_coverage"] == 0.0
-    assert second["explanation_set_change"]["removed_structure_count"] == 2
-    assert "candidate_explanation_set_shrank" in second["coverage_change_causes"]
-    assert second["coverage_decline_classification"]["classification"] == "numerator_decline"
-
-
-def test_set_based_coverage_reports_all_failed_gates_and_deterministic_samples(tmp_path: Path) -> None:
-    memory_dir = tmp_path / "memory"
-    _seed_set_coverage_candidate(
-        memory_dir,
-        extra_family_count=25,
-        cross_scope_count=1,
-        promotion_score=0.1,
-        include_heldout=False,
+    assert {"transfer", "prediction", "contradiction_resolution"} <= set(diagnostic["explained_event_type_counts"])
+    assert diagnostic["explained_event_ids_sample"] == sorted(diagnostic["explained_event_ids_sample"])
+    assert all(
+        event_id.startswith(("transfer:", "prediction:", "contradiction_resolution:"))
+        for event_id in diagnostic["explained_event_ids_sample"]
     )
+
+
+def test_no_eligible_explanation_events_is_reported_separately(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_functional_candidate(memory_dir, heldout_success=None)
+    diagnostic = _coverage_diagnostic(memory_dir, epoch_id="epoch_1")
+    assert diagnostic["eligible_explanation_event_count"] == 0
+    assert "no_eligible_explanation_events" in diagnostic["rejection_reasons"]
+
+
+def test_failed_heldout_transfer_does_not_receive_prediction_credit(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_functional_candidate(memory_dir, heldout_success=0)
 
     diagnostic = _coverage_diagnostic(memory_dir, epoch_id="epoch_1")
 
-    assert diagnostic["newly_explained_structure_ids_sample"] == sorted(
-        diagnostic["newly_explained_structure_ids_sample"]
+    assert diagnostic["eligible_explanation_event_count"] == 1
+    assert diagnostic["explained_event_count"] == 0
+    assert diagnostic["mean_prediction_gain"] < 0.0
+    assert "no_incremental_explanatory_gain" in diagnostic["rejection_reasons"]
+
+
+def test_one_source_role_already_explains_event_gets_no_concept_credit(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_functional_candidate(memory_dir, historical_rates=((2, 0), (1, 1)))
+
+    diagnostic = _coverage_diagnostic(memory_dir, epoch_id="epoch_1")
+
+    assert diagnostic["eligible_explanation_event_count"] == 1
+    assert diagnostic["explained_event_count"] == 0
+    assert diagnostic["mean_compression_gain"] < 0.0
+
+
+def test_event_diagnostic_artifact_has_functional_scores(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_functional_candidate(memory_dir)
+    artifact = tmp_path / "reports" / "h07" / "h07_concept_explanation_events.jsonl"
+
+    validate_incremental_promotions_only(
+        memory_dir=memory_dir,
+        config=IncrementalPromotionValidationConfig(enabled=True),
+        validate_roles_and_concepts=True,
+        validate_world_models=False,
+        diagnostic_epoch_id="epoch_1",
+        explanation_events_path=artifact,
     )
-    assert len(diagnostic["newly_explained_structure_ids_sample"]) == 20
+
+    rows = [json.loads(line) for line in artifact.read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["event_id"].startswith("transfer:")
     assert {
-        "insufficient_cross_context_or_game_evidence",
-        "no_heldout_samples",
-        "below_promotion_score_threshold",
-    } <= set(diagnostic["rejection_reasons"])
+        "best_single_role_score", "lower_level_baseline_score", "concept_enabled_score",
+        "prediction_gain", "behavioral_gain", "compression_gain", "concept_incremental_gain",
+        "explained", "rejection_reason",
+    } <= set(rows[0])
 
 
 def test_incremental_validation_disabled_preserves_legacy_promotion(tmp_path: Path) -> None:
@@ -268,7 +335,7 @@ def test_incremental_validation_disabled_preserves_legacy_promotion(tmp_path: Pa
 
 def test_incremental_validation_failure_count_is_epoch_idempotent_and_resets_on_success(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
-    _seed_set_coverage_candidate(memory_dir, extra_family_count=0)
+    _seed_functional_candidate(memory_dir, heldout_success=None)
     config = IncrementalPromotionValidationConfig(enabled=True)
     for _ in range(2):
         validate_incremental_promotions_only(
@@ -280,10 +347,15 @@ def test_incremental_validation_failure_count_is_epoch_idempotent_and_resets_on_
         )
     with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
         first_failures = conn.execute(
-            "SELECT failure_count FROM promotion_validation_state WHERE candidate_type = 'concept' AND candidate_signature = 'concept-set'"
+            "SELECT failure_count FROM promotion_validation_state WHERE candidate_type = 'concept' AND candidate_signature = 'concept-functional'"
         ).fetchone()[0]
         conn.execute(
-            "INSERT INTO concept_links (concept_signature, linked_type, linked_key, support_count) VALUES ('concept-set', 'family', 'family-new-after-failure', 1)"
+            """
+            INSERT INTO role_transfer_attempts (
+                attempt_id, role_signature, observed_role_signature, target_scope_type, target_scope_key,
+                reuse_success, last_seen_global_step
+            ) VALUES ('heldout-after-failure', 'role-a', 'role-target', 'game', 'target-game', 1, 20)
+            """
         )
         conn.commit()
     assert first_failures == 1
@@ -296,7 +368,7 @@ def test_incremental_validation_failure_count_is_epoch_idempotent_and_resets_on_
     )
     with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
         status = conn.execute(
-            "SELECT failure_count, promotion_status, last_validation_epoch, last_validation_result FROM promotion_validation_state WHERE candidate_type = 'concept' AND candidate_signature = 'concept-set'"
+            "SELECT failure_count, promotion_status, last_validation_epoch, last_validation_result FROM promotion_validation_state WHERE candidate_type = 'concept' AND candidate_signature = 'concept-functional'"
         ).fetchone()
     assert status == (0, "promoted", "epoch_2", "passed")
 
@@ -330,6 +402,13 @@ def test_incremental_promotion_validation_uses_later_evidence_and_demotes_withou
                 VALUES (?, ?, ?, ?)
                 """,
                 (f"{role}-derivation", role, 0, 5),
+            )
+            conn.execute(
+                """
+                INSERT INTO role_transfer_attempts (attempt_id, role_signature, reuse_success, last_seen_global_step)
+                VALUES (?, ?, ?, ?)
+                """,
+                (f"{role}-positive-history", role, 1, 6),
             )
             conn.execute(
                 """
@@ -385,6 +464,11 @@ def test_incremental_promotion_validation_uses_later_evidence_and_demotes_withou
     assert validation_report["enabled"] is True
     assert validation_report["thresholds"] == {
         "min_incremental_coverage": 0.05,
+        "min_incremental_explanatory_coverage": 0.05,
+        "min_event_prediction_gain": 0.01,
+        "min_event_behavioral_gain": 0.01,
+        "min_event_compression_gain": 0.0,
+        "min_explanation_event_count": 1,
         "min_cross_context_or_game_evidence": 2,
         "min_behavioral_or_predictive_lift": 0.01,
         "demotion_failure_limit": 1,
@@ -397,7 +481,7 @@ def test_incremental_promotion_validation_uses_later_evidence_and_demotes_withou
     assert candidate["validation_pass"] is True
     assert candidate["rejection_reasons"] == []
     assert candidate["validation_evidence_count"] == 2
-    assert candidate["heldout_transfer_lift"] == 1.0
+    assert candidate["heldout_transfer_lift"] > 0.0
     assert "source_role_ids" not in candidate
     assert candidate["source_role_count"] == 2
     assert candidate["source_role_ids_sample"] == ["role-a", "role-b"]
@@ -408,7 +492,8 @@ def test_incremental_promotion_validation_uses_later_evidence_and_demotes_withou
         promoted = conn.execute(
             "SELECT is_promoted, validation_scope, validation_transfer_lift FROM concept_candidates WHERE concept_signature='concept-a'"
         ).fetchone()
-    assert promoted == (1, "later_global_step", 1.0)
+    assert promoted[0:2] == (1, "later_global_step")
+    assert promoted[2] > 0.0
     validate_incremental_promotions_only(
         memory_dir=memory_dir,
         config=config,
@@ -533,12 +618,12 @@ def test_h07_incremental_validation_reports_explicit_rejection_reasons(tmp_path:
     )
     validation = result["incremental_promotion_validation"]
     candidates = {item["concept_id"]: item for item in validation["candidates"]}
-    assert "no_incremental_coverage" in candidates["concept-coverage"]["rejection_reasons"]
+    assert "no_eligible_explanation_events" in candidates["concept-coverage"]["rejection_reasons"]
     assert "insufficient_cross_context_or_game_evidence" in candidates["concept-scope"]["rejection_reasons"]
     assert "no_heldout_samples" in candidates["concept-heldout"]["rejection_reasons"]
     assert validation["summary"]["concept_candidates_evaluated"] == len(candidates)
     assert validation["summary"]["concepts_promoted"] == 0
-    assert validation["summary"]["concepts_rejected_no_incremental_coverage"] == 1
+    assert validation["summary"]["concepts_rejected_no_incremental_coverage"] == 3
     assert validation["summary"]["concepts_rejected_insufficient_cross_scope"] == 1
     assert validation["summary"]["concepts_rejected_no_heldout_samples"] == 3
 

@@ -417,6 +417,7 @@ def run_hypothesis_suite_report(
                         validate_roles_and_concepts=True,
                         validate_world_models=False,
                         diagnostic_epoch_id=epoch_id,
+                        explanation_events_path=h07_dir / "h07_concept_explanation_events.jsonl",
                     )
                     timings["validate_concept_promotions_seconds"] = float(time.time() - t0)
             with _phase("H07"):

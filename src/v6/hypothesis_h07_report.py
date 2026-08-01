@@ -304,6 +304,11 @@ def _empty_incremental_promotion_validation_report(
 def _incremental_promotion_thresholds(config: IncrementalPromotionValidationConfig) -> dict[str, int | float]:
     return {
         "min_incremental_coverage": float(config.min_incremental_coverage),
+        "min_incremental_explanatory_coverage": float(config.min_incremental_explanatory_coverage),
+        "min_event_prediction_gain": float(config.min_event_prediction_gain),
+        "min_event_behavioral_gain": float(config.min_event_behavioral_gain),
+        "min_event_compression_gain": float(config.min_event_compression_gain),
+        "min_explanation_event_count": int(config.min_explanation_event_count),
         "min_cross_context_or_game_evidence": int(config.min_cross_context_or_game_evidence),
         "min_behavioral_or_predictive_lift": float(config.min_behavioral_or_predictive_lift),
         "demotion_failure_limit": int(config.demotion_failure_limit),
@@ -347,7 +352,12 @@ def _load_incremental_promotion_validation_report(
         "concept_candidates_evaluated": len(candidates),
         "concepts_promoted": sum(1 for item in candidates if bool(item.get("promoted"))),
         "concepts_rejected_no_incremental_coverage": sum(
-            1 for item in candidates if "no_incremental_coverage" in item.get("rejection_reasons", [])
+            1
+            for item in candidates
+            if any(
+                reason in {"no_incremental_explanatory_gain", "no_eligible_explanation_events"}
+                for reason in item.get("rejection_reasons", [])
+            )
         ),
         "concepts_rejected_insufficient_cross_scope": sum(
             1
@@ -393,19 +403,30 @@ def _incremental_coverage_aggregate(candidates: list[dict[str, Any]]) -> dict[st
         and item["coverage_longitudinal_change"].get("incremental_coverage_delta") is not None
     ]
     classifications = [
-        item.get("coverage_decline_classification", {})
+        {
+            "classification": item.get("functional_coverage_longitudinal_change", {}).get("classification"),
+            "numerator_growth_rate": (
+                float(item.get("functional_coverage_longitudinal_change", {}).get("explained_event_count_delta") or 0.0)
+                / max(1.0, float(item.get("functional_coverage_longitudinal_change", {}).get("previous_explained_event_count") or 0.0))
+            ),
+            "denominator_growth_rate": (
+                float(item.get("functional_coverage_longitudinal_change", {}).get("eligible_event_count_delta") or 0.0)
+                / max(1.0, float(item.get("functional_coverage_longitudinal_change", {}).get("previous_eligible_event_count") or 0.0))
+            ),
+            "overlap_growth_rate": 0.0,
+        }
         for item in candidates
-        if isinstance(item.get("coverage_decline_classification"), dict)
+        if isinstance(item.get("functional_coverage_longitudinal_change"), dict)
     ]
     return {
         "candidates_with_declining_coverage": sum(
             1 for change in changes if float(change.get("incremental_coverage_delta", 0.0) or 0.0) < 0.0
         ),
         "candidates_with_denominator_growth": sum(
-            1 for item in classifications if item.get("classification") in {"denominator_growth", "mixed"}
+            1 for item in classifications if item.get("classification") in {"eligible_event_growth", "mixed"}
         ),
         "candidates_with_numerator_decline": sum(
-            1 for item in classifications if item.get("classification") in {"numerator_decline", "mixed"}
+            1 for item in classifications if item.get("classification") in {"concept_gain_decline", "mixed"}
         ),
         "candidates_with_overlap_growth": sum(
             1 for item in classifications if item.get("classification") in {"overlap_growth", "mixed"}
@@ -464,23 +485,20 @@ def _write_outputs(output_dir: Path, result: dict[str, Any]) -> None:
             if not isinstance(candidate, dict):
                 continue
             reasons = ",".join(str(item) for item in candidate.get("rejection_reasons", [])) or "none"
-            coverage = candidate.get("incremental_coverage_diagnostics", {})
-            longitudinal = candidate.get("coverage_longitudinal_change", {})
-            causes = list(candidate.get("coverage_change_causes", []))
-            previous_coverage = longitudinal.get("previous_incremental_coverage") if isinstance(longitudinal, dict) else None
-            current_coverage = longitudinal.get("current_incremental_coverage") if isinstance(longitudinal, dict) else None
+            longitudinal = candidate.get("functional_coverage_longitudinal_change", {})
+            previous_coverage = longitudinal.get("previous_incremental_explanatory_coverage") if isinstance(longitudinal, dict) else None
+            current_coverage = longitudinal.get("current_incremental_explanatory_coverage") if isinstance(longitudinal, dict) else None
             if previous_coverage is None:
-                coverage_section = "Coverage baseline unavailable.\n"
+                coverage_section = "Functional coverage baseline unavailable.\n"
             elif current_coverage is not None and float(current_coverage) < float(previous_coverage):
                 coverage_section = (
-                    f"Coverage declined from {float(previous_coverage):.5f} to {float(current_coverage):.5f}.\n"
-                    f"Candidate explained structures: {longitudinal.get('previous_candidate_explained_count')} → {longitudinal.get('current_candidate_explained_count')}.\n"
-                    f"Coverage denominator: {longitudinal.get('previous_denominator_count')} → {longitudinal.get('current_denominator_count')}.\n"
-                    f"Already-explained overlap: {longitudinal.get('previous_overlap_weight')} → {longitudinal.get('current_overlap_weight')}.\n"
-                    f"Primary cause: {causes[0] if causes else 'not_determined'}.\n"
+                    f"Functional coverage declined from {float(previous_coverage):.5f} to {float(current_coverage):.5f}.\n"
+                    f"Explained events: {longitudinal.get('previous_explained_event_count')} → {longitudinal.get('current_explained_event_count')}.\n"
+                    f"Eligible events: {longitudinal.get('previous_eligible_event_count')} → {longitudinal.get('current_eligible_event_count')}.\n"
+                    f"Primary cause: {longitudinal.get('classification', 'not_determined')}.\n"
                 )
             else:
-                coverage_section = "Coverage did not decline.\n"
+                coverage_section = "Functional coverage did not decline.\n"
             text += (
                 "\n"
                 f"concept={candidate.get('concept_id')}\n"
@@ -492,9 +510,9 @@ def _write_outputs(output_dir: Path, result: dict[str, Any]) -> None:
                 f"prediction_lift={float(candidate.get('prediction_lift', 0.0) or 0.0):.2f}\n"
                 f"behavioral_lift={float(candidate.get('heldout_action_selection_lift', 0.0) or 0.0):.2f}\n"
                 f"rejection_reasons={reasons}\n"
-                f"concept_explained_structures={coverage.get('concept_explained_structure_count')} "
-                f"newly_explained_structures={coverage.get('newly_explained_structure_count')} "
-                f"denominator={coverage.get('coverage_denominator_count')}\n"
+                f"eligible_events={int(candidate.get('eligible_explanation_event_count', 0) or 0)} "
+                f"explained_events={int(candidate.get('explained_event_count', 0) or 0)} "
+                f"structural_overlap={float(candidate.get('structural_overlap_ratio', 0.0) or 0.0):.2f}\n"
                 f"{coverage_section}"
             )
     (output_dir / "h07_concept_emergence_report.txt").write_text(text, encoding="utf-8")

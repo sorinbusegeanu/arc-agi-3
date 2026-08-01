@@ -91,6 +91,11 @@ class IncrementalPromotionValidationConfig:
 
     enabled: bool = False
     min_incremental_coverage: float = 0.05
+    min_incremental_explanatory_coverage: float = 0.05
+    min_event_prediction_gain: float = 0.01
+    min_event_behavioral_gain: float = 0.01
+    min_event_compression_gain: float = 0.0
+    min_explanation_event_count: int = 1
     min_cross_context_or_game_evidence: int = 2
     min_behavioral_or_predictive_lift: float = 0.01
     demotion_failure_limit: int = 2
@@ -1235,6 +1240,7 @@ def validate_incremental_promotions_only(
     validate_roles_and_concepts: bool,
     validate_world_models: bool,
     diagnostic_epoch_id: str | int | None = None,
+    explanation_events_path: Path | None = None,
 ) -> dict[str, Any]:
     """Apply optional held-out validation without deleting failed candidates."""
     if not config.enabled:
@@ -1248,6 +1254,7 @@ def validate_incremental_promotions_only(
             validate_roles_and_concepts=validate_roles_and_concepts,
             validate_world_models=validate_world_models,
             diagnostic_epoch_id=diagnostic_epoch_id,
+            explanation_events_path=explanation_events_path,
         )
         state_conn.execute(
             """
@@ -1268,6 +1275,7 @@ def _validate_incremental_promotions(
     validate_roles_and_concepts: bool,
     validate_world_models: bool,
     diagnostic_epoch_id: str | int | None,
+    explanation_events_path: Path | None,
 ) -> dict[str, Any]:
     """Calculate Phase 3 metrics from existing structures and later evidence.
 
@@ -1304,8 +1312,9 @@ def _validate_incremental_promotions(
     }
     transfer_rows = state_conn.execute(
         """
-        SELECT role_signature, reuse_success, last_seen_global_step,
-               observed_role_signature, predicted_role_signature, target_carrier_signature
+        SELECT attempt_id, role_signature, reuse_success, last_seen_global_step,
+               observed_role_signature, predicted_role_signature, target_carrier_signature,
+               source_scope_type, source_scope_key, target_scope_type, target_scope_key
         FROM role_transfer_attempts
         ORDER BY role_signature ASC, attempt_id ASC
         """
@@ -1322,7 +1331,8 @@ def _validate_incremental_promotions(
             successful_transfer_target_roles_by_role[source_role].add(str(target_role))
     future_rows = state_conn.execute(
         """
-        SELECT source_role_id, owner_type, owner_key, option_delta
+        SELECT event_id, source_role_id, owner_type, owner_key, option_delta,
+               first_seen_global_step, last_seen_global_step
         FROM future_option_events
         """
     ).fetchall()
@@ -1334,11 +1344,7 @@ def _validate_incremental_promotions(
         if role_signature:
             future_by_role[str(role_signature)].append(float(row["option_delta"] or 0.0))
     previous_coverage_states = _load_incremental_coverage_states(state_conn)
-    previous_states_by_fingerprint: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for previous_state in previous_coverage_states.values():
-        fingerprint = str(previous_state.get("structure_fingerprint") or "")
-        if fingerprint:
-            previous_states_by_fingerprint[fingerprint].append(previous_state)
+    explanation_event_rows: list[dict[str, Any]] = []
 
     role_metrics: dict[str, dict[str, Any]] = {}
     if validate_roles_and_concepts:
@@ -1458,23 +1464,7 @@ def _validate_incremental_promotions(
             baseline_prediction = _mean_metric(source_metrics, "prediction")
             baseline_future = _mean_metric(source_metrics, "future")
             baseline_transfer = _mean_metric(source_metrics, "transfer")
-            coverage_denominator = concept_explained_structures | source_role_explained_structures
-            newly_explained_structures = concept_explained_structures - source_role_explained_structures
-            incremental_coverage = (
-                float(len(newly_explained_structures)) / float(len(coverage_denominator))
-                if coverage_denominator
-                else 0.0
-            )
-            incremental_compression = float(row["compression_gain"] or 0.0) - baseline_compression
             first_seen = None if row["first_seen_global_step"] is None else int(row["first_seen_global_step"])
-            heldout_attempts = [
-                attempt
-                for role in roles
-                for attempt in transfers_by_role.get(role, [])
-                if first_seen is not None
-                and attempt["last_seen_global_step"] is not None
-                and int(attempt["last_seen_global_step"]) > first_seen
-            ]
             derivation_attempts = [
                 attempt
                 for role in roles
@@ -1488,25 +1478,24 @@ def _validate_incremental_promotions(
                 if derivation_attempts
                 else baseline_transfer
             )
-            validation_evidence_count = len(heldout_attempts)
-            validation_transfer_lift = (
-                (sum(int(attempt["reuse_success"] or 0) for attempt in heldout_attempts) / validation_evidence_count)
-                - derivation_transfer_rate
-                if validation_evidence_count
-                else None
+            explanation_events, functional_diagnostics, functional_state = _build_functional_explanation_diagnostics(
+                state_conn=state_conn,
+                candidate_signature=concept_signature,
+                source_roles=roles,
+                first_seen_global_step=first_seen,
+                transfer_rows=transfer_rows,
+                future_rows=future_rows,
+                previous_state=previous_coverage_states.get(concept_signature),
+                diagnostic_epoch_id=diagnostic_epoch_id,
+                config=config,
             )
-            heldout_prediction = [
-                lift
-                for family in links.get("family", set())
-                for lift, family_last_seen in (family_prediction.get(family, (0.0, None)),)
-                if first_seen is not None and family_last_seen is not None and family_last_seen > first_seen
-            ]
-            validation_prediction_lift = (
-                (sum(heldout_prediction) / len(heldout_prediction)) - baseline_prediction
-                if heldout_prediction
-                else None
-            )
-            validation_action_selection_lift = validation_transfer_lift
+            explanation_event_rows.extend(explanation_events)
+            incremental_coverage = float(functional_diagnostics["incremental_explanatory_coverage"])
+            incremental_compression = float(functional_diagnostics["incremental_compression_gain"])
+            validation_evidence_count = int(functional_diagnostics["eligible_explanation_event_count"])
+            validation_prediction_lift = functional_diagnostics["mean_prediction_gain"] if validation_evidence_count else None
+            validation_action_selection_lift = functional_diagnostics["mean_behavioral_gain"] if validation_evidence_count else None
+            validation_transfer_lift = _mean_event_gain(explanation_events, "prediction_gain", event_type="transfer")
             concept_prediction_lift = (
                 sum(family_prediction.get(family, (0.0, None))[0] for family in links.get("family", set()))
                 / max(1, len(links.get("family", set())))
@@ -1516,9 +1505,14 @@ def _validate_incremental_promotions(
             future_lift = (sum(future_values) / len(future_values) if future_values else 0.0) - baseline_future
             cross_game_transfer_lift = validation_transfer_lift if validation_transfer_lift is not None else 0.0
             has_cross_evidence = max(int(row["cross_context_count"] or 0), int(row["cross_game_count"] or 0)) >= int(config.min_cross_context_or_game_evidence)
-            has_incremental_gain = incremental_coverage >= float(config.min_incremental_coverage)
+            required_functional_coverage = max(
+                float(config.min_incremental_coverage),
+                float(config.min_incremental_explanatory_coverage),
+            )
+            has_eligible_events = validation_evidence_count >= int(config.min_explanation_event_count)
+            has_incremental_gain = has_eligible_events and incremental_coverage >= required_functional_coverage
             heldout_lifts = [value for value in (validation_prediction_lift, validation_action_selection_lift, validation_transfer_lift) if value is not None]
-            has_heldout_lift = bool(heldout_lifts) and max(heldout_lifts) >= float(config.min_behavioral_or_predictive_lift)
+            has_heldout_lift = bool(functional_diagnostics["explained_event_count"])
             legacy_promoted = bool(int(row["is_promoted"] or 0))
             promotion_score_before_validation = float(row["promotion_score"] or 0.0)
             meets_promotion_score_threshold = promotion_score_before_validation >= float(config.promotion_score_threshold)
@@ -1570,6 +1564,7 @@ def _validate_incremental_promotions(
                 promoted=promoted,
                 meets_promotion_score_threshold=meets_promotion_score_threshold,
                 has_incremental_gain=has_incremental_gain,
+                has_eligible_events=has_eligible_events,
                 has_cross_evidence=has_cross_evidence,
                 heldout_lifts=heldout_lifts,
                 has_heldout_lift=has_heldout_lift,
@@ -1579,19 +1574,14 @@ def _validate_incremental_promotions(
                 assert not rejection_reasons
             else:
                 assert rejection_reasons
-            coverage_diagnostics, coverage_state = _build_incremental_coverage_diagnostics(
+            structural_diagnostics = _build_structural_provenance_diagnostics(
                 candidate_signature=concept_signature,
-                diagnostic_epoch_id=diagnostic_epoch_id,
                 explanatory_reach=float(row["explanatory_reach"] or 0.0),
                 role_metrics=role_metrics,
                 source_roles=roles,
                 links=links,
                 concept_explained_structures=concept_explained_structures,
                 source_role_explained_structures=source_role_explained_structures,
-                newly_explained_structures=newly_explained_structures,
-                previous_state=previous_coverage_states.get(concept_signature),
-                previous_states_with_same_structure=previous_states_by_fingerprint,
-                all_current_structure_ids=current_structure_ids_by_candidate,
             )
             diagnostic = {
                 "concept_id": concept_signature,
@@ -1626,22 +1616,8 @@ def _validate_incremental_promotions(
                 "consecutive_validation_failures": failure_count,
                 "demoted": demoted,
                 "demotion_reason": "demoted_after_repeated_failure" if demoted else None,
-                **coverage_diagnostics,
-                **{
-                    key: coverage_diagnostics["incremental_coverage_diagnostics"][key]
-                    for key in (
-                        "concept_explained_structure_count",
-                        "source_role_explained_structure_count",
-                        "overlapping_structure_count",
-                        "newly_explained_structure_count",
-                        "coverage_denominator_count",
-                        "incremental_coverage",
-                        "concept_explained_structure_type_counts",
-                        "newly_explained_structure_type_counts",
-                        "newly_explained_structure_ids_sample",
-                        "overlapping_structure_ids_sample",
-                    )
-                },
+                **functional_diagnostics,
+                **structural_diagnostics,
             }
             state_conn.execute(
                 """
@@ -1655,7 +1631,7 @@ def _validate_incremental_promotions(
                 state_conn,
                 candidate_signature=concept_signature,
                 epoch_id=diagnostic_epoch_id,
-                state=coverage_state,
+                state=functional_state,
                 updated_global_step=first_seen,
             )
             summary["concept_candidates_evaluated"] += 1
@@ -1667,6 +1643,8 @@ def _validate_incremental_promotions(
                 summary["concepts_promoted_with_behavioral_lift"] += 1
             if demoted_this_validation:
                 summary["concepts_demoted"] += 1
+        if explanation_events_path is not None:
+            _write_explanation_event_artifact(Path(explanation_events_path), explanation_event_rows)
         active_signatures = [str(row["concept_signature"]) for row in concept_rows]
         if active_signatures:
             placeholders = ", ".join("?" for _ in active_signatures)
@@ -1841,6 +1819,493 @@ def _store_incremental_coverage_state(
             updated_global_step,
         ),
     )
+
+
+def _build_structural_provenance_diagnostics(
+    *,
+    candidate_signature: str,
+    explanatory_reach: float,
+    role_metrics: dict[str, dict[str, Any]],
+    source_roles: list[str],
+    links: dict[str, set[str]],
+    concept_explained_structures: set[str],
+    source_role_explained_structures: set[str],
+) -> dict[str, Any]:
+    """Keep membership sets as provenance-only diagnostics, never as the gate."""
+    overlap = concept_explained_structures & source_role_explained_structures
+    provenance_coverage = (
+        float(len(concept_explained_structures))
+        / float(len(concept_explained_structures | source_role_explained_structures))
+        if concept_explained_structures or source_role_explained_structures
+        else 0.0
+    )
+    return {
+        "structural_provenance_count": len(concept_explained_structures),
+        "structural_provenance_coverage": provenance_coverage,
+        "structural_overlap_count": len(overlap),
+        "structural_overlap_ratio": (
+            float(len(overlap)) / float(len(concept_explained_structures))
+            if concept_explained_structures else 0.0
+        ),
+        "structural_provenance_type_counts": _structure_type_counts(concept_explained_structures),
+        "structural_provenance_ids_sample": sorted(concept_explained_structures)[:_DIAGNOSTIC_ID_SAMPLE_LIMIT],
+        "structural_overlap_ids_sample": sorted(overlap)[:_DIAGNOSTIC_ID_SAMPLE_LIMIT],
+        "structural_provenance_diagnostics": {
+            "candidate_signature": candidate_signature,
+            "explanatory_reach_descriptive": float(explanatory_reach),
+            "source_role_structure_count": len(source_role_explained_structures),
+            "source_role_count": len(source_roles),
+            "source_carrier_count": len(links.get("carrier", set())),
+            "source_family_count": len(links.get("family", set())),
+            "role_overlap": [
+                {
+                    "role_id": role,
+                    "overlap_count": len(concept_explained_structures & set(role_metrics.get(role, {}).get("structures", []))),
+                }
+                for role in sorted(source_roles)
+                if role in role_metrics
+            ][: _DIAGNOSTIC_ID_SAMPLE_LIMIT],
+        },
+    }
+
+
+def _prior_role_success_rate(
+    transfer_rows: list[sqlite3.Row],
+    *,
+    role: str,
+    before_step: int,
+    target_scope: tuple[str, str] | None = None,
+) -> tuple[float, int]:
+    matching = [
+        row for row in transfer_rows
+        if str(row["role_signature"] or "") == role
+        and row["last_seen_global_step"] is not None
+        and int(row["last_seen_global_step"]) < before_step
+        and (
+            target_scope is None
+            or (str(row["target_scope_type"] or ""), str(row["target_scope_key"] or "")) == target_scope
+        )
+    ]
+    if not matching:
+        return 0.0, 0
+    return sum(int(row["reuse_success"] or 0) for row in matching) / len(matching), len(matching)
+
+
+def _combined_role_score(rates: list[float]) -> float:
+    """Probability that a concept's role combination supports the event."""
+    if not rates:
+        return 0.0
+    remaining = 1.0
+    for rate in rates:
+        remaining *= max(0.0, min(1.0, 1.0 - float(rate)))
+    return 1.0 - remaining
+
+
+def _mean_event_gain(events: list[dict[str, Any]], key: str, *, event_type: str | None = None) -> float | None:
+    values = [
+        float(event.get(key, 0.0) or 0.0)
+        for event in events
+        if event_type is None or str(event.get("event_type")) == event_type
+    ]
+    return sum(values) / len(values) if values else None
+
+
+def _transfer_explanation_events(
+    *,
+    candidate_signature: str,
+    source_roles: list[str],
+    first_seen_global_step: int | None,
+    transfer_rows: list[sqlite3.Row],
+) -> list[dict[str, Any]]:
+    if first_seen_global_step is None or len(source_roles) < 1:
+        return []
+    source_role_set = set(source_roles)
+    events: list[dict[str, Any]] = []
+    for row in transfer_rows:
+        source_role = str(row["role_signature"] or "")
+        step = row["last_seen_global_step"]
+        if source_role not in source_role_set or step is None or int(step) <= first_seen_global_step:
+            continue
+        target_role = str(row["observed_role_signature"] or row["predicted_role_signature"] or "unknown")
+        scope = (str(row["target_scope_type"] or "unknown"), str(row["target_scope_key"] or "unknown"))
+        generic_rates = [
+            _prior_role_success_rate(transfer_rows, role=role, before_step=int(step))[0]
+            for role in source_roles
+        ]
+        scoped_rates = [
+            rate for role in source_roles
+            for rate, count in [_prior_role_success_rate(
+                transfer_rows, role=role, before_step=int(step), target_scope=scope
+            )]
+            if count > 0
+        ]
+        best_single = max(generic_rates, default=0.0)
+        baseline = best_single
+        # Older transfer rows can lack scope columns.  Their historical role
+        # evidence remains legitimate lower-level evidence; use it only when
+        # scoped evidence cannot establish a multi-role profile.
+        combination_rates = scoped_rates if len(scoped_rates) >= 2 else generic_rates
+        concept_score = _combined_role_score(combination_rates) if len(combination_rates) >= 2 else baseline
+        event_id = f"transfer:{source_role}:{target_role}:{scope[0]}:{scope[1]}"
+        outcome = float(int(row["reuse_success"] or 0))
+        events.append({
+            "concept_id": candidate_signature,
+            "event_id": event_id,
+            "event_type": "transfer",
+            "evaluation_scope": "later_global_step",
+            "best_single_role_score": best_single,
+            "lower_level_baseline_score": baseline,
+            "concept_enabled_score": concept_score,
+            "prediction_gain": concept_score - baseline,
+            "behavioral_gain": -abs(concept_score - outcome) + abs(baseline - outcome),
+            "_outcome": outcome,
+        })
+    return events
+
+
+def _future_option_motif_explanation_events(
+    state_conn: sqlite3.Connection,
+    *,
+    candidate_signature: str,
+    source_roles: list[str],
+    first_seen_global_step: int | None,
+    future_rows: list[sqlite3.Row],
+) -> list[dict[str, Any]]:
+    if first_seen_global_step is None or not source_roles:
+        return []
+    motif_table = state_conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'future_option_motifs'"
+    ).fetchone()
+    if motif_table is None:
+        return []
+    role_set = set(source_roles)
+    role_rates: dict[str, float] = {}
+    for role in source_roles:
+        values = [
+            1.0 if float(row["option_delta"] or 0.0) > 0.0 else 0.0
+            for row in future_rows
+            if (str(row["source_role_id"] or row["owner_key"] or "") == role)
+            and row["last_seen_global_step"] is not None
+            and int(row["last_seen_global_step"]) < first_seen_global_step
+        ]
+        role_rates[role] = sum(values) / len(values) if values else 0.0
+    events: list[dict[str, Any]] = []
+    for row in state_conn.execute(
+        """
+        SELECT motif_signature, source_role_ids_json, motif_stability_score, is_emergent, last_seen_global_step
+        FROM future_option_motifs ORDER BY motif_signature ASC
+        """
+    ).fetchall():
+        if row["last_seen_global_step"] is None or int(row["last_seen_global_step"]) <= first_seen_global_step:
+            continue
+        try:
+            motif_roles = {str(value) for value in json.loads(str(row["source_role_ids_json"] or "[]"))}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            motif_roles = set()
+        matching_roles = sorted(role_set & motif_roles)
+        if not matching_roles:
+            continue
+        rates = [role_rates[role] for role in matching_roles]
+        baseline = max(rates, default=0.0)
+        concept_score = _combined_role_score(rates) if len(rates) >= 2 else baseline
+        outcome = float(int(row["is_emergent"] or 0))
+        events.append({
+            "concept_id": candidate_signature,
+            "event_id": f"future_option_motif:{row['motif_signature']}",
+            "event_type": "future_option_motif",
+            "evaluation_scope": "later_global_step",
+            "best_single_role_score": baseline,
+            "lower_level_baseline_score": baseline,
+            "concept_enabled_score": concept_score,
+            "prediction_gain": concept_score - baseline,
+            "behavioral_gain": -abs(concept_score - outcome) + abs(baseline - outcome),
+            "_outcome": outcome,
+        })
+    return events
+
+
+def _prediction_result_columns(state_conn: sqlite3.Connection) -> set[str]:
+    """Return the local prediction schema without assuming raw tables exist."""
+    table = state_conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'prediction_results'"
+    ).fetchone()
+    if table is None:
+        return set()
+    return {
+        str(row[1])
+        for row in state_conn.execute("PRAGMA table_info(prediction_results)").fetchall()
+    }
+
+
+def _prediction_explanation_events(
+    state_conn: sqlite3.Connection,
+    *,
+    candidate_signature: str,
+    source_roles: list[str],
+    first_seen_global_step: int | None,
+    transfer_rows: list[sqlite3.Row],
+    role_links: dict[str, dict[str, set[str]]],
+) -> list[dict[str, Any]]:
+    """Evaluate later lower-level predictions without candidate-concept features.
+
+    The raw prediction result supplies only a held-out label.  Scores are
+    derived from pre-event role-transfer evidence, so the observed prediction
+    result is never an input feature.
+    """
+    columns = _prediction_result_columns(state_conn)
+    required = {"id", "global_step", "context_signature", "predicted_family", "actual_family"}
+    if first_seen_global_step is None or not source_roles or not required <= columns:
+        return []
+    relevant_contexts = {
+        context
+        for role in source_roles
+        for context in role_links.get(role, {}).get("context", set())
+    }
+    if not relevant_contexts:
+        return []
+    selected = "id, global_step, context_signature, predicted_family, actual_family"
+    events: list[dict[str, Any]] = []
+    for row in state_conn.execute(
+        f"SELECT {selected} FROM prediction_results WHERE global_step > ? ORDER BY global_step ASC, id ASC",
+        (first_seen_global_step,),
+    ).fetchall():
+        context = str(row["context_signature"] or "")
+        if context not in relevant_contexts:
+            continue
+        step = int(row["global_step"])
+        rates = [
+            _prior_role_success_rate(transfer_rows, role=role, before_step=step)[0]
+            for role in source_roles
+        ]
+        baseline = max(rates, default=0.0)
+        concept_score = _combined_role_score(rates) if len(rates) >= 2 else baseline
+        outcome = float(row["predicted_family"] == row["actual_family"])
+        events.append({
+            "concept_id": candidate_signature,
+            "event_id": f"prediction:prediction_result:{row['id']}:later_global_step",
+            "event_type": "prediction",
+            "evaluation_scope": "later_global_step",
+            "best_single_role_score": baseline,
+            "lower_level_baseline_score": baseline,
+            "concept_enabled_score": concept_score,
+            "prediction_gain": concept_score - baseline,
+            "behavioral_gain": -abs(concept_score - outcome) + abs(baseline - outcome),
+            "_outcome": outcome,
+        })
+    return events
+
+
+def _contradiction_resolution_explanation_events(
+    state_conn: sqlite3.Connection,
+    *,
+    candidate_signature: str,
+    source_roles: list[str],
+    first_seen_global_step: int | None,
+    transfer_rows: list[sqlite3.Row],
+    role_links: dict[str, dict[str, set[str]]],
+) -> list[dict[str, Any]]:
+    """Evaluate held-out contradiction detection/resolution opportunities."""
+    columns = _prediction_result_columns(state_conn)
+    required = {"id", "global_step", "context_signature", "context_contradiction"}
+    if first_seen_global_step is None or not source_roles or not required <= columns:
+        return []
+    relevant_contexts = {
+        context
+        for role in source_roles
+        for context in role_links.get(role, {}).get("context", set())
+    }
+    if not relevant_contexts:
+        return []
+    events: list[dict[str, Any]] = []
+    for row in state_conn.execute(
+        """
+        SELECT id, global_step, context_signature, context_contradiction
+        FROM prediction_results
+        WHERE global_step > ? AND COALESCE(context_contradiction, 0) = 1
+        ORDER BY global_step ASC, id ASC
+        """,
+        (first_seen_global_step,),
+    ).fetchall():
+        if str(row["context_signature"] or "") not in relevant_contexts:
+            continue
+        step = int(row["global_step"])
+        failure_rates = [
+            1.0 - _prior_role_success_rate(transfer_rows, role=role, before_step=step)[0]
+            for role in source_roles
+        ]
+        baseline = max(failure_rates, default=0.0)
+        concept_score = _combined_role_score(failure_rates) if len(failure_rates) >= 2 else baseline
+        events.append({
+            "concept_id": candidate_signature,
+            "event_id": f"contradiction_resolution:{row['id']}:later_global_step",
+            "event_type": "contradiction_resolution",
+            "evaluation_scope": "later_global_step",
+            "best_single_role_score": baseline,
+            "lower_level_baseline_score": baseline,
+            "concept_enabled_score": concept_score,
+            "prediction_gain": concept_score - baseline,
+            "behavioral_gain": concept_score - baseline,
+            "_outcome": 1.0,
+        })
+    return events
+
+
+def _build_functional_explanation_diagnostics(
+    *,
+    state_conn: sqlite3.Connection,
+    candidate_signature: str,
+    source_roles: list[str],
+    first_seen_global_step: int | None,
+    transfer_rows: list[sqlite3.Row],
+    future_rows: list[sqlite3.Row],
+    previous_state: dict[str, Any] | None,
+    diagnostic_epoch_id: str | int | None,
+    config: IncrementalPromotionValidationConfig,
+) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
+    """Evaluate held-out events with and without this concept's role combination."""
+    events = _transfer_explanation_events(
+        candidate_signature=candidate_signature,
+        source_roles=source_roles,
+        first_seen_global_step=first_seen_global_step,
+        transfer_rows=transfer_rows,
+    )
+    events.extend(_future_option_motif_explanation_events(
+        state_conn,
+        candidate_signature=candidate_signature,
+        source_roles=source_roles,
+        first_seen_global_step=first_seen_global_step,
+        future_rows=future_rows,
+    ))
+    role_links = _links_by_signature(state_conn, "role_links", "role_signature")
+    events.extend(_prediction_explanation_events(
+        state_conn,
+        candidate_signature=candidate_signature,
+        source_roles=source_roles,
+        first_seen_global_step=first_seen_global_step,
+        transfer_rows=transfer_rows,
+        role_links=role_links,
+    ))
+    events.extend(_contradiction_resolution_explanation_events(
+        state_conn,
+        candidate_signature=candidate_signature,
+        source_roles=source_roles,
+        first_seen_global_step=first_seen_global_step,
+        transfer_rows=transfer_rows,
+        role_links=role_links,
+    ))
+    events.sort(key=lambda item: (str(item["event_type"]), str(item["event_id"])))
+    definition_cost = 0.05 * max(1, len(source_roles))
+    event_count = len(events)
+    for event in events:
+        outcome = float(event.pop("_outcome"))
+        baseline_error = abs(float(event["lower_level_baseline_score"]) - outcome)
+        concept_error = abs(float(event["concept_enabled_score"]) - outcome)
+        event["baseline_description_cost"] = baseline_error
+        event["concept_description_cost"] = concept_error
+        event["compression_gain"] = baseline_error - concept_error - definition_cost / max(1, event_count)
+        event["concept_incremental_gain"] = float(event["concept_enabled_score"]) - float(
+            event["lower_level_baseline_score"]
+        )
+        # Prediction gain is a held-out scoring improvement, not merely a
+        # larger uncalibrated probability.  This prevents a concept receiving
+        # credit for confidently predicting the wrong transfer outcome.
+        event["prediction_gain"] = baseline_error - concept_error
+        event["behavioral_gain"] = event["prediction_gain"]
+        explained = (
+            float(event["prediction_gain"]) >= float(config.min_event_prediction_gain)
+            or float(event["behavioral_gain"]) >= float(config.min_event_behavioral_gain)
+            or float(event["compression_gain"]) >= float(config.min_event_compression_gain)
+        )
+        event["explained"] = bool(explained)
+        event["rejection_reason"] = None if explained else "no_incremental_explanatory_gain"
+    explained = [event for event in events if bool(event["explained"])]
+    baseline_cost = sum(float(event["baseline_description_cost"]) for event in events)
+    concept_cost = definition_cost + sum(float(event["concept_description_cost"]) for event in events)
+    compression_gain = baseline_cost - concept_cost
+    explained_ids = [str(event["event_id"]) for event in explained]
+    event_ids = [str(event["event_id"]) for event in events]
+    previous_eligible = None if previous_state is None else previous_state.get("eligible_event_count")
+    previous_explained = None if previous_state is None else previous_state.get("explained_event_count")
+    previous_coverage = None if previous_state is None else previous_state.get("incremental_coverage")
+    coverage = float(len(explained)) / float(event_count) if event_count else 0.0
+    if previous_state is None or previous_eligible is None:
+        change_classification = "not_comparable"
+        coverage_delta = None
+    else:
+        coverage_delta = coverage - float(previous_coverage or 0.0)
+        explained_delta = len(explained) - int(previous_explained or 0)
+        eligible_delta = event_count - int(previous_eligible or 0)
+        if explained_delta > 0 and coverage_delta >= 0.0:
+            change_classification = "explained_event_growth"
+        elif eligible_delta > 0 and explained_delta <= 0:
+            change_classification = "eligible_event_growth"
+        elif coverage_delta < 0.0:
+            change_classification = "concept_gain_decline"
+        elif coverage_delta > 0.0:
+            change_classification = "concept_gain_improvement"
+        else:
+            change_classification = "mixed"
+    state = {
+        "eligible_event_count": event_count,
+        "explained_event_count": len(explained),
+        "incremental_coverage": coverage,
+        "explanation_event_ids": event_ids,
+        "structure_fingerprint": _structure_fingerprint(set(event_ids)),
+    }
+    longitudinal = {
+        "previous_epoch": None if previous_state is None else previous_state.get("epoch_id"),
+        "previous_explained_event_count": previous_explained,
+        "current_explained_event_count": len(explained),
+        "explained_event_count_delta": None if previous_explained is None else len(explained) - int(previous_explained or 0),
+        "previous_eligible_event_count": previous_eligible,
+        "current_eligible_event_count": event_count,
+        "eligible_event_count_delta": None if previous_eligible is None else event_count - int(previous_eligible or 0),
+        "previous_incremental_explanatory_coverage": previous_coverage,
+        "current_incremental_explanatory_coverage": coverage,
+        "coverage_delta": coverage_delta,
+        # Compatibility aliases for existing aggregate/report consumers.
+        "previous_incremental_coverage": previous_coverage,
+        "current_incremental_coverage": coverage,
+        "incremental_coverage_delta": coverage_delta,
+        "classification": change_classification,
+    }
+    diagnostics = {
+        "eligible_explanation_event_count": event_count,
+        "explained_event_count": len(explained),
+        "incremental_explanatory_coverage": coverage,
+        "explained_event_type_counts": _event_type_counts(explained),
+        "rejected_event_type_counts": _event_type_counts([event for event in events if not event["explained"]]),
+        "mean_prediction_gain": _mean_event_gain(events, "prediction_gain") or 0.0,
+        "mean_behavioral_gain": _mean_event_gain(events, "behavioral_gain") or 0.0,
+        "mean_compression_gain": _mean_event_gain(events, "compression_gain") or 0.0,
+        "baseline_description_cost": baseline_cost,
+        "concept_description_cost": concept_cost,
+        "incremental_compression_gain": compression_gain,
+        "explained_event_ids_sample": sorted(explained_ids)[:_DIAGNOSTIC_ID_SAMPLE_LIMIT],
+        "rejected_event_ids_sample": sorted(
+            str(event["event_id"]) for event in events if not event["explained"]
+        )[:_DIAGNOSTIC_ID_SAMPLE_LIMIT],
+        "functional_coverage_longitudinal_change": longitudinal,
+        "coverage_longitudinal_change": longitudinal,
+        "coverage_change_classification": change_classification,
+    }
+    return events, diagnostics, state
+
+
+def _event_type_counts(events: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = defaultdict(int)
+    for event in events:
+        counts[str(event["event_type"])] += 1
+    return {key: counts[key] for key in sorted(counts)}
+
+
+def _write_explanation_event_artifact(path: Path, events: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".jsonl.tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        for event in sorted(events, key=lambda item: (str(item["concept_id"]), str(item["event_type"]), str(item["event_id"]))):
+            handle.write(json.dumps(event, sort_keys=True) + "\n")
+    temporary.replace(path)
 
 
 def _build_incremental_coverage_diagnostics(
@@ -2120,6 +2585,7 @@ def _concept_promotion_rejection_reasons(
     promoted: bool,
     meets_promotion_score_threshold: bool,
     has_incremental_gain: bool,
+    has_eligible_events: bool,
     has_cross_evidence: bool,
     heldout_lifts: list[float],
     has_heldout_lift: bool,
@@ -2129,8 +2595,10 @@ def _concept_promotion_rejection_reasons(
     if promoted:
         return []
     reasons: list[str] = []
-    if not has_incremental_gain:
-        reasons.append("no_incremental_coverage")
+    if not has_eligible_events:
+        reasons.append("no_eligible_explanation_events")
+    elif not has_incremental_gain:
+        reasons.append("no_incremental_explanatory_gain")
     if not has_cross_evidence:
         reasons.append("insufficient_cross_context_or_game_evidence")
     if not heldout_lifts:
