@@ -179,7 +179,7 @@ class MemoryPromotionEngine:
                     source_node_id=contingency["node_id"],
                     target_node_id=node_id,
                     promotion_type="M1_M2",
-                    evidence_count=int(contingency.get("support_count", 0) or 0),
+                    evidence_count=int(contingency.get("attrs", {}).get("support_count", 0) or 0),
                     promotion_score=float(support),
                 )
                 promoted += 1
@@ -307,13 +307,14 @@ class MemoryPromotionEngine:
         for role in self.memory.query_nodes(memory_level="M3", node_type="FunctionalRoleMemory"):
             attrs = dict(role.get("attrs", {}))
             carrier_count = int(attrs.get("carrier_count", 0) or 0)
-            transfer_tests = carrier_count
-            success_rate = min(1.0, carrier_count / max(1.0, float(self.config.min_concept_transfer_tests)))
+            role_signature = str(attrs.get("role_signature", role.get("canonical_key", "")))
+            transfer_tests, transfer_success_count, transfer_failure_count = self._actual_role_transfer_counts(role_signature)
             if transfer_tests < self.config.min_concept_transfer_tests:
                 continue
+            success_rate = float(transfer_success_count) / float(transfer_tests)
             if success_rate < self.config.min_concept_transfer_success_rate:
                 continue
-            concept_signature = sha1(str(attrs.get("role_signature", role["canonical_key"])).encode("utf-8")).hexdigest()[:20]
+            concept_signature = sha1(role_signature.encode("utf-8")).hexdigest()[:20]
             node_id = concept_node_id(concept_signature)
             self.memory.upsert_node(
                 MemoryNode(
@@ -324,8 +325,8 @@ class MemoryPromotionEngine:
                     attrs={
                         "source_roles": [role["node_id"]],
                         "transfer_tests": transfer_tests,
-                        "transfer_success_count": transfer_tests,
-                        "transfer_failure_count": 0,
+                        "transfer_success_count": transfer_success_count,
+                        "transfer_failure_count": transfer_failure_count,
                         "explanatory_reach": carrier_count,
                         "applicability_context": "cross_context",
                     },
@@ -343,6 +344,25 @@ class MemoryPromotionEngine:
             )
             promoted += 1
         return {"count": promoted}
+
+    def _actual_role_transfer_counts(self, role_signature: str) -> tuple[int, int, int]:
+        """Read persisted transfer attempts; never synthesize concept evidence."""
+        table = self.memory.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'role_transfer_attempts'"
+        ).fetchone()
+        if table is None:
+            return 0, 0, 0
+        row = self.memory.connection.execute(
+            """
+            SELECT COUNT(*) AS tests, COALESCE(SUM(CASE WHEN COALESCE(reuse_success, 0) = 1 THEN 1 ELSE 0 END), 0) AS successes
+            FROM role_transfer_attempts
+            WHERE role_signature = ?
+            """,
+            (role_signature,),
+        ).fetchone()
+        tests = int(row[0] or 0)
+        successes = int(row[1] or 0)
+        return tests, successes, max(0, tests - successes)
 
     def promote_concept_to_world_model_fragment(self, *, step: int | None = None) -> dict[str, Any]:
         promoted = 0

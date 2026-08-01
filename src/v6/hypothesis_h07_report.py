@@ -75,6 +75,14 @@ def evaluate_h07_concept_emergence(
             expected_candidate_count=len(concept_rows),
         )
         milestone_map = dict(conn.execute("SELECT milestone_name, first_global_step FROM higher_order_milestones").fetchall())
+        history_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'higher_order_milestone_history'"
+        ).fetchone()
+        historical_milestone_map = (
+            dict(conn.execute("SELECT milestone_name, first_global_step FROM higher_order_milestone_history").fetchall())
+            if history_exists is not None
+            else {}
+        )
     roles_skipped_missing_carrier_links = 0
     roles_skipped_missing_family_links = 0
     roles_skipped_missing_transfer_success = 0
@@ -105,8 +113,10 @@ def evaluate_h07_concept_emergence(
         else None
     )
     max_promotion_score = max((float(row["promotion_score"] or 0.0) for row in concept_rows), default=None)
-    cross_context_concept_count = sum(1 for row in concept_rows if int(row["cross_context_count"] or 0) >= 1)
-    cross_game_concept_count = sum(1 for row in concept_rows if int(row["cross_game_count"] or 0) >= 1)
+    candidate_cross_context_count = sum(1 for row in concept_rows if int(row["cross_context_count"] or 0) >= 1)
+    candidate_cross_game_count = sum(1 for row in concept_rows if int(row["cross_game_count"] or 0) >= 1)
+    promoted_cross_context_count = sum(1 for row in promoted_rows if int(row["cross_context_count"] or 0) >= 1)
+    promoted_cross_game_count = sum(1 for row in promoted_rows if int(row["cross_game_count"] or 0) >= 1)
     concept_transfer_success_count = successful_transfers
     concept_strong_transfer_success_count = sum(int(row["strong_transfer_success_count"] or 0) for row in concept_rows)
     source_role_count_mean = (
@@ -119,8 +129,10 @@ def evaluate_h07_concept_emergence(
         if promoted_rows
         else None
     )
-    concept_cross_game_count_max = max((int(row["cross_game_count"] or 0) for row in promoted_rows), default=0)
-    concept_cross_context_count_max = max((int(row["cross_context_count"] or 0) for row in promoted_rows), default=0)
+    candidate_cross_game_count_max = max((int(row["cross_game_count"] or 0) for row in concept_rows), default=0)
+    candidate_cross_context_count_max = max((int(row["cross_context_count"] or 0) for row in concept_rows), default=0)
+    promoted_cross_game_count_max = max((int(row["cross_game_count"] or 0) for row in promoted_rows), default=0)
+    promoted_cross_context_count_max = max((int(row["cross_context_count"] or 0) for row in promoted_rows), default=0)
     strong_transfer_counts = [int(row["strong_transfer_success_count"] or 0) for row in promoted_rows]
     concept_transfer_success_concentration = (
         max(strong_transfer_counts) / max(1, sum(strong_transfer_counts))
@@ -149,10 +161,18 @@ def evaluate_h07_concept_emergence(
         "concept_transfer_success_count": concept_transfer_success_count,
         "concept_strong_transfer_success_count": concept_strong_transfer_success_count,
         "transfer_success_rate": transfer_success_rate,
-        "cross_context_concept_count": cross_context_concept_count,
-        "cross_game_concept_count": cross_game_concept_count,
-        "concept_cross_game_count_max": concept_cross_game_count_max,
-        "concept_cross_context_count_max": concept_cross_context_count_max,
+        "candidate_cross_context_count": candidate_cross_context_count,
+        "candidate_cross_game_count": candidate_cross_game_count,
+        "promoted_cross_context_count": promoted_cross_context_count,
+        "promoted_cross_game_count": promoted_cross_game_count,
+        "candidate_cross_game_count_max": candidate_cross_game_count_max,
+        "candidate_cross_context_count_max": candidate_cross_context_count_max,
+        "promoted_cross_game_count_max": promoted_cross_game_count_max,
+        "promoted_cross_context_count_max": promoted_cross_context_count_max,
+        "cross_context_concept_count": candidate_cross_context_count,
+        "cross_game_concept_count": candidate_cross_game_count,
+        "concept_cross_game_count_max": candidate_cross_game_count_max,
+        "concept_cross_context_count_max": candidate_cross_context_count_max,
         "source_role_count_mean": source_role_count_mean,
         "source_carrier_count_mean": source_carrier_count_mean,
         "max_source_role_count": max_source_role_count,
@@ -162,6 +182,7 @@ def evaluate_h07_concept_emergence(
         "promoted_overconcentrated_concept_count": promoted_overconcentrated_concept_count,
         "first_concept_candidate_step": milestone_map.get("first_concept_candidate_step"),
         "first_promoted_concept_step": milestone_map.get("first_promoted_concept_step"),
+        "historical_first_promoted_concept_step": historical_milestone_map.get("first_promoted_concept_step"),
         "first_role_transfer_success_step": milestone_map.get("first_role_transfer_success_step"),
         "roles_seen_for_concept_derivation": roles_seen_for_concept_derivation,
         "roles_skipped_missing_carrier_links": roles_skipped_missing_carrier_links,
@@ -193,7 +214,7 @@ def evaluate_h07_concept_emergence(
         and concept_strong_transfer_success_count >= 2
         and (max_compression_gain or 0.0) >= 1.50
         and (max_promotion_score or 0.0) >= 0.55
-        and (concept_cross_context_count_max >= 3 or concept_cross_game_count_max >= 2)
+        and (promoted_cross_context_count_max >= 3 or promoted_cross_game_count_max >= 2)
         and max_source_role_count >= 1
         and max_source_family_count >= 2
         and roles_used_for_concepts >= 3
@@ -220,10 +241,30 @@ def evaluate_h07_concept_emergence(
     else:
         decision = "PARTIALLY_VALID"
         missing = []
+    if bool(incremental_validation.get("enabled", False)) and not bool(
+        incremental_validation.get("diagnostics_complete", True)
+    ):
+        decision = "INSUFFICIENT_EVIDENCE"
+        missing = list(dict.fromkeys([
+            *missing,
+            *[str(item) for item in incremental_validation.get("consistency_warnings", [])],
+        ]))
     result = _base_result(decision, missing)
     result.update(metrics)
     result["core_metrics"] = dict(metrics)
     result["incremental_promotion_validation"] = incremental_validation
+    cross_scope_warnings: list[str] = []
+    if metrics["cross_context_concept_count"] != metrics["candidate_cross_context_count"]:
+        cross_scope_warnings.append("cross-context candidate metric aliases disagree")
+    if metrics["cross_game_concept_count"] != metrics["candidate_cross_game_count"]:
+        cross_scope_warnings.append("cross-game candidate metric aliases disagree")
+    if metrics["concept_cross_context_count_max"] != metrics["candidate_cross_context_count_max"]:
+        cross_scope_warnings.append("cross-context maximum metric aliases disagree")
+    if metrics["concept_cross_game_count_max"] != metrics["candidate_cross_game_count_max"]:
+        cross_scope_warnings.append("cross-game maximum metric aliases disagree")
+    result["consistency_warnings"] = cross_scope_warnings
+    if isinstance(incremental_validation, dict) and "incremental_coverage_aggregate" in incremental_validation:
+        result["incremental_coverage_aggregate"] = incremental_validation["incremental_coverage_aggregate"]
     _write_outputs(output_dir, result)
     return result
 
@@ -266,6 +307,7 @@ def _incremental_promotion_thresholds(config: IncrementalPromotionValidationConf
         "min_cross_context_or_game_evidence": int(config.min_cross_context_or_game_evidence),
         "min_behavioral_or_predictive_lift": float(config.min_behavioral_or_predictive_lift),
         "demotion_failure_limit": int(config.demotion_failure_limit),
+        "promotion_score_threshold": float(config.promotion_score_threshold),
     }
 
 
@@ -282,14 +324,24 @@ def _load_incremental_promotion_validation_report(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'concept_promotion_validation_diagnostics'"
     ).fetchone()
     if table_exists is None:
-        raise AssertionError("incremental promotion validation diagnostics table is missing")
+        report.update({
+            "diagnostics_complete": False,
+            "consistency_warnings": ["incremental promotion validation diagnostics table is missing"],
+        })
+        return report
     candidates: list[dict[str, Any]] = []
+    warnings: list[str] = []
     for row in conn.execute(
         "SELECT payload_json FROM concept_promotion_validation_diagnostics ORDER BY concept_signature ASC"
     ).fetchall():
-        payload = json.loads(str(row["payload_json"]))
+        try:
+            payload = json.loads(str(row["payload_json"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            warnings.append("invalid incremental promotion validation diagnostic payload")
+            continue
         if not isinstance(payload, dict):
-            raise AssertionError("invalid incremental promotion validation diagnostic payload")
+            warnings.append("invalid incremental promotion validation diagnostic payload")
+            continue
         candidates.append(payload)
     summary = {
         "concept_candidates_evaluated": len(candidates),
@@ -312,20 +364,67 @@ def _load_incremental_promotion_validation_report(
             1 for item in candidates if "heldout_validation_failed" in item.get("rejection_reasons", [])
         ),
         "concepts_rejected_below_threshold": sum(
-            1 for item in candidates if "below_promotion_threshold" in item.get("rejection_reasons", [])
+            1 for item in candidates if "below_promotion_score_threshold" in item.get("rejection_reasons", [])
         ),
         "concepts_demoted": sum(1 for item in candidates if bool(item.get("demoted"))),
     }
-    assert summary["concept_candidates_evaluated"] == expected_candidate_count
-    assert summary["concepts_promoted"] == sum(1 for item in candidates if bool(item.get("promoted")))
-    assert summary["concepts_demoted"] == sum(1 for item in candidates if bool(item.get("demoted")))
+    if summary["concept_candidates_evaluated"] != expected_candidate_count:
+        warnings.append("candidate count does not match incremental validation diagnostics")
     for candidate in candidates:
         promoted = bool(candidate.get("promoted"))
         reasons = list(candidate.get("rejection_reasons", []))
-        assert not reasons if promoted else bool(reasons)
+        if (promoted and reasons) or (not promoted and not reasons):
+            warnings.append(f"inconsistent rejection reasons for {candidate.get('concept_id', 'unknown')}")
+        for error in candidate.get("diagnostics_errors", []):
+            warnings.append(f"coverage diagnostics error for {candidate.get('concept_id', 'unknown')}: {error}")
     report["summary"] = summary
     report["candidates"] = candidates
+    report["incremental_coverage_aggregate"] = _incremental_coverage_aggregate(candidates)
+    report["diagnostics_complete"] = not warnings
+    report["consistency_warnings"] = warnings
     return report
+
+
+def _incremental_coverage_aggregate(candidates: list[dict[str, Any]]) -> dict[str, int | float]:
+    changes = [
+        item.get("coverage_longitudinal_change", {})
+        for item in candidates
+        if isinstance(item.get("coverage_longitudinal_change"), dict)
+        and item["coverage_longitudinal_change"].get("incremental_coverage_delta") is not None
+    ]
+    classifications = [
+        item.get("coverage_decline_classification", {})
+        for item in candidates
+        if isinstance(item.get("coverage_decline_classification"), dict)
+    ]
+    return {
+        "candidates_with_declining_coverage": sum(
+            1 for change in changes if float(change.get("incremental_coverage_delta", 0.0) or 0.0) < 0.0
+        ),
+        "candidates_with_denominator_growth": sum(
+            1 for item in classifications if item.get("classification") in {"denominator_growth", "mixed"}
+        ),
+        "candidates_with_numerator_decline": sum(
+            1 for item in classifications if item.get("classification") in {"numerator_decline", "mixed"}
+        ),
+        "candidates_with_overlap_growth": sum(
+            1 for item in classifications if item.get("classification") in {"overlap_growth", "mixed"}
+        ),
+        "mean_candidate_explained_growth_rate": _mean_float(
+            item.get("numerator_growth_rate") for item in classifications
+        ),
+        "mean_denominator_growth_rate": _mean_float(
+            item.get("denominator_growth_rate") for item in classifications
+        ),
+        "mean_incremental_coverage_delta": _mean_float(
+            item.get("incremental_coverage_delta") for item in changes
+        ),
+    }
+
+
+def _mean_float(values: Any) -> float:
+    numeric = [float(value) for value in values if value is not None]
+    return sum(numeric) / len(numeric) if numeric else 0.0
 
 
 def _write_outputs(output_dir: Path, result: dict[str, Any]) -> None:
@@ -365,6 +464,23 @@ def _write_outputs(output_dir: Path, result: dict[str, Any]) -> None:
             if not isinstance(candidate, dict):
                 continue
             reasons = ",".join(str(item) for item in candidate.get("rejection_reasons", [])) or "none"
+            coverage = candidate.get("incremental_coverage_diagnostics", {})
+            longitudinal = candidate.get("coverage_longitudinal_change", {})
+            causes = list(candidate.get("coverage_change_causes", []))
+            previous_coverage = longitudinal.get("previous_incremental_coverage") if isinstance(longitudinal, dict) else None
+            current_coverage = longitudinal.get("current_incremental_coverage") if isinstance(longitudinal, dict) else None
+            if previous_coverage is None:
+                coverage_section = "Coverage baseline unavailable.\n"
+            elif current_coverage is not None and float(current_coverage) < float(previous_coverage):
+                coverage_section = (
+                    f"Coverage declined from {float(previous_coverage):.5f} to {float(current_coverage):.5f}.\n"
+                    f"Candidate explained structures: {longitudinal.get('previous_candidate_explained_count')} → {longitudinal.get('current_candidate_explained_count')}.\n"
+                    f"Coverage denominator: {longitudinal.get('previous_denominator_count')} → {longitudinal.get('current_denominator_count')}.\n"
+                    f"Already-explained overlap: {longitudinal.get('previous_overlap_weight')} → {longitudinal.get('current_overlap_weight')}.\n"
+                    f"Primary cause: {causes[0] if causes else 'not_determined'}.\n"
+                )
+            else:
+                coverage_section = "Coverage did not decline.\n"
             text += (
                 "\n"
                 f"concept={candidate.get('concept_id')}\n"
@@ -376,6 +492,10 @@ def _write_outputs(output_dir: Path, result: dict[str, Any]) -> None:
                 f"prediction_lift={float(candidate.get('prediction_lift', 0.0) or 0.0):.2f}\n"
                 f"behavioral_lift={float(candidate.get('heldout_action_selection_lift', 0.0) or 0.0):.2f}\n"
                 f"rejection_reasons={reasons}\n"
+                f"concept_explained_structures={coverage.get('concept_explained_structure_count')} "
+                f"newly_explained_structures={coverage.get('newly_explained_structure_count')} "
+                f"denominator={coverage.get('coverage_denominator_count')}\n"
+                f"{coverage_section}"
             )
     (output_dir / "h07_concept_emergence_report.txt").write_text(text, encoding="utf-8")
     (output_dir / "h07_concept_emergence.md").write_text("```\n" + text + "```\n", encoding="utf-8")

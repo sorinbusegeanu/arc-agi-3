@@ -5365,6 +5365,13 @@ def _ensure_current_state_schema(path: Path) -> None:
                 concept_signature TEXT PRIMARY KEY,
                 payload_json TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS concept_incremental_coverage_state (
+                candidate_signature TEXT PRIMARY KEY,
+                epoch_id TEXT,
+                structure_fingerprint TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                updated_global_step INTEGER
+            );
             CREATE TABLE IF NOT EXISTS world_model_components (
                 component_signature TEXT PRIMARY KEY,
                 component_type TEXT,
@@ -5406,6 +5413,11 @@ def _ensure_current_state_schema(path: Path) -> None:
                 first_global_step INTEGER,
                 evidence_key TEXT
             );
+            CREATE TABLE IF NOT EXISTS higher_order_milestone_history (
+                milestone_name TEXT PRIMARY KEY,
+                first_global_step INTEGER,
+                evidence_key TEXT
+            );
             CREATE TABLE IF NOT EXISTS promotion_validation_state (
                 candidate_type TEXT,
                 candidate_signature TEXT,
@@ -5415,6 +5427,9 @@ def _ensure_current_state_schema(path: Path) -> None:
                 last_validation_prediction_lift REAL,
                 last_validation_action_selection_lift REAL,
                 last_validation_transfer_lift REAL,
+                last_validation_epoch TEXT,
+                last_validation_global_step INTEGER,
+                last_validation_result TEXT,
                 updated_global_step INTEGER,
                 PRIMARY KEY (candidate_type, candidate_signature)
             );
@@ -5672,6 +5687,9 @@ def _ensure_current_state_schema(path: Path) -> None:
         _ensure_column(connection, "concept_candidates", "validation_evidence_count", "INTEGER")
         _ensure_column(connection, "concept_candidates", "promotion_status", "TEXT")
         _ensure_column(connection, "concept_candidates", "promotion_failure_count", "INTEGER DEFAULT 0")
+        _ensure_column(connection, "promotion_validation_state", "last_validation_epoch", "TEXT")
+        _ensure_column(connection, "promotion_validation_state", "last_validation_global_step", "INTEGER")
+        _ensure_column(connection, "promotion_validation_state", "last_validation_result", "TEXT")
         _ensure_column(connection, "world_model_components", "candidate_only", "INTEGER DEFAULT 0")
         _ensure_column(connection, "world_model_components", "predicted_outcome_count", "INTEGER")
         _ensure_column(connection, "world_model_components", "predicted_outcome_count_is_proxy", "INTEGER DEFAULT 0")

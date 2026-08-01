@@ -3099,10 +3099,41 @@ def test_phase3_role_transfer_evidence_can_promote_concept() -> None:
             ),
             step=1,
         )
+        connection.execute(
+            "CREATE TABLE role_transfer_attempts (attempt_id TEXT PRIMARY KEY, role_signature TEXT, reuse_success INTEGER)"
+        )
+        connection.executemany(
+            "INSERT INTO role_transfer_attempts (attempt_id, role_signature, reuse_success) VALUES (?, 'r1', ?)",
+            [("transfer-success", 1), ("transfer-failure", 0)],
+        )
+        connection.commit()
         summary = engine.promote_role_to_concept(step=10)
         concepts = substrate.query_nodes(memory_level="M4", node_type="ConceptMemory")
         assert summary["count"] == 1
         assert concepts
+    finally:
+        connection.close()
+
+
+def test_m1_to_m2_promotion_records_contingency_attrs_support_count() -> None:
+    connection = sqlite3.connect(":memory:")
+    try:
+        substrate = MemorySubstrate(connection)
+        engine = MemoryPromotionEngine(substrate, MemoryPromotionConfig(min_family_support=1))
+        substrate.upsert_node(
+            MemoryNode(
+                node_id="M1:contingency:test",
+                memory_level="M1",
+                node_type="ContingencyMemory",
+                attrs={"transformation_family": 7, "support_count": 9},
+            ),
+            step=1,
+        )
+        engine.promote_m1_to_m2(step=2)
+        evidence_count = connection.execute(
+            "SELECT evidence_count FROM memory_promotions WHERE promotion_type = 'M1_M2'"
+        ).fetchone()[0]
+        assert evidence_count == 9
     finally:
         connection.close()
 

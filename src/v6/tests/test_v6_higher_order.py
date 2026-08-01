@@ -39,6 +39,268 @@ class _ThreadPoolCompat(ThreadPoolExecutor):
         super().__init__(max_workers=max_workers)
 
 
+def _seed_set_coverage_candidate(
+    memory_dir: Path,
+    *,
+    concept_signature: str = "concept-set",
+    extra_family_count: int = 0,
+    legacy_promoted: int = 0,
+    cross_scope_count: int = 2,
+    promotion_score: float = 0.9,
+    include_heldout: bool = True,
+) -> None:
+    paths = ensure_memory_layout(memory_dir)
+    with sqlite3.connect(paths.current_state) as conn:
+        conn.execute(
+            """
+            INSERT INTO role_candidates (
+                role_signature, linked_carrier_count, linked_family_count, linked_context_count,
+                cross_game_count, support_count
+            ) VALUES ('role-source', 1, 8, 0, 0, 1)
+            """
+        )
+        for index in range(8):
+            family = f"family-source-{index:02d}"
+            conn.execute(
+                "INSERT INTO role_links (role_signature, linked_type, linked_key, support_count) VALUES ('role-source', 'family', ?, 1)",
+                (family,),
+            )
+            conn.execute(
+                "INSERT INTO transformation_families (canonical_signature, prediction_lift, last_seen_global_step) VALUES (?, 0.4, 20)",
+                (family,),
+            )
+        conn.execute(
+            """
+            INSERT INTO concept_candidates (
+                concept_signature, compression_gain, explanatory_reach, promotion_score,
+                cross_context_count, cross_game_count, first_seen_global_step, is_promoted
+            ) VALUES (?, 2.0, 8.0, ?, ?, ?, 10, ?)
+            """,
+            (concept_signature, promotion_score, cross_scope_count, cross_scope_count, legacy_promoted),
+        )
+        conn.execute(
+            "INSERT INTO concept_links (concept_signature, linked_type, linked_key, support_count) VALUES (?, 'role', 'role-source', 1)",
+            (concept_signature,),
+        )
+        for index in range(extra_family_count):
+            conn.execute(
+                "INSERT INTO concept_links (concept_signature, linked_type, linked_key, support_count) VALUES (?, 'family', ?, 1)",
+                (concept_signature, f"family-concept-{index:02d}"),
+            )
+        conn.execute(
+            "INSERT INTO role_transfer_attempts (attempt_id, role_signature, reuse_success, last_seen_global_step) VALUES ('derive', 'role-source', 0, 5)"
+        )
+        if include_heldout:
+            conn.execute(
+                "INSERT INTO role_transfer_attempts (attempt_id, role_signature, reuse_success, last_seen_global_step) VALUES ('heldout', 'role-source', 1, 20)"
+            )
+        conn.commit()
+
+
+def _coverage_diagnostic(memory_dir: Path, *, epoch_id: str) -> dict:
+    validate_incremental_promotions_only(
+        memory_dir=memory_dir,
+        config=IncrementalPromotionValidationConfig(enabled=True),
+        validate_roles_and_concepts=True,
+        validate_world_models=False,
+        diagnostic_epoch_id=epoch_id,
+    )
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        payload_json = conn.execute(
+            "SELECT payload_json FROM concept_promotion_validation_diagnostics ORDER BY concept_signature ASC LIMIT 1"
+        ).fetchone()[0]
+    return json.loads(payload_json)
+
+
+def test_set_based_incremental_coverage_and_phase3_promotion_ignore_legacy_flag(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_set_coverage_candidate(memory_dir, extra_family_count=2, legacy_promoted=0)
+
+    diagnostic = _coverage_diagnostic(memory_dir, epoch_id="epoch_1")
+
+    assert diagnostic["legacy_promoted"] is False
+    assert diagnostic["incremental_validation_promoted"] is True
+    assert diagnostic["promoted"] is True
+    assert diagnostic["concept_explained_structure_count"] == 10
+    assert diagnostic["source_role_explained_structure_count"] == 8
+    assert diagnostic["overlapping_structure_count"] == 8
+    assert diagnostic["newly_explained_structure_count"] == 2
+    assert diagnostic["coverage_denominator_count"] == 10
+    assert diagnostic["incremental_explanatory_coverage"] == 0.2
+    assert diagnostic["incremental_coverage_diagnostics"]["incremental_coverage"] == 0.2
+
+
+def test_set_based_incremental_coverage_is_zero_for_identical_sets_and_non_negative(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_set_coverage_candidate(memory_dir, extra_family_count=0)
+
+    diagnostic = _coverage_diagnostic(memory_dir, epoch_id="epoch_1")
+
+    assert diagnostic["newly_explained_structure_count"] == 0
+    assert diagnostic["incremental_explanatory_coverage"] == 0.0
+    assert diagnostic["incremental_explanatory_coverage"] >= 0.0
+    assert "no_incremental_coverage" in diagnostic["rejection_reasons"]
+
+
+def test_set_based_coverage_ignores_support_and_transfer_count_without_target_structures(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_set_coverage_candidate(memory_dir, extra_family_count=2)
+    first = _coverage_diagnostic(memory_dir, epoch_id="epoch_1")
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute("UPDATE role_candidates SET support_count = 999 WHERE role_signature = 'role-source'")
+        conn.execute(
+            "INSERT INTO role_transfer_attempts (attempt_id, role_signature, reuse_success, last_seen_global_step) VALUES ('extra-no-target', 'role-source', 1, 21)"
+        )
+        conn.commit()
+
+    second = _coverage_diagnostic(memory_dir, epoch_id="epoch_2")
+
+    assert second["incremental_explanatory_coverage"] == first["incremental_explanatory_coverage"]
+    assert second["coverage_longitudinal_change"]["incremental_coverage_delta"] == 0.0
+
+
+def test_successful_transfer_target_structures_increase_set_based_coverage(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_set_coverage_candidate(memory_dir, extra_family_count=0)
+    first = _coverage_diagnostic(memory_dir, epoch_id="epoch_1")
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute(
+            "INSERT INTO role_candidates (role_signature, linked_carrier_count, linked_family_count, linked_context_count, cross_game_count, support_count) VALUES ('role-target', 1, 1, 0, 0, 1)"
+        )
+        conn.execute(
+            "INSERT INTO role_links (role_signature, linked_type, linked_key, support_count) VALUES ('role-target', 'family', 'family-target-new', 1)"
+        )
+        conn.execute(
+            """
+            INSERT INTO role_transfer_attempts (
+                attempt_id, role_signature, observed_role_signature, reuse_success, last_seen_global_step
+            ) VALUES ('heldout-target', 'role-source', 'role-target', 1, 22)
+            """
+        )
+        conn.commit()
+
+    second = _coverage_diagnostic(memory_dir, epoch_id="epoch_2")
+
+    assert first["incremental_explanatory_coverage"] == 0.0
+    assert second["newly_explained_structure_count"] == 1
+    assert second["incremental_explanatory_coverage"] == 1.0 / 9.0
+    assert second["concept_explained_structure_type_counts"] == {"family": 9}
+
+
+def test_set_coverage_longitudinally_identifies_denominator_and_overlap_growth(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_set_coverage_candidate(memory_dir, extra_family_count=2)
+    first = _coverage_diagnostic(memory_dir, epoch_id="epoch_1")
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute(
+            "INSERT INTO role_links (role_signature, linked_type, linked_key, support_count) VALUES ('role-source', 'family', 'family-source-growth', 1)"
+        )
+        conn.commit()
+
+    second = _coverage_diagnostic(memory_dir, epoch_id="epoch_2")
+
+    assert second["candidate_signature"] == first["candidate_signature"]
+    assert second["coverage_longitudinal_change"]["previous_epoch"] == "epoch_1"
+    assert second["incremental_explanatory_coverage"] == 2.0 / 11.0
+    assert second["coverage_decline_classification"]["classification"] == "mixed"
+    assert "denominator_growth_exceeded_candidate_growth" in second["coverage_change_causes"]
+    assert "increased_overlap_with_existing_structures" in second["coverage_change_causes"]
+
+
+def test_set_coverage_reports_removed_explanation_structures(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_set_coverage_candidate(memory_dir, extra_family_count=2)
+    _coverage_diagnostic(memory_dir, epoch_id="epoch_1")
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute(
+            "DELETE FROM concept_links WHERE concept_signature = 'concept-set' AND linked_key LIKE 'family-concept-%'"
+        )
+        conn.commit()
+
+    second = _coverage_diagnostic(memory_dir, epoch_id="epoch_2")
+
+    assert second["incremental_explanatory_coverage"] == 0.0
+    assert second["explanation_set_change"]["removed_structure_count"] == 2
+    assert "candidate_explanation_set_shrank" in second["coverage_change_causes"]
+    assert second["coverage_decline_classification"]["classification"] == "numerator_decline"
+
+
+def test_set_based_coverage_reports_all_failed_gates_and_deterministic_samples(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_set_coverage_candidate(
+        memory_dir,
+        extra_family_count=25,
+        cross_scope_count=1,
+        promotion_score=0.1,
+        include_heldout=False,
+    )
+
+    diagnostic = _coverage_diagnostic(memory_dir, epoch_id="epoch_1")
+
+    assert diagnostic["newly_explained_structure_ids_sample"] == sorted(
+        diagnostic["newly_explained_structure_ids_sample"]
+    )
+    assert len(diagnostic["newly_explained_structure_ids_sample"]) == 20
+    assert {
+        "insufficient_cross_context_or_game_evidence",
+        "no_heldout_samples",
+        "below_promotion_score_threshold",
+    } <= set(diagnostic["rejection_reasons"])
+
+
+def test_incremental_validation_disabled_preserves_legacy_promotion(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_set_coverage_candidate(memory_dir, extra_family_count=0, legacy_promoted=1)
+
+    result = validate_incremental_promotions_only(
+        memory_dir=memory_dir,
+        config=IncrementalPromotionValidationConfig(enabled=False),
+        validate_roles_and_concepts=True,
+        validate_world_models=False,
+    )
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        is_promoted = conn.execute(
+            "SELECT is_promoted FROM concept_candidates WHERE concept_signature = 'concept-set'"
+        ).fetchone()[0]
+    assert result == {"incremental_promotion_validation_enabled": False}
+    assert is_promoted == 1
+
+
+def test_incremental_validation_failure_count_is_epoch_idempotent_and_resets_on_success(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_set_coverage_candidate(memory_dir, extra_family_count=0)
+    config = IncrementalPromotionValidationConfig(enabled=True)
+    for _ in range(2):
+        validate_incremental_promotions_only(
+            memory_dir=memory_dir,
+            config=config,
+            validate_roles_and_concepts=True,
+            validate_world_models=False,
+            diagnostic_epoch_id="epoch_1",
+        )
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        first_failures = conn.execute(
+            "SELECT failure_count FROM promotion_validation_state WHERE candidate_type = 'concept' AND candidate_signature = 'concept-set'"
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO concept_links (concept_signature, linked_type, linked_key, support_count) VALUES ('concept-set', 'family', 'family-new-after-failure', 1)"
+        )
+        conn.commit()
+    assert first_failures == 1
+    validate_incremental_promotions_only(
+        memory_dir=memory_dir,
+        config=config,
+        validate_roles_and_concepts=True,
+        validate_world_models=False,
+        diagnostic_epoch_id="epoch_2",
+    )
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        status = conn.execute(
+            "SELECT failure_count, promotion_status, last_validation_epoch, last_validation_result FROM promotion_validation_state WHERE candidate_type = 'concept' AND candidate_signature = 'concept-set'"
+        ).fetchone()
+    assert status == (0, "promoted", "epoch_2", "passed")
+
+
 def test_incremental_promotion_validation_uses_later_evidence_and_demotes_without_deleting(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
     paths = ensure_memory_layout(memory_dir)
@@ -86,6 +348,7 @@ def test_incremental_promotion_validation_uses_later_evidence_and_demotes_withou
         )
         for linked_type, linked_key in (
             ("role", "role-a"), ("role", "role-b"), ("family", "family-a"), ("family", "family-b"),
+            ("family", "family-concept-only"),
             ("context", "ctx-a"), ("context", "ctx-b"), ("game", "game-a"), ("game", "game-b"),
         ):
             conn.execute(
@@ -125,6 +388,7 @@ def test_incremental_promotion_validation_uses_later_evidence_and_demotes_withou
         "min_cross_context_or_game_evidence": 2,
         "min_behavioral_or_predictive_lift": 0.01,
         "demotion_failure_limit": 1,
+        "promotion_score_threshold": 0.55,
     }
     assert validation_report["summary"]["concept_candidates_evaluated"] == 1
     candidate = validation_report["candidates"][0]
@@ -134,6 +398,9 @@ def test_incremental_promotion_validation_uses_later_evidence_and_demotes_withou
     assert candidate["rejection_reasons"] == []
     assert candidate["validation_evidence_count"] == 2
     assert candidate["heldout_transfer_lift"] == 1.0
+    assert "source_role_ids" not in candidate
+    assert candidate["source_role_count"] == 2
+    assert candidate["source_role_ids_sample"] == ["role-a", "role-b"]
     assert (tmp_path / "h07_after_first_validation" / "h07_concept_emergence_report.txt").read_text(
         encoding="utf-8"
     ).count("concept=concept-a") == 1
@@ -191,7 +458,6 @@ def test_incremental_promotion_validation_uses_later_evidence_and_demotes_withou
     demoted_candidate = h07_after_demotion["incremental_promotion_validation"]["candidates"][0]
     assert demoted_candidate["demoted"] is True
     assert demoted_candidate["demotion_reason"] == "demoted_after_repeated_failure"
-    assert "no_predictive_or_behavioral_lift" in demoted_candidate["rejection_reasons"]
     assert "heldout_validation_failed" in demoted_candidate["rejection_reasons"]
 
 
@@ -237,11 +503,14 @@ def test_h07_incremental_validation_reports_explicit_rejection_reasons(tmp_path:
                 """,
                 (signature, explanatory_reach, contexts, games),
             )
-            for linked_type, linked_key in (
+            concept_links = [
                 ("role", role),
                 ("carrier", f"carrier-{role}"),
                 ("family", f"family-{role}"),
-            ):
+            ]
+            if signature != "concept-coverage":
+                concept_links.append(("family", f"family-{signature}-only"))
+            for linked_type, linked_key in concept_links:
                 conn.execute(
                     "INSERT INTO concept_links (concept_signature, linked_type, linked_key, support_count) VALUES (?, ?, ?, 1)",
                     (signature, linked_type, linked_key),

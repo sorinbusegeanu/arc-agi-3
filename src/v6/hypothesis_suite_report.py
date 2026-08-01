@@ -150,13 +150,13 @@ class _HypothesisPhaseTracker:
                 extra=extra,
             )
 
-    def close(self, *, extra: dict[str, Any] | None = None) -> None:
+    def close(self, *, status: str = "done", extra: dict[str, Any] | None = None) -> None:
         if self._bar is not None:
             self._bar.close()
         log_hypothesis_progress(
             self.output_dir,
             self.phase,
-            "done",
+            status,
             epoch_id=self.epoch_id,
             current=self.current if self.total is None else min(self.current, int(self.total)),
             total=self.total,
@@ -167,7 +167,16 @@ class _HypothesisPhaseTracker:
             self.top_bar.update(1)
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        self.close(extra={"error": None if exc is None else f"{type(exc).__name__}: {exc}"})
+        if exc is None:
+            self.close()
+            return
+        self.close(
+            status="failed",
+            extra={
+                "exception_type": exc_type.__name__ if exc_type is not None else type(exc).__name__,
+                "exception_message": str(exc),
+            },
+        )
 
 
 @contextmanager
@@ -196,7 +205,10 @@ def hypothesis_phase(
     )
     try:
         yield tracker.__enter__()
-    finally:
+    except BaseException as exc:
+        tracker.__exit__(type(exc), exc, exc.__traceback__)
+        raise
+    else:
         tracker.__exit__(None, None, None)
 
 
@@ -404,6 +416,7 @@ def run_hypothesis_suite_report(
                         config=promotion_validation_config,
                         validate_roles_and_concepts=True,
                         validate_world_models=False,
+                        diagnostic_epoch_id=epoch_id,
                     )
                     timings["validate_concept_promotions_seconds"] = float(time.time() - t0)
             with _phase("H07"):
@@ -428,6 +441,7 @@ def run_hypothesis_suite_report(
                         config=promotion_validation_config,
                         validate_roles_and_concepts=False,
                         validate_world_models=True,
+                        diagnostic_epoch_id=epoch_id,
                     )
                     promotion_validation_summary["world_model_components_demoted"] = int(
                         world_validation_summary.get("world_model_components_demoted", 0) or 0

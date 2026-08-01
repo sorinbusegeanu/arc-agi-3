@@ -12,6 +12,9 @@ from typing import Any
 from v6.memory.compact_memory import ensure_memory_layout
 
 
+CONCEPT_PROMOTION_SCORE_THRESHOLD = 0.55
+
+
 ROLE_CLEAR_TABLES = (
     "role_neighborhood_signatures",
     "role_candidates",
@@ -19,7 +22,6 @@ ROLE_CLEAR_TABLES = (
     "role_transfer_attempts",
     "concept_candidates",
     "concept_links",
-    "concept_promotion_validation_diagnostics",
     "world_model_components",
     "world_model_links",
     "higher_order_milestones",
@@ -32,7 +34,6 @@ ROLE_ONLY_CLEAR_TABLES = (
     "role_transfer_attempts",
     "concept_candidates",
     "concept_links",
-    "concept_promotion_validation_diagnostics",
     "world_model_components",
     "world_model_links",
     "higher_order_milestones",
@@ -42,7 +43,6 @@ ROLE_TRANSFER_ONLY_CLEAR_TABLES = (
     "role_transfer_attempts",
     "concept_candidates",
     "concept_links",
-    "concept_promotion_validation_diagnostics",
     "world_model_components",
     "world_model_links",
 )
@@ -94,6 +94,7 @@ class IncrementalPromotionValidationConfig:
     min_cross_context_or_game_evidence: int = 2
     min_behavioral_or_predictive_lift: float = 0.01
     demotion_failure_limit: int = 2
+    promotion_score_threshold: float = CONCEPT_PROMOTION_SCORE_THRESHOLD
 
 
 def derive_higher_order_memory(
@@ -960,7 +961,7 @@ def derive_concept_candidates(state_conn: sqlite3.Connection, progress_factory: 
             and linked_family_count >= 2
             and compression_gain >= 1.50
             and (cross_game_count >= 2 or cross_context_count >= 3)
-            and promotion_score >= 0.55
+            and promotion_score >= CONCEPT_PROMOTION_SCORE_THRESHOLD
         )
         if overconcentrated:
             overconcentrated_concepts += 1
@@ -1021,6 +1022,8 @@ def derive_concept_candidates(state_conn: sqlite3.Connection, progress_factory: 
     _close_progress_tracker(concept_tracker)
     _write_milestone(state_conn, "first_concept_candidate_step", first_concept_candidate_step, None)
     _write_milestone(state_conn, "first_promoted_concept_step", first_promoted_concept_step, None)
+    _write_historical_milestone(state_conn, "first_concept_candidate_step", first_concept_candidate_step, None)
+    _write_historical_milestone(state_conn, "first_promoted_concept_step", first_promoted_concept_step, None)
     return {
         "concept_candidate_count": len(concept_groups),
         "promoted_concept_count": promoted_concepts,
@@ -1231,6 +1234,7 @@ def validate_incremental_promotions_only(
     config: IncrementalPromotionValidationConfig,
     validate_roles_and_concepts: bool,
     validate_world_models: bool,
+    diagnostic_epoch_id: str | int | None = None,
 ) -> dict[str, Any]:
     """Apply optional held-out validation without deleting failed candidates."""
     if not config.enabled:
@@ -1243,6 +1247,7 @@ def validate_incremental_promotions_only(
             config=config,
             validate_roles_and_concepts=validate_roles_and_concepts,
             validate_world_models=validate_world_models,
+            diagnostic_epoch_id=diagnostic_epoch_id,
         )
         state_conn.execute(
             """
@@ -1262,6 +1267,7 @@ def _validate_incremental_promotions(
     config: IncrementalPromotionValidationConfig,
     validate_roles_and_concepts: bool,
     validate_world_models: bool,
+    diagnostic_epoch_id: str | int | None,
 ) -> dict[str, Any]:
     """Calculate Phase 3 metrics from existing structures and later evidence.
 
@@ -1281,6 +1287,10 @@ def _validate_incremental_promotions(
         "roles_demoted": 0,
     }
     role_links = _links_by_signature(state_conn, "role_links", "role_signature")
+    role_explained_structures_by_role = {
+        role_signature: _linked_explained_structures(links)
+        for role_signature, links in role_links.items()
+    }
     concept_links = _links_by_signature(state_conn, "concept_links", "concept_signature")
     family_rows = state_conn.execute(
         "SELECT canonical_signature, prediction_lift, last_seen_global_step FROM transformation_families"
@@ -1294,14 +1304,22 @@ def _validate_incremental_promotions(
     }
     transfer_rows = state_conn.execute(
         """
-        SELECT role_signature, reuse_success, last_seen_global_step
+        SELECT role_signature, reuse_success, last_seen_global_step,
+               observed_role_signature, predicted_role_signature, target_carrier_signature
         FROM role_transfer_attempts
         ORDER BY role_signature ASC, attempt_id ASC
         """
     ).fetchall()
     transfers_by_role: dict[str, list[sqlite3.Row]] = defaultdict(list)
+    successful_transfer_target_roles_by_role: dict[str, set[str]] = defaultdict(set)
     for row in transfer_rows:
-        transfers_by_role[str(row["role_signature"])].append(row)
+        source_role = str(row["role_signature"])
+        transfers_by_role[source_role].append(row)
+        if int(row["reuse_success"] or 0) != 1:
+            continue
+        target_role = row["observed_role_signature"] or row["predicted_role_signature"]
+        if target_role and str(target_role) != source_role:
+            successful_transfer_target_roles_by_role[source_role].add(str(target_role))
     future_rows = state_conn.execute(
         """
         SELECT source_role_id, owner_type, owner_key, option_delta
@@ -1315,8 +1333,14 @@ def _validate_incremental_promotions(
             role_signature = row["owner_key"]
         if role_signature:
             future_by_role[str(role_signature)].append(float(row["option_delta"] or 0.0))
+    previous_coverage_states = _load_incremental_coverage_states(state_conn)
+    previous_states_by_fingerprint: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for previous_state in previous_coverage_states.values():
+        fingerprint = str(previous_state.get("structure_fingerprint") or "")
+        if fingerprint:
+            previous_states_by_fingerprint[fingerprint].append(previous_state)
 
-    role_metrics: dict[str, dict[str, float]] = {}
+    role_metrics: dict[str, dict[str, Any]] = {}
     if validate_roles_and_concepts:
         role_rows = state_conn.execute(
             """
@@ -1365,6 +1389,7 @@ def _validate_incremental_promotions(
                 validation_action_selection_lift=transfer_lift,
                 validation_transfer_lift=transfer_lift,
                 updated_global_step=None,
+                validation_epoch=diagnostic_epoch_id,
             )
             role_metrics[role_signature] = {
                 "coverage": explanatory_coverage,
@@ -1372,6 +1397,8 @@ def _validate_incremental_promotions(
                 "prediction": prediction_lift,
                 "future": future_lift,
                 "transfer": transfer_lift,
+                "families": sorted(families),
+                "structures": sorted(role_explained_structures_by_role.get(role_signature, set())),
             }
             state_conn.execute(
                 """
@@ -1399,18 +1426,45 @@ def _validate_incremental_promotions(
             FROM concept_candidates ORDER BY concept_signature ASC
             """
         ).fetchall()
+        source_role_structures_by_candidate: dict[str, set[str]] = {}
+        current_structure_ids_by_candidate: dict[str, set[str]] = {}
+        for concept_row in concept_rows:
+            concept_signature = str(concept_row["concept_signature"])
+            links = concept_links.get(concept_signature, {})
+            roles = sorted(links.get("role", set()))
+            source_role_structures = set().union(
+                *(role_explained_structures_by_role.get(role, set()) for role in roles)
+            ) if roles else set()
+            target_roles = set().union(
+                *(successful_transfer_target_roles_by_role.get(role, set()) for role in roles)
+            ) if roles else set()
+            target_role_structures = set().union(
+                *(role_explained_structures_by_role.get(role, set()) for role in target_roles)
+            ) if target_roles else set()
+            current_structure_ids_by_candidate[concept_signature] = (
+                _linked_explained_structures(links)
+                | source_role_structures
+                | target_role_structures
+            )
+            source_role_structures_by_candidate[concept_signature] = source_role_structures
         for row in concept_rows:
             concept_signature = str(row["concept_signature"])
             links = concept_links.get(concept_signature, {})
             roles = sorted(links.get("role", set()))
+            concept_explained_structures = current_structure_ids_by_candidate[concept_signature]
+            source_role_explained_structures = source_role_structures_by_candidate[concept_signature]
             source_metrics = [role_metrics[role] for role in roles if role in role_metrics]
-            baseline_coverage = _mean_metric(source_metrics, "coverage")
             baseline_compression = _mean_metric(source_metrics, "compression")
             baseline_prediction = _mean_metric(source_metrics, "prediction")
             baseline_future = _mean_metric(source_metrics, "future")
             baseline_transfer = _mean_metric(source_metrics, "transfer")
-            candidate_coverage = min(1.0, float(row["explanatory_reach"] or 0.0) / 8.0)
-            incremental_coverage = candidate_coverage - baseline_coverage
+            coverage_denominator = concept_explained_structures | source_role_explained_structures
+            newly_explained_structures = concept_explained_structures - source_role_explained_structures
+            incremental_coverage = (
+                float(len(newly_explained_structures)) / float(len(coverage_denominator))
+                if coverage_denominator
+                else 0.0
+            )
             incremental_compression = float(row["compression_gain"] or 0.0) - baseline_compression
             first_seen = None if row["first_seen_global_step"] is None else int(row["first_seen_global_step"])
             heldout_attempts = [
@@ -1466,7 +1520,14 @@ def _validate_incremental_promotions(
             heldout_lifts = [value for value in (validation_prediction_lift, validation_action_selection_lift, validation_transfer_lift) if value is not None]
             has_heldout_lift = bool(heldout_lifts) and max(heldout_lifts) >= float(config.min_behavioral_or_predictive_lift)
             legacy_promoted = bool(int(row["is_promoted"] or 0))
-            promoted = legacy_promoted and has_cross_evidence and has_incremental_gain and has_heldout_lift
+            promotion_score_before_validation = float(row["promotion_score"] or 0.0)
+            meets_promotion_score_threshold = promotion_score_before_validation >= float(config.promotion_score_threshold)
+            promoted = (
+                has_cross_evidence
+                and has_incremental_gain
+                and has_heldout_lift
+                and meets_promotion_score_threshold
+            )
             status, failure_count, demoted_this_validation = _update_promotion_validation_state(
                 state_conn,
                 candidate_type="concept",
@@ -1478,11 +1539,12 @@ def _validate_incremental_promotions(
                 validation_action_selection_lift=validation_action_selection_lift,
                 validation_transfer_lift=validation_transfer_lift,
                 updated_global_step=first_seen,
+                validation_epoch=diagnostic_epoch_id,
             )
             adjusted_promotion_score = (
-                float(row["promotion_score"] or 0.0)
+                promotion_score_before_validation
                 if promoted
-                else max(0.0, float(row["promotion_score"] or 0.0) - 0.10 * failure_count)
+                else max(0.0, promotion_score_before_validation - 0.10 * failure_count)
             )
             state_conn.execute(
                 """
@@ -1506,7 +1568,7 @@ def _validate_incremental_promotions(
             demoted = status == "demoted"
             rejection_reasons = _concept_promotion_rejection_reasons(
                 promoted=promoted,
-                legacy_promoted=legacy_promoted,
+                meets_promotion_score_threshold=meets_promotion_score_threshold,
                 has_incremental_gain=has_incremental_gain,
                 has_cross_evidence=has_cross_evidence,
                 heldout_lifts=heldout_lifts,
@@ -1517,15 +1579,30 @@ def _validate_incremental_promotions(
                 assert not rejection_reasons
             else:
                 assert rejection_reasons
+            coverage_diagnostics, coverage_state = _build_incremental_coverage_diagnostics(
+                candidate_signature=concept_signature,
+                diagnostic_epoch_id=diagnostic_epoch_id,
+                explanatory_reach=float(row["explanatory_reach"] or 0.0),
+                role_metrics=role_metrics,
+                source_roles=roles,
+                links=links,
+                concept_explained_structures=concept_explained_structures,
+                source_role_explained_structures=source_role_explained_structures,
+                newly_explained_structures=newly_explained_structures,
+                previous_state=previous_coverage_states.get(concept_signature),
+                previous_states_with_same_structure=previous_states_by_fingerprint,
+                all_current_structure_ids=current_structure_ids_by_candidate,
+            )
             diagnostic = {
                 "concept_id": concept_signature,
                 "candidate_signature": concept_signature,
-                "source_role_ids": roles,
-                "source_carrier_ids": sorted(links.get("carrier", set())),
-                "source_family_ids": sorted(links.get("family", set())),
+                **_compact_source_id_summary("role", roles),
+                **_compact_source_id_summary("carrier", sorted(links.get("carrier", set()))),
+                **_compact_source_id_summary("family", sorted(links.get("family", set()))),
                 "derivation_evidence_count": len(derivation_attempts),
                 "validation_evidence_count": validation_evidence_count,
                 "validation_scope": "later_global_step" if validation_evidence_count else "unavailable",
+                "explanatory_reach": float(row["explanatory_reach"] or 0.0),
                 "incremental_explanatory_coverage": incremental_coverage,
                 "incremental_compression_gain": incremental_compression,
                 "prediction_lift": concept_prediction_lift,
@@ -1537,13 +1614,34 @@ def _validate_incremental_promotions(
                 "cross_context_evidence_count": int(row["cross_context_count"] or 0),
                 "cross_game_evidence_count": int(row["cross_game_count"] or 0),
                 "promotion_score": adjusted_promotion_score,
-                "promotion_threshold": 0.55,
+                "raw_promotion_score": promotion_score_before_validation,
+                "adjusted_promotion_score": adjusted_promotion_score,
+                "promotion_score_before_validation": promotion_score_before_validation,
+                "promotion_threshold": float(config.promotion_score_threshold),
+                "legacy_promoted": legacy_promoted,
+                "incremental_validation_promoted": promoted,
                 "validation_pass": promoted,
                 "promoted": promoted,
                 "rejection_reasons": rejection_reasons,
                 "consecutive_validation_failures": failure_count,
                 "demoted": demoted,
                 "demotion_reason": "demoted_after_repeated_failure" if demoted else None,
+                **coverage_diagnostics,
+                **{
+                    key: coverage_diagnostics["incremental_coverage_diagnostics"][key]
+                    for key in (
+                        "concept_explained_structure_count",
+                        "source_role_explained_structure_count",
+                        "overlapping_structure_count",
+                        "newly_explained_structure_count",
+                        "coverage_denominator_count",
+                        "incremental_coverage",
+                        "concept_explained_structure_type_counts",
+                        "newly_explained_structure_type_counts",
+                        "newly_explained_structure_ids_sample",
+                        "overlapping_structure_ids_sample",
+                    )
+                },
             }
             state_conn.execute(
                 """
@@ -1552,6 +1650,13 @@ def _validate_incremental_promotions(
                 ON CONFLICT(concept_signature) DO UPDATE SET payload_json = excluded.payload_json
                 """,
                 (concept_signature, json.dumps(diagnostic, sort_keys=True)),
+            )
+            _store_incremental_coverage_state(
+                state_conn,
+                candidate_signature=concept_signature,
+                epoch_id=diagnostic_epoch_id,
+                state=coverage_state,
+                updated_global_step=first_seen,
             )
             summary["concept_candidates_evaluated"] += 1
             if not has_incremental_gain:
@@ -1562,6 +1667,21 @@ def _validate_incremental_promotions(
                 summary["concepts_promoted_with_behavioral_lift"] += 1
             if demoted_this_validation:
                 summary["concepts_demoted"] += 1
+        active_signatures = [str(row["concept_signature"]) for row in concept_rows]
+        if active_signatures:
+            placeholders = ", ".join("?" for _ in active_signatures)
+            state_conn.execute(
+                f"DELETE FROM concept_promotion_validation_diagnostics WHERE concept_signature NOT IN ({placeholders})",
+                active_signatures,
+            )
+        else:
+            state_conn.execute("DELETE FROM concept_promotion_validation_diagnostics")
+        active_promoted_step = state_conn.execute(
+            "SELECT MIN(first_seen_global_step) FROM concept_candidates WHERE COALESCE(is_promoted, 0) = 1"
+        ).fetchone()[0]
+        active_promoted_step = None if active_promoted_step is None else int(active_promoted_step)
+        _write_milestone(state_conn, "first_promoted_concept_step", active_promoted_step, None)
+        _write_historical_milestone(state_conn, "first_promoted_concept_step", active_promoted_step, None)
 
     if validate_world_models:
         component_rows = state_conn.execute(
@@ -1600,6 +1720,7 @@ def _validate_incremental_promotions(
                 validation_action_selection_lift=action_lift,
                 validation_transfer_lift=transfer_lift,
                 updated_global_step=None if row["first_seen_global_step"] is None else int(row["first_seen_global_step"]),
+                validation_epoch=diagnostic_epoch_id,
             )
             coherent = bool(int(row["is_coherent"] or 0)) and passed
             adjusted_coherence_score = (
@@ -1625,7 +1746,7 @@ def _validate_incremental_promotions(
     return summary
 
 
-def _mean_metric(items: list[dict[str, float]], key: str) -> float:
+def _mean_metric(items: list[dict[str, Any]], key: str) -> float:
     return sum(float(item.get(key, 0.0) or 0.0) for item in items) / max(1, len(items))
 
 
@@ -1634,10 +1755,370 @@ def _mean_row_metric(items: list[dict[str, Any]], key: str) -> float | None:
     return (sum(values) / len(values)) if values else None
 
 
+_DIAGNOSTIC_ID_SAMPLE_LIMIT = 20
+
+
+def _compact_source_id_summary(kind: str, identifiers: list[str]) -> dict[str, Any]:
+    values = sorted(dict.fromkeys(str(identifier) for identifier in identifiers))
+    return {
+        f"source_{kind}_count": len(values),
+        f"source_{kind}_ids_sample": values[:_DIAGNOSTIC_ID_SAMPLE_LIMIT],
+    }
+
+
+def _linked_explained_structures(links: dict[str, set[str]]) -> set[str]:
+    """Return the stable linked structures used by set-based concept coverage."""
+    values: set[str] = set()
+    for kind in ("family", "context", "game", "carrier"):
+        values.update(f"{kind}:{identifier}" for identifier in links.get(kind, set()))
+    return values
+
+
+def _structure_fingerprint(structure_ids: set[str]) -> str:
+    return sha1("\n".join(sorted(structure_ids)).encode("utf-8")).hexdigest()
+
+
+def _structure_type_counts(structure_ids: set[str]) -> dict[str, int]:
+    counts: dict[str, int] = defaultdict(int)
+    for structure_id in structure_ids:
+        kind, _separator, _identifier = structure_id.partition(":")
+        if kind:
+            counts[kind] += 1
+    return {kind: counts[kind] for kind in sorted(counts)}
+
+
+def _load_incremental_coverage_states(state_conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
+    table_exists = state_conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'concept_incremental_coverage_state'"
+    ).fetchone()
+    if table_exists is None:
+        return {}
+    states: dict[str, dict[str, Any]] = {}
+    for row in state_conn.execute(
+        """
+        SELECT candidate_signature, epoch_id, structure_fingerprint, payload_json
+        FROM concept_incremental_coverage_state
+        ORDER BY candidate_signature ASC
+        """
+    ).fetchall():
+        try:
+            payload = json.loads(str(row["payload_json"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        payload["candidate_signature"] = str(row["candidate_signature"])
+        payload["epoch_id"] = row["epoch_id"]
+        payload["structure_fingerprint"] = str(row["structure_fingerprint"])
+        states[str(row["candidate_signature"])] = payload
+    return states
+
+
+def _store_incremental_coverage_state(
+    state_conn: sqlite3.Connection,
+    *,
+    candidate_signature: str,
+    epoch_id: str | int | None,
+    state: dict[str, Any],
+    updated_global_step: int | None,
+) -> None:
+    state_conn.execute(
+        """
+        INSERT INTO concept_incremental_coverage_state (
+            candidate_signature, epoch_id, structure_fingerprint, payload_json, updated_global_step
+        ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(candidate_signature) DO UPDATE SET
+            epoch_id = excluded.epoch_id,
+            structure_fingerprint = excluded.structure_fingerprint,
+            payload_json = excluded.payload_json,
+            updated_global_step = excluded.updated_global_step
+        """,
+        (
+            candidate_signature,
+            None if epoch_id is None else str(epoch_id),
+            str(state["structure_fingerprint"]),
+            json.dumps(state, sort_keys=True),
+            updated_global_step,
+        ),
+    )
+
+
+def _build_incremental_coverage_diagnostics(
+    *,
+    candidate_signature: str,
+    diagnostic_epoch_id: str | int | None,
+    explanatory_reach: float,
+    role_metrics: dict[str, dict[str, Any]],
+    source_roles: list[str],
+    links: dict[str, set[str]],
+    concept_explained_structures: set[str],
+    source_role_explained_structures: set[str],
+    newly_explained_structures: set[str],
+    previous_state: dict[str, Any] | None,
+    previous_states_with_same_structure: dict[str, list[dict[str, Any]]],
+    all_current_structure_ids: dict[str, set[str]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Expose the same set arithmetic used by the Phase 3 coverage gate."""
+    coverage_denominator = concept_explained_structures | source_role_explained_structures
+    overlapping_structures = concept_explained_structures & source_role_explained_structures
+    candidate_count = len(concept_explained_structures)
+    source_role_count = len(source_role_explained_structures)
+    overlap_count = len(overlapping_structures)
+    newly_count = len(newly_explained_structures)
+    denominator_count = len(coverage_denominator)
+    expected_incremental = float(newly_count) / float(denominator_count) if denominator_count else 0.0
+    diagnostics_errors: list[str] = []
+    if newly_count + overlap_count != candidate_count:
+        diagnostics_errors.append("new_structure_count_plus_overlap_structure_count_mismatch")
+    if not 0.0 <= expected_incremental <= 1.0:
+        diagnostics_errors.append("incremental_explanatory_coverage_out_of_range")
+
+    role_overlap = [
+        {
+            "role_id": role,
+            "overlap_count": len(concept_explained_structures & set(role_metrics.get(role, {}).get("structures", []))),
+            "overlap_weight": float(len(concept_explained_structures & set(role_metrics.get(role, {}).get("structures", [])))),
+        }
+        for role in sorted(source_roles)
+        if role in role_metrics
+    ]
+    family_overlap_counts: dict[str, int] = defaultdict(int)
+    for structure_id in overlapping_structures:
+        if structure_id.startswith("family:"):
+            family_overlap_counts[structure_id.removeprefix("family:")] += 1
+    family_overlap = [
+        {
+            "family_id": family,
+            "overlap_count": count,
+            "overlap_weight": float(count),
+        }
+        for family, count in sorted(family_overlap_counts.items())
+    ]
+    overlap_ratio = float(overlap_count) / float(candidate_count) if candidate_count else 0.0
+    breakdown = _structure_type_counts(coverage_denominator)
+    structure_fingerprint = _structure_fingerprint(concept_explained_structures)
+    state = {
+        "candidate_explained_count": candidate_count,
+        "candidate_explained_weight": float(candidate_count),
+        "candidate_raw_explained_weight": float(explanatory_reach),
+        "already_explained_count": source_role_count,
+        "already_explained_weight": float(source_role_count),
+        "newly_explained_count": newly_count,
+        "coverage_denominator_count": denominator_count,
+        "coverage_denominator_weight": float(denominator_count),
+        "incremental_coverage": expected_incremental,
+        "overlap_count": overlap_count,
+        "overlap_weight": float(overlap_count),
+        "explanation_structure_ids": sorted(concept_explained_structures),
+        "structure_fingerprint": structure_fingerprint,
+    }
+    longitudinal = _coverage_longitudinal_change(
+        current_state=state,
+        previous_state=previous_state,
+        diagnostic_epoch_id=diagnostic_epoch_id,
+    )
+    explanation_change = _explanation_set_change(
+        current_ids=concept_explained_structures,
+        previous_state=previous_state,
+    )
+    causes = _coverage_change_causes(
+        longitudinal=longitudinal,
+        explanation_change=explanation_change,
+        previous_state=previous_state,
+        structure_fingerprint=structure_fingerprint,
+        candidate_signature=candidate_signature,
+        previous_states_with_same_structure=previous_states_with_same_structure,
+        all_current_structure_ids=all_current_structure_ids,
+    )
+    decline = _coverage_decline_classification(longitudinal)
+    return (
+        {
+            "incremental_coverage_diagnostics": {
+                **{key: state[key] for key in (
+                    "candidate_explained_count",
+                    "candidate_explained_weight",
+                    "already_explained_count",
+                    "already_explained_weight",
+                    "coverage_denominator_count",
+                    "coverage_denominator_weight",
+                    "incremental_coverage",
+                )},
+                "newly_explained_count": newly_count,
+                "newly_explained_weight": float(newly_count),
+                "candidate_raw_explained_weight": float(explanatory_reach),
+                "concept_explained_structure_count": candidate_count,
+                "source_role_explained_structure_count": source_role_count,
+                "overlapping_structure_count": overlap_count,
+                "newly_explained_structure_count": newly_count,
+                "concept_explained_structure_type_counts": _structure_type_counts(concept_explained_structures),
+                "newly_explained_structure_type_counts": _structure_type_counts(newly_explained_structures),
+                "newly_explained_structure_ids_sample": sorted(newly_explained_structures)[:_DIAGNOSTIC_ID_SAMPLE_LIMIT],
+                "overlapping_structure_ids_sample": sorted(overlapping_structures)[:_DIAGNOSTIC_ID_SAMPLE_LIMIT],
+            },
+            "coverage_denominator_breakdown": breakdown,
+            "coverage_overlap": {
+                "overlap_count": overlap_count,
+                "overlap_ratio": overlap_ratio,
+                "overlap_by_existing_concept": [],
+                "overlap_by_role": role_overlap[:_DIAGNOSTIC_ID_SAMPLE_LIMIT],
+                "overlap_by_role_count": len(role_overlap),
+                "overlap_by_family": family_overlap[:_DIAGNOSTIC_ID_SAMPLE_LIMIT],
+                "overlap_by_family_count": len(family_overlap),
+            },
+            "coverage_longitudinal_change": longitudinal,
+            "coverage_change_causes": causes,
+            "explanation_set_change": explanation_change,
+            "coverage_decline_classification": decline,
+            "diagnostics_errors": diagnostics_errors,
+        },
+        state,
+    )
+
+
+def _coverage_longitudinal_change(
+    *,
+    current_state: dict[str, Any],
+    previous_state: dict[str, Any] | None,
+    diagnostic_epoch_id: str | int | None,
+) -> dict[str, Any]:
+    if previous_state is None:
+        return {
+            "previous_epoch": None,
+            "current_epoch": None if diagnostic_epoch_id is None else str(diagnostic_epoch_id),
+            "previous_candidate_explained_count": None,
+            "current_candidate_explained_count": current_state["candidate_explained_count"],
+            "candidate_explained_count_delta": None,
+            "previous_denominator_count": None,
+            "current_denominator_count": current_state["coverage_denominator_count"],
+            "denominator_count_delta": None,
+            "previous_incremental_coverage": None,
+            "current_incremental_coverage": current_state["incremental_coverage"],
+            "incremental_coverage_delta": None,
+            "previous_overlap_weight": None,
+            "current_overlap_weight": current_state["overlap_weight"],
+            "previous_newly_explained_count": None,
+            "current_newly_explained_count": current_state["newly_explained_count"],
+        }
+    previous_candidate_count = float(previous_state.get("candidate_explained_count", 0.0) or 0.0)
+    previous_denominator_count = float(previous_state.get("coverage_denominator_count", 0.0) or 0.0)
+    previous_incremental = float(previous_state.get("incremental_coverage", 0.0) or 0.0)
+    previous_overlap = float(previous_state.get("overlap_weight", 0.0) or 0.0)
+    previous_newly_explained_count = float(previous_state.get("newly_explained_count", 0.0) or 0.0)
+    return {
+        "previous_epoch": previous_state.get("epoch_id"),
+        "current_epoch": None if diagnostic_epoch_id is None else str(diagnostic_epoch_id),
+        "previous_candidate_explained_count": previous_state.get("candidate_explained_count"),
+        "current_candidate_explained_count": current_state["candidate_explained_count"],
+        "candidate_explained_count_delta": current_state["candidate_explained_count"] - previous_candidate_count,
+        "previous_denominator_count": previous_state.get("coverage_denominator_count"),
+        "current_denominator_count": current_state["coverage_denominator_count"],
+        "denominator_count_delta": current_state["coverage_denominator_count"] - previous_denominator_count,
+        "previous_incremental_coverage": previous_incremental,
+        "current_incremental_coverage": current_state["incremental_coverage"],
+        "incremental_coverage_delta": current_state["incremental_coverage"] - previous_incremental,
+        "previous_overlap_weight": previous_overlap,
+        "current_overlap_weight": current_state["overlap_weight"],
+        "previous_newly_explained_count": previous_newly_explained_count,
+        "current_newly_explained_count": current_state["newly_explained_count"],
+    }
+
+
+def _explanation_set_change(
+    *,
+    current_ids: set[str],
+    previous_state: dict[str, Any] | None,
+) -> dict[str, Any]:
+    previous_ids = set(previous_state.get("explanation_structure_ids", [])) if previous_state else set()
+    added = sorted(current_ids - previous_ids)
+    removed = sorted(previous_ids - current_ids)
+    return {
+        "added_structure_count": len(added),
+        "removed_structure_count": len(removed),
+        "retained_structure_count": len(current_ids & previous_ids),
+        "added_structure_ids_sample": added[:_DIAGNOSTIC_ID_SAMPLE_LIMIT],
+        "removed_structure_ids_sample": removed[:_DIAGNOSTIC_ID_SAMPLE_LIMIT],
+    }
+
+
+def _coverage_change_causes(
+    *,
+    longitudinal: dict[str, Any],
+    explanation_change: dict[str, Any],
+    previous_state: dict[str, Any] | None,
+    structure_fingerprint: str,
+    candidate_signature: str,
+    previous_states_with_same_structure: dict[str, list[dict[str, Any]]],
+    all_current_structure_ids: dict[str, set[str]],
+) -> list[str]:
+    if previous_state is None:
+        changed_signature = any(
+            str(item.get("candidate_signature")) != candidate_signature
+            for item in previous_states_with_same_structure.get(structure_fingerprint, [])
+        )
+        causes = ["candidate_signature_changed"] if changed_signature else []
+        causes.append("missing_previous_epoch_baseline")
+        return causes
+    candidate_delta = float(longitudinal["current_newly_explained_count"] or 0.0) - float(
+        longitudinal["previous_newly_explained_count"] or 0.0
+    )
+    denominator_delta = float(longitudinal["denominator_count_delta"] or 0.0)
+    overlap_delta = float(longitudinal["current_overlap_weight"] or 0.0) - float(
+        longitudinal["previous_overlap_weight"] or 0.0
+    )
+    causes: list[str] = []
+    if denominator_delta > 0 and candidate_delta < denominator_delta:
+        causes.append("denominator_growth_exceeded_candidate_growth")
+    if overlap_delta > 0:
+        causes.append("increased_overlap_with_existing_structures")
+    if int(explanation_change["removed_structure_count"] or 0) > 0:
+        causes.append("candidate_explanation_set_shrank")
+        removed = set(explanation_change["removed_structure_ids_sample"])
+        if removed and any(
+            candidate != candidate_signature and bool(removed & structures)
+            for candidate, structures in all_current_structure_ids.items()
+        ):
+            causes.append("evidence_reassigned_to_other_structure")
+    return causes
+
+
+def _coverage_decline_classification(longitudinal: dict[str, Any]) -> dict[str, Any]:
+    previous_incremental = longitudinal.get("previous_incremental_coverage")
+    current_incremental = longitudinal.get("current_incremental_coverage")
+    if previous_incremental is None or current_incremental is None or current_incremental >= previous_incremental:
+        return {
+            "classification": "not_declining",
+            "numerator_growth_rate": 0.0,
+            "denominator_growth_rate": 0.0,
+            "overlap_growth_rate": 0.0,
+        }
+    previous_candidate = float(longitudinal.get("previous_newly_explained_count") or 0.0)
+    current_candidate = float(longitudinal.get("current_newly_explained_count") or 0.0)
+    previous_denominator = float(longitudinal.get("previous_denominator_count") or 0.0)
+    current_denominator = float(longitudinal.get("current_denominator_count") or 0.0)
+    previous_overlap = float(longitudinal.get("previous_overlap_weight") or 0.0)
+    current_overlap = float(longitudinal.get("current_overlap_weight") or 0.0)
+    numerator_rate = (current_candidate - previous_candidate) / max(abs(previous_candidate), 1.0)
+    denominator_rate = (current_denominator - previous_denominator) / max(abs(previous_denominator), 1.0)
+    overlap_rate = (current_overlap - previous_overlap) / max(abs(previous_overlap), 1.0)
+    drivers = []
+    if numerator_rate < 0:
+        drivers.append("numerator_decline")
+    if denominator_rate > 0 and numerator_rate < denominator_rate:
+        drivers.append("denominator_growth")
+    if overlap_rate > 0:
+        drivers.append("overlap_growth")
+    return {
+        "classification": drivers[0] if len(drivers) == 1 else ("mixed" if drivers else "not_declining"),
+        "numerator_growth_rate": numerator_rate,
+        "denominator_growth_rate": denominator_rate,
+        "overlap_growth_rate": overlap_rate,
+    }
+
+
 def _concept_promotion_rejection_reasons(
     *,
     promoted: bool,
-    legacy_promoted: bool,
+    meets_promotion_score_threshold: bool,
     has_incremental_gain: bool,
     has_cross_evidence: bool,
     heldout_lifts: list[float],
@@ -1655,12 +2136,12 @@ def _concept_promotion_rejection_reasons(
     if not heldout_lifts:
         reasons.append("no_heldout_samples")
     elif not has_heldout_lift:
-        reasons.extend(("no_predictive_or_behavioral_lift", "heldout_validation_failed"))
-    if not legacy_promoted:
-        reasons.append("below_promotion_threshold")
+        reasons.append("heldout_validation_failed")
+    if not meets_promotion_score_threshold:
+        reasons.append("below_promotion_score_threshold")
     if demoted:
         reasons.append("demoted_after_repeated_failure")
-    return list(dict.fromkeys(reasons)) or ["below_promotion_threshold"]
+    return list(dict.fromkeys(reasons)) or ["below_promotion_score_threshold"]
 
 
 def _update_promotion_validation_state(
@@ -1675,18 +2156,23 @@ def _update_promotion_validation_state(
     validation_action_selection_lift: float | None,
     validation_transfer_lift: float | None,
     updated_global_step: int | None,
+    validation_epoch: str | int | None = None,
 ) -> tuple[str, int, bool]:
     previous = state_conn.execute(
         """
-        SELECT failure_count, promotion_status FROM promotion_validation_state
+        SELECT failure_count, promotion_status, last_validation_epoch FROM promotion_validation_state
         WHERE candidate_type = ? AND candidate_signature = ?
         """,
         (candidate_type, candidate_signature),
     ).fetchone()
     previous_failures = int(previous["failure_count"] or 0) if previous is not None else 0
     previous_status = str(previous["promotion_status"] or "candidate") if previous is not None else "candidate"
+    epoch_value = None if validation_epoch is None else str(validation_epoch)
+    same_epoch = bool(previous is not None and epoch_value is not None and previous["last_validation_epoch"] == epoch_value)
     if passed:
         status, failure_count, demoted = "promoted", 0, False
+    elif same_epoch:
+        status, failure_count, demoted = previous_status, previous_failures, previous_status == "demoted"
     else:
         failure_count = previous_failures + 1
         previously_promoted = previous_status in {"promoted", "validation_failed"}
@@ -1697,8 +2183,9 @@ def _update_promotion_validation_state(
         INSERT INTO promotion_validation_state (
             candidate_type, candidate_signature, failure_count, promotion_status,
             last_validation_scope, last_validation_prediction_lift,
-            last_validation_action_selection_lift, last_validation_transfer_lift, updated_global_step
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            last_validation_action_selection_lift, last_validation_transfer_lift,
+            last_validation_epoch, last_validation_global_step, last_validation_result, updated_global_step
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(candidate_type, candidate_signature) DO UPDATE SET
             failure_count = excluded.failure_count,
             promotion_status = excluded.promotion_status,
@@ -1706,12 +2193,15 @@ def _update_promotion_validation_state(
             last_validation_prediction_lift = excluded.last_validation_prediction_lift,
             last_validation_action_selection_lift = excluded.last_validation_action_selection_lift,
             last_validation_transfer_lift = excluded.last_validation_transfer_lift,
+            last_validation_epoch = excluded.last_validation_epoch,
+            last_validation_global_step = excluded.last_validation_global_step,
+            last_validation_result = excluded.last_validation_result,
             updated_global_step = excluded.updated_global_step
         """,
         (
             candidate_type, candidate_signature, failure_count, status, validation_scope,
             validation_prediction_lift, validation_action_selection_lift, validation_transfer_lift,
-            updated_global_step,
+            epoch_value, updated_global_step, "passed" if passed else "failed", updated_global_step,
         ),
     )
     return status, failure_count, demoted
@@ -2277,6 +2767,28 @@ def _write_milestone(connection: sqlite3.Connection, name: str, first_global_ste
         VALUES (?, ?, ?)
         ON CONFLICT(milestone_name)
         DO UPDATE SET first_global_step = excluded.first_global_step, evidence_key = excluded.evidence_key
+        """,
+        (name, first_global_step, evidence_key),
+    )
+
+
+def _write_historical_milestone(
+    connection: sqlite3.Connection,
+    name: str,
+    first_global_step: int | None,
+    evidence_key: str | None,
+) -> None:
+    if first_global_step is None:
+        return
+    connection.execute(
+        """
+        INSERT INTO higher_order_milestone_history (milestone_name, first_global_step, evidence_key)
+        VALUES (?, ?, ?)
+        ON CONFLICT(milestone_name) DO UPDATE SET
+            first_global_step = MIN(higher_order_milestone_history.first_global_step, excluded.first_global_step),
+            evidence_key = CASE
+                WHEN excluded.first_global_step < higher_order_milestone_history.first_global_step
+                THEN excluded.evidence_key ELSE higher_order_milestone_history.evidence_key END
         """,
         (name, first_global_step, evidence_key),
     )
