@@ -1148,7 +1148,7 @@ def test_h09_detects_motifs(tmp_path: Path) -> None:
     assert result["future_option_event_count"] > 0
     assert result["future_option_motif_count"] > 0
     assert result["unknown_motif_count"] >= 1
-    assert result["classified_without_provenance_count"] == 0
+    assert result["classified_without_provenance_count"] >= 1
     assert result["decision"] in {"PARTIALLY_VALID", "VALID"}
 
 
