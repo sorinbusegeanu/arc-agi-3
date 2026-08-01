@@ -87,7 +87,7 @@ def test_direct_fold_timing_is_emitted_once_after_post_fold_processing(tmp_path:
     )
     monkeypatch.setattr(
         "v6.evaluation.interaction_sampling._evaluate_sampling_runs",
-        lambda config, root, timings: timings.update({"metrics": 0.7, "validation": 0.8}) or [],
+        lambda config, root, timings, validation_metrics=None: timings.update({"metrics": 0.7, "validation": 0.8}) or [],
     )
     monkeypatch.setattr("v6.evaluation.interaction_sampling.sampler_comparison_rows", lambda rows: [])
     monkeypatch.setattr("v6.evaluation.interaction_sampling.best_by_game", lambda rows: [])

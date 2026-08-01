@@ -23,7 +23,13 @@ from v6.environment.arc_adapter import registered_game_ids
 from v6.environment.arc_adapter import ArcGridEnvironment
 from v6.evaluation.broad_game_validation import family_for_game, game_passes, parse_game_selector
 from v6.evaluation.failure_diagnostics import compute_run_diagnostics
-from v6.evaluation.id_free_prefuture_validation import ID_FREE_FEATURE_SETS, evaluate_id_free_config
+from v6.evaluation.id_free_prefuture_validation import (
+    ID_FREE_FEATURE_SETS,
+    evaluate_id_free_config,
+    evaluate_prepared_id_free_config,
+    prepare_id_free_feature_set,
+    prepare_id_free_validation_group,
+)
 from v6.evaluation.prefuture_role_prediction import PREFUTURE_CLASSIFIERS, PrefutureExample, load_prefuture_examples
 from v6.game_sets import load_game_set_manifest, parquet_games_present
 from v6.main import V6Config, V6System
@@ -212,6 +218,7 @@ V05C_GAME_PRESETS = {
 DEFAULT_HIGH_REPLAY_PRIORITY_THRESHOLD = 0.70
 DEFAULT_STABLE_TRANSFORMATION_FAMILY_SUPPORT = 5
 ROOT_DIR = Path(__file__).resolve().parents[3]
+_VALIDATION_THREADPOOL_LIMITER = None
 GAMES_MD_CANDIDATES = (
     ROOT_DIR / "GAMES.md",
     ROOT_DIR / "other_repos" / "arc-interactive" / "GAMES.md",
@@ -231,6 +238,7 @@ class InteractionSamplingConfig:
     adaptive_context_expansion: bool = False
     max_context_depth: int | None = None
     workers: int = 60
+    validation_workers: int = 8
     max_tasks_per_child: int = 1
     commit_steps: int = 5000
     sqlite_synchronous: str = "normal"
@@ -382,7 +390,15 @@ def run_interaction_sampling_v05c(config: InteractionSamplingConfig) -> list[dic
         if isinstance(direct_fold_started_at, (int, float))
         else None
     )
-    rows = _evaluate_sampling_runs(config, sampling_root, direct_fold_timings)
+    validation_execution_metrics: dict[str, object] = {}
+    rows = _evaluate_sampling_runs(
+        config,
+        sampling_root,
+        direct_fold_timings,
+        validation_execution_metrics,
+    )
+    if validation_execution_metrics:
+        worker_execution["validation_execution"] = validation_execution_metrics
     diagnostics_started_at = time.perf_counter()
     comparison = sampler_comparison_rows(rows)
     best = best_by_game(rows)
@@ -410,6 +426,7 @@ def run_interaction_sampling_v05c(config: InteractionSamplingConfig) -> list[dic
         "steps": int(config.steps),
         "horizon": int(config.horizon),
         "context_depth": int(config.context_depth),
+        "validation_workers_requested": int(config.validation_workers),
         "global_step_offset": int(config.global_step_offset),
         "global_step_start": int(config.global_step_offset) + 1,
         "global_step_end": int(config.global_step_offset) + int(config.steps),
@@ -1636,6 +1653,7 @@ def _evaluate_sampling_runs(
     config: InteractionSamplingConfig,
     sampling_root: Path,
     direct_fold_timings: dict[str, float] | None = None,
+    validation_execution_metrics: dict[str, object] | None = None,
 ) -> list[dict]:
     if config.memory_output_dir and direct_streaming_manifest_exists(config.memory_output_dir):
         metrics_started_at = time.perf_counter()
@@ -1654,6 +1672,29 @@ def _evaluate_sampling_runs(
             grouped[(str(row.get("game")), str(row.get("sampler_name")))].append(dict(row))
         for payload in validation_payloads:
             grouped_payloads[(str(payload.get("game")), str(payload.get("sampler_name")))].append(dict(payload))
+        validation_tasks = [
+            {
+                "game": str(game),
+                "sampler_name": str(sampler_name),
+                "payloads": grouped_payloads.get((str(game), str(sampler_name)), []),
+                "config": _validation_task_config(config),
+            }
+            for game in config.games
+            for sampler_name in config.samplers
+        ]
+        validation_results, validation_metrics = _run_streamed_validation_tasks(config, validation_tasks)
+        _add_direct_fold_timing(
+            direct_fold_timings,
+            "validation",
+            float(validation_metrics["validation_parallel_wall_seconds"]),
+        )
+        if validation_execution_metrics is not None:
+            validation_execution_metrics.update(validation_metrics)
+        validation_by_group = {
+            (str(result["game"]), str(result["sampler_name"])): result
+            for result in validation_results
+        }
+        aggregation_started_at = time.perf_counter()
         rows: list[dict] = []
         for game in config.games:
             for sampler_name in config.samplers:
@@ -1665,18 +1706,32 @@ def _evaluate_sampling_runs(
                     continue
                 aggregate = _aggregate_seed_rows(seed_rows, config)
                 _add_direct_fold_timing(direct_fold_timings, "metrics", time.perf_counter() - metrics_started_at)
-                validation_started_at = time.perf_counter()
-                payload_rows = grouped_payloads.get((str(game), str(sampler_name)), [])
-                eval_row = _best_validation_row_from_streamed_payloads(game, sampler_name, config, payload_rows)
-                _add_direct_fold_timing(direct_fold_timings, "validation", time.perf_counter() - validation_started_at)
+                validation_result = validation_by_group[(str(game), str(sampler_name))]
+                if str(validation_result.get("run_status")) != "ok":
+                    failure_reason = str(validation_result.get("failure_reason") or "validation failed")
+                    rows.append(
+                        {
+                            **aggregate,
+                            **_failed_row(game, sampler_name, config, failure_reason),
+                            **dict(validation_result.get("timings", {})),
+                            "run_status": "failed",
+                            "failure_reason": failure_reason,
+                        }
+                    )
+                    continue
                 rows.append(
                     {
                         **aggregate,
-                        **eval_row,
+                        **dict(validation_result["validation"]),
                         "run_status": "ok",
                         "failure_reason": "",
                     }
                 )
+        validation_metrics["validation_result_aggregation_seconds"] = max(
+            0.0, time.perf_counter() - aggregation_started_at
+        )
+        if validation_execution_metrics is not None:
+            validation_execution_metrics.update(validation_metrics)
         return rows
     rows: list[dict] = []
     for game in config.games:
@@ -1898,7 +1953,10 @@ def _run_metrics(path: Path, game: str, sampler_name: str, seed: int, config: In
     metadata = _read_sampling_metadata(path)
     diagnostics.update(metadata)
     diagnostics.update(_read_efficiency_metrics(path))
+    diagnostics["level_completion_records"] = _completion_records_from_sampling_db(path)
     diagnostics["sampler_name"] = sampler_name
+    diagnostics["game"] = str(game)
+    diagnostics["seed"] = int(seed)
     return diagnostics
 
 
@@ -1975,45 +2033,86 @@ def _prefuture_examples_from_payloads(payloads: list[dict]) -> list[PrefutureExa
     return examples
 
 
-def _best_validation_row_from_streamed_payloads(
+def _validation_task_config(config: InteractionSamplingConfig) -> dict[str, object]:
+    """Only the validation settings needed by a worker are serialized per task."""
+    return {
+        "train_seeds": tuple(int(seed) for seed in config.train_seeds),
+        "test_seed": int(config.test_seed),
+        "steps": int(config.steps),
+        "horizon": int(config.horizon),
+        "context_depth": int(config.context_depth),
+        "adaptive_context_expansion": bool(config.adaptive_context_expansion),
+        "max_context_depth": config.max_context_depth,
+    }
+
+
+def _validation_worker_initializer() -> None:
+    """Prevent numerical libraries from oversubscribing validation processes."""
+    global _VALIDATION_THREADPOOL_LIMITER
+    for variable in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ[variable] = "1"
+    try:
+        from threadpoolctl import threadpool_limits
+
+        _VALIDATION_THREADPOOL_LIMITER = threadpool_limits(limits=1)
+    except Exception:
+        # threadpoolctl is optional; the environment settings cover supported backends.
+        pass
+
+
+def _effective_validation_workers(requested_workers: int, task_count: int) -> int:
+    if int(task_count) <= 0:
+        return 1
+    return min(max(1, int(requested_workers)), int(task_count), 16)
+
+
+def _best_validation_row_from_examples(
     game: str,
-    sampler_name: str,
-    config: InteractionSamplingConfig,
-    payloads: list[dict],
+    config: SimpleNamespace,
+    train: list[PrefutureExample],
+    test: list[PrefutureExample],
+    timings: dict[str, float] | None = None,
 ) -> dict:
-    validation_context_depth = (
-        int(config.max_context_depth)
-        if bool(config.adaptive_context_expansion) and config.max_context_depth is not None
-        else int(config.context_depth)
-    )
-    payloads_by_seed: dict[int, list[dict]] = defaultdict(list)
-    for payload in payloads:
-        payloads_by_seed[int(payload.get("seed", 0) or 0)].append(dict(payload))
-    train = _prefuture_examples_from_payloads([payload for seed in config.train_seeds for payload in payloads_by_seed.get(int(seed), [])])
-    train = [item for item in train if int(item.features["context_level"]) <= validation_context_depth]
-    test = _prefuture_examples_from_payloads(payloads_by_seed.get(int(config.test_seed), []))
-    test = [item for item in test if int(item.features["context_level"]) <= validation_context_depth]
     if not train or not test:
         raise RuntimeError("Direct streaming validation payloads missing; raw DB fallback is disabled.")
-    candidates = []
+    feature_started_at = time.perf_counter()
+    prepared_group = prepare_id_free_validation_group(train, test)
+    candidates: list[dict] = []
+    classifier_seconds = 0.0
     for feature_set in ID_FREE_FEATURE_SETS:
+        prepared_features = prepare_id_free_feature_set(prepared_group, feature_set)
         for classifier in PREFUTURE_CLASSIFIERS:
-            row = evaluate_id_free_config(
+            classifier_started_at = time.perf_counter()
+            row = evaluate_prepared_id_free_config(
                 game=game,
                 feature_set=feature_set,
                 classifier=classifier,
-                train_seeds=config.train_seeds,
-                test_seed=config.test_seed,
-                steps=config.steps,
-                horizon=config.horizon,
-                train_examples=train,
-                test_examples=test,
+                train_seeds=tuple(config.train_seeds),
+                test_seed=int(config.test_seed),
+                steps=int(config.steps),
+                horizon=int(config.horizon),
+                prepared_group=prepared_group,
+                prepared_features=prepared_features,
             )
+            classifier_seconds += max(0.0, time.perf_counter() - classifier_started_at)
             if row is not None:
                 candidates.append(row)
+    if timings is not None:
+        timings["validation_feature_preparation_seconds"] = max(
+            0.0, time.perf_counter() - feature_started_at - classifier_seconds
+        )
+        timings["validation_classifier_seconds"] = classifier_seconds
     if not candidates:
         raise RuntimeError("Direct streaming validation payloads missing; raw DB fallback is disabled.")
-    best = max(candidates, key=lambda row: (game_passes({"run_status": "ok", **row}), row["id_free_macro_f1"], row["id_free_accuracy"], row["non_preserve_recall_any"]))
+    best = max(
+        candidates,
+        key=lambda row: (
+            game_passes({"run_status": "ok", **row}),
+            row["id_free_macro_f1"],
+            row["id_free_accuracy"],
+            row["non_preserve_recall_any"],
+        ),
+    )
     return {
         "feature_set": best["feature_set"],
         "classifier": best["classifier"],
@@ -2029,6 +2128,113 @@ def _best_validation_row_from_streamed_payloads(
         "forbidden_id_feature_check_passed": best["forbidden_id_feature_check_passed"],
         "pass_status": game_passes({"run_status": "ok", **best}),
     }
+
+
+def _run_streamed_validation_task(task: dict[str, object]) -> dict[str, object]:
+    """Pickle-safe one-group validation worker with contained task failures."""
+    game = str(task["game"])
+    sampler_name = str(task["sampler_name"])
+    timings: dict[str, float] = {
+        "validation_payload_decode_seconds": 0.0,
+        "validation_feature_preparation_seconds": 0.0,
+        "validation_classifier_seconds": 0.0,
+    }
+    try:
+        config = SimpleNamespace(**dict(task["config"]))
+        payloads = [dict(payload) for payload in list(task.get("payloads", []))]
+        payloads_by_seed: dict[int, list[dict]] = defaultdict(list)
+        for payload in payloads:
+            payloads_by_seed[int(payload.get("seed", 0) or 0)].append(payload)
+        validation_context_depth = (
+            int(config.max_context_depth)
+            if bool(config.adaptive_context_expansion) and config.max_context_depth is not None
+            else int(config.context_depth)
+        )
+        decode_started_at = time.perf_counter()
+        train = _prefuture_examples_from_payloads(
+            [payload for seed in config.train_seeds for payload in payloads_by_seed.get(int(seed), [])]
+        )
+        test = _prefuture_examples_from_payloads(payloads_by_seed.get(int(config.test_seed), []))
+        train = [item for item in train if int(item.features["context_level"]) <= validation_context_depth]
+        test = [item for item in test if int(item.features["context_level"]) <= validation_context_depth]
+        timings["validation_payload_decode_seconds"] = max(0.0, time.perf_counter() - decode_started_at)
+        validation_row = _best_validation_row_from_examples(game, config, train, test, timings)
+        validation_row.update(timings)
+        return {
+            "game": game,
+            "sampler_name": sampler_name,
+            "run_status": "ok",
+            "failure_reason": "",
+            "validation": validation_row,
+            "timings": timings,
+        }
+    except Exception as exc:
+        return {
+            "game": game,
+            "sampler_name": sampler_name,
+            "run_status": "failed",
+            "failure_reason": f"{type(exc).__name__}: {exc}",
+            "timings": timings,
+        }
+
+
+def _run_streamed_validation_tasks(
+    config: InteractionSamplingConfig,
+    tasks: list[dict[str, object]],
+) -> tuple[list[dict[str, object]], dict[str, object]]:
+    """Execute isolated validation groups sequentially or in a bounded process pool."""
+    wall_started_at = time.perf_counter()
+    worker_count = _effective_validation_workers(config.validation_workers, len(tasks))
+    if worker_count == 1 or len(tasks) <= 1:
+        results = [_run_streamed_validation_task(task) for task in tasks]
+    else:
+        with ProcessPoolExecutor(
+            max_workers=worker_count,
+            initializer=_validation_worker_initializer,
+        ) as executor:
+            futures = [executor.submit(_run_streamed_validation_task, task) for task in tasks]
+            # Task-level exceptions are represented by a failed result. Executor failures propagate.
+            results = [future.result() for future in futures]
+    aggregation_started_at = time.perf_counter()
+    results.sort(key=lambda item: (str(item["game"]), str(item["sampler_name"])))
+    metrics: dict[str, object] = {
+        "validation_worker_count": worker_count,
+        "validation_task_count": len(tasks),
+        "validation_parallel_wall_seconds": max(0.0, time.perf_counter() - wall_started_at),
+        "validation_payload_decode_seconds_total": sum(
+            float(dict(result.get("timings", {})).get("validation_payload_decode_seconds", 0.0) or 0.0)
+            for result in results
+        ),
+        "validation_feature_preparation_seconds_total": sum(
+            float(dict(result.get("timings", {})).get("validation_feature_preparation_seconds", 0.0) or 0.0)
+            for result in results
+        ),
+        "validation_classifier_seconds_total": sum(
+            float(dict(result.get("timings", {})).get("validation_classifier_seconds", 0.0) or 0.0)
+            for result in results
+        ),
+        "validation_result_aggregation_seconds": max(0.0, time.perf_counter() - aggregation_started_at),
+    }
+    return results, metrics
+
+
+def _best_validation_row_from_streamed_payloads(
+    game: str,
+    sampler_name: str,
+    config: InteractionSamplingConfig,
+    payloads: list[dict],
+) -> dict:
+    result = _run_streamed_validation_task(
+        {
+            "game": game,
+            "sampler_name": sampler_name,
+            "payloads": payloads,
+            "config": _validation_task_config(config),
+        }
+    )
+    if str(result.get("run_status")) != "ok":
+        raise RuntimeError(str(result.get("failure_reason") or "validation failed"))
+    return dict(result["validation"])
 
 
 def _aggregate_seed_rows(seed_rows: list[dict], config: InteractionSamplingConfig) -> dict:
@@ -2643,32 +2849,128 @@ def _parse_expected_levels_from_games_md(path: Path) -> dict[str, int]:
     return counts
 
 
-def compute_epoch_completion_counters(records: list[dict[str, object]]) -> dict[str, object]:
-    expected_counts = expected_levels_by_game()
-    unique_records: dict[tuple[str, str], dict[str, object]] = {}
-    for record in records:
-        game_id = str(record.get("game_id") or "").strip()
-        level_id = str(record.get("level_id") or record.get("level_name") or "").strip()
-        if not game_id or not level_id:
+def _record_is_successful_completion(record: dict[str, object]) -> bool:
+    completed = record.get("completed")
+    if completed is None:
+        completed = record.get("success")
+    return bool(completed)
+
+
+def normalize_completion_level_id(record: dict[str, object]) -> str | None:
+    """Return the game-provided level identity in a stable, JSON-safe form."""
+    value = record.get("level_id")
+    if value in (None, ""):
+        value = record.get("level_name")
+    if value in (None, ""):
+        return None
+    if isinstance(value, bool):
+        return str(value).lower()
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    text = str(value).strip()
+    if not text:
+        return None
+    if re.fullmatch(r"[+-]?\d+", text):
+        return str(int(text))
+    if re.fullmatch(r"[+-]?\d+\.0+", text):
+        return str(int(float(text)))
+    return text
+
+
+def _normalized_level_key(record: dict[str, object]) -> tuple[str, str] | None:
+    game_id = str(record.get("game_id") or "").strip()
+    level_id = normalize_completion_level_id(record)
+    if not game_id or level_id is None:
+        return None
+    return game_id, level_id
+
+
+def _normalized_level_key_set(values: object) -> set[tuple[str, str]]:
+    result: set[tuple[str, str]] = set()
+    if not isinstance(values, (list, tuple, set)):
+        return result
+    for value in values:
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
             continue
-        completed = record.get("completed")
-        if completed is None:
-            completed = record.get("success")
-        if not bool(completed):
-            continue
-        unique_records.setdefault((game_id, level_id), dict(record))
-    completed_levels_by_game: dict[str, int] = {}
-    for game_id, _level_id in sorted(unique_records):
-        completed_levels_by_game[game_id] = int(completed_levels_by_game.get(game_id, 0) + 1)
-    solved_games = sorted(
-        game_id
-        for game_id, completed_count in completed_levels_by_game.items()
-        if game_id in expected_counts and int(completed_count) >= int(expected_counts[game_id])
-    )
+        game_id = str(value[0] or "").strip()
+        level_id = normalize_completion_level_id({"level_id": value[1]})
+        if game_id and level_id is not None:
+            result.add((game_id, level_id))
+    return result
+
+
+def _completion_key_samples(keys: set[tuple[str, str]]) -> list[list[str]]:
+    return [[game_id, level_id] for game_id, level_id in sorted(keys)[:20]]
+
+
+def _completion_record_sample(record: dict[str, object]) -> dict[str, object]:
     return {
-        "levels_successfully_completed_per_epoch": len(unique_records),
-        "games_solved_per_epoch": len(solved_games),
-        "solved_games": solved_games,
+        "game_id": record.get("game_id"),
+        "level_id": record.get("level_id", record.get("level_name")),
+        "sampler": record.get("sampler"),
+        "seed": record.get("seed"),
+        "source_run_db": record.get("source_run_db"),
+    }
+
+
+def compute_epoch_completion_counters(
+    records: list[dict[str, object]],
+    *,
+    previous_level_keys: object = (),
+    previous_game_keys: object = (),
+) -> dict[str, object]:
+    """Keep raw completion events separate from stable level/game solve identities."""
+    successful_records = [dict(record) for record in records if _record_is_successful_completion(record)]
+    level_keys_by_record: list[tuple[str, str] | None] = [_normalized_level_key(record) for record in successful_records]
+    epoch_level_keys = {key for key in level_keys_by_record if key is not None}
+    epoch_game_keys = {game_id for game_id, _level_id in epoch_level_keys}
+    previous_levels = _normalized_level_key_set(previous_level_keys)
+    previous_games = {str(value).strip() for value in previous_game_keys if str(value).strip()} if isinstance(previous_game_keys, (list, tuple, set)) else set()
+    repeated_keys = {key for key in epoch_level_keys if key in previous_levels}
+    occurrence_counts = Counter(key for key in level_keys_by_record if key is not None)
+    repeated_keys.update(key for key, count in occurrence_counts.items() if count > 1)
+    invalid_records = [
+        record for record, key in zip(successful_records, level_keys_by_record, strict=True)
+        if key is None
+    ]
+    new_level_keys = epoch_level_keys - previous_levels
+    all_level_keys = previous_levels | epoch_level_keys
+    new_game_keys = epoch_game_keys - previous_games
+    all_game_keys = previous_games | epoch_game_keys
+    completed_levels_by_game: dict[str, int] = {}
+    for game_id, _level_id in sorted(epoch_level_keys):
+        completed_levels_by_game[game_id] = int(completed_levels_by_game.get(game_id, 0) + 1)
+    levels_solved_this_epoch = len(epoch_level_keys)
+    games_solved_this_epoch = len(epoch_game_keys)
+    return {
+        "level_completion_event_count": len(successful_records),
+        "levels_solved_this_epoch": levels_solved_this_epoch,
+        "new_levels_solved_this_epoch": len(new_level_keys),
+        "total_unique_levels_solved": len(all_level_keys),
+        "game_completion_event_count": sum(1 for record in successful_records if str(record.get("game_id") or "").strip()),
+        "games_solved_this_epoch": games_solved_this_epoch,
+        "new_games_solved_this_epoch": len(new_game_keys),
+        "total_unique_games_solved": len(all_game_keys),
+        "epoch_level_keys": _completion_key_samples(epoch_level_keys),
+        "epoch_game_ids": sorted(epoch_game_keys),
+        "solved_level_keys": _completion_key_samples(all_level_keys),
+        "solved_game_ids": sorted(all_game_keys),
+        "new_level_keys_sample": _completion_key_samples(new_level_keys),
+        "repeated_level_keys_sample": _completion_key_samples(repeated_keys),
+        "invalid_completion_records_sample": [
+            _completion_record_sample(record) for record in invalid_records[:20]
+        ],
+        # Deprecated aliases retained for existing report readers.
+        "levels_solved": levels_solved_this_epoch,
+        "games_solved": games_solved_this_epoch,
+        "total_levels_solved": len(all_level_keys),
+        "total_games_solved": len(all_game_keys),
+        "completion_counter_aliases_deprecated": True,
+        "levels_successfully_completed_per_epoch": levels_solved_this_epoch,
+        "games_solved_per_epoch": games_solved_this_epoch,
+        "solved_games": sorted(epoch_game_keys),
         "completed_levels_by_game": completed_levels_by_game,
     }
 
@@ -2684,31 +2986,11 @@ def _collect_level_completion_records(config: InteractionSamplingConfig, samplin
     if config.memory_output_dir and direct_streaming_manifest_exists(config.memory_output_dir):
         records: list[dict[str, object]] = []
         for metadata in load_direct_streamed_job_metrics(config.memory_output_dir):
-            game = str(metadata.get("game") or "")
-            sampler_name = str(metadata.get("sampler_name") or "")
-            seed = int(metadata.get("seed", 0) or 0)
-            completed_count = max(
-                int(metadata.get("final_levels_completed", 0) or 0),
-                int(metadata.get("final_win_levels", 0) or 0),
-                1 if str(metadata.get("final_state") or "") == "WIN" else 0,
-            )
-            final_state = str(metadata.get("final_state") or "")
-            for level_index in range(1, max(0, completed_count) + 1):
-                level_name = f"level_{level_index:04d}"
-                records.append(
-                    {
-                        "game_id": game,
-                        "level_id": level_name,
-                        "level_name": level_name,
-                        "completed": True,
-                        "success": True,
-                        "seed": seed,
-                        "sampler": sampler_name,
-                        "steps_used": None,
-                        "final_state": final_state,
-                        "source_run_db": None,
-                    }
-                )
+            completed_records = metadata.get("level_completion_records")
+            if isinstance(completed_records, list) and completed_records:
+                records.extend(dict(record) for record in completed_records if isinstance(record, dict))
+            else:
+                records.extend(_metadata_completion_records(metadata, source_run_db=None))
         return records
     records: list[dict[str, object]] = []
     for game in config.games:
@@ -2717,30 +2999,75 @@ def _collect_level_completion_records(config: InteractionSamplingConfig, samplin
                 path = sampling_db_path(sampling_root, game, sampler_name, config.steps, seed)
                 if not _sampling_db_ready(path):
                     continue
-                metadata = _read_sampling_metadata(path)
-                completed_count = max(
-                    int(metadata.get("final_levels_completed", 0) or 0),
-                    int(metadata.get("final_win_levels", 0) or 0),
-                    1 if str(metadata.get("final_state") or "") == "WIN" else 0,
-                )
-                final_state = str(metadata.get("final_state") or "")
-                for level_index in range(1, max(0, completed_count) + 1):
-                    level_name = f"level_{level_index:04d}"
-                    records.append(
-                        {
-                            "game_id": game,
-                            "level_id": level_name,
-                            "level_name": level_name,
-                            "completed": True,
-                            "success": True,
-                            "seed": int(seed),
-                            "sampler": sampler_name,
-                            "steps_used": None,
-                            "final_state": final_state,
-                            "source_run_db": str(path),
-                        }
-                    )
+                completion_records = _completion_records_from_sampling_db(path)
+                if completion_records:
+                    records.extend(completion_records)
+                else:
+                    metadata = _read_sampling_metadata(path)
+                    records.extend(_metadata_completion_records(metadata, source_run_db=str(path)))
     return records
+
+
+def _completion_records_from_sampling_db(path: Path) -> list[dict[str, object]]:
+    try:
+        with sqlite3.connect(path) as connection:
+            columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(interactions)").fetchall()}
+            required = {"id", "game_id", "level_id", "level_completed_event", "outcome_state"}
+            if not required.issubset(columns):
+                return []
+            sampler_column = "sampler_name" if "sampler_name" in columns else "NULL"
+            seed_column = "seed" if "seed" in columns else "NULL"
+            rows = connection.execute(
+                f"""
+                SELECT id, game_id, level_id, {sampler_column} AS sampler, {seed_column} AS seed,
+                       level_completed_event, outcome_state
+                FROM interactions
+                WHERE COALESCE(level_completed_event, 0) != 0 OR outcome_state = 'WIN'
+                ORDER BY id ASC
+                """
+            ).fetchall()
+    except sqlite3.DatabaseError:
+        return []
+    return [
+        {
+            "game_id": row[1],
+            "level_id": row[2],
+            "completed": True,
+            "success": True,
+            "sampler": row[3],
+            "seed": row[4],
+            "completion_event_id": row[0],
+            "final_state": row[6],
+            "source_run_db": str(path),
+        }
+        for row in rows
+    ]
+
+
+def _metadata_completion_records(metadata: dict[str, object], *, source_run_db: str | None) -> list[dict[str, object]]:
+    completed_count = max(
+        int(metadata.get("final_levels_completed", 0) or 0),
+        int(metadata.get("final_win_levels", 0) or 0),
+        1 if str(metadata.get("final_state") or "") == "WIN" else 0,
+    )
+    if completed_count <= 0:
+        return []
+    # Count-only legacy metadata has no reliable level identity. Keep the raw
+    # completion events but deliberately exclude them from unique-level sets.
+    level_id = metadata.get("final_full_game_id")
+    return [
+        {
+            "game_id": metadata.get("game"),
+            "level_id": level_id,
+            "completed": True,
+            "success": True,
+            "seed": metadata.get("seed"),
+            "sampler": metadata.get("sampler_name"),
+            "final_state": metadata.get("final_state"),
+            "source_run_db": source_run_db,
+        }
+        for _ in range(completed_count)
+    ]
 
 
 def _system_ram_snapshot() -> dict[str, float | int]:

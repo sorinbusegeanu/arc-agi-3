@@ -656,10 +656,10 @@ def test_continuous_prints_epoch_game_and_level_results(tmp_path: Path, monkeypa
         )
     )
     output = capsys.readouterr().out
-    assert " epoch_results: done games_solved=" in output
-    assert "levels_solved=" in output
-    assert "total_games_solved=" in output
-    assert "total_levels_solved=" in output
+    assert " epoch_results: done level_completion_events=" in output
+    assert "levels_solved_this_epoch=" in output
+    assert "total_unique_games_solved=" in output
+    assert "total_unique_levels_solved=" in output
 
 
 def test_continuous_initial_memory_checkpoint_is_copied_to_new_output_only(tmp_path: Path, monkeypatch, capsys) -> None:
@@ -833,12 +833,12 @@ def test_epoch_status_and_suite_summary_exist_and_memory_continuity_is_written(t
     assert status["H02"] is not None
     assert status["H03"] is not None
     assert status["levels_successfully_completed_per_epoch"] == 1
-    assert status["games_solved_per_epoch"] == 0
-    assert status["solved_games"] == []
+    assert status["games_solved_per_epoch"] == 1
+    assert status["solved_games"] == ["tt01"]
     assert summary["H04 decision"] in {"INCONCLUSIVE", "PARTIALLY_VALID", "VALID", "INVALID"}
     assert summary["levels_successfully_completed_per_epoch"] == 1
-    assert summary["games_solved_per_epoch"] == 0
-    assert summary["solved_games"] == []
+    assert summary["games_solved_per_epoch"] == 1
+    assert summary["solved_games"] == ["tt01"]
     assert summary["completed_levels_by_game"] == {"tt01": 1}
     assert continuity["continuity_valid"] is True
 
@@ -867,8 +867,8 @@ def test_compute_epoch_completion_counters_case_b_partial_game(monkeypatch) -> N
         ]
     )
     assert result["levels_successfully_completed_per_epoch"] == 2
-    assert result["games_solved_per_epoch"] == 0
-    assert result["solved_games"] == []
+    assert result["games_solved_per_epoch"] == 1
+    assert result["solved_games"] == ["ga01"]
     assert result["completed_levels_by_game"] == {"ga01": 2}
 
 
@@ -882,8 +882,8 @@ def test_compute_epoch_completion_counters_case_c_mixed_games(monkeypatch) -> No
         ]
     )
     assert result["levels_successfully_completed_per_epoch"] == 3
-    assert result["games_solved_per_epoch"] == 1
-    assert result["solved_games"] == ["ga01"]
+    assert result["games_solved_per_epoch"] == 2
+    assert result["solved_games"] == ["ga01", "gb01"]
     assert result["completed_levels_by_game"] == {"ga01": 2, "gb01": 1}
 
 
@@ -922,8 +922,145 @@ def test_manifest_tracks_run_wide_completion_totals(tmp_path: Path, monkeypatch)
         )
     )
     assert manifest["total_levels_successfully_completed"] == 1
-    assert manifest["total_games_solved"] == 0
-    assert manifest["games_solved_by_epoch"] == {"epoch_0001": []}
+    assert manifest["total_games_solved"] == 1
+    assert manifest["games_solved_by_epoch"] == {"epoch_0001": ["tt01"]}
+
+
+def test_completion_counters_separate_duplicate_events_from_unique_level_solves() -> None:
+    result = interaction_sampling.compute_epoch_completion_counters(
+        [
+            {"game_id": "ga01", "level_id": "01", "completed": True, "sampler": "a", "seed": 0},
+            {"game_id": "ga01", "level_id": 1, "completed": True, "sampler": "b", "seed": 0},
+            {"game_id": "ga01", "level_id": "1.0", "completed": True, "sampler": "a", "seed": 1},
+            {"game_id": "ga01", "level_id": "001", "completed": True, "sampler": "b", "seed": 1},
+        ]
+    )
+    assert result["level_completion_event_count"] == 4
+    assert result["levels_solved_this_epoch"] == 1
+    assert result["new_levels_solved_this_epoch"] == 1
+    assert result["total_unique_levels_solved"] == 1
+    assert result["game_completion_event_count"] == 4
+    assert result["games_solved_this_epoch"] == 1
+    assert result["new_games_solved_this_epoch"] == 1
+    assert result["repeated_level_keys_sample"] == [["ga01", "1"]]
+
+
+def test_completion_counters_keep_repeated_levels_out_of_new_totals() -> None:
+    result = interaction_sampling.compute_epoch_completion_counters(
+        [
+            {"game_id": "ga01", "level_id": "l1", "completed": True},
+            {"game_id": "ga01", "level_id": "l2", "completed": True},
+        ],
+        previous_level_keys=[("ga01", "l1")],
+        previous_game_keys=["ga01"],
+    )
+    assert result["levels_solved_this_epoch"] == 2
+    assert result["new_levels_solved_this_epoch"] == 1
+    assert result["total_unique_levels_solved"] == 2
+    assert result["new_games_solved_this_epoch"] == 0
+    assert result["total_unique_games_solved"] == 1
+    assert result["repeated_level_keys_sample"] == [["ga01", "l1"]]
+    assert result["levels_solved"] == result["levels_solved_this_epoch"]
+    assert result["total_levels_solved"] == result["total_unique_levels_solved"]
+
+
+def test_completion_counters_reject_missing_level_id_from_unique_counts() -> None:
+    result = interaction_sampling.compute_epoch_completion_counters(
+        [{"game_id": "ga01", "completed": True, "sampler": "mixed", "seed": 0}]
+    )
+    assert result["level_completion_event_count"] == 1
+    assert result["levels_solved_this_epoch"] == 0
+    assert result["games_solved_this_epoch"] == 0
+    assert result["invalid_completion_records_sample"] == [
+        {"game_id": "ga01", "level_id": None, "sampler": "mixed", "seed": 0, "source_run_db": None}
+    ]
+
+
+def test_completion_identity_state_loads_persisted_and_reconstructs_epoch_artifacts(tmp_path: Path) -> None:
+    persisted = continuous_research._load_completion_identity_state(
+        tmp_path,
+        {
+            "solved_level_keys": [["ga01", "l1"]],
+            "solved_game_ids": ["ga01"],
+            "completion_identity_state_complete": True,
+            "completion_identity_state_source": "manifest",
+        },
+    )
+    assert persisted["solved_level_keys"] == {("ga01", "l1")}
+    assert persisted["source"] == "manifest"
+
+    epoch_dir = tmp_path / "epochs" / "epoch_0001"
+    report_path = epoch_dir / "raw" / "interaction_sampling_v05c_report.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(json.dumps({"epoch_level_keys": [["gb01", "l2"]]}), encoding="utf-8")
+    reconstructed = continuous_research._load_completion_identity_state(
+        tmp_path,
+        {
+            "completed_epochs": 1,
+            "epochs": [{"status": "complete", "epoch_dir": str(epoch_dir)}],
+        },
+    )
+    assert reconstructed["complete"] is True
+    assert reconstructed["source"] == "epoch_artifacts"
+    assert reconstructed["solved_level_keys"] == {("gb01", "l2")}
+
+
+def test_completion_identity_state_does_not_change_when_same_epoch_is_recomputed() -> None:
+    first = interaction_sampling.compute_epoch_completion_counters(
+        [{"game_id": "ga01", "level_id": "l1", "completed": True}]
+    )
+    rerun = interaction_sampling.compute_epoch_completion_counters(
+        [{"game_id": "ga01", "level_id": "l1", "completed": True}],
+        previous_level_keys=first["solved_level_keys"],
+        previous_game_keys=first["solved_game_ids"],
+    )
+    assert rerun["new_levels_solved_this_epoch"] == 0
+    assert rerun["new_games_solved_this_epoch"] == 0
+    assert rerun["total_unique_levels_solved"] == 1
+    assert rerun["total_unique_games_solved"] == 1
+
+
+def test_continuous_completion_totals_do_not_accumulate_repeated_epoch_solves(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        continuous_research,
+        "run_interaction_sampling_v05c",
+        lambda config: _write_sampling_fixture(Path(config.output_dir), global_step_offset=int(config.global_step_offset), stable_support=25),
+    )
+    root = tmp_path / "continuous"
+    manifest = run_continuous_research(
+        ContinuousResearchConfig(
+            experiment_name="exp", games="tt01", samplers="mixed", seeds="0",
+            steps_per_epoch=2, max_epochs=2, horizon=1, context_depth=1, output_dir=str(root),
+        )
+    )
+    second_status = json.loads((root / "epochs" / "epoch_0002" / "status" / "epoch_status.json").read_text(encoding="utf-8"))
+    assert second_status["level_completion_event_count"] == 1
+    assert second_status["levels_solved_this_epoch"] == 1
+    assert second_status["new_levels_solved_this_epoch"] == 0
+    assert second_status["total_unique_levels_solved"] == 1
+    assert second_status["new_games_solved_this_epoch"] == 0
+    assert second_status["total_unique_games_solved"] == 1
+    assert manifest["solved_level_keys"] == [["tt01", "level_0001"]]
+
+
+def test_completion_identity_state_is_not_persisted_when_epoch_fails(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        continuous_research,
+        "run_interaction_sampling_v05c",
+        lambda config: _write_sampling_fixture(Path(config.output_dir), global_step_offset=int(config.global_step_offset), stable_support=25),
+    )
+    monkeypatch.setattr(continuous_research, "run_hypothesis_suite_report", lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("boom")))
+    root = tmp_path / "continuous"
+    with pytest.raises(RuntimeError, match="boom"):
+        run_continuous_research(
+            ContinuousResearchConfig(
+                experiment_name="exp", games="tt01", samplers="mixed", seeds="0",
+                steps_per_epoch=1, max_epochs=1, horizon=1, context_depth=1, output_dir=str(root),
+            )
+        )
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["solved_level_keys"] == []
+    assert manifest["solved_game_ids"] == []
 
 
 def test_continuous_run_passes_fast_postprocessing_into_sampling(tmp_path: Path, monkeypatch) -> None:

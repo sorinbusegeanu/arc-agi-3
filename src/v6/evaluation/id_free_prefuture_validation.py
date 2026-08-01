@@ -91,6 +91,27 @@ class IdFreePrefutureConfig:
     reuse_v02: bool = True
 
 
+@dataclass(frozen=True)
+class PreparedIdFreeValidationGroup:
+    """Inputs shared by every feature/classifier configuration for one split."""
+
+    train_examples: list[PrefutureExample]
+    test_examples: list[PrefutureExample]
+    train_y: list[str]
+    test_y: list[str]
+    majority_accuracy: float
+    majority_macro_f1: float
+    contingency_accuracy: float
+    random_stratified_accuracy: float
+
+
+@dataclass(frozen=True)
+class PreparedIdFreeFeatureSet:
+    feature_set: str
+    train_xn: object
+    test_xn: object
+
+
 def run_id_free_prefuture_validation_v04d(config: IdFreePrefutureConfig) -> list[dict]:
     output_dir = Path(config.output_dir)
     db_dir = output_dir / "future_effect_v02_dbs"
@@ -153,24 +174,79 @@ def evaluate_id_free_config(
     train_examples: list[PrefutureExample],
     test_examples: list[PrefutureExample],
 ) -> dict | None:
-    if classifier == "logistic_regression" and len({item.label for item in train_examples}) < 2:
-        return None
-    train_x = feature_matrix_for_id_free(train_examples, feature_set)
-    test_x = feature_matrix_for_id_free(test_examples, feature_set)
-    means, stds = normalization_stats(train_x)
-    train_xn = apply_normalization(train_x, means, stds)
-    test_xn = apply_normalization(test_x, means, stds)
+    prepared_group = prepare_id_free_validation_group(train_examples, test_examples)
+    prepared_features = prepare_id_free_feature_set(prepared_group, feature_set)
+    return evaluate_prepared_id_free_config(
+        game=game,
+        feature_set=feature_set,
+        classifier=classifier,
+        train_seeds=train_seeds,
+        test_seed=test_seed,
+        steps=steps,
+        horizon=horizon,
+        prepared_group=prepared_group,
+        prepared_features=prepared_features,
+    )
+
+
+def prepare_id_free_validation_group(
+    train_examples: list[PrefutureExample],
+    test_examples: list[PrefutureExample],
+) -> PreparedIdFreeValidationGroup:
+    """Prepare labels and baselines once for a validation task."""
     train_y = [item.label for item in train_examples]
     test_y = [item.label for item in test_examples]
-    predictions = predict_classifier(classifier, train_xn, train_y, test_xn)
     majority = majority_label(train_y)
     majority_predictions = [majority for _ in test_y]
     contingency_predictions = contingency_baseline_predictions(train_examples, test_examples, majority)
     stratified_predictions = stratified_predictions_from_train(train_y, len(test_y))
-    metrics = classification_metrics(test_y, predictions)
     majority_metrics = classification_metrics(test_y, majority_predictions)
-    majority_accuracy = accuracy(test_y, majority_predictions)
-    contingency_accuracy = accuracy(test_y, contingency_predictions)
+    return PreparedIdFreeValidationGroup(
+        train_examples=train_examples,
+        test_examples=test_examples,
+        train_y=train_y,
+        test_y=test_y,
+        majority_accuracy=accuracy(test_y, majority_predictions),
+        majority_macro_f1=float(majority_metrics["macro_f1"]),
+        contingency_accuracy=accuracy(test_y, contingency_predictions),
+        random_stratified_accuracy=accuracy(test_y, stratified_predictions),
+    )
+
+
+def prepare_id_free_feature_set(
+    prepared_group: PreparedIdFreeValidationGroup,
+    feature_set: str,
+) -> PreparedIdFreeFeatureSet:
+    """Build and normalize a feature set once, then reuse it for classifiers."""
+    train_x = feature_matrix_for_id_free(prepared_group.train_examples, feature_set)
+    test_x = feature_matrix_for_id_free(prepared_group.test_examples, feature_set)
+    means, stds = normalization_stats(train_x)
+    return PreparedIdFreeFeatureSet(
+        feature_set=feature_set,
+        train_xn=apply_normalization(train_x, means, stds),
+        test_xn=apply_normalization(test_x, means, stds),
+    )
+
+
+def evaluate_prepared_id_free_config(
+    *,
+    game: str,
+    feature_set: str,
+    classifier: str,
+    train_seeds: tuple[int, ...],
+    test_seed: int,
+    steps: int,
+    horizon: int,
+    prepared_group: PreparedIdFreeValidationGroup,
+    prepared_features: PreparedIdFreeFeatureSet,
+) -> dict | None:
+    """Evaluate one classifier without rebuilding features, labels, or baselines."""
+    train_y = prepared_group.train_y
+    test_y = prepared_group.test_y
+    if classifier == "logistic_regression" and len(set(train_y)) < 2:
+        return None
+    predictions = predict_classifier(classifier, prepared_features.train_xn, train_y, prepared_features.test_xn)
+    metrics = classification_metrics(test_y, predictions)
     id_free_accuracy = accuracy(test_y, predictions)
     return {
         "game": game,
@@ -180,18 +256,18 @@ def evaluate_id_free_config(
         "test_seed": int(test_seed),
         "steps": int(steps),
         "horizon": int(horizon),
-        "train_sample_count": len(train_examples),
-        "test_sample_count": len(test_examples),
+        "train_sample_count": len(prepared_group.train_examples),
+        "test_sample_count": len(prepared_group.test_examples),
         "class_distribution_train": dict(__import__("collections").Counter(train_y)),
         "class_distribution_test": dict(__import__("collections").Counter(test_y)),
-        "majority_baseline_accuracy": majority_accuracy,
-        "majority_baseline_macro_f1": majority_metrics["macro_f1"],
-        "contingency_baseline_accuracy": contingency_accuracy,
-        "random_stratified_accuracy": accuracy(test_y, stratified_predictions),
+        "majority_baseline_accuracy": prepared_group.majority_accuracy,
+        "majority_baseline_macro_f1": prepared_group.majority_macro_f1,
+        "contingency_baseline_accuracy": prepared_group.contingency_accuracy,
+        "random_stratified_accuracy": prepared_group.random_stratified_accuracy,
         "id_free_accuracy": id_free_accuracy,
         "id_free_macro_f1": metrics["macro_f1"],
-        "id_free_vs_majority_delta": id_free_accuracy - majority_accuracy,
-        "id_free_vs_contingency_delta": id_free_accuracy - contingency_accuracy,
+        "id_free_vs_majority_delta": id_free_accuracy - prepared_group.majority_accuracy,
+        "id_free_vs_contingency_delta": id_free_accuracy - prepared_group.contingency_accuracy,
         "preserve_precision": metrics["precision"]["PRESERVE"],
         "preserve_recall": metrics["recall"]["PRESERVE"],
         "expand_precision": metrics["precision"]["EXPAND"],

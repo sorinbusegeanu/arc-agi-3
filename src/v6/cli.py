@@ -246,6 +246,7 @@ def build_parser() -> argparse.ArgumentParser:
     sampling.add_argument("--adaptive-context-expansion", type=_parse_bool, default=False)
     sampling.add_argument("--max-context-depth", type=int, default=None)
     sampling.add_argument("--workers", type=int, default=60)
+    sampling.add_argument("--validation-workers", type=int, default=8, help="Dedicated (game, sampler) validation workers; capped at 16.")
     sampling.add_argument(
         "--max-tasks-per-child",
         type=int,
@@ -660,6 +661,7 @@ def build_parser() -> argparse.ArgumentParser:
     continuous.add_argument("--replay-retention-percent", type=int, default=5)
     continuous.add_argument("--fast-postprocessing", type=_parse_bool, default=True)
     continuous.add_argument("--workers", type=int, default=60)
+    continuous.add_argument("--validation-workers", type=int, default=8, help="Dedicated (game, sampler) validation workers; capped at 16.")
     continuous.add_argument(
         "--max-tasks-per-child",
         type=int,
@@ -984,6 +986,7 @@ def main(argv: list[str] | None = None) -> int:
                 adaptive_context_expansion=bool(args.adaptive_context_expansion),
                 max_context_depth=args.max_context_depth,
                 workers=args.workers,
+                validation_workers=int(args.validation_workers),
                 max_tasks_per_child=int(args.max_tasks_per_child),
                 commit_steps=args.commit_steps,
                 sqlite_synchronous=str(args.sqlite_synchronous),
@@ -1672,6 +1675,7 @@ def main(argv: list[str] | None = None) -> int:
                 replay_retention_percent=int(args.replay_retention_percent),
                 fast_postprocessing=bool(args.fast_postprocessing),
             workers=int(args.workers),
+            validation_workers=int(args.validation_workers),
             max_tasks_per_child=int(args.max_tasks_per_child),
             commit_steps=int(args.commit_steps),
             sqlite_synchronous=str(args.sqlite_synchronous),
