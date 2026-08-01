@@ -275,6 +275,11 @@ def build_parser() -> argparse.ArgumentParser:
     sampling.add_argument("--live-memory-queue-maxsize", type=int, default=100000)
     sampling.add_argument("--live-memory-batch-size", type=int, default=1000)
     sampling.add_argument("--live-memory-flush-seconds", type=float, default=2.0)
+    sampling.add_argument("--memory-snapshot-mode", choices=("worker_local", "none"), default="worker_local")
+    sampling.add_argument("--memory-snapshot-max-bytes", type=int, default=None)
+    sampling.add_argument("--memory-snapshot-max-ram-percent", type=float, default=85.0)
+    sampling.add_argument("--memory-snapshot-include-graph", type=_parse_bool, default=True)
+    sampling.add_argument("--memory-snapshot-include-substrate", type=_parse_bool, default=True)
     sampling.add_argument("--direct-streaming-fold", dest="direct_streaming_fold", action="store_true", default=True)
     sampling.add_argument("--direct-streaming-fold-workers", type=int, default=8)
     sampling.add_argument("--direct-streaming-fold-retry-attempts", type=int, default=5)
@@ -660,6 +665,11 @@ def build_parser() -> argparse.ArgumentParser:
     continuous.add_argument("--live-memory-queue-maxsize", type=int, default=100000)
     continuous.add_argument("--live-memory-batch-size", type=int, default=1000)
     continuous.add_argument("--live-memory-flush-seconds", type=float, default=2.0)
+    continuous.add_argument("--memory-snapshot-mode", choices=("worker_local", "none"), default="worker_local")
+    continuous.add_argument("--memory-snapshot-max-bytes", type=int, default=None)
+    continuous.add_argument("--memory-snapshot-max-ram-percent", type=float, default=85.0)
+    continuous.add_argument("--memory-snapshot-include-graph", type=_parse_bool, default=True)
+    continuous.add_argument("--memory-snapshot-include-substrate", type=_parse_bool, default=True)
     continuous.add_argument("--direct-streaming-fold", dest="direct_streaming_fold", action="store_true", default=True)
     continuous.add_argument("--direct-streaming-fold-workers", type=int, default=8)
     continuous.add_argument("--direct-streaming-fold-retry-attempts", type=int, default=5)
@@ -971,6 +981,11 @@ def main(argv: list[str] | None = None) -> int:
                 live_memory_queue_maxsize=int(args.live_memory_queue_maxsize),
                 live_memory_batch_size=int(args.live_memory_batch_size),
                 live_memory_flush_seconds=float(args.live_memory_flush_seconds),
+                memory_snapshot_mode=str(args.memory_snapshot_mode),
+                memory_snapshot_max_bytes=args.memory_snapshot_max_bytes,
+                memory_snapshot_max_ram_percent=float(args.memory_snapshot_max_ram_percent),
+                memory_snapshot_include_graph=bool(args.memory_snapshot_include_graph),
+                memory_snapshot_include_substrate=bool(args.memory_snapshot_include_substrate),
                 direct_streaming_fold_enabled=bool(args.direct_streaming_fold),
                 direct_streaming_fold_workers=int(args.direct_streaming_fold_workers),
                 delete_raw_after_direct_streaming_fold=bool(args.delete_raw_after_direct_streaming_fold),
@@ -1636,6 +1651,11 @@ def main(argv: list[str] | None = None) -> int:
                 live_memory_queue_maxsize=int(args.live_memory_queue_maxsize),
                 live_memory_batch_size=int(args.live_memory_batch_size),
                 live_memory_flush_seconds=float(args.live_memory_flush_seconds),
+                memory_snapshot_mode=str(args.memory_snapshot_mode),
+                memory_snapshot_max_bytes=args.memory_snapshot_max_bytes,
+                memory_snapshot_max_ram_percent=float(args.memory_snapshot_max_ram_percent),
+                memory_snapshot_include_graph=bool(args.memory_snapshot_include_graph),
+                memory_snapshot_include_substrate=bool(args.memory_snapshot_include_substrate),
                 direct_streaming_fold=bool(args.direct_streaming_fold),
                 direct_streaming_fold_workers=int(args.direct_streaming_fold_workers),
                 delete_raw_after_direct_streaming_fold=bool(args.delete_raw_after_direct_streaming_fold),

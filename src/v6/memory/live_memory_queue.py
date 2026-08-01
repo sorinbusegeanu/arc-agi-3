@@ -10,6 +10,8 @@ from pathlib import Path
 from queue import Empty
 from typing import Any
 
+from v6.memory.worker_snapshot import WorkerMemoryOverlay
+
 
 _LIVE_MEMORY_MANAGERS: list[Any] = []
 
@@ -51,6 +53,9 @@ class LiveMemoryWriter:
             "last_flush_time": None,
             "event_type_counts": {},
             "queue_stop_received": False,
+            "events_dropped": 0,
+            "queue_peak_size": 0,
+            "queue_block_seconds": 0.0,
         }
         self._batches_since_summary_write = 0
 
@@ -60,6 +65,7 @@ class LiveMemoryWriter:
         try:
             _configure_live_memory_sqlite(connection)
             _ensure_live_memory_schema(connection)
+            self._next_sequence = int(connection.execute("SELECT COALESCE(MAX(sequence), 0) + 1 FROM live_memory_events").fetchone()[0])
             batch: list[dict[str, Any]] = []
             last_flush = time.time()
             while not self._stop_requested:
@@ -81,6 +87,8 @@ class LiveMemoryWriter:
                     elif float(event["priority"]) < float(self.config.min_priority):
                         self.summary["events_dropped_low_priority"] = int(self.summary["events_dropped_low_priority"]) + 1
                     else:
+                        event["sequence"] = int(self._next_sequence)
+                        self._next_sequence += 1
                         batch.append(event)
                         counts = dict(self.summary.get("event_type_counts", {}) or {})
                         counts[event["event_type"]] = int(counts.get(event["event_type"], 0) or 0) + 1
@@ -112,6 +120,7 @@ class LiveMemoryWriter:
                 self.summary["events_written"] = int(self.summary["events_written"]) + 1
             except Exception:
                 self.summary["events_dropped_invalid"] = int(self.summary["events_dropped_invalid"]) + 1
+                self.summary["events_dropped"] = int(self.summary.get("events_dropped", 0)) + 1
                 continue
         connection.commit()
         self.summary["batches_written"] = int(self.summary["batches_written"]) + 1
@@ -128,12 +137,13 @@ class LiveMemoryWriter:
         connection.execute(
             """
             INSERT OR REPLACE INTO live_memory_events (
-                event_id, event_type, global_step, worker_id, priority, payload_json, created_at
+                event_id, sequence, event_type, global_step, worker_id, priority, payload_json, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 str(event["event_id"]),
+                int(event.get("sequence") or 0),
                 str(event["event_type"]),
                 int(event.get("global_step") or 0),
                 str(event.get("worker_id") or ""),
@@ -162,6 +172,12 @@ class LiveMemoryReadCache:
         self.carrier_candidates: list[dict[str, Any]] = []
         self.future_option_events: list[dict[str, Any]] = []
         self.family_updates: list[dict[str, Any]] = []
+        self.overlay = WorkerMemoryOverlay()
+        self.last_applied_live_sequence = -1
+        self.refresh_rows = 0
+        self.refresh_seconds = 0.0
+        self.busy_retry_count = 0
+        self.busy_wait_seconds = 0.0
 
     def refresh_if_due(self, step: int) -> bool:
         if self.last_refresh_step < 0 or int(step) - int(self.last_refresh_step) >= self.refresh_steps:
@@ -174,6 +190,7 @@ class LiveMemoryReadCache:
         if not self.sqlite_path.exists():
             self.refresh_failed_count += 1
             return False
+        started = time.perf_counter()
         try:
             connection = sqlite3.connect(
                 f"file:{self.sqlite_path}?mode=ro",
@@ -185,36 +202,59 @@ class LiveMemoryReadCache:
             return False
         try:
             connection.row_factory = sqlite3.Row
-            self.stable_contingencies = _fetch_projection_rows(
-                connection,
-                "SELECT * FROM live_stable_contingencies ORDER BY priority DESC, support_count DESC, key ASC LIMIT 5000",
-            )
-            self.replay_candidates = _fetch_projection_rows(
-                connection,
-                "SELECT * FROM live_replay_candidates ORDER BY replay_priority DESC, priority DESC, interaction_id ASC LIMIT 5000",
-            )
-            self.contradiction_clusters = _fetch_projection_rows(
-                connection,
-                "SELECT * FROM live_contradiction_clusters ORDER BY priority DESC, count DESC, contradiction_key ASC LIMIT 5000",
-            )
-            self.carrier_candidates = _fetch_projection_rows(
-                connection,
-                "SELECT * FROM live_carrier_candidates ORDER BY priority DESC, support_count DESC, carrier_signature ASC LIMIT 5000",
-            )
-            self.future_option_events = _fetch_projection_rows(
-                connection,
-                "SELECT * FROM live_future_option_events ORDER BY priority DESC, global_step DESC, event_id ASC LIMIT 10000",
-            )
-            self.family_updates = _fetch_projection_rows(
-                connection,
-                "SELECT * FROM live_family_updates ORDER BY priority DESC, support_count DESC, family_signature ASC LIMIT 5000",
-            )
+            if self.last_applied_live_sequence < 0:
+                self.stable_contingencies = _fetch_projection_rows(connection, "SELECT * FROM live_stable_contingencies ORDER BY priority DESC, support_count DESC, key ASC LIMIT 5000")
+                self.replay_candidates = _fetch_projection_rows(connection, "SELECT * FROM live_replay_candidates ORDER BY replay_priority DESC, priority DESC, interaction_id ASC LIMIT 5000")
+                self.contradiction_clusters = _fetch_projection_rows(connection, "SELECT * FROM live_contradiction_clusters ORDER BY priority DESC, count DESC, contradiction_key ASC LIMIT 5000")
+                self.carrier_candidates = _fetch_projection_rows(connection, "SELECT * FROM live_carrier_candidates ORDER BY priority DESC, support_count DESC, carrier_signature ASC LIMIT 5000")
+                self.future_option_events = _fetch_projection_rows(connection, "SELECT * FROM live_future_option_events ORDER BY priority DESC, global_step DESC, event_id ASC LIMIT 10000")
+                self.family_updates = _fetch_projection_rows(connection, "SELECT * FROM live_family_updates ORDER BY priority DESC, support_count DESC, family_signature ASC LIMIT 5000")
+                max_sequence = int(connection.execute("SELECT COALESCE(MAX(sequence), 0) FROM live_memory_events").fetchone()[0] or 0)
+                self.last_applied_live_sequence = max_sequence
+                self.overlay.last_sequence = max_sequence
+                self.refresh_rows += sum(len(rows) for rows in (self.stable_contingencies, self.replay_candidates, self.contradiction_clusters, self.carrier_candidates, self.future_option_events, self.family_updates))
+                initial_events = [
+                    {"event_type": "stable_contingency", "event_id": str(row.get("key")), "payload": dict(row)}
+                    for row in self.stable_contingencies
+                ]
+                self.overlay.apply_rows(initial_events, max_sequence)
+            else:
+                event_rows = connection.execute(
+                    "SELECT sequence, event_id, event_type, global_step, worker_id, priority, payload_json FROM live_memory_events WHERE sequence > ? ORDER BY sequence ASC",
+                    (int(self.last_applied_live_sequence),),
+                ).fetchall()
+                decoded: list[dict[str, Any]] = []
+                for row in event_rows:
+                    try:
+                        decoded.append({
+                            "sequence": int(row[0]), "event_id": str(row[1]), "event_type": str(row[2]),
+                            "global_step": int(row[3] or 0), "payload": json.loads(str(row[6] or "{}")),
+                        })
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        continue
+                if decoded:
+                    self.overlay.apply_rows(decoded, int(decoded[-1]["sequence"]))
+                    self.last_applied_live_sequence = int(decoded[-1]["sequence"])
+                    self.refresh_rows += len(decoded)
+                    for event in decoded:
+                        payload = dict(event.get("payload") or {})
+                        payload.update({"event_id": event["event_id"], "event_type": event["event_type"], "global_step": event["global_step"]})
+                        target = {
+                            "stable_contingency": self.stable_contingencies,
+                            "high_priority_replay": self.replay_candidates,
+                            "future_option": self.future_option_events,
+                            "future_option_event": self.future_option_events,
+                            "family_update": self.family_updates,
+                        }.get(str(event["event_type"]))
+                        if target is not None:
+                            target.append(payload)
         except sqlite3.DatabaseError:
             self.refresh_failed_count += 1
             connection.close()
             return False
         connection.close()
         self.refresh_count += 1
+        self.refresh_seconds += time.perf_counter() - started
         if step is not None:
             self.last_refresh_step = int(step)
         elif self.last_refresh_step < 0:
@@ -275,6 +315,7 @@ def _ensure_live_memory_schema(connection: sqlite3.Connection) -> None:
         """
         CREATE TABLE IF NOT EXISTS live_memory_events (
             event_id TEXT PRIMARY KEY,
+            sequence INTEGER,
             event_type TEXT NOT NULL,
             global_step INTEGER,
             worker_id TEXT,
@@ -347,6 +388,10 @@ def _ensure_live_memory_schema(connection: sqlite3.Connection) -> None:
         );
         """
     )
+    columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(live_memory_events)").fetchall()}
+    if "sequence" not in columns:
+        connection.execute("ALTER TABLE live_memory_events ADD COLUMN sequence INTEGER")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_live_memory_events_sequence ON live_memory_events(sequence)")
     connection.commit()
 
 

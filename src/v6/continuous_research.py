@@ -55,6 +55,10 @@ class ContinuousResearchConfig:
     live_memory_queue_maxsize: int = 100_000
     live_memory_batch_size: int = 1000
     live_memory_flush_seconds: float = 2.0
+    memory_snapshot_mode: str = "worker_local"
+    memory_snapshot_max_bytes: int | None = None
+    memory_snapshot_include_graph: bool = True
+    memory_snapshot_include_substrate: bool = True
     direct_streaming_fold: bool = True
     direct_streaming_fold_workers: int = 8
     delete_raw_after_direct_streaming_fold: bool = True
@@ -231,11 +235,10 @@ def _run_continuous_research_inner(config: ContinuousResearchConfig) -> dict[str
         memory_before = build_memory_summary(memory_paths)
         memory_size_before = _tree_size(memory_dir)
         previous_summary_snapshot = load_memory_summary(memory_paths.summary_json)
-        previous_peak_workers = int(manifest.get("last_sampling_peak_workers", config.workers) or config.workers)
         requested_workers = max(1, int(config.workers))
-        max_epoch_workers = max(1, min(requested_workers, previous_peak_workers))
+        max_epoch_workers = requested_workers
         initial_epoch_workers = max(1, min(int(config.initial_workers or 1), max_epoch_workers))
-        initial_worker_ramp_delay_seconds = 0.0
+        initial_worker_ramp_delay_seconds = float(config.initial_worker_ramp_delay_seconds)
         ram_snapshot_at_epoch_start = _system_ram_snapshot()
         epoch_start_payload = {
             "epoch_id": epoch_id,
@@ -283,6 +286,10 @@ def _run_continuous_research_inner(config: ContinuousResearchConfig) -> dict[str
                 live_memory_queue_maxsize=int(config.live_memory_queue_maxsize),
                 live_memory_batch_size=int(config.live_memory_batch_size),
                 live_memory_flush_seconds=float(config.live_memory_flush_seconds),
+                memory_snapshot_mode=str(config.memory_snapshot_mode),
+                memory_snapshot_max_bytes=config.memory_snapshot_max_bytes,
+                memory_snapshot_include_graph=bool(config.memory_snapshot_include_graph),
+                memory_snapshot_include_substrate=bool(config.memory_snapshot_include_substrate),
                 direct_streaming_fold_enabled=bool(config.direct_streaming_fold),
                 direct_streaming_fold_workers=int(config.direct_streaming_fold_workers),
                 delete_raw_after_direct_streaming_fold=bool(config.delete_raw_after_direct_streaming_fold),

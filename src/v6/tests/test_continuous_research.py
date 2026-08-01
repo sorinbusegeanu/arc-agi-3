@@ -806,7 +806,7 @@ def test_continuous_run_passes_fast_postprocessing_into_sampling(tmp_path: Path,
     assert seen_flags == [True]
 
 
-def test_continuous_run_halves_previous_workers_and_records_ram_start(tmp_path: Path, monkeypatch) -> None:
+def test_continuous_run_preserves_configured_worker_cap_and_records_ram_start(tmp_path: Path, monkeypatch) -> None:
     captured: list[dict[str, object]] = []
 
     def fake_run_sampling(config):
@@ -874,17 +874,17 @@ def test_continuous_run_halves_previous_workers_and_records_ram_start(tmp_path: 
 
     assert captured[0]["workers"] == 12
     assert captured[0]["initial_workers"] == 1
-    assert captured[0]["initial_worker_ramp_delay_seconds"] == 0.0
+    assert captured[0]["initial_worker_ramp_delay_seconds"] == 20.0
     assert captured[0]["per_worker_ramp_delay_seconds"] == 5.0
     assert captured[1]["workers"] == 12
     assert captured[1]["initial_workers"] == 1
-    assert captured[1]["initial_worker_ramp_delay_seconds"] == 0.0
+    assert captured[1]["initial_worker_ramp_delay_seconds"] == 20.0
     assert captured[1]["per_worker_ramp_delay_seconds"] == 5.0
     epoch_start = json.loads((root / "epochs" / "epoch_0002" / "status" / "epoch_start.json").read_text(encoding="utf-8"))
     assert epoch_start["requested_workers"] == 12
     assert epoch_start["initial_epoch_workers"] == 1
     assert epoch_start["ram_ramp_threshold_percent"] == 85.0
-    assert epoch_start["initial_worker_ramp_delay_seconds"] == 0.0
+    assert epoch_start["initial_worker_ramp_delay_seconds"] == 20.0
     assert epoch_start["per_worker_ramp_delay_seconds"] == 5.0
     assert "ram_used_percent" in epoch_start["ram_snapshot_at_epoch_start"]
 

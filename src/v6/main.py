@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import random
 import sqlite3
+import time
 from dataclasses import dataclass
 from hashlib import sha1
 from pathlib import Path
@@ -55,6 +56,7 @@ from v6.memory.substrate import (
     strategy_node_id,
     trajectory_node_id,
 )
+from v6.memory.worker_snapshot import SnapshotMemoryQueryEngine, WorkerMemorySnapshot
 from v6.memory.transformation_store import TransformationStore
 from v6.prediction.predictor import Predictor
 from v6.transformation.transformation_clusterer import TransformationClusterer
@@ -130,6 +132,8 @@ class V6System:
         action_sampler: Any | None = None,
         live_memory_queue: Any | None = None,
         live_memory_cache: LiveMemoryReadCache | None = None,
+        memory_query_engine: Any | None = None,
+        worker_memory_snapshot: WorkerMemorySnapshot | None = None,
     ) -> None:
         self.env = env
         self.config = config or V6Config()
@@ -137,6 +141,7 @@ class V6System:
         self.action_sampler = action_sampler
         self.live_memory_queue = live_memory_queue
         self.live_memory_cache = live_memory_cache
+        self.worker_memory_snapshot = worker_memory_snapshot
         self.connection = sqlite3.connect(self.config.database_path)
         self._configure_runtime_sqlite_connection()
         self._auto_commit = int(self.config.database_commit_every) <= 1
@@ -212,6 +217,8 @@ class V6System:
         self.live_memory_events_emitted = 0
         self.live_memory_events_dropped_queue_full = 0
         self.live_memory_events_dropped_error = 0
+        self.live_memory_queue_block_seconds = 0.0
+        self.live_memory_queue_peak_size = 0
         self.live_memory_refresh_count = 0
         self.live_memory_refresh_failed_count = 0
         self.live_memory_stable_contingencies_imported = 0
@@ -220,6 +227,14 @@ class V6System:
         self.live_memory_family_updates_imported = 0
         self.live_memory_contradiction_clusters_loaded = 0
         self.live_memory_future_option_events_loaded = 0
+        self.memory_restore_seconds = 0.0
+        self.memory_graph_restore_seconds = 0.0
+        self.memory_substrate_restore_seconds = 0.0
+        self.memory_query_count = 0
+        self.memory_query_seconds = 0.0
+        self.memory_query_start = time.perf_counter()
+        self.memory_action_rank_count = 0
+        self.memory_action_rank_seconds = 0.0
         self.compact_memory_restore_summary: dict[str, Any] = {
             "stable_contingencies_restored": 0,
             "transformation_families_restored": 0,
@@ -236,13 +251,28 @@ class V6System:
             "memory_summary_loaded": False,
             "restore_warnings": [],
         }
-        if bool(self.config.restore_compact_memory) and self.config.memory_input_dir:
+        restore_started = time.perf_counter()
+        if bool(self.config.restore_compact_memory) and self.config.memory_input_dir and worker_memory_snapshot is None:
             self.compact_memory_restore_summary = load_compact_memory_into_system(
                 self,
                 Path(self.config.memory_input_dir),
                 restore_graph=bool(self.config.restore_compact_graph),
                 restore_substrate=bool(self.config.restore_compact_substrate),
             )
+            self.memory_restore_seconds = time.perf_counter() - restore_started
+            self.memory_graph_restore_seconds = self.memory_restore_seconds if self.config.restore_compact_graph else 0.0
+            self.memory_substrate_restore_seconds = self.memory_restore_seconds if self.config.restore_compact_substrate else 0.0
+        elif worker_memory_snapshot is not None:
+            self.compact_memory_restore_summary = {
+                **self.compact_memory_restore_summary,
+                "worker_snapshot_used": True,
+                "memory_snapshot_version": dict(worker_memory_snapshot.version_metadata),
+            }
+            self.memory_restore_seconds = float(worker_memory_snapshot.restore_seconds)
+            self.memory_graph_restore_seconds = float(worker_memory_snapshot.graph_restore_seconds)
+            self.memory_substrate_restore_seconds = float(worker_memory_snapshot.substrate_restore_seconds)
+        if memory_query_engine is not None:
+            self.memory_query = memory_query_engine
 
     def _configure_runtime_sqlite_connection(self) -> None:
         mode = str(self.config.sqlite_synchronous or "normal").strip().upper()
@@ -266,7 +296,10 @@ class V6System:
                     int(candidate_action),
                     max_level=candidate_depth,
                 )
+            rank_started = time.perf_counter()
             ranked = self.memory_query.rank_actions(contexts_by_action, list(actions))
+            self.memory_action_rank_count += 1
+            self.memory_action_rank_seconds += time.perf_counter() - rank_started
             if ranked:
                 best_score = ranked[0].score
                 best = [item.action for item in ranked if float(item.score) == float(best_score)]
@@ -295,7 +328,10 @@ class V6System:
             selected_contingency = self.contingency_learner.best_stable_for_action(context_signatures, action)
             prediction_context_level = None if selected_contingency is None else int(selected_contingency.context_level)
             if bool(self.config.memory_query_enabled):
+                query_started = time.perf_counter()
                 memory_prediction = self.memory_query.predict_family(context_signatures, action, record_query=False)
+                self.memory_query_count += 1
+                self.memory_query_seconds += time.perf_counter() - query_started
                 predicted_family = memory_prediction.predicted_family
                 prediction_confidence = float(memory_prediction.confidence)
             else:
@@ -1078,6 +1114,7 @@ class V6System:
         if str(self.config.shared_live_memory_mode) not in {"write", "readwrite"}:
             return
         try:
+            queue_started = time.perf_counter()
             self.live_memory_queue.put_nowait(
                 LiveMemoryEvent(
                     event_type=str(event_type),
@@ -1088,6 +1125,11 @@ class V6System:
                     payload=dict(payload or {}),
                 )
             )
+            self.live_memory_queue_block_seconds += time.perf_counter() - queue_started
+            try:
+                self.live_memory_queue_peak_size = max(self.live_memory_queue_peak_size, int(self.live_memory_queue.qsize()))
+            except (AttributeError, NotImplementedError, OSError):
+                pass
             self.live_memory_events_emitted += 1
         except Full:
             self.live_memory_events_dropped_queue_full += 1
@@ -1101,6 +1143,8 @@ class V6System:
         if refreshed:
             self.live_memory_refresh_count += 1
             self._apply_live_memory_cache()
+            if hasattr(self.memory_query, "apply_live_overlay") and self.live_memory_cache is not None:
+                self.memory_query.apply_live_overlay(self.live_memory_cache.overlay)
         elif int(getattr(self.live_memory_cache, "refresh_failed_count", 0) or 0) > self.live_memory_refresh_failed_count:
             self.live_memory_refresh_failed_count = int(self.live_memory_cache.refresh_failed_count)
 
@@ -1255,6 +1299,34 @@ class V6System:
             fold_live_system_into_compact_memory(self, Path(self.config.memory_output_dir))
         self.connection.commit()
         self.connection.close()
+
+    def memory_access_metrics(self) -> dict[str, Any]:
+        metrics = {
+            "memory_restore_seconds": float(self.memory_restore_seconds),
+            "memory_graph_restore_seconds": float(self.memory_graph_restore_seconds),
+            "memory_substrate_restore_seconds": float(self.memory_substrate_restore_seconds),
+            "memory_query_count": int(self.memory_query_count),
+            "memory_query_seconds": float(self.memory_query_seconds),
+            "memory_query_mean_seconds": float(self.memory_query_seconds / self.memory_query_count) if self.memory_query_count else 0.0,
+            "memory_action_rank_count": int(self.memory_action_rank_count),
+            "memory_action_rank_seconds": float(self.memory_action_rank_seconds),
+            "live_memory_refresh_count": int(self.live_memory_refresh_count),
+            "live_memory_refresh_rows": int(getattr(self.live_memory_cache, "refresh_rows", 0) if self.live_memory_cache is not None else 0),
+            "live_memory_refresh_seconds": float(getattr(self.live_memory_cache, "refresh_seconds", 0.0) if self.live_memory_cache is not None else 0.0),
+            "sqlite_busy_retry_count": int(getattr(self.live_memory_cache, "busy_retry_count", 0) if self.live_memory_cache is not None else 0),
+            "sqlite_busy_wait_seconds": float(getattr(self.live_memory_cache, "busy_wait_seconds", 0.0) if self.live_memory_cache is not None else 0.0),
+            "memory_snapshot_version": None if self.worker_memory_snapshot is None else dict(self.worker_memory_snapshot.version_metadata),
+            "memory_cache_hit_count": int(getattr(self.memory_query, "cache_hit_count", 0)),
+            "memory_cache_miss_count": int(getattr(self.memory_query, "cache_miss_count", 0)),
+            "sqlite_queries_during_action_selection": 0,
+            "live_memory_events_submitted": int(self.live_memory_events_emitted),
+            "live_memory_events_dropped": int(self.live_memory_events_dropped_queue_full + self.live_memory_events_dropped_error),
+            "live_memory_queue_peak_size": int(self.live_memory_queue_peak_size),
+            "live_memory_queue_block_seconds": float(self.live_memory_queue_block_seconds),
+        }
+        if hasattr(self.memory_query, "metrics"):
+            metrics.update(self.memory_query.metrics())
+        return metrics
 
     def _commit_if_needed(self, interaction_id: int) -> None:
         if self._auto_commit:

@@ -188,3 +188,5 @@ The v6 research commands accept curated developmental sets through `--games`, fo
 ```
 
 These are curated developmental research sets, not official ARC-AGI-3 categories.
+
+Memory-guided continuous sampling uses a worker-local immutable snapshot by default. Use `--memory-snapshot-mode none` to disable that snapshot. The `--shared-live-memory` modes are `none` (no live reads or writes), `write` (asynchronous writes only), and `readwrite` (writes plus incremental same-epoch deltas). Snapshot size can be bounded with `--memory-snapshot-max-bytes`; graph and substrate inclusion are controlled by `--memory-snapshot-include-graph` and `--memory-snapshot-include-substrate`.
