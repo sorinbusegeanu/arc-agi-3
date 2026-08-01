@@ -195,6 +195,22 @@ def test_log_epoch_phase_prints_without_jsonl_side_effect(tmp_path: Path, capsys
     assert not any(tmp_path.rglob("epoch_phase_log.jsonl"))
 
 
+def test_log_epoch_phase_done_prints_one_timed_compact_line(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(continuous_research.time, "perf_counter", lambda: 12.345)
+
+    continuous_research._log_epoch_phase_done(
+        "epoch_0001",
+        "artifact_cleanup",
+        10.0,
+        {"disk_after_cleanup_bytes": 50},
+    )
+
+    output = capsys.readouterr().out.strip()
+    assert " artifact_cleanup: done seconds=2.35 disk_after_cleanup_bytes=50" in output
+    assert "starting" not in output
+    assert "{" not in output
+
+
 def test_hypothesis_suite_phase_log_prints_all_hypotheses_in_order(capsys) -> None:
     summary = " ".join(f"H{i:02d}=DECISION_{i:02d}" for i in range(1, 13))
     continuous_research._log_epoch_phase("epoch_0003", "hypothesis_suite", "done", summary)
@@ -313,11 +329,11 @@ def test_continuous_stdout_is_written_to_overwritten_log_file(tmp_path: Path, mo
     assert "Epoch 0001 starting" in log_text
 
 
-def test_continuous_run_emits_post_fold_phase_names(tmp_path: Path, monkeypatch) -> None:
-    phase_events: list[tuple[str, str]] = []
+def test_continuous_run_emits_single_timed_post_fold_phase_lines(tmp_path: Path, monkeypatch) -> None:
+    phase_events: list[tuple[str, str, str | None]] = []
 
-    def record_phase(epoch_id: str, phase: str, status: str = "starting", extra: dict | None = None) -> None:
-        phase_events.append((phase, status))
+    def record_phase(epoch_id: str, phase: str, status: str = "starting", extra: dict | str | None = None) -> None:
+        phase_events.append((phase, status, None if extra is None else str(extra)))
 
     monkeypatch.setattr(continuous_research, "_log_epoch_phase", record_phase)
     monkeypatch.setattr(
@@ -415,12 +431,17 @@ def test_continuous_run_emits_post_fold_phase_names(tmp_path: Path, monkeypatch)
         )
     )
 
-    done_phases = {phase for phase, status in phase_events if status == "done"}
+    assert not any(status == "starting" for _, status, _ in phase_events)
+    done_phases = {phase for phase, status, _ in phase_events if status == "done"}
     assert "hypothesis_suite" in done_phases
     assert "selective_forgetting" in done_phases
     assert "h10b_selective_forgetting" in done_phases
     assert "memory_summary" in done_phases
     assert "artifact_cleanup" in done_phases
+    for phase, status, extra in phase_events:
+        if status == "done" and phase != "epoch_results":
+            assert extra is not None
+            assert "seconds=" in extra
 
 
 def test_continuous_resolves_full_hypothesis_suite_epoch_mode(tmp_path: Path, monkeypatch) -> None:

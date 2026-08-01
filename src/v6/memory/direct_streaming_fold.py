@@ -970,6 +970,7 @@ class DirectStreamingFoldWriter:
         self._job_shard_dirs: dict[str, Path] = {}
         self._effective_workers = 1
         self._merged_jobs = 0
+        self._close_phase_timings: dict[str, float] = {}
         self._summary = {
             "direct_streaming_fold_enabled": True,
             "direct_streaming_fold_job_count": 0,
@@ -1055,6 +1056,7 @@ class DirectStreamingFoldWriter:
     def close(self) -> dict[str, Any]:
         merge_error: Exception | None = None
         pending_merge_batch: list[tuple[DirectStreamingFoldJob, Path, DirectStreamingFoldResult]] = []
+        self._close_phase_timings = {}
         self._progress = tqdm(
             total=int(self._submitted_jobs),
             desc="direct fold",
@@ -1064,7 +1066,14 @@ class DirectStreamingFoldWriter:
         )
         try:
             future_jobs = {future: (job, shard_dir) for future, job, shard_dir in self._futures}
-            for future in as_completed(list(future_jobs)):
+            future_iterator = iter(as_completed(list(future_jobs)))
+            while True:
+                wait_started_at = time.perf_counter()
+                try:
+                    future = next(future_iterator)
+                except StopIteration:
+                    break
+                self._add_close_phase_timing("wait_futures", time.perf_counter() - wait_started_at)
                 job, shard_dir = future_jobs[future]
                 self._completed_jobs += 1
                 self._summary["direct_streaming_fold_jobs_completed"] = int(self._completed_jobs)
@@ -1112,7 +1121,7 @@ class DirectStreamingFoldWriter:
             if self._summary["direct_streaming_fold_success_count"] > 0:
                 merge_started_at = time.time()
                 self._summary["direct_streaming_fold_merge_started_at"] = float(merge_started_at)
-                finalize_started_at = time.time()
+                finalize_started_at = time.perf_counter()
                 finalize_main_compact_memory(
                     memory_dir=self.config.memory_dir,
                     fold_config=_compact_fold_config_from_direct_config(
@@ -1122,20 +1131,25 @@ class DirectStreamingFoldWriter:
                     ),
                     finalize_mode=str(self.config.compact_finalize_mode),
                 )
-                finalize_seconds = float(time.time() - finalize_started_at)
+                finalize_seconds = float(time.perf_counter() - finalize_started_at)
+                self._add_close_phase_timing("finalize_memory", finalize_seconds)
                 self._summary["finalization_seconds"] = finalize_seconds
                 self._summary["memory_summary_seconds"] = finalize_seconds
                 merge_finished_at = time.time()
                 self._summary["direct_streaming_fold_merge_finished_at"] = float(merge_finished_at)
                 self._summary["direct_streaming_fold_merge_seconds"] = float(merge_finished_at - merge_started_at)
                 self._summary["direct_streaming_fold_finalized_main_memory"] = True
-                checkpoint_started_at = time.time()
+                checkpoint_started_at = time.perf_counter()
                 _checkpoint_compact_memory(self.config.memory_dir, busy_timeout_ms=int(self.config.busy_timeout_ms))
+                checkpoint_seconds = float(time.perf_counter() - checkpoint_started_at)
+                self._add_close_phase_timing("checkpoint", checkpoint_seconds)
                 self._summary["total_checkpoint_seconds"] = float(
                     self._summary.get("total_checkpoint_seconds", 0.0) or 0.0
-                ) + float(time.time() - checkpoint_started_at)
+                ) + checkpoint_seconds
                 if self._shard_root.exists() and not any(self._shard_root.iterdir()):
+                    cleanup_started_at = time.perf_counter()
                     shutil.rmtree(self._shard_root, ignore_errors=True)
+                    self._add_close_phase_timing("cleanup", time.perf_counter() - cleanup_started_at)
                 self._summary["direct_streaming_fold_shards_deleted"] = not self._shard_root.exists()
         except Exception as exc:
             merge_error = exc
@@ -1143,12 +1157,22 @@ class DirectStreamingFoldWriter:
             if self._progress is not None:
                 self._progress.close()
             if self._executor is not None:
+                cleanup_started_at = time.perf_counter()
                 self._executor.shutdown(wait=True, cancel_futures=False)
+                self._add_close_phase_timing("cleanup", time.perf_counter() - cleanup_started_at)
             self._write_summary()
+            checkpoint_started_at = time.perf_counter()
             checkpoint_direct_streaming_manifest(self.config.memory_dir, truncate=True)
+            self._add_close_phase_timing("checkpoint", time.perf_counter() - checkpoint_started_at)
+            self._summary["direct_streaming_fold_close_timings"] = dict(self._close_phase_timings)
         if merge_error is not None:
             raise RuntimeError(f"direct streaming fold merge failed: {merge_error}") from merge_error
         return dict(self._summary)
+
+    def _add_close_phase_timing(self, phase: str, elapsed_seconds: float) -> None:
+        self._close_phase_timings[phase] = float(
+            self._close_phase_timings.get(phase, 0.0) + max(0.0, elapsed_seconds)
+        )
 
     def _record_failed_result(self, job: DirectStreamingFoldJob, result: DirectStreamingFoldResult) -> None:
         self._summary["direct_streaming_fold_failed_count"] += 1
@@ -1196,12 +1220,14 @@ class DirectStreamingFoldWriter:
     def _maybe_checkpoint_after_merge(self) -> None:
         interval = max(1, int(self.config.checkpoint_every_merged_jobs or 25))
         if self._merged_jobs > 0 and (self._merged_jobs % interval) == 0:
-            checkpoint_started_at = time.time()
+            checkpoint_started_at = time.perf_counter()
             _checkpoint_compact_memory(self.config.memory_dir, busy_timeout_ms=int(self.config.busy_timeout_ms))
             checkpoint_direct_streaming_manifest(self.config.memory_dir, truncate=True)
+            checkpoint_seconds = float(time.perf_counter() - checkpoint_started_at)
+            self._add_close_phase_timing("checkpoint", checkpoint_seconds)
             self._summary["total_checkpoint_seconds"] = float(
                 self._summary.get("total_checkpoint_seconds", 0.0) or 0.0
-            ) + float(time.time() - checkpoint_started_at)
+            ) + checkpoint_seconds
 
     def _merge_completed_job_shard_batch(
         self,
@@ -1216,6 +1242,7 @@ class DirectStreamingFoldWriter:
         shard_dirs = [item[1] for item in batch]
         results = [item[2] for item in batch]
         merge_started_at = time.time()
+        close_merge_started_at = time.perf_counter()
         try:
             merge_direct_fold_shards(
                 memory_dir=self.config.memory_dir,
@@ -1264,6 +1291,8 @@ class DirectStreamingFoldWriter:
                     ),
                 )
             return
+        finally:
+            self._add_close_phase_timing("merge_shards", time.perf_counter() - close_merge_started_at)
         self._summary["total_batch_merge_seconds"] = float(
             self._summary.get("total_batch_merge_seconds", 0.0) or 0.0
         ) + float(time.time() - merge_started_at)
@@ -1271,6 +1300,7 @@ class DirectStreamingFoldWriter:
         for job, shard_dir, result in batch:
             deleted_raw = False
             raw_delete_started_at = time.time()
+            close_cleanup_started_at = time.perf_counter()
             if bool(self.config.delete_raw_after_fold):
                 deleted_raw = _delete_fold_artifacts(
                     Path(job.db_path),
@@ -1286,6 +1316,7 @@ class DirectStreamingFoldWriter:
             self._summary["total_raw_delete_seconds"] = float(
                 self._summary.get("total_raw_delete_seconds", 0.0) or 0.0
             ) + float(time.time() - raw_delete_started_at)
+            self._add_close_phase_timing("cleanup", time.perf_counter() - close_cleanup_started_at)
             write_fold_job_manifest_result(
                 job,
                 status="folded",
@@ -1304,11 +1335,13 @@ class DirectStreamingFoldWriter:
                 error=None,
             )
             shard_delete_started_at = time.time()
+            close_cleanup_started_at = time.perf_counter()
             if shard_dir.exists():
                 shutil.rmtree(shard_dir, ignore_errors=True)
             self._summary["total_shard_delete_seconds"] = float(
                 self._summary.get("total_shard_delete_seconds", 0.0) or 0.0
             ) + float(time.time() - shard_delete_started_at)
+            self._add_close_phase_timing("cleanup", time.perf_counter() - close_cleanup_started_at)
             self._job_shard_dirs.pop(job.job_id, None)
             self._summary["direct_streaming_fold_job_shards_deleted_count"] += 1
             self._record_success_result(job, result)

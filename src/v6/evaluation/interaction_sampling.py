@@ -727,6 +727,25 @@ def _direct_streaming_fold_job_id(job: dict[str, Any]) -> str:
     )
 
 
+def _format_direct_fold_cleanup_timing_line(timings: dict[str, float]) -> str:
+    """Return the single compact stdout line for direct-fold shutdown timing."""
+    phases = (
+        ("wait", "wait_futures"),
+        ("flush", "live_writer_flush"),
+        ("shutdown", "manager_shutdown"),
+        ("merge", "merge_shards"),
+        ("finalize", "finalize_memory"),
+        ("checkpoint", "checkpoint"),
+        ("cleanup", "cleanup"),
+    )
+    parts = ["DF"]
+    for label, key in phases:
+        if key in timings:
+            parts.append(f"{label}={max(0.0, float(timings[key])):.1f}s")
+    parts.append(f"total={max(0.0, float(timings.get('total', 0.0))):.1f}s")
+    return " ".join(parts)
+
+
 def _run_sampling_jobs(
     jobs: list[dict],
     *,
@@ -1075,8 +1094,12 @@ def _run_sampling_jobs(
                         )
     finally:
         progress.close()
+        direct_fold_cleanup_started_at = time.perf_counter()
+        direct_fold_cleanup_timings: dict[str, float] = {}
         if live_memory_queue is not None and live_memory_writer is not None:
+            live_writer_flush_started_at = time.perf_counter()
             live_memory_writer_stop = stop_live_memory_writer(live_memory_queue, live_memory_writer)
+            direct_fold_cleanup_timings["live_writer_flush"] = time.perf_counter() - live_writer_flush_started_at
             live_memory_writer_stop["summary_path"] = live_memory_summary_path
             if live_memory_summary_path and Path(live_memory_summary_path).exists():
                 try:
@@ -1085,9 +1108,26 @@ def _run_sampling_jobs(
                     )
                 except Exception:
                     live_memory_writer_stop["live_memory_event_counts"] = None
+        manager_shutdown_needed = live_memory_manager_count() > live_memory_manager_start
+        manager_shutdown_started_at = time.perf_counter()
         shutdown_live_memory_managers(live_memory_manager_start)
+        if manager_shutdown_needed:
+            direct_fold_cleanup_timings["manager_shutdown"] = time.perf_counter() - manager_shutdown_started_at
         if direct_fold_writer is not None:
             direct_fold_summary = direct_fold_writer.close()
+            # Shutdown timing is intentionally stdout-only; keep report and
+            # manifest payloads compatible with their existing schemas.
+            close_timings = direct_fold_summary.pop("direct_streaming_fold_close_timings", {})
+            if isinstance(close_timings, dict):
+                direct_fold_cleanup_timings.update(
+                    {
+                        str(key): float(value)
+                        for key, value in close_timings.items()
+                        if isinstance(value, (int, float))
+                    }
+                )
+            direct_fold_cleanup_timings["total"] = time.perf_counter() - direct_fold_cleanup_started_at
+            print(_format_direct_fold_cleanup_timing_line(direct_fold_cleanup_timings), flush=True)
             if int(direct_fold_summary.get("direct_streaming_fold_failed_count", 0) or 0) > 0:
                 failed_ids = list(direct_fold_summary.get("direct_streaming_fold_failed_job_ids", []))[:3]
                 failed_errors = list(direct_fold_summary.get("direct_streaming_fold_failed_errors", []))[:3]

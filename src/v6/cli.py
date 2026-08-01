@@ -624,6 +624,11 @@ def build_parser() -> argparse.ArgumentParser:
     hypothesis_suite.add_argument("--hypothesis-progress", dest="hypothesis_progress", action="store_true", default=True)
     hypothesis_suite.add_argument("--no-hypothesis-progress", dest="hypothesis_progress", action="store_false")
     hypothesis_suite.add_argument("--hypothesis-progress-log-every", type=int, default=1000)
+    hypothesis_suite.add_argument("--incremental-promotion-validation", action="store_true")
+    hypothesis_suite.add_argument("--promotion-min-incremental-coverage", type=float, default=0.05)
+    hypothesis_suite.add_argument("--promotion-min-cross-context-or-game-evidence", type=int, default=2)
+    hypothesis_suite.add_argument("--promotion-min-behavioral-or-predictive-lift", type=float, default=0.01)
+    hypothesis_suite.add_argument("--promotion-demotion-failure-limit", type=int, default=2)
 
     continuous = subparsers.add_parser("continuous-research-run")
     continuous.add_argument("--experiment-name", required=True)
@@ -726,6 +731,11 @@ def build_parser() -> argparse.ArgumentParser:
     continuous.add_argument("--hypothesis-progress", dest="hypothesis_progress", action="store_true", default=True)
     continuous.add_argument("--no-hypothesis-progress", dest="hypothesis_progress", action="store_false")
     continuous.add_argument("--hypothesis-progress-log-every", type=int, default=1000)
+    continuous.add_argument("--incremental-promotion-validation", action="store_true")
+    continuous.add_argument("--promotion-min-incremental-coverage", type=float, default=0.05)
+    continuous.add_argument("--promotion-min-cross-context-or-game-evidence", type=int, default=2)
+    continuous.add_argument("--promotion-min-behavioral-or-predictive-lift", type=float, default=0.01)
+    continuous.add_argument("--promotion-demotion-failure-limit", type=int, default=2)
     continuous.add_argument("--memory-query-enabled", action="store_true")
     continuous.add_argument("--memory-action-selection-enabled", action="store_true")
     continuous.add_argument("--restore-compact-graph", action="store_true")
@@ -1628,6 +1638,11 @@ def main(argv: list[str] | None = None) -> int:
             max_future_option_events=int(args.max_future_option_events_per_epoch),
             max_future_option_motifs=int(args.max_future_option_motifs_per_epoch),
             future_option_development_stage=str(args.future_option_development_stage),
+            incremental_promotion_validation=bool(args.incremental_promotion_validation),
+            promotion_min_incremental_coverage=float(args.promotion_min_incremental_coverage),
+            promotion_min_cross_context_or_game_evidence=int(args.promotion_min_cross_context_or_game_evidence),
+            promotion_min_behavioral_or_predictive_lift=float(args.promotion_min_behavioral_or_predictive_lift),
+            promotion_demotion_failure_limit=int(args.promotion_demotion_failure_limit),
             hypothesis_progress=args.hypothesis_progress,
             hypothesis_progress_log_every=int(args.hypothesis_progress_log_every),
         )
@@ -1715,6 +1730,11 @@ def main(argv: list[str] | None = None) -> int:
             max_future_option_events_per_epoch=int(args.max_future_option_events_per_epoch),
             max_future_option_motifs_per_epoch=int(args.max_future_option_motifs_per_epoch),
             future_option_development_stage=str(args.future_option_development_stage),
+            incremental_promotion_validation=bool(args.incremental_promotion_validation),
+            promotion_min_incremental_coverage=float(args.promotion_min_incremental_coverage),
+            promotion_min_cross_context_or_game_evidence=int(args.promotion_min_cross_context_or_game_evidence),
+            promotion_min_behavioral_or_predictive_lift=float(args.promotion_min_behavioral_or_predictive_lift),
+            promotion_demotion_failure_limit=int(args.promotion_demotion_failure_limit),
             hypothesis_progress=bool(args.hypothesis_progress),
             hypothesis_progress_log_every=int(args.hypothesis_progress_log_every),
             memory_query_enabled=bool(args.memory_query_enabled),

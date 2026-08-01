@@ -103,6 +103,11 @@ class ContinuousResearchConfig:
     max_future_option_events_per_epoch: int = 50_000
     max_future_option_motifs_per_epoch: int = 25_000
     future_option_development_stage: str = "auto"
+    incremental_promotion_validation: bool = False
+    promotion_min_incremental_coverage: float = 0.05
+    promotion_min_cross_context_or_game_evidence: int = 2
+    promotion_min_behavioral_or_predictive_lift: float = 0.01
+    promotion_demotion_failure_limit: int = 2
     hypothesis_progress: bool = True
     hypothesis_progress_log_every: int = 1000
     memory_query_enabled: bool = False
@@ -113,6 +118,21 @@ class ContinuousResearchConfig:
 
 def _log_epoch_phase(epoch_id: str, phase: str, status: str = "starting", extra: dict | str | None = None) -> None:
     print(f"{_format_epoch_phase_prefix(epoch_id)} {phase}: {status}" + (f" {extra}" if extra else ""), flush=True)
+
+
+def _log_epoch_phase_done(
+    epoch_id: str,
+    phase: str,
+    started_at: float,
+    extra: dict | str | None = None,
+) -> None:
+    """Log a completed epoch phase once, with elapsed wall-clock time."""
+    parts = [f"seconds={max(0.0, time.perf_counter() - started_at):.2f}"]
+    if isinstance(extra, dict):
+        parts.extend(f"{key}={value}" for key, value in extra.items())
+    elif extra:
+        parts.append(str(extra))
+    _log_epoch_phase(epoch_id, phase, "done", " ".join(parts))
 
 
 def _format_epoch_phase_prefix(epoch_id: str) -> str:
@@ -268,7 +288,7 @@ def _run_continuous_research_inner(config: ContinuousResearchConfig) -> dict[str
         _write_epoch_start(status_dir, epoch_start_payload)
         print(_format_epoch_start(epoch_start_payload))
 
-        _log_epoch_phase(epoch_id, "sampling_and_direct_fold", "starting")
+        sampling_and_fold_started_at = time.perf_counter()
         sampling_rows = run_interaction_sampling_v05c(
             InteractionSamplingConfig(
                 games=parse_v05c_games(config.games, env_root=config.env_root),
@@ -344,13 +364,13 @@ def _run_continuous_research_inner(config: ContinuousResearchConfig) -> dict[str
                 restore_compact_substrate=bool(config.restore_compact_substrate),
             )
         )
-        _log_epoch_phase(epoch_id, "sampling_and_direct_fold", "done")
+        _log_epoch_phase_done(epoch_id, "sampling_and_direct_fold", sampling_and_fold_started_at)
         worker_execution = _load_sampling_worker_execution(raw_dir)
         if bool(config.direct_streaming_fold):
-            _log_epoch_phase(epoch_id, "direct_fold_manifest_check", "starting")
+            manifest_check_started_at = time.perf_counter()
             if direct_streaming_manifest_has_failures(memory_dir):
                 raise RuntimeError("direct streaming fold manifest reports failures; final raw fallback is disabled")
-            _log_epoch_phase(epoch_id, "direct_fold_manifest_check", "done")
+            _log_epoch_phase_done(epoch_id, "direct_fold_manifest_check", manifest_check_started_at)
             fold_summary = {
                 "direct_streaming_fold_enabled": True,
                 "final_raw_epoch_fold_skipped": True,
@@ -363,7 +383,7 @@ def _run_continuous_research_inner(config: ContinuousResearchConfig) -> dict[str
             if int(epoch_number) % max(1, int(config.full_hypothesis_suite_every_epochs or 5)) == 0
             else str(config.hypothesis_suite_mode)
         )
-        _log_epoch_phase(epoch_id, "hypothesis_suite", "starting", {"suite_mode": resolved_suite_mode})
+        hypothesis_suite_started_at = time.perf_counter()
         suite_summary = run_hypothesis_suite_report(
             run_dir=raw_dir,
             memory_dir=memory_dir,
@@ -387,6 +407,11 @@ def _run_continuous_research_inner(config: ContinuousResearchConfig) -> dict[str
             max_future_option_events=int(config.max_future_option_events_per_epoch),
             max_future_option_motifs=int(config.max_future_option_motifs_per_epoch),
             future_option_development_stage=str(config.future_option_development_stage),
+            incremental_promotion_validation=bool(config.incremental_promotion_validation),
+            promotion_min_incremental_coverage=float(config.promotion_min_incremental_coverage),
+            promotion_min_cross_context_or_game_evidence=int(config.promotion_min_cross_context_or_game_evidence),
+            promotion_min_behavioral_or_predictive_lift=float(config.promotion_min_behavioral_or_predictive_lift),
+            promotion_demotion_failure_limit=int(config.promotion_demotion_failure_limit),
             hypothesis_progress=bool(config.hypothesis_progress),
             hypothesis_progress_log_every=int(config.hypothesis_progress_log_every),
         )
@@ -394,31 +419,36 @@ def _run_continuous_research_inner(config: ContinuousResearchConfig) -> dict[str
             f"H{i:02d}={suite_summary.get(f'H{i:02d} decision', 'N/A')}"
             for i in range(1, 13)
         )
-        _log_epoch_phase(epoch_id, "hypothesis_suite", "done", hypothesis_summary)
-        _log_epoch_phase(epoch_id, "selective_forgetting", "starting")
+        _log_epoch_phase_done(epoch_id, "hypothesis_suite", hypothesis_suite_started_at, hypothesis_summary)
+        selective_forgetting_started_at = time.perf_counter()
         forgetting_summary = run_selective_forgetting_pass(memory_dir=memory_dir, epoch=epoch_number)
-        _log_epoch_phase(epoch_id, "selective_forgetting", "done")
-        _log_epoch_phase(epoch_id, "h10b_selective_forgetting", "starting")
+        _log_epoch_phase_done(epoch_id, "selective_forgetting", selective_forgetting_started_at)
+        h10b_started_at = time.perf_counter()
         h10b_summary = evaluate_h10b_selective_forgetting(
             memory_dir=memory_dir,
             run_dir=raw_dir,
             output_dir=reports_dir / "h10b",
             forgetting_summary=forgetting_summary,
         )
-        _log_epoch_phase(epoch_id, "h10b_selective_forgetting", "done", {"H10B": h10b_summary.get("decision")})
-        _log_epoch_phase(epoch_id, "memory_summary", "starting")
+        _log_epoch_phase_done(
+            epoch_id,
+            "h10b_selective_forgetting",
+            h10b_started_at,
+            {"H10B": h10b_summary.get("decision")},
+        )
+        memory_summary_started_at = time.perf_counter()
         memory_after = build_memory_summary(memory_paths)
-        _log_epoch_phase(
+        _log_epoch_phase_done(
             epoch_id,
             "memory_summary",
-            "done",
+            memory_summary_started_at,
             {
                 "stable_contingencies": memory_after.get("stable_contingency_count"),
                 "transformation_families": memory_after.get("transformation_family_count"),
                 "memory_nodes": memory_after.get("memory_node_count"),
             },
         )
-        _log_epoch_phase(epoch_id, "memory_continuity_report", "starting")
+        continuity_report_started_at = time.perf_counter()
         continuity_report = _write_memory_continuity_report(
             reports_dir=reports_dir,
             epoch_id=epoch_id,
@@ -427,22 +457,22 @@ def _run_continuous_research_inner(config: ContinuousResearchConfig) -> dict[str
             after_epoch_memory_summary=memory_after,
             memory_loaded_from_previous_epoch=epoch_number > 1,
         )
-        _log_epoch_phase(epoch_id, "memory_continuity_report", "done")
+        _log_epoch_phase_done(epoch_id, "memory_continuity_report", continuity_report_started_at)
         _ensure_fold_summary_present(
             memory_paths=memory_paths,
             global_step_start=global_step_start,
             global_step_end=global_step_end,
             worker_execution=worker_execution,
         )
-        _log_epoch_phase(epoch_id, "cleanup_validation", "starting")
+        cleanup_validation_started_at = time.perf_counter()
         validate_cleanup_safe(epoch_dir, memory_dir, required_reports=True)
-        _log_epoch_phase(epoch_id, "cleanup_validation", "done")
-        _log_epoch_phase(epoch_id, "artifact_cleanup", "starting")
+        _log_epoch_phase_done(epoch_id, "cleanup_validation", cleanup_validation_started_at)
+        artifact_cleanup_started_at = time.perf_counter()
         cleanup_summary = cleanup_epoch_artifacts(epoch_dir=epoch_dir, memory_dir=memory_dir) if bool(config.cleanup) else _no_cleanup_summary(epoch_dir, memory_dir)
-        _log_epoch_phase(
+        _log_epoch_phase_done(
             epoch_id,
             "artifact_cleanup",
-            "done",
+            artifact_cleanup_started_at,
             {
                 "disk_before_cleanup_bytes": cleanup_summary.get("disk_before_cleanup_bytes"),
                 "disk_after_cleanup_bytes": cleanup_summary.get("disk_after_cleanup_bytes"),
@@ -512,6 +542,7 @@ def _run_continuous_research_inner(config: ContinuousResearchConfig) -> dict[str
             "concept_candidates": h07_metrics.get("concept_candidate_count"),
             "promoted_concepts": h07_metrics.get("promoted_concept_count"),
             "h07_strong_transfer_successes": h07_metrics.get("concept_strong_transfer_success_count"),
+            "incremental_promotion_validation": suite_summary.get("incremental_promotion_validation"),
             "world_model_components": h08_metrics.get("world_model_component_count"),
             "coherent_world_model_components": h08_metrics.get("coherent_world_model_component_count"),
             "candidate_only_world_model_components": h08_metrics.get("candidate_only_world_model_component_count"),
@@ -556,9 +587,9 @@ def _run_continuous_research_inner(config: ContinuousResearchConfig) -> dict[str
             "deltas": deltas,
             "next_action": f"continue {f'epoch_{epoch_number + 1:04d}'}",
         }
-        _log_epoch_phase(epoch_id, "epoch_status_write", "starting")
+        epoch_status_write_started_at = time.perf_counter()
         _write_epoch_status(status_dir, status)
-        _log_epoch_phase(epoch_id, "epoch_status_write", "done")
+        _log_epoch_phase_done(epoch_id, "epoch_status_write", epoch_status_write_started_at)
 
         manifest["current_epoch"] = epoch_number
         manifest["updated_at"] = _now()
@@ -628,9 +659,14 @@ def _run_continuous_research_inner(config: ContinuousResearchConfig) -> dict[str
             manifest["stopped"] = True
             manifest["stop_reason"] = stop_reason
             status["next_action"] = f"stopped: {stop_reason}"
-            _log_epoch_phase(epoch_id, "epoch_status_write", "starting", {"stop_reason": stop_reason})
+            epoch_status_write_started_at = time.perf_counter()
             _write_epoch_status(status_dir, status)
-            _log_epoch_phase(epoch_id, "epoch_status_write", "done", {"stop_reason": stop_reason})
+            _log_epoch_phase_done(
+                epoch_id,
+                "epoch_status_write",
+                epoch_status_write_started_at,
+                {"stop_reason": stop_reason},
+            )
             break
         _write_manifest(manifest_path, manifest)
 
@@ -705,6 +741,11 @@ def _load_or_initialize_manifest(config: ContinuousResearchConfig, manifest_path
         "live_memory_delta_max_events": int(config.live_memory_delta_max_events),
         "live_memory_delta_batch_limit": int(config.live_memory_delta_batch_limit),
         "future_option_development_stage": str(config.future_option_development_stage),
+        "incremental_promotion_validation": bool(config.incremental_promotion_validation),
+        "promotion_min_incremental_coverage": float(config.promotion_min_incremental_coverage),
+        "promotion_min_cross_context_or_game_evidence": int(config.promotion_min_cross_context_or_game_evidence),
+        "promotion_min_behavioral_or_predictive_lift": float(config.promotion_min_behavioral_or_predictive_lift),
+        "promotion_demotion_failure_limit": int(config.promotion_demotion_failure_limit),
         "stop_if_disk_above_percent": float(config.stop_if_disk_above_percent),
         "stop_if_no_new_stable_contingencies_for": int(config.stop_if_no_new_stable_contingencies_for),
         "completed_epochs": 0,

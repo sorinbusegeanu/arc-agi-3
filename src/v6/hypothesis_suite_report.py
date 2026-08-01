@@ -16,10 +16,12 @@ from v6.hypothesis_h02_report import evaluate_h02_prediction_violation_attention
 from v6.hypothesis_h03_report import evaluate_h03_transformation_family_formation
 from v6.hypothesis_h04_report import evaluate_h04_carrier_emergence
 from v6.higher_order_substrate import (
+    IncrementalPromotionValidationConfig,
     derive_concept_candidates_only,
     derive_role_candidates_only,
     derive_role_transfer_attempts_only,
     derive_world_model_components_only,
+    validate_incremental_promotions_only,
 )
 from v6.future_options import derive_future_option_memory
 from v6.memory.compact_memory import derive_missing_transformation_families_from_stable_contingencies
@@ -222,6 +224,11 @@ def run_hypothesis_suite_report(
     max_future_option_events: int = 50_000,
     max_future_option_motifs: int = 25_000,
     future_option_development_stage: str = "auto",
+    incremental_promotion_validation: bool = False,
+    promotion_min_incremental_coverage: float = 0.05,
+    promotion_min_cross_context_or_game_evidence: int = 2,
+    promotion_min_behavioral_or_predictive_lift: float = 0.01,
+    promotion_demotion_failure_limit: int = 2,
     allow_memory_repair: bool = False,
     hypothesis_progress: bool | None = None,
     hypothesis_progress_log_every: int = 1000,
@@ -255,6 +262,9 @@ def run_hypothesis_suite_report(
         "derive_future_option_events", "derive_future_option_motifs", "derive_future_option_attention_links",
         "derive_future_option_transfer_links", "H09", "H10", "H11", "H12", "summary_write",
     ]
+    if incremental_promotion_validation:
+        phase_names[phase_names.index("H07"):phase_names.index("H07")] = ["validate_concept_promotions"]
+        phase_names[phase_names.index("H08"):phase_names.index("H08")] = ["validate_world_model_promotions"]
     top_bar = tqdm(total=len(phase_names), desc="hypothesis suite", unit="phase", dynamic_ncols=True, leave=True, disable=not progress_enabled)
     timings: dict[str, float] = {
         "family_repair_seconds": 0.0,
@@ -266,6 +276,8 @@ def run_hypothesis_suite_report(
         "derive_role_transfer_attempts_seconds": 0.0,
         "derive_concept_candidates_seconds": 0.0,
         "derive_world_model_components_seconds": 0.0,
+        "validate_concept_promotions_seconds": 0.0,
+        "validate_world_model_promotions_seconds": 0.0,
         "h05_seconds": 0.0,
         "h06_seconds": 0.0,
         "h07_seconds": 0.0,
@@ -279,6 +291,9 @@ def run_hypothesis_suite_report(
         "h11_seconds": 0.0,
         "h12_seconds": 0.0,
         "suite_total_seconds": 0.0,
+    }
+    promotion_validation_summary: dict[str, Any] = {
+        "incremental_promotion_validation_enabled": bool(incremental_promotion_validation),
     }
 
     @contextmanager
@@ -353,6 +368,13 @@ def run_hypothesis_suite_report(
         timings["h04_seconds"] = float(time.time() - t0)
 
     if memory_dir is not None:
+        promotion_validation_config = IncrementalPromotionValidationConfig(
+            enabled=bool(incremental_promotion_validation),
+            min_incremental_coverage=float(promotion_min_incremental_coverage),
+            min_cross_context_or_game_evidence=int(promotion_min_cross_context_or_game_evidence),
+            min_behavioral_or_predictive_lift=float(promotion_min_behavioral_or_predictive_lift),
+            demotion_failure_limit=int(promotion_demotion_failure_limit),
+        )
         with _phase("derive_role_candidates"):
             t0 = time.time()
             derive_role_candidates_only(memory_dir=memory_dir, run_dir=run_dir, max_carriers=int(max_role_carriers), max_roles=int(max_roles), progress_factory=_progress_factory)
@@ -374,6 +396,16 @@ def run_hypothesis_suite_report(
                 t0 = time.time()
                 derive_concept_candidates_only(memory_dir=memory_dir, run_dir=run_dir, progress_factory=_progress_factory)
                 timings["derive_concept_candidates_seconds"] = float(time.time() - t0)
+            if promotion_validation_config.enabled:
+                with _phase("validate_concept_promotions"):
+                    t0 = time.time()
+                    promotion_validation_summary = validate_incremental_promotions_only(
+                        memory_dir=memory_dir,
+                        config=promotion_validation_config,
+                        validate_roles_and_concepts=True,
+                        validate_world_models=False,
+                    )
+                    timings["validate_concept_promotions_seconds"] = float(time.time() - t0)
             with _phase("H07"):
                 t0 = time.time()
                 h07 = evaluate_h07_concept_emergence(memory_dir=memory_dir, run_dir=run_dir, output_dir=h07_dir, already_derived=True)
@@ -382,6 +414,19 @@ def run_hypothesis_suite_report(
                 t0 = time.time()
                 derive_world_model_components_only(memory_dir=memory_dir, run_dir=run_dir, progress_factory=_progress_factory)
                 timings["derive_world_model_components_seconds"] = float(time.time() - t0)
+            if promotion_validation_config.enabled:
+                with _phase("validate_world_model_promotions"):
+                    t0 = time.time()
+                    world_validation_summary = validate_incremental_promotions_only(
+                        memory_dir=memory_dir,
+                        config=promotion_validation_config,
+                        validate_roles_and_concepts=False,
+                        validate_world_models=True,
+                    )
+                    promotion_validation_summary["world_model_components_demoted"] = int(
+                        world_validation_summary.get("world_model_components_demoted", 0) or 0
+                    )
+                    timings["validate_world_model_promotions_seconds"] = float(time.time() - t0)
             with _phase("H08"):
                 t0 = time.time()
                 h08 = evaluate_h08_world_model_coherence(memory_dir=memory_dir, run_dir=run_dir, output_dir=h08_dir, already_derived=True)
@@ -408,12 +453,20 @@ def run_hypothesis_suite_report(
             h09 = _skipped_fast_mode_result("H09")
             h10 = _skipped_fast_mode_result("H10")
             h11 = _skipped_fast_mode_result("H11")
-            for phase_name in (
+            skipped_phase_names = [
                 "derive_role_transfer_attempts",
                 "H06",
                 "derive_concept_candidates",
+            ]
+            if promotion_validation_config.enabled:
+                skipped_phase_names.append("validate_concept_promotions")
+            skipped_phase_names.extend([
                 "H07",
                 "derive_world_model_components",
+            ])
+            if promotion_validation_config.enabled:
+                skipped_phase_names.append("validate_world_model_promotions")
+            skipped_phase_names.extend([
                 "H08",
                 "derive_future_option_events",
                 "derive_future_option_motifs",
@@ -422,7 +475,8 @@ def run_hypothesis_suite_report(
                 "H09",
                 "H10",
                 "H11",
-            ):
+            ])
+            for phase_name in skipped_phase_names:
                 with _phase(phase_name):
                     pass
         if resolved_suite_mode == "full":
@@ -533,6 +587,7 @@ def run_hypothesis_suite_report(
     summary["max_role_transfer_attempts"] = int(max_role_transfer_attempts)
     summary["max_future_option_events"] = int(max_future_option_events)
     summary["max_future_option_motifs"] = int(max_future_option_motifs)
+    summary["incremental_promotion_validation"] = promotion_validation_summary
     consistency_warnings = _collect_hypothesis_consistency_warnings(
         h03=h03, h04=h04, h05=h05, h07=h07, h08=h08, h09=h09, h10=h10, h12=h12
     )

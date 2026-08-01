@@ -76,6 +76,22 @@ class CarrierNeighborhood:
     games: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class IncrementalPromotionValidationConfig:
+    """Thresholds for optional held-out promotion validation.
+
+    This layer is deliberately separate from the existing role, concept, and
+    world-model scoring formulas.  It is enabled only by the Phase 3 feature
+    flag and therefore leaves legacy promotion behaviour unchanged by default.
+    """
+
+    enabled: bool = False
+    min_incremental_coverage: float = 0.05
+    min_cross_context_or_game_evidence: int = 2
+    min_behavioral_or_predictive_lift: float = 0.01
+    demotion_failure_limit: int = 2
+
+
 def derive_higher_order_memory(
     *,
     memory_dir: Path,
@@ -86,6 +102,7 @@ def derive_higher_order_memory(
     workers: int = 1,
     chunk_size: int = 5_000,
     progress_factory: Any | None = None,
+    incremental_promotion_validation: IncrementalPromotionValidationConfig | None = None,
 ) -> dict[str, Any]:
     role_summary = derive_role_candidates_only(
         memory_dir=memory_dir,
@@ -103,8 +120,27 @@ def derive_higher_order_memory(
         progress_factory=progress_factory,
     )
     concept_summary = derive_concept_candidates_only(memory_dir=memory_dir, run_dir=run_dir, progress_factory=progress_factory)
+    validation_config = incremental_promotion_validation or IncrementalPromotionValidationConfig()
+    promotion_summary: dict[str, Any] = {}
+    if validation_config.enabled:
+        promotion_summary = validate_incremental_promotions_only(
+            memory_dir=memory_dir,
+            config=validation_config,
+            validate_roles_and_concepts=True,
+            validate_world_models=False,
+        )
     world_summary = derive_world_model_components_only(memory_dir=memory_dir, run_dir=run_dir, progress_factory=progress_factory)
-    return {**role_summary, **transfer_summary, **concept_summary, **world_summary}
+    if validation_config.enabled:
+        world_promotion_summary = validate_incremental_promotions_only(
+            memory_dir=memory_dir,
+            config=validation_config,
+            validate_roles_and_concepts=False,
+            validate_world_models=True,
+        )
+        promotion_summary["world_model_components_demoted"] = int(
+            world_promotion_summary.get("world_model_components_demoted", 0) or 0
+        )
+    return {**role_summary, **transfer_summary, **concept_summary, **world_summary, **promotion_summary}
 
 
 def derive_role_candidates_only(
@@ -1183,6 +1219,419 @@ def derive_world_model_components(
         "coherent_world_model_component_count": coherent_count,
         "candidate_only_world_model_component_count": candidate_only_count,
     }
+
+
+def validate_incremental_promotions_only(
+    *,
+    memory_dir: Path,
+    config: IncrementalPromotionValidationConfig,
+    validate_roles_and_concepts: bool,
+    validate_world_models: bool,
+) -> dict[str, Any]:
+    """Apply optional held-out validation without deleting failed candidates."""
+    if not config.enabled:
+        return {"incremental_promotion_validation_enabled": False}
+    paths = ensure_memory_layout(memory_dir)
+    with sqlite3.connect(paths.current_state) as state_conn:
+        state_conn.row_factory = sqlite3.Row
+        summary = _validate_incremental_promotions(
+            state_conn,
+            config=config,
+            validate_roles_and_concepts=validate_roles_and_concepts,
+            validate_world_models=validate_world_models,
+        )
+        state_conn.execute(
+            """
+            INSERT INTO memory_summary (key, value_json)
+            VALUES ('incremental_promotion_validation_summary', ?)
+            ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json
+            """,
+            (json.dumps(summary, sort_keys=True),),
+        )
+        state_conn.commit()
+    return summary
+
+
+def _validate_incremental_promotions(
+    state_conn: sqlite3.Connection,
+    *,
+    config: IncrementalPromotionValidationConfig,
+    validate_roles_and_concepts: bool,
+    validate_world_models: bool,
+) -> dict[str, Any]:
+    """Calculate Phase 3 metrics from existing structures and later evidence.
+
+    A later global step is the held-out boundary.  This prevents a concept from
+    validating itself on the same role-transfer observations used to derive it.
+    """
+    summary: dict[str, Any] = {
+        "incremental_promotion_validation_enabled": True,
+        "concept_candidates_evaluated": 0,
+        "concepts_rejected_no_incremental_gain": 0,
+        "concepts_rejected_no_heldout_lift": 0,
+        "concepts_promoted_with_behavioral_lift": 0,
+        "concepts_demoted": 0,
+        "world_model_components_demoted": 0,
+        "role_candidates_evaluated": 0,
+        "roles_promoted_with_behavioral_lift": 0,
+        "roles_demoted": 0,
+    }
+    role_links = _links_by_signature(state_conn, "role_links", "role_signature")
+    concept_links = _links_by_signature(state_conn, "concept_links", "concept_signature")
+    family_rows = state_conn.execute(
+        "SELECT canonical_signature, prediction_lift, last_seen_global_step FROM transformation_families"
+    ).fetchall()
+    family_prediction = {
+        str(row["canonical_signature"]): (
+            float(row["prediction_lift"] or 0.0),
+            None if row["last_seen_global_step"] is None else int(row["last_seen_global_step"]),
+        )
+        for row in family_rows
+    }
+    transfer_rows = state_conn.execute(
+        """
+        SELECT role_signature, reuse_success, last_seen_global_step
+        FROM role_transfer_attempts
+        ORDER BY role_signature ASC, attempt_id ASC
+        """
+    ).fetchall()
+    transfers_by_role: dict[str, list[sqlite3.Row]] = defaultdict(list)
+    for row in transfer_rows:
+        transfers_by_role[str(row["role_signature"])].append(row)
+    future_rows = state_conn.execute(
+        """
+        SELECT source_role_id, owner_type, owner_key, option_delta
+        FROM future_option_events
+        """
+    ).fetchall()
+    future_by_role: dict[str, list[float]] = defaultdict(list)
+    for row in future_rows:
+        role_signature = row["source_role_id"]
+        if role_signature is None and str(row["owner_type"] or "") == "role":
+            role_signature = row["owner_key"]
+        if role_signature:
+            future_by_role[str(role_signature)].append(float(row["option_delta"] or 0.0))
+
+    role_metrics: dict[str, dict[str, float]] = {}
+    if validate_roles_and_concepts:
+        role_rows = state_conn.execute(
+            """
+            SELECT role_signature, linked_carrier_count, linked_family_count,
+                   linked_context_count, cross_game_count, support_count
+            FROM role_candidates ORDER BY role_signature ASC
+            """
+        ).fetchall()
+        for row in role_rows:
+            role_signature = str(row["role_signature"])
+            links = role_links.get(role_signature, {})
+            families = links.get("family", set())
+            prediction_values = [family_prediction.get(family, (0.0, None))[0] for family in families]
+            attempts = transfers_by_role.get(role_signature, [])
+            transfer_lift = (
+                sum(int(item["reuse_success"] or 0) for item in attempts) / len(attempts)
+                if attempts
+                else 0.0
+            )
+            explanatory_coverage = min(
+                1.0,
+                (len(families) + len(links.get("context", set())) + len(links.get("game", set())))
+                / max(1.0, 3.0 * float(row["linked_carrier_count"] or 0)),
+            )
+            compression_gain = float(row["linked_carrier_count"] or 0) / max(1.0, float(row["linked_family_count"] or 0))
+            prediction_lift = sum(prediction_values) / len(prediction_values) if prediction_values else 0.0
+            future_values = future_by_role.get(role_signature, [])
+            future_lift = sum(future_values) / len(future_values) if future_values else 0.0
+            role_has_cross_evidence = max(
+                len(links.get("context", set())), len(links.get("game", set()))
+            ) >= int(config.min_cross_context_or_game_evidence)
+            role_has_behavioral_lift = max(prediction_lift, future_lift, transfer_lift) >= float(
+                config.min_behavioral_or_predictive_lift
+            )
+            role_promoted = role_has_cross_evidence and explanatory_coverage >= float(
+                config.min_incremental_coverage
+            ) and role_has_behavioral_lift
+            role_status, role_failure_count, role_demoted = _update_promotion_validation_state(
+                state_conn,
+                candidate_type="role",
+                candidate_signature=role_signature,
+                passed=role_promoted,
+                demotion_failure_limit=int(config.demotion_failure_limit),
+                validation_scope="role_link_and_transfer_evidence",
+                validation_prediction_lift=prediction_lift,
+                validation_action_selection_lift=transfer_lift,
+                validation_transfer_lift=transfer_lift,
+                updated_global_step=None,
+            )
+            role_metrics[role_signature] = {
+                "coverage": explanatory_coverage,
+                "compression": compression_gain,
+                "prediction": prediction_lift,
+                "future": future_lift,
+                "transfer": transfer_lift,
+            }
+            state_conn.execute(
+                """
+                UPDATE role_candidates
+                SET role_explanatory_coverage = ?, role_compression_gain = ?,
+                    role_prediction_lift = ?, role_future_option_lift = ?,
+                    role_transfer_lift = ?, promotion_status = ?, promotion_failure_count = ?
+                WHERE role_signature = ?
+                """,
+                (
+                    explanatory_coverage, compression_gain, prediction_lift, future_lift,
+                    transfer_lift, role_status, role_failure_count, role_signature,
+                ),
+            )
+            if role_promoted:
+                summary["roles_promoted_with_behavioral_lift"] += 1
+            if role_demoted:
+                summary["roles_demoted"] += 1
+        summary["role_candidates_evaluated"] = len(role_rows)
+
+        concept_rows = state_conn.execute(
+            """
+            SELECT concept_signature, compression_gain, explanatory_reach, promotion_score,
+                   cross_context_count, cross_game_count, first_seen_global_step, is_promoted
+            FROM concept_candidates ORDER BY concept_signature ASC
+            """
+        ).fetchall()
+        for row in concept_rows:
+            concept_signature = str(row["concept_signature"])
+            links = concept_links.get(concept_signature, {})
+            roles = sorted(links.get("role", set()))
+            source_metrics = [role_metrics[role] for role in roles if role in role_metrics]
+            baseline_coverage = _mean_metric(source_metrics, "coverage")
+            baseline_compression = _mean_metric(source_metrics, "compression")
+            baseline_prediction = _mean_metric(source_metrics, "prediction")
+            baseline_future = _mean_metric(source_metrics, "future")
+            baseline_transfer = _mean_metric(source_metrics, "transfer")
+            candidate_coverage = min(1.0, float(row["explanatory_reach"] or 0.0) / 8.0)
+            incremental_coverage = candidate_coverage - baseline_coverage
+            incremental_compression = float(row["compression_gain"] or 0.0) - baseline_compression
+            first_seen = None if row["first_seen_global_step"] is None else int(row["first_seen_global_step"])
+            heldout_attempts = [
+                attempt
+                for role in roles
+                for attempt in transfers_by_role.get(role, [])
+                if first_seen is not None
+                and attempt["last_seen_global_step"] is not None
+                and int(attempt["last_seen_global_step"]) > first_seen
+            ]
+            derivation_attempts = [
+                attempt
+                for role in roles
+                for attempt in transfers_by_role.get(role, [])
+                if first_seen is not None
+                and attempt["last_seen_global_step"] is not None
+                and int(attempt["last_seen_global_step"]) <= first_seen
+            ]
+            derivation_transfer_rate = (
+                sum(int(attempt["reuse_success"] or 0) for attempt in derivation_attempts) / len(derivation_attempts)
+                if derivation_attempts
+                else baseline_transfer
+            )
+            validation_evidence_count = len(heldout_attempts)
+            validation_transfer_lift = (
+                (sum(int(attempt["reuse_success"] or 0) for attempt in heldout_attempts) / validation_evidence_count)
+                - derivation_transfer_rate
+                if validation_evidence_count
+                else None
+            )
+            heldout_prediction = [
+                lift
+                for family in links.get("family", set())
+                for lift, family_last_seen in (family_prediction.get(family, (0.0, None)),)
+                if first_seen is not None and family_last_seen is not None and family_last_seen > first_seen
+            ]
+            validation_prediction_lift = (
+                (sum(heldout_prediction) / len(heldout_prediction)) - baseline_prediction
+                if heldout_prediction
+                else None
+            )
+            validation_action_selection_lift = validation_transfer_lift
+            concept_prediction_lift = (
+                sum(family_prediction.get(family, (0.0, None))[0] for family in links.get("family", set()))
+                / max(1, len(links.get("family", set())))
+                - baseline_prediction
+            )
+            future_values = [value for role in roles for value in future_by_role.get(role, [])]
+            future_lift = (sum(future_values) / len(future_values) if future_values else 0.0) - baseline_future
+            cross_game_transfer_lift = validation_transfer_lift if validation_transfer_lift is not None else 0.0
+            has_cross_evidence = max(int(row["cross_context_count"] or 0), int(row["cross_game_count"] or 0)) >= int(config.min_cross_context_or_game_evidence)
+            has_incremental_gain = incremental_coverage >= float(config.min_incremental_coverage)
+            heldout_lifts = [value for value in (validation_prediction_lift, validation_action_selection_lift, validation_transfer_lift) if value is not None]
+            has_heldout_lift = bool(heldout_lifts) and max(heldout_lifts) >= float(config.min_behavioral_or_predictive_lift)
+            legacy_promoted = bool(int(row["is_promoted"] or 0))
+            promoted = legacy_promoted and has_cross_evidence and has_incremental_gain and has_heldout_lift
+            status, failure_count, demoted = _update_promotion_validation_state(
+                state_conn,
+                candidate_type="concept",
+                candidate_signature=concept_signature,
+                passed=promoted,
+                demotion_failure_limit=int(config.demotion_failure_limit),
+                validation_scope="later_global_step" if validation_evidence_count else "unavailable",
+                validation_prediction_lift=validation_prediction_lift,
+                validation_action_selection_lift=validation_action_selection_lift,
+                validation_transfer_lift=validation_transfer_lift,
+                updated_global_step=first_seen,
+            )
+            adjusted_promotion_score = (
+                float(row["promotion_score"] or 0.0)
+                if promoted
+                else max(0.0, float(row["promotion_score"] or 0.0) - 0.10 * failure_count)
+            )
+            state_conn.execute(
+                """
+                UPDATE concept_candidates
+                SET concept_incremental_coverage = ?, concept_incremental_compression_gain = ?,
+                    concept_prediction_lift = ?, concept_future_option_prediction_lift = ?,
+                    concept_cross_game_transfer_lift = ?, validation_scope = ?,
+                    validation_prediction_lift = ?, validation_action_selection_lift = ?,
+                    validation_transfer_lift = ?, validation_evidence_count = ?,
+                    promotion_status = ?, promotion_failure_count = ?, promotion_score = ?, is_promoted = ?
+                WHERE concept_signature = ?
+                """,
+                (
+                    incremental_coverage, incremental_compression, concept_prediction_lift, future_lift,
+                    cross_game_transfer_lift, "later_global_step" if validation_evidence_count else "unavailable",
+                    validation_prediction_lift, validation_action_selection_lift, validation_transfer_lift,
+                    validation_evidence_count, status, failure_count, adjusted_promotion_score,
+                    int(promoted), concept_signature,
+                ),
+            )
+            summary["concept_candidates_evaluated"] += 1
+            if not has_incremental_gain:
+                summary["concepts_rejected_no_incremental_gain"] += 1
+            if not has_heldout_lift:
+                summary["concepts_rejected_no_heldout_lift"] += 1
+            if promoted:
+                summary["concepts_promoted_with_behavioral_lift"] += 1
+            if demoted:
+                summary["concepts_demoted"] += 1
+
+    if validate_world_models:
+        component_rows = state_conn.execute(
+            """
+            SELECT component_signature, linked_concept_count, first_seen_global_step, coherence_score, is_coherent
+            FROM world_model_components ORDER BY component_signature ASC
+            """
+        ).fetchall()
+        concept_validation = {
+            str(row["concept_signature"]): dict(row)
+            for row in state_conn.execute(
+                """
+                SELECT concept_signature, is_promoted, validation_prediction_lift,
+                       validation_action_selection_lift, validation_transfer_lift
+                FROM concept_candidates
+                """
+            ).fetchall()
+        }
+        component_links = _links_by_signature(state_conn, "world_model_links", "component_signature")
+        for row in component_rows:
+            component_signature = str(row["component_signature"])
+            concepts = component_links.get(component_signature, {}).get("concept", set())
+            validations = [concept_validation[item] for item in concepts if item in concept_validation]
+            prediction_lift = _mean_row_metric(validations, "validation_prediction_lift")
+            action_lift = _mean_row_metric(validations, "validation_action_selection_lift")
+            transfer_lift = _mean_row_metric(validations, "validation_transfer_lift")
+            passed = bool(validations) and all(int(item.get("is_promoted", 0) or 0) == 1 for item in validations)
+            status, failure_count, demoted = _update_promotion_validation_state(
+                state_conn,
+                candidate_type="world_model",
+                candidate_signature=component_signature,
+                passed=passed,
+                demotion_failure_limit=int(config.demotion_failure_limit),
+                validation_scope="derived_concept_heldout",
+                validation_prediction_lift=prediction_lift,
+                validation_action_selection_lift=action_lift,
+                validation_transfer_lift=transfer_lift,
+                updated_global_step=None if row["first_seen_global_step"] is None else int(row["first_seen_global_step"]),
+            )
+            coherent = bool(int(row["is_coherent"] or 0)) and passed
+            adjusted_coherence_score = (
+                float(row["coherence_score"] or 0.0)
+                if passed
+                else max(0.0, float(row["coherence_score"] or 0.0) - 0.10 * failure_count)
+            )
+            state_conn.execute(
+                """
+                UPDATE world_model_components
+                SET validation_prediction_lift = ?, validation_action_selection_lift = ?,
+                    validation_transfer_lift = ?, promotion_status = ?, promotion_failure_count = ?,
+                    coherence_score = ?, candidate_only = ?, is_coherent = ?
+                WHERE component_signature = ?
+                """,
+                (
+                    prediction_lift, action_lift, transfer_lift, status, failure_count,
+                    adjusted_coherence_score, int(not coherent), int(coherent), component_signature,
+                ),
+            )
+            if demoted:
+                summary["world_model_components_demoted"] += 1
+    return summary
+
+
+def _mean_metric(items: list[dict[str, float]], key: str) -> float:
+    return sum(float(item.get(key, 0.0) or 0.0) for item in items) / max(1, len(items))
+
+
+def _mean_row_metric(items: list[dict[str, Any]], key: str) -> float | None:
+    values = [float(item[key]) for item in items if item.get(key) is not None]
+    return (sum(values) / len(values)) if values else None
+
+
+def _update_promotion_validation_state(
+    state_conn: sqlite3.Connection,
+    *,
+    candidate_type: str,
+    candidate_signature: str,
+    passed: bool,
+    demotion_failure_limit: int,
+    validation_scope: str,
+    validation_prediction_lift: float | None,
+    validation_action_selection_lift: float | None,
+    validation_transfer_lift: float | None,
+    updated_global_step: int | None,
+) -> tuple[str, int, bool]:
+    previous = state_conn.execute(
+        """
+        SELECT failure_count, promotion_status FROM promotion_validation_state
+        WHERE candidate_type = ? AND candidate_signature = ?
+        """,
+        (candidate_type, candidate_signature),
+    ).fetchone()
+    previous_failures = int(previous["failure_count"] or 0) if previous is not None else 0
+    previous_status = str(previous["promotion_status"] or "candidate") if previous is not None else "candidate"
+    if passed:
+        status, failure_count, demoted = "promoted", 0, False
+    else:
+        failure_count = previous_failures + 1
+        previously_promoted = previous_status in {"promoted", "validation_failed"}
+        demoted = previously_promoted and failure_count >= max(1, demotion_failure_limit)
+        status = "demoted" if demoted else ("validation_failed" if previously_promoted else "candidate")
+    state_conn.execute(
+        """
+        INSERT INTO promotion_validation_state (
+            candidate_type, candidate_signature, failure_count, promotion_status,
+            last_validation_scope, last_validation_prediction_lift,
+            last_validation_action_selection_lift, last_validation_transfer_lift, updated_global_step
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(candidate_type, candidate_signature) DO UPDATE SET
+            failure_count = excluded.failure_count,
+            promotion_status = excluded.promotion_status,
+            last_validation_scope = excluded.last_validation_scope,
+            last_validation_prediction_lift = excluded.last_validation_prediction_lift,
+            last_validation_action_selection_lift = excluded.last_validation_action_selection_lift,
+            last_validation_transfer_lift = excluded.last_validation_transfer_lift,
+            updated_global_step = excluded.updated_global_step
+        """,
+        (
+            candidate_type, candidate_signature, failure_count, status, validation_scope,
+            validation_prediction_lift, validation_action_selection_lift, validation_transfer_lift,
+            updated_global_step,
+        ),
+    )
+    return status, failure_count, demoted
 
 
 def _run_higher_order_stage(

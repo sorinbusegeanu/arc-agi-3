@@ -7,7 +7,13 @@ from pathlib import Path
 
 from v6.cli import build_parser
 from v6.continuous_research import ContinuousResearchConfig, run_continuous_research
-from v6.evaluation.interaction_sampling import InteractionSamplingConfig, _generate_sampling_dbs, _run_sampling_jobs, run_interaction_sampling_v05c
+from v6.evaluation.interaction_sampling import (
+    InteractionSamplingConfig,
+    _format_direct_fold_cleanup_timing_line,
+    _generate_sampling_dbs,
+    _run_sampling_jobs,
+    run_interaction_sampling_v05c,
+)
 from v6.memory.compact_memory import (
     CompactMemoryFoldConfig,
     checkpoint_compact_memory,
@@ -42,6 +48,23 @@ def _make_fake_raw_job(tmp_path: Path, name: str = "seed_0.sqlite") -> Path:
     ):
         db_path.with_name(sidecar).write_text("{}", encoding="utf-8")
     return db_path
+
+
+def test_direct_fold_cleanup_timing_line_is_single_compact_ordered_line() -> None:
+    line = _format_direct_fold_cleanup_timing_line(
+        {
+            "cleanup": 1.64,
+            "merge_shards": 24.74,
+            "live_writer_flush": 0.44,
+            "wait_futures": 18.34,
+            "checkpoint": 3.24,
+            "total": 60.34,
+        }
+    )
+
+    assert line == "DF wait=18.3s flush=0.4s merge=24.7s checkpoint=3.2s cleanup=1.6s total=60.3s"
+    assert "{" not in line
+    assert "\n" not in line
 
 
 def _make_minimal_sqlite_with_memory_substrate(db_path: Path) -> Path:
@@ -981,7 +1004,7 @@ def test_direct_streaming_fold_start_removes_stale_shard_root_when_manifest_clea
             writer._executor.shutdown(wait=True, cancel_futures=True)
 
 
-def test_sampling_pool_refills_before_direct_fold_submit(monkeypatch, tmp_path: Path) -> None:
+def test_sampling_pool_refills_before_direct_fold_submit(monkeypatch, tmp_path: Path, capsys) -> None:
     class FakeFuture:
         def __init__(self, job):
             self.job = job
@@ -1042,6 +1065,13 @@ def test_sampling_pool_refills_before_direct_fold_submit(monkeypatch, tmp_path: 
                 "direct_streaming_fold_mean_job_seconds": 0.0,
                 "direct_streaming_fold_mean_write_mb_per_second": 0.0,
                 "direct_streaming_shard_synchronous": "off",
+                "direct_streaming_fold_close_timings": {
+                    "wait_futures": 18.34,
+                    "merge_shards": 24.74,
+                    "finalize_memory": 11.94,
+                    "checkpoint": 3.24,
+                    "cleanup": 1.64,
+                },
             }
 
     def _fake_wait(futures, timeout=None, return_when=None):
@@ -1078,6 +1108,11 @@ def test_sampling_pool_refills_before_direct_fold_submit(monkeypatch, tmp_path: 
     assert stats["sampling_refill_count"] >= 2
     assert stats["max_done_batch_size"] == 32
     assert stats["seconds_spent_in_fold_submit_delay"] == 0.0
+    stdout_lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith("DF ")]
+    assert len(stdout_lines) == 1
+    assert stdout_lines[0].startswith(
+        "DF wait=18.3s merge=24.7s finalize=11.9s checkpoint=3.2s cleanup=1.6s total="
+    )
 
 
 def test_compact_sqlite_busy_timeout_wal(tmp_path: Path) -> None:

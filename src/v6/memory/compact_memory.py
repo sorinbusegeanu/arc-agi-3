@@ -5283,7 +5283,14 @@ def _ensure_current_state_schema(path: Path) -> None:
                 role_signature_token_count INTEGER,
                 diagnostic_token_count INTEGER,
                 exact_family_token_count INTEGER,
-                exact_identity_token_count INTEGER
+                exact_identity_token_count INTEGER,
+                role_explanatory_coverage REAL,
+                role_compression_gain REAL,
+                role_prediction_lift REAL,
+                role_future_option_lift REAL,
+                role_transfer_lift REAL,
+                promotion_status TEXT,
+                promotion_failure_count INTEGER DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS role_links (
                 role_signature TEXT,
@@ -5331,7 +5338,19 @@ def _ensure_current_state_schema(path: Path) -> None:
                 promotion_score REAL,
                 first_seen_global_step INTEGER,
                 last_seen_global_step INTEGER,
-                is_promoted INTEGER
+                is_promoted INTEGER,
+                concept_incremental_coverage REAL,
+                concept_incremental_compression_gain REAL,
+                concept_prediction_lift REAL,
+                concept_future_option_prediction_lift REAL,
+                concept_cross_game_transfer_lift REAL,
+                validation_scope TEXT,
+                validation_prediction_lift REAL,
+                validation_action_selection_lift REAL,
+                validation_transfer_lift REAL,
+                validation_evidence_count INTEGER,
+                promotion_status TEXT,
+                promotion_failure_count INTEGER DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS concept_links (
                 concept_signature TEXT,
@@ -5362,7 +5381,12 @@ def _ensure_current_state_schema(path: Path) -> None:
                 predicted_outcome_count_is_proxy INTEGER,
                 first_seen_global_step INTEGER,
                 last_seen_global_step INTEGER,
-                is_coherent INTEGER
+                is_coherent INTEGER,
+                validation_prediction_lift REAL,
+                validation_action_selection_lift REAL,
+                validation_transfer_lift REAL,
+                promotion_status TEXT,
+                promotion_failure_count INTEGER DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS world_model_links (
                 component_signature TEXT,
@@ -5377,6 +5401,18 @@ def _ensure_current_state_schema(path: Path) -> None:
                 milestone_name TEXT PRIMARY KEY,
                 first_global_step INTEGER,
                 evidence_key TEXT
+            );
+            CREATE TABLE IF NOT EXISTS promotion_validation_state (
+                candidate_type TEXT,
+                candidate_signature TEXT,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                promotion_status TEXT NOT NULL DEFAULT 'candidate',
+                last_validation_scope TEXT,
+                last_validation_prediction_lift REAL,
+                last_validation_action_selection_lift REAL,
+                last_validation_transfer_lift REAL,
+                updated_global_step INTEGER,
+                PRIMARY KEY (candidate_type, candidate_signature)
             );
             CREATE TABLE IF NOT EXISTS future_option_events (
                 event_id TEXT PRIMARY KEY,
@@ -5607,15 +5643,39 @@ def _ensure_current_state_schema(path: Path) -> None:
         _ensure_column(connection, "role_candidates", "diagnostic_token_count", "INTEGER")
         _ensure_column(connection, "role_candidates", "exact_family_token_count", "INTEGER")
         _ensure_column(connection, "role_candidates", "exact_identity_token_count", "INTEGER")
+        _ensure_column(connection, "role_candidates", "role_explanatory_coverage", "REAL")
+        _ensure_column(connection, "role_candidates", "role_compression_gain", "REAL")
+        _ensure_column(connection, "role_candidates", "role_prediction_lift", "REAL")
+        _ensure_column(connection, "role_candidates", "role_future_option_lift", "REAL")
+        _ensure_column(connection, "role_candidates", "role_transfer_lift", "REAL")
+        _ensure_column(connection, "role_candidates", "promotion_status", "TEXT")
+        _ensure_column(connection, "role_candidates", "promotion_failure_count", "INTEGER DEFAULT 0")
         _ensure_column(connection, "role_transfer_attempts", "best_margin", "REAL")
         _ensure_column(connection, "role_transfer_attempts", "source_carrier_count", "INTEGER")
         _ensure_column(connection, "role_transfer_attempts", "candidate_role_count", "INTEGER")
         _ensure_column(connection, "concept_candidates", "strong_transfer_success_count", "INTEGER")
         _ensure_column(connection, "concept_candidates", "transfer_success_concentration", "REAL")
         _ensure_column(connection, "concept_candidates", "is_overconcentrated", "INTEGER DEFAULT 0")
+        _ensure_column(connection, "concept_candidates", "concept_incremental_coverage", "REAL")
+        _ensure_column(connection, "concept_candidates", "concept_incremental_compression_gain", "REAL")
+        _ensure_column(connection, "concept_candidates", "concept_prediction_lift", "REAL")
+        _ensure_column(connection, "concept_candidates", "concept_future_option_prediction_lift", "REAL")
+        _ensure_column(connection, "concept_candidates", "concept_cross_game_transfer_lift", "REAL")
+        _ensure_column(connection, "concept_candidates", "validation_scope", "TEXT")
+        _ensure_column(connection, "concept_candidates", "validation_prediction_lift", "REAL")
+        _ensure_column(connection, "concept_candidates", "validation_action_selection_lift", "REAL")
+        _ensure_column(connection, "concept_candidates", "validation_transfer_lift", "REAL")
+        _ensure_column(connection, "concept_candidates", "validation_evidence_count", "INTEGER")
+        _ensure_column(connection, "concept_candidates", "promotion_status", "TEXT")
+        _ensure_column(connection, "concept_candidates", "promotion_failure_count", "INTEGER DEFAULT 0")
         _ensure_column(connection, "world_model_components", "candidate_only", "INTEGER DEFAULT 0")
         _ensure_column(connection, "world_model_components", "predicted_outcome_count", "INTEGER")
         _ensure_column(connection, "world_model_components", "predicted_outcome_count_is_proxy", "INTEGER DEFAULT 0")
+        _ensure_column(connection, "world_model_components", "validation_prediction_lift", "REAL")
+        _ensure_column(connection, "world_model_components", "validation_action_selection_lift", "REAL")
+        _ensure_column(connection, "world_model_components", "validation_transfer_lift", "REAL")
+        _ensure_column(connection, "world_model_components", "promotion_status", "TEXT")
+        _ensure_column(connection, "world_model_components", "promotion_failure_count", "INTEGER DEFAULT 0")
         _ensure_column(connection, "future_option_attention_links", "attention_signal_source", "TEXT")
         _ensure_column(connection, "future_option_attention_links", "raw_high_attention", "INTEGER")
         _ensure_column(connection, "future_option_attention_links", "calibrated_high_attention", "INTEGER")

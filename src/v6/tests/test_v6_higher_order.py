@@ -8,11 +8,13 @@ from pathlib import Path
 from v6.continuous_research import _format_epoch_status
 from v6 import higher_order_substrate
 from v6.higher_order_substrate import (
+    IncrementalPromotionValidationConfig,
     _derive_role_transfer_attempts_chunk,
     _predict_transfer_attempt,
     derive_higher_order_memory,
     derive_role_candidates_only,
     derive_role_transfer_attempts_only,
+    validate_incremental_promotions_only,
 )
 from v6.hypothesis_h05_report import evaluate_h05_role_emergence
 from v6.hypothesis_h06_report import evaluate_h06_role_transfer
@@ -35,6 +37,124 @@ from v6.memory.compact_memory import ensure_memory_layout
 class _ThreadPoolCompat(ThreadPoolExecutor):
     def __init__(self, max_workers=None):
         super().__init__(max_workers=max_workers)
+
+
+def test_incremental_promotion_validation_uses_later_evidence_and_demotes_without_deleting(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    paths = ensure_memory_layout(memory_dir)
+    with sqlite3.connect(paths.current_state) as conn:
+        for role, family, context, game in (("role-a", "family-a", "ctx-a", "game-a"), ("role-b", "family-b", "ctx-b", "game-b")):
+            conn.execute(
+                """
+                INSERT INTO role_candidates (
+                    role_signature, linked_carrier_count, linked_family_count, linked_context_count,
+                    cross_game_count, support_count
+                ) VALUES (?, 2, 1, 1, 1, 8)
+                """,
+                (role,),
+            )
+            for linked_type, linked_key in (("carrier", f"carrier-{role}"), ("family", family), ("context", context), ("game", game)):
+                conn.execute(
+                    "INSERT INTO role_links (role_signature, linked_type, linked_key, support_count) VALUES (?, ?, ?, 1)",
+                    (role, linked_type, linked_key),
+                )
+            conn.execute(
+                "INSERT INTO transformation_families (canonical_signature, prediction_lift, last_seen_global_step) VALUES (?, 0.4, 20)",
+                (family,),
+            )
+            conn.execute(
+                """
+                INSERT INTO role_transfer_attempts (attempt_id, role_signature, reuse_success, last_seen_global_step)
+                VALUES (?, ?, ?, ?)
+                """,
+                (f"{role}-derivation", role, 0, 5),
+            )
+            conn.execute(
+                """
+                INSERT INTO role_transfer_attempts (attempt_id, role_signature, reuse_success, last_seen_global_step)
+                VALUES (?, ?, ?, ?)
+                """,
+                (f"{role}-heldout", role, 1, 20),
+            )
+        conn.execute(
+            """
+            INSERT INTO concept_candidates (
+                concept_signature, compression_gain, explanatory_reach, promotion_score,
+                cross_context_count, cross_game_count, first_seen_global_step, is_promoted
+            ) VALUES ('concept-a', 2.0, 8.0, 0.9, 2, 2, 10, 1)
+            """
+        )
+        for linked_type, linked_key in (
+            ("role", "role-a"), ("role", "role-b"), ("family", "family-a"), ("family", "family-b"),
+            ("context", "ctx-a"), ("context", "ctx-b"), ("game", "game-a"), ("game", "game-b"),
+        ):
+            conn.execute(
+                "INSERT INTO concept_links (concept_signature, linked_type, linked_key, support_count) VALUES ('concept-a', ?, ?, 1)",
+                (linked_type, linked_key),
+            )
+        conn.execute(
+            """
+            INSERT INTO world_model_components (component_signature, linked_concept_count, first_seen_global_step, is_coherent)
+            VALUES ('wm-a', 1, 10, 1)
+            """
+        )
+        conn.execute(
+            "INSERT INTO world_model_links (component_signature, linked_type, linked_key, support_count) VALUES ('wm-a', 'concept', 'concept-a', 1)"
+        )
+        conn.commit()
+
+    config = IncrementalPromotionValidationConfig(enabled=True, demotion_failure_limit=1)
+    first = validate_incremental_promotions_only(
+        memory_dir=memory_dir,
+        config=config,
+        validate_roles_and_concepts=True,
+        validate_world_models=False,
+    )
+    assert first["concepts_promoted_with_behavioral_lift"] == 1
+    with sqlite3.connect(paths.current_state) as conn:
+        promoted = conn.execute(
+            "SELECT is_promoted, validation_scope, validation_transfer_lift FROM concept_candidates WHERE concept_signature='concept-a'"
+        ).fetchone()
+    assert promoted == (1, "later_global_step", 1.0)
+    validate_incremental_promotions_only(
+        memory_dir=memory_dir,
+        config=config,
+        validate_roles_and_concepts=False,
+        validate_world_models=True,
+    )
+
+    with sqlite3.connect(paths.current_state) as conn:
+        conn.execute("DELETE FROM role_transfer_attempts WHERE last_seen_global_step > 10")
+        for role in ("role-a", "role-b"):
+            conn.execute(
+                "INSERT INTO role_transfer_attempts (attempt_id, role_signature, reuse_success, last_seen_global_step) VALUES (?, ?, 0, 20)",
+                (f"{role}-failed-heldout", role),
+            )
+        conn.commit()
+    second = validate_incremental_promotions_only(
+        memory_dir=memory_dir,
+        config=config,
+        validate_roles_and_concepts=True,
+        validate_world_models=False,
+    )
+    world = validate_incremental_promotions_only(
+        memory_dir=memory_dir,
+        config=config,
+        validate_roles_and_concepts=False,
+        validate_world_models=True,
+    )
+    assert second["concepts_rejected_no_heldout_lift"] == 1
+    assert second["concepts_demoted"] == 1
+    assert world["world_model_components_demoted"] == 1
+    with sqlite3.connect(paths.current_state) as conn:
+        concept = conn.execute(
+            "SELECT is_promoted, promotion_status FROM concept_candidates WHERE concept_signature='concept-a'"
+        ).fetchone()
+        component = conn.execute(
+            "SELECT is_coherent, candidate_only FROM world_model_components WHERE component_signature='wm-a'"
+        ).fetchone()
+    assert concept == (0, "demoted")
+    assert component == (0, 1)
 
 
 def test_h06_predicts_correct_role_across_held_out_game(tmp_path: Path) -> None:
