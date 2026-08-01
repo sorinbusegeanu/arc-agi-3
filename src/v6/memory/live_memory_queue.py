@@ -34,6 +34,7 @@ class LiveMemoryWriterConfig:
     flush_seconds: float = 2.0
     min_priority: float = 0.0
     summary_write_every_batches: int = 50
+    delta_log: Any | None = None
 
 
 class LiveMemoryWriter:
@@ -114,15 +115,28 @@ class LiveMemoryWriter:
     def _flush_batch(self, connection: sqlite3.Connection, batch: list[dict[str, Any]]) -> None:
         if not batch:
             return
+        written_events: list[dict[str, Any]] = []
         for event in batch:
             try:
                 self._write_event(connection, event)
                 self.summary["events_written"] = int(self.summary["events_written"]) + 1
+                written_events.append(event)
             except Exception:
                 self.summary["events_dropped_invalid"] = int(self.summary["events_dropped_invalid"]) + 1
                 self.summary["events_dropped"] = int(self.summary.get("events_dropped", 0)) + 1
                 continue
         connection.commit()
+        if self.config.delta_log is not None:
+            for event in written_events:
+                self.config.delta_log.append(
+                    {
+                        "sequence": int(event["sequence"]),
+                        "event_id": str(event["event_id"]),
+                        "event_type": str(event["event_type"]),
+                        "global_step": int(event.get("global_step") or 0),
+                        "payload": dict(event.get("payload") or {}),
+                    }
+                )
         self.summary["batches_written"] = int(self.summary["batches_written"]) + 1
         self.summary["last_flush_time"] = time.time()
         self._batches_since_summary_write += 1
@@ -159,7 +173,9 @@ class LiveMemoryWriter:
 
 
 class LiveMemoryReadCache:
-    def __init__(self, *, memory_dir: str | Path, refresh_steps: int = 250) -> None:
+    """Read cache for legacy SQLite reads or manager-relayed snapshot deltas."""
+
+    def __init__(self, *, memory_dir: str | Path, refresh_steps: int = 250, delta_log: Any | None = None) -> None:
         self.memory_dir = Path(memory_dir)
         self.sqlite_path = self.memory_dir / "live_memory.sqlite"
         self.refresh_steps = max(1, int(refresh_steps))
@@ -178,6 +194,8 @@ class LiveMemoryReadCache:
         self.refresh_seconds = 0.0
         self.busy_retry_count = 0
         self.busy_wait_seconds = 0.0
+        self.delta_log = delta_log
+        self._delta_cursor = 0
 
     def refresh_if_due(self, step: int) -> bool:
         if self.last_refresh_step < 0 or int(step) - int(self.last_refresh_step) >= self.refresh_steps:
@@ -187,6 +205,8 @@ class LiveMemoryReadCache:
     def refresh(self, force: bool = False, step: int | None = None) -> bool:
         if not force and step is not None and self.last_refresh_step >= 0 and int(step) - int(self.last_refresh_step) < self.refresh_steps:
             return False
+        if self.delta_log is not None:
+            return self._refresh_delta_log(step)
         if not self.sqlite_path.exists():
             self.refresh_failed_count += 1
             return False
@@ -261,11 +281,52 @@ class LiveMemoryReadCache:
             self.last_refresh_step = 0
         return True
 
+    def _refresh_delta_log(self, step: int | None) -> bool:
+        """Apply only writer-relayed events; snapshot workers never open SQLite."""
+        started = time.perf_counter()
+        try:
+            size = len(self.delta_log)
+            rows = [self.delta_log[index] for index in range(self._delta_cursor, size)]
+        except Exception:
+            self.refresh_failed_count += 1
+            return False
+        self._delta_cursor = size
+        unseen = [dict(row) for row in rows if int(row.get("sequence", 0) or 0) > self.last_applied_live_sequence]
+        if unseen:
+            self.overlay.apply_rows(unseen)
+            self.last_applied_live_sequence = int(self.overlay.last_sequence)
+            self.refresh_rows += len(unseen)
+            for event in unseen:
+                payload = dict(event.get("payload") or {})
+                payload.update({"event_id": event.get("event_id"), "event_type": event.get("event_type"), "global_step": event.get("global_step")})
+                target = {
+                    "stable_contingency": self.stable_contingencies,
+                    "high_priority_replay": self.replay_candidates,
+                    "future_option": self.future_option_events,
+                    "future_option_event": self.future_option_events,
+                    "family_update": self.family_updates,
+                }.get(str(event.get("event_type")))
+                if target is not None:
+                    target.append(payload)
+        self.refresh_count += 1
+        self.refresh_seconds += time.perf_counter() - started
+        if step is not None:
+            self.last_refresh_step = int(step)
+        elif self.last_refresh_step < 0:
+            self.last_refresh_step = 0
+        return bool(unseen)
+
 
 def make_live_memory_queue(maxsize: int) -> multiprocessing.Queue:
     manager = multiprocessing.Manager()
     _LIVE_MEMORY_MANAGERS.append(manager)
     return manager.Queue(maxsize=max(1, int(maxsize)))
+
+
+def make_live_memory_delta_log() -> Any:
+    manager = multiprocessing.Manager()
+    _LIVE_MEMORY_MANAGERS.append(manager)
+    return manager.list()
 
 
 def start_live_memory_writer(config: LiveMemoryWriterConfig, queue: multiprocessing.Queue) -> multiprocessing.Process:

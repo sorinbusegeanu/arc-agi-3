@@ -57,6 +57,7 @@ class ContinuousResearchConfig:
     live_memory_flush_seconds: float = 2.0
     memory_snapshot_mode: str = "worker_local"
     memory_snapshot_max_bytes: int | None = None
+    memory_snapshot_max_ram_percent: float = 85.0
     memory_snapshot_include_graph: bool = True
     memory_snapshot_include_substrate: bool = True
     direct_streaming_fold: bool = True
@@ -288,6 +289,7 @@ def _run_continuous_research_inner(config: ContinuousResearchConfig) -> dict[str
                 live_memory_flush_seconds=float(config.live_memory_flush_seconds),
                 memory_snapshot_mode=str(config.memory_snapshot_mode),
                 memory_snapshot_max_bytes=config.memory_snapshot_max_bytes,
+                memory_snapshot_max_ram_percent=float(config.memory_snapshot_max_ram_percent),
                 memory_snapshot_include_graph=bool(config.memory_snapshot_include_graph),
                 memory_snapshot_include_substrate=bool(config.memory_snapshot_include_substrate),
                 direct_streaming_fold_enabled=bool(config.direct_streaming_fold),

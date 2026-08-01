@@ -3,8 +3,8 @@ from __future__ import annotations
 import csv
 import inspect
 import json
-import multiprocessing
 import os
+import multiprocessing
 import re
 import sqlite3
 import sys
@@ -30,6 +30,7 @@ from v6.main import V6Config, V6System
 from v6.memory.live_memory_queue import (
     LiveMemoryReadCache,
     LiveMemoryWriterConfig,
+    make_live_memory_delta_log,
     make_live_memory_queue,
     start_live_memory_writer,
     stop_live_memory_writer,
@@ -753,7 +754,6 @@ def _run_sampling_jobs(
     active_futures = {}
     pending_jobs_remaining = len(jobs)
     job_started_at: dict[Any, float] = {}
-    last_progress_log = time.monotonic()
     target_workers = initial
     peak_workers = 0
     ramp_events: list[dict[str, float | int]] = []
@@ -795,6 +795,7 @@ def _run_sampling_jobs(
                 flush=True,
             )
     live_memory_queue = None
+    live_memory_delta_log = None
     live_memory_writer = None
     direct_fold_writer: DirectStreamingFoldWriter | None = None
     direct_fold_summary: dict[str, Any] = {
@@ -816,18 +817,22 @@ def _run_sampling_jobs(
     live_memory_summary_path = None
     if shared_live_memory_mode != "none" and main_memory_dir is not None:
         live_memory_queue = make_live_memory_queue(int(jobs[0].get("live_memory_queue_maxsize", 100_000) or 100_000))
+        if shared_live_memory_mode == "readwrite" and snapshot_job is not None:
+            live_memory_delta_log = make_live_memory_delta_log()
         live_memory_writer = start_live_memory_writer(
             LiveMemoryWriterConfig(
                 memory_dir=str(main_memory_dir),
                 queue_maxsize=int(jobs[0].get("live_memory_queue_maxsize", 100_000) or 100_000),
                 batch_size=int(jobs[0].get("live_memory_batch_size", 1000) or 1000),
                 flush_seconds=float(jobs[0].get("live_memory_flush_seconds", 2.0) or 2.0),
+                delta_log=live_memory_delta_log,
             ),
             live_memory_queue,
         )
         live_memory_summary_path = str(Path(str(main_memory_dir)) / "live_memory_summary.json")
         for job in jobs:
             job["live_memory_queue"] = live_memory_queue
+            job["live_memory_delta_log"] = live_memory_delta_log
     if direct_streaming_fold_enabled and main_memory_dir is not None:
         direct_fold_writer = DirectStreamingFoldWriter(
             DirectStreamingFoldConfig(
@@ -922,7 +927,6 @@ def _run_sampling_jobs(
         if max_tasks_per_child > 0:
             executor_kwargs["max_tasks_per_child"] = max_tasks_per_child
         if snapshot_job is not None:
-            print("worker startup: loading process-local memory snapshots", file=sys.stderr, flush=True)
             executor_kwargs["initializer"] = _initialize_worker_memory_snapshot
             executor_kwargs["initargs"] = (
                 str(snapshot_job["memory_input_dir"]),
@@ -936,22 +940,6 @@ def _run_sampling_jobs(
             while active_futures:
                 done, _pending = wait(active_futures, timeout=0.5, return_when=FIRST_COMPLETED)
                 if not done:
-                    now = time.monotonic()
-                    if now - last_progress_log >= 10.0:
-                        queue_depth = 0
-                        if live_memory_queue is not None:
-                            try:
-                                queue_depth = int(live_memory_queue.qsize())
-                            except (AttributeError, NotImplementedError, OSError):
-                                queue_depth = -1
-                        oldest = max((now - started for started in job_started_at.values()), default=0.0)
-                        print(
-                            f"sampling workers alive; initialized/active={len(active_futures)} "
-                            f"pending={pending_jobs_remaining} writer_queue_depth={queue_depth} oldest_job_seconds={oldest:.1f}",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                        last_progress_log = now
                     if _maybe_ramp():
                         _submit_until_target(executor)
                     continue
@@ -1120,6 +1108,8 @@ def _export_sampling_sqlite_to_parquet(config: InteractionSamplingConfig, sampli
 _WORKER_MEMORY_SNAPSHOT: WorkerMemorySnapshot | None = None
 _WORKER_MEMORY_QUERY_ENGINE: SnapshotMemoryQueryEngine | None = None
 _WORKER_MEMORY_INIT_METRICS: dict[str, object] = {}
+_WORKER_MEMORY_SNAPSHOT_INIT_COUNT = 0
+_WORKER_MEMORY_RESTORE_REPORTED = False
 
 
 class _SnapshotEnvironment:
@@ -1133,11 +1123,10 @@ def _initialize_worker_memory_snapshot(
     include_graph: bool,
     include_substrate: bool,
 ) -> None:
-    global _WORKER_MEMORY_SNAPSHOT, _WORKER_MEMORY_QUERY_ENGINE, _WORKER_MEMORY_INIT_METRICS
+    global _WORKER_MEMORY_SNAPSHOT, _WORKER_MEMORY_QUERY_ENGINE, _WORKER_MEMORY_INIT_METRICS, _WORKER_MEMORY_SNAPSHOT_INIT_COUNT, _WORKER_MEMORY_RESTORE_REPORTED
     if not memory_dir:
         return
     started = time.perf_counter()
-    print("worker memory snapshot build: starting", flush=True)
     metadata: dict[str, object] = {
             "epoch_id": "worker_snapshot",
             "compact_memory_generation": None,
@@ -1171,6 +1160,8 @@ def _initialize_worker_memory_snapshot(
     )
     _WORKER_MEMORY_SNAPSHOT = snapshot
     _WORKER_MEMORY_QUERY_ENGINE = SnapshotMemoryQueryEngine(snapshot)
+    _WORKER_MEMORY_SNAPSHOT_INIT_COUNT += 1
+    _WORKER_MEMORY_RESTORE_REPORTED = False
     _WORKER_MEMORY_INIT_METRICS = {
             "memory_snapshot_version": dict(snapshot.version_metadata),
             "memory_snapshot_bytes": int(snapshot.snapshot_bytes),
@@ -1178,14 +1169,17 @@ def _initialize_worker_memory_snapshot(
             "memory_graph_restore_seconds": float(snapshot.graph_restore_seconds),
             "memory_substrate_restore_seconds": float(snapshot.substrate_restore_seconds),
     }
-    print(
-            f"worker memory snapshot build: done bytes={snapshot.snapshot_bytes} "
-            f"restore_seconds={snapshot.restore_seconds:.3f}",
-            flush=True,
-    )
+
+
+def _worker_memory_snapshot_probe(delay_seconds: float = 0.0) -> tuple[int, int, int]:
+    """Test-only observable proving one process-local snapshot is reused."""
+    if delay_seconds > 0.0:
+        time.sleep(float(delay_seconds))
+    return os.getpid(), id(_WORKER_MEMORY_SNAPSHOT), int(_WORKER_MEMORY_SNAPSHOT_INIT_COUNT)
 
 
 def _run_sampling_job(job: dict) -> dict:
+    global _WORKER_MEMORY_RESTORE_REPORTED
     db_path = Path(str(job["db_path"]))
     db_path.parent.mkdir(parents=True, exist_ok=True)
     sampler_name = str(job["sampler_name"])
@@ -1214,14 +1208,17 @@ def _run_sampling_job(job: dict) -> dict:
         live_memory_worker_id=f"{job['game']}:{sampler_name}:seed{seed}",
         live_memory_refresh_steps=int(job.get("live_memory_refresh_steps", 250) or 250),
     )
+    use_worker_snapshot = str(job.get("memory_snapshot_mode", "worker_local")) == "worker_local" and _WORKER_MEMORY_SNAPSHOT is not None
+    if use_worker_snapshot and _WORKER_MEMORY_QUERY_ENGINE is not None:
+        _WORKER_MEMORY_QUERY_ENGINE.reset_metrics()
     live_memory_cache = None
     if str(job.get("shared_live_memory", "none") or "none") == "readwrite" and job.get("memory_output_dir"):
         live_memory_cache = LiveMemoryReadCache(
             memory_dir=str(job["memory_output_dir"]),
             refresh_steps=int(job.get("live_memory_refresh_steps", 250) or 250),
+            delta_log=job.get("live_memory_delta_log") if use_worker_snapshot else None,
         )
     try:
-        use_worker_snapshot = str(job.get("memory_snapshot_mode", "worker_local")) == "worker_local" and _WORKER_MEMORY_SNAPSHOT is not None
         system_kwargs = {
             "env": env,
             "config": system_config,
@@ -1285,7 +1282,25 @@ def _run_sampling_job(job: dict) -> dict:
             sampler_memory_guided_summary = dict(sampler.memory_guided_summary())
         if hasattr(system, "memory_access_metrics"):
             memory_access_summary = dict(system.memory_access_metrics())
+        if use_worker_snapshot and _WORKER_MEMORY_RESTORE_REPORTED:
+            for key in (
+                "memory_restore_seconds",
+                "memory_graph_restore_seconds",
+                "memory_substrate_restore_seconds",
+                "memory_snapshot_restore_seconds",
+            ):
+                memory_access_summary[key] = 0.0
         memory_access_summary.update(_WORKER_MEMORY_INIT_METRICS)
+        if use_worker_snapshot and _WORKER_MEMORY_RESTORE_REPORTED:
+            for key in (
+                "memory_restore_seconds",
+                "memory_graph_restore_seconds",
+                "memory_substrate_restore_seconds",
+                "memory_snapshot_restore_seconds",
+            ):
+                memory_access_summary[key] = 0.0
+        if use_worker_snapshot:
+            _WORKER_MEMORY_RESTORE_REPORTED = True
     finally:
         system.close()
     _write_sampling_metadata(

@@ -23,20 +23,106 @@ from v6.memory.compact_memory import stable_family_int_id
 from v6.memory.compact_memory_restore import _context_signature_from_canonical_key
 
 
+def _family_id(node_id: str) -> int | None:
+    if not str(node_id).startswith("M2:family:"):
+        return None
+    try:
+        return int(str(node_id).rsplit(":", 1)[-1])
+    except ValueError:
+        return None
+
+
+def _build_role_and_concept_indexes(
+    nodes: Mapping[str, dict],
+    edges_from: Mapping[tuple[str, str | None], list[dict]],
+    edges_to: Mapping[tuple[str, str | None], list[dict]],
+) -> tuple[dict[str, dict], dict[int, list[str]], dict[str, list[str]], list[str], dict[str, dict], dict[str, list[str]]]:
+    """Precompute the role/concept traversal used by MemoryQueryEngine."""
+    role_specs: dict[str, dict] = {}
+    by_action: dict[int, list[str]] = {}
+    by_context: dict[str, list[str]] = {}
+    default_roles: list[str] = []
+    for role_id, role in nodes.items():
+        if str(role.get("memory_level")) != "M3" or str(role.get("node_type")) != "FunctionalRoleMemory":
+            continue
+        attrs = dict(role.get("attrs") or {})
+        carrier_ids = [str(edge["source_node_id"]) for edge in edges_to.get((role_id, "plays_role"), ())]
+        families: list[int] = []
+        actions: set[int] = set()
+        contexts: set[str] = set()
+        for carrier_id in carrier_ids:
+            for edge in edges_from.get((carrier_id, "associated_with_family"), ()):
+                family = _family_id(str(edge["target_node_id"]))
+                if family is not None:
+                    families.append(family)
+            for edge in edges_from.get((carrier_id, "appears_in_context"), ()):
+                contexts.add(str(edge["target_node_id"]))
+            for interaction_edge in edges_from.get((carrier_id, "carried_by"), ()):
+                interaction_id = str(interaction_edge["target_node_id"])
+                for action_edge in edges_from.get((interaction_id, "takes_action"), ()):
+                    try:
+                        actions.add(int(str(action_edge["target_node_id"]).rsplit(":", 1)[-1]))
+                    except ValueError:
+                        continue
+        role_specs[role_id] = {
+            "node_id": role_id,
+            "base_transfer_score": float(attrs.get("transfer_score", 0.0) or 0.0),
+            "family_ids": tuple(families),
+            "actions": frozenset(actions),
+            "contexts": frozenset(contexts),
+        }
+        if float(attrs.get("transfer_score", 0.0) or 0.0) > 0.0:
+            default_roles.append(role_id)
+        for action in actions:
+            by_action.setdefault(action, []).append(role_id)
+        for context in contexts:
+            by_context.setdefault(context, []).append(role_id)
+
+    concept_specs: dict[str, dict] = {}
+    concept_by_role: dict[str, list[str]] = {}
+    for concept_id, concept in nodes.items():
+        if str(concept.get("memory_level")) != "M4" or str(concept.get("node_type")) != "ConceptMemory":
+            continue
+        role_ids = [str(edge["source_node_id"]) for edge in edges_to.get((concept_id, "transfers_to"), ())]
+        family_ids: list[int] = []
+        for role_id in role_ids:
+            for carrier_edge in edges_from.get((role_id, "abstracts_from"), ()):
+                for family_edge in edges_from.get((str(carrier_edge["target_node_id"]), "associated_with_family"), ()):
+                    family = _family_id(str(family_edge["target_node_id"]))
+                    if family is not None:
+                        family_ids.append(family)
+            concept_by_role.setdefault(role_id, []).append(concept_id)
+        concept_specs[concept_id] = {
+            "node_id": concept_id,
+            "role_ids": tuple(role_ids),
+            "family_ids": tuple(family_ids),
+            "transfer_success_count": float(dict(concept.get("attrs") or {}).get("transfer_success_count", 0) or 0),
+        }
+    return role_specs, by_action, by_context, default_roles, concept_specs, concept_by_role
+
+
 @dataclass(frozen=True)
 class WorkerMemorySnapshot:
     version: int
     version_metadata: Mapping[str, Any]
+    exact_contingencies_by_context_action: Mapping[tuple[tuple, int], tuple[dict, ...]]
     stable_contingencies_by_context_action: Mapping[tuple[tuple, int], tuple[dict, ...]]
     family_scores_by_context_action: Mapping[tuple[tuple, int], tuple[dict, ...]]
     replay_candidates_by_context_action: Mapping[tuple[tuple, int], tuple[dict, ...]]
     carrier_candidates_by_context: Mapping[str, tuple[dict, ...]]
     future_option_scores_by_context_action: Mapping[tuple[str, int], tuple[float, ...]]
+    action_evidence_node_ids_by_action: Mapping[int, tuple[str, ...]]
     graph_adjacency: Mapping[str, tuple[dict, ...]]
     substrate_nodes: Mapping[str, dict]
     substrate_scores: Mapping[str, dict]
     substrate_edges_from: Mapping[tuple[str, str | None], tuple[dict, ...]]
     substrate_edges_to: Mapping[tuple[str, str | None], tuple[dict, ...]]
+    role_specs: Mapping[str, dict]
+    role_ids_by_action: Mapping[int, tuple[str, ...]]
+    role_ids_by_context_node: Mapping[str, tuple[str, ...]]
+    default_role_ids: tuple[str, ...]
+    concept_specs: Mapping[str, dict]
+    concept_ids_by_role: Mapping[str, tuple[str, ...]]
     snapshot_bytes: int
     restore_seconds: float
     graph_restore_seconds: float
@@ -106,7 +192,29 @@ class WorkerMemorySnapshot:
                     edges_to.setdefault((str(row[1]), str(row[2])), []).append(edge)
                     edges_to.setdefault((str(row[1]), None), []).append(edge)
 
+        exact_contingencies: dict[tuple[tuple, int], list[dict]] = {}
+        for node in nodes.values():
+            if str(node.get("memory_level")) != "M1" or str(node.get("node_type")) != "ContingencyMemory":
+                continue
+            attrs = dict(node.get("attrs") or {})
+            try:
+                context = tuple(json.loads(str(attrs.get("context_signature") or "[]")))
+                action = int(attrs.get("action"))
+                family = int(attrs.get("transformation_family"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            exact_contingencies.setdefault((context, action), []).append(
+                {
+                    "node_id": str(node["node_id"]),
+                    "family": family,
+                    "confidence": float(attrs.get("confidence", 0.0) or 0.0),
+                }
+            )
+
         future_by_action: dict[tuple[str, int], list[float]] = {}
+        action_evidence_nodes: dict[int, list[str]] = {}
+        replay_by_action: dict[tuple[tuple, int], list[dict]] = {}
+        carrier_by_context: dict[str, list[dict]] = {}
         for (target, edge_type), rows in edges_to.items():
             if edge_type != "takes_action":
                 continue
@@ -115,9 +223,32 @@ class WorkerMemorySnapshot:
             except ValueError:
                 continue
             for edge in rows:
+                action_evidence_nodes.setdefault(action, []).append(str(edge["source_node_id"]))
                 score = scores.get(str(edge["source_node_id"]), {}).get("future_option_delta")
                 if score is not None:
                     future_by_action.setdefault(("", action), []).append(float(score))
+                replay = scores.get(str(edge["source_node_id"]), {}).get("replay_priority")
+                if replay is not None:
+                    replay_by_action.setdefault(((), action), []).append(
+                        {"node_id": str(edge["source_node_id"]), "replay_priority": float(replay)}
+                    )
+
+        for (source, edge_type), rows in edges_from.items():
+            if edge_type != "appears_in_context":
+                continue
+            for edge in rows:
+                carrier_by_context.setdefault(str(edge["target_node_id"]), []).append(
+                    {"node_id": str(source), "weight": float(edge.get("weight", 1.0) or 1.0)}
+                )
+
+        (
+            role_specs,
+            role_ids_by_action,
+            role_ids_by_context_node,
+            default_role_ids,
+            concept_specs,
+            concept_ids_by_role,
+        ) = _build_role_and_concept_indexes(nodes, edges_from, edges_to)
 
         graph_adjacency: dict[str, list[dict]] = {}
         graph = getattr(system, "graph", None)
@@ -141,16 +272,24 @@ class WorkerMemorySnapshot:
         return cls(
             version=1,
             version_metadata=MappingProxyType(metadata),
+            exact_contingencies_by_context_action=MappingProxyType({key: tuple(value) for key, value in exact_contingencies.items()}),
             stable_contingencies_by_context_action=MappingProxyType({key: tuple(value) for key, value in contingencies.items()}),
-            family_scores_by_context_action=MappingProxyType({}),
-            replay_candidates_by_context_action=MappingProxyType({}),
-            carrier_candidates_by_context=MappingProxyType({}),
+            family_scores_by_context_action=MappingProxyType({key: tuple(value) for key, value in contingencies.items()}),
+            replay_candidates_by_context_action=MappingProxyType({key: tuple(value) for key, value in replay_by_action.items()}),
+            carrier_candidates_by_context=MappingProxyType({key: tuple(value) for key, value in carrier_by_context.items()}),
             future_option_scores_by_context_action=MappingProxyType({key: tuple(value) for key, value in future_by_action.items()}),
+            action_evidence_node_ids_by_action=MappingProxyType({key: tuple(value) for key, value in action_evidence_nodes.items()}),
             graph_adjacency=MappingProxyType({key: tuple(value) for key, value in graph_adjacency.items()}),
             substrate_nodes=MappingProxyType(nodes),
             substrate_scores=MappingProxyType(scores),
             substrate_edges_from=MappingProxyType({key: tuple(value) for key, value in edges_from.items()}),
             substrate_edges_to=MappingProxyType({key: tuple(value) for key, value in edges_to.items()}),
+            role_specs=MappingProxyType(role_specs),
+            role_ids_by_action=MappingProxyType({key: tuple(value) for key, value in role_ids_by_action.items()}),
+            role_ids_by_context_node=MappingProxyType({key: tuple(value) for key, value in role_ids_by_context_node.items()}),
+            default_role_ids=tuple(default_role_ids),
+            concept_specs=MappingProxyType(concept_specs),
+            concept_ids_by_role=MappingProxyType({key: tuple(value) for key, value in concept_ids_by_role.items()}),
             snapshot_bytes=int(snapshot_bytes),
             restore_seconds=float(restore_seconds),
             graph_restore_seconds=float(graph_restore_seconds),
@@ -255,9 +394,13 @@ class WorkerMemoryOverlay:
     graph_edges: dict[tuple[str, str, str], dict] = field(default_factory=dict)
     last_sequence: int = 0
 
-    def apply_rows(self, rows: list[dict[str, Any]], sequence: int) -> int:
+    def apply_rows(self, rows: list[dict[str, Any]], sequence: int | None = None) -> int:
         applied = 0
         for row in rows:
+            has_row_sequence = row.get("sequence") is not None
+            row_sequence = int(row.get("sequence", 0) or 0)
+            if has_row_sequence and row_sequence <= self.last_sequence:
+                continue
             payload = dict(row.get("payload") or row)
             event_type = str(row.get("event_type") or payload.get("event_type") or "")
             if event_type == "stable_contingency":
@@ -274,7 +417,10 @@ class WorkerMemoryOverlay:
                 key = (str(payload.get("source_node_id")), str(payload.get("target_node_id")), str(payload.get("edge_type")))
                 self.graph_edges[key] = payload
             applied += 1
-        self.last_sequence = max(int(self.last_sequence), int(sequence))
+            if has_row_sequence:
+                self.last_sequence = max(int(self.last_sequence), row_sequence)
+        if sequence is not None:
+            self.last_sequence = max(int(self.last_sequence), int(sequence))
         return applied
 
 
@@ -292,11 +438,28 @@ class SnapshotMemoryQueryEngine:
         self.cache_hit_count = 0
         self.cache_miss_count = 0
 
+    def reset_metrics(self) -> None:
+        self.memory_query_count = 0
+        self.memory_query_seconds = 0.0
+        self.memory_action_rank_count = 0
+        self.memory_action_rank_seconds = 0.0
+        self.sqlite_queries_during_action_selection = 0
+        self.cache_hit_count = 0
+        self.cache_miss_count = 0
+
     def _best_context_signature(self, context_signatures: dict[int, tuple], action: int) -> tuple:
         if not context_signatures:
             return (int(action),)
         max_level = max(int(level) for level in context_signatures)
         return tuple(context_signatures.get(max_level, next(iter(context_signatures.values()))))
+
+    def _exact_contingency(self, contexts: dict[int, tuple], action: int) -> dict | None:
+        for signature in contexts.values():
+            target = tuple(signature)
+            candidates = self.snapshot.exact_contingencies_by_context_action.get((target, int(action)), ())
+            if candidates:
+                return candidates[0]
+        return None
 
     def _contingency(self, contexts: dict[int, tuple], action: int) -> dict | None:
         for level in sorted(contexts, reverse=True):
@@ -314,16 +477,33 @@ class SnapshotMemoryQueryEngine:
     def predict_family(self, context_signatures: dict[int, tuple], action: int, *, record_query: bool = False) -> MemoryPrediction:
         started = time.perf_counter()
         self.memory_query_count += 1
-        exact = self._contingency(context_signatures, action)
-        if exact is None:
-            result = MemoryPrediction(None, 0.0, "none", [])
-        else:
+        exact = self._exact_contingency(context_signatures, action)
+        if exact is not None:
             result = MemoryPrediction(
-                predicted_family=int(exact.get("family", exact.get("transformation_family", 0))),
+                predicted_family=int(exact.get("family", 0)),
                 confidence=float(exact.get("confidence", 0.0) or 0.0),
                 source="memory_contingency",
                 evidence_node_ids=[str(exact.get("node_id", ""))],
             )
+        else:
+            stable = self._contingency(context_signatures, action)
+            if stable is not None:
+                result = MemoryPrediction(
+                    predicted_family=int(stable.get("family", stable.get("transformation_family", 0))),
+                    confidence=float(stable.get("confidence", 0.0) or 0.0),
+                    source="contingency_learner",
+                    evidence_node_ids=[],
+                )
+            else:
+                best_context_signature = json.dumps(list(self._best_context_signature(context_signatures, action)))
+                role_matches = self.find_similar_roles(best_context_signature, action)
+                concept_matches = self.find_concept_matches(best_context_signature, action, role_matches=role_matches)
+                if role_matches and role_matches[0].get("family_id") is not None:
+                    result = MemoryPrediction(role_matches[0]["family_id"], float(role_matches[0]["score"]), "role_match", [str(role_matches[0]["node_id"])])
+                elif concept_matches and concept_matches[0].get("family_id") is not None:
+                    result = MemoryPrediction(concept_matches[0]["family_id"], float(concept_matches[0]["score"]), "concept_match", [str(concept_matches[0]["node_id"])])
+                else:
+                    result = MemoryPrediction(None, 0.0, "none", [])
         self.memory_query_seconds += time.perf_counter() - started
         return result
 
@@ -339,14 +519,12 @@ class SnapshotMemoryQueryEngine:
             "completion_likelihood": positive / len(deltas) if deltas else 0.0,
             "sources": ["future_option_memory"] if deltas else [],
         }
-        contradiction = any(
-            self._edges_from(str(edge.get("source_node_id")), "violates_prediction")
-            for edge in self._edges_to(action_node_id(action), "takes_action")
-        )
+        source_nodes = self.snapshot.action_evidence_node_ids_by_action.get(int(action), ())
+        contradiction = any(self._edges_from(source_node_id, "violates_prediction") for source_node_id in source_nodes)
         failure = {
-            "failure_risk": sum(1 for value in deltas if value < 0.0) / len(deltas) if deltas else 0.0,
+            "failure_risk": sum(1 for value in deltas if value < 0.0) / len(source_nodes) if source_nodes else 0.0,
             "contradiction_evidence": contradiction,
-            "sources": ["failure_path_memory"] if deltas else [],
+            "sources": ["failure_path_memory"] if source_nodes else [],
         }
         return future, failure
 
@@ -358,28 +536,15 @@ class SnapshotMemoryQueryEngine:
 
     def find_similar_roles(self, context_signature: str, action: int) -> list[dict]:
         context_node_id = "M0:context:" + sha1(str(context_signature).encode("utf-8")).hexdigest()[:20]
-        target_action_node = action_node_id(action)
         matches: list[dict] = []
-        for role in self.snapshot.substrate_nodes.values():
-            if str(role.get("node_type")) != "FunctionalRoleMemory":
-                continue
-            attrs = dict(role.get("attrs") or {})
-            score = float(attrs.get("transfer_score", 0.0) or 0.0)
-            action_match = False
-            context_match = False
-            family_ids: list[int] = []
-            for carrier_edge in self._edges_to(str(role.get("node_id")), "plays_role"):
-                carrier_id = str(carrier_edge.get("source_node_id"))
-                for family_edge in self._edges_from(carrier_id, "associated_with_family"):
-                    family_id = str(family_edge.get("target_node_id"))
-                    if family_id.startswith("M2:family:"):
-                        try:
-                            family_ids.append(int(family_id.rsplit(":", 1)[-1]))
-                        except ValueError:
-                            pass
-                context_match = context_match or any(str(item.get("target_node_id")) == context_node_id for item in self._edges_from(carrier_id, "appears_in_context"))
-                for interaction_edge in self._edges_from(carrier_id, "carried_by"):
-                    action_match = action_match or any(str(item.get("target_node_id")) == target_action_node for item in self._edges_from(str(interaction_edge.get("target_node_id")), "takes_action"))
+        role_ids = set(self.snapshot.default_role_ids)
+        role_ids.update(self.snapshot.role_ids_by_action.get(int(action), ()))
+        role_ids.update(self.snapshot.role_ids_by_context_node.get(context_node_id, ()))
+        for role_id in role_ids:
+            role = self.snapshot.role_specs[role_id]
+            score = float(role["base_transfer_score"])
+            action_match = int(action) in role["actions"]
+            context_match = context_node_id in role["contexts"]
             if action_match:
                 score += 0.25
             if context_match:
@@ -388,35 +553,29 @@ class SnapshotMemoryQueryEngine:
                 score *= 0.25
             score = max(0.0, min(1.0, score))
             if score > 0.0:
-                matches.append({"node_id": role.get("node_id"), "score": score, "family_id": family_ids[0] if family_ids else None, "action_match": action_match, "context_match": context_match})
+                family_ids = role["family_ids"]
+                matches.append({"node_id": role_id, "score": score, "family_id": family_ids[0] if family_ids else None, "action_match": action_match, "context_match": context_match})
         return sorted(matches, key=lambda item: (-float(item["score"]), str(item["node_id"])))
 
-    def find_concept_matches(self, context_signature: str, action: int) -> list[dict]:
+    def find_concept_matches(self, context_signature: str, action: int, *, role_matches: list[dict] | None = None) -> list[dict]:
         matches: list[dict] = []
-        role_matches = self.find_similar_roles(context_signature, action)
+        role_matches = role_matches if role_matches is not None else self.find_similar_roles(context_signature, action)
         role_by_id = {str(item["node_id"]): item for item in role_matches}
-        for concept in self.snapshot.substrate_nodes.values():
-            if str(concept.get("node_type")) != "ConceptMemory":
-                continue
+        concept_ids: set[str] = set()
+        for role_id in role_by_id:
+            concept_ids.update(self.snapshot.concept_ids_by_role.get(role_id, ()))
+        for concept_id in concept_ids:
+            concept = self.snapshot.concept_specs[concept_id]
             best_role_score = 0.0
-            family_ids: list[int] = []
-            for role_edge in self._edges_to(str(concept.get("node_id")), "transfers_to"):
-                role_id = str(role_edge.get("source_node_id"))
+            for role_id in concept["role_ids"]:
                 role_match = role_by_id.get(role_id)
                 if role_match and role_match.get("action_match"):
                     best_role_score = max(best_role_score, float(role_match.get("score", 0.0)))
-                for carrier_edge in self._edges_from(role_id, "abstracts_from"):
-                    for family_edge in self._edges_from(str(carrier_edge.get("target_node_id")), "associated_with_family"):
-                        family_id = str(family_edge.get("target_node_id"))
-                        if family_id.startswith("M2:family:"):
-                            try:
-                                family_ids.append(int(family_id.rsplit(":", 1)[-1]))
-                            except ValueError:
-                                pass
-            transfer_count = float(dict(concept.get("attrs") or {}).get("transfer_success_count", 0) or 0) / 3.0
+            transfer_count = float(concept["transfer_success_count"]) / 3.0
             score = max(0.0, min(1.0, best_role_score * min(1.0, transfer_count)))
             if score > 0.0:
-                matches.append({"node_id": concept.get("node_id"), "score": score, "family_id": family_ids[0] if family_ids else None})
+                family_ids = concept["family_ids"]
+                matches.append({"node_id": concept_id, "score": score, "family_id": family_ids[0] if family_ids else None})
         return sorted(matches, key=lambda item: (-float(item["score"]), str(item["node_id"])))
 
     def score_action(self, context_signatures: dict[int, tuple], action: int, available_actions: list[int], *, record_query: bool = False) -> MemoryActionScore:
@@ -426,7 +585,7 @@ class SnapshotMemoryQueryEngine:
         future, failure = self._future_and_failure(self._best_context_signature(context_signatures, action), action)
         best_context = json.dumps(list(self._best_context_signature(context_signatures, action)))
         role_matches = self.find_similar_roles(best_context, action)
-        concept_matches = self.find_concept_matches(best_context, action)
+        concept_matches = self.find_concept_matches(best_context, action, role_matches=role_matches)
         transfer_score = max(
             float(role_matches[0].get("score", 0.0)) if role_matches else 0.0,
             float(concept_matches[0].get("score", 0.0)) if concept_matches else 0.0,
