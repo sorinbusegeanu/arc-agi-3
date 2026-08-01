@@ -229,7 +229,15 @@ def build_parser() -> argparse.ArgumentParser:
     diagnostics.add_argument("--keep-generated-dbs", action="store_true", help="Keep generated v0.2 SQLite databases after extracting v0.5b diagnostics.")
 
     sampling = subparsers.add_parser("interaction-sampling-v05c")
-    sampling.add_argument("--games", default="failed_representatives")
+    sampling.add_argument(
+        "--games",
+        default="failed_representatives",
+        help=(
+            "Game IDs or named sets: all, broad, failed_representatives, passing_references, "
+            "foundation, transformation, context, role_transfer, future_enable, future_block, "
+            "future_reversible, future_terminate, bridge, transfer_validation, falsification, diverse"
+        ),
+    )
     sampling.add_argument("--samplers", default="random_baseline,action_balance,no_change_avoidance,low_confidence,novelty_delta,mixed,reset_aware_mixed")
     sampling.add_argument("--seeds", default="0,1,2")
     sampling.add_argument("--steps", type=int, default=30000)
@@ -607,7 +615,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     continuous = subparsers.add_parser("continuous-research-run")
     continuous.add_argument("--experiment-name", required=True)
-    continuous.add_argument("--games", default="all")
+    continuous.add_argument(
+        "--games",
+        default="all",
+        help=(
+            "Game IDs or named sets: all, broad, failed_representatives, passing_references, "
+            "foundation, transformation, context, role_transfer, future_enable, future_block, "
+            "future_reversible, future_terminate, bridge, transfer_validation, falsification, diverse"
+        ),
+    )
     continuous.add_argument("--samplers", default="random_baseline,low_confidence,novelty_delta,mixed,reset_aware_mixed")
     continuous.add_argument("--seeds", default="0")
     continuous.add_argument("--steps-per-epoch", type=int, default=5000)

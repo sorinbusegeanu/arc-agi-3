@@ -50,6 +50,127 @@ from v6.storage.migration import migrate_sqlite_to_parquet
 FAILED_REPRESENTATIVES = ("tt01", "pb02", "fs02", "tp02", "gr01")
 PASSING_REFERENCES = ("va02", "mo01")
 DEFAULT_V05C_GAMES = FAILED_REPRESENTATIVES + PASSING_REFERENCES
+FOUNDATION_GAMES = (
+    "ez01", "ez02", "ez03", "ez04",
+    "ul01", "tt01", "pb01", "fs01", "ic01", "va01",
+)
+TRANSFORMATION_GAMES = (
+    "pb01", "pb02", "pb03",
+    "sk01", "sk02", "sk03",
+    "ci01", "op01", "rz01", "mb01", "tk01",
+    "ic01", "ic02", "ic03",
+    "fs01", "fs02", "fs03",
+    "tp01", "tp02", "tp03",
+    "ml01", "ml02", "ml03",
+    "tb01", "tb02", "tb03",
+    "cr01", "rn01", "wl01", "dr01", "dg01", "mx01",
+)
+CONTEXT_GAMES = (
+    "ul01", "ul02", "ul03",
+    "fs01", "fs02", "fs03",
+    "tp01", "tp02", "tp03",
+    "ic01", "ic02", "ic03",
+    "nw01", "nw02", "nw03",
+    "rs01", "rs02", "rs03",
+    "zq01", "zq02", "zq03",
+    "ex01", "ex02", "ex03",
+    "va01", "va02", "va03",
+    "bd01", "hm01", "gl01", "tr01", "vp01", "cf01",
+)
+ROLE_TRANSFER_GAMES = (
+    "ul01", "ul02", "ul03",
+    "fs01", "fs02", "fs03",
+    "co01",
+    "ex01", "ex02", "ex03",
+    "tb01", "tb02", "tb03",
+    "cr01", "rn01", "wl01",
+    "fi01", "fw01", "hd01", "bp01", "dd01", "as01",
+)
+FUTURE_ENABLE_GAMES = (
+    "ul01", "ul02", "ul03",
+    "fs01", "fs02", "fs03",
+    "co01",
+    "tb01", "tb02", "tb03",
+    "cr01", "rn01", "wl01",
+    "fi01", "fw01", "mx01", "dr01", "dg01",
+    "ex01", "ex02", "ex03",
+    "bp01",
+)
+FUTURE_BLOCK_GAMES = (
+    "pb01", "pb02", "pb03",
+    "sk01", "sk02", "sk03",
+    "ci01", "rz01", "op01", "mb01", "fb01",
+    "va02", "bd01", "hm01", "vp01", "gl01", "tr01",
+    "cf01", "in01", "wk01", "lf01", "rh01", "hz01",
+    "zq01", "zq02", "zq03",
+)
+FUTURE_REVERSIBLE_GAMES = (
+    "pb01", "fs01",
+    "tp01", "tp02",
+    "ic01", "ic02", "ic03",
+    "nw01", "nw02", "nw03",
+    "rs01", "rs02", "rs03",
+    "ex01", "ex02", "ex03",
+    "rc01", "bl01", "sw01", "dv01", "dp01", "wr01",
+)
+FUTURE_TERMINATE_GAMES = (
+    "tt01", "tt02", "tt03",
+    "wm01", "wm02", "wm03",
+    "sv01", "sv02", "sv03",
+    "st01", "tg01", "hs01", "sc01", "vi01",
+    "fw01", "fi01", "fb01", "av01", "sb01",
+    "rh01", "lf01", "hz01",
+    "zq01", "zq02", "zq03",
+)
+BRIDGE_GAMES = (
+    "ul01", "ul02", "ul03",
+    "fs01", "fs02", "fs03",
+    "co01",
+    "tb01", "tb02", "tb03",
+    "cr01", "rn01", "wl01",
+    "fi01", "fw01",
+    "pb01", "pb02", "pb03",
+    "sk01", "sk02", "sk03",
+    "ci01",
+    "ic01", "ic02", "ic03",
+    "tp01", "tp02", "tp03",
+    "ex01", "ex02", "ex03",
+    "bp01", "dd01", "as01",
+)
+TRANSFER_VALIDATION_GAMES = (
+    "ul01", "ul02", "ul03",
+    "fs01", "fs02", "fs03",
+    "co01",
+    "pb01", "pb02", "pb03",
+    "sk01", "sk02", "sk03",
+    "ci01",
+    "tb01", "tb02", "tb03",
+    "cr01", "rn01", "wl01",
+    "ex01", "ex02", "ex03",
+    "tp01", "tp02", "tp03",
+    "ml01", "ml02", "ml03",
+    "bp01", "dd01", "as01",
+    "fi01", "fw01",
+)
+FALSIFICATION_GAMES = (
+    "ul01", "ul02", "ul03",
+    "fs01", "fs02", "fs03",
+    "co01",
+    "pb01", "pb03",
+    "sk02", "sk03",
+    "ci01",
+    "tp02", "tp03",
+    "tb02", "tb03",
+    "cr01", "rn01",
+    "ex02", "ex03",
+    "ml03", "nw03", "rs03", "zq03",
+    "dr01", "dg01", "mx01",
+    "fb01", "vi01",
+)
+DIVERSE_GAMES = (
+    "ez01", "ul01", "pb01", "fs01", "tp01",
+    "ic01", "tb01", "ex01", "bp01", "fw01",
+)
 DEFAULT_V05C_SAMPLERS = (
     "random_baseline",
     "action_balance",
@@ -63,6 +184,18 @@ V05C_GAME_PRESETS = {
     "failed_representatives": FAILED_REPRESENTATIVES,
     "passing_references": PASSING_REFERENCES,
     "broad": DEFAULT_V05C_GAMES,
+    "foundation": FOUNDATION_GAMES,
+    "transformation": TRANSFORMATION_GAMES,
+    "context": CONTEXT_GAMES,
+    "role_transfer": ROLE_TRANSFER_GAMES,
+    "future_enable": FUTURE_ENABLE_GAMES,
+    "future_block": FUTURE_BLOCK_GAMES,
+    "future_reversible": FUTURE_REVERSIBLE_GAMES,
+    "future_terminate": FUTURE_TERMINATE_GAMES,
+    "bridge": BRIDGE_GAMES,
+    "transfer_validation": TRANSFER_VALIDATION_GAMES,
+    "falsification": FALSIFICATION_GAMES,
+    "diverse": DIVERSE_GAMES,
 }
 DEFAULT_HIGH_REPLAY_PRIORITY_THRESHOLD = 0.70
 DEFAULT_STABLE_TRANSFORMATION_FAMILY_SUPPORT = 5
@@ -169,12 +302,23 @@ def resolve_game_ids(games_arg: str, env_root: str | None = None) -> list[str]:
     return selected
 
 
+def resolve_game_preset(preset_name: str, env_root: str | None = None) -> tuple[str, ...]:
+    games = tuple(dict.fromkeys(V05C_GAME_PRESETS[preset_name]))
+    available = tuple(sorted(registered_game_ids(env_root)))
+    if available:
+        invalid = [game_id for game_id in games if game_id not in available]
+        if invalid:
+            raise ValueError(
+                f"game preset '{preset_name}' contains invalid game ids: "
+                f"{', '.join(invalid)}. Valid installed IDs: {', '.join(available)}"
+            )
+    return games
+
+
 def parse_v05c_games(selector: str, env_root: str | None = None) -> tuple[str, ...]:
     value = selector.strip()
     if value in V05C_GAME_PRESETS:
-        return tuple(dict.fromkeys(V05C_GAME_PRESETS[value]))
-    if value == "all":
-        return tuple(resolve_game_ids(value, env_root))
+        return resolve_game_preset(value, env_root)
     return tuple(resolve_game_ids(value, env_root))
 
 
@@ -594,6 +738,7 @@ def _run_sampling_jobs(
     max_done_batch_size = 0
     seconds_spent_in_fold_submit_delay = 0.0
     sampling_pool_underfilled_seconds = 0.0
+    worker_ramp_blocked_by_ram = False
     ramp_start_time = time.monotonic()
     last_ramp_time = ramp_start_time
     main_memory_dir = next((str(job["memory_output_dir"]) for job in jobs if job.get("memory_output_dir")), None)
@@ -668,8 +813,10 @@ def _run_sampling_jobs(
         direct_fold_writer.start()
 
     def _maybe_ramp() -> bool:
-        nonlocal target_workers, last_ramp_time
+        nonlocal target_workers, last_ramp_time, worker_ramp_blocked_by_ram
         if not enable_worker_ramp or target_workers >= workers:
+            return False
+        if worker_ramp_blocked_by_ram:
             return False
         now = time.monotonic()
         required_delay = (
@@ -681,6 +828,7 @@ def _run_sampling_jobs(
             return False
         snapshot = _system_ram_snapshot()
         if float(snapshot["ram_used_percent"]) >= float(ram_ramp_threshold_percent):
+            worker_ramp_blocked_by_ram = True
             return False
         target_workers += 1
         last_ramp_time = now
@@ -804,6 +952,7 @@ def _run_sampling_jobs(
         "seconds_spent_in_fold_submit_delay": float(seconds_spent_in_fold_submit_delay),
         "sampling_pool_underfilled_seconds": float(sampling_pool_underfilled_seconds),
         "max_tasks_per_child": int(max_tasks_per_child),
+        "worker_ramp_blocked_by_ram": bool(worker_ramp_blocked_by_ram),
         "worker_ramp_enabled": bool(enable_worker_ramp),
         "ram_ramp_threshold_percent": float(ram_ramp_threshold_percent),
         "initial_worker_ramp_delay_seconds": float(initial_worker_ramp_delay_seconds),

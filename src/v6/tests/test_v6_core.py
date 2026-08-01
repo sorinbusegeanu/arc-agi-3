@@ -79,13 +79,17 @@ from v6.evaluation.id_free_prefuture_validation import (
     write_id_free_reports,
 )
 from v6.evaluation.interaction_sampling import (
+    FAILED_REPRESENTATIVES,
     InteractionSamplingConfig,
+    PASSING_REFERENCES,
     _apply_future_option_efficiency_diagnostics,
     _future_option_deltas_by_interaction_id,
     best_by_game as sampling_best_by_game,
     parse_v05c_games,
     parse_v05c_samplers,
+    V05C_GAME_PRESETS,
     resolve_game_ids,
+    resolve_game_preset,
     resolve_interaction_sampling_scope,
     sampler_comparison_rows,
     sampling_db_path,
@@ -4450,7 +4454,12 @@ def test_v05b_report_generation(tmp_path) -> None:
     assert (tmp_path / "failure_diagnostics_v05b_recommended_next_steps.txt").exists()
 
 
-def test_v05c_sampler_registry_and_aliases() -> None:
+def test_v05c_sampler_registry_and_aliases(monkeypatch) -> None:
+    monkeypatch.setattr(
+        interaction_sampling,
+        "registered_game_ids",
+        lambda env_root=None: tuple(dict.fromkeys(FAILED_REPRESENTATIVES + PASSING_REFERENCES)),
+    )
     registry = sampler_registry()
 
     assert "random_baseline" in registry
@@ -4460,6 +4469,46 @@ def test_v05c_sampler_registry_and_aliases() -> None:
     assert parse_v05c_samplers("random_baseline,reset_aware_mixed") == ("random_baseline", "reset_aware_mixed")
     assert "tt01" in parse_v05c_games("failed_representatives")
     assert InteractionSamplingConfig().commit_steps == 5000
+
+
+def test_v05c_named_presets_resolve_in_order(monkeypatch) -> None:
+    monkeypatch.setattr(interaction_sampling, "registered_game_ids", lambda env_root=None: V05C_GAME_PRESETS["diverse"] + V05C_GAME_PRESETS["bridge"])
+
+    assert parse_v05c_games("diverse") == (
+        "ez01", "ul01", "pb01", "fs01", "tp01", "ic01", "tb01", "ex01", "bp01", "fw01"
+    )
+    assert parse_v05c_games("bridge") == V05C_GAME_PRESETS["bridge"]
+
+
+def test_v05c_preset_duplicates_are_removed(monkeypatch) -> None:
+    monkeypatch.setattr(interaction_sampling, "registered_game_ids", lambda env_root=None: ("pb01", "fs01"))
+    monkeypatch.setitem(V05C_GAME_PRESETS, "duplicate_test", ("pb01", "fs01", "pb01"))
+
+    assert resolve_game_preset("duplicate_test") == ("pb01", "fs01")
+
+
+def test_v05c_invalid_preset_game_id_errors_with_installed_ids(monkeypatch) -> None:
+    monkeypatch.setattr(interaction_sampling, "registered_game_ids", lambda env_root=None: ("pb01", "fs01"))
+    monkeypatch.setitem(V05C_GAME_PRESETS, "invalid_test", ("pb01", "missing99"))
+
+    with pytest.raises(ValueError, match="game preset 'invalid_test'.*missing99") as exc_info:
+        parse_v05c_games("invalid_test")
+    assert "Valid installed IDs: fs01, pb01" in str(exc_info.value)
+
+
+def test_v05c_unknown_selector_uses_normal_game_id_validation(monkeypatch) -> None:
+    monkeypatch.setattr(interaction_sampling, "registered_game_ids", lambda env_root=None: ("pb01",))
+
+    with pytest.raises(ValueError, match=r"invalid game id\(s\): unknown_preset"):
+        parse_v05c_games("unknown_preset")
+
+
+def test_v05c_every_named_preset_is_parser_resolvable(monkeypatch) -> None:
+    installed = tuple(dict.fromkeys(game_id for games in V05C_GAME_PRESETS.values() for game_id in games))
+    monkeypatch.setattr(interaction_sampling, "registered_game_ids", lambda env_root=None: installed)
+
+    for preset_name in V05C_GAME_PRESETS:
+        assert parse_v05c_games(preset_name) == tuple(dict.fromkeys(V05C_GAME_PRESETS[preset_name]))
 
 
 def test_v05c_games_all_expands_to_registered_games(monkeypatch) -> None:
@@ -9207,6 +9256,11 @@ def test_continuous_research_passes_memory_flags_into_interaction_sampling(tmp_p
     import v6.continuous_research as continuous_research
 
     captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        interaction_sampling,
+        "registered_game_ids",
+        lambda env_root=None: tuple(dict.fromkeys(V05C_GAME_PRESETS["bridge"])),
+    )
 
     def _capture_sampling_config(config):
         captured["sampling_config"] = config
@@ -9229,7 +9283,7 @@ def test_continuous_research_passes_memory_flags_into_interaction_sampling(tmp_p
     continuous_research.run_continuous_research(
         continuous_research.ContinuousResearchConfig(
             experiment_name="memory_flags",
-            games="tt01",
+            games="bridge",
             samplers="memory_guided",
             seeds="0",
             steps_per_epoch=1,
@@ -9246,6 +9300,7 @@ def test_continuous_research_passes_memory_flags_into_interaction_sampling(tmp_p
     )
 
     sampling_config = captured["sampling_config"]
+    assert sampling_config.games == V05C_GAME_PRESETS["bridge"]
     assert sampling_config.memory_query_enabled is True
     assert sampling_config.memory_action_selection_enabled is True
     assert sampling_config.restore_compact_graph is True
@@ -9294,22 +9349,23 @@ def test_resume_rejects_incomplete_next_epoch(tmp_path) -> None:
     status_dir.mkdir(parents=True, exist_ok=True)
     (status_dir / "epoch_start.json").write_text(json.dumps({"epoch_id": "epoch_0003"}), encoding="utf-8")
 
-    with pytest.raises(RuntimeError, match="incomplete next epoch"):
-        continuous_research._load_or_initialize_manifest(
-            continuous_research.ContinuousResearchConfig(
-                experiment_name="resume_guard",
-                games="tt01",
-                samplers="mixed",
-                seeds="0",
-                steps_per_epoch=100,
-                max_epochs=4,
-                horizon=2,
-                context_depth=1,
-                output_dir=str(root),
-                resume=True,
-            ),
-            manifest_path,
-        )
+    manifest = continuous_research._load_or_initialize_manifest(
+        continuous_research.ContinuousResearchConfig(
+            experiment_name="resume_guard",
+            games="tt01",
+            samplers="mixed",
+            seeds="0",
+            steps_per_epoch=100,
+            max_epochs=4,
+            horizon=2,
+            context_depth=1,
+            output_dir=str(root),
+            resume=True,
+        ),
+        manifest_path,
+    )
+    assert int(manifest["current_epoch"]) == 2
+    assert not (root / "epochs" / "epoch_0003").exists()
 
 
 def test_v05c_run_sampling_job_non_fast_mode_does_not_call_legacy_future_effects(tmp_path, monkeypatch) -> None:
@@ -15660,6 +15716,87 @@ def test_sampling_executor_passes_positive_max_tasks_per_child(monkeypatch, tmp_
     assert seen["max_workers"] == 1
     assert seen["max_tasks_per_child"] == 50
     assert stats["max_tasks_per_child"] == 50
+
+
+def test_sampling_worker_ramp_stops_for_epoch_after_ram_threshold_hit(monkeypatch, tmp_path: Path) -> None:
+    from v6.evaluation.interaction_sampling import _run_sampling_jobs
+
+    class _FakeFuture:
+        def __init__(self, index: int):
+            self.index = index
+
+        def result(self):
+            return {"ok": True, "index": self.index}
+
+    class _FakeExecutor:
+        def __init__(self, **kwargs):
+            self._submitted = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def submit(self, fn, job):
+            future = _FakeFuture(self._submitted)
+            self._submitted += 1
+            return future
+
+    wait_calls = {"count": 0}
+
+    def _fake_wait(futures, timeout, return_when):
+        wait_calls["count"] += 1
+        keys = list(futures.keys())
+        if not keys:
+            return set(), set()
+        return {keys[0]}, set(keys[1:])
+
+    monotonic_values = iter([0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0])
+    ram_snapshots = iter(
+        [
+            {"ram_used_percent": 10.0},
+            {"ram_used_percent": 60.0},
+            {"ram_used_percent": 10.0},
+            {"ram_used_percent": 10.0},
+        ]
+    )
+
+    monkeypatch.setattr("v6.evaluation.interaction_sampling.ProcessPoolExecutor", _FakeExecutor)
+    monkeypatch.setattr("v6.evaluation.interaction_sampling.wait", _fake_wait)
+    monkeypatch.setattr("v6.evaluation.interaction_sampling.time.monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr("v6.evaluation.interaction_sampling._system_ram_snapshot", lambda: next(ram_snapshots))
+
+    jobs = [
+        {
+            "game": "tt01",
+            "sampler_name": "mixed",
+            "seed": 0,
+            "steps": 1,
+            "horizon": 1,
+            "context_depth": 1,
+            "global_step_offset": index,
+            "db_path": str(tmp_path / f"seed_{index}.sqlite"),
+            "max_tasks_per_child": 0,
+            "memory_output_dir": None,
+            "direct_streaming_fold_enabled": False,
+            "shared_live_memory": "none",
+        }
+        for index in range(3)
+    ]
+    stats = _run_sampling_jobs(
+        jobs,
+        workers=3,
+        initial_workers=1,
+        enable_worker_ramp=True,
+        ram_ramp_threshold_percent=50.0,
+        initial_worker_ramp_delay_seconds=0.0,
+        per_worker_ramp_delay_seconds=0.0,
+    )
+
+    assert stats["peak_workers"] == 1
+    assert stats["ramp_event_count"] == 0
+    assert stats["worker_ramp_blocked_by_ram"] is True
 
 
 def test_retry_direct_streaming_fold_preserves_zero_and_positive_max_tasks_per_child(tmp_path: Path, monkeypatch) -> None:

@@ -175,3 +175,16 @@ uv run main.py --agent=llm --tags="experiment,gpt-4,baseline"
 # Run against an explicit list of games
 uv run main.py --agent=random --game="ls20,ft09"
 
+## v6 developmental game sets
+
+The v6 research commands accept curated developmental sets through `--games`, for example:
+
+```text
+--games diverse
+--games foundation
+--games bridge
+--games transfer_validation
+--games falsification
+```
+
+These are curated developmental research sets, not official ARC-AGI-3 categories.

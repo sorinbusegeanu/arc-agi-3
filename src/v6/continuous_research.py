@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import shutil
 import sys
 import time
 from contextlib import contextmanager
@@ -169,6 +170,16 @@ def _detect_incomplete_next_epoch(root: Path, current_epoch: int) -> dict[str, A
         "epoch_start_path": str(epoch_start),
         "epoch_status_path": str(epoch_status),
     }
+
+
+def _cleanup_incomplete_next_epoch(root: Path, current_epoch: int) -> dict[str, Any] | None:
+    interrupted = _detect_incomplete_next_epoch(root, current_epoch)
+    if interrupted is None:
+        return None
+    epoch_dir = Path(interrupted["epoch_dir"])
+    if epoch_dir.exists():
+        shutil.rmtree(epoch_dir)
+    return interrupted
 
 
 def run_continuous_research(config: ContinuousResearchConfig) -> dict[str, Any]:
@@ -625,14 +636,14 @@ def _load_or_initialize_manifest(config: ContinuousResearchConfig, manifest_path
         missing = [path for path in memory_paths.values() if not Path(path).exists()]
         if missing:
             raise RuntimeError(f"resume requested but required memory files are missing: {missing}")
-        interrupted = _detect_incomplete_next_epoch(manifest_path.parent, int(manifest.get("current_epoch", 0) or 0))
+        interrupted = _cleanup_incomplete_next_epoch(manifest_path.parent, int(manifest.get("current_epoch", 0) or 0))
         if interrupted is not None:
-            raise RuntimeError(
-                "resume found an incomplete next epoch; automatic mid-epoch resume is not supported and rerunning it "
-                "could duplicate direct-streaming folds. "
+            print(
+                "resume removed incomplete next epoch before continuation. "
                 f"incomplete_epoch={interrupted['epoch_id']} "
                 f"epoch_start={interrupted['epoch_start_path']} "
-                f"expected_epoch_status={interrupted['epoch_status_path']}"
+                f"expected_epoch_status={interrupted['epoch_status_path']}",
+                flush=True,
             )
         return manifest
     manifest = {
