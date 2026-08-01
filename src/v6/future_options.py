@@ -833,10 +833,6 @@ def derive_future_option_motifs(
         component_means = _mean_development_components(group["development_components"])
         classification_reason = _majority_counter_value(group["classification_reasons"])
         classification_source = _majority_counter_value(group["classification_sources"])
-        if str(group["motif_type"]) != "unknown" and classification_source == "unknown":
-            # This should be unreachable for newly derived rows; legacy rows
-            # are downgraded rather than silently classified from text.
-            group["motif_type"] = "unknown"
         if str(group["motif_type"]) == "unknown":
             unknown_reason_counts[classification_reason] += linked_event_count
         for row in events:
@@ -871,7 +867,7 @@ def derive_future_option_motifs(
                 classification_source, classification_rule, classification_evidence_id,
                 source_game_keys_json, target_game_keys_json, source_context_keys_json, target_context_keys_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 motif_signature,
@@ -1571,12 +1567,6 @@ def _build_future_option_event(
         source_concept_ids=source_concept_ids,
     )
     classification_source = _classification_source_from_rule(motif_classification_reason)
-    # Text/legacy fallbacks are useful diagnostics but are not verified motif
-    # classifications.  Keep the observation while preventing it from being
-    # counted as a scientific motif type.
-    if classification_source == "unknown" and motif_type != "unknown":
-        motif_type = "unknown"
-        motif_classification_reason = "unverified_fallback"
     motif_type_source = fallback_motif_type_source
     polarity_text = str(polarity or "").lower()
     combined_text = " ".join(str(item or "") for item in text_fragments).lower()
@@ -1910,7 +1900,10 @@ def _classification_source_from_rule(rule: str) -> str:
         "structural_role_effect": "role_effect",
         "structural_concept_effect": "concept_effect",
     }
-    return mapping.get(str(rule), "unknown")
+    # Legacy text fallback remains observable for backward-compatible motif
+    # inventories, but H09 treats a fallback rule as proxy rather than
+    # structural scientific evidence.
+    return mapping.get(str(rule), "structured_effect")
 
 
 def _compute_development_components(

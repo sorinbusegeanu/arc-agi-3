@@ -166,6 +166,7 @@ def evaluate_h09_future_option_motifs(
         row for row in motifs
         if str(row.get("motif_type") or "unknown") != "unknown"
         and str(row.get("classification_source") or "unknown") in allowed_sources
+        and str(row.get("classification_rule") or row.get("motif_classification_reason") or "").startswith("structural_")
         and bool(_json_list(row.get("source_interaction_ids_json")))
     ]
     proxy_motifs = [

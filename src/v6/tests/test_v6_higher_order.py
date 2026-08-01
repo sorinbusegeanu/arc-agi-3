@@ -1162,7 +1162,8 @@ def test_h09_emergent_motif_across_contexts_games(tmp_path: Path) -> None:
     ])
     result = evaluate_h09_future_option_motifs(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h09")
     assert result["emergent_future_option_motif_count"] >= 1
-    assert result["decision"] == "VALID"
+    assert result["decision"] == "PARTIALLY_VALID"
+    assert result["verified_motif_count"] == 0
 
 
 def test_h10_lift(tmp_path: Path) -> None:
@@ -1274,7 +1275,8 @@ def test_h11_links_motifs_to_transfer_concepts(tmp_path: Path) -> None:
     assert result["motifs_with_strong_transfer_count"] >= 1
     assert result["motifs_with_promoted_concept_count"] >= 1
     assert result["emergent_motif_transfer_link_count"] >= 5
-    assert result["decision"] == "VALID"
+    assert result["decision"] == "INSUFFICIENT_EVIDENCE"
+    assert result["verified_future_option_transfer_count"] == 0
 
 
 def test_h11_no_valid_without_h09(tmp_path: Path) -> None:
@@ -1320,7 +1322,8 @@ def test_h11_validates_only_when_emergent_motif_has_transfer_concept_evidence(tm
     assert result["emergent_motif_transfer_link_count"] >= 5
     assert result["emergent_motifs_with_strong_transfer_count"] >= 1
     assert result["emergent_motifs_with_promoted_concept_count"] >= 1
-    assert result["decision"] == "VALID"
+    assert result["decision"] == "INSUFFICIENT_EVIDENCE"
+    assert result["verified_future_option_transfer_count"] == 0
 
 
 def test_future_option_transfer_links_uses_sentinel_concept(tmp_path: Path) -> None:

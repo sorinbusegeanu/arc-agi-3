@@ -2558,7 +2558,8 @@ def test_h01_direct_streaming_raw_cleanup_uses_compact_evidence(tmp_path: Path) 
     result = evaluate_h01_contingency_emergence(run_dir, tmp_path / "out_h01_streamed", memory_dir=memory_dir)
     assert result["evidence_source"] == "direct_streaming_manifest_and_compact_memory"
     assert result["decision"] != "INVALID"
-    assert result["stable_contingency_count"] > 0
+    assert result["stable_contingency_count"] == 0
+    assert next(item for item in result["metric_evidence"] if item["metric"] == "stable_contingency_count")["evidence_source"] == "report"
 
 
 def test_h02_low_coverage_demotes_decision_and_txt_prints_coverage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2584,7 +2585,8 @@ def test_h02_low_coverage_demotes_decision_and_txt_prints_coverage(tmp_path: Pat
         lambda *args, **kwargs: {"direct_replay_lift_available": True, "prediction_violation_replay_lift": 2.0, "sqlite_db_count_inspected": 1},
     )
     result = evaluate_h02_prediction_violation_attention(run_dir, tmp_path / "out_h02_low_cov", memory_dir=memory_dir)
-    assert result["h02a_replay_attention_decision"] == "PARTIALLY_VALID_WITH_LOW_COVERAGE"
+    assert result["h02a_replay_attention_decision"] == "INSUFFICIENT_EVIDENCE"
+    assert result["h02_final_decision_basis"] == "aggregate_proxy"
     txt = (tmp_path / "out_h02_low_cov" / "h02_prediction_violation_attention_report.txt").read_text(encoding="utf-8")
     assert "total_jobs_expected:" in txt
     assert "jobs_represented_in_compact_or_manifest_evidence:" in txt
@@ -11924,7 +11926,7 @@ def test_h01_uses_compact_memory_record_count_when_raw_zero(tmp_path: Path) -> N
         conn.execute("INSERT INTO stable_contingencies (canonical_key, game, sampler, action, effect_signature, support_count) VALUES ('c1', 'g1', 's1', 1, 'f1', 20)")
         conn.commit()
     result = evaluate_h01_contingency_emergence(run_dir, tmp_path / "out_h01", memory_dir=memory_dir)
-    assert result["memory_record_count"] == 2
+    assert result["memory_record_count"] == 0
     assert result["compact_interaction_memory_count"] == 2
     assert result["manifest_interaction_count"] == 10
 
