@@ -422,6 +422,7 @@ class V6System:
         actual_family = self.clusterer.family_for_delta(delta.id)
         if actual_family is None and self.clusterer.families:
             actual_family = self.clusterer.nearest_family(delta)
+        actual_family_id = None if actual_family is None else str(actual_family)
         prediction_correct = None
         if predicted_family is not None and actual_family is not None:
             prediction_correct = int(predicted_family) == int(actual_family)
@@ -456,6 +457,12 @@ class V6System:
                     {
                         "event_id": f"future_option_event:{interaction.id}",
                         "interaction_id": str(interaction.id),
+                        "source_interaction_id": str(interaction.id),
+                        "source_family_id": actual_family_id,
+                        "source_context_signature": serialized_context_signature,
+                        "source_action": str(action),
+                        "source_game_id": str(getattr(self.env, "game_id", getattr(self.env, "env_id", "unknown_game")) or "unknown_game"),
+                        "source_sampler": getattr(self.action_sampler, "name", None),
                         "option_delta": float(future_option_delta.delta_score),
                         "motif_type": motif_type,
                         "motif_type_source": "live_delta_rule",
@@ -465,7 +472,6 @@ class V6System:
         game_id = str(getattr(self.env, "game_id", getattr(self.env, "env_id", "unknown_game")) or "unknown_game")
         level_id = getattr(self.env, "last_full_game_id", None) or getattr(self.env, "level_id", None)
         sampler_name = getattr(self.action_sampler, "name", None)
-        actual_family_id = None if actual_family is None else str(actual_family)
         stable_delta_key = self._stable_delta_key(delta, outcome_state=outcome_state, level_completed_event=level_completed_event)
         memory_counts = self._build_isf_memory_counts(
             delta_id=stable_delta_key,

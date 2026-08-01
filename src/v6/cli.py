@@ -638,6 +638,7 @@ def build_parser() -> argparse.ArgumentParser:
     continuous.add_argument("--horizon", type=int, default=10)
     continuous.add_argument("--context-depth", type=int, default=1)
     continuous.add_argument("--output-dir", required=True)
+    continuous.add_argument("--initial-memory-dir", default=None)
     continuous.add_argument("--stop-if-disk-above-percent", type=float, default=90.0)
     continuous.add_argument("--stop-if-no-new-stable-contingencies-for", type=int, default=2)
     continuous.add_argument("--scan-all-dbs", action="store_true")
@@ -783,6 +784,7 @@ def main(argv: list[str] | None = None) -> int:
                 support_threshold=args.support_threshold,
                 confidence_threshold=args.confidence_threshold,
                 output_dir=args.output_dir,
+                initial_memory_dir=args.initial_memory_dir,
                 env_root=args.env_root,
                 workers=args.workers,
             )

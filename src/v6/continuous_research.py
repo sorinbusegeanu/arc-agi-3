@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import shutil
 import sys
+import tempfile
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -31,6 +33,7 @@ class ContinuousResearchConfig:
     horizon: int
     context_depth: int
     output_dir: str
+    initial_memory_dir: str | None = None
     stop_if_disk_above_percent: float = 90.0
     stop_if_no_new_stable_contingencies_for: int = 2
     scan_all_dbs: bool = False
@@ -107,7 +110,7 @@ class ContinuousResearchConfig:
     restore_compact_substrate: bool = False
 
 
-def _log_epoch_phase(epoch_id: str, phase: str, status: str = "starting", extra: dict | None = None) -> None:
+def _log_epoch_phase(epoch_id: str, phase: str, status: str = "starting", extra: dict | str | None = None) -> None:
     print(f"{_format_epoch_phase_prefix(epoch_id)} {phase}: {status}" + (f" {extra}" if extra else ""), flush=True)
 
 
@@ -203,8 +206,14 @@ def _run_continuous_research_inner(config: ContinuousResearchConfig) -> dict[str
     root_status_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = root / "manifest.json"
     stop_file = root / "STOP"
-    manifest = _load_or_initialize_manifest(config, manifest_path)
     memory_dir = root / "memory"
+    checkpoint_restore = _initialize_memory_checkpoint(config, memory_dir)
+    manifest = _load_or_initialize_manifest(config, manifest_path)
+    if checkpoint_restore["restored"]:
+        manifest["initial_memory_dir"] = checkpoint_restore["initial_memory_dir"]
+        manifest["memory_checkpoint_restored"] = True
+        manifest["memory_checkpoint_copy_time_seconds"] = checkpoint_restore["copy_time_seconds"]
+        _write_manifest(manifest_path, manifest)
     memory_paths = ensure_memory_layout(memory_dir)
     latest_status: dict[str, Any] | None = None
     consecutive_no_new = int(manifest.get("consecutive_no_new_stable_contingencies", 0) or 0)
@@ -379,17 +388,11 @@ def _run_continuous_research_inner(config: ContinuousResearchConfig) -> dict[str
             hypothesis_progress=bool(config.hypothesis_progress),
             hypothesis_progress_log_every=int(config.hypothesis_progress_log_every),
         )
-        _log_epoch_phase(
-            epoch_id,
-            "hypothesis_suite",
-            "done",
-            {
-                "H01": suite_summary.get("H01 decision"),
-                "H03": suite_summary.get("H03 decision"),
-                "H07": suite_summary.get("H07 decision"),
-                "H10": suite_summary.get("H10 decision"),
-            },
+        hypothesis_summary = " ".join(
+            f"H{i:02d}={suite_summary.get(f'H{i:02d} decision', 'N/A')}"
+            for i in range(1, 13)
         )
+        _log_epoch_phase(epoch_id, "hypothesis_suite", "done", hypothesis_summary)
         _log_epoch_phase(epoch_id, "selective_forgetting", "starting")
         forgetting_summary = run_selective_forgetting_pass(memory_dir=memory_dir, epoch=epoch_number)
         _log_epoch_phase(epoch_id, "selective_forgetting", "done")
@@ -569,6 +572,18 @@ def _run_continuous_research_inner(config: ContinuousResearchConfig) -> dict[str
         games_solved_by_epoch[epoch_id] = list(suite_summary.get("solved_games", []) or [])
         manifest["games_solved_by_epoch"] = games_solved_by_epoch
         manifest["total_games_solved"] = len({game for games in games_solved_by_epoch.values() for game in games})
+        epoch_levels_solved = int(suite_summary.get("levels_successfully_completed_per_epoch", 0) or 0)
+        epoch_games_solved = int(suite_summary.get("games_solved_per_epoch", 0) or 0)
+        _log_epoch_phase(
+            epoch_id,
+            "epoch_results",
+            "done",
+            (
+                f"games_solved={epoch_games_solved} levels_solved={epoch_levels_solved} "
+                f"total_games_solved={manifest['total_games_solved']} "
+                f"total_levels_solved={manifest['total_levels_successfully_completed']}"
+            ),
+        )
         manifest.setdefault("epochs", []).append(
             {
                 "epoch_id": epoch_id,
@@ -677,6 +692,9 @@ def _load_or_initialize_manifest(config: ContinuousResearchConfig, manifest_path
         "initial_worker_ramp_delay_seconds": float(config.initial_worker_ramp_delay_seconds),
         "per_worker_ramp_delay_seconds": float(config.per_worker_ramp_delay_seconds),
         "output_dir": str(config.output_dir),
+        "initial_memory_dir": config.initial_memory_dir,
+        "memory_checkpoint_restored": False,
+        "memory_checkpoint_copy_time_seconds": 0.0,
         "shared_live_memory": str(config.shared_live_memory),
         "live_memory_refresh_steps": int(config.live_memory_refresh_steps),
         "live_memory_queue_maxsize": int(config.live_memory_queue_maxsize),
@@ -700,6 +718,50 @@ def _load_or_initialize_manifest(config: ContinuousResearchConfig, manifest_path
     }
     _write_manifest(manifest_path, manifest)
     return manifest
+
+
+def _initialize_memory_checkpoint(config: ContinuousResearchConfig, memory_dir: Path) -> dict[str, Any]:
+    """Copy an immutable starting checkpoint before the destination is initialized."""
+    if not config.initial_memory_dir:
+        return {"initial_memory_dir": None, "restored": False, "copy_time_seconds": 0.0}
+    source = Path(config.initial_memory_dir).expanduser()
+    destination = Path(memory_dir)
+    source_resolved = source.resolve(strict=False)
+    destination_resolved = destination.resolve(strict=False)
+    if not source.is_dir():
+        raise RuntimeError(f"initial memory directory does not exist: {source}")
+    if source_resolved == destination_resolved:
+        raise RuntimeError("initial memory directory must not equal the output memory directory")
+    if destination_resolved.is_relative_to(source_resolved):
+        raise RuntimeError("output memory directory must not be inside the initial memory directory")
+    _verify_memory_checkpoint_sqlite_files(source)
+    if destination.exists():
+        if not bool(config.resume):
+            raise RuntimeError(
+                f"output memory directory already exists: {destination}; use --resume to continue it"
+            )
+        return {"initial_memory_dir": str(source), "restored": False, "copy_time_seconds": 0.0}
+
+    print(f"Initializing memory from:\n  {source}\n\nWriting memory to:\n  {destination}", flush=True)
+    started = time.perf_counter()
+    staging_parent = Path(tempfile.mkdtemp(prefix=".memory_checkpoint_", dir=str(destination.parent)))
+    staged_destination = staging_parent / "memory"
+    try:
+        shutil.copytree(source, staged_destination, copy_function=shutil.copy2)
+        _verify_memory_checkpoint_sqlite_files(staged_destination)
+        os.replace(staged_destination, destination)
+    finally:
+        shutil.rmtree(staging_parent, ignore_errors=True)
+    elapsed = time.perf_counter() - started
+    print("Memory checkpoint restored successfully.", flush=True)
+    return {"initial_memory_dir": str(source), "restored": True, "copy_time_seconds": elapsed}
+
+
+def _verify_memory_checkpoint_sqlite_files(memory_dir: Path) -> None:
+    required = ("current_state.sqlite", "graph.sqlite", "replay_queue.sqlite")
+    missing = [str(Path(memory_dir) / name) for name in required if not (Path(memory_dir) / name).is_file()]
+    if missing:
+        raise RuntimeError(f"initial memory checkpoint is missing required SQLite databases: {missing}")
 
 
 def _epoch_stop_reason(

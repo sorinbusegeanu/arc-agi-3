@@ -5401,6 +5401,15 @@ def _ensure_current_state_schema(path: Path) -> None:
                 memory_priority_score REAL,
                 first_seen_global_step INTEGER,
                 last_seen_global_step INTEGER,
+                source_interaction_id TEXT,
+                source_family_id TEXT,
+                source_carrier_id TEXT,
+                source_role_id TEXT,
+                source_concept_id TEXT,
+                source_context_signature TEXT,
+                source_action TEXT,
+                source_game_id TEXT,
+                source_sampler TEXT,
                 evidence_json TEXT
             );
             CREATE TABLE IF NOT EXISTS future_option_motifs (
@@ -5424,7 +5433,12 @@ def _ensure_current_state_schema(path: Path) -> None:
                 first_seen_global_step INTEGER,
                 last_seen_global_step INTEGER,
                 motif_stability_score REAL,
-                is_emergent INTEGER
+                is_emergent INTEGER,
+                source_interaction_ids_json TEXT,
+                source_family_ids_json TEXT,
+                source_carrier_ids_json TEXT,
+                source_role_ids_json TEXT,
+                source_concept_ids_json TEXT
             );
             CREATE TABLE IF NOT EXISTS future_option_links (
                 motif_signature TEXT,
@@ -5520,6 +5534,12 @@ def _ensure_current_state_schema(path: Path) -> None:
             ON future_option_events(owner_type, owner_key);
             CREATE INDEX IF NOT EXISTS idx_future_option_events_motif
             ON future_option_events(motif_type, option_delta_bucket);
+            CREATE INDEX IF NOT EXISTS idx_future_option_events_source_family
+            ON future_option_events(source_family_id);
+            CREATE INDEX IF NOT EXISTS idx_future_option_events_source_carrier
+            ON future_option_events(source_carrier_id);
+            CREATE INDEX IF NOT EXISTS idx_future_option_events_source_role
+            ON future_option_events(source_role_id);
             CREATE INDEX IF NOT EXISTS idx_future_option_motifs_emergent
             ON future_option_motifs(is_emergent, motif_type);
             CREATE INDEX IF NOT EXISTS idx_future_option_links_type_key
@@ -5590,6 +5610,20 @@ def _ensure_current_state_schema(path: Path) -> None:
         _ensure_column(connection, "future_option_attention_links", "attention_score_percentile", "REAL")
         _ensure_column(connection, "future_option_attention_links", "attention_threshold_method", "TEXT")
         _ensure_column(connection, "future_option_attention_links", "attention_calibration_degenerate", "INTEGER")
+        _ensure_column(connection, "future_option_events", "source_interaction_id", "TEXT")
+        _ensure_column(connection, "future_option_events", "source_family_id", "TEXT")
+        _ensure_column(connection, "future_option_events", "source_carrier_id", "TEXT")
+        _ensure_column(connection, "future_option_events", "source_role_id", "TEXT")
+        _ensure_column(connection, "future_option_events", "source_concept_id", "TEXT")
+        _ensure_column(connection, "future_option_events", "source_context_signature", "TEXT")
+        _ensure_column(connection, "future_option_events", "source_action", "TEXT")
+        _ensure_column(connection, "future_option_events", "source_game_id", "TEXT")
+        _ensure_column(connection, "future_option_events", "source_sampler", "TEXT")
+        _ensure_column(connection, "future_option_motifs", "source_interaction_ids_json", "TEXT")
+        _ensure_column(connection, "future_option_motifs", "source_family_ids_json", "TEXT")
+        _ensure_column(connection, "future_option_motifs", "source_carrier_ids_json", "TEXT")
+        _ensure_column(connection, "future_option_motifs", "source_role_ids_json", "TEXT")
+        _ensure_column(connection, "future_option_motifs", "source_concept_ids_json", "TEXT")
         _ensure_column(connection, "memory_scores", "memory_state", "TEXT")
         _ensure_column(connection, "memory_scores", "stored_epoch", "INTEGER")
         _ensure_column(connection, "memory_scores", "last_replayed_epoch", "INTEGER")

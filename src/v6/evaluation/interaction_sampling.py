@@ -980,6 +980,10 @@ def _run_sampling_jobs(
 
     def _log_stalled_progress() -> None:
         nonlocal last_stalled_progress_log
+        # Once all jobs are submitted, repeated liveness lines add noise while
+        # long-running samplers make ordinary progress internally.
+        if pending_jobs_remaining <= 0:
+            return
         now = time.monotonic()
         if now - last_stalled_progress_log < 10.0:
             return

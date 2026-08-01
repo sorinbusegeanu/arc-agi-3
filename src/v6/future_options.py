@@ -160,9 +160,11 @@ def derive_future_option_events(
                 event_id, owner_type, owner_key, game, sampler, context_key, action_key, source_kind,
                 motif_type, option_delta, option_delta_bucket, option_count_before, option_count_after,
                 novelty_score, reversibility_score, branching_score, termination_score, contradiction_score,
-                replay_priority_score, memory_priority_score, first_seen_global_step, last_seen_global_step, evidence_json
+                replay_priority_score, memory_priority_score, first_seen_global_step, last_seen_global_step,
+                source_interaction_id, source_family_id, source_carrier_id, source_role_id, source_concept_id,
+                source_context_signature, source_action, source_game_id, source_sampler, evidence_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 payload["event_id"],
@@ -187,6 +189,15 @@ def derive_future_option_events(
                 payload["memory_priority_score"],
                 payload["first_seen_global_step"],
                 payload["last_seen_global_step"],
+                payload["source_interaction_id"],
+                payload["source_family_id"],
+                payload["source_carrier_id"],
+                payload["source_role_id"],
+                payload["source_concept_id"],
+                payload["source_context_signature"],
+                payload["source_action"],
+                payload["source_game_id"],
+                payload["source_sampler"],
                 json.dumps(payload["evidence_json"], sort_keys=True),
             ),
         )
@@ -197,6 +208,24 @@ def derive_future_option_events(
 
     carrier_links = _links_by_signature(state_conn, "carrier_links", "carrier_signature")
     role_links = _links_by_signature(state_conn, "role_links", "role_signature")
+    concept_links = _links_by_signature(state_conn, "concept_links", "concept_signature")
+    families_by_contingency: dict[str, set[str]] = defaultdict(set)
+    for row in state_conn.execute(
+        "SELECT family_signature, contingency_key FROM family_members ORDER BY family_signature ASC, contingency_key ASC"
+    ).fetchall():
+        families_by_contingency[str(row["contingency_key"])].add(str(row["family_signature"]))
+    carriers_by_family: dict[str, set[str]] = defaultdict(set)
+    roles_by_carrier: dict[str, set[str]] = defaultdict(set)
+    concepts_by_role: dict[str, set[str]] = defaultdict(set)
+    for carrier_signature, links in carrier_links.items():
+        for family_signature in links.get("family", set()):
+            carriers_by_family[family_signature].add(carrier_signature)
+    for role_signature, links in role_links.items():
+        for carrier_signature in links.get("carrier", set()):
+            roles_by_carrier[carrier_signature].add(role_signature)
+    for concept_signature, links in concept_links.items():
+        for role_signature in links.get("role", set()):
+            concepts_by_role[role_signature].add(concept_signature)
     family_meta = {
         str(row["canonical_signature"]): {
             "effect_type": None if row["effect_type"] is None else str(row["effect_type"]),
@@ -301,10 +330,12 @@ def derive_future_option_events(
                 evidence_json={
                     "source_table": "stable_contingencies",
                     "raw_key": str(row["canonical_key"]),
+                    "source_family_ids": sorted(families_by_contingency.get(str(row["canonical_key"]), set())),
                     "text_tokens_used": _tokenize_text_fragments([row["effect_signature"], row["canonical_key"]]),
                     "heuristic_note": "future-option counts are heuristic unless true reachable-state columns are available",
                 },
                 action_group=None if row["action"] is None else str(row["action"]),
+                source_family_ids=families_by_contingency.get(str(row["canonical_key"]), set()),
             )
         )
         if inserted > before_inserted:
@@ -346,6 +377,8 @@ def derive_future_option_events(
                 evidence_json={
                     "source_table": "transformation_families",
                     "raw_key": str(row["canonical_signature"]),
+                    "source_interaction_ids": _interaction_ids_from_nodes(interaction_ids_by_family.get(family_signature, set())),
+                    "source_carrier_ids": sorted(carriers_by_family.get(family_signature, set())),
                     "text_tokens_used": _tokenize_text_fragments(
                         [row["canonical_signature"], row["effect_type"], row["action_group"], row["polarity"]]
                     ),
@@ -362,6 +395,9 @@ def derive_future_option_events(
                     future_edge_by_interaction,
                 ),
                 live_delta_threshold=live_delta_threshold,
+                source_interaction_ids=_interaction_ids_from_nodes(interaction_ids_by_family.get(family_signature, set())),
+                source_family_ids={family_signature},
+                source_carrier_ids=carriers_by_family.get(family_signature, set()),
             )
         )
         if inserted > before_inserted:
@@ -389,6 +425,8 @@ def derive_future_option_events(
             family_meta=family_meta,
         )
         carrier_interactions = carrier_interaction_ids.get(carrier_node, set())
+        carrier_roles = roles_by_carrier.get(str(row["carrier_signature"]), set())
+        carrier_concepts = set().union(*(concepts_by_role.get(role, set()) for role in carrier_roles)) if carrier_roles else set()
         before_inserted = inserted
         add_event(
             _build_future_option_event(
@@ -413,6 +451,9 @@ def derive_future_option_events(
                     "raw_key": str(row["carrier_signature"]),
                     "linked_families": family_text,
                     "linked_contexts": contexts,
+                    "source_interaction_ids": _interaction_ids_from_nodes(carrier_interactions),
+                    "source_role_ids": sorted(carrier_roles),
+                    "source_concept_ids": sorted(carrier_concepts),
                     "text_tokens_used": _tokenize_text_fragments([row["carrier_source"], *family_text]),
                     "heuristic_note": "future-option counts are heuristic unless true reachable-state columns are available",
                 },
@@ -421,6 +462,11 @@ def derive_future_option_events(
                 live_option_delta=_mean_live_delta_for_interactions(carrier_interactions, live_option_by_interaction),
                 future_option_edge_type=_majority_edge_type_for_interactions(carrier_interactions, future_edge_by_interaction),
                 live_delta_threshold=live_delta_threshold,
+                source_interaction_ids=_interaction_ids_from_nodes(carrier_interactions),
+                source_family_ids=family_text or carrier_family_ids.get(carrier_node, set()),
+                source_carrier_ids={str(row["carrier_signature"])},
+                source_role_ids=carrier_roles,
+                source_concept_ids=carrier_concepts,
             )
         )
         if inserted > before_inserted:
@@ -447,6 +493,8 @@ def derive_future_option_events(
         role_interactions: set[str] = set()
         for carrier_node in role_carrier_ids.get(role_node, set()):
             role_interactions.update(carrier_interaction_ids.get(carrier_node, set()))
+        role_carriers = set(links.get("carrier", set()))
+        role_concepts = concepts_by_role.get(str(row["role_signature"]), set())
         before_inserted = inserted
         add_event(
             _build_future_option_event(
@@ -472,6 +520,9 @@ def derive_future_option_events(
                     "linked_families": families,
                     "linked_contexts": contexts,
                     "linked_games": games,
+                    "source_interaction_ids": _interaction_ids_from_nodes(role_interactions),
+                    "source_carrier_ids": sorted(role_carriers),
+                    "source_concept_ids": sorted(role_concepts),
                     "text_tokens_used": _tokenize_text_fragments([row["role_type"], *families]),
                     "heuristic_note": "future-option counts are heuristic unless true reachable-state columns are available",
                 },
@@ -480,6 +531,11 @@ def derive_future_option_events(
                 live_option_delta=_mean_live_delta_for_interactions(role_interactions, live_option_by_interaction),
                 future_option_edge_type=_majority_edge_type_for_interactions(role_interactions, future_edge_by_interaction),
                 live_delta_threshold=live_delta_threshold,
+                source_interaction_ids=_interaction_ids_from_nodes(role_interactions),
+                source_family_ids=families,
+                source_carrier_ids=role_carriers,
+                source_role_ids={str(row["role_signature"])},
+                source_concept_ids=role_concepts,
             )
         )
         if inserted > before_inserted:
@@ -509,20 +565,36 @@ def derive_future_option_motifs(
     max_motifs: int,
     progress_factory: Any | None = None,
 ) -> dict[str, Any]:
-    del graph_conn
     carrier_links = _links_by_signature(state_conn, "carrier_links", "carrier_signature")
     role_links = _links_by_signature(state_conn, "role_links", "role_signature")
     concept_links = _links_by_signature(state_conn, "concept_links", "concept_signature")
+    carriers_by_family: dict[str, set[str]] = defaultdict(set)
+    roles_by_carrier: dict[str, set[str]] = defaultdict(set)
+    concepts_by_role: dict[str, set[str]] = defaultdict(set)
     concepts_by_link: dict[tuple[str, str], set[str]] = defaultdict(set)
+    for carrier_signature, links in carrier_links.items():
+        for family_signature in links.get("family", set()):
+            carriers_by_family[family_signature].add(carrier_signature)
+    for role_signature, links in role_links.items():
+        for carrier_signature in links.get("carrier", set()):
+            roles_by_carrier[carrier_signature].add(role_signature)
     for concept_signature, link_groups in concept_links.items():
         for linked_type in ("role", "family", "carrier"):
             for linked_key in link_groups.get(linked_type, set()):
                 concepts_by_link[(linked_type, linked_key)].add(concept_signature)
+        for role_signature in link_groups.get("role", set()):
+            concepts_by_role[role_signature].add(concept_signature)
+    _augment_provenance_from_graph(
+        graph_conn,
+        carriers_by_family=carriers_by_family,
+        roles_by_carrier=roles_by_carrier,
+    )
     rows = [dict(row) for row in state_conn.execute("SELECT * FROM future_option_events ORDER BY event_id ASC").fetchall()]
     events_with_owner_type_role = 0
     role_linked_event_count = 0
     motifs_with_role_links = 0
     emergent_motifs_with_role_links = 0
+    provenance_resolution_failures = 0
     groups: dict[str, dict[str, Any]] = {}
     row_tracker = progress_factory("derive_future_option_motifs events", len(rows), "event", False) if progress_factory else None
     for row in rows:
@@ -538,18 +610,29 @@ def derive_future_option_motifs(
         families = set(_coerce_list(evidence.get("linked_families")))
         carriers: set[str] = set()
         roles: set[str] = set()
+        source_interactions = _event_provenance_values(row, evidence, "interaction")
+        source_families = _event_provenance_values(row, evidence, "family")
+        source_carriers = _event_provenance_values(row, evidence, "carrier")
+        source_roles = _event_provenance_values(row, evidence, "role")
+        source_concepts = _event_provenance_values(row, evidence, "concept")
         if str(row["owner_type"]) == "carrier":
             carriers.add(str(row["owner_key"]))
+            source_carriers.add(str(row["owner_key"]))
             families.update(carrier_links.get(str(row["owner_key"]), {}).get("family", set()))
             contexts.update(carrier_links.get(str(row["owner_key"]), {}).get("context", set()))
         if str(row["owner_type"]) == "role":
             roles.add(str(row["owner_key"]))
+            source_roles.add(str(row["owner_key"]))
             role_link_map = role_links.get(str(row["owner_key"]), {})
             families.update(role_link_map.get("family", set()))
             contexts.update(role_link_map.get("context", set()))
             games.update(role_link_map.get("game", set()))
         if str(row["owner_type"]) == "family":
             families.add(str(row["owner_key"]))
+            source_families.add(str(row["owner_key"]))
+        families.update(source_families)
+        carriers.update(source_carriers)
+        roles.update(source_roles)
         concepts: set[str] = set()
         for role_signature in roles:
             concepts.update(concepts_by_link.get(("role", role_signature), set()))
@@ -557,6 +640,7 @@ def derive_future_option_motifs(
             concepts.update(concepts_by_link.get(("family", family_signature), set()))
         for carrier_signature in carriers:
             concepts.update(concepts_by_link.get(("carrier", carrier_signature), set()))
+        concepts.update(source_concepts)
         if roles:
             role_linked_event_count += 1
         signature_tokens = sorted(
@@ -581,6 +665,11 @@ def derive_future_option_motifs(
                 "carriers": set(),
                 "roles": set(),
                 "concepts": set(),
+                "source_interactions": set(),
+                "source_families": set(),
+                "source_carriers": set(),
+                "source_roles": set(),
+                "source_concepts": set(),
                 "contexts": set(),
                 "games": set(),
                 "support_count": 0,
@@ -593,6 +682,11 @@ def derive_future_option_motifs(
         group["carriers"].update(carriers)
         group["roles"].update(roles)
         group["concepts"].update(concepts)
+        group["source_interactions"].update(source_interactions)
+        group["source_families"].update(source_families)
+        group["source_carriers"].update(source_carriers)
+        group["source_roles"].update(source_roles)
+        group["source_concepts"].update(source_concepts)
         group["contexts"].update(contexts)
         group["games"].update(games)
         support_hint = int(evidence.get("support_count", 1) or 1)
@@ -616,6 +710,14 @@ def derive_future_option_motifs(
     motif_tracker = progress_factory("derive_future_option_motifs motifs", len(selected), "motif", False) if progress_factory else None
     for motif_signature in selected:
         group = groups[motif_signature]
+        resolution = _resolve_motif_provenance(
+            group,
+            carriers_by_family=carriers_by_family,
+            roles_by_carrier=roles_by_carrier,
+            concepts_by_role=concepts_by_role,
+            concepts_by_link=concepts_by_link,
+        )
+        provenance_resolution_failures += int(resolution["failures"])
         events = group["events"]
         linked_event_count = len(events)
         linked_family_count = len(group["families"])
@@ -654,14 +756,15 @@ def derive_future_option_motifs(
         motif_type_counts[str(group["motif_type"])] += 1
         state_conn.execute(
             """
-            INSERT INTO future_option_motifs (
+            INSERT OR REPLACE INTO future_option_motifs (
                 motif_signature, motif_type, support_count, linked_event_count, linked_family_count, linked_carrier_count,
                 linked_role_count, linked_concept_count, cross_context_count, cross_game_count, mean_option_delta,
                 mean_abs_option_delta, mean_novelty_score, mean_reversibility_score, mean_branching_score,
                 mean_termination_score, mean_replay_priority_score, first_seen_global_step, last_seen_global_step,
-                motif_stability_score, is_emergent
+                motif_stability_score, is_emergent, source_interaction_ids_json, source_family_ids_json,
+                source_carrier_ids_json, source_role_ids_json, source_concept_ids_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 motif_signature,
@@ -685,6 +788,11 @@ def derive_future_option_motifs(
                 group["last_seen"],
                 motif_stability_score,
                 is_emergent,
+                json.dumps(sorted(group["source_interactions"])),
+                json.dumps(sorted(group["source_families"])),
+                json.dumps(sorted(group["source_carriers"])),
+                json.dumps(sorted(group["source_roles"])),
+                json.dumps(sorted(group["source_concepts"])),
             ),
         )
         if is_emergent:
@@ -697,12 +805,16 @@ def derive_future_option_motifs(
             _insert_future_link(state_conn, motif_signature, "event", str(row["event_id"]), 1, group["first_seen"], group["last_seen"])
         for family in sorted(group["families"]):
             _insert_future_link(state_conn, motif_signature, "family", family, 1, group["first_seen"], group["last_seen"])
+            _upsert_future_provenance_link(state_conn, motif_signature, "motif_derived_from_family", family, group["first_seen"], group["last_seen"])
         for carrier in sorted(group["carriers"]):
             _insert_future_link(state_conn, motif_signature, "carrier", carrier, 1, group["first_seen"], group["last_seen"])
+            _upsert_future_provenance_link(state_conn, motif_signature, "motif_expressed_by_carrier", carrier, group["first_seen"], group["last_seen"])
         for role in sorted(group["roles"]):
             _insert_future_link(state_conn, motif_signature, "role", role, 1, group["first_seen"], group["last_seen"])
+            _upsert_future_provenance_link(state_conn, motif_signature, "motif_associated_with_role", role, group["first_seen"], group["last_seen"])
         for concept in sorted(group["concepts"]):
             _insert_future_link(state_conn, motif_signature, "concept", concept, 1, group["first_seen"], group["last_seen"])
+            _upsert_future_provenance_link(state_conn, motif_signature, "motif_supports_concept", concept, group["first_seen"], group["last_seen"])
         for context in sorted(group["contexts"]):
             _insert_future_link(state_conn, motif_signature, "context", context, 1, group["first_seen"], group["last_seen"])
         for game in sorted(group["games"]):
@@ -731,6 +843,11 @@ def derive_future_option_motifs(
         "role_linked_event_count": role_linked_event_count,
         "motifs_with_role_links": motifs_with_role_links,
         "emergent_motifs_with_role_links": emergent_motifs_with_role_links,
+        "motifs_with_family_provenance": sum(1 for group in groups.values() if group["source_families"]),
+        "motifs_with_carrier_provenance": sum(1 for group in groups.values() if group["source_carriers"]),
+        "motifs_with_role_provenance": sum(1 for group in groups.values() if group["source_roles"]),
+        "motifs_with_concept_provenance": sum(1 for group in groups.values() if group["source_concepts"]),
+        "provenance_resolution_failures": provenance_resolution_failures,
     }
 
 
@@ -1043,10 +1160,15 @@ def derive_future_option_attention_links(state_conn: sqlite3.Connection) -> dict
 
 def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[str, Any]:
     motif_links = _links_by_signature(state_conn, "future_option_links", "motif_signature")
-    motif_emergence = {
-        str(row["motif_signature"]): int(row["is_emergent"] or 0)
+    motif_quality = {
+        str(row["motif_signature"]): {
+            "is_emergent": int(row["is_emergent"] or 0),
+            "support_count": int(row["support_count"] or 0),
+            "motif_stability_score": float(row["motif_stability_score"] or 0.0),
+        }
         for row in state_conn.execute(
-            "SELECT motif_signature, is_emergent FROM future_option_motifs ORDER BY motif_signature ASC"
+            "SELECT motif_signature, is_emergent, support_count, motif_stability_score "
+            "FROM future_option_motifs ORDER BY motif_signature ASC"
         ).fetchall()
     }
     concept_links = _links_by_signature(state_conn, "concept_links", "concept_signature")
@@ -1087,16 +1209,24 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
     emergent_strong_numer = 0
     motifs_seen_for_transfer = 0
     motifs_skipped_no_role_links = 0
+    motifs_skipped_insufficient_support_or_stability = 0
     motifs_with_role_links_for_transfer = 0
     roles_seen_from_motif_links = 0
     roles_with_transfer_attempts = 0
     roles_with_concepts = 0
     for motif_signature in sorted(motif_links):
         motifs_seen_for_transfer += 1
-        is_emergent_motif = int(motif_emergence.get(motif_signature, 0)) == 1
-        roles = sorted(motif_links[motif_signature].get("role", set()))
+        quality = motif_quality.get(motif_signature, {})
+        is_emergent_motif = int(quality.get("is_emergent", 0)) == 1
+        roles = sorted(
+            set(motif_links[motif_signature].get("role", set()))
+            | set(motif_links[motif_signature].get("motif_associated_with_role", set()))
+        )
         if not roles:
             motifs_skipped_no_role_links += 1
+            continue
+        if int(quality.get("support_count", 0)) < 3 or float(quality.get("motif_stability_score", 0.0)) < 0.50:
+            motifs_skipped_insufficient_support_or_stability += 1
             continue
         motifs_with_role_links_for_transfer += 1
         roles_seen_from_motif_links += len(roles)
@@ -1180,12 +1310,14 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
         "motif_strong_transfer_success_rate": (motif_strong_numer / motif_success_denom) if motif_success_denom else None,
         "promoted_concept_motif_count": motifs_with_promoted_concept,
         "emergent_future_option_transfer_link_count": emergent_link_count,
+        "emergent_motif_transfer_link_count": emergent_link_count,
         "emergent_motifs_with_strong_transfer_count": emergent_motifs_with_strong_transfer,
         "emergent_motifs_with_promoted_concept_count": emergent_motifs_with_promoted_concept,
         "emergent_motif_transfer_success_rate": (emergent_success_numer / emergent_success_denom) if emergent_success_denom else None,
         "emergent_motif_strong_transfer_success_rate": (emergent_strong_numer / emergent_success_denom) if emergent_success_denom else None,
         "motifs_seen_for_transfer": motifs_seen_for_transfer,
         "motifs_skipped_no_role_links": motifs_skipped_no_role_links,
+        "motifs_skipped_insufficient_support_or_stability": motifs_skipped_insufficient_support_or_stability,
         "motifs_with_role_links_for_transfer": motifs_with_role_links_for_transfer,
         "roles_seen_from_motif_links": roles_seen_from_motif_links,
         "roles_with_transfer_attempts": roles_with_transfer_attempts,
@@ -1217,6 +1349,11 @@ def _build_future_option_event(
     live_option_delta: float | None = None,
     future_option_edge_type: str | None = None,
     live_delta_threshold: float | None = None,
+    source_interaction_ids: set[str] | list[str] | tuple[str, ...] = (),
+    source_family_ids: set[str] | list[str] | tuple[str, ...] = (),
+    source_carrier_ids: set[str] | list[str] | tuple[str, ...] = (),
+    source_role_ids: set[str] | list[str] | tuple[str, ...] = (),
+    source_concept_ids: set[str] | list[str] | tuple[str, ...] = (),
 ) -> dict[str, Any]:
     motif_type, text_tokens, motif_type_source = _detect_motif_type(
         text_fragments,
@@ -1261,6 +1398,15 @@ def _build_future_option_event(
     evidence["live_option_delta_used"] = bool(live_option_delta_used)
     evidence["raw_live_option_delta"] = live_option_delta
     evidence["future_option_edge_type"] = future_option_edge_type
+    provenance = {
+        "source_interaction_ids": _sorted_ids(source_interaction_ids),
+        "source_family_ids": _sorted_ids(source_family_ids),
+        "source_carrier_ids": _sorted_ids(source_carrier_ids),
+        "source_role_ids": _sorted_ids(source_role_ids),
+        "source_concept_ids": _sorted_ids(source_concept_ids),
+    }
+    for key, values in provenance.items():
+        evidence[key] = values
     return {
         "event_id": "foe:" + sha1(event_id_seed.encode("utf-8")).hexdigest(),
         "owner_type": owner_type,
@@ -1284,6 +1430,15 @@ def _build_future_option_event(
         "memory_priority_score": memory_priority_score,
         "first_seen_global_step": None if first_seen is None else int(first_seen),
         "last_seen_global_step": None if last_seen is None else int(last_seen),
+        "source_interaction_id": _first_id(provenance["source_interaction_ids"]),
+        "source_family_id": _first_id(provenance["source_family_ids"]),
+        "source_carrier_id": _first_id(provenance["source_carrier_ids"]),
+        "source_role_id": _first_id(provenance["source_role_ids"]),
+        "source_concept_id": _first_id(provenance["source_concept_ids"]),
+        "source_context_signature": context_key,
+        "source_action": action_key,
+        "source_game_id": None if game in (None, "") else str(game),
+        "source_sampler": None if sampler in (None, "") else str(sampler),
         "evidence_json": evidence,
     }
 
@@ -1292,6 +1447,135 @@ def _context_key_from_canonical(canonical_key: str) -> str | None:
     if "|a" not in canonical_key:
         return None
     return canonical_key.split("|a", 1)[0] or None
+
+
+def _interaction_ids_from_nodes(node_ids: set[str] | list[str] | tuple[str, ...]) -> list[str]:
+    values: list[str] = []
+    for node_id in node_ids:
+        value = str(node_id)
+        values.append(value.rsplit(":", 1)[-1] if value.startswith("M0:interaction:") else value)
+    return _sorted_ids(values)
+
+
+def _sorted_ids(values: set[str] | list[str] | tuple[str, ...]) -> list[str]:
+    return sorted({str(value) for value in values if value not in (None, "")})
+
+
+def _first_id(values: list[str]) -> str | None:
+    return values[0] if values else None
+
+
+def _event_provenance_values(row: dict[str, Any], evidence: dict[str, Any], level: str) -> set[str]:
+    column = f"source_{level}_id"
+    values = set(_coerce_list(evidence.get(f"source_{level}_ids")))
+    if row.get(column) not in (None, ""):
+        values.add(str(row[column]))
+    return {str(value) for value in values if value not in (None, "")}
+
+
+def _augment_provenance_from_graph(
+    graph_conn: sqlite3.Connection,
+    *,
+    carriers_by_family: dict[str, set[str]],
+    roles_by_carrier: dict[str, set[str]],
+) -> None:
+    """Use canonical graph edges as an additional structural provenance source."""
+    try:
+        graph_nodes = {
+            str(row["node_id"]): str(row["canonical_key"])
+            for row in graph_conn.execute(
+                "SELECT node_id, canonical_key FROM graph_nodes WHERE canonical_key IS NOT NULL"
+            ).fetchall()
+        }
+        edge_rows = graph_conn.execute(
+            "SELECT source_node_id, target_node_id, edge_type FROM graph_edges "
+            "WHERE edge_type IN ('associated_with_family', 'plays_role')"
+        ).fetchall()
+    except sqlite3.Error:
+        return
+    for row in edge_rows:
+        source = graph_nodes.get(str(row["source_node_id"]))
+        target = graph_nodes.get(str(row["target_node_id"]))
+        if source in (None, "") or target in (None, ""):
+            continue
+        if str(row["edge_type"]) == "associated_with_family":
+            carriers_by_family[target].add(source)
+        elif str(row["edge_type"]) == "plays_role":
+            roles_by_carrier[source].add(target)
+
+
+def _resolve_motif_provenance(
+    group: dict[str, Any],
+    *,
+    carriers_by_family: dict[str, set[str]],
+    roles_by_carrier: dict[str, set[str]],
+    concepts_by_role: dict[str, set[str]],
+    concepts_by_link: dict[tuple[str, str], set[str]],
+) -> dict[str, int]:
+    """Resolve only explicit substrate links; no name-based association is used."""
+    failures = 0
+    families = set(group["families"]) | set(group["source_families"])
+    carriers = set(group["carriers"]) | set(group["source_carriers"])
+    roles = set(group["roles"]) | set(group["source_roles"])
+    concepts = set(group["concepts"]) | set(group["source_concepts"])
+    for family in sorted(families):
+        resolved = carriers_by_family.get(family, set())
+        if not resolved:
+            failures += 1
+        carriers.update(resolved)
+    for carrier in sorted(carriers):
+        resolved = roles_by_carrier.get(carrier, set())
+        if not resolved:
+            failures += 1
+        roles.update(resolved)
+        concepts.update(concepts_by_link.get(("carrier", carrier), set()))
+    for role in sorted(roles):
+        resolved = concepts_by_role.get(role, set())
+        if not resolved:
+            failures += 1
+        concepts.update(resolved)
+    for family in families:
+        concepts.update(concepts_by_link.get(("family", family), set()))
+    group["families"].update(families)
+    group["carriers"].update(carriers)
+    group["roles"].update(roles)
+    group["concepts"].update(concepts)
+    group["source_families"].update(families)
+    group["source_carriers"].update(carriers)
+    group["source_roles"].update(roles)
+    group["source_concepts"].update(concepts)
+    return {"failures": failures}
+
+
+def _upsert_future_provenance_link(
+    conn: sqlite3.Connection,
+    motif_signature: str,
+    linked_type: str,
+    linked_key: str | None,
+    first_seen: int | None,
+    last_seen: int | None,
+) -> None:
+    if linked_key in (None, ""):
+        return
+    conn.execute(
+        """
+        INSERT INTO future_option_links (
+            motif_signature, linked_type, linked_key, support_count, first_seen_global_step, last_seen_global_step
+        ) VALUES (?, ?, ?, 1, ?, ?)
+        ON CONFLICT(motif_signature, linked_type, linked_key) DO UPDATE SET
+            first_seen_global_step = CASE
+                WHEN future_option_links.first_seen_global_step IS NULL THEN excluded.first_seen_global_step
+                WHEN excluded.first_seen_global_step IS NULL THEN future_option_links.first_seen_global_step
+                ELSE MIN(future_option_links.first_seen_global_step, excluded.first_seen_global_step)
+            END,
+            last_seen_global_step = CASE
+                WHEN future_option_links.last_seen_global_step IS NULL THEN excluded.last_seen_global_step
+                WHEN excluded.last_seen_global_step IS NULL THEN future_option_links.last_seen_global_step
+                ELSE MAX(future_option_links.last_seen_global_step, excluded.last_seen_global_step)
+            END
+        """,
+        (motif_signature, linked_type, linked_key, first_seen, last_seen),
+    )
 
 
 def _mean_live_delta_for_interactions(

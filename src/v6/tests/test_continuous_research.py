@@ -4,9 +4,12 @@ import json
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 import v6.continuous_research as continuous_research
 import v6.evaluation.interaction_sampling as interaction_sampling
 from v6.continuous_research import ContinuousResearchConfig, run_continuous_research
+from v6.memory.compact_memory import ensure_memory_layout
 
 
 def _write_sampling_fixture(
@@ -190,6 +193,19 @@ def test_log_epoch_phase_prints_without_jsonl_side_effect(tmp_path: Path, capsys
     assert " E0001]" in captured.out
     assert "H01" in captured.out
     assert not any(tmp_path.rglob("epoch_phase_log.jsonl"))
+
+
+def test_hypothesis_suite_phase_log_prints_all_hypotheses_in_order(capsys) -> None:
+    summary = " ".join(f"H{i:02d}=DECISION_{i:02d}" for i in range(1, 13))
+    continuous_research._log_epoch_phase("epoch_0003", "hypothesis_suite", "done", summary)
+    output = capsys.readouterr().out.strip()
+    assert output.endswith(summary)
+    assert "{" not in output
+    assert '"' not in output
+    assert ":" not in output.split(" done ", 1)[1]
+    assert [output.index(f"H{i:02d}=") for i in range(1, 13)] == sorted(
+        output.index(f"H{i:02d}=") for i in range(1, 13)
+    )
 
 
 def test_continuous_stdout_is_written_to_overwritten_log_file(tmp_path: Path, monkeypatch) -> None:
@@ -590,6 +606,110 @@ def test_continuous_command_creates_manifest_epoch_and_memory(tmp_path: Path, mo
     assert (root / "epochs" / "epoch_0001").is_dir()
     assert manifest["completed_epochs"] == 1
     assert calls == [0]
+
+
+def test_continuous_prints_epoch_game_and_level_results(tmp_path: Path, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        continuous_research,
+        "run_interaction_sampling_v05c",
+        lambda config: _write_sampling_fixture(
+            Path(config.output_dir), global_step_offset=int(config.global_step_offset), stable_support=25
+        ),
+    )
+    run_continuous_research(
+        ContinuousResearchConfig(
+            experiment_name="exp",
+            games="tt01",
+            samplers="mixed",
+            seeds="0",
+            steps_per_epoch=10,
+            max_epochs=1,
+            horizon=2,
+            context_depth=1,
+            output_dir=str(tmp_path / "continuous"),
+        )
+    )
+    output = capsys.readouterr().out
+    assert " epoch_results: done games_solved=" in output
+    assert "levels_solved=" in output
+    assert "total_games_solved=" in output
+    assert "total_levels_solved=" in output
+
+
+def test_continuous_initial_memory_checkpoint_is_copied_to_new_output_only(tmp_path: Path, monkeypatch, capsys) -> None:
+    source = tmp_path / "phase_a" / "memory"
+    ensure_memory_layout(source)
+    source_marker = source / "checkpoint_marker.txt"
+    source_marker.write_text("phase-a", encoding="utf-8")
+    monkeypatch.setattr(
+        continuous_research,
+        "run_interaction_sampling_v05c",
+        lambda config: _write_sampling_fixture(
+            Path(config.output_dir), global_step_offset=int(config.global_step_offset), stable_support=25
+        ),
+    )
+
+    root = tmp_path / "phase_b"
+    manifest = run_continuous_research(
+        ContinuousResearchConfig(
+            experiment_name="phase_b",
+            games="tt01",
+            samplers="mixed",
+            seeds="0",
+            steps_per_epoch=10,
+            max_epochs=1,
+            horizon=2,
+            context_depth=1,
+            output_dir=str(root),
+            initial_memory_dir=str(source),
+        )
+    )
+
+    destination = root / "memory"
+    assert (destination / "checkpoint_marker.txt").read_text(encoding="utf-8") == "phase-a"
+    assert source_marker.read_text(encoding="utf-8") == "phase-a"
+    assert source != destination
+    assert manifest["initial_memory_dir"] == str(source)
+    assert manifest["memory_checkpoint_restored"] is True
+    assert float(manifest["memory_checkpoint_copy_time_seconds"]) >= 0.0
+    output = capsys.readouterr().out
+    assert f"Initializing memory from:\n  {source}" in output
+    assert f"Writing memory to:\n  {destination}" in output
+    assert "Memory checkpoint restored successfully." in output
+
+
+def test_initial_memory_checkpoint_validates_source_and_destination(tmp_path: Path) -> None:
+    source = tmp_path / "phase_a" / "memory"
+    ensure_memory_layout(source)
+    common = dict(
+        experiment_name="phase_b", games="tt01", samplers="mixed", seeds="0",
+        steps_per_epoch=10, max_epochs=1, horizon=2, context_depth=1,
+    )
+    with pytest.raises(RuntimeError, match="does not exist"):
+        run_continuous_research(
+            ContinuousResearchConfig(**common, output_dir=str(tmp_path / "missing"), initial_memory_dir=str(tmp_path / "nope"))
+        )
+    incomplete = tmp_path / "incomplete_memory"
+    incomplete.mkdir()
+    with pytest.raises(RuntimeError, match="missing required SQLite"):
+        run_continuous_research(
+            ContinuousResearchConfig(**common, output_dir=str(tmp_path / "incomplete_output"), initial_memory_dir=str(incomplete))
+        )
+    with pytest.raises(RuntimeError, match="must not equal"):
+        run_continuous_research(
+            ContinuousResearchConfig(**common, output_dir=str(tmp_path / "phase_a"), initial_memory_dir=str(source))
+        )
+    existing_output = tmp_path / "existing"
+    (existing_output / "memory").mkdir(parents=True)
+    with pytest.raises(RuntimeError, match="already exists"):
+        run_continuous_research(
+            ContinuousResearchConfig(
+                **common,
+                output_dir=str(existing_output),
+                initial_memory_dir=str(source),
+                resume=False,
+            )
+        )
 
 
 def test_epoch_2_loads_existing_memory_and_global_step_offset_increments(tmp_path: Path, monkeypatch) -> None:
