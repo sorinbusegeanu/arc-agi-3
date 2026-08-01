@@ -616,6 +616,11 @@ def build_parser() -> argparse.ArgumentParser:
     hypothesis_suite.add_argument("--max-role-transfer-attempts-per-epoch", type=int, default=25000)
     hypothesis_suite.add_argument("--max-future-option-events-per-epoch", type=int, default=50000)
     hypothesis_suite.add_argument("--max-future-option-motifs-per-epoch", type=int, default=25000)
+    hypothesis_suite.add_argument(
+        "--future-option-development-stage",
+        choices=("auto", "survival", "movement_freedom", "environmental_influence", "graph_expansion", "role_discovery", "concept_transfer"),
+        default="auto",
+    )
     hypothesis_suite.add_argument("--hypothesis-progress", dest="hypothesis_progress", action="store_true", default=True)
     hypothesis_suite.add_argument("--no-hypothesis-progress", dest="hypothesis_progress", action="store_false")
     hypothesis_suite.add_argument("--hypothesis-progress-log-every", type=int, default=1000)
@@ -713,6 +718,11 @@ def build_parser() -> argparse.ArgumentParser:
     continuous.add_argument("--max-role-transfer-attempts-per-epoch", type=int, default=25000)
     continuous.add_argument("--max-future-option-events-per-epoch", type=int, default=50000)
     continuous.add_argument("--max-future-option-motifs-per-epoch", type=int, default=25000)
+    continuous.add_argument(
+        "--future-option-development-stage",
+        choices=("auto", "survival", "movement_freedom", "environmental_influence", "graph_expansion", "role_discovery", "concept_transfer"),
+        default="auto",
+    )
     continuous.add_argument("--hypothesis-progress", dest="hypothesis_progress", action="store_true", default=True)
     continuous.add_argument("--no-hypothesis-progress", dest="hypothesis_progress", action="store_false")
     continuous.add_argument("--hypothesis-progress-log-every", type=int, default=1000)
@@ -1617,6 +1627,7 @@ def main(argv: list[str] | None = None) -> int:
             max_role_transfer_attempts=int(args.max_role_transfer_attempts_per_epoch),
             max_future_option_events=int(args.max_future_option_events_per_epoch),
             max_future_option_motifs=int(args.max_future_option_motifs_per_epoch),
+            future_option_development_stage=str(args.future_option_development_stage),
             hypothesis_progress=args.hypothesis_progress,
             hypothesis_progress_log_every=int(args.hypothesis_progress_log_every),
         )
@@ -1703,6 +1714,7 @@ def main(argv: list[str] | None = None) -> int:
             max_role_transfer_attempts_per_epoch=int(args.max_role_transfer_attempts_per_epoch),
             max_future_option_events_per_epoch=int(args.max_future_option_events_per_epoch),
             max_future_option_motifs_per_epoch=int(args.max_future_option_motifs_per_epoch),
+            future_option_development_stage=str(args.future_option_development_stage),
             hypothesis_progress=bool(args.hypothesis_progress),
             hypothesis_progress_log_every=int(args.hypothesis_progress_log_every),
             memory_query_enabled=bool(args.memory_query_enabled),

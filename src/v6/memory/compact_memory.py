@@ -5410,6 +5410,15 @@ def _ensure_current_state_schema(path: Path) -> None:
                 source_action TEXT,
                 source_game_id TEXT,
                 source_sampler TEXT,
+                future_option_development_stage TEXT,
+                survival_delta REAL,
+                movement_freedom_delta REAL,
+                environmental_influence_delta REAL,
+                graph_expansion_delta REAL,
+                role_discovery_delta REAL,
+                concept_transfer_delta REAL,
+                developmental_option_value REAL,
+                motif_classification_reason TEXT,
                 evidence_json TEXT
             );
             CREATE TABLE IF NOT EXISTS future_option_motifs (
@@ -5438,7 +5447,10 @@ def _ensure_current_state_schema(path: Path) -> None:
                 source_family_ids_json TEXT,
                 source_carrier_ids_json TEXT,
                 source_role_ids_json TEXT,
-                source_concept_ids_json TEXT
+                source_concept_ids_json TEXT,
+                future_option_development_stage TEXT,
+                development_component_means_json TEXT,
+                motif_classification_reason TEXT
             );
             CREATE TABLE IF NOT EXISTS future_option_links (
                 motif_signature TEXT,
@@ -5540,6 +5552,8 @@ def _ensure_current_state_schema(path: Path) -> None:
             ON future_option_events(source_carrier_id);
             CREATE INDEX IF NOT EXISTS idx_future_option_events_source_role
             ON future_option_events(source_role_id);
+            CREATE INDEX IF NOT EXISTS idx_future_option_events_development_stage
+            ON future_option_events(future_option_development_stage, motif_classification_reason);
             CREATE INDEX IF NOT EXISTS idx_future_option_motifs_emergent
             ON future_option_motifs(is_emergent, motif_type);
             CREATE INDEX IF NOT EXISTS idx_future_option_links_type_key
@@ -5619,11 +5633,23 @@ def _ensure_current_state_schema(path: Path) -> None:
         _ensure_column(connection, "future_option_events", "source_action", "TEXT")
         _ensure_column(connection, "future_option_events", "source_game_id", "TEXT")
         _ensure_column(connection, "future_option_events", "source_sampler", "TEXT")
+        _ensure_column(connection, "future_option_events", "future_option_development_stage", "TEXT")
+        _ensure_column(connection, "future_option_events", "survival_delta", "REAL")
+        _ensure_column(connection, "future_option_events", "movement_freedom_delta", "REAL")
+        _ensure_column(connection, "future_option_events", "environmental_influence_delta", "REAL")
+        _ensure_column(connection, "future_option_events", "graph_expansion_delta", "REAL")
+        _ensure_column(connection, "future_option_events", "role_discovery_delta", "REAL")
+        _ensure_column(connection, "future_option_events", "concept_transfer_delta", "REAL")
+        _ensure_column(connection, "future_option_events", "developmental_option_value", "REAL")
+        _ensure_column(connection, "future_option_events", "motif_classification_reason", "TEXT")
         _ensure_column(connection, "future_option_motifs", "source_interaction_ids_json", "TEXT")
         _ensure_column(connection, "future_option_motifs", "source_family_ids_json", "TEXT")
         _ensure_column(connection, "future_option_motifs", "source_carrier_ids_json", "TEXT")
         _ensure_column(connection, "future_option_motifs", "source_role_ids_json", "TEXT")
         _ensure_column(connection, "future_option_motifs", "source_concept_ids_json", "TEXT")
+        _ensure_column(connection, "future_option_motifs", "future_option_development_stage", "TEXT")
+        _ensure_column(connection, "future_option_motifs", "development_component_means_json", "TEXT")
+        _ensure_column(connection, "future_option_motifs", "motif_classification_reason", "TEXT")
         _ensure_column(connection, "memory_scores", "memory_state", "TEXT")
         _ensure_column(connection, "memory_scores", "stored_epoch", "INTEGER")
         _ensure_column(connection, "memory_scores", "last_replayed_epoch", "INTEGER")

@@ -5,6 +5,7 @@ import sqlite3
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from enum import Enum
 from hashlib import sha1
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,26 @@ FUTURE_OPTION_CLEAR_TABLES = (
     "future_option_attention_links",
     "future_option_transfer_links",
 )
+
+
+class FutureOptionDevelopmentStage(str, Enum):
+    AUTO = "auto"
+    SURVIVAL = "survival"
+    MOVEMENT_FREEDOM = "movement_freedom"
+    ENVIRONMENTAL_INFLUENCE = "environmental_influence"
+    GRAPH_EXPANSION = "graph_expansion"
+    ROLE_DISCOVERY = "role_discovery"
+    CONCEPT_TRANSFER = "concept_transfer"
+
+
+@dataclass(frozen=True)
+class FutureOptionDevelopmentThresholds:
+    stable_contingencies: int = 1
+    transformation_families: int = 1
+    carriers: int = 1
+    roles: int = 1
+    promoted_concepts: int = 1
+    successful_transfers: int = 1
 
 
 @dataclass(frozen=True)
@@ -102,6 +123,8 @@ def derive_future_option_memory(
     run_dir: Path | None = None,
     max_events: int = 500_000,
     max_motifs: int = 100_000,
+    development_stage: str | FutureOptionDevelopmentStage = FutureOptionDevelopmentStage.AUTO,
+    development_thresholds: FutureOptionDevelopmentThresholds | None = None,
     progress_factory: Any | None = None,
 ) -> dict[str, Any]:
     del run_dir
@@ -111,15 +134,38 @@ def derive_future_option_memory(
         graph_conn.row_factory = sqlite3.Row
         for table in FUTURE_OPTION_CLEAR_TABLES:
             state_conn.execute(f"DELETE FROM {table}")
+        resolved_stage = resolve_future_option_development_stage(
+            state_conn,
+            requested_stage=development_stage,
+            thresholds=development_thresholds,
+        )
         t0 = time.time()
-        events = derive_future_option_events(state_conn, graph_conn, max_events=max_events, progress_factory=progress_factory)
+        events = derive_future_option_events(
+            state_conn,
+            graph_conn,
+            max_events=max_events,
+            development_stage=resolved_stage,
+            progress_factory=progress_factory,
+        )
         events["derive_future_option_events_seconds"] = float(time.time() - t0)
         t0 = time.time()
-        motifs = derive_future_option_motifs(state_conn, graph_conn, max_motifs=max_motifs, progress_factory=progress_factory)
+        motifs = derive_future_option_motifs(
+            state_conn,
+            graph_conn,
+            max_motifs=max_motifs,
+            development_stage=resolved_stage,
+            progress_factory=progress_factory,
+        )
         motifs["derive_future_option_motifs_seconds"] = float(time.time() - t0)
         attention = derive_future_option_attention_links(state_conn)
         transfer = derive_future_option_transfer_links(state_conn)
-        summary = {**events, **motifs, **attention, **transfer}
+        summary = {
+            "future_option_stage": resolved_stage.value,
+            **events,
+            **motifs,
+            **attention,
+            **transfer,
+        }
         state_conn.execute(
             """
             INSERT INTO memory_summary (key, value_json)
@@ -137,6 +183,7 @@ def derive_future_option_events(
     state_conn: sqlite3.Connection,
     graph_conn: sqlite3.Connection,
     max_events: int,
+    development_stage: FutureOptionDevelopmentStage = FutureOptionDevelopmentStage.SURVIVAL,
     progress_factory: Any | None = None,
 ) -> dict[str, Any]:
     inserted = 0
@@ -162,9 +209,12 @@ def derive_future_option_events(
                 novelty_score, reversibility_score, branching_score, termination_score, contradiction_score,
                 replay_priority_score, memory_priority_score, first_seen_global_step, last_seen_global_step,
                 source_interaction_id, source_family_id, source_carrier_id, source_role_id, source_concept_id,
-                source_context_signature, source_action, source_game_id, source_sampler, evidence_json
+                source_context_signature, source_action, source_game_id, source_sampler,
+                future_option_development_stage, survival_delta, movement_freedom_delta,
+                environmental_influence_delta, graph_expansion_delta, role_discovery_delta,
+                concept_transfer_delta, developmental_option_value, motif_classification_reason, evidence_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 payload["event_id"],
@@ -198,6 +248,15 @@ def derive_future_option_events(
                 payload["source_action"],
                 payload["source_game_id"],
                 payload["source_sampler"],
+                payload["future_option_development_stage"],
+                payload["survival_delta"],
+                payload["movement_freedom_delta"],
+                payload["environmental_influence_delta"],
+                payload["graph_expansion_delta"],
+                payload["role_discovery_delta"],
+                payload["concept_transfer_delta"],
+                payload["developmental_option_value"],
+                payload["motif_classification_reason"],
                 json.dumps(payload["evidence_json"], sort_keys=True),
             ),
         )
@@ -336,6 +395,7 @@ def derive_future_option_events(
                 },
                 action_group=None if row["action"] is None else str(row["action"]),
                 source_family_ids=families_by_contingency.get(str(row["canonical_key"]), set()),
+                development_stage=development_stage,
             )
         )
         if inserted > before_inserted:
@@ -398,6 +458,7 @@ def derive_future_option_events(
                 source_interaction_ids=_interaction_ids_from_nodes(interaction_ids_by_family.get(family_signature, set())),
                 source_family_ids={family_signature},
                 source_carrier_ids=carriers_by_family.get(family_signature, set()),
+                development_stage=development_stage,
             )
         )
         if inserted > before_inserted:
@@ -467,6 +528,7 @@ def derive_future_option_events(
                 source_carrier_ids={str(row["carrier_signature"])},
                 source_role_ids=carrier_roles,
                 source_concept_ids=carrier_concepts,
+                development_stage=development_stage,
             )
         )
         if inserted > before_inserted:
@@ -536,6 +598,7 @@ def derive_future_option_events(
                 source_carrier_ids=role_carriers,
                 source_role_ids={str(row["role_signature"])},
                 source_concept_ids=role_concepts,
+                development_stage=development_stage,
             )
         )
         if inserted > before_inserted:
@@ -563,6 +626,7 @@ def derive_future_option_motifs(
     state_conn: sqlite3.Connection,
     graph_conn: sqlite3.Connection,
     max_motifs: int,
+    development_stage: FutureOptionDevelopmentStage = FutureOptionDevelopmentStage.SURVIVAL,
     progress_factory: Any | None = None,
 ) -> dict[str, Any]:
     carrier_links = _links_by_signature(state_conn, "carrier_links", "carrier_signature")
@@ -594,7 +658,15 @@ def derive_future_option_motifs(
     role_linked_event_count = 0
     motifs_with_role_links = 0
     emergent_motifs_with_role_links = 0
-    provenance_resolution_failures = 0
+    failure_occurrence_count = 0
+    unresolved_family_occurrence_count = 0
+    unresolved_carrier_occurrence_count = 0
+    unresolved_role_occurrence_count = 0
+    unique_unresolved_families: set[str] = set()
+    unique_unresolved_carriers: set[str] = set()
+    unique_unresolved_roles: set[str] = set()
+    structural_classification_counts: Counter[str] = Counter()
+    unknown_reason_counts: Counter[str] = Counter()
     groups: dict[str, dict[str, Any]] = {}
     row_tracker = progress_factory("derive_future_option_motifs events", len(rows), "event", False) if progress_factory else None
     for row in rows:
@@ -670,6 +742,8 @@ def derive_future_option_motifs(
                 "source_carriers": set(),
                 "source_roles": set(),
                 "source_concepts": set(),
+                "development_components": [],
+                "classification_reasons": Counter(),
                 "contexts": set(),
                 "games": set(),
                 "support_count": 0,
@@ -687,6 +761,11 @@ def derive_future_option_motifs(
         group["source_carriers"].update(source_carriers)
         group["source_roles"].update(source_roles)
         group["source_concepts"].update(source_concepts)
+        group["development_components"].append(_development_components_from_row(row))
+        event_classification_reason = str(row.get("motif_classification_reason") or "unknown")
+        group["classification_reasons"][event_classification_reason] += 1
+        if event_classification_reason.startswith("structural"):
+            structural_classification_counts[event_classification_reason] += 1
         group["contexts"].update(contexts)
         group["games"].update(games)
         support_hint = int(evidence.get("support_count", 1) or 1)
@@ -717,7 +796,16 @@ def derive_future_option_motifs(
             concepts_by_role=concepts_by_role,
             concepts_by_link=concepts_by_link,
         )
-        provenance_resolution_failures += int(resolution["failures"])
+        unresolved_families = set(resolution["unresolved_families"])
+        unresolved_carriers = set(resolution["unresolved_carriers"])
+        unresolved_roles = set(resolution["unresolved_roles"])
+        unresolved_family_occurrence_count += len(unresolved_families)
+        unresolved_carrier_occurrence_count += len(unresolved_carriers)
+        unresolved_role_occurrence_count += len(unresolved_roles)
+        failure_occurrence_count += len(unresolved_families) + len(unresolved_carriers) + len(unresolved_roles)
+        unique_unresolved_families.update(unresolved_families)
+        unique_unresolved_carriers.update(unresolved_carriers)
+        unique_unresolved_roles.update(unresolved_roles)
         events = group["events"]
         linked_event_count = len(events)
         linked_family_count = len(group["families"])
@@ -735,6 +823,10 @@ def derive_future_option_motifs(
         mean_branching_score = _mean([row.get("branching_score") for row in events])
         mean_termination_score = _mean([row.get("termination_score") for row in events])
         mean_replay_priority_score = _mean([row.get("replay_priority_score") for row in events])
+        component_means = _mean_development_components(group["development_components"])
+        classification_reason = _majority_counter_value(group["classification_reasons"])
+        if str(group["motif_type"]) == "unknown":
+            unknown_reason_counts[classification_reason] += linked_event_count
         for row in events:
             evidence = _load_jsonish(row.get("evidence_json"))
             motif_type_source_counts[str(evidence.get("motif_type_source") or "unknown")] += 1
@@ -762,9 +854,10 @@ def derive_future_option_motifs(
                 mean_abs_option_delta, mean_novelty_score, mean_reversibility_score, mean_branching_score,
                 mean_termination_score, mean_replay_priority_score, first_seen_global_step, last_seen_global_step,
                 motif_stability_score, is_emergent, source_interaction_ids_json, source_family_ids_json,
-                source_carrier_ids_json, source_role_ids_json, source_concept_ids_json
+                source_carrier_ids_json, source_role_ids_json, source_concept_ids_json,
+                future_option_development_stage, development_component_means_json, motif_classification_reason
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 motif_signature,
@@ -793,6 +886,9 @@ def derive_future_option_motifs(
                 json.dumps(sorted(group["source_carriers"])),
                 json.dumps(sorted(group["source_roles"])),
                 json.dumps(sorted(group["source_concepts"])),
+                development_stage.value,
+                json.dumps(component_means, sort_keys=True),
+                classification_reason,
             ),
         )
         if is_emergent:
@@ -847,7 +943,21 @@ def derive_future_option_motifs(
         "motifs_with_carrier_provenance": sum(1 for group in groups.values() if group["source_carriers"]),
         "motifs_with_role_provenance": sum(1 for group in groups.values() if group["source_roles"]),
         "motifs_with_concept_provenance": sum(1 for group in groups.values() if group["source_concepts"]),
-        "provenance_resolution_failures": provenance_resolution_failures,
+        "provenance_resolution_failures": failure_occurrence_count,
+        "failure_occurrence_count": failure_occurrence_count,
+        "unique_unresolved_id_count": len(unique_unresolved_families | unique_unresolved_carriers | unique_unresolved_roles),
+        "unresolved_family_to_carrier_count": unresolved_family_occurrence_count,
+        "unresolved_carrier_to_role_count": unresolved_carrier_occurrence_count,
+        "unresolved_role_to_concept_count": unresolved_role_occurrence_count,
+        "unique_unresolved_family_to_carrier_count": len(unique_unresolved_families),
+        "unique_unresolved_carrier_to_role_count": len(unique_unresolved_carriers),
+        "unique_unresolved_role_to_concept_count": len(unique_unresolved_roles),
+        "classified_by_structural_effect_count": int(structural_classification_counts.get("structural_effect", 0)),
+        "classified_by_option_delta_count": int(structural_classification_counts.get("structural_option_delta", 0)),
+        "classified_by_graph_effect_count": int(structural_classification_counts.get("structural_graph_effect", 0)),
+        "classified_by_role_effect_count": int(structural_classification_counts.get("structural_role_effect", 0)),
+        "classified_by_concept_effect_count": int(structural_classification_counts.get("structural_concept_effect", 0)),
+        "unknown_reason_counts": dict(sorted(unknown_reason_counts.items())),
     }
 
 
@@ -1211,9 +1321,12 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
     motifs_skipped_no_role_links = 0
     motifs_skipped_insufficient_support_or_stability = 0
     motifs_with_role_links_for_transfer = 0
-    roles_seen_from_motif_links = 0
-    roles_with_transfer_attempts = 0
-    roles_with_concepts = 0
+    unique_roles_seen_from_motif_links: set[str] = set()
+    unique_roles_with_transfer_attempts: set[str] = set()
+    unique_roles_with_concepts: set[str] = set()
+    motif_role_link_count = 0
+    motif_role_transfer_attempt_link_count = 0
+    motif_role_concept_link_count = 0
     for motif_signature in sorted(motif_links):
         motifs_seen_for_transfer += 1
         quality = motif_quality.get(motif_signature, {})
@@ -1229,7 +1342,8 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
             motifs_skipped_insufficient_support_or_stability += 1
             continue
         motifs_with_role_links_for_transfer += 1
-        roles_seen_from_motif_links += len(roles)
+        motif_role_link_count += len(roles)
+        unique_roles_seen_from_motif_links.update(roles)
         motif_had_transfer = False
         motif_had_strong = False
         motif_had_promoted = False
@@ -1237,9 +1351,11 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
             concepts = sorted(concepts_by_role.get(role_signature, set()) or {"__none__"})
             role_transfer_rows = transfers_by_role.get(role_signature, [])
             if role_transfer_rows:
-                roles_with_transfer_attempts += 1
+                unique_roles_with_transfer_attempts.add(role_signature)
+                motif_role_transfer_attempt_link_count += 1
             if role_signature in concepts_by_role:
-                roles_with_concepts += 1
+                unique_roles_with_concepts.add(role_signature)
+                motif_role_concept_link_count += len(concepts_by_role[role_signature])
             for concept_signature in concepts:
                 transfer_attempt_count = len(role_transfer_rows)
                 successful_transfer_count = sum(1 for row in role_transfer_rows if int(row["reuse_success"] or 0) == 1)
@@ -1267,6 +1383,15 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
                         mean_transfer_score, mean_best_margin, first_seen_global_step, last_seen_global_step
                     )
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(motif_signature, role_signature, concept_signature) DO UPDATE SET
+                        transfer_attempt_count = excluded.transfer_attempt_count,
+                        successful_transfer_count = excluded.successful_transfer_count,
+                        strong_transfer_success_count = excluded.strong_transfer_success_count,
+                        promoted_concept_count = excluded.promoted_concept_count,
+                        mean_transfer_score = excluded.mean_transfer_score,
+                        mean_best_margin = excluded.mean_best_margin,
+                        first_seen_global_step = excluded.first_seen_global_step,
+                        last_seen_global_step = excluded.last_seen_global_step
                     """,
                     (
                         motif_signature,
@@ -1319,9 +1444,15 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
         "motifs_skipped_no_role_links": motifs_skipped_no_role_links,
         "motifs_skipped_insufficient_support_or_stability": motifs_skipped_insufficient_support_or_stability,
         "motifs_with_role_links_for_transfer": motifs_with_role_links_for_transfer,
-        "roles_seen_from_motif_links": roles_seen_from_motif_links,
-        "roles_with_transfer_attempts": roles_with_transfer_attempts,
-        "roles_with_concepts": roles_with_concepts,
+        "roles_seen_from_motif_links": len(unique_roles_seen_from_motif_links),
+        "roles_with_transfer_attempts": len(unique_roles_with_transfer_attempts),
+        "roles_with_concepts": len(unique_roles_with_concepts),
+        "unique_roles_seen_from_motif_links": len(unique_roles_seen_from_motif_links),
+        "unique_roles_with_transfer_attempts": len(unique_roles_with_transfer_attempts),
+        "unique_roles_with_concepts": len(unique_roles_with_concepts),
+        "motif_role_link_count": motif_role_link_count,
+        "motif_role_transfer_attempt_link_count": motif_role_transfer_attempt_link_count,
+        "motif_role_concept_link_count": motif_role_concept_link_count,
     }
 
 
@@ -1354,8 +1485,9 @@ def _build_future_option_event(
     source_carrier_ids: set[str] | list[str] | tuple[str, ...] = (),
     source_role_ids: set[str] | list[str] | tuple[str, ...] = (),
     source_concept_ids: set[str] | list[str] | tuple[str, ...] = (),
+    development_stage: FutureOptionDevelopmentStage = FutureOptionDevelopmentStage.SURVIVAL,
 ) -> dict[str, Any]:
-    motif_type, text_tokens, motif_type_source = _detect_motif_type(
+    fallback_motif_type, text_tokens, fallback_motif_type_source = _detect_motif_type(
         text_fragments,
         owner_type=owner_type,
         source_kind=source_kind,
@@ -1366,6 +1498,18 @@ def _build_future_option_event(
         future_option_edge_type=future_option_edge_type,
         live_delta_threshold=live_delta_threshold,
     )
+    motif_type, motif_classification_reason = _classify_structural_motif(
+        fallback_motif_type=fallback_motif_type,
+        live_option_delta=live_option_delta,
+        future_option_edge_type=future_option_edge_type,
+        effect_type=effect_type,
+        source_interaction_ids=source_interaction_ids,
+        source_family_ids=source_family_ids,
+        source_carrier_ids=source_carrier_ids,
+        source_role_ids=source_role_ids,
+        source_concept_ids=source_concept_ids,
+    )
+    motif_type_source = fallback_motif_type_source
     polarity_text = str(polarity or "").lower()
     combined_text = " ".join(str(item or "") for item in text_fragments).lower()
     if live_option_delta is not None:
@@ -1407,6 +1551,22 @@ def _build_future_option_event(
     }
     for key, values in provenance.items():
         evidence[key] = values
+    components = _compute_development_components(
+        option_delta=option_delta,
+        motif_type=motif_type,
+        effect_type=effect_type,
+        future_option_edge_type=future_option_edge_type,
+        source_interaction_ids=provenance["source_interaction_ids"],
+        source_family_ids=provenance["source_family_ids"],
+        source_carrier_ids=provenance["source_carrier_ids"],
+        source_role_ids=provenance["source_role_ids"],
+        source_concept_ids=provenance["source_concept_ids"],
+    )
+    developmental_option_value = float(components[_development_component_name(development_stage)])
+    evidence["future_option_development_stage"] = development_stage.value
+    evidence["development_components"] = components
+    evidence["developmental_option_value"] = developmental_option_value
+    evidence["motif_classification_reason"] = motif_classification_reason
     return {
         "event_id": "foe:" + sha1(event_id_seed.encode("utf-8")).hexdigest(),
         "owner_type": owner_type,
@@ -1439,6 +1599,15 @@ def _build_future_option_event(
         "source_action": action_key,
         "source_game_id": None if game in (None, "") else str(game),
         "source_sampler": None if sampler in (None, "") else str(sampler),
+        "future_option_development_stage": development_stage.value,
+        "survival_delta": components["survival_delta"],
+        "movement_freedom_delta": components["movement_freedom_delta"],
+        "environmental_influence_delta": components["environmental_influence_delta"],
+        "graph_expansion_delta": components["graph_expansion_delta"],
+        "role_discovery_delta": components["role_discovery_delta"],
+        "concept_transfer_delta": components["concept_transfer_delta"],
+        "developmental_option_value": developmental_option_value,
+        "motif_classification_reason": motif_classification_reason,
         "evidence_json": evidence,
     }
 
@@ -1511,9 +1680,11 @@ def _resolve_motif_provenance(
     roles_by_carrier: dict[str, set[str]],
     concepts_by_role: dict[str, set[str]],
     concepts_by_link: dict[tuple[str, str], set[str]],
-) -> dict[str, int]:
+) -> dict[str, set[str]]:
     """Resolve only explicit substrate links; no name-based association is used."""
-    failures = 0
+    unresolved_families: set[str] = set()
+    unresolved_carriers: set[str] = set()
+    unresolved_roles: set[str] = set()
     families = set(group["families"]) | set(group["source_families"])
     carriers = set(group["carriers"]) | set(group["source_carriers"])
     roles = set(group["roles"]) | set(group["source_roles"])
@@ -1521,18 +1692,18 @@ def _resolve_motif_provenance(
     for family in sorted(families):
         resolved = carriers_by_family.get(family, set())
         if not resolved:
-            failures += 1
+            unresolved_families.add(family)
         carriers.update(resolved)
     for carrier in sorted(carriers):
         resolved = roles_by_carrier.get(carrier, set())
         if not resolved:
-            failures += 1
+            unresolved_carriers.add(carrier)
         roles.update(resolved)
         concepts.update(concepts_by_link.get(("carrier", carrier), set()))
     for role in sorted(roles):
         resolved = concepts_by_role.get(role, set())
         if not resolved:
-            failures += 1
+            unresolved_roles.add(role)
         concepts.update(resolved)
     for family in families:
         concepts.update(concepts_by_link.get(("family", family), set()))
@@ -1544,7 +1715,11 @@ def _resolve_motif_provenance(
     group["source_carriers"].update(carriers)
     group["source_roles"].update(roles)
     group["source_concepts"].update(concepts)
-    return {"failures": failures}
+    return {
+        "unresolved_families": unresolved_families,
+        "unresolved_carriers": unresolved_carriers,
+        "unresolved_roles": unresolved_roles,
+    }
 
 
 def _upsert_future_provenance_link(
@@ -1576,6 +1751,153 @@ def _upsert_future_provenance_link(
         """,
         (motif_signature, linked_type, linked_key, first_seen, last_seen),
     )
+
+
+def resolve_future_option_development_stage(
+    state_conn: sqlite3.Connection,
+    *,
+    requested_stage: str | FutureOptionDevelopmentStage,
+    thresholds: FutureOptionDevelopmentThresholds | None = None,
+) -> FutureOptionDevelopmentStage:
+    requested = (
+        requested_stage
+        if isinstance(requested_stage, FutureOptionDevelopmentStage)
+        else FutureOptionDevelopmentStage(str(requested_stage).strip().lower())
+    )
+    if requested is not FutureOptionDevelopmentStage.AUTO:
+        return requested
+    limits = thresholds or FutureOptionDevelopmentThresholds()
+    counts = {
+        "stable_contingencies": int(state_conn.execute("SELECT COUNT(*) FROM stable_contingencies").fetchone()[0]),
+        "transformation_families": int(state_conn.execute("SELECT COUNT(*) FROM transformation_families").fetchone()[0]),
+        "carriers": int(state_conn.execute("SELECT COUNT(*) FROM carrier_candidates WHERE COALESCE(is_emergent, 0) = 1").fetchone()[0]),
+        "roles": int(state_conn.execute("SELECT COUNT(*) FROM role_candidates WHERE COALESCE(is_emergent, 0) = 1").fetchone()[0]),
+        "promoted_concepts": int(state_conn.execute("SELECT COUNT(*) FROM concept_candidates WHERE COALESCE(is_promoted, 0) = 1").fetchone()[0]),
+        "successful_transfers": int(state_conn.execute("SELECT COUNT(*) FROM role_transfer_attempts WHERE COALESCE(reuse_success, 0) = 1").fetchone()[0]),
+    }
+    if counts["promoted_concepts"] >= limits.promoted_concepts and counts["successful_transfers"] >= limits.successful_transfers:
+        return FutureOptionDevelopmentStage.CONCEPT_TRANSFER
+    if counts["roles"] >= limits.roles:
+        return FutureOptionDevelopmentStage.ROLE_DISCOVERY
+    if counts["carriers"] >= limits.carriers:
+        return FutureOptionDevelopmentStage.GRAPH_EXPANSION
+    if counts["transformation_families"] >= limits.transformation_families:
+        return FutureOptionDevelopmentStage.ENVIRONMENTAL_INFLUENCE
+    if counts["stable_contingencies"] >= limits.stable_contingencies:
+        return FutureOptionDevelopmentStage.MOVEMENT_FREEDOM
+    return FutureOptionDevelopmentStage.SURVIVAL
+
+
+def _classify_structural_motif(
+    *,
+    fallback_motif_type: str,
+    live_option_delta: float | None,
+    future_option_edge_type: str | None,
+    effect_type: str | None,
+    source_interaction_ids: set[str] | list[str] | tuple[str, ...],
+    source_family_ids: set[str] | list[str] | tuple[str, ...],
+    source_carrier_ids: set[str] | list[str] | tuple[str, ...],
+    source_role_ids: set[str] | list[str] | tuple[str, ...],
+    source_concept_ids: set[str] | list[str] | tuple[str, ...],
+) -> tuple[str, str]:
+    effect = str(effect_type or "").lower()
+    edge = str(future_option_edge_type or "")
+    if "terminal_transition" in effect:
+        return "terminate", "structural_effect"
+    if edge == "expands_future_options":
+        return "enable", "structural_option_delta"
+    if edge == "restricts_future_options":
+        return "block", "structural_option_delta"
+    if live_option_delta is not None:
+        if float(live_option_delta) > 0.0:
+            return "enable", "structural_option_delta"
+        if float(live_option_delta) < 0.0:
+            return "block", "structural_option_delta"
+        return "neutral", "structural_option_delta"
+    if effect in {"positive_change", "mixed_change"}:
+        return "transform", "structural_effect"
+    if effect in {"preserve", "no_change"}:
+        return "neutral", "structural_effect"
+    if source_concept_ids:
+        return "transform", "structural_concept_effect"
+    if source_role_ids:
+        return "transform", "structural_role_effect"
+    if source_interaction_ids or source_family_ids or source_carrier_ids:
+        return "transform", "structural_graph_effect"
+    return fallback_motif_type, "fallback_" + ("unknown" if fallback_motif_type == "unknown" else "text_or_legacy")
+
+
+def _compute_development_components(
+    *,
+    option_delta: float,
+    motif_type: str,
+    effect_type: str | None,
+    future_option_edge_type: str | None,
+    source_interaction_ids: list[str],
+    source_family_ids: list[str],
+    source_carrier_ids: list[str],
+    source_role_ids: list[str],
+    source_concept_ids: list[str],
+) -> dict[str, float]:
+    terminal = motif_type == "terminate" or "terminal_transition" in str(effect_type or "").lower()
+    movement = float(option_delta)
+    graph_evidence = len(source_interaction_ids) + len(source_family_ids) + len(source_carrier_ids)
+    environmental = 1.0 if str(effect_type or "").lower() in {"positive_change", "mixed_change"} else 0.0
+    if terminal:
+        environmental = -1.0
+    elif str(future_option_edge_type or "") == "restricts_future_options":
+        environmental = min(environmental, -1.0)
+    return {
+        "survival_delta": -1.0 if terminal else 0.0,
+        "movement_freedom_delta": movement,
+        "environmental_influence_delta": environmental,
+        "graph_expansion_delta": min(1.0, float(graph_evidence) / 3.0),
+        "role_discovery_delta": min(1.0, float(len(source_role_ids))),
+        "concept_transfer_delta": min(1.0, float(len(source_concept_ids))),
+    }
+
+
+def _development_component_name(stage: FutureOptionDevelopmentStage) -> str:
+    return {
+        FutureOptionDevelopmentStage.SURVIVAL: "survival_delta",
+        FutureOptionDevelopmentStage.MOVEMENT_FREEDOM: "movement_freedom_delta",
+        FutureOptionDevelopmentStage.ENVIRONMENTAL_INFLUENCE: "environmental_influence_delta",
+        FutureOptionDevelopmentStage.GRAPH_EXPANSION: "graph_expansion_delta",
+        FutureOptionDevelopmentStage.ROLE_DISCOVERY: "role_discovery_delta",
+        FutureOptionDevelopmentStage.CONCEPT_TRANSFER: "concept_transfer_delta",
+    }.get(stage, "survival_delta")
+
+
+def _development_components_from_row(row: dict[str, Any]) -> dict[str, float]:
+    return {
+        name: float(row.get(name) or 0.0)
+        for name in (
+            "survival_delta",
+            "movement_freedom_delta",
+            "environmental_influence_delta",
+            "graph_expansion_delta",
+            "role_discovery_delta",
+            "concept_transfer_delta",
+        )
+    }
+
+
+def _mean_development_components(components: list[dict[str, float]]) -> dict[str, float | None]:
+    names = (
+        "survival_delta",
+        "movement_freedom_delta",
+        "environmental_influence_delta",
+        "graph_expansion_delta",
+        "role_discovery_delta",
+        "concept_transfer_delta",
+    )
+    return {name: _mean([item.get(name) for item in components]) for name in names}
+
+
+def _majority_counter_value(counter: Counter[str]) -> str:
+    if not counter:
+        return "unknown"
+    return sorted(counter.items(), key=lambda item: (-item[1], item[0]))[0][0]
 
 
 def _mean_live_delta_for_interactions(

@@ -102,6 +102,7 @@ class ContinuousResearchConfig:
     max_role_transfer_attempts_per_epoch: int = 25_000
     max_future_option_events_per_epoch: int = 50_000
     max_future_option_motifs_per_epoch: int = 25_000
+    future_option_development_stage: str = "auto"
     hypothesis_progress: bool = True
     hypothesis_progress_log_every: int = 1000
     memory_query_enabled: bool = False
@@ -385,6 +386,7 @@ def _run_continuous_research_inner(config: ContinuousResearchConfig) -> dict[str
             max_role_transfer_attempts=int(config.max_role_transfer_attempts_per_epoch),
             max_future_option_events=int(config.max_future_option_events_per_epoch),
             max_future_option_motifs=int(config.max_future_option_motifs_per_epoch),
+            future_option_development_stage=str(config.future_option_development_stage),
             hypothesis_progress=bool(config.hypothesis_progress),
             hypothesis_progress_log_every=int(config.hypothesis_progress_log_every),
         )
@@ -702,6 +704,7 @@ def _load_or_initialize_manifest(config: ContinuousResearchConfig, manifest_path
         "live_memory_flush_seconds": float(config.live_memory_flush_seconds),
         "live_memory_delta_max_events": int(config.live_memory_delta_max_events),
         "live_memory_delta_batch_limit": int(config.live_memory_delta_batch_limit),
+        "future_option_development_stage": str(config.future_option_development_stage),
         "stop_if_disk_above_percent": float(config.stop_if_disk_above_percent),
         "stop_if_no_new_stable_contingencies_for": int(config.stop_if_no_new_stable_contingencies_for),
         "completed_epochs": 0,

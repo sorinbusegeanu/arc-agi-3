@@ -221,6 +221,7 @@ def run_hypothesis_suite_report(
     max_role_transfer_attempts: int = 25_000,
     max_future_option_events: int = 50_000,
     max_future_option_motifs: int = 25_000,
+    future_option_development_stage: str = "auto",
     allow_memory_repair: bool = False,
     hypothesis_progress: bool | None = None,
     hypothesis_progress_log_every: int = 1000,
@@ -395,6 +396,7 @@ def run_hypothesis_suite_report(
                                 run_dir=run_dir,
                                 max_events=int(max_future_option_events),
                                 max_motifs=int(max_future_option_motifs),
+                                development_stage=str(future_option_development_stage),
                                 progress_factory=_progress_factory,
                             )
                             timings["derive_future_option_events_seconds"] = float(future_summary.get("derive_future_option_events_seconds", time.time() - future_t0))

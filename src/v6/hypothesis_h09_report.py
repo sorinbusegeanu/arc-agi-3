@@ -114,6 +114,13 @@ def evaluate_h09_future_option_motifs(
         "future_option_events_inserted_total": derivation_summary.get("future_option_events_inserted_total"),
         "future_option_motifs_inserted_total": derivation_summary.get("future_option_motifs_inserted_total"),
         "future_option_derivation_error": derivation_summary.get("future_option_derivation_error"),
+        "future_option_stage": derivation_summary.get("future_option_stage"),
+        "classified_by_structural_effect_count": derivation_summary.get("classified_by_structural_effect_count"),
+        "classified_by_option_delta_count": derivation_summary.get("classified_by_option_delta_count"),
+        "classified_by_graph_effect_count": derivation_summary.get("classified_by_graph_effect_count"),
+        "classified_by_role_effect_count": derivation_summary.get("classified_by_role_effect_count"),
+        "classified_by_concept_effect_count": derivation_summary.get("classified_by_concept_effect_count"),
+        "unknown_reason_counts": derivation_summary.get("unknown_reason_counts"),
         "missing_evidence": [],
     }
     source_counts = Counter()
@@ -181,6 +188,13 @@ def evaluate_h09_future_option_motifs(
             "role_events_inserted",
             "future_option_events_inserted_total",
             "future_option_motifs_inserted_total",
+            "future_option_stage",
+            "classified_by_structural_effect_count",
+            "classified_by_option_delta_count",
+            "classified_by_graph_effect_count",
+            "classified_by_role_effect_count",
+            "classified_by_concept_effect_count",
+            "unknown_reason_counts",
             "future_option_motif_count",
             "emergent_future_option_motif_count",
             "motif_type_counts",
@@ -218,6 +232,7 @@ def _write(output_dir: Path, result: dict[str, Any]) -> None:
         f"future-option events: {result.get('future_option_event_count')}\n"
         f"future-option motifs: {result.get('future_option_motif_count')}\n"
         f"emergent motifs: {result.get('emergent_future_option_motif_count')}\n"
+        f"development stage: {result.get('future_option_stage')}\n"
         f"motif types: {result.get('motif_type_counts')}\n"
         f"motif type sources: {result.get('motif_type_source_counts')}\n"
         f"unknown motif ratio: {result.get('unknown_motif_ratio')}\n"

@@ -135,11 +135,50 @@ def test_family_and_carrier_provenance_resolve_through_role_and_transfer(tmp_pat
             == 1
             for motif_signature in carrier_motifs + family_motifs
         )
+        row_counts_before = {
+            table: state_conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("future_option_motifs", "future_option_links", "future_option_transfer_links")
+        }
         derive_future_option_motifs(state_conn, graph_conn, max_motifs=20)
+        derive_future_option_transfer_links(state_conn)
+        row_counts_after = {
+            table: state_conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("future_option_motifs", "future_option_links", "future_option_transfer_links")
+        }
+        assert row_counts_after == row_counts_before
         assert state_conn.execute(
             "SELECT support_count FROM future_option_links WHERE motif_signature = ? AND linked_type = 'motif_associated_with_role' AND linked_key = 'role-1'",
             (family_motifs[0],),
         ).fetchone()[0] == 1
+    finally:
+        state_conn.close()
+        graph_conn.close()
+
+
+def test_transfer_metrics_distinguish_unique_roles_from_motif_role_associations(tmp_path: Path) -> None:
+    _, state_conn, graph_conn = _provenance_memory(tmp_path)
+    try:
+        for motif_signature in ("motif-1", "motif-2"):
+            state_conn.execute(
+                """INSERT INTO future_option_motifs (
+                    motif_signature, motif_type, support_count, motif_stability_score, is_emergent
+                ) VALUES (?, 'enable', 3, 0.8, 1)""",
+                (motif_signature,),
+            )
+            state_conn.execute(
+                """INSERT INTO future_option_links (
+                    motif_signature, linked_type, linked_key, support_count
+                ) VALUES (?, 'motif_associated_with_role', 'role-1', 1)""",
+                (motif_signature,),
+            )
+        state_conn.commit()
+        summary = derive_future_option_transfer_links(state_conn)
+        assert summary["unique_roles_seen_from_motif_links"] == 1
+        assert summary["unique_roles_with_transfer_attempts"] == 1
+        assert summary["unique_roles_with_concepts"] == 1
+        assert summary["motif_role_link_count"] == 2
+        assert summary["motif_role_transfer_attempt_link_count"] == 2
+        assert summary["motif_role_concept_link_count"] == 2
     finally:
         state_conn.close()
         graph_conn.close()
@@ -196,6 +235,10 @@ def test_missing_provenance_never_invents_links_and_propagation_is_idempotent(tm
             "SELECT COUNT(*) FROM future_option_links WHERE linked_key = 'role-1'"
         ).fetchone()[0]
         assert first["provenance_resolution_failures"] >= 1
+        assert first["unresolved_family_to_carrier_count"] >= 1
+        assert first["unresolved_carrier_to_role_count"] == 0
+        assert first["unresolved_role_to_concept_count"] == 0
+        assert first["failure_occurrence_count"] >= first["unique_unresolved_id_count"]
         assert explicit_before == explicit_after == 0
         assert invented == 0
     finally:
