@@ -53,6 +53,7 @@ from v6.memory.direct_streaming_fold import (
     load_direct_streamed_job_metrics,
     load_direct_streamed_temporal_milestones,
     load_direct_streamed_validation_payloads,
+    record_direct_fold_postprocessing_timings,
 )
 from v6.sampling import make_sampler, sampler_registry
 from v6.storage.migration import migrate_sqlite_to_parquet
@@ -375,19 +376,34 @@ def run_interaction_sampling_v05c(config: InteractionSamplingConfig) -> list[dic
                 _export_sampling_sqlite_to_parquet(config, sampling_root)
             shutil.rmtree(sampling_root, ignore_errors=True)
         return []
-    rows = _evaluate_sampling_runs(config, sampling_root)
+    direct_fold_started_at = worker_execution.pop("direct_fold_shutdown_started_at", None)
+    direct_fold_timings = (
+        dict(worker_execution.get("direct_fold_shutdown_timings", {}) or {})
+        if isinstance(direct_fold_started_at, (int, float))
+        else None
+    )
+    rows = _evaluate_sampling_runs(config, sampling_root, direct_fold_timings)
+    diagnostics_started_at = time.perf_counter()
     comparison = sampler_comparison_rows(rows)
     best = best_by_game(rows)
     family_summary = summary_by_family(best)
+    _add_direct_fold_timing(direct_fold_timings, "diagnostics", time.perf_counter() - diagnostics_started_at)
+    milestones_started_at = time.perf_counter()
     temporal_milestones = _collect_temporal_milestones(config, sampling_root)
+    _add_direct_fold_timing(direct_fold_timings, "milestones", time.perf_counter() - milestones_started_at)
+    metrics_started_at = time.perf_counter()
     level_completion_records = _collect_level_completion_records(config, sampling_root)
+    _add_direct_fold_timing(direct_fold_timings, "metrics", time.perf_counter() - metrics_started_at)
     epoch_completion = compute_epoch_completion_counters(level_completion_records)
+    validation_started_at = time.perf_counter()
+    validation = validation_summary(rows, comparison, best)
+    _add_direct_fold_timing(direct_fold_timings, "validation", time.perf_counter() - validation_started_at)
     payload = {
         "runs": rows,
         "sampler_comparison": comparison,
         "best_by_game": best,
         "summary_by_family": family_summary,
-        "validation": validation_summary(rows, comparison, best),
+        "validation": validation,
         "games": list(config.games),
         "samplers": list(config.samplers),
         "seeds": [int(seed) for seed in config.seeds],
@@ -426,11 +442,30 @@ def run_interaction_sampling_v05c(config: InteractionSamplingConfig) -> list[dic
         "future_option_efficiency_posthoc_only": not bool(config.fast_postprocessing),
         "fast_postprocessing": bool(config.fast_postprocessing),
     }
+    if direct_fold_timings is not None:
+        worker_execution["direct_fold_postprocessing_timings"] = direct_fold_timings
+        payload["direct_fold_postprocessing_timings"] = direct_fold_timings
+    reports_started_at = time.perf_counter()
     write_interaction_sampling_reports(payload, output)
+    _add_direct_fold_timing(direct_fold_timings, "reports", time.perf_counter() - reports_started_at)
+    post_cleanup_started_at = time.perf_counter()
     if config.storage_backend == "parquet":
         if not bool(config.direct_streaming_fold_enabled):
             _export_sampling_sqlite_to_parquet(config, sampling_root)
         shutil.rmtree(sampling_root, ignore_errors=True)
+        _add_direct_fold_timing(direct_fold_timings, "post_cleanup", time.perf_counter() - post_cleanup_started_at)
+    if direct_fold_timings is not None:
+        manifest_started_at = time.perf_counter()
+        if config.memory_output_dir and direct_streaming_manifest_exists(config.memory_output_dir):
+            record_direct_fold_postprocessing_timings(config.memory_output_dir, direct_fold_timings)
+        _add_direct_fold_timing(direct_fold_timings, "reports", time.perf_counter() - manifest_started_at)
+        direct_fold_timings["total"] = time.perf_counter() - float(direct_fold_started_at)
+        worker_execution["direct_fold_postprocessing_timings"] = direct_fold_timings
+        payload["direct_fold_postprocessing_timings"] = direct_fold_timings
+        (output / "interaction_sampling_v05c_report.json").write_text(
+            json.dumps(payload, indent=2), encoding="utf-8"
+        )
+        print(_format_direct_fold_cleanup_timing_line(direct_fold_timings), flush=True)
     return rows
 
 
@@ -728,7 +763,7 @@ def _direct_streaming_fold_job_id(job: dict[str, Any]) -> str:
 
 
 def _format_direct_fold_cleanup_timing_line(timings: dict[str, float]) -> str:
-    """Return the single compact stdout line for direct-fold shutdown timing."""
+    """Return the single compact stdout line for direct-fold post-processing."""
     phases = (
         ("wait", "wait_futures"),
         ("flush", "live_writer_flush"),
@@ -737,6 +772,12 @@ def _format_direct_fold_cleanup_timing_line(timings: dict[str, float]) -> str:
         ("finalize", "finalize_memory"),
         ("checkpoint", "checkpoint"),
         ("cleanup", "cleanup"),
+        ("metrics", "metrics"),
+        ("milestones", "milestones"),
+        ("validation", "validation"),
+        ("diagnostics", "diagnostics"),
+        ("reports", "reports"),
+        ("post_cleanup", "post_cleanup"),
     )
     parts = ["DF"]
     for label, key in phases:
@@ -822,7 +863,6 @@ def _run_sampling_jobs(
                 metadata["epoch_id"] = summary.get("epoch_id", "worker_snapshot")
             except (OSError, TypeError, ValueError, json.JSONDecodeError):
                 pass
-        print("worker memory snapshot build: starting", file=sys.stderr, flush=True)
         snapshot_build_started = time.perf_counter()
         parent_snapshot = build_worker_memory_snapshot_from_directory(
             str(snapshot_job["memory_input_dir"]),
@@ -834,12 +874,6 @@ def _run_sampling_jobs(
         _, snapshot_serialized_bytes = write_worker_memory_snapshot_artifact(parent_snapshot, snapshot_artifact)
         snapshot_build_seconds = time.perf_counter() - snapshot_build_started
         snapshot_estimated_worker_bytes = int(snapshot_serialized_bytes)
-        print(
-            f"worker memory snapshot build: done serialized_bytes={snapshot_serialized_bytes} "
-            f"build_seconds={snapshot_build_seconds:.3f}",
-            file=sys.stderr,
-            flush=True,
-        )
         estimated_total = int(snapshot_estimated_worker_bytes) * int(workers)
         max_snapshot_bytes = snapshot_job.get("memory_snapshot_max_bytes")
         if max_snapshot_bytes is not None and estimated_total > int(max_snapshot_bytes):
@@ -1115,8 +1149,6 @@ def _run_sampling_jobs(
             direct_fold_cleanup_timings["manager_shutdown"] = time.perf_counter() - manager_shutdown_started_at
         if direct_fold_writer is not None:
             direct_fold_summary = direct_fold_writer.close()
-            # Shutdown timing is intentionally stdout-only; keep report and
-            # manifest payloads compatible with their existing schemas.
             close_timings = direct_fold_summary.pop("direct_streaming_fold_close_timings", {})
             if isinstance(close_timings, dict):
                 direct_fold_cleanup_timings.update(
@@ -1126,8 +1158,6 @@ def _run_sampling_jobs(
                         if isinstance(value, (int, float))
                     }
                 )
-            direct_fold_cleanup_timings["total"] = time.perf_counter() - direct_fold_cleanup_started_at
-            print(_format_direct_fold_cleanup_timing_line(direct_fold_cleanup_timings), flush=True)
             if int(direct_fold_summary.get("direct_streaming_fold_failed_count", 0) or 0) > 0:
                 failed_ids = list(direct_fold_summary.get("direct_streaming_fold_failed_job_ids", []))[:3]
                 failed_errors = list(direct_fold_summary.get("direct_streaming_fold_failed_errors", []))[:3]
@@ -1162,6 +1192,10 @@ def _run_sampling_jobs(
         "parallel_sidecar_fold_enabled": False,
         "parallel_sidecar_fold_shard_count": 0,
         "direct_streaming_fold_enabled": bool(direct_streaming_fold_enabled),
+        "direct_fold_shutdown_timings": direct_fold_cleanup_timings,
+        "direct_fold_shutdown_started_at": (
+            float(direct_fold_cleanup_started_at) if direct_fold_writer is not None else None
+        ),
         "direct_streaming_fold_writer_count": 1 if direct_streaming_fold_enabled else 0,
         "direct_streaming_fold_worker_count": int(direct_fold_summary.get("direct_streaming_fold_worker_count", 0) or 0),
         "direct_streaming_fold_shard_count": int(direct_fold_summary.get("direct_streaming_fold_shard_count", 0) or 0),
@@ -1598,10 +1632,18 @@ def _run_sampling_job(job: dict) -> dict:
     }
 
 
-def _evaluate_sampling_runs(config: InteractionSamplingConfig, sampling_root: Path) -> list[dict]:
+def _evaluate_sampling_runs(
+    config: InteractionSamplingConfig,
+    sampling_root: Path,
+    direct_fold_timings: dict[str, float] | None = None,
+) -> list[dict]:
     if config.memory_output_dir and direct_streaming_manifest_exists(config.memory_output_dir):
+        metrics_started_at = time.perf_counter()
         metric_rows = load_direct_streamed_job_metrics(config.memory_output_dir)
+        _add_direct_fold_timing(direct_fold_timings, "metrics", time.perf_counter() - metrics_started_at)
+        validation_started_at = time.perf_counter()
         validation_payloads = load_direct_streamed_validation_payloads(config.memory_output_dir)
+        _add_direct_fold_timing(direct_fold_timings, "validation", time.perf_counter() - validation_started_at)
         if not metric_rows:
             raise RuntimeError("Direct streaming fold manifest missing job metrics; raw DB fallback is disabled for normal continuous sampling.")
         if not validation_payloads:
@@ -1615,13 +1657,18 @@ def _evaluate_sampling_runs(config: InteractionSamplingConfig, sampling_root: Pa
         rows: list[dict] = []
         for game in config.games:
             for sampler_name in config.samplers:
+                metrics_started_at = time.perf_counter()
                 seed_rows = grouped.get((str(game), str(sampler_name)), [])
-                payload_rows = grouped_payloads.get((str(game), str(sampler_name)), [])
                 if not seed_rows:
                     rows.append(_failed_row(game, sampler_name, config, "missing direct-streamed job metrics"))
+                    _add_direct_fold_timing(direct_fold_timings, "metrics", time.perf_counter() - metrics_started_at)
                     continue
                 aggregate = _aggregate_seed_rows(seed_rows, config)
+                _add_direct_fold_timing(direct_fold_timings, "metrics", time.perf_counter() - metrics_started_at)
+                validation_started_at = time.perf_counter()
+                payload_rows = grouped_payloads.get((str(game), str(sampler_name)), [])
                 eval_row = _best_validation_row_from_streamed_payloads(game, sampler_name, config, payload_rows)
+                _add_direct_fold_timing(direct_fold_timings, "validation", time.perf_counter() - validation_started_at)
                 rows.append(
                     {
                         **aggregate,
@@ -1652,6 +1699,11 @@ def _evaluate_sampling_runs(config: InteractionSamplingConfig, sampling_root: Pa
             except Exception as exc:
                 rows.append(_failed_row(game, sampler_name, config, f"{type(exc).__name__}: {exc}"))
     return rows
+
+
+def _add_direct_fold_timing(timings: dict[str, float] | None, phase: str, elapsed_seconds: float) -> None:
+    if timings is not None:
+        timings[phase] = float(timings.get(phase, 0.0) + max(0.0, elapsed_seconds))
 
 
 def _collect_temporal_milestones(config: InteractionSamplingConfig, sampling_root: Path) -> dict:
@@ -2853,6 +2905,23 @@ def _merge_worker_execution_stats(left: dict[str, object], right: dict[str, obje
         "parallel_sidecar_fold_enabled": bool(left.get("parallel_sidecar_fold_enabled", False) or right.get("parallel_sidecar_fold_enabled", False)),
         "parallel_sidecar_fold_shard_count": int(left.get("parallel_sidecar_fold_shard_count", 0) or 0) + int(right.get("parallel_sidecar_fold_shard_count", 0) or 0),
         "direct_streaming_fold_enabled": bool(left.get("direct_streaming_fold_enabled", False) or right.get("direct_streaming_fold_enabled", False)),
+        "direct_fold_shutdown_timings": {
+            key: float((left.get("direct_fold_shutdown_timings", {}) or {}).get(key, 0.0) or 0.0)
+            + float((right.get("direct_fold_shutdown_timings", {}) or {}).get(key, 0.0) or 0.0)
+            for key in set((left.get("direct_fold_shutdown_timings", {}) or {}))
+            | set((right.get("direct_fold_shutdown_timings", {}) or {}))
+        },
+        "direct_fold_shutdown_started_at": min(
+            (
+                float(value)
+                for value in (
+                    left.get("direct_fold_shutdown_started_at"),
+                    right.get("direct_fold_shutdown_started_at"),
+                )
+                if isinstance(value, (int, float))
+            ),
+            default=None,
+        ),
         "direct_streaming_fold_writer_count": int(max(int(left.get("direct_streaming_fold_writer_count", 0) or 0), int(right.get("direct_streaming_fold_writer_count", 0) or 0))),
         "direct_streaming_fold_worker_count": int(max(int(left.get("direct_streaming_fold_worker_count", 0) or 0), int(right.get("direct_streaming_fold_worker_count", 0) or 0))),
         "direct_streaming_fold_shard_count": int(max(int(left.get("direct_streaming_fold_shard_count", 0) or 0), int(right.get("direct_streaming_fold_shard_count", 0) or 0))),

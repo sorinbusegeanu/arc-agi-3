@@ -448,7 +448,6 @@ def _run_continuous_research_inner(config: ContinuousResearchConfig) -> dict[str
                 "memory_nodes": memory_after.get("memory_node_count"),
             },
         )
-        continuity_report_started_at = time.perf_counter()
         continuity_report = _write_memory_continuity_report(
             reports_dir=reports_dir,
             epoch_id=epoch_id,
@@ -457,27 +456,14 @@ def _run_continuous_research_inner(config: ContinuousResearchConfig) -> dict[str
             after_epoch_memory_summary=memory_after,
             memory_loaded_from_previous_epoch=epoch_number > 1,
         )
-        _log_epoch_phase_done(epoch_id, "memory_continuity_report", continuity_report_started_at)
         _ensure_fold_summary_present(
             memory_paths=memory_paths,
             global_step_start=global_step_start,
             global_step_end=global_step_end,
             worker_execution=worker_execution,
         )
-        cleanup_validation_started_at = time.perf_counter()
         validate_cleanup_safe(epoch_dir, memory_dir, required_reports=True)
-        _log_epoch_phase_done(epoch_id, "cleanup_validation", cleanup_validation_started_at)
-        artifact_cleanup_started_at = time.perf_counter()
         cleanup_summary = cleanup_epoch_artifacts(epoch_dir=epoch_dir, memory_dir=memory_dir) if bool(config.cleanup) else _no_cleanup_summary(epoch_dir, memory_dir)
-        _log_epoch_phase_done(
-            epoch_id,
-            "artifact_cleanup",
-            artifact_cleanup_started_at,
-            {
-                "disk_before_cleanup_bytes": cleanup_summary.get("disk_before_cleanup_bytes"),
-                "disk_after_cleanup_bytes": cleanup_summary.get("disk_after_cleanup_bytes"),
-            },
-        )
         disk_after = disk_usage_snapshot(root)
 
         deltas = _compute_epoch_deltas(memory_before, memory_after, suite_summary, latest_status)
@@ -587,9 +573,7 @@ def _run_continuous_research_inner(config: ContinuousResearchConfig) -> dict[str
             "deltas": deltas,
             "next_action": f"continue {f'epoch_{epoch_number + 1:04d}'}",
         }
-        epoch_status_write_started_at = time.perf_counter()
         _write_epoch_status(status_dir, status)
-        _log_epoch_phase_done(epoch_id, "epoch_status_write", epoch_status_write_started_at)
 
         manifest["current_epoch"] = epoch_number
         manifest["updated_at"] = _now()
@@ -659,14 +643,7 @@ def _run_continuous_research_inner(config: ContinuousResearchConfig) -> dict[str
             manifest["stopped"] = True
             manifest["stop_reason"] = stop_reason
             status["next_action"] = f"stopped: {stop_reason}"
-            epoch_status_write_started_at = time.perf_counter()
             _write_epoch_status(status_dir, status)
-            _log_epoch_phase_done(
-                epoch_id,
-                "epoch_status_write",
-                epoch_status_write_started_at,
-                {"stop_reason": stop_reason},
-            )
             break
         _write_manifest(manifest_path, manifest)
 
@@ -945,8 +922,6 @@ def _format_epoch_start(payload: dict[str, Any]) -> str:
         f"Workers: requested={payload.get('requested_workers')} initial={payload.get('initial_epoch_workers')} max_epoch={payload.get('max_epoch_workers')}\n"
         f"RAM used percent at start: {float(ram.get('ram_used_percent', 0.0) or 0.0):.2f}\n"
         f"RAM ramp threshold percent: {float(payload.get('ram_ramp_threshold_percent', 0.0) or 0.0):.2f}\n"
-        f"Initial worker ramp delay seconds: {float(payload.get('initial_worker_ramp_delay_seconds', 0.0) or 0.0):.1f}\n"
-        f"Per-worker ramp delay seconds: {float(payload.get('per_worker_ramp_delay_seconds', 0.0) or 0.0):.1f}\n"
     )
 
 

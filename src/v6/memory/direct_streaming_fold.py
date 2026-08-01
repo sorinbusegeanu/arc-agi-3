@@ -692,6 +692,20 @@ def checkpoint_direct_streaming_manifest(memory_dir: str | Path, truncate: bool 
     }
 
 
+def record_direct_fold_postprocessing_timings(
+    memory_dir: str | Path,
+    timings: dict[str, float],
+) -> None:
+    """Persist the final post-fold timing map without changing fold semantics."""
+    manifest_path = ensure_direct_streaming_fold_manifest(memory_dir)
+    with _connect_manifest(manifest_path) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO fold_summary (key, value_json) VALUES (?, ?)",
+            ("direct_streaming_fold_postprocessing_timings", json.dumps(timings, sort_keys=True)),
+        )
+        conn.commit()
+
+
 def is_retryable_fold_error(exc: Exception) -> bool:
     if not isinstance(exc, (sqlite3.OperationalError, sqlite3.DatabaseError)):
         return False

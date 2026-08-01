@@ -67,6 +67,53 @@ def test_direct_fold_cleanup_timing_line_is_single_compact_ordered_line() -> Non
     assert "\n" not in line
 
 
+def test_direct_fold_timing_is_emitted_once_after_post_fold_processing(tmp_path: Path, monkeypatch, capsys) -> None:
+    import time
+
+    monkeypatch.setattr(
+        "v6.evaluation.interaction_sampling._generate_sampling_dbs",
+        lambda config, root: {
+            "direct_fold_shutdown_started_at": time.perf_counter() - 1.0,
+            "direct_fold_shutdown_timings": {
+                "wait_futures": 0.1,
+                "live_writer_flush": 0.2,
+                "manager_shutdown": 0.1,
+                "merge_shards": 0.3,
+                "finalize_memory": 0.4,
+                "checkpoint": 0.5,
+                "cleanup": 0.6,
+            },
+        },
+    )
+    monkeypatch.setattr(
+        "v6.evaluation.interaction_sampling._evaluate_sampling_runs",
+        lambda config, root, timings: timings.update({"metrics": 0.7, "validation": 0.8}) or [],
+    )
+    monkeypatch.setattr("v6.evaluation.interaction_sampling.sampler_comparison_rows", lambda rows: [])
+    monkeypatch.setattr("v6.evaluation.interaction_sampling.best_by_game", lambda rows: [])
+    monkeypatch.setattr("v6.evaluation.interaction_sampling.summary_by_family", lambda rows: [])
+    monkeypatch.setattr("v6.evaluation.interaction_sampling._collect_temporal_milestones", lambda config, root: {})
+    monkeypatch.setattr("v6.evaluation.interaction_sampling._collect_level_completion_records", lambda config, root: [])
+    monkeypatch.setattr("v6.evaluation.interaction_sampling.validation_summary", lambda rows, comparison, best: {})
+    monkeypatch.setattr("v6.evaluation.interaction_sampling.write_interaction_sampling_reports", lambda payload, output: None)
+
+    run_interaction_sampling_v05c(
+        InteractionSamplingConfig(
+            games=("tt01",), samplers=("random_baseline",), seeds=(0,),
+            steps=1, horizon=1, context_depth=1, output_dir=str(tmp_path / "out"),
+        )
+    )
+
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith("DF ")]
+    assert len(lines) == 1
+    assert lines[0].startswith(
+        "DF wait=0.1s flush=0.2s shutdown=0.1s merge=0.3s finalize=0.4s "
+        "checkpoint=0.5s cleanup=0.6s metrics=0.7s milestones=0.0s validation="
+    )
+    assert "diagnostics=0.0s reports=0.0s" in lines[0]
+    assert "post_cleanup=" not in lines[0]
+
+
 def _make_minimal_sqlite_with_memory_substrate(db_path: Path) -> Path:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(db_path) as conn:
@@ -1108,11 +1155,9 @@ def test_sampling_pool_refills_before_direct_fold_submit(monkeypatch, tmp_path: 
     assert stats["sampling_refill_count"] >= 2
     assert stats["max_done_batch_size"] == 32
     assert stats["seconds_spent_in_fold_submit_delay"] == 0.0
+    assert stats["direct_fold_shutdown_timings"]["wait_futures"] == 18.34
     stdout_lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith("DF ")]
-    assert len(stdout_lines) == 1
-    assert stdout_lines[0].startswith(
-        "DF wait=18.3s merge=24.7s finalize=11.9s checkpoint=3.2s cleanup=1.6s total="
-    )
+    assert stdout_lines == []
 
 
 def test_compact_sqlite_busy_timeout_wal(tmp_path: Path) -> None:

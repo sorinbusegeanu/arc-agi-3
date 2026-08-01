@@ -437,7 +437,12 @@ def test_continuous_run_emits_single_timed_post_fold_phase_lines(tmp_path: Path,
     assert "selective_forgetting" in done_phases
     assert "h10b_selective_forgetting" in done_phases
     assert "memory_summary" in done_phases
-    assert "artifact_cleanup" in done_phases
+    assert not {
+        "memory_continuity_report",
+        "cleanup_validation",
+        "artifact_cleanup",
+        "epoch_status_write",
+    } & done_phases
     for phase, status, extra in phase_events:
         if status == "done" and phase != "epoch_results":
             assert extra is not None
