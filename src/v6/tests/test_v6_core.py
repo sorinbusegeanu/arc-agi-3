@@ -14735,9 +14735,10 @@ def test_suite_summary_exposes_individual_vs_gated_decisions() -> None:
             "sampler_count": 1,
             "seed_count": 1,
             "total_interactions": 1000,
-            "levels_successfully_completed_per_epoch": 0,
-            "games_solved_per_epoch": 0,
-            "solved_games": [],
+            "Levels": 0,
+            "Games": 0,
+            "Total_Levels": 0,
+            "Total_Games": 0,
             "next_recommended_action": "x",
             "H11 suite gating": _suite_gate_status(h11),
         }

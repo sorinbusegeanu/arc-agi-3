@@ -2918,61 +2918,23 @@ def _completion_record_sample(record: dict[str, object]) -> dict[str, object]:
 def compute_epoch_completion_counters(
     records: list[dict[str, object]],
     *,
-    previous_level_keys: object = (),
-    previous_game_keys: object = (),
+    previous_total_levels: int = 0,
+    previous_total_games: int = 0,
 ) -> dict[str, object]:
-    """Keep raw completion events separate from stable level/game solve identities."""
+    """Count every successful completion; totals are intentionally non-unique."""
     successful_records = [dict(record) for record in records if _record_is_successful_completion(record)]
-    level_keys_by_record: list[tuple[str, str] | None] = [_normalized_level_key(record) for record in successful_records]
-    epoch_level_keys = {key for key in level_keys_by_record if key is not None}
-    epoch_game_keys = {game_id for game_id, _level_id in epoch_level_keys}
-    previous_levels = _normalized_level_key_set(previous_level_keys)
-    previous_games = {str(value).strip() for value in previous_game_keys if str(value).strip()} if isinstance(previous_game_keys, (list, tuple, set)) else set()
-    repeated_keys = {key for key in epoch_level_keys if key in previous_levels}
-    occurrence_counts = Counter(key for key in level_keys_by_record if key is not None)
-    repeated_keys.update(key for key, count in occurrence_counts.items() if count > 1)
-    invalid_records = [
-        record for record, key in zip(successful_records, level_keys_by_record, strict=True)
-        if key is None
-    ]
-    new_level_keys = epoch_level_keys - previous_levels
-    all_level_keys = previous_levels | epoch_level_keys
-    new_game_keys = epoch_game_keys - previous_games
-    all_game_keys = previous_games | epoch_game_keys
-    completed_levels_by_game: dict[str, int] = {}
-    for game_id, _level_id in sorted(epoch_level_keys):
-        completed_levels_by_game[game_id] = int(completed_levels_by_game.get(game_id, 0) + 1)
-    levels_solved_this_epoch = len(epoch_level_keys)
-    games_solved_this_epoch = len(epoch_game_keys)
+    levels = len(successful_records)
+    games = sum(1 for record in successful_records if _record_is_successful_game_completion(record))
     return {
-        "level_completion_event_count": len(successful_records),
-        "levels_solved_this_epoch": levels_solved_this_epoch,
-        "new_levels_solved_this_epoch": len(new_level_keys),
-        "total_unique_levels_solved": len(all_level_keys),
-        "game_completion_event_count": sum(1 for record in successful_records if str(record.get("game_id") or "").strip()),
-        "games_solved_this_epoch": games_solved_this_epoch,
-        "new_games_solved_this_epoch": len(new_game_keys),
-        "total_unique_games_solved": len(all_game_keys),
-        "epoch_level_keys": _completion_key_samples(epoch_level_keys),
-        "epoch_game_ids": sorted(epoch_game_keys),
-        "solved_level_keys": _completion_key_samples(all_level_keys),
-        "solved_game_ids": sorted(all_game_keys),
-        "new_level_keys_sample": _completion_key_samples(new_level_keys),
-        "repeated_level_keys_sample": _completion_key_samples(repeated_keys),
-        "invalid_completion_records_sample": [
-            _completion_record_sample(record) for record in invalid_records[:20]
-        ],
-        # Deprecated aliases retained for existing report readers.
-        "levels_solved": levels_solved_this_epoch,
-        "games_solved": games_solved_this_epoch,
-        "total_levels_solved": len(all_level_keys),
-        "total_games_solved": len(all_game_keys),
-        "completion_counter_aliases_deprecated": True,
-        "levels_successfully_completed_per_epoch": levels_solved_this_epoch,
-        "games_solved_per_epoch": games_solved_this_epoch,
-        "solved_games": sorted(epoch_game_keys),
-        "completed_levels_by_game": completed_levels_by_game,
+        "Levels": levels,
+        "Games": games,
+        "Total_Levels": max(0, int(previous_total_levels)) + levels,
+        "Total_Games": max(0, int(previous_total_games)) + games,
     }
+
+
+def _record_is_successful_game_completion(record: dict[str, object]) -> bool:
+    return bool(record.get("game_completed")) or str(record.get("final_state") or "") == "WIN"
 
 
 def _metadata_indicates_game_completed(metadata: dict[str, object]) -> bool:
@@ -3038,6 +3000,7 @@ def _completion_records_from_sampling_db(path: Path) -> list[dict[str, object]]:
             "seed": row[4],
             "completion_event_id": row[0],
             "final_state": row[6],
+            "game_completed": row[6] == "WIN",
             "source_run_db": str(path),
         }
         for row in rows
@@ -3064,6 +3027,7 @@ def _metadata_completion_records(metadata: dict[str, object], *, source_run_db: 
             "seed": metadata.get("seed"),
             "sampler": metadata.get("sampler_name"),
             "final_state": metadata.get("final_state"),
+            "game_completed": _metadata_indicates_game_completed(metadata),
             "source_run_db": source_run_db,
         }
         for _ in range(completed_count)

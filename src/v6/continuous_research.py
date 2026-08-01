@@ -237,7 +237,7 @@ def _run_continuous_research_inner(config: ContinuousResearchConfig) -> dict[str
     memory_dir = root / "memory"
     checkpoint_restore = _initialize_memory_checkpoint(config, memory_dir)
     manifest = _load_or_initialize_manifest(config, manifest_path)
-    completion_identity_state = _load_completion_identity_state(root, manifest)
+    completion_totals = _load_completion_totals(manifest)
     if checkpoint_restore["restored"]:
         manifest["initial_memory_dir"] = checkpoint_restore["initial_memory_dir"]
         manifest["memory_checkpoint_restored"] = True
@@ -375,10 +375,8 @@ def _run_continuous_research_inner(config: ContinuousResearchConfig) -> dict[str
         )
         epoch_completion = _compute_continuous_epoch_completion(
             raw_dir,
-            previous_level_keys=completion_identity_state["solved_level_keys"],
-            previous_game_keys=completion_identity_state["solved_game_ids"],
-            state_complete=bool(completion_identity_state["complete"]),
-            state_source=str(completion_identity_state["source"]),
+            previous_total_levels=completion_totals["Total_Levels"],
+            previous_total_games=completion_totals["Total_Games"],
         )
         _update_sampling_completion_report(raw_dir, epoch_completion)
         _log_epoch_phase_done(epoch_id, "sampling_and_direct_fold", sampling_and_fold_started_at)
@@ -596,44 +594,18 @@ def _run_continuous_research_inner(config: ContinuousResearchConfig) -> dict[str
         manifest["latest_status_path"] = str(status_dir / "epoch_status.json")
         manifest["consecutive_no_new_stable_contingencies"] = consecutive_no_new
         manifest["last_sampling_peak_workers"] = int(worker_execution.get("peak_workers", max_epoch_workers) or max_epoch_workers)
-        manifest["solved_level_keys"] = list(epoch_completion["solved_level_keys"])
-        manifest["solved_game_ids"] = list(epoch_completion["solved_game_ids"])
-        manifest["completion_identity_state_complete"] = bool(epoch_completion["completion_identity_state_complete"])
-        manifest["completion_identity_state_source"] = str(epoch_completion["completion_identity_state_source"])
         manifest["latest_completion_counters"] = {
-            key: epoch_completion[key]
-            for key in (
-                "level_completion_event_count",
-                "levels_solved_this_epoch",
-                "new_levels_solved_this_epoch",
-                "total_unique_levels_solved",
-                "game_completion_event_count",
-                "games_solved_this_epoch",
-                "new_games_solved_this_epoch",
-                "total_unique_games_solved",
-            )
+            key: int(epoch_completion[key])
+            for key in ("Levels", "Games", "Total_Levels", "Total_Games")
         }
-        # Deprecated aliases: totals now derive from persisted identity sets.
-        manifest["total_levels_successfully_completed"] = int(epoch_completion["total_unique_levels_solved"])
-        manifest["total_games_solved"] = int(epoch_completion["total_unique_games_solved"])
-        games_solved_by_epoch = dict(manifest.get("games_solved_by_epoch", {}) or {})
-        games_solved_by_epoch[epoch_id] = list(epoch_completion["epoch_game_ids"])
-        manifest["games_solved_by_epoch"] = games_solved_by_epoch
-        epoch_levels_solved = int(epoch_completion["levels_solved_this_epoch"])
-        epoch_games_solved = int(epoch_completion["games_solved_this_epoch"])
+        manifest.update(manifest["latest_completion_counters"])
         _log_epoch_phase(
             epoch_id,
             "epoch_results",
             "done",
             (
-                f"level_completion_events={epoch_completion['level_completion_event_count']} "
-                f"levels_solved_this_epoch={epoch_levels_solved} "
-                f"new_levels_solved_this_epoch={epoch_completion['new_levels_solved_this_epoch']} "
-                f"total_unique_levels_solved={epoch_completion['total_unique_levels_solved']} "
-                f"game_completion_events={epoch_completion['game_completion_event_count']} "
-                f"games_solved_this_epoch={epoch_games_solved} "
-                f"new_games_solved_this_epoch={epoch_completion['new_games_solved_this_epoch']} "
-                f"total_unique_games_solved={epoch_completion['total_unique_games_solved']}"
+                f"Levels={epoch_completion['Levels']} Games={epoch_completion['Games']} "
+                f"Total_Levels={epoch_completion['Total_Levels']} Total_Games={epoch_completion['Total_Games']}"
             ),
         )
         manifest.setdefault("epochs", []).append(
@@ -660,14 +632,9 @@ def _run_continuous_research_inner(config: ContinuousResearchConfig) -> dict[str
                 "deltas": deltas,
             }
         )
-        completion_identity_state = {
-            "solved_level_keys": {
-                (str(game_id), str(level_id))
-                for game_id, level_id in epoch_completion["solved_level_keys"]
-            },
-            "solved_game_ids": set(str(game_id) for game_id in epoch_completion["solved_game_ids"]),
-            "complete": bool(epoch_completion["completion_identity_state_complete"]),
-            "source": str(epoch_completion["completion_identity_state_source"]),
+        completion_totals = {
+            "Total_Levels": int(epoch_completion["Total_Levels"]),
+            "Total_Games": int(epoch_completion["Total_Games"]),
         }
         manifest["memory_paths"] = {
             "current_state": str(memory_paths.current_state),
@@ -778,13 +745,10 @@ def _load_or_initialize_manifest(config: ContinuousResearchConfig, manifest_path
         "epochs": [],
         "last_global_step_end": 0,
         "consecutive_no_new_stable_contingencies": 0,
-        "total_levels_successfully_completed": 0,
-        "total_games_solved": 0,
-        "games_solved_by_epoch": {},
-        "solved_level_keys": [],
-        "solved_game_ids": [],
-        "completion_identity_state_complete": True,
-        "completion_identity_state_source": "empty",
+        "Levels": 0,
+        "Games": 0,
+        "Total_Levels": 0,
+        "Total_Games": 0,
     }
     _write_manifest(manifest_path, manifest)
     return manifest
@@ -900,11 +864,7 @@ def _format_epoch_status(status: dict[str, Any]) -> str:
         f"RAM at start: {float((status.get('ram_snapshot_at_epoch_start') or {}).get('ram_used_percent', 0.0) or 0.0):.2f}%\n"
         f"Games: {status.get('games')}\n"
         f"Interactions this epoch: {status.get('interactions_this_epoch')}\n"
-        f"Level completion events: {status.get('level_completion_event_count')}\n"
-        f"Levels solved this epoch: {status.get('levels_solved_this_epoch')} (new: {status.get('new_levels_solved_this_epoch')}, total unique: {status.get('total_unique_levels_solved')})\n"
-        f"Game completion events: {status.get('game_completion_event_count')}\n"
-        f"Games solved this epoch: {status.get('games_solved_this_epoch')} (new: {status.get('new_games_solved_this_epoch')}, total unique: {status.get('total_unique_games_solved')})\n"
-        f"Solved games: {', '.join(status.get('solved_games', []) or [])}\n"
+        f"Levels={status.get('Levels')} Games={status.get('Games')} Total_Levels={status.get('Total_Levels')} Total_Games={status.get('Total_Games')}\n"
         f"Disk before cleanup: {cleanup.get('disk_before_cleanup_bytes', 0) / (1024 ** 3):.3f} GB\n"
         f"Disk after cleanup: {cleanup.get('disk_after_cleanup_bytes', 0) / (1024 ** 3):.3f} GB\n"
         f"Disk used percent: {status.get('disk_used_percent', 0.0):.2f}\n\n"
@@ -1082,54 +1042,23 @@ def _decode_manifest_level_keys(values: object) -> set[tuple[str, str]]:
     return result
 
 
-def _load_completion_identity_state(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
-    if "solved_level_keys" in manifest and "solved_game_ids" in manifest:
-        level_keys = _decode_manifest_level_keys(manifest.get("solved_level_keys"))
-        game_ids = {str(value).strip() for value in manifest.get("solved_game_ids", []) if str(value).strip()}
-        source = str(manifest.get("completion_identity_state_source") or "manifest")
-        if source == "empty" and (level_keys or game_ids):
-            source = "manifest"
-        return {
-            "solved_level_keys": level_keys,
-            "solved_game_ids": game_ids,
-            "complete": bool(manifest.get("completion_identity_state_complete", True)),
-            "source": source,
-        }
-    completed_epochs = int(manifest.get("completed_epochs", 0) or 0)
-    if completed_epochs <= 0:
-        return {"solved_level_keys": set(), "solved_game_ids": set(), "complete": True, "source": "empty"}
-    level_keys: set[tuple[str, str]] = set()
-    game_ids: set[str] = set()
-    epoch_entries = manifest.get("epochs", [])
-    if not isinstance(epoch_entries, list) or len(epoch_entries) < completed_epochs:
-        return {"solved_level_keys": level_keys, "solved_game_ids": game_ids, "complete": False, "source": "unavailable"}
-    for entry in epoch_entries:
-        if not isinstance(entry, dict) or str(entry.get("status")) != "complete":
-            continue
-        epoch_dir = Path(str(entry.get("epoch_dir") or ""))
-        report_path = epoch_dir / "raw" / "interaction_sampling_v05c_report.json"
-        if not report_path.exists():
-            return {"solved_level_keys": level_keys, "solved_game_ids": game_ids, "complete": False, "source": "unavailable"}
-        try:
-            report = json.loads(report_path.read_text(encoding="utf-8"))
-            keys = _decode_manifest_level_keys(report.get("epoch_level_keys"))
-            if not keys and report.get("level_completion_records"):
-                reconstructed = compute_epoch_completion_counters(list(report["level_completion_records"]))
-                keys = _decode_manifest_level_keys(reconstructed.get("epoch_level_keys"))
-        except (OSError, TypeError, ValueError, json.JSONDecodeError):
-            return {"solved_level_keys": level_keys, "solved_game_ids": game_ids, "complete": False, "source": "unavailable"}
-        level_keys.update(keys)
-        game_ids.update(game_id for game_id, _level_id in keys)
-    return {"solved_level_keys": level_keys, "solved_game_ids": game_ids, "complete": True, "source": "epoch_artifacts"}
+def _load_completion_totals(manifest: dict[str, Any]) -> dict[str, int]:
+    """Load additive completion totals, including a conservative legacy fallback."""
+    return {
+        "Total_Levels": max(0, int(
+            manifest.get("Total_Levels", manifest.get("total_levels_successfully_completed", 0)) or 0
+        )),
+        "Total_Games": max(0, int(
+            manifest.get("Total_Games", manifest.get("total_games_solved", 0)) or 0
+        )),
+    }
 
 
 def _compute_continuous_epoch_completion(
     raw_dir: Path,
     *,
-    previous_level_keys: set[tuple[str, str]],
-    previous_game_keys: set[str],
-    state_complete: bool,
-    state_source: str,
+    previous_total_levels: int,
+    previous_total_games: int,
 ) -> dict[str, Any]:
     report_path = raw_dir / "interaction_sampling_v05c_report.json"
     records: list[dict[str, object]] = []
@@ -1140,18 +1069,12 @@ def _compute_continuous_epoch_completion(
             if isinstance(raw_records, list):
                 records = [dict(record) for record in raw_records if isinstance(record, dict)]
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
-            state_complete = False
-            state_source = "unavailable"
-    else:
-        state_complete = False
-        state_source = "unavailable"
+            records = []
     counters = compute_epoch_completion_counters(
         records,
-        previous_level_keys=previous_level_keys,
-        previous_game_keys=previous_game_keys,
+        previous_total_levels=previous_total_levels,
+        previous_total_games=previous_total_games,
     )
-    counters["completion_identity_state_complete"] = bool(state_complete)
-    counters["completion_identity_state_source"] = str(state_source)
     return counters
 
 

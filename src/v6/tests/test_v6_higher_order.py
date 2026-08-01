@@ -315,6 +315,176 @@ def test_event_diagnostic_artifact_has_functional_scores(tmp_path: Path) -> None
     } <= set(rows[0])
 
 
+def _functional_event(*, baseline: float = 0.0, concept: float = 0.5, outcome: float = 1.0) -> dict:
+    return {
+        "event_id": "transfer:role-a:role-b:game",
+        "event_type": "transfer",
+        "lower_level_baseline_score": baseline,
+        "concept_enabled_score": concept,
+        "_outcome": outcome,
+        "_evaluation_global_step": 20,
+        "_feature_global_step_max": 10,
+        "_label_used_as_feature": False,
+    }
+
+
+def test_functional_event_channels_require_positive_finite_gains() -> None:
+    compression_only = higher_order_substrate._classify_functional_explanation_event(
+        _functional_event(concept=0.2),
+        config=IncrementalPromotionValidationConfig(
+            enabled=True, min_event_prediction_gain=1.0,
+            min_event_behavioral_gain=1.0, min_event_compression_gain=0.01,
+        ),
+        definition_cost_share=0.01,
+    )
+    assert compression_only["explained"] is True
+    assert compression_only["explanation_channels"] == ["compression"]
+
+    zero_gain = higher_order_substrate._classify_functional_explanation_event(
+        _functional_event(baseline=1.0, concept=1.0, outcome=1.0),
+        config=IncrementalPromotionValidationConfig(
+            enabled=True, min_event_prediction_gain=1.0,
+            min_event_behavioral_gain=1.0, min_event_compression_gain=0.0,
+        ),
+        definition_cost_share=0.0,
+    )
+    assert zero_gain["explained"] is False
+    assert zero_gain["explanation_channels"] == []
+
+    prediction_only = higher_order_substrate._classify_functional_explanation_event(
+        _functional_event(),
+        config=IncrementalPromotionValidationConfig(
+            enabled=True, min_event_prediction_gain=0.1,
+            min_event_behavioral_gain=1.0, min_event_compression_gain=1.0,
+        ),
+        definition_cost_share=0.01,
+    )
+    assert prediction_only["explanation_channels"] == ["prediction"]
+
+    behavioral_only = higher_order_substrate._classify_functional_explanation_event(
+        _functional_event(),
+        config=IncrementalPromotionValidationConfig(
+            enabled=True, min_event_prediction_gain=1.0,
+            min_event_behavioral_gain=0.1, min_event_compression_gain=1.0,
+        ),
+        definition_cost_share=0.01,
+    )
+    assert behavioral_only["explanation_channels"] == ["behavioral"]
+
+
+def test_invalid_functional_events_never_count_as_explained() -> None:
+    non_finite_event = _functional_event()
+    non_finite_event["_prediction_gain"] = float("nan")
+    non_finite = higher_order_substrate._classify_functional_explanation_event(
+        non_finite_event,
+        config=IncrementalPromotionValidationConfig(enabled=True),
+        definition_cost_share=0.01,
+    )
+    assert non_finite["invalid"] is True
+    assert non_finite["rejection_reason"] == "non_finite_explanatory_gain"
+
+    negative_cost_event = _functional_event()
+    negative_cost_event["baseline_description_cost"] = -1.0
+    negative_cost = higher_order_substrate._classify_functional_explanation_event(
+        negative_cost_event,
+        config=IncrementalPromotionValidationConfig(enabled=True),
+        definition_cost_share=0.01,
+    )
+    assert negative_cost["invalid"] is True
+    assert negative_cost["rejection_reason"] == "invalid_description_cost"
+
+    leaked = _functional_event()
+    leaked["_label_used_as_feature"] = True
+    leaked_event = higher_order_substrate._classify_functional_explanation_event(
+        leaked,
+        config=IncrementalPromotionValidationConfig(enabled=True),
+        definition_cost_share=0.01,
+    )
+    assert leaked_event["invalid"] is True
+    assert leaked_event["rejection_reason"] == "label_leakage_detected"
+
+
+def test_invalid_events_are_excluded_from_functional_coverage_denominator(tmp_path: Path, monkeypatch) -> None:
+    valid_event = _functional_event()
+    valid_event["concept_id"] = "concept-events"
+    invalid_event = _functional_event()
+    invalid_event.update({"concept_id": "concept-events", "event_id": "transfer:invalid:role-b:game", "_prediction_gain": float("inf")})
+    monkeypatch.setattr(higher_order_substrate, "_transfer_explanation_events", lambda **_kwargs: [valid_event, invalid_event])
+    monkeypatch.setattr(higher_order_substrate, "_future_option_motif_explanation_events", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(higher_order_substrate, "_prediction_explanation_events", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(higher_order_substrate, "_contradiction_resolution_explanation_events", lambda *_args, **_kwargs: [])
+    paths = ensure_memory_layout(tmp_path / "memory")
+    with sqlite3.connect(paths.current_state) as conn:
+        conn.row_factory = sqlite3.Row
+        _events, diagnostic, _state = higher_order_substrate._build_functional_explanation_diagnostics(
+            state_conn=conn,
+            candidate_signature="concept-events",
+            source_roles=["role-a", "role-b"],
+            first_seen_global_step=10,
+            transfer_rows=[],
+            transfer_history=higher_order_substrate._build_transfer_history_index([]),
+            future_rows=[],
+            previous_state=None,
+            diagnostic_epoch_id="epoch_1",
+            config=IncrementalPromotionValidationConfig(enabled=True),
+        )
+    assert diagnostic["total_event_count"] == 2
+    assert diagnostic["invalid_explanation_event_count"] == 1
+    assert diagnostic["eligible_explanation_event_count"] == 1
+    assert diagnostic["explained_event_count"] == 1
+    assert diagnostic["incremental_explanatory_coverage"] == 1.0
+
+
+def test_transfer_history_index_preserves_prior_rates_and_explanation_events() -> None:
+    transfer_rows = [
+        {
+            "attempt_id": 1, "role_signature": "role-a", "reuse_success": 1,
+            "last_seen_global_step": 2, "observed_role_signature": "target-a",
+            "predicted_role_signature": None, "target_scope_type": "game", "target_scope_key": "g1",
+        },
+        {
+            "attempt_id": 2, "role_signature": "role-b", "reuse_success": 0,
+            "last_seen_global_step": 3, "observed_role_signature": "target-b",
+            "predicted_role_signature": None, "target_scope_type": "game", "target_scope_key": "g1",
+        },
+        {
+            "attempt_id": 3, "role_signature": "role-a", "reuse_success": 0,
+            "last_seen_global_step": 5, "observed_role_signature": "target-c",
+            "predicted_role_signature": None, "target_scope_type": "game", "target_scope_key": "g2",
+        },
+        {
+            "attempt_id": 4, "role_signature": "role-b", "reuse_success": 1,
+            "last_seen_global_step": 6, "observed_role_signature": "target-d",
+            "predicted_role_signature": None, "target_scope_type": "game", "target_scope_key": "g2",
+        },
+    ]
+    history = higher_order_substrate._build_transfer_history_index(transfer_rows)
+    for role, step, scope in (
+        ("role-a", 2, None), ("role-a", 5, ("game", "g1")),
+        ("role-b", 7, None), ("missing", 7, None),
+    ):
+        assert higher_order_substrate._prior_role_success_rate(
+            transfer_rows, role=role, before_step=step, target_scope=scope,
+        ) == higher_order_substrate._prior_role_success_rate(
+            transfer_rows, role=role, before_step=step, target_scope=scope, transfer_history=history,
+        )
+
+    expected = higher_order_substrate._transfer_explanation_events(
+        candidate_signature="concept-ab",
+        source_roles=["role-a", "role-b"],
+        first_seen_global_step=1,
+        transfer_rows=transfer_rows,
+    )
+    actual = higher_order_substrate._transfer_explanation_events(
+        candidate_signature="concept-ab",
+        source_roles=["role-a", "role-b"],
+        first_seen_global_step=1,
+        transfer_rows=transfer_rows,
+        transfer_history=history,
+    )
+    assert actual == expected
+
+
 def test_incremental_validation_disabled_preserves_legacy_promotion(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
     _seed_set_coverage_candidate(memory_dir, extra_family_count=0, legacy_promoted=1)
@@ -467,7 +637,7 @@ def test_incremental_promotion_validation_uses_later_evidence_and_demotes_withou
         "min_incremental_explanatory_coverage": 0.05,
         "min_event_prediction_gain": 0.01,
         "min_event_behavioral_gain": 0.01,
-        "min_event_compression_gain": 0.0,
+        "min_event_compression_gain": 0.01,
         "min_explanation_event_count": 1,
         "min_cross_context_or_game_evidence": 2,
         "min_behavioral_or_predictive_lift": 0.01,
