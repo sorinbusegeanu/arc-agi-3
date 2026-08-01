@@ -68,7 +68,8 @@ def test_structural_effects_precede_text_fallback_and_store_component_vector() -
     assert terminated["motif_type"] == "terminate"
     assert transformed["motif_type"] == "transform"
     assert neutral["motif_type"] == "neutral"
-    assert reversible["motif_type"] == "reversible"
+    assert reversible["motif_type"] == "unknown"
+    assert reversible["motif_classification_reason"] == "unverified_fallback"
     assert unknown["motif_type"] == "unknown"
     assert enabled["movement_freedom_delta"] == 2.0
     assert terminated["survival_delta"] == -1.0
@@ -96,4 +97,4 @@ def test_event_derivation_persists_auto_stage_and_components(tmp_path: Path) -> 
         assert tuple(row)[0] == "movement_freedom"
         assert tuple(row)[1] is not None
         assert tuple(row)[2] == tuple(row)[1]
-        assert str(tuple(row)[3]).startswith(("structural", "fallback"))
+        assert str(tuple(row)[3]).startswith(("structural", "unverified_fallback"))

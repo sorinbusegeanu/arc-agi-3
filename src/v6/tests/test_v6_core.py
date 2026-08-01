@@ -3876,7 +3876,7 @@ def test_h08_requires_at_least_five_coherent_components(tmp_path) -> None:
     finally:
         conn.close()
     result = evaluate_h08_world_model_coherence(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h08", already_derived=True)
-    assert result["coherent_world_model_component_count"] == 2
+    assert result["coherent_world_model_component_count"] == 0
     assert result["decision"] == "PARTIALLY_VALID"
 
 

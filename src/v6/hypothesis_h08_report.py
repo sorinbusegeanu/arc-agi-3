@@ -97,10 +97,7 @@ def evaluate_h08_world_model_coherence(
     # Structural linkage alone is not coherence evidence.  This reporting
     # filter deliberately leaves persisted component state untouched.
     coherent_rows = [row for row in structural_coherent_rows if _has_heldout_gain(row)]
-    # Keep the historic structural count for report compatibility; the new
-    # validated count is the only one eligible for a positive H08 conclusion.
-    coherent_world_model_component_count = len(structural_coherent_rows)
-    validated_coherent_world_model_component_count = len(coherent_rows)
+    coherent_world_model_component_count = len(coherent_rows)
     structural_coherent_world_model_component_count = len(structural_coherent_rows)
     mean_coherence_score = (
         sum(float(row["coherence_score"] or 0.0) for row in component_rows) / max(1, world_model_component_count)
@@ -154,7 +151,6 @@ def evaluate_h08_world_model_coherence(
     metrics = {
         "world_model_component_count": world_model_component_count,
         "coherent_world_model_component_count": coherent_world_model_component_count,
-        "validated_coherent_world_model_component_count": validated_coherent_world_model_component_count,
         "structural_coherent_world_model_component_count": structural_coherent_world_model_component_count,
         "candidate_only_world_model_component_count": candidate_only_world_model_component_count,
         "promoted_concept_count": promoted_concept_count,
@@ -192,7 +188,7 @@ def evaluate_h08_world_model_coherence(
     )
     h08_validity_gates = {
         "promoted_concepts": {"required": 1, "actual": promoted_concept_count, "passed": promoted_concept_count > 0},
-        "heldout_coherent_components": {"required": 1, "actual": validated_coherent_world_model_component_count, "passed": validated_coherent_world_model_component_count >= 1},
+        "heldout_coherent_components": {"required": 1, "actual": coherent_world_model_component_count, "passed": coherent_world_model_component_count >= 1},
         "heldout_positive_gain": {"required": "> 0 in one held-out metric", "actual": sum(1 for row in heldout_components if row["heldout_validation_pass"]), "passed": bool(heldout_components and any(row["heldout_validation_pass"] for row in heldout_components))},
         "cross_scope": {"required": "cross_context >= 3 OR cross_game >= 2", "actual": {"cross_context": component_cross_context_count, "cross_game": component_cross_game_count}, "passed": component_cross_context_count >= 3 or component_cross_game_count >= 2},
         "prediction_evidence": {"required": 1, "actual": predicted_outcome_count, "passed": non_proxy_predicted_outcome_available},
@@ -204,12 +200,12 @@ def evaluate_h08_world_model_coherence(
         decision = "INSUFFICIENT_EVIDENCE"
         metrics["evidence_stage"] = "candidate_proxy_only"
         missing = ["No promoted concepts or coherent world-model components available."]
-    elif world_model_component_count > 0 and validated_coherent_world_model_component_count == 0:
+    elif world_model_component_count > 0 and coherent_world_model_component_count == 0:
         decision = "PARTIALLY_VALID"
         missing = ["Structural world-model components lack positive held-out predictive, behavioral, contradiction, or explanatory gain."]
     elif (
         promoted_concept_count > 0
-        and validated_coherent_world_model_component_count >= 1
+        and coherent_world_model_component_count >= 1
         and world_model_component_count >= 1
         and role_candidate_count >= 1
         and role_transfer_success_count >= 1
@@ -220,7 +216,7 @@ def evaluate_h08_world_model_coherence(
         and family_link_count >= 2
         and supported_context_count >= 2
         and non_proxy_predicted_outcome_available
-        and (candidate_only_world_model_component_count == 0 or validated_coherent_world_model_component_count >= candidate_only_world_model_component_count)
+        and (candidate_only_world_model_component_count == 0 or coherent_world_model_component_count >= candidate_only_world_model_component_count)
     ):
         decision = "VALID"
         missing = [

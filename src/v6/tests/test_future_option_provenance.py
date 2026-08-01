@@ -51,6 +51,13 @@ def _insert_event(
             ),
         ),
     )
+    conn.execute(
+        """UPDATE future_option_events
+           SET source_interaction_id = ?, classification_source = 'structured_effect',
+               classification_rule = 'structural_effect', classification_evidence_id = ?
+           WHERE event_id = ?""",
+        (event_id, event_id, event_id),
+    )
 
 
 def _provenance_memory(tmp_path: Path) -> tuple[Path, sqlite3.Connection, sqlite3.Connection]:

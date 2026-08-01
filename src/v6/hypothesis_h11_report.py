@@ -82,19 +82,19 @@ def evaluate_h11_future_option_transfer_concepts(
         and str(row.get("transfer_provenance_status") or "missing") == "verified"
         and str(row.get("concept_validation_status") or "missing") == "verified"
     ]
-    motifs_with_transfer = len({str(row["motif_signature"]) for row in rows if int(row["transfer_attempt_count"] or 0) > 0})
-    motifs_with_strong = len({str(row["motif_signature"]) for row in rows if int(row["strong_transfer_success_count"] or 0) > 0})
-    motifs_with_promoted = len({str(row["motif_signature"]) for row in rows if int(row["promoted_concept_count"] or 0) > 0})
-    emergent_rows = [row for row in rows if int(row.get("is_emergent") or 0) == 1]
+    motifs_with_transfer = len({str(row["motif_signature"]) for row in fully_verified_rows if int(row["transfer_attempt_count"] or 0) > 0})
+    motifs_with_strong = len({str(row["motif_signature"]) for row in fully_verified_rows if int(row["strong_transfer_success_count"] or 0) > 0})
+    motifs_with_promoted = len({str(row["motif_signature"]) for row in fully_verified_rows if int(row["promoted_concept_count"] or 0) > 0})
+    emergent_rows = [row for row in fully_verified_rows if int(row.get("is_emergent") or 0) == 1]
     non_emergent_rows = [row for row in rows if int(row.get("is_emergent") or 0) != 1]
     emergent_motifs_with_transfer = len({str(row["motif_signature"]) for row in emergent_rows if int(row["transfer_attempt_count"] or 0) > 0})
     emergent_motifs_with_strong = len({str(row["motif_signature"]) for row in emergent_rows if int(row["strong_transfer_success_count"] or 0) > 0})
     emergent_motifs_with_promoted = len({str(row["motif_signature"]) for row in emergent_rows if int(row["promoted_concept_count"] or 0) > 0})
     non_emergent_motifs_with_strong = len({str(row["motif_signature"]) for row in non_emergent_rows if int(row["strong_transfer_success_count"] or 0) > 0})
     non_emergent_motifs_with_promoted = len({str(row["motif_signature"]) for row in non_emergent_rows if int(row["promoted_concept_count"] or 0) > 0})
-    total_attempts = sum(int(row["transfer_attempt_count"] or 0) for row in rows)
-    total_successes = sum(int(row["successful_transfer_count"] or 0) for row in rows)
-    total_strong = sum(int(row["strong_transfer_success_count"] or 0) for row in rows)
+    total_attempts = sum(int(row["transfer_attempt_count"] or 0) for row in fully_verified_rows)
+    total_successes = sum(int(row["successful_transfer_count"] or 0) for row in fully_verified_rows)
+    total_strong = sum(int(row["strong_transfer_success_count"] or 0) for row in fully_verified_rows)
     emergent_attempts = sum(int(row["transfer_attempt_count"] or 0) for row in emergent_rows)
     emergent_successes = sum(int(row["successful_transfer_count"] or 0) for row in emergent_rows)
     emergent_strong = sum(int(row["strong_transfer_success_count"] or 0) for row in emergent_rows)
