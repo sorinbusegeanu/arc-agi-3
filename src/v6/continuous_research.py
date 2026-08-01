@@ -55,6 +55,8 @@ class ContinuousResearchConfig:
     live_memory_queue_maxsize: int = 100_000
     live_memory_batch_size: int = 1000
     live_memory_flush_seconds: float = 2.0
+    live_memory_delta_max_events: int = 100_000
+    live_memory_delta_batch_limit: int = 5_000
     memory_snapshot_mode: str = "worker_local"
     memory_snapshot_max_bytes: int | None = None
     memory_snapshot_max_ram_percent: float = 85.0
@@ -287,6 +289,8 @@ def _run_continuous_research_inner(config: ContinuousResearchConfig) -> dict[str
                 live_memory_queue_maxsize=int(config.live_memory_queue_maxsize),
                 live_memory_batch_size=int(config.live_memory_batch_size),
                 live_memory_flush_seconds=float(config.live_memory_flush_seconds),
+                live_memory_delta_max_events=int(config.live_memory_delta_max_events),
+                live_memory_delta_batch_limit=int(config.live_memory_delta_batch_limit),
                 memory_snapshot_mode=str(config.memory_snapshot_mode),
                 memory_snapshot_max_bytes=config.memory_snapshot_max_bytes,
                 memory_snapshot_max_ram_percent=float(config.memory_snapshot_max_ram_percent),
@@ -678,6 +682,8 @@ def _load_or_initialize_manifest(config: ContinuousResearchConfig, manifest_path
         "live_memory_queue_maxsize": int(config.live_memory_queue_maxsize),
         "live_memory_batch_size": int(config.live_memory_batch_size),
         "live_memory_flush_seconds": float(config.live_memory_flush_seconds),
+        "live_memory_delta_max_events": int(config.live_memory_delta_max_events),
+        "live_memory_delta_batch_limit": int(config.live_memory_delta_batch_limit),
         "stop_if_disk_above_percent": float(config.stop_if_disk_above_percent),
         "stop_if_no_new_stable_contingencies_for": int(config.stop_if_no_new_stable_contingencies_for),
         "completed_epochs": 0,

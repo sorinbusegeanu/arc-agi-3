@@ -5,15 +5,82 @@ import multiprocessing
 import os
 import sqlite3
 import time
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from queue import Empty
 from typing import Any
 
+from multiprocessing.managers import BaseManager
+
 from v6.memory.worker_snapshot import WorkerMemoryOverlay
 
 
 _LIVE_MEMORY_MANAGERS: list[Any] = []
+
+
+class LiveMemoryDeltaRetentionError(RuntimeError):
+    """A worker asked for deltas that have expired from the bounded store."""
+
+
+class LiveMemoryDeltaStore:
+    """Bounded, sequence-ordered delta transport with one RPC per refresh."""
+
+    def __init__(self, max_events: int = 100_000) -> None:
+        self.max_events = max(1, int(max_events))
+        self._events: deque[dict[str, Any]] = deque()
+        self._latest_sequence = 0
+        self._append_calls = 0
+        self._get_after_calls = 0
+        self._lock = multiprocessing.RLock()
+
+    def append_batch(self, events: list[dict]) -> None:
+        if not events:
+            return
+        ordered = sorted((dict(event) for event in events), key=lambda event: int(event.get("sequence", 0) or 0))
+        with self._lock:
+            for event in ordered:
+                sequence = int(event.get("sequence", 0) or 0)
+                if sequence <= self._latest_sequence:
+                    continue
+                self._events.append(event)
+                self._latest_sequence = sequence
+            while len(self._events) > self.max_events:
+                self._events.popleft()
+            self._append_calls += 1
+
+    def get_after(self, sequence: int, limit: int) -> tuple[list[dict], int]:
+        """Return one ordered batch and the current high-water sequence."""
+        requested = int(sequence)
+        bounded_limit = max(1, int(limit))
+        with self._lock:
+            self._get_after_calls += 1
+            if self._events:
+                oldest = int(self._events[0].get("sequence", 0) or 0)
+                if requested < oldest - 1:
+                    raise LiveMemoryDeltaRetentionError(
+                        f"worker sequence {requested} predates retained delta sequence {oldest}"
+                    )
+            rows = [dict(event) for event in self._events if int(event.get("sequence", 0) or 0) > requested]
+            return rows[:bounded_limit], int(self._latest_sequence)
+
+    def stats(self) -> dict[str, int]:
+        with self._lock:
+            return {
+                "size": len(self._events),
+                "max_events": self.max_events,
+                "oldest_sequence": int(self._events[0].get("sequence", 0) or 0) if self._events else 0,
+                "latest_sequence": int(self._latest_sequence),
+                "append_calls": int(self._append_calls),
+                "get_after_calls": int(self._get_after_calls),
+            }
+
+
+class _LiveMemoryDeltaManager(BaseManager):
+    pass
+
+
+_LiveMemoryDeltaManager.register("LiveMemoryDeltaStore", LiveMemoryDeltaStore)
 
 
 @dataclass
@@ -34,7 +101,7 @@ class LiveMemoryWriterConfig:
     flush_seconds: float = 2.0
     min_priority: float = 0.0
     summary_write_every_batches: int = 50
-    delta_log: Any | None = None
+    delta_store: Any | None = None
 
 
 class LiveMemoryWriter:
@@ -126,9 +193,9 @@ class LiveMemoryWriter:
                 self.summary["events_dropped"] = int(self.summary.get("events_dropped", 0)) + 1
                 continue
         connection.commit()
-        if self.config.delta_log is not None:
-            for event in written_events:
-                self.config.delta_log.append(
+        if self.config.delta_store is not None and written_events:
+            self.config.delta_store.append_batch(
+                [
                     {
                         "sequence": int(event["sequence"]),
                         "event_id": str(event["event_id"]),
@@ -136,7 +203,9 @@ class LiveMemoryWriter:
                         "global_step": int(event.get("global_step") or 0),
                         "payload": dict(event.get("payload") or {}),
                     }
-                )
+                    for event in written_events
+                ]
+            )
         self.summary["batches_written"] = int(self.summary["batches_written"]) + 1
         self.summary["last_flush_time"] = time.time()
         self._batches_since_summary_write += 1
@@ -173,9 +242,16 @@ class LiveMemoryWriter:
 
 
 class LiveMemoryReadCache:
-    """Read cache for legacy SQLite reads or manager-relayed snapshot deltas."""
+    """Read cache for legacy SQLite reads or batched snapshot deltas."""
 
-    def __init__(self, *, memory_dir: str | Path, refresh_steps: int = 250, delta_log: Any | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        memory_dir: str | Path,
+        refresh_steps: int = 250,
+        delta_store: Any | None = None,
+        delta_batch_limit: int = 5_000,
+    ) -> None:
         self.memory_dir = Path(memory_dir)
         self.sqlite_path = self.memory_dir / "live_memory.sqlite"
         self.refresh_steps = max(1, int(refresh_steps))
@@ -189,13 +265,20 @@ class LiveMemoryReadCache:
         self.future_option_events: list[dict[str, Any]] = []
         self.family_updates: list[dict[str, Any]] = []
         self.overlay = WorkerMemoryOverlay()
-        self.last_applied_live_sequence = -1
+        # Delta sequence zero is the epoch snapshot baseline.  Unlike the
+        # legacy SQLite cache, a snapshot worker must detect evicted events
+        # even on its first refresh.
+        self.last_applied_live_sequence = 0 if delta_store is not None else -1
         self.refresh_rows = 0
         self.refresh_seconds = 0.0
         self.busy_retry_count = 0
         self.busy_wait_seconds = 0.0
-        self.delta_log = delta_log
-        self._delta_cursor = 0
+        self.delta_store = delta_store
+        self.delta_batch_limit = max(1, int(delta_batch_limit))
+        self.delta_refresh_state = "up_to_date"
+        self.delta_rpc_calls = 0
+        self.delta_lagged_beyond_retention_count = 0
+        self.delta_refresh_failed_count = 0
 
     def refresh_if_due(self, step: int) -> bool:
         if self.last_refresh_step < 0 or int(step) - int(self.last_refresh_step) >= self.refresh_steps:
@@ -205,8 +288,8 @@ class LiveMemoryReadCache:
     def refresh(self, force: bool = False, step: int | None = None) -> bool:
         if not force and step is not None and self.last_refresh_step >= 0 and int(step) - int(self.last_refresh_step) < self.refresh_steps:
             return False
-        if self.delta_log is not None:
-            return self._refresh_delta_log(step)
+        if self.delta_store is not None:
+            return self._refresh_delta_store(step)
         if not self.sqlite_path.exists():
             self.refresh_failed_count += 1
             return False
@@ -281,16 +364,26 @@ class LiveMemoryReadCache:
             self.last_refresh_step = 0
         return True
 
-    def _refresh_delta_log(self, step: int | None) -> bool:
-        """Apply only writer-relayed events; snapshot workers never open SQLite."""
+    def _refresh_delta_store(self, step: int | None) -> bool:
+        """Apply one writer-relayed batch; snapshot workers never open SQLite."""
         started = time.perf_counter()
         try:
-            size = len(self.delta_log)
-            rows = [self.delta_log[index] for index in range(self._delta_cursor, size)]
+            rows, high_water = self.delta_store.get_after(
+                int(self.last_applied_live_sequence),
+                int(self.delta_batch_limit),
+            )
+            self.delta_rpc_calls += 1
+        except LiveMemoryDeltaRetentionError:
+            self.delta_lagged_beyond_retention_count += 1
+            self.delta_refresh_state = "worker_lagged_beyond_retention"
+            self.refresh_failed_count += 1
+            self.delta_refresh_failed_count += 1
+            return False
         except Exception:
             self.refresh_failed_count += 1
+            self.delta_refresh_failed_count += 1
+            self.delta_refresh_state = "delta_refresh_failed"
             return False
-        self._delta_cursor = size
         unseen = [dict(row) for row in rows if int(row.get("sequence", 0) or 0) > self.last_applied_live_sequence]
         if unseen:
             self.overlay.apply_rows(unseen)
@@ -308,12 +401,18 @@ class LiveMemoryReadCache:
                 }.get(str(event.get("event_type")))
                 if target is not None:
                     target.append(payload)
+            self.delta_refresh_state = "deltas_applied"
+        else:
+            self.delta_refresh_state = "up_to_date"
         self.refresh_count += 1
         self.refresh_seconds += time.perf_counter() - started
         if step is not None:
             self.last_refresh_step = int(step)
         elif self.last_refresh_step < 0:
             self.last_refresh_step = 0
+        # A limited response deliberately advances no cursor beyond the applied
+        # rows; the next refresh fetches the following batch.
+        del high_water
         return bool(unseen)
 
 
@@ -323,10 +422,26 @@ def make_live_memory_queue(maxsize: int) -> multiprocessing.Queue:
     return manager.Queue(maxsize=max(1, int(maxsize)))
 
 
-def make_live_memory_delta_log() -> Any:
-    manager = multiprocessing.Manager()
+def make_live_memory_delta_store(max_events: int = 100_000) -> Any:
+    manager = _LiveMemoryDeltaManager()
+    manager.start()
     _LIVE_MEMORY_MANAGERS.append(manager)
-    return manager.list()
+    return manager.LiveMemoryDeltaStore(max(1, int(max_events)))
+
+
+def shutdown_live_memory_managers(start_index: int = 0) -> None:
+    """Close manager servers created for a completed sampling invocation."""
+    selected = _LIVE_MEMORY_MANAGERS[max(0, int(start_index)):]
+    del _LIVE_MEMORY_MANAGERS[max(0, int(start_index)):]
+    for manager in reversed(selected):
+        try:
+            manager.shutdown()
+        except (AttributeError, OSError, EOFError):
+            pass
+
+
+def live_memory_manager_count() -> int:
+    return len(_LIVE_MEMORY_MANAGERS)
 
 
 def start_live_memory_writer(config: LiveMemoryWriterConfig, queue: multiprocessing.Queue) -> multiprocessing.Process:

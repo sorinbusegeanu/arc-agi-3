@@ -27,6 +27,80 @@ class MemoryActionScore:
     evidence_sources: list[str] = field(default_factory=list)
 
 
+def score_role_match(*, base_transfer_score: float, action_match: bool, context_match: bool) -> float:
+    """Pure role scoring shared by SQLite and snapshot query paths."""
+    score = float(base_transfer_score)
+    if action_match:
+        score += 0.25
+    if context_match:
+        score += 0.25
+    if not action_match and not context_match:
+        score *= 0.25
+    return max(0.0, min(1.0, score))
+
+
+def score_concept_match(*, best_role_score: float, transfer_success_count: float) -> float:
+    return max(0.0, min(1.0, float(best_role_score) * min(1.0, float(transfer_success_count) / 3.0)))
+
+
+def aggregate_future_option_evidence(deltas: list[float]) -> dict[str, Any]:
+    positive = sum(1 for value in deltas if float(value) > 0.0)
+    return {
+        "expected_future_option_delta": sum(deltas) / len(deltas) if deltas else 0.0,
+        "completion_likelihood": positive / len(deltas) if deltas else 0.0,
+        "sources": ["future_option_memory"] if deltas else [],
+    }
+
+
+def compute_failure_path_evidence(*, deltas: list[float], evidence_count: int, contradiction: bool) -> dict[str, Any]:
+    return {
+        "failure_risk": sum(1 for value in deltas if float(value) < 0.0) / int(evidence_count) if evidence_count else 0.0,
+        "contradiction_evidence": bool(contradiction),
+        "sources": ["failure_path_memory"] if evidence_count else [],
+    }
+
+
+def compute_memory_action_score(
+    *,
+    action: int,
+    prediction: MemoryPrediction,
+    future_option_evidence: dict[str, Any],
+    failure_evidence: dict[str, Any],
+    role_matches: list[dict],
+    concept_matches: list[dict],
+) -> MemoryActionScore:
+    """The canonical action-ranking formula; keep scientific weights centralized."""
+    transfer_score = max(
+        float(role_matches[0].get("score", 0.0)) if role_matches else 0.0,
+        float(concept_matches[0].get("score", 0.0)) if concept_matches else 0.0,
+    )
+    future_gain = float(future_option_evidence.get("expected_future_option_delta", 0.0) or 0.0)
+    failure_risk = float(failure_evidence.get("failure_risk", 0.0) or 0.0)
+    completion_likelihood = float(future_option_evidence.get("completion_likelihood", 0.0) or 0.0)
+    contradiction_risk = 1.0 if failure_evidence.get("contradiction_evidence") else 0.0
+    score = (
+        0.30 * float(prediction.confidence)
+        + 0.25 * max(0.0, future_gain)
+        + 0.20 * completion_likelihood
+        + 0.15 * transfer_score
+        - 0.25 * failure_risk
+        - 0.10 * contradiction_risk
+    )
+    return MemoryActionScore(
+        action=int(action),
+        score=max(0.0, min(1.0, float(score))),
+        predicted_family=prediction.predicted_family,
+        expected_future_option_delta=future_gain,
+        failure_risk=failure_risk,
+        completion_likelihood=completion_likelihood,
+        evidence_sources=[prediction.source, *future_option_evidence.get("sources", []), *failure_evidence.get("sources", [])],
+    )
+
+
+def order_memory_action_scores(scores: list[MemoryActionScore]) -> list[MemoryActionScore]:
+    return sorted(scores, key=lambda item: (-float(item.score), int(item.action)))
+
+
 class MemoryQueryEngine:
     def __init__(self, memory: MemorySubstrate, contingency_learner: Any = None, graph: Any = None) -> None:
         self.memory = memory
@@ -106,31 +180,13 @@ class MemoryQueryEngine:
         failure = self.find_failure_path_evidence(best_context_signature, action)
         role_matches = self.find_similar_roles(best_context_signature, action)
         concept_matches = self.find_concept_matches(best_context_signature, action)
-        role_or_concept_transfer_score = max(
-            float(role_matches[0].get("score", 0.0)) if role_matches else 0.0,
-            float(concept_matches[0].get("score", 0.0)) if concept_matches else 0.0,
-        )
-        contradiction_risk = 1.0 if failure.get("contradiction_evidence") else 0.0
-        expected_future_option_gain = float(future.get("expected_future_option_delta", 0.0) or 0.0)
-        failure_risk = float(failure.get("failure_risk", 0.0) or 0.0)
-        completion_likelihood = float(future.get("completion_likelihood", 0.0) or 0.0)
-        score = (
-            0.30 * float(prediction.confidence)
-            + 0.25 * max(0.0, expected_future_option_gain)
-            + 0.20 * completion_likelihood
-            + 0.15 * role_or_concept_transfer_score
-            - 0.25 * failure_risk
-            - 0.10 * contradiction_risk
-        )
-        score = max(0.0, min(1.0, float(score)))
-        return MemoryActionScore(
-            action=int(action),
-            score=score,
-            predicted_family=prediction.predicted_family,
-            expected_future_option_delta=expected_future_option_gain,
-            failure_risk=failure_risk,
-            completion_likelihood=completion_likelihood,
-            evidence_sources=[prediction.source, *future.get("sources", []), *failure.get("sources", [])],
+        return compute_memory_action_score(
+            action=action,
+            prediction=prediction,
+            future_option_evidence=future,
+            failure_evidence=failure,
+            role_matches=role_matches,
+            concept_matches=concept_matches,
         )
 
     def rank_actions(
@@ -143,7 +199,7 @@ class MemoryQueryEngine:
             for action in sorted(int(item) for item in available_actions)
             if int(action) in context_signatures_by_action and context_signatures_by_action[int(action)] is not None
         ]
-        return sorted(scores, key=lambda item: (-float(item.score), int(item.action)))
+        return order_memory_action_scores(scores)
 
     def rank_actions_with_shared_context(
         self,
@@ -154,7 +210,7 @@ class MemoryQueryEngine:
             self.score_action(context_signatures, int(action), available_actions, record_query=False)
             for action in sorted(int(item) for item in available_actions)
         ]
-        return sorted(scores, key=lambda item: (-float(item.score), int(item.action)))
+        return order_memory_action_scores(scores)
 
     def find_similar_roles(self, context_signature: str, action: int) -> list[dict]:
         matches: list[dict[str, Any]] = []
@@ -177,14 +233,11 @@ class MemoryQueryEngine:
                     interaction_id = str(interaction_edge["target_node_id"])
                     if any(str(item["target_node_id"]) == target_action_node for item in self.memory.edges_from(interaction_id, "takes_action")):
                         action_match = True
-            score = base_transfer_score
-            if action_match:
-                score += 0.25
-            if context_match:
-                score += 0.25
-            if not action_match and not context_match:
-                score *= 0.25
-            score = max(0.0, min(1.0, float(score)))
+            score = score_role_match(
+                base_transfer_score=base_transfer_score,
+                action_match=action_match,
+                context_match=context_match,
+            )
             if score <= 0.0:
                 continue
             matches.append(
@@ -214,8 +267,10 @@ class MemoryQueryEngine:
                     for family_edge in self.memory.edges_from(carrier_edge["target_node_id"], "associated_with_family"):
                         if str(family_edge["target_node_id"]).startswith("M2:family:"):
                             family_ids.append(int(str(family_edge["target_node_id"]).split(":")[-1]))
-            concept_transfer_score = min(1.0, float(concept.get("attrs", {}).get("transfer_success_count", 0) or 0) / 3.0)
-            score = max(0.0, min(1.0, best_role_score * concept_transfer_score))
+            score = score_concept_match(
+                best_role_score=best_role_score,
+                transfer_success_count=float(concept.get("attrs", {}).get("transfer_success_count", 0) or 0),
+            )
             if score <= 0.0:
                 continue
             matches.append(
@@ -253,17 +308,13 @@ class MemoryQueryEngine:
             deltas.append(delta)
             if delta > 0:
                 positive += 1
-        mean_delta = (sum(deltas) / len(deltas)) if deltas else 0.0
-        return {
-            "expected_future_option_delta": mean_delta,
-            "completion_likelihood": 0.0 if not deltas else float(positive) / float(len(deltas)),
-            "sources": ["future_option_memory"] if deltas else [],
-        }
+        del positive
+        return aggregate_future_option_evidence(deltas)
 
     def find_failure_path_evidence(self, context_signature: str, action: int) -> dict[str, Any]:
         del context_signature
         action_edges = self.memory.edges_to(action_node_id(action), "takes_action")
-        negatives = 0
+        deltas: list[float] = []
         contradiction = False
         total = 0
         for edge in action_edges:
@@ -272,15 +323,17 @@ class MemoryQueryEngine:
                 "SELECT future_option_delta FROM memory_scores WHERE node_id = ?",
                 (str(edge["source_node_id"]),),
             ).fetchone()
-            if score_row is not None and score_row[0] is not None and float(score_row[0]) < 0.0:
-                negatives += 1
+            if score_row is not None and score_row[0] is not None:
+                deltas.append(float(score_row[0]))
             if self.memory.edges_from(str(edge["source_node_id"]), "violates_prediction"):
                 contradiction = True
-        return {
-            "failure_risk": 0.0 if total == 0 else float(negatives) / float(total),
-            "contradiction_evidence": contradiction,
-            "sources": ["failure_path_memory"] if total else [],
-        }
+        # Preserve the legacy denominator: all action evidence, including
+        # evidence rows without a future-option score.
+        return compute_failure_path_evidence(
+            deltas=deltas,
+            evidence_count=total,
+            contradiction=contradiction,
+        )
 
     def _exact_contingency_match(self, context_signatures: dict[int, tuple], action: int) -> dict[str, Any] | None:
         targets = {json.dumps(list(signature)) for signature in context_signatures.values()}
