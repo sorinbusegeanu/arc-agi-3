@@ -1289,7 +1289,87 @@ def derive_future_option_attention_links(state_conn: sqlite3.Connection) -> dict
         state_conn.row_factory = original_row_factory
 
 
+def _resolve_motif_transfer_provenance(
+    state_conn: sqlite3.Connection,
+    *,
+    motif_signature: str,
+    motif_links: dict[str, set[str]],
+    direct_interaction_ids: set[str],
+) -> dict[str, Any]:
+    """Resolve explicit motif substrate links back to concrete interactions."""
+    families = set(motif_links.get("family", set())) | set(motif_links.get("motif_derived_from_family", set()))
+    carriers = set(motif_links.get("carrier", set())) | set(motif_links.get("motif_expressed_by_carrier", set()))
+    roles = set(motif_links.get("role", set())) | set(motif_links.get("motif_associated_with_role", set()))
+    concepts = set(motif_links.get("concept", set())) | set(motif_links.get("motif_supports_concept", set()))
+    interaction_ids = set(direct_interaction_ids) | set(motif_links.get("interaction", set()))
+    interaction_ids.update(motif_links.get("source_interaction", set()))
+    if interaction_ids:
+        return {
+            "status": "verified", "resolution_path": "motif_to_interaction",
+            "interaction_ids": interaction_ids, "family_ids": families,
+            "carrier_ids": carriers, "role_ids": roles, "concept_ids": concepts,
+        }
+
+    concept_links = _links_by_signature(state_conn, "concept_links", "concept_signature")
+    role_links = _links_by_signature(state_conn, "role_links", "role_signature")
+    carrier_links = _links_by_signature(state_conn, "carrier_links", "carrier_signature")
+    for concept in sorted(concepts):
+        roles.update(concept_links.get(concept, {}).get("role", set()))
+    for role in sorted(roles):
+        role_link_values = role_links.get(role, {})
+        carriers.update(role_link_values.get("carrier", set()))
+        families.update(role_link_values.get("family", set()))
+    for carrier in sorted(carriers):
+        families.update(carrier_links.get(carrier, {}).get("family", set()))
+
+    def _event_interactions(column: str, values: set[str]) -> set[str]:
+        if not values:
+            return set()
+        placeholders = ", ".join("?" for _ in values)
+        try:
+            rows = state_conn.execute(
+                f"SELECT source_interaction_id FROM future_option_events "
+                f"WHERE {column} IN ({placeholders}) AND source_interaction_id IS NOT NULL",
+                tuple(sorted(values)),
+            ).fetchall()
+        except sqlite3.Error:
+            return set()
+        return {str(row[0]) for row in rows if row[0] not in (None, "")}
+
+    family_interactions = _event_interactions("source_family_id", families)
+    carrier_interactions = _event_interactions("source_carrier_id", carriers)
+    role_interactions = _event_interactions("source_role_id", roles)
+    concept_interactions = _event_interactions("source_concept_id", concepts)
+    if family_interactions:
+        interaction_ids.update(family_interactions)
+        path = "motif_to_family_to_interaction"
+    elif carrier_interactions:
+        interaction_ids.update(carrier_interactions)
+        path = "motif_to_carrier_to_family_to_interaction"
+    elif role_interactions:
+        interaction_ids.update(role_interactions)
+        path = "motif_to_role_to_carrier_to_family_to_interaction"
+    elif concept_interactions:
+        interaction_ids.update(concept_interactions)
+        path = "motif_to_concept_to_role_to_carrier_to_family_to_interaction"
+    else:
+        path = "unresolved"
+    return {
+        "status": "verified" if interaction_ids else "proxy" if (families or carriers or roles or concepts) else "missing",
+        "resolution_path": path,
+        "interaction_ids": interaction_ids,
+        "family_ids": families,
+        "carrier_ids": carriers,
+        "role_ids": roles,
+        "concept_ids": concepts,
+    }
+
+
 def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[str, Any]:
+    # Transfer links are fully derived from the current motifs and concrete
+    # transfer attempts.  Rebuild atomically so nullable scope keys cannot
+    # bypass SQLite's composite-key conflict detection on a rerun.
+    state_conn.execute("DELETE FROM future_option_transfer_links")
     motif_links = _links_by_signature(state_conn, "future_option_links", "motif_signature")
     motif_quality = {
         str(row["motif_signature"]): {
@@ -1323,11 +1403,16 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
         transfers_by_role[str(row["role_signature"])].append(row)
     concept_validation_status = {
         str(row["concept_signature"]): (
-            "verified" if int(row["is_promoted"] or 0) == 1 and str(row["promotion_status"] or "") in {"promoted", "validated"}
+            "verified"
+            if int(row["is_promoted"] or 0) == 1
+            and str(row["promotion_status"] or "") in {"promoted", "retained", "validated"}
+            and str(row["validation_status"] or "") not in {"failed", "demoted", "invalid"}
+            else "demoted"
+            if str(row["promotion_status"] or "") == "demoted" or str(row["validation_status"] or "") == "demoted"
             else "proxy"
         )
         for row in state_conn.execute(
-            "SELECT concept_signature, is_promoted, promotion_status FROM concept_candidates ORDER BY concept_signature ASC"
+            "SELECT concept_signature, is_promoted, promotion_status, validation_status FROM concept_candidates ORDER BY concept_signature ASC"
         ).fetchall()
     }
     promoted_concepts = {signature for signature, status in concept_validation_status.items() if status == "verified"}
@@ -1355,10 +1440,27 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
     motif_role_link_count = 0
     motif_role_transfer_attempt_link_count = 0
     motif_role_concept_link_count = 0
+    verified_concrete_transfer_link_count = 0
+    verified_transfer_pairs: set[tuple[str, str, str, str]] = set()
+    all_motifs_with_transfer: set[str] = set()
+    verified_motifs_with_transfer: set[str] = set()
+    all_motifs_with_strong: set[str] = set()
+    verified_motifs_with_strong: set[str] = set()
+    all_motifs_with_promoted: set[str] = set()
+    verified_motifs_with_promoted: set[str] = set()
+    fully_verified_emergent_chain_count = 0
+    partially_verified_emergent_chain_count = 0
+    unverified_emergent_chain_count = 0
     for motif_signature in sorted(motif_links):
         motifs_seen_for_transfer += 1
         quality = motif_quality.get(motif_signature, {})
-        motif_provenance_status = "verified" if _coerce_list_json(quality.get("source_interaction_ids_json")) else "missing"
+        provenance_resolution = _resolve_motif_transfer_provenance(
+            state_conn,
+            motif_signature=motif_signature,
+            motif_links=motif_links[motif_signature],
+            direct_interaction_ids=set(_coerce_list_json(quality.get("source_interaction_ids_json"))),
+        )
+        motif_provenance_status = str(provenance_resolution["status"])
         is_emergent_motif = int(quality.get("is_emergent", 0)) == 1
         roles = sorted(
             set(motif_links[motif_signature].get("role", set()))
@@ -1385,101 +1487,104 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
             if role_signature in concepts_by_role:
                 unique_roles_with_concepts.add(role_signature)
                 motif_role_concept_link_count += len(concepts_by_role[role_signature])
+            rows_by_pair: dict[tuple[str | None, str | None, str | None, str | None], list[dict[str, Any]]] = defaultdict(list)
+            for transfer_row in role_transfer_rows:
+                pair = (
+                    transfer_row.get("source_game_key"), transfer_row.get("target_game_key"),
+                    transfer_row.get("source_context_key"), transfer_row.get("target_context_key"),
+                )
+                rows_by_pair[pair].append(transfer_row)
+            if not rows_by_pair:
+                rows_by_pair[(None, None, None, None)] = []
             for concept_signature in concepts:
-                transfer_attempt_count = len(role_transfer_rows)
-                successful_transfer_count = sum(1 for row in role_transfer_rows if int(row["reuse_success"] or 0) == 1)
-                strong_transfer_success_count = sum(
-                    1
-                    for row in role_transfer_rows
-                    if int(row["reuse_success"] or 0) == 1
-                    and int(row["source_evidence_support_count"] or 0) >= MIN_SOURCE_EVIDENCE_SUPPORT
-                    and int(row["candidate_role_count"] or 0) >= 2
-                    and float(row["similarity_score"] or 0.0) >= 0.60
-                    and float(row["best_margin"] or 0.0) >= 0.10
-                )
-                promoted_concept_count = int(concept_signature != "__none__" and concept_signature in promoted_concepts)
-                if transfer_attempt_count <= 0 and promoted_concept_count <= 0:
-                    continue
-                mean_transfer_score = _mean([row.get("transfer_score") for row in role_transfer_rows])
-                mean_best_margin = _mean([row.get("best_margin") for row in role_transfer_rows if row.get("best_margin") is not None])
-                provenance_keys = {
-                    (
-                        row.get("source_game_key"), row.get("target_game_key"),
-                        row.get("source_context_key"), row.get("target_context_key"),
+                for provenance, pair_rows in sorted(rows_by_pair.items(), key=lambda item: tuple(str(value or "") for value in item[0])):
+                    transfer_attempt_count = len(pair_rows)
+                    successful_transfer_count = sum(1 for row in pair_rows if int(row["reuse_success"] or 0) == 1)
+                    strong_transfer_success_count = sum(
+                        1
+                        for row in pair_rows
+                        if int(row["reuse_success"] or 0) == 1
+                        and int(row["source_evidence_support_count"] or 0) >= MIN_SOURCE_EVIDENCE_SUPPORT
+                        and int(row["candidate_role_count"] or 0) >= 2
+                        and float(row["similarity_score"] or 0.0) >= 0.60
+                        and float(row["best_margin"] or 0.0) >= 0.10
                     )
-                    for row in role_transfer_rows
-                }
-                provenance = next(iter(provenance_keys)) if len(provenance_keys) == 1 else (None, None, None, None)
-                link_provenance_mode = "single_source" if len(provenance_keys) == 1 else "multi_source"
-                transfer_provenance_status = "verified" if link_provenance_mode == "single_source" else "proxy"
-                concept_status = concept_validation_status.get(concept_signature, "missing") if concept_signature != "__none__" else "missing"
-                first_seen = _safe_min(state_conn, motif_signature, role_signature, concept_signature, "first")
-                last_seen = _safe_min(state_conn, motif_signature, role_signature, concept_signature, "last")
-                state_conn.execute(
-                    """
-                    INSERT INTO future_option_transfer_links (
-                        motif_signature, role_signature, concept_signature, transfer_attempt_count,
-                        successful_transfer_count, strong_transfer_success_count, promoted_concept_count,
-                        mean_transfer_score, mean_best_margin, source_role_signature, source_game_key,
-                        target_game_key, source_context_key, target_context_key, provenance_mode,
-                        motif_provenance_status, transfer_provenance_status, concept_validation_status,
-                        first_seen_global_step, last_seen_global_step
+                    promoted_concept_count = int(concept_signature != "__none__" and concept_signature in promoted_concepts)
+                    if transfer_attempt_count <= 0 and promoted_concept_count <= 0:
+                        continue
+                    mean_transfer_score = _mean([row.get("transfer_score") for row in pair_rows])
+                    mean_best_margin = _mean([row.get("best_margin") for row in pair_rows if row.get("best_margin") is not None])
+                    source_game_key, target_game_key, source_context_key, target_context_key = provenance
+                    concrete_pair = all(value not in (None, "") for value in provenance)
+                    transfer_provenance_status = "verified" if concrete_pair else "proxy"
+                    concept_status = concept_validation_status.get(concept_signature, "missing") if concept_signature != "__none__" else "missing"
+                    first_seen = _safe_min(state_conn, motif_signature, role_signature, concept_signature, "first")
+                    last_seen = _safe_min(state_conn, motif_signature, role_signature, concept_signature, "last")
+                    state_conn.execute(
+                        """
+                        INSERT INTO future_option_transfer_links (
+                            motif_signature, role_signature, concept_signature, transfer_attempt_count,
+                            successful_transfer_count, strong_transfer_success_count, promoted_concept_count,
+                            mean_transfer_score, mean_best_margin, source_role_signature, source_game_key,
+                            target_game_key, source_context_key, target_context_key, provenance_mode,
+                            motif_provenance_status, transfer_provenance_status, concept_validation_status,
+                            motif_provenance_resolution_path, motif_resolved_interaction_count,
+                            motif_resolved_family_count, motif_resolved_carrier_count,
+                            motif_resolved_role_count, motif_resolved_concept_count,
+                            first_seen_global_step, last_seen_global_step
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            motif_signature, role_signature, concept_signature,
+                            transfer_attempt_count, successful_transfer_count, strong_transfer_success_count,
+                            promoted_concept_count, mean_transfer_score, mean_best_margin, role_signature,
+                            source_game_key, target_game_key, source_context_key, target_context_key,
+                            "single_source", motif_provenance_status, transfer_provenance_status,
+                            concept_status, provenance_resolution["resolution_path"],
+                            len(provenance_resolution["interaction_ids"]), len(provenance_resolution["family_ids"]),
+                            len(provenance_resolution["carrier_ids"]), len(provenance_resolution["role_ids"]),
+                            len(provenance_resolution["concept_ids"]), first_seen, last_seen,
+                        ),
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(motif_signature, role_signature, concept_signature) DO UPDATE SET
-                        transfer_attempt_count = excluded.transfer_attempt_count,
-                        successful_transfer_count = excluded.successful_transfer_count,
-                        strong_transfer_success_count = excluded.strong_transfer_success_count,
-                        promoted_concept_count = excluded.promoted_concept_count,
-                        mean_transfer_score = excluded.mean_transfer_score,
-                        mean_best_margin = excluded.mean_best_margin,
-                        source_role_signature = excluded.source_role_signature,
-                        source_game_key = excluded.source_game_key,
-                        target_game_key = excluded.target_game_key,
-                        source_context_key = excluded.source_context_key,
-                        target_context_key = excluded.target_context_key,
-                        provenance_mode = excluded.provenance_mode,
-                        motif_provenance_status = excluded.motif_provenance_status,
-                        transfer_provenance_status = excluded.transfer_provenance_status,
-                        concept_validation_status = excluded.concept_validation_status,
-                        first_seen_global_step = excluded.first_seen_global_step,
-                        last_seen_global_step = excluded.last_seen_global_step
-                    """,
-                    (
-                        motif_signature,
-                        role_signature,
-                        concept_signature,
-                        transfer_attempt_count,
-                        successful_transfer_count,
-                        strong_transfer_success_count,
-                        promoted_concept_count,
-                        mean_transfer_score,
-                        mean_best_margin,
-                        role_signature,
-                        provenance[0],
-                        provenance[1],
-                        provenance[2],
-                        provenance[3],
-                        link_provenance_mode,
-                        motif_provenance_status,
-                        transfer_provenance_status,
-                        concept_status,
-                        first_seen,
-                        last_seen,
-                    ),
-                )
-                inserted += 1
-                motif_had_transfer = motif_had_transfer or transfer_attempt_count > 0
-                motif_had_strong = motif_had_strong or strong_transfer_success_count > 0
-                motif_had_promoted = motif_had_promoted or promoted_concept_count > 0
-                motif_success_numer += successful_transfer_count
-                motif_success_denom += transfer_attempt_count
-                motif_strong_numer += strong_transfer_success_count
-                if is_emergent_motif:
-                    emergent_link_count += 1
-                    emergent_success_numer += successful_transfer_count
-                    emergent_success_denom += transfer_attempt_count
-                    emergent_strong_numer += strong_transfer_success_count
+                    inserted += 1
+                    motif_had_transfer = motif_had_transfer or transfer_attempt_count > 0
+                    motif_had_strong = motif_had_strong or strong_transfer_success_count > 0
+                    motif_had_promoted = motif_had_promoted or promoted_concept_count > 0
+                    if transfer_attempt_count > 0:
+                        all_motifs_with_transfer.add(motif_signature)
+                    if strong_transfer_success_count > 0:
+                        all_motifs_with_strong.add(motif_signature)
+                    if promoted_concept_count > 0:
+                        all_motifs_with_promoted.add(motif_signature)
+                    fully_verified = (
+                        motif_provenance_status == "verified"
+                        and transfer_provenance_status == "verified"
+                        and concept_status == "verified"
+                    )
+                    if fully_verified and transfer_attempt_count > 0:
+                        verified_motifs_with_transfer.add(motif_signature)
+                    if fully_verified and strong_transfer_success_count > 0:
+                        verified_motifs_with_strong.add(motif_signature)
+                    if fully_verified and promoted_concept_count > 0:
+                        verified_motifs_with_promoted.add(motif_signature)
+                    if transfer_provenance_status == "verified":
+                        assert role_signature and concrete_pair
+                        verified_concrete_transfer_link_count += 1
+                        verified_transfer_pairs.add(tuple(str(value) for value in provenance))
+                    if is_emergent_motif:
+                        emergent_link_count += 1
+                        if fully_verified:
+                            fully_verified_emergent_chain_count += 1
+                        elif motif_provenance_status == "missing" or transfer_provenance_status == "missing" or concept_status == "missing":
+                            unverified_emergent_chain_count += 1
+                        else:
+                            partially_verified_emergent_chain_count += 1
+                        emergent_success_numer += successful_transfer_count
+                        emergent_success_denom += transfer_attempt_count
+                        emergent_strong_numer += strong_transfer_success_count
+                    motif_success_numer += successful_transfer_count
+                    motif_success_denom += transfer_attempt_count
+                    motif_strong_numer += strong_transfer_success_count
         motifs_with_transfer += int(motif_had_transfer)
         motifs_with_strong_transfer += int(motif_had_strong)
         motifs_with_promoted_concept += int(motif_had_promoted)
@@ -1489,14 +1594,28 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
             emergent_motifs_with_promoted_concept += int(motif_had_promoted)
     return {
         "future_option_transfer_link_count": inserted,
-        "motifs_with_transfer_count": motifs_with_transfer,
-        "motifs_with_strong_transfer_count": motifs_with_strong_transfer,
-        "motifs_with_promoted_concept_count": motifs_with_promoted_concept,
+        "all_motifs_with_transfer_count": len(all_motifs_with_transfer),
+        "verified_motifs_with_transfer_count": len(verified_motifs_with_transfer),
+        "all_motifs_with_strong_transfer_count": len(all_motifs_with_strong),
+        "verified_motifs_with_strong_transfer_count": len(verified_motifs_with_strong),
+        "all_motifs_with_promoted_concept_count": len(all_motifs_with_promoted),
+        "verified_motifs_with_promoted_concept_count": len(verified_motifs_with_promoted),
+        # Deprecated aliases retain the inclusive (all-link) meaning.
+        "motifs_with_transfer_count": len(all_motifs_with_transfer),
+        "motifs_with_strong_transfer_count": len(all_motifs_with_strong),
+        "motifs_with_promoted_concept_count": len(all_motifs_with_promoted),
         "motif_transfer_success_rate": (motif_success_numer / motif_success_denom) if motif_success_denom else None,
         "motif_strong_transfer_success_rate": (motif_strong_numer / motif_success_denom) if motif_success_denom else None,
         "promoted_concept_motif_count": motifs_with_promoted_concept,
         "emergent_future_option_transfer_link_count": emergent_link_count,
         "emergent_motif_transfer_link_count": emergent_link_count,
+        "all_emergent_motif_transfer_link_count": emergent_link_count,
+        "fully_verified_emergent_chain_count": fully_verified_emergent_chain_count,
+        "partially_verified_emergent_chain_count": partially_verified_emergent_chain_count,
+        "unverified_emergent_chain_count": unverified_emergent_chain_count,
+        "verified_concrete_transfer_link_count": verified_concrete_transfer_link_count,
+        "verified_transfer_pair_count": len(verified_transfer_pairs),
+        "distinct_source_target_pair_count": len(verified_transfer_pairs),
         "emergent_motifs_with_strong_transfer_count": emergent_motifs_with_strong_transfer,
         "emergent_motifs_with_promoted_concept_count": emergent_motifs_with_promoted_concept,
         "emergent_motif_transfer_success_rate": (emergent_success_numer / emergent_success_denom) if emergent_success_denom else None,

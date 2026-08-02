@@ -82,9 +82,13 @@ def evaluate_h11_future_option_transfer_concepts(
         and str(row.get("transfer_provenance_status") or "missing") == "verified"
         and str(row.get("concept_validation_status") or "missing") == "verified"
     ]
-    motifs_with_transfer = len({str(row["motif_signature"]) for row in fully_verified_rows if int(row["transfer_attempt_count"] or 0) > 0})
-    motifs_with_strong = len({str(row["motif_signature"]) for row in fully_verified_rows if int(row["strong_transfer_success_count"] or 0) > 0})
-    motifs_with_promoted = len({str(row["motif_signature"]) for row in fully_verified_rows if int(row["promoted_concept_count"] or 0) > 0})
+    all_motifs_with_transfer = len({str(row["motif_signature"]) for row in rows if int(row["transfer_attempt_count"] or 0) > 0})
+    verified_motifs_with_transfer = len({str(row["motif_signature"]) for row in fully_verified_rows if int(row["transfer_attempt_count"] or 0) > 0})
+    all_motifs_with_strong = len({str(row["motif_signature"]) for row in rows if int(row["strong_transfer_success_count"] or 0) > 0})
+    verified_motifs_with_strong = len({str(row["motif_signature"]) for row in fully_verified_rows if int(row["strong_transfer_success_count"] or 0) > 0})
+    all_motifs_with_promoted = len({str(row["motif_signature"]) for row in rows if int(row["promoted_concept_count"] or 0) > 0})
+    verified_motifs_with_promoted = len({str(row["motif_signature"]) for row in fully_verified_rows if int(row["promoted_concept_count"] or 0) > 0})
+    emergent_all_rows = [row for row in rows if int(row.get("is_emergent") or 0) == 1]
     emergent_rows = [row for row in fully_verified_rows if int(row.get("is_emergent") or 0) == 1]
     non_emergent_rows = [row for row in rows if int(row.get("is_emergent") or 0) != 1]
     emergent_motifs_with_transfer = len({str(row["motif_signature"]) for row in emergent_rows if int(row["transfer_attempt_count"] or 0) > 0})
@@ -101,27 +105,81 @@ def evaluate_h11_future_option_transfer_concepts(
     verified_cross_game_rows = [
         row for row in fully_verified_rows
         if str(row.get("provenance_mode") or "") == "single_source"
+        and row.get("source_role_signature")
         and row.get("source_game_key") and row.get("target_game_key")
+        and row.get("source_context_key") and row.get("target_context_key")
         and str(row["source_game_key"]) != str(row["target_game_key"])
     ]
     unverified_cross_game_rows = [
         row for row in rows
         if str(row.get("provenance_mode") or "") != "single_source"
     ]
+    chain_state_counts: dict[str, int] = {
+        "verified_verified_verified": 0,
+        "verified_verified_proxy": 0,
+        "verified_proxy_verified": 0,
+        "missing_verified_verified": 0,
+        "missing_proxy_verified": 0,
+        "other": 0,
+    }
+    blocked_by_motif_provenance = 0
+    blocked_by_transfer_provenance = 0
+    blocked_by_concept_validation = 0
+    blocked_by_missing_concept = 0
+    for row in rows:
+        motif_status = str(row.get("motif_provenance_status") or "missing")
+        transfer_status = str(row.get("transfer_provenance_status") or "missing")
+        concept_status = str(row.get("concept_validation_status") or "missing")
+        key = f"{motif_status}_{transfer_status}_{concept_status}"
+        chain_state_counts[key if key in chain_state_counts else "other"] += 1
+        blocked_by_motif_provenance += int(motif_status != "verified")
+        blocked_by_transfer_provenance += int(transfer_status != "verified")
+        blocked_by_concept_validation += int(concept_status != "verified")
+        blocked_by_missing_concept += int(concept_status == "missing")
+    verified_cross_game_pairs = {
+        (str(row["source_game_key"]), str(row["target_game_key"]), str(row["source_context_key"]), str(row["target_context_key"]))
+        for row in verified_cross_game_rows
+    }
     result = {
         "hypothesis_id": "H11",
         "evidence_source": "compact_memory",
         "future_option_transfer_link_count": len(rows),
         "verified_future_option_transfer_count": len(fully_verified_rows),
         "future_option_motif_count": future_option_motif_count,
-        "motifs_with_transfer_count": motifs_with_transfer,
-        "motifs_with_strong_transfer_count": motifs_with_strong,
-        "motifs_with_promoted_concept_count": motifs_with_promoted,
+        "all_motifs_with_transfer_count": all_motifs_with_transfer,
+        "verified_motifs_with_transfer_count": verified_motifs_with_transfer,
+        "all_motifs_with_strong_transfer_count": all_motifs_with_strong,
+        "verified_motifs_with_strong_transfer_count": verified_motifs_with_strong,
+        "all_motifs_with_promoted_concept_count": all_motifs_with_promoted,
+        "verified_motifs_with_promoted_concept_count": verified_motifs_with_promoted,
+        # Backward-compatible aliases use the inclusive all-link population.
+        "motifs_with_transfer_count": all_motifs_with_transfer,
+        "motifs_with_strong_transfer_count": all_motifs_with_strong,
+        "motifs_with_promoted_concept_count": all_motifs_with_promoted,
         "motif_transfer_success_rate": (total_successes / total_attempts) if total_attempts else None,
         "motif_strong_transfer_success_rate": (total_strong / total_attempts) if total_attempts else None,
         "promoted_concept_motif_count": motifs_with_promoted,
         "emergent_future_option_motif_count": emergent_motifs,
-        "emergent_motif_transfer_link_count": len(emergent_rows),
+        "all_emergent_motif_transfer_link_count": len(emergent_all_rows),
+        "emergent_motif_transfer_link_count": len(emergent_all_rows),
+        "fully_verified_emergent_chain_count": len(emergent_rows),
+        "partially_verified_emergent_chain_count": sum(
+            1 for row in emergent_all_rows
+            if row not in fully_verified_rows
+            and "missing" not in {
+                str(row.get("motif_provenance_status") or "missing"),
+                str(row.get("transfer_provenance_status") or "missing"),
+                str(row.get("concept_validation_status") or "missing"),
+            }
+        ),
+        "unverified_emergent_chain_count": sum(
+            1 for row in emergent_all_rows
+            if "missing" in {
+                str(row.get("motif_provenance_status") or "missing"),
+                str(row.get("transfer_provenance_status") or "missing"),
+                str(row.get("concept_validation_status") or "missing"),
+            }
+        ),
         "emergent_motifs_with_transfer_count": emergent_motifs_with_transfer,
         "emergent_motifs_with_strong_transfer_count": emergent_motifs_with_strong,
         "emergent_motifs_with_promoted_concept_count": emergent_motifs_with_promoted,
@@ -134,7 +192,28 @@ def evaluate_h11_future_option_transfer_concepts(
         "successful_role_transfer_count": successful_role_transfer_count,
         "verified_cross_game_future_option_transfer_count": len(verified_cross_game_rows),
         "verified_cross_game_motif_transfer_count": len(verified_cross_game_rows),
+        "verified_cross_game_link_count": len(verified_cross_game_rows),
+        "verified_cross_game_motif_count": len({str(row["motif_signature"]) for row in verified_cross_game_rows}),
+        "verified_cross_game_pair_count": len(verified_cross_game_pairs),
         "unverified_cross_game_motif_transfer_count": len(unverified_cross_game_rows),
+        "verified_concrete_transfer_link_count": sum(
+            1 for row in rows if str(row.get("transfer_provenance_status") or "missing") == "verified"
+        ),
+        "verified_transfer_pair_count": len({
+            (str(row.get("source_game_key") or ""), str(row.get("target_game_key") or ""),
+             str(row.get("source_context_key") or ""), str(row.get("target_context_key") or ""))
+            for row in rows if str(row.get("transfer_provenance_status") or "missing") == "verified"
+        }),
+        "distinct_source_target_pair_count": len({
+            (str(row.get("source_game_key") or ""), str(row.get("target_game_key") or ""),
+             str(row.get("source_context_key") or ""), str(row.get("target_context_key") or ""))
+            for row in rows if str(row.get("transfer_provenance_status") or "missing") == "verified"
+        }),
+        "motif_transfer_chain_provenance_breakdown": chain_state_counts,
+        "blocked_by_motif_provenance": blocked_by_motif_provenance,
+        "blocked_by_transfer_provenance": blocked_by_transfer_provenance,
+        "blocked_by_concept_validation": blocked_by_concept_validation,
+        "blocked_by_missing_concept": blocked_by_missing_concept,
         "motif_transfer_chain_provenance": [
             {
                 "motif_signature": str(row["motif_signature"]),
@@ -143,6 +222,11 @@ def evaluate_h11_future_option_transfer_concepts(
                 "motif_provenance_status": row.get("motif_provenance_status") or "missing",
                 "transfer_provenance_status": row.get("transfer_provenance_status") or "missing",
                 "concept_validation_status": row.get("concept_validation_status") or "missing",
+                "motif_provenance_resolution_path": row.get("motif_provenance_resolution_path") or "unresolved",
+                "source_game_key": row.get("source_game_key"),
+                "target_game_key": row.get("target_game_key"),
+                "source_context_key": row.get("source_context_key"),
+                "target_context_key": row.get("target_context_key"),
             }
             for row in rows
         ],
@@ -191,7 +275,7 @@ def evaluate_h11_future_option_transfer_concepts(
     elif len(emergent_rows) == 0 and len(rows) > 0:
         result["decision"] = "PARTIALLY_VALID"
         result["missing_evidence"].append("Transfer/concept evidence exists, but it is not attached to emergent future-option motifs.")
-    elif len(rows) > 0 and motifs_with_strong == 0:
+    elif len(rows) > 0 and verified_motifs_with_strong == 0:
         result["decision"] = "PARTIALLY_VALID"
     elif (
         len(emergent_rows) >= 5

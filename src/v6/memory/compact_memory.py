@@ -5625,9 +5625,18 @@ def _ensure_current_state_schema(path: Path) -> bool:
                 motif_provenance_status TEXT,
                 transfer_provenance_status TEXT,
                 concept_validation_status TEXT,
+                motif_provenance_resolution_path TEXT,
+                motif_resolved_interaction_count INTEGER DEFAULT 0,
+                motif_resolved_family_count INTEGER DEFAULT 0,
+                motif_resolved_carrier_count INTEGER DEFAULT 0,
+                motif_resolved_role_count INTEGER DEFAULT 0,
+                motif_resolved_concept_count INTEGER DEFAULT 0,
                 first_seen_global_step INTEGER,
                 last_seen_global_step INTEGER,
-                PRIMARY KEY (motif_signature, role_signature, concept_signature)
+                PRIMARY KEY (
+                    motif_signature, role_signature, concept_signature,
+                    source_game_key, target_game_key, source_context_key, target_context_key
+                )
             );
             CREATE TABLE IF NOT EXISTS graph_epoch_summary (
                 epoch_key TEXT PRIMARY KEY,
@@ -5775,6 +5784,77 @@ def _ensure_current_state_schema(path: Path) -> bool:
         _ensure_column(connection, "future_option_transfer_links", "motif_provenance_status", "TEXT")
         _ensure_column(connection, "future_option_transfer_links", "transfer_provenance_status", "TEXT")
         _ensure_column(connection, "future_option_transfer_links", "concept_validation_status", "TEXT")
+        _ensure_column(connection, "future_option_transfer_links", "motif_provenance_resolution_path", "TEXT")
+        _ensure_column(connection, "future_option_transfer_links", "motif_resolved_interaction_count", "INTEGER DEFAULT 0")
+        _ensure_column(connection, "future_option_transfer_links", "motif_resolved_family_count", "INTEGER DEFAULT 0")
+        _ensure_column(connection, "future_option_transfer_links", "motif_resolved_carrier_count", "INTEGER DEFAULT 0")
+        _ensure_column(connection, "future_option_transfer_links", "motif_resolved_role_count", "INTEGER DEFAULT 0")
+        _ensure_column(connection, "future_option_transfer_links", "motif_resolved_concept_count", "INTEGER DEFAULT 0")
+        transfer_link_columns = {
+            str(row[1]): int(row[5])
+            for row in connection.execute("PRAGMA table_info(future_option_transfer_links)").fetchall()
+        }
+        required_transfer_link_pk = {
+            "motif_signature",
+            "role_signature",
+            "concept_signature",
+            "source_game_key",
+            "target_game_key",
+            "source_context_key",
+            "target_context_key",
+        }
+        if not required_transfer_link_pk <= {name for name, pk_order in transfer_link_columns.items() if pk_order > 0}:
+            # These rows are derived H11 artifacts.  The old role-level key
+            # collapsed distinct verified source/target pairs, so retain no
+            # proxy aggregate as evidence after the identity migration.
+            connection.execute("DROP TABLE future_option_transfer_links")
+            connection.execute(
+                """
+                CREATE TABLE future_option_transfer_links (
+                    motif_signature TEXT,
+                    role_signature TEXT,
+                    concept_signature TEXT NOT NULL DEFAULT '__none__',
+                    transfer_attempt_count INTEGER,
+                    successful_transfer_count INTEGER,
+                    strong_transfer_success_count INTEGER,
+                    promoted_concept_count INTEGER,
+                    mean_transfer_score REAL,
+                    mean_best_margin REAL,
+                    source_role_signature TEXT,
+                    source_game_key TEXT,
+                    target_game_key TEXT,
+                    source_context_key TEXT,
+                    target_context_key TEXT,
+                    provenance_mode TEXT,
+                    motif_provenance_status TEXT,
+                    transfer_provenance_status TEXT,
+                    concept_validation_status TEXT,
+                    motif_provenance_resolution_path TEXT,
+                    motif_resolved_interaction_count INTEGER DEFAULT 0,
+                    motif_resolved_family_count INTEGER DEFAULT 0,
+                    motif_resolved_carrier_count INTEGER DEFAULT 0,
+                    motif_resolved_role_count INTEGER DEFAULT 0,
+                    motif_resolved_concept_count INTEGER DEFAULT 0,
+                    first_seen_global_step INTEGER,
+                    last_seen_global_step INTEGER,
+                    PRIMARY KEY (
+                        motif_signature, role_signature, concept_signature,
+                        source_game_key, target_game_key, source_context_key, target_context_key
+                    )
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_future_option_transfer_motif ON future_option_transfer_links(motif_signature)"
+            )
+            connection.execute(
+                """
+                INSERT INTO memory_summary (key, value_json)
+                VALUES ('future_option_transfer_link_identity_migration', ?)
+                ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json
+                """,
+                (json.dumps({"rebuild_required": True, "schema": "concrete_provenance_pair_v2"}, sort_keys=True),),
+            )
         _ensure_column(connection, "concept_candidates", "strong_transfer_success_count", "INTEGER")
         _ensure_column(connection, "concept_candidates", "transfer_success_concentration", "REAL")
         _ensure_column(connection, "concept_candidates", "is_overconcentrated", "INTEGER DEFAULT 0")
