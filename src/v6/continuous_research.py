@@ -115,6 +115,7 @@ class ContinuousResearchConfig:
     promotion_min_cross_context_or_game_evidence: int = 2
     promotion_min_behavioral_or_predictive_lift: float = 0.01
     promotion_min_relevant_heldout_event_count: int = 20
+    promotion_population_comparability_threshold: float = 0.80
     promotion_demotion_failure_limit: int = 2
     hypothesis_progress: bool = True
     hypothesis_progress_log_every: int = 1000
@@ -428,6 +429,7 @@ def _run_continuous_research_inner(config: ContinuousResearchConfig) -> dict[str
             promotion_min_cross_context_or_game_evidence=int(config.promotion_min_cross_context_or_game_evidence),
             promotion_min_behavioral_or_predictive_lift=float(config.promotion_min_behavioral_or_predictive_lift),
             promotion_min_relevant_heldout_event_count=int(config.promotion_min_relevant_heldout_event_count),
+            promotion_population_comparability_threshold=float(config.promotion_population_comparability_threshold),
             promotion_demotion_failure_limit=int(config.promotion_demotion_failure_limit),
             hypothesis_progress=bool(config.hypothesis_progress),
             hypothesis_progress_log_every=int(config.hypothesis_progress_log_every),
@@ -737,6 +739,7 @@ def _load_or_initialize_manifest(config: ContinuousResearchConfig, manifest_path
         "promotion_min_cross_context_or_game_evidence": int(config.promotion_min_cross_context_or_game_evidence),
         "promotion_min_behavioral_or_predictive_lift": float(config.promotion_min_behavioral_or_predictive_lift),
         "promotion_min_relevant_heldout_event_count": int(config.promotion_min_relevant_heldout_event_count),
+        "promotion_population_comparability_threshold": float(config.promotion_population_comparability_threshold),
         "promotion_demotion_failure_limit": int(config.promotion_demotion_failure_limit),
         "stop_if_disk_above_percent": float(config.stop_if_disk_above_percent),
         "stop_if_no_new_stable_contingencies_for": int(config.stop_if_no_new_stable_contingencies_for),

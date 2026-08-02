@@ -630,6 +630,7 @@ def build_parser() -> argparse.ArgumentParser:
     hypothesis_suite.add_argument("--promotion-min-cross-context-or-game-evidence", type=int, default=2)
     hypothesis_suite.add_argument("--promotion-min-behavioral-or-predictive-lift", type=float, default=0.01)
     hypothesis_suite.add_argument("--promotion-min-relevant-heldout-event-count", type=int, default=20)
+    hypothesis_suite.add_argument("--promotion-population-comparability-threshold", type=float, default=0.80)
     hypothesis_suite.add_argument("--promotion-demotion-failure-limit", type=int, default=2)
 
     continuous = subparsers.add_parser("continuous-research-run")
@@ -739,6 +740,7 @@ def build_parser() -> argparse.ArgumentParser:
     continuous.add_argument("--promotion-min-cross-context-or-game-evidence", type=int, default=2)
     continuous.add_argument("--promotion-min-behavioral-or-predictive-lift", type=float, default=0.01)
     continuous.add_argument("--promotion-min-relevant-heldout-event-count", type=int, default=20)
+    continuous.add_argument("--promotion-population-comparability-threshold", type=float, default=0.80)
     continuous.add_argument("--promotion-demotion-failure-limit", type=int, default=2)
     continuous.add_argument("--memory-query-enabled", action="store_true")
     continuous.add_argument("--memory-action-selection-enabled", action="store_true")
@@ -1648,6 +1650,7 @@ def main(argv: list[str] | None = None) -> int:
             promotion_min_cross_context_or_game_evidence=int(args.promotion_min_cross_context_or_game_evidence),
             promotion_min_behavioral_or_predictive_lift=float(args.promotion_min_behavioral_or_predictive_lift),
             promotion_min_relevant_heldout_event_count=int(args.promotion_min_relevant_heldout_event_count),
+            promotion_population_comparability_threshold=float(args.promotion_population_comparability_threshold),
             promotion_demotion_failure_limit=int(args.promotion_demotion_failure_limit),
             hypothesis_progress=args.hypothesis_progress,
             hypothesis_progress_log_every=int(args.hypothesis_progress_log_every),
@@ -1742,6 +1745,7 @@ def main(argv: list[str] | None = None) -> int:
             promotion_min_cross_context_or_game_evidence=int(args.promotion_min_cross_context_or_game_evidence),
             promotion_min_behavioral_or_predictive_lift=float(args.promotion_min_behavioral_or_predictive_lift),
             promotion_min_relevant_heldout_event_count=int(args.promotion_min_relevant_heldout_event_count),
+            promotion_population_comparability_threshold=float(args.promotion_population_comparability_threshold),
             promotion_demotion_failure_limit=int(args.promotion_demotion_failure_limit),
             hypothesis_progress=bool(args.hypothesis_progress),
             hypothesis_progress_log_every=int(args.hypothesis_progress_log_every),

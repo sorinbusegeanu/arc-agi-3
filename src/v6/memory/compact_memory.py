@@ -5376,6 +5376,7 @@ def _ensure_current_state_schema(path: Path) -> None:
                 compression_gain REAL,
                 explanatory_reach REAL,
                 promotion_score REAL,
+                raw_promotion_score REAL,
                 first_seen_global_step INTEGER,
                 last_seen_global_step INTEGER,
                 is_promoted INTEGER,
@@ -5391,6 +5392,7 @@ def _ensure_current_state_schema(path: Path) -> None:
                 validation_contradiction_resolution REAL,
                 validation_explanatory_gain REAL,
                 validation_evidence_count INTEGER,
+                validation_status TEXT,
                 promotion_status TEXT,
                 promotion_failure_count INTEGER DEFAULT 0
             );
@@ -5772,8 +5774,10 @@ def _ensure_current_state_schema(path: Path) -> None:
         _ensure_column(connection, "concept_candidates", "validation_action_selection_lift", "REAL")
         _ensure_column(connection, "concept_candidates", "validation_transfer_lift", "REAL")
         _ensure_column(connection, "concept_candidates", "validation_evidence_count", "INTEGER")
+        _ensure_column(connection, "concept_candidates", "validation_status", "TEXT")
         _ensure_column(connection, "concept_candidates", "promotion_status", "TEXT")
         _ensure_column(connection, "concept_candidates", "promotion_failure_count", "INTEGER DEFAULT 0")
+        _ensure_column(connection, "concept_candidates", "raw_promotion_score", "REAL")
         _ensure_column(connection, "promotion_validation_state", "last_validation_epoch", "TEXT")
         _ensure_column(connection, "promotion_validation_state", "last_validation_global_step", "INTEGER")
         _ensure_column(connection, "promotion_validation_state", "last_validation_result", "TEXT")
@@ -5894,7 +5898,7 @@ def _ensure_current_state_schema(path: Path) -> None:
                 (json.dumps({"rebuild_required": True, "schema": "source_evidence_support_v1"}, sort_keys=True),),
             )
         relevance_migration_row = connection.execute(
-            "SELECT value_json FROM memory_summary WHERE key = 'incremental_promotion_relevance_migration'"
+            "SELECT value_json FROM memory_summary WHERE key = 'incremental_promotion_relevance_migration_v2'"
         ).fetchone()
         if relevance_migration_row is None:
             # The old Phase 3 denominator used every later event and its
@@ -5916,9 +5920,9 @@ def _ensure_current_state_schema(path: Path) -> None:
             connection.execute(
                 """
                 INSERT INTO memory_summary (key, value_json)
-                VALUES ('incremental_promotion_relevance_migration', ?)
+                VALUES ('incremental_promotion_relevance_migration_v2', ?)
                 """,
-                (json.dumps({"rebuild_required": True, "schema": "relevant_heldout_population_v1"}, sort_keys=True),),
+                (json.dumps({"rebuild_required": True, "schema": "relevant_heldout_population_v2"}, sort_keys=True),),
             )
         connection.execute("DROP INDEX IF EXISTS idx_carrier_links_carrier_type_key")
         connection.execute("DROP INDEX IF EXISTS idx_role_neighborhood_carrier")

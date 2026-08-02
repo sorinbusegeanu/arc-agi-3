@@ -5,6 +5,8 @@ import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import pytest
+
 from v6.continuous_research import _format_epoch_status
 from v6 import higher_order_substrate
 from v6.higher_order_substrate import (
@@ -271,7 +273,10 @@ def test_prediction_and_contradiction_events_are_held_out_and_deterministic(tmp_
     _seed_functional_candidate(memory_dir, include_prediction=True)
     diagnostic = _coverage_diagnostic(memory_dir, epoch_id="epoch_1")
 
-    assert {"transfer", "prediction", "contradiction_resolution"} <= set(diagnostic["explained_event_type_counts"])
+    # Prediction rows share only a broad context in this fixture.  Scope-only
+    # overlap is diagnostic rather than a Phase 3 promotion opportunity.
+    assert diagnostic["explained_event_type_counts"] == {"transfer": 1}
+    assert diagnostic["context_only_overlap_count"] >= 2
     assert diagnostic["explained_event_ids_sample"] == sorted(diagnostic["explained_event_ids_sample"])
     assert all(
         event_id.startswith(("transfer:", "prediction:", "contradiction_resolution:"))
@@ -368,10 +373,115 @@ def test_relevant_validation_reports_matched_population_and_score_components(tmp
     assert diagnostic["baseline_event_count"] == diagnostic["candidate_event_count"] == diagnostic["common_event_count"]
     assert diagnostic["relevant_heldout_event_count"] == diagnostic["explained_relevant_event_count"]
     assert diagnostic["global_explanatory_reach"] >= diagnostic["explained_relevant_event_count"]
-    assert diagnostic["adjusted_promotion_score"] == (
-        diagnostic["raw_promotion_score"] + diagnostic["validation_penalty"]
+    assert diagnostic["adjusted_promotion_score"] == 0.5 * (
+        diagnostic["raw_promotion_score"] + diagnostic["validation_score"]
     )
     assert diagnostic["relevant_transfer_event_count"] == 1
+
+
+def test_relevance_requires_structural_overlap_not_game_or_context_only() -> None:
+    candidate_links = {
+        "role": {"role-a"},
+        "family": {"family-a"},
+        "carrier": {"carrier-a"},
+        "context": {"ctx-a"},
+        "game": {"game-a"},
+    }
+    game_only = {"_game_keys": ["game-a"]}
+    context_only = {"_context_keys": ["ctx-a"]}
+    family = {"_family_ids": ["family-a"]}
+    carrier = {"_carrier_ids": ["carrier-a"]}
+    source_role = {"_source_role_signature": "role-a"}
+
+    for event in (game_only, context_only):
+        reasons = higher_order_substrate._event_relevance_reasons(
+            event, source_roles=["role-a"], candidate_links=candidate_links,
+        )
+        assert reasons in (["game_overlap"], ["context_overlap"])
+        assert not higher_order_substrate._event_is_relevant(reasons)
+    for event in (family, carrier, source_role):
+        reasons = higher_order_substrate._event_relevance_reasons(
+            event, source_roles=["role-a"], candidate_links=candidate_links,
+        )
+        assert higher_order_substrate._event_is_relevant(reasons)
+
+
+def test_functional_population_mismatch_is_explicit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    memory_dir = tmp_path / "memory"
+    paths = ensure_memory_layout(memory_dir)
+    event_template = {
+        "concept_id": "concept-a",
+        "event_type": "transfer",
+        "evaluation_scope": "later_global_step",
+        "best_single_role_score": 0.2,
+        "lower_level_baseline_score": 0.2,
+        "concept_enabled_score": 0.8,
+        "_outcome": 1.0,
+        "_evaluation_global_step": 20,
+        "_feature_global_step_max": 10,
+        "_label_used_as_feature": False,
+        "_source_role_signature": "role-a",
+    }
+    monkeypatch.setattr(
+        higher_order_substrate,
+        "_transfer_explanation_events",
+        lambda **_kwargs: [
+            {**event_template, "event_id": "transfer:one"},
+            {**event_template, "event_id": "transfer:two", "_candidate_available": False},
+        ],
+    )
+    monkeypatch.setattr(higher_order_substrate, "_future_option_motif_explanation_events", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(higher_order_substrate, "_prediction_explanation_events", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(higher_order_substrate, "_contradiction_resolution_explanation_events", lambda *_args, **_kwargs: [])
+    with sqlite3.connect(paths.current_state) as conn:
+        conn.row_factory = sqlite3.Row
+        _events, diagnostic, _state = higher_order_substrate._build_functional_explanation_diagnostics(
+            state_conn=conn,
+            candidate_signature="concept-a",
+            source_roles=["role-a"],
+            first_seen_global_step=10,
+            transfer_rows=[], transfer_history=None, future_rows=[], previous_state=None,
+            diagnostic_epoch_id="epoch-1",
+            config=IncrementalPromotionValidationConfig(enabled=True, min_relevant_heldout_event_count=1),
+            candidate_links={"role": {"role-a"}},
+        )
+    assert diagnostic["baseline_event_count"] == 2
+    assert diagnostic["candidate_event_count"] == 1
+    assert diagnostic["common_event_count"] == 1
+    assert diagnostic["baseline_only_event_count"] == 1
+    assert diagnostic["baseline_population_matched"] is False
+    assert diagnostic["invalid_explanation_event_count"] == 1
+
+
+def test_concepts_keep_disjoint_relevance_populations(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_functional_candidate(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute("INSERT INTO role_candidates (role_signature, support_count) VALUES ('role-z', 2)")
+        conn.execute("INSERT INTO concept_candidates (concept_signature, promotion_score, cross_context_count, cross_game_count, first_seen_global_step) VALUES ('concept-z', .9, 2, 2, 10)")
+        conn.execute("INSERT INTO concept_links (concept_signature, linked_type, linked_key, support_count) VALUES ('concept-z', 'role', 'role-z', 1)")
+        conn.execute(
+            """INSERT INTO role_transfer_attempts (
+                attempt_id, role_signature, source_role_signature,
+                predicted_target_role_signature, observed_target_role_signature,
+                source_game_key, target_game_key, source_carrier_signature,
+                provenance_mode, provenance_status, reuse_success, last_seen_global_step
+            ) VALUES ('heldout-z', 'role-z', 'role-z', 'target-z', 'target-z',
+                      'source-z', 'target-z', 'carrier-z', 'single_source', 'verified', 1, 20)"""
+        )
+        conn.commit()
+    validate_incremental_promotions_only(
+        memory_dir=memory_dir,
+        config=IncrementalPromotionValidationConfig(enabled=True, min_relevant_heldout_event_count=1),
+        validate_roles_and_concepts=True, validate_world_models=False, diagnostic_epoch_id="epoch-1",
+    )
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        payloads = {
+            row[0]: json.loads(row[1])
+            for row in conn.execute("SELECT concept_signature, payload_json FROM concept_promotion_validation_diagnostics")
+        }
+    assert payloads["concept-functional"]["relevant_transfer_event_count"] == 1
+    assert payloads["concept-z"]["relevant_transfer_event_count"] == 1
 
 
 def test_one_source_role_already_explains_event_gets_no_concept_credit(tmp_path: Path) -> None:
@@ -650,6 +760,8 @@ def test_incremental_validation_failure_count_is_epoch_idempotent_and_resets_on_
         status = conn.execute(
             "SELECT failure_count, promotion_status, last_validation_epoch, last_validation_result FROM promotion_validation_state WHERE candidate_type = 'concept' AND candidate_signature = 'concept-functional'"
         ).fetchone()
+    # A newly sufficient current population can promote even when the
+    # longitudinal population expanded; expansion only gates demotion logic.
     assert status == (0, "promoted", "epoch_2", "population_expansion")
 
 
@@ -764,7 +876,8 @@ def test_incremental_promotion_validation_uses_later_evidence_and_demotes_withou
         "min_event_behavioral_gain": 0.01,
         "min_event_compression_gain": 0.01,
             "min_explanation_event_count": 1,
-            "min_relevant_heldout_event_count": 1,
+        "min_relevant_heldout_event_count": 1,
+        "promotion_population_comparability_threshold": 0.8,
         "min_cross_context_or_game_evidence": 2,
         "min_behavioral_or_predictive_lift": 0.01,
         "demotion_failure_limit": 1,
@@ -834,7 +947,7 @@ def test_incremental_promotion_validation_uses_later_evidence_and_demotes_withou
         component = conn.execute(
             "SELECT is_coherent, candidate_only FROM world_model_components WHERE component_signature='wm-a'"
         ).fetchone()
-    assert concept == (1, "promoted")
+    assert concept == (1, "retained")
     assert component == (1, 0)
     h07_after_demotion = evaluate_h07_concept_emergence(
         memory_dir=memory_dir,

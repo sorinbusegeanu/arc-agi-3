@@ -311,6 +311,7 @@ def _incremental_promotion_thresholds(config: IncrementalPromotionValidationConf
         "min_event_compression_gain": float(config.min_event_compression_gain),
         "min_explanation_event_count": int(config.min_explanation_event_count),
         "min_relevant_heldout_event_count": int(config.min_relevant_heldout_event_count),
+        "promotion_population_comparability_threshold": float(config.promotion_population_comparability_threshold),
         "min_cross_context_or_game_evidence": int(config.min_cross_context_or_game_evidence),
         "min_behavioral_or_predictive_lift": float(config.min_behavioral_or_predictive_lift),
         "demotion_failure_limit": int(config.demotion_failure_limit),
@@ -515,6 +516,14 @@ def _write_outputs(output_dir: Path, result: dict[str, Any]) -> None:
                 f"incremental_coverage={float(candidate.get('incremental_explanatory_coverage', 0.0) or 0.0):.2f}\n"
                 f"relevant_heldout_samples={int(candidate.get('relevant_heldout_event_count', 0) or 0)} "
                 f"global_reach={int(candidate.get('global_explanatory_reach', 0) or 0)}\n"
+                f"baseline={candidate.get('baseline_type', 'N/A')} "
+                f"candidate={candidate.get('candidate_type', 'N/A')} "
+                f"population={int(candidate.get('common_event_count', 0) or 0)}/"
+                f"{int(candidate.get('baseline_event_count', 0) or 0)}/"
+                f"{int(candidate.get('candidate_event_count', 0) or 0)}\n"
+                f"retained_events={int(candidate.get('retained_event_count', 0) or 0)} "
+                f"current_coverage={float(candidate.get('current_population_coverage', 0.0) or 0.0):.2f} "
+                f"retained_coverage={float(candidate.get('retained_population_coverage', 0.0) or 0.0):.2f}\n"
                 f"prediction_lift={float(candidate.get('prediction_lift', 0.0) or 0.0):.2f}\n"
                 f"behavioral_lift={float(candidate.get('heldout_action_selection_lift', 0.0) or 0.0):.2f}\n"
                 f"rejection_reasons={reasons}\n"

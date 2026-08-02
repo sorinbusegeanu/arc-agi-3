@@ -242,6 +242,7 @@ def run_hypothesis_suite_report(
     promotion_min_cross_context_or_game_evidence: int = 2,
     promotion_min_behavioral_or_predictive_lift: float = 0.01,
     promotion_min_relevant_heldout_event_count: int = 20,
+    promotion_population_comparability_threshold: float = 0.80,
     promotion_demotion_failure_limit: int = 2,
     allow_memory_repair: bool = False,
     hypothesis_progress: bool | None = None,
@@ -388,6 +389,7 @@ def run_hypothesis_suite_report(
             min_cross_context_or_game_evidence=int(promotion_min_cross_context_or_game_evidence),
             min_behavioral_or_predictive_lift=float(promotion_min_behavioral_or_predictive_lift),
             min_relevant_heldout_event_count=int(promotion_min_relevant_heldout_event_count),
+            promotion_population_comparability_threshold=float(promotion_population_comparability_threshold),
             demotion_failure_limit=int(promotion_demotion_failure_limit),
         )
         with _phase("derive_role_candidates"):
