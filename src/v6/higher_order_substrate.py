@@ -15,6 +15,8 @@ from v6.memory.compact_memory import ensure_memory_layout
 
 
 CONCEPT_PROMOTION_SCORE_THRESHOLD = 0.55
+MIN_SOURCE_EVIDENCE_SUPPORT = 2
+MIN_TRANSFER_SIMILARITY = 0.60
 
 
 ROLE_CLEAR_TABLES = (
@@ -296,6 +298,11 @@ def derive_role_transfer_attempts_only(
         graph_conn.row_factory = sqlite3.Row
         for table in ROLE_TRANSFER_ONLY_CLEAR_TABLES:
             state_conn.execute(f"DELETE FROM {table}")
+        # This is a current-state milestone, not a historical first-ever
+        # record.  A fresh zero-success derivation must not inherit it.
+        state_conn.execute(
+            "DELETE FROM higher_order_milestones WHERE milestone_name = 'first_role_transfer_success_step'"
+        )
         summary = derive_role_transfer_attempts_parallel(
             state_conn,
             graph_conn,
@@ -673,6 +680,7 @@ def derive_role_transfer_attempts_parallel(
     best_margin_sum = 0.0
     best_margin_count = 0
     source_carrier_count_sum = 0
+    source_evidence_support_count_sum = 0
     candidate_role_count_sum = 0
     cross_game_attempt_count = 0
     cross_game_success_count = 0
@@ -745,9 +753,11 @@ def derive_role_transfer_attempts_parallel(
             source_carrier_signatures_json, source_game_keys_json, source_context_keys_json,
             provenance_mode, provenance_status, target_carrier_signature, predicted_role_signature,
             observed_role_signature, similarity_score, transfer_score, reuse_success, failure_reason,
-            best_margin, source_carrier_count, candidate_role_count, first_seen_global_step, last_seen_global_step
+            best_margin, source_carrier_count, source_evidence_support_count,
+            support_gate_passed, similarity_gate_passed, role_match_gate_passed,
+            candidate_role_count, first_seen_global_step, last_seen_global_step
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         attempt_rows,
     )
@@ -759,11 +769,13 @@ def derive_role_transfer_attempts_parallel(
         failure_reason = str(row[26] or "")
         best_margin = row[27]
         source_carrier_count = int(row[28] or 0)
-        candidate_role_count = int(row[29] or 0)
-        first_seen_global_step = row[30]
+        source_evidence_support_count = int(row[29] or 0)
+        candidate_role_count = int(row[33] or 0)
+        first_seen_global_step = row[34]
         role_signature = str(row[12] or "")
         transfer_score_sum += transfer_score
         source_carrier_count_sum += source_carrier_count
+        source_evidence_support_count_sum += source_evidence_support_count
         candidate_role_count_sum += candidate_role_count
         if best_margin is not None:
             best_margin_sum += float(best_margin)
@@ -788,7 +800,7 @@ def derive_role_transfer_attempts_parallel(
             no_source_profile_count += 1
         if reuse_success == 1:
             success_count += 1
-            successful_roles.add(str(row[9]))
+            successful_roles.add(str(row[12]))
             if transfer_kind == "cross_game":
                 cross_game_success_count += 1
             else:
@@ -801,12 +813,19 @@ def derive_role_transfer_attempts_parallel(
                 )
 
     _write_milestone(state_conn, "first_role_transfer_attempt_step", first_attempt_step, None)
-    _write_milestone(state_conn, "first_role_transfer_success_step", first_success_step, None)
+    _write_milestone(state_conn, "first_role_transfer_success_step", first_success_step if success_count else None, None)
+    if success_count == 0 and first_success_step is not None:
+        raise AssertionError("zero successful transfers must not retain a success milestone")
     return {
         "transfer_attempt_count": inserted,
+        "candidate_transfer_attempt_count": total_possible_transfer_attempts,
+        "sampled_profile_attempt_count": len(target_attempt_specs),
+        "expanded_transfer_attempt_count": len(attempt_ids),
+        "persisted_transfer_attempt_count": inserted,
+        # Deprecated aliases retain the pre-expansion population definition.
         "total_possible_transfer_attempts": total_possible_transfer_attempts,
-        "sampled_transfer_attempts": inserted,
-        "skipped_by_cap_count": max(0, total_possible_transfer_attempts - inserted),
+        "sampled_transfer_attempts": len(target_attempt_specs),
+        "skipped_by_cap_count": max(0, total_possible_transfer_attempts - len(target_attempt_specs)),
         "sampled_cross_game_attempt_count": cross_game_attempt_count,
         "sampled_cross_context_attempt_count": cross_context_attempt_count,
         "transfer_sampling_strategy": "stratified_balanced",
@@ -829,6 +848,7 @@ def derive_role_transfer_attempts_parallel(
         ),
         "mean_best_margin": (best_margin_sum / best_margin_count) if best_margin_count else None,
         "mean_source_carrier_count": (source_carrier_count_sum / inserted) if inserted else None,
+        "mean_source_evidence_support_count": (source_evidence_support_count_sum / inserted) if inserted else None,
         "candidate_role_count_mean": (candidate_role_count_sum / inserted) if inserted else None,
         "transfer_profile_cache_scope_count": len(profile_cache),
         "transfer_profile_cache_profile_count": sum(len(items) for items in profile_cache.values()),
@@ -958,7 +978,7 @@ def derive_concept_candidates(state_conn: sqlite3.Connection, progress_factory: 
         tokens_by_role[str(row["role_signature"])].update(_load_token_json(row["token_json"]))
     transfer_rows = state_conn.execute(
         """
-        SELECT source_role_signature AS role_signature, reuse_success, similarity_score, best_margin, source_carrier_count, candidate_role_count
+        SELECT source_role_signature AS role_signature, reuse_success, similarity_score, best_margin, source_evidence_support_count, candidate_role_count
         FROM role_transfer_attempts
         WHERE provenance_mode IN ('single_source', 'multi_source')
         ORDER BY role_signature ASC, attempt_id ASC
@@ -971,7 +991,7 @@ def derive_concept_candidates(state_conn: sqlite3.Connection, progress_factory: 
         if int(row["reuse_success"] or 0) == 1:
             success_by_role[role_signature] += 1
             if (
-                int(row["source_carrier_count"] or 0) >= 2
+                int(row["source_evidence_support_count"] or 0) >= MIN_SOURCE_EVIDENCE_SUPPORT
                 and int(row["candidate_role_count"] or 0) >= 2
                 and float(row["similarity_score"] or 0.0) >= 0.60
                 and float(row["best_margin"] or 0.0) >= 0.10
@@ -1200,7 +1220,7 @@ def derive_world_model_components(
     successful_transfer_by_role: dict[str, int] = defaultdict(int)
     for row in state_conn.execute(
         """
-        SELECT source_role_signature AS role_signature, reuse_success, source_carrier_count, candidate_role_count, similarity_score, best_margin
+        SELECT source_role_signature AS role_signature, reuse_success, source_evidence_support_count, candidate_role_count, similarity_score, best_margin
         FROM role_transfer_attempts
         WHERE provenance_mode IN ('single_source', 'multi_source')
         ORDER BY role_signature ASC, attempt_id ASC
@@ -1208,7 +1228,7 @@ def derive_world_model_components(
     ).fetchall():
         if (
             int(row["reuse_success"] or 0) == 1
-            and int(row["source_carrier_count"] or 0) >= 2
+            and int(row["source_evidence_support_count"] or 0) >= MIN_SOURCE_EVIDENCE_SUPPORT
             and int(row["candidate_role_count"] or 0) >= 2
             and float(row["similarity_score"] or 0.0) >= 0.60
             and float(row["best_margin"] or 0.0) >= 0.10
@@ -3086,8 +3106,10 @@ def _predict_transfer_attempt(
     second_similarity = -1.0
     candidate_role_count = 0
     for profile in profile_cache.get((transfer_kind, target_scope_key), []):
+        profile_carriers = tuple(str(value) for value in profile.get("source_carrier_signatures", ()))
         if (
-            int(profile.get("source_carrier_count") or 0) == 1
+            len(profile_carriers) == 1
+            and profile_carriers[0] == str(target_carrier_signature)
             and str(profile.get("role_signature") or "") == str(target["role_signature"])
         ):
             continue
@@ -3106,25 +3128,32 @@ def _predict_transfer_attempt(
     best_margin = None if second is None else float(best_similarity) - float(second_similarity)
     predicted_role_signature = str(best["role_signature"])
     observed_role_signature = str(target["role_signature"])
+    # Older synthetic callers and pre-migration profile caches only carry the
+    # aggregate carrier count.  It is the best available support signal for
+    # those in-memory inputs; persisted attempts always carry the explicit
+    # field below.
+    source_evidence_support_count = int(
+        best.get("source_evidence_support_count", best.get("source_carrier_count", 0)) or 0
+    )
     source_carrier_count = int(best["source_carrier_count"])
     similarity_score = float(best_similarity)
-    reuse_success = int(
-        predicted_role_signature == observed_role_signature
-        and similarity_score >= 0.60
-        and source_carrier_count >= 2
-    )
-    if reuse_success:
-        failure_reason = "success"
-    elif source_carrier_count < 2:
+    support_gate_passed = int(source_evidence_support_count >= MIN_SOURCE_EVIDENCE_SUPPORT)
+    similarity_gate_passed = int(similarity_score >= MIN_TRANSFER_SIMILARITY)
+    role_match_gate_passed = int(predicted_role_signature == observed_role_signature)
+    if not support_gate_passed:
         failure_reason = "insufficient_source_support"
-    elif similarity_score < 0.60:
+    elif not similarity_gate_passed:
         failure_reason = "low_similarity"
-    elif predicted_role_signature != observed_role_signature:
+    elif not role_match_gate_passed:
         failure_reason = "role_mismatch"
     else:
-        failure_reason = "no_source_profile"
+        failure_reason = "success"
+    reuse_success = int(failure_reason == "success")
     target_scope_type = "game" if transfer_kind == "cross_game" else "context"
-    transfer_score = similarity_score * min(1.0, source_carrier_count / 2.0)
+    transfer_score = similarity_score * min(
+        1.0,
+        source_evidence_support_count / MIN_SOURCE_EVIDENCE_SUPPORT,
+    )
     source_carriers = tuple(str(value) for value in best.get("source_carrier_signatures", ()))
     source_games = tuple(str(value) for value in best.get("source_game_keys", ()))
     source_contexts = tuple(str(value) for value in best.get("source_context_keys", ()))
@@ -3193,6 +3222,10 @@ def _predict_transfer_attempt(
         "failure_reason": failure_reason,
         "best_margin": best_margin,
         "source_carrier_count": source_carrier_count,
+        "source_evidence_support_count": source_evidence_support_count,
+        "support_gate_passed": support_gate_passed,
+        "similarity_gate_passed": similarity_gate_passed,
+        "role_match_gate_passed": role_match_gate_passed,
         "candidate_role_count": candidate_role_count,
         "first_seen_global_step": target["first_seen_global_step"],
         "last_seen_global_step": target["last_seen_global_step"],
@@ -3230,6 +3263,10 @@ def _attempt_to_insert_tuple(attempt: dict[str, Any]) -> tuple[Any, ...]:
         attempt["failure_reason"],
         attempt["best_margin"],
         attempt["source_carrier_count"],
+        attempt["source_evidence_support_count"],
+        attempt["support_gate_passed"],
+        attempt["similarity_gate_passed"],
+        attempt["role_match_gate_passed"],
         attempt["candidate_role_count"],
         attempt["first_seen_global_step"],
         attempt["last_seen_global_step"],
@@ -3256,32 +3293,39 @@ def _expand_transfer_attempt_provenance(attempt: dict[str, Any]) -> list[dict[st
     target_games = (str(attempt["target_game_key"]),) if attempt.get("target_game_key") else ()
     result: list[dict[str, Any]] = []
     for source_key in sorted(str(value) for value in source_keys):
-        concrete = dict(attempt)
-        if kind == "cross_game":
-            concrete["source_scope_type"] = "game"
-            concrete["source_scope_key"] = source_key
-            concrete["source_game_key"] = source_key
-        else:
-            concrete["source_scope_type"] = "context"
-            concrete["source_scope_key"] = source_key
-            concrete["source_context_key"] = source_key
-            concrete["source_game_key"] = source_games[0] if len(source_games) == 1 else None
-        concrete["source_carrier_signature"] = source_carriers[0] if len(source_carriers) == 1 else None
-        concrete["provenance_mode"] = "single_source" if len(source_carriers) == 1 else "multi_source"
-        concrete["provenance_status"] = "verified" if concrete["provenance_mode"] == "single_source" else "aggregate_source"
-        seed = "|".join((
-            kind,
-            str(concrete.get("source_role_signature") or ""),
-            str(concrete.get("source_game_key") or ""),
-            str(concrete.get("target_game_key") or ""),
-            str(concrete.get("source_context_key") or ""),
-            str(concrete.get("target_context_key") or ""),
-            str(concrete.get("source_carrier_signature") or ",".join(source_carriers)),
-            str(concrete["target_carrier_signature"]),
-            str(concrete.get("predicted_role_signature") or ""),
-        ))
-        concrete["attempt_id"] = sha1(seed.encode("utf-8")).hexdigest()
-        result.append(concrete)
+        # One concrete carrier/scope pair is a verified provenance row.  It
+        # retains the aggregate profile's independent evidence support, so a
+        # single carrier identity does not erase the evidence that selected
+        # the source role.
+        for source_carrier in (source_carriers or (None,)):
+            concrete = dict(attempt)
+            if kind == "cross_game":
+                concrete["source_scope_type"] = "game"
+                concrete["source_scope_key"] = source_key
+                concrete["source_game_key"] = source_key
+            else:
+                concrete["source_scope_type"] = "context"
+                concrete["source_scope_key"] = source_key
+                concrete["source_context_key"] = source_key
+                concrete["source_game_key"] = source_games[0] if len(source_games) == 1 else None
+            concrete["source_carrier_signature"] = source_carrier
+            concrete["source_carrier_count"] = 1 if source_carrier else 0
+            concrete["source_evidence_support_count"] = int(attempt.get("source_evidence_support_count") or 0)
+            concrete["provenance_mode"] = "single_source" if source_carrier else "multi_source"
+            concrete["provenance_status"] = "verified" if source_carrier else "aggregate_source"
+            seed = "|".join((
+                kind,
+                str(concrete.get("source_role_signature") or ""),
+                str(concrete.get("source_game_key") or ""),
+                str(concrete.get("target_game_key") or ""),
+                str(concrete.get("source_context_key") or ""),
+                str(concrete.get("target_context_key") or ""),
+                str(source_carrier or ""),
+                str(concrete["target_carrier_signature"]),
+                str(concrete.get("predicted_role_signature") or ""),
+            ))
+            concrete["attempt_id"] = sha1(seed.encode("utf-8")).hexdigest()
+            result.append(concrete)
     return result
 
 
@@ -3406,6 +3450,7 @@ def _build_transfer_profile_cache(
                     "source_game_keys": tuple(sorted(game_set)),
                     "source_context_keys": tuple(sorted(context_set)),
                     "source_carrier_count": len(source_carriers),
+                    "source_evidence_support_count": len(source_carriers),
                     "source_context_count": len(context_set),
                     "source_game_count": len(game_set),
                 }
@@ -3464,6 +3509,10 @@ def _no_source_profile_attempt(target: dict[str, Any], transfer_kind: str, targe
         "failure_reason": "no_source_profile",
         "best_margin": None,
         "source_carrier_count": 0,
+        "source_evidence_support_count": 0,
+        "support_gate_passed": 0,
+        "similarity_gate_passed": 0,
+        "role_match_gate_passed": 0,
         "candidate_role_count": 0,
         "first_seen_global_step": target["first_seen_global_step"],
         "last_seen_global_step": target["last_seen_global_step"],
@@ -3793,6 +3842,10 @@ def _safe_scalar_float(connection: sqlite3.Connection, query: str) -> float | No
 def _empty_transfer_summary() -> dict[str, Any]:
     return {
         "transfer_attempt_count": 0,
+        "candidate_transfer_attempt_count": 0,
+        "sampled_profile_attempt_count": 0,
+        "expanded_transfer_attempt_count": 0,
+        "persisted_transfer_attempt_count": 0,
         "successful_transfer_count": 0,
         "successful_role_count": 0,
         "role_mismatch_count": 0,
@@ -3807,5 +3860,6 @@ def _empty_transfer_summary() -> dict[str, Any]:
         "max_transfer_score": None,
         "mean_best_margin": None,
         "mean_source_carrier_count": None,
+        "mean_source_evidence_support_count": None,
         "candidate_role_count_mean": None,
     }

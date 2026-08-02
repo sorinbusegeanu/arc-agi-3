@@ -10,7 +10,7 @@ from hashlib import sha1
 from pathlib import Path
 from typing import Any
 
-from v6.higher_order_substrate import _links_by_signature
+from v6.higher_order_substrate import MIN_SOURCE_EVIDENCE_SUPPORT, _links_by_signature
 from v6.memory.compact_memory import ensure_memory_layout
 
 
@@ -1311,7 +1311,7 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
     transfer_rows = [dict(row) for row in state_conn.execute(
         """
         SELECT source_role_signature AS role_signature, transfer_score, best_margin, reuse_success, similarity_score,
-               source_carrier_count, candidate_role_count, source_game_key, target_game_key,
+               source_evidence_support_count, candidate_role_count, source_game_key, target_game_key,
                source_context_key, target_context_key, provenance_mode
         FROM role_transfer_attempts
         WHERE provenance_mode = 'single_source'
@@ -1392,7 +1392,7 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
                     1
                     for row in role_transfer_rows
                     if int(row["reuse_success"] or 0) == 1
-                    and int(row["source_carrier_count"] or 0) >= 2
+                    and int(row["source_evidence_support_count"] or 0) >= MIN_SOURCE_EVIDENCE_SUPPORT
                     and int(row["candidate_role_count"] or 0) >= 2
                     and float(row["similarity_score"] or 0.0) >= 0.60
                     and float(row["best_margin"] or 0.0) >= 0.10

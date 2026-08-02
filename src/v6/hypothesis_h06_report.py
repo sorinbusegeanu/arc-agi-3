@@ -62,6 +62,8 @@ def evaluate_h06_role_transfer(
                    attempts.provenance_mode, attempts.provenance_status,
                    attempts.similarity_score, attempts.transfer_score, attempts.reuse_success,
                    attempts.failure_reason, attempts.best_margin, attempts.source_carrier_count,
+                   attempts.source_evidence_support_count, attempts.support_gate_passed,
+                   attempts.similarity_gate_passed, attempts.role_match_gate_passed,
                    attempts.candidate_role_count, COALESCE(roles.role_type, 'unknown') AS role_type
             FROM role_transfer_attempts AS attempts
             LEFT JOIN role_candidates AS roles ON roles.role_signature = attempts.source_role_signature
@@ -111,11 +113,17 @@ def evaluate_h06_role_transfer(
     max_transfer_score = max((float(row["transfer_score"] or 0.0) for row in valid_rows), default=None)
     margins = [float(row["best_margin"]) for row in valid_rows if row["best_margin"] is not None]
     source_counts = [int(row["source_carrier_count"] or 0) for row in valid_rows]
+    source_evidence_support_counts = [int(row["source_evidence_support_count"] or 0) for row in valid_rows]
     candidate_role_counts = [int(row["candidate_role_count"] or 0) for row in valid_rows]
     cross_game_success_rate = _rate(cross_game_success_count, len(cross_game_rows))
     cross_context_success_rate = _rate(cross_context_success_count, len(cross_context_rows))
-    total_possible = int(transfer_summary.get("total_possible_transfer_attempts", len(rows)) or 0)
-    sampled_attempts = int(transfer_summary.get("sampled_transfer_attempts", transfer_attempt_count) or 0)
+    candidate_transfer_attempt_count = int(transfer_summary.get("candidate_transfer_attempt_count", transfer_summary.get("total_possible_transfer_attempts", len(rows))) or 0)
+    sampled_profile_attempt_count = int(transfer_summary.get("sampled_profile_attempt_count", transfer_summary.get("sampled_transfer_attempts", len(rows))) or 0)
+    expanded_transfer_attempt_count = int(transfer_summary.get("expanded_transfer_attempt_count", len(rows)) or 0)
+    persisted_transfer_attempt_count = int(transfer_summary.get("persisted_transfer_attempt_count", len(rows)) or 0)
+    multi_source_success_count = sum(int(row["reuse_success"] or 0) for row in multi_source_rows)
+    aggregate_rows = [*verified_rows, *multi_source_rows]
+    aggregate_success_count = sum(int(row["reuse_success"] or 0) for row in aggregate_rows)
     game_provenance_rows = [row for row in verified_rows if row["source_game_key"] and row["target_game_key"]]
     pair_rows = _aggregate_transfer_rows(game_provenance_rows, key_fn=lambda row: (
         str(row["source_game_key"]), str(row["target_game_key"]), str(row["transfer_kind"]),
@@ -135,6 +143,7 @@ def evaluate_h06_role_transfer(
         "similarity_score_buckets": _bucket_transfer_rows(valid_rows, "similarity_score", ((0.40, "<0.40"), (0.60, "0.40-0.59"), (0.80, "0.60-0.79"), (float("inf"), ">=0.80"))),
         "best_margin_buckets": _bucket_transfer_rows(valid_rows, "best_margin", ((0.00, "<0.00"), (0.10, "0.00-0.09"), (0.20, "0.10-0.19"), (float("inf"), ">=0.20"))),
         "source_carrier_count_buckets": _bucket_transfer_rows(valid_rows, "source_carrier_count", ((2, "0-1"), (4, "2-3"), (8, "4-7"), (float("inf"), "8+"))),
+        "source_evidence_support_buckets": _bucket_transfer_rows(valid_rows, "source_evidence_support_count", ((1, "0"), (2, "1"), (4, "2-3"), (8, "4-7"), (float("inf"), "8+"))),
         "candidate_role_count_buckets": _bucket_transfer_rows(valid_rows, "candidate_role_count", ((2, "0-1"), (4, "2-3"), (8, "4-7"), (float("inf"), "8+"))),
     }
     validity_gates = _h06_validity_gates(
@@ -151,6 +160,7 @@ def evaluate_h06_role_transfer(
     metrics = {
         "transfer_attempt_count": transfer_attempt_count,
         "recorded_transfer_attempt_count": len(rows),
+        "verified_single_source_attempt_count": len(verified_rows),
         "verified_cross_game_attempt_count": len(cross_game_rows),
         "verified_cross_game_success_count": cross_game_success_count,
         "verified_cross_game_success_rate": cross_game_success_rate,
@@ -158,6 +168,12 @@ def evaluate_h06_role_transfer(
         "verified_cross_context_success_count": cross_context_success_count,
         "verified_cross_context_success_rate": cross_context_success_rate,
         "multi_source_transfer_attempt_count": len(multi_source_rows),
+        "multi_source_attempt_count": len(multi_source_rows),
+        "multi_source_success_count": multi_source_success_count,
+        "multi_source_success_rate": _rate(multi_source_success_count, len(multi_source_rows)),
+        "aggregate_transfer_attempt_count": len(aggregate_rows),
+        "aggregate_transfer_success_count": aggregate_success_count,
+        "aggregate_transfer_success_rate": _rate(aggregate_success_count, len(aggregate_rows)),
         "missing_source_transfer_attempt_count": sum(
             str(row["provenance_mode"] or "") == "missing_source" for row in rows
         ),
@@ -175,9 +191,13 @@ def evaluate_h06_role_transfer(
         "distinct_target_game_count": len({str(row["target_game_key"]) for row in game_provenance_rows}),
         "distinct_game_pair_count": len(pair_rows),
         "distinct_context_pair_count": len(context_pair_rows),
-        "total_possible_transfer_attempts": total_possible,
-        "sampled_transfer_attempts": sampled_attempts,
-        "sampling_fraction": _rate(sampled_attempts, total_possible),
+        "candidate_transfer_attempt_count": candidate_transfer_attempt_count,
+        "expanded_transfer_attempt_count": expanded_transfer_attempt_count,
+        "persisted_transfer_attempt_count": persisted_transfer_attempt_count,
+        "sampled_profile_attempt_count": sampled_profile_attempt_count,
+        "total_possible_transfer_attempts": candidate_transfer_attempt_count,
+        "sampled_transfer_attempts": sampled_profile_attempt_count,
+        "sampling_fraction": _rate(sampled_profile_attempt_count, candidate_transfer_attempt_count),
         "skipped_by_cap_count": transfer_summary.get("skipped_by_cap_count", 0),
         "sampled_cross_game_attempt_count": transfer_summary.get("sampled_cross_game_attempt_count", len(cross_game_rows)),
         "sampled_cross_context_attempt_count": transfer_summary.get("sampled_cross_context_attempt_count", len(cross_context_rows)),
@@ -207,6 +227,11 @@ def evaluate_h06_role_transfer(
         "max_transfer_score": max_transfer_score,
         "mean_best_margin": (sum(margins) / len(margins)) if margins else None,
         "mean_source_carrier_count": (sum(source_counts) / len(source_counts)) if source_counts else None,
+        "source_carrier_count_mean": (sum(source_counts) / len(source_counts)) if source_counts else None,
+        "mean_source_evidence_support_count": (sum(source_evidence_support_counts) / len(source_evidence_support_counts)) if source_evidence_support_counts else None,
+        "source_evidence_support_count_mean": (sum(source_evidence_support_counts) / len(source_evidence_support_counts)) if source_evidence_support_counts else None,
+        "median_source_evidence_support_count": _median(source_evidence_support_counts),
+        "max_source_evidence_support_count": max(source_evidence_support_counts, default=None),
         "candidate_role_count_mean": (sum(candidate_role_counts) / len(candidate_role_counts)) if candidate_role_counts else None,
         "first_role_candidate_step": milestone_map.get("first_role_candidate_step"),
         "first_role_transfer_attempt_step": milestone_map.get("first_role_transfer_attempt_step"),
@@ -379,6 +404,10 @@ def _median_group_attempts(groups: list[dict[str, Any]]) -> float:
     return float(median(values)) if values else 0.0
 
 
+def _median(values: list[int]) -> float | None:
+    return float(median(values)) if values else None
+
+
 def _max_group_attempts(groups: list[dict[str, Any]]) -> int:
     return max((int(row["attempt_count"]) for row in groups), default=0)
 
@@ -460,6 +489,13 @@ def _write_outputs(output_dir: Path, result: dict[str, Any], *, full_game_pairs:
         f"H06 decision: {result.get('decision')}\n"
         f"transfer attempts: {result.get('transfer_attempt_count')}\n"
         f"recorded transfer attempts: {result.get('recorded_transfer_attempt_count')}\n"
+        f"candidate profile attempts: {result.get('candidate_transfer_attempt_count')}\n"
+        f"sampled profile attempts: {result.get('sampled_profile_attempt_count')}\n"
+        f"expanded concrete attempts: {result.get('expanded_transfer_attempt_count')}\n"
+        f"persisted transfer attempts: {result.get('persisted_transfer_attempt_count')}\n"
+        f"verified single-source attempts: {result.get('verified_single_source_attempt_count')}\n"
+        f"multi-source attempts: {result.get('multi_source_attempt_count')}\n"
+        f"multi-source success rate: {result.get('multi_source_success_rate')}\n"
         f"invalid provenance attempts: {result.get('invalid_provenance_attempt_count')}\n"
         f"legacy provenance attempts: {result.get('legacy_transfer_provenance_count')}\n"
         f"total possible transfer attempts: {result.get('total_possible_transfer_attempts')}\n"
@@ -480,6 +516,9 @@ def _write_outputs(output_dir: Path, result: dict[str, Any], *, full_game_pairs:
         f"- no source profile: {result.get('no_source_profile_count')}, rate {result.get('no_source_profile_rate')}\n"
         f"mean best margin: {result.get('mean_best_margin')}\n"
         f"mean source carrier count: {result.get('mean_source_carrier_count')}\n"
+        f"mean source evidence support: {result.get('mean_source_evidence_support_count')}\n"
+        f"median source evidence support: {result.get('median_source_evidence_support_count')}\n"
+        f"max source evidence support: {result.get('max_source_evidence_support_count')}\n"
         f"candidate role count mean: {result.get('candidate_role_count_mean')}\n"
     )
     gates = result.get("h06_validity_gates", {})

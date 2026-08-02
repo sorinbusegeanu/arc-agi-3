@@ -57,8 +57,9 @@ def _seed_h06_diagnostics(memory_dir: Path, *, pair_count: int = 5) -> None:
                     source_context_key, target_context_key, source_carrier_signature, source_role_signature,
                     predicted_target_role_signature, observed_target_role_signature, provenance_mode,
                     similarity_score, transfer_score, reuse_success,
-                    failure_reason, best_margin, source_carrier_count, candidate_role_count
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'single_source', ?, 0.5, ?, ?, ?, ?, ?)
+                    failure_reason, best_margin, source_carrier_count, source_evidence_support_count,
+                    support_gate_passed, similarity_gate_passed, role_match_gate_passed, candidate_role_count
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'single_source', ?, 0.5, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     f"attempt-{index:03d}", "role-a" if index % 2 == 0 else "role-b", kind,
@@ -70,7 +71,8 @@ def _seed_h06_diagnostics(memory_dir: Path, *, pair_count: int = 5) -> None:
                     f"carrier-source-{index}", "role-a" if index % 2 == 0 else "role-b",
                     "role-a" if index % 2 == 0 else "role-b", "role-a" if index % 2 == 0 else "role-b",
                     0.85 if success else 0.25,
-                    success, reason, 0.25 if success else -0.05, 8 if success else 1, 4 if success else 1,
+                    success, reason, 0.25 if success else -0.05, 1, 8 if success else 1,
+                    int(success), int((0.85 if success else 0.25) >= 0.60), int(success), 4 if success else 1,
                 ),
             )
         conn.execute(
@@ -137,3 +139,47 @@ def test_h06_excludes_legacy_and_invalid_provenance_from_verified_rates(tmp_path
     assert result["recorded_transfer_attempt_count"] == result["transfer_attempt_count"] + 2
     assert "invalid_transfer_provenance" in result["consistency_warnings"]
     assert all(row["source_game"] != "unknown" for row in result["transfer_by_source_game"])
+
+
+def test_h06_separates_verified_and_multi_source_transfer_rates(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_h06_diagnostics(memory_dir, pair_count=2)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute(
+            """
+            INSERT INTO role_transfer_attempts (
+                attempt_id, role_signature, transfer_kind, source_scope_type, source_scope_key,
+                target_scope_type, target_scope_key, source_game_key, target_game_key,
+                source_role_signature, source_carrier_signatures_json, source_game_keys_json,
+                provenance_mode, provenance_status, reuse_success, failure_reason,
+                source_carrier_count, source_evidence_support_count
+            ) VALUES (
+                'multi-source-row', 'role-a', 'cross_game', 'game', 'g_multi', 'game', 't_multi',
+                'g_multi', 't_multi', 'role-a', '["carrier-a", "carrier-b"]', '["g_multi", "g_other"]',
+                'multi_source', 'aggregate_source', 1, 'success', 2, 4
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO memory_summary (key, value_json) VALUES ('higher_order_transfer_summary', ?)
+            ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json
+            """,
+            (json.dumps({
+                "candidate_transfer_attempt_count": 10,
+                "sampled_profile_attempt_count": 5,
+                "expanded_transfer_attempt_count": 6,
+                "persisted_transfer_attempt_count": 6,
+            }),),
+        )
+        conn.commit()
+
+    result = evaluate_h06_role_transfer(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h06", already_derived=True)
+
+    assert result["recorded_transfer_attempt_count"] == 3
+    assert result["verified_single_source_attempt_count"] == 2
+    assert result["multi_source_attempt_count"] == 1
+    assert result["multi_source_success_rate"] == 1.0
+    assert result["aggregate_transfer_attempt_count"] == 3
+    assert result["sampling_fraction"] == 0.5
+    assert all(row["source_game"] != "g_multi" for row in result["transfer_by_source_game"])

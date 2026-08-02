@@ -891,8 +891,8 @@ def test_h06_predicts_correct_role_across_held_out_game(tmp_path: Path) -> None:
     assert rows
     assert int(rows[0]["reuse_success"]) == 1
     assert rows[0]["predicted_role_signature"] == rows[0]["observed_role_signature"]
-    assert result["verified_cross_game_attempt_count"] == 0
-    assert result["multi_source_transfer_attempt_count"] > 0
+    assert result["verified_cross_game_attempt_count"] > 0
+    assert result["multi_source_transfer_attempt_count"] == 0
 
 
 def test_h06_detects_role_mismatch(tmp_path: Path) -> None:
@@ -905,8 +905,8 @@ def test_h06_detects_role_mismatch(tmp_path: Path) -> None:
     ])
     derive_higher_order_memory(memory_dir=memory_dir)
     result = evaluate_h06_role_transfer(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h06")
-    assert result["verified_cross_game_attempt_count"] == 0
-    assert result["multi_source_transfer_attempt_count"] > 0
+    assert result["verified_cross_game_attempt_count"] > 0
+    assert result["multi_source_transfer_attempt_count"] == 0
 
 
 def test_same_family_hash_not_required_for_role_match(tmp_path: Path) -> None:
@@ -967,9 +967,9 @@ def test_h06_valid(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
     _seed_memory(memory_dir, _transfer_rich_specs())
     result = evaluate_h06_role_transfer(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h06")
-    assert result["verified_cross_game_attempt_count"] == 0
-    assert result["multi_source_transfer_attempt_count"] >= 20
-    assert result["decision"] == "INSUFFICIENT_EVIDENCE"
+    assert result["verified_cross_game_attempt_count"] >= 20
+    assert result["multi_source_transfer_attempt_count"] == 0
+    assert result["decision"] in {"PARTIALLY_VALID", "VALID"}
 
 
 def test_h07_valid(tmp_path: Path) -> None:
@@ -1132,7 +1132,7 @@ def test_standalone_h05_h08_derive_safely(tmp_path: Path) -> None:
     h07 = evaluate_h07_concept_emergence(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h07")
     h08 = evaluate_h08_world_model_coherence(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h08")
     assert h05["role_candidate_count"] >= 1
-    assert h06["multi_source_transfer_attempt_count"] >= 1
+    assert h06["verified_single_source_attempt_count"] >= 1
     assert h07["concept_candidate_count"] >= 1
     assert h08["world_model_component_count"] >= 1
 
@@ -1520,6 +1520,43 @@ def test_derive_role_transfer_attempts_only_respects_max_attempts(tmp_path: Path
         assert conn.execute("SELECT COUNT(*) FROM role_transfer_attempts").fetchone()[0] == 3
 
 
+def test_transfer_summary_keeps_profile_and_expanded_populations_separate(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_memory(memory_dir, _transfer_rich_specs())
+    derive_role_candidates_only(memory_dir=memory_dir)
+
+    summary = derive_role_transfer_attempts_only(
+        memory_dir=memory_dir,
+        max_transfer_attempts=50,
+        workers=1,
+        chunk_size=10,
+    )
+
+    assert summary["candidate_transfer_attempt_count"] >= summary["sampled_profile_attempt_count"]
+    assert summary["expanded_transfer_attempt_count"] >= summary["persisted_transfer_attempt_count"]
+    assert summary["persisted_transfer_attempt_count"] == summary["transfer_attempt_count"]
+    assert summary["sampled_profile_attempt_count"] / summary["candidate_transfer_attempt_count"] <= 1.0
+
+
+def test_zero_transfer_success_clears_current_success_milestone(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    paths = ensure_memory_layout(memory_dir)
+    with sqlite3.connect(paths.current_state) as conn:
+        conn.execute(
+            "INSERT INTO higher_order_milestones (milestone_name, first_global_step) VALUES ('first_role_transfer_success_step', 1)"
+        )
+        conn.commit()
+
+    summary = derive_role_transfer_attempts_only(memory_dir=memory_dir)
+
+    with sqlite3.connect(paths.current_state) as conn:
+        row = conn.execute(
+            "SELECT first_global_step FROM higher_order_milestones WHERE milestone_name = 'first_role_transfer_success_step'"
+        ).fetchone()
+    assert summary["successful_transfer_count"] == 0
+    assert row is not None and row[0] is None
+
+
 def test_transfer_attempts_store_concrete_source_and_target_provenance(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
     _seed_memory(memory_dir, _transfer_rich_specs())
@@ -1564,12 +1601,15 @@ def test_transfer_provenance_expansion_uses_distinct_ids_for_source_games() -> N
         "predicted_role_signature": "role-source", "role_signature": "role-target",
         "observed_role_signature": "role-target", "similarity_score": 0.8, "transfer_score": 0.8,
         "reuse_success": 1, "failure_reason": "success", "best_margin": 0.2,
-        "source_carrier_count": 2, "candidate_role_count": 2,
+        "source_carrier_count": 2, "source_evidence_support_count": 2,
+        "candidate_role_count": 2,
         "first_seen_global_step": 1, "last_seen_global_step": 2,
     }
     rows = higher_order_substrate._expand_transfer_attempt_provenance(attempt)
-    assert [row["source_game_key"] for row in rows] == ["game-a", "game-b"]
-    assert len({row["attempt_id"] for row in rows}) == 2
+    assert {row["source_game_key"] for row in rows} == {"game-a", "game-b"}
+    assert all(row["source_carrier_count"] == 1 for row in rows)
+    assert all(row["source_evidence_support_count"] == 2 for row in rows)
+    assert len({row["attempt_id"] for row in rows}) == 4
 
 
 def test_no_source_profile_attempt_has_no_source_provenance() -> None:
@@ -1630,6 +1670,7 @@ def test_transfer_worker_chunk_does_not_open_sqlite(monkeypatch) -> None:
                     "profile_tokens": ["a", "b"],
                     "profile_token_set": {"a", "b"},
                         "source_carrier_count": 2,
+                        "source_evidence_support_count": 2,
                         "source_context_count": 2,
                         "source_game_count": 1,
                         "source_carrier_signatures": ("source1", "source2"),
@@ -1639,7 +1680,7 @@ def test_transfer_worker_chunk_does_not_open_sqlite(monkeypatch) -> None:
             ]
         },
     )
-    assert len(rows) == 1
+    assert len(rows) == 2
 
 
 def test_predict_transfer_attempt_does_not_sort_candidates(monkeypatch) -> None:
@@ -1649,8 +1690,8 @@ def test_predict_transfer_attempt_does_not_sort_candidates(monkeypatch) -> None:
     attempt = _predict_transfer_attempt(
         profile_cache={
             ("cross_game", "g2"): [
-                    {"role_signature": "roleB", "profile_tokens": ["a", "b"], "profile_token_set": {"a", "b"}, "source_carrier_count": 2, "source_game_keys": ("g1",), "source_carrier_signatures": ("source-b",)},
-                    {"role_signature": "roleC", "profile_tokens": ["a"], "profile_token_set": {"a"}, "source_carrier_count": 3, "source_game_keys": ("g1",), "source_carrier_signatures": ("source-c",)},
+                    {"role_signature": "roleB", "profile_tokens": ["a", "b"], "profile_token_set": {"a", "b"}, "source_carrier_count": 2, "source_evidence_support_count": 2, "source_game_keys": ("g1",), "source_carrier_signatures": ("source-b",)},
+                    {"role_signature": "roleC", "profile_tokens": ["a"], "profile_token_set": {"a"}, "source_carrier_count": 3, "source_evidence_support_count": 3, "source_game_keys": ("g1",), "source_carrier_signatures": ("source-c",)},
             ]
         },
         role_rows={
@@ -1678,6 +1719,7 @@ def test_predict_transfer_attempt_without_concrete_source_scope_is_missing_sourc
                     "profile_tokens": ["a"],
                     "profile_token_set": {"a"},
                     "source_carrier_count": 2,
+                    "source_evidence_support_count": 2,
                     "source_carrier_signatures": ("source-b",),
                     "source_game_keys": (),
                 }
@@ -1699,6 +1741,81 @@ def test_predict_transfer_attempt_without_concrete_source_scope_is_missing_sourc
     assert attempt["provenance_mode"] == "missing_source"
     assert attempt["source_game_key"] is None
     assert attempt["source_role_signature"] is None
+
+
+def test_concrete_source_attempt_keeps_aggregate_evidence_support() -> None:
+    attempt = _predict_transfer_attempt(
+        profile_cache={
+            ("cross_game", "g2"): [{
+                "role_signature": "roleA",
+                "profile_tokens": ["a", "b"],
+                "profile_token_set": {"a", "b"},
+                "source_carrier_count": 1,
+                "source_evidence_support_count": 2,
+                "source_carrier_signatures": ("source-carrier",),
+                "source_game_keys": ("g1",),
+                "source_context_keys": ("ctx1",),
+            }]
+        },
+        role_rows={
+            "target-carrier": {
+                "carrier_signature": "target-carrier",
+                "role_signature": "roleA",
+                "tokens": ("a", "b"),
+                "first_seen_global_step": 1,
+                "last_seen_global_step": 2,
+            }
+        },
+        target_carrier_signature="target-carrier",
+        transfer_kind="cross_game",
+        target_scope_key="g2",
+    )
+
+    rows = higher_order_substrate._expand_transfer_attempt_provenance(attempt)
+    assert attempt["reuse_success"] == 1
+    assert attempt["support_gate_passed"] == 1
+    assert attempt["transfer_score"] == 1.0
+    assert len(rows) == 1
+    assert rows[0]["source_carrier_count"] == 1
+    assert rows[0]["source_evidence_support_count"] == 2
+
+
+def test_transfer_support_similarity_and_role_gates_are_independent() -> None:
+    def predict(*, support: int, tokens: tuple[str, ...], role: str) -> dict:
+        return _predict_transfer_attempt(
+            profile_cache={
+                ("cross_game", "g2"): [{
+                    "role_signature": role,
+                    "profile_tokens": list(tokens),
+                    "profile_token_set": set(tokens),
+                    "source_carrier_count": 1,
+                    "source_evidence_support_count": support,
+                    "source_carrier_signatures": ("source-carrier",),
+                    "source_game_keys": ("g1",),
+                }]
+            },
+            role_rows={
+                "target-carrier": {
+                    "carrier_signature": "target-carrier",
+                    "role_signature": "roleA",
+                    "tokens": ("a", "b"),
+                    "first_seen_global_step": 1,
+                    "last_seen_global_step": 2,
+                }
+            },
+            target_carrier_signature="target-carrier",
+            transfer_kind="cross_game",
+            target_scope_key="g2",
+        )
+
+    insufficient = predict(support=1, tokens=("a", "b"), role="roleA")
+    low_similarity = predict(support=2, tokens=("x",), role="roleA")
+    role_mismatch = predict(support=2, tokens=("a", "b"), role="roleB")
+    assert insufficient["failure_reason"] == "insufficient_source_support"
+    assert low_similarity["failure_reason"] == "low_similarity"
+    assert role_mismatch["failure_reason"] == "role_mismatch"
+    assert low_similarity["support_gate_passed"] == 1
+    assert role_mismatch["similarity_gate_passed"] == 1
 
 
 def test_suite_total_interactions_fallback(tmp_path: Path) -> None:

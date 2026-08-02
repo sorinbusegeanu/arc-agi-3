@@ -5033,6 +5033,7 @@ def _ensure_current_state_schema(path: Path) -> None:
             for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
         }
         legacy_transfer_provenance = False
+        legacy_transfer_support = False
         if "role_transfer_attempts" in existing_tables:
             attempt_columns = {
                 str(row[1])
@@ -5044,6 +5045,10 @@ def _ensure_current_state_schema(path: Path) -> None:
                     or "predicted_target_role_signature" not in attempt_columns
                     or "provenance_status" not in attempt_columns
                 )
+                and bool(connection.execute("SELECT 1 FROM role_transfer_attempts LIMIT 1").fetchone())
+            )
+            legacy_transfer_support = (
+                "source_evidence_support_count" not in attempt_columns
                 and bool(connection.execute("SELECT 1 FROM role_transfer_attempts LIMIT 1").fetchone())
             )
         connection.executescript(
@@ -5349,6 +5354,10 @@ def _ensure_current_state_schema(path: Path) -> None:
                 failure_reason TEXT,
                 best_margin REAL,
                 source_carrier_count INTEGER,
+                source_evidence_support_count INTEGER,
+                support_gate_passed INTEGER,
+                similarity_gate_passed INTEGER,
+                role_match_gate_passed INTEGER,
                 candidate_role_count INTEGER,
                 first_seen_global_step INTEGER,
                 last_seen_global_step INTEGER
@@ -5723,6 +5732,10 @@ def _ensure_current_state_schema(path: Path) -> None:
         _ensure_column(connection, "role_candidates", "promotion_failure_count", "INTEGER DEFAULT 0")
         _ensure_column(connection, "role_transfer_attempts", "best_margin", "REAL")
         _ensure_column(connection, "role_transfer_attempts", "source_carrier_count", "INTEGER")
+        _ensure_column(connection, "role_transfer_attempts", "source_evidence_support_count", "INTEGER")
+        _ensure_column(connection, "role_transfer_attempts", "support_gate_passed", "INTEGER")
+        _ensure_column(connection, "role_transfer_attempts", "similarity_gate_passed", "INTEGER")
+        _ensure_column(connection, "role_transfer_attempts", "role_match_gate_passed", "INTEGER")
         _ensure_column(connection, "role_transfer_attempts", "candidate_role_count", "INTEGER")
         _ensure_column(connection, "role_transfer_attempts", "source_game_key", "TEXT")
         _ensure_column(connection, "role_transfer_attempts", "target_game_key", "TEXT")
@@ -5856,6 +5869,29 @@ def _ensure_current_state_schema(path: Path) -> None:
                 ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json
                 """,
                 (json.dumps({"rebuild_required": True, "schema": "concrete_source_scope_v2"}, sort_keys=True),),
+            )
+        if legacy_transfer_support:
+            # Concrete provenance expansion used to overwrite aggregate source
+            # support.  Those rows cannot be interpreted safely, so force a
+            # fresh transfer/concept/world-model derivation.
+            connection.execute("DELETE FROM role_transfer_attempts")
+            for table in (
+                "concept_candidates",
+                "concept_links",
+                "world_model_components",
+                "world_model_links",
+                "concept_promotion_validation_diagnostics",
+                "future_option_transfer_links",
+            ):
+                if table in existing_tables:
+                    connection.execute(f"DELETE FROM {table}")
+            connection.execute(
+                """
+                INSERT INTO memory_summary (key, value_json)
+                VALUES ('role_transfer_support_migration', ?)
+                ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json
+                """,
+                (json.dumps({"rebuild_required": True, "schema": "source_evidence_support_v1"}, sort_keys=True),),
             )
         connection.execute("DROP INDEX IF EXISTS idx_carrier_links_carrier_type_key")
         connection.execute("DROP INDEX IF EXISTS idx_role_neighborhood_carrier")
