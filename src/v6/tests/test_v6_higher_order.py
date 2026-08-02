@@ -1672,7 +1672,8 @@ def test_h11_links_motifs_to_transfer_concepts(tmp_path: Path) -> None:
     assert result["future_option_transfer_link_count"] > 0
     assert result["motifs_with_strong_transfer_count"] == 0
     assert result["motifs_with_promoted_concept_count"] == 0
-    assert result["emergent_motif_transfer_link_count"] == 0
+    assert result["emergent_motif_transfer_link_count"] == 5
+    assert result["fully_verified_emergent_chain_count"] == 0
     assert result["decision"] == "INSUFFICIENT_EVIDENCE"
     assert result["verified_future_option_transfer_count"] == 0
 
@@ -1701,6 +1702,7 @@ def test_h11_does_not_validate_from_non_emergent_motif_links(tmp_path: Path) -> 
     assert result["future_option_transfer_link_count"] > 0
     assert result["non_emergent_motif_transfer_link_count"] > 0
     assert result["emergent_motif_transfer_link_count"] == 0
+    assert result["fully_verified_emergent_chain_count"] == 0
     assert result["decision"] != "VALID"
     assert any("emergent future-option motifs" in item for item in result["missing_evidence"])
 
@@ -1717,7 +1719,7 @@ def test_h11_validates_only_when_emergent_motif_has_transfer_concept_evidence(tm
             conn.execute("INSERT INTO future_option_transfer_links (motif_signature, role_signature, concept_signature, transfer_attempt_count, successful_transfer_count, strong_transfer_success_count, promoted_concept_count, mean_transfer_score, mean_best_margin, first_seen_global_step, last_seen_global_step) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ("m_em", f"role:e{idx}", "concept:em", 5, 5, 5, 1, 0.9, 0.2, 10, 20))
         conn.commit()
     result = evaluate_h11_future_option_transfer_concepts(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h11", already_derived=True)
-    assert result["emergent_motif_transfer_link_count"] == 0
+    assert result["emergent_motif_transfer_link_count"] == 5
     assert result["emergent_motifs_with_strong_transfer_count"] == 0
     assert result["emergent_motifs_with_promoted_concept_count"] == 0
     assert result["decision"] == "INSUFFICIENT_EVIDENCE"

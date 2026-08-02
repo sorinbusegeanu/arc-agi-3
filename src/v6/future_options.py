@@ -1301,8 +1301,33 @@ def _resolve_motif_transfer_provenance(
     carriers = set(motif_links.get("carrier", set())) | set(motif_links.get("motif_expressed_by_carrier", set()))
     roles = set(motif_links.get("role", set())) | set(motif_links.get("motif_associated_with_role", set()))
     concepts = set(motif_links.get("concept", set())) | set(motif_links.get("motif_supports_concept", set()))
+    initial_families = set(families)
+    initial_carriers = set(carriers)
+    initial_roles = set(roles)
+    initial_concepts = set(concepts)
     interaction_ids = set(direct_interaction_ids) | set(motif_links.get("interaction", set()))
     interaction_ids.update(motif_links.get("source_interaction", set()))
+    if interaction_ids:
+        return {
+            "status": "verified", "resolution_path": "motif_to_interaction",
+            "interaction_ids": interaction_ids, "family_ids": families,
+            "carrier_ids": carriers, "role_ids": roles, "concept_ids": concepts,
+        }
+
+    event_ids = set(motif_links.get("event", set())) | set(motif_links.get("future_option_event", set()))
+    if event_ids:
+        placeholders = ", ".join("?" for _ in event_ids)
+        try:
+            event_rows = state_conn.execute(
+                "SELECT source_interaction_id FROM future_option_events "
+                f"WHERE event_id IN ({placeholders}) AND source_interaction_id IS NOT NULL",
+                tuple(sorted(event_ids)),
+            ).fetchall()
+        except sqlite3.Error:
+            event_rows = []
+        interaction_ids.update(
+            str(row[0]) for row in event_rows if row[0] not in (None, "")
+        )
     if interaction_ids:
         return {
             "status": "verified", "resolution_path": "motif_to_interaction",
@@ -1342,7 +1367,14 @@ def _resolve_motif_transfer_provenance(
     concept_interactions = _event_interactions("source_concept_id", concepts)
     if family_interactions:
         interaction_ids.update(family_interactions)
-        path = "motif_to_family_to_interaction"
+        if initial_concepts:
+            path = "motif_to_concept_to_role_to_carrier_to_family_to_interaction"
+        elif initial_roles:
+            path = "motif_to_role_to_carrier_to_family_to_interaction"
+        elif initial_carriers:
+            path = "motif_to_carrier_to_family_to_interaction"
+        else:
+            path = "motif_to_family_to_interaction"
     elif carrier_interactions:
         interaction_ids.update(carrier_interactions)
         path = "motif_to_carrier_to_family_to_interaction"

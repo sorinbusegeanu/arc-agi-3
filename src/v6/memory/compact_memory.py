@@ -5805,8 +5805,16 @@ def _ensure_current_state_schema(path: Path) -> bool:
         }
         if not required_transfer_link_pk <= {name for name, pk_order in transfer_link_columns.items() if pk_order > 0}:
             # These rows are derived H11 artifacts.  The old role-level key
-            # collapsed distinct verified source/target pairs, so retain no
-            # proxy aggregate as evidence after the identity migration.
+            # collapsed distinct verified source/target pairs.  Invalidate
+            # every dependent future-option artifact so the next derivation
+            # cannot combine fresh concrete rows with old proxy aggregates.
+            for derived_table in (
+                "future_option_transfer_links",
+                "future_option_links",
+                "future_option_motifs",
+                "future_option_events",
+            ):
+                connection.execute(f"DELETE FROM {derived_table}")
             connection.execute("DROP TABLE future_option_transfer_links")
             connection.execute(
                 """

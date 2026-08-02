@@ -82,6 +82,12 @@ def evaluate_h11_future_option_transfer_concepts(
         and str(row.get("transfer_provenance_status") or "missing") == "verified"
         and str(row.get("concept_validation_status") or "missing") == "verified"
     ]
+    for row in rows:
+        if str(row.get("transfer_provenance_status") or "missing") == "verified":
+            assert str(row.get("provenance_mode") or "") == "single_source"
+            assert row.get("source_role_signature")
+            assert row.get("source_game_key") and row.get("target_game_key")
+            assert row.get("source_context_key") and row.get("target_context_key")
     all_motifs_with_transfer = len({str(row["motif_signature"]) for row in rows if int(row["transfer_attempt_count"] or 0) > 0})
     verified_motifs_with_transfer = len({str(row["motif_signature"]) for row in fully_verified_rows if int(row["transfer_attempt_count"] or 0) > 0})
     all_motifs_with_strong = len({str(row["motif_signature"]) for row in rows if int(row["strong_transfer_success_count"] or 0) > 0})
@@ -152,13 +158,13 @@ def evaluate_h11_future_option_transfer_concepts(
         "verified_motifs_with_strong_transfer_count": verified_motifs_with_strong,
         "all_motifs_with_promoted_concept_count": all_motifs_with_promoted,
         "verified_motifs_with_promoted_concept_count": verified_motifs_with_promoted,
-        # Backward-compatible aliases use the inclusive all-link population.
-        "motifs_with_transfer_count": all_motifs_with_transfer,
-        "motifs_with_strong_transfer_count": all_motifs_with_strong,
-        "motifs_with_promoted_concept_count": all_motifs_with_promoted,
+        # Legacy H11 counters retain their previous verified-only meaning.
+        "motifs_with_transfer_count": verified_motifs_with_transfer,
+        "motifs_with_strong_transfer_count": verified_motifs_with_strong,
+        "motifs_with_promoted_concept_count": verified_motifs_with_promoted,
         "motif_transfer_success_rate": (total_successes / total_attempts) if total_attempts else None,
         "motif_strong_transfer_success_rate": (total_strong / total_attempts) if total_attempts else None,
-        "promoted_concept_motif_count": motifs_with_promoted,
+        "promoted_concept_motif_count": verified_motifs_with_promoted,
         "emergent_future_option_motif_count": emergent_motifs,
         "all_emergent_motif_transfer_link_count": len(emergent_all_rows),
         "emergent_motif_transfer_link_count": len(emergent_all_rows),
@@ -265,6 +271,9 @@ def evaluate_h11_future_option_transfer_concepts(
         "motif_role_concept_link_count": derivation_summary.get("motif_role_concept_link_count"),
         "missing_evidence": [],
     }
+    assert int(result["fully_verified_emergent_chain_count"] or 0) <= int(
+        result["all_emergent_motif_transfer_link_count"] or 0
+    )
     if future_option_motif_count == 0:
         result["decision"] = "INSUFFICIENT_EVIDENCE"
         result["missing_evidence"].append("H11 blocked because future-option motifs are absent.")
@@ -313,11 +322,21 @@ def evaluate_h11_future_option_transfer_concepts(
             "motifs_with_transfer_count",
             "motifs_with_strong_transfer_count",
             "motifs_with_promoted_concept_count",
+            "all_motifs_with_transfer_count",
+            "verified_motifs_with_transfer_count",
+            "all_motifs_with_strong_transfer_count",
+            "verified_motifs_with_strong_transfer_count",
+            "all_motifs_with_promoted_concept_count",
+            "verified_motifs_with_promoted_concept_count",
             "motif_transfer_success_rate",
             "motif_strong_transfer_success_rate",
             "promoted_concept_motif_count",
             "emergent_future_option_motif_count",
             "emergent_motif_transfer_link_count",
+            "all_emergent_motif_transfer_link_count",
+            "fully_verified_emergent_chain_count",
+            "partially_verified_emergent_chain_count",
+            "unverified_emergent_chain_count",
             "emergent_motifs_with_transfer_count",
             "emergent_motifs_with_strong_transfer_count",
             "emergent_motifs_with_promoted_concept_count",
@@ -328,6 +347,17 @@ def evaluate_h11_future_option_transfer_concepts(
             "non_emergent_motifs_with_strong_transfer_count",
             "non_emergent_motifs_with_promoted_concept_count",
             "successful_role_transfer_count",
+            "verified_concrete_transfer_link_count",
+            "verified_transfer_pair_count",
+            "distinct_source_target_pair_count",
+            "verified_cross_game_link_count",
+            "verified_cross_game_motif_count",
+            "verified_cross_game_pair_count",
+            "motif_transfer_chain_provenance_breakdown",
+            "blocked_by_motif_provenance",
+            "blocked_by_transfer_provenance",
+            "blocked_by_concept_validation",
+            "blocked_by_missing_concept",
             "promoted_concept_count",
             "events_with_owner_type_role",
             "role_linked_event_count",
@@ -370,10 +400,14 @@ def _write(output_dir: Path, result: dict[str, object]) -> None:
     text = (
         f"H11 decision: {result.get('decision')}\n"
         f"future-option transfer links: {result.get('future_option_transfer_link_count')}\n"
-        f"emergent motif transfer links: {result.get('emergent_motif_transfer_link_count')}\n"
-        f"motifs with strong transfer: {result.get('motifs_with_strong_transfer_count')}\n"
+        f"all / verified motif transfers: {result.get('all_motifs_with_transfer_count')} / {result.get('verified_motifs_with_transfer_count')}\n"
+        f"all / verified strong transfers: {result.get('all_motifs_with_strong_transfer_count')} / {result.get('verified_motifs_with_strong_transfer_count')}\n"
+        f"all / verified promoted-concept motifs: {result.get('all_motifs_with_promoted_concept_count')} / {result.get('verified_motifs_with_promoted_concept_count')}\n"
+        f"all / fully verified emergent chains: {result.get('all_emergent_motif_transfer_link_count')} / {result.get('fully_verified_emergent_chain_count')}\n"
+        f"partially / unverified emergent chains: {result.get('partially_verified_emergent_chain_count')} / {result.get('unverified_emergent_chain_count')}\n"
+        f"verified cross-game links / pairs: {result.get('verified_cross_game_link_count')} / {result.get('verified_cross_game_pair_count')}\n"
+        f"blocked by motif / transfer / concept: {result.get('blocked_by_motif_provenance')} / {result.get('blocked_by_transfer_provenance')} / {result.get('blocked_by_concept_validation')}\n"
         f"emergent motifs with strong transfer: {result.get('emergent_motifs_with_strong_transfer_count')}\n"
-        f"motifs with promoted concepts: {result.get('motifs_with_promoted_concept_count')}\n"
         f"emergent motifs with promoted concepts: {result.get('emergent_motifs_with_promoted_concept_count')}\n"
         f"non-emergent motif transfer links: {result.get('non_emergent_motif_transfer_link_count')}\n"
         f"motifs skipped no role links: {result.get('motifs_skipped_no_role_links')}\n"

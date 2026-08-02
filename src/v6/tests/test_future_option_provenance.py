@@ -4,7 +4,13 @@ import json
 import sqlite3
 from pathlib import Path
 
-from v6.future_options import derive_future_option_events, derive_future_option_motifs, derive_future_option_transfer_links
+from v6.future_options import (
+    _resolve_motif_transfer_provenance,
+    derive_future_option_events,
+    derive_future_option_motifs,
+    derive_future_option_transfer_links,
+)
+from v6.hypothesis_h11_report import evaluate_h11_future_option_transfer_concepts
 from v6.memory.compact_memory import ensure_memory_layout
 
 
@@ -78,12 +84,35 @@ def _provenance_memory(tmp_path: Path) -> tuple[Path, sqlite3.Connection, sqlite
             attempt_id, role_signature, transfer_kind, reuse_success, similarity_score,
             transfer_score, best_margin, source_carrier_count, candidate_role_count,
             source_role_signature, predicted_target_role_signature, observed_target_role_signature,
-            source_game_key, target_game_key, source_carrier_signature, provenance_mode, provenance_status
+            source_game_key, target_game_key, source_context_key, target_context_key,
+            source_carrier_signature, provenance_mode, provenance_status
         ) VALUES ('attempt-1', 'role-1', 'cross_game', 1, 0.9, 0.9, 0.2, 2, 2,
-                  'role-1', 'role-1', 'role-1', 'g1', 'g2', 'carrier-1', 'single_source', 'verified')"""
+                  'role-1', 'role-1', 'role-1', 'g1', 'g2', 'ctx1', 'ctx2',
+                  'carrier-1', 'single_source', 'verified')"""
     )
     state_conn.commit()
     return memory_dir, state_conn, graph_conn
+
+
+def _seed_verified_transfer_motif(state_conn: sqlite3.Connection, *, motif_signature: str = "motif-verified") -> None:
+    state_conn.execute(
+        """UPDATE concept_candidates
+           SET is_promoted = 1, promotion_status = 'retained', validation_status = 'passed'
+           WHERE concept_signature = 'concept-1'"""
+    )
+    state_conn.execute(
+        """INSERT INTO future_option_motifs (
+            motif_signature, motif_type, support_count, motif_stability_score, is_emergent,
+            source_interaction_ids_json
+        ) VALUES (?, 'enable', 3, 0.8, 1, '[\"interaction-1\"]')""",
+        (motif_signature,),
+    )
+    state_conn.execute(
+        """INSERT INTO future_option_links (motif_signature, linked_type, linked_key, support_count)
+           VALUES (?, 'motif_associated_with_role', 'role-1', 1)""",
+        (motif_signature,),
+    )
+    state_conn.commit()
 
 
 def test_family_and_carrier_provenance_resolve_through_role_and_transfer(tmp_path: Path) -> None:
@@ -251,6 +280,141 @@ def test_missing_provenance_never_invents_links_and_propagation_is_idempotent(tm
         assert first["failure_occurrence_count"] >= first["unique_unresolved_id_count"]
         assert explicit_before == explicit_after == 0
         assert invented == 0
+    finally:
+        state_conn.close()
+        graph_conn.close()
+
+
+def test_h11_retained_concept_and_concrete_pairs_remain_verified(tmp_path: Path) -> None:
+    memory_dir, state_conn, graph_conn = _provenance_memory(tmp_path)
+    try:
+        _seed_verified_transfer_motif(state_conn)
+        state_conn.execute(
+            """INSERT INTO role_transfer_attempts (
+                attempt_id, role_signature, transfer_kind, reuse_success, similarity_score,
+                transfer_score, best_margin, source_carrier_count, source_evidence_support_count,
+                candidate_role_count, source_role_signature, predicted_target_role_signature,
+                observed_target_role_signature, source_game_key, target_game_key,
+                source_context_key, target_context_key, source_carrier_signature,
+                provenance_mode, provenance_status
+            ) VALUES ('attempt-2', 'role-1', 'cross_game', 1, 0.9, 0.9, 0.2, 1, 2, 2,
+                      'role-1', 'role-1', 'role-1', 'g3', 'g4', 'ctx3', 'ctx4',
+                      'carrier-1', 'single_source', 'verified')"""
+        )
+        state_conn.commit()
+        summary = derive_future_option_transfer_links(state_conn)
+        rows = state_conn.execute(
+            """SELECT source_game_key, target_game_key, provenance_mode,
+                      transfer_provenance_status, concept_validation_status
+               FROM future_option_transfer_links
+               WHERE motif_signature = 'motif-verified'
+               ORDER BY source_game_key"""
+        ).fetchall()
+        assert len(rows) == 2
+        assert {(row[0], row[1]) for row in rows} == {("g1", "g2"), ("g3", "g4")}
+        assert all(tuple(row[2:]) == ("single_source", "verified", "verified") for row in rows)
+        assert summary["verified_concrete_transfer_link_count"] == 2
+        assert summary["verified_transfer_pair_count"] == 2
+        state_conn.commit()
+        report = evaluate_h11_future_option_transfer_concepts(
+            memory_dir=memory_dir,
+            run_dir=None,
+            output_dir=tmp_path / "h11",
+            already_derived=True,
+        )
+        assert report["verified_future_option_transfer_count"] == 2
+        assert report["verified_cross_game_pair_count"] == 2
+        assert report["decision"] != "INSUFFICIENT_EVIDENCE"
+    finally:
+        state_conn.close()
+        graph_conn.close()
+
+
+def test_h11_concept_validation_statuses_are_explicit(tmp_path: Path) -> None:
+    _, state_conn, graph_conn = _provenance_memory(tmp_path)
+    try:
+        _seed_verified_transfer_motif(state_conn)
+        derive_future_option_transfer_links(state_conn)
+        assert state_conn.execute(
+            "SELECT concept_validation_status FROM future_option_transfer_links"
+        ).fetchone()[0] == "verified"
+
+        state_conn.execute(
+            """UPDATE concept_candidates
+               SET is_promoted = 0, promotion_status = 'candidate', validation_status = 'passed'
+               WHERE concept_signature = 'concept-1'"""
+        )
+        state_conn.commit()
+        derive_future_option_transfer_links(state_conn)
+        assert state_conn.execute(
+            "SELECT concept_validation_status FROM future_option_transfer_links"
+        ).fetchone()[0] == "proxy"
+
+        state_conn.execute(
+            """UPDATE concept_candidates
+               SET is_promoted = 0, promotion_status = 'demoted', validation_status = 'demoted'
+               WHERE concept_signature = 'concept-1'"""
+        )
+        state_conn.commit()
+        derive_future_option_transfer_links(state_conn)
+        assert state_conn.execute(
+            "SELECT concept_validation_status FROM future_option_transfer_links"
+        ).fetchone()[0] == "demoted"
+    finally:
+        state_conn.close()
+        graph_conn.close()
+
+
+def test_motif_provenance_resolves_direct_and_structural_paths(tmp_path: Path) -> None:
+    _, state_conn, graph_conn = _provenance_memory(tmp_path)
+    try:
+        _insert_event(
+            state_conn,
+            event_id="family-provenance-event",
+            owner_type="family",
+            owner_key="family-1",
+            family="family-1",
+        )
+        state_conn.commit()
+        direct = _resolve_motif_transfer_provenance(
+            state_conn,
+            motif_signature="direct",
+            motif_links={"event": {"family-provenance-event"}},
+            direct_interaction_ids=set(),
+        )
+        family = _resolve_motif_transfer_provenance(
+            state_conn,
+            motif_signature="family",
+            motif_links={"motif_derived_from_family": {"family-1"}},
+            direct_interaction_ids=set(),
+        )
+        carrier = _resolve_motif_transfer_provenance(
+            state_conn,
+            motif_signature="carrier",
+            motif_links={"motif_expressed_by_carrier": {"carrier-1"}},
+            direct_interaction_ids=set(),
+        )
+        role = _resolve_motif_transfer_provenance(
+            state_conn,
+            motif_signature="role",
+            motif_links={"motif_associated_with_role": {"role-1"}},
+            direct_interaction_ids=set(),
+        )
+        missing = _resolve_motif_transfer_provenance(
+            state_conn,
+            motif_signature="missing",
+            motif_links={},
+            direct_interaction_ids=set(),
+        )
+        assert (direct["status"], direct["resolution_path"]) == ("verified", "motif_to_interaction")
+        assert (family["status"], family["resolution_path"]) == ("verified", "motif_to_family_to_interaction")
+        assert (carrier["status"], carrier["resolution_path"]) == (
+            "verified", "motif_to_carrier_to_family_to_interaction",
+        )
+        assert (role["status"], role["resolution_path"]) == (
+            "verified", "motif_to_role_to_carrier_to_family_to_interaction",
+        )
+        assert missing["status"] == "missing"
     finally:
         state_conn.close()
         graph_conn.close()
