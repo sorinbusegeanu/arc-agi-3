@@ -78,6 +78,7 @@ def evaluate_h08_world_model_coherence(
                    heldout_prediction_gain, matched_prediction_event_count, unmatched_prediction_event_count,
                    structural_coherence_score, functional_coherence_score, combined_coherence_score,
                    candidate_family_link_count, retained_family_link_count, dropped_family_link_count,
+                   family_links_dropped_low_support, family_links_dropped_limit,
                    is_coherent, candidate_only, validation_prediction_lift,
                    validation_action_selection_lift, validation_transfer_lift,
                    validation_contradiction_resolution, validation_explanatory_gain
@@ -86,11 +87,15 @@ def evaluate_h08_world_model_coherence(
             """
         ).fetchall()
         component_links = [dict(row) for row in conn.execute("SELECT component_signature, linked_type, linked_key FROM world_model_links ORDER BY component_signature ASC, linked_type ASC, linked_key ASC").fetchall()]
+        component_state_rows = conn.execute(
+            "SELECT component_signature, historically_coherent, currently_coherent, validation_status FROM world_model_component_state"
+        ).fetchall() if "world_model_component_state" in tables else []
         milestone_map = dict(conn.execute("SELECT milestone_name, first_global_step FROM higher_order_milestones").fetchall())
     link_map: dict[str, dict[str, set[str]]] = {}
     for row in component_links:
         groups = link_map.setdefault(str(row["component_signature"]), {})
         groups.setdefault(str(row["linked_type"]), set()).add(str(row["linked_key"]))
+    component_state = {str(row["component_signature"]): dict(row) for row in component_state_rows}
     world_model_component_count = len(component_rows)
     structural_coherent_rows = [row for row in component_rows if int(row["is_coherent"] or 0) == 1]
     def _has_heldout_gain(row: sqlite3.Row) -> bool:
@@ -139,10 +144,7 @@ def evaluate_h08_world_model_coherence(
         int(row["predicted_outcome_count"] or 0)
         for row in component_rows if str(row["prediction_evidence_status"] or "missing") == "proxy"
     )
-    missing_outcome_count = sum(
-        int(row["unmatched_prediction_event_count"] or 0)
-        for row in component_rows if str(row["prediction_evidence_status"] or "missing") == "missing"
-    )
+    missing_outcome_count = sum(int(row["unmatched_prediction_event_count"] or 0) for row in component_rows)
     predicted_outcome_count_is_proxy_count = sum(int(row["predicted_outcome_count_is_proxy"] or 0) for row in component_rows)
     supported_context_count = max((len(link_map.get(str(row["component_signature"]), {}).get("context", set())) for row in component_rows), default=0)
     concept_link_count = max((len(link_map.get(str(row["component_signature"]), {}).get("concept", set())) for row in component_rows), default=0)
@@ -175,6 +177,12 @@ def evaluate_h08_world_model_coherence(
         "coherent_world_model_component_count": coherent_world_model_component_count,
         "structural_coherent_world_model_component_count": structural_coherent_world_model_component_count,
         "candidate_only_world_model_component_count": candidate_only_world_model_component_count,
+        "historically_coherent_component_count": sum(
+            int(row.get("historically_coherent") or 0) for row in component_state.values()
+        ),
+        "currently_coherent_component_count": sum(
+            int(row.get("currently_coherent") or 0) for row in component_state.values()
+        ),
         "promoted_concept_count": promoted_concept_count,
         "role_candidate_count": role_candidate_count,
         "role_transfer_success_count": role_transfer_success_count,
@@ -193,11 +201,18 @@ def evaluate_h08_world_model_coherence(
         "matched_prediction_event_count": sum(int(row["matched_prediction_event_count"] or 0) for row in component_rows),
         "unmatched_prediction_event_count": sum(int(row["unmatched_prediction_event_count"] or 0) for row in component_rows),
         "predicted_outcome_count_is_proxy_count": predicted_outcome_count_is_proxy_count,
-        "structural_coherence_score": _count_statistics([int(round(float(row["structural_coherence_score"] or 0.0) * 100)) for row in component_rows]),
-        "functional_coherence_score": _count_statistics([int(round(float(row["functional_coherence_score"] or 0.0) * 100)) for row in component_rows]),
-        "combined_coherence_score": _count_statistics([int(round(float(row["combined_coherence_score"] or 0.0) * 100)) for row in component_rows]),
+        "structural_coherence_score": _numeric_statistics([float(row["structural_coherence_score"] or 0.0) for row in component_rows]),
+        "functional_coherence_score": _numeric_statistics([float(row["functional_coherence_score"] or 0.0) for row in component_rows]),
+        "combined_coherence_score": _numeric_statistics([float(row["combined_coherence_score"] or 0.0) for row in component_rows]),
         "candidate_family_link_count": sum(int(row["candidate_family_link_count"] or 0) for row in component_rows),
         "retained_family_link_count": sum(int(row["retained_family_link_count"] or 0) for row in component_rows),
+        "dropped_family_link_count": sum(int(row["dropped_family_link_count"] or 0) for row in component_rows),
+        "family_links_dropped_low_support": sum(int(row["family_links_dropped_low_support"] or 0) for row in component_rows),
+        "family_links_dropped_limit": sum(int(row["family_links_dropped_limit"] or 0) for row in component_rows),
+        "family_link_verification_ratio": (
+            sum(int(row["retained_family_link_count"] or 0) for row in component_rows)
+            / max(1, sum(int(row["candidate_family_link_count"] or 0) for row in component_rows))
+        ),
         "supported_context_count": supported_context_count,
         "concept_link_count": concept_link_count,
         "role_link_count": role_link_count,
@@ -293,6 +308,22 @@ def _count_statistics(values: list[int]) -> dict[str, Any]:
         "mean": (sum(cooked) / len(cooked)) if cooked else 0.0,
         "median": float(median(cooked)) if cooked else 0.0,
         "maximum": max(cooked, default=0),
+        "distribution": distribution,
+    }
+
+
+def _numeric_statistics(values: list[float]) -> dict[str, Any]:
+    cooked = [float(value) for value in values]
+    distribution: dict[str, int] = {}
+    for value in sorted(cooked):
+        key = f"{value:.6f}"
+        distribution[key] = distribution.get(key, 0) + 1
+    return {
+        "total": sum(cooked),
+        "distinct": len(set(cooked)),
+        "mean": (sum(cooked) / len(cooked)) if cooked else 0.0,
+        "median": float(median(cooked)) if cooked else 0.0,
+        "maximum": max(cooked, default=0.0),
         "distribution": distribution,
     }
 

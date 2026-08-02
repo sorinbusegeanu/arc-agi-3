@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from hashlib import sha1
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,7 @@ from v6.higher_order_substrate import (
     derive_higher_order_memory,
     derive_role_candidates_only,
     derive_role_transfer_attempts_only,
+    derive_world_model_components_only,
     validate_incremental_promotions_only,
 )
 from v6.hypothesis_h05_report import evaluate_h05_role_emergence
@@ -1608,7 +1610,9 @@ def test_h09_detects_motifs(tmp_path: Path) -> None:
     assert result["future_option_event_count"] > 0
     assert result["future_option_motif_count"] > 0
     assert result["unknown_motif_count"] >= 1
-    assert result["classified_without_provenance_count"] >= 1
+    # These seeded motifs are linked back to concrete carrier/family evidence;
+    # strict H09 reporting must no longer mislabel that evidence as proxy.
+    assert result["verified_motif_count"] >= 1
     assert result["decision"] in {"PARTIALLY_VALID", "VALID"}
 
 
@@ -1623,7 +1627,81 @@ def test_h09_emergent_motif_across_contexts_games(tmp_path: Path) -> None:
     result = evaluate_h09_future_option_motifs(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h09")
     assert result["emergent_future_option_motif_count"] >= 1
     assert result["decision"] == "PARTIALLY_VALID"
-    assert result["verified_motif_count"] == 0
+    assert result["verified_motif_count"] >= 1
+
+
+def test_h09_cross_game_requires_a_verified_concrete_observation_pair(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute(
+            "INSERT INTO future_option_motifs (motif_signature, motif_type, provenance_status) VALUES ('motif-a', 'enable', 'verified')"
+        )
+        # Two source games in a motif union are not a source-target pair.
+        for event_id, game in (("event-a", "g1"), ("event-b", "g2")):
+            conn.execute(
+                "INSERT INTO future_option_events (event_id, motif_type, classification_source) VALUES (?, 'enable', 'structural_effect')",
+                (event_id,),
+            )
+            conn.execute(
+                """INSERT INTO future_option_motif_observations (
+                    motif_signature, event_id, source_game_key, provenance_status, classification_source
+                ) VALUES ('motif-a', ?, ?, 'verified', 'structural_effect')""",
+                (event_id, game),
+            )
+        conn.commit()
+    result = evaluate_h09_future_option_motifs(
+        memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h09", already_derived=True
+    )
+    assert result["cross_game_motif_count"] == 0
+    assert result["verified_cross_game_observation_count"] == 0
+
+
+def test_h08_counts_only_predictions_matched_to_later_outcomes(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    ensure_memory_layout(memory_dir)
+    component_signature = "wm:" + sha1(b"concept-wm").hexdigest()[:20]
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute(
+            "INSERT INTO concept_candidates (concept_signature, is_promoted, promotion_score, first_seen_global_step) VALUES ('concept-wm', 1, 0.9, 1)"
+        )
+        conn.execute(
+            "INSERT INTO concept_promotion_state (concept_signature, historically_promoted, currently_promoted, promotion_status, validation_status, first_promoted_global_step) VALUES ('concept-wm', 1, 1, 'promoted', 'passed', 1)"
+        )
+        for index in range(2):
+            family = f"family-wm-{index}"
+            carrier = f"carrier-wm-{index}"
+            conn.execute("INSERT INTO transformation_families (canonical_signature, prediction_lift) VALUES (?, 0.2)", (family,))
+            conn.execute("INSERT INTO concept_links (concept_signature, linked_type, linked_key, support_count) VALUES ('concept-wm', 'family', ?, 1)", (family,))
+            conn.execute("INSERT INTO concept_links (concept_signature, linked_type, linked_key, support_count) VALUES ('concept-wm', 'carrier', ?, 1)", (carrier,))
+        conn.execute("INSERT INTO role_candidates (role_signature) VALUES ('role-wm')")
+        conn.execute("INSERT INTO concept_links (concept_signature, linked_type, linked_key, support_count) VALUES ('concept-wm', 'role', 'role-wm', 1)")
+        conn.execute(
+            """INSERT INTO world_model_prediction_events (
+                prediction_event_id, component_signature, prediction_global_step,
+                observed_event_id, observed_global_step, prediction_correct,
+                baseline_prediction_score, component_prediction_score
+            ) VALUES ('prediction-valid', ?, 4, 'outcome-1', 5, 1, 0.2, 0.8)""",
+            (component_signature,),
+        )
+        conn.execute(
+            """INSERT INTO world_model_prediction_events (
+                prediction_event_id, component_signature, prediction_global_step,
+                observed_event_id, observed_global_step, prediction_correct
+            ) VALUES ('prediction-not-later', ?, 5, 'outcome-2', 5, 1)""",
+            (component_signature,),
+        )
+        conn.commit()
+    derive_world_model_components_only(memory_dir=memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        row = conn.execute(
+            """SELECT prediction_support_count, predicted_outcome_count,
+                      observed_outcome_count, matched_prediction_event_count,
+                      unmatched_prediction_event_count, prediction_evidence_status
+               FROM world_model_components WHERE component_signature = ?""",
+            (component_signature,),
+        ).fetchone()
+    assert row == (0, 1, 1, 1, 1, "verified")
 
 
 def test_h10_lift(tmp_path: Path) -> None:

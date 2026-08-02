@@ -27,6 +27,11 @@ def _clamp01(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
 
 
+def _mean_optional(values: list[Any]) -> float | None:
+    cooked = [float(value) for value in values if value is not None]
+    return (sum(cooked) / len(cooked)) if cooked else None
+
+
 ROLE_CLEAR_TABLES = (
     "role_neighborhood_signatures",
     "role_candidates",
@@ -36,6 +41,7 @@ ROLE_CLEAR_TABLES = (
     "concept_links",
     "world_model_components",
     "world_model_links",
+    "world_model_family_links",
     "future_option_transfer_links",
     "higher_order_milestones",
 )
@@ -49,6 +55,7 @@ ROLE_ONLY_CLEAR_TABLES = (
     "concept_links",
     "world_model_components",
     "world_model_links",
+    "world_model_family_links",
     "future_option_transfer_links",
     "higher_order_milestones",
 )
@@ -59,6 +66,7 @@ ROLE_TRANSFER_ONLY_CLEAR_TABLES = (
     "concept_links",
     "world_model_components",
     "world_model_links",
+    "world_model_family_links",
     "future_option_transfer_links",
 )
 
@@ -67,11 +75,13 @@ CONCEPT_ONLY_CLEAR_TABLES = (
     "concept_links",
     "world_model_components",
     "world_model_links",
+    "world_model_family_links",
 )
 
 WORLD_MODEL_ONLY_CLEAR_TABLES = (
     "world_model_components",
     "world_model_links",
+    "world_model_family_links",
 )
 
 
@@ -355,12 +365,20 @@ def derive_world_model_components_only(
     memory_dir: Path,
     run_dir: Path | None = None,
     progress_factory: Any | None = None,
+    max_world_model_family_links: int = MAX_WORLD_MODEL_FAMILY_LINKS,
 ) -> dict[str, Any]:
     del run_dir
+    if int(max_world_model_family_links) < 1:
+        raise ValueError("max_world_model_family_links must be positive")
     return _run_higher_order_stage(
         memory_dir=memory_dir,
         clear_tables=WORLD_MODEL_ONLY_CLEAR_TABLES,
-        runner=lambda state_conn, graph_conn: derive_world_model_components(state_conn, graph_conn, progress_factory=progress_factory),
+        runner=lambda state_conn, graph_conn: derive_world_model_components(
+            state_conn,
+            graph_conn,
+            progress_factory=progress_factory,
+            max_world_model_family_links=int(max_world_model_family_links),
+        ),
     )
 
 
@@ -1334,6 +1352,7 @@ def derive_world_model_components(
     state_conn: sqlite3.Connection,
     graph_conn: sqlite3.Connection,
     progress_factory: Any | None = None,
+    max_world_model_family_links: int = MAX_WORLD_MODEL_FAMILY_LINKS,
 ) -> dict[str, Any]:
     concept_rows = [dict(row) for row in state_conn.execute(
         """
@@ -1426,7 +1445,7 @@ def derive_world_model_components(
             0 if item["provenance_status"] == "verified" else 1,
             -float(item["prediction_gain"]), -int(item["support"]), str(item["family"]),
         ))
-        retained_family_records = eligible_families[:MAX_WORLD_MODEL_FAMILY_LINKS]
+        retained_family_records = eligible_families[:int(max_world_model_family_links)]
         families = [str(item["family"]) for item in retained_family_records]
         family_links_dropped_low_support = len(family_candidates) - len(eligible_families)
         family_links_dropped_limit = len(eligible_families) - len(retained_family_records)
@@ -1479,17 +1498,22 @@ def derive_world_model_components(
             (component_signature,),
         ).fetchone()[0])
         observed_outcome_count = len(prediction_rows)
+        prediction_event_count = observed_outcome_count + unmatched_prediction_event_count
         correct_prediction_count = sum(int(item["prediction_correct"] or 0) for item in prediction_rows)
         prediction_error_count = observed_outcome_count - correct_prediction_count
-        baseline_prediction_score = _mean([item["baseline_prediction_score"] for item in prediction_rows])
-        component_prediction_score = _mean([item["component_prediction_score"] for item in prediction_rows])
+        baseline_prediction_score = _mean_optional([item["baseline_prediction_score"] for item in prediction_rows])
+        component_prediction_score = _mean_optional([item["component_prediction_score"] for item in prediction_rows])
         prediction_accuracy = correct_prediction_count / max(1, observed_outcome_count)
         heldout_prediction_gain = (
             float(component_prediction_score) - float(baseline_prediction_score)
             if component_prediction_score is not None and baseline_prediction_score is not None
             else 0.0
         )
-        prediction_evidence_status = "verified" if observed_outcome_count else "missing"
+        prediction_evidence_status = (
+            "verified" if observed_outcome_count
+            else "proxy" if prediction_event_count
+            else "missing"
+        )
         edge_density = graph_edge_count / max(1, node_count * max(1, node_count - 1))
         total_link_count = linked_role_count + linked_family_count + linked_carrier_count + len(contexts) + len(games)
         verified_link_count = sum(1 for item in retained_family_records if item["provenance_status"] == "verified") + linked_role_count + linked_carrier_count
@@ -1558,7 +1582,11 @@ def derive_world_model_components(
                 cross_context_count,
                 cross_game_count,
                 explanatory_coverage,
-                structural_prediction_support_count,
+                # The legacy column is retained for readers of existing
+                # compact stores, but it is no longer a structural proxy for
+                # prediction evidence.  Concrete matched rows above are the
+                # only source for predicted_outcome_count.
+                0,
                 contradiction_coverage_count,
                 coherence_score,
                 candidate_only,

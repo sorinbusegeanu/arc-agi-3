@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections import Counter
+from hashlib import sha1
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,19 @@ def _missing_tables(connection: sqlite3.Connection, required: tuple[str, ...]) -
         for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
     }
     return [name for name in required if name not in tables]
+
+
+def _complete_context_key(value: object) -> bool:
+    if value in (None, ""):
+        return False
+    text = str(value).strip().lower()
+    return bool(text) and "null" not in text and "none" not in text and text not in {"[]", "{}"}
+
+
+def _context_id(value: object) -> str | None:
+    if value in (None, ""):
+        return None
+    return "ctx:" + sha1(str(value).encode("utf-8")).hexdigest()[:20]
 
 
 def evaluate_h09_future_option_motifs(
@@ -62,9 +76,9 @@ def evaluate_h09_future_option_motifs(
             return result
         events = [dict(row) for row in conn.execute("SELECT * FROM future_option_events ORDER BY event_id ASC").fetchall()]
         motifs = [dict(row) for row in conn.execute("SELECT * FROM future_option_motifs ORDER BY motif_signature ASC").fetchall()]
-        transfer_links = [dict(row) for row in conn.execute(
-            "SELECT motif_signature, source_game_key, target_game_key, source_context_key, target_context_key, provenance_mode FROM future_option_transfer_links"
-        ).fetchall()] if "future_option_transfer_links" in {str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()} else []
+        observations = [dict(row) for row in conn.execute(
+            "SELECT * FROM future_option_motif_observations ORDER BY motif_signature ASC, event_id ASC"
+        ).fetchall()] if "future_option_motif_observations" in {str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()} else []
         milestone_map = dict(conn.execute("SELECT milestone_name, first_global_step FROM higher_order_milestones").fetchall())
         summary_row = conn.execute(
             "SELECT value_json FROM memory_summary WHERE key = 'future_option_derivation_summary'"
@@ -74,24 +88,24 @@ def evaluate_h09_future_option_motifs(
         transformation_families_count = int(conn.execute("SELECT COUNT(*) FROM transformation_families").fetchone()[0])
     motif_type_counts = Counter(str(row["motif_type"] or "unknown") for row in motifs)
     emergent_count = sum(1 for row in motifs if int(row["is_emergent"] or 0) == 1)
-    concrete_scopes: dict[str, dict[str, set[str]]] = {}
-    for link in transfer_links:
-        if str(link.get("provenance_mode") or "") != "single_source":
-            continue
-        scope = concrete_scopes.setdefault(str(link["motif_signature"]), {"source_games": set(), "target_games": set(), "source_contexts": set(), "target_contexts": set()})
-        for field, key in (("source_game_key", "source_games"), ("target_game_key", "target_games"), ("source_context_key", "source_contexts"), ("target_context_key", "target_contexts")):
-            if link.get(field) not in (None, ""):
-                scope[key].add(str(link[field]))
-    cross_context_motif_count = sum(
-        1 for scope in concrete_scopes.values()
-        if scope["source_contexts"] and scope["target_contexts"]
-        and any(source != target for source in scope["source_contexts"] for target in scope["target_contexts"])
-    )
-    cross_game_motif_count = sum(
-        1 for scope in concrete_scopes.values()
-        if scope["source_games"] and scope["target_games"]
-        and any(source != target for source in scope["source_games"] for target in scope["target_games"])
-    )
+    verified_observations = [row for row in observations if str(row.get("provenance_status") or "missing") == "verified"]
+    verified_cross_game_observations = [
+        row for row in verified_observations
+        if row.get("source_game_key") not in (None, "") and row.get("target_game_key") not in (None, "")
+        and str(row["source_game_key"]) != str(row["target_game_key"])
+        and not int(row.get("source_game_is_surrogate") or 0)
+        and not int(row.get("target_game_is_surrogate") or 0)
+    ]
+    verified_cross_context_observations = [
+        row for row in verified_observations
+        if _complete_context_key(row.get("source_context_key"))
+        and _complete_context_key(row.get("target_context_key"))
+        and str(row["source_context_key"]) != str(row["target_context_key"])
+        and not int(row.get("source_context_is_surrogate") or 0)
+        and not int(row.get("target_context_is_surrogate") or 0)
+    ]
+    cross_context_motif_count = len({str(row["motif_signature"]) for row in verified_cross_context_observations})
+    cross_game_motif_count = len({str(row["motif_signature"]) for row in verified_cross_game_observations})
     mean_abs_option_delta = _mean([abs(float(row.get("option_delta") or 0.0)) for row in events])
     max_abs_option_delta = max((abs(float(row.get("option_delta") or 0.0)) for row in events), default=None)
     mean_motif_stability_score = _mean([row.get("motif_stability_score") for row in motifs])
@@ -118,6 +132,14 @@ def evaluate_h09_future_option_motifs(
         "structured_effect_event_count": 0,
         "text_keyword_event_count": 0,
         "future_option_edge_event_count": 0,
+        "structural_effect_path_enabled": derivation_summary.get("structural_effect_path_enabled"),
+        "future_option_edge_path_enabled": derivation_summary.get("future_option_edge_path_enabled"),
+        "text_keyword_path_enabled": derivation_summary.get("text_keyword_path_enabled"),
+        "structural_rows_seen": derivation_summary.get("structural_rows_seen"),
+        "structural_rows_eligible": derivation_summary.get("structural_rows_eligible"),
+        "structural_rows_inserted": derivation_summary.get("structural_rows_inserted"),
+        "structural_rows_skipped_missing_effect": derivation_summary.get("structural_rows_skipped_missing_effect"),
+        "structural_rows_skipped_missing_scope": derivation_summary.get("structural_rows_skipped_missing_scope"),
         "first_future_option_event_step": milestone_map.get("first_future_option_event_step"),
         "first_emergent_future_option_motif_step": milestone_map.get("first_emergent_future_option_motif_step"),
         "stable_contingencies_count": stable_contingencies_count,
@@ -145,8 +167,11 @@ def evaluate_h09_future_option_motifs(
     source_counts = Counter()
     unknown_event_count = 0
     for row in events:
-        evidence = json.loads(str(row.get("evidence_json") or "{}"))
-        source_counts[str(evidence.get("motif_type_source") or "unknown")] += 1
+        # The persisted classification fields are the decision evidence.  The
+        # historical JSON payload is only supplemental and may describe a
+        # pre-classification heuristic, so it must not override a concrete
+        # classification source (in particular, a measured "unknown").
+        source_counts[str(row.get("classification_source") or "unknown")] += 1
         if str(row.get("motif_type") or "unknown") == "unknown":
             unknown_event_count += 1
     unknown_motif_count = int(motif_type_counts.get("unknown", 0))
@@ -158,40 +183,84 @@ def evaluate_h09_future_option_motifs(
     result["unknown_motif_source_count"] = int(source_counts.get("unknown", 0))
     result["unknown_motif_source_ratio"] = (result["unknown_motif_source_count"] / len(events)) if events else None
     result["live_delta_event_count"] = int(source_counts.get("live_delta", 0)) + int(source_counts.get("live_delta_rule", 0))
-    result["structured_effect_event_count"] = int(source_counts.get("structured_effect", 0))
+    result["structured_effect_event_count"] = int(source_counts.get("structural_effect", 0)) + int(source_counts.get("structured_effect", 0))
     result["text_keyword_event_count"] = int(source_counts.get("text_keyword", 0))
     result["future_option_edge_event_count"] = int(source_counts.get("future_option_edge", 0))
-    allowed_sources = {"structured_effect", "option_delta", "graph_effect", "role_effect", "concept_effect"}
-    verified_motifs = [
-        row for row in motifs
-        if str(row.get("motif_type") or "unknown") != "unknown"
-        and str(row.get("classification_source") or "unknown") in allowed_sources
-        and str(row.get("classification_rule") or row.get("motif_classification_reason") or "").startswith("structural_")
-        and bool(_json_list(row.get("source_interaction_ids_json")))
-    ]
-    proxy_motifs = [
-        row for row in motifs
-        if str(row.get("motif_type") or "unknown") != "unknown"
-        and row not in verified_motifs
-        and str(row.get("classification_source") or "unknown") in allowed_sources
-    ]
+    allowed_sources = {"structural_effect", "structured_effect", "option_delta", "graph_effect", "role_effect", "concept_effect", "future_option_edge", "live_delta_rule"}
+    verified_motifs = [row for row in motifs if str(row.get("provenance_status") or "missing") == "verified"]
+    proxy_motifs = [row for row in motifs if str(row.get("provenance_status") or "missing") == "proxy"]
     legacy_motifs = [row for row in motifs if str(row.get("classification_source") or "unknown") == "unknown"]
+    missing_motifs = [row for row in motifs if str(row.get("provenance_status") or "missing") not in {"verified", "proxy"}]
     result["verified_motif_count"] = len(verified_motifs)
     result["proxy_motif_count"] = len(proxy_motifs)
     result["legacy_motif_count"] = len(legacy_motifs)
     result["classified_without_provenance_count"] = len(proxy_motifs) + sum(
         1 for row in legacy_motifs if str(row.get("motif_type") or "unknown") != "unknown"
     )
-    result["motif_scope_provenance"] = [
+    result["missing_motif_count"] = len(missing_motifs)
+    result["motif_scope_summary"] = {
+        "observation_count": len(observations),
+        "verified_cross_game_observation_count": len(verified_cross_game_observations),
+        "verified_cross_context_observation_count": len(verified_cross_context_observations),
+    }
+    result["motif_scope_sample"] = [
         {
-            "motif_signature": signature,
-            "source_game_keys": sorted(scope["source_games"]),
-            "target_game_keys": sorted(scope["target_games"]),
-            "source_context_keys": sorted(scope["source_contexts"]),
-            "target_context_keys": sorted(scope["target_contexts"]),
+            "motif_signature": row["motif_signature"], "event_id": row["event_id"],
+            "source_game_key": row.get("source_game_key"), "target_game_key": row.get("target_game_key"),
+            "source_context_id": _context_id(row.get("source_context_key")),
+            "target_context_id": _context_id(row.get("target_context_key")),
+            "provenance_status": row.get("provenance_status"),
         }
-        for signature, scope in sorted(concrete_scopes.items())
+        for row in observations[:200]
     ]
+    result["classification_source_counts"] = dict(sorted(Counter(str(row.get("classification_source") or "unknown") for row in events).items()))
+    result["classification_provenance_status_counts"] = dict(sorted(Counter(str(row.get("classification_provenance_status") or "missing") for row in events).items()))
+    result["verified_observation_count"] = len(verified_observations)
+    result["proxy_observation_count"] = sum(1 for row in observations if str(row.get("provenance_status") or "missing") == "proxy")
+    result["incomplete_context_observation_count"] = sum(1 for row in observations if not _complete_context_key(row.get("source_context_key")) or not _complete_context_key(row.get("target_context_key")))
+    result["surrogate_context_observation_count"] = sum(1 for row in observations if int(row.get("source_context_is_surrogate") or 0) or int(row.get("target_context_is_surrogate") or 0))
+    result["verified_cross_game_observation_count"] = len(verified_cross_game_observations)
+    result["verified_cross_context_observation_count"] = len(verified_cross_context_observations)
+    verified_motif_ids = {str(row["motif_signature"]) for row in verified_observations}
+    direct_motif_ids = {
+        str(row["motif_signature"])
+        for row in verified_observations if row.get("source_interaction_id") not in (None, "")
+    }
+    family_motif_ids = {
+        str(row["motif_signature"])
+        for row in motifs
+        if str(row.get("provenance_status") or "missing") == "verified"
+        and bool(_json_list(row.get("source_family_ids_json")))
+    }
+    carrier_motif_ids = {
+        str(row["motif_signature"])
+        for row in motifs
+        if str(row.get("provenance_status") or "missing") == "verified"
+        and bool(_json_list(row.get("source_carrier_ids_json")))
+    }
+    role_motif_ids = {
+        str(row["motif_signature"])
+        for row in motifs
+        if str(row.get("provenance_status") or "missing") == "verified"
+        and bool(_json_list(row.get("source_role_ids_json")))
+    }
+    concept_motif_ids = {
+        str(row["motif_signature"])
+        for row in motifs
+        if str(row.get("provenance_status") or "missing") == "verified"
+        and bool(_json_list(row.get("source_concept_ids_json")))
+    }
+    result["motifs_verified_by_direct_interaction"] = len(direct_motif_ids)
+    result["motifs_verified_by_family_path"] = len(family_motif_ids - direct_motif_ids)
+    result["motifs_verified_by_carrier_path"] = len(carrier_motif_ids - direct_motif_ids - family_motif_ids)
+    result["motifs_verified_by_role_path"] = len(role_motif_ids - direct_motif_ids - family_motif_ids - carrier_motif_ids)
+    result["motifs_verified_by_concept_path"] = len(concept_motif_ids - direct_motif_ids - family_motif_ids - carrier_motif_ids - role_motif_ids)
+    result["motifs_with_only_surrogate_scope"] = len({
+        str(row["motif_signature"])
+        for row in observations
+        if str(row.get("motif_signature")) not in verified_motif_ids
+        and (int(row.get("source_context_is_surrogate") or 0) or int(row.get("target_context_is_surrogate") or 0))
+    })
     non_unknown_types = [key for key, value in motif_type_counts.items() if key != "unknown" and value > 0]
     if not events:
         if stable_contingencies_count > 0 or transformation_families_count > 0:
@@ -269,10 +338,27 @@ def evaluate_h09_future_option_motifs(
             "future_option_edge_event_count",
             "verified_motif_count",
             "proxy_motif_count",
-            "legacy_motif_count",
-            "classified_without_provenance_count",
+                "legacy_motif_count",
+                "missing_motif_count",
+                "classified_without_provenance_count",
+                "classification_source_counts",
+                "classification_provenance_status_counts",
+                "verified_observation_count",
+                "proxy_observation_count",
+                "incomplete_context_observation_count",
+                "surrogate_context_observation_count",
+                "verified_cross_game_observation_count",
+                "verified_cross_context_observation_count",
         )
     }
+    _write_observations(output_dir, observations)
+    result["h09_motif_observations_artifact"] = "h09_motif_observations.jsonl"
+    assert result["verified_motif_count"] + result["proxy_motif_count"] + result["missing_motif_count"] == len(motifs)
+    assert result["unknown_motif_source_count"] == sum(
+        1 for row in events if str(row.get("classification_source") or "unknown") == "unknown"
+    )
+    assert result["cross_game_motif_count"] == len({str(row["motif_signature"]) for row in verified_cross_game_observations})
+    assert result["cross_context_motif_count"] == len({str(row["motif_signature"]) for row in verified_cross_context_observations})
     _write(output_dir, result)
     return result
 
@@ -304,3 +390,12 @@ def _write(output_dir: Path, result: dict[str, Any]) -> None:
     )
     (output_dir / "h09_future_option_motifs_report.txt").write_text(text, encoding="utf-8")
     (output_dir / "h09_future_option_motifs.md").write_text("```\n" + text + "```\n", encoding="utf-8")
+
+
+def _write_observations(output_dir: Path, observations: list[dict[str, Any]]) -> None:
+    with (output_dir / "h09_motif_observations.jsonl").open("w", encoding="utf-8") as handle:
+        for row in observations:
+            payload = dict(row)
+            payload["source_context_id"] = _context_id(payload.pop("source_context_key", None))
+            payload["target_context_id"] = _context_id(payload.pop("target_context_key", None))
+            handle.write(json.dumps(payload, sort_keys=True) + "\n")

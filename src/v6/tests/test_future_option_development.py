@@ -7,6 +7,7 @@ from v6.future_options import (
     FutureOptionDevelopmentStage,
     _build_future_option_event,
     derive_future_option_events,
+    is_complete_context_key,
     resolve_future_option_development_stage,
 )
 from v6.memory.compact_memory import ensure_memory_layout
@@ -98,3 +99,37 @@ def test_event_derivation_persists_auto_stage_and_components(tmp_path: Path) -> 
         assert tuple(row)[1] is not None
         assert tuple(row)[2] == tuple(row)[1]
         assert str(tuple(row)[3]).startswith(("structural", "unverified_fallback"))
+
+
+def test_classification_provenance_and_incomplete_context_are_explicit() -> None:
+    event = _event(
+        context_key="[null,null,1]",
+        effect_type="positive_change",
+        source_family_ids={"family-1"},
+    )
+    assert event["classification_source"] == "structural_effect"
+    assert event["classification_provenance_status"] == "verified"
+    assert event["source_context_is_surrogate"] == 1
+    assert event["context_resolution_source"] == "surrogate"
+    assert str(event["source_context_key"]).startswith("surrogate_context:")
+    assert not is_complete_context_key("[null,null,1]")
+
+
+def test_future_option_edge_event_keeps_concrete_edge_provenance(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as state_conn, sqlite3.connect(memory_dir / "graph.sqlite") as graph_conn:
+        state_conn.row_factory = sqlite3.Row
+        graph_conn.row_factory = sqlite3.Row
+        state_conn.execute(
+            """INSERT INTO memory_edges (
+                source_node_id, target_node_id, edge_type, support_count, evidence_json
+            ) VALUES ('M0:interaction:11', 'M0:interaction:12', 'expands_future_options', 3, '{\"kind\":\"test\"}')"""
+        )
+        derive_future_option_events(state_conn, graph_conn, max_events=10)
+        row = state_conn.execute(
+            """SELECT classification_source, source_interaction_id, target_interaction_id,
+                      classification_provenance_status
+               FROM future_option_events WHERE source_kind = 'future_option_edge'"""
+        ).fetchone()
+    assert tuple(row) == ("future_option_edge", "11", "12", "verified")

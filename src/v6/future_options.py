@@ -64,6 +64,42 @@ def is_complete_context_key(context_key: object) -> bool:
     return value not in {"[]", "{}"}
 
 
+def _surrogate_context_key(*, event_id_seed: str, owner_type: str, owner_key: str) -> str:
+    """Stable identity for an unresolved context, never scope evidence."""
+    payload = json.dumps(
+        {"event": event_id_seed, "owner_type": owner_type, "owner_key": owner_key},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return "surrogate_context:" + sha1(payload.encode("utf-8")).hexdigest()[:20]
+
+
+def _resolved_event_context(
+    *,
+    context_key: str | None,
+    evidence_json: dict[str, Any],
+    event_id_seed: str,
+    owner_type: str,
+    owner_key: str,
+) -> tuple[str, str, int]:
+    """Resolve direct/linked context conservatively; a surrogate proves no scope."""
+    if is_complete_context_key(context_key):
+        return str(context_key), "direct_event", 0
+    for candidate in sorted(str(item) for item in _coerce_list(evidence_json.get("linked_contexts"))):
+        if is_complete_context_key(candidate):
+            source = {
+                "family": "family_interaction",
+                "carrier": "carrier_interaction",
+                "role": "role_interaction",
+            }.get(owner_type, "linked_interaction")
+            return candidate, source, 0
+    return _surrogate_context_key(
+        event_id_seed=event_id_seed,
+        owner_type=owner_type,
+        owner_key=owner_key,
+    ), "surrogate", 1
+
+
 @dataclass(frozen=True)
 class FutureOptionDelta:
     interaction_id: int
@@ -207,6 +243,12 @@ def derive_future_option_events(
     carrier_events_inserted = 0
     role_rows_seen = 0
     role_events_inserted = 0
+    structural_rows_seen = 0
+    structural_rows_eligible = 0
+    structural_rows_inserted = 0
+    structural_rows_skipped_missing_effect = 0
+    structural_rows_skipped_missing_scope = 0
+    future_option_edge_event_count = 0
 
     def add_event(payload: dict[str, Any]) -> None:
         nonlocal inserted, first_event_step
@@ -231,7 +273,7 @@ def derive_future_option_events(
                 source_context_is_surrogate, target_context_is_surrogate,
                 context_resolution_source, context_is_surrogate
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 payload["event_id"],
@@ -348,7 +390,7 @@ def derive_future_option_events(
     future_edge_by_interaction: dict[str, str] = {}
     future_edge_rows = state_conn.execute(
         """
-        SELECT source_node_id, edge_type
+        SELECT source_node_id, target_node_id, edge_type, support_count, evidence_json
         FROM memory_edges
         WHERE source_node_id LIKE 'M0:interaction:%'
           AND edge_type IN (
@@ -365,6 +407,45 @@ def derive_future_option_events(
         if edge_scan_tracker is not None:
             edge_scan_tracker.update(1)
     _close_progress_tracker(edge_scan_tracker)
+    for edge_row in future_edge_rows:
+        source_node_id = str(edge_row["source_node_id"])
+        target_node_id = str(edge_row["target_node_id"])
+        edge_type = str(edge_row["edge_type"])
+        interaction_id = _interaction_ids_from_nodes([source_node_id])
+        target_interaction_ids = _interaction_ids_from_nodes([target_node_id])
+        before_inserted = inserted
+        edge_event = _build_future_option_event(
+                owner_type="interaction",
+                owner_key=source_node_id,
+                source_kind="future_option_edge",
+                game=None,
+                sampler=None,
+                context_key=None,
+                action_key=None,
+                text_fragments=[edge_type],
+                support_count=1,
+                polarity=None,
+                first_seen=None,
+                last_seen=None,
+                mean_prediction_error=0.0,
+                mean_replay_priority=0.0,
+                stability_score=0.0,
+                event_id_seed=f"future_option_edge|{source_node_id}|{edge_type}",
+                evidence_json={
+                    "source_node_id": source_node_id,
+                    "target_node_id": target_node_id,
+                    "edge_type": edge_type,
+                    "support_count": int(edge_row["support_count"] or 0),
+                    "edge_evidence": _load_jsonish(edge_row["evidence_json"]),
+                },
+                future_option_edge_type=edge_type,
+                source_interaction_ids=interaction_id,
+                development_stage=development_stage,
+            )
+        edge_event["target_interaction_id"] = _first_id(target_interaction_ids)
+        add_event(edge_event)
+        if inserted > before_inserted:
+            future_option_edge_event_count += 1
     interaction_ids_by_family: dict[str, set[str]] = defaultdict(set)
     carrier_interaction_ids: dict[str, set[str]] = defaultdict(set)
     carrier_family_ids: dict[str, set[str]] = defaultdict(set)
@@ -447,7 +528,12 @@ def derive_future_option_events(
     family_tracker = progress_factory("derive_future_option_events transformation_families", len(family_rows), "family", False) if progress_factory else None
     for row in family_rows:
         transformation_family_rows_seen += 1
+        structural_rows_seen += 1
         family_signature = str(row["canonical_signature"])
+        if row["effect_type"] in (None, ""):
+            structural_rows_skipped_missing_effect += 1
+        else:
+            structural_rows_eligible += 1
         before_inserted = inserted
         add_event(
             _build_future_option_event(
@@ -496,6 +582,10 @@ def derive_future_option_events(
         )
         if inserted > before_inserted:
             transformation_family_events_inserted += 1
+            if row["effect_type"] not in (None, ""):
+                structural_rows_inserted += 1
+        elif row["effect_type"] not in (None, ""):
+            structural_rows_skipped_missing_scope += 1
         if family_tracker is not None:
             family_tracker.update(1)
     _close_progress_tracker(family_tracker)
@@ -639,6 +729,8 @@ def derive_future_option_events(
         if role_tracker is not None:
             role_tracker.update(1)
     _close_progress_tracker(role_tracker)
+    if structural_rows_eligible > 0 and structural_rows_inserted == 0 and int(max_events) > 0:
+        raise AssertionError("eligible structural-effect rows produced no future-option events")
     _write_future_milestone(state_conn, "first_future_option_event_step", first_event_step, None)
     return {
         "future_option_event_count": inserted,
@@ -651,6 +743,15 @@ def derive_future_option_events(
         "carrier_events_inserted": carrier_events_inserted,
         "role_rows_seen": role_rows_seen,
         "role_events_inserted": role_events_inserted,
+        "structural_effect_path_enabled": True,
+        "future_option_edge_path_enabled": True,
+        "text_keyword_path_enabled": True,
+        "structural_rows_seen": structural_rows_seen,
+        "structural_rows_eligible": structural_rows_eligible,
+        "structural_rows_inserted": structural_rows_inserted,
+        "structural_rows_skipped_missing_effect": structural_rows_skipped_missing_effect,
+        "structural_rows_skipped_missing_scope": structural_rows_skipped_missing_scope,
+        "future_option_edge_event_count": future_option_edge_event_count,
         "first_future_option_event_step": first_event_step,
     }
 
@@ -2029,8 +2130,13 @@ def _build_future_option_event(
     for key, values in provenance.items():
         evidence[key] = values
     source_game_key = None if game in (None, "") else str(game)
-    source_context_key = context_key if is_complete_context_key(context_key) else None
-    context_is_surrogate = int(context_key not in (None, "") and source_context_key is None)
+    source_context_key, context_resolution_source, context_is_surrogate = _resolved_event_context(
+        context_key=context_key,
+        evidence_json=evidence_json,
+        event_id_seed=event_id_seed,
+        owner_type=owner_type,
+        owner_key=owner_key,
+    )
     concrete_provenance = bool(
         provenance["source_interaction_ids"]
         or provenance["source_family_ids"]
@@ -2047,7 +2153,7 @@ def _build_future_option_event(
     evidence["classification_provenance_status"] = classification_provenance_status
     evidence["source_game_key"] = source_game_key
     evidence["source_context_key"] = source_context_key
-    evidence["context_resolution_source"] = "direct_event" if source_context_key else "missing"
+    evidence["context_resolution_source"] = context_resolution_source
     evidence["context_is_surrogate"] = bool(context_is_surrogate)
     components = _compute_development_components(
         option_delta=option_delta,
@@ -2124,7 +2230,7 @@ def _build_future_option_event(
         "target_game_is_surrogate": 0,
         "source_context_is_surrogate": context_is_surrogate,
         "target_context_is_surrogate": 0,
-        "context_resolution_source": "direct_event" if source_context_key else "missing",
+        "context_resolution_source": context_resolution_source,
         "context_is_surrogate": context_is_surrogate,
         "evidence_json": evidence,
     }
@@ -2323,9 +2429,9 @@ def _classify_structural_motif(
     if "terminal_transition" in effect:
         return "terminate", "structural_effect"
     if edge == "expands_future_options":
-        return "enable", "structural_option_delta"
+        return "enable", "future_option_edge"
     if edge == "restricts_future_options":
-        return "block", "structural_option_delta"
+        return "block", "future_option_edge"
     if live_option_delta is not None:
         if float(live_option_delta) > 0.0:
             return "enable", "structural_option_delta"
@@ -2352,6 +2458,7 @@ def _classification_source_from_rule(rule: str) -> str:
         "structural_graph_effect": "graph_effect",
         "structural_role_effect": "role_effect",
         "structural_concept_effect": "concept_effect",
+        "future_option_edge": "future_option_edge",
     }
     return mapping.get(str(rule), "unknown")
 
