@@ -412,6 +412,12 @@ def test_relevant_validation_reports_matched_population_and_score_components(tmp
         + 0.20 * diagnostic["compression_component"]
         + 0.15 * diagnostic["cross_scope_component"]
     )
+    assert diagnostic["adjusted_promotion_score"] == (
+        diagnostic["raw_score_contribution"] + diagnostic["validation_score_contribution"]
+    )
+    assert diagnostic["raw_score_weight"] == diagnostic["validation_score_weight"] == 0.5
+    assert diagnostic["validation_algorithm_version"] == 3
+    assert diagnostic["validation_state_reset_applied_this_run"] is False
 
 
 def test_adjusted_score_controls_incremental_promotion_gate(tmp_path: Path) -> None:
@@ -437,6 +443,26 @@ def test_adjusted_score_controls_incremental_promotion_gate(tmp_path: Path) -> N
     assert diagnostic["adjusted_promotion_score"] < diagnostic["promotion_threshold"]
     assert diagnostic["incremental_validation_promoted"] is False
     assert "below_promotion_score_threshold" in diagnostic["rejection_reasons"]
+    assert diagnostic["promotion_blocked_only_by_validation_score_contribution"] is True
+
+
+def test_score_gate_diagnostics_identify_insufficient_raw_contribution(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_functional_candidate(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute("UPDATE concept_candidates SET promotion_score = 0 WHERE concept_signature = 'concept-functional'")
+        conn.commit()
+    validate_incremental_promotions_only(
+        memory_dir=memory_dir,
+        config=IncrementalPromotionValidationConfig(enabled=True, min_relevant_heldout_event_count=1),
+        validate_roles_and_concepts=True, validate_world_models=False, diagnostic_epoch_id="epoch_1",
+    )
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        diagnostic = json.loads(conn.execute(
+            "SELECT payload_json FROM concept_promotion_validation_diagnostics"
+        ).fetchone()[0])
+    assert diagnostic["promotion_score_gate_passed"] is False
+    assert diagnostic["promotion_blocked_only_by_raw_score_contribution"] is True
 
 
 def test_retained_expansion_is_comparable_for_failure_accounting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -527,7 +553,8 @@ def test_validation_v3_reset_preserves_historical_milestone_once(tmp_path: Path)
         )
         conn.execute("DELETE FROM memory_summary WHERE key = 'incremental_promotion_validation_version'")
         conn.commit()
-    ensure_memory_layout(memory_dir)
+    first_paths = ensure_memory_layout(memory_dir)
+    assert first_paths.validation_state_reset_applied_this_run is True
     with sqlite3.connect(paths.current_state) as conn:
         row = conn.execute(
             "SELECT raw_promotion_score, promotion_failure_count, validation_status, demotion_reason, validation_penalty FROM concept_candidates WHERE concept_signature = 'concept-a'"
@@ -537,9 +564,22 @@ def test_validation_v3_reset_preserves_historical_milestone_once(tmp_path: Path)
         assert conn.execute(
             "SELECT first_global_step FROM higher_order_milestone_history WHERE milestone_name = 'first_promoted_concept_step'"
         ).fetchone()[0] == 7
+        assert json.loads(conn.execute(
+            "SELECT value_json FROM memory_summary WHERE key = 'incremental_promotion_validation_version'"
+        ).fetchone()[0]) == 3
+        assert json.loads(conn.execute(
+            "SELECT value_json FROM memory_summary WHERE key = 'incremental_promotion_validation_last_reset_version'"
+        ).fetchone()[0]) == 3
+        assert json.loads(conn.execute(
+            "SELECT value_json FROM memory_summary WHERE key = 'incremental_promotion_validation_last_reset_reason'"
+        ).fetchone()[0]) == "migration_from_global_denominator_or_broken_relevance_validation"
+        assert json.loads(conn.execute(
+            "SELECT value_json FROM memory_summary WHERE key = 'incremental_promotion_validation_last_reset_timestamp'"
+        ).fetchone()[0])
         conn.execute("UPDATE concept_candidates SET promotion_failure_count = 4 WHERE concept_signature = 'concept-a'")
         conn.commit()
-    ensure_memory_layout(memory_dir)
+    second_paths = ensure_memory_layout(memory_dir)
+    assert second_paths.validation_state_reset_applied_this_run is False
     with sqlite3.connect(paths.current_state) as conn:
         assert conn.execute("SELECT promotion_failure_count FROM concept_candidates WHERE concept_signature = 'concept-a'").fetchone()[0] == 4
 

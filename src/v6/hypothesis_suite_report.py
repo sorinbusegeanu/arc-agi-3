@@ -24,7 +24,10 @@ from v6.higher_order_substrate import (
     validate_incremental_promotions_only,
 )
 from v6.future_options import derive_future_option_memory
-from v6.memory.compact_memory import derive_missing_transformation_families_from_stable_contingencies
+from v6.memory.compact_memory import (
+    derive_missing_transformation_families_from_stable_contingencies,
+    ensure_memory_layout,
+)
 from v6.hypothesis_h05_report import evaluate_h05_role_emergence
 from v6.hypothesis_h06_report import evaluate_h06_role_transfer
 from v6.hypothesis_h07_report import evaluate_h07_concept_emergence
@@ -250,6 +253,10 @@ def run_hypothesis_suite_report(
 ) -> dict[str, Any]:
     run_dir = Path(run_dir)
     memory_dir = None if memory_dir is None else Path(memory_dir)
+    validation_state_reset_applied_this_run = (
+        ensure_memory_layout(memory_dir).validation_state_reset_applied_this_run
+        if memory_dir is not None else False
+    )
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -423,6 +430,7 @@ def run_hypothesis_suite_report(
                         validate_world_models=False,
                         diagnostic_epoch_id=epoch_id,
                         explanation_events_path=h07_dir / "h07_concept_explanation_events.jsonl",
+                        validation_state_reset_applied_this_run=validation_state_reset_applied_this_run,
                     )
                     timings["validate_concept_promotions_seconds"] = float(time.time() - t0)
             with _phase("H07"):
@@ -448,6 +456,7 @@ def run_hypothesis_suite_report(
                         validate_roles_and_concepts=False,
                         validate_world_models=True,
                         diagnostic_epoch_id=epoch_id,
+                        validation_state_reset_applied_this_run=False,
                     )
                     promotion_validation_summary["world_model_components_demoted"] = int(
                         world_validation_summary.get("world_model_components_demoted", 0) or 0

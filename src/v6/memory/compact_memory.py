@@ -5,6 +5,7 @@ import json
 import sqlite3
 import tempfile
 import shutil
+from datetime import datetime, timezone
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from hashlib import sha1
@@ -21,6 +22,7 @@ DEFAULT_MAX_EXAMPLES_PER_CONTINGENCY = 4
 DEFAULT_MAX_EXAMPLES_PER_FAMILY = 5
 DEFAULT_MAX_EXAMPLES_PER_CARRIER = 5
 DEFAULT_MAX_EXAMPLES_PER_CONTRADICTION_CLUSTER = 5
+INCREMENTAL_PROMOTION_VALIDATION_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -30,6 +32,7 @@ class CompactMemoryPaths:
     graph: Path
     replay_queue: Path
     summary_json: Path
+    validation_state_reset_applied_this_run: bool = False
 
 
 @dataclass(frozen=True)
@@ -97,7 +100,15 @@ def ensure_memory_layout(memory_dir: str | Path) -> CompactMemoryPaths:
         replay_queue=root / "replay_queue.sqlite",
         summary_json=root / "memory_summary.json",
     )
-    _ensure_current_state_schema(paths.current_state)
+    validation_state_reset_applied_this_run = _ensure_current_state_schema(paths.current_state)
+    paths = CompactMemoryPaths(
+        root=paths.root,
+        current_state=paths.current_state,
+        graph=paths.graph,
+        replay_queue=paths.replay_queue,
+        summary_json=paths.summary_json,
+        validation_state_reset_applied_this_run=validation_state_reset_applied_this_run,
+    )
     _ensure_graph_schema(paths.graph)
     _ensure_replay_schema(paths.replay_queue)
     if not paths.summary_json.exists():
@@ -5025,7 +5036,8 @@ def _normalize_carrier_timing_source(value: Any) -> str:
     return "unknown"
 
 
-def _ensure_current_state_schema(path: Path) -> None:
+def _ensure_current_state_schema(path: Path) -> bool:
+    validation_state_reset_applied_this_run = False
     with sqlite3.connect(path) as connection:
         configure_compact_sqlite_connection(connection, write=True)
         existing_tables = {
@@ -5935,7 +5947,7 @@ def _ensure_current_state_schema(path: Path) -> None:
             validation_version = int(json.loads(str(validation_version_row[0]))) if validation_version_row else 0
         except (TypeError, ValueError, json.JSONDecodeError):
             validation_version = 0
-        if validation_version < 3:
+        if validation_version < INCREMENTAL_PROMOTION_VALIDATION_VERSION:
             # v3 evaluates the adjusted score and candidate-family relevance.
             # Old global/relevance failure streaks are incomparable, but the
             # original raw derivation score and historical milestones remain.
@@ -5953,17 +5965,41 @@ def _ensure_current_state_schema(path: Path) -> None:
             )
             connection.execute("DELETE FROM concept_promotion_validation_diagnostics")
             connection.execute("DELETE FROM concept_incremental_coverage_state")
+            reset_timestamp = datetime.now(timezone.utc).isoformat()
             connection.execute(
                 """
                 INSERT INTO memory_summary (key, value_json)
                 VALUES ('incremental_promotion_validation_version', ?)
                 ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json
                 """,
-                (json.dumps(3),),
+                (json.dumps(INCREMENTAL_PROMOTION_VALIDATION_VERSION),),
             )
+            connection.execute(
+                """
+                INSERT INTO memory_summary (key, value_json)
+                VALUES
+                    ('incremental_promotion_validation_last_reset_version', ?),
+                    ('incremental_promotion_validation_last_reset_timestamp', ?),
+                    ('incremental_promotion_validation_last_reset_reason', ?)
+                ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json
+                """,
+                (
+                    json.dumps(INCREMENTAL_PROMOTION_VALIDATION_VERSION),
+                    json.dumps(reset_timestamp),
+                    json.dumps("migration_from_global_denominator_or_broken_relevance_validation"),
+                ),
+            )
+            validation_state_reset_applied_this_run = True
+            assert validation_version < INCREMENTAL_PROMOTION_VALIDATION_VERSION
+        stored_validation_version_row = connection.execute(
+            "SELECT value_json FROM memory_summary WHERE key = 'incremental_promotion_validation_version'"
+        ).fetchone()
+        stored_validation_version = int(json.loads(str(stored_validation_version_row[0])))
+        assert stored_validation_version == INCREMENTAL_PROMOTION_VALIDATION_VERSION
         connection.execute("DROP INDEX IF EXISTS idx_carrier_links_carrier_type_key")
         connection.execute("DROP INDEX IF EXISTS idx_role_neighborhood_carrier")
         connection.commit()
+    return validation_state_reset_applied_this_run
 
 
 def _ensure_graph_schema(path: Path) -> None:

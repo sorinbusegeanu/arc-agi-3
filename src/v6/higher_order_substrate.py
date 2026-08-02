@@ -11,7 +11,10 @@ from hashlib import sha1
 from pathlib import Path
 from typing import Any
 
-from v6.memory.compact_memory import ensure_memory_layout
+from v6.memory.compact_memory import (
+    INCREMENTAL_PROMOTION_VALIDATION_VERSION,
+    ensure_memory_layout,
+)
 
 
 CONCEPT_PROMOTION_SCORE_THRESHOLD = 0.55
@@ -220,6 +223,7 @@ def derive_higher_order_memory(
     progress_factory: Any | None = None,
     incremental_promotion_validation: IncrementalPromotionValidationConfig | None = None,
 ) -> dict[str, Any]:
+    schema_paths = ensure_memory_layout(memory_dir)
     role_summary = derive_role_candidates_only(
         memory_dir=memory_dir,
         run_dir=run_dir,
@@ -244,6 +248,7 @@ def derive_higher_order_memory(
             config=validation_config,
             validate_roles_and_concepts=True,
             validate_world_models=False,
+            validation_state_reset_applied_this_run=schema_paths.validation_state_reset_applied_this_run,
         )
     world_summary = derive_world_model_components_only(memory_dir=memory_dir, run_dir=run_dir, progress_factory=progress_factory)
     if validation_config.enabled:
@@ -252,6 +257,7 @@ def derive_higher_order_memory(
             config=validation_config,
             validate_roles_and_concepts=False,
             validate_world_models=True,
+            validation_state_reset_applied_this_run=False,
         )
         promotion_summary["world_model_components_demoted"] = int(
             world_promotion_summary.get("world_model_components_demoted", 0) or 0
@@ -1389,11 +1395,14 @@ def validate_incremental_promotions_only(
     validate_world_models: bool,
     diagnostic_epoch_id: str | int | None = None,
     explanation_events_path: Path | None = None,
+    validation_state_reset_applied_this_run: bool | None = None,
 ) -> dict[str, Any]:
     """Apply optional held-out validation without deleting failed candidates."""
     if not config.enabled:
         return {"incremental_promotion_validation_enabled": False}
     paths = ensure_memory_layout(memory_dir)
+    if validation_state_reset_applied_this_run is None:
+        validation_state_reset_applied_this_run = paths.validation_state_reset_applied_this_run
     with sqlite3.connect(paths.current_state) as state_conn:
         state_conn.row_factory = sqlite3.Row
         summary = _validate_incremental_promotions(
@@ -1403,6 +1412,7 @@ def validate_incremental_promotions_only(
             validate_world_models=validate_world_models,
             diagnostic_epoch_id=diagnostic_epoch_id,
             explanation_events_path=explanation_events_path,
+            validation_state_reset_applied_this_run=bool(validation_state_reset_applied_this_run),
         )
         state_conn.execute(
             """
@@ -1424,6 +1434,7 @@ def _validate_incremental_promotions(
     validate_world_models: bool,
     diagnostic_epoch_id: str | int | None,
     explanation_events_path: Path | None,
+    validation_state_reset_applied_this_run: bool,
 ) -> dict[str, Any]:
     """Calculate Phase 3 metrics from existing structures and later evidence.
 
@@ -1442,13 +1453,15 @@ def _validate_incremental_promotions(
         "roles_promoted_with_behavioral_lift": 0,
         "roles_demoted": 0,
     }
-    validation_version_row = state_conn.execute(
-        "SELECT value_json FROM memory_summary WHERE key = 'incremental_promotion_validation_version'"
+    last_reset_version_row = state_conn.execute(
+        "SELECT value_json FROM memory_summary WHERE key = 'incremental_promotion_validation_last_reset_version'"
     ).fetchone()
     try:
-        validation_state_reset_applied = int(json.loads(str(validation_version_row[0]))) >= 3 if validation_version_row else False
+        validation_state_last_reset_version = (
+            int(json.loads(str(last_reset_version_row[0]))) if last_reset_version_row else None
+        )
     except (TypeError, ValueError, json.JSONDecodeError):
-        validation_state_reset_applied = False
+        validation_state_last_reset_version = None
     role_links = _links_by_signature(state_conn, "role_links", "role_signature")
     role_explained_structures_by_role = {
         role_signature: _linked_explained_structures(links)
@@ -1737,7 +1750,11 @@ def _validate_incremental_promotions(
                 + 0.20 * compression_component
                 + 0.15 * cross_scope_component
             )
-            adjusted_promotion_score = 0.5 * promotion_score_before_validation + 0.5 * validation_score
+            raw_score_weight = 0.5
+            validation_score_weight = 0.5
+            raw_score_contribution = raw_score_weight * promotion_score_before_validation
+            validation_score_contribution = validation_score_weight * validation_score
+            adjusted_promotion_score = raw_score_contribution + validation_score_contribution
             assert all(
                 0.0 <= value <= 1.0
                 for value in (
@@ -1747,11 +1764,22 @@ def _validate_incremental_promotions(
             )
             assert math.isclose(
                 adjusted_promotion_score,
-                0.5 * promotion_score_before_validation + 0.5 * validation_score,
+                raw_score_contribution + validation_score_contribution,
                 rel_tol=0.0,
                 abs_tol=1e-12,
             )
             meets_promotion_score_threshold = adjusted_promotion_score >= float(config.promotion_score_threshold)
+            contribution_threshold = 0.5 * float(config.promotion_score_threshold)
+            promotion_blocked_only_by_raw_score_contribution = bool(
+                not meets_promotion_score_threshold
+                and validation_score_contribution >= contribution_threshold
+                and raw_score_contribution < contribution_threshold
+            )
+            promotion_blocked_only_by_validation_score_contribution = bool(
+                not meets_promotion_score_threshold
+                and raw_score_contribution >= contribution_threshold
+                and validation_score_contribution < contribution_threshold
+            )
             promoted_by_validation = (
                 has_cross_evidence
                 and has_incremental_gain
@@ -1872,6 +1900,10 @@ def _validate_incremental_promotions(
                 "cross_game_evidence_count": int(row["cross_game_count"] or 0),
                 "promotion_score": adjusted_promotion_score,
                 "raw_promotion_score": promotion_score_before_validation,
+                "raw_score_weight": raw_score_weight,
+                "validation_score_weight": validation_score_weight,
+                "raw_score_contribution": raw_score_contribution,
+                "validation_score_contribution": validation_score_contribution,
                 "adjusted_promotion_score": adjusted_promotion_score,
                 "promotion_score_before_validation": promotion_score_before_validation,
                 "coverage_component": coverage_component,
@@ -1885,14 +1917,18 @@ def _validate_incremental_promotions(
                 "validation_penalty_reasons": [],
                 "promotion_threshold": float(config.promotion_score_threshold),
                 "promotion_gate_score_used": "adjusted_promotion_score",
+                "promotion_score_gate_passed": meets_promotion_score_threshold,
+                "promotion_blocked_only_by_raw_score_contribution": promotion_blocked_only_by_raw_score_contribution,
+                "promotion_blocked_only_by_validation_score_contribution": promotion_blocked_only_by_validation_score_contribution,
                 "population_comparable": population_status == "comparable",
                 "population_change": population_change,
                 "retained_fraction_previous": functional_diagnostics["retained_fraction_previous"],
                 "retained_fraction_current": functional_diagnostics["retained_fraction_current"],
                 "relevant_prediction_event_count": functional_diagnostics["relevant_prediction_event_count"],
                 "relevant_contradiction_event_count": functional_diagnostics["relevant_behavior_event_count"],
-                "validation_algorithm_version": 3,
-                "validation_state_reset_applied": validation_state_reset_applied,
+                "validation_algorithm_version": INCREMENTAL_PROMOTION_VALIDATION_VERSION,
+                "validation_state_reset_applied_this_run": validation_state_reset_applied_this_run,
+                "validation_state_last_reset_version": validation_state_last_reset_version,
                 "legacy_promoted": legacy_promoted,
                 "incremental_validation_promoted": promoted_by_validation,
                 "promotion_retained_from_history": legacy_promoted and not promoted_by_validation and promoted,
