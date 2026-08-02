@@ -284,6 +284,31 @@ def test_prediction_and_contradiction_events_are_held_out_and_deterministic(tmp_
     )
 
 
+def test_prediction_family_overlap_makes_prediction_event_relevant(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_functional_candidate(memory_dir, include_prediction=True)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute(
+            "UPDATE prediction_results SET predicted_family = 'family-role-a', actual_family = 'family-other'"
+        )
+        conn.commit()
+
+    diagnostic = _coverage_diagnostic(memory_dir, epoch_id="epoch_1")
+
+    assert diagnostic["relevant_prediction_event_count"] == 1
+    assert diagnostic["relevant_by_family_count"] >= 1
+
+
+def test_unrelated_prediction_family_remains_outside_relevant_population(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_functional_candidate(memory_dir, include_prediction=True)
+
+    diagnostic = _coverage_diagnostic(memory_dir, epoch_id="epoch_1")
+
+    assert diagnostic["relevant_prediction_event_count"] == 0
+    assert diagnostic["unrelated_event_count"] >= 2
+
+
 def test_no_eligible_explanation_events_is_reported_separately(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
     _seed_functional_candidate(memory_dir, heldout_success=None)
@@ -377,6 +402,146 @@ def test_relevant_validation_reports_matched_population_and_score_components(tmp
         diagnostic["raw_promotion_score"] + diagnostic["validation_score"]
     )
     assert diagnostic["relevant_transfer_event_count"] == 1
+    assert diagnostic["promotion_gate_score_used"] == "adjusted_promotion_score"
+    assert diagnostic["lift_component"] == max(
+        diagnostic["prediction_component"], diagnostic["behavior_component"],
+    )
+    assert diagnostic["validation_score"] == (
+        0.35 * diagnostic["coverage_component"]
+        + 0.30 * diagnostic["lift_component"]
+        + 0.20 * diagnostic["compression_component"]
+        + 0.15 * diagnostic["cross_scope_component"]
+    )
+
+
+def test_adjusted_score_controls_incremental_promotion_gate(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_functional_candidate(memory_dir, historical_rates=((2, 0), (1, 1)), heldout_success=0)
+
+    validate_incremental_promotions_only(
+        memory_dir=memory_dir,
+        config=IncrementalPromotionValidationConfig(
+            enabled=True,
+            min_relevant_heldout_event_count=1,
+            promotion_score_threshold=0.60,
+        ),
+        validate_roles_and_concepts=True,
+        validate_world_models=False,
+        diagnostic_epoch_id="epoch_1",
+    )
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        diagnostic = json.loads(conn.execute(
+            "SELECT payload_json FROM concept_promotion_validation_diagnostics"
+        ).fetchone()[0])
+    assert diagnostic["raw_promotion_score"] > diagnostic["promotion_threshold"]
+    assert diagnostic["adjusted_promotion_score"] < diagnostic["promotion_threshold"]
+    assert diagnostic["incremental_validation_promoted"] is False
+    assert "below_promotion_score_threshold" in diagnostic["rejection_reasons"]
+
+
+def test_retained_expansion_is_comparable_for_failure_accounting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    paths = ensure_memory_layout(tmp_path / "memory")
+    template = {
+        "concept_id": "concept-a", "event_type": "transfer", "evaluation_scope": "later_global_step",
+        "lower_level_baseline_score": 0.2, "concept_enabled_score": 0.8, "_outcome": 1.0,
+        "_evaluation_global_step": 20, "_feature_global_step_max": 10,
+        "_label_used_as_feature": False, "_source_role_signature": "role-a",
+    }
+    monkeypatch.setattr(
+        higher_order_substrate, "_transfer_explanation_events",
+        lambda **_kwargs: [{**template, "event_id": f"transfer:{index}"} for index in range(3)],
+    )
+    monkeypatch.setattr(higher_order_substrate, "_future_option_motif_explanation_events", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(higher_order_substrate, "_prediction_explanation_events", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(higher_order_substrate, "_contradiction_resolution_explanation_events", lambda *_args, **_kwargs: [])
+    previous_state = {
+        "relevant_event_ids": ["transfer:0", "transfer:1"],
+        "explained_relevant_event_ids": ["transfer:0"],
+        "incremental_coverage": 0.5,
+    }
+    with sqlite3.connect(paths.current_state) as conn:
+        conn.row_factory = sqlite3.Row
+        _events, diagnostic, _state = higher_order_substrate._build_functional_explanation_diagnostics(
+            state_conn=conn, candidate_signature="concept-a", source_roles=["role-a"],
+            first_seen_global_step=10, transfer_rows=[], transfer_history=None, future_rows=[],
+            previous_state=previous_state, diagnostic_epoch_id="epoch_2",
+            config=IncrementalPromotionValidationConfig(enabled=True, min_relevant_heldout_event_count=1),
+            candidate_links={"role": {"role-a"}},
+        )
+    change = diagnostic["functional_coverage_longitudinal_change"]
+    assert change["population_change"] == "population_expansion"
+    assert change["population_comparison"] == "comparable"
+    assert diagnostic["retained_fraction_previous"] == 1.0
+
+
+def test_comparable_expansion_failure_increments_validation_state(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_functional_candidate(memory_dir)
+    config = IncrementalPromotionValidationConfig(
+        enabled=True, min_relevant_heldout_event_count=1, demotion_failure_limit=2,
+    )
+    validate_incremental_promotions_only(
+        memory_dir=memory_dir, config=config, validate_roles_and_concepts=True,
+        validate_world_models=False, diagnostic_epoch_id="epoch_1",
+    )
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute("UPDATE role_transfer_attempts SET reuse_success = 0 WHERE attempt_id = 'heldout-functional'")
+        conn.execute(
+            """INSERT INTO role_transfer_attempts (
+                attempt_id, role_signature, source_role_signature,
+                predicted_target_role_signature, observed_target_role_signature,
+                source_game_key, target_game_key, source_carrier_signature,
+                provenance_mode, provenance_status, reuse_success, last_seen_global_step
+            ) VALUES ('heldout-expanded-failure', 'role-a', 'role-a', 'role-target', 'role-target',
+                      'source-role-a', 'target-game', 'carrier-role-a', 'single_source', 'verified', 0, 21)"""
+        )
+        conn.commit()
+    validate_incremental_promotions_only(
+        memory_dir=memory_dir, config=config, validate_roles_and_concepts=True,
+        validate_world_models=False, diagnostic_epoch_id="epoch_2",
+    )
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        failures = conn.execute(
+            "SELECT failure_count FROM promotion_validation_state WHERE candidate_type = 'concept' AND candidate_signature = 'concept-functional'"
+        ).fetchone()[0]
+        diagnostic = json.loads(conn.execute(
+            "SELECT payload_json FROM concept_promotion_validation_diagnostics WHERE concept_signature = 'concept-functional'"
+        ).fetchone()[0])
+    assert diagnostic["population_change"] == "population_expansion"
+    assert diagnostic["population_comparable"] is True
+    assert failures == 1
+
+
+def test_validation_v3_reset_preserves_historical_milestone_once(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    paths = ensure_memory_layout(memory_dir)
+    with sqlite3.connect(paths.current_state) as conn:
+        conn.execute(
+            "INSERT INTO concept_candidates (concept_signature, raw_promotion_score, promotion_failure_count, validation_status, demotion_reason, validation_penalty) VALUES ('concept-a', .9, 3, 'failed', 'old', .2)"
+        )
+        conn.execute(
+            "INSERT INTO promotion_validation_state (candidate_type, candidate_signature, failure_count, promotion_status) VALUES ('concept', 'concept-a', 3, 'demoted')"
+        )
+        conn.execute(
+            "INSERT INTO higher_order_milestone_history (milestone_name, first_global_step) VALUES ('first_promoted_concept_step', 7)"
+        )
+        conn.execute("DELETE FROM memory_summary WHERE key = 'incremental_promotion_validation_version'")
+        conn.commit()
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(paths.current_state) as conn:
+        row = conn.execute(
+            "SELECT raw_promotion_score, promotion_failure_count, validation_status, demotion_reason, validation_penalty FROM concept_candidates WHERE concept_signature = 'concept-a'"
+        ).fetchone()
+        assert row == (0.9, 0, None, None, 0.0)
+        assert conn.execute("SELECT COUNT(*) FROM promotion_validation_state WHERE candidate_type = 'concept'").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT first_global_step FROM higher_order_milestone_history WHERE milestone_name = 'first_promoted_concept_step'"
+        ).fetchone()[0] == 7
+        conn.execute("UPDATE concept_candidates SET promotion_failure_count = 4 WHERE concept_signature = 'concept-a'")
+        conn.commit()
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(paths.current_state) as conn:
+        assert conn.execute("SELECT promotion_failure_count FROM concept_candidates WHERE concept_signature = 'concept-a'").fetchone()[0] == 4
 
 
 def test_relevance_requires_structural_overlap_not_game_or_context_only() -> None:

@@ -5393,6 +5393,8 @@ def _ensure_current_state_schema(path: Path) -> None:
                 validation_explanatory_gain REAL,
                 validation_evidence_count INTEGER,
                 validation_status TEXT,
+                validation_penalty REAL DEFAULT 0,
+                demotion_reason TEXT,
                 promotion_status TEXT,
                 promotion_failure_count INTEGER DEFAULT 0
             );
@@ -5775,6 +5777,8 @@ def _ensure_current_state_schema(path: Path) -> None:
         _ensure_column(connection, "concept_candidates", "validation_transfer_lift", "REAL")
         _ensure_column(connection, "concept_candidates", "validation_evidence_count", "INTEGER")
         _ensure_column(connection, "concept_candidates", "validation_status", "TEXT")
+        _ensure_column(connection, "concept_candidates", "validation_penalty", "REAL DEFAULT 0")
+        _ensure_column(connection, "concept_candidates", "demotion_reason", "TEXT")
         _ensure_column(connection, "concept_candidates", "promotion_status", "TEXT")
         _ensure_column(connection, "concept_candidates", "promotion_failure_count", "INTEGER DEFAULT 0")
         _ensure_column(connection, "concept_candidates", "raw_promotion_score", "REAL")
@@ -5923,6 +5927,39 @@ def _ensure_current_state_schema(path: Path) -> None:
                 VALUES ('incremental_promotion_relevance_migration_v2', ?)
                 """,
                 (json.dumps({"rebuild_required": True, "schema": "relevant_heldout_population_v2"}, sort_keys=True),),
+            )
+        validation_version_row = connection.execute(
+            "SELECT value_json FROM memory_summary WHERE key = 'incremental_promotion_validation_version'"
+        ).fetchone()
+        try:
+            validation_version = int(json.loads(str(validation_version_row[0]))) if validation_version_row else 0
+        except (TypeError, ValueError, json.JSONDecodeError):
+            validation_version = 0
+        if validation_version < 3:
+            # v3 evaluates the adjusted score and candidate-family relevance.
+            # Old global/relevance failure streaks are incomparable, but the
+            # original raw derivation score and historical milestones remain.
+            connection.execute(
+                """
+                UPDATE concept_candidates
+                SET promotion_failure_count = 0,
+                    validation_status = NULL,
+                    demotion_reason = NULL,
+                    validation_penalty = 0
+                """
+            )
+            connection.execute(
+                "DELETE FROM promotion_validation_state WHERE candidate_type = 'concept'"
+            )
+            connection.execute("DELETE FROM concept_promotion_validation_diagnostics")
+            connection.execute("DELETE FROM concept_incremental_coverage_state")
+            connection.execute(
+                """
+                INSERT INTO memory_summary (key, value_json)
+                VALUES ('incremental_promotion_validation_version', ?)
+                ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json
+                """,
+                (json.dumps(3),),
             )
         connection.execute("DROP INDEX IF EXISTS idx_carrier_links_carrier_type_key")
         connection.execute("DROP INDEX IF EXISTS idx_role_neighborhood_carrier")

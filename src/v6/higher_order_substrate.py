@@ -1442,6 +1442,13 @@ def _validate_incremental_promotions(
         "roles_promoted_with_behavioral_lift": 0,
         "roles_demoted": 0,
     }
+    validation_version_row = state_conn.execute(
+        "SELECT value_json FROM memory_summary WHERE key = 'incremental_promotion_validation_version'"
+    ).fetchone()
+    try:
+        validation_state_reset_applied = int(json.loads(str(validation_version_row[0]))) >= 3 if validation_version_row else False
+    except (TypeError, ValueError, json.JSONDecodeError):
+        validation_state_reset_applied = False
     role_links = _links_by_signature(state_conn, "role_links", "role_signature")
     role_explained_structures_by_role = {
         role_signature: _linked_explained_structures(links)
@@ -1595,9 +1602,12 @@ def _validate_incremental_promotions(
             relevance_links: dict[str, set[str]] = defaultdict(set)
             for link_type, identifiers in links.items():
                 relevance_links[link_type].update(identifiers)
+            relevance_links["_candidate_family"].update(links.get("family", set()))
             for role in roles:
                 for link_type, identifiers in role_links.get(role, {}).items():
                     relevance_links[link_type].update(identifiers)
+                    if link_type == "family":
+                        relevance_links["_candidate_role_family"].update(identifiers)
             relevance_links_by_candidate[concept_signature] = {
                 link_type: set(identifiers)
                 for link_type, identifiers in relevance_links.items()
@@ -1703,7 +1713,45 @@ def _validate_incremental_promotions(
                 if row["raw_promotion_score"] is not None
                 else row["promotion_score"] or 0.0
             )
-            meets_promotion_score_threshold = promotion_score_before_validation >= float(config.promotion_score_threshold)
+            coverage_component = min(1.0, incremental_coverage / max(required_functional_coverage, 1e-12))
+            prediction_component = min(
+                1.0,
+                max(0.0, float(validation_prediction_lift or 0.0))
+                / max(float(config.min_behavioral_or_predictive_lift), 1e-12),
+            )
+            behavior_component = min(
+                1.0,
+                max(0.0, float(validation_action_selection_lift or 0.0))
+                / max(float(config.min_behavioral_or_predictive_lift), 1e-12),
+            )
+            lift_component = max(prediction_component, behavior_component)
+            compression_component = 1.0 if has_positive_compression else 0.0
+            cross_scope_component = min(
+                1.0,
+                max(int(row["cross_context_count"] or 0), int(row["cross_game_count"] or 0))
+                / max(1, int(config.min_cross_context_or_game_evidence)),
+            )
+            validation_score = (
+                0.35 * coverage_component
+                + 0.30 * lift_component
+                + 0.20 * compression_component
+                + 0.15 * cross_scope_component
+            )
+            adjusted_promotion_score = 0.5 * promotion_score_before_validation + 0.5 * validation_score
+            assert all(
+                0.0 <= value <= 1.0
+                for value in (
+                    coverage_component, prediction_component, behavior_component, lift_component,
+                    compression_component, cross_scope_component, validation_score,
+                )
+            )
+            assert math.isclose(
+                adjusted_promotion_score,
+                0.5 * promotion_score_before_validation + 0.5 * validation_score,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+            meets_promotion_score_threshold = adjusted_promotion_score >= float(config.promotion_score_threshold)
             promoted_by_validation = (
                 has_cross_evidence
                 and has_incremental_gain
@@ -1715,7 +1763,6 @@ def _validate_incremental_promotions(
                 population_matched
                 and has_relevant_samples
                 and population_status == "comparable"
-                and population_change == "unchanged"
                 and not promoted_by_validation
             )
             if not population_matched:
@@ -1746,32 +1793,7 @@ def _validate_incremental_promotions(
                 validation_result=validation_status,
             )
             promoted = bool(promoted_by_validation or (legacy_promoted and not demoted_this_validation))
-            coverage_component = min(1.0, incremental_coverage / max(required_functional_coverage, 1e-12))
-            prediction_component = min(
-                1.0,
-                max(0.0, float(validation_prediction_lift or 0.0))
-                / max(float(config.min_behavioral_or_predictive_lift), 1e-12),
-            )
-            behavior_component = min(
-                1.0,
-                max(0.0, float(validation_action_selection_lift or 0.0))
-                / max(float(config.min_behavioral_or_predictive_lift), 1e-12),
-            )
-            compression_component = 1.0 if has_positive_compression else 0.0
-            cross_scope_component = min(
-                1.0,
-                max(int(row["cross_context_count"] or 0), int(row["cross_game_count"] or 0))
-                / max(1, int(config.min_cross_context_or_game_evidence)),
-            )
-            validation_score = (
-                0.30 * coverage_component
-                + 0.20 * prediction_component
-                + 0.20 * behavior_component
-                + 0.20 * compression_component
-                + 0.10 * cross_scope_component
-            )
             validation_penalty = 0.0
-            adjusted_promotion_score = 0.5 * promotion_score_before_validation + 0.5 * validation_score
             state_conn.execute(
                 """
                 UPDATE concept_candidates
@@ -1781,7 +1803,7 @@ def _validate_incremental_promotions(
                     validation_prediction_lift = ?, validation_action_selection_lift = ?,
                     validation_transfer_lift = ?, validation_evidence_count = ?,
                     promotion_status = ?, promotion_failure_count = ?, promotion_score = ?, raw_promotion_score = ?, is_promoted = ?,
-                    validation_status = ?
+                    validation_status = ?, validation_penalty = ?, demotion_reason = ?
                 WHERE concept_signature = ?
                 """,
                 (
@@ -1791,7 +1813,9 @@ def _validate_incremental_promotions(
                     validation_evidence_count,
                     ("promoted" if promoted_by_validation else "retained" if promoted else "demoted" if demoted_this_validation else "candidate"),
                     failure_count, adjusted_promotion_score, promotion_score_before_validation,
-                    int(promoted), validation_status, concept_signature,
+                    int(promoted), validation_status, validation_penalty,
+                    "demoted_after_repeated_failure" if demoted_this_validation else None,
+                    concept_signature,
                 ),
             )
             demoted = status == "demoted"
@@ -1853,12 +1877,22 @@ def _validate_incremental_promotions(
                 "coverage_component": coverage_component,
                 "prediction_component": prediction_component,
                 "behavior_component": behavior_component,
+                "lift_component": lift_component,
                 "compression_component": compression_component,
                 "cross_scope_component": cross_scope_component,
                 "validation_score": validation_score,
                 "validation_penalty": validation_penalty,
                 "validation_penalty_reasons": [],
                 "promotion_threshold": float(config.promotion_score_threshold),
+                "promotion_gate_score_used": "adjusted_promotion_score",
+                "population_comparable": population_status == "comparable",
+                "population_change": population_change,
+                "retained_fraction_previous": functional_diagnostics["retained_fraction_previous"],
+                "retained_fraction_current": functional_diagnostics["retained_fraction_current"],
+                "relevant_prediction_event_count": functional_diagnostics["relevant_prediction_event_count"],
+                "relevant_contradiction_event_count": functional_diagnostics["relevant_behavior_event_count"],
+                "validation_algorithm_version": 3,
+                "validation_state_reset_applied": validation_state_reset_applied,
                 "legacy_promoted": legacy_promoted,
                 "incremental_validation_promoted": promoted_by_validation,
                 "promotion_retained_from_history": legacy_promoted and not promoted_by_validation and promoted,
@@ -2398,12 +2432,20 @@ def _prediction_explanation_events(
     if first_seen_global_step is None or not source_roles or not required <= columns:
         return []
     selected = "id, global_step, context_signature, predicted_family, actual_family"
+    source_role_family_ids = sorted({
+        str(family)
+        for role in source_roles
+        for family in role_links.get(role, {}).get("family", set())
+        if family not in (None, "")
+    })
     events: list[dict[str, Any]] = []
     for row in state_conn.execute(
         f"SELECT {selected} FROM prediction_results WHERE global_step > ? ORDER BY global_step ASC, id ASC",
         (first_seen_global_step,),
     ).fetchall():
         context = str(row["context_signature"] or "")
+        predicted_family = str(row["predicted_family"] or "")
+        actual_family = str(row["actual_family"] or "")
         step = int(row["global_step"])
         rates = [
             _prior_role_success_rate(
@@ -2416,12 +2458,15 @@ def _prediction_explanation_events(
         ]
         baseline = max(rates, default=0.0)
         concept_score = _combined_role_score(rates) if len(rates) >= 2 else baseline
-        outcome = float(row["predicted_family"] == row["actual_family"])
+        outcome = float(predicted_family == actual_family)
         events.append({
             "concept_id": candidate_signature,
             "event_id": f"prediction:prediction_result:{row['id']}:later_global_step",
             "event_type": "prediction",
             "evaluation_scope": "later_global_step",
+            "predicted_family": predicted_family,
+            "actual_family": actual_family,
+            "candidate_role_family_ids": source_role_family_ids,
             "best_single_role_score": baseline,
             "lower_level_baseline_score": baseline,
             "concept_enabled_score": concept_score,
@@ -2440,6 +2485,7 @@ def _prediction_explanation_events(
             ),
             "_label_used_as_feature": False,
             "_context_keys": [context] if context else [],
+            "_family_ids": [family for family in (predicted_family, actual_family) if family],
         })
     return events
 
@@ -2460,9 +2506,19 @@ def _contradiction_resolution_explanation_events(
     if first_seen_global_step is None or not source_roles or not required <= columns:
         return []
     events: list[dict[str, Any]] = []
+    source_role_family_ids = sorted({
+        str(family)
+        for role in source_roles
+        for family in role_links.get(role, {}).get("family", set())
+        if family not in (None, "")
+    })
+    available_family_columns = {"predicted_family", "actual_family"} <= columns
+    selected = "id, global_step, context_signature, context_contradiction"
+    if available_family_columns:
+        selected += ", predicted_family, actual_family"
     for row in state_conn.execute(
-        """
-        SELECT id, global_step, context_signature, context_contradiction
+        f"""
+        SELECT {selected}
         FROM prediction_results
         WHERE global_step > ? AND COALESCE(context_contradiction, 0) = 1
         ORDER BY global_step ASC, id ASC
@@ -2470,6 +2526,8 @@ def _contradiction_resolution_explanation_events(
         (first_seen_global_step,),
     ).fetchall():
         step = int(row["global_step"])
+        predicted_family = str(row["predicted_family"] or "") if available_family_columns else ""
+        actual_family = str(row["actual_family"] or "") if available_family_columns else ""
         failure_rates = [
             1.0 - _prior_role_success_rate(
                 transfer_rows,
@@ -2486,6 +2544,9 @@ def _contradiction_resolution_explanation_events(
             "event_id": f"contradiction_resolution:{row['id']}:later_global_step",
             "event_type": "contradiction_resolution",
             "evaluation_scope": "later_global_step",
+            "predicted_family": predicted_family,
+            "actual_family": actual_family,
+            "candidate_role_family_ids": source_role_family_ids,
             "best_single_role_score": baseline,
             "lower_level_baseline_score": baseline,
             "concept_enabled_score": concept_score,
@@ -2504,6 +2565,7 @@ def _contradiction_resolution_explanation_events(
             ),
             "_label_used_as_feature": False,
             "_context_keys": [str(row["context_signature"] or "")] if row["context_signature"] else [],
+            "_family_ids": [family for family in (predicted_family, actual_family) if family],
         })
     return events
 
@@ -2594,7 +2656,12 @@ def _event_relevance_reasons(
         str(event.get("_observed_target_role_signature") or ""),
     } & roles:
         reasons.append("target_role_overlap")
-    if set(str(value) for value in event.get("_family_ids", ()) if value) & set(candidate_links.get("family", set())):
+    family_ids = set(str(value) for value in event.get("_family_ids", ()) if value)
+    candidate_family_overlap = bool(family_ids & set(candidate_links.get("_candidate_family", set())))
+    candidate_role_family_overlap = bool(family_ids & set(candidate_links.get("_candidate_role_family", set())))
+    event["candidate_family_overlap"] = candidate_family_overlap
+    event["candidate_role_family_overlap"] = candidate_role_family_overlap
+    if family_ids & set(candidate_links.get("family", set())):
         reasons.append("family_overlap")
     if set(str(value) for value in event.get("_carrier_ids", ()) if value) & set(candidate_links.get("carrier", set())):
         reasons.append("carrier_overlap")
