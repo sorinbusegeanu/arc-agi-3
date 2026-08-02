@@ -85,9 +85,16 @@ def _provenance_memory(tmp_path: Path) -> tuple[Path, sqlite3.Connection, sqlite
             transfer_score, best_margin, source_carrier_count, candidate_role_count,
             source_role_signature, predicted_target_role_signature, observed_target_role_signature,
             source_game_key, target_game_key, source_context_key, target_context_key,
+            source_interaction_id, target_interaction_id,
+            source_game_is_surrogate, target_game_is_surrogate,
+            source_context_is_surrogate, target_context_is_surrogate,
+            source_game_resolution_source, target_game_resolution_source,
+            source_context_resolution_source, target_context_resolution_source,
             source_carrier_signature, provenance_mode, provenance_status
         ) VALUES ('attempt-1', 'role-1', 'cross_game', 1, 0.9, 0.9, 0.2, 2, 2,
                   'role-1', 'role-1', 'role-1', 'g1', 'g2', 'ctx1', 'ctx2',
+                  'source-interaction-1', 'target-interaction-1', 0, 0, 0, 0,
+                  'interaction', 'interaction', 'interaction', 'interaction',
                   'carrier-1', 'single_source', 'verified')"""
     )
     state_conn.commit()
@@ -218,6 +225,118 @@ def test_transfer_metrics_distinguish_unique_roles_from_motif_role_associations(
         assert summary["motif_role_link_count"] == 2
         assert summary["motif_role_transfer_attempt_link_count"] == 2
         assert summary["motif_role_concept_link_count"] == 2
+    finally:
+        state_conn.close()
+        graph_conn.close()
+
+
+def test_h11_retained_persistent_concept_state_remains_verified(tmp_path: Path) -> None:
+    _, state_conn, graph_conn = _provenance_memory(tmp_path)
+    try:
+        state_conn.execute(
+            """UPDATE concept_candidates
+               SET is_promoted = 0, promotion_status = 'candidate', validation_status = NULL
+               WHERE concept_signature = 'concept-1'"""
+        )
+        state_conn.execute(
+            """INSERT INTO concept_promotion_state (
+                concept_signature, historically_promoted, currently_promoted,
+                promotion_status, validation_status, first_promoted_global_step
+            ) VALUES ('concept-1', 1, 1, 'retained', 'passed', 3)"""
+        )
+        _seed_verified_transfer_motif(state_conn)
+        derive_future_option_transfer_links(state_conn)
+        row = state_conn.execute(
+            """SELECT concept_validation_status, concept_resolution_mode
+               FROM future_option_transfer_links"""
+        ).fetchone()
+        assert tuple(row) == ("verified", "direct_role")
+    finally:
+        state_conn.close()
+        graph_conn.close()
+
+
+def test_h11_indirect_role_concept_resolution_uses_shared_carrier_only_without_direct_link(tmp_path: Path) -> None:
+    _, state_conn, graph_conn = _provenance_memory(tmp_path)
+    try:
+        state_conn.execute(
+            "DELETE FROM concept_links WHERE concept_signature = 'concept-1' AND linked_type = 'role'"
+        )
+        state_conn.execute(
+            """INSERT INTO concept_links (concept_signature, linked_type, linked_key, support_count)
+               VALUES ('concept-1', 'carrier', 'carrier-1', 1)"""
+        )
+        _seed_verified_transfer_motif(state_conn)
+        summary = derive_future_option_transfer_links(state_conn)
+        row = state_conn.execute(
+            """SELECT concept_signature, concept_resolution_mode, shared_carrier_count,
+                      shared_family_count, concept_validation_status
+               FROM future_option_transfer_links"""
+        ).fetchone()
+        assert tuple(row) == ("concept-1", "shared_carrier", 1, 0, "verified")
+        assert summary["roles_resolved_via_shared_carrier"] == 1
+        assert summary["h11_links_using_indirect_concept_resolution"] == 1
+        assert summary["indirect_verified_chain_count"] == 1
+    finally:
+        state_conn.close()
+        graph_conn.close()
+
+
+def test_h11_indirect_role_concept_resolution_uses_shared_family_deterministically(tmp_path: Path) -> None:
+    _, state_conn, graph_conn = _provenance_memory(tmp_path)
+    try:
+        state_conn.execute(
+            "DELETE FROM concept_links WHERE concept_signature = 'concept-1' AND linked_type = 'role'"
+        )
+        state_conn.execute(
+            """INSERT INTO role_links (role_signature, linked_type, linked_key, support_count)
+               VALUES ('role-1', 'family', 'family-1', 1)"""
+        )
+        state_conn.execute(
+            """INSERT INTO concept_links (concept_signature, linked_type, linked_key, support_count)
+               VALUES ('concept-1', 'family', 'family-1', 1)"""
+        )
+        state_conn.execute("UPDATE concept_candidates SET promotion_score = 1.0 WHERE concept_signature = 'concept-1'")
+        state_conn.execute(
+            """INSERT INTO concept_candidates (concept_signature, support_count, is_promoted,
+                                                  promotion_status, validation_status, promotion_score)
+               VALUES ('concept-z', 1, 1, 'promoted', 'passed', 1.0)"""
+        )
+        state_conn.execute(
+            """INSERT INTO concept_links (concept_signature, linked_type, linked_key, support_count)
+               VALUES ('concept-z', 'family', 'family-1', 1)"""
+        )
+        _seed_verified_transfer_motif(state_conn)
+        derive_future_option_transfer_links(state_conn)
+        row = state_conn.execute(
+            """SELECT concept_signature, concept_resolution_mode, shared_family_count
+               FROM future_option_transfer_links"""
+        ).fetchone()
+        # Identical structural evidence is resolved by lexical concept signature.
+        assert tuple(row) == ("concept-1", "shared_family", 1)
+    finally:
+        state_conn.close()
+        graph_conn.close()
+
+
+def test_h11_does_not_resolve_unrelated_indirect_concept(tmp_path: Path) -> None:
+    _, state_conn, graph_conn = _provenance_memory(tmp_path)
+    try:
+        state_conn.execute(
+            "DELETE FROM concept_links WHERE concept_signature = 'concept-1' AND linked_type = 'role'"
+        )
+        state_conn.execute(
+            """INSERT INTO concept_links (concept_signature, linked_type, linked_key, support_count)
+               VALUES ('concept-1', 'family', 'unrelated-family', 1)"""
+        )
+        _seed_verified_transfer_motif(state_conn)
+        summary = derive_future_option_transfer_links(state_conn)
+        row = state_conn.execute(
+            """SELECT concept_signature, concept_resolution_mode
+               FROM future_option_transfer_links"""
+        ).fetchone()
+        assert tuple(row) == ("__none__", "missing")
+        assert summary["roles_still_without_concept"] == 1
     finally:
         state_conn.close()
         graph_conn.close()
@@ -418,3 +537,102 @@ def test_motif_provenance_resolves_direct_and_structural_paths(tmp_path: Path) -
     finally:
         state_conn.close()
         graph_conn.close()
+
+
+def _seed_many_h11_links(memory_dir: Path, *, count: int = 205) -> None:
+    paths = ensure_memory_layout(memory_dir)
+    with sqlite3.connect(paths.current_state) as conn:
+        for index in range(count):
+            motif = f"motif-{index:04d}"
+            conn.execute(
+                """INSERT INTO future_option_motifs (
+                    motif_signature, motif_type, support_count, motif_stability_score, is_emergent
+                ) VALUES (?, 'enable', 3, 0.8, 1)""",
+                (motif,),
+            )
+            conn.execute(
+                """INSERT INTO future_option_transfer_links (
+                    motif_signature, role_signature, concept_signature,
+                    transfer_attempt_count, successful_transfer_count,
+                    strong_transfer_success_count, promoted_concept_count,
+                    mean_transfer_score, mean_best_margin, source_role_signature,
+                    source_game_key, target_game_key, source_context_key, target_context_key,
+                    provenance_mode, motif_provenance_status,
+                    transfer_provenance_status, concept_validation_status,
+                    motif_provenance_resolution_path, first_seen_global_step, last_seen_global_step
+                ) VALUES (?, 'role-1', 'concept-1', 1, 1, 1, 1, 0.9, 0.2, 'role-1',
+                          'source-game', 'target-game', 'a very long source context key',
+                          'a very long target context key', 'single_source', 'verified',
+                          'verified', 'verified', 'motif_to_interaction', 1, 2)""",
+                (motif,),
+            )
+
+
+def test_h11_streams_full_provenance_and_bounds_main_report(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_many_h11_links(memory_dir)
+    output_dir = tmp_path / "h11"
+    result = evaluate_h11_future_option_transfer_concepts(
+        memory_dir=memory_dir,
+        run_dir=None,
+        output_dir=output_dir,
+        already_derived=True,
+        max_main_report_bytes=1_000_000,
+    )
+    main = json.loads((output_dir / "h11_future_option_transfer_concepts_report.json").read_text(encoding="utf-8"))
+    provenance_rows = [json.loads(line) for line in (output_dir / "h11_transfer_chain_provenance.jsonl").read_text(encoding="utf-8").splitlines()]
+    context_rows = [json.loads(line) for line in (output_dir / "h11_context_lookup.jsonl").read_text(encoding="utf-8").splitlines()]
+    game_pairs = [json.loads(line) for line in (output_dir / "h11_transfer_by_game_pair.jsonl").read_text(encoding="utf-8").splitlines()]
+    context_pairs = [json.loads(line) for line in (output_dir / "h11_transfer_by_context_pair.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert result["future_option_transfer_link_count"] == 205
+    assert main["motif_transfer_chain_provenance_total_count"] == 205
+    assert main["motif_transfer_chain_provenance_sample_count"] == 200
+    assert main["motif_transfer_chain_provenance_truncated"] is True
+    assert main["motif_transfer_chain_provenance_is_sample"] is True
+    assert len(main["motif_transfer_chain_provenance"]) == 200
+    assert [row["motif_signature"] for row in main["motif_transfer_chain_provenance_sample"][:3]] == [
+        "motif-0000", "motif-0001", "motif-0002"
+    ]
+    assert len(provenance_rows) == 205
+    assert len(context_rows) == 2
+    assert len({row["transfer_pair_id"] for row in provenance_rows}) == 1
+    assert len(game_pairs) == len(context_pairs) == 1
+    assert game_pairs[0]["link_count"] == context_pairs[0]["link_count"] == 205
+    assert all(
+        row["source_context_id"] in {item["context_id"] for item in context_rows}
+        and row["target_context_id"] in {item["context_id"] for item in context_rows}
+        for row in provenance_rows
+    )
+    assert (output_dir / "h11_future_option_transfer_concepts_report.json").stat().st_size <= 1_000_000
+
+
+def test_h11_detail_controls_preserve_decision_and_counters(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_many_h11_links(memory_dir, count=3)
+    detailed = evaluate_h11_future_option_transfer_concepts(
+        memory_dir=memory_dir,
+        run_dir=None,
+        output_dir=tmp_path / "detailed",
+        already_derived=True,
+    )
+    sampled = evaluate_h11_future_option_transfer_concepts(
+        memory_dir=memory_dir,
+        run_dir=None,
+        output_dir=tmp_path / "sampled",
+        already_derived=True,
+        provenance_sample_limit=0,
+        write_full_provenance_jsonl=False,
+    )
+    for key in (
+        "decision",
+        "future_option_transfer_link_count",
+        "verified_future_option_transfer_count",
+        "verified_cross_game_pair_count",
+        "fully_verified_emergent_chain_count",
+    ):
+        assert sampled[key] == detailed[key]
+    assert sampled["motif_transfer_chain_provenance_sample"] == []
+    assert sampled["motif_transfer_chain_provenance_sample_count"] == 0
+    assert not (tmp_path / "sampled" / "h11_transfer_chain_provenance.jsonl").exists()
+    assert (tmp_path / "sampled" / "h11_transfer_by_game_pair.jsonl").exists()
+    assert (tmp_path / "sampled" / "h11_transfer_by_context_pair.jsonl").exists()

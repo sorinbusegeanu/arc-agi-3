@@ -632,6 +632,10 @@ def build_parser() -> argparse.ArgumentParser:
     hypothesis_suite.add_argument("--promotion-min-relevant-heldout-event-count", type=int, default=20)
     hypothesis_suite.add_argument("--promotion-population-comparability-threshold", type=float, default=0.80)
     hypothesis_suite.add_argument("--promotion-demotion-failure-limit", type=int, default=2)
+    hypothesis_suite.add_argument("--h11-provenance-sample-limit", type=_parse_non_negative_int, default=200)
+    hypothesis_suite.add_argument("--h11-write-full-provenance-jsonl", dest="h11_write_full_provenance_jsonl", action="store_true", default=True)
+    hypothesis_suite.add_argument("--no-h11-write-full-provenance-jsonl", dest="h11_write_full_provenance_jsonl", action="store_false")
+    hypothesis_suite.add_argument("--max-h11-main-report-bytes", type=int, default=5_000_000)
 
     continuous = subparsers.add_parser("continuous-research-run")
     continuous.add_argument("--experiment-name", required=True)
@@ -742,6 +746,10 @@ def build_parser() -> argparse.ArgumentParser:
     continuous.add_argument("--promotion-min-relevant-heldout-event-count", type=int, default=20)
     continuous.add_argument("--promotion-population-comparability-threshold", type=float, default=0.80)
     continuous.add_argument("--promotion-demotion-failure-limit", type=int, default=2)
+    continuous.add_argument("--h11-provenance-sample-limit", type=_parse_non_negative_int, default=200)
+    continuous.add_argument("--h11-write-full-provenance-jsonl", dest="h11_write_full_provenance_jsonl", action="store_true", default=True)
+    continuous.add_argument("--no-h11-write-full-provenance-jsonl", dest="h11_write_full_provenance_jsonl", action="store_false")
+    continuous.add_argument("--max-h11-main-report-bytes", type=int, default=5_000_000)
     continuous.add_argument("--memory-query-enabled", action="store_true")
     continuous.add_argument("--memory-action-selection-enabled", action="store_true")
     continuous.add_argument("--restore-compact-graph", action="store_true")
@@ -1652,6 +1660,9 @@ def main(argv: list[str] | None = None) -> int:
             promotion_min_relevant_heldout_event_count=int(args.promotion_min_relevant_heldout_event_count),
             promotion_population_comparability_threshold=float(args.promotion_population_comparability_threshold),
             promotion_demotion_failure_limit=int(args.promotion_demotion_failure_limit),
+            h11_provenance_sample_limit=int(args.h11_provenance_sample_limit),
+            h11_write_full_provenance_jsonl=bool(args.h11_write_full_provenance_jsonl),
+            max_h11_main_report_bytes=int(args.max_h11_main_report_bytes),
             hypothesis_progress=args.hypothesis_progress,
             hypothesis_progress_log_every=int(args.hypothesis_progress_log_every),
         )
@@ -1747,6 +1758,9 @@ def main(argv: list[str] | None = None) -> int:
             promotion_min_relevant_heldout_event_count=int(args.promotion_min_relevant_heldout_event_count),
             promotion_population_comparability_threshold=float(args.promotion_population_comparability_threshold),
             promotion_demotion_failure_limit=int(args.promotion_demotion_failure_limit),
+            h11_provenance_sample_limit=int(args.h11_provenance_sample_limit),
+            h11_write_full_provenance_jsonl=bool(args.h11_write_full_provenance_jsonl),
+            max_h11_main_report_bytes=int(args.max_h11_main_report_bytes),
             hypothesis_progress=bool(args.hypothesis_progress),
             hypothesis_progress_log_every=int(args.hypothesis_progress_log_every),
             memory_query_enabled=bool(args.memory_query_enabled),
@@ -1913,6 +1927,13 @@ def _parse_csv_str(value: str) -> list[str]:
 
 def _parse_csv_int(value: str) -> list[int]:
     return [int(item) for item in _parse_csv_str(value)]
+
+
+def _parse_non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be non-negative")
+    return parsed
 
 
 if __name__ == "__main__":

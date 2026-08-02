@@ -57,6 +57,8 @@ def evaluate_h06_role_transfer(
                    attempts.source_scope_key, attempts.target_scope_type, attempts.target_scope_key,
                    attempts.source_game_key, attempts.target_game_key,
                    attempts.source_context_key, attempts.target_context_key,
+                   attempts.source_game_is_surrogate, attempts.target_game_is_surrogate,
+                   attempts.source_context_is_surrogate, attempts.target_context_is_surrogate,
                    attempts.source_carrier_signature, attempts.source_role_signature,
                    attempts.predicted_target_role_signature, attempts.observed_target_role_signature,
                    attempts.provenance_mode, attempts.provenance_status,
@@ -79,7 +81,11 @@ def evaluate_h06_role_transfer(
     legacy_rows = [row for row, error in zip(rows, provenance_errors, strict=True) if error == "legacy_transfer_provenance"]
     invalid_rows = [row for row, error in zip(rows, provenance_errors, strict=True) if error not in (None, "legacy_transfer_provenance")]
     provenance_valid_rows = [row for row, error in zip(rows, provenance_errors, strict=True) if error is None]
-    verified_rows = [row for row in provenance_valid_rows if str(row["provenance_mode"] or "") == "single_source"]
+    verified_rows = [
+        row for row in provenance_valid_rows
+        if str(row["provenance_mode"] or "") == "single_source"
+        and str(row["provenance_status"] or "") == "verified"
+    ]
     multi_source_rows = [row for row in provenance_valid_rows if str(row["provenance_mode"] or "") == "multi_source"]
     valid_rows = verified_rows
     success_rows = [row for row in valid_rows if int(row["reuse_success"] or 0) == 1]
@@ -337,6 +343,8 @@ def _transfer_provenance_error(row: sqlite3.Row) -> str | None:
             return "missing_source_game"
         if not target_game:
             return "missing_target_game"
+        if int(row["source_game_is_surrogate"] or 0) or int(row["target_game_is_surrogate"] or 0):
+            return None
         if str(source_game) == str(target_game):
             return "same_game_marked_cross_game"
         return None
@@ -345,9 +353,16 @@ def _transfer_provenance_error(row: sqlite3.Row) -> str | None:
             return "missing_source_context"
         if not target_context:
             return "missing_target_context"
+        if int(row["source_context_is_surrogate"] or 0) or int(row["target_context_is_surrogate"] or 0):
+            return None
         if str(source_context) == str(target_context):
             return "same_context_marked_cross_context"
-        if source_game and target_game and str(source_game) != str(target_game):
+        if (
+            source_game and target_game
+            and not int(row["source_game_is_surrogate"] or 0)
+            and not int(row["target_game_is_surrogate"] or 0)
+            and str(source_game) != str(target_game)
+        ):
             return "cross_game_context_transfer_not_supported"
         return None
     return "unknown_transfer_kind"

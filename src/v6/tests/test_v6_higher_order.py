@@ -109,7 +109,12 @@ def _coverage_diagnostic(memory_dir: Path, *, epoch_id: str) -> dict:
     )
     with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
         payload_json = conn.execute(
-            "SELECT payload_json FROM concept_promotion_validation_diagnostics ORDER BY concept_signature ASC LIMIT 1"
+            """
+            SELECT payload_json FROM concept_promotion_validation_diagnostics
+            WHERE diagnostic_epoch_id = ?
+            ORDER BY concept_signature ASC LIMIT 1
+            """,
+            (epoch_id,),
         ).fetchone()[0]
     return json.loads(payload_json)
 
@@ -266,6 +271,60 @@ def test_functional_coverage_ignores_provenance_support_counts(tmp_path: Path) -
 
     assert second["incremental_explanatory_coverage"] == first["incremental_explanatory_coverage"]
     assert second["coverage_longitudinal_change"]["incremental_coverage_delta"] == 0.0
+
+
+def test_concept_validation_diagnostics_are_preserved_by_epoch_and_rerun_idempotently(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_functional_candidate(memory_dir)
+    _coverage_diagnostic(memory_dir, epoch_id="epoch_1")
+    _coverage_diagnostic(memory_dir, epoch_id="epoch_2")
+    _coverage_diagnostic(memory_dir, epoch_id="epoch_2")
+
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        rows = conn.execute(
+            """
+            SELECT diagnostic_epoch_id, concept_signature, validation_algorithm_version
+            FROM concept_promotion_validation_diagnostics
+            WHERE concept_signature = 'concept-functional'
+            ORDER BY diagnostic_epoch_id ASC
+            """
+        ).fetchall()
+    assert [tuple(row)[:2] for row in rows] == [
+        ("epoch_1", "concept-functional"),
+        ("epoch_2", "concept-functional"),
+    ]
+
+
+def test_persistent_concept_state_restores_retained_promotion_after_candidate_rebuild(tmp_path: Path) -> None:
+    paths = ensure_memory_layout(tmp_path / "memory")
+    with sqlite3.connect(paths.current_state) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            """INSERT INTO concept_promotion_state (
+                concept_signature, historically_promoted, currently_promoted,
+                promotion_status, validation_status, first_promoted_global_step,
+                consecutive_validation_failures
+            ) VALUES ('concept-retained', 1, 1, 'retained', 'passed', 7, 0)"""
+        )
+        # This row represents regenerated current evidence: it is no longer
+        # structurally sufficient, but it must not erase valid longitudinal state.
+        conn.execute(
+            """INSERT INTO concept_candidates (
+                concept_signature, is_promoted, structurally_promoted_this_epoch,
+                promotion_status
+            ) VALUES ('concept-retained', 0, 0, 'candidate')"""
+        )
+        higher_order_substrate._restore_persistent_concept_state(conn)
+        restored = conn.execute(
+            """SELECT is_promoted, promotion_status, promotion_retained_from_history
+               FROM concept_candidates WHERE concept_signature = 'concept-retained'"""
+        ).fetchone()
+        persistent = conn.execute(
+            """SELECT historically_promoted, currently_promoted, first_promoted_global_step
+               FROM concept_promotion_state WHERE concept_signature = 'concept-retained'"""
+        ).fetchone()
+    assert tuple(restored) == (1, "retained", 1)
+    assert tuple(persistent) == (1, 1, 7)
 
 
 def test_prediction_and_contradiction_events_are_held_out_and_deterministic(tmp_path: Path) -> None:
@@ -531,7 +590,10 @@ def test_comparable_expansion_failure_increments_validation_state(tmp_path: Path
             "SELECT failure_count FROM promotion_validation_state WHERE candidate_type = 'concept' AND candidate_signature = 'concept-functional'"
         ).fetchone()[0]
         diagnostic = json.loads(conn.execute(
-            "SELECT payload_json FROM concept_promotion_validation_diagnostics WHERE concept_signature = 'concept-functional'"
+            """
+            SELECT payload_json FROM concept_promotion_validation_diagnostics
+            WHERE concept_signature = 'concept-functional' AND diagnostic_epoch_id = 'epoch_2'
+            """
         ).fetchone()[0])
     assert diagnostic["population_change"] == "population_expansion"
     assert diagnostic["population_comparable"] is True
@@ -1973,20 +2035,99 @@ def test_transfer_attempts_store_concrete_source_and_target_provenance(tmp_path:
         cross_context = conn.execute(
             """
             SELECT source_context_key, target_context_key, source_game_key, target_game_key
+                   , source_game_is_surrogate, target_game_is_surrogate
             FROM role_transfer_attempts WHERE transfer_kind = 'cross_context'
             """
         ).fetchall()
     assert cross_game
     assert all(row["source_game_key"] and row["target_game_key"] for row in cross_game)
+    assert all(row["source_context_key"] and row["target_context_key"] for row in cross_game)
     assert all(row["source_game_key"] != row["target_game_key"] for row in cross_game)
     assert all(row["source_scope_key"] == row["source_game_key"] for row in cross_game)
     assert all(row["source_scope_key"] != row["target_scope_key"] for row in cross_game)
     assert cross_context
     assert all(row["source_context_key"] != row["target_context_key"] for row in cross_context)
+    assert all(row["source_game_key"] and row["target_game_key"] for row in cross_context)
     assert all(
-        not row["source_game_key"] or not row["target_game_key"] or row["source_game_key"] == row["target_game_key"]
+        row["source_game_is_surrogate"]
+        or row["target_game_is_surrogate"]
+        or row["source_game_key"] == row["target_game_key"]
         for row in cross_context
     )
+
+
+def test_transfer_scope_resolves_interaction_and_surrogates_deterministically(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            """INSERT INTO future_option_events (
+                event_id, game, context_key, source_interaction_id, source_carrier_id,
+                source_role_id, first_seen_global_step
+            ) VALUES ('event-b', 'game-b', 'ctx-b', 'interaction-b', 'carrier-a', 'role-a', 2)"""
+        )
+        conn.execute(
+            """INSERT INTO future_option_events (
+                event_id, game, context_key, source_interaction_id, source_carrier_id,
+                source_role_id, first_seen_global_step
+            ) VALUES ('event-a', 'game-a', 'ctx-a', 'interaction-a', 'carrier-a', 'role-a', 1)"""
+        )
+        resolved = higher_order_substrate.resolve_transfer_scope(
+            conn,
+            interaction_id=None,
+            carrier_signature="carrier-a",
+            role_signature="role-a",
+            existing_game_key=None,
+            existing_context_key=None,
+        )
+        surrogate_a = higher_order_substrate.resolve_transfer_scope(
+            conn,
+            interaction_id=None,
+            carrier_signature="carrier-missing",
+            role_signature="role-missing",
+            existing_game_key=None,
+            existing_context_key=None,
+        )
+        surrogate_b = higher_order_substrate.resolve_transfer_scope(
+            conn,
+            interaction_id=None,
+            carrier_signature="carrier-missing",
+            role_signature="role-missing",
+            existing_game_key=None,
+            existing_context_key=None,
+        )
+    assert resolved["interaction_id"] == "interaction-a"
+    assert resolved["game_key"] == "game-a"
+    assert resolved["context_key"] == "ctx-a"
+    assert resolved["game_resolution_source"] == "carrier_interaction"
+    assert resolved["context_resolution_source"] == "carrier_interaction"
+    assert surrogate_a == surrogate_b
+    assert str(surrogate_a["game_key"]).startswith("surrogate_game:")
+    assert str(surrogate_a["context_key"]).startswith("surrogate_context:")
+    assert surrogate_a["game_resolution_source"] == "surrogate"
+    assert surrogate_a["context_resolution_source"] == "surrogate"
+
+
+def test_surrogate_scope_cannot_be_verified_cross_game_transfer(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    ensure_memory_layout(memory_dir)
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        attempt = higher_order_substrate._resolve_transfer_attempt_provenance(
+            conn,
+            {
+                "attempt_id": "old", "transfer_kind": "cross_game", "provenance_mode": "single_source",
+                "source_game_key": None, "target_game_key": None,
+                "source_context_key": None, "target_context_key": None,
+                "source_carrier_signature": "source-carrier", "target_carrier_signature": "target-carrier",
+                "source_role_signature": "role-source", "observed_target_role_signature": "role-target",
+                "predicted_target_role_signature": "role-target",
+            },
+        )
+    assert attempt["source_game_key"] and attempt["target_game_key"]
+    assert attempt["source_context_key"] and attempt["target_context_key"]
+    assert attempt["provenance_status"] == "resolved_with_surrogate"
+    assert attempt["source_game_is_surrogate"] or attempt["target_game_is_surrogate"]
 
 
 def test_transfer_provenance_expansion_uses_distinct_ids_for_source_games() -> None:

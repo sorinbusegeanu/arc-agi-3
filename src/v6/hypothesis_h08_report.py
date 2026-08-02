@@ -52,7 +52,12 @@ def evaluate_h08_world_model_coherence(
             _write_outputs(output_dir, result)
             return result
         concept_candidate_count = int(conn.execute("SELECT COUNT(*) FROM concept_candidates").fetchone()[0])
-        promoted_concept_count = int(conn.execute("SELECT COUNT(*) FROM concept_candidates WHERE COALESCE(is_promoted, 0) = 1").fetchone()[0])
+        promoted_concept_count = int(conn.execute(
+            """SELECT COUNT(*) FROM concept_candidates AS candidate
+               LEFT JOIN concept_promotion_state AS persistent
+                 ON persistent.concept_signature = candidate.concept_signature
+               WHERE COALESCE(persistent.currently_promoted, candidate.is_promoted, 0) = 1"""
+        ).fetchone()[0])
         role_candidate_count = int(conn.execute("SELECT COUNT(*) FROM role_candidates").fetchone()[0]) if "role_candidates" in tables else 0
         role_transfer_success_count = (
             int(
@@ -68,6 +73,11 @@ def evaluate_h08_world_model_coherence(
             SELECT component_signature, coherence_score, explanatory_coverage, cross_context_count, cross_game_count,
                    linked_concept_count, linked_role_count, linked_family_count, prediction_support_count,
                    contradiction_coverage_count, predicted_outcome_count, predicted_outcome_count_is_proxy,
+                   observed_outcome_count, correct_prediction_count, prediction_error_count,
+                   prediction_evidence_status, baseline_prediction_score, component_prediction_score,
+                   heldout_prediction_gain, matched_prediction_event_count, unmatched_prediction_event_count,
+                   structural_coherence_score, functional_coherence_score, combined_coherence_score,
+                   candidate_family_link_count, retained_family_link_count, dropped_family_link_count,
                    is_coherent, candidate_only, validation_prediction_lift,
                    validation_action_selection_lift, validation_transfer_lift,
                    validation_contradiction_resolution, validation_explanatory_gain
@@ -87,7 +97,7 @@ def evaluate_h08_world_model_coherence(
         return any(
             value is not None and float(value) > 0.0
             for value in (
-                row["validation_prediction_lift"],
+                row["heldout_prediction_gain"],
                 row["validation_action_selection_lift"],
                 row["validation_transfer_lift"],
                 row["validation_contradiction_resolution"],
@@ -120,7 +130,19 @@ def evaluate_h08_world_model_coherence(
     candidate_only_world_model_component_count = sum(1 for row in component_rows if int(row["candidate_only"] or 0) == 1)
     component_cross_context_count = max((int(row["cross_context_count"] or 0) for row in component_rows), default=0)
     component_cross_game_count = max((int(row["cross_game_count"] or 0) for row in component_rows), default=0)
-    predicted_outcome_count = max((int(row["predicted_outcome_count"] or 0) for row in component_rows), default=0)
+    predicted_outcome_count = sum(int(row["predicted_outcome_count"] or 0) for row in component_rows)
+    verified_predicted_outcome_count = sum(
+        int(row["predicted_outcome_count"] or 0)
+        for row in component_rows if str(row["prediction_evidence_status"] or "missing") == "verified"
+    )
+    proxy_predicted_outcome_count = sum(
+        int(row["predicted_outcome_count"] or 0)
+        for row in component_rows if str(row["prediction_evidence_status"] or "missing") == "proxy"
+    )
+    missing_outcome_count = sum(
+        int(row["unmatched_prediction_event_count"] or 0)
+        for row in component_rows if str(row["prediction_evidence_status"] or "missing") == "missing"
+    )
     predicted_outcome_count_is_proxy_count = sum(int(row["predicted_outcome_count_is_proxy"] or 0) for row in component_rows)
     supported_context_count = max((len(link_map.get(str(row["component_signature"]), {}).get("context", set())) for row in component_rows), default=0)
     concept_link_count = max((len(link_map.get(str(row["component_signature"]), {}).get("concept", set())) for row in component_rows), default=0)
@@ -139,7 +161,7 @@ def evaluate_h08_world_model_coherence(
     heldout_components = [
         {
             "component_signature": str(row["component_signature"]),
-            "heldout_prediction_gain": row["validation_prediction_lift"],
+            "heldout_prediction_gain": row["heldout_prediction_gain"],
             "heldout_behavior_gain": row["validation_action_selection_lift"],
             "heldout_contradiction_resolution": row["validation_contradiction_resolution"],
             "heldout_explanatory_gain": row["validation_explanatory_gain"],
@@ -165,7 +187,17 @@ def evaluate_h08_world_model_coherence(
         "component_cross_context_count": component_cross_context_count,
         "component_cross_game_count": component_cross_game_count,
         "predicted_outcome_count": predicted_outcome_count,
+        "verified_predicted_outcome_count": verified_predicted_outcome_count,
+        "proxy_predicted_outcome_count": proxy_predicted_outcome_count,
+        "missing_outcome_count": missing_outcome_count,
+        "matched_prediction_event_count": sum(int(row["matched_prediction_event_count"] or 0) for row in component_rows),
+        "unmatched_prediction_event_count": sum(int(row["unmatched_prediction_event_count"] or 0) for row in component_rows),
         "predicted_outcome_count_is_proxy_count": predicted_outcome_count_is_proxy_count,
+        "structural_coherence_score": _count_statistics([int(round(float(row["structural_coherence_score"] or 0.0) * 100)) for row in component_rows]),
+        "functional_coherence_score": _count_statistics([int(round(float(row["functional_coherence_score"] or 0.0) * 100)) for row in component_rows]),
+        "combined_coherence_score": _count_statistics([int(round(float(row["combined_coherence_score"] or 0.0) * 100)) for row in component_rows]),
+        "candidate_family_link_count": sum(int(row["candidate_family_link_count"] or 0) for row in component_rows),
+        "retained_family_link_count": sum(int(row["retained_family_link_count"] or 0) for row in component_rows),
         "supported_context_count": supported_context_count,
         "concept_link_count": concept_link_count,
         "role_link_count": role_link_count,
@@ -183,15 +215,13 @@ def evaluate_h08_world_model_coherence(
         "first_promoted_concept_step": milestone_map.get("first_promoted_concept_step"),
         "evidence_stage": None,
     }
-    non_proxy_predicted_outcome_available = (
-        predicted_outcome_count > 0 and predicted_outcome_count_is_proxy_count <= 0
-    )
+    non_proxy_predicted_outcome_available = verified_predicted_outcome_count >= 1
     h08_validity_gates = {
         "promoted_concepts": {"required": 1, "actual": promoted_concept_count, "passed": promoted_concept_count > 0},
         "heldout_coherent_components": {"required": 1, "actual": coherent_world_model_component_count, "passed": coherent_world_model_component_count >= 1},
         "heldout_positive_gain": {"required": "> 0 in one held-out metric", "actual": sum(1 for row in heldout_components if row["heldout_validation_pass"]), "passed": bool(heldout_components and any(row["heldout_validation_pass"] for row in heldout_components))},
         "cross_scope": {"required": "cross_context >= 3 OR cross_game >= 2", "actual": {"cross_context": component_cross_context_count, "cross_game": component_cross_game_count}, "passed": component_cross_context_count >= 3 or component_cross_game_count >= 2},
-        "prediction_evidence": {"required": 1, "actual": predicted_outcome_count, "passed": non_proxy_predicted_outcome_available},
+        "prediction_evidence": {"required": 1, "actual": verified_predicted_outcome_count, "passed": non_proxy_predicted_outcome_available},
     }
     if world_model_component_count <= 0:
         decision = "INSUFFICIENT_EVIDENCE"

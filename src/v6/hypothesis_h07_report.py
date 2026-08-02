@@ -59,6 +59,15 @@ def evaluate_h07_concept_emergence(
                 """
             ).fetchall()
         }
+        roles_with_transfer_attempts = int(conn.execute(
+            "SELECT COUNT(DISTINCT COALESCE(source_role_signature, role_signature)) FROM role_transfer_attempts"
+        ).fetchone()[0])
+        roles_with_successful_transfers = int(conn.execute(
+            """
+            SELECT COUNT(DISTINCT COALESCE(source_role_signature, role_signature))
+            FROM role_transfer_attempts WHERE COALESCE(reuse_success, 0) = 1
+            """
+        ).fetchone()[0])
         concept_rows = conn.execute(
             """
             SELECT concept_signature, compression_gain, promotion_score, transfer_success_count,
@@ -185,6 +194,9 @@ def evaluate_h07_concept_emergence(
         "historical_first_promoted_concept_step": historical_milestone_map.get("first_promoted_concept_step"),
         "first_role_transfer_success_step": milestone_map.get("first_role_transfer_success_step"),
         "roles_seen_for_concept_derivation": roles_seen_for_concept_derivation,
+        "roles_with_transfer_attempts": roles_with_transfer_attempts,
+        "roles_with_successful_transfers": roles_with_successful_transfers,
+        "roles_eligible_for_concept_derivation": roles_used_for_concepts,
         "roles_skipped_missing_carrier_links": roles_skipped_missing_carrier_links,
         "roles_skipped_missing_family_links": roles_skipped_missing_family_links,
         "roles_skipped_missing_transfer_success": roles_skipped_missing_transfer_success,
@@ -340,7 +352,16 @@ def _load_incremental_promotion_validation_report(
     candidates: list[dict[str, Any]] = []
     warnings: list[str] = []
     for row in conn.execute(
-        "SELECT payload_json FROM concept_promotion_validation_diagnostics ORDER BY concept_signature ASC"
+        """
+        SELECT diagnostic.payload_json
+        FROM concept_promotion_validation_diagnostics AS diagnostic
+        WHERE diagnostic.rowid IN (
+            SELECT MAX(rowid)
+            FROM concept_promotion_validation_diagnostics
+            GROUP BY concept_signature
+        )
+        ORDER BY diagnostic.concept_signature ASC
+        """
     ).fetchall():
         try:
             payload = json.loads(str(row["payload_json"]))

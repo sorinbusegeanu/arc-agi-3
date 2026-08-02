@@ -20,6 +20,11 @@ from v6.memory.compact_memory import (
 CONCEPT_PROMOTION_SCORE_THRESHOLD = 0.55
 MIN_SOURCE_EVIDENCE_SUPPORT = 2
 MIN_TRANSFER_SIMILARITY = 0.60
+MAX_WORLD_MODEL_FAMILY_LINKS = 50
+
+
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
 
 
 ROLE_CLEAR_TABLES = (
@@ -60,7 +65,6 @@ ROLE_TRANSFER_ONLY_CLEAR_TABLES = (
 CONCEPT_ONLY_CLEAR_TABLES = (
     "concept_candidates",
     "concept_links",
-    "concept_promotion_validation_diagnostics",
     "world_model_components",
     "world_model_links",
 )
@@ -694,6 +698,8 @@ def derive_role_transfer_attempts_parallel(
     cross_game_success_count = 0
     cross_context_attempt_count = 0
     cross_context_success_count = 0
+    scope_surrogate_counts: dict[str, int] = defaultdict(int)
+    scope_resolution_counts: dict[str, int] = defaultdict(int)
 
     total_possible_transfer_attempts = len(target_attempt_specs)
     target_attempt_specs = _sample_transfer_attempt_specs(
@@ -711,11 +717,11 @@ def derive_role_transfer_attempts_parallel(
         target_attempt_specs[index:index + max(1, int(chunk_size))]
         for index in range(0, len(target_attempt_specs), max(1, int(chunk_size)))
     ]
-    attempt_rows: list[tuple[Any, ...]] = []
+    attempt_items: list[dict[str, Any]] = []
     if int(workers or 1) <= 1 or len(chunks) <= 1:
         chunk_tracker = progress_factory("derive_role_transfer chunks", len(chunks), "chunk", False) if progress_factory else None
         for chunk in chunks:
-            attempt_rows.extend(
+            attempt_items.extend(
                 _derive_role_transfer_attempts_chunk(
                     chunk=chunk,
                     role_rows=role_rows,
@@ -738,25 +744,38 @@ def derive_role_transfer_attempts_parallel(
             ]
             chunk_tracker = progress_factory("derive_role_transfer chunks", len(futures), "chunk", False) if progress_factory else None
             for future in futures:
-                attempt_rows.extend(list(future.result()))
+                attempt_items.extend(list(future.result()))
                 if chunk_tracker is not None:
                     chunk_tracker.update(1)
             _close_progress_tracker(chunk_tracker)
     # Expansion converts a selected aggregate profile into concrete
     # source-target evidence.  Keep the configured cap over persisted rows,
     # not merely the pre-expansion target requests.
-    attempt_ids = [str(row[0]) for row in attempt_rows]
+    attempt_items = [
+        _resolve_transfer_attempt_provenance(state_conn, item)
+        for item in attempt_items
+    ]
+    for item in attempt_items:
+        _validate_transfer_attempt_provenance(item)
+    attempt_ids = [str(item["attempt_id"]) for item in attempt_items]
     if len(attempt_ids) != len(set(attempt_ids)):
         raise ValueError("role transfer attempt identity collision before persistence")
-    attempt_rows.sort(key=lambda row: str(row[0]))
-    if len(attempt_rows) > int(max_transfer_attempts):
-        attempt_rows = attempt_rows[: int(max_transfer_attempts)]
+    attempt_items.sort(key=lambda item: str(item["attempt_id"]))
+    if len(attempt_items) > int(max_transfer_attempts):
+        attempt_items = attempt_items[: int(max_transfer_attempts)]
+    attempt_rows = [_attempt_to_insert_tuple(item) for item in attempt_items]
     state_conn.executemany(
         """
         INSERT INTO role_transfer_attempts (
             attempt_id, role_signature, transfer_kind, source_scope_type, source_scope_key,
             target_scope_type, target_scope_key, source_game_key, target_game_key,
-            source_context_key, target_context_key, source_carrier_signature, source_role_signature,
+            source_context_key, target_context_key,
+            source_interaction_id, target_interaction_id, source_scope_origin, target_scope_origin,
+            source_game_is_surrogate, target_game_is_surrogate,
+            source_context_is_surrogate, target_context_is_surrogate,
+            source_game_resolution_source, target_game_resolution_source,
+            source_context_resolution_source, target_context_resolution_source,
+            source_carrier_signature, source_role_signature,
             predicted_target_role_signature, observed_target_role_signature,
             source_carrier_signatures_json, source_game_keys_json, source_context_keys_json,
             provenance_mode, provenance_status, target_carrier_signature, predicted_role_signature,
@@ -765,22 +784,26 @@ def derive_role_transfer_attempts_parallel(
             support_gate_passed, similarity_gate_passed, role_match_gate_passed,
             candidate_role_count, first_seen_global_step, last_seen_global_step
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         attempt_rows,
     )
-    inserted = len(attempt_rows)
-    for row in attempt_rows:
-        transfer_kind = str(row[2])
-        transfer_score = float(row[24] or 0.0)
-        reuse_success = int(row[25] or 0)
-        failure_reason = str(row[26] or "")
-        best_margin = row[27]
-        source_carrier_count = int(row[28] or 0)
-        source_evidence_support_count = int(row[29] or 0)
-        candidate_role_count = int(row[33] or 0)
-        first_seen_global_step = row[34]
-        role_signature = str(row[12] or "")
+    inserted = len(attempt_items)
+    for item in attempt_items:
+        transfer_kind = str(item["transfer_kind"])
+        transfer_score = float(item["transfer_score"] or 0.0)
+        reuse_success = int(item["reuse_success"] or 0)
+        failure_reason = str(item["failure_reason"] or "")
+        best_margin = item["best_margin"]
+        source_carrier_count = int(item["source_carrier_count"] or 0)
+        source_evidence_support_count = int(item["source_evidence_support_count"] or 0)
+        candidate_role_count = int(item["candidate_role_count"] or 0)
+        first_seen_global_step = item["first_seen_global_step"]
+        role_signature = str(item["source_role_signature"] or "")
+        for prefix in ("source_game", "target_game", "source_context", "target_context"):
+            if int(item.get(f"{prefix}_is_surrogate") or 0):
+                scope_surrogate_counts[prefix] += 1
+            scope_resolution_counts[str(item.get(f"{prefix}_resolution_source") or "unknown")] += 1
         transfer_score_sum += transfer_score
         source_carrier_count_sum += source_carrier_count
         source_evidence_support_count_sum += source_evidence_support_count
@@ -808,7 +831,7 @@ def derive_role_transfer_attempts_parallel(
             no_source_profile_count += 1
         if reuse_success == 1:
             success_count += 1
-            successful_roles.add(str(row[12]))
+            successful_roles.add(role_signature)
             if transfer_kind == "cross_game":
                 cross_game_success_count += 1
             else:
@@ -858,6 +881,15 @@ def derive_role_transfer_attempts_parallel(
         "mean_source_carrier_count": (source_carrier_count_sum / inserted) if inserted else None,
         "mean_source_evidence_support_count": (source_evidence_support_count_sum / inserted) if inserted else None,
         "candidate_role_count_mean": (candidate_role_count_sum / inserted) if inserted else None,
+        "source_game_missing_before_resolution_count": sum(1 for item in attempt_items if item.get("source_game_resolution_source") != "direct_attempt"),
+        "target_game_missing_before_resolution_count": sum(1 for item in attempt_items if item.get("target_game_resolution_source") != "direct_attempt"),
+        "source_context_missing_before_resolution_count": sum(1 for item in attempt_items if item.get("source_context_resolution_source") != "direct_attempt"),
+        "target_context_missing_before_resolution_count": sum(1 for item in attempt_items if item.get("target_context_resolution_source") != "direct_attempt"),
+        "source_game_surrogate_count": scope_surrogate_counts["source_game"],
+        "target_game_surrogate_count": scope_surrogate_counts["target_game"],
+        "source_context_surrogate_count": scope_surrogate_counts["source_context"],
+        "target_context_surrogate_count": scope_surrogate_counts["target_context"],
+        "scope_resolution_source_counts": dict(sorted(scope_resolution_counts.items())),
         "transfer_profile_cache_scope_count": len(profile_cache),
         "transfer_profile_cache_profile_count": sum(len(items) for items in profile_cache.values()),
 }
@@ -941,6 +973,80 @@ def _sample_transfer_attempt_specs(
     return selected[:limit]
 
 
+def _restore_persistent_concept_state(state_conn: sqlite3.Connection) -> None:
+    """Reattach durable promotion state to this epoch's candidate snapshot."""
+    candidate_rows = state_conn.execute(
+        """
+        SELECT concept_signature, first_seen_global_step, is_promoted,
+               structurally_promoted_this_epoch
+        FROM concept_candidates ORDER BY concept_signature ASC
+        """
+    ).fetchall()
+    for candidate in candidate_rows:
+        signature = str(candidate["concept_signature"])
+        structural_promoted = int(
+            candidate["structurally_promoted_this_epoch"]
+            if candidate["structurally_promoted_this_epoch"] is not None
+            else candidate["is_promoted"] or 0
+        )
+        state = state_conn.execute(
+            "SELECT * FROM concept_promotion_state WHERE concept_signature = ?", (signature,)
+        ).fetchone()
+        if state is None:
+            status = "promoted" if structural_promoted else "candidate"
+            state_conn.execute(
+                """
+                INSERT INTO concept_promotion_state (
+                    concept_signature, historically_promoted, currently_promoted,
+                    promotion_status, first_promoted_global_step,
+                    validation_algorithm_version, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+                """,
+                (
+                    signature, structural_promoted, structural_promoted, status,
+                    candidate["first_seen_global_step"] if structural_promoted else None,
+                    INCREMENTAL_PROMOTION_VALIDATION_VERSION,
+                ),
+            )
+            continue
+        historically_promoted = bool(state["historically_promoted"] or 0)
+        currently_promoted = bool(state["currently_promoted"] or 0)
+        previous_status = str(state["promotion_status"] or "candidate")
+        previous_validation = str(state["validation_status"] or "")
+        retained = bool(
+            historically_promoted
+            and currently_promoted
+            and previous_status in {"promoted", "retained", "validated"}
+            and previous_validation not in {"failed", "demoted", "invalid"}
+        )
+        if retained:
+            state_conn.execute(
+                """
+                UPDATE concept_candidates
+                SET is_promoted = 1, promotion_status = 'retained',
+                    validation_status = ?, promotion_failure_count = ?,
+                    demotion_reason = ?, promotion_retained_from_history = 1
+                WHERE concept_signature = ?
+                """,
+                (
+                    state["validation_status"], state["consecutive_validation_failures"],
+                    state["last_demotion_reason"], signature,
+                ),
+            )
+        elif structural_promoted:
+            state_conn.execute(
+                """
+                UPDATE concept_promotion_state
+                SET historically_promoted = 1, currently_promoted = 1,
+                    promotion_status = 'promoted',
+                    first_promoted_global_step = COALESCE(first_promoted_global_step, ?),
+                    validation_algorithm_version = ?, updated_at = datetime('now')
+                WHERE concept_signature = ?
+                """,
+                (candidate["first_seen_global_step"], INCREMENTAL_PROMOTION_VALIDATION_VERSION, signature),
+            )
+
+
 def derive_concept_candidates(state_conn: sqlite3.Connection, progress_factory: Any | None = None) -> dict[str, Any]:
     try:
         state_conn.execute("ALTER TABLE concept_candidates ADD COLUMN transfer_success_concentration REAL")
@@ -968,6 +1074,9 @@ def derive_concept_candidates(state_conn: sqlite3.Connection, progress_factory: 
             "promoted_concept_count": 0,
             "concept_strong_transfer_success_count": 0,
             "roles_seen_for_concept_derivation": 0,
+            "roles_with_transfer_attempts": 0,
+            "roles_with_successful_transfers": 0,
+            "roles_eligible_for_concept_derivation": 0,
             "roles_skipped_missing_carrier_links": 0,
             "roles_skipped_missing_family_links": 0,
             "roles_skipped_missing_transfer_success": 0,
@@ -1140,9 +1249,11 @@ def derive_concept_candidates(state_conn: sqlite3.Connection, progress_factory: 
                    linked_family_count, transfer_success_count, strong_transfer_success_count, cross_game_count,
                    cross_context_count, compression_gain, explanatory_reach, promotion_score,
                    transfer_success_concentration, is_overconcentrated,
-                   first_seen_global_step, last_seen_global_step, is_promoted
+                   first_seen_global_step, last_seen_global_step, is_promoted,
+                   structurally_promoted_this_epoch, promotion_retained_from_history,
+                   promotion_status
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 concept_signature,
@@ -1163,6 +1274,9 @@ def derive_concept_candidates(state_conn: sqlite3.Connection, progress_factory: 
                 first_seen,
                 last_seen,
                 is_promoted,
+                is_promoted,
+                0,
+                "promoted" if is_promoted else "candidate",
             ),
         )
         for role_signature in sorted(group["roles"]):
@@ -1178,6 +1292,16 @@ def derive_concept_candidates(state_conn: sqlite3.Connection, progress_factory: 
         if concept_tracker is not None:
             concept_tracker.update(1)
     _close_progress_tracker(concept_tracker)
+    _restore_persistent_concept_state(state_conn)
+    active_promoted_step = state_conn.execute(
+        "SELECT MIN(first_seen_global_step) FROM concept_candidates WHERE COALESCE(is_promoted, 0) = 1"
+    ).fetchone()[0]
+    first_promoted_concept_step = (
+        None if active_promoted_step is None else int(active_promoted_step)
+    )
+    promoted_concepts = int(state_conn.execute(
+        "SELECT COUNT(*) FROM concept_candidates WHERE COALESCE(is_promoted, 0) = 1"
+    ).fetchone()[0])
     _write_milestone(state_conn, "first_concept_candidate_step", first_concept_candidate_step, None)
     _write_milestone(state_conn, "first_promoted_concept_step", first_promoted_concept_step, None)
     _write_historical_milestone(state_conn, "first_concept_candidate_step", first_concept_candidate_step, None)
@@ -1189,6 +1313,11 @@ def derive_concept_candidates(state_conn: sqlite3.Connection, progress_factory: 
         "overconcentrated_concept_count": overconcentrated_concepts,
         "promoted_overconcentrated_concept_count": promoted_overconcentrated_concepts,
         "roles_seen_for_concept_derivation": roles_seen_for_concept_derivation,
+        "roles_with_transfer_attempts": len({
+            str(row["role_signature"]) for row in transfer_rows
+        }),
+        "roles_with_successful_transfers": len(success_by_role),
+        "roles_eligible_for_concept_derivation": roles_used_for_concepts,
         "roles_skipped_missing_carrier_links": roles_skipped_missing_carrier_links,
         "roles_skipped_missing_family_links": roles_skipped_missing_family_links,
         "roles_skipped_missing_transfer_success": roles_skipped_missing_transfer_success,
@@ -1208,11 +1337,16 @@ def derive_world_model_components(
 ) -> dict[str, Any]:
     concept_rows = [dict(row) for row in state_conn.execute(
         """
-        SELECT concept_signature, concept_type, linked_role_count, linked_carrier_count, linked_family_count,
-               cross_context_count, cross_game_count, promotion_score, first_seen_global_step, last_seen_global_step,
-               is_promoted
-        FROM concept_candidates
-        ORDER BY COALESCE(is_promoted, 0) DESC, COALESCE(promotion_score, 0.0) DESC, concept_signature ASC
+        SELECT candidate.concept_signature, candidate.concept_type, candidate.linked_role_count,
+               candidate.linked_carrier_count, candidate.linked_family_count,
+               candidate.cross_context_count, candidate.cross_game_count, candidate.promotion_score,
+               candidate.first_seen_global_step, candidate.last_seen_global_step,
+               COALESCE(persistent.currently_promoted, candidate.is_promoted, 0) AS is_promoted
+        FROM concept_candidates AS candidate
+        LEFT JOIN concept_promotion_state AS persistent
+          ON persistent.concept_signature = candidate.concept_signature
+        ORDER BY COALESCE(persistent.currently_promoted, candidate.is_promoted, 0) DESC,
+                 COALESCE(candidate.promotion_score, 0.0) DESC, candidate.concept_signature ASC
         """
     ).fetchall()]
     if not concept_rows:
@@ -1259,9 +1393,43 @@ def derive_world_model_components(
         links = concept_links.get(concept_signature, {})
         roles = sorted(links.get("role", set()))
         carriers = sorted(links.get("carrier", set()))
-        families = sorted(links.get("family", set()))
+        candidate_families = sorted(links.get("family", set()))
         contexts = sorted(links.get("context", set()))
         games = sorted(links.get("game", set()))
+        family_candidates: list[dict[str, Any]] = []
+        for family in candidate_families:
+            support_row = state_conn.execute(
+                "SELECT COALESCE(SUM(support_count), 0) FROM family_members WHERE family_signature = ?",
+                (family,),
+            ).fetchone()
+            role_count = sum(
+                1 for role in roles if family in role_links.get(role, {}).get("family", set())
+            )
+            event_count = int(state_conn.execute(
+                "SELECT COUNT(*) FROM future_option_events WHERE source_family_id = ?", (family,)
+            ).fetchone()[0])
+            prediction_gain_row = state_conn.execute(
+                "SELECT AVG(prediction_lift) FROM transformation_families WHERE canonical_signature = ?", (family,)
+            ).fetchone()
+            prediction_gain = float(prediction_gain_row[0] or 0.0)
+            family_candidates.append({
+                "family": family,
+                "support": int(support_row[0] or 0), "role_count": role_count,
+                "event_count": event_count, "prediction_gain": prediction_gain,
+                "provenance_status": "verified" if event_count > 0 else "proxy",
+            })
+        eligible_families = [
+            item for item in family_candidates
+            if item["event_count"] >= 2 or item["prediction_gain"] > 0.0 or item["role_count"] >= 2
+        ]
+        eligible_families.sort(key=lambda item: (
+            0 if item["provenance_status"] == "verified" else 1,
+            -float(item["prediction_gain"]), -int(item["support"]), str(item["family"]),
+        ))
+        retained_family_records = eligible_families[:MAX_WORLD_MODEL_FAMILY_LINKS]
+        families = [str(item["family"]) for item in retained_family_records]
+        family_links_dropped_low_support = len(family_candidates) - len(eligible_families)
+        family_links_dropped_limit = len(eligible_families) - len(retained_family_records)
         node_ids = {f"concept:{concept_signature}"}
         node_ids.update(f"role:{role}" for role in roles)
         node_ids.update(f"carrier:{carrier}" for carrier in carriers)
@@ -1275,7 +1443,7 @@ def derive_world_model_components(
             if str(edge["source_node_id"]) in node_ids or str(edge["target_node_id"]) in node_ids
         )
         implicit_edge_count = len(roles) + len(carriers) + len(families) + len(contexts) + len(games)
-        prediction_support_count = len(families) + sum(successful_transfer_by_role.get(role, 0) for role in roles)
+        structural_prediction_support_count = len(families) + sum(successful_transfer_by_role.get(role, 0) for role in roles)
         contradiction_coverage_count = 0
         family_nodes = {f"family:{family}" for family in families}
         for edge in edge_rows:
@@ -1292,27 +1460,62 @@ def derive_world_model_components(
         linked_carrier_count = len(carriers)
         cross_context_count = len(contexts)
         cross_game_count = len(games)
-        explanatory_coverage = (
-            linked_family_count + linked_carrier_count + prediction_support_count + contradiction_coverage_count
-        ) / max(1, node_count)
-        coherence_score = (
-            0.25 * min(1.0, edge_count / max(1.0, node_count * 2.0))
-            + 0.25 * min(1.0, explanatory_coverage)
-            + 0.20 * min(1.0, linked_role_count / 2.0)
-            + 0.15 * min(1.0, cross_context_count / 3.0)
-            + 0.15 * min(1.0, cross_game_count / 2.0)
+        explanatory_coverage = (linked_family_count + linked_carrier_count + contradiction_coverage_count) / max(1, node_count)
+        component_signature = f"wm:{sha1(concept_signature.encode('utf-8')).hexdigest()[:20]}"
+        prediction_rows = state_conn.execute(
+            """
+            SELECT * FROM world_model_prediction_events
+            WHERE component_signature = ?
+              AND observed_event_id IS NOT NULL AND observed_global_step IS NOT NULL
+              AND prediction_global_step < observed_global_step
+            ORDER BY prediction_event_id ASC
+            """,
+            (component_signature,),
+        ).fetchall()
+        unmatched_prediction_event_count = int(state_conn.execute(
+            """SELECT COUNT(*) FROM world_model_prediction_events
+               WHERE component_signature = ? AND (observed_event_id IS NULL OR observed_global_step IS NULL
+                    OR prediction_global_step >= observed_global_step)""",
+            (component_signature,),
+        ).fetchone()[0])
+        observed_outcome_count = len(prediction_rows)
+        correct_prediction_count = sum(int(item["prediction_correct"] or 0) for item in prediction_rows)
+        prediction_error_count = observed_outcome_count - correct_prediction_count
+        baseline_prediction_score = _mean([item["baseline_prediction_score"] for item in prediction_rows])
+        component_prediction_score = _mean([item["component_prediction_score"] for item in prediction_rows])
+        prediction_accuracy = correct_prediction_count / max(1, observed_outcome_count)
+        heldout_prediction_gain = (
+            float(component_prediction_score) - float(baseline_prediction_score)
+            if component_prediction_score is not None and baseline_prediction_score is not None
+            else 0.0
         )
+        prediction_evidence_status = "verified" if observed_outcome_count else "missing"
+        edge_density = graph_edge_count / max(1, node_count * max(1, node_count - 1))
+        total_link_count = linked_role_count + linked_family_count + linked_carrier_count + len(contexts) + len(games)
+        verified_link_count = sum(1 for item in retained_family_records if item["provenance_status"] == "verified") + linked_role_count + linked_carrier_count
+        verified_link_ratio = verified_link_count / max(1, total_link_count)
+        scope_generalization = (cross_context_count + cross_game_count) / max(1, len(contexts) + len(games))
+        contradiction_resolution_rate = 0.0
+        structural_coherence_score = _clamp01(0.5 * edge_density + 0.5 * verified_link_ratio)
+        functional_coherence_score = _clamp01(
+            0.30 * prediction_accuracy
+            + 0.30 * max(0.0, heldout_prediction_gain)
+            + 0.25 * scope_generalization
+            + 0.15 * contradiction_resolution_rate
+        )
+        coherence_score = _clamp01(0.4 * structural_coherence_score + 0.6 * functional_coherence_score)
         is_promoted = int(row.get("is_promoted", 0) or 0) == 1
         candidate_only = 0 if is_promoted else 1
-        predicted_outcome_count = prediction_support_count
-        predicted_outcome_count_is_proxy = 1
+        predicted_outcome_count = observed_outcome_count
+        predicted_outcome_count_is_proxy = 0
         is_coherent = int(
             is_promoted
             and linked_role_count >= 1
             and linked_family_count >= 2
             and linked_carrier_count >= 2
             and (cross_context_count >= 3 or cross_game_count >= 2)
-            and prediction_support_count > 0
+            and observed_outcome_count > 0
+            and functional_coherence_score > 0.0
             and coherence_score >= 0.55
         )
         if candidate_only:
@@ -1325,7 +1528,6 @@ def derive_world_model_components(
             first_component_step = first_seen if first_component_step is None else min(first_component_step, first_seen)
             if is_coherent:
                 first_coherent_step = first_seen if first_coherent_step is None else min(first_coherent_step, first_seen)
-        component_signature = f"wm:{sha1(concept_signature.encode('utf-8')).hexdigest()[:20]}"
         component_type = "promoted_concept_component" if is_promoted else "candidate_concept_component"
         state_conn.execute(
             """
@@ -1334,9 +1536,15 @@ def derive_world_model_components(
                 linked_role_count, linked_family_count, linked_carrier_count, cross_context_count,
                 cross_game_count, explanatory_coverage, prediction_support_count, contradiction_coverage_count,
                 coherence_score, candidate_only, predicted_outcome_count, predicted_outcome_count_is_proxy,
-                first_seen_global_step, last_seen_global_step, is_coherent
+                first_seen_global_step, last_seen_global_step, is_coherent,
+                structural_prediction_support_count, observed_outcome_count, correct_prediction_count,
+                prediction_error_count, prediction_evidence_status, baseline_prediction_score,
+                component_prediction_score, heldout_prediction_gain, matched_prediction_event_count,
+                unmatched_prediction_event_count, structural_coherence_score, functional_coherence_score,
+                combined_coherence_score, candidate_family_link_count, retained_family_link_count,
+                dropped_family_link_count, family_links_dropped_low_support, family_links_dropped_limit
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 component_signature,
@@ -1350,7 +1558,7 @@ def derive_world_model_components(
                 cross_context_count,
                 cross_game_count,
                 explanatory_coverage,
-                prediction_support_count,
+                structural_prediction_support_count,
                 contradiction_coverage_count,
                 coherence_score,
                 candidate_only,
@@ -1359,6 +1567,24 @@ def derive_world_model_components(
                 first_seen,
                 last_seen,
                 is_coherent,
+                structural_prediction_support_count,
+                observed_outcome_count,
+                correct_prediction_count,
+                prediction_error_count,
+                prediction_evidence_status,
+                baseline_prediction_score,
+                component_prediction_score,
+                heldout_prediction_gain,
+                observed_outcome_count,
+                unmatched_prediction_event_count,
+                structural_coherence_score,
+                functional_coherence_score,
+                coherence_score,
+                len(family_candidates),
+                len(retained_family_records),
+                family_links_dropped_low_support + family_links_dropped_limit,
+                family_links_dropped_low_support,
+                family_links_dropped_limit,
             ),
         )
         _insert_link(state_conn, "world_model_links", "component_signature", component_signature, "concept", concept_signature, 1, first_seen, last_seen)
@@ -1370,6 +1596,49 @@ def derive_world_model_components(
             _insert_link(state_conn, "world_model_links", "component_signature", component_signature, "carrier", carrier, 1, first_seen, last_seen)
         for family in families:
             _insert_link(state_conn, "world_model_links", "component_signature", component_signature, "family", family, 1, first_seen, last_seen)
+        for family_record in retained_family_records:
+            state_conn.execute(
+                """
+                INSERT INTO world_model_family_links (
+                    component_signature, family_signature, family_link_support_count,
+                    family_link_role_count, family_link_event_count, family_link_prediction_gain,
+                    family_link_provenance_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(component_signature, family_signature) DO UPDATE SET
+                    family_link_support_count = excluded.family_link_support_count,
+                    family_link_role_count = excluded.family_link_role_count,
+                    family_link_event_count = excluded.family_link_event_count,
+                    family_link_prediction_gain = excluded.family_link_prediction_gain,
+                    family_link_provenance_status = excluded.family_link_provenance_status
+                """,
+                (
+                    component_signature, family_record["family"], family_record["support"],
+                    family_record["role_count"], family_record["event_count"],
+                    family_record["prediction_gain"], family_record["provenance_status"],
+                ),
+            )
+        state_conn.execute(
+            """
+            INSERT INTO world_model_component_state (
+                component_signature, historically_coherent, currently_coherent,
+                first_coherent_global_step, last_validated_global_step,
+                consecutive_validation_failures, validation_status, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(component_signature) DO UPDATE SET
+                historically_coherent = MAX(world_model_component_state.historically_coherent, excluded.historically_coherent),
+                currently_coherent = excluded.currently_coherent,
+                first_coherent_global_step = COALESCE(world_model_component_state.first_coherent_global_step, excluded.first_coherent_global_step),
+                last_validated_global_step = excluded.last_validated_global_step,
+                consecutive_validation_failures = CASE WHEN excluded.currently_coherent = 1 THEN 0 ELSE world_model_component_state.consecutive_validation_failures END,
+                validation_status = excluded.validation_status,
+                updated_at = excluded.updated_at
+            """,
+            (
+                component_signature, is_coherent, is_coherent,
+                first_seen if is_coherent else None, last_seen, 0,
+                "passed" if is_coherent else "missing_prediction_evidence" if not observed_outcome_count else "failed",
+            ),
+        )
         for context in contexts:
             _insert_link(state_conn, "world_model_links", "component_signature", component_signature, "context", context, 1, first_seen, last_seen)
         for game in games:
@@ -1600,9 +1869,19 @@ def _validate_incremental_promotions(
 
         concept_rows = state_conn.execute(
             """
-            SELECT concept_signature, compression_gain, explanatory_reach, promotion_score, raw_promotion_score,
-                   cross_context_count, cross_game_count, first_seen_global_step, is_promoted
-            FROM concept_candidates ORDER BY concept_signature ASC
+            SELECT concept_candidates.concept_signature, compression_gain, explanatory_reach, promotion_score, raw_promotion_score,
+                   cross_context_count, cross_game_count, first_seen_global_step, is_promoted,
+                   structurally_promoted_this_epoch, promotion_retained_from_history,
+                   COALESCE(persistent.historically_promoted, 0) AS persistent_historically_promoted,
+                   COALESCE(persistent.currently_promoted, 0) AS persistent_currently_promoted,
+                   persistent.promotion_status AS persistent_promotion_status,
+                   persistent.validation_status AS persistent_validation_status,
+                   persistent.consecutive_validation_failures AS persistent_failure_count,
+                   persistent.total_validation_failures AS persistent_total_failure_count
+            FROM concept_candidates
+            LEFT JOIN concept_promotion_state AS persistent
+              ON persistent.concept_signature = concept_candidates.concept_signature
+            ORDER BY concept_candidates.concept_signature ASC
             """
         ).fetchall()
         source_role_structures_by_candidate: dict[str, set[str]] = {}
@@ -1720,7 +1999,11 @@ def _validate_incremental_promotions(
                 for value in heldout_lifts
             )
             has_positive_compression = incremental_compression > 0.0
-            legacy_promoted = bool(int(row["is_promoted"] or 0))
+            historically_promoted = bool(int(row["persistent_historically_promoted"] or 0))
+            legacy_promoted = bool(
+                int(row["persistent_currently_promoted"] or 0)
+                or int(row["is_promoted"] or 0)
+            )
             promotion_score_before_validation = float(
                 row["raw_promotion_score"]
                 if row["raw_promotion_score"] is not None
@@ -1820,8 +2103,20 @@ def _validate_incremental_promotions(
                 previously_promoted=legacy_promoted,
                 validation_result=validation_status,
             )
-            promoted = bool(promoted_by_validation or (legacy_promoted and not demoted_this_validation))
+            retained_from_valid_history = bool(
+                historically_promoted
+                and legacy_promoted
+                and str(row["persistent_validation_status"] or "") not in {"failed", "demoted", "invalid"}
+                and failure_count < int(config.demotion_failure_limit)
+                and not demoted_this_validation
+            )
+            promoted = bool(promoted_by_validation or retained_from_valid_history)
             validation_penalty = 0.0
+            persisted_status = (
+                "promoted" if promoted_by_validation else "retained"
+                if retained_from_valid_history else "demoted"
+                if demoted_this_validation else "candidate"
+            )
             state_conn.execute(
                 """
                 UPDATE concept_candidates
@@ -1839,11 +2134,47 @@ def _validate_incremental_promotions(
                     cross_game_transfer_lift, "relevant_later_global_step" if validation_evidence_count else "unavailable",
                     validation_prediction_lift, validation_action_selection_lift, validation_transfer_lift,
                     validation_evidence_count,
-                    ("promoted" if promoted_by_validation else "retained" if promoted else "demoted" if demoted_this_validation else "candidate"),
+                    persisted_status,
                     failure_count, adjusted_promotion_score, promotion_score_before_validation,
                     int(promoted), validation_status, validation_penalty,
                     "demoted_after_repeated_failure" if demoted_this_validation else None,
                     concept_signature,
+                ),
+            )
+            if promoted and persisted_status not in {"promoted", "retained", "validated"}:
+                raise AssertionError("promoted concept must have an active promotion status")
+            if persisted_status == "retained" and not historically_promoted:
+                raise AssertionError("retained concept must be historically promoted")
+            first_promoted_step = first_seen if promoted_by_validation else None
+            state_conn.execute(
+                """
+                INSERT INTO concept_promotion_state (
+                    concept_signature, historically_promoted, currently_promoted,
+                    promotion_status, validation_status, first_promoted_global_step,
+                    last_validated_global_step, consecutive_validation_failures,
+                    total_validation_failures, last_demotion_reason,
+                    validation_algorithm_version, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                ON CONFLICT(concept_signature) DO UPDATE SET
+                    historically_promoted = MAX(concept_promotion_state.historically_promoted, excluded.historically_promoted),
+                    currently_promoted = excluded.currently_promoted,
+                    promotion_status = excluded.promotion_status,
+                    validation_status = excluded.validation_status,
+                    first_promoted_global_step = COALESCE(concept_promotion_state.first_promoted_global_step, excluded.first_promoted_global_step),
+                    last_validated_global_step = excluded.last_validated_global_step,
+                    consecutive_validation_failures = excluded.consecutive_validation_failures,
+                    total_validation_failures = MAX(concept_promotion_state.total_validation_failures, excluded.total_validation_failures),
+                    last_demotion_reason = excluded.last_demotion_reason,
+                    validation_algorithm_version = excluded.validation_algorithm_version,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    concept_signature, int(historically_promoted or promoted), int(promoted),
+                    persisted_status, validation_status, first_promoted_step, first_seen,
+                    failure_count,
+                    int(row["persistent_total_failure_count"] or 0) + int(comparable_failure and not promoted_by_validation),
+                    "demoted_after_repeated_failure" if demoted_this_validation else None,
+                    INCREMENTAL_PROMOTION_VALIDATION_VERSION,
                 ),
             )
             demoted = status == "demoted"
@@ -1883,8 +2214,8 @@ def _validate_incremental_promotions(
                 "validation_evidence_count": validation_evidence_count,
                 "validation_scope": "relevant_later_global_step" if validation_evidence_count else "unavailable",
                 "validation_status": validation_status,
-                "promotion_status": "promoted" if promoted_by_validation else "retained" if promoted else "demoted" if demoted_this_validation else "candidate",
-                "historical_promotion_status": "promoted" if legacy_promoted else "candidate",
+                "promotion_status": persisted_status,
+                "historical_promotion_status": "promoted" if historically_promoted else "candidate",
                 "explanatory_reach": float(row["explanatory_reach"] or 0.0),
                 "global_explanatory_reach": int(functional_diagnostics["global_explanatory_reach"]),
                 "relevant_incremental_coverage": incremental_coverage,
@@ -1931,10 +2262,10 @@ def _validate_incremental_promotions(
                 "validation_state_last_reset_version": validation_state_last_reset_version,
                 "legacy_promoted": legacy_promoted,
                 "incremental_validation_promoted": promoted_by_validation,
-                "promotion_retained_from_history": legacy_promoted and not promoted_by_validation and promoted,
+                "promotion_retained_from_history": retained_from_valid_history,
                 "current_validation_passed": promoted_by_validation,
                 "currently_promoted": promoted,
-                "historically_promoted": legacy_promoted,
+                "historically_promoted": historically_promoted or promoted,
                 "demoted_this_epoch": demoted_this_validation,
                 "validation_pass": promoted_by_validation,
                 "promoted": promoted,
@@ -1947,11 +2278,17 @@ def _validate_incremental_promotions(
             }
             state_conn.execute(
                 """
-                INSERT INTO concept_promotion_validation_diagnostics (concept_signature, payload_json)
-                VALUES (?, ?)
-                ON CONFLICT(concept_signature) DO UPDATE SET payload_json = excluded.payload_json
+                INSERT INTO concept_promotion_validation_diagnostics (
+                    diagnostic_epoch_id, concept_signature, validation_algorithm_version, payload_json
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(diagnostic_epoch_id, concept_signature, validation_algorithm_version)
+                DO UPDATE SET payload_json = excluded.payload_json
                 """,
-                (concept_signature, json.dumps(diagnostic, sort_keys=True)),
+                (
+                    "" if diagnostic_epoch_id is None else str(diagnostic_epoch_id),
+                    concept_signature, INCREMENTAL_PROMOTION_VALIDATION_VERSION,
+                    json.dumps(diagnostic, sort_keys=True),
+                ),
             )
             _store_incremental_coverage_state(
                 state_conn,
@@ -1972,14 +2309,23 @@ def _validate_incremental_promotions(
         if explanation_events_path is not None:
             _write_explanation_event_artifact(Path(explanation_events_path), explanation_event_rows)
         active_signatures = [str(row["concept_signature"]) for row in concept_rows]
+        diagnostic_epoch_key = "" if diagnostic_epoch_id is None else str(diagnostic_epoch_id)
         if active_signatures:
             placeholders = ", ".join("?" for _ in active_signatures)
             state_conn.execute(
-                f"DELETE FROM concept_promotion_validation_diagnostics WHERE concept_signature NOT IN ({placeholders})",
-                active_signatures,
+                f"""
+                DELETE FROM concept_promotion_validation_diagnostics
+                WHERE diagnostic_epoch_id = ? AND validation_algorithm_version = ?
+                  AND concept_signature NOT IN ({placeholders})
+                """,
+                [diagnostic_epoch_key, INCREMENTAL_PROMOTION_VALIDATION_VERSION, *active_signatures],
             )
         else:
-            state_conn.execute("DELETE FROM concept_promotion_validation_diagnostics")
+            state_conn.execute(
+                "DELETE FROM concept_promotion_validation_diagnostics "
+                "WHERE diagnostic_epoch_id = ? AND validation_algorithm_version = ?",
+                (diagnostic_epoch_key, INCREMENTAL_PROMOTION_VALIDATION_VERSION),
+            )
         active_promoted_step = state_conn.execute(
             "SELECT MIN(first_seen_global_step) FROM concept_candidates WHERE COALESCE(is_promoted, 0) = 1"
         ).fetchone()[0]
@@ -3609,6 +3955,10 @@ def _predict_transfer_attempt(
     source_carriers = tuple(str(value) for value in best.get("source_carrier_signatures", ()))
     source_games = tuple(str(value) for value in best.get("source_game_keys", ()))
     source_contexts = tuple(str(value) for value in best.get("source_context_keys", ()))
+    source_context_game_keys = {
+        str(context): tuple(str(game) for game in games)
+        for context, games in dict(best.get("source_context_game_keys", {})).items()
+    }
     # A profile can still match structurally while lacking the concrete scope
     # required to make the requested transfer claim.  Treat it as an
     # unusable source profile instead of manufacturing a source identity or
@@ -3663,6 +4013,7 @@ def _predict_transfer_attempt(
         "source_carrier_signatures_json": json.dumps(source_carriers),
         "source_game_keys_json": json.dumps(source_games),
         "source_context_keys_json": json.dumps(source_contexts),
+        "source_context_game_keys_json": json.dumps(source_context_game_keys, sort_keys=True),
         "provenance_mode": provenance_mode,
         "provenance_status": "verified" if provenance_mode == "single_source" else "aggregate_source",
         "target_carrier_signature": target_carrier_signature,
@@ -3697,6 +4048,18 @@ def _attempt_to_insert_tuple(attempt: dict[str, Any]) -> tuple[Any, ...]:
         attempt["target_game_key"],
         attempt["source_context_key"],
         attempt["target_context_key"],
+        attempt["source_interaction_id"],
+        attempt["target_interaction_id"],
+        attempt["source_scope_origin"],
+        attempt["target_scope_origin"],
+        attempt["source_game_is_surrogate"],
+        attempt["target_game_is_surrogate"],
+        attempt["source_context_is_surrogate"],
+        attempt["target_context_is_surrogate"],
+        attempt["source_game_resolution_source"],
+        attempt["target_game_resolution_source"],
+        attempt["source_context_resolution_source"],
+        attempt["target_context_resolution_source"],
         attempt["source_carrier_signature"],
         attempt["source_role_signature"],
         attempt["predicted_target_role_signature"],
@@ -3725,6 +4088,229 @@ def _attempt_to_insert_tuple(attempt: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
+def _scope_surrogate(prefix: str, payload: dict[str, object]) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return f"{prefix}:" + sha1(encoded.encode("utf-8")).hexdigest()[:20]
+
+
+def _transfer_scope_candidates(
+    connection: sqlite3.Connection,
+    *,
+    interaction_id: str | None,
+    carrier_signature: str | None,
+    role_signature: str | None,
+) -> list[dict[str, object]]:
+    """Return deterministic concrete evidence candidates for one transfer side."""
+    candidates: list[dict[str, object]] = []
+    try:
+        rows = connection.execute(
+            """
+            SELECT source_interaction_id, COALESCE(source_game_id, game) AS game_key,
+                   COALESCE(source_context_signature, context_key) AS context_key,
+                   source_carrier_id, source_role_id, source_family_id,
+                   first_seen_global_step
+            FROM future_option_events
+            WHERE source_interaction_id IS NOT NULL
+              AND (
+                    source_interaction_id = ?
+                 OR source_carrier_id = ?
+                 OR source_role_id = ?
+              )
+            ORDER BY CASE WHEN source_interaction_id = ? THEN 0
+                          WHEN source_carrier_id = ? THEN 1
+                          WHEN source_role_id = ? THEN 2 ELSE 3 END,
+                     COALESCE(first_seen_global_step, 9223372036854775807) ASC,
+                     source_interaction_id ASC
+            """,
+            (interaction_id, carrier_signature, role_signature, interaction_id, carrier_signature, role_signature),
+        ).fetchall()
+        for row in rows:
+            candidates.append(
+                {
+                    "interaction_id": str(row["source_interaction_id"]),
+                    "game_key": row["game_key"],
+                    "context_key": row["context_key"],
+                    "origin": (
+                        "interaction" if interaction_id not in (None, "") and str(row["source_interaction_id"]) == str(interaction_id)
+                        else "carrier_interaction" if row["source_carrier_id"] == carrier_signature
+                        else "role_interaction"
+                    ),
+                    "step": row["first_seen_global_step"],
+                }
+            )
+    except sqlite3.Error:
+        pass
+    if candidates or not carrier_signature:
+        return candidates
+    try:
+        families = [
+            str(row[0])
+            for row in connection.execute(
+                "SELECT linked_key FROM carrier_links WHERE carrier_signature = ? AND linked_type = 'family' ORDER BY linked_key ASC",
+                (carrier_signature,),
+            ).fetchall()
+        ]
+        if families:
+            placeholders = ",".join("?" for _ in families)
+            rows = connection.execute(
+                f"""
+                SELECT source_interaction_id, COALESCE(source_game_id, game) AS game_key,
+                       COALESCE(source_context_signature, context_key) AS context_key,
+                       first_seen_global_step
+                FROM future_option_events
+                WHERE source_family_id IN ({placeholders}) AND source_interaction_id IS NOT NULL
+                ORDER BY source_family_id ASC, COALESCE(first_seen_global_step, 9223372036854775807) ASC,
+                         source_interaction_id ASC
+                """,
+                tuple(families),
+            ).fetchall()
+            candidates.extend(
+                {
+                    "interaction_id": str(row["source_interaction_id"]),
+                    "game_key": row["game_key"],
+                    "context_key": row["context_key"],
+                    "origin": "family_interaction",
+                    "step": row["first_seen_global_step"],
+                }
+                for row in rows
+            )
+    except sqlite3.Error:
+        pass
+    return candidates
+
+
+def resolve_transfer_scope(
+    connection: sqlite3.Connection,
+    *,
+    interaction_id: str | None,
+    carrier_signature: str | None,
+    role_signature: str | None,
+    existing_game_key: str | None,
+    existing_context_key: str | None,
+    side: str = "source",
+) -> dict[str, str | int | None]:
+    """Resolve a transfer side without losing concrete evidence provenance.
+
+    The public fields follow the stable transfer-validation normalization.  The
+    extra interaction/origin fields let the caller persist the selected proof.
+    """
+    candidates = _transfer_scope_candidates(
+        connection,
+        interaction_id=interaction_id,
+        carrier_signature=carrier_signature,
+        role_signature=role_signature,
+    )
+    candidate = candidates[0] if candidates else {}
+    chosen_interaction_id = interaction_id or candidate.get("interaction_id")
+    game_key = existing_game_key or candidate.get("game_key")
+    context_key = existing_context_key or candidate.get("context_key")
+    game_source = "direct_attempt" if existing_game_key else (str(candidate.get("origin")) if candidate.get("game_key") else None)
+    context_source = "direct_attempt" if existing_context_key else (str(candidate.get("origin")) if candidate.get("context_key") else None)
+    if chosen_interaction_id in (None, ""):
+        chosen_interaction_id = _scope_surrogate(
+            "surrogate_interaction",
+            {
+                "side": side,
+                "role_signature": role_signature,
+                "carrier_signature": carrier_signature,
+                "game_key": game_key,
+                "context_key": context_key,
+            },
+        )
+        interaction_origin = "surrogate"
+    else:
+        interaction_origin = str(candidate.get("origin") or "direct_attempt")
+    game_is_surrogate = 0
+    if game_key in (None, ""):
+        game_key = _scope_surrogate(
+            "surrogate_game",
+            {
+                "side": side,
+                "role_signature": role_signature,
+                "carrier_signature": carrier_signature,
+                "context_key": context_key,
+                "interaction_id": chosen_interaction_id,
+            },
+        )
+        game_source = "surrogate"
+        game_is_surrogate = 1
+    context_is_surrogate = 0
+    if context_key in (None, ""):
+        context_key = _scope_surrogate(
+            "surrogate_context",
+            {
+                "side": side,
+                "game_key": game_key,
+                "role_signature": role_signature,
+                "carrier_signature": carrier_signature,
+                "interaction_id": chosen_interaction_id,
+            },
+        )
+        context_source = "surrogate"
+        context_is_surrogate = 1
+    return {
+        "game_key": str(game_key),
+        "context_key": str(context_key),
+        "game_resolution_source": str(game_source or "surrogate"),
+        "context_resolution_source": str(context_source or "surrogate"),
+        "interaction_id": str(chosen_interaction_id),
+        "scope_origin": interaction_origin,
+        "game_is_surrogate": game_is_surrogate,
+        "context_is_surrogate": context_is_surrogate,
+    }
+
+
+def _resolve_transfer_attempt_provenance(connection: sqlite3.Connection, attempt: dict[str, Any]) -> dict[str, Any]:
+    source = resolve_transfer_scope(
+        connection,
+        interaction_id=attempt.get("source_interaction_id"),
+        carrier_signature=attempt.get("source_carrier_signature"),
+        role_signature=attempt.get("source_role_signature"),
+        existing_game_key=attempt.get("source_game_key"),
+        existing_context_key=attempt.get("source_context_key"),
+        side="source",
+    )
+    target = resolve_transfer_scope(
+        connection,
+        interaction_id=attempt.get("target_interaction_id"),
+        carrier_signature=attempt.get("target_carrier_signature"),
+        role_signature=attempt.get("observed_target_role_signature") or attempt.get("role_signature"),
+        existing_game_key=attempt.get("target_game_key"),
+        existing_context_key=attempt.get("target_context_key"),
+        side="target",
+    )
+    attempt.update(
+        {
+            "source_interaction_id": source["interaction_id"], "target_interaction_id": target["interaction_id"],
+            "source_scope_origin": source["scope_origin"], "target_scope_origin": target["scope_origin"],
+            "source_game_key": source["game_key"], "target_game_key": target["game_key"],
+            "source_context_key": source["context_key"], "target_context_key": target["context_key"],
+            "source_game_is_surrogate": source["game_is_surrogate"], "target_game_is_surrogate": target["game_is_surrogate"],
+            "source_context_is_surrogate": source["context_is_surrogate"], "target_context_is_surrogate": target["context_is_surrogate"],
+            "source_game_resolution_source": source["game_resolution_source"], "target_game_resolution_source": target["game_resolution_source"],
+            "source_context_resolution_source": source["context_resolution_source"], "target_context_resolution_source": target["context_resolution_source"],
+        }
+    )
+    real_cross_game = not source["game_is_surrogate"] and not target["game_is_surrogate"] and source["game_key"] != target["game_key"]
+    real_cross_context = not source["context_is_surrogate"] and not target["context_is_surrogate"] and source["context_key"] != target["context_key"]
+    if str(attempt.get("provenance_mode")) == "single_source" and (real_cross_game or real_cross_context):
+        attempt["provenance_status"] = "verified"
+    elif all((source["game_key"], target["game_key"], source["context_key"], target["context_key"])) and any((source["game_is_surrogate"], target["game_is_surrogate"], source["context_is_surrogate"], target["context_is_surrogate"])):
+        attempt["provenance_status"] = "resolved_with_surrogate"
+    else:
+        attempt["provenance_status"] = "proxy"
+    attempt["attempt_id"] = sha1(json.dumps({
+        "transfer_kind": attempt.get("transfer_kind"), "source_role_signature": attempt.get("source_role_signature"),
+        "source_game_key": source["game_key"], "target_game_key": target["game_key"],
+        "source_context_key": source["context_key"], "target_context_key": target["context_key"],
+        "source_carrier_signature": attempt.get("source_carrier_signature"),
+        "target_carrier_signature": attempt.get("target_carrier_signature"),
+        "predicted_target_role_signature": attempt.get("predicted_target_role_signature"),
+        "source_interaction_id": source["interaction_id"], "target_interaction_id": target["interaction_id"],
+    }, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    return attempt
+
+
 def _expand_transfer_attempt_provenance(attempt: dict[str, Any]) -> list[dict[str, Any]]:
     """Expand a multi-scope source profile into concrete source-target attempts.
 
@@ -3742,6 +4328,7 @@ def _expand_transfer_attempt_provenance(attempt: dict[str, Any]) -> list[dict[st
         return [attempt]
     source_carriers = tuple(json.loads(str(attempt["source_carrier_signatures_json"] or "[]")))
     source_games = tuple(json.loads(str(attempt["source_game_keys_json"] or "[]")))
+    source_context_game_keys = json.loads(str(attempt.get("source_context_game_keys_json") or "{}"))
     target_games = (str(attempt["target_game_key"]),) if attempt.get("target_game_key") else ()
     result: list[dict[str, Any]] = []
     for source_key in sorted(str(value) for value in source_keys):
@@ -3759,7 +4346,13 @@ def _expand_transfer_attempt_provenance(attempt: dict[str, Any]) -> list[dict[st
                 concrete["source_scope_type"] = "context"
                 concrete["source_scope_key"] = source_key
                 concrete["source_context_key"] = source_key
-                concrete["source_game_key"] = source_games[0] if len(source_games) == 1 else None
+                candidate_games = tuple(sorted(str(value) for value in source_context_game_keys.get(source_key, ())))
+                target_game = str(concrete.get("target_game_key") or "")
+                concrete["source_game_key"] = (
+                    target_game if target_game and target_game in candidate_games
+                    else candidate_games[0] if candidate_games
+                    else source_games[0] if len(source_games) == 1 else None
+                )
             concrete["source_carrier_signature"] = source_carrier
             concrete["source_carrier_count"] = 1 if source_carrier else 0
             concrete["source_evidence_support_count"] = int(attempt.get("source_evidence_support_count") or 0)
@@ -3784,30 +4377,36 @@ def _expand_transfer_attempt_provenance(attempt: dict[str, Any]) -> list[dict[st
 def _validate_transfer_attempt_provenance(attempt: dict[str, Any]) -> None:
     """Reject malformed concrete provenance before it reaches SQLite."""
     mode = str(attempt.get("provenance_mode") or "")
-    if mode == "missing_source":
-        if any(attempt.get(key) not in (None, "") for key in (
-            "source_scope_type", "source_scope_key", "source_game_key", "source_context_key",
-            "source_carrier_signature", "source_role_signature",
-        )):
-            raise ValueError("missing-source transfer attempt contains source provenance")
-        return
-    if mode not in {"single_source", "multi_source"}:
+    if mode not in {"single_source", "multi_source", "missing_source"}:
         raise ValueError(f"unsupported transfer provenance mode: {mode}")
     kind = str(attempt.get("transfer_kind") or "")
-    if kind == "cross_game":
-        if not attempt.get("source_game_key") or not attempt.get("target_game_key"):
-            raise ValueError("cross-game transfer attempt is missing game provenance")
-        if str(attempt["source_game_key"]) == str(attempt["target_game_key"]):
-            raise ValueError("cross-game transfer attempt has identical source and target games")
-    elif kind == "cross_context":
-        if not attempt.get("source_context_key") or not attempt.get("target_context_key"):
-            raise ValueError("cross-context transfer attempt is missing context provenance")
-        if str(attempt["source_context_key"]) == str(attempt["target_context_key"]):
-            raise ValueError("cross-context transfer attempt has identical source and target contexts")
-        if attempt.get("source_game_key") and attempt.get("target_game_key") and str(attempt["source_game_key"]) != str(attempt["target_game_key"]):
-            raise ValueError("cross-context transfer attempt crosses games")
-    else:
+    if kind not in {"cross_game", "cross_context"}:
         raise ValueError(f"unsupported transfer kind: {kind}")
+    for key in (
+        "source_interaction_id", "target_interaction_id", "source_game_key", "target_game_key",
+        "source_context_key", "target_context_key",
+    ):
+        if attempt.get(key) in (None, ""):
+            raise ValueError(f"transfer attempt is missing resolved {key}")
+    for prefix in ("source_game", "target_game", "source_context", "target_context"):
+        is_surrogate = bool(attempt.get(f"{prefix}_is_surrogate"))
+        source = str(attempt.get(f"{prefix}_resolution_source") or "")
+        if is_surrogate != (source == "surrogate"):
+            raise ValueError(f"transfer attempt has inconsistent {prefix} surrogate resolution")
+    real_cross_game = (
+        not bool(attempt.get("source_game_is_surrogate"))
+        and not bool(attempt.get("target_game_is_surrogate"))
+        and str(attempt["source_game_key"]) != str(attempt["target_game_key"])
+    )
+    real_cross_context = (
+        not bool(attempt.get("source_context_is_surrogate"))
+        and not bool(attempt.get("target_context_is_surrogate"))
+        and str(attempt["source_context_key"]) != str(attempt["target_context_key"])
+    )
+    if str(attempt.get("provenance_status")) == "verified" and not (
+        mode == "single_source" and (real_cross_game or real_cross_context)
+    ):
+        raise ValueError("verified transfer attempt lacks a real cross-scope dimension")
     if int(attempt.get("reuse_success") or 0) == 1 and not attempt.get("source_role_signature"):
         raise ValueError("successful transfer attempt is missing a source role")
     if mode == "single_source" and not attempt.get("source_carrier_signature"):
@@ -3819,8 +4418,8 @@ def _derive_role_transfer_attempts_chunk(
     chunk: list[tuple[str, str, str]],
     role_rows: dict[str, dict[str, Any]],
     profile_cache: dict[tuple[str, str], list[dict[str, Any]]],
-) -> list[tuple[Any, ...]]:
-    rows: list[tuple[Any, ...]] = []
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
     for carrier_signature, transfer_kind, target_scope_key in chunk:
         attempt = _predict_transfer_attempt(
             profile_cache=profile_cache,
@@ -3830,8 +4429,7 @@ def _derive_role_transfer_attempts_chunk(
             target_scope_key=target_scope_key,
         )
         for item in _expand_transfer_attempt_provenance(attempt):
-            _validate_transfer_attempt_provenance(item)
-            rows.append(_attempt_to_insert_tuple(item))
+            rows.append(item)
     return rows
 
 
@@ -3901,6 +4499,10 @@ def _build_transfer_profile_cache(
                     "source_carrier_signatures": tuple(sorted(source_carriers)),
                     "source_game_keys": tuple(sorted(game_set)),
                     "source_context_keys": tuple(sorted(context_set)),
+                    "source_context_game_keys": {
+                        context: tuple(sorted(context_games.get(context, set())))
+                        for context in sorted(context_set)
+                    },
                     "source_carrier_count": len(source_carriers),
                     "source_evidence_support_count": len(source_carriers),
                     "source_context_count": len(context_set),
@@ -3993,10 +4595,14 @@ def _carrier_scope_maps(
     carrier_contexts = {carrier: set(link_types.get("context", set())) for carrier, link_types in links_by_carrier.items()}
     carrier_games: dict[str, set[str]] = defaultdict(set)
     context_node_ids = {f"context:{context}" for contexts in carrier_contexts.values() for context in contexts}
-    context_games = _context_games_for_context_nodes(graph_conn, context_node_ids)
+    context_node_games = _context_games_for_context_nodes(graph_conn, context_node_ids)
     for carrier_signature, contexts in carrier_contexts.items():
         for context in contexts:
-            carrier_games[carrier_signature].update(context_games.get(f"context:{context}", set()))
+            carrier_games[carrier_signature].update(context_node_games.get(f"context:{context}", set()))
+    context_games = {
+        str(node_id).removeprefix("context:"): set(games)
+        for node_id, games in context_node_games.items()
+    }
     return carrier_contexts, carrier_games, context_games
 
 

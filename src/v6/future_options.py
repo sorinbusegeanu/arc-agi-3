@@ -20,6 +20,7 @@ FUTURE_OPTION_CLEAR_TABLES = (
     "future_option_links",
     "future_option_attention_links",
     "future_option_transfer_links",
+    "future_option_motif_observations",
 )
 
 
@@ -51,6 +52,16 @@ class FutureOptionSet:
     reachable_signatures: tuple[str, ...]
     estimated_branching_factor: int
     depth: int
+
+
+def is_complete_context_key(context_key: object) -> bool:
+    """Reject serialized partial contexts; they cannot support scope claims."""
+    if context_key in (None, ""):
+        return False
+    value = str(context_key).strip().lower()
+    if not value or "null" in value or "none" in value:
+        return False
+    return value not in {"[]", "{}"}
 
 
 @dataclass(frozen=True)
@@ -214,8 +225,13 @@ def derive_future_option_events(
                 environmental_influence_delta, graph_expansion_delta, role_discovery_delta,
                 concept_transfer_delta, developmental_option_value, motif_classification_reason,
                 classification_source, classification_rule, classification_evidence_id, evidence_json
+                , classification_type, classification_provenance_status,
+                source_game_key, target_game_key, source_context_key, target_context_key,
+                target_interaction_id, source_game_is_surrogate, target_game_is_surrogate,
+                source_context_is_surrogate, target_context_is_surrogate,
+                context_resolution_source, context_is_surrogate
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 payload["event_id"],
@@ -262,6 +278,19 @@ def derive_future_option_events(
                 payload["classification_rule"],
                 payload["classification_evidence_id"],
                 json.dumps(payload["evidence_json"], sort_keys=True),
+                payload["classification_type"],
+                payload["classification_provenance_status"],
+                payload["source_game_key"],
+                payload["target_game_key"],
+                payload["source_context_key"],
+                payload["target_context_key"],
+                payload["target_interaction_id"],
+                payload["source_game_is_surrogate"],
+                payload["target_game_is_surrogate"],
+                payload["source_context_is_surrogate"],
+                payload["target_context_is_surrogate"],
+                payload["context_resolution_source"],
+                payload["context_is_surrogate"],
             ),
         )
         inserted += 1
@@ -837,6 +866,16 @@ def derive_future_option_motifs(
             # Legacy/unclassified rows remain observable but are not scientific
             # motif classifications.
             group["motif_type"] = "unknown"
+        verified_event_observations = [
+            row for row in events
+            if str(row.get("classification_provenance_status") or "missing") == "verified"
+            and str(row.get("classification_source") or "unknown") != "unknown"
+        ]
+        motif_provenance_status = (
+            "verified" if verified_event_observations
+            else "proxy" if events and str(group["motif_type"]) != "unknown"
+            else "missing"
+        )
         if str(group["motif_type"]) == "unknown":
             unknown_reason_counts[classification_reason] += linked_event_count
         for row in events:
@@ -912,6 +951,10 @@ def derive_future_option_motifs(
                 json.dumps([]),
             ),
         )
+        state_conn.execute(
+            "UPDATE future_option_motifs SET provenance_status = ? WHERE motif_signature = ?",
+            (motif_provenance_status, motif_signature),
+        )
         if is_emergent:
             emergent_count += 1
             if linked_role_count > 0:
@@ -920,6 +963,27 @@ def derive_future_option_motifs(
                 first_emergent_step = group["first_seen"] if first_emergent_step is None else min(first_emergent_step, int(group["first_seen"]))
         for row in events:
             _insert_future_link(state_conn, motif_signature, "event", str(row["event_id"]), 1, group["first_seen"], group["last_seen"])
+            state_conn.execute(
+                """
+                INSERT OR REPLACE INTO future_option_motif_observations (
+                    motif_signature, event_id, source_game_key, target_game_key,
+                    source_context_key, target_context_key, source_interaction_id,
+                    target_interaction_id, source_game_is_surrogate, target_game_is_surrogate,
+                    source_context_is_surrogate, target_context_is_surrogate,
+                    provenance_status, classification_source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    motif_signature, str(row["event_id"]), row.get("source_game_key") or row.get("game"),
+                    row.get("target_game_key"), row.get("source_context_key") or row.get("context_key"),
+                    row.get("target_context_key"), row.get("source_interaction_id"),
+                    row.get("target_interaction_id"), int(row.get("source_game_is_surrogate") or 0),
+                    int(row.get("target_game_is_surrogate") or 0), int(row.get("source_context_is_surrogate") or 0),
+                    int(row.get("target_context_is_surrogate") or 0),
+                    str(row.get("classification_provenance_status") or "missing"),
+                    str(row.get("classification_source") or "unknown"),
+                ),
+            )
         for family in sorted(group["families"]):
             _insert_future_link(state_conn, motif_signature, "family", family, 1, group["first_seen"], group["last_seen"])
             _upsert_future_provenance_link(state_conn, motif_signature, "motif_derived_from_family", family, group["first_seen"], group["last_seen"])
@@ -1397,6 +1461,126 @@ def _resolve_motif_transfer_provenance(
     }
 
 
+def _concept_validation_records(state_conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
+    """Use durable promotion state when available, with a legacy fallback."""
+    rows = state_conn.execute(
+        """
+        SELECT candidate.concept_signature, candidate.is_promoted,
+               candidate.promotion_status, candidate.validation_status,
+               candidate.promotion_score,
+               persistent.currently_promoted, persistent.promotion_status AS persistent_promotion_status,
+               persistent.validation_status AS persistent_validation_status
+        FROM concept_candidates AS candidate
+        LEFT JOIN concept_promotion_state AS persistent
+          ON persistent.concept_signature = candidate.concept_signature
+        ORDER BY candidate.concept_signature ASC
+        """
+    ).fetchall()
+    records: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        signature = str(row["concept_signature"])
+        promoted = int(
+            row["currently_promoted"]
+            if row["currently_promoted"] is not None else row["is_promoted"] or 0
+        )
+        promotion_status = str(
+            row["persistent_promotion_status"]
+            if row["persistent_promotion_status"] not in (None, "") else row["promotion_status"] or "candidate"
+        )
+        validation_status = str(
+            row["persistent_validation_status"]
+            if row["persistent_validation_status"] not in (None, "") else row["validation_status"] or ""
+        )
+        status = (
+            "verified"
+            if promoted == 1
+            and promotion_status in {"promoted", "retained", "validated"}
+            and validation_status not in {"failed", "demoted", "invalid"}
+            else "demoted"
+            if promotion_status == "demoted" or validation_status == "demoted"
+            else "proxy"
+        )
+        records[signature] = {
+            "status": status,
+            "adjusted_promotion_score": float(row["promotion_score"] or 0.0),
+        }
+    return records
+
+
+def _resolve_concepts_for_roles(
+    state_conn: sqlite3.Connection,
+    *,
+    concept_links: dict[str, dict[str, set[str]]],
+    concept_records: dict[str, dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Return direct concepts, or the strongest concrete indirect fallback."""
+    role_links = _links_by_signature(state_conn, "role_links", "role_signature")
+    direct: dict[str, set[str]] = defaultdict(set)
+    for concept_signature, links in concept_links.items():
+        for role_signature in links.get("role", set()):
+            direct[role_signature].add(concept_signature)
+
+    resolutions: dict[str, list[dict[str, Any]]] = {}
+    all_roles = set(role_links) | set(direct)
+    for role_signature in sorted(all_roles):
+        direct_concepts = sorted(direct.get(role_signature, set()))
+        if direct_concepts:
+            resolutions[role_signature] = [
+                {
+                    "concept_signature": concept_signature,
+                    "mode": "direct_role",
+                    "path": "role_to_concept",
+                    "shared_carrier_count": 0,
+                    "shared_family_count": 0,
+                    "status": concept_records.get(concept_signature, {}).get("status", "missing"),
+                }
+                for concept_signature in direct_concepts
+            ]
+            continue
+        role_carriers = set(role_links.get(role_signature, {}).get("carrier", set()))
+        role_families = set(role_links.get(role_signature, {}).get("family", set()))
+        candidates: list[dict[str, Any]] = []
+        for concept_signature, links in concept_links.items():
+            shared_carriers = role_carriers & set(links.get("carrier", set()))
+            shared_families = role_families & set(links.get("family", set()))
+            if not shared_carriers and not shared_families:
+                continue
+            if shared_carriers and shared_families:
+                mode, path, strength = "shared_carrier_and_family", "role_to_carrier_and_family_to_concept", 0
+            elif shared_carriers:
+                mode, path, strength = "shared_carrier", "role_to_carrier_to_concept", 1
+            else:
+                mode, path, strength = "shared_family", "role_to_family_to_concept", 2
+            record = concept_records.get(concept_signature, {})
+            candidates.append({
+                "concept_signature": concept_signature,
+                "mode": mode,
+                "path": path,
+                "shared_carrier_count": len(shared_carriers),
+                "shared_family_count": len(shared_families),
+                "status": record.get("status", "missing"),
+                "_strength": strength,
+                "_score": float(record.get("adjusted_promotion_score", 0.0)),
+            })
+        if candidates:
+            candidates.sort(key=lambda item: (
+                item["_strength"],
+                0 if item["status"] == "verified" else 1,
+                -(item["shared_carrier_count"] + item["shared_family_count"]),
+                -item["_score"], item["concept_signature"],
+            ))
+            best = dict(candidates[0])
+            best.pop("_strength", None)
+            best.pop("_score", None)
+            resolutions[role_signature] = [best]
+        else:
+            resolutions[role_signature] = [{
+                "concept_signature": "__none__", "mode": "missing", "path": "unresolved",
+                "shared_carrier_count": 0, "shared_family_count": 0, "status": "missing",
+            }]
+    return resolutions
+
+
 def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[str, Any]:
     # Transfer links are fully derived from the current motifs and concrete
     # transfer attempts.  Rebuild atomically so nullable scope keys cannot
@@ -1416,15 +1600,20 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
         ).fetchall()
     }
     concept_links = _links_by_signature(state_conn, "concept_links", "concept_signature")
-    concepts_by_role: dict[str, set[str]] = defaultdict(set)
-    for concept_signature, links in concept_links.items():
-        for role_signature in links.get("role", set()):
-            concepts_by_role[role_signature].add(concept_signature)
+    concept_records = _concept_validation_records(state_conn)
+    concept_resolutions_by_role = _resolve_concepts_for_roles(
+        state_conn, concept_links=concept_links, concept_records=concept_records,
+    )
     transfer_rows = [dict(row) for row in state_conn.execute(
         """
         SELECT source_role_signature AS role_signature, transfer_score, best_margin, reuse_success, similarity_score,
                source_evidence_support_count, candidate_role_count, source_game_key, target_game_key,
-               source_context_key, target_context_key, provenance_mode
+               source_context_key, target_context_key, source_interaction_id, target_interaction_id,
+               source_game_is_surrogate, target_game_is_surrogate,
+               source_context_is_surrogate, target_context_is_surrogate,
+               source_game_resolution_source, target_game_resolution_source,
+               source_context_resolution_source, target_context_resolution_source,
+               provenance_mode, provenance_status
         FROM role_transfer_attempts
         WHERE provenance_mode = 'single_source'
         ORDER BY source_role_signature ASC, attempt_id ASC
@@ -1434,18 +1623,8 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
     for row in transfer_rows:
         transfers_by_role[str(row["role_signature"])].append(row)
     concept_validation_status = {
-        str(row["concept_signature"]): (
-            "verified"
-            if int(row["is_promoted"] or 0) == 1
-            and str(row["promotion_status"] or "") in {"promoted", "retained", "validated"}
-            and str(row["validation_status"] or "") not in {"failed", "demoted", "invalid"}
-            else "demoted"
-            if str(row["promotion_status"] or "") == "demoted" or str(row["validation_status"] or "") == "demoted"
-            else "proxy"
-        )
-        for row in state_conn.execute(
-            "SELECT concept_signature, is_promoted, promotion_status, validation_status FROM concept_candidates ORDER BY concept_signature ASC"
-        ).fetchall()
+        signature: str(record["status"])
+        for signature, record in concept_records.items()
     }
     promoted_concepts = {signature for signature, status in concept_validation_status.items() if status == "verified"}
     inserted = 0
@@ -1472,6 +1651,15 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
     motif_role_link_count = 0
     motif_role_transfer_attempt_link_count = 0
     motif_role_concept_link_count = 0
+    roles_with_direct_concept_links: set[str] = set()
+    roles_resolved_via_shared_carrier: set[str] = set()
+    roles_resolved_via_shared_family: set[str] = set()
+    roles_resolved_via_carrier_and_family: set[str] = set()
+    roles_still_without_concept: set[str] = set()
+    h11_links_using_direct_concept_resolution = 0
+    h11_links_using_indirect_concept_resolution = 0
+    indirect_verified_chain_count = 0
+    indirect_proxy_chain_count = 0
     verified_concrete_transfer_link_count = 0
     verified_transfer_pairs: set[tuple[str, str, str, str]] = set()
     all_motifs_with_transfer: set[str] = set()
@@ -1511,14 +1699,27 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
         motif_had_strong = False
         motif_had_promoted = False
         for role_signature in roles:
-            concepts = sorted(concepts_by_role.get(role_signature, set()) or {"__none__"})
+            concept_resolutions = concept_resolutions_by_role.get(role_signature, [{
+                "concept_signature": "__none__", "mode": "missing", "path": "unresolved",
+                "shared_carrier_count": 0, "shared_family_count": 0, "status": "missing",
+            }])
+            concepts = [str(item["concept_signature"]) for item in concept_resolutions]
             role_transfer_rows = transfers_by_role.get(role_signature, [])
             if role_transfer_rows:
                 unique_roles_with_transfer_attempts.add(role_signature)
                 motif_role_transfer_attempt_link_count += 1
-            if role_signature in concepts_by_role:
+            if any(item["mode"] == "direct_role" for item in concept_resolutions):
+                roles_with_direct_concept_links.add(role_signature)
                 unique_roles_with_concepts.add(role_signature)
-                motif_role_concept_link_count += len(concepts_by_role[role_signature])
+                motif_role_concept_link_count += len(concept_resolutions)
+            elif concept_resolutions[0]["mode"] == "shared_carrier_and_family":
+                roles_resolved_via_carrier_and_family.add(role_signature)
+            elif concept_resolutions[0]["mode"] == "shared_carrier":
+                roles_resolved_via_shared_carrier.add(role_signature)
+            elif concept_resolutions[0]["mode"] == "shared_family":
+                roles_resolved_via_shared_family.add(role_signature)
+            else:
+                roles_still_without_concept.add(role_signature)
             rows_by_pair: dict[tuple[str | None, str | None, str | None, str | None], list[dict[str, Any]]] = defaultdict(list)
             for transfer_row in role_transfer_rows:
                 pair = (
@@ -1528,7 +1729,8 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
                 rows_by_pair[pair].append(transfer_row)
             if not rows_by_pair:
                 rows_by_pair[(None, None, None, None)] = []
-            for concept_signature in concepts:
+            for resolution in concept_resolutions:
+                concept_signature = str(resolution["concept_signature"])
                 for provenance, pair_rows in sorted(rows_by_pair.items(), key=lambda item: tuple(str(value or "") for value in item[0])):
                     transfer_attempt_count = len(pair_rows)
                     successful_transfer_count = sum(1 for row in pair_rows if int(row["reuse_success"] or 0) == 1)
@@ -1547,9 +1749,32 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
                     mean_transfer_score = _mean([row.get("transfer_score") for row in pair_rows])
                     mean_best_margin = _mean([row.get("best_margin") for row in pair_rows if row.get("best_margin") is not None])
                     source_game_key, target_game_key, source_context_key, target_context_key = provenance
-                    concrete_pair = all(value not in (None, "") for value in provenance)
-                    transfer_provenance_status = "verified" if concrete_pair else "proxy"
-                    concept_status = concept_validation_status.get(concept_signature, "missing") if concept_signature != "__none__" else "missing"
+                    representative = pair_rows[0] if pair_rows else {}
+                    source_game_is_surrogate = int(representative.get("source_game_is_surrogate") or 0)
+                    target_game_is_surrogate = int(representative.get("target_game_is_surrogate") or 0)
+                    source_context_is_surrogate = int(representative.get("source_context_is_surrogate") or 0)
+                    target_context_is_surrogate = int(representative.get("target_context_is_surrogate") or 0)
+                    real_cross_game = (
+                        not source_game_is_surrogate and not target_game_is_surrogate
+                        and source_game_key != target_game_key
+                    )
+                    real_cross_context = (
+                        not source_context_is_surrogate and not target_context_is_surrogate
+                        and source_context_key != target_context_key
+                    )
+                    transfer_provenance_status = (
+                        "verified" if pair_rows and all(str(row.get("provenance_status") or "") == "verified" for row in pair_rows)
+                        else "resolved_with_surrogate" if any((source_game_is_surrogate, target_game_is_surrogate, source_context_is_surrogate, target_context_is_surrogate))
+                        else "proxy"
+                    )
+                    transfer_scope = (
+                        "cross_game_and_context" if real_cross_game and real_cross_context
+                        else "cross_game" if real_cross_game
+                        else "cross_context" if real_cross_context
+                        else "surrogate_resolved" if transfer_provenance_status == "resolved_with_surrogate"
+                        else "same_scope"
+                    )
+                    concept_status = str(resolution["status"]) if concept_signature != "__none__" else "missing"
                     first_seen = _safe_min(state_conn, motif_signature, role_signature, concept_signature, "first")
                     last_seen = _safe_min(state_conn, motif_signature, role_signature, concept_signature, "last")
                     state_conn.execute(
@@ -1558,27 +1783,47 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
                             motif_signature, role_signature, concept_signature, transfer_attempt_count,
                             successful_transfer_count, strong_transfer_success_count, promoted_concept_count,
                             mean_transfer_score, mean_best_margin, source_role_signature, source_game_key,
-                            target_game_key, source_context_key, target_context_key, provenance_mode,
+                            target_game_key, source_context_key, target_context_key,
+                            source_interaction_id, target_interaction_id,
+                            source_game_is_surrogate, target_game_is_surrogate,
+                            source_context_is_surrogate, target_context_is_surrogate,
+                            source_game_resolution_source, target_game_resolution_source,
+                            source_context_resolution_source, target_context_resolution_source,
+                            transfer_scope, provenance_mode,
                             motif_provenance_status, transfer_provenance_status, concept_validation_status,
                             motif_provenance_resolution_path, motif_resolved_interaction_count,
                             motif_resolved_family_count, motif_resolved_carrier_count,
                             motif_resolved_role_count, motif_resolved_concept_count,
+                            concept_resolution_mode, concept_resolution_path,
+                            shared_carrier_count, shared_family_count,
                             first_seen_global_step, last_seen_global_step
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             motif_signature, role_signature, concept_signature,
                             transfer_attempt_count, successful_transfer_count, strong_transfer_success_count,
                             promoted_concept_count, mean_transfer_score, mean_best_margin, role_signature,
                             source_game_key, target_game_key, source_context_key, target_context_key,
-                            "single_source", motif_provenance_status, transfer_provenance_status,
+                            representative.get("source_interaction_id"), representative.get("target_interaction_id"),
+                            source_game_is_surrogate, target_game_is_surrogate,
+                            source_context_is_surrogate, target_context_is_surrogate,
+                            representative.get("source_game_resolution_source"), representative.get("target_game_resolution_source"),
+                            representative.get("source_context_resolution_source"), representative.get("target_context_resolution_source"),
+                            transfer_scope, "single_source", motif_provenance_status, transfer_provenance_status,
                             concept_status, provenance_resolution["resolution_path"],
                             len(provenance_resolution["interaction_ids"]), len(provenance_resolution["family_ids"]),
                             len(provenance_resolution["carrier_ids"]), len(provenance_resolution["role_ids"]),
-                            len(provenance_resolution["concept_ids"]), first_seen, last_seen,
+                            len(provenance_resolution["concept_ids"]),
+                            resolution["mode"], resolution["path"],
+                            int(resolution["shared_carrier_count"]), int(resolution["shared_family_count"]),
+                            first_seen, last_seen,
                         ),
                     )
                     inserted += 1
+                    if resolution["mode"] == "direct_role":
+                        h11_links_using_direct_concept_resolution += 1
+                    elif resolution["mode"] != "missing":
+                        h11_links_using_indirect_concept_resolution += 1
                     motif_had_transfer = motif_had_transfer or transfer_attempt_count > 0
                     motif_had_strong = motif_had_strong or strong_transfer_success_count > 0
                     motif_had_promoted = motif_had_promoted or promoted_concept_count > 0
@@ -1593,6 +1838,11 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
                         and transfer_provenance_status == "verified"
                         and concept_status == "verified"
                     )
+                    if resolution["mode"] != "direct_role" and resolution["mode"] != "missing":
+                        if fully_verified:
+                            indirect_verified_chain_count += 1
+                        else:
+                            indirect_proxy_chain_count += 1
                     if fully_verified and transfer_attempt_count > 0:
                         verified_motifs_with_transfer.add(motif_signature)
                     if fully_verified and strong_transfer_success_count > 0:
@@ -1600,7 +1850,7 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
                     if fully_verified and promoted_concept_count > 0:
                         verified_motifs_with_promoted.add(motif_signature)
                     if transfer_provenance_status == "verified":
-                        assert role_signature and concrete_pair
+                        assert role_signature and (real_cross_game or real_cross_context)
                         verified_concrete_transfer_link_count += 1
                         verified_transfer_pairs.add(tuple(str(value) for value in provenance))
                     if is_emergent_motif:
@@ -1665,6 +1915,15 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
         "motif_role_link_count": motif_role_link_count,
         "motif_role_transfer_attempt_link_count": motif_role_transfer_attempt_link_count,
         "motif_role_concept_link_count": motif_role_concept_link_count,
+        "roles_with_direct_concept_links": len(roles_with_direct_concept_links),
+        "roles_resolved_via_shared_carrier": len(roles_resolved_via_shared_carrier),
+        "roles_resolved_via_shared_family": len(roles_resolved_via_shared_family),
+        "roles_resolved_via_carrier_and_family": len(roles_resolved_via_carrier_and_family),
+        "roles_still_without_concept": len(roles_still_without_concept),
+        "h11_links_using_direct_concept_resolution": h11_links_using_direct_concept_resolution,
+        "h11_links_using_indirect_concept_resolution": h11_links_using_indirect_concept_resolution,
+        "indirect_verified_chain_count": indirect_verified_chain_count,
+        "indirect_proxy_chain_count": indirect_proxy_chain_count,
     }
 
 
@@ -1769,6 +2028,27 @@ def _build_future_option_event(
     }
     for key, values in provenance.items():
         evidence[key] = values
+    source_game_key = None if game in (None, "") else str(game)
+    source_context_key = context_key if is_complete_context_key(context_key) else None
+    context_is_surrogate = int(context_key not in (None, "") and source_context_key is None)
+    concrete_provenance = bool(
+        provenance["source_interaction_ids"]
+        or provenance["source_family_ids"]
+        or provenance["source_carrier_ids"]
+        or provenance["source_role_ids"]
+        or provenance["source_concept_ids"]
+    )
+    classification_provenance_status = (
+        "verified" if classification_source != "unknown" and concrete_provenance
+        else "proxy" if classification_source != "unknown"
+        else "missing"
+    )
+    evidence["classification_type"] = motif_type
+    evidence["classification_provenance_status"] = classification_provenance_status
+    evidence["source_game_key"] = source_game_key
+    evidence["source_context_key"] = source_context_key
+    evidence["context_resolution_source"] = "direct_event" if source_context_key else "missing"
+    evidence["context_is_surrogate"] = bool(context_is_surrogate)
     components = _compute_development_components(
         option_delta=option_delta,
         motif_type=motif_type,
@@ -1833,6 +2113,19 @@ def _build_future_option_event(
         "classification_source": classification_source,
         "classification_rule": motif_classification_reason,
         "classification_evidence_id": event_id,
+        "classification_type": motif_type,
+        "classification_provenance_status": classification_provenance_status,
+        "source_game_key": source_game_key,
+        "target_game_key": None,
+        "source_context_key": source_context_key,
+        "target_context_key": None,
+        "target_interaction_id": None,
+        "source_game_is_surrogate": 0,
+        "target_game_is_surrogate": 0,
+        "source_context_is_surrogate": context_is_surrogate,
+        "target_context_is_surrogate": 0,
+        "context_resolution_source": "direct_event" if source_context_key else "missing",
+        "context_is_surrogate": context_is_surrogate,
         "evidence_json": evidence,
     }
 
@@ -2054,7 +2347,7 @@ def _classify_structural_motif(
 
 def _classification_source_from_rule(rule: str) -> str:
     mapping = {
-        "structural_effect": "structured_effect",
+        "structural_effect": "structural_effect",
         "structural_option_delta": "option_delta",
         "structural_graph_effect": "graph_effect",
         "structural_role_effect": "role_effect",

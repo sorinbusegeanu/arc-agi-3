@@ -5046,6 +5046,7 @@ def _ensure_current_state_schema(path: Path) -> bool:
         }
         legacy_transfer_provenance = False
         legacy_transfer_support = False
+        legacy_transfer_scope_resolution = False
         if "role_transfer_attempts" in existing_tables:
             attempt_columns = {
                 str(row[1])
@@ -5062,6 +5063,23 @@ def _ensure_current_state_schema(path: Path) -> bool:
             legacy_transfer_support = (
                 "source_evidence_support_count" not in attempt_columns
                 and bool(connection.execute("SELECT 1 FROM role_transfer_attempts LIMIT 1").fetchone())
+            )
+            legacy_transfer_scope_resolution = (
+                not {
+                    "source_interaction_id", "target_interaction_id",
+                    "source_game_is_surrogate", "target_game_is_surrogate",
+                    "source_context_is_surrogate", "target_context_is_surrogate",
+                    "source_game_resolution_source", "target_game_resolution_source",
+                    "source_context_resolution_source", "target_context_resolution_source",
+                }.issubset(attempt_columns)
+                or bool(
+                    connection.execute(
+                        """SELECT 1 FROM role_transfer_attempts
+                           WHERE source_game_key IS NULL OR target_game_key IS NULL
+                              OR source_context_key IS NULL OR target_context_key IS NULL
+                           LIMIT 1"""
+                    ).fetchone()
+                )
             )
         connection.executescript(
             """
@@ -5325,7 +5343,9 @@ def _ensure_current_state_schema(path: Path) -> bool:
                 role_future_option_lift REAL,
                 role_transfer_lift REAL,
                 promotion_status TEXT,
-                promotion_failure_count INTEGER DEFAULT 0
+                promotion_failure_count INTEGER DEFAULT 0,
+                structurally_promoted_this_epoch INTEGER DEFAULT 0,
+                promotion_retained_from_history INTEGER DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS role_links (
                 role_signature TEXT,
@@ -5348,6 +5368,18 @@ def _ensure_current_state_schema(path: Path) -> bool:
                 target_game_key TEXT,
                 source_context_key TEXT,
                 target_context_key TEXT,
+                source_interaction_id TEXT,
+                target_interaction_id TEXT,
+                source_scope_origin TEXT,
+                target_scope_origin TEXT,
+                source_game_is_surrogate INTEGER DEFAULT 0,
+                target_game_is_surrogate INTEGER DEFAULT 0,
+                source_context_is_surrogate INTEGER DEFAULT 0,
+                target_context_is_surrogate INTEGER DEFAULT 0,
+                source_game_resolution_source TEXT,
+                target_game_resolution_source TEXT,
+                source_context_resolution_source TEXT,
+                target_context_resolution_source TEXT,
                 source_carrier_signature TEXT,
                 source_role_signature TEXT,
                 predicted_target_role_signature TEXT,
@@ -5420,8 +5452,25 @@ def _ensure_current_state_schema(path: Path) -> bool:
                 PRIMARY KEY (concept_signature, linked_type, linked_key)
             );
             CREATE TABLE IF NOT EXISTS concept_promotion_validation_diagnostics (
+                diagnostic_epoch_id TEXT NOT NULL DEFAULT '',
+                concept_signature TEXT NOT NULL,
+                validation_algorithm_version INTEGER NOT NULL DEFAULT 0,
+                payload_json TEXT NOT NULL,
+                PRIMARY KEY (diagnostic_epoch_id, concept_signature, validation_algorithm_version)
+            );
+            CREATE TABLE IF NOT EXISTS concept_promotion_state (
                 concept_signature TEXT PRIMARY KEY,
-                payload_json TEXT NOT NULL
+                historically_promoted INTEGER NOT NULL DEFAULT 0,
+                currently_promoted INTEGER NOT NULL DEFAULT 0,
+                promotion_status TEXT NOT NULL DEFAULT 'candidate',
+                validation_status TEXT,
+                first_promoted_global_step INTEGER,
+                last_validated_global_step INTEGER,
+                consecutive_validation_failures INTEGER NOT NULL DEFAULT 0,
+                total_validation_failures INTEGER NOT NULL DEFAULT 0,
+                last_demotion_reason TEXT,
+                validation_algorithm_version INTEGER,
+                updated_at TEXT
             );
             CREATE TABLE IF NOT EXISTS concept_incremental_coverage_state (
                 candidate_signature TEXT PRIMARY KEY,
@@ -5455,7 +5504,64 @@ def _ensure_current_state_schema(path: Path) -> bool:
                 validation_action_selection_lift REAL,
                 validation_transfer_lift REAL,
                 promotion_status TEXT,
-                promotion_failure_count INTEGER DEFAULT 0
+                promotion_failure_count INTEGER DEFAULT 0,
+                structural_prediction_support_count INTEGER DEFAULT 0,
+                observed_outcome_count INTEGER DEFAULT 0,
+                correct_prediction_count INTEGER DEFAULT 0,
+                prediction_error_count INTEGER DEFAULT 0,
+                prediction_evidence_status TEXT DEFAULT 'missing',
+                baseline_prediction_score REAL,
+                component_prediction_score REAL,
+                heldout_prediction_gain REAL,
+                matched_prediction_event_count INTEGER DEFAULT 0,
+                unmatched_prediction_event_count INTEGER DEFAULT 0,
+                structural_coherence_score REAL,
+                functional_coherence_score REAL,
+                combined_coherence_score REAL,
+                candidate_family_link_count INTEGER DEFAULT 0,
+                retained_family_link_count INTEGER DEFAULT 0,
+                dropped_family_link_count INTEGER DEFAULT 0,
+                family_links_dropped_low_support INTEGER DEFAULT 0,
+                family_links_dropped_limit INTEGER DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS world_model_component_state (
+                component_signature TEXT PRIMARY KEY,
+                historically_coherent INTEGER NOT NULL DEFAULT 0,
+                currently_coherent INTEGER NOT NULL DEFAULT 0,
+                first_coherent_global_step INTEGER,
+                last_validated_global_step INTEGER,
+                consecutive_validation_failures INTEGER NOT NULL DEFAULT 0,
+                validation_status TEXT,
+                updated_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS world_model_prediction_events (
+                prediction_event_id TEXT PRIMARY KEY,
+                component_signature TEXT NOT NULL,
+                prediction_global_step INTEGER NOT NULL,
+                predicted_family TEXT,
+                predicted_effect TEXT,
+                predicted_outcome TEXT,
+                observed_event_id TEXT,
+                observed_global_step INTEGER,
+                observed_family TEXT,
+                observed_effect TEXT,
+                prediction_correct INTEGER,
+                game_key TEXT,
+                context_key TEXT,
+                action_key TEXT,
+                baseline_prediction_score REAL,
+                component_prediction_score REAL,
+                provenance_status TEXT NOT NULL DEFAULT 'missing'
+            );
+            CREATE TABLE IF NOT EXISTS world_model_family_links (
+                component_signature TEXT,
+                family_signature TEXT,
+                family_link_support_count INTEGER DEFAULT 0,
+                family_link_role_count INTEGER DEFAULT 0,
+                family_link_event_count INTEGER DEFAULT 0,
+                family_link_prediction_gain REAL DEFAULT 0,
+                family_link_provenance_status TEXT DEFAULT 'missing',
+                PRIMARY KEY (component_signature, family_signature)
             );
             CREATE TABLE IF NOT EXISTS world_model_links (
                 component_signature TEXT,
@@ -5535,6 +5641,19 @@ def _ensure_current_state_schema(path: Path) -> bool:
                 classification_source TEXT,
                 classification_rule TEXT,
                 classification_evidence_id TEXT,
+                classification_type TEXT,
+                classification_provenance_status TEXT,
+                source_game_key TEXT,
+                target_game_key TEXT,
+                source_context_key TEXT,
+                target_context_key TEXT,
+                target_interaction_id TEXT,
+                source_game_is_surrogate INTEGER DEFAULT 0,
+                target_game_is_surrogate INTEGER DEFAULT 0,
+                source_context_is_surrogate INTEGER DEFAULT 0,
+                target_context_is_surrogate INTEGER DEFAULT 0,
+                context_resolution_source TEXT,
+                context_is_surrogate INTEGER DEFAULT 0,
                 evidence_json TEXT
             );
             CREATE TABLE IF NOT EXISTS future_option_motifs (
@@ -5570,10 +5689,28 @@ def _ensure_current_state_schema(path: Path) -> bool:
                 classification_source TEXT,
                 classification_rule TEXT,
                 classification_evidence_id TEXT,
+                provenance_status TEXT,
                 source_game_keys_json TEXT,
                 target_game_keys_json TEXT,
                 source_context_keys_json TEXT,
                 target_context_keys_json TEXT
+            );
+            CREATE TABLE IF NOT EXISTS future_option_motif_observations (
+                motif_signature TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                source_game_key TEXT,
+                target_game_key TEXT,
+                source_context_key TEXT,
+                target_context_key TEXT,
+                source_interaction_id TEXT,
+                target_interaction_id TEXT,
+                source_game_is_surrogate INTEGER DEFAULT 0,
+                target_game_is_surrogate INTEGER DEFAULT 0,
+                source_context_is_surrogate INTEGER DEFAULT 0,
+                target_context_is_surrogate INTEGER DEFAULT 0,
+                provenance_status TEXT NOT NULL DEFAULT 'missing',
+                classification_source TEXT,
+                PRIMARY KEY (motif_signature, event_id, source_game_key, target_game_key, source_context_key, target_context_key)
             );
             CREATE TABLE IF NOT EXISTS future_option_links (
                 motif_signature TEXT,
@@ -5621,6 +5758,17 @@ def _ensure_current_state_schema(path: Path) -> bool:
                 target_game_key TEXT,
                 source_context_key TEXT,
                 target_context_key TEXT,
+                source_interaction_id TEXT,
+                target_interaction_id TEXT,
+                source_game_is_surrogate INTEGER DEFAULT 0,
+                target_game_is_surrogate INTEGER DEFAULT 0,
+                source_context_is_surrogate INTEGER DEFAULT 0,
+                target_context_is_surrogate INTEGER DEFAULT 0,
+                source_game_resolution_source TEXT,
+                target_game_resolution_source TEXT,
+                source_context_resolution_source TEXT,
+                target_context_resolution_source TEXT,
+                transfer_scope TEXT,
                 provenance_mode TEXT,
                 motif_provenance_status TEXT,
                 transfer_provenance_status TEXT,
@@ -5631,6 +5779,10 @@ def _ensure_current_state_schema(path: Path) -> bool:
                 motif_resolved_carrier_count INTEGER DEFAULT 0,
                 motif_resolved_role_count INTEGER DEFAULT 0,
                 motif_resolved_concept_count INTEGER DEFAULT 0,
+                concept_resolution_mode TEXT,
+                concept_resolution_path TEXT,
+                shared_carrier_count INTEGER DEFAULT 0,
+                shared_family_count INTEGER DEFAULT 0,
                 first_seen_global_step INTEGER,
                 last_seen_global_step INTEGER,
                 PRIMARY KEY (
@@ -5766,6 +5918,18 @@ def _ensure_current_state_schema(path: Path) -> bool:
         _ensure_column(connection, "role_transfer_attempts", "target_game_key", "TEXT")
         _ensure_column(connection, "role_transfer_attempts", "source_context_key", "TEXT")
         _ensure_column(connection, "role_transfer_attempts", "target_context_key", "TEXT")
+        _ensure_column(connection, "role_transfer_attempts", "source_interaction_id", "TEXT")
+        _ensure_column(connection, "role_transfer_attempts", "target_interaction_id", "TEXT")
+        _ensure_column(connection, "role_transfer_attempts", "source_scope_origin", "TEXT")
+        _ensure_column(connection, "role_transfer_attempts", "target_scope_origin", "TEXT")
+        _ensure_column(connection, "role_transfer_attempts", "source_game_is_surrogate", "INTEGER DEFAULT 0")
+        _ensure_column(connection, "role_transfer_attempts", "target_game_is_surrogate", "INTEGER DEFAULT 0")
+        _ensure_column(connection, "role_transfer_attempts", "source_context_is_surrogate", "INTEGER DEFAULT 0")
+        _ensure_column(connection, "role_transfer_attempts", "target_context_is_surrogate", "INTEGER DEFAULT 0")
+        _ensure_column(connection, "role_transfer_attempts", "source_game_resolution_source", "TEXT")
+        _ensure_column(connection, "role_transfer_attempts", "target_game_resolution_source", "TEXT")
+        _ensure_column(connection, "role_transfer_attempts", "source_context_resolution_source", "TEXT")
+        _ensure_column(connection, "role_transfer_attempts", "target_context_resolution_source", "TEXT")
         _ensure_column(connection, "role_transfer_attempts", "source_carrier_signature", "TEXT")
         _ensure_column(connection, "role_transfer_attempts", "source_role_signature", "TEXT")
         _ensure_column(connection, "role_transfer_attempts", "predicted_target_role_signature", "TEXT")
@@ -5780,6 +5944,17 @@ def _ensure_current_state_schema(path: Path) -> bool:
         _ensure_column(connection, "future_option_transfer_links", "target_game_key", "TEXT")
         _ensure_column(connection, "future_option_transfer_links", "source_context_key", "TEXT")
         _ensure_column(connection, "future_option_transfer_links", "target_context_key", "TEXT")
+        _ensure_column(connection, "future_option_transfer_links", "source_interaction_id", "TEXT")
+        _ensure_column(connection, "future_option_transfer_links", "target_interaction_id", "TEXT")
+        _ensure_column(connection, "future_option_transfer_links", "source_game_is_surrogate", "INTEGER DEFAULT 0")
+        _ensure_column(connection, "future_option_transfer_links", "target_game_is_surrogate", "INTEGER DEFAULT 0")
+        _ensure_column(connection, "future_option_transfer_links", "source_context_is_surrogate", "INTEGER DEFAULT 0")
+        _ensure_column(connection, "future_option_transfer_links", "target_context_is_surrogate", "INTEGER DEFAULT 0")
+        _ensure_column(connection, "future_option_transfer_links", "source_game_resolution_source", "TEXT")
+        _ensure_column(connection, "future_option_transfer_links", "target_game_resolution_source", "TEXT")
+        _ensure_column(connection, "future_option_transfer_links", "source_context_resolution_source", "TEXT")
+        _ensure_column(connection, "future_option_transfer_links", "target_context_resolution_source", "TEXT")
+        _ensure_column(connection, "future_option_transfer_links", "transfer_scope", "TEXT")
         _ensure_column(connection, "future_option_transfer_links", "provenance_mode", "TEXT")
         _ensure_column(connection, "future_option_transfer_links", "motif_provenance_status", "TEXT")
         _ensure_column(connection, "future_option_transfer_links", "transfer_provenance_status", "TEXT")
@@ -5833,6 +6008,17 @@ def _ensure_current_state_schema(path: Path) -> bool:
                     target_game_key TEXT,
                     source_context_key TEXT,
                     target_context_key TEXT,
+                    source_interaction_id TEXT,
+                    target_interaction_id TEXT,
+                    source_game_is_surrogate INTEGER DEFAULT 0,
+                    target_game_is_surrogate INTEGER DEFAULT 0,
+                    source_context_is_surrogate INTEGER DEFAULT 0,
+                    target_context_is_surrogate INTEGER DEFAULT 0,
+                    source_game_resolution_source TEXT,
+                    target_game_resolution_source TEXT,
+                    source_context_resolution_source TEXT,
+                    target_context_resolution_source TEXT,
+                    transfer_scope TEXT,
                     provenance_mode TEXT,
                     motif_provenance_status TEXT,
                     transfer_provenance_status TEXT,
@@ -5843,6 +6029,10 @@ def _ensure_current_state_schema(path: Path) -> bool:
                     motif_resolved_carrier_count INTEGER DEFAULT 0,
                     motif_resolved_role_count INTEGER DEFAULT 0,
                     motif_resolved_concept_count INTEGER DEFAULT 0,
+                    concept_resolution_mode TEXT,
+                    concept_resolution_path TEXT,
+                    shared_carrier_count INTEGER DEFAULT 0,
+                    shared_family_count INTEGER DEFAULT 0,
                     first_seen_global_step INTEGER,
                     last_seen_global_step INTEGER,
                     PRIMARY KEY (
@@ -5882,6 +6072,93 @@ def _ensure_current_state_schema(path: Path) -> bool:
         _ensure_column(connection, "concept_candidates", "promotion_status", "TEXT")
         _ensure_column(connection, "concept_candidates", "promotion_failure_count", "INTEGER DEFAULT 0")
         _ensure_column(connection, "concept_candidates", "raw_promotion_score", "REAL")
+        _ensure_column(connection, "concept_candidates", "structurally_promoted_this_epoch", "INTEGER DEFAULT 0")
+        _ensure_column(connection, "concept_candidates", "promotion_retained_from_history", "INTEGER DEFAULT 0")
+        # Diagnostics used to be keyed only by concept signature, which made
+        # every candidate rebuild erase longitudinal evidence.  Preserve old
+        # rows as an explicit legacy epoch before accepting epoch/version rows.
+        diagnostic_columns = {
+            str(row[1]): int(row[5])
+            for row in connection.execute("PRAGMA table_info(concept_promotion_validation_diagnostics)").fetchall()
+        }
+        diagnostic_pk = {
+            name for name, pk_order in diagnostic_columns.items() if pk_order > 0
+        }
+        required_diagnostic_pk = {
+            "diagnostic_epoch_id", "concept_signature", "validation_algorithm_version"
+        }
+        if not required_diagnostic_pk <= diagnostic_pk:
+            connection.execute(
+                "ALTER TABLE concept_promotion_validation_diagnostics RENAME TO concept_promotion_validation_diagnostics_legacy"
+            )
+            connection.execute(
+                """
+                CREATE TABLE concept_promotion_validation_diagnostics (
+                    diagnostic_epoch_id TEXT NOT NULL DEFAULT '',
+                    concept_signature TEXT NOT NULL,
+                    validation_algorithm_version INTEGER NOT NULL DEFAULT 0,
+                    payload_json TEXT NOT NULL,
+                    PRIMARY KEY (diagnostic_epoch_id, concept_signature, validation_algorithm_version)
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO concept_promotion_validation_diagnostics (
+                    diagnostic_epoch_id, concept_signature, validation_algorithm_version, payload_json
+                )
+                SELECT 'legacy', concept_signature, 0, payload_json
+                FROM concept_promotion_validation_diagnostics_legacy
+                """
+            )
+            connection.execute("DROP TABLE concept_promotion_validation_diagnostics_legacy")
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_concept_promotion_diagnostics_signature "
+            "ON concept_promotion_validation_diagnostics(concept_signature, diagnostic_epoch_id)"
+        )
+        # State survives regenerated concept evidence.  The insert is
+        # intentionally non-destructive: it seeds pre-state databases while
+        # never overwriting a previously validated concept.
+        connection.execute(
+            """
+            INSERT INTO concept_promotion_state (
+                concept_signature, historically_promoted, currently_promoted,
+                promotion_status, validation_status, first_promoted_global_step,
+                consecutive_validation_failures, total_validation_failures,
+                last_demotion_reason, validation_algorithm_version, updated_at
+            )
+            SELECT
+                concept_signature,
+                CASE WHEN COALESCE(is_promoted, 0) = 1
+                       OR COALESCE(promotion_status, '') IN ('promoted', 'retained', 'validated')
+                     THEN 1 ELSE 0 END,
+                COALESCE(is_promoted, 0),
+                COALESCE(NULLIF(promotion_status, ''), CASE WHEN COALESCE(is_promoted, 0) = 1 THEN 'promoted' ELSE 'candidate' END),
+                validation_status,
+                CASE WHEN COALESCE(is_promoted, 0) = 1 THEN first_seen_global_step ELSE NULL END,
+                COALESCE(promotion_failure_count, 0),
+                COALESCE(promotion_failure_count, 0),
+                demotion_reason,
+                ?,
+                datetime('now')
+                FROM concept_candidates
+                WHERE 1
+                ON CONFLICT(concept_signature) DO NOTHING
+            """,
+            (INCREMENTAL_PROMOTION_VALIDATION_VERSION,),
+        )
+        connection.execute(
+            """
+            INSERT INTO memory_summary (key, value_json)
+            VALUES ('concept_promotion_state_migration_v1', ?)
+            ON CONFLICT(key) DO NOTHING
+            """,
+            (json.dumps({"schema": "persistent_concept_promotion_state_v1"}, sort_keys=True),),
+        )
+        _ensure_column(connection, "future_option_transfer_links", "concept_resolution_mode", "TEXT")
+        _ensure_column(connection, "future_option_transfer_links", "concept_resolution_path", "TEXT")
+        _ensure_column(connection, "future_option_transfer_links", "shared_carrier_count", "INTEGER DEFAULT 0")
+        _ensure_column(connection, "future_option_transfer_links", "shared_family_count", "INTEGER DEFAULT 0")
         _ensure_column(connection, "promotion_validation_state", "last_validation_epoch", "TEXT")
         _ensure_column(connection, "promotion_validation_state", "last_validation_global_step", "INTEGER")
         _ensure_column(connection, "promotion_validation_state", "last_validation_result", "TEXT")
@@ -5895,6 +6172,24 @@ def _ensure_current_state_schema(path: Path) -> bool:
         _ensure_column(connection, "world_model_components", "validation_explanatory_gain", "REAL")
         _ensure_column(connection, "world_model_components", "promotion_status", "TEXT")
         _ensure_column(connection, "world_model_components", "promotion_failure_count", "INTEGER DEFAULT 0")
+        _ensure_column(connection, "world_model_components", "structural_prediction_support_count", "INTEGER DEFAULT 0")
+        _ensure_column(connection, "world_model_components", "observed_outcome_count", "INTEGER DEFAULT 0")
+        _ensure_column(connection, "world_model_components", "correct_prediction_count", "INTEGER DEFAULT 0")
+        _ensure_column(connection, "world_model_components", "prediction_error_count", "INTEGER DEFAULT 0")
+        _ensure_column(connection, "world_model_components", "prediction_evidence_status", "TEXT DEFAULT 'missing'")
+        _ensure_column(connection, "world_model_components", "baseline_prediction_score", "REAL")
+        _ensure_column(connection, "world_model_components", "component_prediction_score", "REAL")
+        _ensure_column(connection, "world_model_components", "heldout_prediction_gain", "REAL")
+        _ensure_column(connection, "world_model_components", "matched_prediction_event_count", "INTEGER DEFAULT 0")
+        _ensure_column(connection, "world_model_components", "unmatched_prediction_event_count", "INTEGER DEFAULT 0")
+        _ensure_column(connection, "world_model_components", "structural_coherence_score", "REAL")
+        _ensure_column(connection, "world_model_components", "functional_coherence_score", "REAL")
+        _ensure_column(connection, "world_model_components", "combined_coherence_score", "REAL")
+        _ensure_column(connection, "world_model_components", "candidate_family_link_count", "INTEGER DEFAULT 0")
+        _ensure_column(connection, "world_model_components", "retained_family_link_count", "INTEGER DEFAULT 0")
+        _ensure_column(connection, "world_model_components", "dropped_family_link_count", "INTEGER DEFAULT 0")
+        _ensure_column(connection, "world_model_components", "family_links_dropped_low_support", "INTEGER DEFAULT 0")
+        _ensure_column(connection, "world_model_components", "family_links_dropped_limit", "INTEGER DEFAULT 0")
         _ensure_column(connection, "future_option_attention_links", "attention_signal_source", "TEXT")
         _ensure_column(connection, "future_option_attention_links", "raw_high_attention", "INTEGER")
         _ensure_column(connection, "future_option_attention_links", "calibrated_high_attention", "INTEGER")
@@ -5924,6 +6219,19 @@ def _ensure_current_state_schema(path: Path) -> bool:
         _ensure_column(connection, "future_option_events", "classification_source", "TEXT")
         _ensure_column(connection, "future_option_events", "classification_rule", "TEXT")
         _ensure_column(connection, "future_option_events", "classification_evidence_id", "TEXT")
+        _ensure_column(connection, "future_option_events", "classification_type", "TEXT")
+        _ensure_column(connection, "future_option_events", "classification_provenance_status", "TEXT")
+        _ensure_column(connection, "future_option_events", "source_game_key", "TEXT")
+        _ensure_column(connection, "future_option_events", "target_game_key", "TEXT")
+        _ensure_column(connection, "future_option_events", "source_context_key", "TEXT")
+        _ensure_column(connection, "future_option_events", "target_context_key", "TEXT")
+        _ensure_column(connection, "future_option_events", "target_interaction_id", "TEXT")
+        _ensure_column(connection, "future_option_events", "source_game_is_surrogate", "INTEGER DEFAULT 0")
+        _ensure_column(connection, "future_option_events", "target_game_is_surrogate", "INTEGER DEFAULT 0")
+        _ensure_column(connection, "future_option_events", "source_context_is_surrogate", "INTEGER DEFAULT 0")
+        _ensure_column(connection, "future_option_events", "target_context_is_surrogate", "INTEGER DEFAULT 0")
+        _ensure_column(connection, "future_option_events", "context_resolution_source", "TEXT")
+        _ensure_column(connection, "future_option_events", "context_is_surrogate", "INTEGER DEFAULT 0")
         _ensure_column(connection, "future_option_motifs", "source_interaction_ids_json", "TEXT")
         _ensure_column(connection, "future_option_motifs", "source_family_ids_json", "TEXT")
         _ensure_column(connection, "future_option_motifs", "source_carrier_ids_json", "TEXT")
@@ -5935,6 +6243,7 @@ def _ensure_current_state_schema(path: Path) -> bool:
         _ensure_column(connection, "future_option_motifs", "classification_source", "TEXT")
         _ensure_column(connection, "future_option_motifs", "classification_rule", "TEXT")
         _ensure_column(connection, "future_option_motifs", "classification_evidence_id", "TEXT")
+        _ensure_column(connection, "future_option_motifs", "provenance_status", "TEXT")
         _ensure_column(connection, "future_option_motifs", "source_game_keys_json", "TEXT")
         _ensure_column(connection, "future_option_motifs", "target_game_keys_json", "TEXT")
         _ensure_column(connection, "future_option_motifs", "source_context_keys_json", "TEXT")
@@ -5965,7 +6274,6 @@ def _ensure_current_state_schema(path: Path) -> bool:
                 "concept_links",
                 "world_model_components",
                 "world_model_links",
-                "concept_promotion_validation_diagnostics",
                 "future_option_transfer_links",
             ):
                 if table in existing_tables:
@@ -5988,7 +6296,6 @@ def _ensure_current_state_schema(path: Path) -> bool:
                 "concept_links",
                 "world_model_components",
                 "world_model_links",
-                "concept_promotion_validation_diagnostics",
                 "future_option_transfer_links",
             ):
                 if table in existing_tables:
@@ -6001,6 +6308,19 @@ def _ensure_current_state_schema(path: Path) -> bool:
                 """,
                 (json.dumps({"rebuild_required": True, "schema": "source_evidence_support_v1"}, sort_keys=True),),
             )
+        if legacy_transfer_scope_resolution:
+            # Old attempts dropped one side of the scope dimensions.  Their
+            # derived H11 rows must not survive into reports; the normal role
+            # transfer stage rebuilds attempts with concrete/surrogate scope.
+            connection.execute("DELETE FROM future_option_transfer_links")
+            connection.execute(
+                """
+                INSERT INTO memory_summary (key, value_json)
+                VALUES ('role_transfer_scope_resolution_migration', ?)
+                ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json
+                """,
+                (json.dumps({"rebuild_required": True, "schema": "complete_scope_v3"}, sort_keys=True),),
+            )
         relevance_migration_row = connection.execute(
             "SELECT value_json FROM memory_summary WHERE key = 'incremental_promotion_relevance_migration_v2'"
         ).fetchone()
@@ -6010,7 +6330,6 @@ def _ensure_current_state_schema(path: Path) -> bool:
             # validation.  Rebuild all dependent upper-level artifacts rather
             # than carrying stale promotion or demotion state forward.
             for table in (
-                "concept_promotion_validation_diagnostics",
                 "concept_incremental_coverage_state",
                 "promotion_validation_state",
                 "future_option_transfer_links",
@@ -6051,7 +6370,6 @@ def _ensure_current_state_schema(path: Path) -> bool:
             connection.execute(
                 "DELETE FROM promotion_validation_state WHERE candidate_type = 'concept'"
             )
-            connection.execute("DELETE FROM concept_promotion_validation_diagnostics")
             connection.execute("DELETE FROM concept_incremental_coverage_state")
             reset_timestamp = datetime.now(timezone.utc).isoformat()
             connection.execute(

@@ -117,6 +117,9 @@ class ContinuousResearchConfig:
     promotion_min_relevant_heldout_event_count: int = 20
     promotion_population_comparability_threshold: float = 0.80
     promotion_demotion_failure_limit: int = 2
+    h11_provenance_sample_limit: int = 200
+    h11_write_full_provenance_jsonl: bool = True
+    max_h11_main_report_bytes: int = 5_000_000
     hypothesis_progress: bool = True
     hypothesis_progress_log_every: int = 1000
     memory_query_enabled: bool = False
@@ -431,6 +434,9 @@ def _run_continuous_research_inner(config: ContinuousResearchConfig) -> dict[str
             promotion_min_relevant_heldout_event_count=int(config.promotion_min_relevant_heldout_event_count),
             promotion_population_comparability_threshold=float(config.promotion_population_comparability_threshold),
             promotion_demotion_failure_limit=int(config.promotion_demotion_failure_limit),
+            h11_provenance_sample_limit=int(config.h11_provenance_sample_limit),
+            h11_write_full_provenance_jsonl=bool(config.h11_write_full_provenance_jsonl),
+            max_h11_main_report_bytes=int(config.max_h11_main_report_bytes),
             hypothesis_progress=bool(config.hypothesis_progress),
             hypothesis_progress_log_every=int(config.hypothesis_progress_log_every),
         )

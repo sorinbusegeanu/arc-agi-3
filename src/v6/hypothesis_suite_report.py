@@ -247,6 +247,9 @@ def run_hypothesis_suite_report(
     promotion_min_relevant_heldout_event_count: int = 20,
     promotion_population_comparability_threshold: float = 0.80,
     promotion_demotion_failure_limit: int = 2,
+    h11_provenance_sample_limit: int = 200,
+    h11_write_full_provenance_jsonl: bool = True,
+    max_h11_main_report_bytes: int = 5_000_000,
     allow_memory_repair: bool = False,
     hypothesis_progress: bool | None = None,
     hypothesis_progress_log_every: int = 1000,
@@ -525,7 +528,15 @@ def run_hypothesis_suite_report(
                 timings["h10_seconds"] = float(time.time() - t0)
             with _phase("H11"):
                 t0 = time.time()
-                h11 = evaluate_h11_future_option_transfer_concepts(memory_dir=memory_dir, run_dir=run_dir, output_dir=h11_dir, already_derived=True)
+                h11 = evaluate_h11_future_option_transfer_concepts(
+                    memory_dir=memory_dir,
+                    run_dir=run_dir,
+                    output_dir=h11_dir,
+                    already_derived=True,
+                    provenance_sample_limit=int(h11_provenance_sample_limit),
+                    write_full_provenance_jsonl=bool(h11_write_full_provenance_jsonl),
+                    max_main_report_bytes=int(max_h11_main_report_bytes),
+                )
                 timings["h11_seconds"] = float(time.time() - t0)
         with _phase("H12"):
             t0 = time.time()

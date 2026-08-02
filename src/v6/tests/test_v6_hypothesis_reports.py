@@ -55,11 +55,11 @@ def _seed_h06_diagnostics(memory_dir: Path, *, pair_count: int = 5) -> None:
                     attempt_id, role_signature, transfer_kind, source_scope_type, source_scope_key,
                     target_scope_type, target_scope_key, source_game_key, target_game_key,
                     source_context_key, target_context_key, source_carrier_signature, source_role_signature,
-                    predicted_target_role_signature, observed_target_role_signature, provenance_mode,
+                    predicted_target_role_signature, observed_target_role_signature, provenance_mode, provenance_status,
                     similarity_score, transfer_score, reuse_success,
                     failure_reason, best_margin, source_carrier_count, source_evidence_support_count,
                     support_gate_passed, similarity_gate_passed, role_match_gate_passed, candidate_role_count
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'single_source', ?, 0.5, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'single_source', 'verified', ?, 0.5, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     f"attempt-{index:03d}", "role-a" if index % 2 == 0 else "role-b", kind,
