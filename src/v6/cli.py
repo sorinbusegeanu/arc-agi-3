@@ -629,6 +629,7 @@ def build_parser() -> argparse.ArgumentParser:
     hypothesis_suite.add_argument("--promotion-min-incremental-coverage", type=float, default=0.05)
     hypothesis_suite.add_argument("--promotion-min-cross-context-or-game-evidence", type=int, default=2)
     hypothesis_suite.add_argument("--promotion-min-behavioral-or-predictive-lift", type=float, default=0.01)
+    hypothesis_suite.add_argument("--promotion-min-relevant-heldout-event-count", type=int, default=20)
     hypothesis_suite.add_argument("--promotion-demotion-failure-limit", type=int, default=2)
 
     continuous = subparsers.add_parser("continuous-research-run")
@@ -737,6 +738,7 @@ def build_parser() -> argparse.ArgumentParser:
     continuous.add_argument("--promotion-min-incremental-coverage", type=float, default=0.05)
     continuous.add_argument("--promotion-min-cross-context-or-game-evidence", type=int, default=2)
     continuous.add_argument("--promotion-min-behavioral-or-predictive-lift", type=float, default=0.01)
+    continuous.add_argument("--promotion-min-relevant-heldout-event-count", type=int, default=20)
     continuous.add_argument("--promotion-demotion-failure-limit", type=int, default=2)
     continuous.add_argument("--memory-query-enabled", action="store_true")
     continuous.add_argument("--memory-action-selection-enabled", action="store_true")
@@ -1645,6 +1647,7 @@ def main(argv: list[str] | None = None) -> int:
             promotion_min_incremental_coverage=float(args.promotion_min_incremental_coverage),
             promotion_min_cross_context_or_game_evidence=int(args.promotion_min_cross_context_or_game_evidence),
             promotion_min_behavioral_or_predictive_lift=float(args.promotion_min_behavioral_or_predictive_lift),
+            promotion_min_relevant_heldout_event_count=int(args.promotion_min_relevant_heldout_event_count),
             promotion_demotion_failure_limit=int(args.promotion_demotion_failure_limit),
             hypothesis_progress=args.hypothesis_progress,
             hypothesis_progress_log_every=int(args.hypothesis_progress_log_every),
@@ -1738,6 +1741,7 @@ def main(argv: list[str] | None = None) -> int:
             promotion_min_incremental_coverage=float(args.promotion_min_incremental_coverage),
             promotion_min_cross_context_or_game_evidence=int(args.promotion_min_cross_context_or_game_evidence),
             promotion_min_behavioral_or_predictive_lift=float(args.promotion_min_behavioral_or_predictive_lift),
+            promotion_min_relevant_heldout_event_count=int(args.promotion_min_relevant_heldout_event_count),
             promotion_demotion_failure_limit=int(args.promotion_demotion_failure_limit),
             hypothesis_progress=bool(args.hypothesis_progress),
             hypothesis_progress_log_every=int(args.hypothesis_progress_log_every),
@@ -1747,7 +1751,12 @@ def main(argv: list[str] | None = None) -> int:
             restore_compact_substrate=bool(args.restore_compact_substrate),
         )
         )
-        print(json.dumps(result, indent=2))
+        print(
+            "continuous_research: complete "
+            f"epochs={int(result.get('completed_epochs', 0) or 0)} "
+            f"output_dir={args.output_dir}",
+            flush=True,
+        )
         return 0
     return 0
 

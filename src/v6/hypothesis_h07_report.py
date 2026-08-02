@@ -290,6 +290,7 @@ def _empty_incremental_promotion_validation_report(
             "concept_candidates_evaluated": 0,
             "concepts_promoted": 0,
             "concepts_rejected_no_incremental_coverage": 0,
+            "concepts_rejected_insufficient_relevant_samples": 0,
             "concepts_rejected_insufficient_cross_scope": 0,
             "concepts_rejected_no_predictive_or_behavioral_lift": 0,
             "concepts_rejected_no_heldout_samples": 0,
@@ -309,6 +310,7 @@ def _incremental_promotion_thresholds(config: IncrementalPromotionValidationConf
         "min_event_behavioral_gain": float(config.min_event_behavioral_gain),
         "min_event_compression_gain": float(config.min_event_compression_gain),
         "min_explanation_event_count": int(config.min_explanation_event_count),
+        "min_relevant_heldout_event_count": int(config.min_relevant_heldout_event_count),
         "min_cross_context_or_game_evidence": int(config.min_cross_context_or_game_evidence),
         "min_behavioral_or_predictive_lift": float(config.min_behavioral_or_predictive_lift),
         "demotion_failure_limit": int(config.demotion_failure_limit),
@@ -355,9 +357,13 @@ def _load_incremental_promotion_validation_report(
             1
             for item in candidates
             if any(
-                reason in {"no_incremental_explanatory_gain", "no_eligible_explanation_events"}
+                reason in {"relevant_coverage_below_threshold", "insufficient_relevant_samples"}
                 for reason in item.get("rejection_reasons", [])
             )
+        ),
+        "concepts_rejected_insufficient_relevant_samples": sum(
+            1 for item in candidates
+            if "insufficient_relevant_samples" in item.get("rejection_reasons", [])
         ),
         "concepts_rejected_insufficient_cross_scope": sum(
             1
@@ -473,6 +479,7 @@ def _write_outputs(output_dir: Path, result: dict[str, Any]) -> None:
         f"concept candidates evaluated: {validation_summary.get('concept_candidates_evaluated')}\n"
         f"concepts promoted: {validation_summary.get('concepts_promoted')}\n"
         f"rejected no incremental coverage: {validation_summary.get('concepts_rejected_no_incremental_coverage')}\n"
+        f"rejected insufficient relevant samples: {validation_summary.get('concepts_rejected_insufficient_relevant_samples')}\n"
         f"rejected insufficient cross scope: {validation_summary.get('concepts_rejected_insufficient_cross_scope')}\n"
         f"rejected no predictive or behavioral lift: {validation_summary.get('concepts_rejected_no_predictive_or_behavioral_lift')}\n"
         f"rejected no heldout samples: {validation_summary.get('concepts_rejected_no_heldout_samples')}\n"
@@ -506,7 +513,8 @@ def _write_outputs(output_dir: Path, result: dict[str, Any]) -> None:
                 f"score={float(candidate.get('promotion_score', 0.0) or 0.0):.2f} "
                 f"threshold={float(candidate.get('promotion_threshold', 0.0) or 0.0):.2f}\n"
                 f"incremental_coverage={float(candidate.get('incremental_explanatory_coverage', 0.0) or 0.0):.2f}\n"
-                f"heldout_samples={int(candidate.get('validation_evidence_count', 0) or 0)}\n"
+                f"relevant_heldout_samples={int(candidate.get('relevant_heldout_event_count', 0) or 0)} "
+                f"global_reach={int(candidate.get('global_explanatory_reach', 0) or 0)}\n"
                 f"prediction_lift={float(candidate.get('prediction_lift', 0.0) or 0.0):.2f}\n"
                 f"behavioral_lift={float(candidate.get('heldout_action_selection_lift', 0.0) or 0.0):.2f}\n"
                 f"rejection_reasons={reasons}\n"

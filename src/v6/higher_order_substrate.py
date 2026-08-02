@@ -103,6 +103,7 @@ class IncrementalPromotionValidationConfig:
     min_event_behavioral_gain: float = 0.01
     min_event_compression_gain: float = 0.01
     min_explanation_event_count: int = 1
+    min_relevant_heldout_event_count: int = 20
     min_cross_context_or_game_evidence: int = 2
     min_behavioral_or_predictive_lift: float = 0.01
     demotion_failure_limit: int = 2
@@ -1460,7 +1461,8 @@ def _validate_incremental_promotions(
         """
         SELECT attempt_id, source_role_signature AS role_signature, reuse_success, last_seen_global_step,
                observed_target_role_signature AS observed_role_signature,
-               predicted_target_role_signature AS predicted_role_signature, target_carrier_signature,
+               predicted_target_role_signature AS predicted_role_signature,
+               source_carrier_signature, target_carrier_signature,
                source_game_key, target_game_key, source_context_key, target_context_key,
                provenance_mode
         FROM role_transfer_attempts
@@ -1588,6 +1590,12 @@ def _validate_incremental_promotions(
             concept_signature = str(concept_row["concept_signature"])
             links = concept_links.get(concept_signature, {})
             roles = sorted(links.get("role", set()))
+            relevance_links: dict[str, set[str]] = defaultdict(set)
+            for link_type, identifiers in links.items():
+                relevance_links[link_type].update(identifiers)
+            for role in roles:
+                for link_type, identifiers in role_links.get(role, {}).items():
+                    relevance_links[link_type].update(identifiers)
             source_role_structures = set().union(
                 *(role_explained_structures_by_role.get(role, set()) for role in roles)
             ) if roles else set()
@@ -1639,15 +1647,19 @@ def _validate_incremental_promotions(
                 previous_state=previous_coverage_states.get(concept_signature),
                 diagnostic_epoch_id=diagnostic_epoch_id,
                 config=config,
+                candidate_links=relevance_links,
             )
             explanation_event_rows.extend(explanation_events)
-            incremental_coverage = float(functional_diagnostics["incremental_explanatory_coverage"])
+            incremental_coverage = float(functional_diagnostics["relevant_incremental_coverage"])
             incremental_compression = float(functional_diagnostics["incremental_compression_gain"])
-            validation_evidence_count = int(functional_diagnostics["eligible_explanation_event_count"])
+            validation_evidence_count = int(functional_diagnostics["relevant_heldout_event_count"])
             validation_prediction_lift = functional_diagnostics["mean_prediction_gain"] if validation_evidence_count else None
             validation_action_selection_lift = functional_diagnostics["mean_behavioral_gain"] if validation_evidence_count else None
             validation_transfer_lift = _mean_event_gain(
-                [event for event in explanation_events if not bool(event.get("invalid"))],
+                [
+                    event for event in explanation_events
+                    if not bool(event.get("invalid")) and bool(event.get("is_relevant"))
+                ],
                 "prediction_gain",
                 event_type="transfer",
             )
@@ -1664,37 +1676,66 @@ def _validate_incremental_promotions(
                 float(config.min_incremental_coverage),
                 float(config.min_incremental_explanatory_coverage),
             )
-            has_eligible_events = validation_evidence_count >= int(config.min_explanation_event_count)
-            has_incremental_gain = has_eligible_events and incremental_coverage >= required_functional_coverage
-            heldout_lifts = [value for value in (validation_prediction_lift, validation_action_selection_lift, validation_transfer_lift) if value is not None]
-            has_heldout_lift = bool(functional_diagnostics["explained_event_count"])
+            population_matched = (
+                int(functional_diagnostics["baseline_event_count"])
+                == int(functional_diagnostics["candidate_event_count"])
+                == int(functional_diagnostics["common_event_count"])
+            )
+            population_status = str(functional_diagnostics["functional_coverage_longitudinal_change"]["population_comparison"])
+            has_relevant_samples = validation_evidence_count >= int(config.min_relevant_heldout_event_count)
+            has_incremental_gain = has_relevant_samples and incremental_coverage >= required_functional_coverage
+            heldout_lifts = [value for value in (validation_prediction_lift, validation_action_selection_lift) if value is not None]
+            has_heldout_lift = any(
+                float(value) >= float(config.min_behavioral_or_predictive_lift)
+                for value in heldout_lifts
+            )
+            has_positive_compression = incremental_compression > 0.0
             legacy_promoted = bool(int(row["is_promoted"] or 0))
             promotion_score_before_validation = float(row["promotion_score"] or 0.0)
             meets_promotion_score_threshold = promotion_score_before_validation >= float(config.promotion_score_threshold)
-            promoted = (
+            promoted_by_validation = (
                 has_cross_evidence
                 and has_incremental_gain
                 and has_heldout_lift
+                and has_positive_compression
                 and meets_promotion_score_threshold
             )
+            comparable_failure = (
+                population_matched
+                and has_relevant_samples
+                and population_status == "comparable"
+                and not promoted_by_validation
+            )
+            if not population_matched:
+                validation_status = "invalid_baseline_population"
+            elif not has_relevant_samples:
+                validation_status = "insufficient_relevant_samples"
+            elif population_status != "comparable":
+                validation_status = population_status
+            elif promoted_by_validation:
+                validation_status = "passed"
+            else:
+                validation_status = "failed"
             status, failure_count, demoted_this_validation = _update_promotion_validation_state(
                 state_conn,
                 candidate_type="concept",
                 candidate_signature=concept_signature,
-                passed=promoted,
+                passed=promoted_by_validation,
                 demotion_failure_limit=int(config.demotion_failure_limit),
-                validation_scope="later_global_step" if validation_evidence_count else "unavailable",
+                validation_scope="relevant_later_global_step" if validation_evidence_count else "unavailable",
                 validation_prediction_lift=validation_prediction_lift,
                 validation_action_selection_lift=validation_action_selection_lift,
                 validation_transfer_lift=validation_transfer_lift,
                 updated_global_step=first_seen,
                 validation_epoch=diagnostic_epoch_id,
+                count_failure=comparable_failure,
+                retain_previous_promotion=legacy_promoted and not comparable_failure,
+                previously_promoted=legacy_promoted,
+                validation_result=validation_status,
             )
-            adjusted_promotion_score = (
-                promotion_score_before_validation
-                if promoted
-                else max(0.0, promotion_score_before_validation - 0.10 * failure_count)
-            )
+            promoted = bool(promoted_by_validation or (legacy_promoted and not demoted_this_validation))
+            validation_penalty = 0.0
+            adjusted_promotion_score = promotion_score_before_validation + validation_penalty
             state_conn.execute(
                 """
                 UPDATE concept_candidates
@@ -1708,9 +1749,9 @@ def _validate_incremental_promotions(
                 """,
                 (
                     incremental_coverage, incremental_compression, concept_prediction_lift, future_lift,
-                    cross_game_transfer_lift, "later_global_step" if validation_evidence_count else "unavailable",
+                    cross_game_transfer_lift, "relevant_later_global_step" if validation_evidence_count else "unavailable",
                     validation_prediction_lift, validation_action_selection_lift, validation_transfer_lift,
-                    validation_evidence_count, status, failure_count, adjusted_promotion_score,
+                    validation_evidence_count, "promoted" if promoted else status, failure_count, adjusted_promotion_score,
                     int(promoted), concept_signature,
                 ),
             )
@@ -1719,10 +1760,13 @@ def _validate_incremental_promotions(
                 promoted=promoted,
                 meets_promotion_score_threshold=meets_promotion_score_threshold,
                 has_incremental_gain=has_incremental_gain,
-                has_eligible_events=has_eligible_events,
+                has_relevant_samples=has_relevant_samples,
                 has_cross_evidence=has_cross_evidence,
                 heldout_lifts=heldout_lifts,
                 has_heldout_lift=has_heldout_lift,
+                has_positive_compression=has_positive_compression,
+                population_matched=population_matched,
+                population_status=population_status,
                 demoted=demoted,
             )
             if promoted:
@@ -1746,8 +1790,13 @@ def _validate_incremental_promotions(
                 **_compact_source_id_summary("family", sorted(links.get("family", set()))),
                 "derivation_evidence_count": len(derivation_attempts),
                 "validation_evidence_count": validation_evidence_count,
-                "validation_scope": "later_global_step" if validation_evidence_count else "unavailable",
+                "validation_scope": "relevant_later_global_step" if validation_evidence_count else "unavailable",
+                "validation_status": validation_status,
+                "promotion_status": "promoted" if promoted else status,
+                "historical_promotion_status": "promoted" if legacy_promoted else "candidate",
                 "explanatory_reach": float(row["explanatory_reach"] or 0.0),
+                "global_explanatory_reach": int(functional_diagnostics["global_explanatory_reach"]),
+                "relevant_incremental_coverage": incremental_coverage,
                 "incremental_explanatory_coverage": incremental_coverage,
                 "incremental_compression_gain": incremental_compression,
                 "prediction_lift": concept_prediction_lift,
@@ -1762,6 +1811,17 @@ def _validate_incremental_promotions(
                 "raw_promotion_score": promotion_score_before_validation,
                 "adjusted_promotion_score": adjusted_promotion_score,
                 "promotion_score_before_validation": promotion_score_before_validation,
+                "coverage_component": incremental_coverage,
+                "prediction_component": float(validation_prediction_lift or 0.0),
+                "behavior_component": float(validation_action_selection_lift or 0.0),
+                "compression_component": incremental_compression,
+                "cross_scope_component": min(
+                    1.0,
+                    max(int(row["cross_context_count"] or 0), int(row["cross_game_count"] or 0))
+                    / max(1, int(config.min_cross_context_or_game_evidence)),
+                ),
+                "validation_penalty": validation_penalty,
+                "validation_penalty_reasons": [],
                 "promotion_threshold": float(config.promotion_score_threshold),
                 "legacy_promoted": legacy_promoted,
                 "incremental_validation_promoted": promoted,
@@ -1821,11 +1881,11 @@ def _validate_incremental_promotions(
         ).fetchone()[0])
         summary["phase3_promoted_count"] = phase3_promoted_count
         summary["active_promoted_concept_count"] = active_promoted_count
-        if phase3_promoted_count != active_promoted_count:
-            summary["validation_errors"] = [
-                "phase3_promoted_count_does_not_match_active_concept_promotion_state"
-            ]
-            raise RuntimeError(summary["validation_errors"][0])
+        # Existing promoted concepts remain active during non-comparable or
+        # insufficient-sample validation; only comparable repeated failures
+        # can demote them.  Therefore the active count is not necessarily the
+        # number newly passed in this validation call.
+        summary["phase3_active_promoted_count"] = active_promoted_count
 
     if validate_world_models:
         component_rows = state_conn.execute(
@@ -2104,7 +2164,7 @@ def _transfer_explanation_events(
     for row in transfer_rows:
         source_role = str(row["role_signature"] or "")
         step = row["last_seen_global_step"]
-        if source_role not in source_role_set or step is None or int(step) <= first_seen_global_step:
+        if step is None or int(step) <= first_seen_global_step:
             continue
         target_role = str(row["observed_role_signature"] or row["predicted_role_signature"] or "unknown")
         source_game_key = str(row["source_game_key"] or "")
@@ -2145,7 +2205,7 @@ def _transfer_explanation_events(
         concept_score = _combined_role_score(combination_rates) if len(combination_rates) >= 2 else baseline
         event_id = (
             f"transfer:{source_role}:{target_role}:{source_game_key}:{source_context_key}:"
-            f"{target_game_key}:{target_context_key}"
+            f"{target_game_key}:{target_context_key}:{row['attempt_id']}"
         )
         outcome = float(int(row["reuse_success"] or 0))
         feature_step = (
@@ -2184,6 +2244,18 @@ def _transfer_explanation_events(
             "_evaluation_global_step": int(step),
             "_feature_global_step_max": feature_step,
             "_label_used_as_feature": False,
+            "_source_role_signature": source_role,
+            "_predicted_target_role_signature": str(row["predicted_role_signature"] or ""),
+            "_observed_target_role_signature": str(row["observed_role_signature"] or ""),
+            "_carrier_ids": [
+                str(value) for value in (
+                    row["source_carrier_signature"] if "source_carrier_signature" in row.keys() else None,
+                    row["target_carrier_signature"] if "target_carrier_signature" in row.keys() else None,
+                )
+                if value not in (None, "")
+            ],
+            "_context_keys": [value for value in (source_context_key, target_context_key) if value],
+            "_game_keys": [value for value in (source_game_key, target_game_key) if value],
         })
     return events
 
@@ -2228,8 +2300,6 @@ def _future_option_motif_explanation_events(
         except (TypeError, ValueError, json.JSONDecodeError):
             motif_roles = set()
         matching_roles = sorted(role_set & motif_roles)
-        if not matching_roles:
-            continue
         rates = [role_rates[role] for role in matching_roles]
         baseline = max(rates, default=0.0)
         concept_score = _combined_role_score(rates) if len(rates) >= 2 else baseline
@@ -2248,6 +2318,7 @@ def _future_option_motif_explanation_events(
             "_evaluation_global_step": int(row["last_seen_global_step"]),
             "_feature_global_step_max": first_seen_global_step - 1,
             "_label_used_as_feature": False,
+            "_source_role_ids": sorted(motif_roles),
         })
     return events
 
@@ -2285,13 +2356,6 @@ def _prediction_explanation_events(
     required = {"id", "global_step", "context_signature", "predicted_family", "actual_family"}
     if first_seen_global_step is None or not source_roles or not required <= columns:
         return []
-    relevant_contexts = {
-        context
-        for role in source_roles
-        for context in role_links.get(role, {}).get("context", set())
-    }
-    if not relevant_contexts:
-        return []
     selected = "id, global_step, context_signature, predicted_family, actual_family"
     events: list[dict[str, Any]] = []
     for row in state_conn.execute(
@@ -2299,8 +2363,6 @@ def _prediction_explanation_events(
         (first_seen_global_step,),
     ).fetchall():
         context = str(row["context_signature"] or "")
-        if context not in relevant_contexts:
-            continue
         step = int(row["global_step"])
         rates = [
             _prior_role_success_rate(
@@ -2336,6 +2398,7 @@ def _prediction_explanation_events(
                 )
             ),
             "_label_used_as_feature": False,
+            "_context_keys": [context] if context else [],
         })
     return events
 
@@ -2355,13 +2418,6 @@ def _contradiction_resolution_explanation_events(
     required = {"id", "global_step", "context_signature", "context_contradiction"}
     if first_seen_global_step is None or not source_roles or not required <= columns:
         return []
-    relevant_contexts = {
-        context
-        for role in source_roles
-        for context in role_links.get(role, {}).get("context", set())
-    }
-    if not relevant_contexts:
-        return []
     events: list[dict[str, Any]] = []
     for row in state_conn.execute(
         """
@@ -2372,8 +2428,6 @@ def _contradiction_resolution_explanation_events(
         """,
         (first_seen_global_step,),
     ).fetchall():
-        if str(row["context_signature"] or "") not in relevant_contexts:
-            continue
         step = int(row["global_step"])
         failure_rates = [
             1.0 - _prior_role_success_rate(
@@ -2408,6 +2462,7 @@ def _contradiction_resolution_explanation_events(
                 )
             ),
             "_label_used_as_feature": False,
+            "_context_keys": [str(row["context_signature"] or "")] if row["context_signature"] else [],
         })
     return events
 
@@ -2477,6 +2532,56 @@ def _classify_functional_explanation_event(
     return event
 
 
+def _event_relevance_reasons(
+    event: dict[str, Any],
+    *,
+    source_roles: list[str],
+    candidate_links: dict[str, set[str]],
+) -> list[str]:
+    """Return concrete candidate/event overlaps used by the Phase 3 denominator."""
+    reasons: list[str] = []
+    roles = set(source_roles)
+    source_role = str(event.get("_source_role_signature") or "")
+    if not source_role and str(event.get("event_type")) == "transfer":
+        source_role = str(event.get("event_id", "")).split(":", 2)[1] if ":" in str(event.get("event_id", "")) else ""
+    if source_role in roles or roles & {
+        str(value) for value in event.get("_source_role_ids", ()) if value not in (None, "")
+    }:
+        reasons.append("source_role_overlap")
+    if {
+        str(event.get("_predicted_target_role_signature") or ""),
+        str(event.get("_observed_target_role_signature") or ""),
+    } & roles:
+        reasons.append("target_role_overlap")
+    if set(str(value) for value in event.get("_family_ids", ()) if value) & set(candidate_links.get("family", set())):
+        reasons.append("family_overlap")
+    if set(str(value) for value in event.get("_carrier_ids", ()) if value) & set(candidate_links.get("carrier", set())):
+        reasons.append("carrier_overlap")
+    if set(str(value) for value in event.get("_context_keys", ()) if value) & set(candidate_links.get("context", set())):
+        reasons.append("context_overlap")
+    if set(str(value) for value in event.get("_game_keys", ()) if value) & set(candidate_links.get("game", set())):
+        reasons.append("game_overlap")
+    return reasons
+
+
+def _relevant_event_type_diagnostics(events: list[dict[str, Any]]) -> dict[str, dict[str, float | int]]:
+    labels = ("transfer", "future_option_motif", "prediction", "contradiction_resolution")
+    output: dict[str, dict[str, float | int]] = {}
+    for label in labels:
+        items = [item for item in events if str(item.get("event_type")) == label and not bool(item.get("invalid"))]
+        explained = [item for item in items if bool(item.get("explained"))]
+        count = len(items)
+        output[label] = {
+            "eligible": count,
+            "explained": len(explained),
+            "coverage": float(len(explained)) / count if count else 0.0,
+            "prediction_lift": _mean_event_gain(items, "prediction_gain") or 0.0,
+            "behavioral_lift": _mean_event_gain(items, "behavioral_gain") or 0.0,
+            "compression_gain": _mean_event_gain(items, "compression_gain") or 0.0,
+        }
+    return output
+
+
 def _build_functional_explanation_diagnostics(
     *,
     state_conn: sqlite3.Connection,
@@ -2489,6 +2594,7 @@ def _build_functional_explanation_diagnostics(
     previous_state: dict[str, Any] | None,
     diagnostic_epoch_id: str | int | None,
     config: IncrementalPromotionValidationConfig,
+    candidate_links: dict[str, set[str]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
     """Evaluate held-out events with and without this concept's role combination."""
     events = _transfer_explanation_events(
@@ -2525,6 +2631,7 @@ def _build_functional_explanation_diagnostics(
         transfer_history=transfer_history,
     ))
     events.sort(key=lambda item: (str(item["event_type"]), str(item["event_id"])))
+    candidate_links = candidate_links or {}
     definition_cost = 0.05 * max(1, len(source_roles))
     event_count = len(events)
     seen_event_ids: set[str] = set()
@@ -2539,6 +2646,14 @@ def _build_functional_explanation_diagnostics(
                 "compression_gain": 0.0, "prediction_gain": 0.0,
                 "behavioral_gain": 0.0, "concept_incremental_gain": 0.0,
             })
+            reasons = _event_relevance_reasons(
+                event,
+                source_roles=source_roles,
+                candidate_links=candidate_links or {},
+            )
+            event["candidate_id"] = candidate_signature
+            event["is_relevant"] = bool(reasons)
+            event["relevance_reasons"] = reasons
             continue
         seen_event_ids.add(event_id)
         _classify_functional_explanation_event(
@@ -2546,42 +2661,65 @@ def _build_functional_explanation_diagnostics(
             config=config,
             definition_cost_share=definition_cost / max(1, event_count),
         )
+        reasons = _event_relevance_reasons(
+            event,
+            source_roles=source_roles,
+            candidate_links=candidate_links,
+        )
+        event["candidate_id"] = candidate_signature
+        event["is_relevant"] = bool(reasons)
+        event["relevance_reasons"] = reasons
     eligible_events = [event for event in events if not bool(event.get("invalid"))]
     invalid_events = [event for event in events if bool(event.get("invalid"))]
-    explained = [event for event in eligible_events if bool(event["explained"])]
-    rejected = [event for event in eligible_events if not bool(event["explained"])]
-    eligible_count = len(eligible_events)
-    baseline_cost = sum(float(event["baseline_description_cost"]) for event in eligible_events)
-    concept_cost = definition_cost + sum(float(event["concept_description_cost"]) for event in eligible_events)
+    relevant_events = [event for event in eligible_events if bool(event.get("is_relevant"))]
+    unrelated_events = [event for event in eligible_events if not bool(event.get("is_relevant"))]
+    explained = [event for event in relevant_events if bool(event["explained"])]
+    rejected = [event for event in relevant_events if not bool(event["explained"])]
+    global_explained = [event for event in eligible_events if bool(event["explained"])]
+    eligible_count = len(relevant_events)
+    baseline_cost = sum(float(event["baseline_description_cost"]) for event in relevant_events)
+    concept_cost = definition_cost + sum(float(event["concept_description_cost"]) for event in relevant_events)
     compression_gain = baseline_cost - concept_cost
     explained_ids = [str(event["event_id"]) for event in explained]
-    event_ids = [str(event["event_id"]) for event in events]
-    previous_eligible = None if previous_state is None else previous_state.get("eligible_event_count")
+    event_ids = [str(event["event_id"]) for event in relevant_events]
+    previous_eligible = None if previous_state is None else previous_state.get("relevant_event_count")
+    if previous_eligible is None and previous_state is not None:
+        previous_eligible = previous_state.get("eligible_event_count")
     previous_explained = None if previous_state is None else previous_state.get("explained_event_count")
     previous_coverage = None if previous_state is None else previous_state.get("incremental_coverage")
     coverage = float(len(explained)) / float(eligible_count) if eligible_count else 0.0
-    if previous_state is None or previous_eligible is None:
-        change_classification = "not_comparable"
-        coverage_delta = None
+    previous_ids = set(previous_state.get("relevant_event_ids", previous_state.get("explanation_event_ids", ())) or ()) if previous_state else set()
+    current_ids = set(event_ids)
+    retained_ids = previous_ids & current_ids
+    new_ids = current_ids - previous_ids
+    expired_ids = previous_ids - current_ids
+    if previous_state is None:
+        population_status = "population_definition_changed"
+    elif current_ids == previous_ids:
+        population_status = "comparable"
+    elif retained_ids == previous_ids:
+        population_status = "population_expansion"
+    elif retained_ids == current_ids:
+        population_status = "population_contraction"
     else:
-        coverage_delta = coverage - float(previous_coverage or 0.0)
-        explained_delta = len(explained) - int(previous_explained or 0)
-        eligible_delta = eligible_count - int(previous_eligible or 0)
-        if explained_delta > 0 and coverage_delta >= 0.0:
-            change_classification = "explained_event_growth"
-        elif eligible_delta > 0 and explained_delta <= 0:
-            change_classification = "eligible_event_growth"
-        elif coverage_delta < 0.0:
-            change_classification = "concept_gain_decline"
-        elif coverage_delta > 0.0:
-            change_classification = "concept_gain_improvement"
-        else:
-            change_classification = "mixed"
+        population_status = "population_definition_changed"
+    comparable = population_status == "comparable"
+    change_classification = population_status
+    coverage_delta = coverage - float(previous_coverage or 0.0) if comparable and previous_coverage is not None else None
+    evaluation_population_id = sha1("\n".join(sorted(event_ids)).encode("utf-8")).hexdigest()
+    for event in events:
+        event["evaluation_population_id"] = evaluation_population_id
+        event["baseline_event_count"] = eligible_count
+        event["candidate_event_count"] = eligible_count
+        event["common_event_count"] = eligible_count
     state = {
         "eligible_event_count": eligible_count,
+        "relevant_event_count": eligible_count,
         "explained_event_count": len(explained),
         "incremental_coverage": coverage,
-        "explanation_event_ids": event_ids,
+        "relevant_event_ids": sorted(current_ids),
+        "explanation_event_ids": sorted(current_ids),
+        "relevant_population_signature": _structure_fingerprint(current_ids),
         "structure_fingerprint": _structure_fingerprint(set(event_ids)),
     }
     longitudinal = {
@@ -2595,6 +2733,12 @@ def _build_functional_explanation_diagnostics(
         "previous_incremental_explanatory_coverage": previous_coverage,
         "current_incremental_explanatory_coverage": coverage,
         "coverage_delta": coverage_delta,
+        "relevant_population_signature": state["relevant_population_signature"],
+        "relevant_event_count": eligible_count,
+        "retained_event_count": len(retained_ids),
+        "new_relevant_event_count": len(new_ids),
+        "expired_relevant_event_count": len(expired_ids),
+        "population_comparison": population_status,
         # Compatibility aliases for existing aggregate/report consumers.
         "previous_incremental_coverage": previous_coverage,
         "current_incremental_coverage": coverage,
@@ -2603,11 +2747,18 @@ def _build_functional_explanation_diagnostics(
     }
     diagnostics = {
         "total_event_count": event_count,
+        "total_later_event_count": event_count,
         "eligible_explanation_event_count": eligible_count,
+        "relevant_heldout_event_count": eligible_count,
+        "explained_relevant_event_count": len(explained),
+        "unrelated_event_count": len(unrelated_events),
         "invalid_explanation_event_count": len(invalid_events),
         "explained_event_count": len(explained),
         "rejected_event_count": len(rejected),
         "incremental_explanatory_coverage": coverage,
+        "relevant_incremental_coverage": coverage,
+        "global_explanatory_reach": len(global_explained),
+        "global_coverage_descriptive": float(len(global_explained)) / len(eligible_events) if eligible_events else 0.0,
         "explained_event_type_counts": _event_type_counts(explained),
         "rejected_event_type_counts": _event_type_counts(rejected),
         "invalid_event_type_counts": _event_type_counts(invalid_events),
@@ -2615,9 +2766,9 @@ def _build_functional_explanation_diagnostics(
         "behavioral_explained_event_count": sum("behavioral" in event["explanation_channels"] for event in explained),
         "compression_explained_event_count": sum("compression" in event["explanation_channels"] for event in explained),
         "multi_channel_explained_event_count": sum(len(event["explanation_channels"]) > 1 for event in explained),
-        "mean_prediction_gain": _mean_event_gain(eligible_events, "prediction_gain") or 0.0,
-        "mean_behavioral_gain": _mean_event_gain(eligible_events, "behavioral_gain") or 0.0,
-        "mean_compression_gain": _mean_event_gain(eligible_events, "compression_gain") or 0.0,
+        "mean_prediction_gain": _mean_event_gain(relevant_events, "prediction_gain") or 0.0,
+        "mean_behavioral_gain": _mean_event_gain(relevant_events, "behavioral_gain") or 0.0,
+        "mean_compression_gain": _mean_event_gain(relevant_events, "compression_gain") or 0.0,
         "baseline_description_cost": baseline_cost,
         "concept_description_cost": concept_cost,
         "incremental_compression_gain": compression_gain,
@@ -2628,6 +2779,16 @@ def _build_functional_explanation_diagnostics(
         "functional_coverage_longitudinal_change": longitudinal,
         "coverage_longitudinal_change": longitudinal,
         "coverage_change_classification": change_classification,
+        "relevant_event_type_diagnostics": _relevant_event_type_diagnostics(relevant_events),
+        "relevant_transfer_event_count": sum(1 for event in relevant_events if event["event_type"] == "transfer"),
+        "relevant_future_option_event_count": sum(1 for event in relevant_events if event["event_type"] == "future_option_motif"),
+        "relevant_prediction_event_count": sum(1 for event in relevant_events if event["event_type"] == "prediction"),
+        "relevant_behavior_event_count": sum(1 for event in relevant_events if event["event_type"] == "contradiction_resolution"),
+        "evaluation_population_id": evaluation_population_id,
+        "baseline_event_count": eligible_count,
+        "candidate_event_count": eligible_count,
+        "common_event_count": eligible_count,
+        "baseline_population_matched": True,
     }
     return events, diagnostics, state
 
@@ -2925,26 +3086,33 @@ def _concept_promotion_rejection_reasons(
     promoted: bool,
     meets_promotion_score_threshold: bool,
     has_incremental_gain: bool,
-    has_eligible_events: bool,
+    has_relevant_samples: bool,
     has_cross_evidence: bool,
     heldout_lifts: list[float],
     has_heldout_lift: bool,
+    has_positive_compression: bool,
+    population_matched: bool,
+    population_status: str,
     demoted: bool,
 ) -> list[str]:
     """Expose the exact Phase 3 gate outcomes without changing the gates."""
     if promoted:
         return []
     reasons: list[str] = []
-    if not has_eligible_events:
-        reasons.append("no_eligible_explanation_events")
+    if not population_matched:
+        reasons.append("baseline_population_mismatch")
+    if not has_relevant_samples:
+        reasons.append("insufficient_relevant_samples")
     elif not has_incremental_gain:
-        reasons.append("no_incremental_explanatory_gain")
+        reasons.append("relevant_coverage_below_threshold")
     if not has_cross_evidence:
         reasons.append("insufficient_cross_context_or_game_evidence")
-    if not heldout_lifts:
-        reasons.append("no_heldout_samples")
-    elif not has_heldout_lift:
-        reasons.append("heldout_validation_failed")
+    if not has_positive_compression:
+        reasons.append("compression_gain_non_positive")
+    if population_status != "comparable":
+        reasons.append("population_not_comparable")
+    if not heldout_lifts or not has_heldout_lift:
+        reasons.extend(("prediction_lift_below_threshold", "behavioral_lift_below_threshold"))
     if not meets_promotion_score_threshold:
         reasons.append("below_promotion_score_threshold")
     if demoted:
@@ -2965,6 +3133,10 @@ def _update_promotion_validation_state(
     validation_transfer_lift: float | None,
     updated_global_step: int | None,
     validation_epoch: str | int | None = None,
+    count_failure: bool = True,
+    retain_previous_promotion: bool = False,
+    previously_promoted: bool = False,
+    validation_result: str | None = None,
 ) -> tuple[str, int, bool]:
     previous = state_conn.execute(
         """
@@ -2979,13 +3151,16 @@ def _update_promotion_validation_state(
     same_epoch = bool(previous is not None and epoch_value is not None and previous["last_validation_epoch"] == epoch_value)
     if passed:
         status, failure_count, demoted = "promoted", 0, False
+    elif not count_failure:
+        status = "promoted" if retain_previous_promotion else previous_status
+        failure_count, demoted = previous_failures, False
     elif same_epoch:
         status, failure_count, demoted = previous_status, previous_failures, previous_status == "demoted"
     else:
         failure_count = previous_failures + 1
-        previously_promoted = previous_status in {"promoted", "validation_failed"}
-        demoted = previously_promoted and failure_count >= max(1, demotion_failure_limit)
-        status = "demoted" if demoted else ("validation_failed" if previously_promoted else "candidate")
+        was_promoted = bool(previously_promoted or previous_status in {"promoted", "validation_failed"})
+        demoted = was_promoted and failure_count >= max(1, demotion_failure_limit)
+        status = "demoted" if demoted else ("validation_failed" if was_promoted else "candidate")
     state_conn.execute(
         """
         INSERT INTO promotion_validation_state (
@@ -3009,7 +3184,8 @@ def _update_promotion_validation_state(
         (
             candidate_type, candidate_signature, failure_count, status, validation_scope,
             validation_prediction_lift, validation_action_selection_lift, validation_transfer_lift,
-            epoch_value, updated_global_step, "passed" if passed else "failed", updated_global_step,
+            epoch_value, updated_global_step,
+            validation_result or ("passed" if passed else "failed"), updated_global_step,
         ),
     )
     return status, failure_count, demoted

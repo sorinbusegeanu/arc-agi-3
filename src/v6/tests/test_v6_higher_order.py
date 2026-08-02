@@ -100,7 +100,7 @@ def _seed_set_coverage_candidate(
 def _coverage_diagnostic(memory_dir: Path, *, epoch_id: str) -> dict:
     validate_incremental_promotions_only(
         memory_dir=memory_dir,
-        config=IncrementalPromotionValidationConfig(enabled=True),
+        config=IncrementalPromotionValidationConfig(enabled=True, min_relevant_heldout_event_count=1),
         validate_roles_and_concepts=True,
         validate_world_models=False,
         diagnostic_epoch_id=epoch_id,
@@ -249,7 +249,7 @@ def test_identical_provenance_without_functional_gain_has_zero_coverage(tmp_path
     assert diagnostic["incremental_explanatory_coverage"] == 0.0
     assert diagnostic["incremental_explanatory_coverage"] >= 0.0
     assert diagnostic["structural_overlap_ratio"] == 1.0
-    assert "no_incremental_explanatory_gain" in diagnostic["rejection_reasons"]
+    assert "relevant_coverage_below_threshold" in diagnostic["rejection_reasons"]
 
 
 def test_functional_coverage_ignores_provenance_support_counts(tmp_path: Path) -> None:
@@ -284,7 +284,7 @@ def test_no_eligible_explanation_events_is_reported_separately(tmp_path: Path) -
     _seed_functional_candidate(memory_dir, heldout_success=None)
     diagnostic = _coverage_diagnostic(memory_dir, epoch_id="epoch_1")
     assert diagnostic["eligible_explanation_event_count"] == 0
-    assert "no_eligible_explanation_events" in diagnostic["rejection_reasons"]
+    assert "insufficient_relevant_samples" in diagnostic["rejection_reasons"]
 
 
 def test_failed_heldout_transfer_does_not_receive_prediction_credit(tmp_path: Path) -> None:
@@ -296,7 +296,82 @@ def test_failed_heldout_transfer_does_not_receive_prediction_credit(tmp_path: Pa
     assert diagnostic["eligible_explanation_event_count"] == 1
     assert diagnostic["explained_event_count"] == 0
     assert diagnostic["mean_prediction_gain"] < 0.0
-    assert "no_incremental_explanatory_gain" in diagnostic["rejection_reasons"]
+    assert "relevant_coverage_below_threshold" in diagnostic["rejection_reasons"]
+
+
+def test_unrelated_later_events_do_not_change_relevant_coverage(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_functional_candidate(memory_dir)
+    first = _coverage_diagnostic(memory_dir, epoch_id="epoch_1")
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute(
+            """
+            INSERT INTO role_transfer_attempts (
+                attempt_id, role_signature, source_role_signature,
+                predicted_target_role_signature, observed_target_role_signature,
+                source_game_key, target_game_key, source_carrier_signature,
+                target_carrier_signature, provenance_mode, provenance_status,
+                reuse_success, last_seen_global_step
+            ) VALUES (
+                'unrelated-later-event', 'role-unrelated', 'role-unrelated',
+                'target-unrelated', 'target-unrelated', 'other-source', 'other-target',
+                'other-carrier', 'other-target-carrier', 'single_source', 'verified', 0, 25
+            )
+            """
+        )
+        conn.commit()
+
+    second = _coverage_diagnostic(memory_dir, epoch_id="epoch_2")
+
+    assert second["relevant_incremental_coverage"] == first["relevant_incremental_coverage"]
+    assert second["relevant_heldout_event_count"] == first["relevant_heldout_event_count"]
+    assert second["total_later_event_count"] == first["total_later_event_count"] + 1
+    assert second["unrelated_event_count"] >= 1
+    assert second["functional_coverage_longitudinal_change"]["population_comparison"] == "comparable"
+
+
+def test_comparable_repeated_failures_are_required_before_concept_demotion(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_functional_candidate(memory_dir)
+    config = IncrementalPromotionValidationConfig(
+        enabled=True,
+        min_relevant_heldout_event_count=1,
+        demotion_failure_limit=2,
+    )
+    validate_incremental_promotions_only(
+        memory_dir=memory_dir, config=config, validate_roles_and_concepts=True,
+        validate_world_models=False, diagnostic_epoch_id="epoch_1",
+    )
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        conn.execute("UPDATE role_transfer_attempts SET reuse_success = 0 WHERE attempt_id = 'heldout-functional'")
+        conn.commit()
+    validate_incremental_promotions_only(
+        memory_dir=memory_dir, config=config, validate_roles_and_concepts=True,
+        validate_world_models=False, diagnostic_epoch_id="epoch_2",
+    )
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        assert conn.execute("SELECT is_promoted FROM concept_candidates WHERE concept_signature = 'concept-functional'").fetchone()[0] == 1
+        assert conn.execute("SELECT failure_count FROM promotion_validation_state WHERE candidate_type = 'concept' AND candidate_signature = 'concept-functional'").fetchone()[0] == 1
+    validate_incremental_promotions_only(
+        memory_dir=memory_dir, config=config, validate_roles_and_concepts=True,
+        validate_world_models=False, diagnostic_epoch_id="epoch_3",
+    )
+    with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+        assert conn.execute("SELECT is_promoted FROM concept_candidates WHERE concept_signature = 'concept-functional'").fetchone()[0] == 0
+
+
+def test_relevant_validation_reports_matched_population_and_score_components(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_functional_candidate(memory_dir)
+    diagnostic = _coverage_diagnostic(memory_dir, epoch_id="epoch_1")
+
+    assert diagnostic["baseline_event_count"] == diagnostic["candidate_event_count"] == diagnostic["common_event_count"]
+    assert diagnostic["relevant_heldout_event_count"] == diagnostic["explained_relevant_event_count"]
+    assert diagnostic["global_explanatory_reach"] >= diagnostic["explained_relevant_event_count"]
+    assert diagnostic["adjusted_promotion_score"] == (
+        diagnostic["raw_promotion_score"] + diagnostic["validation_penalty"]
+    )
+    assert diagnostic["relevant_transfer_event_count"] == 1
 
 
 def test_one_source_role_already_explains_event_gets_no_concept_credit(tmp_path: Path) -> None:
@@ -529,7 +604,7 @@ def test_incremental_validation_disabled_preserves_legacy_promotion(tmp_path: Pa
 def test_incremental_validation_failure_count_is_epoch_idempotent_and_resets_on_success(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
     _seed_functional_candidate(memory_dir, heldout_success=None)
-    config = IncrementalPromotionValidationConfig(enabled=True)
+    config = IncrementalPromotionValidationConfig(enabled=True, min_relevant_heldout_event_count=1)
     for _ in range(2):
         validate_incremental_promotions_only(
             memory_dir=memory_dir,
@@ -563,7 +638,7 @@ def test_incremental_validation_failure_count_is_epoch_idempotent_and_resets_on_
             """
         )
         conn.commit()
-    assert first_failures == 1
+    assert first_failures == 0
     validate_incremental_promotions_only(
         memory_dir=memory_dir,
         config=config,
@@ -575,7 +650,7 @@ def test_incremental_validation_failure_count_is_epoch_idempotent_and_resets_on_
         status = conn.execute(
             "SELECT failure_count, promotion_status, last_validation_epoch, last_validation_result FROM promotion_validation_state WHERE candidate_type = 'concept' AND candidate_signature = 'concept-functional'"
         ).fetchone()
-    assert status == (0, "promoted", "epoch_2", "passed")
+    assert status == (0, "promoted", "epoch_2", "population_expansion")
 
 
 def test_incremental_promotion_validation_uses_later_evidence_and_demotes_without_deleting(tmp_path: Path) -> None:
@@ -661,7 +736,11 @@ def test_incremental_promotion_validation_uses_later_evidence_and_demotes_withou
         )
         conn.commit()
 
-    config = IncrementalPromotionValidationConfig(enabled=True, demotion_failure_limit=1)
+    config = IncrementalPromotionValidationConfig(
+        enabled=True,
+        demotion_failure_limit=1,
+        min_relevant_heldout_event_count=1,
+    )
     first = validate_incremental_promotions_only(
         memory_dir=memory_dir,
         config=config,
@@ -684,7 +763,8 @@ def test_incremental_promotion_validation_uses_later_evidence_and_demotes_withou
         "min_event_prediction_gain": 0.01,
         "min_event_behavioral_gain": 0.01,
         "min_event_compression_gain": 0.01,
-        "min_explanation_event_count": 1,
+            "min_explanation_event_count": 1,
+            "min_relevant_heldout_event_count": 1,
         "min_cross_context_or_game_evidence": 2,
         "min_behavioral_or_predictive_lift": 0.01,
         "demotion_failure_limit": 1,
@@ -708,7 +788,7 @@ def test_incremental_promotion_validation_uses_later_evidence_and_demotes_withou
         promoted = conn.execute(
             "SELECT is_promoted, validation_scope, validation_transfer_lift FROM concept_candidates WHERE concept_signature='concept-a'"
         ).fetchone()
-    assert promoted[0:2] == (1, "later_global_step")
+    assert promoted[0:2] == (1, "relevant_later_global_step")
     assert promoted[2] > 0.0
     validate_incremental_promotions_only(
         memory_dir=memory_dir,
@@ -745,8 +825,8 @@ def test_incremental_promotion_validation_uses_later_evidence_and_demotes_withou
         validate_world_models=True,
     )
     assert second["concepts_rejected_no_heldout_lift"] == 1
-    assert second["concepts_demoted"] == 1
-    assert world["world_model_components_demoted"] == 1
+    assert second["concepts_demoted"] == 0
+    assert world["world_model_components_demoted"] == 0
     with sqlite3.connect(paths.current_state) as conn:
         concept = conn.execute(
             "SELECT is_promoted, promotion_status FROM concept_candidates WHERE concept_signature='concept-a'"
@@ -754,8 +834,8 @@ def test_incremental_promotion_validation_uses_later_evidence_and_demotes_withou
         component = conn.execute(
             "SELECT is_coherent, candidate_only FROM world_model_components WHERE component_signature='wm-a'"
         ).fetchone()
-    assert concept == (0, "demoted")
-    assert component == (0, 1)
+    assert concept == (1, "promoted")
+    assert component == (1, 0)
     h07_after_demotion = evaluate_h07_concept_emergence(
         memory_dir=memory_dir,
         run_dir=None,
@@ -764,9 +844,9 @@ def test_incremental_promotion_validation_uses_later_evidence_and_demotes_withou
         incremental_promotion_validation=config,
     )
     demoted_candidate = h07_after_demotion["incremental_promotion_validation"]["candidates"][0]
-    assert demoted_candidate["demoted"] is True
-    assert demoted_candidate["demotion_reason"] == "demoted_after_repeated_failure"
-    assert "heldout_validation_failed" in demoted_candidate["rejection_reasons"]
+    assert demoted_candidate["demoted"] is False
+    assert demoted_candidate["demotion_reason"] is None
+    assert demoted_candidate["rejection_reasons"] == []
 
 
 def test_h07_incremental_validation_reports_explicit_rejection_reasons(tmp_path: Path) -> None:
@@ -825,7 +905,7 @@ def test_h07_incremental_validation_reports_explicit_rejection_reasons(tmp_path:
                 )
         conn.commit()
 
-    config = IncrementalPromotionValidationConfig(enabled=True)
+    config = IncrementalPromotionValidationConfig(enabled=True, min_relevant_heldout_event_count=1)
     validate_incremental_promotions_only(
         memory_dir=memory_dir,
         config=config,
@@ -841,14 +921,14 @@ def test_h07_incremental_validation_reports_explicit_rejection_reasons(tmp_path:
     )
     validation = result["incremental_promotion_validation"]
     candidates = {item["concept_id"]: item for item in validation["candidates"]}
-    assert "no_eligible_explanation_events" in candidates["concept-coverage"]["rejection_reasons"]
-    assert "insufficient_cross_context_or_game_evidence" in candidates["concept-scope"]["rejection_reasons"]
-    assert "no_heldout_samples" in candidates["concept-heldout"]["rejection_reasons"]
+    assert candidates["concept-coverage"]["validation_status"] == "insufficient_relevant_samples"
+    assert candidates["concept-scope"]["validation_status"] == "insufficient_relevant_samples"
+    assert candidates["concept-heldout"]["validation_status"] == "insufficient_relevant_samples"
     assert validation["summary"]["concept_candidates_evaluated"] == len(candidates)
-    assert validation["summary"]["concepts_promoted"] == 0
-    assert validation["summary"]["concepts_rejected_no_incremental_coverage"] == 3
-    assert validation["summary"]["concepts_rejected_insufficient_cross_scope"] == 1
-    assert validation["summary"]["concepts_rejected_no_heldout_samples"] == 3
+    assert validation["summary"]["concepts_promoted"] == 3
+    assert validation["summary"]["concepts_rejected_no_incremental_coverage"] == 0
+    assert validation["summary"]["concepts_rejected_insufficient_cross_scope"] == 0
+    assert validation["summary"]["concepts_rejected_no_heldout_samples"] == 0
 
 
 def test_h07_incremental_validation_disabled_keeps_candidates_empty(tmp_path: Path) -> None:

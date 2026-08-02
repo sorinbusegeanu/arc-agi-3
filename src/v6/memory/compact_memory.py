@@ -5893,6 +5893,33 @@ def _ensure_current_state_schema(path: Path) -> None:
                 """,
                 (json.dumps({"rebuild_required": True, "schema": "source_evidence_support_v1"}, sort_keys=True),),
             )
+        relevance_migration_row = connection.execute(
+            "SELECT value_json FROM memory_summary WHERE key = 'incremental_promotion_relevance_migration'"
+        ).fetchone()
+        if relevance_migration_row is None:
+            # The old Phase 3 denominator used every later event and its
+            # failure counts are not comparable with candidate-relevant
+            # validation.  Rebuild all dependent upper-level artifacts rather
+            # than carrying stale promotion or demotion state forward.
+            for table in (
+                "concept_promotion_validation_diagnostics",
+                "concept_incremental_coverage_state",
+                "promotion_validation_state",
+                "future_option_transfer_links",
+                "world_model_links",
+                "world_model_components",
+                "concept_links",
+                "concept_candidates",
+            ):
+                if table in existing_tables:
+                    connection.execute(f"DELETE FROM {table}")
+            connection.execute(
+                """
+                INSERT INTO memory_summary (key, value_json)
+                VALUES ('incremental_promotion_relevance_migration', ?)
+                """,
+                (json.dumps({"rebuild_required": True, "schema": "relevant_heldout_population_v1"}, sort_keys=True),),
+            )
         connection.execute("DROP INDEX IF EXISTS idx_carrier_links_carrier_type_key")
         connection.execute("DROP INDEX IF EXISTS idx_role_neighborhood_carrier")
         connection.commit()

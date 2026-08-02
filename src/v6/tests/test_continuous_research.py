@@ -666,6 +666,26 @@ def test_continuous_prints_epoch_game_and_level_results(tmp_path: Path, monkeypa
     assert " Total_Games=" in output
 
 
+def test_continuous_cli_prints_one_compact_final_line(monkeypatch, capsys, tmp_path: Path) -> None:
+    import v6.cli as cli
+
+    monkeypatch.setattr(
+        cli,
+        "run_continuous_research",
+        lambda _config: {"completed_epochs": 10, "large_manifest_payload": {"rows": list(range(1_000))}},
+    )
+
+    assert cli.main([
+        "continuous-research-run",
+        "--experiment-name", "quiet-final-output",
+        "--output-dir", str(tmp_path / "continuous"),
+    ]) == 0
+
+    assert capsys.readouterr().out.splitlines() == [
+        f"continuous_research: complete epochs=10 output_dir={tmp_path / 'continuous'}"
+    ]
+
+
 def test_continuous_initial_memory_checkpoint_is_copied_to_new_output_only(tmp_path: Path, monkeypatch, capsys) -> None:
     source = tmp_path / "phase_a" / "memory"
     ensure_memory_layout(source)
