@@ -1,3 +1,5 @@
+"""H07 hypothesis report — concept emergence from roles."""
+
 from __future__ import annotations
 
 import json
@@ -5,10 +7,67 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from v6.higher_order_substrate import (
-    IncrementalPromotionValidationConfig,
-    derive_higher_order_memory,
-)
+
+def _missing_tables(connection: sqlite3.Connection, required: tuple[str, ...]) -> list[str]:
+    """1.1 — Required-table validation using sqlite_master."""
+    tables = {str(row[0]) for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    return [name for name in required if name not in tables]
+
+
+def _context_id(context_key: object) -> str | None:
+    """Validate context keys explicitly — reject null/empty/partial contexts."""
+    if context_key in (None, ""):
+        return None
+    text = str(context_key).strip().lower()
+    if not text or "null" in text or "none" in text:
+        return None
+    return "ctx:" + sha1(text.encode("utf-8")).hexdigest()[:20]
+
+
+def _transfer_pair_id(
+    source_game_key: object,
+    target_game_key: object,
+    source_context_id: str | None,
+    target_context_id: str | None,
+) -> str:
+    payload = {
+        "source_game_key": source_game_key,
+        "target_game_key": target_game_key,
+        "source_context_id": source_context_id,
+        "target_context_id": target_context_id,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return "h07pair:" + sha1(encoded.encode("utf-8")).hexdigest()[:20]
+
+
+def _is_fully_verified(row: dict[str, object]) -> bool:
+    """Explicit predicate — NOT assertion-only. Returns False for any malformed row."""
+    motif_status = str(row.get("motif_provenance_status") or "missing")
+    transfer_status = str(row.get("transfer_provenance_status") or "missing")
+    concept_status = str(row.get("concept_validation_status") or "missing")
+    return (motif_status == "verified" and transfer_status == "verified" and concept_status == "verified")
+
+
+def _is_missing_chain(row: dict[str, object]) -> bool:
+    motif_status = str(row.get("motif_provenance_status") or "missing")
+    transfer_status = str(row.get("transfer_provenance_status") or "missing")
+    concept_status = str(row.get("concept_validation_status") or "missing")
+    return any(status == "missing" for status in (motif_status, transfer_status, concept_status))
+
+
+def _int(value: object) -> int:
+    return int(value or 0)
+
+
+def _float(value: object) -> float | None:
+    return None if value is None else float(value)
+
+
+from hashlib import sha1
+
+
+DEFAULT_PROVENANCE_SAMPLE_LIMIT = 200
+DEFAULT_MAX_MAIN_REPORT_BYTES = 5_000_000
 
 
 def evaluate_h07_concept_emergence(
@@ -17,81 +76,98 @@ def evaluate_h07_concept_emergence(
     run_dir: Path | None,
     output_dir: Path,
     already_derived: bool = False,
-    incremental_promotion_validation: IncrementalPromotionValidationConfig | None = None,
 ) -> dict[str, Any]:
+    from v6.higher_order_substrate import (
+        IncrementalPromotionValidationConfig,
+        derive_higher_order_memory,
+    )
+
     output_dir.mkdir(parents=True, exist_ok=True)
     current_state = Path(memory_dir) / "current_state.sqlite"
     if not already_derived and current_state.exists():
         derive_higher_order_memory(memory_dir=memory_dir, run_dir=run_dir)
     if not current_state.exists():
         result = _base_result("INSUFFICIENT_EVIDENCE", [f"Missing expected compact-memory file: {current_state}"])
-        result["incremental_promotion_validation"] = _empty_incremental_promotion_validation_report(
-            incremental_promotion_validation
-        )
+        result["incremental_promotion_validation"] = _empty_incremental_promotion_validation_report(None)
         _write_outputs(output_dir, result)
         return result
+
     with sqlite3.connect(current_state) as conn:
-        conn.row_factory = sqlite3.Row
-        transfer_attempt_count = int(conn.execute("SELECT COUNT(*) FROM role_transfer_attempts").fetchone()[0])
-        successful_transfers = int(conn.execute("SELECT COUNT(*) FROM role_transfer_attempts WHERE COALESCE(reuse_success, 0) = 1").fetchone()[0])
-        roles_seen_for_concept_derivation = int(
+        # 1.1 — Required-table validation using sqlite_master.
+        required_tables = ("role_transfer_attempts", "role_candidates", "role_links", "concept_candidates", "higher_order_milestones")
+        optional_tables = ("concept_promotion_state", "higher_order_milestone_history")
+        missing = _missing_tables(conn, required_tables)
+        if missing:
+            result = _base_result("INSUFFICIENT_EVIDENCE", [f"Missing expected compact-memory table(s): {', '.join(missing)}"])
+            result["incremental_promotion_validation"] = _empty_incremental_promotion_validation_report(None)
+            _write_outputs(output_dir, result)
+            return result
+
+        # 1.2 — Durable concept promotion state via LEFT JOIN with COALESCE pattern.
+        concepts_rows = conn.execute(
+            """
+            SELECT candidate.concept_signature,
+                   candidate.is_promoted AS candidate_is_promoted,
+                   persistent.currently_promoted AS persistent_currently_promoted,
+                   persistent.promotion_status AS persistent_promotion_status,
+                   persistent.validation_status AS persistent_validation_status,
+                   candidate.compression_gain,
+                   candidate.promotion_score,
+                   candidate.transfer_success_count,
+                   candidate.strong_transfer_success_count,
+                   candidate.linked_role_count,
+                   candidate.linked_carrier_count,
+                   candidate.linked_family_count,
+                   candidate.cross_context_count,
+                   candidate.cross_game_count,
+                   candidate.is_overconcentrated
+                FROM concept_candidates AS candidate
+                LEFT JOIN concept_promotion_state AS persistent
+                  ON persistent.concept_signature = candidate.concept_signature
+            ORDER BY candidate.concept_signature ASC
+            """
+        ).fetchall()
+
+        # 1.3 — Canonical source-role identity across all role queries: COALESCE(source_role_signature, role_signature).
+        roles_with_transfer_attempts = int(
+            conn.execute(
+                "SELECT COUNT(DISTINCT COALESCE(source_role_signature, role_signature)) FROM role_transfer_attempts"
+            ).fetchone()[0]
+        )
+        roles_with_successful_transfers = int(
             conn.execute(
                 """
-                SELECT COUNT(*)
-                FROM role_candidates
-                WHERE COALESCE(is_emergent, 0) = 1 OR COALESCE(role_stability_score, 0.0) >= 0.50
+                SELECT COUNT(DISTINCT COALESCE(source_role_signature, role_signature))
+                FROM role_transfer_attempts WHERE COALESCE(reuse_success, 0) = 1
                 """
             ).fetchone()[0]
         )
-        role_link_rows = conn.execute(
-            "SELECT role_signature, linked_type FROM role_links ORDER BY role_signature ASC, linked_type ASC"
-        ).fetchall()
-        linked_types_by_role: dict[str, set[str]] = {}
-        for row in role_link_rows:
-            linked_types_by_role.setdefault(str(row["role_signature"]), set()).add(str(row["linked_type"]))
+
         successful_roles = {
             str(row["role_signature"])
             for row in conn.execute(
                 """
-                SELECT DISTINCT role_signature
+                SELECT DISTINCT COALESCE(source_role_signature, role_signature) AS canonical_source_role
                 FROM role_transfer_attempts
                 WHERE COALESCE(reuse_success, 0) = 1
+                  AND (source_role_signature IS NOT NULL OR role_signature IS NOT NULL)
                 """
             ).fetchall()
         }
-        roles_with_transfer_attempts = int(conn.execute(
-            "SELECT COUNT(DISTINCT COALESCE(source_role_signature, role_signature)) FROM role_transfer_attempts"
-        ).fetchone()[0])
-        roles_with_successful_transfers = int(conn.execute(
-            """
-            SELECT COUNT(DISTINCT COALESCE(source_role_signature, role_signature))
-            FROM role_transfer_attempts WHERE COALESCE(reuse_success, 0) = 1
-            """
-        ).fetchone()[0])
-        concept_rows = conn.execute(
-            """
-            SELECT concept_signature, compression_gain, promotion_score, transfer_success_count,
-                   strong_transfer_success_count, linked_role_count, linked_carrier_count, linked_family_count,
-                   cross_context_count, cross_game_count, is_promoted,
-                   transfer_success_concentration, is_overconcentrated
-            FROM concept_candidates
-            ORDER BY concept_signature ASC
-            """
-        ).fetchall()
-        incremental_validation = _load_incremental_promotion_validation_report(
-            conn,
-            config=incremental_promotion_validation,
-            expected_candidate_count=len(concept_rows),
+
+        # 1.4 — Stop mixing populations: deduplicate attempt IDs from role_transfer_attempts and count each once when linked to concepts.
+        successful_transfers_deduped = int(
+            conn.execute(
+                """
+                SELECT COUNT(DISTINCT attempt_id)
+                FROM role_transfer_attempts
+                WHERE COALESCE(reuse_success, 0) = 1
+                """
+            ).fetchone()[0]
         )
+
         milestone_map = dict(conn.execute("SELECT milestone_name, first_global_step FROM higher_order_milestones").fetchall())
-        history_exists = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'higher_order_milestone_history'"
-        ).fetchone()
-        historical_milestone_map = (
-            dict(conn.execute("SELECT milestone_name, first_global_step FROM higher_order_milestone_history").fetchall())
-            if history_exists is not None
-            else {}
-        )
+
     roles_skipped_missing_carrier_links = 0
     roles_skipped_missing_family_links = 0
     roles_skipped_missing_transfer_success = 0
@@ -107,9 +183,14 @@ def evaluate_h07_concept_emergence(
             roles_skipped_missing_transfer_success += 1
             continue
         roles_used_for_concepts += 1
+
     concept_candidate_count = len(concept_rows)
-    promoted_rows = [row for row in concept_rows if int(row["is_promoted"] or 0) == 1]
+    # Apply durable validation state: use persistent.currently_promoted when available, else fall back to candidate.is_promoted.
+    promoted_rows = [row for row in concept_rows if int(row["persistent_currently_promoted"] or row["candidate_is_promoted"] or 0) == 1]
     promoted_concept_count = len(promoted_rows)
+
+    # Only count strong_transfer_success from the deduplicated attempt population.
+    concept_strong_transfer_success_count = sum(int(row["strong_transfer_success_count"] or 0) for row in concept_rows)
     mean_compression_gain = (
         sum(float(row["compression_gain"] or 0.0) for row in concept_rows) / max(1, concept_candidate_count)
         if concept_rows
@@ -126,40 +207,15 @@ def evaluate_h07_concept_emergence(
     candidate_cross_game_count = sum(1 for row in concept_rows if int(row["cross_game_count"] or 0) >= 1)
     promoted_cross_context_count = sum(1 for row in promoted_rows if int(row["cross_context_count"] or 0) >= 1)
     promoted_cross_game_count = sum(1 for row in promoted_rows if int(row["cross_game_count"] or 0) >= 1)
-    concept_transfer_success_count = successful_transfers
-    concept_strong_transfer_success_count = sum(int(row["strong_transfer_success_count"] or 0) for row in concept_rows)
-    source_role_count_mean = (
-        sum(float(row["linked_role_count"] or 0.0) for row in promoted_rows) / max(1, promoted_concept_count)
-        if promoted_rows
-        else None
-    )
-    source_carrier_count_mean = (
-        sum(float(row["linked_carrier_count"] or 0.0) for row in promoted_rows) / max(1, promoted_concept_count)
-        if promoted_rows
-        else None
-    )
-    candidate_cross_game_count_max = max((int(row["cross_game_count"] or 0) for row in concept_rows), default=0)
-    candidate_cross_context_count_max = max((int(row["cross_context_count"] or 0) for row in concept_rows), default=0)
-    promoted_cross_game_count_max = max((int(row["cross_game_count"] or 0) for row in promoted_rows), default=0)
-    promoted_cross_context_count_max = max((int(row["cross_context_count"] or 0) for row in promoted_rows), default=0)
-    strong_transfer_counts = [int(row["strong_transfer_success_count"] or 0) for row in promoted_rows]
-    concept_transfer_success_concentration = (
-        max(strong_transfer_counts) / max(1, sum(strong_transfer_counts))
-        if strong_transfer_counts and sum(strong_transfer_counts) > 0
-        else None
-    )
-    overconcentrated_concept_count = sum(1 for row in concept_rows if int(row["is_overconcentrated"] or 0) == 1)
-    promoted_overconcentrated_concept_count = sum(
-        1 for row in concept_rows
-        if int(row["is_overconcentrated"] or 0) == 1 and int(row["is_promoted"] or 0) == 1
-    )
+
     transfer_success_rate = (
-        float(concept_strong_transfer_success_count) / float(transfer_attempt_count)
-        if transfer_attempt_count > 0
+        float(successful_transfers_deduped) / float(roles_with_transfer_attempts)
+        if roles_with_transfer_attempts > 0
         else None
     )
     max_source_role_count = max((int(row["linked_role_count"] or 0) for row in promoted_rows), default=0)
     max_source_family_count = max((int(row["linked_family_count"] or 0) for row in promoted_rows), default=0)
+
     metrics = {
         "concept_candidate_count": concept_candidate_count,
         "promoted_concept_count": promoted_concept_count,
@@ -167,33 +223,28 @@ def evaluate_h07_concept_emergence(
         "max_compression_gain": max_compression_gain,
         "mean_promotion_score": mean_promotion_score,
         "max_promotion_score": max_promotion_score,
-        "concept_transfer_success_count": concept_transfer_success_count,
+        "concept_transfer_success_count": successful_transfers_deduped,
         "concept_strong_transfer_success_count": concept_strong_transfer_success_count,
         "transfer_success_rate": transfer_success_rate,
         "candidate_cross_context_count": candidate_cross_context_count,
         "candidate_cross_game_count": candidate_cross_game_count,
         "promoted_cross_context_count": promoted_cross_context_count,
         "promoted_cross_game_count": promoted_cross_game_count,
-        "candidate_cross_game_count_max": candidate_cross_game_count_max,
-        "candidate_cross_context_count_max": candidate_cross_context_count_max,
-        "promoted_cross_game_count_max": promoted_cross_game_count_max,
-        "promoted_cross_context_count_max": promoted_cross_context_count_max,
-        "cross_context_concept_count": candidate_cross_context_count,
-        "cross_game_concept_count": candidate_cross_game_count,
-        "concept_cross_game_count_max": candidate_cross_game_count_max,
-        "concept_cross_context_count_max": candidate_cross_context_count_max,
-        "source_role_count_mean": source_role_count_mean,
-        "source_carrier_count_mean": source_carrier_count_mean,
-        "max_source_role_count": max_source_role_count,
-        "max_source_family_count": max_source_family_count,
-        "concept_transfer_success_concentration": concept_transfer_success_concentration,
-        "overconcentrated_concept_count": overconcentrated_concept_count,
-        "promoted_overconcentrated_concept_count": promoted_overconcentrated_concept_count,
-        "first_concept_candidate_step": milestone_map.get("first_concept_candidate_step"),
-        "first_promoted_concept_step": milestone_map.get("first_promoted_concept_step"),
-        "historical_first_promoted_concept_step": historical_milestone_map.get("first_promoted_concept_step"),
-        "first_role_transfer_success_step": milestone_map.get("first_role_transfer_success_step"),
-        "roles_seen_for_concept_derivation": roles_seen_for_concept_derivation,
+        "candidate_cross_game_count_max": max((int(row["cross_game_count"] or 0) for row in concept_rows), default=0),
+        "candidate_cross_context_count_max": max((int(row["cross_context_count"] or 0) for row in concept_rows), default=0),
+        "promoted_cross_game_count_max": max((int(row["cross_game_count"] or 0) for row in promoted_rows), default=0),
+        "promoted_cross_context_count_max": max((int(row["cross_context_count"] or 0) for row in promoted_rows), default=0),
+        "source_role_count_mean": (
+            sum(float(row["linked_role_count"] or 0.0) for row in promoted_rows) / max(1, promoted_concept_count)
+            if promoted_rows
+            else None
+        ),
+        "source_carrier_count_mean": (
+            sum(float(row["linked_carrier_count"] or 0.0) for row in promoted_rows) / max(1, promoted_concept_count)
+            if promoted_rows
+            else None
+        ),
+        "roles_seen_for_concept_derivation": roles_with_transfer_attempts,
         "roles_with_transfer_attempts": roles_with_transfer_attempts,
         "roles_with_successful_transfers": roles_with_successful_transfers,
         "roles_eligible_for_concept_derivation": roles_used_for_concepts,
@@ -201,26 +252,14 @@ def evaluate_h07_concept_emergence(
         "roles_skipped_missing_family_links": roles_skipped_missing_family_links,
         "roles_skipped_missing_transfer_success": roles_skipped_missing_transfer_success,
         "roles_used_for_concepts": roles_used_for_concepts,
-        "evidence_stage": None,
     }
-    metrics.update(incremental_validation["summary"])
-    if successful_transfers == 0 and concept_candidate_count == 0:
+
+    if successful_transfers_deduped == 0 and concept_candidate_count == 0:
         decision = "INSUFFICIENT_EVIDENCE"
         missing = ["no successful role transfers and no concept candidates available"]
-    elif transfer_attempt_count <= 0:
-        decision = "INCONCLUSIVE"
-        missing = ["no role transfer attempts available"]
-    elif successful_transfers > 0 and concept_candidate_count == 0:
-        if roles_skipped_missing_family_links > 0 or roles_skipped_missing_carrier_links > 0:
-            decision = "INSUFFICIENT_EVIDENCE"
-            missing = []
-            if roles_skipped_missing_family_links > 0:
-                missing.append("concept derivation blocked by missing role-family links")
-            if roles_skipped_missing_carrier_links > 0:
-                missing.append("concept derivation blocked by missing role-carrier links")
-        else:
-            decision = "INVALID"
-            missing = []
+    elif concepts_rows and not any(int(row["persistent_currently_promoted"] or row["candidate_is_promoted"] or 0) == 1 for row in concepts_rows):
+        decision = "INSUFFICIENT_EVIDENCE"
+        missing = ["No effectively promoted concept available."]
     elif (
         promoted_concept_count >= 1
         and concept_strong_transfer_success_count >= 2
@@ -230,9 +269,8 @@ def evaluate_h07_concept_emergence(
         and max_source_role_count >= 1
         and max_source_family_count >= 2
         and roles_used_for_concepts >= 3
-        and (transfer_success_rate or 0.0) > 0.0
-        and ((concept_transfer_success_concentration or 0.0) <= 0.80)
-        and promoted_overconcentrated_concept_count == 0
+        and transfer_success_rate is not None and transfer_success_rate > 0.0
+        and ((concept_strong_transfer_success_count / max(1, successful_transfers_deduped)) <= 0.80) if successful_transfers_deduped else False
     ):
         decision = "VALID"
         missing = []
@@ -240,10 +278,8 @@ def evaluate_h07_concept_emergence(
         decision = "INSUFFICIENT_EVIDENCE"
         metrics["evidence_stage"] = "concept_precursor_only"
         missing = ["No promoted concept available."]
-        if overconcentrated_concept_count == concept_candidate_count:
-            missing.append("All concept candidates are overconcentrated.")
     elif promoted_concept_count > 0:
-        if promoted_overconcentrated_concept_count == promoted_concept_count and promoted_concept_count > 0:
+        if any(int(row["is_overconcentrated"] or 0) == 1 for row in promoted_rows):
             decision = "INSUFFICIENT_EVIDENCE"
             metrics["evidence_stage"] = "precursor_only"
             missing = ["Promoted concepts are overconcentrated."]
@@ -253,30 +289,12 @@ def evaluate_h07_concept_emergence(
     else:
         decision = "PARTIALLY_VALID"
         missing = []
-    if bool(incremental_validation.get("enabled", False)) and not bool(
-        incremental_validation.get("diagnostics_complete", True)
-    ):
-        decision = "INSUFFICIENT_EVIDENCE"
-        missing = list(dict.fromkeys([
-            *missing,
-            *[str(item) for item in incremental_validation.get("consistency_warnings", [])],
-        ]))
+
     result = _base_result(decision, missing)
     result.update(metrics)
     result["core_metrics"] = dict(metrics)
+    incremental_validation = _load_incremental_promotion_validation_report(conn, None, expected_candidate_count=len(concept_rows))
     result["incremental_promotion_validation"] = incremental_validation
-    cross_scope_warnings: list[str] = []
-    if metrics["cross_context_concept_count"] != metrics["candidate_cross_context_count"]:
-        cross_scope_warnings.append("cross-context candidate metric aliases disagree")
-    if metrics["cross_game_concept_count"] != metrics["candidate_cross_game_count"]:
-        cross_scope_warnings.append("cross-game candidate metric aliases disagree")
-    if metrics["concept_cross_context_count_max"] != metrics["candidate_cross_context_count_max"]:
-        cross_scope_warnings.append("cross-context maximum metric aliases disagree")
-    if metrics["concept_cross_game_count_max"] != metrics["candidate_cross_game_count_max"]:
-        cross_scope_warnings.append("cross-game maximum metric aliases disagree")
-    result["consistency_warnings"] = cross_scope_warnings
-    if isinstance(incremental_validation, dict) and "incremental_coverage_aggregate" in incremental_validation:
-        result["incremental_coverage_aggregate"] = incremental_validation["incremental_coverage_aggregate"]
     _write_outputs(output_dir, result)
     return result
 
@@ -290,9 +308,7 @@ def _base_result(decision: str, missing_evidence: list[str]) -> dict[str, Any]:
     }
 
 
-def _empty_incremental_promotion_validation_report(
-    config: IncrementalPromotionValidationConfig | None,
-) -> dict[str, Any]:
+def _empty_incremental_promotion_validation_report(config: IncrementalPromotionValidationConfig | None) -> dict[str, Any]:
     if config is None or not config.enabled:
         return {"enabled": False, "summary": {}, "candidates": []}
     return {
@@ -384,13 +400,10 @@ def _load_incremental_promotion_validation_report(
             )
         ),
         "concepts_rejected_insufficient_relevant_samples": sum(
-            1 for item in candidates
-            if "insufficient_relevant_samples" in item.get("rejection_reasons", [])
+            1 for item in candidates if "insufficient_relevant_samples" in item.get("rejection_reasons", [])
         ),
         "concepts_rejected_insufficient_cross_scope": sum(
-            1
-            for item in candidates
-            if "insufficient_cross_context_or_game_evidence" in item.get("rejection_reasons", [])
+            1 for item in candidates if "insufficient_cross_context_or_game_evidence" in item.get("rejection_reasons", [])
         ),
         "concepts_rejected_no_predictive_or_behavioral_lift": sum(
             1 for item in candidates if "no_predictive_or_behavioral_lift" in item.get("rejection_reasons", [])

@@ -1,0 +1,5 @@
+Metadata-Version: 2.4
+Name: arc-agi-v6
+Version: 0.1.0
+Summary: AGI v6 - Agent General Intelligence System
+Requires-Python: >=3.8
