@@ -144,7 +144,7 @@ def evaluate_h07_concept_emergence(
         )
 
         successful_roles = {
-            str(row["role_signature"])
+            str(row[0])
             for row in conn.execute(
                 """
                 SELECT DISTINCT COALESCE(source_role_signature, role_signature) AS canonical_source_role
@@ -172,17 +172,6 @@ def evaluate_h07_concept_emergence(
     roles_skipped_missing_family_links = 0
     roles_skipped_missing_transfer_success = 0
     roles_used_for_concepts = 0
-    for role_signature, linked_types in linked_types_by_role.items():
-        if "carrier" not in linked_types:
-            roles_skipped_missing_carrier_links += 1
-            continue
-        if "family" not in linked_types:
-            roles_skipped_missing_family_links += 1
-            continue
-        if role_signature not in successful_roles:
-            roles_skipped_missing_transfer_success += 1
-            continue
-        roles_used_for_concepts += 1
 
     concept_candidate_count = len(concept_rows)
     # Apply durable validation state: use persistent.currently_promoted when available, else fall back to candidate.is_promoted.
