@@ -1,32 +1,8 @@
-....F..F..FF.FF                                                          [100%]
+.......F...F.FF                                                          [100%]
 =================================== FAILURES ===================================
-_____________ test_derive_future_option_events_persists_provenance _____________
-
-tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-24/test_derive_future_option_even0')
-
-    def test_derive_future_option_events_persists_provenance(tmp_path: Path) -> None:
-        memory_dir = tmp_path / "memory"
-        _seed_base_state(memory_dir)
-        with _open_state(memory_dir / "current_state.sqlite") as state_conn, sqlite3.connect(
-            memory_dir / "graph.sqlite"
-        ) as graph_conn:
-            derive_future_option_events(state_conn, graph_conn, max_events=10)
-            row = state_conn.execute(
-                """SELECT classification_source, source_kind
-                   FROM future_option_events
-                   ORDER BY first_seen_global_step ASC
-                   LIMIT 1"""
-            ).fetchone()
->           assert str(row[0]).startswith(("structural", "unverified_fallback"))
-E           AssertionError: assert False
-E            +  where False = <built-in method startswith of str object at 0x73477fe9e670>(('structural', 'unverified_fallback'))
-E            +    where <built-in method startswith of str object at 0x73477fe9e670> = 'graph_effect'.startswith
-E            +      where 'graph_effect' = str('graph_effect')
-
-src/v6/tests/test_future_options.py:278: AssertionError
 _______ test_derive_future_option_transfer_links_verifies_concrete_pairs _______
 
-tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-24/test_derive_future_option_tran0')
+tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-27/test_derive_future_option_tran0')
 
     def test_derive_future_option_transfer_links_verifies_concrete_pairs(tmp_path: Path) -> None:
         memory_dir = tmp_path / "memory"
@@ -36,53 +12,10 @@ tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-24/test_derive_future_option_
 >           assert summary["verified_concrete_transfer_link_count"] >= 1
 E           assert 0 >= 1
 
-src/v6/tests/test_future_options.py:309: AssertionError
-____________ test_h11_provenance_resolution_paths_are_deterministic ____________
-
-tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-24/test_h11_provenance_resolution0')
-
-    def test_h11_provenance_resolution_paths_are_deterministic(tmp_path: Path) -> None:
-        memory_dir = tmp_path / "memory"
-        _seed_base_state(memory_dir)
-        with _open_state(memory_dir / "current_state.sqlite") as state_conn:
-            direct = _resolve_motif_transfer_provenance(
-                state_conn,
-                motif_signature="direct",
-                motif_links={"event": {"interaction-1"}},
-                direct_interaction_ids={"interaction-1"},
-            )
-            family = _resolve_motif_transfer_provenance(
-                state_conn,
-                motif_signature="family",
-                motif_links={"motif_derived_from_family": {"family-1"}},
-                direct_interaction_ids=set(),
-            )
-            carrier = _resolve_motif_transfer_provenance(
-                state_conn,
-                motif_signature="carrier",
-                motif_links={"motif_expressed_by_carrier": {"carrier-1"}},
-                direct_interaction_ids=set(),
-            )
-            role = _resolve_motif_transfer_provenance(
-                state_conn,
-                motif_signature="role",
-                motif_links={"motif_associated_with_role": {"role-1"}},
-                direct_interaction_ids=set(),
-            )
-            assert (direct["status"], direct["resolution_path"]) == (
-                "verified",
-                "motif_to_interaction",
-            )
->           assert family["status"] == "verified"
-E           AssertionError: assert 'proxy' == 'verified'
-E             
-E             - verified
-E             + proxy
-
-src/v6/tests/test_future_options.py:390: AssertionError
+src/v6/tests/test_future_options.py:338: AssertionError
 ______________ test_h11_transfer_metrics_aggregate_across_motifs _______________
 
-tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-24/test_h11_transfer_metrics_aggr0')
+tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-27/test_h11_transfer_metrics_aggr0')
 
     def test_h11_transfer_metrics_aggregate_across_motifs(tmp_path: Path) -> None:
         memory_dir = tmp_path / "memory"
@@ -107,10 +40,10 @@ tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-24/test_h11_transfer_metrics_
 >           assert summary["all_motifs_with_transfer_count"] == 2
 E           assert 0 == 2
 
-src/v6/tests/test_future_options.py:416: AssertionError
+src/v6/tests/test_future_options.py:445: AssertionError
 _________ test_h11_multiple_game_pairs_produce_distinct_verified_pairs _________
 
-tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-24/test_h11_multiple_game_pairs_p0')
+tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-27/test_h11_multiple_game_pairs_p0')
 
     def test_h11_multiple_game_pairs_produce_distinct_verified_pairs(tmp_path: Path) -> None:
         memory_dir = tmp_path / "memory"
@@ -136,10 +69,10 @@ tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-24/test_h11_multiple_game_pai
 >           assert summary["verified_concrete_transfer_link_count"] >= 2
 E           assert 0 >= 2
 
-src/v6/tests/test_future_options.py:465: AssertionError
+src/v6/tests/test_future_options.py:494: AssertionError
 ___________ test_h11_emergent_motif_with_role_association_is_tracked ___________
 
-tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-24/test_h11_emergent_motif_with_r0')
+tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-27/test_h11_emergent_motif_with_r0')
 
     def test_h11_emergent_motif_with_role_association_is_tracked(tmp_path: Path) -> None:
         memory_dir = tmp_path / "memory"
@@ -163,12 +96,10 @@ tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-24/test_h11_emergent_motif_wi
 >           assert summary["emergent_motifs_with_strong_transfer_count"] >= 1
 E           assert 0 >= 1
 
-src/v6/tests/test_future_options.py:487: AssertionError
+src/v6/tests/test_future_options.py:516: AssertionError
 =========================== short test summary info ============================
-FAILED src/v6/tests/test_future_options.py::test_derive_future_option_events_persists_provenance
 FAILED src/v6/tests/test_future_options.py::test_derive_future_option_transfer_links_verifies_concrete_pairs
-FAILED src/v6/tests/test_future_options.py::test_h11_provenance_resolution_paths_are_deterministic
 FAILED src/v6/tests/test_future_options.py::test_h11_transfer_metrics_aggregate_across_motifs
 FAILED src/v6/tests/test_future_options.py::test_h11_multiple_game_pairs_produce_distinct_verified_pairs
 FAILED src/v6/tests/test_future_options.py::test_h11_emergent_motif_with_role_association_is_tracked
-6 failed, 9 passed in 0.60s
+4 failed, 11 passed in 0.59s
