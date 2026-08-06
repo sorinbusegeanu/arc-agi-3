@@ -588,6 +588,23 @@ def evaluate_h11_future_option_transfer_concepts(
             ).fetchall()
         ]
 
+        derivation_summary: dict[str, Any] = {}
+        if "memory_summary" in tables:
+            summary_row = conn.execute(
+                """
+                SELECT value_json
+                FROM memory_summary
+                WHERE key = 'future_option_derivation_summary'
+                """
+            ).fetchone()
+            if summary_row is not None and summary_row[0]:
+                try:
+                    parsed_summary = json.loads(str(summary_row[0]))
+                    if isinstance(parsed_summary, dict):
+                        derivation_summary = parsed_summary
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    derivation_summary = {}
+
         if "concept_promotion_state" in tables:
             concept_rows = [
                 dict(row)
@@ -730,6 +747,19 @@ def evaluate_h11_future_option_transfer_concepts(
 
     verified_transfer_pair_count = len(
         verified_pair_ids
+    )
+    verified_cross_game_pair_count = len(
+        {
+            _transfer_pair_id(
+                row.get("source_game_key"),
+                row.get("target_game_key"),
+                _context_id(row.get("source_context_key")),
+                _context_id(row.get("target_context_key")),
+            )
+            for row in fully_verified_links
+            if str(row.get("source_game_key"))
+            != str(row.get("target_game_key"))
+        }
     )
     pair_diversity_passed = (
         verified_transfer_pair_count
@@ -917,9 +947,21 @@ def evaluate_h11_future_option_transfer_concepts(
     missing_evidence: list[str] = []
     if not links:
         decision = "INSUFFICIENT_EVIDENCE"
-        missing_evidence = [
-            "No future-option transfer links available."
-        ]
+        if (
+            int(derivation_summary.get("roles_with_transfer_attempts") or 0) > 0
+            and int(derivation_summary.get("unique_roles_with_concepts") or 0) == 0
+        ):
+            missing_evidence = [
+                "Role-transfer evidence exists, but roles are not linked to concepts."
+            ]
+        elif int(derivation_summary.get("motifs_skipped_no_role_links") or 0) > 0:
+            missing_evidence = [
+                "Future-option motifs exist, but motifs are not linked to roles."
+            ]
+        else:
+            missing_evidence = [
+                "No future-option transfer links available."
+            ]
     elif base_valid_conditions and pair_diversity_passed:
         decision = "VALID"
     elif base_valid_conditions and not pair_diversity_passed:
@@ -998,9 +1040,15 @@ def evaluate_h11_future_option_transfer_concepts(
         }
     )
 
-    motifs_skipped_no_role_links = 0
-    motifs_skipped_no_transfer_attempts = 0
-    motifs_skipped_no_concepts = 0
+    motifs_skipped_no_role_links = int(
+        derivation_summary.get("motifs_skipped_no_role_links") or 0
+    )
+    motifs_skipped_no_transfer_attempts = int(
+        derivation_summary.get("motifs_skipped_no_transfer_attempts") or 0
+    )
+    motifs_skipped_no_concepts = int(
+        derivation_summary.get("motifs_skipped_no_concepts") or 0
+    )
     for motif_signature in {
         str(row.get("motif_signature"))
         for row in links
@@ -1011,21 +1059,30 @@ def evaluate_h11_future_option_transfer_concepts(
             for row in links
             if str(row.get("motif_signature")) == motif_signature
         ]
-        if not any(
-            row.get("role_signature") not in (None, "")
-            or row.get("source_role_signature") not in (None, "")
-            for row in motif_rows
+        if (
+            "motifs_skipped_no_role_links" not in derivation_summary
+            and not any(
+                row.get("role_signature") not in (None, "")
+                or row.get("source_role_signature") not in (None, "")
+                for row in motif_rows
+            )
         ):
             motifs_skipped_no_role_links += 1
-        if not any(
-            _int(row.get("transfer_attempt_count")) > 0
-            for row in motif_rows
+        if (
+            "motifs_skipped_no_transfer_attempts" not in derivation_summary
+            and not any(
+                _int(row.get("transfer_attempt_count")) > 0
+                for row in motif_rows
+            )
         ):
             motifs_skipped_no_transfer_attempts += 1
-        if not any(
-            row.get("concept_signature")
-            not in (None, "", "__none__")
-            for row in motif_rows
+        if (
+            "motifs_skipped_no_concepts" not in derivation_summary
+            and not any(
+                row.get("concept_signature")
+                not in (None, "", "__none__")
+                for row in motif_rows
+            )
         ):
             motifs_skipped_no_concepts += 1
 
@@ -1054,9 +1111,13 @@ def evaluate_h11_future_option_transfer_concepts(
             len(verified_motifs_with_strong),
         "verified_motifs_with_promoted_concept_count":
             len(verified_motifs_with_promoted),
+        "motifs_with_promoted_concept_count":
+            len(verified_motifs_with_promoted),
         "verified_emergent_motifs_with_transfer_count":
             len(emergent_motifs_with_transfer),
         "verified_emergent_motifs_with_strong_transfer_count":
+            len(emergent_motifs_with_strong),
+        "emergent_motifs_with_strong_transfer_count":
             len(emergent_motifs_with_strong),
         "verified_emergent_motifs_with_promoted_concept_count":
             len(emergent_motifs_with_promoted),
@@ -1093,7 +1154,11 @@ def evaluate_h11_future_option_transfer_concepts(
         "motifs_skipped_no_concepts":
             motifs_skipped_no_concepts,
         "roles_with_transfer_attempts":
-            roles_with_transfer_attempts,
+            int(
+                derivation_summary.get("roles_with_transfer_attempts")
+                or derivation_summary.get("unique_roles_with_transfer_attempts")
+                or roles_with_transfer_attempts
+            ),
         "roles_with_successful_transfers":
             roles_with_successful_transfers,
         "motif_count":
@@ -1102,6 +1167,10 @@ def evaluate_h11_future_option_transfer_concepts(
             emergent_motif_count,
         "verified_transfer_pair_count":
             verified_transfer_pair_count,
+        "verified_cross_game_pair_count":
+            verified_cross_game_pair_count,
+        "motif_transfer_chain_provenance_sample_count":
+            len(provenance_sample),
         "minimum_verified_transfer_pairs_required":
             MIN_H11_VERIFIED_TRANSFER_PAIRS,
         "verified_transfer_pair_diversity_gate_passed":

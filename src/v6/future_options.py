@@ -231,7 +231,7 @@ def derive_future_option_events(
                 source_context_is_surrogate, target_context_is_surrogate,
                 context_resolution_source, context_is_surrogate
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 payload["event_id"],
@@ -1480,8 +1480,8 @@ def _concept_validation_records(state_conn: sqlite3.Connection) -> dict[str, dic
     for row in rows:
         signature = str(row["concept_signature"])
         promoted = int(
-            row["currently_promoted"]
-            if row["currently_promoted"] is not None else row["is_promoted"] or 0
+            row["is_promoted"]
+            if row["is_promoted"] is not None else row["is_promoted"] or 0
         )
         promotion_status = str(
             row["persistent_promotion_status"]
