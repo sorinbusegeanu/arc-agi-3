@@ -1,63 +1,262 @@
-...........F.F.                                                          [100%]
+........................................................................ [  8%]
+...FF...........FF...................................................... [ 17%]
+........................................................................ [ 26%]
+...........................................................s............ [ 34%]
+........................................................................ [ 43%]
+........................................................................ [ 52%]
+........................................................................ [ 61%]
+........................................................................ [ 69%]
+........................................................................ [ 78%]
+....F..F................................................................ [ 87%]
+.......................................................FFF.............. [ 95%]
+..................................                                       [100%]
 =================================== FAILURES ===================================
-______________ test_h11_transfer_metrics_aggregate_across_motifs _______________
+______ test_classification_provenance_and_incomplete_context_are_explicit ______
 
-tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-31/test_h11_transfer_metrics_aggr0')
+    def test_classification_provenance_and_incomplete_context_are_explicit() -> None:
+        event = _event(
+            context_key="[null,null,1]",
+            effect_type="positive_change",
+            source_family_ids={"family-1"},
+        )
+        assert event["classification_source"] == "structural_effect"
+        assert event["classification_provenance_status"] == "verified"
+        assert event["source_context_is_surrogate"] == 1
+>       assert event["context_resolution_source"] == "surrogate"
+E       AssertionError: assert 'missing' == 'surrogate'
+E         
+E         - surrogate
+E         + missing
 
-    def test_h11_transfer_metrics_aggregate_across_motifs(tmp_path: Path) -> None:
+src/v6/tests/test_future_option_development.py:113: AssertionError
+_________ test_future_option_edge_event_keeps_concrete_edge_provenance _________
+
+tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-35/test_future_option_edge_event_0')
+
+    def test_future_option_edge_event_keeps_concrete_edge_provenance(tmp_path: Path) -> None:
         memory_dir = tmp_path / "memory"
-        _seed_base_state(memory_dir)
-        with _open_state(memory_dir / "current_state.sqlite") as state_conn:
-            for motif_signature in ("motif-a", "motif-b"):
-                state_conn.execute(
-                    """INSERT INTO future_option_motifs (
-                           motif_signature, motif_type, support_count,
-                           motif_stability_score, is_emergent
-                       ) VALUES (?, 'enable', 5, 0.8, 1)""",
-                    (motif_signature,),
-                )
-                state_conn.execute(
-                    """INSERT INTO future_option_links (
-                           motif_signature, linked_type, linked_key, support_count
-                       ) VALUES (?, 'motif_associated_with_role', 'role-1', 3)""",
-                    (motif_signature,),
-                )
-            state_conn.commit()
-            summary = derive_future_option_transfer_links(state_conn)
->           assert summary["all_motifs_with_transfer_count"] == 2
-E           assert 3 == 2
-
-src/v6/tests/test_future_options.py:450: AssertionError
-_________ test_h11_multiple_game_pairs_produce_distinct_verified_pairs _________
-
-tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-31/test_h11_multiple_game_pairs_p0')
-
-    def test_h11_multiple_game_pairs_produce_distinct_verified_pairs(tmp_path: Path) -> None:
-        memory_dir = tmp_path / "memory"
-        _seed_base_state(memory_dir)
-        with _open_state(memory_dir / "current_state.sqlite") as state_conn:
->           state_conn.execute(
-                """INSERT INTO role_transfer_attempts (
-                       attempt_id, source_role_signature, transfer_kind, reuse_success,
-                       similarity_score, transfer_score, best_margin,
-                       source_evidence_support_count, candidate_role_count,
-                       source_game_key, target_game_key,
-                       source_context_key, target_context_key,
-                       source_interaction_id, target_interaction_id,
-                       source_game_is_surrogate, target_game_is_surrogate,
-                       source_context_is_surrogate, target_context_is_surrogate,
-                       provenance_mode, provenance_status
-                   ) VALUES (
-                       'transfer-2', 'role-1', 'cross_game', 1,
-                       0.9, 0.85, 0.2, 2, 3,
-                       'g3', 'g4', 'ctx3', 'ctx4',
-                       'single_source', 'verified'
-                   )"""
+        ensure_memory_layout(memory_dir)
+        with sqlite3.connect(memory_dir / "current_state.sqlite") as state_conn, sqlite3.connect(memory_dir / "graph.sqlite") as graph_conn:
+            state_conn.row_factory = sqlite3.Row
+            graph_conn.row_factory = sqlite3.Row
+            state_conn.execute(
+                """INSERT INTO memory_edges (
+                    source_node_id, target_node_id, edge_type, support_count, evidence_json
+                ) VALUES ('M0:interaction:11', 'M0:interaction:12', 'expands_future_options', 3, '{\"kind\":\"test\"}')"""
             )
-E           sqlite3.OperationalError: 15 values for 21 columns
+            derive_future_option_events(state_conn, graph_conn, max_events=10)
+            row = state_conn.execute(
+                """SELECT classification_source, source_interaction_id, target_interaction_id,
+                          classification_provenance_status
+                   FROM future_option_events WHERE source_kind = 'future_option_edge'"""
+            ).fetchone()
+>       assert tuple(row) == ("future_option_edge", "11", "12", "verified")
+               ^^^^^^^^^^
+E       TypeError: 'NoneType' object is not iterable
 
-src/v6/tests/test_future_options.py:482: OperationalError
+src/v6/tests/test_future_option_development.py:135: TypeError
+___________ test_h11_streams_full_provenance_and_bounds_main_report ____________
+
+tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-35/test_h11_streams_full_provenan0')
+
+    def test_h11_streams_full_provenance_and_bounds_main_report(tmp_path: Path) -> None:
+        memory_dir = tmp_path / "memory"
+        _seed_many_h11_links(memory_dir)
+        output_dir = tmp_path / "h11"
+        result = evaluate_h11_future_option_transfer_concepts(
+            memory_dir=memory_dir,
+            run_dir=None,
+            output_dir=output_dir,
+            already_derived=True,
+            max_main_report_bytes=1_000_000,
+        )
+        main = json.loads((output_dir / "h11_future_option_transfer_concepts_report.json").read_text(encoding="utf-8"))
+        provenance_rows = [json.loads(line) for line in (output_dir / "h11_transfer_chain_provenance.jsonl").read_text(encoding="utf-8").splitlines()]
+        context_rows = [json.loads(line) for line in (output_dir / "h11_context_lookup.jsonl").read_text(encoding="utf-8").splitlines()]
+        game_pairs = [json.loads(line) for line in (output_dir / "h11_transfer_by_game_pair.jsonl").read_text(encoding="utf-8").splitlines()]
+        context_pairs = [json.loads(line) for line in (output_dir / "h11_transfer_by_context_pair.jsonl").read_text(encoding="utf-8").splitlines()]
+        assert result["future_option_transfer_link_count"] == 205
+        assert main["motif_transfer_chain_provenance_total_count"] == 205
+        assert main["motif_transfer_chain_provenance_sample_count"] == 200
+>       assert main["motif_transfer_chain_provenance_truncated"] is True
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       KeyError: 'motif_transfer_chain_provenance_truncated'
+
+src/v6/tests/test_future_option_provenance.py:590: KeyError
+___________ test_h11_detail_controls_preserve_decision_and_counters ____________
+
+tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-35/test_h11_detail_controls_prese0')
+
+    def test_h11_detail_controls_preserve_decision_and_counters(tmp_path: Path) -> None:
+        memory_dir = tmp_path / "memory"
+        _seed_many_h11_links(memory_dir, count=3)
+        detailed = evaluate_h11_future_option_transfer_concepts(
+            memory_dir=memory_dir,
+            run_dir=None,
+            output_dir=tmp_path / "detailed",
+            already_derived=True,
+        )
+        sampled = evaluate_h11_future_option_transfer_concepts(
+            memory_dir=memory_dir,
+            run_dir=None,
+            output_dir=tmp_path / "sampled",
+            already_derived=True,
+            provenance_sample_limit=0,
+            write_full_provenance_jsonl=False,
+        )
+        for key in (
+            "decision",
+            "future_option_transfer_link_count",
+            "verified_future_option_transfer_count",
+            "verified_cross_game_pair_count",
+            "fully_verified_emergent_chain_count",
+        ):
+            assert sampled[key] == detailed[key]
+>       assert sampled["motif_transfer_chain_provenance_sample"] == []
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       KeyError: 'motif_transfer_chain_provenance_sample'
+
+src/v6/tests/test_future_option_provenance.py:634: KeyError
+____ test_h09_zero_events_with_stable_substrate_reports_derivation_failure _____
+
+tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-35/test_h09_zero_events_with_stab0')
+
+    def test_h09_zero_events_with_stable_substrate_reports_derivation_failure(tmp_path: Path) -> None:
+        memory_dir = tmp_path / "memory_h09_zero_events"
+        ensure_memory_layout(memory_dir)
+        with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+            conn.execute("INSERT INTO stable_contingencies (canonical_key, game, sampler, context_level, action, effect_signature, support_count, first_seen_global_step, last_seen_global_step, stability_score) VALUES ('c1','g1','s1',1,1,'e1',5,1,2,0.5)")
+            conn.execute("INSERT INTO memory_summary (key, value_json) VALUES ('future_option_derivation_summary', ?)", (json.dumps({"stable_contingency_rows_seen": 1, "stable_contingency_events_inserted": 0, "future_option_events_inserted_total": 0}),))
+            conn.commit()
+        result = evaluate_h09_future_option_motifs(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h09_zero", already_derived=True)
+        assert result["decision"] == "INSUFFICIENT_EVIDENCE"
+>       assert "Future-option derivation produced zero events despite available substrate." in result["missing_evidence"]
+E       AssertionError: assert 'Future-option derivation produced zero events despite available substrate.' in ['Stable substrate evidence exists but no future-option events were derived.']
+
+src/v6/tests/test_v6_core.py:13941: AssertionError
+____ test_h11_diagnostics_explain_missing_transfer_links_without_role_links ____
+
+tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-35/test_h11_diagnostics_explain_m0')
+
+    def test_h11_diagnostics_explain_missing_transfer_links_without_role_links(tmp_path: Path) -> None:
+        from v6.hypothesis_h11_report import evaluate_h11_future_option_transfer_concepts
+    
+        memory_dir = tmp_path / "memory_h11_diag"
+        ensure_memory_layout(memory_dir)
+        with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+            conn.execute(
+                """
+                INSERT INTO future_option_motifs (
+                    motif_signature, motif_type, support_count, linked_event_count, linked_family_count,
+                    linked_carrier_count, linked_role_count, linked_concept_count, cross_context_count,
+                    cross_game_count, mean_option_delta, mean_abs_option_delta, first_seen_global_step,
+                    last_seen_global_step, motif_stability_score, is_emergent
+                ) VALUES ('m1', 'enable', 3, 3, 1, 0, 0, 0, 2, 1, 1.0, 1.0, 1, 2, 0.8, 1)
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO memory_summary (key, value_json)
+                VALUES ('future_option_derivation_summary', ?)
+                """,
+                (
+                    json.dumps(
+                        {
+                            "motifs_seen_for_transfer": 1,
+                            "motifs_skipped_no_role_links": 1,
+                            "motifs_with_role_links_for_transfer": 0,
+                            "roles_seen_from_motif_links": 0,
+                            "roles_with_transfer_attempts": 0,
+                            "roles_with_concepts": 0,
+                        }
+                    ),
+                ),
+            )
+            conn.commit()
+        result = evaluate_h11_future_option_transfer_concepts(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h11_diag", already_derived=True)
+        assert result["motifs_skipped_no_role_links"] == 1
+>       assert "No future-option transfer links were produced because motifs lack role links." in result["missing_evidence"]
+E       AssertionError: assert 'No future-option transfer links were produced because motifs lack role links.' in ['Future-option motifs exist, but motifs are not linked to roles.']
+
+src/v6/tests/test_v6_core.py:14000: AssertionError
+________________________ test_h11_no_valid_without_h09 _________________________
+
+tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-35/test_h11_no_valid_without_h090')
+
+    def test_h11_no_valid_without_h09(tmp_path: Path) -> None:
+        memory_dir = tmp_path / "memory"
+        _seed_memory(memory_dir, [
+            {"carrier": "s1", "game": "g1", "contexts": ["ctx1", "ctx2"], "effect": "unknown_effect", "action": "unknown_action", "polarity": "neutral"},
+            {"carrier": "s2", "game": "g2", "contexts": ["ctx3", "ctx4"], "effect": "unknown_effect", "action": "unknown_action", "polarity": "neutral"},
+        ])
+        result = evaluate_h11_future_option_transfer_concepts(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h11")
+>       assert result["decision"] in {"INCONCLUSIVE", "PARTIALLY_VALID"}
+E       AssertionError: assert 'INSUFFICIENT_EVIDENCE' in {'INCONCLUSIVE', 'PARTIALLY_VALID'}
+
+src/v6/tests/test_v6_higher_order.py:1828: AssertionError
+___________ test_h11_does_not_validate_from_non_emergent_motif_links ___________
+
+tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-35/test_h11_does_not_validate_fro0')
+
+    def test_h11_does_not_validate_from_non_emergent_motif_links(tmp_path: Path) -> None:
+        memory_dir = tmp_path / "memory"
+        _seed_memory(memory_dir, [])
+        with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+            conn.execute("INSERT INTO future_option_motifs (motif_signature, motif_type, support_count, linked_event_count, linked_family_count, linked_carrier_count, linked_role_count, linked_concept_count, cross_context_count, cross_game_count, mean_option_delta, mean_abs_option_delta, mean_novelty_score, mean_reversibility_score, mean_branching_score, mean_termination_score, mean_replay_priority_score, first_seen_global_step, last_seen_global_step, motif_stability_score, is_emergent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ("m_non", "enable", 5, 5, 1, 1, 1, 1, 2, 2, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.8, 10, 20, 0.8, 0))
+            for idx in range(5):
+                conn.execute("INSERT INTO future_option_transfer_links (motif_signature, role_signature, concept_signature, transfer_attempt_count, successful_transfer_count, strong_transfer_success_count, promoted_concept_count, mean_transfer_score, mean_best_margin, first_seen_global_step, last_seen_global_step) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ("m_non", f"role:{idx}", f"concept:{idx}", 5, 5, 5, 1, 0.9, 0.2, 10, 20))
+            conn.execute("INSERT INTO concept_candidates (concept_signature, concept_type, support_count, linked_role_count, linked_carrier_count, linked_family_count, transfer_success_count, strong_transfer_success_count, cross_game_count, cross_context_count, compression_gain, explanatory_reach, promotion_score, first_seen_global_step, last_seen_global_step, is_promoted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ("concept:0", "x", 5, 1, 2, 2, 5, 5, 2, 2, 2.0, 4.0, 0.9, 10, 20, 1))
+            conn.commit()
+        result = evaluate_h11_future_option_transfer_concepts(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h11", already_derived=True)
+        assert result["future_option_transfer_link_count"] > 0
+        assert result["non_emergent_motif_transfer_link_count"] > 0
+        assert result["emergent_motif_transfer_link_count"] == 0
+        assert result["fully_verified_emergent_chain_count"] == 0
+        assert result["decision"] != "VALID"
+>       assert any("emergent future-option motifs" in item for item in result["missing_evidence"])
+E       assert False
+E        +  where False = any(<generator object test_h11_does_not_validate_from_non_emergent_motif_links.<locals>.<genexpr> at 0x733dc556fd30>)
+
+src/v6/tests/test_v6_higher_order.py:1847: AssertionError
+__ test_h11_validates_only_when_emergent_motif_has_transfer_concept_evidence ___
+
+tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-35/test_h11_validates_only_when_e0')
+
+    def test_h11_validates_only_when_emergent_motif_has_transfer_concept_evidence(tmp_path: Path) -> None:
+        memory_dir = tmp_path / "memory"
+        _seed_memory(memory_dir, [])
+        with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
+            conn.execute("INSERT INTO future_option_motifs (motif_signature, motif_type, support_count, linked_event_count, linked_family_count, linked_carrier_count, linked_role_count, linked_concept_count, cross_context_count, cross_game_count, mean_option_delta, mean_abs_option_delta, mean_novelty_score, mean_reversibility_score, mean_branching_score, mean_termination_score, mean_replay_priority_score, first_seen_global_step, last_seen_global_step, motif_stability_score, is_emergent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ("m_non", "enable", 5, 5, 1, 1, 1, 1, 2, 2, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.8, 10, 20, 0.8, 0))
+            conn.execute("INSERT INTO future_option_motifs (motif_signature, motif_type, support_count, linked_event_count, linked_family_count, linked_carrier_count, linked_role_count, linked_concept_count, cross_context_count, cross_game_count, mean_option_delta, mean_abs_option_delta, mean_novelty_score, mean_reversibility_score, mean_branching_score, mean_termination_score, mean_replay_priority_score, first_seen_global_step, last_seen_global_step, motif_stability_score, is_emergent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ("m_em", "enable", 5, 5, 1, 1, 1, 1, 2, 2, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.8, 10, 20, 0.8, 1))
+            conn.execute("INSERT INTO concept_candidates (concept_signature, concept_type, support_count, linked_role_count, linked_carrier_count, linked_family_count, transfer_success_count, strong_transfer_success_count, cross_game_count, cross_context_count, compression_gain, explanatory_reach, promotion_score, first_seen_global_step, last_seen_global_step, is_promoted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ("concept:em", "x", 5, 1, 2, 2, 5, 5, 2, 2, 2.0, 4.0, 0.9, 10, 20, 1))
+            conn.execute("INSERT INTO future_option_transfer_links (motif_signature, role_signature, concept_signature, transfer_attempt_count, successful_transfer_count, strong_transfer_success_count, promoted_concept_count, mean_transfer_score, mean_best_margin, first_seen_global_step, last_seen_global_step) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ("m_non", "role:n", "concept:n", 5, 5, 5, 1, 0.9, 0.2, 10, 20))
+            for idx in range(5):
+                conn.execute("INSERT INTO future_option_transfer_links (motif_signature, role_signature, concept_signature, transfer_attempt_count, successful_transfer_count, strong_transfer_success_count, promoted_concept_count, mean_transfer_score, mean_best_margin, first_seen_global_step, last_seen_global_step) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ("m_em", f"role:e{idx}", "concept:em", 5, 5, 5, 1, 0.9, 0.2, 10, 20))
+            conn.commit()
+        result = evaluate_h11_future_option_transfer_concepts(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h11", already_derived=True)
+        assert result["emergent_motif_transfer_link_count"] == 5
+        assert result["emergent_motifs_with_strong_transfer_count"] == 0
+>       assert result["emergent_motifs_with_promoted_concept_count"] == 0
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       KeyError: 'emergent_motifs_with_promoted_concept_count'
+
+src/v6/tests/test_v6_higher_order.py:1864: KeyError
+=============================== warnings summary ===============================
+tests/test_v6_core.py: 44 warnings
+tests/test_v6_interaction_sampling.py: 4 warnings
+tests/test_worker_memory_snapshot.py: 2 warnings
+  /usr/lib/python3.12/multiprocessing/popen_fork.py:66: DeprecationWarning: This process (pid=9728) is multi-threaded, use of fork() may lead to deadlocks in the child.
+    self.pid = os.fork()
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
 =========================== short test summary info ============================
-FAILED src/v6/tests/test_future_options.py::test_h11_transfer_metrics_aggregate_across_motifs
-FAILED src/v6/tests/test_future_options.py::test_h11_multiple_game_pairs_produce_distinct_verified_pairs
-2 failed, 13 passed in 0.61s
+FAILED src/v6/tests/test_future_option_development.py::test_classification_provenance_and_incomplete_context_are_explicit
+FAILED src/v6/tests/test_future_option_development.py::test_future_option_edge_event_keeps_concrete_edge_provenance
+FAILED src/v6/tests/test_future_option_provenance.py::test_h11_streams_full_provenance_and_bounds_main_report
+FAILED src/v6/tests/test_future_option_provenance.py::test_h11_detail_controls_preserve_decision_and_counters
+FAILED src/v6/tests/test_v6_core.py::test_h09_zero_events_with_stable_substrate_reports_derivation_failure
+FAILED src/v6/tests/test_v6_core.py::test_h11_diagnostics_explain_missing_transfer_links_without_role_links
+FAILED src/v6/tests/test_v6_higher_order.py::test_h11_no_valid_without_h09 - ...
+FAILED src/v6/tests/test_v6_higher_order.py::test_h11_does_not_validate_from_non_emergent_motif_links
+FAILED src/v6/tests/test_v6_higher_order.py::test_h11_validates_only_when_emergent_motif_has_transfer_concept_evidence
+9 failed, 816 passed, 1 skipped, 50 warnings in 26.41s

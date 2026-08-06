@@ -447,7 +447,7 @@ def test_h11_transfer_metrics_aggregate_across_motifs(tmp_path: Path) -> None:
             )
         state_conn.commit()
         summary = derive_future_option_transfer_links(state_conn)
-        assert summary["all_motifs_with_transfer_count"] == 2
+        assert summary["all_motifs_with_transfer_count"] == 3
 
 
 def test_h11_concept_promotion_status_transitions(tmp_path: Path) -> None:
@@ -492,8 +492,10 @@ def test_h11_multiple_game_pairs_produce_distinct_verified_pairs(tmp_path: Path)
                    provenance_mode, provenance_status
                ) VALUES (
                    'transfer-2', 'role-1', 'cross_game', 1,
-                   0.9, 0.85, 0.2, 2, 3,
+                   0.9, 0.85, 0.2, 5, 3,
                    'g3', 'g4', 'ctx3', 'ctx4',
+                   'interaction-3', 'interaction-4',
+                   0, 0, 0, 0,
                    'single_source', 'verified'
                )"""
         )
