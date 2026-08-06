@@ -1,21 +1,8 @@
-.......F...F.FF                                                          [100%]
+...........F.F.                                                          [100%]
 =================================== FAILURES ===================================
-_______ test_derive_future_option_transfer_links_verifies_concrete_pairs _______
-
-tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-27/test_derive_future_option_tran0')
-
-    def test_derive_future_option_transfer_links_verifies_concrete_pairs(tmp_path: Path) -> None:
-        memory_dir = tmp_path / "memory"
-        _seed_base_state(memory_dir)
-        with _open_state(memory_dir / "current_state.sqlite") as state_conn:
-            summary = derive_future_option_transfer_links(state_conn)
->           assert summary["verified_concrete_transfer_link_count"] >= 1
-E           assert 0 >= 1
-
-src/v6/tests/test_future_options.py:338: AssertionError
 ______________ test_h11_transfer_metrics_aggregate_across_motifs _______________
 
-tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-27/test_h11_transfer_metrics_aggr0')
+tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-31/test_h11_transfer_metrics_aggr0')
 
     def test_h11_transfer_metrics_aggregate_across_motifs(tmp_path: Path) -> None:
         memory_dir = tmp_path / "memory"
@@ -38,24 +25,27 @@ tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-27/test_h11_transfer_metrics_
             state_conn.commit()
             summary = derive_future_option_transfer_links(state_conn)
 >           assert summary["all_motifs_with_transfer_count"] == 2
-E           assert 0 == 2
+E           assert 3 == 2
 
-src/v6/tests/test_future_options.py:445: AssertionError
+src/v6/tests/test_future_options.py:450: AssertionError
 _________ test_h11_multiple_game_pairs_produce_distinct_verified_pairs _________
 
-tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-27/test_h11_multiple_game_pairs_p0')
+tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-31/test_h11_multiple_game_pairs_p0')
 
     def test_h11_multiple_game_pairs_produce_distinct_verified_pairs(tmp_path: Path) -> None:
         memory_dir = tmp_path / "memory"
         _seed_base_state(memory_dir)
         with _open_state(memory_dir / "current_state.sqlite") as state_conn:
-            state_conn.execute(
+>           state_conn.execute(
                 """INSERT INTO role_transfer_attempts (
-                       attempt_id, role_signature, transfer_kind, reuse_success,
+                       attempt_id, source_role_signature, transfer_kind, reuse_success,
                        similarity_score, transfer_score, best_margin,
-                       source_carrier_count, candidate_role_count,
+                       source_evidence_support_count, candidate_role_count,
                        source_game_key, target_game_key,
                        source_context_key, target_context_key,
+                       source_interaction_id, target_interaction_id,
+                       source_game_is_surrogate, target_game_is_surrogate,
+                       source_context_is_surrogate, target_context_is_surrogate,
                        provenance_mode, provenance_status
                    ) VALUES (
                        'transfer-2', 'role-1', 'cross_game', 1,
@@ -64,42 +54,10 @@ tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-27/test_h11_multiple_game_pai
                        'single_source', 'verified'
                    )"""
             )
-            state_conn.commit()
-            summary = derive_future_option_transfer_links(state_conn)
->           assert summary["verified_concrete_transfer_link_count"] >= 2
-E           assert 0 >= 2
+E           sqlite3.OperationalError: 15 values for 21 columns
 
-src/v6/tests/test_future_options.py:494: AssertionError
-___________ test_h11_emergent_motif_with_role_association_is_tracked ___________
-
-tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-27/test_h11_emergent_motif_with_r0')
-
-    def test_h11_emergent_motif_with_role_association_is_tracked(tmp_path: Path) -> None:
-        memory_dir = tmp_path / "memory"
-        _seed_base_state(memory_dir)
-        with _open_state(memory_dir / "current_state.sqlite") as state_conn:
-            state_conn.execute(
-                """INSERT INTO future_option_motifs (
-                       motif_signature, motif_type, support_count,
-                       motif_stability_score, is_emergent
-                   ) VALUES ('motif-emergent', 'enable', 5, 0.8, 1)"""
-            )
-            state_conn.execute(
-                """INSERT INTO future_option_links (
-                       motif_signature, linked_type, linked_key, support_count
-                   ) VALUES (
-                       'motif-emergent', 'motif_associated_with_role', 'role-1', 3
-                   )"""
-            )
-            state_conn.commit()
-            summary = derive_future_option_transfer_links(state_conn)
->           assert summary["emergent_motifs_with_strong_transfer_count"] >= 1
-E           assert 0 >= 1
-
-src/v6/tests/test_future_options.py:516: AssertionError
+src/v6/tests/test_future_options.py:482: OperationalError
 =========================== short test summary info ============================
-FAILED src/v6/tests/test_future_options.py::test_derive_future_option_transfer_links_verifies_concrete_pairs
 FAILED src/v6/tests/test_future_options.py::test_h11_transfer_metrics_aggregate_across_motifs
 FAILED src/v6/tests/test_future_options.py::test_h11_multiple_game_pairs_produce_distinct_verified_pairs
-FAILED src/v6/tests/test_future_options.py::test_h11_emergent_motif_with_role_association_is_tracked
-4 failed, 11 passed in 0.59s
+2 failed, 13 passed in 0.61s

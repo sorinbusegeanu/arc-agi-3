@@ -84,16 +84,21 @@ def _seed_base_state(memory_dir: Path) -> None:
         )
         conn.execute(
             """INSERT INTO role_transfer_attempts (
-                   attempt_id, role_signature, transfer_kind, reuse_success,
+                   attempt_id, source_role_signature, transfer_kind, reuse_success,
                    similarity_score, transfer_score, best_margin,
-                   source_carrier_count, candidate_role_count,
+                   source_evidence_support_count, candidate_role_count,
                    source_game_key, target_game_key,
                    source_context_key, target_context_key,
+                   source_interaction_id, target_interaction_id,
+                   source_game_is_surrogate, target_game_is_surrogate,
+                   source_context_is_surrogate, target_context_is_surrogate,
                    provenance_mode, provenance_status
                ) VALUES (
                    'transfer-1', 'role-1', 'cross_game', 1,
-                   0.9, 0.85, 0.2, 2, 3,
+                   0.9, 0.85, 0.2, 5, 3,
                    'g1', 'g2', 'ctx1', 'ctx2',
+                   'interaction-1', 'interaction-2',
+                   0, 0, 0, 0,
                    'single_source', 'verified'
                )"""
         )
@@ -476,11 +481,14 @@ def test_h11_multiple_game_pairs_produce_distinct_verified_pairs(tmp_path: Path)
     with _open_state(memory_dir / "current_state.sqlite") as state_conn:
         state_conn.execute(
             """INSERT INTO role_transfer_attempts (
-                   attempt_id, role_signature, transfer_kind, reuse_success,
+                   attempt_id, source_role_signature, transfer_kind, reuse_success,
                    similarity_score, transfer_score, best_margin,
-                   source_carrier_count, candidate_role_count,
+                   source_evidence_support_count, candidate_role_count,
                    source_game_key, target_game_key,
                    source_context_key, target_context_key,
+                   source_interaction_id, target_interaction_id,
+                   source_game_is_surrogate, target_game_is_surrogate,
+                   source_context_is_surrogate, target_context_is_surrogate,
                    provenance_mode, provenance_status
                ) VALUES (
                    'transfer-2', 'role-1', 'cross_game', 1,
