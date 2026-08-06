@@ -1,54 +1,61 @@
-# ARC-AGI3 H07/H09 next repairs
+# ARC-AGI3 H07/H08 evidence repairs
 
-Copy `src` into the repository root. The patch loads automatically because the
-run command uses `PYTHONPATH=src`.
+Extract into the repository root. It preserves the earlier drop-ins and loads
+automatically through the existing `PYTHONPATH=src` command.
 
-## H07
+## Fixes
 
-- Filters incremental validation diagnostics to signatures currently present in
-  `concept_candidates`.
-- Excludes stale historical diagnostics from current candidate counts.
-- Separates persistent historical retention from current validated promotion.
-- Uses `current_validation_passed` and the current promotion-score gate for the
-  scientific `promoted_concept_count`.
-- Adds explicit rejection reasons for zero coverage, insufficient samples,
-  insufficient cross-scope evidence, absent lift, score failure, and
-  incomparable held-out populations.
-- Does not delete or rewrite historical promotion state.
+### H07 longitudinal population continuity
 
-New report fields include:
+Previously stored relevant event IDs remain relevant for the same persistent
+concept while those events still exist and remain valid. Changing role links no
+longer replaces almost the entire held-out population.
+
+New diagnostics:
 
 ```text
-persistent_retained_concept_count
-current_validated_promoted_concept_count
-stale_historical_promotion_diagnostic_count
-concepts_retained_without_current_validation
+population_retention_policy
+historical_population_ids_available
+historical_population_ids_carried_forward
+relevant_by_historical_population_count
 ```
 
-## H09
+The first epoch using this patch can immediately reuse the full prior event-ID
+population stored in `concept_incremental_coverage_state`.
 
-- Detects cross-game and cross-context motif recurrence across distinct verified
-  observations of the same motif.
-- Does not require each observation to contain a source-target transfer pair.
-- Excludes surrogate scopes from recurrence evidence.
-- Retains the old pairwise counts under `pairwise_verified_*`.
-- Uses recurrence evidence for qualifying emergent motifs and the H09 decision.
+### H07 compact prediction and contradiction evidence
 
-New report fields include:
+The compact fallback now supports:
 
-```text
-verified_cross_game_recurrence_motif_count
-verified_cross_context_recurrence_motif_count
-verified_cross_game_recurrence_observation_count
-verified_cross_context_recurrence_observation_count
-motif_scope_evidence_method
+- `memory_nodes.attrs_json` and `payload_json`;
+- interaction IDs such as `M0:interaction:g12345`;
+- `updated_step`, local step and global-step columns;
+- direct and two-hop interaction-to-contingency-to-family links;
+- role matching through family, carrier, context or game links.
+
+Prediction events are included only when a concrete compact structural link to
+one of the concept's source roles is found.
+
+### H08 current promotion state
+
+H08 now uses the latest `current_validation_passed` result and the current
+promotion-score gate. Historical retention is reported separately and cannot
+satisfy the H08 promoted-concept gate.
+
+World-model validation is also run against temporary current-validation flags,
+then the historical `concept_candidates.is_promoted` values are restored.
+
+## Install
+
+```bash
+unzip -o arc_agi3_h07_h08_evidence_repairs.zip
 ```
 
 ## Verify
 
 ```bash
 PYTHONPATH=src python -c \
-'import v6.h07_h09_next_repairs as p; import v6.hypothesis_h07_report as h7; import v6.hypothesis_h09_report as h9; print(p._PATCHED, h7._ARC_AGI3_CURRENT_CANDIDATE_REPORT_FIX, h9._ARC_AGI3_CROSS_OBSERVATION_SCOPE_FIX)'
+'import v6.h07_h08_evidence_repairs as p; import v6.higher_order_substrate as h; import v6.hypothesis_h08_report as r; print(p._PATCHED, h._ARC_AGI3_H07_EVIDENCE_CONTINUITY_FIX, r._ARC_AGI3_CURRENT_PROMOTION_FIX)'
 ```
 
 Expected:
@@ -57,5 +64,5 @@ Expected:
 True True True
 ```
 
-No new output directory is required. The corrected logic applies from the next
-hypothesis-suite execution.
+The patch applies on the next hypothesis-suite execution. A new output
+directory is not required.
