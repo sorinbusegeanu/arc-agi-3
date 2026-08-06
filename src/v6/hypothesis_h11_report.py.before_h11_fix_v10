@@ -1120,17 +1120,6 @@ def evaluate_h11_future_option_transfer_concepts(
         ):
             motifs_skipped_no_concepts += 1
 
-    provenance_report_sample = [
-        {
-            "motif_signature": row.get("motif_signature"),
-            "role_signature": row.get("role_signature"),
-            "concept_signature": row.get("concept_signature"),
-            "transfer_pair_id": row.get("transfer_pair_id"),
-            "fully_verified": row.get("fully_verified"),
-        }
-        for row in provenance_sample
-    ]
-
     metrics: dict[str, object] = {
         "future_option_transfer_link_count":
             len(links),
@@ -1216,8 +1205,8 @@ def evaluate_h11_future_option_transfer_concepts(
             verified_transfer_pair_count,
         "verified_cross_game_pair_count":
             verified_cross_game_pair_count,
-        "motif_transfer_chain_provenance": provenance_report_sample,
-        "motif_transfer_chain_provenance_sample": provenance_report_sample,
+        "motif_transfer_chain_provenance": provenance_sample,
+        "motif_transfer_chain_provenance_sample": provenance_sample,
         "motif_transfer_chain_provenance_sample_count":
             len(provenance_sample),
         "motif_transfer_chain_provenance_truncated":
