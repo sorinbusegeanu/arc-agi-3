@@ -28,6 +28,13 @@ except Exception:
 if _apply_h07_h09_next_repairs is not None:
     _apply_h07_h09_next_repairs()
 
-from v6.h07_h08_evidence_repairs import apply_patch as _apply_h07_h08_evidence_repairs
+try:
+    from v6.h07_h08_evidence_repairs import apply_patch as _apply_h07_h08_evidence_repairs
+except Exception:
+    _apply_h07_h08_evidence_repairs = None
+if _apply_h07_h08_evidence_repairs is not None:
+    _apply_h07_h08_evidence_repairs()
 
-_apply_h07_h08_evidence_repairs()
+from v6.remaining_report_repairs import apply_patch as _apply_remaining_report_repairs
+
+_apply_remaining_report_repairs()

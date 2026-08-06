@@ -1,68 +1,78 @@
-# ARC-AGI3 H07/H08 evidence repairs
+# ARC-AGI3 remaining report repairs
 
-Extract into the repository root. It preserves the earlier drop-ins and loads
-automatically through the existing `PYTHONPATH=src` command.
+Extract into the repository root. This package preserves and loads the earlier
+drop-ins.
 
-## Fixes
+## H02 compact metadata
 
-### H07 longitudinal population continuity
-
-Previously stored relevant event IDs remain relevant for the same persistent
-concept while those events still exist and remain valid. Changing role links no
-longer replaces almost the entire held-out population.
-
-New diagnostics:
+When direct replay lift comes from the compact interaction join, the report now
+fills:
 
 ```text
-population_retention_policy
-historical_population_ids_available
-historical_population_ids_carried_forward
-relevant_by_historical_population_count
+row_count_available
+row_count_used
+prediction_violation_row_count
+non_prediction_violation_row_count
+mean_replay_priority_for_prediction_violating_interactions
+mean_replay_priority_for_non_prediction_violating_interactions
+candidate_tables_used
+prediction_violation_metric_source
+replay_priority_metric_source
+db_path
 ```
 
-The first epoch using this patch can immediately reuse the full prior event-ID
-population stored in `concept_incremental_coverage_state`.
+## H08 family-link selectivity
 
-### H07 compact prediction and contradiction evidence
+World-model family links are filtered using all of the following:
 
-The compact fallback now supports:
+- verified provenance;
+- support of at least two;
+- at least two observed events;
+- at least two linked roles or positive prediction gain.
 
-- `memory_nodes.attrs_json` and `payload_json`;
-- interaction IDs such as `M0:interaction:g12345`;
-- `updated_step`, local step and global-step columns;
-- direct and two-hop interaction-to-contingency-to-family links;
-- role matching through family, carrier, context or game links.
+Strong links are ranked by event support, role breadth, raw support and
+prediction gain. An adaptive cap is then applied:
 
-Prediction events are included only when a concrete compact structural link to
-one of the concept's source roles is found.
+```text
+min(configured_cap, max(8, round(sqrt(candidate_family_count))))
+```
 
-### H08 current promotion state
+The fix does not raise the old 50-link cap. It prevents components from
+expanding indefinitely as candidate families accumulate.
 
-H08 now uses the latest `current_validation_passed` result and the current
-promotion-score gate. Historical retention is reported separately and cannot
-satisfy the H08 promoted-concept gate.
+Diagnostics are stored under:
 
-World-model validation is also run against temporary current-validation flags,
-then the historical `concept_candidates.is_promoted` values are restored.
+```text
+memory_summary.world_model_family_selection_repair
+```
+
+## H09 graph-edge provenance
+
+Future-option graph-edge events are backfilled from concrete interaction
+metadata in `memory_nodes` or `graph_nodes`.
+
+A graph-edge classification is verified when its source interaction has a
+concrete game and context. Target scope is also populated when the target is a
+resolvable interaction.
 
 ## Install
 
 ```bash
-unzip -o arc_agi3_h07_h08_evidence_repairs.zip
+unzip -o arc_agi3_remaining_report_repairs.zip
 ```
 
 ## Verify
 
 ```bash
 PYTHONPATH=src python -c \
-'import v6.h07_h08_evidence_repairs as p; import v6.higher_order_substrate as h; import v6.hypothesis_h08_report as r; print(p._PATCHED, h._ARC_AGI3_H07_EVIDENCE_CONTINUITY_FIX, r._ARC_AGI3_CURRENT_PROMOTION_FIX)'
+'import v6.remaining_report_repairs as p; import v6.hypothesis_h02_report as h2; import v6.higher_order_substrate as h8; import v6.future_options as h9; print(p._PATCHED, h2._ARC_AGI3_COMPACT_METADATA_FIX, h8._ARC_AGI3_WORLD_MODEL_FAMILY_SELECTIVITY_FIX, h9._ARC_AGI3_EDGE_PROVENANCE_BACKFILL_FIX)'
 ```
 
 Expected:
 
 ```text
-True True True
+True True True True
 ```
 
-The patch applies on the next hypothesis-suite execution. A new output
-directory is not required.
+A new output directory is not required. The fixes apply from the next
+hypothesis-suite execution.
