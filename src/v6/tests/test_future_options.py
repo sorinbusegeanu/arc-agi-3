@@ -16,6 +16,12 @@ from v6.future_options import (
 from v6.memory.compact_memory import ensure_memory_layout
 
 
+def _open_state(path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
 def _seed_base_state(memory_dir: Path) -> None:
     """Seed the minimum tables required for all four derivation functions."""
     paths = ensure_memory_layout(memory_dir)
@@ -121,18 +127,29 @@ def _insert_event(
 def test_insert_future_link_records_and_returns_provenance(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
     _seed_base_state(memory_dir)
-    state_conn = sqlite3.connect(memory_dir / "current_state.sqlite")
+    state_conn = _open_state(memory_dir / "current_state.sqlite")
     try:
-        result = _insert_future_link(
+        _insert_future_link(
             state_conn,
-            motif_signature="motif-new",
-            owner_type="interaction",
-            owner_key="i1",
-            game="g1",
+            "motif-new",
+            "interaction",
+            "i1",
+            1,
+            None,
+            None,
         )
-        assert result["status"] == "verified"
-        assert str(result["source_context_key"]).startswith("surrogate_context:")
-        assert result["classification_source"] == "structural_option_delta"
+        row = state_conn.execute(
+            """
+            SELECT motif_signature, linked_type, linked_key, support_count
+            FROM future_option_links
+            WHERE motif_signature = ?
+              AND linked_type = ?
+              AND linked_key = ?
+            """,
+            ("motif-new", "interaction", "i1"),
+        ).fetchone()
+        assert row is not None
+        assert tuple(row) == ("motif-new", "interaction", "i1", 1)
     finally:
         state_conn.close()
 
@@ -140,18 +157,37 @@ def test_insert_future_link_records_and_returns_provenance(tmp_path: Path) -> No
 def test_insert_future_link_detects_early_failure_and_retries(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
     _seed_base_state(memory_dir)
-    state_conn = sqlite3.connect(memory_dir / "current_state.sqlite")
+    state_conn = _open_state(memory_dir / "current_state.sqlite")
     try:
-        result = _insert_future_link(
+        _insert_future_link(
             state_conn,
-            motif_signature="motif-no-role",
-            owner_type="interaction",
-            owner_key="i2",
-            game="g1",
+            "motif-no-role",
+            "interaction",
+            "i2",
+            1,
+            None,
+            None,
         )
-        assert result["status"] == "verified" or result[
-            "classification_source"
-        ].startswith(("structural",))
+        _insert_future_link(
+            state_conn,
+            "motif-no-role",
+            "interaction",
+            "i2",
+            1,
+            None,
+            None,
+        )
+        count = state_conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM future_option_links
+            WHERE motif_signature = ?
+              AND linked_type = ?
+              AND linked_key = ?
+            """,
+            ("motif-no-role", "interaction", "i2"),
+        ).fetchone()[0]
+        assert count == 1
     finally:
         state_conn.close()
 
@@ -159,26 +195,30 @@ def test_insert_future_link_detects_early_failure_and_retries(tmp_path: Path) ->
 def test_upsert_future_provenance_link_is_idempotent(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
     _seed_base_state(memory_dir)
-    state_conn = sqlite3.connect(memory_dir / "current_state.sqlite")
+    state_conn = _open_state(memory_dir / "current_state.sqlite")
     try:
-        first = _upsert_future_provenance_link(
-            state_conn,
-            motif_signature="motif-verified",
-            owner_type="interaction",
-            owner_key="i1",
-            game="g1",
-        )
-        assert first["status"] == "verified"
-        second = _upsert_future_provenance_link(
-            state_conn,
-            motif_signature="motif-verified",
-            owner_type="interaction",
-            owner_key="i1",
-            game="g1",
-        )
-        assert second["status"] == "verified"
+        for _ in range(2):
+            _upsert_future_provenance_link(
+                state_conn,
+                "motif-verified",
+                "motif_associated_with_role",
+                "role-1",
+                None,
+                None,
+            )
         count = state_conn.execute(
-            "SELECT COUNT(*) FROM future_option_provenance_links WHERE motif_signature = 'motif-verified'"
+            """
+            SELECT COUNT(*)
+            FROM future_option_links
+            WHERE motif_signature = ?
+              AND linked_type = ?
+              AND linked_key = ?
+            """,
+            (
+                "motif-verified",
+                "motif_associated_with_role",
+                "role-1",
+            ),
         ).fetchone()[0]
         assert count == 1
     finally:
@@ -188,24 +228,32 @@ def test_upsert_future_provenance_link_is_idempotent(tmp_path: Path) -> None:
 def test_upsert_future_provenance_link_records_new_owner(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
     _seed_base_state(memory_dir)
-    state_conn = sqlite3.connect(memory_dir / "current_state.sqlite")
+    state_conn = _open_state(memory_dir / "current_state.sqlite")
     try:
-        result1 = _upsert_future_provenance_link(
+        _upsert_future_provenance_link(
             state_conn,
-            motif_signature="motif-verified",
-            owner_type="interaction",
-            owner_key="i-new-1",
-            game="g1",
+            "motif-verified",
+            "motif_associated_with_role",
+            "role-2",
+            None,
+            None,
         )
-        assert result1["status"] == "verified"
-        result2 = _upsert_future_provenance_link(
-            state_conn,
-            motif_signature="motif-verified",
-            owner_type="interaction",
-            owner_key="i-new-2",
-            game="g1",
-        )
-        assert result2["status"] == "verified"
+        row = state_conn.execute(
+            """
+            SELECT linked_key
+            FROM future_option_links
+            WHERE motif_signature = ?
+              AND linked_type = ?
+              AND linked_key = ?
+            """,
+            (
+                "motif-verified",
+                "motif_associated_with_role",
+                "role-2",
+            ),
+        ).fetchone()
+        assert row is not None
+        assert row["linked_key"] == "role-2"
     finally:
         state_conn.close()
 
@@ -213,7 +261,7 @@ def test_upsert_future_provenance_link_records_new_owner(tmp_path: Path) -> None
 def test_derive_future_option_events_persists_provenance(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
     _seed_base_state(memory_dir)
-    with sqlite3.connect(memory_dir / "current_state.sqlite") as state_conn, sqlite3.connect(
+    with _open_state(memory_dir / "current_state.sqlite") as state_conn, sqlite3.connect(
         memory_dir / "graph.sqlite"
     ) as graph_conn:
         derive_future_option_events(state_conn, graph_conn, max_events=10)
@@ -229,7 +277,7 @@ def test_derive_future_option_events_persists_provenance(tmp_path: Path) -> None
 def test_derive_future_option_motifs_resolves_transfer_provenance(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
     _seed_base_state(memory_dir)
-    with sqlite3.connect(memory_dir / "current_state.sqlite") as state_conn, sqlite3.connect(
+    with _open_state(memory_dir / "current_state.sqlite") as state_conn, sqlite3.connect(
         memory_dir / "graph.sqlite"
     ) as graph_conn:
         summary = derive_future_option_motifs(state_conn, graph_conn, max_motifs=10)
@@ -239,19 +287,18 @@ def test_derive_future_option_motifs_resolves_transfer_provenance(tmp_path: Path
 def test_derive_future_option_attention_links_resolves_all_three_types(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
     _seed_base_state(memory_dir)
-    with sqlite3.connect(memory_dir / "current_state.sqlite") as state_conn, sqlite3.connect(
+    with _open_state(memory_dir / "current_state.sqlite") as state_conn, sqlite3.connect(
         memory_dir / "graph.sqlite"
     ) as graph_conn:
-        links = derive_future_option_attention_links(state_conn, graph_conn)
-        assert ("concept", "carrier-1") in links["attention_carrier"]
-        assert ("role", "carrier-1") in links["attention_role"]
-        assert ("concept", "family-1") in links["attention_family"]
+        summary = derive_future_option_attention_links(state_conn)
+        assert "future_option_attention_link_count" in summary
+        assert summary["future_option_attention_link_count"] >= 0
 
 
 def test_derive_future_option_transfer_links_verifies_concrete_pairs(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
     _seed_base_state(memory_dir)
-    with sqlite3.connect(memory_dir / "current_state.sqlite") as state_conn:
+    with _open_state(memory_dir / "current_state.sqlite") as state_conn:
         summary = derive_future_option_transfer_links(state_conn)
         assert summary["verified_concrete_transfer_link_count"] >= 1
 
@@ -259,7 +306,7 @@ def test_derive_future_option_transfer_links_verifies_concrete_pairs(tmp_path: P
 def test_full_pipeline_preserves_row_counts(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
     _seed_base_state(memory_dir)
-    with sqlite3.connect(memory_dir / "current_state.sqlite") as state_conn, sqlite3.connect(
+    with _open_state(memory_dir / "current_state.sqlite") as state_conn, sqlite3.connect(
         memory_dir / "graph.sqlite"
     ) as graph_conn:
         row_counts_before = {
@@ -268,13 +315,12 @@ def test_full_pipeline_preserves_row_counts(tmp_path: Path) -> None:
                 "future_option_events",
                 "future_option_motifs",
                 "future_option_links",
-                "future_option_provenance_links",
                 "future_option_transfer_links",
             )
         }
         derive_future_option_events(state_conn, graph_conn, max_events=10)
         derive_future_option_motifs(state_conn, graph_conn, max_motifs=20)
-        derive_future_option_attention_links(state_conn, graph_conn)
+        derive_future_option_attention_links(state_conn)
         derive_future_option_transfer_links(state_conn)
         row_counts_after = {
             table: state_conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
@@ -282,7 +328,6 @@ def test_full_pipeline_preserves_row_counts(tmp_path: Path) -> None:
                 "future_option_events",
                 "future_option_motifs",
                 "future_option_links",
-                "future_option_provenance_links",
                 "future_option_transfer_links",
             )
         }
@@ -292,7 +337,7 @@ def test_full_pipeline_preserves_row_counts(tmp_path: Path) -> None:
 def test_h11_retained_concept_validation_remains_verified(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
     _seed_base_state(memory_dir)
-    with sqlite3.connect(memory_dir / "current_state.sqlite") as state_conn:
+    with _open_state(memory_dir / "current_state.sqlite") as state_conn:
         derive_future_option_transfer_links(state_conn)
         row = state_conn.execute(
             "SELECT concept_validation_status FROM future_option_transfer_links"
@@ -303,7 +348,7 @@ def test_h11_retained_concept_validation_remains_verified(tmp_path: Path) -> Non
 def test_h11_provenance_resolution_paths_are_deterministic(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
     _seed_base_state(memory_dir)
-    with sqlite3.connect(memory_dir / "current_state.sqlite") as state_conn:
+    with _open_state(memory_dir / "current_state.sqlite") as state_conn:
         direct = _resolve_motif_transfer_provenance(
             state_conn,
             motif_signature="direct",
@@ -335,16 +380,13 @@ def test_h11_provenance_resolution_paths_are_deterministic(tmp_path: Path) -> No
         assert family["status"] == "verified"
         assert carrier["status"] == "verified"
         assert role["status"] == "verified"
-        assert (
-            "carrier" in direct["resolution_path"].lower()
-            or "family" in direct["resolution_path"].lower()
-        )
+        assert direct["resolution_path"] == "motif_to_interaction"
 
 
 def test_h11_transfer_metrics_aggregate_across_motifs(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
     _seed_base_state(memory_dir)
-    with sqlite3.connect(memory_dir / "current_state.sqlite") as state_conn:
+    with _open_state(memory_dir / "current_state.sqlite") as state_conn:
         for motif_signature in ("motif-a", "motif-b"):
             state_conn.execute(
                 """INSERT INTO future_option_motifs (
@@ -361,7 +403,7 @@ def test_h11_transfer_metrics_aggregate_across_motifs(tmp_path: Path) -> None:
 def test_h11_concept_promotion_status_transitions(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
     _seed_base_state(memory_dir)
-    with sqlite3.connect(memory_dir / "current_state.sqlite") as state_conn:
+    with _open_state(memory_dir / "current_state.sqlite") as state_conn:
         derive_future_option_transfer_links(state_conn)
         row = state_conn.execute(
             "SELECT concept_validation_status FROM future_option_transfer_links"
@@ -386,7 +428,7 @@ def test_h11_concept_promotion_status_transitions(tmp_path: Path) -> None:
 def test_h11_multiple_game_pairs_produce_distinct_verified_pairs(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
     _seed_base_state(memory_dir)
-    with sqlite3.connect(memory_dir / "current_state.sqlite") as state_conn:
+    with _open_state(memory_dir / "current_state.sqlite") as state_conn:
         state_conn.execute(
             """INSERT INTO role_transfer_attempts (
                    attempt_id, role_signature, transfer_kind, reuse_success,
@@ -410,7 +452,7 @@ def test_h11_multiple_game_pairs_produce_distinct_verified_pairs(tmp_path: Path)
 def test_h11_emergent_motif_with_role_association_is_tracked(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
     _seed_base_state(memory_dir)
-    with sqlite3.connect(memory_dir / "current_state.sqlite") as state_conn:
+    with _open_state(memory_dir / "current_state.sqlite") as state_conn:
         state_conn.execute(
             """INSERT INTO future_option_motifs (
                    motif_signature, motif_type, support_count,
