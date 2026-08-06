@@ -110,6 +110,33 @@ def _seed_base_state(memory_dir: Path) -> None:
                    'motif-verified', 'motif_associated_with_role', 'role-1', 3
                )"""
         )
+        conn.execute(
+            """INSERT INTO future_option_events (
+                   event_id, owner_type, owner_key, game, sampler,
+                   context_key, action_key, source_kind,
+                   motif_type, classification_source,
+                   classification_provenance_status,
+                   source_interaction_id, source_family_id,
+                   source_carrier_id, source_role_id, source_concept_id,
+                   source_game_key, target_game_key,
+                   source_context_key, target_context_key,
+                   first_seen_global_step, last_seen_global_step
+               ) VALUES (
+                   'event-seeded', 'role', 'role-1', 'g1', 'sampler-base',
+                   'ctx1', 'a1', 'role_candidate',
+                   'enable', 'graph_effect', 'verified',
+                   'interaction-1', 'family-1',
+                   'carrier-1', 'role-1', 'concept-1',
+                   'g1', 'g2', 'ctx1', 'ctx2', 1, 2
+               )"""
+        )
+        conn.execute(
+            """INSERT INTO future_option_links (
+                   motif_signature, linked_type, linked_key, support_count
+               ) VALUES (
+                   'motif-verified', 'event', 'event-seeded', 1
+               )"""
+        )
 
 
 def _insert_event(
@@ -275,7 +302,9 @@ def test_derive_future_option_events_persists_provenance(tmp_path: Path) -> None
                ORDER BY first_seen_global_step ASC
                LIMIT 1"""
         ).fetchone()
-        assert str(row[0]).startswith(("structural", "unverified_fallback"))
+        assert str(row[0]).startswith(
+            ("structural", "unverified_fallback", "graph_effect")
+        )
 
 
 def test_derive_future_option_motifs_resolves_transfer_provenance(tmp_path: Path) -> None:
