@@ -1221,7 +1221,7 @@ def evaluate_h11_future_option_transfer_concepts(
         ),
         "game_pair_count": len(game_pairs),
         "context_pair_count": len(context_pairs),
-        "provenance_sample": [],
+        "provenance_sample": provenance_sample,
         "full_provenance_jsonl_written":
             write_full_provenance_jsonl,
         "full_provenance_jsonl_path":
