@@ -1,8 +1,8 @@
-....FF.FF.FFFFF                                                          [100%]
+....F..F..FF.FF                                                          [100%]
 =================================== FAILURES ===================================
 _____________ test_derive_future_option_events_persists_provenance _____________
 
-tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-17/test_derive_future_option_even0')
+tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-21/test_derive_future_option_even0')
 
     def test_derive_future_option_events_persists_provenance(tmp_path: Path) -> None:
         memory_dir = tmp_path / "memory"
@@ -11,33 +11,22 @@ tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-17/test_derive_future_option_
             memory_dir / "graph.sqlite"
         ) as graph_conn:
             derive_future_option_events(state_conn, graph_conn, max_events=10)
->           row = state_conn.execute(
+            row = state_conn.execute(
                 """SELECT classification_source, source_kind
                    FROM future_option_events
-                   ORDER BY first_seen ASC
+                   ORDER BY first_seen_global_step ASC
                    LIMIT 1"""
             ).fetchone()
-E           sqlite3.OperationalError: no such column: first_seen
+>           assert str(row[0]).startswith(("structural", "unverified_fallback"))
+E           AssertionError: assert False
+E            +  where False = <built-in method startswith of str object at 0x7003bcc832f0>(('structural', 'unverified_fallback'))
+E            +    where <built-in method startswith of str object at 0x7003bcc832f0> = 'graph_effect'.startswith
+E            +      where 'graph_effect' = str('graph_effect')
 
-src/v6/tests/test_future_options.py:268: OperationalError
-________ test_derive_future_option_motifs_resolves_transfer_provenance _________
-
-tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-17/test_derive_future_option_moti0')
-
-    def test_derive_future_option_motifs_resolves_transfer_provenance(tmp_path: Path) -> None:
-        memory_dir = tmp_path / "memory"
-        _seed_base_state(memory_dir)
-        with _open_state(memory_dir / "current_state.sqlite") as state_conn, sqlite3.connect(
-            memory_dir / "graph.sqlite"
-        ) as graph_conn:
-            summary = derive_future_option_motifs(state_conn, graph_conn, max_motifs=10)
->           assert summary["motifs_with_role_provenance"] >= 1
-E           assert 0 >= 1
-
-src/v6/tests/test_future_options.py:284: AssertionError
+src/v6/tests/test_future_options.py:278: AssertionError
 _______ test_derive_future_option_transfer_links_verifies_concrete_pairs _______
 
-tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-17/test_derive_future_option_tran0')
+tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-21/test_derive_future_option_tran0')
 
     def test_derive_future_option_transfer_links_verifies_concrete_pairs(tmp_path: Path) -> None:
         memory_dir = tmp_path / "memory"
@@ -47,53 +36,10 @@ tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-17/test_derive_future_option_
 >           assert summary["verified_concrete_transfer_link_count"] >= 1
 E           assert 0 >= 1
 
-src/v6/tests/test_future_options.py:303: AssertionError
-___________________ test_full_pipeline_preserves_row_counts ____________________
-
-tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-17/test_full_pipeline_preserves_r0')
-
-    def test_full_pipeline_preserves_row_counts(tmp_path: Path) -> None:
-        memory_dir = tmp_path / "memory"
-        _seed_base_state(memory_dir)
-        with _open_state(memory_dir / "current_state.sqlite") as state_conn, sqlite3.connect(
-            memory_dir / "graph.sqlite"
-        ) as graph_conn:
-            row_counts_before = {
-                table: state_conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-                for table in (
-                    "future_option_events",
-                    "future_option_motifs",
-                    "future_option_links",
-                    "future_option_transfer_links",
-                )
-            }
-            derive_future_option_events(state_conn, graph_conn, max_events=10)
-            derive_future_option_motifs(state_conn, graph_conn, max_motifs=20)
-            derive_future_option_attention_links(state_conn)
-            derive_future_option_transfer_links(state_conn)
-            row_counts_after = {
-                table: state_conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-                for table in (
-                    "future_option_events",
-                    "future_option_motifs",
-                    "future_option_links",
-                    "future_option_transfer_links",
-                )
-            }
->           assert row_counts_after == row_counts_before
-E           AssertionError: assert {'future_opti...fer_links': 1} == {'future_opti...fer_links': 0}
-E             
-E             Differing items:
-E             {'future_option_links': 31} != {'future_option_links': 1}
-E             {'future_option_events': 4} != {'future_option_events': 0}
-E             {'future_option_transfer_links': 1} != {'future_option_transfer_links': 0}
-E             {'future_option_motifs': 5} != {'future_option_motifs': 1}
-E             Use -v to get more diff
-
-src/v6/tests/test_future_options.py:334: AssertionError
+src/v6/tests/test_future_options.py:309: AssertionError
 ____________ test_h11_provenance_resolution_paths_are_deterministic ____________
 
-tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-17/test_h11_provenance_resolution0')
+tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-21/test_h11_provenance_resolution0')
 
     def test_h11_provenance_resolution_paths_are_deterministic(tmp_path: Path) -> None:
         memory_dir = tmp_path / "memory"
@@ -103,7 +49,7 @@ tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-17/test_h11_provenance_resolu
                 state_conn,
                 motif_signature="direct",
                 motif_links={"event": {"interaction-1"}},
-                direct_interaction_ids=set(),
+                direct_interaction_ids={"interaction-1"},
             )
             family = _resolve_motif_transfer_provenance(
                 state_conn,
@@ -123,19 +69,20 @@ tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-17/test_h11_provenance_resolu
                 motif_links={"motif_associated_with_role": {"role-1"}},
                 direct_interaction_ids=set(),
             )
->           assert (direct["status"], direct["resolution_path"]) == (
+            assert (direct["status"], direct["resolution_path"]) == (
                 "verified",
                 "motif_to_interaction",
             )
-E           AssertionError: assert ('missing', 'unresolved') == ('verified', ..._interaction')
+>           assert family["status"] == "verified"
+E           AssertionError: assert 'proxy' == 'verified'
 E             
-E             At index 0 diff: 'missing' != 'verified'
-E             Use -v to get more diff
+E             - verified
+E             + proxy
 
-src/v6/tests/test_future_options.py:376: AssertionError
+src/v6/tests/test_future_options.py:390: AssertionError
 ______________ test_h11_transfer_metrics_aggregate_across_motifs _______________
 
-tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-17/test_h11_transfer_metrics_aggr0')
+tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-21/test_h11_transfer_metrics_aggr0')
 
     def test_h11_transfer_metrics_aggregate_across_motifs(tmp_path: Path) -> None:
         memory_dir = tmp_path / "memory"
@@ -149,46 +96,21 @@ tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-17/test_h11_transfer_metrics_
                        ) VALUES (?, 'enable', 5, 0.8, 1)""",
                     (motif_signature,),
                 )
+                state_conn.execute(
+                    """INSERT INTO future_option_links (
+                           motif_signature, linked_type, linked_key, support_count
+                       ) VALUES (?, 'motif_associated_with_role', 'role-1', 3)""",
+                    (motif_signature,),
+                )
             state_conn.commit()
             summary = derive_future_option_transfer_links(state_conn)
 >           assert summary["all_motifs_with_transfer_count"] == 2
 E           assert 0 == 2
 
-src/v6/tests/test_future_options.py:400: AssertionError
-________________ test_h11_concept_promotion_status_transitions _________________
-
-tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-17/test_h11_concept_promotion_sta0')
-
-    def test_h11_concept_promotion_status_transitions(tmp_path: Path) -> None:
-        memory_dir = tmp_path / "memory"
-        _seed_base_state(memory_dir)
-        with _open_state(memory_dir / "current_state.sqlite") as state_conn:
-            derive_future_option_transfer_links(state_conn)
-            row = state_conn.execute(
-                "SELECT concept_validation_status FROM future_option_transfer_links"
-            ).fetchone()
-            assert tuple(row)[0] == "verified"
-    
-            state_conn.execute(
-                """UPDATE concept_promotion_state
-                   SET currently_promoted = 0,
-                       promotion_status = 'demoted',
-                       validation_status = 'failed'
-                   WHERE concept_signature = 'concept-1'"""
-            )
-            state_conn.commit()
-            derive_future_option_transfer_links(state_conn)
-            row = state_conn.execute(
-                "SELECT concept_validation_status FROM future_option_transfer_links"
-            ).fetchone()
->           assert tuple(row)[0] == "demoted"
-                   ^^^^^^^^^^
-E           TypeError: 'NoneType' object is not iterable
-
-src/v6/tests/test_future_options.py:425: TypeError
+src/v6/tests/test_future_options.py:416: AssertionError
 _________ test_h11_multiple_game_pairs_produce_distinct_verified_pairs _________
 
-tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-17/test_h11_multiple_game_pairs_p0')
+tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-21/test_h11_multiple_game_pairs_p0')
 
     def test_h11_multiple_game_pairs_produce_distinct_verified_pairs(tmp_path: Path) -> None:
         memory_dir = tmp_path / "memory"
@@ -214,10 +136,10 @@ tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-17/test_h11_multiple_game_pai
 >           assert summary["verified_concrete_transfer_link_count"] >= 2
 E           assert 0 >= 2
 
-src/v6/tests/test_future_options.py:449: AssertionError
+src/v6/tests/test_future_options.py:465: AssertionError
 ___________ test_h11_emergent_motif_with_role_association_is_tracked ___________
 
-tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-17/test_h11_emergent_motif_with_r0')
+tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-21/test_h11_emergent_motif_with_r0')
 
     def test_h11_emergent_motif_with_role_association_is_tracked(tmp_path: Path) -> None:
         memory_dir = tmp_path / "memory"
@@ -241,15 +163,12 @@ tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-17/test_h11_emergent_motif_wi
 >           assert summary["emergent_motifs_with_strong_transfer_count"] >= 1
 E           assert 0 >= 1
 
-src/v6/tests/test_future_options.py:471: AssertionError
+src/v6/tests/test_future_options.py:487: AssertionError
 =========================== short test summary info ============================
 FAILED src/v6/tests/test_future_options.py::test_derive_future_option_events_persists_provenance
-FAILED src/v6/tests/test_future_options.py::test_derive_future_option_motifs_resolves_transfer_provenance
 FAILED src/v6/tests/test_future_options.py::test_derive_future_option_transfer_links_verifies_concrete_pairs
-FAILED src/v6/tests/test_future_options.py::test_full_pipeline_preserves_row_counts
 FAILED src/v6/tests/test_future_options.py::test_h11_provenance_resolution_paths_are_deterministic
 FAILED src/v6/tests/test_future_options.py::test_h11_transfer_metrics_aggregate_across_motifs
-FAILED src/v6/tests/test_future_options.py::test_h11_concept_promotion_status_transitions
 FAILED src/v6/tests/test_future_options.py::test_h11_multiple_game_pairs_produce_distinct_verified_pairs
 FAILED src/v6/tests/test_future_options.py::test_h11_emergent_motif_with_role_association_is_tracked
-9 failed, 6 passed in 0.59s
+6 failed, 9 passed in 0.59s
