@@ -1,0 +1,529 @@
+FFFFFFFFFFFFFFF                                                          [100%]
+=================================== FAILURES ===================================
+____________ test_insert_future_link_records_and_returns_provenance ____________
+
+tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-11/test_insert_future_link_record0')
+
+    def test_insert_future_link_records_and_returns_provenance(tmp_path: Path) -> None:
+        memory_dir = tmp_path / "memory"
+        _seed_base_state(memory_dir)
+        state_conn = sqlite3.connect(memory_dir / "current_state.sqlite")
+        try:
+>           result = _insert_future_link(
+                state_conn,
+                motif_signature="motif-new",
+                owner_type="interaction",
+                owner_key="i1",
+                game="g1",
+            )
+E           TypeError: _insert_future_link() got an unexpected keyword argument 'owner_type'
+
+src/v6/tests/test_future_options.py:126: TypeError
+__________ test_insert_future_link_detects_early_failure_and_retries ___________
+
+tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-11/test_insert_future_link_detect0')
+
+    def test_insert_future_link_detects_early_failure_and_retries(tmp_path: Path) -> None:
+        memory_dir = tmp_path / "memory"
+        _seed_base_state(memory_dir)
+        state_conn = sqlite3.connect(memory_dir / "current_state.sqlite")
+        try:
+>           result = _insert_future_link(
+                state_conn,
+                motif_signature="motif-no-role",
+                owner_type="interaction",
+                owner_key="i2",
+                game="g1",
+            )
+E           TypeError: _insert_future_link() got an unexpected keyword argument 'owner_type'
+
+src/v6/tests/test_future_options.py:145: TypeError
+_______________ test_upsert_future_provenance_link_is_idempotent _______________
+
+tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-11/test_upsert_future_provenance_0')
+
+    def test_upsert_future_provenance_link_is_idempotent(tmp_path: Path) -> None:
+        memory_dir = tmp_path / "memory"
+        _seed_base_state(memory_dir)
+        state_conn = sqlite3.connect(memory_dir / "current_state.sqlite")
+        try:
+>           first = _upsert_future_provenance_link(
+                state_conn,
+                motif_signature="motif-verified",
+                owner_type="interaction",
+                owner_key="i1",
+                game="g1",
+            )
+E           TypeError: _upsert_future_provenance_link() got an unexpected keyword argument 'owner_type'
+
+src/v6/tests/test_future_options.py:164: TypeError
+_____________ test_upsert_future_provenance_link_records_new_owner _____________
+
+tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-11/test_upsert_future_provenance_1')
+
+    def test_upsert_future_provenance_link_records_new_owner(tmp_path: Path) -> None:
+        memory_dir = tmp_path / "memory"
+        _seed_base_state(memory_dir)
+        state_conn = sqlite3.connect(memory_dir / "current_state.sqlite")
+        try:
+>           result1 = _upsert_future_provenance_link(
+                state_conn,
+                motif_signature="motif-verified",
+                owner_type="interaction",
+                owner_key="i-new-1",
+                game="g1",
+            )
+E           TypeError: _upsert_future_provenance_link() got an unexpected keyword argument 'owner_type'
+
+src/v6/tests/test_future_options.py:193: TypeError
+_____________ test_derive_future_option_events_persists_provenance _____________
+
+tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-11/test_derive_future_option_even0')
+
+    def test_derive_future_option_events_persists_provenance(tmp_path: Path) -> None:
+        memory_dir = tmp_path / "memory"
+        _seed_base_state(memory_dir)
+        with sqlite3.connect(memory_dir / "current_state.sqlite") as state_conn, sqlite3.connect(
+            memory_dir / "graph.sqlite"
+        ) as graph_conn:
+>           derive_future_option_events(state_conn, graph_conn, max_events=10)
+
+src/v6/tests/test_future_options.py:219: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/v6/future_options.py:301: in derive_future_option_events
+    carrier_links = _links_by_signature(state_conn, "carrier_links", "carrier_signature")
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+state_conn = <sqlite3.Connection object at 0x76fde5ced030>
+table = 'carrier_links', signature_column = 'carrier_signature'
+
+    def _links_by_signature(
+        state_conn: sqlite3.Connection,
+        table: str,
+        signature_column: str,
+    ) -> dict[str, dict[str, set[str]]]:
+        results: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
+        for row in state_conn.execute(
+            f"""
+            SELECT {signature_column} AS signature_value, linked_type, linked_key
+            FROM {table}
+            ORDER BY {signature_column} ASC, linked_type ASC, linked_key ASC
+            """
+        ).fetchall():
+>           if row["linked_key"] not in (None, ""):
+               ^^^^^^^^^^^^^^^^^
+E           TypeError: tuple indices must be integers or slices, not str
+
+src/v6/higher_order_substrate.py:4650: TypeError
+________ test_derive_future_option_motifs_resolves_transfer_provenance _________
+
+tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-11/test_derive_future_option_moti0')
+
+    def test_derive_future_option_motifs_resolves_transfer_provenance(tmp_path: Path) -> None:
+        memory_dir = tmp_path / "memory"
+        _seed_base_state(memory_dir)
+        with sqlite3.connect(memory_dir / "current_state.sqlite") as state_conn, sqlite3.connect(
+            memory_dir / "graph.sqlite"
+        ) as graph_conn:
+>           summary = derive_future_option_motifs(state_conn, graph_conn, max_motifs=10)
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/v6/tests/test_future_options.py:235: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/v6/future_options.py:665: in derive_future_option_motifs
+    carrier_links = _links_by_signature(state_conn, "carrier_links", "carrier_signature")
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+state_conn = <sqlite3.Connection object at 0x76fde5ced7b0>
+table = 'carrier_links', signature_column = 'carrier_signature'
+
+    def _links_by_signature(
+        state_conn: sqlite3.Connection,
+        table: str,
+        signature_column: str,
+    ) -> dict[str, dict[str, set[str]]]:
+        results: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
+        for row in state_conn.execute(
+            f"""
+            SELECT {signature_column} AS signature_value, linked_type, linked_key
+            FROM {table}
+            ORDER BY {signature_column} ASC, linked_type ASC, linked_key ASC
+            """
+        ).fetchall():
+>           if row["linked_key"] not in (None, ""):
+               ^^^^^^^^^^^^^^^^^
+E           TypeError: tuple indices must be integers or slices, not str
+
+src/v6/higher_order_substrate.py:4650: TypeError
+______ test_derive_future_option_attention_links_resolves_all_three_types ______
+
+tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-11/test_derive_future_option_atte0')
+
+    def test_derive_future_option_attention_links_resolves_all_three_types(tmp_path: Path) -> None:
+        memory_dir = tmp_path / "memory"
+        _seed_base_state(memory_dir)
+        with sqlite3.connect(memory_dir / "current_state.sqlite") as state_conn, sqlite3.connect(
+            memory_dir / "graph.sqlite"
+        ) as graph_conn:
+>           links = derive_future_option_attention_links(state_conn, graph_conn)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: derive_future_option_attention_links() takes 1 positional argument but 2 were given
+
+src/v6/tests/test_future_options.py:245: TypeError
+_______ test_derive_future_option_transfer_links_verifies_concrete_pairs _______
+
+tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-11/test_derive_future_option_tran0')
+
+    def test_derive_future_option_transfer_links_verifies_concrete_pairs(tmp_path: Path) -> None:
+        memory_dir = tmp_path / "memory"
+        _seed_base_state(memory_dir)
+        with sqlite3.connect(memory_dir / "current_state.sqlite") as state_conn:
+>           summary = derive_future_option_transfer_links(state_conn)
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/v6/tests/test_future_options.py:255: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/v6/future_options.py:1589: in derive_future_option_transfer_links
+    motif_links = _links_by_signature(state_conn, "future_option_links", "motif_signature")
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+state_conn = <sqlite3.Connection object at 0x76fde5cedd50>
+table = 'future_option_links', signature_column = 'motif_signature'
+
+    def _links_by_signature(
+        state_conn: sqlite3.Connection,
+        table: str,
+        signature_column: str,
+    ) -> dict[str, dict[str, set[str]]]:
+        results: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
+        for row in state_conn.execute(
+            f"""
+            SELECT {signature_column} AS signature_value, linked_type, linked_key
+            FROM {table}
+            ORDER BY {signature_column} ASC, linked_type ASC, linked_key ASC
+            """
+        ).fetchall():
+>           if row["linked_key"] not in (None, ""):
+               ^^^^^^^^^^^^^^^^^
+E           TypeError: tuple indices must be integers or slices, not str
+
+src/v6/higher_order_substrate.py:4650: TypeError
+___________________ test_full_pipeline_preserves_row_counts ____________________
+
+tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-11/test_full_pipeline_preserves_r0')
+
+    def test_full_pipeline_preserves_row_counts(tmp_path: Path) -> None:
+        memory_dir = tmp_path / "memory"
+        _seed_base_state(memory_dir)
+        with sqlite3.connect(memory_dir / "current_state.sqlite") as state_conn, sqlite3.connect(
+            memory_dir / "graph.sqlite"
+        ) as graph_conn:
+            row_counts_before = {
+>               table: state_conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                for table in (
+                    "future_option_events",
+                    "future_option_motifs",
+                    "future_option_links",
+                    "future_option_provenance_links",
+                    "future_option_transfer_links",
+                )
+            }
+E           sqlite3.OperationalError: no such table: future_option_provenance_links
+
+src/v6/tests/test_future_options.py:266: OperationalError
+____________ test_h11_retained_concept_validation_remains_verified _____________
+
+tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-11/test_h11_retained_concept_vali0')
+
+    def test_h11_retained_concept_validation_remains_verified(tmp_path: Path) -> None:
+        memory_dir = tmp_path / "memory"
+        _seed_base_state(memory_dir)
+        with sqlite3.connect(memory_dir / "current_state.sqlite") as state_conn:
+>           derive_future_option_transfer_links(state_conn)
+
+src/v6/tests/test_future_options.py:296: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/v6/future_options.py:1589: in derive_future_option_transfer_links
+    motif_links = _links_by_signature(state_conn, "future_option_links", "motif_signature")
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+state_conn = <sqlite3.Connection object at 0x76fde5ceda80>
+table = 'future_option_links', signature_column = 'motif_signature'
+
+    def _links_by_signature(
+        state_conn: sqlite3.Connection,
+        table: str,
+        signature_column: str,
+    ) -> dict[str, dict[str, set[str]]]:
+        results: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
+        for row in state_conn.execute(
+            f"""
+            SELECT {signature_column} AS signature_value, linked_type, linked_key
+            FROM {table}
+            ORDER BY {signature_column} ASC, linked_type ASC, linked_key ASC
+            """
+        ).fetchall():
+>           if row["linked_key"] not in (None, ""):
+               ^^^^^^^^^^^^^^^^^
+E           TypeError: tuple indices must be integers or slices, not str
+
+src/v6/higher_order_substrate.py:4650: TypeError
+____________ test_h11_provenance_resolution_paths_are_deterministic ____________
+
+tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-11/test_h11_provenance_resolution0')
+
+    def test_h11_provenance_resolution_paths_are_deterministic(tmp_path: Path) -> None:
+        memory_dir = tmp_path / "memory"
+        _seed_base_state(memory_dir)
+        with sqlite3.connect(memory_dir / "current_state.sqlite") as state_conn:
+>           direct = _resolve_motif_transfer_provenance(
+                state_conn,
+                motif_signature="direct",
+                motif_links={"event": {"interaction-1"}},
+                direct_interaction_ids=set(),
+            )
+
+src/v6/tests/test_future_options.py:307: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/v6/future_options.py:1402: in _resolve_motif_transfer_provenance
+    concept_links = _links_by_signature(state_conn, "concept_links", "concept_signature")
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+state_conn = <sqlite3.Connection object at 0x76fde5cee4d0>
+table = 'concept_links', signature_column = 'concept_signature'
+
+    def _links_by_signature(
+        state_conn: sqlite3.Connection,
+        table: str,
+        signature_column: str,
+    ) -> dict[str, dict[str, set[str]]]:
+        results: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
+        for row in state_conn.execute(
+            f"""
+            SELECT {signature_column} AS signature_value, linked_type, linked_key
+            FROM {table}
+            ORDER BY {signature_column} ASC, linked_type ASC, linked_key ASC
+            """
+        ).fetchall():
+>           if row["linked_key"] not in (None, ""):
+               ^^^^^^^^^^^^^^^^^
+E           TypeError: tuple indices must be integers or slices, not str
+
+src/v6/higher_order_substrate.py:4650: TypeError
+______________ test_h11_transfer_metrics_aggregate_across_motifs _______________
+
+tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-11/test_h11_transfer_metrics_aggr0')
+
+    def test_h11_transfer_metrics_aggregate_across_motifs(tmp_path: Path) -> None:
+        memory_dir = tmp_path / "memory"
+        _seed_base_state(memory_dir)
+        with sqlite3.connect(memory_dir / "current_state.sqlite") as state_conn:
+            for motif_signature in ("motif-a", "motif-b"):
+                state_conn.execute(
+                    """INSERT INTO future_option_motifs (
+                           motif_signature, motif_type, support_count,
+                           motif_stability_score, is_emergent
+                       ) VALUES (?, 'enable', 5, 0.8, 1)""",
+                    (motif_signature,),
+                )
+            state_conn.commit()
+>           summary = derive_future_option_transfer_links(state_conn)
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/v6/tests/test_future_options.py:357: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/v6/future_options.py:1589: in derive_future_option_transfer_links
+    motif_links = _links_by_signature(state_conn, "future_option_links", "motif_signature")
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+state_conn = <sqlite3.Connection object at 0x76fde5ced4e0>
+table = 'future_option_links', signature_column = 'motif_signature'
+
+    def _links_by_signature(
+        state_conn: sqlite3.Connection,
+        table: str,
+        signature_column: str,
+    ) -> dict[str, dict[str, set[str]]]:
+        results: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
+        for row in state_conn.execute(
+            f"""
+            SELECT {signature_column} AS signature_value, linked_type, linked_key
+            FROM {table}
+            ORDER BY {signature_column} ASC, linked_type ASC, linked_key ASC
+            """
+        ).fetchall():
+>           if row["linked_key"] not in (None, ""):
+               ^^^^^^^^^^^^^^^^^
+E           TypeError: tuple indices must be integers or slices, not str
+
+src/v6/higher_order_substrate.py:4650: TypeError
+________________ test_h11_concept_promotion_status_transitions _________________
+
+tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-11/test_h11_concept_promotion_sta0')
+
+    def test_h11_concept_promotion_status_transitions(tmp_path: Path) -> None:
+        memory_dir = tmp_path / "memory"
+        _seed_base_state(memory_dir)
+        with sqlite3.connect(memory_dir / "current_state.sqlite") as state_conn:
+>           derive_future_option_transfer_links(state_conn)
+
+src/v6/tests/test_future_options.py:365: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/v6/future_options.py:1589: in derive_future_option_transfer_links
+    motif_links = _links_by_signature(state_conn, "future_option_links", "motif_signature")
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+state_conn = <sqlite3.Connection object at 0x76fde5cee890>
+table = 'future_option_links', signature_column = 'motif_signature'
+
+    def _links_by_signature(
+        state_conn: sqlite3.Connection,
+        table: str,
+        signature_column: str,
+    ) -> dict[str, dict[str, set[str]]]:
+        results: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
+        for row in state_conn.execute(
+            f"""
+            SELECT {signature_column} AS signature_value, linked_type, linked_key
+            FROM {table}
+            ORDER BY {signature_column} ASC, linked_type ASC, linked_key ASC
+            """
+        ).fetchall():
+>           if row["linked_key"] not in (None, ""):
+               ^^^^^^^^^^^^^^^^^
+E           TypeError: tuple indices must be integers or slices, not str
+
+src/v6/higher_order_substrate.py:4650: TypeError
+_________ test_h11_multiple_game_pairs_produce_distinct_verified_pairs _________
+
+tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-11/test_h11_multiple_game_pairs_p0')
+
+    def test_h11_multiple_game_pairs_produce_distinct_verified_pairs(tmp_path: Path) -> None:
+        memory_dir = tmp_path / "memory"
+        _seed_base_state(memory_dir)
+        with sqlite3.connect(memory_dir / "current_state.sqlite") as state_conn:
+            state_conn.execute(
+                """INSERT INTO role_transfer_attempts (
+                       attempt_id, role_signature, transfer_kind, reuse_success,
+                       similarity_score, transfer_score, best_margin,
+                       source_carrier_count, candidate_role_count,
+                       source_game_key, target_game_key,
+                       source_context_key, target_context_key,
+                       provenance_mode, provenance_status
+                   ) VALUES (
+                       'transfer-2', 'role-1', 'cross_game', 1,
+                       0.9, 0.85, 0.2, 2, 3,
+                       'g3', 'g4', 'ctx3', 'ctx4',
+                       'single_source', 'verified'
+                   )"""
+            )
+            state_conn.commit()
+>           summary = derive_future_option_transfer_links(state_conn)
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/v6/tests/test_future_options.py:406: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/v6/future_options.py:1589: in derive_future_option_transfer_links
+    motif_links = _links_by_signature(state_conn, "future_option_links", "motif_signature")
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+state_conn = <sqlite3.Connection object at 0x76fde5cec6d0>
+table = 'future_option_links', signature_column = 'motif_signature'
+
+    def _links_by_signature(
+        state_conn: sqlite3.Connection,
+        table: str,
+        signature_column: str,
+    ) -> dict[str, dict[str, set[str]]]:
+        results: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
+        for row in state_conn.execute(
+            f"""
+            SELECT {signature_column} AS signature_value, linked_type, linked_key
+            FROM {table}
+            ORDER BY {signature_column} ASC, linked_type ASC, linked_key ASC
+            """
+        ).fetchall():
+>           if row["linked_key"] not in (None, ""):
+               ^^^^^^^^^^^^^^^^^
+E           TypeError: tuple indices must be integers or slices, not str
+
+src/v6/higher_order_substrate.py:4650: TypeError
+___________ test_h11_emergent_motif_with_role_association_is_tracked ___________
+
+tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-11/test_h11_emergent_motif_with_r0')
+
+    def test_h11_emergent_motif_with_role_association_is_tracked(tmp_path: Path) -> None:
+        memory_dir = tmp_path / "memory"
+        _seed_base_state(memory_dir)
+        with sqlite3.connect(memory_dir / "current_state.sqlite") as state_conn:
+            state_conn.execute(
+                """INSERT INTO future_option_motifs (
+                       motif_signature, motif_type, support_count,
+                       motif_stability_score, is_emergent
+                   ) VALUES ('motif-emergent', 'enable', 5, 0.8, 1)"""
+            )
+            state_conn.execute(
+                """INSERT INTO future_option_links (
+                       motif_signature, linked_type, linked_key, support_count
+                   ) VALUES (
+                       'motif-emergent', 'motif_associated_with_role', 'role-1', 3
+                   )"""
+            )
+            state_conn.commit()
+>           summary = derive_future_option_transfer_links(state_conn)
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/v6/tests/test_future_options.py:428: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/v6/future_options.py:1589: in derive_future_option_transfer_links
+    motif_links = _links_by_signature(state_conn, "future_option_links", "motif_signature")
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+state_conn = <sqlite3.Connection object at 0x76fde5cec5e0>
+table = 'future_option_links', signature_column = 'motif_signature'
+
+    def _links_by_signature(
+        state_conn: sqlite3.Connection,
+        table: str,
+        signature_column: str,
+    ) -> dict[str, dict[str, set[str]]]:
+        results: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
+        for row in state_conn.execute(
+            f"""
+            SELECT {signature_column} AS signature_value, linked_type, linked_key
+            FROM {table}
+            ORDER BY {signature_column} ASC, linked_type ASC, linked_key ASC
+            """
+        ).fetchall():
+>           if row["linked_key"] not in (None, ""):
+               ^^^^^^^^^^^^^^^^^
+E           TypeError: tuple indices must be integers or slices, not str
+
+src/v6/higher_order_substrate.py:4650: TypeError
+=========================== short test summary info ============================
+FAILED src/v6/tests/test_future_options.py::test_insert_future_link_records_and_returns_provenance
+FAILED src/v6/tests/test_future_options.py::test_insert_future_link_detects_early_failure_and_retries
+FAILED src/v6/tests/test_future_options.py::test_upsert_future_provenance_link_is_idempotent
+FAILED src/v6/tests/test_future_options.py::test_upsert_future_provenance_link_records_new_owner
+FAILED src/v6/tests/test_future_options.py::test_derive_future_option_events_persists_provenance
+FAILED src/v6/tests/test_future_options.py::test_derive_future_option_motifs_resolves_transfer_provenance
+FAILED src/v6/tests/test_future_options.py::test_derive_future_option_attention_links_resolves_all_three_types
+FAILED src/v6/tests/test_future_options.py::test_derive_future_option_transfer_links_verifies_concrete_pairs
+FAILED src/v6/tests/test_future_options.py::test_full_pipeline_preserves_row_counts
+FAILED src/v6/tests/test_future_options.py::test_h11_retained_concept_validation_remains_verified
+FAILED src/v6/tests/test_future_options.py::test_h11_provenance_resolution_paths_are_deterministic
+FAILED src/v6/tests/test_future_options.py::test_h11_transfer_metrics_aggregate_across_motifs
+FAILED src/v6/tests/test_future_options.py::test_h11_concept_promotion_status_transitions
+FAILED src/v6/tests/test_future_options.py::test_h11_multiple_game_pairs_produce_distinct_verified_pairs
+FAILED src/v6/tests/test_future_options.py::test_h11_emergent_motif_with_role_association_is_tracked
+15 failed in 1.20s
