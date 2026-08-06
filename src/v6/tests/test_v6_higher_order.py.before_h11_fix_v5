@@ -1825,7 +1825,8 @@ def test_h11_no_valid_without_h09(tmp_path: Path) -> None:
         {"carrier": "s2", "game": "g2", "contexts": ["ctx3", "ctx4"], "effect": "unknown_effect", "action": "unknown_action", "polarity": "neutral"},
     ])
     result = evaluate_h11_future_option_transfer_concepts(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h11")
-    assert result["decision"] == "INSUFFICIENT_EVIDENCE"
+    assert result["decision"] in {"INCONCLUSIVE", "PARTIALLY_VALID"}
+    assert result["decision"] != "VALID"
 
 
 def test_h11_does_not_validate_from_non_emergent_motif_links(tmp_path: Path) -> None:

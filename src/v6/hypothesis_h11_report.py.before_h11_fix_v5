@@ -499,10 +499,6 @@ def evaluate_h11_future_option_transfer_concepts(
             "missing_evidence": [
                 f"Missing expected compact-memory file: {current_state}"
             ],
-            "motif_transfer_chain_provenance_sample": [],
-            "motif_transfer_chain_provenance_sample_count": 0,
-            "motif_transfer_chain_provenance_truncated": False,
-            "emergent_motifs_with_promoted_concept_count": 0,
             "core_metrics": {},
         }
         _write(
@@ -553,11 +549,7 @@ def evaluate_h11_future_option_transfer_concepts(
                     "Missing expected compact-memory table(s): "
                     + ", ".join(missing_tables)
                 ],
-                "motif_transfer_chain_provenance_sample": [],
-            "motif_transfer_chain_provenance_sample_count": 0,
-            "motif_transfer_chain_provenance_truncated": False,
-            "emergent_motifs_with_promoted_concept_count": 0,
-            "core_metrics": {},
+                "core_metrics": {},
             }
             _write(
                 output_dir,
@@ -964,7 +956,7 @@ def evaluate_h11_future_option_transfer_concepts(
             ]
         elif int(derivation_summary.get("motifs_skipped_no_role_links") or 0) > 0:
             missing_evidence = [
-                "No future-option transfer links were produced because motifs lack role links."
+                "Future-option motifs exist, but motifs are not linked to roles."
             ]
         else:
             missing_evidence = [
@@ -1000,28 +992,6 @@ def evaluate_h11_future_option_transfer_concepts(
         missing_evidence = [
             "No fully verified transfer chains available."
         ]
-
-    if not emergent_links and not any(
-        "emergent future-option motifs" in item
-        for item in missing_evidence
-    ):
-        missing_evidence.append(
-            "No emergent future-option motifs with transfer evidence."
-        )
-    if (
-        not links
-        and int(
-            derivation_summary.get("motifs_skipped_no_role_links") or 0
-        )
-        > 0
-        and (
-            "No future-option transfer links were produced because motifs lack role links."
-            not in missing_evidence
-        )
-    ):
-        missing_evidence.append(
-            "No future-option transfer links were produced because motifs lack role links."
-        )
 
     motif_count = len(
         {
@@ -1151,8 +1121,6 @@ def evaluate_h11_future_option_transfer_concepts(
             len(emergent_motifs_with_strong),
         "verified_emergent_motifs_with_promoted_concept_count":
             len(emergent_motifs_with_promoted),
-        "emergent_motifs_with_promoted_concept_count":
-            len(emergent_motifs_with_promoted),
         "verified_transfer_attempt_count":
             verified_attempts,
         "verified_successful_transfer_count":
@@ -1201,11 +1169,8 @@ def evaluate_h11_future_option_transfer_concepts(
             verified_transfer_pair_count,
         "verified_cross_game_pair_count":
             verified_cross_game_pair_count,
-        "motif_transfer_chain_provenance_sample": provenance_sample,
         "motif_transfer_chain_provenance_sample_count":
             len(provenance_sample),
-        "motif_transfer_chain_provenance_truncated":
-            len(provenance_sample) < len(links),
         "minimum_verified_transfer_pairs_required":
             MIN_H11_VERIFIED_TRANSFER_PAIRS,
         "verified_transfer_pair_diversity_gate_passed":
@@ -1269,9 +1234,6 @@ def _write(
         compact = dict(result)
         compact["provenance_sample"] = []
         compact["provenance_sample_truncated"] = True
-        compact["motif_transfer_chain_provenance_sample"] = []
-        compact["motif_transfer_chain_provenance_sample_count"] = 0
-        compact["motif_transfer_chain_provenance_truncated"] = True
         serialized = json.dumps(compact, indent=2)
     report_path.write_text(
         serialized,
