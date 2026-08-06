@@ -502,7 +502,6 @@ def evaluate_h11_future_option_transfer_concepts(
             "motif_transfer_chain_provenance_sample": [],
             "motif_transfer_chain_provenance_sample_count": 0,
             "motif_transfer_chain_provenance_truncated": False,
-            "motif_transfer_chain_provenance_is_sample": False,
             "emergent_motifs_with_promoted_concept_count": 0,
             "core_metrics": {},
         }
@@ -557,7 +556,6 @@ def evaluate_h11_future_option_transfer_concepts(
                 "motif_transfer_chain_provenance_sample": [],
             "motif_transfer_chain_provenance_sample_count": 0,
             "motif_transfer_chain_provenance_truncated": False,
-            "motif_transfer_chain_provenance_is_sample": False,
             "emergent_motifs_with_promoted_concept_count": 0,
             "core_metrics": {},
             }
@@ -1208,8 +1206,6 @@ def evaluate_h11_future_option_transfer_concepts(
             len(provenance_sample),
         "motif_transfer_chain_provenance_truncated":
             len(provenance_sample) < len(links),
-        "motif_transfer_chain_provenance_is_sample":
-            len(provenance_sample) < len(links),
         "minimum_verified_transfer_pairs_required":
             MIN_H11_VERIFIED_TRANSFER_PAIRS,
         "verified_transfer_pair_diversity_gate_passed":
@@ -1276,7 +1272,6 @@ def _write(
         compact["motif_transfer_chain_provenance_sample"] = []
         compact["motif_transfer_chain_provenance_sample_count"] = 0
         compact["motif_transfer_chain_provenance_truncated"] = True
-        compact["motif_transfer_chain_provenance_is_sample"] = True
         serialized = json.dumps(compact, indent=2)
     report_path.write_text(
         serialized,
