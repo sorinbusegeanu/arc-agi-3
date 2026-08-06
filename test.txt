@@ -1,5 +1,5 @@
 ........................................................................ [  8%]
-...FF...........FF...................................................... [ 17%]
+................FF...................................................... [ 17%]
 ........................................................................ [ 26%]
 ...........................................................s............ [ 34%]
 ........................................................................ [ 43%]
@@ -7,57 +7,13 @@
 ........................................................................ [ 61%]
 ........................................................................ [ 69%]
 ........................................................................ [ 78%]
-....F..F................................................................ [ 87%]
+.......F................................................................ [ 87%]
 .......................................................FFF.............. [ 95%]
 ..................................                                       [100%]
 =================================== FAILURES ===================================
-______ test_classification_provenance_and_incomplete_context_are_explicit ______
-
-    def test_classification_provenance_and_incomplete_context_are_explicit() -> None:
-        event = _event(
-            context_key="[null,null,1]",
-            effect_type="positive_change",
-            source_family_ids={"family-1"},
-        )
-        assert event["classification_source"] == "structural_effect"
-        assert event["classification_provenance_status"] == "verified"
-        assert event["source_context_is_surrogate"] == 1
->       assert event["context_resolution_source"] == "surrogate"
-E       AssertionError: assert 'missing' == 'surrogate'
-E         
-E         - surrogate
-E         + missing
-
-src/v6/tests/test_future_option_development.py:113: AssertionError
-_________ test_future_option_edge_event_keeps_concrete_edge_provenance _________
-
-tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-35/test_future_option_edge_event_0')
-
-    def test_future_option_edge_event_keeps_concrete_edge_provenance(tmp_path: Path) -> None:
-        memory_dir = tmp_path / "memory"
-        ensure_memory_layout(memory_dir)
-        with sqlite3.connect(memory_dir / "current_state.sqlite") as state_conn, sqlite3.connect(memory_dir / "graph.sqlite") as graph_conn:
-            state_conn.row_factory = sqlite3.Row
-            graph_conn.row_factory = sqlite3.Row
-            state_conn.execute(
-                """INSERT INTO memory_edges (
-                    source_node_id, target_node_id, edge_type, support_count, evidence_json
-                ) VALUES ('M0:interaction:11', 'M0:interaction:12', 'expands_future_options', 3, '{\"kind\":\"test\"}')"""
-            )
-            derive_future_option_events(state_conn, graph_conn, max_events=10)
-            row = state_conn.execute(
-                """SELECT classification_source, source_interaction_id, target_interaction_id,
-                          classification_provenance_status
-                   FROM future_option_events WHERE source_kind = 'future_option_edge'"""
-            ).fetchone()
->       assert tuple(row) == ("future_option_edge", "11", "12", "verified")
-               ^^^^^^^^^^
-E       TypeError: 'NoneType' object is not iterable
-
-src/v6/tests/test_future_option_development.py:135: TypeError
 ___________ test_h11_streams_full_provenance_and_bounds_main_report ____________
 
-tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-35/test_h11_streams_full_provenan0')
+tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-40/test_h11_streams_full_provenan0')
 
     def test_h11_streams_full_provenance_and_bounds_main_report(tmp_path: Path) -> None:
         memory_dir = tmp_path / "memory"
@@ -85,7 +41,7 @@ E       KeyError: 'motif_transfer_chain_provenance_truncated'
 src/v6/tests/test_future_option_provenance.py:590: KeyError
 ___________ test_h11_detail_controls_preserve_decision_and_counters ____________
 
-tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-35/test_h11_detail_controls_prese0')
+tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-40/test_h11_detail_controls_prese0')
 
     def test_h11_detail_controls_preserve_decision_and_counters(tmp_path: Path) -> None:
         memory_dir = tmp_path / "memory"
@@ -117,26 +73,9 @@ tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-35/test_h11_detail_controls_p
 E       KeyError: 'motif_transfer_chain_provenance_sample'
 
 src/v6/tests/test_future_option_provenance.py:634: KeyError
-____ test_h09_zero_events_with_stable_substrate_reports_derivation_failure _____
-
-tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-35/test_h09_zero_events_with_stab0')
-
-    def test_h09_zero_events_with_stable_substrate_reports_derivation_failure(tmp_path: Path) -> None:
-        memory_dir = tmp_path / "memory_h09_zero_events"
-        ensure_memory_layout(memory_dir)
-        with sqlite3.connect(memory_dir / "current_state.sqlite") as conn:
-            conn.execute("INSERT INTO stable_contingencies (canonical_key, game, sampler, context_level, action, effect_signature, support_count, first_seen_global_step, last_seen_global_step, stability_score) VALUES ('c1','g1','s1',1,1,'e1',5,1,2,0.5)")
-            conn.execute("INSERT INTO memory_summary (key, value_json) VALUES ('future_option_derivation_summary', ?)", (json.dumps({"stable_contingency_rows_seen": 1, "stable_contingency_events_inserted": 0, "future_option_events_inserted_total": 0}),))
-            conn.commit()
-        result = evaluate_h09_future_option_motifs(memory_dir=memory_dir, run_dir=None, output_dir=tmp_path / "h09_zero", already_derived=True)
-        assert result["decision"] == "INSUFFICIENT_EVIDENCE"
->       assert "Future-option derivation produced zero events despite available substrate." in result["missing_evidence"]
-E       AssertionError: assert 'Future-option derivation produced zero events despite available substrate.' in ['Stable substrate evidence exists but no future-option events were derived.']
-
-src/v6/tests/test_v6_core.py:13941: AssertionError
 ____ test_h11_diagnostics_explain_missing_transfer_links_without_role_links ____
 
-tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-35/test_h11_diagnostics_explain_m0')
+tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-40/test_h11_diagnostics_explain_m0')
 
     def test_h11_diagnostics_explain_missing_transfer_links_without_role_links(tmp_path: Path) -> None:
         from v6.hypothesis_h11_report import evaluate_h11_future_option_transfer_concepts
@@ -181,7 +120,7 @@ E       AssertionError: assert 'No future-option transfer links were produced be
 src/v6/tests/test_v6_core.py:14000: AssertionError
 ________________________ test_h11_no_valid_without_h09 _________________________
 
-tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-35/test_h11_no_valid_without_h090')
+tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-40/test_h11_no_valid_without_h090')
 
     def test_h11_no_valid_without_h09(tmp_path: Path) -> None:
         memory_dir = tmp_path / "memory"
@@ -196,7 +135,7 @@ E       AssertionError: assert 'INSUFFICIENT_EVIDENCE' in {'INCONCLUSIVE', 'PART
 src/v6/tests/test_v6_higher_order.py:1828: AssertionError
 ___________ test_h11_does_not_validate_from_non_emergent_motif_links ___________
 
-tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-35/test_h11_does_not_validate_fro0')
+tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-40/test_h11_does_not_validate_fro0')
 
     def test_h11_does_not_validate_from_non_emergent_motif_links(tmp_path: Path) -> None:
         memory_dir = tmp_path / "memory"
@@ -215,12 +154,12 @@ tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-35/test_h11_does_not_validate
         assert result["decision"] != "VALID"
 >       assert any("emergent future-option motifs" in item for item in result["missing_evidence"])
 E       assert False
-E        +  where False = any(<generator object test_h11_does_not_validate_from_non_emergent_motif_links.<locals>.<genexpr> at 0x733dc556fd30>)
+E        +  where False = any(<generator object test_h11_does_not_validate_from_non_emergent_motif_links.<locals>.<genexpr> at 0x710b19e98ba0>)
 
 src/v6/tests/test_v6_higher_order.py:1847: AssertionError
 __ test_h11_validates_only_when_emergent_motif_has_transfer_concept_evidence ___
 
-tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-35/test_h11_validates_only_when_e0')
+tmp_path = PosixPath('/tmp/pytest-of-zodrak/pytest-40/test_h11_validates_only_when_e0')
 
     def test_h11_validates_only_when_emergent_motif_has_transfer_concept_evidence(tmp_path: Path) -> None:
         memory_dir = tmp_path / "memory"
@@ -245,18 +184,15 @@ src/v6/tests/test_v6_higher_order.py:1864: KeyError
 tests/test_v6_core.py: 44 warnings
 tests/test_v6_interaction_sampling.py: 4 warnings
 tests/test_worker_memory_snapshot.py: 2 warnings
-  /usr/lib/python3.12/multiprocessing/popen_fork.py:66: DeprecationWarning: This process (pid=9728) is multi-threaded, use of fork() may lead to deadlocks in the child.
+  /usr/lib/python3.12/multiprocessing/popen_fork.py:66: DeprecationWarning: This process (pid=12572) is multi-threaded, use of fork() may lead to deadlocks in the child.
     self.pid = os.fork()
 
 -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
 =========================== short test summary info ============================
-FAILED src/v6/tests/test_future_option_development.py::test_classification_provenance_and_incomplete_context_are_explicit
-FAILED src/v6/tests/test_future_option_development.py::test_future_option_edge_event_keeps_concrete_edge_provenance
 FAILED src/v6/tests/test_future_option_provenance.py::test_h11_streams_full_provenance_and_bounds_main_report
 FAILED src/v6/tests/test_future_option_provenance.py::test_h11_detail_controls_preserve_decision_and_counters
-FAILED src/v6/tests/test_v6_core.py::test_h09_zero_events_with_stable_substrate_reports_derivation_failure
 FAILED src/v6/tests/test_v6_core.py::test_h11_diagnostics_explain_missing_transfer_links_without_role_links
 FAILED src/v6/tests/test_v6_higher_order.py::test_h11_no_valid_without_h09 - ...
 FAILED src/v6/tests/test_v6_higher_order.py::test_h11_does_not_validate_from_non_emergent_motif_links
 FAILED src/v6/tests/test_v6_higher_order.py::test_h11_validates_only_when_emergent_motif_has_transfer_concept_evidence
-9 failed, 816 passed, 1 skipped, 50 warnings in 26.41s
+6 failed, 819 passed, 1 skipped, 50 warnings in 26.28s

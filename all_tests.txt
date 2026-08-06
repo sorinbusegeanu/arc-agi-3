@@ -1,0 +1,16 @@
+
+==================================== ERRORS ====================================
+___ ERROR collecting other_repos/arc-interactive/benchmarks/run_task_test.py ___
+ImportError while importing test module '/home/zodrak/zod/arc-agi-3/other_repos/arc-interactive/benchmarks/run_task_test.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/usr/lib/python3.12/importlib/__init__.py:90: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+other_repos/arc-interactive/benchmarks/run_task_test.py:13: in <module>
+    from arc_agi import Arcade, OperationMode
+E   ModuleNotFoundError: No module named 'arc_agi'
+=========================== short test summary info ============================
+ERROR other_repos/arc-interactive/benchmarks/run_task_test.py
+!!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!
+1 error in 1.02s

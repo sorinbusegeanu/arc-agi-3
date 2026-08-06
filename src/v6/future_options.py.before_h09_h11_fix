@@ -348,7 +348,7 @@ def derive_future_option_events(
     future_edge_by_interaction: dict[str, str] = {}
     future_edge_rows = state_conn.execute(
         """
-        SELECT source_node_id, target_node_id, edge_type
+        SELECT source_node_id, edge_type
         FROM memory_edges
         WHERE source_node_id LIKE 'M0:interaction:%'
           AND edge_type IN (
@@ -365,63 +365,6 @@ def derive_future_option_events(
         if edge_scan_tracker is not None:
             edge_scan_tracker.update(1)
     _close_progress_tracker(edge_scan_tracker)
-
-    # Preserve concrete future-option graph-edge provenance as first-class
-    # future-option events. These rows must not depend on a corresponding
-    # memory_scores row or higher-order substrate candidate.
-    for row in future_edge_rows:
-        source_node_id = str(row["source_node_id"])
-        target_node_id = str(row["target_node_id"])
-        source_interaction_id = (
-            source_node_id.rsplit(":", 1)[-1]
-            if source_node_id.startswith("M0:interaction:")
-            else source_node_id
-        )
-        target_interaction_id = (
-            target_node_id.rsplit(":", 1)[-1]
-            if target_node_id.startswith("M0:interaction:")
-            else target_node_id
-        )
-        edge_type = str(row["edge_type"])
-        payload = _build_future_option_event(
-            owner_type="interaction",
-            owner_key=source_interaction_id,
-            source_kind="future_option_edge",
-            game=None,
-            sampler=None,
-            context_key=None,
-            action_key=None,
-            text_fragments=[edge_type],
-            support_count=1,
-            polarity=None,
-            first_seen=None,
-            last_seen=None,
-            mean_prediction_error=0.0,
-            mean_replay_priority=0.0,
-            stability_score=0.0,
-            event_id_seed=(
-                f"future_option_edge|{source_node_id}|"
-                f"{target_node_id}|{edge_type}"
-            ),
-            evidence_json={
-                "source_table": "memory_edges",
-                "source_node_id": source_node_id,
-                "target_node_id": target_node_id,
-                "edge_type": edge_type,
-            },
-            future_option_edge_type=edge_type,
-            source_interaction_ids={source_interaction_id},
-            development_stage=development_stage,
-        )
-        payload["target_interaction_id"] = target_interaction_id
-        payload["classification_source"] = "future_option_edge"
-        payload["classification_rule"] = "future_option_edge"
-        payload["classification_provenance_status"] = "verified"
-        payload["evidence_json"]["classification_source"] = "future_option_edge"
-        payload["evidence_json"]["classification_rule"] = "future_option_edge"
-        payload["evidence_json"]["classification_provenance_status"] = "verified"
-        add_event(payload)
-
     interaction_ids_by_family: dict[str, set[str]] = defaultdict(set)
     carrier_interaction_ids: dict[str, set[str]] = defaultdict(set)
     carrier_family_ids: dict[str, set[str]] = defaultdict(set)
@@ -2086,21 +2029,8 @@ def _build_future_option_event(
     for key, values in provenance.items():
         evidence[key] = values
     source_game_key = None if game in (None, "") else str(game)
-    if is_complete_context_key(context_key):
-        source_context_key = str(context_key)
-        context_is_surrogate = 0
-        context_resolution_source = "direct_event"
-    elif context_key not in (None, ""):
-        source_context_key = (
-            "surrogate_context:"
-            + sha1(str(context_key).encode("utf-8")).hexdigest()[:20]
-        )
-        context_is_surrogate = 1
-        context_resolution_source = "surrogate"
-    else:
-        source_context_key = None
-        context_is_surrogate = 0
-        context_resolution_source = "missing"
+    source_context_key = context_key if is_complete_context_key(context_key) else None
+    context_is_surrogate = int(context_key not in (None, "") and source_context_key is None)
     concrete_provenance = bool(
         provenance["source_interaction_ids"]
         or provenance["source_family_ids"]
@@ -2117,7 +2047,7 @@ def _build_future_option_event(
     evidence["classification_provenance_status"] = classification_provenance_status
     evidence["source_game_key"] = source_game_key
     evidence["source_context_key"] = source_context_key
-    evidence["context_resolution_source"] = context_resolution_source
+    evidence["context_resolution_source"] = "direct_event" if source_context_key else "missing"
     evidence["context_is_surrogate"] = bool(context_is_surrogate)
     components = _compute_development_components(
         option_delta=option_delta,
@@ -2194,7 +2124,7 @@ def _build_future_option_event(
         "target_game_is_surrogate": 0,
         "source_context_is_surrogate": context_is_surrogate,
         "target_context_is_surrogate": 0,
-        "context_resolution_source": context_resolution_source,
+        "context_resolution_source": "direct_event" if source_context_key else "missing",
         "context_is_surrogate": context_is_surrogate,
         "evidence_json": evidence,
     }

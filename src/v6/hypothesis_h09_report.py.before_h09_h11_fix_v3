@@ -669,7 +669,8 @@ def evaluate_h09_future_option_motifs(
         )
         result["missing_evidence"] = [
             (
-                'Future-option derivation produced zero events despite available substrate.'
+                "Stable substrate evidence exists but no "
+                "future-option events were derived."
                 if substrate_available
                 else "No future-option events available."
             )
