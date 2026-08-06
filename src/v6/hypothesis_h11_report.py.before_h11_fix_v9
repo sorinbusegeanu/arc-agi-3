@@ -499,7 +499,6 @@ def evaluate_h11_future_option_transfer_concepts(
             "missing_evidence": [
                 f"Missing expected compact-memory file: {current_state}"
             ],
-            "motif_transfer_chain_provenance": [],
             "motif_transfer_chain_provenance_sample": [],
             "motif_transfer_chain_provenance_sample_count": 0,
             "motif_transfer_chain_provenance_truncated": False,
@@ -555,7 +554,6 @@ def evaluate_h11_future_option_transfer_concepts(
                     "Missing expected compact-memory table(s): "
                     + ", ".join(missing_tables)
                 ],
-                "motif_transfer_chain_provenance": [],
                 "motif_transfer_chain_provenance_sample": [],
             "motif_transfer_chain_provenance_sample_count": 0,
             "motif_transfer_chain_provenance_truncated": False,
@@ -1205,7 +1203,6 @@ def evaluate_h11_future_option_transfer_concepts(
             verified_transfer_pair_count,
         "verified_cross_game_pair_count":
             verified_cross_game_pair_count,
-        "motif_transfer_chain_provenance": provenance_sample,
         "motif_transfer_chain_provenance_sample": provenance_sample,
         "motif_transfer_chain_provenance_sample_count":
             len(provenance_sample),
@@ -1273,24 +1270,14 @@ def _write(
     )
     serialized = json.dumps(result, indent=2)
     if len(serialized.encode("utf-8")) > max_main_report_bytes:
-        serialized = json.dumps(
-            result,
-            separators=(",", ":"),
-        )
-    if len(serialized.encode("utf-8")) > max_main_report_bytes:
         compact = dict(result)
         compact["provenance_sample"] = []
         compact["provenance_sample_truncated"] = True
-        compact["motif_transfer_chain_provenance"] = []
         compact["motif_transfer_chain_provenance_sample"] = []
         compact["motif_transfer_chain_provenance_sample_count"] = 0
         compact["motif_transfer_chain_provenance_truncated"] = True
         compact["motif_transfer_chain_provenance_is_sample"] = True
-        serialized = json.dumps(
-            compact,
-            separators=(",", ":"),
-        )
-
+        serialized = json.dumps(compact, indent=2)
     report_path.write_text(
         serialized,
         encoding="utf-8",
