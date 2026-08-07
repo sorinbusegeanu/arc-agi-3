@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import shutil
 import py_compile
+import sqlite3
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -66,6 +68,7 @@ def install_files() -> None:
     files = (
         "src/v6/memory/v621_runtime.py",
         "src/v6/memory/v621_compact.py",
+        "src/v6/memory/migrations/v62.py",
         "src/v6/memory/migrations/v621.py",
         "src/v6/tests/test_v621_memory_completion.py",
     )
@@ -269,7 +272,7 @@ def patch_main() -> None:
     )
 
     if text == original:
-        raise RuntimeError("main.py was not changed")
+        return
     backup = path.with_suffix(".py.v62_backup")
     if not backup.exists():
         backup.write_text(original, encoding="utf-8")
@@ -334,7 +337,7 @@ def patch_compact_memory() -> None:
     )
 
     if text == original:
-        raise RuntimeError("compact_memory.py was not changed")
+        return
     backup = path.with_suffix(".py.v62_backup")
     if not backup.exists():
         backup.write_text(original, encoding="utf-8")
@@ -372,15 +375,37 @@ def patch_compact_restore() -> None:
         "restore extended substrate state",
     )
 
-    text = text.replace(
-        "                system.memory_lifecycle.import_record(record)\n",
-        (
-            "                if hasattr(system, \"memory_controller\"):\n"
-            "                    system.memory_controller.import_lifecycle_record(record)\n"
-            "                else:\n"
-            "                    system.memory_lifecycle.import_record(record)\n"
-        ),
+    record_end = (
+        '                    retention_reason=str(row["reason"]),\n'
+        '                )\n'
     )
+    record_import = (
+        '                if hasattr(system, "memory_controller"):\n'
+        '                    system.memory_controller.import_lifecycle_record(record)\n'
+        '                else:\n'
+        '                    system.memory_lifecycle.import_record(record)\n'
+    )
+    record_end_count = text.count(record_end)
+    if record_end_count != 1:
+        raise RuntimeError(
+            "restore lifecycle record anchor: expected exactly one match, "
+            f"found {record_end_count}"
+        )
+    block_start = text.index(record_end) + len(record_end)
+    replay_markers = (
+        '                replay_candidate = ReplayCandidate(\n',
+        '                system.memory_lifecycle.import_replay_candidate(\n',
+    )
+    replay_positions = [
+        pos for marker in replay_markers
+        if (pos := text.find(marker, block_start)) >= 0
+    ]
+    if not replay_positions:
+        raise RuntimeError(
+            "restore lifecycle record block: replay marker missing"
+        )
+    block_end = min(replay_positions)
+    text = text[:block_start] + record_import + text[block_end:]
 
     replay_block = '''                system.memory_lifecycle.import_replay_candidate(
                     ReplayCandidate(
@@ -418,11 +443,209 @@ def patch_compact_restore() -> None:
     )
 
     if text == original:
-        raise RuntimeError("compact_memory_restore.py was not changed")
+        return
     backup = path.with_suffix(".py.v62_backup")
     if not backup.exists():
         backup.write_text(original, encoding="utf-8")
     path.write_text(text, encoding="utf-8")
+
+
+def patch_hypothesis_suite_compatibility() -> None:
+    path = REPO / "src/v6/hypothesis_suite_report.py"
+    text = path.read_text(encoding="utf-8")
+    original = text
+
+    if "from contextlib import contextmanager\n" not in text:
+        text = replace_once(
+            text,
+            "import time\n",
+            "import time\nfrom contextlib import contextmanager\n",
+            "hypothesis phase contextmanager import",
+        )
+    if "from tqdm.auto import tqdm\n" not in text:
+        text = replace_once(
+            text,
+            "from typing import Any, Callable, Mapping\n",
+            "from typing import Any, Callable, Mapping\n\nfrom tqdm.auto import tqdm\n",
+            "hypothesis phase tqdm import",
+        )
+
+    if "def hypothesis_phase(\n" not in text:
+        compatibility = '''
+
+class _HypothesisPhaseTracker:
+    def __init__(
+        self,
+        *,
+        output_dir: Path,
+        phase: str,
+        epoch_id: str | None,
+        total: int | None,
+        unit: str,
+        enabled: bool,
+        leave: bool,
+        log_every: int,
+        top_bar: Any | None = None,
+    ) -> None:
+        self.output_dir = output_dir
+        self.phase = phase
+        self.epoch_id = epoch_id
+        self.total = total
+        self.unit = unit
+        self.enabled = enabled
+        self.leave = leave
+        self.log_every = max(1, int(log_every))
+        self.top_bar = top_bar
+        self.current = 0
+        self.last_logged = 0
+        self.started_at = time.time()
+        self._bar = None
+
+    def __enter__(self) -> "_HypothesisPhaseTracker":
+        log_hypothesis_progress(
+            self.output_dir,
+            self.phase,
+            "starting",
+            epoch_id=self.epoch_id,
+            current=0,
+            total=self.total,
+        )
+        if self.top_bar is not None:
+            self.top_bar.set_postfix_str(f"current={self.phase}")
+        if self.enabled:
+            self._bar = tqdm(
+                total=self.total,
+                desc=self.phase,
+                unit=self.unit,
+                dynamic_ncols=True,
+                leave=self.leave,
+            )
+        return self
+
+    def update(
+        self,
+        n: int = 1,
+        *,
+        current: int | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        if current is not None:
+            n = int(current) - int(self.current)
+            self.current = int(current)
+        else:
+            self.current += int(n)
+        if self._bar is not None and n:
+            self._bar.update(int(n))
+        if (
+            self.current >= self.log_every + self.last_logged
+            or (
+                self.total is not None
+                and self.current >= int(self.total)
+            )
+        ):
+            self.last_logged = int(self.current)
+            log_hypothesis_progress(
+                self.output_dir,
+                self.phase,
+                "progress",
+                epoch_id=self.epoch_id,
+                current=self.current,
+                total=self.total,
+                start_time=self.started_at,
+                extra=extra,
+            )
+
+    def close(
+        self,
+        *,
+        status: str = "done",
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        if self._bar is not None:
+            self._bar.close()
+        log_hypothesis_progress(
+            self.output_dir,
+            self.phase,
+            status,
+            epoch_id=self.epoch_id,
+            current=(
+                self.current
+                if self.total is None
+                else min(self.current, int(self.total))
+            ),
+            total=self.total,
+            start_time=self.started_at,
+            extra=extra,
+        )
+        if self.top_bar is not None:
+            self.top_bar.update(1)
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if exc is None:
+            self.close()
+            return
+        self.close(
+            status="failed",
+            extra={
+                "exception_type": (
+                    exc_type.__name__
+                    if exc_type is not None
+                    else type(exc).__name__
+                ),
+                "exception_message": str(exc),
+            },
+        )
+
+
+@contextmanager
+def hypothesis_phase(
+    output_dir: Path,
+    phase: str,
+    *,
+    epoch_id: str | None,
+    total: int | None,
+    unit: str,
+    enabled: bool,
+    leave: bool,
+    log_every: int,
+    top_bar: Any | None = None,
+):
+    """Compatibility phase context manager retained for existing callers/tests."""
+    tracker = _HypothesisPhaseTracker(
+        output_dir=output_dir,
+        phase=phase,
+        epoch_id=epoch_id,
+        total=total,
+        unit=unit,
+        enabled=enabled,
+        leave=leave,
+        log_every=log_every,
+        top_bar=top_bar,
+    )
+    try:
+        yield tracker.__enter__()
+    except BaseException as exc:
+        tracker.__exit__(type(exc), exc, exc.__traceback__)
+        raise
+    else:
+        tracker.__exit__(None, None, None)
+'''
+        marker = "\ndef _call_supported(\n"
+        if marker not in text:
+            raise RuntimeError(
+                "hypothesis phase compatibility: _call_supported marker missing"
+            )
+        text = text.replace(
+            marker,
+            compatibility + "\n\n" + marker,
+            1,
+        )
+
+    if text != original:
+        backup = path.with_suffix(".py.v61_reporting_backup")
+        if not backup.exists():
+            backup.write_text(original, encoding="utf-8")
+        path.write_text(text, encoding="utf-8")
 
 
 def patch_migrations_init() -> None:
@@ -447,13 +670,41 @@ def validate_installed_sources() -> None:
         REPO / "src/v6/main.py",
         REPO / "src/v6/memory/compact_memory.py",
         REPO / "src/v6/memory/compact_memory_restore.py",
+        REPO / "src/v6/hypothesis_suite_report.py",
         REPO / "src/v6/memory/v621_runtime.py",
         REPO / "src/v6/memory/v621_compact.py",
+        REPO / "src/v6/memory/migrations/v62.py",
         REPO / "src/v6/memory/migrations/v621.py",
         REPO / "src/v6/tests/test_v621_memory_completion.py",
     )
     for path in files:
         py_compile.compile(str(path), doraise=True)
+
+    src_path = str(REPO / "src")
+    if src_path not in sys.path:
+        sys.path.insert(0, src_path)
+    from v6.memory.migrations.v621 import migrate_connection as _migrate_v621
+
+    smoke = sqlite3.connect(":memory:")
+    try:
+        result = _migrate_v621(smoke)
+        version_row = smoke.execute(
+            "SELECT value FROM memory_versions WHERE key='memory_substrate_schema'"
+        ).fetchone()
+        if result.get("schema_version") != "v6.2.1" or version_row != ("v6.2.1",):
+            raise RuntimeError(
+                "fresh SQLite migration smoke test did not reach v6.2.1"
+            )
+    finally:
+        smoke.close()
+
+    report_text = (
+        REPO / "src/v6/hypothesis_suite_report.py"
+    ).read_text(encoding="utf-8")
+    if "def hypothesis_phase(" not in report_text:
+        raise RuntimeError(
+            "hypothesis_phase compatibility API was not restored"
+        )
 
     main_text = (REPO / "src/v6/main.py").read_text(
         encoding="utf-8"
@@ -498,6 +749,7 @@ def main() -> None:
     patch_main()
     patch_compact_memory()
     patch_compact_restore()
+    patch_hypothesis_suite_compatibility()
     patch_migrations_init()
     validate_installed_sources()
     print("ARC-AGI3 v6.2.1 completion drop-in installed")

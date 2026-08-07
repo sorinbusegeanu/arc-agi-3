@@ -415,3 +415,25 @@ def test_sampler_action_can_be_overridden_by_strong_memory_prior() -> None:
         override_margin=0.15,
     )
     assert selected == 2
+
+
+def test_v621_migration_bootstraps_fresh_sqlite_file() -> None:
+    from v6.memory.migrations.v621 import migrate_connection as migrate_v621_connection
+
+    conn = sqlite3.connect(":memory:")
+    result = migrate_v621_connection(conn)
+    tables = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    assert result["schema_version"] == "v6.2.1"
+    assert "memory_versions" in tables
+    assert "memory_development_state" in tables
+    assert "memory_promotion_evidence_v62" in tables
+    assert "memory_level_lifecycle_v621" in tables
+    version = conn.execute(
+        "SELECT value FROM memory_versions WHERE key='memory_substrate_schema'"
+    ).fetchone()
+    assert version is not None and version[0] == "v6.2.1"

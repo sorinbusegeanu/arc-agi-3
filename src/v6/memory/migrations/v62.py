@@ -22,8 +22,15 @@ def _ensure_column(connection: sqlite3.Connection, table: str, name: str, declar
 
 
 def migrate_connection(connection: sqlite3.Connection) -> dict[str, object]:
+    # This migration must be safe on a brand-new compact-memory database.
+    # MemorySubstrate normally creates memory_versions first, but compact-memory
+    # initialization may invoke migrations before MemorySubstrate is constructed.
     connection.executescript(
         """
+        CREATE TABLE IF NOT EXISTS memory_versions (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        );
         CREATE TABLE IF NOT EXISTS memory_development_state (
             key TEXT PRIMARY KEY,
             value_json TEXT NOT NULL,

@@ -41,6 +41,10 @@ def _ensure_column(
 
 
 def migrate_connection(connection: sqlite3.Connection) -> dict[str, object]:
+    # Keep v6.2.1 independently safe if called against a fresh SQLite file.
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS memory_versions (key TEXT PRIMARY KEY, value TEXT)"
+    )
     migrate_v62_connection(connection)
 
     connection.executescript(

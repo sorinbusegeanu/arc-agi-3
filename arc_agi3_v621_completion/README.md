@@ -82,3 +82,18 @@ PYTHONPATH=src pytest -q src/v6/tests/test_v621_memory_completion.py
 ```
 
 Then run the existing v6.1/v6.2 and full v6 test suites.
+
+## v6.2.1 startup migration hotfix
+
+The package now makes the v6.2/v6.2.1 migrations self-bootstrapping on a fresh
+`current_state.sqlite`. `memory_versions` is created before schema-version writes,
+so `continuous-research-run` can initialize a new compact-memory directory without
+requiring a prior `MemorySubstrate` construction.
+
+
+## Installer reruns
+
+The installer is safe to rerun on an already-patched tree. If a target file already contains the v6.2.1 changes, that patch step is treated as a successful no-op.
+
+## Installer repair revision
+The installer is idempotent and repairs a malformed lifecycle restore block produced by earlier v6.2.1 installer revisions before source validation.
