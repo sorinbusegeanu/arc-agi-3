@@ -29,7 +29,6 @@ from v6.memory.compact_memory import fold_live_system_into_compact_memory
 from v6.memory.live_memory_queue import LiveMemoryEvent, LiveMemoryReadCache
 from v6.memory.promotion_engine import MemoryPromotionConfig, MemoryPromotionEngine
 from v6.memory.query_engine import MemoryQueryEngine
-from v6.memory.v62_runtime import LearnedFutureOptionEstimator, V62MemoryController
 from v6.memory.compact_memory_restore import load_compact_memory_into_system
 from v6.memory.interaction_store import Interaction, InteractionStore
 from v6.memory.trajectory_efficiency import (
@@ -99,8 +98,8 @@ class V6Config:
     memory_promotion_every: int = 100
     future_options_enabled: bool = True
     future_option_depth: int = 1
-    memory_query_enabled: bool = True
-    memory_action_selection_enabled: bool = True
+    memory_query_enabled: bool = False
+    memory_action_selection_enabled: bool = False
     memory_query_use_roles: bool = True
     memory_query_use_concepts: bool = True
     memory_query_use_future_options: bool = True
@@ -190,7 +189,7 @@ class V6System:
             action_cost_default=self.config.efficiency_action_cost_default,
             recent_window_size=self.config.efficiency_recent_window_size,
         )
-        self.future_option_estimator = LearnedFutureOptionEstimator(self.connection, fallback=FutureOptionEstimator())
+        self.future_option_estimator = FutureOptionEstimator()
         best_known_path = self._best_known_solution_lengths_path()
         self.trajectory_efficiency = TrajectoryEfficiencyTracker(
             best_known_solution_lengths=load_best_known_solution_lengths(best_known_path),
@@ -205,23 +204,6 @@ class V6System:
             contingency_learner=self.contingency_learner,
             graph=self.graph,
         )
-        self.memory_controller = V62MemoryController(
-            self.memory,
-            contingency_learner=self.contingency_learner,
-            graph=self.graph,
-            query_engine=self.memory_query,
-            promotion_engine=self.promotion_engine,
-            context_head=self.context_contradictions,
-            carrier_head=self.carrier_tracker,
-            lifecycle_head=self.memory_lifecycle,
-            efficiency_head=self.efficiency_tracker,
-        )
-        self.memory_query = self.memory_controller.query_engine
-        self.promotion_engine = self.memory_controller.promotion_engine
-        self.context_contradictions = self.memory_controller.context_head
-        self.carrier_tracker = self.memory_controller.carrier_head
-        self.memory_lifecycle = self.memory_controller.lifecycle_head
-        self.efficiency_tracker = self.memory_controller.efficiency_head
         self.episode_id = 0
         self.step_count = 0
         self._isf_counts: dict[str, int] = {}
@@ -290,7 +272,6 @@ class V6System:
             self.memory_graph_restore_seconds = float(worker_memory_snapshot.graph_restore_seconds)
             self.memory_substrate_restore_seconds = float(worker_memory_snapshot.substrate_restore_seconds)
         if memory_query_engine is not None:
-            self.memory_controller.query_engine = memory_query_engine
             self.memory_query = memory_query_engine
 
     def _configure_runtime_sqlite_connection(self) -> None:
@@ -316,7 +297,7 @@ class V6System:
                     max_level=candidate_depth,
                 )
             rank_started = time.perf_counter()
-            ranked = self.memory_controller.choose_action_candidates(contexts_by_action, list(actions))
+            ranked = self.memory_query.rank_actions(contexts_by_action, list(actions))
             self.memory_action_rank_count += 1
             self.memory_action_rank_seconds += time.perf_counter() - rank_started
             if ranked:
@@ -348,7 +329,7 @@ class V6System:
             prediction_context_level = None if selected_contingency is None else int(selected_contingency.context_level)
             if bool(self.config.memory_query_enabled):
                 query_started = time.perf_counter()
-                memory_prediction = self.memory_controller.predict(context_signatures, action, record_query=False)
+                memory_prediction = self.memory_query.predict_family(context_signatures, action, record_query=False)
                 self.memory_query_count += 1
                 self.memory_query_seconds += time.perf_counter() - query_started
                 predicted_family = memory_prediction.predicted_family
@@ -564,7 +545,6 @@ class V6System:
             outcome_state=outcome_state,
             outcome_polarity=outcome_polarity,
             level_completed_event=level_completed_event,
-            weights=self.memory_controller.current_isf_weights(),
         )
         carrier_signature, carrier_source = extract_carrier_signature(
             before_observation=observation_before,
@@ -1046,7 +1026,7 @@ class V6System:
         )
         promotion_every = max(1, int(self.config.memory_promotion_every))
         if int(interaction.id) % promotion_every == 0:
-            self.memory_controller.promote_candidates(step=int(interaction.id))
+            self.promotion_engine.run_all(step=int(interaction.id))
         if self._auto_commit:
             self.connection.commit()
 
