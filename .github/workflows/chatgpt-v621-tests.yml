@@ -1,0 +1,24 @@
+name: ChatGPT v6.2.1 full tests
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  pytest-v6:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest numpy tqdm psutil pandas pyarrow
+      - name: Run v6 tests
+        env:
+          PYTHONPATH: src
+        run: pytest -q src/v6/tests
