@@ -1631,7 +1631,7 @@ def fold_live_system_into_compact_memory(system: Any, memory_dir: str | Path) ->
                 )
         if live_connection is not None:
             live_connection.row_factory = sqlite3.Row
-            for row in live_connection.execute("SELECT * FROM memory_nodes ORDER BY node_id ASC").fetchall():
+            for row in live_connection.execute("SELECT node_id, memory_level, node_type, canonical_key, support_count, first_seen_step, last_seen_step, attrs_json FROM memory_nodes ORDER BY node_id ASC").fetchall():
                 state_conn.execute(
                     """
                     INSERT INTO memory_nodes (
@@ -1683,7 +1683,7 @@ def fold_live_system_into_compact_memory(system: Any, memory_dir: str | Path) ->
                     """,
                     tuple(row[column] for column in row.keys()),
                 )
-            for row in live_connection.execute("SELECT * FROM memory_scores ORDER BY node_id ASC").fetchall():
+            for row in live_connection.execute("SELECT node_id, isf_total, prediction_lift, transfer_score, explanatory_reach, compression_gain, future_option_delta, replay_priority, retention_status, memory_state, stored_epoch, last_replayed_epoch, last_promoted_epoch, retention_score, forgetting_score, compressed_into_id, superseded_by_id, forgetting_reason, updated_step FROM memory_scores ORDER BY node_id ASC").fetchall():
                 state_conn.execute(
                     """
                     INSERT INTO memory_scores (
@@ -1716,7 +1716,7 @@ def fold_live_system_into_compact_memory(system: Any, memory_dir: str | Path) ->
                     """,
                     tuple(row[column] for column in row.keys()),
                 )
-            for row in live_connection.execute("SELECT * FROM memory_promotions ORDER BY promotion_id ASC").fetchall():
+            for row in live_connection.execute("SELECT promotion_id, source_node_id, target_node_id, promotion_type, evidence_count, promotion_score, status, payload_json FROM memory_promotions ORDER BY promotion_id ASC").fetchall():
                 state_conn.execute(
                     """
                     INSERT OR REPLACE INTO memory_promotions (
