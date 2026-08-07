@@ -19,4 +19,12 @@ jobs:
       - name: Run v6 tests
         env:
           PYTHONPATH: src
-        run: pytest -q src/v6/tests
+        run: |
+          set -o pipefail
+          pytest -q src/v6/tests 2>&1 | tee pytest-v6-output.txt
+      - name: Upload pytest output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-v6-output
+          path: pytest-v6-output.txt
