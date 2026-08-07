@@ -11,7 +11,6 @@ import numpy as np
 from v6.carrier_emergence import CarrierEmergenceTracker
 from v6.contingency.contingency_learner import Contingency
 from v6.memory.compact_memory import configure_compact_sqlite_connection, stable_family_int_id
-from v6.memory.v621_compact import merge_v621_state_connections
 from v6.memory_lifecycle import MemoryRecord, ReplayCandidate
 from v6.memory.substrate import MemoryEdge, MemoryEvidence, MemoryNode, MemoryPromotion, MemoryScore
 from v6.transformation.transformation_clusterer import TransformationFamily
@@ -265,7 +264,6 @@ def load_compact_memory_into_system(
                     )
                 )
                 summary["memory_promotions_restored"] += 1
-            merge_v621_state_connections(state_conn, system.memory.connection)
         elif hasattr(system, "memory"):
             summary["substrate_restore_skipped"] = True
 
@@ -299,26 +297,17 @@ def load_compact_memory_into_system(
                     status="protected" if float(row["priority_score"] or 0.0) >= 0.8 else str(payload.get("status", "active")),
                     retention_reason=str(row["reason"]),
                 )
-                if hasattr(system, "memory_controller"):
-                    system.memory_controller.import_lifecycle_record(record)
-                else:
-                    system.memory_lifecycle.import_record(record)
-                replay_candidate = ReplayCandidate(
-                    interaction_id=interaction_id,
-                    replay_priority=float(row["priority_score"] or 0.0),
-                    reason=str(row["reason"]),
-                    family_id=record.family_id,
-                    context_signature=record.context_signature,
-                    status=record.status,
+                system.memory_lifecycle.import_record(record)
+                system.memory_lifecycle.import_replay_candidate(
+                    ReplayCandidate(
+                        interaction_id=interaction_id,
+                        replay_priority=float(row["priority_score"] or 0.0),
+                        reason=str(row["reason"]),
+                        family_id=record.family_id,
+                        context_signature=record.context_signature,
+                        status=record.status,
+                    )
                 )
-                if hasattr(system, "memory_controller"):
-                    system.memory_controller.import_replay_candidate(
-                        replay_candidate
-                    )
-                else:
-                    system.memory_lifecycle.import_replay_candidate(
-                        replay_candidate
-                    )
                 summary["replay_candidates_restored"] += 1
 
     if paths["graph"].exists() and bool(restore_graph):

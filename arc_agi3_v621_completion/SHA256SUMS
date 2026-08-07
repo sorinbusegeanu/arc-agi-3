@@ -1,0 +1,7 @@
+e9b3e93e5907a590cc6b495ce9802175daa11455500cd8d47d881b93d77893cb  ./README.md
+31788e22092cf0cdbdadcfc9fa99a5b99745d807dc0ab1daec2d8c7863ddefe6  ./SHA256SUMS
+734c6c4dfd110553c45d68aad69e0350f87babf752c1954ff8588b8017594e05  ./apply_v621_completion.py
+689d962b7d7213bfd1aef26716e032b69f44429e4974a7f1db87e366eba9c727  ./src/v6/memory/migrations/v621.py
+778f7f3eef60886f3ee4c1feff9b6e1c08d4497b63be114b6aa5eae2630dcf6f  ./src/v6/memory/v621_compact.py
+d258b1aae4c0c558d703c743675eb1fbe32ff7545400ea0b9ac863e341198a66  ./src/v6/memory/v621_runtime.py
+befdf0ca09410cb68895d03aa9bbf580becb067f5b8e01177e2673712fd89504  ./src/v6/tests/test_v621_memory_completion.py

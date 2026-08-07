@@ -1,0 +1,507 @@
+from __future__ import annotations
+
+import shutil
+import py_compile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+REPO = Path.cwd()
+
+
+def replace_once(
+    text: str,
+    old: str,
+    new: str,
+    label: str,
+) -> str:
+    if new in text:
+        return text
+    count = text.count(old)
+    if count != 1:
+        raise RuntimeError(
+            f"{label}: expected exactly one match, found {count}"
+        )
+    return text.replace(old, new, 1)
+
+
+def insert_after_once(
+    text: str,
+    marker: str,
+    insertion: str,
+    label: str,
+) -> str:
+    if insertion.strip() in text:
+        return text
+    count = text.count(marker)
+    if count != 1:
+        raise RuntimeError(
+            f"{label}: expected exactly one marker, found {count}"
+        )
+    index = text.index(marker) + len(marker)
+    return text[:index] + insertion + text[index:]
+
+
+def replace_function(
+    text: str,
+    function_marker: str,
+    next_function_marker: str,
+    replacement: str,
+    label: str,
+) -> str:
+    start = text.find(function_marker)
+    if start < 0:
+        if replacement.strip() in text:
+            return text
+        raise RuntimeError(f"{label}: function marker missing")
+    end = text.find(next_function_marker, start)
+    if end < 0:
+        raise RuntimeError(f"{label}: next function marker missing")
+    existing = text[start:end]
+    if replacement.strip() == existing.strip():
+        return text
+    return text[:start] + replacement + "\n\n" + text[end:]
+
+
+def install_files() -> None:
+    files = (
+        "src/v6/memory/v621_runtime.py",
+        "src/v6/memory/v621_compact.py",
+        "src/v6/memory/migrations/v621.py",
+        "src/v6/tests/test_v621_memory_completion.py",
+    )
+    for rel in files:
+        source = ROOT / rel
+        target = REPO / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if source.resolve() != target.resolve():
+            shutil.copy2(source, target)
+
+
+def patch_main() -> None:
+    path = REPO / "src/v6/main.py"
+    text = path.read_text(encoding="utf-8")
+    original = text
+
+    text = replace_once(
+        text,
+        "from v6.memory.v62_runtime import LearnedFutureOptionEstimator, V62MemoryController\n",
+        (
+            "from v6.memory.v62_runtime import LearnedFutureOptionEstimator, V62MemoryController\n"
+            "from v6.memory.v621_runtime import CachedAbstractionFutureOptionEstimator, V621MemoryController\n"
+        ),
+        "v621 main import",
+    )
+
+    text = insert_after_once(
+        text,
+        "    memory_action_selection_enabled: bool = True\n",
+        "    memory_sampler_prior_margin: float = 0.15\n",
+        "memory sampler prior config",
+    )
+
+    text = replace_once(
+        text,
+        "        self.future_option_estimator = LearnedFutureOptionEstimator(self.connection, fallback=FutureOptionEstimator())\n",
+        (
+            "        self.future_option_estimator = CachedAbstractionFutureOptionEstimator(\n"
+            "            self.connection,\n"
+            "            fallback=FutureOptionEstimator(),\n"
+            "        )\n"
+        ),
+        "future-option estimator",
+    )
+
+    text = text.replace(
+        "        self.memory_controller = V62MemoryController(\n",
+        "        self.memory_controller = V621MemoryController(\n",
+        1,
+    )
+
+    text = replace_once(
+        text,
+        (
+            "        if memory_query_engine is not None:\n"
+            "            self.memory_controller.query_engine = memory_query_engine\n"
+            "            self.memory_query = memory_query_engine\n"
+        ),
+        (
+            "        if memory_query_engine is not None:\n"
+            "            adapted_query_engine = self.memory_controller.adapt_query_engine(memory_query_engine)\n"
+            "            self.memory_controller.query_engine = adapted_query_engine\n"
+            "            self.memory_query = adapted_query_engine\n"
+        ),
+        "external worker query adaptation",
+    )
+
+    choose_action = '''    def choose_action(self) -> int:
+        actions = self.env.available_actions()
+        if not actions:
+            raise ValueError("environment returned no available actions")
+
+        contexts_by_action: dict[int, dict[int, tuple]] | None = None
+        if bool(self.config.memory_action_selection_enabled):
+            contexts_by_action = {}
+            for candidate_action in actions:
+                candidate_depth = self._context_depth_for_action(
+                    int(candidate_action)
+                )
+                contexts_by_action[int(candidate_action)] = (
+                    self.context_builder.multi_scale_signatures(
+                        int(candidate_action),
+                        max_level=candidate_depth,
+                    )
+                )
+
+        if self.action_sampler is not None:
+            sampled_action = int(
+                self.action_sampler.choose_action(self, actions)
+            )
+            if contexts_by_action:
+                rank_started = time.perf_counter()
+                selected = self.memory_controller.choose_with_sampler_prior(
+                    context_signatures_by_action=contexts_by_action,
+                    available_actions=list(actions),
+                    sampler_action=sampled_action,
+                    override_margin=float(
+                        self.config.memory_sampler_prior_margin
+                    ),
+                )
+                self.memory_action_rank_count += 1
+                self.memory_action_rank_seconds += (
+                    time.perf_counter() - rank_started
+                )
+                return int(selected)
+            return sampled_action
+
+        if contexts_by_action:
+            rank_started = time.perf_counter()
+            ranked = self.memory_controller.choose_action_candidates(
+                contexts_by_action,
+                list(actions),
+            )
+            self.memory_action_rank_count += 1
+            self.memory_action_rank_seconds += (
+                time.perf_counter() - rank_started
+            )
+            if ranked:
+                best_score = ranked[0].score
+                best = [
+                    item.action
+                    for item in ranked
+                    if float(item.score) == float(best_score)
+                ]
+                return int(self.rng.choice(best))
+
+        return int(self.rng.choice(actions))
+'''
+    text = replace_function(
+        text,
+        "    def choose_action(self) -> int:\n",
+        "    def run_step(self) -> StepResult:\n",
+        choose_action,
+        "choose_action",
+    )
+
+    replacements = {
+        "self.carrier_tracker.record_interaction(": "self.memory_controller.record_carrier_interaction(",
+        "self.carrier_tracker.stats_for_carrier(": "self.memory_controller.carrier_stats(",
+        "self.carrier_tracker.import_candidate(": "self.memory_controller.import_carrier_candidate(",
+        "self.efficiency_tracker.record_interaction(": "self.memory_controller.record_efficiency_interaction(",
+        "self.context_contradictions.record_prediction_result(": "self.memory_controller.record_prediction_result(",
+        "self.context_contradictions.should_expand_context(": "self.memory_controller.should_expand_context(",
+        "self.context_contradictions.summary()": "self.memory_controller.context_summary()",
+        "self.memory_lifecycle.register_interaction(": "self.memory_controller.register_interaction(",
+        "self.memory_lifecycle.replay_candidates": "self.memory_controller.replay_candidates",
+        "self.memory_lifecycle.records": "self.memory_controller.lifecycle_records",
+        "self.memory_lifecycle.import_record(": "self.memory_controller.import_lifecycle_record(",
+        "self.memory_lifecycle.import_replay_candidate(": "self.memory_controller.import_replay_candidate(",
+        "self.memory_lifecycle.apply_post_factum_credit(": "self.memory_controller.apply_post_factum_credit(",
+        "self.memory_query.record_selected_action_query(": "self.memory_controller.record_selected_action_query(",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+
+    game_marker = (
+        '        game_id = str(getattr(self.env, "game_id", getattr(self.env, "env_id", "unknown_game")) or "unknown_game")\n'
+    )
+    prediction_record = (
+        "        self.memory_controller.record_prediction_outcome(\n"
+        "            prediction=memory_prediction,\n"
+        "            success=prediction_correct,\n"
+        "            game=game_id,\n"
+        "            context_key=serialized_context_signature,\n"
+        "            context_signatures=context_signatures,\n"
+        "            action=action,\n"
+        "            actual_family=actual_family_id,\n"
+        "            global_step=int(interaction.global_step or interaction.id),\n"
+        "        )\n"
+    )
+    text = insert_after_once(
+        text,
+        game_marker,
+        prediction_record,
+        "concept transfer runtime evidence",
+    )
+
+    terminal_record = (
+        "        self.memory_controller.record_selected_action_outcome(\n"
+        "            action=action,\n"
+        "            success=(\n"
+        "                True\n"
+        "                if bool(level_completed_event) or outcome_state == \"WIN\"\n"
+        "                else False\n"
+        "                if outcome_state == \"GAME_OVER\"\n"
+        "                else None\n"
+        "            ),\n"
+        "            game=game_id,\n"
+        "            level_key=None if level_id is None else str(level_id),\n"
+        "            context_key=serialized_context_signature,\n"
+        "            cost=float(efficiency_event.cumulative_cost),\n"
+        "            epoch=self._epoch_number(),\n"
+        "            global_step=int(interaction.global_step or interaction.id),\n"
+        "        )\n"
+    )
+    text = insert_after_once(
+        text,
+        "        promotion_every = max(1, int(self.config.memory_promotion_every))\n",
+        terminal_record,
+        "strategy reuse runtime evidence",
+    )
+
+    if text == original:
+        raise RuntimeError("main.py was not changed")
+    backup = path.with_suffix(".py.v62_backup")
+    if not backup.exists():
+        backup.write_text(original, encoding="utf-8")
+    path.write_text(text, encoding="utf-8")
+
+
+def patch_compact_memory() -> None:
+    path = REPO / "src/v6/memory/compact_memory.py"
+    text = path.read_text(encoding="utf-8")
+    original = text
+
+    text = replace_once(
+        text,
+        "from v6.memory.substrate import interaction_node_id, scoped_interaction_key\n",
+        (
+            "from v6.memory.substrate import interaction_node_id, scoped_interaction_key\n"
+            "from v6.memory.v621_compact import (\n"
+            "    ensure_v621_state_path,\n"
+            "    merge_v621_state_connections,\n"
+            "    merge_v621_state_file_into_connection,\n"
+            ")\n"
+        ),
+        "compact v621 imports",
+    )
+
+    text = insert_after_once(
+        text,
+        "    validation_state_reset_applied_this_run = _ensure_current_state_schema(paths.current_state)\n",
+        "    ensure_v621_state_path(paths.current_state)\n",
+        "compact schema migration",
+    )
+
+    text = replace_once(
+        text,
+        "        _merge_state_tables_set_based(temp_paths.current_state, state_conn, fold_config)\n",
+        (
+            "        _merge_state_tables_set_based(temp_paths.current_state, state_conn, fold_config)\n"
+            "        merge_v621_state_file_into_connection(temp_paths.current_state, state_conn)\n"
+        ),
+        "set-based compact merge",
+    )
+
+    text = replace_once(
+        text,
+        "        _merge_state_tables(temp_state, state_conn, fold_config)\n",
+        (
+            "        _merge_state_tables(temp_state, state_conn, fold_config)\n"
+            "        merge_v621_state_connections(temp_state, state_conn)\n"
+        ),
+        "row compact merge",
+    )
+
+    text = replace_once(
+        text,
+        "        if graph_rows:\n",
+        (
+            "        if live_connection is not None:\n"
+            "            merge_v621_state_connections(live_connection, state_conn)\n"
+            "        if graph_rows:\n"
+        ),
+        "live compact v621 extension merge",
+    )
+
+    if text == original:
+        raise RuntimeError("compact_memory.py was not changed")
+    backup = path.with_suffix(".py.v62_backup")
+    if not backup.exists():
+        backup.write_text(original, encoding="utf-8")
+    path.write_text(text, encoding="utf-8")
+
+
+def patch_compact_restore() -> None:
+    path = REPO / "src/v6/memory/compact_memory_restore.py"
+    text = path.read_text(encoding="utf-8")
+    original = text
+
+    text = replace_once(
+        text,
+        "from v6.memory.compact_memory import configure_compact_sqlite_connection, stable_family_int_id\n",
+        (
+            "from v6.memory.compact_memory import configure_compact_sqlite_connection, stable_family_int_id\n"
+            "from v6.memory.v621_compact import merge_v621_state_connections\n"
+        ),
+        "restore v621 import",
+    )
+
+    marker = (
+        '                summary["memory_promotions_restored"] += 1\n'
+        '        elif hasattr(system, "memory"):\n'
+    )
+    replacement = (
+        '                summary["memory_promotions_restored"] += 1\n'
+        "            merge_v621_state_connections(state_conn, system.memory.connection)\n"
+        '        elif hasattr(system, "memory"):\n'
+    )
+    text = replace_once(
+        text,
+        marker,
+        replacement,
+        "restore extended substrate state",
+    )
+
+    text = text.replace(
+        "                system.memory_lifecycle.import_record(record)\n",
+        (
+            "                if hasattr(system, \"memory_controller\"):\n"
+            "                    system.memory_controller.import_lifecycle_record(record)\n"
+            "                else:\n"
+            "                    system.memory_lifecycle.import_record(record)\n"
+        ),
+    )
+
+    replay_block = '''                system.memory_lifecycle.import_replay_candidate(
+                    ReplayCandidate(
+                        interaction_id=interaction_id,
+                        replay_priority=float(row["priority_score"] or 0.0),
+                        reason=str(row["reason"]),
+                        family_id=record.family_id,
+                        context_signature=record.context_signature,
+                        status=record.status,
+                    )
+                )
+'''
+    replay_replacement = '''                replay_candidate = ReplayCandidate(
+                    interaction_id=interaction_id,
+                    replay_priority=float(row["priority_score"] or 0.0),
+                    reason=str(row["reason"]),
+                    family_id=record.family_id,
+                    context_signature=record.context_signature,
+                    status=record.status,
+                )
+                if hasattr(system, "memory_controller"):
+                    system.memory_controller.import_replay_candidate(
+                        replay_candidate
+                    )
+                else:
+                    system.memory_lifecycle.import_replay_candidate(
+                        replay_candidate
+                    )
+'''
+    text = replace_once(
+        text,
+        replay_block,
+        replay_replacement,
+        "restore replay controller branch",
+    )
+
+    if text == original:
+        raise RuntimeError("compact_memory_restore.py was not changed")
+    backup = path.with_suffix(".py.v62_backup")
+    if not backup.exists():
+        backup.write_text(original, encoding="utf-8")
+    path.write_text(text, encoding="utf-8")
+
+
+def patch_migrations_init() -> None:
+    path = REPO / "src/v6/memory/migrations/__init__.py"
+    if not path.exists():
+        path.write_text("", encoding="utf-8")
+    text = path.read_text(encoding="utf-8")
+    line = (
+        "from v6.memory.migrations.v621 import "
+        "migrate_connection as migrate_v621_connection\n"
+    )
+    if line not in text:
+        text += (
+            "\n" if text and not text.endswith("\n") else ""
+        ) + line
+        path.write_text(text, encoding="utf-8")
+
+
+
+def validate_installed_sources() -> None:
+    files = (
+        REPO / "src/v6/main.py",
+        REPO / "src/v6/memory/compact_memory.py",
+        REPO / "src/v6/memory/compact_memory_restore.py",
+        REPO / "src/v6/memory/v621_runtime.py",
+        REPO / "src/v6/memory/v621_compact.py",
+        REPO / "src/v6/memory/migrations/v621.py",
+        REPO / "src/v6/tests/test_v621_memory_completion.py",
+    )
+    for path in files:
+        py_compile.compile(str(path), doraise=True)
+
+    main_text = (REPO / "src/v6/main.py").read_text(
+        encoding="utf-8"
+    )
+    required = (
+        "V621MemoryController",
+        "CachedAbstractionFutureOptionEstimator",
+        "choose_with_sampler_prior",
+        "record_prediction_outcome",
+        "record_selected_action_outcome",
+    )
+    missing = [
+        marker for marker in required if marker not in main_text
+    ]
+    if missing:
+        raise RuntimeError(
+            f"v6.2.1 main integration missing markers: {missing}"
+        )
+    forbidden = (
+        "self.carrier_tracker.record_interaction(",
+        "self.carrier_tracker.import_candidate(",
+        "self.efficiency_tracker.record_interaction(",
+        "self.context_contradictions.record_prediction_result(",
+        "self.memory_lifecycle.register_interaction(",
+        "self.memory_lifecycle.apply_post_factum_credit(",
+    )
+    leftovers = [
+        marker for marker in forbidden if marker in main_text
+    ]
+    if leftovers:
+        raise RuntimeError(
+            f"controller routing incomplete: {leftovers}"
+        )
+
+
+def main() -> None:
+    if not (REPO / "src/v6/main.py").exists():
+        raise SystemExit(
+            "Run this script from the arc-agi-3 repository root"
+        )
+    install_files()
+    patch_main()
+    patch_compact_memory()
+    patch_compact_restore()
+    patch_migrations_init()
+    validate_installed_sources()
+    print("ARC-AGI3 v6.2.1 completion drop-in installed")
+
+
+if __name__ == "__main__":
+    main()

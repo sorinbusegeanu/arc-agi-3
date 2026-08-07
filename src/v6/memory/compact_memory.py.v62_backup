@@ -16,11 +16,6 @@ import numpy as np
 from tqdm.auto import tqdm
 from v6.memory.trajectory_efficiency import infer_epoch_from_path
 from v6.memory.substrate import interaction_node_id, scoped_interaction_key
-from v6.memory.v621_compact import (
-    ensure_v621_state_path,
-    merge_v621_state_connections,
-    merge_v621_state_file_into_connection,
-)
 
 
 DEFAULT_MAX_EXAMPLES_PER_CONTINGENCY = 4
@@ -106,7 +101,6 @@ def ensure_memory_layout(memory_dir: str | Path) -> CompactMemoryPaths:
         summary_json=root / "memory_summary.json",
     )
     validation_state_reset_applied_this_run = _ensure_current_state_schema(paths.current_state)
-    ensure_v621_state_path(paths.current_state)
     paths = CompactMemoryPaths(
         root=paths.root,
         current_state=paths.current_state,
@@ -1727,8 +1721,6 @@ def fold_live_system_into_compact_memory(system: Any, memory_dir: str | Path) ->
                     """,
                     tuple(row[column] for column in row.keys()),
                 )
-        if live_connection is not None:
-            merge_v621_state_connections(live_connection, state_conn)
         if graph_rows:
             temp_path = paths.root / "_live_graph_export_tmp.json"
             temp_path.write_text(json.dumps(graph_rows, indent=2), encoding="utf-8")
@@ -2164,7 +2156,6 @@ def _merge_compact_memory_dir_into_main(
     if bool(fold_config.use_set_based_merge):
         before_graph_edges = int(graph_conn.execute("SELECT COUNT(*) FROM graph_edges").fetchone()[0] or 0)
         _merge_state_tables_set_based(temp_paths.current_state, state_conn, fold_config)
-        merge_v621_state_file_into_connection(temp_paths.current_state, state_conn)
         _merge_graph_tables_set_based(temp_paths.graph, graph_conn, fold_config)
         if enforce_graph_caps_after_merge:
             _enforce_graph_caps_after_merge(graph_conn, fold_config, totals=totals)
@@ -2187,7 +2178,6 @@ def _merge_compact_memory_dir_into_main(
         temp_graph.row_factory = sqlite3.Row
         temp_replay.row_factory = sqlite3.Row
         _merge_state_tables(temp_state, state_conn, fold_config)
-        merge_v621_state_connections(temp_state, state_conn)
         _merge_graph_tables(temp_graph, graph_conn, fold_config)
         _merge_replay_queue(temp_replay, replay_conn)
 

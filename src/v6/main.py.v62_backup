@@ -30,7 +30,6 @@ from v6.memory.live_memory_queue import LiveMemoryEvent, LiveMemoryReadCache
 from v6.memory.promotion_engine import MemoryPromotionConfig, MemoryPromotionEngine
 from v6.memory.query_engine import MemoryQueryEngine
 from v6.memory.v62_runtime import LearnedFutureOptionEstimator, V62MemoryController
-from v6.memory.v621_runtime import CachedAbstractionFutureOptionEstimator, V621MemoryController
 from v6.memory.compact_memory_restore import load_compact_memory_into_system
 from v6.memory.interaction_store import Interaction, InteractionStore
 from v6.memory.trajectory_efficiency import (
@@ -102,7 +101,6 @@ class V6Config:
     future_option_depth: int = 1
     memory_query_enabled: bool = True
     memory_action_selection_enabled: bool = True
-    memory_sampler_prior_margin: float = 0.15
     memory_query_use_roles: bool = True
     memory_query_use_concepts: bool = True
     memory_query_use_future_options: bool = True
@@ -192,10 +190,7 @@ class V6System:
             action_cost_default=self.config.efficiency_action_cost_default,
             recent_window_size=self.config.efficiency_recent_window_size,
         )
-        self.future_option_estimator = CachedAbstractionFutureOptionEstimator(
-            self.connection,
-            fallback=FutureOptionEstimator(),
-        )
+        self.future_option_estimator = LearnedFutureOptionEstimator(self.connection, fallback=FutureOptionEstimator())
         best_known_path = self._best_known_solution_lengths_path()
         self.trajectory_efficiency = TrajectoryEfficiencyTracker(
             best_known_solution_lengths=load_best_known_solution_lengths(best_known_path),
@@ -210,7 +205,7 @@ class V6System:
             contingency_learner=self.contingency_learner,
             graph=self.graph,
         )
-        self.memory_controller = V621MemoryController(
+        self.memory_controller = V62MemoryController(
             self.memory,
             contingency_learner=self.contingency_learner,
             graph=self.graph,
@@ -295,9 +290,8 @@ class V6System:
             self.memory_graph_restore_seconds = float(worker_memory_snapshot.graph_restore_seconds)
             self.memory_substrate_restore_seconds = float(worker_memory_snapshot.substrate_restore_seconds)
         if memory_query_engine is not None:
-            adapted_query_engine = self.memory_controller.adapt_query_engine(memory_query_engine)
-            self.memory_controller.query_engine = adapted_query_engine
-            self.memory_query = adapted_query_engine
+            self.memory_controller.query_engine = memory_query_engine
+            self.memory_query = memory_query_engine
 
     def _configure_runtime_sqlite_connection(self) -> None:
         mode = str(self.config.sqlite_synchronous or "normal").strip().upper()
@@ -313,63 +307,25 @@ class V6System:
         actions = self.env.available_actions()
         if not actions:
             raise ValueError("environment returned no available actions")
-
-        contexts_by_action: dict[int, dict[int, tuple]] | None = None
-        if bool(self.config.memory_action_selection_enabled):
-            contexts_by_action = {}
+        if bool(self.config.memory_action_selection_enabled) and self.action_sampler is None:
+            contexts_by_action: dict[int, dict[int, tuple]] = {}
             for candidate_action in actions:
-                candidate_depth = self._context_depth_for_action(
-                    int(candidate_action)
+                candidate_depth = self._context_depth_for_action(int(candidate_action))
+                contexts_by_action[int(candidate_action)] = self.context_builder.multi_scale_signatures(
+                    int(candidate_action),
+                    max_level=candidate_depth,
                 )
-                contexts_by_action[int(candidate_action)] = (
-                    self.context_builder.multi_scale_signatures(
-                        int(candidate_action),
-                        max_level=candidate_depth,
-                    )
-                )
-
-        if self.action_sampler is not None:
-            sampled_action = int(
-                self.action_sampler.choose_action(self, actions)
-            )
-            if contexts_by_action:
-                rank_started = time.perf_counter()
-                selected = self.memory_controller.choose_with_sampler_prior(
-                    context_signatures_by_action=contexts_by_action,
-                    available_actions=list(actions),
-                    sampler_action=sampled_action,
-                    override_margin=float(
-                        self.config.memory_sampler_prior_margin
-                    ),
-                )
-                self.memory_action_rank_count += 1
-                self.memory_action_rank_seconds += (
-                    time.perf_counter() - rank_started
-                )
-                return int(selected)
-            return sampled_action
-
-        if contexts_by_action:
             rank_started = time.perf_counter()
-            ranked = self.memory_controller.choose_action_candidates(
-                contexts_by_action,
-                list(actions),
-            )
+            ranked = self.memory_controller.choose_action_candidates(contexts_by_action, list(actions))
             self.memory_action_rank_count += 1
-            self.memory_action_rank_seconds += (
-                time.perf_counter() - rank_started
-            )
+            self.memory_action_rank_seconds += time.perf_counter() - rank_started
             if ranked:
                 best_score = ranked[0].score
-                best = [
-                    item.action
-                    for item in ranked
-                    if float(item.score) == float(best_score)
-                ]
+                best = [item.action for item in ranked if float(item.score) == float(best_score)]
                 return int(self.rng.choice(best))
-
+        if self.action_sampler is not None:
+            return int(self.action_sampler.choose_action(self, actions))
         return int(self.rng.choice(actions))
-
 
     def run_step(self) -> StepResult:
         self._refresh_live_memory_if_due()
@@ -533,16 +489,6 @@ class V6System:
                 )
         action_signature = f"a{int(action)}"
         game_id = str(getattr(self.env, "game_id", getattr(self.env, "env_id", "unknown_game")) or "unknown_game")
-        self.memory_controller.record_prediction_outcome(
-            prediction=memory_prediction,
-            success=prediction_correct,
-            game=game_id,
-            context_key=serialized_context_signature,
-            context_signatures=context_signatures,
-            action=action,
-            actual_family=actual_family_id,
-            global_step=int(interaction.global_step or interaction.id),
-        )
         level_id = getattr(self.env, "last_full_game_id", None) or getattr(self.env, "level_id", None)
         sampler_name = getattr(self.action_sampler, "name", None)
         stable_delta_key = self._stable_delta_key(delta, outcome_state=outcome_state, level_completed_event=level_completed_event)
@@ -627,7 +573,7 @@ class V6System:
             context_signature=serialized_context_signature,
             action_signature=action_signature,
         )
-        carrier_event = self.memory_controller.record_carrier_interaction(
+        carrier_event = self.carrier_tracker.record_interaction(
             interaction_id=str(interaction.id),
             carrier_signature=carrier_signature,
             context_signature=serialized_context_signature,
@@ -639,7 +585,7 @@ class V6System:
             global_step=interaction.global_step,
         )
         carrier_stats = (
-            self.memory_controller.carrier_stats(carrier_signature)
+            self.carrier_tracker.stats_for_carrier(carrier_signature)
             if carrier_signature is not None
             else {
                 "carrier_signature": None,
@@ -681,7 +627,7 @@ class V6System:
                     "linked_family_count": int(carrier_stats.get("carrier_distinct_family_count") or 0),
                 },
             )
-        efficiency_event = self.memory_controller.record_efficiency_interaction(
+        efficiency_event = self.efficiency_tracker.record_interaction(
             interaction_id=str(interaction.id),
             before_observation=observation_before,
             after_observation=observation_after_for_delta,
@@ -694,7 +640,7 @@ class V6System:
             # Future-option deltas are post-run diagnostics only here; do not use future horizon data during sampling.
             future_option_delta=None if future_option_delta is None else float(future_option_delta.delta_score),
         )
-        contradiction_event = self.memory_controller.record_prediction_result(
+        contradiction_event = self.context_contradictions.record_prediction_result(
             interaction_id=str(interaction.id),
             context_signature=serialized_context_signature,
             action_signature=action_signature,
@@ -715,7 +661,7 @@ class V6System:
             context_contradiction_key = contradiction_event.contradiction_key
             suggested_context_depth = int(contradiction_event.suggested_context_depth)
             context_contradiction_reason = contradiction_event.reason
-            context_expansion_suggested = self.memory_controller.should_expand_context(
+            context_expansion_suggested = self.context_contradictions.should_expand_context(
                 serialized_context_signature,
                 action_signature,
             )
@@ -747,10 +693,10 @@ class V6System:
                         "contradiction_key": str(contradiction_event.contradiction_key),
                         "context_signature": serialized_context_signature,
                         "action_signature": action_signature,
-                        "count": int(self.memory_controller.context_summary().get("repeated_contradiction_count", 1) or 1),
+                        "count": int(self.context_contradictions.summary().get("repeated_contradiction_count", 1) or 1),
                     },
                 )
-        memory_record = self.memory_controller.register_interaction(
+        memory_record = self.memory_lifecycle.register_interaction(
             interaction_id=str(interaction.id),
             family_id=actual_family_id,
             context_signature=serialized_context_signature,
@@ -773,7 +719,7 @@ class V6System:
             context_contradiction=bool(memory_record.context_contradiction),
             replay_count=int(memory_record.replay_count),
         )
-        replay_candidate = self.memory_controller.replay_candidates.get(str(interaction.id))
+        replay_candidate = self.memory_lifecycle.replay_candidates.get(str(interaction.id))
         base_replay_priority = 0.0 if replay_candidate is None else float(replay_candidate.replay_priority)
         current_epoch = self._epoch_number()
         initial_retention_score = self._initial_retention_score(
@@ -1099,22 +1045,6 @@ class V6System:
             )
         )
         promotion_every = max(1, int(self.config.memory_promotion_every))
-        self.memory_controller.record_selected_action_outcome(
-            action=action,
-            success=(
-                True
-                if bool(level_completed_event) or outcome_state == "WIN"
-                else False
-                if outcome_state == "GAME_OVER"
-                else None
-            ),
-            game=game_id,
-            level_key=None if level_id is None else str(level_id),
-            context_key=serialized_context_signature,
-            cost=float(efficiency_event.cumulative_cost),
-            epoch=self._epoch_number(),
-            global_step=int(interaction.global_step or interaction.id),
-        )
         if int(interaction.id) % promotion_every == 0:
             self.memory_controller.promote_candidates(step=int(interaction.id))
         if self._auto_commit:
@@ -1163,7 +1093,7 @@ class V6System:
             )
 
         if bool(self.config.memory_query_enabled) or bool(self.config.memory_action_selection_enabled):
-            self.memory_controller.record_selected_action_query(
+            self.memory_query.record_selected_action_query(
                 context_signatures=context_signatures,
                 action=action,
                 prediction=memory_prediction,
@@ -1278,12 +1208,12 @@ class V6System:
             interaction_id = str(row.get("interaction_id") or "")
             if not interaction_id:
                 continue
-            existing = self.memory_controller.replay_candidates.get(interaction_id)
+            existing = self.memory_lifecycle.replay_candidates.get(interaction_id)
             remote_priority = float(row.get("replay_priority") or 0.0)
             if existing is not None and float(existing.replay_priority) >= remote_priority:
                 continue
-            if interaction_id not in self.memory_controller.lifecycle_records:
-                self.memory_controller.import_lifecycle_record(
+            if interaction_id not in self.memory_lifecycle.records:
+                self.memory_lifecycle.import_record(
                     MemoryRecord(
                         interaction_id=interaction_id,
                         family_id=None if row.get("family_id") is None else str(row.get("family_id")),
@@ -1302,7 +1232,7 @@ class V6System:
                         retention_reason=str(row.get("reason") or "shared_live_memory"),
                     )
                 )
-            self.memory_controller.import_replay_candidate(
+            self.memory_lifecycle.import_replay_candidate(
                 ReplayCandidate(
                     interaction_id=interaction_id,
                     replay_priority=remote_priority,
@@ -1320,7 +1250,7 @@ class V6System:
             carrier_signature = str(row.get("carrier_signature") or "")
             if not carrier_signature or carrier_signature in self._live_memory_imported_carrier_signatures:
                 continue
-            self.memory_controller.import_carrier_candidate(
+            self.carrier_tracker.import_candidate(
                 carrier_signature=carrier_signature,
                 carrier_source=str(row.get("carrier_source") or "unknown"),
                 support_count=int(row.get("support_count") or 0),
@@ -1518,7 +1448,7 @@ class V6System:
                     int(interaction_id),
                 ),
             )
-            self.memory_controller.apply_post_factum_credit(
+            self.memory_lifecycle.apply_post_factum_credit(
                 str(interaction_id),
                 learning_credit=float(credit),
                 reason="post_factum_level_completion",
@@ -1583,7 +1513,7 @@ class V6System:
                     int(interaction_id),
                 ),
             )
-            self.memory_controller.apply_post_factum_credit(
+            self.memory_lifecycle.apply_post_factum_credit(
                 str(interaction_id),
                 learning_credit=float(credit),
                 reason=str(reason),
@@ -1594,7 +1524,7 @@ class V6System:
         self._current_level_interaction_ids = []
 
     def _sync_post_factum_replay_fields(self, interaction_id: int) -> None:
-        candidate = self.memory_controller.replay_candidates.get(str(interaction_id))
+        candidate = self.memory_lifecycle.replay_candidates.get(str(interaction_id))
         if candidate is None:
             return
         self.connection.execute(
@@ -1827,9 +1757,9 @@ class V6System:
                     int(interaction_id),
                 ),
             )
-            candidate = self.memory_controller.replay_candidates.get(str(interaction_id))
+            candidate = self.memory_lifecycle.replay_candidates.get(str(interaction_id))
             if candidate is not None:
-                self.memory_controller.replay_candidates[str(interaction_id)] = ReplayCandidate(
+                self.memory_lifecycle.replay_candidates[str(interaction_id)] = ReplayCandidate(
                     interaction_id=candidate.interaction_id,
                     replay_priority=float(replay_priority),
                     reason=str(candidate.reason),
