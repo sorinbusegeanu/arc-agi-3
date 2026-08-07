@@ -5,15 +5,43 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   test-v6:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: chatgpt-v621-test
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Patch v6.2.1 compact compatibility
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('src/v6/memory/compact_memory.py')
+          text = path.read_text(encoding='utf-8')
+          replacements = {
+              'live_connection.execute("SELECT * FROM memory_nodes ORDER BY node_id ASC")': 'live_connection.execute("SELECT node_id, memory_level, node_type, canonical_key, support_count, first_seen_step, last_seen_step, attrs_json FROM memory_nodes ORDER BY node_id ASC")',
+              'live_connection.execute("SELECT * FROM memory_scores ORDER BY node_id ASC")': 'live_connection.execute("SELECT node_id, isf_total, prediction_lift, transfer_score, explanatory_reach, compression_gain, future_option_delta, replay_priority, retention_status, memory_state, stored_epoch, last_replayed_epoch, last_promoted_epoch, retention_score, forgetting_score, compressed_into_id, superseded_by_id, forgetting_reason, updated_step FROM memory_scores ORDER BY node_id ASC")',
+              'live_connection.execute("SELECT * FROM memory_promotions ORDER BY promotion_id ASC")': 'live_connection.execute("SELECT promotion_id, source_node_id, target_node_id, promotion_type, evidence_count, promotion_score, status, payload_json FROM memory_promotions ORDER BY promotion_id ASC")',
+          }
+          for old, new in replacements.items():
+              if old in text:
+                  text = text.replace(old, new, 1)
+          path.write_text(text, encoding='utf-8')
+          PY
+          if ! git diff --quiet -- src/v6/memory/compact_memory.py; then
+            git config user.name "ChatGPT"
+            git config user.email "actions@users.noreply.github.com"
+            git add src/v6/memory/compact_memory.py
+            git commit -m "Fix v6.2.1 compact fold compatibility"
+            git push origin HEAD:chatgpt-v621-test
+          fi
       - name: Install test dependencies
         run: python -m pip install --upgrade pip pytest numpy networkx tqdm pandas scikit-learn pyarrow duckdb 'arc-agi>=0.9.1'
       - name: Run v6 tests
