@@ -1,0 +1,30 @@
+{
+  "base_commit": "a55688a60a56762e9f582ceb8997b39df92c5025",
+  "branch": "main",
+  "new_modules": [
+    "src/v6/reporting/__init__.py",
+    "src/v6/reporting/contracts.py",
+    "src/v6/reporting/evidence_snapshot.py",
+    "src/v6/reporting/framework.py",
+    "src/v6/memory/migrations/__init__.py",
+    "src/v6/memory/migrations/v61.py",
+    "src/v6/memory/controller.py"
+  ],
+  "package": "arc_agi3_v61_canonical_dropin",
+  "replaced_files": [
+    "src/v6/hypothesis_suite_report.py",
+    "src/v6/provenance_validation.py",
+    "src/v6/memory/substrate.py",
+    "src/v6/graph/graph_manager.py",
+    "src/v6/context/contradiction_tracker.py"
+  ],
+  "repository": "sorinbusegeanu/arc-agi-3",
+  "tests": {
+    "focused_tests": 21,
+    "focused_tests_passed": 21,
+    "migration_snapshot_smoke": "passed",
+    "suite_smoke": "passed",
+    "syntax_compilation": "passed"
+  },
+  "version": "1.0"
+}

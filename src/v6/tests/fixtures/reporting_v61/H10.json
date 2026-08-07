@@ -1,0 +1,20 @@
+{
+  "expected": {
+    "dependency_gate": "PASS",
+    "evidence_contract_gate": "PASS",
+    "final_decision": "VALID",
+    "quality_gate": "PASS",
+    "raw_decision": "VALID"
+  },
+  "hypothesis_id": "H10",
+  "raw_result": {
+    "core_metrics": {
+      "fixture": 1
+    },
+    "decision": "VALID",
+    "evidence_coverage_ratio": 1.0,
+    "hypothesis_id": "H10",
+    "missing_evidence": [],
+    "verified_claim_count": 1
+  }
+}
