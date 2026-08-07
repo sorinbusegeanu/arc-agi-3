@@ -5,6 +5,7 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Temporary CI harness for validating the current main snapshot.
 jobs:
   pytest-v6:
     runs-on: ubuntu-latest
