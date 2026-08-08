@@ -7,7 +7,8 @@ import pytest
 
 from v6.interaction_significance import compute_interaction_significance
 from v6.memory.promotion_engine import MemoryPromotionEngine
-from v6.memory.substrate import MemoryNode, MemorySubstrate
+from v6.memory.substrate import MemoryNode, MemoryScore, MemorySubstrate
+from v6.memory.v621_compact import merge_v621_state_connections
 from v6.memory.v621_runtime import V621AbstractionEngine
 from v6.memory.v63_policy import (
     ABSTRACTION_VERSION,
@@ -15,7 +16,10 @@ from v6.memory.v63_policy import (
     _bounded_pairs,
     resolve_transfer_evidence,
 )
-from v6.memory.v63_transfer import QUALIFIED_EVIDENCE_PREFIX
+from v6.memory.v63_transfer import (
+    QUALIFIED_EVIDENCE_PREFIX,
+    _initial_retention_score_v63,
+)
 from v6.memory_lifecycle import MemoryLifecycleManager, compute_memory_fitness
 
 
@@ -102,6 +106,29 @@ def test_v63_memory_fitness_does_not_double_count_prediction_error() -> None:
     )
     assert low_pe == pytest.approx(0.6)
     assert high_pe == pytest.approx(low_pe)
+
+
+def test_v63_retention_does_not_feed_replay_or_future_option_back_into_fitness() -> None:
+    low = _initial_retention_score_v63(
+        None,
+        isf_total=0.6,
+        replay_priority=0.0,
+        explanatory_reach=0.0,
+        transfer_potential=0.0,
+        recurrence=0.0,
+        future_option_impact=0.0,
+    )
+    high_legacy_inputs = _initial_retention_score_v63(
+        None,
+        isf_total=0.6,
+        replay_priority=1.0,
+        explanatory_reach=0.0,
+        transfer_potential=0.0,
+        recurrence=0.0,
+        future_option_impact=1.0,
+    )
+    assert low == pytest.approx(0.6)
+    assert high_legacy_inputs == pytest.approx(low)
 
 
 def test_v63_empirical_transfer_overrides_prior() -> None:
@@ -259,3 +286,77 @@ def test_v63_pair_generation_respects_budget() -> None:
     pairs = list(_bounded_pairs(ids, 17))
     assert len(pairs) == 17
     assert V63CandidateBudget().max_role_pair_comparisons > 17
+
+
+def test_v63_compact_merge_preserves_score_extensions_and_evidence_tables() -> None:
+    source = sqlite3.connect(":memory:")
+    target = sqlite3.connect(":memory:")
+    source_memory = MemorySubstrate(source)
+    target_memory = MemorySubstrate(target)
+    MemoryPromotionEngine(source_memory)
+    MemoryPromotionEngine(target_memory)
+
+    for memory in (source_memory, target_memory):
+        memory.upsert_node(
+            MemoryNode(
+                node_id="M3:role:compact",
+                memory_level="M3",
+                node_type="FunctionalRoleMemory",
+                canonical_key="compact",
+                attrs={},
+            )
+        )
+        memory.upsert_score(
+            MemoryScore(
+                node_id="M3:role:compact",
+                isf_total=0.5,
+            )
+        )
+
+    source.execute(
+        """
+        UPDATE memory_scores
+        SET transfer_prior=0.7,
+            transfer_empirical_rate=0.4,
+            transfer_evidence_status='empirical',
+            memory_fitness=0.6,
+            score_policy_version='v63_unified_memory_fitness_v1'
+        WHERE node_id='M3:role:compact'
+        """
+    )
+    source.execute(
+        """
+        INSERT INTO memory_evidence_revisions_v63(
+            revision_id, node_id, evidence_kind,
+            prospective_value, realized_value,
+            evidence_status, evidence_source, global_step, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "revision-1",
+            "M3:role:compact",
+            "transfer",
+            0.7,
+            0.4,
+            "empirical",
+            "test",
+            10,
+            time.time(),
+        ),
+    )
+    source.commit()
+
+    merge_v621_state_connections(source, target)
+    score = target.execute(
+        """
+        SELECT transfer_prior, transfer_empirical_rate,
+               transfer_evidence_status, memory_fitness, score_policy_version
+        FROM memory_scores
+        WHERE node_id='M3:role:compact'
+        """
+    ).fetchone()
+    revision_count = target.execute(
+        "SELECT COUNT(*) FROM memory_evidence_revisions_v63 WHERE revision_id='revision-1'"
+    ).fetchone()[0]
+    assert score == pytest.approx((0.7, 0.4, "empirical", 0.6, "v63_unified_memory_fitness_v1"))
+    assert revision_count == 1
