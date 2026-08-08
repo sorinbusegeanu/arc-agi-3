@@ -206,6 +206,33 @@ def migrate_connection(connection: sqlite3.Connection) -> dict[str, object]:
     }
 
 
+def _ensure_latest_performance_indexes(
+    connection: sqlite3.Connection,
+    schema_version: str | None,
+) -> list[str]:
+    if _version_tuple(schema_version) < (6, 3):
+        return []
+    from v6.memory.migrations.v63 import (
+        PERFORMANCE_SCHEMA_KEY,
+        PERFORMANCE_SCHEMA_VERSION,
+        _ensure_performance_indexes,
+    )
+
+    if _memory_version(connection, PERFORMANCE_SCHEMA_KEY) == PERFORMANCE_SCHEMA_VERSION:
+        return []
+    indexes = _ensure_performance_indexes(connection)
+    connection.execute(
+        """
+        INSERT INTO memory_versions(key, value)
+        VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """,
+        (PERFORMANCE_SCHEMA_KEY, PERFORMANCE_SCHEMA_VERSION),
+    )
+    connection.commit()
+    return indexes
+
+
 def migrate_memory_dir(memory_dir: str | Path) -> dict[str, object]:
     root = Path(memory_dir)
     database = root / "current_state.sqlite"
@@ -213,6 +240,12 @@ def migrate_memory_dir(memory_dir: str | Path) -> dict[str, object]:
         raise FileNotFoundError(database)
     with sqlite3.connect(database, timeout=60.0) as connection:
         result = migrate_connection(connection)
+        performance_indexes = _ensure_latest_performance_indexes(
+            connection,
+            str(result.get("schema_version") or ""),
+        )
+        if performance_indexes:
+            result["performance_indexes"] = performance_indexes
     manifest = root / "v61_schema_migration.json"
     manifest.write_text(
         json.dumps(
