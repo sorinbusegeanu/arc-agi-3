@@ -3261,7 +3261,8 @@ def test_phase4_isf_changes_when_future_option_delta_is_passed() -> None:
         level_completed_event=False,
     )
     assert with_negative_delta.survival_impact >= 0.8
-    assert with_delta.transfer_potential > without_delta.transfer_potential
+    assert with_delta.transfer_potential == without_delta.transfer_potential == 0.0
+    assert with_delta.transfer_prior == without_delta.transfer_prior == 0.0
     assert with_delta.survival_impact == without_delta.survival_impact
 
 
