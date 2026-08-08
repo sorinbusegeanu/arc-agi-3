@@ -31,9 +31,8 @@ def _ensure_column(
     name: str,
     declaration: str,
 ) -> None:
-    if not _columns(connection, table):
-        return
-    if name in _columns(connection, table):
+    columns = _columns(connection, table)
+    if not columns or name in columns:
         return
     connection.execute(
         f'ALTER TABLE "{table}" ADD COLUMN "{name}" {declaration}'
@@ -63,7 +62,18 @@ def _schema_version_before(connection: sqlite3.Connection) -> str | None:
 
 def migrate_connection(connection: sqlite3.Connection) -> dict[str, object]:
     existing_schema_version = _schema_version_before(connection)
-    # Keep v6.2.1 independently safe if called against a fresh SQLite file.
+    if _version_tuple(existing_schema_version) >= _version_tuple(SCHEMA_VERSION):
+        return {
+            "schema_version": existing_schema_version or SCHEMA_VERSION,
+            "migration_applied": False,
+            "tables": [
+                "concept_transfer_attempts_v621",
+                "world_model_relations_v621",
+                "memory_level_lifecycle_v621",
+                "memory_runtime_audit_v621",
+            ],
+        }
+
     connection.execute(
         "CREATE TABLE IF NOT EXISTS memory_versions (key TEXT PRIMARY KEY, value TEXT)"
     )
@@ -137,24 +147,9 @@ def migrate_connection(connection: sqlite3.Connection) -> dict[str, object]:
         """
     )
 
-    _ensure_column(
-        connection,
-        "memory_scores",
-        "lifecycle_version",
-        "TEXT",
-    )
-    _ensure_column(
-        connection,
-        "memory_promotion_evidence_v62",
-        "policy_version",
-        "TEXT",
-    )
-    _ensure_column(
-        connection,
-        "memory_promotion_evidence_v62",
-        "validation_source",
-        "TEXT",
-    )
+    _ensure_column(connection, "memory_scores", "lifecycle_version", "TEXT")
+    _ensure_column(connection, "memory_promotion_evidence_v62", "policy_version", "TEXT")
+    _ensure_column(connection, "memory_promotion_evidence_v62", "validation_source", "TEXT")
 
     effective_version = (
         existing_schema_version
