@@ -2027,7 +2027,7 @@ def _validate_incremental_promotions(
                 for value in heldout_lifts
             )
             has_positive_compression = incremental_compression > 0.0
-            historically_promoted = bool(int(row["persistent_historically_promoted"] or 0))
+            historically_promoted = bool(int(row["persistent_historically_promoted"] or 0) or int(row["is_promoted"] or 0))
             legacy_promoted = bool(
                 int(row["persistent_currently_promoted"] or 0)
                 or int(row["is_promoted"] or 0)

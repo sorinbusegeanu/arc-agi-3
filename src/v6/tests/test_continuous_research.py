@@ -20,7 +20,7 @@ def _write_sampling_fixture(
     worker_execution: dict | None = None,
 ) -> list[dict]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    db_path = output_dir / "sampling_v05c" / "tt01" / "mixed" / "steps_5000" / "seed_0.sqlite"
+    db_path = output_dir / "sampling_v05c" / "ft09" / "mixed" / "steps_5000" / "seed_0.sqlite"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(db_path) as connection:
         connection.executescript(
@@ -90,12 +90,12 @@ def _write_sampling_fixture(
     (output_dir / "interaction_sampling_v05c_report.json").write_text(
         json.dumps(
             {
-                "games": ["tt01"],
+                "games": ["ft09"],
                 "samplers": ["mixed"],
                 "seeds": [0],
                 "runs": [
                     {
-                        "game": "tt01",
+                        "game": "ft09",
                         "sampler_name": "mixed",
                         "run_status": "ok",
                         "total_interactions": 4,
@@ -134,7 +134,7 @@ def _write_sampling_fixture(
                 "temporal_milestones": {
                     "by_game_sampler_seed": [
                         {
-                            "game": "tt01",
+                            "game": "ft09",
                             "sampler": "mixed",
                             "seed": 0,
                             "first_interaction_step": global_step_offset + 1,
@@ -163,7 +163,7 @@ def _write_sampling_fixture(
             },
                 "level_completion_records": [
                     {
-                        "game_id": "tt01",
+                        "game_id": "ft09",
                         "level_id": "level_0001",
                         "level_name": "level_0001",
                         "completed": True,
@@ -184,7 +184,7 @@ def _write_sampling_fixture(
         encoding="utf-8",
     )
     (output_dir / "interaction_sampling_v05c_report.txt").write_text("stub\n", encoding="utf-8")
-    return [{"game": "tt01", "total_interactions": 4}]
+    return [{"game": "ft09", "total_interactions": 4}]
 
 
 def test_log_epoch_phase_prints_without_jsonl_side_effect(tmp_path: Path, capsys) -> None:
@@ -314,7 +314,7 @@ def test_continuous_stdout_is_written_to_overwritten_log_file(tmp_path: Path, mo
     run_continuous_research(
         ContinuousResearchConfig(
             experiment_name="exp",
-            games="tt01",
+            games="ft09",
             samplers="mixed",
             seeds="0",
             steps_per_epoch=10,
@@ -353,7 +353,7 @@ def test_continuous_run_emits_single_timed_post_fold_phase_lines(tmp_path: Path,
             "Games": 1,
             "Total_Levels": 1,
             "Total_Games": 1,
-            "completed_levels_by_game": {"tt01": 1},
+            "completed_levels_by_game": {"ft09": 1},
             "H01 decision": "PARTIALLY_VALID",
             "H02 decision": "PARTIALLY_VALID",
             "H03 decision": "PARTIALLY_VALID",
@@ -422,7 +422,7 @@ def test_continuous_run_emits_single_timed_post_fold_phase_lines(tmp_path: Path,
     run_continuous_research(
         ContinuousResearchConfig(
             experiment_name="exp",
-            games="tt01",
+            games="ft09",
             samplers="mixed",
             seeds="0",
             steps_per_epoch=5000,
@@ -509,7 +509,7 @@ def test_continuous_resolves_full_hypothesis_suite_epoch_mode(tmp_path: Path, mo
     run_continuous_research(
         ContinuousResearchConfig(
             experiment_name="exp",
-            games="tt01",
+            games="ft09",
             samplers="mixed",
             seeds="0",
             steps_per_epoch=10,
@@ -588,7 +588,7 @@ def test_continuous_passes_hypothesis_suite_limits(tmp_path: Path, monkeypatch) 
     run_continuous_research(
         ContinuousResearchConfig(
             experiment_name="exp",
-            games="tt01",
+            games="ft09",
             samplers="mixed",
             seeds="0",
             steps_per_epoch=10,
@@ -619,7 +619,7 @@ def test_continuous_command_creates_manifest_epoch_and_memory(tmp_path: Path, mo
     manifest = run_continuous_research(
         ContinuousResearchConfig(
             experiment_name="exp",
-            games="tt01",
+            games="ft09",
             samplers="mixed",
             seeds="0",
             steps_per_epoch=5000,
@@ -649,7 +649,7 @@ def test_continuous_prints_epoch_game_and_level_results(tmp_path: Path, monkeypa
     run_continuous_research(
         ContinuousResearchConfig(
             experiment_name="exp",
-            games="tt01",
+            games="ft09",
             samplers="mixed",
             seeds="0",
             steps_per_epoch=10,
@@ -703,7 +703,7 @@ def test_continuous_initial_memory_checkpoint_is_copied_to_new_output_only(tmp_p
     manifest = run_continuous_research(
         ContinuousResearchConfig(
             experiment_name="phase_b",
-            games="tt01",
+            games="ft09",
             samplers="mixed",
             seeds="0",
             steps_per_epoch=10,
@@ -732,7 +732,7 @@ def test_initial_memory_checkpoint_validates_source_and_destination(tmp_path: Pa
     source = tmp_path / "phase_a" / "memory"
     ensure_memory_layout(source)
     common = dict(
-        experiment_name="phase_b", games="tt01", samplers="mixed", seeds="0",
+        experiment_name="phase_b", games="ft09", samplers="mixed", seeds="0",
         steps_per_epoch=10, max_epochs=1, horizon=2, context_depth=1,
     )
     with pytest.raises(RuntimeError, match="does not exist"):
@@ -773,7 +773,7 @@ def test_epoch_2_loads_existing_memory_and_global_step_offset_increments(tmp_pat
     root = tmp_path / "continuous"
     first = ContinuousResearchConfig(
         experiment_name="exp",
-        games="tt01",
+        games="ft09",
         samplers="mixed",
         seeds="0",
         steps_per_epoch=5000,
@@ -784,7 +784,7 @@ def test_epoch_2_loads_existing_memory_and_global_step_offset_increments(tmp_pat
     )
     second = ContinuousResearchConfig(
         experiment_name="exp",
-        games="tt01",
+        games="ft09",
         samplers="mixed",
         seeds="0",
         steps_per_epoch=5000,
@@ -813,7 +813,7 @@ def test_no_new_contingencies_stop_works(tmp_path: Path, monkeypatch) -> None:
     manifest = run_continuous_research(
         ContinuousResearchConfig(
             experiment_name="exp",
-            games="tt01",
+            games="ft09",
             samplers="mixed",
             seeds="0",
             steps_per_epoch=5000,
@@ -839,7 +839,7 @@ def test_epoch_status_and_suite_summary_exist_and_memory_continuity_is_written(t
     run_continuous_research(
         ContinuousResearchConfig(
             experiment_name="exp",
-            games="tt01",
+            games="ft09",
             samplers="mixed",
             seeds="0",
             steps_per_epoch=5000,
@@ -922,7 +922,7 @@ def test_manifest_tracks_run_wide_completion_totals(tmp_path: Path, monkeypatch)
     manifest = run_continuous_research(
         ContinuousResearchConfig(
             experiment_name="exp",
-            games="tt01",
+            games="ft09",
             samplers="mixed",
             seeds="0",
             steps_per_epoch=5000,
@@ -982,7 +982,7 @@ def test_continuous_completion_totals_accumulate_repeated_epoch_solves(tmp_path:
     root = tmp_path / "continuous"
     manifest = run_continuous_research(
         ContinuousResearchConfig(
-            experiment_name="exp", games="tt01", samplers="mixed", seeds="0",
+            experiment_name="exp", games="ft09", samplers="mixed", seeds="0",
             steps_per_epoch=2, max_epochs=2, horizon=1, context_depth=1, output_dir=str(root),
         )
     )
@@ -1004,13 +1004,13 @@ def test_resume_continues_additive_completion_totals(tmp_path: Path, monkeypatch
     root = tmp_path / "continuous"
     run_continuous_research(
         ContinuousResearchConfig(
-            experiment_name="exp", games="tt01", samplers="mixed", seeds="0",
+            experiment_name="exp", games="ft09", samplers="mixed", seeds="0",
             steps_per_epoch=2, max_epochs=1, horizon=1, context_depth=1, output_dir=str(root),
         )
     )
     manifest = run_continuous_research(
         ContinuousResearchConfig(
-            experiment_name="exp", games="tt01", samplers="mixed", seeds="0",
+            experiment_name="exp", games="ft09", samplers="mixed", seeds="0",
             steps_per_epoch=2, max_epochs=2, horizon=1, context_depth=1,
             output_dir=str(root), resume=True,
         )
@@ -1030,7 +1030,7 @@ def test_completion_totals_are_not_updated_when_epoch_fails(tmp_path: Path, monk
     with pytest.raises(RuntimeError, match="boom"):
         run_continuous_research(
             ContinuousResearchConfig(
-                experiment_name="exp", games="tt01", samplers="mixed", seeds="0",
+                experiment_name="exp", games="ft09", samplers="mixed", seeds="0",
                 steps_per_epoch=1, max_epochs=1, horizon=1, context_depth=1, output_dir=str(root),
             )
         )
@@ -1050,7 +1050,7 @@ def test_continuous_run_passes_fast_postprocessing_into_sampling(tmp_path: Path,
     run_continuous_research(
         ContinuousResearchConfig(
             experiment_name="exp",
-            games="tt01",
+            games="ft09",
             samplers="mixed",
             seeds="0",
             steps_per_epoch=5000,
@@ -1102,7 +1102,7 @@ def test_continuous_run_preserves_configured_worker_cap_and_records_ram_start(tm
     run_continuous_research(
         ContinuousResearchConfig(
             experiment_name="exp",
-            games="tt01",
+            games="ft09",
             samplers="mixed",
             seeds="0",
             steps_per_epoch=5000,
@@ -1117,7 +1117,7 @@ def test_continuous_run_preserves_configured_worker_cap_and_records_ram_start(tm
     run_continuous_research(
         ContinuousResearchConfig(
             experiment_name="exp",
-            games="tt01",
+            games="ft09",
             samplers="mixed",
             seeds="0",
             steps_per_epoch=5000,
@@ -1181,7 +1181,7 @@ def test_continuous_run_uses_configured_initial_workers(tmp_path: Path, monkeypa
     run_continuous_research(
         ContinuousResearchConfig(
             experiment_name="exp",
-            games="tt01",
+            games="ft09",
             samplers="mixed",
             seeds="0",
             steps_per_epoch=5000,
@@ -1210,7 +1210,7 @@ def test_disk_stop_triggers_and_default_is_90(tmp_path: Path, monkeypatch) -> No
     manifest = run_continuous_research(
         ContinuousResearchConfig(
             experiment_name="exp",
-            games="tt01",
+            games="ft09",
             samplers="mixed",
             seeds="0",
             steps_per_epoch=5000,
@@ -1235,7 +1235,7 @@ def test_resume_true_fails_if_memory_files_missing(tmp_path: Path, monkeypatch) 
     run_continuous_research(
         ContinuousResearchConfig(
             experiment_name="exp",
-            games="tt01",
+            games="ft09",
             samplers="mixed",
             seeds="0",
             steps_per_epoch=5000,
@@ -1250,7 +1250,7 @@ def test_resume_true_fails_if_memory_files_missing(tmp_path: Path, monkeypatch) 
         run_continuous_research(
             ContinuousResearchConfig(
                 experiment_name="exp",
-                games="tt01",
+                games="ft09",
                 samplers="mixed",
                 seeds="0",
                 steps_per_epoch=5000,

@@ -23,6 +23,14 @@ def _missing_tables(
     return [name for name in required if name not in tables]
 
 
+
+def _complete_game_key(value: object) -> bool:
+    if value in (None, ""):
+        return False
+    text = str(value).strip().lower()
+    return bool(text) and text not in {"__none__", "none", "null", "unknown"} and not text.startswith("surrogate_game:")
+
+
 def _complete_context_key(value: object) -> bool:
     if value in (None, ""):
         return False
@@ -268,8 +276,8 @@ def evaluate_h09_future_option_motifs(
     verified_cross_game_observations = [
         row
         for row in verified_observations
-        if row.get("source_game_key") not in (None, "")
-        and row.get("target_game_key") not in (None, "")
+        if _complete_game_key(row.get("source_game_key"))
+        and _complete_game_key(row.get("target_game_key"))
         and str(row["source_game_key"])
         != str(row["target_game_key"])
         and int(row.get("source_game_is_surrogate") or 0) == 0
@@ -339,8 +347,8 @@ def evaluate_h09_future_option_motifs(
         ]
 
         has_verified_cross_game = any(
-            obs.get("source_game_key") not in (None, "")
-            and obs.get("target_game_key") not in (None, "")
+            _complete_game_key(obs.get("source_game_key"))
+            and _complete_game_key(obs.get("target_game_key"))
             and str(obs["source_game_key"])
             != str(obs["target_game_key"])
             and int(
