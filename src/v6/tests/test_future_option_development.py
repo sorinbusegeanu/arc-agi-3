@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -52,6 +53,29 @@ def test_auto_development_stage_follows_structural_maturity(tmp_path: Path) -> N
         assert resolve_future_option_development_stage(conn, requested_stage="auto") is FutureOptionDevelopmentStage.ROLE_DISCOVERY
         conn.execute("INSERT INTO concept_candidates (concept_signature, is_promoted) VALUES ('concept', 1)")
         conn.execute("INSERT INTO role_transfer_attempts (attempt_id, reuse_success) VALUES ('transfer', 1)")
+        assert resolve_future_option_development_stage(conn, requested_stage="auto") is FutureOptionDevelopmentStage.ROLE_DISCOVERY
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS concept_promotion_validation_diagnostics (
+                concept_signature TEXT,
+                payload_json TEXT
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO concept_promotion_validation_diagnostics (concept_signature, payload_json) VALUES (?, ?)",
+            (
+                "concept",
+                json.dumps(
+                    {
+                        "historically_promoted": True,
+                        "current_validation_passed": True,
+                        "validation_status": "passed",
+                        "demoted": False,
+                    }
+                ),
+            ),
+        )
         assert resolve_future_option_development_stage(conn, requested_stage="auto") is FutureOptionDevelopmentStage.CONCEPT_TRANSFER
 
 
