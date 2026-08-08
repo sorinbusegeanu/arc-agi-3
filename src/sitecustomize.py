@@ -42,3 +42,7 @@ _apply_remaining_report_repairs()
 from v6.final_runtime_repairs import apply_patch as _apply_final_runtime_repairs
 
 _apply_final_runtime_repairs()
+
+from v6.snapshot_schema_compat import apply_patch as _apply_snapshot_schema_compat
+
+_apply_snapshot_schema_compat()
