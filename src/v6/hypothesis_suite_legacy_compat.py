@@ -156,6 +156,8 @@ def install_compat(ns: dict[str, Any]) -> None:
             key = f"H{number:02d}"
             payload = results.get(key, {})
             decision = payload.get("decision") or payload.get("final_decision") or "INCONCLUSIVE"
+            if payload.get("raw_decision") == "SKIPPED_FAST_MODE":
+                decision = "SKIPPED_FAST_MODE"
             if memory_dir is None and number >= 4 and key not in legacy_results:
                 decision = "INCONCLUSIVE"
             summary[f"{key} decision"] = decision
@@ -175,6 +177,9 @@ def install_compat(ns: dict[str, Any]) -> None:
             if name.startswith("DERIVE."):
                 summary["derive_" + name[len("DERIVE."):]] = value
         summary.setdefault("suite_total_seconds", float((timings or {}).get("suite_total_seconds", 0.0)))
+        summary["memory_repair_ran_during_report"] = bool(
+            (derivation_summary or {}).get("memory_repair_ran_during_report", False)
+        )
         summary.setdefault("missing_evidence", [])
         return summary
 
@@ -310,10 +315,64 @@ def install_compat(ns: dict[str, Any]) -> None:
         lines.append(f"total_interactions: {summary.get('total_interactions', 0)}")
         return "\n".join(lines) + "\n"
 
+    def _suite_gate_status(payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "decision": payload.get("decision"),
+            "individual_decision_before_suite_gates": payload.get("individual_decision_before_suite_gates"),
+            "suite_gated_decision": payload.get("suite_gated_decision", payload.get("decision")),
+            "suite_gate_reasons": list(payload.get("suite_gate_reasons", []) or []),
+            "epoch_maturity_demoted": bool(payload.get("epoch_maturity_demoted", False)),
+            "dependency_demoted": bool(payload.get("dependency_demoted", False)),
+        }
+
+    def _format_text_compat(summary: dict[str, Any]) -> str:
+        gate_lines: list[str] = []
+        for number in range(4, 12):
+            payload = summary.get(f"H{number:02d} suite gating") or {}
+            individual = payload.get("individual_decision_before_suite_gates")
+            gated = payload.get("suite_gated_decision") or payload.get("decision")
+            if individual not in (None, gated):
+                gate_lines.extend([
+                    f"H{number:02d} individual: {individual}",
+                    f"H{number:02d} suite-gated: {gated}",
+                    f"H{number:02d} suite-gate reasons: {', '.join(payload.get('suite_gate_reasons') or [])}",
+                ])
+        lines = ["Hypothesis Suite Summary", f"source_run_dir: {summary.get('source_run_dir')}"]
+        for number in range(1, 13):
+            lines.append(f"H{number:02d}: {summary.get(f'H{number:02d} decision', 'INCONCLUSIVE')}")
+        lines.append(f"games: {summary.get('game_count', 0)} samplers: {summary.get('sampler_count', 0)} seeds: {summary.get('seed_count', 0)}")
+        lines.append(f"total_interactions: {summary.get('total_interactions', 0)}")
+        lines.extend(gate_lines)
+        if summary.get("next_recommended_action") is not None:
+            lines.append(f"next_recommended_action: {summary.get('next_recommended_action')}")
+        return "\n".join(lines) + "\n"
+
+    strict_run = ns["run_hypothesis_suite_report"]
+    def run_hypothesis_suite_report(**kwargs: Any) -> dict[str, Any]:
+        output_dir = Path(kwargs["output_dir"])
+        output_dir.mkdir(parents=True, exist_ok=True)
+        enabled = bool(kwargs.get("hypothesis_progress", True))
+        bar = ns["tqdm"](total=1, desc="hypothesis suite", unit="suite", dynamic_ncols=True, leave=False, disable=not enabled)
+        started = __import__("time").time()
+        ns["log_hypothesis_progress"](output_dir, "SUITE", "starting", epoch_id=kwargs.get("epoch_id"), current=0, total=1)
+        try:
+            result = strict_run(**kwargs)
+        except BaseException as exc:
+            ns["log_hypothesis_progress"](output_dir, "SUITE", "failed", epoch_id=kwargs.get("epoch_id"), current=0, total=1, start_time=started, extra={"exception_type": type(exc).__name__, "exception_message": str(exc)})
+            raise
+        else:
+            bar.update(1)
+            ns["log_hypothesis_progress"](output_dir, "SUITE", "done", epoch_id=kwargs.get("epoch_id"), current=1, total=1, start_time=started)
+            return result
+        finally:
+            bar.close()
+
     ns["build_hypothesis_suite_summary"] = build_hypothesis_suite_summary
+    ns["run_hypothesis_suite_report"] = run_hypothesis_suite_report
     ns["_apply_higher_order_dependency_gates"] = _apply_higher_order_dependency_gates
     ns["_apply_epoch_maturity_gates"] = _apply_epoch_maturity_gates
     ns["_blocker_flags_for_result"] = _blocker_flags_for_result
     ns["_write_aggregated_hypothesis_text"] = _write_aggregated_hypothesis_text
     ns["_format_aggregated_result_section"] = _format_section
-    ns["_format_text"] = _format_text
+    ns["_suite_gate_status"] = _suite_gate_status
+    ns["_format_text"] = _format_text_compat

@@ -2132,11 +2132,12 @@ def _validate_incremental_promotions(
                 validation_result=validation_status,
             )
             retained_from_valid_history = bool(
-                historically_promoted
-                and legacy_promoted
-                and str(row["persistent_validation_status"] or "") not in {"failed", "demoted", "invalid"}
-                and failure_count < int(config.demotion_failure_limit)
+                legacy_promoted
                 and not demoted_this_validation
+                and (
+                    not comparable_failure
+                    or failure_count < int(config.demotion_failure_limit)
+                )
             )
             promoted = bool(promoted_by_validation or retained_from_valid_history)
             validation_penalty = 0.0
