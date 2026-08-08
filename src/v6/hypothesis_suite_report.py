@@ -1314,3 +1314,16 @@ def _write_suite_summary(
 
 from v6.hypothesis_suite_legacy_compat import install_compat as _install_hypothesis_suite_compat
 _install_hypothesis_suite_compat(globals())
+
+# v6.3 canonical temporal summary
+_build_hypothesis_suite_summary_base = build_hypothesis_suite_summary
+
+def build_hypothesis_suite_summary(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    from v6.v63_report_repairs import _strict_temporal_summary
+    summary = _build_hypothesis_suite_summary_base(*args, **kwargs)
+    run_dir = kwargs.get("run_dir")
+    if run_dir is not None:
+        strict = _strict_temporal_summary(run_dir)
+        if strict is not None:
+  summary["temporal_order_diagnostics"] = strict
+    return summary

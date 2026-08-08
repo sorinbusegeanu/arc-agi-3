@@ -1004,3 +1004,130 @@ def install_v63_report_repairs() -> None:
     _patch_future_option_concept_semantics()
     _patch_h07()
     _patch_suite_summary()
+
+
+# Canonical call points: pure helpers, no module patching.
+def normalize_h01_result(result: dict[str, Any]) -> dict[str, Any]:
+    stable = result.get("stable_contingency_count")
+    if stable is not None:
+        _repair_core_metrics(
+  result,
+  {
+      "stable_contingencies_count": int(stable),
+      "discovered_contingencies_count": int(
+          result.get("discovered_contingency_count")
+          or result.get("contingency_candidate_count")
+          or 0
+      ),
+  },
+        )
+    return result
+
+
+def normalize_h02_result(result: dict[str, Any]) -> dict[str, Any]:
+    if result.get("context_contradiction_count") is not None:
+        _repair_core_metrics(
+  result,
+  {
+      "context_contradiction_tagged_interaction_count": int(
+          result.get("context_contradiction_count") or 0
+      )
+  },
+        )
+    return result
+
+
+def normalize_h03_result(result: dict[str, Any], memory_dir: Any) -> dict[str, Any]:
+    updates: dict[str, Any] = {}
+    if memory_dir is not None:
+        for field, scope, legacy_field in (
+  ("family_cross_game_count", "game", "family_cross_game_membership_count"),
+  ("family_cross_sampler_count", "sampler", "family_cross_sampler_membership_count"),
+        ):
+  actual = _distinct_family_scope_count(memory_dir, scope)
+  if actual is not None:
+      if result.get(field) is not None:
+          updates[legacy_field] = result.get(field)
+      updates[field] = actual
+    if updates:
+        _repair_core_metrics(result, updates)
+    return result
+
+
+def normalize_h04_result(result: dict[str, Any]) -> dict[str, Any]:
+    strict = _strict_before(
+        result.get("first_stable_transformation_family_step"),
+        result.get("first_emergent_carrier_step"),
+    )
+    strict_usable = _strict_before(
+        result.get("first_stable_transformation_family_step"),
+        result.get("first_usable_emergent_carrier_step"),
+    )
+    _repair_core_metrics(
+        result,
+        {
+  "h03_before_h04": strict,
+  "h03_before_h04_usable": strict_usable,
+  "temporal_order_comparison": "strict_before",
+        },
+    )
+    if strict_usable is False:
+        message = (
+  "Strict H03-before-H04 temporal order is not demonstrated; "
+  "equal timestamps do not establish developmental precedence."
+        )
+        if str(result.get("carrier_timing_source")) == "real_evidence":
+  result["decision"] = "INVALID"
+        elif str(result.get("decision")) == "VALID":
+  result["decision"] = "PARTIALLY_VALID"
+        _add_missing(result, message)
+    return result
+
+
+def normalize_h05_result(result: dict[str, Any]) -> dict[str, Any]:
+    strict = _strict_before(
+        result.get("first_emergent_carrier_step"),
+        result.get("first_emergent_role_step"),
+    )
+    _repair_core_metrics(
+        result,
+        {
+  "h04_before_h05": strict,
+  "h04_before_h05_cases": 1 if strict is True else 0,
+  "temporal_order_comparison": "strict_before",
+        },
+    )
+    if strict is False:
+        message = (
+  "Strict H04-before-H05 temporal order is not demonstrated; "
+  "equal timestamps do not establish developmental precedence."
+        )
+        if str(result.get("role_timing_source")) == "real_evidence":
+  result["decision"] = "INVALID"
+        elif str(result.get("decision")) == "VALID":
+  result["decision"] = "PARTIALLY_VALID"
+        _add_missing(result, message)
+    return result
+
+
+def normalize_h07_result(result: dict[str, Any]) -> dict[str, Any]:
+    validation = result.get("incremental_promotion_validation")
+    candidates = list(validation.get("candidates") or []) if isinstance(validation, dict) else []
+    if candidates:
+        current = [item for item in candidates if bool(item.get("current_validation_passed"))]
+        historical = [item for item in candidates if bool(item.get("historically_promoted"))]
+        updates = {
+  "current_validated_promoted_concept_count": len(current),
+  "promoted_concept_count": len(current),
+  "historical_promoted_concept_count": len(historical),
+  "promoted_cross_game_count": sum(
+      1 for item in current if int(item.get("cross_game_evidence_count") or 0) >= 1
+  ),
+  "promoted_cross_context_count": sum(
+      1 for item in current if int(item.get("cross_context_evidence_count") or 0) >= 1
+  ),
+        }
+        if not current:
+  updates["first_promoted_concept_step"] = None
+        _repair_core_metrics(result, updates)
+    return result

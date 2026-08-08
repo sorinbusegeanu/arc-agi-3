@@ -186,6 +186,19 @@ def apply_decision_envelope(
 ) -> dict[str, Any]:
     contract = get_contract(hypothesis_id)
     updated = dict(result)
+    coverage_source = "report"
+    if updated.get("evidence_coverage_ratio") is None:
+        record = dict((provenance or {}).get("by_hypothesis", {}).get(hypothesis_id, {}) or {})
+        verified = int(record.get("verified_claim_count", 0) or 0)
+        proxy = int(record.get("proxy_claim_count", 0) or 0)
+        legacy = int(record.get("legacy_claim_count", 0) or 0)
+        invalid = int(record.get("invalid_claim_count", 0) or 0)
+        missing = int(record.get("missing_provenance_count", 0) or 0)
+        total = verified + proxy + legacy + invalid + missing
+        if total > 0:
+            updated["evidence_coverage_ratio"] = float(verified) / float(total)
+            updated["evidence_coverage_source"] = "provenance_claims"
+            coverage_source = "provenance_claims"
     raw_decision = _normalize_raw_decision(updated.get("decision"))
     contract_check = validate_contract(
         contract,
@@ -303,6 +316,7 @@ def apply_decision_envelope(
                 "reasons": quality_reasons,
                 "minimum_coverage": contract.minimum_coverage,
                 "actual_coverage": coverage,
+                "coverage_source": updated.get("evidence_coverage_source", coverage_source),
                 **proxy_summary,
             },
             "dependency_gate": {

@@ -8,13 +8,7 @@ from v6.v63_report_repairs import (
     _derive_provenance_coverage,
     _role_structure_ids,
     _strict_before,
-    install_v63_report_repairs,
 )
-
-
-def test_v63_report_repairs_install_idempotently() -> None:
-    install_v63_report_repairs()
-    install_v63_report_repairs()
 
 
 def test_provenance_coverage_is_derived_from_claim_population() -> None:

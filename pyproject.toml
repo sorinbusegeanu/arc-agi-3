@@ -6,4 +6,17 @@ build-backend = "setuptools.build_meta"
 name = "arc-agi-v6"
 version = "0.1.0"
 description = "AGI v6 - Agent General Intelligence System"
-requires-python = ">=3.8"
+requires-python = ">=3.12"
+dependencies = [
+    "arc-agi>=0.9.9,<1.0",
+    "duckdb>=1.0",
+    "networkx>=3.0",
+    "numpy>=1.26",
+    "pandas>=2.0",
+    "pyarrow>=15.0",
+    "scikit-learn>=1.4",
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]

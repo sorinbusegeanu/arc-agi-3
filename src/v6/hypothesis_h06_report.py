@@ -31,8 +31,8 @@ def evaluate_h06_role_transfer(
     already_derived: bool = False,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    ensure_memory_layout(memory_dir)
     if not already_derived:
+        ensure_memory_layout(memory_dir)
         derive_higher_order_memory(memory_dir=memory_dir, run_dir=run_dir)
     current_state = Path(memory_dir) / "current_state.sqlite"
     if not current_state.exists():
