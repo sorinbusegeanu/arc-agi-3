@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 from v6.memory.migrations.v621 import migrate_connection as migrate_v621_connection
+from v6.memory.v63_transfer import install_v63_transfer_policy
 
 SCHEMA_VERSION = "v6.3"
 
@@ -40,6 +41,7 @@ def _ensure_column(
 
 
 def migrate_connection(connection: sqlite3.Connection) -> dict[str, object]:
+    install_v63_transfer_policy()
     connection.execute(
         "CREATE TABLE IF NOT EXISTS memory_versions (key TEXT PRIMARY KEY, value TEXT)"
     )
