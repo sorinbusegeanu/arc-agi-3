@@ -21,7 +21,29 @@ def _ensure_column(connection: sqlite3.Connection, table: str, name: str, declar
         connection.execute(f'ALTER TABLE "{table}" ADD COLUMN "{name}" {declaration}')
 
 
+def _version_tuple(value: str | None) -> tuple[int, ...]:
+    if not value:
+        return ()
+    text = str(value).strip().lower().lstrip("v")
+    try:
+        return tuple(int(part) for part in text.split("."))
+    except ValueError:
+        return ()
+
+
+def _schema_version_before(connection: sqlite3.Connection) -> str | None:
+    if connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_versions'"
+    ).fetchone() is None:
+        return None
+    row = connection.execute(
+        "SELECT value FROM memory_versions WHERE key='memory_substrate_schema'"
+    ).fetchone()
+    return None if row is None or row[0] is None else str(row[0])
+
+
 def migrate_connection(connection: sqlite3.Connection) -> dict[str, object]:
+    existing_schema_version = _schema_version_before(connection)
     # This migration must be safe on a brand-new compact-memory database.
     # MemorySubstrate normally creates memory_versions first, but compact-memory
     # initialization may invoke migrations before MemorySubstrate is constructed.
@@ -69,16 +91,21 @@ def migrate_connection(connection: sqlite3.Connection) -> dict[str, object]:
             "policy_version": "TEXT",
         }.items():
             _ensure_column(connection, "memory_promotions", name, declaration)
+    effective_version = (
+        existing_schema_version
+        if _version_tuple(existing_schema_version) > _version_tuple(SCHEMA_VERSION)
+        else SCHEMA_VERSION
+    )
     connection.execute(
         """
         INSERT INTO memory_versions(key, value)
         VALUES ('memory_substrate_schema', ?)
         ON CONFLICT(key) DO UPDATE SET value=excluded.value
         """,
-        (SCHEMA_VERSION,),
+        (effective_version,),
     )
     connection.commit()
-    return {"schema_version": SCHEMA_VERSION, "migration_applied": True}
+    return {"schema_version": effective_version, "migration_applied": True}
 
 
 def migrate_memory_dir(memory_dir: str | Path) -> dict[str, object]:
