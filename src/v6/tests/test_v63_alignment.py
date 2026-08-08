@@ -37,7 +37,8 @@ def test_v63_prediction_error_is_inactive_without_supported_expectation() -> Non
     assert score.prediction_error == 0.0
     assert score.component_active is not None
     assert score.component_active["prediction_error"] is False
-    assert score.version == "isf_v63"
+    assert score.version == "isf_v02"
+    assert score.policy_version == "isf_v63"
 
 
 def test_v63_transfer_prior_requires_cross_context_reuse() -> None:
