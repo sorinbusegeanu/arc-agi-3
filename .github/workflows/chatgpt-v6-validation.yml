@@ -20,6 +20,22 @@ jobs:
           python-version: '3.12'
       - name: Install dependencies
         run: python -m pip install --upgrade pip pytest numpy networkx tqdm pandas scikit-learn pyarrow duckdb 'arc-agi>=0.9.1'
+      - name: Repair diagnostics
+        env:
+          PYTHONPATH: src
+        run: |
+          python - <<'PY'
+          import v6.future_options as f
+          import v6.higher_order_substrate as h
+          import v6.hypothesis_h09_report as h09
+          import v6.hypothesis_suite_report as suite
+          print('future_events', f.derive_future_option_events.__module__, f.derive_future_option_events.__qualname__)
+          print('future_motifs', f.derive_future_option_motifs.__module__, f.derive_future_option_motifs.__qualname__)
+          print('promotion', h.validate_incremental_promotions_only.__module__, h.validate_incremental_promotions_only.__qualname__)
+          print('h09', h09.evaluate_h09_future_option_motifs.__module__, h09.evaluate_h09_future_option_motifs.__qualname__)
+          print('suite_eval_one', suite._evaluate_one.__module__, suite._evaluate_one.__qualname__)
+          print('suite_run', suite.run_hypothesis_suite_report.__module__, suite.run_hypothesis_suite_report.__qualname__)
+          PY
       - name: Focused repaired tests
         env:
           PYTHONPATH: src
