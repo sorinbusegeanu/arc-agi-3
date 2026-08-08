@@ -164,6 +164,8 @@ def install_compat(ns: dict[str, Any]) -> None:
                 decision = "SKIPPED_FAST_MODE"
             if payload.get("raw_decision") == "SKIPPED_FAST_MODE":
                 decision = "SKIPPED_FAST_MODE"
+            if payload.get("raw_decision") == "SKIPPED_FAST_MODE":
+                decision = "SKIPPED_FAST_MODE"
             if memory_dir is None and number >= 4 and key not in legacy_results:
                 decision = "INCONCLUSIVE"
             summary[f"{key} decision"] = decision
