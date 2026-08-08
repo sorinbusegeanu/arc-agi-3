@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import time
 from typing import Any
 
@@ -32,6 +33,7 @@ def install_v63_transfer_policy() -> None:
     global _ORIGINAL_RECORD_PREDICTION_OUTCOME
     global _ORIGINAL_CONCEPT_TRANSFER_COUNTS
     if _PATCHED:
+        _patch_v6_system_if_loaded()
         return
 
     from v6.memory.v621_runtime import (
@@ -56,6 +58,276 @@ def install_v63_transfer_policy() -> None:
         _concept_transfer_counts_v63
     )
     _PATCHED = True
+    _patch_v6_system_if_loaded()
+
+
+def _patch_v6_system_if_loaded() -> None:
+    module = sys.modules.get("v6.main")
+    system_type = None if module is None else getattr(module, "V6System", None)
+    if system_type is None:
+        return
+    system_type._initial_retention_score = _initial_retention_score_v63
+    system_type._apply_trajectory_efficiency_bonus = (
+        _apply_trajectory_efficiency_bonus_v63
+    )
+
+
+def _initial_retention_score_v63(
+    self: Any,
+    *,
+    isf_total: float,
+    replay_priority: float,
+    explanatory_reach: float,
+    transfer_potential: float,
+    recurrence: float,
+    future_option_impact: float,
+    efficiency_bonus: float = 0.0,
+) -> float:
+    from v6.memory.v63_policy import unified_memory_fitness
+
+    # Replay is an output of fitness, not an input back into retention.
+    # Future-option impact is already represented through ISF and is not
+    # counted a second time here.
+    del replay_priority, future_option_impact
+    score, _components = unified_memory_fitness(
+        isf_score=float(isf_total),
+        explanatory_reach=(
+            float(explanatory_reach)
+            if float(explanatory_reach) > 0.0
+            else None
+        ),
+        transfer_prior=(
+            float(transfer_potential)
+            if float(transfer_potential) > 0.0
+            else None
+        ),
+        transfer_empirical=None,
+        recurrence_score=(
+            float(recurrence) if float(recurrence) > 0.0 else None
+        ),
+        efficiency_score=(
+            float(efficiency_bonus)
+            if float(efficiency_bonus) > 0.0
+            else None
+        ),
+    )
+    return score
+
+
+def _apply_trajectory_efficiency_bonus_v63(
+    self: Any,
+    *,
+    trajectory_record: Any,
+    interaction_ids: list[int],
+) -> None:
+    from v6.memory.substrate import MemoryScore, trajectory_node_id
+    from v6.memory.v63_policy import SCORE_POLICY_VERSION, unified_memory_fitness
+    from v6.memory_lifecycle import ReplayCandidate
+
+    efficiency_active = bool(trajectory_record.efficiency_active)
+    memory_bonus = float(
+        trajectory_record.efficiency_memory_bonus
+        if efficiency_active
+        else 0.0
+    )
+    replay_bonus = float(
+        trajectory_record.efficiency_replay_bonus
+        if efficiency_active
+        else 0.0
+    )
+    retention_bonus = float(
+        trajectory_record.efficiency_retention_bonus
+        if efficiency_active
+        else 0.0
+    )
+    promotion_bonus = float(
+        trajectory_record.efficiency_promotion_bonus
+        if efficiency_active
+        else 0.0
+    )
+    useful_outcome = bool(
+        str(trajectory_record.outcome_class) in {"WIN", "LEVEL_COMPLETE"}
+        or float(trajectory_record.future_option_gain or 0.0) > 0.0
+    )
+    efficiency_score = (
+        None
+        if not efficiency_active
+        or not useful_outcome
+        or trajectory_record.efficiency_score is None
+        else float(trajectory_record.efficiency_score)
+    )
+
+    for interaction_id in interaction_ids:
+        row = self.connection.execute(
+            """
+            SELECT memory_fitness_base,
+                   memory_replay_priority_base,
+                   memory_replay_priority,
+                   memory_status
+            FROM interactions
+            WHERE id = ?
+            """,
+            (int(interaction_id),),
+        ).fetchone()
+        base_fitness = float(
+            (row[0] if row and row[0] is not None else 0.0) or 0.0
+        )
+        base_replay = float(
+            (row[1] if row and row[1] is not None else 0.0) or 0.0
+        )
+        current_replay = float(
+            (row[2] if row and row[2] is not None else base_replay)
+            or base_replay
+        )
+
+        memory_fitness, components = unified_memory_fitness(
+            isf_score=base_fitness,
+            explanatory_reach=None,
+            transfer_prior=None,
+            transfer_empirical=None,
+            recurrence_score=None,
+            efficiency_score=efficiency_score,
+        )
+        if efficiency_score is None:
+            memory_fitness = base_fitness
+        replay_priority = max(current_replay, base_replay, memory_fitness)
+        retention_score_base = base_fitness
+        retention_score = memory_fitness
+
+        self.connection.execute(
+            """
+            UPDATE interactions
+            SET
+                trajectory_efficiency_active = ?,
+                trajectory_outcome_class = ?,
+                comparable_outcome_group_id = ?,
+                trajectory_efficiency_score = ?,
+                efficiency_memory_bonus = ?,
+                efficiency_replay_bonus = ?,
+                efficiency_retention_bonus = ?,
+                efficiency_promotion_bonus = ?,
+                memory_fitness = ?,
+                memory_replay_priority = MAX(COALESCE(memory_replay_priority, 0.0), ?),
+                retention_score_base = ?,
+                retention_score = ?
+            WHERE id = ?
+            """,
+            (
+                int(efficiency_active),
+                str(trajectory_record.outcome_class),
+                str(trajectory_record.comparable_outcome_group_id),
+                None
+                if trajectory_record.efficiency_score is None
+                else float(trajectory_record.efficiency_score),
+                memory_bonus,
+                replay_bonus,
+                retention_bonus,
+                promotion_bonus,
+                float(memory_fitness),
+                float(replay_priority),
+                float(retention_score_base),
+                float(retention_score),
+                int(interaction_id),
+            ),
+        )
+        self.connection.execute(
+            """
+            UPDATE prediction_results
+            SET
+                trajectory_efficiency_active = ?,
+                trajectory_outcome_class = ?,
+                comparable_outcome_group_id = ?,
+                trajectory_efficiency_score = ?,
+                efficiency_memory_bonus = ?,
+                efficiency_replay_bonus = ?,
+                efficiency_retention_bonus = ?,
+                efficiency_promotion_bonus = ?,
+                memory_fitness = ?,
+                memory_replay_priority = MAX(COALESCE(memory_replay_priority, 0.0), ?),
+                retention_score_base = ?,
+                retention_score = ?
+            WHERE interaction_id = ?
+            """,
+            (
+                int(efficiency_active),
+                str(trajectory_record.outcome_class),
+                str(trajectory_record.comparable_outcome_group_id),
+                None
+                if trajectory_record.efficiency_score is None
+                else float(trajectory_record.efficiency_score),
+                memory_bonus,
+                replay_bonus,
+                retention_bonus,
+                promotion_bonus,
+                float(memory_fitness),
+                float(replay_priority),
+                float(retention_score_base),
+                float(retention_score),
+                int(interaction_id),
+            ),
+        )
+
+        candidate = self.memory_controller.replay_candidates.get(
+            str(interaction_id)
+        )
+        if candidate is not None:
+            self.memory_controller.replay_candidates[str(interaction_id)] = (
+                ReplayCandidate(
+                    interaction_id=candidate.interaction_id,
+                    replay_priority=float(replay_priority),
+                    reason=str(candidate.reason),
+                    family_id=candidate.family_id,
+                    context_signature=candidate.context_signature,
+                    status=candidate.status,
+                )
+            )
+            self._sync_post_factum_replay_fields(int(interaction_id))
+
+        node_id = self._interaction_memory_node_id(interaction_id)
+        self.memory.upsert_score(
+            MemoryScore(
+                node_id=node_id,
+                replay_priority=float(replay_priority),
+                memory_state="active" if efficiency_active else None,
+                retention_score=float(retention_score),
+                forgetting_score=float(max(0.0, 1.0 - retention_score)),
+            ),
+            step=int(interaction_id),
+        )
+        self.memory.connection.execute(
+            """
+            UPDATE memory_scores
+            SET memory_fitness=?,
+                efficiency_score=?,
+                score_components_json=?,
+                score_policy_version=?
+            WHERE node_id=?
+            """,
+            (
+                float(memory_fitness),
+                efficiency_score,
+                __import__("json").dumps(components, sort_keys=True),
+                SCORE_POLICY_VERSION,
+                node_id,
+            ),
+        )
+
+    trajectory_node = trajectory_node_id(self.episode_id)
+    attrs = {
+        "trajectory_efficiency_active": bool(efficiency_active),
+        "trajectory_efficiency_score": trajectory_record.efficiency_score,
+        "efficiency_memory_bonus": memory_bonus,
+        "efficiency_replay_bonus": replay_bonus,
+        "efficiency_retention_bonus": retention_bonus,
+        "efficiency_promotion_bonus": promotion_bonus,
+        "memory_fitness_policy": "v63_unified_memory_fitness_v1",
+    }
+    self.memory.update_node_support_and_attrs(
+        trajectory_node,
+        attrs,
+        support_increment=0,
+    )
+    self.memory.connection.commit()
 
 
 def _record_prediction_outcome_v63(
