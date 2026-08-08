@@ -2824,7 +2824,7 @@ def _safe_min(
 _concept_validation_records_base = _concept_validation_records
 
 def _concept_validation_records(state_conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
-    from v6.v63_report_repairs import _current_validation_records
+    from v6.v63_semantics import _current_validation_records
     previous = state_conn.row_factory
     state_conn.row_factory = sqlite3.Row
     try:

@@ -1150,7 +1150,7 @@ def _write_outputs(
 _evaluate_h07_concept_emergence_base = evaluate_h07_concept_emergence
 
 def evaluate_h07_concept_emergence(*args: Any, **kwargs: Any) -> dict:
-    from v6.v63_report_repairs import _rewrite_json, normalize_h07_result
+    from v6.v63_semantics import _rewrite_json, normalize_h07_result
     result = _evaluate_h07_concept_emergence_base(*args, **kwargs)
     normalize_h07_result(result)
     output_dir = kwargs.get("output_dir")

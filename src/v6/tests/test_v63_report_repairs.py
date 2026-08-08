@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 
-from v6.v63_report_repairs import (
+from v6.v63_semantics import (
     _current_validation_records,
     _derive_provenance_coverage,
     _role_structure_ids,

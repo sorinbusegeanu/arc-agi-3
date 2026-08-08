@@ -4955,6 +4955,6 @@ def _empty_transfer_summary() -> dict[str, Any]:
 _derive_concept_candidates_base = derive_concept_candidates
 
 def derive_concept_candidates(state_conn: sqlite3.Connection, progress_factory: Any | None = None) -> dict[str, Any]:
-    from v6.v63_report_repairs import _refine_broad_concept_candidates
+    from v6.v63_semantics import _refine_broad_concept_candidates
     summary = _derive_concept_candidates_base(state_conn, progress_factory=progress_factory)
     return _refine_broad_concept_candidates(state_conn, summary)

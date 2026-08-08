@@ -2419,7 +2419,7 @@ def _format_markdown_acceptance_checks(checks: dict[str, Any]) -> list[str]:
 _evaluate_h02_prediction_violation_attention_base = evaluate_h02_prediction_violation_attention
 
 def evaluate_h02_prediction_violation_attention(*args: Any, **kwargs: Any) -> dict:
-    from v6.v63_report_repairs import _rewrite_json, normalize_h02_result
+    from v6.v63_semantics import _rewrite_json, normalize_h02_result
     result = _evaluate_h02_prediction_violation_attention_base(*args, **kwargs)
     normalize_h02_result(result)
     output_dir = kwargs.get("output_dir")

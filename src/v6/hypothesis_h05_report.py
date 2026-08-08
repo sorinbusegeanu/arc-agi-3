@@ -285,7 +285,7 @@ def _write_outputs(output_dir: Path, result: dict[str, Any]) -> None:
 _evaluate_h05_role_emergence_base = evaluate_h05_role_emergence
 
 def evaluate_h05_role_emergence(*args: Any, **kwargs: Any) -> dict:
-    from v6.v63_report_repairs import _rewrite_json, normalize_h05_result
+    from v6.v63_semantics import _rewrite_json, normalize_h05_result
     result = _evaluate_h05_role_emergence_base(*args, **kwargs)
     normalize_h05_result(result)
     output_dir = kwargs.get("output_dir")
