@@ -99,7 +99,7 @@ def test_direct_fold_timing_is_emitted_once_after_post_fold_processing(tmp_path:
 
     run_interaction_sampling_v05c(
         InteractionSamplingConfig(
-            games=("tt01",), samplers=("random_baseline",), seeds=(0,),
+            games=("ft09",), samplers=("random_baseline",), seeds=(0,),
             steps=1, horizon=1, context_depth=1, output_dir=str(tmp_path / "out"),
         )
     )
@@ -254,15 +254,15 @@ def test_direct_streaming_fold_creates_no_temp_dirs_and_deletes_raw(tmp_path: Pa
 
     monkeypatch.setattr(
         "v6.memory.direct_streaming_fold.compute_sampling_job_metrics",
-        lambda *args, **kwargs: {"game": "tt01", "sampler_name": "random_baseline", "seed": 0, "steps": 5, "horizon": 2},
+        lambda *args, **kwargs: {"game": "ft09", "sampler_name": "random_baseline", "seed": 0, "steps": 5, "horizon": 2},
     )
     monkeypatch.setattr(
         "v6.memory.direct_streaming_fold.compute_sampling_job_temporal_milestones",
-        lambda *args, **kwargs: {"game": "tt01", "sampler": "random_baseline", "seed": 0},
+        lambda *args, **kwargs: {"game": "ft09", "sampler": "random_baseline", "seed": 0},
     )
     monkeypatch.setattr(
         "v6.memory.direct_streaming_fold.compute_sampling_job_validation_payload",
-        lambda *args, **kwargs: {"game": "tt01", "sampler_name": "random_baseline", "seed": 0, "examples": [{"contingency_id": 1, "contingency_key": [1, ["ctx"], 1, 1], "features": {"context_level": 1.0}, "label": "PRESERVE"}]},
+        lambda *args, **kwargs: {"game": "ft09", "sampler_name": "random_baseline", "seed": 0, "examples": [{"contingency_id": 1, "contingency_key": [1, ["ctx"], 1, 1], "features": {"context_level": 1.0}, "label": "PRESERVE"}]},
     )
     monkeypatch.setattr(
         "v6.memory.direct_streaming_fold.fold_single_sampling_db_into_main_compact_memory",
@@ -281,9 +281,9 @@ def test_direct_streaming_fold_creates_no_temp_dirs_and_deletes_raw(tmp_path: Pa
     writer.start()
     writer.submit(
         DirectStreamingFoldJob(
-            job_id="tt01:random_baseline:seed0:steps5",
+            job_id="ft09:random_baseline:seed0:steps5",
             db_path=str(db_path),
-            game="tt01",
+            game="ft09",
             sampler="random_baseline",
             seed=0,
             steps=5,
@@ -312,7 +312,7 @@ def test_direct_streaming_fold_creates_no_temp_dirs_and_deletes_raw(tmp_path: Pa
     assert not db_path.with_name("memory_replay_candidates.json").exists()
     assert not db_path.with_name("efficiency_summary.json").exists()
     with sqlite3.connect(memory_dir / "direct_streaming_fold_manifest.sqlite") as conn:
-        row = conn.execute("SELECT status, deleted_raw FROM folded_jobs WHERE job_id = ?", ("tt01:random_baseline:seed0:steps5",)).fetchone()
+        row = conn.execute("SELECT status, deleted_raw FROM folded_jobs WHERE job_id = ?", ("ft09:random_baseline:seed0:steps5",)).fetchone()
         validation_count = conn.execute("SELECT COUNT(*) FROM validation_payloads").fetchone()[0]
     assert row == ("folded", 1)
     assert validation_count == 1
@@ -332,15 +332,15 @@ def test_direct_streaming_fold_failure_keeps_raw(tmp_path: Path, monkeypatch) ->
 
     monkeypatch.setattr(
         "v6.memory.direct_streaming_fold.compute_sampling_job_metrics",
-        lambda *args, **kwargs: {"game": "tt01", "sampler_name": "random_baseline", "seed": 0, "steps": 5, "horizon": 2},
+        lambda *args, **kwargs: {"game": "ft09", "sampler_name": "random_baseline", "seed": 0, "steps": 5, "horizon": 2},
     )
     monkeypatch.setattr(
         "v6.memory.direct_streaming_fold.compute_sampling_job_temporal_milestones",
-        lambda *args, **kwargs: {"game": "tt01", "sampler": "random_baseline", "seed": 0},
+        lambda *args, **kwargs: {"game": "ft09", "sampler": "random_baseline", "seed": 0},
     )
     monkeypatch.setattr(
         "v6.memory.direct_streaming_fold.compute_sampling_job_validation_payload",
-        lambda *args, **kwargs: {"game": "tt01", "sampler_name": "random_baseline", "seed": 0, "examples": []},
+        lambda *args, **kwargs: {"game": "ft09", "sampler_name": "random_baseline", "seed": 0, "examples": []},
     )
 
     def _boom(*args, **kwargs):
@@ -357,9 +357,9 @@ def test_direct_streaming_fold_failure_keeps_raw(tmp_path: Path, monkeypatch) ->
     writer.start()
     writer.submit(
         DirectStreamingFoldJob(
-            job_id="tt01:random_baseline:seed0:steps5",
+            job_id="ft09:random_baseline:seed0:steps5",
             db_path=str(db_path),
-            game="tt01",
+            game="ft09",
             sampler="random_baseline",
             seed=0,
             steps=5,
@@ -375,7 +375,7 @@ def test_direct_streaming_fold_failure_keeps_raw(tmp_path: Path, monkeypatch) ->
     assert summary["direct_streaming_fold_failed_count"] == 1
     assert db_path.exists()
     with sqlite3.connect(memory_dir / "direct_streaming_fold_manifest.sqlite") as conn:
-        row = conn.execute("SELECT status, deleted_raw, error FROM folded_jobs WHERE job_id = ?", ("tt01:random_baseline:seed0:steps5",)).fetchone()
+        row = conn.execute("SELECT status, deleted_raw, error FROM folded_jobs WHERE job_id = ?", ("ft09:random_baseline:seed0:steps5",)).fetchone()
     assert row[0] == "failed"
     assert row[1] == 0
     assert "broken fold" in str(row[2])
@@ -388,15 +388,15 @@ def test_direct_streaming_merge_failure_keeps_raw_and_job_shard(tmp_path: Path, 
 
     monkeypatch.setattr(
         "v6.memory.direct_streaming_fold.compute_sampling_job_metrics",
-        lambda *args, **kwargs: {"game": "tt01", "sampler_name": "random_baseline", "seed": 0, "steps": 5, "horizon": 2},
+        lambda *args, **kwargs: {"game": "ft09", "sampler_name": "random_baseline", "seed": 0, "steps": 5, "horizon": 2},
     )
     monkeypatch.setattr(
         "v6.memory.direct_streaming_fold.compute_sampling_job_temporal_milestones",
-        lambda *args, **kwargs: {"game": "tt01", "sampler": "random_baseline", "seed": 0},
+        lambda *args, **kwargs: {"game": "ft09", "sampler": "random_baseline", "seed": 0},
     )
     monkeypatch.setattr(
         "v6.memory.direct_streaming_fold.compute_sampling_job_validation_payload",
-        lambda *args, **kwargs: {"game": "tt01", "sampler_name": "random_baseline", "seed": 0, "examples": []},
+        lambda *args, **kwargs: {"game": "ft09", "sampler_name": "random_baseline", "seed": 0, "examples": []},
     )
     monkeypatch.setattr("v6.memory.direct_streaming_fold.fold_single_sampling_db_into_main_compact_memory", lambda *args, **kwargs: {"db_files_folded": 1})
     monkeypatch.setattr("v6.memory.direct_streaming_fold.merge_direct_fold_shards", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom merge")))
@@ -408,9 +408,9 @@ def test_direct_streaming_merge_failure_keeps_raw_and_job_shard(tmp_path: Path, 
     )
     writer.start()
     job = DirectStreamingFoldJob(
-        job_id="tt01:random_baseline:seed0:steps5",
+        job_id="ft09:random_baseline:seed0:steps5",
         db_path=str(db_path),
-        game="tt01",
+        game="ft09",
         sampler="random_baseline",
         seed=0,
         steps=5,
@@ -423,7 +423,7 @@ def test_direct_streaming_merge_failure_keeps_raw_and_job_shard(tmp_path: Path, 
     writer.submit(job)
     summary = writer.close()
 
-    job_shard = memory_dir / "direct_streaming_fold_shards" / "job_tt01_random_baseline_seed0_steps5"
+    job_shard = memory_dir / "direct_streaming_fold_shards" / "job_ft09_random_baseline_seed0_steps5"
     assert summary["direct_streaming_fold_failed_count"] == 1
     assert summary["direct_streaming_fold_success_count"] == 0
     assert db_path.exists()
@@ -442,13 +442,13 @@ def test_direct_streaming_merge_failure_keeps_raw_and_job_shard(tmp_path: Path, 
 def test_direct_streaming_fold_workers_cli_and_defaults() -> None:
     parser = build_parser()
     sampling_args = parser.parse_args(["interaction-sampling-v05c", "--direct-streaming-fold-workers", "4"])
-    continuous_args = parser.parse_args(["continuous-research-run", "--experiment-name", "x", "--games", "tt01", "--samplers", "random_baseline", "--seeds", "0", "--steps-per-epoch", "10", "--max-epochs", "1", "--horizon", "2", "--context-depth", "1", "--output-dir", "runs/tmp", "--direct-streaming-fold-workers", "4"])
+    continuous_args = parser.parse_args(["continuous-research-run", "--experiment-name", "x", "--games", "ft09", "--samplers", "random_baseline", "--seeds", "0", "--steps-per-epoch", "10", "--max-epochs", "1", "--horizon", "2", "--context-depth", "1", "--output-dir", "runs/tmp", "--direct-streaming-fold-workers", "4"])
     assert sampling_args.direct_streaming_fold_workers == 4
     assert continuous_args.direct_streaming_fold_workers == 4
     assert InteractionSamplingConfig().direct_streaming_fold_workers == 8
     assert ContinuousResearchConfig(
         experiment_name="x",
-        games="tt01",
+        games="ft09",
         samplers="random_baseline",
         seeds="0",
         steps_per_epoch=10,
@@ -473,7 +473,7 @@ def test_direct_streaming_fold_job_dict_includes_worker_count(tmp_path: Path) ->
     try:
         _generate_sampling_dbs(
         InteractionSamplingConfig(
-            games=("tt01",),
+            games=("ft09",),
             samplers=("random_baseline",),
             seeds=(0,),
             steps=5,
@@ -497,15 +497,15 @@ def test_bounded_shard_creation_and_summary(tmp_path: Path, monkeypatch) -> None
     _patch_writer_parallelism(monkeypatch)
     monkeypatch.setattr(
         "v6.memory.direct_streaming_fold.compute_sampling_job_metrics",
-        lambda *args, **kwargs: {"game": "tt01", "sampler_name": "random_baseline", "seed": 0, "steps": 5, "horizon": 2},
+        lambda *args, **kwargs: {"game": "ft09", "sampler_name": "random_baseline", "seed": 0, "steps": 5, "horizon": 2},
     )
     monkeypatch.setattr(
         "v6.memory.direct_streaming_fold.compute_sampling_job_temporal_milestones",
-        lambda *args, **kwargs: {"game": "tt01", "sampler": "random_baseline", "seed": 0},
+        lambda *args, **kwargs: {"game": "ft09", "sampler": "random_baseline", "seed": 0},
     )
     monkeypatch.setattr(
         "v6.memory.direct_streaming_fold.compute_sampling_job_validation_payload",
-        lambda *args, **kwargs: {"game": "tt01", "sampler_name": "random_baseline", "seed": 0, "examples": []},
+        lambda *args, **kwargs: {"game": "ft09", "sampler_name": "random_baseline", "seed": 0, "examples": []},
     )
     monkeypatch.setattr("v6.memory.direct_streaming_fold.fold_single_sampling_db_into_main_compact_memory", lambda *args, **kwargs: {"db_files_folded": 1})
     monkeypatch.setattr("v6.memory.direct_streaming_fold.merge_direct_fold_shards", lambda *args, **kwargs: {"merged": True})
@@ -521,9 +521,9 @@ def test_bounded_shard_creation_and_summary(tmp_path: Path, monkeypatch) -> None
         db_path = _make_fake_raw_job(raw_dir / f"job_{idx}", name=f"seed_{idx}.sqlite")
         writer.submit(
             DirectStreamingFoldJob(
-                job_id=f"tt01:random_baseline:seed{idx}:steps5",
+                job_id=f"ft09:random_baseline:seed{idx}:steps5",
                 db_path=str(db_path),
-                game="tt01",
+                game="ft09",
                 sampler="random_baseline",
                 seed=idx,
                 steps=5,
@@ -549,7 +549,7 @@ def test_direct_streaming_fold_preserves_validation(tmp_path: Path) -> None:
     memory_dir = output_dir / "memory"
     rows = run_interaction_sampling_v05c(
         InteractionSamplingConfig(
-            games=("tt01",),
+            games=("ft09",),
             samplers=("random_baseline",),
             seeds=(0, 1, 2),
             train_seeds=(0, 1),
@@ -581,7 +581,7 @@ def test_collect_only_parquet_exports_before_delete(tmp_path: Path) -> None:
     parquet_root = tmp_path / "parquet"
     rows = run_interaction_sampling_v05c(
         InteractionSamplingConfig(
-            games=("tt01",),
+            games=("ft09",),
             samplers=("random_baseline",),
             seeds=(0,),
             train_seeds=(0,),
@@ -615,15 +615,15 @@ def test_direct_streaming_fold_finalizes_once(tmp_path: Path, monkeypatch) -> No
 
     monkeypatch.setattr(
         "v6.memory.direct_streaming_fold.compute_sampling_job_metrics",
-        lambda *args, **kwargs: {"game": "tt01", "sampler_name": "random_baseline", "seed": 0, "steps": 5, "horizon": 2},
+        lambda *args, **kwargs: {"game": "ft09", "sampler_name": "random_baseline", "seed": 0, "steps": 5, "horizon": 2},
     )
     monkeypatch.setattr(
         "v6.memory.direct_streaming_fold.compute_sampling_job_temporal_milestones",
-        lambda *args, **kwargs: {"game": "tt01", "sampler": "random_baseline", "seed": 0},
+        lambda *args, **kwargs: {"game": "ft09", "sampler": "random_baseline", "seed": 0},
     )
     monkeypatch.setattr(
         "v6.memory.direct_streaming_fold.compute_sampling_job_validation_payload",
-        lambda *args, **kwargs: {"game": "tt01", "sampler_name": "random_baseline", "seed": 0, "examples": []},
+        lambda *args, **kwargs: {"game": "ft09", "sampler_name": "random_baseline", "seed": 0, "examples": []},
     )
 
     _patch_writer_parallelism(monkeypatch)
@@ -652,9 +652,9 @@ def test_direct_streaming_fold_finalizes_once(tmp_path: Path, monkeypatch) -> No
     for idx, db_path in enumerate((db_path_a, db_path_b)):
         writer.submit(
             DirectStreamingFoldJob(
-                job_id=f"tt01:random_baseline:seed{idx}:steps5",
+                job_id=f"ft09:random_baseline:seed{idx}:steps5",
                 db_path=str(db_path),
-                game="tt01",
+                game="ft09",
                 sampler="random_baseline",
                 seed=idx,
                 steps=5,
@@ -674,7 +674,7 @@ def test_direct_streaming_fold_finalizes_once(tmp_path: Path, monkeypatch) -> No
 
 def test_fold_memory_substrate_false_skips_substrate_tables(tmp_path: Path) -> None:
     raw_db = _make_minimal_sqlite_with_memory_substrate(
-        tmp_path / "sampling" / "tt01" / "random_baseline" / "seed_0.sqlite"
+        tmp_path / "sampling" / "ft09" / "random_baseline" / "seed_0.sqlite"
     )
     memory_dir = tmp_path / "memory"
     fold_single_sampling_db_into_main_compact_memory(
@@ -696,7 +696,7 @@ def test_fold_memory_substrate_false_skips_substrate_tables(tmp_path: Path) -> N
 
 def test_fold_graph_false_skips_graph_writes(tmp_path: Path) -> None:
     raw_db = _make_minimal_sqlite_with_prediction_results(
-        tmp_path / "sampling" / "tt01" / "random_baseline" / "seed_0.sqlite"
+        tmp_path / "sampling" / "ft09" / "random_baseline" / "seed_0.sqlite"
     )
     memory_dir = tmp_path / "memory"
     fold_single_sampling_db_into_main_compact_memory(
@@ -722,15 +722,15 @@ def test_checkpoint_interval_runs_after_batch_merges(tmp_path: Path, monkeypatch
 
     monkeypatch.setattr(
         "v6.memory.direct_streaming_fold.compute_sampling_job_metrics",
-        lambda *args, **kwargs: {"game": "tt01", "sampler_name": "random_baseline", "seed": 0, "steps": 5, "horizon": 2},
+        lambda *args, **kwargs: {"game": "ft09", "sampler_name": "random_baseline", "seed": 0, "steps": 5, "horizon": 2},
     )
     monkeypatch.setattr(
         "v6.memory.direct_streaming_fold.compute_sampling_job_temporal_milestones",
-        lambda *args, **kwargs: {"game": "tt01", "sampler": "random_baseline", "seed": 0},
+        lambda *args, **kwargs: {"game": "ft09", "sampler": "random_baseline", "seed": 0},
     )
     monkeypatch.setattr(
         "v6.memory.direct_streaming_fold.compute_sampling_job_validation_payload",
-        lambda *args, **kwargs: {"game": "tt01", "sampler_name": "random_baseline", "seed": 0, "examples": []},
+        lambda *args, **kwargs: {"game": "ft09", "sampler_name": "random_baseline", "seed": 0, "examples": []},
     )
     monkeypatch.setattr(
         "v6.memory.direct_streaming_fold.fold_single_sampling_db_into_main_compact_memory",
@@ -767,9 +767,9 @@ def test_checkpoint_interval_runs_after_batch_merges(tmp_path: Path, monkeypatch
         db_path = _make_fake_raw_job(tmp_path / f"raw_{index}")
         writer.submit(
             DirectStreamingFoldJob(
-                job_id=f"tt01:random_baseline:seed{index}:steps5",
+                job_id=f"ft09:random_baseline:seed{index}:steps5",
                 db_path=str(db_path),
-                game="tt01",
+                game="ft09",
                 sampler="random_baseline",
                 seed=index,
                 steps=5,
@@ -793,15 +793,15 @@ def test_direct_streaming_batch_merge_deletes_raw_only_after_successful_batch_me
     _patch_writer_parallelism(monkeypatch)
     monkeypatch.setattr(
         "v6.memory.direct_streaming_fold.compute_sampling_job_metrics",
-        lambda *args, **kwargs: {"game": "tt01", "sampler_name": "random_baseline", "seed": 0, "steps": 5, "horizon": 2},
+        lambda *args, **kwargs: {"game": "ft09", "sampler_name": "random_baseline", "seed": 0, "steps": 5, "horizon": 2},
     )
     monkeypatch.setattr(
         "v6.memory.direct_streaming_fold.compute_sampling_job_temporal_milestones",
-        lambda *args, **kwargs: {"game": "tt01", "sampler": "random_baseline", "seed": 0},
+        lambda *args, **kwargs: {"game": "ft09", "sampler": "random_baseline", "seed": 0},
     )
     monkeypatch.setattr(
         "v6.memory.direct_streaming_fold.compute_sampling_job_validation_payload",
-        lambda *args, **kwargs: {"game": "tt01", "sampler_name": "random_baseline", "seed": 0, "examples": []},
+        lambda *args, **kwargs: {"game": "ft09", "sampler_name": "random_baseline", "seed": 0, "examples": []},
     )
     monkeypatch.setattr("v6.memory.direct_streaming_fold.fold_single_sampling_db_into_main_compact_memory", lambda *args, **kwargs: {"db_files_folded": 1})
     seen_raw_during_merge: list[bool] = []
@@ -823,9 +823,9 @@ def test_direct_streaming_batch_merge_deletes_raw_only_after_successful_batch_me
     for idx, db_path in enumerate((db_path_a, db_path_b)):
         writer.submit(
             DirectStreamingFoldJob(
-                job_id=f"tt01:random_baseline:seed{idx}:steps5",
+                job_id=f"ft09:random_baseline:seed{idx}:steps5",
                 db_path=str(db_path),
-                game="tt01",
+                game="ft09",
                 sampler="random_baseline",
                 seed=idx,
                 steps=5,
@@ -851,15 +851,15 @@ def test_direct_streaming_failed_batch_merge_keeps_raw_and_shards(tmp_path: Path
     _patch_writer_parallelism(monkeypatch)
     monkeypatch.setattr(
         "v6.memory.direct_streaming_fold.compute_sampling_job_metrics",
-        lambda *args, **kwargs: {"game": "tt01", "sampler_name": "random_baseline", "seed": 0, "steps": 5, "horizon": 2},
+        lambda *args, **kwargs: {"game": "ft09", "sampler_name": "random_baseline", "seed": 0, "steps": 5, "horizon": 2},
     )
     monkeypatch.setattr(
         "v6.memory.direct_streaming_fold.compute_sampling_job_temporal_milestones",
-        lambda *args, **kwargs: {"game": "tt01", "sampler": "random_baseline", "seed": 0},
+        lambda *args, **kwargs: {"game": "ft09", "sampler": "random_baseline", "seed": 0},
     )
     monkeypatch.setattr(
         "v6.memory.direct_streaming_fold.compute_sampling_job_validation_payload",
-        lambda *args, **kwargs: {"game": "tt01", "sampler_name": "random_baseline", "seed": 0, "examples": []},
+        lambda *args, **kwargs: {"game": "ft09", "sampler_name": "random_baseline", "seed": 0, "examples": []},
     )
     monkeypatch.setattr("v6.memory.direct_streaming_fold.fold_single_sampling_db_into_main_compact_memory", lambda *args, **kwargs: {"db_files_folded": 1})
     monkeypatch.setattr("v6.memory.direct_streaming_fold.merge_direct_fold_shards", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("batch fail")))
@@ -873,9 +873,9 @@ def test_direct_streaming_failed_batch_merge_keeps_raw_and_shards(tmp_path: Path
     for idx, db_path in enumerate((db_path_a, db_path_b)):
         writer.submit(
             DirectStreamingFoldJob(
-                job_id=f"tt01:random_baseline:seed{idx}:steps5",
+                job_id=f"ft09:random_baseline:seed{idx}:steps5",
                 db_path=str(db_path),
-                game="tt01",
+                game="ft09",
                 sampler="random_baseline",
                 seed=idx,
                 steps=5,
@@ -921,7 +921,7 @@ def test_retry_direct_streaming_fold_rebuilds_reports_after_success(tmp_path: Pa
     memory_dir = tmp_path / "memory"
     manifest_path = ensure_direct_streaming_fold_manifest(memory_dir)
     db_path = _make_fake_raw_job(
-        tmp_path / "epochs" / "epoch_0001" / "raw" / "sampling_v05c" / "tt01" / "random_baseline" / "steps_5",
+        tmp_path / "epochs" / "epoch_0001" / "raw" / "sampling_v05c" / "ft09" / "random_baseline" / "steps_5",
         "seed_0.sqlite",
     )
     with sqlite3.connect(manifest_path) as conn:
@@ -934,9 +934,9 @@ def test_retry_direct_streaming_fold_rebuilds_reports_after_success(tmp_path: Pa
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                "tt01:random_baseline:seed0:steps5",
+                "ft09:random_baseline:seed0:steps5",
                 str(db_path),
-                "tt01",
+                "ft09",
                 "random_baseline",
                 0,
                 5,
@@ -1015,9 +1015,9 @@ def test_direct_streaming_fold_start_removes_stale_shard_root_when_manifest_clea
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                "tt01:random_baseline:seed0:steps5",
+                "ft09:random_baseline:seed0:steps5",
                 str(tmp_path / "seed_0.sqlite"),
-                "tt01",
+                "ft09",
                 "random_baseline",
                 0,
                 5,
@@ -1130,7 +1130,7 @@ def test_sampling_pool_refills_before_direct_fold_submit(monkeypatch, tmp_path: 
 
     jobs = [
         {
-            "game": "tt01",
+            "game": "ft09",
             "sampler_name": "random_baseline",
             "seed": idx,
             "steps": 5,
@@ -1165,7 +1165,7 @@ def test_compact_sqlite_busy_timeout_wal(tmp_path: Path) -> None:
     memory_dir = output_dir / "memory"
     run_interaction_sampling_v05c(
         InteractionSamplingConfig(
-            games=("tt01",),
+            games=("ft09",),
             samplers=("random_baseline",),
             seeds=(0,),
             train_seeds=(0,),
@@ -1223,7 +1223,7 @@ def test_finalize_main_compact_memory_respects_example_caps(tmp_path: Path) -> N
                     f"example:{idx}",
                     "contingency",
                     "contingency:1",
-                    "tt01",
+                    "ft09",
                     "random_baseline",
                     0,
                     idx + 1,
@@ -1326,7 +1326,7 @@ def test_direct_streaming_replay_queue_payload_is_minimal(tmp_path: Path) -> Non
     memory_dir = output_dir / "memory"
     run_interaction_sampling_v05c(
         InteractionSamplingConfig(
-            games=("tt01",),
+            games=("ft09",),
             samplers=("random_baseline",),
             seeds=(0,),
             steps=30,
@@ -1378,7 +1378,7 @@ def test_continuous_run_skips_final_raw_fold(tmp_path: Path) -> None:
     manifest = run_continuous_research(
         ContinuousResearchConfig(
             experiment_name="direct_fold_smoke",
-            games="tt01",
+            games="ft09",
             samplers="random_baseline",
             seeds="0",
             steps_per_epoch=10,
@@ -1411,11 +1411,11 @@ def test_failed_validation_payload_keeps_raw(tmp_path: Path, monkeypatch) -> Non
 
     monkeypatch.setattr(
         "v6.memory.direct_streaming_fold.compute_sampling_job_metrics",
-        lambda *args, **kwargs: {"game": "tt01", "sampler_name": "random_baseline", "seed": 0, "steps": 5, "horizon": 2},
+        lambda *args, **kwargs: {"game": "ft09", "sampler_name": "random_baseline", "seed": 0, "steps": 5, "horizon": 2},
     )
     monkeypatch.setattr(
         "v6.memory.direct_streaming_fold.compute_sampling_job_temporal_milestones",
-        lambda *args, **kwargs: {"game": "tt01", "sampler": "random_baseline", "seed": 0},
+        lambda *args, **kwargs: {"game": "ft09", "sampler": "random_baseline", "seed": 0},
     )
 
     def _validation_boom(*args, **kwargs):
@@ -1430,9 +1430,9 @@ def test_failed_validation_payload_keeps_raw(tmp_path: Path, monkeypatch) -> Non
     writer.start()
     writer.submit(
         DirectStreamingFoldJob(
-            job_id="tt01:random_baseline:seed0:steps5",
+            job_id="ft09:random_baseline:seed0:steps5",
             db_path=str(db_path),
-            game="tt01",
+            game="ft09",
             sampler="random_baseline",
             seed=0,
             steps=5,
@@ -1463,15 +1463,15 @@ def test_retryable_locked_fold_is_retried_and_succeeds(tmp_path: Path, monkeypat
     monkeypatch.setattr("v6.memory.direct_streaming_fold.time.sleep", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         "v6.memory.direct_streaming_fold.compute_sampling_job_metrics",
-        lambda *args, **kwargs: {"game": "tt01", "sampler_name": "random_baseline", "seed": 0},
+        lambda *args, **kwargs: {"game": "ft09", "sampler_name": "random_baseline", "seed": 0},
     )
     monkeypatch.setattr(
         "v6.memory.direct_streaming_fold.compute_sampling_job_temporal_milestones",
-        lambda *args, **kwargs: {"game": "tt01", "sampler": "random_baseline", "seed": 0},
+        lambda *args, **kwargs: {"game": "ft09", "sampler": "random_baseline", "seed": 0},
     )
     monkeypatch.setattr(
         "v6.memory.direct_streaming_fold.compute_sampling_job_validation_payload",
-        lambda *args, **kwargs: {"game": "tt01", "sampler_name": "random_baseline", "seed": 0, "examples": []},
+        lambda *args, **kwargs: {"game": "ft09", "sampler_name": "random_baseline", "seed": 0, "examples": []},
     )
 
     def _fold(*args, **kwargs):
@@ -1483,9 +1483,9 @@ def test_retryable_locked_fold_is_retried_and_succeeds(tmp_path: Path, monkeypat
     monkeypatch.setattr("v6.memory.direct_streaming_fold.fold_single_sampling_db_into_main_compact_memory", _fold)
     result = fold_one_completed_job_to_shard(
         job=DirectStreamingFoldJob(
-            job_id="tt01:random_baseline:seed0:steps5",
+            job_id="ft09:random_baseline:seed0:steps5",
             db_path=str(db_path),
-            game="tt01",
+            game="ft09",
             sampler="random_baseline",
             seed=0,
             steps=5,
@@ -1510,15 +1510,15 @@ def test_retryable_locked_fold_exhausts_and_fails(tmp_path: Path, monkeypatch) -
     monkeypatch.setattr("v6.memory.direct_streaming_fold.time.sleep", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         "v6.memory.direct_streaming_fold.compute_sampling_job_metrics",
-        lambda *args, **kwargs: {"game": "tt01", "sampler_name": "random_baseline", "seed": 0},
+        lambda *args, **kwargs: {"game": "ft09", "sampler_name": "random_baseline", "seed": 0},
     )
     monkeypatch.setattr(
         "v6.memory.direct_streaming_fold.compute_sampling_job_temporal_milestones",
-        lambda *args, **kwargs: {"game": "tt01", "sampler": "random_baseline", "seed": 0},
+        lambda *args, **kwargs: {"game": "ft09", "sampler": "random_baseline", "seed": 0},
     )
     monkeypatch.setattr(
         "v6.memory.direct_streaming_fold.compute_sampling_job_validation_payload",
-        lambda *args, **kwargs: {"game": "tt01", "sampler_name": "random_baseline", "seed": 0, "examples": []},
+        lambda *args, **kwargs: {"game": "ft09", "sampler_name": "random_baseline", "seed": 0, "examples": []},
     )
 
     def _fold(*args, **kwargs):
@@ -1528,9 +1528,9 @@ def test_retryable_locked_fold_exhausts_and_fails(tmp_path: Path, monkeypatch) -
     monkeypatch.setattr("v6.memory.direct_streaming_fold.fold_single_sampling_db_into_main_compact_memory", _fold)
     result = fold_one_completed_job_to_shard(
         job=DirectStreamingFoldJob(
-            job_id="tt01:random_baseline:seed0:steps5",
+            job_id="ft09:random_baseline:seed0:steps5",
             db_path=str(db_path),
-            game="tt01",
+            game="ft09",
             sampler="random_baseline",
             seed=0,
             steps=5,
@@ -1555,15 +1555,15 @@ def test_non_retryable_fold_error_is_not_retried(tmp_path: Path, monkeypatch) ->
     monkeypatch.setattr("v6.memory.direct_streaming_fold.time.sleep", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         "v6.memory.direct_streaming_fold.compute_sampling_job_metrics",
-        lambda *args, **kwargs: {"game": "tt01", "sampler_name": "random_baseline", "seed": 0},
+        lambda *args, **kwargs: {"game": "ft09", "sampler_name": "random_baseline", "seed": 0},
     )
     monkeypatch.setattr(
         "v6.memory.direct_streaming_fold.compute_sampling_job_temporal_milestones",
-        lambda *args, **kwargs: {"game": "tt01", "sampler": "random_baseline", "seed": 0},
+        lambda *args, **kwargs: {"game": "ft09", "sampler": "random_baseline", "seed": 0},
     )
     monkeypatch.setattr(
         "v6.memory.direct_streaming_fold.compute_sampling_job_validation_payload",
-        lambda *args, **kwargs: {"game": "tt01", "sampler_name": "random_baseline", "seed": 0, "examples": []},
+        lambda *args, **kwargs: {"game": "ft09", "sampler_name": "random_baseline", "seed": 0, "examples": []},
     )
 
     def _fold(*args, **kwargs):
@@ -1573,9 +1573,9 @@ def test_non_retryable_fold_error_is_not_retried(tmp_path: Path, monkeypatch) ->
     monkeypatch.setattr("v6.memory.direct_streaming_fold.fold_single_sampling_db_into_main_compact_memory", _fold)
     result = fold_one_completed_job_to_shard(
         job=DirectStreamingFoldJob(
-            job_id="tt01:random_baseline:seed0:steps5",
+            job_id="ft09:random_baseline:seed0:steps5",
             db_path=str(db_path),
-            game="tt01",
+            game="ft09",
             sampler="random_baseline",
             seed=0,
             steps=5,

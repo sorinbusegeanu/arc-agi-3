@@ -23,6 +23,14 @@ def _missing_tables(
     return [name for name in required if name not in tables]
 
 
+
+def _complete_game_key(value: object) -> bool:
+    if value in (None, ""):
+        return False
+    text = str(value).strip().lower()
+    return bool(text) and text not in {"__none__", "none", "null", "unknown"} and not text.startswith("surrogate_game:")
+
+
 def _complete_context_key(value: object) -> bool:
     if value in (None, ""):
         return False
@@ -268,8 +276,10 @@ def evaluate_h09_future_option_motifs(
     verified_cross_game_observations = [
         row
         for row in verified_observations
-        if row.get("source_game_key") not in (None, "")
-        and row.get("target_game_key") not in (None, "")
+        if row.get("source_interaction_id") not in (None, "")
+        and row.get("target_interaction_id") not in (None, "")
+        and _complete_game_key(row.get("source_game_key"))
+        and _complete_game_key(row.get("target_game_key"))
         and str(row["source_game_key"])
         != str(row["target_game_key"])
         and int(row.get("source_game_is_surrogate") or 0) == 0
@@ -339,8 +349,10 @@ def evaluate_h09_future_option_motifs(
         ]
 
         has_verified_cross_game = any(
-            obs.get("source_game_key") not in (None, "")
-            and obs.get("target_game_key") not in (None, "")
+            obs.get("source_interaction_id") not in (None, "")
+            and obs.get("target_interaction_id") not in (None, "")
+            and _complete_game_key(obs.get("source_game_key"))
+            and _complete_game_key(obs.get("target_game_key"))
             and str(obs["source_game_key"])
             != str(obs["target_game_key"])
             and int(
@@ -656,7 +668,18 @@ def evaluate_h09_future_option_motifs(
     for key, value in derivation_summary.items():
         result.setdefault(key, value)
 
-    if not events:
+    derivation_inserted_events = derivation_summary.get("future_option_events_inserted_total")
+    derivation_failed_with_substrate = bool(
+        (stable_contingencies_count > 0 or transformation_families_count > 0)
+        and derivation_inserted_events is not None
+        and int(derivation_inserted_events or 0) == 0
+    )
+    if derivation_failed_with_substrate:
+        result["decision"] = "INSUFFICIENT_EVIDENCE"
+        result["missing_evidence"] = [
+            "Future-option derivation produced zero events despite available substrate."
+        ]
+    elif not events:
         substrate_available = (
             stable_contingencies_count > 0
             or transformation_families_count > 0

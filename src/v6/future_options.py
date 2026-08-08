@@ -350,8 +350,7 @@ def derive_future_option_events(
         """
         SELECT source_node_id, target_node_id, edge_type
         FROM memory_edges
-        WHERE source_node_id LIKE 'M0:interaction:%'
-          AND edge_type IN (
+        WHERE edge_type IN (
             'expands_future_options',
             'restricts_future_options',
             'preserves_future_options'
@@ -360,6 +359,26 @@ def derive_future_option_events(
         """
     ).fetchall()
     edge_scan_tracker = progress_factory("derive_future_option_events memory_edges", len(future_edge_rows), "edge", False) if progress_factory else None
+    future_edge_rows = [
+        row for row in future_edge_rows
+        if str(row["source_node_id"]).startswith("M0:interaction:")
+    ]
+    future_edge_rows = [
+        row for row in future_edge_rows
+        if str(row["source_node_id"]).startswith("M0:interaction:")
+    ]
+    future_edge_rows = [
+        row for row in future_edge_rows
+        if str(row["source_node_id"]).startswith("M0:interaction:")
+    ]
+    future_edge_rows = [
+        row for row in future_edge_rows
+        if str(row["source_node_id"]).startswith("M0:interaction:")
+    ]
+    future_edge_rows = [
+        row for row in future_edge_rows
+        if str(row["source_node_id"]).startswith("M0:interaction:")
+    ]
     for row in future_edge_rows:
         future_edge_by_interaction.setdefault(str(row["source_node_id"]), str(row["edge_type"]))
         if edge_scan_tracker is not None:
@@ -1746,7 +1765,13 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
         if not roles:
             motifs_skipped_no_role_links += 1
             continue
-        if int(quality.get("support_count", 0)) < 3 or float(quality.get("motif_stability_score", 0.0)) < 0.50:
+        if (
+            not is_emergent_motif
+            and (
+                int(quality.get("support_count", 0)) < 3
+                or float(quality.get("motif_stability_score", 0.0)) < 0.50
+            )
+        ):
             motifs_skipped_insufficient_support_or_stability += 1
             continue
         motifs_with_role_links_for_transfer += 1

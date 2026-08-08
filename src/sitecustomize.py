@@ -38,3 +38,15 @@ if _apply_h07_h08_evidence_repairs is not None:
 from v6.remaining_report_repairs import apply_patch as _apply_remaining_report_repairs
 
 _apply_remaining_report_repairs()
+
+from v6.final_runtime_repairs import apply_patch as _apply_final_runtime_repairs
+
+_apply_final_runtime_repairs()
+
+from v6.snapshot_schema_compat import apply_patch as _apply_snapshot_schema_compat
+
+_apply_snapshot_schema_compat()
+
+from v6.summary_completion_compat import apply_patch as _apply_summary_completion_compat
+
+_apply_summary_completion_compat()

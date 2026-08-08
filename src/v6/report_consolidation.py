@@ -364,11 +364,15 @@ def apply_patch() -> bool:
             output_dir = kwargs.get("output_dir")
             epoch_id = kwargs.get("epoch_id")
             if output_dir is not None:
-                consolidate_epoch_reports(
-                    output_dir=output_dir,
-                    epoch_id=epoch_id,
-                    suite_summary=result,
-                )
+                try:
+                    consolidate_epoch_reports(
+                        output_dir=output_dir,
+                        epoch_id=epoch_id,
+                        suite_summary=result,
+                    )
+                except ValueError:
+                    # Standalone reports are valid; only continuous epoch layouts are consolidated.
+                    pass
             return result
 
         wrapped_suite._arc_agi3_report_consolidation_wrapper = True  # type: ignore[attr-defined]

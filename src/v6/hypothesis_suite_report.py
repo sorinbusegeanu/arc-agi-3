@@ -1310,3 +1310,7 @@ def _write_suite_summary(
         output_dir,
         hypothesis_results=hypothesis_results,
     )
+
+
+from v6.hypothesis_suite_legacy_compat import install_compat as _install_hypothesis_suite_compat
+_install_hypothesis_suite_compat(globals())
