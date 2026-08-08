@@ -16,6 +16,7 @@ jobs:
           ref: chatgpt-all-tests-pass
       - name: Update strict evidence decision expectation
         run: |
+          # One-time compatibility update for the strict v6.1 evidence contract.
           python - <<'PY'
           from pathlib import Path
           path = Path('src/v6/tests/test_continuous_research.py')
