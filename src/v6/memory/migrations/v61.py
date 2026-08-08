@@ -4,10 +4,11 @@ import json
 import sqlite3
 import time
 from pathlib import Path
-from typing import Iterable
 
 
 SCHEMA_VERSION = "v6.1"
+MIGRATION_MARKER_KEY = "v61_additive_schema"
+MIGRATION_MARKER_VERSION = "v1"
 
 
 def _columns(connection: sqlite3.Connection, table: str) -> set[str]:
@@ -31,20 +32,50 @@ def _ensure_column(
     name: str,
     declaration: str,
 ) -> None:
-    if name in _columns(connection, table):
+    columns = _columns(connection, table)
+    if not columns or name in columns:
         return
     connection.execute(
         f'ALTER TABLE "{table}" ADD COLUMN "{name}" {declaration}'
     )
 
 
+def _version_tuple(value: str | None) -> tuple[int, ...]:
+    if not value:
+        return ()
+    text = str(value).strip().lower().lstrip("v")
+    try:
+        return tuple(int(part) for part in text.split("."))
+    except ValueError:
+        return ()
+
+
+def _memory_version(connection: sqlite3.Connection, key: str) -> str | None:
+    if connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_versions'"
+    ).fetchone() is None:
+        return None
+    row = connection.execute(
+        "SELECT value FROM memory_versions WHERE key=?",
+        (str(key),),
+    ).fetchone()
+    return None if row is None or row[0] is None else str(row[0])
+
+
 def migrate_connection(connection: sqlite3.Connection) -> dict[str, object]:
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS memory_versions (key TEXT PRIMARY KEY, value TEXT)"
+    )
+    existing_schema_version = _memory_version(connection, "memory_substrate_schema")
+    marker = _memory_version(connection, MIGRATION_MARKER_KEY)
+    if marker == MIGRATION_MARKER_VERSION:
+        return {
+            "schema_version": existing_schema_version or SCHEMA_VERSION,
+            "migration_applied": False,
+        }
+
     connection.executescript(
         """
-        CREATE TABLE IF NOT EXISTS memory_versions (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        );
         CREATE TABLE IF NOT EXISTS memory_lifecycle_events (
             lifecycle_event_id TEXT PRIMARY KEY,
             memory_id TEXT NOT NULL,
@@ -112,17 +143,11 @@ def migrate_connection(connection: sqlite3.Connection) -> dict[str, object]:
     }
 
     for name, declaration in node_columns.items():
-        _ensure_column(
-            connection, "memory_nodes", name, declaration
-        )
+        _ensure_column(connection, "memory_nodes", name, declaration)
     for name, declaration in edge_columns.items():
-        _ensure_column(
-            connection, "memory_edges", name, declaration
-        )
+        _ensure_column(connection, "memory_edges", name, declaration)
     for name, declaration in promotion_columns.items():
-        _ensure_column(
-            connection, "memory_promotions", name, declaration
-        )
+        _ensure_column(connection, "memory_promotions", name, declaration)
 
     connection.executescript(
         """
@@ -139,28 +164,41 @@ def migrate_connection(connection: sqlite3.Connection) -> dict[str, object]:
         """
     )
 
+    effective_version = (
+        existing_schema_version
+        if _version_tuple(existing_schema_version) > _version_tuple(SCHEMA_VERSION)
+        else SCHEMA_VERSION
+    )
     connection.execute(
         """
         INSERT INTO memory_versions(key, value)
         VALUES ('memory_substrate_schema', ?)
         ON CONFLICT(key) DO UPDATE SET value=excluded.value
         """,
-        (SCHEMA_VERSION,),
+        (effective_version,),
     )
-
-    # Existing nodes are valid v6.1 identities after additive migration.
     connection.execute(
         """
-        UPDATE memory_nodes
-        SET
-            schema_version=COALESCE(NULLIF(schema_version, ''), 'v6.1'),
-            evidence_version=COALESCE(NULLIF(evidence_version, ''), 'v1'),
-            status=COALESCE(NULLIF(status, ''), 'active')
-        """
+        INSERT INTO memory_versions(key, value)
+        VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """,
+        (MIGRATION_MARKER_KEY, MIGRATION_MARKER_VERSION),
     )
+
+    if _columns(connection, "memory_nodes"):
+        connection.execute(
+            """
+            UPDATE memory_nodes
+            SET
+                schema_version=COALESCE(NULLIF(schema_version, ''), 'v6.1'),
+                evidence_version=COALESCE(NULLIF(evidence_version, ''), 'v1'),
+                status=COALESCE(NULLIF(status, ''), 'active')
+            """
+        )
     connection.commit()
     return {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": effective_version,
         "memory_node_columns": sorted(node_columns),
         "memory_edge_columns": sorted(edge_columns),
         "memory_promotion_columns": sorted(promotion_columns),
