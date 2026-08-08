@@ -2801,3 +2801,18 @@ def _format_bullets(items: list[str]) -> list[str]:
 
 def _format_acceptance_checks(checks: dict[str, Any]) -> list[str]:
     return [f"- {name}: {value}" for name, value in checks.items()]
+
+# v6.3 canonical semantics
+_evaluate_h03_transformation_family_formation_base = evaluate_h03_transformation_family_formation
+
+def evaluate_h03_transformation_family_formation(*args: Any, **kwargs: Any) -> dict:
+    from v6.v63_semantics import _rewrite_json, normalize_h03_result
+    result = _evaluate_h03_transformation_family_formation_base(*args, **kwargs)
+    memory_dir = kwargs.get("memory_dir")
+    normalize_h03_result(result, memory_dir)
+    output_dir = kwargs.get("output_dir")
+    if output_dir is None and len(args) > 1:
+        output_dir = args[1]
+    if output_dir is not None:
+        _rewrite_json(output_dir, "h03_transformation_family_report.json", result)
+    return result

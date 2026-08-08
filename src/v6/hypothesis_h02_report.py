@@ -2414,3 +2414,17 @@ def _format_acceptance_checks(checks: dict[str, Any]) -> list[str]:
 
 def _format_markdown_acceptance_checks(checks: dict[str, Any]) -> list[str]:
     return _format_acceptance_checks(checks)
+
+# v6.3 canonical semantics
+_evaluate_h02_prediction_violation_attention_base = evaluate_h02_prediction_violation_attention
+
+def evaluate_h02_prediction_violation_attention(*args: Any, **kwargs: Any) -> dict:
+    from v6.v63_semantics import _rewrite_json, normalize_h02_result
+    result = _evaluate_h02_prediction_violation_attention_base(*args, **kwargs)
+    normalize_h02_result(result)
+    output_dir = kwargs.get("output_dir")
+    if output_dir is None and len(args) > 1:
+        output_dir = args[1]
+    if output_dir is not None:
+        _rewrite_json(output_dir, H02_JSON_NAME, result)
+    return result

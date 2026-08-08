@@ -1211,3 +1211,13 @@ def _timestamp(value: float | None) -> str | None:
     if value is None:
         return None
     return datetime.fromtimestamp(value, tz=timezone.utc).isoformat()
+
+# v6.3 canonical semantics
+_evaluate_h01_contingency_emergence_base = evaluate_h01_contingency_emergence
+
+def evaluate_h01_contingency_emergence(run_dir: Path, output_dir: Path, *, memory_dir: Path | None = None) -> dict:
+    from v6.v63_semantics import normalize_h01_result
+    result = _evaluate_h01_contingency_emergence_base(run_dir, output_dir, memory_dir=memory_dir)
+    normalize_h01_result(result)
+    _finalize_h01_result(result, Path(output_dir))
+    return result

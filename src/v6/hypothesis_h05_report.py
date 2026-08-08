@@ -280,3 +280,17 @@ def _write_outputs(output_dir: Path, result: dict[str, Any]) -> None:
     )
     (output_dir / "h05_functional_role_emergence_report.txt").write_text(text, encoding="utf-8")
     (output_dir / "h05_functional_role_emergence.md").write_text("```\n" + text + "```\n", encoding="utf-8")
+
+# v6.3 canonical semantics
+_evaluate_h05_role_emergence_base = evaluate_h05_role_emergence
+
+def evaluate_h05_role_emergence(*args: Any, **kwargs: Any) -> dict:
+    from v6.v63_semantics import _rewrite_json, normalize_h05_result
+    result = _evaluate_h05_role_emergence_base(*args, **kwargs)
+    normalize_h05_result(result)
+    output_dir = kwargs.get("output_dir")
+    if output_dir is None and len(args) > 1:
+        output_dir = args[1]
+    if output_dir is not None:
+        _rewrite_json(output_dir, "h05_functional_role_emergence_report.json", result)
+    return result

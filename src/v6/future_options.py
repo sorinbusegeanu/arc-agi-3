@@ -2819,3 +2819,53 @@ def _safe_min(
     if not rows or rows[0] is None:
         return None
     return int(rows[0])
+
+# v6.3 canonical current-validation semantics
+_concept_validation_records_base = _concept_validation_records
+
+def _concept_validation_records(state_conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
+    from v6.v63_semantics import _current_validation_records
+    previous = state_conn.row_factory
+    state_conn.row_factory = sqlite3.Row
+    try:
+        base = _concept_validation_records_base(state_conn)
+    finally:
+        state_conn.row_factory = previous
+    return _current_validation_records(state_conn, base)
+
+
+def resolve_future_option_development_stage(
+    state_conn: sqlite3.Connection,
+    *,
+    requested_stage: FutureOptionDevelopmentStage | str,
+    thresholds: FutureOptionDevelopmentThresholds | None = None,
+) -> FutureOptionDevelopmentStage:
+    requested = (
+        requested_stage
+        if isinstance(requested_stage, FutureOptionDevelopmentStage)
+        else FutureOptionDevelopmentStage(str(requested_stage).strip().lower())
+    )
+    if requested is not FutureOptionDevelopmentStage.AUTO:
+        return requested
+    limits = thresholds or FutureOptionDevelopmentThresholds()
+    records = _concept_validation_records(state_conn)
+    verified_concepts = sum(1 for record in records.values() if record.get("status") == "verified")
+    counts = {
+        "stable_contingencies": int(state_conn.execute("SELECT COUNT(*) FROM stable_contingencies").fetchone()[0]),
+        "transformation_families": int(state_conn.execute("SELECT COUNT(*) FROM transformation_families").fetchone()[0]),
+        "carriers": int(state_conn.execute("SELECT COUNT(*) FROM carrier_candidates WHERE COALESCE(is_emergent,0)=1").fetchone()[0]),
+        "roles": int(state_conn.execute("SELECT COUNT(*) FROM role_candidates WHERE COALESCE(is_emergent,0)=1").fetchone()[0]),
+        "promoted_concepts": verified_concepts,
+        "successful_transfers": int(state_conn.execute("SELECT COUNT(*) FROM role_transfer_attempts WHERE COALESCE(reuse_success,0)=1").fetchone()[0]),
+    }
+    if counts["promoted_concepts"] >= limits.promoted_concepts and counts["successful_transfers"] >= limits.successful_transfers:
+        return FutureOptionDevelopmentStage.CONCEPT_TRANSFER
+    if counts["roles"] >= limits.roles:
+        return FutureOptionDevelopmentStage.ROLE_DISCOVERY
+    if counts["carriers"] >= limits.carriers:
+        return FutureOptionDevelopmentStage.GRAPH_EXPANSION
+    if counts["transformation_families"] >= limits.transformation_families:
+        return FutureOptionDevelopmentStage.ENVIRONMENTAL_INFLUENCE
+    if counts["stable_contingencies"] >= limits.stable_contingencies:
+        return FutureOptionDevelopmentStage.MOVEMENT_FREEDOM
+    return FutureOptionDevelopmentStage.SURVIVAL

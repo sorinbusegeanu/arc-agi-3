@@ -8,8 +8,6 @@ from itertools import combinations
 from pathlib import Path
 from typing import Any, Mapping
 
-
-_PATCHED = False
 MAX_ROLES_PER_CONCEPT = 4
 MAX_PAIR_COMPARISONS = 2048
 MAX_PAIR_CANDIDATES_PER_PARENT = 64
@@ -61,132 +59,6 @@ def _repair_core_metrics(result: dict[str, Any], updates: Mapping[str, Any]) -> 
     result["core_metrics"] = core
 
 
-def _patch_framework() -> None:
-    from v6.reporting import framework
-
-    original = framework.apply_decision_envelope
-    if getattr(original, "_v63_repaired", False):
-        return
-
-    def repaired(
-        hypothesis_id: str,
-        result: Mapping[str, Any],
-        *,
-        memory_dir: Path | None,
-        provenance: Mapping[str, Any] | None = None,
-        dependency_results: Mapping[str, Mapping[str, Any]] | None = None,
-        memory_unchanged: bool = True,
-    ) -> dict[str, Any]:
-        prepared = dict(result)
-        coverage_source = "report"
-        if prepared.get("evidence_coverage_ratio") is None:
-            derived = _derive_provenance_coverage(hypothesis_id, provenance)
-            if derived is not None:
-                prepared["evidence_coverage_ratio"] = derived
-                prepared["evidence_coverage_source"] = "provenance_claims"
-                coverage_source = "provenance_claims"
-        updated = original(
-            hypothesis_id,
-            prepared,
-            memory_dir=memory_dir,
-            provenance=provenance,
-            dependency_results=dependency_results,
-            memory_unchanged=memory_unchanged,
-        )
-        quality = dict(updated.get("quality_gate") or {})
-        quality["coverage_source"] = prepared.get(
-            "evidence_coverage_source", coverage_source
-        )
-        updated["quality_gate"] = quality
-        return updated
-
-    repaired._v63_repaired = True  # type: ignore[attr-defined]
-    framework.apply_decision_envelope = repaired
-
-    try:
-        import v6.hypothesis_suite_report as suite
-
-        suite.apply_decision_envelope = repaired
-    except Exception:
-        pass
-
-
-def _patch_h01() -> None:
-    import v6.hypothesis_h01_report as module
-
-    original = module.evaluate_h01_contingency_emergence
-    if getattr(original, "_v63_repaired", False):
-        return
-
-    def repaired(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        result = original(*args, **kwargs)
-        stable = result.get("stable_contingency_count")
-        if stable is not None:
-            updates = {
-                "stable_contingencies_count": int(stable),
-                "discovered_contingencies_count": int(
-                    result.get("discovered_contingency_count")
-                    or result.get("contingency_candidate_count")
-                    or 0
-                ),
-            }
-            _repair_core_metrics(result, updates)
-        output_dir = kwargs.get("output_dir")
-        if output_dir is not None:
-            _rewrite_json(
-                output_dir,
-                "h01_contingency_emergence_report.json",
-                result,
-            )
-        return result
-
-    repaired._v63_repaired = True  # type: ignore[attr-defined]
-    module.evaluate_h01_contingency_emergence = repaired
-    try:
-        import v6.hypothesis_suite_report as suite
-
-        suite.evaluate_h01_contingency_emergence = repaired
-    except Exception:
-        pass
-
-
-def _patch_h02() -> None:
-    import v6.hypothesis_h02_report as module
-
-    original = module.evaluate_h02_prediction_violation_attention
-    if getattr(original, "_v63_repaired", False):
-        return
-
-    def repaired(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        result = original(*args, **kwargs)
-        if result.get("context_contradiction_count") is not None:
-            _repair_core_metrics(
-                result,
-                {
-                    "context_contradiction_tagged_interaction_count": int(
-                        result.get("context_contradiction_count") or 0
-                    )
-                },
-            )
-        output_dir = kwargs.get("output_dir")
-        if output_dir is not None:
-            _rewrite_json(
-                output_dir,
-                "h02_prediction_violation_attention_report.json",
-                result,
-            )
-        return result
-
-    repaired._v63_repaired = True  # type: ignore[attr-defined]
-    module.evaluate_h02_prediction_violation_attention = repaired
-    try:
-        import v6.hypothesis_suite_report as suite
-
-        suite.evaluate_h02_prediction_violation_attention = repaired
-    except Exception:
-        pass
-
-
 def _distinct_family_scope_count(memory_dir: Any, scope_column: str) -> int | None:
     database = Path(memory_dir) / "current_state.sqlite"
     if not database.exists():
@@ -222,184 +94,6 @@ def _distinct_family_scope_count(memory_dir: Any, scope_column: str) -> int | No
             return int(row[0] or 0) if row is not None else 0
     except sqlite3.Error:
         return None
-
-
-def _patch_h03() -> None:
-    import v6.hypothesis_h03_report as module
-
-    original = module.evaluate_h03_transformation_family_formation
-    if getattr(original, "_v63_repaired", False):
-        return
-
-    def repaired(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        result = original(*args, **kwargs)
-        memory_dir = kwargs.get("memory_dir")
-        updates: dict[str, Any] = {}
-        if memory_dir is not None:
-            for field, scope, legacy_field in (
-                ("family_cross_game_count", "game", "family_cross_game_membership_count"),
-                ("family_cross_sampler_count", "sampler", "family_cross_sampler_membership_count"),
-            ):
-                actual = _distinct_family_scope_count(memory_dir, scope)
-                if actual is not None:
-                    if result.get(field) is not None:
-                        updates[legacy_field] = result.get(field)
-                    updates[field] = actual
-        if updates:
-            _repair_core_metrics(result, updates)
-        output_dir = kwargs.get("output_dir")
-        if output_dir is not None:
-            _rewrite_json(
-                output_dir,
-                "h03_transformation_family_report.json",
-                result,
-            )
-        return result
-
-    repaired._v63_repaired = True  # type: ignore[attr-defined]
-    module.evaluate_h03_transformation_family_formation = repaired
-    try:
-        import v6.hypothesis_suite_report as suite
-
-        suite.evaluate_h03_transformation_family_formation = repaired
-    except Exception:
-        pass
-
-
-def _patch_h04() -> None:
-    import v6.hypothesis_h04_report as module
-
-    original = module.evaluate_h04_carrier_emergence
-    if getattr(original, "_v63_repaired", False):
-        return
-
-    def repaired(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        result = original(*args, **kwargs)
-        strict = _strict_before(
-            result.get("first_stable_transformation_family_step"),
-            result.get("first_emergent_carrier_step"),
-        )
-        strict_usable = _strict_before(
-            result.get("first_stable_transformation_family_step"),
-            result.get("first_usable_emergent_carrier_step"),
-        )
-        _repair_core_metrics(
-            result,
-            {
-                "h03_before_h04": strict,
-                "h03_before_h04_usable": strict_usable,
-                "temporal_order_comparison": "strict_before",
-            },
-        )
-        if strict_usable is False:
-            message = (
-                "Strict H03-before-H04 temporal order is not demonstrated; "
-                "equal timestamps do not establish developmental precedence."
-            )
-            if str(result.get("carrier_timing_source")) == "real_evidence":
-                result["decision"] = "INVALID"
-            elif str(result.get("decision")) == "VALID":
-                result["decision"] = "PARTIALLY_VALID"
-            _add_missing(result, message)
-        result["core_metrics"] = {
-            **dict(result.get("core_metrics") or {}),
-            "h03_before_h04": strict,
-            "h03_before_h04_usable": strict_usable,
-            "temporal_order_comparison": "strict_before",
-        }
-        output_dir = kwargs.get("output_dir")
-        if output_dir is not None:
-            _rewrite_json(output_dir, "h04_carrier_emergence_report.json", result)
-        return result
-
-    repaired._v63_repaired = True  # type: ignore[attr-defined]
-    module.evaluate_h04_carrier_emergence = repaired
-    try:
-        import v6.hypothesis_suite_report as suite
-
-        suite.evaluate_h04_carrier_emergence = repaired
-    except Exception:
-        pass
-
-
-def _patch_h05() -> None:
-    import v6.hypothesis_h05_report as module
-
-    original = module.evaluate_h05_role_emergence
-    if getattr(original, "_v63_repaired", False):
-        return
-
-    def repaired(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        result = original(*args, **kwargs)
-        strict = _strict_before(
-            result.get("first_emergent_carrier_step"),
-            result.get("first_emergent_role_step"),
-        )
-        cases = 1 if strict is True else 0
-        _repair_core_metrics(
-            result,
-            {
-                "h04_before_h05": strict,
-                "h04_before_h05_cases": cases,
-                "temporal_order_comparison": "strict_before",
-            },
-        )
-        if strict is False:
-            message = (
-                "Strict H04-before-H05 temporal order is not demonstrated; "
-                "equal timestamps do not establish developmental precedence."
-            )
-            if str(result.get("role_timing_source")) == "real_evidence":
-                result["decision"] = "INVALID"
-            elif str(result.get("decision")) == "VALID":
-                result["decision"] = "PARTIALLY_VALID"
-            _add_missing(result, message)
-        output_dir = kwargs.get("output_dir")
-        if output_dir is not None:
-            _rewrite_json(output_dir, "h05_functional_role_emergence_report.json", result)
-        return result
-
-    repaired._v63_repaired = True  # type: ignore[attr-defined]
-    module.evaluate_h05_role_emergence = repaired
-    try:
-        import v6.hypothesis_suite_report as suite
-
-        suite.evaluate_h05_role_emergence = repaired
-    except Exception:
-        pass
-
-
-def _patch_h06() -> None:
-    import v6.hypothesis_h06_report as module
-
-    original = module.evaluate_h06_role_transfer
-    if getattr(original, "_v63_repaired", False):
-        return
-
-    def repaired(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        already_derived = bool(kwargs.get("already_derived", False))
-        if not already_derived:
-            return original(*args, **kwargs)
-        ensure_original = module.ensure_memory_layout
-        module.ensure_memory_layout = lambda _memory_dir: None
-        try:
-            result = original(*args, **kwargs)
-        finally:
-            module.ensure_memory_layout = ensure_original
-        result["evidence_source"] = "read_only_snapshot"
-        output_dir = kwargs.get("output_dir")
-        if output_dir is not None:
-            _rewrite_json(output_dir, "h06_role_transfer_report.json", result)
-        return result
-
-    repaired._v63_repaired = True  # type: ignore[attr-defined]
-    module.evaluate_h06_role_transfer = repaired
-    try:
-        import v6.hypothesis_suite_report as suite
-
-        suite.evaluate_h06_role_transfer = repaired
-    except Exception:
-        pass
 
 
 def _role_structure_ids(links: Mapping[str, set[str]]) -> set[str]:
@@ -703,24 +397,6 @@ def _refine_broad_concept_candidates(
     return summary
 
 
-def _patch_concept_derivation() -> None:
-    from v6 import higher_order_substrate as module
-
-    original = module.derive_concept_candidates
-    if getattr(original, "_v63_repaired", False):
-        return
-
-    def repaired(
-        state_conn: sqlite3.Connection,
-        progress_factory: Any | None = None,
-    ) -> dict[str, Any]:
-        summary = original(state_conn, progress_factory=progress_factory)
-        return _refine_broad_concept_candidates(state_conn, summary)
-
-    repaired._v63_repaired = True  # type: ignore[attr-defined]
-    module.derive_concept_candidates = repaired
-
-
 def _current_validation_records(
     state_conn: sqlite3.Connection,
     base_records: dict[str, dict[str, Any]],
@@ -774,134 +450,6 @@ def _current_validation_records(
             payload.get("historically_promoted")
         )
     return records
-
-
-def _patch_future_option_concept_semantics() -> None:
-    import v6.future_options as module
-
-    original_records = module._concept_validation_records
-    if not getattr(original_records, "_v63_repaired", False):
-        def repaired_records(
-            state_conn: sqlite3.Connection,
-        ) -> dict[str, dict[str, Any]]:
-            base = original_records(state_conn)
-            return _current_validation_records(state_conn, base)
-
-        repaired_records._v63_repaired = True  # type: ignore[attr-defined]
-        module._concept_validation_records = repaired_records
-
-    original_stage = module.resolve_future_option_development_stage
-    if getattr(original_stage, "_v63_repaired", False):
-        return
-
-    def repaired_stage(
-        state_conn: sqlite3.Connection,
-        *,
-        requested_stage: Any,
-        thresholds: Any = None,
-    ) -> Any:
-        requested = (
-            requested_stage
-            if isinstance(requested_stage, module.FutureOptionDevelopmentStage)
-            else module.FutureOptionDevelopmentStage(
-                str(requested_stage).strip().lower()
-            )
-        )
-        if requested is not module.FutureOptionDevelopmentStage.AUTO:
-            return requested
-        limits = thresholds or module.FutureOptionDevelopmentThresholds()
-        records = module._concept_validation_records(state_conn)
-        verified_concepts = sum(
-            1 for record in records.values() if record.get("status") == "verified"
-        )
-        counts = {
-            "stable_contingencies": int(state_conn.execute("SELECT COUNT(*) FROM stable_contingencies").fetchone()[0]),
-            "transformation_families": int(state_conn.execute("SELECT COUNT(*) FROM transformation_families").fetchone()[0]),
-            "carriers": int(state_conn.execute("SELECT COUNT(*) FROM carrier_candidates WHERE COALESCE(is_emergent,0)=1").fetchone()[0]),
-            "roles": int(state_conn.execute("SELECT COUNT(*) FROM role_candidates WHERE COALESCE(is_emergent,0)=1").fetchone()[0]),
-            "promoted_concepts": verified_concepts,
-            "successful_transfers": int(state_conn.execute("SELECT COUNT(*) FROM role_transfer_attempts WHERE COALESCE(reuse_success,0)=1").fetchone()[0]),
-        }
-        if (
-            counts["promoted_concepts"] >= limits.promoted_concepts
-            and counts["successful_transfers"] >= limits.successful_transfers
-        ):
-            return module.FutureOptionDevelopmentStage.CONCEPT_TRANSFER
-        if counts["roles"] >= limits.roles:
-            return module.FutureOptionDevelopmentStage.ROLE_DISCOVERY
-        if counts["carriers"] >= limits.carriers:
-            return module.FutureOptionDevelopmentStage.GRAPH_EXPANSION
-        if counts["transformation_families"] >= limits.transformation_families:
-            return module.FutureOptionDevelopmentStage.ENVIRONMENTAL_INFLUENCE
-        if counts["stable_contingencies"] >= limits.stable_contingencies:
-            return module.FutureOptionDevelopmentStage.MOVEMENT_FREEDOM
-        return module.FutureOptionDevelopmentStage.SURVIVAL
-
-    repaired_stage._v63_repaired = True  # type: ignore[attr-defined]
-    module.resolve_future_option_development_stage = repaired_stage
-    try:
-        import v6.hypothesis_suite_report as suite
-
-        suite.derive_future_option_memory = module.derive_future_option_memory
-    except Exception:
-        pass
-
-
-def _patch_h07() -> None:
-    import v6.hypothesis_h07_report as module
-
-    original = module.evaluate_h07_concept_emergence
-    if getattr(original, "_v63_repaired", False):
-        return
-
-    def repaired(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        result = original(*args, **kwargs)
-        validation = result.get("incremental_promotion_validation")
-        candidates = (
-            list(validation.get("candidates") or [])
-            if isinstance(validation, dict)
-            else []
-        )
-        if candidates:
-            current = [
-                item
-                for item in candidates
-                if bool(item.get("current_validation_passed"))
-            ]
-            historical = [
-                item
-                for item in candidates
-                if bool(item.get("historically_promoted"))
-            ]
-            updates = {
-                "current_validated_promoted_concept_count": len(current),
-                "promoted_concept_count": len(current),
-                "historical_promoted_concept_count": len(historical),
-                "promoted_cross_game_count": sum(
-                    1 for item in current
-                    if int(item.get("cross_game_evidence_count") or 0) >= 1
-                ),
-                "promoted_cross_context_count": sum(
-                    1 for item in current
-                    if int(item.get("cross_context_evidence_count") or 0) >= 1
-                ),
-            }
-            if not current:
-                updates["first_promoted_concept_step"] = None
-            _repair_core_metrics(result, updates)
-        output_dir = kwargs.get("output_dir")
-        if output_dir is not None:
-            _rewrite_json(output_dir, "h07_concept_emergence_report.json", result)
-        return result
-
-    repaired._v63_repaired = True  # type: ignore[attr-defined]
-    module.evaluate_h07_concept_emergence = repaired
-    try:
-        import v6.hypothesis_suite_report as suite
-
-        suite.evaluate_h07_concept_emergence = repaired
-    except Exception:
-        pass
 
 
 def _strict_temporal_summary(run_dir: Any) -> dict[str, Any] | None:
@@ -968,39 +516,90 @@ def _strict_temporal_summary(run_dir: Any) -> dict[str, Any] | None:
     }
 
 
-def _patch_suite_summary() -> None:
-    import v6.hypothesis_suite_report as suite
-
-    original = suite.build_hypothesis_suite_summary
-    if getattr(original, "_v63_repaired", False):
-        return
-
-    def repaired(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        summary = original(*args, **kwargs)
-        run_dir = kwargs.get("run_dir")
-        if run_dir is not None:
-            strict = _strict_temporal_summary(run_dir)
-            if strict is not None:
-                summary["temporal_order_diagnostics"] = strict
-        return summary
-
-    repaired._v63_repaired = True  # type: ignore[attr-defined]
-    suite.build_hypothesis_suite_summary = repaired
+def normalize_h01_result(result: dict[str, Any]) -> dict[str, Any]:
+    stable = result.get("stable_contingency_count")
+    if stable is not None:
+        _repair_core_metrics(result, {
+            "stable_contingencies_count": int(stable),
+            "discovered_contingencies_count": int(result.get("discovered_contingency_count") or result.get("contingency_candidate_count") or 0),
+        })
+    return result
 
 
-def install_v63_report_repairs() -> None:
-    global _PATCHED
-    if _PATCHED:
-        return
-    _PATCHED = True
-    _patch_framework()
-    _patch_h01()
-    _patch_h02()
-    _patch_h03()
-    _patch_h04()
-    _patch_h05()
-    _patch_h06()
-    _patch_concept_derivation()
-    _patch_future_option_concept_semantics()
-    _patch_h07()
-    _patch_suite_summary()
+def normalize_h02_result(result: dict[str, Any]) -> dict[str, Any]:
+    if result.get("context_contradiction_count") is not None:
+        _repair_core_metrics(result, {
+            "context_contradiction_tagged_interaction_count": int(result.get("context_contradiction_count") or 0)
+        })
+    return result
+
+
+def normalize_h03_result(result: dict[str, Any], memory_dir: Any) -> dict[str, Any]:
+    updates: dict[str, Any] = {}
+    if memory_dir is not None:
+        for field, scope, legacy_field in (
+            ("family_cross_game_count", "game", "family_cross_game_membership_count"),
+            ("family_cross_sampler_count", "sampler", "family_cross_sampler_membership_count"),
+        ):
+            actual = _distinct_family_scope_count(memory_dir, scope)
+            if actual is not None:
+                if result.get(field) is not None:
+                    updates[legacy_field] = result.get(field)
+                updates[field] = actual
+    if updates:
+        _repair_core_metrics(result, updates)
+    return result
+
+
+def normalize_h04_result(result: dict[str, Any]) -> dict[str, Any]:
+    strict = _strict_before(result.get("first_stable_transformation_family_step"), result.get("first_emergent_carrier_step"))
+    strict_usable = _strict_before(result.get("first_stable_transformation_family_step"), result.get("first_usable_emergent_carrier_step"))
+    _repair_core_metrics(result, {
+        "h03_before_h04": strict,
+        "h03_before_h04_usable": strict_usable,
+        "temporal_order_comparison": "strict_before",
+    })
+    if strict_usable is False:
+        message = "Strict H03-before-H04 temporal order is not demonstrated; equal timestamps do not establish developmental precedence."
+        if str(result.get("carrier_timing_source")) == "real_evidence":
+            result["decision"] = "INVALID"
+        elif str(result.get("decision")) == "VALID":
+            result["decision"] = "PARTIALLY_VALID"
+        _add_missing(result, message)
+    return result
+
+
+def normalize_h05_result(result: dict[str, Any]) -> dict[str, Any]:
+    strict = _strict_before(result.get("first_emergent_carrier_step"), result.get("first_emergent_role_step"))
+    _repair_core_metrics(result, {
+        "h04_before_h05": strict,
+        "h04_before_h05_cases": 1 if strict is True else 0,
+        "temporal_order_comparison": "strict_before",
+    })
+    if strict is False:
+        message = "Strict H04-before-H05 temporal order is not demonstrated; equal timestamps do not establish developmental precedence."
+        if str(result.get("role_timing_source")) == "real_evidence":
+            result["decision"] = "INVALID"
+        elif str(result.get("decision")) == "VALID":
+            result["decision"] = "PARTIALLY_VALID"
+        _add_missing(result, message)
+    return result
+
+
+def normalize_h07_result(result: dict[str, Any]) -> dict[str, Any]:
+    validation = result.get("incremental_promotion_validation")
+    candidates = list(validation.get("candidates") or []) if isinstance(validation, dict) else []
+    if candidates:
+        current = [item for item in candidates if bool(item.get("current_validation_passed"))]
+        historical = [item for item in candidates if bool(item.get("historically_promoted"))]
+        updates = {
+            "current_validated_promoted_concept_count": len(current),
+            "promoted_concept_count": len(current),
+            "historical_promoted_concept_count": len(historical),
+            "promoted_cross_game_count": sum(1 for item in current if int(item.get("cross_game_evidence_count") or 0) >= 1),
+            "promoted_cross_context_count": sum(1 for item in current if int(item.get("cross_context_evidence_count") or 0) >= 1),
+        }
+        if not current:
+            updates["first_promoted_concept_step"] = None
+        _repair_core_metrics(result, updates)
+    return result
