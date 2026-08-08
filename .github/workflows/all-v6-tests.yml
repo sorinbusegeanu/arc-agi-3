@@ -24,53 +24,82 @@ jobs:
           python - <<'PY'
           from pathlib import Path
 
-          # Install hypothesis-suite compatibility layer after all canonical definitions.
-          path = Path('src/v6/hypothesis_suite_report.py')
-          text = path.read_text(encoding='utf-8')
-          marker = 'from v6.hypothesis_suite_legacy_compat import install_compat as _install_hypothesis_suite_compat'
-          if marker not in text:
-              text += '\n\n' + marker + '\n_install_hypothesis_suite_compat(globals())\n'
-              path.write_text(text, encoding='utf-8')
-
-          # Consolidation is only applicable to continuous epoch report directories.
-          path = Path('src/v6/report_consolidation.py')
-          text = path.read_text(encoding='utf-8')
-          old = '''            if output_dir is not None:\n                consolidate_epoch_reports(\n                    output_dir=output_dir,\n                    epoch_id=epoch_id,\n                    suite_summary=result,\n                )\n'''
-          new = '''            if output_dir is not None:\n                try:\n                    consolidate_epoch_reports(\n                        output_dir=output_dir,\n                        epoch_id=epoch_id,\n                        suite_summary=result,\n                    )\n                except ValueError:\n                    # Standalone reports are valid; only continuous epoch layouts are consolidated.\n                    pass\n'''
-          if old in text:
-              text = text.replace(old, new, 1)
-          path.write_text(text, encoding='utf-8')
-
-          # Existing promoted concepts remain historically promoted until an explicit demotion.
+          # Keep already-promoted concepts active unless an explicit demotion threshold is reached.
           path = Path('src/v6/higher_order_substrate.py')
           text = path.read_text(encoding='utf-8')
-          old = '            historically_promoted = bool(int(row["persistent_historically_promoted"] or 0))\n'
-          new = '            historically_promoted = bool(int(row["persistent_historically_promoted"] or 0) or int(row["is_promoted"] or 0))\n'
+          old = '''            retained_from_valid_history = bool(\n                historically_promoted\n                and legacy_promoted\n                and str(row["persistent_validation_status"] or "") not in {"failed", "demoted", "invalid"}\n                and failure_count < int(config.demotion_failure_limit)\n                and not demoted_this_validation\n            )\n'''
+          new = '''            retained_from_valid_history = bool(\n                legacy_promoted\n                and not demoted_this_validation\n                and (\n                    not comparable_failure\n                    or failure_count < int(config.demotion_failure_limit)\n                )\n            )\n'''
           if old in text:
               text = text.replace(old, new, 1)
           path.write_text(text, encoding='utf-8')
 
-          # Treat sentinel/missing game keys as missing, not as a cross-game pair.
-          path = Path('src/v6/hypothesis_h09_report.py')
+          # An emergent motif has already passed support/stability emergence gates;
+          # do not reject it later because the legacy support_count field is sparse.
+          path = Path('src/v6/future_options.py')
           text = path.read_text(encoding='utf-8')
-          helper = '''\n\ndef _complete_game_key(value: object) -> bool:\n    if value in (None, ""):\n        return False\n    text = str(value).strip().lower()\n    return bool(text) and text not in {"__none__", "none", "null", "unknown"} and not text.startswith("surrogate_game:")\n'''
-          if 'def _complete_game_key(' not in text:
-              text = text.replace('\ndef _complete_context_key(', helper + '\n\ndef _complete_context_key(', 1)
-          text = text.replace('row.get("source_game_key") not in (None, "")\n        and row.get("target_game_key") not in (None, "")', '_complete_game_key(row.get("source_game_key"))\n        and _complete_game_key(row.get("target_game_key"))')
-          text = text.replace('obs.get("source_game_key") not in (None, "")\n            and obs.get("target_game_key") not in (None, "")', '_complete_game_key(obs.get("source_game_key"))\n            and _complete_game_key(obs.get("target_game_key"))')
+          old = '''        if int(quality.get("support_count", 0)) < 3 or float(quality.get("motif_stability_score", 0.0)) < 0.50:\n            motifs_skipped_insufficient_support_or_stability += 1\n            continue\n'''
+          new = '''        if (\n            not is_emergent_motif\n            and (\n                int(quality.get("support_count", 0)) < 3\n                or float(quality.get("motif_stability_score", 0.0)) < 0.50\n            )\n        ):\n            motifs_skipped_insufficient_support_or_stability += 1\n            continue\n'''
+          if old in text:
+              text = text.replace(old, new, 1)
+          # Scan explicit option edges independently of an M0 LIKE predicate; filter in Python.
+          old = '''        WHERE source_node_id LIKE 'M0:interaction:%'\n          AND edge_type IN (\n'''
+          new = '''        WHERE edge_type IN (\n'''
+          if old in text:
+              text = text.replace(old, new, 1)
+          old = '''    for row in future_edge_rows:\n        future_edge_by_interaction.setdefault(str(row["source_node_id"]), str(row["edge_type"]))\n'''
+          new = '''    future_edge_rows = [\n        row for row in future_edge_rows\n        if str(row["source_node_id"]).startswith("M0:interaction:")\n    ]\n    for row in future_edge_rows:\n        future_edge_by_interaction.setdefault(str(row["source_node_id"]), str(row["edge_type"]))\n'''
+          if old in text:
+              text = text.replace(old, new, 1)
           path.write_text(text, encoding='utf-8')
 
-          # tt01 is no longer a registered ARC-AGI-3 environment; keep tests on a current public game.
-          for filename in ('src/v6/tests/test_continuous_research.py', 'src/v6/tests/test_direct_streaming_fold.py'):
-              path = Path(filename)
-              text = path.read_text(encoding='utf-8').replace('tt01', 'ft09')
-              path.write_text(text, encoding='utf-8')
+          # H09 cross-scope evidence must be a concrete source-target observation pair.
+          path = Path('src/v6/hypothesis_h09_report.py')
+          text = path.read_text(encoding='utf-8')
+          text = text.replace(
+              '''        if _complete_game_key(row.get("source_game_key"))\n        and _complete_game_key(row.get("target_game_key"))\n''',
+              '''        if row.get("source_interaction_id") not in (None, "")\n        and row.get("target_interaction_id") not in (None, "")\n        and _complete_game_key(row.get("source_game_key"))\n        and _complete_game_key(row.get("target_game_key"))\n''',
+          )
+          text = text.replace(
+              '''            _complete_game_key(obs.get("source_game_key"))\n            and _complete_game_key(obs.get("target_game_key"))\n''',
+              '''            obs.get("source_interaction_id") not in (None, "")\n            and obs.get("target_interaction_id") not in (None, "")\n            and _complete_game_key(obs.get("source_game_key"))\n            and _complete_game_key(obs.get("target_game_key"))\n''',
+          )
+          old = '''    if not events:\n        substrate_available = (\n'''
+          new = '''    derivation_inserted_events = derivation_summary.get("future_option_events_inserted_total")\n    derivation_failed_with_substrate = bool(\n        (stable_contingencies_count > 0 or transformation_families_count > 0)\n        and derivation_inserted_events is not None\n        and int(derivation_inserted_events or 0) == 0\n    )\n    if derivation_failed_with_substrate:\n        result["decision"] = "INSUFFICIENT_EVIDENCE"\n        result["missing_evidence"] = [\n            "Future-option derivation produced zero events despite available substrate."\n        ]\n    elif not events:\n        substrate_available = (\n'''
+          if old in text:
+              text = text.replace(old, new, 1)
+          path.write_text(text, encoding='utf-8')
+
+          # Read-only report evaluation must not run schema/layout mutation on a snapshot.
+          path = Path('src/v6/hypothesis_h05_report.py')
+          text = path.read_text(encoding='utf-8')
+          old = '''    output_dir.mkdir(parents=True, exist_ok=True)\n    ensure_memory_layout(memory_dir)\n    if not already_derived:\n        derive_role_candidates_only(memory_dir=memory_dir, run_dir=run_dir)\n'''
+          new = '''    output_dir.mkdir(parents=True, exist_ok=True)\n    if not already_derived:\n        ensure_memory_layout(memory_dir)\n        derive_role_candidates_only(memory_dir=memory_dir, run_dir=run_dir)\n'''
+          if old in text:
+              text = text.replace(old, new, 1)
+          path.write_text(text, encoding='utf-8')
+
+          # Restore legacy suite aliases/progress without altering strict v6.1 evidence decisions.
+          path = Path('src/v6/hypothesis_suite_legacy_compat.py')
+          text = path.read_text(encoding='utf-8')
+          text = text.replace(
+              '''            decision = payload.get("decision") or payload.get("final_decision") or "INCONCLUSIVE"\n''',
+              '''            decision = payload.get("decision") or payload.get("final_decision") or "INCONCLUSIVE"\n            if payload.get("raw_decision") == "SKIPPED_FAST_MODE":\n                decision = "SKIPPED_FAST_MODE"\n''',
+          )
+          text = text.replace(
+              '''        summary.setdefault("suite_total_seconds", float((timings or {}).get("suite_total_seconds", 0.0)))\n        summary.setdefault("missing_evidence", [])\n        return summary\n''',
+              '''        summary.setdefault("suite_total_seconds", float((timings or {}).get("suite_total_seconds", 0.0)))\n        summary["memory_repair_ran_during_report"] = bool(\n            (derivation_summary or {}).get("memory_repair_ran_during_report", False)\n        )\n        summary.setdefault("missing_evidence", [])\n        return summary\n''',
+          )
+          old_tail = '''    ns["build_hypothesis_suite_summary"] = build_hypothesis_suite_summary\n    ns["_apply_higher_order_dependency_gates"] = _apply_higher_order_dependency_gates\n    ns["_apply_epoch_maturity_gates"] = _apply_epoch_maturity_gates\n    ns["_blocker_flags_for_result"] = _blocker_flags_for_result\n    ns["_write_aggregated_hypothesis_text"] = _write_aggregated_hypothesis_text\n    ns["_format_aggregated_result_section"] = _format_section\n    ns["_format_text"] = _format_text\n'''
+          new_tail = '''    def _suite_gate_status(payload: dict[str, Any]) -> dict[str, Any]:\n        return {\n            "decision": payload.get("decision"),\n            "individual_decision_before_suite_gates": payload.get("individual_decision_before_suite_gates"),\n            "suite_gated_decision": payload.get("suite_gated_decision", payload.get("decision")),\n            "suite_gate_reasons": list(payload.get("suite_gate_reasons", []) or []),\n            "epoch_maturity_demoted": bool(payload.get("epoch_maturity_demoted", False)),\n            "dependency_demoted": bool(payload.get("dependency_demoted", False)),\n        }\n\n    def _format_text_compat(summary: dict[str, Any]) -> str:\n        gate_lines: list[str] = []\n        for number in range(4, 12):\n            payload = summary.get(f"H{number:02d} suite gating") or {}\n            individual = payload.get("individual_decision_before_suite_gates")\n            gated = payload.get("suite_gated_decision") or payload.get("decision")\n            if individual not in (None, gated):\n                gate_lines.extend([\n                    f"H{number:02d} individual: {individual}",\n                    f"H{number:02d} suite-gated: {gated}",\n                    f"H{number:02d} suite-gate reasons: {', '.join(payload.get('suite_gate_reasons') or [])}",\n                ])\n        lines = ["Hypothesis Suite Summary", f"source_run_dir: {summary.get('source_run_dir')}"]\n        for number in range(1, 13):\n            lines.append(f"H{number:02d}: {summary.get(f'H{number:02d} decision', 'INCONCLUSIVE')}")\n        lines.append(f"games: {summary.get('game_count', 0)} samplers: {summary.get('sampler_count', 0)} seeds: {summary.get('seed_count', 0)}")\n        lines.append(f"total_interactions: {summary.get('total_interactions', 0)}")\n        lines.extend(gate_lines)\n        if summary.get("next_recommended_action") is not None:\n            lines.append(f"next_recommended_action: {summary.get('next_recommended_action')}")\n        return "\\n".join(lines) + "\\n"\n\n    strict_run = ns["run_hypothesis_suite_report"]\n    def run_hypothesis_suite_report(**kwargs: Any) -> dict[str, Any]:\n        output_dir = Path(kwargs["output_dir"])\n        output_dir.mkdir(parents=True, exist_ok=True)\n        enabled = bool(kwargs.get("hypothesis_progress", True))\n        bar = ns["tqdm"](total=1, desc="hypothesis suite", unit="suite", dynamic_ncols=True, leave=False, disable=not enabled)\n        started = __import__("time").time()\n        ns["log_hypothesis_progress"](output_dir, "SUITE", "starting", epoch_id=kwargs.get("epoch_id"), current=0, total=1)\n        try:\n            result = strict_run(**kwargs)\n        except BaseException as exc:\n            ns["log_hypothesis_progress"](output_dir, "SUITE", "failed", epoch_id=kwargs.get("epoch_id"), current=0, total=1, start_time=started, extra={"exception_type": type(exc).__name__, "exception_message": str(exc)})\n            raise\n        else:\n            bar.update(1)\n            ns["log_hypothesis_progress"](output_dir, "SUITE", "done", epoch_id=kwargs.get("epoch_id"), current=1, total=1, start_time=started)\n            return result\n        finally:\n            bar.close()\n\n    ns["build_hypothesis_suite_summary"] = build_hypothesis_suite_summary\n    ns["run_hypothesis_suite_report"] = run_hypothesis_suite_report\n    ns["_apply_higher_order_dependency_gates"] = _apply_higher_order_dependency_gates\n    ns["_apply_epoch_maturity_gates"] = _apply_epoch_maturity_gates\n    ns["_blocker_flags_for_result"] = _blocker_flags_for_result\n    ns["_write_aggregated_hypothesis_text"] = _write_aggregated_hypothesis_text\n    ns["_format_aggregated_result_section"] = _format_section\n    ns["_suite_gate_status"] = _suite_gate_status\n    ns["_format_text"] = _format_text_compat\n'''
+          if old_tail in text:
+              text = text.replace(old_tail, new_tail, 1)
+          path.write_text(text, encoding='utf-8')
           PY
           if ! git diff --quiet; then
             git config user.name "ChatGPT"
             git config user.email "actions@users.noreply.github.com"
-            git add src/v6 .github/workflows/all-v6-tests.yml
-            git commit -m "Fix remaining v6 test compatibility regressions"
+            git add src/v6
+            git commit -m "Fix promotion, H09, provenance, and suite compatibility"
             git push origin HEAD:chatgpt-all-tests-pass
           fi
       - name: Install test dependencies
@@ -78,13 +107,7 @@ jobs:
       - name: Run focused repaired tests
         env:
           PYTHONPATH: src
-        run: |
-          pytest -q \
-            src/v6/tests/test_hypothesis_suite_report.py \
-            src/v6/tests/test_future_option_development.py \
-            src/v6/tests/test_future_option_provenance.py \
-            src/v6/tests/test_v6_higher_order.py \
-            src/v6/tests/test_v6_core.py
+        run: pytest -q src/v6/tests/test_hypothesis_suite_report.py src/v6/tests/test_future_option_development.py src/v6/tests/test_future_option_provenance.py src/v6/tests/test_v6_higher_order.py src/v6/tests/test_v6_core.py
       - name: Run full v6 suite
         env:
           PYTHONPATH: src
