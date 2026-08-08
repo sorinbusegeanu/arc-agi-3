@@ -4,34 +4,17 @@ on:
   pull_request:
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
   pytest:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: canonicalize-v63-repairs
-          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
           cache: pip
-      - name: Apply one-shot canonicalization
-        if: github.head_ref == 'canonicalize-v63-repairs'
-        run: |
-          sed -n "/python - <<'PY'/,/^          PY$/p" .github/workflows/canonicalize-v63.yml | sed '1d;$d;s/^          //' > /tmp/canonicalize.py
-          python /tmp/canonicalize.py
-          git restore .github/workflows/v6-pytest.yml .github/workflows/canonicalize-v63.yml
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add -A
-          git commit -m "Canonicalize v6.3 semantics and package dependencies"
-          git push origin HEAD:canonicalize-v63-repairs
-      - name: Install declared dependencies
+      - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[test]"
