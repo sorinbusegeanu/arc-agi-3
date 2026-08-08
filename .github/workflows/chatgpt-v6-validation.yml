@@ -1,0 +1,36 @@
+name: ChatGPT v6 validation
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: chatgpt-all-tests-pass
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip pytest numpy networkx tqdm pandas scikit-learn pyarrow duckdb 'arc-agi>=0.9.1'
+      - name: Focused repaired tests
+        env:
+          PYTHONPATH: src
+        run: pytest -q src/v6/tests/test_hypothesis_suite_report.py src/v6/tests/test_future_option_development.py src/v6/tests/test_future_option_provenance.py src/v6/tests/test_v6_higher_order.py src/v6/tests/test_v6_core.py
+      - name: Full v6 suite
+        env:
+          PYTHONPATH: src
+        run: |
+          set -o pipefail
+          pytest -q src/v6/tests 2>&1 | tee pytest-v6-output.txt
+      - name: Upload output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trusted-v6-output
+          path: pytest-v6-output.txt
