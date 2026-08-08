@@ -860,7 +860,7 @@ def test_epoch_status_and_suite_summary_exist_and_memory_continuity_is_written(t
     assert status["Games"] == 1
     assert status["Total_Levels"] == 1
     assert status["Total_Games"] == 1
-    assert summary["H04 decision"] in {"INCONCLUSIVE", "PARTIALLY_VALID", "VALID", "INVALID"}
+    assert summary["H04 decision"] in {"INSUFFICIENT_EVIDENCE", "INCONCLUSIVE", "PARTIALLY_VALID", "VALID", "INVALID"}
     assert summary["Levels"] == 1
     assert summary["Games"] == 1
     assert summary["Total_Levels"] == 1
