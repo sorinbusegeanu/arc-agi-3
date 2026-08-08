@@ -30,3 +30,9 @@ def apply_patch() -> None:
         return result
 
     module.run_hypothesis_suite_report = run_hypothesis_suite_report
+
+    # continuous_research imports the reporter into its module namespace, so
+    # keep that bound reference synchronized with the final patched reporter.
+    import v6.continuous_research as continuous_research
+
+    continuous_research.run_hypothesis_suite_report = run_hypothesis_suite_report
