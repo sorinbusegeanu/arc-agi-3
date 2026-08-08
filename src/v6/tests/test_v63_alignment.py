@@ -358,5 +358,10 @@ def test_v63_compact_merge_preserves_score_extensions_and_evidence_tables() -> N
     revision_count = target.execute(
         "SELECT COUNT(*) FROM memory_evidence_revisions_v63 WHERE revision_id='revision-1'"
     ).fetchone()[0]
-    assert score == pytest.approx((0.7, 0.4, "empirical", 0.6, "v63_unified_memory_fitness_v1"))
+    assert score is not None
+    assert score[0] == pytest.approx(0.7)
+    assert score[1] == pytest.approx(0.4)
+    assert score[2] == "empirical"
+    assert score[3] == pytest.approx(0.6)
+    assert score[4] == "v63_unified_memory_fitness_v1"
     assert revision_count == 1
