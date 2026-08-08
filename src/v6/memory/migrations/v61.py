@@ -62,11 +62,20 @@ def _memory_version(connection: sqlite3.Connection, key: str) -> str | None:
     return None if row is None or row[0] is None else str(row[0])
 
 
+def _install_current_runtime_performance(schema_version: str | None) -> None:
+    if _version_tuple(schema_version) < (6, 3):
+        return
+    from v6.memory.v63_performance import install_v63_validation_performance
+
+    install_v63_validation_performance()
+
+
 def migrate_connection(connection: sqlite3.Connection) -> dict[str, object]:
     connection.execute(
         "CREATE TABLE IF NOT EXISTS memory_versions (key TEXT PRIMARY KEY, value TEXT)"
     )
     existing_schema_version = _memory_version(connection, "memory_substrate_schema")
+    _install_current_runtime_performance(existing_schema_version)
     marker = _memory_version(connection, MIGRATION_MARKER_KEY)
     if marker == MIGRATION_MARKER_VERSION:
         return {
