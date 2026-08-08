@@ -4,6 +4,8 @@ from collections import Counter
 from dataclasses import asdict, dataclass
 from typing import Any, Iterable
 
+from v6.memory.v63_policy import unified_memory_fitness
+
 
 def clamp01(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
@@ -26,6 +28,11 @@ class MemoryRecord:
     replay_count: int
     status: str
     retention_reason: str
+    transfer_prior: float | None = None
+    transfer_empirical_rate: float | None = None
+    learning_value_realized: float | None = None
+    explanatory_value_realized: float | None = None
+    evidence_revision_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -54,16 +61,19 @@ def compute_memory_fitness(
     context_contradiction: bool,
     replay_count: int,
 ) -> float:
-    fitness = (
-        0.35 * clamp01(isf_total)
-        + 0.20 * clamp01(prediction_error)
-        + 0.15 * clamp01(learning_value)
-        + 0.15 * clamp01(transfer_potential)
-        + 0.10 * clamp01(explanatory_potential)
-        + 0.05 * (1.0 if context_contradiction else 0.0)
+    # v6.3: PE/LV/TP/EP are already represented in ISF and must not be re-added
+    # with a second arbitrary coefficient set. MF is the common monotone
+    # aggregation over active normalized memory-level dimensions.
+    fitness, _components = unified_memory_fitness(
+        isf_score=clamp01(isf_total),
+        explanatory_reach=clamp01(explanatory_potential),
+        transfer_prior=clamp01(transfer_potential),
+        transfer_empirical=None,
+        recurrence_score=None,
+        efficiency_score=None,
     )
-    fitness = fitness / (1.0 + 0.10 * max(0, int(replay_count)))
-    return clamp01(fitness)
+    del prediction_error, learning_value, context_contradiction, replay_count
+    return fitness
 
 
 class MemoryLifecycleManager:
@@ -133,6 +143,7 @@ class MemoryLifecycleManager:
             replay_count=0,
             status=status,
             retention_reason=retention_reason,
+            transfer_prior=float(transfer_potential),
         )
         self.records[record.interaction_id] = record
         self._recompute_counters()
@@ -213,6 +224,9 @@ class MemoryLifecycleManager:
             "memory_replay_candidate_count": len(self.replay_candidates),
             "memory_max_replay_priority": max(priorities, default=0.0),
             "memory_mean_replay_priority": (sum(priorities) / len(priorities)) if priorities else 0.0,
+            "memory_evidence_revision_count": sum(
+                int(record.evidence_revision_count) for record in self.records.values()
+            ),
             "memory_top_retention_reasons": [
                 {"retention_reason": reason, "count": int(count)}
                 for reason, count in self.retention_reason_counts.most_common(20)
@@ -242,32 +256,80 @@ class MemoryLifecycleManager:
         learning_credit: float,
         reason: str,
     ) -> None:
+        self.apply_retrospective_evidence(
+            interaction_id,
+            learning_value=learning_credit,
+            reason=reason,
+        )
+
+    def apply_retrospective_evidence(
+        self,
+        interaction_id: str,
+        *,
+        learning_value: float | None = None,
+        explanatory_value: float | None = None,
+        transfer_empirical_rate: float | None = None,
+        reason: str,
+    ) -> None:
         interaction_id = str(interaction_id)
         record = self.records.get(interaction_id)
         if record is None:
             return
+        updated = MemoryRecord(
+            **{
+                **record.to_dict(),
+                "learning_value_realized": _max_optional(
+                    record.learning_value_realized,
+                    learning_value,
+                ),
+                "explanatory_value_realized": _max_optional(
+                    record.explanatory_value_realized,
+                    explanatory_value,
+                ),
+                "transfer_empirical_rate": (
+                    record.transfer_empirical_rate
+                    if transfer_empirical_rate is None
+                    else clamp01(transfer_empirical_rate)
+                ),
+                "evidence_revision_count": int(record.evidence_revision_count) + 1,
+            }
+        )
+        self.records[interaction_id] = updated
+
+        realized_credit = max(
+            0.0,
+            float(learning_value or 0.0),
+            float(explanatory_value or 0.0),
+            float(transfer_empirical_rate or 0.0),
+        )
         existing = self.replay_candidates.get(interaction_id)
         replay_priority = max(
             0.0 if existing is None else float(existing.replay_priority),
-            clamp01(float(learning_credit)),
+            clamp01(realized_credit),
+            self._memory_fitness(updated),
         )
         merged_reason = _merge_reasons(existing.reason if existing is not None else None, reason)
         self.replay_candidates[interaction_id] = ReplayCandidate(
             interaction_id=interaction_id,
             replay_priority=replay_priority,
             reason=merged_reason,
-            family_id=record.family_id,
-            context_signature=record.context_signature,
-            status=record.status,
+            family_id=updated.family_id,
+            context_signature=updated.context_signature,
+            status=updated.status,
         )
         self._trim_replay_queue()
         self._recompute_counters()
 
     def _should_enter_replay(self, record: MemoryRecord) -> bool:
+        transfer_prior = (
+            record.transfer_prior
+            if record.transfer_prior is not None
+            else record.transfer_potential
+        )
         return (
             float(record.prediction_error) >= 0.50
             or float(record.learning_value) >= 0.50
-            or float(record.transfer_potential) >= 0.40
+            or float(transfer_prior or 0.0) >= 0.40
             or float(record.explanatory_potential) >= 0.40
             or bool(record.context_contradiction)
         )
@@ -280,15 +342,24 @@ class MemoryLifecycleManager:
         self.replay_candidates = {key: value for key, value in self.replay_candidates.items() if key in keep_ids}
 
     def _memory_fitness(self, record: MemoryRecord) -> float:
-        return compute_memory_fitness(
-            isf_total=record.isf_total,
-            prediction_error=record.prediction_error,
-            learning_value=record.learning_value,
-            transfer_potential=record.transfer_potential,
-            explanatory_potential=record.explanatory_potential,
-            context_contradiction=record.context_contradiction,
-            replay_count=record.replay_count,
+        transfer_prior = (
+            record.transfer_prior
+            if record.transfer_prior is not None
+            else record.transfer_potential
         )
+        fitness, _components = unified_memory_fitness(
+            isf_score=record.isf_total,
+            explanatory_reach=(
+                record.explanatory_value_realized
+                if record.explanatory_value_realized is not None
+                else record.explanatory_potential
+            ),
+            transfer_prior=transfer_prior,
+            transfer_empirical=record.transfer_empirical_rate,
+            recurrence_score=None,
+            efficiency_score=None,
+        )
+        return fitness
 
     def _recompute_counters(self) -> None:
         self.status_counts = Counter(record.status for record in self.records.values())
@@ -315,7 +386,7 @@ def _retention_reason(
     candidates = {
         "prediction_error": clamp01(prediction_error),
         "learning_value": clamp01(learning_value),
-        "transfer_potential": clamp01(transfer_potential),
+        "transfer_prior": clamp01(transfer_potential),
         "explanatory_potential": clamp01(explanatory_potential),
         "context_contradiction": 1.0 if context_contradiction else 0.0,
     }
@@ -332,3 +403,11 @@ def _merge_reasons(old: str | None, new: str) -> str:
             if part and part not in parts:
                 parts.append(part)
     return "+".join(parts)
+
+
+def _max_optional(old: float | None, new: float | None) -> float | None:
+    if new is None:
+        return old
+    if old is None:
+        return clamp01(new)
+    return max(clamp01(old), clamp01(new))
