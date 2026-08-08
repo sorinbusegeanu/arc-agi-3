@@ -1,0 +1,398 @@
+name: canonicalize v63
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  canonicalize:
+    if: github.head_ref == 'canonicalize-v63-repairs'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: canonicalize-v63-repairs
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Canonicalize v6.3 semantics and packaging
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def append_once(path, marker, text):
+              p = Path(path)
+              s = p.read_text()
+              if marker not in s:
+                  p.write_text(s.rstrip() + "\n\n" + text.strip() + "\n")
+
+          # Packaging: declare what the package actually imports/uses.
+          Path('pyproject.toml').write_text('''[build-system]\nrequires = ["setuptools>=61.0"]\nbuild-backend = "setuptools.build_meta"\n\n[project]\nname = "arc-agi-v6"\nversion = "0.1.0"\ndescription = "AGI v6 - Agent General Intelligence System"\nrequires-python = ">=3.12"\ndependencies = [\n    "arc-agi>=0.9.9,<1.0",\n    "duckdb>=1.0",\n    "networkx>=3.0",\n    "numpy>=1.26",\n    "pandas>=2.0",\n    "pyarrow>=15.0",\n    "scikit-learn>=1.4",\n    "tqdm>=4.66",\n]\n\n[project.optional-dependencies]\ntest = ["pytest>=8.0"]\n''')
+
+          # Importing v6 must have no side-effect monkey patching.
+          Path('src/v6/__init__.py').write_text('''"""ARC-AGI3 v6 cognitive interaction learner."""\n\nfrom v6.main import V6Config, V6System\n\n__all__ = ["V6Config", "V6System"]\n''')
+
+          # Add pure normalization entry points to the existing v6.3 semantics module.
+          repairs = Path('src/v6/v63_report_repairs.py')
+          rs = repairs.read_text()
+          marker = '# Canonical call points: pure helpers, no module patching.'
+          if marker not in rs:
+              rs += r'''
+
+# Canonical call points: pure helpers, no module patching.
+def normalize_h01_result(result: dict[str, Any]) -> dict[str, Any]:
+    stable = result.get("stable_contingency_count")
+    if stable is not None:
+        _repair_core_metrics(
+            result,
+            {
+                "stable_contingencies_count": int(stable),
+                "discovered_contingencies_count": int(
+                    result.get("discovered_contingency_count")
+                    or result.get("contingency_candidate_count")
+                    or 0
+                ),
+            },
+        )
+    return result
+
+
+def normalize_h02_result(result: dict[str, Any]) -> dict[str, Any]:
+    if result.get("context_contradiction_count") is not None:
+        _repair_core_metrics(
+            result,
+            {
+                "context_contradiction_tagged_interaction_count": int(
+                    result.get("context_contradiction_count") or 0
+                )
+            },
+        )
+    return result
+
+
+def normalize_h03_result(result: dict[str, Any], memory_dir: Any) -> dict[str, Any]:
+    updates: dict[str, Any] = {}
+    if memory_dir is not None:
+        for field, scope, legacy_field in (
+            ("family_cross_game_count", "game", "family_cross_game_membership_count"),
+            ("family_cross_sampler_count", "sampler", "family_cross_sampler_membership_count"),
+        ):
+            actual = _distinct_family_scope_count(memory_dir, scope)
+            if actual is not None:
+                if result.get(field) is not None:
+                    updates[legacy_field] = result.get(field)
+                updates[field] = actual
+    if updates:
+        _repair_core_metrics(result, updates)
+    return result
+
+
+def normalize_h04_result(result: dict[str, Any]) -> dict[str, Any]:
+    strict = _strict_before(
+        result.get("first_stable_transformation_family_step"),
+        result.get("first_emergent_carrier_step"),
+    )
+    strict_usable = _strict_before(
+        result.get("first_stable_transformation_family_step"),
+        result.get("first_usable_emergent_carrier_step"),
+    )
+    _repair_core_metrics(
+        result,
+        {
+            "h03_before_h04": strict,
+            "h03_before_h04_usable": strict_usable,
+            "temporal_order_comparison": "strict_before",
+        },
+    )
+    if strict_usable is False:
+        message = (
+            "Strict H03-before-H04 temporal order is not demonstrated; "
+            "equal timestamps do not establish developmental precedence."
+        )
+        if str(result.get("carrier_timing_source")) == "real_evidence":
+            result["decision"] = "INVALID"
+        elif str(result.get("decision")) == "VALID":
+            result["decision"] = "PARTIALLY_VALID"
+        _add_missing(result, message)
+    return result
+
+
+def normalize_h05_result(result: dict[str, Any]) -> dict[str, Any]:
+    strict = _strict_before(
+        result.get("first_emergent_carrier_step"),
+        result.get("first_emergent_role_step"),
+    )
+    _repair_core_metrics(
+        result,
+        {
+            "h04_before_h05": strict,
+            "h04_before_h05_cases": 1 if strict is True else 0,
+            "temporal_order_comparison": "strict_before",
+        },
+    )
+    if strict is False:
+        message = (
+            "Strict H04-before-H05 temporal order is not demonstrated; "
+            "equal timestamps do not establish developmental precedence."
+        )
+        if str(result.get("role_timing_source")) == "real_evidence":
+            result["decision"] = "INVALID"
+        elif str(result.get("decision")) == "VALID":
+            result["decision"] = "PARTIALLY_VALID"
+        _add_missing(result, message)
+    return result
+
+
+def normalize_h07_result(result: dict[str, Any]) -> dict[str, Any]:
+    validation = result.get("incremental_promotion_validation")
+    candidates = list(validation.get("candidates") or []) if isinstance(validation, dict) else []
+    if candidates:
+        current = [item for item in candidates if bool(item.get("current_validation_passed"))]
+        historical = [item for item in candidates if bool(item.get("historically_promoted"))]
+        updates = {
+            "current_validated_promoted_concept_count": len(current),
+            "promoted_concept_count": len(current),
+            "historical_promoted_concept_count": len(historical),
+            "promoted_cross_game_count": sum(
+                1 for item in current if int(item.get("cross_game_evidence_count") or 0) >= 1
+            ),
+            "promoted_cross_context_count": sum(
+                1 for item in current if int(item.get("cross_context_evidence_count") or 0) >= 1
+            ),
+        }
+        if not current:
+            updates["first_promoted_concept_step"] = None
+        _repair_core_metrics(result, updates)
+    return result
+'''
+              repairs.write_text(rs)
+
+          # Framework directly derives claim coverage instead of relying on an installer.
+          p = Path('src/v6/reporting/framework.py')
+          s = p.read_text()
+          if 'coverage_source = "report"' not in s:
+              s = s.replace(
+                  '    updated = dict(result)\n    raw_decision = _normalize_raw_decision(updated.get("decision"))',
+                  '    updated = dict(result)\n    coverage_source = "report"\n    if updated.get("evidence_coverage_ratio") is None:\n        record = dict((provenance or {}).get("by_hypothesis", {}).get(hypothesis_id, {}) or {})\n        verified = int(record.get("verified_claim_count", 0) or 0)\n        proxy = int(record.get("proxy_claim_count", 0) or 0)\n        legacy = int(record.get("legacy_claim_count", 0) or 0)\n        invalid = int(record.get("invalid_claim_count", 0) or 0)\n        missing = int(record.get("missing_provenance_count", 0) or 0)\n        total = verified + proxy + legacy + invalid + missing\n        if total > 0:\n            updated["evidence_coverage_ratio"] = float(verified) / float(total)\n            updated["evidence_coverage_source"] = "provenance_claims"\n            coverage_source = "provenance_claims"\n    raw_decision = _normalize_raw_decision(updated.get("decision"))'
+              )
+              s = s.replace(
+                  '                "actual_coverage": coverage,\n                **proxy_summary,',
+                  '                "actual_coverage": coverage,\n                "coverage_source": updated.get("evidence_coverage_source", coverage_source),\n                **proxy_summary,'
+              )
+              p.write_text(s)
+
+          # H06 read-only mode must never initialize/migrate the snapshot.
+          p = Path('src/v6/hypothesis_h06_report.py')
+          s = p.read_text()
+          s = s.replace(
+              '    output_dir.mkdir(parents=True, exist_ok=True)\n    ensure_memory_layout(memory_dir)\n    if not already_derived:\n        derive_higher_order_memory(memory_dir=memory_dir, run_dir=run_dir)',
+              '    output_dir.mkdir(parents=True, exist_ok=True)\n    if not already_derived:\n        ensure_memory_layout(memory_dir)\n        derive_higher_order_memory(memory_dir=memory_dir, run_dir=run_dir)'
+          )
+          p.write_text(s)
+
+          # Canonical evaluators own their v6.3 post-processing.
+          wrappers = {
+          'src/v6/hypothesis_h01_report.py': r'''
+# v6.3 canonical semantics
+_evaluate_h01_contingency_emergence_base = evaluate_h01_contingency_emergence
+
+def evaluate_h01_contingency_emergence(run_dir: Path, output_dir: Path, *, memory_dir: Path | None = None) -> dict:
+    from v6.v63_report_repairs import normalize_h01_result
+    result = _evaluate_h01_contingency_emergence_base(run_dir, output_dir, memory_dir=memory_dir)
+    normalize_h01_result(result)
+    _finalize_h01_result(result, Path(output_dir))
+    return result
+''',
+          'src/v6/hypothesis_h02_report.py': r'''
+# v6.3 canonical semantics
+_evaluate_h02_prediction_violation_attention_base = evaluate_h02_prediction_violation_attention
+
+def evaluate_h02_prediction_violation_attention(*args: Any, **kwargs: Any) -> dict:
+    from v6.v63_report_repairs import _rewrite_json, normalize_h02_result
+    result = _evaluate_h02_prediction_violation_attention_base(*args, **kwargs)
+    normalize_h02_result(result)
+    output_dir = kwargs.get("output_dir")
+    if output_dir is None and len(args) > 1:
+        output_dir = args[1]
+    if output_dir is not None:
+        _rewrite_json(output_dir, H02_JSON_NAME, result)
+    return result
+''',
+          'src/v6/hypothesis_h03_report.py': r'''
+# v6.3 canonical semantics
+_evaluate_h03_transformation_family_formation_base = evaluate_h03_transformation_family_formation
+
+def evaluate_h03_transformation_family_formation(*args: Any, **kwargs: Any) -> dict:
+    from v6.v63_report_repairs import _rewrite_json, normalize_h03_result
+    result = _evaluate_h03_transformation_family_formation_base(*args, **kwargs)
+    memory_dir = kwargs.get("memory_dir")
+    normalize_h03_result(result, memory_dir)
+    output_dir = kwargs.get("output_dir")
+    if output_dir is None and len(args) > 1:
+        output_dir = args[1]
+    if output_dir is not None:
+        _rewrite_json(output_dir, "h03_transformation_family_report.json", result)
+    return result
+''',
+          'src/v6/hypothesis_h04_report.py': r'''
+# v6.3 canonical semantics
+_evaluate_h04_carrier_emergence_base = evaluate_h04_carrier_emergence
+
+def evaluate_h04_carrier_emergence(*args: Any, **kwargs: Any) -> dict:
+    from v6.v63_report_repairs import _rewrite_json, normalize_h04_result
+    result = _evaluate_h04_carrier_emergence_base(*args, **kwargs)
+    normalize_h04_result(result)
+    output_dir = kwargs.get("output_dir")
+    if output_dir is None and len(args) > 1:
+        output_dir = args[1]
+    if output_dir is not None:
+        _rewrite_json(output_dir, "h04_carrier_emergence_report.json", result)
+    return result
+''',
+          'src/v6/hypothesis_h05_report.py': r'''
+# v6.3 canonical semantics
+_evaluate_h05_role_emergence_base = evaluate_h05_role_emergence
+
+def evaluate_h05_role_emergence(*args: Any, **kwargs: Any) -> dict:
+    from v6.v63_report_repairs import _rewrite_json, normalize_h05_result
+    result = _evaluate_h05_role_emergence_base(*args, **kwargs)
+    normalize_h05_result(result)
+    output_dir = kwargs.get("output_dir")
+    if output_dir is None and len(args) > 1:
+        output_dir = args[1]
+    if output_dir is not None:
+        _rewrite_json(output_dir, "h05_functional_role_emergence_report.json", result)
+    return result
+''',
+          'src/v6/hypothesis_h07_report.py': r'''
+# v6.3 canonical semantics
+_evaluate_h07_concept_emergence_base = evaluate_h07_concept_emergence
+
+def evaluate_h07_concept_emergence(*args: Any, **kwargs: Any) -> dict:
+    from v6.v63_report_repairs import _rewrite_json, normalize_h07_result
+    result = _evaluate_h07_concept_emergence_base(*args, **kwargs)
+    normalize_h07_result(result)
+    output_dir = kwargs.get("output_dir")
+    if output_dir is not None:
+        _rewrite_json(output_dir, "h07_concept_emergence_report.json", result)
+    return result
+''',
+          }
+          for path, text in wrappers.items():
+              append_once(path, '# v6.3 canonical semantics', text)
+
+          append_once('src/v6/higher_order_substrate.py', '# v6.3 canonical concept refinement', r'''
+# v6.3 canonical concept refinement
+_derive_concept_candidates_base = derive_concept_candidates
+
+def derive_concept_candidates(state_conn: sqlite3.Connection, progress_factory: Any | None = None) -> dict[str, Any]:
+    from v6.v63_report_repairs import _refine_broad_concept_candidates
+    summary = _derive_concept_candidates_base(state_conn, progress_factory=progress_factory)
+    return _refine_broad_concept_candidates(state_conn, summary)
+''')
+
+          append_once('src/v6/future_options.py', '# v6.3 canonical current-validation semantics', r'''
+# v6.3 canonical current-validation semantics
+_concept_validation_records_base = _concept_validation_records
+
+def _concept_validation_records(state_conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
+    from v6.v63_report_repairs import _current_validation_records
+    previous = state_conn.row_factory
+    state_conn.row_factory = sqlite3.Row
+    try:
+        base = _concept_validation_records_base(state_conn)
+    finally:
+        state_conn.row_factory = previous
+    return _current_validation_records(state_conn, base)
+
+
+def resolve_future_option_development_stage(
+    state_conn: sqlite3.Connection,
+    *,
+    requested_stage: FutureOptionDevelopmentStage | str,
+    thresholds: FutureOptionDevelopmentThresholds | None = None,
+) -> FutureOptionDevelopmentStage:
+    requested = (
+        requested_stage
+        if isinstance(requested_stage, FutureOptionDevelopmentStage)
+        else FutureOptionDevelopmentStage(str(requested_stage).strip().lower())
+    )
+    if requested is not FutureOptionDevelopmentStage.AUTO:
+        return requested
+    limits = thresholds or FutureOptionDevelopmentThresholds()
+    records = _concept_validation_records(state_conn)
+    verified_concepts = sum(1 for record in records.values() if record.get("status") == "verified")
+    counts = {
+        "stable_contingencies": int(state_conn.execute("SELECT COUNT(*) FROM stable_contingencies").fetchone()[0]),
+        "transformation_families": int(state_conn.execute("SELECT COUNT(*) FROM transformation_families").fetchone()[0]),
+        "carriers": int(state_conn.execute("SELECT COUNT(*) FROM carrier_candidates WHERE COALESCE(is_emergent,0)=1").fetchone()[0]),
+        "roles": int(state_conn.execute("SELECT COUNT(*) FROM role_candidates WHERE COALESCE(is_emergent,0)=1").fetchone()[0]),
+        "promoted_concepts": verified_concepts,
+        "successful_transfers": int(state_conn.execute("SELECT COUNT(*) FROM role_transfer_attempts WHERE COALESCE(reuse_success,0)=1").fetchone()[0]),
+    }
+    if counts["promoted_concepts"] >= limits.promoted_concepts and counts["successful_transfers"] >= limits.successful_transfers:
+        return FutureOptionDevelopmentStage.CONCEPT_TRANSFER
+    if counts["roles"] >= limits.roles:
+        return FutureOptionDevelopmentStage.ROLE_DISCOVERY
+    if counts["carriers"] >= limits.carriers:
+        return FutureOptionDevelopmentStage.GRAPH_EXPANSION
+    if counts["transformation_families"] >= limits.transformation_families:
+        return FutureOptionDevelopmentStage.ENVIRONMENTAL_INFLUENCE
+    if counts["stable_contingencies"] >= limits.stable_contingencies:
+        return FutureOptionDevelopmentStage.MOVEMENT_FREEDOM
+    return FutureOptionDevelopmentStage.SURVIVAL
+''')
+
+          append_once('src/v6/hypothesis_suite_report.py', '# v6.3 canonical temporal summary', r'''
+# v6.3 canonical temporal summary
+_build_hypothesis_suite_summary_base = build_hypothesis_suite_summary
+
+def build_hypothesis_suite_summary(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    from v6.v63_report_repairs import _strict_temporal_summary
+    summary = _build_hypothesis_suite_summary_base(*args, **kwargs)
+    run_dir = kwargs.get("run_dir")
+    if run_dir is not None:
+        strict = _strict_temporal_summary(run_dir)
+        if strict is not None:
+            summary["temporal_order_diagnostics"] = strict
+    return summary
+''')
+
+          # The compatibility monkey patch is no longer needed.
+          compat = Path('src/v6/v63_report_repairs_compat.py')
+          if compat.exists():
+              compat.unlink()
+
+          # Tests must exercise canonical call points, not install the old patch layer.
+          p = Path('src/v6/tests/test_v63_report_repairs.py')
+          s = p.read_text()
+          s = s.replace(',\n    install_v63_report_repairs,', ',')
+          start = s.find('def test_v63_report_repairs_install_idempotently()')
+          if start >= 0:
+              end = s.find('\n\ndef ', start + 1)
+              if end >= 0:
+                  s = s[:start] + s[end+2:]
+          p.write_text(s)
+
+          # CI now verifies that declared package metadata is sufficient.
+          p = Path('.github/workflows/v6-pytest.yml')
+          s = p.read_text()
+          s = s.replace('python -m pip install -e . pytest numpy pandas tqdm networkx pyarrow duckdb scikit-learn arc-agi', 'python -m pip install -e ".[test]"')
+          p.write_text(s)
+
+          # No import-time installation may remain.
+          init_text = Path('src/v6/__init__.py').read_text()
+          assert 'install_v63_report_repairs' not in init_text
+          assert 'install_v63_report_repairs_compat' not in init_text
+          assert 'ensure_memory_layout(memory_dir)\n    if not already_derived' not in Path('src/v6/hypothesis_h06_report.py').read_text()
+          PY
+          git rm .github/workflows/canonicalize-v63.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git commit -m "Canonicalize v6.3 semantics and package dependencies"
+          git push origin HEAD:canonicalize-v63-repairs
