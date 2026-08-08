@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import time
+from hashlib import sha1
 from typing import Any
 
 V63_ABSTRACTION_VERSION = "v63_relational_abstraction_v1"
@@ -11,6 +12,7 @@ UNQUALIFIED_EVIDENCE_PREFIX = "v63_unqualified_transfer:"
 _PATCHED = False
 _ORIGINAL_RECORD_PREDICTION_OUTCOME: Any = None
 _ORIGINAL_CONCEPT_TRANSFER_COUNTS: Any = None
+_ORIGINAL_PROMOTE_MULTI_ROLE_CONCEPTS: Any = None
 
 
 def _table_columns(connection: Any, table: str) -> set[str]:
@@ -32,6 +34,7 @@ def install_v63_transfer_policy() -> None:
     global _PATCHED
     global _ORIGINAL_RECORD_PREDICTION_OUTCOME
     global _ORIGINAL_CONCEPT_TRANSFER_COUNTS
+    global _ORIGINAL_PROMOTE_MULTI_ROLE_CONCEPTS
     if _PATCHED:
         _patch_v6_system_if_loaded()
         return
@@ -48,11 +51,17 @@ def install_v63_transfer_policy() -> None:
     _ORIGINAL_CONCEPT_TRANSFER_COUNTS = (
         V621PromotionEngine._concept_transfer_counts
     )
+    _ORIGINAL_PROMOTE_MULTI_ROLE_CONCEPTS = (
+        V621AbstractionEngine.promote_multi_role_concepts
+    )
     V621MemoryController.record_prediction_outcome = (
         _record_prediction_outcome_v63
     )
     V621AbstractionEngine._direct_concept_transfer_for_roles = (
         _direct_concept_transfer_for_roles_v63
+    )
+    V621AbstractionEngine.promote_multi_role_concepts = (
+        _promote_multi_role_concepts_with_empirical_upgrade_v63
     )
     V621PromotionEngine._concept_transfer_counts = (
         _concept_transfer_counts_v63
@@ -120,6 +129,8 @@ def _apply_trajectory_efficiency_bonus_v63(
     trajectory_record: Any,
     interaction_ids: list[int],
 ) -> None:
+    import json
+
     from v6.memory.substrate import MemoryScore, trajectory_node_id
     from v6.memory.v63_policy import SCORE_POLICY_VERSION, unified_memory_fitness
     from v6.memory_lifecycle import ReplayCandidate
@@ -306,7 +317,7 @@ def _apply_trajectory_efficiency_bonus_v63(
             (
                 float(memory_fitness),
                 efficiency_score,
-                __import__("json").dumps(components, sort_keys=True),
+                json.dumps(components, sort_keys=True),
                 SCORE_POLICY_VERSION,
                 node_id,
             ),
@@ -484,6 +495,86 @@ def _direct_concept_transfer_for_roles_v63(
         "tests": int(row[0] or 0),
         "successes": int(row[1] or 0),
     }
+
+
+def _promote_multi_role_concepts_with_empirical_upgrade_v63(
+    self: Any,
+    *,
+    step: int | None = None,
+) -> int:
+    created = int(
+        _ORIGINAL_PROMOTE_MULTI_ROLE_CONCEPTS(self, step=step) or 0
+    )
+    for concept in self.memory.query_nodes(
+        memory_level="M4",
+        node_type="ConceptMemory",
+    ):
+        attrs = dict(concept.get("attrs") or {})
+        if attrs.get("concept_version") != V63_ABSTRACTION_VERSION:
+            continue
+        concept_id = str(concept["node_id"])
+        row = self.memory.connection.execute(
+            """
+            SELECT COUNT(*),
+                   COALESCE(SUM(CASE WHEN success=1 THEN 1 ELSE 0 END), 0),
+                   COUNT(DISTINCT game)
+            FROM concept_transfer_attempts_v621
+            WHERE concept_id=?
+              AND evidence_source LIKE ?
+            """,
+            (concept_id, QUALIFIED_EVIDENCE_PREFIX + "%"),
+        ).fetchone()
+        tests = int(row[0] or 0)
+        successes = int(row[1] or 0)
+        target_game_count = int(row[2] or 0)
+        if tests <= 0:
+            continue
+        rate = float(successes) / float(tests)
+        attrs["transfer_tests"] = tests
+        attrs["transfer_success_count"] = successes
+        attrs["transfer_failure_count"] = max(0, tests - successes)
+        attrs["transfer_empirical_rate"] = rate
+        attrs["transfer_evidence_status"] = "empirical"
+        attrs["transfer_score"] = rate
+        attrs["empirical_target_game_count"] = target_game_count
+        attrs["cross_game_evidence"] = True
+        attrs["validation_source"] = "qualified_unseen_concept_transfer"
+        if tests >= 2 and rate >= 0.5:
+            attrs["promotion_status"] = "accepted"
+        else:
+            attrs["promotion_status"] = "candidate"
+        self.memory.update_node_support_and_attrs(
+            concept_id,
+            attrs,
+            support_increment=0,
+            step=step,
+        )
+        revision_id = "v63evidence:" + sha1(
+            f"{concept_id}|transfer|{tests}|{successes}|{step}".encode("utf-8")
+        ).hexdigest()[:24]
+        self.memory.connection.execute(
+            """
+            INSERT OR REPLACE INTO memory_evidence_revisions_v63(
+                revision_id, node_id, evidence_kind,
+                prospective_value, realized_value,
+                evidence_status, evidence_source,
+                global_step, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                revision_id,
+                concept_id,
+                "transfer",
+                attrs.get("transfer_prior"),
+                rate,
+                "empirical",
+                "qualified_unseen_concept_transfer",
+                step,
+                time.time(),
+            ),
+        )
+    self.memory.connection.commit()
+    return created
 
 
 def _concept_transfer_counts_v63(
