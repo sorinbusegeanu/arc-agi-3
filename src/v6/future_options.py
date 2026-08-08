@@ -367,6 +367,10 @@ def derive_future_option_events(
         row for row in future_edge_rows
         if str(row["source_node_id"]).startswith("M0:interaction:")
     ]
+    future_edge_rows = [
+        row for row in future_edge_rows
+        if str(row["source_node_id"]).startswith("M0:interaction:")
+    ]
     for row in future_edge_rows:
         future_edge_by_interaction.setdefault(str(row["source_node_id"]), str(row["edge_type"]))
         if edge_scan_tracker is not None:
