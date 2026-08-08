@@ -25,7 +25,10 @@ class InteractionSignificanceScore:
     transfer_prior: float = 0.0
     transfer_empirical_rate: float | None = None
     component_active: dict[str, bool] | None = None
-    version: str = "isf_v63"
+    # Keep the persisted record-format version stable for existing reports/tests.
+    # v6.3 policy semantics are versioned independently.
+    version: str = "isf_v02"
+    policy_version: str = "isf_v63"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
