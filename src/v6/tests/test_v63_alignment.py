@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 
 import pytest
 
 from v6.interaction_significance import compute_interaction_significance
 from v6.memory.promotion_engine import MemoryPromotionEngine
 from v6.memory.substrate import MemoryNode, MemorySubstrate
+from v6.memory.v621_runtime import V621AbstractionEngine
 from v6.memory.v63_policy import (
+    ABSTRACTION_VERSION,
     V63CandidateBudget,
     _bounded_pairs,
     resolve_transfer_evidence,
 )
+from v6.memory.v63_transfer import QUALIFIED_EVIDENCE_PREFIX
 from v6.memory_lifecycle import MemoryLifecycleManager, compute_memory_fitness
 
 
@@ -112,6 +116,77 @@ def test_v63_empirical_transfer_overrides_prior() -> None:
     assert empirical == pytest.approx(0.25)
     assert effective == pytest.approx(0.25)
     assert status == "empirical"
+
+
+def test_v63_concept_empirical_counts_only_qualified_unseen_reuse() -> None:
+    connection = sqlite3.connect(":memory:")
+    memory = MemorySubstrate(connection)
+    MemoryPromotionEngine(memory)
+    abstraction = V621AbstractionEngine(memory)
+
+    role_ids = {"M3:role:r1", "M3:role:r2"}
+    memory.upsert_node(
+        MemoryNode(
+            node_id="M4:concept:v63test",
+            memory_level="M4",
+            node_type="ConceptMemory",
+            canonical_key="v63test",
+            attrs={
+                "source_roles": sorted(role_ids),
+                "concept_version": ABSTRACTION_VERSION,
+                "source_games": ["source_game"],
+            },
+        )
+    )
+    now = time.time()
+    connection.execute(
+        """
+        INSERT INTO concept_transfer_attempts_v621(
+            attempt_id, concept_id, game, context_key,
+            action, predicted_family, actual_family,
+            success, evidence_source, global_step, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "qualified",
+            "M4:concept:v63test",
+            "heldout_game",
+            "ctx",
+            1,
+            "7",
+            "7",
+            1,
+            QUALIFIED_EVIDENCE_PREFIX + "test",
+            1,
+            now,
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO concept_transfer_attempts_v621(
+            attempt_id, concept_id, game, context_key,
+            action, predicted_family, actual_family,
+            success, evidence_source, global_step, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "unqualified",
+            "M4:concept:v63test",
+            "source_game",
+            "ctx",
+            1,
+            "7",
+            "7",
+            1,
+            "v63_unqualified_transfer:test",
+            2,
+            now,
+        ),
+    )
+    connection.commit()
+
+    counts = abstraction._direct_concept_transfer_for_roles(role_ids)
+    assert counts == {"tests": 1, "successes": 1}
 
 
 def test_v63_migration_and_legacy_world_model_path_disabled() -> None:
