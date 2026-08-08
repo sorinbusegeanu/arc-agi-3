@@ -22,7 +22,13 @@ class InteractionSignificanceScore:
     weights: dict[str, float]
     outcome_state: str | None = None
     outcome_polarity: str | None = None
+    transfer_prior: float = 0.0
+    transfer_empirical_rate: float | None = None
+    component_active: dict[str, bool] | None = None
+    # Keep the persisted record-format version stable for existing reports/tests.
+    # v6.3 policy semantics are versioned independently.
     version: str = "isf_v02"
+    policy_version: str = "isf_v63"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -92,12 +98,19 @@ def compute_interaction_significance(
     if future_option_delta is not None and float(future_option_delta) < 0.0:
         survival_impact = max(survival_impact, clamp01(abs(float(future_option_delta))))
 
-    if prediction_correct is True:
+    # v6.3: no supported expectation means PE is inactive. It must not be
+    # represented by a synthetic 0.5 surprise value during contingency seeding.
+    prediction_active = (
+        prediction_correct is not None
+        and prediction_confidence is not None
+        and float(prediction_confidence) > 0.0
+    )
+    if not prediction_active:
+        prediction_error = 0.0
+    elif prediction_correct is True:
         prediction_error = 1.0 - clamp01(prediction_confidence or 0.0)
-    elif prediction_correct is False:
-        prediction_error = max(0.5, clamp01(prediction_confidence or 0.5))
     else:
-        prediction_error = 0.5
+        prediction_error = max(0.5, clamp01(prediction_confidence or 0.5))
 
     novelty_scores: list[float] = []
     if delta_id:
@@ -124,12 +137,31 @@ def compute_interaction_significance(
         progress_learning_value = _novelty(memory_counts.get("level_completed_event:true", 0))
         learning_value = max(learning_value, progress_learning_value)
 
-    if future_option_delta is not None:
-        transfer_potential = clamp01(abs(future_option_delta))
-    else:
-        transfer_potential = 0.0
-    if actual_family_id and int(memory_counts.get(f"actual_family_id:{actual_family_id}", 0)) <= 2:
-        transfer_potential = max(transfer_potential, 0.4)
+    # v6.3: transfer prior is structural/contextual reuse evidence available now.
+    # Future-option magnitude and novelty are not transfer evidence.
+    transfer_prior = 0.0
+    transfer_active = False
+    if actual_family_id:
+        family_count = max(
+            0,
+            int(memory_counts.get(f"actual_family_id:{actual_family_id}", 0)),
+        )
+        local_count = 0
+        if context_signature:
+            local_count = max(
+                0,
+                int(
+                    memory_counts.get(
+                        f"context_family:{context_signature}|{actual_family_id}",
+                        0,
+                    )
+                ),
+            )
+        if family_count > 0:
+            cross_context_count = max(0, family_count - local_count)
+            transfer_prior = clamp01(cross_context_count / family_count)
+            transfer_active = True
+    transfer_potential = transfer_prior
 
     if explanatory_delta is not None:
         explanatory_potential = clamp01(abs(explanatory_delta))
@@ -140,12 +172,23 @@ def compute_interaction_significance(
     if int(graph_counts.get("new_graph_edge", 0)) > 0:
         explanatory_potential = max(explanatory_potential, 0.35)
 
-    total = clamp01(
-        survival_impact * normalized_weights["survival_impact"]
-        + prediction_error * normalized_weights["prediction_error"]
-        + learning_value * normalized_weights["learning_value"]
-        + transfer_potential * normalized_weights["transfer_potential"]
-        + explanatory_potential * normalized_weights["explanatory_potential"]
+    component_active = {
+        "survival_impact": True,
+        "prediction_error": prediction_active,
+        "learning_value": True,
+        "transfer_potential": transfer_active,
+        "explanatory_potential": bool(graph_counts) or explanatory_delta is not None,
+    }
+    total = _active_weighted_total(
+        {
+            "survival_impact": survival_impact,
+            "prediction_error": prediction_error,
+            "learning_value": learning_value,
+            "transfer_potential": transfer_potential,
+            "explanatory_potential": explanatory_potential,
+        },
+        normalized_weights,
+        component_active,
     )
     return InteractionSignificanceScore(
         survival_impact=survival_impact,
@@ -157,7 +200,30 @@ def compute_interaction_significance(
         weights=normalized_weights,
         outcome_state=normalized_outcome_state,
         outcome_polarity=normalized_outcome_polarity,
+        transfer_prior=transfer_prior,
+        transfer_empirical_rate=None,
+        component_active=component_active,
     )
+
+
+def _active_weighted_total(
+    values: Mapping[str, float],
+    weights: Mapping[str, float],
+    active: Mapping[str, bool],
+) -> float:
+    active_weight = sum(
+        float(weights.get(key, 0.0))
+        for key in values
+        if bool(active.get(key, False)) and float(weights.get(key, 0.0)) > 0.0
+    )
+    if active_weight <= 0.0:
+        return 0.0
+    weighted = sum(
+        clamp01(value) * float(weights.get(key, 0.0))
+        for key, value in values.items()
+        if bool(active.get(key, False)) and float(weights.get(key, 0.0)) > 0.0
+    )
+    return clamp01(weighted / active_weight)
 
 
 def _novelty(prior_count: int) -> float:

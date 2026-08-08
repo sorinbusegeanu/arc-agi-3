@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-from v6.memory.migrations.v621 import migrate_connection as migrate_v621_connection
+from v6.memory.migrations.v63 import migrate_connection as migrate_v63_connection
 
 
 V621_NODE_COLUMNS = (
@@ -22,12 +22,27 @@ V621_EDGE_COLUMNS = (
     "last_validated_epoch",
 )
 
+# The compact-memory entry points retain their historic v621 names because they
+# are used widely by the fold pipeline. On the v6.3 branch they preserve both
+# v6.2.1 and v6.3 score extensions.
 V621_SCORE_COLUMNS = (
     "hierarchical_score",
     "developmental_stage",
     "source_score_count",
     "score_version",
     "lifecycle_version",
+    "transfer_prior",
+    "transfer_empirical_rate",
+    "transfer_evidence_status",
+    "memory_fitness",
+    "recurrence_score",
+    "efficiency_score",
+    "score_components_json",
+    "prospective_learning_value",
+    "realized_learning_value",
+    "prospective_explanatory_potential",
+    "realized_explanatory_reach",
+    "score_policy_version",
 )
 
 V621_PROMOTION_COLUMNS = (
@@ -54,6 +69,8 @@ V621_AUX_TABLES = (
     "world_model_relations_v621",
     "memory_level_lifecycle_v621",
     "memory_runtime_audit_v621",
+    "memory_evidence_revisions_v63",
+    "abstraction_frontier_audit_v63",
 )
 
 
@@ -75,14 +92,14 @@ def _columns(connection: sqlite3.Connection, table: str) -> list[str]:
 def ensure_v621_state_connection(
     connection: sqlite3.Connection,
 ) -> None:
-    migrate_v621_connection(connection)
+    migrate_v63_connection(connection)
 
 
 def ensure_v621_state_path(path: str | Path) -> None:
     database = Path(path)
     database.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(database, timeout=60.0) as connection:
-        migrate_v621_connection(connection)
+        migrate_v63_connection(connection)
 
 
 def _copy_extension_columns(
@@ -130,7 +147,6 @@ def _copy_extension_columns(
         )
         updated += 1
     return updated
-
 
 
 def _copy_composite_extension_columns(
@@ -214,7 +230,7 @@ def merge_v621_state_connections(
     source: sqlite3.Connection,
     target: sqlite3.Connection,
 ) -> dict[str, int]:
-    migrate_v621_connection(target)
+    migrate_v63_connection(target)
 
     summary = {
         "memory_nodes_extended": _copy_extension_columns(
