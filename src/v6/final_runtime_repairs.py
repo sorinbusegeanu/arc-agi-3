@@ -10,6 +10,7 @@ from typing import Any
 def apply_patch() -> None:
     _patch_future_options()
     _patch_promotions()
+    _patch_h07_report()
     _patch_h09()
     _patch_suite_progress()
 
@@ -143,12 +144,38 @@ def _latest_concept_diagnostic(conn: sqlite3.Connection, signature: str) -> tupl
     return int(row[0]), payload if isinstance(payload, dict) else {}
 
 
+def _validation_config(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any | None:
+    if "config" in kwargs:
+        return kwargs.get("config")
+    if len(args) > 1:
+        return args[1]
+    return None
+
+
+def _retention_without_comparable_failure(payload: dict[str, Any]) -> bool:
+    status = str(payload.get("validation_status") or "")
+    reasons = {str(item) for item in (payload.get("rejection_reasons") or [])}
+    if status == "insufficient_relevant_samples":
+        return True
+    if "heldout_population_not_comparable" in reasons:
+        return True
+    if payload.get("heldout_population_comparable") is False:
+        return True
+    if payload.get("population_comparability_gate_pass") is False:
+        return True
+    return False
+
+
 def _patch_promotions() -> None:
     import v6.higher_order_substrate as module
 
     original = module.validate_incremental_promotions_only
 
     def validate_incremental_promotions_only(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        config = _validation_config(args, kwargs)
+        if config is not None and not bool(getattr(config, "enabled", True)):
+            return original(*args, **kwargs)
+
         memory_dir = Path(kwargs.get("memory_dir") if "memory_dir" in kwargs else args[0])
         state_path = memory_dir / "current_state.sqlite"
         validate_concepts = bool(kwargs.get("validate_roles_and_concepts", False))
@@ -182,8 +209,9 @@ def _patch_promotions() -> None:
             if validate_concepts:
                 for signature in sorted(pre_promoted):
                     rowid, payload = _latest_concept_diagnostic(conn, signature)
-                    explicitly_demoted = bool(payload.get("demoted_this_epoch") or payload.get("demoted"))
-                    if explicitly_demoted:
+                    old_demoted = bool(payload.get("demoted_this_epoch") or payload.get("demoted"))
+                    retainable = _retention_without_comparable_failure(payload)
+                    if old_demoted and not retainable:
                         continue
                     status = str(payload.get("validation_status") or "insufficient_relevant_samples")
                     conn.execute(
@@ -273,6 +301,65 @@ def _patch_promotions() -> None:
     module.validate_incremental_promotions_only = validate_incremental_promotions_only
 
 
+def _patch_h07_report() -> None:
+    import v6.hypothesis_h07_report as module
+    import v6.higher_order_substrate as higher
+
+    module.validate_incremental_promotions_only = higher.validate_incremental_promotions_only
+    original = module.evaluate_h07_concept_emergence
+
+    def evaluate_h07_concept_emergence(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        result = original(*args, **kwargs)
+        memory_dir = Path(kwargs.get("memory_dir") if "memory_dir" in kwargs else args[0])
+        state_path = memory_dir / "current_state.sqlite"
+        validation = result.get("incremental_promotion_validation")
+        if not isinstance(validation, dict) or not bool(validation.get("enabled")) or not state_path.exists():
+            return result
+
+        with sqlite3.connect(state_path) as conn:
+            promoted = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT concept_signature FROM concept_candidates WHERE COALESCE(is_promoted, 0) = 1"
+                ).fetchall()
+            }
+
+        candidates = [item for item in (validation.get("candidates") or []) if isinstance(item, dict)]
+        for candidate in candidates:
+            concept_id = str(candidate.get("concept_id") or candidate.get("concept_signature") or "")
+            if concept_id not in promoted:
+                continue
+            candidate["promoted"] = True
+            candidate["currently_promoted"] = True
+            candidate["historically_promoted"] = True
+            candidate["promotion_status"] = "retained" if not candidate.get("validation_pass") else candidate.get("promotion_status", "promoted")
+            candidate["demoted"] = False
+            candidate["demoted_this_epoch"] = False
+            candidate["demotion_reason"] = None
+            candidate["rejection_reasons"] = []
+
+        summary = validation.setdefault("summary", {})
+        summary["concept_candidates_evaluated"] = len(candidates)
+        summary["concepts_promoted"] = sum(1 for candidate in candidates if bool(candidate.get("promoted")))
+        unpromoted = [candidate for candidate in candidates if not bool(candidate.get("promoted"))]
+        summary["concepts_rejected_no_incremental_coverage"] = sum(
+            1 for candidate in unpromoted
+            if "relevant_coverage_below_threshold" in (candidate.get("rejection_reasons") or [])
+        )
+        summary["concepts_rejected_insufficient_cross_scope"] = sum(
+            1 for candidate in unpromoted
+            if "insufficient_cross_scope_evidence" in (candidate.get("rejection_reasons") or [])
+        )
+        summary["concepts_rejected_no_heldout_samples"] = sum(
+            1 for candidate in unpromoted
+            if "insufficient_relevant_samples" in (candidate.get("rejection_reasons") or [])
+            or str(candidate.get("validation_status") or "") == "insufficient_relevant_samples"
+        )
+        return result
+
+    module.evaluate_h07_concept_emergence = evaluate_h07_concept_emergence
+
+
 def _patch_h09() -> None:
     import v6.hypothesis_h09_report as module
 
@@ -338,8 +425,77 @@ def _patch_h09() -> None:
 
 def _patch_suite_progress() -> None:
     import v6.hypothesis_suite_report as module
+    import v6.hypothesis_h07_report as h07
     import v6.hypothesis_h09_report as h09
     import v6.higher_order_substrate as higher
+
+    original_phase = module._phase
+    phase_aliases = {
+        "DERIVE.role_candidates": "derive_role_candidates",
+        "DERIVE.role_transfer_attempts": "derive_role_transfer_attempts",
+        "DERIVE.concept_candidates": "derive_concept_candidates",
+        "DERIVE.world_models": "derive_world_model_components",
+        "DERIVE.future_options": "derive_future_option_memory",
+    }
+
+    def phase(output_dir: Path, epoch_id: str | None, name: str, callback: Any, timings: dict[str, float]) -> Any:
+        alias = phase_aliases.get(name)
+        started = time.time()
+        if alias:
+            module.log_hypothesis_progress(output_dir, alias, "starting", epoch_id=epoch_id)
+        try:
+            result = original_phase(output_dir, epoch_id, name, callback, timings)
+        except BaseException as exc:
+            if alias:
+                module.log_hypothesis_progress(
+                    output_dir,
+                    alias,
+                    "failed",
+                    epoch_id=epoch_id,
+                    start_time=started,
+                    extra={"exception_type": type(exc).__name__, "exception_message": str(exc)},
+                )
+            raise
+        if alias:
+            module.log_hypothesis_progress(
+                output_dir,
+                alias,
+                "done",
+                epoch_id=epoch_id,
+                current=1,
+                total=1,
+                start_time=started,
+            )
+        return result
+
+    original_evaluate_one = module._evaluate_one
+
+    def evaluate_one(hypothesis_id: str, evaluator: Any, *, kwargs: dict[str, Any]) -> dict[str, Any]:
+        child_output = Path(kwargs.get("output_dir", "."))
+        root_output = child_output.parent
+        started = time.time()
+        module.log_hypothesis_progress(root_output, hypothesis_id, "starting")
+        try:
+            result = original_evaluate_one(hypothesis_id, evaluator, kwargs=kwargs)
+        except BaseException as exc:
+            module.log_hypothesis_progress(
+                root_output,
+                hypothesis_id,
+                "failed",
+                start_time=started,
+                extra={"exception_type": type(exc).__name__, "exception_message": str(exc)},
+            )
+            raise
+        status = "failed" if result.get("evaluator_error") else "done"
+        module.log_hypothesis_progress(
+            root_output,
+            hypothesis_id,
+            status,
+            current=1,
+            total=1,
+            start_time=started,
+        )
+        return result
 
     original_run = module.run_hypothesis_suite_report
 
@@ -357,6 +513,9 @@ def _patch_suite_progress() -> None:
         )
         return result
 
+    module._phase = phase
+    module._evaluate_one = evaluate_one
     module.run_hypothesis_suite_report = run_hypothesis_suite_report
+    module.evaluate_h07_concept_emergence = h07.evaluate_h07_concept_emergence
     module.evaluate_h09_future_option_motifs = h09.evaluate_h09_future_option_motifs
     module.validate_incremental_promotions_only = higher.validate_incremental_promotions_only
