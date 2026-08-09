@@ -1,20 +1,22 @@
 name: temp-v63-watch-fixes
 
 on:
-  push:
+  pull_request:
     branches:
       - main
-      - fix-v63-hypothesis-watch-items
+    types: [opened, synchronize, reopened]
 
 permissions:
   contents: write
 
 jobs:
   patch-test-commit:
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.pull_request.head.ref }}
           fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
@@ -30,36 +32,55 @@ jobs:
 
           cr = Path('src/v6/continuous_research.py')
           text = cr.read_text()
-          old = '    incremental_promotion_validation: bool = False\n'
-          if old in text:
-              text = text.replace(old, '    incremental_promotion_validation: bool = True\n', 1)
-          old = '                "memory_nodes": memory_after.get("memory_node_count"),\n'
-          if old in text:
-              text = text.replace(old, '                "memory_nodes": memory_after.get("memory_substrate_node_count"),\n', 1)
+          text = text.replace(
+              '    incremental_promotion_validation: bool = False\n',
+              '    incremental_promotion_validation: bool = True\n',
+              1,
+          )
+          text = text.replace(
+              '                "memory_nodes": memory_after.get("memory_node_count"),\n',
+              '                "memory_nodes": memory_after.get("memory_substrate_node_count"),\n',
+              1,
+          )
           cr.write_text(text)
 
           hs = Path('src/v6/hypothesis_suite_report.py')
           text = hs.read_text()
           if 'from concurrent.futures import ProcessPoolExecutor\n' not in text:
-              old = 'from contextlib import contextmanager\n'
-              assert old in text, 'import anchor missing'
-              text = text.replace(old, 'from concurrent.futures import ProcessPoolExecutor\nfrom contextlib import contextmanager\n', 1)
+              text = text.replace(
+                  'from contextlib import contextmanager\n',
+                  'from concurrent.futures import ProcessPoolExecutor\nfrom contextlib import contextmanager\n',
+                  1,
+              )
 
           old_sig = '''    max_h11_main_report_bytes: int,\n) -> dict[str, dict[str, Any]]:\n'''
           if old_sig in text:
-              text = text.replace(old_sig, '''    max_h11_main_report_bytes: int,\n    evaluator_workers: int = 1,\n) -> dict[str, dict[str, Any]]:\n''', 1)
+              text = text.replace(
+                  old_sig,
+                  '''    max_h11_main_report_bytes: int,\n    evaluator_workers: int = 1,\n) -> dict[str, dict[str, Any]]:\n''',
+                  1,
+              )
 
           function_start = text.index('def evaluate_hypotheses_read_only(')
-          block_start = text.index('    results: dict[str, dict[str, Any]] = {}\n', function_start)
-          block_end = text.index('    return results\n', block_start) + len('    return results\n')
+          block_start = text.index(
+              '    results: dict[str, dict[str, Any]] = {}\n',
+              function_start,
+          )
+          block_end = text.index(
+              '    return results\n', block_start
+          ) + len('    return results\n')
           current_block = text[block_start:block_end]
           if 'ProcessPoolExecutor(max_workers=worker_count)' not in current_block:
-              replacement = '''    tasks: list[tuple[str, Callable[..., dict[str, Any]], dict[str, Any]]] = [\n        ("H01", evaluate_h01_contingency_emergence, {**common, "output_dir": dirs["H01"]}),\n        ("H02", evaluate_h02_prediction_violation_attention, {**common, "output_dir": dirs["H02"], "max_rows": int(max_rows), "max_db_files": int(max_db_files), "scan_all_dbs": bool(scan_all_dbs)}),\n        ("H03", evaluate_h03_transformation_family_formation, {**common, "output_dir": dirs["H03"], "max_rows": int(max_rows), "max_db_files": int(max_db_files), "scan_all_dbs": bool(scan_all_dbs)}),\n        ("H04", evaluate_h04_carrier_emergence, {**common, "output_dir": dirs["H04"]}),\n        ("H05", evaluate_h05_role_emergence, {**common, "output_dir": dirs["H05"], "already_derived": True}),\n        ("H12", evaluate_h12_efficiency_emergence, {**common, "output_dir": dirs["H12"]}),\n    ]\n    results: dict[str, dict[str, Any]] = {}\n    if str(suite_mode or "fast").lower() != "full":\n        for hypothesis_id in ("H06", "H07", "H08", "H09", "H10", "H11"):\n            results[hypothesis_id] = _skipped_result(hypothesis_id)\n    else:\n        tasks.extend([\n            ("H06", evaluate_h06_role_transfer, {**common, "output_dir": dirs["H06"], "already_derived": True}),\n            ("H07", evaluate_h07_concept_emergence, {**common, "output_dir": dirs["H07"], "already_derived": True, "incremental_promotion_validation": validation_config}),\n            ("H08", evaluate_h08_world_model_coherence, {**common, "output_dir": dirs["H08"], "already_derived": True}),\n            ("H09", evaluate_h09_future_option_motifs, {**common, "output_dir": dirs["H09"], "already_derived": True}),\n            ("H10", evaluate_h10_future_option_attention, {**common, "output_dir": dirs["H10"], "already_derived": True}),\n            ("H11", evaluate_h11_future_option_transfer_concepts, {**common, "output_dir": dirs["H11"], "already_derived": True, "provenance_sample_limit": int(h11_provenance_sample_limit), "write_full_provenance_jsonl": bool(h11_write_full_provenance_jsonl), "max_main_report_bytes": int(max_h11_main_report_bytes)}),\n        ])\n\n    worker_count = max(1, min(int(evaluator_workers), len(tasks)))\n    if worker_count == 1:\n        for hypothesis_id, evaluator, kwargs in tasks:\n            results[hypothesis_id] = _evaluate_one(hypothesis_id, evaluator, kwargs=kwargs)\n    else:\n        with ProcessPoolExecutor(max_workers=worker_count) as executor:\n            futures = {\n                executor.submit(_evaluate_one, hypothesis_id, evaluator, kwargs=kwargs): hypothesis_id\n                for hypothesis_id, evaluator, kwargs in tasks\n            }\n            for future, hypothesis_id in futures.items():\n                try:\n                    results[hypothesis_id] = future.result()\n                except Exception as exc:\n                    results[hypothesis_id] = _failed_evaluator_result(hypothesis_id, exc)\n    return results\n'''
+              replacement = '''    tasks: list[tuple[str, Callable[..., dict[str, Any]], dict[str, Any]]] = [\n        ("H01", evaluate_h01_contingency_emergence, {**common, "output_dir": dirs["H01"]}),\n        ("H02", evaluate_h02_prediction_violation_attention, {**common, "output_dir": dirs["H02"], "max_rows": int(max_rows), "max_db_files": int(max_db_files), "scan_all_dbs": bool(scan_all_dbs)}),\n        ("H03", evaluate_h03_transformation_family_formation, {**common, "output_dir": dirs["H03"], "max_rows": int(max_rows), "max_db_files": int(max_db_files), "scan_all_dbs": bool(scan_all_dbs)}),\n        ("H04", evaluate_h04_carrier_emergence, {**common, "output_dir": dirs["H04"]}),\n        ("H05", evaluate_h05_role_emergence, {**common, "output_dir": dirs["H05"], "already_derived": True}),\n        ("H12", evaluate_h12_efficiency_emergence, {**common, "output_dir": dirs["H12"]}),\n    ]\n    results: dict[str, dict[str, Any]] = {}\n    if str(suite_mode or "fast").lower() != "full":\n        for hypothesis_id in ("H06", "H07", "H08", "H09", "H10", "H11"):\n            results[hypothesis_id] = _skipped_result(hypothesis_id)\n    else:\n        tasks.extend([\n            ("H06", evaluate_h06_role_transfer, {**common, "output_dir": dirs["H06"], "already_derived": True}),\n            ("H07", evaluate_h07_concept_emergence, {**common, "output_dir": dirs["H07"], "already_derived": True, "incremental_promotion_validation": validation_config}),\n            ("H08", evaluate_h08_world_model_coherence, {**common, "output_dir": dirs["H08"], "already_derived": True}),\n            ("H09", evaluate_h09_future_option_motifs, {**common, "output_dir": dirs["H09"], "already_derived": True}),\n            ("H10", evaluate_h10_future_option_attention, {**common, "output_dir": dirs["H10"], "already_derived": True}),\n            ("H11", evaluate_h11_future_option_transfer_concepts, {**common, "output_dir": dirs["H11"], "already_derived": True, "provenance_sample_limit": int(h11_provenance_sample_limit), "write_full_provenance_jsonl": bool(h11_write_full_provenance_jsonl), "max_main_report_bytes": int(max_h11_main_report_bytes)}),\n        ])\n\n    worker_count = max(1, min(int(evaluator_workers), len(tasks)))\n    if worker_count == 1:\n        for hypothesis_id, evaluator, kwargs in tasks:\n            results[hypothesis_id] = _evaluate_one(\n                hypothesis_id, evaluator, kwargs=kwargs\n            )\n    else:\n        with ProcessPoolExecutor(max_workers=worker_count) as executor:\n            futures = {\n                executor.submit(\n                    _evaluate_one,\n                    hypothesis_id,\n                    evaluator,\n                    kwargs=kwargs,\n                ): hypothesis_id\n                for hypothesis_id, evaluator, kwargs in tasks\n            }\n            for future, hypothesis_id in futures.items():\n                try:\n                    results[hypothesis_id] = future.result()\n                except Exception as exc:\n                    results[hypothesis_id] = _failed_evaluator_result(\n                        hypothesis_id, exc\n                    )\n    return results\n'''
               text = text[:block_start] + replacement + text[block_end:]
 
           old = '''            max_h11_main_report_bytes=\n                max_h11_main_report_bytes,\n        )\n'''
           if old in text:
-              text = text.replace(old, '''            max_h11_main_report_bytes=\n                max_h11_main_report_bytes,\n            evaluator_workers=max(1, int(higher_order_workers)),\n        )\n''', 1)
+              text = text.replace(
+                  old,
+                  '''            max_h11_main_report_bytes=\n                max_h11_main_report_bytes,\n            evaluator_workers=max(1, int(higher_order_workers)),\n        )\n''',
+                  1,
+              )
           hs.write_text(text)
           PY
       - name: Compile changed modules
@@ -68,7 +89,9 @@ jobs:
       - name: Run full v6 test suite
         run: |
           PYTHONPATH=src pytest src/v6/tests -q
-      - name: Commit tested fixes
+      - name: Commit tested fixes to PR branch
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
         run: |
           if git diff --quiet; then
             echo "No changes to commit"
@@ -78,4 +101,4 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add src/v6/continuous_research.py src/v6/hypothesis_suite_report.py
           git commit -m "Fix hypothesis reporting and evaluation"
-          git push origin HEAD:${GITHUB_REF_NAME}
+          git push origin HEAD:${HEAD_REF}
