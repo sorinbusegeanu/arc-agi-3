@@ -21,13 +21,17 @@ def install_v63_prediction_reuse_completion() -> None:
         V621SnapshotMemoryQueryEngine.score_action = _snapshot_score_capture_prediction
         _INSTALLED = True
 
-    # This is intentionally invoked on every migration entrypoint call because
-    # the earlier v6.3 installers may refresh V6System method patches.
+    # These are intentionally invoked on every migration entrypoint call because
+    # the earlier v6.3 installers may refresh runtime method patches.
     from v6.memory.v63_performance_compat_completion import (
         install_v63_performance_compat_completion,
     )
+    from v6.memory.v63_temporal_semantics_completion import (
+        install_v63_temporal_semantics_completion,
+    )
 
     install_v63_performance_compat_completion()
+    install_v63_temporal_semantics_completion()
 
 
 def _context_key(context_signatures: dict[int, tuple], action: int) -> tuple[Any, ...]:
