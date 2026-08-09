@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import json
 import time
+from concurrent.futures import ProcessPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -599,6 +600,7 @@ def evaluate_hypotheses_read_only(
     h11_provenance_sample_limit: int,
     h11_write_full_provenance_jsonl: bool,
     max_h11_main_report_bytes: int,
+    evaluator_workers: int = 1,
 ) -> dict[str, dict[str, Any]]:
     """REPORT phase. All evaluators receive a read-only evidence snapshot."""
     dirs = {
@@ -634,128 +636,52 @@ def evaluate_hypotheses_read_only(
         "run_dir": run_dir,
         "memory_dir": evidence_memory_dir,
     }
+    tasks: list[tuple[str, Callable[..., dict[str, Any]], dict[str, Any]]] = [
+        ("H01", evaluate_h01_contingency_emergence, {**common, "output_dir": dirs["H01"]}),
+        ("H02", evaluate_h02_prediction_violation_attention, {**common, "output_dir": dirs["H02"], "max_rows": int(max_rows), "max_db_files": int(max_db_files), "scan_all_dbs": bool(scan_all_dbs)}),
+        ("H03", evaluate_h03_transformation_family_formation, {**common, "output_dir": dirs["H03"], "max_rows": int(max_rows), "max_db_files": int(max_db_files), "scan_all_dbs": bool(scan_all_dbs)}),
+        ("H04", evaluate_h04_carrier_emergence, {**common, "output_dir": dirs["H04"]}),
+        ("H05", evaluate_h05_role_emergence, {**common, "output_dir": dirs["H05"], "already_derived": True}),
+        ("H12", evaluate_h12_efficiency_emergence, {**common, "output_dir": dirs["H12"]}),
+    ]
     results: dict[str, dict[str, Any]] = {}
-    results["H01"] = _evaluate_one(
-        "H01",
-        evaluate_h01_contingency_emergence,
-        kwargs={**common, "output_dir": dirs["H01"]},
-    )
-    results["H02"] = _evaluate_one(
-        "H02",
-        evaluate_h02_prediction_violation_attention,
-        kwargs={
-            **common,
-            "output_dir": dirs["H02"],
-            "max_rows": int(max_rows),
-            "max_db_files": int(max_db_files),
-            "scan_all_dbs": bool(scan_all_dbs),
-        },
-    )
-    results["H03"] = _evaluate_one(
-        "H03",
-        evaluate_h03_transformation_family_formation,
-        kwargs={
-            **common,
-            "output_dir": dirs["H03"],
-            "max_rows": int(max_rows),
-            "max_db_files": int(max_db_files),
-            "scan_all_dbs": bool(scan_all_dbs),
-        },
-    )
-    results["H04"] = _evaluate_one(
-        "H04",
-        evaluate_h04_carrier_emergence,
-        kwargs={**common, "output_dir": dirs["H04"]},
-    )
-    results["H05"] = _evaluate_one(
-        "H05",
-        evaluate_h05_role_emergence,
-        kwargs={
-            **common,
-            "output_dir": dirs["H05"],
-            "already_derived": True,
-        },
-    )
-
     if str(suite_mode or "fast").lower() != "full":
-        for hypothesis_id in (
-            "H06", "H07", "H08", "H09", "H10", "H11"
-        ):
-            results[hypothesis_id] = _skipped_result(
-                hypothesis_id
+        for hypothesis_id in ("H06", "H07", "H08", "H09", "H10", "H11"):
+            results[hypothesis_id] = _skipped_result(hypothesis_id)
+    else:
+        tasks.extend([
+            ("H06", evaluate_h06_role_transfer, {**common, "output_dir": dirs["H06"], "already_derived": True}),
+            ("H07", evaluate_h07_concept_emergence, {**common, "output_dir": dirs["H07"], "already_derived": True, "incremental_promotion_validation": validation_config}),
+            ("H08", evaluate_h08_world_model_coherence, {**common, "output_dir": dirs["H08"], "already_derived": True}),
+            ("H09", evaluate_h09_future_option_motifs, {**common, "output_dir": dirs["H09"], "already_derived": True}),
+            ("H10", evaluate_h10_future_option_attention, {**common, "output_dir": dirs["H10"], "already_derived": True}),
+            ("H11", evaluate_h11_future_option_transfer_concepts, {**common, "output_dir": dirs["H11"], "already_derived": True, "provenance_sample_limit": int(h11_provenance_sample_limit), "write_full_provenance_jsonl": bool(h11_write_full_provenance_jsonl), "max_main_report_bytes": int(max_h11_main_report_bytes)}),
+        ])
+
+    worker_count = max(1, min(int(evaluator_workers), len(tasks)))
+    if worker_count == 1:
+        for hypothesis_id, evaluator, kwargs in tasks:
+            results[hypothesis_id] = _evaluate_one(
+                hypothesis_id, evaluator, kwargs=kwargs
             )
     else:
-        results["H06"] = _evaluate_one(
-            "H06",
-            evaluate_h06_role_transfer,
-            kwargs={
-                **common,
-                "output_dir": dirs["H06"],
-                "already_derived": True,
-            },
-        )
-        results["H07"] = _evaluate_one(
-            "H07",
-            evaluate_h07_concept_emergence,
-            kwargs={
-                **common,
-                "output_dir": dirs["H07"],
-                "already_derived": True,
-                "incremental_promotion_validation":
-                    validation_config,
-            },
-        )
-        results["H08"] = _evaluate_one(
-            "H08",
-            evaluate_h08_world_model_coherence,
-            kwargs={
-                **common,
-                "output_dir": dirs["H08"],
-                "already_derived": True,
-            },
-        )
-        results["H09"] = _evaluate_one(
-            "H09",
-            evaluate_h09_future_option_motifs,
-            kwargs={
-                **common,
-                "output_dir": dirs["H09"],
-                "already_derived": True,
-            },
-        )
-        results["H10"] = _evaluate_one(
-            "H10",
-            evaluate_h10_future_option_attention,
-            kwargs={
-                **common,
-                "output_dir": dirs["H10"],
-                "already_derived": True,
-            },
-        )
-        results["H11"] = _evaluate_one(
-            "H11",
-            evaluate_h11_future_option_transfer_concepts,
-            kwargs={
-                **common,
-                "output_dir": dirs["H11"],
-                "already_derived": True,
-                "provenance_sample_limit": int(
-                    h11_provenance_sample_limit
-                ),
-                "write_full_provenance_jsonl": bool(
-                    h11_write_full_provenance_jsonl
-                ),
-                "max_main_report_bytes": int(
-                    max_h11_main_report_bytes
-                ),
-            },
-        )
-
-    results["H12"] = _evaluate_one(
-        "H12",
-        evaluate_h12_efficiency_emergence,
-        kwargs={**common, "output_dir": dirs["H12"]},
-    )
+        with ProcessPoolExecutor(max_workers=worker_count) as executor:
+            futures = {
+                executor.submit(
+                    _evaluate_one,
+                    hypothesis_id,
+                    evaluator,
+                    kwargs=kwargs,
+                ): hypothesis_id
+                for hypothesis_id, evaluator, kwargs in tasks
+            }
+            for future, hypothesis_id in futures.items():
+                try:
+                    results[hypothesis_id] = future.result()
+                except Exception as exc:
+                    results[hypothesis_id] = _failed_evaluator_result(
+                        hypothesis_id, exc
+                    )
     return results
 
 
@@ -993,6 +919,7 @@ def run_hypothesis_suite_report(
                 h11_write_full_provenance_jsonl,
             max_h11_main_report_bytes=
                 max_h11_main_report_bytes,
+            evaluator_workers=max(1, int(higher_order_workers)),
         )
 
         fingerprint_after_report = memory_fingerprint(memory_dir)

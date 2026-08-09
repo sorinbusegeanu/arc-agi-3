@@ -110,7 +110,7 @@ class ContinuousResearchConfig:
     max_future_option_events_per_epoch: int = 50_000
     max_future_option_motifs_per_epoch: int = 25_000
     future_option_development_stage: str = "auto"
-    incremental_promotion_validation: bool = False
+    incremental_promotion_validation: bool = True
     promotion_min_incremental_coverage: float = 0.05
     promotion_min_cross_context_or_game_evidence: int = 2
     promotion_min_behavioral_or_predictive_lift: float = 0.01
@@ -470,7 +470,7 @@ def _run_continuous_research_inner(config: ContinuousResearchConfig) -> dict[str
             {
                 "stable_contingencies": memory_after.get("stable_contingency_count"),
                 "transformation_families": memory_after.get("transformation_family_count"),
-                "memory_nodes": memory_after.get("memory_node_count"),
+                "memory_nodes": memory_after.get("memory_substrate_node_count"),
             },
         )
         continuity_report = _write_memory_continuity_report(
