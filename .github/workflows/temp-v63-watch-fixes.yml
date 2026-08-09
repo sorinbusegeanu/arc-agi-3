@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - fix-v63-hypothesis-watch-items
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: write
