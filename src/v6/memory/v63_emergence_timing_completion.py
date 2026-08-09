@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,7 @@ _ORIGINAL_FOLD_SINGLE_DB: Any = None
 _ORIGINAL_MERGE_STATE_SET_BASED: Any = None
 _ORIGINAL_MERGE_STATE_ROWS: Any = None
 _ORIGINAL_FOLD_LIVE_SYSTEM: Any = None
+_ORIGINAL_RESTORE_COMPACT: Any = None
 _ORIGINAL_REPAIR_ROLE_EMERGENCE: Any = None
 _ORIGINAL_H04_BASE: Any = None
 
@@ -25,10 +27,12 @@ def install_v63_emergence_timing_completion() -> None:
     global _ORIGINAL_MERGE_STATE_SET_BASED
     global _ORIGINAL_MERGE_STATE_ROWS
     global _ORIGINAL_FOLD_LIVE_SYSTEM
+    global _ORIGINAL_RESTORE_COMPACT
     global _ORIGINAL_REPAIR_ROLE_EMERGENCE
     global _ORIGINAL_H04_BASE
 
     from v6.memory import compact_memory as compact
+    from v6.memory import compact_memory_restore as restore
     from v6 import v63_higher_order_semantics as higher_semantics
     from v6 import hypothesis_h04_report as h04
 
@@ -38,17 +42,22 @@ def install_v63_emergence_timing_completion() -> None:
         _ORIGINAL_MERGE_STATE_SET_BASED = compact._merge_state_tables_set_based
         _ORIGINAL_MERGE_STATE_ROWS = compact._merge_state_tables
         _ORIGINAL_FOLD_LIVE_SYSTEM = compact.fold_live_system_into_compact_memory
+        _ORIGINAL_RESTORE_COMPACT = restore.load_compact_memory_into_system
         _ORIGINAL_REPAIR_ROLE_EMERGENCE = higher_semantics._repair_role_emergence_steps
         _ORIGINAL_H04_BASE = h04._evaluate_h04_carrier_emergence_base
         _INSTALLED = True
 
     # Reapply on every migration entry point because earlier compatibility
-    # installers may refresh runtime function bindings.
+    # installers can refresh bindings.
     compact._ensure_current_state_schema = _ensure_current_state_schema
     compact._fold_single_db = _fold_single_db
     compact._merge_state_tables_set_based = _merge_state_tables_set_based
     compact._merge_state_tables = _merge_state_tables
     compact.fold_live_system_into_compact_memory = _fold_live_system_into_compact_memory
+    restore.load_compact_memory_into_system = _restore_compact_memory_into_system
+    main_module = sys.modules.get("v6.main")
+    if main_module is not None:
+        setattr(main_module, "load_compact_memory_into_system", _restore_compact_memory_into_system)
     higher_semantics._repair_role_emergence_steps = _repair_role_emergence_steps
     h04._evaluate_h04_carrier_emergence_base = _evaluate_h04_base
 
@@ -176,31 +185,31 @@ def _merge_explicit_emergence_from_attached(
             return
         state_conn.execute(
             f"""
-            UPDATE carrier_candidates AS main
+            UPDATE carrier_candidates
             SET first_emergent_global_step = CASE
-                WHEN main.first_emergent_global_step IS NULL THEN (
+                WHEN first_emergent_global_step IS NULL THEN (
                     SELECT shard.first_emergent_global_step
                     FROM {alias}.carrier_candidates AS shard
-                    WHERE shard.carrier_signature = main.carrier_signature
+                    WHERE shard.carrier_signature = carrier_candidates.carrier_signature
                 )
                 WHEN (
                     SELECT shard.first_emergent_global_step
                     FROM {alias}.carrier_candidates AS shard
-                    WHERE shard.carrier_signature = main.carrier_signature
-                ) IS NULL THEN main.first_emergent_global_step
+                    WHERE shard.carrier_signature = carrier_candidates.carrier_signature
+                ) IS NULL THEN first_emergent_global_step
                 ELSE MIN(
-                    main.first_emergent_global_step,
+                    first_emergent_global_step,
                     (
                         SELECT shard.first_emergent_global_step
                         FROM {alias}.carrier_candidates AS shard
-                        WHERE shard.carrier_signature = main.carrier_signature
+                        WHERE shard.carrier_signature = carrier_candidates.carrier_signature
                     )
                 )
             END
             WHERE EXISTS (
                 SELECT 1
                 FROM {alias}.carrier_candidates AS shard
-                WHERE shard.carrier_signature = main.carrier_signature
+                WHERE shard.carrier_signature = carrier_candidates.carrier_signature
                   AND shard.first_emergent_global_step IS NOT NULL
             )
             """
@@ -289,6 +298,55 @@ def _fold_live_system_into_compact_memory(system: Any, memory_dir: str | Path) -
             )
         state_conn.commit()
     return result
+
+
+def _restore_compact_memory_into_system(
+    system: Any,
+    memory_dir: str | Path,
+    *,
+    restore_graph: bool = True,
+    restore_substrate: bool = True,
+) -> dict[str, Any]:
+    summary = _ORIGINAL_RESTORE_COMPACT(
+        system,
+        memory_dir,
+        restore_graph=restore_graph,
+        restore_substrate=restore_substrate,
+    )
+    tracker = getattr(system, "carrier_tracker", None)
+    if tracker is None:
+        return summary
+    current_state = Path(memory_dir) / "current_state.sqlite"
+    if not current_state.exists():
+        return summary
+    try:
+        with sqlite3.connect(f"file:{current_state.resolve()}?mode=ro", uri=True) as connection:
+            columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(carrier_candidates)").fetchall()
+            }
+            if "first_emergent_global_step" not in columns:
+                return summary
+            rows = connection.execute(
+                """
+                SELECT carrier_signature, first_emergent_global_step
+                FROM carrier_candidates
+                WHERE COALESCE(is_emergent, 0)=1
+                  AND carrier_source != 'context_action_fallback'
+                  AND first_emergent_global_step IS NOT NULL
+                """
+            ).fetchall()
+    except sqlite3.Error:
+        return summary
+    first_steps = getattr(tracker, "_v63_first_emergent_steps", None)
+    if first_steps is None:
+        first_steps = {}
+        tracker._v63_first_emergent_steps = first_steps
+    for signature, first_emergent in rows:
+        first_steps[str(signature)] = int(first_emergent)
+    summary = dict(summary)
+    summary["carrier_emergence_thresholds_restored"] = len(rows)
+    return summary
 
 
 def _repair_role_emergence_steps(
