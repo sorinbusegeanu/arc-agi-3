@@ -42,10 +42,8 @@ def _import_candidate_preserving_emergence_step(self: Any, **kwargs: Any) -> Any
     """Keep the persisted emergence threshold when restoring an emergent carrier.
 
     Compact v6.3 carrier rows intentionally store the threshold-crossing step in
-    first_seen_global_step once a carrier is emergent.  The legacy restore path
-    reconstructs synthetic observations and can otherwise lose that threshold
-    when the final persisted stability score makes the reconstructed candidate
-    emergent only after the synthetic observations have been imported.
+    first_seen_global_step once a carrier is emergent. The legacy restore path
+    reconstructs synthetic observations and can otherwise lose that threshold.
     """
     result = _ORIGINAL_IMPORT_CANDIDATE(self, **kwargs)
     carrier_signature = str(kwargs.get("carrier_signature") or "")
@@ -169,22 +167,19 @@ def _repair_fold_threshold_timing(
 
     # The compact schema predates an explicit first_emergent column and uses
     # first_seen_global_step as the H04 emergence timestamp for rows that are
-    # already emergent.  Make that overloaded field agree with the sidecar's
-    # actual threshold crossing, never with the carrier's first observation.
+    # already emergent. Explicit sidecar threshold evidence is authoritative;
+    # do not minimize it against a stale first-observation timestamp.
     for carrier_signature, threshold_step in _carrier_thresholds_from_sidecar(db_path).items():
         state_conn.execute(
             """
             UPDATE carrier_candidates
-            SET first_seen_global_step = CASE
-                WHEN first_seen_global_step IS NULL THEN ?
-                ELSE MIN(first_seen_global_step, ?)
-            END,
+            SET first_seen_global_step = ?,
                 carrier_timing_source = 'real_evidence'
             WHERE carrier_signature = ?
               AND COALESCE(is_emergent, 0) = 1
               AND carrier_source != 'context_action_fallback'
             """,
-            (int(threshold_step), int(threshold_step), carrier_signature),
+            (int(threshold_step), carrier_signature),
         )
 
     return {
