@@ -29,9 +29,17 @@ def install_v63_prediction_reuse_completion() -> None:
     from v6.memory.v63_temporal_semantics_completion import (
         install_v63_temporal_semantics_completion,
     )
+    from v6.memory.v63_emergence_timing_completion import (
+        install_v63_emergence_timing_completion,
+    )
+    from v6.memory.v63_validation_parallel_completion import (
+        install_v63_validation_parallel_completion,
+    )
 
     install_v63_performance_compat_completion()
     install_v63_temporal_semantics_completion()
+    install_v63_emergence_timing_completion()
+    install_v63_validation_parallel_completion()
 
 
 def _context_key(context_signatures: dict[int, tuple], action: int) -> tuple[Any, ...]:
