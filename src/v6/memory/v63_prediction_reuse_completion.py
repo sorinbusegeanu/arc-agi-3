@@ -9,19 +9,25 @@ _INSTALLED = False
 def install_v63_prediction_reuse_completion() -> None:
     """Reuse the exact prediction produced while ranking the selected action."""
     global _INSTALLED
-    if _INSTALLED:
-        return
+    if not _INSTALLED:
+        from v6.memory import v63_performance_completion as completion
+        from v6.memory.v621_runtime import (
+            V621MemoryController,
+            V621SnapshotMemoryQueryEngine,
+        )
 
-    from v6.memory import v63_performance_completion as completion
-    from v6.memory.v621_runtime import (
-        V621MemoryController,
-        V621SnapshotMemoryQueryEngine,
+        completion._cache_prediction = _cache_prediction_by_action
+        V621MemoryController.predict = _controller_predict_reuse
+        V621SnapshotMemoryQueryEngine.score_action = _snapshot_score_capture_prediction
+        _INSTALLED = True
+
+    # This is intentionally invoked on every migration entrypoint call because
+    # the earlier v6.3 installers may refresh V6System method patches.
+    from v6.memory.v63_performance_compat_completion import (
+        install_v63_performance_compat_completion,
     )
 
-    completion._cache_prediction = _cache_prediction_by_action
-    V621MemoryController.predict = _controller_predict_reuse
-    V621SnapshotMemoryQueryEngine.score_action = _snapshot_score_capture_prediction
-    _INSTALLED = True
+    install_v63_performance_compat_completion()
 
 
 def _context_key(context_signatures: dict[int, tuple], action: int) -> tuple[Any, ...]:
