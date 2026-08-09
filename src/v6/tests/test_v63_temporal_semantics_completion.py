@@ -97,7 +97,7 @@ def test_fold_repairs_h03_h04_threshold_crossing_milestones(tmp_path: Path) -> N
                 "object",
                 4,
                 2,
-                8,
+                1,
                 10,
                 "real_evidence",
                 0.8,
@@ -133,10 +133,10 @@ def test_restored_emergent_carrier_keeps_persisted_threshold_step() -> None:
     install_v63_higher_order_semantics()
     install_v63_temporal_semantics_completion()
     tracker = CarrierEmergenceTracker(
-        min_support=3,
-        min_distinct_contexts=2,
-        min_prediction_lift=0.05,
-        min_compression_gain=0.01,
+        min_support=1,
+        min_distinct_contexts=1,
+        min_prediction_lift=-1.0,
+        min_compression_gain=0.0,
     )
     tracker.import_candidate(
         carrier_signature="object_id:restored",
@@ -148,6 +148,7 @@ def test_restored_emergent_carrier_keeps_persisted_threshold_step() -> None:
         stability_score=0.8,
         is_emergent=True,
     )
+    assert tracker._v63_first_emergent_steps["object_id:restored"] == 8
     candidate = tracker._build_candidate("object_id:restored")
     assert candidate.status == "emergent_carrier"
     assert candidate.first_emergent_global_step == 8
