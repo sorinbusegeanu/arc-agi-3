@@ -8,6 +8,8 @@ from pathlib import Path
 from v6.memory.migrations.v621 import migrate_connection as migrate_v621_connection
 from v6.memory.v63_performance import install_v63_sampling_performance
 from v6.memory.v63_transfer import install_v63_transfer_policy
+from v6.v63_higher_order_semantics import install_v63_higher_order_semantics
+from v6.v63_higher_order_compat import install_v63_higher_order_compat
 
 SCHEMA_VERSION = "v6.3"
 PERFORMANCE_SCHEMA_KEY = "v63_performance_schema"
@@ -111,6 +113,8 @@ def _ensure_performance_indexes(connection: sqlite3.Connection) -> list[str]:
 def migrate_connection(connection: sqlite3.Connection) -> dict[str, object]:
     install_v63_transfer_policy()
     install_v63_sampling_performance()
+    install_v63_higher_order_semantics()
+    install_v63_higher_order_compat()
     connection.execute(
         "CREATE TABLE IF NOT EXISTS memory_versions (key TEXT PRIMARY KEY, value TEXT)"
     )
