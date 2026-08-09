@@ -3,8 +3,8 @@ from __future__ import annotations
 import sqlite3
 
 from v6.carrier_emergence import CarrierEmergenceTracker
-from v6.hypothesis_h06_report import _transfer_provenance_error
-from v6.hypothesis_h08_report import _component_passes_h08_validity
+from v6 import hypothesis_h06_report as h06
+from v6 import hypothesis_h08_report as h08
 from v6.memory.compact_memory import ensure_memory_layout
 from v6.v63_higher_order_semantics import (
     _build_relational_world_models,
@@ -63,7 +63,7 @@ def test_h06_surrogate_game_cannot_validate_transfer() -> None:
                0 AS target_game_is_surrogate
         """
     ).fetchone()
-    assert _transfer_provenance_error(row) == "surrogate_game_provenance"
+    assert h06._transfer_provenance_error(row) == "surrogate_game_provenance"
 
 
 def test_h08_requires_multiple_concepts() -> None:
@@ -83,9 +83,9 @@ def test_h08_requires_multiple_concepts() -> None:
         "explanatory_coverage": 0.5,
         "candidate_only": False,
     }
-    assert not _component_passes_h08_validity(record)
+    assert not h08._component_passes_h08_validity(record)
     record["concept_link_count"] = 2
-    assert _component_passes_h08_validity(record)
+    assert h08._component_passes_h08_validity(record)
 
 
 def test_relational_world_model_uses_two_concepts_and_later_prediction(tmp_path) -> None:
