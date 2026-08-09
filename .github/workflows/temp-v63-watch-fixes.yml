@@ -13,6 +13,7 @@ jobs:
   patch-test-commit:
     if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
@@ -21,10 +22,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: pip
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pytest numpy tqdm pandas pyarrow
+          python -m pip install -e ".[test]"
       - name: Apply fixes
         run: |
           python - <<'PY'
@@ -87,8 +89,9 @@ jobs:
         run: |
           PYTHONPATH=src python -m py_compile src/v6/continuous_research.py src/v6/hypothesis_suite_report.py
       - name: Run full v6 test suite
-        run: |
-          PYTHONPATH=src pytest src/v6/tests -q
+        env:
+          PYTHONPATH: src
+        run: pytest -q --import-mode=importlib
       - name: Commit tested fixes to PR branch
         env:
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
