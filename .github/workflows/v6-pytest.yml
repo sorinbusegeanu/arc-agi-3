@@ -56,7 +56,7 @@ jobs:
         run: |
           python -m py_compile src/v6/higher_order_substrate.py src/v6/tests/test_validation_hotpath_caching.py
           pytest -q src/v6/tests/test_validation_hotpath_caching.py
-          pytest -q src/v6/tests/test_v6_higher_order.py src/v6/tests/test_v63_repairs.py
+          pytest -q src/v6/tests/test_v6_higher_order.py
       - name: Run full test suite
         env:
           PYTHONPATH: src
