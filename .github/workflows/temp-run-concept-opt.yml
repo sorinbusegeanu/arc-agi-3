@@ -1,0 +1,119 @@
+name: temp-run-concept-opt
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+jobs:
+  run-opt:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: optimize-v63-concept-validation
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test]"
+      - name: Apply optimization
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('src/v6/higher_order_substrate.py')
+          text=p.read_text()
+
+          old='''def _prior_role_success_rate(\n    transfer_rows: list[sqlite3.Row],\n    *,\n    role: str,\n    before_step: int,\n    source_game_key: str | None = None,\n    source_context_key: str | None = None,\n    target_game_key: str | None = None,\n    target_context_key: str | None = None,\n    transfer_history: _TransferHistoryIndex | None = None,\n) -> tuple[float, int]:\n    if transfer_history is not None:\n        return transfer_history.rate_before(\n            role=role,\n            step=before_step,\n            source_game_key=source_game_key,\n            source_context_key=source_context_key,\n            target_game_key=target_game_key,\n            target_context_key=target_context_key,\n        )\n'''
+          new='''def _prior_role_success_rate(\n    transfer_rows: list[sqlite3.Row],\n    *,\n    role: str,\n    before_step: int,\n    source_game_key: str | None = None,\n    source_context_key: str | None = None,\n    target_game_key: str | None = None,\n    target_context_key: str | None = None,\n    transfer_history: _TransferHistoryIndex | None = None,\n    rate_cache: dict[tuple[str, int, str, str, str, str], tuple[float, int]] | None = None,\n) -> tuple[float, int]:\n    if transfer_history is not None:\n        cache_key=(role,int(before_step),source_game_key or "",source_context_key or "",target_game_key or "",target_context_key or "")\n        if rate_cache is not None and cache_key in rate_cache:\n            return rate_cache[cache_key]\n        result=transfer_history.rate_before(\n            role=role, step=before_step, source_game_key=source_game_key,\n            source_context_key=source_context_key, target_game_key=target_game_key,\n            target_context_key=target_context_key,\n        )\n        if rate_cache is not None:\n            rate_cache[cache_key]=result\n        return result\n'''
+          if old not in text: raise SystemExit('prior-rate block missing')
+          text=text.replace(old,new,1)
+
+          old='''def _transfer_explanation_events(\n    *,\n    candidate_signature: str,\n    source_roles: list[str],\n    first_seen_global_step: int | None,\n    transfer_rows: list[sqlite3.Row],\n    transfer_history: _TransferHistoryIndex | None = None,\n) -> list[dict[str, Any]]:\n'''
+          new='''def _transfer_explanation_events(\n    *,\n    candidate_signature: str,\n    source_roles: list[str],\n    first_seen_global_step: int | None,\n    transfer_rows: list[sqlite3.Row],\n    transfer_history: _TransferHistoryIndex | None = None,\n    rate_cache: dict[tuple[str, int, str, str, str, str], tuple[float, int]] | None = None,\n) -> list[dict[str, Any]]:\n'''
+          if old not in text: raise SystemExit('transfer events signature missing')
+          text=text.replace(old,new,1)
+          text=text.replace('transfer_history=transfer_history,\n            )[0]\n            for role in source_roles','transfer_history=transfer_history,\n                rate_cache=rate_cache,\n            )[0]\n            for role in source_roles',1)
+          text=text.replace('target_context_key=target_context_key,\n                    transfer_history=transfer_history,\n                )','target_context_key=target_context_key,\n                    transfer_history=transfer_history,\n                    rate_cache=rate_cache,\n                )',1)
+
+          old='''def _future_option_motif_explanation_events(\n    state_conn: sqlite3.Connection,\n    *,\n    candidate_signature: str,\n    source_roles: list[str],\n    first_seen_global_step: int | None,\n    future_rows: list[sqlite3.Row],\n) -> list[dict[str, Any]]:\n'''
+          new='''def _future_option_motif_explanation_events(\n    state_conn: sqlite3.Connection,\n    *,\n    candidate_signature: str,\n    source_roles: list[str],\n    first_seen_global_step: int | None,\n    future_rows: list[sqlite3.Row],\n    role_rate_cache: dict[tuple[str, int], float] | None = None,\n) -> list[dict[str, Any]]:\n'''
+          if old not in text: raise SystemExit('future signature missing')
+          text=text.replace(old,new,1)
+          old='''    role_rates: dict[str, float] = {}\n    for role in source_roles:\n        values = [\n            1.0 if float(row["option_delta"] or 0.0) > 0.0 else 0.0\n            for row in future_rows\n            if (str(row["source_role_id"] or row["owner_key"] or "") == role)\n            and row["last_seen_global_step"] is not None\n            and int(row["last_seen_global_step"]) < first_seen_global_step\n        ]\n        role_rates[role] = sum(values) / len(values) if values else 0.0\n'''
+          new='''    role_rates: dict[str, float] = {}\n    for role in source_roles:\n        cache_key=(role,int(first_seen_global_step))\n        if role_rate_cache is not None and cache_key in role_rate_cache:\n            role_rates[role]=role_rate_cache[cache_key]\n            continue\n        values=[\n            1.0 if float(row["option_delta"] or 0.0) > 0.0 else 0.0\n            for row in future_rows\n            if (str(row["source_role_id"] or row["owner_key"] or "") == role)\n            and row["last_seen_global_step"] is not None\n            and int(row["last_seen_global_step"]) < first_seen_global_step\n        ]\n        role_rates[role]=sum(values)/len(values) if values else 0.0\n        if role_rate_cache is not None:\n            role_rate_cache[cache_key]=role_rates[role]\n'''
+          if old not in text: raise SystemExit('future rates block missing')
+          text=text.replace(old,new,1)
+
+          # Add cache arg to prediction and contradiction helpers.
+          for doc in ('Evaluate later lower-level predictions without candidate-concept features.','Evaluate held-out contradiction detection/resolution opportunities.'):
+              marker='    transfer_history: _TransferHistoryIndex | None = None,\n) -> list[dict[str, Any]]:\n    """'+doc
+              repl='    transfer_history: _TransferHistoryIndex | None = None,\n    rate_cache: dict[tuple[str, int, str, str, str, str], tuple[float, int]] | None = None,\n) -> list[dict[str, Any]]:\n    """'+doc
+              if marker not in text: raise SystemExit('helper signature missing '+doc)
+              text=text.replace(marker,repl,1)
+          # Generic rate call in prediction and contradiction.
+          text=text.replace('transfer_history=transfer_history,\n            )[0]\n            for role in source_roles\n        ]\n        baseline = max(rates','transfer_history=transfer_history,\n                rate_cache=rate_cache,\n            )[0]\n            for role in source_roles\n        ]\n        baseline = max(rates',1)
+          text=text.replace('transfer_history=transfer_history,\n            )[0]\n            for role in source_roles\n        ]\n        baseline = max(failure_rates','transfer_history=transfer_history,\n                rate_cache=rate_cache,\n            )[0]\n            for role in source_roles\n        ]\n        baseline = max(failure_rates',1)
+
+          old='''    config: IncrementalPromotionValidationConfig,\n    candidate_links: dict[str, set[str]] | None = None,\n) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:\n'''
+          new='''    config: IncrementalPromotionValidationConfig,\n    candidate_links: dict[str, set[str]] | None = None,\n    role_links: dict[str, dict[str, set[str]]] | None = None,\n    transfer_rate_cache: dict[tuple[str, int, str, str, str, str], tuple[float, int]] | None = None,\n    future_role_rate_cache: dict[tuple[str, int], float] | None = None,\n) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:\n'''
+          if old not in text: raise SystemExit('functional signature missing')
+          text=text.replace(old,new,1)
+          text=text.replace('transfer_history=transfer_history,\n    )\n    events.extend(_future_option','transfer_history=transfer_history,\n        rate_cache=transfer_rate_cache,\n    )\n    events.extend(_future_option',1)
+          text=text.replace('future_rows=future_rows,\n    ))\n    role_links = _links_by_signature(state_conn, "role_links", "role_signature")','future_rows=future_rows,\n        role_rate_cache=future_role_rate_cache,\n    ))\n    role_links = role_links or _links_by_signature(state_conn, "role_links", "role_signature")',1)
+          text=text.replace('role_links=role_links,\n        transfer_history=transfer_history,\n    ))','role_links=role_links,\n        transfer_history=transfer_history,\n        rate_cache=transfer_rate_cache,\n    ))',2)
+
+          old='''    transfer_history = _build_transfer_history_index(transfer_rows)\n    transfers_by_role: dict[str, list[sqlite3.Row]] = defaultdict(list)\n'''
+          new='''    transfer_history = _build_transfer_history_index(transfer_rows)\n    transfer_rate_cache: dict[tuple[str, int, str, str, str, str], tuple[float, int]] = {}\n    future_role_rate_cache: dict[tuple[str, int], float] = {}\n    transfers_by_role: dict[str, list[sqlite3.Row]] = defaultdict(list)\n'''
+          if old not in text: raise SystemExit('cache insertion missing')
+          text=text.replace(old,new,1)
+          old='''                config=config,\n                candidate_links=relevance_links_by_candidate.get(concept_signature, {}),\n            )\n'''
+          new='''                config=config,\n                candidate_links=relevance_links_by_candidate.get(concept_signature, {}),\n                role_links=role_links,\n                transfer_rate_cache=transfer_rate_cache,\n                future_role_rate_cache=future_role_rate_cache,\n            )\n'''
+          if old not in text: raise SystemExit('diagnostics call missing')
+          text=text.replace(old,new,1)
+
+          old='''    contradiction_keys = {\n        str(row["canonical_key"])\n        for row in state_conn.execute("SELECT canonical_key FROM contradiction_clusters ORDER BY canonical_key ASC").fetchall()\n    }\n    promoted_rows = [row for row in concept_rows if int(row.get("is_promoted", 0) or 0) == 1]\n'''
+          new='''    contradiction_keys = {\n        str(row["canonical_key"])\n        for row in state_conn.execute("SELECT canonical_key FROM contradiction_clusters ORDER BY canonical_key ASC").fetchall()\n    }\n    family_support={str(row["family_signature"]):int(row["support"] or 0) for row in state_conn.execute(\n        "SELECT family_signature, COALESCE(SUM(support_count),0) AS support FROM family_members GROUP BY family_signature").fetchall()}\n    future_event_count_by_family={str(row["source_family_id"]):int(row["event_count"] or 0) for row in state_conn.execute(\n        "SELECT source_family_id, COUNT(*) AS event_count FROM future_option_events WHERE source_family_id IS NOT NULL GROUP BY source_family_id").fetchall()}\n    family_prediction_gain={str(row["canonical_signature"]):float(row["prediction_lift"] or 0.0) for row in state_conn.execute(\n        "SELECT canonical_signature, prediction_lift FROM transformation_families").fetchall()}\n    promoted_rows = [row for row in concept_rows if int(row.get("is_promoted", 0) or 0) == 1]\n'''
+          if old not in text: raise SystemExit('world preload insertion missing')
+          text=text.replace(old,new,1)
+          old='''        for family in candidate_families:\n            support_row = state_conn.execute(\n                "SELECT COALESCE(SUM(support_count), 0) FROM family_members WHERE family_signature = ?",\n                (family,),\n            ).fetchone()\n            role_count = sum(\n                1 for role in roles if family in role_links.get(role, {}).get("family", set())\n            )\n            event_count = int(state_conn.execute(\n                "SELECT COUNT(*) FROM future_option_events WHERE source_family_id = ?", (family,)\n            ).fetchone()[0])\n            prediction_gain_row = state_conn.execute(\n                "SELECT AVG(prediction_lift) FROM transformation_families WHERE canonical_signature = ?", (family,)\n            ).fetchone()\n            prediction_gain = float(prediction_gain_row[0] or 0.0)\n            family_candidates.append({\n                "family": family,\n                "support": int(support_row[0] or 0), "role_count": role_count,\n'''
+          new='''        for family in candidate_families:\n            role_count = sum(\n                1 for role in roles if family in role_links.get(role, {}).get("family", set())\n            )\n            event_count=future_event_count_by_family.get(family,0)\n            prediction_gain=family_prediction_gain.get(family,0.0)\n            family_candidates.append({\n                "family": family,\n                "support": family_support.get(family,0), "role_count": role_count,\n'''
+          if old not in text: raise SystemExit('world N+1 block missing')
+          text=text.replace(old,new,1)
+          p.write_text(text)
+          PY
+      - name: Add cache regression
+        run: |
+          cat > src/v6/tests/test_validation_hotpath_caching.py <<'PY'
+          import sqlite3
+          from v6.higher_order_substrate import _build_transfer_history_index, _prior_role_success_rate
+          def test_transfer_rate_cache_preserves_results():
+              c=sqlite3.connect(':memory:'); c.row_factory=sqlite3.Row
+              c.execute('CREATE TABLE t(last_seen_global_step INTEGER, role_signature TEXT, reuse_success INTEGER, source_game_key TEXT, source_context_key TEXT, target_game_key TEXT, target_context_key TEXT)')
+              c.executemany('INSERT INTO t VALUES(?,?,?,?,?,?,?)',[(10,'r',1,'a','b','c','d'),(20,'r',0,'a','b','c','d'),(30,'r',1,'a','b','c','d')])
+              rows=c.execute('SELECT * FROM t').fetchall(); h=_build_transfer_history_index(rows); cache={}
+              assert _prior_role_success_rate(rows,role='r',before_step=30,transfer_history=h,rate_cache=cache)==(0.5,2)
+              assert _prior_role_success_rate(rows,role='r',before_step=30,transfer_history=h,rate_cache=cache)==(0.5,2)
+              assert len(cache)==1
+              c.close()
+          PY
+      - name: Compile and focused tests
+        env: {PYTHONPATH: src}
+        run: |
+          python -m py_compile src/v6/higher_order_substrate.py src/v6/tests/test_validation_hotpath_caching.py
+          pytest -q src/v6/tests/test_validation_hotpath_caching.py
+          pytest -q src/v6/tests/test_v6_higher_order.py src/v6/tests/test_v63_repairs.py
+      - name: Full v6 suite
+        env: {PYTHONPATH: src}
+        run: pytest -q src/v6/tests
+      - name: Commit to optimization branch
+        run: |
+          git rm .github/workflows/temp-concept-validation-optimization.yml || true
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/v6/higher_order_substrate.py src/v6/tests/test_validation_hotpath_caching.py
+          git commit -m "Optimize incremental promotion validation hotpath"
+          git push origin HEAD:optimize-v63-concept-validation
