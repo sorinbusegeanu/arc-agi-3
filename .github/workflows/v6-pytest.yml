@@ -4,12 +4,20 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   pytest:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - name: Checkout concept optimization head
+        if: github.event_name == 'pull_request' && github.head_ref == 'optimize-v63-concept-validation'
+        run: |
+          git fetch origin optimize-v63-concept-validation
+          git checkout -B optimize-v63-concept-validation origin/optimize-v63-concept-validation
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -18,7 +26,49 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[test]"
+      - name: Apply concept validation optimization
+        if: github.event_name == 'pull_request' && github.head_ref == 'optimize-v63-concept-validation'
+        run: |
+          if [ -f tools/temp_apply_concept_opt.py ]; then
+            python tools/temp_apply_concept_opt.py
+            cat > src/v6/tests/test_validation_hotpath_caching.py <<'PY'
+          import sqlite3
+          from v6.higher_order_substrate import _build_transfer_history_index, _prior_role_success_rate
+
+          def test_transfer_rate_cache_preserves_results():
+              connection = sqlite3.connect(':memory:')
+              connection.row_factory = sqlite3.Row
+              connection.execute('CREATE TABLE t(last_seen_global_step INTEGER, role_signature TEXT, reuse_success INTEGER, source_game_key TEXT, source_context_key TEXT, target_game_key TEXT, target_context_key TEXT)')
+              connection.executemany('INSERT INTO t VALUES(?,?,?,?,?,?,?)', [(10,'r',1,'a','b','c','d'), (20,'r',0,'a','b','c','d'), (30,'r',1,'a','b','c','d')])
+              rows = connection.execute('SELECT * FROM t').fetchall()
+              history = _build_transfer_history_index(rows)
+              cache = {}
+              assert _prior_role_success_rate(rows, role='r', before_step=30, transfer_history=history, rate_cache=cache) == (0.5, 2)
+              assert _prior_role_success_rate(rows, role='r', before_step=30, transfer_history=history, rate_cache=cache) == (0.5, 2)
+              assert len(cache) == 1
+              connection.close()
+          PY
+          fi
+      - name: Compile optimized hotpath
+        if: github.event_name == 'pull_request' && github.head_ref == 'optimize-v63-concept-validation'
+        env:
+          PYTHONPATH: src
+        run: |
+          python -m py_compile src/v6/higher_order_substrate.py src/v6/tests/test_validation_hotpath_caching.py
+          pytest -q src/v6/tests/test_validation_hotpath_caching.py
+          pytest -q src/v6/tests/test_v6_higher_order.py src/v6/tests/test_v63_repairs.py
       - name: Run full test suite
         env:
           PYTHONPATH: src
         run: pytest -q --import-mode=importlib
+      - name: Commit tested optimization
+        if: github.event_name == 'pull_request' && github.head_ref == 'optimize-v63-concept-validation'
+        run: |
+          if [ -f tools/temp_apply_concept_opt.py ]; then
+            git rm tools/temp_apply_concept_opt.py .github/workflows/temp-concept-validation-optimization.yml || true
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add src/v6/higher_order_substrate.py src/v6/tests/test_validation_hotpath_caching.py
+            git commit -m "Optimize incremental promotion validation hotpath"
+            git push origin HEAD:optimize-v63-concept-validation
+          fi
