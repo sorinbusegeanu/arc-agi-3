@@ -1538,7 +1538,6 @@ def derive_world_model_components(
             and linked_family_count >= 2
             and linked_carrier_count >= 2
             and (cross_context_count >= 3 or cross_game_count >= 2)
-            and observed_outcome_count > 0
             and functional_coherence_score > 0.0
             and coherence_score >= 0.55
         )
@@ -2423,12 +2422,12 @@ def _validate_incremental_promotions(
                 UPDATE world_model_components
                 SET validation_prediction_lift = ?, validation_action_selection_lift = ?,
                     validation_transfer_lift = ?, promotion_status = ?, promotion_failure_count = ?,
-                    coherence_score = ?, candidate_only = ?, is_coherent = ?
+                    coherence_score = ?, is_coherent = ?
                 WHERE component_signature = ?
                 """,
                 (
                     prediction_lift, action_lift, transfer_lift, status, failure_count,
-                    adjusted_coherence_score, int(not coherent), int(coherent), component_signature,
+                    adjusted_coherence_score, int(coherent), component_signature,
                 ),
             )
             if demoted:

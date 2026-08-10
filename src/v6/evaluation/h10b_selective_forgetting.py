@@ -44,6 +44,25 @@ def evaluate_h10b_selective_forgetting(
             result["decision"] = "PARTIALLY_VALID"
     else:
         result["decision"] = "PARTIALLY_VALID"
+    # H10B_SUBSTANTIVE_EVIDENCE_GATE_V1
+    compression_improved = float(result.get("compression_ratio_after") or 0.0) > float(result.get("compression_ratio_before") or 0.0)
+    abstraction_improved = float(result.get("abstraction_score_after") or 0.0) > float(result.get("abstraction_score_before") or 0.0)
+    transfer_before = result.get("transfer_score_before")
+    transfer_after = result.get("transfer_score_after")
+    transfer_improved = (
+        transfer_before is not None
+        and transfer_after is not None
+        and float(transfer_after) > float(transfer_before)
+    )
+    substantive_forgetting_evidence = compression_improved or abstraction_improved or transfer_improved
+    result["substantive_forgetting_evidence"] = substantive_forgetting_evidence
+    if result.get("decision") == "VALID" and not substantive_forgetting_evidence:
+        result["decision"] = "PARTIALLY_VALID"
+        result["missing_evidence"] = list(dict.fromkeys(
+            list(result.get("missing_evidence", []))
+            + ["Selective survival lift exists, but no compression, abstraction, or transfer improvement is demonstrated."]
+        ))
+
     _write_report(output_dir, result)
     return result
 

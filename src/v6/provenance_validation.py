@@ -440,7 +440,12 @@ def _validate_h11(
         if statuses == {"verified"}:
             _count(report, "verified", "H11")
         elif "missing" in statuses:
-            _count(report, "missing", "H11")
+            # A materialized H11 link with a partially resolved chain is candidate/proxy evidence,
+            # not a missing required claim. Only a wholly absent provenance chain is missing.
+            if statuses == {"missing"}:
+                _count(report, "missing", "H11")
+            else:
+                _count(report, "proxy", "H11")
         elif "legacy" in statuses:
             _count(report, "legacy", "H11")
         else:

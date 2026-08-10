@@ -1845,8 +1845,8 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
                         and source_context_key != target_context_key
                     )
                     transfer_provenance_status = (
-                        "verified" if pair_rows and all(str(row.get("provenance_status") or "") == "verified" for row in pair_rows)
-                        else "resolved_with_surrogate" if any((source_game_is_surrogate, target_game_is_surrogate, source_context_is_surrogate, target_context_is_surrogate))
+                        "resolved_with_surrogate" if any((source_game_is_surrogate, target_game_is_surrogate, source_context_is_surrogate, target_context_is_surrogate))
+                        else "verified" if pair_rows and all(str(row.get("provenance_status") or "") == "verified" for row in pair_rows)
                         else "proxy"
                     )
                     transfer_scope = (
