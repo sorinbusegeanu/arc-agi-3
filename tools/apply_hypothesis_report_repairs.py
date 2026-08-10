@@ -22,19 +22,7 @@ def repair_h12() -> None:
         "from v6.memory.compact_memory import configure_compact_sqlite_connection, ensure_memory_layout",
         "from v6.memory.compact_memory import configure_compact_sqlite_connection",
     )
-    replace_once(
-        path,
-        "from v6.memory.trajectory_efficiency import load_best_known_solution_lengths, save_best_known_solution_lengths",
-        "from v6.memory.trajectory_efficiency import load_best_known_solution_lengths",
-    )
-    replace_once(path, "    efficiency_root.mkdir(parents=True, exist_ok=True)\n", "")
-    replace_once(path, "    save_best_known_solution_lengths(best_known_path, best_known_map)\n", "")
     replace_once(path, "    ensure_memory_layout(memory_dir)\n", "")
-    replace_once(
-        path,
-        "    if should_update_state:\n        state_path.write_text(json.dumps(state_payload, indent=2), encoding=\"utf-8\")\n",
-        "    # REPORT evaluators are read-only. Persistent efficiency state is updated during DERIVE/runtime only.\n",
-    )
 
 
 def repair_h08() -> None:
