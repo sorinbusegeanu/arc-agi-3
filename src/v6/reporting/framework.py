@@ -15,6 +15,7 @@ VALID_DECISIONS = {
     "INVALID",
     "INSUFFICIENT_EVIDENCE",
     "SKIPPED_FAST_MODE",
+    "EVALUATOR_ERROR",
 }
 
 
@@ -264,7 +265,9 @@ def apply_decision_envelope(
     ]
     dependency_passed = not failed_dependencies
 
-    if not contract_check.passed:
+    if raw_decision == "EVALUATOR_ERROR":
+        final_decision = "EVALUATOR_ERROR"
+    elif not contract_check.passed:
         final_decision = "INSUFFICIENT_EVIDENCE"
     elif proxy_summary["proxy_only"]:
         final_decision = "INSUFFICIENT_EVIDENCE"

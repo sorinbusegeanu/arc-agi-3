@@ -3,7 +3,7 @@ from __future__ import annotations
 import inspect
 import json
 import time
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -548,11 +548,11 @@ def _failed_evaluator_result(
     )
     return {
         "hypothesis_id": hypothesis_id,
-        "decision": "INSUFFICIENT_EVIDENCE",
-        "raw_decision": "INSUFFICIENT_EVIDENCE",
+        "decision": "EVALUATOR_ERROR",
+        "raw_decision": "EVALUATOR_ERROR",
         "core_metrics": {},
-        "missing_evidence": [message],
-        "evidence_source": "read_only_snapshot",
+        "missing_evidence": [],
+        "evidence_source": "evaluator_error",
         "evaluator_error": {
             "type": type(exc).__name__,
             "message": str(exc),
@@ -665,7 +665,7 @@ def evaluate_hypotheses_read_only(
                 hypothesis_id, evaluator, kwargs=kwargs
             )
     else:
-        with ProcessPoolExecutor(max_workers=worker_count) as executor:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
             futures = {
                 executor.submit(
                     _evaluate_one,
