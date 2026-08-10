@@ -91,9 +91,9 @@ def repair_h10b() -> None:
     marker = "H10B_SUBSTANTIVE_EVIDENCE_GATE_V1"
     if marker in text:
         return
-    anchor = text.rfind("    return result")
+    anchor = text.rfind("    _write_report(output_dir, result)")
     if anchor < 0:
-        raise RuntimeError("H10B return anchor not found")
+        raise RuntimeError("H10B report-write anchor not found")
     gate = '''    # H10B_SUBSTANTIVE_EVIDENCE_GATE_V1\n    compression_improved = float(result.get("compression_ratio_after") or 0.0) > float(result.get("compression_ratio_before") or 0.0)\n    abstraction_improved = float(result.get("abstraction_score_after") or 0.0) > float(result.get("abstraction_score_before") or 0.0)\n    transfer_before = result.get("transfer_score_before")\n    transfer_after = result.get("transfer_score_after")\n    transfer_improved = (\n        transfer_before is not None\n        and transfer_after is not None\n        and float(transfer_after) > float(transfer_before)\n    )\n    substantive_forgetting_evidence = compression_improved or abstraction_improved or transfer_improved\n    result["substantive_forgetting_evidence"] = substantive_forgetting_evidence\n    if result.get("decision") == "VALID" and not substantive_forgetting_evidence:\n        result["decision"] = "PARTIALLY_VALID"\n        result["missing_evidence"] = list(dict.fromkeys(\n            list(result.get("missing_evidence", []))\n            + ["Selective survival lift exists, but no compression, abstraction, or transfer improvement is demonstrated."]\n        ))\n\n'''
     path.write_text(text[:anchor] + gate + text[anchor:], encoding="utf-8")
 
