@@ -7,11 +7,12 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def replace_once(path: Path, old: str, new: str) -> None:
     text = path.read_text(encoding="utf-8")
+    if old in text:
+        path.write_text(text.replace(old, new, 1), encoding="utf-8")
+        return
     if new in text:
         return
-    if old not in text:
-        raise RuntimeError(f"expected text not found in {path}: {old[:120]!r}")
-    path.write_text(text.replace(old, new, 1), encoding="utf-8")
+    raise RuntimeError(f"expected text not found in {path}: {old[:120]!r}")
 
 
 def repair_h12() -> None:
@@ -85,14 +86,7 @@ def repair_h07() -> None:
 
 
 def repair_h10b() -> None:
-    candidates = []
-    for path in (ROOT / "src/v6").rglob("*.py"):
-        text = path.read_text(encoding="utf-8")
-        if "high_vs_low_survival_lift" in text and "compression_ratio_before" in text:
-            candidates.append(path)
-    if len(candidates) != 1:
-        raise RuntimeError(f"expected one H10B evaluator, found {candidates}")
-    path = candidates[0]
+    path = ROOT / "src/v6/evaluation/h10b_selective_forgetting.py"
     text = path.read_text(encoding="utf-8")
     marker = "H10B_SUBSTANTIVE_EVIDENCE_GATE_V1"
     if marker in text:
