@@ -10,7 +10,7 @@ def _valid_result(**kwargs):
     }
 
 
-def _call_parallel_suite(tmp_path, *, suite_mode="full", workers=4):
+def _call_suite(tmp_path, *, suite_mode="full"):
     return suite.evaluate_hypotheses_read_only(
         run_dir=tmp_path / "run",
         evidence_memory_dir=tmp_path / "memory",
@@ -29,11 +29,10 @@ def _call_parallel_suite(tmp_path, *, suite_mode="full", workers=4):
         h11_provenance_sample_limit=10,
         h11_write_full_provenance_jsonl=False,
         max_h11_main_report_bytes=10000,
-        evaluator_workers=workers,
     )
 
 
-def test_parallel_evaluators_do_not_require_picklable_runtime_bindings(tmp_path, monkeypatch):
+def test_report_evaluators_accept_runtime_installed_bindings(tmp_path, monkeypatch):
     evaluator_names = [
         "evaluate_h01_contingency_emergence",
         "evaluate_h02_prediction_violation_attention",
@@ -54,7 +53,7 @@ def test_parallel_evaluators_do_not_require_picklable_runtime_bindings(tmp_path,
             return _valid_result(**kwargs)
         monkeypatch.setattr(suite, name, local_evaluator)
 
-    results = _call_parallel_suite(tmp_path, workers=4)
+    results = _call_suite(tmp_path)
 
     assert set(results) == {f"H{i:02d}" for i in range(1, 13)}
     assert all(result["decision"] == "VALID" for result in results.values())
@@ -63,7 +62,7 @@ def test_parallel_evaluators_do_not_require_picklable_runtime_bindings(tmp_path,
 
 def test_evaluator_exception_is_not_mislabeled_as_insufficient_evidence(tmp_path, monkeypatch):
     def failing_evaluator(**kwargs):
-        raise RuntimeError("parallel evaluator regression sentinel")
+        raise RuntimeError("evaluator regression sentinel")
 
     monkeypatch.setattr(suite, "evaluate_h01_contingency_emergence", failing_evaluator)
     monkeypatch.setattr(suite, "evaluate_h02_prediction_violation_attention", _valid_result)
@@ -72,7 +71,7 @@ def test_evaluator_exception_is_not_mislabeled_as_insufficient_evidence(tmp_path
     monkeypatch.setattr(suite, "evaluate_h05_role_emergence", _valid_result)
     monkeypatch.setattr(suite, "evaluate_h12_efficiency_emergence", _valid_result)
 
-    results = _call_parallel_suite(tmp_path, suite_mode="fast", workers=4)
+    results = _call_suite(tmp_path, suite_mode="fast")
 
     assert results["H01"]["decision"] == "EVALUATOR_ERROR"
     assert results["H01"]["evaluator_error"]["type"] == "RuntimeError"
@@ -104,3 +103,14 @@ def test_decision_envelope_preserves_evaluator_error(tmp_path, monkeypatch):
     )
     assert result["raw_decision"] == "EVALUATOR_ERROR"
     assert result["final_decision"] == "EVALUATOR_ERROR"
+
+
+def test_report_phase_has_no_evaluator_worker_fanout():
+    import inspect
+
+    signature = inspect.signature(suite.evaluate_hypotheses_read_only)
+    assert "evaluator_workers" not in signature.parameters
+    source = inspect.getsource(suite.run_hypothesis_suite_report)
+    assert "evaluator_workers" not in source
+    assert "ProcessPoolExecutor" not in inspect.getsource(suite)
+    assert "ThreadPoolExecutor" not in inspect.getsource(suite)

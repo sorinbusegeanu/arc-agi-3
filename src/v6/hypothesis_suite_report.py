@@ -3,7 +3,6 @@ from __future__ import annotations
 import inspect
 import json
 import time
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -600,7 +599,6 @@ def evaluate_hypotheses_read_only(
     h11_provenance_sample_limit: int,
     h11_write_full_provenance_jsonl: bool,
     max_h11_main_report_bytes: int,
-    evaluator_workers: int = 1,
 ) -> dict[str, dict[str, Any]]:
     """REPORT phase. All evaluators receive a read-only evidence snapshot."""
     dirs = {
@@ -658,30 +656,10 @@ def evaluate_hypotheses_read_only(
             ("H11", evaluate_h11_future_option_transfer_concepts, {**common, "output_dir": dirs["H11"], "already_derived": True, "provenance_sample_limit": int(h11_provenance_sample_limit), "write_full_provenance_jsonl": bool(h11_write_full_provenance_jsonl), "max_main_report_bytes": int(max_h11_main_report_bytes)}),
         ])
 
-    worker_count = max(1, min(int(evaluator_workers), len(tasks)))
-    if worker_count == 1:
-        for hypothesis_id, evaluator, kwargs in tasks:
-            results[hypothesis_id] = _evaluate_one(
-                hypothesis_id, evaluator, kwargs=kwargs
-            )
-    else:
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            futures = {
-                executor.submit(
-                    _evaluate_one,
-                    hypothesis_id,
-                    evaluator,
-                    kwargs=kwargs,
-                ): hypothesis_id
-                for hypothesis_id, evaluator, kwargs in tasks
-            }
-            for future, hypothesis_id in futures.items():
-                try:
-                    results[hypothesis_id] = future.result()
-                except Exception as exc:
-                    results[hypothesis_id] = _failed_evaluator_result(
-                        hypothesis_id, exc
-                    )
+    for hypothesis_id, evaluator, kwargs in tasks:
+        results[hypothesis_id] = _evaluate_one(
+            hypothesis_id, evaluator, kwargs=kwargs
+        )
     return results
 
 
@@ -919,7 +897,6 @@ def run_hypothesis_suite_report(
                 h11_write_full_provenance_jsonl,
             max_h11_main_report_bytes=
                 max_h11_main_report_bytes,
-            evaluator_workers=max(1, int(higher_order_workers)),
         )
 
         fingerprint_after_report = memory_fingerprint(memory_dir)
