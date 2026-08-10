@@ -7,7 +7,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from v6.memory.compact_memory import configure_compact_sqlite_connection, ensure_memory_layout
+from v6.memory.compact_memory import configure_compact_sqlite_connection
 from v6.memory.direct_streaming_fold import direct_streaming_manifest_exists
 from v6.memory.trajectory_efficiency import load_best_known_solution_lengths, save_best_known_solution_lengths
 
@@ -284,7 +284,6 @@ def _load_trajectory_rows(*, run_dir: Path, memory_dir: Path | None) -> tuple[li
     if memory_dir is None:
         diagnostics["missing_compact_trajectory_records"] = True
         return [], "none", diagnostics
-    ensure_memory_layout(memory_dir)
     with sqlite3.connect(Path(memory_dir) / "current_state.sqlite") as conn:
         conn.row_factory = sqlite3.Row
         configure_compact_sqlite_connection(conn, write=False)

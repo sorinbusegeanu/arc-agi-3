@@ -685,6 +685,16 @@ def evaluate_h07_concept_emergence(
             incremental_validation["incremental_coverage_aggregate"]
         )
 
+    # H07_CURRENT_VALIDATION_GATE_V1
+    retained_without_validation = int(result.get("concepts_retained_without_current_validation", 0) or 0)
+    result["promotion_retained_without_current_validation"] = retained_without_validation > 0
+    if retained_without_validation > 0 and result.get("decision") == "VALID":
+        result["decision"] = "PARTIALLY_VALID"
+        result["missing_evidence"] = list(dict.fromkeys(
+            list(result.get("missing_evidence", []))
+            + [f"{retained_without_validation} promoted concept(s) are retained without current held-out validation."]
+        ))
+
     _write_outputs(output_dir, result)
     return result
 
