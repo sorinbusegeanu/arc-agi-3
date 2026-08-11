@@ -1083,42 +1083,37 @@ def evaluate_h11_future_option_transfer_concepts(
     motifs_skipped_no_concepts = int(
         derivation_summary.get("motifs_skipped_no_concepts") or 0
     )
-    for motif_signature in {
-        str(row.get("motif_signature"))
-        for row in links
-        if row.get("motif_signature") not in (None, "")
-    }:
-        motif_rows = [
-            row
-            for row in links
-            if str(row.get("motif_signature")) == motif_signature
-        ]
-        if (
-            "motifs_skipped_no_role_links" not in derivation_summary
-            and not any(
-                row.get("role_signature") not in (None, "")
-                or row.get("source_role_signature") not in (None, "")
-                for row in motif_rows
-            )
-        ):
-            motifs_skipped_no_role_links += 1
-        if (
-            "motifs_skipped_no_transfer_attempts" not in derivation_summary
-            and not any(
-                _int(row.get("transfer_attempt_count")) > 0
-                for row in motif_rows
-            )
-        ):
-            motifs_skipped_no_transfer_attempts += 1
-        if (
-            "motifs_skipped_no_concepts" not in derivation_summary
-            and not any(
-                row.get("concept_signature")
-                not in (None, "", "__none__")
-                for row in motif_rows
-            )
-        ):
-            motifs_skipped_no_concepts += 1
+    fallback_keys = (
+        "motifs_skipped_no_role_links",
+        "motifs_skipped_no_transfer_attempts",
+        "motifs_skipped_no_concepts",
+    )
+    if any(key not in derivation_summary for key in fallback_keys):
+        motif_rows_by_signature: dict[str, list[dict[str, object]]] = defaultdict(list)
+        for row in links:
+            motif_signature = row.get("motif_signature")
+            if motif_signature not in (None, ""):
+                motif_rows_by_signature[str(motif_signature)].append(row)
+        for motif_rows in motif_rows_by_signature.values():
+            if (
+                "motifs_skipped_no_role_links" not in derivation_summary
+                and not any(
+                    row.get("role_signature") not in (None, "")
+                    or row.get("source_role_signature") not in (None, "")
+                    for row in motif_rows
+                )
+            ):
+                motifs_skipped_no_role_links += 1
+            if (
+                "motifs_skipped_no_transfer_attempts" not in derivation_summary
+                and not any(_int(row.get("transfer_attempt_count")) > 0 for row in motif_rows)
+            ):
+                motifs_skipped_no_transfer_attempts += 1
+            if (
+                "motifs_skipped_no_concepts" not in derivation_summary
+                and not any(row.get("concept_signature") not in (None, "", "__none__") for row in motif_rows)
+            ):
+                motifs_skipped_no_concepts += 1
 
     provenance_report_sample = [
         {

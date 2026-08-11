@@ -1747,6 +1747,33 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
     fully_verified_emergent_chain_count = 0
     partially_verified_emergent_chain_count = 0
     unverified_emergent_chain_count = 0
+
+    # Pairing role-transfer evidence is role-local and does not depend on the motif.
+    # Build it once instead of rebuilding identical dictionaries for every motif-role link.
+    transfer_pairs_by_role: dict[
+        str,
+        dict[tuple[str | None, str | None, str | None, str | None], list[dict[str, Any]]],
+    ] = {}
+    for cached_role_signature, cached_rows in transfers_by_role.items():
+        cached_pairs: dict[
+            tuple[str | None, str | None, str | None, str | None],
+            list[dict[str, Any]],
+        ] = defaultdict(list)
+        for transfer_row in cached_rows:
+            cached_pairs[(
+                transfer_row.get("source_game_key"),
+                transfer_row.get("target_game_key"),
+                transfer_row.get("source_context_key"),
+                transfer_row.get("target_context_key"),
+            )].append(transfer_row)
+        if not cached_pairs:
+            cached_pairs[(None, None, None, None)] = []
+        transfer_pairs_by_role[cached_role_signature] = cached_pairs
+
+    # first/last evidence bounds depend only on motif-role-concept, not on the
+    # source/target scope pair. Large runs can emit many scope pairs per triple.
+    evidence_bounds_cache: dict[tuple[str, str, str], tuple[Any, Any]] = {}
+
     for motif_signature in sorted(motif_links):
         motifs_seen_for_transfer += 1
         quality = motif_quality.get(motif_signature, {})
@@ -1802,15 +1829,10 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
                 roles_resolved_via_shared_family.add(role_signature)
             else:
                 roles_still_without_concept.add(role_signature)
-            rows_by_pair: dict[tuple[str | None, str | None, str | None, str | None], list[dict[str, Any]]] = defaultdict(list)
-            for transfer_row in role_transfer_rows:
-                pair = (
-                    transfer_row.get("source_game_key"), transfer_row.get("target_game_key"),
-                    transfer_row.get("source_context_key"), transfer_row.get("target_context_key"),
-                )
-                rows_by_pair[pair].append(transfer_row)
-            if not rows_by_pair:
-                rows_by_pair[(None, None, None, None)] = []
+            rows_by_pair = transfer_pairs_by_role.get(
+                role_signature,
+                {(None, None, None, None): []},
+            )
             for resolution in concept_resolutions:
                 concept_signature = str(resolution["concept_signature"])
                 for provenance, pair_rows in sorted(rows_by_pair.items(), key=lambda item: tuple(str(value or "") for value in item[0])):
@@ -1857,8 +1879,15 @@ def derive_future_option_transfer_links(state_conn: sqlite3.Connection) -> dict[
                         else "same_scope"
                     )
                     concept_status = str(resolution["status"]) if concept_signature != "__none__" else "missing"
-                    first_seen = _safe_min(state_conn, motif_signature, role_signature, concept_signature, "first")
-                    last_seen = _safe_min(state_conn, motif_signature, role_signature, concept_signature, "last")
+                    bounds_key = (motif_signature, role_signature, concept_signature)
+                    bounds = evidence_bounds_cache.get(bounds_key)
+                    if bounds is None:
+                        bounds = (
+                            _safe_min(state_conn, motif_signature, role_signature, concept_signature, "first"),
+                            _safe_min(state_conn, motif_signature, role_signature, concept_signature, "last"),
+                        )
+                        evidence_bounds_cache[bounds_key] = bounds
+                    first_seen, last_seen = bounds
                     state_conn.execute(
                         """
                         INSERT INTO future_option_transfer_links (

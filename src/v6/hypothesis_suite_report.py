@@ -657,8 +657,12 @@ def evaluate_hypotheses_read_only(
         ])
 
     for hypothesis_id, evaluator, kwargs in tasks:
+        evaluator_started = time.perf_counter()
         results[hypothesis_id] = _evaluate_one(
             hypothesis_id, evaluator, kwargs=kwargs
+        )
+        results[hypothesis_id]["evaluator_seconds"] = (
+            time.perf_counter() - evaluator_started
         )
     return results
 
@@ -899,6 +903,11 @@ def run_hypothesis_suite_report(
                 max_h11_main_report_bytes,
         )
 
+        evaluator_profile = {
+            hypothesis_id: float(result.get("evaluator_seconds", 0.0) or 0.0)
+            for hypothesis_id, result in raw_results.items()
+        }
+
         fingerprint_after_report = memory_fingerprint(memory_dir)
         memory_unchanged = (
             fingerprint_before_report == fingerprint_after_report
@@ -945,6 +954,11 @@ def run_hypothesis_suite_report(
             ),
             "report_seconds": report_seconds,
             "suite_total_seconds": time.time() - started,
+            **{
+                f"evaluator_{key.lower()}_seconds": float(value)
+                for key, value in evaluator_profile.items()
+            },
+            "evaluator_total_seconds": sum(evaluator_profile.values()),
         },
         global_step_start=global_step_start,
         global_step_end=global_step_end,

@@ -1539,7 +1539,7 @@ def derive_world_model_components(
             and linked_carrier_count >= 2
             and (cross_context_count >= 3 or cross_game_count >= 2)
             and functional_coherence_score > 0.0
-            and coherence_score >= 0.55
+            and coherence_score >= 0.45
         )
         if candidate_only:
             candidate_only_count += 1
