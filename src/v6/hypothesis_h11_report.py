@@ -873,29 +873,24 @@ def evaluate_h11_future_option_transfer_concepts(
         if write_full_provenance_jsonl
         else None
     )
+    for row in links[:provenance_sample_limit]:
+        provenance_sample.append(_chain_output_row(row)[0])
+    # Preserve historical pair-artifact semantics on normal/small fixtures.
+    # On very large reports, the DB remains the complete evidence store and
+    # pair artifacts need only the fully verified chains used for validation.
+    artifact_rows = (
+        links
+        if full_handle is not None or len(links) <= 100_000
+        else fully_verified_links
+    )
     try:
-        for row in links:
-            output, game_pair, context_pair = (
-                _chain_output_row(row)
-            )
+        for row in artifact_rows:
+            output, game_pair, context_pair = _chain_output_row(row)
             fully_verified = _is_fully_verified(row)
-            _add_pair_row(
-                game_pairs[game_pair],
-                output,
-                fully_verified,
-            )
-            _add_pair_row(
-                context_pairs[context_pair],
-                output,
-                fully_verified,
-            )
-
-            source_context_id = output.get(
-                "source_context_id"
-            )
-            target_context_id = output.get(
-                "target_context_id"
-            )
+            _add_pair_row(game_pairs[game_pair], output, fully_verified)
+            _add_pair_row(context_pairs[context_pair], output, fully_verified)
+            source_context_id = output.get("source_context_id")
+            target_context_id = output.get("target_context_id")
             if source_context_id:
                 context_lookup[str(source_context_id)] = str(
                     row.get("source_context_key") or ""
@@ -904,17 +899,8 @@ def evaluate_h11_future_option_transfer_concepts(
                 context_lookup[str(target_context_id)] = str(
                     row.get("target_context_key") or ""
                 )
-
-            if (
-                len(provenance_sample)
-                < provenance_sample_limit
-            ):
-                provenance_sample.append(output)
             if full_handle is not None:
-                full_handle.write(
-                    json.dumps(output, sort_keys=True)
-                    + "\n"
-                )
+                full_handle.write(json.dumps(output, sort_keys=True) + "\n")
     finally:
         if full_handle is not None:
             full_handle.close()

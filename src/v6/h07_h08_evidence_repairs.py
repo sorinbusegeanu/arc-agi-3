@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import math
 import os
@@ -1111,7 +1112,21 @@ def apply_patch() -> bool:
             )
 
         def build_functional(*args: Any, **kwargs: Any):
-            result = original_build(*args, **kwargs)
+            signature = inspect.signature(original_build)
+            accepts_var_kwargs = any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in signature.parameters.values()
+            )
+            supported_kwargs = (
+                kwargs
+                if accepts_var_kwargs
+                else {
+                    key: value
+                    for key, value in kwargs.items()
+                    if key in signature.parameters
+                }
+            )
+            result = original_build(*args, **supported_kwargs)
             events, diagnostics, state = result
             return _recompute_population_continuity(
                 higher_order,
