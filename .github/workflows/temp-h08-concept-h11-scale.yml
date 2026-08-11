@@ -43,12 +43,26 @@ jobs:
             src/v6/hypothesis_suite_report.py \
             src/v6/continuous_research.py \
             src/v6/cli.py
-      - name: Run focused tests
+      - name: Higher-order focused tests
         env:
           PYTHONPATH: src
-        run: |
-          pytest -q src/v6/tests/test_v6_higher_order.py
-          pytest -q src/v6/tests -k "h08 or h11 or concept or hypothesis_suite or incremental_promotion"
+        run: pytest -vv -x src/v6/tests/test_v6_higher_order.py
+      - name: H08 focused tests
+        env:
+          PYTHONPATH: src
+        run: pytest -vv -x src/v6/tests -k "h08"
+      - name: H11 focused tests
+        env:
+          PYTHONPATH: src
+        run: pytest -vv -x src/v6/tests -k "h11"
+      - name: Concept validation focused tests
+        env:
+          PYTHONPATH: src
+        run: pytest -vv -x src/v6/tests -k "concept or incremental_promotion"
+      - name: Suite focused tests
+        env:
+          PYTHONPATH: src
+        run: pytest -vv -x src/v6/tests -k "hypothesis_suite"
       - name: Run full suite
         env:
           PYTHONPATH: src
