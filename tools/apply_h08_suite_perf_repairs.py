@@ -16,11 +16,7 @@ def replace_once(path: Path, old: str, new: str) -> None:
 
 def patch_h08_threshold() -> None:
     path = ROOT / "src/v6/higher_order_substrate.py"
-    replace_once(
-        path,
-        "            and coherence_score >= 0.55\n",
-        "            and coherence_score >= 0.45\n",
-    )
+    replace_once(path, "            and coherence_score >= 0.55\n", "            and coherence_score >= 0.45\n")
 
 
 def patch_future_option_transfer_derivation() -> None:
@@ -45,7 +41,7 @@ def patch_future_option_transfer_derivation() -> None:
 def patch_h11_report_scan() -> None:
     path = ROOT / "src/v6/hypothesis_h11_report.py"
     old = '''    for motif_signature in {\n        str(row.get("motif_signature"))\n        for row in links\n        if row.get("motif_signature") not in (None, "")\n    }:\n        motif_rows = [\n            row\n            for row in links\n            if str(row.get("motif_signature")) == motif_signature\n        ]\n        if (\n            "motifs_skipped_no_role_links" not in derivation_summary\n            and not any(\n                row.get("role_signature") not in (None, "")\n                or row.get("source_role_signature") not in (None, "")\n                for row in motif_rows\n            )\n        ):\n            motifs_skipped_no_role_links += 1\n        if (\n            "motifs_skipped_no_transfer_attempts" not in derivation_summary\n            and not any(\n                _int(row.get("transfer_attempt_count")) > 0\n                for row in motif_rows\n            )\n        ):\n            motifs_skipped_no_transfer_attempts += 1\n        if (\n            "motifs_skipped_no_concepts" not in derivation_summary\n            and not any(\n                row.get("concept_signature")\n                not in (None, "", "__none__")\n                for row in motif_rows\n            )\n        ):\n            motifs_skipped_no_concepts += 1\n'''
-    new = '''    fallback_keys = (\n        "motifs_skipped_no_role_links",\n        "motifs_skipped_no_transfer_attempts",\n        "motifs_skipped_no_concepts",\n    )\n    if any(key not in derivation_summary for key in fallback_keys):\n        motif_rows_by_signature: dict[str, list[dict[str, object]]] = defaultdict(list)\n        for row in links:\n            motif_signature = row.get("motif_signature")\n            if motif_signature not in (None, ""):\n                motif_rows_by_signature[str(motif_signature)].append(row)\n        for motif_rows in motif_rows_by_signature.values():\n            if (\n                "motifs_skipped_no_role_links" not in derivation_summary\n                and not any(\n                    row.get("role_signature") not in (None, "")\n                    or row.get("source_role_signature") not in (None, "")\n                    for row in motif_rows\n                )\n            ):\n                motifs_skipped_no_role_links += 1\n            if (\n                "motifs_skipped_no_transfer_attempts" not in derivation_summary\n                and not any(\n                    _int(row.get("transfer_attempt_count")) > 0\n                    for row in motif_rows\n                )\n            ):\n                motifs_skipped_no_transfer_attempts += 1\n            if (\n                "motifs_skipped_no_concepts" not in derivation_summary\n                and not any(\n                    row.get("concept_signature") not in (None, "", "__none__")\n                    for row in motif_rows\n                )\n            ):\n                motifs_skipped_no_concepts += 1\n'''
+    new = '''    fallback_keys = (\n        "motifs_skipped_no_role_links",\n        "motifs_skipped_no_transfer_attempts",\n        "motifs_skipped_no_concepts",\n    )\n    if any(key not in derivation_summary for key in fallback_keys):\n        motif_rows_by_signature: dict[str, list[dict[str, object]]] = defaultdict(list)\n        for row in links:\n            motif_signature = row.get("motif_signature")\n            if motif_signature not in (None, ""):\n                motif_rows_by_signature[str(motif_signature)].append(row)\n        for motif_rows in motif_rows_by_signature.values():\n            if (\n                "motifs_skipped_no_role_links" not in derivation_summary\n                and not any(\n                    row.get("role_signature") not in (None, "")\n                    or row.get("source_role_signature") not in (None, "")\n                    for row in motif_rows\n                )\n            ):\n                motifs_skipped_no_role_links += 1\n            if (\n                "motifs_skipped_no_transfer_attempts" not in derivation_summary\n                and not any(_int(row.get("transfer_attempt_count")) > 0 for row in motif_rows)\n            ):\n                motifs_skipped_no_transfer_attempts += 1\n            if (\n                "motifs_skipped_no_concepts" not in derivation_summary\n                and not any(row.get("concept_signature") not in (None, "", "__none__") for row in motif_rows)\n            ):\n                motifs_skipped_no_concepts += 1\n'''
     replace_once(path, old, new)
 
 
@@ -53,23 +49,18 @@ def patch_suite_profiler() -> None:
     path = ROOT / "src/v6/hypothesis_suite_report.py"
     replace_once(
         path,
-        "def evaluate_hypotheses_read_only(\n",
-        "def evaluate_hypotheses_read_only(\n",
-    )
-    replace_once(
-        path,
         "    for hypothesis_id, evaluator, kwargs in tasks:\n        results[hypothesis_id] = _evaluate_one(\n            hypothesis_id, evaluator, kwargs=kwargs\n        )\n    return results\n",
-        "    evaluator_timings: dict[str, float] = {}\n    for hypothesis_id, evaluator, kwargs in tasks:\n        evaluator_started = time.perf_counter()\n        results[hypothesis_id] = _evaluate_one(\n            hypothesis_id, evaluator, kwargs=kwargs\n        )\n        evaluator_timings[hypothesis_id] = time.perf_counter() - evaluator_started\n        results[hypothesis_id][\"evaluator_seconds\"] = evaluator_timings[hypothesis_id]\n    results[\"__timings__\"] = {\n        \"evaluator_seconds\": evaluator_timings,\n        \"total_evaluator_seconds\": sum(evaluator_timings.values()),\n    }\n    return results\n",
+        "    for hypothesis_id, evaluator, kwargs in tasks:\n        evaluator_started = time.perf_counter()\n        results[hypothesis_id] = _evaluate_one(\n            hypothesis_id, evaluator, kwargs=kwargs\n        )\n        results[hypothesis_id][\"evaluator_seconds\"] = (\n            time.perf_counter() - evaluator_started\n        )\n    return results\n",
     )
     replace_once(
         path,
         "        fingerprint_after_report = memory_fingerprint(memory_dir)\n",
-        "        evaluator_profile = dict(raw_results.pop(\"__timings__\", {}))\n\n        fingerprint_after_report = memory_fingerprint(memory_dir)\n",
+        "        evaluator_profile = {\n            hypothesis_id: float(result.get(\"evaluator_seconds\", 0.0) or 0.0)\n            for hypothesis_id, result in raw_results.items()\n        }\n\n        fingerprint_after_report = memory_fingerprint(memory_dir)\n",
     )
     replace_once(
         path,
         "            \"report_seconds\": report_seconds,\n            \"suite_total_seconds\": time.time() - started,\n",
-        "            \"report_seconds\": report_seconds,\n            \"suite_total_seconds\": time.time() - started,\n            **{\n                f\"evaluator_{key.lower()}_seconds\": float(value)\n                for key, value in dict(evaluator_profile.get(\"evaluator_seconds\", {})).items()\n            },\n            \"evaluator_total_seconds\": float(evaluator_profile.get(\"total_evaluator_seconds\", 0.0) or 0.0),\n",
+        "            \"report_seconds\": report_seconds,\n            \"suite_total_seconds\": time.time() - started,\n            **{\n                f\"evaluator_{key.lower()}_seconds\": float(value)\n                for key, value in evaluator_profile.items()\n            },\n            \"evaluator_total_seconds\": sum(evaluator_profile.values()),\n",
     )
 
 
