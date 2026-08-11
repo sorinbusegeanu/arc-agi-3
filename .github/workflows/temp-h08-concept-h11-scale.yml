@@ -35,8 +35,8 @@ jobs:
         run: python tools/temp_apply_h08_h11_scale.py
       - name: Apply H07 compatibility repair
         run: python tools/temp_apply_h07_compat.py
-      - name: Locate functional cache monkeypatch
-        run: grep -R -n "_build_functional_from_cache" src/v6 || true
+      - name: Apply validation parallel compatibility repair
+        run: python tools/temp_apply_validation_parallel_compat.py
       - name: Compile changed modules
         env:
           PYTHONPATH: src
@@ -44,6 +44,7 @@ jobs:
           python -m py_compile \
             src/v6/higher_order_substrate.py \
             src/v6/h07_h08_evidence_repairs.py \
+            src/v6/memory/v63_validation_parallel_completion.py \
             src/v6/hypothesis_h11_report.py \
             src/v6/hypothesis_suite_report.py \
             src/v6/continuous_research.py \
