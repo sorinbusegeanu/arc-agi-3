@@ -816,7 +816,7 @@ def run_hypothesis_suite_report(
     promotion_population_comparability_threshold: float = 0.80,
     promotion_demotion_failure_limit: int = 2,
     h11_provenance_sample_limit: int = 200,
-    h11_write_full_provenance_jsonl: bool = True,
+    h11_write_full_provenance_jsonl: bool = False,
     max_h11_main_report_bytes: int = 5_000_000,
     allow_memory_repair: bool = False,
     hypothesis_progress: bool | None = None,

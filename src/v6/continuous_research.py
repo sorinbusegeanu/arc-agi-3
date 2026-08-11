@@ -118,7 +118,7 @@ class ContinuousResearchConfig:
     promotion_population_comparability_threshold: float = 0.80
     promotion_demotion_failure_limit: int = 2
     h11_provenance_sample_limit: int = 200
-    h11_write_full_provenance_jsonl: bool = True
+    h11_write_full_provenance_jsonl: bool = False
     max_h11_main_report_bytes: int = 5_000_000
     hypothesis_progress: bool = True
     hypothesis_progress_log_every: int = 1000

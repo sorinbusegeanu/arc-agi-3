@@ -1400,6 +1400,12 @@ def derive_world_model_components(
         str(row["canonical_key"])
         for row in state_conn.execute("SELECT canonical_key FROM contradiction_clusters ORDER BY canonical_key ASC").fetchall()
     }
+    family_support = {str(row["family_signature"]): int(row["support"] or 0) for row in state_conn.execute(
+        "SELECT family_signature, COALESCE(SUM(support_count), 0) AS support FROM family_members GROUP BY family_signature").fetchall()}
+    future_event_count_by_family = {str(row["source_family_id"]): int(row["event_count"] or 0) for row in state_conn.execute(
+        "SELECT source_family_id, COUNT(*) AS event_count FROM future_option_events WHERE source_family_id IS NOT NULL GROUP BY source_family_id").fetchall()}
+    family_prediction_gain = {str(row["canonical_signature"]): float(row["prediction_lift"] or 0.0) for row in state_conn.execute(
+        "SELECT canonical_signature, prediction_lift FROM transformation_families").fetchall()}
     promoted_rows = [row for row in concept_rows if int(row.get("is_promoted", 0) or 0) == 1]
     candidate_rows = promoted_rows if promoted_rows else concept_rows[:20]
     coherent_count = 0
@@ -1417,23 +1423,14 @@ def derive_world_model_components(
         games = sorted(links.get("game", set()))
         family_candidates: list[dict[str, Any]] = []
         for family in candidate_families:
-            support_row = state_conn.execute(
-                "SELECT COALESCE(SUM(support_count), 0) FROM family_members WHERE family_signature = ?",
-                (family,),
-            ).fetchone()
             role_count = sum(
                 1 for role in roles if family in role_links.get(role, {}).get("family", set())
             )
-            event_count = int(state_conn.execute(
-                "SELECT COUNT(*) FROM future_option_events WHERE source_family_id = ?", (family,)
-            ).fetchone()[0])
-            prediction_gain_row = state_conn.execute(
-                "SELECT AVG(prediction_lift) FROM transformation_families WHERE canonical_signature = ?", (family,)
-            ).fetchone()
-            prediction_gain = float(prediction_gain_row[0] or 0.0)
+            event_count = future_event_count_by_family.get(family, 0)
+            prediction_gain = family_prediction_gain.get(family, 0.0)
             family_candidates.append({
                 "family": family,
-                "support": int(support_row[0] or 0), "role_count": role_count,
+                "support": family_support.get(family, 0), "role_count": role_count,
                 "event_count": event_count, "prediction_gain": prediction_gain,
                 "provenance_status": "verified" if event_count > 0 else "proxy",
             })
@@ -1788,6 +1785,8 @@ def _validate_incremental_promotions(
         """
     ).fetchall()
     transfer_history = _build_transfer_history_index(transfer_rows)
+    transfer_rate_cache: dict[tuple[str, int, str, str, str, str], tuple[float, int]] = {}
+    future_role_rate_cache: dict[tuple[str, int], float] = {}
     transfers_by_role: dict[str, list[sqlite3.Row]] = defaultdict(list)
     successful_transfer_target_roles_by_role: dict[str, set[str]] = defaultdict(set)
     for row in transfer_rows:
@@ -1983,6 +1982,9 @@ def _validate_incremental_promotions(
                 diagnostic_epoch_id=diagnostic_epoch_id,
                 config=config,
                 candidate_links=relevance_links_by_candidate.get(concept_signature, {}),
+                role_links=role_links,
+                transfer_rate_cache=transfer_rate_cache,
+                future_role_rate_cache=future_role_rate_cache,
             )
             explanation_event_rows.extend(explanation_events)
             incremental_coverage = float(functional_diagnostics["relevant_incremental_coverage"])
@@ -2390,10 +2392,21 @@ def _validate_incremental_promotions(
             ).fetchall()
         }
         component_links = _links_by_signature(state_conn, "world_model_links", "component_signature")
+        # Real components have a deterministic owning concept. Other concept
+        # graph links are contextual evidence and must not demote the owner.
+        # Synthetic/legacy component ids fall back to their explicit links.
+        owner_validation = {
+            f"wm:{sha1(signature.encode('utf-8')).hexdigest()[:20]}": record
+            for signature, record in concept_validation.items()
+        }
         for row in component_rows:
             component_signature = str(row["component_signature"])
-            concepts = component_links.get(component_signature, {}).get("concept", set())
-            validations = [concept_validation[item] for item in concepts if item in concept_validation]
+            owner = owner_validation.get(component_signature)
+            if owner is not None:
+                validations = [owner]
+            else:
+                concepts = component_links.get(component_signature, {}).get("concept", set())
+                validations = [concept_validation[item] for item in concepts if item in concept_validation]
             prediction_lift = _mean_row_metric(validations, "validation_prediction_lift")
             action_lift = _mean_row_metric(validations, "validation_action_selection_lift")
             transfer_lift = _mean_row_metric(validations, "validation_transfer_lift")
@@ -2428,6 +2441,28 @@ def _validate_incremental_promotions(
                 (
                     prediction_lift, action_lift, transfer_lift, status, failure_count,
                     adjusted_coherence_score, int(coherent), component_signature,
+                ),
+            )
+            state_conn.execute(
+                """
+                UPDATE world_model_component_state
+                SET historically_coherent = MAX(historically_coherent, ?),
+                    currently_coherent = ?,
+                    first_coherent_global_step = COALESCE(
+                        first_coherent_global_step,
+                        CASE WHEN ? = 1 THEN ? ELSE NULL END
+                    ),
+                    last_validated_global_step = ?,
+                    consecutive_validation_failures = ?,
+                    validation_status = ?,
+                    updated_at = datetime('now')
+                WHERE component_signature = ?
+                """,
+                (
+                    int(coherent), int(coherent), int(coherent),
+                    None if row["first_seen_global_step"] is None else int(row["first_seen_global_step"]),
+                    None if row["first_seen_global_step"] is None else int(row["first_seen_global_step"]),
+                    failure_count, "passed" if coherent else status, component_signature,
                 ),
             )
             if demoted:
@@ -2590,16 +2625,20 @@ def _prior_role_success_rate(
     target_game_key: str | None = None,
     target_context_key: str | None = None,
     transfer_history: _TransferHistoryIndex | None = None,
+    rate_cache: dict[tuple[str, int, str, str, str, str], tuple[float, int]] | None = None,
 ) -> tuple[float, int]:
     if transfer_history is not None:
-        return transfer_history.rate_before(
-            role=role,
-            step=before_step,
-            source_game_key=source_game_key,
-            source_context_key=source_context_key,
-            target_game_key=target_game_key,
+        cache_key = (role, int(before_step), source_game_key or "", source_context_key or "", target_game_key or "", target_context_key or "")
+        if rate_cache is not None and cache_key in rate_cache:
+            return rate_cache[cache_key]
+        result = transfer_history.rate_before(
+            role=role, step=before_step, source_game_key=source_game_key,
+            source_context_key=source_context_key, target_game_key=target_game_key,
             target_context_key=target_context_key,
         )
+        if rate_cache is not None:
+            rate_cache[cache_key] = result
+        return result
     matching = [
         row for row in transfer_rows
         if str(row["role_signature"] or "") == role
@@ -2641,6 +2680,7 @@ def _transfer_explanation_events(
     first_seen_global_step: int | None,
     transfer_rows: list[sqlite3.Row],
     transfer_history: _TransferHistoryIndex | None = None,
+    rate_cache: dict[tuple[str, int, str, str, str, str], tuple[float, int]] | None = None,
 ) -> list[dict[str, Any]]:
     if first_seen_global_step is None or len(source_roles) < 1:
         return []
@@ -2662,6 +2702,7 @@ def _transfer_explanation_events(
                 role=role,
                 before_step=int(step),
                 transfer_history=transfer_history,
+                rate_cache=rate_cache,
             )[0]
             for role in source_roles
         ]
@@ -2677,6 +2718,7 @@ def _transfer_explanation_events(
                     target_game_key=target_game_key,
                     target_context_key=target_context_key,
                     transfer_history=transfer_history,
+                    rate_cache=rate_cache,
                 )
             ]
             if count > 0
@@ -2752,6 +2794,7 @@ def _future_option_motif_explanation_events(
     source_roles: list[str],
     first_seen_global_step: int | None,
     future_rows: list[sqlite3.Row],
+    role_rate_cache: dict[tuple[str, int], float] | None = None,
 ) -> list[dict[str, Any]]:
     if first_seen_global_step is None or not source_roles:
         return []
@@ -2763,6 +2806,10 @@ def _future_option_motif_explanation_events(
     role_set = set(source_roles)
     role_rates: dict[str, float] = {}
     for role in source_roles:
+        cache_key = (role, int(first_seen_global_step))
+        if role_rate_cache is not None and cache_key in role_rate_cache:
+            role_rates[role] = role_rate_cache[cache_key]
+            continue
         values = [
             1.0 if float(row["option_delta"] or 0.0) > 0.0 else 0.0
             for row in future_rows
@@ -2771,6 +2818,8 @@ def _future_option_motif_explanation_events(
             and int(row["last_seen_global_step"]) < first_seen_global_step
         ]
         role_rates[role] = sum(values) / len(values) if values else 0.0
+        if role_rate_cache is not None:
+            role_rate_cache[cache_key] = role_rates[role]
     events: list[dict[str, Any]] = []
     for row in state_conn.execute(
         """
@@ -2830,6 +2879,7 @@ def _prediction_explanation_events(
     transfer_rows: list[sqlite3.Row],
     role_links: dict[str, dict[str, set[str]]],
     transfer_history: _TransferHistoryIndex | None = None,
+    rate_cache: dict[tuple[str, int, str, str, str, str], tuple[float, int]] | None = None,
 ) -> list[dict[str, Any]]:
     """Evaluate later lower-level predictions without candidate-concept features.
 
@@ -2863,6 +2913,7 @@ def _prediction_explanation_events(
                 role=role,
                 before_step=step,
                 transfer_history=transfer_history,
+                rate_cache=rate_cache,
             )[0]
             for role in source_roles
         ]
@@ -2909,6 +2960,7 @@ def _contradiction_resolution_explanation_events(
     transfer_rows: list[sqlite3.Row],
     role_links: dict[str, dict[str, set[str]]],
     transfer_history: _TransferHistoryIndex | None = None,
+    rate_cache: dict[tuple[str, int, str, str, str, str], tuple[float, int]] | None = None,
 ) -> list[dict[str, Any]]:
     """Evaluate held-out contradiction detection/resolution opportunities."""
     columns = _prediction_result_columns(state_conn)
@@ -2944,6 +2996,7 @@ def _contradiction_resolution_explanation_events(
                 role=role,
                 before_step=step,
                 transfer_history=transfer_history,
+                rate_cache=rate_cache,
             )[0]
             for role in source_roles
         ]
@@ -3125,6 +3178,9 @@ def _build_functional_explanation_diagnostics(
     diagnostic_epoch_id: str | int | None,
     config: IncrementalPromotionValidationConfig,
     candidate_links: dict[str, set[str]] | None = None,
+    role_links: dict[str, dict[str, set[str]]] | None = None,
+    transfer_rate_cache: dict[tuple[str, int, str, str, str, str], tuple[float, int]] | None = None,
+    future_role_rate_cache: dict[tuple[str, int], float] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
     """Evaluate held-out events with and without this concept's role combination."""
     events = _transfer_explanation_events(
@@ -3133,6 +3189,7 @@ def _build_functional_explanation_diagnostics(
         first_seen_global_step=first_seen_global_step,
         transfer_rows=transfer_rows,
         transfer_history=transfer_history,
+        rate_cache=transfer_rate_cache,
     )
     events.extend(_future_option_motif_explanation_events(
         state_conn,
@@ -3140,8 +3197,9 @@ def _build_functional_explanation_diagnostics(
         source_roles=source_roles,
         first_seen_global_step=first_seen_global_step,
         future_rows=future_rows,
+        role_rate_cache=future_role_rate_cache,
     ))
-    role_links = _links_by_signature(state_conn, "role_links", "role_signature")
+    role_links = role_links or _links_by_signature(state_conn, "role_links", "role_signature")
     events.extend(_prediction_explanation_events(
         state_conn,
         candidate_signature=candidate_signature,
@@ -3150,6 +3208,7 @@ def _build_functional_explanation_diagnostics(
         transfer_rows=transfer_rows,
         role_links=role_links,
         transfer_history=transfer_history,
+        rate_cache=transfer_rate_cache,
     ))
     events.extend(_contradiction_resolution_explanation_events(
         state_conn,
@@ -3159,6 +3218,7 @@ def _build_functional_explanation_diagnostics(
         transfer_rows=transfer_rows,
         role_links=role_links,
         transfer_history=transfer_history,
+        rate_cache=transfer_rate_cache,
     ))
     events.sort(key=lambda item: (str(item["event_type"]), str(item["event_id"])))
     candidate_links = candidate_links or {}

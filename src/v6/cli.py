@@ -633,7 +633,7 @@ def build_parser() -> argparse.ArgumentParser:
     hypothesis_suite.add_argument("--promotion-population-comparability-threshold", type=float, default=0.80)
     hypothesis_suite.add_argument("--promotion-demotion-failure-limit", type=int, default=2)
     hypothesis_suite.add_argument("--h11-provenance-sample-limit", type=_parse_non_negative_int, default=200)
-    hypothesis_suite.add_argument("--h11-write-full-provenance-jsonl", dest="h11_write_full_provenance_jsonl", action="store_true", default=True)
+    hypothesis_suite.add_argument("--h11-write-full-provenance-jsonl", dest="h11_write_full_provenance_jsonl", action="store_true", default=False)
     hypothesis_suite.add_argument("--no-h11-write-full-provenance-jsonl", dest="h11_write_full_provenance_jsonl", action="store_false")
     hypothesis_suite.add_argument("--max-h11-main-report-bytes", type=int, default=5_000_000)
 
@@ -747,7 +747,7 @@ def build_parser() -> argparse.ArgumentParser:
     continuous.add_argument("--promotion-population-comparability-threshold", type=float, default=0.80)
     continuous.add_argument("--promotion-demotion-failure-limit", type=int, default=2)
     continuous.add_argument("--h11-provenance-sample-limit", type=_parse_non_negative_int, default=200)
-    continuous.add_argument("--h11-write-full-provenance-jsonl", dest="h11_write_full_provenance_jsonl", action="store_true", default=True)
+    continuous.add_argument("--h11-write-full-provenance-jsonl", dest="h11_write_full_provenance_jsonl", action="store_true", default=False)
     continuous.add_argument("--no-h11-write-full-provenance-jsonl", dest="h11_write_full_provenance_jsonl", action="store_false")
     continuous.add_argument("--max-h11-main-report-bytes", type=int, default=5_000_000)
     continuous.add_argument("--memory-query-enabled", action="store_true")

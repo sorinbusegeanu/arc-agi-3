@@ -290,6 +290,9 @@ def _build_functional_from_cache(
     diagnostic_epoch_id: str | int | None,
     config: Any,
     candidate_links: dict[str, set[str]] | None = None,
+    role_links: dict[str, dict[str, set[str]]] | None = None,
+    transfer_rate_cache: dict[Any, Any] | None = None,
+    future_role_rate_cache: dict[Any, Any] | None = None,
 ) -> tuple[Any, Any, Any]:
     key = (
         str(candidate_signature),
@@ -310,4 +313,7 @@ def _build_functional_from_cache(
         diagnostic_epoch_id=diagnostic_epoch_id,
         config=config,
         candidate_links=candidate_links,
+        role_links=role_links,
+        transfer_rate_cache=transfer_rate_cache,
+        future_role_rate_cache=future_role_rate_cache,
     )
