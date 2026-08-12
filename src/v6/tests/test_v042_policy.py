@@ -143,7 +143,7 @@ def test_demotion_enters_probation_when_context_is_unresolved() -> None:
         count_failure=True,
         retain_previous_promotion=False,
         previously_promoted=True,
-        validation_result="failed",
+        validation_result="insufficient_context",
     )
     assert demoted is False
     assert failures == 0
