@@ -48,6 +48,52 @@ def _current_evidence_step(conn: sqlite3.Connection) -> int | None:
     return max(values) if values else None
 
 
+def _clean_scope(values: list[str], *, reject_surrogate: bool = False) -> list[str]:
+    cleaned = sorted({str(value) for value in values if value is not None and str(value)})
+    if reject_surrogate:
+        cleaned = [value for value in cleaned if not value.startswith("surrogate_game:")]
+    return cleaned
+
+
+def _prediction_scope_payload(
+    *, predicted_family: str, contexts: list[str], games: list[str]
+) -> str:
+    return json.dumps(
+        {
+            "kind": "next_family",
+            "family": str(predicted_family),
+            "contexts": _clean_scope(contexts),
+            "games": _clean_scope(games, reject_surrogate=True),
+            "scope_version": "component_scope_v2",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _parse_prediction_scope(
+    payload: Any,
+    *,
+    fallback_context: Any = None,
+    fallback_game: Any = None,
+) -> tuple[list[str], list[str]]:
+    contexts: list[str] = []
+    games: list[str] = []
+    if payload:
+        try:
+            parsed = json.loads(str(payload))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parsed = None
+        if isinstance(parsed, dict) and parsed.get("scope_version") == "component_scope_v2":
+            contexts = _clean_scope(list(parsed.get("contexts") or []))
+            games = _clean_scope(list(parsed.get("games") or []), reject_surrogate=True)
+    if not contexts and fallback_context:
+        contexts = [str(fallback_context)]
+    if not games and fallback_game:
+        games = [str(fallback_game)]
+    return contexts, games
+
+
 def _issue_world_model_prediction(
     conn: sqlite3.Connection,
     *,
@@ -57,6 +103,9 @@ def _issue_world_model_prediction(
     contexts: list[str],
     games: list[str],
 ) -> None:
+    families = _clean_scope(families)
+    contexts = _clean_scope(contexts)
+    games = _clean_scope(games, reject_surrogate=True)
     if not families:
         return
 
@@ -72,38 +121,50 @@ def _issue_world_model_prediction(
         return
 
     family_expr = _future_event_family_expr(conn)
-    best_context: str | None = None
+    params: list[Any] = [int(prediction_step)]
+    where = ["first_seen_global_step <= ?"]
+    if contexts:
+        placeholders = ",".join("?" for _ in contexts)
+        where.append(f"context_key IN ({placeholders})")
+        params.extend(contexts)
+    if games:
+        placeholders = ",".join("?" for _ in games)
+        where.append(f"game IN ({placeholders})")
+        params.extend(games)
+    placeholders = ",".join("?" for _ in families)
+    where.append(f"{family_expr} IN ({placeholders})")
+    params.extend(families)
+
+    try:
+        rows = conn.execute(
+            f"SELECT {family_expr} AS family, COUNT(*) AS n "
+            "FROM future_option_events WHERE " + " AND ".join(where)
+            + " GROUP BY family ORDER BY n DESC, family ASC",
+            params,
+        ).fetchall()
+    except sqlite3.Error:
+        rows = []
+
     predicted_family = families[0]
     baseline = 0.0
-    best_count = -1
-    for context in contexts or [None]:
-        params: list[Any] = [int(prediction_step)]
-        where = "first_seen_global_step <= ?"
-        if context is not None:
-            where += " AND context_key=?"
-            params.append(context)
-        placeholders = ",".join("?" for _ in families)
-        where += f" AND {family_expr} IN ({placeholders})"
-        params.extend(families)
-        try:
-            rows = conn.execute(
-                f"SELECT {family_expr} AS family, COUNT(*) AS n "
-                f"FROM future_option_events WHERE {where} "
-                "GROUP BY family ORDER BY n DESC, family ASC",
-                params,
-            ).fetchall()
-        except sqlite3.Error:
-            rows = []
+    if rows:
         total = sum(int(row[1] or 0) for row in rows)
-        if rows and int(rows[0][1] or 0) > best_count:
-            best_count = int(rows[0][1] or 0)
-            predicted_family = str(rows[0][0])
-            best_context = context
-            baseline = float(best_count / max(1, total))
+        predicted_family = str(rows[0][0])
+        baseline = float(int(rows[0][1] or 0) / max(1, total))
 
+    scope_payload = _prediction_scope_payload(
+        predicted_family=predicted_family,
+        contexts=contexts,
+        games=games,
+    )
+    # Keep legacy scalar scope columns only when the component itself has a
+    # single context/game. Multi-context models are validated over the full
+    # persisted component scope encoded in predicted_outcome.
+    exact_context = contexts[0] if len(contexts) == 1 else None
+    exact_game = games[0] if len(games) == 1 else None
     event_id = "wm-pred:" + sha1(
         json.dumps(
-            [signature, int(prediction_step), best_context, predicted_family],
+            [signature, int(prediction_step), scope_payload, predicted_family],
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()[:24]
@@ -121,11 +182,9 @@ def _issue_world_model_prediction(
             signature,
             int(prediction_step),
             predicted_family,
-            f"next_family:{predicted_family}",
-            games[0]
-            if len(games) == 1 and not games[0].startswith("surrogate_game:")
-            else None,
-            best_context,
+            scope_payload,
+            exact_game,
+            exact_context,
             baseline,
         ),
     )
@@ -136,7 +195,7 @@ def _match_world_model_predictions(conn: sqlite3.Connection, signature: str) -> 
     rows = conn.execute(
         """
         SELECT prediction_event_id, prediction_global_step, predicted_family,
-               game_key, context_key
+               game_key, context_key, predicted_outcome
         FROM world_model_prediction_events
         WHERE component_signature=? AND observed_event_id IS NULL
           AND COALESCE(provenance_status, 'prospective')='prospective'
@@ -148,14 +207,19 @@ def _match_world_model_predictions(conn: sqlite3.Connection, signature: str) -> 
     current_step = _current_evidence_step(conn)
     for row in rows:
         prediction_step = int(row[1])
+        contexts, games = _parse_prediction_scope(
+            row[5], fallback_context=row[4], fallback_game=row[3]
+        )
         where = ["last_seen_global_step > ?"]
         params: list[Any] = [prediction_step]
-        if row[4]:
-            where.append("context_key=?")
-            params.append(str(row[4]))
-        if row[3]:
-            where.append("game=?")
-            params.append(str(row[3]))
+        if contexts:
+            placeholders = ",".join("?" for _ in contexts)
+            where.append(f"context_key IN ({placeholders})")
+            params.extend(contexts)
+        if games:
+            placeholders = ",".join("?" for _ in games)
+            where.append(f"game IN ({placeholders})")
+            params.extend(games)
         try:
             observed = conn.execute(
                 f"SELECT event_id, last_seen_global_step, {family_expr} AS family, motif_type "
@@ -167,9 +231,9 @@ def _match_world_model_predictions(conn: sqlite3.Connection, signature: str) -> 
             observed = None
 
         if observed is None:
-            # Once newer compact evidence exists, an unresolved prediction is
-            # stale rather than a permanent blocker. A later derivation may
-            # issue a fresh prediction at the new evidence frontier.
+            # Once newer compact evidence exists outside the eligible component
+            # scope, keep the prediction live. It becomes stale only after the
+            # evidence frontier advances and there is still no eligible event.
             if current_step is not None and int(current_step) > prediction_step:
                 conn.execute(
                     "UPDATE world_model_prediction_events "
