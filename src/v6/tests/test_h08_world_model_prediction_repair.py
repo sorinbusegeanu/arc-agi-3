@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 
 from v6.h08_world_model_prediction_repair import (
@@ -164,3 +165,86 @@ def test_live_unmatched_prediction_still_blocks_duplicate_issue() -> None:
         "SELECT COUNT(*) FROM world_model_prediction_events WHERE component_signature='wm:test'"
     ).fetchone()[0]
     assert count == 1
+
+
+def test_multicontext_prediction_persists_component_scope_not_one_context() -> None:
+    conn = _connection()
+    conn.executemany(
+        """
+        INSERT INTO future_option_events (
+            event_id, owner_type, owner_key, source_family_id,
+            first_seen_global_step, last_seen_global_step,
+            context_key, game, motif_type
+        ) VALUES (?, 'family', ?, ?, ?, ?, ?, ?, 'motif')
+        """,
+        [
+            ('old-a', 'fam-a', 'fam-a', 100, 100, 'ctx-a', 'game-a'),
+            ('old-b', 'fam-a', 'fam-a', 110, 110, 'ctx-b', 'game-b'),
+            ('old-c', 'fam-b', 'fam-b', 120, 120, 'ctx-b', 'game-b'),
+        ],
+    )
+    _issue_world_model_prediction(
+        conn,
+        signature='wm:multi',
+        prediction_step=200,
+        families=['fam-a', 'fam-b'],
+        contexts=['ctx-a', 'ctx-b'],
+        games=['game-a', 'game-b'],
+    )
+    row = conn.execute(
+        "SELECT predicted_family, context_key, game_key, predicted_outcome "
+        "FROM world_model_prediction_events WHERE component_signature='wm:multi'"
+    ).fetchone()
+    assert row[0] == 'fam-a'
+    assert row[1] is None
+    assert row[2] is None
+    payload = json.loads(row[3])
+    assert payload['contexts'] == ['ctx-a', 'ctx-b']
+    assert payload['games'] == ['game-a', 'game-b']
+    assert payload['scope_version'] == 'component_scope_v2'
+
+
+def test_multicontext_prediction_matches_later_event_in_different_supported_context() -> None:
+    conn = _connection()
+    conn.executemany(
+        """
+        INSERT INTO future_option_events (
+            event_id, owner_type, owner_key, source_family_id,
+            first_seen_global_step, last_seen_global_step,
+            context_key, game, motif_type
+        ) VALUES (?, 'family', ?, ?, ?, ?, ?, ?, 'motif')
+        """,
+        [
+            ('old-a', 'fam-a', 'fam-a', 100, 100, 'ctx-a', 'game-a'),
+            ('old-b', 'fam-a', 'fam-a', 110, 110, 'ctx-b', 'game-b'),
+        ],
+    )
+    _issue_world_model_prediction(
+        conn,
+        signature='wm:multi',
+        prediction_step=200,
+        families=['fam-a'],
+        contexts=['ctx-a', 'ctx-b'],
+        games=['game-a', 'game-b'],
+    )
+    conn.execute(
+        """
+        INSERT INTO future_option_events (
+            event_id, owner_type, owner_key, source_family_id,
+            first_seen_global_step, last_seen_global_step,
+            context_key, game, motif_type
+        ) VALUES ('later-b', 'family', 'fam-a', 'fam-a', 250, 250, 'ctx-b', 'game-b', 'motif')
+        """
+    )
+
+    _match_world_model_predictions(conn, 'wm:multi')
+
+    row = conn.execute(
+        "SELECT observed_event_id, observed_global_step, prediction_correct, provenance_status "
+        "FROM world_model_prediction_events WHERE component_signature='wm:multi'"
+    ).fetchone()
+    assert row == ('later-b', 250, 1, 'verified')
+    metrics = _world_model_prediction_metrics(conn, 'wm:multi')
+    assert metrics['matched'] == 1
+    assert metrics['correct'] == 1
+    assert metrics['unmatched'] == 0
