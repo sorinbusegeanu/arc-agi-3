@@ -7,6 +7,7 @@ from v6.h08_world_model_prediction_repair import install_h08_world_model_predict
 from v6.v042_policy import install_v042_policy
 from v6.v042_compat import apply_v042_compatibility
 from v6.suite_runtime_repairs import install_suite_runtime_repairs
+from v6.suite_runtime_repairs_compat import install_suite_runtime_repairs_compat
 
 install_hypothesis_suite_performance_policy()
 apply_hypothesis_suite_performance_compatibility()
@@ -14,5 +15,6 @@ install_h08_world_model_prediction_repair()
 install_v042_policy()
 apply_v042_compatibility()
 install_suite_runtime_repairs()
+install_suite_runtime_repairs_compat()
 
 __all__ = ["V6Config", "V6System"]
