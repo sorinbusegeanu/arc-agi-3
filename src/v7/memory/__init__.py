@@ -21,6 +21,7 @@ from v7.memory.transport import (
     MmapReadViewTransport,
     ReadViewHandle,
     ReadViewTransport,
+    SegmentedMmapReadViewTransport,
 )
 from v7.memory.writer import CanonicalMemoryWriter, PreparedGeneration
 
@@ -60,4 +61,5 @@ __all__ = [
     "RoleIndexMutation",
     "ScoreColumns",
     "ScoreMutation",
+    "SegmentedMmapReadViewTransport",
 ]
