@@ -41,17 +41,10 @@ Implemented:
 - structural parent provenance emitted by the M1-M6 learning pipeline;
 - batched transfer summaries kept distinct from transfer priors.
 
-The six implementation phases following the v7 foundation are represented end-to-end:
-
-1. M1-M6 scientific derivation constructors and pipeline.
-2. Writer-owned deterministic canonical ID allocation.
-3. Packed and mmap-backed cognition indexes.
-4. Vectorized/batched cognition and action scoring.
-5. Bounded parallel derivation execution with deterministic merge.
-6. Incremental generation publication with unchanged section reuse and content-addressed mmap segments.
+The six implementation phases following the v7 foundation are represented end-to-end.
 
 The first runtime lifecycle block is also implemented: retention/replay/promotion-demotion plus append-only evidence, provenance, transfer and contradiction storage.
 
-Remaining major work is durable restart/restore, end-to-end v7 runner/CLI integration, H01-H12 reporting/evidence contracts, differential scientific validation against v6 and performance validation. GPU ranking and remote samplers remain intentionally later phases.
+Next integration block: restart/restore, runner/CLI, strict H01-H12 evidence contracts, differential scientific validation, and performance validation.
 
 Scientific M1-M6 behavior is clean-break v7 code and does not import v6 runtime modules. Stable v6 behavior remains an external scientific reference for differential validation.
