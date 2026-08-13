@@ -25,6 +25,7 @@ class EpisodeEvidence:
     source_game: str | None = None
     source_context: str | None = None
     source_global_step: int | None = None
+    outcome_polarity: str | None = None
 
 
 class ScientificDerivationKernels:
