@@ -17,6 +17,9 @@ from v7.memory.models import EdgeMutation, EdgeState, MemoryNode, MemoryScore, N
 from v7.memory.read_view import MemoryReadView
 
 
+PreparedGeneration = tuple[GenerationState, MemoryReadView, GenerationDelta]
+
+
 class CanonicalMemoryWriter:
     """Single-owner mutable frontier for v7 active semantic memory."""
 
@@ -34,6 +37,7 @@ class CanonicalMemoryWriter:
         self._dirty_edges: set[tuple[MemoryId, int, MemoryId]] = set()
         self._first_global_step: int | None = None
         self._last_global_step: int | None = None
+        self._pending_generation: PreparedGeneration | None = None
         self._published_view = MemoryReadView.freeze(
             generation_id=self._published_generation,
             nodes={},
@@ -51,6 +55,10 @@ class CanonicalMemoryWriter:
         return self._mutable_generation
 
     @property
+    def has_pending_generation(self) -> bool:
+        return self._pending_generation is not None
+
+    @property
     def dirty_counts(self) -> dict[str, int]:
         return {
             "nodes": len(self._dirty_nodes),
@@ -58,7 +66,12 @@ class CanonicalMemoryWriter:
             "edges": len(self._dirty_edges),
         }
 
+    def _ensure_mutable(self) -> None:
+        if self._pending_generation is not None:
+            raise RuntimeError("generation is prepared; finalize or abort it before mutating")
+
     def observe_global_step(self, global_step: int) -> None:
+        self._ensure_mutable()
         step = int(global_step)
         if step < 0:
             raise ValueError("global_step must be non-negative")
@@ -67,6 +80,7 @@ class CanonicalMemoryWriter:
         self._last_global_step = step if self._last_global_step is None else max(self._last_global_step, step)
 
     def apply_mutation_batch(self, mutations: Iterable[NodeMutation]) -> int:
+        self._ensure_mutable()
         coalesced: dict[MemoryId, NodeMutation] = {}
         for mutation in mutations:
             prior = coalesced.get(mutation.memory_id)
@@ -118,6 +132,7 @@ class CanonicalMemoryWriter:
         return len(coalesced)
 
     def apply_edge_batch(self, mutations: Iterable[EdgeMutation]) -> int:
+        self._ensure_mutable()
         coalesced: dict[tuple[MemoryId, int, MemoryId], int] = {}
         for mutation in mutations:
             key = (mutation.source_id, int(mutation.relation_type), mutation.target_id)
@@ -139,6 +154,7 @@ class CanonicalMemoryWriter:
         return len(coalesced)
 
     def apply_score_batch(self, mutations: Iterable[ScoreMutation]) -> int:
+        self._ensure_mutable()
         coalesced: dict[MemoryId, ScoreMutation] = {}
         for mutation in mutations:
             prior = coalesced.get(mutation.memory_id)
@@ -176,18 +192,25 @@ class CanonicalMemoryWriter:
         return len(coalesced)
 
     def apply_contingency_index_batch(self, mutations: Iterable[ContingencyIndexMutation]) -> int:
+        self._ensure_mutable()
         return self._cognition_indexes.apply_contingency_batch(mutations)
 
     def apply_role_index_batch(self, mutations: Iterable[RoleIndexMutation]) -> int:
+        self._ensure_mutable()
         return self._cognition_indexes.apply_role_batch(mutations)
 
     def apply_role_concept_index_batch(self, mutations: Iterable[RoleConceptIndexMutation]) -> int:
+        self._ensure_mutable()
         return self._cognition_indexes.apply_role_concept_batch(mutations)
 
     def apply_action_aggregate_batch(self, deltas: Iterable[ActionAggregateDelta]) -> int:
+        self._ensure_mutable()
         return self._cognition_indexes.apply_action_aggregate_batch(deltas)
 
-    def commit_generation(self) -> tuple[GenerationState, MemoryReadView, GenerationDelta]:
+    def prepare_generation(self) -> PreparedGeneration:
+        if self._pending_generation is not None:
+            return self._pending_generation
+
         adjacency: dict[tuple[MemoryId, int], list[MemoryId]] = {}
         for (source_id, relation_type, target_id), support in self._edge_support.items():
             if support <= 0:
@@ -223,13 +246,37 @@ class CanonicalMemoryWriter:
                 )
             ),
         )
+        self._pending_generation = (state, view, delta)
+        return self._pending_generation
 
-        self._published_generation = self._mutable_generation
-        self._mutable_generation = GenerationId(int(self._mutable_generation) + 1)
+    def finalize_generation(self) -> PreparedGeneration:
+        prepared = self._pending_generation
+        if prepared is None:
+            raise RuntimeError("no prepared generation to finalize")
+
+        state, view, delta = prepared
+        self._published_generation = state.generation_id
+        self._mutable_generation = GenerationId(int(state.generation_id) + 1)
         self._published_view = view
         self._dirty_nodes.clear()
         self._dirty_scores.clear()
         self._dirty_edges.clear()
         self._first_global_step = None
         self._last_global_step = None
+        self._pending_generation = None
         return state, view, delta
+
+    def abort_generation(self) -> None:
+        if self._pending_generation is None:
+            raise RuntimeError("no prepared generation to abort")
+        self._pending_generation = None
+
+    def commit_generation(self) -> PreparedGeneration:
+        """In-memory convenience commit for tests and non-durable callers.
+
+        Durable runtime orchestration should use prepare_generation(), persist the
+        delta, publish the read view, then finalize_generation().
+        """
+
+        self.prepare_generation()
+        return self.finalize_generation()
