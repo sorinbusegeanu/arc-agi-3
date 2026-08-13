@@ -15,7 +15,12 @@ from v7.memory.indexes.cognition import (
 from v7.memory.models import EdgeMutation, EdgeState, MemoryNode, MemoryScore, NodeMutation, ScoreMutation
 from v7.memory.publisher import GenerationPublisher, PublicationRecord
 from v7.memory.read_view import MemoryReadView
-from v7.memory.transport import LocalReadViewTransport, ReadViewHandle, ReadViewTransport
+from v7.memory.transport import (
+    LocalReadViewTransport,
+    MmapReadViewTransport,
+    ReadViewHandle,
+    ReadViewTransport,
+)
 from v7.memory.writer import CanonicalMemoryWriter, PreparedGeneration
 
 __all__ = [
@@ -41,6 +46,7 @@ __all__ = [
     "MemoryNode",
     "MemoryReadView",
     "MemoryScore",
+    "MmapReadViewTransport",
     "NodeMutation",
     "PreparedGeneration",
     "PublicationRecord",
