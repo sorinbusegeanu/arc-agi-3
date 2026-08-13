@@ -42,7 +42,7 @@ def test_writer_coalesces_and_publishes_immutable_generation(tmp_path) -> None:
     assert view.scores[source_id].future_option_delta == 1.5
     assert view.neighbors([source_id], 7) == ((target_id,),)
     assert delta.mutation_count == 4
-    assert writer.dirty_counts == {"nodes": 0, "scores": 0, "edges": 0}
+    assert writer.dirty_counts == {"nodes": 0, "scores": 0, "edges": 0, "derivation": 2}
 
     durable = DurableGenerationStore(tmp_path / "state.sqlite")
     try:
