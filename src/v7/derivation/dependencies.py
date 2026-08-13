@@ -3,9 +3,10 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Iterable, Mapping
+from typing import TYPE_CHECKING, Iterable, Mapping
 
-from v7.memory.ids import MemoryId, MemoryLevel
+if TYPE_CHECKING:
+    from v7.memory.ids import MemoryId, MemoryLevel
 
 
 @dataclass(frozen=True, slots=True)
