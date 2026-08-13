@@ -22,16 +22,20 @@ Implemented:
 - content-addressed read-view files with digest validation and explicit generation release;
 - retry-safe publication after a durable generation has already committed;
 - incremental M1->M6 dependency registration and dirty-neighborhood propagation;
-- deterministic per-level `DirtyDerivationPlan` snapshots and consumption.
+- deterministic per-level `DirtyDerivationPlan` snapshots and consumption;
+- read-only compact node and score columns backed by numeric buffers;
+- packed typed adjacency using source/relation rows plus offset/length target segments;
+- `MemoryReadView` hot node/score/neighbor reads routed through compact arenas;
+- deterministic bounded `DerivationTaskPlanner` chunks for dirty M2-M6 work;
+- worker-side generation attachment once per worker and task descriptors containing only levels and MemoryIds.
 
-Current mmap transport reconstructs the immutable Python read model from a memory-mapped generation blob on attach. The next physical-layout phase will replace object reconstruction in hot arrays with compact columnar/offset structures while preserving the same transport/publication contract.
+Current mmap transport still reconstructs the immutable Python read model on attach before compact arenas are built. The next physical-layout step is to mmap the numeric arena segments directly so worker hot arrays become zero/low-copy rather than reconstructed.
 
 Next implementation slices:
 
-- compact columnar arenas and packed adjacency;
-- zero/low-copy numeric read-view segments for hot worker queries;
-- incremental derivation workers consuming dirty plans;
-- vectorized/batched higher-order derivation kernels;
+- direct mmap/shared numeric arena segments;
+- vectorized/batched higher-order derivation kernels consuming `DerivationTask` chunks;
+- deterministic merge of derived mutation batches back into the single canonical writer;
 - GPU candidate ranking only after residual CPU bottlenecks are measured;
 - remote samplers later.
 
