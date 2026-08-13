@@ -1,119 +1,136 @@
 from __future__ import annotations
 
-from collections import defaultdict
+import json
+from collections import Counter, defaultdict
 from dataclasses import dataclass
+from hashlib import blake2b
+from typing import Iterable
 
 from v7.derivation.pipeline import MemoryLearningPipeline
-from v7.derivation.scientific import ScientificDerivationKernels, TYPE_CONCEPT, TYPE_CONTINGENCY, TYPE_ROLE, TYPE_WORLD_MODEL
+from v7.derivation.scientific import TYPE_CONCEPT, TYPE_CONTINGENCY, TYPE_FAMILY, TYPE_ROLE, TYPE_STRATEGY, TYPE_WORLD_MODEL, ScientificDerivationKernels
 from v7.memory.concept_validation import ConceptValidationStatus
+from v7.memory.evidence_lifecycle import EvidenceLifecycleStore, ProvenanceRecord
+from v7.memory.evidence_store import EvidenceStore
+from v7.memory.evidence_types import EvidenceType
 from v7.memory.ids import MemoryId, MemoryLevel
-from v7.memory.indexes.cognition import RoleConceptIndexMutation
+from v7.memory.indexes.cognition import RoleConceptIndexMutation, RoleIndexMutation
+from v7.memory.models import NodeMutation
 from v7.memory.writer import CanonicalMemoryWriter
 
-_MASK63 = (1 << 63) - 1
+_MASK63=(1<<63)-1
 
 @dataclass(frozen=True, slots=True)
 class OnlineDerivationStats:
-    families: int = 0
-    roles: int = 0
-    concepts: int = 0
-    world_models: int = 0
-    strategies: int = 0
-
+    families:int=0; roles:int=0; concepts:int=0; world_models:int=0; strategies:int=0
     @property
-    def total(self) -> int:
-        return self.families + self.roles + self.concepts + self.world_models + self.strategies
+    def total(self)->int:
+        return self.families+self.roles+self.concepts+self.world_models+self.strategies
 
 class OnlineHierarchyBuilder:
-    def __init__(self, writer: CanonicalMemoryWriter, pipeline: MemoryLearningPipeline) -> None:
-        self.writer = writer
-        self.pipeline = pipeline
+    """Bounded keyed M2-M6 derivation from committed evidence; no all-pairs search."""
+    def __init__(self, writer:CanonicalMemoryWriter, pipeline:MemoryLearningPipeline, evidence_store:EvidenceStore, lifecycle_store:EvidenceLifecycleStore)->None:
+        self.writer=writer; self.pipeline=pipeline; self.evidence_store=evidence_store; self.lifecycle_store=lifecycle_store
 
-    def derive(self) -> OnlineDerivationStats:
-        registry = self.writer._canonical_registry
-        nodes = self.writer._nodes
-        cognition = self.writer._cognition_indexes
-        families = roles = concepts = world_models = strategies = 0
-        grouped_m1: dict[tuple[int, int], list[MemoryId]] = defaultdict(list)
-        for memory_id, node in sorted(nodes.items(), key=lambda item: int(item[0])):
-            if node.level != MemoryLevel.M1 or node.type_id != TYPE_CONTINGENCY:
-                continue
-            key = registry.key_for(memory_id)
-            if key is None or len(key.parts) < 3:
-                continue
-            _, action_id, outcome_signature = key.parts[:3]
-            grouped_m1[(int(action_id), int(outcome_signature))].append(memory_id)
-        family_members: dict[MemoryId, tuple[MemoryId, ...]] = {}
-        for (action_id, outcome_signature), member_ids in sorted(grouped_m1.items()):
-            members = tuple(sorted(set(member_ids), key=int))
-            if len(members) < 2:
-                continue
-            candidate = ScientificDerivationKernels.m2_family(action_id=action_id, member_ids=members, outcome_class=outcome_signature)
-            family_id = self.writer.canonical_memory_id(candidate.key)
-            if family_id is None:
-                family_id = self.pipeline.derive_m2(action_id=action_id, member_ids=members, outcome_class=outcome_signature)
-                families += 1
-            family_members[family_id] = members
-        roles_by_family: dict[MemoryId, list[MemoryId]] = defaultdict(list)
-        for family_id, members in sorted(family_members.items(), key=lambda item: int(item[0])):
-            family_key = registry.key_for(family_id)
-            if family_key is None or len(family_key.parts) < 2:
-                continue
-            action_id = int(family_key.parts[0])
-            by_context: dict[int, list[MemoryId]] = defaultdict(list)
-            for member_id in members:
-                member_key = registry.key_for(member_id)
-                if member_key is not None and len(member_key.parts) >= 3:
-                    by_context[int(member_key.parts[0])].append(member_id)
-            for context, context_members in sorted(by_context.items()):
-                unique_members = tuple(sorted(set(context_members), key=int))
-                candidate = ScientificDerivationKernels.m3_role(family_id=family_id, context_class=context, action_id=action_id, member_ids=unique_members)
-                role_id = self.writer.canonical_memory_id(candidate.key)
-                if role_id is None:
-                    role_id = self.pipeline.derive_m3(family_id=family_id, context_class=context, action_id=action_id, member_ids=unique_members)
-                    roles += 1
-                roles_by_family[family_id].append(role_id)
-        for memory_id, node in sorted(nodes.items(), key=lambda item: int(item[0])):
-            if node.level == MemoryLevel.M3 and node.type_id == TYPE_ROLE:
-                key = registry.key_for(memory_id)
-                if key is not None and key.parts:
-                    roles_by_family[MemoryId(int(key.parts[0]))].append(memory_id)
-        for family_id, role_ids in sorted(roles_by_family.items(), key=lambda item: int(item[0])):
-            unique_roles = tuple(sorted(set(role_ids), key=int))
-            if len(unique_roles) < 2:
-                continue
-            relation_signature = _mix_signature(int(family_id), 0)
-            candidate = ScientificDerivationKernels.m4_concept(role_ids=unique_roles, relation_signature=relation_signature)
-            concept_id = self.writer.canonical_memory_id(candidate.key)
-            if concept_id is None:
-                concept_id = self.pipeline.derive_m4(role_ids=unique_roles, relation_signature=relation_signature)
-                concepts += 1
+    def derive(self)->OnlineDerivationStats:
+        nodes=getattr(self.writer,'_nodes'); registry=getattr(self.writer,'_canonical_registry')
+        families=roles=concepts=world_models=strategies=0
+        grouped:dict[tuple[int,int],list[MemoryId]]=defaultdict(list)
+        contexts:dict[tuple[int,int],dict[int,list[MemoryId]]]=defaultdict(lambda:defaultdict(list))
+        for mid,node in sorted(nodes.items(), key=lambda x:int(x[0])):
+            if node.level!=MemoryLevel.M1 or node.type_id!=TYPE_CONTINGENCY: continue
+            key=registry.key_for(mid)
+            if key is None or len(key.parts)<3: continue
+            context,action,outcome=map(int,key.parts[:3]); grouped[(action,outcome)].append(mid); contexts[(action,outcome)][context].append(mid)
+        family_by_member:dict[MemoryId,MemoryId]={}; role_by_family:dict[MemoryId,MemoryId]={}
+        for (action,outcome), raw_members in sorted(grouped.items()):
+            members=tuple(sorted(set(raw_members),key=int))
+            if len(members)<2: continue
+            candidate=ScientificDerivationKernels.m2_family(action_id=action,member_ids=members,outcome_class=outcome)
+            family=self.writer.canonical_memory_id(candidate.key)
+            if family is None:
+                family=self.pipeline.derive_m2(action_id=action,member_ids=members,outcome_class=outcome); families+=1
+            else: self._add_parent_support(family,MemoryLevel.M2,TYPE_FAMILY,members)
+            for member in members: family_by_member[member]=family
+            context_map=contexts[(action,outcome)]; all_members=tuple(sorted({m for values in context_map.values() for m in values},key=int)); first=min(context_map)
+            rc=ScientificDerivationKernels.m3_role(family_id=family,context_class=first,action_id=action,member_ids=all_members)
+            role=self.writer.canonical_memory_id(rc.key)
+            if role is None:
+                role=self.pipeline.derive_m3(family_id=family,context_class=first,action_id=action,member_ids=all_members); roles+=1
+            else: self._add_parent_support(role,MemoryLevel.M3,TYPE_ROLE,all_members)
+            self.writer.apply_role_index_batch(RoleIndexMutation(ctx,action,role,family) for ctx in sorted(context_map)); role_by_family[family]=role
+
+        episodes=self._load(EvidenceType.EPISODE); carrier_roles:dict[int,set[MemoryId]]=defaultdict(set)
+        for row in episodes:
+            carrier=row.get('carrier_signature'); mid=row.get('memory_id')
+            if carrier is None or mid is None: continue
+            family=family_by_member.get(MemoryId(int(mid))); role=role_by_family.get(family) if family is not None else None
+            if role is not None: carrier_roles[int(carrier)].add(role)
+        for carrier, raw_roles in sorted(carrier_roles.items()):
+            role_ids=tuple(sorted(raw_roles,key=int))
+            if len(role_ids)<2: continue
+            cc=ScientificDerivationKernels.m4_concept(role_ids=role_ids,relation_signature=carrier); concept=self.writer.canonical_memory_id(cc.key)
+            if concept is None:
+                concept=self.pipeline.derive_m4(role_ids=role_ids,relation_signature=carrier); concepts+=1
             else:
-                self.writer.apply_role_concept_index_batch(RoleConceptIndexMutation(role_id, concept_id) for role_id in unique_roles)
-        validated_concepts = tuple(sorted((memory_id for memory_id, node in nodes.items() if node.level == MemoryLevel.M4 and node.type_id == TYPE_CONCEPT and int(node.status_flags) & int(ConceptValidationStatus.TRANSFER_VALIDATED)), key=int))
-        if len(validated_concepts) >= 2:
-            signature = _fold_signature(validated_concepts)
-            candidate = ScientificDerivationKernels.m5_world_model(concept_ids=validated_concepts, transition_signature=signature)
-            if self.writer.canonical_memory_id(candidate.key) is None:
-                self.pipeline.derive_m5(concept_ids=validated_concepts, transition_signature=signature)
-                world_models += 1
-        model_ids = tuple(sorted((memory_id for memory_id, node in nodes.items() if node.level == MemoryLevel.M5 and node.type_id == TYPE_WORLD_MODEL), key=int))
+                self._add_parent_support(concept,MemoryLevel.M4,TYPE_CONCEPT,role_ids)
+                self.writer.apply_role_concept_index_batch(RoleConceptIndexMutation(role,concept) for role in role_ids)
+
+        validated={int(mid) for mid,node in nodes.items() if node.level==MemoryLevel.M4 and node.type_id==TYPE_CONCEPT and int(node.status_flags)&int(ConceptValidationStatus.TRANSFER_VALIDATED)}
+        transition_counts:Counter[int]=Counter(); transition_concepts:dict[int,set[MemoryId]]=defaultdict(set); by_game:dict[str,list[dict[str,object]]]=defaultdict(list)
+        for row in episodes:
+            if row.get('source_game'): by_game[str(row['source_game'])].append(row)
+        for game in sorted(by_game):
+            prior:tuple[int,...]=()
+            for row in sorted(by_game[game],key=lambda r:int(r.get('source_global_step') or -1)):
+                current=tuple(sorted({int(v) for v in row.get('decision_concept_ids',()) if int(v) in validated}))
+                if prior and current:
+                    union=tuple(sorted(set(prior)|set(current)))
+                    if len(union)>=2:
+                        sig=_transition_key(prior,int(row.get('action_id') or 0),current); transition_counts[sig]+=1; transition_concepts[sig].update(MemoryId(v) for v in union)
+                prior=current
+        for sig,count in sorted(transition_counts.items()):
+            concept_ids=tuple(sorted(transition_concepts[sig],key=int))
+            if count<2 or len(concept_ids)<2: continue
+            wc=ScientificDerivationKernels.m5_world_model(concept_ids=concept_ids,transition_signature=sig); model=self.writer.canonical_memory_id(wc.key)
+            if model is None:
+                self.pipeline.derive_m5(concept_ids=concept_ids,transition_signature=sig); world_models+=1
+            else: self._add_parent_support(model,MemoryLevel.M5,TYPE_WORLD_MODEL,concept_ids)
+
+        model_ids=tuple(sorted((mid for mid,node in nodes.items() if node.level==MemoryLevel.M5 and node.type_id==TYPE_WORLD_MODEL),key=int))
         if model_ids:
-            for action_id, aggregate in sorted(cognition.freeze().action_aggregates.items()):
-                if aggregate.future_option_count <= 0 or aggregate.future_option_mean <= 0:
-                    continue
-                candidate = ScientificDerivationKernels.m6_strategy(world_model_ids=model_ids, action_signature=int(action_id), efficiency_gain=float(aggregate.future_option_mean))
-                if self.writer.canonical_memory_id(candidate.key) is None:
-                    self.pipeline.derive_m6(world_model_ids=model_ids, action_signature=int(action_id), efficiency_gain=float(aggregate.future_option_mean))
-                    strategies += 1
-        return OnlineDerivationStats(families, roles, concepts, world_models, strategies)
+            groups:dict[tuple[str,str],list[dict[str,object]]]=defaultdict(list)
+            for row in self._load(EvidenceType.TRAJECTORY):
+                if bool(row.get('success')): groups[(str(row.get('source_game') or ''),str(row.get('level_key') or 'level'))].append(row)
+            for _key, rows in sorted(groups.items()):
+                if len(rows)<2: continue
+                best=None; best_action=None; gain=0.0
+                for row in sorted(rows,key=lambda r:int(r.get('source_global_step') or -1)):
+                    steps=int(row.get('steps_to_success') or 0); action=row.get('representative_action')
+                    if steps<=0: continue
+                    if best is not None and steps<best:
+                        g=(best-steps)/max(1.0,float(best))
+                        if g>gain: gain=g; best_action=None if action is None else int(action)
+                    best=steps if best is None else min(best,steps)
+                if gain<=0 or best_action is None: continue
+                sc=ScientificDerivationKernels.m6_strategy(world_model_ids=model_ids,action_signature=best_action,efficiency_gain=gain)
+                if self.writer.canonical_memory_id(sc.key) is None:
+                    self.pipeline.derive_m6(world_model_ids=model_ids,action_signature=best_action,efficiency_gain=gain); strategies+=1
+        return OnlineDerivationStats(families,roles,concepts,world_models,strategies)
 
-def _mix_signature(a: int, b: int) -> int:
-    return ((int(a) * 6364136223846793005) ^ (int(b) * 1442695040888963407)) & _MASK63
+    def _add_parent_support(self,memory_id:MemoryId,level:MemoryLevel,type_id:int,parents:Iterable[MemoryId])->None:
+        existing=set(self.lifecycle_store.provenance_parents(memory_id)); new=tuple(sorted(set(parents)-existing,key=int))
+        if not new: return
+        self.writer.apply_mutation_batch((NodeMutation(memory_id,level,type_id,support_delta=len(new)),))
+        generation=int(self.writer.mutable_generation_id)
+        self.lifecycle_store.append_provenance(ProvenanceRecord(memory_id=memory_id,parent_memory_id=parent,generation_id=generation) for parent in new)
 
-def _fold_signature(memory_ids: tuple[MemoryId, ...]) -> int:
-    value = 1469598103934665603
-    for memory_id in memory_ids:
-        value ^= int(memory_id)
-        value = (value * 1099511628211) & _MASK63
-    return value
+    def _load(self,evidence_type:EvidenceType)->list[dict[str,object]]:
+        rows=self.evidence_store.connection.execute('SELECT memory_id,source_game,source_context,source_global_step,payload_json,generation_id FROM evidence_records WHERE evidence_type=? ORDER BY evidence_id',(int(evidence_type),)).fetchall(); result=[]
+        for mid,game,context,step,payload_json,generation in rows:
+            try: payload=json.loads(str(payload_json or '{}'))
+            except json.JSONDecodeError: payload={}
+            payload.update({'memory_id':None if mid is None else int(mid),'source_game':game,'source_context':context,'source_global_step':step,'generation_id':int(generation)}); result.append(payload)
+        return result
+
+def _transition_key(prior:tuple[int,...],action_id:int,current:tuple[int,...])->int:
+    digest=blake2b(digest_size=8); digest.update(b'world-transition-v1'); digest.update(str(tuple(prior)).encode('ascii')); digest.update(str(int(action_id)).encode('ascii')); digest.update(str(tuple(current)).encode('ascii')); return int.from_bytes(digest.digest(),'little')&_MASK63

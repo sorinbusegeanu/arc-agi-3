@@ -1,276 +1,196 @@
 from __future__ import annotations
 
 import json
+from collections import defaultdict
+from hashlib import blake2b
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
+from v7.derivation.scientific import TYPE_CONCEPT, TYPE_FAMILY, TYPE_ROLE, TYPE_STRATEGY, TYPE_WORLD_MODEL
 from v7.memory.concept_validation import ConceptValidationStatus
+from v7.memory.evidence_types import EvidenceType
 from v7.memory.ids import MemoryId, MemoryLevel
 from v7.memory.lifecycle import MemoryStatus
+from v7.memory.reporting import StrictHypothesisReporter, report_as_dict
+from v7.runtime import V7Runtime
 
-EVIDENCE_INTERACTION = 2001
-EVIDENCE_TRAJECTORY = 2012
-
-HYPOTHESIS_RISKS: dict[str, tuple[str, ...]] = {
-    "H01": ("Support count alone can overstate stability when repeated evidence comes from one game/context.",),
-    "H02": ("The prediction tracker is worker-local and resets for each sampling job; cross-epoch prediction learning is not yet represented.", "Replay can be triggered by signals other than prediction error, so direct per-memory linkage is required."),
-    "H03": ("Transformation families are keyed by action/outcome signature; weak outcome signatures can merge unrelated transformations.",),
-    "H04": ("v7 has no separate canonical carrier memory type; carrier evidence is inferred from M3 structural precursors, so H04 cannot be classified VALID yet."),
-    "H05": ("M3 role identity contains context, which can fragment one functional role across contexts and suppress cross-context reuse evidence.",),
-    "H06": ("Role transfer requires genuinely different source/target games; repeated trials in one game do not count.", "Action selection can bias which transfer opportunities are observed."),
-    "H07": ("Concept validation requires retrospective transfer trials; newly created concepts cannot validate in the same epoch that creates them.",),
-    "H08": ("World models require at least two transfer-validated concepts, creating a developmental lag of at least one additional derivation cycle.",),
-    "H09": ("Future-option delta is currently measured as change in available action IDs, which may miss latent option changes not exposed by the environment API.",),
-    "H10": ("Attention saturation can make high- and low-option-change populations indistinguishable.", "Replay status is memory-level while future-option evidence is interaction-level, so aggregation can blur causality."),
-    "H11": ("A future-option-bearing ancestor does not by itself prove the future-option signal caused transfer; provenance establishes linkage, not causality.",),
-    "H12": ("Trajectory comparisons are meaningful only across comparable successful episodes; sparse wins can leave this hypothesis underpowered.", "Different ARC levels can have very different intrinsic solution lengths and should not be pooled blindly."),
-}
-
-
-def build_hypothesis_rows(runtime, *, epoch: int) -> dict[str, dict[str, object]]:
-    view = runtime.writer.published_view
-    level_ids: dict[MemoryLevel, tuple[MemoryId, ...]] = {
-        level: tuple(sorted((memory_id for memory_id, node in view.nodes.items() if node.level == level), key=int))
-        for level in MemoryLevel
-    }
-    raw = _interaction_rows(runtime)
-    transfer_rows = _transfer_rows(runtime)
-
-    rows: dict[str, dict[str, object]] = {}
-
-    def put(hid: str, decision: str, measurement: object, evidence_rows: int, metrics: dict[str, object], *, quality_gate: str = "PASS") -> None:
-        rows[hid] = {
-            "raw_decision": decision,
-            "quality_gate": quality_gate,
-            "evidence": {
-                "evidence_rows": int(evidence_rows),
-                "measurement": measurement,
-                "metrics": metrics,
-                "issues": list(HYPOTHESIS_RISKS[hid]),
-            },
-        }
-
-    m1 = level_ids[MemoryLevel.M1]
-    supported_m1 = tuple(mid for mid in m1 if int(view.nodes[mid].support_count) >= 2)
-    source_games = {row.get("source_game") for row in raw if row.get("source_game")}
-    h01_decision = "VALID" if supported_m1 and len(source_games) >= 2 else "PARTIALLY_VALID" if m1 else "INSUFFICIENT_EVIDENCE"
-    put("H01", h01_decision, len(supported_m1), len(raw), {"m1": len(m1), "supported_m1": len(supported_m1), "source_games": len(source_games)})
-
-    pe_rows = [row for row in raw if float(row.get("prediction_error") or 0.0) > 0.0]
-    no_pe_rows = [row for row in raw if float(row.get("prediction_error") or 0.0) <= 0.0]
-    pe_rate = _replay_rate(pe_rows, view)
-    no_pe_rate = _replay_rate(no_pe_rows, view)
-    if len(pe_rows) >= 5 and len(no_pe_rows) >= 5 and pe_rate is not None and no_pe_rate is not None:
-        h02_decision = "VALID" if pe_rate > no_pe_rate else "INVALID"
-    elif pe_rows:
-        h02_decision = "PARTIALLY_VALID"
-    else:
-        h02_decision = "INSUFFICIENT_EVIDENCE"
-    put("H02", h02_decision, None if pe_rate is None or no_pe_rate is None else pe_rate - no_pe_rate, len(pe_rows), {"prediction_violation_rows": len(pe_rows), "baseline_rows": len(no_pe_rows), "prediction_violation_replay_rate": pe_rate, "baseline_replay_rate": no_pe_rate})
-
-    m2 = level_ids[MemoryLevel.M2]
-    valid_families = [mid for mid in m2 if _parent_count(runtime, mid, level=MemoryLevel.M1, view=view) >= 2]
-    h03_decision = "VALID" if valid_families else "PARTIALLY_VALID" if m2 else "INSUFFICIENT_EVIDENCE"
-    put("H03", h03_decision, len(valid_families), len(m2), {"m2": len(m2), "families_with_2plus_m1_parents": len(valid_families)})
-
-    m3 = level_ids[MemoryLevel.M3]
-    carrier_precursors = [mid for mid in m3 if _parent_count(runtime, mid, level=MemoryLevel.M2, view=view) >= 1 and _parent_count(runtime, mid, level=MemoryLevel.M1, view=view) >= 1]
-    h04_decision = "PARTIALLY_VALID" if carrier_precursors else "INSUFFICIENT_EVIDENCE"
-    put("H04", h04_decision, len(carrier_precursors), len(m3), {"carrier_precursor_count": len(carrier_precursors), "explicit_carrier_type_available": False})
-
-    supported_roles = [mid for mid in m3 if int(view.nodes[mid].support_count) >= 1 and _parent_count(runtime, mid, level=MemoryLevel.M2, view=view) >= 1]
-    h05_decision = "VALID" if supported_roles else "INSUFFICIENT_EVIDENCE"
-    put("H05", h05_decision, len(supported_roles), len(m3), {"m3": len(m3), "supported_roles": len(supported_roles)})
-
-    role_trials = [row for row in transfer_rows if _node_level(view, row["memory_id"]) == MemoryLevel.M3]
-    role_success = [row for row in role_trials if row["success"]]
-    role_pairs = {(row["source_game"], row["target_game"]) for row in role_trials if row["source_game"] != row["target_game"]}
-    if len(role_trials) >= 2 and role_pairs:
-        h06_decision = "VALID" if role_success else "INVALID"
-    elif role_trials:
-        h06_decision = "PARTIALLY_VALID"
-    else:
-        h06_decision = "INSUFFICIENT_EVIDENCE"
-    put("H06", h06_decision, _rate(len(role_success), len(role_trials)), len(role_trials), {"role_transfer_trials": len(role_trials), "successful_role_transfers": len(role_success), "distinct_game_pairs": len(role_pairs)})
-
-    m4 = level_ids[MemoryLevel.M4]
-    candidates = [mid for mid in m4 if int(view.nodes[mid].status_flags) & int(ConceptValidationStatus.CANDIDATE)]
-    validated = [mid for mid in m4 if int(view.nodes[mid].status_flags) & int(ConceptValidationStatus.TRANSFER_VALIDATED)]
-    h07_decision = "VALID" if validated else "PARTIALLY_VALID" if candidates or m4 else "INSUFFICIENT_EVIDENCE"
-    put("H07", h07_decision, len(validated), len(m4), {"m4": len(m4), "concept_candidates": len(candidates), "transfer_validated_concepts": len(validated)})
-
-    m5 = level_ids[MemoryLevel.M5]
-    coherent_models = [mid for mid in m5 if _validated_concept_parent_count(runtime, mid, view) >= 2]
-    h08_decision = "VALID" if coherent_models else "PARTIALLY_VALID" if m5 else "INSUFFICIENT_EVIDENCE"
-    put("H08", h08_decision, len(coherent_models), len(m5), {"m5": len(m5), "models_with_2plus_validated_concepts": len(coherent_models)})
-
-    fo_rows = [row for row in raw if float(row.get("future_option_delta") or 0.0) != 0.0]
-    motifs: dict[tuple[int, int], set[str]] = {}
-    motif_counts: dict[tuple[int, int], int] = {}
-    for item in fo_rows:
-        delta = float(item.get("future_option_delta") or 0.0)
-        key = (int(item.get("action_id") or 0), 1 if delta > 0 else -1)
-        motif_counts[key] = motif_counts.get(key, 0) + 1
-        game = str(item.get("source_game") or "")
-        if game:
-            motifs.setdefault(key, set()).add(game)
-    repeated_motifs = [key for key, count in motif_counts.items() if count >= 2 and len(motifs.get(key, set())) >= 2]
-    h09_decision = "VALID" if repeated_motifs else "PARTIALLY_VALID" if fo_rows else "INSUFFICIENT_EVIDENCE"
-    put("H09", h09_decision, len(repeated_motifs), len(fo_rows), {"future_option_events": len(fo_rows), "cross_game_repeated_motifs": len(repeated_motifs)})
-
-    zero_fo_rows = [row for row in raw if float(row.get("future_option_delta") or 0.0) == 0.0]
-    high_fo_replay = _replay_rate(fo_rows, view)
-    low_fo_replay = _replay_rate(zero_fo_rows, view)
-    lift = None if high_fo_replay is None or low_fo_replay is None or low_fo_replay <= 0 else high_fo_replay / low_fo_replay
-    if len(fo_rows) >= 5 and len(zero_fo_rows) >= 5 and high_fo_replay is not None and low_fo_replay is not None:
-        if high_fo_replay == low_fo_replay:
-            h10_decision = "INSUFFICIENT_EVIDENCE"
-        else:
-            h10_decision = "VALID" if (lift is not None and lift > 1.25) or (low_fo_replay == 0 and high_fo_replay > 0) else "INVALID"
-    elif fo_rows:
-        h10_decision = "PARTIALLY_VALID"
-    else:
-        h10_decision = "INSUFFICIENT_EVIDENCE"
-    put("H10", h10_decision, lift, len(fo_rows), {"high_option_change_rows": len(fo_rows), "zero_option_change_rows": len(zero_fo_rows), "high_option_replay_rate": high_fo_replay, "baseline_replay_rate": low_fo_replay, "replay_lift": lift})
-
-    concept_trials = [row for row in transfer_rows if _node_level(view, row["memory_id"]) == MemoryLevel.M4]
-    fo_memory_ids = {MemoryId(int(row["memory_id"])) for row in fo_rows if row.get("memory_id") is not None}
-    linked_trials = []
-    for trial in concept_trials:
-        ancestors = _ancestor_ids(runtime, MemoryId(int(trial["memory_id"])))
-        if ancestors & fo_memory_ids:
-            linked_trials.append(trial)
-    successful_linked = [row for row in linked_trials if row["success"]]
-    linked_pairs = {(row["source_game"], row["target_game"]) for row in successful_linked}
-    if len(successful_linked) >= 2 and len(linked_pairs) >= 2:
-        h11_decision = "VALID"
-    elif linked_trials:
-        h11_decision = "PARTIALLY_VALID"
-    else:
-        h11_decision = "INSUFFICIENT_EVIDENCE"
-    put("H11", h11_decision, len(successful_linked), len(linked_trials), {"future_option_linked_concept_transfer_trials": len(linked_trials), "successful_linked_transfers": len(successful_linked), "distinct_success_pairs": len(linked_pairs)})
-
-    trajectories = _trajectory_rows(runtime)
-    success_trajectories = [row for row in trajectories if bool(row.get("success"))]
-    current = [row for row in success_trajectories if int(row.get("epoch", -1)) == int(epoch)]
-    previous = [row for row in success_trajectories if int(row.get("epoch", -1)) < int(epoch)]
-    current_mean = _mean([float(row["steps"]) for row in current if row.get("steps") is not None])
-    previous_mean = _mean([float(row["steps"]) for row in previous if row.get("steps") is not None])
-    improvement = None if current_mean is None or previous_mean is None else previous_mean - current_mean
-    if len(current) >= 2 and previous_mean is not None:
-        h12_decision = "VALID" if improvement is not None and improvement > 0 else "PARTIALLY_VALID"
-    elif success_trajectories:
-        h12_decision = "PARTIALLY_VALID"
-    else:
-        h12_decision = "INSUFFICIENT_EVIDENCE"
-    put("H12", h12_decision, improvement, len(trajectories), {"successful_trajectories": len(success_trajectories), "current_epoch_successes": len(current), "current_mean_steps": current_mean, "previous_mean_steps": previous_mean, "step_improvement": improvement})
-
-    _apply_dependencies(rows)
-    return rows
+_MASK63=(1<<63)-1
+NAMES={'H01':'Contingency emergence from interaction history','H02':'Prediction violations drive attention and memory','H03':'Transformation-family formation','H04':'Carrier emergence','H05':'Functional-role emergence','H06':'Role transfer across contexts or games','H07':'Concept emergence through transfer validation','H08':'World-model coherence and later predictive recurrence','H09':'Future-option motif emergence','H10':'Future-option change attracts selective attention','H11':'Future-option transfer supports validated concepts','H12':'Trajectory-efficiency emergence'}
+DEPENDENCIES={'H03':('H01',),'H04':('H03',),'H05':('H04',),'H06':('H05',),'H07':('H06',),'H08':('H06','H07'),'H10':('H09',),'H11':('H06','H09')}
+ISSUES={
+'H01':['Whole-grid context identities can fragment recurrence when irrelevant pixels differ.','Support is observational under the current sampler and is not an intervention test.'],
+'H02':['Prediction trackers are worker-local and restart for each sampling job, so violations do not yet use a shared learned predictor.','Replay evidence is linked at memory identity level, not to the exact violating event.','Prediction error and learning value are coupled, so a clean causal claim still requires ablation.'],
+'H03':['Translation-normalized signatures may merge causally different transformations with identical local change patterns.','Action+transformation families may require richer relational alignment for stronger abstraction.'],
+'H04':['Carrier signatures are localized change-region hypotheses, not persistent tracked objects.','Identical local geometry/value patterns can conflate distinct carriers.','H03-before-H04 order is partly construction-imposed because carriers are recognized only after family links exist.'],
+'H05':['Role identity is currently family+action and can overmerge distinct functions.','Role evidence is recurring support, not a separately learned carrier-to-role causal model.'],
+'H06':['Transfer trials are observational and policy-selected rather than counterfactual.','Terminal credit can be coarse when many actions contributed.','Multi-source provenance is excluded from strong validation.'],
+'H07':['Concept validation can overfit environments already sampled.','Later unseen-scope trials remain the strongest evidence.'],
+'H08':['World-model creation alone does not prove prediction; VALID requires later recurrence.','M5 is not yet directly used by action selection.'],
+'H09':['Structural option breadth is an operational estimate, not the true reachable-state option set.','Unknown affordances are absent from the estimate.'],
+'H10':['The action scorer already contains a future-option term, so positive lift is mechanism-coupled.','Memory-guided selection is action-level attention, not complete replay/retention attention.','Saturation makes the test unevaluable.'],
+'H11':['Only post-validation transfer trials count as strong held-out evidence.','Multi-source provenance breaks single-source attribution.'],
+'H12':['Only successful trajectories are comparable; fixed horizons censor unsolved trajectories.','Local level ordinals may not perfectly align semantics across resets.','M6 construction alone is not behavioral preference without later replay/promotion or use.']}
 
 
-def write_hypothesis_diagnostics(root: str | Path, *, epoch: int, rows: dict[str, dict[str, object]]) -> None:
-    target = Path(root) / "reports" / f"hypotheses_epoch_{epoch + 1:04d}.json"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps({"epoch": epoch + 1, "hypotheses": rows}, indent=2, sort_keys=True), encoding="utf-8")
+def evaluate_hypothesis_suite(runtime:V7Runtime,*,epoch:int,output_root:str|Path,workers:int=1)->dict[str,dict[str,Any]]:
+    s=_Snapshot(runtime); rows={'H01':_h01(s),'H02':_h02(s),'H03':_h03(s),'H04':_h04(s),'H05':_h05(s),'H06':_h06(s),'H07':_h07(s),'H08':_h08(s),'H09':_h09(s),'H10':_h10(s),'H11':_h11(s),'H12':_h12(s)}
+    for hid,deps in DEPENDENCIES.items():
+        blocked=[dep for dep in deps if rows[dep]['raw_decision'] in {'INVALID','INSUFFICIENT_EVIDENCE'}]
+        if blocked: rows[hid]['dependency_gate']='FAIL'; rows[hid]['evidence']['blocked_by_dependencies']=blocked
+    reports=StrictHypothesisReporter().evaluate_suite(rows,workers=workers); output=Path(output_root)/'reports'/f'epoch_{epoch+1:04d}'; output.mkdir(parents=True,exist_ok=True); detailed={}
+    for hid,report in reports.items():
+        payload=report_as_dict(report); payload['hypothesis_name']=NAMES[hid]; payload['missing_evidence']=list(rows[hid].get('missing_evidence',())); payload['potential_issues']=list(ISSUES[hid]); detailed[hid]=payload; (output/f'{hid.lower()}.json').write_text(json.dumps(payload,indent=2,sort_keys=True),encoding='utf-8')
+    (output/'hypotheses.json').write_text(json.dumps(detailed,indent=2,sort_keys=True),encoding='utf-8'); return detailed
 
+class _Snapshot:
+    def __init__(self,runtime:V7Runtime)->None:
+        self.runtime=runtime; self.view=runtime.writer.published_view; self.nodes=self.view.nodes; self.registry=getattr(runtime.writer,'_canonical_registry'); self.parents=defaultdict(set); self.direct_games=defaultdict(set); self.direct_contexts=defaultdict(set)
+        for mid,parent,game,context in runtime.lifecycle_evidence.connection.execute('SELECT memory_id,parent_memory_id,source_game,source_context FROM provenance_records').fetchall():
+            mid=int(mid)
+            if parent is not None: self.parents[mid].add(int(parent))
+            if game: self.direct_games[mid].add(str(game))
+            if context: self.direct_contexts[mid].add(str(context))
+        self._games={}; self._contexts={}; self.episodes=self._load(EvidenceType.EPISODE); self.trajectories=self._load(EvidenceType.TRAJECTORY); self.concept_validations=self._load(EvidenceType.CONCEPT_VALIDATION)
+        self.replay_ids={int(r[0]) for r in runtime.evidence.connection.execute('SELECT DISTINCT memory_id FROM evidence_records WHERE evidence_type=? AND memory_id IS NOT NULL',(int(EvidenceType.REPLAY),)).fetchall()}; self.promotion_ids={int(r[0]) for r in runtime.evidence.connection.execute('SELECT DISTINCT memory_id FROM evidence_records WHERE evidence_type=? AND memory_id IS NOT NULL',(int(EvidenceType.PROMOTION),)).fetchall()}; self.transfer_trials=self._transfers(); self.children=defaultdict(set)
+        for child,parents in self.parents.items():
+            for parent in parents: self.children[parent].add(child)
+    def _load(self,t:EvidenceType)->list[dict[str,Any]]:
+        result=[]
+        for mid,game,context,step,payload_json,generation in self.runtime.evidence.connection.execute('SELECT memory_id,source_game,source_context,source_global_step,payload_json,generation_id FROM evidence_records WHERE evidence_type=? ORDER BY evidence_id',(int(t),)).fetchall():
+            try: payload=json.loads(str(payload_json or '{}'))
+            except json.JSONDecodeError: payload={}
+            payload.update({'memory_id':None if mid is None else int(mid),'source_game':game,'source_context':context,'source_global_step':step,'generation_id':int(generation)}); result.append(payload)
+        return result
+    def _transfers(self)->list[dict[str,Any]]:
+        result=[]
+        for mid,source,target,success,score,payload_json,generation in self.runtime.lifecycle_evidence.connection.execute('SELECT memory_id,source_game,target_game,success,score,payload_json,generation_id FROM transfer_trials ORDER BY transfer_trial_id').fetchall():
+            try: payload=json.loads(str(payload_json or '{}'))
+            except json.JSONDecodeError: payload={}
+            payload.update({'memory_id':int(mid),'source_game':str(source),'target_game':str(target),'success':bool(success),'score':float(score),'generation_id':int(generation)}); result.append(payload)
+        return result
+    def _scope(self,mid:int,direct:dict[int,set[str]],cache:dict[int,set[str]])->set[str]:
+        if mid in cache: return set(cache[mid])
+        visited=set()
+        def walk(x:int)->set[str]:
+            if x in visited:return set()
+            visited.add(x); values=set(direct.get(x,()))
+            for parent in self.parents.get(x,()): values.update(walk(parent))
+            return values
+        value=walk(mid); cache[mid]=set(value); return value
+    def source_games(self,mid:int)->set[str]: return self._scope(int(mid),self.direct_games,self._games)
+    def source_contexts(self,mid:int)->set[str]: return self._scope(int(mid),self.direct_contexts,self._contexts)
+    def nodes_at(self,level:MemoryLevel,type_id:int|None=None): return [(int(mid),node) for mid,node in self.nodes.items() if node.level==level and (type_id is None or node.type_id==type_id)]
 
-def _interaction_rows(runtime) -> list[dict[str, Any]]:
-    rows = runtime.evidence.connection.execute(
-        "SELECT memory_id, source_game, source_context, source_global_step, payload_json FROM evidence_records WHERE evidence_type=? ORDER BY evidence_id",
-        (EVIDENCE_INTERACTION,),
-    ).fetchall()
-    result: list[dict[str, Any]] = []
-    for memory_id, game, context, step, payload_json in rows:
-        try:
-            payload = json.loads(str(payload_json or "{}"))
-        except (TypeError, json.JSONDecodeError):
-            payload = {}
-        payload.update({"memory_id": memory_id, "source_game": game, "source_context": context, "source_global_step": step})
-        result.append(payload)
-    return result
+def _base(decision:str,rows:int,measurement:Any,*,proxy:bool=False,missing:Iterable[str]=())->dict[str,Any]: return {'raw_decision':decision,'quality_gate':'PASS','dependency_gate':'PASS','evidence':{'evidence_rows':int(rows),'measurement':measurement,'proxy_only':bool(proxy)},'missing_evidence':list(missing)}
 
+def _h01(s:_Snapshot):
+    m1=s.nodes_at(MemoryLevel.M1); stable=[(mid,n) for mid,n in m1 if int(n.support_count)>=2]; games={g for mid,_ in stable for g in s.source_games(mid)}; pe=sum(float(r.get('prediction_error') or 0)>0 for r in s.episodes)
+    decision='VALID' if stable and len(games)>=2 and pe>0 else 'PARTIALLY_VALID' if m1 else 'INSUFFICIENT_EVIDENCE'
+    return _base(decision,len(s.episodes),{'interaction_count':len(s.episodes),'contingency_count':len(m1),'stable_contingency_count':len(stable),'games_with_stable_contingencies':len(games),'prediction_violation_count':pe})
 
-def _trajectory_rows(runtime) -> list[dict[str, Any]]:
-    rows = runtime.evidence.connection.execute(
-        "SELECT source_game, source_global_step, payload_json FROM evidence_records WHERE evidence_type=? ORDER BY evidence_id",
-        (EVIDENCE_TRAJECTORY,),
-    ).fetchall()
-    result: list[dict[str, Any]] = []
-    for game, step, payload_json in rows:
-        try:
-            payload = json.loads(str(payload_json or "{}"))
-        except (TypeError, json.JSONDecodeError):
-            payload = {}
-        payload.update({"source_game": game, "source_global_step": step})
-        result.append(payload)
-    return result
+def _carrier_metrics(s:_Snapshot):
+    groups=defaultdict(list)
+    for row in s.episodes:
+        if row.get('carrier_signature') is not None: groups[int(row['carrier_signature'])].append(row)
+    usable=cross_game=max_families=0; first=None
+    for rows in groups.values():
+        fam=set(); contexts=set(); games=set(); raw_gen=None
+        for row in sorted(rows,key=lambda r:(int(r.get('generation_id') or 0),int(r.get('source_global_step') or 0))):
+            fam.update(child for child in s.children.get(int(row.get('memory_id') or -1),()) if child in s.nodes and s.nodes[MemoryId(child)].level==MemoryLevel.M2); contexts.add(str(row.get('source_context') or '')); games.add(str(row.get('source_game') or ''))
+            if len(contexts)>=2 and raw_gen is None: raw_gen=int(row.get('generation_id') or 0)
+        max_families=max(max_families,len(fam))
+        if len(fam)>=2 and len(contexts)>=2:
+            usable+=1; cross_game+=int(len(games)>=2); family_ready=max((int(s.nodes[MemoryId(fid)].created_generation) for fid in fam),default=raw_gen or 0); recognized=max(raw_gen or 0,family_ready); first=recognized if first is None else min(first,recognized)
+    return {'carrier_candidate_count':len(groups),'usable_emergent_carrier_count':usable,'cross_game_carrier_count':cross_game,'max_linked_family_count':max_families,'first_emergent_carrier_generation':first}
 
+def _h02(s:_Snapshot):
+    violating=[r for r in s.episodes if float(r.get('prediction_error') or 0)>0]; non=[r for r in s.episodes if float(r.get('prediction_error') or 0)<=0]
+    def rate(rows): return None if not rows else sum(int(r.get('memory_id') or -1) in s.replay_ids for r in rows)/len(rows)
+    high,low=rate(violating),rate(non); lift=None if high is None or low is None else float('inf') if low==0 and high>0 else high/low if low>0 else 1.0; carrier=_carrier_metrics(s)['first_emergent_carrier_generation']; first=min((int(r.get('generation_id') or 0) for r in violating),default=None); pre=first is not None and (carrier is None or first<=carrier)
+    decision='VALID' if violating and high and (lift==float('inf') or (lift is not None and lift>=1.25)) and pre else 'PARTIALLY_VALID' if violating and high else 'INVALID' if len(violating)>=5 else 'INSUFFICIENT_EVIDENCE'
+    return _base(decision,len(violating),{'prediction_violation_count':len(violating),'replay_rate_prediction_violation':high,'replay_rate_non_violation':low,'replay_lift':lift,'prediction_violation_precedes_carrier':pre})
 
-def _transfer_rows(runtime) -> list[dict[str, Any]]:
-    return [
-        {"memory_id": int(memory_id), "source_game": str(source_game), "target_game": str(target_game), "success": bool(success), "score": float(score)}
-        for memory_id, source_game, target_game, success, score in runtime.lifecycle_evidence.connection.execute(
-            "SELECT memory_id, source_game, target_game, success, score FROM transfer_trials ORDER BY transfer_trial_id"
-        ).fetchall()
-    ]
+def _h03(s:_Snapshot):
+    families=s.nodes_at(MemoryLevel.M2,TYPE_FAMILY); multi=cross_context=cross_game=0
+    for mid,_ in families:
+        m1=[p for p in s.parents.get(mid,()) if p in s.nodes and s.nodes[MemoryId(p)].level==MemoryLevel.M1]; multi+=int(len(m1)>=2); cross_context+=int(len(s.source_contexts(mid))>=2); cross_game+=int(len(s.source_games(mid))>=2)
+    decision='VALID' if multi and (cross_context or cross_game) else 'PARTIALLY_VALID' if families else 'INVALID' if s.nodes_at(MemoryLevel.M1) else 'INSUFFICIENT_EVIDENCE'
+    return _base(decision,len(families),{'family_count':len(families),'families_with_multiple_members':multi,'cross_context_family_count':cross_context,'cross_game_family_count':cross_game})
 
+def _h04(s:_Snapshot):
+    m=_carrier_metrics(s); first_family=min((int(n.created_generation) for _,n in s.nodes_at(MemoryLevel.M2,TYPE_FAMILY)),default=None); first_carrier=m['first_emergent_carrier_generation']; temporal=first_family is not None and first_carrier is not None and first_family<=first_carrier; m.update({'first_family_generation':first_family,'family_precedes_carrier':temporal if first_carrier is not None else None}); decision='VALID' if m['usable_emergent_carrier_count'] and temporal else 'PARTIALLY_VALID' if m['carrier_candidate_count'] else 'INSUFFICIENT_EVIDENCE'; return _base(decision,m['carrier_candidate_count'],m)
 
-def _replay_rate(rows: list[dict[str, Any]], view) -> float | None:
-    ids = [MemoryId(int(row["memory_id"])) for row in rows if row.get("memory_id") is not None and MemoryId(int(row["memory_id"])) in view.nodes]
-    if not ids:
-        return None
-    replayed = sum(bool(int(view.nodes[mid].status_flags) & int(MemoryStatus.REPLAY_QUEUED)) for mid in ids)
-    return replayed / len(ids)
+def _h05(s:_Snapshot):
+    roles=s.nodes_at(MemoryLevel.M3,TYPE_ROLE); usable=cross_context=cross_game=0
+    for mid,_ in roles:
+        m1=[p for p in s.parents.get(mid,()) if p in s.nodes and s.nodes[MemoryId(p)].level==MemoryLevel.M1]; contexts=s.source_contexts(mid); games=s.source_games(mid); cross_context+=int(len(contexts)>=2); cross_game+=int(len(games)>=2); usable+=int(len(m1)>=2 and (len(contexts)>=2 or len(games)>=2))
+    carrier=_carrier_metrics(s); first_role=min((int(n.created_generation) for _,n in roles),default=None); first_carrier=carrier['first_emergent_carrier_generation']; temporal=first_role is not None and first_carrier is not None and first_carrier<=first_role; decision='VALID' if usable and temporal else 'PARTIALLY_VALID' if roles else 'INSUFFICIENT_EVIDENCE'; return _base(decision,len(roles),{'role_count':len(roles),'usable_role_count':usable,'cross_context_role_count':cross_context,'cross_game_role_count':cross_game,'carrier_precedes_role':temporal if first_carrier is not None else None})
 
+def _h06(s:_Snapshot):
+    role_ids={mid for mid,_ in s.nodes_at(MemoryLevel.M3,TYPE_ROLE)}; rows=[r for r in s.transfer_trials if int(r['memory_id']) in role_ids]; verified=[r for r in rows if int(r.get('source_game_count') or 1)==1 and r.get('source_game')!=r.get('target_game')]; success=[r for r in verified if r.get('success')]; roles={int(r['memory_id']) for r in success}; pairs={(r['source_game'],r['target_game']) for r in verified}; rate=len(success)/len(verified) if verified else None; decision='VALID' if len(verified)>=4 and len(success)>=2 and len(roles)>=2 and len(pairs)>=2 and (rate or 0)>=.25 else 'INVALID' if len(verified)>=4 and not success else 'PARTIALLY_VALID' if verified else 'INSUFFICIENT_EVIDENCE'; return _base(decision,len(verified),{'recorded_role_transfer_trials':len(rows),'verified_single_source_cross_game_trials':len(verified),'successful_verified_trials':len(success),'successful_role_count':len(roles),'distinct_game_pair_count':len(pairs),'transfer_success_rate':rate})
 
-def _parent_count(runtime, memory_id: MemoryId, *, level: MemoryLevel, view) -> int:
-    return sum(1 for parent in runtime.lifecycle_evidence.provenance_parents(memory_id) if parent in view.nodes and view.nodes[parent].level == level)
+def _h07(s:_Snapshot):
+    concepts=s.nodes_at(MemoryLevel.M4,TYPE_CONCEPT); candidates=[(m,n) for m,n in concepts if int(n.status_flags)&int(ConceptValidationStatus.CANDIDATE)]; validated=[(m,n) for m,n in concepts if int(n.status_flags)&int(ConceptValidationStatus.TRANSFER_VALIDATED)]; rejected=[(m,n) for m,n in concepts if int(n.status_flags)&int(ConceptValidationStatus.TRANSFER_REJECTED)]; robust=0
+    for mid,_ in validated:
+        role_parents=[p for p in s.parents.get(mid,()) if p in s.nodes and s.nodes[MemoryId(p)].level==MemoryLevel.M3]; trials=[r for r in s.transfer_trials if int(r['memory_id'])==mid]; robust+=int(len(role_parents)>=2 and len(trials)>=2 and len(s.source_games(mid))>=2)
+    decision='VALID' if robust else 'INVALID' if concepts and len(rejected)==len(concepts) else 'PARTIALLY_VALID' if concepts else 'INSUFFICIENT_EVIDENCE'; return _base(decision,len(concepts),{'concept_count':len(concepts),'concept_candidate_count':len(candidates),'transfer_validated_concept_count':len(validated),'transfer_rejected_concept_count':len(rejected),'robust_validated_concept_count':robust})
 
+def _transition_key(prior:tuple[int,...],action:int,current:tuple[int,...])->int:
+    d=blake2b(digest_size=8); d.update(b'world-transition-v1'); d.update(str(tuple(prior)).encode('ascii')); d.update(str(int(action)).encode('ascii')); d.update(str(tuple(current)).encode('ascii')); return int.from_bytes(d.digest(),'little')&_MASK63
 
-def _validated_concept_parent_count(runtime, memory_id: MemoryId, view) -> int:
-    return sum(
-        1
-        for parent in runtime.lifecycle_evidence.provenance_parents(memory_id)
-        if parent in view.nodes
-        and view.nodes[parent].level == MemoryLevel.M4
-        and int(view.nodes[parent].status_flags) & int(ConceptValidationStatus.TRANSFER_VALIDATED)
-    )
+def _transitions(s:_Snapshot):
+    validated={mid for mid,n in s.nodes_at(MemoryLevel.M4,TYPE_CONCEPT) if int(n.status_flags)&int(ConceptValidationStatus.TRANSFER_VALIDATED)}; by_game=defaultdict(list); out=defaultdict(list)
+    for r in s.episodes:
+        if r.get('source_game'): by_game[str(r['source_game'])].append(r)
+    for game,rows in by_game.items():
+        prior=()
+        for r in sorted(rows,key=lambda x:int(x.get('source_global_step') or -1)):
+            current=tuple(sorted({int(v) for v in r.get('decision_concept_ids',()) if int(v) in validated}))
+            if prior and current and len(set(prior)|set(current))>=2: out[_transition_key(prior,int(r.get('action_id') or 0),current)].append(r)
+            prior=current
+    return out
 
+def _h08(s:_Snapshot):
+    models=s.nodes_at(MemoryLevel.M5,TYPE_WORLD_MODEL); occ=_transitions(s); heldout=cross_game=0
+    for mid,node in models:
+        key=s.registry.key_for(MemoryId(mid)); rows=() if key is None or not key.parts else occ.get(int(key.parts[0]),()); heldout+=int(any(int(r.get('generation_id') or 0)>int(node.created_generation) for r in rows)); cross_game+=int(len({str(r.get('source_game') or '') for r in rows})>=2)
+    decision='VALID' if models and heldout and cross_game else 'PARTIALLY_VALID' if models else 'INSUFFICIENT_EVIDENCE'; return _base(decision,len(models),{'world_model_count':len(models),'models_with_post_creation_recurrence':heldout,'cross_game_recurrent_model_count':cross_game})
 
-def _ancestor_ids(runtime, memory_id: MemoryId) -> set[MemoryId]:
-    rows = runtime.lifecycle_evidence.connection.execute(
-        """
-        WITH RECURSIVE ancestry(memory_id) AS (
-            SELECT ?
-            UNION
-            SELECT p.parent_memory_id FROM provenance_records p JOIN ancestry a ON p.memory_id=a.memory_id WHERE p.parent_memory_id IS NOT NULL
-        )
-        SELECT memory_id FROM ancestry
-        """,
-        (int(memory_id),),
-    ).fetchall()
-    return {MemoryId(int(row[0])) for row in rows}
+def _h09(s:_Snapshot):
+    nonzero=[r for r in s.episodes if abs(float(r.get('future_option_delta') or 0))>0]; motifs=defaultdict(list)
+    for r in nonzero:
+        if r.get('carrier_signature') is not None: motifs[(int(r['carrier_signature']),int(r.get('action_id') or 0),1 if float(r.get('future_option_delta') or 0)>0 else -1)].append(r)
+    recurring=[rows for rows in motifs.values() if len(rows)>=2 and (len({str(r.get('source_context') or '') for r in rows})>=2 or len({str(r.get('source_game') or '') for r in rows})>=2)]; cross=sum(len({str(r.get('source_game') or '') for r in rows})>=2 for rows in recurring); decision='VALID' if recurring and cross else 'PARTIALLY_VALID' if nonzero else 'INSUFFICIENT_EVIDENCE'; return _base(decision,len(nonzero),{'live_future_option_change_events':len(nonzero),'recurring_future_option_motifs':len(recurring),'cross_game_future_option_motifs':cross,'measurement_definition':'delta in known action+contingency+role+concept option breadth'},proxy=True)
 
+def _h10(s:_Snapshot):
+    if not s.episodes:return _base('INSUFFICIENT_EVIDENCE',0,{'episode_count':0})
+    values=sorted(abs(float(r.get('future_option_delta') or 0)) for r in s.episodes); threshold=values[min(len(values)-1,int(.8*len(values)))]; nonzero=[v for v in values if v>0]; threshold=threshold if threshold>0 else min(nonzero) if nonzero else 0; high=[r for r in s.episodes if threshold>0 and abs(float(r.get('future_option_delta') or 0))>=threshold]; low=[r for r in s.episodes if abs(float(r.get('future_option_delta') or 0))<threshold] if threshold>0 else []
+    def rate(rows):return None if not rows else sum(bool(r.get('memory_guided')) for r in rows)/len(rows)
+    hr,lr=rate(high),rate(low); lift=None if hr is None or lr is None else float('inf') if lr==0 and hr>0 else hr/lr if lr>0 else 1.0; saturation=bool(s.episodes) and (all(bool(r.get('memory_guided')) for r in s.episodes) or all(not bool(r.get('memory_guided')) for r in s.episodes)); decision='INSUFFICIENT_EVIDENCE' if not high or not low or saturation else 'PARTIALLY_VALID' if lift==float('inf') or (lift is not None and lift>=1.25) else 'INVALID' if hr is not None and lr is not None and hr<lr and len(high)>=5 else 'PARTIALLY_VALID'; return _base(decision,len(high),{'high_option_change_threshold':threshold,'high_option_change_count':len(high),'low_option_change_count':len(low),'memory_guided_rate_high_option_change':hr,'memory_guided_rate_low_option_change':lr,'attention_lift':lift,'attention_saturation':saturation,'causal_ablation_available':False})
 
-def _node_level(view, memory_id: int) -> MemoryLevel | None:
-    node = view.nodes.get(MemoryId(int(memory_id)))
-    return None if node is None else node.level
+def _h11(s:_Snapshot):
+    concept_ids={mid for mid,_ in s.nodes_at(MemoryLevel.M4,TYPE_CONCEPT)}; validation={}
+    for r in s.concept_validations:
+        if r.get('memory_id') is not None and r.get('validated'): validation[int(r['memory_id'])]=min(validation.get(int(r['memory_id']),int(r['generation_id'])),int(r['generation_id']))
+    chain=[]; held=[]
+    for r in s.transfer_trials:
+        mid=int(r['memory_id'])
+        if mid not in concept_ids or int(r.get('source_game_count') or 1)!=1 or r.get('source_game')==r.get('target_game') or abs(float(r.get('future_option_delta') or 0))<=0 or mid not in validation: continue
+        chain.append(r)
+        if r.get('success') and int(r.get('generation_id') or 0)>validation[mid]: held.append(r)
+    pairs={(r['source_game'],r['target_game']) for r in held}; decision='VALID' if len(held)>=2 and len(pairs)>=2 else 'PARTIALLY_VALID' if chain else 'INSUFFICIENT_EVIDENCE'; return _base(decision,len(chain),{'verified_future_option_concept_transfer_chains':len(chain),'successful_post_validation_chains':len(held),'distinct_post_validation_game_pairs':len(pairs),'validated_concepts_with_recorded_generation':len(validation)})
 
-
-def _apply_dependencies(rows: dict[str, dict[str, object]]) -> None:
-    deps = {
-        "H03": ("H01",), "H04": ("H03",), "H05": ("H04",), "H06": ("H05",),
-        "H07": ("H06",), "H08": ("H07",), "H10": ("H09",), "H11": ("H06", "H09"),
-    }
-    for hid, required in deps.items():
-        blocked = any(str(rows[parent]["raw_decision"]) in {"INVALID", "INSUFFICIENT_EVIDENCE"} for parent in required)
-        rows[hid]["dependency_gate"] = "FAIL" if blocked else "PASS"
-
-
-def _rate(a: int, b: int) -> float | None:
-    return None if b <= 0 else a / b
-
-
-def _mean(values: list[float]) -> float | None:
-    return None if not values else sum(values) / len(values)
+def _h12(s:_Snapshot):
+    groups=defaultdict(list)
+    for r in s.trajectories:
+        if r.get('success'):groups[(str(r.get('source_game') or ''),str(r.get('level_key') or 'level'))].append(r)
+    comparable=improvements=0
+    for rows in groups.values():
+        if len(rows)<2:continue
+        comparable+=1; best=None
+        for r in sorted(rows,key=lambda x:int(x.get('source_global_step') or -1)):
+            steps=int(r.get('steps_to_success') or 0)
+            if steps<=0:continue
+            if best is not None and steps<best:improvements+=1
+            best=steps if best is None else min(best,steps)
+    strategies=s.nodes_at(MemoryLevel.M6,TYPE_STRATEGY); ids={m for m,_ in strategies}; linked=bool(ids&(s.replay_ids|s.promotion_ids)) or any(int(n.status_flags)&int(MemoryStatus.PROMOTED|MemoryStatus.REPLAY_QUEUED) for _,n in strategies); decision='INSUFFICIENT_EVIDENCE' if comparable<=0 else 'VALID' if improvements>0 and strategies and linked else 'PARTIALLY_VALID'; return _base(decision,len(s.trajectories),{'successful_trajectory_count':len(s.trajectories),'comparable_trajectory_groups':comparable,'best_known_improvement_count':improvements,'strategy_count':len(strategies),'strategy_replay_or_promotion_link':linked})

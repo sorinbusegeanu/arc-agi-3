@@ -13,7 +13,6 @@ TYPE_CONCEPT = 400
 TYPE_WORLD_MODEL = 500
 TYPE_STRATEGY = 600
 
-
 @dataclass(frozen=True, slots=True)
 class EpisodeEvidence:
     context_signature: int
@@ -25,28 +24,20 @@ class EpisodeEvidence:
     source_game: str | None = None
     source_context: str | None = None
     source_global_step: int | None = None
-    outcome_polarity: str | None = None
-
+    carrier_signature: int | None = None
+    decision_role_ids: tuple[int, ...] = ()
+    decision_concept_ids: tuple[int, ...] = ()
+    terminal_polarity: int = 0
+    raw_action_option_delta: float = 0.0
+    decision_score: float = 0.0
+    max_action_score: float = 0.0
+    memory_guided: bool = False
 
 class ScientificDerivationKernels:
-    """Deterministic clean-break M1-M6 semantic constructors.
-
-    Canonical identities represent abstractions; supporting memory IDs are evidence,
-    not part of the abstraction identity. This prevents support growth from creating
-    duplicate higher-order memories.
-    """
-
     @staticmethod
     def m1_from_episode(evidence: EpisodeEvidence) -> CanonicalCandidateMutation:
         key = CanonicalMemoryKey(MemoryLevel.M1, TYPE_CONTINGENCY, (int(evidence.context_signature), int(evidence.action_id), int(evidence.outcome_signature)))
-        return CanonicalCandidateMutation(
-            key=key,
-            support_delta=1,
-            significance=1.0 if evidence.success else 0.5,
-            prediction_error=max(0.0, float(evidence.prediction_error)),
-            learning_value=max(0.0, float(evidence.prediction_error)),
-            future_option_delta=float(evidence.future_option_delta),
-        )
+        return CanonicalCandidateMutation(key=key, support_delta=1, significance=1.0 if evidence.success else 0.5, prediction_error=max(0.0, float(evidence.prediction_error)), learning_value=max(0.0, float(evidence.prediction_error)), future_option_delta=float(evidence.future_option_delta))
 
     @staticmethod
     def m2_family(*, action_id: int, member_ids: Iterable[MemoryId], outcome_class: int) -> CanonicalCandidateMutation:
@@ -61,7 +52,7 @@ class ScientificDerivationKernels:
         members = tuple(sorted(set(member_ids), key=int))
         if not members:
             raise ValueError("M3 role requires supporting members")
-        key = CanonicalMemoryKey(MemoryLevel.M3, TYPE_ROLE, (int(family_id), int(context_class), int(action_id)))
+        key = CanonicalMemoryKey(MemoryLevel.M3, TYPE_ROLE, (int(family_id), int(action_id)))
         return CanonicalCandidateMutation(key=key, support_delta=len(members), parents=(family_id, *members), explanatory_potential=min(1.0, len(members) / 4.0))
 
     @staticmethod
@@ -102,7 +93,6 @@ class ScientificDerivationKernels:
         if level == MemoryLevel.M6:
             return cls.m6_strategy(world_model_ids=payload["world_model_ids"], action_signature=int(payload["action_signature"]), efficiency_gain=float(payload["efficiency_gain"]))
         raise ValueError("derive_level targets M2-M6")
-
 
 def _support_signature(memory_ids: tuple[MemoryId, ...]) -> int:
     value = 1469598103934665603
