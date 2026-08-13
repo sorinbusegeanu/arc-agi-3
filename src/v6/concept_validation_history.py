@@ -150,12 +150,14 @@ def _diagnostics(*args: Any, **kwargs: Any):
     direct_context = ctx is None
     if ctx is None:
         ctx = _history_from_connection(state_conn)
-    current_transfer = list(kwargs.get("transfer_rows") or [])
-    current_future = list(kwargs.get("future_rows") or [])
-    cache_key = (id(current_transfer), len(current_transfer), id(current_future), len(current_future))
+    transfer_source = kwargs.get("transfer_rows") or []
+    future_source = kwargs.get("future_rows") or []
+    cache_key = (id(transfer_source), len(transfer_source), id(future_source), len(future_source))
     cache = ctx["merged_cache"]
     merged = cache.get(cache_key)
     if merged is None:
+        current_transfer = list(transfer_source)
+        current_future = list(future_source)
         transfer_rows = _dedupe(list(ctx["transfer_rows"]) + current_transfer, "attempt_id")
         future_rows = _dedupe(list(ctx["future_rows"]) + current_future, "event_id")
         from v6 import higher_order_substrate as substrate
