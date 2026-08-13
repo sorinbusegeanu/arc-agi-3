@@ -8,10 +8,12 @@ from v7.memory.arenas.compact import CompactMemoryArena
 from v7.memory.generation import GenerationId
 from v7.memory.ids import MemoryId
 from v7.memory.indexes.cognition import ActionScoreInput, CognitionIndexes
+from v7.memory.indexes.mapped import MappedPackedCognitionIndexes
 from v7.memory.indexes.packed import PackedCognitionIndexes
 from v7.memory.models import MemoryNode, MemoryScore
 
 EdgeKey = tuple[MemoryId, int]
+PackedCognitionView = PackedCognitionIndexes | MappedPackedCognitionIndexes
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,7 +25,7 @@ class MemoryReadView:
     scores: Mapping[MemoryId, MemoryScore]
     adjacency: Mapping[EdgeKey, tuple[MemoryId, ...]]
     cognition_indexes: CognitionIndexes
-    packed_cognition: PackedCognitionIndexes
+    packed_cognition: PackedCognitionView
     compact_arena: CompactMemoryArena
 
     @classmethod
@@ -69,7 +71,7 @@ class MemoryReadView:
         adjacency: Mapping[EdgeKey, tuple[MemoryId, ...]],
         cognition_indexes: CognitionIndexes,
         compact_arena: CompactMemoryArena,
-        packed_cognition: PackedCognitionIndexes | None = None,
+        packed_cognition: PackedCognitionView | None = None,
     ) -> "MemoryReadView":
         return cls(
             generation_id=generation_id,
@@ -99,29 +101,10 @@ class MemoryReadView:
         role_limit: int = 64,
         concept_limit: int = 128,
     ) -> tuple[ActionScoreInput, ...]:
-        if role_limit < 0 or concept_limit < 0:
-            raise ValueError("limits must be non-negative")
-        family_ids_by_action = family_ids_by_action or {}
-        rows: list[ActionScoreInput] = []
-        packed = self.packed_cognition
-        for raw_action in action_ids:
-            action_id = int(raw_action)
-            contingencies = packed.contingencies.lookup(int(context_signature), action_id)
-            family_id = family_ids_by_action.get(action_id)
-            roles = () if family_id is None else packed.roles_exact.lookup(int(context_signature), action_id, family_id, role_limit)
-            if not roles:
-                roles = packed.roles_fallback.lookup(int(context_signature), action_id, role_limit)
-            concepts: list[MemoryId] = []
-            seen: set[MemoryId] = set()
-            for role_id in roles:
-                for concept_id in packed.concepts(role_id, concept_limit):
-                    if concept_id in seen:
-                        continue
-                    seen.add(concept_id)
-                    concepts.append(concept_id)
-                    if len(concepts) >= concept_limit:
-                        break
-                if len(concepts) >= concept_limit:
-                    break
-            rows.append(ActionScoreInput(action_id, contingencies, packed.action_aggregates.get(action_id), roles, tuple(concepts)))
-        return tuple(rows)
+        return self.packed_cognition.score_inputs(
+            context_signature=context_signature,
+            action_ids=action_ids,
+            family_ids_by_action=family_ids_by_action,
+            role_limit=role_limit,
+            concept_limit=concept_limit,
+        )
