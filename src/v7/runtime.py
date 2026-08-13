@@ -27,7 +27,7 @@ class V7RuntimeConfig:
 
 
 class V7Runtime:
-    """End-to-end v7 research runtime around one canonical writer."""
+    """End-to-end v7 runtime with durable generations and lifecycle commits."""
 
     def __init__(self, config: V7RuntimeConfig) -> None:
         self.config = config
@@ -56,10 +56,14 @@ class V7Runtime:
         return self.pipeline.observe_episode(evidence)
 
     def commit(self, *, batch_id: int = 0, run_lifecycle: bool = True) -> GenerationCommitResult:
+        """Commit semantic changes, then durably commit lifecycle mutations if any."""
         result = self.coordinator.commit(batch_id=batch_id)
-        self.snapshots.persist(self.writer)
         if run_lifecycle:
             self.lifecycle.run(result.view, writer=self.writer)
+            dirty = self.writer.dirty_counts
+            if dirty["nodes"] or dirty["scores"] or dirty["edges"] or dirty["cognition"]:
+                result = self.coordinator.commit(batch_id=batch_id + 1)
+        self.snapshots.persist(self.writer)
         return result
 
     def pending_derivation_plan(self):

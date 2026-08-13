@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import asdict
 from pathlib import Path
 
 from v7.derivation.scientific import EpisodeEvidence
+from v7.environment.runner import ArcGameRunConfig, run_arc_game
 from v7.runtime import V7Runtime, V7RuntimeConfig
 
 
@@ -45,8 +47,21 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--root", required=True)
     run.add_argument("--events", required=True)
     run.add_argument("--no-restore", action="store_true")
+    game = sub.add_parser("game")
+    game.add_argument("--root", required=True)
+    game.add_argument("--game", required=True)
+    game.add_argument("--steps", type=int, default=1000)
+    game.add_argument("--seed", type=int, default=0)
+    game.add_argument("--env-root", default=None)
+    game.add_argument("--commit-every", type=int, default=1000)
+    game.add_argument("--epsilon", type=float, default=0.10)
+    game.add_argument("--no-restore", action="store_true")
     args = parser.parse_args(argv)
     if args.command == "run":
         print(json.dumps(run_events(args.root, args.events, no_restore=args.no_restore), sort_keys=True))
+        return 0
+    if args.command == "game":
+        result = run_arc_game(args.root, ArcGameRunConfig(game_id=args.game, steps=args.steps, seed=args.seed, env_root=args.env_root, commit_every=args.commit_every, epsilon=args.epsilon, restore=not args.no_restore))
+        print(json.dumps(asdict(result), sort_keys=True))
         return 0
     return 2
