@@ -6,8 +6,8 @@ from v7.memory.generation import GenerationId, GenerationState
 from v7.memory.ids import MemoryId, MemoryIdAllocator, MemoryLevel
 from v7.memory.indexes import (
     ActionAggregate, ActionAggregateDelta, ActionScoreInput, CognitionIndexBuilder,
-    CognitionIndexes, ContingencyIndexMutation, PackedCognitionIndexes,
-    RoleConceptIndexMutation, RoleIndexMutation,
+    CognitionIndexes, ContingencyIndexMutation, MappedPackedCognitionIndexes,
+    PackedCognitionIndexes, RoleConceptIndexMutation, RoleIndexMutation,
 )
 from v7.memory.models import EdgeMutation, EdgeState, MemoryNode, MemoryScore, NodeMutation, ScoreMutation
 from v7.memory.publisher import GenerationPublisher, PublicationRecord
@@ -23,9 +23,9 @@ __all__ = [
     "CognitionIndexes", "CompactMemoryArena", "ContingencyIndexMutation", "EdgeMutation",
     "EdgeState", "GenerationCommitCoordinator", "GenerationCommitResult", "GenerationDelta",
     "GenerationId", "GenerationPublisher", "GenerationState", "LocalReadViewTransport",
-    "MemoryId", "MemoryIdAllocator", "MemoryLevel", "MemoryNode", "MemoryReadView",
-    "MemoryScore", "MmapReadViewTransport", "NodeColumns", "NodeMutation", "PackedAdjacency",
-    "PackedCognitionIndexes", "PreparedGeneration", "PublicationRecord", "ReadViewHandle",
-    "ReadViewTransport", "RoleConceptIndexMutation", "RoleIndexMutation", "ScoreColumns",
-    "ScoreMutation", "SegmentedMmapReadViewTransport", "VectorizedActionScorer",
+    "MappedPackedCognitionIndexes", "MemoryId", "MemoryIdAllocator", "MemoryLevel", "MemoryNode",
+    "MemoryReadView", "MemoryScore", "MmapReadViewTransport", "NodeColumns", "NodeMutation",
+    "PackedAdjacency", "PackedCognitionIndexes", "PreparedGeneration", "PublicationRecord",
+    "ReadViewHandle", "ReadViewTransport", "RoleConceptIndexMutation", "RoleIndexMutation",
+    "ScoreColumns", "ScoreMutation", "SegmentedMmapReadViewTransport", "VectorizedActionScorer",
 ]
