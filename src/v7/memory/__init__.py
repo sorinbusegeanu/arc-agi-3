@@ -1,7 +1,9 @@
 from v7.memory.arenas import CompactMemoryArena, NodeColumns, PackedAdjacency, ScoreColumns
 from v7.memory.canonical import CanonicalCandidateMutation, CanonicalMemoryKey, CanonicalMemoryRegistry
+from v7.memory.concept_validation import ConceptValidationDecision, ConceptValidationPolicy, ConceptValidationStatus, EmpiricalConceptValidator
 from v7.memory.coordinator import GenerationCommitCoordinator, GenerationCommitResult
 from v7.memory.delta import GenerationDelta
+from v7.memory.development import DevelopmentalLifecycleResult, DevelopmentalLifecycleRuntime
 from v7.memory.evidence_lifecycle import ContradictionRecord, EvidenceLifecycleStore, ProvenanceRecord, TransferTrialRecord
 from v7.memory.generation import GenerationId, GenerationState
 from v7.memory.ids import MemoryId, MemoryIdAllocator, MemoryLevel
@@ -23,16 +25,18 @@ __all__ = [
     "ActionAggregate", "ActionAggregateDelta", "ActionScoreBatch", "ActionScoreInput",
     "ActionScoringWeights", "CanonicalCandidateMutation", "CanonicalMemoryKey",
     "CanonicalMemoryRegistry", "CanonicalMemoryWriter", "CognitionIndexBuilder",
-    "CognitionIndexes", "CompactMemoryArena", "ContingencyIndexMutation", "ContradictionRecord",
-    "EdgeMutation", "EdgeState", "EvidenceLifecycleStore", "GenerationCommitCoordinator",
-    "GenerationCommitResult", "GenerationDelta", "GenerationId", "GenerationPublisher",
-    "GenerationState", "LifecycleDecision", "LifecyclePolicy", "LifecycleRunStats",
-    "LocalReadViewTransport", "MappedPackedCognitionIndexes", "MemoryId", "MemoryIdAllocator",
-    "MemoryLevel", "MemoryLifecycleController", "MemoryLifecycleRuntime", "MemoryNode",
-    "MemoryReadView", "MemoryScore", "MemoryStatus", "MmapReadViewTransport", "NodeColumns",
-    "NodeMutation", "PackedAdjacency", "PackedCognitionIndexes", "PreparedGeneration",
-    "ProvenanceRecord", "PublicationRecord", "ReadViewHandle", "ReadViewTransport",
-    "ReplayQueue", "ReplayRequest", "RoleConceptIndexMutation", "RoleIndexMutation",
-    "ScoreColumns", "ScoreMutation", "SegmentedMmapReadViewTransport", "TransferTrialRecord",
-    "VectorizedActionScorer",
+    "CognitionIndexes", "CompactMemoryArena", "ConceptValidationDecision",
+    "ConceptValidationPolicy", "ConceptValidationStatus", "ContingencyIndexMutation",
+    "ContradictionRecord", "DevelopmentalLifecycleResult", "DevelopmentalLifecycleRuntime",
+    "EdgeMutation", "EdgeState", "EmpiricalConceptValidator", "EvidenceLifecycleStore",
+    "GenerationCommitCoordinator", "GenerationCommitResult", "GenerationDelta", "GenerationId",
+    "GenerationPublisher", "GenerationState", "LifecycleDecision", "LifecyclePolicy",
+    "LifecycleRunStats", "LocalReadViewTransport", "MappedPackedCognitionIndexes", "MemoryId",
+    "MemoryIdAllocator", "MemoryLevel", "MemoryLifecycleController", "MemoryLifecycleRuntime",
+    "MemoryNode", "MemoryReadView", "MemoryScore", "MemoryStatus", "MmapReadViewTransport",
+    "NodeColumns", "NodeMutation", "PackedAdjacency", "PackedCognitionIndexes",
+    "PreparedGeneration", "ProvenanceRecord", "PublicationRecord", "ReadViewHandle",
+    "ReadViewTransport", "ReplayQueue", "ReplayRequest", "RoleConceptIndexMutation",
+    "RoleIndexMutation", "ScoreColumns", "ScoreMutation", "SegmentedMmapReadViewTransport",
+    "TransferTrialRecord", "VectorizedActionScorer",
 ]
