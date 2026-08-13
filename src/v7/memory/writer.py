@@ -3,9 +3,10 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Iterable
 
+from v7.memory.delta import GenerationDelta
 from v7.memory.generation import GenerationId, GenerationState
 from v7.memory.ids import MemoryId
-from v7.memory.models import EdgeMutation, MemoryNode, MemoryScore, NodeMutation, ScoreMutation
+from v7.memory.models import EdgeMutation, EdgeState, MemoryNode, MemoryScore, NodeMutation, ScoreMutation
 from v7.memory.read_view import MemoryReadView
 
 
@@ -90,6 +91,8 @@ class CanonicalMemoryWriter:
                     support_count=support_count,
                 )
             else:
+                if current.level != mutation.level or current.type_id != mutation.type_id:
+                    raise ValueError(f"memory identity is immutable for memory_id={int(memory_id)}")
                 support_count = current.support_count + mutation.support_delta
                 if support_count < 0:
                     raise ValueError("node support cannot be negative")
@@ -153,7 +156,7 @@ class CanonicalMemoryWriter:
             self._dirty_scores.add(memory_id)
         return len(coalesced)
 
-    def commit_generation(self) -> tuple[GenerationState, MemoryReadView]:
+    def commit_generation(self) -> tuple[GenerationState, MemoryReadView, GenerationDelta]:
         adjacency: dict[tuple[MemoryId, int], list[MemoryId]] = {}
         for (source_id, relation_type, target_id), support in self._edge_support.items():
             if support <= 0:
@@ -172,6 +175,23 @@ class CanonicalMemoryWriter:
             scores=self._scores,
             adjacency=adjacency,
         )
+        delta = GenerationDelta(
+            nodes=tuple(self._nodes[memory_id] for memory_id in sorted(self._dirty_nodes, key=int)),
+            scores=tuple(self._scores[memory_id] for memory_id in sorted(self._dirty_scores, key=int)),
+            edges=tuple(
+                EdgeState(
+                    source_id=source_id,
+                    relation_type=relation_type,
+                    target_id=target_id,
+                    support_count=self._edge_support.get((source_id, relation_type, target_id), 0),
+                )
+                for source_id, relation_type, target_id in sorted(
+                    self._dirty_edges,
+                    key=lambda key: (int(key[0]), key[1], int(key[2])),
+                )
+            ),
+        )
+
         self._published_generation = self._mutable_generation
         self._mutable_generation = GenerationId(int(self._mutable_generation) + 1)
         self._published_view = view
@@ -180,10 +200,4 @@ class CanonicalMemoryWriter:
         self._dirty_edges.clear()
         self._first_global_step = None
         self._last_global_step = None
-        return state, view
-
-    def edge_support_snapshot(self) -> dict[tuple[int, int, int], int]:
-        return {
-            (int(source_id), relation_type, int(target_id)): support
-            for (source_id, relation_type, target_id), support in self._edge_support.items()
-        }
+        return state, view, delta
