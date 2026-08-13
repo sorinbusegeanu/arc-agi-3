@@ -3,19 +3,49 @@ from __future__ import annotations
 from array import array
 from bisect import bisect_left
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, Sequence
 
 from v7.memory.ids import MemoryId
 from v7.memory.indexes.cognition import ActionAggregate, CognitionIndexes
 
 
+def _pair_row(a_values: Sequence[int], b_values: Sequence[int], a: int, b: int) -> int:
+    target = (int(a), int(b))
+    lo, hi = 0, len(a_values)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        current = (int(a_values[mid]), int(b_values[mid]))
+        if current < target:
+            lo = mid + 1
+        else:
+            hi = mid
+    if lo < len(a_values) and (int(a_values[lo]), int(b_values[lo])) == target:
+        return lo
+    return -1
+
+
+def _triple_row(a_values: Sequence[int], b_values: Sequence[int], c_values: Sequence[int], a: int, b: int, c: int) -> int:
+    target = (int(a), int(b), int(c))
+    lo, hi = 0, len(a_values)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        current = (int(a_values[mid]), int(b_values[mid]), int(c_values[mid]))
+        if current < target:
+            lo = mid + 1
+        else:
+            hi = mid
+    if lo < len(a_values) and (int(a_values[lo]), int(b_values[lo]), int(c_values[lo])) == target:
+        return lo
+    return -1
+
+
 @dataclass(frozen=True, slots=True)
 class PackedPairIndex:
-    key_a: array
-    key_b: array
-    offsets: array
-    lengths: array
-    values: array
+    key_a: Sequence[int]
+    key_b: Sequence[int]
+    offsets: Sequence[int]
+    lengths: Sequence[int]
+    values: Sequence[int]
 
     @classmethod
     def build(cls, rows: Iterable[tuple[int, int, Iterable[MemoryId]]]) -> "PackedPairIndex":
@@ -26,11 +56,10 @@ class PackedPairIndex:
         return cls(key_a, key_b, offsets, lengths, values)
 
     def lookup(self, a: int, b: int, limit: int | None = None) -> tuple[MemoryId, ...]:
-        target = (int(a), int(b))
-        lo = bisect_left(list(zip(self.key_a, self.key_b)), target)
-        if lo >= len(self.key_a) or (int(self.key_a[lo]), int(self.key_b[lo])) != target:
+        row = _pair_row(self.key_a, self.key_b, a, b)
+        if row < 0:
             return ()
-        start = int(self.offsets[lo]); stop = start + int(self.lengths[lo])
+        start = int(self.offsets[row]); stop = start + int(self.lengths[row])
         if limit is not None:
             stop = min(stop, start + max(0, int(limit)))
         return tuple(MemoryId(int(v)) for v in self.values[start:stop])
@@ -38,12 +67,12 @@ class PackedPairIndex:
 
 @dataclass(frozen=True, slots=True)
 class PackedRoleExactIndex:
-    contexts: array
-    actions: array
-    families: array
-    offsets: array
-    lengths: array
-    values: array
+    contexts: Sequence[int]
+    actions: Sequence[int]
+    families: Sequence[int]
+    offsets: Sequence[int]
+    lengths: Sequence[int]
+    values: Sequence[int]
 
     @classmethod
     def build(cls, indexes: CognitionIndexes) -> "PackedRoleExactIndex":
@@ -54,19 +83,17 @@ class PackedRoleExactIndex:
         return cls(contexts, actions, families, offsets, lengths, values)
 
     def lookup(self, context: int, action: int, family: MemoryId, limit: int) -> tuple[MemoryId, ...]:
-        target = (int(context), int(action), int(family))
-        keys = list(zip(self.contexts, self.actions, self.families))
-        lo = bisect_left(keys, target)
-        if lo >= len(keys) or tuple(int(v) for v in keys[lo]) != target:
+        row = _triple_row(self.contexts, self.actions, self.families, context, action, int(family))
+        if row < 0:
             return ()
-        start = int(self.offsets[lo]); stop = min(start + int(self.lengths[lo]), start + max(0, int(limit)))
+        start = int(self.offsets[row]); stop = min(start + int(self.lengths[row]), start + max(0, int(limit)))
         return tuple(MemoryId(int(v)) for v in self.values[start:stop])
 
 
 @dataclass(frozen=True, slots=True)
 class PackedActionAggregates:
-    action_ids: array
-    values: array
+    action_ids: Sequence[int]
+    values: Sequence[float]
 
     @classmethod
     def build(cls, indexes: CognitionIndexes) -> "PackedActionAggregates":
@@ -81,8 +108,7 @@ class PackedActionAggregates:
         if pos >= len(self.action_ids) or int(self.action_ids[pos]) != int(action_id):
             return ActionAggregate()
         base = pos * 6
-        row = self.values[base:base + 6]
-        return ActionAggregate(float(row[0]), int(row[1]), int(row[2]), int(row[3]), int(row[4]), int(row[5]))
+        return ActionAggregate(float(self.values[base]), int(self.values[base + 1]), int(self.values[base + 2]), int(self.values[base + 3]), int(self.values[base + 4]), int(self.values[base + 5]))
 
 
 @dataclass(frozen=True, slots=True)
