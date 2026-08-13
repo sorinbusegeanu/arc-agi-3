@@ -39,6 +39,19 @@ class GenerationPublisher:
         self._record = record
         return record
 
+    def ensure_published(self, view: MemoryReadView) -> PublicationRecord:
+        """Publish a generation or return its existing record on a safe retry."""
+
+        current = self._record
+        if current is not None:
+            current_generation = int(current.generation_id)
+            requested_generation = int(view.generation_id)
+            if current_generation == requested_generation:
+                return current
+            if current_generation > requested_generation:
+                raise ValueError("cannot publish an older generation")
+        return self.publish(view)
+
     def attach_current(self) -> MemoryReadView | None:
         record = self._record
         if record is None:
