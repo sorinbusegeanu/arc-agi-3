@@ -9,6 +9,8 @@ from time import perf_counter
 from v7.environment.parallel_sampling import ParallelSamplingPool, SamplingJob
 from v7.environment.runner import ArcGameRunResult
 from v7.game_sets import resolve_game_selector
+from v7.memory.ids import MemoryLevel
+from v7.memory.reporting import StrictHypothesisReporter
 from v7.parallel import ParallelExecutionConfig
 from v7.runtime import V7Runtime, V7RuntimeConfig
 
@@ -58,6 +60,58 @@ def _log(epoch: int, message: str) -> None:
     print(f'[{time.strftime("%H:%M")} E{epoch + 1:04d}] {message}', flush=True)
 
 
+def _epoch_hypothesis_rows(runtime: V7Runtime) -> dict[str, dict[str, object]]:
+    """Build conservative v7 hypothesis rows from evidence already represented in the runtime.
+
+    These rows never upgrade a hypothesis to VALID from proxy evidence alone. Where
+    v7 has only structural emergence but not the full hypothesis-specific measurement,
+    the decision remains PARTIALLY_VALID or INSUFFICIENT_EVIDENCE.
+    """
+    view = runtime.writer.published_view
+    level_counts = {
+        level: sum(1 for node in view.nodes.values() if node.level == level)
+        for level in MemoryLevel
+    }
+    supported = {
+        level: sum(1 for node in view.nodes.values() if node.level == level and int(node.support_count) >= 2)
+        for level in MemoryLevel
+    }
+    pe_count = sum(1 for score in view.scores.values() if float(score.prediction_error) > 0.0)
+    fo_count = sum(1 for score in view.scores.values() if float(score.future_option_delta) != 0.0)
+
+    rows: dict[str, dict[str, object]] = {}
+
+    def row(hypothesis_id: str, decision: str, measurement: object, evidence_rows: int, *, proxy_only: bool = False) -> None:
+        rows[hypothesis_id] = {
+            'raw_decision': decision,
+            'evidence': {
+                'evidence_rows': int(evidence_rows),
+                'measurement': measurement,
+                'proxy_only': bool(proxy_only),
+            },
+        }
+
+    row('H01', 'VALID' if supported[MemoryLevel.M1] > 0 else ('PARTIALLY_VALID' if level_counts[MemoryLevel.M1] > 0 else 'INSUFFICIENT_EVIDENCE'), {'m1': level_counts[MemoryLevel.M1], 'supported_m1': supported[MemoryLevel.M1]}, level_counts[MemoryLevel.M1])
+    row('H02', 'PARTIALLY_VALID' if pe_count > 0 else 'INSUFFICIENT_EVIDENCE', {'prediction_error_memories': pe_count}, pe_count, proxy_only=True)
+    row('H03', 'VALID' if supported[MemoryLevel.M2] > 0 else ('PARTIALLY_VALID' if level_counts[MemoryLevel.M2] > 0 else 'INSUFFICIENT_EVIDENCE'), {'m2': level_counts[MemoryLevel.M2], 'supported_m2': supported[MemoryLevel.M2]}, level_counts[MemoryLevel.M2])
+    row('H04', 'INSUFFICIENT_EVIDENCE', {'carrier_specific_evaluator': False}, 0)
+    row('H05', 'VALID' if supported[MemoryLevel.M3] > 0 else ('PARTIALLY_VALID' if level_counts[MemoryLevel.M3] > 0 else 'INSUFFICIENT_EVIDENCE'), {'m3': level_counts[MemoryLevel.M3], 'supported_m3': supported[MemoryLevel.M3]}, level_counts[MemoryLevel.M3])
+    row('H06', 'INSUFFICIENT_EVIDENCE', {'role_transfer_specific_evaluator': False}, 0)
+    row('H07', 'PARTIALLY_VALID' if level_counts[MemoryLevel.M4] > 0 else 'INSUFFICIENT_EVIDENCE', {'m4': level_counts[MemoryLevel.M4]}, level_counts[MemoryLevel.M4], proxy_only=True)
+    row('H08', 'PARTIALLY_VALID' if level_counts[MemoryLevel.M5] > 0 else 'INSUFFICIENT_EVIDENCE', {'m5': level_counts[MemoryLevel.M5]}, level_counts[MemoryLevel.M5], proxy_only=True)
+    row('H09', 'PARTIALLY_VALID' if fo_count > 0 else 'INSUFFICIENT_EVIDENCE', {'future_option_memories': fo_count}, fo_count, proxy_only=True)
+    row('H10', 'INSUFFICIENT_EVIDENCE', {'future_option_attention_specific_evaluator': False}, 0)
+    row('H11', 'INSUFFICIENT_EVIDENCE', {'future_option_transfer_specific_evaluator': False}, 0)
+    row('H12', 'PARTIALLY_VALID' if level_counts[MemoryLevel.M6] > 0 else 'INSUFFICIENT_EVIDENCE', {'m6': level_counts[MemoryLevel.M6]}, level_counts[MemoryLevel.M6], proxy_only=True)
+    return rows
+
+
+def _log_hypothesis_summary(epoch: int, runtime: V7Runtime, workers: int) -> None:
+    reports = StrictHypothesisReporter().evaluate_suite(_epoch_hypothesis_rows(runtime), workers=workers)
+    summary = ' '.join(f'{hypothesis_id}={report.final_decision}' for hypothesis_id, report in reports.items())
+    _log(epoch, f'hypotheses {summary}')
+
+
 def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7ExperimentResult:
     """Run deterministic parallel sampling waves against immutable v7 generations."""
     root_path = Path(root)
@@ -97,7 +151,7 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
                 if record is None:
                     raise RuntimeError('v7 runtime has no published generation')
                 _log(epoch, f'epoch starting generation={int(record.generation_id)} memories={final_memories}')
-                _log(epoch, f'sampling starting jobs={len(config.games)} workers={config.workers}')
+                _log(epoch, f'sampling starting jobs={len(config.games)} workers={config.workers} initial_workers={parallel_config.resolved_initial_workers}')
                 jobs: list[SamplingJob] = []
                 for game_index, game_id in enumerate(config.games):
                     ordinal = epoch * len(config.games) + game_index
@@ -115,20 +169,22 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
 
                 sampling_started = perf_counter()
                 sampled = sampling_pool.run_wave(handle=record.handle, jobs=jobs)
-                sampled_levels = sum(batch.levels_completed for batch in sampled)
-                sampled_wins = sum(batch.wins for batch in sampled)
-                sampled_failures = sum(batch.failures for batch in sampled)
-                _log(epoch, f'sampling done jobs={len(sampled)} levels={sampled_levels} wins={sampled_wins} failures={sampled_failures} seconds={perf_counter() - sampling_started:.2f}')
+                _log(
+                    epoch,
+                    f'sampling done jobs={len(sampled)} levels={sum(batch.levels_completed for batch in sampled)} '
+                    f'wins={sum(batch.wins for batch in sampled)} failures={sum(batch.failures for batch in sampled)} '
+                    f'seconds={perf_counter() - sampling_started:.2f}',
+                )
 
                 since_commit = 0
                 evidence_rows = sum(len(batch.evidence) for batch in sampled)
-                _log(epoch, f'ingestion starting evidence_rows={evidence_rows}')
+                _log(epoch, f'ingestion starting evidence_rows={evidence_rows} commit_every={config.commit_every}')
                 ingestion_phase_started = perf_counter()
                 commit_count = 0
                 for batch in sampled:
                     ingestion_started = perf_counter()
-                    for row in batch.evidence:
-                        runtime.observe(row)
+                    for evidence in batch.evidence:
+                        runtime.observe(evidence)
                         since_commit += 1
                         if since_commit >= config.commit_every:
                             sampling_pool.metrics.canonical_ingestion_seconds += perf_counter() - ingestion_started
@@ -148,7 +204,12 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
                     final_generation = int(committed.state.generation_id)
                     final_memories = len(committed.view.nodes)
                     commit_count += 1
-                _log(epoch, f'ingestion done commits={commit_count} generation={final_generation} memories={final_memories} seconds={perf_counter() - ingestion_phase_started:.2f}')
+                    since_commit = 0
+                _log(
+                    epoch,
+                    f'ingestion done commits={commit_count} generation={final_generation} memories={final_memories} '
+                    f'seconds={perf_counter() - ingestion_phase_started:.2f}',
+                )
 
                 for batch in sampled:
                     results.append(ArcGameRunResult(
@@ -161,7 +222,13 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
                         levels_completed=batch.levels_completed,
                         resets=batch.resets,
                     ))
-                _log(epoch, f'epoch done generation={final_generation} memories={final_memories} levels={sampled_levels} wins={sampled_wins} failures={sampled_failures} seconds={perf_counter() - epoch_started:.2f}')
+                _log_hypothesis_summary(epoch, runtime, config.report_workers)
+                _log(
+                    epoch,
+                    f'epoch done generation={final_generation} memories={final_memories} '
+                    f'levels={sum(batch.levels_completed for batch in sampled)} wins={sum(batch.wins for batch in sampled)} '
+                    f'failures={sum(batch.failures for batch in sampled)} seconds={perf_counter() - epoch_started:.2f}',
+                )
 
             metrics = sampling_pool.metrics.as_dict()
             metrics.update({
@@ -187,7 +254,12 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
         execution_metrics=metrics,
     )
     (root_path / 'experiment_summary.json').write_text(json.dumps(asdict(summary), indent=2, sort_keys=True), encoding='utf-8')
-    print(f'v7 experiment complete: epochs={summary.epochs} games={summary.games} total_steps={summary.total_steps} generation={summary.final_generation} memories={summary.final_memories} levels={summary.levels_completed} wins={summary.wins} failures={summary.failures}', flush=True)
+    print(
+        f'v7 experiment complete: epochs={summary.epochs} games={summary.games} total_steps={summary.total_steps} '
+        f'generation={summary.final_generation} memories={summary.final_memories} '
+        f'levels={summary.levels_completed} wins={summary.wins} failures={summary.failures}',
+        flush=True,
+    )
     return summary
 
 
