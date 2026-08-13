@@ -7,6 +7,7 @@ from typing import Callable, Sequence
 
 from v7.environment.arc_adapter import ArcGridEnvironment
 from v7.environment.runner import ArcGameRunConfig, ArcGameRunResult, run_arc_game
+from v7.game_sets import resolve_game_selector
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,18 +42,13 @@ class V7ExperimentResult:
     runs: tuple[ArcGameRunResult, ...]
 
 
-def run_experiment(
-    root: str | Path,
-    config: V7ExperimentConfig,
-    *,
-    env_factory: Callable[..., ArcGridEnvironment] = ArcGridEnvironment,
-) -> V7ExperimentResult:
+def run_experiment(root: str | Path, config: V7ExperimentConfig, *, env_factory: Callable[..., ArcGridEnvironment] = ArcGridEnvironment) -> V7ExperimentResult:
     root_path = Path(root)
     root_path.mkdir(parents=True, exist_ok=True)
     results: list[ArcGameRunResult] = []
     for epoch in range(config.epochs):
         for game_index, game_id in enumerate(config.games):
-            result = run_arc_game(
+            results.append(run_arc_game(
                 root_path,
                 ArcGameRunConfig(
                     game_id=game_id,
@@ -65,8 +61,7 @@ def run_experiment(
                     op_mode=config.op_mode,
                 ),
                 env_factory=env_factory,
-            )
-            results.append(result)
+            ))
     final = results[-1]
     summary = V7ExperimentResult(
         epochs=config.epochs,
@@ -84,8 +79,10 @@ def run_experiment(
     return summary
 
 
-def parse_games(values: Sequence[str]) -> tuple[str, ...]:
+def parse_games(values: Sequence[str], env_root: str | None = None) -> tuple[str, ...]:
     result: list[str] = []
     for value in values:
-        result.extend(part.strip() for part in str(value).split(",") if part.strip())
+        selector = str(value).strip()
+        if selector:
+            result.extend(resolve_game_selector(selector, env_root))
     return tuple(dict.fromkeys(result))
