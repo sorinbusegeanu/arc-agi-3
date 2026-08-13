@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from time import perf_counter
 
-from v7.environment.parallel_sampling import ParallelSamplingPool, SamplingBatchResult, SamplingJob
+from v7.environment.parallel_sampling import ParallelSamplingPool, SamplingJob
 from v7.environment.runner import ArcGameRunResult
 from v7.game_sets import resolve_game_selector
 from v7.parallel import ParallelExecutionConfig
@@ -97,11 +97,7 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
                 if record is None:
                     raise RuntimeError('v7 runtime has no published generation')
                 _log(epoch, f'epoch starting generation={int(record.generation_id)} memories={final_memories}')
-                _log(
-                    epoch,
-                    f'sampling starting jobs={len(config.games)} workers={config.workers} '
-                    f'initial_workers={parallel_config.resolved_initial_workers}',
-                )
+                _log(epoch, f'sampling starting jobs={len(config.games)} workers={config.workers}')
                 jobs: list[SamplingJob] = []
                 for game_index, game_id in enumerate(config.games):
                     ordinal = epoch * len(config.games) + game_index
@@ -118,25 +114,15 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
                     global_job_index += 1
 
                 sampling_started = perf_counter()
-
-                def on_progress(batch: SamplingBatchResult, completed: int, total: int) -> None:
-                    _log(
-                        epoch,
-                        f'sampling {completed}/{total} game={batch.game_id} seed={batch.seed} '
-                        f'steps={batch.steps} levels={batch.levels_completed} wins={batch.wins} '
-                        f'seconds={batch.worker_seconds:.2f}',
-                    )
-
-                sampled = sampling_pool.run_wave(
-                    handle=record.handle,
-                    jobs=jobs,
-                    progress_callback=on_progress,
-                )
-                _log(epoch, f'sampling done jobs={len(sampled)} seconds={perf_counter() - sampling_started:.2f}')
+                sampled = sampling_pool.run_wave(handle=record.handle, jobs=jobs)
+                sampled_levels = sum(batch.levels_completed for batch in sampled)
+                sampled_wins = sum(batch.wins for batch in sampled)
+                sampled_failures = sum(batch.failures for batch in sampled)
+                _log(epoch, f'sampling done jobs={len(sampled)} levels={sampled_levels} wins={sampled_wins} failures={sampled_failures} seconds={perf_counter() - sampling_started:.2f}')
 
                 since_commit = 0
                 evidence_rows = sum(len(batch.evidence) for batch in sampled)
-                _log(epoch, f'ingestion starting evidence_rows={evidence_rows} commit_every={config.commit_every}')
+                _log(epoch, f'ingestion starting evidence_rows={evidence_rows}')
                 ingestion_phase_started = perf_counter()
                 commit_count = 0
                 for batch in sampled:
@@ -148,34 +134,21 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
                             sampling_pool.metrics.canonical_ingestion_seconds += perf_counter() - ingestion_started
                             commit_started = perf_counter()
                             committed = runtime.commit()
-                            commit_seconds = perf_counter() - commit_started
-                            sampling_pool.metrics.generation_commit_seconds += commit_seconds
+                            sampling_pool.metrics.generation_commit_seconds += perf_counter() - commit_started
                             final_generation = int(committed.state.generation_id)
                             final_memories = len(committed.view.nodes)
                             commit_count += 1
-                            _log(
-                                epoch,
-                                f'commit {commit_count} generation={final_generation} memories={final_memories} '
-                                f'seconds={commit_seconds:.2f}',
-                            )
                             since_commit = 0
                             ingestion_started = perf_counter()
                     sampling_pool.metrics.canonical_ingestion_seconds += perf_counter() - ingestion_started
                 if since_commit:
                     commit_started = perf_counter()
                     committed = runtime.commit()
-                    commit_seconds = perf_counter() - commit_started
-                    sampling_pool.metrics.generation_commit_seconds += commit_seconds
+                    sampling_pool.metrics.generation_commit_seconds += perf_counter() - commit_started
                     final_generation = int(committed.state.generation_id)
                     final_memories = len(committed.view.nodes)
                     commit_count += 1
-                    _log(
-                        epoch,
-                        f'commit {commit_count} generation={final_generation} memories={final_memories} '
-                        f'seconds={commit_seconds:.2f}',
-                    )
-                    since_commit = 0
-                _log(epoch, f'ingestion done seconds={perf_counter() - ingestion_phase_started:.2f}')
+                _log(epoch, f'ingestion done commits={commit_count} generation={final_generation} memories={final_memories} seconds={perf_counter() - ingestion_phase_started:.2f}')
 
                 for batch in sampled:
                     results.append(ArcGameRunResult(
@@ -188,12 +161,7 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
                         levels_completed=batch.levels_completed,
                         resets=batch.resets,
                     ))
-                _log(
-                    epoch,
-                    f'epoch done generation={final_generation} memories={final_memories} '
-                    f'levels={sum(batch.levels_completed for batch in sampled)} '
-                    f'seconds={perf_counter() - epoch_started:.2f}',
-                )
+                _log(epoch, f'epoch done generation={final_generation} memories={final_memories} levels={sampled_levels} wins={sampled_wins} failures={sampled_failures} seconds={perf_counter() - epoch_started:.2f}')
 
             metrics = sampling_pool.metrics.as_dict()
             metrics.update({
@@ -219,12 +187,7 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
         execution_metrics=metrics,
     )
     (root_path / 'experiment_summary.json').write_text(json.dumps(asdict(summary), indent=2, sort_keys=True), encoding='utf-8')
-    print(
-        f'v7 experiment complete: epochs={summary.epochs} games={summary.games} total_steps={summary.total_steps} '
-        f'generation={summary.final_generation} memories={summary.final_memories} '
-        f'levels={summary.levels_completed} wins={summary.wins} failures={summary.failures}',
-        flush=True,
-    )
+    print(f'v7 experiment complete: epochs={summary.epochs} games={summary.games} total_steps={summary.total_steps} generation={summary.final_generation} memories={summary.final_memories} levels={summary.levels_completed} wins={summary.wins} failures={summary.failures}', flush=True)
     return summary
 
 
