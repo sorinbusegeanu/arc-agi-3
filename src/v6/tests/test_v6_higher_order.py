@@ -2892,3 +2892,77 @@ def _insert_edge(conn: sqlite3.Connection, source: str, target: str, edge_type: 
         """,
         (edge_id, source, target, edge_type, 10, 20, 1, 1.0),
     )
+
+
+def test_cross_context_expansion_binds_source_and_target_to_same_real_game() -> None:
+    attempt = {
+        "attempt_id": "aggregate",
+        "role_signature": "role-target",
+        "transfer_kind": "cross_context",
+        "source_scope_type": "context",
+        "source_scope_key": None,
+        "target_scope_type": "context",
+        "target_scope_key": "ctx-target",
+        "source_game_key": None,
+        "target_game_key": None,
+        "source_context_key": None,
+        "target_context_key": "ctx-target",
+        "source_carrier_signature": None,
+        "source_role_signature": "role-source",
+        "predicted_target_role_signature": "role-source",
+        "observed_target_role_signature": "role-target",
+        "source_carrier_signatures_json": json.dumps(["carrier-source"]),
+        "source_game_keys_json": json.dumps(["game-a", "game-b"]),
+        "source_context_keys_json": json.dumps(["ctx-source"]),
+        "source_context_game_keys_json": json.dumps({"ctx-source": ["game-a", "game-b"]}),
+        "target_game_keys_json": json.dumps(["game-b", "game-c"]),
+        "provenance_mode": "single_source",
+        "provenance_status": "verified",
+        "target_carrier_signature": "carrier-target",
+        "predicted_role_signature": "role-source",
+        "observed_role_signature": "role-target",
+        "similarity_score": 1.0,
+        "transfer_score": 1.0,
+        "reuse_success": 1,
+        "failure_reason": "success",
+        "best_margin": 0.2,
+        "source_carrier_count": 1,
+        "source_evidence_support_count": 2,
+        "support_gate_passed": 1,
+        "similarity_gate_passed": 1,
+        "role_match_gate_passed": 1,
+        "candidate_role_count": 2,
+        "first_seen_global_step": 1,
+        "last_seen_global_step": 2,
+    }
+    rows = higher_order_substrate._expand_transfer_attempt_provenance(attempt)
+    assert len(rows) == 1
+    assert rows[0]["source_game_key"] == "game-b"
+    assert rows[0]["target_game_key"] == "game-b"
+
+
+def test_cross_context_persistence_rejects_distinct_real_games() -> None:
+    attempt = {
+        "provenance_mode": "single_source",
+        "transfer_kind": "cross_context",
+        "source_interaction_id": "i1",
+        "target_interaction_id": "i2",
+        "source_game_key": "game-a",
+        "target_game_key": "game-b",
+        "source_context_key": "ctx-a",
+        "target_context_key": "ctx-b",
+        "source_game_is_surrogate": 0,
+        "target_game_is_surrogate": 0,
+        "source_context_is_surrogate": 0,
+        "target_context_is_surrogate": 0,
+        "source_game_resolution_source": "direct_attempt",
+        "target_game_resolution_source": "direct_attempt",
+        "source_context_resolution_source": "direct_attempt",
+        "target_context_resolution_source": "direct_attempt",
+        "provenance_status": "verified",
+        "reuse_success": 1,
+        "source_role_signature": "role-source",
+        "source_carrier_signature": "carrier-source",
+    }
+    with pytest.raises(ValueError, match="spans distinct real games"):
+        higher_order_substrate._validate_transfer_attempt_provenance(attempt)
