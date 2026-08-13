@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections import defaultdict
 from dataclasses import asdict
 from pathlib import Path
 
 from v7.derivation.scientific import EpisodeEvidence
 from v7.environment.runner import ArcGameRunConfig, run_arc_game
-from v7.experiment import V7ExperimentConfig, resolve_games, run_experiment
+from v7.experiment import V7ExperimentConfig, V7ExperimentResult, resolve_games, run_experiment
 from v7.runtime import V7Runtime, V7RuntimeConfig
 
 
@@ -76,6 +77,57 @@ def _add_continuous_arguments(parser: argparse.ArgumentParser) -> None:
     _add_parallel_arguments(parser)
 
 
+def _format_experiment_summary(result: V7ExperimentResult, root: str | Path) -> str:
+    metrics = result.execution_metrics
+    lines = [
+        '',
+        'V7 experiment complete',
+        f'  epochs={result.epochs}  games={result.games}  steps={result.total_steps:,}',
+        f'  levels_completed={result.levels_completed}  wins={result.wins}  failures={result.failures}',
+        f'  generation={result.final_generation}  memories={result.final_memories:,}',
+    ]
+
+    sampling_seconds = float(metrics.get('sampling_wall_seconds', 0.0) or 0.0)
+    ingestion_seconds = float(metrics.get('canonical_ingestion_seconds', 0.0) or 0.0)
+    commit_seconds = float(metrics.get('generation_commit_seconds', 0.0) or 0.0)
+    steps_per_second = float(metrics.get('steps_per_second', 0.0) or 0.0)
+    peak_workers = int(metrics.get('peak_active_workers', 0) or 0)
+    configured_workers = int(metrics.get('configured_workers', 0) or 0)
+    lines.append(
+        '  performance: '
+        f'sampling={sampling_seconds:.2f}s ({steps_per_second:,.0f} steps/s), '
+        f'ingestion={ingestion_seconds:.2f}s, commit={commit_seconds:.2f}s, '
+        f'peak_workers={peak_workers}/{configured_workers}'
+    )
+
+    by_game: dict[str, dict[str, int]] = defaultdict(lambda: {'levels': 0, 'wins': 0, 'failures': 0})
+    for run in result.runs:
+        row = by_game[run.game_id]
+        row['levels'] += int(run.levels_completed)
+        row['wins'] += int(run.wins)
+        row['failures'] += int(run.failures)
+
+    progress = [
+        f"{game}: {row['levels']} levels, {row['wins']} wins"
+        for game, row in sorted(by_game.items())
+        if row['levels'] or row['wins']
+    ]
+    if progress:
+        lines.append('  progress: ' + '; '.join(progress))
+
+    failures = [
+        f"{game}: {row['failures']}"
+        for game, row in sorted(by_game.items(), key=lambda item: (-item[1]['failures'], item[0]))
+        if row['failures']
+    ]
+    if failures:
+        lines.append('  failures by game: ' + ', '.join(failures))
+
+    lines.append(f'  detailed results: {Path(root) / "experiment_summary.json"}')
+    lines.append(f'  runtime metrics: {Path(root) / "parallel_runtime_metrics.json"}')
+    return '\n'.join(lines)
+
+
 def _run_experiment_args(args, *, continuous: bool = False) -> int:
     games = resolve_games(args.games, args.env_root)
     steps = args.steps_per_epoch if continuous else args.steps_per_game
@@ -100,7 +152,7 @@ def _run_experiment_args(args, *, continuous: bool = False) -> int:
             per_worker_ramp_delay_seconds=args.per_worker_ramp_delay_seconds,
         ),
     )
-    print(json.dumps(asdict(result), sort_keys=True))
+    print(_format_experiment_summary(result, args.root), flush=True)
     return 0
 
 
@@ -131,7 +183,8 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     if args.command == 'run':
-        print(json.dumps(run_events(args.root, args.events, no_restore=args.no_restore), sort_keys=True))
+        result = run_events(args.root, args.events, no_restore=args.no_restore)
+        print(f"events={result['events']:,}  generation={result['generation']}  memories={result['memories']:,}")
         return 0
     if args.command == 'game':
         result = run_arc_game(
@@ -146,7 +199,11 @@ def main(argv: list[str] | None = None) -> int:
                 restore=not args.no_restore,
             ),
         )
-        print(json.dumps(asdict(result), sort_keys=True))
+        print(
+            f"game={result.game_id}  steps={result.steps:,}  levels={result.levels_completed}  "
+            f"wins={result.wins}  failures={result.failures}  generation={result.generation}  "
+            f"memories={result.memories:,}"
+        )
         return 0
     if args.command == 'experiment':
         return _run_experiment_args(args)
