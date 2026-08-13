@@ -7,6 +7,17 @@ _INSTALLED = False
 _ORIGINAL: Any = None
 
 
+def _inc(ctx: dict[str, Any] | None, key: str, amount: int = 1) -> None:
+    if ctx is None:
+        return
+    stats = ctx.setdefault("cache_stats", {})
+    stats[key] = int(stats.get(key, 0)) + int(amount)
+    # The existing fastpath profile already exports index_stats. Mirror cache
+    # counters there so nested canonical profiling cannot hide them.
+    index_stats = ctx.setdefault("index_stats", {})
+    index_stats[f"sparse_cache.{key}"] = int(stats[key])
+
+
 def _sparse_role_score_bundle(
     substrate: Any,
     *,
@@ -25,6 +36,7 @@ def _sparse_role_score_bundle(
     """
     from v6 import concept_validation_fastpath as fast
 
+    started = time.perf_counter()
     ctx = fast._ACTIVE.get()
     roles_key = tuple(source_roles)
     step_i = int(step)
@@ -38,8 +50,7 @@ def _sparse_role_score_bundle(
     generic_key = (roles_key, step_i)
     if generic_cache is not None and generic_key in generic_cache:
         generic_rates = generic_cache[generic_key]
-        stats = ctx.setdefault("cache_stats", {})
-        stats["generic_hits"] = int(stats.get("generic_hits", 0)) + 1
+        _inc(ctx, "generic_hits")
     else:
         generic_rates = [
             substrate._prior_role_success_rate(
@@ -53,16 +64,14 @@ def _sparse_role_score_bundle(
         ]
         if generic_cache is not None:
             generic_cache[generic_key] = generic_rates
-            stats = ctx.setdefault("cache_stats", {})
-            stats["generic_misses"] = int(stats.get("generic_misses", 0)) + 1
+            _inc(ctx, "generic_misses")
 
     scoped_rates: list[float] = []
     if scope is not None:
         scope_key = (roles_key, step_i, *scope)
         if scoped_cache is not None and scope_key in scoped_cache:
             scoped_rates = scoped_cache[scope_key]
-            stats = ctx.setdefault("cache_stats", {})
-            stats["scoped_hits"] = int(stats.get("scoped_hits", 0)) + 1
+            _inc(ctx, "scoped_hits")
         else:
             source_game_key, source_context_key, target_game_key, target_context_key = scope
             sparse_index = getattr(transfer_history, "by_source_target_scope", None)
@@ -99,11 +108,18 @@ def _sparse_role_score_bundle(
                         scoped_rates.append(rate)
             if scoped_cache is not None:
                 scoped_cache[scope_key] = scoped_rates
-                stats = ctx.setdefault("cache_stats", {})
-                stats["scoped_misses"] = int(stats.get("scoped_misses", 0)) + 1
+                _inc(ctx, "scoped_misses")
                 if not scoped_rates:
-                    stats["scoped_empty"] = int(stats.get("scoped_empty", 0)) + 1
+                    _inc(ctx, "scoped_empty")
 
+    if ctx is not None:
+        index_stats = ctx.setdefault("index_stats", {})
+        index_stats["sparse_cache.generic_entries"] = len(generic_cache or {})
+        index_stats["sparse_cache.scoped_entries"] = len(scoped_cache or {})
+        timings = ctx.setdefault("timings", {})
+        timings["role_score_bundle.sparse_total"] = float(
+            timings.get("role_score_bundle.sparse_total", 0.0) or 0.0
+        ) + (time.perf_counter() - started)
     return generic_rates, scoped_rates
 
 
@@ -141,13 +157,6 @@ def _profiled_validate(*args: Any, **kwargs: Any):
         existing = result.get("concept_validation_fastpath_profile")
         profile = dict(existing) if isinstance(existing, dict) else {}
         profile.setdefault("outer_total_seconds", elapsed)
-        profile["sparse_cache"] = {
-            "generic_entries": len(ctx["generic_role_score_cache"]),
-            "scoped_entries": len(ctx["scoped_role_score_cache"]),
-            **{key: int(value) for key, value in sorted(ctx["cache_stats"].items())},
-        }
-        # If the inner canonical fastpath did not create a profile, preserve
-        # enough diagnostics to prove which helpers executed.
         if not existing:
             profile["timings"] = {key: float(value) for key, value in sorted(ctx["timings"].items())}
             profile["call_counts"] = {key: int(value) for key, value in sorted(ctx["call_counts"].items())}
