@@ -33,9 +33,15 @@ Implemented:
 - worker-side generation attachment once per process;
 - vectorized derivation inputs using dense numeric arrays for each dirty task chunk;
 - bounded `ParallelDerivationExecutor` using process workers and mmap generation attachment;
-- deterministic `DerivedMutationBatch` merge back into the single canonical writer independent of worker completion order.
+- deterministic `DerivedMutationBatch` merge back into the single canonical writer independent of worker completion order;
+- configurable retention fitness, promotion, demotion and replay policy over immutable generations;
+- deterministic bounded replay queue and explicit lifecycle status flags;
+- append-only lifecycle evidence for promotion, demotion and replay decisions;
+- dedicated provenance, transfer-trial and contradiction ledgers;
+- structural parent provenance emitted by the M1-M6 learning pipeline;
+- batched transfer summaries kept distinct from transfer priors.
 
-The six implementation phases following the v7 foundation are now represented end-to-end:
+The six implementation phases following the v7 foundation are represented end-to-end:
 
 1. M1-M6 scientific derivation constructors and pipeline.
 2. Writer-owned deterministic canonical ID allocation.
@@ -44,6 +50,8 @@ The six implementation phases following the v7 foundation are now represented en
 5. Bounded parallel derivation execution with deterministic merge.
 6. Incremental generation publication with unchanged section reuse and content-addressed mmap segments.
 
-Remaining major work is runtime integration rather than foundation architecture: retention/replay/promotion-demotion lifecycle, evidence/provenance/transfer policies, durable restart/restore, v7 runner/CLI, H01-H12 reporting integration, and performance validation against v6. GPU ranking and remote samplers remain intentionally later phases.
+The first runtime lifecycle block is also implemented: retention/replay/promotion-demotion plus append-only evidence, provenance, transfer and contradiction storage.
+
+Remaining major work is durable restart/restore, end-to-end v7 runner/CLI integration, H01-H12 reporting/evidence contracts, differential scientific validation against v6 and performance validation. GPU ranking and remote samplers remain intentionally later phases.
 
 Scientific M1-M6 behavior is clean-break v7 code and does not import v6 runtime modules. Stable v6 behavior remains an external scientific reference for differential validation.
