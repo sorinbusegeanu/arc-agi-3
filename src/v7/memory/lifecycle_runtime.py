@@ -21,6 +21,7 @@ class LifecycleRunStats:
     replay_queued: int
     evidence_records: int
     transfer_signals: int
+    contradiction_signals: int
 
 
 class MemoryLifecycleRuntime:
@@ -38,13 +39,24 @@ class MemoryLifecycleRuntime:
 
     def run(self, view: MemoryReadView, *, writer: CanonicalMemoryWriter) -> tuple[tuple[LifecycleDecision, ...], LifecycleRunStats]:
         empirical_transfer = {}
+        contradiction_severity = {}
         if self.evidence_lifecycle is not None:
-            summary = self.evidence_lifecycle.transfer_summary(view.nodes.keys())
+            transfer_summary = self.evidence_lifecycle.transfer_summary(view.nodes.keys())
             empirical_transfer = {
                 memory_id: successes / total if total > 0 else 0.0
-                for memory_id, (total, successes, _mean_score) in summary.items()
+                for memory_id, (total, successes, _mean_score) in transfer_summary.items()
             }
-        decisions = self.controller.apply(view, writer=writer, empirical_transfer=empirical_transfer)
+            contradiction_summary = self.evidence_lifecycle.contradiction_summary(view.nodes.keys())
+            contradiction_severity = {
+                memory_id: max_severity
+                for memory_id, (_total, max_severity) in contradiction_summary.items()
+            }
+        decisions = self.controller.apply(
+            view,
+            writer=writer,
+            empirical_transfer=empirical_transfer,
+            contradiction_severity=contradiction_severity,
+        )
         records: list[EvidenceRecord] = []
         generation_id = int(writer.mutable_generation_id)
         for decision in decisions:
@@ -53,6 +65,7 @@ class MemoryLifecycleRuntime:
                 "previous_flags": decision.previous_flags,
                 "next_flags": decision.next_flags,
                 "empirical_transfer": decision.empirical_transfer,
+                "contradiction_severity": decision.contradiction_severity,
             }
             if decision.promote:
                 records.append(EvidenceRecord(decision.memory_id, EVIDENCE_PROMOTION, generation_id, common))
@@ -68,5 +81,6 @@ class MemoryLifecycleRuntime:
             replay_queued=sum(1 for item in decisions if item.replay),
             evidence_records=written,
             transfer_signals=len(empirical_transfer),
+            contradiction_signals=len(contradiction_severity),
         )
         return decisions, stats
