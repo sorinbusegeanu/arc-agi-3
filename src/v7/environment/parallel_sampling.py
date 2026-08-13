@@ -128,6 +128,7 @@ def sample_job(directory: str, handle: ReadViewHandle, job: SamplingJob) -> Samp
 
 
 WorkerFunction = Callable[[str, ReadViewHandle, SamplingJob], SamplingBatchResult]
+ProgressCallback = Callable[[SamplingBatchResult, int, int], None]
 
 
 class ParallelSamplingPool:
@@ -164,13 +165,26 @@ class ParallelSamplingPool:
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
 
-    def run_wave(self, *, handle: ReadViewHandle, jobs: Iterable[SamplingJob]) -> tuple[SamplingBatchResult, ...]:
+    def run_wave(
+        self,
+        *,
+        handle: ReadViewHandle,
+        jobs: Iterable[SamplingJob],
+        progress_callback: ProgressCallback | None = None,
+    ) -> tuple[SamplingBatchResult, ...]:
         ordered_jobs = tuple(sorted(jobs, key=lambda job: job.job_index))
         if not ordered_jobs:
             return ()
+        total = len(ordered_jobs)
         started = perf_counter()
         if self._pool is None:
-            outputs = tuple(self.worker_fn(self.directory, handle, job) for job in ordered_jobs)
+            outputs_list: list[SamplingBatchResult] = []
+            for job in ordered_jobs:
+                result = self.worker_fn(self.directory, handle, job)
+                outputs_list.append(result)
+                if progress_callback is not None:
+                    progress_callback(result, len(outputs_list), total)
+            outputs = tuple(outputs_list)
             self._record_results(outputs, perf_counter() - started, peak=1)
             return outputs
 
@@ -199,8 +213,11 @@ class ParallelSamplingPool:
             for future in done:
                 futures.pop(future)
                 try:
-                    outputs.append(future.result())
+                    result = future.result()
+                    outputs.append(result)
                     self.metrics.jobs_completed += 1
+                    if progress_callback is not None:
+                        progress_callback(result, len(outputs), total)
                 except Exception:
                     self.metrics.jobs_failed += 1
                     raise
