@@ -96,3 +96,37 @@ def test_provenance_transfer_and_contradiction_ledgers_are_append_only(tmp_path)
         assert ledger.connection.execute("SELECT COUNT(*) FROM contradiction_records").fetchone() == (1,)
     finally:
         ledger.close()
+
+
+def test_runtime_keeps_empirical_transfer_distinct_and_uses_it_as_lifecycle_signal(tmp_path) -> None:
+    memory_id = MemoryIdAllocator().allocate()
+    writer = CanonicalMemoryWriter()
+    writer.apply_mutation_batch((NodeMutation(memory_id, MemoryLevel.M3, 30, support_delta=3),))
+    writer.apply_score_batch((ScoreMutation(memory_id, significance=0.2, transfer_prior=0.0),))
+    _, view, _ = writer.commit_generation()
+
+    ledger = EvidenceLifecycleStore(tmp_path / "transfer.sqlite")
+    try:
+        ledger.append_transfer_trials((
+            TransferTrialRecord(memory_id, 1, "source", "target-a", True, 0.8),
+            TransferTrialRecord(memory_id, 1, "source", "target-b", True, 0.9),
+        ))
+        policy = LifecyclePolicy(
+            promote_threshold=0.10,
+            retain_threshold=0.01,
+            replay_prediction_error=2.0,
+            replay_learning_value=2.0,
+            replay_transfer_prior=2.0,
+            replay_empirical_transfer=0.5,
+            replay_explanatory_potential=2.0,
+        )
+        decisions, stats = MemoryLifecycleRuntime(
+            MemoryLifecycleController(policy),
+            evidence_lifecycle=ledger,
+        ).run(view, writer=writer)
+        assert stats.transfer_signals == 1
+        assert decisions[0].empirical_transfer == 1.0
+        assert decisions[0].replay is True
+        assert view.scores[memory_id].transfer_prior == 0.0
+    finally:
+        ledger.close()
