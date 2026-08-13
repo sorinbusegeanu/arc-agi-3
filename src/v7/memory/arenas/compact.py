@@ -4,22 +4,26 @@ from array import array
 from bisect import bisect_left
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Mapping
+from typing import Iterable, Mapping
 
 from v7.memory.generation import GenerationId
 from v7.memory.ids import MemoryId, MemoryLevel
 from v7.memory.models import MemoryNode, MemoryScore
 
 
+def _readonly(typecode: str, values: Iterable[int | float]) -> memoryview:
+    return memoryview(array(typecode, values)).toreadonly()
+
+
 @dataclass(frozen=True, slots=True)
 class NodeColumns:
-    memory_ids: array
-    levels: array
-    type_ids: array
-    created_generations: array
-    updated_generations: array
-    status_flags: array
-    support_counts: array
+    memory_ids: memoryview
+    levels: memoryview
+    type_ids: memoryview
+    created_generations: memoryview
+    updated_generations: memoryview
+    status_flags: memoryview
+    support_counts: memoryview
     row_by_id: Mapping[MemoryId, int]
 
     @classmethod
@@ -29,13 +33,13 @@ class NodeColumns:
             {node.memory_id: index for index, node in enumerate(ordered)}
         )
         return cls(
-            memory_ids=array("Q", (int(node.memory_id) for node in ordered)),
-            levels=array("B", (int(node.level) for node in ordered)),
-            type_ids=array("I", (int(node.type_id) for node in ordered)),
-            created_generations=array("Q", (int(node.created_generation) for node in ordered)),
-            updated_generations=array("Q", (int(node.updated_generation) for node in ordered)),
-            status_flags=array("Q", (int(node.status_flags) for node in ordered)),
-            support_counts=array("q", (int(node.support_count) for node in ordered)),
+            memory_ids=_readonly("Q", (int(node.memory_id) for node in ordered)),
+            levels=_readonly("B", (int(node.level) for node in ordered)),
+            type_ids=_readonly("I", (int(node.type_id) for node in ordered)),
+            created_generations=_readonly("Q", (int(node.created_generation) for node in ordered)),
+            updated_generations=_readonly("Q", (int(node.updated_generation) for node in ordered)),
+            status_flags=_readonly("Q", (int(node.status_flags) for node in ordered)),
+            support_counts=_readonly("q", (int(node.support_count) for node in ordered)),
             row_by_id=row_by_id,
         )
 
@@ -60,7 +64,7 @@ class NodeColumns:
     @property
     def payload_bytes(self) -> int:
         return sum(
-            values.buffer_info()[1] * values.itemsize
+            values.nbytes
             for values in (
                 self.memory_ids,
                 self.levels,
@@ -75,13 +79,13 @@ class NodeColumns:
 
 @dataclass(frozen=True, slots=True)
 class ScoreColumns:
-    memory_ids: array
-    significance: array
-    prediction_error: array
-    learning_value: array
-    transfer_prior: array
-    explanatory_potential: array
-    future_option_delta: array
+    memory_ids: memoryview
+    significance: memoryview
+    prediction_error: memoryview
+    learning_value: memoryview
+    transfer_prior: memoryview
+    explanatory_potential: memoryview
+    future_option_delta: memoryview
     row_by_id: Mapping[MemoryId, int]
 
     @classmethod
@@ -91,13 +95,13 @@ class ScoreColumns:
             {score.memory_id: index for index, score in enumerate(ordered)}
         )
         return cls(
-            memory_ids=array("Q", (int(score.memory_id) for score in ordered)),
-            significance=array("d", (float(score.significance) for score in ordered)),
-            prediction_error=array("d", (float(score.prediction_error) for score in ordered)),
-            learning_value=array("d", (float(score.learning_value) for score in ordered)),
-            transfer_prior=array("d", (float(score.transfer_prior) for score in ordered)),
-            explanatory_potential=array("d", (float(score.explanatory_potential) for score in ordered)),
-            future_option_delta=array("d", (float(score.future_option_delta) for score in ordered)),
+            memory_ids=_readonly("Q", (int(score.memory_id) for score in ordered)),
+            significance=_readonly("d", (float(score.significance) for score in ordered)),
+            prediction_error=_readonly("d", (float(score.prediction_error) for score in ordered)),
+            learning_value=_readonly("d", (float(score.learning_value) for score in ordered)),
+            transfer_prior=_readonly("d", (float(score.transfer_prior) for score in ordered)),
+            explanatory_potential=_readonly("d", (float(score.explanatory_potential) for score in ordered)),
+            future_option_delta=_readonly("d", (float(score.future_option_delta) for score in ordered)),
             row_by_id=row_by_id,
         )
 
@@ -122,7 +126,7 @@ class ScoreColumns:
     @property
     def payload_bytes(self) -> int:
         return sum(
-            values.buffer_info()[1] * values.itemsize
+            values.nbytes
             for values in (
                 self.memory_ids,
                 self.significance,
@@ -137,11 +141,11 @@ class ScoreColumns:
 
 @dataclass(frozen=True, slots=True)
 class PackedAdjacency:
-    source_ids: array
-    relation_types: array
-    offsets: array
-    lengths: array
-    targets: array
+    source_ids: memoryview
+    relation_types: memoryview
+    offsets: memoryview
+    lengths: memoryview
+    targets: memoryview
 
     @classmethod
     def build(
@@ -162,11 +166,11 @@ class PackedAdjacency:
             lengths.append(len(values))
             targets.extend(int(value) for value in values)
         return cls(
-            source_ids=source_ids,
-            relation_types=relation_types,
-            offsets=offsets,
-            lengths=lengths,
-            targets=targets,
+            source_ids=memoryview(source_ids).toreadonly(),
+            relation_types=memoryview(relation_types).toreadonly(),
+            offsets=memoryview(offsets).toreadonly(),
+            lengths=memoryview(lengths).toreadonly(),
+            targets=memoryview(targets).toreadonly(),
         )
 
     def neighbors(self, source_id: MemoryId, relation_type: int) -> tuple[MemoryId, ...]:
@@ -195,7 +199,7 @@ class PackedAdjacency:
     @property
     def payload_bytes(self) -> int:
         return sum(
-            values.buffer_info()[1] * values.itemsize
+            values.nbytes
             for values in (
                 self.source_ids,
                 self.relation_types,
