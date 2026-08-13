@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
+from time import perf_counter
+from typing import Callable, Iterable
 
 import numpy as np
 
@@ -72,3 +73,33 @@ class VectorizedActionScorer:
         scores.setflags(write=False)
         evidence_counts.setflags(write=False)
         return ActionScoreBatch(ids, scores, evidence_counts)
+
+
+@dataclass(frozen=True, slots=True)
+class PerformanceMeasurement:
+    name: str
+    iterations: int
+    total_seconds: float
+    mean_seconds: float
+    operations_per_second: float
+
+
+class PerformanceProbe:
+    """Small deterministic timing harness for v7 regression/performance validation."""
+
+    @staticmethod
+    def measure(name: str, operation: Callable[[], object], *, iterations: int = 1) -> PerformanceMeasurement:
+        if iterations <= 0:
+            raise ValueError("iterations must be positive")
+        started = perf_counter()
+        for _ in range(iterations):
+            operation()
+        total = perf_counter() - started
+        mean = total / iterations
+        return PerformanceMeasurement(name, iterations, total, mean, float("inf") if total == 0 else iterations / total)
+
+    @staticmethod
+    def within_budget(measurement: PerformanceMeasurement, *, max_mean_seconds: float) -> bool:
+        if max_mean_seconds < 0:
+            raise ValueError("max_mean_seconds must be non-negative")
+        return measurement.mean_seconds <= max_mean_seconds
