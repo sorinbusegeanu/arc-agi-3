@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import pytest
 
+from v7.memory.coordinator import GenerationCommitCoordinator
+from v7.memory.durable_store import DurableGenerationStore
 from v7.memory.generation import GenerationId
 from v7.memory.ids import MemoryIdAllocator, MemoryLevel
 from v7.memory.indexes.cognition import ContingencyIndexMutation
@@ -108,3 +110,84 @@ def test_unpublished_mutations_are_not_visible_to_attached_reader() -> None:
     assert attached is not None
     assert attached.get_nodes([first_id, second_id])[0] is not None
     assert attached.get_nodes([first_id, second_id])[1] is None
+
+
+def test_prepare_blocks_mutation_until_finalize_or_abort() -> None:
+    ids = MemoryIdAllocator()
+    first_id, second_id = ids.allocate_many(2)
+    writer = CanonicalMemoryWriter()
+    writer.apply_mutation_batch(
+        [NodeMutation(first_id, MemoryLevel.M1, 10, support_delta=1)]
+    )
+
+    prepared = writer.prepare_generation()
+    assert writer.has_pending_generation
+    assert writer.prepare_generation() is prepared
+
+    with pytest.raises(RuntimeError, match="generation is prepared"):
+        writer.apply_mutation_batch(
+            [NodeMutation(second_id, MemoryLevel.M1, 10, support_delta=1)]
+        )
+
+    writer.abort_generation()
+    assert not writer.has_pending_generation
+    writer.apply_mutation_batch(
+        [NodeMutation(second_id, MemoryLevel.M1, 10, support_delta=1)]
+    )
+
+
+def test_coordinator_persists_before_publishing_and_finalizing(tmp_path) -> None:
+    memory_id = MemoryIdAllocator().allocate()
+    writer = CanonicalMemoryWriter()
+    writer.apply_mutation_batch(
+        [NodeMutation(memory_id, MemoryLevel.M1, 10, support_delta=1)]
+    )
+    durable = DurableGenerationStore(tmp_path / "state.sqlite")
+    publisher = GenerationPublisher(LocalReadViewTransport())
+    coordinator = GenerationCommitCoordinator(
+        writer=writer,
+        durable_store=durable,
+        publisher=publisher,
+    )
+    try:
+        result = coordinator.commit(batch_id=7)
+        assert int(result.state.generation_id) == 1
+        assert publisher.attach_current() is result.view
+        assert writer.published_view is result.view
+        assert int(writer.mutable_generation_id) == 2
+        assert not writer.has_pending_generation
+        assert durable.connection.execute(
+            "SELECT committed FROM generations WHERE generation_id=1"
+        ).fetchone() == (1,)
+        assert durable.connection.execute(
+            "SELECT mutation_count FROM generation_batches WHERE generation_id=1 AND batch_id=7"
+        ).fetchone() == (1,)
+    finally:
+        durable.close()
+
+
+def test_durability_failure_does_not_publish_or_advance_writer() -> None:
+    class FailingStore:
+        def persist_generation_delta(self, state, delta, *, batch_id=0):
+            raise OSError("disk unavailable")
+
+    memory_id = MemoryIdAllocator().allocate()
+    writer = CanonicalMemoryWriter()
+    writer.apply_mutation_batch(
+        [NodeMutation(memory_id, MemoryLevel.M1, 10, support_delta=1)]
+    )
+    publisher = GenerationPublisher(LocalReadViewTransport())
+    coordinator = GenerationCommitCoordinator(
+        writer=writer,
+        durable_store=FailingStore(),
+        publisher=publisher,
+    )
+
+    with pytest.raises(OSError, match="disk unavailable"):
+        coordinator.commit()
+
+    assert publisher.current_record is None
+    assert int(writer.published_view.generation_id) == 0
+    assert int(writer.mutable_generation_id) == 1
+    assert not writer.has_pending_generation
+    assert writer.dirty_counts["nodes"] == 1
