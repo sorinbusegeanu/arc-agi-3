@@ -21,6 +21,7 @@ from v6.concept_validation_history import install_concept_validation_history
 from v6.higher_order_evidence_history import install_higher_order_evidence_history
 from v6.world_model_validation_history import install_world_model_validation_history
 from v6.cumulative_evidence_reporting import install_cumulative_evidence_reporting
+from v6.h05_temporal_order_compat import install_h05_temporal_order_compat
 
 install_hypothesis_suite_performance_policy()
 apply_hypothesis_suite_performance_compatibility()
@@ -42,5 +43,6 @@ install_concept_validation_history()
 install_higher_order_evidence_history()
 install_world_model_validation_history()
 install_cumulative_evidence_reporting()
+install_h05_temporal_order_compat()
 
 __all__ = ["V6Config", "V6System"]
