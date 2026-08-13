@@ -155,6 +155,25 @@ class EvidenceLifecycleStore:
             for memory_id, total, successes, avg_score in rows
         }
 
+    def contradiction_summary(self, memory_ids: Iterable[MemoryId]) -> dict[MemoryId, tuple[int, float]]:
+        ids = tuple(sorted(set(int(memory_id) for memory_id in memory_ids)))
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        rows = self.connection.execute(
+            f"""
+            SELECT memory_id, COUNT(*), MAX(severity)
+            FROM contradiction_records
+            WHERE memory_id IN ({placeholders})
+            GROUP BY memory_id
+            """,
+            ids,
+        ).fetchall()
+        return {
+            MemoryId(int(memory_id)): (int(total), float(max_severity or 0.0))
+            for memory_id, total, max_severity in rows
+        }
+
     def provenance_parents(self, memory_id: MemoryId) -> tuple[MemoryId, ...]:
         rows = self.connection.execute(
             """
