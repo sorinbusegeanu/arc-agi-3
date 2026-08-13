@@ -80,6 +80,48 @@ CREATE TABLE IF NOT EXISTS evidence_records (
 
 CREATE INDEX IF NOT EXISTS idx_evidence_memory_generation
 ON evidence_records(memory_id, generation_id);
+
+CREATE TABLE IF NOT EXISTS provenance_records (
+    provenance_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    memory_id INTEGER NOT NULL,
+    parent_memory_id INTEGER,
+    relation_type INTEGER NOT NULL DEFAULT 0,
+    source_game TEXT,
+    source_context TEXT,
+    source_global_step INTEGER,
+    generation_id INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_provenance_memory_generation
+ON provenance_records(memory_id, generation_id, parent_memory_id);
+
+CREATE TABLE IF NOT EXISTS transfer_trials (
+    transfer_trial_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    memory_id INTEGER NOT NULL,
+    source_game TEXT NOT NULL,
+    target_game TEXT NOT NULL,
+    success INTEGER NOT NULL CHECK(success IN (0, 1)),
+    score REAL NOT NULL DEFAULT 0,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    generation_id INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_transfer_memory_generation
+ON transfer_trials(memory_id, generation_id, target_game);
+
+CREATE TABLE IF NOT EXISTS contradiction_records (
+    contradiction_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    memory_id INTEGER NOT NULL,
+    severity REAL NOT NULL,
+    source_game TEXT,
+    source_context TEXT,
+    source_global_step INTEGER,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    generation_id INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_contradiction_memory_generation
+ON contradiction_records(memory_id, generation_id);
 """
 
 
