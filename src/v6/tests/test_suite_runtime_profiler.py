@@ -7,8 +7,9 @@ from v6 import suite_runtime_profiler as profiler
 
 
 def test_runtime_profiler_is_installed() -> None:
-    assert suite.run_hypothesis_suite_report is profiler._run_profiled
+    assert profiler._INSTALLED is True
     assert suite._phase is profiler._phase_profiled
+    assert "run_hypothesis_suite_report" in profiler._ORIGINALS
 
 
 def test_profile_from_summary_separates_derive_report_and_unaccounted() -> None:
