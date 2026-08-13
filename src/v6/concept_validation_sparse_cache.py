@@ -130,6 +130,12 @@ def _profiled_validate(*args: Any, **kwargs: Any):
     if fast._ACTIVE.get() is not None:
         return _ORIGINAL(*args, **kwargs)
 
+    config = kwargs.get("config")
+    if config is None and len(args) > 1:
+        config = args[1]
+    if config is not None and not bool(getattr(config, "enabled", False)):
+        return _ORIGINAL(*args, **kwargs)
+
     validate_roles_and_concepts = bool(kwargs.get("validate_roles_and_concepts", False))
     if not validate_roles_and_concepts:
         return _ORIGINAL(*args, **kwargs)
