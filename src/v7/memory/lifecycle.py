@@ -28,6 +28,7 @@ class LifecyclePolicy:
     replay_transfer_prior: float = 0.40
     replay_empirical_transfer: float = 0.50
     replay_explanatory_potential: float = 0.40
+    replay_contradiction_severity: float = 0.50
     replay_limit: int = 256
     significance_weight: float = 0.20
     prediction_error_weight: float = 0.25
@@ -59,6 +60,7 @@ class LifecycleDecision:
     previous_flags: int
     next_flags: int
     empirical_transfer: float = 0.0
+    contradiction_severity: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +106,7 @@ class MemoryLifecycleController:
     REPLAY_TRANSFER_PRIOR = 1 << 2
     REPLAY_EXPLANATORY = 1 << 3
     REPLAY_TRANSFER_EMPIRICAL = 1 << 4
+    REPLAY_CONTRADICTION = 1 << 5
 
     def __init__(self, policy: LifecyclePolicy | None = None) -> None:
         self.policy = policy or LifecyclePolicy()
@@ -124,27 +127,31 @@ class MemoryLifecycleController:
             + p.support_weight * support_term
         )
 
-    def _replay_reason(self, score: MemoryScore | None, empirical_transfer: float) -> tuple[int, float]:
-        score = score or MemoryScore(memory_id=MemoryId(1))
+    def _replay_reason(self, score: MemoryScore | None, empirical_transfer: float, contradiction_severity: float) -> tuple[int, float]:
         p = self.policy
         reason = 0
         priority = 0.0
-        if score.prediction_error >= p.replay_prediction_error:
-            reason |= self.REPLAY_PE
-            priority = max(priority, score.prediction_error)
-        if score.learning_value >= p.replay_learning_value:
-            reason |= self.REPLAY_LV
-            priority = max(priority, score.learning_value)
-        if score.transfer_prior >= p.replay_transfer_prior:
-            reason |= self.REPLAY_TRANSFER_PRIOR
-            priority = max(priority, score.transfer_prior)
+        if score is not None:
+            if score.prediction_error >= p.replay_prediction_error:
+                reason |= self.REPLAY_PE
+                priority = max(priority, score.prediction_error)
+            if score.learning_value >= p.replay_learning_value:
+                reason |= self.REPLAY_LV
+                priority = max(priority, score.learning_value)
+            if score.transfer_prior >= p.replay_transfer_prior:
+                reason |= self.REPLAY_TRANSFER_PRIOR
+                priority = max(priority, score.transfer_prior)
+            if score.explanatory_potential >= p.replay_explanatory_potential:
+                reason |= self.REPLAY_EXPLANATORY
+                priority = max(priority, score.explanatory_potential)
         empirical = min(1.0, max(0.0, float(empirical_transfer)))
         if empirical >= p.replay_empirical_transfer:
             reason |= self.REPLAY_TRANSFER_EMPIRICAL
             priority = max(priority, empirical)
-        if score.explanatory_potential >= p.replay_explanatory_potential:
-            reason |= self.REPLAY_EXPLANATORY
-            priority = max(priority, score.explanatory_potential)
+        contradiction = max(0.0, float(contradiction_severity))
+        if contradiction >= p.replay_contradiction_severity:
+            reason |= self.REPLAY_CONTRADICTION
+            priority = max(priority, contradiction)
         return reason, priority
 
     def evaluate(
@@ -153,9 +160,11 @@ class MemoryLifecycleController:
         memory_ids: Iterable[MemoryId] | None = None,
         *,
         empirical_transfer: Mapping[MemoryId, float] | None = None,
+        contradiction_severity: Mapping[MemoryId, float] | None = None,
     ) -> tuple[LifecycleDecision, ...]:
         ids = tuple(sorted(memory_ids if memory_ids is not None else view.nodes.keys(), key=int))
         transfer = empirical_transfer or {}
+        contradictions = contradiction_severity or {}
         decisions: list[LifecycleDecision] = []
         for memory_id in ids:
             node = view.nodes.get(memory_id)
@@ -163,10 +172,11 @@ class MemoryLifecycleController:
                 continue
             score = view.scores.get(memory_id)
             empirical = float(transfer.get(memory_id, 0.0))
+            contradiction = float(contradictions.get(memory_id, 0.0))
             fitness = self.fitness(node, score, empirical_transfer=empirical)
             promote = node.support_count >= self.policy.minimum_promotion_support and fitness >= self.policy.promote_threshold
             demote = not promote and fitness < self.policy.retain_threshold
-            replay_reason, replay_priority = self._replay_reason(score, empirical)
+            replay_reason, replay_priority = self._replay_reason(score, empirical, contradiction)
             replay = replay_reason != 0
             flags = int(node.status_flags) | int(MemoryStatus.ACTIVE)
             if promote:
@@ -178,7 +188,7 @@ class MemoryLifecycleController:
                 self.replay_queue.push(ReplayRequest(memory_id, replay_priority, replay_reason))
             else:
                 flags &= ~int(MemoryStatus.REPLAY_QUEUED)
-            decisions.append(LifecycleDecision(memory_id, fitness, promote, demote, replay, int(node.status_flags), flags, empirical))
+            decisions.append(LifecycleDecision(memory_id, fitness, promote, demote, replay, int(node.status_flags), flags, empirical, contradiction))
         return tuple(decisions)
 
     def apply(
@@ -188,8 +198,14 @@ class MemoryLifecycleController:
         writer: CanonicalMemoryWriter,
         memory_ids: Iterable[MemoryId] | None = None,
         empirical_transfer: Mapping[MemoryId, float] | None = None,
+        contradiction_severity: Mapping[MemoryId, float] | None = None,
     ) -> tuple[LifecycleDecision, ...]:
-        decisions = self.evaluate(view, memory_ids, empirical_transfer=empirical_transfer)
+        decisions = self.evaluate(
+            view,
+            memory_ids,
+            empirical_transfer=empirical_transfer,
+            contradiction_severity=contradiction_severity,
+        )
         mutations = []
         for decision in decisions:
             if decision.next_flags == decision.previous_flags:
