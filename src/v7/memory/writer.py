@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Iterable
 
+from v7.derivation.dependencies import DependencyMutation, DirtyDerivationPlan, MemoryDependencyGraph
 from v7.memory.delta import GenerationDelta
 from v7.memory.generation import GenerationId, GenerationState
 from v7.memory.ids import MemoryId
@@ -32,6 +33,7 @@ class CanonicalMemoryWriter:
         self._scores: dict[MemoryId, MemoryScore] = {}
         self._edge_support: dict[tuple[MemoryId, int, MemoryId], int] = {}
         self._cognition_indexes = CognitionIndexBuilder()
+        self._dependencies = MemoryDependencyGraph()
         self._dirty_nodes: set[MemoryId] = set()
         self._dirty_scores: set[MemoryId] = set()
         self._dirty_edges: set[tuple[MemoryId, int, MemoryId]] = set()
@@ -64,6 +66,7 @@ class CanonicalMemoryWriter:
             "nodes": len(self._dirty_nodes),
             "scores": len(self._dirty_scores),
             "edges": len(self._dirty_edges),
+            "derivation": self._dependencies.dirty_count,
         }
 
     def _ensure_mutable(self) -> None:
@@ -127,9 +130,24 @@ class CanonicalMemoryWriter:
                     support_count=support_count,
                 )
 
+        for memory_id, node in staged.items():
+            self._dependencies.register_node(memory_id, node.level)
         self._nodes.update(staged)
         self._dirty_nodes.update(staged)
+        if staged:
+            self._dependencies.mark_dirty(staged)
         return len(coalesced)
+
+    def apply_dependency_batch(self, mutations: Iterable[DependencyMutation]) -> int:
+        self._ensure_mutable()
+        return self._dependencies.apply_dependency_batch(mutations)
+
+    def dirty_derivation_plan(self) -> DirtyDerivationPlan:
+        return self._dependencies.snapshot_plan()
+
+    def consume_dirty_derivation_plan(self) -> DirtyDerivationPlan:
+        self._ensure_mutable()
+        return self._dependencies.consume_plan()
 
     def apply_edge_batch(self, mutations: Iterable[EdgeMutation]) -> int:
         self._ensure_mutable()
