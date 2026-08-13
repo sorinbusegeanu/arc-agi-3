@@ -42,7 +42,7 @@ class _FakeEngine:
         self.index = 0
         return self.rows[0]
 
-    def step(self, _action):
+    def step(self, _action, data=None):
         self.index = min(self.index + 1, len(self.rows) - 1)
         return self.rows[self.index]
 
@@ -65,6 +65,7 @@ class _FakeAdapter:
         self.last_outcome_state = "NOT_FINISHED"
         self.last_outcome_polarity = "neutral"
         self.last_levels_completed = 0
+        self.level_completed_event = False
         self.reset_count = 0
 
     def observe(self):
@@ -73,8 +74,12 @@ class _FakeAdapter:
     def available_actions(self):
         return [1, 2]
 
-    def step(self, action):
+    def action_data(self, _action, rng=None):
+        return {}
+
+    def step(self, action, data=None):
         self.grid = np.array([[int(action)]], dtype=np.int64)
+        self.level_completed_event = False
         return self.grid.copy()
 
 
@@ -87,4 +92,5 @@ def test_game_runner_ingests_transition_loop(tmp_path) -> None:
     assert result.steps == 4
     assert result.memories > 0
     assert result.generation >= 2
+    assert result.transfer_trials >= 0
     assert (tmp_path / "state.sqlite").exists()

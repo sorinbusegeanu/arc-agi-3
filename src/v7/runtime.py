@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from v7.derivation.online import OnlineDerivationStats, OnlineHierarchyBuilder
 from v7.derivation.pipeline import MemoryLearningPipeline
 from v7.derivation.scientific import EpisodeEvidence
 from v7.memory.coordinator import GenerationCommitCoordinator, GenerationCommitResult
@@ -20,14 +21,21 @@ from v7.memory.writer import CanonicalMemoryWriter
 class V7RuntimeConfig:
     root: Path
     restore: bool = True
+    derive_hierarchy: bool = True
 
     @classmethod
-    def from_path(cls, root: str | Path, *, restore: bool = True) -> "V7RuntimeConfig":
-        return cls(Path(root), restore)
+    def from_path(
+        cls,
+        root: str | Path,
+        *,
+        restore: bool = True,
+        derive_hierarchy: bool = True,
+    ) -> "V7RuntimeConfig":
+        return cls(Path(root), restore, derive_hierarchy)
 
 
 class V7Runtime:
-    """End-to-end v7 runtime with durable generations and lifecycle commits."""
+    """End-to-end v7 runtime with durable generations, derivation and lifecycle."""
 
     def __init__(self, config: V7RuntimeConfig) -> None:
         self.config = config
@@ -38,12 +46,21 @@ class V7Runtime:
         self.evidence = EvidenceStore(config.root / "evidence.sqlite")
         self.lifecycle_evidence = EvidenceLifecycleStore(config.root / "lifecycle.sqlite")
         self.pipeline = MemoryLearningPipeline(self.writer, self.lifecycle_evidence)
+        self.hierarchy = OnlineHierarchyBuilder(self.writer, self.pipeline)
+        self.last_derivation_stats = OnlineDerivationStats()
         self.transport = SegmentedMmapReadViewTransport(config.root / "segments")
         self.publisher = GenerationPublisher(self.transport)
         if int(self.writer.published_view.generation_id) > 0:
             self.publisher.ensure_published(self.writer.published_view)
-        self.coordinator = GenerationCommitCoordinator(writer=self.writer, durable_store=self.durable, publisher=self.publisher)
-        self.lifecycle = DevelopmentalLifecycleRuntime(evidence_lifecycle=self.lifecycle_evidence, evidence_store=self.evidence)
+        self.coordinator = GenerationCommitCoordinator(
+            writer=self.writer,
+            durable_store=self.durable,
+            publisher=self.publisher,
+        )
+        self.lifecycle = DevelopmentalLifecycleRuntime(
+            evidence_lifecycle=self.lifecycle_evidence,
+            evidence_store=self.evidence,
+        )
 
     def close(self) -> None:
         self.evidence.close()
@@ -55,14 +72,32 @@ class V7Runtime:
             self.writer.observe_global_step(evidence.source_global_step)
         return self.pipeline.observe_episode(evidence)
 
-    def commit(self, *, batch_id: int = 0, run_lifecycle: bool = True) -> GenerationCommitResult:
-        """Commit semantic changes, then durably commit lifecycle mutations if any."""
+    def commit(
+        self,
+        *,
+        batch_id: int = 0,
+        run_lifecycle: bool = True,
+        derive_hierarchy: bool | None = None,
+    ) -> GenerationCommitResult:
+        """Durably commit observations, hierarchy derivation and lifecycle mutations."""
         result = self.coordinator.commit(batch_id=batch_id)
+        next_batch = int(batch_id) + 1
+
+        should_derive = self.config.derive_hierarchy if derive_hierarchy is None else bool(derive_hierarchy)
+        if should_derive:
+            self.last_derivation_stats = self.hierarchy.derive()
+            if self.last_derivation_stats.total:
+                result = self.coordinator.commit(batch_id=next_batch)
+                next_batch += 1
+        else:
+            self.last_derivation_stats = OnlineDerivationStats()
+
         if run_lifecycle:
             self.lifecycle.run(result.view, writer=self.writer)
             dirty = self.writer.dirty_counts
             if dirty["nodes"] or dirty["scores"] or dirty["edges"] or dirty["cognition"]:
-                result = self.coordinator.commit(batch_id=batch_id + 1)
+                result = self.coordinator.commit(batch_id=next_batch)
+
         self.snapshots.persist(self.writer)
         return result
 
