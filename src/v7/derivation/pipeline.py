@@ -26,10 +26,11 @@ class MemoryLearningPipeline:
     def _record_parents(self, memory_id: MemoryId, parents: Iterable[MemoryId]) -> None:
         if self.evidence_lifecycle is None:
             return
+        existing = set(self.evidence_lifecycle.provenance_parents(memory_id))
         generation_id = int(self.writer.mutable_generation_id)
         rows = tuple(
             ProvenanceRecord(memory_id=memory_id, parent_memory_id=parent_id, generation_id=generation_id)
-            for parent_id in sorted(set(parents), key=int)
+            for parent_id in sorted(set(parents) - existing, key=int)
         )
         if rows:
             self.evidence_lifecycle.append_provenance(rows)
@@ -38,13 +39,23 @@ class MemoryLearningPipeline:
         candidate = ScientificDerivationKernels.m1_from_episode(evidence)
         memory_id = self.writer.apply_canonical_candidate_batch((candidate,))[candidate.key]
         self.writer.apply_contingency_index_batch((ContingencyIndexMutation(evidence.context_signature, evidence.action_id, memory_id),))
+        polarity = evidence.outcome_polarity
+        if polarity == "positive":
+            positive, negative, failure = 1, 0, 0
+        elif polarity == "negative":
+            positive, negative, failure = 0, 1, 1
+        elif polarity == "neutral":
+            positive, negative, failure = 0, 0, 0
+        else:
+            positive, negative, failure = (1, 0, 0) if evidence.success else (0, 1, 1)
         self.writer.apply_action_aggregate_batch((ActionAggregateDelta(
             action_id=evidence.action_id,
             future_option_sum_delta=evidence.future_option_delta,
             future_option_count_delta=1,
-            positive_count_delta=1 if evidence.success else 0,
-            negative_count_delta=0 if evidence.success else 1,
-            failure_count_delta=0 if evidence.success else 1,
+            positive_count_delta=positive,
+            negative_count_delta=negative,
+            failure_count_delta=failure,
+            contradiction_count_delta=1 if float(evidence.prediction_error) > 0.0 else 0,
         ),))
         if self.evidence_lifecycle is not None:
             self.evidence_lifecycle.append_provenance((ProvenanceRecord(
