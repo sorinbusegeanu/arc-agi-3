@@ -5,7 +5,14 @@ from types import SimpleNamespace
 import numpy as np
 
 from v7.environment.arc_adapter import ArcGridEnvironment
-from v7.environment.encoding import SupportedPredictionTracker, grid_signature, transition_signature
+from v7.environment.cognition import LocalCognitionOverlay
+from v7.environment.encoding import (
+    SupportedPredictionTracker,
+    grid_signature,
+    structural_grid_signature,
+    transformation_family_signature,
+    transition_signature,
+)
 from v7.environment.runner import ArcGameRunConfig, run_arc_game
 
 
@@ -17,6 +24,42 @@ def test_grid_and_transition_signatures_are_deterministic_and_sqlite_safe() -> N
     assert transition_signature(before, before) != transition_signature(before, after)
     assert 0 <= grid_signature(before) < 2**63
     assert 0 <= transition_signature(before, after) < 2**63
+
+
+def test_structural_context_and_transformation_family_generalize() -> None:
+    a = np.array([[0, 1, 0], [0, 0, 0]], dtype=np.int64)
+    b = np.array([[0, 7, 0], [0, 0, 0]], dtype=np.int64)
+    assert structural_grid_signature(a) == structural_grid_signature(b)
+
+    before_a = np.zeros((4, 4), dtype=np.int64)
+    after_a = before_a.copy()
+    before_a[0, 0] = 1
+    after_a[0, 0] = 0
+    after_a[0, 1] = 1
+    before_b = np.zeros((4, 4), dtype=np.int64)
+    after_b = before_b.copy()
+    before_b[2, 1] = 7
+    after_b[2, 1] = 0
+    after_b[2, 2] = 7
+    assert transformation_family_signature(before_a, after_a) == transformation_family_signature(before_b, after_b)
+
+
+def test_worker_local_overlay_learns_before_canonical_commit() -> None:
+    overlay = LocalCognitionOverlay(prediction_min_support=1)
+    context = overlay.build_context(structural_signature=10, exact_signature=20)
+    overlay.record_step(
+        contexts=context.signatures,
+        next_contexts=(),
+        action_id=1,
+        outcome_signature=100,
+        terminal_polarity=-1,
+        prediction_error=0.0,
+        future_option_delta=-2.0,
+        changed=False,
+    )
+    stats = overlay.stats_for(context.signatures[0], 1)
+    assert stats.failure_risk == 1.0
+    assert stats.no_change_ratio == 1.0
 
 
 def test_prediction_error_is_inactive_until_supported_expectation_exists() -> None:
