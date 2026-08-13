@@ -29,6 +29,14 @@ class MemoryScore:
 
 
 @dataclass(frozen=True, slots=True)
+class EdgeState:
+    source_id: MemoryId
+    relation_type: int
+    target_id: MemoryId
+    support_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class NodeMutation:
     memory_id: MemoryId
     level: MemoryLevel
