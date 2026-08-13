@@ -6,6 +6,7 @@ from v7.memory.arenas.mapped import MappedCompactMemoryArena
 from v7.memory.generation import GenerationId
 from v7.memory.ids import MemoryIdAllocator, MemoryLevel
 from v7.memory.indexes.cognition import ActionAggregate, CognitionIndexes
+from v7.memory.indexes.mapped import MappedPackedCognitionIndexes
 from v7.memory.models import MemoryNode, MemoryScore
 from v7.memory.read_view import MemoryReadView
 from v7.memory.transport.mmap_segments import SegmentedMmapReadViewTransport
@@ -44,6 +45,7 @@ def test_segmented_transport_attaches_direct_mmap_numeric_arena(tmp_path) -> Non
     attached = transport.attach(handle)
 
     assert isinstance(attached.compact_arena, MappedCompactMemoryArena)
+    assert isinstance(attached.packed_cognition, MappedPackedCognitionIndexes)
     assert isinstance(attached.compact_arena.nodes.memory_ids, memoryview)
     assert isinstance(attached.packed_cognition.contingencies.values, memoryview)
     assert attached.get_nodes([first_id, second_id]) == view.get_nodes([first_id, second_id])
@@ -89,7 +91,7 @@ def test_unchanged_numeric_segments_are_reused_between_generations(tmp_path) -> 
     handle2 = transport.publish(view2)
     m1 = json.loads((tmp_path / "generation-4.manifest").read_bytes())
     m2 = json.loads((tmp_path / "generation-5.manifest").read_bytes())
-    assert m1["nodes"]["file"] != m2["nodes"]["file"]  # updated_generation changed in this fixture
+    assert m1["nodes"]["file"] != m2["nodes"]["file"]
     assert m1["adjacency"]["file"] == m2["adjacency"]["file"]
     assert m1["cognition"]["file"] == m2["cognition"]["file"]
     assert m1["scores"]["file"] != m2["scores"]["file"]
