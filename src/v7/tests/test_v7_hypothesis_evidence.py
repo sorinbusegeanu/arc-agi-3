@@ -16,9 +16,9 @@ def test_transition_and_carrier_signatures_ignore_absolute_position() -> None:
     assert carrier_signature(before_a,after_a)==carrier_signature(before_b,after_b)
 
 
-def test_higher_order_canonical_keys_do_not_depend_on_support_population() -> None:
+def test_higher_order_canonical_keys_ignore_support_population_but_m3_keeps_context() -> None:
     m2a=ScientificDerivationKernels.m2_family(action_id=4,member_ids=(1,2),outcome_class=9); m2b=ScientificDerivationKernels.m2_family(action_id=4,member_ids=(1,2,3),outcome_class=9); assert m2a.key==m2b.key
-    m3a=ScientificDerivationKernels.m3_role(family_id=10,context_class=100,action_id=4,member_ids=(1,2)); m3b=ScientificDerivationKernels.m3_role(family_id=10,context_class=200,action_id=4,member_ids=(1,2,3)); assert m3a.key==m3b.key
+    m3a=ScientificDerivationKernels.m3_role(family_id=10,context_class=100,action_id=4,member_ids=(1,2)); m3b=ScientificDerivationKernels.m3_role(family_id=10,context_class=100,action_id=4,member_ids=(1,2,3)); m3c=ScientificDerivationKernels.m3_role(family_id=10,context_class=200,action_id=4,member_ids=(1,2,3)); assert m3a.key==m3b.key; assert m3a.key!=m3c.key
     m4a=ScientificDerivationKernels.m4_concept(role_ids=(11,12),relation_signature=99); m4b=ScientificDerivationKernels.m4_concept(role_ids=(11,12,13),relation_signature=99); assert m4a.key==m4b.key
 
 
