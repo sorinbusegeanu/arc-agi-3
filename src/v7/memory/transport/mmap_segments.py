@@ -9,12 +9,21 @@ from typing import Iterator, Mapping
 
 from v7.memory.arenas.mapped import MappedCompactMemoryArena, MappedNodeColumns, MappedPackedAdjacency, MappedScoreColumns
 from v7.memory.ids import MemoryId
-from v7.memory.indexes.cognition import ActionAggregate, CognitionIndexes
+from v7.memory.indexes.cognition import CognitionIndexes
+from v7.memory.indexes.packed import PackedActionAggregates, PackedCognitionIndexes, PackedPairIndex, PackedRoleExactIndex
 from v7.memory.models import MemoryNode, MemoryScore
 from v7.memory.read_view import MemoryReadView
 from v7.memory.transport.base import ReadViewHandle
 
-_FORMAT_VERSION = 1
+_FORMAT_VERSION = 2
+_ITEMSIZE = {"B": 1, "I": 4, "Q": 8, "q": 8, "d": 8}
+
+
+def _typecode(values: object) -> str:
+    code = getattr(values, "typecode", None) or getattr(values, "format", None)
+    if code not in _ITEMSIZE:
+        raise ValueError(f"unsupported numeric typecode: {code}")
+    return str(code)
 
 
 def _write_atomic(path: Path, payload: bytes) -> str:
@@ -34,29 +43,31 @@ def _segment_payload(*arrays) -> tuple[bytes, list[dict[str, int | str]]]:
     layout: list[dict[str, int | str]] = []
     for values in arrays:
         raw = values.tobytes()
-        layout.append({"offset": len(payload), "count": len(values), "typecode": values.typecode})
+        code = _typecode(values)
+        layout.append({"offset": len(payload), "count": len(values), "typecode": code})
         payload.extend(raw)
-    return bytes(payload), layout
+    return (bytes(payload) if payload else b"\0"), layout
 
 
 def _cast(mapped: mmap.mmap, spec: Mapping[str, int | str]) -> memoryview:
-    offset = int(spec["offset"])
-    count = int(spec["count"])
-    typecode = str(spec["typecode"])
-    itemsize = {"B": 1, "I": 4, "Q": 8, "q": 8, "d": 8}[typecode]
-    return memoryview(mapped)[offset : offset + count * itemsize].cast(typecode)
+    offset, count, typecode = int(spec["offset"]), int(spec["count"]), str(spec["typecode"])
+    return memoryview(mapped)[offset : offset + count * _ITEMSIZE[typecode]].cast(typecode).toreadonly()
+
+
+def _content_segment(directory: Path, kind: str, payload: bytes, layout: list[dict[str, int | str]]) -> dict[str, object]:
+    digest = hashlib.sha256(payload).hexdigest()
+    name = f"segment-{kind}-{digest[:24]}.bin"
+    _write_atomic(directory / name, payload)
+    return {"file": name, "digest": digest, "layout": layout}
 
 
 class _NodeMap(Mapping[MemoryId, MemoryNode]):
     def __init__(self, columns: MappedNodeColumns) -> None:
         self.columns = columns
-
     def __len__(self) -> int:
         return self.columns.count
-
     def __iter__(self) -> Iterator[MemoryId]:
         return (MemoryId(int(value)) for value in self.columns.memory_ids)
-
     def __getitem__(self, key: MemoryId) -> MemoryNode:
         value = self.columns.get(key)
         if value is None:
@@ -67,13 +78,10 @@ class _NodeMap(Mapping[MemoryId, MemoryNode]):
 class _ScoreMap(Mapping[MemoryId, MemoryScore]):
     def __init__(self, columns: MappedScoreColumns) -> None:
         self.columns = columns
-
     def __len__(self) -> int:
         return self.columns.count
-
     def __iter__(self) -> Iterator[MemoryId]:
         return (MemoryId(int(value)) for value in self.columns.memory_ids)
-
     def __getitem__(self, key: MemoryId) -> MemoryScore:
         value = self.columns.get(key)
         if value is None:
@@ -84,25 +92,19 @@ class _ScoreMap(Mapping[MemoryId, MemoryScore]):
 class _AdjacencyMap(Mapping[tuple[MemoryId, int], tuple[MemoryId, ...]]):
     def __init__(self, adjacency: MappedPackedAdjacency) -> None:
         self.adjacency = adjacency
-
     def __len__(self) -> int:
         return len(self.adjacency.source_ids)
-
     def __iter__(self) -> Iterator[tuple[MemoryId, int]]:
-        return (
-            (MemoryId(int(self.adjacency.source_ids[i])), int(self.adjacency.relation_types[i]))
-            for i in range(len(self.adjacency.source_ids))
-        )
-
+        return ((MemoryId(int(self.adjacency.source_ids[i])), int(self.adjacency.relation_types[i])) for i in range(len(self.adjacency.source_ids)))
     def __getitem__(self, key: tuple[MemoryId, int]) -> tuple[MemoryId, ...]:
-        for candidate in self:
-            if candidate == key:
-                return self.adjacency.neighbors(*key)
-        raise KeyError(key)
+        value = self.adjacency.neighbors(*key)
+        if not value and key not in tuple(self):
+            raise KeyError(key)
+        return value
 
 
 class SegmentedMmapReadViewTransport:
-    """Direct numeric mmap transport for node, score and packed-adjacency arenas."""
+    """Content-addressed low-copy mmap transport for numeric cognition generations."""
 
     def __init__(self, directory: str | Path) -> None:
         self.directory = Path(directory)
@@ -110,50 +112,43 @@ class SegmentedMmapReadViewTransport:
 
     def publish(self, view: MemoryReadView) -> ReadViewHandle:
         arena = view.compact_arena
-        node_payload, node_layout = _segment_payload(
-            arena.nodes.memory_ids, arena.nodes.levels, arena.nodes.type_ids,
-            arena.nodes.created_generations, arena.nodes.updated_generations,
-            arena.nodes.status_flags, arena.nodes.support_counts,
+        nodes_payload, nodes_layout = _segment_payload(arena.nodes.memory_ids, arena.nodes.levels, arena.nodes.type_ids, arena.nodes.created_generations, arena.nodes.updated_generations, arena.nodes.status_flags, arena.nodes.support_counts)
+        scores_payload, scores_layout = _segment_payload(arena.scores.memory_ids, arena.scores.significance, arena.scores.prediction_error, arena.scores.learning_value, arena.scores.transfer_prior, arena.scores.explanatory_potential, arena.scores.future_option_delta)
+        adj_payload, adj_layout = _segment_payload(arena.adjacency.source_ids, arena.adjacency.relation_types, arena.adjacency.offsets, arena.adjacency.lengths, arena.adjacency.targets)
+        packed = view.packed_cognition
+        cognition_arrays = (
+            packed.contingencies.key_a, packed.contingencies.key_b, packed.contingencies.offsets, packed.contingencies.lengths, packed.contingencies.values,
+            packed.roles_fallback.key_a, packed.roles_fallback.key_b, packed.roles_fallback.offsets, packed.roles_fallback.lengths, packed.roles_fallback.values,
+            packed.roles_exact.contexts, packed.roles_exact.actions, packed.roles_exact.families, packed.roles_exact.offsets, packed.roles_exact.lengths, packed.roles_exact.values,
+            packed.concepts_by_role.key_a, packed.concepts_by_role.key_b, packed.concepts_by_role.offsets, packed.concepts_by_role.lengths, packed.concepts_by_role.values,
+            packed.action_aggregates.action_ids, packed.action_aggregates.values,
         )
-        score_payload, score_layout = _segment_payload(
-            arena.scores.memory_ids, arena.scores.significance, arena.scores.prediction_error,
-            arena.scores.learning_value, arena.scores.transfer_prior,
-            arena.scores.explanatory_potential, arena.scores.future_option_delta,
-        )
-        adjacency_payload, adjacency_layout = _segment_payload(
-            arena.adjacency.source_ids, arena.adjacency.relation_types, arena.adjacency.offsets,
-            arena.adjacency.lengths, arena.adjacency.targets,
-        )
-        prefix = f"generation-{int(view.generation_id)}"
-        node_name, score_name, adjacency_name = f"{prefix}.nodes", f"{prefix}.scores", f"{prefix}.adj"
-        node_digest = _write_atomic(self.directory / node_name, node_payload)
-        score_digest = _write_atomic(self.directory / score_name, score_payload)
-        adjacency_digest = _write_atomic(self.directory / adjacency_name, adjacency_payload)
-        indexes = view.cognition_indexes
+        cognition_payload, cognition_layout = _segment_payload(*cognition_arrays)
         manifest = {
             "format_version": _FORMAT_VERSION,
             "generation_id": int(view.generation_id),
-            "nodes": {"file": node_name, "digest": node_digest, "layout": node_layout},
-            "scores": {"file": score_name, "digest": score_digest, "layout": score_layout},
-            "adjacency": {"file": adjacency_name, "digest": adjacency_digest, "layout": adjacency_layout},
-            "contingencies": [[c, a, [int(v) for v in values]] for (c, a), values in sorted(indexes.contingency_by_context_action.items())],
-            "roles_exact": [[c, a, int(f), [int(v) for v in values]] for (c, a, f), values in sorted(indexes.role_by_context_action_family.items(), key=lambda item: (item[0][0], item[0][1], int(item[0][2])))],
-            "roles_fallback": [[c, a, [int(v) for v in values]] for (c, a), values in sorted(indexes.role_by_context_action.items())],
-            "concepts": [[int(role), [int(v) for v in values]] for role, values in sorted(indexes.concepts_by_role.items(), key=lambda item: int(item[0]))],
-            "aggregates": [[a, x.future_option_sum, x.future_option_count, x.positive_count, x.negative_count, x.failure_count, x.contradiction_count] for a, x in sorted(indexes.action_aggregates.items())],
+            "nodes": _content_segment(self.directory, "nodes", nodes_payload, nodes_layout),
+            "scores": _content_segment(self.directory, "scores", scores_payload, scores_layout),
+            "adjacency": _content_segment(self.directory, "adj", adj_payload, adj_layout),
+            "cognition": _content_segment(self.directory, "cog", cognition_payload, cognition_layout),
         }
-        manifest_payload = json.dumps(manifest, separators=(",", ":"), sort_keys=True).encode()
-        manifest_name = f"{prefix}.manifest"
-        manifest_digest = _write_atomic(self.directory / manifest_name, manifest_payload)
-        return ReadViewHandle(view.generation_id, f"{manifest_name}:{manifest_digest}")
+        payload = json.dumps(manifest, separators=(",", ":"), sort_keys=True).encode()
+        manifest_name = f"generation-{int(view.generation_id)}.manifest"
+        digest = hashlib.sha256(payload).hexdigest()
+        path = self.directory / manifest_name
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        temporary.write_bytes(payload)
+        os.replace(temporary, path)
+        return ReadViewHandle(view.generation_id, f"{manifest_name}:{digest}")
 
     def _open_segment(self, spec: Mapping[str, object]) -> mmap.mmap:
         path = self.directory / str(spec["file"])
+        if not path.exists():
+            raise KeyError(str(spec["file"]))
         stream = path.open("rb")
         mapped = mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ)
         stream.close()
-        digest = hashlib.sha256(mapped[:]).hexdigest()
-        if digest != spec["digest"]:
+        if hashlib.sha256(mapped[:]).hexdigest() != spec["digest"]:
             mapped.close()
             raise ValueError("mmap numeric segment digest mismatch")
         return mapped
@@ -168,41 +163,53 @@ class SegmentedMmapReadViewTransport:
         raw = json.loads(payload)
         if raw["format_version"] != _FORMAT_VERSION or int(raw["generation_id"]) != int(handle.generation_id):
             raise ValueError("segmented mmap generation mismatch")
-        node_map = self._open_segment(raw["nodes"])
-        score_map = self._open_segment(raw["scores"])
-        adjacency_map = self._open_segment(raw["adjacency"])
+        node_map, score_map, adjacency_map, cognition_map = (self._open_segment(raw[key]) for key in ("nodes", "scores", "adjacency", "cognition"))
         n = [_cast(node_map, spec) for spec in raw["nodes"]["layout"]]
         s = [_cast(score_map, spec) for spec in raw["scores"]["layout"]]
         a = [_cast(adjacency_map, spec) for spec in raw["adjacency"]["layout"]]
-        arena = MappedCompactMemoryArena(
-            generation_id=handle.generation_id,
-            nodes=MappedNodeColumns(*n),
-            scores=MappedScoreColumns(*s),
-            adjacency=MappedPackedAdjacency(*a),
-            owners=(node_map, score_map, adjacency_map),
+        c = [_cast(cognition_map, spec) for spec in raw["cognition"]["layout"]]
+        arena = MappedCompactMemoryArena(handle.generation_id, MappedNodeColumns(*n), MappedScoreColumns(*s), MappedPackedAdjacency(*a), owners=(node_map, score_map, adjacency_map, cognition_map))
+        packed = PackedCognitionIndexes(
+            PackedPairIndex(*c[0:5]),
+            PackedPairIndex(*c[5:10]),
+            PackedRoleExactIndex(*c[10:16]),
+            PackedPairIndex(*c[16:21]),
+            PackedActionAggregates(*c[21:23]),
         )
-        indexes = CognitionIndexes.freeze(
-            contingency_by_context_action={(int(c), int(action)): tuple(MemoryId(v) for v in values) for c, action, values in raw["contingencies"]},
-            role_by_context_action_family={(int(c), int(action), MemoryId(f)): tuple(MemoryId(v) for v in values) for c, action, f, values in raw["roles_exact"]},
-            role_by_context_action={(int(c), int(action)): tuple(MemoryId(v) for v in values) for c, action, values in raw["roles_fallback"]},
-            concepts_by_role={MemoryId(role): tuple(MemoryId(v) for v in values) for role, values in raw["concepts"]},
-            action_aggregates={int(row[0]): ActionAggregate(*row[1:]) for row in raw["aggregates"]},
-        )
-        return MemoryReadView(
+        return MemoryReadView.from_compact_arena(
             generation_id=handle.generation_id,
             nodes=_NodeMap(arena.nodes),
             scores=_ScoreMap(arena.scores),
             adjacency=_AdjacencyMap(arena.adjacency),
-            cognition_indexes=indexes,
+            cognition_indexes=CognitionIndexes.empty(),
+            packed_cognition=packed,
             compact_arena=arena,  # type: ignore[arg-type]
         )
 
     def release(self, handle: ReadViewHandle) -> None:
         manifest_name = handle.transport_key.partition(":")[0]
-        manifest_path = self.directory / manifest_name
-        if not manifest_path.exists():
+        path = self.directory / manifest_name
+        if not path.exists():
             return
-        raw = json.loads(manifest_path.read_bytes())
-        for key in ("nodes", "scores", "adjacency"):
-            (self.directory / raw[key]["file"]).unlink(missing_ok=True)
-        manifest_path.unlink(missing_ok=True)
+        raw = json.loads(path.read_bytes())
+        segment_names = {str(raw[key]["file"]) for key in ("nodes", "scores", "adjacency", "cognition")}
+        path.unlink(missing_ok=True)
+        referenced: set[str] = set()
+        for other in self.directory.glob("generation-*.manifest"):
+            try:
+                other_raw = json.loads(other.read_bytes())
+                referenced.update(str(other_raw[key]["file"]) for key in ("nodes", "scores", "adjacency", "cognition"))
+            except (OSError, KeyError, ValueError, json.JSONDecodeError):
+                continue
+        for name in segment_names - referenced:
+            (self.directory / name).unlink(missing_ok=True)
+
+    @property
+    def retained_generations(self) -> tuple[int, ...]:
+        generations: list[int] = []
+        for path in self.directory.glob("generation-*.manifest"):
+            try:
+                generations.append(int(path.stem.split("-")[1]))
+            except (IndexError, ValueError):
+                continue
+        return tuple(sorted(generations))
