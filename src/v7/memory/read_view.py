@@ -56,11 +56,7 @@ class MemoryReadView:
             scores_dirty=scores_dirty,
             adjacency_dirty=adjacency_dirty,
         )
-        packed = (
-            previous_view.packed_cognition
-            if previous_view is not None and not cognition_dirty
-            else PackedCognitionIndexes.build(cognition)
-        )
+        packed = previous_view.packed_cognition if previous_view is not None and not cognition_dirty else PackedCognitionIndexes.build(cognition)
         return cls(generation_id, frozen_nodes, frozen_scores, frozen_adjacency, cognition, packed, arena)
 
     @classmethod
@@ -73,6 +69,7 @@ class MemoryReadView:
         adjacency: Mapping[EdgeKey, tuple[MemoryId, ...]],
         cognition_indexes: CognitionIndexes,
         compact_arena: CompactMemoryArena,
+        packed_cognition: PackedCognitionIndexes | None = None,
     ) -> "MemoryReadView":
         return cls(
             generation_id=generation_id,
@@ -80,7 +77,7 @@ class MemoryReadView:
             scores=scores,
             adjacency=adjacency,
             cognition_indexes=cognition_indexes,
-            packed_cognition=PackedCognitionIndexes.build(cognition_indexes),
+            packed_cognition=packed_cognition or PackedCognitionIndexes.build(cognition_indexes),
             compact_arena=compact_arena,
         )
 
@@ -102,10 +99,29 @@ class MemoryReadView:
         role_limit: int = 64,
         concept_limit: int = 128,
     ) -> tuple[ActionScoreInput, ...]:
-        return self.cognition_indexes.score_inputs(
-            context_signature=context_signature,
-            action_ids=action_ids,
-            family_ids_by_action=family_ids_by_action,
-            role_limit=role_limit,
-            concept_limit=concept_limit,
-        )
+        if role_limit < 0 or concept_limit < 0:
+            raise ValueError("limits must be non-negative")
+        family_ids_by_action = family_ids_by_action or {}
+        rows: list[ActionScoreInput] = []
+        packed = self.packed_cognition
+        for raw_action in action_ids:
+            action_id = int(raw_action)
+            contingencies = packed.contingencies.lookup(int(context_signature), action_id)
+            family_id = family_ids_by_action.get(action_id)
+            roles = () if family_id is None else packed.roles_exact.lookup(int(context_signature), action_id, family_id, role_limit)
+            if not roles:
+                roles = packed.roles_fallback.lookup(int(context_signature), action_id, role_limit)
+            concepts: list[MemoryId] = []
+            seen: set[MemoryId] = set()
+            for role_id in roles:
+                for concept_id in packed.concepts(role_id, concept_limit):
+                    if concept_id in seen:
+                        continue
+                    seen.add(concept_id)
+                    concepts.append(concept_id)
+                    if len(concepts) >= concept_limit:
+                        break
+                if len(concepts) >= concept_limit:
+                    break
+            rows.append(ActionScoreInput(action_id, contingencies, packed.action_aggregates.get(action_id), roles, tuple(concepts)))
+        return tuple(rows)
