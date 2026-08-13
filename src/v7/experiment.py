@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import time
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from time import perf_counter
 
+from v7.environment.online_sampling import sample_job as online_sample_job
 from v7.environment.parallel_sampling import ParallelSamplingPool, SamplingJob
 from v7.environment.runner import ArcGameRunResult
 from v7.game_sets import resolve_game_selector
@@ -36,11 +38,11 @@ class V7ExperimentConfig:
 
     def __post_init__(self) -> None:
         if not self.games:
-            raise ValueError('at least one game is required')
+            raise ValueError("at least one game is required")
         if self.steps_per_game < 1 or self.epochs < 1 or self.commit_every < 1:
-            raise ValueError('steps_per_game, epochs and commit_every must be positive')
+            raise ValueError("steps_per_game, epochs and commit_every must be positive")
         if self.workers <= 0 or self.derivation_workers <= 0 or self.report_workers <= 0:
-            raise ValueError('worker counts must be positive')
+            raise ValueError("worker counts must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,33 +63,67 @@ def _log(epoch: int, message: str) -> None:
     print(f'[{time.strftime("%H:%M")} E{epoch + 1:04d}] {message}', flush=True)
 
 
+def _representative(actions: list[int]) -> int | None:
+    if not actions:
+        return None
+    counts = Counter(int(value) for value in actions)
+    return min(counts.items(), key=lambda item: (-item[1], item[0]))[0]
+
+
 def _write_trajectory_evidence(runtime: V7Runtime, sampled) -> int:
+    """Reconstruct bounded successful/failed action sequences from step evidence."""
     generation_id = int(runtime.writer.mutable_generation_id)
-    records = []
+    records: list[EvidenceRecord] = []
     for batch in sampled:
-        for row in batch.trajectories:
+        actions: list[int] = []
+        contexts: list[int] = []
+        future_sum = 0.0
+        level_index = 0
+        for row in batch.evidence:
+            actions.append(int(row.action_id))
+            context_values = tuple(
+                int(value)
+                for value in getattr(row, "context_signatures", ()) or ()
+            )
+            contexts.append(
+                context_values[-2]
+                if len(context_values) >= 2
+                else int(row.context_signature)
+            )
+            future_sum += float(row.future_option_delta)
+            polarity = int(getattr(row, "terminal_polarity", 0) or 0)
+            if polarity == 0:
+                continue
+            level_key = f"level_{level_index:04d}"
             records.append(EvidenceRecord(
                 memory_id=None,
                 evidence_type=int(EvidenceType.TRAJECTORY),
                 generation_id=generation_id,
-                source_game=row.game_id,
-                source_context=row.level_key,
+                source_game=batch.game_id,
+                source_context=level_key,
                 source_global_step=row.source_global_step,
                 payload={
-                    'epoch': int(row.epoch),
-                    'level_key': row.level_key,
-                    'steps_to_success': int(row.steps_to_success),
-                    'future_option_sum': float(row.future_option_sum),
-                    'future_option_per_action': float(row.future_option_sum) / max(1, int(row.steps_to_success)),
-                    'representative_action': row.representative_action,
-                    'success': bool(row.success),
+                    "epoch": int(batch.epoch),
+                    "level_key": level_key,
+                    "steps_to_success": len(actions),
+                    "future_option_sum": future_sum,
+                    "future_option_per_action": future_sum / max(1, len(actions)),
+                    "representative_action": _representative(actions),
+                    "action_sequence": list(actions[:256]),
+                    "context_sequence": list(contexts[:256]),
+                    "success": polarity > 0,
                 },
             ))
+            if polarity > 0:
+                level_index += 1
+            actions.clear()
+            contexts.clear()
+            future_sum = 0.0
     return runtime.evidence.append_evidence_batch(records)
 
 
 def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7ExperimentResult:
-    """Run deterministic parallel sampling waves against immutable v7 generations."""
+    """Run parallel games with immutable shared memory and worker-local online learning."""
     root_path = Path(root)
     root_path.mkdir(parents=True, exist_ok=True)
     parallel_config = ParallelExecutionConfig(
@@ -101,9 +137,9 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
         per_worker_ramp_delay_seconds=config.per_worker_ramp_delay_seconds,
     )
     print(
-        f'v7 experiment: games={len(config.games)} epochs={config.epochs} steps/game={config.steps_per_game} '
-        f'workers={config.workers} initial_workers={parallel_config.resolved_initial_workers} '
-        f'derivation_workers={config.derivation_workers} report_workers={config.report_workers}',
+        f"v7 experiment: games={len(config.games)} epochs={config.epochs} steps/game={config.steps_per_game} "
+        f"workers={config.workers} initial_workers={parallel_config.resolved_initial_workers} "
+        f"derivation_workers={config.derivation_workers} report_workers={config.report_workers}",
         flush=True,
     )
     runtime = V7Runtime(V7RuntimeConfig.from_path(
@@ -118,13 +154,17 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
     final_memories = len(runtime.writer.published_view.nodes)
     metrics: dict[str, object] = {}
     try:
-        with ParallelSamplingPool(directory=root_path / 'segments', config=parallel_config) as sampling_pool:
+        with ParallelSamplingPool(
+            directory=root_path / "segments",
+            config=parallel_config,
+            worker_fn=online_sample_job,
+        ) as sampling_pool:
             for epoch in range(config.epochs):
                 epoch_started = perf_counter()
                 record = runtime.publisher.current_record
                 if record is None:
-                    raise RuntimeError('v7 runtime has no published generation')
-                _log(epoch, f'epoch starting generation={int(record.generation_id)} memories={final_memories}')
+                    raise RuntimeError("v7 runtime has no published generation")
+                _log(epoch, f"epoch starting generation={int(record.generation_id)} memories={final_memories}")
                 jobs: list[SamplingJob] = []
                 for game_index, game_id in enumerate(config.games):
                     ordinal = epoch * len(config.games) + game_index
@@ -144,9 +184,9 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
                 sampled = sampling_pool.run_wave(handle=record.handle, jobs=jobs)
                 _log(
                     epoch,
-                    f'sampling done jobs={len(sampled)} levels={sum(batch.levels_completed for batch in sampled)} '
-                    f'wins={sum(batch.wins for batch in sampled)} failures={sum(batch.failures for batch in sampled)} '
-                    f'seconds={perf_counter() - sampling_started:.2f}',
+                    f"sampling done jobs={len(sampled)} levels={sum(batch.levels_completed for batch in sampled)} "
+                    f"wins={sum(batch.wins for batch in sampled)} failures={sum(batch.failures for batch in sampled)} "
+                    f"seconds={perf_counter() - sampling_started:.2f}",
                 )
 
                 ingestion_phase_started = perf_counter()
@@ -176,7 +216,6 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
                     final_generation = int(committed.state.generation_id)
                     final_memories = len(committed.view.nodes)
                     commit_count += 1
-                    buffer.clear()
 
                 _write_trajectory_evidence(runtime, sampled)
                 finalize_started = perf_counter()
@@ -186,8 +225,8 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
                 final_memories = len(committed.view.nodes)
                 _log(
                     epoch,
-                    f'ingestion done commits={commit_count} generation={final_generation} memories={final_memories} '
-                    f'seconds={perf_counter() - ingestion_phase_started:.2f}',
+                    f"ingestion done commits={commit_count} generation={final_generation} memories={final_memories} "
+                    f"seconds={perf_counter() - ingestion_phase_started:.2f}",
                 )
 
                 for batch in sampled:
@@ -208,26 +247,28 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
                     output_root=root_path,
                     workers=config.report_workers,
                 )
-                summary = ' '.join(
+                summary = " ".join(
                     f'{hypothesis_id}={payload["final_decision"]}'
                     for hypothesis_id, payload in sorted(hypotheses.items())
                 )
-                _log(epoch, f'hypotheses {summary}')
+                _log(epoch, f"hypotheses {summary}")
                 _log(
                     epoch,
-                    f'epoch done generation={final_generation} memories={final_memories} '
-                    f'levels={sum(batch.levels_completed for batch in sampled)} wins={sum(batch.wins for batch in sampled)} '
-                    f'failures={sum(batch.failures for batch in sampled)} seconds={perf_counter() - epoch_started:.2f}',
+                    f"epoch done generation={final_generation} memories={final_memories} "
+                    f"levels={sum(batch.levels_completed for batch in sampled)} wins={sum(batch.wins for batch in sampled)} "
+                    f"failures={sum(batch.failures for batch in sampled)} seconds={perf_counter() - epoch_started:.2f}",
                 )
 
             metrics = sampling_pool.metrics.as_dict()
             metrics.update({
-                'derivation_workers': config.derivation_workers,
-                'report_workers': config.report_workers,
-                'nested_pool_oversubscription': False,
-                'generation_model': 'immutable_wave_single_writer',
+                "derivation_workers": config.derivation_workers,
+                "report_workers": config.report_workers,
+                "nested_pool_oversubscription": False,
+                "generation_model": "immutable_wave_single_writer_with_local_online_overlay",
             })
-            (root_path / 'parallel_runtime_metrics.json').write_text(json.dumps(metrics, indent=2, sort_keys=True), encoding='utf-8')
+            (root_path / "parallel_runtime_metrics.json").write_text(
+                json.dumps(metrics, indent=2, sort_keys=True), encoding="utf-8"
+            )
     finally:
         runtime.close()
 
@@ -243,11 +284,13 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
         runs=tuple(results),
         execution_metrics=metrics,
     )
-    (root_path / 'experiment_summary.json').write_text(json.dumps(asdict(summary), indent=2, sort_keys=True), encoding='utf-8')
+    (root_path / "experiment_summary.json").write_text(
+        json.dumps(asdict(summary), indent=2, sort_keys=True), encoding="utf-8"
+    )
     print(
-        f'v7 experiment complete: epochs={summary.epochs} games={summary.games} total_steps={summary.total_steps} '
-        f'generation={summary.final_generation} memories={summary.final_memories} '
-        f'levels={summary.levels_completed} wins={summary.wins} failures={summary.failures}',
+        f"v7 experiment complete: epochs={summary.epochs} games={summary.games} total_steps={summary.total_steps} "
+        f"generation={summary.final_generation} memories={summary.final_memories} "
+        f"levels={summary.levels_completed} wins={summary.wins} failures={summary.failures}",
         flush=True,
     )
     return summary
