@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import sqlite3
-
 from v7.memory.candidates.cpu import IndexedCpuCandidateProvider
 from v7.memory.durable_store import DurableGenerationStore
 from v7.memory.evidence_store import EvidenceRecord, EvidenceStore
@@ -36,22 +34,47 @@ def test_writer_coalesces_and_publishes_immutable_generation(tmp_path) -> None:
         ]
     )
     writer.observe_global_step(100)
-    state, view = writer.commit_generation()
+    state, view, delta = writer.commit_generation()
 
     assert int(state.generation_id) == 1
     assert view.nodes[source_id].support_count == 3
     assert view.scores[source_id].significance == 0.2
     assert view.scores[source_id].future_option_delta == 1.5
     assert view.neighbors([source_id], 7) == ((target_id,),)
+    assert delta.mutation_count == 4
     assert writer.dirty_counts == {"nodes": 0, "scores": 0, "edges": 0}
 
     durable = DurableGenerationStore(tmp_path / "state.sqlite")
     try:
-        durable.persist_generation(state, view, writer.edge_support_snapshot())
+        durable.persist_generation_delta(state, delta)
         row = durable.connection.execute(
             "SELECT committed FROM generations WHERE generation_id=1"
         ).fetchone()
         assert row == (1,)
+        assert durable.connection.execute("SELECT support_count FROM memory_nodes WHERE memory_id=?", (int(source_id),)).fetchone() == (3,)
+        assert durable.connection.execute("SELECT support_count FROM memory_edges").fetchone() == (4,)
+    finally:
+        durable.close()
+
+
+def test_second_generation_persists_only_dirty_delta(tmp_path) -> None:
+    memory_id = MemoryIdAllocator().allocate()
+    writer = CanonicalMemoryWriter()
+    writer.apply_mutation_batch([NodeMutation(memory_id, MemoryLevel.M1, 10, support_delta=1)])
+    state_1, _, delta_1 = writer.commit_generation()
+    state_2, _, delta_2 = writer.commit_generation()
+
+    assert delta_1.mutation_count == 1
+    assert delta_2.mutation_count == 0
+
+    durable = DurableGenerationStore(tmp_path / "state.sqlite")
+    try:
+        durable.persist_generation_delta(state_1, delta_1)
+        durable.persist_generation_delta(state_2, delta_2)
+        assert durable.connection.execute("SELECT COUNT(*) FROM memory_nodes").fetchone() == (1,)
+        assert durable.connection.execute(
+            "SELECT mutation_count FROM generation_batches WHERE generation_id=2"
+        ).fetchone() == (0,)
     finally:
         durable.close()
 
