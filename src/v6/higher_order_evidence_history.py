@@ -48,6 +48,7 @@ FUTURE_LINK_TABLES = {
         ("motif_signature", "event_id"),
     ),
 }
+WORLD_VALIDATION_HISTORY = "higher_order_world_model_validation_history"
 
 
 def _db(memory_dir: Path) -> Path:
@@ -104,36 +105,12 @@ def _archive_table(
     source_columns = _columns(conn, source)
     target_columns = set(_columns(conn, target))
     common = [name for name in source_columns if name in target_columns]
+    if not common:
+        return 0
     cols = ", ".join(f'"{name}"' for name in common)
     before = conn.total_changes
     verb = "INSERT OR IGNORE" if immutable else "INSERT OR REPLACE"
     conn.execute(f'{verb} INTO "{target}" ({cols}) SELECT {cols} FROM "{source}"')
-    return conn.total_changes - before
-
-
-def _restore_table(
-    conn: sqlite3.Connection,
-    source: str,
-    target: str,
-    keys: tuple[str, ...],
-    *,
-    replace: bool = False,
-) -> int:
-    if not _exists(conn, source) or not _exists(conn, target):
-        return 0
-    source_columns = _columns(conn, source)
-    target_columns = set(_columns(conn, target))
-    common = [name for name in source_columns if name in target_columns]
-    cols = ", ".join(f'"{name}"' for name in common)
-    before = conn.total_changes
-    if replace:
-        conn.execute(f'INSERT OR REPLACE INTO "{source}" ({cols}) SELECT {cols} FROM "{target}"')
-    else:
-        predicate = " AND ".join(f'current."{key}" IS history."{key}"' for key in keys)
-        conn.execute(
-            f'INSERT INTO "{source}" ({cols}) SELECT {cols} FROM "{target}" AS history '
-            f'WHERE NOT EXISTS (SELECT 1 FROM "{source}" AS current WHERE {predicate})'
-        )
     return conn.total_changes - before
 
 
@@ -144,22 +121,6 @@ def _archive_group(memory_dir: Path, tables: dict[str, tuple[str, tuple[str, ...
     with sqlite3.connect(path) as conn:
         for source, (target, keys) in tables.items():
             _archive_table(conn, source, target, keys)
-        conn.commit()
-
-
-def _restore_group(
-    memory_dir: Path,
-    tables: dict[str, tuple[str, tuple[str, ...]]],
-    *,
-    replace_entities: set[str] | None = None,
-) -> None:
-    path = _db(memory_dir)
-    if not path.exists():
-        return
-    replace_entities = replace_entities or set()
-    with sqlite3.connect(path) as conn:
-        for source, (target, keys) in tables.items():
-            _restore_table(conn, source, target, keys, replace=source in replace_entities)
         conn.commit()
 
 
@@ -216,30 +177,73 @@ def _archive_validation_tables(memory_dir: Path) -> None:
     validation_history.archive_validation_evidence(memory_dir)
 
 
-def _restore_validation_tables(memory_dir: Path) -> None:
+def archive_world_model_validation_evidence(
+    memory_dir: Path,
+    diagnostic_epoch_id: str | int | None,
+) -> int:
+    """Persist post-validation component observations without changing current state."""
     path = _db(memory_dir)
     if not path.exists():
-        return
+        return 0
     with sqlite3.connect(path) as conn:
-        for source, target, keys in (
-            ("role_transfer_attempts", validation_history.TRANSFER_HISTORY, ("attempt_id",)),
-            ("future_option_events", validation_history.FUTURE_HISTORY, ("event_id",)),
-        ):
-            if _exists(conn, source) and _exists(conn, target):
-                _restore_table(conn, source, target, keys)
-        if _exists(conn, "future_option_motifs") and _exists(conn, validation_history.MOTIF_HISTORY):
-            cols = _columns(conn, "future_option_motifs")
-            history_cols = set(_columns(conn, validation_history.MOTIF_HISTORY))
-            common = [name for name in cols if name in history_cols]
-            col_sql = ", ".join(f'"{name}"' for name in common)
+        if not _exists(conn, "world_model_components"):
+            return 0
+        if not _exists(conn, WORLD_VALIDATION_HISTORY):
             conn.execute(
-                f'INSERT OR REPLACE INTO future_option_motifs ({col_sql}) '
-                f'SELECT {col_sql} FROM ('
-                f'SELECT {col_sql}, ROW_NUMBER() OVER ('
-                f'PARTITION BY motif_signature ORDER BY COALESCE(last_seen_global_step,-1) DESC, rowid DESC'
-                f') AS rank FROM "{validation_history.MOTIF_HISTORY}") WHERE rank=1'
+                f'CREATE TABLE "{WORLD_VALIDATION_HISTORY}" AS '
+                'SELECT * FROM world_model_components WHERE 0'
             )
+            conn.execute(f'ALTER TABLE "{WORLD_VALIDATION_HISTORY}" ADD COLUMN diagnostic_epoch_id TEXT')
+            conn.execute(f'ALTER TABLE "{WORLD_VALIDATION_HISTORY}" ADD COLUMN state_historically_coherent INTEGER')
+            conn.execute(f'ALTER TABLE "{WORLD_VALIDATION_HISTORY}" ADD COLUMN state_currently_coherent INTEGER')
+            conn.execute(f'ALTER TABLE "{WORLD_VALIDATION_HISTORY}" ADD COLUMN state_validation_status TEXT')
+        else:
+            current_cols = conn.execute("PRAGMA table_info(world_model_components)").fetchall()
+            history_cols = set(_columns(conn, WORLD_VALIDATION_HISTORY))
+            for row in current_cols:
+                name = str(row[1])
+                if name in history_cols:
+                    continue
+                declared = str(row[2] or "").strip()
+                suffix = f" {declared}" if declared else ""
+                conn.execute(f'ALTER TABLE "{WORLD_VALIDATION_HISTORY}" ADD COLUMN "{name}"{suffix}')
+        conn.execute(
+            f'CREATE UNIQUE INDEX IF NOT EXISTS idx_world_model_validation_history_identity '
+            f'ON "{WORLD_VALIDATION_HISTORY}" (component_signature, diagnostic_epoch_id)'
+        )
+        component_cols = _columns(conn, "world_model_components")
+        history_cols = set(_columns(conn, WORLD_VALIDATION_HISTORY))
+        common = [name for name in component_cols if name in history_cols]
+        col_sql = ", ".join(f'"{name}"' for name in common)
+        max_step = conn.execute(
+            "SELECT MAX(COALESCE(last_seen_global_step, first_seen_global_step, -1)) FROM world_model_components"
+        ).fetchone()[0]
+        epoch_key = str(diagnostic_epoch_id) if diagnostic_epoch_id is not None else f"step:{int(max_step or -1)}"
+        state_exists = _exists(conn, "world_model_component_state")
+        if state_exists:
+            select_state = (
+                "COALESCE(s.historically_coherent,0), COALESCE(s.currently_coherent,0), "
+                "COALESCE(s.validation_status,'')"
+            )
+            join_state = (
+                " LEFT JOIN world_model_component_state AS s "
+                "ON s.component_signature=c.component_signature"
+            )
+        else:
+            select_state = "NULL, NULL, NULL"
+            join_state = ""
+        before = conn.total_changes
+        component_select = ", ".join(f'c."{name}"' for name in common)
+        conn.execute(
+            f'INSERT OR REPLACE INTO "{WORLD_VALIDATION_HISTORY}" '
+            f'({col_sql}, diagnostic_epoch_id, state_historically_coherent, '
+            f'state_currently_coherent, state_validation_status) '
+            f'SELECT {component_select}, ?, {select_state} '
+            f'FROM world_model_components AS c{join_state}',
+            (epoch_key,),
+        )
         conn.commit()
+        return conn.total_changes - before
 
 
 def _derive_role_candidates(*args: Any, **kwargs: Any):
@@ -251,32 +255,32 @@ def _derive_role_candidates(*args: Any, **kwargs: Any):
     _archive_group(memory_dir, {"future_option_transfer_links": FUTURE_LINK_TABLES["future_option_transfer_links"]})
     result = _ORIGINAL_ROLE_CANDIDATES(*args, **kwargs)
     _archive_group(memory_dir, ROLE_TABLES)
-    _restore_group(memory_dir, ROLE_TABLES, replace_entities={"role_neighborhood_signatures", "role_candidates"})
     if isinstance(result, dict):
         result = dict(result)
-        result["cumulative_role_candidate_count"] = _source_count(memory_dir, "role_candidates")
+        result["current_role_candidate_count"] = _source_count(memory_dir, "role_candidates")
+        result["cumulative_role_candidate_count"] = _history_count(memory_dir, ROLE_TABLES["role_candidates"][0])
         result["history_archive_boundary"] = "before_role_candidate_clear"
+        result["historical_rows_restored_into_current_state"] = False
     return result
 
 
 def _derive_role_transfers(*args: Any, **kwargs: Any):
     memory_dir = _memory_dir(args, kwargs)
     _archive_validation_tables(memory_dir)
-    historical = _history_count(memory_dir, validation_history.TRANSFER_HISTORY)
+    historical_before = _history_count(memory_dir, validation_history.TRANSFER_HISTORY)
     budget = int(kwargs.get("max_transfer_attempts", 0) or 0)
-    updated = dict(kwargs)
-    if budget > 0:
-        updated["max_transfer_attempts"] = historical + budget
-    result = _ORIGINAL_ROLE_TRANSFERS(*args, **updated)
+    result = _ORIGINAL_ROLE_TRANSFERS(*args, **kwargs)
     _archive_validation_tables(memory_dir)
-    _restore_validation_tables(memory_dir)
-    cumulative = _source_count(memory_dir, "role_transfer_attempts")
+    current = _source_count(memory_dir, "role_transfer_attempts")
+    cumulative = _history_count(memory_dir, validation_history.TRANSFER_HISTORY)
     extra = {
         "configured_transfer_attempt_budget": budget,
-        "historical_transfer_attempt_count_before": historical,
-        "new_transfer_attempt_count_this_derivation": max(0, cumulative - historical),
+        "historical_transfer_attempt_count_before": historical_before,
+        "current_transfer_attempt_count": current,
+        "new_transfer_attempt_count_this_derivation": max(0, cumulative - historical_before),
         "cumulative_transfer_attempt_count": cumulative,
-        "transfer_attempt_generation_window": int(updated.get("max_transfer_attempts", 0) or 0),
+        "transfer_attempt_generation_window": budget,
+        "historical_rows_restored_into_current_state": False,
     }
     if isinstance(result, dict):
         result = {**result, **extra}
@@ -290,10 +294,11 @@ def _derive_concepts(*args: Any, **kwargs: Any):
     _archive_group(memory_dir, WORLD_TABLES)
     result = _ORIGINAL_CONCEPTS(*args, **kwargs)
     _archive_group(memory_dir, CONCEPT_TABLES)
-    _restore_group(memory_dir, CONCEPT_TABLES, replace_entities={"concept_candidates"})
     if isinstance(result, dict):
         result = dict(result)
-        result["cumulative_concept_candidate_count"] = _source_count(memory_dir, "concept_candidates")
+        result["current_concept_candidate_count"] = _source_count(memory_dir, "concept_candidates")
+        result["cumulative_concept_candidate_count"] = _history_count(memory_dir, CONCEPT_TABLES["concept_candidates"][0])
+        result["historical_rows_restored_into_current_state"] = False
     return result
 
 
@@ -302,10 +307,11 @@ def _derive_world_models(*args: Any, **kwargs: Any):
     _archive_group(memory_dir, WORLD_TABLES)
     result = _ORIGINAL_WORLD_MODELS(*args, **kwargs)
     _archive_group(memory_dir, WORLD_TABLES)
-    _restore_group(memory_dir, WORLD_TABLES, replace_entities={"world_model_components"})
     if isinstance(result, dict):
         result = dict(result)
-        result["cumulative_world_model_component_count"] = _source_count(memory_dir, "world_model_components")
+        result["current_world_model_component_count"] = _source_count(memory_dir, "world_model_components")
+        result["cumulative_world_model_component_count"] = _history_count(memory_dir, WORLD_TABLES["world_model_components"][0])
+        result["historical_rows_restored_into_current_state"] = False
     return result
 
 
@@ -314,41 +320,30 @@ def _derive_future_options(*args: Any, **kwargs: Any):
     _archive_validation_tables(memory_dir)
     _archive_group(memory_dir, FUTURE_LINK_TABLES)
     historical_events = _history_count(memory_dir, validation_history.FUTURE_HISTORY)
-    historical_motifs = 0
-    path = _db(memory_dir)
-    if path.exists():
-        with sqlite3.connect(path) as conn:
-            if _exists(conn, validation_history.MOTIF_HISTORY):
-                historical_motifs = int(
-                    conn.execute(
-                        f'SELECT COUNT(DISTINCT motif_signature) FROM "{validation_history.MOTIF_HISTORY}"'
-                    ).fetchone()[0]
-                )
+    historical_motifs = _history_count(memory_dir, validation_history.MOTIF_HISTORY)
     event_budget = int(kwargs.get("max_events", 0) or 0)
     motif_budget = int(kwargs.get("max_motifs", 0) or 0)
-    updated = dict(kwargs)
-    if event_budget > 0:
-        updated["max_events"] = historical_events + event_budget
-    if motif_budget > 0:
-        updated["max_motifs"] = historical_motifs + motif_budget
-    result = _ORIGINAL_FUTURE_OPTIONS(*args, **updated)
+    result = _ORIGINAL_FUTURE_OPTIONS(*args, **kwargs)
     _archive_validation_tables(memory_dir)
     _archive_group(memory_dir, FUTURE_LINK_TABLES)
-    _restore_validation_tables(memory_dir)
-    _restore_group(memory_dir, FUTURE_LINK_TABLES)
-    cumulative_events = _source_count(memory_dir, "future_option_events")
-    cumulative_motifs = _source_count(memory_dir, "future_option_motifs")
+    current_events = _source_count(memory_dir, "future_option_events")
+    current_motifs = _source_count(memory_dir, "future_option_motifs")
+    cumulative_events = _history_count(memory_dir, validation_history.FUTURE_HISTORY)
+    cumulative_motifs = _history_count(memory_dir, validation_history.MOTIF_HISTORY)
     extra = {
         "configured_future_option_event_budget": event_budget,
         "configured_future_option_motif_budget": motif_budget,
         "historical_future_option_event_count_before": historical_events,
-        "historical_future_option_motif_count_before": historical_motifs,
+        "historical_future_option_motif_observation_count_before": historical_motifs,
+        "current_future_option_event_count": current_events,
+        "current_future_option_motif_count": current_motifs,
         "new_future_option_event_count_this_derivation": max(0, cumulative_events - historical_events),
-        "new_future_option_motif_count_this_derivation": max(0, cumulative_motifs - historical_motifs),
+        "new_future_option_motif_observation_count_this_derivation": max(0, cumulative_motifs - historical_motifs),
         "cumulative_future_option_event_count": cumulative_events,
-        "cumulative_future_option_motif_count": cumulative_motifs,
-        "future_option_event_generation_window": int(updated.get("max_events", 0) or 0),
-        "future_option_motif_generation_window": int(updated.get("max_motifs", 0) or 0),
+        "cumulative_future_option_motif_observation_count": cumulative_motifs,
+        "future_option_event_generation_window": event_budget,
+        "future_option_motif_generation_window": motif_budget,
+        "historical_rows_restored_into_current_state": False,
     }
     if isinstance(result, dict):
         result = {**result, **extra}
