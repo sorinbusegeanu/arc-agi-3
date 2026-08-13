@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from array import array
+import pytest
 
 from v7.memory.generation import GenerationId
 from v7.memory.ids import MemoryIdAllocator, MemoryLevel
@@ -37,14 +37,25 @@ def test_read_view_builds_numeric_columnar_arenas() -> None:
     arena = view.compact_arena
 
     assert arena.generation_id == GenerationId(2)
-    assert isinstance(arena.nodes.memory_ids, array)
-    assert isinstance(arena.scores.significance, array)
-    assert arena.nodes.memory_ids.typecode == "Q"
-    assert arena.nodes.levels.typecode == "B"
-    assert arena.scores.significance.typecode == "d"
+    assert isinstance(arena.nodes.memory_ids, memoryview)
+    assert isinstance(arena.scores.significance, memoryview)
+    assert arena.nodes.memory_ids.format == "Q"
+    assert arena.nodes.levels.format == "B"
+    assert arena.scores.significance.format == "d"
+    assert arena.nodes.memory_ids.readonly
+    assert arena.scores.significance.readonly
+    assert arena.adjacency.targets.readonly
     assert arena.nodes.count == 3
     assert arena.scores.count == 2
     assert arena.payload_bytes > 0
+
+
+def test_compact_numeric_buffers_reject_mutation() -> None:
+    view = _view()
+    with pytest.raises(TypeError):
+        view.compact_arena.nodes.memory_ids[0] = 999
+    with pytest.raises(TypeError):
+        view.compact_arena.adjacency.targets[0] = 999
 
 
 def test_columnar_node_and_score_lookup_preserves_semantics() -> None:
