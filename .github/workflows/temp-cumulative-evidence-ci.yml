@@ -1,0 +1,38 @@
+name: temp cumulative evidence ci
+
+on:
+  push:
+    branches: [fix-v6-cumulative-higher-order-evidence]
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test]"
+      - name: Compile touched modules
+        env:
+          PYTHONPATH: src
+        run: |
+          python -m py_compile src/v6/higher_order_evidence_history.py src/v6/concept_validation_profiler_wiring.py src/v6/__init__.py
+      - name: Run focused tests
+        env:
+          PYTHONPATH: src
+        run: |
+          pytest -q src/v6/tests/test_higher_order_evidence_history.py src/v6/tests/test_concept_validation_profiler_wiring.py src/v6/tests/test_concept_validation_history.py src/v6/tests/test_concept_validation_profiler_context_fix.py
+      - name: Run higher-order regression tests
+        env:
+          PYTHONPATH: src
+        run: pytest -q src/v6/tests/test_v6_higher_order.py
+      - name: Run full v6 tests
+        env:
+          PYTHONPATH: src
+        run: pytest -q src/v6/tests
