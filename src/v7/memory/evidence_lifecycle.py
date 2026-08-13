@@ -185,3 +185,50 @@ class EvidenceLifecycleStore:
             (int(memory_id),),
         ).fetchall()
         return tuple(MemoryId(int(row[0])) for row in rows)
+
+    def provenance_source_games(self, memory_id: MemoryId) -> tuple[str, ...]:
+        """Return source games reachable through structural provenance ancestry."""
+        rows = self.connection.execute(
+            """
+            WITH RECURSIVE ancestry(memory_id) AS (
+                SELECT ?
+                UNION
+                SELECT p.parent_memory_id
+                FROM provenance_records AS p
+                JOIN ancestry AS a ON p.memory_id = a.memory_id
+                WHERE p.parent_memory_id IS NOT NULL
+            )
+            SELECT DISTINCT p.source_game
+            FROM provenance_records AS p
+            JOIN ancestry AS a ON p.memory_id = a.memory_id
+            WHERE p.source_game IS NOT NULL AND p.source_game <> ''
+            ORDER BY p.source_game
+            """,
+            (int(memory_id),),
+        ).fetchall()
+        return tuple(str(row[0]) for row in rows)
+
+    def transfer_trial_exists(
+        self,
+        memory_id: MemoryId,
+        *,
+        target_game: str,
+        source_global_step: int | None,
+    ) -> bool:
+        """Prevent duplicate retrospective trials when a step is retried/resumed."""
+        rows = self.connection.execute(
+            """
+            SELECT payload_json
+            FROM transfer_trials
+            WHERE memory_id=? AND target_game=?
+            """,
+            (int(memory_id), str(target_game)),
+        ).fetchall()
+        for (payload_json,) in rows:
+            try:
+                payload = json.loads(payload_json)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if payload.get("source_global_step") == source_global_step:
+                return True
+        return False
