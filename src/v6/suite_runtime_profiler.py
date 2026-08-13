@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
 
 PROFILE_NAME = "hypothesis_suite_runtime_profile.json"
-PROFILER_VERSION = "suite_runtime_v2"
+PROFILER_VERSION = "suite_runtime_v3"
 _INSTALLED = False
 _TLS = threading.local()
 _ORIGINALS: dict[str, Any] = {}
@@ -68,7 +68,6 @@ def _profile_from_summary(summary: Mapping[str, Any]) -> dict[str, Any]:
         for key, value in dict(derivation.get("timings") or {}).items()
         if str(key).endswith("_seconds")
     }
-    # Legacy compatibility also mirrors DERIVE timings at the summary root.
     for key, value in summary.items():
         if str(key).startswith("DERIVE.") and str(key).endswith("_seconds"):
             try:
@@ -114,6 +113,15 @@ def _load_evaluator_profile(output_dir: Path) -> dict[str, Any]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _concept_validation_profile() -> dict[str, Any]:
+    try:
+        from v6.concept_validation_sparse_cache import get_last_concept_validation_profile
+        payload = get_last_concept_validation_profile()
+    except Exception:
         return {}
     return payload if isinstance(payload, dict) else {}
 
@@ -201,6 +209,7 @@ def _write_suite_summary_profiled(
     state = _state()
     timings = dict(state.get("timings") or {})
     evaluator_profile = _load_evaluator_profile(output_dir)
+    concept_profile = _concept_validation_profile()
     profile = {
         "profiler_version": PROFILER_VERSION,
         "epoch_id": summary.get("epoch_id"),
@@ -216,6 +225,7 @@ def _write_suite_summary_profiled(
         "database_sizes_bytes": _database_sizes(memory_dir),
         "phase_log": _phase_log_summary(output_dir),
         "evaluator_profile": evaluator_profile,
+        "concept_validation_fastpath_profile": concept_profile,
     }
     derive_steps = reported.get("derive_step_seconds") or {}
     if derive_steps:
@@ -239,6 +249,7 @@ def _write_suite_summary_profiled(
                 "report_seconds": reported.get("report_reported_seconds"),
                 "top_level_unaccounted_seconds": reported.get("top_level_unaccounted_seconds"),
                 "slowest_derive_step": profile.get("slowest_derive_step"),
+                "concept_validation_profile_available": bool(concept_profile),
                 **_resource_snapshot(),
             },
         )
