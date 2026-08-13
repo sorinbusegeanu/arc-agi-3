@@ -20,7 +20,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -e '.[test]'
       - name: Apply H06 scope fix
         run: python tools/temp_apply_h06_scope_fix.py
       - name: Compile
