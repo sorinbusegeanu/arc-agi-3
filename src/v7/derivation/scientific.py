@@ -13,7 +13,6 @@ TYPE_CONCEPT = 400
 TYPE_WORLD_MODEL = 500
 TYPE_STRATEGY = 600
 
-
 @dataclass(frozen=True, slots=True)
 class EpisodeEvidence:
     context_signature: int
@@ -25,29 +24,27 @@ class EpisodeEvidence:
     source_game: str | None = None
     source_context: str | None = None
     source_global_step: int | None = None
-
+    carrier_signature: int | None = None
+    decision_role_ids: tuple[int, ...] = ()
+    decision_concept_ids: tuple[int, ...] = ()
+    terminal_polarity: int = 0
+    raw_action_option_delta: float = 0.0
+    decision_score: float = 0.0
+    max_action_score: float = 0.0
+    memory_guided: bool = False
 
 class ScientificDerivationKernels:
-    """Deterministic clean-break M1-M6 semantic constructors."""
-
     @staticmethod
     def m1_from_episode(evidence: EpisodeEvidence) -> CanonicalCandidateMutation:
         key = CanonicalMemoryKey(MemoryLevel.M1, TYPE_CONTINGENCY, (int(evidence.context_signature), int(evidence.action_id), int(evidence.outcome_signature)))
-        return CanonicalCandidateMutation(
-            key=key,
-            support_delta=1,
-            significance=1.0 if evidence.success else 0.5,
-            prediction_error=max(0.0, float(evidence.prediction_error)),
-            learning_value=max(0.0, float(evidence.prediction_error)),
-            future_option_delta=float(evidence.future_option_delta),
-        )
+        return CanonicalCandidateMutation(key=key, support_delta=1, significance=1.0 if evidence.success else 0.5, prediction_error=max(0.0, float(evidence.prediction_error)), learning_value=max(0.0, float(evidence.prediction_error)), future_option_delta=float(evidence.future_option_delta))
 
     @staticmethod
     def m2_family(*, action_id: int, member_ids: Iterable[MemoryId], outcome_class: int) -> CanonicalCandidateMutation:
         members = tuple(sorted(set(member_ids), key=int))
         if not members:
             raise ValueError("M2 family requires at least one M1 member")
-        key = CanonicalMemoryKey(MemoryLevel.M2, TYPE_FAMILY, (int(action_id), int(outcome_class), *(int(v) for v in members)))
+        key = CanonicalMemoryKey(MemoryLevel.M2, TYPE_FAMILY, (int(action_id), int(outcome_class)))
         return CanonicalCandidateMutation(key=key, support_delta=len(members), parents=members, transfer_prior=min(1.0, len(members) / 4.0))
 
     @staticmethod
@@ -55,7 +52,7 @@ class ScientificDerivationKernels:
         members = tuple(sorted(set(member_ids), key=int))
         if not members:
             raise ValueError("M3 role requires supporting members")
-        key = CanonicalMemoryKey(MemoryLevel.M3, TYPE_ROLE, (int(family_id), int(context_class), int(action_id)))
+        key = CanonicalMemoryKey(MemoryLevel.M3, TYPE_ROLE, (int(family_id), int(action_id)))
         return CanonicalCandidateMutation(key=key, support_delta=len(members), parents=(family_id, *members), explanatory_potential=min(1.0, len(members) / 4.0))
 
     @staticmethod
@@ -63,7 +60,7 @@ class ScientificDerivationKernels:
         roles = tuple(sorted(set(role_ids), key=int))
         if len(roles) < 2:
             raise ValueError("M4 concept requires at least two roles")
-        key = CanonicalMemoryKey(MemoryLevel.M4, TYPE_CONCEPT, (int(relation_signature), *(int(v) for v in roles)))
+        key = CanonicalMemoryKey(MemoryLevel.M4, TYPE_CONCEPT, (int(relation_signature),))
         return CanonicalCandidateMutation(key=key, support_delta=len(roles), parents=roles, explanatory_potential=min(1.0, len(roles) / 3.0), transfer_prior=min(1.0, len(roles) / 5.0))
 
     @staticmethod
@@ -71,7 +68,7 @@ class ScientificDerivationKernels:
         concepts = tuple(sorted(set(concept_ids), key=int))
         if len(concepts) < 2:
             raise ValueError("M5 world model requires at least two concepts")
-        key = CanonicalMemoryKey(MemoryLevel.M5, TYPE_WORLD_MODEL, (int(transition_signature), *(int(v) for v in concepts)))
+        key = CanonicalMemoryKey(MemoryLevel.M5, TYPE_WORLD_MODEL, (int(transition_signature),))
         return CanonicalCandidateMutation(key=key, support_delta=len(concepts), parents=concepts, explanatory_potential=min(1.0, 0.25 * len(concepts)), transfer_prior=min(1.0, 0.20 * len(concepts)))
 
     @staticmethod
@@ -80,7 +77,7 @@ class ScientificDerivationKernels:
         if not models:
             raise ValueError("M6 strategy requires world-model support")
         gain = float(efficiency_gain)
-        key = CanonicalMemoryKey(MemoryLevel.M6, TYPE_STRATEGY, (int(action_signature), *(int(v) for v in models)))
+        key = CanonicalMemoryKey(MemoryLevel.M6, TYPE_STRATEGY, (int(action_signature), _support_signature(models)))
         return CanonicalCandidateMutation(key=key, support_delta=len(models), parents=models, significance=max(0.0, gain), learning_value=max(0.0, gain), future_option_delta=gain)
 
     @classmethod
@@ -96,3 +93,10 @@ class ScientificDerivationKernels:
         if level == MemoryLevel.M6:
             return cls.m6_strategy(world_model_ids=payload["world_model_ids"], action_signature=int(payload["action_signature"]), efficiency_gain=float(payload["efficiency_gain"]))
         raise ValueError("derive_level targets M2-M6")
+
+def _support_signature(memory_ids: tuple[MemoryId, ...]) -> int:
+    value = 1469598103934665603
+    for memory_id in memory_ids:
+        value ^= int(memory_id)
+        value = (value * 1099511628211) & ((1 << 63) - 1)
+    return value

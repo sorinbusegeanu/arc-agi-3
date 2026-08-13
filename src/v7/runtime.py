@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from v7.derivation.executor import ParallelDerivationConfig, ParallelDerivationExecutor
+from v7.derivation.online_runtime import OnlineDerivationStats, OnlineHierarchyBuilder
 from v7.derivation.pipeline import MemoryLearningPipeline
 from v7.derivation.scientific import EpisodeEvidence
 from v7.memory.coordinator import GenerationCommitCoordinator, GenerationCommitResult
@@ -24,23 +25,14 @@ class V7RuntimeConfig:
     derivation_workers: int = 4
     derivation_chunk_size: int = 256
     max_tasks_per_child: int | None = None
+    derive_hierarchy: bool = True
 
     @classmethod
-    def from_path(
-        cls,
-        root: str | Path,
-        *,
-        restore: bool = True,
-        derivation_workers: int = 4,
-        derivation_chunk_size: int = 256,
-        max_tasks_per_child: int | None = None,
-    ) -> 'V7RuntimeConfig':
-        return cls(Path(root), restore, derivation_workers, derivation_chunk_size, max_tasks_per_child)
+    def from_path(cls, root: str | Path, *, restore: bool = True, derivation_workers: int = 4, derivation_chunk_size: int = 256, max_tasks_per_child: int | None = None, derive_hierarchy: bool = True) -> 'V7RuntimeConfig':
+        return cls(Path(root), restore, derivation_workers, derivation_chunk_size, max_tasks_per_child, derive_hierarchy)
 
 
 class V7Runtime:
-    """End-to-end v7 runtime with durable generations and lifecycle commits."""
-
     def __init__(self, config: V7RuntimeConfig) -> None:
         self.config = config
         config.root.mkdir(parents=True, exist_ok=True)
@@ -49,21 +41,15 @@ class V7Runtime:
         self.writer = self.snapshots.restore() if config.restore else CanonicalMemoryWriter()
         self.evidence = EvidenceStore(config.root / 'evidence.sqlite')
         self.lifecycle_evidence = EvidenceLifecycleStore(config.root / 'lifecycle.sqlite')
-        self.pipeline = MemoryLearningPipeline(self.writer, self.lifecycle_evidence)
+        self.pipeline = MemoryLearningPipeline(self.writer, self.lifecycle_evidence, self.evidence)
+        self.hierarchy = OnlineHierarchyBuilder(self.writer, self.pipeline, self.evidence, self.lifecycle_evidence)
+        self.last_derivation_stats = OnlineDerivationStats()
         self.transport = SegmentedMmapReadViewTransport(config.root / 'segments')
         self.publisher = GenerationPublisher(self.transport)
-        # Generation zero is a valid immutable sampling baseline and must be attachable.
         self.publisher.ensure_published(self.writer.published_view)
         self.coordinator = GenerationCommitCoordinator(writer=self.writer, durable_store=self.durable, publisher=self.publisher)
         self.lifecycle = DevelopmentalLifecycleRuntime(evidence_lifecycle=self.lifecycle_evidence, evidence_store=self.evidence)
-        self.derivation_executor = ParallelDerivationExecutor(
-            directory=config.root / 'segments',
-            config=ParallelDerivationConfig(
-                workers=max(1, int(config.derivation_workers)),
-                max_tasks_per_child=config.max_tasks_per_child,
-                chunk_size=max(1, int(config.derivation_chunk_size)),
-            ),
-        )
+        self.derivation_executor = ParallelDerivationExecutor(directory=config.root / 'segments', config=ParallelDerivationConfig(workers=max(1, int(config.derivation_workers)), max_tasks_per_child=config.max_tasks_per_child, chunk_size=max(1, int(config.derivation_chunk_size))))
 
     def close(self) -> None:
         self.derivation_executor.close()
@@ -77,16 +63,29 @@ class V7Runtime:
         return self.pipeline.observe_episode(evidence)
 
     def observe_batch(self, rows) -> tuple:
-        """Canonical single-writer ingestion boundary for deterministic worker evidence batches."""
-        return tuple(self.observe(row) for row in rows)
+        batch = tuple(rows)
+        for evidence in batch:
+            if evidence.source_global_step is not None:
+                self.writer.observe_global_step(evidence.source_global_step)
+        return self.pipeline.observe_batch(batch)
 
-    def commit(self, *, batch_id: int = 0, run_lifecycle: bool = True) -> GenerationCommitResult:
+    def commit(self, *, batch_id: int = 0, run_lifecycle: bool = True, derive_hierarchy: bool | None = None) -> GenerationCommitResult:
         result = self.coordinator.commit(batch_id=batch_id)
+        next_batch = int(batch_id) + 1
+        should_derive = self.config.derive_hierarchy if derive_hierarchy is None else bool(derive_hierarchy)
+        if should_derive:
+            self.last_derivation_stats = self.hierarchy.derive()
+            dirty = self.writer.dirty_counts
+            if dirty['nodes'] or dirty['scores'] or dirty['edges'] or dirty['cognition']:
+                result = self.coordinator.commit(batch_id=next_batch)
+                next_batch += 1
+        else:
+            self.last_derivation_stats = OnlineDerivationStats()
         if run_lifecycle:
             self.lifecycle.run(result.view, writer=self.writer)
             dirty = self.writer.dirty_counts
             if dirty['nodes'] or dirty['scores'] or dirty['edges'] or dirty['cognition']:
-                result = self.coordinator.commit(batch_id=batch_id + 1)
+                result = self.coordinator.commit(batch_id=next_batch)
         self.snapshots.persist(self.writer)
         return result
 
@@ -97,7 +96,6 @@ class V7Runtime:
         return self.writer.consume_dirty_derivation_plan()
 
     def run_dirty_derivation(self, kernel):
-        """Execute current M2-M6 dirty ranges in the persistent derivation pool."""
         plan = self.consume_derivation_plan()
         record = self.publisher.current_record
         if record is None:

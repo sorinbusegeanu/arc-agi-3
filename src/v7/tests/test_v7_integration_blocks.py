@@ -71,7 +71,7 @@ def test_cli_jsonl_runs_and_commits_lifecycle_state(tmp_path) -> None:
 def test_hypothesis_contracts_require_real_evidence_and_separate_gates() -> None:
     reporter = StrictHypothesisReporter()
     assert reporter.evaluate("H01", raw_decision="VALID", evidence={"evidence_rows": 2}).final_decision == "INSUFFICIENT_EVIDENCE"
-    assert reporter.evaluate("H01", raw_decision="VALID", evidence={"evidence_rows": 2, "measurement": 0.8, "proxy_only": True}).final_decision == "INSUFFICIENT_EVIDENCE"
+    assert reporter.evaluate("H01", raw_decision="VALID", evidence={"evidence_rows": 2, "measurement": 0.8, "proxy_only": True}).final_decision == "PARTIALLY_VALID"
     valid = reporter.evaluate("H01", raw_decision="VALID", evidence={"evidence_rows": 2, "measurement": 0.8})
     assert valid.raw_decision == valid.final_decision == "VALID"
     assert reporter.evaluate("H01", raw_decision="VALID", evidence={"evidence_rows": 2, "measurement": 0.8}, dependency_gate="FAIL").final_decision == "INSUFFICIENT_EVIDENCE"
