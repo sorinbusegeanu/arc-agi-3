@@ -30,7 +30,7 @@ class ActionScoreBatch:
 
 
 class VectorizedActionScorer:
-    """O(actions) aggregate scorer over bounded cognition indexes."""
+    """Fully batched O(actions log A) scoring over packed action aggregates."""
 
     def __init__(self, weights: ActionScoringWeights | None = None) -> None:
         self.weights = weights or ActionScoringWeights()
@@ -40,27 +40,35 @@ class VectorizedActionScorer:
         if ids.size == 0:
             empty = np.asarray([], dtype=np.float64)
             return ActionScoreBatch(ids, empty, np.asarray([], dtype=np.int64))
+
+        packed_ids = np.asarray(indexes.action_aggregates.action_ids, dtype=np.int64)
         matrix = np.zeros((ids.size, 6), dtype=np.float64)
-        for row, action_id in enumerate(ids):
-            agg = indexes.action_aggregates.get(int(action_id))
-            matrix[row] = (
-                agg.future_option_mean,
-                agg.positive_count,
-                agg.negative_count,
-                agg.failure_count,
-                agg.contradiction_count,
-                agg.positive_count + agg.negative_count + agg.failure_count + agg.contradiction_count,
-            )
-        counts = matrix[:, 5].astype(np.int64)
-        denom = np.maximum(1.0, counts.astype(np.float64))
-        normalized = matrix[:, 1:5] / denom[:, None]
+        if packed_ids.size:
+            positions = np.searchsorted(packed_ids, ids)
+            present = positions < packed_ids.size
+            present_indices = np.flatnonzero(present)
+            if present_indices.size:
+                matched = packed_ids[positions[present_indices]] == ids[present_indices]
+                present_indices = present_indices[matched]
+            if present_indices.size:
+                positions = positions[present_indices]
+                values = np.asarray(indexes.action_aggregates.values, dtype=np.float64).reshape((-1, 6))
+                matrix[present_indices] = values[positions]
+
+        future_option_count = matrix[:, 1]
+        future_option_mean = np.divide(matrix[:, 0], future_option_count, out=np.zeros(ids.size, dtype=np.float64), where=future_option_count > 0)
+        evidence_counts = matrix[:, 2:6].sum(axis=1).astype(np.int64)
+        denom = np.maximum(1.0, evidence_counts.astype(np.float64))
+        normalized = matrix[:, 2:6] / denom[:, None]
         w = self.weights
         scores = (
-            w.future_option * matrix[:, 0]
+            w.future_option * future_option_mean
             + w.positive * normalized[:, 0]
             - w.negative * normalized[:, 1]
             - w.failure * normalized[:, 2]
             - w.contradiction * normalized[:, 3]
         )
-        ids.setflags(write=False); scores.setflags(write=False); counts.setflags(write=False)
-        return ActionScoreBatch(ids, scores, counts)
+        ids.setflags(write=False)
+        scores.setflags(write=False)
+        evidence_counts.setflags(write=False)
+        return ActionScoreBatch(ids, scores, evidence_counts)
