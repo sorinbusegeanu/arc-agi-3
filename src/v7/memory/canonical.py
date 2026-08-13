@@ -21,6 +21,19 @@ class CanonicalMemoryKey:
             raise ValueError("canonical key parts cannot be empty")
 
 
+@dataclass(frozen=True, slots=True)
+class CanonicalCandidateMutation:
+    key: CanonicalMemoryKey
+    support_delta: int = 1
+    parents: tuple[MemoryId, ...] = ()
+    significance: float | None = None
+    prediction_error: float | None = None
+    learning_value: float | None = None
+    transfer_prior: float | None = None
+    explanatory_potential: float | None = None
+    future_option_delta: float | None = None
+
+
 class CanonicalMemoryRegistry:
     """Single-writer deterministic key-to-MemoryId resolver."""
 
