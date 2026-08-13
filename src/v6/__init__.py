@@ -12,6 +12,7 @@ from v6.suite_runtime_profiler import install_suite_runtime_profiler
 from v6.concept_validation_fastpath import install_concept_validation_fastpath
 from v6.concept_validation_fastpath_compat import install_concept_validation_fastpath_compat
 from v6.concept_validation_fastpath_fixups import install_concept_validation_fastpath_fixups
+from v6.concept_validation_sparse_cache import install_concept_validation_sparse_cache
 
 install_hypothesis_suite_performance_policy()
 apply_hypothesis_suite_performance_compatibility()
@@ -24,5 +25,6 @@ install_suite_runtime_profiler()
 install_concept_validation_fastpath()
 install_concept_validation_fastpath_compat()
 install_concept_validation_fastpath_fixups()
+install_concept_validation_sparse_cache()
 
 __all__ = ["V6Config", "V6System"]
