@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from v7.memory.evidence_lifecycle import EvidenceLifecycleStore
 from v7.memory.evidence_store import EvidenceRecord, EvidenceStore
 from v7.memory.lifecycle import LifecycleDecision, MemoryLifecycleController
 from v7.memory.read_view import MemoryReadView
@@ -19,17 +20,31 @@ class LifecycleRunStats:
     demoted: int
     replay_queued: int
     evidence_records: int
+    transfer_signals: int
 
 
 class MemoryLifecycleRuntime:
     """Apply lifecycle decisions and append their historical evidence."""
 
-    def __init__(self, controller: MemoryLifecycleController | None = None, evidence_store: EvidenceStore | None = None) -> None:
+    def __init__(
+        self,
+        controller: MemoryLifecycleController | None = None,
+        evidence_store: EvidenceStore | None = None,
+        evidence_lifecycle: EvidenceLifecycleStore | None = None,
+    ) -> None:
         self.controller = controller or MemoryLifecycleController()
         self.evidence_store = evidence_store
+        self.evidence_lifecycle = evidence_lifecycle
 
     def run(self, view: MemoryReadView, *, writer: CanonicalMemoryWriter) -> tuple[tuple[LifecycleDecision, ...], LifecycleRunStats]:
-        decisions = self.controller.apply(view, writer=writer)
+        empirical_transfer = {}
+        if self.evidence_lifecycle is not None:
+            summary = self.evidence_lifecycle.transfer_summary(view.nodes.keys())
+            empirical_transfer = {
+                memory_id: successes / total if total > 0 else 0.0
+                for memory_id, (total, successes, _mean_score) in summary.items()
+            }
+        decisions = self.controller.apply(view, writer=writer, empirical_transfer=empirical_transfer)
         records: list[EvidenceRecord] = []
         generation_id = int(writer.mutable_generation_id)
         for decision in decisions:
@@ -37,6 +52,7 @@ class MemoryLifecycleRuntime:
                 "fitness": decision.fitness,
                 "previous_flags": decision.previous_flags,
                 "next_flags": decision.next_flags,
+                "empirical_transfer": decision.empirical_transfer,
             }
             if decision.promote:
                 records.append(EvidenceRecord(decision.memory_id, EVIDENCE_PROMOTION, generation_id, common))
@@ -51,5 +67,6 @@ class MemoryLifecycleRuntime:
             demoted=sum(1 for item in decisions if item.demote),
             replay_queued=sum(1 for item in decisions if item.replay),
             evidence_records=written,
+            transfer_signals=len(empirical_transfer),
         )
         return decisions, stats
