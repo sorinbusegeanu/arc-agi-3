@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-from collections import defaultdict
 from dataclasses import asdict
 from pathlib import Path
 
@@ -78,54 +77,13 @@ def _add_continuous_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def _format_experiment_summary(result: V7ExperimentResult, root: str | Path) -> str:
-    metrics = result.execution_metrics
-    lines = [
+    return '\n'.join([
         '',
         'V7 experiment complete',
         f'  epochs={result.epochs}  games={result.games}  steps={result.total_steps:,}',
         f'  levels_completed={result.levels_completed}  wins={result.wins}  failures={result.failures}',
         f'  generation={result.final_generation}  memories={result.final_memories:,}',
-    ]
-
-    sampling_seconds = float(metrics.get('sampling_wall_seconds', 0.0) or 0.0)
-    ingestion_seconds = float(metrics.get('canonical_ingestion_seconds', 0.0) or 0.0)
-    commit_seconds = float(metrics.get('generation_commit_seconds', 0.0) or 0.0)
-    steps_per_second = float(metrics.get('steps_per_second', 0.0) or 0.0)
-    peak_workers = int(metrics.get('peak_active_workers', 0) or 0)
-    configured_workers = int(metrics.get('configured_workers', 0) or 0)
-    lines.append(
-        '  performance: '
-        f'sampling={sampling_seconds:.2f}s ({steps_per_second:,.0f} steps/s), '
-        f'ingestion={ingestion_seconds:.2f}s, commit={commit_seconds:.2f}s, '
-        f'peak_workers={peak_workers}/{configured_workers}'
-    )
-
-    by_game: dict[str, dict[str, int]] = defaultdict(lambda: {'levels': 0, 'wins': 0, 'failures': 0})
-    for run in result.runs:
-        row = by_game[run.game_id]
-        row['levels'] += int(run.levels_completed)
-        row['wins'] += int(run.wins)
-        row['failures'] += int(run.failures)
-
-    progress = [
-        f"{game}: {row['levels']} levels, {row['wins']} wins"
-        for game, row in sorted(by_game.items())
-        if row['levels'] or row['wins']
-    ]
-    if progress:
-        lines.append('  progress: ' + '; '.join(progress))
-
-    failures = [
-        f"{game}: {row['failures']}"
-        for game, row in sorted(by_game.items(), key=lambda item: (-item[1]['failures'], item[0]))
-        if row['failures']
-    ]
-    if failures:
-        lines.append('  failures by game: ' + ', '.join(failures))
-
-    lines.append(f'  detailed results: {Path(root) / "experiment_summary.json"}')
-    lines.append(f'  runtime metrics: {Path(root) / "parallel_runtime_metrics.json"}')
-    return '\n'.join(lines)
+    ])
 
 
 def _run_experiment_args(args, *, continuous: bool = False) -> int:
