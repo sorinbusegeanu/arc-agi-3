@@ -55,7 +55,7 @@ class GenerationCommitCoordinator:
             self._writer.abort_generation()
             raise
 
-        publication = self._publisher.publish(view)
+        publication = self._publisher.ensure_published(view)
         self._writer.finalize_generation()
         return GenerationCommitResult(
             state=state,
