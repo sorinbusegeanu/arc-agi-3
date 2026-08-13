@@ -4,7 +4,14 @@ from collections import defaultdict
 from dataclasses import dataclass
 
 from v7.derivation.pipeline import MemoryLearningPipeline
-from v7.derivation.scientific import TYPE_CONCEPT, TYPE_CONTINGENCY, TYPE_FAMILY, TYPE_ROLE, TYPE_WORLD_MODEL
+from v7.derivation.scientific import (
+    TYPE_CONCEPT,
+    TYPE_CONTINGENCY,
+    TYPE_FAMILY,
+    TYPE_ROLE,
+    TYPE_WORLD_MODEL,
+    ScientificDerivationKernels,
+)
 from v7.memory.concept_validation import ConceptValidationStatus
 from v7.memory.ids import MemoryId, MemoryLevel
 from v7.memory.writer import CanonicalMemoryWriter
@@ -28,9 +35,10 @@ class OnlineDerivationStats:
 class OnlineHierarchyBuilder:
     """Bounded deterministic structural derivation for live v7 experiments.
 
-    This builder does not invent perceptual objects. It promotes recurring canonical
-    interaction structure already present in the memory graph. Empirical transfer is
-    still required separately before an M4 candidate is treated as validated.
+    The builder creates only structures supported by already-observed canonical
+    interaction memories. Existing canonical structures are reused without adding
+    support again, so an empty derivation pass is idempotent. M5 formation requires
+    empirically validated M4 concepts.
     """
 
     def __init__(self, writer: CanonicalMemoryWriter, pipeline: MemoryLearningPipeline) -> None:
@@ -44,7 +52,6 @@ class OnlineHierarchyBuilder:
 
         families = roles = concepts = world_models = strategies = 0
 
-        # M1 -> M2: recurrence across distinct contexts for the same action/outcome.
         grouped_m1: dict[tuple[int, int], list[MemoryId]] = defaultdict(list)
         for memory_id, node in sorted(nodes.items(), key=lambda item: int(item[0])):
             if node.level != MemoryLevel.M1 or node.type_id != TYPE_CONTINGENCY:
@@ -60,12 +67,21 @@ class OnlineHierarchyBuilder:
             members = tuple(sorted(set(member_ids), key=int))
             if len(members) < 2:
                 continue
-            before = len(nodes)
-            family_id = self.pipeline.derive_m2(action_id=action_id, member_ids=members, outcome_class=outcome_signature)
+            candidate = ScientificDerivationKernels.m2_family(
+                action_id=action_id,
+                member_ids=members,
+                outcome_class=outcome_signature,
+            )
+            family_id = self.writer.canonical_memory_id(candidate.key)
+            if family_id is None:
+                family_id = self.pipeline.derive_m2(
+                    action_id=action_id,
+                    member_ids=members,
+                    outcome_class=outcome_signature,
+                )
+                families += 1
             family_members[family_id] = members
-            families += int(len(nodes) > before)
 
-        # Include existing families so later levels keep progressing after restart.
         for memory_id, node in sorted(nodes.items(), key=lambda item: int(item[0])):
             if node.level != MemoryLevel.M2 or node.type_id != TYPE_FAMILY or memory_id in family_members:
                 continue
@@ -74,7 +90,6 @@ class OnlineHierarchyBuilder:
                 continue
             family_members[memory_id] = tuple(MemoryId(int(value)) for value in key.parts[2:])
 
-        # M2 -> M3: one role position per distinct context participating in a family.
         roles_by_family: dict[MemoryId, list[MemoryId]] = defaultdict(list)
         for family_id, members in sorted(family_members.items(), key=lambda item: int(item[0])):
             family_key = registry.key_for(family_id)
@@ -87,17 +102,24 @@ class OnlineHierarchyBuilder:
                 if member_key is not None and len(member_key.parts) >= 3:
                     by_context[int(member_key.parts[0])].append(member_id)
             for context, context_members in sorted(by_context.items()):
-                before = len(nodes)
-                role_id = self.pipeline.derive_m3(
+                unique_members = tuple(sorted(set(context_members), key=int))
+                candidate = ScientificDerivationKernels.m3_role(
                     family_id=family_id,
                     context_class=context,
                     action_id=action_id,
-                    member_ids=tuple(sorted(set(context_members), key=int)),
+                    member_ids=unique_members,
                 )
+                role_id = self.writer.canonical_memory_id(candidate.key)
+                if role_id is None:
+                    role_id = self.pipeline.derive_m3(
+                        family_id=family_id,
+                        context_class=context,
+                        action_id=action_id,
+                        member_ids=unique_members,
+                    )
+                    roles += 1
                 roles_by_family[family_id].append(role_id)
-                roles += int(len(nodes) > before)
 
-        # Include pre-existing roles.
         for memory_id, node in sorted(nodes.items(), key=lambda item: int(item[0])):
             if node.level != MemoryLevel.M3 or node.type_id != TYPE_ROLE:
                 continue
@@ -105,17 +127,19 @@ class OnlineHierarchyBuilder:
             if key is not None and key.parts:
                 roles_by_family[MemoryId(int(key.parts[0]))].append(memory_id)
 
-        # M3 -> M4: recurring family roles across at least two contexts form a concept candidate.
         for family_id, role_ids in sorted(roles_by_family.items(), key=lambda item: int(item[0])):
             unique_roles = tuple(sorted(set(role_ids), key=int))
             if len(unique_roles) < 2:
                 continue
             relation_signature = _mix_signature(int(family_id), len(unique_roles))
-            before = len(nodes)
-            self.pipeline.derive_m4(role_ids=unique_roles, relation_signature=relation_signature)
-            concepts += int(len(nodes) > before)
+            candidate = ScientificDerivationKernels.m4_concept(
+                role_ids=unique_roles,
+                relation_signature=relation_signature,
+            )
+            if self.writer.canonical_memory_id(candidate.key) is None:
+                self.pipeline.derive_m4(role_ids=unique_roles, relation_signature=relation_signature)
+                concepts += 1
 
-        # M4 -> M5 only after empirical transfer validation.
         validated_concepts = tuple(
             sorted(
                 (
@@ -130,14 +154,24 @@ class OnlineHierarchyBuilder:
         )
         if len(validated_concepts) >= 2:
             transition_signature = _fold_signature(validated_concepts)
-            before = len(nodes)
-            self.pipeline.derive_m5(concept_ids=validated_concepts, transition_signature=transition_signature)
-            world_models += int(len(nodes) > before)
+            candidate = ScientificDerivationKernels.m5_world_model(
+                concept_ids=validated_concepts,
+                transition_signature=transition_signature,
+            )
+            if self.writer.canonical_memory_id(candidate.key) is None:
+                self.pipeline.derive_m5(
+                    concept_ids=validated_concepts,
+                    transition_signature=transition_signature,
+                )
+                world_models += 1
 
-        # M5 -> M6 after a positive observed future-option gain for an action.
         model_ids = tuple(
             sorted(
-                (memory_id for memory_id, node in nodes.items() if node.level == MemoryLevel.M5 and node.type_id == TYPE_WORLD_MODEL),
+                (
+                    memory_id
+                    for memory_id, node in nodes.items()
+                    if node.level == MemoryLevel.M5 and node.type_id == TYPE_WORLD_MODEL
+                ),
                 key=int,
             )
         )
@@ -146,13 +180,18 @@ class OnlineHierarchyBuilder:
             for action_id, aggregate in sorted(aggregates.items()):
                 if aggregate.future_option_count <= 0 or aggregate.future_option_mean <= 0:
                     continue
-                before = len(nodes)
-                self.pipeline.derive_m6(
+                candidate = ScientificDerivationKernels.m6_strategy(
                     world_model_ids=model_ids,
                     action_signature=int(action_id),
                     efficiency_gain=float(aggregate.future_option_mean),
                 )
-                strategies += int(len(nodes) > before)
+                if self.writer.canonical_memory_id(candidate.key) is None:
+                    self.pipeline.derive_m6(
+                        world_model_ids=model_ids,
+                        action_signature=int(action_id),
+                        efficiency_gain=float(aggregate.future_option_mean),
+                    )
+                    strategies += 1
 
         return OnlineDerivationStats(families, roles, concepts, world_models, strategies)
 
