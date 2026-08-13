@@ -1,0 +1,45 @@
+name: temp-h06-scope-fix
+
+on:
+  push:
+    branches: [fix-h06-transfer-scope-classification]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch-test-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix-h06-transfer-scope-classification
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Apply H06 scope fix
+        run: python tools/temp_apply_h06_scope_fix.py
+      - name: Compile
+        run: python -m py_compile src/v6/higher_order_substrate.py src/v6/tests/test_v6_higher_order.py
+      - name: Focused H06 scope regressions
+        run: PYTHONPATH=src pytest -q src/v6/tests/test_v6_higher_order.py -k 'cross_context_expansion_binds_source_and_target_to_same_real_game or cross_context_persistence_rejects_distinct_real_games or h06'
+      - name: Higher-order suite
+        run: PYTHONPATH=src pytest -q src/v6/tests/test_v6_higher_order.py
+      - name: Full v6 suite
+        run: PYTHONPATH=src pytest -q src/v6/tests
+      - name: Commit tested source changes
+        if: success()
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/v6/higher_order_substrate.py src/v6/tests/test_v6_higher_order.py
+          if git diff --cached --quiet; then
+            echo 'No source changes to commit'
+          else
+            git commit -m 'Fix H06 transfer scope classification'
+            git push origin HEAD:fix-h06-transfer-scope-classification
+          fi
