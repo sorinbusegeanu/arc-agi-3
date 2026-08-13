@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import sqlite3
+from collections import defaultdict
 
 from v6 import concept_validation_fastpath as fast
+from v6 import concept_validation_fastpath_compat as compat
 from v6 import higher_order_substrate as substrate
 from v6 import hypothesis_suite_report as suite
 
@@ -26,19 +28,21 @@ def _prediction_db() -> sqlite3.Connection:
     return conn
 
 
-def test_fastpath_is_installed() -> None:
+def test_fastpath_is_installed_without_overriding_canonical_prediction_semantics() -> None:
     assert fast._INSTALLED is True
-    assert substrate._prediction_explanation_events is fast._prediction_explanation_events
-    assert substrate._contradiction_resolution_explanation_events is fast._contradiction_resolution_explanation_events
-    assert substrate.validate_incremental_promotions_only is fast._validate_incremental_promotions_only
-    assert suite.validate_incremental_promotions_only is fast._validate_incremental_promotions_only
+    assert compat._INSTALLED is True
+    assert substrate._transfer_explanation_events is compat._safe_transfer
+    assert substrate._future_option_motif_explanation_events is compat._future_option_motif_explanation_events
+    assert substrate.validate_incremental_promotions_only is compat._validate
+    assert suite.validate_incremental_promotions_only is compat._validate
+    assert substrate._prediction_explanation_events is not fast._prediction_explanation_events
 
 
 def test_prediction_row_index_is_built_once_per_validation_context() -> None:
     conn = _prediction_db()
     ctx = {
         "cache": {}, "role_score_cache": {}, "timings": {}, "call_counts": {},
-        "event_counts": __import__("collections").defaultdict(int), "index_stats": {},
+        "event_counts": defaultdict(int), "index_stats": {},
     }
     token = fast._ACTIVE.set(ctx)
     try:
@@ -76,3 +80,18 @@ def test_transfer_step_index_uses_strictly_later_rows() -> None:
     start = bisect_right(steps, 20)
     assert [row["attempt_id"] for row in ordered[start:]] == ["c"]
     conn.close()
+
+
+def test_disabled_validation_delegates_without_fastpath_side_effects(tmp_path, monkeypatch) -> None:
+    class Config:
+        enabled = False
+
+    called = []
+    monkeypatch.setitem(
+        fast._ORIGINALS,
+        "validate_incremental_promotions_only",
+        lambda *args, **kwargs: called.append((args, kwargs)) or {"enabled": False},
+    )
+    result = compat._validate(memory_dir=tmp_path, config=Config(), validate_roles_and_concepts=True)
+    assert result == {"enabled": False}
+    assert len(called) == 1
