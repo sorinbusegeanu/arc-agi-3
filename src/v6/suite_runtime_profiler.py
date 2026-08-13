@@ -19,8 +19,6 @@ _ORIGINALS: dict[str, Any] = {}
 def _resource_snapshot() -> dict[str, float]:
     usage = resource.getrusage(resource.RUSAGE_SELF)
     rss = float(usage.ru_maxrss)
-    # Linux reports KiB; macOS reports bytes. ARC runtime is Linux, but keep the
-    # conversion conservative for local development on Darwin.
     rss_mb = rss / (1024.0 * 1024.0) if rss > 10_000_000 else rss / 1024.0
     return {
         "process_cpu_seconds": float(usage.ru_utime + usage.ru_stime),
@@ -108,19 +106,14 @@ def _heartbeat(output_dir: Path, phase: str, epoch_id: str | None, started: floa
     interval = max(5.0, float(os.getenv("ARC_HYPOTHESIS_PROFILE_HEARTBEAT_SECONDS", "30")))
     while not stop.wait(interval):
         elapsed = time.perf_counter() - started
-        resources = _resource_snapshot()
         suite.log_hypothesis_progress(
             output_dir,
             phase,
             "heartbeat",
             epoch_id=epoch_id,
             start_time=time.time() - elapsed,
-            extra={**resources, "profiler": "suite_runtime_v1"},
+            extra={**_resource_snapshot(), "profiler": "suite_runtime_v1"},
         )
-        profile = _ACTIVE.get()
-        # ContextVars do not propagate into new threads by default, therefore
-        # heartbeat data is emitted to the phase log; the parent records counts.
-        del profile
 
 
 def _phase_profiled(output_dir: Path, epoch_id: str | None, name: str, callback: Callable[[], Any], timings: dict[str, float]) -> Any:
@@ -156,7 +149,12 @@ def _snapshot_profiled(memory_dir: Path | None) -> Iterator[Path | None]:
     started_total = time.perf_counter()
     manager = _ORIGINALS["read_only_evidence_snapshot"](memory_dir)
     started_setup = time.perf_counter()
-    evidence_dir = manager.__enter__()
+    try:
+        evidence_dir = manager.__enter__()
+    except BaseException:
+        _add_timing("report.snapshot_setup", time.perf_counter() - started_setup)
+        _add_timing("report.snapshot_total", time.perf_counter() - started_total)
+        raise
     _add_timing("report.snapshot_setup", time.perf_counter() - started_setup)
     try:
         yield evidence_dir
@@ -236,7 +234,6 @@ def install_suite_runtime_profiler() -> None:
         "read_only_evidence_snapshot",
         "memory_fingerprint",
         "validate_hypothesis_provenance",
-        "evaluate_hypotheses_read_only",
         "apply_decision_envelope",
         "_write_normalized_result",
         "build_hypothesis_suite_summary",
@@ -251,7 +248,6 @@ def install_suite_runtime_profiler() -> None:
     suite.read_only_evidence_snapshot = _snapshot_profiled
     suite.memory_fingerprint = _simple_wrapper("report.memory_fingerprint", "memory_fingerprint")
     suite.validate_hypothesis_provenance = _simple_wrapper("report.provenance_validation", "validate_hypothesis_provenance")
-    suite.evaluate_hypotheses_read_only = _simple_wrapper("report.evaluators_wall", "evaluate_hypotheses_read_only")
     suite.apply_decision_envelope = _simple_wrapper("report.decision_envelopes", "apply_decision_envelope")
     suite._write_normalized_result = _simple_wrapper("report.normalized_result_writes", "_write_normalized_result")
     suite.build_hypothesis_suite_summary = _simple_wrapper("summary.build", "build_hypothesis_suite_summary")
