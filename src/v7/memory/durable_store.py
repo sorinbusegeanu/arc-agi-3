@@ -23,15 +23,11 @@ class DurableGenerationStore:
 
     def persist_generation_delta(self, state: GenerationState, delta: GenerationDelta, *, batch_id: int = 0) -> None:
         generation_id = int(state.generation_id)
+        parent_generation_id = None if state.parent_generation_id is None or int(state.parent_generation_id) == 0 else int(state.parent_generation_id)
         with self.connection:
             self.connection.execute(
                 "INSERT OR REPLACE INTO generations(generation_id, parent_generation_id, first_global_step, last_global_step, committed) VALUES (?, ?, ?, ?, 0)",
-                (
-                    generation_id,
-                    None if state.parent_generation_id is None else int(state.parent_generation_id),
-                    state.first_global_step,
-                    state.last_global_step,
-                ),
+                (generation_id, parent_generation_id, state.first_global_step, state.last_global_step),
             )
             self.connection.execute(
                 "INSERT OR REPLACE INTO generation_batches(generation_id, batch_id, mutation_count) VALUES (?, ?, ?)",
