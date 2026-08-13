@@ -18,5 +18,8 @@ dependencies = [
     "tqdm>=4.66",
 ]
 
+[project.scripts]
+arc-agi3-v7 = "v7.cli:main"
+
 [project.optional-dependencies]
 test = ["pytest>=8.0"]
