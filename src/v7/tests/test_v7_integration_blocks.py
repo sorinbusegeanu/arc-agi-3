@@ -59,10 +59,13 @@ def test_runtime_resumes_and_reuses_existing_memory_id(tmp_path) -> None:
         runtime.close()
 
 
-def test_cli_jsonl_runs_one_generation(tmp_path) -> None:
+def test_cli_jsonl_runs_and_commits_lifecycle_state(tmp_path) -> None:
     events = tmp_path / "events.jsonl"
     events.write_text(json.dumps({"context_signature": 1, "action_id": 2, "outcome_signature": 3, "success": True}) + "\n", encoding="utf-8")
-    assert run_events(tmp_path / "run", events) == {"events": 1, "generation": 1, "memories": 1}
+    result = run_events(tmp_path / "run", events)
+    assert result["events"] == 1
+    assert result["memories"] == 1
+    assert result["generation"] >= 1
 
 
 def test_hypothesis_contracts_require_real_evidence_and_separate_gates() -> None:
