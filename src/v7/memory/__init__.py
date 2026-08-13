@@ -1,3 +1,4 @@
+from v7.memory.arenas import CompactMemoryArena, NodeColumns, PackedAdjacency, ScoreColumns
 from v7.memory.coordinator import GenerationCommitCoordinator, GenerationCommitResult
 from v7.memory.delta import GenerationDelta
 from v7.memory.generation import GenerationId, GenerationState
@@ -30,6 +31,7 @@ __all__ = [
     "CanonicalMemoryWriter",
     "CognitionIndexBuilder",
     "CognitionIndexes",
+    "CompactMemoryArena",
     "ContingencyIndexMutation",
     "EdgeMutation",
     "EdgeState",
@@ -47,12 +49,15 @@ __all__ = [
     "MemoryReadView",
     "MemoryScore",
     "MmapReadViewTransport",
+    "NodeColumns",
     "NodeMutation",
+    "PackedAdjacency",
     "PreparedGeneration",
     "PublicationRecord",
     "ReadViewHandle",
     "ReadViewTransport",
     "RoleConceptIndexMutation",
     "RoleIndexMutation",
+    "ScoreColumns",
     "ScoreMutation",
 ]
