@@ -20,31 +20,25 @@ Implemented:
 - durable-before-publish `GenerationCommitCoordinator`;
 - monotonic `GenerationPublisher` with reader refresh-by-generation semantics;
 - direct-reference local transport for single-process use;
-- legacy complete-view mmap transport for compatibility tests;
 - content-addressed segmented mmap transport for nodes, scores, adjacency and cognition indexes;
-- mmap-backed packed cognition indexes, avoiding JSON reconstruction on worker hot paths;
-- explicit generation release with shared content-segment retention across generations;
+- mmap-backed packed cognition indexes;
 - incremental M1->M6 dependency registration and dirty-neighborhood propagation;
-- deterministic per-level `DirtyDerivationPlan` snapshots and consumption;
-- read-only compact node and score columns backed by numeric buffers;
-- packed typed adjacency using source/relation rows plus offset/length target segments;
-- incremental arena publication that reuses unchanged node, score, adjacency and cognition sections;
-- deterministic bounded `DerivationTaskPlanner` chunks for dirty M2-M6 work;
-- worker-side generation attachment once per process;
-- vectorized derivation inputs using dense numeric arrays for each dirty task chunk;
-- bounded `ParallelDerivationExecutor` using process workers and mmap generation attachment;
-- deterministic `DerivedMutationBatch` merge back into the single canonical writer independent of worker completion order;
-- configurable retention fitness, promotion, demotion and replay policy over immutable generations;
-- deterministic bounded replay queue and explicit lifecycle status flags;
-- append-only lifecycle evidence for promotion, demotion and replay decisions;
-- dedicated provenance, transfer-trial and contradiction ledgers;
-- structural parent provenance emitted by the M1-M6 learning pipeline;
-- batched transfer summaries kept distinct from transfer priors.
+- deterministic bounded derivation tasks and process execution;
+- deterministic derived-batch merge into the canonical writer;
+- configurable retention fitness, promotion, demotion and replay;
+- append-only lifecycle evidence, provenance, transfer trials and contradictions;
+- empirical concept validation kept separate from transfer priors.
 
-The six implementation phases following the v7 foundation are represented end-to-end.
+Integration block completed:
 
-The first runtime lifecycle block is also implemented: retention/replay/promotion-demotion plus append-only evidence, provenance, transfer and contradiction storage.
+1. Durable runtime snapshots restore committed generation state, canonical IDs, nodes, scores, edge support, cognition indexes, dependency graph and lifecycle flags.
+2. `V7Runtime` and `arc-agi3-v7`/`python -m v7` provide an end-to-end JSONL episode ingestion and generation-commit path with restart support.
+3. Strict H01-H12 evidence contracts enforce missing evidence and proxy-only evidence as `INSUFFICIENT_EVIDENCE` while preserving raw decision, quality gate and dependency gate separately.
+4. Differential scientific artifact comparison operates on exported artifacts without importing the v6 runtime.
+5. Performance validation covers memory size, generation commit latency, derivation throughput, action-selection latency, mmap attach latency and parallel derivation throughput, with like-for-like baseline comparison.
 
-Next integration block: restart/restore, runner/CLI, strict H01-H12 evidence contracts, differential scientific validation, and performance validation.
+Unit coverage for these blocks is under `src/v7/tests/test_v7_integration_blocks.py`.
 
 Scientific M1-M6 behavior is clean-break v7 code and does not import v6 runtime modules. Stable v6 behavior remains an external scientific reference for differential validation.
+
+Remaining work is experiment integration and measured validation: execute the v7 unit/runtime suite, feed real ARC-AGI-3 environment traces, generate H01-H12 evidence from those runs, and collect like-for-like v6/v7 performance measurements. GPU ranking and remote samplers remain later optional phases.
