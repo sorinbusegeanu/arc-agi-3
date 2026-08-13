@@ -57,8 +57,15 @@ def _validated_concepts(memory_dir: Path) -> tuple[set[str], set[str]]:
     if not db.exists(): return promoted, validated
     with sqlite3.connect(db) as conn:
         if _exists(conn, "concept_promotion_state"):
-            for s,p in conn.execute("SELECT concept_signature, currently_promoted FROM concept_promotion_state").fetchall():
-                if int(p or 0)==1: promoted.add(str(s))
+            state_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(concept_promotion_state)").fetchall()}
+            if {"concept_signature", "currently_promoted"} <= state_columns:
+                validation_available = "validation_status" in state_columns
+                select = "concept_signature, currently_promoted" + (", validation_status" if validation_available else "")
+                for row in conn.execute(f"SELECT {select} FROM concept_promotion_state").fetchall():
+                    if int(row[1] or 0) == 1:
+                        promoted.add(str(row[0]))
+                        if validation_available and str(row[2] or "").strip().lower() in {"passed", "validated"}:
+                            validated.add(str(row[0]))
         elif _exists(conn, "concept_candidates"):
             for s,p in conn.execute("SELECT concept_signature, is_promoted FROM concept_candidates").fetchall():
                 if int(p or 0)==1: promoted.add(str(s))
@@ -86,18 +93,19 @@ def _evaluate_h07(*args: Any, **kwargs: Any) -> dict[str, Any]:
 def _historical_h08_qualifying(memory_dir: Path) -> tuple[int,list[str]]:
     from v6 import hypothesis_h08_report as h08
     from v6.higher_order_evidence_history import WORLD_VALIDATION_HISTORY
+    from v6.world_model_validation_history import LINK_HISTORY
     db=memory_dir/"current_state.sqlite"
     if not db.exists(): return 0,[]
     with sqlite3.connect(db) as conn:
         conn.row_factory=sqlite3.Row
-        if not _exists(conn,WORLD_VALIDATION_HISTORY): return 0,[]
+        if not _exists(conn,WORLD_VALIDATION_HISTORY) or not _exists(conn,LINK_HISTORY): return 0,[]
         link_map={}
-        if _exists(conn,"world_model_links"):
-            for row in conn.execute("SELECT component_signature, linked_type, linked_key FROM world_model_links").fetchall(): link_map.setdefault(str(row[0]),{}).setdefault(str(row[1]),set()).add(str(row[2]))
+        for row in conn.execute(f'SELECT component_signature, diagnostic_epoch_id, linked_type, linked_key FROM "{LINK_HISTORY}"').fetchall():
+            link_map.setdefault((str(row[0]),str(row[1])),{}).setdefault(str(row[2]),set()).add(str(row[3]))
         rows=[dict(row) for row in conn.execute(f'SELECT * FROM "{WORLD_VALIDATION_HISTORY}"').fetchall()]
     qualifying=set()
     for row in rows:
-        sig=str(row.get("component_signature") or ""); links=link_map.get(sig,{})
+        sig=str(row.get("component_signature") or ""); epoch=str(row.get("diagnostic_epoch_id") or ""); links=link_map.get((sig,epoch),{})
         rec={"component_signature":sig,"effective_currently_coherent":bool(int(row.get("state_currently_coherent") or 0) or int(row.get("is_coherent") or 0)),"effective_validation_status":str(row.get("state_validation_status") or "").strip().lower(),"has_positive_heldout_gain":h08._has_positive_heldout_gain(row),"cross_context_count":int(row.get("cross_context_count") or 0),"cross_game_count":int(row.get("cross_game_count") or 0),"supported_context_count":len(links.get("context",set())),"concept_link_count":len(links.get("concept",set())),"role_link_count":len(links.get("role",set())),"family_link_count":int(row.get("linked_family_count") or 0),"verified_predicted_outcome_count":int(row.get("predicted_outcome_count") or 0) if str(row.get("prediction_evidence_status") or "missing")=="verified" else 0,"coherence_score":float(row.get("coherence_score") or 0),"explanatory_coverage":float(row.get("explanatory_coverage") or 0),"candidate_only":int(row.get("candidate_only") or 0)==1,"heldout_prediction_gain":row.get("heldout_prediction_gain"),"validation_action_selection_lift":row.get("validation_action_selection_lift"),"validation_transfer_lift":row.get("validation_transfer_lift"),"validation_contradiction_resolution":row.get("validation_contradiction_resolution"),"validation_explanatory_gain":row.get("validation_explanatory_gain")}
         if h08._component_passes_h08_validity(rec): qualifying.add(sig)
     return len(qualifying),sorted(qualifying)
