@@ -22,13 +22,17 @@ def test_scientific_pipeline_builds_m1_to_m6_and_reuses_canonical_m1() -> None:
 
     e1 = EpisodeEvidence(10, 2, 100, True, prediction_error=0.4, future_option_delta=1.0)
     e2 = EpisodeEvidence(11, 2, 101, True, prediction_error=0.2, future_option_delta=0.5)
+    e3 = EpisodeEvidence(12, 3, 102, True, prediction_error=0.1, future_option_delta=0.25)
     m1a = pipeline.observe_episode(e1)
     assert pipeline.observe_episode(e1) == m1a
     m1b = pipeline.observe_episode(e2)
+    m1c = pipeline.observe_episode(e3)
 
     m2 = pipeline.derive_m2(action_id=2, member_ids=(m1a, m1b), outcome_class=7)
-    r1 = pipeline.derive_m3(family_id=m2, context_class=10, action_id=2, member_ids=(m1a,))
-    r2 = pipeline.derive_m3(family_id=m2, context_class=11, action_id=2, member_ids=(m1b,))
+    m2b = pipeline.derive_m2(action_id=3, member_ids=(m1c,), outcome_class=8)
+    r1 = pipeline.derive_m3(family_id=m2, context_class=10, action_id=2, member_ids=(m1a, m1b))
+    r2 = pipeline.derive_m3(family_id=m2b, context_class=12, action_id=3, member_ids=(m1c,))
+    assert r1 != r2
     c1 = pipeline.derive_m4(role_ids=(r1, r2), relation_signature=70)
     c2 = pipeline.derive_m4(role_ids=(r1, r2), relation_signature=71)
     m5 = pipeline.derive_m5(concept_ids=(c1, c2), transition_signature=80)
