@@ -22,6 +22,9 @@ class EpisodeEvidence:
     success: bool
     prediction_error: float = 0.0
     future_option_delta: float = 0.0
+    source_game: str | None = None
+    source_context: str | None = None
+    source_global_step: int | None = None
 
 
 class ScientificDerivationKernels:
