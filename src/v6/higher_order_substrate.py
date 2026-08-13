@@ -4102,6 +4102,11 @@ def _predict_transfer_attempt(
         "source_game_keys_json": json.dumps(source_games),
         "source_context_keys_json": json.dumps(source_contexts),
         "source_context_game_keys_json": json.dumps(source_context_game_keys, sort_keys=True),
+        # Ephemeral expansion evidence: when a context occurs in multiple games,
+        # concrete cross-context provenance must bind both sides to one shared game.
+        # This key is consumed before persistence and is intentionally not part of
+        # the role_transfer_attempts schema.
+        "target_game_keys_json": json.dumps(target_games),
         "provenance_mode": provenance_mode,
         "provenance_status": "verified" if provenance_mode == "single_source" else "aggregate_source",
         "target_carrier_signature": target_carrier_signature,
@@ -4381,7 +4386,15 @@ def _resolve_transfer_attempt_provenance(connection: sqlite3.Connection, attempt
     )
     real_cross_game = not source["game_is_surrogate"] and not target["game_is_surrogate"] and source["game_key"] != target["game_key"]
     real_cross_context = not source["context_is_surrogate"] and not target["context_is_surrogate"] and source["context_key"] != target["context_key"]
-    if str(attempt.get("provenance_mode")) == "single_source" and (real_cross_game or real_cross_context):
+    transfer_kind = str(attempt.get("transfer_kind") or "")
+    kind_matches_resolved_scope = (
+        real_cross_game
+        if transfer_kind == "cross_game"
+        else (real_cross_context and not real_cross_game)
+        if transfer_kind == "cross_context"
+        else False
+    )
+    if str(attempt.get("provenance_mode")) == "single_source" and kind_matches_resolved_scope:
         attempt["provenance_status"] = "verified"
     elif all((source["game_key"], target["game_key"], source["context_key"], target["context_key"])) and any((source["game_is_surrogate"], target["game_is_surrogate"], source["context_is_surrogate"], target["context_is_surrogate"])):
         attempt["provenance_status"] = "resolved_with_surrogate"
@@ -4417,7 +4430,13 @@ def _expand_transfer_attempt_provenance(attempt: dict[str, Any]) -> list[dict[st
     source_carriers = tuple(json.loads(str(attempt["source_carrier_signatures_json"] or "[]")))
     source_games = tuple(json.loads(str(attempt["source_game_keys_json"] or "[]")))
     source_context_game_keys = json.loads(str(attempt.get("source_context_game_keys_json") or "{}"))
-    target_games = (str(attempt["target_game_key"]),) if attempt.get("target_game_key") else ()
+    target_games = tuple(
+        str(value)
+        for value in json.loads(str(attempt.get("target_game_keys_json") or "[]"))
+        if value not in (None, "")
+    )
+    if not target_games and attempt.get("target_game_key"):
+        target_games = (str(attempt["target_game_key"]),)
     result: list[dict[str, Any]] = []
     for source_key in sorted(str(value) for value in source_keys):
         # One concrete carrier/scope pair is a verified provenance row.  It
@@ -4435,12 +4454,16 @@ def _expand_transfer_attempt_provenance(attempt: dict[str, Any]) -> list[dict[st
                 concrete["source_scope_key"] = source_key
                 concrete["source_context_key"] = source_key
                 candidate_games = tuple(sorted(str(value) for value in source_context_game_keys.get(source_key, ())))
-                target_game = str(concrete.get("target_game_key") or "")
-                concrete["source_game_key"] = (
-                    target_game if target_game and target_game in candidate_games
-                    else candidate_games[0] if candidate_games
-                    else source_games[0] if len(source_games) == 1 else None
-                )
+                # A cross-context claim is only valid within one real game.
+                # Select a deterministic game observed for both the source and
+                # target contexts.  Cross-game evidence is generated separately
+                # by the cross_game population and must never leak into this one.
+                shared_games = tuple(sorted(set(candidate_games) & set(target_games)))
+                if not shared_games:
+                    continue
+                shared_game = shared_games[0]
+                concrete["source_game_key"] = shared_game
+                concrete["target_game_key"] = shared_game
             concrete["source_carrier_signature"] = source_carrier
             concrete["source_carrier_count"] = 1 if source_carrier else 0
             concrete["source_evidence_support_count"] = int(attempt.get("source_evidence_support_count") or 0)
@@ -4491,10 +4514,15 @@ def _validate_transfer_attempt_provenance(attempt: dict[str, Any]) -> None:
         and not bool(attempt.get("target_context_is_surrogate"))
         and str(attempt["source_context_key"]) != str(attempt["target_context_key"])
     )
+    if kind == "cross_game" and not bool(attempt.get("source_game_is_surrogate")) and not bool(attempt.get("target_game_is_surrogate")) and not real_cross_game:
+        raise ValueError("cross-game transfer attempt does not span distinct real games")
+    if kind == "cross_context" and real_cross_game:
+        raise ValueError("cross-context transfer attempt spans distinct real games")
+    kind_matches_resolved_scope = real_cross_game if kind == "cross_game" else (real_cross_context and not real_cross_game)
     if str(attempt.get("provenance_status")) == "verified" and not (
-        mode == "single_source" and (real_cross_game or real_cross_context)
+        mode == "single_source" and kind_matches_resolved_scope
     ):
-        raise ValueError("verified transfer attempt lacks a real cross-scope dimension")
+        raise ValueError("verified transfer attempt lacks the requested real cross-scope dimension")
     if int(attempt.get("reuse_success") or 0) == 1 and not attempt.get("source_role_signature"):
         raise ValueError("successful transfer attempt is missing a source role")
     if mode == "single_source" and not attempt.get("source_carrier_signature"):
