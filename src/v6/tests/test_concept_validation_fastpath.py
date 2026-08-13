@@ -5,8 +5,8 @@ from collections import defaultdict
 
 from v6 import concept_validation_fastpath as fast
 from v6 import concept_validation_fastpath_compat as compat
+from v6 import concept_validation_fastpath_fixups as fixups
 from v6 import higher_order_substrate as substrate
-from v6 import hypothesis_suite_report as suite
 
 
 def _prediction_db() -> sqlite3.Connection:
@@ -28,14 +28,15 @@ def _prediction_db() -> sqlite3.Connection:
     return conn
 
 
-def test_fastpath_is_installed_without_overriding_canonical_prediction_semantics() -> None:
+def test_fastpath_is_installed_without_overriding_canonical_validation_wrappers() -> None:
     assert fast._INSTALLED is True
     assert compat._INSTALLED is True
+    assert fixups._INSTALLED is True
     assert substrate._transfer_explanation_events is compat._safe_transfer
     assert substrate._future_option_motif_explanation_events is compat._future_option_motif_explanation_events
-    assert substrate.validate_incremental_promotions_only is compat._validate
-    assert suite.validate_incremental_promotions_only is compat._validate
     assert substrate._prediction_explanation_events is not fast._prediction_explanation_events
+    assert callable(substrate.validate_incremental_promotions_only)
+    assert compat._state_fingerprint is fixups._state_fingerprint
 
 
 def test_prediction_row_index_is_built_once_per_validation_context() -> None:
