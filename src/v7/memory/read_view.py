@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Mapping
 
@@ -14,6 +14,7 @@ from v7.memory.models import MemoryNode, MemoryScore
 
 EdgeKey = tuple[MemoryId, int]
 PackedCognitionView = PackedCognitionIndexes | MappedPackedCognitionIndexes
+_TRANSFER_REJECTED_FLAG = 1 << 10
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,10 +102,22 @@ class MemoryReadView:
         role_limit: int = 64,
         concept_limit: int = 128,
     ) -> tuple[ActionScoreInput, ...]:
-        return self.packed_cognition.score_inputs(
+        rows = self.packed_cognition.score_inputs(
             context_signature=context_signature,
             action_ids=action_ids,
             family_ids_by_action=family_ids_by_action,
             role_limit=role_limit,
             concept_limit=concept_limit,
         )
+        output: list[ActionScoreInput] = []
+        for row in rows:
+            concepts = tuple(
+                memory_id
+                for memory_id in row.concept_ids
+                if not (
+                    (node := self.nodes.get(memory_id)) is not None
+                    and int(node.status_flags) & _TRANSFER_REJECTED_FLAG
+                )
+            )
+            output.append(row if concepts == row.concept_ids else replace(row, concept_ids=concepts))
+        return tuple(output)
