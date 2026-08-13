@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Iterator, Mapping
 
 from v7.memory.arenas.mapped import MappedCompactMemoryArena, MappedNodeColumns, MappedPackedAdjacency, MappedScoreColumns
-from v7.memory.generation import GenerationId
 from v7.memory.ids import MemoryId
 from v7.memory.indexes.cognition import ActionAggregate, CognitionIndexes
 from v7.memory.models import MemoryNode, MemoryScore
@@ -51,10 +50,13 @@ def _cast(mapped: mmap.mmap, spec: Mapping[str, int | str]) -> memoryview:
 class _NodeMap(Mapping[MemoryId, MemoryNode]):
     def __init__(self, columns: MappedNodeColumns) -> None:
         self.columns = columns
+
     def __len__(self) -> int:
         return self.columns.count
+
     def __iter__(self) -> Iterator[MemoryId]:
         return (MemoryId(int(value)) for value in self.columns.memory_ids)
+
     def __getitem__(self, key: MemoryId) -> MemoryNode:
         value = self.columns.get(key)
         if value is None:
@@ -65,10 +67,13 @@ class _NodeMap(Mapping[MemoryId, MemoryNode]):
 class _ScoreMap(Mapping[MemoryId, MemoryScore]):
     def __init__(self, columns: MappedScoreColumns) -> None:
         self.columns = columns
+
     def __len__(self) -> int:
         return self.columns.count
+
     def __iter__(self) -> Iterator[MemoryId]:
         return (MemoryId(int(value)) for value in self.columns.memory_ids)
+
     def __getitem__(self, key: MemoryId) -> MemoryScore:
         value = self.columns.get(key)
         if value is None:
@@ -79,10 +84,16 @@ class _ScoreMap(Mapping[MemoryId, MemoryScore]):
 class _AdjacencyMap(Mapping[tuple[MemoryId, int], tuple[MemoryId, ...]]):
     def __init__(self, adjacency: MappedPackedAdjacency) -> None:
         self.adjacency = adjacency
+
     def __len__(self) -> int:
         return len(self.adjacency.source_ids)
+
     def __iter__(self) -> Iterator[tuple[MemoryId, int]]:
-        return ((MemoryId(int(self.adjacency.source_ids[i])), int(self.adjacency.relation_types[i])) for i in range(len(self.adjacency.source_ids)))
+        return (
+            (MemoryId(int(self.adjacency.source_ids[i])), int(self.adjacency.relation_types[i]))
+            for i in range(len(self.adjacency.source_ids))
+        )
+
     def __getitem__(self, key: tuple[MemoryId, int]) -> tuple[MemoryId, ...]:
         for candidate in self:
             if candidate == key:
@@ -177,13 +188,13 @@ class SegmentedMmapReadViewTransport:
             concepts_by_role={MemoryId(role): tuple(MemoryId(v) for v in values) for role, values in raw["concepts"]},
             action_aggregates={int(row[0]): ActionAggregate(*row[1:]) for row in raw["aggregates"]},
         )
-        return MemoryReadView.from_compact_arena(
+        return MemoryReadView(
             generation_id=handle.generation_id,
             nodes=_NodeMap(arena.nodes),
             scores=_ScoreMap(arena.scores),
             adjacency=_AdjacencyMap(arena.adjacency),
             cognition_indexes=indexes,
-            compact_arena=arena,
+            compact_arena=arena,  # type: ignore[arg-type]
         )
 
     def release(self, handle: ReadViewHandle) -> None:
