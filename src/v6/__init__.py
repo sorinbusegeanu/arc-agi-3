@@ -14,6 +14,8 @@ from v6.concept_validation_fastpath_compat import install_concept_validation_fas
 from v6.concept_validation_fastpath_fixups import install_concept_validation_fastpath_fixups
 from v6.concept_validation_sparse_cache import install_concept_validation_sparse_cache
 from v6.concept_validation_profiler_context_fix import install_concept_validation_profiler_context_fix
+from v6.concept_validation_relevance_pruning import install_concept_validation_relevance_pruning
+from v6.concept_validation_relevance_compat import install_concept_validation_relevance_compat
 
 install_hypothesis_suite_performance_policy()
 apply_hypothesis_suite_performance_compatibility()
@@ -28,5 +30,7 @@ install_concept_validation_fastpath_compat()
 install_concept_validation_fastpath_fixups()
 install_concept_validation_sparse_cache()
 install_concept_validation_profiler_context_fix()
+install_concept_validation_relevance_pruning()
+install_concept_validation_relevance_compat()
 
 __all__ = ["V6Config", "V6System"]
