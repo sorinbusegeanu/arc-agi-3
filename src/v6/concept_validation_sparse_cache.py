@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import os
 import time
 from typing import Any
 
 _INSTALLED = False
 _ORIGINAL: Any = None
+_ORIGINAL_PRIOR_RATE: Any = None
+_ORIGINAL_FUNCTIONAL_DIAGNOSTICS: Any = None
+_LAST_PROFILE: dict[str, Any] = {}
 
 
 def _inc(ctx: dict[str, Any] | None, key: str, amount: int = 1) -> None:
@@ -12,10 +16,15 @@ def _inc(ctx: dict[str, Any] | None, key: str, amount: int = 1) -> None:
         return
     stats = ctx.setdefault("cache_stats", {})
     stats[key] = int(stats.get(key, 0)) + int(amount)
-    # The existing fastpath profile already exports index_stats. Mirror cache
-    # counters there so nested canonical profiling cannot hide them.
     index_stats = ctx.setdefault("index_stats", {})
     index_stats[f"sparse_cache.{key}"] = int(stats[key])
+
+
+def _add_timing(ctx: dict[str, Any] | None, key: str, seconds: float) -> None:
+    if ctx is None:
+        return
+    timings = ctx.setdefault("timings", {})
+    timings[key] = float(timings.get(key, 0.0) or 0.0) + float(seconds)
 
 
 def _sparse_role_score_bundle(
@@ -28,12 +37,6 @@ def _sparse_role_score_bundle(
     rate_cache: Any,
     scope: tuple[str, str, str, str] | None = None,
 ):
-    """Equivalent role-score lookup with generic/scoped caches split.
-
-    Generic role history depends only on (roles, step), not on the event scope.
-    Scoped history is sparse in the transfer-history index, so missing exact
-    role/scope series are skipped without invoking the generic lookup helper.
-    """
     from v6 import concept_validation_fastpath as fast
 
     started = time.perf_counter()
@@ -116,15 +119,97 @@ def _sparse_role_score_bundle(
         index_stats = ctx.setdefault("index_stats", {})
         index_stats["sparse_cache.generic_entries"] = len(generic_cache or {})
         index_stats["sparse_cache.scoped_entries"] = len(scoped_cache or {})
-        timings = ctx.setdefault("timings", {})
-        timings["role_score_bundle.sparse_total"] = float(
-            timings.get("role_score_bundle.sparse_total", 0.0) or 0.0
-        ) + (time.perf_counter() - started)
+        _add_timing(ctx, "role_score_bundle.sparse_total", time.perf_counter() - started)
     return generic_rates, scoped_rates
 
 
+def _profiled_prior_role_success_rate(*args: Any, **kwargs: Any):
+    from v6 import concept_validation_fastpath as fast
+
+    ctx = fast._ACTIVE.get()
+    started = time.perf_counter()
+    try:
+        return _ORIGINAL_PRIOR_RATE(*args, **kwargs)
+    finally:
+        if ctx is not None:
+            _inc(ctx, "prior_role_success_rate_calls")
+            _add_timing(ctx, "prior_role_success_rate.total", time.perf_counter() - started)
+
+
+def _profiled_functional_diagnostics(*args: Any, **kwargs: Any):
+    from v6 import concept_validation_fastpath as fast
+
+    ctx = fast._ACTIVE.get()
+    started = time.perf_counter()
+    result = _ORIGINAL_FUNCTIONAL_DIAGNOSTICS(*args, **kwargs)
+    elapsed = time.perf_counter() - started
+    if ctx is None:
+        return result
+
+    candidate = str(kwargs.get("candidate_signature") or "unknown")
+    events = result[0] if isinstance(result, tuple) and result else []
+    per_concept = ctx.setdefault("per_concept", {})
+    record = per_concept.setdefault(candidate, {"calls": 0, "seconds": 0.0})
+    record["calls"] = int(record.get("calls", 0)) + 1
+    record["seconds"] = float(record.get("seconds", 0.0) or 0.0) + elapsed
+
+    type_counts: dict[str, dict[str, int]] = {}
+    for event in events if isinstance(events, list) else []:
+        event_type = str(event.get("event_type") or "unknown")
+        item = type_counts.setdefault(event_type, {"examined": 0, "relevant": 0, "accepted": 0, "invalid": 0})
+        item["examined"] += 1
+        if bool(event.get("is_relevant")):
+            item["relevant"] += 1
+        if bool(event.get("invalid")):
+            item["invalid"] += 1
+        elif bool(event.get("is_relevant")):
+            item["accepted"] += 1
+    record["event_types"] = type_counts
+    record["events_examined"] = sum(item["examined"] for item in type_counts.values())
+    record["events_relevant"] = sum(item["relevant"] for item in type_counts.values())
+    record["events_accepted"] = sum(item["accepted"] for item in type_counts.values())
+    transfer = type_counts.get("transfer", {})
+    record["transfer_rows_examined"] = int(transfer.get("examined", 0))
+    record["transfer_rows_accepted"] = int(transfer.get("accepted", 0))
+    _add_timing(ctx, "functional_diagnostics.total", elapsed)
+    _inc(ctx, "functional_diagnostics_calls")
+    return result
+
+
+def _merge_profile(profile: dict[str, Any], ctx: dict[str, Any], elapsed: float) -> dict[str, Any]:
+    merged = dict(profile)
+    merged.setdefault("outer_total_seconds", elapsed)
+    timings = dict(merged.get("timings") or {})
+    for key, value in dict(ctx.get("timings") or {}).items():
+        timings[key] = max(float(timings.get(key, 0.0) or 0.0), float(value))
+    merged["timings"] = timings
+
+    call_counts = dict(merged.get("call_counts") or {})
+    for key, value in dict(ctx.get("call_counts") or {}).items():
+        call_counts[key] = max(int(call_counts.get(key, 0) or 0), int(value))
+    merged["call_counts"] = call_counts
+
+    index_stats = dict(merged.get("index_stats") or {})
+    index_stats.update(dict(ctx.get("index_stats") or {}))
+    merged["index_stats"] = index_stats
+    merged["event_counts"] = dict(ctx.get("event_counts") or merged.get("event_counts") or {})
+    merged["sparse_cache"] = {
+        "generic_entries": len(ctx.get("generic_role_score_cache") or {}),
+        "scoped_entries": len(ctx.get("scoped_role_score_cache") or {}),
+        **{key: int(value) for key, value in sorted(dict(ctx.get("cache_stats") or {}).items())},
+    }
+    merged["per_concept"] = dict(ctx.get("per_concept") or {})
+    merged["worker"] = {
+        "pid": os.getpid(),
+        "seconds": float(elapsed),
+        "concept_count": len(merged["per_concept"]),
+    }
+    merged["role_score_cache_entries"] = len(ctx.get("role_score_cache") or {})
+    return merged
+
+
 def _profiled_validate(*args: Any, **kwargs: Any):
-    """Ensure profiling exists even when later runtime wrappers are installed."""
+    global _LAST_PROFILE
     from v6 import concept_validation_fastpath as fast
 
     if fast._ACTIVE.get() is not None:
@@ -150,6 +235,7 @@ def _profiled_validate(*args: Any, **kwargs: Any):
         "event_counts": {},
         "index_stats": {},
         "cache_stats": {},
+        "per_concept": {},
     }
     token = fast._ACTIVE.set(ctx)
     started = time.perf_counter()
@@ -161,19 +247,18 @@ def _profiled_validate(*args: Any, **kwargs: Any):
 
     if isinstance(result, dict):
         existing = result.get("concept_validation_fastpath_profile")
-        profile = dict(existing) if isinstance(existing, dict) else {}
-        profile.setdefault("outer_total_seconds", elapsed)
-        if not existing:
-            profile["timings"] = {key: float(value) for key, value in sorted(ctx["timings"].items())}
-            profile["call_counts"] = {key: int(value) for key, value in sorted(ctx["call_counts"].items())}
-            profile["index_stats"] = dict(ctx["index_stats"])
-            profile["role_score_cache_entries"] = len(ctx["role_score_cache"])
+        profile = _merge_profile(dict(existing) if isinstance(existing, dict) else {}, ctx, elapsed)
         result["concept_validation_fastpath_profile"] = profile
+        _LAST_PROFILE = profile
     return result
 
 
+def get_last_concept_validation_profile() -> dict[str, Any]:
+    return dict(_LAST_PROFILE)
+
+
 def install_concept_validation_sparse_cache() -> None:
-    global _INSTALLED, _ORIGINAL
+    global _INSTALLED, _ORIGINAL, _ORIGINAL_PRIOR_RATE, _ORIGINAL_FUNCTIONAL_DIAGNOSTICS
     if _INSTALLED:
         return
 
@@ -182,6 +267,12 @@ def install_concept_validation_sparse_cache() -> None:
     from v6 import hypothesis_suite_report as suite
 
     fast._role_score_bundle = _sparse_role_score_bundle
+
+    _ORIGINAL_PRIOR_RATE = substrate._prior_role_success_rate
+    substrate._prior_role_success_rate = _profiled_prior_role_success_rate
+
+    _ORIGINAL_FUNCTIONAL_DIAGNOSTICS = substrate._build_functional_explanation_diagnostics
+    substrate._build_functional_explanation_diagnostics = _profiled_functional_diagnostics
 
     _ORIGINAL = substrate.validate_incremental_promotions_only
     substrate.validate_incremental_promotions_only = _profiled_validate
