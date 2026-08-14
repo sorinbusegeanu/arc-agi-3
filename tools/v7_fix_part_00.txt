@@ -1,0 +1,145 @@
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def read(path: str) -> str:
+    return (ROOT / path).read_text(encoding="utf-8")
+
+
+def write(path: str, text: str) -> None:
+    (ROOT / path).write_text(text, encoding="utf-8")
+
+
+def replace_once(path: str, old: str, new: str) -> None:
+    text = read(path)
+    count = text.count(old)
+    if count != 1:
+        raise RuntimeError(f"{path}: expected one occurrence, found {count}: {old[:80]!r}")
+    write(path, text.replace(old, new, 1))
+
+
+def regex_once(path: str, pattern: str, replacement: str) -> None:
+    text = read(path)
+    updated, count = re.subn(pattern, replacement, text, count=1, flags=re.S)
+    if count != 1:
+        raise RuntimeError(f"{path}: regex expected one occurrence, found {count}: {pattern[:80]!r}")
+    write(path, updated)
+
+
+# Dedicated future-option scorer ablation.
+replace_once(
+    "src/v7/environment/ablation.py",
+    "    DEVELOPMENTAL_POLICY = 1 << 4\n",
+    "    DEVELOPMENTAL_POLICY = 1 << 4\n    FUTURE_OPTION = 1 << 5\n",
+)
+replace_once(
+    "src/v7/environment/ablation.py",
+    '    "development": CognitionAblation.DEVELOPMENTAL_POLICY,\n',
+    '    "development": CognitionAblation.DEVELOPMENTAL_POLICY,\n'
+    '    "future_option": CognitionAblation.FUTURE_OPTION,\n'
+    '    "future_options": CognitionAblation.FUTURE_OPTION,\n',
+)
+replace_once(
+    "src/v7/environment/ablation.py",
+    '        ("developmental_policy", CognitionAblation.DEVELOPMENTAL_POLICY),\n',
+    '        ("developmental_policy", CognitionAblation.DEVELOPMENTAL_POLICY),\n'
+    '        ("future_option", CognitionAblation.FUTURE_OPTION),\n',
+)
+replace_once(
+    "src/v7/environment/ablation.py",
+    '        "no_developmental_policy": int(CognitionAblation.DEVELOPMENTAL_POLICY),\n',
+    '        "no_developmental_policy": int(CognitionAblation.DEVELOPMENTAL_POLICY),\n'
+    '        "no_future_option": int(CognitionAblation.FUTURE_OPTION),\n',
+)
+
+# Expose the exact additive future-option component from the contextual scorer.
+replace_once(
+    "src/v7/environment/cognition.py",
+    "    future_reachability: float\n    prediction_confidence: float = 0.0\n",
+    "    future_reachability: float\n    future_option_score_component: float = 0.0\n    prediction_confidence: float = 0.0\n",
+)
+replace_once(
+    "src/v7/environment/cognition.py",
+    "        score = (\n            0.22 * prediction\n",
+    "        future_option_score_component = 0.16 * max(0.0, future)\n        score = (\n            0.22 * prediction\n",
+)
+replace_once(
+    "src/v7/environment/cognition.py",
+    "            + 0.16 * max(0.0, future)\n",
+    "            + future_option_score_component\n",
+)
+replace_once(
+    "src/v7/environment/cognition.py",
+    "            future_reachability=reachability,\n            prediction_confidence=prediction,\n",
+    "            future_reachability=reachability,\n            future_option_score_component=future_option_score_component,\n            prediction_confidence=prediction,\n",
+)
+
+# Remove/reinsert the additive future-option component at the phase-1 policy boundary.
+replace_once(
+    "src/v7/environment/phase1_policy.py",
+    "    option_loss_risk: float\n    development_stage: str = \"CONTROL\"\n",
+    "    option_loss_risk: float\n    future_option_score_component: float = 0.0\n    development_stage: str = \"CONTROL\"\n",
+)
+replace_once(
+    "src/v7/environment/phase1_policy.py",
+    "            memory_score = float(row.score) - 0.08 * float(row.exploration_score)\n\n",
+    "            memory_score = float(row.score) - 0.08 * float(row.exploration_score)\n"
+    "            future_option_component = float(\n"
+    "                getattr(row, \"future_option_score_component\", 0.0)\n"
+    "            )\n"
+    "            future_option_ablated = ablated(\n"
+    "                self.ablation_mask, CognitionAblation.FUTURE_OPTION\n"
+    "            )\n"
+    "            if future_option_ablated:\n"
+    "                memory_score -= future_option_component\n\n",
+)
+replace_once(
+    "src/v7/environment/phase1_policy.py",
+    "                memory_score -= 0.12 * signal.stall_risk\n                memory_score -= 0.10 * signal.option_loss_risk\n",
+    "                memory_score -= 0.12 * signal.stall_risk\n"
+    "                option_loss_component = -0.10 * signal.option_loss_risk\n"
+    "                future_option_component += option_loss_component\n"
+    "                if not future_option_ablated:\n"
+    "                    memory_score += option_loss_component\n",
+)
+replace_once(
+    "src/v7/environment/phase1_policy.py",
+    "                    option_loss_risk=signal.option_loss_risk,\n                    development_stage=stage_name,\n",
+    "                    option_loss_risk=signal.option_loss_risk,\n"
+    "                    future_option_score_component=future_option_component,\n"
+    "                    development_stage=stage_name,\n",
+)
+
+# Carry paired scorer-ablation evidence out of the worker.
+replace_once(
+    "src/v7/context_evidence.py",
+    "    ablation_mask: int = 0\n",
+    "    ablation_mask: int = 0\n"
+    "    future_option_ablation_available: bool = False\n"
+    "    future_option_ablation_score_delta: float = 0.0\n"
+    "    future_option_ablation_rank_lift: int = 0\n",
+)
+replace_once(
+    "src/v7/environment/online_sampling.py",
+    "from v7.environment.arc_adapter import ArcGridEnvironment\n",
+    "from v7.environment.ablation import CognitionAblation\n"
+    "from v7.environment.arc_adapter import ArcGridEnvironment\n",
+)
+replace_once(
+    "src/v7/environment/online_sampling.py",
+    "def _representative(actions: list[int]) -> int | None:\n    if not actions:\n        return None\n    counts = {action: actions.count(action) for action in set(actions)}\n    return min(counts.items(), key=lambda item: (-item[1], item[0]))[0]\n\n\n",
+    "def _representative(actions: list[int]) -> int | None:\n"
+    "    if not actions:\n"
+    "        return None\n"
+    "    counts = {action: actions.count(action) for action in set(actions)}\n"
+    "    return min(counts.items(), key=lambda item: (-item[1], item[0]))[0]\n\n\n"
+    "def _future_option_ablation(\n"
+    "    decisions, action_id: int, *, future_option_ablated: bool\n"
+    ") -> tuple[float, int]:\n"
+    "    on_scores: dict[int, float] = {}\n"
+    "    off_scores: dict[int, float] = {}\n"
+    "    for row in decisions:\n"
