@@ -4,6 +4,7 @@ import math
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Iterable
+from weakref import ReferenceType, ref
 
 from v7.memory.concept_validation import ConceptValidationStatus
 from v7.memory.ids import MemoryId, MemoryLevel
@@ -88,6 +89,9 @@ _PROFILES = {
     ),
 }
 
+_PROFILE_CACHE_VIEW: ReferenceType[MemoryReadView] | None = None
+_PROFILE_CACHE_VALUE: DevelopmentProfile | None = None
+
 
 def development_profile(stage: DevelopmentStage) -> DevelopmentProfile:
     return _PROFILES[DevelopmentStage(stage)]
@@ -138,7 +142,22 @@ def infer_development_stage(view: MemoryReadView) -> DevelopmentStage:
 
 
 def profile_for_view(view: MemoryReadView) -> DevelopmentProfile:
-    return development_profile(infer_development_stage(view))
+    """Return the immutable generation profile without rescanning it per action.
+
+    Sampling workers repeatedly score the same MemoryReadView for every action
+    of every step. Stage inference is O(number of memories), so doing it inside
+    each scorer turned accumulated memory into a sampling-time multiplier. A
+    weak single-entry process-local cache keeps the lookup O(1) while allowing
+    the prior generation view to be released as soon as the worker finishes.
+    """
+    global _PROFILE_CACHE_VIEW, _PROFILE_CACHE_VALUE
+    cached_view = None if _PROFILE_CACHE_VIEW is None else _PROFILE_CACHE_VIEW()
+    if cached_view is view and _PROFILE_CACHE_VALUE is not None:
+        return _PROFILE_CACHE_VALUE
+    profile = development_profile(infer_development_stage(view))
+    _PROFILE_CACHE_VIEW = ref(view)
+    _PROFILE_CACHE_VALUE = profile
+    return profile
 
 
 def focused_replay_ids(
