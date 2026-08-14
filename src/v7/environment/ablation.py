@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import IntFlag
+
+from v7.environment.parallel_sampling import SamplingJob
 
 
 class CognitionAblation(IntFlag):
@@ -10,6 +13,11 @@ class CognitionAblation(IntFlag):
     FUNCTIONAL_ROLES = 1 << 2
     RELATIONAL_WORLD_MODELS = 1 << 3
     DEVELOPMENTAL_POLICY = 1 << 4
+
+
+@dataclass(frozen=True, slots=True)
+class MatureSamplingJob(SamplingJob):
+    ablation_mask: int = 0
 
 
 _NAME_TO_FLAG = {
