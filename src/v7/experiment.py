@@ -198,6 +198,8 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
     metrics: dict[str, object] = {}
     cognition_metrics: dict[str, object] = {}
     cognition = CognitionMetricsAccumulator()
+    running_levels = 0
+    running_wins = 0
     try:
         with ParallelSamplingPool(
             directory=root_path / "segments",
@@ -234,10 +236,17 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
                 sampling_started = perf_counter()
                 sampled = sampling_pool.run_wave(handle=record.handle, jobs=jobs)
                 cognition.observe_epoch(epoch, sampled)
+                epoch_levels = sum(batch.levels_completed for batch in sampled)
+                epoch_wins = sum(batch.wins for batch in sampled)
+                running_levels += epoch_levels
+                running_wins += epoch_wins
+                completed_epochs = epoch + 1
+                avg_levels = running_levels / completed_epochs
+                avg_wins = running_wins / completed_epochs
                 _log(
                     epoch,
-                    f"sampling done jobs={len(sampled)} levels={sum(batch.levels_completed for batch in sampled)} "
-                    f"wins={sum(batch.wins for batch in sampled)} failures={sum(batch.failures for batch in sampled)} "
+                    f"sampling done jobs={len(sampled)} levels={epoch_levels} wins={epoch_wins} "
+                    f"avg_levels={avg_levels:.2f} avg_wins={avg_wins:.2f} "
                     f"seconds={perf_counter() - sampling_started:.2f}",
                 )
 
@@ -338,8 +347,8 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
                 _log(
                     epoch,
                     f"epoch done generation={final_generation} memories={final_memories} "
-                    f"levels={sum(batch.levels_completed for batch in sampled)} wins={sum(batch.wins for batch in sampled)} "
-                    f"failures={sum(batch.failures for batch in sampled)} seconds={perf_counter() - epoch_started:.2f}",
+                    f"levels={epoch_levels} wins={epoch_wins} avg_levels={avg_levels:.2f} avg_wins={avg_wins:.2f} "
+                    f"seconds={perf_counter() - epoch_started:.2f}",
                 )
 
             cognition_metrics = _write_cognition_metrics(
@@ -387,7 +396,9 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
     print(
         f"v7 experiment complete: epochs={summary.epochs} games={summary.games} total_steps={summary.total_steps} "
         f"generation={summary.final_generation} memories={summary.final_memories} "
-        f"levels={summary.levels_completed} wins={summary.wins} failures={summary.failures}",
+        f"levels={summary.levels_completed} wins={summary.wins} "
+        f"avg_levels={summary.levels_completed / max(1, summary.epochs):.2f} "
+        f"avg_wins={summary.wins / max(1, summary.epochs):.2f}",
         flush=True,
     )
     return summary
