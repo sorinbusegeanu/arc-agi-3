@@ -353,9 +353,7 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
                 avg_wins = running_wins / completed_epochs
                 _log(
                     epoch,
-                    f"sampling done jobs={len(sampled)} levels={epoch_levels} wins={epoch_wins} "
-                    f"avg_levels={avg_levels:.2f} avg_wins={avg_wins:.2f} "
-                    f"seconds={perf_counter() - sampling_started:.2f}",
+                    f"sampling done seconds={perf_counter() - sampling_started:.2f}",
                 )
 
                 ingestion_phase_started = perf_counter()
@@ -494,14 +492,6 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
     (root_path / "experiment_summary.json").write_text(
         json.dumps(asdict(summary), indent=2, sort_keys=True),
         encoding="utf-8",
-    )
-    print(
-        f"v7 experiment complete: epochs={summary.epochs} games={summary.games} total_steps={summary.total_steps} "
-        f"generation={summary.final_generation} memories={summary.final_memories} "
-        f"levels={summary.levels_completed} wins={summary.wins} "
-        f"avg_levels={summary.levels_completed / max(1, summary.epochs):.2f} "
-        f"avg_wins={summary.wins / max(1, summary.epochs):.2f}",
-        flush=True,
     )
     return summary
 
