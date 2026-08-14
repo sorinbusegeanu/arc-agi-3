@@ -1,0 +1,11 @@
+arc-agi<1.0,>=0.9.9
+duckdb>=1.0
+networkx>=3.0
+numpy>=1.26
+pandas>=2.0
+pyarrow>=15.0
+scikit-learn>=1.4
+tqdm>=4.66
+
+[test]
+pytest>=8.0

@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
-from hashlib import blake2b
 from pathlib import Path
 from typing import Any, Iterable
 
-from v7.derivation.scientific import TYPE_CONCEPT, TYPE_FAMILY, TYPE_ROLE, TYPE_STRATEGY, TYPE_WORLD_MODEL
+from v7.derivation.scientific import TYPE_CONCEPT, TYPE_FAMILY, TYPE_ROLE, TYPE_STRATEGY, TYPE_WORLD_MODEL, world_transition_signature
 from v7.memory.concept_validation import ConceptValidationStatus
 from v7.memory.evidence_types import EvidenceType
 from v7.memory.ids import MemoryId, MemoryLevel
@@ -14,7 +13,6 @@ from v7.memory.lifecycle import MemoryStatus
 from v7.memory.reporting import StrictHypothesisReporter, report_as_dict
 from v7.runtime import V7Runtime
 
-_MASK63=(1<<63)-1
 NAMES={'H01':'Contingency emergence from interaction history','H02':'Prediction violations drive attention and memory','H03':'Transformation-family formation','H04':'Carrier emergence','H05':'Functional-role emergence','H06':'Role transfer across contexts or games','H07':'Concept emergence through transfer validation','H08':'World-model coherence and later predictive recurrence','H09':'Future-option motif emergence','H10':'Future-option change attracts selective attention','H11':'Future-option transfer supports validated concepts','H12':'Trajectory-efficiency emergence'}
 DEPENDENCIES={'H03':('H01',),'H04':('H03',),'H05':('H04',),'H06':('H05',),'H07':('H06',),'H08':('H06','H07'),'H10':('H09',),'H11':('H06','H09')}
 ISSUES={
@@ -26,9 +24,9 @@ ISSUES={
 'H06':['Transfer trials are observational and policy-selected rather than counterfactual.','Terminal credit can be coarse when many actions contributed.','Multi-source provenance is excluded from strong validation.'],
 'H07':['Concept validation can overfit environments already sampled.','Later unseen-scope trials remain the strongest evidence.'],
 'H08':['World-model creation alone does not prove prediction; VALID requires later recurrence.','M5 is not yet directly used by action selection.'],
-'H09':['Structural option breadth is an operational estimate, not the true reachable-state option set.','Unknown affordances are absent from the estimate.'],
-'H10':['The action scorer already contains a future-option term, so positive lift is mechanism-coupled.','Memory-guided selection is action-level attention, not complete replay/retention attention.','Saturation makes the test unevaluable.'],
-'H11':['Only post-validation transfer trials count as strong held-out evidence.','Multi-source provenance breaks single-source attribution.'],
+'H09':['Direct evidence measures immediate available-action breadth; deeper reachable-state option sets remain outside this test.'],
+'H10':['The paired scorer ablation isolates the additive future-option mechanism but does not ablate all planning mechanisms.'],
+'H11':['Only successful post-validation transfer into games outside the validation scope counts as strong held-out evidence.'],
 'H12':['Only successful trajectories are comparable; fixed horizons censor unsolved trajectories.','Local level ordinals may not perfectly align semantics across resets.','M6 construction alone is not behavioral preference without later replay/promotion or use.']}
 
 
@@ -99,15 +97,14 @@ def _validity_blockers(hypothesis_id:str,row:dict[str,Any])->tuple[list[str],lis
     elif hypothesis_id=='H09':
         threshold('recurring_future_option_motifs',1,'recurring future-option motifs'); threshold('cross_game_future_option_motifs',1,'cross-game future-option motifs')
     elif hypothesis_id=='H10':
-        threshold('high_option_change_count',1,'high option-change events'); threshold('low_option_change_count',1,'low option-change events')
-        if m.get('attention_saturation') is True: blockers.append('memory-guided attention is saturated'); required.append('observe both memory-guided and non-memory-guided actions')
-        threshold('attention_lift',1.25,'attention lift')
-        if m.get('causal_ablation_available') is not True: blockers.append('causal ablation is unavailable'); required.append('produce a causal ablation separating future-option influence from the action scorer')
+        threshold('high_option_change_count',5,'high option-change events'); threshold('low_option_change_count',5,'low option-change events')
+        threshold('causal_attention_lift',1.25,'causal attention lift')
+        if m.get('causal_ablation_available') is not True: blockers.append('causal ablation is unavailable'); required.append('produce paired future-option scorer ablation evidence')
     elif hypothesis_id=='H11':
-        threshold('successful_post_validation_chains',2,'successful post-validation chains'); threshold('distinct_post_validation_game_pairs',2,'distinct post-validation game pairs')
+        threshold('successful_post_validation_chains',2,'successful post-validation chains'); threshold('distinct_post_validation_target_games',2,'distinct held-out target games')
         if int(m.get('validated_concepts_with_recorded_generation') or 0)<=0: blockers.append('validated concepts with recorded generation 0/1'); required.append('record validation generation for at least 1 concept')
     elif hypothesis_id=='H12':
-        threshold('comparable_trajectory_groups',1,'comparable trajectory groups'); threshold('best_known_improvement_count',1,'best-known trajectory improvements'); threshold('strategy_count',1,'M6 strategies'); truth('strategy_replay_or_promotion_link','no M6 strategy is linked to replay or promotion','link at least 1 M6 strategy to replay or promotion')
+        threshold('comparable_trajectory_groups',1,'comparable trajectory groups'); threshold('best_known_improvement_count',1,'best-known trajectory improvements'); threshold('strategy_count',1,'M6 strategies'); truth('strategy_behavioral_or_lifecycle_link','no M6 strategy has post-creation behavioral use, replay, or promotion','observe post-creation M6 use or link at least 1 M6 strategy to replay/promotion')
     else: raise KeyError(hypothesis_id)
     return blockers,required
 
@@ -149,6 +146,15 @@ class _Snapshot:
     def source_games(self,mid:int)->set[str]: return self._scope(int(mid),self.direct_games,self._games)
     def source_contexts(self,mid:int)->set[str]: return self._scope(int(mid),self.direct_contexts,self._contexts)
     def nodes_at(self,level:MemoryLevel,type_id:int|None=None): return [(int(mid),node) for mid,node in self.nodes.items() if node.level==level and (type_id is None or node.type_id==type_id)]
+    def ancestors_at_level(self,mid:int,level:MemoryLevel)->set[int]:
+        found=set(); visited=set(); stack=list(self.parents.get(int(mid),()))
+        while stack:
+            current=int(stack.pop())
+            if current in visited: continue
+            visited.add(current); node=self.nodes.get(MemoryId(current))
+            if node is not None and node.level==level: found.add(current); continue
+            stack.extend(self.parents.get(current,()))
+        return found
 
 def _base(decision:str,rows:int,measurement:Any,*,proxy:bool=False,missing:Iterable[str]=())->dict[str,Any]: return {'raw_decision':decision,'quality_gate':'PASS','dependency_gate':'PASS','evidence':{'evidence_rows':int(rows),'measurement':measurement,'proxy_only':bool(proxy)},'missing_evidence':list(missing)}
 
@@ -192,7 +198,7 @@ def _h04(s:_Snapshot):
 def _h05(s:_Snapshot):
     roles=s.nodes_at(MemoryLevel.M3,TYPE_ROLE); usable=cross_context=cross_game=0
     for mid,_ in roles:
-        m1=[p for p in s.parents.get(mid,()) if p in s.nodes and s.nodes[MemoryId(p)].level==MemoryLevel.M1]; contexts=s.source_contexts(mid); games=s.source_games(mid); cross_context+=int(len(contexts)>=2); cross_game+=int(len(games)>=2); usable+=int(len(m1)>=2 and (len(contexts)>=2 or len(games)>=2))
+        m1=s.ancestors_at_level(mid,MemoryLevel.M1); contexts=s.source_contexts(mid); games=s.source_games(mid); cross_context+=int(len(contexts)>=2); cross_game+=int(len(games)>=2); usable+=int(len(m1)>=2 and (len(contexts)>=2 or len(games)>=2))
     carrier=_carrier_metrics(s); first_role=min((int(n.created_generation) for _,n in roles),default=None); first_carrier=carrier['first_emergent_carrier_generation']; temporal=first_role is not None and first_carrier is not None and first_carrier<=first_role; decision='VALID' if usable and temporal else 'PARTIALLY_VALID' if roles else 'INSUFFICIENT_EVIDENCE'; return _base(decision,len(roles),{'role_count':len(roles),'usable_role_count':usable,'cross_context_role_count':cross_context,'cross_game_role_count':cross_game,'carrier_precedes_role':temporal if first_carrier is not None else None})
 
 def _h06(s:_Snapshot):
@@ -204,19 +210,16 @@ def _h07(s:_Snapshot):
         role_parents=[p for p in s.parents.get(mid,()) if p in s.nodes and s.nodes[MemoryId(p)].level==MemoryLevel.M3]; trials=[r for r in s.transfer_trials if int(r['memory_id'])==mid]; robust+=int(len(role_parents)>=2 and len(trials)>=2 and len(s.source_games(mid))>=2)
     decision='VALID' if robust else 'INVALID' if concepts and len(rejected)==len(concepts) else 'PARTIALLY_VALID' if concepts else 'INSUFFICIENT_EVIDENCE'; return _base(decision,len(concepts),{'concept_count':len(concepts),'concept_candidate_count':len(candidates),'transfer_validated_concept_count':len(validated),'transfer_rejected_concept_count':len(rejected),'robust_validated_concept_count':robust})
 
-def _transition_key(prior:tuple[int,...],action:int,current:tuple[int,...])->int:
-    d=blake2b(digest_size=8); d.update(b'world-transition-v1'); d.update(str(tuple(prior)).encode('ascii')); d.update(str(int(action)).encode('ascii')); d.update(str(tuple(current)).encode('ascii')); return int.from_bytes(d.digest(),'little')&_MASK63
-
 def _transitions(s:_Snapshot):
     validated={mid for mid,n in s.nodes_at(MemoryLevel.M4,TYPE_CONCEPT) if int(n.status_flags)&int(ConceptValidationStatus.TRANSFER_VALIDATED)}; by_game=defaultdict(list); out=defaultdict(list)
     for r in s.episodes:
         if r.get('source_game'): by_game[str(r['source_game'])].append(r)
     for game,rows in by_game.items():
-        prior=()
+        prior=(); prior_action=None
         for r in sorted(rows,key=lambda x:int(x.get('source_global_step') or -1)):
             current=tuple(sorted({int(v) for v in r.get('decision_concept_ids',()) if int(v) in validated}))
-            if prior and current and len(set(prior)|set(current))>=2: out[_transition_key(prior,int(r.get('action_id') or 0),current)].append(r)
-            prior=current
+            if prior and current and prior_action is not None and len(set(prior)|set(current))>=2: out[world_transition_signature(prior,prior_action,current)].append(r)
+            prior=current; prior_action=int(r.get('action_id') or 0)
     return out
 
 def _h08(s:_Snapshot):
@@ -226,28 +229,33 @@ def _h08(s:_Snapshot):
     decision='VALID' if models and heldout and cross_game else 'PARTIALLY_VALID' if models else 'INSUFFICIENT_EVIDENCE'; return _base(decision,len(models),{'world_model_count':len(models),'models_with_post_creation_recurrence':heldout,'cross_game_recurrent_model_count':cross_game})
 
 def _h09(s:_Snapshot):
-    nonzero=[r for r in s.episodes if abs(float(r.get('future_option_delta') or 0))>0]; motifs=defaultdict(list)
+    nonzero=[r for r in s.episodes if abs(float(r.get('raw_action_option_delta') or 0))>0]; motifs=defaultdict(list)
     for r in nonzero:
-        if r.get('carrier_signature') is not None: motifs[(int(r['carrier_signature']),int(r.get('action_id') or 0),1 if float(r.get('future_option_delta') or 0)>0 else -1)].append(r)
-    recurring=[rows for rows in motifs.values() if len(rows)>=2 and (len({str(r.get('source_context') or '') for r in rows})>=2 or len({str(r.get('source_game') or '') for r in rows})>=2)]; cross=sum(len({str(r.get('source_game') or '') for r in rows})>=2 for rows in recurring); decision='VALID' if recurring and cross else 'PARTIALLY_VALID' if nonzero else 'INSUFFICIENT_EVIDENCE'; return _base(decision,len(nonzero),{'live_future_option_change_events':len(nonzero),'recurring_future_option_motifs':len(recurring),'cross_game_future_option_motifs':cross,'measurement_definition':'delta in known action+contingency+role+concept option breadth'},proxy=True)
+        if r.get('carrier_signature') is not None: motifs[(int(r['carrier_signature']),int(r.get('action_id') or 0),1 if float(r.get('raw_action_option_delta') or 0)>0 else -1)].append(r)
+    recurring=[rows for rows in motifs.values() if len(rows)>=2 and (len({str(r.get('source_context') or '') for r in rows})>=2 or len({str(r.get('source_game') or '') for r in rows})>=2)]; cross=sum(len({str(r.get('source_game') or '') for r in rows})>=2 for rows in recurring); decision='VALID' if recurring and cross else 'PARTIALLY_VALID' if nonzero else 'INSUFFICIENT_EVIDENCE'; return _base(decision,len(nonzero),{'direct_option_change_events':len(nonzero),'recurring_future_option_motifs':len(recurring),'cross_game_future_option_motifs':cross,'measurement_definition':'direct delta in environment-reported available actions after versus before the selected action'})
 
 def _h10(s:_Snapshot):
-    if not s.episodes:return _base('INSUFFICIENT_EVIDENCE',0,{'episode_count':0})
-    values=sorted(abs(float(r.get('future_option_delta') or 0)) for r in s.episodes); threshold=values[min(len(values)-1,int(.8*len(values)))]; nonzero=[v for v in values if v>0]; threshold=threshold if threshold>0 else min(nonzero) if nonzero else 0; high=[r for r in s.episodes if threshold>0 and abs(float(r.get('future_option_delta') or 0))>=threshold]; low=[r for r in s.episodes if abs(float(r.get('future_option_delta') or 0))<threshold] if threshold>0 else []
-    def rate(rows):return None if not rows else sum(bool(r.get('memory_guided')) for r in rows)/len(rows)
-    hr,lr=rate(high),rate(low); lift=None if hr is None or lr is None else float('inf') if lr==0 and hr>0 else hr/lr if lr>0 else 1.0; saturation=bool(s.episodes) and (all(bool(r.get('memory_guided')) for r in s.episodes) or all(not bool(r.get('memory_guided')) for r in s.episodes)); decision='INSUFFICIENT_EVIDENCE' if not high or not low or saturation else 'PARTIALLY_VALID' if lift==float('inf') or (lift is not None and lift>=1.25) else 'INVALID' if hr is not None and lr is not None and hr<lr and len(high)>=5 else 'PARTIALLY_VALID'; return _base(decision,len(high),{'high_option_change_threshold':threshold,'high_option_change_count':len(high),'low_option_change_count':len(low),'memory_guided_rate_high_option_change':hr,'memory_guided_rate_low_option_change':lr,'attention_lift':lift,'attention_saturation':saturation,'causal_ablation_available':False})
+    rows=[r for r in s.episodes if r.get('future_option_ablation_available') is True]
+    if not rows:return _base('INSUFFICIENT_EVIDENCE',0,{'episode_count':len(s.episodes),'causal_ablation_available':False})
+    values=sorted(abs(float(r.get('raw_action_option_delta') or 0)) for r in rows); threshold=values[min(len(values)-1,int(.8*len(values)))]; nonzero=[v for v in values if v>0]; threshold=threshold if threshold>0 else min(nonzero) if nonzero else 0; high=[r for r in rows if threshold>0 and abs(float(r.get('raw_action_option_delta') or 0))>=threshold]; low=[r for r in rows if abs(float(r.get('raw_action_option_delta') or 0))<threshold] if threshold>0 else []
+    def mean_effect(items): return None if not items else sum(abs(float(r.get('future_option_ablation_score_delta') or 0)) for r in items)/len(items)
+    high_effect,low_effect=mean_effect(high),mean_effect(low); lift=None if high_effect is None or low_effect is None else float('inf') if low_effect==0 and high_effect>0 else high_effect/low_effect if low_effect>0 else 1.0; rank_lift=None if not high else sum(float(r.get('future_option_ablation_rank_lift') or 0) for r in high)/len(high); enough=len(high)>=5 and len(low)>=5; decision='VALID' if enough and lift is not None and lift>=1.25 else 'INVALID' if enough and lift is not None and lift<1.0 else 'PARTIALLY_VALID'; return _base(decision,len(rows),{'high_option_change_threshold':threshold,'high_option_change_count':len(high),'low_option_change_count':len(low),'causal_score_effect_high':high_effect,'causal_score_effect_low':low_effect,'causal_attention_lift':lift,'mean_high_option_rank_lift':rank_lift,'causal_ablation_available':True,'measurement_definition':'paired same-state scorer intervention with future-option additive terms enabled versus removed'})
 
 def _h11(s:_Snapshot):
     concept_ids={mid for mid,_ in s.nodes_at(MemoryLevel.M4,TYPE_CONCEPT)}; validation={}
     for r in s.concept_validations:
-        if r.get('memory_id') is not None and r.get('validated'): validation[int(r['memory_id'])]=min(validation.get(int(r['memory_id']),int(r['generation_id'])),int(r['generation_id']))
-    chain=[]; held=[]
+        if r.get('memory_id') is None or not r.get('validated'): continue
+        mid=int(r['memory_id']); generation=int(r['generation_id']); scope=frozenset(str(v) for v in r.get('validation_source_games',()) if v)
+        if mid not in validation or generation<validation[mid][0]: validation[mid]=(generation,scope)
+    post=[]; held=[]
     for r in s.transfer_trials:
         mid=int(r['memory_id'])
-        if mid not in concept_ids or int(r.get('source_game_count') or 1)!=1 or r.get('source_game')==r.get('target_game') or abs(float(r.get('future_option_delta') or 0))<=0 or mid not in validation: continue
-        chain.append(r)
-        if r.get('success') and int(r.get('generation_id') or 0)>validation[mid]: held.append(r)
-    pairs={(r['source_game'],r['target_game']) for r in held}; decision='VALID' if len(held)>=2 and len(pairs)>=2 else 'PARTIALLY_VALID' if chain else 'INSUFFICIENT_EVIDENCE'; return _base(decision,len(chain),{'verified_future_option_concept_transfer_chains':len(chain),'successful_post_validation_chains':len(held),'distinct_post_validation_game_pairs':len(pairs),'validated_concepts_with_recorded_generation':len(validation)})
+        if mid not in concept_ids or mid not in validation or r.get('attribution')!='trajectory_usage' or abs(float(r.get('raw_action_option_delta') or 0))<=0: continue
+        generation,scope=validation[mid]
+        if int(r.get('generation_id') or 0)<=generation or str(r.get('target_game') or '') in scope: continue
+        post.append(r)
+        if r.get('success'): held.append(r)
+    targets={r['target_game'] for r in held}; decision='VALID' if len(held)>=2 and len(targets)>=2 else 'PARTIALLY_VALID' if post or validation else 'INSUFFICIENT_EVIDENCE'; return _base(decision,len(post),{'verified_future_option_concept_transfer_chains':len(post),'successful_post_validation_chains':len(held),'distinct_post_validation_target_games':len(targets),'distinct_post_validation_game_pairs':len(targets),'validated_concepts_with_recorded_generation':len(validation)})
 
 def _h12(s:_Snapshot):
     groups=defaultdict(list)
@@ -262,4 +270,10 @@ def _h12(s:_Snapshot):
             if steps<=0:continue
             if best is not None and steps<best:improvements+=1
             best=steps if best is None else min(best,steps)
-    strategies=s.nodes_at(MemoryLevel.M6,TYPE_STRATEGY); ids={m for m,_ in strategies}; linked=bool(ids&(s.replay_ids|s.promotion_ids)) or any(int(n.status_flags)&int(MemoryStatus.PROMOTED|MemoryStatus.REPLAY_QUEUED) for _,n in strategies); decision='INSUFFICIENT_EVIDENCE' if comparable<=0 else 'VALID' if improvements>0 and strategies and linked else 'PARTIALLY_VALID'; return _base(decision,len(s.trajectories),{'successful_trajectory_count':len(s.trajectories),'comparable_trajectory_groups':comparable,'best_known_improvement_count':improvements,'strategy_count':len(strategies),'strategy_replay_or_promotion_link':linked})
+    strategies=s.nodes_at(MemoryLevel.M6,TYPE_STRATEGY); ids={m for m,_ in strategies}; nodes={m:n for m,n in strategies}; lifecycle_link=bool(ids&(s.replay_ids|s.promotion_ids)) or any(int(n.status_flags)&int(MemoryStatus.PROMOTED|MemoryStatus.REPLAY_QUEUED) for _,n in strategies); post_creation_uses=0
+    for r in s.episodes:
+        generation=int(r.get('generation_id') or 0)
+        for raw_id in r.get('decision_strategy_ids',()) or ():
+            memory_id=int(raw_id); node=nodes.get(memory_id)
+            if node is not None and generation>int(node.created_generation): post_creation_uses+=1
+    linked=lifecycle_link or post_creation_uses>0; decision='INSUFFICIENT_EVIDENCE' if comparable<=0 else 'VALID' if improvements>0 and strategies and linked else 'PARTIALLY_VALID'; return _base(decision,len(s.trajectories),{'successful_trajectory_count':len(s.trajectories),'comparable_trajectory_groups':comparable,'best_known_improvement_count':improvements,'strategy_count':len(strategies),'strategy_replay_or_promotion_link':lifecycle_link,'strategy_post_creation_use_count':post_creation_uses,'strategy_behavioral_or_lifecycle_link':linked})

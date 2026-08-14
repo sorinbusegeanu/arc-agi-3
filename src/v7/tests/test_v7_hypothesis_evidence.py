@@ -4,10 +4,13 @@ import json
 
 import numpy as np
 
-from v7.derivation.scientific import EpisodeEvidence, ScientificDerivationKernels
+from v7.derivation.scientific import EpisodeEvidence, ScientificDerivationKernels, world_transition_signature
+from v7.environment.ablation import CognitionAblation, ablation_names
 from v7.environment.encoding import carrier_signature, transition_signature
 from v7.experiment import _append_hypothesis_log
-from v7.hypotheses import evaluate_hypothesis_suite
+from v7.hypotheses import _Snapshot, _h09, _h10, _h11, evaluate_hypothesis_suite
+from v7.memory.evidence_store import EvidenceRecord
+from v7.memory.evidence_types import EvidenceType
 from v7.memory.ids import MemoryLevel
 from v7.runtime import V7Runtime, V7RuntimeConfig
 
@@ -53,3 +56,53 @@ def test_hypothesis_blockers_are_written_to_dedicated_log_without_stdout(tmp_pat
     assert (tmp_path / 'hypotheis.log').read_text(encoding='utf-8').endswith(
         'E0003] H05 blockers: usable roles 0/1\n'
     )
+
+
+
+def test_world_transition_identity_and_future_option_ablation_contract() -> None:
+    assert world_transition_signature((1, 2), 3, (4, 5)) == world_transition_signature((1, 2), 3, (4, 5))
+    assert world_transition_signature((1, 2), 3, (4, 5)) != world_transition_signature((1, 2), 4, (4, 5))
+    assert ablation_names(int(CognitionAblation.FUTURE_OPTION)) == ("future_option",)
+
+
+def test_h09_uses_direct_option_change_without_proxy(tmp_path) -> None:
+    runtime = V7Runtime(V7RuntimeConfig.from_path(tmp_path, restore=False))
+    try:
+        rows = []
+        for step, game, context in ((1, "g1", "a"), (2, "g1", "b"), (3, "g2", "c"), (4, "g2", "d")):
+            rows.append(EvidenceRecord(memory_id=None, evidence_type=int(EvidenceType.EPISODE), generation_id=1, payload={"raw_action_option_delta": 1.0, "carrier_signature": 77, "action_id": 2}, source_game=game, source_context=context, source_global_step=step))
+        runtime.evidence.append_evidence_batch(rows)
+        result = _h09(_Snapshot(runtime))
+        assert result["raw_decision"] == "VALID"
+        assert result["evidence"]["proxy_only"] is False
+    finally:
+        runtime.close()
+
+
+def test_h10_uses_paired_same_state_scorer_ablation(tmp_path) -> None:
+    runtime = V7Runtime(V7RuntimeConfig.from_path(tmp_path, restore=False))
+    try:
+        rows = []
+        for step in range(20):
+            high = step < 10
+            rows.append(EvidenceRecord(memory_id=None, evidence_type=int(EvidenceType.EPISODE), generation_id=1, payload={"raw_action_option_delta": 2.0 if high else 0.0, "future_option_ablation_available": True, "future_option_ablation_score_delta": 0.20 if high else 0.01, "future_option_ablation_rank_lift": 1 if high else 0}, source_game="g1", source_context=str(step), source_global_step=step + 1))
+        runtime.evidence.append_evidence_batch(rows)
+        result = _h10(_Snapshot(runtime))
+        assert result["raw_decision"] == "VALID"
+        assert result["evidence"]["measurement"]["causal_attention_lift"] >= 1.25
+    finally:
+        runtime.close()
+
+
+def test_h11_uses_validation_scope_not_single_source_provenance() -> None:
+    class Stub:
+        concept_validations = [{"memory_id": 10, "validated": True, "generation_id": 5, "validation_source_games": ["g1", "g0"]}]
+        transfer_trials = [
+            {"memory_id": 10, "generation_id": 6, "target_game": "g2", "source_game": "g0", "source_game_count": 2, "success": True, "attribution": "trajectory_usage", "raw_action_option_delta": 1.0},
+            {"memory_id": 10, "generation_id": 7, "target_game": "g3", "source_game": "g1", "source_game_count": 3, "success": True, "attribution": "trajectory_usage", "raw_action_option_delta": -1.0},
+        ]
+        def nodes_at(self, level, type_id=None):
+            return [(10, object())] if level == MemoryLevel.M4 else []
+    result = _h11(Stub())
+    assert result["raw_decision"] == "VALID"
+    assert result["evidence"]["measurement"]["distinct_post_validation_target_games"] == 2

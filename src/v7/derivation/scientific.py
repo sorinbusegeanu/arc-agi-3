@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import blake2b
 from typing import Iterable, Mapping
 
 from v7.memory.canonical import CanonicalCandidateMutation, CanonicalMemoryKey
@@ -14,6 +15,21 @@ TYPE_CARRIER = 302
 TYPE_CONCEPT = 400
 TYPE_WORLD_MODEL = 500
 TYPE_STRATEGY = 600
+
+_MASK63 = (1 << 63) - 1
+
+
+def world_transition_signature(
+    prior: Iterable[int], action_id: int, current: Iterable[int]
+) -> int:
+    prior_values = tuple(int(value) for value in prior)
+    current_values = tuple(int(value) for value in current)
+    digest = blake2b(digest_size=8)
+    digest.update(b"world-transition-v3")
+    digest.update(str(prior_values).encode("ascii"))
+    digest.update(str(int(action_id)).encode("ascii"))
+    digest.update(str(current_values).encode("ascii"))
+    return int.from_bytes(digest.digest(), "little") & _MASK63
 
 
 @dataclass(frozen=True, slots=True)

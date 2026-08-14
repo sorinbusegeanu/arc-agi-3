@@ -17,8 +17,10 @@ from v7.evaluation.cognition_metrics import (
 )
 from v7.game_sets import resolve_game_selector
 from v7.hypotheses import evaluate_hypothesis_suite
+from v7.memory.evidence_lifecycle import TransferTrialRecord
 from v7.memory.evidence_store import EvidenceRecord
 from v7.memory.evidence_types import EvidenceType
+from v7.memory.ids import MemoryId
 from v7.parallel import ParallelExecutionConfig
 from v7.runtime import V7Runtime, V7RuntimeConfig
 
@@ -215,13 +217,17 @@ def _epoch_game_rates(sampled) -> tuple[float, float]:
 
 
 def _write_trajectory_evidence(runtime: V7Runtime, sampled) -> int:
-    """Reconstruct bounded successful/failed action sequences from step evidence."""
+    """Persist trajectories and credit terminal transfer to memories used along them."""
     generation_id = int(runtime.writer.mutable_generation_id)
     records: list[EvidenceRecord] = []
+    transfer_records: list[TransferTrialRecord] = []
     for batch in sampled:
         actions: list[int] = []
         contexts: list[int] = []
+        used_memory_ids: set[int] = set()
+        usage_counts: Counter[int] = Counter()
         future_sum = 0.0
+        raw_option_sum = 0.0
         level_index = 0
         terminal_index = 0
         trajectory_keys = tuple(
@@ -239,7 +245,15 @@ def _write_trajectory_evidence(runtime: V7Runtime, sampled) -> int:
                 if len(context_values) >= 2
                 else int(row.context_signature)
             )
+            for raw_memory_id in (
+                *(getattr(row, "decision_role_ids", ()) or ()),
+                *(getattr(row, "decision_concept_ids", ()) or ()),
+            ):
+                memory_id = int(raw_memory_id)
+                used_memory_ids.add(memory_id)
+                usage_counts[memory_id] += 1
             future_sum += float(row.future_option_delta)
+            raw_option_sum += float(getattr(row, "raw_action_option_delta", 0.0) or 0.0)
             polarity = int(getattr(row, "terminal_polarity", 0) or 0)
             if polarity == 0:
                 continue
@@ -262,6 +276,7 @@ def _write_trajectory_evidence(runtime: V7Runtime, sampled) -> int:
                         "level_key": level_key,
                         "steps_to_success": len(actions),
                         "future_option_sum": future_sum,
+                        "raw_action_option_sum": raw_option_sum,
                         "future_option_per_action": future_sum / max(1, len(actions)),
                         "representative_action": _representative(actions),
                         "action_sequence": list(actions[:256]),
@@ -270,12 +285,52 @@ def _write_trajectory_evidence(runtime: V7Runtime, sampled) -> int:
                     },
                 )
             )
+            for raw_memory_id in sorted(used_memory_ids):
+                memory_id = MemoryId(raw_memory_id)
+                source_games = tuple(
+                    game
+                    for game in runtime.lifecycle_evidence.provenance_source_games(memory_id)
+                    if game != batch.game_id
+                )
+                if not source_games:
+                    continue
+                if runtime.lifecycle_evidence.transfer_trial_exists(
+                    memory_id,
+                    target_game=batch.game_id,
+                    source_global_step=row.source_global_step,
+                ):
+                    continue
+                transfer_records.append(
+                    TransferTrialRecord(
+                        memory_id=memory_id,
+                        generation_id=generation_id,
+                        source_game=source_games[0],
+                        target_game=batch.game_id,
+                        success=polarity > 0,
+                        score=1.0 if polarity > 0 else 0.0,
+                        payload={
+                            "source_games": list(source_games),
+                            "source_game_count": len(source_games),
+                            "target_context": level_key,
+                            "source_global_step": row.source_global_step,
+                            "future_option_delta": future_sum,
+                            "raw_action_option_delta": raw_option_sum,
+                            "attribution": "trajectory_usage",
+                            "usage_count": int(usage_counts[raw_memory_id]),
+                        },
+                    )
+                )
             if polarity > 0:
                 level_index += 1
             actions.clear()
             contexts.clear()
+            used_memory_ids.clear()
+            usage_counts.clear()
             future_sum = 0.0
-    return runtime.evidence.append_evidence_batch(records)
+            raw_option_sum = 0.0
+    evidence_rows = runtime.evidence.append_evidence_batch(records)
+    transfer_rows = runtime.lifecycle_evidence.append_transfer_trials(transfer_records)
+    return evidence_rows + transfer_rows
 
 
 def _write_cognition_metrics(

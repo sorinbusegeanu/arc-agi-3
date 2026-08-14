@@ -250,6 +250,15 @@ class MemoryLearningPipeline:
                         "decision_score": float(evidence.decision_score),
                         "max_action_score": float(evidence.max_action_score),
                         "memory_guided": bool(evidence.memory_guided),
+                        "future_option_ablation_available": bool(
+                            getattr(evidence, "future_option_ablation_available", False)
+                        ),
+                        "future_option_ablation_score_delta": float(
+                            getattr(evidence, "future_option_ablation_score_delta", 0.0)
+                        ),
+                        "future_option_ablation_rank_lift": int(
+                            getattr(evidence, "future_option_ablation_rank_lift", 0)
+                        ),
                     },
                 )
                 for evidence, memory_id in zip(

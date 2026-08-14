@@ -89,6 +89,9 @@ class DevelopmentalLifecycleRuntime:
                         "previous_flags": int(d.previous_flags),
                         "next_flags": int(d.next_flags),
                         "development_stage": profile.stage.name,
+                        "validation_source_games": list(
+                            self.evidence_lifecycle.provenance_source_games(d.memory_id)
+                        ),
                     },
                 )
                 for d in concept_decisions
