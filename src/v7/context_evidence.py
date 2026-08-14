@@ -18,6 +18,9 @@ class ContextEpisodeEvidence(EpisodeEvidence):
     effective_epsilon: float = 0.0
     development_stage: str = ""
     ablation_mask: int = 0
+    future_option_ablation_available: bool = False
+    future_option_ablation_score_delta: float = 0.0
+    future_option_ablation_rank_lift: int = 0
 
     def __post_init__(self) -> None:
         contexts = tuple(int(value) for value in self.context_signatures)

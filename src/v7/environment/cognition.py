@@ -97,6 +97,7 @@ class ContextualActionDecision:
     failure_risk: float
     contradiction_risk: float
     future_reachability: float
+    future_option_score_component: float = 0.0
     prediction_confidence: float = 0.0
     completion_likelihood: float = 0.0
 
@@ -556,10 +557,11 @@ class ContextualActionScorer:
         failure = max(m1_failure, local_failure)
         contradiction = max(m1_contradiction, local_contradiction)
 
+        future_option_score_component = 0.16 * max(0.0, future)
         score = (
             0.22 * prediction
             + 0.16 * completion
-            + 0.16 * max(0.0, future)
+            + future_option_score_component
             + 0.08 * role_strength
             + 0.08 * concept_strength
             + 0.10 * world_strength
@@ -588,6 +590,7 @@ class ContextualActionScorer:
             failure_risk=failure,
             contradiction_risk=contradiction,
             future_reachability=reachability,
+            future_option_score_component=future_option_score_component,
             prediction_confidence=prediction,
             completion_likelihood=completion,
         )

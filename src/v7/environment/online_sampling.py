@@ -4,6 +4,7 @@ from random import Random
 from time import perf_counter
 
 from v7.context_evidence import ContextEpisodeEvidence
+from v7.environment.ablation import CognitionAblation
 from v7.environment.arc_adapter import ArcGridEnvironment
 from v7.environment.cognition import LocalCognitionOverlay
 from v7.environment.encoding import (
@@ -33,6 +34,32 @@ def _representative(actions: list[int]) -> int | None:
         return None
     counts = {action: actions.count(action) for action in set(actions)}
     return min(counts.items(), key=lambda item: (-item[1], item[0]))[0]
+
+
+def _future_option_ablation(
+    decisions, action_id: int, *, future_option_ablated: bool
+) -> tuple[float, int]:
+    on_scores: dict[int, float] = {}
+    off_scores: dict[int, float] = {}
+    for row in decisions:
+        component = float(getattr(row, "future_option_score_component", 0.0))
+        if future_option_ablated:
+            off_score = float(row.score)
+            on_score = off_score + component
+        else:
+            on_score = float(row.score)
+            off_score = on_score - component
+        on_scores[int(row.action_id)] = on_score
+        off_scores[int(row.action_id)] = off_score
+    action = int(action_id)
+    if action not in on_scores or action not in off_scores:
+        return 0.0, 0
+    on_order = [key for key, _ in sorted(on_scores.items(), key=lambda item: (-item[1], item[0]))]
+    off_order = [key for key, _ in sorted(off_scores.items(), key=lambda item: (-item[1], item[0]))]
+    return (
+        float(on_scores[action] - off_scores[action]),
+        int(off_order.index(action) - on_order.index(action)),
+    )
 
 
 def sample_job(directory: str, handle, job: SamplingJob) -> SamplingBatchResult:
@@ -94,6 +121,15 @@ def sample_job(directory: str, handle, job: SamplingJob) -> SamplingBatchResult:
         )
         decision = selection.decision
         action = int(decision.action_id)
+        future_option_ablation_score_delta, future_option_ablation_rank_lift = (
+            _future_option_ablation(
+                decisions,
+                action,
+                future_option_ablated=bool(
+                    ablation_mask & int(CognitionAblation.FUTURE_OPTION)
+                ),
+            )
+        )
         max_score = max(float(item.score) for item in decisions)
 
         after = env.step(action)
@@ -211,6 +247,9 @@ def sample_job(directory: str, handle, job: SamplingJob) -> SamplingBatchResult:
                 effective_epsilon=float(selection.effective_epsilon),
                 development_stage=selection.development_stage,
                 ablation_mask=ablation_mask,
+                future_option_ablation_available=True,
+                future_option_ablation_score_delta=future_option_ablation_score_delta,
+                future_option_ablation_rank_lift=future_option_ablation_rank_lift,
             )
         )
 

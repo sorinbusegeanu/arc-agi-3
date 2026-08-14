@@ -17,6 +17,7 @@ from v7.derivation.scientific import (
     TYPE_STRATEGY,
     TYPE_WORLD_MODEL,
     ScientificDerivationKernels,
+    world_transition_signature,
 )
 from v7.memory.canonical import CanonicalCandidateMutation, CanonicalMemoryKey
 from v7.memory.concept_validation import ConceptValidationStatus
@@ -449,7 +450,7 @@ class OnlineHierarchyBuilder:
                 ):
                     union = tuple(sorted(set(prior_concepts) | set(current)))
                     if len(union) >= 2:
-                        signature = _transition_key(
+                        signature = world_transition_signature(
                             prior_concepts,
                             prior_action,
                             current,
@@ -841,18 +842,6 @@ def _functional_role_signature(
         digest.update(int(value).to_bytes(8, "little", signed=True))
     return int.from_bytes(digest.digest(), "little") & _MASK63
 
-
-def _transition_key(
-    prior: tuple[int, ...],
-    action_id: int,
-    current: tuple[int, ...],
-) -> int:
-    digest = blake2b(digest_size=8)
-    digest.update(b"world-transition-v3")
-    digest.update(str(tuple(prior)).encode("ascii"))
-    digest.update(str(int(action_id)).encode("ascii"))
-    digest.update(str(tuple(current)).encode("ascii"))
-    return int.from_bytes(digest.digest(), "little") & _MASK63
 
 
 def _relation_key(source: int, relation_type: int, target: int) -> int:

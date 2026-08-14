@@ -13,6 +13,7 @@ class CognitionAblation(IntFlag):
     FUNCTIONAL_ROLES = 1 << 2
     RELATIONAL_WORLD_MODELS = 1 << 3
     DEVELOPMENTAL_POLICY = 1 << 4
+    FUTURE_OPTION = 1 << 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,6 +32,8 @@ _NAME_TO_FLAG = {
     "relational_m5": CognitionAblation.RELATIONAL_WORLD_MODELS,
     "developmental_policy": CognitionAblation.DEVELOPMENTAL_POLICY,
     "development": CognitionAblation.DEVELOPMENTAL_POLICY,
+    "future_option": CognitionAblation.FUTURE_OPTION,
+    "future_options": CognitionAblation.FUTURE_OPTION,
 }
 
 
@@ -62,6 +65,7 @@ def ablation_names(mask: int) -> tuple[str, ...]:
         ("functional_roles", CognitionAblation.FUNCTIONAL_ROLES),
         ("relational_world_models", CognitionAblation.RELATIONAL_WORLD_MODELS),
         ("developmental_policy", CognitionAblation.DEVELOPMENTAL_POLICY),
+        ("future_option", CognitionAblation.FUTURE_OPTION),
     )
     return tuple(name for name, flag in canonical if value & flag)
 
@@ -76,4 +80,5 @@ def standard_ablation_masks() -> dict[str, int]:
             CognitionAblation.RELATIONAL_WORLD_MODELS
         ),
         "no_developmental_policy": int(CognitionAblation.DEVELOPMENTAL_POLICY),
+        "no_future_option": int(CognitionAblation.FUTURE_OPTION),
     }

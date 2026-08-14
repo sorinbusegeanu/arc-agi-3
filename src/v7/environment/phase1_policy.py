@@ -118,6 +118,7 @@ class Phase1ActionDecision:
     persistent_failure_risk: float
     dead_end_risk: float
     option_loss_risk: float
+    future_option_score_component: float = 0.0
     development_stage: str = "CONTROL"
 
 
@@ -185,6 +186,14 @@ class Phase1ActionScorer:
             # exploitation from exploration so a validated memory policy can
             # override exploratory preference.
             memory_score = float(row.score) - 0.08 * float(row.exploration_score)
+            future_option_component = float(
+                getattr(row, "future_option_score_component", 0.0)
+            )
+            future_option_ablated = ablated(
+                self.ablation_mask, CognitionAblation.FUTURE_OPTION
+            )
+            if future_option_ablated:
+                memory_score -= future_option_component
 
             if ablated(
                 self.ablation_mask,
@@ -227,7 +236,10 @@ class Phase1ActionScorer:
                 memory_score += 0.08 * signal.reachability
                 memory_score -= 0.20 * signal.failure_risk
                 memory_score -= 0.12 * signal.stall_risk
-                memory_score -= 0.10 * signal.option_loss_risk
+                option_loss_component = -0.10 * signal.option_loss_risk
+                future_option_component += option_loss_component
+                if not future_option_ablated:
+                    memory_score += option_loss_component
 
             failure = max(float(row.failure_risk), signal.failure_risk)
             reachability = max(
@@ -278,6 +290,7 @@ class Phase1ActionScorer:
                     persistent_failure_risk=signal.failure_risk,
                     dead_end_risk=signal.stall_risk,
                     option_loss_risk=signal.option_loss_risk,
+                    future_option_score_component=future_option_component,
                     development_stage=stage_name,
                 )
             )
