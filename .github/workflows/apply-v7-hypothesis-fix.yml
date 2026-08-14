@@ -22,7 +22,10 @@ jobs:
       - name: Install test dependencies
         run: python -m pip install -e '.[test]'
       - name: Apply fixes
-        run: python tools/apply_v7_hypothesis_fix.py
+        run: |
+          cat tools/v7_fix_part_*.txt > tools/apply_v7_hypothesis_fix.py
+          python -m py_compile tools/apply_v7_hypothesis_fix.py
+          python tools/apply_v7_hypothesis_fix.py
       - name: Compile v7
         run: python -m compileall -q src/v7
       - name: Run v7 tests
