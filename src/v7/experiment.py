@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import json
 import time
-from collections import Counter
-from dataclasses import asdict, dataclass, field
+from collections import Counter, defaultdict
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from time import perf_counter
 
@@ -79,6 +79,107 @@ def _representative(actions: list[int]) -> int | None:
     return min(counts.items(), key=lambda item: (-item[1], item[0]))[0]
 
 
+def _sampling_shards(
+    *,
+    games: tuple[str, ...],
+    epoch: int,
+    steps_per_game: int,
+    workers: int,
+    seed: int,
+    env_root: str | None,
+    epsilon: float,
+    ablation_mask: int,
+    first_job_index: int,
+    epoch_count: int,
+) -> tuple[MatureSamplingJob, ...]:
+    """Build balanced independent sampling lanes without multiplying step budget."""
+    game_count = len(games)
+    if game_count <= 0:
+        return ()
+    max_useful_jobs = game_count * int(steps_per_game)
+    target_jobs = max(game_count, min(int(workers), max_useful_jobs))
+    base_shards, extra_shards = divmod(target_jobs, game_count)
+    shard_counts = tuple(
+        base_shards + int(game_index < extra_shards)
+        for game_index in range(game_count)
+    )
+    seed_stride = max(1, int(epoch_count) * game_count)
+    jobs: list[MatureSamplingJob] = []
+    next_job_index = int(first_job_index)
+    for game_index, game_id in enumerate(games):
+        shard_count = int(shard_counts[game_index])
+        base_steps, extra_steps = divmod(int(steps_per_game), shard_count)
+        game_ordinal = int(epoch) * game_count + game_index
+        game_step_base = game_ordinal * int(steps_per_game)
+        consumed = 0
+        for shard_index in range(shard_count):
+            shard_steps = base_steps + int(shard_index < extra_steps)
+            jobs.append(
+                MatureSamplingJob(
+                    job_index=next_job_index,
+                    epoch=int(epoch),
+                    game_id=game_id,
+                    steps=shard_steps,
+                    seed=int(seed) + game_ordinal + shard_index * seed_stride,
+                    global_step_offset=game_step_base + consumed,
+                    env_root=env_root,
+                    epsilon=float(epsilon),
+                    ablation_mask=int(ablation_mask),
+                )
+            )
+            consumed += shard_steps
+            next_job_index += 1
+    return tuple(jobs)
+
+
+def _namespace_sampling_trajectories(sampled, jobs) -> tuple:
+    """Give parallel lanes stable trajectory identities across epochs."""
+    lane_by_job = {
+        int(job.job_index): lane_index
+        for lane_index, job in enumerate(jobs)
+    }
+    namespaced = []
+    for batch in sampled:
+        lane_index = lane_by_job[int(batch.job_index)]
+        prefix = f"lane_{lane_index:04d}/"
+        trajectories = tuple(
+            replace(
+                trajectory,
+                level_key=prefix + str(trajectory.level_key),
+            )
+            for trajectory in batch.trajectories
+        )
+        namespaced.append(replace(batch, trajectories=trajectories))
+    return tuple(namespaced)
+
+
+def _append_aggregated_game_results(
+    results: list[ArcGameRunResult],
+    *,
+    sampled,
+    games: tuple[str, ...],
+    generation: int,
+    memories: int,
+) -> None:
+    grouped = defaultdict(list)
+    for batch in sampled:
+        grouped[str(batch.game_id)].append(batch)
+    for game_id in games:
+        batches = grouped.get(str(game_id), ())
+        results.append(
+            ArcGameRunResult(
+                game_id=game_id,
+                steps=sum(int(batch.steps) for batch in batches),
+                generation=int(generation),
+                memories=int(memories),
+                wins=sum(int(batch.wins) for batch in batches),
+                failures=sum(int(batch.failures) for batch in batches),
+                levels_completed=sum(int(batch.levels_completed) for batch in batches),
+                resets=sum(int(batch.resets) for batch in batches),
+            )
+        )
+
+
 def _write_trajectory_evidence(runtime: V7Runtime, sampled) -> int:
     """Reconstruct bounded successful/failed action sequences from step evidence."""
     generation_id = int(runtime.writer.mutable_generation_id)
@@ -88,6 +189,11 @@ def _write_trajectory_evidence(runtime: V7Runtime, sampled) -> int:
         contexts: list[int] = []
         future_sum = 0.0
         level_index = 0
+        terminal_index = 0
+        trajectory_keys = tuple(
+            str(trajectory.level_key)
+            for trajectory in getattr(batch, "trajectories", ()) or ()
+        )
         for row in batch.evidence:
             actions.append(int(row.action_id))
             context_values = tuple(
@@ -103,7 +209,12 @@ def _write_trajectory_evidence(runtime: V7Runtime, sampled) -> int:
             polarity = int(getattr(row, "terminal_polarity", 0) or 0)
             if polarity == 0:
                 continue
-            level_key = f"level_{level_index:04d}"
+            level_key = (
+                trajectory_keys[terminal_index]
+                if terminal_index < len(trajectory_keys)
+                else f"level_{level_index:04d}"
+            )
+            terminal_index += 1
             records.append(
                 EvidenceRecord(
                     memory_id=None,
@@ -215,26 +326,23 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
                     epoch,
                     f"epoch starting generation={int(record.generation_id)} memories={final_memories}",
                 )
-                jobs: list[MatureSamplingJob] = []
-                for game_index, game_id in enumerate(config.games):
-                    ordinal = epoch * len(config.games) + game_index
-                    jobs.append(
-                        MatureSamplingJob(
-                            job_index=global_job_index,
-                            epoch=epoch,
-                            game_id=game_id,
-                            steps=config.steps_per_game,
-                            seed=config.seed + ordinal,
-                            global_step_offset=ordinal * config.steps_per_game,
-                            env_root=config.env_root,
-                            epsilon=config.epsilon,
-                            ablation_mask=int(config.ablation_mask),
-                        )
-                    )
-                    global_job_index += 1
+                jobs = _sampling_shards(
+                    games=config.games,
+                    epoch=epoch,
+                    steps_per_game=config.steps_per_game,
+                    workers=config.workers,
+                    seed=config.seed,
+                    env_root=config.env_root,
+                    epsilon=config.epsilon,
+                    ablation_mask=config.ablation_mask,
+                    first_job_index=global_job_index,
+                    epoch_count=config.epochs,
+                )
+                global_job_index += len(jobs)
 
                 sampling_started = perf_counter()
                 sampled = sampling_pool.run_wave(handle=record.handle, jobs=jobs)
+                sampled = _namespace_sampling_trajectories(sampled, jobs)
                 cognition.observe_epoch(epoch, sampled)
                 epoch_levels = sum(batch.levels_completed for batch in sampled)
                 epoch_wins = sum(batch.wins for batch in sampled)
@@ -306,19 +414,13 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
                     f"seconds={perf_counter() - ingestion_phase_started:.2f}",
                 )
 
-                for batch in sampled:
-                    results.append(
-                        ArcGameRunResult(
-                            game_id=batch.game_id,
-                            steps=batch.steps,
-                            generation=final_generation,
-                            memories=final_memories,
-                            wins=batch.wins,
-                            failures=batch.failures,
-                            levels_completed=batch.levels_completed,
-                            resets=batch.resets,
-                        )
-                    )
+                _append_aggregated_game_results(
+                    results,
+                    sampled=sampled,
+                    games=config.games,
+                    generation=final_generation,
+                    memories=final_memories,
+                )
 
                 hypotheses = evaluate_hypothesis_suite(
                     runtime,
