@@ -21,8 +21,16 @@ TYPE_EXECUTABLE_PROCEDURE = 601
 
 
 def planning_context(signatures: Iterable[int], fallback: int = 0) -> int:
-    """Return the C2 planning context when available, otherwise the best fallback."""
+    """Return the reusable combined planning context with legacy compatibility."""
     values = tuple(int(value) for value in signatures)
+    # Phase 4 context lattice: C0 general, C1 behavioral, C2 structural,
+    # C3 combined, C4 exact. C3 is the persistent planning identity.
+    if len(values) >= 5:
+        return int(values[3])
+    # Ordinary phase-4 evidence omits C4, leaving C0-C3.
+    if len(values) == 4:
+        return int(values[3])
+    # Phase-1/legacy evidence used C0,C1,C2 where C2 was planning context.
     if len(values) >= 3:
         return int(values[2])
     if values:
