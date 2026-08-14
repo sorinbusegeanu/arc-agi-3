@@ -118,7 +118,7 @@ def test_transfer_candidate_gets_bounded_probe_priority() -> None:
             )
         },
     )
-    assert _transfer_probe_strength(candidate_view, (concept,)) == 0.72
+    assert abs(_transfer_probe_strength(candidate_view, (concept,)) - 0.72) < 1e-12
     candidate_view.nodes[concept].status_flags = int(
         ConceptValidationStatus.TRANSFER_REJECTED
     )
