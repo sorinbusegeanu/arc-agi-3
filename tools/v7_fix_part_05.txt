@@ -61,7 +61,7 @@ def test_h09_uses_direct_option_change_without_proxy(tmp_path) -> None:
     try:
         rows = []
         for step, game, context in ((1, "g1", "a"), (2, "g1", "b"), (3, "g2", "c"), (4, "g2", "d")):
-            rows.append(EvidenceRecord(None, int(EvidenceType.EPISODE), 1, game, context, step, {"raw_action_option_delta": 1.0, "carrier_signature": 77, "action_id": 2}))
+            rows.append(EvidenceRecord(memory_id=None, evidence_type=int(EvidenceType.EPISODE), generation_id=1, payload={"raw_action_option_delta": 1.0, "carrier_signature": 77, "action_id": 2}, source_game=game, source_context=context, source_global_step=step))
         runtime.evidence.append_evidence_batch(rows)
         result = _h09(_Snapshot(runtime))
         assert result["raw_decision"] == "VALID"
@@ -76,7 +76,7 @@ def test_h10_uses_paired_same_state_scorer_ablation(tmp_path) -> None:
         rows = []
         for step in range(20):
             high = step < 10
-            rows.append(EvidenceRecord(None, int(EvidenceType.EPISODE), 1, "g1", str(step), step + 1, {"raw_action_option_delta": 2.0 if high else 0.0, "future_option_ablation_available": True, "future_option_ablation_score_delta": 0.20 if high else 0.01, "future_option_ablation_rank_lift": 1 if high else 0}))
+            rows.append(EvidenceRecord(memory_id=None, evidence_type=int(EvidenceType.EPISODE), generation_id=1, payload={"raw_action_option_delta": 2.0 if high else 0.0, "future_option_ablation_available": True, "future_option_ablation_score_delta": 0.20 if high else 0.01, "future_option_ablation_rank_lift": 1 if high else 0}, source_game="g1", source_context=str(step), source_global_step=step + 1))
         runtime.evidence.append_evidence_batch(rows)
         result = _h10(_Snapshot(runtime))
         assert result["raw_decision"] == "VALID"
