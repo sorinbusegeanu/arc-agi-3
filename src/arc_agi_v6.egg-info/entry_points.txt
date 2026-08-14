@@ -1,2 +1,0 @@
-[console_scripts]
-arc-agi3-v7 = v7.cli:main

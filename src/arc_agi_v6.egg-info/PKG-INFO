@@ -2,14 +2,4 @@ Metadata-Version: 2.4
 Name: arc-agi-v6
 Version: 0.1.0
 Summary: AGI v6 - Agent General Intelligence System
-Requires-Python: >=3.12
-Requires-Dist: arc-agi<1.0,>=0.9.9
-Requires-Dist: duckdb>=1.0
-Requires-Dist: networkx>=3.0
-Requires-Dist: numpy>=1.26
-Requires-Dist: pandas>=2.0
-Requires-Dist: pyarrow>=15.0
-Requires-Dist: scikit-learn>=1.4
-Requires-Dist: tqdm>=4.66
-Provides-Extra: test
-Requires-Dist: pytest>=8.0; extra == "test"
+Requires-Python: >=3.8
