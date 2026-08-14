@@ -19,6 +19,16 @@ class ConceptValidationStatus(IntFlag):
     TRUSTED = 1 << 13
 
 
+_VALIDATION_MASK = int(
+    ConceptValidationStatus.CANDIDATE
+    | ConceptValidationStatus.TRANSFER_VALIDATED
+    | ConceptValidationStatus.TRANSFER_REJECTED
+    | ConceptValidationStatus.STRUCTURAL_SUPPORTED
+    | ConceptValidationStatus.TRANSFER_CANDIDATE
+    | ConceptValidationStatus.TRUSTED
+)
+
+
 @dataclass(frozen=True, slots=True)
 class ConceptValidationPolicy:
     minimum_support: int = 2
@@ -118,9 +128,7 @@ class EmpiricalConceptValidator:
 
             flags = int(node.status_flags)
             flags = self._set_flag(
-                flags,
-                ConceptValidationStatus.CANDIDATE,
-                candidate,
+                flags, ConceptValidationStatus.CANDIDATE, candidate
             )
             flags = self._set_flag(
                 flags,
@@ -138,9 +146,7 @@ class EmpiricalConceptValidator:
                 validated,
             )
             flags = self._set_flag(
-                flags,
-                ConceptValidationStatus.TRUSTED,
-                trusted,
+                flags, ConceptValidationStatus.TRUSTED, trusted
             )
             flags = self._set_flag(
                 flags,
@@ -185,17 +191,26 @@ class EmpiricalConceptValidator:
         writer: CanonicalMemoryWriter,
     ) -> int:
         mutations = []
+        current_nodes = getattr(writer, "_nodes")
         for decision in decisions:
-            if decision.next_flags == decision.previous_flags:
+            current = current_nodes.get(decision.memory_id)
+            if current is None:
                 continue
-            node = view.nodes[decision.memory_id]
+            # Lifecycle and concept validation run in one mutable generation.
+            # Merge only the concept-validation bit range so replay/promotion
+            # flags written earlier in the same generation are never lost.
+            merged_flags = (
+                int(current.status_flags) & ~_VALIDATION_MASK
+            ) | (int(decision.next_flags) & _VALIDATION_MASK)
+            if merged_flags == int(current.status_flags):
+                continue
             mutations.append(
                 NodeMutation(
-                    node.memory_id,
-                    node.level,
-                    node.type_id,
+                    current.memory_id,
+                    current.level,
+                    current.type_id,
                     support_delta=0,
-                    status_flags=decision.next_flags,
+                    status_flags=merged_flags,
                 )
             )
         return writer.apply_mutation_batch(mutations) if mutations else 0
