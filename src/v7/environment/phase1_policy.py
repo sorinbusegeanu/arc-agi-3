@@ -5,15 +5,18 @@ from dataclasses import dataclass
 from random import Random
 from typing import Iterable
 
+from v7.environment.ablation import CognitionAblation, ablated
 from v7.environment.cognition import (
     ContextualActionDecision,
     ContextualActionScorer,
     DecisionContext,
     LocalCognitionOverlay,
 )
+from v7.memory.developmental_policy import DevelopmentStage, profile_for_view
 from v7.memory.ids import MemoryId
-from v7.memory.planning import PersistentPlanningGraph, StrategyProcedure
+from v7.memory.planning import PersistentPlanningGraph
 from v7.memory.read_view import MemoryReadView
+from v7.memory.semantic_relations import TYPE_RELATIONAL_WORLD_MODEL
 
 
 def _clamp01(value: float) -> float:
@@ -35,6 +38,7 @@ class Phase1ActionDecision:
     persistent_failure_risk: float
     dead_end_risk: float
     option_loss_risk: float
+    development_stage: str = "CONTROL"
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,18 +47,25 @@ class Phase1Selection:
     mode: str
     strategy_id: int | None = None
     effective_epsilon: float = 0.0
+    development_stage: str = "CONTROL"
 
 
 class Phase1ActionScorer:
-    """Augment contextual v7 scores with persistent planning evidence.
+    """Contextual exploitation score augmented by persistent planning.
 
-    Exploration remains a separate signal. The returned score is an
-    exploitation/memory score rather than exploration already mixed into the
-    same scalar.
+    Phase 5 adjusts planning depth from evidence maturity. Phase 6 ablations
+    remove mechanisms at the acting-policy boundary without mutating the shared
+    memory substrate.
     """
 
-    def __init__(self, planning: PersistentPlanningGraph) -> None:
+    def __init__(
+        self,
+        planning: PersistentPlanningGraph,
+        *,
+        ablation_mask: int = 0,
+    ) -> None:
         self.planning = planning
+        self.ablation_mask = int(ablation_mask)
         self.base = ContextualActionScorer()
 
     def score_actions(
@@ -71,27 +82,72 @@ class Phase1ActionScorer:
             actions=actions,
             overlay=overlay,
         )
+        profile = profile_for_view(view)
+        stage_name = profile.stage.name
+        planning_depth = (
+            3
+            if ablated(
+                self.ablation_mask,
+                CognitionAblation.DEVELOPMENTAL_POLICY,
+            )
+            else int(profile.planning_depth)
+        )
         output: list[Phase1ActionDecision] = []
         for row in base_rows:
-            planning_input = view.score_inputs(
-                context_signature=contexts.planning_signature,
-                action_ids=(row.action_id,),
-            )[0]
-            signal = self.planning.evaluate(
-                view,
-                planning_input.contingency_ids,
-                depth=3,
-                max_nodes=64,
+            signal = self._planning_signal(
+                view=view,
+                contexts=contexts,
+                row=row,
+                depth=planning_depth,
             )
 
-            # The base scorer includes +0.08*exploration. Remove that term so
-            # exploration and exploitation can be arbitrated explicitly.
+            # Base scorer mixes +0.08 exploration. Phase-1+ policy separates
+            # exploitation from exploration so a validated memory policy can
+            # override exploratory preference.
             memory_score = float(row.score) - 0.08 * float(row.exploration_score)
-            memory_score += 0.12 * signal.success_reachability
-            memory_score += 0.08 * signal.reachability
-            memory_score -= 0.20 * signal.failure_risk
-            memory_score -= 0.12 * signal.stall_risk
-            memory_score -= 0.10 * signal.option_loss_risk
+
+            if ablated(
+                self.ablation_mask,
+                CognitionAblation.FUNCTIONAL_ROLES,
+            ):
+                role_strength = self.base._memory_strength(  # noqa: SLF001
+                    view,
+                    getattr(row.support, "role_ids", ()) or (),
+                )
+                memory_score -= 0.08 * role_strength
+
+            if ablated(
+                self.ablation_mask,
+                CognitionAblation.RELATIONAL_WORLD_MODELS,
+            ):
+                all_worlds = tuple(
+                    int(value)
+                    for value in getattr(row.support, "world_model_ids", ()) or ()
+                )
+                transition_worlds = tuple(
+                    memory_id
+                    for memory_id in all_worlds
+                    if (
+                        (node := view.nodes.get(MemoryId(memory_id))) is not None
+                        and int(node.type_id) != TYPE_RELATIONAL_WORLD_MODEL
+                    )
+                )
+                all_strength = self.base._memory_strength(view, all_worlds)  # noqa: SLF001
+                transition_strength = self.base._memory_strength(  # noqa: SLF001
+                    view,
+                    transition_worlds,
+                )
+                memory_score -= 0.10 * max(0.0, all_strength - transition_strength)
+
+            if not ablated(
+                self.ablation_mask,
+                CognitionAblation.PERSISTENT_PLANNING,
+            ):
+                memory_score += 0.12 * signal.success_reachability
+                memory_score += 0.08 * signal.reachability
+                memory_score -= 0.20 * signal.failure_risk
+                memory_score -= 0.12 * signal.stall_risk
+                memory_score -= 0.10 * signal.option_loss_risk
 
             failure = max(float(row.failure_risk), signal.failure_risk)
             reachability = max(
@@ -101,12 +157,16 @@ class Phase1ActionScorer:
             )
             support = int(getattr(row.support, "contextual_support", 0) or 0)
             local_support = int(getattr(row.support, "local_support", 0) or 0)
-            support_confidence = 1.0 - math.exp(-max(0, support + local_support) / 4.0)
+            support_confidence = 1.0 - math.exp(
+                -max(0, support + local_support) / 4.0
+            )
             semantic_confidence = max(
                 _clamp01(reachability),
                 _clamp01(failure),
                 _clamp01(row.contradiction_risk),
                 _clamp01(signal.success_reachability),
+                _clamp01(row.prediction_confidence),
+                _clamp01(row.completion_likelihood),
             )
             confidence = _clamp01(
                 0.65 * support_confidence + 0.35 * semantic_confidence
@@ -127,13 +187,40 @@ class Phase1ActionScorer:
                     persistent_failure_risk=signal.failure_risk,
                     dead_end_risk=signal.stall_risk,
                     option_loss_risk=signal.option_loss_risk,
+                    development_stage=stage_name,
                 )
             )
         return tuple(sorted(output, key=lambda item: item.action_id))
 
+    def _planning_signal(
+        self,
+        *,
+        view: MemoryReadView,
+        contexts: DecisionContext,
+        row: ContextualActionDecision,
+        depth: int,
+    ):
+        if ablated(
+            self.ablation_mask,
+            CognitionAblation.PERSISTENT_PLANNING,
+        ):
+            from v7.memory.planning import PlanningSignal
+
+            return PlanningSignal()
+        planning_input = view.score_inputs(
+            context_signature=contexts.planning_signature,
+            action_ids=(row.action_id,),
+        )[0]
+        return self.planning.evaluate(
+            view,
+            planning_input.contingency_ids,
+            depth=max(1, int(depth)),
+            max_nodes=64,
+        )
+
 
 class StrategyExecutionCursor:
-    """Execute a validated successful M6 procedure step-by-step until it diverges."""
+    """Execute a validated successful M6 procedure step-by-step until divergence."""
 
     def __init__(
         self,
@@ -205,7 +292,8 @@ class StrategyExecutionCursor:
                     continue
                 candidate = (confidence, -len(procedure.steps), strategy_id, decision)
                 if best is None or candidate[:2] > best[:2] or (
-                    candidate[:2] == best[:2] and int(strategy_id) < int(best[2])
+                    candidate[:2] == best[:2]
+                    and int(strategy_id) < int(best[2])
                 ):
                     best = candidate
 
@@ -224,21 +312,23 @@ class StrategyExecutionCursor:
     ) -> None:
         if self.strategy_id is None:
             return
-        if selected_strategy_id is None or int(selected_strategy_id) != int(self.strategy_id):
+        if selected_strategy_id is None or int(selected_strategy_id) != int(
+            self.strategy_id
+        ):
             self.reset()
             return
         if int(terminal_polarity) != 0:
             self.reset()
             return
         self.position += 1
-        # Context mismatch is checked before executing the next step. We can
-        # reject immediately when the expected context is already known.
-        # The procedure itself is looked up on the next recommend() call.
         if next_context_signature is None:
             self.reset()
 
     @staticmethod
-    def _strategy_confidence(view: MemoryReadView, strategy_id: MemoryId) -> float:
+    def _strategy_confidence(
+        view: MemoryReadView,
+        strategy_id: MemoryId,
+    ) -> float:
         node = view.nodes.get(strategy_id)
         if node is None:
             return 0.0
@@ -263,34 +353,73 @@ def select_phase1_action(
     decisions: Iterable[Phase1ActionDecision],
     rng: Random,
     epsilon: float,
+    ablation_mask: int = 0,
 ) -> Phase1Selection:
     rows = tuple(decisions)
     if not rows:
         raise ValueError("environment returned no available actions")
 
-    strategy = cursor.recommend(
-        view=view,
-        planning=planning,
-        contexts=contexts,
-        decisions=rows,
+    profile = profile_for_view(view)
+    stage_name = profile.stage.name
+    strategy_enabled = not ablated(
+        ablation_mask,
+        CognitionAblation.STRATEGY_EXECUTION,
     )
-    if strategy is not None:
-        decision, strategy_id = strategy
-        return Phase1Selection(
-            decision=decision,
-            mode="strategy",
-            strategy_id=int(strategy_id),
-            effective_epsilon=0.0,
+    if strategy_enabled:
+        strategy = cursor.recommend(
+            view=view,
+            planning=planning,
+            contexts=contexts,
+            decisions=rows,
         )
+        if strategy is not None:
+            decision, strategy_id = strategy
+            return Phase1Selection(
+                decision=decision,
+                mode="strategy",
+                strategy_id=int(strategy_id),
+                effective_epsilon=0.0,
+                development_stage=stage_name,
+            )
+    else:
+        cursor.reset()
 
     memory = min(rows, key=lambda item: (-item.score, item.action_id))
     exploration = min(
-        rows, key=lambda item: (-item.exploration_score, item.action_id)
+        rows,
+        key=lambda item: (-item.exploration_score, item.action_id),
     )
     confidence = _clamp01(memory.memory_confidence)
-    effective_epsilon = _clamp01(float(epsilon)) * (1.0 - confidence) ** 2
+    developmental_multiplier = (
+        1.0
+        if ablated(
+            ablation_mask,
+            CognitionAblation.DEVELOPMENTAL_POLICY,
+        )
+        else float(profile.exploration_multiplier)
+    )
+    effective_epsilon = _clamp01(
+        float(epsilon)
+        * developmental_multiplier
+        * (1.0 - confidence) ** 2
+    )
 
-    if confidence >= 0.78:
+    # Mature validated knowledge earns near-deterministic exploitation. Early
+    # stages remain more exploratory until confidence is supported.
+    high_confidence_threshold = (
+        0.78
+        if ablated(
+            ablation_mask,
+            CognitionAblation.DEVELOPMENTAL_POLICY,
+        )
+        else 0.82
+        if profile.stage <= DevelopmentStage.CONTINGENCY
+        else 0.76
+        if profile.stage <= DevelopmentStage.TRANSFER
+        else 0.68
+    )
+
+    if confidence >= high_confidence_threshold:
         selected = memory
         mode = "memory"
     elif effective_epsilon > 0.0 and rng.random() < effective_epsilon:
@@ -301,6 +430,11 @@ def select_phase1_action(
         mode = "exploration"
     else:
         temperature = 0.08 + 0.32 * (1.0 - confidence)
+        if profile.stage >= DevelopmentStage.PLANNING and not ablated(
+            ablation_mask,
+            CognitionAblation.DEVELOPMENTAL_POLICY,
+        ):
+            temperature *= 0.70
         maximum = max(float(item.score) for item in rows)
         weights = [
             math.exp((float(item.score) - maximum) / max(1e-6, temperature))
@@ -313,10 +447,7 @@ def select_phase1_action(
             selected = rng.choices(list(rows), weights=weights, k=1)[0]
         mode = "memory" if selected.action_id == memory.action_id else "stochastic"
 
-    # If the chosen memory action is the first step of a sufficiently strong
-    # stored procedure, start the cursor now so subsequent steps are executed
-    # procedurally instead of independently rescored.
-    if mode != "exploration":
+    if strategy_enabled and mode != "exploration":
         started = cursor.recommend(
             view=view,
             planning=planning,
@@ -330,6 +461,7 @@ def select_phase1_action(
                 mode="strategy",
                 strategy_id=int(strategy_id),
                 effective_epsilon=effective_epsilon,
+                development_stage=stage_name,
             )
 
     return Phase1Selection(
@@ -337,4 +469,5 @@ def select_phase1_action(
         mode=mode,
         strategy_id=None,
         effective_epsilon=effective_epsilon,
+        development_stage=stage_name,
     )

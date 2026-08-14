@@ -7,9 +7,14 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from time import perf_counter
 
+from v7.environment.ablation import MatureSamplingJob, ablation_names
 from v7.environment.online_sampling import sample_job as online_sample_job
-from v7.environment.parallel_sampling import ParallelSamplingPool, SamplingJob
+from v7.environment.parallel_sampling import ParallelSamplingPool
 from v7.environment.runner import ArcGameRunResult
+from v7.evaluation.cognition_metrics import (
+    CognitionMetricsAccumulator,
+    cross_game_transfer_counts,
+)
 from v7.game_sets import resolve_game_selector
 from v7.hypotheses import evaluate_hypothesis_suite
 from v7.memory.evidence_store import EvidenceRecord
@@ -35,6 +40,7 @@ class V7ExperimentConfig:
     ram_ramp_threshold_percent: float = 85.0
     initial_worker_ramp_delay_seconds: float = 20.0
     per_worker_ramp_delay_seconds: float = 5.0
+    ablation_mask: int = 0
 
     def __post_init__(self) -> None:
         if not self.games:
@@ -43,6 +49,8 @@ class V7ExperimentConfig:
             raise ValueError("steps_per_game, epochs and commit_every must be positive")
         if self.workers <= 0 or self.derivation_workers <= 0 or self.report_workers <= 0:
             raise ValueError("worker counts must be positive")
+        if int(self.ablation_mask) < 0:
+            raise ValueError("ablation_mask must be non-negative")
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +65,7 @@ class V7ExperimentResult:
     levels_completed: int
     runs: tuple[ArcGameRunResult, ...]
     execution_metrics: dict[str, object] = field(default_factory=dict)
+    cognition_metrics: dict[str, object] = field(default_factory=dict)
 
 
 def _log(epoch: int, message: str) -> None:
@@ -95,31 +104,60 @@ def _write_trajectory_evidence(runtime: V7Runtime, sampled) -> int:
             if polarity == 0:
                 continue
             level_key = f"level_{level_index:04d}"
-            records.append(EvidenceRecord(
-                memory_id=None,
-                evidence_type=int(EvidenceType.TRAJECTORY),
-                generation_id=generation_id,
-                source_game=batch.game_id,
-                source_context=level_key,
-                source_global_step=row.source_global_step,
-                payload={
-                    "epoch": int(batch.epoch),
-                    "level_key": level_key,
-                    "steps_to_success": len(actions),
-                    "future_option_sum": future_sum,
-                    "future_option_per_action": future_sum / max(1, len(actions)),
-                    "representative_action": _representative(actions),
-                    "action_sequence": list(actions[:256]),
-                    "context_sequence": list(contexts[:256]),
-                    "success": polarity > 0,
-                },
-            ))
+            records.append(
+                EvidenceRecord(
+                    memory_id=None,
+                    evidence_type=int(EvidenceType.TRAJECTORY),
+                    generation_id=generation_id,
+                    source_game=batch.game_id,
+                    source_context=level_key,
+                    source_global_step=row.source_global_step,
+                    payload={
+                        "epoch": int(batch.epoch),
+                        "level_key": level_key,
+                        "steps_to_success": len(actions),
+                        "future_option_sum": future_sum,
+                        "future_option_per_action": future_sum / max(1, len(actions)),
+                        "representative_action": _representative(actions),
+                        "action_sequence": list(actions[:256]),
+                        "context_sequence": list(contexts[:256]),
+                        "success": polarity > 0,
+                    },
+                )
+            )
             if polarity > 0:
                 level_index += 1
             actions.clear()
             contexts.clear()
             future_sum = 0.0
     return runtime.evidence.append_evidence_batch(records)
+
+
+def _write_cognition_metrics(
+    root: Path,
+    *,
+    epoch: int | None,
+    accumulator: CognitionMetricsAccumulator,
+    runtime: V7Runtime,
+    ablation_mask: int,
+) -> dict[str, object]:
+    trials, successes = cross_game_transfer_counts(
+        runtime.lifecycle_evidence.connection
+    )
+    payload = accumulator.snapshot(
+        transfer_trials=trials,
+        transfer_successes=successes,
+    ).as_dict()
+    payload["ablation_mask"] = int(ablation_mask)
+    payload["ablations"] = list(ablation_names(ablation_mask))
+    if epoch is None:
+        path = root / "cognition_metrics.json"
+    else:
+        directory = root / "reports" / f"epoch_{epoch + 1:04d}"
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / "cognition_metrics.json"
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    return payload
 
 
 def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7ExperimentResult:
@@ -136,23 +174,30 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
         initial_worker_ramp_delay_seconds=config.initial_worker_ramp_delay_seconds,
         per_worker_ramp_delay_seconds=config.per_worker_ramp_delay_seconds,
     )
+    active_ablations = ablation_names(config.ablation_mask)
+    ablation_text = ",".join(active_ablations) if active_ablations else "none"
     print(
         f"v7 experiment: games={len(config.games)} epochs={config.epochs} steps/game={config.steps_per_game} "
         f"workers={config.workers} initial_workers={parallel_config.resolved_initial_workers} "
-        f"derivation_workers={config.derivation_workers} report_workers={config.report_workers}",
+        f"derivation_workers={config.derivation_workers} report_workers={config.report_workers} "
+        f"ablations={ablation_text}",
         flush=True,
     )
-    runtime = V7Runtime(V7RuntimeConfig.from_path(
-        root_path,
-        restore=True,
-        derivation_workers=config.derivation_workers,
-        max_tasks_per_child=config.max_tasks_per_child,
-    ))
+    runtime = V7Runtime(
+        V7RuntimeConfig.from_path(
+            root_path,
+            restore=True,
+            derivation_workers=config.derivation_workers,
+            max_tasks_per_child=config.max_tasks_per_child,
+        )
+    )
     results: list[ArcGameRunResult] = []
     global_job_index = 0
     final_generation = int(runtime.writer.published_view.generation_id)
     final_memories = len(runtime.writer.published_view.nodes)
     metrics: dict[str, object] = {}
+    cognition_metrics: dict[str, object] = {}
+    cognition = CognitionMetricsAccumulator()
     try:
         with ParallelSamplingPool(
             directory=root_path / "segments",
@@ -164,24 +209,31 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
                 record = runtime.publisher.current_record
                 if record is None:
                     raise RuntimeError("v7 runtime has no published generation")
-                _log(epoch, f"epoch starting generation={int(record.generation_id)} memories={final_memories}")
-                jobs: list[SamplingJob] = []
+                _log(
+                    epoch,
+                    f"epoch starting generation={int(record.generation_id)} memories={final_memories}",
+                )
+                jobs: list[MatureSamplingJob] = []
                 for game_index, game_id in enumerate(config.games):
                     ordinal = epoch * len(config.games) + game_index
-                    jobs.append(SamplingJob(
-                        job_index=global_job_index,
-                        epoch=epoch,
-                        game_id=game_id,
-                        steps=config.steps_per_game,
-                        seed=config.seed + ordinal,
-                        global_step_offset=ordinal * config.steps_per_game,
-                        env_root=config.env_root,
-                        epsilon=config.epsilon,
-                    ))
+                    jobs.append(
+                        MatureSamplingJob(
+                            job_index=global_job_index,
+                            epoch=epoch,
+                            game_id=game_id,
+                            steps=config.steps_per_game,
+                            seed=config.seed + ordinal,
+                            global_step_offset=ordinal * config.steps_per_game,
+                            env_root=config.env_root,
+                            epsilon=config.epsilon,
+                            ablation_mask=int(config.ablation_mask),
+                        )
+                    )
                     global_job_index += 1
 
                 sampling_started = perf_counter()
                 sampled = sampling_pool.run_wave(handle=record.handle, jobs=jobs)
+                cognition.observe_epoch(epoch, sampled)
                 _log(
                     epoch,
                     f"sampling done jobs={len(sampled)} levels={sum(batch.levels_completed for batch in sampled)} "
@@ -199,20 +251,34 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
                         del buffer[: config.commit_every]
                         ingestion_started = perf_counter()
                         runtime.observe_batch(chunk)
-                        sampling_pool.metrics.canonical_ingestion_seconds += perf_counter() - ingestion_started
+                        sampling_pool.metrics.canonical_ingestion_seconds += (
+                            perf_counter() - ingestion_started
+                        )
                         commit_started = perf_counter()
-                        committed = runtime.commit(run_lifecycle=False, derive_hierarchy=False)
-                        sampling_pool.metrics.generation_commit_seconds += perf_counter() - commit_started
+                        committed = runtime.commit(
+                            run_lifecycle=False,
+                            derive_hierarchy=False,
+                        )
+                        sampling_pool.metrics.generation_commit_seconds += (
+                            perf_counter() - commit_started
+                        )
                         final_generation = int(committed.state.generation_id)
                         final_memories = len(committed.view.nodes)
                         commit_count += 1
                 if buffer:
                     ingestion_started = perf_counter()
                     runtime.observe_batch(tuple(buffer))
-                    sampling_pool.metrics.canonical_ingestion_seconds += perf_counter() - ingestion_started
+                    sampling_pool.metrics.canonical_ingestion_seconds += (
+                        perf_counter() - ingestion_started
+                    )
                     commit_started = perf_counter()
-                    committed = runtime.commit(run_lifecycle=False, derive_hierarchy=False)
-                    sampling_pool.metrics.generation_commit_seconds += perf_counter() - commit_started
+                    committed = runtime.commit(
+                        run_lifecycle=False,
+                        derive_hierarchy=False,
+                    )
+                    sampling_pool.metrics.generation_commit_seconds += (
+                        perf_counter() - commit_started
+                    )
                     final_generation = int(committed.state.generation_id)
                     final_memories = len(committed.view.nodes)
                     commit_count += 1
@@ -220,7 +286,9 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
                 _write_trajectory_evidence(runtime, sampled)
                 finalize_started = perf_counter()
                 committed = runtime.commit(run_lifecycle=True, derive_hierarchy=True)
-                sampling_pool.metrics.generation_commit_seconds += perf_counter() - finalize_started
+                sampling_pool.metrics.generation_commit_seconds += (
+                    perf_counter() - finalize_started
+                )
                 final_generation = int(committed.state.generation_id)
                 final_memories = len(committed.view.nodes)
                 _log(
@@ -230,16 +298,18 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
                 )
 
                 for batch in sampled:
-                    results.append(ArcGameRunResult(
-                        game_id=batch.game_id,
-                        steps=batch.steps,
-                        generation=final_generation,
-                        memories=final_memories,
-                        wins=batch.wins,
-                        failures=batch.failures,
-                        levels_completed=batch.levels_completed,
-                        resets=batch.resets,
-                    ))
+                    results.append(
+                        ArcGameRunResult(
+                            game_id=batch.game_id,
+                            steps=batch.steps,
+                            generation=final_generation,
+                            memories=final_memories,
+                            wins=batch.wins,
+                            failures=batch.failures,
+                            levels_completed=batch.levels_completed,
+                            resets=batch.resets,
+                        )
+                    )
 
                 hypotheses = evaluate_hypothesis_suite(
                     runtime,
@@ -247,11 +317,24 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
                     output_root=root_path,
                     workers=config.report_workers,
                 )
-                summary = " ".join(
+                cognition_metrics = _write_cognition_metrics(
+                    root_path,
+                    epoch=epoch,
+                    accumulator=cognition,
+                    runtime=runtime,
+                    ablation_mask=config.ablation_mask,
+                )
+                hypothesis_summary = " ".join(
                     f'{hypothesis_id}={payload["final_decision"]}'
                     for hypothesis_id, payload in sorted(hypotheses.items())
                 )
-                _log(epoch, f"hypotheses {summary}")
+                _log(epoch, f"hypotheses {hypothesis_summary}")
+                _log(
+                    epoch,
+                    f"cognition solved_games={cognition_metrics['solved_game_count_by_epoch'][-1]} "
+                    f"repeat_rate={cognition_metrics['repeat_solution_rate']} "
+                    f"retention_rate={cognition_metrics['solution_retention_rate']}",
+                )
                 _log(
                     epoch,
                     f"epoch done generation={final_generation} memories={final_memories} "
@@ -259,15 +342,27 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
                     f"failures={sum(batch.failures for batch in sampled)} seconds={perf_counter() - epoch_started:.2f}",
                 )
 
+            cognition_metrics = _write_cognition_metrics(
+                root_path,
+                epoch=None,
+                accumulator=cognition,
+                runtime=runtime,
+                ablation_mask=config.ablation_mask,
+            )
             metrics = sampling_pool.metrics.as_dict()
-            metrics.update({
-                "derivation_workers": config.derivation_workers,
-                "report_workers": config.report_workers,
-                "nested_pool_oversubscription": False,
-                "generation_model": "immutable_wave_single_writer_with_local_online_overlay",
-            })
+            metrics.update(
+                {
+                    "derivation_workers": config.derivation_workers,
+                    "report_workers": config.report_workers,
+                    "nested_pool_oversubscription": False,
+                    "generation_model": "immutable_wave_single_writer_with_local_online_overlay",
+                    "ablation_mask": int(config.ablation_mask),
+                    "ablations": list(active_ablations),
+                }
+            )
             (root_path / "parallel_runtime_metrics.json").write_text(
-                json.dumps(metrics, indent=2, sort_keys=True), encoding="utf-8"
+                json.dumps(metrics, indent=2, sort_keys=True),
+                encoding="utf-8",
             )
     finally:
         runtime.close()
@@ -283,9 +378,11 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
         levels_completed=sum(item.levels_completed for item in results),
         runs=tuple(results),
         execution_metrics=metrics,
+        cognition_metrics=cognition_metrics,
     )
     (root_path / "experiment_summary.json").write_text(
-        json.dumps(asdict(summary), indent=2, sort_keys=True), encoding="utf-8"
+        json.dumps(asdict(summary), indent=2, sort_keys=True),
+        encoding="utf-8",
     )
     print(
         f"v7 experiment complete: epochs={summary.epochs} games={summary.games} total_steps={summary.total_steps} "

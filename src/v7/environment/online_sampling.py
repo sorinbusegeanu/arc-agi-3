@@ -48,7 +48,8 @@ def sample_job(directory: str, handle, job: SamplingJob) -> SamplingBatchResult:
     rng = Random(job.seed)
     overlay = LocalCognitionOverlay()
     planning = PersistentPlanningGraph.from_view(view)
-    scorer = Phase1ActionScorer(planning)
+    ablation_mask = int(getattr(job, "ablation_mask", 0) or 0)
+    scorer = Phase1ActionScorer(planning, ablation_mask=ablation_mask)
     strategy_cursor = StrategyExecutionCursor()
     evidence = []
     trajectories = []
@@ -89,6 +90,7 @@ def sample_job(directory: str, handle, job: SamplingJob) -> SamplingBatchResult:
             decisions=decisions,
             rng=rng,
             epsilon=job.epsilon,
+            ablation_mask=ablation_mask,
         )
         decision = selection.decision
         action = int(decision.action_id)
@@ -202,6 +204,13 @@ def sample_job(directory: str, handle, job: SamplingJob) -> SamplingBatchResult:
                 ),
                 decision_strategy_ids=tuple(sorted(strategy_ids)),
                 changed_cells=changed,
+                selected_context_rank=int(
+                    getattr(support, "context_rank", 0) or 0
+                ),
+                selection_mode=selection.mode,
+                effective_epsilon=float(selection.effective_epsilon),
+                development_stage=selection.development_stage,
+                ablation_mask=ablation_mask,
             )
         )
 

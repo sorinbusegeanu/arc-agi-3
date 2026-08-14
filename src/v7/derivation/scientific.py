@@ -9,6 +9,8 @@ from v7.memory.ids import MemoryId, MemoryLevel
 TYPE_CONTINGENCY = 100
 TYPE_FAMILY = 200
 TYPE_ROLE = 300
+TYPE_CONTEXTUAL_ROLE = 301
+TYPE_CARRIER = 302
 TYPE_CONCEPT = 400
 TYPE_WORLD_MODEL = 500
 TYPE_STRATEGY = 600
@@ -70,17 +72,109 @@ class ScientificDerivationKernels:
     def m2_family(
         *, action_id: int, member_ids: Iterable[MemoryId], outcome_class: int
     ) -> CanonicalCandidateMutation:
+        """Create an action-independent transformation family.
+
+        ``action_id`` remains in the API because callers naturally discover the
+        family while grouping action-conditioned M1 evidence, but it is not
+        part of canonical M2 identity. This allows the same normalized
+        transformation to generalize across distinct actions.
+        """
+        del action_id
         members = tuple(sorted(set(member_ids), key=int))
         if not members:
             raise ValueError("M2 family requires at least one M1 member")
         key = CanonicalMemoryKey(
-            MemoryLevel.M2, TYPE_FAMILY, (int(action_id), int(outcome_class))
+            MemoryLevel.M2,
+            TYPE_FAMILY,
+            (int(outcome_class),),
         )
         return CanonicalCandidateMutation(
             key=key,
             support_delta=len(members),
             parents=members,
             transfer_prior=min(1.0, len(members) / 4.0),
+        )
+
+    @staticmethod
+    def m3_carrier(
+        *,
+        carrier_signature: int,
+        parent_ids: Iterable[MemoryId],
+        support_count: int,
+        prediction_lift: float,
+        compression_gain: float,
+    ) -> CanonicalCandidateMutation:
+        parents = tuple(sorted(set(parent_ids), key=int))
+        if not parents or int(support_count) < 1:
+            raise ValueError("carrier requires supporting lower-level evidence")
+        key = CanonicalMemoryKey(
+            MemoryLevel.M3,
+            TYPE_CARRIER,
+            (int(carrier_signature),),
+        )
+        return CanonicalCandidateMutation(
+            key=key,
+            support_delta=int(support_count),
+            parents=parents,
+            learning_value=max(0.0, min(1.0, float(prediction_lift))),
+            explanatory_potential=max(0.0, min(1.0, float(compression_gain))),
+        )
+
+    @staticmethod
+    def m3_contextual_role(
+        *,
+        family_id: MemoryId,
+        carrier_id: MemoryId,
+        context_class: int,
+        action_id: int,
+        member_ids: Iterable[MemoryId],
+    ) -> CanonicalCandidateMutation:
+        members = tuple(sorted(set(member_ids), key=int))
+        if not members:
+            raise ValueError("contextual role requires supporting members")
+        key = CanonicalMemoryKey(
+            MemoryLevel.M3,
+            TYPE_CONTEXTUAL_ROLE,
+            (
+                int(family_id),
+                int(carrier_id),
+                int(action_id),
+                int(context_class),
+            ),
+        )
+        return CanonicalCandidateMutation(
+            key=key,
+            support_delta=len(members),
+            parents=(family_id, carrier_id, *members),
+            explanatory_potential=min(1.0, len(members) / 4.0),
+        )
+
+    @staticmethod
+    def m3_functional_role(
+        *,
+        function_signature: int,
+        instance_ids: Iterable[MemoryId],
+        support_count: int | None = None,
+        transfer_prior: float = 0.0,
+        explanatory_potential: float = 0.0,
+    ) -> CanonicalCandidateMutation:
+        instances = tuple(sorted(set(instance_ids), key=int))
+        if not instances:
+            raise ValueError("functional role requires contextual role instances")
+        support = len(instances) if support_count is None else max(1, int(support_count))
+        key = CanonicalMemoryKey(
+            MemoryLevel.M3,
+            TYPE_ROLE,
+            (int(function_signature),),
+        )
+        return CanonicalCandidateMutation(
+            key=key,
+            support_delta=support,
+            parents=instances,
+            transfer_prior=max(0.0, min(1.0, float(transfer_prior))),
+            explanatory_potential=max(
+                0.0, min(1.0, float(explanatory_potential))
+            ),
         )
 
     @staticmethod
@@ -91,14 +185,26 @@ class ScientificDerivationKernels:
         action_id: int,
         member_ids: Iterable[MemoryId],
     ) -> CanonicalCandidateMutation:
+        """Backward-compatible kernel for direct tests/callers.
+
+        Production online derivation uses ``m3_contextual_role`` followed by
+        ``m3_functional_role``. This helper keeps the older public kernel shape
+        while producing a deterministic functional-role key.
+        """
         members = tuple(sorted(set(member_ids), key=int))
         if not members:
             raise ValueError("M3 role requires supporting members")
-        key = CanonicalMemoryKey(
-            MemoryLevel.M3,
-            TYPE_ROLE,
-            (int(family_id), int(action_id), int(context_class)),
+        signature = _support_signature(
+            tuple(
+                MemoryId(int(value))
+                for value in (
+                    int(family_id),
+                    int(action_id),
+                    int(context_class),
+                )
+            )
         )
+        key = CanonicalMemoryKey(MemoryLevel.M3, TYPE_ROLE, (signature,))
         return CanonicalCandidateMutation(
             key=key,
             support_delta=len(members),
@@ -114,7 +220,9 @@ class ScientificDerivationKernels:
         if len(roles) < 2:
             raise ValueError("M4 concept requires at least two roles")
         key = CanonicalMemoryKey(
-            MemoryLevel.M4, TYPE_CONCEPT, (int(relation_signature),)
+            MemoryLevel.M4,
+            TYPE_CONCEPT,
+            (int(relation_signature),),
         )
         return CanonicalCandidateMutation(
             key=key,
@@ -132,7 +240,9 @@ class ScientificDerivationKernels:
         if len(concepts) < 2:
             raise ValueError("M5 world model requires at least two concepts")
         key = CanonicalMemoryKey(
-            MemoryLevel.M5, TYPE_WORLD_MODEL, (int(transition_signature),)
+            MemoryLevel.M5,
+            TYPE_WORLD_MODEL,
+            (int(transition_signature),),
         )
         return CanonicalCandidateMutation(
             key=key,
@@ -173,7 +283,7 @@ class ScientificDerivationKernels:
     ) -> CanonicalCandidateMutation:
         if level == MemoryLevel.M2:
             return cls.m2_family(
-                action_id=int(payload["action_id"]),
+                action_id=int(payload.get("action_id", 0)),
                 member_ids=payload["member_ids"],
                 outcome_class=int(payload["outcome_class"]),
             )
