@@ -331,6 +331,8 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
     metrics: dict[str, object] = {}
     cognition_metrics: dict[str, object] = {}
     cognition = CognitionMetricsAccumulator()
+    running_win_rate = 0.0
+    running_level_rate = 0.0
     try:
         with ParallelSamplingPool(
             directory=root_path / "segments",
@@ -365,6 +367,11 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
                 sampled = _namespace_sampling_trajectories(sampled, jobs)
                 cognition.observe_epoch(epoch, sampled)
                 epoch_win_rate, epoch_level_rate = _epoch_game_rates(sampled)
+                running_win_rate += epoch_win_rate
+                running_level_rate += epoch_level_rate
+                completed_epochs = epoch + 1
+                avg_win_rate = running_win_rate / completed_epochs
+                avg_level_rate = running_level_rate / completed_epochs
                 _log(
                     epoch,
                     f"sampling done seconds={perf_counter() - sampling_started:.2f}",
@@ -454,13 +461,15 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
                 _log(epoch, f"hypotheses {hypothesis_summary}")
                 _log(
                     epoch,
-                    f"cognition repeat_rate={cognition_metrics['repeat_solution_rate']} "
+                    f"cognition solved_games={cognition_metrics['ever_solved_game_count']}/{len(config.games)} "
+                    f"repeat_rate={cognition_metrics['repeat_solution_rate']} "
                     f"retention_rate={cognition_metrics['solution_retention_rate']}",
                 )
                 _log(
                     epoch,
                     f"epoch done generation={final_generation} memories={final_memories} "
                     f"win_rate={epoch_win_rate:.1f}% level_rate={epoch_level_rate:.1f}% "
+                    f"avg_win_rate={avg_win_rate:.1f}% avg_level_rate={avg_level_rate:.1f}% "
                     f"seconds={perf_counter() - epoch_started:.2f}",
                 )
 
