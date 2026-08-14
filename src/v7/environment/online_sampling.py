@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import math
 from random import Random
 from time import perf_counter
 
 from v7.context_evidence import ContextEpisodeEvidence
 from v7.environment.arc_adapter import ArcGridEnvironment
-from v7.environment.cognition import ContextualActionScorer, LocalCognitionOverlay
+from v7.environment.cognition import LocalCognitionOverlay
 from v7.environment.encoding import (
     carrier_signature,
     changed_cell_count,
@@ -15,21 +14,18 @@ from v7.environment.encoding import (
     transformation_family_signature,
     transition_signature,
 )
-from v7.environment.parallel_sampling import SamplingBatchResult, SamplingJob, TrajectoryEvidence
+from v7.environment.parallel_sampling import (
+    SamplingBatchResult,
+    SamplingJob,
+    TrajectoryEvidence,
+)
+from v7.environment.phase1_policy import (
+    Phase1ActionScorer,
+    StrategyExecutionCursor,
+    select_phase1_action,
+)
+from v7.memory.planning import PersistentPlanningGraph
 from v7.memory.transport.mmap_segments import SegmentedMmapReadViewTransport
-
-
-def _select(decisions, rng: Random, epsilon: float):
-    if not decisions:
-        raise ValueError("environment returned no available actions")
-    if rng.random() < max(0.0, min(1.0, float(epsilon))):
-        return decisions[rng.randrange(len(decisions))]
-    maximum = max(float(item.score) for item in decisions)
-    weights = [math.exp((float(item.score) - maximum) / 0.35) for item in decisions]
-    total = sum(weights)
-    if not math.isfinite(total) or total <= 0.0:
-        return min(decisions, key=lambda item: (-item.score, item.action_id))
-    return rng.choices(list(decisions), weights=weights, k=1)[0]
 
 
 def _representative(actions: list[int]) -> int | None:
@@ -40,14 +36,20 @@ def _representative(actions: list[int]) -> int | None:
 
 
 def sample_job(directory: str, handle, job: SamplingJob) -> SamplingBatchResult:
-    """Sample one game with immutable long-term memory plus a worker-local online overlay."""
+    """Sample one game with long-term planning plus worker-local online learning."""
     started = perf_counter()
     view = SegmentedMmapReadViewTransport(directory).attach(handle)
     attach_seconds = perf_counter() - started
-    env = ArcGridEnvironment(game_id=job.game_id, seed=job.seed, env_root=job.env_root)
+    env = ArcGridEnvironment(
+        game_id=job.game_id,
+        seed=job.seed,
+        env_root=job.env_root,
+    )
     rng = Random(job.seed)
     overlay = LocalCognitionOverlay()
-    scorer = ContextualActionScorer()
+    planning = PersistentPlanningGraph.from_view(view)
+    scorer = Phase1ActionScorer(planning)
+    strategy_cursor = StrategyExecutionCursor()
     evidence = []
     trajectories = []
     wins = failures = levels_completed = 0
@@ -60,6 +62,7 @@ def sample_job(directory: str, handle, job: SamplingJob) -> SamplingBatchResult:
         if overlay.should_reset():
             env.reset()
             overlay.reset_episode_history(keep_statistics=True)
+            strategy_cursor.reset()
             trajectory_actions.clear()
             trajectory_contexts.clear()
             trajectory_future = 0.0
@@ -68,25 +71,63 @@ def sample_job(directory: str, handle, job: SamplingJob) -> SamplingBatchResult:
         before_actions = env.available_actions()
         exact = grid_signature(before)
         structural = structural_grid_signature(before)
-        contexts = overlay.build_context(structural_signature=structural, exact_signature=exact)
-        decisions = scorer.score_actions(view=view, contexts=contexts, actions=before_actions, overlay=overlay)
-        decision = _select(decisions, rng, job.epsilon)
+        contexts = overlay.build_context(
+            structural_signature=structural,
+            exact_signature=exact,
+        )
+        decisions = scorer.score_actions(
+            view=view,
+            contexts=contexts,
+            actions=before_actions,
+            overlay=overlay,
+        )
+        selection = select_phase1_action(
+            view=view,
+            planning=planning,
+            cursor=strategy_cursor,
+            contexts=contexts,
+            decisions=decisions,
+            rng=rng,
+            epsilon=job.epsilon,
+        )
+        decision = selection.decision
         action = int(decision.action_id)
         max_score = max(float(item.score) for item in decisions)
 
         after = env.step(action)
-        positive = env.last_outcome_polarity == "positive" or bool(env.level_completed_event) or env.last_outcome_state == "WIN"
-        negative = env.last_outcome_polarity == "negative" or env.last_outcome_state == "GAME_OVER"
+        positive = (
+            env.last_outcome_polarity == "positive"
+            or bool(env.level_completed_event)
+            or env.last_outcome_state == "WIN"
+        )
+        negative = (
+            env.last_outcome_polarity == "negative"
+            or env.last_outcome_state == "GAME_OVER"
+        )
         terminal = 1 if positive else -1 if negative else 0
-        transition_after = before if bool(env.last_step_was_reset_boundary) and terminal else after
+        transition_after = (
+            before
+            if bool(env.last_step_was_reset_boundary) and terminal
+            else after
+        )
         outcome = transformation_family_signature(before, transition_after)
         raw_transition = transition_signature(before, transition_after)
         changed = changed_cell_count(before, transition_after)
-        prediction_error = overlay.prediction_error(contexts.signatures, action, outcome)
+        prediction_error = overlay.prediction_error(
+            contexts.signatures,
+            action,
+            outcome,
+        )
         after_actions = env.available_actions()
-        raw_action_delta = float(len(set(after_actions)) - len(set(before_actions)))
-        before_value = float(len(set(before_actions))) + 4.0 * float(decision.future_reachability)
-        after_value = float(len(set(after_actions))) + (4.0 if terminal > 0 else -4.0 if terminal < 0 else 0.0)
+        raw_action_delta = float(
+            len(set(after_actions)) - len(set(before_actions))
+        )
+        before_value = float(len(set(before_actions))) + 4.0 * float(
+            decision.future_reachability
+        )
+        after_value = float(len(set(after_actions))) + (
+            4.0 if terminal > 0 else -4.0 if terminal < 0 else 0.0
+        )
         future_delta = after_value - before_value
 
         overlay.record_step(
@@ -100,44 +141,69 @@ def sample_job(directory: str, handle, job: SamplingJob) -> SamplingBatchResult:
             changed=changed > 0,
         )
         next_signatures: tuple[int, ...] = ()
+        next_planning_context: int | None = None
         if terminal == 0:
             next_context = overlay.build_context(
                 structural_signature=structural_grid_signature(after),
                 exact_signature=grid_signature(after),
             )
             next_signatures = next_context.signatures
-            for source, target in zip(contexts.signatures, next_signatures, strict=True):
+            next_planning_context = int(next_context.planning_signature)
+            for source, target in zip(
+                contexts.signatures,
+                next_signatures,
+                strict=True,
+            ):
                 overlay.transitions[(int(source), action)][int(target)] += 1
             overlay.recent_states.append(int(next_signatures[-1]))
 
-        support = decision.support
-        evidence.append(ContextEpisodeEvidence(
-            context_signature=int(support.context_signature),
-            action_id=action,
-            outcome_signature=outcome,
-            success=terminal >= 0,
-            prediction_error=prediction_error,
-            future_option_delta=future_delta,
-            source_game=job.game_id,
-            source_context=str(support.context_signature),
-            source_global_step=job.global_step_offset + local_step,
-            carrier_signature=carrier_signature(before, transition_after),
-            decision_role_ids=tuple(int(v) for v in support.role_ids),
-            decision_concept_ids=tuple(int(v) for v in support.concept_ids),
+        strategy_cursor.observe_outcome(
+            selected_strategy_id=selection.strategy_id,
             terminal_polarity=terminal,
-            raw_action_option_delta=raw_action_delta,
-            decision_score=float(decision.score),
-            max_action_score=max_score,
-            memory_guided=support.contextual_support > 0 or support.local_support > 0,
-            context_signatures=contexts.signatures,
-            next_context_signatures=next_signatures,
-            exact_context_signature=exact,
-            structural_context_signature=structural,
-            raw_transition_signature=raw_transition,
-            decision_world_model_ids=tuple(int(v) for v in support.world_model_ids),
-            decision_strategy_ids=tuple(int(v) for v in support.strategy_ids),
-            changed_cells=changed,
-        ))
+            next_context_signature=next_planning_context,
+        )
+
+        support = decision.support
+        strategy_ids = {
+            int(value) for value in getattr(support, "strategy_ids", ()) or ()
+        }
+        if selection.strategy_id is not None:
+            strategy_ids.add(int(selection.strategy_id))
+        evidence.append(
+            ContextEpisodeEvidence(
+                context_signature=int(support.context_signature),
+                action_id=action,
+                outcome_signature=outcome,
+                success=terminal >= 0,
+                prediction_error=prediction_error,
+                future_option_delta=future_delta,
+                source_game=job.game_id,
+                source_context=str(support.context_signature),
+                source_global_step=job.global_step_offset + local_step,
+                carrier_signature=carrier_signature(before, transition_after),
+                decision_role_ids=tuple(int(v) for v in support.role_ids),
+                decision_concept_ids=tuple(int(v) for v in support.concept_ids),
+                terminal_polarity=terminal,
+                raw_action_option_delta=raw_action_delta,
+                decision_score=float(decision.score),
+                max_action_score=max_score,
+                memory_guided=(
+                    selection.mode in {"memory", "strategy"}
+                    or support.contextual_support > 0
+                    or support.local_support > 0
+                ),
+                context_signatures=contexts.signatures,
+                next_context_signatures=next_signatures,
+                exact_context_signature=exact,
+                structural_context_signature=structural,
+                raw_transition_signature=raw_transition,
+                decision_world_model_ids=tuple(
+                    int(v) for v in support.world_model_ids
+                ),
+                decision_strategy_ids=tuple(sorted(strategy_ids)),
+                changed_cells=changed,
+            )
+        )
 
         wins += int(env.last_outcome_state == "WIN")
         failures += int(env.last_outcome_state == "GAME_OVER")
@@ -147,18 +213,18 @@ def sample_job(directory: str, handle, job: SamplingJob) -> SamplingBatchResult:
         trajectory_contexts.append(int(contexts.planning_signature))
         trajectory_future += future_delta
         if level_event or env.last_outcome_state == "WIN" or terminal < 0:
-            trajectories.append(TrajectoryEvidence(
-                game_id=job.game_id,
-                epoch=job.epoch,
-                level_key=f"level_{level_index:04d}",
-                steps_to_success=len(trajectory_actions),
-                source_global_step=job.global_step_offset + local_step,
-                future_option_sum=trajectory_future,
-                representative_action=_representative(trajectory_actions),
-                success=terminal >= 0,
-            ))
-            # Existing TrajectoryEvidence is kept ABI-compatible; full sequences
-            # are carried by the episode stream and reconstructed at ingestion.
+            trajectories.append(
+                TrajectoryEvidence(
+                    game_id=job.game_id,
+                    epoch=job.epoch,
+                    level_key=f"level_{level_index:04d}",
+                    steps_to_success=len(trajectory_actions),
+                    source_global_step=job.global_step_offset + local_step,
+                    future_option_sum=trajectory_future,
+                    representative_action=_representative(trajectory_actions),
+                    success=terminal >= 0,
+                )
+            )
             if level_event or env.last_outcome_state == "WIN":
                 level_index += 1
             trajectory_actions.clear()
