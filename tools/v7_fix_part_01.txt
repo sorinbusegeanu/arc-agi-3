@@ -1,0 +1,127 @@
+    "        component = float(getattr(row, \"future_option_score_component\", 0.0))\n"
+    "        if future_option_ablated:\n"
+    "            off_score = float(row.score)\n"
+    "            on_score = off_score + component\n"
+    "        else:\n"
+    "            on_score = float(row.score)\n"
+    "            off_score = on_score - component\n"
+    "        on_scores[int(row.action_id)] = on_score\n"
+    "        off_scores[int(row.action_id)] = off_score\n"
+    "    action = int(action_id)\n"
+    "    if action not in on_scores or action not in off_scores:\n"
+    "        return 0.0, 0\n"
+    "    on_order = [key for key, _ in sorted(on_scores.items(), key=lambda item: (-item[1], item[0]))]\n"
+    "    off_order = [key for key, _ in sorted(off_scores.items(), key=lambda item: (-item[1], item[0]))]\n"
+    "    return (\n"
+    "        float(on_scores[action] - off_scores[action]),\n"
+    "        int(off_order.index(action) - on_order.index(action)),\n"
+    "    )\n\n\n",
+)
+replace_once(
+    "src/v7/environment/online_sampling.py",
+    "        decision = selection.decision\n        action = int(decision.action_id)\n        max_score = max(float(item.score) for item in decisions)\n",
+    "        decision = selection.decision\n"
+    "        action = int(decision.action_id)\n"
+    "        future_option_ablation_score_delta, future_option_ablation_rank_lift = (\n"
+    "            _future_option_ablation(\n"
+    "                decisions,\n"
+    "                action,\n"
+    "                future_option_ablated=bool(\n"
+    "                    ablation_mask & int(CognitionAblation.FUTURE_OPTION)\n"
+    "                ),\n"
+    "            )\n"
+    "        )\n"
+    "        max_score = max(float(item.score) for item in decisions)\n",
+)
+replace_once(
+    "src/v7/environment/online_sampling.py",
+    "                ablation_mask=ablation_mask,\n",
+    "                ablation_mask=ablation_mask,\n"
+    "                future_option_ablation_available=True,\n"
+    "                future_option_ablation_score_delta=future_option_ablation_score_delta,\n"
+    "                future_option_ablation_rank_lift=future_option_ablation_rank_lift,\n",
+)
+
+# Persist paired scorer-ablation evidence in the existing episode row.
+replace_once(
+    "src/v7/derivation/pipeline.py",
+    '                        "memory_guided": bool(evidence.memory_guided),\n',
+    '                        "memory_guided": bool(evidence.memory_guided),\n'
+    '                        "future_option_ablation_available": bool(\n'
+    '                            getattr(evidence, "future_option_ablation_available", False)\n'
+    '                        ),\n'
+    '                        "future_option_ablation_score_delta": float(\n'
+    '                            getattr(evidence, "future_option_ablation_score_delta", 0.0)\n'
+    '                        ),\n'
+    '                        "future_option_ablation_rank_lift": int(\n'
+    '                            getattr(evidence, "future_option_ablation_rank_lift", 0)\n'
+    '                        ),\n',
+)
+
+# One canonical M5 transition identity shared by derivation and evaluation.
+replace_once(
+    "src/v7/derivation/scientific.py",
+    "from dataclasses import dataclass\n",
+    "from dataclasses import dataclass\nfrom hashlib import blake2b\n",
+)
+replace_once(
+    "src/v7/derivation/scientific.py",
+    "TYPE_STRATEGY = 600\n\n\n@dataclass",
+    "TYPE_STRATEGY = 600\n\n"
+    "_MASK63 = (1 << 63) - 1\n\n\n"
+    "def world_transition_signature(\n"
+    "    prior: Iterable[int], action_id: int, current: Iterable[int]\n"
+    ") -> int:\n"
+    "    prior_values = tuple(int(value) for value in prior)\n"
+    "    current_values = tuple(int(value) for value in current)\n"
+    "    digest = blake2b(digest_size=8)\n"
+    "    digest.update(b\"world-transition-v3\")\n"
+    "    digest.update(str(prior_values).encode(\"ascii\"))\n"
+    "    digest.update(str(int(action_id)).encode(\"ascii\"))\n"
+    "    digest.update(str(current_values).encode(\"ascii\"))\n"
+    "    return int.from_bytes(digest.digest(), \"little\") & _MASK63\n\n\n"
+    "@dataclass",
+)
+replace_once(
+    "src/v7/derivation/online_runtime.py",
+    "    ScientificDerivationKernels,\n)",
+    "    ScientificDerivationKernels,\n    world_transition_signature,\n)",
+)
+replace_once(
+    "src/v7/derivation/online_runtime.py",
+    "                        signature = _transition_key(\n",
+    "                        signature = world_transition_signature(\n",
+)
+regex_once(
+    "src/v7/derivation/online_runtime.py",
+    r"\ndef _transition_key\(\n.*?\n\ndef _relation_key\(",
+    "\n\ndef _relation_key(",
+)
+
+# Record validation scope so post-validation held-out targets remain meaningful
+# even after a concept acquires multi-source ancestry.
+replace_once(
+    "src/v7/memory/development.py",
+    '                        "development_stage": profile.stage.name,\n',
+    '                        "development_stage": profile.stage.name,\n'
+    '                        "validation_source_games": list(\n'
+    '                            self.evidence_lifecycle.provenance_source_games(d.memory_id)\n'
+    '                        ),\n',
+)
+
+# Attribute terminal transfer outcomes to roles/concepts used anywhere in the
+# trajectory, not only to memories present on the terminal action.
+replace_once(
+    "src/v7/experiment.py",
+    "from v7.memory.evidence_store import EvidenceRecord\n",
+    "from v7.memory.evidence_lifecycle import TransferTrialRecord\n"
+    "from v7.memory.evidence_store import EvidenceRecord\n",
+)
+replace_once(
+    "src/v7/experiment.py",
+    "from v7.memory.evidence_types import EvidenceType\n",
+    "from v7.memory.evidence_types import EvidenceType\nfrom v7.memory.ids import MemoryId\n",
+)
+regex_once(
+    "src/v7/experiment.py",
+    r"def _write_trajectory_evidence\(runtime: V7Runtime, sampled\) -> int:\n.*?\n\ndef _write_cognition_metrics\(",
