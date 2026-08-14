@@ -9,6 +9,7 @@ from typing import Iterable
 class CognitionMetricsSnapshot:
     epochs_observed: int
     solved_game_count_by_epoch: tuple[int, ...]
+    ever_solved_game_count: int
     repeat_solution_rate: float | None
     solution_retention_rate: float | None
     mean_successful_trajectory_length: float | None
@@ -28,6 +29,7 @@ class CognitionMetricsSnapshot:
         return {
             "epochs_observed": self.epochs_observed,
             "solved_game_count_by_epoch": list(self.solved_game_count_by_epoch),
+            "ever_solved_game_count": self.ever_solved_game_count,
             "repeat_solution_rate": self.repeat_solution_rate,
             "solution_retention_rate": self.solution_retention_rate,
             "mean_successful_trajectory_length": self.mean_successful_trajectory_length,
@@ -167,6 +169,7 @@ class CognitionMetricsAccumulator:
             solved_game_count_by_epoch=tuple(
                 len(values) for values in self._solved_by_epoch
             ),
+            ever_solved_game_count=len(self._ever_solved_games),
             repeat_solution_rate=repeat,
             solution_retention_rate=retention,
             mean_successful_trajectory_length=mean_length,
