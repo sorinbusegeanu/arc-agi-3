@@ -6,8 +6,14 @@ from dataclasses import asdict
 from pathlib import Path
 
 from v7.derivation.scientific import EpisodeEvidence
+from v7.environment.ablation import parse_ablation_spec
 from v7.environment.runner import ArcGameRunConfig, run_arc_game
-from v7.experiment import V7ExperimentConfig, V7ExperimentResult, resolve_games, run_experiment
+from v7.experiment import (
+    V7ExperimentConfig,
+    V7ExperimentResult,
+    resolve_games,
+    run_experiment,
+)
 from v7.runtime import V7Runtime, V7RuntimeConfig
 
 
@@ -36,7 +42,11 @@ def run_events(root: str | Path, events_path: str | Path, *, no_restore: bool = 
                 runtime.observe(_episode(json.loads(line)))
                 count += 1
         result = runtime.commit()
-        return {'events': count, 'generation': int(result.state.generation_id), 'memories': len(result.view.nodes)}
+        return {
+            'events': count,
+            'generation': int(result.state.generation_id),
+            'memories': len(result.view.nodes),
+        }
     finally:
         runtime.close()
 
@@ -52,6 +62,18 @@ def _add_parallel_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--per-worker-ramp-delay-seconds', type=float, default=5.0)
 
 
+def _add_cognition_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        '--ablate',
+        default='none',
+        help=(
+            'Comma-separated Phase-6 acting-policy ablations: '
+            'persistent_planning,strategy_execution,functional_roles,'
+            'relational_world_models,developmental_policy.'
+        ),
+    )
+
+
 def _add_experiment_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--root', required=True)
     parser.add_argument('--games', required=True, help="v6-compatible game preset, 'all', or comma-separated game ids")
@@ -61,6 +83,7 @@ def _add_experiment_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--env-root', default=None)
     parser.add_argument('--commit-every', type=int, default=1000)
     parser.add_argument('--epsilon', type=float, default=0.10)
+    _add_cognition_arguments(parser)
     _add_parallel_arguments(parser)
 
 
@@ -73,6 +96,7 @@ def _add_continuous_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--env-root', default=None)
     parser.add_argument('--commit-every', type=int, default=1000)
     parser.add_argument('--epsilon', type=float, default=0.10)
+    _add_cognition_arguments(parser)
     _add_parallel_arguments(parser)
 
 
@@ -108,6 +132,7 @@ def _run_experiment_args(args, *, continuous: bool = False) -> int:
             ram_ramp_threshold_percent=args.ram_ramp_threshold_percent,
             initial_worker_ramp_delay_seconds=args.initial_worker_ramp_delay_seconds,
             per_worker_ramp_delay_seconds=args.per_worker_ramp_delay_seconds,
+            ablation_mask=parse_ablation_spec(args.ablate),
         ),
     )
     print(_format_experiment_summary(result, args.root), flush=True)
@@ -142,7 +167,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == 'run':
         result = run_events(args.root, args.events, no_restore=args.no_restore)
-        print(f"events={result['events']:,}  generation={result['generation']}  memories={result['memories']:,}")
+        print(
+            f"events={result['events']:,}  generation={result['generation']}  memories={result['memories']:,}"
+        )
         return 0
     if args.command == 'game':
         result = run_arc_game(
