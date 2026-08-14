@@ -10,7 +10,6 @@ from v7.environment.ablation import parse_ablation_spec
 from v7.environment.runner import ArcGameRunConfig, run_arc_game
 from v7.experiment import (
     V7ExperimentConfig,
-    V7ExperimentResult,
     resolve_games,
     run_experiment,
 )
@@ -100,21 +99,11 @@ def _add_continuous_arguments(parser: argparse.ArgumentParser) -> None:
     _add_parallel_arguments(parser)
 
 
-def _format_experiment_summary(result: V7ExperimentResult, root: str | Path) -> str:
-    return '\n'.join([
-        '',
-        'V7 experiment complete',
-        f'  epochs={result.epochs}  games={result.games}  steps={result.total_steps:,}',
-        f'  levels_completed={result.levels_completed}  wins={result.wins}  failures={result.failures}',
-        f'  generation={result.final_generation}  memories={result.final_memories:,}',
-    ])
-
-
 def _run_experiment_args(args, *, continuous: bool = False) -> int:
     games = resolve_games(args.games, args.env_root)
     steps = args.steps_per_epoch if continuous else args.steps_per_game
     epochs = args.max_epochs if continuous else args.epochs
-    result = run_experiment(
+    run_experiment(
         args.root,
         V7ExperimentConfig(
             games=games,
@@ -135,7 +124,6 @@ def _run_experiment_args(args, *, continuous: bool = False) -> int:
             ablation_mask=parse_ablation_spec(args.ablate),
         ),
     )
-    print(_format_experiment_summary(result, args.root), flush=True)
     return 0
 
 
