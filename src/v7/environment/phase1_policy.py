@@ -12,6 +12,7 @@ from v7.environment.cognition import (
     DecisionContext,
     LocalCognitionOverlay,
 )
+from v7.memory.concept_validation import ConceptValidationStatus
 from v7.memory.developmental_policy import DevelopmentStage, profile_for_view
 from v7.memory.ids import MemoryId
 from v7.memory.planning import PersistentPlanningGraph
@@ -21,6 +22,85 @@ from v7.memory.semantic_relations import TYPE_RELATIONAL_WORLD_MODEL
 
 def _clamp01(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
+
+
+def _local_policy_confidence(
+    confidence: float,
+    *,
+    signature_count: int,
+    context_rank: int,
+    local_support: int,
+) -> float:
+    """Cap shared-memory confidence until the current lane confirms it locally.
+
+    The five-signature v7 context lattice can retrieve broad cross-game support.
+    That support is useful for transfer, but it must not make a novel target
+    context deterministic before the worker has observed local evidence.
+    Legacy context layouts preserve their previous behavior.
+    """
+    value = _clamp01(confidence)
+    if int(signature_count) < 5 or int(local_support) >= 2:
+        return value
+    specificity = _clamp01(int(context_rank) / 4.0)
+    if int(local_support) <= 0:
+        cap = 0.55 + 0.10 * specificity
+    else:
+        cap = 0.65 + 0.10 * specificity
+    return min(value, cap)
+
+
+def _is_transfer_frontier(
+    contexts: DecisionContext,
+    decision: object,
+) -> bool:
+    """Return whether a decision is broad/unconfirmed in the new v7 lattice."""
+    if len(contexts.signatures) < 5:
+        return False
+    support = getattr(decision, "support", None)
+    context_rank = int(getattr(support, "context_rank", 0) or 0)
+    local_support = int(getattr(support, "local_support", 0) or 0)
+    return context_rank < 3 or local_support <= 0
+
+
+def _transfer_probe_strength(
+    view: MemoryReadView,
+    concept_ids: Iterable[int],
+) -> float:
+    """Bounded priority for testing transferable concepts in a new context."""
+    best = 0.0
+    for raw_memory_id in concept_ids:
+        memory_id = MemoryId(int(raw_memory_id))
+        node = view.nodes.get(memory_id)
+        if node is None:
+            continue
+        flags = int(node.status_flags)
+        if flags & int(ConceptValidationStatus.TRANSFER_REJECTED):
+            continue
+        score = view.scores.get(memory_id)
+        if score is None:
+            continue
+        semantic = _clamp01(
+            max(
+                float(score.transfer_prior),
+                float(score.learning_value),
+                float(score.explanatory_potential),
+            )
+        )
+        if flags & int(
+            ConceptValidationStatus.TRUSTED
+            | ConceptValidationStatus.TRANSFER_VALIDATED
+        ):
+            status_weight = 1.0
+        elif flags & int(ConceptValidationStatus.TRANSFER_CANDIDATE):
+            status_weight = 0.90
+        elif flags & int(ConceptValidationStatus.STRUCTURAL_SUPPORTED):
+            status_weight = 0.75
+        elif flags & int(ConceptValidationStatus.CANDIDATE):
+            status_weight = 0.50
+        else:
+            status_weight = 0.25
+        best = max(best, status_weight * semantic)
+    return _clamp01(best)
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,6 +237,7 @@ class Phase1ActionScorer:
             )
             support = int(getattr(row.support, "contextual_support", 0) or 0)
             local_support = int(getattr(row.support, "local_support", 0) or 0)
+            context_rank = int(getattr(row.support, "context_rank", 0) or 0)
             support_confidence = 1.0 - math.exp(
                 -max(0, support + local_support) / 4.0
             )
@@ -172,12 +253,22 @@ class Phase1ActionScorer:
                 0.65 * support_confidence + 0.35 * semantic_confidence
             )
 
+            transfer_probe = _transfer_probe_strength(
+                view,
+                getattr(row.support, "concept_ids", ()) or (),
+            )
+            exploration_score = float(row.exploration_score)
+            if len(contexts.signatures) >= 5 and context_rank <= 2:
+                exploration_score = _clamp01(
+                    exploration_score + 0.30 * transfer_probe
+                )
+
             output.append(
                 Phase1ActionDecision(
                     action_id=int(row.action_id),
                     score=float(memory_score),
                     support=row.support,
-                    exploration_score=float(row.exploration_score),
+                    exploration_score=exploration_score,
                     failure_risk=failure,
                     contradiction_risk=float(row.contradiction_risk),
                     future_reachability=reachability,
@@ -366,6 +457,7 @@ def select_phase1_action(
         CognitionAblation.STRATEGY_EXECUTION,
     )
     if strategy_enabled:
+        was_active = cursor.active
         strategy = cursor.recommend(
             view=view,
             planning=planning,
@@ -374,13 +466,15 @@ def select_phase1_action(
         )
         if strategy is not None:
             decision, strategy_id = strategy
-            return Phase1Selection(
-                decision=decision,
-                mode="strategy",
-                strategy_id=int(strategy_id),
-                effective_epsilon=0.0,
-                development_stage=stage_name,
-            )
+            if was_active or not _is_transfer_frontier(contexts, decision):
+                return Phase1Selection(
+                    decision=decision,
+                    mode="strategy",
+                    strategy_id=int(strategy_id),
+                    effective_epsilon=0.0,
+                    development_stage=stage_name,
+                )
+            cursor.reset()
     else:
         cursor.reset()
 
@@ -389,7 +483,16 @@ def select_phase1_action(
         rows,
         key=lambda item: (-item.exploration_score, item.action_id),
     )
-    confidence = _clamp01(memory.memory_confidence)
+    support = getattr(memory, "support", None)
+    context_rank = int(getattr(support, "context_rank", 0) or 0)
+    local_support = int(getattr(support, "local_support", 0) or 0)
+    confidence = _local_policy_confidence(
+        memory.memory_confidence,
+        signature_count=len(contexts.signatures),
+        context_rank=context_rank,
+        local_support=local_support,
+    )
+    transfer_frontier = _is_transfer_frontier(contexts, memory)
     developmental_multiplier = (
         1.0
         if ablated(
@@ -398,14 +501,25 @@ def select_phase1_action(
         )
         else float(profile.exploration_multiplier)
     )
+    if transfer_frontier and not ablated(
+        ablation_mask,
+        CognitionAblation.DEVELOPMENTAL_POLICY,
+    ):
+        developmental_multiplier = max(1.0, developmental_multiplier)
+    base_epsilon = _clamp01(float(epsilon))
     effective_epsilon = _clamp01(
-        float(epsilon)
+        base_epsilon
         * developmental_multiplier
         * (1.0 - confidence) ** 2
     )
+    if transfer_frontier and base_epsilon > 0.0:
+        effective_epsilon = max(
+            effective_epsilon,
+            min(base_epsilon, 0.08),
+        )
 
-    # Mature validated knowledge earns near-deterministic exploitation. Early
-    # stages remain more exploratory until confidence is supported.
+    # Mature validated knowledge earns near-deterministic exploitation only
+    # after the current target context has locally confirmed it.
     high_confidence_threshold = (
         0.78
         if ablated(
@@ -430,9 +544,13 @@ def select_phase1_action(
         mode = "exploration"
     else:
         temperature = 0.08 + 0.32 * (1.0 - confidence)
-        if profile.stage >= DevelopmentStage.PLANNING and not ablated(
-            ablation_mask,
-            CognitionAblation.DEVELOPMENTAL_POLICY,
+        if (
+            profile.stage >= DevelopmentStage.PLANNING
+            and not ablated(
+                ablation_mask,
+                CognitionAblation.DEVELOPMENTAL_POLICY,
+            )
+            and not transfer_frontier
         ):
             temperature *= 0.70
         maximum = max(float(item.score) for item in rows)
@@ -447,7 +565,11 @@ def select_phase1_action(
             selected = rng.choices(list(rows), weights=weights, k=1)[0]
         mode = "memory" if selected.action_id == memory.action_id else "stochastic"
 
-    if strategy_enabled and mode != "exploration":
+    if (
+        strategy_enabled
+        and mode != "exploration"
+        and not _is_transfer_frontier(contexts, selected)
+    ):
         started = cursor.recommend(
             view=view,
             planning=planning,

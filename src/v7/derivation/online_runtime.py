@@ -37,6 +37,29 @@ from v7.memory.writer import CanonicalMemoryWriter
 _MASK63 = (1 << 63) - 1
 
 
+def _retrieval_contexts(row: dict[str, Any]) -> tuple[int, ...]:
+    """Return bounded general/structural/planning contexts for transfer lookup.
+
+    New five-signature evidence is indexed at C0, C2, and C3 so functional
+    roles and world models learned in one game are reachable in another game
+    before an exact target context has accumulated evidence. Legacy layouts
+    retain their reusable general and planning identities.
+    """
+    values = tuple(
+        int(value) for value in row.get("context_signatures", ()) or ()
+    )
+    fallback = int(row.get("context_signature") or 0)
+    if len(values) >= 5:
+        candidates = (values[0], values[2], values[3])
+    elif len(values) >= 3:
+        candidates = (values[0], planning_context(values, fallback=fallback))
+    elif values:
+        candidates = (values[0], values[-1])
+    else:
+        candidates = (fallback,)
+    return tuple(dict.fromkeys(int(value) for value in candidates))
+
+
 @dataclass(frozen=True, slots=True)
 class OnlineDerivationStats:
     families: int = 0
@@ -328,11 +351,15 @@ class OnlineHierarchyBuilder:
             )
             roles += int(created)
             for instance_id in instances:
-                family_id, carrier_id, action, context, members, _rows = instance_info[
+                family_id, carrier_id, action, context, members, instance_rows = instance_info[
                     instance_id
                 ]
+                retrieval_contexts = {int(context)}
+                for row in instance_rows:
+                    retrieval_contexts.update(_retrieval_contexts(row))
                 self.writer.apply_role_index_batch(
-                    (RoleIndexMutation(context, action, role_id, family_id),)
+                    RoleIndexMutation(index_context, action, role_id, family_id)
+                    for index_context in sorted(retrieval_contexts)
                 )
                 functional_role_by_carrier[carrier_id].add(role_id)
                 for member in members:
@@ -397,7 +424,7 @@ class OnlineHierarchyBuilder:
         for game in sorted(by_game):
             prior_concepts: tuple[int, ...] = ()
             prior_action: int | None = None
-            prior_context: int | None = None
+            prior_contexts: tuple[int, ...] = ()
             prior_future = 0.0
             prior_terminal = 0
             for row in sorted(
@@ -418,7 +445,7 @@ class OnlineHierarchyBuilder:
                     and prior_concepts
                     and current
                     and prior_action is not None
-                    and prior_context is not None
+                    and prior_contexts
                 ):
                     union = tuple(sorted(set(prior_concepts) | set(current)))
                     if len(union) >= 2:
@@ -431,8 +458,8 @@ class OnlineHierarchyBuilder:
                         transition_concepts[signature].update(
                             MemoryId(value) for value in union
                         )
-                        transition_locations[signature].add(
-                            (prior_context, prior_action)
+                        transition_locations[signature].update(
+                            (context, prior_action) for context in prior_contexts
                         )
                         transition_relation_rows[signature].append(
                             (
@@ -444,10 +471,7 @@ class OnlineHierarchyBuilder:
                         )
                 prior_concepts = current
                 prior_action = int(row.get("action_id") or 0)
-                prior_context = planning_context(
-                    row.get("context_signatures", ()) or (),
-                    fallback=int(row.get("context_signature") or 0),
-                )
+                prior_contexts = _retrieval_contexts(row)
                 prior_future = float(row.get("future_option_delta") or 0.0)
                 prior_terminal = int(row.get("terminal_polarity") or 0)
 
