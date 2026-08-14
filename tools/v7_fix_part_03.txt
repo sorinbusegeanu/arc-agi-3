@@ -1,0 +1,49 @@
+    "'H10':['The action scorer already contains a future-option term, so positive lift is mechanism-coupled.','Memory-guided selection is action-level attention, not complete replay/retention attention.','Saturation makes the test unevaluable.'],\n",
+    "'H10':['The paired scorer ablation isolates the additive future-option mechanism but does not ablate all planning mechanisms.'],\n",
+)
+replace_once(
+    "src/v7/hypotheses.py",
+    "'H11':['Only post-validation transfer trials count as strong held-out evidence.','Multi-source provenance breaks single-source attribution.'],\n",
+    "'H11':['Only successful post-validation transfer into games outside the validation scope counts as strong held-out evidence.'],\n",
+)
+replace_once(
+    "src/v7/hypotheses.py",
+    "    elif hypothesis_id=='H10':\n        threshold('high_option_change_count',1,'high option-change events'); threshold('low_option_change_count',1,'low option-change events')\n        if m.get('attention_saturation') is True: blockers.append('memory-guided attention is saturated'); required.append('observe both memory-guided and non-memory-guided actions')\n        threshold('attention_lift',1.25,'attention lift')\n        if m.get('causal_ablation_available') is not True: blockers.append('causal ablation is unavailable'); required.append('produce a causal ablation separating future-option influence from the action scorer')\n    elif hypothesis_id=='H11':\n        threshold('successful_post_validation_chains',2,'successful post-validation chains'); threshold('distinct_post_validation_game_pairs',2,'distinct post-validation game pairs')\n        if int(m.get('validated_concepts_with_recorded_generation') or 0)<=0: blockers.append('validated concepts with recorded generation 0/1'); required.append('record validation generation for at least 1 concept')\n    elif hypothesis_id=='H12':\n        threshold('comparable_trajectory_groups',1,'comparable trajectory groups'); threshold('best_known_improvement_count',1,'best-known trajectory improvements'); threshold('strategy_count',1,'M6 strategies'); truth('strategy_replay_or_promotion_link','no M6 strategy is linked to replay or promotion','link at least 1 M6 strategy to replay or promotion')\n",
+    "    elif hypothesis_id=='H10':\n"
+    "        threshold('high_option_change_count',5,'high option-change events'); threshold('low_option_change_count',5,'low option-change events')\n"
+    "        threshold('causal_attention_lift',1.25,'causal attention lift')\n"
+    "        if m.get('causal_ablation_available') is not True: blockers.append('causal ablation is unavailable'); required.append('produce paired future-option scorer ablation evidence')\n"
+    "    elif hypothesis_id=='H11':\n"
+    "        threshold('successful_post_validation_chains',2,'successful post-validation chains'); threshold('distinct_post_validation_target_games',2,'distinct held-out target games')\n"
+    "        if int(m.get('validated_concepts_with_recorded_generation') or 0)<=0: blockers.append('validated concepts with recorded generation 0/1'); required.append('record validation generation for at least 1 concept')\n"
+    "    elif hypothesis_id=='H12':\n"
+    "        threshold('comparable_trajectory_groups',1,'comparable trajectory groups'); threshold('best_known_improvement_count',1,'best-known trajectory improvements'); threshold('strategy_count',1,'M6 strategies'); truth('strategy_behavioral_or_lifecycle_link','no M6 strategy has post-creation behavioral use, replay, or promotion','observe post-creation M6 use or link at least 1 M6 strategy to replay/promotion')\n",
+)
+replace_once(
+    "src/v7/hypotheses.py",
+    "    def nodes_at(self,level:MemoryLevel,type_id:int|None=None): return [(int(mid),node) for mid,node in self.nodes.items() if node.level==level and (type_id is None or node.type_id==type_id)]\n",
+    "    def nodes_at(self,level:MemoryLevel,type_id:int|None=None): return [(int(mid),node) for mid,node in self.nodes.items() if node.level==level and (type_id is None or node.type_id==type_id)]\n"
+    "    def ancestors_at_level(self,mid:int,level:MemoryLevel)->set[int]:\n"
+    "        found=set(); visited=set(); stack=list(self.parents.get(int(mid),()))\n"
+    "        while stack:\n"
+    "            current=int(stack.pop())\n"
+    "            if current in visited: continue\n"
+    "            visited.add(current); node=self.nodes.get(MemoryId(current))\n"
+    "            if node is not None and node.level==level: found.add(current); continue\n"
+    "            stack.extend(self.parents.get(current,()))\n"
+    "        return found\n",
+)
+regex_once(
+    "src/v7/hypotheses.py",
+    r"def _h05\(s:_Snapshot\):\n.*?\n\ndef _h06",
+    '''def _h05(s:_Snapshot):
+    roles=s.nodes_at(MemoryLevel.M3,TYPE_ROLE); usable=cross_context=cross_game=0
+    for mid,_ in roles:
+        m1=s.ancestors_at_level(mid,MemoryLevel.M1); contexts=s.source_contexts(mid); games=s.source_games(mid); cross_context+=int(len(contexts)>=2); cross_game+=int(len(games)>=2); usable+=int(len(m1)>=2 and (len(contexts)>=2 or len(games)>=2))
+    carrier=_carrier_metrics(s); first_role=min((int(n.created_generation) for _,n in roles),default=None); first_carrier=carrier['first_emergent_carrier_generation']; temporal=first_role is not None and first_carrier is not None and first_carrier<=first_role; decision='VALID' if usable and temporal else 'PARTIALLY_VALID' if roles else 'INSUFFICIENT_EVIDENCE'; return _base(decision,len(roles),{'role_count':len(roles),'usable_role_count':usable,'cross_context_role_count':cross_context,'cross_game_role_count':cross_game,'carrier_precedes_role':temporal if first_carrier is not None else None})
+
+def _h06''',
+)
+regex_once(
+    "src/v7/hypotheses.py",
+    r"def _transition_key\(prior:tuple\[int,\.\.\.\],action:int,current:tuple\[int,\.\.\.\]\)->int:\n.*?\n\ndef _h08",
