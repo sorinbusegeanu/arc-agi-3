@@ -17,7 +17,7 @@ PackedCognitionView = PackedCognitionIndexes | MappedPackedCognitionIndexes
 _TRANSFER_REJECTED_FLAG = 1 << 10
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class MemoryReadView:
     """Immutable generation-specific cognition view."""
 
