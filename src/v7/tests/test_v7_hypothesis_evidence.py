@@ -6,6 +6,7 @@ import numpy as np
 
 from v7.derivation.scientific import EpisodeEvidence, ScientificDerivationKernels
 from v7.environment.encoding import carrier_signature, transition_signature
+from v7.experiment import _append_hypothesis_log
 from v7.hypotheses import evaluate_hypothesis_suite
 from v7.memory.ids import MemoryLevel
 from v7.runtime import V7Runtime, V7RuntimeConfig
@@ -40,3 +41,15 @@ def test_hypothesis_reports_include_real_metrics_and_issue_diagnostics(tmp_path)
         blocker_path=tmp_path/'reports'/'epoch_0001'/'hypothesis_blockers.jsonl'; rows=[json.loads(line) for line in blocker_path.read_text(encoding='utf-8').splitlines()]; assert [row['hypothesis_id'] for row in rows]==[f'H{i:02d}' for i in range(1,13)]; assert all(row['blockers'] for row in rows if not row['valid']); assert all(not row['blockers'] and not row['dependency_blockers'] for row in rows if row['valid']); h06=rows[5]; assert any('0/4' in blocker for blocker in h06['blockers']); h08=rows[7]; assert h08['dependency_blockers'] and len(h08['blockers'])>len(h08['dependency_blockers'])
         first=blocker_path.read_text(encoding='utf-8'); evaluate_hypothesis_suite(runtime,epoch=0,output_root=tmp_path,workers=2); assert blocker_path.read_text(encoding='utf-8')==first; assert len(blocker_path.read_text(encoding='utf-8').splitlines())==12
     finally: runtime.close()
+
+
+def test_hypothesis_blockers_are_written_to_dedicated_log_without_stdout(tmp_path, capsys) -> None:
+    reports = {
+        'H01': {'final_decision': 'VALID', 'blockers': []},
+        'H05': {'final_decision': 'PARTIALLY_VALID', 'blockers': ['usable roles 0/1']},
+    }
+    _append_hypothesis_log(tmp_path, 2, reports)
+    assert capsys.readouterr().out == ''
+    assert (tmp_path / 'hypotheis.log').read_text(encoding='utf-8').endswith(
+        'E0003] H05 blockers: usable roles 0/1\n'
+    )

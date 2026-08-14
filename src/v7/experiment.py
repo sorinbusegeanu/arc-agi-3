@@ -72,6 +72,18 @@ def _log(epoch: int, message: str) -> None:
     print(f'[{time.strftime("%H:%M")} E{epoch + 1:04d}] {message}', flush=True)
 
 
+def _append_hypothesis_log(root: Path, epoch: int, hypotheses: dict[str, dict[str, object]]) -> None:
+    timestamp = time.strftime("%H:%M")
+    lines = [
+        f'[{timestamp} E{epoch + 1:04d}] {hypothesis_id} blockers: {"; ".join(payload["blockers"])}\n'
+        for hypothesis_id, payload in sorted(hypotheses.items())
+        if payload["final_decision"] != "VALID"
+    ]
+    if lines:
+        with (root / "hypotheis.log").open("a", encoding="utf-8") as stream:
+            stream.writelines(lines)
+
+
 def _representative(actions: list[int]) -> int | None:
     if not actions:
         return None
@@ -459,9 +471,7 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
                     for hypothesis_id, payload in sorted(hypotheses.items())
                 )
                 _log(epoch, f"hypotheses {hypothesis_summary}")
-                for hypothesis_id, payload in sorted(hypotheses.items()):
-                    if payload["final_decision"] != "VALID":
-                        _log(epoch, f'{hypothesis_id} blockers: {"; ".join(payload["blockers"])}')
+                _append_hypothesis_log(root_path, epoch, hypotheses)
                 _log(
                     epoch,
                     f"cognition solved_games={cognition_metrics['ever_solved_game_count']}/{len(config.games)} "

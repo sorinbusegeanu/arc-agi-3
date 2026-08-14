@@ -13,7 +13,7 @@ from v7.experiment import (
     resolve_games,
     run_experiment,
 )
-from v7.runtime import V7Runtime, V7RuntimeConfig
+from v7.runtime import V7Runtime, V7RuntimeConfig, reset_disk_memory
 
 
 def _episode(row: dict[str, object]) -> EpisodeEvidence:
@@ -73,6 +73,14 @@ def _add_cognition_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_reset_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        '--reset',
+        action='store_true',
+        help='Delete persisted v7 memory under --root before starting.',
+    )
+
+
 def _add_experiment_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--root', required=True)
     parser.add_argument('--games', required=True, help="v6-compatible game preset, 'all', or comma-separated game ids")
@@ -82,6 +90,7 @@ def _add_experiment_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--env-root', default=None)
     parser.add_argument('--commit-every', type=int, default=1000)
     parser.add_argument('--epsilon', type=float, default=0.10)
+    _add_reset_argument(parser)
     _add_cognition_arguments(parser)
     _add_parallel_arguments(parser)
 
@@ -95,6 +104,7 @@ def _add_continuous_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--env-root', default=None)
     parser.add_argument('--commit-every', type=int, default=1000)
     parser.add_argument('--epsilon', type=float, default=0.10)
+    _add_reset_argument(parser)
     _add_cognition_arguments(parser)
     _add_parallel_arguments(parser)
 
@@ -135,6 +145,7 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument('--root', required=True)
     run.add_argument('--events', required=True)
     run.add_argument('--no-restore', action='store_true')
+    _add_reset_argument(run)
 
     game = sub.add_parser('game')
     game.add_argument('--root', required=True)
@@ -145,6 +156,7 @@ def main(argv: list[str] | None = None) -> int:
     game.add_argument('--commit-every', type=int, default=1000)
     game.add_argument('--epsilon', type=float, default=0.10)
     game.add_argument('--no-restore', action='store_true')
+    _add_reset_argument(game)
 
     experiment = sub.add_parser('experiment')
     _add_experiment_arguments(experiment)
@@ -153,6 +165,9 @@ def main(argv: list[str] | None = None) -> int:
     _add_continuous_arguments(continuous)
 
     args = parser.parse_args(argv)
+    if args.reset:
+        removed = reset_disk_memory(args.root)
+        print(f'memory_reset={len(removed)}  root={Path(args.root)}')
     if args.command == 'run':
         result = run_events(args.root, args.events, no_restore=args.no_restore)
         print(

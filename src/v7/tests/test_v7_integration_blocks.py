@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from v7.cli import run_events
+from v7.cli import main, run_events
 from v7.derivation.pipeline import MemoryLearningPipeline
 from v7.derivation.scientific import EpisodeEvidence, ScientificDerivationKernels
 from v7.memory.development import ScientificArtifactComparator
@@ -14,7 +14,7 @@ from v7.memory.restart import RuntimeSnapshotStore
 from v7.memory.scoring import PerformanceProbe
 from v7.memory.writer import CanonicalMemoryWriter
 from v7.performance import PerformanceSample, PerformanceValidationSuite, REQUIRED_PERFORMANCE_METRICS
-from v7.runtime import V7Runtime, V7RuntimeConfig
+from v7.runtime import V7Runtime, V7RuntimeConfig, reset_disk_memory
 
 
 def test_restart_restores_canonical_identity_cognition_edges_and_dirty_plan(tmp_path) -> None:
@@ -66,6 +66,38 @@ def test_cli_jsonl_runs_and_commits_lifecycle_state(tmp_path) -> None:
     assert result["events"] == 1
     assert result["memories"] == 1
     assert result["generation"] >= 1
+
+
+def test_reset_disk_memory_preserves_non_memory_outputs(tmp_path) -> None:
+    root = tmp_path / "run"
+    segments = root / "segments"
+    reports = root / "reports"
+    segments.mkdir(parents=True)
+    reports.mkdir()
+    (segments / "generation.bin").write_bytes(b"memory")
+    (reports / "keep.json").write_text("{}", encoding="utf-8")
+    for filename in ("state.sqlite", "evidence.sqlite", "lifecycle.sqlite"):
+        (root / filename).write_bytes(b"memory")
+        (root / f"{filename}-wal").write_bytes(b"sidecar")
+    removed = reset_disk_memory(root)
+    assert len(removed) == 7
+    assert not segments.exists()
+    assert not any((root / filename).exists() for filename in ("state.sqlite", "evidence.sqlite", "lifecycle.sqlite"))
+    assert not any((root / f"{filename}-wal").exists() for filename in ("state.sqlite", "evidence.sqlite", "lifecycle.sqlite"))
+    assert (reports / "keep.json").exists()
+
+
+def test_cli_reset_starts_with_fresh_disk_memory(tmp_path, capsys) -> None:
+    root = tmp_path / "run"
+    old_events = tmp_path / "old.jsonl"
+    new_events = tmp_path / "new.jsonl"
+    old_events.write_text(json.dumps({"context_signature": 1, "action_id": 2, "outcome_signature": 3, "success": True}) + "\n", encoding="utf-8")
+    new_events.write_text(json.dumps({"context_signature": 10, "action_id": 20, "outcome_signature": 30, "success": True}) + "\n", encoding="utf-8")
+    run_events(root, old_events)
+    assert main(["run", "--root", str(root), "--events", str(new_events), "--reset"]) == 0
+    output = capsys.readouterr().out
+    assert "memory_reset=" in output
+    assert "memories=1" in output
 
 
 def test_hypothesis_contracts_require_real_evidence_and_separate_gates() -> None:

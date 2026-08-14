@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,6 +18,32 @@ from v7.memory.publisher import GenerationPublisher
 from v7.memory.restart import RuntimeSnapshotStore
 from v7.memory.transport.mmap_segments import SegmentedMmapReadViewTransport
 from v7.memory.writer import CanonicalMemoryWriter
+
+
+_DISK_MEMORY_FILES = ("state.sqlite", "evidence.sqlite", "lifecycle.sqlite")
+_SQLITE_SIDECARS = ("", "-wal", "-shm", "-journal")
+
+
+def reset_disk_memory(root: str | Path) -> tuple[Path, ...]:
+    """Delete persisted v7 memory while preserving reports and run summaries."""
+    root_path = Path(root).expanduser().resolve()
+    if root_path == Path(root_path.anchor) or root_path == Path.home().resolve():
+        raise ValueError("refusing to reset memory at a filesystem or home root")
+    removed = []
+    for filename in _DISK_MEMORY_FILES:
+        for suffix in _SQLITE_SIDECARS:
+            path = root_path / f"{filename}{suffix}"
+            if path.is_file() or path.is_symlink():
+                path.unlink()
+                removed.append(path)
+    segments = root_path / "segments"
+    if segments.is_symlink() or segments.is_file():
+        segments.unlink()
+        removed.append(segments)
+    elif segments.is_dir():
+        shutil.rmtree(segments)
+        removed.append(segments)
+    return tuple(removed)
 
 
 @dataclass(frozen=True, slots=True)
