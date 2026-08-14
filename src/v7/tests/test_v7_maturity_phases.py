@@ -158,6 +158,7 @@ def test_cognition_metrics_measure_retention_rediscovery_and_failure_repetition(
     )
     snapshot = metrics.snapshot(transfer_trials=4, transfer_successes=3)
     assert snapshot.solved_game_count_by_epoch == (1, 2)
+    assert snapshot.ever_solved_game_count == 2
     assert snapshot.repeat_solution_rate == 1.0
     assert snapshot.solution_retention_rate == 1.0
     assert snapshot.mean_successful_trajectory_length == 37 / 3
