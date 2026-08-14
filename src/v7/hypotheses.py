@@ -37,10 +37,79 @@ def evaluate_hypothesis_suite(runtime:V7Runtime,*,epoch:int,output_root:str|Path
     for hid,deps in DEPENDENCIES.items():
         blocked=[dep for dep in deps if rows[dep]['raw_decision'] in {'INVALID','INSUFFICIENT_EVIDENCE'}]
         if blocked: rows[hid]['dependency_gate']='FAIL'; rows[hid]['evidence']['blocked_by_dependencies']=blocked
-    reports=StrictHypothesisReporter().evaluate_suite(rows,workers=workers); output=Path(output_root)/'reports'/f'epoch_{epoch+1:04d}'; output.mkdir(parents=True,exist_ok=True); detailed={}
+    reports=StrictHypothesisReporter().evaluate_suite(rows,workers=workers); output=Path(output_root)/'reports'/f'epoch_{epoch+1:04d}'; output.mkdir(parents=True,exist_ok=True); detailed={}; blocker_rows=[]
     for hid,report in reports.items():
-        payload=report_as_dict(report); payload['hypothesis_name']=NAMES[hid]; payload['missing_evidence']=list(rows[hid].get('missing_evidence',())); payload['potential_issues']=list(ISSUES[hid]); detailed[hid]=payload; (output/f'{hid.lower()}.json').write_text(json.dumps(payload,indent=2,sort_keys=True),encoding='utf-8')
-    (output/'hypotheses.json').write_text(json.dumps(detailed,indent=2,sort_keys=True),encoding='utf-8'); return detailed
+        payload=report_as_dict(report); payload['hypothesis_name']=NAMES[hid]; payload['missing_evidence']=list(rows[hid].get('missing_evidence',())); payload['potential_issues']=list(ISSUES[hid])
+        dependency_blockers=[f"blocked by {dep}={rows[dep]['raw_decision']}" for dep in rows[hid]['evidence'].get('blocked_by_dependencies',())]
+        local_blockers,next_required=_validity_blockers(hid,rows[hid]); blockers=list(dependency_blockers)+local_blockers
+        if report.final_decision!='VALID':
+            if report.quality_gate!='PASS': blockers.append(f'quality gate is {report.quality_gate}')
+            blockers.extend(f'missing required report field: {field}' for field in report.missing_fields)
+            if bool(report.evidence.get('proxy_only')): blockers.append('proxy-only evidence cannot produce VALID')
+            if not blockers: blockers.append(f'raw decision remains {report.raw_decision} despite satisfied VALID measurements')
+        else:
+            dependency_blockers=[]; blockers=[]; next_required=[]
+        payload['dependency_blockers']=dependency_blockers; payload['blockers']=blockers; payload['next_required_evidence']=next_required; detailed[hid]=payload
+        blocker_rows.append({'epoch':epoch+1,'hypothesis_id':hid,'hypothesis_name':NAMES[hid],'raw_decision':report.raw_decision,'final_decision':report.final_decision,'valid':report.final_decision=='VALID','dependency_blockers':dependency_blockers,'blockers':blockers,'next_required_evidence':next_required,'measurements':dict(report.evidence['measurement'])})
+        (output/f'{hid.lower()}.json').write_text(json.dumps(payload,indent=2,sort_keys=True),encoding='utf-8')
+    (output/'hypotheses.json').write_text(json.dumps(detailed,indent=2,sort_keys=True),encoding='utf-8'); _write_blocker_log(output/'hypothesis_blockers.jsonl',blocker_rows); return detailed
+
+
+def _write_blocker_log(path:Path,rows:Iterable[dict[str,Any]])->None:
+    temporary=path.with_suffix(path.suffix+'.tmp')
+    temporary.write_text(''.join(json.dumps(row,sort_keys=True)+'\n' for row in rows),encoding='utf-8')
+    temporary.replace(path)
+
+
+def _validity_blockers(hypothesis_id:str,row:dict[str,Any])->tuple[list[str],list[str]]:
+    m=row['evidence']['measurement']; blockers=[]; required=[]
+    def threshold(field:str,target:float,label:str)->None:
+        value=m.get(field)
+        if value is None or float(value)<target:
+            shown='unavailable' if value is None else f'{float(value):.3f}' if isinstance(value,float) else str(value)
+            goal=f'{target:.3f}' if isinstance(target,float) and not target.is_integer() else str(int(target))
+            blockers.append(f'{label} {shown}/{goal}')
+            required.append(f'increase {label} to at least {goal}')
+    def truth(field:str,blocker:str,requirement:str)->None:
+        if m.get(field) is not True: blockers.append(blocker); required.append(requirement)
+    def positive(field:str,label:str)->None:
+        value=m.get(field)
+        if value is None or float(value)<=0:
+            shown='unavailable' if value is None else f'{float(value):.3f}'
+            blockers.append(f'{label} is {shown}; required > 0')
+            required.append(f'increase {label} above 0')
+
+    if hypothesis_id=='H01':
+        threshold('stable_contingency_count',1,'stable contingencies'); threshold('games_with_stable_contingencies',2,'games with stable contingencies'); threshold('prediction_violation_count',1,'prediction violations')
+    elif hypothesis_id=='H02':
+        threshold('prediction_violation_count',1,'prediction violations'); positive('replay_rate_prediction_violation','prediction-violation replay rate'); threshold('replay_lift',1.25,'replay lift'); truth('prediction_violation_precedes_carrier','prediction violation did not precede carrier emergence','observe a prediction violation no later than first carrier emergence')
+    elif hypothesis_id=='H03':
+        threshold('families_with_multiple_members',1,'families with at least 2 M1 parents')
+        if int(m.get('cross_context_family_count') or 0)<=0 and int(m.get('cross_game_family_count') or 0)<=0: blockers.append('no family recurs across contexts or games'); required.append('observe at least 1 family across contexts or games')
+    elif hypothesis_id=='H04':
+        threshold('usable_emergent_carrier_count',1,'carriers linking at least 2 families across at least 2 contexts'); truth('family_precedes_carrier','family emergence did not precede carrier emergence','observe family emergence no later than carrier emergence')
+    elif hypothesis_id=='H05':
+        threshold('usable_role_count',1,'roles linking at least 2 M1 parents across contexts or games'); truth('carrier_precedes_role','carrier emergence did not precede role emergence','observe carrier emergence no later than role emergence')
+    elif hypothesis_id=='H06':
+        threshold('verified_single_source_cross_game_trials',4,'verified single-source cross-game trials'); threshold('successful_verified_trials',2,'successful verified trials'); threshold('successful_role_count',2,'successful roles'); threshold('distinct_game_pair_count',2,'distinct game pairs'); threshold('transfer_success_rate',.25,'transfer success rate')
+    elif hypothesis_id=='H07':
+        threshold('robust_validated_concept_count',1,'robust validated concepts')
+    elif hypothesis_id=='H08':
+        threshold('world_model_count',1,'M5 world models'); threshold('models_with_post_creation_recurrence',1,'world models with post-creation recurrence'); threshold('cross_game_recurrent_model_count',1,'cross-game recurrent world models')
+    elif hypothesis_id=='H09':
+        threshold('recurring_future_option_motifs',1,'recurring future-option motifs'); threshold('cross_game_future_option_motifs',1,'cross-game future-option motifs')
+    elif hypothesis_id=='H10':
+        threshold('high_option_change_count',1,'high option-change events'); threshold('low_option_change_count',1,'low option-change events')
+        if m.get('attention_saturation') is True: blockers.append('memory-guided attention is saturated'); required.append('observe both memory-guided and non-memory-guided actions')
+        threshold('attention_lift',1.25,'attention lift')
+        if m.get('causal_ablation_available') is not True: blockers.append('causal ablation is unavailable'); required.append('produce a causal ablation separating future-option influence from the action scorer')
+    elif hypothesis_id=='H11':
+        threshold('successful_post_validation_chains',2,'successful post-validation chains'); threshold('distinct_post_validation_game_pairs',2,'distinct post-validation game pairs')
+        if int(m.get('validated_concepts_with_recorded_generation') or 0)<=0: blockers.append('validated concepts with recorded generation 0/1'); required.append('record validation generation for at least 1 concept')
+    elif hypothesis_id=='H12':
+        threshold('comparable_trajectory_groups',1,'comparable trajectory groups'); threshold('best_known_improvement_count',1,'best-known trajectory improvements'); threshold('strategy_count',1,'M6 strategies'); truth('strategy_replay_or_promotion_link','no M6 strategy is linked to replay or promotion','link at least 1 M6 strategy to replay or promotion')
+    else: raise KeyError(hypothesis_id)
+    return blockers,required
 
 class _Snapshot:
     def __init__(self,runtime:V7Runtime)->None:

@@ -459,6 +459,9 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
                     for hypothesis_id, payload in sorted(hypotheses.items())
                 )
                 _log(epoch, f"hypotheses {hypothesis_summary}")
+                for hypothesis_id, payload in sorted(hypotheses.items()):
+                    if payload["final_decision"] != "VALID":
+                        _log(epoch, f'{hypothesis_id} blockers: {"; ".join(payload["blockers"])}')
                 _log(
                     epoch,
                     f"cognition solved_games={cognition_metrics['ever_solved_game_count']}/{len(config.games)} "

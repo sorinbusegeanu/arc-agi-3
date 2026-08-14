@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import numpy as np
 
 from v7.derivation.scientific import EpisodeEvidence, ScientificDerivationKernels
@@ -35,4 +37,6 @@ def test_hypothesis_reports_include_real_metrics_and_issue_diagnostics(tmp_path)
     try:
         runtime.observe_batch((EpisodeEvidence(1,1,100,True,prediction_error=1.0,source_game='g1',source_context='1',source_global_step=1,carrier_signature=77),EpisodeEvidence(2,1,100,True,source_game='g1',source_context='2',source_global_step=2,carrier_signature=77),EpisodeEvidence(3,2,200,True,source_game='g2',source_context='3',source_global_step=3,carrier_signature=77),EpisodeEvidence(4,2,200,True,source_game='g2',source_context='4',source_global_step=4,carrier_signature=77)))
         runtime.commit(run_lifecycle=True,derive_hierarchy=True); reports=evaluate_hypothesis_suite(runtime,epoch=0,output_root=tmp_path,workers=2); assert set(reports)=={f'H{i:02d}' for i in range(1,13)}; assert reports['H03']['evidence']['measurement']['family_count']>=2; assert reports['H04']['evidence']['measurement']['carrier_candidate_count']>=1; assert reports['H04']['potential_issues']; assert (tmp_path/'reports'/'epoch_0001'/'hypotheses.json').exists()
+        blocker_path=tmp_path/'reports'/'epoch_0001'/'hypothesis_blockers.jsonl'; rows=[json.loads(line) for line in blocker_path.read_text(encoding='utf-8').splitlines()]; assert [row['hypothesis_id'] for row in rows]==[f'H{i:02d}' for i in range(1,13)]; assert all(row['blockers'] for row in rows if not row['valid']); assert all(not row['blockers'] and not row['dependency_blockers'] for row in rows if row['valid']); h06=rows[5]; assert any('0/4' in blocker for blocker in h06['blockers']); h08=rows[7]; assert h08['dependency_blockers'] and len(h08['blockers'])>len(h08['dependency_blockers'])
+        first=blocker_path.read_text(encoding='utf-8'); evaluate_hypothesis_suite(runtime,epoch=0,output_root=tmp_path,workers=2); assert blocker_path.read_text(encoding='utf-8')==first; assert len(blocker_path.read_text(encoding='utf-8').splitlines())==12
     finally: runtime.close()
