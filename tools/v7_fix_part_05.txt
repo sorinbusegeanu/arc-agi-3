@@ -1,0 +1,119 @@
+    '''def _h12(s:_Snapshot):
+    groups=defaultdict(list)
+    for r in s.trajectories:
+        if r.get('success'):groups[(str(r.get('source_game') or ''),str(r.get('level_key') or 'level'))].append(r)
+    comparable=improvements=0
+    for rows in groups.values():
+        if len(rows)<2:continue
+        comparable+=1; best=None
+        for r in sorted(rows,key=lambda x:int(x.get('source_global_step') or -1)):
+            steps=int(r.get('steps_to_success') or 0)
+            if steps<=0:continue
+            if best is not None and steps<best:improvements+=1
+            best=steps if best is None else min(best,steps)
+    strategies=s.nodes_at(MemoryLevel.M6,TYPE_STRATEGY); ids={m for m,_ in strategies}; nodes={m:n for m,n in strategies}; lifecycle_link=bool(ids&(s.replay_ids|s.promotion_ids)) or any(int(n.status_flags)&int(MemoryStatus.PROMOTED|MemoryStatus.REPLAY_QUEUED) for _,n in strategies); post_creation_uses=0
+    for r in s.episodes:
+        generation=int(r.get('generation_id') or 0)
+        for raw_id in r.get('decision_strategy_ids',()) or ():
+            memory_id=int(raw_id); node=nodes.get(memory_id)
+            if node is not None and generation>int(node.created_generation): post_creation_uses+=1
+    linked=lifecycle_link or post_creation_uses>0; decision='INSUFFICIENT_EVIDENCE' if comparable<=0 else 'VALID' if improvements>0 and strategies and linked else 'PARTIALLY_VALID'; return _base(decision,len(s.trajectories),{'successful_trajectory_count':len(s.trajectories),'comparable_trajectory_groups':comparable,'best_known_improvement_count':improvements,'strategy_count':len(strategies),'strategy_replay_or_promotion_link':lifecycle_link,'strategy_post_creation_use_count':post_creation_uses,'strategy_behavioral_or_lifecycle_link':linked})
+''',
+)
+
+# Focused regression coverage for the corrected evidence contracts.
+test_path = "src/v7/tests/test_v7_hypothesis_evidence.py"
+text = read(test_path)
+text = text.replace(
+    "from v7.derivation.scientific import EpisodeEvidence, ScientificDerivationKernels\n",
+    "from v7.derivation.scientific import EpisodeEvidence, ScientificDerivationKernels, world_transition_signature\n",
+    1,
+)
+text = text.replace(
+    "from v7.environment.encoding import carrier_signature, transition_signature\n",
+    "from v7.environment.ablation import CognitionAblation, ablation_names\n"
+    "from v7.environment.encoding import carrier_signature, transition_signature\n",
+    1,
+)
+text = text.replace(
+    "from v7.hypotheses import evaluate_hypothesis_suite\n",
+    "from v7.hypotheses import _Snapshot, _h09, _h10, _h11, evaluate_hypothesis_suite\n",
+    1,
+)
+text = text.replace(
+    "from v7.memory.ids import MemoryLevel\n",
+    "from v7.memory.evidence_store import EvidenceRecord\n"
+    "from v7.memory.evidence_types import EvidenceType\n"
+    "from v7.memory.ids import MemoryLevel\n",
+    1,
+)
+append = r'''
+
+
+def test_world_transition_identity_and_future_option_ablation_contract() -> None:
+    assert world_transition_signature((1, 2), 3, (4, 5)) == world_transition_signature((1, 2), 3, (4, 5))
+    assert world_transition_signature((1, 2), 3, (4, 5)) != world_transition_signature((1, 2), 4, (4, 5))
+    assert ablation_names(int(CognitionAblation.FUTURE_OPTION)) == ("future_option",)
+
+
+def test_h09_uses_direct_option_change_without_proxy(tmp_path) -> None:
+    runtime = V7Runtime(V7RuntimeConfig.from_path(tmp_path, restore=False))
+    try:
+        rows = []
+        for step, game, context in ((1, "g1", "a"), (2, "g1", "b"), (3, "g2", "c"), (4, "g2", "d")):
+            rows.append(EvidenceRecord(None, int(EvidenceType.EPISODE), 1, game, context, step, {"raw_action_option_delta": 1.0, "carrier_signature": 77, "action_id": 2}))
+        runtime.evidence.append_evidence_batch(rows)
+        result = _h09(_Snapshot(runtime))
+        assert result["raw_decision"] == "VALID"
+        assert result["evidence"]["proxy_only"] is False
+    finally:
+        runtime.close()
+
+
+def test_h10_uses_paired_same_state_scorer_ablation(tmp_path) -> None:
+    runtime = V7Runtime(V7RuntimeConfig.from_path(tmp_path, restore=False))
+    try:
+        rows = []
+        for step in range(20):
+            high = step < 10
+            rows.append(EvidenceRecord(None, int(EvidenceType.EPISODE), 1, "g1", str(step), step + 1, {"raw_action_option_delta": 2.0 if high else 0.0, "future_option_ablation_available": True, "future_option_ablation_score_delta": 0.20 if high else 0.01, "future_option_ablation_rank_lift": 1 if high else 0}))
+        runtime.evidence.append_evidence_batch(rows)
+        result = _h10(_Snapshot(runtime))
+        assert result["raw_decision"] == "VALID"
+        assert result["evidence"]["measurement"]["causal_attention_lift"] >= 1.25
+    finally:
+        runtime.close()
+
+
+def test_h11_uses_validation_scope_not_single_source_provenance() -> None:
+    class Stub:
+        concept_validations = [{"memory_id": 10, "validated": True, "generation_id": 5, "validation_source_games": ["g1", "g0"]}]
+        transfer_trials = [
+            {"memory_id": 10, "generation_id": 6, "target_game": "g2", "source_game": "g0", "source_game_count": 2, "success": True, "attribution": "trajectory_usage", "raw_action_option_delta": 1.0},
+            {"memory_id": 10, "generation_id": 7, "target_game": "g3", "source_game": "g1", "source_game_count": 3, "success": True, "attribution": "trajectory_usage", "raw_action_option_delta": -1.0},
+        ]
+        def nodes_at(self, level, type_id=None):
+            return [(10, object())] if level == MemoryLevel.M4 else []
+    result = _h11(Stub())
+    assert result["raw_decision"] == "VALID"
+    assert result["evidence"]["measurement"]["distinct_post_validation_target_games"] == 2
+'''
+if "test_world_transition_identity_and_future_option_ablation_contract" in text:
+    raise RuntimeError("tests already patched")
+write(test_path, text + append)
+
+# Remove the one-shot patch machinery from the resulting commit.
+for relative in (
+    "tools/apply_v7_hypothesis_fix.py",
+    ".github/workflows/apply-v7-hypothesis-fix.yml",
+    "tools/v7_fix_part_00.txt",
+    "tools/v7_fix_part_01.txt",
+    "tools/v7_fix_part_02.txt",
+    "tools/v7_fix_part_03.txt",
+    "tools/v7_fix_part_04.txt",
+    "tools/v7_fix_part_05.txt",
+    "tools/v7_fix_part_06.txt",
+):
+    path = ROOT / relative
+    if path.exists():
+        path.unlink()
