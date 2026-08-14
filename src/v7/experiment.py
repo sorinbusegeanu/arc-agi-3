@@ -180,6 +180,28 @@ def _append_aggregated_game_results(
         )
 
 
+def _epoch_game_rates(sampled) -> tuple[float, float]:
+    """Return shard-invariant percentages of games won and games advancing a level."""
+    grouped = defaultdict(list)
+    for batch in sampled:
+        grouped[str(batch.game_id)].append(batch)
+    games_played = len(grouped)
+    if games_played == 0:
+        return 0.0, 0.0
+    games_won = sum(
+        any(int(batch.wins) > 0 for batch in batches)
+        for batches in grouped.values()
+    )
+    games_with_level = sum(
+        any(int(batch.levels_completed) > 0 for batch in batches)
+        for batches in grouped.values()
+    )
+    return (
+        100.0 * games_won / games_played,
+        100.0 * games_with_level / games_played,
+    )
+
+
 def _write_trajectory_evidence(runtime: V7Runtime, sampled) -> int:
     """Reconstruct bounded successful/failed action sequences from step evidence."""
     generation_id = int(runtime.writer.mutable_generation_id)
@@ -309,8 +331,6 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
     metrics: dict[str, object] = {}
     cognition_metrics: dict[str, object] = {}
     cognition = CognitionMetricsAccumulator()
-    running_levels = 0
-    running_wins = 0
     try:
         with ParallelSamplingPool(
             directory=root_path / "segments",
@@ -344,13 +364,7 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
                 sampled = sampling_pool.run_wave(handle=record.handle, jobs=jobs)
                 sampled = _namespace_sampling_trajectories(sampled, jobs)
                 cognition.observe_epoch(epoch, sampled)
-                epoch_levels = sum(batch.levels_completed for batch in sampled)
-                epoch_wins = sum(batch.wins for batch in sampled)
-                running_levels += epoch_levels
-                running_wins += epoch_wins
-                completed_epochs = epoch + 1
-                avg_levels = running_levels / completed_epochs
-                avg_wins = running_wins / completed_epochs
+                epoch_win_rate, epoch_level_rate = _epoch_game_rates(sampled)
                 _log(
                     epoch,
                     f"sampling done seconds={perf_counter() - sampling_started:.2f}",
@@ -440,14 +454,13 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
                 _log(epoch, f"hypotheses {hypothesis_summary}")
                 _log(
                     epoch,
-                    f"cognition solved_games={cognition_metrics['solved_game_count_by_epoch'][-1]} "
-                    f"repeat_rate={cognition_metrics['repeat_solution_rate']} "
+                    f"cognition repeat_rate={cognition_metrics['repeat_solution_rate']} "
                     f"retention_rate={cognition_metrics['solution_retention_rate']}",
                 )
                 _log(
                     epoch,
                     f"epoch done generation={final_generation} memories={final_memories} "
-                    f"levels={epoch_levels} wins={epoch_wins} avg_levels={avg_levels:.2f} avg_wins={avg_wins:.2f} "
+                    f"win_rate={epoch_win_rate:.1f}% level_rate={epoch_level_rate:.1f}% "
                     f"seconds={perf_counter() - epoch_started:.2f}",
                 )
 

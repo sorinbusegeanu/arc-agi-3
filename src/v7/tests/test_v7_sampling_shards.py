@@ -1,6 +1,13 @@
 from __future__ import annotations
 
-from v7.experiment import _sampling_shards
+from types import SimpleNamespace
+
+from v7.environment.runner import ArcGameRunResult
+from v7.experiment import (
+    _append_aggregated_game_results,
+    _epoch_game_rates,
+    _sampling_shards,
+)
 
 
 def test_sampling_shards_fill_worker_budget_without_multiplying_steps() -> None:
@@ -44,3 +51,45 @@ def test_sampling_shards_do_not_split_single_step_games() -> None:
     )
     assert len(shards) == 2
     assert [job.steps for job in shards] == [1, 1]
+
+
+def test_epoch_game_rates_count_games_not_shards() -> None:
+    sampled = (
+        SimpleNamespace(game_id="g0", wins=40, levels_completed=50),
+        SimpleNamespace(game_id="g0", wins=30, levels_completed=40),
+        SimpleNamespace(game_id="g1", wins=0, levels_completed=3),
+        SimpleNamespace(game_id="g1", wins=0, levels_completed=0),
+        SimpleNamespace(game_id="g2", wins=0, levels_completed=0),
+    )
+    win_rate, level_rate = _epoch_game_rates(sampled)
+    assert win_rate == 100.0 / 3.0
+    assert level_rate == 200.0 / 3.0
+
+
+def test_aggregated_game_results_remain_one_row_per_game_after_sharding() -> None:
+    sampled = (
+        SimpleNamespace(game_id="g0", steps=4, wins=2, failures=1, levels_completed=3, resets=1),
+        SimpleNamespace(game_id="g0", steps=6, wins=5, failures=2, levels_completed=7, resets=2),
+        SimpleNamespace(game_id="g1", steps=10, wins=0, failures=4, levels_completed=1, resets=3),
+    )
+    results: list[ArcGameRunResult] = []
+    _append_aggregated_game_results(
+        results,
+        sampled=sampled,
+        games=("g0", "g1"),
+        generation=9,
+        memories=123,
+    )
+    assert len(results) == 2
+    assert results[0].game_id == "g0"
+    assert results[0].steps == 10
+    assert results[0].wins == 7
+    assert results[0].failures == 3
+    assert results[0].levels_completed == 10
+    assert results[0].resets == 3
+    assert results[1].game_id == "g1"
+    assert results[1].steps == 10
+    assert results[1].wins == 0
+    assert results[1].failures == 4
+    assert results[1].levels_completed == 1
+    assert results[1].resets == 3
