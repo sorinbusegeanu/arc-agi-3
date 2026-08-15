@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import unittest
+from struct import Struct
 
-from v8.arena import EdgeRecord, NodeRecord
+from v8.arena import EdgeRecord, NodeRecord, SharedEdgeArena
 from v8.model import (
     CognitiveState,
     EventId,
@@ -105,15 +106,42 @@ class BoundedSimilarityTests(unittest.TestCase):
         self.assertEqual(restored.evaluate(nodes, ()), ())
         self.assertEqual(restored.candidate_comparisons, before)
 
-    def test_similarity_prior_nominates_single_game_transfer_candidate(self) -> None:
-        row = role_node((1, 0), watermark=5, transfer_prior=0.8)
+    def test_scored_similarity_nominates_cross_game_transfer_candidates(self) -> None:
+        a = role_node((1, 0), watermark=5)
+        b = role_node((2, 0), watermark=6)
+        source, target = sorted((a.uid, b.uid))
+        edge = EdgeRecord(
+            source,
+            int(RelationType.SIMILAR_TO),
+            target,
+            2,
+            6,
+            1.6,
+            2.0,
+            5,
+            6,
+        )
+        games = {a.uid: frozenset({101}), b.uid: frozenset({202})}
         candidates = TransferValidator().candidates(
-            (row,),
+            (a, b),
+            (edge,),
+            provenance=lambda uid: games[uid],
+        )
+        self.assertEqual(len(candidates), 2)
+        self.assertTrue(all(abs(item.structural_score - 0.8) < 1e-9 for item in candidates))
+        self.assertEqual({item.correspondence_uid for item in candidates}, {a.uid, b.uid})
+
+    def test_same_game_similarity_does_not_nominate_transfer(self) -> None:
+        a = role_node((1, 0), watermark=5)
+        b = role_node((2, 0), watermark=6)
+        source, target = sorted((a.uid, b.uid))
+        edge = EdgeRecord(source, int(RelationType.SIMILAR_TO), target, 1, 6, 0.9, 1.0)
+        candidates = TransferValidator().candidates(
+            (a, b),
+            (edge,),
             provenance=lambda _uid: frozenset({101}),
         )
-        self.assertEqual(len(candidates), 1)
-        self.assertEqual(candidates[0].formation_games, (101,))
-        self.assertGreaterEqual(candidates[0].structural_score, 0.8)
+        self.assertEqual(candidates, ())
 
     def test_similarity_memory_proposal_serializes_as_relation_packet(self) -> None:
         a = role_node((1, 0), watermark=10)
@@ -142,6 +170,46 @@ class BoundedSimilarityTests(unittest.TestCase):
         self.assertEqual(relation.support_delta, 1)
         self.assertAlmostEqual(relation.score_sum, 0.8)
         self.assertAlmostEqual(relation.score_weight, 1.0)
+
+    def test_edge_arena_round_trip_preserves_similarity_score_and_versions(self) -> None:
+        a = role_node((1, 0), watermark=10)
+        b = role_node((2, 0), watermark=11)
+        arena = SharedEdgeArena(capacity=4)
+        try:
+            edge = EdgeRecord(a.uid, int(RelationType.SIMILAR_TO), b.uid, 3, 11, 2.4, 3.0, 10, 11)
+            arena.begin_write()
+            arena.write(0, edge)
+            arena.end_write(count=1)
+            restored = arena.read(0)
+            self.assertAlmostEqual(restored.score, 0.8)
+            self.assertEqual(restored.source_version, 10)
+            self.assertEqual(restored.target_version, 11)
+        finally:
+            arena.dispose()
+
+    def test_edge_arena_migrates_legacy_snapshot(self) -> None:
+        a = role_node((1, 0), watermark=10)
+        b = role_node((2, 0), watermark=11)
+        header = Struct("<QQ")
+        legacy = Struct("<QQHQQqQ")
+        payload = header.pack(1, 0) + legacy.pack(
+            a.uid.hi,
+            a.uid.lo,
+            int(RelationType.EXPLAINS),
+            b.uid.hi,
+            b.uid.lo,
+            2,
+            11,
+        )
+        arena = SharedEdgeArena(capacity=4)
+        try:
+            arena.load_snapshot(payload)
+            restored = arena.read(0)
+            self.assertEqual(restored.support_count, 2)
+            self.assertEqual(restored.score_weight, 0.0)
+            self.assertEqual(restored.updated_watermark, 11)
+        finally:
+            arena.dispose()
 
 
 class _ReadView:
