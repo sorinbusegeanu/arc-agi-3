@@ -5,7 +5,7 @@ import multiprocessing as mp
 import queue
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from v8.arena import SharedActionArena, SharedEdgeArena, SharedNodeArena
@@ -13,6 +13,7 @@ from v8.development import STAGES, stage_worker
 from v8.model import (
     EventId,
     ExperienceEvent,
+    MemoryLevel,
     PIPELINE_PACKET_SIZE,
     PROPOSAL_PACKET_SIZE,
     PipelineEvent,
@@ -66,6 +67,7 @@ class ContinuousMemoryRuntime:
         self._error_queue: mp.Queue = mp.Queue()
         self._watermark = mp.Value("Q", 0)
         self._snapshot_id = 0
+        self._submit_lock = threading.Lock()
 
         self._stage_rings = tuple(
             SharedRingBuffer(capacity=config.stage_ring_capacity, slot_size=PIPELINE_PACKET_SIZE)
@@ -98,6 +100,12 @@ class ContinuousMemoryRuntime:
                 self._watermark.value = int(restored_watermark)
 
         self.read_view = LiveReadView(self.shard_descriptors)
+        self._submitted_event_ids: set[tuple[int, int]] = set()
+        if restored is not None:
+            for record in self.read_view.node_records(level=MemoryLevel.M0):
+                if len(record.key_parts) >= 2:
+                    self._submitted_event_ids.add((int(record.key_parts[0]), int(record.key_parts[1])))
+
         self._stage_inflight = tuple(mp.Value("Q", 0) for _ in STAGES)
         self._shard_inflight = tuple(mp.Value("Q", 0) for _ in range(config.shards))
         self._shard_watermarks = tuple(mp.Value("Q", 0) for _ in range(config.shards))
@@ -193,11 +201,6 @@ class ContinuousMemoryRuntime:
             self._snapshot_id += 1
             self.snapshot_service.request_latest(self._snapshot_id, self.watermark)
 
-    def _next_watermark(self) -> int:
-        with self._watermark.get_lock():
-            self._watermark.value += 1
-            return int(self._watermark.value)
-
     def make_experience(
         self,
         *,
@@ -217,7 +220,7 @@ class ContinuousMemoryRuntime:
     ) -> ExperienceEvent:
         return ExperienceEvent(
             event_id=EventId.from_producer(producer_id, producer_sequence),
-            watermark=self._next_watermark(),
+            watermark=0,
             producer_id=int(producer_id),
             producer_sequence=int(producer_sequence),
             source_game_hash=int(source_game_hash),
@@ -239,10 +242,21 @@ class ContinuousMemoryRuntime:
         if not self._accepting:
             raise RuntimeError("v8 runtime is draining and no longer accepts experiences")
         self.raise_worker_errors()
-        with self._watermark.get_lock():
-            self._watermark.value = max(int(self._watermark.value), int(event.watermark))
-        if not self._stage_rings[0].put(encode_pipeline(PipelineEvent(event)), timeout=timeout):
-            raise TimeoutError("M0 experience ring remained full")
+        event_key = (int(event.event_id.hi), int(event.event_id.lo))
+        with self._submit_lock:
+            if event_key in self._submitted_event_ids:
+                return
+            with self._watermark.get_lock():
+                current = int(self._watermark.value)
+                assigned = int(event.watermark)
+                if assigned <= 0:
+                    assigned = current + 1
+                accepted = replace(event, watermark=assigned)
+                packet = encode_pipeline(PipelineEvent(accepted))
+                if not self._stage_rings[0].put(packet, timeout=timeout):
+                    raise TimeoutError("M0 experience ring remained full")
+                self._watermark.value = max(current, assigned)
+            self._submitted_event_ids.add(event_key)
 
     def raise_worker_errors(self) -> None:
         errors = []
