@@ -75,6 +75,7 @@ class GateValidationDecision:
     next_validation_state: GateValidationState
     previous_cognitive_state: CognitiveState
     next_cognitive_state: CognitiveState
+    dependency_satisfied: bool = True
 
 
 class EmpiricalGateValidator:
@@ -121,8 +122,10 @@ class EmpiricalGateValidator:
         *,
         gate_summaries: Mapping[MemoryId, GateTrialSummary],
         memory_ids: Iterable[MemoryId] | None = None,
+        parent_validity: Mapping[MemoryId, bool] | None = None,
     ) -> tuple[GateValidationDecision, ...]:
         ids = tuple(sorted(memory_ids if memory_ids is not None else view.nodes, key=int))
+        dependencies = parent_validity or {}
         decisions: list[GateValidationDecision] = []
         for memory_id in ids:
             node = view.nodes.get(memory_id)
@@ -134,10 +137,12 @@ class EmpiricalGateValidator:
             policy = self.policies[gate]
             summary = gate_summaries.get(memory_id, GateTrialSummary())
             support = max(0, int(node.support_count))
+            dependency_satisfied = bool(dependencies.get(memory_id, True))
             structural = support >= policy.minimum_support
-            probe = structural
+            probe = structural and dependency_satisfied
             tested = (
-                summary.trials >= policy.minimum_trials
+                probe
+                and summary.trials >= policy.minimum_trials
                 and summary.independent_targets >= policy.minimum_targets
             )
             validated = tested and summary.mean_causal_gain >= policy.minimum_causal_gain
@@ -164,7 +169,14 @@ class EmpiricalGateValidator:
                 next_validation = GateValidationState.STRUCTURAL_CANDIDATE
 
             previous_cognitive = self._cognitive_state(node)
-            if next_validation in {GateValidationState.VALIDATED, GateValidationState.TRUSTED}:
+            if not dependency_satisfied:
+                next_cognitive = CognitiveState.QUARANTINED
+            elif next_validation in {
+                GateValidationState.VALIDATED,
+                GateValidationState.TRUSTED,
+            }:
+                # Validation unlocks cognition. Later lifecycle demotion can
+                # still suppress a scientifically valid memory independently.
                 next_cognitive = CognitiveState.ACTIVE
             elif next_validation == GateValidationState.REJECTED:
                 next_cognitive = CognitiveState.QUARANTINED
@@ -191,6 +203,7 @@ class EmpiricalGateValidator:
                     next_validation_state=next_validation,
                     previous_cognitive_state=previous_cognitive,
                     next_cognitive_state=next_cognitive,
+                    dependency_satisfied=dependency_satisfied,
                 )
             )
         return tuple(decisions)
@@ -246,12 +259,33 @@ class EmpiricalGateValidator:
             if current is None:
                 continue
             flags = self._compatibility_flags(current, decision)
+            next_cognitive = decision.next_cognitive_state
+            # Lifecycle and validation share one mutable generation. A memory
+            # that was already scientifically valid may have just been moved
+            # to PROBE_ONLY/QUARANTINED by persistent low utility; do not
+            # reactivate it merely because validation remains valid.
+            current_validation = self._validation_state(current)
+            current_cognitive = self._cognitive_state(current)
             if (
-                int(getattr(current, "validation_state", GateValidationState.VALIDATED))
-                == int(decision.next_validation_state)
-                and int(getattr(current, "cognitive_state", CognitiveState.ACTIVE))
-                == int(decision.next_cognitive_state)
-                and int(getattr(current, "gate_id", 0)) == int(decision.gate_id)
+                current_validation in {
+                    GateValidationState.VALIDATED,
+                    GateValidationState.TRUSTED,
+                }
+                and decision.next_validation_state
+                in {
+                    GateValidationState.VALIDATED,
+                    GateValidationState.TRUSTED,
+                }
+                and current_cognitive
+                in {CognitiveState.PROBE_ONLY, CognitiveState.QUARANTINED}
+            ):
+                next_cognitive = current_cognitive
+                flags &= ~int(MemoryStatus.ACTIVE)
+                flags |= int(MemoryStatus.DEMOTED)
+            if (
+                int(current.validation_state) == int(decision.next_validation_state)
+                and int(current.cognitive_state) == int(next_cognitive)
+                and int(current.gate_id) == int(decision.gate_id)
                 and int(current.status_flags) == flags
             ):
                 continue
@@ -262,7 +296,7 @@ class EmpiricalGateValidator:
                     current.type_id,
                     support_delta=0,
                     status_flags=flags,
-                    cognitive_state=int(decision.next_cognitive_state),
+                    cognitive_state=int(next_cognitive),
                     validation_state=int(decision.next_validation_state),
                     gate_id=int(decision.gate_id),
                 )
