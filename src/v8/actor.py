@@ -4,6 +4,7 @@ import math
 import multiprocessing as mp
 import queue
 import time
+from collections import deque
 from dataclasses import dataclass
 from random import Random
 from typing import Callable, Iterable
@@ -101,6 +102,32 @@ def _local_significance(changed_cells: int, future_delta: float) -> float:
     return 0.55 * structural + 0.45 * option
 
 
+def _trajectory_step_cost(
+    *,
+    context: int,
+    after_context: int,
+    changed_cells: int,
+    negative_outcome: bool,
+    recent_contexts: tuple[int, ...],
+) -> float:
+    """Observed outcome-conditioned step cost for M7 efficiency.
+
+    One interaction is the base cost. No-change/blocked steps, immediate repeated
+    states, short loops, and negative outcomes add explicit penalties. This makes M7
+    efficiency an observed property rather than a constant support proxy.
+    """
+    cost = 1.0
+    if int(changed_cells) <= 0:
+        cost += 1.0
+    if int(after_context) == int(context):
+        cost += 0.5
+    if int(after_context) in set(int(value) for value in recent_contexts):
+        cost += 1.0
+    if bool(negative_outcome):
+        cost += 1.0
+    return float(cost)
+
+
 def _bucket(value: float, threshold: float = 1e-9) -> int:
     return 1 if value > threshold else -1 if value < -threshold else 0
 
@@ -195,6 +222,7 @@ def actor_worker(
         sequence_base = int(watermark.value)
     rolling_trajectory = stable_u64(job.actor_id, job.seed, sequence_base, person=b"v8-traj-seed")
     local_overlay: dict[tuple[int, int], tuple[int, float]] = {}
+    recent_contexts: deque[int] = deque(maxlen=8)
     wins = failures = levels_completed = 0
     replans = planned_steps = 0
     selected_outcome: MemoryUid | None = None
@@ -218,6 +246,7 @@ def actor_worker(
             if not before_actions:
                 env.reset()
                 selected_outcome = selected_strategy = None
+                recent_contexts.clear()
                 continue
             context = int(structural_grid_signature(before))
 
@@ -225,13 +254,8 @@ def actor_worker(
             planned = plans[0] if plans else None
             explicit_replan: tuple[MemoryUid, MemoryUid, MemoryUid] | None = None
             if planned is not None:
-                # A clean preference observation is allowed only when the selected plan
-                # was not already boosted by an established PREFERENCE relation.
                 alternatives = [row for row in plans[1:] if row.outcome_uid != planned.outcome_uid]
-                if (
-                    alternatives
-                    and len(preference_probes) < int(job.max_probe_records)
-                ):
+                if alternatives and len(preference_probes) < int(job.max_probe_records):
                     preference_probes.append(
                         PreferenceProbeResult(
                             planned.outcome_uid,
@@ -249,8 +273,6 @@ def actor_worker(
                     and row.strategy_uid != planned.strategy_uid
                 ]
                 if same_outcome and rng.random() < float(job.replanning_probe_rate):
-                    # Explicit causal H14 probe: pretend the primary strategy is
-                    # unavailable and execute a separately represented alternative.
                     alternative = same_outcome[0]
                     explicit_replan = (
                         planned.strategy_uid,
@@ -388,7 +410,13 @@ def actor_worker(
                     or planned.outcome_uid in {observed_variant, observed_coarse}
                 ):
                     stat[1] += 1.0
-                stat[2] += 1.0
+                stat[2] += _trajectory_step_cost(
+                    context=context,
+                    after_context=after_context,
+                    changed_cells=changed,
+                    negative_outcome=env.last_outcome_polarity == "negative",
+                    recent_contexts=tuple(recent_contexts),
+                )
 
             if explicit_replan is not None and len(replanning_trials) < int(job.max_probe_records):
                 primary_uid, alternative_uid, target_outcome = explicit_replan
@@ -401,11 +429,13 @@ def actor_worker(
                     )
                 )
 
+            recent_contexts.append(context)
             if current_levels < last_levels or env.last_step_was_reset_boundary:
                 rolling_trajectory = stable_u64(
                     job.actor_id, producer_sequence, current_watermark, person=b"v8-traj-reset"
                 )
                 selected_outcome = selected_strategy = None
+                recent_contexts.clear()
             last_levels = current_levels
 
             now = time.monotonic()
@@ -472,10 +502,11 @@ def run_actor_jobs(
     if progress_interval_seconds <= 0:
         raise ValueError("progress_interval_seconds must be positive")
 
-    results: mp.Queue = mp.Queue()
-    progress: mp.Queue = mp.Queue(maxsize=max(16, len(jobs) * 4))
+    ctx = runtime._mp_ctx
+    results = ctx.Queue()
+    progress = ctx.Queue(maxsize=max(16, len(jobs) * 4))
     processes = [
-        mp.Process(
+        ctx.Process(
             target=actor_worker,
             kwargs={
                 "job": job,
