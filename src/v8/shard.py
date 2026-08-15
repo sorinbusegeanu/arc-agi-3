@@ -101,6 +101,31 @@ def _write_edge(
     return edge_count
 
 
+def _behavior_delta(proposal) -> tuple[float, float]:
+    significance = float(proposal.significance_sum)
+    learning = float(proposal.learning_value_sum)
+    prediction = float(proposal.prediction_error_sum)
+    transfer = float(proposal.transfer_prior_sum)
+    explanatory = float(proposal.explanatory_sum)
+    future = max(-1.0, min(1.0, float(proposal.future_option_sum)))
+    value = (
+        significance
+        + 0.20 * learning
+        - 0.35 * prediction
+        + 0.10 * transfer
+        + 0.05 * explanatory
+        + 0.15 * future
+    )
+    metric_update = any(
+        abs(component) > 0.0
+        for component in (significance, learning, prediction, transfer, explanatory, future)
+    )
+    weight = max(0.0, float(proposal.score_weight))
+    if metric_update and weight <= 0.0:
+        weight = 1.0
+    return float(value), float(weight)
+
+
 def shard_worker(
     config: ShardConfig,
     ring_args: dict[str, object],
@@ -177,19 +202,12 @@ def shard_worker(
                             if len(seen_order) > dedupe_capacity:
                                 seen.discard(seen_order.popleft())
 
-                            # Relation proposals are valid only for already-canonical
-                            # source memories. The target may live on another shard.
                             source_row = node_index.get(relation.source_uid)
                             if source_row is None:
                                 continue
                             mutated = True
                             max_watermark = max(max_watermark, int(relation.watermark))
 
-                            # Preserve the pre-phase-4 prospective transfer-prior
-                            # behavior while the canonical edge itself is now reduced
-                            # independently of node identity. Phase 6 can consume the
-                            # relation score directly and remove this compatibility
-                            # accumulation.
                             if relation.score_weight > 0.0:
                                 current = nodes.read(source_row)
                                 nodes.write(
@@ -333,8 +351,6 @@ def shard_worker(
                             )
 
                         if int(proposal.source_game_hash) != 0:
-                            # target.lo is the exact reversible game hash; target.hi=0
-                            # intentionally distinguishes it from canonical memory UIDs.
                             edge_count = _write_edge(
                                 edges=edges,
                                 edge_index=edge_index,
@@ -347,31 +363,30 @@ def shard_worker(
                                 shard_id=config.shard_id,
                             )
 
-                        if proposal.level == MemoryLevel.M1 and len(proposal.key_parts) >= 2 and (
-                            proposal.support_delta > 0 or abs(float(proposal.significance_sum)) > 0.0
-                        ):
-                            context = int(proposal.key_parts[0])
-                            action = signed_u64(int(proposal.key_parts[1]))
-                            action_row, prior_action = _action_slot(actions, action_index, context, action)
-                            significance = float(proposal.significance_sum)
-                            if prior_action is None:
-                                action_record = ActionRecord(
-                                    u64(context),
-                                    action,
-                                    proposal.support_delta,
-                                    significance,
-                                    max(0.0, proposal.score_weight),
-                                    proposal.watermark,
-                                )
-                            else:
-                                action_record = replace(
-                                    prior_action,
-                                    support_count=prior_action.support_count + proposal.support_delta,
-                                    score_sum=prior_action.score_sum + significance,
-                                    score_weight=prior_action.score_weight + max(0.0, proposal.score_weight),
-                                    updated_watermark=max(prior_action.updated_watermark, proposal.watermark),
-                                )
-                            actions.write(action_row, action_record)
+                        if proposal.level == MemoryLevel.M1 and len(proposal.key_parts) >= 2:
+                            behavior_delta, behavior_weight = _behavior_delta(proposal)
+                            if proposal.support_delta > 0 or behavior_weight > 0.0:
+                                context = int(proposal.key_parts[0])
+                                action = signed_u64(int(proposal.key_parts[1]))
+                                action_row, prior_action = _action_slot(actions, action_index, context, action)
+                                if prior_action is None:
+                                    action_record = ActionRecord(
+                                        u64(context),
+                                        action,
+                                        proposal.support_delta,
+                                        behavior_delta,
+                                        behavior_weight,
+                                        proposal.watermark,
+                                    )
+                                else:
+                                    action_record = replace(
+                                        prior_action,
+                                        support_count=prior_action.support_count + proposal.support_delta,
+                                        score_sum=prior_action.score_sum + behavior_delta,
+                                        score_weight=prior_action.score_weight + behavior_weight,
+                                        updated_watermark=max(prior_action.updated_watermark, proposal.watermark),
+                                    )
+                                actions.write(action_row, action_record)
                     with watermark.get_lock():
                         watermark.value = max(int(watermark.value), max_watermark)
                 finally:
