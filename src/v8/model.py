@@ -186,6 +186,11 @@ class PipelineEvent:
     experience: ExperienceEvent
     parent_uid: MemoryUid = MemoryUid(0, 0)
     current_level: int = -1
+    multiplicity: int = 1
+
+    def __post_init__(self) -> None:
+        if self.multiplicity <= 0:
+            raise ValueError("pipeline multiplicity must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,7 +236,7 @@ class MemoryProposal:
 
 _EXPERIENCE = Struct("<QQQIQQQiQQQdIbQ")
 _EXPERIENCE_EXTRA = Struct("<QQd")
-_PIPE_SUFFIX = Struct("<QQb")
+_PIPE_SUFFIX = Struct("<QQbQ")
 _PROPOSAL = Struct("<QQQQQQBHBQQQQqddddddddddQQHQbb")
 
 EXPERIENCE_PACKET_SIZE = _EXPERIENCE.size + _EXPERIENCE_EXTRA.size
@@ -313,6 +318,7 @@ def encode_pipeline(event: PipelineEvent) -> bytes:
         u64(event.parent_uid.hi),
         u64(event.parent_uid.lo),
         int(event.current_level),
+        int(event.multiplicity),
     )
 
 
@@ -320,8 +326,15 @@ def decode_pipeline(payload: bytes) -> PipelineEvent:
     if len(payload) != PIPELINE_PACKET_SIZE:
         raise ValueError(f"invalid pipeline packet size {len(payload)}")
     experience = decode_experience(payload[:EXPERIENCE_PACKET_SIZE])
-    parent_hi, parent_lo, current_level = _PIPE_SUFFIX.unpack(payload[EXPERIENCE_PACKET_SIZE:])
-    return PipelineEvent(experience, MemoryUid(parent_hi, parent_lo), int(current_level))
+    parent_hi, parent_lo, current_level, multiplicity = _PIPE_SUFFIX.unpack(
+        payload[EXPERIENCE_PACKET_SIZE:]
+    )
+    return PipelineEvent(
+        experience,
+        MemoryUid(parent_hi, parent_lo),
+        int(current_level),
+        int(multiplicity),
+    )
 
 
 def proposal_fingerprint(level: int, memory_type: int, key_parts: Iterable[int]) -> int:
