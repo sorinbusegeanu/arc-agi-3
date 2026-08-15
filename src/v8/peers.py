@@ -29,6 +29,7 @@ from v8.pruning import PruningPlanner
 from v8.replanning import ReplanningController, ReplanningTrial
 from v8.replay import ReplayScheduler
 from v8.roles import FunctionalRoleEstimator
+from v8.similarity import BoundedNeighborhoodSimilarity
 from v8.strategies import StrategyEstimator
 from v8.transfer import TransferTrial, TransferValidator
 from v8.world_model import WorldModelEstimator
@@ -42,6 +43,8 @@ class PeerMetrics:
     interval_seconds: float
     candidate_budget: int
     failures: int
+    similarity_comparisons: int = 0
+    similarity_processed_descriptors: int = 0
 
 
 class DevelopmentalPeerSupervisor:
@@ -67,6 +70,7 @@ class DevelopmentalPeerSupervisor:
         self.roles = FunctionalRoleEstimator()
         self.future_options = FutureOptionEstimator()
         self.compression = CompressionEstimator()
+        self.similarity = BoundedNeighborhoodSimilarity()
         self.transfer = TransferValidator()
         self.outcomes = OutcomeEquivalenceEstimator()
         self.strategies = StrategyEstimator()
@@ -92,7 +96,11 @@ class DevelopmentalPeerSupervisor:
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
-        self._thread = threading.Thread(target=self._run, name="v8-developmental-peers", daemon=True)
+        self._thread = threading.Thread(
+            target=self._run,
+            name="v8-developmental-peers",
+            daemon=True,
+        )
         self._thread.start()
 
     def close(self) -> None:
@@ -111,6 +119,7 @@ class DevelopmentalPeerSupervisor:
 
     def set_candidate_budget(self, budget: int) -> None:
         self.candidate_budget = max(8, int(budget))
+        self.similarity.set_budget(min(32, self.candidate_budget))
 
     def raise_if_failed(self) -> None:
         if self._last_error is not None:
@@ -126,6 +135,8 @@ class DevelopmentalPeerSupervisor:
             self.interval_seconds,
             self.candidate_budget,
             self._failures,
+            self.similarity.candidate_comparisons,
+            self.similarity.processed_descriptors,
         )
 
     def _event_id(self) -> EventId:
@@ -175,7 +186,9 @@ class DevelopmentalPeerSupervisor:
                 normalized_value=max(0.0, min(1.0, abs(float(value)))),
                 developmental_stage=int(row.level),
                 validation_state=int(
-                    row.validation_state if validation_state is None else validation_state
+                    row.validation_state
+                    if validation_state is None
+                    else validation_state
                 ),
                 source_game_hash=(games[0] if len(games) == 1 else 0),
                 target_game_hash=int(target_game_hash),
@@ -233,20 +246,25 @@ class DevelopmentalPeerSupervisor:
         self._proposals += 1
 
     def _parallel_analyses(self, nodes, edges):
-        with ThreadPoolExecutor(max_workers=8, thread_name_prefix="v8-peer") as pool:
+        with ThreadPoolExecutor(max_workers=9, thread_name_prefix="v8-peer") as pool:
             futures = {
                 "prediction": pool.submit(self.prediction.evaluate, nodes),
                 "context": pool.submit(self.context.propose, nodes),
                 "roles": pool.submit(self.roles.propose, nodes),
                 "future": pool.submit(self.future_options.evaluate, nodes),
                 "compression": pool.submit(self.compression.evaluate, nodes, edges),
+                "similarity": pool.submit(self.similarity.evaluate, nodes, edges),
                 "transfer": pool.submit(
                     self.transfer.candidates,
                     nodes,
                     provenance=self.read_view.source_games,
                 ),
                 "world": pool.submit(self.world_model.propose, nodes),
-                "replay": pool.submit(self.replay.candidates, nodes, budget=self.candidate_budget),
+                "replay": pool.submit(
+                    self.replay.candidates,
+                    nodes,
+                    budget=self.candidate_budget,
+                ),
             }
             return {name: future.result() for name, future in futures.items()}
 
@@ -260,7 +278,6 @@ class DevelopmentalPeerSupervisor:
             analyses = self._parallel_analyses(nodes, edges)
             attended = {item.uid for item in analyses["replay"]}
 
-            # Base developmental evidence, including previously unreachable contracts.
             for row in nodes:
                 if row.support_count < 2:
                     continue
@@ -279,41 +296,71 @@ class DevelopmentalPeerSupervisor:
                         else "role_candidate"
                     )
                 if kind and self._fresh(kind, row.uid, row.updated_watermark):
-                    self._append_evidence(kind, row, min(1.0, row.support_count / 4.0))
+                    self._append_evidence(
+                        kind,
+                        row,
+                        min(1.0, row.support_count / 4.0),
+                    )
                 if (
                     int(row.level) == int(MemoryLevel.M3)
                     and int(row.memory_type) == int(MemoryType.CARRIER)
-                    and self._fresh("carrier_emergence", row.uid, row.updated_watermark)
+                    and self._fresh(
+                        "carrier_emergence", row.uid, row.updated_watermark
+                    )
                 ):
-                    self._append_evidence("carrier_emergence", row, min(1.0, row.support_count / 4.0))
+                    self._append_evidence(
+                        "carrier_emergence",
+                        row,
+                        min(1.0, row.support_count / 4.0),
+                    )
                 if (
                     int(row.memory_type) == int(MemoryType.CONTEXTUAL_ROLE)
                     and row.support_count >= 2
                     and self._fresh("context_gain", row.uid, row.updated_watermark)
                 ):
-                    self._append_evidence("context_refinement_gain", row, max(row.significance, row.learning_value))
+                    self._append_evidence(
+                        "context_refinement_gain",
+                        row,
+                        max(row.significance, row.learning_value),
+                    )
 
             for replay in analyses["replay"]:
                 row = by_uid.get(replay.uid)
-                if row is not None and self._fresh("replay", row.uid, row.updated_watermark):
-                    self._append_evidence("replay_priority", row, replay.priority)
+                if row is not None and self._fresh(
+                    "replay", row.uid, row.updated_watermark
+                ):
+                    self._append_evidence(
+                        "replay_priority", row, replay.priority
+                    )
 
             for evidence in analyses["prediction"]:
                 uid = MemoryUid(evidence.uid_hi, evidence.uid_lo)
                 row = by_uid.get(uid)
-                if row is None or not self._fresh("prediction", uid, row.updated_watermark):
+                if row is None or not self._fresh(
+                    "prediction", uid, row.updated_watermark
+                ):
                     continue
                 self._append_evidence("supported_prediction", row, 1.0)
                 if evidence.error > 0.0:
-                    self._append_evidence("prediction_violation", row, evidence.error)
+                    self._append_evidence(
+                        "prediction_violation", row, evidence.error
+                    )
 
             for refinement in analyses["context"][: self.candidate_budget]:
                 source = by_uid.get(refinement.source_uid)
-                if source is None or not self._fresh("context", refinement.candidate_uid, source.updated_watermark):
+                if source is None or not self._fresh(
+                    "context",
+                    refinement.candidate_uid,
+                    source.updated_watermark,
+                ):
                     continue
                 proposal = MemoryProposal(
                     uid=refinement.candidate_uid,
-                    fingerprint=proposal_fingerprint(MemoryLevel.M3, MemoryType.CONTEXTUAL_ROLE, refinement.key_parts),
+                    fingerprint=proposal_fingerprint(
+                        MemoryLevel.M3,
+                        MemoryType.CONTEXTUAL_ROLE,
+                        refinement.key_parts,
+                    ),
                     event_id=self._event_id(),
                     watermark=int(self.current_watermark()),
                     level=MemoryLevel.M3,
@@ -329,18 +376,32 @@ class DevelopmentalPeerSupervisor:
                     validation_state=int(ValidationState.STRUCTURAL),
                 )
                 self._submit(proposal)
-                self._append_evidence("context_refinement", source, refinement.contradiction_rate)
+                self._append_evidence(
+                    "context_refinement",
+                    source,
+                    refinement.contradiction_rate,
+                )
 
             for candidate in analyses["roles"][: self.candidate_budget]:
-                watermarks = [by_uid[u].updated_watermark for u in candidate.carriers if u in by_uid]
-                if not watermarks or not self._fresh("role", candidate.uid, max(watermarks)):
+                watermarks = [
+                    by_uid[uid].updated_watermark
+                    for uid in candidate.carriers
+                    if uid in by_uid
+                ]
+                if not watermarks or not self._fresh(
+                    "role", candidate.uid, max(watermarks)
+                ):
                     continue
-                exact_games = set()
+                exact_games: set[int] = set()
                 for carrier in candidate.carriers:
                     exact_games.update(self.read_view.source_games(carrier))
                 proposal = MemoryProposal(
                     uid=candidate.uid,
-                    fingerprint=proposal_fingerprint(MemoryLevel.M3, MemoryType.ROLE, candidate.key_parts),
+                    fingerprint=proposal_fingerprint(
+                        MemoryLevel.M3,
+                        MemoryType.ROLE,
+                        candidate.key_parts,
+                    ),
                     event_id=self._event_id(),
                     watermark=int(self.current_watermark()),
                     level=MemoryLevel.M3,
@@ -358,33 +419,86 @@ class DevelopmentalPeerSupervisor:
                 self._submit(proposal)
                 source = by_uid.get(candidate.carriers[0])
                 if source is not None:
-                    self._append_evidence("role_emergence", source, 1.0, validation_state=int(ValidationState.STRUCTURAL))
+                    self._append_evidence(
+                        "role_emergence",
+                        source,
+                        1.0,
+                        validation_state=int(ValidationState.STRUCTURAL),
+                    )
 
             for evidence in analyses["future"][: self.candidate_budget]:
                 row = by_uid.get(evidence.uid)
-                if row is None or not self._fresh("fo", row.uid, row.updated_watermark):
+                if row is None or not self._fresh(
+                    "fo", row.uid, row.updated_watermark
+                ):
                     continue
-                self._submit(self._existing_proposal(row, future_option=float(evidence.delta)))
-                self._append_evidence("future_option_estimate", row, min(1.0, abs(evidence.delta) / 4.0))
+                self._submit(
+                    self._existing_proposal(
+                        row,
+                        future_option=float(evidence.delta),
+                    )
+                )
+                self._append_evidence(
+                    "future_option_estimate",
+                    row,
+                    min(1.0, abs(evidence.delta) / 4.0),
+                )
 
             for evidence in analyses["compression"][: self.candidate_budget]:
                 row = by_uid.get(evidence.uid)
-                if row is None or not self._fresh("compression", row.uid, row.updated_watermark):
+                if row is None or not self._fresh(
+                    "compression", row.uid, row.updated_watermark
+                ):
                     continue
-                self._submit(self._existing_proposal(row, explanatory=float(evidence.explanatory_reach)))
-                kind = "family_compression" if int(row.level) == int(MemoryLevel.M2) else "compression"
-                self._append_evidence(kind, row, min(1.0, evidence.compression_benefit / 4.0))
+                self._submit(
+                    self._existing_proposal(
+                        row,
+                        explanatory=float(evidence.explanatory_reach),
+                    )
+                )
+                kind = (
+                    "family_compression"
+                    if int(row.level) == int(MemoryLevel.M2)
+                    else "compression"
+                )
+                self._append_evidence(
+                    kind,
+                    row,
+                    min(1.0, evidence.compression_benefit / 4.0),
+                )
                 for target in evidence.superseded[:8]:
-                    self._submit(self._existing_proposal(row, parent_uid=target, relation_type=RelationType.SUPERSEDES))
+                    self._submit(
+                        self._existing_proposal(
+                            row,
+                            parent_uid=target,
+                            relation_type=RelationType.SUPERSEDES,
+                        )
+                    )
 
             for component in analyses["world"][: self.candidate_budget]:
-                wm_watermark = max((by_uid[u].updated_watermark for u in component.consequences if u in by_uid), default=0)
-                if not component.consequences or not self._fresh("world_model", component.uid, wm_watermark):
+                wm_watermark = max(
+                    (
+                        by_uid[uid].updated_watermark
+                        for uid in component.consequences
+                        if uid in by_uid
+                    ),
+                    default=0,
+                )
+                if (
+                    not component.consequences
+                    or not self._fresh(
+                        "world_model", component.uid, wm_watermark
+                    )
+                ):
                     continue
                 first = component.consequences[0]
                 proposal = MemoryProposal(
                     uid=component.uid,
-                    fingerprint=proposal_fingerprint(MemoryLevel.M5, MemoryType.WORLD_MODEL, component.key_parts),
+                    fingerprint=proposal_fingerprint(
+                        MemoryLevel.M5,
+                        MemoryType.WORLD_MODEL,
+                        component.key_parts,
+                    ),
                     event_id=self._event_id(),
                     watermark=int(self.current_watermark()),
                     level=MemoryLevel.M5,
@@ -400,22 +514,84 @@ class DevelopmentalPeerSupervisor:
                 )
                 self._submit(proposal)
                 for parent in component.consequences[1:8]:
-                    self._submit(self._existing_proposal(type("R", (), {
-                        "uid": component.uid,
-                        "fingerprint": proposal.fingerprint,
-                        "level": int(MemoryLevel.M5),
-                        "memory_type": int(MemoryType.WORLD_MODEL),
-                        "key_parts": component.key_parts,
-                    })(), parent_uid=parent))
+                    identity = type(
+                        "WorldModelIdentity",
+                        (),
+                        {
+                            "uid": component.uid,
+                            "fingerprint": proposal.fingerprint,
+                            "level": int(MemoryLevel.M5),
+                            "memory_type": int(MemoryType.WORLD_MODEL),
+                            "key_parts": component.key_parts,
+                        },
+                    )()
+                    self._submit(
+                        self._existing_proposal(identity, parent_uid=parent)
+                    )
                 source = by_uid.get(first)
                 if source is not None:
-                    self._append_evidence("world_model_component", source, min(1.0, len(component.consequences) / 4.0))
+                    self._append_evidence(
+                        "world_model_component",
+                        source,
+                        min(1.0, len(component.consequences) / 4.0),
+                    )
+
+            # Similarity is candidate evidence only.  It creates a canonical
+            # SIMILAR_TO edge and a transfer prior, never identity merging or
+            # validation. Cross-game empirical validation remains a separate trial.
+            for evidence in analyses["similarity"][: self.candidate_budget]:
+                source = by_uid.get(evidence.source_uid)
+                target = by_uid.get(evidence.target_uid)
+                if source is None or target is None:
+                    continue
+                freshness_kind = f"similarity:{target.uid.hex()}"
+                if not self._fresh(
+                    freshness_kind,
+                    source.uid,
+                    evidence.evidence_watermark,
+                ):
+                    continue
+                self._submit(
+                    self._existing_proposal(
+                        source,
+                        transfer_prior=evidence.score,
+                        parent_uid=target.uid,
+                        relation_type=RelationType.SIMILAR_TO,
+                    )
+                )
+                self._submit(
+                    self._existing_proposal(
+                        target,
+                        transfer_prior=evidence.score,
+                    )
+                )
+                games = tuple(
+                    sorted(
+                        self.read_view.source_games(source.uid)
+                        | self.read_view.source_games(target.uid)
+                    )
+                )
+                self._append_evidence(
+                    "structural_similarity",
+                    source,
+                    evidence.score,
+                    validation_state=int(ValidationState.STRUCTURAL),
+                    provenance_games=games,
+                )
 
             for candidate in analyses["transfer"][: self.candidate_budget]:
                 row = by_uid.get(candidate.uid)
-                if row is None or not self._fresh("transfer", row.uid, row.updated_watermark):
+                if row is None or not self._fresh(
+                    "transfer", row.uid, row.updated_watermark
+                ):
                     continue
-                self._submit(self._existing_proposal(row, transfer_prior=candidate.structural_score, validation_state=int(ValidationState.STRUCTURAL)))
+                self._submit(
+                    self._existing_proposal(
+                        row,
+                        transfer_prior=candidate.structural_score,
+                        validation_state=int(ValidationState.STRUCTURAL),
+                    )
+                )
                 self._append_evidence(
                     "transfer_structural",
                     row,
@@ -424,68 +600,127 @@ class DevelopmentalPeerSupervisor:
                     provenance_games=candidate.formation_games,
                 )
 
-            # Operational M6 coarse-class merge and M7 rebinding.
             classes = self.outcomes.rebuild(nodes)
-            m7_rows = [row for row in nodes if int(row.level) == int(MemoryLevel.M7) and len(row.key_parts) >= 4]
+            m7_rows = [
+                row
+                for row in nodes
+                if int(row.level) == int(MemoryLevel.M7)
+                and len(row.key_parts) >= 4
+            ]
             for outcome in classes[: self.candidate_budget]:
                 revision = self.outcomes.merge_revision(outcome)
                 if revision is None:
                     row = by_uid.get(outcome.uid)
-                    if row is not None and row.support_count >= 2 and self._fresh("outcome", row.uid, row.updated_watermark):
-                        self._append_evidence("outcome_equivalence", row, min(1.0, row.support_count / 4.0))
+                    if (
+                        row is not None
+                        and row.support_count >= 2
+                        and self._fresh(
+                            "outcome", row.uid, row.updated_watermark
+                        )
+                    ):
+                        self._append_evidence(
+                            "outcome_equivalence",
+                            row,
+                            min(1.0, row.support_count / 4.0),
+                        )
                     continue
-                max_wm = max((by_uid[u].updated_watermark for u in revision.sources if u in by_uid), default=0)
-                if not self._fresh("outcome_merge", revision.target, max_wm):
+                max_wm = max(
+                    (
+                        by_uid[uid].updated_watermark
+                        for uid in revision.sources
+                        if uid in by_uid
+                    ),
+                    default=0,
+                )
+                if not self._fresh(
+                    "outcome_merge", revision.target, max_wm
+                ):
                     continue
-                target_fingerprint = proposal_fingerprint(MemoryLevel.M6, MemoryType.OUTCOME, revision.descriptor)
+                target_fingerprint = proposal_fingerprint(
+                    MemoryLevel.M6,
+                    MemoryType.OUTCOME,
+                    revision.descriptor,
+                )
                 for index, source_uid in enumerate(revision.sources):
                     source = by_uid.get(source_uid)
                     if source is None:
                         continue
-                    self._submit(MemoryProposal(
-                        uid=revision.target,
-                        fingerprint=target_fingerprint,
-                        event_id=self._event_id(),
-                        watermark=int(self.current_watermark()),
-                        level=MemoryLevel.M6,
-                        memory_type=MemoryType.OUTCOME,
-                        key_parts=tuple(revision.descriptor),
-                        support_delta=(max(1, outcome.support) if index == 0 else 0),
-                        explanatory_sum=1.0 if index == 0 else 0.0,
-                        score_weight=1.0 if index == 0 else 0.0,
-                        parent_uid=source_uid,
-                        relation_type=RelationType.SUPERSEDES,
-                        cognitive_state=int(CognitiveState.ACTIVE),
-                        validation_state=int(ValidationState.STRUCTURAL),
-                    ))
+                    self._submit(
+                        MemoryProposal(
+                            uid=revision.target,
+                            fingerprint=target_fingerprint,
+                            event_id=self._event_id(),
+                            watermark=int(self.current_watermark()),
+                            level=MemoryLevel.M6,
+                            memory_type=MemoryType.OUTCOME,
+                            key_parts=tuple(revision.descriptor),
+                            support_delta=(
+                                max(1, outcome.support) if index == 0 else 0
+                            ),
+                            explanatory_sum=1.0 if index == 0 else 0.0,
+                            score_weight=1.0 if index == 0 else 0.0,
+                            parent_uid=source_uid,
+                            relation_type=RelationType.SUPERSEDES,
+                            cognitive_state=int(CognitiveState.ACTIVE),
+                            validation_state=int(ValidationState.STRUCTURAL),
+                        )
+                    )
                     self._append_evidence("outcome_merge", source, 1.0)
                 for strategy in m7_rows:
-                    member_outcome = MemoryUid(int(strategy.key_parts[1]), int(strategy.key_parts[2]))
+                    member_outcome = MemoryUid(
+                        int(strategy.key_parts[1]),
+                        int(strategy.key_parts[2]),
+                    )
                     if member_outcome not in revision.sources:
                         continue
-                    key = (int(strategy.key_parts[0]), int(revision.target.hi), int(revision.target.lo), int(strategy.key_parts[3]))
-                    merged_uid = MemoryUid.from_key(MemoryLevel.M7, MemoryType.STRATEGY, key)
-                    self._submit(MemoryProposal(
-                        uid=merged_uid,
-                        fingerprint=proposal_fingerprint(MemoryLevel.M7, MemoryType.STRATEGY, key),
-                        event_id=self._event_id(),
-                        watermark=int(self.current_watermark()),
-                        level=MemoryLevel.M7,
-                        memory_type=MemoryType.STRATEGY,
-                        key_parts=key,
-                        support_delta=max(1, int(strategy.support_count)),
-                        significance_sum=float(strategy.significance_sum),
-                        learning_value_sum=float(strategy.learning_value_sum),
-                        future_option_sum=float(strategy.future_option_sum),
-                        score_weight=max(1.0, float(strategy.score_weight)),
-                        success_sum=float(strategy.success_sum),
-                        cost_sum=float(strategy.cost_sum),
-                        attempt_weight=float(strategy.attempt_weight),
-                        parent_uid=revision.target,
-                        relation_type=RelationType.LEADS_TO,
-                        cognitive_state=int(strategy.cognitive_state),
-                        validation_state=int(strategy.validation_state),
-                    ))
+                    key = (
+                        int(strategy.key_parts[0]),
+                        int(revision.target.hi),
+                        int(revision.target.lo),
+                        int(strategy.key_parts[3]),
+                    )
+                    merged_uid = MemoryUid.from_key(
+                        MemoryLevel.M7,
+                        MemoryType.STRATEGY,
+                        key,
+                    )
+                    self._submit(
+                        MemoryProposal(
+                            uid=merged_uid,
+                            fingerprint=proposal_fingerprint(
+                                MemoryLevel.M7,
+                                MemoryType.STRATEGY,
+                                key,
+                            ),
+                            event_id=self._event_id(),
+                            watermark=int(self.current_watermark()),
+                            level=MemoryLevel.M7,
+                            memory_type=MemoryType.STRATEGY,
+                            key_parts=key,
+                            support_delta=max(
+                                1, int(strategy.support_count)
+                            ),
+                            significance_sum=float(
+                                strategy.significance_sum
+                            ),
+                            learning_value_sum=float(
+                                strategy.learning_value_sum
+                            ),
+                            future_option_sum=float(
+                                strategy.future_option_sum
+                            ),
+                            score_weight=max(
+                                1.0, float(strategy.score_weight)
+                            ),
+                            success_sum=float(strategy.success_sum),
+                            cost_sum=float(strategy.cost_sum),
+                            attempt_weight=float(strategy.attempt_weight),
+                            parent_uid=revision.target,
+                            relation_type=RelationType.LEADS_TO,
+                            cognitive_state=int(strategy.cognitive_state),
+                            validation_state=int(strategy.validation_state),
+                        )
+                    )
 
             by_outcome = self.strategies.by_outcome(nodes)
             for _outcome_uid, alternatives in by_outcome.items():
@@ -495,27 +730,72 @@ class DevelopmentalPeerSupervisor:
                     row = by_uid.get(strategy.uid)
                     if row is None:
                         continue
-                    if self._fresh("alternative", row.uid, row.updated_watermark):
-                        self._append_evidence("alternative_strategy", row, min(1.0, len(alternatives) / 3.0))
-                    if row.attempt_weight > 0 and self._fresh("efficiency", row.uid, row.updated_watermark):
-                        efficiency = 1.0 / max(1e-9, strategy.mean_cost)
-                        self._append_evidence("strategy_efficiency", row, min(1.0, efficiency))
+                    if self._fresh(
+                        "alternative", row.uid, row.updated_watermark
+                    ):
+                        self._append_evidence(
+                            "alternative_strategy",
+                            row,
+                            min(1.0, len(alternatives) / 3.0),
+                        )
+                    if (
+                        row.attempt_weight > 0
+                        and self._fresh(
+                            "efficiency", row.uid, row.updated_watermark
+                        )
+                    ):
+                        efficiency = 1.0 / max(
+                            1e-9, strategy.mean_cost
+                        )
+                        self._append_evidence(
+                            "strategy_efficiency",
+                            row,
+                            min(1.0, efficiency),
+                        )
 
-            # Lifecycle first stages retirement, then pruning resolves dependency safety.
-            lifecycle_rows = tuple(row for row in nodes if not attended or row.uid in attended or int(row.cognitive_state) >= int(CognitiveState.QUARANTINED))
+            lifecycle_rows = tuple(
+                row
+                for row in nodes
+                if not attended
+                or row.uid in attended
+                or int(row.cognitive_state)
+                >= int(CognitiveState.QUARANTINED)
+            )
             for row in lifecycle_rows[: self.candidate_budget * 2]:
                 decision = self.lifecycle.decide(row)
-                if decision is None or not self._fresh("lifecycle", row.uid, row.updated_watermark):
+                if decision is None or not self._fresh(
+                    "lifecycle", row.uid, row.updated_watermark
+                ):
                     continue
-                self._submit(self._existing_proposal(row, cognitive_state=decision.cognitive_state, validation_state=decision.validation_state))
-            protected = {candidate.uid: candidate.protected_by_dependencies for candidate in self.pruning.candidates(nodes, edges)}
+                self._submit(
+                    self._existing_proposal(
+                        row,
+                        cognitive_state=decision.cognitive_state,
+                        validation_state=decision.validation_state,
+                    )
+                )
+            protected = {
+                candidate.uid: candidate.protected_by_dependencies
+                for candidate in self.pruning.candidates(nodes, edges)
+            }
             for row in nodes:
                 if row.uid not in protected:
                     continue
-                decision = self.lifecycle.finalize_retirement(row, protected_by_dependencies=protected[row.uid])
-                if decision is None or not self._fresh("retire", row.uid, row.updated_watermark):
+                decision = self.lifecycle.finalize_retirement(
+                    row,
+                    protected_by_dependencies=protected[row.uid],
+                )
+                if decision is None or not self._fresh(
+                    "retire", row.uid, row.updated_watermark
+                ):
                     continue
-                self._submit(self._existing_proposal(row, cognitive_state=decision.cognitive_state, validation_state=decision.validation_state))
+                self._submit(
+                    self._existing_proposal(
+                        row,
+                        cognitive_state=decision.cognitive_state,
+                        validation_state=decision.validation_state,
+                    )
+                )
                 self._append_evidence("memory_retired", row, 1.0)
 
             self._cycles += 1
@@ -531,16 +811,25 @@ class DevelopmentalPeerSupervisor:
         cost: float,
         source_game_hash: int,
     ) -> bool:
-        row = next((r for r in self.read_view.node_records(level=MemoryLevel.M7) if r.uid == uid), None)
+        row = next(
+            (
+                value
+                for value in self.read_view.node_records(level=MemoryLevel.M7)
+                if value.uid == uid
+            ),
+            None,
+        )
         if row is None or attempts <= 0:
             return False
-        self._submit(self._existing_proposal(
-            row,
-            success_sum=float(max(0, successes)),
-            cost_sum=float(max(0.0, cost)),
-            attempt_weight=float(attempts),
-            source_game_hash=int(source_game_hash),
-        ))
+        self._submit(
+            self._existing_proposal(
+                row,
+                success_sum=float(max(0, successes)),
+                cost_sum=float(max(0.0, cost)),
+                attempt_weight=float(attempts),
+                source_game_hash=int(source_game_hash),
+            )
+        )
         self._append_evidence(
             "strategy_efficiency",
             row,
@@ -567,11 +856,19 @@ class DevelopmentalPeerSupervisor:
             formation_games=formation_games,
             intervention=intervention,
         )
-        row = next((r for r in self.read_view.node_records() if r.uid == uid), None)
+        row = next(
+            (r for r in self.read_view.node_records() if r.uid == uid),
+            None,
+        )
         if row is None:
             return trial
         if trial.passed:
-            self._submit(self._existing_proposal(row, validation_state=int(ValidationState.VALIDATED)))
+            self._submit(
+                self._existing_proposal(
+                    row,
+                    validation_state=int(ValidationState.VALIDATED),
+                )
+            )
             self._append_evidence(
                 "transfer_trial_pass",
                 row,
@@ -617,7 +914,10 @@ class DevelopmentalPeerSupervisor:
         )
         if not accepted:
             return False
-        rows = {row.uid: row for row in self.read_view.node_records(level=MemoryLevel.M6)}
+        rows = {
+            row.uid: row
+            for row in self.read_view.node_records(level=MemoryLevel.M6)
+        }
         chosen = rows.get(chosen_outcome)
         if chosen is not None:
             self._append_evidence(
@@ -634,26 +934,42 @@ class DevelopmentalPeerSupervisor:
             other = rows.get(evidence.other)
             if preferred is None or other is None:
                 continue
-            stable_key = f"stable-preference:{preferred.uid.hex()}:{other.uid.hex()}:{evidence.context_bucket}"
+            stable_key = (
+                f"stable-preference:{preferred.uid.hex()}:"
+                f"{other.uid.hex()}:{evidence.context_bucket}"
+            )
             if self.ledger.contains(stable_key):
                 continue
-            self._submit(self._existing_proposal(preferred, parent_uid=other.uid, relation_type=RelationType.PREFERENCE))
+            self._submit(
+                self._existing_proposal(
+                    preferred,
+                    parent_uid=other.uid,
+                    relation_type=RelationType.PREFERENCE,
+                )
+            )
             watermark = int(self.current_watermark())
-            games = tuple(sorted(self.read_view.source_games(preferred) | self.read_view.source_games(other)))
-            self.ledger.append(EvidenceRecord.for_uid(
-                stable_key,
-                preferred.uid,
-                evidence_kind="stable_preference_probe",
-                watermark=watermark,
-                raw_value=abs(evidence.strength),
-                normalized_value=min(1.0, abs(evidence.strength)),
-                developmental_stage=int(MemoryLevel.M6),
-                validation_state=int(ValidationState.VALIDATED),
-                provenance_games=games,
-                causal_intervention="clean_choice_probe",
-                effect_direction=1,
-                graph_generation=int(self.current_generation()),
-            ))
+            games = tuple(
+                sorted(
+                    self.read_view.source_games(preferred)
+                    | self.read_view.source_games(other)
+                )
+            )
+            self.ledger.append(
+                EvidenceRecord.for_uid(
+                    stable_key,
+                    preferred.uid,
+                    evidence_kind="stable_preference_probe",
+                    watermark=watermark,
+                    raw_value=abs(evidence.strength),
+                    normalized_value=min(1.0, abs(evidence.strength)),
+                    developmental_stage=int(MemoryLevel.M6),
+                    validation_state=int(ValidationState.VALIDATED),
+                    provenance_games=games,
+                    causal_intervention="clean_choice_probe",
+                    effect_direction=1,
+                    graph_generation=int(self.current_generation()),
+                )
+            )
         return True
 
     def record_replanning_trial(
@@ -666,15 +982,23 @@ class DevelopmentalPeerSupervisor:
         alternative_selected: bool,
         recovery_succeeded: bool,
     ) -> ReplanningTrial:
-        rows = {row.uid: row for row in self.read_view.node_records(level=MemoryLevel.M7)}
+        rows = {
+            row.uid: row
+            for row in self.read_view.node_records(level=MemoryLevel.M7)
+        }
         primary = rows.get(primary_strategy_uid)
         alternative = rows.get(alternative_strategy_uid)
         primary_outcome = None
         alternative_outcome = None
         if primary is not None and len(primary.key_parts) >= 3:
-            primary_outcome = MemoryUid(int(primary.key_parts[1]), int(primary.key_parts[2]))
+            primary_outcome = MemoryUid(
+                int(primary.key_parts[1]), int(primary.key_parts[2])
+            )
         if alternative is not None and len(alternative.key_parts) >= 3:
-            alternative_outcome = MemoryUid(int(alternative.key_parts[1]), int(alternative.key_parts[2]))
+            alternative_outcome = MemoryUid(
+                int(alternative.key_parts[1]),
+                int(alternative.key_parts[2]),
+            )
         outcome_preserved = bool(
             primary_outcome == outcome_uid
             and alternative_outcome == outcome_uid
@@ -702,11 +1026,16 @@ class DevelopmentalPeerSupervisor:
 
     def state_dict(self) -> dict[str, object]:
         return {
-            "version": 1,
+            "version": 2,
             "sequence": self._sequence,
             "evidence_sequence": self._evidence_sequence,
             "seen": [
-                {"kind": kind, "hi": hi, "lo": lo, "watermark": watermark}
+                {
+                    "kind": kind,
+                    "hi": hi,
+                    "lo": lo,
+                    "watermark": watermark,
+                }
                 for (kind, hi, lo), watermark in self._seen.items()
             ],
             "ledger": self.ledger.state_dict(),
@@ -714,23 +1043,61 @@ class DevelopmentalPeerSupervisor:
             "preference": self.preference.state_dict(),
             "lifecycle": self.lifecycle.state_dict(),
             "outcomes": self.outcomes.state_dict(),
+            "similarity": self.similarity.state_dict(),
         }
 
     def load_state(self, state: dict[str, object] | None) -> None:
         if not state:
             return
-        self._sequence = max(self._sequence, int(state.get("sequence", 0)))
-        self._evidence_sequence = max(self._evidence_sequence, int(state.get("evidence_sequence", 0)))
+        self._sequence = max(
+            self._sequence, int(state.get("sequence", 0))
+        )
+        self._evidence_sequence = max(
+            self._evidence_sequence,
+            int(state.get("evidence_sequence", 0)),
+        )
         for raw in state.get("seen", []):
             if not isinstance(raw, dict):
                 continue
-            key = (str(raw.get("kind", "")), int(raw.get("hi", 0)), int(raw.get("lo", 0)))
-            self._seen[key] = max(self._seen.get(key, -1), int(raw.get("watermark", 0)))
-        self.ledger.load_state(state.get("ledger") if isinstance(state.get("ledger"), dict) else None)
-        self.transfer.load_state(state.get("transfer") if isinstance(state.get("transfer"), dict) else None)
-        self.preference.load_state(state.get("preference") if isinstance(state.get("preference"), dict) else None)
-        self.lifecycle.load_state(state.get("lifecycle") if isinstance(state.get("lifecycle"), dict) else None)
-        self.outcomes.load_state(state.get("outcomes") if isinstance(state.get("outcomes"), dict) else None)
+            key = (
+                str(raw.get("kind", "")),
+                int(raw.get("hi", 0)),
+                int(raw.get("lo", 0)),
+            )
+            self._seen[key] = max(
+                self._seen.get(key, -1),
+                int(raw.get("watermark", 0)),
+            )
+        self.ledger.load_state(
+            state.get("ledger")
+            if isinstance(state.get("ledger"), dict)
+            else None
+        )
+        self.transfer.load_state(
+            state.get("transfer")
+            if isinstance(state.get("transfer"), dict)
+            else None
+        )
+        self.preference.load_state(
+            state.get("preference")
+            if isinstance(state.get("preference"), dict)
+            else None
+        )
+        self.lifecycle.load_state(
+            state.get("lifecycle")
+            if isinstance(state.get("lifecycle"), dict)
+            else None
+        )
+        self.outcomes.load_state(
+            state.get("outcomes")
+            if isinstance(state.get("outcomes"), dict)
+            else None
+        )
+        self.similarity.load_state(
+            state.get("similarity")
+            if isinstance(state.get("similarity"), dict)
+            else None
+        )
 
     def _run(self) -> None:
         while not self._stop.wait(self.interval_seconds):
