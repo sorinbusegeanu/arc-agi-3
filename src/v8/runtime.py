@@ -9,10 +9,12 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from v8.arena import SharedActionArena, SharedEdgeArena, SharedNodeArena
+from v8.compaction import CompactionResult, compact_retired_memory as compact_retired_arenas
 from v8.development import STAGES, stage_worker
 from v8.evaluation import ScientificHypothesisEvaluator
 from v8.evidence import EvidenceRecord
 from v8.model import (
+    CognitiveState,
     EventId,
     ExperienceEvent,
     MemoryLevel,
@@ -87,7 +89,9 @@ class ContinuousMemoryRuntime:
         self._actor_throttle = mp.Value("d", 0.0)
         self._snapshot_id = 0
         self._submit_lock = threading.Lock()
+        self._maintenance_lock = threading.Lock()
         self._snapshot_error: str | None = None
+        self._last_compaction = CompactionResult(0, 0, 0, 0)
 
         self._stage_rings = tuple(
             SharedRingBuffer(capacity=config.stage_ring_capacity, slot_size=PIPELINE_PACKET_SIZE)
@@ -134,31 +138,9 @@ class ContinuousMemoryRuntime:
         self._shard_inflight = tuple(mp.Value("Q", 0) for _ in range(config.shards))
         self._shard_watermarks = tuple(mp.Value("Q", 0) for _ in range(config.shards))
         self._stage_processes: list[mp.Process] = []
-        self._shard_processes: list[mp.Process] = []
-
-        for shard_id in range(config.shards):
-            self._shard_processes.append(
-                mp.Process(
-                    target=shard_worker,
-                    args=(
-                        ShardConfig(
-                            shard_id,
-                            self._node_arenas[shard_id].descriptor,
-                            self._edge_arenas[shard_id].descriptor,
-                            self._action_arenas[shard_id].descriptor,
-                        ),
-                        self._shard_rings[shard_id].attachment_args(),
-                        self._stop,
-                        self._shard_inflight[shard_id],
-                        self._shard_watermarks[shard_id],
-                        self._error_queue,
-                        config.shard_batch_size,
-                        self._generation,
-                    ),
-                    name=f"v8-shard-{shard_id:02d}",
-                    daemon=True,
-                )
-            )
+        self._shard_processes: list[mp.Process] = [
+            self._build_shard_process(shard_id) for shard_id in range(config.shards)
+        ]
 
         shard_ring_args = tuple(ring.attachment_args() for ring in self._shard_rings)
         for stage_index, definition in enumerate(STAGES):
@@ -215,6 +197,28 @@ class ContinuousMemoryRuntime:
             if isinstance(peer_state, dict):
                 self.peers.load_state(peer_state)
         self.hypothesis_evaluator = ScientificHypothesisEvaluator()
+
+    def _build_shard_process(self, shard_id: int) -> mp.Process:
+        return mp.Process(
+            target=shard_worker,
+            args=(
+                ShardConfig(
+                    shard_id,
+                    self._node_arenas[shard_id].descriptor,
+                    self._edge_arenas[shard_id].descriptor,
+                    self._action_arenas[shard_id].descriptor,
+                ),
+                self._shard_rings[shard_id].attachment_args(),
+                self._stop,
+                self._shard_inflight[shard_id],
+                self._shard_watermarks[shard_id],
+                self._error_queue,
+                self.config.shard_batch_size,
+                self._generation,
+            ),
+            name=f"v8-shard-{shard_id:02d}",
+            daemon=True,
+        )
 
     @property
     def watermark(self) -> int:
@@ -276,19 +280,32 @@ class ContinuousMemoryRuntime:
         while not self._resource_thread_stop.wait(0.5):
             if self._closed:
                 return
+            memory_capacity = self.config.node_capacity_per_shard * self.config.shards
+            edge_capacity = self.config.edge_capacity_per_shard * self.config.shards
             decision = self.resource_controller.decide(
                 stage_depths=tuple(ring.qsize for ring in self._stage_rings),
                 shard_depths=tuple(ring.qsize for ring in self._shard_rings),
                 stage_capacity=self.config.stage_ring_capacity,
                 shard_capacity=self.config.shard_ring_capacity,
                 memory_count=self.read_view.memory_count,
-                memory_capacity=self.config.node_capacity_per_shard * self.config.shards,
+                memory_capacity=memory_capacity,
             )
             with self._actor_throttle.get_lock():
                 self._actor_throttle.value = float(decision.actor_throttle_seconds)
             if self.peers is not None:
                 self.peers.set_interval(decision.peer_interval_seconds)
                 self.peers.set_candidate_budget(decision.candidate_budget)
+            node_ratio = self.read_view.memory_count / max(1, memory_capacity)
+            edge_ratio = self.read_view.edge_count / max(1, edge_capacity)
+            if max(node_ratio, edge_ratio) >= 0.80 and any(
+                int(row.cognitive_state) == int(CognitiveState.RETIRED)
+                for row in self.read_view.node_records()
+            ):
+                try:
+                    self.compact_retired_memory(timeout=30.0)
+                except BaseException as exc:
+                    self._snapshot_error = f"compaction {type(exc).__name__}: {exc}"
+                    return
 
     def make_experience(
         self,
@@ -428,26 +445,71 @@ class ContinuousMemoryRuntime:
             if self.peers is not None and resume_peers and not self._snapshot_freeze.is_set():
                 self.peers.resume()
 
+    def compact_retired_memory(self, *, timeout: float = 30.0) -> CompactionResult:
+        """Archive and physically reclaim RETIRED RAM rows without losing provenance."""
+        if not self._started:
+            self.start()
+        with self._maintenance_lock:
+            self._snapshot_freeze.set()
+            if self.peers is not None:
+                self.peers.pause()
+            try:
+                self.wait_quiescent(timeout=timeout, resume_peers=False)
+                if not any(
+                    int(row.cognitive_state) == int(CognitiveState.RETIRED)
+                    for row in self.read_view.node_records()
+                ):
+                    self._last_compaction = CompactionResult(
+                        0, 0, self.read_view.memory_count, self.read_view.edge_count
+                    )
+                    return self._last_compaction
+
+                old_processes = tuple(self._shard_processes)
+                self._shard_processes = []
+                for process in old_processes:
+                    if process.is_alive():
+                        process.terminate()
+                    process.join(timeout=2.0)
+
+                result = compact_retired_arenas(
+                    self.shard_descriptors,
+                    archive_path=self.root / "archive" / "retired_memory.jsonl",
+                )
+                self._shard_processes = [
+                    self._build_shard_process(shard_id) for shard_id in range(self.config.shards)
+                ]
+                for process in self._shard_processes:
+                    process.start()
+                with self._generation.get_lock():
+                    self._generation.value += 1
+                self._last_compaction = result
+                return result
+            finally:
+                if self.peers is not None:
+                    self.peers.resume()
+                self._snapshot_freeze.clear()
+
     def request_consistent_snapshot(self, *, timeout: float = 30.0) -> None:
         if self.snapshot_service is None:
             return
-        self._snapshot_freeze.set()
-        if self.peers is not None:
-            self.peers.pause()
-        try:
-            self.wait_quiescent(timeout=timeout, resume_peers=False)
-            self._snapshot_id += 1
-            self.snapshot_service.request_consistent_capture(
-                self._snapshot_id,
-                self.watermark,
-                generation=self.generation,
-                auxiliary_state=self._auxiliary_state_json(),
-                timeout=timeout,
-            )
-        finally:
+        with self._maintenance_lock:
+            self._snapshot_freeze.set()
             if self.peers is not None:
-                self.peers.resume()
-            self._snapshot_freeze.clear()
+                self.peers.pause()
+            try:
+                self.wait_quiescent(timeout=timeout, resume_peers=False)
+                self._snapshot_id += 1
+                self.snapshot_service.request_consistent_capture(
+                    self._snapshot_id,
+                    self.watermark,
+                    generation=self.generation,
+                    auxiliary_state=self._auxiliary_state_json(),
+                    timeout=timeout,
+                )
+            finally:
+                if self.peers is not None:
+                    self.peers.resume()
+                self._snapshot_freeze.clear()
 
     def scientific_statuses(self) -> dict[str, str]:
         if self.peers is None:
@@ -596,6 +658,7 @@ class ContinuousMemoryRuntime:
             "shard_inflight": [int(value.value) for value in self._shard_inflight],
             "shard_watermarks": [int(value.value) for value in self._shard_watermarks],
             "actor_throttle_seconds": throttle,
+            "last_compaction": asdict(self._last_compaction),
             "peers": peer_metrics,
         }
 
@@ -639,6 +702,30 @@ class ContinuousMemoryRuntime:
                 self.wait_quiescent(timeout=timeout, resume_peers=False)
                 if self.peers is not None:
                     self.peers.close()
+                # Final maintenance compaction reclaims all dependency-safe retired rows
+                # before the reporting cut and final recovery snapshot.
+                if any(
+                    int(row.cognitive_state) == int(CognitiveState.RETIRED)
+                    for row in self.read_view.node_records()
+                ):
+                    # Peers are already closed; compact directly at the quiescent cut.
+                    old_processes = tuple(self._shard_processes)
+                    self._shard_processes = []
+                    for process in old_processes:
+                        if process.is_alive():
+                            process.terminate()
+                        process.join(timeout=2.0)
+                    self._last_compaction = compact_retired_arenas(
+                        self.shard_descriptors,
+                        archive_path=self.root / "archive" / "retired_memory.jsonl",
+                    )
+                    self._shard_processes = [
+                        self._build_shard_process(shard_id) for shard_id in range(self.config.shards)
+                    ]
+                    for process in self._shard_processes:
+                        process.start()
+                    with self._generation.get_lock():
+                        self._generation.value += 1
                 self.write_scientific_report()
                 if self.snapshot_service is not None:
                     final_result = self.final_snapshot(timeout=timeout)
