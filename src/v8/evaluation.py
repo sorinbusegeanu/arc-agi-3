@@ -78,7 +78,16 @@ CONTRACTS: tuple[HypothesisContract, ...] = (
         dependencies=("H06",),
     ),
     HypothesisContract("H12", ("strategy_reuse",), ("strategy_efficiency",), 1),
-    HypothesisContract("H13", ("outcome_equivalence",), ("outcome_merge",), 1),
+    HypothesisContract(
+        "H13",
+        ("outcome_equivalence", "outcome_merge"),
+        ("outcome_consistency_holdout",),
+        1,
+        negative_kinds=("outcome_consistency_fail",),
+        held_out_required=True,
+        positive_effect_required=True,
+        min_distinct_targets=1,
+    ),
     HypothesisContract(
         "H14",
         ("alternative_strategy", "replanning_observed"),
