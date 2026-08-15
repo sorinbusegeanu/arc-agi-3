@@ -20,9 +20,10 @@ from v7.memory.evidence_lifecycle import (
 )
 from v7.memory.evidence_store import EvidenceStore
 from v7.memory.ids import MemoryId, MemoryLevel
+from v7.memory.models import NodeMutation
 from v7.memory.publisher import GenerationPublisher
 from v7.memory.restart import RuntimeSnapshotStore
-from v7.memory.state import GateId, gate_for_identity
+from v7.memory.state import CognitiveState, GateId, GateValidationState, gate_for_identity
 from v7.memory.transport.mmap_segments import SegmentedMmapReadViewTransport
 from v7.memory.writer import CanonicalMemoryWriter
 
@@ -98,7 +99,11 @@ class V7Runtime:
         config.root.mkdir(parents=True, exist_ok=True)
         self.durable = DurableGenerationStore(config.root / "state.sqlite")
         self.snapshots = RuntimeSnapshotStore(self.durable)
-        self.writer = self.snapshots.restore() if config.restore else CanonicalMemoryWriter()
+        if config.restore:
+            self.writer = self.snapshots.restore()
+            self.writer.gate_candidates = True
+        else:
+            self.writer = CanonicalMemoryWriter(gate_candidates=True)
         self.evidence = EvidenceStore(config.root / "evidence.sqlite")
         self.lifecycle_evidence = EvidenceLifecycleStore(config.root / "lifecycle.sqlite")
         self.pipeline = MemoryLearningPipeline(
@@ -147,6 +152,10 @@ class V7Runtime:
             for value in getattr(evidence, "context_signatures", ()) or ()
         )
         return values or (int(evidence.context_signature),)
+
+    @staticmethod
+    def _is_legacy_episode(evidence: EpisodeEvidence) -> bool:
+        return not hasattr(evidence, "context_signatures")
 
     def _capture_g01_predictions(
         self,
@@ -238,12 +247,6 @@ class V7Runtime:
                             source_global_step=evidence.source_global_step,
                         )
                     )
-                node = nodes.get(memory_id)
-                if node is not None and self.lifecycle_evidence.candidate_scope(memory_id) is None:
-                    # Freeze immediately after the formation observation has
-                    # been recorded. Later evidence cannot expand this scope.
-                    if memory_id == primary_id or records:
-                        pass
         if records:
             self.lifecycle_evidence.append_provenance(records)
         for evidence in batch:
@@ -267,6 +270,40 @@ class V7Runtime:
                         memory_id,
                         int(node.created_generation),
                     )
+
+    def _activate_legacy_primary_m1(
+        self,
+        batch: tuple[EpisodeEvidence, ...],
+        primary_ids: tuple[MemoryId, ...],
+    ) -> None:
+        """Preserve direct EpisodeEvidence API semantics used by fixtures/tools.
+
+        Real online sampling emits ContextEpisodeEvidence and remains fully
+        gate-controlled. Plain EpisodeEvidence historically represents already
+        accepted fixture observations and is kept backward compatible.
+        """
+        nodes = getattr(self.writer, "_nodes")
+        mutations: list[NodeMutation] = []
+        for evidence, memory_id in zip(batch, primary_ids, strict=True):
+            if not self._is_legacy_episode(evidence):
+                continue
+            node = nodes.get(memory_id)
+            if node is None:
+                continue
+            mutations.append(
+                NodeMutation(
+                    memory_id,
+                    node.level,
+                    node.type_id,
+                    support_delta=0,
+                    status_flags=node.status_flags,
+                    cognitive_state=int(CognitiveState.ACTIVE),
+                    validation_state=int(GateValidationState.VALIDATED),
+                    gate_id=int(GateId.G01),
+                )
+            )
+        if mutations:
+            self.writer.apply_mutation_batch(mutations)
 
     def _write_g01_trials(
         self,
@@ -390,6 +427,7 @@ class V7Runtime:
                 self.writer.observe_global_step(evidence.source_global_step)
         predictions = self._capture_g01_predictions(batch)
         primary_ids = self.pipeline.observe_batch(batch)
+        self._activate_legacy_primary_m1(batch, primary_ids)
         self._complete_m1_provenance(batch, primary_ids)
         self._write_g01_trials(predictions, batch)
         self._write_decision_gate_trials(batch)
