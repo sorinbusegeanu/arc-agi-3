@@ -73,6 +73,16 @@ class ReplanningTrialResult:
 
 
 @dataclass(frozen=True, slots=True)
+class ActorLearningBatch:
+    actor_id: int
+    game_id: str
+    strategy_stats: tuple[StrategyRunStat, ...] = ()
+    preference_probes: tuple[PreferenceProbeResult, ...] = ()
+    replanning_trials: tuple[ReplanningTrialResult, ...] = ()
+    replans: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class ActorResult:
     actor_id: int
     game_id: str
@@ -110,12 +120,6 @@ def _trajectory_step_cost(
     negative_outcome: bool,
     recent_contexts: tuple[int, ...],
 ) -> float:
-    """Observed outcome-conditioned step cost for M7 efficiency.
-
-    One interaction is the base cost. No-change/blocked steps, immediate repeated
-    states, short loops, and negative outcomes add explicit penalties. This makes M7
-    efficiency an observed property rather than a constant support proxy.
-    """
     cost = 1.0
     if int(changed_cells) <= 0:
         cost += 1.0
@@ -145,21 +149,35 @@ def _changed_bucket(changed_cells: int) -> int:
     return 4
 
 
+def _outcome_bucket(changed_cells: int, terminal_polarity: int) -> int:
+    polarity = 1 if int(terminal_polarity) > 0 else -1 if int(terminal_polarity) < 0 else 0
+    return _changed_bucket(changed_cells) * 3 + (polarity + 1)
+
+
 def _observed_outcome_uids(
     *,
     outcome_signature: int,
     family_signature: int,
     future_delta: float,
     changed_cells: int,
+    terminal_polarity: int = 0,
 ) -> tuple[MemoryUid, MemoryUid]:
     future = _bucket(future_delta)
-    changed = _changed_bucket(changed_cells)
+    outcome_bucket = _outcome_bucket(changed_cells, terminal_polarity)
     variant = stable_u64(
         outcome_signature, family_signature, person=b"v8-outcome-variant"
     ) & 0xF
     return (
-        MemoryUid.from_key(MemoryLevel.M6, MemoryType.OUTCOME, (future, changed, variant)),
-        MemoryUid.from_key(MemoryLevel.M6, MemoryType.OUTCOME, (future, changed)),
+        MemoryUid.from_key(MemoryLevel.M6, MemoryType.OUTCOME, (future, outcome_bucket, variant)),
+        MemoryUid.from_key(MemoryLevel.M6, MemoryType.OUTCOME, (future, outcome_bucket)),
+    )
+
+
+def _stats_tuple(values: dict[MemoryUid, list[float]]) -> tuple[StrategyRunStat, ...]:
+    return tuple(
+        StrategyRunStat(uid, int(row[0]), int(row[1]), float(row[2]))
+        for uid, row in sorted(values.items())
+        if row[0] > 0
     )
 
 
@@ -192,6 +210,31 @@ def _publish_progress(
         pass
 
 
+def _publish_learning(
+    progress_queue: mp.Queue | None,
+    *,
+    job: ActorJob,
+    strategy_stats: dict[MemoryUid, list[float]],
+    preference_probes: list[PreferenceProbeResult],
+    replanning_trials: list[ReplanningTrialResult],
+) -> None:
+    if progress_queue is None:
+        return
+    stats = _stats_tuple(strategy_stats)
+    if not stats and not preference_probes and not replanning_trials:
+        return
+    progress_queue.put(
+        ActorLearningBatch(
+            job.actor_id,
+            job.game_id,
+            stats,
+            tuple(preference_probes),
+            tuple(replanning_trials),
+            len(replanning_trials),
+        )
+    )
+
+
 def actor_worker(
     *,
     job: ActorJob,
@@ -217,6 +260,8 @@ def actor_worker(
     view = LiveReadView(read_descriptors)
     rng = Random(job.seed)
     env = ArcGridEnvironment(game_id=job.game_id, seed=job.seed, env_root=job.env_root)
+    terminal_wait_seconds = max(0.0, float(env.game_wait_seconds))
+    env.game_wait_seconds = 0.0
     sequence = 0
     with watermark.get_lock():
         sequence_base = int(watermark.value)
@@ -228,8 +273,11 @@ def actor_worker(
     selected_outcome: MemoryUid | None = None
     selected_strategy: MemoryUid | None = None
     strategy_stats: dict[MemoryUid, list[float]] = {}
+    pending_strategy_stats: dict[MemoryUid, list[float]] = {}
     preference_probes: list[PreferenceProbeResult] = []
+    pending_preference_probes: list[PreferenceProbeResult] = []
     replanning_trials: list[ReplanningTrialResult] = []
+    pending_replanning_trials: list[ReplanningTrialResult] = []
     last_levels = int(env.last_levels_completed)
     next_progress = time.monotonic() + 5.0
     try:
@@ -247,6 +295,7 @@ def actor_worker(
                 env.reset()
                 selected_outcome = selected_strategy = None
                 recent_contexts.clear()
+                local_overlay.clear()
                 continue
             context = int(structural_grid_signature(before))
 
@@ -256,15 +305,15 @@ def actor_worker(
             if planned is not None:
                 alternatives = [row for row in plans[1:] if row.outcome_uid != planned.outcome_uid]
                 if alternatives and len(preference_probes) < int(job.max_probe_records):
-                    preference_probes.append(
-                        PreferenceProbeResult(
-                            planned.outcome_uid,
-                            alternatives[0].outcome_uid,
-                            stable_u64(context, person=b"v8-context"),
-                            planned.outcome_uid,
-                            bool(planned.preference_influenced),
-                        )
+                    probe = PreferenceProbeResult(
+                        planned.outcome_uid,
+                        alternatives[0].outcome_uid,
+                        stable_u64(context, person=b"v8-context"),
+                        planned.outcome_uid,
+                        bool(planned.preference_influenced),
                     )
+                    preference_probes.append(probe)
+                    pending_preference_probes.append(probe)
 
                 same_outcome = [
                     row
@@ -329,6 +378,7 @@ def actor_worker(
             carrier = int(carrier_signature(before, after) or 0)
             changed = int(changed_cell_count(before, after))
             future_delta = float(len(after_actions) - len(before_actions))
+            terminal_polarity = _polarity(env.last_outcome_polarity)
             prediction_error = (
                 0.0
                 if not prediction_distribution
@@ -362,7 +412,7 @@ def actor_worker(
                         carrier_signature=carrier,
                         future_option_delta=future_delta,
                         changed_cells=changed,
-                        terminal_polarity=_polarity(env.last_outcome_polarity),
+                        terminal_polarity=terminal_polarity,
                         trajectory_signature=rolling_trajectory,
                         next_context_signature=after_context,
                         prediction_error=prediction_error,
@@ -378,17 +428,22 @@ def actor_worker(
             sequence = next_sequence
 
             significance = _local_significance(changed, future_delta)
+            local_value = (
+                0.30 * significance
+                + 0.55 * terminal_polarity
+                + 0.15 * math.tanh(future_delta)
+            )
             old_support, old_score = local_overlay.get((context, action), (0, 0.0))
             new_support = old_support + 1
             local_overlay[(context, action)] = (
                 new_support,
-                (old_score * old_support + significance) / new_support,
+                (old_score * old_support + local_value) / new_support,
             )
 
             prior_levels = last_levels
-            if env.last_outcome_polarity == "positive":
+            if env.last_outcome_state == "WIN":
                 wins += 1
-            elif env.last_outcome_polarity == "negative":
+            elif env.last_outcome_state == "GAME_OVER":
                 failures += 1
             current_levels = int(env.last_levels_completed)
             level_advanced = current_levels > prior_levels
@@ -400,42 +455,62 @@ def actor_worker(
                 family_signature=family,
                 future_delta=future_delta,
                 changed_cells=changed,
+                terminal_polarity=terminal_polarity,
             )
             if planned is not None:
-                stat = strategy_stats.setdefault(planned.strategy_uid, [0.0, 0.0, 0.0])
-                stat[0] += 1.0
-                if (
-                    env.last_outcome_polarity == "positive"
+                success = int(
+                    env.last_outcome_state == "WIN"
                     or level_advanced
                     or planned.outcome_uid in {observed_variant, observed_coarse}
-                ):
-                    stat[1] += 1.0
-                stat[2] += _trajectory_step_cost(
+                )
+                step_cost = _trajectory_step_cost(
                     context=context,
                     after_context=after_context,
                     changed_cells=changed,
-                    negative_outcome=env.last_outcome_polarity == "negative",
+                    negative_outcome=env.last_outcome_state == "GAME_OVER",
                     recent_contexts=tuple(recent_contexts),
                 )
+                for stats_map in (strategy_stats, pending_strategy_stats):
+                    stat = stats_map.setdefault(planned.strategy_uid, [0.0, 0.0, 0.0])
+                    stat[0] += 1.0
+                    stat[1] += float(success)
+                    stat[2] += step_cost
 
             if explicit_replan is not None and len(replanning_trials) < int(job.max_probe_records):
                 primary_uid, alternative_uid, target_outcome = explicit_replan
-                replanning_trials.append(
-                    ReplanningTrialResult(
-                        primary_uid,
-                        alternative_uid,
-                        target_outcome,
-                        target_outcome in {observed_variant, observed_coarse},
-                    )
+                trial = ReplanningTrialResult(
+                    primary_uid,
+                    alternative_uid,
+                    target_outcome,
+                    target_outcome in {observed_variant, observed_coarse},
                 )
+                replanning_trials.append(trial)
+                pending_replanning_trials.append(trial)
 
             recent_contexts.append(context)
-            if current_levels < last_levels or env.last_step_was_reset_boundary:
+            terminal_game = env.last_outcome_state in {"WIN", "GAME_OVER"}
+            reset_boundary = current_levels < last_levels or env.last_step_was_reset_boundary
+            if terminal_game:
+                _publish_learning(
+                    progress_queue,
+                    job=job,
+                    strategy_stats=pending_strategy_stats,
+                    preference_probes=pending_preference_probes,
+                    replanning_trials=pending_replanning_trials,
+                )
+                pending_strategy_stats.clear()
+                pending_preference_probes.clear()
+                pending_replanning_trials.clear()
+                local_overlay.clear()
+                if terminal_wait_seconds > 0:
+                    time.sleep(terminal_wait_seconds)
+            if reset_boundary:
                 rolling_trajectory = stable_u64(
                     job.actor_id, producer_sequence, current_watermark, person=b"v8-traj-reset"
                 )
                 selected_outcome = selected_strategy = None
                 recent_contexts.clear()
+                local_overlay.clear()
             last_levels = current_levels
 
             now = time.monotonic()
@@ -452,6 +527,13 @@ def actor_worker(
                 )
                 next_progress = now + 5.0
 
+        _publish_learning(
+            progress_queue,
+            job=job,
+            strategy_stats=pending_strategy_stats,
+            preference_probes=pending_preference_probes,
+            replanning_trials=pending_replanning_trials,
+        )
         _publish_progress(
             progress_queue,
             job=job,
@@ -461,10 +543,6 @@ def actor_worker(
             levels_completed=levels_completed,
             replans=replans,
             planned_steps=planned_steps,
-        )
-        stats = tuple(
-            StrategyRunStat(uid, int(values[0]), int(values[1]), float(values[2]))
-            for uid, values in sorted(strategy_stats.items())
         )
         result_queue.put(
             ActorResult(
@@ -477,7 +555,7 @@ def actor_worker(
                 int(env.reset_count),
                 replans,
                 planned_steps,
-                stats,
+                _stats_tuple(strategy_stats),
                 tuple(preference_probes),
                 tuple(replanning_trials),
             )
@@ -504,7 +582,7 @@ def run_actor_jobs(
 
     ctx = runtime._mp_ctx
     results = ctx.Queue()
-    progress = ctx.Queue(maxsize=max(16, len(jobs) * 4))
+    progress = ctx.Queue(maxsize=max(16, len(jobs) * 8))
     processes = [
         ctx.Process(
             target=actor_worker,
@@ -545,6 +623,8 @@ def run_actor_jobs(
                     break
                 if isinstance(row, ActorProgress):
                     latest[row.actor_id] = row
+                elif isinstance(row, ActorLearningBatch):
+                    runtime.record_actor_results((row,))
 
             while True:
                 try:
@@ -583,6 +663,16 @@ def run_actor_jobs(
 
         for process in processes:
             process.join(timeout=2.0)
+
+        while True:
+            try:
+                row = progress.get_nowait()
+            except queue.Empty:
+                break
+            if isinstance(row, ActorProgress):
+                latest[row.actor_id] = row
+            elif isinstance(row, ActorLearningBatch):
+                runtime.record_actor_results((row,))
 
         result_deadline = time.monotonic() + 2.0
         while len(result_by_actor) < len(jobs) and time.monotonic() < result_deadline:
