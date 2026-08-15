@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 
 from v7.derivation.executor import ParallelDerivationConfig, ParallelDerivationExecutor
 from v7.derivation.online_runtime import OnlineDerivationStats, OnlineHierarchyBuilder
@@ -118,6 +119,7 @@ class V7Runtime:
         self.planning_builder = Phase1PlanningBuilder(self.writer, self.evidence)
         self.last_derivation_stats = OnlineDerivationStats()
         self.last_planning_stats = PlanningDerivationStats()
+        self.last_commit_timings: dict[str, float] = {}
         self.transport = SegmentedMmapReadViewTransport(config.root / "segments")
         self.publisher = GenerationPublisher(self.transport)
         self.publisher.ensure_published(self.writer.published_view)
@@ -472,7 +474,19 @@ class V7Runtime:
         run_lifecycle: bool = True,
         derive_hierarchy: bool | None = None,
     ) -> GenerationCommitResult:
+        total_started = perf_counter()
+        timings = {
+            "initial_commit_seconds": 0.0,
+            "hierarchy_seconds": 0.0,
+            "planning_seconds": 0.0,
+            "derivation_commit_seconds": 0.0,
+            "lifecycle_seconds": 0.0,
+            "lifecycle_commit_seconds": 0.0,
+            "snapshot_seconds": 0.0,
+        }
+        phase_started = perf_counter()
         result = self.coordinator.commit(batch_id=batch_id)
+        timings["initial_commit_seconds"] = perf_counter() - phase_started
         next_batch = int(batch_id) + 1
         should_derive = (
             self.config.derive_hierarchy
@@ -480,21 +494,39 @@ class V7Runtime:
             else bool(derive_hierarchy)
         )
         if should_derive:
+            phase_started = perf_counter()
             self.last_derivation_stats = self.hierarchy.derive()
+            timings["hierarchy_seconds"] = perf_counter() - phase_started
+            phase_started = perf_counter()
             self.last_planning_stats = self.planning_builder.derive()
+            timings["planning_seconds"] = perf_counter() - phase_started
             dirty = self.writer.dirty_counts
             if dirty["nodes"] or dirty["scores"] or dirty["edges"] or dirty["cognition"]:
+                phase_started = perf_counter()
                 result = self.coordinator.commit(batch_id=next_batch)
+                timings["derivation_commit_seconds"] = (
+                    perf_counter() - phase_started
+                )
                 next_batch += 1
         else:
             self.last_derivation_stats = OnlineDerivationStats()
             self.last_planning_stats = PlanningDerivationStats()
         if run_lifecycle:
+            phase_started = perf_counter()
             self.lifecycle.run(result.view, writer=self.writer)
+            timings["lifecycle_seconds"] = perf_counter() - phase_started
             dirty = self.writer.dirty_counts
             if dirty["nodes"] or dirty["scores"] or dirty["edges"] or dirty["cognition"]:
+                phase_started = perf_counter()
                 result = self.coordinator.commit(batch_id=next_batch)
+                timings["lifecycle_commit_seconds"] = (
+                    perf_counter() - phase_started
+                )
+        phase_started = perf_counter()
         self.snapshots.persist(self.writer)
+        timings["snapshot_seconds"] = perf_counter() - phase_started
+        timings["total_seconds"] = perf_counter() - total_started
+        self.last_commit_timings = timings
         return result
 
     def pending_derivation_plan(self):

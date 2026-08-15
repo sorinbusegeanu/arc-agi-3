@@ -294,6 +294,7 @@ class ContextRefinementRuntime:
         self.minimum_contradictions = max(1, int(minimum_contradictions))
         self.minimum_partition_support = max(2, int(minimum_partition_support))
         self.minimum_prediction_gain = max(0.0, float(minimum_prediction_gain))
+        self._last_contradiction_id = 0
         ensure_v707_schema(lifecycle_store)
 
     def _m1_ancestors(self, memory_id: MemoryId, nodes) -> tuple[MemoryId, ...]:
@@ -313,25 +314,7 @@ class ContextRefinementRuntime:
         return tuple(sorted(result, key=int))
 
     def _episode_rows(self) -> list[dict[str, object]]:
-        rows = self.evidence_store.connection.execute(
-            "SELECT source_game,source_context,source_global_step,payload_json,generation_id "
-            "FROM evidence_records WHERE evidence_type=? ORDER BY evidence_id",
-            (int(EvidenceType.EPISODE),),
-        ).fetchall()
-        result = []
-        for game, context, step, payload_json, generation in rows:
-            try:
-                payload = json.loads(str(payload_json or "{}"))
-            except (TypeError, json.JSONDecodeError):
-                payload = {}
-            payload.update(
-                source_game=game,
-                source_context=context,
-                source_global_step=step,
-                generation_id=int(generation),
-            )
-            result.append(payload)
-        return result
+        return self.evidence_store.load_evidence(int(EvidenceType.EPISODE))
 
     @staticmethod
     def _partition_gain(rows: list[dict[str, object]], outcome: int, context: int) -> tuple[float, float, int, int]:
@@ -358,12 +341,32 @@ class ContextRefinementRuntime:
     def run(self, view, *, writer) -> tuple[ContextRefinementDecision, ...]:
         nodes = getattr(writer, "_nodes")
         registry = getattr(writer, "_canonical_registry")
-        contradiction_rows = self.lifecycle_store.connection.execute(
-            "SELECT memory_id,COUNT(*) FROM contradiction_records "
-            "WHERE severity>0 GROUP BY memory_id HAVING COUNT(*)>=?",
-            (self.minimum_contradictions,),
+        new_contradictions = self.lifecycle_store.connection.execute(
+            "SELECT contradiction_id,memory_id FROM contradiction_records "
+            "WHERE severity>0 AND contradiction_id>? ORDER BY contradiction_id",
+            (int(self._last_contradiction_id),),
         ).fetchall()
+        if not new_contradictions:
+            return ()
+        next_watermark = int(new_contradictions[-1][0])
+        driver_ids = tuple(
+            sorted({int(memory_id) for _row_id, memory_id in new_contradictions})
+        )
+        contradiction_rows: list[tuple[int, int]] = []
+        for ids in self.lifecycle_store._memory_id_chunks(
+            MemoryId(memory_id) for memory_id in driver_ids
+        ):
+            placeholders = ",".join("?" for _ in ids)
+            contradiction_rows.extend(
+                self.lifecycle_store.connection.execute(
+                    "SELECT memory_id,COUNT(*) FROM contradiction_records "
+                    f"WHERE severity>0 AND memory_id IN ({placeholders}) "
+                    "GROUP BY memory_id HAVING COUNT(*)>=?",
+                    (*ids, self.minimum_contradictions),
+                ).fetchall()
+            )
         if not contradiction_rows:
+            self._last_contradiction_id = next_watermark
             return ()
         episodes = self._episode_rows()
         generation = int(writer.mutable_generation_id)
@@ -473,6 +476,7 @@ class ContextRefinementRuntime:
                             1 if accepted else 0,
                         ),
                     )
+        self._last_contradiction_id = next_watermark
         return tuple(decisions)
 
 
@@ -499,6 +503,7 @@ class MemoryCompressionRuntime:
     ) -> None:
         self.lifecycle_store = lifecycle_store
         self.unique_coverage_tolerance = max(0.0, float(unique_coverage_tolerance))
+        self._last_generation = -1
         ensure_v707_schema(lifecycle_store)
 
     def _contexts(self, memory_id: MemoryId) -> set[str]:
@@ -681,6 +686,9 @@ class TrajectoryEfficiencyRuntime:
     def __init__(self, lifecycle_store: EvidenceLifecycleStore, evidence_store) -> None:
         self.lifecycle_store = lifecycle_store
         self.evidence_store = evidence_store
+        self._last_evidence_id = 0
+        self._best_by_signature: dict[int, float] = {}
+        self._max_quality_by_group: dict[int, float] = {}
         ensure_v707_schema(lifecycle_store)
 
     def run(self, *, writer) -> tuple[TrajectoryEfficiency, ...]:
@@ -785,30 +793,63 @@ class CarrierPersistenceRuntime:
     def __init__(self, lifecycle_store: EvidenceLifecycleStore, evidence_store) -> None:
         self.lifecycle_store = lifecycle_store
         self.evidence_store = evidence_store
+        self._last_evidence_id = 0
+        self._last_by_game: dict[
+            str,
+            tuple[int, int, dict[str, object], int],
+        ] = {}
+        self._counts: Counter[tuple[int, int]] = Counter()
+        self._gains: defaultdict[tuple[int, int], float] = defaultdict(float)
+        self._first: dict[tuple[int, int], int] = {}
+        self._last: dict[tuple[int, int], int] = {}
         ensure_v707_schema(lifecycle_store)
 
     def run(self, *, writer) -> tuple[CarrierPersistenceLink, ...]:
-        rows = self.evidence_store.connection.execute(
-            "SELECT source_game,source_global_step,payload_json,generation_id FROM evidence_records "
-            "WHERE evidence_type=? ORDER BY source_game,source_global_step,evidence_id",
-            (int(EvidenceType.EPISODE),),
-        ).fetchall()
-        by_game: dict[str, list[tuple[int, dict[str, object], int]]] = defaultdict(list)
-        for game, step, payload_json, generation in rows:
-            try:
-                payload = json.loads(str(payload_json or "{}"))
-            except (TypeError, json.JSONDecodeError):
-                payload = {}
-            by_game[str(game or "")].append((int(step or -1), payload, int(generation)))
-        counts: Counter[tuple[int, int]] = Counter()
-        gains: defaultdict[tuple[int, int], float] = defaultdict(float)
-        first: dict[tuple[int, int], int] = {}
-        last: dict[tuple[int, int], int] = {}
+        rows = self.evidence_store.load_evidence(
+            int(EvidenceType.EPISODE),
+            after_evidence_id=self._last_evidence_id,
+        )
+        if not rows:
+            return ()
+        by_game: dict[
+            str,
+            list[tuple[int, int, dict[str, object], int]],
+        ] = defaultdict(list)
+        for payload in rows:
+            game = str(payload.get("source_game") or "")
+            by_game[game].append(
+                (
+                    int(payload.get("evidence_id") or 0),
+                    int(payload.get("source_global_step") or -1),
+                    payload,
+                    int(payload.get("generation_id") or 0),
+                )
+            )
+        if self._last_evidence_id:
+            out_of_order = any(
+                game in self._last_by_game
+                and min(item[1] for item in game_rows)
+                <= self._last_by_game[game][1]
+                for game, game_rows in by_game.items()
+            )
+            if out_of_order:
+                self._last_evidence_id = 0
+                self._last_by_game.clear()
+                self._counts.clear()
+                self._gains.clear()
+                self._first.clear()
+                self._last.clear()
+                return self.run(writer=writer)
+        changed: set[tuple[int, int]] = set()
         for game_rows in by_game.values():
-            game_rows.sort(key=lambda row: row[0])
+            game = str(game_rows[0][2].get("source_game") or "")
+            prior = self._last_by_game.get(game)
+            if prior is not None:
+                game_rows.append(prior)
+            game_rows.sort(key=lambda row: (row[1], row[0]))
             for left, right in zip(game_rows, game_rows[1:]):
-                left_step, a, gen_a = left
-                right_step, b, gen_b = right
+                _left_id, left_step, a, gen_a = left
+                _right_id, right_step, b, gen_b = right
                 if right_step != left_step + 1:
                     continue
                 ca = a.get("carrier_signature")
@@ -824,15 +865,25 @@ class CarrierPersistenceRuntime:
                 if not (same_family or continuous):
                     continue
                 key = tuple(sorted((int(ca), int(cb))))
-                counts[key] += 1
-                gains[key] += 0.5 * float(same_family) + 0.5 * float(continuous)
-                first.setdefault(key, min(gen_a, gen_b))
-                last[key] = max(gen_a, gen_b)
+                self._counts[key] += 1
+                self._gains[key] += 0.5 * float(same_family) + 0.5 * float(continuous)
+                self._first.setdefault(key, min(gen_a, gen_b))
+                self._last[key] = max(gen_a, gen_b)
+                changed.add(key)
+            self._last_by_game[game] = max(
+                game_rows,
+                key=lambda row: (row[1], row[0]),
+            )
+        self._last_evidence_id = max(
+            self._last_evidence_id,
+            max(int(row.get("evidence_id") or 0) for row in rows),
+        )
         links: list[CarrierPersistenceLink] = []
-        for key, count in counts.items():
+        for key in sorted(changed):
+            count = int(self._counts[key])
             if count < 2:
                 continue
-            gain = gains[key] / count
+            gain = self._gains[key] / count
             with self.lifecycle_store.connection:
                 self.lifecycle_store.connection.execute(
                     "INSERT INTO carrier_persistence_links("
@@ -841,7 +892,14 @@ class CarrierPersistenceRuntime:
                     "support_count=MAX(carrier_persistence_links.support_count,excluded.support_count),"
                     "last_generation=MAX(carrier_persistence_links.last_generation,excluded.last_generation),"
                     "predictive_gain=MAX(carrier_persistence_links.predictive_gain,excluded.predictive_gain)",
-                    (key[0], key[1], count, first[key], last[key], gain),
+                    (
+                        key[0],
+                        key[1],
+                        count,
+                        self._first[key],
+                        self._last[key],
+                        gain,
+                    ),
                 )
             links.append(CarrierPersistenceLink(key[0], key[1], count, gain))
         return tuple(links)
@@ -1064,10 +1122,19 @@ def install_v707_extensions() -> None:
         profile = profile_for_view(view)
         self.lifecycle_runtime.controller._v707_stage = profile.stage.name
         result = original_development_run(self, view, writer=writer)
-        ContextRefinementRuntime(self.evidence_lifecycle, self.evidence_store).run(
-            view, writer=writer
-        )
-        MemoryCompressionRuntime(self.evidence_lifecycle).run(writer=writer)
+        context_runtime = getattr(self, "_v707_context_runtime", None)
+        if context_runtime is None:
+            context_runtime = ContextRefinementRuntime(
+                self.evidence_lifecycle,
+                self.evidence_store,
+            )
+            self._v707_context_runtime = context_runtime
+        context_runtime.run(view, writer=writer)
+        compression_runtime = getattr(self, "_v707_compression_runtime", None)
+        if compression_runtime is None:
+            compression_runtime = MemoryCompressionRuntime(self.evidence_lifecycle)
+            self._v707_compression_runtime = compression_runtime
+        compression_runtime.run(writer=writer)
         return result
 
     DevelopmentalLifecycleRuntime.run = _v707_development_run
@@ -1076,12 +1143,22 @@ def install_v707_extensions() -> None:
 
     def _v707_hierarchy_derive(self):
         result = original_hierarchy_derive(self)
-        TrajectoryEfficiencyRuntime(self.lifecycle_store, self.evidence_store).run(
-            writer=self.writer
-        )
-        CarrierPersistenceRuntime(self.lifecycle_store, self.evidence_store).run(
-            writer=self.writer
-        )
+        efficiency_runtime = getattr(self, "_v707_efficiency_runtime", None)
+        if efficiency_runtime is None:
+            efficiency_runtime = TrajectoryEfficiencyRuntime(
+                self.lifecycle_store,
+                self.evidence_store,
+            )
+            self._v707_efficiency_runtime = efficiency_runtime
+        efficiency_runtime.run(writer=self.writer)
+        carrier_runtime = getattr(self, "_v707_carrier_runtime", None)
+        if carrier_runtime is None:
+            carrier_runtime = CarrierPersistenceRuntime(
+                self.lifecycle_store,
+                self.evidence_store,
+            )
+            self._v707_carrier_runtime = carrier_runtime
+        carrier_runtime.run(writer=self.writer)
         return result
 
     OnlineHierarchyBuilder.derive = _v707_hierarchy_derive

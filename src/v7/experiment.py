@@ -558,6 +558,15 @@ def run_experiment(
                     f"ingestion done commits={commit_count} generation={final_generation} memories={final_memories} "
                     f"seconds={perf_counter() - ingestion_phase_started:.2f}",
                 )
+                phase_timings = runtime.last_commit_timings
+                _log(
+                    epoch,
+                    "generation phases "
+                    + " ".join(
+                        f"{name.removesuffix('_seconds')}={seconds:.2f}s"
+                        for name, seconds in phase_timings.items()
+                    ),
+                )
 
                 _append_aggregated_game_results(
                     results,

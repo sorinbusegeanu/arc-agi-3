@@ -56,6 +56,14 @@ class DevelopmentalLifecycleRuntime:
             evidence_store=evidence_store,
             evidence_lifecycle=evidence_lifecycle,
         )
+        self.structural_gate_runtime = (
+            None
+            if evidence_store is None
+            else StructuralGateRuntime(
+                evidence_store=evidence_store,
+                lifecycle_store=evidence_lifecycle,
+            )
+        )
         self.concept_validator = concept_validator or EmpiricalConceptValidator()
         self.gate_validator = gate_validator or EmpiricalGateValidator()
 
@@ -68,11 +76,8 @@ class DevelopmentalLifecycleRuntime:
         profile = profile_for_view(view)
         lifecycle_decisions, stats = self.lifecycle_runtime.run(view, writer=writer)
 
-        if self.evidence_store is not None:
-            StructuralGateRuntime(
-                evidence_store=self.evidence_store,
-                lifecycle_store=self.evidence_lifecycle,
-            ).run(writer)
+        if self.structural_gate_runtime is not None:
+            self.structural_gate_runtime.run(writer)
 
         # Existing M4 validator remains as a compatibility/reporting surface.
         # Newly created v7.0.6 memories are promoted by generic gate trials.

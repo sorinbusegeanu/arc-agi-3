@@ -44,8 +44,22 @@ def _compression_run(self, *, writer):
     nodes = getattr(writer, "_nodes")
     scores = getattr(writer, "_scores")
     generation = int(writer.mutable_generation_id)
+    pending_replacements = {
+        int(row[0])
+        for row in self.lifecycle_store.connection.execute(
+            "SELECT DISTINCT replacement_memory_id "
+            "FROM memory_compression_replacements WHERE replacement_state<3"
+        ).fetchall()
+    }
+    last_generation = int(getattr(self, "_last_generation", -1))
     decisions = []
     for replacement_id, replacement in sorted(nodes.items(), key=lambda item: int(item[0])):
+        if (
+            last_generation >= 0
+            and int(replacement.updated_generation) <= last_generation
+            and int(replacement_id) not in pending_replacements
+        ):
+            continue
         if int(replacement.level) < int(MemoryLevel.M2) or not memory_is_active(replacement):
             continue
         validation = memory_validation_state(replacement)
@@ -135,44 +149,66 @@ def _compression_run(self, *, writer):
                     )
                 )
             decisions.append(d.CompressionDecision(parent_id, replacement_id, unique, next_state))
+    self._last_generation = generation
     return tuple(decisions)
 
 
-def _canonical_carrier_signature(self, raw_signature: int) -> int:
+def _canonical_carrier_map(self) -> dict[int, int]:
     rows = self.lifecycle_store.connection.execute(
-        "SELECT carrier_a,carrier_b FROM carrier_persistence_links"
+        "SELECT carrier_a,carrier_b FROM carrier_persistence_links "
+        "WHERE support_count>=2"
     ).fetchall()
-    group = {int(raw_signature)}
-    changed = True
-    while changed:
-        changed = False
-        for a, b in rows:
-            if int(a) in group or int(b) in group:
-                before = len(group)
-                group.update((int(a), int(b)))
-                changed |= len(group) != before
-    if len(group) == 1:
-        return int(raw_signature)
-    digest = blake2b(digest_size=8)
-    digest.update(b"persistent-carrier-v707")
-    digest.update(str(tuple(sorted(group))).encode("ascii"))
-    return int.from_bytes(digest.digest(), "little") & ((1 << 63) - 1)
+    parents: dict[int, int] = {}
+
+    def find(value: int) -> int:
+        parents.setdefault(value, value)
+        root = value
+        while parents[root] != root:
+            root = parents[root]
+        while parents[value] != value:
+            parent = parents[value]
+            parents[value] = root
+            value = parent
+        return root
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parents[max(left_root, right_root)] = min(left_root, right_root)
+
+    for raw_left, raw_right in rows:
+        union(int(raw_left), int(raw_right))
+    groups = defaultdict(list)
+    for value in parents:
+        groups[find(value)].append(value)
+    mapping: dict[int, int] = {}
+    for values in groups.values():
+        ordered = tuple(sorted(values))
+        digest = blake2b(digest_size=8)
+        digest.update(b"persistent-carrier-v707")
+        digest.update(str(ordered).encode("ascii"))
+        canonical = int.from_bytes(digest.digest(), "little") & ((1 << 63) - 1)
+        mapping.update((value, canonical) for value in ordered)
+    return mapping
+
+
+def _canonical_carrier_signature(self, raw_signature: int) -> int:
+    value = int(raw_signature)
+    return self.canonical_carrier_map().get(value, value)
 
 
 def _efficiency_run(self, *, writer):
-    rows = self.evidence_store.connection.execute(
-        "SELECT source_game,source_context,payload_json FROM evidence_records "
-        "WHERE evidence_type=? ORDER BY evidence_id",
-        (int(d.EvidenceType.TRAJECTORY),),
-    ).fetchall()
-    import json
+    rows = self.evidence_store.load_evidence(
+        int(d.EvidenceType.TRAJECTORY),
+        after_evidence_id=int(getattr(self, "_last_evidence_id", 0)),
+    )
     generation = int(writer.mutable_generation_id)
     metrics = []
-    for game, context, payload_json in rows:
-        try:
-            payload = json.loads(str(payload_json or "{}"))
-        except (TypeError, json.JSONDecodeError):
-            payload = {}
+    trial_rows = []
+    for payload in rows:
+        game = payload.get("source_game")
+        context = payload.get("source_context")
         actions = tuple(int(v) for v in payload.get("action_sequence", ()) or ())
         contexts = tuple(int(v) for v in payload.get("context_sequence", ()) or ())
         if not actions:
@@ -184,33 +220,45 @@ def _efficiency_run(self, *, writer):
             raw_action_option_sum=float(payload.get("raw_action_option_sum") or 0.0),
         )
         metrics.append((game, str(payload.get("level_key") or context or ""), metric))
+        trial_rows.append(
+            (
+                generation, game, str(payload.get("level_key") or context or ""),
+                int(metric.action_signature), float(metric.outcome_quality),
+                float(metric.interaction_cost), float(metric.efficiency),
+                int(metric.equivalent_group),
+            )
+        )
+    if trial_rows:
         with self.lifecycle_store.connection:
-            self.lifecycle_store.connection.execute(
+            self.lifecycle_store.connection.executemany(
                 "INSERT OR IGNORE INTO trajectory_efficiency_trials("
                 "generation_id,source_game,level_key,action_signature,outcome_quality,"
                 "interaction_cost,efficiency,equivalent_group) VALUES (?,?,?,?,?,?,?,?)",
-                (
-                    generation, game, str(payload.get("level_key") or context or ""),
-                    int(metric.action_signature), float(metric.outcome_quality),
-                    float(metric.interaction_cost), float(metric.efficiency),
-                    int(metric.equivalent_group),
-                ),
+                trial_rows,
             )
     if not metrics:
+        if rows:
+            self._last_evidence_id = max(
+                int(row.get("evidence_id") or 0) for row in rows
+            )
         return ()
-    best_by_signature = {}
     by_group = defaultdict(list)
     for _game, _level, metric in metrics:
         by_group[metric.equivalent_group].append(metric)
-    for group_metrics in by_group.values():
-        max_quality = max(item.outcome_quality for item in group_metrics)
+    for group, group_metrics in by_group.items():
+        max_quality = max(
+            float(self._max_quality_by_group.get(group, float("-inf"))),
+            max(item.outcome_quality for item in group_metrics),
+        )
+        self._max_quality_by_group[group] = max_quality
         for item in group_metrics:
             if item.outcome_quality < max_quality - 0.50:
                 continue
             value = d._clamp01(0.5 + 0.5 * math.tanh(item.efficiency))
-            best_by_signature[item.action_signature] = max(
-                best_by_signature.get(item.action_signature, 0.0), value
+            self._best_by_signature[item.action_signature] = max(
+                self._best_by_signature.get(item.action_signature, 0.0), value
             )
+    best_by_signature = self._best_by_signature
     registry = getattr(writer, "_canonical_registry")
     nodes = getattr(writer, "_nodes")
     active_models = tuple(
@@ -257,6 +305,9 @@ def _efficiency_run(self, *, writer):
         )
     if mutations:
         writer.apply_score_batch(mutations)
+    self._last_evidence_id = max(
+        int(row.get("evidence_id") or 0) for row in rows
+    )
     return tuple(metric for _game, _level, metric in metrics)
 
 
@@ -272,6 +323,7 @@ def harden_v707_extensions() -> None:
     d.promotion_assessment = _promotion_assessment
     d._sequence_key = _sequence_key
     d.MemoryCompressionRuntime.run = _compression_run
+    d.CarrierPersistenceRuntime.canonical_carrier_map = _canonical_carrier_map
     d.CarrierPersistenceRuntime.canonical_carrier_signature = _canonical_carrier_signature
     d.TrajectoryEfficiencyRuntime.run = _efficiency_run
 
@@ -280,11 +332,19 @@ def harden_v707_extensions() -> None:
     def _carrier_aware_load(self, evidence_type):
         rows = current_load(self, evidence_type)
         if int(evidence_type) == int(d.EvidenceType.EPISODE):
-            runtime = d.CarrierPersistenceRuntime(self.lifecycle_store, self.evidence_store)
+            runtime = getattr(self, "_v707_carrier_runtime", None)
+            if runtime is None:
+                runtime = d.CarrierPersistenceRuntime(
+                    self.lifecycle_store,
+                    self.evidence_store,
+                )
+                self._v707_carrier_runtime = runtime
+            carrier_map = runtime.canonical_carrier_map()
             for row in rows:
                 raw = row.get("carrier_signature")
                 if raw is not None:
-                    row["carrier_signature"] = runtime.canonical_carrier_signature(int(raw))
+                    value = int(raw)
+                    row["carrier_signature"] = carrier_map.get(value, value)
         return rows
 
     OnlineHierarchyBuilder._load = _carrier_aware_load

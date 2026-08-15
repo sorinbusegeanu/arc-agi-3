@@ -84,6 +84,9 @@ CREATE TABLE IF NOT EXISTS evidence_records (
 CREATE INDEX IF NOT EXISTS idx_evidence_memory_generation
 ON evidence_records(memory_id, generation_id);
 
+CREATE INDEX IF NOT EXISTS idx_evidence_type_id
+ON evidence_records(evidence_type, evidence_id);
+
 CREATE TABLE IF NOT EXISTS provenance_records (
     provenance_id INTEGER PRIMARY KEY AUTOINCREMENT,
     memory_id INTEGER NOT NULL,

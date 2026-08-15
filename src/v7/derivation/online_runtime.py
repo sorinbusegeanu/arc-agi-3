@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from collections import Counter, defaultdict
 from dataclasses import dataclass, replace
 from hashlib import blake2b
@@ -984,28 +983,7 @@ class OnlineHierarchyBuilder:
             self.writer.apply_score_batch(mutations)
 
     def _load(self, evidence_type: EvidenceType) -> list[dict[str, Any]]:
-        rows = self.evidence_store.connection.execute(
-            "SELECT memory_id,source_game,source_context,source_global_step,payload_json,generation_id "
-            "FROM evidence_records WHERE evidence_type=? ORDER BY evidence_id",
-            (int(evidence_type),),
-        ).fetchall()
-        result: list[dict[str, Any]] = []
-        for memory_id, game, context, step, payload_json, generation in rows:
-            try:
-                payload = json.loads(str(payload_json or "{}"))
-            except json.JSONDecodeError:
-                payload = {}
-            payload.update(
-                {
-                    "memory_id": None if memory_id is None else int(memory_id),
-                    "source_game": game,
-                    "source_context": context,
-                    "source_global_step": step,
-                    "generation_id": int(generation),
-                }
-            )
-            result.append(payload)
-        return result
+        return self.evidence_store.load_evidence(int(evidence_type))
 
 
 def _functional_role_signature(
