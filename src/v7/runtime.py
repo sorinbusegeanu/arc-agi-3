@@ -356,6 +356,30 @@ class V7Runtime:
             )
         self.lifecycle_evidence.append_gate_trials(records)
 
+    @staticmethod
+    def _observed_decision_utility(evidence: EpisodeEvidence) -> tuple[float, float, float]:
+        """Return bounded outcome, terminal, and future-option utility signals.
+
+        Decision-memory contribution is only an intervention magnitude. It is
+        not itself evidence that the memory helped. Scientific gate credit is
+        therefore conditioned on an observed consequence of the chosen action.
+        """
+        terminal = (
+            1.0
+            if int(evidence.terminal_polarity) > 0
+            else -1.0
+            if int(evidence.terminal_polarity) < 0
+            else 0.0
+        )
+        future = max(
+            -1.0,
+            min(1.0, float(getattr(evidence, "future_option_delta", 0.0)) / 4.0),
+        )
+        if terminal != 0.0:
+            return terminal, terminal, future
+        # Non-terminal evidence is deliberately weaker than terminal evidence.
+        return 0.25 * future, 0.0, future
+
     def _write_decision_gate_trials(
         self,
         batch: tuple[EpisodeEvidence, ...],
@@ -364,6 +388,9 @@ class V7Runtime:
         generation = int(self.writer.mutable_generation_id)
         records: list[GateTrialRecord] = []
         for evidence in batch:
+            outcome_utility, terminal_gain, future_gain = (
+                self._observed_decision_utility(evidence)
+            )
             contributions = tuple(
                 getattr(evidence, "decision_memory_contributions", ()) or ()
             )
@@ -382,6 +409,7 @@ class V7Runtime:
                     memory_id,
                     int(node.created_generation),
                 )
+                causal_gain = contribution * outcome_utility
                 records.append(
                     GateTrialRecord(
                         memory_id=memory_id,
@@ -392,15 +420,14 @@ class V7Runtime:
                         target_context=evidence.source_context,
                         participated=True,
                         contribution=contribution,
-                        causal_gain=contribution,
-                        terminal_gain=float(
-                            1
-                            if int(evidence.terminal_polarity) > 0
-                            else -1
-                            if int(evidence.terminal_polarity) < 0
-                            else 0
+                        causal_gain=causal_gain,
+                        future_option_gain=(
+                            abs(contribution) * future_gain
                         ),
-                        intervention_type="decision_score_ablation",
+                        terminal_gain=(
+                            abs(contribution) * terminal_gain
+                        ),
+                        intervention_type="decision_outcome_ablation",
                         paired_trial_id=(
                             f"decision:{int(memory_id)}:{evidence.source_game}:"
                             f"{evidence.source_global_step}"
@@ -411,6 +438,11 @@ class V7Runtime:
                             "max_action_score": float(evidence.max_action_score),
                             "selection_mode": str(
                                 getattr(evidence, "selection_mode", "") or ""
+                            ),
+                            "outcome_utility": float(outcome_utility),
+                            "terminal_polarity": int(evidence.terminal_polarity),
+                            "future_option_delta": float(
+                                getattr(evidence, "future_option_delta", 0.0)
                             ),
                         },
                     )
