@@ -22,18 +22,14 @@ from v7.memory.status import (
 
 EdgeKey = tuple[MemoryId, int]
 PackedCognitionView = PackedCognitionIndexes | MappedPackedCognitionIndexes
+_UNBOUNDED_LOOKUP = (1 << 31) - 1
 
 
 def _filter_cognition(
     cognition: CognitionIndexes,
     nodes: Mapping[MemoryId, MemoryNode],
 ) -> CognitionIndexes:
-    """Build the normal ACTIVE-only publication index.
-
-    The writer retains the complete canonical index in `cognition_indexes` for
-    restart and controlled probes. Normal packed cognition contains only ACTIVE
-    memories, so quarantine/demotion does not rely on per-action filtering.
-    """
+    """Build the normal ACTIVE-only publication index."""
 
     def active_values(values):
         return tuple(
@@ -271,12 +267,7 @@ class MemoryReadView:
         concept_limit: int = 128,
         include_probe: bool = False,
     ) -> tuple[ActionScoreInput, ...]:
-        """Return relevance-ranked cognition candidates.
-
-        Normal reads use the publication-time ACTIVE-only packed index. Explicit
-        probe/replay reads use the complete immutable index and admit PROBE_ONLY
-        memories while still excluding QUARANTINED/RETIRED memories.
-        """
+        """Return relevance-ranked cognition candidates."""
         if role_limit < 0 or concept_limit < 0:
             raise ValueError("limits must be non-negative")
         families = family_ids_by_action or {}
@@ -288,8 +279,8 @@ class MemoryReadView:
                     context_signature=int(context_signature),
                     action_ids=action_ids,
                     family_ids_by_action=families,
-                    role_limit=2**31 - 1,
-                    concept_limit=2**31 - 1,
+                    role_limit=_UNBOUNDED_LOOKUP,
+                    concept_limit=_UNBOUNDED_LOOKUP,
                 )
             }
             for raw_action_id in action_ids:
@@ -338,13 +329,13 @@ class MemoryReadView:
                     int(context_signature),
                     action_id,
                     family,
-                    role_limit,
+                    _UNBOUNDED_LOOKUP,
                 )
             if not role_candidates:
                 role_candidates = packed.roles_fallback.lookup(
                     int(context_signature),
                     action_id,
-                    role_limit,
+                    _UNBOUNDED_LOOKUP,
                 )
             roles = self._rank_available(
                 role_candidates,
