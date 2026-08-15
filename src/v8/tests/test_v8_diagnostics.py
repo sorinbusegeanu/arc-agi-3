@@ -43,14 +43,20 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertAlmostEqual(level_rate, 200.0 / 3.0)
         self.assertEqual(
             format_game_rate_line(rows),
-            "win_rate=33.3% level_rate=66.7%",
+            "wins=33.3% levels_solved=66.7%",
         )
+
+    def test_progress_line_is_single_dedicated_percentage_line(self) -> None:
+        rows = (ActorProgress(1, "game-a", 100, 1, 0, 1),)
+        line = format_game_rate_line(rows)
+        self.assertNotIn("\n", line)
+        self.assertEqual(line, "wins=100.0% levels_solved=100.0%")
 
     def test_empty_progress_has_zero_rates(self) -> None:
         self.assertEqual(game_rates(()), (0.0, 0.0))
         self.assertEqual(
             format_game_rate_line(()),
-            "win_rate=0.0% level_rate=0.0%",
+            "wins=0.0% levels_solved=0.0%",
         )
 
 
