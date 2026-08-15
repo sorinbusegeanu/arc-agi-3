@@ -46,9 +46,15 @@ class TransferValidator:
                 continue
             formation = tuple(sorted(provenance(row.uid))) if provenance is not None else ()
             games = len(formation) if formation else int(row.game_evidence_count)
-            if games < 2:
+            recurrence_prior = min(1.0, games / 4.0) * min(
+                1.0, max(1, row.support_count) / 8.0
+            )
+            structural = max(float(row.transfer_prior), recurrence_prior)
+            # A bounded graph-similarity correspondence can nominate a memory
+            # formed in only one game for a held-out probe.  It remains only a
+            # prospective prior; validation still requires record_trial().
+            if games < 2 and structural <= 0.0:
                 continue
-            structural = min(1.0, games / 4.0) * min(1.0, max(1, row.support_count) / 8.0)
             result.append(TransferCandidate(row.uid, games, structural, formation))
         return tuple(result)
 
