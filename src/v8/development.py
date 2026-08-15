@@ -4,6 +4,7 @@ import math
 import multiprocessing as mp
 from dataclasses import dataclass
 
+from v8.dirty import DirtyAccumulator
 from v8.model import (
     CognitiveState,
     MemoryLevel,
@@ -85,11 +86,13 @@ def _key_for(level: MemoryLevel, event: PipelineEvent) -> tuple[int, ...]:
             int(future_bucket),
         )
     if level == MemoryLevel.M6:
-        # Outcome identity is consequence-oriented rather than trajectory-oriented.
-        # Distinct endpoint signatures with the same coarse consequence descriptor
-        # intentionally converge here; the background outcome estimator can later
-        # split/merge classes as richer evidence becomes available.
-        return (int(future_bucket), int(changed_bucket))
+        # First create bounded consequence variants. The outcome peer can merge these
+        # into a persistent coarse outcome class and can later split that class again
+        # without losing the original member identities.
+        consequence_bucket = stable_u64(
+            e.outcome_signature, e.family_signature, person=b"v8-outcome-variant"
+        ) & 0xF
+        return (int(future_bucket), int(changed_bucket), int(consequence_bucket))
     if level == MemoryLevel.M7:
         if event.parent_uid.is_zero:
             raise ValueError("M7 strategy requires M6 outcome parent")
@@ -108,6 +111,7 @@ def derive_proposal(level: MemoryLevel, event: PipelineEvent) -> MemoryProposal:
     key = _key_for(level, event)
     uid = MemoryUid.from_key(level, definition.memory_type, key)
     e = event.experience
+    multiplicity = max(1, int(event.multiplicity))
 
     structural_change = min(1.0, max(0, int(e.changed_cells)) / 32.0)
     option_magnitude = math.tanh(abs(float(e.future_option_delta)))
@@ -123,14 +127,14 @@ def derive_proposal(level: MemoryLevel, event: PipelineEvent) -> MemoryProposal:
         level=level,
         memory_type=definition.memory_type,
         key_parts=key,
-        support_delta=1,
-        significance_sum=significance,
-        prediction_error_sum=0.0,
-        learning_value_sum=learning_value,
+        support_delta=multiplicity,
+        significance_sum=significance * multiplicity,
+        prediction_error_sum=(float(e.prediction_error) * multiplicity if level == MemoryLevel.M1 else 0.0),
+        learning_value_sum=learning_value * multiplicity,
         transfer_prior_sum=0.0,
         explanatory_sum=0.0,
-        future_option_sum=float(e.future_option_delta),
-        score_weight=1.0,
+        future_option_sum=float(e.future_option_delta) * multiplicity,
+        score_weight=float(multiplicity),
         parent_uid=event.parent_uid,
         relation_type=relation,
         source_game_hash=int(e.source_game_hash),
@@ -161,6 +165,48 @@ def _drain_batch(ingress: SharedRingBuffer, first: bytes, *, limit: int = 256) -
     return batch
 
 
+def _developmental_path_key(level: MemoryLevel, event: PipelineEvent) -> tuple[object, ...]:
+    """Fields that can affect any downstream identity or aggregate statistic."""
+    e = event.experience
+    return (
+        int(level),
+        int(e.source_game_hash),
+        int(e.context_signature),
+        int(e.action_id),
+        int(e.outcome_signature),
+        int(e.next_context_signature),
+        int(e.family_signature),
+        int(e.carrier_signature),
+        float(e.future_option_delta),
+        int(e.changed_cells),
+        int(e.terminal_polarity),
+        float(e.prediction_error),
+        int(event.parent_uid.hi),
+        int(event.parent_uid.lo),
+    )
+
+
+def _flush_dirty(
+    accumulator: DirtyAccumulator[PipelineEvent],
+    next_ring: SharedRingBuffer | None,
+    stop_event: mp.synchronize.Event,
+) -> bool:
+    if next_ring is None:
+        accumulator.drain()
+        return True
+    for _key, item in accumulator.drain():
+        base = item.payload
+        forwarded = PipelineEvent(
+            base.experience,
+            parent_uid=base.parent_uid,
+            current_level=base.current_level,
+            multiplicity=item.multiplicity,
+        )
+        if not _put_with_backpressure(next_ring, encode_pipeline(forwarded), stop_event):
+            return False
+    return True
+
+
 def stage_worker(
     *,
     level: int,
@@ -175,19 +221,18 @@ def stage_worker(
     ingress = SharedRingBuffer(**ingress_args)
     next_ring = None if next_args is None else SharedRingBuffer(**next_args)
     shard_rings = tuple(SharedRingBuffer(**args) for args in shard_ring_args)
+    dirty: DirtyAccumulator[PipelineEvent] = DirtyAccumulator()
     try:
-        while not stop_event.is_set() or not ingress.empty:
-            first = ingress.get(timeout=0.05)
+        while not stop_event.is_set() or not ingress.empty or dirty.pending_count:
+            first = ingress.get(timeout=0.02)
             if first is None:
+                if dirty.pending_count and not _flush_dirty(dirty, next_ring, stop_event):
+                    return
                 continue
             payloads = _drain_batch(ingress, first)
             with inflight.get_lock():
                 inflight.value += len(payloads)
             try:
-                # Every evidence contribution reaches the canonical owner. Downstream
-                # propagation is dirty-key coalesced per batch: a changed canonical UID
-                # creates at most one notification regardless of repeated raw events.
-                downstream: dict[MemoryUid, PipelineEvent] = {}
                 for payload in payloads:
                     pipeline = decode_pipeline(payload)
                     proposal = derive_proposal(target, pipeline)
@@ -197,17 +242,22 @@ def stage_worker(
                     ):
                         return
                     if next_ring is not None:
-                        downstream[proposal.uid] = PipelineEvent(
+                        forwarded = PipelineEvent(
                             pipeline.experience,
                             parent_uid=proposal.uid,
                             current_level=int(target),
+                            multiplicity=pipeline.multiplicity,
                         )
-                if next_ring is not None:
-                    for forwarded in downstream.values():
-                        if not _put_with_backpressure(
-                            next_ring, encode_pipeline(forwarded), stop_event
-                        ):
-                            return
+                        dirty.add(
+                            _developmental_path_key(target, forwarded),
+                            forwarded,
+                            version=int(pipeline.experience.watermark),
+                            multiplicity=int(pipeline.multiplicity),
+                        )
+                if (ingress.empty or dirty.pending_count >= 256) and not _flush_dirty(
+                    dirty, next_ring, stop_event
+                ):
+                    return
             finally:
                 with inflight.get_lock():
                     inflight.value -= len(payloads)
