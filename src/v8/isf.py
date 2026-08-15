@@ -20,9 +20,6 @@ class ISFScore:
     developmental_stage: int
 
 
-# Stage weights are runtime hypotheses, not universal coefficients. They are fixed
-# for one peer update interval and selected from capabilities established before
-# that interval. Channels that are not yet available naturally contribute zero.
 _STAGE_WEIGHTS: dict[int, tuple[float, float, float, float, float, float]] = {
     0: (0.70, 0.00, 0.15, 0.00, 0.05, 0.10),
     1: (0.25, 0.30, 0.25, 0.05, 0.05, 0.10),
@@ -41,19 +38,26 @@ _ADMISSIBLE = {
 
 _STAGE_LOCK = Lock()
 _CURRENT_DEVELOPMENTAL_STAGE = 0
+_DEVELOPMENTAL_STAGE_REVISION = 0
 
 
 def publish_developmental_stage(stage: int) -> int:
-    global _CURRENT_DEVELOPMENTAL_STAGE
+    """Publish the Stage_t fixed for the current peer update interval."""
+    global _CURRENT_DEVELOPMENTAL_STAGE, _DEVELOPMENTAL_STAGE_REVISION
     value = max(0, min(6, int(stage)))
     with _STAGE_LOCK:
         _CURRENT_DEVELOPMENTAL_STAGE = value
+        _DEVELOPMENTAL_STAGE_REVISION += 1
     return value
 
 
-def current_developmental_stage() -> int:
+def developmental_stage_snapshot() -> tuple[int, int]:
     with _STAGE_LOCK:
-        return int(_CURRENT_DEVELOPMENTAL_STAGE)
+        return int(_CURRENT_DEVELOPMENTAL_STAGE), int(_DEVELOPMENTAL_STAGE_REVISION)
+
+
+def current_developmental_stage() -> int:
+    return developmental_stage_snapshot()[0]
 
 
 def _clip(value: float) -> float:
@@ -63,9 +67,8 @@ def _clip(value: float) -> float:
 def infer_developmental_stage(rows: Iterable[NodeRecord]) -> int:
     """Infer Stage_t only from capabilities already present in the published cut.
 
-    A positive stored prediction error is itself evidence that a supported expectation
-    existed before the corresponding transition, so it implies at least Stage 1 even
-    when the row carrying that evidence is not yet an active higher abstraction.
+    Positive stored prediction error implies at least Stage 1 because such an error
+    can only exist after a supported expectation was available before the transition.
     """
     rows = tuple(rows)
     minimum_stage = 1 if any(float(row.prediction_error) > 0.0 for row in rows) else 0
@@ -140,10 +143,7 @@ def score_memory(row: NodeRecord, *, developmental_stage: int | None = None) -> 
         explanatory,
         future,
     )
-    total = sum(
-        weight * component
-        for weight, component in zip(weights, components, strict=True)
-    )
+    total = sum(weight * component for weight, component in zip(weights, components, strict=True))
     return ISFScore(
         option_impact,
         prediction,
