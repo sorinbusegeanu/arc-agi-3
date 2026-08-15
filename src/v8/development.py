@@ -5,6 +5,7 @@ import multiprocessing as mp
 from dataclasses import dataclass
 
 from v8.model import (
+    CognitiveState,
     MemoryLevel,
     MemoryProposal,
     MemoryType,
@@ -16,7 +17,6 @@ from v8.model import (
     encode_proposal,
     proposal_fingerprint,
     stable_u64,
-    u64,
 )
 from v8.ring import SharedRingBuffer
 
@@ -31,7 +31,7 @@ STAGES: tuple[StageDefinition, ...] = (
     StageDefinition(MemoryLevel.M0, MemoryType.EPISODE),
     StageDefinition(MemoryLevel.M1, MemoryType.CONTINGENCY),
     StageDefinition(MemoryLevel.M2, MemoryType.FAMILY),
-    StageDefinition(MemoryLevel.M3, MemoryType.ROLE),
+    StageDefinition(MemoryLevel.M3, MemoryType.CARRIER),
     StageDefinition(MemoryLevel.M4, MemoryType.CONCEPT),
     StageDefinition(MemoryLevel.M5, MemoryType.CONSEQUENCE),
     StageDefinition(MemoryLevel.M6, MemoryType.OUTCOME),
@@ -63,7 +63,12 @@ def _key_for(level: MemoryLevel, event: PipelineEvent) -> tuple[int, ...]:
     if level == MemoryLevel.M0:
         return (int(e.event_id.hi), int(e.event_id.lo))
     if level == MemoryLevel.M1:
-        return (int(e.context_signature), int(e.action_id), int(e.outcome_signature))
+        return (
+            int(e.context_signature),
+            int(e.action_id),
+            int(e.outcome_signature),
+            int(e.next_context_signature),
+        )
     if level == MemoryLevel.M2:
         return (int(e.family_signature),)
     if level == MemoryLevel.M3:
@@ -80,25 +85,17 @@ def _key_for(level: MemoryLevel, event: PipelineEvent) -> tuple[int, ...]:
             int(future_bucket),
         )
     if level == MemoryLevel.M6:
-        return (
-            int(e.outcome_signature),
-            int(future_bucket),
-            int(changed_bucket),
-        )
+        # Outcome identity is consequence-oriented rather than trajectory-oriented.
+        # Distinct endpoint signatures with the same coarse consequence descriptor
+        # intentionally converge here; the background outcome estimator can later
+        # split/merge classes as richer evidence becomes available.
+        return (int(future_bucket), int(changed_bucket))
     if level == MemoryLevel.M7:
         if event.parent_uid.is_zero:
             raise ValueError("M7 strategy requires M6 outcome parent")
-        # Strategy identity must describe a reusable procedure, not a unique rolling
-        # trajectory instance. Including trajectory_signature here created almost one
-        # M7 node per environment step and eventually exhausted the RAM arena.
-        strategy_signature = stable_u64(
-            e.action_id,
-            e.family_signature,
-            person=b"v8-strategy",
-        )
         context_bucket = stable_u64(e.context_signature, person=b"v8-context")
         return (
-            int(strategy_signature),
+            int(e.action_id),
             int(event.parent_uid.hi),
             int(event.parent_uid.lo),
             int(context_bucket),
@@ -136,6 +133,8 @@ def derive_proposal(level: MemoryLevel, event: PipelineEvent) -> MemoryProposal:
         score_weight=1.0,
         parent_uid=event.parent_uid,
         relation_type=relation,
+        source_game_hash=int(e.source_game_hash),
+        cognitive_state=int(CognitiveState.ACTIVE) if level <= MemoryLevel.M1 else -1,
     )
 
 
@@ -146,11 +145,20 @@ def _put_with_backpressure(
     *,
     retry_seconds: float = 0.05,
 ) -> bool:
-    """Wait for bounded RAM capacity instead of turning normal pressure into failure."""
     while not stop_event.is_set():
         if ring.put(payload, timeout=retry_seconds):
             return True
     return False
+
+
+def _drain_batch(ingress: SharedRingBuffer, first: bytes, *, limit: int = 256) -> list[bytes]:
+    batch = [first]
+    for _ in range(max(0, int(limit) - 1)):
+        payload = ingress.get(timeout=0.0)
+        if payload is None:
+            break
+        batch.append(payload)
+    return batch
 
 
 def stage_worker(
@@ -169,36 +177,40 @@ def stage_worker(
     shard_rings = tuple(SharedRingBuffer(**args) for args in shard_ring_args)
     try:
         while not stop_event.is_set() or not ingress.empty:
-            payload = ingress.get(timeout=0.05)
-            if payload is None:
+            first = ingress.get(timeout=0.05)
+            if first is None:
                 continue
+            payloads = _drain_batch(ingress, first)
             with inflight.get_lock():
-                inflight.value += 1
+                inflight.value += len(payloads)
             try:
-                pipeline = decode_pipeline(payload)
-                proposal = derive_proposal(target, pipeline)
-                shard = proposal.uid.shard(len(shard_rings))
-                if not _put_with_backpressure(
-                    shard_rings[shard],
-                    encode_proposal(proposal),
-                    stop_event,
-                ):
-                    return
-                if next_ring is not None:
-                    forwarded = PipelineEvent(
-                        pipeline.experience,
-                        parent_uid=proposal.uid,
-                        current_level=int(target),
-                    )
+                # Every evidence contribution reaches the canonical owner. Downstream
+                # propagation is dirty-key coalesced per batch: a changed canonical UID
+                # creates at most one notification regardless of repeated raw events.
+                downstream: dict[MemoryUid, PipelineEvent] = {}
+                for payload in payloads:
+                    pipeline = decode_pipeline(payload)
+                    proposal = derive_proposal(target, pipeline)
+                    shard = proposal.uid.shard(len(shard_rings))
                     if not _put_with_backpressure(
-                        next_ring,
-                        encode_pipeline(forwarded),
-                        stop_event,
+                        shard_rings[shard], encode_proposal(proposal), stop_event
                     ):
                         return
+                    if next_ring is not None:
+                        downstream[proposal.uid] = PipelineEvent(
+                            pipeline.experience,
+                            parent_uid=proposal.uid,
+                            current_level=int(target),
+                        )
+                if next_ring is not None:
+                    for forwarded in downstream.values():
+                        if not _put_with_backpressure(
+                            next_ring, encode_pipeline(forwarded), stop_event
+                        ):
+                            return
             finally:
                 with inflight.get_lock():
-                    inflight.value -= 1
+                    inflight.value -= len(payloads)
     except BaseException as exc:
         try:
             error_queue.put((f"M{int(target)}", type(exc).__name__, str(exc)))

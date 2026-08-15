@@ -8,10 +8,16 @@ import queue
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
+from struct import Struct
 from typing import Iterable
 
-from v8.arena import SharedActionArena, SharedEdgeArena, SharedNodeArena
+from v8.arena import NodeRecord, SharedActionArena, SharedEdgeArena, SharedNodeArena
+from v8.model import MemoryUid
 from v8.publication import ShardReadDescriptor
+
+_CHUNK_BYTES = 4 * 1024 * 1024
+_HEADER = Struct("<QQ")
+_OLD_NODE = Struct("<QQQBHBQQQQqdddddddQBB")
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +44,37 @@ def _snapshot_directory(root: Path, snapshot_id: int) -> Path:
     return root / "snapshots" / f"snapshot-{int(snapshot_id):020d}"
 
 
+def _write_content_chunks(root: Path, payload: bytes) -> list[dict[str, object]]:
+    directory = root / "snapshot_chunks"
+    directory.mkdir(parents=True, exist_ok=True)
+    result: list[dict[str, object]] = []
+    for offset in range(0, len(payload), _CHUNK_BYTES):
+        chunk = payload[offset : offset + _CHUNK_BYTES]
+        digest = _sha(chunk)
+        path = directory / f"{digest}.bin"
+        if not path.exists():
+            temp = directory / f".{digest}.{os.getpid()}.tmp"
+            temp.write_bytes(chunk)
+            try:
+                os.replace(temp, path)
+            except OSError:
+                if temp.exists():
+                    temp.unlink(missing_ok=True)
+        result.append({"sha256": digest, "bytes": len(chunk)})
+    return result
+
+
+def _read_content_chunks(root: Path, chunks: list[dict[str, object]]) -> bytes:
+    payload = bytearray()
+    for spec in chunks:
+        digest = str(spec["sha256"])
+        chunk = (root / "snapshot_chunks" / f"{digest}.bin").read_bytes()
+        if len(chunk) != int(spec["bytes"]) or _sha(chunk) != digest:
+            raise RuntimeError(f"snapshot chunk checksum mismatch {digest}")
+        payload.extend(chunk)
+    return bytes(payload)
+
+
 def _write_snapshot(root: Path, descriptors: tuple[ShardReadDescriptor, ...], request: SnapshotRequest) -> SnapshotResult:
     snapshots = root / "snapshots"
     snapshots.mkdir(parents=True, exist_ok=True)
@@ -48,10 +85,11 @@ def _write_snapshot(root: Path, descriptors: tuple[ShardReadDescriptor, ...], re
     temp.mkdir(parents=True)
 
     manifest: dict[str, object] = {
-        "format_version": 1,
+        "format_version": 2,
         "snapshot_id": int(request.snapshot_id),
         "watermark": int(request.watermark),
         "final": bool(request.final),
+        "chunk_bytes": _CHUNK_BYTES,
         "shards": [],
     }
     opened = []
@@ -68,12 +106,8 @@ def _write_snapshot(root: Path, descriptors: tuple[ShardReadDescriptor, ...], re
                 ("actions", actions, descriptor.actions),
             ):
                 payload = arena.snapshot_bytes()
-                filename = f"shard-{shard_id:04d}-{label}.bin"
-                path = temp / filename
-                with path.open("wb") as stream:
-                    stream.write(payload)
                 shard_manifest[label] = {
-                    "file": filename,
+                    "chunks": _write_content_chunks(root, payload),
                     "sha256": _sha(payload),
                     "capacity": int(desc.capacity),
                     "kind": desc.kind,
@@ -141,7 +175,7 @@ def _snapshot_worker(
 
 
 class SnapshotService:
-    """Asynchronous latest-wins recovery snapshot service."""
+    """Asynchronous latest-wins recovery snapshot service with content-addressed chunks."""
 
     def __init__(self, root: str | Path, descriptors: Iterable[ShardReadDescriptor]) -> None:
         self.root = Path(root)
@@ -243,7 +277,41 @@ def latest_complete_snapshot(root: str | Path) -> Path | None:
     return max(candidates, key=lambda p: p.name) if candidates else None
 
 
+def _load_nodes_compatible(arena: SharedNodeArena, payload: bytes) -> None:
+    if len(payload) < _HEADER.size:
+        raise RuntimeError("invalid node snapshot")
+    count, _seq = _HEADER.unpack_from(payload, 0)
+    old_expected = _HEADER.size + int(count) * _OLD_NODE.size
+    if len(payload) != old_expected:
+        arena.load_snapshot(payload)
+        return
+    arena.begin_write()
+    try:
+        for row in range(int(count)):
+            values = _OLD_NODE.unpack_from(payload, _HEADER.size + row * _OLD_NODE.size)
+            (
+                hi, lo, fingerprint, level, memory_type, key_count,
+                k0, k1, k2, k3, support,
+                significance, prediction_error, learning_value, transfer_prior,
+                explanatory, future_option, weight, watermark,
+                cognitive_state, validation_state,
+            ) = values
+            arena.write(
+                row,
+                NodeRecord(
+                    MemoryUid(hi, lo), int(fingerprint), int(level), int(memory_type),
+                    tuple((k0, k1, k2, k3)[:int(key_count)]), int(support),
+                    float(significance), float(prediction_error), float(learning_value),
+                    float(transfer_prior), float(explanatory), float(future_option),
+                    float(weight), int(watermark), 0, int(cognitive_state), int(validation_state),
+                ),
+            )
+    finally:
+        arena.end_write(count=int(count))
+
+
 def restore_latest_snapshot(root: str | Path, descriptors: Iterable[ShardReadDescriptor]) -> tuple[int, int] | None:
+    root = Path(root)
     snapshot = latest_complete_snapshot(root)
     if snapshot is None:
         return None
@@ -267,12 +335,18 @@ def restore_latest_snapshot(root: str | Path, descriptors: Iterable[ShardReadDes
                 spec = shard[label]
                 if int(spec["capacity"]) > int(desc.capacity):
                     raise RuntimeError(f"configured {label} arena is smaller than snapshot")
-                payload = (snapshot / spec["file"]).read_bytes()
+                if "chunks" in spec:
+                    payload = _read_content_chunks(root, spec["chunks"])
+                else:
+                    payload = (snapshot / spec["file"]).read_bytes()
                 if _sha(payload) != spec["sha256"]:
-                    raise RuntimeError(f"snapshot checksum mismatch for {spec['file']}")
+                    raise RuntimeError(f"snapshot checksum mismatch for {label}")
                 arena = arena_cls.attach(desc)
                 opened.append(arena)
-                arena.load_snapshot(payload)
+                if label == "nodes":
+                    _load_nodes_compatible(arena, payload)
+                else:
+                    arena.load_snapshot(payload)
         return int(manifest["snapshot_id"]), int(manifest["watermark"])
     finally:
         for arena in opened:

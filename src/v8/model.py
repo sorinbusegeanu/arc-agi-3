@@ -7,7 +7,7 @@ from struct import Struct
 from typing import Iterable
 
 _MASK64 = (1 << 64) - 1
-_SCHEMA = b"arc-agi3-v8-memory-v1"
+_SCHEMA = b"arc-agi3-v8-memory-v2"
 
 
 class MemoryLevel(IntEnum):
@@ -25,17 +25,45 @@ class MemoryType(IntEnum):
     EPISODE = 1
     CONTINGENCY = 100
     FAMILY = 200
+    CARRIER = 250
+    CONTEXTUAL_ROLE = 275
     ROLE = 300
     CONCEPT = 400
+    TRANSFER_EVIDENCE = 450
     CONSEQUENCE = 500
     OUTCOME = 600
     STRATEGY = 700
+    PREFERENCE_EVIDENCE = 750
 
 
 class RelationType(IntEnum):
     PROVENANCE = 1
     EXPLAINS = 2
     LEADS_TO = 3
+    CONTEXT_REFINES = 4
+    SIMILAR_TO = 5
+    TRANSFER_CORRESPONDENCE = 6
+    SUPERSEDES = 7
+    PREFERENCE = 8
+
+
+class CognitiveState(IntEnum):
+    CANDIDATE = 0
+    PROBATION = 1
+    ACTIVE = 2
+    VALIDATED = 3
+    QUARANTINED = 4
+    RETIRE_PENDING = 5
+    RETIRED = 6
+    REACTIVATED = 7
+
+
+class ValidationState(IntEnum):
+    UNTESTED = 0
+    STRUCTURAL = 1
+    TESTED = 2
+    VALIDATED = 3
+    FAILED = 4
 
 
 def u64(value: int) -> int:
@@ -139,6 +167,7 @@ class ExperienceEvent:
     changed_cells: int
     terminal_polarity: int
     trajectory_signature: int
+    next_context_signature: int = 0
 
     def __post_init__(self) -> None:
         if self.watermark < 0 or self.global_step < 0 or self.producer_sequence < 0:
@@ -173,22 +202,29 @@ class MemoryProposal:
     score_weight: float = 1.0
     parent_uid: MemoryUid = MemoryUid(0, 0)
     relation_type: RelationType = RelationType.PROVENANCE
+    source_game_hash: int = 0
+    cognitive_state: int = -1
+    validation_state: int = -1
 
     def __post_init__(self) -> None:
         if not 0 < len(self.key_parts) <= 4:
             raise ValueError("v8 hot-path canonical keys support 1..4 parts")
-        if self.support_delta <= 0:
-            raise ValueError("support_delta must be positive")
+        if self.support_delta < 0:
+            raise ValueError("support_delta cannot be negative")
         if self.score_weight < 0:
             raise ValueError("score_weight cannot be negative")
+        if self.cognitive_state < -1 or self.cognitive_state > 127:
+            raise ValueError("invalid cognitive_state")
+        if self.validation_state < -1 or self.validation_state > 127:
+            raise ValueError("invalid validation_state")
 
 
 _EXPERIENCE = Struct("<QQQIQQQiQQQdIbQ")
 _PIPE_SUFFIX = Struct("<QQb")
-_PROPOSAL = Struct("<QQQQQQBHBQQQQqdddddddQQH")
+_PROPOSAL = Struct("<QQQQQQBHBQQQQqdddddddQQHQbb")
 
-EXPERIENCE_PACKET_SIZE = _EXPERIENCE.size
-PIPELINE_PACKET_SIZE = _EXPERIENCE.size + _PIPE_SUFFIX.size
+EXPERIENCE_PACKET_SIZE = _EXPERIENCE.size + 16
+PIPELINE_PACKET_SIZE = EXPERIENCE_PACKET_SIZE + _PIPE_SUFFIX.size
 PROPOSAL_PACKET_SIZE = _PROPOSAL.size
 
 
@@ -209,20 +245,15 @@ def encode_experience(event: ExperienceEvent) -> bytes:
         int(event.changed_cells) & 0xFFFFFFFF,
         int(event.terminal_polarity),
         u64(event.trajectory_signature),
-    ) + int(event.carrier_signature).to_bytes(8, "little", signed=False)
-
-
-# Carrier was added after the original fixed layout. Keep the packet a single fixed
-# binary shape while avoiding JSON/pickle on the hot path.
-EXPERIENCE_PACKET_SIZE += 8
-PIPELINE_PACKET_SIZE += 8
+    ) + u64(event.carrier_signature).to_bytes(8, "little") + u64(event.next_context_signature).to_bytes(8, "little")
 
 
 def decode_experience(payload: bytes) -> ExperienceEvent:
     if len(payload) != EXPERIENCE_PACKET_SIZE:
         raise ValueError(f"invalid experience packet size {len(payload)}")
-    base = payload[:-8]
-    carrier = int.from_bytes(payload[-8:], "little")
+    base = payload[:-16]
+    carrier = int.from_bytes(payload[-16:-8], "little")
+    next_context = int.from_bytes(payload[-8:], "little")
     (
         event_hi,
         event_lo,
@@ -256,6 +287,7 @@ def decode_experience(payload: bytes) -> ExperienceEvent:
         int(changed_cells),
         int(terminal_polarity),
         int(trajectory_signature),
+        int(next_context),
     )
 
 
@@ -305,6 +337,9 @@ def encode_proposal(proposal: MemoryProposal) -> bytes:
         u64(proposal.parent_uid.hi),
         u64(proposal.parent_uid.lo),
         int(proposal.relation_type),
+        u64(proposal.source_game_hash),
+        int(proposal.cognitive_state),
+        int(proposal.validation_state),
     )
 
 
@@ -337,6 +372,9 @@ def decode_proposal(payload: bytes) -> MemoryProposal:
         parent_hi,
         parent_lo,
         relation_type,
+        source_game_hash,
+        cognitive_state,
+        validation_state,
     ) = values
     keys = (k0, k1, k2, k3)[: int(key_count)]
     return MemoryProposal(
@@ -357,4 +395,7 @@ def decode_proposal(payload: bytes) -> MemoryProposal:
         score_weight=float(score_weight),
         parent_uid=MemoryUid(parent_hi, parent_lo),
         relation_type=RelationType(relation_type),
+        source_game_hash=int(source_game_hash),
+        cognitive_state=int(cognitive_state),
+        validation_state=int(validation_state),
     )

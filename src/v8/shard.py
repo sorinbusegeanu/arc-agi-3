@@ -13,7 +13,7 @@ from v8.arena import (
     SharedEdgeArena,
     SharedNodeArena,
 )
-from v8.model import MemoryLevel, MemoryType, MemoryUid, decode_proposal, signed_u64, u64
+from v8.model import CognitiveState, MemoryLevel, MemoryUid, ValidationState, decode_proposal, signed_u64, u64
 from v8.ring import SharedRingBuffer
 
 
@@ -49,6 +49,11 @@ def _action_slot(
             index[key] = row
             return row, value
     raise MemoryError("action arena is full")
+
+
+def _game_bit(source_game_hash: int) -> int:
+    value = int(source_game_hash)
+    return 0 if value == 0 else 1 << (value & 63)
 
 
 def shard_worker(
@@ -113,6 +118,7 @@ def shard_worker(
                             continue
                         seen.add(dedupe)
                         max_watermark = max(max_watermark, int(proposal.watermark))
+                        game_bit = _game_bit(proposal.source_game_hash)
 
                         row = node_index.get(proposal.uid)
                         if row is None:
@@ -121,8 +127,16 @@ def shard_worker(
                             row = node_count
                             node_count += 1
                             node_index[proposal.uid] = row
-                            active = 1 if int(proposal.level) <= int(MemoryLevel.M1) else 0
-                            validated = 1 if int(proposal.level) <= int(MemoryLevel.M1) else 0
+                            active = (
+                                int(proposal.cognitive_state)
+                                if int(proposal.cognitive_state) >= 0
+                                else int(CognitiveState.ACTIVE if int(proposal.level) <= int(MemoryLevel.M1) else CognitiveState.CANDIDATE)
+                            )
+                            validated = (
+                                int(proposal.validation_state)
+                                if int(proposal.validation_state) >= 0
+                                else int(ValidationState.VALIDATED if int(proposal.level) <= int(MemoryLevel.M1) else ValidationState.UNTESTED)
+                            )
                             record = NodeRecord(
                                 uid=proposal.uid,
                                 fingerprint=proposal.fingerprint,
@@ -138,6 +152,7 @@ def shard_worker(
                                 future_option_sum=proposal.future_option_sum,
                                 score_weight=proposal.score_weight,
                                 updated_watermark=proposal.watermark,
+                                game_mask=game_bit,
                                 cognitive_state=active,
                                 validation_state=validated,
                             )
@@ -153,6 +168,16 @@ def shard_worker(
                                 or tuple(current.key_parts) != tuple(u64(v) for v in proposal.key_parts)
                             ):
                                 raise RuntimeError(f"immutable memory identity mismatch {proposal.uid.hex()}")
+                            cognitive_state = (
+                                int(proposal.cognitive_state)
+                                if int(proposal.cognitive_state) >= 0
+                                else int(current.cognitive_state)
+                            )
+                            validation_state = (
+                                int(proposal.validation_state)
+                                if int(proposal.validation_state) >= 0
+                                else int(current.validation_state)
+                            )
                             record = replace(
                                 current,
                                 support_count=current.support_count + proposal.support_delta,
@@ -164,6 +189,9 @@ def shard_worker(
                                 future_option_sum=current.future_option_sum + proposal.future_option_sum,
                                 score_weight=current.score_weight + proposal.score_weight,
                                 updated_watermark=max(current.updated_watermark, proposal.watermark),
+                                game_mask=int(current.game_mask) | game_bit,
+                                cognitive_state=cognitive_state,
+                                validation_state=validation_state,
                             )
                         nodes.write(row, record)
 
@@ -184,24 +212,24 @@ def shard_worker(
                                     proposal.uid,
                                     int(proposal.relation_type),
                                     proposal.parent_uid,
-                                    1,
+                                    max(1, int(proposal.support_delta)),
                                     proposal.watermark,
                                 )
                             else:
                                 prior_edge = edges.read(edge_row)
                                 edge_record = replace(
                                     prior_edge,
-                                    support_count=prior_edge.support_count + 1,
+                                    support_count=prior_edge.support_count + max(1, int(proposal.support_delta)),
                                     updated_watermark=max(prior_edge.updated_watermark, proposal.watermark),
                                 )
                             edges.write(edge_row, edge_record)
 
-                        if proposal.level == MemoryLevel.M1 and len(proposal.key_parts) >= 2:
+                        if proposal.level == MemoryLevel.M1 and len(proposal.key_parts) >= 2 and (
+                            proposal.support_delta > 0 or abs(float(proposal.significance_sum)) > 0.0
+                        ):
                             context = int(proposal.key_parts[0])
                             action = signed_u64(int(proposal.key_parts[1]))
-                            action_row, prior_action = _action_slot(
-                                actions, action_index, context, action
-                            )
+                            action_row, prior_action = _action_slot(actions, action_index, context, action)
                             significance = float(proposal.significance_sum)
                             if prior_action is None:
                                 action_record = ActionRecord(

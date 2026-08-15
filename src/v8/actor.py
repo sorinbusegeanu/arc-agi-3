@@ -31,6 +31,8 @@ class ActorProgress:
     wins: int
     failures: int
     levels_completed: int
+    replans: int = 0
+    planned_steps: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +44,8 @@ class ActorResult:
     failures: int
     levels_completed: int
     resets: int
+    replans: int = 0
+    planned_steps: int = 0
 
 
 def _polarity(value: str) -> int:
@@ -66,6 +70,8 @@ def _publish_progress(
     wins: int,
     failures: int,
     levels_completed: int,
+    replans: int,
+    planned_steps: int,
 ) -> None:
     if progress_queue is None:
         return
@@ -76,6 +82,8 @@ def _publish_progress(
         int(wins),
         int(failures),
         int(levels_completed),
+        int(replans),
+        int(planned_steps),
     )
     try:
         progress_queue.put_nowait(row)
@@ -92,6 +100,7 @@ def actor_worker(
     stop_event: mp.synchronize.Event,
     result_queue: mp.Queue,
     progress_queue: mp.Queue | None = None,
+    actor_throttle: mp.sharedctypes.Synchronized | None = None,
 ) -> None:
     from v7.environment.arc_adapter import ArcGridEnvironment
     from v7.environment.encoding import (
@@ -112,6 +121,9 @@ def actor_worker(
     rolling_trajectory = stable_u64(job.actor_id, job.seed, sequence_base, person=b"v8-traj-seed")
     local_overlay: dict[tuple[int, int], tuple[int, float]] = {}
     wins = failures = levels_completed = 0
+    replans = planned_steps = 0
+    selected_outcome = None
+    selected_strategy = None
     last_levels = int(env.last_levels_completed)
     next_progress = time.monotonic() + 5.0
     try:
@@ -122,29 +134,54 @@ def actor_worker(
             before_actions = tuple(sorted(set(int(value) for value in env.available_actions())))
             if not before_actions:
                 env.reset()
+                selected_outcome = selected_strategy = None
                 continue
             context = int(structural_grid_signature(before))
-            scores = view.score_actions(context, before_actions)
-            combined = []
-            for score in scores:
-                local_support, local_score = local_overlay.get((context, score.action_id), (0, 0.0))
-                support = score.support_count + local_support
-                if support <= 0:
-                    value = 0.0
-                else:
-                    weighted = score.score * score.support_count + local_score * local_support
-                    value = weighted / support
-                combined.append((score.action_id, support, value))
-            unseen = [action for action, support, _score in combined if support == 0]
-            if unseen:
-                action = unseen[rng.randrange(len(unseen))]
-            elif rng.random() < float(job.epsilon):
-                action = before_actions[rng.randrange(len(before_actions))]
+
+            # Late developmental memory is consulted first. If no admissible M7 plan
+            # exists, retain the established M1 + actor-local overlay behavior.
+            planned = view.planned_action(context, before_actions)
+            if planned is not None:
+                action = int(planned.action_id)
+                planned_steps += 1
+                if (
+                    selected_outcome is not None
+                    and selected_outcome == planned.outcome_uid
+                    and selected_strategy is not None
+                    and selected_strategy != planned.strategy_uid
+                ):
+                    replans += 1
+                selected_outcome = planned.outcome_uid
+                selected_strategy = planned.strategy_uid
             else:
-                action = min(combined, key=lambda row: (-row[2], -row[1], row[0]))[0]
+                scores = view.score_actions(context, before_actions)
+                combined = []
+                for score in scores:
+                    local_support, local_score = local_overlay.get((context, score.action_id), (0, 0.0))
+                    support = score.support_count + local_support
+                    if support <= 0:
+                        value = 0.0
+                    else:
+                        weighted = score.score * score.support_count + local_score * local_support
+                        value = weighted / support
+                    combined.append((score.action_id, support, value))
+                unseen = [action for action, support, _score in combined if support == 0]
+                if unseen:
+                    action = unseen[rng.randrange(len(unseen))]
+                elif rng.random() < float(job.epsilon):
+                    action = before_actions[rng.randrange(len(before_actions))]
+                else:
+                    action = min(combined, key=lambda row: (-row[2], -row[1], row[0]))[0]
+
+            if actor_throttle is not None:
+                with actor_throttle.get_lock():
+                    delay = float(actor_throttle.value)
+                if delay > 0:
+                    time.sleep(delay)
 
             after = env.step(action)
             after_actions = tuple(sorted(set(int(value) for value in env.available_actions())))
+            after_context = int(structural_grid_signature(after))
             outcome = int(transition_signature(before, after))
             family = int(transformation_family_signature(before, after))
             carrier = int(carrier_signature(before, after) or 0)
@@ -177,6 +214,7 @@ def actor_worker(
                         changed_cells=changed,
                         terminal_polarity=_polarity(env.last_outcome_polarity),
                         trajectory_signature=rolling_trajectory,
+                        next_context_signature=after_context,
                     )
                     packet = encode_pipeline(PipelineEvent(event))
                     if ring.put(packet, timeout=0.05):
@@ -207,6 +245,7 @@ def actor_worker(
                 rolling_trajectory = stable_u64(
                     job.actor_id, producer_sequence, current_watermark, person=b"v8-traj-reset"
                 )
+                selected_outcome = selected_strategy = None
             last_levels = current_levels
 
             now = time.monotonic()
@@ -218,6 +257,8 @@ def actor_worker(
                     wins=wins,
                     failures=failures,
                     levels_completed=levels_completed,
+                    replans=replans,
+                    planned_steps=planned_steps,
                 )
                 next_progress = now + 5.0
 
@@ -228,6 +269,8 @@ def actor_worker(
             wins=wins,
             failures=failures,
             levels_completed=levels_completed,
+            replans=replans,
+            planned_steps=planned_steps,
         )
         result_queue.put(
             ActorResult(
@@ -238,6 +281,8 @@ def actor_worker(
                 failures,
                 levels_completed,
                 int(env.reset_count),
+                replans,
+                planned_steps,
             )
         )
     finally:
@@ -273,6 +318,7 @@ def run_actor_jobs(
                 "stop_event": runtime._stop,
                 "result_queue": results,
                 "progress_queue": progress,
+                "actor_throttle": runtime._actor_throttle,
             },
             name=f"v8-actor-{job.actor_id:03d}-{job.game_id}",
             daemon=True,
@@ -315,17 +361,13 @@ def run_actor_jobs(
                         row.wins,
                         row.failures,
                         row.levels_completed,
+                        row.replans,
+                        row.planned_steps,
                     )
 
-            failed = [
-                process
-                for process in processes
-                if process.exitcode not in (None, 0)
-            ]
+            failed = [process for process in processes if process.exitcode not in (None, 0)]
             if failed:
-                detail = ", ".join(
-                    f"{process.name}={process.exitcode}" for process in failed
-                )
+                detail = ", ".join(f"{process.name}={process.exitcode}" for process in failed)
                 raise RuntimeError(f"actor failed: {detail}")
 
             now = time.monotonic()
@@ -358,6 +400,8 @@ def run_actor_jobs(
                     row.wins,
                     row.failures,
                     row.levels_completed,
+                    row.replans,
+                    row.planned_steps,
                 )
 
         if len(result_by_actor) != len(jobs):
