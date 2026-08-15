@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 from v8.model import MemoryUid
 
@@ -27,12 +27,7 @@ class PreferenceEvidence:
 
 
 class PreferenceEstimator:
-    """Infer target-like preference only from causally clean comparable probes.
-
-    A probe contributes only when both outcomes were represented as reachable before
-    the choice and an already-active preference did not influence that choice. This
-    prevents preference -> choice -> preference self-validation.
-    """
+    """Infer target-like preference only from causally clean comparable probes."""
 
     def __init__(self, *, support_threshold: int = 6, stable_margin: float = 0.30) -> None:
         self.support_threshold = int(support_threshold)
@@ -104,3 +99,37 @@ class PreferenceEstimator:
                 )
             )
         return tuple(result)
+
+    def state_dict(self) -> dict[str, object]:
+        rows = []
+        for probe in self._probes:
+            raw = asdict(probe)
+            for key in ("outcome_a", "outcome_b", "chosen_outcome"):
+                uid = raw[key]
+                raw[key] = [uid.hi, uid.lo]
+            rows.append(raw)
+        return {
+            "support_threshold": self.support_threshold,
+            "stable_margin": self.stable_margin,
+            "probes": rows,
+        }
+
+    def load_state(self, state: dict[str, object] | None) -> None:
+        if not state:
+            return
+        for raw in state.get("probes", []):
+            if not isinstance(raw, dict):
+                continue
+            a = raw.get("outcome_a", [0, 0])
+            b = raw.get("outcome_b", [0, 0])
+            chosen = raw.get("chosen_outcome", [0, 0])
+            self._probes.append(
+                PreferenceProbe(
+                    MemoryUid(int(a[0]), int(a[1])),
+                    MemoryUid(int(b[0]), int(b[1])),
+                    int(raw.get("context_bucket", 0)),
+                    MemoryUid(int(chosen[0]), int(chosen[1])),
+                    bool(raw.get("both_reachable", True)),
+                    bool(raw.get("preference_influenced", False)),
+                )
+            )
