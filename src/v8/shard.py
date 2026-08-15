@@ -79,6 +79,10 @@ def _write_edge(
     support_delta: int,
     watermark: int,
     shard_id: int,
+    score_sum: float = 0.0,
+    score_weight: float = 0.0,
+    source_version: int = 0,
+    target_version: int = 0,
 ) -> int:
     key = (source_uid, int(relation_type), target_uid)
     row = edge_index.get(key)
@@ -89,13 +93,27 @@ def _write_edge(
         row = edge_count
         edge_count += 1
         edge_index[key] = row
-        record = EdgeRecord(source_uid, int(relation_type), target_uid, increment, int(watermark))
+        record = EdgeRecord(
+            source_uid,
+            int(relation_type),
+            target_uid,
+            increment,
+            int(watermark),
+            float(score_sum),
+            max(0.0, float(score_weight)),
+            int(source_version),
+            int(target_version),
+        )
     else:
         prior = edges.read(row)
         record = replace(
             prior,
             support_count=prior.support_count + increment,
             updated_watermark=max(prior.updated_watermark, int(watermark)),
+            score_sum=prior.score_sum + float(score_sum),
+            score_weight=prior.score_weight + max(0.0, float(score_weight)),
+            source_version=max(prior.source_version, int(source_version)),
+            target_version=max(prior.target_version, int(target_version)),
         )
     edges.write(row, record)
     return edge_count
@@ -129,8 +147,6 @@ def shard_worker(
             if occupied:
                 action_index[(value.context_signature, value.action_id)] = row
 
-        # Duplicate protection is bounded. Restart safety is provided by the runtime's
-        # restored M0 event identities, so this set does not need to grow forever.
         dedupe_capacity = max(65_536, int(batch_size) * 1024)
         seen: set[tuple[int, ...]] = set()
         seen_order: deque[tuple[int, ...]] = deque()
@@ -177,35 +193,10 @@ def shard_worker(
                             if len(seen_order) > dedupe_capacity:
                                 seen.discard(seen_order.popleft())
 
-                            # Relation proposals are valid only for already-canonical
-                            # source memories. The target may live on another shard.
-                            source_row = node_index.get(relation.source_uid)
-                            if source_row is None:
+                            if node_index.get(relation.source_uid) is None:
                                 continue
                             mutated = True
                             max_watermark = max(max_watermark, int(relation.watermark))
-
-                            # Preserve the pre-phase-4 prospective transfer-prior
-                            # behavior while the canonical edge itself is now reduced
-                            # independently of node identity. Phase 6 can consume the
-                            # relation score directly and remove this compatibility
-                            # accumulation.
-                            if relation.score_weight > 0.0:
-                                current = nodes.read(source_row)
-                                nodes.write(
-                                    source_row,
-                                    replace(
-                                        current,
-                                        transfer_prior_sum=(
-                                            current.transfer_prior_sum + relation.score_sum
-                                        ),
-                                        updated_watermark=max(
-                                            current.updated_watermark,
-                                            relation.watermark,
-                                        ),
-                                    ),
-                                )
-
                             edge_count = _write_edge(
                                 edges=edges,
                                 edge_index=edge_index,
@@ -216,6 +207,10 @@ def shard_worker(
                                 support_delta=relation.support_delta,
                                 watermark=relation.watermark,
                                 shard_id=config.shard_id,
+                                score_sum=relation.score_sum,
+                                score_weight=relation.score_weight,
+                                source_version=relation.source_version,
+                                target_version=relation.target_version,
                             )
                             continue
 
@@ -333,8 +328,6 @@ def shard_worker(
                             )
 
                         if int(proposal.source_game_hash) != 0:
-                            # target.lo is the exact reversible game hash; target.hi=0
-                            # intentionally distinguishes it from canonical memory UIDs.
                             edge_count = _write_edge(
                                 edges=edges,
                                 edge_index=edge_index,
