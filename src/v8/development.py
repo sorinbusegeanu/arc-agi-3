@@ -88,12 +88,17 @@ def _key_for(level: MemoryLevel, event: PipelineEvent) -> tuple[int, ...]:
     if level == MemoryLevel.M7:
         if event.parent_uid.is_zero:
             raise ValueError("M7 strategy requires M6 outcome parent")
-        trajectory = int(e.trajectory_signature) or stable_u64(
-            e.context_signature, e.action_id, person=b"v8-trajectory"
+        # Strategy identity must describe a reusable procedure, not a unique rolling
+        # trajectory instance. Including trajectory_signature here created almost one
+        # M7 node per environment step and eventually exhausted the RAM arena.
+        strategy_signature = stable_u64(
+            e.action_id,
+            e.family_signature,
+            person=b"v8-strategy",
         )
         context_bucket = stable_u64(e.context_signature, person=b"v8-context")
         return (
-            int(trajectory),
+            int(strategy_signature),
             int(event.parent_uid.hi),
             int(event.parent_uid.lo),
             int(context_bucket),
@@ -134,6 +139,20 @@ def derive_proposal(level: MemoryLevel, event: PipelineEvent) -> MemoryProposal:
     )
 
 
+def _put_with_backpressure(
+    ring: SharedRingBuffer,
+    payload: bytes,
+    stop_event: mp.synchronize.Event,
+    *,
+    retry_seconds: float = 0.05,
+) -> bool:
+    """Wait for bounded RAM capacity instead of turning normal pressure into failure."""
+    while not stop_event.is_set():
+        if ring.put(payload, timeout=retry_seconds):
+            return True
+    return False
+
+
 def stage_worker(
     *,
     level: int,
@@ -159,16 +178,24 @@ def stage_worker(
                 pipeline = decode_pipeline(payload)
                 proposal = derive_proposal(target, pipeline)
                 shard = proposal.uid.shard(len(shard_rings))
-                if not shard_rings[shard].put(encode_proposal(proposal), timeout=1.0):
-                    raise RuntimeError(f"shard {shard} proposal ring remained full")
+                if not _put_with_backpressure(
+                    shard_rings[shard],
+                    encode_proposal(proposal),
+                    stop_event,
+                ):
+                    return
                 if next_ring is not None:
                     forwarded = PipelineEvent(
                         pipeline.experience,
                         parent_uid=proposal.uid,
                         current_level=int(target),
                     )
-                    if not next_ring.put(encode_pipeline(forwarded), timeout=1.0):
-                        raise RuntimeError(f"downstream ring after M{int(target)} remained full")
+                    if not _put_with_backpressure(
+                        next_ring,
+                        encode_pipeline(forwarded),
+                        stop_event,
+                    ):
+                        return
             finally:
                 with inflight.get_lock():
                     inflight.value -= 1
