@@ -342,16 +342,29 @@ class ContinuousMemoryRuntime:
         return True
 
     def wait_quiescent(self, *, timeout: float = 60.0, stable_checks: int = 5) -> None:
+        """Drain the mandatory pipeline and advance peer operators to a fixed point."""
         deadline = time.monotonic() + float(timeout)
         stable = 0
         while time.monotonic() < deadline:
             self.raise_worker_errors()
-            if self._is_quiescent():
+            if not self._is_quiescent():
+                stable = 0
+                time.sleep(0.01)
+                continue
+
+            peer_changed = False
+            if self.peers is not None:
+                before = self.peers.metrics().proposals
+                self.peers.run_once()
+                after = self.peers.metrics().proposals
+                peer_changed = after > before
+
+            if peer_changed or not self._is_quiescent():
+                stable = 0
+            else:
                 stable += 1
                 if stable >= int(stable_checks):
                     return
-            else:
-                stable = 0
             time.sleep(0.01)
         raise TimeoutError("v8 did not reach quiescence; " + json.dumps(self.metrics(), sort_keys=True))
 
@@ -365,13 +378,16 @@ class ContinuousMemoryRuntime:
         if self.peers is None:
             return
         cut = self.peers.ledger.cut(self.watermark)
-        self.peers.ledger.export_jsonl(self.root / "evidence" / "v8_evidence.jsonl", watermark=self.watermark)
+        self.peers.ledger.export_jsonl(
+            self.root / "evidence" / "v8_evidence.jsonl", watermark=self.watermark
+        )
         self.hypothesis_evaluator.write_report(self.root / "reports" / "h01_h15.json", cut)
 
     def record_actor_results(self, results) -> None:
         if self.peers is None:
             return
         from v8.evidence import EvidenceRecord
+
         for result in results:
             if int(getattr(result, "replans", 0)) <= 0:
                 continue
@@ -401,13 +417,18 @@ class ContinuousMemoryRuntime:
         return self.snapshot_service.request_final(self._snapshot_id, self.watermark, timeout=timeout)
 
     def metrics(self) -> dict[str, object]:
-        saved_watermark = 0 if self.snapshot_service is None else int(self.snapshot_service.saved_watermark.value)
-        peer_metrics = None if self.peers is None else self.peers.metrics().__dict__ if hasattr(self.peers.metrics(), "__dict__") else {
-            "cycles": self.peers.metrics().cycles,
-            "proposals": self.peers.metrics().proposals,
-            "evidence_records": self.peers.metrics().evidence_records,
-            "interval_seconds": self.peers.metrics().interval_seconds,
-        }
+        saved_watermark = (
+            0 if self.snapshot_service is None else int(self.snapshot_service.saved_watermark.value)
+        )
+        peer_metrics = None
+        if self.peers is not None:
+            peer = self.peers.metrics()
+            peer_metrics = {
+                "cycles": peer.cycles,
+                "proposals": peer.proposals,
+                "evidence_records": peer.evidence_records,
+                "interval_seconds": peer.interval_seconds,
+            }
         with self._actor_throttle.get_lock():
             throttle = float(self._actor_throttle.value)
         return {
@@ -441,10 +462,9 @@ class ContinuousMemoryRuntime:
 
         final_result = None
         if normal:
-            if self.peers is not None:
-                self.peers.run_once()
-                self.peers.close()
             self.wait_quiescent(timeout=timeout)
+            if self.peers is not None:
+                self.peers.close()
             self.write_scientific_report()
             if self.snapshot_service is not None:
                 final_result = self.final_snapshot(timeout=timeout)
