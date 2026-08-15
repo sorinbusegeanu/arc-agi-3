@@ -40,7 +40,6 @@ class KnownBugTests(unittest.TestCase):
             trajectory_signature=400,
         )
 
-    @unittest.expectedFailure
     def test_constructing_unsubmitted_experience_does_not_advance_watermark(self) -> None:
         root = Path(tempfile.mkdtemp())
         runtime = ContinuousMemoryRuntime(self.config(root))
@@ -51,7 +50,6 @@ class KnownBugTests(unittest.TestCase):
         finally:
             runtime.close(normal=False)
 
-    @unittest.expectedFailure
     def test_duplicate_event_after_restart_does_not_double_count_support(self) -> None:
         root = Path(tempfile.mkdtemp())
         config = self.config(root, snapshots=True, restore=True)
