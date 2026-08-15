@@ -13,6 +13,7 @@ from v8.model import CognitiveState, MemoryLevel, MemoryType, MemoryUid, Validat
 from v8.planning import Planner
 from v8.prediction import PredictionEstimator
 from v8.preference import PreferenceEstimator
+from v8.replanning import ReplanningController
 from v8.roles import FunctionalRoleEstimator
 from v8.strategies import StrategyEvidence
 from v8.transfer import TransferValidator
@@ -116,14 +117,11 @@ class TransferPlanningPreferenceTests(unittest.TestCase):
 
     def test_replanning_preserves_outcome_identity(self) -> None:
         outcome = MemoryUid(11, 22)
-        s1 = StrategyEvidence(MemoryUid(1, 1), outcome, 1, 55, 8, 1.0, 1.0)
-        s2 = StrategyEvidence(MemoryUid(2, 2), outcome, 2, 55, 5, 1.0, 1.0)
         planner = Planner()
-        # Planner hashes raw context, so use its generated bucket for test evidence.
         from v8.model import stable_u64
         bucket = stable_u64(7, person=b"v8-context")
-        s1 = StrategyEvidence(s1.uid, outcome, 1, bucket, 8, 1.0, 1.0)
-        s2 = StrategyEvidence(s2.uid, outcome, 2, bucket, 5, 1.0, 1.0)
+        s1 = StrategyEvidence(MemoryUid(1, 1), outcome, 1, bucket, 8, 1.0, 1.0)
+        s2 = StrategyEvidence(MemoryUid(2, 2), outcome, 2, bucket, 5, 1.0, 1.0)
         current = planner.select(context_signature=7, available_actions=(1, 2), strategies=(s1, s2))
         self.assertIsNotNone(current)
         replanned = planner.replan(current, context_signature=7, available_actions=(1, 2), strategies=(s1, s2))
@@ -131,16 +129,65 @@ class TransferPlanningPreferenceTests(unittest.TestCase):
         self.assertEqual(replanned.outcome_uid, current.outcome_uid)
         self.assertNotEqual(replanned.strategy_uid, current.strategy_uid)
 
-    def test_preference_requires_comparable_repeated_outcomes(self) -> None:
-        a, b = MemoryUid(10, 10), MemoryUid(20, 20)
-        strategies = (
-            StrategyEvidence(MemoryUid(1, 1), a, 1, 77, 10, 1.0, 1.0),
-            StrategyEvidence(MemoryUid(2, 2), b, 2, 77, 2, 0.5, 1.0),
+    def test_h14_trial_requires_explicit_invalidation_and_recovery(self) -> None:
+        outcome = MemoryUid(11, 22)
+        controller = ReplanningController()
+        invalid = controller.record_trial(
+            primary_strategy_uid=MemoryUid(1, 1),
+            alternative_strategy_uid=MemoryUid(2, 2),
+            outcome_uid=outcome,
+            primary_invalidated=False,
+            alternative_selected=True,
+            outcome_preserved=True,
+            recovery_succeeded=True,
         )
-        evidence = PreferenceEstimator(support_threshold=6, stable_margin=0.3).evaluate(strategies)
+        self.assertFalse(invalid.valid_recovery)
+        valid = controller.record_trial(
+            primary_strategy_uid=MemoryUid(1, 1),
+            alternative_strategy_uid=MemoryUid(2, 2),
+            outcome_uid=outcome,
+            primary_invalidated=True,
+            alternative_selected=True,
+            outcome_preserved=True,
+            recovery_succeeded=True,
+        )
+        self.assertTrue(valid.valid_recovery)
+
+    def test_preference_ignores_preference_influenced_choices(self) -> None:
+        a, b = MemoryUid(10, 10), MemoryUid(20, 20)
+        estimator = PreferenceEstimator(support_threshold=3, stable_margin=0.3)
+        for _ in range(10):
+            self.assertFalse(
+                estimator.record_probe(
+                    outcome_a=a,
+                    outcome_b=b,
+                    context_bucket=77,
+                    chosen_outcome=a,
+                    both_reachable=True,
+                    preference_influenced=True,
+                )
+            )
+        self.assertEqual(estimator.evaluate(), ())
+
+    def test_clean_preference_probes_can_become_stable(self) -> None:
+        a, b = MemoryUid(10, 10), MemoryUid(20, 20)
+        estimator = PreferenceEstimator(support_threshold=6, stable_margin=0.3)
+        for chosen in (a, a, a, a, a, b):
+            self.assertTrue(
+                estimator.record_probe(
+                    outcome_a=a,
+                    outcome_b=b,
+                    context_bucket=77,
+                    chosen_outcome=chosen,
+                    both_reachable=True,
+                    preference_influenced=False,
+                )
+            )
+        evidence = estimator.evaluate()
         self.assertEqual(len(evidence), 1)
         self.assertEqual(evidence[0].state, "STABLE")
         self.assertEqual(evidence[0].preferred, a)
+        self.assertEqual(evidence[0].clean_probe_count, 6)
 
 
 class LifecycleAndReportingTests(unittest.TestCase):
@@ -176,6 +223,63 @@ class LifecycleAndReportingTests(unittest.TestCase):
         statuses = evaluator.status_map(evaluator.evaluate((partial,)))
         self.assertEqual(statuses["H06"], "PARTIALLY_VALID")
         self.assertNotEqual(statuses["H06"], "VALID")
+
+    def test_h14_observed_switch_does_not_validate_without_recovery_trial(self) -> None:
+        evaluator = ScientificHypothesisEvaluator()
+        observed = EvidenceRecord.for_uid(
+            "h14-observed",
+            MemoryUid(1, 2),
+            evidence_kind="replanning_observed",
+            watermark=10,
+            raw_value=1.0,
+            normalized_value=1.0,
+            developmental_stage=7,
+            validation_state=int(ValidationState.STRUCTURAL),
+        )
+        statuses = evaluator.status_map(evaluator.evaluate((observed,)))
+        self.assertEqual(statuses["H14"], "PARTIALLY_VALID")
+
+    def test_h14_explicit_recovery_trial_can_validate(self) -> None:
+        evaluator = ScientificHypothesisEvaluator()
+        trial = EvidenceRecord.for_uid(
+            "h14-trial",
+            MemoryUid(1, 2),
+            evidence_kind="replanning_recovery_trial",
+            watermark=10,
+            raw_value=1.0,
+            normalized_value=1.0,
+            developmental_stage=7,
+            validation_state=int(ValidationState.VALIDATED),
+        )
+        statuses = evaluator.status_map(evaluator.evaluate((trial,)))
+        self.assertEqual(statuses["H14"], "VALID")
+
+    def test_h15_requires_stable_clean_probe(self) -> None:
+        evaluator = ScientificHypothesisEvaluator()
+        probe = EvidenceRecord.for_uid(
+            "h15-probe",
+            MemoryUid(1, 2),
+            evidence_kind="preference_probe",
+            watermark=10,
+            raw_value=1.0,
+            normalized_value=1.0,
+            developmental_stage=6,
+            validation_state=int(ValidationState.STRUCTURAL),
+        )
+        statuses = evaluator.status_map(evaluator.evaluate((probe,)))
+        self.assertEqual(statuses["H15"], "PARTIALLY_VALID")
+        stable = EvidenceRecord.for_uid(
+            "h15-stable",
+            MemoryUid(1, 2),
+            evidence_kind="stable_preference_probe",
+            watermark=11,
+            raw_value=1.0,
+            normalized_value=1.0,
+            developmental_stage=6,
+            validation_state=int(ValidationState.VALIDATED),
+        )
+        statuses = evaluator.status_map(evaluator.evaluate((probe, stable)))
+        self.assertEqual(statuses["H15"], "VALID")
 
 
 if __name__ == "__main__":
