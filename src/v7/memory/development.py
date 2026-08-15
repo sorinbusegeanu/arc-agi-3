@@ -55,7 +55,12 @@ class DevelopmentalLifecycleRuntime:
     ) -> DevelopmentalLifecycleResult:
         profile = profile_for_view(view)
         lifecycle_decisions, stats = self.lifecycle_runtime.run(view, writer=writer)
-        summaries = self.evidence_lifecycle.transfer_summary(view.nodes.keys())
+        # Concept validation must be based on transfer into games outside the
+        # concept's formation provenance. Total transfer remains available to
+        # the generic lifecycle fitness calculation, but it cannot validate M4.
+        summaries = self.evidence_lifecycle.heldout_transfer_summary(
+            view.nodes.keys()
+        )
         concept_decisions = self.concept_validator.evaluate(
             view,
             transfer_summary=summaries,
@@ -89,8 +94,11 @@ class DevelopmentalLifecycleRuntime:
                         "previous_flags": int(d.previous_flags),
                         "next_flags": int(d.next_flags),
                         "development_stage": profile.stage.name,
+                        "heldout_validation": True,
                         "validation_source_games": list(
-                            self.evidence_lifecycle.provenance_source_games(d.memory_id)
+                            self.evidence_lifecycle.provenance_source_games(
+                                d.memory_id
+                            )
                         ),
                     },
                 )
