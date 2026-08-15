@@ -191,6 +191,18 @@ class TransferPlanningPreferenceTests(unittest.TestCase):
 
 
 class LifecycleAndReportingTests(unittest.TestCase):
+    def _h13_evidence(self) -> EvidenceRecord:
+        return EvidenceRecord.for_uid(
+            "h13-merge",
+            MemoryUid(9, 9),
+            evidence_kind="outcome_merge",
+            watermark=9,
+            raw_value=1.0,
+            normalized_value=1.0,
+            developmental_stage=6,
+            validation_state=int(ValidationState.STRUCTURAL),
+        )
+
     def test_high_fitness_candidate_promotes_with_hysteresis_model(self) -> None:
         row = node(
             MemoryLevel.M4,
@@ -236,7 +248,7 @@ class LifecycleAndReportingTests(unittest.TestCase):
             developmental_stage=7,
             validation_state=int(ValidationState.STRUCTURAL),
         )
-        statuses = evaluator.status_map(evaluator.evaluate((observed,)))
+        statuses = evaluator.status_map(evaluator.evaluate((observed, self._h13_evidence())))
         self.assertEqual(statuses["H14"], "PARTIALLY_VALID")
 
     def test_h14_explicit_recovery_trial_can_validate(self) -> None:
@@ -250,8 +262,10 @@ class LifecycleAndReportingTests(unittest.TestCase):
             normalized_value=1.0,
             developmental_stage=7,
             validation_state=int(ValidationState.VALIDATED),
+            causal_intervention="strategy_ablation_recovery",
+            effect_direction=1,
         )
-        statuses = evaluator.status_map(evaluator.evaluate((trial,)))
+        statuses = evaluator.status_map(evaluator.evaluate((self._h13_evidence(), trial)))
         self.assertEqual(statuses["H14"], "VALID")
 
     def test_h15_requires_stable_clean_probe(self) -> None:
@@ -265,8 +279,9 @@ class LifecycleAndReportingTests(unittest.TestCase):
             normalized_value=1.0,
             developmental_stage=6,
             validation_state=int(ValidationState.STRUCTURAL),
+            causal_intervention="clean_choice_probe",
         )
-        statuses = evaluator.status_map(evaluator.evaluate((probe,)))
+        statuses = evaluator.status_map(evaluator.evaluate((self._h13_evidence(), probe)))
         self.assertEqual(statuses["H15"], "PARTIALLY_VALID")
         stable = EvidenceRecord.for_uid(
             "h15-stable",
@@ -277,8 +292,10 @@ class LifecycleAndReportingTests(unittest.TestCase):
             normalized_value=1.0,
             developmental_stage=6,
             validation_state=int(ValidationState.VALIDATED),
+            causal_intervention="clean_choice_probe",
+            effect_direction=1,
         )
-        statuses = evaluator.status_map(evaluator.evaluate((probe, stable)))
+        statuses = evaluator.status_map(evaluator.evaluate((self._h13_evidence(), probe, stable)))
         self.assertEqual(statuses["H15"], "VALID")
 
 
