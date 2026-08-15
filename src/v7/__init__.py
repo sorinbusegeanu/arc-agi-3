@@ -1,8 +1,15 @@
-"""ARC-AGI-3 v7 clean-break runtime foundation."""
+"""ARC-AGI-3 v7 developmental memory runtime."""
 
 from v7.memory.ids import MemoryId, MemoryIdAllocator, MemoryLevel
 from v7.memory.writer import CanonicalMemoryWriter
 from v7.runtime import V7Runtime, V7RuntimeConfig
+from v7.developmental_v707 import install_v707_extensions
+from v7.developmental_v707_hardening import harden_v707_extensions
+from v7.developmental_v707_compat import install_v707_compatibility
+
+install_v707_extensions()
+harden_v707_extensions()
+install_v707_compatibility()
 
 __all__ = [
     "CanonicalMemoryWriter",
@@ -12,4 +19,4 @@ __all__ = [
     "V7Runtime",
     "V7RuntimeConfig",
 ]
-__version__ = "7.0.0-dev0"
+__version__ = "7.0.7"
