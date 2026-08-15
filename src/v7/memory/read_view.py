@@ -6,14 +6,17 @@ from types import MappingProxyType
 from typing import Mapping
 
 from v7.memory.arenas.compact import CompactMemoryArena
-from v7.memory.concept_validation import ConceptValidationStatus
 from v7.memory.generation import GenerationId
 from v7.memory.ids import MemoryId, MemoryLevel
 from v7.memory.indexes.cognition import ActionScoreInput, CognitionIndexes
 from v7.memory.indexes.mapped import MappedPackedCognitionIndexes
 from v7.memory.indexes.packed import PackedCognitionIndexes
 from v7.memory.models import MemoryNode, MemoryScore
-from v7.memory.status import MemoryStatus, memory_is_active
+from v7.memory.status import (
+    ConceptValidationStatus,
+    MemoryStatus,
+    memory_is_active,
+)
 
 EdgeKey = tuple[MemoryId, int]
 PackedCognitionView = PackedCognitionIndexes | MappedPackedCognitionIndexes
@@ -109,13 +112,17 @@ class MemoryReadView:
         self,
         memory_ids: list[MemoryId] | tuple[MemoryId, ...],
     ) -> tuple[MemoryNode | None, ...]:
-        return tuple(self.compact_arena.nodes.get(memory_id) for memory_id in memory_ids)
+        return tuple(
+            self.compact_arena.nodes.get(memory_id) for memory_id in memory_ids
+        )
 
     def get_scores(
         self,
         memory_ids: list[MemoryId] | tuple[MemoryId, ...],
     ) -> tuple[MemoryScore | None, ...]:
-        return tuple(self.compact_arena.scores.get(memory_id) for memory_id in memory_ids)
+        return tuple(
+            self.compact_arena.scores.get(memory_id) for memory_id in memory_ids
+        )
 
     def neighbors(
         self,
@@ -184,8 +191,6 @@ class MemoryReadView:
             if not memory_is_active(self.nodes.get(memory_id)):
                 continue
             priority = self._memory_priority(memory_id)[0]
-            # Negative priority is an explicit semantic exclusion, currently
-            # used for rejected concepts as well as inactive memories.
             if priority < 0.0:
                 continue
             ranked.append((priority, memory_id))
