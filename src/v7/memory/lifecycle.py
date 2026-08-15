@@ -34,6 +34,8 @@ class LifecyclePolicy:
     probe_after_low_windows: int = 2
     quarantine_after_low_windows: int = 4
     quarantine_after_harm_windows: int = 2
+    retire_after_low_windows: int = 8
+    retire_after_harm_windows: int = 4
     reactivate_after_positive_windows: int = 2
 
     def __post_init__(self) -> None:
@@ -50,11 +52,17 @@ class LifecyclePolicy:
             self.probe_after_low_windows,
             self.quarantine_after_low_windows,
             self.quarantine_after_harm_windows,
+            self.retire_after_low_windows,
+            self.retire_after_harm_windows,
             self.reactivate_after_positive_windows,
         ) < 1:
             raise ValueError("lifecycle window thresholds must be positive")
         if self.quarantine_after_low_windows < self.probe_after_low_windows:
             raise ValueError("quarantine window cannot precede probe-only window")
+        if self.retire_after_low_windows < self.quarantine_after_low_windows:
+            raise ValueError("retirement cannot precede low-utility quarantine")
+        if self.retire_after_harm_windows < self.quarantine_after_harm_windows:
+            raise ValueError("retirement cannot precede harm quarantine")
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +78,13 @@ class LifecycleDecision:
     contradiction_severity: float = 0.0
     previous_cognitive_state: int = int(CognitiveState.ACTIVE)
     next_cognitive_state: int = int(CognitiveState.ACTIVE)
+
+    @property
+    def retired(self) -> bool:
+        return (
+            self.previous_cognitive_state != int(CognitiveState.RETIRED)
+            and self.next_cognitive_state == int(CognitiveState.RETIRED)
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,6 +231,11 @@ class MemoryLifecycleController:
             return CognitiveState.QUARANTINED if legacy_demote else CognitiveState.ACTIVE
         low_windows, harm_windows, positive_windows = (int(value) for value in window)
         p = self.policy
+        if (
+            harm_windows >= p.retire_after_harm_windows
+            or low_windows >= p.retire_after_low_windows
+        ):
+            return CognitiveState.RETIRED
         if harm_windows >= p.quarantine_after_harm_windows:
             return CognitiveState.QUARANTINED
         if low_windows >= p.quarantine_after_low_windows:
@@ -267,6 +287,8 @@ class MemoryLifecycleController:
                 legacy_demote=legacy_demote,
             )
             previous_cognitive = memory_cognitive_state(node) or CognitiveState.ACTIVE
+            if next_cognitive == CognitiveState.RETIRED:
+                promote = False
             demote = (
                 previous_cognitive == CognitiveState.ACTIVE
                 and next_cognitive != CognitiveState.ACTIVE
@@ -276,7 +298,10 @@ class MemoryLifecycleController:
                 empirical,
                 contradiction,
             )
-            replay = replay_reason != 0 or next_cognitive == CognitiveState.PROBE_ONLY
+            replay = (
+                next_cognitive != CognitiveState.RETIRED
+                and (replay_reason != 0 or next_cognitive == CognitiveState.PROBE_ONLY)
+            )
             flags = int(node.status_flags)
             if next_cognitive == CognitiveState.ACTIVE:
                 flags |= int(MemoryStatus.ACTIVE)
@@ -286,7 +311,7 @@ class MemoryLifecycleController:
                 flags &= ~int(MemoryStatus.ACTIVE)
             if promote:
                 flags |= int(MemoryStatus.PROMOTED)
-            elif demote:
+            elif demote or next_cognitive == CognitiveState.RETIRED:
                 flags &= ~int(MemoryStatus.PROMOTED)
             if replay:
                 flags |= int(MemoryStatus.REPLAY_QUEUED)
