@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 DDL = """
 PRAGMA foreign_keys = ON;
@@ -41,7 +41,10 @@ CREATE TABLE IF NOT EXISTS memory_nodes (
     created_generation INTEGER NOT NULL,
     updated_generation INTEGER NOT NULL,
     status_flags INTEGER NOT NULL DEFAULT 0,
-    support_count INTEGER NOT NULL DEFAULT 0
+    support_count INTEGER NOT NULL DEFAULT 0,
+    cognitive_state INTEGER NOT NULL DEFAULT 1,
+    validation_state INTEGER NOT NULL DEFAULT 4,
+    gate_id INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS memory_edges (
@@ -122,14 +125,107 @@ CREATE TABLE IF NOT EXISTS contradiction_records (
 
 CREATE INDEX IF NOT EXISTS idx_contradiction_memory_generation
 ON contradiction_records(memory_id, generation_id);
+
+CREATE TABLE IF NOT EXISTS candidate_provenance (
+    memory_id INTEGER PRIMARY KEY,
+    candidate_generation INTEGER NOT NULL,
+    provenance_games_json TEXT NOT NULL DEFAULT '[]',
+    provenance_contexts_json TEXT NOT NULL DEFAULT '[]',
+    scope_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS gate_trials (
+    gate_trial_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    memory_id INTEGER NOT NULL,
+    gate_id INTEGER NOT NULL,
+    candidate_generation INTEGER NOT NULL,
+    target_game TEXT,
+    target_context TEXT,
+    participated INTEGER NOT NULL CHECK(participated IN (0,1)),
+    contribution REAL NOT NULL DEFAULT 0,
+    causal_gain REAL NOT NULL DEFAULT 0,
+    prediction_gain REAL NOT NULL DEFAULT 0,
+    planning_gain REAL NOT NULL DEFAULT 0,
+    future_option_gain REAL NOT NULL DEFAULT 0,
+    terminal_gain REAL NOT NULL DEFAULT 0,
+    efficiency_gain REAL NOT NULL DEFAULT 0,
+    intervention_type TEXT NOT NULL,
+    paired_trial_id TEXT NOT NULL,
+    genuine INTEGER NOT NULL DEFAULT 0 CHECK(genuine IN (0,1)),
+    success INTEGER NOT NULL DEFAULT 0 CHECK(success IN (0,1)),
+    transfer_score REAL NOT NULL DEFAULT 0,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    generation_id INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_gate_trials_memory_gate
+ON gate_trials(memory_id, gate_id, genuine, generation_id, target_game, target_context);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_gate_trials_pair
+ON gate_trials(memory_id, gate_id, paired_trial_id);
+
+CREATE TABLE IF NOT EXISTS lifecycle_windows (
+    memory_id INTEGER PRIMARY KEY,
+    consecutive_low_windows INTEGER NOT NULL DEFAULT 0,
+    consecutive_harm_windows INTEGER NOT NULL DEFAULT 0,
+    consecutive_positive_windows INTEGER NOT NULL DEFAULT 0,
+    last_utility REAL NOT NULL DEFAULT 0,
+    last_generation INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS memory_tombstones (
+    memory_id INTEGER PRIMARY KEY,
+    level_id INTEGER NOT NULL,
+    type_id INTEGER NOT NULL,
+    canonical_key TEXT,
+    retired_generation INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    replacement_memory_id INTEGER,
+    provenance_pointer TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 
-def ensure_v7_schema(connection: sqlite3.Connection) -> None:
+def _columns(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")}
+
+
+def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
+    columns = _columns(connection, "memory_nodes")
+    additions = (
+        ("cognitive_state", "INTEGER NOT NULL DEFAULT 1"),
+        ("validation_state", "INTEGER NOT NULL DEFAULT 4"),
+        ("gate_id", "INTEGER NOT NULL DEFAULT 0"),
+    )
+    for name, declaration in additions:
+        if name not in columns:
+            connection.execute(f"ALTER TABLE memory_nodes ADD COLUMN {name} {declaration}")
     connection.executescript(DDL)
+    connection.execute("UPDATE v7_schema_meta SET schema_version=?", (SCHEMA_VERSION,))
+
+
+def ensure_v7_schema(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS v7_schema_meta (schema_version INTEGER NOT NULL)"
+    )
     row = connection.execute("SELECT schema_version FROM v7_schema_meta LIMIT 1").fetchone()
     if row is None:
-        connection.execute("INSERT INTO v7_schema_meta(schema_version) VALUES (?)", (SCHEMA_VERSION,))
-    elif int(row[0]) != SCHEMA_VERSION:
-        raise RuntimeError(f"unsupported v7 schema version {row[0]}; expected {SCHEMA_VERSION}")
+        connection.executescript(DDL)
+        connection.execute(
+            "INSERT INTO v7_schema_meta(schema_version) VALUES (?)",
+            (SCHEMA_VERSION,),
+        )
+    else:
+        version = int(row[0])
+        if version == 1:
+            _migrate_v1_to_v2(connection)
+        elif version == SCHEMA_VERSION:
+            connection.executescript(DDL)
+        else:
+            raise RuntimeError(
+                f"unsupported v7 schema version {version}; expected 1 or {SCHEMA_VERSION}"
+            )
     connection.commit()
