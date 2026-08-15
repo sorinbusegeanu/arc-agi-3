@@ -25,6 +25,8 @@ class ContextEpisodeEvidence(EpisodeEvidence):
     trajectory_segment_id: str = ""
     reset_boundary_before_step: bool = False
     future_option_observable: bool = True
+    decision_contingency_ids: tuple[int, ...] = ()
+    decision_memory_contributions: tuple[tuple[int, float], ...] = ()
 
     def __post_init__(self) -> None:
         contexts = tuple(int(value) for value in self.context_signatures)
@@ -39,5 +41,21 @@ class ContextEpisodeEvidence(EpisodeEvidence):
         ):
             contexts = contexts[:4]
             next_contexts = next_contexts[:4]
+        contributions = tuple(
+            sorted(
+                (
+                    (int(memory_id), float(value))
+                    for memory_id, value in self.decision_memory_contributions
+                    if float(value) != 0.0
+                ),
+                key=lambda item: item[0],
+            )
+        )
         object.__setattr__(self, "context_signatures", contexts)
         object.__setattr__(self, "next_context_signatures", next_contexts)
+        object.__setattr__(
+            self,
+            "decision_contingency_ids",
+            tuple(sorted(set(int(value) for value in self.decision_contingency_ids))),
+        )
+        object.__setattr__(self, "decision_memory_contributions", contributions)
