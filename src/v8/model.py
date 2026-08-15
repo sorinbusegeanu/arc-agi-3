@@ -7,7 +7,7 @@ from struct import Struct
 from typing import Iterable
 
 _MASK64 = (1 << 64) - 1
-_SCHEMA = b"arc-agi3-v8-memory-v3"
+_SCHEMA = b"arc-agi3-v8-memory-v2"
 
 
 class MemoryLevel(IntEnum):
