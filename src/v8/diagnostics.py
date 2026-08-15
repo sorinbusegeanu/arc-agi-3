@@ -49,22 +49,31 @@ def format_hypothesis_line(
     )
 
 
-def game_rates(rows: Iterable[GameProgress]) -> tuple[float, float]:
-    """Return game-level win and level-solved rates, invariant to actor lane count."""
+def game_summary(rows: Iterable[GameProgress]) -> tuple[float, float, int, int]:
+    """Return game-level rates plus distinct solved-game count and total games."""
     grouped: dict[str, list[GameProgress]] = defaultdict(list)
     for row in rows:
         grouped[str(row.game_id)].append(row)
     if not grouped:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0, 0
     games = len(grouped)
     won = sum(any(int(row.wins) > 0 for row in lane_rows) for lane_rows in grouped.values())
     solved_level = sum(
         any(int(row.levels_completed) > 0 for row in lane_rows)
         for lane_rows in grouped.values()
     )
-    return 100.0 * won / games, 100.0 * solved_level / games
+    return 100.0 * won / games, 100.0 * solved_level / games, int(won), int(games)
+
+
+def game_rates(rows: Iterable[GameProgress]) -> tuple[float, float]:
+    """Return game-level win and level-solved rates, invariant to actor lane count."""
+    win_rate, level_rate, _solved_games, _games = game_summary(rows)
+    return win_rate, level_rate
 
 
 def format_game_rate_line(rows: Iterable[GameProgress]) -> str:
-    win_rate, level_rate = game_rates(rows)
-    return f"wins={win_rate:.1f}% levels_solved={level_rate:.1f}%"
+    win_rate, level_rate, solved_games, games = game_summary(rows)
+    return (
+        f"wins={win_rate:.1f}% levels_solved={level_rate:.1f}% "
+        f"solved_games={solved_games}/{games}"
+    )
