@@ -10,17 +10,23 @@ from pathlib import Path
 
 from v8.arena import SharedActionArena, SharedEdgeArena, SharedNodeArena
 from v8.development import STAGES, stage_worker
+from v8.evaluation import ScientificHypothesisEvaluator
 from v8.model import (
     EventId,
     ExperienceEvent,
     MemoryLevel,
+    MemoryProposal,
+    MemoryUid,
     PIPELINE_PACKET_SIZE,
     PROPOSAL_PACKET_SIZE,
     PipelineEvent,
     encode_pipeline,
+    encode_proposal,
 )
+from v8.peers import DevelopmentalPeerSupervisor
 from v8.publication import LiveReadView, ShardReadDescriptor
 from v8.ring import SharedRingBuffer
+from v8.scheduler import ResourceController
 from v8.shard import ShardConfig, shard_worker
 from v8.snapshot import SnapshotResult, SnapshotService, restore_latest_snapshot
 
@@ -39,6 +45,8 @@ class V8RuntimeConfig:
     snapshot_interval_seconds: float = 60.0
     enable_snapshots: bool = True
     restore: bool = True
+    enable_peers: bool = True
+    peer_interval_seconds: float = 0.5
 
     @classmethod
     def from_path(cls, root: str | Path, **kwargs) -> "V8RuntimeConfig":
@@ -49,8 +57,8 @@ class V8RuntimeConfig:
             raise ValueError("shards and stage_workers must be positive")
         if self.stage_ring_capacity <= 0 or self.shard_ring_capacity <= 0:
             raise ValueError("ring capacities must be positive")
-        if self.snapshot_interval_seconds <= 0:
-            raise ValueError("snapshot_interval_seconds must be positive")
+        if self.snapshot_interval_seconds <= 0 or self.peer_interval_seconds <= 0:
+            raise ValueError("snapshot and peer intervals must be positive")
 
 
 class ContinuousMemoryRuntime:
@@ -66,6 +74,7 @@ class ContinuousMemoryRuntime:
         self._closed = False
         self._error_queue: mp.Queue = mp.Queue()
         self._watermark = mp.Value("Q", 0)
+        self._actor_throttle = mp.Value("d", 0.0)
         self._snapshot_id = 0
         self._submit_lock = threading.Lock()
 
@@ -171,6 +180,21 @@ class ContinuousMemoryRuntime:
         self._snapshot_thread: threading.Thread | None = None
         self._snapshot_thread_stop = threading.Event()
 
+        self.resource_controller = ResourceController()
+        self._resource_thread: threading.Thread | None = None
+        self._resource_thread_stop = threading.Event()
+        self.peers = (
+            DevelopmentalPeerSupervisor(
+                read_view=self.read_view,
+                submit_proposal=self.submit_proposal,
+                watermark=lambda: self.watermark,
+                interval_seconds=config.peer_interval_seconds,
+            )
+            if config.enable_peers
+            else None
+        )
+        self.hypothesis_evaluator = ScientificHypothesisEvaluator()
+
     @property
     def watermark(self) -> int:
         with self._watermark.get_lock():
@@ -191,6 +215,14 @@ class ContinuousMemoryRuntime:
                 daemon=True,
             )
             self._snapshot_thread.start()
+        if self.peers is not None:
+            self.peers.start()
+        self._resource_thread = threading.Thread(
+            target=self._resource_cadence,
+            name="v8-resource-controller",
+            daemon=True,
+        )
+        self._resource_thread.start()
         self._started = True
 
     def _snapshot_cadence(self) -> None:
@@ -200,6 +232,23 @@ class ContinuousMemoryRuntime:
                 return
             self._snapshot_id += 1
             self.snapshot_service.request_latest(self._snapshot_id, self.watermark)
+
+    def _resource_cadence(self) -> None:
+        while not self._resource_thread_stop.wait(0.5):
+            if self._closed:
+                return
+            decision = self.resource_controller.decide(
+                stage_depths=tuple(ring.qsize for ring in self._stage_rings),
+                shard_depths=tuple(ring.qsize for ring in self._shard_rings),
+                stage_capacity=self.config.stage_ring_capacity,
+                shard_capacity=self.config.shard_ring_capacity,
+                memory_count=self.read_view.memory_count,
+                memory_capacity=self.config.node_capacity_per_shard * self.config.shards,
+            )
+            with self._actor_throttle.get_lock():
+                self._actor_throttle.value = float(decision.actor_throttle_seconds)
+            if self.peers is not None:
+                self.peers.set_interval(decision.peer_interval_seconds)
 
     def make_experience(
         self,
@@ -217,6 +266,7 @@ class ContinuousMemoryRuntime:
         changed_cells: int = 0,
         terminal_polarity: int = 0,
         trajectory_signature: int = 0,
+        next_context_signature: int = 0,
     ) -> ExperienceEvent:
         return ExperienceEvent(
             event_id=EventId.from_producer(producer_id, producer_sequence),
@@ -234,6 +284,7 @@ class ContinuousMemoryRuntime:
             changed_cells=int(changed_cells),
             terminal_polarity=int(terminal_polarity),
             trajectory_signature=int(trajectory_signature),
+            next_context_signature=int(next_context_signature),
         )
 
     def submit(self, event: ExperienceEvent, *, timeout: float = 1.0) -> None:
@@ -257,6 +308,18 @@ class ContinuousMemoryRuntime:
                     raise TimeoutError("M0 experience ring remained full")
                 self._watermark.value = max(current, assigned)
             self._submitted_event_ids.add(event_key)
+
+    def submit_proposal(self, proposal: MemoryProposal, *, timeout: float = 0.25) -> None:
+        if self._closed or self._stop.is_set():
+            return
+        shard = proposal.uid.shard(len(self._shard_rings))
+        deadline = time.monotonic() + float(timeout)
+        payload = encode_proposal(proposal)
+        while not self._stop.is_set():
+            if self._shard_rings[shard].put(payload, timeout=0.05):
+                return
+            if time.monotonic() >= deadline:
+                return
 
     def raise_worker_errors(self) -> None:
         errors = []
@@ -292,6 +355,39 @@ class ContinuousMemoryRuntime:
             time.sleep(0.01)
         raise TimeoutError("v8 did not reach quiescence; " + json.dumps(self.metrics(), sort_keys=True))
 
+    def scientific_statuses(self) -> dict[str, str]:
+        if self.peers is None:
+            return {f"H{i:02d}": "INSUFFICIENT_EVIDENCE" for i in range(1, 16)}
+        decisions = self.hypothesis_evaluator.evaluate(self.peers.ledger.cut(self.watermark))
+        return self.hypothesis_evaluator.status_map(decisions)
+
+    def write_scientific_report(self) -> None:
+        if self.peers is None:
+            return
+        cut = self.peers.ledger.cut(self.watermark)
+        self.peers.ledger.export_jsonl(self.root / "evidence" / "v8_evidence.jsonl", watermark=self.watermark)
+        self.hypothesis_evaluator.write_report(self.root / "reports" / "h01_h15.json", cut)
+
+    def record_actor_results(self, results) -> None:
+        if self.peers is None:
+            return
+        from v8.evidence import EvidenceRecord
+        for result in results:
+            if int(getattr(result, "replans", 0)) <= 0:
+                continue
+            self.peers.ledger.append(
+                EvidenceRecord.for_uid(
+                    f"replanning:{result.actor_id}:{self.watermark}",
+                    MemoryUid.zero(),
+                    evidence_kind="replanning_recovery",
+                    watermark=self.watermark,
+                    raw_value=float(result.replans),
+                    normalized_value=1.0,
+                    developmental_stage=int(MemoryLevel.M7),
+                    validation_state=3,
+                )
+            )
+
     def request_snapshot(self) -> None:
         if self.snapshot_service is None:
             return
@@ -305,9 +401,15 @@ class ContinuousMemoryRuntime:
         return self.snapshot_service.request_final(self._snapshot_id, self.watermark, timeout=timeout)
 
     def metrics(self) -> dict[str, object]:
-        saved_watermark = (
-            0 if self.snapshot_service is None else int(self.snapshot_service.saved_watermark.value)
-        )
+        saved_watermark = 0 if self.snapshot_service is None else int(self.snapshot_service.saved_watermark.value)
+        peer_metrics = None if self.peers is None else self.peers.metrics().__dict__ if hasattr(self.peers.metrics(), "__dict__") else {
+            "cycles": self.peers.metrics().cycles,
+            "proposals": self.peers.metrics().proposals,
+            "evidence_records": self.peers.metrics().evidence_records,
+            "interval_seconds": self.peers.metrics().interval_seconds,
+        }
+        with self._actor_throttle.get_lock():
+            throttle = float(self._actor_throttle.value)
         return {
             "watermark": self.watermark,
             "saved_watermark": saved_watermark,
@@ -320,6 +422,8 @@ class ContinuousMemoryRuntime:
             "stage_inflight": [int(value.value) for value in self._stage_inflight],
             "shard_inflight": [int(value.value) for value in self._shard_inflight],
             "shard_watermarks": [int(value.value) for value in self._shard_watermarks],
+            "actor_throttle_seconds": throttle,
+            "peers": peer_metrics,
         }
 
     def close(self, *, normal: bool = True, timeout: float = 120.0) -> SnapshotResult | None:
@@ -329,12 +433,19 @@ class ContinuousMemoryRuntime:
             self.start()
         self._accepting = False
         self._snapshot_thread_stop.set()
+        self._resource_thread_stop.set()
         if self._snapshot_thread is not None:
             self._snapshot_thread.join(timeout=2.0)
+        if self._resource_thread is not None:
+            self._resource_thread.join(timeout=2.0)
 
         final_result = None
         if normal:
+            if self.peers is not None:
+                self.peers.run_once()
+                self.peers.close()
             self.wait_quiescent(timeout=timeout)
+            self.write_scientific_report()
             if self.snapshot_service is not None:
                 final_result = self.final_snapshot(timeout=timeout)
                 if int(final_result.watermark) != int(self.watermark):
@@ -352,6 +463,8 @@ class ContinuousMemoryRuntime:
                     ),
                     encoding="utf-8",
                 )
+        elif self.peers is not None:
+            self.peers.close()
 
         self._stop.set()
         for process in (*self._stage_processes, *self._shard_processes):
