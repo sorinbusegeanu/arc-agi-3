@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from v8.arena import NodeRecord
-from v8.isf import score_memory
+from v8.isf import developmental_stage_snapshot, score_memory
 from v8.model import CognitiveState, MemoryLevel, MemoryType, MemoryUid, ValidationState
 
 
@@ -32,21 +32,32 @@ class LifecycleController:
         self.demotion_threshold = float(demotion_threshold)
         self.min_support = int(min_support)
         self.developmental_stage = 0
+        _stage, self._stage_revision = developmental_stage_snapshot()
+        self._stage_explicit = False
         self._low_windows: dict[MemoryUid, int] = {}
 
     def set_developmental_stage(self, stage: int) -> None:
         self.developmental_stage = max(0, min(6, int(stage)))
+        _stage, self._stage_revision = developmental_stage_snapshot()
+        self._stage_explicit = True
+
+    def _sync_published_stage(self) -> None:
+        if self._stage_explicit:
+            return
+        stage, revision = developmental_stage_snapshot()
+        if revision > self._stage_revision:
+            self.developmental_stage = stage
+            self._stage_revision = revision
 
     def fitness(self, row: NodeRecord) -> float:
+        self._sync_published_stage()
         base = score_memory(row, developmental_stage=self.developmental_stage).total
         validation_bonus = (
             0.10
             if int(row.validation_state) >= int(ValidationState.VALIDATED)
             else 0.0
         )
-        reliability_bonus = 0.10 * max(
-            0.0, min(1.0, row.strategy_reliability)
-        )
+        reliability_bonus = 0.10 * max(0.0, min(1.0, row.strategy_reliability))
         return min(1.0, base + validation_bonus + reliability_bonus)
 
     def decide(self, row: NodeRecord) -> LifecycleDecision | None:
@@ -68,9 +79,7 @@ class LifecycleController:
                 int(CognitiveState.REACTIVATED),
             }
         ):
-            self._low_windows[row.uid] = max(
-                3, self._low_windows.get(row.uid, 0)
-            )
+            self._low_windows[row.uid] = max(3, self._low_windows.get(row.uid, 0))
             return LifecycleDecision(
                 row.uid,
                 int(CognitiveState.QUARANTINED),
@@ -156,6 +165,7 @@ class LifecycleController:
     def state_dict(self) -> dict[str, object]:
         return {
             "developmental_stage": self.developmental_stage,
+            "stage_revision": self._stage_revision,
             "low_windows": [
                 {"uid": [uid.hi, uid.lo], "windows": windows}
                 for uid, windows in self._low_windows.items()
@@ -165,7 +175,10 @@ class LifecycleController:
     def load_state(self, state: dict[str, object] | None) -> None:
         if not state:
             return
-        self.set_developmental_stage(int(state.get("developmental_stage", 0)))
+        self.developmental_stage = max(0, min(6, int(state.get("developmental_stage", 0))))
+        _stage, current_revision = developmental_stage_snapshot()
+        self._stage_revision = max(current_revision, int(state.get("stage_revision", 0)))
+        self._stage_explicit = False
         for raw in state.get("low_windows", []):
             if not isinstance(raw, dict):
                 continue
