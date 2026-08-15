@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from v8.arena import NodeRecord
-from v8.isf import ISFScore, score_memory
+from v8.isf import ISFScore, infer_developmental_stage, score_memory
 from v8.model import CognitiveState, MemoryUid
 
 
@@ -20,6 +20,7 @@ class ReplayScheduler:
 
     def __init__(self, *, min_priority: float = 0.25) -> None:
         self.min_priority = float(min_priority)
+        self.last_developmental_stage = 0
 
     def candidates(
         self,
@@ -27,6 +28,11 @@ class ReplayScheduler:
         *,
         budget: int,
     ) -> tuple[ReplayCandidate, ...]:
+        # Stage_t is inferred once from the input published cut and held fixed for
+        # every score generated in this interval. Evidence created later in the
+        # interval may only influence the next call/Stage_(t+1).
+        stage = infer_developmental_stage(rows)
+        self.last_developmental_stage = stage
         ranked: list[ReplayCandidate] = []
         for row in rows:
             if int(row.cognitive_state) in {
@@ -34,7 +40,7 @@ class ReplayScheduler:
                 int(CognitiveState.RETIRE_PENDING),
             }:
                 continue
-            score = score_memory(row)
+            score = score_memory(row, developmental_stage=stage)
             novelty = 1.0 / max(1.0, float(row.support_count))
             priority = score.total + 0.10 * novelty
             if priority < self.min_priority:
