@@ -51,13 +51,26 @@ class TransferValidator:
         if not eligible:
             return ()
 
-        # Preserve the existing peer call shape while switching the evidence source
-        # from node recurrence/priors to canonical scored SIMILAR_TO relations.
         if not edges and provenance is not None:
             owner = getattr(provenance, "__self__", None)
             edge_records = getattr(owner, "edge_records", None)
             if callable(edge_records):
                 edges = tuple(edge_records())
+
+        # Keep the standalone legacy API useful for old unit callers. Production
+        # peers always provide exact provenance and therefore use scored graph edges.
+        if not edges and provenance is None:
+            result = []
+            for row in eligible.values():
+                games = int(row.game_evidence_count)
+                recurrence = min(1.0, games / 4.0) * min(
+                    1.0, max(1, row.support_count) / 8.0
+                )
+                if games >= 2 and recurrence > 0.0:
+                    result.append(
+                        TransferCandidate(row.uid, games, recurrence)
+                    )
+            return tuple(result)
 
         def games(uid: MemoryUid) -> tuple[int, ...]:
             row = eligible.get(uid)
