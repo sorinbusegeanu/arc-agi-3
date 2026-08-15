@@ -10,6 +10,7 @@ from v8.actor import ActorJob, run_actor_jobs
 from v8.capacity import plan_capacities
 from v8.diagnostics import format_game_rate_line, format_hypothesis_line
 from v8.runtime import ContinuousMemoryRuntime, V8RuntimeConfig
+from v8.snapshot import latest_complete_snapshot
 
 
 def _runtime_config(args, *, total_steps: int = 0) -> V8RuntimeConfig:
@@ -107,6 +108,21 @@ def _log(message: str) -> None:
     print(f'[{time.strftime("%H:%M")}] {message}', flush=True)
 
 
+def _graph_load_line(
+    *,
+    snapshot_path: Path | None,
+    restore_enabled: bool,
+    nodes: int,
+) -> str:
+    if not restore_enabled:
+        source = "empty(--no-restore)"
+    elif snapshot_path is None:
+        source = "empty(no-snapshot)"
+    else:
+        source = str(snapshot_path)
+    return f"graph source={source} nodes={int(nodes)}"
+
+
 def run_continuous(args) -> int:
     from v7.game_sets import resolve_game_selector
 
@@ -120,13 +136,23 @@ def run_continuous(args) -> int:
         epsilon=args.epsilon,
     )
     total_steps = sum(int(job.steps) for job in jobs)
+    restore_enabled = not args.no_restore
+    restore_source = latest_complete_snapshot(args.root) if restore_enabled else None
     runtime = ContinuousMemoryRuntime(_runtime_config(args, total_steps=total_steps))
+    loaded_nodes = runtime.read_view.memory_count
     try:
         runtime.start()
         print(
             f"v8 continuous: games={len(games)} actors={len(jobs)} shards={args.shards} "
             f"stage_workers={args.stage_workers} snapshots={'off' if args.no_snapshots else 'async'}",
             flush=True,
+        )
+        _log(
+            _graph_load_line(
+                snapshot_path=restore_source,
+                restore_enabled=restore_enabled,
+                nodes=loaded_nodes,
+            )
         )
         _log(format_hypothesis_line())
         results = run_actor_jobs(
