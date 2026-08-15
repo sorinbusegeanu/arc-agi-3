@@ -110,13 +110,15 @@ def _raw_probe_strength(view, memory_id: MemoryId) -> float:
     if validation == int(GateValidationState.TRUSTED):
         return strength
     if validation == int(GateValidationState.VALIDATED):
-        return 0.85 * strength
+        return 0.90 * strength
     if validation in {
         int(GateValidationState.PROBE_ELIGIBLE),
         int(GateValidationState.TRANSFER_TESTED),
     }:
-        return 0.55 * strength
-    return 0.20 * strength
+        # Probe lanes are already rare and explicitly isolated. Artificially
+        # shrinking them below the gate threshold made validation impossible.
+        return strength
+    return 0.35 * strength
 
 
 def _probe_component_weight(node) -> float:
@@ -156,12 +158,12 @@ def _maybe_select_probe(
     rng: Random,
     epsilon: float,
 ):
-    """Occasionally enable one PROBE_ONLY memory for a controlled on/off decision probe."""
+    """Occasionally enable one PROBE_ONLY memory without degrading action rank."""
     probe_probability = min(0.10, max(0.02, float(epsilon)))
     if probe_probability <= 0.0 or rng.random() >= probe_probability:
         return selection, None, 0.0
     by_action = {int(row.action_id): row for row in decisions}
-    best: tuple[float, int, int] | None = None
+    best: tuple[float, float, int, int] | None = None
     for context in contexts.signatures:
         rows = view.probe_score_inputs(
             context_signature=int(context),
@@ -187,16 +189,33 @@ def _maybe_select_probe(
                 contribution = weight * max(0.0, enabled_strength - active_strength)
                 if contribution <= 0.0:
                     continue
-                candidate = (float(contribution), -int(row.action_id), -int(memory_id))
+                augmented_score = float(decision.score) + float(contribution)
+                candidate = (
+                    augmented_score,
+                    float(contribution),
+                    -int(row.action_id),
+                    -int(memory_id),
+                )
                 if best is None or candidate > best:
                     best = candidate
     if best is None:
         return selection, None, 0.0
-    contribution, neg_action, neg_memory = best
+
+    augmented_score, contribution, neg_action, neg_memory = best
     action_id = -neg_action
     memory_id = MemoryId(-neg_memory)
+    selected_action = int(selection.decision.action_id)
+    selected_score = float(selection.decision.score)
+
+    # A probe may change the action only if enabling the candidate makes that
+    # action genuinely outrank the already selected action. Explicit exploration
+    # is never cancelled by a probe for another action.
+    if action_id != selected_action:
+        if str(selection.mode) == "exploration" or augmented_score <= selected_score:
+            return selection, None, 0.0
+
     decision = by_action[action_id]
-    decision = replace(decision, score=float(decision.score) + contribution)
+    decision = replace(decision, score=float(augmented_score))
     return (
         replace(selection, decision=decision, mode="probe", strategy_id=None),
         memory_id,
