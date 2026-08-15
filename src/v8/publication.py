@@ -240,6 +240,12 @@ class LiveReadView:
                 continue
             action = signed_u64(int(row.key_parts[0]))
             outcome = MemoryUid(int(row.key_parts[1]), int(row.key_parts[2]))
+            # Strategies are cognitively admissible only while their represented
+            # outcome class is itself active. This is required for operational M6
+            # split/demotion: an invalidated coarse outcome cannot keep directing
+            # behavior through an otherwise-active M7 strategy.
+            if outcome not in active_uids:
+                continue
             if outcome in suppressed:
                 continue
             context_bucket = int(row.key_parts[3])
