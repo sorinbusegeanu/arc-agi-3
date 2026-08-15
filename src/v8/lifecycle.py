@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from v8.arena import NodeRecord
 from v8.isf import score_memory
-from v8.model import CognitiveState, MemoryLevel, MemoryUid, ValidationState
+from v8.model import CognitiveState, MemoryLevel, MemoryType, MemoryUid, ValidationState
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,8 +36,14 @@ class LifecycleController:
     @staticmethod
     def fitness(row: NodeRecord) -> float:
         base = score_memory(row).total
-        validation_bonus = 0.10 if int(row.validation_state) >= int(ValidationState.VALIDATED) else 0.0
-        reliability_bonus = 0.10 * max(0.0, min(1.0, row.strategy_reliability))
+        validation_bonus = (
+            0.10
+            if int(row.validation_state) >= int(ValidationState.VALIDATED)
+            else 0.0
+        )
+        reliability_bonus = 0.10 * max(
+            0.0, min(1.0, row.strategy_reliability)
+        )
         return min(1.0, base + validation_bonus + reliability_bonus)
 
     def decide(self, row: NodeRecord) -> LifecycleDecision | None:
@@ -46,6 +52,35 @@ class LifecycleController:
         fitness = self.fitness(row)
         current = int(row.cognitive_state)
         validation = int(row.validation_state)
+
+        # A coarse M6 outcome (two-part descriptor) is a learned merge over
+        # persistent fine-grained outcome members. Failed validation invalidates
+        # only the coarse class. Quarantining it immediately removes its
+        # SUPERSEDES effect from the actor read view, exposing the original member
+        # outcomes again without destroying their identities or provenance.
+        if (
+            int(row.level) == int(MemoryLevel.M6)
+            and int(row.memory_type) == int(MemoryType.OUTCOME)
+            and len(row.key_parts) == 2
+            and validation == int(ValidationState.FAILED)
+            and current
+            in {
+                int(CognitiveState.ACTIVE),
+                int(CognitiveState.VALIDATED),
+                int(CognitiveState.REACTIVATED),
+            }
+        ):
+            self._low_windows[row.uid] = max(
+                3, self._low_windows.get(row.uid, 0)
+            )
+            return LifecycleDecision(
+                row.uid,
+                int(CognitiveState.QUARANTINED),
+                validation,
+                fitness,
+                "failed coarse outcome validation; split to persistent members",
+            )
+
         if row.support_count >= self.min_support and fitness >= self.promotion_threshold:
             self._low_windows.pop(row.uid, None)
             state = int(
@@ -54,7 +89,11 @@ class LifecycleController:
                 else CognitiveState.ACTIVE
             )
             if state != current:
-                reason = "reactivated by renewed evidence" if current == int(CognitiveState.RETIRED) else "sustained promotion evidence"
+                reason = (
+                    "reactivated by renewed evidence"
+                    if current == int(CognitiveState.RETIRED)
+                    else "sustained promotion evidence"
+                )
                 return LifecycleDecision(row.uid, state, validation, fitness, reason)
             return None
         if fitness <= self.demotion_threshold:
@@ -131,6 +170,6 @@ class LifecycleController:
             if not isinstance(raw, dict):
                 continue
             uid_raw = raw.get("uid", [0, 0])
-            self._low_windows[MemoryUid(int(uid_raw[0]), int(uid_raw[1]))] = int(
-                raw.get("windows", 0)
-            )
+            self._low_windows[
+                MemoryUid(int(uid_raw[0]), int(uid_raw[1]))
+            ] = int(raw.get("windows", 0))
