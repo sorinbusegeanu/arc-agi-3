@@ -62,7 +62,7 @@ def _signature(parts: Iterable[int], *, person: bytes) -> int:
 class BoundedNeighborhoodSimilarity:
     """Incremental radius-1 typed graph similarity over M3 roles and M4 concepts.
 
-    Canonical identity is never changed.  The service only returns bounded
+    Canonical identity is never changed. The service only returns bounded
     structural correspondence candidates for later SIMILAR_TO reduction and
     held-out transfer testing.
     """
@@ -114,6 +114,7 @@ class BoundedNeighborhoodSimilarity:
         neighbor_types: dict[MemoryUid, Counter[int]] = defaultdict(Counter)
         dependencies: dict[MemoryUid, list[int]] = defaultdict(list)
         enable_block: dict[MemoryUid, list[int]] = defaultdict(list)
+        consequence_neighbors: dict[MemoryUid, list[int]] = defaultdict(list)
         versions: dict[MemoryUid, int] = {
             row.uid: int(row.updated_watermark) for row in nodes if row.uid in eligible
         }
@@ -135,6 +136,8 @@ class BoundedNeighborhoodSimilarity:
                     dependencies[src.uid].extend((relation, int(dst.level), int(dst.memory_type)))
                 if relation in {int(RelationType.ENABLES), int(RelationType.BLOCKS)}:
                     enable_block[src.uid].extend((relation, int(dst.level), int(dst.memory_type)))
+                if int(dst.level) >= int(MemoryLevel.M5):
+                    consequence_neighbors[src.uid].append(int(dst.fingerprint))
             if dst.uid in eligible:
                 incoming[dst.uid][relation] += 1
                 neighbor_levels[dst.uid][int(src.level)] += 1
@@ -154,14 +157,9 @@ class BoundedNeighborhoodSimilarity:
             context = 0
             if int(row.memory_type) == int(MemoryType.CONTEXTUAL_ROLE) and row.key_parts:
                 context = int(row.key_parts[0])
-            consequence_neighbors = sorted(
-                int(by_uid[edge.target_uid].fingerprint)
-                for edge in edges
-                if edge.source_uid == row.uid
-                and edge.target_uid in by_uid
-                and int(by_uid[edge.target_uid].level) >= int(MemoryLevel.M5)
+            consequence = _signature(
+                sorted(consequence_neighbors[row.uid]), person=b"v8-sim-conseq"
             )
-            consequence = _signature(consequence_neighbors, person=b"v8-sim-conseq")
             result[row.uid] = NeighborhoodDescriptor(
                 uid=row.uid,
                 level=int(row.level),
@@ -170,8 +168,12 @@ class BoundedNeighborhoodSimilarity:
                 outgoing_relations=tuple(sorted(outgoing[row.uid].items())),
                 neighbor_levels=tuple(sorted(neighbor_levels[row.uid].items())),
                 neighbor_types=tuple(sorted(neighbor_types[row.uid].items())),
-                dependency_signature=_signature(sorted(dependencies[row.uid]), person=b"v8-sim-dep"),
-                enable_block_signature=_signature(sorted(enable_block[row.uid]), person=b"v8-sim-enblk"),
+                dependency_signature=_signature(
+                    sorted(dependencies[row.uid]), person=b"v8-sim-dep"
+                ),
+                enable_block_signature=_signature(
+                    sorted(enable_block[row.uid]), person=b"v8-sim-enblk"
+                ),
                 future_option_bucket=_bucket(row.future_option_delta),
                 consequence_bucket=int(consequence),
                 context_bucket=int(context),
@@ -181,12 +183,12 @@ class BoundedNeighborhoodSimilarity:
 
     @staticmethod
     def score(a: NeighborhoodDescriptor, b: NeighborhoodDescriptor) -> SimilarityEvidence:
-        relation = 0.5 * _hist_similarity(a.incoming_relations, b.incoming_relations) + 0.5 * _hist_similarity(
-            a.outgoing_relations, b.outgoing_relations
-        )
-        level_type = 0.5 * _hist_similarity(a.neighbor_levels, b.neighbor_levels) + 0.5 * _hist_similarity(
-            a.neighbor_types, b.neighbor_types
-        )
+        relation = 0.5 * _hist_similarity(
+            a.incoming_relations, b.incoming_relations
+        ) + 0.5 * _hist_similarity(a.outgoing_relations, b.outgoing_relations)
+        level_type = 0.5 * _hist_similarity(
+            a.neighbor_levels, b.neighbor_levels
+        ) + 0.5 * _hist_similarity(a.neighbor_types, b.neighbor_types)
         dependency = None
         if a.dependency_signature and b.dependency_signature:
             dependency = 1.0 if a.dependency_signature == b.dependency_signature else 0.0
@@ -211,7 +213,9 @@ class BoundedNeighborhoodSimilarity:
             components.append((0.05, enable))
         if consequence is not None:
             components.append((0.10, consequence))
-        total = sum(weight * value for weight, value in components) / sum(weight for weight, _ in components)
+        total = sum(weight * value for weight, value in components) / sum(
+            weight for weight, _ in components
+        )
         source, target = sorted((a.uid, b.uid))
         return SimilarityEvidence(
             source_uid=source,
@@ -224,13 +228,17 @@ class BoundedNeighborhoodSimilarity:
             future_option_score=float(future),
             consequence_score=consequence,
             context_score=float(context),
-            evidence_watermark=max(int(a.descriptor_version), int(b.descriptor_version)),
+            evidence_watermark=max(
+                int(a.descriptor_version), int(b.descriptor_version)
+            ),
         )
 
     @staticmethod
     def _relation_bucket(descriptor: NeighborhoodDescriptor) -> int:
         flat: list[int] = []
-        for relation, count in descriptor.incoming_relations + descriptor.outgoing_relations:
+        for relation, count in (
+            descriptor.incoming_relations + descriptor.outgoing_relations
+        ):
             flat.extend((int(relation), min(7, int(count))))
         return _signature(flat, person=b"v8-sim-rel") & 0xF
 
@@ -240,7 +248,9 @@ class BoundedNeighborhoodSimilarity:
         edges: Iterable[EdgeRecord],
     ) -> tuple[SimilarityEvidence, ...]:
         descriptors = self.descriptors(nodes, edges)
-        index: dict[tuple[int, int, int, int], list[NeighborhoodDescriptor]] = defaultdict(list)
+        index: dict[
+            tuple[int, int, int, int], list[NeighborhoodDescriptor]
+        ] = defaultdict(list)
         fallback: dict[tuple[int, int], list[NeighborhoodDescriptor]] = defaultdict(list)
         for descriptor in sorted(descriptors.values(), key=lambda item: item.uid):
             index[
@@ -256,7 +266,8 @@ class BoundedNeighborhoodSimilarity:
         dirty = [
             descriptor
             for descriptor in sorted(descriptors.values(), key=lambda item: item.uid)
-            if descriptor.descriptor_version > self._processed_versions.get(descriptor.uid, -1)
+            if descriptor.descriptor_version
+            > self._processed_versions.get(descriptor.uid, -1)
         ]
         results: dict[tuple[MemoryUid, MemoryUid], SimilarityEvidence] = {}
         for descriptor in dirty:
@@ -275,14 +286,18 @@ class BoundedNeighborhoodSimilarity:
                     )
                 )
             if len(candidates) < self.max_candidates:
-                candidates.extend(fallback.get((descriptor.level, descriptor.memory_type), ()))
+                candidates.extend(
+                    fallback.get((descriptor.level, descriptor.memory_type), ())
+                )
             unique_candidates = {
                 candidate.uid: candidate
                 for candidate in candidates
                 if candidate.uid != descriptor.uid
             }
             scored: list[SimilarityEvidence] = []
-            for candidate in sorted(unique_candidates.values(), key=lambda item: item.uid)[: self.max_candidates]:
+            for candidate in sorted(
+                unique_candidates.values(), key=lambda item: item.uid
+            )[: self.max_candidates]:
                 self.candidate_comparisons += 1
                 evidence = self.score(descriptor, candidate)
                 if evidence.score >= self.threshold:
@@ -303,7 +318,11 @@ class BoundedNeighborhoodSimilarity:
         return {
             "version": 1,
             "processed_versions": [
-                {"hi": uid.hi, "lo": uid.lo, "descriptor_version": version}
+                {
+                    "hi": uid.hi,
+                    "lo": uid.lo,
+                    "descriptor_version": version,
+                }
                 for uid, version in sorted(self._processed_versions.items())
             ],
             "candidate_comparisons": self.candidate_comparisons,
@@ -322,8 +341,10 @@ class BoundedNeighborhoodSimilarity:
                 int(raw.get("descriptor_version", 0)),
             )
         self.candidate_comparisons = max(
-            self.candidate_comparisons, int(state.get("candidate_comparisons", 0))
+            self.candidate_comparisons,
+            int(state.get("candidate_comparisons", 0)),
         )
         self.processed_descriptors = max(
-            self.processed_descriptors, int(state.get("processed_descriptors", 0))
+            self.processed_descriptors,
+            int(state.get("processed_descriptors", 0)),
         )
