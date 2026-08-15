@@ -7,7 +7,8 @@ from typing import Iterable, Mapping
 from v7.memory.ids import MemoryId
 from v7.memory.models import MemoryNode, MemoryScore, NodeMutation
 from v7.memory.read_view import MemoryReadView
-from v7.memory.status import MemoryStatus
+from v7.memory.state import CognitiveState, GateId, GateValidationState, is_gate_validated
+from v7.memory.status import MemoryStatus, memory_cognitive_state, memory_validation_state
 from v7.memory.writer import CanonicalMemoryWriter
 
 
@@ -30,6 +31,12 @@ class LifecyclePolicy:
     empirical_transfer_weight: float = 0.075
     explanatory_weight: float = 0.15
     support_weight: float = 0.05
+    probe_after_low_windows: int = 2
+    quarantine_after_low_windows: int = 4
+    quarantine_after_harm_windows: int = 2
+    retire_after_low_windows: int = 8
+    retire_after_harm_windows: int = 4
+    reactivate_after_positive_windows: int = 2
 
     def __post_init__(self) -> None:
         if self.minimum_promotion_support < 1:
@@ -41,6 +48,21 @@ class LifecyclePolicy:
                 raise ValueError("lifecycle thresholds must be non-negative")
         if self.retain_threshold > self.promote_threshold:
             raise ValueError("retain_threshold cannot exceed promote_threshold")
+        if min(
+            self.probe_after_low_windows,
+            self.quarantine_after_low_windows,
+            self.quarantine_after_harm_windows,
+            self.retire_after_low_windows,
+            self.retire_after_harm_windows,
+            self.reactivate_after_positive_windows,
+        ) < 1:
+            raise ValueError("lifecycle window thresholds must be positive")
+        if self.quarantine_after_low_windows < self.probe_after_low_windows:
+            raise ValueError("quarantine window cannot precede probe-only window")
+        if self.retire_after_low_windows < self.quarantine_after_low_windows:
+            raise ValueError("retirement cannot precede low-utility quarantine")
+        if self.retire_after_harm_windows < self.quarantine_after_harm_windows:
+            raise ValueError("retirement cannot precede harm quarantine")
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +76,15 @@ class LifecycleDecision:
     next_flags: int
     empirical_transfer: float = 0.0
     contradiction_severity: float = 0.0
+    previous_cognitive_state: int = int(CognitiveState.ACTIVE)
+    next_cognitive_state: int = int(CognitiveState.ACTIVE)
+
+    @property
+    def retired(self) -> bool:
+        return (
+            self.previous_cognitive_state != int(CognitiveState.RETIRED)
+            and self.next_cognitive_state == int(CognitiveState.RETIRED)
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,7 +131,7 @@ class ReplayQueue:
 
 
 class MemoryLifecycleController:
-    """Evaluate retention, replay and promotion state from one immutable generation."""
+    """Evaluate retention/replay without treating fitness as scientific validation."""
 
     REPLAY_PE = 1 << 0
     REPLAY_LV = 1 << 1
@@ -169,6 +200,54 @@ class MemoryLifecycleController:
             priority = max(priority, contradiction)
         return reason, priority
 
+    @staticmethod
+    def _scientifically_valid(node: MemoryNode) -> bool:
+        if int(getattr(node, "gate_id", GateId.NONE)) == int(GateId.NONE):
+            return True
+        state = memory_validation_state(node)
+        return state is not None and is_gate_validated(state)
+
+    def _window_state(
+        self,
+        node: MemoryNode,
+        fitness: float,
+        *,
+        window: tuple[int, int, int] | None,
+        legacy_demote: bool,
+    ) -> CognitiveState:
+        current = memory_cognitive_state(node) or CognitiveState.ACTIVE
+        validation = memory_validation_state(node) or GateValidationState.VALIDATED
+        if current == CognitiveState.RETIRED:
+            return current
+        if validation == GateValidationState.REJECTED:
+            return CognitiveState.QUARANTINED
+        if not self._scientifically_valid(node):
+            return (
+                CognitiveState.QUARANTINED
+                if current == CognitiveState.QUARANTINED
+                else CognitiveState.PROBE_ONLY
+            )
+        if window is None:
+            return CognitiveState.QUARANTINED if legacy_demote else CognitiveState.ACTIVE
+        low_windows, harm_windows, positive_windows = (int(value) for value in window)
+        p = self.policy
+        if (
+            harm_windows >= p.retire_after_harm_windows
+            or low_windows >= p.retire_after_low_windows
+        ):
+            return CognitiveState.RETIRED
+        if harm_windows >= p.quarantine_after_harm_windows:
+            return CognitiveState.QUARANTINED
+        if low_windows >= p.quarantine_after_low_windows:
+            return CognitiveState.QUARANTINED
+        if low_windows >= p.probe_after_low_windows:
+            return CognitiveState.PROBE_ONLY
+        if positive_windows >= p.reactivate_after_positive_windows:
+            return CognitiveState.ACTIVE
+        if current in {CognitiveState.PROBE_ONLY, CognitiveState.QUARANTINED}:
+            return current
+        return CognitiveState.ACTIVE
+
     def evaluate(
         self,
         view: MemoryReadView,
@@ -176,6 +255,7 @@ class MemoryLifecycleController:
         *,
         empirical_transfer: Mapping[MemoryId, float] | None = None,
         contradiction_severity: Mapping[MemoryId, float] | None = None,
+        lifecycle_windows: Mapping[MemoryId, tuple[int, int, int]] | None = None,
     ) -> tuple[LifecycleDecision, ...]:
         ids = tuple(
             sorted(
@@ -185,6 +265,7 @@ class MemoryLifecycleController:
         )
         transfer = empirical_transfer or {}
         contradictions = contradiction_severity or {}
+        windows = lifecycle_windows
         decisions: list[LifecycleDecision] = []
         for memory_id in ids:
             node = view.nodes.get(memory_id)
@@ -198,26 +279,44 @@ class MemoryLifecycleController:
                 node.support_count >= self.policy.minimum_promotion_support
                 and fitness >= self.policy.promote_threshold
             )
-            demote = not promote and fitness < self.policy.retain_threshold
+            legacy_demote = not promote and fitness < self.policy.retain_threshold
+            next_cognitive = self._window_state(
+                node,
+                fitness,
+                window=None if windows is None else windows.get(memory_id, (0, 0, 0)),
+                legacy_demote=legacy_demote,
+            )
+            previous_cognitive = memory_cognitive_state(node) or CognitiveState.ACTIVE
+            if next_cognitive == CognitiveState.RETIRED:
+                promote = False
+            demote = (
+                previous_cognitive == CognitiveState.ACTIVE
+                and next_cognitive != CognitiveState.ACTIVE
+            )
             replay_reason, replay_priority = self._replay_reason(
                 score,
                 empirical,
                 contradiction,
             )
-            replay = replay_reason != 0
-            flags = int(node.status_flags) | int(MemoryStatus.ACTIVE)
+            replay = (
+                next_cognitive != CognitiveState.RETIRED
+                and (replay_reason != 0 or next_cognitive == CognitiveState.PROBE_ONLY)
+            )
+            flags = int(node.status_flags)
+            if next_cognitive == CognitiveState.ACTIVE:
+                flags |= int(MemoryStatus.ACTIVE)
+                flags &= ~int(MemoryStatus.DEMOTED)
+            else:
+                flags |= int(MemoryStatus.DEMOTED)
+                flags &= ~int(MemoryStatus.ACTIVE)
             if promote:
-                flags = (flags | int(MemoryStatus.PROMOTED)) & ~int(
-                    MemoryStatus.DEMOTED
-                )
-            elif demote:
-                flags = (flags | int(MemoryStatus.DEMOTED)) & ~int(
-                    MemoryStatus.PROMOTED | MemoryStatus.ACTIVE
-                )
+                flags |= int(MemoryStatus.PROMOTED)
+            elif demote or next_cognitive == CognitiveState.RETIRED:
+                flags &= ~int(MemoryStatus.PROMOTED)
             if replay:
                 flags |= int(MemoryStatus.REPLAY_QUEUED)
                 self.replay_queue.push(
-                    ReplayRequest(memory_id, replay_priority, replay_reason)
+                    ReplayRequest(memory_id, max(replay_priority, fitness), replay_reason)
                 )
             else:
                 flags &= ~int(MemoryStatus.REPLAY_QUEUED)
@@ -232,6 +331,8 @@ class MemoryLifecycleController:
                     flags,
                     empirical,
                     contradiction,
+                    int(previous_cognitive),
+                    int(next_cognitive),
                 )
             )
         return tuple(decisions)
@@ -244,18 +345,24 @@ class MemoryLifecycleController:
         memory_ids: Iterable[MemoryId] | None = None,
         empirical_transfer: Mapping[MemoryId, float] | None = None,
         contradiction_severity: Mapping[MemoryId, float] | None = None,
+        lifecycle_windows: Mapping[MemoryId, tuple[int, int, int]] | None = None,
     ) -> tuple[LifecycleDecision, ...]:
         decisions = self.evaluate(
             view,
             memory_ids,
             empirical_transfer=empirical_transfer,
             contradiction_severity=contradiction_severity,
+            lifecycle_windows=lifecycle_windows,
         )
         mutations = []
         for decision in decisions:
-            if decision.next_flags == decision.previous_flags:
-                continue
             node = view.nodes[decision.memory_id]
+            if (
+                decision.next_flags == decision.previous_flags
+                and int(getattr(node, "cognitive_state", CognitiveState.ACTIVE))
+                == decision.next_cognitive_state
+            ):
+                continue
             mutations.append(
                 NodeMutation(
                     decision.memory_id,
@@ -263,6 +370,7 @@ class MemoryLifecycleController:
                     node.type_id,
                     support_delta=0,
                     status_flags=decision.next_flags,
+                    cognitive_state=decision.next_cognitive_state,
                 )
             )
         if mutations:

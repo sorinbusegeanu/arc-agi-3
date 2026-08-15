@@ -30,6 +30,9 @@ class MappedNodeColumns:
     updated_generations: memoryview
     status_flags: memoryview
     support_counts: memoryview
+    cognitive_states: memoryview
+    validation_states: memoryview
+    gate_ids: memoryview
 
     def get(self, memory_id: MemoryId) -> MemoryNode | None:
         row = find_row(self.memory_ids, int(memory_id))
@@ -43,6 +46,9 @@ class MappedNodeColumns:
             GenerationId(int(self.updated_generations[row])),
             int(self.status_flags[row]),
             int(self.support_counts[row]),
+            int(self.cognitive_states[row]),
+            int(self.validation_states[row]),
+            int(self.gate_ids[row]),
         )
 
     @property
@@ -87,7 +93,9 @@ class MappedPackedAdjacency:
     lengths: memoryview
     targets: memoryview
 
-    def neighbors(self, source_id: MemoryId, relation_type: int) -> tuple[MemoryId, ...]:
+    def neighbors(
+        self, source_id: MemoryId, relation_type: int
+    ) -> tuple[MemoryId, ...]:
         row = find_row(self.source_ids, int(source_id))
         if row < 0:
             return ()

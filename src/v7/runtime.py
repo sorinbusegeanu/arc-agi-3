@@ -8,14 +8,22 @@ from v7.derivation.executor import ParallelDerivationConfig, ParallelDerivationE
 from v7.derivation.online_runtime import OnlineDerivationStats, OnlineHierarchyBuilder
 from v7.derivation.pipeline import MemoryLearningPipeline
 from v7.derivation.planning_runtime import Phase1PlanningBuilder, PlanningDerivationStats
-from v7.derivation.scientific import EpisodeEvidence
+from v7.derivation.scientific import EpisodeEvidence, TYPE_CONTINGENCY
+from v7.memory.canonical import CanonicalMemoryKey
 from v7.memory.coordinator import GenerationCommitCoordinator, GenerationCommitResult
 from v7.memory.development import DevelopmentalLifecycleRuntime
 from v7.memory.durable_store import DurableGenerationStore
-from v7.memory.evidence_lifecycle import EvidenceLifecycleStore
+from v7.memory.evidence_lifecycle import (
+    EvidenceLifecycleStore,
+    GateTrialRecord,
+    ProvenanceRecord,
+)
 from v7.memory.evidence_store import EvidenceStore
+from v7.memory.ids import MemoryId, MemoryLevel
+from v7.memory.models import NodeMutation
 from v7.memory.publisher import GenerationPublisher
 from v7.memory.restart import RuntimeSnapshotStore
+from v7.memory.state import CognitiveState, GateId, GateValidationState, gate_for_identity
 from v7.memory.transport.mmap_segments import SegmentedMmapReadViewTransport
 from v7.memory.writer import CanonicalMemoryWriter
 
@@ -76,13 +84,26 @@ class V7RuntimeConfig:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _G01Prediction:
+    memory_id: MemoryId
+    predicted_outcome: int
+    target_game: str | None
+    target_context: str
+    source_global_step: int | None
+
+
 class V7Runtime:
     def __init__(self, config: V7RuntimeConfig) -> None:
         self.config = config
         config.root.mkdir(parents=True, exist_ok=True)
         self.durable = DurableGenerationStore(config.root / "state.sqlite")
         self.snapshots = RuntimeSnapshotStore(self.durable)
-        self.writer = self.snapshots.restore() if config.restore else CanonicalMemoryWriter()
+        if config.restore:
+            self.writer = self.snapshots.restore()
+            self.writer.gate_candidates = True
+        else:
+            self.writer = CanonicalMemoryWriter(gate_candidates=True)
         self.evidence = EvidenceStore(config.root / "evidence.sqlite")
         self.lifecycle_evidence = EvidenceLifecycleStore(config.root / "lifecycle.sqlite")
         self.pipeline = MemoryLearningPipeline(
@@ -124,17 +145,293 @@ class V7Runtime:
         self.lifecycle_evidence.close()
         self.durable.close()
 
+    @staticmethod
+    def _contexts(evidence: EpisodeEvidence) -> tuple[int, ...]:
+        values = tuple(
+            int(value)
+            for value in getattr(evidence, "context_signatures", ()) or ()
+        )
+        return values or (int(evidence.context_signature),)
+
+    @staticmethod
+    def _is_legacy_episode(evidence: EpisodeEvidence) -> bool:
+        return not hasattr(evidence, "context_signatures")
+
+    def _capture_g01_predictions(
+        self,
+        batch: tuple[EpisodeEvidence, ...],
+    ) -> tuple[_G01Prediction, ...]:
+        builder = getattr(self.writer, "_cognition_indexes")
+        registry = getattr(self.writer, "_canonical_registry")
+        nodes = getattr(self.writer, "_nodes")
+        rows: list[_G01Prediction] = []
+        for evidence in batch:
+            for context in self._contexts(evidence):
+                memory_ids = tuple(
+                    getattr(builder, "_contingencies", {}).get(
+                        (int(context), int(evidence.action_id)),
+                        (),
+                    )
+                )
+                candidates = []
+                for memory_id in memory_ids:
+                    node = nodes.get(memory_id)
+                    key = registry.key_for(memory_id)
+                    if (
+                        node is None
+                        or key is None
+                        or node.level != MemoryLevel.M1
+                        or int(node.type_id) != TYPE_CONTINGENCY
+                        or len(key.parts) < 3
+                    ):
+                        continue
+                    candidates.append(
+                        (
+                            int(node.support_count),
+                            -int(memory_id),
+                            memory_id,
+                            int(key.parts[2]),
+                        )
+                    )
+                if not candidates:
+                    continue
+                _support, _neg_id, memory_id, predicted_outcome = max(candidates)
+                node = nodes[memory_id]
+                self.lifecycle_evidence.freeze_candidate_scope(
+                    memory_id,
+                    int(node.created_generation),
+                )
+                episode_context = (
+                    f"{int(context)}#step:{evidence.source_global_step}"
+                )
+                rows.append(
+                    _G01Prediction(
+                        memory_id,
+                        predicted_outcome,
+                        evidence.source_game,
+                        episode_context,
+                        evidence.source_global_step,
+                    )
+                )
+        return tuple(rows)
+
+    def _complete_m1_provenance(
+        self,
+        batch: tuple[EpisodeEvidence, ...],
+        primary_ids: tuple[MemoryId, ...],
+    ) -> None:
+        records: list[ProvenanceRecord] = []
+        generation = int(self.writer.mutable_generation_id)
+        nodes = getattr(self.writer, "_nodes")
+        for evidence, primary_id in zip(batch, primary_ids, strict=True):
+            for context in self._contexts(evidence):
+                key = CanonicalMemoryKey(
+                    MemoryLevel.M1,
+                    TYPE_CONTINGENCY,
+                    (
+                        int(context),
+                        int(evidence.action_id),
+                        int(evidence.outcome_signature),
+                    ),
+                )
+                memory_id = self.writer.canonical_memory_id(key)
+                if memory_id is None:
+                    continue
+                if memory_id != primary_id:
+                    records.append(
+                        ProvenanceRecord(
+                            memory_id=memory_id,
+                            generation_id=generation,
+                            source_game=evidence.source_game,
+                            source_context=str(context),
+                            source_global_step=evidence.source_global_step,
+                        )
+                    )
+        if records:
+            self.lifecycle_evidence.append_provenance(records)
+        for evidence in batch:
+            for context in self._contexts(evidence):
+                memory_id = self.writer.canonical_memory_id(
+                    CanonicalMemoryKey(
+                        MemoryLevel.M1,
+                        TYPE_CONTINGENCY,
+                        (
+                            int(context),
+                            int(evidence.action_id),
+                            int(evidence.outcome_signature),
+                        ),
+                    )
+                )
+                if memory_id is None:
+                    continue
+                node = nodes.get(memory_id)
+                if node is not None:
+                    self.lifecycle_evidence.freeze_candidate_scope(
+                        memory_id,
+                        int(node.created_generation),
+                    )
+
+    def _activate_legacy_primary_m1(
+        self,
+        batch: tuple[EpisodeEvidence, ...],
+        primary_ids: tuple[MemoryId, ...],
+    ) -> None:
+        """Preserve direct EpisodeEvidence API semantics used by fixtures/tools.
+
+        Real online sampling emits ContextEpisodeEvidence and remains fully
+        gate-controlled. Plain EpisodeEvidence historically represents already
+        accepted fixture observations and is kept backward compatible.
+        """
+        nodes = getattr(self.writer, "_nodes")
+        mutations: list[NodeMutation] = []
+        for evidence, memory_id in zip(batch, primary_ids, strict=True):
+            if not self._is_legacy_episode(evidence):
+                continue
+            node = nodes.get(memory_id)
+            if node is None:
+                continue
+            mutations.append(
+                NodeMutation(
+                    memory_id,
+                    node.level,
+                    node.type_id,
+                    support_delta=0,
+                    status_flags=node.status_flags,
+                    cognitive_state=int(CognitiveState.ACTIVE),
+                    validation_state=int(GateValidationState.VALIDATED),
+                    gate_id=int(GateId.G01),
+                )
+            )
+        if mutations:
+            self.writer.apply_mutation_batch(mutations)
+
+    def _write_g01_trials(
+        self,
+        predictions: tuple[_G01Prediction, ...],
+        batch: tuple[EpisodeEvidence, ...],
+    ) -> None:
+        actual_by_step = {
+            (evidence.source_game, evidence.source_global_step): evidence
+            for evidence in batch
+        }
+        generation = int(self.writer.mutable_generation_id)
+        records: list[GateTrialRecord] = []
+        for prediction in predictions:
+            evidence = actual_by_step.get(
+                (prediction.target_game, prediction.source_global_step)
+            )
+            if evidence is None:
+                continue
+            correct = int(prediction.predicted_outcome) == int(
+                evidence.outcome_signature
+            )
+            gain = 0.50 if correct else -0.50
+            scope = self.lifecycle_evidence.candidate_scope(prediction.memory_id)
+            if scope is None:
+                continue
+            records.append(
+                GateTrialRecord(
+                    memory_id=prediction.memory_id,
+                    generation_id=generation,
+                    gate_id=GateId.G01,
+                    candidate_generation=scope.candidate_generation,
+                    target_game=prediction.target_game,
+                    target_context=prediction.target_context,
+                    participated=True,
+                    contribution=1.0,
+                    causal_gain=gain,
+                    prediction_gain=gain,
+                    intervention_type="heldout_prediction_ablation",
+                    paired_trial_id=(
+                        f"g01:{int(prediction.memory_id)}:"
+                        f"{prediction.target_game}:{prediction.source_global_step}:"
+                        f"{prediction.target_context}"
+                    ),
+                    payload={
+                        "predicted_outcome": int(prediction.predicted_outcome),
+                        "actual_outcome": int(evidence.outcome_signature),
+                        "prediction_error": float(evidence.prediction_error),
+                    },
+                )
+            )
+        self.lifecycle_evidence.append_gate_trials(records)
+
+    def _write_decision_gate_trials(
+        self,
+        batch: tuple[EpisodeEvidence, ...],
+    ) -> None:
+        nodes = getattr(self.writer, "_nodes")
+        generation = int(self.writer.mutable_generation_id)
+        records: list[GateTrialRecord] = []
+        for evidence in batch:
+            contributions = tuple(
+                getattr(evidence, "decision_memory_contributions", ()) or ()
+            )
+            for raw_memory_id, raw_contribution in contributions:
+                memory_id = MemoryId(int(raw_memory_id))
+                contribution = float(raw_contribution)
+                if contribution == 0.0:
+                    continue
+                node = nodes.get(memory_id)
+                if node is None:
+                    continue
+                gate = gate_for_identity(node.level, node.type_id)
+                if gate not in {GateId.G23R, GateId.G34, GateId.G45, GateId.G56}:
+                    continue
+                scope = self.lifecycle_evidence.freeze_candidate_scope(
+                    memory_id,
+                    int(node.created_generation),
+                )
+                records.append(
+                    GateTrialRecord(
+                        memory_id=memory_id,
+                        generation_id=generation,
+                        gate_id=gate,
+                        candidate_generation=scope.candidate_generation,
+                        target_game=evidence.source_game,
+                        target_context=evidence.source_context,
+                        participated=True,
+                        contribution=contribution,
+                        causal_gain=contribution,
+                        terminal_gain=float(
+                            1
+                            if int(evidence.terminal_polarity) > 0
+                            else -1
+                            if int(evidence.terminal_polarity) < 0
+                            else 0
+                        ),
+                        intervention_type="decision_score_ablation",
+                        paired_trial_id=(
+                            f"decision:{int(memory_id)}:{evidence.source_game}:"
+                            f"{evidence.source_global_step}"
+                        ),
+                        payload={
+                            "source_global_step": evidence.source_global_step,
+                            "decision_score": float(evidence.decision_score),
+                            "max_action_score": float(evidence.max_action_score),
+                            "selection_mode": str(
+                                getattr(evidence, "selection_mode", "") or ""
+                            ),
+                        },
+                    )
+                )
+        self.lifecycle_evidence.append_gate_trials(records)
+
     def observe(self, evidence: EpisodeEvidence):
-        if evidence.source_global_step is not None:
-            self.writer.observe_global_step(evidence.source_global_step)
-        return self.pipeline.observe_episode(evidence)
+        return self.observe_batch((evidence,))[0]
 
     def observe_batch(self, rows) -> tuple:
         batch = tuple(rows)
         for evidence in batch:
             if evidence.source_global_step is not None:
                 self.writer.observe_global_step(evidence.source_global_step)
-        return self.pipeline.observe_batch(batch)
+        predictions = self._capture_g01_predictions(batch)
+        primary_ids = self.pipeline.observe_batch(batch)
+        self._activate_legacy_primary_m1(batch, primary_ids)
+        self._complete_m1_provenance(batch, primary_ids)
+        self._write_g01_trials(predictions, batch)
+        self._write_decision_gate_trials(batch)
+        return primary_ids
 
     def commit(
         self,
@@ -152,9 +449,6 @@ class V7Runtime:
         )
         if should_derive:
             self.last_derivation_stats = self.hierarchy.derive()
-            # Phase 1 adds persistent planning edges and executable M6
-            # procedures after the ordinary hierarchy exists. Both are
-            # published atomically in the next immutable generation.
             self.last_planning_stats = self.planning_builder.derive()
             dirty = self.writer.dirty_counts
             if dirty["nodes"] or dirty["scores"] or dirty["edges"] or dirty["cognition"]:

@@ -12,10 +12,18 @@ from v7.memory.developmental_policy import focused_replay_ids, profile_for_view
 from v7.memory.evidence_lifecycle import EvidenceLifecycleStore
 from v7.memory.evidence_store import EvidenceRecord, EvidenceStore
 from v7.memory.evidence_types import EvidenceType
+from v7.memory.gate_validation import (
+    EmpiricalGateValidator,
+    GateTrialSummary,
+    GateValidationDecision,
+)
 from v7.memory.lifecycle import LifecycleDecision, MemoryLifecycleController, MemoryStatus
 from v7.memory.lifecycle_runtime import LifecycleRunStats, MemoryLifecycleRuntime
 from v7.memory.models import NodeMutation
 from v7.memory.read_view import MemoryReadView
+from v7.memory.state import GateId, gate_for_identity
+from v7.memory.status import memory_is_derivation_eligible
+from v7.memory.structural_gate_runtime import StructuralGateRuntime
 from v7.memory.writer import CanonicalMemoryWriter
 
 
@@ -27,6 +35,8 @@ class DevelopmentalLifecycleResult:
     concept_mutations: int
     development_stage: str = "CONTROL"
     developmental_replay_mutations: int = 0
+    gates: tuple[GateValidationDecision, ...] = ()
+    gate_mutations: int = 0
 
 
 class DevelopmentalLifecycleRuntime:
@@ -37,6 +47,7 @@ class DevelopmentalLifecycleRuntime:
         evidence_store: EvidenceStore | None = None,
         lifecycle: MemoryLifecycleController | None = None,
         concept_validator: EmpiricalConceptValidator | None = None,
+        gate_validator: EmpiricalGateValidator | None = None,
     ) -> None:
         self.evidence_lifecycle = evidence_lifecycle
         self.evidence_store = evidence_store
@@ -46,6 +57,7 @@ class DevelopmentalLifecycleRuntime:
             evidence_lifecycle=evidence_lifecycle,
         )
         self.concept_validator = concept_validator or EmpiricalConceptValidator()
+        self.gate_validator = gate_validator or EmpiricalGateValidator()
 
     def run(
         self,
@@ -55,6 +67,15 @@ class DevelopmentalLifecycleRuntime:
     ) -> DevelopmentalLifecycleResult:
         profile = profile_for_view(view)
         lifecycle_decisions, stats = self.lifecycle_runtime.run(view, writer=writer)
+
+        if self.evidence_store is not None:
+            StructuralGateRuntime(
+                evidence_store=self.evidence_store,
+                lifecycle_store=self.evidence_lifecycle,
+            ).run(writer)
+
+        # Existing M4 validator remains as a compatibility/reporting surface.
+        # Newly created v7.0.6 memories are promoted by generic gate trials.
         formation_generations = {
             memory_id: int(node.created_generation)
             for memory_id, node in view.nodes.items()
@@ -68,11 +89,63 @@ class DevelopmentalLifecycleRuntime:
             view,
             transfer_summary=summaries,
         )
-        mutations = self.concept_validator.apply(
+        concept_mutations = self.concept_validator.apply(
             concept_decisions,
             view=view,
             writer=writer,
         )
+
+        gate_ids: list = []
+        parent_validity = {}
+        for memory_id, node in view.nodes.items():
+            gate = gate_for_identity(node.level, node.type_id)
+            if gate == GateId.NONE:
+                continue
+            self.evidence_lifecycle.freeze_candidate_scope(
+                memory_id,
+                int(node.created_generation),
+            )
+            gate_ids.append(memory_id)
+            parent_validity[memory_id] = self._dependency_satisfied(
+                view,
+                memory_id,
+                set(),
+            )
+        gate_summaries = self.evidence_lifecycle.gate_trial_summary(gate_ids)
+
+        # Compatibility only for pre-v7.0.6 M4 nodes that have no explicit
+        # gate identity. New nodes never convert associative terminal credit
+        # into generic causal gate evidence.
+        for memory_id, (total, successes, mean_score) in summaries.items():
+            node = view.nodes.get(memory_id)
+            if (
+                node is None
+                or int(getattr(node, "gate_id", 0)) != int(GateId.NONE)
+                or memory_id in gate_summaries
+                or total <= 0
+            ):
+                continue
+            gate_summaries[memory_id] = GateTrialSummary(
+                trials=int(total),
+                successes=int(successes),
+                independent_targets=max(1, min(int(total), 2)),
+                mean_causal_gain=float(mean_score),
+                mean_transfer_score=float(mean_score),
+                positive_terminal_gain=(
+                    float(successes) / float(total) if total > 0 else 0.0
+                ),
+            )
+        gate_decisions = self.gate_validator.evaluate(
+            view,
+            gate_summaries=gate_summaries,
+            memory_ids=gate_ids,
+            parent_validity=parent_validity,
+        )
+        gate_mutations = self.gate_validator.apply(
+            gate_decisions,
+            writer=writer,
+        )
+
         replay_mutations = self._apply_developmental_replay(
             view,
             writer=writer,
@@ -98,9 +171,7 @@ class DevelopmentalLifecycleRuntime:
                         "next_flags": int(d.next_flags),
                         "development_stage": profile.stage.name,
                         "heldout_validation": True,
-                        "formation_generation": formation_generations.get(
-                            d.memory_id
-                        ),
+                        "formation_generation": formation_generations.get(d.memory_id),
                         "validation_source_games": list(
                             self.evidence_lifecycle.provenance_source_games_at(
                                 d.memory_id,
@@ -114,14 +185,65 @@ class DevelopmentalLifecycleRuntime:
                 )
                 for d in concept_decisions
             )
+        if self.evidence_store is not None and gate_decisions:
+            generation = int(writer.mutable_generation_id)
+            self.evidence_store.append_evidence_batch(
+                EvidenceRecord(
+                    memory_id=d.memory_id,
+                    evidence_type=int(EvidenceType.GATE_VALIDATION),
+                    generation_id=generation,
+                    payload={
+                        "gate_id": int(d.gate_id),
+                        "trials": int(d.trials),
+                        "successes": int(d.successes),
+                        "independent_targets": int(d.independent_targets),
+                        "mean_causal_gain": float(d.mean_causal_gain),
+                        "structural_candidate": bool(d.structural_candidate),
+                        "probe_eligible": bool(d.probe_eligible),
+                        "tested": bool(d.tested),
+                        "validated": bool(d.validated),
+                        "trusted": bool(d.trusted),
+                        "rejected": bool(d.rejected),
+                        "dependency_satisfied": bool(d.dependency_satisfied),
+                        "previous_validation_state": int(d.previous_validation_state),
+                        "next_validation_state": int(d.next_validation_state),
+                        "previous_cognitive_state": int(d.previous_cognitive_state),
+                        "next_cognitive_state": int(d.next_cognitive_state),
+                    },
+                )
+                for d in gate_decisions
+            )
         return DevelopmentalLifecycleResult(
             lifecycle_decisions,
             stats,
             concept_decisions,
-            mutations,
+            concept_mutations,
             profile.stage.name,
             replay_mutations,
+            gate_decisions,
+            gate_mutations,
         )
+
+    def _dependency_satisfied(
+        self,
+        view: MemoryReadView,
+        memory_id,
+        visiting: set,
+    ) -> bool:
+        if memory_id in visiting:
+            return True
+        visiting = set(visiting)
+        visiting.add(memory_id)
+        for parent_id in self.evidence_lifecycle.provenance_parents(memory_id):
+            parent = view.nodes.get(parent_id)
+            if parent is None:
+                continue
+            parent_gate = gate_for_identity(parent.level, parent.type_id)
+            if parent_gate != GateId.NONE and not memory_is_derivation_eligible(parent):
+                return False
+            if not self._dependency_satisfied(view, parent_id, visiting):
+                return False
+        return True
 
     def _apply_developmental_replay(
         self,

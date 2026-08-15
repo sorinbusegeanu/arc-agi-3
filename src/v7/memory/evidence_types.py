@@ -10,6 +10,8 @@ class EvidenceType(IntEnum):
     DEMOTION = 1002
     REPLAY = 1003
     CONCEPT_VALIDATION = 1004
+    GATE_VALIDATION = 1005
+    RETIREMENT = 1006
 
 
 __all__ = ["EvidenceType"]

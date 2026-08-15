@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+from dataclasses import replace
 from random import Random
 from time import perf_counter
 
@@ -25,7 +27,10 @@ from v7.environment.phase1_policy import (
     StrategyExecutionCursor,
     select_phase1_action,
 )
+from v7.memory.ids import MemoryId, MemoryLevel
 from v7.memory.planning import PersistentPlanningGraph
+from v7.memory.state import GateValidationState
+from v7.memory.status import memory_is_active, memory_is_probe_eligible
 from v7.memory.transport.mmap_segments import SegmentedMmapReadViewTransport
 
 
@@ -77,6 +82,190 @@ def _future_option_ablation(
         float(on_scores[action] - off_scores[action]),
         int(off_order.index(action) - on_order.index(action)),
         bool(on_order and off_order and on_order[0] != off_order[0]),
+    )
+
+
+def _raw_probe_strength(view, memory_id: MemoryId) -> float:
+    """Counterfactual memory strength when a PROBE_ONLY node is enabled."""
+    node = view.nodes.get(memory_id)
+    if not memory_is_probe_eligible(node):
+        return 0.0
+    assert node is not None
+    support = 1.0 - math.exp(-max(0, int(node.support_count)) / 3.0)
+    score = view.scores.get(memory_id)
+    semantic = 0.0
+    if score is not None:
+        semantic = max(
+            float(score.significance),
+            float(score.learning_value),
+            float(score.transfer_prior),
+            float(score.explanatory_potential),
+        )
+    strength = max(0.0, min(1.0, 0.5 * support + 0.5 * semantic))
+    validation = int(
+        getattr(node, "validation_state", GateValidationState.VALIDATED)
+    )
+    if validation == int(GateValidationState.REJECTED):
+        return 0.0
+    if validation == int(GateValidationState.TRUSTED):
+        return strength
+    if validation == int(GateValidationState.VALIDATED):
+        return 0.85 * strength
+    if validation in {
+        int(GateValidationState.PROBE_ELIGIBLE),
+        int(GateValidationState.TRANSFER_TESTED),
+    }:
+        return 0.55 * strength
+    return 0.20 * strength
+
+
+def _probe_component_weight(node) -> float:
+    if node is None:
+        return 0.0
+    if node.level == MemoryLevel.M3 and int(node.type_id) == 300:
+        return 0.08
+    if node.level == MemoryLevel.M4:
+        return 0.08
+    if node.level == MemoryLevel.M5:
+        return 0.10
+    if node.level == MemoryLevel.M6:
+        return 0.12
+    return 0.0
+
+
+def _active_group(decision, node) -> tuple[int, ...]:
+    support = decision.support
+    if node.level == MemoryLevel.M3:
+        return tuple(int(value) for value in support.role_ids)
+    if node.level == MemoryLevel.M4:
+        return tuple(int(value) for value in support.concept_ids)
+    if node.level == MemoryLevel.M5:
+        return tuple(int(value) for value in support.world_model_ids)
+    if node.level == MemoryLevel.M6:
+        return tuple(int(value) for value in support.strategy_ids)
+    return ()
+
+
+def _maybe_select_probe(
+    *,
+    view,
+    scorer: Phase1ActionScorer,
+    contexts,
+    decisions,
+    selection,
+    rng: Random,
+    epsilon: float,
+):
+    """Occasionally enable one PROBE_ONLY memory for a controlled on/off decision probe."""
+    probe_probability = min(0.10, max(0.02, float(epsilon)))
+    if probe_probability <= 0.0 or rng.random() >= probe_probability:
+        return selection, None, 0.0
+    by_action = {int(row.action_id): row for row in decisions}
+    best: tuple[float, int, int] | None = None
+    for context in contexts.signatures:
+        rows = view.probe_score_inputs(
+            context_signature=int(context),
+            action_ids=tuple(sorted(by_action)),
+        )
+        for row in rows:
+            decision = by_action.get(int(row.action_id))
+            if decision is None:
+                continue
+            candidate_ids = tuple(row.role_ids) + tuple(row.concept_ids)
+            for memory_id in candidate_ids:
+                node = view.nodes.get(memory_id)
+                if node is None or memory_is_active(node) or not memory_is_probe_eligible(node):
+                    continue
+                weight = _probe_component_weight(node)
+                if weight <= 0.0:
+                    continue
+                active_strength = scorer.base._memory_strength(  # noqa: SLF001
+                    view,
+                    _active_group(decision, node),
+                )
+                enabled_strength = max(active_strength, _raw_probe_strength(view, memory_id))
+                contribution = weight * max(0.0, enabled_strength - active_strength)
+                if contribution <= 0.0:
+                    continue
+                candidate = (float(contribution), -int(row.action_id), -int(memory_id))
+                if best is None or candidate > best:
+                    best = candidate
+    if best is None:
+        return selection, None, 0.0
+    contribution, neg_action, neg_memory = best
+    action_id = -neg_action
+    memory_id = MemoryId(-neg_memory)
+    decision = by_action[action_id]
+    decision = replace(decision, score=float(decision.score) + contribution)
+    return (
+        replace(selection, decision=decision, mode="probe", strategy_id=None),
+        memory_id,
+        float(contribution),
+    )
+
+
+def _m1_component(features: tuple[float, float, float, float, float]) -> float:
+    confidence, value, future, failure, contradiction = features
+    return (
+        0.22 * float(confidence)
+        + 0.16 * float(value)
+        + 0.16 * max(0.0, float(future))
+        - 0.24 * float(failure)
+        - 0.10 * float(contradiction)
+    )
+
+
+def _decision_memory_contributions(
+    *,
+    view,
+    scorer: Phase1ActionScorer,
+    decision,
+    probe_memory_id: MemoryId | None,
+    probe_contribution: float,
+) -> tuple[tuple[int, ...], tuple[tuple[int, float], ...]]:
+    """Counterfactual score delta when each selected memory is removed."""
+    support = decision.support
+    active_row = view.score_inputs(
+        context_signature=int(support.context_signature),
+        action_ids=(int(decision.action_id),),
+    )[0]
+    contingency_ids = tuple(active_row.contingency_ids)
+    contributions: dict[int, float] = {}
+
+    m1_on = _m1_component(
+        scorer.base._m1_features(view, contingency_ids)  # noqa: SLF001
+    )
+    for memory_id in contingency_ids:
+        off_ids = tuple(value for value in contingency_ids if value != memory_id)
+        off = _m1_component(
+            scorer.base._m1_features(view, off_ids)  # noqa: SLF001
+        )
+        delta = float(m1_on - off)
+        if delta != 0.0:
+            contributions[int(memory_id)] = delta
+
+    groups = (
+        (0.08, tuple(int(value) for value in support.role_ids)),
+        (0.08, tuple(int(value) for value in support.concept_ids)),
+        (0.10, tuple(int(value) for value in support.world_model_ids)),
+        (0.12, tuple(int(value) for value in support.strategy_ids)),
+    )
+    for weight, ids in groups:
+        if not ids:
+            continue
+        on = scorer.base._memory_strength(view, ids)  # noqa: SLF001
+        for raw_memory_id in ids:
+            off_ids = tuple(value for value in ids if value != raw_memory_id)
+            off = scorer.base._memory_strength(view, off_ids)  # noqa: SLF001
+            delta = float(weight * (on - off))
+            if delta != 0.0:
+                contributions[raw_memory_id] = contributions.get(raw_memory_id, 0.0) + delta
+
+    if probe_memory_id is not None and probe_contribution != 0.0:
+        contributions[int(probe_memory_id)] = float(probe_contribution)
+    return (
+        tuple(int(value) for value in contingency_ids),
+        tuple(sorted(contributions.items())),
     )
 
 
@@ -147,8 +336,27 @@ def sample_job(directory: str, handle, job: SamplingJob) -> SamplingBatchResult:
             epsilon=job.epsilon,
             ablation_mask=ablation_mask,
         )
+        selection, probe_memory_id, probe_contribution = _maybe_select_probe(
+            view=view,
+            scorer=scorer,
+            contexts=contexts,
+            decisions=decisions,
+            selection=selection,
+            rng=rng,
+            epsilon=job.epsilon,
+        )
         decision = selection.decision
         action = int(decision.action_id)
+        (
+            decision_contingency_ids,
+            decision_memory_contributions,
+        ) = _decision_memory_contributions(
+            view=view,
+            scorer=scorer,
+            decision=decision,
+            probe_memory_id=probe_memory_id,
+            probe_contribution=probe_contribution,
+        )
         (
             future_option_ablation_score_delta,
             future_option_ablation_rank_lift,
@@ -161,6 +369,8 @@ def sample_job(directory: str, handle, job: SamplingJob) -> SamplingBatchResult:
             ),
         )
         max_score = max(float(item.score) for item in decisions)
+        if probe_memory_id is not None:
+            max_score = max(max_score, float(decision.score))
 
         after = env.step(action)
         positive = (
@@ -187,9 +397,6 @@ def sample_job(directory: str, handle, job: SamplingJob) -> SamplingBatchResult:
             outcome,
         )
 
-        # Empty terminal frames are automatically reset by the adapter. The
-        # resulting action list belongs to the next episode and must not be
-        # measured as this action's future-option set.
         future_option_observable = not bool(env.last_step_was_reset_boundary)
         after_actions = env.available_actions() if future_option_observable else []
         raw_action_delta = (
@@ -245,6 +452,20 @@ def sample_job(directory: str, handle, job: SamplingJob) -> SamplingBatchResult:
         }
         if selection.strategy_id is not None:
             strategy_ids.add(int(selection.strategy_id))
+        role_ids = {int(value) for value in support.role_ids}
+        concept_ids = {int(value) for value in support.concept_ids}
+        world_model_ids = {int(value) for value in support.world_model_ids}
+        if probe_memory_id is not None:
+            probe_node = view.nodes.get(probe_memory_id)
+            if probe_node is not None:
+                if probe_node.level == MemoryLevel.M3 and int(probe_node.type_id) == 300:
+                    role_ids.add(int(probe_memory_id))
+                elif probe_node.level == MemoryLevel.M4:
+                    concept_ids.add(int(probe_memory_id))
+                elif probe_node.level == MemoryLevel.M5:
+                    world_model_ids.add(int(probe_memory_id))
+                elif probe_node.level == MemoryLevel.M6:
+                    strategy_ids.add(int(probe_memory_id))
         evidence.append(
             ContextEpisodeEvidence(
                 context_signature=int(support.context_signature),
@@ -257,14 +478,14 @@ def sample_job(directory: str, handle, job: SamplingJob) -> SamplingBatchResult:
                 source_context=str(support.context_signature),
                 source_global_step=job.global_step_offset + local_step,
                 carrier_signature=carrier_signature(before, transition_after),
-                decision_role_ids=tuple(int(v) for v in support.role_ids),
-                decision_concept_ids=tuple(int(v) for v in support.concept_ids),
+                decision_role_ids=tuple(sorted(role_ids)),
+                decision_concept_ids=tuple(sorted(concept_ids)),
                 terminal_polarity=terminal,
                 raw_action_option_delta=raw_action_delta,
                 decision_score=float(decision.score),
                 max_action_score=max_score,
                 memory_guided=(
-                    selection.mode in {"memory", "strategy"}
+                    selection.mode in {"memory", "strategy", "probe"}
                     or support.contextual_support > 0
                     or support.local_support > 0
                 ),
@@ -273,9 +494,7 @@ def sample_job(directory: str, handle, job: SamplingJob) -> SamplingBatchResult:
                 exact_context_signature=exact,
                 structural_context_signature=structural,
                 raw_transition_signature=raw_transition,
-                decision_world_model_ids=tuple(
-                    int(v) for v in support.world_model_ids
-                ),
+                decision_world_model_ids=tuple(sorted(world_model_ids)),
                 decision_strategy_ids=tuple(sorted(strategy_ids)),
                 changed_cells=changed,
                 selected_context_rank=int(
@@ -298,6 +517,8 @@ def sample_job(directory: str, handle, job: SamplingJob) -> SamplingBatchResult:
                 trajectory_segment_id=trajectory_segment_id,
                 reset_boundary_before_step=reset_boundary_before_step,
                 future_option_observable=future_option_observable,
+                decision_contingency_ids=decision_contingency_ids,
+                decision_memory_contributions=decision_memory_contributions,
             )
         )
 

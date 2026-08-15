@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from v7.memory.generation import GenerationId
 from v7.memory.ids import MemoryId, MemoryLevel
+from v7.memory.state import CognitiveState, GateId, GateValidationState
 
 
 @dataclass(frozen=True, slots=True)
@@ -15,6 +16,9 @@ class MemoryNode:
     updated_generation: GenerationId
     status_flags: int = 0
     support_count: int = 0
+    cognitive_state: int = int(CognitiveState.ACTIVE)
+    validation_state: int = int(GateValidationState.VALIDATED)
+    gate_id: int = int(GateId.NONE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +47,9 @@ class NodeMutation:
     type_id: int
     support_delta: int = 0
     status_flags: int | None = None
+    cognitive_state: int | None = None
+    validation_state: int | None = None
+    gate_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
