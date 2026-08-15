@@ -56,51 +56,157 @@ class EvidenceLifecycleStore:
         self.connection.close()
 
     def append_provenance(self, records: Iterable[ProvenanceRecord]) -> int:
-        rows = [(int(r.memory_id), None if r.parent_memory_id is None else int(r.parent_memory_id), int(r.relation_type), r.source_game, r.source_context, r.source_global_step, int(r.generation_id)) for r in records]
+        rows = [
+            (
+                int(r.memory_id),
+                None if r.parent_memory_id is None else int(r.parent_memory_id),
+                int(r.relation_type),
+                r.source_game,
+                r.source_context,
+                r.source_global_step,
+                int(r.generation_id),
+            )
+            for r in records
+        ]
         if not rows:
             return 0
         with self.connection:
-            self.connection.executemany("INSERT INTO provenance_records(memory_id,parent_memory_id,relation_type,source_game,source_context,source_global_step,generation_id) VALUES (?,?,?,?,?,?,?)", rows)
+            self.connection.executemany(
+                "INSERT INTO provenance_records(memory_id,parent_memory_id,relation_type,source_game,source_context,source_global_step,generation_id) VALUES (?,?,?,?,?,?,?)",
+                rows,
+            )
         return len(rows)
 
     def append_transfer_trials(self, records: Iterable[TransferTrialRecord]) -> int:
-        rows = [(int(r.memory_id), r.source_game, r.target_game, 1 if r.success else 0, float(r.score), json.dumps(r.payload or {}, separators=(",", ":"), sort_keys=True), int(r.generation_id)) for r in records]
+        rows = [
+            (
+                int(r.memory_id),
+                r.source_game,
+                r.target_game,
+                1 if r.success else 0,
+                float(r.score),
+                json.dumps(r.payload or {}, separators=(",", ":"), sort_keys=True),
+                int(r.generation_id),
+            )
+            for r in records
+        ]
         if not rows:
             return 0
         with self.connection:
-            self.connection.executemany("INSERT INTO transfer_trials(memory_id,source_game,target_game,success,score,payload_json,generation_id) VALUES (?,?,?,?,?,?,?)", rows)
+            self.connection.executemany(
+                "INSERT INTO transfer_trials(memory_id,source_game,target_game,success,score,payload_json,generation_id) VALUES (?,?,?,?,?,?,?)",
+                rows,
+            )
         return len(rows)
 
     def append_contradictions(self, records: Iterable[ContradictionRecord]) -> int:
-        rows = [(int(r.memory_id), float(r.severity), r.source_game, r.source_context, r.source_global_step, json.dumps(r.payload or {}, separators=(",", ":"), sort_keys=True), int(r.generation_id)) for r in records]
+        rows = [
+            (
+                int(r.memory_id),
+                float(r.severity),
+                r.source_game,
+                r.source_context,
+                r.source_global_step,
+                json.dumps(r.payload or {}, separators=(",", ":"), sort_keys=True),
+                int(r.generation_id),
+            )
+            for r in records
+        ]
         if not rows:
             return 0
         with self.connection:
-            self.connection.executemany("INSERT INTO contradiction_records(memory_id,severity,source_game,source_context,source_global_step,payload_json,generation_id) VALUES (?,?,?,?,?,?,?)", rows)
+            self.connection.executemany(
+                "INSERT INTO contradiction_records(memory_id,severity,source_game,source_context,source_global_step,payload_json,generation_id) VALUES (?,?,?,?,?,?,?)",
+                rows,
+            )
         return len(rows)
 
-    def transfer_summary(self, memory_ids: Iterable[MemoryId]) -> dict[MemoryId, tuple[int, int, float]]:
+    def transfer_summary(
+        self,
+        memory_ids: Iterable[MemoryId],
+    ) -> dict[MemoryId, tuple[int, int, float]]:
         ids = tuple(sorted(set(int(memory_id) for memory_id in memory_ids)))
         if not ids:
             return {}
         placeholders = ",".join("?" for _ in ids)
-        rows = self.connection.execute(f"SELECT memory_id, COUNT(*), SUM(success), AVG(score) FROM transfer_trials WHERE memory_id IN ({placeholders}) GROUP BY memory_id", ids).fetchall()
-        return {MemoryId(int(memory_id)): (int(total), int(successes or 0), float(avg_score or 0.0)) for memory_id, total, successes, avg_score in rows}
+        rows = self.connection.execute(
+            f"SELECT memory_id, COUNT(*), SUM(success), AVG(score) FROM transfer_trials WHERE memory_id IN ({placeholders}) GROUP BY memory_id",
+            ids,
+        ).fetchall()
+        return {
+            MemoryId(int(memory_id)): (
+                int(total),
+                int(successes or 0),
+                float(avg_score or 0.0),
+            )
+            for memory_id, total, successes, avg_score in rows
+        }
 
-    def contradiction_summary(self, memory_ids: Iterable[MemoryId]) -> dict[MemoryId, tuple[int, float]]:
+    def heldout_transfer_summary(
+        self,
+        memory_ids: Iterable[MemoryId],
+    ) -> dict[MemoryId, tuple[int, int, float]]:
+        """Summarize only transfer trials into games outside formation provenance."""
+        ids = tuple(sorted(set(MemoryId(int(memory_id)) for memory_id in memory_ids), key=int))
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        rows = self.connection.execute(
+            f"SELECT memory_id, source_game, target_game, success, score FROM transfer_trials WHERE memory_id IN ({placeholders}) ORDER BY transfer_trial_id",
+            tuple(int(memory_id) for memory_id in ids),
+        ).fetchall()
+        scopes = {
+            memory_id: set(self.provenance_source_games(memory_id))
+            for memory_id in ids
+        }
+        grouped: dict[MemoryId, list[tuple[int, float]]] = {}
+        for raw_id, source_game, target_game, success, score in rows:
+            memory_id = MemoryId(int(raw_id))
+            scope = scopes.get(memory_id, set())
+            source = str(source_game or "")
+            target = str(target_game or "")
+            if not scope or not target or target in scope or source == target:
+                continue
+            if source and source not in scope:
+                continue
+            grouped.setdefault(memory_id, []).append((int(success), float(score)))
+        return {
+            memory_id: (
+                len(values),
+                sum(success for success, _score in values),
+                sum(score for _success, score in values) / len(values),
+            )
+            for memory_id, values in grouped.items()
+            if values
+        }
+
+    def contradiction_summary(
+        self,
+        memory_ids: Iterable[MemoryId],
+    ) -> dict[MemoryId, tuple[int, float]]:
         ids = tuple(sorted(set(int(memory_id) for memory_id in memory_ids)))
         if not ids:
             return {}
         placeholders = ",".join("?" for _ in ids)
-        rows = self.connection.execute(f"SELECT memory_id, COUNT(*), MAX(severity) FROM contradiction_records WHERE memory_id IN ({placeholders}) GROUP BY memory_id", ids).fetchall()
-        return {MemoryId(int(memory_id)): (int(total), float(max_severity or 0.0)) for memory_id, total, max_severity in rows}
+        rows = self.connection.execute(
+            f"SELECT memory_id, COUNT(*), MAX(severity) FROM contradiction_records WHERE memory_id IN ({placeholders}) GROUP BY memory_id",
+            ids,
+        ).fetchall()
+        return {
+            MemoryId(int(memory_id)): (int(total), float(max_severity or 0.0))
+            for memory_id, total, max_severity in rows
+        }
 
     def provenance_parents(self, memory_id: MemoryId) -> tuple[MemoryId, ...]:
-        rows = self.connection.execute("SELECT DISTINCT parent_memory_id FROM provenance_records WHERE memory_id=? AND parent_memory_id IS NOT NULL ORDER BY parent_memory_id", (int(memory_id),)).fetchall()
+        rows = self.connection.execute(
+            "SELECT DISTINCT parent_memory_id FROM provenance_records WHERE memory_id=? AND parent_memory_id IS NOT NULL ORDER BY parent_memory_id",
+            (int(memory_id),),
+        ).fetchall()
         return tuple(MemoryId(int(row[0])) for row in rows)
 
     def provenance_source_games(self, memory_id: MemoryId) -> tuple[str, ...]:
-        rows = self.connection.execute("""
+        rows = self.connection.execute(
+            """
             WITH RECURSIVE ancestry(memory_id) AS (
                 SELECT ?
                 UNION
@@ -108,11 +214,22 @@ class EvidenceLifecycleStore:
             )
             SELECT DISTINCT p.source_game FROM provenance_records AS p JOIN ancestry AS a ON p.memory_id=a.memory_id
             WHERE p.source_game IS NOT NULL AND p.source_game<>'' ORDER BY p.source_game
-        """, (int(memory_id),)).fetchall()
+            """,
+            (int(memory_id),),
+        ).fetchall()
         return tuple(str(row[0]) for row in rows)
 
-    def transfer_trial_exists(self, memory_id: MemoryId, *, target_game: str, source_global_step: int | None) -> bool:
-        rows = self.connection.execute("SELECT payload_json FROM transfer_trials WHERE memory_id=? AND target_game=?", (int(memory_id), str(target_game))).fetchall()
+    def transfer_trial_exists(
+        self,
+        memory_id: MemoryId,
+        *,
+        target_game: str,
+        source_global_step: int | None,
+    ) -> bool:
+        rows = self.connection.execute(
+            "SELECT payload_json FROM transfer_trials WHERE memory_id=? AND target_game=?",
+            (int(memory_id), str(target_game)),
+        ).fetchall()
         for (payload_json,) in rows:
             try:
                 payload = json.loads(payload_json)
