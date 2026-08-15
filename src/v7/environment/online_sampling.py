@@ -37,12 +37,17 @@ def _representative(actions: list[int]) -> int | None:
 
 
 def _future_option_ablation(
-    decisions, action_id: int, *, future_option_ablated: bool
-) -> tuple[float, int]:
+    decisions,
+    action_id: int,
+    *,
+    future_option_ablated: bool,
+) -> tuple[float, int, bool]:
     on_scores: dict[int, float] = {}
     off_scores: dict[int, float] = {}
     for row in decisions:
-        component = float(getattr(row, "future_option_score_component", 0.0))
+        component = float(
+            getattr(row, "future_option_score_component", 0.0)
+        )
         if future_option_ablated:
             off_score = float(row.score)
             on_score = off_score + component
@@ -53,12 +58,25 @@ def _future_option_ablation(
         off_scores[int(row.action_id)] = off_score
     action = int(action_id)
     if action not in on_scores or action not in off_scores:
-        return 0.0, 0
-    on_order = [key for key, _ in sorted(on_scores.items(), key=lambda item: (-item[1], item[0]))]
-    off_order = [key for key, _ in sorted(off_scores.items(), key=lambda item: (-item[1], item[0]))]
+        return 0.0, 0, False
+    on_order = [
+        key
+        for key, _ in sorted(
+            on_scores.items(),
+            key=lambda item: (-item[1], item[0]),
+        )
+    ]
+    off_order = [
+        key
+        for key, _ in sorted(
+            off_scores.items(),
+            key=lambda item: (-item[1], item[0]),
+        )
+    ]
     return (
         float(on_scores[action] - off_scores[action]),
         int(off_order.index(action) - on_order.index(action)),
+        bool(on_order and off_order and on_order[0] != off_order[0]),
     )
 
 
@@ -82,19 +100,29 @@ def sample_job(directory: str, handle, job: SamplingJob) -> SamplingBatchResult:
     trajectories = []
     wins = failures = levels_completed = 0
     level_index = 0
+    segment_index = 0
     trajectory_actions: list[int] = []
     trajectory_contexts: list[int] = []
     trajectory_future = 0.0
 
     for local_step in range(1, job.steps + 1):
+        reset_boundary_before_step = False
         if overlay.should_reset():
             env.reset()
-            overlay.reset_episode_history(keep_statistics=True)
+            overlay.reset_episode_history(
+                keep_statistics=True,
+                clear_failure_streak=True,
+            )
             strategy_cursor.reset()
             trajectory_actions.clear()
             trajectory_contexts.clear()
             trajectory_future = 0.0
+            segment_index += 1
+            reset_boundary_before_step = True
 
+        trajectory_segment_id = (
+            f"job_{int(job.job_index):06d}/segment_{segment_index:06d}"
+        )
         before = env.observe()
         before_actions = env.available_actions()
         exact = grid_signature(before)
@@ -121,14 +149,16 @@ def sample_job(directory: str, handle, job: SamplingJob) -> SamplingBatchResult:
         )
         decision = selection.decision
         action = int(decision.action_id)
-        future_option_ablation_score_delta, future_option_ablation_rank_lift = (
-            _future_option_ablation(
-                decisions,
-                action,
-                future_option_ablated=bool(
-                    ablation_mask & int(CognitionAblation.FUTURE_OPTION)
-                ),
-            )
+        (
+            future_option_ablation_score_delta,
+            future_option_ablation_rank_lift,
+            future_option_ablation_choice_changed,
+        ) = _future_option_ablation(
+            decisions,
+            action,
+            future_option_ablated=bool(
+                ablation_mask & int(CognitionAblation.FUTURE_OPTION)
+            ),
         )
         max_score = max(float(item.score) for item in decisions)
 
@@ -156,9 +186,16 @@ def sample_job(directory: str, handle, job: SamplingJob) -> SamplingBatchResult:
             action,
             outcome,
         )
-        after_actions = env.available_actions()
-        raw_action_delta = float(
-            len(set(after_actions)) - len(set(before_actions))
+
+        # Empty terminal frames are automatically reset by the adapter. The
+        # resulting action list belongs to the next episode and must not be
+        # measured as this action's future-option set.
+        future_option_observable = not bool(env.last_step_was_reset_boundary)
+        after_actions = env.available_actions() if future_option_observable else []
+        raw_action_delta = (
+            float(len(set(after_actions)) - len(set(before_actions)))
+            if future_option_observable
+            else 0.0
         )
         before_value = float(len(set(before_actions))) + 4.0 * float(
             decision.future_reachability
@@ -203,7 +240,8 @@ def sample_job(directory: str, handle, job: SamplingJob) -> SamplingBatchResult:
 
         support = decision.support
         strategy_ids = {
-            int(value) for value in getattr(support, "strategy_ids", ()) or ()
+            int(value)
+            for value in getattr(support, "strategy_ids", ()) or ()
         }
         if selection.strategy_id is not None:
             strategy_ids.add(int(selection.strategy_id))
@@ -247,9 +285,19 @@ def sample_job(directory: str, handle, job: SamplingJob) -> SamplingBatchResult:
                 effective_epsilon=float(selection.effective_epsilon),
                 development_stage=selection.development_stage,
                 ablation_mask=ablation_mask,
-                future_option_ablation_available=True,
-                future_option_ablation_score_delta=future_option_ablation_score_delta,
-                future_option_ablation_rank_lift=future_option_ablation_rank_lift,
+                future_option_ablation_available=future_option_observable,
+                future_option_ablation_score_delta=(
+                    future_option_ablation_score_delta
+                ),
+                future_option_ablation_rank_lift=(
+                    future_option_ablation_rank_lift
+                ),
+                future_option_ablation_choice_changed=(
+                    future_option_ablation_choice_changed
+                ),
+                trajectory_segment_id=trajectory_segment_id,
+                reset_boundary_before_step=reset_boundary_before_step,
+                future_option_observable=future_option_observable,
             )
         )
 
@@ -278,6 +326,7 @@ def sample_job(directory: str, handle, job: SamplingJob) -> SamplingBatchResult:
             trajectory_actions.clear()
             trajectory_contexts.clear()
             trajectory_future = 0.0
+            segment_index += 1
 
     return SamplingBatchResult(
         job_index=job.job_index,
