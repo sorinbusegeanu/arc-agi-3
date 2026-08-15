@@ -105,7 +105,20 @@ class LiveReadView:
             return None
         return min(seen, key=lambda row: (-row.score, -row.support_count, row.action_id)).action_id
 
-    def outcome_distribution(self, context_signature: int, action_id: int) -> dict[int, float]:
+    def outcome_distribution(
+        self,
+        context_signature: int,
+        action_id: int,
+        *,
+        min_support: int = 3,
+        stability_threshold: float = 0.60,
+    ) -> dict[int, float]:
+        """Return an expectation only after it is supported and stable.
+
+        Actors call this before the transition. Returning an empty mapping suppresses
+        prediction-error generation until an expectation actually exists, removing the
+        bootstrap/circularity problem from early sparse contingencies.
+        """
         counts: dict[int, int] = {}
         total = 0
         context = int(context_signature)
@@ -119,7 +132,10 @@ class LiveReadView:
             outcome = int(row.key_parts[2])
             counts[outcome] = counts.get(outcome, 0) + support
             total += support
-        if total <= 0:
+        if total < max(1, int(min_support)) or not counts:
+            return {}
+        dominant = max(counts.values()) / total
+        if dominant < float(stability_threshold):
             return {}
         return {outcome: count / total for outcome, count in counts.items()}
 
@@ -136,12 +152,7 @@ class LiveReadView:
         return tuple(record for arena in self._edges for record in arena.records())
 
     def source_games(self, uid: MemoryUid, *, max_depth: int = 8) -> frozenset[int]:
-        """Return exact formation provenance, inherited through graph ancestry.
-
-        Base memories have direct GAME_PROVENANCE edges. Peer-created abstractions may
-        not have been emitted by one raw game event, so their exact formation games are
-        the union of their explanatory/context/merge parents' game provenance.
-        """
+        """Return exact formation provenance, inherited through graph ancestry."""
         edges = self.edge_records()
         direct: dict[MemoryUid, set[int]] = {}
         parents: dict[MemoryUid, set[MemoryUid]] = {}
