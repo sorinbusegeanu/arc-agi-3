@@ -17,7 +17,12 @@ class PredictionEvidence:
 
 
 class PredictionEstimator:
-    """Activate empirical prediction error only after supported contingencies exist."""
+    """Expose prediction violation only after a supported expectation existed.
+
+    Actor events store error against the outcome distribution visible before the
+    transition. This estimator only admits those causal errors after the corresponding
+    context/action contingency has enough support and a stable dominant expectation.
+    """
 
     def __init__(self, *, min_support: int = 3, stability_threshold: float = 0.60) -> None:
         self.min_support = int(min_support)
@@ -40,13 +45,11 @@ class PredictionEstimator:
             if stability < self.stability_threshold:
                 continue
             for row in variants:
-                probability = max(0, int(row.support_count)) / total if total else 0.0
-                error = max(0.0, 1.0 - probability)
                 result.append(
                     PredictionEvidence(
                         int(row.uid.hi),
                         int(row.uid.lo),
-                        error,
+                        max(0.0, float(row.prediction_error)),
                         int(row.support_count),
                         True,
                     )
