@@ -21,6 +21,7 @@ from v7.memory.evidence_lifecycle import TransferTrialRecord
 from v7.memory.evidence_store import EvidenceRecord
 from v7.memory.evidence_types import EvidenceType
 from v7.memory.ids import MemoryId
+from v7.memory.planning import planning_context
 from v7.parallel import ParallelExecutionConfig
 from v7.runtime import V7Runtime, V7RuntimeConfig
 
@@ -48,8 +49,14 @@ class V7ExperimentConfig:
         if not self.games:
             raise ValueError("at least one game is required")
         if self.steps_per_game < 1 or self.epochs < 1 or self.commit_every < 1:
-            raise ValueError("steps_per_game, epochs and commit_every must be positive")
-        if self.workers <= 0 or self.derivation_workers <= 0 or self.report_workers <= 0:
+            raise ValueError(
+                "steps_per_game, epochs and commit_every must be positive"
+            )
+        if (
+            self.workers <= 0
+            or self.derivation_workers <= 0
+            or self.report_workers <= 0
+        ):
             raise ValueError("worker counts must be positive")
         if int(self.ablation_mask) < 0:
             raise ValueError("ablation_mask must be non-negative")
@@ -71,10 +78,17 @@ class V7ExperimentResult:
 
 
 def _log(epoch: int, message: str) -> None:
-    print(f'[{time.strftime("%H:%M")} E{epoch + 1:04d}] {message}', flush=True)
+    print(
+        f'[{time.strftime("%H:%M")} E{epoch + 1:04d}] {message}',
+        flush=True,
+    )
 
 
-def _append_hypothesis_log(root: Path, epoch: int, hypotheses: dict[str, dict[str, object]]) -> None:
+def _append_hypothesis_log(
+    root: Path,
+    epoch: int,
+    hypotheses: dict[str, dict[str, object]],
+) -> None:
     timestamp = time.strftime("%H:%M")
     lines = [
         f'[{timestamp} E{epoch + 1:04d}] {hypothesis_id} blockers: {"; ".join(payload["blockers"])}\n'
@@ -149,8 +163,7 @@ def _sampling_shards(
 def _namespace_sampling_trajectories(sampled, jobs) -> tuple:
     """Give parallel lanes stable trajectory identities across epochs."""
     lane_by_job = {
-        int(job.job_index): lane_index
-        for lane_index, job in enumerate(jobs)
+        int(job.job_index): lane_index for lane_index, job in enumerate(jobs)
     }
     namespaced = []
     for batch in sampled:
@@ -188,14 +201,16 @@ def _append_aggregated_game_results(
                 memories=int(memories),
                 wins=sum(int(batch.wins) for batch in batches),
                 failures=sum(int(batch.failures) for batch in batches),
-                levels_completed=sum(int(batch.levels_completed) for batch in batches),
+                levels_completed=sum(
+                    int(batch.levels_completed) for batch in batches
+                ),
                 resets=sum(int(batch.resets) for batch in batches),
             )
         )
 
 
 def _epoch_game_rates(sampled) -> tuple[float, float]:
-    """Return shard-invariant percentages of games won and games advancing a level."""
+    """Return shard-invariant percentages of games won and advancing a level."""
     grouped = defaultdict(list)
     for batch in sampled:
         grouped[str(batch.game_id)].append(batch)
@@ -217,7 +232,7 @@ def _epoch_game_rates(sampled) -> tuple[float, float]:
 
 
 def _write_trajectory_evidence(runtime: V7Runtime, sampled) -> int:
-    """Persist trajectories and credit terminal transfer to memories used along them."""
+    """Persist bounded trajectories without crossing reset or shard segments."""
     generation_id = int(runtime.writer.mutable_generation_id)
     records: list[EvidenceRecord] = []
     transfer_records: list[TransferTrialRecord] = []
@@ -230,20 +245,45 @@ def _write_trajectory_evidence(runtime: V7Runtime, sampled) -> int:
         raw_option_sum = 0.0
         level_index = 0
         terminal_index = 0
+        current_segment: str | None = None
         trajectory_keys = tuple(
             str(trajectory.level_key)
             for trajectory in getattr(batch, "trajectories", ()) or ()
         )
+
+        def clear_segment() -> None:
+            nonlocal future_sum, raw_option_sum
+            actions.clear()
+            contexts.clear()
+            used_memory_ids.clear()
+            usage_counts.clear()
+            future_sum = 0.0
+            raw_option_sum = 0.0
+
         for row in batch.evidence:
+            segment = str(
+                getattr(row, "trajectory_segment_id", "")
+                or f"legacy-job-{int(batch.job_index)}"
+            )
+            if current_segment is None:
+                current_segment = segment
+            elif segment != current_segment:
+                clear_segment()
+                current_segment = segment
+            if bool(getattr(row, "reset_boundary_before_step", False)):
+                clear_segment()
+                current_segment = segment
+
             actions.append(int(row.action_id))
             context_values = tuple(
                 int(value)
                 for value in getattr(row, "context_signatures", ()) or ()
             )
             contexts.append(
-                context_values[-2]
-                if len(context_values) >= 2
-                else int(row.context_signature)
+                planning_context(
+                    context_values,
+                    fallback=int(row.context_signature),
+                )
             )
             for raw_memory_id in (
                 *(getattr(row, "decision_role_ids", ()) or ()),
@@ -253,7 +293,10 @@ def _write_trajectory_evidence(runtime: V7Runtime, sampled) -> int:
                 used_memory_ids.add(memory_id)
                 usage_counts[memory_id] += 1
             future_sum += float(row.future_option_delta)
-            raw_option_sum += float(getattr(row, "raw_action_option_delta", 0.0) or 0.0)
+            if bool(getattr(row, "future_option_observable", True)):
+                raw_option_sum += float(
+                    getattr(row, "raw_action_option_delta", 0.0) or 0.0
+                )
             polarity = int(getattr(row, "terminal_polarity", 0) or 0)
             if polarity == 0:
                 continue
@@ -274,10 +317,12 @@ def _write_trajectory_evidence(runtime: V7Runtime, sampled) -> int:
                     payload={
                         "epoch": int(batch.epoch),
                         "level_key": level_key,
+                        "trajectory_segment_id": current_segment,
                         "steps_to_success": len(actions),
                         "future_option_sum": future_sum,
                         "raw_action_option_sum": raw_option_sum,
-                        "future_option_per_action": future_sum / max(1, len(actions)),
+                        "future_option_per_action": future_sum
+                        / max(1, len(actions)),
                         "representative_action": _representative(actions),
                         "action_sequence": list(actions[:256]),
                         "context_sequence": list(contexts[:256]),
@@ -289,7 +334,9 @@ def _write_trajectory_evidence(runtime: V7Runtime, sampled) -> int:
                 memory_id = MemoryId(raw_memory_id)
                 source_games = tuple(
                     game
-                    for game in runtime.lifecycle_evidence.provenance_source_games(memory_id)
+                    for game in runtime.lifecycle_evidence.provenance_source_games(
+                        memory_id
+                    )
                     if game != batch.game_id
                 )
                 if not source_games:
@@ -298,6 +345,7 @@ def _write_trajectory_evidence(runtime: V7Runtime, sampled) -> int:
                     memory_id,
                     target_game=batch.game_id,
                     source_global_step=row.source_global_step,
+                    attribution="trajectory_usage",
                 ):
                     continue
                 transfer_records.append(
@@ -317,19 +365,18 @@ def _write_trajectory_evidence(runtime: V7Runtime, sampled) -> int:
                             "raw_action_option_delta": raw_option_sum,
                             "attribution": "trajectory_usage",
                             "usage_count": int(usage_counts[raw_memory_id]),
+                            "trajectory_segment_id": current_segment,
                         },
                     )
                 )
             if polarity > 0:
                 level_index += 1
-            actions.clear()
-            contexts.clear()
-            used_memory_ids.clear()
-            usage_counts.clear()
-            future_sum = 0.0
-            raw_option_sum = 0.0
+            clear_segment()
+            current_segment = None
     evidence_rows = runtime.evidence.append_evidence_batch(records)
-    transfer_rows = runtime.lifecycle_evidence.append_transfer_trials(transfer_records)
+    transfer_rows = runtime.lifecycle_evidence.append_transfer_trials(
+        transfer_records
+    )
     return evidence_rows + transfer_rows
 
 
@@ -356,12 +403,18 @@ def _write_cognition_metrics(
         directory = root / "reports" / f"epoch_{epoch + 1:04d}"
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / "cognition_metrics.json"
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
     return payload
 
 
-def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7ExperimentResult:
-    """Run parallel games with immutable shared memory and worker-local online learning."""
+def run_experiment(
+    root: str | Path,
+    config: V7ExperimentConfig,
+) -> V7ExperimentResult:
+    """Run parallel games with immutable shared memory and worker-local learning."""
     root_path = Path(root)
     root_path.mkdir(parents=True, exist_ok=True)
     parallel_config = ParallelExecutionConfig(
@@ -430,7 +483,10 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
                 global_job_index += len(jobs)
 
                 sampling_started = perf_counter()
-                sampled = sampling_pool.run_wave(handle=record.handle, jobs=jobs)
+                sampled = sampling_pool.run_wave(
+                    handle=record.handle,
+                    jobs=jobs,
+                )
                 sampled = _namespace_sampling_trajectories(sampled, jobs)
                 cognition.observe_epoch(epoch, sampled)
                 epoch_win_rate, epoch_level_rate = _epoch_game_rates(sampled)
@@ -488,7 +544,10 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
 
                 _write_trajectory_evidence(runtime, sampled)
                 finalize_started = perf_counter()
-                committed = runtime.commit(run_lifecycle=True, derive_hierarchy=True)
+                committed = runtime.commit(
+                    run_lifecycle=True,
+                    derive_hierarchy=True,
+                )
                 sampling_pool.metrics.generation_commit_seconds += (
                     perf_counter() - finalize_started
                 )
@@ -586,5 +645,8 @@ def run_experiment(root: str | Path, config: V7ExperimentConfig) -> V7Experiment
     return summary
 
 
-def resolve_games(selector: str, env_root: str | None = None) -> tuple[str, ...]:
+def resolve_games(
+    selector: str,
+    env_root: str | None = None,
+) -> tuple[str, ...]:
     return resolve_game_selector(selector, env_root)

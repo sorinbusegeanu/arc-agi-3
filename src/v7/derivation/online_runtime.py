@@ -4,7 +4,7 @@ import json
 from collections import Counter, defaultdict
 from dataclasses import dataclass, replace
 from hashlib import blake2b
-from typing import Any, Iterable
+from typing import Any, Iterable, TypeVar
 
 from v7.derivation.pipeline import MemoryLearningPipeline
 from v7.derivation.scientific import (
@@ -33,19 +33,38 @@ from v7.memory.semantic_relations import (
     TYPE_RELATIONAL_WORLD_MODEL,
     classify_transition_relations,
 )
+from v7.memory.status import memory_is_active
 from v7.memory.writer import CanonicalMemoryWriter
 
 _MASK63 = (1 << 63) - 1
+_T = TypeVar("_T")
+
+
+def _rotating_budget(
+    rows: Iterable[_T],
+    budget: int,
+    generation: int,
+    *,
+    salt: int = 0,
+) -> tuple[_T, ...]:
+    """Return a deterministic rotating bounded frontier.
+
+    Fixed ``sorted(... )[:budget]`` permanently starves later candidates once
+    a frontier exceeds its budget. Advancing by one budget-width per generation
+    guarantees that every deterministic candidate ordering is eventually seen.
+    """
+    values = tuple(rows)
+    limit = max(0, int(budget))
+    if limit <= 0 or not values:
+        return ()
+    if len(values) <= limit:
+        return values
+    start = ((max(0, int(generation)) + int(salt)) * limit) % len(values)
+    return tuple(values[(start + offset) % len(values)] for offset in range(limit))
 
 
 def _retrieval_contexts(row: dict[str, Any]) -> tuple[int, ...]:
-    """Return bounded general/structural/planning contexts for transfer lookup.
-
-    New five-signature evidence is indexed at C0, C2, and C3 so functional
-    roles and world models learned in one game are reachable in another game
-    before an exact target context has accumulated evidence. Legacy layouts
-    retain their reusable general and planning identities.
-    """
+    """Return bounded general/structural/planning contexts for transfer lookup."""
     values = tuple(
         int(value) for value in row.get("context_signatures", ()) or ()
     )
@@ -59,6 +78,39 @@ def _retrieval_contexts(row: dict[str, Any]) -> tuple[int, ...]:
     else:
         candidates = (fallback,)
     return tuple(dict.fromkeys(int(value) for value in candidates))
+
+
+def _transition_segment(row: dict[str, Any]) -> str:
+    return str(row.get("trajectory_segment_id") or "")
+
+
+def _continuous_episode_rows(
+    prior: dict[str, Any],
+    current: dict[str, Any],
+) -> bool:
+    """Require two evidence rows to belong to one uninterrupted trajectory."""
+    prior_segment = _transition_segment(prior)
+    current_segment = _transition_segment(current)
+    if prior_segment or current_segment:
+        if not prior_segment or prior_segment != current_segment:
+            return False
+    if int(prior.get("terminal_polarity") or 0) != 0:
+        return False
+    prior_step = prior.get("source_global_step")
+    current_step = current.get("source_global_step")
+    if prior_step is not None and current_step is not None:
+        if int(current_step) != int(prior_step) + 1:
+            return False
+    next_contexts = prior.get("next_context_signatures", ()) or ()
+    if next_contexts:
+        after_context = planning_context(next_contexts, fallback=-1)
+        before_context = planning_context(
+            current.get("context_signatures", ()) or (),
+            fallback=int(current.get("context_signature") or -2),
+        )
+        if after_context < 0 or before_context < 0 or after_context != before_context:
+            return False
+    return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,13 +140,7 @@ class OnlineDerivationStats:
 
 
 class OnlineHierarchyBuilder:
-    """Bounded M2-M6 derivation with explicit carriers and relational M5.
-
-    Phase 2 changes M2 to action-independent transformation identity and splits
-    M3 into carrier -> contextual role instance -> functional role. Phase 3
-    requires transfer-validated concepts for M5 and derives typed relational
-    world-model evidence from repeated abstract transitions.
-    """
+    """Bounded M2-M6 derivation with explicit carriers and relational M5."""
 
     def __init__(
         self,
@@ -113,6 +159,7 @@ class OnlineHierarchyBuilder:
         registry = getattr(self.writer, "_canonical_registry")
         profile = profile_for_view(self.writer.published_view)
         budget = max(1, int(profile.abstraction_budget))
+        generation = int(self.writer.mutable_generation_id)
         episodes = self._load(EvidenceType.EPISODE)
 
         families = carriers = contextual_roles = roles = concepts = 0
@@ -124,7 +171,11 @@ class OnlineHierarchyBuilder:
         family_groups: dict[int, list[MemoryId]] = defaultdict(list)
         m1_identity: dict[MemoryId, tuple[int, int, int]] = {}
         for memory_id, node in sorted(nodes.items(), key=lambda item: int(item[0])):
-            if node.level != MemoryLevel.M1 or node.type_id != TYPE_CONTINGENCY:
+            if (
+                node.level != MemoryLevel.M1
+                or node.type_id != TYPE_CONTINGENCY
+                or not memory_is_active(node)
+            ):
                 continue
             key = registry.key_for(memory_id)
             if key is None or len(key.parts) < 3:
@@ -134,7 +185,13 @@ class OnlineHierarchyBuilder:
             family_groups[outcome].append(memory_id)
 
         family_by_member: dict[MemoryId, MemoryId] = {}
-        for outcome, raw_members in list(sorted(family_groups.items()))[:budget]:
+        family_frontier = _rotating_budget(
+            sorted(family_groups.items()),
+            budget,
+            generation,
+            salt=0,
+        )
+        for outcome, raw_members in family_frontier:
             members = tuple(sorted(set(raw_members), key=int))
             if len(members) < 2:
                 continue
@@ -151,8 +208,6 @@ class OnlineHierarchyBuilder:
             for member in members:
                 family_by_member[member] = family
 
-        # Baseline action/outcome distributions support empirical carrier
-        # prediction-lift calculation.
         action_outcomes: dict[int, Counter[int]] = defaultdict(Counter)
         for row in episodes:
             action = int(row.get("action_id") or 0)
@@ -174,7 +229,13 @@ class OnlineHierarchyBuilder:
 
         carrier_id_by_signature: dict[int, MemoryId] = {}
         usable_carriers: set[int] = set()
-        for carrier_signature, rows_for_carrier in list(sorted(carrier_rows.items()))[:budget]:
+        carrier_frontier = _rotating_budget(
+            sorted(carrier_rows.items()),
+            budget,
+            generation,
+            salt=1,
+        )
+        for carrier_signature, rows_for_carrier in carrier_frontier:
             support_count = len(rows_for_carrier)
             if support_count < 2:
                 continue
@@ -198,7 +259,9 @@ class OnlineHierarchyBuilder:
                     key=int,
                 )
             )
-            parent_ids = tuple(sorted(set(member_ids) | set(family_ids), key=int))
+            parent_ids = tuple(
+                sorted(set(member_ids) | set(family_ids), key=int)
+            )
             if not parent_ids:
                 continue
             contexts = {
@@ -255,19 +318,35 @@ class OnlineHierarchyBuilder:
 
         instance_info: dict[
             MemoryId,
-            tuple[MemoryId, MemoryId, int, int, tuple[MemoryId, ...], list[dict[str, Any]]],
+            tuple[
+                MemoryId,
+                MemoryId,
+                int,
+                int,
+                tuple[MemoryId, ...],
+                list[dict[str, Any]],
+            ],
         ] = {}
-        for (family_id, carrier_id, action, context), rows_for_instance in list(
-            sorted(
-                instance_groups.items(),
-                key=lambda item: (
-                    int(item[0][0]),
-                    int(item[0][1]),
-                    item[0][2],
-                    item[0][3],
-                ),
-            )
-        )[:budget]:
+        ordered_instances = sorted(
+            instance_groups.items(),
+            key=lambda item: (
+                int(item[0][0]),
+                int(item[0][1]),
+                item[0][2],
+                item[0][3],
+            ),
+        )
+        for (
+            family_id,
+            carrier_id,
+            action,
+            context,
+        ), rows_for_instance in _rotating_budget(
+            ordered_instances,
+            budget,
+            generation,
+            salt=2,
+        ):
             members = tuple(
                 sorted(
                     {
@@ -308,13 +387,23 @@ class OnlineHierarchyBuilder:
         for instance_id, info in instance_info.items():
             family_id, _carrier_id, _action, _context, _members, instance_rows = info
             family_key = registry.key_for(family_id)
-            outcome = int(family_key.parts[0]) if family_key and family_key.parts else 0
+            outcome = (
+                int(family_key.parts[0])
+                if family_key and family_key.parts
+                else 0
+            )
             signature = _functional_role_signature(outcome, instance_rows)
             functional_groups[signature].append(instance_id)
 
         functional_role_by_member: dict[MemoryId, set[MemoryId]] = defaultdict(set)
         functional_role_by_carrier: dict[MemoryId, set[MemoryId]] = defaultdict(set)
-        for signature, raw_instances in list(sorted(functional_groups.items()))[:budget]:
+        functional_frontier = _rotating_budget(
+            sorted(functional_groups.items()),
+            budget,
+            generation,
+            salt=3,
+        )
+        for signature, raw_instances in functional_frontier:
             instances = tuple(sorted(set(raw_instances), key=int))
             if len(instances) < 2:
                 continue
@@ -337,8 +426,14 @@ class OnlineHierarchyBuilder:
             occurrence_count = sum(
                 len(instance_info[instance_id][5]) for instance_id in instances
             )
-            transfer_prior = min(1.0, max(len(contexts), len(games)) / 4.0)
-            explanatory = min(1.0, max(len(instances), len(carrier_ids)) / 4.0)
+            transfer_prior = min(
+                1.0,
+                max(len(contexts), len(games)) / 4.0,
+            )
+            explanatory = min(
+                1.0,
+                max(len(instances), len(carrier_ids)) / 4.0,
+            )
             candidate = ScientificDerivationKernels.m3_functional_role(
                 function_signature=signature,
                 instance_ids=instances,
@@ -352,14 +447,24 @@ class OnlineHierarchyBuilder:
             )
             roles += int(created)
             for instance_id in instances:
-                family_id, carrier_id, action, context, members, instance_rows = instance_info[
-                    instance_id
-                ]
+                (
+                    family_id,
+                    carrier_id,
+                    action,
+                    context,
+                    members,
+                    instance_rows,
+                ) = instance_info[instance_id]
                 retrieval_contexts = {int(context)}
                 for row in instance_rows:
                     retrieval_contexts.update(_retrieval_contexts(row))
                 self.writer.apply_role_index_batch(
-                    RoleIndexMutation(index_context, action, role_id, family_id)
+                    RoleIndexMutation(
+                        index_context,
+                        action,
+                        role_id,
+                        family_id,
+                    )
                     for index_context in sorted(retrieval_contexts)
                 )
                 functional_role_by_carrier[carrier_id].add(role_id)
@@ -369,11 +474,18 @@ class OnlineHierarchyBuilder:
         # ------------------------------------------------------------------
         # M4 concepts bind multiple functional roles through carrier relation.
         # ------------------------------------------------------------------
-        for carrier_signature, carrier_id in list(
-            sorted(carrier_id_by_signature.items())
-        )[:budget]:
+        concept_frontier = _rotating_budget(
+            sorted(carrier_id_by_signature.items()),
+            budget,
+            generation,
+            salt=4,
+        )
+        for carrier_signature, carrier_id in concept_frontier:
             role_ids = tuple(
-                sorted(functional_role_by_carrier.get(carrier_id, ()), key=int)
+                sorted(
+                    functional_role_by_carrier.get(carrier_id, ()),
+                    key=int,
+                )
             )
             if len(role_ids) < 2:
                 continue
@@ -387,13 +499,15 @@ class OnlineHierarchyBuilder:
             )
             concepts += int(created)
             self.writer.apply_role_concept_index_batch(
-                RoleConceptIndexMutation(role_id, concept_id) for role_id in role_ids
+                RoleConceptIndexMutation(role_id, concept_id)
+                for role_id in role_ids
             )
 
         self._update_strategy_reuse_scores(episodes)
 
         # ------------------------------------------------------------------
-        # M5a: empirical transition models require validated concepts.
+        # M5a: empirical transitions require active validated concepts and
+        # uninterrupted trajectory continuity.
         # ------------------------------------------------------------------
         validated_mask = int(
             ConceptValidationStatus.TRANSFER_VALIDATED
@@ -404,6 +518,7 @@ class OnlineHierarchyBuilder:
             for memory_id, node in nodes.items()
             if node.level == MemoryLevel.M4
             and node.type_id == TYPE_CONCEPT
+            and memory_is_active(node)
             and bool(int(node.status_flags) & validated_mask)
             and not bool(
                 int(node.status_flags)
@@ -415,7 +530,8 @@ class OnlineHierarchyBuilder:
         transition_concepts: dict[int, set[MemoryId]] = defaultdict(set)
         transition_locations: dict[int, set[tuple[int, int]]] = defaultdict(set)
         transition_relation_rows: dict[
-            int, list[tuple[tuple[int, ...], tuple[int, ...], float, int]]
+            int,
+            list[tuple[tuple[int, ...], tuple[int, ...], float, int]],
         ] = defaultdict(list)
         by_game: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for row in episodes:
@@ -423,6 +539,7 @@ class OnlineHierarchyBuilder:
                 by_game[str(row["source_game"])].append(row)
 
         for game in sorted(by_game):
+            prior_row: dict[str, Any] | None = None
             prior_concepts: tuple[int, ...] = ()
             prior_action: int | None = None
             prior_contexts: tuple[int, ...] = ()
@@ -441,8 +558,13 @@ class OnlineHierarchyBuilder:
                         }
                     )
                 )
+                continuous = (
+                    prior_row is not None
+                    and _continuous_episode_rows(prior_row, row)
+                )
                 if (
-                    prior_terminal == 0
+                    continuous
+                    and prior_terminal == 0
                     and prior_concepts
                     and current
                     and prior_action is not None
@@ -460,7 +582,8 @@ class OnlineHierarchyBuilder:
                             MemoryId(value) for value in union
                         )
                         transition_locations[signature].update(
-                            (context, prior_action) for context in prior_contexts
+                            (context, prior_action)
+                            for context in prior_contexts
                         )
                         transition_relation_rows[signature].append(
                             (
@@ -470,6 +593,7 @@ class OnlineHierarchyBuilder:
                                 prior_terminal,
                             )
                         )
+                prior_row = row
                 prior_concepts = current
                 prior_action = int(row.get("action_id") or 0)
                 prior_contexts = _retrieval_contexts(row)
@@ -478,8 +602,16 @@ class OnlineHierarchyBuilder:
 
         model_by_signature: dict[int, MemoryId] = {}
         models_by_location: dict[tuple[int, int], set[MemoryId]] = defaultdict(set)
-        for signature, count in list(sorted(transition_counts.items()))[:budget]:
-            concept_ids = tuple(sorted(transition_concepts[signature], key=int))
+        model_frontier = _rotating_budget(
+            sorted(transition_counts.items()),
+            budget,
+            generation,
+            salt=5,
+        )
+        for signature, count in model_frontier:
+            concept_ids = tuple(
+                sorted(transition_concepts[signature], key=int)
+            )
             if count < 2 or len(concept_ids) < 2:
                 continue
             candidate = ScientificDerivationKernels.m5_world_model(
@@ -502,8 +634,14 @@ class OnlineHierarchyBuilder:
         # M5b: typed relational model inferred from repeated M5a transitions.
         # ------------------------------------------------------------------
         relation_counts: Counter[tuple[int, int, int]] = Counter()
-        relation_models: dict[tuple[int, int, int], set[MemoryId]] = defaultdict(set)
-        relation_locations: dict[tuple[int, int, int], set[tuple[int, int]]] = defaultdict(set)
+        relation_models: dict[
+            tuple[int, int, int],
+            set[MemoryId],
+        ] = defaultdict(set)
+        relation_locations: dict[
+            tuple[int, int, int],
+            set[tuple[int, int]],
+        ] = defaultdict(set)
         for signature, rows in transition_relation_rows.items():
             model_id = model_by_signature.get(signature)
             if model_id is None:
@@ -518,20 +656,35 @@ class OnlineHierarchyBuilder:
                     key = (source, relation_type, target)
                     relation_counts[key] += 1
                     relation_models[key].add(model_id)
-                    relation_locations[key].update(transition_locations[signature])
+                    relation_locations[key].update(
+                        transition_locations[signature]
+                    )
 
-        desired_relation_edges: Counter[tuple[MemoryId, int, MemoryId]] = Counter()
-        for (source, relation_type, target), count in list(
-            sorted(relation_counts.items())
-        )[:budget]:
+        desired_relation_edges: Counter[
+            tuple[MemoryId, int, MemoryId]
+        ] = Counter()
+        relation_frontier = _rotating_budget(
+            sorted(relation_counts.items()),
+            budget,
+            generation,
+            salt=6,
+        )
+        for (source, relation_type, target), count in relation_frontier:
             if count < 2:
                 continue
             source_id = MemoryId(source)
             target_id = MemoryId(target)
             supporting_models = tuple(
-                sorted(relation_models[(source, relation_type, target)], key=int)
+                sorted(
+                    relation_models[(source, relation_type, target)],
+                    key=int,
+                )
             )
-            relation_signature = _relation_key(source, relation_type, target)
+            relation_signature = _relation_key(
+                source,
+                relation_type,
+                target,
+            )
             key = CanonicalMemoryKey(
                 MemoryLevel.M5,
                 TYPE_RELATIONAL_WORLD_MODEL,
@@ -556,12 +709,13 @@ class OnlineHierarchyBuilder:
                     (RoleIndexMutation(context, action, relation_id, None),)
                 )
                 models_by_location[(context, action)].add(relation_id)
-            desired_relation_edges[(source_id, relation_type, target_id)] = count
+            desired_relation_edges[
+                (source_id, relation_type, target_id)
+            ] = count
         self._sync_edge_support(desired_relation_edges)
 
         # ------------------------------------------------------------------
-        # M6 efficiency strategies remain as compact hierarchy memories. Phase
-        # 1 executable procedures are derived separately from trajectory data.
+        # M6 efficiency strategies remain compact hierarchy memories.
         # ------------------------------------------------------------------
         all_models = tuple(
             sorted(
@@ -569,24 +723,32 @@ class OnlineHierarchyBuilder:
                     memory_id
                     for memory_id, node in nodes.items()
                     if node.level == MemoryLevel.M5
-                    and node.type_id in {TYPE_WORLD_MODEL, TYPE_RELATIONAL_WORLD_MODEL}
+                    and node.type_id
+                    in {TYPE_WORLD_MODEL, TYPE_RELATIONAL_WORLD_MODEL}
+                    and memory_is_active(node)
                 ),
                 key=int,
             )
         )[:64]
         trajectories = self._load(EvidenceType.TRAJECTORY)
+        successful_trajectories = [
+            row for row in trajectories if bool(row.get("success"))
+        ]
         best_steps: dict[tuple[str, str], int] = {}
-        strategy_candidates = 0
-        for row in trajectories:
-            if strategy_candidates >= budget:
-                break
-            if not bool(row.get("success")):
-                continue
+        strategy_frontier = _rotating_budget(
+            successful_trajectories,
+            budget,
+            generation,
+            salt=7,
+        )
+        for row in strategy_frontier:
             actions = tuple(
-                int(value) for value in row.get("action_sequence", ()) or ()
+                int(value)
+                for value in row.get("action_sequence", ()) or ()
             )
             contexts_seq = tuple(
-                int(value) for value in row.get("context_sequence", ()) or ()
+                int(value)
+                for value in row.get("context_sequence", ()) or ()
             )
             if not actions:
                 representative = row.get("representative_action")
@@ -604,11 +766,18 @@ class OnlineHierarchyBuilder:
             contexts_seq = contexts_seq[:pair_count]
             relevant_models: set[MemoryId] = set()
             for context, action in zip(contexts_seq, actions, strict=True):
-                relevant_models.update(models_by_location.get((context, action), ()))
+                relevant_models.update(
+                    model_id
+                    for model_id in models_by_location.get((context, action), ())
+                    if memory_is_active(nodes.get(model_id))
+                )
             model_ids = tuple(sorted(relevant_models, key=int))[:64] or all_models
             if not model_ids:
                 continue
-            steps = max(1, int(row.get("steps_to_success") or len(actions)))
+            steps = max(
+                1,
+                int(row.get("steps_to_success") or len(actions)),
+            )
             group_key = (
                 str(row.get("source_game") or ""),
                 str(row.get("level_key") or "level"),
@@ -618,10 +787,13 @@ class OnlineHierarchyBuilder:
             improvement = 0.0
             if previous_best is not None and steps < previous_best:
                 improvement = (previous_best - steps) / max(
-                    1.0, float(previous_best)
+                    1.0,
+                    float(previous_best),
                 )
             best_steps[group_key] = (
-                steps if previous_best is None else min(previous_best, steps)
+                steps
+                if previous_best is None
+                else min(previous_best, steps)
             )
             efficiency = min(1.0, base_efficiency + improvement)
             action_signature = _sequence_key(actions, contexts_seq)
@@ -635,7 +807,6 @@ class OnlineHierarchyBuilder:
                 desired_support=len(model_ids),
             )
             strategies += int(created)
-            strategy_candidates += 1
 
         return OnlineDerivationStats(
             families=families,
@@ -669,9 +840,16 @@ class OnlineHierarchyBuilder:
                 continue
             local_confidence = max(counts.values()) / local_total
             baseline_confidence = max(baseline.values()) / baseline_total
-            weighted += max(0.0, local_confidence - baseline_confidence) * local_total
+            weighted += (
+                max(0.0, local_confidence - baseline_confidence)
+                * local_total
+            )
             total_weight += local_total
-        return 0.0 if total_weight <= 0 else min(1.0, weighted / total_weight)
+        return (
+            0.0
+            if total_weight <= 0
+            else min(1.0, weighted / total_weight)
+        )
 
     def _sync_candidate(
         self,
@@ -744,7 +922,11 @@ class OnlineHierarchyBuilder:
         mutations: list[EdgeMutation] = []
         for key, wanted in sorted(
             desired.items(),
-            key=lambda item: (int(item[0][0]), item[0][1], int(item[0][2])),
+            key=lambda item: (
+                int(item[0][0]),
+                item[0][1],
+                int(item[0][2]),
+            ),
         ):
             current = int(edge_support.get(key, 0))
             delta = int(wanted) - current
@@ -765,18 +947,24 @@ class OnlineHierarchyBuilder:
         episodes: list[dict[str, Any]],
     ) -> None:
         outcomes: dict[MemoryId, list[int]] = defaultdict(list)
+        writer_nodes = getattr(self.writer, "_nodes")
         for row in episodes:
             polarity = int(row.get("terminal_polarity") or 0)
             if polarity == 0:
                 continue
             for raw_id in row.get("decision_strategy_ids", ()) or ():
                 memory_id = MemoryId(int(raw_id))
-                node = getattr(self.writer, "_nodes").get(memory_id)
-                if node is not None and node.level == MemoryLevel.M6:
+                node = writer_nodes.get(memory_id)
+                if (
+                    node is not None
+                    and node.level == MemoryLevel.M6
+                    and memory_is_active(node)
+                ):
                     outcomes[memory_id].append(polarity)
         mutations = []
         for memory_id, values in sorted(
-            outcomes.items(), key=lambda item: int(item[0])
+            outcomes.items(),
+            key=lambda item: int(item[0]),
         ):
             successes = sum(1 for value in values if value > 0)
             failures = sum(1 for value in values if value < 0)
@@ -824,12 +1012,22 @@ def _functional_role_signature(
     outcome_signature: int,
     rows: list[dict[str, Any]],
 ) -> int:
-    future = sum(float(row.get("future_option_delta") or 0.0) for row in rows)
+    future = sum(
+        float(row.get("future_option_delta") or 0.0) for row in rows
+    )
     future_bucket = 1 if future > 0 else -1 if future < 0 else 0
-    positives = sum(int(row.get("terminal_polarity") or 0) > 0 for row in rows)
-    negatives = sum(int(row.get("terminal_polarity") or 0) < 0 for row in rows)
-    terminal_bucket = 1 if positives > negatives else -1 if negatives > positives else 0
-    changed = sum(int(row.get("changed_cells") or 0) > 0 for row in rows)
+    positives = sum(
+        int(row.get("terminal_polarity") or 0) > 0 for row in rows
+    )
+    negatives = sum(
+        int(row.get("terminal_polarity") or 0) < 0 for row in rows
+    )
+    terminal_bucket = (
+        1 if positives > negatives else -1 if negatives > positives else 0
+    )
+    changed = sum(
+        int(row.get("changed_cells") or 0) > 0 for row in rows
+    )
     changed_bucket = 1 if changed * 2 >= max(1, len(rows)) else 0
     digest = blake2b(digest_size=8)
     digest.update(b"functional-role-v1")
@@ -843,7 +1041,6 @@ def _functional_role_signature(
     return int.from_bytes(digest.digest(), "little") & _MASK63
 
 
-
 def _relation_key(source: int, relation_type: int, target: int) -> int:
     digest = blake2b(digest_size=8)
     digest.update(b"relational-world-model-v1")
@@ -855,6 +1052,10 @@ def _relation_key(source: int, relation_type: int, target: int) -> int:
 def _sequence_key(actions: Iterable[int], contexts: Iterable[int]) -> int:
     digest = blake2b(digest_size=8)
     digest.update(b"strategy-sequence-v2")
-    digest.update(str(tuple(int(value) for value in actions)).encode("ascii"))
-    digest.update(str(tuple(int(value) for value in contexts)).encode("ascii"))
+    digest.update(
+        str(tuple(int(value) for value in actions)).encode("ascii")
+    )
+    digest.update(
+        str(tuple(int(value) for value in contexts)).encode("ascii")
+    )
     return int.from_bytes(digest.digest(), "little") & _MASK63

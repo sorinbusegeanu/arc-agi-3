@@ -24,6 +24,7 @@ from v7.memory.indexes.cognition import (
     RoleConceptIndexMutation,
     RoleIndexMutation,
 )
+from v7.memory.planning import planning_context
 from v7.memory.writer import CanonicalMemoryWriter
 
 
@@ -41,7 +42,9 @@ class MemoryLearningPipeline:
         self.evidence_store = evidence_store
 
     def _record_parents(
-        self, memory_id: MemoryId, parents: Iterable[MemoryId]
+        self,
+        memory_id: MemoryId,
+        parents: Iterable[MemoryId],
     ) -> None:
         if self.evidence_lifecycle is None:
             return
@@ -68,7 +71,8 @@ class MemoryLearningPipeline:
 
     @staticmethod
     def _m1_candidate(
-        evidence: EpisodeEvidence, context_signature: int
+        evidence: EpisodeEvidence,
+        context_signature: int,
     ) -> CanonicalCandidateMutation:
         polarity = int(getattr(evidence, "terminal_polarity", 0) or 0)
         if polarity > 0:
@@ -98,16 +102,25 @@ class MemoryLearningPipeline:
     def observe_episode(self, evidence: EpisodeEvidence) -> MemoryId:
         return self.observe_batch((evidence,))[0]
 
-    def observe_batch(self, rows: Iterable[EpisodeEvidence]) -> tuple[MemoryId, ...]:
+    def observe_batch(
+        self,
+        rows: Iterable[EpisodeEvidence],
+    ) -> tuple[MemoryId, ...]:
         episodes = tuple(rows)
         if not episodes:
             return ()
 
-        expanded: list[tuple[EpisodeEvidence, int, CanonicalCandidateMutation]] = []
+        expanded: list[
+            tuple[EpisodeEvidence, int, CanonicalCandidateMutation]
+        ] = []
         for evidence in episodes:
             for context in self._contexts(evidence):
                 expanded.append(
-                    (evidence, context, self._m1_candidate(evidence, context))
+                    (
+                        evidence,
+                        context,
+                        self._m1_candidate(evidence, context),
+                    )
                 )
         resolved = self.writer.apply_canonical_candidate_batch(
             candidate for _evidence, _context, candidate in expanded
@@ -121,9 +134,16 @@ class MemoryLearningPipeline:
             for evidence, context, candidate in expanded
         )
 
+        # Historical evidence, planning markers and M6 procedure steps must all
+        # refer to the stable C3 planning identity. Terminal/surprising rows may
+        # retain C4 as an extra specialization, but C4 is not the trajectory ID.
         memory_ids: list[MemoryId] = []
         for evidence in episodes:
-            context = self._contexts(evidence)[-1]
+            contexts = self._contexts(evidence)
+            context = planning_context(
+                contexts,
+                fallback=int(evidence.context_signature),
+            )
             memory_ids.append(
                 resolved[self._m1_candidate(evidence, context).key]
             )
@@ -160,7 +180,9 @@ class MemoryLearningPipeline:
                     source_global_step=evidence.source_global_step,
                 )
                 for evidence, memory_id in zip(
-                    episodes, memory_ids, strict=True
+                    episodes,
+                    memory_ids,
+                    strict=True,
                 )
             )
             self.evidence_lifecycle.append_contradictions(
@@ -177,7 +199,9 @@ class MemoryLearningPipeline:
                     },
                 )
                 for evidence, memory_id in zip(
-                    episodes, memory_ids, strict=True
+                    episodes,
+                    memory_ids,
+                    strict=True,
                 )
                 if float(evidence.prediction_error) > 0
             )
@@ -197,26 +221,32 @@ class MemoryLearningPipeline:
                         "next_context_signatures": [
                             int(value)
                             for value in getattr(
-                                evidence, "next_context_signatures", ()
+                                evidence,
+                                "next_context_signatures",
+                                (),
                             )
                             or ()
                         ],
                         "exact_context_signature": getattr(
-                            evidence, "exact_context_signature", None
+                            evidence,
+                            "exact_context_signature",
+                            None,
                         ),
                         "structural_context_signature": getattr(
-                            evidence, "structural_context_signature", None
+                            evidence,
+                            "structural_context_signature",
+                            None,
                         ),
                         "action_id": int(evidence.action_id),
                         "outcome_signature": int(evidence.outcome_signature),
                         "raw_transition_signature": getattr(
-                            evidence, "raw_transition_signature", None
+                            evidence,
+                            "raw_transition_signature",
+                            None,
                         ),
                         "success": bool(evidence.success),
                         "prediction_error": float(evidence.prediction_error),
-                        "future_option_delta": float(
-                            evidence.future_option_delta
-                        ),
+                        "future_option_delta": float(evidence.future_option_delta),
                         "raw_action_option_delta": float(
                             evidence.raw_action_option_delta
                         ),
@@ -232,14 +262,18 @@ class MemoryLearningPipeline:
                         "decision_world_model_ids": [
                             int(value)
                             for value in getattr(
-                                evidence, "decision_world_model_ids", ()
+                                evidence,
+                                "decision_world_model_ids",
+                                (),
                             )
                             or ()
                         ],
                         "decision_strategy_ids": [
                             int(value)
                             for value in getattr(
-                                evidence, "decision_strategy_ids", ()
+                                evidence,
+                                "decision_strategy_ids",
+                                (),
                             )
                             or ()
                         ],
@@ -251,18 +285,56 @@ class MemoryLearningPipeline:
                         "max_action_score": float(evidence.max_action_score),
                         "memory_guided": bool(evidence.memory_guided),
                         "future_option_ablation_available": bool(
-                            getattr(evidence, "future_option_ablation_available", False)
+                            getattr(
+                                evidence,
+                                "future_option_ablation_available",
+                                False,
+                            )
                         ),
                         "future_option_ablation_score_delta": float(
-                            getattr(evidence, "future_option_ablation_score_delta", 0.0)
+                            getattr(
+                                evidence,
+                                "future_option_ablation_score_delta",
+                                0.0,
+                            )
                         ),
                         "future_option_ablation_rank_lift": int(
-                            getattr(evidence, "future_option_ablation_rank_lift", 0)
+                            getattr(
+                                evidence,
+                                "future_option_ablation_rank_lift",
+                                0,
+                            )
+                        ),
+                        "future_option_ablation_choice_changed": bool(
+                            getattr(
+                                evidence,
+                                "future_option_ablation_choice_changed",
+                                False,
+                            )
+                        ),
+                        "trajectory_segment_id": str(
+                            getattr(evidence, "trajectory_segment_id", "") or ""
+                        ),
+                        "reset_boundary_before_step": bool(
+                            getattr(
+                                evidence,
+                                "reset_boundary_before_step",
+                                False,
+                            )
+                        ),
+                        "future_option_observable": bool(
+                            getattr(
+                                evidence,
+                                "future_option_observable",
+                                True,
+                            )
                         ),
                     },
                 )
                 for evidence, memory_id in zip(
-                    episodes, memory_ids, strict=True
+                    episodes,
+                    memory_ids,
+                    strict=True,
                 )
             )
 
@@ -272,14 +344,18 @@ class MemoryLearningPipeline:
                 if evidence.terminal_polarity != 0 and evidence.source_game:
                     transfer_records.extend(
                         self._transfer_records(
-                            evidence, target_game=evidence.source_game
+                            evidence,
+                            target_game=evidence.source_game,
                         )
                     )
             self.evidence_lifecycle.append_transfer_trials(transfer_records)
         return tuple(memory_ids)
 
     def _transfer_records(
-        self, evidence: EpisodeEvidence, *, target_game: str
+        self,
+        evidence: EpisodeEvidence,
+        *,
+        target_game: str,
     ) -> list[TransferTrialRecord]:
         if self.evidence_lifecycle is None:
             return []
@@ -324,12 +400,14 @@ class MemoryLearningPipeline:
                         "source_game_count": len(source_games),
                         "target_context": evidence.source_context,
                         "source_global_step": evidence.source_global_step,
-                        "future_option_delta": float(
-                            evidence.future_option_delta
-                        ),
+                        "future_option_delta": float(evidence.future_option_delta),
                         "carrier_signature": None
                         if evidence.carrier_signature is None
                         else int(evidence.carrier_signature),
+                        "attribution": "terminal_action",
+                        "trajectory_segment_id": str(
+                            getattr(evidence, "trajectory_segment_id", "") or ""
+                        ),
                     },
                 )
             )
@@ -380,7 +458,10 @@ class MemoryLearningPipeline:
         self.writer.apply_role_index_batch(
             (
                 RoleIndexMutation(
-                    int(context_class), int(action_id), memory_id, family_id
+                    int(context_class),
+                    int(action_id),
+                    memory_id,
+                    family_id,
                 ),
             )
         )
@@ -388,11 +469,15 @@ class MemoryLearningPipeline:
         return memory_id
 
     def derive_m4(
-        self, *, role_ids: Iterable[MemoryId], relation_signature: int
+        self,
+        *,
+        role_ids: Iterable[MemoryId],
+        relation_signature: int,
     ) -> MemoryId:
         roles = tuple(role_ids)
         candidate = ScientificDerivationKernels.m4_concept(
-            role_ids=roles, relation_signature=relation_signature
+            role_ids=roles,
+            relation_signature=relation_signature,
         )
         memory_id = self.writer.apply_canonical_candidate_batch((candidate,))[
             candidate.key
@@ -414,7 +499,8 @@ class MemoryLearningPipeline:
     ) -> MemoryId:
         concepts = tuple(concept_ids)
         candidate = ScientificDerivationKernels.m5_world_model(
-            concept_ids=concepts, transition_signature=transition_signature
+            concept_ids=concepts,
+            transition_signature=transition_signature,
         )
         memory_id = self.writer.apply_canonical_candidate_batch((candidate,))[
             candidate.key

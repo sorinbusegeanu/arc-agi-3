@@ -7,6 +7,7 @@ from typing import Iterable
 
 from v7.memory.ids import MemoryId, MemoryLevel
 from v7.memory.read_view import MemoryReadView
+from v7.memory.status import memory_is_active
 
 # Typed relations stored in the canonical adjacency graph. They deliberately
 # live outside the M1-M6 type-id range and are stable logical semantics.
@@ -23,14 +24,10 @@ TYPE_EXECUTABLE_PROCEDURE = 601
 def planning_context(signatures: Iterable[int], fallback: int = 0) -> int:
     """Return the reusable combined planning context with legacy compatibility."""
     values = tuple(int(value) for value in signatures)
-    # Phase 4 context lattice: C0 general, C1 behavioral, C2 structural,
-    # C3 combined, C4 exact. C3 is the persistent planning identity.
     if len(values) >= 5:
         return int(values[3])
-    # Ordinary phase-4 evidence omits C4, leaving C0-C3.
     if len(values) == 4:
         return int(values[3])
-    # Phase-1/legacy evidence used C0,C1,C2 where C2 was planning context.
     if len(values) >= 3:
         return int(values[2])
     if values:
@@ -63,12 +60,7 @@ class StrategyProcedure:
 
 
 class PersistentPlanningGraph:
-    """Immutable read-side planning graph reconstructed from canonical typed edges.
-
-    The graph persists because the writer stores the typed edges in the same
-    generation graph as the M1-M6 memories. Workers reconstruct this small
-    read-side index once when attaching an immutable generation.
-    """
+    """Immutable read-side planning graph reconstructed from active memories."""
 
     def __init__(
         self,
@@ -102,7 +94,14 @@ class PersistentPlanningGraph:
         )
 
         for source, relation in view.adjacency:
-            targets = view.adjacency[(source, relation)]
+            source_node = view.nodes.get(source)
+            if not memory_is_active(source_node):
+                continue
+            targets = tuple(
+                target
+                for target in view.adjacency[(source, relation)]
+                if memory_is_active(view.nodes.get(target))
+            )
             if relation == REL_PLAN_TRANSITION:
                 transition_sets[source].update(targets)
             elif relation == REL_PLAN_SUCCESS:
@@ -113,9 +112,12 @@ class PersistentPlanningGraph:
                 stall.add(source)
             elif relation == REL_PLAN_OPTION_LOSS:
                 option_loss.add(source)
-            elif REL_STRATEGY_STEP_BASE <= relation < REL_STRATEGY_STEP_BASE + MAX_STRATEGY_STEPS:
-                node = view.nodes.get(source)
-                if node is None or node.level != MemoryLevel.M6:
+            elif (
+                REL_STRATEGY_STEP_BASE
+                <= relation
+                < REL_STRATEGY_STEP_BASE + MAX_STRATEGY_STEPS
+            ):
+                if source_node is None or source_node.level != MemoryLevel.M6:
                     continue
                 position = int(relation - REL_STRATEGY_STEP_BASE)
                 raw_strategy_steps[source][position].update(targets)
@@ -144,7 +146,10 @@ class PersistentPlanningGraph:
                     )
                 )
             if steps and [step.position for step in steps] == list(range(len(steps))):
-                strategies[strategy_id] = StrategyProcedure(strategy_id, tuple(steps))
+                strategies[strategy_id] = StrategyProcedure(
+                    strategy_id,
+                    tuple(steps),
+                )
 
         return cls(
             transitions={
@@ -160,7 +165,9 @@ class PersistentPlanningGraph:
         )
 
     @staticmethod
-    def _reverse_contingency_index(view: MemoryReadView) -> dict[MemoryId, tuple[int, int]]:
+    def _reverse_contingency_index(
+        view: MemoryReadView,
+    ) -> dict[MemoryId, tuple[int, int]]:
         packed = view.packed_cognition.contingencies
         output: dict[MemoryId, tuple[int, int]] = {}
         for row in range(len(packed.key_a)):
@@ -171,7 +178,11 @@ class PersistentPlanningGraph:
             for raw_memory_id in packed.values[start:stop]:
                 memory_id = MemoryId(int(raw_memory_id))
                 node = view.nodes.get(memory_id)
-                if node is not None and node.level == MemoryLevel.M1:
+                if (
+                    node is not None
+                    and node.level == MemoryLevel.M1
+                    and memory_is_active(node)
+                ):
                     output.setdefault(memory_id, (context, action))
         return output
 
@@ -186,7 +197,7 @@ class PersistentPlanningGraph:
         sources = tuple(
             memory_id
             for memory_id in sorted(set(source_ids), key=int)
-            if memory_id in view.nodes
+            if memory_is_active(view.nodes.get(memory_id))
         )
         if not sources:
             return PlanningSignal()
@@ -199,7 +210,9 @@ class PersistentPlanningGraph:
 
         def weighted_marker(markers: frozenset[MemoryId]) -> float:
             return sum(
-                weight for memory_id, weight in weights.items() if memory_id in markers
+                weight
+                for memory_id, weight in weights.items()
+                if memory_id in markers
             ) / total_weight
 
         direct_failure = weighted_marker(self.failure_nodes)
@@ -211,7 +224,9 @@ class PersistentPlanningGraph:
         queue: deque[tuple[MemoryId, int]] = deque(
             (memory_id, 0) for memory_id in sources
         )
-        best_depth: dict[MemoryId, int] = {memory_id: 0 for memory_id in sources}
+        best_depth: dict[MemoryId, int] = {
+            memory_id: 0 for memory_id in sources
+        }
         success_reach = direct_success
         descendant_failure = 0.0
         descendant_stall = 0.0
@@ -222,6 +237,8 @@ class PersistentPlanningGraph:
             if distance >= max(1, int(depth)):
                 continue
             for target in self.transitions.get(current, ()):
+                if not memory_is_active(view.nodes.get(target)):
+                    continue
                 next_distance = distance + 1
                 old = best_depth.get(target)
                 if old is not None and old <= next_distance:
@@ -242,17 +259,25 @@ class PersistentPlanningGraph:
                 queue.append((target, next_distance))
 
         reachability = (
-            min(1.0, math.log1p(len(reached)) / math.log1p(max(2, int(max_nodes))))
+            min(
+                1.0,
+                math.log1p(len(reached))
+                / math.log1p(max(2, int(max_nodes))),
+            )
             if reached
             else 0.0
         )
         return PlanningSignal(
             reachability=reachability,
             success_reachability=min(1.0, success_reach),
-            failure_risk=min(1.0, max(direct_failure, 0.5 * descendant_failure)),
+            failure_risk=min(
+                1.0,
+                max(direct_failure, 0.5 * descendant_failure),
+            ),
             stall_risk=min(1.0, max(direct_stall, 0.5 * descendant_stall)),
             option_loss_risk=min(
-                1.0, max(direct_option_loss, 0.5 * descendant_option_loss)
+                1.0,
+                max(direct_option_loss, 0.5 * descendant_option_loss),
             ),
             reachable_nodes=len(reached),
         )

@@ -1,21 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import IntFlag
 from math import log1p
 from typing import Iterable, Mapping
 
 from v7.memory.ids import MemoryId
 from v7.memory.models import MemoryNode, MemoryScore, NodeMutation
 from v7.memory.read_view import MemoryReadView
+from v7.memory.status import MemoryStatus
 from v7.memory.writer import CanonicalMemoryWriter
-
-
-class MemoryStatus(IntFlag):
-    ACTIVE = 1 << 0
-    PROMOTED = 1 << 1
-    DEMOTED = 1 << 2
-    REPLAY_QUEUED = 1 << 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,11 +79,19 @@ class ReplayQueue:
         ):
             self._requests[request.memory_id] = request
         if len(self._requests) > self.limit:
-            ordered = sorted(self._requests.values(), key=lambda item: (-item.priority, int(item.memory_id)))[: self.limit]
+            ordered = sorted(
+                self._requests.values(),
+                key=lambda item: (-item.priority, int(item.memory_id)),
+            )[: self.limit]
             self._requests = {item.memory_id: item for item in ordered}
 
     def snapshot(self) -> tuple[ReplayRequest, ...]:
-        return tuple(sorted(self._requests.values(), key=lambda item: (-item.priority, int(item.memory_id))))
+        return tuple(
+            sorted(
+                self._requests.values(),
+                key=lambda item: (-item.priority, int(item.memory_id)),
+            )
+        )
 
     def pop_all(self) -> tuple[ReplayRequest, ...]:
         rows = self.snapshot()
@@ -112,10 +113,19 @@ class MemoryLifecycleController:
         self.policy = policy or LifecyclePolicy()
         self.replay_queue = ReplayQueue(limit=self.policy.replay_limit)
 
-    def fitness(self, node: MemoryNode, score: MemoryScore | None, *, empirical_transfer: float = 0.0) -> float:
+    def fitness(
+        self,
+        node: MemoryNode,
+        score: MemoryScore | None,
+        *,
+        empirical_transfer: float = 0.0,
+    ) -> float:
         score = score or MemoryScore(memory_id=node.memory_id)
         p = self.policy
-        support_term = min(1.0, log1p(max(0, node.support_count)) / log1p(8.0))
+        support_term = min(
+            1.0,
+            log1p(max(0, node.support_count)) / log1p(8.0),
+        )
         empirical = min(1.0, max(0.0, float(empirical_transfer)))
         return (
             p.significance_weight * max(0.0, score.significance)
@@ -127,7 +137,12 @@ class MemoryLifecycleController:
             + p.support_weight * support_term
         )
 
-    def _replay_reason(self, score: MemoryScore | None, empirical_transfer: float, contradiction_severity: float) -> tuple[int, float]:
+    def _replay_reason(
+        self,
+        score: MemoryScore | None,
+        empirical_transfer: float,
+        contradiction_severity: float,
+    ) -> tuple[int, float]:
         p = self.policy
         reason = 0
         priority = 0.0
@@ -162,7 +177,12 @@ class MemoryLifecycleController:
         empirical_transfer: Mapping[MemoryId, float] | None = None,
         contradiction_severity: Mapping[MemoryId, float] | None = None,
     ) -> tuple[LifecycleDecision, ...]:
-        ids = tuple(sorted(memory_ids if memory_ids is not None else view.nodes.keys(), key=int))
+        ids = tuple(
+            sorted(
+                memory_ids if memory_ids is not None else view.nodes.keys(),
+                key=int,
+            )
+        )
         transfer = empirical_transfer or {}
         contradictions = contradiction_severity or {}
         decisions: list[LifecycleDecision] = []
@@ -174,21 +194,46 @@ class MemoryLifecycleController:
             empirical = float(transfer.get(memory_id, 0.0))
             contradiction = float(contradictions.get(memory_id, 0.0))
             fitness = self.fitness(node, score, empirical_transfer=empirical)
-            promote = node.support_count >= self.policy.minimum_promotion_support and fitness >= self.policy.promote_threshold
+            promote = (
+                node.support_count >= self.policy.minimum_promotion_support
+                and fitness >= self.policy.promote_threshold
+            )
             demote = not promote and fitness < self.policy.retain_threshold
-            replay_reason, replay_priority = self._replay_reason(score, empirical, contradiction)
+            replay_reason, replay_priority = self._replay_reason(
+                score,
+                empirical,
+                contradiction,
+            )
             replay = replay_reason != 0
             flags = int(node.status_flags) | int(MemoryStatus.ACTIVE)
             if promote:
-                flags = (flags | int(MemoryStatus.PROMOTED)) & ~int(MemoryStatus.DEMOTED)
+                flags = (flags | int(MemoryStatus.PROMOTED)) & ~int(
+                    MemoryStatus.DEMOTED
+                )
             elif demote:
-                flags = (flags | int(MemoryStatus.DEMOTED)) & ~int(MemoryStatus.PROMOTED | MemoryStatus.ACTIVE)
+                flags = (flags | int(MemoryStatus.DEMOTED)) & ~int(
+                    MemoryStatus.PROMOTED | MemoryStatus.ACTIVE
+                )
             if replay:
                 flags |= int(MemoryStatus.REPLAY_QUEUED)
-                self.replay_queue.push(ReplayRequest(memory_id, replay_priority, replay_reason))
+                self.replay_queue.push(
+                    ReplayRequest(memory_id, replay_priority, replay_reason)
+                )
             else:
                 flags &= ~int(MemoryStatus.REPLAY_QUEUED)
-            decisions.append(LifecycleDecision(memory_id, fitness, promote, demote, replay, int(node.status_flags), flags, empirical, contradiction))
+            decisions.append(
+                LifecycleDecision(
+                    memory_id,
+                    fitness,
+                    promote,
+                    demote,
+                    replay,
+                    int(node.status_flags),
+                    flags,
+                    empirical,
+                    contradiction,
+                )
+            )
         return tuple(decisions)
 
     def apply(
@@ -211,7 +256,15 @@ class MemoryLifecycleController:
             if decision.next_flags == decision.previous_flags:
                 continue
             node = view.nodes[decision.memory_id]
-            mutations.append(NodeMutation(decision.memory_id, node.level, node.type_id, support_delta=0, status_flags=decision.next_flags))
+            mutations.append(
+                NodeMutation(
+                    decision.memory_id,
+                    node.level,
+                    node.type_id,
+                    support_delta=0,
+                    status_flags=decision.next_flags,
+                )
+            )
         if mutations:
             writer.apply_mutation_batch(mutations)
         return decisions

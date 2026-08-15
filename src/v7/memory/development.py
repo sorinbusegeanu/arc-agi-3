@@ -55,7 +55,15 @@ class DevelopmentalLifecycleRuntime:
     ) -> DevelopmentalLifecycleResult:
         profile = profile_for_view(view)
         lifecycle_decisions, stats = self.lifecycle_runtime.run(view, writer=writer)
-        summaries = self.evidence_lifecycle.transfer_summary(view.nodes.keys())
+        formation_generations = {
+            memory_id: int(node.created_generation)
+            for memory_id, node in view.nodes.items()
+            if int(node.level) == 4
+        }
+        summaries = self.evidence_lifecycle.heldout_transfer_summary(
+            formation_generations.keys(),
+            formation_generations=formation_generations,
+        )
         concept_decisions = self.concept_validator.evaluate(
             view,
             transfer_summary=summaries,
@@ -89,8 +97,18 @@ class DevelopmentalLifecycleRuntime:
                         "previous_flags": int(d.previous_flags),
                         "next_flags": int(d.next_flags),
                         "development_stage": profile.stage.name,
+                        "heldout_validation": True,
+                        "formation_generation": formation_generations.get(
+                            d.memory_id
+                        ),
                         "validation_source_games": list(
-                            self.evidence_lifecycle.provenance_source_games(d.memory_id)
+                            self.evidence_lifecycle.provenance_source_games_at(
+                                d.memory_id,
+                                formation_generations.get(
+                                    d.memory_id,
+                                    int(view.generation_id),
+                                ),
+                            )
                         ),
                     },
                 )
