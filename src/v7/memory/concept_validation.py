@@ -1,22 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import IntFlag
 from typing import Iterable, Mapping
 
 from v7.memory.ids import MemoryId, MemoryLevel
 from v7.memory.models import NodeMutation
 from v7.memory.read_view import MemoryReadView
+from v7.memory.status import ConceptValidationStatus
 from v7.memory.writer import CanonicalMemoryWriter
-
-
-class ConceptValidationStatus(IntFlag):
-    CANDIDATE = 1 << 8
-    TRANSFER_VALIDATED = 1 << 9
-    TRANSFER_REJECTED = 1 << 10
-    STRUCTURAL_SUPPORTED = 1 << 11
-    TRANSFER_CANDIDATE = 1 << 12
-    TRUSTED = 1 << 13
 
 
 _VALIDATION_MASK = int(
@@ -178,7 +169,11 @@ class EmpiricalConceptValidator:
         return tuple(result)
 
     @staticmethod
-    def _set_flag(flags: int, flag: ConceptValidationStatus, enabled: bool) -> int:
+    def _set_flag(
+        flags: int,
+        flag: ConceptValidationStatus,
+        enabled: bool,
+    ) -> int:
         if enabled:
             return int(flags) | int(flag)
         return int(flags) & ~int(flag)
