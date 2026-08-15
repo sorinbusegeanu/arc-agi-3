@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -12,6 +13,9 @@ from v8.diagnostics import format_game_rate_line, format_hypothesis_line
 from v8.experiments import ExperimentSummary, run_automatic_transfer_experiments
 from v8.runtime import ContinuousMemoryRuntime, V8RuntimeConfig
 from v8.snapshot import latest_complete_snapshot
+
+
+_GAME_WAIT_ENV = "ARC_AGI3_GAME_WAIT_SECONDS"
 
 
 def _runtime_config(args, *, total_steps: int = 0) -> V8RuntimeConfig:
@@ -110,6 +114,9 @@ def _graph_load_line(*, snapshot_path: Path | None, restore_enabled: bool, nodes
 def run_continuous(args) -> int:
     from v7.game_sets import resolve_game_selector
 
+    if float(args.wait) < 0:
+        raise ValueError("--wait must be non-negative")
+
     games = resolve_game_selector(args.games, args.env_root)
     jobs = _actor_jobs(
         games,
@@ -131,22 +138,31 @@ def run_continuous(args) -> int:
 
     experiments = ExperimentSummary(0, 0, 0)
     try:
-        runtime.start()
-        print(
-            f"v8 continuous: games={len(games)} actors={len(jobs)} shards={args.shards} "
-            f"stage_workers={args.stage_workers} peers={'off' if args.no_peers else 'on'} "
-            f"snapshots={'off' if args.no_snapshots else 'async'}",
-            flush=True,
-        )
-        _log(_graph_load_line(snapshot_path=restore_source, restore_enabled=restore_enabled, nodes=loaded_nodes))
-        _log(format_hypothesis_line(runtime.scientific_statuses()))
-        results = run_actor_jobs(
-            runtime,
-            jobs,
-            timeout=args.actor_timeout,
-            progress_interval_seconds=args.progress_interval_seconds,
-            progress_callback=report_progress,
-        )
+        previous_wait = os.environ.get(_GAME_WAIT_ENV)
+        os.environ[_GAME_WAIT_ENV] = str(float(args.wait))
+        try:
+            runtime.start()
+            print(
+                f"v8 continuous: games={len(games)} actors={len(jobs)} shards={args.shards} "
+                f"stage_workers={args.stage_workers} peers={'off' if args.no_peers else 'on'} "
+                f"snapshots={'off' if args.no_snapshots else 'async'} wait={float(args.wait):g}s/game",
+                flush=True,
+            )
+            _log(_graph_load_line(snapshot_path=restore_source, restore_enabled=restore_enabled, nodes=loaded_nodes))
+            _log(format_hypothesis_line(runtime.scientific_statuses()))
+            results = run_actor_jobs(
+                runtime,
+                jobs,
+                timeout=args.actor_timeout,
+                progress_interval_seconds=args.progress_interval_seconds,
+                progress_callback=report_progress,
+            )
+        finally:
+            if previous_wait is None:
+                os.environ.pop(_GAME_WAIT_ENV, None)
+            else:
+                os.environ[_GAME_WAIT_ENV] = previous_wait
+
         runtime.record_actor_results(results)
         runtime.wait_quiescent(timeout=args.drain_timeout)
 
@@ -231,6 +247,12 @@ def main(argv: list[str] | None = None) -> int:
     continuous.add_argument("--seed", type=int, default=0)
     continuous.add_argument("--env-root", default=None)
     continuous.add_argument("--epsilon", type=float, default=0.10)
+    continuous.add_argument(
+        "--wait",
+        type=float,
+        default=1.0,
+        help="seconds each actor waits after a complete ARC game episode (WIN/GAME_OVER)",
+    )
     continuous.add_argument("--actor-timeout", type=float, default=None)
     continuous.add_argument("--progress-interval-seconds", type=float, default=60.0)
     continuous.add_argument("--drain-timeout", type=float, default=300.0)
