@@ -47,6 +47,10 @@ class RelationType(IntEnum):
     SUPERSEDES = 7
     PREFERENCE = 8
     GAME_PROVENANCE = 9
+    DEPENDS_ON = 10
+    ENABLES = 11
+    BLOCKS = 12
+    OUTCOME_EQUIVALENT = 13
 
 
 class CognitiveState(IntEnum):
