@@ -41,8 +41,8 @@ CONTRACTS: tuple[HypothesisContract, ...] = (
     HypothesisContract("H11", ("transfer_trial_pass",), ("transfer_trial_pass",), 2),
     HypothesisContract("H12", ("strategy_reuse",), ("strategy_efficiency",), 1),
     HypothesisContract("H13", ("outcome_equivalence",), ("outcome_equivalence",), 2),
-    HypothesisContract("H14", ("alternative_strategy",), ("replanning_recovery",), 1),
-    HypothesisContract("H15", ("preference_candidate",), ("stable_preference",), 1),
+    HypothesisContract("H14", ("alternative_strategy", "replanning_observed"), ("replanning_recovery_trial",), 1),
+    HypothesisContract("H15", ("preference_probe",), ("stable_preference_probe",), 1),
 )
 
 
