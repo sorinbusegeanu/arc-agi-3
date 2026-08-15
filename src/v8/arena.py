@@ -9,7 +9,8 @@ from v8.model import MemoryUid, u64
 
 _HEADER = Struct("<QQ")  # count, seqlock version
 _NODE = Struct("<QQQBHBQQQQqddddddddddQQBB")
-_EDGE = Struct("<QQHQQqQ")
+_EDGE_V1 = Struct("<QQHQQqQ")
+_EDGE = Struct("<QQHQQqQddQQ")
 _ACTION = Struct("<BQiqddQ")
 
 
@@ -87,6 +88,14 @@ class EdgeRecord:
     target_uid: MemoryUid
     support_count: int
     updated_watermark: int
+    score_sum: float = 0.0
+    score_weight: float = 0.0
+    source_version: int = 0
+    target_version: int = 0
+
+    @property
+    def score(self) -> float:
+        return 0.0 if self.score_weight <= 0 else self.score_sum / self.score_weight
 
 
 @dataclass(frozen=True, slots=True)
@@ -310,19 +319,67 @@ class SharedEdgeArena(_SharedArena):
             u64(value.target_uid.lo),
             int(value.support_count),
             u64(value.updated_watermark),
+            float(value.score_sum),
+            float(value.score_weight),
+            u64(value.source_version),
+            u64(value.target_version),
         )
 
     def read(self, row: int) -> EdgeRecord:
-        source_hi, source_lo, relation, target_hi, target_lo, support, watermark = _EDGE.unpack_from(
-            self._shm.buf, self._offset(row)
-        )
+        (
+            source_hi,
+            source_lo,
+            relation,
+            target_hi,
+            target_lo,
+            support,
+            watermark,
+            score_sum,
+            score_weight,
+            source_version,
+            target_version,
+        ) = _EDGE.unpack_from(self._shm.buf, self._offset(row))
         return EdgeRecord(
             MemoryUid(source_hi, source_lo),
             int(relation),
             MemoryUid(target_hi, target_lo),
             int(support),
             int(watermark),
+            float(score_sum),
+            float(score_weight),
+            int(source_version),
+            int(target_version),
         )
+
+    def load_snapshot(self, payload: bytes) -> None:
+        if len(payload) < _HEADER.size:
+            raise ValueError("invalid arena snapshot")
+        count, seq = _HEADER.unpack_from(payload, 0)
+        current_size = _HEADER.size + int(count) * _EDGE.size
+        if len(payload) == current_size:
+            return super().load_snapshot(payload)
+        legacy_size = _HEADER.size + int(count) * _EDGE_V1.size
+        if len(payload) != legacy_size:
+            raise ValueError("edge arena snapshot size mismatch")
+        if int(count) > self.capacity:
+            raise ValueError("snapshot exceeds edge arena capacity")
+        self._shm.buf[:] = b"\0" * len(self._shm.buf)
+        self._set_header(int(count), int(seq) + 1 if int(seq) & 1 else int(seq))
+        for row in range(int(count)):
+            offset = _HEADER.size + row * _EDGE_V1.size
+            source_hi, source_lo, relation, target_hi, target_lo, support, watermark = _EDGE_V1.unpack_from(
+                payload, offset
+            )
+            self.write(
+                row,
+                EdgeRecord(
+                    MemoryUid(source_hi, source_lo),
+                    int(relation),
+                    MemoryUid(target_hi, target_lo),
+                    int(support),
+                    int(watermark),
+                ),
+            )
 
     def records(self) -> Iterator[EdgeRecord]:
         for row in range(self.count):
