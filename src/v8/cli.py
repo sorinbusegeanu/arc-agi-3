@@ -7,20 +7,30 @@ from dataclasses import asdict
 from pathlib import Path
 
 from v8.actor import ActorJob, run_actor_jobs
+from v8.capacity import plan_capacities
 from v8.diagnostics import format_game_rate_line, format_hypothesis_line
 from v8.runtime import ContinuousMemoryRuntime, V8RuntimeConfig
 
 
-def _runtime_config(args) -> V8RuntimeConfig:
+def _runtime_config(args, *, total_steps: int = 0) -> V8RuntimeConfig:
+    plan = plan_capacities(
+        total_steps=int(total_steps),
+        shards=int(args.shards),
+        root=args.root,
+        restore=not args.no_restore,
+        node_override=args.node_capacity_per_shard,
+        edge_override=args.edge_capacity_per_shard,
+        action_override=args.action_capacity_per_shard,
+    )
     return V8RuntimeConfig.from_path(
         args.root,
         shards=args.shards,
         stage_workers=args.stage_workers,
         stage_ring_capacity=args.stage_ring_capacity,
         shard_ring_capacity=args.shard_ring_capacity,
-        node_capacity_per_shard=args.node_capacity_per_shard,
-        edge_capacity_per_shard=args.edge_capacity_per_shard,
-        action_capacity_per_shard=args.action_capacity_per_shard,
+        node_capacity_per_shard=plan.node_capacity_per_shard,
+        edge_capacity_per_shard=plan.edge_capacity_per_shard,
+        action_capacity_per_shard=plan.action_capacity_per_shard,
         snapshot_interval_seconds=args.snapshot_interval_seconds,
         enable_snapshots=not args.no_snapshots,
         restore=not args.no_restore,
@@ -33,9 +43,24 @@ def _add_runtime_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--stage-workers", type=int, default=2)
     parser.add_argument("--stage-ring-capacity", type=int, default=8192)
     parser.add_argument("--shard-ring-capacity", type=int, default=8192)
-    parser.add_argument("--node-capacity-per-shard", type=int, default=250_000)
-    parser.add_argument("--edge-capacity-per-shard", type=int, default=500_000)
-    parser.add_argument("--action-capacity-per-shard", type=int, default=65_536)
+    parser.add_argument(
+        "--node-capacity-per-shard",
+        type=int,
+        default=None,
+        help="Manual node arena capacity. Default: auto-size from total requested steps.",
+    )
+    parser.add_argument(
+        "--edge-capacity-per-shard",
+        type=int,
+        default=None,
+        help="Manual edge arena capacity. Default: auto-size from total requested steps.",
+    )
+    parser.add_argument(
+        "--action-capacity-per-shard",
+        type=int,
+        default=None,
+        help="Manual action-index capacity. Default: auto-size from total requested steps.",
+    )
     parser.add_argument("--snapshot-interval-seconds", type=float, default=60.0)
     parser.add_argument("--no-restore", action="store_true")
     parser.add_argument("--no-snapshots", action="store_true")
@@ -94,7 +119,8 @@ def run_continuous(args) -> int:
         env_root=args.env_root,
         epsilon=args.epsilon,
     )
-    runtime = ContinuousMemoryRuntime(_runtime_config(args))
+    total_steps = sum(int(job.steps) for job in jobs)
+    runtime = ContinuousMemoryRuntime(_runtime_config(args, total_steps=total_steps))
     try:
         runtime.start()
         print(
@@ -131,7 +157,7 @@ def run_continuous(args) -> int:
 
 
 def run_smoke(args) -> int:
-    runtime = ContinuousMemoryRuntime(_runtime_config(args))
+    runtime = ContinuousMemoryRuntime(_runtime_config(args, total_steps=int(args.events)))
     try:
         runtime.start()
         for index in range(args.events):
