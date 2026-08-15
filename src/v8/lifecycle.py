@@ -31,11 +31,14 @@ class LifecycleController:
         self.promotion_threshold = float(promotion_threshold)
         self.demotion_threshold = float(demotion_threshold)
         self.min_support = int(min_support)
+        self.developmental_stage = 0
         self._low_windows: dict[MemoryUid, int] = {}
 
-    @staticmethod
-    def fitness(row: NodeRecord) -> float:
-        base = score_memory(row).total
+    def set_developmental_stage(self, stage: int) -> None:
+        self.developmental_stage = max(0, min(6, int(stage)))
+
+    def fitness(self, row: NodeRecord) -> float:
+        base = score_memory(row, developmental_stage=self.developmental_stage).total
         validation_bonus = (
             0.10
             if int(row.validation_state) >= int(ValidationState.VALIDATED)
@@ -53,11 +56,6 @@ class LifecycleController:
         current = int(row.cognitive_state)
         validation = int(row.validation_state)
 
-        # A coarse M6 outcome (two-part descriptor) is a learned merge over
-        # persistent fine-grained outcome members. Failed validation invalidates
-        # only the coarse class. Quarantining it immediately removes its
-        # SUPERSEDES effect from the actor read view, exposing the original member
-        # outcomes again without destroying their identities or provenance.
         if (
             int(row.level) == int(MemoryLevel.M6)
             and int(row.memory_type) == int(MemoryType.OUTCOME)
@@ -157,15 +155,17 @@ class LifecycleController:
 
     def state_dict(self) -> dict[str, object]:
         return {
+            "developmental_stage": self.developmental_stage,
             "low_windows": [
                 {"uid": [uid.hi, uid.lo], "windows": windows}
                 for uid, windows in self._low_windows.items()
-            ]
+            ],
         }
 
     def load_state(self, state: dict[str, object] | None) -> None:
         if not state:
             return
+        self.set_developmental_stage(int(state.get("developmental_stage", 0)))
         for raw in state.get("low_windows", []):
             if not isinstance(raw, dict):
                 continue
