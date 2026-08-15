@@ -3,7 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from v8.arena import NodeRecord
-from v8.isf import ISFScore, infer_developmental_stage, score_memory
+from v8.isf import (
+    ISFScore,
+    infer_developmental_stage,
+    publish_developmental_stage,
+    score_memory,
+)
 from v8.model import CognitiveState, MemoryUid
 
 
@@ -32,7 +37,7 @@ class ReplayScheduler:
         # every score generated in this interval. Evidence created later in the
         # interval may only influence the next call/Stage_(t+1).
         stage = infer_developmental_stage(rows)
-        self.last_developmental_stage = stage
+        self.last_developmental_stage = publish_developmental_stage(stage)
         ranked: list[ReplayCandidate] = []
         for row in rows:
             if int(row.cognitive_state) in {
