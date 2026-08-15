@@ -9,6 +9,7 @@ from pathlib import Path
 from v8.actor import ActorJob, run_actor_jobs
 from v8.capacity import plan_capacities
 from v8.diagnostics import format_game_rate_line, format_hypothesis_line
+from v8.hypotheses import evaluate_live_hypothesis_statuses
 from v8.runtime import ContinuousMemoryRuntime, V8RuntimeConfig
 from v8.snapshot import latest_complete_snapshot
 
@@ -140,6 +141,11 @@ def run_continuous(args) -> int:
     restore_source = latest_complete_snapshot(args.root) if restore_enabled else None
     runtime = ContinuousMemoryRuntime(_runtime_config(args, total_steps=total_steps))
     loaded_nodes = runtime.read_view.memory_count
+
+    def report_progress(rows) -> None:
+        _log(format_game_rate_line(rows))
+        _log(format_hypothesis_line(evaluate_live_hypothesis_statuses(runtime.read_view)))
+
     try:
         runtime.start()
         print(
@@ -154,13 +160,13 @@ def run_continuous(args) -> int:
                 nodes=loaded_nodes,
             )
         )
-        _log(format_hypothesis_line())
+        _log(format_hypothesis_line(evaluate_live_hypothesis_statuses(runtime.read_view)))
         results = run_actor_jobs(
             runtime,
             jobs,
             timeout=args.actor_timeout,
             progress_interval_seconds=args.progress_interval_seconds,
-            progress_callback=lambda rows: _log(format_game_rate_line(rows)),
+            progress_callback=report_progress,
         )
         runtime.wait_quiescent(timeout=args.drain_timeout)
         metrics = runtime.metrics()
