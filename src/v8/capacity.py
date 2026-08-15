@@ -11,12 +11,13 @@ DEFAULT_NODE_CAPACITY = 250_000
 DEFAULT_EDGE_CAPACITY = 500_000
 DEFAULT_ACTION_CAPACITY = 65_536
 
-# Observed v8 memory growth is dominated by retained M0 episodes. M7 strategy
-# identity is now reusable rather than trajectory-instance scoped. These factors
-# intentionally leave substantial headroom for M1-M6 novelty and shard skew.
-NODE_GROWTH_PER_EVENT = 4.0
-EDGE_GROWTH_PER_EVENT = 4.0
-ACTION_GROWTH_PER_EVENT = 0.75
+# Per-event planning is intentionally conservative. One novel experience can create
+# M0-M7 nodes, hierarchy edges, exact GAME_PROVENANCE edges, and later peer-derived
+# abstractions. Runtime retirement/compaction reduces actual retention, but capacity
+# must still be safe for the declared interaction budget before compaction is possible.
+NODE_GROWTH_PER_EVENT = 10.0
+EDGE_GROWTH_PER_EVENT = 24.0
+ACTION_GROWTH_PER_EVENT = 1.5
 FIXED_HEADROOM = 8_192
 
 
@@ -36,7 +37,19 @@ class CapacityPlan:
     action_capacity_per_shard: int
 
 
-def _arena_count(path: Path) -> int:
+def _arena_count_from_spec(root: Path, snapshot: Path, spec: dict[str, object]) -> int:
+    """Read the first uint64 arena count from legacy files or chunk snapshots."""
+    if "chunks" in spec:
+        chunks = spec.get("chunks", [])
+        if not isinstance(chunks, list) or not chunks:
+            return 0
+        first = chunks[0]
+        if not isinstance(first, dict):
+            raise RuntimeError("invalid chunk snapshot arena specification")
+        digest = str(first.get("sha256", ""))
+        path = root / "snapshot_chunks" / f"{digest}.bin"
+    else:
+        path = snapshot / str(spec["file"])
     with path.open("rb") as stream:
         raw = stream.read(8)
     if len(raw) != 8:
@@ -45,6 +58,7 @@ def _arena_count(path: Path) -> int:
 
 
 def snapshot_usage(root: str | Path) -> SnapshotUsage:
+    root = Path(root)
     snapshot = latest_complete_snapshot(root)
     if snapshot is None:
         return SnapshotUsage()
@@ -55,8 +69,8 @@ def snapshot_usage(root: str | Path) -> SnapshotUsage:
         node_spec = shard["nodes"]
         edge_spec = shard["edges"]
         action_spec = shard["actions"]
-        node_count = max(node_count, _arena_count(snapshot / node_spec["file"]))
-        edge_count = max(edge_count, _arena_count(snapshot / edge_spec["file"]))
+        node_count = max(node_count, _arena_count_from_spec(root, snapshot, node_spec))
+        edge_count = max(edge_count, _arena_count_from_spec(root, snapshot, edge_spec))
         node_capacity = max(node_capacity, int(node_spec["capacity"]))
         edge_capacity = max(edge_capacity, int(edge_spec["capacity"]))
         action_capacity = max(action_capacity, int(action_spec["capacity"]))
@@ -109,8 +123,6 @@ def plan_capacities(
 
     if action_override is None:
         action_growth = math.ceil(per_shard_steps * ACTION_GROWTH_PER_EVENT)
-        # Action arenas are open-addressed tables, so preserve prior table size and
-        # add headroom on continuation runs rather than risking a full probe table.
         continuation_floor = prior.action_capacity + action_growth if prior.action_capacity else 0
         action_capacity = max(
             DEFAULT_ACTION_CAPACITY,

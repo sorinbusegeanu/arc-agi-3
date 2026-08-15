@@ -35,6 +35,7 @@ class SharedRingBuffer:
         head=None,
         tail=None,
         count=None,
+        mp_context=None,
     ) -> None:
         if capacity <= 0 or slot_size <= 0:
             raise ValueError("capacity and slot_size must be positive")
@@ -48,14 +49,15 @@ class SharedRingBuffer:
             name=name,
         )
         if create:
-            self._free = mp.Semaphore(self.capacity)
-            self._used = mp.Semaphore(0)
-            self._put_lock = mp.Lock()
-            self._get_lock = mp.Lock()
-            self._count_lock = mp.Lock()
-            self._head = mp.Value("Q", 0, lock=False)
-            self._tail = mp.Value("Q", 0, lock=False)
-            self._count = mp.Value("Q", 0, lock=False)
+            ctx = mp_context if mp_context is not None else mp.get_context()
+            self._free = ctx.Semaphore(self.capacity)
+            self._used = ctx.Semaphore(0)
+            self._put_lock = ctx.Lock()
+            self._get_lock = ctx.Lock()
+            self._count_lock = ctx.Lock()
+            self._head = ctx.Value("Q", 0, lock=False)
+            self._tail = ctx.Value("Q", 0, lock=False)
+            self._count = ctx.Value("Q", 0, lock=False)
         else:
             required = (free, used, put_lock, get_lock, count_lock, head, tail, count)
             if any(value is None for value in required):

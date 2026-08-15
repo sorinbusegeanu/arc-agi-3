@@ -17,7 +17,14 @@ from v8.publication import ShardReadDescriptor
 
 _CHUNK_BYTES = 4 * 1024 * 1024
 _HEADER = Struct("<QQ")
-_OLD_NODE = Struct("<QQQBHBQQQQqdddddddQBB")
+_OLD_NODE_V1 = Struct("<QQQBHBQQQQqdddddddQBB")
+_OLD_NODE_V2 = Struct("<QQQBHBQQQQqdddddddQQBB")
+
+
+def _snapshot_mp_context():
+    methods = tuple(mp.get_all_start_methods())
+    method = "forkserver" if "forkserver" in methods else "spawn"
+    return mp.get_context(method)
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,6 +32,9 @@ class SnapshotRequest:
     snapshot_id: int
     watermark: int
     final: bool = False
+    generation: int = 0
+    auxiliary_state: str = ""
+    consistent_capture: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +44,7 @@ class SnapshotResult:
     path: str
     digest: str
     final: bool
+    generation: int = 0
 
 
 def _sha(payload: bytes) -> str:
@@ -75,7 +86,44 @@ def _read_content_chunks(root: Path, chunks: list[dict[str, object]]) -> bytes:
     return bytes(payload)
 
 
-def _write_snapshot(root: Path, descriptors: tuple[ShardReadDescriptor, ...], request: SnapshotRequest) -> SnapshotResult:
+def _capture_payloads(
+    descriptors: tuple[ShardReadDescriptor, ...],
+) -> tuple[tuple[dict[str, object], ...], ...]:
+    captured = []
+    opened = []
+    try:
+        for shard_id, descriptor in enumerate(descriptors):
+            nodes = SharedNodeArena.attach(descriptor.nodes)
+            edges = SharedEdgeArena.attach(descriptor.edges)
+            actions = SharedActionArena.attach(descriptor.actions)
+            opened.extend((nodes, edges, actions))
+            shard = []
+            for label, arena, desc in (
+                ("nodes", nodes, descriptor.nodes),
+                ("edges", edges, descriptor.edges),
+                ("actions", actions, descriptor.actions),
+            ):
+                shard.append(
+                    {
+                        "label": label,
+                        "payload": arena.snapshot_bytes(),
+                        "capacity": int(desc.capacity),
+                        "kind": desc.kind,
+                        "shard_id": shard_id,
+                    }
+                )
+            captured.append(tuple(shard))
+        return tuple(captured)
+    finally:
+        for arena in opened:
+            arena.close()
+
+
+def _write_snapshot_from_capture(
+    root: Path,
+    captured: tuple[tuple[dict[str, object], ...], ...],
+    request: SnapshotRequest,
+) -> SnapshotResult:
     snapshots = root / "snapshots"
     snapshots.mkdir(parents=True, exist_ok=True)
     final_path = _snapshot_directory(root, request.snapshot_id)
@@ -85,37 +133,41 @@ def _write_snapshot(root: Path, descriptors: tuple[ShardReadDescriptor, ...], re
     temp.mkdir(parents=True)
 
     manifest: dict[str, object] = {
-        "format_version": 2,
+        "format_version": 3,
         "snapshot_id": int(request.snapshot_id),
         "watermark": int(request.watermark),
+        "generation": int(request.generation),
         "final": bool(request.final),
         "chunk_bytes": _CHUNK_BYTES,
         "shards": [],
     }
-    opened = []
     try:
-        for shard_id, descriptor in enumerate(descriptors):
-            nodes = SharedNodeArena.attach(descriptor.nodes)
-            edges = SharedEdgeArena.attach(descriptor.edges)
-            actions = SharedActionArena.attach(descriptor.actions)
-            opened.extend((nodes, edges, actions))
+        for shard in captured:
+            shard_id = int(shard[0]["shard_id"]) if shard else 0
             shard_manifest: dict[str, object] = {"shard_id": shard_id}
-            for label, arena, desc in (
-                ("nodes", nodes, descriptor.nodes),
-                ("edges", edges, descriptor.edges),
-                ("actions", actions, descriptor.actions),
-            ):
-                payload = arena.snapshot_bytes()
+            for item in shard:
+                label = str(item["label"])
+                payload = bytes(item["payload"])
                 shard_manifest[label] = {
                     "chunks": _write_content_chunks(root, payload),
                     "sha256": _sha(payload),
-                    "capacity": int(desc.capacity),
-                    "kind": desc.kind,
+                    "capacity": int(item["capacity"]),
+                    "kind": str(item["kind"]),
                     "bytes": len(payload),
                 }
             cast = manifest["shards"]
             assert isinstance(cast, list)
             cast.append(shard_manifest)
+
+        if request.auxiliary_state:
+            aux_payload = request.auxiliary_state.encode("utf-8")
+            aux_name = "auxiliary_state.json"
+            (temp / aux_name).write_bytes(aux_payload)
+            manifest["auxiliary_state"] = {
+                "file": aux_name,
+                "sha256": _sha(aux_payload),
+                "bytes": len(aux_payload),
+            }
 
         manifest_payload = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8")
         manifest_digest = _sha(manifest_payload)
@@ -130,10 +182,9 @@ def _write_snapshot(root: Path, descriptors: tuple[ShardReadDescriptor, ...], re
             str(final_path),
             manifest_digest,
             request.final,
+            request.generation,
         )
     finally:
-        for arena in opened:
-            arena.close()
         if temp.exists():
             shutil.rmtree(temp, ignore_errors=True)
 
@@ -141,11 +192,11 @@ def _write_snapshot(root: Path, descriptors: tuple[ShardReadDescriptor, ...], re
 def _snapshot_worker(
     root: str,
     descriptors: tuple[ShardReadDescriptor, ...],
-    requests: mp.Queue,
-    acknowledgements: mp.Queue,
-    saved_watermark: mp.sharedctypes.Synchronized,
-    saved_snapshot: mp.sharedctypes.Synchronized,
-    stop_event: mp.synchronize.Event,
+    requests,
+    acknowledgements,
+    saved_watermark,
+    saved_snapshot,
+    stop_event,
 ) -> None:
     try:
         try:
@@ -161,31 +212,41 @@ def _snapshot_worker(
             if request is None:
                 break
             try:
-                result = _write_snapshot(root_path, descriptors, request)
+                captured = _capture_payloads(descriptors)
+                if request.consistent_capture:
+                    acknowledgements.put(("captured", request.snapshot_id))
+                result = _write_snapshot_from_capture(root_path, captured, request)
             except BaseException as exc:
-                acknowledgements.put(("error", request.snapshot_id, type(exc).__name__, str(exc)))
+                acknowledgements.put(
+                    ("error", request.snapshot_id, type(exc).__name__, str(exc))
+                )
                 continue
             with saved_watermark.get_lock():
-                saved_watermark.value = max(int(saved_watermark.value), int(result.watermark))
+                saved_watermark.value = max(
+                    int(saved_watermark.value), int(result.watermark)
+                )
             with saved_snapshot.get_lock():
-                saved_snapshot.value = max(int(saved_snapshot.value), int(result.snapshot_id))
+                saved_snapshot.value = max(
+                    int(saved_snapshot.value), int(result.snapshot_id)
+                )
             acknowledgements.put(("ok", result))
     finally:
         stop_event.set()
 
 
 class SnapshotService:
-    """Asynchronous latest-wins recovery snapshot service with content-addressed chunks."""
+    """Latest-wins content-addressed snapshots with optional consistent capture ack."""
 
     def __init__(self, root: str | Path, descriptors: Iterable[ShardReadDescriptor]) -> None:
         self.root = Path(root)
         self.descriptors = tuple(descriptors)
-        self._requests: mp.Queue = mp.Queue(maxsize=1)
-        self._acks: mp.Queue = mp.Queue()
-        self._stop = mp.Event()
-        self.saved_watermark = mp.Value("Q", 0)
-        self.saved_snapshot = mp.Value("Q", 0)
-        self._process = mp.Process(
+        self._mp_ctx = _snapshot_mp_context()
+        self._requests = self._mp_ctx.Queue(maxsize=1)
+        self._acks = self._mp_ctx.Queue()
+        self._stop = self._mp_ctx.Event()
+        self.saved_watermark = self._mp_ctx.Value("Q", 0)
+        self.saved_snapshot = self._mp_ctx.Value("Q", 0)
+        self._process = self._mp_ctx.Process(
             target=_snapshot_worker,
             kwargs={
                 "root": str(self.root),
@@ -200,12 +261,30 @@ class SnapshotService:
             daemon=True,
         )
 
+    @property
+    def multiprocessing_start_method(self) -> str:
+        return self._mp_ctx.get_start_method()
+
     def start(self) -> None:
         if not self._process.is_alive():
             self._process.start()
 
-    def request_latest(self, snapshot_id: int, watermark: int) -> None:
-        request = SnapshotRequest(int(snapshot_id), int(watermark), False)
+    def request_latest(
+        self,
+        snapshot_id: int,
+        watermark: int,
+        *,
+        generation: int = 0,
+        auxiliary_state: str = "",
+    ) -> None:
+        request = SnapshotRequest(
+            int(snapshot_id),
+            int(watermark),
+            False,
+            int(generation),
+            str(auxiliary_state),
+            False,
+        )
         try:
             self._requests.put_nowait(request)
             return
@@ -220,8 +299,62 @@ class SnapshotService:
         except queue.Full:
             pass
 
-    def request_final(self, snapshot_id: int, watermark: int, *, timeout: float = 120.0) -> SnapshotResult:
-        request = SnapshotRequest(int(snapshot_id), int(watermark), True)
+    def request_consistent_capture(
+        self,
+        snapshot_id: int,
+        watermark: int,
+        *,
+        generation: int,
+        auxiliary_state: str,
+        timeout: float = 30.0,
+    ) -> None:
+        import time
+
+        request = SnapshotRequest(
+            int(snapshot_id),
+            int(watermark),
+            False,
+            int(generation),
+            str(auxiliary_state),
+            True,
+        )
+        while True:
+            try:
+                self._requests.get_nowait()
+            except queue.Empty:
+                break
+        self._requests.put(request)
+        deadline = time.monotonic() + float(timeout)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("consistent v8 snapshot capture did not finish")
+            message = self._acks.get(timeout=min(1.0, remaining))
+            if not message:
+                continue
+            if message[0] == "captured" and int(message[1]) == int(snapshot_id):
+                return
+            if message[0] == "error" and int(message[1]) == int(snapshot_id):
+                _kind, _sid, error_type, text = message
+                raise RuntimeError(f"snapshot capture failed: {error_type}: {text}")
+
+    def request_final(
+        self,
+        snapshot_id: int,
+        watermark: int,
+        *,
+        generation: int = 0,
+        auxiliary_state: str = "",
+        timeout: float = 120.0,
+    ) -> SnapshotResult:
+        request = SnapshotRequest(
+            int(snapshot_id),
+            int(watermark),
+            True,
+            int(generation),
+            str(auxiliary_state),
+            False,
+        )
         while True:
             try:
                 self._requests.get_nowait()
@@ -229,6 +362,7 @@ class SnapshotService:
                 break
         self._requests.put(request)
         import time
+
         deadline = time.monotonic() + timeout
         while True:
             remaining = deadline - time.monotonic()
@@ -241,6 +375,8 @@ class SnapshotService:
                 _kind, sid, error_type, text = message
                 if int(sid) == int(snapshot_id):
                     raise RuntimeError(f"final snapshot failed: {error_type}: {text}")
+                continue
+            if message[0] != "ok":
                 continue
             _kind, result = message
             if isinstance(result, SnapshotResult) and int(result.snapshot_id) == int(snapshot_id):
@@ -277,40 +413,136 @@ def latest_complete_snapshot(root: str | Path) -> Path | None:
     return max(candidates, key=lambda p: p.name) if candidates else None
 
 
-def _load_nodes_compatible(arena: SharedNodeArena, payload: bytes) -> None:
+def load_latest_auxiliary_state(root: str | Path) -> dict[str, object] | None:
+    snapshot = latest_complete_snapshot(root)
+    if snapshot is None:
+        return None
+    manifest = json.loads((snapshot / "manifest.json").read_text(encoding="utf-8"))
+    spec = manifest.get("auxiliary_state")
+    if not isinstance(spec, dict):
+        return None
+    payload = (snapshot / str(spec["file"])).read_bytes()
+    if _sha(payload) != str(spec["sha256"]):
+        raise RuntimeError("snapshot auxiliary-state checksum mismatch")
+    value = json.loads(payload)
+    return value if isinstance(value, dict) else None
+
+
+def _migrate_old_node(
+    arena: SharedNodeArena,
+    payload: bytes,
+    record: Struct,
+    *,
+    has_game_mask: bool,
+) -> bool:
     if len(payload) < _HEADER.size:
-        raise RuntimeError("invalid node snapshot")
+        return False
     count, _seq = _HEADER.unpack_from(payload, 0)
-    old_expected = _HEADER.size + int(count) * _OLD_NODE.size
-    if len(payload) != old_expected:
-        arena.load_snapshot(payload)
-        return
+    if len(payload) != _HEADER.size + int(count) * record.size:
+        return False
     arena.begin_write()
     try:
         for row in range(int(count)):
-            values = _OLD_NODE.unpack_from(payload, _HEADER.size + row * _OLD_NODE.size)
-            (
-                hi, lo, fingerprint, level, memory_type, key_count,
-                k0, k1, k2, k3, support,
-                significance, prediction_error, learning_value, transfer_prior,
-                explanatory, future_option, weight, watermark,
-                cognitive_state, validation_state,
-            ) = values
+            values = record.unpack_from(payload, _HEADER.size + row * record.size)
+            if has_game_mask:
+                (
+                    hi,
+                    lo,
+                    fingerprint,
+                    level,
+                    memory_type,
+                    key_count,
+                    k0,
+                    k1,
+                    k2,
+                    k3,
+                    support,
+                    significance,
+                    prediction_error,
+                    learning_value,
+                    transfer_prior,
+                    explanatory,
+                    future_option,
+                    weight,
+                    watermark,
+                    game_mask,
+                    cognitive_state,
+                    validation_state,
+                ) = values
+            else:
+                (
+                    hi,
+                    lo,
+                    fingerprint,
+                    level,
+                    memory_type,
+                    key_count,
+                    k0,
+                    k1,
+                    k2,
+                    k3,
+                    support,
+                    significance,
+                    prediction_error,
+                    learning_value,
+                    transfer_prior,
+                    explanatory,
+                    future_option,
+                    weight,
+                    watermark,
+                    cognitive_state,
+                    validation_state,
+                ) = values
+                game_mask = 0
             arena.write(
                 row,
                 NodeRecord(
-                    MemoryUid(hi, lo), int(fingerprint), int(level), int(memory_type),
-                    tuple((k0, k1, k2, k3)[:int(key_count)]), int(support),
-                    float(significance), float(prediction_error), float(learning_value),
-                    float(transfer_prior), float(explanatory), float(future_option),
-                    float(weight), int(watermark), 0, int(cognitive_state), int(validation_state),
+                    MemoryUid(hi, lo),
+                    int(fingerprint),
+                    int(level),
+                    int(memory_type),
+                    tuple((k0, k1, k2, k3)[: int(key_count)]),
+                    int(support),
+                    float(significance),
+                    float(prediction_error),
+                    float(learning_value),
+                    float(transfer_prior),
+                    float(explanatory),
+                    float(future_option),
+                    float(weight),
+                    int(watermark),
+                    int(game_mask),
+                    int(cognitive_state),
+                    int(validation_state),
+                    0.0,
+                    0.0,
+                    0.0,
                 ),
             )
     finally:
         arena.end_write(count=int(count))
+    return True
 
 
-def restore_latest_snapshot(root: str | Path, descriptors: Iterable[ShardReadDescriptor]) -> tuple[int, int] | None:
+def _load_nodes_compatible(arena: SharedNodeArena, payload: bytes) -> None:
+    if len(payload) < _HEADER.size:
+        raise RuntimeError("invalid node snapshot")
+    count, _seq = _HEADER.unpack_from(payload, 0)
+    new_expected = _HEADER.size + int(count) * arena.record.size
+    if len(payload) == new_expected:
+        arena.load_snapshot(payload)
+        return
+    if _migrate_old_node(arena, payload, _OLD_NODE_V2, has_game_mask=True):
+        return
+    if _migrate_old_node(arena, payload, _OLD_NODE_V1, has_game_mask=False):
+        return
+    raise RuntimeError("unsupported v8 node snapshot format")
+
+
+def restore_latest_snapshot(
+    root: str | Path,
+    descriptors: Iterable[ShardReadDescriptor],
+) -> tuple[int, int] | None:
     root = Path(root)
     snapshot = latest_complete_snapshot(root)
     if snapshot is None:

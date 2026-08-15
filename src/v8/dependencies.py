@@ -1,3 +1,3 @@
-from v8.dirty import DirtyKeyTracker, DirtyState
+from v8.dirty import DirtyAccumulator, DirtyItem, DirtyKeyTracker, DirtyState
 
-__all__ = ["DirtyKeyTracker", "DirtyState"]
+__all__ = ["DirtyAccumulator", "DirtyItem", "DirtyKeyTracker", "DirtyState"]

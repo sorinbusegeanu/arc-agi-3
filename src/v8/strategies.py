@@ -4,7 +4,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 
 from v8.arena import NodeRecord
-from v8.model import MemoryLevel, MemoryType, MemoryUid, signed_u64
+from v8.model import CognitiveState, MemoryLevel, MemoryType, MemoryUid, signed_u64
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,22 +19,31 @@ class StrategyEvidence:
 
 
 class StrategyEstimator:
-    """Maintain alternative strategies separately from persistent outcome identity."""
+    """Maintain outcome-conditioned strategy reliability and observed cost."""
 
     def evaluate(self, rows: tuple[NodeRecord, ...]) -> tuple[StrategyEvidence, ...]:
         result = []
+        admissible = {
+            int(CognitiveState.ACTIVE),
+            int(CognitiveState.VALIDATED),
+            int(CognitiveState.REACTIVATED),
+        }
         for row in rows:
             if int(row.level) != int(MemoryLevel.M7) or int(row.memory_type) != int(MemoryType.STRATEGY):
                 continue
-            if len(row.key_parts) < 4:
+            if len(row.key_parts) < 4 or int(row.cognitive_state) not in admissible:
                 continue
             action = signed_u64(int(row.key_parts[0]))
             outcome = MemoryUid(int(row.key_parts[1]), int(row.key_parts[2]))
-            attempts = max(0, int(row.support_count))
-            reliability = min(1.0, attempts / 4.0)
-            # Until explicit per-trajectory cost evidence is available, one emitted
-            # strategy step is the declared minimal unit cost.
-            mean_cost = 1.0
+            attempts = max(0, int(round(row.attempt_weight)))
+            if attempts > 0:
+                reliability = max(0.0, min(1.0, row.strategy_reliability))
+                mean_cost = max(1e-9, row.strategy_mean_cost)
+            else:
+                # Prior only; it can guide exploration but is not efficiency evidence.
+                attempts = max(0, int(row.support_count))
+                reliability = min(0.75, attempts / 8.0)
+                mean_cost = 1.0
             result.append(
                 StrategyEvidence(
                     row.uid,

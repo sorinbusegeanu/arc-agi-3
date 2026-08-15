@@ -9,6 +9,7 @@ from pathlib import Path
 from v8.actor import ActorJob, run_actor_jobs
 from v8.capacity import plan_capacities
 from v8.diagnostics import format_game_rate_line, format_hypothesis_line
+from v8.experiments import ExperimentSummary, run_automatic_transfer_experiments
 from v8.runtime import ContinuousMemoryRuntime, V8RuntimeConfig
 from v8.snapshot import latest_complete_snapshot
 
@@ -128,6 +129,7 @@ def run_continuous(args) -> int:
         _log(format_game_rate_line(rows))
         _log(format_hypothesis_line(runtime.scientific_statuses()))
 
+    experiments = ExperimentSummary(0, 0, 0)
     try:
         runtime.start()
         print(
@@ -147,12 +149,25 @@ def run_continuous(args) -> int:
         )
         runtime.record_actor_results(results)
         runtime.wait_quiescent(timeout=args.drain_timeout)
+
+        if not args.no_automatic_experiments and not args.no_peers:
+            experiments = run_automatic_transfer_experiments(
+                runtime,
+                games=tuple(games),
+                env_root=args.env_root,
+                seed=args.seed,
+                steps_per_trial=args.transfer_experiment_steps,
+                max_trials=args.max_transfer_experiments,
+            )
+            runtime.wait_quiescent(timeout=args.drain_timeout)
+
         metrics = runtime.metrics()
         hypothesis_statuses = runtime.scientific_statuses()
         final = runtime.close(normal=True, timeout=args.final_save_timeout)
         summary = {
             "games": list(games),
             "actors": [asdict(result) for result in results],
+            "automatic_transfer_experiments": asdict(experiments),
             "hypotheses": hypothesis_statuses,
             "metrics": metrics,
             "final_snapshot": None if final is None else asdict(final),
@@ -220,6 +235,9 @@ def main(argv: list[str] | None = None) -> int:
     continuous.add_argument("--progress-interval-seconds", type=float, default=60.0)
     continuous.add_argument("--drain-timeout", type=float, default=300.0)
     continuous.add_argument("--final-save-timeout", type=float, default=300.0)
+    continuous.add_argument("--transfer-experiment-steps", type=int, default=32)
+    continuous.add_argument("--max-transfer-experiments", type=int, default=8)
+    continuous.add_argument("--no-automatic-experiments", action="store_true")
 
     smoke = sub.add_parser("smoke")
     _add_runtime_args(smoke)

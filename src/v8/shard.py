@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import queue
+from collections import deque
 from dataclasses import dataclass, replace
 
 from v8.arena import (
@@ -13,7 +14,16 @@ from v8.arena import (
     SharedEdgeArena,
     SharedNodeArena,
 )
-from v8.model import CognitiveState, MemoryLevel, MemoryUid, ValidationState, decode_proposal, signed_u64, u64
+from v8.model import (
+    CognitiveState,
+    MemoryLevel,
+    MemoryUid,
+    RelationType,
+    ValidationState,
+    decode_proposal,
+    signed_u64,
+    u64,
+)
 from v8.ring import SharedRingBuffer
 
 
@@ -56,6 +66,39 @@ def _game_bit(source_game_hash: int) -> int:
     return 0 if value == 0 else 1 << (value & 63)
 
 
+def _write_edge(
+    *,
+    edges: SharedEdgeArena,
+    edge_index: dict[tuple[MemoryUid, int, MemoryUid], int],
+    edge_count: int,
+    source_uid: MemoryUid,
+    relation_type: int,
+    target_uid: MemoryUid,
+    support_delta: int,
+    watermark: int,
+    shard_id: int,
+) -> int:
+    key = (source_uid, int(relation_type), target_uid)
+    row = edge_index.get(key)
+    increment = max(1, int(support_delta))
+    if row is None:
+        if edge_count >= edges.capacity:
+            raise MemoryError(f"edge arena full in shard {shard_id}")
+        row = edge_count
+        edge_count += 1
+        edge_index[key] = row
+        record = EdgeRecord(source_uid, int(relation_type), target_uid, increment, int(watermark))
+    else:
+        prior = edges.read(row)
+        record = replace(
+            prior,
+            support_count=prior.support_count + increment,
+            updated_watermark=max(prior.updated_watermark, int(watermark)),
+        )
+    edges.write(row, record)
+    return edge_count
+
+
 def shard_worker(
     config: ShardConfig,
     ring_args: dict[str, object],
@@ -64,6 +107,7 @@ def shard_worker(
     watermark: mp.sharedctypes.Synchronized,
     error_queue: mp.Queue,
     batch_size: int = 256,
+    global_generation: mp.sharedctypes.Synchronized | None = None,
 ) -> None:
     ring = SharedRingBuffer(**ring_args)
     nodes = SharedNodeArena.attach(config.node_arena)
@@ -83,7 +127,11 @@ def shard_worker(
             if occupied:
                 action_index[(value.context_signature, value.action_id)] = row
 
+        # Duplicate protection is bounded. Restart safety is provided by the runtime's
+        # restored M0 event identities, so this set does not need to grow forever.
+        dedupe_capacity = max(65_536, int(batch_size) * 1024)
         seen: set[tuple[int, int, int, int]] = set()
+        seen_order: deque[tuple[int, int, int, int]] = deque()
 
         while not stop_event.is_set() or not ring.empty:
             first = ring.get(timeout=0.05)
@@ -98,6 +146,7 @@ def shard_worker(
 
             with inflight.get_lock():
                 inflight.value += len(packets)
+            mutated = False
             try:
                 nodes.begin_write()
                 edges.begin_write()
@@ -117,6 +166,11 @@ def shard_worker(
                         if dedupe in seen:
                             continue
                         seen.add(dedupe)
+                        seen_order.append(dedupe)
+                        if len(seen_order) > dedupe_capacity:
+                            seen.discard(seen_order.popleft())
+
+                        mutated = True
                         max_watermark = max(max_watermark, int(proposal.watermark))
                         game_bit = _game_bit(proposal.source_game_hash)
 
@@ -155,6 +209,9 @@ def shard_worker(
                                 game_mask=game_bit,
                                 cognitive_state=active,
                                 validation_state=validated,
+                                success_sum=proposal.success_sum,
+                                cost_sum=proposal.cost_sum,
+                                attempt_weight=proposal.attempt_weight,
                             )
                         else:
                             current = nodes.read(row)
@@ -188,6 +245,9 @@ def shard_worker(
                                 explanatory_sum=current.explanatory_sum + proposal.explanatory_sum,
                                 future_option_sum=current.future_option_sum + proposal.future_option_sum,
                                 score_weight=current.score_weight + proposal.score_weight,
+                                success_sum=current.success_sum + proposal.success_sum,
+                                cost_sum=current.cost_sum + proposal.cost_sum,
+                                attempt_weight=current.attempt_weight + proposal.attempt_weight,
                                 updated_watermark=max(current.updated_watermark, proposal.watermark),
                                 game_mask=int(current.game_mask) | game_bit,
                                 cognitive_state=cognitive_state,
@@ -196,33 +256,32 @@ def shard_worker(
                         nodes.write(row, record)
 
                         if not proposal.parent_uid.is_zero:
-                            edge_key = (
-                                proposal.uid,
-                                int(proposal.relation_type),
-                                proposal.parent_uid,
+                            edge_count = _write_edge(
+                                edges=edges,
+                                edge_index=edge_index,
+                                edge_count=edge_count,
+                                source_uid=proposal.uid,
+                                relation_type=int(proposal.relation_type),
+                                target_uid=proposal.parent_uid,
+                                support_delta=proposal.support_delta,
+                                watermark=proposal.watermark,
+                                shard_id=config.shard_id,
                             )
-                            edge_row = edge_index.get(edge_key)
-                            if edge_row is None:
-                                if edge_count >= edges.capacity:
-                                    raise MemoryError(f"edge arena full in shard {config.shard_id}")
-                                edge_row = edge_count
-                                edge_count += 1
-                                edge_index[edge_key] = edge_row
-                                edge_record = EdgeRecord(
-                                    proposal.uid,
-                                    int(proposal.relation_type),
-                                    proposal.parent_uid,
-                                    max(1, int(proposal.support_delta)),
-                                    proposal.watermark,
-                                )
-                            else:
-                                prior_edge = edges.read(edge_row)
-                                edge_record = replace(
-                                    prior_edge,
-                                    support_count=prior_edge.support_count + max(1, int(proposal.support_delta)),
-                                    updated_watermark=max(prior_edge.updated_watermark, proposal.watermark),
-                                )
-                            edges.write(edge_row, edge_record)
+
+                        if int(proposal.source_game_hash) != 0:
+                            # target.lo is the exact reversible game hash; target.hi=0
+                            # intentionally distinguishes it from canonical memory UIDs.
+                            edge_count = _write_edge(
+                                edges=edges,
+                                edge_index=edge_index,
+                                edge_count=edge_count,
+                                source_uid=proposal.uid,
+                                relation_type=int(RelationType.GAME_PROVENANCE),
+                                target_uid=MemoryUid(0, u64(proposal.source_game_hash)),
+                                support_delta=proposal.support_delta,
+                                watermark=proposal.watermark,
+                                shard_id=config.shard_id,
+                            )
 
                         if proposal.level == MemoryLevel.M1 and len(proposal.key_parts) >= 2 and (
                             proposal.support_delta > 0 or abs(float(proposal.significance_sum)) > 0.0
@@ -256,6 +315,9 @@ def shard_worker(
                     edges.end_write(count=edge_count)
                     actions.end_write(count=actions.count)
             finally:
+                if mutated and global_generation is not None:
+                    with global_generation.get_lock():
+                        global_generation.value += 1
                 with inflight.get_lock():
                     inflight.value -= len(packets)
     except BaseException as exc:

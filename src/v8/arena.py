@@ -8,7 +8,7 @@ from typing import Iterator
 from v8.model import MemoryUid, u64
 
 _HEADER = Struct("<QQ")  # count, seqlock version
-_NODE = Struct("<QQQBHBQQQQqdddddddQQBB")
+_NODE = Struct("<QQQBHBQQQQqddddddddddQQBB")
 _EDGE = Struct("<QQHQQqQ")
 _ACTION = Struct("<BQiqddQ")
 
@@ -39,6 +39,9 @@ class NodeRecord:
     game_mask: int = 0
     cognitive_state: int = 0
     validation_state: int = 0
+    success_sum: float = 0.0
+    cost_sum: float = 0.0
+    attempt_weight: float = 0.0
 
     @property
     def significance(self) -> float:
@@ -67,6 +70,14 @@ class NodeRecord:
     @property
     def game_evidence_count(self) -> int:
         return int(self.game_mask).bit_count()
+
+    @property
+    def strategy_reliability(self) -> float:
+        return 0.0 if self.attempt_weight <= 0 else self.success_sum / self.attempt_weight
+
+    @property
+    def strategy_mean_cost(self) -> float:
+        return 1.0 if self.attempt_weight <= 0 else self.cost_sum / self.attempt_weight
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,6 +228,9 @@ class SharedNodeArena(_SharedArena):
             float(value.explanatory_sum),
             float(value.future_option_sum),
             float(value.score_weight),
+            float(value.success_sum),
+            float(value.cost_sum),
+            float(value.attempt_weight),
             u64(value.updated_watermark),
             u64(value.game_mask),
             int(value.cognitive_state) & 0xFF,
@@ -244,6 +258,9 @@ class SharedNodeArena(_SharedArena):
             explanatory,
             future_option,
             weight,
+            success_sum,
+            cost_sum,
+            attempt_weight,
             watermark,
             game_mask,
             cognitive_state,
@@ -267,6 +284,9 @@ class SharedNodeArena(_SharedArena):
             game_mask=int(game_mask),
             cognitive_state=int(cognitive_state),
             validation_state=int(validation_state),
+            success_sum=float(success_sum),
+            cost_sum=float(cost_sum),
+            attempt_weight=float(attempt_weight),
         )
 
     def records(self) -> Iterator[NodeRecord]:

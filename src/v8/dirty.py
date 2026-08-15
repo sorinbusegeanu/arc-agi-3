@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from threading import Lock
-from typing import Hashable
+from typing import Generic, Hashable, TypeVar
 
 
 @dataclass(slots=True)
@@ -52,3 +52,55 @@ class DirtyKeyTracker:
                 value.latest_required_version,
                 value.queued,
             )
+
+
+T = TypeVar("T")
+
+
+@dataclass(slots=True)
+class DirtyItem(Generic[T]):
+    payload: T
+    version: int
+    multiplicity: int
+
+
+class DirtyAccumulator(Generic[T]):
+    """Persistent per-worker canonical invalidation accumulator.
+
+    Repeated changes to one canonical key replace the payload with the newest value while
+    preserving the exact accumulated multiplicity. Draining marks the key processed, so
+    later evidence can invalidate it again without replaying the earlier raw events.
+    """
+
+    def __init__(self) -> None:
+        self.tracker = DirtyKeyTracker()
+        self._pending: dict[Hashable, DirtyItem[T]] = {}
+
+    def add(
+        self,
+        key: Hashable,
+        payload: T,
+        *,
+        version: int,
+        multiplicity: int = 1,
+    ) -> None:
+        multiplicity = max(1, int(multiplicity))
+        self.tracker.invalidate(key, int(version))
+        prior = self._pending.get(key)
+        if prior is None:
+            self._pending[key] = DirtyItem(payload, int(version), multiplicity)
+        else:
+            prior.payload = payload
+            prior.version = max(prior.version, int(version))
+            prior.multiplicity += multiplicity
+
+    def drain(self) -> tuple[tuple[Hashable, DirtyItem[T]], ...]:
+        rows = tuple(self._pending.items())
+        self._pending.clear()
+        for key, item in rows:
+            self.tracker.complete(key, item.version)
+        return rows
+
+    @property
+    def pending_count(self) -> int:
+        return len(self._pending)
