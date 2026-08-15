@@ -44,8 +44,14 @@ def _clip(value: float) -> float:
 
 
 def infer_developmental_stage(rows: Iterable[NodeRecord]) -> int:
-    """Infer Stage_t only from capabilities already present in the published cut."""
+    """Infer Stage_t only from capabilities already present in the published cut.
+
+    A positive stored prediction error is itself evidence that a supported expectation
+    existed before the corresponding transition, so it implies at least Stage 1 even
+    when the row carrying that evidence is not yet an active higher abstraction.
+    """
     rows = tuple(rows)
+    minimum_stage = 1 if any(float(row.prediction_error) > 0.0 for row in rows) else 0
     active = tuple(row for row in rows if int(row.cognitive_state) in _ADMISSIBLE)
     if any(
         int(row.level) == int(MemoryLevel.M7)
@@ -79,7 +85,7 @@ def infer_developmental_stage(rows: Iterable[NodeRecord]) -> int:
         for row in rows
     ):
         return 1
-    return 0
+    return minimum_stage
 
 
 def _fallback_stage(row: NodeRecord) -> int:
