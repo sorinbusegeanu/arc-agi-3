@@ -174,21 +174,26 @@ class MemoryReadView:
         *,
         limit: int | None,
     ) -> tuple[MemoryId, ...]:
-        unique = {
-            MemoryId(int(memory_id))
-            for memory_id in memory_ids
-            if memory_is_active(self.nodes.get(MemoryId(int(memory_id))))
-        }
-        ordered = sorted(
-            unique,
-            key=lambda memory_id: (
-                -self._memory_priority(memory_id)[0],
-                int(memory_id),
-            ),
-        )
+        ranked: list[tuple[float, MemoryId]] = []
+        seen: set[MemoryId] = set()
+        for raw_memory_id in memory_ids:
+            memory_id = MemoryId(int(raw_memory_id))
+            if memory_id in seen:
+                continue
+            seen.add(memory_id)
+            if not memory_is_active(self.nodes.get(memory_id)):
+                continue
+            priority = self._memory_priority(memory_id)[0]
+            # Negative priority is an explicit semantic exclusion, currently
+            # used for rejected concepts as well as inactive memories.
+            if priority < 0.0:
+                continue
+            ranked.append((priority, memory_id))
+        ranked.sort(key=lambda item: (-item[0], int(item[1])))
+        values = [memory_id for _priority, memory_id in ranked]
         if limit is not None:
-            ordered = ordered[: max(0, int(limit))]
-        return tuple(ordered)
+            values = values[: max(0, int(limit))]
+        return tuple(values)
 
     def score_inputs(
         self,
@@ -220,8 +225,6 @@ class MemoryReadView:
             family = families.get(action_id)
             role_candidates: tuple[MemoryId, ...] = ()
             if family is not None:
-                # Exact-role lookup currently accepts an integer bound. Use a
-                # very high scan bound, then rank and truncate below.
                 role_candidates = packed.roles_exact.lookup(
                     int(context_signature),
                     action_id,
