@@ -14,6 +14,7 @@ from v7.memory.concept_validation import ConceptValidationStatus
 from v7.memory.developmental_policy import profile_for_view
 from v7.memory.ids import MemoryId, MemoryLevel
 from v7.memory.read_view import MemoryReadView
+from v7.memory.status import memory_is_active
 
 _MASK63 = (1 << 63) - 1
 
@@ -211,7 +212,11 @@ class LocalCognitionOverlay:
         self._last_contexts = signatures
         return DecisionContext(signatures, int(structural_signature), int(exact_signature))
 
-    def stats_for(self, context_signature: int, action_id: int) -> _LocalActionStats:
+    def stats_for(
+        self,
+        context_signature: int,
+        action_id: int,
+    ) -> _LocalActionStats:
         return self.stats.get(
             (int(context_signature), int(action_id)),
             _LocalActionStats.empty(),
@@ -333,7 +338,11 @@ class LocalCognitionOverlay:
         context_values = tuple(int(value) for value in contexts)
         if not context_values:
             return 0.0
-        root = context_values[-2] if len(context_values) >= 2 else context_values[-1]
+        root = (
+            context_values[-2]
+            if len(context_values) >= 5
+            else context_values[-1]
+        )
         first = tuple(self.transitions.get((root, int(action_id)), ()))
         if not first:
             return 0.0
@@ -375,13 +384,20 @@ class LocalCognitionOverlay:
                 return True
         return self._consecutive_failures >= 3
 
-    def reset_episode_history(self, *, keep_statistics: bool = True) -> None:
+    def reset_episode_history(
+        self,
+        *,
+        keep_statistics: bool = True,
+        clear_failure_streak: bool = False,
+    ) -> None:
         self.recent_actions.clear()
         self.recent_outcomes.clear()
         self.recent_no_change.clear()
         self.recent_states.clear()
         self._trajectory.clear()
         self._last_contexts = ()
+        if clear_failure_streak:
+            self._consecutive_failures = 0
         if not keep_statistics:
             self.action_counts.clear()
             self.stats.clear()
@@ -458,22 +474,23 @@ class ContextualActionScorer:
         for rank, context in enumerate(contexts.signatures):
             row = rows_by_context[int(context)][action_id]
             roles, worlds, strategies = self._split_decision_memories(
-                view, row.role_ids
+                view,
+                row.role_ids,
             )
             m1_support = sum(
                 int(view.nodes[memory_id].support_count)
                 for memory_id in row.contingency_ids
-                if memory_id in view.nodes
+                if memory_is_active(view.nodes.get(memory_id))
             )
             local = overlay.stats_for(int(context), action_id)
-            support = (
+            persistent_support = (
                 m1_support
-                + local.count
                 + len(roles)
                 + len(row.concept_ids)
                 + len(worlds)
                 + len(strategies)
             )
+            support = persistent_support + local.count
             m1 = self._m1_features(view, row.contingency_ids)
             confidence = max(m1[0], local.prediction_confidence)
             contradiction = max(m1[4], local.contradiction_risk)
@@ -496,7 +513,10 @@ class ContextualActionScorer:
         for candidate in candidates[1:]:
             if candidate.support < self.minimum_context_support:
                 continue
-            is_exact = candidate.rank == len(candidates) - 1 and len(candidates) >= 5
+            is_exact = (
+                candidate.rank == len(candidates) - 1
+                and len(candidates) >= 5
+            )
             if is_exact:
                 exact_ready = (
                     candidate.support >= profile.exact_specialization_min_support
@@ -513,12 +533,22 @@ class ContextualActionScorer:
                 >= profile.contradiction_specialization_threshold
                 and candidate.contradiction + 0.05 < selected.contradiction
             )
-            improves_prediction = candidate.confidence >= selected.confidence + 0.10
-            substantially_supported = candidate.support >= max(
-                self.minimum_context_support,
-                2 * selected.support,
+            improves_prediction = (
+                candidate.confidence >= selected.confidence + 0.10
             )
-            if resolves_contradiction or improves_prediction or substantially_supported:
+            # Prefer a more specific context once it has minimum evidence and
+            # comparable predictive quality. C0 naturally has much larger
+            # support, so requiring 2x C0 support made specialization impossible.
+            specificity_supported = (
+                candidate.support >= self.minimum_context_support
+                and candidate.confidence + 0.05 >= selected.confidence
+                and candidate.contradiction <= selected.contradiction + 0.05
+            )
+            if (
+                resolves_contradiction
+                or improves_prediction
+                or specificity_supported
+            ):
                 selected = candidate
 
         selected_row = selected.row
@@ -572,13 +602,17 @@ class ContextualActionScorer:
             - 0.10 * contradiction
             - 0.08 * no_change
         )
+        persistent_contextual_support = max(
+            0,
+            int(selected.support) - int(selected_local.count),
+        )
         support = DecisionSupport(
             context_signature=selected.context,
             role_ids=selected.roles,
             concept_ids=tuple(int(value) for value in selected_row.concept_ids),
             world_model_ids=selected.worlds,
             strategy_ids=selected.strategies,
-            contextual_support=selected.support,
+            contextual_support=persistent_contextual_support,
             local_support=selected_local.count,
             context_rank=selected.rank,
         )
@@ -605,8 +639,9 @@ class ContextualActionScorer:
         strategies: list[int] = []
         for memory_id in memory_ids:
             node = view.nodes.get(memory_id)
-            if node is None:
+            if not memory_is_active(node):
                 continue
+            assert node is not None
             if node.level == MemoryLevel.M3 and int(node.type_id) == TYPE_ROLE:
                 roles.append(int(memory_id))
             elif node.level == MemoryLevel.M5:
@@ -623,7 +658,11 @@ class ContextualActionScorer:
         rows: list[tuple[int, float, float, float]] = []
         for memory_id in memory_ids:
             node = view.nodes.get(memory_id)
-            if node is None or node.level != MemoryLevel.M1:
+            if (
+                node is None
+                or node.level != MemoryLevel.M1
+                or not memory_is_active(node)
+            ):
                 continue
             score = view.scores.get(memory_id)
             rows.append(
@@ -678,8 +717,9 @@ class ContextualActionScorer:
         for raw_memory_id in memory_ids:
             memory_id = MemoryId(int(raw_memory_id))
             node = view.nodes.get(memory_id)
-            if node is None:
+            if not memory_is_active(node):
                 continue
+            assert node is not None
             score = view.scores.get(memory_id)
             support = 1.0 - math.exp(
                 -max(0, int(node.support_count)) / 3.0
@@ -753,7 +793,9 @@ def choose_contextual_action(
     if not decisions:
         raise ValueError("environment returned no available actions")
     profile = profile_for_view(view)
-    effective_epsilon = _clamp01(float(epsilon) * profile.exploration_multiplier)
+    effective_epsilon = _clamp01(
+        float(epsilon) * profile.exploration_multiplier
+    )
     if rng.random() < effective_epsilon:
         selected = decisions[rng.randrange(len(decisions))]
         return selected.action_id, selected
@@ -764,8 +806,15 @@ def choose_contextual_action(
     weights = np.exp(values)
     total = float(np.sum(weights))
     if not np.isfinite(total) or total <= 0.0:
-        selected = min(decisions, key=lambda item: (-item.score, item.action_id))
+        selected = min(
+            decisions,
+            key=lambda item: (-item.score, item.action_id),
+        )
         return selected.action_id, selected
     probabilities = (weights / total).tolist()
-    selected = rng.choices(list(decisions), weights=probabilities, k=1)[0]
+    selected = rng.choices(
+        list(decisions),
+        weights=probabilities,
+        k=1,
+    )[0]
     return selected.action_id, selected
