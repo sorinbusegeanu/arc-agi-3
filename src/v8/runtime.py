@@ -41,6 +41,20 @@ from v8.snapshot import (
 )
 
 
+def _safe_mp_context(requested: str | None = None):
+    methods = tuple(mp.get_all_start_methods())
+    method = requested
+    if method is None:
+        method = "forkserver" if "forkserver" in methods else "spawn"
+    if method not in methods:
+        raise ValueError(
+            f"multiprocessing start method {method!r} is unavailable; choices={methods}"
+        )
+    if method == "fork":
+        raise ValueError("v8 does not allow fork because runtime peers use threads")
+    return mp.get_context(method)
+
+
 @dataclass(frozen=True, slots=True)
 class V8RuntimeConfig:
     root: Path
@@ -57,6 +71,7 @@ class V8RuntimeConfig:
     restore: bool = True
     enable_peers: bool = True
     peer_interval_seconds: float = 0.5
+    multiprocessing_start_method: str | None = None
 
     @classmethod
     def from_path(cls, root: str | Path, **kwargs) -> "V8RuntimeConfig":
@@ -69,6 +84,8 @@ class V8RuntimeConfig:
             raise ValueError("ring capacities must be positive")
         if self.snapshot_interval_seconds <= 0 or self.peer_interval_seconds <= 0:
             raise ValueError("snapshot and peer intervals must be positive")
+        if self.multiprocessing_start_method is not None:
+            _safe_mp_context(self.multiprocessing_start_method)
 
 
 class ContinuousMemoryRuntime:
@@ -78,15 +95,16 @@ class ContinuousMemoryRuntime:
         self.config = config
         self.root = config.root
         self.root.mkdir(parents=True, exist_ok=True)
-        self._stop = mp.Event()
-        self._snapshot_freeze = mp.Event()
+        self._mp_ctx = _safe_mp_context(config.multiprocessing_start_method)
+        self._stop = self._mp_ctx.Event()
+        self._snapshot_freeze = self._mp_ctx.Event()
         self._accepting = True
         self._started = False
         self._closed = False
-        self._error_queue: mp.Queue = mp.Queue()
-        self._watermark = mp.Value("Q", 0)
-        self._generation = mp.Value("Q", 0)
-        self._actor_throttle = mp.Value("d", 0.0)
+        self._error_queue = self._mp_ctx.Queue()
+        self._watermark = self._mp_ctx.Value("Q", 0)
+        self._generation = self._mp_ctx.Value("Q", 0)
+        self._actor_throttle = self._mp_ctx.Value("d", 0.0)
         self._snapshot_id = 0
         self._submit_lock = threading.Lock()
         self._maintenance_lock = threading.Lock()
@@ -94,11 +112,19 @@ class ContinuousMemoryRuntime:
         self._last_compaction = CompactionResult(0, 0, 0, 0)
 
         self._stage_rings = tuple(
-            SharedRingBuffer(capacity=config.stage_ring_capacity, slot_size=PIPELINE_PACKET_SIZE)
+            SharedRingBuffer(
+                capacity=config.stage_ring_capacity,
+                slot_size=PIPELINE_PACKET_SIZE,
+                mp_context=self._mp_ctx,
+            )
             for _ in STAGES
         )
         self._shard_rings = tuple(
-            SharedRingBuffer(capacity=config.shard_ring_capacity, slot_size=PROPOSAL_PACKET_SIZE)
+            SharedRingBuffer(
+                capacity=config.shard_ring_capacity,
+                slot_size=PROPOSAL_PACKET_SIZE,
+                mp_context=self._mp_ctx,
+            )
             for _ in range(config.shards)
         )
         self._node_arenas = tuple(
@@ -134,11 +160,15 @@ class ContinuousMemoryRuntime:
                 if len(record.key_parts) >= 2:
                     self._submitted_event_ids.add((int(record.key_parts[0]), int(record.key_parts[1])))
 
-        self._stage_inflight = tuple(mp.Value("Q", 0) for _ in STAGES)
-        self._shard_inflight = tuple(mp.Value("Q", 0) for _ in range(config.shards))
-        self._shard_watermarks = tuple(mp.Value("Q", 0) for _ in range(config.shards))
-        self._stage_processes: list[mp.Process] = []
-        self._shard_processes: list[mp.Process] = [
+        self._stage_inflight = tuple(self._mp_ctx.Value("Q", 0) for _ in STAGES)
+        self._shard_inflight = tuple(
+            self._mp_ctx.Value("Q", 0) for _ in range(config.shards)
+        )
+        self._shard_watermarks = tuple(
+            self._mp_ctx.Value("Q", 0) for _ in range(config.shards)
+        )
+        self._stage_processes = []
+        self._shard_processes = [
             self._build_shard_process(shard_id) for shard_id in range(config.shards)
         ]
 
@@ -151,7 +181,7 @@ class ContinuousMemoryRuntime:
             )
             for worker_id in range(config.stage_workers):
                 self._stage_processes.append(
-                    mp.Process(
+                    self._mp_ctx.Process(
                         target=stage_worker,
                         kwargs={
                             "level": int(definition.level),
@@ -198,8 +228,8 @@ class ContinuousMemoryRuntime:
                 self.peers.load_state(peer_state)
         self.hypothesis_evaluator = ScientificHypothesisEvaluator()
 
-    def _build_shard_process(self, shard_id: int) -> mp.Process:
-        return mp.Process(
+    def _build_shard_process(self, shard_id: int):
+        return self._mp_ctx.Process(
             target=shard_worker,
             args=(
                 ShardConfig(
@@ -647,6 +677,7 @@ class ContinuousMemoryRuntime:
         return {
             "watermark": self.watermark,
             "generation": self.generation,
+            "multiprocessing_start_method": self._mp_ctx.get_start_method(),
             "saved_watermark": saved_watermark,
             "unsaved_tail": max(0, self.watermark - saved_watermark),
             "memories": self.read_view.memory_count,
@@ -702,13 +733,10 @@ class ContinuousMemoryRuntime:
                 self.wait_quiescent(timeout=timeout, resume_peers=False)
                 if self.peers is not None:
                     self.peers.close()
-                # Final maintenance compaction reclaims all dependency-safe retired rows
-                # before the reporting cut and final recovery snapshot.
                 if any(
                     int(row.cognitive_state) == int(CognitiveState.RETIRED)
                     for row in self.read_view.node_records()
                 ):
-                    # Peers are already closed; compact directly at the quiescent cut.
                     old_processes = tuple(self._shard_processes)
                     self._shard_processes = []
                     for process in old_processes:
