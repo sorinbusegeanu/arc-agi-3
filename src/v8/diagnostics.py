@@ -92,7 +92,7 @@ def format_game_rate_line(rows: Iterable[GameProgress]) -> str:
     rows = tuple(rows)
     win_rate, level_rate, solved_games, games = game_summary(rows)
     names = solved_game_ids(rows)
-    suffix = "" if not names else " (" + ",".join(names) + ")"
+    suffix = "" if not names else " (" + ", ".join(names) + ")"
     return (
         f"wins={win_rate:.1f}% levels_solved={level_rate:.1f}% "
         f"solved_games={solved_games}/{games}{suffix}"
