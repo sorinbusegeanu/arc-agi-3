@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from dataclasses import asdict
 from pathlib import Path
 
 from v8.actor import ActorJob, run_actor_jobs
+from v8.diagnostics import format_game_rate_line, format_hypothesis_line
 from v8.runtime import ContinuousMemoryRuntime, V8RuntimeConfig
 
 
@@ -76,6 +78,10 @@ def _actor_jobs(
     return tuple(jobs)
 
 
+def _log(message: str) -> None:
+    print(f'[{time.strftime("%H:%M")}] {message}', flush=True)
+
+
 def run_continuous(args) -> int:
     from v7.game_sets import resolve_game_selector
 
@@ -96,10 +102,16 @@ def run_continuous(args) -> int:
             f"stage_workers={args.stage_workers} snapshots={'off' if args.no_snapshots else 'async'}",
             flush=True,
         )
-        results = run_actor_jobs(runtime, jobs, timeout=args.actor_timeout)
+        _log(format_hypothesis_line())
+        results = run_actor_jobs(
+            runtime,
+            jobs,
+            timeout=args.actor_timeout,
+            progress_interval_seconds=args.progress_interval_seconds,
+            progress_callback=lambda rows: _log(format_game_rate_line(rows)),
+        )
         runtime.wait_quiescent(timeout=args.drain_timeout)
         metrics = runtime.metrics()
-        print(json.dumps(metrics, sort_keys=True), flush=True)
         final = runtime.close(normal=True, timeout=args.final_save_timeout)
         summary = {
             "games": list(games),
@@ -140,7 +152,12 @@ def run_smoke(args) -> int:
                 )
             )
         runtime.wait_quiescent(timeout=args.drain_timeout)
-        print(json.dumps(runtime.metrics(), indent=2, sort_keys=True))
+        metrics = runtime.metrics()
+        print(
+            f"v8 smoke done events={args.events} memories={metrics['memories']} "
+            f"edges={metrics['edges']}",
+            flush=True,
+        )
         runtime.close(normal=True, timeout=args.final_save_timeout)
         return 0
     except BaseException:
@@ -161,6 +178,7 @@ def main(argv: list[str] | None = None) -> int:
     continuous.add_argument("--env-root", default=None)
     continuous.add_argument("--epsilon", type=float, default=0.10)
     continuous.add_argument("--actor-timeout", type=float, default=None)
+    continuous.add_argument("--progress-interval-seconds", type=float, default=60.0)
     continuous.add_argument("--drain-timeout", type=float, default=300.0)
     continuous.add_argument("--final-save-timeout", type=float, default=300.0)
 

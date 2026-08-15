@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import math
 import multiprocessing as mp
+import queue
+import time
 from dataclasses import dataclass
 from random import Random
-from typing import Iterable
+from typing import Callable, Iterable
 
 from v8.model import EventId, ExperienceEvent, PipelineEvent, encode_pipeline, stable_u64
 from v8.publication import LiveReadView, ShardReadDescriptor
@@ -19,6 +21,16 @@ class ActorJob:
     seed: int
     env_root: str | None = None
     epsilon: float = 0.10
+
+
+@dataclass(frozen=True, slots=True)
+class ActorProgress:
+    actor_id: int
+    game_id: str
+    steps: int
+    wins: int
+    failures: int
+    levels_completed: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +58,31 @@ def _local_significance(changed_cells: int, future_delta: float) -> float:
     return 0.55 * structural + 0.45 * option
 
 
+def _publish_progress(
+    progress_queue: mp.Queue | None,
+    *,
+    job: ActorJob,
+    steps: int,
+    wins: int,
+    failures: int,
+    levels_completed: int,
+) -> None:
+    if progress_queue is None:
+        return
+    row = ActorProgress(
+        job.actor_id,
+        job.game_id,
+        int(steps),
+        int(wins),
+        int(failures),
+        int(levels_completed),
+    )
+    try:
+        progress_queue.put_nowait(row)
+    except queue.Full:
+        pass
+
+
 def actor_worker(
     *,
     job: ActorJob,
@@ -54,6 +91,7 @@ def actor_worker(
     watermark: mp.sharedctypes.Synchronized,
     stop_event: mp.synchronize.Event,
     result_queue: mp.Queue,
+    progress_queue: mp.Queue | None = None,
 ) -> None:
     from v7.environment.arc_adapter import ArcGridEnvironment
     from v7.environment.encoding import (
@@ -69,10 +107,13 @@ def actor_worker(
     rng = Random(job.seed)
     env = ArcGridEnvironment(game_id=job.game_id, seed=job.seed, env_root=job.env_root)
     sequence = 0
-    rolling_trajectory = stable_u64(job.actor_id, job.seed, person=b"v8-traj-seed")
+    with watermark.get_lock():
+        sequence_base = int(watermark.value)
+    rolling_trajectory = stable_u64(job.actor_id, job.seed, sequence_base, person=b"v8-traj-seed")
     local_overlay: dict[tuple[int, int], tuple[int, float]] = {}
-    wins = failures = 0
+    wins = failures = levels_completed = 0
     last_levels = int(env.last_levels_completed)
+    next_progress = time.monotonic() + 5.0
     try:
         for _ in range(int(job.steps)):
             if stop_event.is_set():
@@ -104,10 +145,6 @@ def actor_worker(
 
             after = env.step(action)
             after_actions = tuple(sorted(set(int(value) for value in env.available_actions())))
-            sequence += 1
-            with watermark.get_lock():
-                watermark.value += 1
-                current_watermark = int(watermark.value)
             outcome = int(transition_signature(before, after))
             family = int(transformation_family_signature(before, after))
             carrier = int(carrier_signature(before, after) or 0)
@@ -116,27 +153,40 @@ def actor_worker(
             rolling_trajectory = stable_u64(
                 rolling_trajectory, context, action, outcome, person=b"v8-trajectory"
             )
-            event = ExperienceEvent(
-                event_id=EventId.from_producer(job.actor_id, sequence),
-                watermark=current_watermark,
-                producer_id=job.actor_id,
-                producer_sequence=sequence,
-                source_game_hash=stable_u64(job.game_id, person=b"v8-game"),
-                global_step=current_watermark,
-                context_signature=context,
-                action_id=action,
-                outcome_signature=outcome,
-                family_signature=family,
-                carrier_signature=carrier,
-                future_option_delta=future_delta,
-                changed_cells=changed,
-                terminal_polarity=_polarity(env.last_outcome_polarity),
-                trajectory_signature=rolling_trajectory,
-            )
-            packet = encode_pipeline(PipelineEvent(event))
+
+            next_sequence = sequence + 1
+            producer_sequence = sequence_base + next_sequence
+            accepted = False
+            current_watermark = 0
             while not stop_event.is_set():
-                if ring.put(packet, timeout=0.25):
-                    break
+                with watermark.get_lock():
+                    current_watermark = int(watermark.value) + 1
+                    event = ExperienceEvent(
+                        event_id=EventId.from_producer(job.actor_id, producer_sequence),
+                        watermark=current_watermark,
+                        producer_id=job.actor_id,
+                        producer_sequence=producer_sequence,
+                        source_game_hash=stable_u64(job.game_id, person=b"v8-game"),
+                        global_step=current_watermark,
+                        context_signature=context,
+                        action_id=action,
+                        outcome_signature=outcome,
+                        family_signature=family,
+                        carrier_signature=carrier,
+                        future_option_delta=future_delta,
+                        changed_cells=changed,
+                        terminal_polarity=_polarity(env.last_outcome_polarity),
+                        trajectory_signature=rolling_trajectory,
+                    )
+                    packet = encode_pipeline(PipelineEvent(event))
+                    if ring.put(packet, timeout=0.05):
+                        watermark.value = current_watermark
+                        accepted = True
+                        break
+                time.sleep(0)
+            if not accepted:
+                break
+            sequence = next_sequence
 
             significance = _local_significance(changed, future_delta)
             old_support, old_score = local_overlay.get((context, action), (0, 0.0))
@@ -151,11 +201,34 @@ def actor_worker(
             elif env.last_outcome_polarity == "negative":
                 failures += 1
             current_levels = int(env.last_levels_completed)
+            if current_levels > last_levels:
+                levels_completed += current_levels - last_levels
             if current_levels < last_levels or env.last_step_was_reset_boundary:
                 rolling_trajectory = stable_u64(
-                    job.actor_id, sequence, current_watermark, person=b"v8-traj-reset"
+                    job.actor_id, producer_sequence, current_watermark, person=b"v8-traj-reset"
                 )
             last_levels = current_levels
+
+            now = time.monotonic()
+            if now >= next_progress:
+                _publish_progress(
+                    progress_queue,
+                    job=job,
+                    steps=sequence,
+                    wins=wins,
+                    failures=failures,
+                    levels_completed=levels_completed,
+                )
+                next_progress = now + 5.0
+
+        _publish_progress(
+            progress_queue,
+            job=job,
+            steps=sequence,
+            wins=wins,
+            failures=failures,
+            levels_completed=levels_completed,
+        )
         result_queue.put(
             ActorResult(
                 job.actor_id,
@@ -163,7 +236,7 @@ def actor_worker(
                 sequence,
                 wins,
                 failures,
-                int(env.last_levels_completed),
+                levels_completed,
                 int(env.reset_count),
             )
         )
@@ -172,12 +245,23 @@ def actor_worker(
         ring.close()
 
 
-def run_actor_jobs(runtime, jobs: Iterable[ActorJob], *, timeout: float | None = None) -> tuple[ActorResult, ...]:
+def run_actor_jobs(
+    runtime,
+    jobs: Iterable[ActorJob],
+    *,
+    timeout: float | None = None,
+    progress_interval_seconds: float = 60.0,
+    progress_callback: Callable[[tuple[ActorProgress, ...]], None] | None = None,
+) -> tuple[ActorResult, ...]:
     runtime.start()
     jobs = tuple(jobs)
     if not jobs:
         return ()
+    if progress_interval_seconds <= 0:
+        raise ValueError("progress_interval_seconds must be positive")
+
     results: mp.Queue = mp.Queue()
+    progress: mp.Queue = mp.Queue(maxsize=max(16, len(jobs) * 4))
     processes = [
         mp.Process(
             target=actor_worker,
@@ -188,22 +272,106 @@ def run_actor_jobs(runtime, jobs: Iterable[ActorJob], *, timeout: float | None =
                 "watermark": runtime._watermark,
                 "stop_event": runtime._stop,
                 "result_queue": results,
+                "progress_queue": progress,
             },
             name=f"v8-actor-{job.actor_id:03d}-{job.game_id}",
             daemon=True,
         )
         for job in jobs
     ]
-    for process in processes:
-        process.start()
-    for process in processes:
-        process.join(timeout=timeout)
-    for process in processes:
-        if process.is_alive():
-            process.terminate()
+    latest = {
+        job.actor_id: ActorProgress(job.actor_id, job.game_id, 0, 0, 0, 0)
+        for job in jobs
+    }
+    result_by_actor: dict[int, ActorResult] = {}
+    started = time.monotonic()
+    deadline = None if timeout is None else started + float(timeout)
+    next_report = started + float(progress_interval_seconds)
+
+    try:
+        for process in processes:
+            process.start()
+
+        while True:
+            while True:
+                try:
+                    row = progress.get_nowait()
+                except queue.Empty:
+                    break
+                if isinstance(row, ActorProgress):
+                    latest[row.actor_id] = row
+
+            while True:
+                try:
+                    row = results.get_nowait()
+                except queue.Empty:
+                    break
+                if isinstance(row, ActorResult):
+                    result_by_actor[row.actor_id] = row
+                    latest[row.actor_id] = ActorProgress(
+                        row.actor_id,
+                        row.game_id,
+                        row.steps,
+                        row.wins,
+                        row.failures,
+                        row.levels_completed,
+                    )
+
+            failed = [
+                process
+                for process in processes
+                if process.exitcode not in (None, 0)
+            ]
+            if failed:
+                detail = ", ".join(
+                    f"{process.name}={process.exitcode}" for process in failed
+                )
+                raise RuntimeError(f"actor failed: {detail}")
+
+            now = time.monotonic()
+            if progress_callback is not None and now >= next_report:
+                progress_callback(tuple(latest[key] for key in sorted(latest)))
+                while next_report <= now:
+                    next_report += float(progress_interval_seconds)
+
+            if all(not process.is_alive() for process in processes):
+                break
+            if deadline is not None and now >= deadline:
+                raise TimeoutError("actor jobs timed out")
+            time.sleep(0.05)
+
+        for process in processes:
             process.join(timeout=2.0)
-            raise TimeoutError(f"actor timed out: {process.name}")
-        if process.exitcode != 0:
-            raise RuntimeError(f"actor failed: {process.name} exit={process.exitcode}")
-    rows = [results.get(timeout=2.0) for _ in jobs]
-    return tuple(sorted(rows, key=lambda row: row.actor_id))
+
+        result_deadline = time.monotonic() + 2.0
+        while len(result_by_actor) < len(jobs) and time.monotonic() < result_deadline:
+            try:
+                row = results.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if isinstance(row, ActorResult):
+                result_by_actor[row.actor_id] = row
+                latest[row.actor_id] = ActorProgress(
+                    row.actor_id,
+                    row.game_id,
+                    row.steps,
+                    row.wins,
+                    row.failures,
+                    row.levels_completed,
+                )
+
+        if len(result_by_actor) != len(jobs):
+            missing = sorted(set(latest) - set(result_by_actor))
+            raise RuntimeError(f"actor result missing for ids: {missing}")
+
+        if progress_callback is not None:
+            progress_callback(tuple(latest[key] for key in sorted(latest)))
+
+        return tuple(result_by_actor[key] for key in sorted(result_by_actor))
+    except BaseException:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+        for process in processes:
+            process.join(timeout=2.0)
+        raise
