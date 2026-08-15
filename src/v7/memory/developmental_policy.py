@@ -10,6 +10,7 @@ from v7.memory.concept_validation import ConceptValidationStatus
 from v7.memory.ids import MemoryId, MemoryLevel
 from v7.memory.planning import TYPE_EXECUTABLE_PROCEDURE
 from v7.memory.read_view import MemoryReadView
+from v7.memory.status import memory_is_active
 
 
 class DevelopmentStage(IntEnum):
@@ -98,22 +99,25 @@ def development_profile(stage: DevelopmentStage) -> DevelopmentProfile:
 
 
 def infer_development_stage(view: MemoryReadView) -> DevelopmentStage:
+    active_nodes = tuple(
+        node for node in view.nodes.values() if memory_is_active(node)
+    )
     stable_m1 = any(
         node.level == MemoryLevel.M1 and int(node.support_count) >= 2
-        for node in view.nodes.values()
+        for node in active_nodes
     )
     if not stable_m1:
         return DevelopmentStage.CONTROL
 
-    has_m2 = any(node.level == MemoryLevel.M2 for node in view.nodes.values())
+    has_m2 = any(node.level == MemoryLevel.M2 for node in active_nodes)
     if not has_m2:
         return DevelopmentStage.CONTINGENCY
 
-    # Functional roles use type 300. Other M3 subtypes (carrier/contextual
-    # instance) deliberately do not advance the developmental stage.
+    # Functional roles use type 300. Other M3 subtypes deliberately do not
+    # advance developmental stage, and demoted roles never count as maturity.
     has_functional_role = any(
         node.level == MemoryLevel.M3 and int(node.type_id) == 300
-        for node in view.nodes.values()
+        for node in active_nodes
     )
     if not has_functional_role:
         return DevelopmentStage.ABSTRACTION
@@ -125,7 +129,7 @@ def infer_development_stage(view: MemoryReadView) -> DevelopmentStage:
     has_validated_concept = any(
         node.level == MemoryLevel.M4
         and bool(int(node.status_flags) & validated_mask)
-        for node in view.nodes.values()
+        for node in active_nodes
     )
     if not has_validated_concept:
         return DevelopmentStage.TRANSFER
@@ -134,7 +138,7 @@ def infer_development_stage(view: MemoryReadView) -> DevelopmentStage:
         node.level == MemoryLevel.M6
         and int(node.type_id) == int(TYPE_EXECUTABLE_PROCEDURE)
         and int(node.support_count) > 0
-        for node in view.nodes.values()
+        for node in active_nodes
     )
     if not has_procedure:
         return DevelopmentStage.PLANNING
@@ -142,14 +146,7 @@ def infer_development_stage(view: MemoryReadView) -> DevelopmentStage:
 
 
 def profile_for_view(view: MemoryReadView) -> DevelopmentProfile:
-    """Return the immutable generation profile without rescanning it per action.
-
-    Sampling workers repeatedly score the same MemoryReadView for every action
-    of every step. Stage inference is O(number of memories), so doing it inside
-    each scorer turned accumulated memory into a sampling-time multiplier. A
-    weak single-entry process-local cache keeps the lookup O(1) while allowing
-    the prior generation view to be released as soon as the worker finishes.
-    """
+    """Return the immutable generation profile without rescanning it per action."""
     global _PROFILE_CACHE_VIEW, _PROFILE_CACHE_VALUE
     cached_view = None if _PROFILE_CACHE_VIEW is None else _PROFILE_CACHE_VIEW()
     if cached_view is view and _PROFILE_CACHE_VALUE is not None:
@@ -166,22 +163,20 @@ def focused_replay_ids(
     profile: DevelopmentProfile | None = None,
     limit: int = 64,
 ) -> tuple[MemoryId, ...]:
-    """Return deterministic stage-relevant memories for developmental replay.
-
-    This is an additional focus frontier. It does not erase ordinary replay
-    decisions driven by prediction error, transfer, contradiction, or learning
-    value.
-    """
+    """Return deterministic stage-relevant active memories for replay."""
     if limit <= 0:
         return ()
     profile = profile or profile_for_view(view)
     allowed = set(profile.replay_levels)
     rows: list[tuple[float, int, MemoryId]] = []
     for memory_id, node in view.nodes.items():
-        if node.level not in allowed:
+        if node.level not in allowed or not memory_is_active(node):
             continue
         score = view.scores.get(memory_id)
-        support = min(1.0, math.log1p(max(0, int(node.support_count))) / math.log1p(8.0))
+        support = min(
+            1.0,
+            math.log1p(max(0, int(node.support_count))) / math.log1p(8.0),
+        )
         semantic = 0.0
         if score is not None:
             semantic = max(
@@ -201,6 +196,7 @@ def focused_replay_ids(
 def stage_counts(view: MemoryReadView) -> dict[str, int | str]:
     counts = {f"M{level}": 0 for level in range(7)}
     for node in view.nodes.values():
-        counts[f"M{int(node.level)}"] += 1
+        if memory_is_active(node):
+            counts[f"M{int(node.level)}"] += 1
     stage = infer_development_stage(view)
     return {"stage": stage.name, **counts}
