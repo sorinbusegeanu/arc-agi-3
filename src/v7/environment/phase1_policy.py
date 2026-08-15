@@ -487,6 +487,7 @@ def select_phase1_action(
 
     profile = profile_for_view(view)
     stage_name = profile.stage.name
+    base_epsilon = _clamp01(float(epsilon))
     strategy_enabled = not ablated(
         ablation_mask,
         CognitionAblation.STRATEGY_EXECUTION,
@@ -501,7 +502,15 @@ def select_phase1_action(
         )
         if strategy is not None:
             decision, strategy_id = strategy
-            if was_active or not _is_transfer_frontier(contexts, decision):
+            strategy_allowed = was_active or not _is_transfer_frontier(
+                contexts, decision
+            )
+            strategy_interrupt = (
+                strategy_allowed
+                and base_epsilon > 0.0
+                and rng.random() < min(base_epsilon, 0.02)
+            )
+            if strategy_allowed and not strategy_interrupt:
                 return Phase1Selection(
                     decision=decision,
                     mode="strategy",
@@ -543,7 +552,6 @@ def select_phase1_action(
         CognitionAblation.DEVELOPMENTAL_POLICY,
     ):
         developmental_multiplier = max(1.0, developmental_multiplier)
-    base_epsilon = _clamp01(float(epsilon))
     uncertainty_scale = max(0.35, 1.0 - confidence)
     effective_epsilon = _clamp01(
         base_epsilon * developmental_multiplier * uncertainty_scale
@@ -572,12 +580,12 @@ def select_phase1_action(
         else 0.76
     )
 
-    if confidence >= high_confidence_threshold:
-        selected = memory
-        mode = "memory"
-    elif effective_epsilon > 0.0 and rng.random() < effective_epsilon:
+    if effective_epsilon > 0.0 and rng.random() < effective_epsilon:
         selected = exploration
         mode = "exploration"
+    elif confidence >= high_confidence_threshold:
+        selected = memory
+        mode = "memory"
     elif exploration.exploration_score >= 0.75 and confidence < 0.35:
         selected = exploration
         mode = "exploration"
