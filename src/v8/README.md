@@ -38,6 +38,10 @@ SUPERSEDES
 LEADS_TO
 PREFERENCE
 GAME_PROVENANCE
+DEPENDS_ON
+ENABLES
+BLOCKS
+OUTCOME_EQUIVALENT
 ```
 
 `GAME_PROVENANCE` stores the exact source-game hash. Higher abstractions inherit exact provenance through graph lineage rather than relying on the compact 64-bit game mask.
@@ -50,13 +54,14 @@ The shared graph is continuously inspected by independent analyses which emit ca
 prediction-violation estimation
 context refinement
 carrier → role formation
+bounded typed graph-neighborhood similarity
 bounded future-option estimation
 ISF attention / replay prioritization
 explanatory reach / compression
 held-out transfer candidacy and automatic matched intervention
 concept validation
 M5 world-model integration
-M6 outcome-equivalence merge/refinement
+M6 outcome-equivalence merge/split/refinement
 M7 strategy reliability / cost / alternatives
 target-like preference estimation
 planning / replanning / strategy-ablation probes
@@ -73,7 +78,13 @@ Actors compare each observed transition against the M1 outcome distribution visi
 
 ### ISF and replay
 
-Stage-dependent ISF combines normalized survival/significance, prediction error, learning value, transfer potential, explanatory reach, and future-option value. A bounded replay/attention scheduler prioritizes violations, transfer opportunities, explanatory opportunities, future-option effects, and high-value developmental memories instead of processing only by raw support.
+A capability-derived developmental `Stage_t` is inferred from the published graph before each peer interval and held fixed while that interval is scored. The ISF combines bounded option-structure impact, prediction error, prospective learning value, transfer prior, explanatory potential, and future-option value. A bounded replay/attention scheduler prioritizes violations, transfer opportunities, explanatory opportunities, future-option effects, and high-value developmental memories instead of processing only by raw support. Evidence created during the interval can affect only the next inferred stage.
+
+### Bounded graph-neighborhood similarity
+
+M3 role/contextual-role and M4 concept candidates receive deterministic radius-1 typed neighborhood descriptors. Candidate generation uses coarse structural buckets and hard limits; exact comparison is restricted to at most the configured candidate budget and unchanged descriptor versions are skipped.
+
+High similarity never merges canonical identity. It produces only `SIMILAR_TO` evidence and a prospective transfer prior. A later held-out intervention is still required for empirical transfer or concept validation.
 
 ### Future options
 
@@ -81,7 +92,7 @@ The actor's immediate available-action change remains early `OE0` evidence. The 
 
 ### Transfer and concepts
 
-Structural cross-game recurrence creates transfer candidates only. It cannot validate a concept. `continuous-run` automatically schedules bounded matched held-out experiments when a candidate has an admissible target game:
+Structural cross-game recurrence or bounded graph correspondence creates transfer candidates only. It cannot validate a concept. `continuous-run` automatically schedules bounded matched held-out experiments when a candidate has an admissible target game:
 
 ```text
 same target game
@@ -96,7 +107,7 @@ Positive held-out effects can validate transfer/concepts. Failed interventions a
 
 ### Outcomes, strategies, replanning and preference
 
-M6 first retains bounded fine consequence variants. The outcome peer can merge recurring variants into a persistent coarse outcome class and rebind M7 alternatives to that class. If the coarse class stops being active, the fine members remain available as reversible lineage rather than being destroyed.
+M6 first retains bounded fine consequence variants. The outcome peer can merge recurring variants into a persistent coarse outcome class and rebind M7 alternatives to that class. If a coarse class fails validation it is quarantined, its `SUPERSEDES` effect stops participating in cognition, and its persistent fine members become usable again. M7 strategies pointing to an inactive coarse outcome are not selectable.
 
 M7 stores observed attempts, success/reach statistics, and cost separately from outcome identity. Actor planning ranks admissible strategies by learned reliability and efficiency, with preference as a separate bonus. `QUARANTINED`, `RETIRE_PENDING`, and `RETIRED` strategies cannot guide action.
 
@@ -130,7 +141,7 @@ RETIRED
 REACTIVATED
 ```
 
-Lifecycle fitness is ISF-based. Dependency-safe `RETIRE_PENDING` memories become `RETIRED`; retired memories are excluded from cognition immediately.
+Lifecycle fitness consumes the same fixed developmental Stageₜ weighting state used by attention/replay. Dependency-safe `RETIRE_PENDING` memories become `RETIRED`; retired memories are excluded from cognition immediately.
 
 When node/edge pressure is high, or at final maintenance, v8 enters a short quiescent generation barrier, archives retired nodes and incident edges to:
 
@@ -198,7 +209,7 @@ Ordinary learning does not wait for disk chunk serialization.
 
 For a periodic recovery cut, actors are briefly frozen, canonical queues and developmental peers reach a fixed point, and the snapshot process copies all shard arenas into its own immutable RAM payloads. Actors resume as soon as that coherent capture is complete; content-addressed disk chunking continues asynchronously.
 
-Recovery snapshots use 4 MiB content-addressed chunks. Unchanged chunks are reused across snapshots. Snapshot auxiliary state includes the scientific evidence ledger, transfer trials, preference probes, lifecycle state, peer dedupe/version state, and graph generation. Existing v8 node snapshots are migrated into the current RAM record shape on load while canonical v8 `MemoryUid` identity remains stable.
+Recovery snapshots use 4 MiB content-addressed chunks. Unchanged chunks are reused across snapshots. Snapshot auxiliary state includes the scientific evidence ledger, transfer trials, preference probes, lifecycle state, similarity descriptor versions, peer dedupe/version state, and graph generation. Existing v8 node snapshots are migrated into the current RAM record shape on load while canonical v8 `MemoryUid` identity remains stable.
 
 ```text
 RAM evolution ───────────────► cognition
