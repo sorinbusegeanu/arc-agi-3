@@ -19,6 +19,7 @@ from v8.model import (
     MemoryType,
     MemoryUid,
     RelationType,
+    ValidationState,
     signed_u64,
     stable_u64,
 )
@@ -56,6 +57,17 @@ class _StrategyRow:
     support: int
     reliability: float
     mean_cost: float
+    context_bucket: int
+    probationary: bool = False
+    transferable: bool = False
+
+
+_LINEAGE_RELATIONS = {
+    int(RelationType.PROVENANCE),
+    int(RelationType.EXPLAINS),
+    int(RelationType.LEADS_TO),
+    int(RelationType.CONTEXT_REFINES),
+}
 
 
 class LiveReadView:
@@ -68,15 +80,19 @@ class LiveReadView:
         self._actions = tuple(SharedActionArena.attach(d.actions) for d in self.descriptors)
         self._strategy_version: tuple[int, ...] = ()
         self._strategy_by_context: dict[int, list[_StrategyRow]] = {}
+        self._strategy_fallback: list[_StrategyRow] = []
         self._preferred_outcomes: set[MemoryUid] = set()
         self._suppressed_outcomes: set[MemoryUid] = set()
         self._parents: dict[MemoryUid, set[MemoryUid]] = {}
+        self._node_by_uid: dict[MemoryUid, NodeRecord] = {}
+        self._refined_action_scores: dict[tuple[int, int], tuple[int, float]] = {}
 
     def close(self) -> None:
         for arena in (*self._nodes, *self._edges, *self._actions):
             arena.close()
 
     def score_actions(self, context_signature: int, action_ids: Iterable[int]) -> tuple[ActionScore, ...]:
+        self._refresh_strategy_cache()
         rows: list[ActionScore] = []
         for raw_action in action_ids:
             action = int(raw_action)
@@ -92,6 +108,13 @@ class LiveReadView:
                 support += int(record.support_count)
                 total_score += float(record.score_sum)
                 total_weight += float(record.score_weight)
+            refined_support, refined_score = self._refined_action_scores.get(
+                (int(context_signature), action), (0, 0.0)
+            )
+            if refined_support > 0:
+                support += refined_support
+                total_score += refined_score * refined_support
+                total_weight += refined_support
             score = 0.0 if total_weight <= 0 else total_score / total_weight
             rows.append(ActionScore(action, support, score, evidence_shards))
         return tuple(rows)
@@ -113,12 +136,6 @@ class LiveReadView:
         min_support: int = 3,
         stability_threshold: float = 0.60,
     ) -> dict[int, float]:
-        """Return an expectation only after it is supported and stable.
-
-        Actors call this before the transition. Returning an empty mapping suppresses
-        prediction-error generation until an expectation actually exists, removing the
-        bootstrap/circularity problem from early sparse contingencies.
-        """
         counts: dict[int, int] = {}
         total = 0
         context = int(context_signature)
@@ -139,36 +156,39 @@ class LiveReadView:
             return {}
         return {outcome: count / total for outcome, count in counts.items()}
 
+    @staticmethod
+    def _stable_records(arena, *, retries: int = 16):
+        for _ in range(max(1, int(retries))):
+            before = arena.sequence
+            if before & 1:
+                continue
+            rows = tuple(arena.records())
+            after = arena.sequence
+            if before == after and not (after & 1):
+                return rows
+        raise RuntimeError(f"could not obtain coherent live {arena.kind} records")
+
     def node_records(self, *, level: MemoryLevel | int | None = None) -> tuple[NodeRecord, ...]:
         selected = []
         wanted = None if level is None else int(level)
         for arena in self._nodes:
-            for record in arena.records():
+            for record in self._stable_records(arena):
                 if wanted is None or int(record.level) == wanted:
                     selected.append(record)
         return tuple(selected)
 
     def edge_records(self) -> tuple[EdgeRecord, ...]:
-        return tuple(record for arena in self._edges for record in arena.records())
+        return tuple(record for arena in self._edges for record in self._stable_records(arena))
 
     def source_games(self, uid: MemoryUid, *, max_depth: int = 8) -> frozenset[int]:
-        """Return exact formation provenance, inherited through graph ancestry."""
         edges = self.edge_records()
         direct: dict[MemoryUid, set[int]] = {}
         parents: dict[MemoryUid, set[MemoryUid]] = {}
-        lineage_relations = {
-            int(RelationType.PROVENANCE),
-            int(RelationType.EXPLAINS),
-            int(RelationType.CONTEXT_REFINES),
-            int(RelationType.TRANSFER_CORRESPONDENCE),
-            int(RelationType.SUPERSEDES),
-            int(RelationType.LEADS_TO),
-        }
         for edge in edges:
             relation = int(edge.relation_type)
             if relation == int(RelationType.GAME_PROVENANCE) and int(edge.target_uid.hi) == 0:
                 direct.setdefault(edge.source_uid, set()).add(int(edge.target_uid.lo))
-            elif relation in lineage_relations:
+            elif relation in _LINEAGE_RELATIONS:
                 parents.setdefault(edge.source_uid, set()).add(edge.target_uid)
 
         games = set(direct.get(uid, ()))
@@ -204,47 +224,101 @@ class LiveReadView:
     def has_uid(self, uid: MemoryUid) -> bool:
         return any(record.uid == uid for record in self.node_records())
 
+    def _has_transferable_ancestor(self, uid: MemoryUid, *, max_depth: int = 8) -> bool:
+        frontier = {uid}
+        visited = set(frontier)
+        for _depth in range(max(0, int(max_depth))):
+            following: set[MemoryUid] = set()
+            for current in frontier:
+                for parent in self._parents.get(current, ()):
+                    row = self._node_by_uid.get(parent)
+                    if row is not None and int(row.level) >= int(MemoryLevel.M3):
+                        if (
+                            row.game_evidence_count >= 2
+                            or int(row.validation_state) >= int(ValidationState.VALIDATED)
+                        ):
+                            return True
+                    if parent not in visited:
+                        visited.add(parent)
+                        following.add(parent)
+            if not following:
+                break
+            frontier = following
+        return False
+
     def _refresh_strategy_cache(self) -> None:
-        version = tuple(arena.sequence for arena in (*self._nodes, *self._edges))
-        if version == self._strategy_version:
-            return
-        admissible = {
+        for _ in range(8):
+            version_before = tuple(arena.sequence for arena in (*self._nodes, *self._edges))
+            if any(value & 1 for value in version_before):
+                continue
+            if version_before == self._strategy_version:
+                return
+            nodes = self.node_records()
+            edges = self.edge_records()
+            version_after = tuple(arena.sequence for arena in (*self._nodes, *self._edges))
+            if version_before == version_after and not any(value & 1 for value in version_after):
+                version = version_after
+                break
+        else:
+            raise RuntimeError("could not obtain coherent node/edge publication cut")
+
+        active_states = {
             int(CognitiveState.ACTIVE),
             int(CognitiveState.VALIDATED),
             int(CognitiveState.REACTIVATED),
         }
-        nodes = self.node_records()
-        active_uids = {row.uid for row in nodes if int(row.cognitive_state) in admissible}
-        edges = self.edge_records()
+        probe_states = active_states | {
+            int(CognitiveState.CANDIDATE),
+            int(CognitiveState.PROBATION),
+        }
+        active_uids = {row.uid for row in nodes if int(row.cognitive_state) in active_states}
+        node_by_uid = {row.uid: row for row in nodes}
         parents: dict[MemoryUid, set[MemoryUid]] = {}
         preferred: set[MemoryUid] = set()
         suppressed: set[MemoryUid] = set()
+        refined: dict[tuple[int, int], list[float]] = {}
         for edge in edges:
             relation = int(edge.relation_type)
-            if relation == int(RelationType.GAME_PROVENANCE):
-                continue
-            parents.setdefault(edge.source_uid, set()).add(edge.target_uid)
+            if relation in _LINEAGE_RELATIONS:
+                parents.setdefault(edge.source_uid, set()).add(edge.target_uid)
             if relation == int(RelationType.PREFERENCE) and edge.source_uid in active_uids:
                 preferred.add(edge.source_uid)
             if relation == int(RelationType.SUPERSEDES) and edge.source_uid in active_uids:
                 suppressed.add(edge.target_uid)
+            if relation == int(RelationType.CONTEXT_REFINES):
+                role = node_by_uid.get(edge.source_uid)
+                source = node_by_uid.get(edge.target_uid)
+                if (
+                    role is not None
+                    and source is not None
+                    and int(role.memory_type) == int(MemoryType.CONTEXTUAL_ROLE)
+                    and len(source.key_parts) >= 2
+                    and int(role.cognitive_state) in probe_states
+                    and role.support_count > 0
+                ):
+                    context = int(source.key_parts[0])
+                    action = signed_u64(int(source.key_parts[1]))
+                    value = max(0.0, float(role.learning_value), float(role.significance))
+                    bucket = refined.setdefault((context, action), [0.0, 0.0])
+                    bucket[0] += max(1, int(role.support_count))
+                    bucket[1] += value * max(1, int(role.support_count))
 
+        self._parents = parents
+        self._node_by_uid = node_by_uid
         by_context: dict[int, list[_StrategyRow]] = {}
+        fallback: list[_StrategyRow] = []
         for row in nodes:
             if (
                 int(row.level) != int(MemoryLevel.M7)
                 or int(row.memory_type) != int(MemoryType.STRATEGY)
                 or len(row.key_parts) < 4
-                or int(row.cognitive_state) not in admissible
+                or int(row.cognitive_state) not in probe_states
             ):
                 continue
             action = signed_u64(int(row.key_parts[0]))
             outcome = MemoryUid(int(row.key_parts[1]), int(row.key_parts[2]))
-            # Strategies are cognitively admissible only while their represented
-            # outcome class is itself active. This is required for operational M6
-            # split/demotion: an invalidated coarse outcome cannot keep directing
-            # behavior through an otherwise-active M7 strategy.
-            if outcome not in active_uids:
+            outcome_row = node_by_uid.get(outcome)
+            if outcome_row is None or int(outcome_row.cognitive_state) not in probe_states:
                 continue
             if outcome in suppressed:
                 continue
@@ -253,22 +327,43 @@ class LiveReadView:
                 reliability = max(0.0, min(1.0, row.strategy_reliability))
                 mean_cost = max(1e-9, row.strategy_mean_cost)
             else:
-                reliability = min(0.75, max(0, int(row.support_count)) / 8.0)
+                reliability = min(0.55, max(0, int(row.support_count)) / 10.0)
                 mean_cost = 1.0
-            by_context.setdefault(context_bucket, []).append(
-                _StrategyRow(
-                    action,
-                    outcome,
-                    row.uid,
-                    int(row.support_count),
-                    reliability,
-                    mean_cost,
-                )
+            probationary = int(row.cognitive_state) not in active_states
+            strategy = _StrategyRow(
+                action,
+                outcome,
+                row.uid,
+                int(row.support_count),
+                reliability,
+                mean_cost,
+                context_bucket,
+                probationary,
+                False,
             )
+            transferable = self._has_transferable_ancestor(row.uid)
+            strategy = _StrategyRow(
+                strategy.action_id,
+                strategy.outcome_uid,
+                strategy.strategy_uid,
+                strategy.support,
+                strategy.reliability,
+                strategy.mean_cost,
+                strategy.context_bucket,
+                strategy.probationary,
+                transferable,
+            )
+            by_context.setdefault(context_bucket, []).append(strategy)
+            if transferable:
+                fallback.append(strategy)
         self._strategy_by_context = by_context
+        self._strategy_fallback = fallback
         self._preferred_outcomes = preferred
         self._suppressed_outcomes = suppressed
-        self._parents = parents
+        self._refined_action_scores = {
+            key: (int(values[0]), values[1] / max(1.0, values[0]))
+            for key, values in refined.items()
+        }
         self._strategy_version = version
 
     def strategy_has_ancestor(
@@ -310,8 +405,15 @@ class LiveReadView:
         self._refresh_strategy_cache()
         context_bucket = stable_u64(int(context_signature), person=b"v8-context")
         available = {int(value) for value in action_ids}
+        exact = list(self._strategy_by_context.get(context_bucket, ()))
+        active_exact = [row for row in exact if not row.probationary]
+        source = active_exact if active_exact else exact
+        cross_context = False
+        if not source:
+            source = list(self._strategy_fallback)
+            cross_context = True
         candidates: list[PlannedAction] = []
-        for row in self._strategy_by_context.get(context_bucket, ()):
+        for row in source:
             if row.action_id not in available or row.support <= 0:
                 continue
             if row.strategy_uid in excluded_strategies:
@@ -328,7 +430,16 @@ class LiveReadView:
             preference_bonus = 0.25 if preference_influenced else 0.0
             support_prior = 0.05 * math.log1p(max(0, row.support))
             efficiency = 1.0 / max(1e-9, row.mean_cost)
-            score = row.reliability + 0.10 * efficiency + support_prior + preference_bonus
+            probation_penalty = 0.25 if row.probationary else 0.0
+            transfer_penalty = 0.30 if cross_context else 0.0
+            score = (
+                row.reliability
+                + 0.10 * efficiency
+                + support_prior
+                + preference_bonus
+                - probation_penalty
+                - transfer_penalty
+            )
             candidates.append(
                 PlannedAction(
                     row.action_id,
