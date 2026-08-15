@@ -5,12 +5,13 @@ import multiprocessing as mp
 import queue
 import threading
 import time
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from v8.arena import SharedActionArena, SharedEdgeArena, SharedNodeArena
 from v8.development import STAGES, stage_worker
 from v8.evaluation import ScientificHypothesisEvaluator
+from v8.evidence import EvidenceRecord
 from v8.model import (
     EventId,
     ExperienceEvent,
@@ -22,13 +23,20 @@ from v8.model import (
     PipelineEvent,
     encode_pipeline,
     encode_proposal,
+    stable_u64,
 )
 from v8.peers import DevelopmentalPeerSupervisor
 from v8.publication import LiveReadView, ShardReadDescriptor
+from v8.reporting_snapshot import capture_reporting_cut
 from v8.ring import SharedRingBuffer
 from v8.scheduler import ResourceController
 from v8.shard import ShardConfig, shard_worker
-from v8.snapshot import SnapshotResult, SnapshotService, restore_latest_snapshot
+from v8.snapshot import (
+    SnapshotResult,
+    SnapshotService,
+    load_latest_auxiliary_state,
+    restore_latest_snapshot,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,14 +77,17 @@ class ContinuousMemoryRuntime:
         self.root = config.root
         self.root.mkdir(parents=True, exist_ok=True)
         self._stop = mp.Event()
+        self._snapshot_freeze = mp.Event()
         self._accepting = True
         self._started = False
         self._closed = False
         self._error_queue: mp.Queue = mp.Queue()
         self._watermark = mp.Value("Q", 0)
+        self._generation = mp.Value("Q", 0)
         self._actor_throttle = mp.Value("d", 0.0)
         self._snapshot_id = 0
         self._submit_lock = threading.Lock()
+        self._snapshot_error: str | None = None
 
         self._stage_rings = tuple(
             SharedRingBuffer(capacity=config.stage_ring_capacity, slot_size=PIPELINE_PACKET_SIZE)
@@ -103,10 +114,14 @@ class ContinuousMemoryRuntime:
         )
 
         restored = restore_latest_snapshot(self.root, self.shard_descriptors) if config.restore else None
+        restored_aux = load_latest_auxiliary_state(self.root) if restored is not None else None
         if restored is not None:
             self._snapshot_id, restored_watermark = restored
             with self._watermark.get_lock():
                 self._watermark.value = int(restored_watermark)
+        if restored_aux is not None:
+            with self._generation.get_lock():
+                self._generation.value = int(restored_aux.get("generation", 0))
 
         self.read_view = LiveReadView(self.shard_descriptors)
         self._submitted_event_ids: set[tuple[int, int]] = set()
@@ -138,6 +153,7 @@ class ContinuousMemoryRuntime:
                         self._shard_watermarks[shard_id],
                         self._error_queue,
                         config.shard_batch_size,
+                        self._generation,
                     ),
                     name=f"v8-shard-{shard_id:02d}",
                     daemon=True,
@@ -188,17 +204,27 @@ class ContinuousMemoryRuntime:
                 read_view=self.read_view,
                 submit_proposal=self.submit_proposal,
                 watermark=lambda: self.watermark,
+                generation=lambda: self.generation,
                 interval_seconds=config.peer_interval_seconds,
             )
             if config.enable_peers
             else None
         )
+        if self.peers is not None and restored_aux is not None:
+            peer_state = restored_aux.get("peers")
+            if isinstance(peer_state, dict):
+                self.peers.load_state(peer_state)
         self.hypothesis_evaluator = ScientificHypothesisEvaluator()
 
     @property
     def watermark(self) -> int:
         with self._watermark.get_lock():
             return int(self._watermark.value)
+
+    @property
+    def generation(self) -> int:
+        with self._generation.get_lock():
+            return int(self._generation.value)
 
     def start(self) -> None:
         if self._started:
@@ -225,13 +251,26 @@ class ContinuousMemoryRuntime:
         self._resource_thread.start()
         self._started = True
 
+    def _auxiliary_state_json(self) -> str:
+        payload: dict[str, object] = {
+            "version": 1,
+            "watermark": self.watermark,
+            "generation": self.generation,
+        }
+        if self.peers is not None:
+            payload["peers"] = self.peers.state_dict()
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
     def _snapshot_cadence(self) -> None:
         interval = float(self.config.snapshot_interval_seconds)
         while not self._snapshot_thread_stop.wait(interval):
             if self._closed or self.snapshot_service is None:
                 return
-            self._snapshot_id += 1
-            self.snapshot_service.request_latest(self._snapshot_id, self.watermark)
+            try:
+                self.request_consistent_snapshot(timeout=max(10.0, interval))
+            except BaseException as exc:
+                self._snapshot_error = f"{type(exc).__name__}: {exc}"
+                return
 
     def _resource_cadence(self) -> None:
         while not self._resource_thread_stop.wait(0.5):
@@ -249,6 +288,7 @@ class ContinuousMemoryRuntime:
                 self._actor_throttle.value = float(decision.actor_throttle_seconds)
             if self.peers is not None:
                 self.peers.set_interval(decision.peer_interval_seconds)
+                self.peers.set_candidate_budget(decision.candidate_budget)
 
     def make_experience(
         self,
@@ -267,6 +307,7 @@ class ContinuousMemoryRuntime:
         terminal_polarity: int = 0,
         trajectory_signature: int = 0,
         next_context_signature: int = 0,
+        prediction_error: float = 0.0,
     ) -> ExperienceEvent:
         return ExperienceEvent(
             event_id=EventId.from_producer(producer_id, producer_sequence),
@@ -285,6 +326,7 @@ class ContinuousMemoryRuntime:
             terminal_polarity=int(terminal_polarity),
             trajectory_signature=int(trajectory_signature),
             next_context_signature=int(next_context_signature),
+            prediction_error=float(prediction_error),
         )
 
     def submit(self, event: ExperienceEvent, *, timeout: float = 1.0) -> None:
@@ -292,6 +334,8 @@ class ContinuousMemoryRuntime:
             self.start()
         if not self._accepting:
             raise RuntimeError("v8 runtime is draining and no longer accepts experiences")
+        while self._snapshot_freeze.is_set() and not self._stop.is_set():
+            time.sleep(0.002)
         self.raise_worker_errors()
         event_key = (int(event.event_id.hi), int(event.event_id.lo))
         with self._submit_lock:
@@ -333,6 +377,12 @@ class ContinuousMemoryRuntime:
         for process in (*self._stage_processes, *self._shard_processes):
             if process.exitcode not in (None, 0):
                 raise RuntimeError(f"v8 worker exited unexpectedly: {process.name}={process.exitcode}")
+        if self.peers is not None:
+            self.peers.raise_if_failed()
+        if self._snapshot_error is not None:
+            message = self._snapshot_error
+            self._snapshot_error = None
+            raise RuntimeError(f"v8 snapshot failure: {message}")
 
     def _is_quiescent(self) -> bool:
         if any(not ring.empty for ring in (*self._stage_rings, *self._shard_rings)):
@@ -341,32 +391,63 @@ class ContinuousMemoryRuntime:
             return False
         return True
 
-    def wait_quiescent(self, *, timeout: float = 60.0, stable_checks: int = 5) -> None:
-        """Drain the mandatory pipeline and advance peer operators to a fixed point."""
+    def wait_quiescent(
+        self,
+        *,
+        timeout: float = 60.0,
+        stable_checks: int = 5,
+        resume_peers: bool = True,
+    ) -> None:
+        """Drain canonical queues and advance peer operators to a fixed point."""
         deadline = time.monotonic() + float(timeout)
         stable = 0
-        while time.monotonic() < deadline:
-            self.raise_worker_errors()
-            if not self._is_quiescent():
-                stable = 0
+        if self.peers is not None:
+            self.peers.pause()
+        try:
+            while time.monotonic() < deadline:
+                self.raise_worker_errors()
+                if not self._is_quiescent():
+                    stable = 0
+                    time.sleep(0.01)
+                    continue
+                peer_changed = False
+                if self.peers is not None:
+                    before = self.peers.metrics().proposals
+                    self.peers.run_once()
+                    after = self.peers.metrics().proposals
+                    peer_changed = after > before
+                if peer_changed or not self._is_quiescent():
+                    stable = 0
+                else:
+                    stable += 1
+                    if stable >= int(stable_checks):
+                        return
                 time.sleep(0.01)
-                continue
+            raise TimeoutError("v8 did not reach quiescence; " + json.dumps(self.metrics(), sort_keys=True))
+        finally:
+            if self.peers is not None and resume_peers and not self._snapshot_freeze.is_set():
+                self.peers.resume()
 
-            peer_changed = False
+    def request_consistent_snapshot(self, *, timeout: float = 30.0) -> None:
+        if self.snapshot_service is None:
+            return
+        self._snapshot_freeze.set()
+        if self.peers is not None:
+            self.peers.pause()
+        try:
+            self.wait_quiescent(timeout=timeout, resume_peers=False)
+            self._snapshot_id += 1
+            self.snapshot_service.request_consistent_capture(
+                self._snapshot_id,
+                self.watermark,
+                generation=self.generation,
+                auxiliary_state=self._auxiliary_state_json(),
+                timeout=timeout,
+            )
+        finally:
             if self.peers is not None:
-                before = self.peers.metrics().proposals
-                self.peers.run_once()
-                after = self.peers.metrics().proposals
-                peer_changed = after > before
-
-            if peer_changed or not self._is_quiescent():
-                stable = 0
-            else:
-                stable += 1
-                if stable >= int(stable_checks):
-                    return
-            time.sleep(0.01)
-        raise TimeoutError("v8 did not reach quiescence; " + json.dumps(self.metrics(), sort_keys=True))
+                self.peers.resume()
+            self._snapshot_freeze.clear()
 
     def scientific_statuses(self) -> dict[str, str]:
         if self.peers is None:
@@ -377,44 +458,112 @@ class ContinuousMemoryRuntime:
     def write_scientific_report(self) -> None:
         if self.peers is None:
             return
-        cut = self.peers.ledger.cut(self.watermark)
-        self.peers.ledger.export_jsonl(
-            self.root / "evidence" / "v8_evidence.jsonl", watermark=self.watermark
+        cut = capture_reporting_cut(
+            self.read_view,
+            self.peers.ledger,
+            self.watermark,
+            generation=self.generation,
         )
-        self.hypothesis_evaluator.write_report(self.root / "reports" / "h01_h15.json", cut)
+        self.peers.ledger.export_jsonl(
+            self.root / "evidence" / "v8_evidence.jsonl", watermark=cut.watermark
+        )
+        decisions = self.hypothesis_evaluator.write_report(
+            self.root / "reports" / "h01_h15.json", cut.evidence
+        )
+        (self.root / "reports" / "reporting_cut.json").write_text(
+            json.dumps(
+                {
+                    "watermark": cut.watermark,
+                    "generation": cut.generation,
+                    "graph_digest": cut.graph_digest,
+                    "evidence_count": len(cut.evidence),
+                    "decisions": [asdict(row) for row in decisions],
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
 
     def record_actor_results(self, results) -> None:
         if self.peers is None:
             return
-        from v8.evidence import EvidenceRecord
-
         for result in results:
-            if int(getattr(result, "replans", 0)) <= 0:
-                continue
-            self.peers.ledger.append(
-                EvidenceRecord.for_uid(
-                    f"replanning:{result.actor_id}:{self.watermark}",
-                    MemoryUid.zero(),
-                    evidence_kind="replanning_recovery",
-                    watermark=self.watermark,
-                    raw_value=float(result.replans),
-                    normalized_value=1.0,
-                    developmental_stage=int(MemoryLevel.M7),
-                    validation_state=3,
+            game_hash = stable_u64(result.game_id, person=b"v8-game")
+            for stat in getattr(result, "strategy_stats", ()):
+                self.peers.record_strategy_statistics(
+                    stat.strategy_uid,
+                    attempts=stat.attempts,
+                    successes=stat.successes,
+                    cost=stat.cost,
+                    source_game_hash=game_hash,
                 )
-            )
+            for probe in getattr(result, "preference_probes", ()):
+                self.peers.record_preference_probe(
+                    outcome_a=probe.outcome_a,
+                    outcome_b=probe.outcome_b,
+                    context_bucket=probe.context_bucket,
+                    chosen_outcome=probe.chosen_outcome,
+                    both_reachable=True,
+                    preference_influenced=probe.preference_influenced,
+                )
+            for trial in getattr(result, "replanning_trials", ()):
+                recorded = self.peers.record_replanning_trial(
+                    primary_strategy_uid=trial.primary_strategy_uid,
+                    alternative_strategy_uid=trial.alternative_strategy_uid,
+                    outcome_uid=trial.outcome_uid,
+                    primary_invalidated=True,
+                    alternative_selected=True,
+                    recovery_succeeded=trial.recovery_succeeded,
+                )
+                if not recorded.valid_recovery:
+                    alternative = next(
+                        (
+                            row
+                            for row in self.read_view.node_records(level=MemoryLevel.M7)
+                            if row.uid == trial.alternative_strategy_uid
+                        ),
+                        None,
+                    )
+                    if alternative is not None:
+                        self.peers._append_evidence(
+                            "replanning_recovery_fail",
+                            alternative,
+                            1.0,
+                            unique=True,
+                            causal_intervention="strategy_ablation_recovery",
+                            effect_direction=-1,
+                        )
+            if int(getattr(result, "replans", 0)) > 0:
+                self.peers.ledger.append(
+                    EvidenceRecord.for_uid(
+                        f"replanning-observed:{result.actor_id}:{self.watermark}",
+                        MemoryUid.zero(),
+                        evidence_kind="replanning_observed",
+                        watermark=self.watermark,
+                        raw_value=float(result.replans),
+                        normalized_value=min(1.0, float(result.replans)),
+                        developmental_stage=int(MemoryLevel.M7),
+                        validation_state=3,
+                        source_game_hash=game_hash,
+                        graph_generation=self.generation,
+                    )
+                )
 
     def request_snapshot(self) -> None:
-        if self.snapshot_service is None:
-            return
-        self._snapshot_id += 1
-        self.snapshot_service.request_latest(self._snapshot_id, self.watermark)
+        self.request_consistent_snapshot()
 
     def final_snapshot(self, *, timeout: float = 120.0) -> SnapshotResult:
         if self.snapshot_service is None:
             raise RuntimeError("snapshots are disabled")
         self._snapshot_id += 1
-        return self.snapshot_service.request_final(self._snapshot_id, self.watermark, timeout=timeout)
+        return self.snapshot_service.request_final(
+            self._snapshot_id,
+            self.watermark,
+            generation=self.generation,
+            auxiliary_state=self._auxiliary_state_json(),
+            timeout=timeout,
+        )
 
     def metrics(self) -> dict[str, object]:
         saved_watermark = (
@@ -428,11 +577,14 @@ class ContinuousMemoryRuntime:
                 "proposals": peer.proposals,
                 "evidence_records": peer.evidence_records,
                 "interval_seconds": peer.interval_seconds,
+                "candidate_budget": peer.candidate_budget,
+                "failures": peer.failures,
             }
         with self._actor_throttle.get_lock():
             throttle = float(self._actor_throttle.value)
         return {
             "watermark": self.watermark,
+            "generation": self.generation,
             "saved_watermark": saved_watermark,
             "unsaved_tail": max(0, self.watermark - saved_watermark),
             "memories": self.read_view.memory_count,
@@ -447,6 +599,26 @@ class ContinuousMemoryRuntime:
             "peers": peer_metrics,
         }
 
+    def _cleanup(self) -> None:
+        self._stop.set()
+        self._snapshot_freeze.clear()
+        for process in (*self._stage_processes, *self._shard_processes):
+            process.join(timeout=5.0)
+        for process in (*self._stage_processes, *self._shard_processes):
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=2.0)
+        if self.snapshot_service is not None:
+            self.snapshot_service.close()
+        try:
+            self.read_view.close()
+        finally:
+            for ring in (*self._stage_rings, *self._shard_rings):
+                ring.dispose()
+            for arena in (*self._node_arenas, *self._edge_arenas, *self._action_arenas):
+                arena.dispose()
+        self._closed = True
+
     def close(self, *, normal: bool = True, timeout: float = 120.0) -> SnapshotResult | None:
         if self._closed:
             return None
@@ -460,48 +632,37 @@ class ContinuousMemoryRuntime:
         if self._resource_thread is not None:
             self._resource_thread.join(timeout=2.0)
 
-        final_result = None
-        if normal:
-            self.wait_quiescent(timeout=timeout)
-            if self.peers is not None:
+        final_result: SnapshotResult | None = None
+        try:
+            if normal:
+                self._snapshot_freeze.set()
+                self.wait_quiescent(timeout=timeout, resume_peers=False)
+                if self.peers is not None:
+                    self.peers.close()
+                self.write_scientific_report()
+                if self.snapshot_service is not None:
+                    final_result = self.final_snapshot(timeout=timeout)
+                    if int(final_result.watermark) != int(self.watermark):
+                        raise RuntimeError("final persisted watermark does not match final RAM watermark")
+                    (self.root / "RUN_COMPLETE.json").write_text(
+                        json.dumps(
+                            {
+                                "final_watermark": self.watermark,
+                                "final_generation": self.generation,
+                                "snapshot_id": final_result.snapshot_id,
+                                "snapshot_digest": final_result.digest,
+                                "snapshot_path": final_result.path,
+                            },
+                            indent=2,
+                            sort_keys=True,
+                        ),
+                        encoding="utf-8",
+                    )
+            elif self.peers is not None:
                 self.peers.close()
-            self.write_scientific_report()
-            if self.snapshot_service is not None:
-                final_result = self.final_snapshot(timeout=timeout)
-                if int(final_result.watermark) != int(self.watermark):
-                    raise RuntimeError("final persisted watermark does not match final RAM watermark")
-                (self.root / "RUN_COMPLETE.json").write_text(
-                    json.dumps(
-                        {
-                            "final_watermark": self.watermark,
-                            "snapshot_id": final_result.snapshot_id,
-                            "snapshot_digest": final_result.digest,
-                            "snapshot_path": final_result.path,
-                        },
-                        indent=2,
-                        sort_keys=True,
-                    ),
-                    encoding="utf-8",
-                )
-        elif self.peers is not None:
-            self.peers.close()
-
-        self._stop.set()
-        for process in (*self._stage_processes, *self._shard_processes):
-            process.join(timeout=5.0)
-        for process in (*self._stage_processes, *self._shard_processes):
-            if process.is_alive():
-                process.terminate()
-                process.join(timeout=2.0)
-        if self.snapshot_service is not None:
-            self.snapshot_service.close()
-        self.read_view.close()
-        for ring in (*self._stage_rings, *self._shard_rings):
-            ring.dispose()
-        for arena in (*self._node_arenas, *self._edge_arenas, *self._action_arenas):
-            arena.dispose()
-        self._closed = True
-        return final_result
+            return final_result
+        finally:
+            self._cleanup()
 
     def __enter__(self) -> "ContinuousMemoryRuntime":
         self.start()
