@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from threading import Lock
 from typing import Iterable
 
 from v8.arena import NodeRecord
@@ -37,6 +38,22 @@ _ADMISSIBLE = {
     int(CognitiveState.VALIDATED),
     int(CognitiveState.REACTIVATED),
 }
+
+_STAGE_LOCK = Lock()
+_CURRENT_DEVELOPMENTAL_STAGE = 0
+
+
+def publish_developmental_stage(stage: int) -> int:
+    global _CURRENT_DEVELOPMENTAL_STAGE
+    value = max(0, min(6, int(stage)))
+    with _STAGE_LOCK:
+        _CURRENT_DEVELOPMENTAL_STAGE = value
+    return value
+
+
+def current_developmental_stage() -> int:
+    with _STAGE_LOCK:
+        return int(_CURRENT_DEVELOPMENTAL_STAGE)
 
 
 def _clip(value: float) -> float:
