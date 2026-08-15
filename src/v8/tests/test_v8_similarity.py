@@ -5,11 +5,16 @@ import unittest
 from v8.arena import EdgeRecord, NodeRecord
 from v8.model import (
     CognitiveState,
+    EventId,
     MemoryLevel,
+    MemoryProposal,
     MemoryType,
     MemoryUid,
+    RELATION_PROPOSAL_PACKET_SIZE,
     RelationType,
     ValidationState,
+    decode_relation_proposal,
+    encode_proposal,
 )
 from v8.peers import DevelopmentalPeerSupervisor
 from v8.similarity import BoundedNeighborhoodSimilarity
@@ -57,6 +62,24 @@ class BoundedSimilarityTests(unittest.TestCase):
         descriptors = estimator.descriptors((a, b, child_a, child_b), edges)
         score = estimator.score(descriptors[a.uid], descriptors[b.uid])
         self.assertAlmostEqual(score.score, 1.0)
+        self.assertIsNone(score.context_score)
+        self.assertEqual(descriptors[a.uid].dependency_signature, 0)
+        self.assertEqual(descriptors[b.uid].dependency_signature, 0)
+
+    def test_real_dependency_edges_activate_dependency_similarity(self) -> None:
+        a = role_node((1, 0), watermark=10)
+        b = role_node((2, 0), watermark=11)
+        child_a = role_node((10, 0), watermark=8)
+        child_b = role_node((20, 0), watermark=9)
+        edges = (
+            EdgeRecord(a.uid, int(RelationType.DEPENDS_ON), child_a.uid, 1, 10),
+            EdgeRecord(b.uid, int(RelationType.DEPENDS_ON), child_b.uid, 1, 11),
+        )
+        estimator = BoundedNeighborhoodSimilarity(threshold=0.0)
+        descriptors = estimator.descriptors((a, b, child_a, child_b), edges)
+        score = estimator.score(descriptors[a.uid], descriptors[b.uid])
+        self.assertNotEqual(descriptors[a.uid].dependency_signature, 0)
+        self.assertEqual(score.dependency_score, 1.0)
 
     def test_candidate_search_is_bounded_and_incremental(self) -> None:
         nodes = tuple(role_node((index, 0), watermark=index + 1) for index in range(40))
@@ -91,6 +114,34 @@ class BoundedSimilarityTests(unittest.TestCase):
         self.assertEqual(len(candidates), 1)
         self.assertEqual(candidates[0].formation_games, (101,))
         self.assertGreaterEqual(candidates[0].structural_score, 0.8)
+
+    def test_similarity_memory_proposal_serializes_as_relation_packet(self) -> None:
+        a = role_node((1, 0), watermark=10)
+        b = role_node((2, 0), watermark=11)
+        source, target = sorted((a.uid, b.uid))
+        proposal = MemoryProposal(
+            uid=source,
+            fingerprint=a.fingerprint,
+            event_id=EventId.from_producer(99, 1),
+            watermark=11,
+            level=MemoryLevel.M3,
+            memory_type=MemoryType.ROLE,
+            key_parts=a.key_parts,
+            support_delta=0,
+            transfer_prior_sum=0.8,
+            score_weight=0.0,
+            parent_uid=target,
+            relation_type=RelationType.SIMILAR_TO,
+        )
+        payload = encode_proposal(proposal)
+        self.assertEqual(len(payload), RELATION_PROPOSAL_PACKET_SIZE)
+        relation = decode_relation_proposal(payload)
+        self.assertEqual(relation.source_uid, source)
+        self.assertEqual(relation.target_uid, target)
+        self.assertEqual(relation.relation_type, RelationType.SIMILAR_TO)
+        self.assertEqual(relation.support_delta, 1)
+        self.assertAlmostEqual(relation.score_sum, 0.8)
+        self.assertAlmostEqual(relation.score_weight, 1.0)
 
 
 class _ReadView:
@@ -139,6 +190,10 @@ class SimilarityPeerIntegrationTests(unittest.TestCase):
         self.assertIn(similar[0].parent_uid, {nodes[0].uid, nodes[1].uid})
         self.assertEqual(len({nodes[0].uid, nodes[1].uid}), 2)
         self.assertGreater(peer.metrics().similarity_comparisons, 0)
+
+        relation = decode_relation_proposal(encode_proposal(similar[0]))
+        self.assertEqual(relation.relation_type, RelationType.SIMILAR_TO)
+        self.assertNotEqual(relation.source_uid, relation.target_uid)
 
 
 if __name__ == "__main__":
