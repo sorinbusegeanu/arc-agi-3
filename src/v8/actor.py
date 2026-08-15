@@ -107,7 +107,9 @@ def actor_worker(
     rng = Random(job.seed)
     env = ArcGridEnvironment(game_id=job.game_id, seed=job.seed, env_root=job.env_root)
     sequence = 0
-    rolling_trajectory = stable_u64(job.actor_id, job.seed, person=b"v8-traj-seed")
+    with watermark.get_lock():
+        sequence_base = int(watermark.value)
+    rolling_trajectory = stable_u64(job.actor_id, job.seed, sequence_base, person=b"v8-traj-seed")
     local_overlay: dict[tuple[int, int], tuple[int, float]] = {}
     wins = failures = levels_completed = 0
     last_levels = int(env.last_levels_completed)
@@ -143,10 +145,6 @@ def actor_worker(
 
             after = env.step(action)
             after_actions = tuple(sorted(set(int(value) for value in env.available_actions())))
-            sequence += 1
-            with watermark.get_lock():
-                watermark.value += 1
-                current_watermark = int(watermark.value)
             outcome = int(transition_signature(before, after))
             family = int(transformation_family_signature(before, after))
             carrier = int(carrier_signature(before, after) or 0)
@@ -155,27 +153,40 @@ def actor_worker(
             rolling_trajectory = stable_u64(
                 rolling_trajectory, context, action, outcome, person=b"v8-trajectory"
             )
-            event = ExperienceEvent(
-                event_id=EventId.from_producer(job.actor_id, sequence),
-                watermark=current_watermark,
-                producer_id=job.actor_id,
-                producer_sequence=sequence,
-                source_game_hash=stable_u64(job.game_id, person=b"v8-game"),
-                global_step=current_watermark,
-                context_signature=context,
-                action_id=action,
-                outcome_signature=outcome,
-                family_signature=family,
-                carrier_signature=carrier,
-                future_option_delta=future_delta,
-                changed_cells=changed,
-                terminal_polarity=_polarity(env.last_outcome_polarity),
-                trajectory_signature=rolling_trajectory,
-            )
-            packet = encode_pipeline(PipelineEvent(event))
+
+            next_sequence = sequence + 1
+            producer_sequence = sequence_base + next_sequence
+            accepted = False
+            current_watermark = 0
             while not stop_event.is_set():
-                if ring.put(packet, timeout=0.25):
-                    break
+                with watermark.get_lock():
+                    current_watermark = int(watermark.value) + 1
+                    event = ExperienceEvent(
+                        event_id=EventId.from_producer(job.actor_id, producer_sequence),
+                        watermark=current_watermark,
+                        producer_id=job.actor_id,
+                        producer_sequence=producer_sequence,
+                        source_game_hash=stable_u64(job.game_id, person=b"v8-game"),
+                        global_step=current_watermark,
+                        context_signature=context,
+                        action_id=action,
+                        outcome_signature=outcome,
+                        family_signature=family,
+                        carrier_signature=carrier,
+                        future_option_delta=future_delta,
+                        changed_cells=changed,
+                        terminal_polarity=_polarity(env.last_outcome_polarity),
+                        trajectory_signature=rolling_trajectory,
+                    )
+                    packet = encode_pipeline(PipelineEvent(event))
+                    if ring.put(packet, timeout=0.05):
+                        watermark.value = current_watermark
+                        accepted = True
+                        break
+                time.sleep(0)
+            if not accepted:
+                break
+            sequence = next_sequence
 
             significance = _local_significance(changed, future_delta)
             old_support, old_score = local_overlay.get((context, action), (0, 0.0))
@@ -194,7 +205,7 @@ def actor_worker(
                 levels_completed += current_levels - last_levels
             if current_levels < last_levels or env.last_step_was_reset_boundary:
                 rolling_trajectory = stable_u64(
-                    job.actor_id, sequence, current_watermark, person=b"v8-traj-reset"
+                    job.actor_id, producer_sequence, current_watermark, person=b"v8-traj-reset"
                 )
             last_levels = current_levels
 
