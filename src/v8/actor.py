@@ -8,7 +8,16 @@ from dataclasses import dataclass
 from random import Random
 from typing import Callable, Iterable
 
-from v8.model import EventId, ExperienceEvent, PipelineEvent, encode_pipeline, stable_u64
+from v8.model import (
+    EventId,
+    ExperienceEvent,
+    MemoryLevel,
+    MemoryType,
+    MemoryUid,
+    PipelineEvent,
+    encode_pipeline,
+    stable_u64,
+)
 from v8.publication import LiveReadView, ShardReadDescriptor
 from v8.ring import SharedRingBuffer
 
@@ -21,6 +30,8 @@ class ActorJob:
     seed: int
     env_root: str | None = None
     epsilon: float = 0.10
+    replanning_probe_rate: float = 0.02
+    max_probe_records: int = 256
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +47,31 @@ class ActorProgress:
 
 
 @dataclass(frozen=True, slots=True)
+class StrategyRunStat:
+    strategy_uid: MemoryUid
+    attempts: int
+    successes: int
+    cost: float
+
+
+@dataclass(frozen=True, slots=True)
+class PreferenceProbeResult:
+    outcome_a: MemoryUid
+    outcome_b: MemoryUid
+    context_bucket: int
+    chosen_outcome: MemoryUid
+    preference_influenced: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ReplanningTrialResult:
+    primary_strategy_uid: MemoryUid
+    alternative_strategy_uid: MemoryUid
+    outcome_uid: MemoryUid
+    recovery_succeeded: bool
+
+
+@dataclass(frozen=True, slots=True)
 class ActorResult:
     actor_id: int
     game_id: str
@@ -46,6 +82,9 @@ class ActorResult:
     resets: int
     replans: int = 0
     planned_steps: int = 0
+    strategy_stats: tuple[StrategyRunStat, ...] = ()
+    preference_probes: tuple[PreferenceProbeResult, ...] = ()
+    replanning_trials: tuple[ReplanningTrialResult, ...] = ()
 
 
 def _polarity(value: str) -> int:
@@ -60,6 +99,41 @@ def _local_significance(changed_cells: int, future_delta: float) -> float:
     structural = min(1.0, max(0, int(changed_cells)) / 32.0)
     option = math.tanh(abs(float(future_delta)))
     return 0.55 * structural + 0.45 * option
+
+
+def _bucket(value: float, threshold: float = 1e-9) -> int:
+    return 1 if value > threshold else -1 if value < -threshold else 0
+
+
+def _changed_bucket(changed_cells: int) -> int:
+    value = max(0, int(changed_cells))
+    if value == 0:
+        return 0
+    if value <= 4:
+        return 1
+    if value <= 16:
+        return 2
+    if value <= 64:
+        return 3
+    return 4
+
+
+def _observed_outcome_uids(
+    *,
+    outcome_signature: int,
+    family_signature: int,
+    future_delta: float,
+    changed_cells: int,
+) -> tuple[MemoryUid, MemoryUid]:
+    future = _bucket(future_delta)
+    changed = _changed_bucket(changed_cells)
+    variant = stable_u64(
+        outcome_signature, family_signature, person=b"v8-outcome-variant"
+    ) & 0xF
+    return (
+        MemoryUid.from_key(MemoryLevel.M6, MemoryType.OUTCOME, (future, changed, variant)),
+        MemoryUid.from_key(MemoryLevel.M6, MemoryType.OUTCOME, (future, changed)),
+    )
 
 
 def _publish_progress(
@@ -101,6 +175,7 @@ def actor_worker(
     result_queue: mp.Queue,
     progress_queue: mp.Queue | None = None,
     actor_throttle: mp.sharedctypes.Synchronized | None = None,
+    snapshot_freeze: mp.synchronize.Event | None = None,
 ) -> None:
     from v7.environment.arc_adapter import ArcGridEnvironment
     from v7.environment.encoding import (
@@ -122,14 +197,22 @@ def actor_worker(
     local_overlay: dict[tuple[int, int], tuple[int, float]] = {}
     wins = failures = levels_completed = 0
     replans = planned_steps = 0
-    selected_outcome = None
-    selected_strategy = None
+    selected_outcome: MemoryUid | None = None
+    selected_strategy: MemoryUid | None = None
+    strategy_stats: dict[MemoryUid, list[float]] = {}
+    preference_probes: list[PreferenceProbeResult] = []
+    replanning_trials: list[ReplanningTrialResult] = []
     last_levels = int(env.last_levels_completed)
     next_progress = time.monotonic() + 5.0
     try:
         for _ in range(int(job.steps)):
             if stop_event.is_set():
                 break
+            while snapshot_freeze is not None and snapshot_freeze.is_set() and not stop_event.is_set():
+                time.sleep(0.002)
+            if stop_event.is_set():
+                break
+
             before = env.observe()
             before_actions = tuple(sorted(set(int(value) for value in env.available_actions())))
             if not before_actions:
@@ -138,10 +221,45 @@ def actor_worker(
                 continue
             context = int(structural_grid_signature(before))
 
-            # Late developmental memory is consulted first. If no admissible M7 plan
-            # exists, retain the established M1 + actor-local overlay behavior.
-            planned = view.planned_action(context, before_actions)
+            plans = view.plan_candidates(context, before_actions)
+            planned = plans[0] if plans else None
+            explicit_replan: tuple[MemoryUid, MemoryUid, MemoryUid] | None = None
             if planned is not None:
+                # A clean preference observation is allowed only when the selected plan
+                # was not already boosted by an established PREFERENCE relation.
+                alternatives = [row for row in plans[1:] if row.outcome_uid != planned.outcome_uid]
+                if (
+                    alternatives
+                    and len(preference_probes) < int(job.max_probe_records)
+                ):
+                    preference_probes.append(
+                        PreferenceProbeResult(
+                            planned.outcome_uid,
+                            alternatives[0].outcome_uid,
+                            stable_u64(context, person=b"v8-context"),
+                            planned.outcome_uid,
+                            bool(planned.preference_influenced),
+                        )
+                    )
+
+                same_outcome = [
+                    row
+                    for row in plans[1:]
+                    if row.outcome_uid == planned.outcome_uid
+                    and row.strategy_uid != planned.strategy_uid
+                ]
+                if same_outcome and rng.random() < float(job.replanning_probe_rate):
+                    # Explicit causal H14 probe: pretend the primary strategy is
+                    # unavailable and execute a separately represented alternative.
+                    alternative = same_outcome[0]
+                    explicit_replan = (
+                        planned.strategy_uid,
+                        alternative.strategy_uid,
+                        planned.outcome_uid,
+                    )
+                    planned = alternative
+                    replans += 1
+
                 action = int(planned.action_id)
                 planned_steps += 1
                 if (
@@ -173,6 +291,8 @@ def actor_worker(
                 else:
                     action = min(combined, key=lambda row: (-row[2], -row[1], row[0]))[0]
 
+            prediction_distribution = view.outcome_distribution(context, action)
+
             if actor_throttle is not None:
                 with actor_throttle.get_lock():
                     delay = float(actor_throttle.value)
@@ -187,6 +307,11 @@ def actor_worker(
             carrier = int(carrier_signature(before, after) or 0)
             changed = int(changed_cell_count(before, after))
             future_delta = float(len(after_actions) - len(before_actions))
+            prediction_error = (
+                0.0
+                if not prediction_distribution
+                else max(0.0, 1.0 - float(prediction_distribution.get(outcome, 0.0)))
+            )
             rolling_trajectory = stable_u64(
                 rolling_trajectory, context, action, outcome, person=b"v8-trajectory"
             )
@@ -196,6 +321,9 @@ def actor_worker(
             accepted = False
             current_watermark = 0
             while not stop_event.is_set():
+                if snapshot_freeze is not None and snapshot_freeze.is_set():
+                    time.sleep(0.002)
+                    continue
                 with watermark.get_lock():
                     current_watermark = int(watermark.value) + 1
                     event = ExperienceEvent(
@@ -215,6 +343,7 @@ def actor_worker(
                         terminal_polarity=_polarity(env.last_outcome_polarity),
                         trajectory_signature=rolling_trajectory,
                         next_context_signature=after_context,
+                        prediction_error=prediction_error,
                     )
                     packet = encode_pipeline(PipelineEvent(event))
                     if ring.put(packet, timeout=0.05):
@@ -234,13 +363,44 @@ def actor_worker(
                 (old_score * old_support + significance) / new_support,
             )
 
+            prior_levels = last_levels
             if env.last_outcome_polarity == "positive":
                 wins += 1
             elif env.last_outcome_polarity == "negative":
                 failures += 1
             current_levels = int(env.last_levels_completed)
-            if current_levels > last_levels:
-                levels_completed += current_levels - last_levels
+            level_advanced = current_levels > prior_levels
+            if level_advanced:
+                levels_completed += current_levels - prior_levels
+
+            observed_variant, observed_coarse = _observed_outcome_uids(
+                outcome_signature=outcome,
+                family_signature=family,
+                future_delta=future_delta,
+                changed_cells=changed,
+            )
+            if planned is not None:
+                stat = strategy_stats.setdefault(planned.strategy_uid, [0.0, 0.0, 0.0])
+                stat[0] += 1.0
+                if (
+                    env.last_outcome_polarity == "positive"
+                    or level_advanced
+                    or planned.outcome_uid in {observed_variant, observed_coarse}
+                ):
+                    stat[1] += 1.0
+                stat[2] += 1.0
+
+            if explicit_replan is not None and len(replanning_trials) < int(job.max_probe_records):
+                primary_uid, alternative_uid, target_outcome = explicit_replan
+                replanning_trials.append(
+                    ReplanningTrialResult(
+                        primary_uid,
+                        alternative_uid,
+                        target_outcome,
+                        target_outcome in {observed_variant, observed_coarse},
+                    )
+                )
+
             if current_levels < last_levels or env.last_step_was_reset_boundary:
                 rolling_trajectory = stable_u64(
                     job.actor_id, producer_sequence, current_watermark, person=b"v8-traj-reset"
@@ -272,6 +432,10 @@ def actor_worker(
             replans=replans,
             planned_steps=planned_steps,
         )
+        stats = tuple(
+            StrategyRunStat(uid, int(values[0]), int(values[1]), float(values[2]))
+            for uid, values in sorted(strategy_stats.items())
+        )
         result_queue.put(
             ActorResult(
                 job.actor_id,
@@ -283,6 +447,9 @@ def actor_worker(
                 int(env.reset_count),
                 replans,
                 planned_steps,
+                stats,
+                tuple(preference_probes),
+                tuple(replanning_trials),
             )
         )
     finally:
@@ -319,6 +486,7 @@ def run_actor_jobs(
                 "result_queue": results,
                 "progress_queue": progress,
                 "actor_throttle": runtime._actor_throttle,
+                "snapshot_freeze": runtime._snapshot_freeze,
             },
             name=f"v8-actor-{job.actor_id:03d}-{job.game_id}",
             daemon=True,
