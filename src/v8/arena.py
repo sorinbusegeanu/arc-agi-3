@@ -5,12 +5,12 @@ from multiprocessing.shared_memory import SharedMemory
 from struct import Struct
 from typing import Iterator
 
-from v8.model import MemoryLevel, MemoryType, MemoryUid, signed_u64, u64
+from v8.model import MemoryUid, u64
 
 _HEADER = Struct("<QQ")  # count, seqlock version
-_NODE = Struct("<QQQBHBQQQQqdddddddQBB")
+_NODE = Struct("<QQQBHBQQQQqdddddddQQBB")
 _EDGE = Struct("<QQHQQqQ")
-_ACTION = Struct("<BQi qddQ".replace(" ", ""))
+_ACTION = Struct("<BQiqddQ")
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +36,7 @@ class NodeRecord:
     future_option_sum: float
     score_weight: float
     updated_watermark: int
+    game_mask: int = 0
     cognitive_state: int = 0
     validation_state: int = 0
 
@@ -52,8 +53,20 @@ class NodeRecord:
         return 0.0 if self.score_weight <= 0 else self.learning_value_sum / self.score_weight
 
     @property
+    def transfer_prior(self) -> float:
+        return 0.0 if self.score_weight <= 0 else self.transfer_prior_sum / self.score_weight
+
+    @property
+    def explanatory_reach(self) -> float:
+        return 0.0 if self.score_weight <= 0 else self.explanatory_sum / self.score_weight
+
+    @property
     def future_option_delta(self) -> float:
         return 0.0 if self.score_weight <= 0 else self.future_option_sum / self.score_weight
+
+    @property
+    def game_evidence_count(self) -> int:
+        return int(self.game_mask).bit_count()
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,6 +218,7 @@ class SharedNodeArena(_SharedArena):
             float(value.future_option_sum),
             float(value.score_weight),
             u64(value.updated_watermark),
+            u64(value.game_mask),
             int(value.cognitive_state) & 0xFF,
             int(value.validation_state) & 0xFF,
         )
@@ -231,6 +245,7 @@ class SharedNodeArena(_SharedArena):
             future_option,
             weight,
             watermark,
+            game_mask,
             cognitive_state,
             validation_state,
         ) = values
@@ -249,6 +264,7 @@ class SharedNodeArena(_SharedArena):
             future_option_sum=float(future_option),
             score_weight=float(weight),
             updated_watermark=int(watermark),
+            game_mask=int(game_mask),
             cognitive_state=int(cognitive_state),
             validation_state=int(validation_state),
         )
