@@ -146,30 +146,73 @@ class EvidenceLifecycleStore:
         self,
         memory_ids: Iterable[MemoryId],
     ) -> dict[MemoryId, tuple[int, int, float]]:
-        """Summarize only transfer trials into games outside formation provenance."""
-        ids = tuple(sorted(set(MemoryId(int(memory_id)) for memory_id in memory_ids), key=int))
+        """Summarize unique transfer into games outside formation provenance.
+
+        One terminal can generate both direct terminal-action evidence and the
+        stronger trajectory-usage record. Those describe the same target trial
+        and must count once; trajectory attribution wins when both are present.
+        """
+        ids = tuple(
+            sorted(
+                set(MemoryId(int(memory_id)) for memory_id in memory_ids),
+                key=int,
+            )
+        )
         if not ids:
             return {}
         placeholders = ",".join("?" for _ in ids)
         rows = self.connection.execute(
-            f"SELECT memory_id, source_game, target_game, success, score FROM transfer_trials WHERE memory_id IN ({placeholders}) ORDER BY transfer_trial_id",
+            f"SELECT memory_id, source_game, target_game, success, score, payload_json FROM transfer_trials WHERE memory_id IN ({placeholders}) ORDER BY transfer_trial_id",
             tuple(int(memory_id) for memory_id in ids),
         ).fetchall()
         scopes = {
             memory_id: set(self.provenance_source_games(memory_id))
             for memory_id in ids
         }
-        grouped: dict[MemoryId, list[tuple[int, float]]] = {}
-        for raw_id, source_game, target_game, success, score in rows:
+        unique: dict[
+            tuple[MemoryId, str, int | None],
+            tuple[str, str, int, float, str],
+        ] = {}
+        for raw_id, source_game, target_game, success, score, payload_json in rows:
             memory_id = MemoryId(int(raw_id))
-            scope = scopes.get(memory_id, set())
             source = str(source_game or "")
             target = str(target_game or "")
+            try:
+                payload = json.loads(str(payload_json or "{}"))
+            except (TypeError, json.JSONDecodeError):
+                payload = {}
+            step = payload.get("source_global_step")
+            step_value = None if step is None else int(step)
+            attribution = str(payload.get("attribution") or "")
+            key = (memory_id, target, step_value)
+            candidate = (
+                source,
+                target,
+                int(success),
+                float(score),
+                attribution,
+            )
+            current = unique.get(key)
+            if current is None or (
+                attribution == "trajectory_usage"
+                and current[4] != "trajectory_usage"
+            ):
+                unique[key] = candidate
+
+        grouped: dict[MemoryId, list[tuple[int, float]]] = {}
+        for (memory_id, _target_key, _step), (
+            source,
+            target,
+            success,
+            score,
+            _attribution,
+        ) in unique.items():
+            scope = scopes.get(memory_id, set())
             if not scope or not target or target in scope or source == target:
                 continue
             if source and source not in scope:
                 continue
-            grouped.setdefault(memory_id, []).append((int(success), float(score)))
+            grouped.setdefault(memory_id, []).append((success, score))
         return {
             memory_id: (
                 len(values),
@@ -225,6 +268,7 @@ class EvidenceLifecycleStore:
         *,
         target_game: str,
         source_global_step: int | None,
+        attribution: str | None = None,
     ) -> bool:
         rows = self.connection.execute(
             "SELECT payload_json FROM transfer_trials WHERE memory_id=? AND target_game=?",
@@ -232,9 +276,12 @@ class EvidenceLifecycleStore:
         ).fetchall()
         for (payload_json,) in rows:
             try:
-                payload = json.loads(payload_json)
+                payload = json.loads(str(payload_json or "{}"))
             except (TypeError, json.JSONDecodeError):
                 continue
-            if payload.get("source_global_step") == source_global_step:
-                return True
+            if payload.get("source_global_step") != source_global_step:
+                continue
+            if attribution is not None and str(payload.get("attribution") or "") != str(attribution):
+                continue
+            return True
         return False
