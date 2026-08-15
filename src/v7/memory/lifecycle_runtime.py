@@ -9,7 +9,7 @@ from v7.memory.evidence_lifecycle import (
 from v7.memory.evidence_store import EvidenceRecord, EvidenceStore
 from v7.memory.lifecycle import LifecycleDecision, MemoryLifecycleController
 from v7.memory.read_view import MemoryReadView
-from v7.memory.state import CognitiveState
+from v7.memory.state import CognitiveState, GateId
 from v7.memory.status import memory_cognitive_state
 from v7.memory.writer import CanonicalMemoryWriter
 
@@ -84,9 +84,18 @@ class MemoryLifecycleRuntime:
             legacy_transfer = self.evidence_lifecycle.transfer_summary(memory_ids)
             for memory_id in memory_ids:
                 gate = gate_summaries.get(memory_id)
+                node = view.nodes.get(memory_id)
+                explicitly_gated = bool(
+                    node is not None
+                    and int(getattr(node, "gate_id", GateId.NONE))
+                    != int(GateId.NONE)
+                )
                 if gate is not None and gate.trials > 0:
                     empirical_transfer[memory_id] = gate.success_rate
-                elif memory_id in legacy_transfer:
+                elif not explicitly_gated and memory_id in legacy_transfer:
+                    # Compatibility-only ungated memories may still consume the
+                    # pre-v7.0.6 associative transfer ledger. G01-G56 memories
+                    # are influenced only by genuine held-out gate evidence.
                     total, successes, _mean_score = legacy_transfer[memory_id]
                     empirical_transfer[memory_id] = (
                         successes / total if total > 0 else 0.0
