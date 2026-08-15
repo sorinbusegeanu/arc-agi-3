@@ -6,7 +6,7 @@ from hashlib import blake2b
 
 import v7.developmental_v707 as d
 from v7.derivation.scientific import ScientificDerivationKernels, TYPE_STRATEGY
-from v7.memory.ids import MemoryLevel
+from v7.memory.ids import MemoryId, MemoryLevel
 from v7.memory.models import MemoryScore, NodeMutation, ScoreMutation
 from v7.memory.state import CognitiveState, GateId, GateValidationState
 from v7.memory.status import memory_cognitive_state, memory_is_active, memory_validation_state
@@ -44,6 +44,34 @@ def _compression_run(self, *, writer):
     nodes = getattr(writer, "_nodes")
     scores = getattr(writer, "_scores")
     generation = int(writer.mutable_generation_id)
+    parent_map = defaultdict(list)
+    context_map = defaultdict(set)
+    for memory_id, parent_id, source_context in self.lifecycle_store.connection.execute(
+        "SELECT memory_id,parent_memory_id,source_context FROM provenance_records"
+    ).fetchall():
+        if parent_id is not None:
+            parent_map[int(memory_id)].append(MemoryId(int(parent_id)))
+        if source_context is not None and str(source_context):
+            context_map[int(memory_id)].add(str(source_context))
+    context_cache: dict[int, set[str]] = {}
+
+    def contexts(memory_id: MemoryId) -> set[str]:
+        raw_id = int(memory_id)
+        cached = context_cache.get(raw_id)
+        if cached is not None:
+            return cached
+        direct = set(context_map.get(raw_id, ()))
+        cached = direct or self._contexts(memory_id)
+        context_cache[raw_id] = cached
+        return cached
+
+    replacement_rows = {
+        int(parent_id): (int(first_generation), int(state))
+        for parent_id, first_generation, state in self.lifecycle_store.connection.execute(
+            "SELECT parent_memory_id,generation_id,replacement_state "
+            "FROM memory_compression_replacements"
+        ).fetchall()
+    }
     pending_replacements = {
         int(row[0])
         for row in self.lifecycle_store.connection.execute(
@@ -53,6 +81,9 @@ def _compression_run(self, *, writer):
     }
     last_generation = int(getattr(self, "_last_generation", -1))
     decisions = []
+    mutations = []
+    upsert_rows = []
+    tombstones = []
     for replacement_id, replacement in sorted(nodes.items(), key=lambda item: int(item[0])):
         if (
             last_generation >= 0
@@ -66,11 +97,18 @@ def _compression_run(self, *, writer):
         if int(getattr(replacement, "gate_id", GateId.NONE)) != int(GateId.NONE):
             if validation not in {GateValidationState.VALIDATED, GateValidationState.TRUSTED}:
                 continue
-        for parent_id in self.lifecycle_store.provenance_parents(replacement_id):
+        for parent_id in parent_map.get(int(replacement_id), ()):
             parent = nodes.get(parent_id)
             if parent is None or int(parent.level) >= int(replacement.level):
                 continue
-            unique = self._unique_coverage(parent_id, replacement_id)
+            parent_contexts = contexts(parent_id)
+            replacement_contexts = contexts(replacement_id)
+            unique = (
+                0.0
+                if not parent_contexts
+                else len(parent_contexts - replacement_contexts)
+                / max(1, len(parent_contexts))
+            )
             if unique > self.unique_coverage_tolerance:
                 continue
             parent_score = scores.get(parent_id, MemoryScore(parent_id))
@@ -95,11 +133,7 @@ def _compression_run(self, *, writer):
                     or replacement_utility + 0.05 < parent_utility
                 ):
                     continue
-            existing = self.lifecycle_store.connection.execute(
-                "SELECT generation_id,replacement_state FROM memory_compression_replacements "
-                "WHERE parent_memory_id=?",
-                (int(parent_id),),
-            ).fetchone()
+            existing = replacement_rows.get(int(parent_id))
             current = memory_cognitive_state(parent) or CognitiveState.ACTIVE
             if existing is None:
                 first_generation = generation
@@ -118,26 +152,24 @@ def _compression_run(self, *, writer):
                     phase = max(1, phase)
                     next_state = CognitiveState.PROBE_ONLY
             if current != next_state:
-                writer.apply_mutation_batch(
-                    (NodeMutation(parent_id, parent.level, parent.type_id, cognitive_state=int(next_state)),)
+                mutations.append(
+                    NodeMutation(
+                        parent_id,
+                        parent.level,
+                        parent.type_id,
+                        cognitive_state=int(next_state),
+                    )
                 )
-            with self.lifecycle_store.connection:
-                self.lifecycle_store.connection.execute(
-                    "INSERT INTO memory_compression_replacements("
-                    "parent_memory_id,replacement_memory_id,generation_id,unique_coverage_score,"
-                    "replacement_state,provenance_only,reason) VALUES (?,?,?,?,?,1,?) "
-                    "ON CONFLICT(parent_memory_id) DO UPDATE SET "
-                    "replacement_memory_id=excluded.replacement_memory_id,"
-                    "unique_coverage_score=excluded.unique_coverage_score,"
-                    "replacement_state=excluded.replacement_state,provenance_only=1",
-                    (
-                        int(parent_id), int(replacement_id), int(first_generation), float(unique),
-                        int(phase), "redundant_under_validated_abstraction",
-                    ),
+            replacement_rows[int(parent_id)] = (int(first_generation), int(phase))
+            upsert_rows.append(
+                (
+                    int(parent_id), int(replacement_id), int(first_generation), float(unique),
+                    int(phase), "redundant_under_validated_abstraction",
                 )
+            )
             if next_state == CognitiveState.RETIRED:
                 from v7.memory.evidence_lifecycle import MemoryTombstoneRecord
-                self.lifecycle_store.append_tombstone(
+                tombstones.append(
                     MemoryTombstoneRecord(
                         memory_id=parent_id,
                         level_id=int(parent.level),
@@ -149,6 +181,22 @@ def _compression_run(self, *, writer):
                     )
                 )
             decisions.append(d.CompressionDecision(parent_id, replacement_id, unique, next_state))
+    if mutations:
+        writer.apply_mutation_batch(mutations)
+    if upsert_rows:
+        with self.lifecycle_store.connection:
+            self.lifecycle_store.connection.executemany(
+                    "INSERT INTO memory_compression_replacements("
+                    "parent_memory_id,replacement_memory_id,generation_id,unique_coverage_score,"
+                    "replacement_state,provenance_only,reason) VALUES (?,?,?,?,?,1,?) "
+                    "ON CONFLICT(parent_memory_id) DO UPDATE SET "
+                    "replacement_memory_id=excluded.replacement_memory_id,"
+                    "unique_coverage_score=excluded.unique_coverage_score,"
+                    "replacement_state=excluded.replacement_state,provenance_only=1",
+                    upsert_rows,
+                )
+    if tombstones:
+        self.lifecycle_store.append_tombstones(tombstones)
     self._last_generation = generation
     return tuple(decisions)
 

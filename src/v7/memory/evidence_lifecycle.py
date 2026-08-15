@@ -109,6 +109,7 @@ class EvidenceLifecycleStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(self.path)
         ensure_v7_schema(self.connection)
+        self._candidate_scope_cache: dict[int, CandidateProvenanceRecord] = {}
 
     def close(self) -> None:
         self.connection.close()
@@ -452,14 +453,19 @@ class EvidenceLifecycleStore:
                     scope_hash,
                 ),
             )
-        return self.candidate_scope(memory_id) or CandidateProvenanceRecord(
+        record = self.candidate_scope(memory_id) or CandidateProvenanceRecord(
             memory_id, generation, games, contexts, scope_hash
         )
+        self._candidate_scope_cache[int(memory_id)] = record
+        return record
 
     def candidate_scope(
         self,
         memory_id: MemoryId,
     ) -> CandidateProvenanceRecord | None:
+        cached = self._candidate_scope_cache.get(int(memory_id))
+        if cached is not None:
+            return cached
         row = self.connection.execute(
             "SELECT candidate_generation,provenance_games_json,provenance_contexts_json,scope_hash FROM candidate_provenance WHERE memory_id=?",
             (int(memory_id),),
@@ -475,13 +481,15 @@ class EvidenceLifecycleStore:
             contexts = tuple(str(value) for value in json.loads(contexts_json or "[]"))
         except (TypeError, json.JSONDecodeError):
             contexts = ()
-        return CandidateProvenanceRecord(
+        record = CandidateProvenanceRecord(
             memory_id,
             int(generation),
             tuple(sorted(set(games))),
             tuple(sorted(set(contexts))),
             str(scope_hash),
         )
+        self._candidate_scope_cache[int(memory_id)] = record
+        return record
 
     @staticmethod
     def _gate_transfer_score(record: GateTrialRecord) -> float:
@@ -692,23 +700,37 @@ class EvidenceLifecycleStore:
         )
 
     def append_tombstone(self, record: MemoryTombstoneRecord) -> int:
+        return self.append_tombstones((record,))
+
+    def append_tombstones(
+        self,
+        records: Iterable[MemoryTombstoneRecord],
+    ) -> int:
+        rows = [
+            (
+                int(record.memory_id),
+                int(record.level_id),
+                int(record.type_id),
+                record.canonical_key,
+                int(record.retired_generation),
+                str(record.reason),
+                None
+                if record.replacement_memory_id is None
+                else int(record.replacement_memory_id),
+                record.provenance_pointer,
+            )
+            for record in records
+        ]
+        if not rows:
+            return 0
         before = self.connection.total_changes
         with self.connection:
-            self.connection.execute(
+            self.connection.executemany(
                 """
                 INSERT OR REPLACE INTO memory_tombstones(memory_id,level_id,type_id,canonical_key,retired_generation,reason,replacement_memory_id,provenance_pointer)
                 VALUES (?,?,?,?,?,?,?,?)
                 """,
-                (
-                    int(record.memory_id),
-                    int(record.level_id),
-                    int(record.type_id),
-                    record.canonical_key,
-                    int(record.retired_generation),
-                    str(record.reason),
-                    None if record.replacement_memory_id is None else int(record.replacement_memory_id),
-                    record.provenance_pointer,
-                ),
+                rows,
             )
         return int(self.connection.total_changes - before)
 

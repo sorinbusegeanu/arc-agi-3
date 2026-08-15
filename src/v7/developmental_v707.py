@@ -5,6 +5,7 @@ import math
 from collections import Counter, defaultdict
 from dataclasses import dataclass, replace
 from hashlib import blake2b
+from time import perf_counter
 from typing import Iterable, Mapping
 
 from v7.derivation.scientific import TYPE_CONTINGENCY, TYPE_STRATEGY
@@ -369,113 +370,177 @@ class ContextRefinementRuntime:
             self._last_contradiction_id = next_watermark
             return ()
         episodes = self._episode_rows()
+        outcome_counts: dict[int, Counter[int]] = defaultdict(Counter)
+        context_outcome_counts: dict[int, dict[int, Counter[int]]] = defaultdict(
+            lambda: defaultdict(Counter)
+        )
+        for row in episodes:
+            action = int(row.get("action_id") or 0)
+            actual_outcome = int(row.get("outcome_signature") or 0)
+            outcome_counts[action][actual_outcome] += 1
+            for context in set(
+                int(value)
+                for value in (row.get("context_signatures", ()) or ())
+            ):
+                context_outcome_counts[action][context][actual_outcome] += 1
+
+        ranked_partitions: dict[
+            tuple[int, int],
+            tuple[tuple[float, int, int, int, float, float, int, int], ...],
+        ] = {}
+
+        def partitions(action: int, outcome: int):
+            cache_key = (int(action), int(outcome))
+            cached = ranked_partitions.get(cache_key)
+            if cached is not None:
+                return cached
+            totals = outcome_counts.get(int(action), Counter())
+            total = sum(totals.values())
+            positives = int(totals.get(int(outcome), 0))
+            negatives = total - positives
+            if total < self.minimum_partition_support * 2:
+                ranked_partitions[cache_key] = ()
+                return ()
+            baseline = max(positives, negatives) / total
+            candidates = []
+            for context, inside_counts in context_outcome_counts.get(
+                int(action), {}
+            ).items():
+                support = sum(inside_counts.values())
+                if support < self.minimum_partition_support or support >= total:
+                    continue
+                inside_positive = int(inside_counts.get(int(outcome), 0))
+                inside_negative = support - inside_positive
+                outside_positive = positives - inside_positive
+                outside_negative = negatives - inside_negative
+                refined = (
+                    max(inside_positive, inside_negative)
+                    + max(outside_positive, outside_negative)
+                ) / total
+                gain = refined - baseline
+                candidates.append(
+                    (
+                        gain,
+                        support,
+                        -int(context),
+                        int(context),
+                        baseline,
+                        refined,
+                        positives,
+                        negatives,
+                    )
+                )
+            cached = tuple(sorted(candidates, reverse=True))
+            ranked_partitions[cache_key] = cached
+            return cached
+
+        parent_ids: set[MemoryId] = set()
+        for raw_driver, _count in contradiction_rows:
+            parent_ids.update(
+                self._m1_ancestors(MemoryId(int(raw_driver)), nodes)
+            )
         generation = int(writer.mutable_generation_id)
         decisions: list[ContextRefinementDecision] = []
-        for raw_driver, _count in contradiction_rows:
-            driver_id = MemoryId(int(raw_driver))
-            for parent_id in self._m1_ancestors(driver_id, nodes):
-                parent = nodes.get(parent_id)
-                key = registry.key_for(parent_id)
-                if parent is None or key is None or len(key.parts) < 3:
-                    continue
-                original_context, action, outcome = map(int, key.parts[:3])
-                relevant = [
-                    row for row in episodes
-                    if int(row.get("action_id") or 0) == action
-                ]
-                if len(relevant) < self.minimum_partition_support * 2:
-                    continue
-                candidates = Counter(
-                    int(context)
-                    for row in relevant
-                    for context in (row.get("context_signatures", ()) or ())
-                    if int(context) != original_context
+        trial_rows = []
+        for parent_id in sorted(parent_ids, key=int):
+            parent = nodes.get(parent_id)
+            key = registry.key_for(parent_id)
+            if parent is None or key is None or len(key.parts) < 3:
+                continue
+            original_context, action, outcome = map(int, key.parts[:3])
+            best = next(
+                (
+                    candidate
+                    for candidate in partitions(action, outcome)
+                    if int(candidate[3]) != original_context
+                ),
+                None,
+            )
+            if best is None:
+                continue
+            gain, support, _neg_context, context, baseline, refined, positives, negatives = best
+            accepted = (
+                gain >= self.minimum_prediction_gain
+                and positives > 0
+                and negatives > 0
+                and support >= self.minimum_partition_support
+            )
+            child_id = None
+            if accepted:
+                child_key = CanonicalMemoryKey(
+                    MemoryLevel.M1,
+                    TYPE_CONTINGENCY,
+                    (int(context), action, outcome),
                 )
-                best = None
-                for context, support in candidates.items():
-                    if support < self.minimum_partition_support:
-                        continue
-                    baseline, refined, positives, negatives = self._partition_gain(
-                        relevant, outcome, context
-                    )
-                    gain = refined - baseline
-                    candidate = (gain, support, -context, context, baseline, refined, positives, negatives)
-                    if best is None or candidate > best:
-                        best = candidate
-                if best is None:
-                    continue
-                gain, support, _neg_context, context, baseline, refined, positives, negatives = best
-                accepted = (
-                    gain >= self.minimum_prediction_gain
-                    and positives > 0
-                    and negatives > 0
-                    and support >= self.minimum_partition_support
+                mutation = CanonicalCandidateMutation(
+                    key=child_key,
+                    support_delta=max(1, int(support)),
+                    significance=max(0.0, min(1.0, refined)),
+                    learning_value=max(0.0, min(1.0, gain)),
+                    transfer_prior=max(
+                        0.0,
+                        min(
+                            1.0,
+                            support
+                            / max(1, sum(outcome_counts[action].values())),
+                        ),
+                    ),
+                    explanatory_potential=max(0.0, min(1.0, refined)),
                 )
-                child_id = None
-                if accepted:
-                    child_key = CanonicalMemoryKey(
-                        MemoryLevel.M1,
-                        TYPE_CONTINGENCY,
-                        (int(context), action, outcome),
-                    )
-                    mutation = CanonicalCandidateMutation(
-                        key=child_key,
-                        support_delta=max(1, int(support)),
-                        significance=max(0.0, min(1.0, refined)),
-                        learning_value=max(0.0, min(1.0, gain)),
-                        transfer_prior=max(0.0, min(1.0, support / max(1, len(relevant)))),
-                        explanatory_potential=max(0.0, min(1.0, refined)),
-                    )
-                    child_id = writer.apply_canonical_candidate_batch((mutation,))[child_key]
-                    writer.apply_contingency_index_batch(
-                        (ContingencyIndexMutation(int(context), action, child_id),)
-                    )
-                    current_parent = nodes.get(parent_id)
-                    if current_parent is not None and memory_is_active(current_parent):
-                        writer.apply_mutation_batch(
-                            (
-                                NodeMutation(
-                                    parent_id,
-                                    current_parent.level,
-                                    current_parent.type_id,
-                                    cognitive_state=int(CognitiveState.PROBE_ONLY),
-                                ),
-                            )
+                child_id = writer.apply_canonical_candidate_batch((mutation,))[child_key]
+                writer.apply_contingency_index_batch(
+                    (ContingencyIndexMutation(int(context), action, child_id),)
+                )
+                current_parent = nodes.get(parent_id)
+                if current_parent is not None and memory_is_active(current_parent):
+                    writer.apply_mutation_batch(
+                        (
+                            NodeMutation(
+                                parent_id,
+                                current_parent.level,
+                                current_parent.type_id,
+                                cognitive_state=int(CognitiveState.PROBE_ONLY),
+                            ),
                         )
-                decision = ContextRefinementDecision(
-                    parent_id,
+                    )
+            decision = ContextRefinementDecision(
+                parent_id,
+                int(context),
+                float(baseline),
+                float(refined),
+                float(gain),
+                int(positives),
+                int(negatives),
+                bool(accepted),
+                child_id,
+            )
+            decisions.append(decision)
+            trial_rows.append(
+                (
+                    int(parent_id),
+                    None if child_id is None else int(child_id),
+                    generation,
                     int(context),
+                    "context_membership",
+                    int(positives),
+                    int(negatives),
                     float(baseline),
                     float(refined),
                     float(gain),
-                    int(positives),
-                    int(negatives),
-                    bool(accepted),
-                    child_id,
+                    float(gain),
+                    1 if accepted else 0,
                 )
-                decisions.append(decision)
-                with self.lifecycle_store.connection:
-                    self.lifecycle_store.connection.execute(
-                        "INSERT OR IGNORE INTO context_refinement_trials("
-                        "parent_memory_id,child_memory_id,generation_id,candidate_context_signature,"
-                        "partition_feature,positive_support,contradiction_support,baseline_accuracy,"
-                        "refined_accuracy,prediction_gain,causal_gain,accepted) "
-                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                        (
-                            int(parent_id),
-                            None if child_id is None else int(child_id),
-                            generation,
-                            int(context),
-                            "context_membership",
-                            int(positives),
-                            int(negatives),
-                            float(baseline),
-                            float(refined),
-                            float(gain),
-                            float(gain),
-                            1 if accepted else 0,
-                        ),
-                    )
+            )
+        if trial_rows:
+            with self.lifecycle_store.connection:
+                self.lifecycle_store.connection.executemany(
+                    "INSERT OR IGNORE INTO context_refinement_trials("
+                    "parent_memory_id,child_memory_id,generation_id,candidate_context_signature,"
+                    "partition_feature,positive_support,contradiction_support,baseline_accuracy,"
+                    "refined_accuracy,prediction_gain,causal_gain,accepted) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    trial_rows,
+                )
         self._last_contradiction_id = next_watermark
         return tuple(decisions)
 
@@ -1121,7 +1186,28 @@ def install_v707_extensions() -> None:
         ensure_v707_schema(self.evidence_lifecycle)
         profile = profile_for_view(view)
         self.lifecycle_runtime.controller._v707_stage = profile.stage.name
+        parent_rows = self.evidence_lifecycle.connection.execute(
+            "SELECT memory_id,parent_memory_id FROM provenance_records "
+            "WHERE parent_memory_id IS NOT NULL"
+        ).fetchall()
+        parent_map: dict[MemoryId, list[MemoryId]] = defaultdict(list)
+        for memory_id, parent_id in parent_rows:
+            parent_map[MemoryId(int(memory_id))].append(MemoryId(int(parent_id)))
+        self._v707_parent_map = {
+            memory_id: tuple(sorted(set(parents), key=int))
+            for memory_id, parents in parent_map.items()
+        }
+        self._v707_dependency_cache = {}
+        self._v707_compression_edges = {
+            (int(parent_id), int(replacement_id))
+            for parent_id, replacement_id in self.evidence_lifecycle.connection.execute(
+                "SELECT parent_memory_id,replacement_memory_id "
+                "FROM memory_compression_replacements WHERE provenance_only=1"
+            ).fetchall()
+        }
+        phase_started = perf_counter()
         result = original_development_run(self, view, writer=writer)
+        core_seconds = perf_counter() - phase_started
         context_runtime = getattr(self, "_v707_context_runtime", None)
         if context_runtime is None:
             context_runtime = ContextRefinementRuntime(
@@ -1129,12 +1215,21 @@ def install_v707_extensions() -> None:
                 self.evidence_store,
             )
             self._v707_context_runtime = context_runtime
+        phase_started = perf_counter()
         context_runtime.run(view, writer=writer)
+        context_seconds = perf_counter() - phase_started
         compression_runtime = getattr(self, "_v707_compression_runtime", None)
         if compression_runtime is None:
             compression_runtime = MemoryCompressionRuntime(self.evidence_lifecycle)
             self._v707_compression_runtime = compression_runtime
+        phase_started = perf_counter()
         compression_runtime.run(writer=writer)
+        compression_seconds = perf_counter() - phase_started
+        self.last_v707_lifecycle_timings = {
+            "lifecycle_core_seconds": core_seconds,
+            "context_refinement_seconds": context_seconds,
+            "compression_seconds": compression_seconds,
+        }
         return result
 
     DevelopmentalLifecycleRuntime.run = _v707_development_run
@@ -1169,26 +1264,29 @@ def install_v707_extensions() -> None:
     original_dependency = DevelopmentalLifecycleRuntime._dependency_satisfied
 
     def _v707_dependency_satisfied(self, view, memory_id, visiting):
+        cache = getattr(self, "_v707_dependency_cache", {})
+        if memory_id in cache:
+            return bool(cache[memory_id])
         if memory_id in visiting:
             return True
         visiting = set(visiting)
         visiting.add(memory_id)
-        for parent_id in self.evidence_lifecycle.provenance_parents(memory_id):
-            row = self.evidence_lifecycle.connection.execute(
-                "SELECT replacement_memory_id FROM memory_compression_replacements "
-                "WHERE parent_memory_id=? AND provenance_only=1",
-                (int(parent_id),),
-            ).fetchone()
-            if row is not None and int(row[0]) == int(memory_id):
+        parents = getattr(self, "_v707_parent_map", {}).get(memory_id, ())
+        compression_edges = getattr(self, "_v707_compression_edges", set())
+        for parent_id in parents:
+            if (int(parent_id), int(memory_id)) in compression_edges:
                 continue
             parent = view.nodes.get(parent_id)
             if parent is None:
                 continue
             parent_gate = gate_for_identity(parent.level, parent.type_id)
             if parent_gate != GateId.NONE and not memory_is_derivation_eligible(parent):
+                cache[memory_id] = False
                 return False
             if not _v707_dependency_satisfied(self, view, parent_id, visiting):
+                cache[memory_id] = False
                 return False
+        cache[memory_id] = True
         return True
 
     DevelopmentalLifecycleRuntime._dependency_satisfied = _v707_dependency_satisfied

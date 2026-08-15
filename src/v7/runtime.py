@@ -515,6 +515,9 @@ class V7Runtime:
             phase_started = perf_counter()
             self.lifecycle.run(result.view, writer=self.writer)
             timings["lifecycle_seconds"] = perf_counter() - phase_started
+            timings.update(
+                getattr(self.lifecycle, "last_v707_lifecycle_timings", {})
+            )
             dirty = self.writer.dirty_counts
             if dirty["nodes"] or dirty["scores"] or dirty["edges"] or dirty["cognition"]:
                 phase_started = perf_counter()

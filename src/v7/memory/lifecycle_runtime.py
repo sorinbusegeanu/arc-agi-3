@@ -186,6 +186,7 @@ class MemoryLifecycleRuntime:
             ),
         )
         records: list[EvidenceRecord] = []
+        tombstones: list[MemoryTombstoneRecord] = []
         generation_id = int(writer.mutable_generation_id)
         registry = getattr(writer, "_canonical_registry", None)
         for decision in decisions:
@@ -253,7 +254,7 @@ class MemoryLifecycleRuntime:
                                 f"M{int(key.level)}:{int(key.type_id)}:"
                                 + ",".join(str(int(value)) for value in key.parts)
                             )
-                    self.evidence_lifecycle.append_tombstone(
+                    tombstones.append(
                         MemoryTombstoneRecord(
                             memory_id=decision.memory_id,
                             level_id=int(node.level),
@@ -264,6 +265,8 @@ class MemoryLifecycleRuntime:
                             provenance_pointer=f"memory:{int(decision.memory_id)}",
                         )
                     )
+        if self.evidence_lifecycle is not None and tombstones:
+            self.evidence_lifecycle.append_tombstones(tombstones)
         written = (
             self.evidence_store.append_evidence_batch(records)
             if self.evidence_store is not None
