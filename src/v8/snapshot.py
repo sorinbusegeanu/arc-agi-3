@@ -21,6 +21,12 @@ _OLD_NODE_V1 = Struct("<QQQBHBQQQQqdddddddQBB")
 _OLD_NODE_V2 = Struct("<QQQBHBQQQQqdddddddQQBB")
 
 
+def _snapshot_mp_context():
+    methods = tuple(mp.get_all_start_methods())
+    method = "forkserver" if "forkserver" in methods else "spawn"
+    return mp.get_context(method)
+
+
 @dataclass(frozen=True, slots=True)
 class SnapshotRequest:
     snapshot_id: int
@@ -186,11 +192,11 @@ def _write_snapshot_from_capture(
 def _snapshot_worker(
     root: str,
     descriptors: tuple[ShardReadDescriptor, ...],
-    requests: mp.Queue,
-    acknowledgements: mp.Queue,
-    saved_watermark: mp.sharedctypes.Synchronized,
-    saved_snapshot: mp.sharedctypes.Synchronized,
-    stop_event: mp.synchronize.Event,
+    requests,
+    acknowledgements,
+    saved_watermark,
+    saved_snapshot,
+    stop_event,
 ) -> None:
     try:
         try:
@@ -211,12 +217,18 @@ def _snapshot_worker(
                     acknowledgements.put(("captured", request.snapshot_id))
                 result = _write_snapshot_from_capture(root_path, captured, request)
             except BaseException as exc:
-                acknowledgements.put(("error", request.snapshot_id, type(exc).__name__, str(exc)))
+                acknowledgements.put(
+                    ("error", request.snapshot_id, type(exc).__name__, str(exc))
+                )
                 continue
             with saved_watermark.get_lock():
-                saved_watermark.value = max(int(saved_watermark.value), int(result.watermark))
+                saved_watermark.value = max(
+                    int(saved_watermark.value), int(result.watermark)
+                )
             with saved_snapshot.get_lock():
-                saved_snapshot.value = max(int(saved_snapshot.value), int(result.snapshot_id))
+                saved_snapshot.value = max(
+                    int(saved_snapshot.value), int(result.snapshot_id)
+                )
             acknowledgements.put(("ok", result))
     finally:
         stop_event.set()
@@ -228,12 +240,13 @@ class SnapshotService:
     def __init__(self, root: str | Path, descriptors: Iterable[ShardReadDescriptor]) -> None:
         self.root = Path(root)
         self.descriptors = tuple(descriptors)
-        self._requests: mp.Queue = mp.Queue(maxsize=1)
-        self._acks: mp.Queue = mp.Queue()
-        self._stop = mp.Event()
-        self.saved_watermark = mp.Value("Q", 0)
-        self.saved_snapshot = mp.Value("Q", 0)
-        self._process = mp.Process(
+        self._mp_ctx = _snapshot_mp_context()
+        self._requests = self._mp_ctx.Queue(maxsize=1)
+        self._acks = self._mp_ctx.Queue()
+        self._stop = self._mp_ctx.Event()
+        self.saved_watermark = self._mp_ctx.Value("Q", 0)
+        self.saved_snapshot = self._mp_ctx.Value("Q", 0)
+        self._process = self._mp_ctx.Process(
             target=_snapshot_worker,
             kwargs={
                 "root": str(self.root),
@@ -248,6 +261,10 @@ class SnapshotService:
             daemon=True,
         )
 
+    @property
+    def multiprocessing_start_method(self) -> str:
+        return self._mp_ctx.get_start_method()
+
     def start(self) -> None:
         if not self._process.is_alive():
             self._process.start()
@@ -261,7 +278,12 @@ class SnapshotService:
         auxiliary_state: str = "",
     ) -> None:
         request = SnapshotRequest(
-            int(snapshot_id), int(watermark), False, int(generation), str(auxiliary_state), False
+            int(snapshot_id),
+            int(watermark),
+            False,
+            int(generation),
+            str(auxiliary_state),
+            False,
         )
         try:
             self._requests.put_nowait(request)
@@ -315,8 +337,6 @@ class SnapshotService:
             if message[0] == "error" and int(message[1]) == int(snapshot_id):
                 _kind, _sid, error_type, text = message
                 raise RuntimeError(f"snapshot capture failed: {error_type}: {text}")
-            # Completed acknowledgements from older async requests are intentionally
-            # discarded here; their saved watermark remains available via shared state.
 
     def request_final(
         self,
@@ -328,7 +348,12 @@ class SnapshotService:
         timeout: float = 120.0,
     ) -> SnapshotResult:
         request = SnapshotRequest(
-            int(snapshot_id), int(watermark), True, int(generation), str(auxiliary_state), False
+            int(snapshot_id),
+            int(watermark),
+            True,
+            int(generation),
+            str(auxiliary_state),
+            False,
         )
         while True:
             try:
@@ -337,6 +362,7 @@ class SnapshotService:
                 break
         self._requests.put(request)
         import time
+
         deadline = time.monotonic() + timeout
         while True:
             remaining = deadline - time.monotonic()
@@ -402,7 +428,13 @@ def load_latest_auxiliary_state(root: str | Path) -> dict[str, object] | None:
     return value if isinstance(value, dict) else None
 
 
-def _migrate_old_node(arena: SharedNodeArena, payload: bytes, record: Struct, *, has_game_mask: bool) -> bool:
+def _migrate_old_node(
+    arena: SharedNodeArena,
+    payload: bytes,
+    record: Struct,
+    *,
+    has_game_mask: bool,
+) -> bool:
     if len(payload) < _HEADER.size:
         return False
     count, _seq = _HEADER.unpack_from(payload, 0)
@@ -414,30 +446,77 @@ def _migrate_old_node(arena: SharedNodeArena, payload: bytes, record: Struct, *,
             values = record.unpack_from(payload, _HEADER.size + row * record.size)
             if has_game_mask:
                 (
-                    hi, lo, fingerprint, level, memory_type, key_count,
-                    k0, k1, k2, k3, support,
-                    significance, prediction_error, learning_value, transfer_prior,
-                    explanatory, future_option, weight, watermark, game_mask,
-                    cognitive_state, validation_state,
+                    hi,
+                    lo,
+                    fingerprint,
+                    level,
+                    memory_type,
+                    key_count,
+                    k0,
+                    k1,
+                    k2,
+                    k3,
+                    support,
+                    significance,
+                    prediction_error,
+                    learning_value,
+                    transfer_prior,
+                    explanatory,
+                    future_option,
+                    weight,
+                    watermark,
+                    game_mask,
+                    cognitive_state,
+                    validation_state,
                 ) = values
             else:
                 (
-                    hi, lo, fingerprint, level, memory_type, key_count,
-                    k0, k1, k2, k3, support,
-                    significance, prediction_error, learning_value, transfer_prior,
-                    explanatory, future_option, weight, watermark,
-                    cognitive_state, validation_state,
+                    hi,
+                    lo,
+                    fingerprint,
+                    level,
+                    memory_type,
+                    key_count,
+                    k0,
+                    k1,
+                    k2,
+                    k3,
+                    support,
+                    significance,
+                    prediction_error,
+                    learning_value,
+                    transfer_prior,
+                    explanatory,
+                    future_option,
+                    weight,
+                    watermark,
+                    cognitive_state,
+                    validation_state,
                 ) = values
                 game_mask = 0
             arena.write(
                 row,
                 NodeRecord(
-                    MemoryUid(hi, lo), int(fingerprint), int(level), int(memory_type),
-                    tuple((k0, k1, k2, k3)[:int(key_count)]), int(support),
-                    float(significance), float(prediction_error), float(learning_value),
-                    float(transfer_prior), float(explanatory), float(future_option),
-                    float(weight), int(watermark), int(game_mask), int(cognitive_state),
-                    int(validation_state), 0.0, 0.0, 0.0,
+                    MemoryUid(hi, lo),
+                    int(fingerprint),
+                    int(level),
+                    int(memory_type),
+                    tuple((k0, k1, k2, k3)[: int(key_count)]),
+                    int(support),
+                    float(significance),
+                    float(prediction_error),
+                    float(learning_value),
+                    float(transfer_prior),
+                    float(explanatory),
+                    float(future_option),
+                    float(weight),
+                    int(watermark),
+                    int(game_mask),
+                    int(cognitive_state),
+                    int(validation_state),
+                    0.0,
+                    0.0,
+                    0.0,
                 ),
             )
     finally:
@@ -460,7 +539,10 @@ def _load_nodes_compatible(arena: SharedNodeArena, payload: bytes) -> None:
     raise RuntimeError("unsupported v8 node snapshot format")
 
 
-def restore_latest_snapshot(root: str | Path, descriptors: Iterable[ShardReadDescriptor]) -> tuple[int, int] | None:
+def restore_latest_snapshot(
+    root: str | Path,
+    descriptors: Iterable[ShardReadDescriptor],
+) -> tuple[int, int] | None:
     root = Path(root)
     snapshot = latest_complete_snapshot(root)
     if snapshot is None:
