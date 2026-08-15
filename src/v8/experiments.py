@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from v8.model import MemoryUid, stable_u64
+from v8.model import MemoryLevel, MemoryUid, stable_u64
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,7 +59,6 @@ def _probe_policy(
         if current_levels > last_levels:
             level_gain += current_levels - last_levels
         last_levels = current_levels
-    # A simple matched behavioral metric; same game/seed/budget is used on and off.
     metric = (5.0 * wins + 2.0 * level_gain - 0.25 * failures) / max(1.0, float(steps))
     return float(metric), used
 
@@ -73,23 +72,17 @@ def run_automatic_transfer_experiments(
     steps_per_trial: int = 32,
     max_trials: int = 8,
 ) -> ExperimentSummary:
-    """Run matched held-out memory-on/off interventions automatically.
-
-    The `on` arm may use only M7 strategies whose graph ancestry includes the tested
-    M3/M4 memory. The `off` arm uses the same M1 fallback policy, same game, seed and
-    interaction budget. A target game must be absent from exact formation provenance.
-    """
+    """Run matched held-out memory-on/off interventions automatically."""
     if runtime.peers is None or max_trials <= 0 or steps_per_trial <= 0:
         return ExperimentSummary(0, 0, 0)
     nodes = runtime.read_view.node_records()
+    by_uid = {row.uid: row for row in nodes}
     candidates = runtime.peers.transfer.candidates(
         nodes,
         provenance=runtime.read_view.source_games,
     )
     attempted = completed = passed = 0
-    game_hashes = {
-        game: stable_u64(game, person=b"v8-game") for game in games
-    }
+    game_hashes = {game: stable_u64(game, person=b"v8-game") for game in games}
     for candidate in sorted(candidates, key=lambda row: (-row.structural_score, row.uid)):
         formation = tuple(candidate.formation_games)
         for game_id in games:
@@ -128,4 +121,28 @@ def run_automatic_transfer_experiments(
             )
             completed += 1
             passed += int(trial.passed)
+            if not trial.passed:
+                row = by_uid.get(candidate.uid)
+                if row is not None:
+                    runtime.peers._append_evidence(
+                        "transfer_trial_fail",
+                        row,
+                        abs(float(trial.effect)),
+                        unique=True,
+                        target_game_hash=target_hash,
+                        provenance_games=formation,
+                        causal_intervention="matched_arc_memory_ablation",
+                        effect_direction=-1,
+                    )
+                    if int(row.level) == int(MemoryLevel.M4):
+                        runtime.peers._append_evidence(
+                            "concept_transfer_fail",
+                            row,
+                            abs(float(trial.effect)),
+                            unique=True,
+                            target_game_hash=target_hash,
+                            provenance_games=formation,
+                            causal_intervention="matched_arc_memory_ablation",
+                            effect_direction=-1,
+                        )
     return ExperimentSummary(attempted, completed, passed)
