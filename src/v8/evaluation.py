@@ -20,6 +20,7 @@ class HypothesisContract:
     positive_effect_required: bool = False
     min_distinct_targets: int = 0
     dependencies: tuple[str, ...] = ()
+    dependency_min_status: str = "VALID"
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +98,7 @@ CONTRACTS: tuple[HypothesisContract, ...] = (
         causal_required=True,
         positive_effect_required=True,
         dependencies=("H13",),
+        dependency_min_status="PARTIALLY_VALID",
     ),
     HypothesisContract(
         "H15",
@@ -106,6 +108,7 @@ CONTRACTS: tuple[HypothesisContract, ...] = (
         negative_kinds=("preference_instability",),
         causal_required=True,
         dependencies=("H13",),
+        dependency_min_status="PARTIALLY_VALID",
     ),
 )
 
@@ -138,6 +141,14 @@ class ScientificHypothesisEvaluator:
                 return False
         return True
 
+    @staticmethod
+    def _dependency_satisfied(actual: str | None, required: str) -> bool:
+        if actual == "INVALID":
+            return False
+        if required == "PARTIALLY_VALID":
+            return actual in {"PARTIALLY_VALID", "VALID"}
+        return actual == "VALID"
+
     def evaluate(self, evidence: Iterable[EvidenceRecord]) -> tuple[HypothesisDecision, ...]:
         rows = tuple(evidence)
         kinds: dict[str, list[EvidenceRecord]] = {}
@@ -168,7 +179,9 @@ class ScientificHypothesisEvaluator:
             quality_gate = "PASS" if quality_pass else ("NO_EVIDENCE" if not rows else "FAIL")
 
             blocked_dependencies = [
-                dep for dep in contract.dependencies if decided.get(dep) != "VALID"
+                dep
+                for dep in contract.dependencies
+                if not self._dependency_satisfied(decided.get(dep), contract.dependency_min_status)
             ]
             dependency_gate = "PASS" if not blocked_dependencies else "BLOCKED"
 
