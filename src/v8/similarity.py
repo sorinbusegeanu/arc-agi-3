@@ -36,7 +36,7 @@ class SimilarityEvidence:
     enable_block_score: float | None
     future_option_score: float
     consequence_score: float | None
-    context_score: float
+    context_score: float | None
     evidence_watermark: int
 
 
@@ -132,7 +132,7 @@ class BoundedNeighborhoodSimilarity:
                 versions[src.uid] = max(
                     versions[src.uid], int(edge.updated_watermark), int(dst.updated_watermark)
                 )
-                if relation in {int(RelationType.DEPENDS_ON), int(RelationType.EXPLAINS)}:
+                if relation == int(RelationType.DEPENDS_ON):
                     dependencies[src.uid].extend((relation, int(dst.level), int(dst.memory_type)))
                 if relation in {int(RelationType.ENABLES), int(RelationType.BLOCKS)}:
                     enable_block[src.uid].extend((relation, int(dst.level), int(dst.memory_type)))
@@ -145,10 +145,12 @@ class BoundedNeighborhoodSimilarity:
                 versions[dst.uid] = max(
                     versions[dst.uid], int(edge.updated_watermark), int(src.updated_watermark)
                 )
-                if relation in {int(RelationType.DEPENDS_ON), int(RelationType.EXPLAINS)}:
+                if relation == int(RelationType.DEPENDS_ON):
                     dependencies[dst.uid].extend((relation, int(src.level), int(src.memory_type)))
                 if relation in {int(RelationType.ENABLES), int(RelationType.BLOCKS)}:
                     enable_block[dst.uid].extend((relation, int(src.level), int(src.memory_type)))
+                if int(src.level) >= int(MemoryLevel.M5):
+                    consequence_neighbors[dst.uid].append(int(src.fingerprint))
 
         result: dict[MemoryUid, NeighborhoodDescriptor] = {}
         for row in nodes:
@@ -199,14 +201,17 @@ class BoundedNeighborhoodSimilarity:
         consequence = None
         if a.consequence_bucket and b.consequence_bucket:
             consequence = 1.0 if a.consequence_bucket == b.consequence_bucket else 0.0
-        context = 1.0 if a.context_bucket == b.context_bucket else 0.5
+        context = None
+        if a.context_bucket and b.context_bucket:
+            context = 1.0 if a.context_bucket == b.context_bucket else 0.0
 
         components: list[tuple[float, float]] = [
             (0.30, relation),
             (0.20, level_type),
             (0.15, future),
-            (0.10, context),
         ]
+        if context is not None:
+            components.append((0.10, context))
         if dependency is not None:
             components.append((0.10, dependency))
         if enable is not None:
@@ -227,7 +232,7 @@ class BoundedNeighborhoodSimilarity:
             enable_block_score=enable,
             future_option_score=float(future),
             consequence_score=consequence,
-            context_score=float(context),
+            context_score=context,
             evidence_watermark=max(
                 int(a.descriptor_version), int(b.descriptor_version)
             ),

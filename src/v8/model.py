@@ -238,14 +238,49 @@ class MemoryProposal:
             raise ValueError("invalid validation_state")
 
 
+@dataclass(frozen=True, slots=True)
+class RelationProposal:
+    """Immutable edge-only canonical mutation.
+
+    Relation proposals intentionally carry no node identity fields beyond their
+    endpoints.  They let background developmental peers publish structural
+    correspondence without pretending that an edge update is a node mutation.
+    """
+
+    source_uid: MemoryUid
+    target_uid: MemoryUid
+    relation_type: RelationType
+    event_id: EventId
+    watermark: int
+    support_delta: int = 1
+    score_sum: float = 0.0
+    score_weight: float = 0.0
+    source_version: int = 0
+    target_version: int = 0
+
+    def __post_init__(self) -> None:
+        if self.source_uid.is_zero or self.target_uid.is_zero:
+            raise ValueError("relation endpoints must be non-zero canonical UIDs")
+        if self.source_uid == self.target_uid:
+            raise ValueError("self-relations are not admissible")
+        if self.watermark < 0 or self.source_version < 0 or self.target_version < 0:
+            raise ValueError("relation watermarks/versions must be non-negative")
+        if self.support_delta <= 0:
+            raise ValueError("relation support_delta must be positive")
+        if self.score_weight < 0:
+            raise ValueError("relation score_weight cannot be negative")
+
+
 _EXPERIENCE = Struct("<QQQIQQQiQQQdIbQ")
 _EXPERIENCE_EXTRA = Struct("<QQd")
 _PIPE_SUFFIX = Struct("<QQbQ")
 _PROPOSAL = Struct("<QQQQQQBHBQQQQqddddddddddQQHQbb")
+_RELATION_PROPOSAL = Struct("<QQQQHQQQqddQQ")
 
 EXPERIENCE_PACKET_SIZE = _EXPERIENCE.size + _EXPERIENCE_EXTRA.size
 PIPELINE_PACKET_SIZE = EXPERIENCE_PACKET_SIZE + _PIPE_SUFFIX.size
 PROPOSAL_PACKET_SIZE = _PROPOSAL.size
+RELATION_PROPOSAL_PACKET_SIZE = _RELATION_PROPOSAL.size
 
 
 def encode_experience(event: ExperienceEvent) -> bytes:
@@ -346,7 +381,88 @@ def proposal_fingerprint(level: int, memory_type: int, key_parts: Iterable[int])
     return stable_u64(int(level), int(memory_type), *parts, person=b"v8-key-fp")
 
 
+def encode_relation_proposal(proposal: RelationProposal) -> bytes:
+    return _RELATION_PROPOSAL.pack(
+        u64(proposal.source_uid.hi),
+        u64(proposal.source_uid.lo),
+        u64(proposal.target_uid.hi),
+        u64(proposal.target_uid.lo),
+        int(proposal.relation_type),
+        u64(proposal.event_id.hi),
+        u64(proposal.event_id.lo),
+        u64(proposal.watermark),
+        int(proposal.support_delta),
+        float(proposal.score_sum),
+        float(proposal.score_weight),
+        u64(proposal.source_version),
+        u64(proposal.target_version),
+    )
+
+
+def decode_relation_proposal(payload: bytes) -> RelationProposal:
+    if len(payload) != RELATION_PROPOSAL_PACKET_SIZE:
+        raise ValueError(f"invalid relation proposal packet size {len(payload)}")
+    (
+        source_hi,
+        source_lo,
+        target_hi,
+        target_lo,
+        relation_type,
+        event_hi,
+        event_lo,
+        watermark,
+        support_delta,
+        score_sum,
+        score_weight,
+        source_version,
+        target_version,
+    ) = _RELATION_PROPOSAL.unpack(payload)
+    return RelationProposal(
+        source_uid=MemoryUid(source_hi, source_lo),
+        target_uid=MemoryUid(target_hi, target_lo),
+        relation_type=RelationType(relation_type),
+        event_id=EventId(event_hi, event_lo),
+        watermark=int(watermark),
+        support_delta=int(support_delta),
+        score_sum=float(score_sum),
+        score_weight=float(score_weight),
+        source_version=int(source_version),
+        target_version=int(target_version),
+    )
+
+
+def _similarity_relation_packet(proposal: MemoryProposal) -> bytes | None:
+    """Compatibility bridge for existing peers while phase 4 becomes canonical.
+
+    Similarity was initially emitted as a node-shaped MemoryProposal.  Convert that
+    legacy producer shape at the binary boundary so shard reducers receive a true
+    edge-only RelationProposal.  Other MemoryProposal relations remain unchanged.
+    """
+    if (
+        proposal.relation_type != RelationType.SIMILAR_TO
+        or proposal.parent_uid.is_zero
+    ):
+        return None
+    source, target = sorted((proposal.uid, proposal.parent_uid))
+    relation = RelationProposal(
+        source_uid=source,
+        target_uid=target,
+        relation_type=RelationType.SIMILAR_TO,
+        event_id=proposal.event_id,
+        watermark=proposal.watermark,
+        support_delta=max(1, int(proposal.support_delta)),
+        score_sum=float(proposal.transfer_prior_sum),
+        score_weight=1.0 if abs(float(proposal.transfer_prior_sum)) > 0.0 else 0.0,
+        source_version=proposal.watermark,
+        target_version=proposal.watermark,
+    )
+    return encode_relation_proposal(relation)
+
+
 def encode_proposal(proposal: MemoryProposal) -> bytes:
+    relation_packet = _similarity_relation_packet(proposal)
+    if relation_packet is not None:
+        return relation_packet
     parts = tuple(u64(value) for value in proposal.key_parts)
     padded = parts + (0,) * (4 - len(parts))
     return _PROPOSAL.pack(

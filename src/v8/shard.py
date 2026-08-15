@@ -18,9 +18,11 @@ from v8.model import (
     CognitiveState,
     MemoryLevel,
     MemoryUid,
+    RELATION_PROPOSAL_PACKET_SIZE,
     RelationType,
     ValidationState,
     decode_proposal,
+    decode_relation_proposal,
     signed_u64,
     u64,
 )
@@ -130,8 +132,8 @@ def shard_worker(
         # Duplicate protection is bounded. Restart safety is provided by the runtime's
         # restored M0 event identities, so this set does not need to grow forever.
         dedupe_capacity = max(65_536, int(batch_size) * 1024)
-        seen: set[tuple[int, int, int, int]] = set()
-        seen_order: deque[tuple[int, int, int, int]] = deque()
+        seen: set[tuple[int, ...]] = set()
+        seen_order: deque[tuple[int, ...]] = deque()
 
         while not stop_event.is_set() or not ring.empty:
             first = ring.get(timeout=0.05)
@@ -156,8 +158,70 @@ def shard_worker(
                 max_watermark = int(watermark.value)
                 try:
                     for payload in packets:
+                        if len(payload) == RELATION_PROPOSAL_PACKET_SIZE:
+                            relation = decode_relation_proposal(payload)
+                            dedupe = (
+                                1,
+                                int(relation.event_id.hi),
+                                int(relation.event_id.lo),
+                                int(relation.source_uid.hi),
+                                int(relation.source_uid.lo),
+                                int(relation.target_uid.hi),
+                                int(relation.target_uid.lo),
+                                int(relation.relation_type),
+                            )
+                            if dedupe in seen:
+                                continue
+                            seen.add(dedupe)
+                            seen_order.append(dedupe)
+                            if len(seen_order) > dedupe_capacity:
+                                seen.discard(seen_order.popleft())
+
+                            # Relation proposals are valid only for already-canonical
+                            # source memories. The target may live on another shard.
+                            source_row = node_index.get(relation.source_uid)
+                            if source_row is None:
+                                continue
+                            mutated = True
+                            max_watermark = max(max_watermark, int(relation.watermark))
+
+                            # Preserve the pre-phase-4 prospective transfer-prior
+                            # behavior while the canonical edge itself is now reduced
+                            # independently of node identity. Phase 6 can consume the
+                            # relation score directly and remove this compatibility
+                            # accumulation.
+                            if relation.score_weight > 0.0:
+                                current = nodes.read(source_row)
+                                nodes.write(
+                                    source_row,
+                                    replace(
+                                        current,
+                                        transfer_prior_sum=(
+                                            current.transfer_prior_sum + relation.score_sum
+                                        ),
+                                        updated_watermark=max(
+                                            current.updated_watermark,
+                                            relation.watermark,
+                                        ),
+                                    ),
+                                )
+
+                            edge_count = _write_edge(
+                                edges=edges,
+                                edge_index=edge_index,
+                                edge_count=edge_count,
+                                source_uid=relation.source_uid,
+                                relation_type=int(relation.relation_type),
+                                target_uid=relation.target_uid,
+                                support_delta=relation.support_delta,
+                                watermark=relation.watermark,
+                                shard_id=config.shard_id,
+                            )
+                            continue
+
                         proposal = decode_proposal(payload)
                         dedupe = (
+                            0,
                             int(proposal.event_id.hi),
                             int(proposal.event_id.lo),
                             int(proposal.uid.hi),
