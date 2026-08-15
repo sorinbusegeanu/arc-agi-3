@@ -138,6 +138,8 @@ def test_mature_global_stage_preserves_transfer_frontier_exploration_floor(
         score=1.0,
         exploration_score=0.5,
         memory_confidence=0.99,
+        failure_risk=0.0,
+        contradiction_risk=0.0,
         support=SimpleNamespace(
             context_rank=0,
             local_support=0,
