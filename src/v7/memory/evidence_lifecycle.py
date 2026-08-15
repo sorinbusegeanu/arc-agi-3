@@ -4,7 +4,7 @@ import json
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Mapping
 
 from v7.memory.ids import MemoryId
 from v7.memory.schema import ensure_v7_schema
@@ -145,12 +145,16 @@ class EvidenceLifecycleStore:
     def heldout_transfer_summary(
         self,
         memory_ids: Iterable[MemoryId],
+        *,
+        formation_generations: Mapping[MemoryId, int] | None = None,
     ) -> dict[MemoryId, tuple[int, int, float]]:
-        """Summarize unique transfer into games outside formation provenance.
+        """Summarize unique transfer into games outside frozen formation scope.
 
-        One terminal can generate both direct terminal-action evidence and the
-        stronger trajectory-usage record. Those describe the same target trial
-        and must count once; trajectory attribution wins when both are present.
+        When a creation generation is supplied, provenance is resolved only
+        through links/evidence that already existed by that generation. Later
+        parent additions therefore cannot retroactively redefine a target game
+        as part of formation. One terminal can also generate both direct and
+        trajectory evidence; the stronger trajectory record wins that duplicate.
         """
         ids = tuple(
             sorted(
@@ -160,15 +164,23 @@ class EvidenceLifecycleStore:
         )
         if not ids:
             return {}
+        cutoffs = formation_generations or {}
+        scopes = {
+            memory_id: set(
+                self.provenance_source_games_at(
+                    memory_id,
+                    int(cutoffs[memory_id]),
+                )
+                if memory_id in cutoffs
+                else self.provenance_source_games(memory_id)
+            )
+            for memory_id in ids
+        }
         placeholders = ",".join("?" for _ in ids)
         rows = self.connection.execute(
             f"SELECT memory_id, source_game, target_game, success, score, payload_json FROM transfer_trials WHERE memory_id IN ({placeholders}) ORDER BY transfer_trial_id",
             tuple(int(memory_id) for memory_id in ids),
         ).fetchall()
-        scopes = {
-            memory_id: set(self.provenance_source_games(memory_id))
-            for memory_id in ids
-        }
         unique: dict[
             tuple[MemoryId, str, int | None],
             tuple[str, str, int, float, str],
@@ -259,6 +271,35 @@ class EvidenceLifecycleStore:
             WHERE p.source_game IS NOT NULL AND p.source_game<>'' ORDER BY p.source_game
             """,
             (int(memory_id),),
+        ).fetchall()
+        return tuple(str(row[0]) for row in rows)
+
+    def provenance_source_games_at(
+        self,
+        memory_id: MemoryId,
+        generation_id: int,
+    ) -> tuple[str, ...]:
+        """Resolve ancestry and source games as they existed at one generation."""
+        cutoff = int(generation_id)
+        rows = self.connection.execute(
+            """
+            WITH RECURSIVE ancestry(memory_id) AS (
+                SELECT ?
+                UNION
+                SELECT p.parent_memory_id
+                FROM provenance_records AS p
+                JOIN ancestry AS a ON p.memory_id=a.memory_id
+                WHERE p.parent_memory_id IS NOT NULL AND p.generation_id<=?
+            )
+            SELECT DISTINCT p.source_game
+            FROM provenance_records AS p
+            JOIN ancestry AS a ON p.memory_id=a.memory_id
+            WHERE p.generation_id<=?
+              AND p.source_game IS NOT NULL
+              AND p.source_game<>''
+            ORDER BY p.source_game
+            """,
+            (int(memory_id), cutoff, cutoff),
         ).fetchall()
         return tuple(str(row[0]) for row in rows)
 
