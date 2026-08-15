@@ -16,11 +16,23 @@ class ContextRefinement:
 
 
 class ContextRefiner:
-    """Propose context splits only when one action has recurrent conflicting outcomes."""
+    """Propose context partitions only when they reduce predictive contradiction."""
 
     def __init__(self, *, min_support: int = 4, contradiction_threshold: float = 0.20) -> None:
         self.min_support = int(min_support)
         self.contradiction_threshold = float(contradiction_threshold)
+
+    @staticmethod
+    def _error(rows: list[NodeRecord]) -> float:
+        total = sum(max(0, int(row.support_count)) for row in rows)
+        if total <= 0:
+            return 0.0
+        by_outcome: dict[int, int] = defaultdict(int)
+        for row in rows:
+            if len(row.key_parts) >= 3:
+                by_outcome[int(row.key_parts[2])] += max(0, int(row.support_count))
+        dominant = max(by_outcome.values(), default=0)
+        return 1.0 - dominant / total
 
     def propose(self, rows: tuple[NodeRecord, ...]) -> tuple[ContextRefinement, ...]:
         grouped: dict[tuple[int, int], list[NodeRecord]] = defaultdict(list)
@@ -32,10 +44,22 @@ class ContextRefiner:
             total = sum(int(row.support_count) for row in variants)
             if total < self.min_support or len(variants) < 2:
                 continue
-            dominant = max(int(row.support_count) for row in variants)
-            contradiction = 1.0 - dominant / max(1, total)
-            if contradiction < self.contradiction_threshold:
+            broad_error = self._error(variants)
+            if broad_error < self.contradiction_threshold:
                 continue
+
+            partitions: dict[int, list[NodeRecord]] = defaultdict(list)
+            for row in variants:
+                next_context = int(row.key_parts[3]) if len(row.key_parts) >= 4 else 0
+                partitions[next_context].append(row)
+            refined_error = 0.0
+            for partition_rows in partitions.values():
+                partition_support = sum(max(0, int(row.support_count)) for row in partition_rows)
+                refined_error += (partition_support / max(1, total)) * self._error(partition_rows)
+            gain = max(0.0, broad_error - refined_error)
+            if gain <= 1e-12:
+                continue
+
             for row in variants:
                 outcome = int(row.key_parts[2])
                 next_context = int(row.key_parts[3]) if len(row.key_parts) >= 4 else 0
@@ -46,7 +70,7 @@ class ContextRefiner:
                         row.uid,
                         MemoryUid.from_key(MemoryLevel.M3, MemoryType.CONTEXTUAL_ROLE, key),
                         key,
-                        contradiction,
+                        gain,
                     )
                 )
         return tuple(result)
