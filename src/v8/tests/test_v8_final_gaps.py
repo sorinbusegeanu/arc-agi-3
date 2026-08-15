@@ -100,6 +100,27 @@ class MultiprocessingSafetyTests(unittest.TestCase):
             self.assertNotEqual(runtime._mp_ctx.get_start_method(), "fork")
             runtime.close(normal=False)
 
+    def test_snapshot_service_never_uses_fork(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = ContinuousMemoryRuntime(
+                V8RuntimeConfig.from_path(
+                    tmp,
+                    shards=1,
+                    stage_workers=1,
+                    enable_snapshots=True,
+                    enable_peers=False,
+                    node_capacity_per_shard=128,
+                    edge_capacity_per_shard=256,
+                    action_capacity_per_shard=64,
+                )
+            )
+            self.assertIsNotNone(runtime.snapshot_service)
+            self.assertNotEqual(
+                runtime.snapshot_service.multiprocessing_start_method,
+                "fork",
+            )
+            runtime.close(normal=False)
+
 
 class ChunkCapacityContinuationTests(unittest.TestCase):
     def test_capacity_planner_reads_content_addressed_final_snapshot(self) -> None:
