@@ -131,12 +131,34 @@ def run_continuous(args) -> int:
     restore_source = latest_complete_snapshot(args.root) if restore_enabled else None
     runtime = ContinuousMemoryRuntime(_runtime_config(args, total_steps=total_steps))
     loaded_nodes = runtime.read_view.memory_count
+    experiments = ExperimentSummary(0, 0, 0)
+
+    def accumulate_experiments(summary: ExperimentSummary) -> None:
+        nonlocal experiments
+        experiments = ExperimentSummary(
+            experiments.attempted + summary.attempted,
+            experiments.completed + summary.completed,
+            experiments.passed + summary.passed,
+        )
 
     def report_progress(rows) -> None:
         _log(format_game_rate_line(rows))
         _log(format_hypothesis_line(runtime.scientific_statuses()))
+        if args.no_automatic_experiments or args.no_peers:
+            return
+        remaining = max(0, int(args.max_transfer_experiments) - experiments.attempted)
+        if remaining <= 0:
+            return
+        live = run_automatic_transfer_experiments(
+            runtime,
+            games=tuple(games),
+            env_root=args.env_root,
+            seed=args.seed + experiments.attempted * 7919,
+            steps_per_trial=args.transfer_experiment_steps,
+            max_trials=min(2, remaining),
+        )
+        accumulate_experiments(live)
 
-    experiments = ExperimentSummary(0, 0, 0)
     try:
         previous_wait = os.environ.get(_GAME_WAIT_ENV)
         os.environ[_GAME_WAIT_ENV] = str(float(args.wait))
@@ -163,18 +185,20 @@ def run_continuous(args) -> int:
             else:
                 os.environ[_GAME_WAIT_ENV] = previous_wait
 
-        runtime.record_actor_results(results)
         runtime.wait_quiescent(timeout=args.drain_timeout)
 
         if not args.no_automatic_experiments and not args.no_peers:
-            experiments = run_automatic_transfer_experiments(
-                runtime,
-                games=tuple(games),
-                env_root=args.env_root,
-                seed=args.seed,
-                steps_per_trial=args.transfer_experiment_steps,
-                max_trials=args.max_transfer_experiments,
-            )
+            remaining = max(0, int(args.max_transfer_experiments) - experiments.attempted)
+            if remaining > 0:
+                tail = run_automatic_transfer_experiments(
+                    runtime,
+                    games=tuple(games),
+                    env_root=args.env_root,
+                    seed=args.seed + experiments.attempted * 7919,
+                    steps_per_trial=args.transfer_experiment_steps,
+                    max_trials=remaining,
+                )
+                accumulate_experiments(tail)
             runtime.wait_quiescent(timeout=args.drain_timeout)
 
         metrics = runtime.metrics()

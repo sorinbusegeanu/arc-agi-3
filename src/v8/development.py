@@ -57,10 +57,15 @@ def _changed_bucket(changed_cells: int) -> int:
     return 4
 
 
+def _outcome_bucket(changed_cells: int, terminal_polarity: int) -> int:
+    polarity = 1 if int(terminal_polarity) > 0 else -1 if int(terminal_polarity) < 0 else 0
+    return _changed_bucket(changed_cells) * 3 + (polarity + 1)
+
+
 def _key_for(level: MemoryLevel, event: PipelineEvent) -> tuple[int, ...]:
     e = event.experience
     future_bucket = _bucket(e.future_option_delta)
-    changed_bucket = _changed_bucket(e.changed_cells)
+    outcome_bucket = _outcome_bucket(e.changed_cells, e.terminal_polarity)
     if level == MemoryLevel.M0:
         return (int(e.event_id.hi), int(e.event_id.lo))
     if level == MemoryLevel.M1:
@@ -86,13 +91,10 @@ def _key_for(level: MemoryLevel, event: PipelineEvent) -> tuple[int, ...]:
             int(future_bucket),
         )
     if level == MemoryLevel.M6:
-        # First create bounded consequence variants. The outcome peer can merge these
-        # into a persistent coarse outcome class and can later split that class again
-        # without losing the original member identities.
         consequence_bucket = stable_u64(
             e.outcome_signature, e.family_signature, person=b"v8-outcome-variant"
         ) & 0xF
-        return (int(future_bucket), int(changed_bucket), int(consequence_bucket))
+        return (int(future_bucket), int(outcome_bucket), int(consequence_bucket))
     if level == MemoryLevel.M7:
         if event.parent_uid.is_zero:
             raise ValueError("M7 strategy requires M6 outcome parent")
@@ -114,9 +116,16 @@ def derive_proposal(level: MemoryLevel, event: PipelineEvent) -> MemoryProposal:
     multiplicity = max(1, int(event.multiplicity))
 
     structural_change = min(1.0, max(0, int(e.changed_cells)) / 32.0)
-    option_magnitude = math.tanh(abs(float(e.future_option_delta)))
+    option_signed = math.tanh(float(e.future_option_delta))
+    option_magnitude = abs(option_signed)
     significance = 0.55 * structural_change + 0.45 * option_magnitude
     learning_value = structural_change
+    if level == MemoryLevel.M1:
+        significance = (
+            0.30 * significance
+            + 0.55 * max(-1, min(1, int(e.terminal_polarity)))
+            + 0.15 * option_signed
+        )
 
     relation = RelationType.LEADS_TO if level == MemoryLevel.M7 else RelationType.EXPLAINS
     return MemoryProposal(
@@ -166,7 +175,6 @@ def _drain_batch(ingress: SharedRingBuffer, first: bytes, *, limit: int = 256) -
 
 
 def _developmental_path_key(level: MemoryLevel, event: PipelineEvent) -> tuple[object, ...]:
-    """Fields that can affect any downstream identity or aggregate statistic."""
     e = event.experience
     return (
         int(level),
