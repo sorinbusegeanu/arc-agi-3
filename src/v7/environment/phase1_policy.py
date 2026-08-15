@@ -18,6 +18,7 @@ from v7.memory.ids import MemoryId
 from v7.memory.planning import PersistentPlanningGraph
 from v7.memory.read_view import MemoryReadView
 from v7.memory.semantic_relations import TYPE_RELATIONAL_WORLD_MODEL
+from v7.memory.status import memory_is_active
 
 
 def _clamp01(value: float) -> float:
@@ -31,13 +32,7 @@ def _local_policy_confidence(
     context_rank: int,
     local_support: int,
 ) -> float:
-    """Cap shared-memory confidence until the current lane confirms it locally.
-
-    The five-signature v7 context lattice can retrieve broad cross-game support.
-    That support is useful for transfer, but it must not make a novel target
-    context deterministic before the worker has observed local evidence.
-    Legacy context layouts preserve their previous behavior.
-    """
+    """Cap shared-memory confidence until the current lane confirms it locally."""
     value = _clamp01(confidence)
     if int(signature_count) < 5 or int(local_support) >= 2:
         return value
@@ -53,26 +48,29 @@ def _is_transfer_frontier(
     contexts: DecisionContext,
     decision: object,
 ) -> bool:
-    """Return whether a decision is broad/unconfirmed in the new v7 lattice."""
+    """Return whether a decision is broad or not yet locally confirmed."""
     if len(contexts.signatures) < 5:
         return False
     support = getattr(decision, "support", None)
     context_rank = int(getattr(support, "context_rank", 0) or 0)
     local_support = int(getattr(support, "local_support", 0) or 0)
-    return context_rank < 3 or local_support <= 0
+    # The confidence cap considers two local observations sufficient. Strategy
+    # start must use the same threshold rather than becoming deterministic at 1.
+    return context_rank < 3 or local_support < 2
 
 
 def _transfer_probe_strength(
     view: MemoryReadView,
     concept_ids: Iterable[int],
 ) -> float:
-    """Bounded priority for testing transferable concepts in a new context."""
+    """Bounded priority for testing transferable active concepts."""
     best = 0.0
     for raw_memory_id in concept_ids:
         memory_id = MemoryId(int(raw_memory_id))
         node = view.nodes.get(memory_id)
-        if node is None:
+        if not memory_is_active(node):
             continue
+        assert node is not None
         flags = int(node.status_flags)
         if flags & int(ConceptValidationStatus.TRANSFER_REJECTED):
             continue
@@ -132,12 +130,7 @@ class Phase1Selection:
 
 
 class Phase1ActionScorer:
-    """Contextual exploitation score augmented by persistent planning.
-
-    Phase 5 adjusts planning depth from evidence maturity. Phase 6 ablations
-    remove mechanisms at the acting-policy boundary without mutating the shared
-    memory substrate.
-    """
+    """Contextual exploitation score augmented by persistent planning."""
 
     def __init__(
         self,
@@ -182,15 +175,13 @@ class Phase1ActionScorer:
                 depth=planning_depth,
             )
 
-            # Base scorer mixes +0.08 exploration. Phase-1+ policy separates
-            # exploitation from exploration so a validated memory policy can
-            # override exploratory preference.
             memory_score = float(row.score) - 0.08 * float(row.exploration_score)
             future_option_component = float(
                 getattr(row, "future_option_score_component", 0.0)
             )
             future_option_ablated = ablated(
-                self.ablation_mask, CognitionAblation.FUTURE_OPTION
+                self.ablation_mask,
+                CognitionAblation.FUTURE_OPTION,
             )
             if future_option_ablated:
                 memory_score -= future_option_component
@@ -217,16 +208,23 @@ class Phase1ActionScorer:
                     memory_id
                     for memory_id in all_worlds
                     if (
-                        (node := view.nodes.get(MemoryId(memory_id))) is not None
-                        and int(node.type_id) != TYPE_RELATIONAL_WORLD_MODEL
+                        memory_is_active(view.nodes.get(MemoryId(memory_id)))
+                        and int(view.nodes[MemoryId(memory_id)].type_id)
+                        != TYPE_RELATIONAL_WORLD_MODEL
                     )
                 )
-                all_strength = self.base._memory_strength(view, all_worlds)  # noqa: SLF001
+                all_strength = self.base._memory_strength(  # noqa: SLF001
+                    view,
+                    all_worlds,
+                )
                 transition_strength = self.base._memory_strength(  # noqa: SLF001
                     view,
                     transition_worlds,
                 )
-                memory_score -= 0.10 * max(0.0, all_strength - transition_strength)
+                memory_score -= 0.10 * max(
+                    0.0,
+                    all_strength - transition_strength,
+                )
 
             if not ablated(
                 self.ablation_mask,
@@ -392,9 +390,17 @@ class StrategyExecutionCursor:
                 confidence = self._strategy_confidence(view, strategy_id)
                 if confidence < self.start_confidence:
                     continue
-                if max(decision.failure_risk, decision.dead_end_risk) >= self.risk_abort_threshold:
+                if (
+                    max(decision.failure_risk, decision.dead_end_risk)
+                    >= self.risk_abort_threshold
+                ):
                     continue
-                candidate = (confidence, -len(procedure.steps), strategy_id, decision)
+                candidate = (
+                    confidence,
+                    -len(procedure.steps),
+                    strategy_id,
+                    decision,
+                )
                 if best is None or candidate[:2] > best[:2] or (
                     candidate[:2] == best[:2]
                     and int(strategy_id) < int(best[2])
@@ -434,8 +440,9 @@ class StrategyExecutionCursor:
         strategy_id: MemoryId,
     ) -> float:
         node = view.nodes.get(strategy_id)
-        if node is None:
+        if not memory_is_active(node):
             return 0.0
+        assert node is not None
         support = 1.0 - math.exp(-max(0, int(node.support_count)) / 2.0)
         score = view.scores.get(strategy_id)
         semantic = 0.0
@@ -521,9 +528,7 @@ def select_phase1_action(
         developmental_multiplier = max(1.0, developmental_multiplier)
     base_epsilon = _clamp01(float(epsilon))
     effective_epsilon = _clamp01(
-        base_epsilon
-        * developmental_multiplier
-        * (1.0 - confidence) ** 2
+        base_epsilon * developmental_multiplier * (1.0 - confidence) ** 2
     )
     if transfer_frontier and base_epsilon > 0.0:
         effective_epsilon = max(
@@ -531,8 +536,6 @@ def select_phase1_action(
             min(base_epsilon, 0.08),
         )
 
-    # Mature validated knowledge earns near-deterministic exploitation only
-    # after the current target context has locally confirmed it.
     high_confidence_threshold = (
         0.78
         if ablated(
@@ -568,7 +571,9 @@ def select_phase1_action(
             temperature *= 0.70
         maximum = max(float(item.score) for item in rows)
         weights = [
-            math.exp((float(item.score) - maximum) / max(1e-6, temperature))
+            math.exp(
+                (float(item.score) - maximum) / max(1e-6, temperature)
+            )
             for item in rows
         ]
         total = sum(weights)
@@ -576,7 +581,11 @@ def select_phase1_action(
             selected = memory
         else:
             selected = rng.choices(list(rows), weights=weights, k=1)[0]
-        mode = "memory" if selected.action_id == memory.action_id else "stochastic"
+        mode = (
+            "memory"
+            if selected.action_id == memory.action_id
+            else "stochastic"
+        )
 
     if (
         strategy_enabled
