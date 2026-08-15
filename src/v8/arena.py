@@ -7,8 +7,8 @@ from typing import Iterator
 
 from v8.model import MemoryUid, u64
 
-_HEADER = Struct("<QQ")  # count, seqlock version
-_NODE = Struct("<QQQBHBQQQQqdddddddQQBB")
+_HEADER = Struct("<QQ")
+_NODE = Struct("<QQQBHBQQQQqdddddddQQdQQBB")
 _EDGE = Struct("<QQHQQqQ")
 _ACTION = Struct("<BQiqddQ")
 
@@ -35,7 +35,10 @@ class NodeRecord:
     explanatory_sum: float
     future_option_sum: float
     score_weight: float
-    updated_watermark: int
+    strategy_attempt_count: int = 0
+    strategy_success_count: int = 0
+    strategy_cost_sum: float = 0.0
+    updated_watermark: int = 0
     game_mask: int = 0
     cognitive_state: int = 0
     validation_state: int = 0
@@ -67,6 +70,14 @@ class NodeRecord:
     @property
     def game_evidence_count(self) -> int:
         return int(self.game_mask).bit_count()
+
+    @property
+    def strategy_reliability(self) -> float:
+        return 0.0 if self.strategy_attempt_count <= 0 else self.strategy_success_count / self.strategy_attempt_count
+
+    @property
+    def strategy_mean_cost(self) -> float:
+        return 1.0 if self.strategy_success_count <= 0 else self.strategy_cost_sum / self.strategy_success_count
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,11 +112,7 @@ class _SharedArena:
             raise ValueError("capacity must be positive")
         self.capacity = int(capacity)
         self._owner = bool(create)
-        self._shm = SharedMemory(
-            create=create,
-            size=_HEADER.size + self.capacity * self.record.size if create else 0,
-            name=name,
-        )
+        self._shm = SharedMemory(create=create, size=_HEADER.size + self.capacity * self.record.size if create else 0, name=name)
         if create:
             self._shm.buf[:] = b"\0" * len(self._shm.buf)
 
@@ -132,17 +139,15 @@ class _SharedArena:
 
     def begin_write(self) -> None:
         count, seq = _HEADER.unpack_from(self._shm.buf, 0)
-        seq = int(seq)
-        if seq & 1:
+        if int(seq) & 1:
             raise RuntimeError("arena write already active")
-        self._set_header(int(count), seq + 1)
+        self._set_header(int(count), int(seq) + 1)
 
     def end_write(self, *, count: int | None = None) -> None:
         current_count, seq = _HEADER.unpack_from(self._shm.buf, 0)
-        seq = int(seq)
-        if not seq & 1:
+        if not int(seq) & 1:
             raise RuntimeError("arena write not active")
-        self._set_header(int(current_count if count is None else count), seq + 1)
+        self._set_header(int(current_count if count is None else count), int(seq) + 1)
 
     def _offset(self, row: int) -> int:
         if row < 0 or row >= self.capacity:
@@ -200,78 +205,28 @@ class SharedNodeArena(_SharedArena):
             raise ValueError("node key has more than four hot-path parts")
         padded = parts + (0,) * (4 - len(parts))
         _NODE.pack_into(
-            self._shm.buf,
-            self._offset(row),
-            u64(value.uid.hi),
-            u64(value.uid.lo),
-            u64(value.fingerprint),
-            int(value.level),
-            int(value.memory_type),
-            len(parts),
-            *padded,
-            int(value.support_count),
-            float(value.significance_sum),
-            float(value.prediction_error_sum),
-            float(value.learning_value_sum),
-            float(value.transfer_prior_sum),
-            float(value.explanatory_sum),
-            float(value.future_option_sum),
-            float(value.score_weight),
-            u64(value.updated_watermark),
-            u64(value.game_mask),
-            int(value.cognitive_state) & 0xFF,
-            int(value.validation_state) & 0xFF,
+            self._shm.buf, self._offset(row), u64(value.uid.hi), u64(value.uid.lo), u64(value.fingerprint),
+            int(value.level), int(value.memory_type), len(parts), *padded, int(value.support_count),
+            float(value.significance_sum), float(value.prediction_error_sum), float(value.learning_value_sum),
+            float(value.transfer_prior_sum), float(value.explanatory_sum), float(value.future_option_sum),
+            float(value.score_weight), u64(value.strategy_attempt_count), u64(value.strategy_success_count),
+            float(value.strategy_cost_sum), u64(value.updated_watermark), u64(value.game_mask),
+            int(value.cognitive_state) & 0xFF, int(value.validation_state) & 0xFF,
         )
 
     def read(self, row: int) -> NodeRecord:
         values = _NODE.unpack_from(self._shm.buf, self._offset(row))
-        (
-            hi,
-            lo,
-            fingerprint,
-            level,
-            memory_type,
-            key_count,
-            k0,
-            k1,
-            k2,
-            k3,
-            support,
-            significance,
-            prediction_error,
-            learning_value,
-            transfer_prior,
-            explanatory,
-            future_option,
-            weight,
-            watermark,
-            game_mask,
-            cognitive_state,
-            validation_state,
-        ) = values
         return NodeRecord(
-            uid=MemoryUid(hi, lo),
-            fingerprint=int(fingerprint),
-            level=int(level),
-            memory_type=int(memory_type),
-            key_parts=tuple((k0, k1, k2, k3)[: int(key_count)]),
-            support_count=int(support),
-            significance_sum=float(significance),
-            prediction_error_sum=float(prediction_error),
-            learning_value_sum=float(learning_value),
-            transfer_prior_sum=float(transfer_prior),
-            explanatory_sum=float(explanatory),
-            future_option_sum=float(future_option),
-            score_weight=float(weight),
-            updated_watermark=int(watermark),
-            game_mask=int(game_mask),
-            cognitive_state=int(cognitive_state),
-            validation_state=int(validation_state),
+            uid=MemoryUid(values[0], values[1]), fingerprint=int(values[2]), level=int(values[3]), memory_type=int(values[4]),
+            key_parts=tuple(values[6:10][: int(values[5])]), support_count=int(values[10]), significance_sum=float(values[11]),
+            prediction_error_sum=float(values[12]), learning_value_sum=float(values[13]), transfer_prior_sum=float(values[14]),
+            explanatory_sum=float(values[15]), future_option_sum=float(values[16]), score_weight=float(values[17]),
+            strategy_attempt_count=int(values[18]), strategy_success_count=int(values[19]), strategy_cost_sum=float(values[20]),
+            updated_watermark=int(values[21]), game_mask=int(values[22]), cognitive_state=int(values[23]), validation_state=int(values[24]),
         )
 
     def records(self) -> Iterator[NodeRecord]:
-        count = self.count
-        for row in range(count):
+        for row in range(self.count):
             yield self.read(row)
 
 
@@ -280,29 +235,11 @@ class SharedEdgeArena(_SharedArena):
     kind = "edges"
 
     def write(self, row: int, value: EdgeRecord) -> None:
-        _EDGE.pack_into(
-            self._shm.buf,
-            self._offset(row),
-            u64(value.source_uid.hi),
-            u64(value.source_uid.lo),
-            int(value.relation_type),
-            u64(value.target_uid.hi),
-            u64(value.target_uid.lo),
-            int(value.support_count),
-            u64(value.updated_watermark),
-        )
+        _EDGE.pack_into(self._shm.buf, self._offset(row), u64(value.source_uid.hi), u64(value.source_uid.lo), int(value.relation_type), u64(value.target_uid.hi), u64(value.target_uid.lo), int(value.support_count), u64(value.updated_watermark))
 
     def read(self, row: int) -> EdgeRecord:
-        source_hi, source_lo, relation, target_hi, target_lo, support, watermark = _EDGE.unpack_from(
-            self._shm.buf, self._offset(row)
-        )
-        return EdgeRecord(
-            MemoryUid(source_hi, source_lo),
-            int(relation),
-            MemoryUid(target_hi, target_lo),
-            int(support),
-            int(watermark),
-        )
+        source_hi, source_lo, relation, target_hi, target_lo, support, watermark = _EDGE.unpack_from(self._shm.buf, self._offset(row))
+        return EdgeRecord(MemoryUid(source_hi, source_lo), int(relation), MemoryUid(target_hi, target_lo), int(support), int(watermark))
 
     def records(self) -> Iterator[EdgeRecord]:
         for row in range(self.count):
@@ -319,25 +256,11 @@ class SharedActionArena(_SharedArena):
             self._set_header(self.capacity, 0)
 
     def write(self, row: int, value: ActionRecord, *, occupied: bool = True) -> None:
-        _ACTION.pack_into(
-            self._shm.buf,
-            self._offset(row),
-            1 if occupied else 0,
-            u64(value.context_signature),
-            int(value.action_id),
-            int(value.support_count),
-            float(value.score_sum),
-            float(value.score_weight),
-            u64(value.updated_watermark),
-        )
+        _ACTION.pack_into(self._shm.buf, self._offset(row), 1 if occupied else 0, u64(value.context_signature), int(value.action_id), int(value.support_count), float(value.score_sum), float(value.score_weight), u64(value.updated_watermark))
 
     def read_slot(self, row: int) -> tuple[bool, ActionRecord]:
-        occupied, context, action, support, score_sum, weight, watermark = _ACTION.unpack_from(
-            self._shm.buf, self._offset(row)
-        )
-        return bool(occupied), ActionRecord(
-            int(context), int(action), int(support), float(score_sum), float(weight), int(watermark)
-        )
+        occupied, context, action, support, score_sum, weight, watermark = _ACTION.unpack_from(self._shm.buf, self._offset(row))
+        return bool(occupied), ActionRecord(int(context), int(action), int(support), float(score_sum), float(weight), int(watermark))
 
     def lookup(self, context_signature: int, action_id: int) -> ActionRecord | None:
         start = (u64(context_signature) ^ (int(action_id) * 0x9E3779B185EBCA87)) % self.capacity
