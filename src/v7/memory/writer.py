@@ -32,6 +32,12 @@ from v7.memory.models import (
     ScoreMutation,
 )
 from v7.memory.read_view import MemoryReadView
+from v7.memory.state import (
+    CognitiveState,
+    GateId,
+    GateValidationState,
+    gate_for_identity,
+)
 
 PreparedGeneration = tuple[GenerationState, MemoryReadView, GenerationDelta]
 
@@ -133,6 +139,13 @@ class CanonicalMemoryWriter:
                 mutation.status_flags
                 if mutation.status_flags is not None
                 else prior.status_flags,
+                mutation.cognitive_state
+                if mutation.cognitive_state is not None
+                else prior.cognitive_state,
+                mutation.validation_state
+                if mutation.validation_state is not None
+                else prior.validation_state,
+                mutation.gate_id if mutation.gate_id is not None else prior.gate_id,
             )
         generation = self._mutable_generation
         staged: dict[MemoryId, MemoryNode] = {}
@@ -148,10 +161,17 @@ class CanonicalMemoryWriter:
                     mutation.type_id,
                     generation,
                     generation,
-                    0
-                    if mutation.status_flags is None
-                    else mutation.status_flags,
+                    0 if mutation.status_flags is None else mutation.status_flags,
                     support_count,
+                    int(CognitiveState.ACTIVE)
+                    if mutation.cognitive_state is None
+                    else int(mutation.cognitive_state),
+                    int(GateValidationState.VALIDATED)
+                    if mutation.validation_state is None
+                    else int(mutation.validation_state),
+                    int(GateId.NONE)
+                    if mutation.gate_id is None
+                    else int(mutation.gate_id),
                 )
             else:
                 if (
@@ -171,6 +191,15 @@ class CanonicalMemoryWriter:
                     if mutation.status_flags is None
                     else mutation.status_flags,
                     support_count=support_count,
+                    cognitive_state=current.cognitive_state
+                    if mutation.cognitive_state is None
+                    else int(mutation.cognitive_state),
+                    validation_state=current.validation_state
+                    if mutation.validation_state is None
+                    else int(mutation.validation_state),
+                    gate_id=current.gate_id
+                    if mutation.gate_id is None
+                    else int(mutation.gate_id),
                 )
         for memory_id, node in staged.items():
             self._dependencies.register_node(memory_id, node.level)
@@ -229,12 +258,28 @@ class CanonicalMemoryWriter:
             group = grouped[key]
             memory_id = resolved[key]
             support_delta = sum(item.support_delta for item in group)
+            current = self._nodes.get(memory_id)
+            gate = gate_for_identity(key.level, key.type_id)
+            cognitive_state = None
+            validation_state = None
+            gate_id = None
+            if current is None and gate != GateId.NONE:
+                cognitive_state = int(CognitiveState.PROBE_ONLY)
+                validation_state = int(
+                    GateValidationState.PROBE_ELIGIBLE
+                    if support_delta >= 2
+                    else GateValidationState.STRUCTURAL_CANDIDATE
+                )
+                gate_id = int(gate)
             node_mutations.append(
                 NodeMutation(
                     memory_id,
                     key.level,
                     key.type_id,
                     support_delta=support_delta,
+                    cognitive_state=cognitive_state,
+                    validation_state=validation_state,
+                    gate_id=gate_id,
                 )
             )
             score_mutations.append(
@@ -443,7 +488,7 @@ class CanonicalMemoryWriter:
             nodes_dirty=bool(self._dirty_nodes),
             scores_dirty=bool(self._dirty_scores),
             adjacency_dirty=bool(self._dirty_edges),
-            cognition_dirty=self._cognition_dirty,
+            cognition_dirty=self._cognition_dirty or bool(self._dirty_nodes),
         )
         delta = GenerationDelta(
             nodes=tuple(
