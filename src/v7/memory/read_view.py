@@ -12,14 +12,56 @@ from v7.memory.indexes.cognition import ActionScoreInput, CognitionIndexes
 from v7.memory.indexes.mapped import MappedPackedCognitionIndexes
 from v7.memory.indexes.packed import PackedCognitionIndexes
 from v7.memory.models import MemoryNode, MemoryScore
+from v7.memory.state import GateValidationState
 from v7.memory.status import (
     ConceptValidationStatus,
     MemoryStatus,
     memory_is_active,
+    memory_is_probe_eligible,
 )
 
 EdgeKey = tuple[MemoryId, int]
 PackedCognitionView = PackedCognitionIndexes | MappedPackedCognitionIndexes
+
+
+def _filter_cognition(
+    cognition: CognitionIndexes,
+    nodes: Mapping[MemoryId, MemoryNode],
+) -> CognitionIndexes:
+    """Build the normal ACTIVE-only publication index.
+
+    The writer retains the complete canonical index in `cognition_indexes` for
+    restart and controlled probes. Normal packed cognition contains only ACTIVE
+    memories, so quarantine/demotion does not rely on per-action filtering.
+    """
+
+    def active_values(values):
+        return tuple(
+            memory_id
+            for memory_id in values
+            if memory_is_active(nodes.get(memory_id))
+        )
+
+    return CognitionIndexes.freeze(
+        contingency_by_context_action={
+            key: active_values(values)
+            for key, values in cognition.contingency_by_context_action.items()
+        },
+        role_by_context_action_family={
+            key: active_values(values)
+            for key, values in cognition.role_by_context_action_family.items()
+        },
+        role_by_context_action={
+            key: active_values(values)
+            for key, values in cognition.role_by_context_action.items()
+        },
+        concepts_by_role={
+            role_id: active_values(values)
+            for role_id, values in cognition.concepts_by_role.items()
+            if memory_is_active(nodes.get(role_id))
+        },
+        action_aggregates=cognition.action_aggregates,
+    )
 
 
 @dataclass(frozen=True, slots=True, weakref_slot=True)
@@ -60,6 +102,7 @@ class MemoryReadView:
         }
         frozen_adjacency = MappingProxyType(frozen_adjacency_dict)
         cognition = cognition_indexes or CognitionIndexes.empty()
+        active_cognition = _filter_cognition(cognition, frozen_nodes)
         arena = CompactMemoryArena.build_incremental(
             generation_id=generation_id,
             nodes=frozen_nodes,
@@ -73,7 +116,7 @@ class MemoryReadView:
         packed = (
             previous_view.packed_cognition
             if previous_view is not None and not cognition_dirty
-            else PackedCognitionIndexes.build(cognition)
+            else PackedCognitionIndexes.build(active_cognition)
         )
         return cls(
             generation_id,
@@ -104,7 +147,7 @@ class MemoryReadView:
             adjacency=adjacency,
             cognition_indexes=cognition_indexes,
             packed_cognition=packed_cognition
-            or PackedCognitionIndexes.build(cognition_indexes),
+            or PackedCognitionIndexes.build(_filter_cognition(cognition_indexes, nodes)),
             compact_arena=compact_arena,
         )
 
@@ -134,9 +177,21 @@ class MemoryReadView:
             for memory_id in memory_ids
         )
 
-    def _memory_priority(self, memory_id: MemoryId) -> tuple[float, int]:
+    def _available(self, node: MemoryNode | None, *, include_probe: bool) -> bool:
+        return (
+            memory_is_probe_eligible(node)
+            if include_probe
+            else memory_is_active(node)
+        )
+
+    def _memory_priority(
+        self,
+        memory_id: MemoryId,
+        *,
+        include_probe: bool = False,
+    ) -> tuple[float, int]:
         node = self.nodes.get(memory_id)
-        if not memory_is_active(node):
+        if not self._available(node, include_probe=include_probe):
             return (-1.0, -int(memory_id))
         assert node is not None
         score = self.scores.get(memory_id)
@@ -155,15 +210,16 @@ class MemoryReadView:
         flags = int(node.status_flags)
         if flags & int(MemoryStatus.PROMOTED):
             status += 0.10
+        validation = int(getattr(node, "validation_state", GateValidationState.VALIDATED))
+        if validation == int(GateValidationState.TRUSTED):
+            status += 0.25
+        elif validation == int(GateValidationState.VALIDATED):
+            status += 0.20
+        elif validation == int(GateValidationState.PROBE_ELIGIBLE):
+            status += 0.05
         if node.level == MemoryLevel.M4:
             if flags & int(ConceptValidationStatus.TRANSFER_REJECTED):
                 return (-1.0, -int(memory_id))
-            if flags & int(ConceptValidationStatus.TRUSTED):
-                status += 0.25
-            elif flags & int(ConceptValidationStatus.TRANSFER_VALIDATED):
-                status += 0.20
-            elif flags & int(ConceptValidationStatus.TRANSFER_CANDIDATE):
-                status += 0.10
         level_bonus = {
             MemoryLevel.M6: 0.06,
             MemoryLevel.M5: 0.04,
@@ -175,11 +231,12 @@ class MemoryReadView:
             -int(memory_id),
         )
 
-    def _rank_active(
+    def _rank_available(
         self,
         memory_ids,
         *,
         limit: int | None,
+        include_probe: bool,
     ) -> tuple[MemoryId, ...]:
         ranked: list[tuple[float, MemoryId]] = []
         seen: set[MemoryId] = set()
@@ -188,9 +245,13 @@ class MemoryReadView:
             if memory_id in seen:
                 continue
             seen.add(memory_id)
-            if not memory_is_active(self.nodes.get(memory_id)):
+            if not self._available(
+                self.nodes.get(memory_id), include_probe=include_probe
+            ):
                 continue
-            priority = self._memory_priority(memory_id)[0]
+            priority = self._memory_priority(
+                memory_id, include_probe=include_probe
+            )[0]
             if priority < 0.0:
                 continue
             ranked.append((priority, memory_id))
@@ -208,24 +269,67 @@ class MemoryReadView:
         family_ids_by_action: Mapping[int, MemoryId] | None = None,
         role_limit: int = 64,
         concept_limit: int = 128,
+        include_probe: bool = False,
     ) -> tuple[ActionScoreInput, ...]:
-        """Return active, relevance-ranked cognition candidates.
+        """Return relevance-ranked cognition candidates.
 
-        Packed indexes are identity ordered for compact storage. Candidate
-        truncation therefore happens only after active-state and semantic
-        ranking, so old low IDs and rejected concepts cannot monopolize the
-        acting frontier.
+        Normal reads use the publication-time ACTIVE-only packed index. Explicit
+        probe/replay reads use the complete immutable index and admit PROBE_ONLY
+        memories while still excluding QUARANTINED/RETIRED memories.
         """
         if role_limit < 0 or concept_limit < 0:
             raise ValueError("limits must be non-negative")
         families = family_ids_by_action or {}
-        packed = self.packed_cognition
         rows: list[ActionScoreInput] = []
+        if include_probe:
+            raw_rows = {
+                int(row.action_id): row
+                for row in self.cognition_indexes.score_inputs(
+                    context_signature=int(context_signature),
+                    action_ids=action_ids,
+                    family_ids_by_action=families,
+                    role_limit=2**31 - 1,
+                    concept_limit=2**31 - 1,
+                )
+            }
+            for raw_action_id in action_ids:
+                action_id = int(raw_action_id)
+                raw = raw_rows[action_id]
+                roles = self._rank_available(
+                    raw.role_ids,
+                    limit=role_limit,
+                    include_probe=True,
+                )
+                concept_candidates: set[MemoryId] = set()
+                for role_id in roles:
+                    concept_candidates.update(
+                        self.cognition_indexes.concepts_by_role.get(role_id, ())
+                    )
+                concepts = self._rank_available(
+                    concept_candidates,
+                    limit=concept_limit,
+                    include_probe=True,
+                )
+                rows.append(
+                    ActionScoreInput(
+                        action_id=action_id,
+                        contingency_ids=self._rank_available(
+                            raw.contingency_ids,
+                            limit=None,
+                            include_probe=True,
+                        ),
+                        aggregate=raw.aggregate,
+                        role_ids=roles,
+                        concept_ids=concepts,
+                    )
+                )
+            return tuple(rows)
+
+        packed = self.packed_cognition
         for raw_action_id in action_ids:
             action_id = int(raw_action_id)
-            contingencies = self._rank_active(
-                packed.contingencies.lookup(int(context_signature), action_id),
-                limit=None,
+            contingencies = packed.contingencies.lookup(
+                int(context_signature), action_id
             )
             family = families.get(action_id)
             role_candidates: tuple[MemoryId, ...] = ()
@@ -234,24 +338,28 @@ class MemoryReadView:
                     int(context_signature),
                     action_id,
                     family,
-                    2**31 - 1,
+                    role_limit,
                 )
             if not role_candidates:
                 role_candidates = packed.roles_fallback.lookup(
                     int(context_signature),
                     action_id,
-                    None,
+                    role_limit,
                 )
-            roles = self._rank_active(role_candidates, limit=role_limit)
-
+            roles = self._rank_available(
+                role_candidates,
+                limit=role_limit,
+                include_probe=False,
+            )
             concept_candidates: set[MemoryId] = set()
             for role_id in roles:
                 concept_candidates.update(
                     packed.concepts_by_role.lookup(int(role_id), 0, None)
                 )
-            concepts = self._rank_active(
+            concepts = self._rank_available(
                 concept_candidates,
                 limit=concept_limit,
+                include_probe=False,
             )
             rows.append(
                 ActionScoreInput(
@@ -263,3 +371,7 @@ class MemoryReadView:
                 )
             )
         return tuple(rows)
+
+    def probe_score_inputs(self, **kwargs) -> tuple[ActionScoreInput, ...]:
+        kwargs["include_probe"] = True
+        return self.score_inputs(**kwargs)
