@@ -31,16 +31,21 @@ def _local_policy_confidence(
     signature_count: int,
     context_rank: int,
     local_support: int,
+    failure_risk: float = 0.0,
+    contradiction_risk: float = 0.0,
 ) -> float:
-    """Cap shared-memory confidence until the current lane confirms it locally."""
+    """Cap shared-memory confidence until local evidence is both sufficient and safe."""
     value = _clamp01(confidence)
-    if int(signature_count) < 5 or int(local_support) >= 2:
-        return value
+    risk = _clamp01(max(float(failure_risk), float(contradiction_risk)))
+    locally_confirmed = int(local_support) >= 2 and risk < 0.50
+    if int(signature_count) < 5 or locally_confirmed:
+        return _clamp01(value * (1.0 - 0.35 * risk))
     specificity = _clamp01(int(context_rank) / 4.0)
     if int(local_support) <= 0:
         cap = 0.55 + 0.10 * specificity
     else:
         cap = 0.65 + 0.10 * specificity
+    cap = max(0.30, cap - 0.20 * risk)
     return min(value, cap)
 
 
@@ -48,15 +53,18 @@ def _is_transfer_frontier(
     contexts: DecisionContext,
     decision: object,
 ) -> bool:
-    """Return whether a decision is broad or not yet locally confirmed."""
+    """Return whether a decision is broad or not yet safely confirmed locally."""
     if len(contexts.signatures) < 5:
         return False
     support = getattr(decision, "support", None)
     context_rank = int(getattr(support, "context_rank", 0) or 0)
     local_support = int(getattr(support, "local_support", 0) or 0)
-    # The confidence cap considers two local observations sufficient. Strategy
-    # start must use the same threshold rather than becoming deterministic at 1.
-    return context_rank < 3 or local_support < 2
+    failure = _clamp01(float(getattr(decision, "failure_risk", 0.0) or 0.0))
+    contradiction = _clamp01(
+        float(getattr(decision, "contradiction_risk", 0.0) or 0.0)
+    )
+    locally_confirmed = local_support >= 2 and max(failure, contradiction) < 0.50
+    return context_rank < 3 or not locally_confirmed
 
 
 def _transfer_probe_strength(
@@ -251,16 +259,23 @@ class Phase1ActionScorer:
             support_confidence = 1.0 - math.exp(
                 -max(0, support + local_support) / 4.0
             )
-            semantic_confidence = max(
+            risk = _clamp01(
+                max(
+                    failure,
+                    float(row.contradiction_risk),
+                    signal.stall_risk,
+                )
+            )
+            positive_semantic = max(
                 _clamp01(reachability),
-                _clamp01(failure),
-                _clamp01(row.contradiction_risk),
                 _clamp01(signal.success_reachability),
                 _clamp01(row.prediction_confidence),
                 _clamp01(row.completion_likelihood),
             )
+            semantic_confidence = positive_semantic * (1.0 - 0.65 * risk)
             confidence = _clamp01(
-                0.65 * support_confidence + 0.35 * semantic_confidence
+                (0.60 * support_confidence + 0.40 * semantic_confidence)
+                * (1.0 - 0.35 * risk)
             )
 
             transfer_probe = _transfer_probe_strength(
@@ -511,6 +526,8 @@ def select_phase1_action(
         signature_count=len(contexts.signatures),
         context_rank=context_rank,
         local_support=local_support,
+        failure_risk=memory.failure_risk,
+        contradiction_risk=memory.contradiction_risk,
     )
     transfer_frontier = _is_transfer_frontier(contexts, memory)
     developmental_multiplier = (
@@ -519,7 +536,7 @@ def select_phase1_action(
             ablation_mask,
             CognitionAblation.DEVELOPMENTAL_POLICY,
         )
-        else float(profile.exploration_multiplier)
+        else max(0.75, float(profile.exploration_multiplier))
     )
     if transfer_frontier and not ablated(
         ablation_mask,
@@ -527,9 +544,15 @@ def select_phase1_action(
     ):
         developmental_multiplier = max(1.0, developmental_multiplier)
     base_epsilon = _clamp01(float(epsilon))
+    uncertainty_scale = max(0.35, 1.0 - confidence)
     effective_epsilon = _clamp01(
-        base_epsilon * developmental_multiplier * (1.0 - confidence) ** 2
+        base_epsilon * developmental_multiplier * uncertainty_scale
     )
+    if base_epsilon > 0.0:
+        effective_epsilon = max(
+            effective_epsilon,
+            min(base_epsilon, 0.02),
+        )
     if transfer_frontier and base_epsilon > 0.0:
         effective_epsilon = max(
             effective_epsilon,
@@ -544,9 +567,9 @@ def select_phase1_action(
         )
         else 0.82
         if profile.stage <= DevelopmentStage.CONTINGENCY
-        else 0.76
+        else 0.78
         if profile.stage <= DevelopmentStage.TRANSFER
-        else 0.68
+        else 0.76
     )
 
     if confidence >= high_confidence_threshold:
@@ -559,7 +582,7 @@ def select_phase1_action(
         selected = exploration
         mode = "exploration"
     else:
-        temperature = 0.08 + 0.32 * (1.0 - confidence)
+        temperature = 0.12 + 0.30 * (1.0 - confidence)
         if (
             profile.stage >= DevelopmentStage.PLANNING
             and not ablated(
@@ -568,7 +591,7 @@ def select_phase1_action(
             )
             and not transfer_frontier
         ):
-            temperature *= 0.70
+            temperature *= 0.90
         maximum = max(float(item.score) for item in rows)
         weights = [
             math.exp(
