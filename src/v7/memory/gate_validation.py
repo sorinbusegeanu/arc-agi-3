@@ -32,10 +32,13 @@ DEFAULT_GATE_POLICIES: Mapping[GateId, GatePolicy] = {
     GateId.G01: GatePolicy(2, 2, 1, 0.05, 4, 4, 2, 0.10),
     GateId.G12: GatePolicy(2, 2, 2, 0.05, 4, 4, 3, 0.10),
     GateId.G23C: GatePolicy(2, 2, 2, 0.05, 4, 4, 3, 0.10),
-    GateId.G23R: GatePolicy(2, 2, 2, 0.05, 4, 4, 3, 0.10),
-    GateId.G34: GatePolicy(3, 2, 1, 0.05, 4, 4, 2, 0.10),
-    GateId.G45: GatePolicy(3, 3, 1, 0.05, 5, 5, 2, 0.10),
-    GateId.G56: GatePolicy(3, 3, 2, 0.08, 5, 5, 3, 0.12),
+    # Decision-level probes contribute at most their bounded prospective score
+    # component. Thresholds must therefore be reachable while remaining above
+    # numerical noise. The evidence itself is outcome-conditioned in runtime.py.
+    GateId.G23R: GatePolicy(2, 2, 2, 0.02, 4, 4, 3, 0.04),
+    GateId.G34: GatePolicy(3, 2, 1, 0.02, 4, 4, 2, 0.04),
+    GateId.G45: GatePolicy(3, 3, 1, 0.025, 5, 5, 2, 0.05),
+    GateId.G56: GatePolicy(3, 3, 2, 0.03, 5, 5, 3, 0.06),
 }
 
 
@@ -145,7 +148,11 @@ class EmpiricalGateValidator:
                 and summary.trials >= policy.minimum_trials
                 and summary.independent_targets >= policy.minimum_targets
             )
-            validated = tested and summary.mean_causal_gain >= policy.minimum_causal_gain
+            validated = (
+                tested
+                and summary.successes > 0
+                and summary.mean_causal_gain >= policy.minimum_causal_gain
+            )
             trusted = (
                 validated
                 and support >= policy.trusted_support

@@ -536,9 +536,6 @@ class ContextualActionScorer:
             improves_prediction = (
                 candidate.confidence >= selected.confidence + 0.10
             )
-            # Prefer a more specific context once it has minimum evidence and
-            # comparable predictive quality. C0 naturally has much larger
-            # support, so requiring 2x C0 support made specialization impossible.
             specificity_supported = (
                 candidate.support >= self.minimum_context_support
                 and candidate.confidence + 0.05 >= selected.confidence
@@ -579,7 +576,6 @@ class ContextualActionScorer:
             depth=profile.planning_depth,
         )
         exploration = overlay.exploration_score(contexts.signatures, action_id)
-        global_prior = self._global_prior(view, action_id)
 
         prediction = max(m1_confidence, local_confidence)
         future = max(m1_future, local_future, reachability)
@@ -597,7 +593,6 @@ class ContextualActionScorer:
             + 0.10 * world_strength
             + 0.12 * strategy_strength
             + 0.08 * exploration
-            + 0.04 * global_prior
             - 0.24 * failure
             - 0.10 * contradiction
             - 0.08 * no_change
@@ -754,23 +749,15 @@ class ContextualActionScorer:
 
     @staticmethod
     def _global_prior(view: MemoryReadView, action_id: int) -> float:
-        aggregate = view.packed_cognition.action_aggregates.get(int(action_id))
-        evidence = max(
-            1,
-            int(aggregate.future_option_count),
-            int(aggregate.positive_count + aggregate.negative_count),
-        )
-        completion = aggregate.positive_count / max(
-            1,
-            aggregate.positive_count + aggregate.negative_count,
-        )
-        failure = aggregate.failure_count / evidence
-        future = _signed_unit(aggregate.future_option_mean)
-        return _clamp01(
-            0.45 * completion
-            + 0.35 * max(0.0, future)
-            + 0.20 * (1.0 - failure)
-        )
+        """Return a neutral prior until active-only aggregates are available.
+
+        The persisted action aggregates are lifetime episode statistics and
+        cannot be decomposed after individual memories are quarantined or
+        retired. Using them in cognition would let forgotten evidence continue
+        steering behavior, so they remain reporting-only.
+        """
+        del view, action_id
+        return 0.0
 
 
 def choose_contextual_action(
