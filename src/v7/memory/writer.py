@@ -45,9 +45,15 @@ PreparedGeneration = tuple[GenerationState, MemoryReadView, GenerationDelta]
 class CanonicalMemoryWriter:
     """Single-owner mutable frontier for v7 active semantic memory."""
 
-    def __init__(self, *, initial_generation: int = 0) -> None:
+    def __init__(
+        self,
+        *,
+        initial_generation: int = 0,
+        gate_candidates: bool = False,
+    ) -> None:
         if initial_generation < 0:
             raise ValueError("initial_generation must be non-negative")
+        self.gate_candidates = bool(gate_candidates)
         self._published_generation = GenerationId(initial_generation)
         self._mutable_generation = GenerationId(initial_generation + 1)
         self._nodes: dict[MemoryId, MemoryNode] = {}
@@ -263,7 +269,7 @@ class CanonicalMemoryWriter:
             cognitive_state = None
             validation_state = None
             gate_id = None
-            if current is None and gate != GateId.NONE:
+            if self.gate_candidates and current is None and gate != GateId.NONE:
                 cognitive_state = int(CognitiveState.PROBE_ONLY)
                 validation_state = int(
                     GateValidationState.PROBE_ELIGIBLE
