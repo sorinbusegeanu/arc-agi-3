@@ -16,14 +16,14 @@ class FutureOptionEvidence:
 
 
 class FutureOptionEstimator:
-    """Bounded learned reachability over the discovered M1 context-transition graph."""
+    """Bounded learned reachability with local dirty-cache invalidation."""
 
     def __init__(self, *, horizon: int = 3) -> None:
         if horizon <= 0:
             raise ValueError("horizon must be positive")
         self.horizon = int(horizon)
-        self._cache: dict[tuple[int, int], int] = {}
-        self._graph_version = -1
+        self._cache: dict[int, int] = {}
+        self._adjacency: dict[int, tuple[int, ...]] = {}
 
     @staticmethod
     def _graph(rows: tuple[NodeRecord, ...]) -> dict[int, set[int]]:
@@ -37,9 +37,36 @@ class FutureOptionEstimator:
                 graph[before].add(after)
         return graph
 
-    def _reach(self, graph: dict[int, set[int]], start: int, version: int) -> int:
-        cache_key = (int(start), int(version))
-        cached = self._cache.get(cache_key)
+    def _invalidate_changed_neighborhood(self, graph: dict[int, set[int]]) -> None:
+        current = {node: tuple(sorted(targets)) for node, targets in graph.items()}
+        changed = {
+            node
+            for node in set(current) | set(self._adjacency)
+            if current.get(node, ()) != self._adjacency.get(node, ())
+        }
+        if not changed:
+            return
+        reverse: dict[int, set[int]] = defaultdict(set)
+        for source, targets in graph.items():
+            for target in targets:
+                reverse[target].add(source)
+        affected = set(changed)
+        frontier = deque((node, 0) for node in changed)
+        while frontier:
+            node, depth = frontier.popleft()
+            if depth >= self.horizon:
+                continue
+            for parent in reverse.get(node, ()):
+                if parent in affected:
+                    continue
+                affected.add(parent)
+                frontier.append((parent, depth + 1))
+        for node in affected:
+            self._cache.pop(node, None)
+        self._adjacency = current
+
+    def _reach(self, graph: dict[int, set[int]], start: int) -> int:
+        cached = self._cache.get(int(start))
         if cached is not None:
             return cached
         visited = {int(start)}
@@ -54,16 +81,13 @@ class FutureOptionEstimator:
                 visited.add(nxt)
                 frontier.append((nxt, depth + 1))
         value = max(0, len(visited) - 1)
-        self._cache[cache_key] = value
+        self._cache[int(start)] = value
         return value
 
     def evaluate(self, rows: tuple[NodeRecord, ...]) -> tuple[FutureOptionEvidence, ...]:
         m1 = tuple(row for row in rows if int(row.level) == int(MemoryLevel.M1))
-        version = max((int(row.updated_watermark) for row in m1), default=0)
-        if version != self._graph_version:
-            self._cache.clear()
-            self._graph_version = version
         graph = self._graph(m1)
+        self._invalidate_changed_neighborhood(graph)
         result: list[FutureOptionEvidence] = []
         for row in m1:
             if len(row.key_parts) < 4:
@@ -72,7 +96,14 @@ class FutureOptionEstimator:
             after = int(row.key_parts[3])
             if after == 0:
                 continue
-            before_reach = self._reach(graph, before, version)
-            after_reach = self._reach(graph, after, version)
-            result.append(FutureOptionEvidence(row.uid, before_reach, after_reach, after_reach - before_reach))
+            before_reach = self._reach(graph, before)
+            after_reach = self._reach(graph, after)
+            result.append(
+                FutureOptionEvidence(
+                    row.uid,
+                    before_reach,
+                    after_reach,
+                    after_reach - before_reach,
+                )
+            )
         return tuple(result)
