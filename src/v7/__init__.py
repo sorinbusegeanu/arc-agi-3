@@ -5,9 +5,11 @@ from v7.memory.writer import CanonicalMemoryWriter
 from v7.runtime import V7Runtime, V7RuntimeConfig
 from v7.developmental_v707 import install_v707_extensions
 from v7.developmental_v707_hardening import harden_v707_extensions
+from v7.developmental_v707_compat import install_v707_compatibility
 
 install_v707_extensions()
 harden_v707_extensions()
+install_v707_compatibility()
 
 __all__ = [
     "CanonicalMemoryWriter",
