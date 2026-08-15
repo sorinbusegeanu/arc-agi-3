@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 from hashlib import blake2b
 from typing import Iterable
@@ -157,15 +158,18 @@ class LiveReadView:
         return {outcome: count / total for outcome, count in counts.items()}
 
     @staticmethod
-    def _stable_records(arena, *, retries: int = 16):
-        for _ in range(max(1, int(retries))):
+    def _stable_records(arena, *, timeout: float = 1.0):
+        deadline = time.monotonic() + max(0.01, float(timeout))
+        while time.monotonic() < deadline:
             before = arena.sequence
             if before & 1:
+                time.sleep(0.0005)
                 continue
             rows = tuple(arena.records())
             after = arena.sequence
             if before == after and not (after & 1):
                 return rows
+            time.sleep(0)
         raise RuntimeError(f"could not obtain coherent live {arena.kind} records")
 
     def node_records(self, *, level: MemoryLevel | int | None = None) -> tuple[NodeRecord, ...]:
@@ -247,9 +251,11 @@ class LiveReadView:
         return False
 
     def _refresh_strategy_cache(self) -> None:
-        for _ in range(8):
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
             version_before = tuple(arena.sequence for arena in (*self._nodes, *self._edges))
             if any(value & 1 for value in version_before):
+                time.sleep(0.0005)
                 continue
             if version_before == self._strategy_version:
                 return
@@ -259,6 +265,7 @@ class LiveReadView:
             if version_before == version_after and not any(value & 1 for value in version_after):
                 version = version_after
                 break
+            time.sleep(0)
         else:
             raise RuntimeError("could not obtain coherent node/edge publication cut")
 
@@ -330,8 +337,6 @@ class LiveReadView:
                 reliability = min(0.55, max(0, int(row.support_count)) / 10.0)
                 mean_cost = 1.0
             probationary = int(row.cognitive_state) not in active_states
-            self._parents = parents
-            self._node_by_uid = node_by_uid
             transferable = self._has_transferable_ancestor(row.uid)
             strategy = _StrategyRow(
                 action,
