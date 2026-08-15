@@ -3,8 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable
 import os
+import time
 
 import numpy as np
+
+
+_GAME_WAIT_ENV = "ARC_AGI3_GAME_WAIT_SECONDS"
 
 
 class ArcGridEnvironment:
@@ -33,6 +37,8 @@ class ArcGridEnvironment:
             render_mode=render_mode,
         )
         self.auto_reset_on_empty_frame = bool(auto_reset_on_empty_frame)
+        self.game_wait_seconds = _game_wait_seconds()
+        self._terminal_wait_armed = True
         self.reset_count = 0
         self.skipped_terminal_steps = 0
         self.last_step_was_reset_boundary = False
@@ -49,6 +55,7 @@ class ArcGridEnvironment:
 
     def reset(self) -> np.ndarray:
         self._last_raw = self.env.reset()
+        self._terminal_wait_armed = True
         self.reset_count += 1
         self.last_step_was_reset_boundary = True
         self.last_terminal_state = "explicit_reset"
@@ -76,8 +83,10 @@ class ArcGridEnvironment:
             self.level_completed_event = levels > previous_levels
             self.last_outcome_polarity = _polarity(self.last_outcome_state, self.level_completed_event)
             self.last_terminal_state = self.last_outcome_state if self.last_outcome_state in {"WIN", "GAME_OVER"} else None
+            self._wait_after_terminal_game()
             self._last_raw = self.env.reset()
             self._last_grid = _grid_from_raw(self._last_raw)
+            self._terminal_wait_armed = True
             self.reset_count += 1
             self.skipped_terminal_steps += 1
             self.last_step_was_reset_boundary = True
@@ -89,6 +98,7 @@ class ArcGridEnvironment:
         self.level_completed_event = levels > previous_levels
         self.last_outcome_polarity = _polarity(state, self.level_completed_event)
         self.last_terminal_state = state if state in {"WIN", "GAME_OVER"} else None
+        self._wait_after_terminal_game()
         return grid.copy()
 
     def available_actions(self) -> list[int]:
@@ -97,6 +107,13 @@ class ArcGridEnvironment:
             return [int(action) for action in actions]
         method = getattr(self.env, "available_actions", None)
         return [] if method is None else [int(action) for action in method()]
+
+    def _wait_after_terminal_game(self) -> None:
+        if self.last_terminal_state not in {"WIN", "GAME_OVER"} or not self._terminal_wait_armed:
+            return
+        self._terminal_wait_armed = False
+        if self.game_wait_seconds > 0:
+            time.sleep(self.game_wait_seconds)
 
     def _update_from_raw(self, raw: Any, *, reset_boundary: bool) -> None:
         self._last_grid = _grid_from_raw(raw)
@@ -141,6 +158,17 @@ def _candidate_environment_roots(env_root: str | None) -> tuple[Path, ...]:
             seen.add(path)
             result.append(path)
     return tuple(result)
+
+
+def _game_wait_seconds() -> float:
+    raw = os.environ.get(_GAME_WAIT_ENV)
+    if raw is None or not raw.strip():
+        return 0.0
+    try:
+        value = float(raw)
+    except ValueError:
+        return 0.0
+    return max(0.0, value)
 
 
 def _grid_from_raw(raw: Any) -> np.ndarray:
