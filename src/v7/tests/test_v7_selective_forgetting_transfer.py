@@ -39,7 +39,7 @@ def test_gate_mapping_covers_reusable_hierarchy() -> None:
 
 
 def test_new_canonical_candidate_is_probe_only_until_gate_validation() -> None:
-    writer = CanonicalMemoryWriter()
+    writer = CanonicalMemoryWriter(gate_candidates=True)
     role_id = MemoryId(100)
     writer.apply_mutation_batch(
         (NodeMutation(role_id, MemoryLevel.M3, 300, support_delta=4),)
