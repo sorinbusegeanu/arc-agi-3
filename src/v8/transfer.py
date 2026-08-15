@@ -51,6 +51,14 @@ class TransferValidator:
         if not eligible:
             return ()
 
+        # Preserve the existing peer call shape while switching the evidence source
+        # from node recurrence/priors to canonical scored SIMILAR_TO relations.
+        if not edges and provenance is not None:
+            owner = getattr(provenance, "__self__", None)
+            edge_records = getattr(owner, "edge_records", None)
+            if callable(edge_records):
+                edges = tuple(edge_records())
+
         def games(uid: MemoryUid) -> tuple[int, ...]:
             row = eligible.get(uid)
             if row is None:
