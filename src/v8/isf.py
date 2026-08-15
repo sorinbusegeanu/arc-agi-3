@@ -8,7 +8,7 @@ from v8.model import MemoryLevel
 
 @dataclass(frozen=True, slots=True)
 class ISFScore:
-    survival_impact: float
+    option_structure_impact: float
     prediction_error: float
     learning_value: float
     transfer_potential: float
@@ -34,19 +34,40 @@ def _clip(value: float) -> float:
 
 
 def score_memory(row: NodeRecord) -> ISFScore:
-    """Stage-dependent normalized importance/significance/fitness score.
+    """Stage-dependent normalized interaction significance / memory fitness input.
 
-    All components are causally available statistics already stored on the memory.
-    Strategy success can strengthen survival impact, while transfer and explanatory
-    evidence matter progressively more at higher developmental levels.
+    The first component is option-structure impact, not survival or terminal utility.
+    It is estimated from causally available structural significance and, for mature
+    strategy memories, observed reliability. Transfer and explanatory evidence gain
+    weight progressively at higher developmental memory levels.
     """
-    survival = _clip(max(row.significance, row.strategy_reliability))
+    option_impact = _clip(max(row.significance, row.strategy_reliability))
     prediction = _clip(row.prediction_error)
     learning = _clip(row.learning_value)
     transfer = _clip(row.transfer_prior)
     explanatory = _clip(row.explanatory_reach / 4.0)
     future = _clip(abs(row.future_option_delta) / 4.0)
-    weights = _STAGE_WEIGHTS.get(int(row.level), _STAGE_WEIGHTS[int(MemoryLevel.M4)])
-    components = (survival, prediction, learning, transfer, explanatory, future)
-    total = sum(weight * component for weight, component in zip(weights, components, strict=True))
-    return ISFScore(survival, prediction, learning, transfer, explanatory, future, float(total))
+    weights = _STAGE_WEIGHTS.get(
+        int(row.level), _STAGE_WEIGHTS[int(MemoryLevel.M4)]
+    )
+    components = (
+        option_impact,
+        prediction,
+        learning,
+        transfer,
+        explanatory,
+        future,
+    )
+    total = sum(
+        weight * component
+        for weight, component in zip(weights, components, strict=True)
+    )
+    return ISFScore(
+        option_impact,
+        prediction,
+        learning,
+        transfer,
+        explanatory,
+        future,
+        float(total),
+    )
