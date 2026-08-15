@@ -135,14 +135,46 @@ class LiveReadView:
     def edge_records(self) -> tuple[EdgeRecord, ...]:
         return tuple(record for arena in self._edges for record in arena.records())
 
-    def source_games(self, uid: MemoryUid) -> frozenset[int]:
-        return frozenset(
-            int(edge.target_uid.lo)
-            for edge in self.edge_records()
-            if edge.source_uid == uid
-            and int(edge.relation_type) == int(RelationType.GAME_PROVENANCE)
-            and int(edge.target_uid.hi) == 0
-        )
+    def source_games(self, uid: MemoryUid, *, max_depth: int = 8) -> frozenset[int]:
+        """Return exact formation provenance, inherited through graph ancestry.
+
+        Base memories have direct GAME_PROVENANCE edges. Peer-created abstractions may
+        not have been emitted by one raw game event, so their exact formation games are
+        the union of their explanatory/context/merge parents' game provenance.
+        """
+        edges = self.edge_records()
+        direct: dict[MemoryUid, set[int]] = {}
+        parents: dict[MemoryUid, set[MemoryUid]] = {}
+        lineage_relations = {
+            int(RelationType.PROVENANCE),
+            int(RelationType.EXPLAINS),
+            int(RelationType.CONTEXT_REFINES),
+            int(RelationType.TRANSFER_CORRESPONDENCE),
+            int(RelationType.SUPERSEDES),
+            int(RelationType.LEADS_TO),
+        }
+        for edge in edges:
+            relation = int(edge.relation_type)
+            if relation == int(RelationType.GAME_PROVENANCE) and int(edge.target_uid.hi) == 0:
+                direct.setdefault(edge.source_uid, set()).add(int(edge.target_uid.lo))
+            elif relation in lineage_relations:
+                parents.setdefault(edge.source_uid, set()).add(edge.target_uid)
+
+        games = set(direct.get(uid, ()))
+        frontier = {uid}
+        visited = {uid}
+        for _depth in range(max(0, int(max_depth))):
+            following: set[MemoryUid] = set()
+            for current in frontier:
+                for parent in parents.get(current, ()):
+                    games.update(direct.get(parent, ()))
+                    if parent not in visited:
+                        visited.add(parent)
+                        following.add(parent)
+            if not following:
+                break
+            frontier = following
+        return frozenset(games)
 
     def level_counts(self) -> dict[int, int]:
         result = {int(level): 0 for level in MemoryLevel}
