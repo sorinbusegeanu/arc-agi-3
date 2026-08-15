@@ -9,7 +9,6 @@ from pathlib import Path
 from v8.actor import ActorJob, run_actor_jobs
 from v8.capacity import plan_capacities
 from v8.diagnostics import format_game_rate_line, format_hypothesis_line
-from v8.hypotheses import evaluate_live_hypothesis_statuses
 from v8.runtime import ContinuousMemoryRuntime, V8RuntimeConfig
 from v8.snapshot import latest_complete_snapshot
 
@@ -36,6 +35,8 @@ def _runtime_config(args, *, total_steps: int = 0) -> V8RuntimeConfig:
         snapshot_interval_seconds=args.snapshot_interval_seconds,
         enable_snapshots=not args.no_snapshots,
         restore=not args.no_restore,
+        enable_peers=not args.no_peers,
+        peer_interval_seconds=args.peer_interval_seconds,
     )
 
 
@@ -45,27 +46,14 @@ def _add_runtime_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--stage-workers", type=int, default=2)
     parser.add_argument("--stage-ring-capacity", type=int, default=8192)
     parser.add_argument("--shard-ring-capacity", type=int, default=8192)
-    parser.add_argument(
-        "--node-capacity-per-shard",
-        type=int,
-        default=None,
-        help="Manual node arena capacity. Default: auto-size from total requested steps.",
-    )
-    parser.add_argument(
-        "--edge-capacity-per-shard",
-        type=int,
-        default=None,
-        help="Manual edge arena capacity. Default: auto-size from total requested steps.",
-    )
-    parser.add_argument(
-        "--action-capacity-per-shard",
-        type=int,
-        default=None,
-        help="Manual action-index capacity. Default: auto-size from total requested steps.",
-    )
+    parser.add_argument("--node-capacity-per-shard", type=int, default=None)
+    parser.add_argument("--edge-capacity-per-shard", type=int, default=None)
+    parser.add_argument("--action-capacity-per-shard", type=int, default=None)
     parser.add_argument("--snapshot-interval-seconds", type=float, default=60.0)
+    parser.add_argument("--peer-interval-seconds", type=float, default=0.5)
     parser.add_argument("--no-restore", action="store_true")
     parser.add_argument("--no-snapshots", action="store_true")
+    parser.add_argument("--no-peers", action="store_true")
 
 
 def _actor_jobs(
@@ -84,8 +72,7 @@ def _actor_jobs(
     lanes = max(len(games), int(actors))
     base, extra = divmod(lanes, len(games))
     for game_index, game_id in enumerate(games):
-        lane_count = base + int(game_index < extra)
-        lane_count = max(1, lane_count)
+        lane_count = max(1, base + int(game_index < extra))
         base_steps, extra_steps = divmod(int(steps_per_game), lane_count)
         for lane in range(lane_count):
             steps = base_steps + int(lane < extra_steps)
@@ -109,12 +96,7 @@ def _log(message: str) -> None:
     print(f'[{time.strftime("%H:%M")}] {message}', flush=True)
 
 
-def _graph_load_line(
-    *,
-    snapshot_path: Path | None,
-    restore_enabled: bool,
-    nodes: int,
-) -> str:
+def _graph_load_line(*, snapshot_path: Path | None, restore_enabled: bool, nodes: int) -> str:
     if not restore_enabled:
         source = "empty(--no-restore)"
     elif snapshot_path is None:
@@ -144,23 +126,18 @@ def run_continuous(args) -> int:
 
     def report_progress(rows) -> None:
         _log(format_game_rate_line(rows))
-        _log(format_hypothesis_line(evaluate_live_hypothesis_statuses(runtime.read_view)))
+        _log(format_hypothesis_line(runtime.scientific_statuses()))
 
     try:
         runtime.start()
         print(
             f"v8 continuous: games={len(games)} actors={len(jobs)} shards={args.shards} "
-            f"stage_workers={args.stage_workers} snapshots={'off' if args.no_snapshots else 'async'}",
+            f"stage_workers={args.stage_workers} peers={'off' if args.no_peers else 'on'} "
+            f"snapshots={'off' if args.no_snapshots else 'async'}",
             flush=True,
         )
-        _log(
-            _graph_load_line(
-                snapshot_path=restore_source,
-                restore_enabled=restore_enabled,
-                nodes=loaded_nodes,
-            )
-        )
-        _log(format_hypothesis_line(evaluate_live_hypothesis_statuses(runtime.read_view)))
+        _log(_graph_load_line(snapshot_path=restore_source, restore_enabled=restore_enabled, nodes=loaded_nodes))
+        _log(format_hypothesis_line(runtime.scientific_statuses()))
         results = run_actor_jobs(
             runtime,
             jobs,
@@ -168,12 +145,15 @@ def run_continuous(args) -> int:
             progress_interval_seconds=args.progress_interval_seconds,
             progress_callback=report_progress,
         )
+        runtime.record_actor_results(results)
         runtime.wait_quiescent(timeout=args.drain_timeout)
         metrics = runtime.metrics()
+        hypothesis_statuses = runtime.scientific_statuses()
         final = runtime.close(normal=True, timeout=args.final_save_timeout)
         summary = {
             "games": list(games),
             "actors": [asdict(result) for result in results],
+            "hypotheses": hypothesis_statuses,
             "metrics": metrics,
             "final_snapshot": None if final is None else asdict(final),
         }
@@ -193,13 +173,14 @@ def run_smoke(args) -> int:
     try:
         runtime.start()
         for index in range(args.events):
+            context = 10 + index % 3
             runtime.submit(
                 runtime.make_experience(
                     producer_id=1,
                     producer_sequence=index + 1,
-                    source_game_hash=1,
+                    source_game_hash=1 + index % 2,
                     global_step=index,
-                    context_signature=10 + index % 3,
+                    context_signature=context,
                     action_id=index % 4,
                     outcome_signature=100 + index % 5,
                     family_signature=200 + index % 3,
@@ -207,13 +188,13 @@ def run_smoke(args) -> int:
                     future_option_delta=float((index % 3) - 1),
                     changed_cells=1 + index % 12,
                     trajectory_signature=400 + index % 9,
+                    next_context_signature=10 + (index + 1) % 3,
                 )
             )
         runtime.wait_quiescent(timeout=args.drain_timeout)
         metrics = runtime.metrics()
         print(
-            f"v8 smoke done events={args.events} memories={metrics['memories']} "
-            f"edges={metrics['edges']}",
+            f"v8 smoke done events={args.events} memories={metrics['memories']} edges={metrics['edges']}",
             flush=True,
         )
         runtime.close(normal=True, timeout=args.final_save_timeout)
