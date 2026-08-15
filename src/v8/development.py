@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import math
 import multiprocessing as mp
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, replace
 
+from v8.dirty import DirtyKeyTracker
 from v8.model import (
     CognitiveState,
     MemoryLevel,
@@ -61,14 +63,10 @@ def _key_for(level: MemoryLevel, event: PipelineEvent) -> tuple[int, ...]:
     future_bucket = _bucket(e.future_option_delta)
     changed_bucket = _changed_bucket(e.changed_cells)
     if level == MemoryLevel.M0:
-        return (int(e.event_id.hi), int(e.event_id.lo))
+        # source_game_hash is retained exactly for scientific provenance reconstruction.
+        return (int(e.event_id.hi), int(e.event_id.lo), int(e.source_game_hash))
     if level == MemoryLevel.M1:
-        return (
-            int(e.context_signature),
-            int(e.action_id),
-            int(e.outcome_signature),
-            int(e.next_context_signature),
-        )
+        return (int(e.context_signature), int(e.action_id), int(e.outcome_signature), int(e.next_context_signature))
     if level == MemoryLevel.M2:
         return (int(e.family_signature),)
     if level == MemoryLevel.M3:
@@ -78,28 +76,14 @@ def _key_for(level: MemoryLevel, event: PipelineEvent) -> tuple[int, ...]:
     if level == MemoryLevel.M5:
         if event.parent_uid.is_zero:
             raise ValueError("M5 consequence requires M4 parent")
-        return (
-            int(event.parent_uid.hi),
-            int(event.parent_uid.lo),
-            int(e.outcome_signature),
-            int(future_bucket),
-        )
+        return (int(event.parent_uid.hi), int(event.parent_uid.lo), int(e.outcome_signature), int(future_bucket))
     if level == MemoryLevel.M6:
-        # Outcome identity is consequence-oriented rather than trajectory-oriented.
-        # Distinct endpoint signatures with the same coarse consequence descriptor
-        # intentionally converge here; the background outcome estimator can later
-        # split/merge classes as richer evidence becomes available.
         return (int(future_bucket), int(changed_bucket))
     if level == MemoryLevel.M7:
         if event.parent_uid.is_zero:
             raise ValueError("M7 strategy requires M6 outcome parent")
         context_bucket = stable_u64(e.context_signature, person=b"v8-context")
-        return (
-            int(e.action_id),
-            int(event.parent_uid.hi),
-            int(event.parent_uid.lo),
-            int(context_bucket),
-        )
+        return (int(e.action_id), int(event.parent_uid.hi), int(event.parent_uid.lo), int(context_bucket))
     raise ValueError(level)
 
 
@@ -108,13 +92,14 @@ def derive_proposal(level: MemoryLevel, event: PipelineEvent) -> MemoryProposal:
     key = _key_for(level, event)
     uid = MemoryUid.from_key(level, definition.memory_type, key)
     e = event.experience
-
     structural_change = min(1.0, max(0, int(e.changed_cells)) / 32.0)
     option_magnitude = math.tanh(abs(float(e.future_option_delta)))
-    significance = 0.55 * structural_change + 0.45 * option_magnitude
+    # Early hot-path significance is only causally available OE0/structural evidence.
+    # Full stage-dependent ISF is computed by the background significance service.
+    significance = 0.5 * structural_change + 0.5 * option_magnitude
     learning_value = structural_change
-
     relation = RelationType.LEADS_TO if level == MemoryLevel.M7 else RelationType.EXPLAINS
+    weight = float(event.support_delta)
     return MemoryProposal(
         uid=uid,
         fingerprint=proposal_fingerprint(level, definition.memory_type, key),
@@ -123,14 +108,14 @@ def derive_proposal(level: MemoryLevel, event: PipelineEvent) -> MemoryProposal:
         level=level,
         memory_type=definition.memory_type,
         key_parts=key,
-        support_delta=1,
-        significance_sum=significance,
+        support_delta=int(event.support_delta),
+        significance_sum=significance * weight,
         prediction_error_sum=0.0,
-        learning_value_sum=learning_value,
+        learning_value_sum=learning_value * weight,
         transfer_prior_sum=0.0,
         explanatory_sum=0.0,
-        future_option_sum=float(e.future_option_delta),
-        score_weight=1.0,
+        future_option_sum=float(e.future_option_delta) * weight,
+        score_weight=weight,
         parent_uid=event.parent_uid,
         relation_type=relation,
         source_game_hash=int(e.source_game_hash),
@@ -138,13 +123,7 @@ def derive_proposal(level: MemoryLevel, event: PipelineEvent) -> MemoryProposal:
     )
 
 
-def _put_with_backpressure(
-    ring: SharedRingBuffer,
-    payload: bytes,
-    stop_event: mp.synchronize.Event,
-    *,
-    retry_seconds: float = 0.05,
-) -> bool:
+def _put_with_backpressure(ring: SharedRingBuffer, payload: bytes, stop_event: mp.synchronize.Event, *, retry_seconds: float = 0.05) -> bool:
     while not stop_event.is_set():
         if ring.put(payload, timeout=retry_seconds):
             return True
@@ -161,53 +140,67 @@ def _drain_batch(ingress: SharedRingBuffer, first: bytes, *, limit: int = 256) -
     return batch
 
 
-def stage_worker(
-    *,
-    level: int,
-    ingress_args: dict[str, object],
-    next_args: dict[str, object] | None,
-    shard_ring_args: tuple[dict[str, object], ...],
-    stop_event: mp.synchronize.Event,
-    inflight: mp.sharedctypes.Synchronized,
-    error_queue: mp.Queue,
-) -> None:
+def _merge_pipeline(prior: PipelineEvent | None, current: PipelineEvent) -> PipelineEvent:
+    if prior is None:
+        return current
+    latest = current if current.experience.watermark >= prior.experience.watermark else prior
+    return replace(latest, support_delta=int(prior.support_delta) + int(current.support_delta))
+
+
+def stage_worker(*, level: int, ingress_args: dict[str, object], next_args: dict[str, object] | None, shard_ring_args: tuple[dict[str, object], ...], stop_event: mp.synchronize.Event, inflight: mp.sharedctypes.Synchronized, error_queue: mp.Queue) -> None:
     target = MemoryLevel(level)
     ingress = SharedRingBuffer(**ingress_args)
     next_ring = None if next_args is None else SharedRingBuffer(**next_args)
     shard_rings = tuple(SharedRingBuffer(**args) for args in shard_ring_args)
+    dirty = DirtyKeyTracker()
+    pending: dict[MemoryUid, PipelineEvent] = {}
+    last_flush = time.monotonic()
+
+    def flush_pending() -> bool:
+        nonlocal last_flush
+        if next_ring is None or not pending:
+            last_flush = time.monotonic()
+            return True
+        items = sorted(pending.items(), key=lambda item: item[0])
+        pending.clear()
+        for uid, forwarded in items:
+            processed_version = dirty.begin(uid)
+            if not _put_with_backpressure(next_ring, encode_pipeline(forwarded), stop_event):
+                return False
+            dirty.complete(uid, processed_version)
+        last_flush = time.monotonic()
+        return True
+
     try:
-        while not stop_event.is_set() or not ingress.empty:
-            first = ingress.get(timeout=0.05)
+        while not stop_event.is_set() or not ingress.empty or pending:
+            first = ingress.get(timeout=0.01)
             if first is None:
+                if pending and (time.monotonic() - last_flush >= 0.01 or stop_event.is_set()):
+                    if not flush_pending():
+                        return
                 continue
             payloads = _drain_batch(ingress, first)
             with inflight.get_lock():
                 inflight.value += len(payloads)
             try:
-                # Every evidence contribution reaches the canonical owner. Downstream
-                # propagation is dirty-key coalesced per batch: a changed canonical UID
-                # creates at most one notification regardless of repeated raw events.
-                downstream: dict[MemoryUid, PipelineEvent] = {}
                 for payload in payloads:
                     pipeline = decode_pipeline(payload)
                     proposal = derive_proposal(target, pipeline)
                     shard = proposal.uid.shard(len(shard_rings))
-                    if not _put_with_backpressure(
-                        shard_rings[shard], encode_proposal(proposal), stop_event
-                    ):
+                    if not _put_with_backpressure(shard_rings[shard], encode_proposal(proposal), stop_event):
                         return
                     if next_ring is not None:
-                        downstream[proposal.uid] = PipelineEvent(
+                        forwarded = PipelineEvent(
                             pipeline.experience,
                             parent_uid=proposal.uid,
                             current_level=int(target),
+                            support_delta=int(pipeline.support_delta),
                         )
-                if next_ring is not None:
-                    for forwarded in downstream.values():
-                        if not _put_with_backpressure(
-                            next_ring, encode_pipeline(forwarded), stop_event
-                        ):
-                            return
+                        dirty.invalidate(proposal.uid, proposal.watermark)
+                        pending[proposal.uid] = _merge_pipeline(pending.get(proposal.uid), forwarded)
+                if pending and (len(pending) >= 256 or time.monotonic() - last_flush >= 0.01 or ingress.empty):
+                    if not flush_pending():
+                        return
             finally:
                 with inflight.get_lock():
                     inflight.value -= len(payloads)
