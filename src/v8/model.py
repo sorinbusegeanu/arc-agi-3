@@ -119,6 +119,10 @@ class MemoryUid:
         raw = digest.digest()
         return cls(int.from_bytes(raw[:8], "little"), int.from_bytes(raw[8:], "little"))
 
+    @classmethod
+    def from_optional(cls, value: "MemoryUid | None") -> "MemoryUid":
+        return cls.zero() if value is None else value
+
     @property
     def is_zero(self) -> bool:
         return int(self.hi) == 0 and int(self.lo) == 0
@@ -164,12 +168,17 @@ class ExperienceEvent:
     terminal_polarity: int
     trajectory_signature: int
     next_context_signature: int = 0
+    selected_outcome_uid: MemoryUid = MemoryUid(0, 0)
+    selected_strategy_uid: MemoryUid = MemoryUid(0, 0)
+    trajectory_cost: int = 1
 
     def __post_init__(self) -> None:
         if self.watermark < 0 or self.global_step < 0 or self.producer_sequence < 0:
             raise ValueError("watermarks and sequence values must be non-negative")
         if self.terminal_polarity not in {-1, 0, 1}:
             raise ValueError("terminal_polarity must be -1, 0 or 1")
+        if self.trajectory_cost <= 0:
+            raise ValueError("trajectory_cost must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,6 +210,9 @@ class MemoryProposal:
     explanatory_sum: float = 0.0
     future_option_sum: float = 0.0
     score_weight: float = 1.0
+    strategy_attempt_delta: int = 0
+    strategy_success_delta: int = 0
+    strategy_cost_sum: float = 0.0
     parent_uid: MemoryUid = MemoryUid(0, 0)
     relation_type: RelationType = RelationType.PROVENANCE
     source_game_hash: int = 0
@@ -210,10 +222,12 @@ class MemoryProposal:
     def __post_init__(self) -> None:
         if not 0 < len(self.key_parts) <= 4:
             raise ValueError("v8 hot-path canonical keys support 1..4 parts")
-        if self.support_delta < 0:
-            raise ValueError("support_delta cannot be negative")
-        if self.score_weight < 0:
-            raise ValueError("score_weight cannot be negative")
+        if self.support_delta < 0 or self.strategy_attempt_delta < 0 or self.strategy_success_delta < 0:
+            raise ValueError("proposal deltas cannot be negative")
+        if self.strategy_success_delta > self.strategy_attempt_delta and self.strategy_attempt_delta > 0:
+            raise ValueError("strategy successes cannot exceed attempts")
+        if self.score_weight < 0 or self.strategy_cost_sum < 0:
+            raise ValueError("weights and strategy cost cannot be negative")
         if self.cognitive_state < -1 or self.cognitive_state > 127:
             raise ValueError("invalid cognitive_state")
         if self.validation_state < -1 or self.validation_state > 127:
@@ -221,10 +235,11 @@ class MemoryProposal:
 
 
 _EXPERIENCE = Struct("<QQQIQQQiQQQdIbQ")
+_EXPERIENCE_EXTRA = Struct("<QQQQQQI")
 _PIPE_SUFFIX = Struct("<QQbQ")
-_PROPOSAL = Struct("<QQQQQQBHBQQQQqdddddddQQHQbb")
+_PROPOSAL = Struct("<QQQQQQBHBQQQQqdddddddQQdQQHQbb")
 
-EXPERIENCE_PACKET_SIZE = _EXPERIENCE.size + 16
+EXPERIENCE_PACKET_SIZE = _EXPERIENCE.size + _EXPERIENCE_EXTRA.size
 PIPELINE_PACKET_SIZE = EXPERIENCE_PACKET_SIZE + _PIPE_SUFFIX.size
 PROPOSAL_PACKET_SIZE = _PROPOSAL.size
 
@@ -237,21 +252,27 @@ def encode_experience(event: ExperienceEvent) -> bytes:
         u64(event.context_signature), u64(event.outcome_signature), u64(event.family_signature),
         float(event.future_option_delta), int(event.changed_cells) & 0xFFFFFFFF,
         int(event.terminal_polarity), u64(event.trajectory_signature),
-    ) + u64(event.carrier_signature).to_bytes(8, "little") + u64(event.next_context_signature).to_bytes(8, "little")
+    ) + _EXPERIENCE_EXTRA.pack(
+        u64(event.carrier_signature), u64(event.next_context_signature),
+        u64(event.selected_outcome_uid.hi), u64(event.selected_outcome_uid.lo),
+        u64(event.selected_strategy_uid.hi), u64(event.selected_strategy_uid.lo),
+        int(event.trajectory_cost) & 0xFFFFFFFF,
+    )
 
 
 def decode_experience(payload: bytes) -> ExperienceEvent:
     if len(payload) != EXPERIENCE_PACKET_SIZE:
         raise ValueError(f"invalid experience packet size {len(payload)}")
-    base = payload[:-16]
-    carrier = int.from_bytes(payload[-16:-8], "little")
-    next_context = int.from_bytes(payload[-8:], "little")
+    base = payload[:_EXPERIENCE.size]
+    extra = payload[_EXPERIENCE.size:]
     values = _EXPERIENCE.unpack(base)
+    carrier, next_context, outcome_hi, outcome_lo, strategy_hi, strategy_lo, trajectory_cost = _EXPERIENCE_EXTRA.unpack(extra)
     return ExperienceEvent(
         EventId(values[0], values[1]), int(values[2]), int(values[3]), int(values[4]),
         int(values[5]), int(values[6]), int(values[8]), int(values[7]), int(values[9]),
         int(values[10]), int(carrier), float(values[11]), int(values[12]), int(values[13]),
-        int(values[14]), int(next_context),
+        int(values[14]), int(next_context), MemoryUid(outcome_hi, outcome_lo),
+        MemoryUid(strategy_hi, strategy_lo), int(trajectory_cost),
     )
 
 
@@ -285,6 +306,7 @@ def encode_proposal(proposal: MemoryProposal) -> bytes:
         float(proposal.prediction_error_sum), float(proposal.learning_value_sum),
         float(proposal.transfer_prior_sum), float(proposal.explanatory_sum),
         float(proposal.future_option_sum), float(proposal.score_weight),
+        u64(proposal.strategy_attempt_delta), u64(proposal.strategy_success_delta), float(proposal.strategy_cost_sum),
         u64(proposal.parent_uid.hi), u64(proposal.parent_uid.lo), int(proposal.relation_type),
         u64(proposal.source_game_hash), int(proposal.cognitive_state), int(proposal.validation_state),
     )
@@ -296,13 +318,12 @@ def decode_proposal(payload: bytes) -> MemoryProposal:
     values = _PROPOSAL.unpack(payload)
     keys = tuple(int(value) for value in values[9:13][: int(values[8])])
     return MemoryProposal(
-        uid=MemoryUid(values[0], values[1]), fingerprint=int(values[2]),
-        event_id=EventId(values[3], values[4]), watermark=int(values[5]),
-        level=MemoryLevel(values[6]), memory_type=MemoryType(values[7]), key_parts=keys,
-        support_delta=int(values[13]), significance_sum=float(values[14]),
-        prediction_error_sum=float(values[15]), learning_value_sum=float(values[16]),
-        transfer_prior_sum=float(values[17]), explanatory_sum=float(values[18]),
-        future_option_sum=float(values[19]), score_weight=float(values[20]),
-        parent_uid=MemoryUid(values[21], values[22]), relation_type=RelationType(values[23]),
-        source_game_hash=int(values[24]), cognitive_state=int(values[25]), validation_state=int(values[26]),
+        uid=MemoryUid(values[0], values[1]), fingerprint=int(values[2]), event_id=EventId(values[3], values[4]),
+        watermark=int(values[5]), level=MemoryLevel(values[6]), memory_type=MemoryType(values[7]), key_parts=keys,
+        support_delta=int(values[13]), significance_sum=float(values[14]), prediction_error_sum=float(values[15]),
+        learning_value_sum=float(values[16]), transfer_prior_sum=float(values[17]), explanatory_sum=float(values[18]),
+        future_option_sum=float(values[19]), score_weight=float(values[20]), strategy_attempt_delta=int(values[21]),
+        strategy_success_delta=int(values[22]), strategy_cost_sum=float(values[23]), parent_uid=MemoryUid(values[24], values[25]),
+        relation_type=RelationType(values[26]), source_game_hash=int(values[27]), cognitive_state=int(values[28]),
+        validation_state=int(values[29]),
     )
