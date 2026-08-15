@@ -13,6 +13,9 @@ from v7.memory.schema import ensure_v7_schema
 from v7.memory.state import GateId
 
 
+_SQLITE_ID_CHUNK_CAP = 900
+
+
 @dataclass(frozen=True, slots=True)
 class ProvenanceRecord:
     memory_id: MemoryId
@@ -110,6 +113,25 @@ class EvidenceLifecycleStore:
     def close(self) -> None:
         self.connection.close()
 
+    def _memory_id_chunks(
+        self,
+        memory_ids: Iterable[MemoryId],
+    ) -> tuple[tuple[int, ...], ...]:
+        ids = tuple(sorted(set(int(memory_id) for memory_id in memory_ids)))
+        if not ids:
+            return ()
+        try:
+            variable_limit = int(
+                self.connection.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER)
+            )
+        except (AttributeError, TypeError, ValueError, sqlite3.Error):
+            variable_limit = 999
+        chunk_size = max(1, min(_SQLITE_ID_CHUNK_CAP, variable_limit))
+        return tuple(
+            ids[offset : offset + chunk_size]
+            for offset in range(0, len(ids), chunk_size)
+        )
+
     def append_provenance(self, records: Iterable[ProvenanceRecord]) -> int:
         rows = [
             (
@@ -180,22 +202,24 @@ class EvidenceLifecycleStore:
         self,
         memory_ids: Iterable[MemoryId],
     ) -> dict[MemoryId, tuple[int, int, float]]:
-        ids = tuple(sorted(set(int(memory_id) for memory_id in memory_ids)))
-        if not ids:
-            return {}
-        placeholders = ",".join("?" for _ in ids)
-        rows = self.connection.execute(
-            f"SELECT memory_id, COUNT(*), SUM(success), AVG(score) FROM transfer_trials WHERE memory_id IN ({placeholders}) GROUP BY memory_id",
-            ids,
-        ).fetchall()
-        return {
-            MemoryId(int(memory_id)): (
-                int(total),
-                int(successes or 0),
-                float(avg_score or 0.0),
+        summaries: dict[MemoryId, tuple[int, int, float]] = {}
+        for ids in self._memory_id_chunks(memory_ids):
+            placeholders = ",".join("?" for _ in ids)
+            rows = self.connection.execute(
+                f"SELECT memory_id, COUNT(*), SUM(success), AVG(score) FROM transfer_trials WHERE memory_id IN ({placeholders}) GROUP BY memory_id",
+                ids,
+            ).fetchall()
+            summaries.update(
+                {
+                    MemoryId(int(memory_id)): (
+                        int(total),
+                        int(successes or 0),
+                        float(avg_score or 0.0),
+                    )
+                    for memory_id, total, successes, avg_score in rows
+                }
             )
-            for memory_id, total, successes, avg_score in rows
-        }
+        return summaries
 
     def heldout_transfer_summary(
         self,
@@ -224,11 +248,15 @@ class EvidenceLifecycleStore:
             )
             for memory_id in ids
         }
-        placeholders = ",".join("?" for _ in ids)
-        rows = self.connection.execute(
-            f"SELECT memory_id, source_game, target_game, success, score, payload_json FROM transfer_trials WHERE memory_id IN ({placeholders}) ORDER BY transfer_trial_id",
-            tuple(int(memory_id) for memory_id in ids),
-        ).fetchall()
+        rows: list[tuple[object, ...]] = []
+        for chunk in self._memory_id_chunks(ids):
+            placeholders = ",".join("?" for _ in chunk)
+            rows.extend(
+                self.connection.execute(
+                    f"SELECT memory_id, source_game, target_game, success, score, payload_json FROM transfer_trials WHERE memory_id IN ({placeholders}) ORDER BY transfer_trial_id",
+                    chunk,
+                ).fetchall()
+            )
         unique: dict[
             tuple[MemoryId, str, int | None],
             tuple[str, str, int, float, str],
@@ -287,18 +315,23 @@ class EvidenceLifecycleStore:
         self,
         memory_ids: Iterable[MemoryId],
     ) -> dict[MemoryId, tuple[int, float]]:
-        ids = tuple(sorted(set(int(memory_id) for memory_id in memory_ids)))
-        if not ids:
-            return {}
-        placeholders = ",".join("?" for _ in ids)
-        rows = self.connection.execute(
-            f"SELECT memory_id, COUNT(*), MAX(severity) FROM contradiction_records WHERE memory_id IN ({placeholders}) GROUP BY memory_id",
-            ids,
-        ).fetchall()
-        return {
-            MemoryId(int(memory_id)): (int(total), float(max_severity or 0.0))
-            for memory_id, total, max_severity in rows
-        }
+        summaries: dict[MemoryId, tuple[int, float]] = {}
+        for ids in self._memory_id_chunks(memory_ids):
+            placeholders = ",".join("?" for _ in ids)
+            rows = self.connection.execute(
+                f"SELECT memory_id, COUNT(*), MAX(severity) FROM contradiction_records WHERE memory_id IN ({placeholders}) GROUP BY memory_id",
+                ids,
+            ).fetchall()
+            summaries.update(
+                {
+                    MemoryId(int(memory_id)): (
+                        int(total),
+                        float(max_severity or 0.0),
+                    )
+                    for memory_id, total, max_severity in rows
+                }
+            )
+        return summaries
 
     def provenance_parents(self, memory_id: MemoryId) -> tuple[MemoryId, ...]:
         rows = self.connection.execute(
@@ -546,20 +579,21 @@ class EvidenceLifecycleStore:
         self,
         memory_ids: Iterable[MemoryId],
     ) -> dict[MemoryId, GateTrialSummary]:
-        ids = tuple(sorted(set(int(memory_id) for memory_id in memory_ids)))
-        if not ids:
-            return {}
-        placeholders = ",".join("?" for _ in ids)
-        rows = self.connection.execute(
-            f"""
-            SELECT memory_id,target_game,target_context,success,causal_gain,transfer_score,
-                   terminal_gain,prediction_gain,planning_gain,future_option_gain,efficiency_gain
-            FROM gate_trials
-            WHERE genuine=1 AND memory_id IN ({placeholders})
-            ORDER BY gate_trial_id
-            """,
-            ids,
-        ).fetchall()
+        rows: list[tuple[object, ...]] = []
+        for ids in self._memory_id_chunks(memory_ids):
+            placeholders = ",".join("?" for _ in ids)
+            rows.extend(
+                self.connection.execute(
+                    f"""
+                    SELECT memory_id,target_game,target_context,success,causal_gain,transfer_score,
+                           terminal_gain,prediction_gain,planning_gain,future_option_gain,efficiency_gain
+                    FROM gate_trials
+                    WHERE genuine=1 AND memory_id IN ({placeholders})
+                    ORDER BY gate_trial_id
+                    """,
+                    ids,
+                ).fetchall()
+            )
         grouped: dict[MemoryId, list[tuple[object, ...]]] = {}
         for row in rows:
             grouped.setdefault(MemoryId(int(row[0])), []).append(row[1:])
