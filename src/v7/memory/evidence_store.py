@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from bisect import bisect_right
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -29,9 +30,61 @@ class EvidenceStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(self.path)
         ensure_v7_schema(self.connection)
+        self._parsed_rows: dict[int, list[dict[str, Any]]] = {}
+        self._parsed_ids: dict[int, list[int]] = {}
+        self._parsed_watermarks: dict[int, int] = {}
 
     def close(self) -> None:
         self.connection.close()
+
+    def _refresh_parsed_rows(self, evidence_type: int) -> None:
+        kind = int(evidence_type)
+        watermark = int(self._parsed_watermarks.get(kind, 0))
+        rows = self.connection.execute(
+            "SELECT evidence_id,memory_id,source_game,source_context,"
+            "source_global_step,payload_json,generation_id "
+            "FROM evidence_records WHERE evidence_type=? AND evidence_id>? "
+            "ORDER BY evidence_id",
+            (kind, watermark),
+        ).fetchall()
+        if not rows:
+            return
+        parsed = self._parsed_rows.setdefault(kind, [])
+        ids = self._parsed_ids.setdefault(kind, [])
+        for evidence_id, memory_id, game, context, step, payload_json, generation in rows:
+            try:
+                payload = json.loads(str(payload_json or "{}"))
+            except (TypeError, json.JSONDecodeError):
+                payload = {}
+            payload.update(
+                {
+                    "evidence_id": int(evidence_id),
+                    "memory_id": None if memory_id is None else int(memory_id),
+                    "source_game": game,
+                    "source_context": context,
+                    "source_global_step": step,
+                    "generation_id": int(generation),
+                }
+            )
+            parsed.append(payload)
+            ids.append(int(evidence_id))
+        self._parsed_watermarks[kind] = int(rows[-1][0])
+
+    def load_evidence(
+        self,
+        evidence_type: int,
+        *,
+        after_evidence_id: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Return parsed evidence while querying and decoding only new rows."""
+
+        kind = int(evidence_type)
+        self._refresh_parsed_rows(kind)
+        rows = self._parsed_rows.get(kind, [])
+        ids = self._parsed_ids.get(kind, [])
+        start = bisect_right(ids, int(after_evidence_id))
+        # Callers add derived fields, so keep the cached raw payload immutable.
+        return [dict(row) for row in rows[start:]]
 
     def append_evidence_batch(self, records: Iterable[EvidenceRecord]) -> int:
         rows = [

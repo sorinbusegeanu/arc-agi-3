@@ -628,6 +628,7 @@ class EvidenceLifecycleStore:
         harm: bool,
         low_threshold: float = 0.10,
         positive_threshold: float = 0.20,
+        commit: bool = True,
     ) -> LifecycleWindowRecord:
         prior = self.lifecycle_window(memory_id)
         low = 0 if prior is None else prior.consecutive_low_windows
@@ -637,7 +638,8 @@ class EvidenceLifecycleStore:
         low = low + 1 if value < float(low_threshold) else 0
         harm_count = harm_count + 1 if bool(harm) else 0
         positive = positive + 1 if value >= float(positive_threshold) and not harm else 0
-        with self.connection:
+
+        def write() -> None:
             self.connection.execute(
                 """
                 INSERT INTO lifecycle_windows(memory_id,consecutive_low_windows,consecutive_harm_windows,consecutive_positive_windows,last_utility,last_generation,updated_at)
@@ -659,6 +661,11 @@ class EvidenceLifecycleStore:
                     int(generation_id),
                 ),
             )
+        if commit:
+            with self.connection:
+                write()
+        else:
+            write()
         return LifecycleWindowRecord(
             memory_id,
             low,

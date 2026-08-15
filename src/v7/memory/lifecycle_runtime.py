@@ -107,70 +107,75 @@ class MemoryLifecycleRuntime:
             }
             latest_gate_generation = self._latest_gate_generations()
             generation_id = int(writer.mutable_generation_id)
-            for memory_id, node in view.nodes.items():
-                empirical = float(empirical_transfer.get(memory_id, 0.0))
-                fitness = self.controller.fitness(
-                    node,
-                    view.scores.get(memory_id),
-                    empirical_transfer=empirical,
-                )
-                gate = gate_summaries.get(memory_id)
-                causal = 0.0 if gate is None else float(gate.mean_causal_gain)
-                contradiction = float(contradiction_severity.get(memory_id, 0.0))
-                prior_window = self.evidence_lifecycle.lifecycle_window(memory_id)
-                prior_generation = (
-                    -1 if prior_window is None else int(prior_window.last_generation)
-                )
-                gate_generation = int(
-                    latest_gate_generation.get(int(memory_id), -1)
-                )
-                observed_since_window = (
-                    prior_window is None
-                    or int(node.updated_generation) > prior_generation
-                    or gate_generation > prior_generation
-                )
-
-                if observed_since_window:
-                    # Retirement is driven by newly observed harmful utility, not
-                    # by the mere passage of epochs. Historical contradictions
-                    # remain replay signals but do not repeatedly age the harm
-                    # counter without a new applicable observation.
-                    harm = causal < 0.0
-                    utility = max(
-                        0.0,
-                        min(
-                            1.0,
-                            0.70 * fitness + 0.30 * max(0.0, causal),
-                        ),
+            # SQLite transaction setup dominates when every memory commits its
+            # lifecycle window separately. Keep the one-writer rule and commit
+            # the deterministic window updates as one batch.
+            with self.evidence_lifecycle.connection:
+                for memory_id, node in view.nodes.items():
+                    empirical = float(empirical_transfer.get(memory_id, 0.0))
+                    fitness = self.controller.fitness(
+                        node,
+                        view.scores.get(memory_id),
+                        empirical_transfer=empirical,
                     )
-                    window = self.evidence_lifecycle.update_lifecycle_window(
-                        memory_id,
-                        generation_id=generation_id,
-                        utility=utility,
-                        harm=harm,
-                        low_threshold=self.controller.policy.retain_threshold,
-                        positive_threshold=self.controller.policy.promote_threshold,
+                    gate = gate_summaries.get(memory_id)
+                    causal = 0.0 if gate is None else float(gate.mean_causal_gain)
+                    contradiction = float(contradiction_severity.get(memory_id, 0.0))
+                    prior_window = self.evidence_lifecycle.lifecycle_window(memory_id)
+                    prior_generation = (
+                        -1 if prior_window is None else int(prior_window.last_generation)
                     )
-                else:
-                    assert prior_window is not None
-                    window = prior_window
+                    gate_generation = int(
+                        latest_gate_generation.get(int(memory_id), -1)
+                    )
+                    observed_since_window = (
+                        prior_window is None
+                        or int(node.updated_generation) > prior_generation
+                        or gate_generation > prior_generation
+                    )
 
-                low_windows = int(window.consecutive_low_windows)
-                harm_windows = int(window.consecutive_harm_windows)
-                if self._has_live_dependents(writer, view, memory_id):
-                    low_windows = min(
+                    if observed_since_window:
+                        # Retirement is driven by newly observed harmful utility, not
+                        # by the mere passage of epochs. Historical contradictions
+                        # remain replay signals but do not repeatedly age the harm
+                        # counter without a new applicable observation.
+                        harm = causal < 0.0
+                        utility = max(
+                            0.0,
+                            min(
+                                1.0,
+                                0.70 * fitness + 0.30 * max(0.0, causal),
+                            ),
+                        )
+                        window = self.evidence_lifecycle.update_lifecycle_window(
+                            memory_id,
+                            generation_id=generation_id,
+                            utility=utility,
+                            harm=harm,
+                            low_threshold=self.controller.policy.retain_threshold,
+                            positive_threshold=self.controller.policy.promote_threshold,
+                            commit=False,
+                        )
+                    else:
+                        assert prior_window is not None
+                        window = prior_window
+
+                    low_windows = int(window.consecutive_low_windows)
+                    harm_windows = int(window.consecutive_harm_windows)
+                    if self._has_live_dependents(writer, view, memory_id):
+                        low_windows = min(
+                            low_windows,
+                            self.controller.policy.retire_after_low_windows - 1,
+                        )
+                        harm_windows = min(
+                            harm_windows,
+                            self.controller.policy.retire_after_harm_windows - 1,
+                        )
+                    lifecycle_windows[memory_id] = (
                         low_windows,
-                        self.controller.policy.retire_after_low_windows - 1,
-                    )
-                    harm_windows = min(
                         harm_windows,
-                        self.controller.policy.retire_after_harm_windows - 1,
+                        int(window.consecutive_positive_windows),
                     )
-                lifecycle_windows[memory_id] = (
-                    low_windows,
-                    harm_windows,
-                    int(window.consecutive_positive_windows),
-                )
         decisions = self.controller.apply(
             view,
             writer=writer,

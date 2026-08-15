@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 
@@ -41,28 +40,63 @@ class StructuralGateRuntime:
     ) -> None:
         self.evidence_store = evidence_store
         self.lifecycle_store = lifecycle_store
+        self._last_evidence_id = 0
+        self._known_family_ids: set[int] = set()
+        self._known_carrier_ids: set[int] = set()
+        self._carrier_baselines: dict[
+            int,
+            tuple[dict[int, Counter[int]], dict[int, Counter[int]]],
+        ] = {}
 
     def run(self, writer: CanonicalMemoryWriter) -> StructuralGateStats:
-        episodes = self._episodes()
-        if not episodes:
-            return StructuralGateStats()
         nodes = getattr(writer, "_nodes")
         registry = getattr(writer, "_canonical_registry")
+        candidates = tuple(
+            (memory_id, node)
+            for memory_id, node in sorted(nodes.items(), key=lambda item: int(item[0]))
+            if (
+                node.level == MemoryLevel.M2 and int(node.type_id) == TYPE_FAMILY
+            )
+            or (
+                node.level == MemoryLevel.M3 and int(node.type_id) == TYPE_CARRIER
+            )
+        )
+        has_new_candidates = any(
+            (
+                node.level == MemoryLevel.M2
+                and int(memory_id) not in self._known_family_ids
+            )
+            or (
+                node.level == MemoryLevel.M3
+                and int(memory_id) not in self._known_carrier_ids
+            )
+            for memory_id, node in candidates
+        )
+        new_episodes = self._episodes(after_evidence_id=self._last_evidence_id)
+        if has_new_candidates:
+            all_episodes = self._episodes()
+        else:
+            all_episodes = new_episodes
+        if not all_episodes and not candidates:
+            return StructuralGateStats()
         generation_id = int(writer.mutable_generation_id)
         family_records: list[GateTrialRecord] = []
         carrier_records: list[GateTrialRecord] = []
 
-        for memory_id, node in sorted(nodes.items(), key=lambda item: int(item[0])):
+        for memory_id, node in candidates:
             if node.level == MemoryLevel.M2 and int(node.type_id) == TYPE_FAMILY:
                 key = registry.key_for(memory_id)
                 if key is None or not key.parts:
                     continue
+                candidate_id = int(memory_id)
+                first_run = candidate_id not in self._known_family_ids
+                self._known_family_ids.add(candidate_id)
                 outcome = int(key.parts[0])
                 scope = self.lifecycle_store.freeze_candidate_scope(
                     memory_id,
                     int(node.created_generation),
                 )
-                for row in episodes:
+                for row in all_episodes if first_run else new_episodes:
                     if int(row["generation_id"]) <= int(scope.candidate_generation):
                         continue
                     if int(row.get("outcome_signature") or 0) != outcome:
@@ -98,25 +132,33 @@ class StructuralGateRuntime:
                 key = registry.key_for(memory_id)
                 if key is None or not key.parts:
                     continue
+                candidate_id = int(memory_id)
+                first_run = candidate_id not in self._known_carrier_ids
+                self._known_carrier_ids.add(candidate_id)
                 carrier = int(key.parts[0])
                 scope = self.lifecycle_store.freeze_candidate_scope(
                     memory_id,
                     int(node.created_generation),
                 )
-                formation = [
-                    row
-                    for row in episodes
-                    if int(row["generation_id"]) <= int(scope.candidate_generation)
-                ]
-                carrier_counts: dict[int, Counter[int]] = defaultdict(Counter)
-                baseline_counts: dict[int, Counter[int]] = defaultdict(Counter)
-                for row in formation:
+                baseline = self._carrier_baselines.get(candidate_id)
+                if baseline is None:
+                    carrier_counts = defaultdict(Counter)
+                    baseline_counts = defaultdict(Counter)
+                    baseline = (carrier_counts, baseline_counts)
+                    self._carrier_baselines[candidate_id] = baseline
+                    formation_rows = all_episodes
+                else:
+                    carrier_counts, baseline_counts = baseline
+                    formation_rows = new_episodes
+                for row in formation_rows:
+                    if int(row["generation_id"]) > int(scope.candidate_generation):
+                        continue
                     action = int(row.get("action_id") or 0)
                     outcome = int(row.get("outcome_signature") or 0)
                     baseline_counts[action][outcome] += 1
                     if int(row.get("carrier_signature") or -1) == carrier:
                         carrier_counts[action][outcome] += 1
-                for row in episodes:
+                for row in all_episodes if first_run else new_episodes:
                     if int(row["generation_id"]) <= int(scope.candidate_generation):
                         continue
                     if int(row.get("carrier_signature") or -1) != carrier:
@@ -165,6 +207,10 @@ class StructuralGateRuntime:
 
         family_count = self.lifecycle_store.append_gate_trials(family_records)
         carrier_count = self.lifecycle_store.append_gate_trials(carrier_records)
+        if new_episodes:
+            self._last_evidence_id = max(
+                int(row.get("evidence_id") or 0) for row in new_episodes
+            )
         return StructuralGateStats(family_count, carrier_count)
 
     @staticmethod
@@ -173,28 +219,11 @@ class StructuralGateRuntime:
         fallback = int(row.get("context_signature") or 0)
         return str(planning_context(contexts, fallback=fallback))
 
-    def _episodes(self) -> list[dict[str, object]]:
-        rows = self.evidence_store.connection.execute(
-            "SELECT source_game,source_context,source_global_step,payload_json,generation_id "
-            "FROM evidence_records WHERE evidence_type=? ORDER BY evidence_id",
-            (int(EvidenceType.EPISODE),),
-        ).fetchall()
-        result: list[dict[str, object]] = []
-        for game, context, step, payload_json, generation in rows:
-            try:
-                payload = json.loads(str(payload_json or "{}"))
-            except (TypeError, json.JSONDecodeError):
-                payload = {}
-            payload.update(
-                {
-                    "source_game": game,
-                    "source_context": context,
-                    "source_global_step": step,
-                    "generation_id": int(generation),
-                }
-            )
-            result.append(payload)
-        return result
+    def _episodes(self, *, after_evidence_id: int = 0) -> list[dict[str, object]]:
+        return self.evidence_store.load_evidence(
+            int(EvidenceType.EPISODE),
+            after_evidence_id=after_evidence_id,
+        )
 
 
 __all__ = ["StructuralGateRuntime", "StructuralGateStats"]
