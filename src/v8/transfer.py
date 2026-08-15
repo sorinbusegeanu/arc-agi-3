@@ -36,6 +36,49 @@ class TransferValidator:
         self.effect_threshold = float(effect_threshold)
         self._trials: dict[MemoryUid, list[TransferTrial]] = {}
 
+    @staticmethod
+    def _provenance_from_edges(
+        uids: tuple[MemoryUid, ...],
+        edges: tuple[EdgeRecord, ...],
+        *,
+        max_depth: int = 8,
+    ) -> dict[MemoryUid, tuple[int, ...]]:
+        direct: dict[MemoryUid, set[int]] = {}
+        parents: dict[MemoryUid, set[MemoryUid]] = {}
+        lineage = {
+            int(RelationType.PROVENANCE),
+            int(RelationType.EXPLAINS),
+            int(RelationType.CONTEXT_REFINES),
+            int(RelationType.TRANSFER_CORRESPONDENCE),
+            int(RelationType.SUPERSEDES),
+            int(RelationType.LEADS_TO),
+        }
+        for edge in edges:
+            relation = int(edge.relation_type)
+            if relation == int(RelationType.GAME_PROVENANCE) and int(edge.target_uid.hi) == 0:
+                direct.setdefault(edge.source_uid, set()).add(int(edge.target_uid.lo))
+            elif relation in lineage:
+                parents.setdefault(edge.source_uid, set()).add(edge.target_uid)
+
+        result: dict[MemoryUid, tuple[int, ...]] = {}
+        for uid in uids:
+            found = set(direct.get(uid, ()))
+            frontier = {uid}
+            visited = {uid}
+            for _depth in range(max(0, int(max_depth))):
+                following: set[MemoryUid] = set()
+                for current in frontier:
+                    for parent in parents.get(current, ()):
+                        found.update(direct.get(parent, ()))
+                        if parent not in visited:
+                            visited.add(parent)
+                            following.add(parent)
+                if not following:
+                    break
+                frontier = following
+            result[uid] = tuple(sorted(found))
+        return result
+
     def candidates(
         self,
         rows: tuple[NodeRecord, ...],
@@ -51,14 +94,15 @@ class TransferValidator:
         if not eligible:
             return ()
 
-        if not edges and provenance is not None:
+        bound_read_view = None
+        if provenance is not None:
             owner = getattr(provenance, "__self__", None)
             edge_records = getattr(owner, "edge_records", None)
             if callable(edge_records):
-                edges = tuple(edge_records())
+                bound_read_view = owner
+                if not edges:
+                    edges = tuple(edge_records())
 
-        # Keep the standalone legacy API useful for old unit callers. Production
-        # peers always provide exact provenance and therefore use scored graph edges.
         if not edges and provenance is None:
             result = []
             for row in eligible.values():
@@ -67,15 +111,21 @@ class TransferValidator:
                     1.0, max(1, row.support_count) / 8.0
                 )
                 if games >= 2 and recurrence > 0.0:
-                    result.append(
-                        TransferCandidate(row.uid, games, recurrence)
-                    )
+                    result.append(TransferCandidate(row.uid, games, recurrence))
             return tuple(result)
+
+        graph_games = (
+            self._provenance_from_edges(tuple(eligible), edges)
+            if bound_read_view is not None
+            else None
+        )
 
         def games(uid: MemoryUid) -> tuple[int, ...]:
             row = eligible.get(uid)
             if row is None:
                 return ()
+            if graph_games is not None:
+                return graph_games.get(uid, ())
             if provenance is not None:
                 return tuple(sorted(provenance(uid)))
             mask = int(row.game_mask)
