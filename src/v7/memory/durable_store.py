@@ -36,14 +36,17 @@ class DurableGenerationStore:
             if delta.nodes:
                 self.connection.executemany(
                     """
-                    INSERT INTO memory_nodes(memory_id, level_id, type_id, created_generation, updated_generation, status_flags, support_count)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO memory_nodes(memory_id, level_id, type_id, created_generation, updated_generation, status_flags, support_count, cognitive_state, validation_state, gate_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(memory_id) DO UPDATE SET
                         level_id=excluded.level_id,
                         type_id=excluded.type_id,
                         updated_generation=excluded.updated_generation,
                         status_flags=excluded.status_flags,
-                        support_count=excluded.support_count
+                        support_count=excluded.support_count,
+                        cognitive_state=excluded.cognitive_state,
+                        validation_state=excluded.validation_state,
+                        gate_id=excluded.gate_id
                     """,
                     [self._node_row(node) for node in delta.nodes],
                 )
@@ -96,6 +99,9 @@ class DurableGenerationStore:
             int(node.updated_generation),
             int(node.status_flags),
             int(node.support_count),
+            int(node.cognitive_state),
+            int(node.validation_state),
+            int(node.gate_id),
         )
 
     @staticmethod
