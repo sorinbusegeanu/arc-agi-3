@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass
 from threading import Lock
 from typing import Iterable
 
 from v8.arena import NodeRecord
-from v8.model import CognitiveState, MemoryLevel, MemoryType, ValidationState
+from v8.model import CognitiveState, MemoryLevel, MemoryType, MemoryUid, ValidationState
 
 
 @dataclass(frozen=True, slots=True)
@@ -15,19 +16,22 @@ class ISFScore:
     learning_value: float
     transfer_potential: float
     explanatory_potential: float
+    # Preserved as separate evidence for planning/reporting.  It is not a sixth
+    # independently weighted ISF channel in v8.2.
     future_option_value: float
     total: float
     developmental_stage: int
 
 
-_STAGE_WEIGHTS: dict[int, tuple[float, float, float, float, float, float]] = {
-    0: (0.70, 0.00, 0.15, 0.00, 0.05, 0.10),
-    1: (0.25, 0.30, 0.25, 0.05, 0.05, 0.10),
-    2: (0.15, 0.15, 0.25, 0.20, 0.20, 0.05),
-    3: (0.10, 0.10, 0.15, 0.30, 0.30, 0.05),
-    4: (0.15, 0.10, 0.15, 0.15, 0.20, 0.25),
-    5: (0.15, 0.05, 0.10, 0.15, 0.20, 0.35),
-    6: (0.15, 0.05, 0.10, 0.10, 0.15, 0.45),
+# Five paper channels: OSI, PE, LV_hat, TP_prior, EP_hat.
+_STAGE_WEIGHTS: dict[int, tuple[float, float, float, float, float]] = {
+    0: (0.80, 0.00, 0.15, 0.00, 0.05),
+    1: (0.30, 0.30, 0.25, 0.05, 0.10),
+    2: (0.15, 0.15, 0.25, 0.20, 0.25),
+    3: (0.10, 0.10, 0.15, 0.30, 0.35),
+    4: (0.25, 0.10, 0.15, 0.20, 0.30),
+    5: (0.30, 0.05, 0.10, 0.20, 0.35),
+    6: (0.30, 0.05, 0.10, 0.15, 0.40),
 }
 
 _ADMISSIBLE = {
@@ -65,11 +69,7 @@ def _clip(value: float) -> float:
 
 
 def infer_developmental_stage(rows: Iterable[NodeRecord]) -> int:
-    """Infer Stage_t only from capabilities already present in the published cut.
-
-    Positive stored prediction error implies at least Stage 1 because such an error
-    can only exist after a supported expectation was available before the transition.
-    """
+    """Infer Stage_t only from capabilities present before the scoring interval."""
     rows = tuple(rows)
     minimum_stage = 1 if any(float(row.prediction_error) > 0.0 for row in rows) else 0
     active = tuple(row for row in rows if int(row.cognitive_state) in _ADMISSIBLE)
@@ -125,32 +125,94 @@ def _fallback_stage(row: NodeRecord) -> int:
     return 6
 
 
-def score_memory(row: NodeRecord, *, developmental_stage: int | None = None) -> ISFScore:
-    """Bounded causally-available interaction significance / fitness input."""
-    stage = _fallback_stage(row) if developmental_stage is None else max(0, min(6, int(developmental_stage)))
-    option_impact = _clip(max(row.significance, row.strategy_reliability))
+def raw_components(row: NodeRecord) -> tuple[float, float, float, float, float, float]:
+    """Return bounded raw OSI/PE/LV/TP/EP plus separate FO evidence.
+
+    After learned reachability exists, |delta FO| is the structural OSI estimate.
+    Before that, the stored non-semantic structural significance is used.
+    """
+    future = _clip(abs(row.future_option_delta) / 4.0)
+    option_impact = future if abs(float(row.future_option_delta)) > 1e-9 else _clip(row.significance)
     prediction = _clip(row.prediction_error)
     learning = _clip(row.learning_value)
     transfer = _clip(row.transfer_prior)
     explanatory = _clip(row.explanatory_reach / 4.0)
-    future = _clip(abs(row.future_option_delta) / 4.0)
-    weights = _STAGE_WEIGHTS[stage]
-    components = (
-        option_impact,
-        prediction,
-        learning,
-        transfer,
-        explanatory,
-        future,
+    return option_impact, prediction, learning, transfer, explanatory, future
+
+
+def _score_from_components(
+    components: tuple[float, float, float, float, float, float],
+    stage: int,
+) -> ISFScore:
+    option_impact, prediction, learning, transfer, explanatory, future = components
+    weighted = (option_impact, prediction, learning, transfer, explanatory)
+    total = sum(
+        weight * component
+        for weight, component in zip(_STAGE_WEIGHTS[stage], weighted, strict=True)
     )
-    total = sum(weight * component for weight, component in zip(weights, components, strict=True))
     return ISFScore(
-        option_impact,
-        prediction,
-        learning,
-        transfer,
-        explanatory,
-        future,
+        float(option_impact),
+        float(prediction),
+        float(learning),
+        float(transfer),
+        float(explanatory),
+        float(future),
         float(total),
-        stage,
+        int(stage),
     )
+
+
+def score_memory(row: NodeRecord, *, developmental_stage: int | None = None) -> ISFScore:
+    """Static bounded fallback when a comparison-class snapshot is unavailable."""
+    stage = (
+        _fallback_stage(row)
+        if developmental_stage is None
+        else max(0, min(6, int(developmental_stage)))
+    )
+    return _score_from_components(raw_components(row), stage)
+
+
+def _rank_normalize(
+    values: list[tuple[MemoryUid, float]],
+) -> dict[MemoryUid, float]:
+    if len(values) < 4:
+        return {uid: _clip(value) for uid, value in values}
+    ordered = sorted(values, key=lambda item: (float(item[1]), item[0]))
+    denominator = max(1, len(ordered) - 1)
+    result: dict[MemoryUid, float] = {}
+    for rank, (uid, _value) in enumerate(ordered):
+        result[uid] = rank / denominator
+    return result
+
+
+def score_memories(
+    rows: Iterable[NodeRecord],
+    *,
+    developmental_stage: int,
+) -> dict[MemoryUid, ISFScore]:
+    """Deterministically normalize within (level,type,Stage_t) comparison classes."""
+    stage = max(0, min(6, int(developmental_stage)))
+    grouped: dict[tuple[int, int, int], list[NodeRecord]] = defaultdict(list)
+    for row in rows:
+        grouped[(int(row.level), int(row.memory_type), stage)].append(row)
+
+    result: dict[MemoryUid, ISFScore] = {}
+    for members in grouped.values():
+        raw = {row.uid: raw_components(row) for row in members}
+        normalized_channels: list[dict[MemoryUid, float]] = []
+        for index in range(5):
+            normalized_channels.append(
+                _rank_normalize([(row.uid, raw[row.uid][index]) for row in members])
+            )
+        for row in members:
+            future = raw[row.uid][5]
+            components = (
+                normalized_channels[0][row.uid],
+                normalized_channels[1][row.uid],
+                normalized_channels[2][row.uid],
+                normalized_channels[3][row.uid],
+                normalized_channels[4][row.uid],
+                future,
+            )
+            result[row.uid] = _score_from_components(components, stage)
+    return result
