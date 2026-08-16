@@ -517,7 +517,9 @@ def _install_planning_and_stagnation() -> None:
                     strategy_value = 0.0 if row is None else float(getattr(row, "expected_primary_valence", 0.0)) * float(getattr(row, "primary_valence_confidence", 0.0))
                     outcome_value = 0.0 if outcome is None else float(getattr(outcome, "expected_primary_valence", 0.0)) * float(getattr(outcome, "primary_valence_confidence", 0.0))
                     self._v055_active_sequence = (strategy_uid, outcome_uid, remaining[1:])
-                    return (PlannedAction(action, outcome_uid, strategy_uid, 1.0 + 1.5 * strategy_value + outcome_value, False),)
+                    plan = PlannedAction(action, outcome_uid, strategy_uid, 1.0 + 1.5 * strategy_value + outcome_value, False)
+                    self._behavior_last_plans = (plan,)
+                    return (plan,)
             self._v055_active_sequence = None
         if self._v055_progress_epoch != _PROGRESS_EPOCH:
             self._v055_progress_epoch = _PROGRESS_EPOCH
@@ -531,6 +533,7 @@ def _install_planning_and_stagnation() -> None:
             self._v055_escape_budget = _ESCAPE_BUDGET
             self._v055_last_novel_tick = self._v055_tick
         if self._v055_escape_budget > 0:
+            self._behavior_last_plans = ()
             return ()
 
         base = list(base_plan(self, context_signature, action_ids, **kwargs))
@@ -567,6 +570,7 @@ def _install_planning_and_stagnation() -> None:
                         chosen.outcome_uid,
                         tuple(path[1:]),
                     )
+        self._behavior_last_plans = tuple(all_plans)
         return tuple(all_plans)
 
     def score_actions(self, context_signature, action_ids):
