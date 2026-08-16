@@ -214,6 +214,8 @@ def run_continuous(args) -> int:
             else:
                 os.environ[_GAME_WAIT_ENV] = previous_wait
 
+        stop_reporter()
+        _log("sampling done")
         runtime.wait_quiescent(timeout=args.drain_timeout)
 
         if not args.no_automatic_experiments and not args.no_peers:
@@ -232,7 +234,6 @@ def run_continuous(args) -> int:
 
         metrics = runtime.metrics()
         hypothesis_statuses = runtime.scientific_statuses()
-        stop_reporter()
         final = runtime.close(normal=True, timeout=args.final_save_timeout)
         summary = {
             "games": list(games),

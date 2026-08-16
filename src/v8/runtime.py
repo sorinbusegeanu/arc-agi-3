@@ -444,6 +444,7 @@ class ContinuousMemoryRuntime:
         timeout: float = 60.0,
         stable_checks: int = 5,
         resume_peers: bool = True,
+        settle_peers: bool = True,
     ) -> None:
         """Drain canonical queues and advance peer operators to a fixed point."""
         deadline = time.monotonic() + float(timeout)
@@ -458,7 +459,7 @@ class ContinuousMemoryRuntime:
                     time.sleep(0.01)
                     continue
                 peer_changed = False
-                if self.peers is not None:
+                if self.peers is not None and settle_peers:
                     before = self.peers.metrics().proposals
                     self.peers.run_once()
                     after = self.peers.metrics().proposals
@@ -523,18 +524,27 @@ class ContinuousMemoryRuntime:
         if self.snapshot_service is None:
             return
         with self._maintenance_lock:
+            deadline = time.monotonic() + float(timeout)
             self._snapshot_freeze.set()
             if self.peers is not None:
                 self.peers.pause()
             try:
-                self.wait_quiescent(timeout=timeout, resume_peers=False)
+                if self.peers is not None and not self.peers.wait_idle(
+                    max(0.0, deadline - time.monotonic())
+                ):
+                    raise TimeoutError("v8 peers did not pause for consistent snapshot")
+                self.wait_quiescent(
+                    timeout=max(0.0, deadline - time.monotonic()),
+                    resume_peers=False,
+                    settle_peers=False,
+                )
                 self._snapshot_id += 1
                 self.snapshot_service.request_consistent_capture(
                     self._snapshot_id,
                     self.watermark,
                     generation=self.generation,
                     auxiliary_state=self._auxiliary_state_json(),
-                    timeout=timeout,
+                    timeout=max(0.0, deadline - time.monotonic()),
                 )
             finally:
                 if self.peers is not None:

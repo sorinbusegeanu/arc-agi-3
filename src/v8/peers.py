@@ -111,6 +111,13 @@ class DevelopmentalPeerSupervisor:
     def pause(self) -> None:
         self._pause.set()
 
+    def wait_idle(self, timeout: float) -> bool:
+        """Wait until an already-running peer cycle has released its write lock."""
+        acquired = self._run_lock.acquire(timeout=max(0.0, float(timeout)))
+        if acquired:
+            self._run_lock.release()
+        return acquired
+
     def resume(self) -> None:
         self._pause.clear()
 

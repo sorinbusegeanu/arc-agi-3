@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import dataclass
 
 from v8.carriers import CarrierEstimator
@@ -100,6 +101,17 @@ class V82DevelopmentalPeerSupervisor(DevelopmentalPeerSupervisor):
     @property
     def last_developmental_cut(self) -> DevelopmentalGenerationCut | None:
         return self._last_developmental_cut
+
+    def wait_idle(self, timeout: float) -> bool:
+        """Wait for the complete frozen-cut cycle, including v8.2 formation work."""
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        acquired = self._v82_run_lock.acquire(timeout=max(0.0, deadline - time.monotonic()))
+        if not acquired:
+            return False
+        try:
+            return super().wait_idle(max(0.0, deadline - time.monotonic()))
+        finally:
+            self._v82_run_lock.release()
 
     def _fresh(self, kind: str, uid: MemoryUid, watermark: int) -> bool:
         # Carrier recurrence alone is candidate evidence.  It becomes emergence

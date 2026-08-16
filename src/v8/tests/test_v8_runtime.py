@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 from v8.model import (
     EventId,
@@ -167,6 +171,30 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(restored.metrics()["saved_watermark"], watermark)
         finally:
             restored.close(normal=False)
+
+    def test_periodic_snapshot_drains_writes_without_advancing_peer_fixed_point(self) -> None:
+        runtime = object.__new__(ContinuousMemoryRuntime)
+        runtime.snapshot_service = Mock()
+        runtime._maintenance_lock = threading.Lock()
+        runtime._snapshot_freeze = threading.Event()
+        runtime._snapshot_id = 4
+        runtime._watermark = SimpleNamespace(value=11, get_lock=nullcontext)
+        runtime._generation = SimpleNamespace(value=17, get_lock=nullcontext)
+        runtime._auxiliary_state_json = Mock(return_value="{}")
+        runtime.wait_quiescent = Mock()
+        runtime.peers = Mock()
+        runtime.peers.wait_idle.return_value = True
+
+        runtime.request_consistent_snapshot(timeout=2.0)
+
+        runtime.peers.pause.assert_called_once_with()
+        runtime.peers.wait_idle.assert_called_once()
+        runtime.wait_quiescent.assert_called_once()
+        self.assertFalse(runtime.wait_quiescent.call_args.kwargs["settle_peers"])
+        self.assertFalse(runtime.wait_quiescent.call_args.kwargs["resume_peers"])
+        runtime.snapshot_service.request_consistent_capture.assert_called_once()
+        runtime.peers.resume.assert_called_once_with()
+        self.assertFalse(runtime._snapshot_freeze.is_set())
 
 
 if __name__ == "__main__":
