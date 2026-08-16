@@ -57,13 +57,17 @@ def experience(*, polarity: int) -> ExperienceEvent:
 
 
 class LiveLearningRegressionTests(unittest.TestCase):
-    def test_m1_terminal_label_does_not_change_behavioral_value(self) -> None:
+    def test_m1_primary_valence_changes_drive_evidence_without_changing_identity(self) -> None:
         positive = derive_proposal(MemoryLevel.M1, PipelineEvent(experience(polarity=1)))
         neutral = derive_proposal(MemoryLevel.M1, PipelineEvent(experience(polarity=0)))
         negative = derive_proposal(MemoryLevel.M1, PipelineEvent(experience(polarity=-1)))
-        self.assertAlmostEqual(positive.significance_sum, neutral.significance_sum)
-        self.assertAlmostEqual(neutral.significance_sum, negative.significance_sum)
-        self.assertGreater(positive.significance_sum, 0.0)
+        self.assertEqual(positive.uid, neutral.uid)
+        self.assertEqual(neutral.uid, negative.uid)
+        self.assertAlmostEqual(positive.primary_valence_sum, 1.0)
+        self.assertAlmostEqual(negative.primary_valence_sum, -1.0)
+        self.assertAlmostEqual(neutral.primary_valence_weight, 0.0)
+        self.assertAlmostEqual(positive.significance_sum, negative.significance_sum)
+        self.assertGreater(positive.significance_sum, neutral.significance_sum)
 
     def test_m6_terminal_label_does_not_change_outcome_identity(self) -> None:
         positive = derive_proposal(MemoryLevel.M6, PipelineEvent(experience(polarity=1)))
