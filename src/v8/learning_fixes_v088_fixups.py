@@ -15,7 +15,7 @@ def _install_outcome_conditioned_efficiency() -> None:
     from v8 import learning_blockers_v055 as blocker_module
 
     # v8.8 initially restored the pre-v8.4 absolute cost term to regain search
-    # pressure.  Search is now explicit, so remove that term again and retain the
+    # pressure. Search is now explicit, so remove that term again and retain the
     # v8.4 outcome-conditioned relative efficiency semantics.
     current_score_rows = behavior_module._score_strategy_rows
 
@@ -37,7 +37,7 @@ def _install_outcome_conditioned_efficiency() -> None:
     behavior_module._score_strategy_rows = score_rows
 
     # v8.5 composite plans also carried an unconditional 1/path-length bonus, and
-    # v8.8 initially added empirical absolute cost on top.  Remove both and add a
+    # v8.8 initially added empirical absolute cost on top. Remove both and add a
     # relative term only when at least two procedures target the same M6 outcome.
     current_composites = blocker_module._composite_plans
 
@@ -109,14 +109,17 @@ def _install_cross_context_probe_fallback() -> None:
             # Keep those available for an explicit validation probe, but never let
             # them bypass the normal behavioral control gate.
             by_uid = getattr(self, "_node_by_uid", {})
-            return tuple(
-                plan
-                for plan in plans
-                if not blocker_module.is_composite_strategy(by_uid.get(plan.strategy_uid))
-                or behavior_module.strategy_can_control(
+            admitted = []
+            for plan in plans:
+                row = by_uid.get(plan.strategy_uid)
+                if row is None or not blocker_module.is_composite_strategy(row):
+                    admitted.append(plan)
+                    continue
+                if behavior_module.strategy_can_control(
                     self, plan.strategy_uid, plan.outcome_uid
-                )
-            )
+                ):
+                    admitted.append(plan)
+            return tuple(admitted)
 
         if plans:
             return plans
