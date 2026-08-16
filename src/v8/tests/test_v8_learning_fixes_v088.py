@@ -198,14 +198,15 @@ class V088LearningFixTests(unittest.TestCase):
         self.assertGreater(paired[0].score, paired[1].score)
         self.assertAlmostEqual(scores((fast,))[0].score, scores((slow,))[0].score)
 
-    def test_progress_reports_first_best_and_last_solve_lengths(self):
+    def test_progress_reports_best_and_last_solve_lengths(self):
         from v8 import diagnostics
 
         rows = (
             ActorProgress(1, "ez01", 1000, 3, 0, 5, first_win_step=205, best_win_steps=180, last_win_steps=190),
         )
         line = diagnostics.format_game_rate_line(rows)
-        self.assertIn("ez01:first=205,best=180,last=190", line)
+        self.assertIn("ez01:B=180,L=190", line)
+        self.assertNotIn("first=", line)
 
     def test_memory_free_action_is_seeded_but_memory_independent(self):
         from random import Random
