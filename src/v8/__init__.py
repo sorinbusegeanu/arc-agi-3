@@ -52,6 +52,9 @@ from v8.learning_blockers_v055_fixups import (
 from v8.normalized_memory_v086 import (
     install_normalized_memory_v086 as _install_normalized_memory_v086,
 )
+from v8.normalized_memory_v086_fixups import (
+    install_normalized_memory_v086_fixups as _install_normalized_memory_v086_fixups,
+)
 
 # Install semantic layers in chronological order. v8.6 is last because it changes
 # the M0->M1 abstraction boundary while preserving v8.5 local control behavior.
@@ -64,6 +67,7 @@ _install_hypothesis_validation_v054()
 _install_learning_blockers_v055()
 _install_learning_blockers_v055_fixups()
 _install_normalized_memory_v086()
+_install_normalized_memory_v086_fixups()
 
 # Preserve existing import paths: `from v8.runtime import ContinuousMemoryRuntime`
 # and the package-level API both resolve to the current semantic layer.
