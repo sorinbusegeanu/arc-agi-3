@@ -9,7 +9,7 @@ from v8 import primary_valence as _primary
 _INSTALLED = False
 _BASE_EXPERIENCE = None
 _BASE_RESET_CAPTURE = None
-_LOCAL_STEP = 0
+_FIRST_PRODUCER_SEQUENCE = 0
 _FIRST_WIN_STEP = 0
 
 
@@ -27,20 +27,31 @@ class ActorProgress:
 
 
 def _reset_progress_capture() -> None:
-    global _LOCAL_STEP, _FIRST_WIN_STEP
+    global _FIRST_PRODUCER_SEQUENCE, _FIRST_WIN_STEP
     if _BASE_RESET_CAPTURE is not None:
         _BASE_RESET_CAPTURE()
-    _LOCAL_STEP = 0
+    _FIRST_PRODUCER_SEQUENCE = 0
     _FIRST_WIN_STEP = 0
 
 
 def _experience_with_progress(*args, **kwargs):
-    global _LOCAL_STEP, _FIRST_WIN_STEP
+    global _FIRST_PRODUCER_SEQUENCE, _FIRST_WIN_STEP
     event = _BASE_EXPERIENCE(*args, **kwargs)
     if bool(getattr(_primary, "_CAPTURE_ACTIVE", False)):
-        _LOCAL_STEP += 1
-        if int(getattr(event, "terminal_polarity", 0)) > 0 and _FIRST_WIN_STEP <= 0:
-            _FIRST_WIN_STEP = int(_LOCAL_STEP)
+        producer_sequence = int(getattr(event, "producer_sequence", 0))
+        if _FIRST_PRODUCER_SEQUENCE <= 0 and producer_sequence > 0:
+            _FIRST_PRODUCER_SEQUENCE = producer_sequence
+        local_step = (
+            producer_sequence - _FIRST_PRODUCER_SEQUENCE + 1
+            if producer_sequence > 0 and _FIRST_PRODUCER_SEQUENCE > 0
+            else 0
+        )
+        if (
+            int(getattr(event, "terminal_polarity", 0)) > 0
+            and _FIRST_WIN_STEP <= 0
+            and local_step > 0
+        ):
+            _FIRST_WIN_STEP = int(local_step)
     return event
 
 
