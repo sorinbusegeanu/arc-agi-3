@@ -79,6 +79,7 @@ class LiveReadView:
         self._nodes = tuple(SharedNodeArena.attach(d.nodes) for d in self.descriptors)
         self._edges = tuple(SharedEdgeArena.attach(d.edges) for d in self.descriptors)
         self._actions = tuple(SharedActionArena.attach(d.actions) for d in self.descriptors)
+        self._record_cache: dict[int, tuple[tuple[object, ...], int]] = {}
         self._strategy_version: tuple[int, ...] = ()
         self._strategy_by_context: dict[int, list[_StrategyRow]] = {}
         self._strategy_fallback: list[_StrategyRow] = []
@@ -87,6 +88,8 @@ class LiveReadView:
         self._parents: dict[MemoryUid, set[MemoryUid]] = {}
         self._node_by_uid: dict[MemoryUid, NodeRecord] = {}
         self._refined_action_scores: dict[tuple[int, int], tuple[int, float]] = {}
+        for arena in (*self._nodes, *self._edges):
+            self._stable_records_with_version(arena)
 
     def close(self) -> None:
         for arena in (*self._nodes, *self._edges, *self._actions):
@@ -157,24 +160,32 @@ class LiveReadView:
             return {}
         return {outcome: count / total for outcome, count in counts.items()}
 
-    @staticmethod
-    def _stable_records_with_version(arena, *, timeout: float = 1.0):
+    def _stable_records_with_version(self, arena, *, timeout: float = 1.0):
+        cache_key = id(arena)
+        cached = self._record_cache.get(cache_key)
         deadline = time.monotonic() + max(0.01, float(timeout))
         while time.monotonic() < deadline:
             before = arena.sequence
             if before & 1:
+                if cached is not None:
+                    return cached
                 time.sleep(0.0005)
                 continue
             rows = tuple(arena.records())
             after = arena.sequence
             if before == after and not (after & 1):
-                return rows, int(after)
+                snapshot = (rows, int(after))
+                self._record_cache[cache_key] = snapshot
+                return snapshot
+            if cached is not None:
+                return cached
             time.sleep(0)
+        if cached is not None:
+            return cached
         raise RuntimeError(f"could not obtain coherent live {arena.kind} records")
 
-    @staticmethod
-    def _stable_records(arena, *, timeout: float = 1.0):
-        rows, _version = LiveReadView._stable_records_with_version(arena, timeout=timeout)
+    def _stable_records(self, arena, *, timeout: float = 1.0):
+        rows, _version = self._stable_records_with_version(arena, timeout=timeout)
         return rows
 
     def node_records(self, *, level: MemoryLevel | int | None = None) -> tuple[NodeRecord, ...]:
