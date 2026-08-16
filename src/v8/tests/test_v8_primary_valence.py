@@ -23,6 +23,7 @@ from v8.model import (
 )
 from v8.observation_contract import ARC_GRID_CONTRACT
 from v8.runtime_v82 import V82ContinuousMemoryRuntime
+from v8.trajectory_efficiency_v054 import _TRACKER
 
 
 class PrimaryValenceTests(unittest.TestCase):
@@ -152,20 +153,25 @@ class PrimaryValenceTests(unittest.TestCase):
 
     def test_strategy_achievement_reliability_is_not_terminal_valence(self) -> None:
         strategy = MemoryUid.from_key(MemoryLevel.M7, MemoryType.STRATEGY, (1, 2, 3, 4))
+        _TRACKER.reset()
+        _TRACKER.stats[strategy] = [3.0, 1.0, 5.0]
         primary_valence._WINDOW_ACHIEVEMENT.clear()
-        primary_valence._WINDOW_ACHIEVEMENT[strategy] = [3.0, 1.0, 5.0]
-        batch = actor._learning_batch(
-            job=SimpleNamespace(actor_id=7, game_id="g"),
-            strategy_stats={strategy: [3.0, 3.0, 7.0]},
-            preference_probes=[],
-            replanning_trials=[],
-        )
-        self.assertIsNotNone(batch)
-        stat = batch.strategy_stats[0]
-        self.assertEqual(stat.attempts, 3)
-        self.assertEqual(stat.successes, 1)
-        self.assertAlmostEqual(stat.cost, 5.0)
-        primary_valence._WINDOW_ACHIEVEMENT.clear()
+        primary_valence._WINDOW_ACHIEVEMENT[strategy] = [3.0, 3.0, 1.0]
+        try:
+            batch = actor._learning_batch(
+                job=SimpleNamespace(actor_id=7, game_id="g"),
+                strategy_stats={strategy: [3.0, 3.0, 7.0]},
+                preference_probes=[],
+                replanning_trials=[],
+            )
+            self.assertIsNotNone(batch)
+            stat = batch.strategy_stats[0]
+            self.assertEqual(stat.attempts, 3)
+            self.assertEqual(stat.successes, 1)
+            self.assertAlmostEqual(stat.cost, 5.0)
+        finally:
+            _TRACKER.reset()
+            primary_valence._WINDOW_ACHIEVEMENT.clear()
 
     def test_primary_valence_is_admitted_without_task_semantic_reward_fields(self) -> None:
         forbidden = set(ARC_GRID_CONTRACT.forbidden_semantic_fields)
@@ -176,9 +182,12 @@ class PrimaryValenceTests(unittest.TestCase):
         self.assertNotIn("primary_valence", forbidden)
         self.assertEqual(ARC_GRID_CONTRACT.contract_id, "arc-grid-v1-primary-valence")
 
-    def test_runtime_reports_v053_semantics(self) -> None:
-        self.assertEqual(V82ContinuousMemoryRuntime.research_paper_version, "0.5.3")
-        self.assertEqual(V82ContinuousMemoryRuntime.scientific_semantics_version, "v8.3-primary-valence")
+    def test_runtime_reports_v054_semantics(self) -> None:
+        self.assertEqual(V82ContinuousMemoryRuntime.research_paper_version, "0.5.4")
+        self.assertEqual(
+            V82ContinuousMemoryRuntime.scientific_semantics_version,
+            "v8.4-outcome-conditioned-efficiency",
+        )
 
 
 if __name__ == "__main__":
