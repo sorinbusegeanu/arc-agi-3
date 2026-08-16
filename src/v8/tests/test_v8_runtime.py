@@ -8,13 +8,16 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+from v8.behavior_recovery import strategy_can_control
 from v8.model import (
+    CognitiveState,
     EventId,
     ExperienceEvent,
     MemoryLevel,
     MemoryType,
     MemoryUid,
     PipelineEvent,
+    ValidationState,
     decode_pipeline,
     encode_pipeline,
 )
@@ -91,7 +94,7 @@ class RuntimeTests(unittest.TestCase):
                 )
             )
 
-    def test_continuous_pipeline_stops_higher_formation_until_concept_validation(self) -> None:
+    def test_continuous_pipeline_allows_probe_scaffold_without_prevalidation_control(self) -> None:
         root = Path(tempfile.mkdtemp())
         runtime = ContinuousMemoryRuntime(self.config(root, snapshots=False, restore=False))
         try:
@@ -99,13 +102,37 @@ class RuntimeTests(unittest.TestCase):
             self.populate(runtime, 120)
             runtime.wait_quiescent(timeout=20)
             counts = runtime.read_view.level_counts()
-            # Raw and structural evidence can develop through M4. v8.7 intentionally
-            # forbids M5/M6/M7 from appearing until an M4 concept has passed held-out
-            # empirical transfer validation.
+            # Raw and structural evidence develops through M4. v8.8 may create
+            # probationary M5-M7 descendants so M4 transfer can be tested without
+            # circular dependence on an already validated M7 strategy.
             for level in (MemoryLevel.M0, MemoryLevel.M1, MemoryLevel.M2, MemoryLevel.M3, MemoryLevel.M4):
                 self.assertGreater(counts[int(level)], 0, f"M{int(level)} remained empty")
-            for level in (MemoryLevel.M5, MemoryLevel.M6, MemoryLevel.M7):
-                self.assertEqual(counts[int(level)], 0, f"M{int(level)} formed before validated M4")
+            self.assertGreater(counts[int(MemoryLevel.M5)], 0, "M5 probe scaffold was not formed")
+
+            higher = tuple(
+                row
+                for row in runtime.read_view.node_records()
+                if int(row.level) >= int(MemoryLevel.M5)
+            )
+            self.assertTrue(higher)
+            for row in higher:
+                self.assertNotEqual(
+                    int(row.validation_state),
+                    int(ValidationState.VALIDATED),
+                    f"M{int(row.level)} validated before empirical M4 transfer",
+                )
+                self.assertNotIn(
+                    int(row.cognitive_state),
+                    {int(CognitiveState.VALIDATED), int(CognitiveState.REACTIVATED)},
+                    f"M{int(row.level)} became validated control before empirical M4 transfer",
+                )
+                if int(row.level) == int(MemoryLevel.M7) and len(row.key_parts) >= 3:
+                    outcome_uid = MemoryUid(int(row.key_parts[1]), int(row.key_parts[2]))
+                    self.assertFalse(
+                        strategy_can_control(runtime.read_view, row.uid, outcome_uid),
+                        "provisional M7 scaffold became normal control before M4 validation",
+                    )
+
             self.assertGreater(runtime.read_view.edge_count, 0)
             self.assertEqual(runtime.metrics()["unsaved_tail"], runtime.watermark)
             normalization = runtime.metrics()["memory_normalization"]
