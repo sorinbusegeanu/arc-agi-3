@@ -8,6 +8,7 @@ import numpy as np
 
 import v8
 from v7.environment.arc_adapter import ArcGridEnvironment
+from v8.action_targeting_v810 import is_structural_click_token, structural_click_targets
 from v8.arena import EdgeRecord, NodeRecord
 from v8.behavior_recovery import CausalEvidenceGatedPromotionEngine
 from v8.future_options import FutureOptionEstimator
@@ -133,17 +134,20 @@ class LearningBlockersV055Tests(unittest.TestCase):
         self.assertEqual(len(seen), 4096)
         self.assertEqual(unpack_action_choice(3), (3, None))
 
-    def test_environment_exposes_bounded_pages_and_executes_coordinate_payload(self):
+    def test_environment_exposes_structural_targets_and_executes_coordinate_payload(self):
         env = ArcGridEnvironment(game_id="fixture", env_factory=_factory)
         first = env.available_actions()
-        self.assertEqual(len(first), 65)
-        complex_tokens = [value for value in first if value != 1]
-        self.assertEqual(len(complex_tokens), 64)
-        token = pack_action_choice(6, 12, 34)
-        env.step(token)
-        self.assertEqual(env.env.calls[-1], (6, {"x": 12, "y": 34}))
+        self.assertIn(1, first)
+        self.assertNotIn(6, first)
+        complex_tokens = [value for value in first if is_structural_click_token(value)]
+        self.assertTrue(complex_tokens)
+        self.assertLessEqual(len(complex_tokens), 96)
+        target = structural_click_targets(env.observe())[0]
+        self.assertIn(target.token, first)
+        env.step(target.token)
+        self.assertEqual(env.env.calls[-1], (6, {"x": target.x, "y": target.y}))
         second = env.available_actions()
-        self.assertNotEqual(set(complex_tokens), set(value for value in second if value != 1))
+        self.assertEqual(set(first), set(second))
 
     def test_level_advancement_remains_positive_primitive_signal(self):
         env = ArcGridEnvironment(game_id="fixture", env_factory=_factory)
