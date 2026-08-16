@@ -6,9 +6,6 @@ from v8.primary_valence import (
     install_primary_valence_runtime as _install_primary_valence_runtime,
     install_primary_valence_schema as _install_primary_valence_schema,
 )
-from v8.primary_valence_fixups import (
-    install_primary_valence_runtime_fixups as _unused_runtime_fixups,
-) if False else (None,)
 
 _install_primary_valence_schema()
 from v8.primary_valence_fixups import install_schema_fixups as _install_schema_fixups
