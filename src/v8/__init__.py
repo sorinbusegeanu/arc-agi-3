@@ -92,6 +92,9 @@ from v8.trajectory_optimizer_v814_fixups import (
 from v8.restart_memory_v815 import (
     install_restart_memory_v815 as _install_restart_memory_v815,
 )
+from v8.restart_memory_v815_fixups import (
+    install_restart_memory_v815_fixups as _install_restart_memory_v815_fixups,
+)
 
 # Install semantic layers in chronological order. v8.15 is last so restart-memory
 # fallback, session retention and trajectory phase reuse see the final policy stack.
@@ -119,6 +122,7 @@ _install_dedicated_lifecycle_v813()
 _install_trajectory_optimizer_v814()
 _install_trajectory_optimizer_v814_fixups()
 _install_restart_memory_v815()
+_install_restart_memory_v815_fixups()
 
 # Preserve existing import paths: `from v8.runtime import ContinuousMemoryRuntime`
 # and the package-level API both resolve to the current semantic layer.
