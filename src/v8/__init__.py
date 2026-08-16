@@ -59,6 +59,9 @@ from v8.intelligence_loop_v087_fixups import (
 from v8.learning_fixes_v088 import (
     install_learning_fixes_v088 as _install_learning_fixes_v088,
 )
+from v8.learning_fixes_v088_fixups import (
+    install_learning_fixes_v088_fixups as _install_learning_fixes_v088_fixups,
+)
 
 # Install semantic layers in chronological order. v8.8 is last so the fixes apply
 # to the complete v8.7 behavior without changing the RAM/snapshot substrate.
@@ -75,6 +78,7 @@ _install_normalized_memory_v086_fixups()
 _install_intelligence_loop_v087()
 _install_intelligence_loop_v087_fixups()
 _install_learning_fixes_v088()
+_install_learning_fixes_v088_fixups()
 
 # Preserve existing import paths: `from v8.runtime import ContinuousMemoryRuntime`
 # and the package-level API both resolve to the current semantic layer.
