@@ -93,11 +93,11 @@ class TrajectoryEfficiencyV054Tests(unittest.TestCase):
         self.assertIn("strategy_efficiency", h12.required_evidence)
         self.assertIn("primary_valence_efficiency", h12.candidate_evidence)
 
-    def test_runtime_reports_v054_semantics(self) -> None:
+    def test_runtime_reports_v8_5_semantics(self) -> None:
         self.assertEqual(V82ContinuousMemoryRuntime.research_paper_version, "0.5.4")
         self.assertEqual(
             V82ContinuousMemoryRuntime.scientific_semantics_version,
-            "v8.4-outcome-conditioned-efficiency",
+            "v8.5-learning-capability",
         )
 
 
