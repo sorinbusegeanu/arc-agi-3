@@ -21,24 +21,20 @@ def install_trajectory_optimizer_v814_fixups() -> None:
             self._v814_active_actions = ()
             self._v814_attempted_variants = set()
 
-        available = {int(value) for value in action_ids}
         active = getattr(self, "_v814_active_variant", None)
         remaining = tuple(getattr(self, "_v814_active_actions", ()))
         if active is not None and remaining:
             action = int(remaining[0])
-            if action in available:
-                self._v814_active_actions = remaining[1:]
-                plan = PlannedAction(
-                    action,
-                    active.target_outcome_uid,
-                    active.strategy_uid,
-                    1_000_000.0,
-                    False,
-                )
-                self._behavior_last_plans = (plan,)
-                return (plan,)
-            self._v814_active_variant = None
-            self._v814_active_actions = ()
+            self._v814_active_actions = remaining[1:]
+            plan = PlannedAction(
+                action,
+                active.target_outcome_uid,
+                active.strategy_uid,
+                1_000_000.0,
+                False,
+            )
+            self._behavior_last_plans = (plan,)
+            return (plan,)
 
         optimizer._refresh_view_variants(self)
         selected = optimizer.select_validated_variant(
@@ -50,19 +46,17 @@ def install_trajectory_optimizer_v814_fixups() -> None:
         )
         if selected is not None:
             self._v814_attempted_variants.add(selected.variant_id)
-            action = int(selected.actions[0])
-            if action in available:
-                self._v814_active_variant = selected
-                self._v814_active_actions = tuple(selected.actions[1:])
-                plan = PlannedAction(
-                    action,
-                    selected.target_outcome_uid,
-                    selected.strategy_uid,
-                    1_000_000.0,
-                    False,
-                )
-                self._behavior_last_plans = (plan,)
-                return (plan,)
+            self._v814_active_variant = selected
+            self._v814_active_actions = tuple(selected.actions[1:])
+            plan = PlannedAction(
+                int(selected.actions[0]),
+                selected.target_outcome_uid,
+                selected.strategy_uid,
+                1_000_000.0,
+                False,
+            )
+            self._behavior_last_plans = (plan,)
+            return (plan,)
 
         return optimizer._BASE_PLAN_CANDIDATES(
             self, context_signature, action_ids, **kwargs
