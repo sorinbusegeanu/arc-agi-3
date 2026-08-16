@@ -67,8 +67,9 @@ def _publish_progress(
     replans: int,
     planned_steps: int,
 ) -> None:
-    first_win_step = int(_FIRST_WIN_STEP)
-    if int(wins) > 0 and first_win_step <= 0:
+    capture_active = bool(getattr(_primary, "_CAPTURE_ACTIVE", False))
+    first_win_step = int(_FIRST_WIN_STEP) if capture_active else 0
+    if capture_active and int(wins) > 0 and first_win_step <= 0:
         first_win_step = int(steps)
     row = ActorProgress(
         int(job.actor_id),
