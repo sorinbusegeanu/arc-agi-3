@@ -1,4 +1,4 @@
-"""ARC-AGI-3 v8.3 primary-valence RAM-authoritative developmental memory runtime."""
+"""ARC-AGI-3 v8.4 primary-valence and trajectory-efficiency runtime."""
 
 # Install the v0.5.3 memory schema before importing development/runtime modules so
 # proposal packets, shared arenas and snapshot compatibility agree on one layout.
@@ -34,14 +34,22 @@ finally:
 from v8.runtime_v82 import V82ContinuousMemoryRuntime
 from v8.behavior_recovery import install_behavior_recovery as _install_behavior_recovery
 from v8.primary_valence_fixups import install_runtime_fixups as _install_runtime_fixups
+from v8.trajectory_efficiency_v054 import (
+    install_trajectory_efficiency_v054 as _install_trajectory_efficiency_v054,
+)
+from v8.progress_reporting_v054 import (
+    install_progress_reporting_v054 as _install_progress_reporting_v054,
+)
 
 # Behavioral recovery establishes canonical M6 recognition, causal M7 formation,
-# planner admission and exploration. Primary-valence semantics then add signed drive
-# evidence, delayed trajectory credit and valence-grounded preference without
-# changing structural memory identity.
+# planner admission and exploration. Primary-valence semantics add signed drive
+# evidence and delayed credit. v0.5.4 then makes realized actions-to-outcome a
+# distinct M7 efficiency statistic, compared only inside outcome/context cohorts.
 _install_behavior_recovery()
 _install_primary_valence_runtime()
 _install_runtime_fixups()
+_install_trajectory_efficiency_v054()
+_install_progress_reporting_v054()
 
 # Preserve existing import paths: `from v8.runtime import ContinuousMemoryRuntime`
 # and the package-level API both resolve to the current semantic layer.
