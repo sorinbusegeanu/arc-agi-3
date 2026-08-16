@@ -1,9 +1,89 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from v8.model import stable_u64
 
 
 _INSTALLED = False
+_RELATIVE_EFFICIENCY_WEIGHT = 0.15
+
+
+def _install_outcome_conditioned_efficiency() -> None:
+    """Keep efficiency comparative inside one outcome/context cohort."""
+    from v8 import behavior_recovery as behavior_module
+    from v8 import learning_blockers_v055 as blocker_module
+
+    # v8.8 initially restored the pre-v8.4 absolute cost term to regain search
+    # pressure.  Search is now explicit, so remove that term again and retain the
+    # v8.4 outcome-conditioned relative efficiency semantics.
+    current_score_rows = behavior_module._score_strategy_rows
+
+    def score_rows(view, rows, **kwargs):
+        rows = tuple(rows)
+        plans = list(current_score_rows(view, rows, **kwargs))
+        by_uid = {row.strategy_uid: row for row in rows}
+        adjusted = []
+        for plan in plans:
+            row = by_uid.get(plan.strategy_uid)
+            if row is None:
+                adjusted.append(plan)
+                continue
+            absolute = 0.10 / max(1.0, float(row.mean_cost))
+            adjusted.append(replace(plan, score=float(plan.score) - absolute))
+        adjusted.sort(key=lambda item: (-item.score, item.action_id, item.strategy_uid))
+        return tuple(adjusted)
+
+    behavior_module._score_strategy_rows = score_rows
+
+    # v8.5 composite plans also carried an unconditional 1/path-length bonus, and
+    # v8.8 initially added empirical absolute cost on top.  Remove both and add a
+    # relative term only when at least two procedures target the same M6 outcome.
+    current_composites = blocker_module._composite_plans
+
+    def composite_plans(view, context_signature, action_ids):
+        plans = list(current_composites(view, context_signature, action_ids))
+        by_uid = getattr(view, "_node_by_uid", {})
+        rows = []
+        grouped: dict[object, list[int]] = {}
+        for index, plan in enumerate(plans):
+            row = by_uid.get(plan.strategy_uid)
+            if row is None:
+                rows.append((plan, float(plan.score), 1.0))
+                grouped.setdefault(plan.outcome_uid, []).append(index)
+                continue
+            path = blocker_module._path_for_composite(view, row, int(context_signature))
+            path_cost = float(max(1, len(path)))
+            base_score = float(plan.score) - 0.10 / path_cost
+            attempts = float(getattr(row, "attempt_weight", 0.0))
+            if attempts > 0.0:
+                empirical_cost = max(1.0, float(getattr(row, "strategy_mean_cost", 1.0)))
+                base_score -= 0.10 / empirical_cost
+                cost = empirical_cost
+            else:
+                cost = path_cost
+            rows.append((plan, base_score, cost))
+            grouped.setdefault(plan.outcome_uid, []).append(index)
+
+        relative: dict[int, float] = {}
+        for members in grouped.values():
+            if len(members) < 2:
+                continue
+            best = min(rows[index][2] for index in members)
+            for index in members:
+                relative[index] = max(0.0, min(1.0, best / max(1.0, rows[index][2])))
+
+        adjusted = [
+            replace(
+                plan,
+                score=base_score + _RELATIVE_EFFICIENCY_WEIGHT * relative.get(index, 0.0),
+            )
+            for index, (plan, base_score, _cost) in enumerate(rows)
+        ]
+        adjusted.sort(key=lambda item: (-item.score, item.action_id, item.strategy_uid))
+        return tuple(adjusted)
+
+    blocker_module._composite_plans = composite_plans
 
 
 def _install_cross_context_probe_fallback() -> None:
@@ -17,10 +97,17 @@ def _install_cross_context_probe_fallback() -> None:
         plans = tuple(current_plan_candidates(self, context_signature, action_ids, **kwargs))
         required_ancestor = kwargs.get("required_ancestor")
 
-        # v8.5 composite planning admitted probationary composites directly.  Keep
-        # those available for an explicit validation probe, but never let them
-        # bypass the normal behavioral control gate.
         if required_ancestor is None:
+            # Preserve actor epsilon/efficiency-search randomization even when the
+            # v8.5 composite planner found a replayable procedure after the base
+            # behavior layer deliberately requested random exploration.
+            if bool(getattr(self, "_behavior_force_random", False)):
+                self._behavior_last_plans = ()
+                return ()
+
+            # v8.5 composite planning admitted probationary composites directly.
+            # Keep those available for an explicit validation probe, but never let
+            # them bypass the normal behavioral control gate.
             by_uid = getattr(self, "_node_by_uid", {})
             return tuple(
                 plan
@@ -69,5 +156,6 @@ def install_learning_fixes_v088_fixups() -> None:
     global _INSTALLED
     if _INSTALLED:
         return
+    _install_outcome_conditioned_efficiency()
     _install_cross_context_probe_fallback()
     _INSTALLED = True

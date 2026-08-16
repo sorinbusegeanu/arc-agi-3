@@ -163,7 +163,7 @@ class V088LearningFixTests(unittest.TestCase):
         self.assertEqual(summary.attempted, 0)
         self.assertEqual(summary.completed, 0)
 
-    def test_single_strategy_retains_absolute_efficiency_pressure(self):
+    def test_efficiency_is_relative_to_same_outcome_alternatives(self):
         from v8 import behavior_recovery as behavior_module
 
         outcome = MemoryUid.from_key(MemoryLevel.M6, MemoryType.OUTCOME, (1, 2, 3))
@@ -178,21 +178,25 @@ class V088LearningFixTests(unittest.TestCase):
                 del strategy_uid, ancestor_uid
                 return True
 
-        def score(row):
+        fast = _StrategyRow(1, outcome, fast_uid, 5, 0.6, 2.0, 9, False, False)
+        slow = _StrategyRow(2, outcome, slow_uid, 5, 0.6, 8.0, 9, False, False)
+
+        def scores(rows):
             return behavior_module._score_strategy_rows(
                 View(),
-                (row,),
-                available={row.action_id},
+                rows,
+                available={row.action_id for row in rows},
                 outcome_uid=None,
                 required_ancestor=None,
                 excluded_strategies=frozenset(),
                 ignore_preference=True,
                 cross_context=False,
-            )[0].score
+            )
 
-        fast = _StrategyRow(1, outcome, fast_uid, 5, 0.6, 2.0, 9, False, False)
-        slow = _StrategyRow(2, outcome, slow_uid, 5, 0.6, 8.0, 9, False, False)
-        self.assertGreater(score(fast), score(slow))
+        paired = scores((fast, slow))
+        self.assertEqual(paired[0].strategy_uid, fast_uid)
+        self.assertGreater(paired[0].score, paired[1].score)
+        self.assertAlmostEqual(scores((fast,))[0].score, scores((slow,))[0].score)
 
     def test_progress_reports_first_best_and_last_solve_lengths(self):
         from v8 import diagnostics
