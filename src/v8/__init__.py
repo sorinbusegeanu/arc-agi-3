@@ -21,6 +21,13 @@ finally:
     _development.STAGES = _full_stages
 
 from v8.runtime_v82 import V82ContinuousMemoryRuntime
+from v8.behavior_recovery import install_behavior_recovery as _install_behavior_recovery
+
+# Install the behavioral half of the v8.2 semantics after the RAM/concurrency
+# authority has loaded.  This keeps the runtime architecture unchanged while
+# enforcing causal strategy formation, empirical planner admission, canonical
+# outcome recognition and actor exploration.
+_install_behavior_recovery()
 
 # Preserve existing import paths: `from v8.runtime import ContinuousMemoryRuntime`
 # and the package-level API both resolve to the v8.2 semantic layer.

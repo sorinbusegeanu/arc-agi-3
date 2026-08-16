@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import unittest
 
-from v8.arena import SharedActionArena, SharedEdgeArena, SharedNodeArena, NodeRecord
+from v8.arena import EdgeRecord, SharedActionArena, SharedEdgeArena, SharedNodeArena, NodeRecord
 from v8.lifecycle import LifecycleController
 from v8.model import (
     CognitiveState,
     MemoryLevel,
     MemoryType,
     MemoryUid,
+    RelationType,
     ValidationState,
     stable_u64,
 )
@@ -61,6 +62,28 @@ def strategy_node(action: int, outcome: MemoryUid, context: int) -> NodeRecord:
     )
 
 
+def contingency_node(context: int, action: int) -> NodeRecord:
+    key = (context, action, 77, context + 1)
+    return NodeRecord(
+        uid=MemoryUid.from_key(MemoryLevel.M1, MemoryType.CONTINGENCY, key),
+        fingerprint=3,
+        level=int(MemoryLevel.M1),
+        memory_type=int(MemoryType.CONTINGENCY),
+        key_parts=key,
+        support_count=5,
+        significance_sum=2.0,
+        prediction_error_sum=0.0,
+        learning_value_sum=1.0,
+        transfer_prior_sum=0.0,
+        explanatory_sum=0.0,
+        future_option_sum=5.0,
+        score_weight=5.0,
+        updated_watermark=10,
+        cognitive_state=int(CognitiveState.ACTIVE),
+        validation_state=int(ValidationState.VALIDATED),
+    )
+
+
 class OutcomeSplitTests(unittest.TestCase):
     def test_failed_coarse_outcome_is_quarantined_as_split(self) -> None:
         coarse = outcome_node(
@@ -91,12 +114,44 @@ class OutcomeSplitTests(unittest.TestCase):
             )
             coarse_strategy = strategy_node(1, coarse.uid, 99)
             fine_strategy = strategy_node(2, fine.uid, 99)
+            fine_contingency = contingency_node(99, 2)
             nodes.begin_write()
             try:
-                for index, row in enumerate((coarse, fine, coarse_strategy, fine_strategy)):
+                for index, row in enumerate(
+                    (coarse, fine, coarse_strategy, fine_strategy, fine_contingency)
+                ):
                     nodes.write(index, row)
             finally:
-                nodes.end_write(count=4)
+                nodes.end_write(count=5)
+
+            # The active fine strategy is a scientifically admissible strategy:
+            # the observed M1 contingency belongs to the M6 outcome's lineage and
+            # the M7 strategy explicitly depends on that same contingency.
+            edges.begin_write()
+            try:
+                edges.write(
+                    0,
+                    EdgeRecord(
+                        fine.uid,
+                        int(RelationType.EXPLAINS),
+                        fine_contingency.uid,
+                        5,
+                        10,
+                    ),
+                )
+                edges.write(
+                    1,
+                    EdgeRecord(
+                        fine_strategy.uid,
+                        int(RelationType.DEPENDS_ON),
+                        fine_contingency.uid,
+                        5,
+                        10,
+                    ),
+                )
+            finally:
+                edges.end_write(count=2)
+
             descriptor = ShardReadDescriptor(nodes.descriptor, edges.descriptor, actions.descriptor)
             view = LiveReadView((descriptor,))
             candidates = view.plan_candidates(99, (1, 2))
