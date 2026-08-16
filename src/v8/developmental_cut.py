@@ -17,20 +17,30 @@ class DevelopmentalGenerationCut:
 
 
 def capture_developmental_cut(read_view, *, generation: int, watermark: int) -> DevelopmentalGenerationCut:
-    """Pin immutable per-shard records and expose one stable vector scientific cut.
+    """Pin one immutable scientific/developmental source cut.
 
-    Actors continue using the normal bounded-staleness LiveReadView.  This function
-    is for peer/scientific operations that need a declared multi-shard source cut.
+    Production LiveReadView exposes per-arena seqlock versions. Lightweight test or
+    analytical read views may expose only materialized record accessors; those are
+    still accepted as an already-frozen single-vector cut.
     """
     nodes: list[NodeRecord] = []
     edges: list[EdgeRecord] = []
     vector: list[tuple[int, int]] = []
-    for index, (node_arena, edge_arena) in enumerate(zip(read_view._nodes, read_view._edges, strict=True)):
-        node_rows, node_version = read_view._stable_records_with_version(node_arena)
-        edge_rows, edge_version = read_view._stable_records_with_version(edge_arena)
-        nodes.extend(node_rows)
-        edges.extend(edge_rows)
-        vector.append((int(node_version), int(edge_version)))
+    if (
+        hasattr(read_view, "_nodes")
+        and hasattr(read_view, "_edges")
+        and hasattr(read_view, "_stable_records_with_version")
+    ):
+        for node_arena, edge_arena in zip(read_view._nodes, read_view._edges, strict=True):
+            node_rows, node_version = read_view._stable_records_with_version(node_arena)
+            edge_rows, edge_version = read_view._stable_records_with_version(edge_arena)
+            nodes.extend(node_rows)
+            edges.extend(edge_rows)
+            vector.append((int(node_version), int(edge_version)))
+    else:
+        nodes.extend(tuple(read_view.node_records()))
+        edges.extend(tuple(read_view.edge_records()))
+        vector.append((int(generation), int(generation)))
 
     node_uids = {row.uid for row in nodes}
     # Pseudo GAME_PROVENANCE targets deliberately do not correspond to live nodes.
