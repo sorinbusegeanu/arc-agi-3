@@ -17,7 +17,12 @@ class LifecycleDecision:
 
 
 class LifecycleController:
-    """Hysteretic retention/quarantine/retirement decisions with provenance preserved."""
+    """Hysteretic retention/quarantine/retirement decisions with provenance preserved.
+
+    All memory levels participate in fitness hysteresis.  Retirement remains a
+    separate pruning decision: M0/M1 may reach RETIRE_PENDING here, but low-level
+    safety gates in PruningPlanner decide whether they are actually safe to retire.
+    """
 
     def __init__(
         self,
@@ -61,8 +66,6 @@ class LifecycleController:
         return min(1.0, base + validation_bonus + reliability_bonus)
 
     def decide(self, row: NodeRecord) -> LifecycleDecision | None:
-        if int(row.level) <= int(MemoryLevel.M1):
-            return None
         fitness = self.fitness(row)
         current = int(row.cognitive_state)
         validation = int(row.validation_state)
