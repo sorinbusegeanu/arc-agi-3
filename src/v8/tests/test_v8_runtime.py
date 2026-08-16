@@ -87,7 +87,7 @@ class RuntimeTests(unittest.TestCase):
                 )
             )
 
-    def test_continuous_pipeline_populates_all_memory_levels(self) -> None:
+    def test_continuous_pipeline_stops_higher_formation_until_concept_validation(self) -> None:
         root = Path(tempfile.mkdtemp())
         runtime = ContinuousMemoryRuntime(self.config(root, snapshots=False, restore=False))
         try:
@@ -95,8 +95,13 @@ class RuntimeTests(unittest.TestCase):
             self.populate(runtime, 120)
             runtime.wait_quiescent(timeout=20)
             counts = runtime.read_view.level_counts()
-            for level in MemoryLevel:
+            # Raw and structural evidence can develop through M4. v8.7 intentionally
+            # forbids M5/M6/M7 from appearing until an M4 concept has passed held-out
+            # empirical transfer validation.
+            for level in (MemoryLevel.M0, MemoryLevel.M1, MemoryLevel.M2, MemoryLevel.M3, MemoryLevel.M4):
                 self.assertGreater(counts[int(level)], 0, f"M{int(level)} remained empty")
+            for level in (MemoryLevel.M5, MemoryLevel.M6, MemoryLevel.M7):
+                self.assertEqual(counts[int(level)], 0, f"M{int(level)} formed before validated M4")
             self.assertGreater(runtime.read_view.edge_count, 0)
             self.assertEqual(runtime.metrics()["unsaved_tail"], runtime.watermark)
             normalization = runtime.metrics()["memory_normalization"]
