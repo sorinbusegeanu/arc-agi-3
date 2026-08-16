@@ -21,6 +21,7 @@ from v8.model import (
     PipelineEvent,
     ValidationState,
 )
+from v8.normalized_memory_v086 import is_grounded_contingency, is_normalized_contingency
 from v8.outcomes import OutcomeEquivalenceEstimator
 from v8.replay import ReplayScheduler
 from v8.runtime import ContinuousMemoryRuntime, V8RuntimeConfig
@@ -263,8 +264,17 @@ class RuntimeDurabilityTests(unittest.TestCase):
                 )
             runtime.wait_quiescent(timeout=10)
             m1 = runtime.read_view.node_records(level=MemoryLevel.M1)
-            self.assertEqual(len(m1), 1)
-            self.assertEqual(runtime.read_view.source_games(m1[0].uid), frozenset({1, 65}))
+            grounded = [row for row in m1 if is_grounded_contingency(row)]
+            normalized = [row for row in m1 if is_normalized_contingency(row)]
+            self.assertEqual(len(grounded), 2)
+            self.assertEqual(
+                {runtime.read_view.source_games(row.uid) for row in grounded},
+                {frozenset({1}), frozenset({65})},
+            )
+            self.assertTrue(normalized)
+            self.assertTrue(
+                any(runtime.read_view.source_games(row.uid) == frozenset({1, 65}) for row in normalized)
+            )
             runtime.close(normal=True, timeout=10)
 
     def test_peer_evidence_restores_with_final_snapshot(self) -> None:
