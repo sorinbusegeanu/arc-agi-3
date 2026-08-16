@@ -30,7 +30,7 @@ class TransferTrial:
 
 
 class TransferValidator:
-    """Separate prospective structural reuse from empirical held-out intervention."""
+    """Separate prospective reuse, structural admissibility and empirical transfer."""
 
     def __init__(self, *, effect_threshold: float = 0.0) -> None:
         self.effect_threshold = float(effect_threshold)
@@ -49,7 +49,6 @@ class TransferValidator:
             int(RelationType.PROVENANCE),
             int(RelationType.EXPLAINS),
             int(RelationType.CONTEXT_REFINES),
-            int(RelationType.TRANSFER_CORRESPONDENCE),
             int(RelationType.SUPERSEDES),
             int(RelationType.LEADS_TO),
         }
@@ -103,6 +102,8 @@ class TransferValidator:
                 if not edges:
                     edges = tuple(edge_records())
 
+        # Compatibility fallback for pure unit use without a graph.  In the live
+        # runtime, where edges are present, formal TRANSFER_CORRESPONDENCE is required.
         if not edges and provenance is None:
             result = []
             for row in eligible.values():
@@ -133,7 +134,7 @@ class TransferValidator:
 
         best: dict[MemoryUid, TransferCandidate] = {}
         for edge in edges:
-            if int(edge.relation_type) != int(RelationType.SIMILAR_TO):
+            if int(edge.relation_type) != int(RelationType.TRANSFER_CORRESPONDENCE):
                 continue
             if edge.source_uid not in eligible or edge.target_uid not in eligible:
                 continue
