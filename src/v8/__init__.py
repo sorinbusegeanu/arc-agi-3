@@ -1,9 +1,18 @@
-"""ARC-AGI-3 v8.2 RAM-authoritative developmental memory runtime."""
+"""ARC-AGI-3 v8.3 primary-valence RAM-authoritative developmental memory runtime."""
 
-# runtime.py remains the v8.1 RAM/concurrency authority.  During its import, bind
+# Install the v0.5.3 memory schema before importing development/runtime modules so
+# proposal packets, shared arenas and snapshot compatibility agree on one layout.
+from v8.primary_valence import (
+    install_primary_valence_runtime as _install_primary_valence_runtime,
+    install_primary_valence_schema as _install_primary_valence_schema,
+)
+
+_install_primary_valence_schema()
+
+# runtime.py remains the v8.1 RAM/concurrency authority. During its import, bind
 # only the scientific-semantic extension points: raw stage topology, peer supervisor,
-# and evaluator.  Direct derivation helpers retain the complete level table for
-# migration/unit-boundary compatibility but live raw events stop at M1.
+# and evaluator. Direct raw events still instantiate only M0/M1; M2-M7 emerge from
+# accumulated memory state.
 from v8 import development as _development
 from v8 import evaluation as _evaluation
 from v8 import peers as _peers
@@ -23,14 +32,15 @@ finally:
 from v8.runtime_v82 import V82ContinuousMemoryRuntime
 from v8.behavior_recovery import install_behavior_recovery as _install_behavior_recovery
 
-# Install the behavioral half of the v8.2 semantics after the RAM/concurrency
-# authority has loaded.  This keeps the runtime architecture unchanged while
-# enforcing causal strategy formation, empirical planner admission, canonical
-# outcome recognition and actor exploration.
+# Behavioral recovery establishes canonical M6 recognition, causal M7 formation,
+# planner admission and exploration. Primary-valence semantics then add signed drive
+# evidence, delayed trajectory credit and valence-grounded preference without
+# changing structural memory identity.
 _install_behavior_recovery()
+_install_primary_valence_runtime()
 
 # Preserve existing import paths: `from v8.runtime import ContinuousMemoryRuntime`
-# and the package-level API both resolve to the v8.2 semantic layer.
+# and the package-level API both resolve to the current semantic layer.
 _runtime.ContinuousMemoryRuntime = V82ContinuousMemoryRuntime
 ContinuousMemoryRuntime = V82ContinuousMemoryRuntime
 V8RuntimeConfig = _runtime.V8RuntimeConfig
