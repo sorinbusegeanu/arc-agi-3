@@ -207,7 +207,7 @@ class ActorProgressFanoutTests(unittest.TestCase):
 
 
 class DedicatedReporterProcessTests(unittest.TestCase):
-    def test_process_waits_for_interval_then_reports_progress_and_hypotheses(self) -> None:
+    def test_process_reports_progress_only_without_hypothesis_stdout(self) -> None:
         method = "forkserver" if "forkserver" in mp.get_all_start_methods() else "spawn"
         ctx = mp.get_context(method)
         watermark = ctx.Value("Q", 10)
@@ -230,11 +230,12 @@ class DedicatedReporterProcessTests(unittest.TestCase):
                 output.get(timeout=0.1)
 
             game_line = output.get(timeout=3.0)
-            hypothesis_line = output.get(timeout=3.0)
             self.assertIn("current_run_wins=50.0%", game_line)
             self.assertIn("current_run_levels_solved=20.0%", game_line)
             self.assertIn("current_run_solved_games=1/2 (tt01:B=20,L=20)", game_line)
-            self.assertIn("hypotheses H01=VALID", hypothesis_line)
+            self.assertNotIn("hypotheses", game_line)
+            with self.assertRaises(queue.Empty):
+                output.get(timeout=0.15)
         finally:
             reporter.close()
             output.close()
