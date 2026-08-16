@@ -74,6 +74,9 @@ from v8.action_targeting_v810_fixups import (
 from v8.final_save_lifecycle_v812 import (
     install_final_save_lifecycle_v812 as _install_final_save_lifecycle_v812,
 )
+from v8.final_save_lifecycle_v812_fixups import (
+    install_final_save_lifecycle_v812_fixups as _install_final_save_lifecycle_v812_fixups,
+)
 
 # Install semantic layers in chronological order. v8.12 is last so shutdown/snapshot
 # fixes observe all prior runtime overlays and lifecycle sees the final memory semantics.
@@ -95,6 +98,7 @@ _install_shutdown_semantics_v089()
 _install_action_targeting_v810()
 _install_action_targeting_v810_fixups()
 _install_final_save_lifecycle_v812()
+_install_final_save_lifecycle_v812_fixups()
 
 # Preserve existing import paths: `from v8.runtime import ContinuousMemoryRuntime`
 # and the package-level API both resolve to the current semantic layer.
