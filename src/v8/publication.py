@@ -158,7 +158,7 @@ class LiveReadView:
         return {outcome: count / total for outcome, count in counts.items()}
 
     @staticmethod
-    def _stable_records(arena, *, timeout: float = 1.0):
+    def _stable_records_with_version(arena, *, timeout: float = 1.0):
         deadline = time.monotonic() + max(0.01, float(timeout))
         while time.monotonic() < deadline:
             before = arena.sequence
@@ -168,9 +168,14 @@ class LiveReadView:
             rows = tuple(arena.records())
             after = arena.sequence
             if before == after and not (after & 1):
-                return rows
+                return rows, int(after)
             time.sleep(0)
         raise RuntimeError(f"could not obtain coherent live {arena.kind} records")
+
+    @staticmethod
+    def _stable_records(arena, *, timeout: float = 1.0):
+        rows, _version = LiveReadView._stable_records_with_version(arena, timeout=timeout)
+        return rows
 
     def node_records(self, *, level: MemoryLevel | int | None = None) -> tuple[NodeRecord, ...]:
         selected = []
@@ -251,23 +256,27 @@ class LiveReadView:
         return False
 
     def _refresh_strategy_cache(self) -> None:
-        deadline = time.monotonic() + 1.0
-        while time.monotonic() < deadline:
-            version_before = tuple(arena.sequence for arena in (*self._nodes, *self._edges))
-            if any(value & 1 for value in version_before):
-                time.sleep(0.0005)
-                continue
-            if version_before == self._strategy_version:
-                return
-            nodes = self.node_records()
-            edges = self.edge_records()
-            version_after = tuple(arena.sequence for arena in (*self._nodes, *self._edges))
-            if version_before == version_after and not any(value & 1 for value in version_after):
-                version = version_after
-                break
-            time.sleep(0)
-        else:
-            raise RuntimeError("could not obtain coherent node/edge publication cut")
+        current_version = tuple(arena.sequence for arena in (*self._nodes, *self._edges))
+        if current_version == self._strategy_version and not any(value & 1 for value in current_version):
+            return
+
+        nodes_list: list[NodeRecord] = []
+        node_versions: list[int] = []
+        for arena in self._nodes:
+            rows, version = self._stable_records_with_version(arena)
+            nodes_list.extend(rows)
+            node_versions.append(version)
+
+        edges_list: list[EdgeRecord] = []
+        edge_versions: list[int] = []
+        for arena in self._edges:
+            rows, version = self._stable_records_with_version(arena)
+            edges_list.extend(rows)
+            edge_versions.append(version)
+
+        nodes = tuple(nodes_list)
+        edges = tuple(edges_list)
+        version = tuple((*node_versions, *edge_versions))
 
         active_states = {
             int(CognitiveState.ACTIVE),
