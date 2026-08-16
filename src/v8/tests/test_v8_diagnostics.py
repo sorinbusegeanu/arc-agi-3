@@ -49,7 +49,7 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual(solved_game_steps(rows), (("game-a", 86),))
         self.assertEqual(
             format_game_rate_line(rows),
-            "wins=33.3% levels_solved=53.3% solved_games=1/3 (game-a:86)",
+            "current_run_wins=33.3% current_run_levels_solved=53.3% current_run_solved_games=1/3 (game-a:86)",
         )
 
     def test_distinct_solved_games_and_steps_are_not_double_counted_across_actor_lanes(self) -> None:
@@ -64,7 +64,7 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual(solved_game_steps(rows), (("ez01", 88), ("ez02", 94)))
         self.assertEqual(
             format_game_rate_line(rows),
-            "wins=66.7% levels_solved=80.0% solved_games=2/3 (ez01:88, ez02:94)",
+            "current_run_wins=66.7% current_run_levels_solved=80.0% current_run_solved_games=2/3 (ez01:88, ez02:94)",
         )
 
     def test_progress_line_is_single_dedicated_percentage_line(self) -> None:
@@ -73,7 +73,7 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertNotIn("\n", line)
         self.assertEqual(
             line,
-            "wins=100.0% levels_solved=100.0% solved_games=1/1 (ez01:101)",
+            "current_run_wins=100.0% current_run_levels_solved=100.0% current_run_solved_games=1/1 (ez01:101)",
         )
 
     def test_partial_progress_for_one_of_ten_games_is_visible(self) -> None:
@@ -90,7 +90,7 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual(solved_game_steps(()), ())
         self.assertEqual(
             format_game_rate_line(()),
-            "wins=0.0% levels_solved=0.0% solved_games=0/0",
+            "current_run_wins=0.0% current_run_levels_solved=0.0% current_run_solved_games=0/0",
         )
 
 
