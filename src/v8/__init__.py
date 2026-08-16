@@ -6,8 +6,13 @@ from v8.primary_valence import (
     install_primary_valence_runtime as _install_primary_valence_runtime,
     install_primary_valence_schema as _install_primary_valence_schema,
 )
+from v8.primary_valence_fixups import (
+    install_primary_valence_runtime_fixups as _unused_runtime_fixups,
+) if False else (None,)
 
 _install_primary_valence_schema()
+from v8.primary_valence_fixups import install_schema_fixups as _install_schema_fixups
+_install_schema_fixups()
 
 # runtime.py remains the v8.1 RAM/concurrency authority. During its import, bind
 # only the scientific-semantic extension points: raw stage topology, peer supervisor,
@@ -31,6 +36,7 @@ finally:
 
 from v8.runtime_v82 import V82ContinuousMemoryRuntime
 from v8.behavior_recovery import install_behavior_recovery as _install_behavior_recovery
+from v8.primary_valence_fixups import install_runtime_fixups as _install_runtime_fixups
 
 # Behavioral recovery establishes canonical M6 recognition, causal M7 formation,
 # planner admission and exploration. Primary-valence semantics then add signed drive
@@ -38,6 +44,7 @@ from v8.behavior_recovery import install_behavior_recovery as _install_behavior_
 # changing structural memory identity.
 _install_behavior_recovery()
 _install_primary_valence_runtime()
+_install_runtime_fixups()
 
 # Preserve existing import paths: `from v8.runtime import ContinuousMemoryRuntime`
 # and the package-level API both resolve to the current semantic layer.
