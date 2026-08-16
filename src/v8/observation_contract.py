@@ -21,7 +21,7 @@ class ObservationStructureContract:
 
     @property
     def digest(self) -> str:
-        h = blake2b(digest_size=16, person=b"v8.2-obs-contract")
+        h = blake2b(digest_size=16, person=b"v82-obs-contract")
         for value in (
             self.contract_id,
             self.schema_version,
