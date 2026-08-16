@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from v8.arena import EdgeRecord, NodeRecord, SharedEdgeArena, SharedNodeArena
-from v8.model import CognitiveState, MemoryUid
+from v8.model import CognitiveState, MemoryLevel, MemoryType, MemoryUid, RelationType
 from v8.publication import ShardReadDescriptor
 
 
@@ -37,22 +37,106 @@ def _edge_payload(row: EdgeRecord) -> dict[str, object]:
     }
 
 
+def _is_grounded_m1(row: NodeRecord) -> bool:
+    return bool(
+        int(row.level) == int(MemoryLevel.M1)
+        and int(row.memory_type) == int(MemoryType.CONTINGENCY)
+        and len(row.key_parts) >= 4
+    )
+
+
+def _promote_low_level_provenance(
+    *,
+    descriptors: tuple[ShardReadDescriptor, ...],
+    by_uid: dict[MemoryUid, NodeRecord],
+    retired: set[MemoryUid],
+    shard_edges: list[tuple[SharedEdgeArena, list[EdgeRecord]]],
+) -> None:
+    """Copy direct game provenance from retired M0/M1 to active superseders."""
+    low_retired = {
+        uid
+        for uid in retired
+        if uid in by_uid and int(by_uid[uid].level) <= int(MemoryLevel.M1)
+    }
+    if not low_retired:
+        return
+
+    active_states = {
+        int(CognitiveState.ACTIVE),
+        int(CognitiveState.VALIDATED),
+        int(CognitiveState.REACTIVATED),
+    }
+    all_edges = tuple(edge for _arena, rows in shard_edges for edge in rows)
+    games_by_target: dict[MemoryUid, dict[MemoryUid, EdgeRecord]] = {}
+    superseders_by_target: dict[MemoryUid, set[MemoryUid]] = {}
+    existing = {
+        (edge.source_uid, int(edge.relation_type), edge.target_uid)
+        for edge in all_edges
+    }
+
+    for edge in all_edges:
+        relation = int(edge.relation_type)
+        if (
+            relation == int(RelationType.GAME_PROVENANCE)
+            and edge.source_uid in low_retired
+            and int(edge.target_uid.hi) == 0
+        ):
+            prior = games_by_target.setdefault(edge.source_uid, {}).get(edge.target_uid)
+            if prior is None or int(edge.support_count) > int(prior.support_count):
+                games_by_target[edge.source_uid][edge.target_uid] = edge
+        elif relation == int(RelationType.SUPERSEDES) and edge.target_uid in low_retired:
+            source = by_uid.get(edge.source_uid)
+            if (
+                source is not None
+                and edge.source_uid not in retired
+                and int(source.cognitive_state) in active_states
+            ):
+                superseders_by_target.setdefault(edge.target_uid, set()).add(edge.source_uid)
+
+    shard_count = len(descriptors)
+    for target_uid in sorted(low_retired):
+        game_edges = games_by_target.get(target_uid, {})
+        if not game_edges:
+            continue
+        for source_uid in sorted(superseders_by_target.get(target_uid, ())):
+            source = by_uid[source_uid]
+            shard_index = source_uid.shard(shard_count)
+            _arena, rows = shard_edges[shard_index]
+            for game_uid, provenance in sorted(game_edges.items()):
+                key = (source_uid, int(RelationType.GAME_PROVENANCE), game_uid)
+                if key in existing:
+                    continue
+                rows.append(
+                    EdgeRecord(
+                        source_uid,
+                        int(RelationType.GAME_PROVENANCE),
+                        game_uid,
+                        max(1, int(provenance.support_count)),
+                        max(int(provenance.updated_watermark), int(source.updated_watermark)),
+                    )
+                )
+                existing.add(key)
+
+
 def compact_retired_memory(
     descriptors: tuple[ShardReadDescriptor, ...],
     *,
     archive_path: str | Path,
 ) -> CompactionResult:
-    """Physically reclaim RETIRED node/edge rows at a quiescent generation barrier.
+    """Physically reclaim safely RETIRED rows at a quiescent generation barrier.
 
-    The removed records and all incident edges are appended to a durable archive before
-    RAM rows are rewritten densely. M0/M1 are never retired by lifecycle, so the live
-    action index needs no rebuild here. Shard writer processes must be restarted after
-    this function so their local UID/edge indexes are reconstructed from compacted RAM.
+    Removed records and incident edges are appended to a durable archive before RAM
+    rows are rewritten densely.  M0 and normalized M1 may now retire; direct game
+    provenance is first copied to their active semantic superseders.  Grounded M1 is
+    a live ActionArena/M7 causal anchor and is fail-closed here even if an invalid
+    caller marks it RETIRED, so the action index never needs an unsafe partial rebuild.
+    Shard writers must be restarted afterwards so UID/edge indexes match compacted RAM.
     """
     opened: list[object] = []
     shard_nodes: list[tuple[SharedNodeArena, list[NodeRecord]]] = []
     shard_edges: list[tuple[SharedEdgeArena, list[EdgeRecord]]] = []
     retired: set[MemoryUid] = set()
+    by_uid: dict[MemoryUid, NodeRecord] = {}
     try:
         for descriptor in descriptors:
             nodes = SharedNodeArena.attach(descriptor.nodes)
@@ -62,11 +146,13 @@ def compact_retired_memory(
             edge_rows = list(edges.records())
             shard_nodes.append((nodes, rows))
             shard_edges.append((edges, edge_rows))
-            retired.update(
-                row.uid
-                for row in rows
-                if int(row.cognitive_state) == int(CognitiveState.RETIRED)
-            )
+            for row in rows:
+                by_uid[row.uid] = row
+                if (
+                    int(row.cognitive_state) == int(CognitiveState.RETIRED)
+                    and not _is_grounded_m1(row)
+                ):
+                    retired.add(row.uid)
 
         if not retired:
             return CompactionResult(
@@ -75,6 +161,13 @@ def compact_retired_memory(
                 sum(len(rows) for _arena, rows in shard_nodes),
                 sum(len(rows) for _arena, rows in shard_edges),
             )
+
+        _promote_low_level_provenance(
+            descriptors=descriptors,
+            by_uid=by_uid,
+            retired=retired,
+            shard_edges=shard_edges,
+        )
 
         archive = Path(archive_path)
         archive.parent.mkdir(parents=True, exist_ok=True)
@@ -115,6 +208,8 @@ def compact_retired_memory(
                 for edge in rows
                 if edge.source_uid not in retired and edge.target_uid not in retired
             ]
+            if len(keep) > arena.capacity:
+                raise MemoryError("provenance-preserving compaction exceeds edge arena capacity")
             arena.begin_write()
             try:
                 for index, edge in enumerate(keep):
