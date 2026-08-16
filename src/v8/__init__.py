@@ -86,6 +86,9 @@ from v8.dedicated_lifecycle_v813 import (
 from v8.trajectory_optimizer_v814 import (
     install_trajectory_optimizer_v814 as _install_trajectory_optimizer_v814,
 )
+from v8.trajectory_optimizer_v814_fixups import (
+    install_trajectory_optimizer_v814_fixups as _install_trajectory_optimizer_v814_fixups,
+)
 
 # Install semantic layers in chronological order. v8.14 is last so trajectory
 # capture and optimized action playback wrap the final actor/runtime behavior.
@@ -111,6 +114,7 @@ _install_final_save_lifecycle_v812_fixups()
 _install_lifecycle_progress_v812()
 _install_dedicated_lifecycle_v813()
 _install_trajectory_optimizer_v814()
+_install_trajectory_optimizer_v814_fixups()
 
 # Preserve existing import paths: `from v8.runtime import ContinuousMemoryRuntime`
 # and the package-level API both resolve to the current semantic layer.
