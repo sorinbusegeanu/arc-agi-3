@@ -36,6 +36,15 @@ class PublicationConcurrencyRegressionTests(unittest.TestCase):
         self.assertEqual(view.plan_candidates(123, (1, 2)), ())
         self.assertTrue(view._strategy_version)
 
+    def test_edge_read_uses_last_coherent_snapshot_while_writer_is_active(self) -> None:
+        edges = _CrossMutatingArena("edges")
+        view = LiveReadView(())
+        view._edges = (edges,)
+
+        self.assertEqual(view.edge_records(), ())
+        edges._sequence = 1
+        self.assertEqual(view.edge_records(), ())
+
 
 if __name__ == "__main__":
     unittest.main()
