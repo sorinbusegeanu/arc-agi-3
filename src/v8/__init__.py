@@ -1,4 +1,4 @@
-"""ARC-AGI-3 v8.11 memory-to-intelligence runtime."""
+"""ARC-AGI-3 v8.12 memory-to-intelligence runtime."""
 
 # Install the v0.5.3 memory schema before importing development/runtime modules so
 # proposal packets, shared arenas and snapshot compatibility agree on one layout.
@@ -71,9 +71,12 @@ from v8.action_targeting_v810 import (
 from v8.action_targeting_v810_fixups import (
     install_action_targeting_v810_fixups as _install_action_targeting_v810_fixups,
 )
+from v8.final_save_lifecycle_v812 import (
+    install_final_save_lifecycle_v812 as _install_final_save_lifecycle_v812,
+)
 
-# Install semantic layers in chronological order. v8.10 is last so action targeting
-# sees the final behavior, restart and shutdown semantics while preserving snapshots.
+# Install semantic layers in chronological order. v8.12 is last so shutdown/snapshot
+# fixes observe all prior runtime overlays and lifecycle sees the final memory semantics.
 _install_behavior_recovery()
 _install_primary_valence_runtime()
 _install_runtime_fixups()
@@ -91,6 +94,7 @@ _install_learning_fixes_v088_fixups()
 _install_shutdown_semantics_v089()
 _install_action_targeting_v810()
 _install_action_targeting_v810_fixups()
+_install_final_save_lifecycle_v812()
 
 # Preserve existing import paths: `from v8.runtime import ContinuousMemoryRuntime`
 # and the package-level API both resolve to the current semantic layer.
