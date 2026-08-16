@@ -1,4 +1,4 @@
-"""ARC-AGI-3 v8.12 memory-to-intelligence runtime."""
+"""ARC-AGI-3 v8.13 memory-to-intelligence runtime."""
 
 # Install the v0.5.3 memory schema before importing development/runtime modules so
 # proposal packets, shared arenas and snapshot compatibility agree on one layout.
@@ -80,9 +80,12 @@ from v8.final_save_lifecycle_v812_fixups import (
 from v8.lifecycle_progress_v812 import (
     install_lifecycle_progress_v812 as _install_lifecycle_progress_v812,
 )
+from v8.dedicated_lifecycle_v813 import (
+    install_dedicated_lifecycle_v813 as _install_dedicated_lifecycle_v813,
+)
 
-# Install semantic layers in chronological order. v8.12 is last so shutdown/snapshot
-# fixes observe all prior runtime overlays and lifecycle sees the final memory semantics.
+# Install semantic layers in chronological order. v8.13 is last so lifecycle scheduling
+# owns the final lifecycle hooks after all prior memory and shutdown overlays.
 _install_behavior_recovery()
 _install_primary_valence_runtime()
 _install_runtime_fixups()
@@ -103,6 +106,7 @@ _install_action_targeting_v810_fixups()
 _install_final_save_lifecycle_v812()
 _install_final_save_lifecycle_v812_fixups()
 _install_lifecycle_progress_v812()
+_install_dedicated_lifecycle_v813()
 
 # Preserve existing import paths: `from v8.runtime import ContinuousMemoryRuntime`
 # and the package-level API both resolve to the current semantic layer.
