@@ -17,7 +17,6 @@ from v8.model import (
     MemoryType,
     MemoryUid,
     PipelineEvent,
-    RelationType,
     ValidationState,
     proposal_fingerprint,
 )
@@ -162,12 +161,13 @@ class PrimaryValenceTests(unittest.TestCase):
         self.assertAlmostEqual(stat.cost, 5.0)
         primary_valence._WINDOW_ACHIEVEMENT.clear()
 
-    def test_task_semantic_firewall_remains_but_valence_firewall_is_removed(self) -> None:
+    def test_primary_valence_is_admitted_without_task_semantic_reward_fields(self) -> None:
         forbidden = set(ARC_GRID_CONTRACT.forbidden_semantic_fields)
-        self.assertNotIn("reward", forbidden)
-        self.assertNotIn("win_value", forbidden)
-        self.assertNotIn("terminal_value", forbidden)
-        self.assertIn("goal", forbidden)
+        self.assertIn("reward", forbidden)
+        self.assertIn("win_value", forbidden)
+        self.assertIn("terminal_value", forbidden)
+        self.assertNotIn("terminal_polarity", forbidden)
+        self.assertNotIn("primary_valence", forbidden)
         self.assertEqual(ARC_GRID_CONTRACT.contract_id, "arc-grid-v1-primary-valence")
 
     def test_runtime_reports_v053_semantics(self) -> None:
