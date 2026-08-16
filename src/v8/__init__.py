@@ -1,4 +1,4 @@
-"""ARC-AGI-3 v8.14 memory-to-intelligence runtime."""
+"""ARC-AGI-3 v8.15 memory-to-intelligence runtime."""
 
 # Install the v0.5.3 memory schema before importing development/runtime modules so
 # proposal packets, shared arenas and snapshot compatibility agree on one layout.
@@ -89,9 +89,15 @@ from v8.trajectory_optimizer_v814 import (
 from v8.trajectory_optimizer_v814_fixups import (
     install_trajectory_optimizer_v814_fixups as _install_trajectory_optimizer_v814_fixups,
 )
+from v8.restart_memory_v815 import (
+    install_restart_memory_v815 as _install_restart_memory_v815,
+)
+from v8.restart_memory_v815_fixups import (
+    install_restart_memory_v815_fixups as _install_restart_memory_v815_fixups,
+)
 
-# Install semantic layers in chronological order. v8.14 is last so trajectory
-# capture and optimized action playback wrap the final actor/runtime behavior.
+# Install semantic layers in chronological order. v8.15 is last so restart-memory
+# fallback, session retention and trajectory phase reuse see the final policy stack.
 _install_behavior_recovery()
 _install_primary_valence_runtime()
 _install_runtime_fixups()
@@ -115,6 +121,8 @@ _install_lifecycle_progress_v812()
 _install_dedicated_lifecycle_v813()
 _install_trajectory_optimizer_v814()
 _install_trajectory_optimizer_v814_fixups()
+_install_restart_memory_v815()
+_install_restart_memory_v815_fixups()
 
 # Preserve existing import paths: `from v8.runtime import ContinuousMemoryRuntime`
 # and the package-level API both resolve to the current semantic layer.
