@@ -37,6 +37,9 @@ from v8.primary_valence_fixups import install_runtime_fixups as _install_runtime
 from v8.trajectory_efficiency_v054 import (
     install_trajectory_efficiency_v054 as _install_trajectory_efficiency_v054,
 )
+from v8.progress_reporting_v054 import (
+    install_progress_reporting_v054 as _install_progress_reporting_v054,
+)
 
 # Behavioral recovery establishes canonical M6 recognition, causal M7 formation,
 # planner admission and exploration. Primary-valence semantics add signed drive
@@ -46,6 +49,7 @@ _install_behavior_recovery()
 _install_primary_valence_runtime()
 _install_runtime_fixups()
 _install_trajectory_efficiency_v054()
+_install_progress_reporting_v054()
 
 # Preserve existing import paths: `from v8.runtime import ContinuousMemoryRuntime`
 # and the package-level API both resolve to the current semantic layer.
