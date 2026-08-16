@@ -71,7 +71,7 @@ class CanonicalOutcomeTests(unittest.TestCase):
             MemoryType.CONSEQUENCE,
             (101, 202, 303, 1),
         )
-        expected_variant = stable_u64(101, 202, person=b"v8.2-outcome-context") & 0xF
+        expected_variant = stable_u64(101, 202, person=b"v8.5-outcome-context")
         self.assertEqual(canonical_outcome_key(consequence), (1, 303, expected_variant))
 
     def test_actor_observation_resolves_existing_canonical_m6_uid(self) -> None:

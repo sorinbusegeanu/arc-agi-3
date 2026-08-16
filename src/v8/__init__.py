@@ -1,4 +1,4 @@
-"""ARC-AGI-3 v8.4 primary-valence and trajectory-efficiency runtime."""
+"""ARC-AGI-3 v8.5 learning-capability runtime."""
 
 # Install the v0.5.3 memory schema before importing development/runtime modules so
 # proposal packets, shared arenas and snapshot compatibility agree on one layout.
@@ -43,17 +43,24 @@ from v8.progress_reporting_v054 import (
 from v8.hypothesis_validation_v054 import (
     install_hypothesis_validation_v054 as _install_hypothesis_validation_v054,
 )
+from v8.learning_blockers_v055 import (
+    install_learning_blockers_v055 as _install_learning_blockers_v055,
+)
+from v8.learning_blockers_v055_fixups import (
+    install_learning_blockers_v055_fixups as _install_learning_blockers_v055_fixups,
+)
 
-# Behavioral recovery establishes canonical M6 recognition, causal M7 formation,
-# planner admission and exploration. Primary-valence semantics add signed drive
-# evidence and delayed credit. v0.5.4 then makes realized actions-to-outcome a
-# distinct M7 efficiency statistic, compared only inside outcome/context cohorts.
+# Install semantic layers in chronological order. v8.5 is last because it tightens
+# control-state/action representation, multi-action planning, causal validation and
+# exploration semantics established by the preceding compatibility layers.
 _install_behavior_recovery()
 _install_primary_valence_runtime()
 _install_runtime_fixups()
 _install_trajectory_efficiency_v054()
 _install_progress_reporting_v054()
 _install_hypothesis_validation_v054()
+_install_learning_blockers_v055()
+_install_learning_blockers_v055_fixups()
 
 # Preserve existing import paths: `from v8.runtime import ContinuousMemoryRuntime`
 # and the package-level API both resolve to the current semantic layer.

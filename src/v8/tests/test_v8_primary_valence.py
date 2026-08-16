@@ -182,11 +182,11 @@ class PrimaryValenceTests(unittest.TestCase):
         self.assertNotIn("primary_valence", forbidden)
         self.assertEqual(ARC_GRID_CONTRACT.contract_id, "arc-grid-v1-primary-valence")
 
-    def test_runtime_reports_v054_semantics(self) -> None:
+    def test_runtime_reports_v8_5_semantics(self) -> None:
         self.assertEqual(V82ContinuousMemoryRuntime.research_paper_version, "0.5.4")
         self.assertEqual(
             V82ContinuousMemoryRuntime.scientific_semantics_version,
-            "v8.4-outcome-conditioned-efficiency",
+            "v8.5-learning-capability",
         )
 
 
