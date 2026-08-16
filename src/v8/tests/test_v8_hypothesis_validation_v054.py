@@ -84,13 +84,13 @@ def correspondence(source: MemoryUid, target: MemoryUid, score: float) -> EdgeRe
 
 
 class WorldModelFormationTests(unittest.TestCase):
-    def test_world_model_groups_by_learned_consequence_profile_not_concept_identity(self) -> None:
+    def test_world_model_groups_matching_consequence_structure_across_concepts(self) -> None:
         a = node(MemoryLevel.M5, MemoryType.CONSEQUENCE, (10, 11, 111, 1))
-        b = node(MemoryLevel.M5, MemoryType.CONSEQUENCE, (20, 21, 999, 1))
+        b = node(MemoryLevel.M5, MemoryType.CONSEQUENCE, (20, 21, 111, 1))
         components = WorldModelEstimator().propose((a, b))
         self.assertEqual(len(components), 1)
         self.assertEqual(set(components[0].consequences), {a.uid, b.uid})
-        self.assertEqual(components[0].key_parts, (1, 0))
+        self.assertEqual(components[0].key_parts, (111, 1, 0))
 
     def test_world_model_keeps_opposite_primary_valence_profiles_separate(self) -> None:
         positive = node(
@@ -103,7 +103,7 @@ class WorldModelFormationTests(unittest.TestCase):
         negative = node(
             MemoryLevel.M5,
             MemoryType.CONSEQUENCE,
-            (20, 21, 999, 1),
+            (20, 21, 111, 1),
             valence_sum=-3.0,
             valence_weight=3.0,
         )
@@ -111,7 +111,7 @@ class WorldModelFormationTests(unittest.TestCase):
 
 
 class AutomaticTransferValidationTests(unittest.TestCase):
-    def test_leave_one_memory_out_trial_uses_held_out_target_and_best_ablation_baseline(self) -> None:
+    def test_structural_correspondence_no_longer_auto_validates_transfer(self) -> None:
         source = node(MemoryLevel.M4, MemoryType.CONCEPT, (1, 1))
         alternative = node(MemoryLevel.M4, MemoryType.CONCEPT, (2, 2))
         target = node(MemoryLevel.M4, MemoryType.CONCEPT, (3, 3))
@@ -136,18 +136,12 @@ class AutomaticTransferValidationTests(unittest.TestCase):
 
         peer = Peer()
         _auto_transfer_trials(peer, (source, alternative, target), edges)
-        call = next(row for row in peer.calls if row["uid"] == source.uid)
-        self.assertEqual(call["target_game_hash"], 200)
-        self.assertEqual(call["formation_games"], (100,))
-        self.assertAlmostEqual(call["metric_on"], 0.8)
-        self.assertAlmostEqual(call["metric_off"], 0.5)
-        trial = peer.transfer.trials(source.uid)[0]
-        self.assertTrue(trial.passed)
-        self.assertNotIn(trial.target_game_hash, trial.formation_games)
+        self.assertEqual(peer.calls, [])
+        self.assertEqual(peer.transfer.trials(source.uid), ())
 
 
 class OutcomeHoldoutTests(unittest.TestCase):
-    def test_persistent_cross_game_outcome_class_emits_held_out_consistency(self) -> None:
+    def test_structural_outcome_holdout_no_longer_emits_validated_evidence(self) -> None:
         a = node(MemoryLevel.M6, MemoryType.OUTCOME, (1, 2, 1), support=8)
         b = node(MemoryLevel.M6, MemoryType.OUTCOME, (1, 2, 2), support=8)
         edges = (provenance(a.uid, 100), provenance(b.uid, 200))
@@ -167,12 +161,7 @@ class OutcomeHoldoutTests(unittest.TestCase):
 
         peer = Peer()
         _auto_outcome_holdout(peer, (a, b), edges)
-        self.assertTrue(peer.rows)
-        kind, _row, value, kwargs = peer.rows[0]
-        self.assertEqual(kind, "outcome_consistency_holdout")
-        self.assertGreater(value, 0.0)
-        self.assertNotIn(kwargs["target_game_hash"], kwargs["provenance_games"])
-        self.assertEqual(kwargs["effect_direction"], 1)
+        self.assertEqual(peer.rows, [])
 
 
 class TrajectoryReplanningTests(unittest.TestCase):
@@ -216,7 +205,7 @@ class TrajectoryReplanningTests(unittest.TestCase):
 
 
 class PreferenceAggregationTests(unittest.TestCase):
-    def test_primary_valence_preferences_add_context_general_clean_probe(self) -> None:
+    def test_v054_helper_can_still_be_called_for_legacy_replay(self) -> None:
         import v8.hypothesis_validation_v054 as module
 
         preferred = MemoryUid(10, 10)
