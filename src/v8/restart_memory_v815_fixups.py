@@ -5,7 +5,6 @@ import time
 
 
 _INSTALLED = False
-_BASE_GRAPH_CHECK = None
 _BASE_SCORE = None
 _BASE_PLAN = None
 _BASE_STEP = None
@@ -85,17 +84,15 @@ def _reporting_worker_after_first_progress(
 
 def install_restart_memory_v815_fixups() -> None:
     global _INSTALLED
-    global _BASE_GRAPH_CHECK, _BASE_SCORE, _BASE_PLAN, _BASE_STEP, _BASE_INIT
+    global _BASE_SCORE, _BASE_PLAN, _BASE_STEP, _BASE_INIT
     if _INSTALLED:
         return
 
     from v7.environment.arc_adapter import ArcGridEnvironment
-    from v8 import actor as actor_module
     from v8 import behavior_recovery as behavior
     from v8 import reporter as reporter_module
     from v8.publication import LiveReadView
 
-    _BASE_GRAPH_CHECK = actor_module._refresh_actor_graph_if_due
     _BASE_SCORE = LiveReadView.score_actions
     _BASE_PLAN = LiveReadView.plan_candidates
     _BASE_STEP = ArcGridEnvironment.step
@@ -123,30 +120,17 @@ def install_restart_memory_v815_fixups() -> None:
             or str(getattr(self, "last_outcome_state", "")) in {"WIN", "GAME_OVER"}
             or bool(getattr(self, "last_step_was_reset_boundary", False))
         ):
+            # The terminal event is published after env.step returns.  Arm a
+            # bounded seqlock-version watch so the actor notices that publication
+            # as soon as it lands, rather than waiting for the coarse 1000-step
+            # graph interval. This preserves the existing completed-step helper
+            # contract while making episode-boundary learning visible promptly.
             _arm_refresh_retry(view)
         return result
-
-    def refresh_actor_graph_if_due(
-        read_view,
-        *,
-        completed_steps: int,
-        next_check_step: int,
-        check_interval_steps: int = actor_module._ACTOR_GRAPH_CHECK_INTERVAL_STEPS,
-    ) -> int:
-        # The actor calls this before taking the next action. Use the impending
-        # accepted step for the boundary test so a 1000-step job with a 1000-step
-        # graph interval performs one shared-graph check instead of zero.
-        return _BASE_GRAPH_CHECK(
-            read_view,
-            completed_steps=int(completed_steps) + 1,
-            next_check_step=int(next_check_step),
-            check_interval_steps=int(check_interval_steps),
-        )
 
     LiveReadView.__init__ = init
     LiveReadView.score_actions = score_actions
     LiveReadView.plan_candidates = plan_candidates
     ArcGridEnvironment.step = step
-    actor_module._refresh_actor_graph_if_due = refresh_actor_graph_if_due
     reporter_module.reporting_worker = _reporting_worker_after_first_progress
     _INSTALLED = True
