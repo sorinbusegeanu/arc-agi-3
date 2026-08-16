@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import queue
 import time
 
 
@@ -42,6 +43,46 @@ def _refresh_if_published(view) -> None:
         view._v815_wait_version = ()
 
 
+def _reporting_worker_after_first_progress(
+    *,
+    event_queue,
+    stop_event,
+    watermark,
+    actors,
+    interval_seconds: float,
+    output_queue=None,
+) -> None:
+    del watermark
+    from v8.actor import ActorProgress
+    from v8.diagnostics import format_game_rate_line
+    from v8.reporter import _emit_line
+
+    latest = {
+        int(actor_id): ActorProgress(int(actor_id), str(game_id), 0, 0, 0, 0)
+        for actor_id, game_id in actors
+    }
+    seen_progress = False
+    next_report = time.monotonic() + float(interval_seconds)
+    while not stop_event.is_set():
+        now = time.monotonic()
+        timeout = max(0.0, min(0.25, next_report - now))
+        try:
+            row = event_queue.get(timeout=timeout)
+        except queue.Empty:
+            row = None
+        if isinstance(row, ActorProgress):
+            latest[int(row.actor_id)] = row
+            seen_progress = True
+        now = time.monotonic()
+        if now < next_report:
+            continue
+        if seen_progress:
+            rows = tuple(latest[key] for key in sorted(latest))
+            _emit_line(format_game_rate_line(rows), output_queue)
+        while next_report <= now:
+            next_report += float(interval_seconds)
+
+
 def install_restart_memory_v815_fixups() -> None:
     global _INSTALLED
     global _BASE_GRAPH_CHECK, _BASE_SCORE, _BASE_PLAN, _BASE_STEP, _BASE_INIT
@@ -51,6 +92,7 @@ def install_restart_memory_v815_fixups() -> None:
     from v7.environment.arc_adapter import ArcGridEnvironment
     from v8 import actor as actor_module
     from v8 import behavior_recovery as behavior
+    from v8 import reporter as reporter_module
     from v8.publication import LiveReadView
 
     _BASE_GRAPH_CHECK = actor_module._refresh_actor_graph_if_due
@@ -106,4 +148,5 @@ def install_restart_memory_v815_fixups() -> None:
     LiveReadView.plan_candidates = plan_candidates
     ArcGridEnvironment.step = step
     actor_module._refresh_actor_graph_if_due = refresh_actor_graph_if_due
+    reporter_module.reporting_worker = _reporting_worker_after_first_progress
     _INSTALLED = True
