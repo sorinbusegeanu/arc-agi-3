@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 
-from v8.model import MemoryLevel, stable_u64
+from v8.model import (
+    MemoryLevel,
+    MemoryType,
+    MemoryUid,
+    proposal_fingerprint,
+    stable_u64,
+)
 from v8.normalized_memory_v086 import (
     MAX_NORMALIZED_FACTS_PER_EVENT,
     V86PipelineEvent,
@@ -15,6 +22,9 @@ from v8.structural_events import is_normalized_fact_token, native_action_set_sig
 
 _INSTALLED = False
 _CURRENT_ACTION_SET_SIGNATURE = 0
+_M1G_CONTEXT_MARKER = 1 << 63
+_M1G_CONTEXT_MASK = _M1G_CONTEXT_MARKER - 1
+_CONTROL_SCOPE_ENV = "ARC_AGI3_V8_CONTROL_SCOPE"
 
 
 def _pipeline_post_init(self) -> None:
@@ -31,6 +41,22 @@ def _pipeline_post_init(self) -> None:
     for value in self.normalized_facts:
         if not is_normalized_fact_token(int(value)):
             raise ValueError("invalid normalized M1N fact token")
+
+
+def _is_grounded_context(value: int) -> bool:
+    return bool(int(value) & _M1G_CONTEXT_MARKER)
+
+
+def _grounded_context(source_game_hash: int, context_signature: int) -> int:
+    value = int(context_signature)
+    if _is_grounded_context(value):
+        return value
+    digest = stable_u64(
+        int(source_game_hash),
+        value,
+        person=b"v8.6-m1g-context",
+    )
+    return int(_M1G_CONTEXT_MARKER | (digest & _M1G_CONTEXT_MASK))
 
 
 def install_normalized_memory_v086_fixups() -> None:
@@ -61,35 +87,49 @@ def install_normalized_memory_v086_fixups() -> None:
         return values
 
     def structural_grid_signature(grid):
-        return stable_u64(
+        observable = stable_u64(
             int(base_structural(grid)),
             int(_CURRENT_ACTION_SET_SIGNATURE),
             person=b"v8.6-action-context",
         )
+        scope = os.environ.get(_CONTROL_SCOPE_ENV, "")
+        game_hash = stable_u64(scope, person=b"v8-game") if scope else 0
+        return _grounded_context(game_hash, observable)
 
     adapter.ArcGridEnvironment.available_actions = available_actions
     encoding.structural_grid_signature = structural_grid_signature
 
-    # Preserve the existing primary-valence invariant: a grounded terminal event
-    # remains maximally significant. v8.6 removes changed-cell magnitude as the
-    # importance proxy; it does not weaken primitive valence.
+    # Enforce game-local M1G identity at memory construction as well as on the
+    # actor path. M1N remains game-independent and can aggregate provenance.
     base_derive = development.derive_proposal
 
     def derive_proposal(level, event):
         proposal = base_derive(level, event)
-        if (
-            int(level) == int(MemoryLevel.M1)
-            and len(proposal.key_parts) >= 4
-            and int(event.experience.terminal_polarity) != 0
-        ):
-            multiplicity = max(1, int(event.multiplicity))
+        if int(level) == int(MemoryLevel.M1) and len(proposal.key_parts) >= 4:
+            e = event.experience
+            key = (
+                _grounded_context(int(e.source_game_hash), int(proposal.key_parts[0])),
+                int(proposal.key_parts[1]),
+                int(proposal.key_parts[2]),
+                _grounded_context(int(e.source_game_hash), int(proposal.key_parts[3])),
+            )
             proposal = replace(
                 proposal,
-                significance_sum=float(multiplicity),
-                learning_value_sum=max(
-                    float(proposal.learning_value_sum), float(multiplicity)
+                uid=MemoryUid.from_key(MemoryLevel.M1, MemoryType.CONTINGENCY, key),
+                fingerprint=proposal_fingerprint(
+                    MemoryLevel.M1, MemoryType.CONTINGENCY, key
                 ),
+                key_parts=key,
             )
+            if int(e.terminal_polarity) != 0:
+                multiplicity = max(1, int(event.multiplicity))
+                proposal = replace(
+                    proposal,
+                    significance_sum=float(multiplicity),
+                    learning_value_sum=max(
+                        float(proposal.learning_value_sum), float(multiplicity)
+                    ),
+                )
         return proposal
 
     development.derive_proposal = derive_proposal
