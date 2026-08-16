@@ -1,4 +1,4 @@
-"""ARC-AGI-3 v8.7 memory-to-intelligence runtime."""
+"""ARC-AGI-3 v8.8 memory-to-intelligence runtime."""
 
 # Install the v0.5.3 memory schema before importing development/runtime modules so
 # proposal packets, shared arenas and snapshot compatibility agree on one layout.
@@ -56,9 +56,12 @@ from v8.intelligence_loop_v087 import (
 from v8.intelligence_loop_v087_fixups import (
     install_intelligence_loop_v087_fixups as _install_intelligence_loop_v087_fixups,
 )
+from v8.learning_fixes_v088 import (
+    install_learning_fixes_v088 as _install_learning_fixes_v088,
+)
 
-# Install semantic layers in chronological order. v8.7 is last because it closes the
-# higher-order memory-to-intelligence loop without changing the RAM/snapshot substrate.
+# Install semantic layers in chronological order. v8.8 is last so the fixes apply
+# to the complete v8.7 behavior without changing the RAM/snapshot substrate.
 _install_behavior_recovery()
 _install_primary_valence_runtime()
 _install_runtime_fixups()
@@ -71,6 +74,7 @@ _install_normalized_memory_v086()
 _install_normalized_memory_v086_fixups()
 _install_intelligence_loop_v087()
 _install_intelligence_loop_v087_fixups()
+_install_learning_fixes_v088()
 
 # Preserve existing import paths: `from v8.runtime import ContinuousMemoryRuntime`
 # and the package-level API both resolve to the current semantic layer.
