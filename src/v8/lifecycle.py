@@ -19,9 +19,11 @@ class LifecycleDecision:
 class LifecycleController:
     """Hysteretic retention/quarantine/retirement decisions with provenance preserved.
 
-    All memory levels participate in fitness hysteresis.  Retirement remains a
+    All memory levels participate in fitness hysteresis. Retirement remains a
     separate pruning decision: M0/M1 may reach RETIRE_PENDING here, but low-level
     safety gates in PruningPlanner decide whether they are actually safe to retire.
+    A low-fitness window is one call to decide() while the memory is in an active or
+    quarantined lifecycle state; pending/retired/candidate rows do not accumulate it.
     """
 
     def __init__(
@@ -106,7 +108,16 @@ class LifecycleController:
                 )
                 return LifecycleDecision(row.uid, state, validation, fitness, reason)
             return None
+
         if fitness <= self.demotion_threshold:
+            countable_states = {
+                int(CognitiveState.ACTIVE),
+                int(CognitiveState.VALIDATED),
+                int(CognitiveState.REACTIVATED),
+                int(CognitiveState.QUARANTINED),
+            }
+            if current not in countable_states:
+                return None
             windows = self._low_windows.get(row.uid, 0) + 1
             self._low_windows[row.uid] = windows
             if windows >= 3 and current in {
