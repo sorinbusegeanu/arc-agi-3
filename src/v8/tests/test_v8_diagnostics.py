@@ -64,7 +64,7 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual(solved_game_steps(rows), (("ez01", 88), ("ez02", 94)))
         self.assertEqual(
             format_game_rate_line(rows),
-            "current_run_wins=66.7% current_run_levels_solved=80.0% current_run_solved_games=2/3 (ez01:88, ez02:94)",
+            "current_run_wins=66.7% current_run_levels_solved=80.0% current_run_solved_games=2/3 (ez01:88; ez02:94)",
         )
 
     def test_progress_line_is_single_dedicated_percentage_line(self) -> None:
