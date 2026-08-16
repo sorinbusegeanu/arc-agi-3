@@ -179,6 +179,11 @@ def run_continuous(args) -> int:
         previous_wait = os.environ.get(_GAME_WAIT_ENV)
         os.environ[_GAME_WAIT_ENV] = str(float(args.wait))
         try:
+            # Restored graphs can take seconds to copy into each actor's initial
+            # read cache. Keep autonomous graph writers paused until every actor
+            # has obtained that coherent cut.
+            if runtime.peers is not None:
+                runtime.peers.pause()
             runtime.start()
             print(
                 f"v8 continuous: games={len(games)} actors={len(jobs)} shards={args.shards} "

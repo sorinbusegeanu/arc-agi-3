@@ -26,6 +26,7 @@ from v8.ring import SharedRingBuffer
 _MAX_PARENT_MESSAGES_PER_CYCLE = 256
 _LEARNING_PUBLISH_INTERVAL_SECONDS = 5.0
 _ACTOR_GRAPH_CHECK_INTERVAL_STEPS = 1_000
+_ACTOR_STARTUP_TIMEOUT_SECONDS = 300.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -349,6 +350,8 @@ def actor_worker(
     reporting_queue: mp.Queue | None = None,
     actor_throttle: mp.sharedctypes.Synchronized | None = None,
     snapshot_freeze: mp.synchronize.Event | None = None,
+    startup_ready: mp.synchronize.Event | None = None,
+    startup_gate: mp.synchronize.Event | None = None,
 ) -> None:
     from v7.environment.arc_adapter import ArcGridEnvironment
     from v7.environment.encoding import (
@@ -389,6 +392,17 @@ def actor_worker(
     next_learning_publish = time.monotonic() + _LEARNING_PUBLISH_INTERVAL_SECONDS
     next_graph_check_step = int(job.graph_check_steps)
     try:
+        if startup_ready is not None:
+            startup_ready.set()
+        while (
+            startup_gate is not None
+            and not startup_gate.wait(0.05)
+            and not stop_event.is_set()
+        ):
+            pass
+        if stop_event.is_set():
+            return
+
         for _ in range(int(job.steps)):
             if stop_event.is_set():
                 break
@@ -702,14 +716,36 @@ def run_actor_jobs(
     progress_callback: Callable[[tuple[ActorProgress, ...]], None] | None = None,
     reporting_queue: mp.Queue | None = None,
 ) -> tuple[ActorResult, ...]:
-    runtime.start()
     jobs = tuple(jobs)
+    peers = getattr(runtime, "peers", None)
+    if peers is not None:
+        peers.pause()
+    runtime.start()
     if not jobs:
+        if peers is not None:
+            peers.resume()
         return ()
     if progress_interval_seconds <= 0:
         raise ValueError("progress_interval_seconds must be positive")
 
     ctx = runtime._mp_ctx
+    startup_gate = ctx.Event() if hasattr(ctx, "Event") else None
+    startup_ready = (
+        tuple(ctx.Event() for _job in jobs) if startup_gate is not None else ()
+    )
+    if peers is not None:
+        startup_timeout = (
+            _ACTOR_STARTUP_TIMEOUT_SECONDS
+            if timeout is None
+            else max(0.01, min(float(timeout), _ACTOR_STARTUP_TIMEOUT_SECONDS))
+        )
+        if not peers.wait_idle(startup_timeout):
+            raise TimeoutError("v8 peers did not pause before actor startup")
+        runtime.wait_quiescent(
+            timeout=startup_timeout,
+            resume_peers=False,
+            settle_peers=False,
+        )
     results = ctx.Queue()
     progress = ctx.Queue(maxsize=max(16, len(jobs) * 8))
     processes = [
@@ -726,11 +762,15 @@ def run_actor_jobs(
                 "reporting_queue": reporting_queue,
                 "actor_throttle": runtime._actor_throttle,
                 "snapshot_freeze": runtime._snapshot_freeze,
+                "startup_ready": (
+                    None if startup_gate is None else startup_ready[index]
+                ),
+                "startup_gate": startup_gate,
             },
             name=f"v8-actor-{job.actor_id:03d}-{job.game_id}",
             daemon=True,
         )
-        for job in jobs
+        for index, job in enumerate(jobs)
     ]
     latest = {
         job.actor_id: ActorProgress(job.actor_id, job.game_id, 0, 0, 0, 0)
@@ -746,6 +786,25 @@ def run_actor_jobs(
         for process in processes:
             process.start()
             started_processes.append(process)
+
+        if startup_gate is not None:
+            while not all(event.is_set() for event in startup_ready):
+                failed = [
+                    process
+                    for process in started_processes
+                    if process.exitcode not in (None, 0)
+                ]
+                if failed:
+                    detail = ", ".join(
+                        f"{process.name}={process.exitcode}" for process in failed
+                    )
+                    raise RuntimeError(f"actor failed during graph startup: {detail}")
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError("actor graph startup timed out")
+                time.sleep(0.01)
+            startup_gate.set()
+        if peers is not None:
+            peers.resume()
 
         while True:
             learning_batches: list[ActorLearningBatch] = []
@@ -847,6 +906,8 @@ def run_actor_jobs(
 
         return tuple(result_by_actor[key] for key in sorted(result_by_actor))
     except BaseException:
+        if startup_gate is not None:
+            startup_gate.set()
         for process in started_processes:
             if process.is_alive():
                 process.terminate()
