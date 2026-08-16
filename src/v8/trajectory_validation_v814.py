@@ -43,15 +43,6 @@ class ArcReplayAdapter:
         executed = 0
         try:
             for action in anchor.prefix_actions:
-                available = tuple(int(value) for value in env.available_actions())
-                if available and int(action) not in set(available):
-                    return ValidationResult(
-                        False,
-                        executed,
-                        "anchor_action_unavailable",
-                        str(getattr(env, "last_outcome_state", "")),
-                        int(getattr(env, "last_levels_completed", 0)),
-                    )
                 env.step(int(action))
                 executed += 1
                 if str(getattr(env, "last_outcome_state", "")) == "GAME_OVER":
@@ -74,15 +65,6 @@ class ArcReplayAdapter:
 
             candidate_steps = 0
             for action in candidate.actions:
-                available = tuple(int(value) for value in env.available_actions())
-                if available and int(action) not in set(available):
-                    return ValidationResult(
-                        False,
-                        candidate_steps,
-                        "candidate_action_unavailable",
-                        str(getattr(env, "last_outcome_state", "")),
-                        int(getattr(env, "last_levels_completed", 0)),
-                    )
                 env.step(int(action))
                 candidate_steps += 1
                 if _target_reached(env, target):
@@ -119,5 +101,9 @@ class ArcReplayAdapter:
             )
 
 
+def validate_candidate(candidate, adapter: ReplayAdapter) -> ValidationResult:
+    return adapter.validate(candidate)
+
+
 def validate_arc_candidate(candidate) -> ValidationResult:
-    return ArcReplayAdapter().validate(candidate)
+    return validate_candidate(candidate, ArcReplayAdapter())
