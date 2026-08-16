@@ -68,6 +68,9 @@ from v8.shutdown_semantics_v089 import (
 from v8.action_targeting_v810 import (
     install_action_targeting_v810 as _install_action_targeting_v810,
 )
+from v8.action_targeting_v810_fixups import (
+    install_action_targeting_v810_fixups as _install_action_targeting_v810_fixups,
+)
 
 # Install semantic layers in chronological order. v8.10 is last so action targeting
 # sees the final behavior, restart and shutdown semantics while preserving snapshots.
@@ -87,6 +90,7 @@ _install_learning_fixes_v088()
 _install_learning_fixes_v088_fixups()
 _install_shutdown_semantics_v089()
 _install_action_targeting_v810()
+_install_action_targeting_v810_fixups()
 
 # Preserve existing import paths: `from v8.runtime import ContinuousMemoryRuntime`
 # and the package-level API both resolve to the current semantic layer.
