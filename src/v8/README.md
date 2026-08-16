@@ -225,9 +225,14 @@ PYTHONPATH=src python -m v8 continuous-run \
   --games diverse \
   --steps-per-game 1000 \
   --actors 8 \
+  --graph-check 1000 \
   --shards 4 \
   --stage-workers 2
 ```
+
+Each actor checks shared node/edge arena versions every `--graph-check` accepted
+steps. A changed version rebuilds that actor's read-only strategy, outcome, and
+lineage query indexes; the shared arenas remain the only authoritative graph.
 
 Automatic transfer experiments are enabled by default and bounded by:
 

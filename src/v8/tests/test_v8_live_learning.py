@@ -2,8 +2,21 @@ from __future__ import annotations
 
 import queue
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
-from v8.actor import ActorJob, ActorLearningBatch, StrategyRunStat, _publish_learning
+from v8.actor import (
+    ActorJob,
+    ActorLearningBatch,
+    PreferenceProbeResult,
+    ReplanningTrialResult,
+    StrategyRunStat,
+    _is_new_terminal_game,
+    _merge_learning_batches,
+    _publish_learning,
+    _refresh_actor_graph_if_due,
+    _reset_after_terminal_game,
+)
 from v8.development import derive_proposal
 from v8.model import (
     EventId,
@@ -99,16 +112,118 @@ class LiveLearningRegressionTests(unittest.TestCase):
         target: queue.Queue[object] = queue.Queue()
         job = ActorJob(1, "game", 10, 0)
         uid = MemoryUid(1, 2)
-        _publish_learning(
+        published = _publish_learning(
             target,
             job=job,
             strategy_stats={uid: [2.0, 1.0, 3.5]},
             preference_probes=[],
             replanning_trials=[],
         )
+        self.assertTrue(published)
         row = target.get_nowait()
         self.assertIsInstance(row, ActorLearningBatch)
         self.assertEqual(row.strategy_stats, (StrategyRunStat(uid, 2, 1, 3.5),))
+
+    def test_full_learning_queue_retains_batch_for_later_retry(self) -> None:
+        target: queue.Queue[object] = queue.Queue(maxsize=1)
+        target.put_nowait(object())
+        job = ActorJob(1, "game", 10, 0)
+        uid = MemoryUid(1, 2)
+
+        self.assertFalse(
+            _publish_learning(
+                target,
+                job=job,
+                strategy_stats={uid: [2.0, 1.0, 3.5]},
+                preference_probes=[],
+                replanning_trials=[],
+            )
+        )
+        self.assertEqual(target.qsize(), 1)
+
+    def test_learning_batches_are_merged_losslessly_per_actor(self) -> None:
+        uid = MemoryUid(1, 2)
+        outcome_a = MemoryUid(3, 4)
+        outcome_b = MemoryUid(5, 6)
+        probe = PreferenceProbeResult(outcome_a, outcome_b, 7, outcome_a, True)
+        trial = ReplanningTrialResult(uid, outcome_a, outcome_b, True)
+        merged = _merge_learning_batches(
+            (
+                ActorLearningBatch(
+                    1,
+                    "game",
+                    (StrategyRunStat(uid, 2, 1, 3.5),),
+                    (probe,),
+                    (),
+                    0,
+                ),
+                ActorLearningBatch(
+                    1,
+                    "game",
+                    (StrategyRunStat(uid, 3, 2, 4.5),),
+                    (),
+                    (trial,),
+                    1,
+                ),
+            )
+        )
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0].strategy_stats, (StrategyRunStat(uid, 5, 3, 8.0),))
+        self.assertEqual(merged[0].preference_probes, (probe,))
+        self.assertEqual(merged[0].replanning_trials, (trial,))
+        self.assertEqual(merged[0].replans, 1)
+
+    def test_terminal_episode_is_counted_waited_and_reset_only_once(self) -> None:
+        env = SimpleNamespace(
+            last_outcome_state="WIN",
+            last_step_was_reset_boundary=False,
+            reset=Mock(),
+        )
+        self.assertTrue(_is_new_terminal_game(env))
+        with patch("v8.actor.time.sleep") as sleep:
+            _reset_after_terminal_game(env, 1.0)
+        sleep.assert_called_once_with(1.0)
+        env.reset.assert_called_once_with()
+
+        env.last_step_was_reset_boundary = True
+        self.assertFalse(_is_new_terminal_game(env))
+
+    def test_actor_graph_check_occurs_each_thousand_completed_steps(self) -> None:
+        read_view = Mock()
+
+        next_check = _refresh_actor_graph_if_due(
+            read_view,
+            completed_steps=999,
+            next_check_step=1_000,
+        )
+        self.assertEqual(next_check, 1_000)
+        read_view.invalidate_strategy_cache.assert_not_called()
+
+        next_check = _refresh_actor_graph_if_due(
+            read_view,
+            completed_steps=1_000,
+            next_check_step=next_check,
+        )
+        self.assertEqual(next_check, 2_000)
+        read_view.invalidate_strategy_cache.assert_called_once_with()
+
+        next_check = _refresh_actor_graph_if_due(
+            read_view,
+            completed_steps=2_500,
+            next_check_step=next_check,
+            check_interval_steps=1_000,
+        )
+        self.assertEqual(next_check, 3_000)
+        self.assertEqual(read_view.invalidate_strategy_cache.call_count, 2)
+
+        next_check = _refresh_actor_graph_if_due(
+            read_view,
+            completed_steps=3_000,
+            next_check_step=3_000,
+            check_interval_steps=250,
+        )
+        self.assertEqual(next_check, 3_250)
 
 
 if __name__ == "__main__":

@@ -7,7 +7,14 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from v8.actor import ActorJob, ActorProgress, ActorResult, _publish_progress, run_actor_jobs
+from v8.actor import (
+    ActorJob,
+    ActorLearningBatch,
+    ActorProgress,
+    ActorResult,
+    _publish_progress,
+    run_actor_jobs,
+)
 from v8.evidence import EvidenceLedger, EvidenceRecord
 from v8.model import MemoryLevel, MemoryUid, ValidationState
 from v8.reporter import DedicatedReporter
@@ -69,7 +76,8 @@ class ActorProgressFanoutTests(unittest.TestCase):
 
     def test_parent_reporting_deadline_is_checked_before_busy_queue_is_empty(self) -> None:
         job = ActorJob(1, "tt01", 1, 0)
-        result = ActorResult(1, "tt01", 1, 0, 0, 0, 0)
+        pending = ActorLearningBatch(1, "tt01")
+        result = ActorResult(1, "tt01", 1, 0, 0, 0, 0, pending_learning=pending)
 
         class BusyProgressQueue:
             def __init__(self) -> None:
@@ -132,6 +140,7 @@ class ActorProgressFanoutTests(unittest.TestCase):
         self.assertEqual(rows, (result,))
         self.assertGreater(callback_depths[0], 0)
         self.assertEqual(callback_depths[-1], 0)
+        runtime.record_actor_results.assert_called_once_with((pending,))
 
 
 class DedicatedReporterProcessTests(unittest.TestCase):

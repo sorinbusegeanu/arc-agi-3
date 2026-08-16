@@ -52,10 +52,10 @@ class GameWaitTests(unittest.TestCase):
                 env.step(1)
                 sleep.assert_called_once_with(1.0)
 
-    def test_cli_wait_defaults_to_one_second(self) -> None:
+    def test_cli_wait_defaults_to_no_actor_delay(self) -> None:
         with patch("v8.cli.run_continuous", return_value=0) as run:
             self.assertEqual(main(["continuous-run", "--games", "diverse"]), 0)
-        self.assertEqual(run.call_args.args[0].wait, 1.0)
+        self.assertEqual(run.call_args.args[0].wait, 0.0)
 
     def test_cli_wait_can_be_overridden(self) -> None:
         with patch("v8.cli.run_continuous", return_value=0) as run:
@@ -64,6 +64,18 @@ class GameWaitTests(unittest.TestCase):
                 0,
             )
         self.assertEqual(run.call_args.args[0].wait, 0.25)
+
+    def test_cli_graph_check_defaults_to_one_thousand_and_can_be_overridden(self) -> None:
+        with patch("v8.cli.run_continuous", return_value=0) as run:
+            self.assertEqual(main(["continuous-run", "--games", "diverse"]), 0)
+        self.assertEqual(run.call_args.args[0].graph_check, 1_000)
+
+        with patch("v8.cli.run_continuous", return_value=0) as run:
+            self.assertEqual(
+                main(["continuous-run", "--games", "diverse", "--graph-check", "250"]),
+                0,
+            )
+        self.assertEqual(run.call_args.args[0].graph_check, 250)
 
 
 if __name__ == "__main__":

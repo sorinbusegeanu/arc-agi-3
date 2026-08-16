@@ -139,6 +139,27 @@ class DevelopmentalFormationTests(unittest.TestCase):
 
 
 class StructuralTransferTests(unittest.TestCase):
+    def test_correspondence_descriptors_use_one_edge_pass(self) -> None:
+        class CountingEstimator(StructuralCorrespondenceEstimator):
+            descriptor_passes = 0
+
+            @classmethod
+            def _descriptors(cls, uids, edges, by_uid):
+                cls.descriptor_passes += 1
+                return super()._descriptors(uids, edges, by_uid)
+
+        left = node(MemoryLevel.M3, MemoryType.ROLE, (1, 1))
+        middle = node(MemoryLevel.M3, MemoryType.ROLE, (2, 1))
+        right = node(MemoryLevel.M3, MemoryType.ROLE, (3, 1))
+        graph = (
+            edge(left.uid, RelationType.SIMILAR_TO, middle.uid, score=0.9),
+            edge(left.uid, RelationType.SIMILAR_TO, right.uid, score=0.8),
+        )
+
+        CountingEstimator().evaluate((left, middle, right), graph)
+
+        self.assertEqual(CountingEstimator.descriptor_passes, 1)
+
     def test_similarity_requires_formal_correspondence_before_transfer_candidate(self) -> None:
         left = node(MemoryLevel.M3, MemoryType.ROLE, (1, 1), support=4, game_mask=1)
         right = node(MemoryLevel.M3, MemoryType.ROLE, (2, 1), support=4, game_mask=2)

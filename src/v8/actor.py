@@ -24,6 +24,8 @@ from v8.ring import SharedRingBuffer
 
 
 _MAX_PARENT_MESSAGES_PER_CYCLE = 256
+_LEARNING_PUBLISH_INTERVAL_SECONDS = 5.0
+_ACTOR_GRAPH_CHECK_INTERVAL_STEPS = 1_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +38,7 @@ class ActorJob:
     epsilon: float = 0.10
     replanning_probe_rate: float = 0.02
     max_probe_records: int = 256
+    graph_check_steps: int = _ACTOR_GRAPH_CHECK_INTERVAL_STEPS
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +102,7 @@ class ActorResult:
     strategy_stats: tuple[StrategyRunStat, ...] = ()
     preference_probes: tuple[PreferenceProbeResult, ...] = ()
     replanning_trials: tuple[ReplanningTrialResult, ...] = ()
+    pending_learning: ActorLearningBatch | None = None
 
 
 def _polarity(value: str) -> int:
@@ -215,6 +219,26 @@ def _publish_progress(
             pass
 
 
+def _learning_batch(
+    *,
+    job: ActorJob,
+    strategy_stats: dict[MemoryUid, list[float]],
+    preference_probes: list[PreferenceProbeResult],
+    replanning_trials: list[ReplanningTrialResult],
+) -> ActorLearningBatch | None:
+    stats = _stats_tuple(strategy_stats)
+    if not stats and not preference_probes and not replanning_trials:
+        return None
+    return ActorLearningBatch(
+        job.actor_id,
+        job.game_id,
+        stats,
+        tuple(preference_probes),
+        tuple(replanning_trials),
+        len(replanning_trials),
+    )
+
+
 def _publish_learning(
     progress_queue: mp.Queue | None,
     *,
@@ -222,22 +246,95 @@ def _publish_learning(
     strategy_stats: dict[MemoryUid, list[float]],
     preference_probes: list[PreferenceProbeResult],
     replanning_trials: list[ReplanningTrialResult],
-) -> None:
-    if progress_queue is None:
-        return
-    stats = _stats_tuple(strategy_stats)
-    if not stats and not preference_probes and not replanning_trials:
-        return
-    progress_queue.put(
-        ActorLearningBatch(
-            job.actor_id,
-            job.game_id,
-            stats,
-            tuple(preference_probes),
-            tuple(replanning_trials),
-            len(replanning_trials),
-        )
+) -> bool:
+    batch = _learning_batch(
+        job=job,
+        strategy_stats=strategy_stats,
+        preference_probes=preference_probes,
+        replanning_trials=replanning_trials,
     )
+    if batch is None:
+        return True
+    if progress_queue is None:
+        return False
+    try:
+        progress_queue.put_nowait(batch)
+    except queue.Full:
+        return False
+    return True
+
+
+def _merge_learning_batches(
+    rows: Iterable[ActorLearningBatch],
+) -> tuple[ActorLearningBatch, ...]:
+    grouped: dict[tuple[int, str], dict[str, object]] = {}
+    for row in rows:
+        key = (int(row.actor_id), str(row.game_id))
+        bucket = grouped.setdefault(
+            key,
+            {"stats": {}, "probes": [], "trials": [], "replans": 0},
+        )
+        stats = bucket["stats"]
+        assert isinstance(stats, dict)
+        for stat in row.strategy_stats:
+            values = stats.setdefault(stat.strategy_uid, [0.0, 0.0, 0.0])
+            values[0] += float(stat.attempts)
+            values[1] += float(stat.successes)
+            values[2] += float(stat.cost)
+        probes = bucket["probes"]
+        trials = bucket["trials"]
+        assert isinstance(probes, list) and isinstance(trials, list)
+        probes.extend(row.preference_probes)
+        trials.extend(row.replanning_trials)
+        bucket["replans"] = int(bucket["replans"]) + int(row.replans)
+
+    merged: list[ActorLearningBatch] = []
+    for (actor_id, game_id), bucket in sorted(grouped.items()):
+        stats = bucket["stats"]
+        probes = bucket["probes"]
+        trials = bucket["trials"]
+        assert isinstance(stats, dict)
+        assert isinstance(probes, list) and isinstance(trials, list)
+        merged.append(
+            ActorLearningBatch(
+                actor_id,
+                game_id,
+                _stats_tuple(stats),
+                tuple(probes),
+                tuple(trials),
+                int(bucket["replans"]),
+            )
+        )
+    return tuple(merged)
+
+
+def _is_new_terminal_game(env) -> bool:
+    return bool(
+        env.last_outcome_state in {"WIN", "GAME_OVER"}
+        and not env.last_step_was_reset_boundary
+    )
+
+
+def _reset_after_terminal_game(env, wait_seconds: float) -> None:
+    if wait_seconds > 0:
+        time.sleep(float(wait_seconds))
+    env.reset()
+
+
+def _refresh_actor_graph_if_due(
+    read_view: LiveReadView,
+    *,
+    completed_steps: int,
+    next_check_step: int,
+    check_interval_steps: int = _ACTOR_GRAPH_CHECK_INTERVAL_STEPS,
+) -> int:
+    interval = int(check_interval_steps)
+    if interval <= 0:
+        raise ValueError("graph check interval must be positive")
+    if int(completed_steps) < int(next_check_step):
+        return int(next_check_step)
+    read_view.invalidate_strategy_cache()
+    return (int(completed_steps) // interval + 1) * interval
 
 
 def actor_worker(
@@ -263,7 +360,10 @@ def actor_worker(
     )
 
     ring = SharedRingBuffer(**experience_ring_args)
-    view = LiveReadView(read_descriptors)
+    view = LiveReadView(
+        read_descriptors,
+        refresh_interval_seconds=None,
+    )
     rng = Random(job.seed)
     env = ArcGridEnvironment(game_id=job.game_id, seed=job.seed, env_root=job.env_root)
     terminal_wait_seconds = max(0.0, float(env.game_wait_seconds))
@@ -286,6 +386,8 @@ def actor_worker(
     pending_replanning_trials: list[ReplanningTrialResult] = []
     last_levels = int(env.last_levels_completed)
     next_progress = time.monotonic() + 5.0
+    next_learning_publish = time.monotonic() + _LEARNING_PUBLISH_INTERVAL_SECONDS
+    next_graph_check_step = int(job.graph_check_steps)
     try:
         for _ in range(int(job.steps)):
             if stop_event.is_set():
@@ -294,6 +396,13 @@ def actor_worker(
                 time.sleep(0.002)
             if stop_event.is_set():
                 break
+
+            next_graph_check_step = _refresh_actor_graph_if_due(
+                view,
+                completed_steps=sequence,
+                next_check_step=next_graph_check_step,
+                check_interval_steps=job.graph_check_steps,
+            )
 
             before = env.observe()
             before_actions = tuple(sorted(set(int(value) for value in env.available_actions())))
@@ -447,9 +556,10 @@ def actor_worker(
             )
 
             prior_levels = last_levels
-            if env.last_outcome_state == "WIN":
+            terminal_game = _is_new_terminal_game(env)
+            if terminal_game and env.last_outcome_state == "WIN":
                 wins += 1
-            elif env.last_outcome_state == "GAME_OVER":
+            elif terminal_game and env.last_outcome_state == "GAME_OVER":
                 failures += 1
             current_levels = int(env.last_levels_completed)
             level_advanced = current_levels > prior_levels
@@ -494,22 +604,23 @@ def actor_worker(
                 pending_replanning_trials.append(trial)
 
             recent_contexts.append(context)
-            terminal_game = env.last_outcome_state in {"WIN", "GAME_OVER"}
             reset_boundary = current_levels < last_levels or env.last_step_was_reset_boundary
             if terminal_game:
-                _publish_learning(
+                now = time.monotonic()
+                if now >= next_learning_publish and _publish_learning(
                     progress_queue,
                     job=job,
                     strategy_stats=pending_strategy_stats,
                     preference_probes=pending_preference_probes,
                     replanning_trials=pending_replanning_trials,
-                )
-                pending_strategy_stats.clear()
-                pending_preference_probes.clear()
-                pending_replanning_trials.clear()
+                ):
+                    pending_strategy_stats.clear()
+                    pending_preference_probes.clear()
+                    pending_replanning_trials.clear()
+                    next_learning_publish = now + _LEARNING_PUBLISH_INTERVAL_SECONDS
                 local_overlay.clear()
-                if terminal_wait_seconds > 0:
-                    time.sleep(terminal_wait_seconds)
+                _reset_after_terminal_game(env, terminal_wait_seconds)
+                reset_boundary = True
             if reset_boundary:
                 rolling_trajectory = stable_u64(
                     job.actor_id, producer_sequence, current_watermark, person=b"v8-traj-reset"
@@ -517,7 +628,7 @@ def actor_worker(
                 selected_outcome = selected_strategy = None
                 recent_contexts.clear()
                 local_overlay.clear()
-            last_levels = current_levels
+            last_levels = int(env.last_levels_completed) if reset_boundary else current_levels
 
             now = time.monotonic()
             if now >= next_progress:
@@ -534,13 +645,21 @@ def actor_worker(
                 )
                 next_progress = now + 5.0
 
-        _publish_learning(
+        final_learning_published = _publish_learning(
             progress_queue,
             job=job,
             strategy_stats=pending_strategy_stats,
             preference_probes=pending_preference_probes,
             replanning_trials=pending_replanning_trials,
         )
+        pending_learning = None
+        if not final_learning_published:
+            pending_learning = _learning_batch(
+                job=job,
+                strategy_stats=pending_strategy_stats,
+                preference_probes=pending_preference_probes,
+                replanning_trials=pending_replanning_trials,
+            )
         _publish_progress(
             progress_queue,
             reporting_queue,
@@ -566,6 +685,7 @@ def actor_worker(
                 _stats_tuple(strategy_stats),
                 tuple(preference_probes),
                 tuple(replanning_trials),
+                pending_learning,
             )
         )
     finally:
@@ -626,6 +746,7 @@ def run_actor_jobs(
             process.start()
 
         while True:
+            learning_batches: list[ActorLearningBatch] = []
             for _ in range(_MAX_PARENT_MESSAGES_PER_CYCLE):
                 try:
                     row = progress.get_nowait()
@@ -634,8 +755,11 @@ def run_actor_jobs(
                 if isinstance(row, ActorProgress):
                     latest[row.actor_id] = row
                 elif isinstance(row, ActorLearningBatch):
-                    runtime.record_actor_results((row,))
+                    learning_batches.append(row)
+            if learning_batches:
+                runtime.record_actor_results(_merge_learning_batches(learning_batches))
 
+            result_learning: list[ActorLearningBatch] = []
             while True:
                 try:
                     row = results.get_nowait()
@@ -653,6 +777,10 @@ def run_actor_jobs(
                         row.replans,
                         row.planned_steps,
                     )
+                    if row.pending_learning is not None:
+                        result_learning.append(row.pending_learning)
+            if result_learning:
+                runtime.record_actor_results(_merge_learning_batches(result_learning))
 
             failed = [process for process in processes if process.exitcode not in (None, 0)]
             if failed:
@@ -674,6 +802,7 @@ def run_actor_jobs(
         for process in processes:
             process.join(timeout=2.0)
 
+        learning_batches = []
         while True:
             try:
                 row = progress.get_nowait()
@@ -682,7 +811,9 @@ def run_actor_jobs(
             if isinstance(row, ActorProgress):
                 latest[row.actor_id] = row
             elif isinstance(row, ActorLearningBatch):
-                runtime.record_actor_results((row,))
+                learning_batches.append(row)
+        if learning_batches:
+            runtime.record_actor_results(_merge_learning_batches(learning_batches))
 
         result_deadline = time.monotonic() + 2.0
         while len(result_by_actor) < len(jobs) and time.monotonic() < result_deadline:
@@ -702,6 +833,8 @@ def run_actor_jobs(
                     row.replans,
                     row.planned_steps,
                 )
+                if row.pending_learning is not None:
+                    runtime.record_actor_results((row.pending_learning,))
 
         if len(result_by_actor) != len(jobs):
             missing = sorted(set(latest) - set(result_by_actor))

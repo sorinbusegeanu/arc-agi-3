@@ -75,6 +75,35 @@ class StructuralCorrespondenceEstimator:
                 )
         return descriptor
 
+    @classmethod
+    def _descriptors(
+        cls,
+        uids: set[MemoryUid],
+        edges: tuple[EdgeRecord, ...],
+        by_uid: dict[MemoryUid, NodeRecord],
+    ) -> dict[MemoryUid, Counter[tuple[int, int, int, int]]]:
+        descriptors = {uid: Counter() for uid in uids}
+        for edge in edges:
+            relation = int(edge.relation_type)
+            if relation not in cls._STRUCTURAL_RELATIONS:
+                continue
+            weight = max(1, int(edge.support_count))
+            source_descriptor = descriptors.get(edge.source_uid)
+            if source_descriptor is not None:
+                neighbor = by_uid.get(edge.target_uid)
+                if neighbor is not None:
+                    source_descriptor[
+                        (1, relation, int(neighbor.level), int(neighbor.memory_type))
+                    ] += weight
+            target_descriptor = descriptors.get(edge.target_uid)
+            if target_descriptor is not None:
+                neighbor = by_uid.get(edge.source_uid)
+                if neighbor is not None:
+                    target_descriptor[
+                        (-1, relation, int(neighbor.level), int(neighbor.memory_type))
+                    ] += weight
+        return descriptors
+
     @staticmethod
     def _error(
         left: Counter[tuple[int, int, int, int]],
@@ -107,17 +136,17 @@ class StructuralCorrespondenceEstimator:
             and edge.target_uid in by_uid
         ]
         similarities.sort(key=lambda edge: (-float(edge.score), edge.source_uid, edge.target_uid))
+        selected = similarities[: max(0, int(budget))]
+        descriptor_uids = {
+            uid
+            for edge in selected
+            for uid in (edge.source_uid, edge.target_uid)
+        }
+        descriptor_cache = self._descriptors(descriptor_uids, edges, by_uid)
         result: list[StructuralCorrespondence] = []
-        descriptor_cache: dict[MemoryUid, Counter[tuple[int, int, int, int]]] = {}
-        for edge in similarities[: max(0, int(budget))]:
-            left = descriptor_cache.setdefault(
-                edge.source_uid,
-                self._descriptor(edge.source_uid, edges, by_uid),
-            )
-            right = descriptor_cache.setdefault(
-                edge.target_uid,
-                self._descriptor(edge.target_uid, edges, by_uid),
-            )
+        for edge in selected:
+            left = descriptor_cache[edge.source_uid]
+            right = descriptor_cache[edge.target_uid]
             preserved_lr, mismatched_lr, mapping_lr, epsilon_lr = self._error(left, right)
             preserved_rl, mismatched_rl, mapping_rl, epsilon_rl = self._error(right, left)
             preserved = min(preserved_lr, preserved_rl)

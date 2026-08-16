@@ -74,12 +74,24 @@ _LINEAGE_RELATIONS = {
 class LiveReadView:
     """Bounded-staleness live view over independently published RAM shards."""
 
-    def __init__(self, descriptors: Iterable[ShardReadDescriptor]) -> None:
+    def __init__(
+        self,
+        descriptors: Iterable[ShardReadDescriptor],
+        *,
+        refresh_interval_seconds: float | None = 0.0,
+    ) -> None:
+        if refresh_interval_seconds is not None and refresh_interval_seconds < 0:
+            raise ValueError("refresh interval must be non-negative")
         self.descriptors = tuple(descriptors)
         self._nodes = tuple(SharedNodeArena.attach(d.nodes) for d in self.descriptors)
         self._edges = tuple(SharedEdgeArena.attach(d.edges) for d in self.descriptors)
         self._actions = tuple(SharedActionArena.attach(d.actions) for d in self.descriptors)
         self._record_cache: dict[int, tuple[tuple[object, ...], int]] = {}
+        self._refresh_interval_seconds = (
+            None if refresh_interval_seconds is None else float(refresh_interval_seconds)
+        )
+        self._next_strategy_refresh = 0.0
+        self._strategy_cache_stale = True
         self._strategy_version: tuple[int, ...] = ()
         self._strategy_by_context: dict[int, list[_StrategyRow]] = {}
         self._strategy_fallback: list[_StrategyRow] = []
@@ -88,12 +100,19 @@ class LiveReadView:
         self._parents: dict[MemoryUid, set[MemoryUid]] = {}
         self._node_by_uid: dict[MemoryUid, NodeRecord] = {}
         self._refined_action_scores: dict[tuple[int, int], tuple[int, float]] = {}
+        self._outcome_counts: dict[tuple[int, int], dict[int, int]] = {}
+        self._outcome_totals: dict[tuple[int, int], int] = {}
         for arena in (*self._nodes, *self._edges):
             self._stable_records_with_version(arena)
 
     def close(self) -> None:
         for arena in (*self._nodes, *self._edges, *self._actions):
             arena.close()
+
+    def invalidate_strategy_cache(self) -> None:
+        """Schedule one coherent node/edge index refresh before the next query."""
+        self._strategy_cache_stale = True
+        self._next_strategy_refresh = 0.0
 
     def score_actions(self, context_signature: int, action_ids: Iterable[int]) -> tuple[ActionScore, ...]:
         self._refresh_strategy_cache()
@@ -140,19 +159,10 @@ class LiveReadView:
         min_support: int = 3,
         stability_threshold: float = 0.60,
     ) -> dict[int, float]:
-        counts: dict[int, int] = {}
-        total = 0
-        context = int(context_signature)
-        action = int(action_id)
-        for row in self.node_records(level=MemoryLevel.M1):
-            if len(row.key_parts) < 3:
-                continue
-            if int(row.key_parts[0]) != context or signed_u64(int(row.key_parts[1])) != action:
-                continue
-            support = max(0, int(row.support_count))
-            outcome = int(row.key_parts[2])
-            counts[outcome] = counts.get(outcome, 0) + support
-            total += support
+        self._refresh_strategy_cache()
+        key = (int(context_signature), int(action_id))
+        counts = self._outcome_counts.get(key, {})
+        total = self._outcome_totals.get(key, 0)
         if total < max(1, int(min_support)) or not counts:
             return {}
         dominant = max(counts.values()) / total
@@ -267,8 +277,17 @@ class LiveReadView:
         return False
 
     def _refresh_strategy_cache(self) -> None:
+        now = time.monotonic()
+        if not self._strategy_cache_stale:
+            if self._refresh_interval_seconds is None:
+                return
+            if self._strategy_version and now < self._next_strategy_refresh:
+                return
         current_version = tuple(arena.sequence for arena in (*self._nodes, *self._edges))
         if current_version == self._strategy_version and not any(value & 1 for value in current_version):
+            self._strategy_cache_stale = False
+            if self._refresh_interval_seconds is not None:
+                self._next_strategy_refresh = now + self._refresh_interval_seconds
             return
 
         nodes_list: list[NodeRecord] = []
@@ -300,6 +319,17 @@ class LiveReadView:
         }
         active_uids = {row.uid for row in nodes if int(row.cognitive_state) in active_states}
         node_by_uid = {row.uid: row for row in nodes}
+        outcome_counts: dict[tuple[int, int], dict[int, int]] = {}
+        outcome_totals: dict[tuple[int, int], int] = {}
+        for row in nodes:
+            if int(row.level) != int(MemoryLevel.M1) or len(row.key_parts) < 3:
+                continue
+            key = (int(row.key_parts[0]), signed_u64(int(row.key_parts[1])))
+            support = max(0, int(row.support_count))
+            outcome = int(row.key_parts[2])
+            counts = outcome_counts.setdefault(key, {})
+            counts[outcome] = counts.get(outcome, 0) + support
+            outcome_totals[key] = outcome_totals.get(key, 0) + support
         parents: dict[MemoryUid, set[MemoryUid]] = {}
         preferred: set[MemoryUid] = set()
         suppressed: set[MemoryUid] = set()
@@ -380,7 +410,12 @@ class LiveReadView:
             key: (int(values[0]), values[1] / max(1.0, values[0]))
             for key, values in refined.items()
         }
+        self._outcome_counts = outcome_counts
+        self._outcome_totals = outcome_totals
         self._strategy_version = version
+        self._strategy_cache_stale = False
+        if self._refresh_interval_seconds is not None:
+            self._next_strategy_refresh = now + self._refresh_interval_seconds
 
     def strategy_has_ancestor(
         self,

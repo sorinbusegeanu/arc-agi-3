@@ -69,6 +69,7 @@ def _actor_jobs(
     seed: int,
     env_root: str | None,
     epsilon: float,
+    graph_check_steps: int = 1_000,
 ) -> tuple[ActorJob, ...]:
     if actors <= 0:
         raise ValueError("actors must be positive")
@@ -91,6 +92,7 @@ def _actor_jobs(
                     seed=int(seed) + actor_id * 1009,
                     env_root=env_root,
                     epsilon=float(epsilon),
+                    graph_check_steps=int(graph_check_steps),
                 )
             )
             actor_id += 1
@@ -116,6 +118,9 @@ def run_continuous(args) -> int:
 
     if float(args.wait) < 0:
         raise ValueError("--wait must be non-negative")
+    graph_check_steps = int(getattr(args, "graph_check", 1_000))
+    if graph_check_steps <= 0:
+        raise ValueError("--graph-check must be positive")
 
     games = resolve_game_selector(args.games, args.env_root)
     jobs = _actor_jobs(
@@ -125,6 +130,7 @@ def run_continuous(args) -> int:
         seed=args.seed,
         env_root=args.env_root,
         epsilon=args.epsilon,
+        graph_check_steps=graph_check_steps,
     )
     total_steps = sum(int(job.steps) for job in jobs)
     restore_enabled = not args.no_restore
@@ -177,7 +183,8 @@ def run_continuous(args) -> int:
             print(
                 f"v8 continuous: games={len(games)} actors={len(jobs)} shards={args.shards} "
                 f"stage_workers={args.stage_workers} peers={'off' if args.no_peers else 'on'} "
-                f"snapshots={'off' if args.no_snapshots else 'async'} wait={float(args.wait):g}s/game",
+                f"snapshots={'off' if args.no_snapshots else 'async'} wait={float(args.wait):g}s/game "
+                f"graph_check={graph_check_steps}steps",
                 flush=True,
             )
             _log(_graph_load_line(snapshot_path=restore_source, restore_enabled=restore_enabled, nodes=loaded_nodes))
@@ -297,9 +304,15 @@ def main(argv: list[str] | None = None) -> int:
     continuous.add_argument("--env-root", default=None)
     continuous.add_argument("--epsilon", type=float, default=0.10)
     continuous.add_argument(
+        "--graph-check",
+        type=int,
+        default=1_000,
+        help="accepted actor steps between shared-graph version checks",
+    )
+    continuous.add_argument(
         "--wait",
         type=float,
-        default=1.0,
+        default=0.0,
         help="seconds each actor waits after a complete ARC game episode (WIN/GAME_OVER)",
     )
     continuous.add_argument("--actor-timeout", type=float, default=None)
