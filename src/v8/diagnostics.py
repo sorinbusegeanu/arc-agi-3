@@ -95,8 +95,10 @@ def game_summary(
     *,
     levels_per_game: int = _DEFAULT_LEVELS_PER_GAME,
 ) -> tuple[float, float, int, int]:
-    """Return distinct-game win rate and partial level-completion rate.
+    """Return distinct-game current-run win rate and partial level-completion rate.
 
+    These values intentionally describe only observations since the current process
+    started; they are not a retained-competence estimate from restored memory.
     Multiple actor lanes for the same game cannot inflate progress: the maximum
     completed-level count observed for that game is used. When no game-specific
     level count is available, five levels per game is the declared denominator.
@@ -119,17 +121,18 @@ def game_summary(
 
 
 def game_rates(rows: Iterable[GameProgress]) -> tuple[float, float]:
-    """Return distinct-game win rate and partial level-completion rate."""
+    """Return distinct-game current-run win and partial level-completion rates."""
     win_rate, level_rate, _solved_games, _games = game_summary(rows)
     return win_rate, level_rate
 
 
 def format_game_rate_line(rows: Iterable[GameProgress]) -> str:
+    """Format explicitly run-local progress; restored competence must be measured separately."""
     rows = tuple(rows)
     win_rate, level_rate, solved_games, games = game_summary(rows)
     solved = solved_game_steps(rows)
     suffix = "" if not solved else " (" + ", ".join(f"{game_id}:{steps}" for game_id, steps in solved) + ")"
     return (
-        f"wins={win_rate:.1f}% levels_solved={level_rate:.1f}% "
-        f"solved_games={solved_games}/{games}{suffix}"
+        f"current_run_wins={win_rate:.1f}% current_run_levels_solved={level_rate:.1f}% "
+        f"current_run_solved_games={solved_games}/{games}{suffix}"
     )
