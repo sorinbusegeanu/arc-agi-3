@@ -1,4 +1,4 @@
-"""ARC-AGI-3 v8.10 memory-to-intelligence runtime."""
+"""ARC-AGI-3 v8.11 memory-to-intelligence runtime."""
 
 # Install the v0.5.3 memory schema before importing development/runtime modules so
 # proposal packets, shared arenas and snapshot compatibility agree on one layout.
