@@ -14,8 +14,9 @@ def _mark_sampling_started(runtime) -> None:
 def _mark_sampling_complete(runtime) -> None:
     """Stop autonomous peer scheduling as soon as actor sampling has ended."""
     runtime._sampling_complete = True
-    if runtime.peers is not None:
-        runtime.peers.pause()
+    peers = getattr(runtime, "peers", None)
+    if peers is not None:
+        peers.pause()
 
 
 def _remaining(deadline: float) -> float:
