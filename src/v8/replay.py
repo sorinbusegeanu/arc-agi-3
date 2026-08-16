@@ -7,7 +7,7 @@ from v8.isf import (
     ISFScore,
     infer_developmental_stage,
     publish_developmental_stage,
-    score_memory,
+    score_memories,
 )
 from v8.model import CognitiveState, MemoryUid
 
@@ -21,7 +21,7 @@ class ReplayCandidate:
 
 
 class ReplayScheduler:
-    """Bound developmental attention using ISF rather than raw support alone."""
+    """Bound developmental attention using the frozen v8.2 ISF snapshot."""
 
     def __init__(self, *, min_priority: float = 0.25) -> None:
         self.min_priority = float(min_priority)
@@ -33,11 +33,9 @@ class ReplayScheduler:
         *,
         budget: int,
     ) -> tuple[ReplayCandidate, ...]:
-        # Stage_t is inferred once from the input published cut and held fixed for
-        # every score generated in this interval. Evidence created later in the
-        # interval may only influence the next call/Stage_(t+1).
         stage = infer_developmental_stage(rows)
         self.last_developmental_stage = publish_developmental_stage(stage)
+        scores = score_memories(rows, developmental_stage=stage)
         ranked: list[ReplayCandidate] = []
         for row in rows:
             if int(row.cognitive_state) in {
@@ -45,7 +43,7 @@ class ReplayScheduler:
                 int(CognitiveState.RETIRE_PENDING),
             }:
                 continue
-            score = score_memory(row, developmental_stage=stage)
+            score = scores[row.uid]
             novelty = 1.0 / max(1.0, float(row.support_count))
             priority = score.total + 0.10 * novelty
             if priority < self.min_priority:

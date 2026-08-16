@@ -44,22 +44,22 @@ def experience(*, polarity: int) -> ExperienceEvent:
 
 
 class LiveLearningRegressionTests(unittest.TestCase):
-    def test_m1_terminal_reward_changes_behavioral_value(self) -> None:
+    def test_m1_terminal_label_does_not_change_behavioral_value(self) -> None:
         positive = derive_proposal(MemoryLevel.M1, PipelineEvent(experience(polarity=1)))
         neutral = derive_proposal(MemoryLevel.M1, PipelineEvent(experience(polarity=0)))
         negative = derive_proposal(MemoryLevel.M1, PipelineEvent(experience(polarity=-1)))
-        self.assertGreater(positive.significance_sum, neutral.significance_sum)
-        self.assertGreater(neutral.significance_sum, negative.significance_sum)
+        self.assertAlmostEqual(positive.significance_sum, neutral.significance_sum)
+        self.assertAlmostEqual(neutral.significance_sum, negative.significance_sum)
         self.assertGreater(positive.significance_sum, 0.0)
-        self.assertLess(negative.significance_sum, 0.0)
 
-    def test_m6_success_and_failure_are_distinct_outcomes(self) -> None:
+    def test_m6_terminal_label_does_not_change_outcome_identity(self) -> None:
         positive = derive_proposal(MemoryLevel.M6, PipelineEvent(experience(polarity=1)))
+        neutral = derive_proposal(MemoryLevel.M6, PipelineEvent(experience(polarity=0)))
         negative = derive_proposal(MemoryLevel.M6, PipelineEvent(experience(polarity=-1)))
-        self.assertNotEqual(positive.uid, negative.uid)
-        self.assertNotEqual(positive.key_parts[:2], negative.key_parts[:2])
+        self.assertEqual(positive.uid, neutral.uid)
+        self.assertEqual(neutral.uid, negative.uid)
+        self.assertEqual(positive.key_parts, negative.key_parts)
         self.assertEqual(len(positive.key_parts), 3)
-        self.assertEqual(len(negative.key_parts), 3)
 
     def test_peer_metrics_change_hot_action_value(self) -> None:
         key = (7, 2, 123, 8)

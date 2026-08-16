@@ -39,6 +39,10 @@ STAGES: tuple[StageDefinition, ...] = (
     StageDefinition(MemoryLevel.M7, MemoryType.STRATEGY),
 )
 
+# v8.2: raw ExperienceEvent traffic is allowed to instantiate only M0/M1.
+# M2-M7 are produced by evidence-gated peers from published lower-level state.
+RAW_STAGES: tuple[StageDefinition, ...] = STAGES[:2]
+
 
 def _bucket(value: float, threshold: float = 1e-9) -> int:
     return 1 if value > threshold else -1 if value < -threshold else 0
@@ -57,15 +61,15 @@ def _changed_bucket(changed_cells: int) -> int:
     return 4
 
 
-def _outcome_bucket(changed_cells: int, terminal_polarity: int) -> int:
-    polarity = 1 if int(terminal_polarity) > 0 else -1 if int(terminal_polarity) < 0 else 0
-    return _changed_bucket(changed_cells) * 3 + (polarity + 1)
+def _outcome_bucket(changed_cells: int) -> int:
+    """Terminal-label-free structural outcome bucket used only by legacy helpers."""
+    return _changed_bucket(changed_cells)
 
 
 def _key_for(level: MemoryLevel, event: PipelineEvent) -> tuple[int, ...]:
     e = event.experience
     future_bucket = _bucket(e.future_option_delta)
-    outcome_bucket = _outcome_bucket(e.changed_cells, e.terminal_polarity)
+    outcome_bucket = _outcome_bucket(e.changed_cells)
     if level == MemoryLevel.M0:
         return (int(e.event_id.hi), int(e.event_id.lo))
     if level == MemoryLevel.M1:
@@ -75,6 +79,8 @@ def _key_for(level: MemoryLevel, event: PipelineEvent) -> tuple[int, ...]:
             int(e.outcome_signature),
             int(e.next_context_signature),
         )
+    # M2-M7 key construction is retained only for migration/unit-boundary helpers.
+    # The live runtime does not forward raw events to these levels in v8.2.
     if level == MemoryLevel.M2:
         return (int(e.family_signature),)
     if level == MemoryLevel.M3:
@@ -109,6 +115,7 @@ def _key_for(level: MemoryLevel, event: PipelineEvent) -> tuple[int, ...]:
 
 
 def derive_proposal(level: MemoryLevel, event: PipelineEvent) -> MemoryProposal:
+    """Construct one proposal without assigning primitive terminal-label utility."""
     definition = STAGES[int(level)]
     key = _key_for(level, event)
     uid = MemoryUid.from_key(level, definition.memory_type, key)
@@ -121,11 +128,9 @@ def derive_proposal(level: MemoryLevel, event: PipelineEvent) -> MemoryProposal:
     significance = 0.55 * structural_change + 0.45 * option_magnitude
     learning_value = structural_change
     if level == MemoryLevel.M1:
-        significance = (
-            0.30 * significance
-            + 0.55 * max(-1, min(1, int(e.terminal_polarity)))
-            + 0.15 * option_signed
-        )
+        # The environment's terminal label is external benchmark evidence only.
+        # Internal significance uses observable structural change and option impact.
+        significance = 0.65 * structural_change + 0.35 * option_magnitude
 
     relation = RelationType.LEADS_TO if level == MemoryLevel.M7 else RelationType.EXPLAINS
     return MemoryProposal(
@@ -183,11 +188,8 @@ def _developmental_path_key(level: MemoryLevel, event: PipelineEvent) -> tuple[o
         int(e.action_id),
         int(e.outcome_signature),
         int(e.next_context_signature),
-        int(e.family_signature),
-        int(e.carrier_signature),
         float(e.future_option_delta),
         int(e.changed_cells),
-        int(e.terminal_polarity),
         float(e.prediction_error),
         int(event.parent_uid.hi),
         int(event.parent_uid.lo),

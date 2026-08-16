@@ -64,20 +64,24 @@ class RuntimeTests(unittest.TestCase):
         )
 
     def populate(self, runtime: ContinuousMemoryRuntime, count: int = 100) -> None:
+        # Recurrent lower-level contingencies are intentional: v8.2 may form M2+
+        # only after accumulated lower-level evidence, not by direct raw-event projection.
         for index in range(count):
+            context = index % 3
+            action = index % 2
             runtime.submit(
                 runtime.make_experience(
                     producer_id=1 + index % 4,
                     producer_sequence=1 + index // 4,
-                    source_game_hash=1 + index % 3,
+                    source_game_hash=1 + context,
                     global_step=index,
-                    context_signature=10 + index % 5,
-                    action_id=index % 4,
-                    outcome_signature=100 + index % 7,
-                    family_signature=200 + index % 3,
-                    carrier_signature=300 + index % 8,
-                    future_option_delta=float((index % 3) - 1),
-                    changed_cells=1 + index % 12,
+                    context_signature=10 + context,
+                    action_id=action,
+                    outcome_signature=100 + action,
+                    family_signature=200 + action,
+                    carrier_signature=300 + context,
+                    future_option_delta=1.0,
+                    changed_cells=1 + action,
                     trajectory_signature=400 + index % 11,
                 )
             )

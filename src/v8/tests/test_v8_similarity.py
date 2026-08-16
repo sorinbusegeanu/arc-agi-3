@@ -106,11 +106,11 @@ class BoundedSimilarityTests(unittest.TestCase):
         self.assertEqual(restored.evaluate(nodes, ()), ())
         self.assertEqual(restored.candidate_comparisons, before)
 
-    def test_scored_similarity_nominates_cross_game_transfer_candidates(self) -> None:
+    def test_scored_similarity_requires_structural_correspondence_before_transfer_candidates(self) -> None:
         a = role_node((1, 0), watermark=5)
         b = role_node((2, 0), watermark=6)
         source, target = sorted((a.uid, b.uid))
-        edge = EdgeRecord(
+        similarity = EdgeRecord(
             source,
             int(RelationType.SIMILAR_TO),
             target,
@@ -122,20 +122,48 @@ class BoundedSimilarityTests(unittest.TestCase):
             6,
         )
         games = {a.uid: frozenset({101}), b.uid: frozenset({202})}
-        candidates = TransferValidator().candidates(
+        validator = TransferValidator()
+        self.assertEqual(
+            validator.candidates(
+                (a, b),
+                (similarity,),
+                provenance=lambda uid: games[uid],
+            ),
+            (),
+        )
+        correspondence = EdgeRecord(
+            source,
+            int(RelationType.TRANSFER_CORRESPONDENCE),
+            target,
+            2,
+            6,
+            1.6,
+            2.0,
+            5,
+            6,
+        )
+        candidates = validator.candidates(
             (a, b),
-            (edge,),
+            (similarity, correspondence),
             provenance=lambda uid: games[uid],
         )
         self.assertEqual(len(candidates), 2)
         self.assertTrue(all(abs(item.structural_score - 0.8) < 1e-9 for item in candidates))
         self.assertEqual({item.correspondence_uid for item in candidates}, {a.uid, b.uid})
 
-    def test_same_game_similarity_does_not_nominate_transfer(self) -> None:
+    def test_same_game_correspondence_does_not_nominate_transfer(self) -> None:
         a = role_node((1, 0), watermark=5)
         b = role_node((2, 0), watermark=6)
         source, target = sorted((a.uid, b.uid))
-        edge = EdgeRecord(source, int(RelationType.SIMILAR_TO), target, 1, 6, 0.9, 1.0)
+        edge = EdgeRecord(
+            source,
+            int(RelationType.TRANSFER_CORRESPONDENCE),
+            target,
+            1,
+            6,
+            0.9,
+            1.0,
+        )
         candidates = TransferValidator().candidates(
             (a, b),
             (edge,),
