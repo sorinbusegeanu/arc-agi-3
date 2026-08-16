@@ -105,7 +105,14 @@ class V82DevelopmentalPeerSupervisor(DevelopmentalPeerSupervisor):
         # Carrier recurrence alone is candidate evidence.  It becomes emergence
         # evidence only after explanatory/compression utility is positive.
         if kind == "carrier_emergence":
-            row = next((value for value in self.read_view.node_records(level=MemoryLevel.M3) if value.uid == uid), None)
+            row = next(
+                (
+                    value
+                    for value in self.read_view.node_records(level=MemoryLevel.M3)
+                    if value.uid == uid
+                ),
+                None,
+            )
             if row is None:
                 return False
             hypotheses = self.carrier_activation.evaluate((row,))
@@ -128,6 +135,27 @@ class V82DevelopmentalPeerSupervisor(DevelopmentalPeerSupervisor):
             candidate.key_parts,
         )
 
+    @staticmethod
+    def _formation_future_option(
+        candidate: FormationCandidate,
+        by_uid: dict[MemoryUid, object],
+    ) -> float:
+        """Preserve an already-learned role FO bucket when forming a concept.
+
+        Base role construction stores the structurally learned future-option bucket in
+        the role canonical key.  That bucket is causal input to later consequence and
+        outcome structure even when no score delta was accumulated on the role row.
+        """
+        if candidate.level == MemoryLevel.M4 and candidate.parents:
+            parent = by_uid.get(candidate.parents[0])
+            if (
+                parent is not None
+                and int(parent.memory_type) == int(MemoryType.ROLE)
+                and len(parent.key_parts) >= 2
+            ):
+                return float(max(-1, min(1, int(parent.key_parts[1]))))
+        return float(candidate.future_option_delta)
+
     def _process_formation(
         self,
         cut: DevelopmentalGenerationCut,
@@ -149,6 +177,7 @@ class V82DevelopmentalPeerSupervisor(DevelopmentalPeerSupervisor):
             identity = self._formation_identity(candidate)
             weight = max(1.0, float(candidate.support))
             first_parent = candidate.parents[0] if candidate.parents else MemoryUid.zero()
+            future_option_delta = self._formation_future_option(candidate, by_uid)
             proposal = MemoryProposal(
                 uid=candidate.uid,
                 fingerprint=identity.fingerprint,
@@ -162,7 +191,7 @@ class V82DevelopmentalPeerSupervisor(DevelopmentalPeerSupervisor):
                 learning_value_sum=float(candidate.learning_value) * weight,
                 transfer_prior_sum=float(candidate.transfer_prior) * weight,
                 explanatory_sum=float(candidate.explanatory_reach) * weight,
-                future_option_sum=float(candidate.future_option_delta) * weight,
+                future_option_sum=future_option_delta * weight,
                 score_weight=weight,
                 parent_uid=first_parent,
                 relation_type=self._relation_for(candidate),
