@@ -232,8 +232,8 @@ class DedicatedReporterProcessTests(unittest.TestCase):
             game_line = output.get(timeout=3.0)
             hypothesis_line = output.get(timeout=3.0)
             self.assertIn("wins=50.0%", game_line)
-            self.assertIn("levels_solved=50.0%", game_line)
-            self.assertIn("solved_games=1/2 (tt01)", game_line)
+            self.assertIn("levels_solved=20.0%", game_line)
+            self.assertIn("solved_games=1/2 (tt01:20)", game_line)
             self.assertIn("hypotheses H01=VALID", hypothesis_line)
         finally:
             reporter.close()
