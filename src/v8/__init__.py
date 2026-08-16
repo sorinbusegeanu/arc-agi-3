@@ -53,6 +53,9 @@ from v8.normalized_memory_v086_fixups import (
 from v8.intelligence_loop_v087 import (
     install_intelligence_loop_v087 as _install_intelligence_loop_v087,
 )
+from v8.intelligence_loop_v087_fixups import (
+    install_intelligence_loop_v087_fixups as _install_intelligence_loop_v087_fixups,
+)
 
 # Install semantic layers in chronological order. v8.7 is last because it closes the
 # higher-order memory-to-intelligence loop without changing the RAM/snapshot substrate.
@@ -67,6 +70,7 @@ _install_learning_blockers_v055_fixups()
 _install_normalized_memory_v086()
 _install_normalized_memory_v086_fixups()
 _install_intelligence_loop_v087()
+_install_intelligence_loop_v087_fixups()
 
 # Preserve existing import paths: `from v8.runtime import ContinuousMemoryRuntime`
 # and the package-level API both resolve to the current semantic layer.
