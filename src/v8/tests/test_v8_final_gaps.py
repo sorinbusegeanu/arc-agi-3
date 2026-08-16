@@ -6,6 +6,7 @@ import unittest
 from v8.actor import _trajectory_step_cost
 from v8.capacity import snapshot_usage
 from v8.model import MemoryLevel
+from v8.normalized_memory_v086 import is_grounded_contingency
 from v8.runtime import ContinuousMemoryRuntime, V8RuntimeConfig
 
 
@@ -41,7 +42,14 @@ class PredictionBootstrapTests(unittest.TestCase):
                     )
                 )
             runtime.wait_quiescent(timeout=15)
-            self.assertEqual(runtime.read_view.outcome_distribution(10, 2), {})
+            grounded = [
+                row
+                for row in runtime.read_view.node_records(level=MemoryLevel.M1)
+                if is_grounded_contingency(row)
+            ]
+            self.assertEqual(len(grounded), 1)
+            grounded_context = int(grounded[0].key_parts[0])
+            self.assertEqual(runtime.read_view.outcome_distribution(grounded_context, 2), {})
 
             runtime.submit(
                 runtime.make_experience(
@@ -58,7 +66,10 @@ class PredictionBootstrapTests(unittest.TestCase):
                 )
             )
             runtime.wait_quiescent(timeout=15)
-            self.assertEqual(runtime.read_view.outcome_distribution(10, 2), {100: 1.0})
+            self.assertEqual(
+                runtime.read_view.outcome_distribution(grounded_context, 2),
+                {100: 1.0},
+            )
             runtime.close(normal=True, timeout=15)
 
 
