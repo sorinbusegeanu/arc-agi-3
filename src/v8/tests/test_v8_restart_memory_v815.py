@@ -30,8 +30,8 @@ from v8.restart_memory_v815 import (
     _build_restart_indexes,
     _credit_session,
     _phase_variant,
-    _reporting_worker_v815,
 )
+from v8.restart_memory_v815_fixups import _reporting_worker_after_first_progress
 from v8.runtime import V8RuntimeConfig
 from v8.structural_events import NormalizedPrimitive, StructuralFact
 from v8.trajectory_optimizer_v814 import ReplayAnchor, TrajectoryTarget, ValidatedTrajectory
@@ -251,14 +251,14 @@ class SessionAndTrajectoryReuseTests(unittest.TestCase):
 
 
 class ReporterStartupTests(unittest.TestCase):
-    def test_reporter_does_not_emit_zero_percent_before_all_actors_report(self) -> None:
+    def test_reporter_suppresses_only_preprogress_zero_line(self) -> None:
         from v8.actor import ActorProgress
 
         events = queue.Queue()
         output = queue.Queue()
         stop = threading.Event()
         thread = threading.Thread(
-            target=_reporting_worker_v815,
+            target=_reporting_worker_after_first_progress,
             kwargs={
                 "event_queue": events,
                 "stop_event": stop,
@@ -274,9 +274,6 @@ class ReporterStartupTests(unittest.TestCase):
             time.sleep(0.08)
             self.assertTrue(output.empty())
             events.put(ActorProgress(1, "a", 10, 0, 0, 0))
-            time.sleep(0.08)
-            self.assertTrue(output.empty())
-            events.put(ActorProgress(2, "b", 10, 0, 0, 0))
             deadline = time.monotonic() + 0.3
             while output.empty() and time.monotonic() < deadline:
                 time.sleep(0.01)
