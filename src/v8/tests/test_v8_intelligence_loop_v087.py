@@ -64,11 +64,13 @@ class V087IntelligenceLoopTests(unittest.TestCase):
         self.assertNotIn(111, roles[0].key_parts)
         self.assertNotIn(222, roles[0].key_parts)
 
-    def test_unvalidated_concept_cannot_form_m5(self):
+    def test_structurally_ready_concept_can_form_probe_scaffold_but_failed_cannot(self):
         candidate = node(MemoryLevel.M4, MemoryType.CONCEPT, (7, 8), support=4, cognitive=CognitiveState.CANDIDATE, validation=ValidationState.STRUCTURAL)
+        failed = node(MemoryLevel.M4, MemoryType.CONCEPT, (11, 12), support=4, cognitive=CognitiveState.QUARANTINED, validation=ValidationState.FAILED)
         validated = node(MemoryLevel.M4, MemoryType.CONCEPT, (9, 10), support=4, cognitive=CognitiveState.VALIDATED, validation=ValidationState.VALIDATED)
         engine = EvidenceGatedPromotionEngine()
-        self.assertFalse(any(int(item.level) == int(MemoryLevel.M5) for item in engine.propose((candidate,), (), budget=16)))
+        self.assertTrue(any(int(item.level) == int(MemoryLevel.M5) for item in engine.propose((candidate,), (), budget=16)))
+        self.assertFalse(any(int(item.level) == int(MemoryLevel.M5) for item in engine.propose((failed,), (), budget=16)))
         self.assertTrue(any(int(item.level) == int(MemoryLevel.M5) for item in engine.propose((validated,), (), budget=16)))
 
     def test_failed_transfer_persistently_penalizes_and_quarantines(self):
