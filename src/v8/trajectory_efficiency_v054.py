@@ -57,7 +57,6 @@ class TrajectoryEfficiencyTracker:
         strategy_uid = None if plan is None else plan.strategy_uid
 
         if self.active is not None and strategy_uid != self.active.strategy_uid:
-            # The previous strategy stopped before the current action was taken.
             previous_end = max(self.active.start_step, current_step - 1)
             self._finish(success=False, end_step=previous_end)
 
@@ -128,11 +127,17 @@ def _strategy_stats_tuple(actor_module):
 
 
 def _learning_batch_v054(*, job, strategy_stats, preference_probes, replanning_trials):
-    del strategy_stats, preference_probes
+    del preference_probes
     _TRACKER.flush_open_run()
     from v8 import actor as actor_module
 
     stats = _strategy_stats_tuple(actor_module)
+    if not stats and not bool(_primary._CAPTURE_ACTIVE):
+        stats = tuple(
+            actor_module.StrategyRunStat(uid, int(values[0]), int(values[1]), float(values[2]))
+            for uid, values in sorted(strategy_stats.items())
+            if values[0] > 0
+        )
     credits = _primary._credit_tuple()
     preferences = tuple(_primary._PENDING_VALENCE_PREFERENCES)
     if not stats and not replanning_trials and not credits and not preferences:
@@ -242,8 +247,6 @@ def _score_strategy_rows_v054(view, rows, **kwargs):
         if row is None:
             adjusted.append(plan)
             continue
-        # behavior_recovery's base score contains 0.10 / mean_cost. Remove that
-        # absolute bonus and replace it with an outcome-conditioned comparison.
         absolute_bonus = 0.10 / max(1e-9, float(row.mean_cost))
         relative_bonus = _RELATIVE_EFFICIENCY_WEIGHT * relative.get(plan.strategy_uid, 0.0)
         adjusted.append(replace(plan, score=float(plan.score) - absolute_bonus + relative_bonus))
