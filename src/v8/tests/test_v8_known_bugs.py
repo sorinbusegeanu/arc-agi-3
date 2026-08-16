@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from v8.model import MemoryLevel
+from v8.normalized_memory_v086 import is_grounded_contingency, is_normalized_contingency
 from v8.runtime import ContinuousMemoryRuntime, V8RuntimeConfig
 
 
@@ -66,8 +67,12 @@ class KnownBugTests(unittest.TestCase):
             restored.submit(event)
             restored.wait_quiescent(timeout=20)
             rows = restored.read_view.node_records(level=MemoryLevel.M1)
-            self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0].support_count, 1)
+            grounded = [row for row in rows if is_grounded_contingency(row)]
+            normalized = [row for row in rows if is_normalized_contingency(row)]
+            self.assertEqual(len(grounded), 1)
+            self.assertEqual(grounded[0].support_count, 1)
+            self.assertTrue(normalized)
+            self.assertTrue(all(row.support_count == 1 for row in normalized))
         finally:
             restored.close(normal=False)
 
