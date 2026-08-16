@@ -16,6 +16,7 @@ from v8.snapshot import latest_complete_snapshot
 
 
 _GAME_WAIT_ENV = "ARC_AGI3_GAME_WAIT_SECONDS"
+_HYPOTHESIS_INITIAL_DELAY_SECONDS = 60.0
 
 
 def _runtime_config(args, *, total_steps: int = 0) -> V8RuntimeConfig:
@@ -132,6 +133,7 @@ def run_continuous(args) -> int:
     runtime = ContinuousMemoryRuntime(_runtime_config(args, total_steps=total_steps))
     loaded_nodes = runtime.read_view.memory_count
     experiments = ExperimentSummary(0, 0, 0)
+    hypothesis_reporting_started_at: float | None = None
 
     def accumulate_experiments(summary: ExperimentSummary) -> None:
         nonlocal experiments
@@ -143,7 +145,12 @@ def run_continuous(args) -> int:
 
     def report_progress(rows) -> None:
         _log(format_game_rate_line(rows))
-        _log(format_hypothesis_line(runtime.scientific_statuses()))
+        if (
+            hypothesis_reporting_started_at is not None
+            and time.monotonic() - hypothesis_reporting_started_at
+            >= _HYPOTHESIS_INITIAL_DELAY_SECONDS
+        ):
+            _log(format_hypothesis_line(runtime.scientific_statuses()))
         if args.no_automatic_experiments or args.no_peers:
             return
         remaining = max(0, int(args.max_transfer_experiments) - experiments.attempted)
@@ -164,6 +171,7 @@ def run_continuous(args) -> int:
         os.environ[_GAME_WAIT_ENV] = str(float(args.wait))
         try:
             runtime.start()
+            hypothesis_reporting_started_at = time.monotonic()
             print(
                 f"v8 continuous: games={len(games)} actors={len(jobs)} shards={args.shards} "
                 f"stage_workers={args.stage_workers} peers={'off' if args.no_peers else 'on'} "
@@ -171,7 +179,6 @@ def run_continuous(args) -> int:
                 flush=True,
             )
             _log(_graph_load_line(snapshot_path=restore_source, restore_enabled=restore_enabled, nodes=loaded_nodes))
-            _log(format_hypothesis_line(runtime.scientific_statuses()))
             results = run_actor_jobs(
                 runtime,
                 jobs,
