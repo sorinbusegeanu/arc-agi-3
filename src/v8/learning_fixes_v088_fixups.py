@@ -8,6 +8,7 @@ _INSTALLED = False
 
 def _install_cross_context_probe_fallback() -> None:
     from v8 import behavior_recovery as behavior_module
+    from v8 import learning_blockers_v055 as blocker_module
     from v8.publication import LiveReadView
 
     current_plan_candidates = LiveReadView.plan_candidates
@@ -15,7 +16,22 @@ def _install_cross_context_probe_fallback() -> None:
     def plan_candidates(self, context_signature, action_ids, **kwargs):
         plans = tuple(current_plan_candidates(self, context_signature, action_ids, **kwargs))
         required_ancestor = kwargs.get("required_ancestor")
-        if plans or required_ancestor is None:
+
+        # v8.5 composite planning admitted probationary composites directly.  Keep
+        # those available for an explicit validation probe, but never let them
+        # bypass the normal behavioral control gate.
+        if required_ancestor is None:
+            by_uid = getattr(self, "_node_by_uid", {})
+            return tuple(
+                plan
+                for plan in plans
+                if not blocker_module.is_composite_strategy(by_uid.get(plan.strategy_uid))
+                or behavior_module.strategy_can_control(
+                    self, plan.strategy_uid, plan.outcome_uid
+                )
+            )
+
+        if plans:
             return plans
 
         self._refresh_strategy_cache()
