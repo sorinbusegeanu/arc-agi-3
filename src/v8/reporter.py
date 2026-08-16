@@ -6,9 +6,8 @@ import time
 from typing import Iterable
 
 from v8.actor import ActorProgress
-from v8.diagnostics import format_game_rate_line, format_hypothesis_line
-from v8.evaluation import ScientificHypothesisEvaluator
-from v8.evidence import EvidenceLedger, EvidenceRecord
+from v8.diagnostics import format_game_rate_line
+from v8.evidence import EvidenceRecord
 
 
 def _emit_line(message: str, output_queue: mp.Queue | None) -> None:
@@ -32,8 +31,6 @@ def reporting_worker(
         int(actor_id): ActorProgress(int(actor_id), str(game_id), 0, 0, 0, 0)
         for actor_id, game_id in actors
     }
-    ledger = EvidenceLedger()
-    evaluator = ScientificHypothesisEvaluator()
     next_report = time.monotonic() + float(interval_seconds)
 
     while not stop_event.is_set():
@@ -47,24 +44,22 @@ def reporting_worker(
         if isinstance(row, ActorProgress):
             latest[int(row.actor_id)] = row
         elif isinstance(row, EvidenceRecord):
-            ledger.append(row)
+            # Evidence remains authoritative in the runtime ledger and final reports.
+            # The dedicated stdout reporter intentionally ignores it for now.
+            pass
 
         now = time.monotonic()
         if now < next_report:
             continue
 
         rows = tuple(latest[key] for key in sorted(latest))
-        with watermark.get_lock():
-            reporting_watermark = int(watermark.value)
-        decisions = evaluator.evaluate(ledger.cut(reporting_watermark))
         _emit_line(format_game_rate_line(rows), output_queue)
-        _emit_line(format_hypothesis_line(evaluator.status_map(decisions)), output_queue)
         while next_report <= now:
             next_report += float(interval_seconds)
 
 
 class DedicatedReporter:
-    """Isolated periodic reporter fed by actor progress and mirrored evidence."""
+    """Isolated periodic progress reporter fed by actor progress."""
 
     def __init__(
         self,
