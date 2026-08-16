@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from multiprocessing.reduction import ForkingPickler
 from types import SimpleNamespace
 
 import v8
@@ -25,6 +26,11 @@ from v8.runtime_v82 import V82ContinuousMemoryRuntime
 
 
 class PrimaryValenceTests(unittest.TestCase):
+    def test_installed_actor_worker_is_forkserver_picklable(self) -> None:
+        payload = ForkingPickler.dumps(actor.actor_worker)
+        self.assertTrue(payload)
+        self.assertNotIn("<locals>", actor.actor_worker.__qualname__)
+
     def test_proposal_codec_preserves_primary_valence_statistics(self) -> None:
         key = (11, 2, 33, 44)
         uid = MemoryUid.from_key(MemoryLevel.M1, MemoryType.CONTINGENCY, key)

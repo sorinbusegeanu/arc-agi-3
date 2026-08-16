@@ -116,6 +116,7 @@ _RECENT_CONTEXTS: deque[int] = deque(maxlen=8)
 _PENDING_CREDITS: dict[_model.MemoryUid, list[object]] = {}
 _PENDING_VALENCE_PREFERENCES: list[PrimaryValencePreference] = []
 _WINDOW_ACHIEVEMENT: dict[_model.MemoryUid, list[float]] = {}
+_PRIMARY_VALENCE_BASE_ACTOR_WORKER = None
 
 
 def _encode_proposal(proposal: MemoryProposal) -> bytes:
@@ -524,12 +525,26 @@ def _emit_terminal_credits(primary_valence: int, behavior_module) -> None:
                     _model.stable_u64(int(event.context_signature), person=b"v8-context"), float(value)))
 
 
+def _actor_worker_with_primary_valence(*args, **kwargs):
+    """Picklable process entry point for actor-local primary-valence capture."""
+    global _CAPTURE_ACTIVE
+    if _PRIMARY_VALENCE_BASE_ACTOR_WORKER is None:
+        raise RuntimeError("primary-valence actor semantics are not installed")
+    _reset_actor_capture(); _CAPTURE_ACTIVE = True
+    try:
+        return _PRIMARY_VALENCE_BASE_ACTOR_WORKER(*args, **kwargs)
+    finally:
+        _CAPTURE_ACTIVE = False; _reset_actor_capture()
+
+
 def _install_actor_semantics() -> None:
+    global _PRIMARY_VALENCE_BASE_ACTOR_WORKER
     from v8 import actor as actor_module
     from v8 import behavior_recovery as behavior_module
     base_experience = _model.ExperienceEvent
     behavior_observed = actor_module._observed_outcome_uids
     behavior_worker = actor_module.actor_worker
+    _PRIMARY_VALENCE_BASE_ACTOR_WORKER = behavior_worker
     actor_module.ExperienceEvent = _capture_experience_factory(base_experience, behavior_module)
 
     def observed_with_valence(**kwargs):
@@ -611,15 +626,7 @@ def _install_actor_semantics() -> None:
 
     actor_module._merge_learning_batches = merge_learning_batches
 
-    def worker_with_primary_valence(*args, **kwargs):
-        global _CAPTURE_ACTIVE
-        _reset_actor_capture(); _CAPTURE_ACTIVE = True
-        try:
-            return behavior_worker(*args, **kwargs)
-        finally:
-            _CAPTURE_ACTIVE = False; _reset_actor_capture()
-
-    actor_module.actor_worker = worker_with_primary_valence
+    actor_module.actor_worker = _actor_worker_with_primary_valence
 
 
 def _parent_valence_stats(candidate, by_uid):

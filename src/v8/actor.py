@@ -740,10 +740,12 @@ def run_actor_jobs(
     started = time.monotonic()
     deadline = None if timeout is None else started + float(timeout)
     next_report = started + float(progress_interval_seconds)
+    started_processes: list[mp.Process] = []
 
     try:
         for process in processes:
             process.start()
+            started_processes.append(process)
 
         while True:
             learning_batches: list[ActorLearningBatch] = []
@@ -845,9 +847,9 @@ def run_actor_jobs(
 
         return tuple(result_by_actor[key] for key in sorted(result_by_actor))
     except BaseException:
-        for process in processes:
+        for process in started_processes:
             if process.is_alive():
                 process.terminate()
-        for process in processes:
+        for process in started_processes:
             process.join(timeout=2.0)
         raise

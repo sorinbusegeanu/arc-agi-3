@@ -142,6 +142,69 @@ class ActorProgressFanoutTests(unittest.TestCase):
         self.assertEqual(callback_depths[-1], 0)
         runtime.record_actor_results.assert_called_once_with((pending,))
 
+    def test_failed_process_start_only_cleans_up_started_processes(self) -> None:
+        jobs = (ActorJob(1, "tt01", 1, 0), ActorJob(2, "tt02", 1, 1))
+
+        class EmptyQueue:
+            def get_nowait(self):
+                raise queue.Empty
+
+        class Process:
+            def __init__(self, *, fail_start: bool) -> None:
+                self.fail_start = fail_start
+                self.started = False
+                self.terminated = False
+                self.joined = False
+
+            def start(self) -> None:
+                if self.fail_start:
+                    raise AttributeError("cannot pickle actor target")
+                self.started = True
+
+            def is_alive(self) -> bool:
+                if not self.started:
+                    raise AssertionError("queried unstarted process")
+                return True
+
+            def terminate(self) -> None:
+                self.terminated = True
+
+            def join(self, timeout=None) -> None:
+                if not self.started:
+                    raise AssertionError("joined unstarted process")
+                self.joined = True
+
+        created: list[Process] = []
+
+        def make_process(**_kwargs):
+            process = Process(fail_start=bool(created))
+            created.append(process)
+            return process
+
+        context = SimpleNamespace(
+            Queue=lambda **_kwargs: EmptyQueue(),
+            Process=make_process,
+        )
+        runtime = SimpleNamespace(
+            start=Mock(),
+            _mp_ctx=context,
+            _stage_rings=(SimpleNamespace(attachment_args=lambda: {}),),
+            shard_descriptors=(),
+            _watermark=object(),
+            _stop=object(),
+            _actor_throttle=object(),
+            _snapshot_freeze=object(),
+            record_actor_results=Mock(),
+        )
+
+        with self.assertRaisesRegex(AttributeError, "cannot pickle"):
+            run_actor_jobs(runtime, jobs)
+
+        self.assertTrue(created[0].terminated)
+        self.assertTrue(created[0].joined)
+        self.assertFalse(created[1].started)
+        self.assertFalse(created[1].joined)
+
 
 class DedicatedReporterProcessTests(unittest.TestCase):
     def test_process_waits_for_interval_then_reports_progress_and_hypotheses(self) -> None:
