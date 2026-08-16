@@ -14,6 +14,7 @@ from v8.model import (
     decode_pipeline,
     encode_pipeline,
 )
+from v8.normalized_memory_v086 import is_grounded_contingency, is_normalized_contingency
 from v8.runtime import ContinuousMemoryRuntime, V8RuntimeConfig
 
 
@@ -98,6 +99,10 @@ class RuntimeTests(unittest.TestCase):
                 self.assertGreater(counts[int(level)], 0, f"M{int(level)} remained empty")
             self.assertGreater(runtime.read_view.edge_count, 0)
             self.assertEqual(runtime.metrics()["unsaved_tail"], runtime.watermark)
+            normalization = runtime.metrics()["memory_normalization"]
+            self.assertGreater(normalization["m1g_nodes"], 0)
+            self.assertGreater(normalization["m1n_nodes"], 0)
+            self.assertGreater(normalization["m2_from_m1n"], 0)
         finally:
             runtime.close(normal=False)
 
@@ -125,8 +130,12 @@ class RuntimeTests(unittest.TestCase):
                 )
             runtime.wait_quiescent(timeout=20)
             m1 = runtime.read_view.node_records(level=MemoryLevel.M1)
-            self.assertEqual(len(m1), 1)
-            self.assertEqual(m1[0].support_count, 10)
+            grounded = [row for row in m1 if is_grounded_contingency(row)]
+            normalized = [row for row in m1 if is_normalized_contingency(row)]
+            self.assertEqual(len(grounded), 1)
+            self.assertEqual(grounded[0].support_count, 10)
+            self.assertGreaterEqual(len(normalized), 1)
+            self.assertTrue(all(row.support_count == 10 for row in normalized))
         finally:
             runtime.close(normal=False)
 
