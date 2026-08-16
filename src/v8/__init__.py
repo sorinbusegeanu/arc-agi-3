@@ -46,6 +46,9 @@ from v8.hypothesis_validation_v054 import (
 from v8.learning_blockers_v055 import (
     install_learning_blockers_v055 as _install_learning_blockers_v055,
 )
+from v8.learning_blockers_v055_fixups import (
+    install_learning_blockers_v055_fixups as _install_learning_blockers_v055_fixups,
+)
 
 # Install semantic layers in chronological order. v8.5 is last because it tightens
 # control-state/action representation, multi-action planning, causal validation and
@@ -57,6 +60,7 @@ _install_trajectory_efficiency_v054()
 _install_progress_reporting_v054()
 _install_hypothesis_validation_v054()
 _install_learning_blockers_v055()
+_install_learning_blockers_v055_fixups()
 
 # Preserve existing import paths: `from v8.runtime import ContinuousMemoryRuntime`
 # and the package-level API both resolve to the current semantic layer.
