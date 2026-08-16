@@ -88,8 +88,26 @@ class _FakeEnv:
         self.raw = _FakeRaw([[0, 0], [0, 0]], levels=0)
         return self.raw
 
+    @staticmethod
+    def _action_id(action):
+        try:
+            return int(action)
+        except TypeError:
+            for name in ("id", "action_id", "value"):
+                value = getattr(action, name, None)
+                if value is not None:
+                    try:
+                        return int(value)
+                    except (TypeError, ValueError):
+                        continue
+            text = str(action)
+            digits = "".join(ch for ch in text if ch.isdigit())
+            if digits:
+                return int(digits)
+            raise
+
     def step(self, action, data=None):
-        action_id = int(action)
+        action_id = self._action_id(action)
         self.calls.append((action_id, data))
         if data is None and action_id == 1:
             self.levels += 1
@@ -262,7 +280,7 @@ class LearningBlockersV055Tests(unittest.TestCase):
         self.assertAlmostEqual(primary_valence._VALENCE_GAMMA, 0.995)
         self.assertEqual(FutureOptionEstimator().horizon, 8)
 
-    def test_preference_probe_is_idempotent(self):
+    def test_independent_repeated_preference_probes_remain_evidence(self):
         estimator = PreferenceEstimator(support_threshold=2)
         a = MemoryUid.from_key(MemoryLevel.M6, MemoryType.OUTCOME, (1, 2))
         b = MemoryUid.from_key(MemoryLevel.M6, MemoryType.OUTCOME, (1, 3))
@@ -275,8 +293,8 @@ class LearningBlockersV055Tests(unittest.TestCase):
             preference_influenced=False,
         )
         self.assertTrue(estimator.record_probe(**kwargs))
-        self.assertFalse(estimator.record_probe(**kwargs))
-        self.assertEqual(estimator.evaluate()[0].clean_probe_count, 1)
+        self.assertTrue(estimator.record_probe(**kwargs))
+        self.assertEqual(estimator.evaluate()[0].clean_probe_count, 2)
 
     def test_runtime_metadata_marks_learning_capability_layer(self):
         self.assertEqual(
