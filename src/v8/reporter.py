@@ -1,0 +1,130 @@
+from __future__ import annotations
+
+import multiprocessing as mp
+import queue
+import time
+from typing import Iterable
+
+from v8.actor import ActorProgress
+from v8.diagnostics import format_game_rate_line, format_hypothesis_line
+from v8.evaluation import ScientificHypothesisEvaluator
+from v8.evidence import EvidenceLedger, EvidenceRecord
+
+
+def _emit_line(message: str, output_queue: mp.Queue | None) -> None:
+    line = f'[{time.strftime("%H:%M")}] {message}'
+    if output_queue is None:
+        print(line, flush=True)
+    else:
+        output_queue.put(line)
+
+
+def reporting_worker(
+    *,
+    event_queue: mp.Queue,
+    stop_event: mp.synchronize.Event,
+    watermark: mp.sharedctypes.Synchronized,
+    actors: tuple[tuple[int, str], ...],
+    interval_seconds: float,
+    output_queue: mp.Queue | None = None,
+) -> None:
+    latest = {
+        int(actor_id): ActorProgress(int(actor_id), str(game_id), 0, 0, 0, 0)
+        for actor_id, game_id in actors
+    }
+    ledger = EvidenceLedger()
+    evaluator = ScientificHypothesisEvaluator()
+    next_report = time.monotonic() + float(interval_seconds)
+
+    while not stop_event.is_set():
+        now = time.monotonic()
+        timeout = max(0.0, min(0.25, next_report - now))
+        try:
+            row = event_queue.get(timeout=timeout)
+        except queue.Empty:
+            row = None
+
+        if isinstance(row, ActorProgress):
+            latest[int(row.actor_id)] = row
+        elif isinstance(row, EvidenceRecord):
+            ledger.append(row)
+
+        now = time.monotonic()
+        if now < next_report:
+            continue
+
+        rows = tuple(latest[key] for key in sorted(latest))
+        with watermark.get_lock():
+            reporting_watermark = int(watermark.value)
+        decisions = evaluator.evaluate(ledger.cut(reporting_watermark))
+        _emit_line(format_game_rate_line(rows), output_queue)
+        _emit_line(format_hypothesis_line(evaluator.status_map(decisions)), output_queue)
+        while next_report <= now:
+            next_report += float(interval_seconds)
+
+
+class DedicatedReporter:
+    """Isolated periodic reporter fed by actor progress and mirrored evidence."""
+
+    def __init__(
+        self,
+        mp_context,
+        *,
+        watermark: mp.sharedctypes.Synchronized,
+        actors: Iterable[tuple[int, str]],
+        interval_seconds: float = 60.0,
+        output_queue: mp.Queue | None = None,
+    ) -> None:
+        if interval_seconds <= 0:
+            raise ValueError("reporting interval must be positive")
+        self._queue = mp_context.Queue()
+        self._stop = mp_context.Event()
+        self._process = mp_context.Process(
+            target=reporting_worker,
+            kwargs={
+                "event_queue": self._queue,
+                "stop_event": self._stop,
+                "watermark": watermark,
+                "actors": tuple((int(actor_id), str(game_id)) for actor_id, game_id in actors),
+                "interval_seconds": float(interval_seconds),
+                "output_queue": output_queue,
+            },
+            name="v8-dedicated-reporter",
+            daemon=True,
+        )
+        self._started = False
+        self._closed = False
+
+    @property
+    def progress_queue(self) -> mp.Queue:
+        return self._queue
+
+    def start(self) -> None:
+        if self._started:
+            return
+        self._process.start()
+        self._started = True
+
+    def publish_evidence(self, row: EvidenceRecord) -> None:
+        if self._closed:
+            return
+        self._queue.put(row)
+
+    def raise_if_failed(self) -> None:
+        if self._started and self._process.exitcode not in (None, 0):
+            raise RuntimeError(
+                f"v8 dedicated reporter exited unexpectedly: {self._process.exitcode}"
+            )
+
+    def close(self, *, timeout: float = 3.0) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._stop.set()
+        if self._started:
+            self._process.join(timeout=float(timeout))
+            if self._process.is_alive():
+                self._process.terminate()
+                self._process.join(timeout=2.0)
+        self._queue.cancel_join_thread()
+        self._queue.close()

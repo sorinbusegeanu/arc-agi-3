@@ -5,6 +5,7 @@ import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from threading import Lock
+from typing import Callable
 
 from v8.model import MemoryUid
 
@@ -92,6 +93,7 @@ class EvidenceLedger:
         self._rows: list[EvidenceRecord] = []
         self._ids: set[str] = set()
         self._lock = Lock()
+        self._append_listener: Callable[[EvidenceRecord], None] | None = None
 
     def append(self, row: EvidenceRecord) -> bool:
         if row.evidence_available_watermark > row.decision_watermark:
@@ -103,7 +105,23 @@ class EvidenceLedger:
                 return False
             self._ids.add(row.evidence_id)
             self._rows.append(row)
-            return True
+            listener = self._append_listener
+        if listener is not None:
+            listener(row)
+        return True
+
+    def set_append_listener(
+        self,
+        listener: Callable[[EvidenceRecord], None] | None,
+        *,
+        replay: bool = False,
+    ) -> None:
+        with self._lock:
+            self._append_listener = listener
+            rows = tuple(self._rows) if listener is not None and replay else ()
+        if listener is not None:
+            for row in rows:
+                listener(row)
 
     def contains(self, evidence_id: str) -> bool:
         with self._lock:

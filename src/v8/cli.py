@@ -9,14 +9,13 @@ from pathlib import Path
 
 from v8.actor import ActorJob, run_actor_jobs
 from v8.capacity import plan_capacities
-from v8.diagnostics import format_game_rate_line, format_hypothesis_line
 from v8.experiments import ExperimentSummary, run_automatic_transfer_experiments
+from v8.reporter import DedicatedReporter
 from v8.runtime import ContinuousMemoryRuntime, V8RuntimeConfig
 from v8.snapshot import latest_complete_snapshot
 
 
 _GAME_WAIT_ENV = "ARC_AGI3_GAME_WAIT_SECONDS"
-_HYPOTHESIS_INITIAL_DELAY_SECONDS = 60.0
 
 
 def _runtime_config(args, *, total_steps: int = 0) -> V8RuntimeConfig:
@@ -133,7 +132,7 @@ def run_continuous(args) -> int:
     runtime = ContinuousMemoryRuntime(_runtime_config(args, total_steps=total_steps))
     loaded_nodes = runtime.read_view.memory_count
     experiments = ExperimentSummary(0, 0, 0)
-    hypothesis_reporting_started_at: float | None = None
+    reporter: DedicatedReporter | None = None
 
     def accumulate_experiments(summary: ExperimentSummary) -> None:
         nonlocal experiments
@@ -143,14 +142,9 @@ def run_continuous(args) -> int:
             experiments.passed + summary.passed,
         )
 
-    def report_progress(rows) -> None:
-        _log(format_game_rate_line(rows))
-        if (
-            hypothesis_reporting_started_at is not None
-            and time.monotonic() - hypothesis_reporting_started_at
-            >= _HYPOTHESIS_INITIAL_DELAY_SECONDS
-        ):
-            _log(format_hypothesis_line(runtime.scientific_statuses()))
+    def periodic_maintenance(_rows) -> None:
+        if reporter is not None:
+            reporter.raise_if_failed()
         if args.no_automatic_experiments or args.no_peers:
             return
         remaining = max(0, int(args.max_transfer_experiments) - experiments.attempted)
@@ -166,12 +160,20 @@ def run_continuous(args) -> int:
         )
         accumulate_experiments(live)
 
+    def stop_reporter() -> None:
+        nonlocal reporter
+        if reporter is None:
+            return
+        if runtime.peers is not None:
+            runtime.peers.ledger.set_append_listener(None)
+        reporter.close()
+        reporter = None
+
     try:
         previous_wait = os.environ.get(_GAME_WAIT_ENV)
         os.environ[_GAME_WAIT_ENV] = str(float(args.wait))
         try:
             runtime.start()
-            hypothesis_reporting_started_at = time.monotonic()
             print(
                 f"v8 continuous: games={len(games)} actors={len(jobs)} shards={args.shards} "
                 f"stage_workers={args.stage_workers} peers={'off' if args.no_peers else 'on'} "
@@ -179,12 +181,25 @@ def run_continuous(args) -> int:
                 flush=True,
             )
             _log(_graph_load_line(snapshot_path=restore_source, restore_enabled=restore_enabled, nodes=loaded_nodes))
+            reporter = DedicatedReporter(
+                runtime._mp_ctx,
+                watermark=runtime._watermark,
+                actors=((job.actor_id, job.game_id) for job in jobs),
+                interval_seconds=args.progress_interval_seconds,
+            )
+            reporter.start()
+            if runtime.peers is not None:
+                runtime.peers.ledger.set_append_listener(
+                    reporter.publish_evidence,
+                    replay=True,
+                )
             results = run_actor_jobs(
                 runtime,
                 jobs,
                 timeout=args.actor_timeout,
                 progress_interval_seconds=args.progress_interval_seconds,
-                progress_callback=report_progress,
+                progress_callback=periodic_maintenance,
+                reporting_queue=reporter.progress_queue,
             )
         finally:
             if previous_wait is None:
@@ -210,6 +225,7 @@ def run_continuous(args) -> int:
 
         metrics = runtime.metrics()
         hypothesis_statuses = runtime.scientific_statuses()
+        stop_reporter()
         final = runtime.close(normal=True, timeout=args.final_save_timeout)
         summary = {
             "games": list(games),
@@ -223,9 +239,11 @@ def run_continuous(args) -> int:
         path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
         return 0
     except KeyboardInterrupt:
+        stop_reporter()
         runtime.close(normal=True, timeout=args.final_save_timeout)
         raise
     except BaseException:
+        stop_reporter()
         runtime.close(normal=False)
         raise
 

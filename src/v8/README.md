@@ -238,7 +238,9 @@ Automatic transfer experiments are enabled by default and bounded by:
 
 They can be disabled with `--no-automatic-experiments`.
 
-Every progress interval prints dedicated game progress and H01-H15 lines, for example:
+Every progress interval, a dedicated reporting process prints game progress and
+H01-H15 lines independently of actor-learning queue load. The first report is
+emitted after the first interval (60 seconds by default), not at startup. For example:
 
 ```text
 [19:45] wins=50.0% levels_solved=50.0% solved_games=5/10 (ez01, ez02, ez03, ez04, ez05)

@@ -23,6 +23,9 @@ from v8.publication import LiveReadView, ShardReadDescriptor
 from v8.ring import SharedRingBuffer
 
 
+_MAX_PARENT_MESSAGES_PER_CYCLE = 256
+
+
 @dataclass(frozen=True, slots=True)
 class ActorJob:
     actor_id: int
@@ -183,6 +186,7 @@ def _stats_tuple(values: dict[MemoryUid, list[float]]) -> tuple[StrategyRunStat,
 
 def _publish_progress(
     progress_queue: mp.Queue | None,
+    reporting_queue: mp.Queue | None = None,
     *,
     job: ActorJob,
     steps: int,
@@ -192,8 +196,6 @@ def _publish_progress(
     replans: int,
     planned_steps: int,
 ) -> None:
-    if progress_queue is None:
-        return
     row = ActorProgress(
         job.actor_id,
         job.game_id,
@@ -204,10 +206,13 @@ def _publish_progress(
         int(replans),
         int(planned_steps),
     )
-    try:
-        progress_queue.put_nowait(row)
-    except queue.Full:
-        pass
+    for target in (progress_queue, reporting_queue):
+        if target is None:
+            continue
+        try:
+            target.put_nowait(row)
+        except queue.Full:
+            pass
 
 
 def _publish_learning(
@@ -244,6 +249,7 @@ def actor_worker(
     stop_event: mp.synchronize.Event,
     result_queue: mp.Queue,
     progress_queue: mp.Queue | None = None,
+    reporting_queue: mp.Queue | None = None,
     actor_throttle: mp.sharedctypes.Synchronized | None = None,
     snapshot_freeze: mp.synchronize.Event | None = None,
 ) -> None:
@@ -517,6 +523,7 @@ def actor_worker(
             if now >= next_progress:
                 _publish_progress(
                     progress_queue,
+                    reporting_queue,
                     job=job,
                     steps=sequence,
                     wins=wins,
@@ -536,6 +543,7 @@ def actor_worker(
         )
         _publish_progress(
             progress_queue,
+            reporting_queue,
             job=job,
             steps=sequence,
             wins=wins,
@@ -572,6 +580,7 @@ def run_actor_jobs(
     timeout: float | None = None,
     progress_interval_seconds: float = 60.0,
     progress_callback: Callable[[tuple[ActorProgress, ...]], None] | None = None,
+    reporting_queue: mp.Queue | None = None,
 ) -> tuple[ActorResult, ...]:
     runtime.start()
     jobs = tuple(jobs)
@@ -594,6 +603,7 @@ def run_actor_jobs(
                 "stop_event": runtime._stop,
                 "result_queue": results,
                 "progress_queue": progress,
+                "reporting_queue": reporting_queue,
                 "actor_throttle": runtime._actor_throttle,
                 "snapshot_freeze": runtime._snapshot_freeze,
             },
@@ -616,7 +626,7 @@ def run_actor_jobs(
             process.start()
 
         while True:
-            while True:
+            for _ in range(_MAX_PARENT_MESSAGES_PER_CYCLE):
                 try:
                     row = progress.get_nowait()
                 except queue.Empty:
