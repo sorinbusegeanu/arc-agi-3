@@ -11,10 +11,9 @@ _install_primary_valence_schema()
 from v8.primary_valence_fixups import install_schema_fixups as _install_schema_fixups
 _install_schema_fixups()
 
-# runtime.py remains the v8.1 RAM/concurrency authority. During its import, bind
-# only the scientific-semantic extension points: raw stage topology, peer supervisor,
-# and evaluator. Direct raw events still instantiate only M0/M1; M2-M7 emerge from
-# accumulated memory state.
+# runtime.py remains the v8.1 RAM/concurrency authority. Bind the v8.2 semantic
+# extensions around it, then make the raw runtime topology explicit: ExperienceEvent
+# traffic has exactly two raw stages (M0/M1). M2-M7 are peer/evidence formed.
 from v8 import development as _development
 from v8 import evaluation as _evaluation
 from v8 import peers as _peers
@@ -22,14 +21,10 @@ from v8.evaluation_v82 import V82ScientificHypothesisEvaluator
 from v8.model import EventId, ExperienceEvent, MemoryLevel, MemoryType, MemoryUid
 from v8.peers_v82 import V82DevelopmentalPeerSupervisor
 
-_full_stages = _development.STAGES
-_development.STAGES = _development.RAW_STAGES
 _peers.DevelopmentalPeerSupervisor = V82DevelopmentalPeerSupervisor
 _evaluation.ScientificHypothesisEvaluator = V82ScientificHypothesisEvaluator
-try:
-    import v8.runtime as _runtime
-finally:
-    _development.STAGES = _full_stages
+import v8.runtime as _runtime
+_runtime.STAGES = _development.RAW_STAGES
 
 from v8.runtime_v82 import V82ContinuousMemoryRuntime
 from v8.behavior_recovery import install_behavior_recovery as _install_behavior_recovery
