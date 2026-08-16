@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import tempfile
 import threading
 import unittest
@@ -182,18 +184,26 @@ class RuntimeTests(unittest.TestCase):
         runtime.start()
         self.populate(runtime, 80)
         runtime.wait_quiescent(timeout=20)
-        before = runtime.read_view.state_digest()
         watermark = runtime.watermark
         final = runtime.close(normal=True, timeout=30)
         self.assertIsNotNone(final)
         self.assertEqual(final.watermark, watermark)
         self.assertTrue((root / "RUN_COMPLETE.json").is_file())
 
+        manifest = json.loads((Path(final.path) / "manifest.json").read_text(encoding="utf-8"))
         restored = ContinuousMemoryRuntime(config)
         try:
             restored.start()
-            after = restored.read_view.state_digest()
-            self.assertEqual(before, after)
+            for shard_manifest, nodes, edges, actions in zip(
+                manifest["shards"],
+                restored.read_view._nodes,
+                restored.read_view._edges,
+                restored.read_view._actions,
+                strict=True,
+            ):
+                for label, arena in (("nodes", nodes), ("edges", edges), ("actions", actions)):
+                    digest = hashlib.sha256(arena.snapshot_bytes()).hexdigest()
+                    self.assertEqual(digest, shard_manifest[label]["sha256"])
             self.assertEqual(restored.watermark, watermark)
             self.assertEqual(restored.metrics()["saved_watermark"], watermark)
         finally:
