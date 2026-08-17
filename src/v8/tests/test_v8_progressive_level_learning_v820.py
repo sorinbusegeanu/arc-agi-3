@@ -69,7 +69,7 @@ class ProgressiveAdmissionTests(unittest.TestCase):
             )
             self.assertIn(row.trajectory_id, progressive._PREWIN_CHEAP_TRAJECTORIES)
 
-    def test_only_improving_pre_win_source_is_admitted(self) -> None:
+    def test_only_first_pre_win_source_is_validated_while_storage_keeps_improving(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             service = runtime_owned_service(root)
             first = source(actions=(1, 2, 3), prefix=(9, 8), level=2)
@@ -83,7 +83,7 @@ class ProgressiveAdmissionTests(unittest.TestCase):
                 self.assertTrue(v819._service_submit_v819(service, first))
                 self.assertTrue(v819._service_submit_v819(service, worse))
                 self.assertTrue(v819._service_submit_v819(service, better))
-            self.assertEqual(submit.call_count, 2)
+            self.assertEqual(submit.call_count, 1)
             self.assertEqual(
                 service._v819_pre_win_sources["world"][2].trajectory_id,
                 better.trajectory_id,
