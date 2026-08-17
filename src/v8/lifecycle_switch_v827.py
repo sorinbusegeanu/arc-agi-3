@@ -33,3 +33,9 @@ def install_lifecycle_switch_v827() -> None:
     _BASE_SUPERVISOR_START = V82DevelopmentalPeerSupervisor.start
     V82DevelopmentalPeerSupervisor.start = _supervisor_start_v827
     _INSTALLED = True
+
+    from v8.lifecycle_competence_integration_v827_fixups import (
+        install_lifecycle_competence_integration_v827_fixups,
+    )
+
+    install_lifecycle_competence_integration_v827_fixups()
