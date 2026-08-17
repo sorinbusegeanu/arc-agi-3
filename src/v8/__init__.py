@@ -1,4 +1,4 @@
-"""ARC-AGI-3 v8.25 memory-to-intelligence runtime."""
+"""ARC-AGI-3 v8.26 memory-to-intelligence runtime."""
 
 # Install the v0.5.3 memory schema before importing development/runtime modules so
 # proposal packets, shared arenas and snapshot compatibility agree on one layout.
@@ -158,9 +158,13 @@ from v8.learning_performance_repair_v824 import (
 from v8.complete_win_trajectory_repair_v825 import (
     install_complete_win_trajectory_repair_v825 as _install_complete_win_trajectory_repair_v825,
 )
+from v8.learning_control_continuity_v826 import (
+    install_learning_control_continuity_v826 as _install_learning_control_continuity_v826,
+)
 
-# Install semantic/control layers in chronological order. v8.25 restores complete
-# multi-level WIN composition and keeps trajectory evidence durable across runs.
+# Install semantic/control layers in chronological order. v8.26 restores the
+# planner-first learning contract and keeps unsolved episodes continuous across the
+# former 2048-action allocator boundary while retaining v8.25 trajectory durability.
 _install_behavior_recovery()
 _install_primary_valence_runtime()
 _install_runtime_fixups()
@@ -207,6 +211,7 @@ _install_runtime_repair_v822()
 _install_progress_runtime_fix_v822()
 _install_learning_performance_repair_v824()
 _install_complete_win_trajectory_repair_v825()
+_install_learning_control_continuity_v826()
 
 # Preserve existing import paths: `from v8.runtime import ContinuousMemoryRuntime`
 # and the package-level API both resolve to the current semantic layer.
