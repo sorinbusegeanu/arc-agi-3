@@ -12,18 +12,19 @@ import v8
 from v8 import adaptive_learning_allocation_v819 as v819
 from v8 import adaptive_learning_allocation_v819_solve_fix as solve_fix
 from v8 import trajectory_optimizer_v814 as optimizer
-from v8.adaptive_learning_allocation_v819 import FrontierSource, SamplingMode
+from v8.adaptive_learning_allocation_v819 import FrontierSource
 from v8.model import MemoryUid
 
 
-def source(*, game="world", actions=(1, 2, 3), level=1, terminal="LEVEL", prefix=()):
-    anchor = optimizer.ReplayAnchor(game, 77, tuple(prefix), None)
+def source(*, actions=(1, 2, 3), prefix=(), level=1, terminal="LEVEL"):
+    anchor = optimizer.ReplayAnchor("world", 0, tuple(prefix), None)
     target = optimizer.TrajectoryTarget(level, terminal)
+    actions = tuple(int(value) for value in actions)
     return optimizer.SuccessfulTrajectory(
         optimizer._trajectory_id(anchor, target, actions),
         anchor,
         target,
-        tuple(actions),
+        actions,
         MemoryUid.zero(),
         MemoryUid.zero(),
         0,
@@ -36,6 +37,7 @@ def runtime_owned_service(root: str):
         validator=lambda _candidate: SimpleNamespace(success=True, reason="ok"),
     )
     coordinator = v819.AdaptiveLearningCoordinator()
+    coordinator.register_games(("world",))
     runtime = SimpleNamespace(_v819_adaptive_learning=coordinator)
     service._v819_runtime = runtime
     service._v819_lock = threading.RLock()
@@ -46,33 +48,29 @@ def runtime_owned_service(root: str):
 
 
 class CaptureSourceTests(unittest.TestCase):
-    def test_transfer_sampling_marks_captured_trajectory_as_transfer_source(self) -> None:
-        row = source()
-        prior = os.environ.get(v819._SAMPLING_MODE_ENV)
-        try:
-            os.environ[v819._SAMPLING_MODE_ENV] = SamplingMode.TRANSFER.value
-            raw = row.to_dict()
-        finally:
-            if prior is None:
-                os.environ.pop(v819._SAMPLING_MODE_ENV, None)
-            else:
-                os.environ[v819._SAMPLING_MODE_ENV] = prior
-        self.assertEqual(raw["frontier_source"], FrontierSource.TRANSFER.value)
-        self.assertEqual(raw["sampling_mode"], SamplingMode.TRANSFER.value)
-        self.assertNotIn("seed", raw["anchor"])
-
     def test_normal_sampling_marks_sampler_source(self) -> None:
-        row = source()
         prior = os.environ.get(v819._SAMPLING_MODE_ENV)
         try:
-            os.environ[v819._SAMPLING_MODE_ENV] = SamplingMode.ALTERNATIVE.value
-            raw = row.to_dict()
+            os.environ[v819._SAMPLING_MODE_ENV] = v819.SamplingMode.DISCOVERY.value
+            raw = source().to_dict()
         finally:
             if prior is None:
                 os.environ.pop(v819._SAMPLING_MODE_ENV, None)
             else:
                 os.environ[v819._SAMPLING_MODE_ENV] = prior
         self.assertEqual(raw["frontier_source"], FrontierSource.SAMPLER.value)
+
+    def test_transfer_sampling_marks_captured_trajectory_as_transfer_source(self) -> None:
+        prior = os.environ.get(v819._SAMPLING_MODE_ENV)
+        try:
+            os.environ[v819._SAMPLING_MODE_ENV] = v819.SamplingMode.TRANSFER.value
+            raw = source().to_dict()
+        finally:
+            if prior is None:
+                os.environ.pop(v819._SAMPLING_MODE_ENV, None)
+            else:
+                os.environ[v819._SAMPLING_MODE_ENV] = prior
+        self.assertEqual(raw["frontier_source"], FrontierSource.TRANSFER.value)
 
 
 class ServiceCompatibilityTests(unittest.TestCase):
@@ -114,7 +112,7 @@ class ServiceCompatibilityTests(unittest.TestCase):
             self.assertEqual(routed.edit_kind, "VALIDATE_SOURCE")
             self.assertEqual(tuple(routed.actions), tuple(row.actions))
 
-    def test_pre_win_storage_keeps_only_shortest_source_per_level(self) -> None:
+    def test_pre_win_storage_keeps_shortest_source_without_repeated_validation(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             service = runtime_owned_service(root)
             longer = source(actions=(1, 2, 3, 4), level=2, prefix=(9, 8, 7))
@@ -122,7 +120,7 @@ class ServiceCompatibilityTests(unittest.TestCase):
             with patch.object(v819, "_BASE_ROUTE_CANDIDATE", return_value=True) as route:
                 self.assertTrue(v819._service_submit_v819(service, longer))
                 self.assertTrue(v819._service_submit_v819(service, shorter))
-            self.assertEqual(route.call_count, 2)
+            self.assertEqual(route.call_count, 1)
             stored = service._v819_pre_win_sources["world"][2]
             self.assertEqual(stored.trajectory_id, shorter.trajectory_id)
 

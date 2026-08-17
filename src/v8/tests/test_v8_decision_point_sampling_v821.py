@@ -146,7 +146,7 @@ class DecisionPointSamplingV821Tests(unittest.TestCase):
             1,
         )
 
-    def test_success_is_verified_twice_then_transferred_to_next_level(self) -> None:
+    def test_success_is_verified_once_then_transferred_to_next_level(self) -> None:
         sampler = sampling.DecisionPointSampler("ez01", seed=3)
         self.assertEqual(
             sampler.discovery_action(level=0, context=10, actions=(1, 2, 3, 4), history=()),
@@ -168,37 +168,33 @@ class DecisionPointSamplingV821Tests(unittest.TestCase):
             future_delta=0.0,
         )
         self.assertIsNotNone(sampler.verification)
-        self.assertEqual(sampler.verification.remaining, 2)
+        self.assertEqual(sampler.verification.remaining, 1)
 
         env = _Env()
-        for remaining in (1, 0):
-            self.assertTrue(sampler.prepare_step(env))
-            action = sampler.forced_action(
-                level=0,
-                context=10,
-                actions=(1, 2, 3, 4),
-                history=(),
-            )
-            self.assertEqual(action, 1)
-            sampler.observe_transition(
-                before_level=0,
-                before_context=10,
-                action=1,
-                after_level=1,
-                after_context=20,
-                after_actions=(1, 2, 3, 4),
-                history_after=(1,),
-                changed_cells=1,
-                terminal_state="NOT_FINISHED",
-                terminal_polarity=1,
-                level_advanced=True,
-                prediction_error=0.0,
-                future_delta=0.0,
-            )
-            if remaining:
-                self.assertEqual(sampler.verification.remaining, remaining)
-            else:
-                self.assertIsNone(sampler.verification)
+        self.assertTrue(sampler.prepare_step(env))
+        action = sampler.forced_action(
+            level=0,
+            context=10,
+            actions=(1, 2, 3, 4),
+            history=(),
+        )
+        self.assertEqual(action, 1)
+        sampler.observe_transition(
+            before_level=0,
+            before_context=10,
+            action=1,
+            after_level=1,
+            after_context=20,
+            after_actions=(1, 2, 3, 4),
+            history_after=(1,),
+            changed_cells=1,
+            terminal_state="NOT_FINISHED",
+            terminal_polarity=1,
+            level_advanced=True,
+            prediction_error=0.0,
+            future_delta=0.0,
+        )
+        self.assertIsNone(sampler.verification)
 
         self.assertEqual(sampler.transfer_action, 1)
         self.assertEqual(sampler.transfer_from_level, 0)

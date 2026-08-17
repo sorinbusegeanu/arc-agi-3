@@ -117,4 +117,9 @@ def install_progress_runtime_fix_v822() -> None:
     actor_module.ActorProgress = V822ActorProgress
     actor_module._publish_progress = _publish_progress_v822
     diagnostics.format_game_rate_line = _format_game_rate_line_v822
+
+    # Install v8.23 last so it can repair the final composed actor/planner chain.
+    from v8.sampling_control_repair_v823 import install_sampling_control_repair_v823
+
+    install_sampling_control_repair_v823()
     _INSTALLED = True
