@@ -70,7 +70,7 @@ class ActorProgressFanoutTests(unittest.TestCase):
             planned_steps=4,
         )
 
-        expected = ActorProgress(3, "tt01", 7, 1, 0, 2, 3, 4)
+        expected = ActorProgress(3, "tt01", 7, 1, 0, 2, 3, 4, first_win_step=7)
         self.assertEqual(parent.get_nowait(), expected)
         self.assertEqual(reporting.get_nowait(), expected)
 
@@ -90,7 +90,7 @@ class ActorProgressFanoutTests(unittest.TestCase):
                 return ActorProgress(1, "tt01", 1, 0, 0, 0)
 
         class ResultQueue:
-            def __init__(self) -> None:
+            def __init__(self):
                 self.pending = [result]
 
             def get_nowait(self):
@@ -232,7 +232,7 @@ class DedicatedReporterProcessTests(unittest.TestCase):
             game_line = output.get(timeout=3.0)
             self.assertIn("current_run_wins=50.0%", game_line)
             self.assertIn("current_run_levels_solved=20.0%", game_line)
-            self.assertIn("current_run_solved_games=1/2 (tt01:B=20,L=20)", game_line)
+            self.assertIn("current_run_solved_games=1/2 (tt01:win_observed)", game_line)
             self.assertNotIn("hypotheses", game_line)
             with self.assertRaises(queue.Empty):
                 output.get(timeout=0.15)
