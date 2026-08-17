@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-"""v8.32 productive-action persistence for the adaptive sampling portfolio.
+"""v8.32 variable-length productive-action rollouts for the sampling portfolio.
 
-v8.31 bounded arbitrary action combinations to depth four.  That is appropriate
-for combinatorial branching, but it accidentally bounded repeated productive
-runs too.  Movement tutorials expose the failure directly: later levels can
-require six or seven repetitions of one action.
+Combinatorial branch generation remains bounded, but execution length does not.
+A productive action rollout is an A* macro: once selected, the same action keeps
+executing until the level resolves, the environment reaches a stationary no-op,
+terminal failure occurs, the action disappears, or the actor's existing sampling
+budget is exhausted.  There is no second internal action-count limit.
 
-This layer keeps combinatorial sequence search bounded while allowing one action
-that continues to change observable state to persist for a bounded rollout.  A
-persistence rollout stops on a no-op/stall, GAME_OVER, action disappearance, or
-a hard 64-step cap.  Level progress may carry the same action into the next level.
+A level boundary ends the rollout.  The successful action is retained only as a
+high-priority transfer candidate for the next level; the next level still gets a
+fresh portfolio decision and therefore preserves exploration authority.
 """
 
 
@@ -19,8 +19,6 @@ _BASE_BEGIN_LEASE = None
 _BASE_ON_EXTERNAL_RESET = None
 _BASE_FORCED_ACTION = None
 _BASE_OBSERVE_TRANSITION = None
-
-_MAX_ACTION_PERSISTENCE = 64
 
 
 def _clear_persistence_v832(sampler) -> None:
@@ -53,7 +51,7 @@ def _forced_action_v832(
     actions: tuple[int, ...],
     history: tuple[int, ...],
 ) -> int | None:
-    """Continue a productive rollout before selecting another portfolio branch."""
+    """Continue a productive rollout until a semantic boundary or actor budget end."""
     from v8 import decision_point_sampling_v821 as sampling
     from v8 import sampling_portfolio_v831 as portfolio
 
@@ -74,12 +72,11 @@ def _forced_action_v832(
         )
 
     action = getattr(self, "_v832_persist_action", None)
-    steps = int(getattr(self, "_v832_persist_steps", 0))
     available = {int(value) for value in actions}
     if action is not None:
         action = int(action)
-        if action in available and steps < _MAX_ACTION_PERSISTENCE:
-            self._v832_persist_steps = steps + 1
+        if action in available:
+            self._v832_persist_steps = int(getattr(self, "_v832_persist_steps", 0)) + 1
             self.base.current = sampling.Intervention(
                 "PERSIST",
                 (int(level), int(context)),
@@ -136,21 +133,14 @@ def _observe_persist_v832(self, intervention, **kwargs) -> None:
         self.saw_progress = True
         self.base.transfer_action = action
         self.base.transfer_from_level = max(int(self.base.transfer_from_level), before_level)
-        if terminal_state != "WIN" and action in after_actions:
-            # A level boundary is a new branch.  Carry the productive action, but
-            # never retain an old reset anchor across that boundary.
-            _arm_persistence_v832(self, action, None)
-        else:
-            _clear_persistence_v832(self)
+        # The level boundary is the semantic end of this rollout.  Do not force
+        # persistence into the next level; expose the action as transfer evidence.
+        _clear_persistence_v832(self)
         portfolio._set_mode(None)
         return
 
-    if (
-        terminal_state != "GAME_OVER"
-        and productive
-        and action in after_actions
-        and int(getattr(self, "_v832_persist_steps", 0)) < _MAX_ACTION_PERSISTENCE
-    ):
+    if terminal_state != "GAME_OVER" and productive and action in after_actions:
+        # No fixed length cap.  The actor's for-range(job.steps) is the budget.
         portfolio._set_mode(None)
         return
 
@@ -185,23 +175,21 @@ def _observe_transition_v832(self, **kwargs) -> None:
     result = _BASE_OBSERVE_TRANSITION(self, **kwargs)
 
     if sequence:
-        if success and terminal_state != "WIN" and action in after_actions:
-            _arm_persistence_v832(self, action, None)
+        if success:
+            # v8.31 already records the successful action as transfer evidence.
+            # A new level is a new sampling decision, not a continuation counter.
+            _clear_persistence_v832(self)
         elif (
-            not success
-            and terminal_state != "GAME_OVER"
+            terminal_state != "GAME_OVER"
             and remaining == 0
             and productive
             and action in after_actions
         ):
-            # v8.31 would reset immediately after this singleton/finished prefix.
-            # Keep walking the productive direction instead; if it later stalls,
-            # resume the queued sequence frontier from the original anchor.
+            # A finished short prefix that is still changing state becomes A*.
+            # If it later stalls, resume the sequence frontier from this origin.
             self.pending_sequence = None
             _arm_persistence_v832(self, action, origin)
     elif success:
-        # Another portfolio strategy found real progress.  Its own v8.21 logic
-        # owns transfer/verification; discard any stale persistence rollout.
         _clear_persistence_v832(self)
 
     return result

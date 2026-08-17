@@ -56,7 +56,7 @@ class SamplingPersistenceV832Tests(unittest.TestCase):
             future_delta=0.0,
         )
 
-    def test_productive_singleton_extends_beyond_depth_four(self):
+    def test_productive_singleton_extends_without_internal_length_limit(self):
         sampler = portfolio.PortfolioSampler("ez02", seed=1)
         sampler.begin_lease(1)
         row = sampler._frontier(level=0, context=10, actions=(1, 2, 3, 4), history=())
@@ -79,9 +79,7 @@ class SamplingPersistenceV832Tests(unittest.TestCase):
             history_after=(3,),
         )
 
-        # v8.31 stopped arbitrary sequence enumeration at depth four.  Productive
-        # action persistence must continue the same action well beyond that bound.
-        for step in range(2, 8):
+        for step in range(2, 130):
             action = sampler.forced_action(
                 level=0,
                 context=10 + step - 1,
@@ -100,7 +98,10 @@ class SamplingPersistenceV832Tests(unittest.TestCase):
                 history_after=(3,) * step,
             )
 
-    def test_level_progress_carries_productive_action_to_next_level(self):
+        self.assertGreater(getattr(sampler, "_v832_persist_steps", 0), 64)
+        self.assertFalse(hasattr(repair, "_MAX_ACTION_PERSISTENCE"))
+
+    def test_level_progress_ends_rollout_and_exposes_transfer_probe(self):
         sampler = portfolio.PortfolioSampler("ez02", seed=2)
         sampler.begin_lease(2)
         repair._arm_persistence_v832(sampler, 3, None)
@@ -122,16 +123,22 @@ class SamplingPersistenceV832Tests(unittest.TestCase):
             history_after=(3, 3),
         )
 
-        action = sampler.forced_action(
+        self.assertIsNone(getattr(sampler, "_v832_persist_action", None))
+        self.assertEqual(sampler.base.transfer_action, 3)
+        self.assertEqual(sampler.base.transfer_from_level, 0)
+        self.assertGreaterEqual(sampler.base.points[(1, 100)].priority, 6)
+
+        portfolio._set_mode("TRANSFER")
+        action = sampler.discovery_action(
             level=1,
             context=100,
             actions=(1, 2, 3, 4),
             history=(3, 3),
         )
         self.assertEqual(action, 3)
-        self.assertEqual(v829._CONTROL_STATE.selection_source, "ACTION_PERSISTENCE")
+        self.assertEqual(v829._CONTROL_STATE.selection_source, "TRANSFER_PROBE")
 
-    def test_persistence_stops_on_noop(self):
+    def test_persistence_stops_on_stationary_noop(self):
         sampler = portfolio.PortfolioSampler("ez02", seed=3)
         sampler.begin_lease(3)
         repair._arm_persistence_v832(sampler, 3, None)
@@ -154,20 +161,19 @@ class SamplingPersistenceV832Tests(unittest.TestCase):
         )
         self.assertIsNone(getattr(sampler, "_v832_persist_action", None))
 
-    def test_persistence_is_hard_bounded(self):
+    def test_large_step_counter_does_not_stop_productive_rollout(self):
         sampler = portfolio.PortfolioSampler("ez02", seed=4)
         sampler.begin_lease(4)
         repair._arm_persistence_v832(sampler, 3, None)
-        sampler._v832_persist_steps = repair._MAX_ACTION_PERSISTENCE
+        sampler._v832_persist_steps = 1_000_000
         action = sampler.forced_action(
             level=0,
             context=40,
             actions=(1, 2, 3, 4),
             history=(),
         )
-        self.assertIsNone(getattr(sampler, "_v832_persist_action", None))
-        # The normal portfolio may choose another action; only persistence must stop.
-        self.assertNotEqual(v829._CONTROL_STATE.selection_source, "ACTION_PERSISTENCE")
+        self.assertEqual(action, 3)
+        self.assertEqual(v829._CONTROL_STATE.selection_source, "ACTION_PERSISTENCE")
 
     def test_install_patches_portfolio_sampler(self):
         self.assertIs(portfolio.PortfolioSampler.begin_lease, repair._begin_lease_v832)
