@@ -4,37 +4,51 @@ import os
 import unittest
 
 import v8
+from v8 import actor as actor_module
 from v8 import cli_v819
 from v8 import decision_point_sampling_v821 as sampling
-from v8.sampling_baseline_recovery_v828 import (
-    _decision_mode_enabled_v828,
-    _requested_actor_pool_v828,
-)
+from v8 import sampling_baseline_recovery_v828 as baseline
+from v8.sampling_baseline_recovery_v828 import _requested_actor_pool_v828
 
 
 class SamplingBaselineRecoveryV828Tests(unittest.TestCase):
     def test_production_discovery_bypasses_v821_decision_sampler(self) -> None:
-        prior = os.environ.get(sampling._SAMPLING_MODE_ENV)
-        try:
-            os.environ[sampling._SAMPLING_MODE_ENV] = "DISCOVERY"
-            self.assertIs(sampling._decision_mode_enabled, _decision_mode_enabled_v828)
-            self.assertFalse(sampling._decision_mode_enabled())
-        finally:
-            if prior is None:
-                os.environ.pop(sampling._SAMPLING_MODE_ENV, None)
-            else:
-                os.environ[sampling._SAMPLING_MODE_ENV] = prior
-
-    def test_v821_actor_wrapper_falls_through_to_pre_v821_worker(self) -> None:
-        calls = []
+        prior_mode = os.environ.get(sampling._SAMPLING_MODE_ENV)
         prior_base = sampling._BASE_ACTOR_WORKER
+        calls = []
         sampling._BASE_ACTOR_WORKER = lambda **kwargs: calls.append(kwargs) or "baseline"
         try:
-            result = sampling._actor_worker_v821(job="job", marker=7)
+            os.environ[sampling._SAMPLING_MODE_ENV] = "DISCOVERY"
+            # Historical v8.21 semantics remain testable, but final actor dispatch
+            # bypasses that custom worker and calls its captured pre-v8.21 base.
+            self.assertTrue(sampling._decision_mode_enabled())
+            self.assertIs(actor_module.actor_worker, baseline._actor_worker_v828)
+            result = actor_module.actor_worker(job="job", marker=7)
         finally:
             sampling._BASE_ACTOR_WORKER = prior_base
+            if prior_mode is None:
+                os.environ.pop(sampling._SAMPLING_MODE_ENV, None)
+            else:
+                os.environ[sampling._SAMPLING_MODE_ENV] = prior_mode
         self.assertEqual(result, "baseline")
         self.assertEqual(calls, [{"job": "job", "marker": 7}])
+
+    def test_non_discovery_keeps_final_composed_actor_chain(self) -> None:
+        prior_mode = os.environ.get(sampling._SAMPLING_MODE_ENV)
+        prior_base = baseline._BASE_ACTOR_WORKER
+        calls = []
+        baseline._BASE_ACTOR_WORKER = lambda **kwargs: calls.append(kwargs) or "composed"
+        try:
+            os.environ[sampling._SAMPLING_MODE_ENV] = "VERIFY"
+            result = baseline._actor_worker_v828(job="job", marker=9)
+        finally:
+            baseline._BASE_ACTOR_WORKER = prior_base
+            if prior_mode is None:
+                os.environ.pop(sampling._SAMPLING_MODE_ENV, None)
+            else:
+                os.environ[sampling._SAMPLING_MODE_ENV] = prior_mode
+        self.assertEqual(result, "composed")
+        self.assertEqual(calls, [{"job": "job", "marker": 9}])
 
     def test_learning_set_restores_one_worker_per_game_by_default(self) -> None:
         self.assertIs(cli_v819._requested_actor_pool, _requested_actor_pool_v828)
