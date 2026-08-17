@@ -6,6 +6,7 @@ _BASE_RUNTIME_INIT = None
 _BASE_FRONTIER_LIFECYCLE_CLASS = None
 _BASE_REFRESH_VIEW_VARIANTS_V827 = None
 _BASE_LIFECYCLE_DECIDE = None
+_BASE_LIFECYCLE_FINALIZE = None
 _BASE_RUN_LIFECYCLE_ITERATION = None
 
 
@@ -115,10 +116,24 @@ def _lifecycle_decide_v827(self, row):
     return _BASE_LIFECYCLE_DECIDE(self, row)
 
 
+def _lifecycle_finalize_v827(self, row, *, protected_by_dependencies: bool):
+    from v8.model import ValidationState
+
+    protected = getattr(self, "_v827_protected_competence_uids", frozenset())
+    validation = int(getattr(row, "validation_state", int(ValidationState.UNTESTED)))
+    if row.uid in protected and validation != int(ValidationState.FAILED):
+        return None
+    return _BASE_LIFECYCLE_FINALIZE(
+        self,
+        row,
+        protected_by_dependencies=protected_by_dependencies,
+    )
+
+
 def install_lifecycle_competence_integration_v827_fixups() -> None:
     global _INSTALLED, _BASE_RUNTIME_INIT, _BASE_FRONTIER_LIFECYCLE_CLASS
     global _BASE_REFRESH_VIEW_VARIANTS_V827, _BASE_LIFECYCLE_DECIDE
-    global _BASE_RUN_LIFECYCLE_ITERATION
+    global _BASE_LIFECYCLE_FINALIZE, _BASE_RUN_LIFECYCLE_ITERATION
     if _INSTALLED:
         return
 
@@ -140,6 +155,8 @@ def install_lifecycle_competence_integration_v827_fixups() -> None:
 
     _BASE_LIFECYCLE_DECIDE = LifecycleController.decide
     LifecycleController.decide = _lifecycle_decide_v827
+    _BASE_LIFECYCLE_FINALIZE = LifecycleController.finalize_retirement
+    LifecycleController.finalize_retirement = _lifecycle_finalize_v827
     _BASE_RUN_LIFECYCLE_ITERATION = dedicated._run_lifecycle_iteration
     dedicated._run_lifecycle_iteration = _run_lifecycle_iteration_v827
 
