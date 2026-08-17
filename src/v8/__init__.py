@@ -1,4 +1,4 @@
-"""ARC-AGI-3 v8.18 memory-to-intelligence runtime."""
+"""ARC-AGI-3 v8.19 memory-to-intelligence runtime."""
 
 # Install the v0.5.3 memory schema before importing development/runtime modules so
 # proposal packets, shared arenas and snapshot compatibility agree on one layout.
@@ -107,10 +107,13 @@ from v8.trajectory_optimizer_v818 import (
 from v8.trajectory_optimizer_v818_fixups import (
     install_trajectory_optimizer_v818_fixups as _install_trajectory_optimizer_v818_fixups,
 )
+from v8.adaptive_learning_allocation_v819 import (
+    install_adaptive_learning_allocation_v819 as _install_adaptive_learning_allocation_v819,
+)
 
-# Install semantic layers in chronological order. v8.18 keeps v8.17 context safety,
-# removes seed from trajectory semantics, and replaces serial validation with bounded
-# per-game validators plus target-compatible optimized trajectory reuse.
+# Install semantic layers in chronological order. v8.19 keeps v8.18 trajectory
+# safety and adds a shared M7 frontier, validated learning states, adaptive
+# sampling leases, explicit solved-game sampling modes, persistence and telemetry.
 _install_behavior_recovery()
 _install_primary_valence_runtime()
 _install_runtime_fixups()
@@ -140,6 +143,7 @@ _install_trajectory_optimizer_stdout_v816()
 _install_restart_control_safety_v817()
 _install_trajectory_optimizer_v818()
 _install_trajectory_optimizer_v818_fixups()
+_install_adaptive_learning_allocation_v819()
 
 # Preserve existing import paths: `from v8.runtime import ContinuousMemoryRuntime`
 # and the package-level API both resolve to the current semantic layer.
