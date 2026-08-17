@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import queue
 from dataclasses import dataclass
 
@@ -7,6 +8,7 @@ from v8.episode_progress_reporting_v821 import EpisodeActorProgress
 
 
 _INSTALLED = False
+_BASE_ACTOR_WORKER = None
 _FIRST_WIN_AT: dict[tuple[int, str], int] = {}
 _LAST_STEPS: dict[tuple[int, str], int] = {}
 _LAST_WINS: dict[tuple[int, str], int] = {}
@@ -18,6 +20,24 @@ class V822ActorProgress(EpisodeActorProgress):
 
     best_win_steps: int = 0
     last_win_steps: int = 0
+
+
+def _actor_worker_with_solve_metrics_v822(*, job, **kwargs):
+    """Keep solve-efficiency capture active for every adaptive sampling mode."""
+
+    from v8 import behavior_recovery as behavior
+    from v8 import runtime_repair_v822 as repair
+
+    prior_mode = os.environ.get(behavior._ACTOR_MODE_ENV)
+    os.environ[behavior._ACTOR_MODE_ENV] = "1"
+    repair._reset_solve_metrics()
+    try:
+        return _BASE_ACTOR_WORKER(job=job, **kwargs)
+    finally:
+        if prior_mode is None:
+            os.environ.pop(behavior._ACTOR_MODE_ENV, None)
+        else:
+            os.environ[behavior._ACTOR_MODE_ENV] = prior_mode
 
 
 def _publish_progress_v822(
@@ -107,7 +127,7 @@ def _format_game_rate_line_v822(rows) -> str:
 
 
 def install_progress_runtime_fix_v822() -> None:
-    global _INSTALLED
+    global _INSTALLED, _BASE_ACTOR_WORKER
     if _INSTALLED:
         return
 
@@ -122,4 +142,10 @@ def install_progress_runtime_fix_v822() -> None:
     from v8.sampling_control_repair_v823 import install_sampling_control_repair_v823
 
     install_sampling_control_repair_v823()
+
+    # v8.22 enabled solve metrics only in DISCOVERY. Adaptive VERIFY, ALTERNATIVE,
+    # and TRANSFER leases can also win, so keep the metric environment active for
+    # every lease and reset process-local counters before worker reuse.
+    _BASE_ACTOR_WORKER = actor_module.actor_worker
+    actor_module.actor_worker = _actor_worker_with_solve_metrics_v822
     _INSTALLED = True
