@@ -59,3 +59,6 @@ def install_lifecycle_switch_v827() -> None:
 
     from v8.snapshot_resilience_v833 import install_snapshot_resilience_v833
     install_snapshot_resilience_v833()
+
+    from v8.runtime_win_optimization_v834 import install_runtime_win_optimization_v834
+    install_runtime_win_optimization_v834()
