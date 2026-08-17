@@ -4,8 +4,9 @@ import unittest
 from types import SimpleNamespace
 
 import v8
+from v8.arena import NodeRecord
 from v8.lifecycle import LifecycleController
-from v8.model import CognitiveState, MemoryUid, ValidationState
+from v8.model import CognitiveState, MemoryLevel, MemoryType, MemoryUid, ValidationState
 
 
 class LifecycleCompetenceProtectionV827Tests(unittest.TestCase):
@@ -26,32 +27,37 @@ class LifecycleCompetenceProtectionV827Tests(unittest.TestCase):
         self.assertEqual(decision.cognitive_state, int(CognitiveState.REACTIVATED))
         self.assertNotIn(uid, controller._low_windows)
 
-    def test_failed_validation_is_not_protected_from_lifecycle(self) -> None:
-        uid = MemoryUid(7, 10)
+    def test_failed_validation_is_not_exempted_by_competence_dependency(self) -> None:
+        uid = MemoryUid.from_key(MemoryLevel.M7, MemoryType.STRATEGY, (1, 2, 3, 4))
         controller = LifecycleController()
         controller._v827_protected_competence_uids = frozenset({uid})
-        row = SimpleNamespace(
-            uid=uid,
-            level=7,
-            memory_type=700,
-            key_parts=(1, 2, 3, 4),
-            support_count=0,
-            significance=0.0,
-            prediction_error=0.0,
-            learning_value=0.0,
-            transfer_potential=0.0,
-            explanatory_potential=0.0,
-            future_option_delta=0.0,
-            novelty=0.0,
-            game_evidence_count=0,
-            cognitive_state=int(CognitiveState.ACTIVE),
-            validation_state=int(ValidationState.FAILED),
-            strategy_reliability=0.0,
+        row = NodeRecord(
+            uid,
+            uid.hi ^ uid.lo,
+            int(MemoryLevel.M7),
+            int(MemoryType.STRATEGY),
+            (1, 2, 3, 4),
+            0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            1,
+            0,
+            int(CognitiveState.ACTIVE),
+            int(ValidationState.FAILED),
+            0.0,
+            0.0,
+            0.0,
         )
 
-        # The protected fast path must not reactivate or exempt failed evidence.
+        decision = controller.decide(row)
+
         self.assertNotEqual(
-            getattr(controller.decide(row), "reason", ""),
+            getattr(decision, "reason", ""),
             "reactivated by validated competence dependency",
         )
 
