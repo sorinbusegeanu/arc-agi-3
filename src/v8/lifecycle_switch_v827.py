@@ -57,3 +57,7 @@ def install_lifecycle_switch_v827() -> None:
     )
 
     install_optimizer_budget_control_v830()
+
+    from v8.sampling_portfolio_v831 import install_sampling_portfolio_v831
+
+    install_sampling_portfolio_v831()
