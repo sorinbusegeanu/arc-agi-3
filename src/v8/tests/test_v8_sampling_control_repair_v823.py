@@ -8,12 +8,14 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import v8
+from v8 import actor as actor_module
 from v8 import adaptive_learning_allocation_v819 as v819
 from v8 import adaptive_learning_allocation_v819_performance_fix as perf
 from v8 import adaptive_learning_allocation_v819_performance_fixups as perf_fixups
 from v8 import adaptive_learning_allocation_v819_solve_fix as solve_fix
 from v8 import cli_v819
 from v8 import decision_point_sampling_v821 as sampling
+from v8 import learning_fixes_v088 as learning
 from v8 import progressive_level_learning_v820 as progressive
 from v8 import runtime_repair_v822 as v822
 from v8 import sampling_control_repair_v823 as repair
@@ -35,6 +37,14 @@ def _source(*, game="world", level=1, actions=(1, 2), prefix=()):
         MemoryUid.zero(),
         0,
     )
+
+
+class _Queue:
+    def __init__(self) -> None:
+        self.rows = []
+
+    def put(self, row) -> None:
+        self.rows.append(row)
 
 
 class PlannerAuthorityTests(unittest.TestCase):
@@ -111,6 +121,8 @@ class AdaptivePoolTests(unittest.TestCase):
         self.assertTrue(
             any("_v823_initial_unsolved_lease_steps" in set(code.co_names) for code in codes)
         )
+        self.assertIn("best_win_steps", root.co_consts)
+        self.assertIn("last_win_steps", root.co_consts)
         self.assertIs(progressive._BASE_RUN_ACTOR_JOBS, perf_fixups._run_actor_jobs_v819)
 
     def test_cli_actor_batch_reports_pool_but_retains_all_game_jobs(self) -> None:
@@ -122,6 +134,68 @@ class AdaptivePoolTests(unittest.TestCase):
             cli_v819._requested_actor_pool(["continuous-run", "--actors", "20"]),
             20,
         )
+
+
+class AdaptiveWinMetricTests(unittest.TestCase):
+    def test_result_adapter_carries_process_local_win_metrics(self) -> None:
+        prior_best = learning._BEST_WIN_STEPS
+        prior_last = learning._LAST_WIN_STEPS
+        target = _Queue()
+        lease = v819.ActorLease(
+            1,
+            1,
+            "ic01",
+            100,
+            7,
+            None,
+            0.10,
+            1000,
+            v819.SamplingMode.DISCOVERY,
+            MemoryUid.zero(),
+        )
+        result = actor_module.ActorResult(1, "ic01", 42, 1, 0, 5, 2)
+        try:
+            learning._BEST_WIN_STEPS = 17
+            learning._LAST_WIN_STEPS = 19
+            repair._ResultAdapterV823(target, 1, lease).put(result)
+        finally:
+            learning._BEST_WIN_STEPS = prior_best
+            learning._LAST_WIN_STEPS = prior_last
+
+        self.assertEqual(len(target.rows), 1)
+        event = target.rows[0]
+        self.assertIsInstance(event, v819._LeaseResult)
+        self.assertEqual(event.result.best_win_steps, 17)
+        self.assertEqual(event.result.last_win_steps, 19)
+        self.assertEqual(event.result.wins, 1)
+
+    def test_completed_win_metrics_survive_progress_synthesis(self) -> None:
+        self.assertIs(v819._adaptive_progress_rows, repair._adaptive_progress_rows_v823)
+        jobs = (actor_module.ActorJob(1, "ic01", 10000, 0),)
+        completed = {
+            "ic01": {
+                "steps": 42,
+                "wins": 1,
+                "failures": 0,
+                "levels_completed": 5,
+                "replans": 0,
+                "planned_steps": 0,
+                "first_win_step": 42,
+                "best_win_steps": 17,
+                "last_win_steps": 19,
+                "resets": 2,
+            }
+        }
+        row = v819._adaptive_progress_rows(
+            actor_module,
+            jobs,
+            completed,
+            {},
+            {},
+        )[0]
+        self.assertEqual(row.wins, 1)
+        self.assertEqual(row.best_win_steps, 17)
+        self.assertEqual(row.last_win_steps, 19)
 
 
 class PreWinValidationBudgetTests(unittest.TestCase):
