@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,14 +10,15 @@ from unittest.mock import patch
 
 import v8
 from v8 import adaptive_learning_allocation_v819 as v819
+from v8 import adaptive_learning_allocation_v819_solve_fix as solve_fix
 from v8 import trajectory_optimizer_v814 as optimizer
 from v8.adaptive_learning_allocation_v819 import FrontierSource, SamplingMode
 from v8.model import MemoryUid
 
 
-def source(*, game="world", actions=(1, 2, 3), level=1):
-    anchor = optimizer.ReplayAnchor(game, 77, (), None)
-    target = optimizer.TrajectoryTarget(level, "LEVEL")
+def source(*, game="world", actions=(1, 2, 3), level=1, terminal="LEVEL", prefix=()):
+    anchor = optimizer.ReplayAnchor(game, 77, tuple(prefix), None)
+    target = optimizer.TrajectoryTarget(level, terminal)
     return optimizer.SuccessfulTrajectory(
         optimizer._trajectory_id(anchor, target, actions),
         anchor,
@@ -26,6 +28,21 @@ def source(*, game="world", actions=(1, 2, 3), level=1):
         MemoryUid.zero(),
         0,
     )
+
+
+def runtime_owned_service(root: str):
+    service = optimizer.TrajectoryOptimizationService(
+        Path(root),
+        validator=lambda _candidate: SimpleNamespace(success=True, reason="ok"),
+    )
+    coordinator = v819.AdaptiveLearningCoordinator()
+    runtime = SimpleNamespace(_v819_adaptive_learning=coordinator)
+    service._v819_runtime = runtime
+    service._v819_lock = threading.RLock()
+    service._v819_source_seen = set()
+    service._v819_source_pending = {}
+    service._v819_source_kind = {}
+    return service
 
 
 class CaptureSourceTests(unittest.TestCase):
@@ -70,26 +87,54 @@ class ServiceCompatibilityTests(unittest.TestCase):
             self.assertEqual(service._sources.unfinished_tasks, 1)
             self.assertFalse(hasattr(service, "_v819_runtime"))
 
-    def test_runtime_owned_source_is_validated_before_optimizer_queue(self) -> None:
+    def test_runtime_owned_partial_source_is_deferred_without_validator(self) -> None:
         with tempfile.TemporaryDirectory() as root:
-            service = optimizer.TrajectoryOptimizationService(
-                Path(root),
-                validator=lambda _candidate: SimpleNamespace(success=True, reason="ok"),
+            service = runtime_owned_service(root)
+            row = source(level=2, prefix=(9, 8))
+            with patch.object(v819, "_BASE_ROUTE_CANDIDATE", return_value=True) as route:
+                self.assertTrue(v819._service_submit_v819(service, row))
+            route.assert_not_called()
+            self.assertEqual(service._sources.unfinished_tasks, 0)
+            self.assertEqual(
+                service._v819_pre_win_sources["world"][2].trajectory_id,
+                row.trajectory_id,
             )
-            coordinator = v819.AdaptiveLearningCoordinator()
-            runtime = SimpleNamespace(_v819_adaptive_learning=coordinator)
-            service._v819_runtime = runtime
-            service._v819_lock = __import__("threading").RLock()
-            service._v819_source_seen = set()
-            service._v819_source_pending = {}
-            service._v819_source_kind = {}
-            row = source()
+
+    def test_runtime_owned_win_source_is_validated_before_optimizer_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            service = runtime_owned_service(root)
+            row = source(level=3, terminal="WIN", prefix=(9, 8))
             with patch.object(v819, "_BASE_ROUTE_CANDIDATE", return_value=True) as route:
                 self.assertTrue(v819._service_submit_v819(service, row))
             self.assertEqual(service._sources.unfinished_tasks, 0)
             routed = route.call_args.args[1]
             self.assertEqual(routed.edit_kind, "VALIDATE_SOURCE")
             self.assertEqual(tuple(routed.actions), tuple(row.actions))
+
+    def test_pre_win_storage_keeps_only_shortest_source_per_level(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            service = runtime_owned_service(root)
+            longer = source(actions=(1, 2, 3, 4), level=2, prefix=(9, 8, 7))
+            shorter = source(actions=(1, 2), level=2, prefix=(9,))
+            self.assertTrue(v819._service_submit_v819(service, longer))
+            self.assertTrue(v819._service_submit_v819(service, shorter))
+            stored = service._v819_pre_win_sources["world"][2]
+            self.assertEqual(stored.trajectory_id, shorter.trajectory_id)
+
+    def test_validated_win_can_release_deferred_levels_to_optimizer(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            service = runtime_owned_service(root)
+            rows = (
+                source(actions=(1, 2), level=1),
+                source(actions=(3, 4), level=2, prefix=(1, 2)),
+            )
+            for row in rows:
+                self.assertTrue(v819._service_submit_v819(service, row))
+            with patch.object(v819, "_BASE_SERVICE_SUBMIT", return_value=True) as submit:
+                released = solve_fix._release_pre_win_sources(service, "world")
+            self.assertEqual(released, 2)
+            self.assertEqual(submit.call_count, 2)
+            self.assertNotIn("world", service._v819_pre_win_sources)
 
 
 if __name__ == "__main__":
