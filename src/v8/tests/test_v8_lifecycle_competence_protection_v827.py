@@ -27,6 +27,20 @@ class LifecycleCompetenceProtectionV827Tests(unittest.TestCase):
         self.assertEqual(decision.cognitive_state, int(CognitiveState.REACTIVATED))
         self.assertNotIn(uid, controller._low_windows)
 
+    def test_validated_competence_dependency_cannot_finalize_retirement(self) -> None:
+        uid = MemoryUid(7, 11)
+        controller = LifecycleController()
+        controller._v827_protected_competence_uids = frozenset({uid})
+        row = SimpleNamespace(
+            uid=uid,
+            cognitive_state=int(CognitiveState.RETIRE_PENDING),
+            validation_state=int(ValidationState.TESTED),
+        )
+
+        self.assertIsNone(
+            controller.finalize_retirement(row, protected_by_dependencies=False)
+        )
+
     def test_failed_validation_is_not_exempted_by_competence_dependency(self) -> None:
         uid = MemoryUid.from_key(MemoryLevel.M7, MemoryType.STRATEGY, (1, 2, 3, 4))
         controller = LifecycleController()
