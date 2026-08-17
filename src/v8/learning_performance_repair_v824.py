@@ -27,11 +27,15 @@ def unsolved_lease_steps_v824(
     )
 
 
-def _foreign_key(game_id: str, strategy_uid) -> tuple[int, int, int]:
+def _game_hash(game_id: str) -> int:
     from v8.model import stable_u64
 
+    return int(stable_u64(str(game_id), person=b"v8-game"))
+
+
+def _foreign_key(game_id: str, strategy_uid) -> tuple[int, int, int]:
     return (
-        int(stable_u64(str(game_id), person=b"v8-game")),
+        _game_hash(game_id),
         int(strategy_uid.hi),
         int(strategy_uid.lo),
     )
@@ -57,7 +61,7 @@ def _plan_candidates_v824(self, context_signature, action_ids, **kwargs):
     game_id = str(getattr(optimizer, "_CAPTURE_SOURCE_ID", ""))
     if not game_id:
         return ()
-    current_game_hash = _foreign_key(game_id, type("U", (), {"hi": 0, "lo": 0})())[0]
+    current_game_hash = _game_hash(game_id)
     selected = []
     for row in rows:
         source_games = self.source_games(row.strategy_uid)
