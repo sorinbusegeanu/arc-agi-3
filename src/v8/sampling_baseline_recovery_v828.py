@@ -7,8 +7,8 @@ trajectories. v8.21 later replaced the no-plan actor path with decision-point
 reset/replay probing. Later repairs restored planner-first control and long leases,
 but cold-start DISCOVERY still fell back into the v8.21 sampler.
 
-Keep all later memory, optimizer, trajectory, transfer and lifecycle layers, while
-restoring two runtime properties from PR #99:
+Keep all later memory, optimizer, trajectory, transfer, reporting and lifecycle
+layers while restoring two PR #99 runtime properties:
 
 * ordinary DISCOVERY uses the pre-v8.21 actor exploration path;
 * --actors remains a minimum lane request, so a game set still gets at least one
@@ -20,7 +20,7 @@ import os
 
 
 _INSTALLED = False
-_BASE_ACTOR_WORKER = None
+_BASE_ACTOR_DELEGATE = None
 
 
 def _requested_actor_pool_v828(values: list[str]) -> int:
@@ -43,8 +43,6 @@ def _requested_actor_pool_v828(values: list[str]) -> int:
     if selector in V7_GAME_PRESETS:
         game_count = len(tuple(dict.fromkeys(V7_GAME_PRESETS[selector])))
     elif selector == "all":
-        # Preserve normal base-CLI validation for 'all'; only use the registry here
-        # to size the pool when it is available.
         try:
             from v7.environment.arc_adapter import registered_game_ids
 
@@ -60,45 +58,31 @@ def _requested_actor_pool_v828(values: list[str]) -> int:
     return max(requested, int(game_count))
 
 
-def _actor_worker_v828(*, job, **kwargs):
-    """Use PR #99 exploration for DISCOVERY while preserving later instrumentation."""
+def _actor_delegate_v828(*, job, **kwargs):
+    """Route cold-start DISCOVERY to PR #99; retain later modes unchanged."""
 
     from v8 import decision_point_sampling_v821 as sampling
 
     mode = os.environ.get(sampling._SAMPLING_MODE_ENV, "DISCOVERY").strip().upper()
-    if mode not in {"", "DISCOVERY"}:
-        return _BASE_ACTOR_WORKER(job=job, **kwargs)
-
-    from v8 import learning_fixes_v088 as learning
-    from v8 import progress_runtime_fix_v822 as progress
-    from v8 import runtime_repair_v822 as repair
-
-    prior_metric_env_name = learning._ACTOR_MODE_ENV
-    prior_metric_env = os.environ.get(progress._SOLVE_METRICS_ENV)
-    learning._ACTOR_MODE_ENV = progress._SOLVE_METRICS_ENV
-    os.environ[progress._SOLVE_METRICS_ENV] = "1"
-    repair._reset_solve_metrics()
-    try:
-        # v8.21 captured this before replacing actor_worker. It is the PR #99-style
-        # continuous planner/unseen-action exploration chain, with no anchor resets.
+    if mode in {"", "DISCOVERY"}:
+        # v8.21 captured this function before replacing actor_worker. It is the
+        # continuous planner/unseen-action exploration chain used by PR #99: no
+        # decision-point reset/replay controller and no artificial shallow anchor.
         return sampling._BASE_ACTOR_WORKER(job=job, **kwargs)
-    finally:
-        learning._ACTOR_MODE_ENV = prior_metric_env_name
-        if prior_metric_env is None:
-            os.environ.pop(progress._SOLVE_METRICS_ENV, None)
-        else:
-            os.environ[progress._SOLVE_METRICS_ENV] = prior_metric_env
+    return _BASE_ACTOR_DELEGATE(job=job, **kwargs)
 
 
 def install_sampling_baseline_recovery_v828() -> None:
-    global _INSTALLED, _BASE_ACTOR_WORKER
+    global _INSTALLED, _BASE_ACTOR_DELEGATE
     if _INSTALLED:
         return
 
-    from v8 import actor as actor_module
     from v8 import cli_v819
+    from v8 import progress_runtime_fix_v822 as progress
 
-    _BASE_ACTOR_WORKER = actor_module.actor_worker
-    actor_module.actor_worker = _actor_worker_v828
+    # Keep the v8.22 solve-metric wrapper as the public/final actor authority.
+    # Change only what that wrapper calls underneath for ordinary DISCOVERY.
+    _BASE_ACTOR_DELEGATE = progress._BASE_ACTOR_WORKER
+    progress._BASE_ACTOR_WORKER = _actor_delegate_v828
     cli_v819._requested_actor_pool = _requested_actor_pool_v828
     _INSTALLED = True
