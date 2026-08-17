@@ -173,6 +173,18 @@ class LiveReadView:
     def _stable_records_with_version(self, arena, *, timeout: float = 1.0):
         cache_key = id(arena)
         cached = self._record_cache.get(cache_key)
+        if cached is not None and arena.sequence & 1:
+            return cached
+        snapshot_records = getattr(arena, "snapshot_records", None)
+        if snapshot_records is not None:
+            try:
+                snapshot = snapshot_records(timeout=timeout)
+            except RuntimeError:
+                if cached is not None:
+                    return cached
+                raise RuntimeError(f"could not obtain coherent live {arena.kind} records") from None
+            self._record_cache[cache_key] = snapshot
+            return snapshot
         deadline = time.monotonic() + max(0.01, float(timeout))
         while time.monotonic() < deadline:
             before = arena.sequence

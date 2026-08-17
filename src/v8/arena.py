@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from multiprocessing.shared_memory import SharedMemory
 from struct import Struct
@@ -169,17 +170,35 @@ class _SharedArena:
             raise IndexError(row)
         return _HEADER.size + row * self.record.size
 
-    def snapshot_bytes(self, *, retries: int = 1000) -> bytes:
-        for _ in range(retries):
+    def snapshot_bytes(self, *, retries: int = 1000, timeout: float | None = None) -> bytes:
+        attempts = 0
+        deadline = None if timeout is None else time.monotonic() + max(0.01, float(timeout))
+        while (
+            attempts < max(1, int(retries))
+            if deadline is None
+            else attempts == 0 or time.monotonic() < deadline
+        ):
+            attempts += 1
             count1, seq1 = _HEADER.unpack_from(self._shm.buf, 0)
             if int(seq1) & 1:
+                if deadline is not None:
+                    time.sleep(0.0005)
                 continue
             length = _HEADER.size + int(count1) * self.record.size
             payload = bytes(self._shm.buf[:length])
             count2, seq2 = _HEADER.unpack_from(self._shm.buf, 0)
             if int(seq1) == int(seq2) and int(count1) == int(count2) and not (int(seq2) & 1):
                 return payload
+            if deadline is not None:
+                time.sleep(0)
         raise RuntimeError(f"could not obtain stable {self.kind} arena snapshot")
+
+    def snapshot_records(self, *, timeout: float = 1.0) -> tuple[tuple[object, ...], int]:
+        """Copy a coherent arena cut, then decode it outside the seqlock window."""
+        payload = self.snapshot_bytes(retries=1, timeout=timeout)
+        count, sequence = _HEADER.unpack_from(payload, 0)
+        rows = tuple(self._read_from_buffer(payload, row) for row in range(int(count)))
+        return rows, int(sequence)
 
     def load_snapshot(self, payload: bytes) -> None:
         if len(payload) < _HEADER.size:
@@ -246,8 +265,8 @@ class SharedNodeArena(_SharedArena):
             int(value.validation_state) & 0xFF,
         )
 
-    def read(self, row: int) -> NodeRecord:
-        values = _NODE.unpack_from(self._shm.buf, self._offset(row))
+    def _read_from_buffer(self, buffer, row: int) -> NodeRecord:
+        values = self.record.unpack_from(buffer, self._offset(row))
         (
             hi,
             lo,
@@ -298,6 +317,9 @@ class SharedNodeArena(_SharedArena):
             attempt_weight=float(attempt_weight),
         )
 
+    def read(self, row: int) -> NodeRecord:
+        return self._read_from_buffer(self._shm.buf, row)
+
     def records(self) -> Iterator[NodeRecord]:
         count = self.count
         for row in range(count):
@@ -325,7 +347,7 @@ class SharedEdgeArena(_SharedArena):
             u64(value.target_version),
         )
 
-    def read(self, row: int) -> EdgeRecord:
+    def _read_from_buffer(self, buffer, row: int) -> EdgeRecord:
         (
             source_hi,
             source_lo,
@@ -338,7 +360,7 @@ class SharedEdgeArena(_SharedArena):
             score_weight,
             source_version,
             target_version,
-        ) = _EDGE.unpack_from(self._shm.buf, self._offset(row))
+        ) = self.record.unpack_from(buffer, self._offset(row))
         return EdgeRecord(
             MemoryUid(source_hi, source_lo),
             int(relation),
@@ -350,6 +372,9 @@ class SharedEdgeArena(_SharedArena):
             int(source_version),
             int(target_version),
         )
+
+    def read(self, row: int) -> EdgeRecord:
+        return self._read_from_buffer(self._shm.buf, row)
 
     def load_snapshot(self, payload: bytes) -> None:
         if len(payload) < _HEADER.size:
@@ -408,13 +433,16 @@ class SharedActionArena(_SharedArena):
             u64(value.updated_watermark),
         )
 
-    def read_slot(self, row: int) -> tuple[bool, ActionRecord]:
-        occupied, context, action, support, score_sum, weight, watermark = _ACTION.unpack_from(
-            self._shm.buf, self._offset(row)
+    def _read_from_buffer(self, buffer, row: int) -> tuple[bool, ActionRecord]:
+        occupied, context, action, support, score_sum, weight, watermark = self.record.unpack_from(
+            buffer, self._offset(row)
         )
         return bool(occupied), ActionRecord(
             int(context), int(action), int(support), float(score_sum), float(weight), int(watermark)
         )
+
+    def read_slot(self, row: int) -> tuple[bool, ActionRecord]:
+        return self._read_from_buffer(self._shm.buf, row)
 
     def lookup(self, context_signature: int, action_id: int) -> ActionRecord | None:
         start = (u64(context_signature) ^ (int(action_id) * 0x9E3779B185EBCA87)) % self.capacity

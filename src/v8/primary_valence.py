@@ -205,8 +205,8 @@ def _node_write(self, row: int, value: NodeRecord) -> None:
     )
 
 
-def _node_read(self, row: int) -> NodeRecord:
-    values = _NODE.unpack_from(self._shm.buf, self._offset(row))
+def _node_read_from_buffer(self, buffer, row: int) -> NodeRecord:
+    values = _NODE.unpack_from(buffer, self._offset(row))
     (hi, lo, fingerprint, level, memory_type, key_count, k0, k1, k2, k3, support,
      significance, prediction_error, learning_value, transfer_prior, explanatory,
      future_option, weight, success_sum, cost_sum, attempt_weight, valence_sum,
@@ -226,6 +226,10 @@ def _node_read(self, row: int) -> NodeRecord:
         primary_valence_sq_sum=float(valence_sq_sum), primary_valence_weight=float(valence_weight),
         positive_valence_count=float(positive_count), negative_valence_count=float(negative_count),
     )
+
+
+def _node_read(self, row: int) -> NodeRecord:
+    return _node_read_from_buffer(self, self._shm.buf, row)
 
 
 def _install_snapshot_compatibility() -> None:
@@ -390,6 +394,7 @@ def install_primary_valence_schema() -> None:
     _arena._NODE = _NODE
     _arena.SharedNodeArena.record = _NODE
     _arena.SharedNodeArena.write = _node_write
+    _arena.SharedNodeArena._read_from_buffer = _node_read_from_buffer
     _arena.SharedNodeArena.read = _node_read
     if not hasattr(_model.ExperienceEvent, "primary_valence"):
         _model.ExperienceEvent.primary_valence = property(lambda self: int(self.terminal_polarity))

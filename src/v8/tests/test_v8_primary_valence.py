@@ -89,7 +89,9 @@ class PrimaryValenceTests(unittest.TestCase):
             arena.begin_write()
             arena.write(0, record)
             arena.end_write(count=1)
-            restored = arena.read(0)
+            snapshot, sequence = arena.snapshot_records()
+            restored = snapshot[0]
+            self.assertEqual(sequence, 2)
             self.assertEqual(restored.uid, uid)
             self.assertEqual(restored.key_parts, key)
             self.assertAlmostEqual(restored.expected_primary_valence, 0.75)

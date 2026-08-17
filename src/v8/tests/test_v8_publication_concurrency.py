@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import unittest
 
+from v8.arena import EdgeRecord, SharedEdgeArena
+from v8.model import MemoryUid, RelationType
 from v8.publication import LiveReadView
 
 
@@ -33,6 +35,21 @@ class _CountingArena:
     def records(self):
         self.record_reads += 1
         return ()
+
+
+class _SnapshotCapableArena:
+    kind = "edges"
+
+    def __init__(self) -> None:
+        self.sequence = 0
+        self.snapshot_reads = 0
+
+    def snapshot_records(self, *, timeout: float):
+        self.snapshot_reads += 1
+        return (("coherent",), 2)
+
+    def records(self):
+        raise AssertionError("live records must not be decoded under the seqlock")
 
 
 class PublicationConcurrencyRegressionTests(unittest.TestCase):
@@ -94,6 +111,46 @@ class PublicationConcurrencyRegressionTests(unittest.TestCase):
         self.assertEqual(view.edge_records(), ())
         edges._sequence = 1
         self.assertEqual(view.edge_records(), ())
+
+    def test_snapshot_capable_arena_decodes_after_coherent_copy(self) -> None:
+        edges = _SnapshotCapableArena()
+        view = LiveReadView(())
+        view._edges = (edges,)
+
+        self.assertEqual(view.edge_records(), ("coherent",))
+        self.assertEqual(edges.snapshot_reads, 1)
+
+    def test_shared_edge_snapshot_records_are_detached_from_later_writes(self) -> None:
+        arena = SharedEdgeArena(capacity=1)
+        try:
+            first = EdgeRecord(
+                MemoryUid(1, 2),
+                int(RelationType.EXPLAINS),
+                MemoryUid(3, 4),
+                1,
+                5,
+            )
+            second = EdgeRecord(
+                MemoryUid(6, 7),
+                int(RelationType.EXPLAINS),
+                MemoryUid(8, 9),
+                2,
+                10,
+            )
+            arena.begin_write()
+            arena.write(0, first)
+            arena.end_write(count=1)
+
+            rows, sequence = arena.snapshot_records()
+
+            arena.begin_write()
+            arena.write(0, second)
+            arena.end_write(count=1)
+            self.assertEqual(rows, (first,))
+            self.assertEqual(sequence, 2)
+            self.assertEqual(arena.read(0), second)
+        finally:
+            arena.dispose()
 
 
 if __name__ == "__main__":
