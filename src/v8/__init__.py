@@ -110,6 +110,9 @@ from v8.trajectory_optimizer_v818_fixups import (
 from v8.trajectory_inspection_v819 import (
     install_trajectory_inspection_v819 as _install_trajectory_inspection_v819,
 )
+from v8.trajectory_inspection_v819_fixups import (
+    install_trajectory_inspection_v819_fixups as _install_trajectory_inspection_v819_fixups,
+)
 from v8.adaptive_learning_allocation_v819 import (
     install_adaptive_learning_allocation_v819 as _install_adaptive_learning_allocation_v819,
 )
@@ -153,6 +156,7 @@ _install_restart_control_safety_v817()
 _install_trajectory_optimizer_v818()
 _install_trajectory_optimizer_v818_fixups()
 _install_trajectory_inspection_v819()
+_install_trajectory_inspection_v819_fixups()
 _install_adaptive_learning_allocation_v819()
 _install_adaptive_learning_allocation_v819_fixups()
 _install_adaptive_learning_allocation_v819_inflight_fix()
