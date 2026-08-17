@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import threading
+import types
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -9,6 +10,7 @@ from unittest.mock import Mock, patch
 import v8
 from v8 import adaptive_learning_allocation_v819 as v819
 from v8 import adaptive_learning_allocation_v819_performance_fix as perf
+from v8 import adaptive_learning_allocation_v819_performance_fixups as perf_fixups
 from v8 import adaptive_learning_allocation_v819_solve_fix as solve_fix
 from v8 import cli_v819
 from v8 import decision_point_sampling_v821 as sampling
@@ -101,11 +103,15 @@ class AdaptivePoolTests(unittest.TestCase):
             10000,
         )
 
-    def test_adaptive_runner_uses_v823_pool_helpers(self) -> None:
-        names = set(perf._adaptive_run_actor_jobs_perf.__code__.co_names)
-        self.assertIn("_v823_requested_actor_pool", names)
-        self.assertIn("_v823_initial_unsolved_lease_steps", names)
-        self.assertIs(progressive._BASE_RUN_ACTOR_JOBS, perf._adaptive_run_actor_jobs_perf)
+    def test_adaptive_runner_uses_v823_pool_helpers_and_preserves_explicit_dispatcher(self) -> None:
+        root = perf._adaptive_run_actor_jobs_perf.__code__
+        codes = [root]
+        codes.extend(value for value in root.co_consts if isinstance(value, types.CodeType))
+        self.assertIn("_v823_requested_actor_pool", set(root.co_names))
+        self.assertTrue(
+            any("_v823_initial_unsolved_lease_steps" in set(code.co_names) for code in codes)
+        )
+        self.assertIs(progressive._BASE_RUN_ACTOR_JOBS, perf_fixups._run_actor_jobs_v819)
 
     def test_cli_actor_batch_reports_pool_but_retains_all_game_jobs(self) -> None:
         batch = cli_v819._ActorJobBatch(tuple(range(36)), 8)
