@@ -118,7 +118,7 @@ class SolvedGameRecoveryV821Tests(unittest.TestCase):
             self.assertIsNotNone(record)
             self.assertEqual(record["game_id"], "ic02")
             self.assertEqual(record["source"], "optimized")
-            self.assertEqual(record["total_cost"], 6)
+            self.assertEqual(record["total_cost"], 7)
             self.assertEqual(
                 [level["actions"] for level in record["levels"]],
                 [[1], [2], [3, 3], [4], [2, 3]],
