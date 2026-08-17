@@ -134,6 +134,10 @@ def install_adaptive_learning_allocation_v819_worker_fix() -> None:
         return
 
     from v8 import adaptive_learning_allocation_v819_performance_fix as perf
+    from v8.adaptive_learning_allocation_v819_solve_fix import (
+        install_adaptive_learning_allocation_v819_solve_fix,
+    )
 
     perf._worker_until_win = _worker_until_completed_win
+    install_adaptive_learning_allocation_v819_solve_fix()
     _INSTALLED = True
