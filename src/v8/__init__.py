@@ -104,6 +104,9 @@ from v8.restart_control_safety_v817 import (
 from v8.trajectory_optimizer_v818 import (
     install_trajectory_optimizer_v818 as _install_trajectory_optimizer_v818,
 )
+from v8.trajectory_optimizer_v818_fixups import (
+    install_trajectory_optimizer_v818_fixups as _install_trajectory_optimizer_v818_fixups,
+)
 
 # Install semantic layers in chronological order. v8.18 keeps v8.17 context safety,
 # removes seed from trajectory semantics, and replaces serial validation with bounded
@@ -136,6 +139,7 @@ _install_restart_memory_v815_fixups()
 _install_trajectory_optimizer_stdout_v816()
 _install_restart_control_safety_v817()
 _install_trajectory_optimizer_v818()
+_install_trajectory_optimizer_v818_fixups()
 
 # Preserve existing import paths: `from v8.runtime import ContinuousMemoryRuntime`
 # and the package-level API both resolve to the current semantic layer.
