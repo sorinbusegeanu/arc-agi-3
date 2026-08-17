@@ -16,10 +16,7 @@ def _supervisor_start_v827(self) -> None:
     if lifecycle_enabled():
         return _BASE_SUPERVISOR_START(self)
 
-    # Start the developmental peer thread directly, bypassing only v8.13's
-    # dedicated lifecycle-thread wrapper. Prediction/promotion/replay peers remain on.
     from v8.peers import DevelopmentalPeerSupervisor
-
     return DevelopmentalPeerSupervisor.start(self)
 
 
@@ -37,31 +34,25 @@ def install_lifecycle_switch_v827() -> None:
     from v8.lifecycle_competence_integration_v827_fixups import (
         install_lifecycle_competence_integration_v827_fixups,
     )
-
     install_lifecycle_competence_integration_v827_fixups()
 
-    from v8.sampling_baseline_recovery_v828 import (
-        install_sampling_baseline_recovery_v828,
-    )
-
+    from v8.sampling_baseline_recovery_v828 import install_sampling_baseline_recovery_v828
     install_sampling_baseline_recovery_v828()
 
-    from v8.sampling_progress_control_v829 import (
-        install_sampling_progress_control_v829,
-    )
-
+    from v8.sampling_progress_control_v829 import install_sampling_progress_control_v829
     install_sampling_progress_control_v829()
 
-    from v8.optimizer_budget_control_v830 import (
-        install_optimizer_budget_control_v830,
-    )
-
+    from v8.optimizer_budget_control_v830 import install_optimizer_budget_control_v830
     install_optimizer_budget_control_v830()
 
     from v8.sampling_portfolio_v831 import install_sampling_portfolio_v831
-
     install_sampling_portfolio_v831()
 
     from v8.sampling_persistence_v832 import install_sampling_persistence_v832
-
     install_sampling_persistence_v832()
+
+    from v8.sampling_transfer_v833 import install_sampling_transfer_v833
+    install_sampling_transfer_v833()
+
+    from v8.snapshot_resilience_v833 import install_snapshot_resilience_v833
+    install_snapshot_resilience_v833()
