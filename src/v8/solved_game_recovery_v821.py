@@ -8,9 +8,12 @@ from pathlib import Path
 
 
 _INSTALLED = False
-_BASE_WRITE_SUCCESSFUL_TRAJECTORY = None
 _BASE_VISIBLE_SOLUTION = None
-_RECENT_LEVEL_PREFIXES: dict[str, dict[int, tuple[int, ...]]] = {}
+_BASE_ENV_INIT = None
+_BASE_ENV_STEP = None
+_BASE_ENV_RESET = None
+_RUNTIME_ACTIONS: dict[int, list[int]] = {}
+_RUNTIME_BOUNDARIES: dict[int, list[int]] = {}
 
 
 def _level_payload(levels: tuple[tuple[int, ...], ...]) -> list[dict[str, object]]:
@@ -20,58 +23,71 @@ def _level_payload(levels: tuple[tuple[int, ...], ...]) -> list[dict[str, object
     ]
 
 
-def _levels_from_prefixes(
-    game_id: str,
-    full_actions: tuple[int, ...],
-    levels_completed: int,
+def _flatten_record(raw: object) -> tuple[int, ...]:
+    if not isinstance(raw, dict):
+        return ()
+    levels = raw.get("levels")
+    if not isinstance(levels, list):
+        return ()
+    result: list[int] = []
+    for level in levels:
+        if not isinstance(level, dict) or not isinstance(level.get("actions"), list):
+            return ()
+        try:
+            result.extend(int(value) for value in level["actions"])
+        except (TypeError, ValueError):
+            return ()
+    return tuple(result)
+
+
+def _already_visible(optimizer_root: Path, game_id: str, actions: tuple[int, ...]) -> bool:
+    best_path = optimizer_root / "best_successful.json"
+    try:
+        payload = json.loads(best_path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        payload = {}
+    games = payload.get("games", {}) if isinstance(payload, dict) else {}
+    if isinstance(games, dict) and _flatten_record(games.get(str(game_id))) == actions:
+        return True
+
+    inbox = optimizer_root / "solutions_inbox"
+    for path in sorted(inbox.glob("*.json"))[-128:]:
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError):
+            continue
+        if str(raw.get("game_id", "")) == str(game_id) and _flatten_record(raw) == actions:
+            return True
+    return False
+
+
+def _split_runtime_levels(
+    actions: tuple[int, ...], boundaries: tuple[int, ...]
 ) -> tuple[tuple[int, ...], ...]:
-    count = max(1, int(levels_completed))
-    if count <= 1:
-        return (tuple(full_actions),)
-
-    by_level = _RECENT_LEVEL_PREFIXES.get(str(game_id), {})
-    cumulative: list[tuple[int, ...]] = [()]
-    for level in range(1, count):
-        prefix = tuple(by_level.get(level, ()))
-        previous = cumulative[-1]
-        if (
-            not prefix
-            or len(prefix) <= len(previous)
-            or len(prefix) >= len(full_actions)
-            or tuple(full_actions[: len(prefix)]) != prefix
-        ):
-            # Exact level boundaries are optional for visibility.  The complete
-            # winning action sequence is still authoritative and must not be lost.
-            return (tuple(full_actions),)
-        cumulative.append(prefix)
-    cumulative.append(tuple(full_actions))
-    return tuple(
-        current[len(previous) :]
-        for previous, current in zip(cumulative, cumulative[1:])
-    )
+    cuts = sorted({int(value) for value in boundaries if 0 < int(value) < len(actions)})
+    if not cuts:
+        return (actions,)
+    levels = []
+    start = 0
+    for stop in cuts:
+        levels.append(tuple(actions[start:stop]))
+        start = stop
+    levels.append(tuple(actions[start:]))
+    return tuple(level for level in levels if level)
 
 
-def _publish_complete_win(row) -> None:
+def _publish_runtime_win(game_id: str, actions: tuple[int, ...], boundaries=()) -> None:
     from v8 import trajectory_inspection_v819 as inspection
     from v8 import trajectory_optimizer_v814 as optimizer
 
-    game = str(row.anchor.source_id)
-    full = tuple(int(value) for value in row.full_actions)
+    game = str(game_id)
+    full = tuple(int(value) for value in actions)
     if not game or not full:
         return
-
-    level = max(1, int(row.target.levels_completed))
-    if not tuple(row.anchor.prefix_actions) and level <= 1:
-        _RECENT_LEVEL_PREFIXES[game] = {}
-    _RECENT_LEVEL_PREFIXES.setdefault(game, {})[level] = full
-
-    if str(row.target.terminal_state) != "WIN":
-        return
-
-    levels = _levels_from_prefixes(game, full, level)
+    levels = _split_runtime_levels(full, tuple(int(value) for value in boundaries))
     record = {
         "game_id": game,
-        "trajectory_id": str(row.trajectory_id),
+        "trajectory_id": f"runtime-{optimizer.action_sequence_hash(full):016x}",
         "source": "observed",
         "terminal_state": "WIN",
         "total_cost": len(full),
@@ -85,22 +101,64 @@ def _publish_complete_win(row) -> None:
 
     root_raw = os.environ.get(optimizer._TRAJECTORY_ROOT_ENV)
     if root_raw:
-        inbox = Path(root_raw) / "solutions_inbox"
-        target = inbox / (
-            f"complete-{game}-{row.trajectory_id}-{os.getpid()}-{time.time_ns()}.json"
+        optimizer_root = Path(root_raw)
+        if _already_visible(optimizer_root, game, full):
+            return
+        target = optimizer_root / "solutions_inbox" / (
+            f"runtime-{game}-{os.getpid()}-{time.time_ns()}.json"
         )
         optimizer._atomic_json(target, record)
     else:
         inspection._CAPTURED_SOLUTIONS_FOR_TESTS.append(record)
-    _RECENT_LEVEL_PREFIXES.pop(game, None)
 
 
-def _write_successful_trajectory_v821(row) -> None:
-    # Preserve every existing optimizer/inspection side effect first.  Then publish
-    # a complete WIN directly from the cumulative SuccessfulTrajectory row before
-    # actor capture state is cleared by the environment hook.
-    _BASE_WRITE_SUCCESSFUL_TRAJECTORY(row)
-    _publish_complete_win(row)
+def _tracked_env_init(self, *args, **kwargs) -> None:
+    _BASE_ENV_INIT(self, *args, **kwargs)
+    key = id(self)
+    self._v821_recovery_game_id = str(kwargs.get("game_id", ""))
+    _RUNTIME_ACTIONS[key] = []
+    _RUNTIME_BOUNDARIES[key] = []
+
+
+def _tracked_env_reset(self):
+    result = _BASE_ENV_RESET(self)
+    key = id(self)
+    _RUNTIME_ACTIONS[key] = []
+    _RUNTIME_BOUNDARIES[key] = []
+    return result
+
+
+def _tracked_env_step(self, action):
+    from v8 import trajectory_optimizer_v814 as optimizer
+
+    key = id(self)
+    prior_level = int(getattr(self, "last_levels_completed", 0))
+    result = _BASE_ENV_STEP(self, action)
+
+    # This fallback is actor-execution-only. Validators and synthetic calls to the
+    # trajectory writer never satisfy the capture gate and cannot manufacture a WIN.
+    if not bool(getattr(optimizer, "_CAPTURE_ACTIVE", False)):
+        return result
+
+    actions = _RUNTIME_ACTIONS.setdefault(key, [])
+    boundaries = _RUNTIME_BOUNDARIES.setdefault(key, [])
+    actions.append(int(action))
+    current_level = int(getattr(self, "last_levels_completed", prior_level))
+    if current_level > prior_level:
+        boundaries.append(len(actions))
+
+    state = str(getattr(self, "last_outcome_state", ""))
+    if state == "WIN":
+        game = str(getattr(self, "_v821_recovery_game_id", "")) or str(
+            getattr(optimizer, "_CAPTURE_SOURCE_ID", "")
+        )
+        _publish_runtime_win(game, tuple(actions), tuple(boundaries))
+        _RUNTIME_ACTIONS[key] = []
+        _RUNTIME_BOUNDARIES[key] = []
+    elif state == "GAME_OVER" or bool(getattr(self, "last_step_was_reset_boundary", False)):
+        _RUNTIME_ACTIONS[key] = []
+        _RUNTIME_BOUNDARIES[key] = []
+    return result
 
 
 def _validated_rows(optimizer_root: Path, game_id: str):
@@ -197,23 +255,26 @@ def _best_visible_solution_v821(root: str | Path, game_id: str):
 
 
 def install_solved_game_recovery_v821() -> None:
-    global _INSTALLED, _BASE_WRITE_SUCCESSFUL_TRAJECTORY, _BASE_VISIBLE_SOLUTION
+    global _INSTALLED, _BASE_VISIBLE_SOLUTION, _BASE_ENV_INIT, _BASE_ENV_STEP, _BASE_ENV_RESET
     if _INSTALLED:
         return
 
+    from v7.environment.arc_adapter import ArcGridEnvironment
     from v8 import adaptive_learning_allocation_v819_performance_fix as perf
     from v8 import trajectory_inspection_v819_fixups as visibility
-    from v8 import trajectory_optimizer_v814 as optimizer
-
-    _BASE_WRITE_SUCCESSFUL_TRAJECTORY = optimizer._write_successful_trajectory
-    optimizer._write_successful_trajectory = _write_successful_trajectory_v821
 
     _BASE_VISIBLE_SOLUTION = visibility._best_visible_solution
     visibility._best_visible_solution = _best_visible_solution_v821
 
-    # A runtime WIN is already enough evidence to stop spending DISCOVERY credits
-    # on the same game while its trajectory is being validated.  The previous
-    # 60-second expiry allowed a fast solved game to become UNSOLVED-priority again
-    # if persistence/validation lagged, starving harder games of freed workers.
+    _BASE_ENV_INIT = ArcGridEnvironment.__init__
+    _BASE_ENV_STEP = ArcGridEnvironment.step
+    _BASE_ENV_RESET = ArcGridEnvironment.reset
+    ArcGridEnvironment.__init__ = _tracked_env_init
+    ArcGridEnvironment.step = _tracked_env_step
+    ArcGridEnvironment.reset = _tracked_env_reset
+
+    # A runtime WIN is enough to stop spending DISCOVERY credits on the same game
+    # while its trajectory is being validated. Scientific solved state still comes
+    # only from the existing validated frontier path.
     perf._PROVISIONAL_WIN_SECONDS = math.inf
     _INSTALLED = True
