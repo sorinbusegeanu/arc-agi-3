@@ -51,3 +51,9 @@ def install_lifecycle_switch_v827() -> None:
     )
 
     install_sampling_progress_control_v829()
+
+    from v8.optimizer_budget_control_v830 import (
+        install_optimizer_budget_control_v830,
+    )
+
+    install_optimizer_budget_control_v830()
