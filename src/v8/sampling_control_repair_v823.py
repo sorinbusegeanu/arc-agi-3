@@ -40,14 +40,15 @@ def initial_unsolved_lease_steps(
 
 
 def _install_bounded_adaptive_runner() -> None:
-    """Patch only the two scaling defects in the v8.19 adaptive runner.
+    """Patch only the two scaling defects in the default v8.19 adaptive runner.
 
     The source rewrite is intentionally guarded by exact snippets so a future
     implementation change fails loudly instead of silently applying a stale patch.
+    Explicit custom lease configurations still go through the existing v8.19
+    performance-fixup dispatcher unchanged.
     """
 
     from v8 import adaptive_learning_allocation_v819_performance_fix as perf
-    from v8 import progressive_level_learning_v820 as progressive
 
     source = textwrap.dedent(inspect.getsource(perf._adaptive_run_actor_jobs_perf))
     worker_old = "    worker_count = max(1, len(jobs))"
@@ -65,10 +66,6 @@ def _install_bounded_adaptive_runner() -> None:
     perf.__dict__["_v823_requested_actor_pool"] = requested_actor_pool
     perf.__dict__["_v823_initial_unsolved_lease_steps"] = initial_unsolved_lease_steps
     exec(compile(source, perf.__file__ or "<v8.23-adaptive>", "exec"), perf.__dict__)
-
-    # v8.20 batching wraps the adaptive runner and captured the old function.
-    # Point that wrapper at the repaired function without changing its batching.
-    progressive._BASE_RUN_ACTOR_JOBS = perf._adaptive_run_actor_jobs_perf
 
 
 def _unsolved_game_count(service) -> int:
@@ -180,7 +177,6 @@ def install_sampling_control_repair_v823() -> None:
 
     from v8 import adaptive_learning_allocation_v819 as v819
     from v8 import decision_point_sampling_v821 as sampling
-    from v8 import progressive_level_learning_v820 as progressive
     from v8 import runtime_repair_v822 as v822
     from v8 import trajectory_optimizer_v818 as v818
     from v8.publication import LiveReadView
