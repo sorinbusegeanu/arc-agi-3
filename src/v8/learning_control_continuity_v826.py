@@ -47,11 +47,11 @@ def episode_aligned_unsolved_lease_steps_v826(
 def _plan_candidates_v826(self, context_signature, action_ids, **kwargs):
     """Give learned control first authority without weakening v8.24 transfer gates.
 
-    v8.24's planner wrapper is retained as the semantic authority because it also
-    enforces foreign provenance in TRANSFER mode.  We suppress only the transient
+    The captured v8.24 planner remains the semantic authority because it also
+    enforces foreign provenance in TRANSFER mode.  Suppress only the transient
     v8.22 `before_plan` discovery flag while invoking it.  If no plan is returned,
-    the flag is restored and the v8.21 actor naturally falls through to the
-    decision-point sampler.
+    restore the flag so the v8.21 actor naturally falls through to decision-point
+    discovery.
     """
 
     from v8 import runtime_repair_v822 as v822
@@ -71,23 +71,21 @@ def install_learning_control_continuity_v826() -> None:
         return
 
     from v8 import adaptive_learning_allocation_v819_performance_fix as perf
-    from v8 import learning_performance_repair_v824 as v824
     from v8 import runtime_repair_v822 as v822
     from v8 import sampling_control_repair_v823 as v823
     from v8.publication import LiveReadView
 
     # Preserve adaptive allocation and its early-WIN credit release, but remove the
-    # hard 2048-action cutoff for games that have not solved yet.  v8.23 rewrites
-    # the adaptive runner to call this hook for every unsolved assignment.
+    # hard 2048-action cutoff for final composed runtime behavior.  Keep the v8.24
+    # helper itself unchanged so historical-layer tests continue to describe v8.24.
     perf.__dict__["_v823_initial_unsolved_lease_steps"] = (
         episode_aligned_unsolved_lease_steps_v826
     )
-    v824.unsolved_lease_steps_v824 = episode_aligned_unsolved_lease_steps_v826
 
     # Capture the final v8.24 planner chain (including TRANSFER provenance rules),
-    # then make planner-first behavior the final composed control authority.
+    # then make planner-first behavior the final composed control authority.  Keep
+    # the v8.24 function object intact and wrap it rather than rewriting history.
     _BASE_PLAN_CANDIDATES = LiveReadView.plan_candidates
-    v824._plan_candidates_v824 = _plan_candidates_v826
     v822._BASE_PLAN_CANDIDATES = _plan_candidates_v826
     LiveReadView.plan_candidates = _plan_candidates_v826
 
@@ -98,7 +96,5 @@ def install_learning_control_continuity_v826() -> None:
 
     sampling._VERIFICATION_REPEATS = 1
 
-    # Keep the v8.23 implementation reachable for diagnostics/tests; v8.26 changes
-    # only final authority and the unsolved lease-length hook.
     assert v823._INSTALLED
     _INSTALLED = True
