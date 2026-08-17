@@ -9,6 +9,7 @@ from v8.episode_progress_reporting_v821 import EpisodeActorProgress
 
 _INSTALLED = False
 _BASE_ACTOR_WORKER = None
+_SOLVE_METRICS_ENV = "ARC_AGI3_V8_SOLVE_METRICS"
 _FIRST_WIN_AT: dict[tuple[int, str], int] = {}
 _LAST_STEPS: dict[tuple[int, str], int] = {}
 _LAST_WINS: dict[tuple[int, str], int] = {}
@@ -23,21 +24,24 @@ class V822ActorProgress(EpisodeActorProgress):
 
 
 def _actor_worker_with_solve_metrics_v822(*, job, **kwargs):
-    """Keep solve-efficiency capture active for every adaptive sampling mode."""
+    """Keep solve-efficiency capture active without changing actor policy mode."""
 
-    from v8 import behavior_recovery as behavior
+    from v8 import learning_fixes_v088 as learning
     from v8 import runtime_repair_v822 as repair
 
-    prior_mode = os.environ.get(behavior._ACTOR_MODE_ENV)
-    os.environ[behavior._ACTOR_MODE_ENV] = "1"
+    prior_metric_env_name = learning._ACTOR_MODE_ENV
+    prior_metric_env = os.environ.get(_SOLVE_METRICS_ENV)
+    learning._ACTOR_MODE_ENV = _SOLVE_METRICS_ENV
+    os.environ[_SOLVE_METRICS_ENV] = "1"
     repair._reset_solve_metrics()
     try:
         return _BASE_ACTOR_WORKER(job=job, **kwargs)
     finally:
-        if prior_mode is None:
-            os.environ.pop(behavior._ACTOR_MODE_ENV, None)
+        learning._ACTOR_MODE_ENV = prior_metric_env_name
+        if prior_metric_env is None:
+            os.environ.pop(_SOLVE_METRICS_ENV, None)
         else:
-            os.environ[behavior._ACTOR_MODE_ENV] = prior_mode
+            os.environ[_SOLVE_METRICS_ENV] = prior_metric_env
 
 
 def _publish_progress_v822(
@@ -144,8 +148,8 @@ def install_progress_runtime_fix_v822() -> None:
     install_sampling_control_repair_v823()
 
     # v8.22 enabled solve metrics only in DISCOVERY. Adaptive VERIFY, ALTERNATIVE,
-    # and TRANSFER leases can also win, so keep the metric environment active for
-    # every lease and reset process-local counters before worker reuse.
+    # and TRANSFER leases can also win. Keep only the solve-metric instrumentation
+    # active for every lease; do not alter behavior/planner mode.
     _BASE_ACTOR_WORKER = actor_module.actor_worker
     actor_module.actor_worker = _actor_worker_with_solve_metrics_v822
     _INSTALLED = True
