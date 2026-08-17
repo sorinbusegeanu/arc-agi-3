@@ -9,6 +9,7 @@ import v8
 from v8 import adaptive_learning_allocation_v819 as v819
 from v8 import adaptive_learning_allocation_v819_performance_fix as perf
 from v8 import final_save_lifecycle_v812 as lifecycle
+from v8 import learning_control_continuity_v826 as v826
 from v8 import learning_performance_repair_v824 as repair
 from v8 import runtime_repair_v822 as v822
 from v8 import trajectory_optimizer_v814 as optimizer
@@ -20,11 +21,12 @@ class LearningPerformanceRepairV824Tests(unittest.TestCase):
     def test_final_install_authorities(self) -> None:
         self.assertIs(
             perf.__dict__["_v823_initial_unsolved_lease_steps"],
-            repair.unsolved_lease_steps_v824,
+            v826.episode_aligned_unsolved_lease_steps_v826,
         )
         self.assertIs(v819._service_submit_v819, repair._prewin_submit_v824)
-        self.assertIs(LiveReadView.plan_candidates, v822._BASE_PLAN_CANDIDATES)
-        self.assertIs(v822._BASE_PLAN_CANDIDATES, repair._plan_candidates_v824)
+        self.assertIs(LiveReadView.plan_candidates, v826._plan_candidates_v826)
+        self.assertIs(v822._BASE_PLAN_CANDIDATES, v826._plan_candidates_v826)
+        self.assertIs(v826._BASE_PLAN_CANDIDATES, repair._plan_candidates_v824)
         self.assertEqual(lifecycle._LIFECYCLE_GENERATION_SPAN, 64)
         self.assertIs(v822._BASE_LIFECYCLE_WORKER, repair._lifecycle_worker_v824)
         self.assertEqual(repair._LIFECYCLE_MIN_INTERVAL_SECONDS, 60.0)
