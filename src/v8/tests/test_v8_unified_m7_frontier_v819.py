@@ -87,13 +87,16 @@ class ServiceCompatibilityTests(unittest.TestCase):
             self.assertEqual(service._sources.unfinished_tasks, 1)
             self.assertFalse(hasattr(service, "_v819_runtime"))
 
-    def test_runtime_owned_partial_source_is_deferred_without_validator(self) -> None:
+    def test_runtime_owned_partial_source_is_validated_cheaply_before_optimizer_queue(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             service = runtime_owned_service(root)
             row = source(level=2, prefix=(9, 8))
             with patch.object(v819, "_BASE_ROUTE_CANDIDATE", return_value=True) as route:
                 self.assertTrue(v819._service_submit_v819(service, row))
-            route.assert_not_called()
+            route.assert_called_once()
+            routed = route.call_args.args[1]
+            self.assertEqual(routed.edit_kind, "VALIDATE_SOURCE")
+            self.assertEqual(tuple(routed.actions), tuple(row.actions))
             self.assertEqual(service._sources.unfinished_tasks, 0)
             self.assertEqual(
                 service._v819_pre_win_sources["world"][2].trajectory_id,
@@ -116,8 +119,10 @@ class ServiceCompatibilityTests(unittest.TestCase):
             service = runtime_owned_service(root)
             longer = source(actions=(1, 2, 3, 4), level=2, prefix=(9, 8, 7))
             shorter = source(actions=(1, 2), level=2, prefix=(9,))
-            self.assertTrue(v819._service_submit_v819(service, longer))
-            self.assertTrue(v819._service_submit_v819(service, shorter))
+            with patch.object(v819, "_BASE_ROUTE_CANDIDATE", return_value=True) as route:
+                self.assertTrue(v819._service_submit_v819(service, longer))
+                self.assertTrue(v819._service_submit_v819(service, shorter))
+            self.assertEqual(route.call_count, 2)
             stored = service._v819_pre_win_sources["world"][2]
             self.assertEqual(stored.trajectory_id, shorter.trajectory_id)
 
@@ -128,8 +133,9 @@ class ServiceCompatibilityTests(unittest.TestCase):
                 source(actions=(1, 2), level=1),
                 source(actions=(3, 4), level=2, prefix=(1, 2)),
             )
-            for row in rows:
-                self.assertTrue(v819._service_submit_v819(service, row))
+            with patch.object(v819, "_BASE_ROUTE_CANDIDATE", return_value=True):
+                for row in rows:
+                    self.assertTrue(v819._service_submit_v819(service, row))
             with patch.object(v819, "_BASE_SERVICE_SUBMIT", return_value=True) as submit:
                 released = solve_fix._release_pre_win_sources(service, "world")
             self.assertEqual(released, 2)
