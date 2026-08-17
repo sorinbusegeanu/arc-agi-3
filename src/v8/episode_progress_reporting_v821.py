@@ -19,7 +19,9 @@ _MAX_LEVEL_REACHED: dict[tuple[int, str], int] = {}
 class EpisodeActorProgress(_progress_v054.ActorProgress):
     """Actor progress plus deepest level reached in any single current-run episode."""
 
-    max_level_reached: int = 0
+    # -1 identifies callers/tests constructing legacy-style progress rows without
+    # the episode-depth metric. Real actor publications always pass an explicit >=0.
+    max_level_reached: int = -1
 
 
 def _record_level_progress(levels_completed: int) -> None:
