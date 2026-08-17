@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 import v8
+from v7.environment.arc_adapter import ArcGridEnvironment
 from v8 import adaptive_learning_allocation_v819_performance_fix as perf
 from v8 import solved_game_recovery_v821 as recovery
 from v8 import trajectory_inspection_v819_fixups as visibility
@@ -17,40 +18,16 @@ from v8.model import MemoryUid
 
 class SolvedGameRecoveryV821Tests(unittest.TestCase):
     def setUp(self) -> None:
-        recovery._RECENT_LEVEL_PREFIXES.clear()
+        recovery._RUNTIME_ACTIONS.clear()
+        recovery._RUNTIME_BOUNDARIES.clear()
 
-    @staticmethod
-    def _row(*, level: int, terminal: str, prefix=(), actions=(1,)):
-        anchor = optimizer.ReplayAnchor("ic02", 0, tuple(prefix), None)
-        target = optimizer.TrajectoryTarget(int(level), str(terminal))
-        action_values = tuple(actions)
-        return optimizer.SuccessfulTrajectory(
-            optimizer._trajectory_id(anchor, target, action_values),
-            anchor,
-            target,
-            action_values,
-            MemoryUid.zero(),
-            MemoryUid.zero(),
-            0,
-        )
-
-    def test_terminal_win_directly_publishes_complete_solution_with_level_boundaries(self) -> None:
+    def test_runtime_win_publishes_complete_solution_with_level_boundaries(self) -> None:
         prior = os.environ.get(optimizer._TRAJECTORY_ROOT_ENV)
         try:
             with tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary) / "trajectory_optimizer"
                 os.environ[optimizer._TRAJECTORY_ROOT_ENV] = str(root)
-                recovery._publish_complete_win(
-                    self._row(level=1, terminal="LEVEL", actions=(2, 3))
-                )
-                recovery._publish_complete_win(
-                    self._row(
-                        level=2,
-                        terminal="WIN",
-                        prefix=(2, 3),
-                        actions=(4, 5),
-                    )
-                )
+                recovery._publish_runtime_win("ic02", (2, 3, 4, 5), (2, 4))
                 paths = tuple((root / "solutions_inbox").glob("*.json"))
                 self.assertEqual(len(paths), 1)
                 payload = json.loads(paths[0].read_text(encoding="utf-8"))
@@ -67,15 +44,13 @@ class SolvedGameRecoveryV821Tests(unittest.TestCase):
             else:
                 os.environ[optimizer._TRAJECTORY_ROOT_ENV] = prior
 
-    def test_terminal_win_is_never_dropped_when_exact_boundaries_are_missing(self) -> None:
+    def test_runtime_win_is_never_dropped_when_exact_boundaries_are_missing(self) -> None:
         prior = os.environ.get(optimizer._TRAJECTORY_ROOT_ENV)
         try:
             with tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary) / "trajectory_optimizer"
                 os.environ[optimizer._TRAJECTORY_ROOT_ENV] = str(root)
-                recovery._publish_complete_win(
-                    self._row(level=3, terminal="WIN", actions=(6, 7, 8))
-                )
+                recovery._publish_runtime_win("ic02", (6, 7, 8), ())
                 path = next((root / "solutions_inbox").glob("*.json"))
                 payload = json.loads(path.read_text(encoding="utf-8"))
                 self.assertEqual(payload["total_cost"], 3)
@@ -119,8 +94,9 @@ class SolvedGameRecoveryV821Tests(unittest.TestCase):
     def test_runtime_win_does_not_expire_back_into_unsolved_discovery_priority(self) -> None:
         self.assertTrue(math.isinf(perf._PROVISIONAL_WIN_SECONDS))
 
-    def test_recovery_wrapper_is_installed_after_existing_trajectory_layers(self) -> None:
-        self.assertIs(optimizer._write_successful_trajectory, recovery._write_successful_trajectory_v821)
+    def test_recovery_is_installed_at_real_environment_boundary(self) -> None:
+        self.assertIs(ArcGridEnvironment.step, recovery._tracked_env_step)
+        self.assertIs(ArcGridEnvironment.reset, recovery._tracked_env_reset)
 
 
 if __name__ == "__main__":
