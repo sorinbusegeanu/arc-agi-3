@@ -114,6 +114,13 @@ def _graph_load_line(*, snapshot_path: Path | None, restore_enabled: bool, nodes
 
 
 def run_continuous(args) -> int:
+    if getattr(args, "show_best_trajectory", None):
+        from v8.trajectory_inspection_v819 import show_best_trajectory
+
+        return int(show_best_trajectory(args.root, args.show_best_trajectory))
+    if not getattr(args, "games", None):
+        raise ValueError("--games is required for a normal continuous run")
+
     from v7.game_sets import resolve_game_selector
 
     if float(args.wait) < 0:
@@ -303,7 +310,8 @@ def main(argv: list[str] | None = None) -> int:
 
     continuous = sub.add_parser("continuous-run")
     _add_runtime_args(continuous)
-    continuous.add_argument("--games", required=True)
+    continuous.add_argument("--games", required=False, default=None)
+    continuous.add_argument("--show-best-trajectory", metavar="GAME_ID", default=None)
     continuous.add_argument("--steps-per-game", type=int, default=1000)
     continuous.add_argument("--actors", type=int, default=8)
     continuous.add_argument("--seed", type=int, default=0)
