@@ -106,7 +106,11 @@ class CompleteWinTrajectoryRepairV825Tests(unittest.TestCase):
                 {"version": 1, "validated": [row.to_dict()]},
             )
             self.assertEqual(repair._restore_persisted_validated_v825(service), 1)
-            self.assertEqual(tuple(service._validated.values()), (row,))
+            restored = tuple(service._validated.values())
+            self.assertEqual(len(restored), 1)
+            self.assertEqual(restored[0].anchor.source_id, "ic02")
+            self.assertEqual(restored[0].target.levels_completed, 1)
+            self.assertEqual(tuple(restored[0].actions), (1, 2))
 
     def test_show_best_recovers_complete_ic02_from_snapshot_when_live_sidecar_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as root_raw:
