@@ -137,6 +137,7 @@ def install_progress_runtime_fix_v822() -> None:
 
     from v8 import actor as actor_module
     from v8 import diagnostics
+    from v8 import runtime_repair_v822 as repair
 
     actor_module.ActorProgress = V822ActorProgress
     actor_module._publish_progress = _publish_progress_v822
@@ -151,5 +152,6 @@ def install_progress_runtime_fix_v822() -> None:
     # and TRANSFER leases can also win. Keep only the solve-metric instrumentation
     # active for every lease; do not alter behavior/planner mode.
     _BASE_ACTOR_WORKER = actor_module.actor_worker
-    actor_module.actor_worker = _actor_worker_with_solve_metrics_v822
+    repair._actor_worker_v822 = _actor_worker_with_solve_metrics_v822
+    actor_module.actor_worker = repair._actor_worker_v822
     _INSTALLED = True
