@@ -93,7 +93,7 @@ def solved_game_steps(rows: Iterable[GameProgress]) -> tuple[tuple[str, int], ..
 def _deepest_level(row: GameProgress) -> int:
     """Return deepest level reached in one episode, with legacy-row fallback."""
     deepest = getattr(row, "max_level_reached", None)
-    if deepest is None:
+    if deepest is None or int(deepest) < 0:
         deepest = getattr(row, "levels_completed", 0)
     return max(0, int(deepest))
 
@@ -109,7 +109,7 @@ def game_summary(
     started; they are not a retained-competence estimate from restored memory.
     Multiple actor lanes for the same game cannot inflate progress: the maximum
     deepest level reached in a single episode for that game is used. Legacy rows
-    without ``max_level_reached`` fall back to ``levels_completed``.
+    without an episode-depth metric fall back to cumulative ``levels_completed``.
     """
     grouped = _group_games(rows)
     if not grouped:
