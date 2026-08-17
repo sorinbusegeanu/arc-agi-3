@@ -54,5 +54,8 @@ def install_lifecycle_switch_v827() -> None:
     from v8.sampling_transfer_v833 import install_sampling_transfer_v833
     install_sampling_transfer_v833()
 
+    from v8.sampling_transfer_v833_fixups import install_sampling_transfer_v833_fixups
+    install_sampling_transfer_v833_fixups()
+
     from v8.snapshot_resilience_v833 import install_snapshot_resilience_v833
     install_snapshot_resilience_v833()
