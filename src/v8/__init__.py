@@ -1,4 +1,4 @@
-"""ARC-AGI-3 v8.21 memory-to-intelligence runtime."""
+"""ARC-AGI-3 v8.22 memory-to-intelligence runtime."""
 
 # Install the v0.5.3 memory schema before importing development/runtime modules so
 # proposal packets, shared arenas and snapshot compatibility agree on one layout.
@@ -146,11 +146,13 @@ from v8.episode_progress_reporting_v821 import (
 from v8.solved_game_recovery_v821 import (
     install_solved_game_recovery_v821 as _install_solved_game_recovery_v821,
 )
+from v8.runtime_repair_v822 import (
+    install_runtime_repair_v822 as _install_runtime_repair_v822,
+)
 
-# Install semantic/control layers in chronological order. v8.21 keeps the v8.20
-# memory semantics and replaces only no-plan random-walk discovery with bounded
-# replayable decision-point interventions. Episode progress reporting and solved-
-# game recovery are installed last so they observe the final actor/allocator paths.
+# Install semantic/control layers in chronological order. v8.22 repairs the v8.21
+# DISCOVERY wrapper contract, makes decision-point probing authoritative before
+# planner reuse, delays lifecycle work, and persists only actual complete WIN paths.
 _install_behavior_recovery()
 _install_primary_valence_runtime()
 _install_runtime_fixups()
@@ -193,6 +195,7 @@ _install_progressive_level_learning_v820()
 _install_decision_point_sampling_v821()
 _install_episode_progress_reporting_v821()
 _install_solved_game_recovery_v821()
+_install_runtime_repair_v822()
 
 # Preserve existing import paths: `from v8.runtime import ContinuousMemoryRuntime`
 # and the package-level API both resolve to the current semantic layer.
