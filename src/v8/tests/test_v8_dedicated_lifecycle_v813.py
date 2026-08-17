@@ -57,6 +57,11 @@ def node(key=(101,)) -> NodeRecord:
 
 
 class DedicatedLifecycleWorkerTests(unittest.TestCase):
+    def test_lifecycle_default_start_delay_is_five_minutes(self) -> None:
+        from v8 import runtime_repair_v822 as repair
+
+        self.assertEqual(repair._LIFECYCLE_START_DELAY_SECONDS, 300.0)
+
     def test_lifecycle_completes_while_main_peer_cycle_is_blocked(self) -> None:
         entered = threading.Event()
         release = threading.Event()
@@ -69,6 +74,8 @@ class DedicatedLifecycleWorkerTests(unittest.TestCase):
             interval_seconds=0.05,
         )
         supervisor.set_candidate_budget(512)
+        # Unit tests exercise lifecycle behavior itself, not the production 5-minute delay.
+        supervisor._v822_lifecycle_start_delay_seconds = 0.0
 
         def blocked_peer_cycle():
             entered.set()
