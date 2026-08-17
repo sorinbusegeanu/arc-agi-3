@@ -60,7 +60,7 @@ class CaptureSourceTests(unittest.TestCase):
                 os.environ[v819._SAMPLING_MODE_ENV] = prior
         self.assertEqual(raw["frontier_source"], FrontierSource.SAMPLER.value)
 
-    def test_transfer_sampling_marks_captured_trajectory_as_transfer_source(self) -> None:
+    def test_transfer_mode_without_foreign_parent_is_not_transfer_evidence(self) -> None:
         prior = os.environ.get(v819._SAMPLING_MODE_ENV)
         try:
             os.environ[v819._SAMPLING_MODE_ENV] = v819.SamplingMode.TRANSFER.value
@@ -70,7 +70,7 @@ class CaptureSourceTests(unittest.TestCase):
                 os.environ.pop(v819._SAMPLING_MODE_ENV, None)
             else:
                 os.environ[v819._SAMPLING_MODE_ENV] = prior
-        self.assertEqual(raw["frontier_source"], FrontierSource.TRANSFER.value)
+        self.assertEqual(raw["frontier_source"], FrontierSource.SAMPLER.value)
 
 
 class ServiceCompatibilityTests(unittest.TestCase):
