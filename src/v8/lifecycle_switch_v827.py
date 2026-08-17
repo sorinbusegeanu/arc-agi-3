@@ -39,3 +39,9 @@ def install_lifecycle_switch_v827() -> None:
     )
 
     install_lifecycle_competence_integration_v827_fixups()
+
+    from v8.sampling_baseline_recovery_v828 import (
+        install_sampling_baseline_recovery_v828,
+    )
+
+    install_sampling_baseline_recovery_v828()
