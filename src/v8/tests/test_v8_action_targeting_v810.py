@@ -210,10 +210,10 @@ class CompactProgressTests(unittest.TestCase):
             ),
         )
         line = diagnostics.format_game_rate_line(rows)
-        self.assertIn("tp01:B=766,L=812", line)
+        self.assertIn("tp01:best_win_actions=766,last_win_actions=812", line)
         self.assertNotIn("first=", line)
-        self.assertNotIn("best=", line)
-        self.assertNotIn("last=", line)
+        self.assertNotIn("B=", line)
+        self.assertNotIn("L=", line)
 
 
 if __name__ == "__main__":

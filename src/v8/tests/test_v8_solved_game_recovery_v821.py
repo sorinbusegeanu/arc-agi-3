@@ -10,6 +10,7 @@ from pathlib import Path
 import v8
 from v7.environment.arc_adapter import ArcGridEnvironment
 from v8 import adaptive_learning_allocation_v819_performance_fix as perf
+from v8 import runtime_repair_v822 as repair
 from v8 import solved_game_recovery_v821 as recovery
 from v8 import trajectory_inspection_v819_fixups as visibility
 from v8 import trajectory_optimizer_v814 as optimizer
@@ -21,6 +22,7 @@ class SolvedGameRecoveryV821Tests(unittest.TestCase):
         recovery._RUNTIME_SEGMENT_ACTIONS.clear()
         recovery._RUNTIME_LEVEL_SEGMENTS.clear()
         recovery._RUNTIME_CURRENT_LEVEL.clear()
+        repair._RUNTIME_EPISODE_BOUNDARIES.clear()
 
     def test_runtime_win_publishes_complete_solution_with_level_boundaries(self) -> None:
         prior = os.environ.get(optimizer._TRAJECTORY_ROOT_ENV)
@@ -77,6 +79,13 @@ class SolvedGameRecoveryV821Tests(unittest.TestCase):
         recovery._store_level_segment(key, 2, (4,))
         levels = recovery._complete_runtime_levels(key, 3)
         self.assertEqual(levels, ((2,), (3, 3), (4,)))
+
+    def test_exact_episode_boundaries_reconstruct_only_one_complete_win(self) -> None:
+        self.assertEqual(
+            repair._episode_levels((1, 2, 3, 4, 5), (1, 2, 3, 4), 5),
+            ((1,), (2,), (3,), (4,), (5,)),
+        )
+        self.assertIsNone(repair._episode_levels((1, 2, 3, 4, 5), (1, 3), 5))
 
     def test_show_best_reconstructs_independently_validated_levels(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -214,9 +223,9 @@ class SolvedGameRecoveryV821Tests(unittest.TestCase):
     def test_runtime_win_does_not_expire_back_into_unsolved_discovery_priority(self) -> None:
         self.assertTrue(math.isinf(perf._PROVISIONAL_WIN_SECONDS))
 
-    def test_recovery_is_installed_at_real_environment_boundary(self) -> None:
-        self.assertIs(ArcGridEnvironment.step, recovery._tracked_env_step)
-        self.assertIs(ArcGridEnvironment.reset, recovery._tracked_env_reset)
+    def test_v822_runtime_capture_is_installed_at_real_environment_boundary(self) -> None:
+        self.assertIs(ArcGridEnvironment.step, repair._runtime_env_step)
+        self.assertIs(ArcGridEnvironment.reset, repair._runtime_env_reset)
 
 
 if __name__ == "__main__":

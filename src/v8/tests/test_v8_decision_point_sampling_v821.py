@@ -6,6 +6,7 @@ import unittest
 import v8
 from v8 import actor as actor_module
 from v8 import decision_point_sampling_v821 as sampling
+from v8 import runtime_repair_v822 as repair
 
 
 class _Env:
@@ -18,8 +19,34 @@ class _Env:
 
 
 class DecisionPointSamplingV821Tests(unittest.TestCase):
-    def test_installed_actor_uses_v821_discovery_controller(self) -> None:
-        self.assertIs(actor_module.actor_worker, sampling._actor_worker_v821)
+    def test_installed_actor_uses_v822_wrapper_over_v821_discovery_controller(self) -> None:
+        self.assertIs(actor_module.actor_worker, repair._actor_worker_v822)
+        self.assertIs(repair._BASE_ACTOR_WORKER, sampling._actor_worker_v821)
+
+    def test_new_decision_point_suppresses_planner_until_probe_is_selected(self) -> None:
+        sampler = sampling.DecisionPointSampler("ez01", seed=9)
+        self.assertIsNone(
+            sampler.forced_action(
+                level=0,
+                context=10,
+                actions=(1, 2, 3, 4),
+                history=(),
+            )
+        )
+        self.assertTrue(bool(getattr(repair._PROBE_STATE, "before_plan", False)))
+        self.assertEqual(repair._plan_candidates_v822(object(), 10, (1, 2, 3, 4)), ())
+        self.assertEqual(
+            sampler.discovery_action(level=0, context=10, actions=(1, 2, 3, 4), history=()),
+            1,
+        )
+        self.assertFalse(bool(getattr(repair._PROBE_STATE, "before_plan", False)))
+
+    def test_successful_point_is_not_reopened_as_frontier(self) -> None:
+        sampler = sampling.DecisionPointSampler("ez01", seed=10)
+        solved = sampler.register_point(level=0, context=10, anchor=(), actions=(1, 2), priority=6)
+        solved.successful_action = 1
+        other = sampler.register_point(level=1, context=20, anchor=(1,), actions=(1, 2), priority=2)
+        self.assertIs(sampler._best_frontier(), other)
 
     def test_ordinary_probe_returns_to_shallow_decision_point_before_random_walk(self) -> None:
         sampler = sampling.DecisionPointSampler("ez01", seed=7)

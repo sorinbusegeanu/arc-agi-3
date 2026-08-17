@@ -59,7 +59,7 @@ class EpisodeProgressReportingV821Tests(unittest.TestCase):
         )
         self.assertEqual(len(target.rows), 1)
         row = target.rows[0]
-        self.assertIsInstance(row, actor_module.ActorProgress)
+        self.assertIsInstance(row, progress_fix.EpisodeActorProgress)
         self.assertEqual(row.levels_completed, 7)
         self.assertEqual(row.max_level_reached, 2)
         self.assertEqual(row.first_win_step, 0)
