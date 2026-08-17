@@ -205,8 +205,9 @@ class V088LearningFixTests(unittest.TestCase):
             ActorProgress(1, "ez01", 1000, 3, 0, 5, first_win_step=205, best_win_steps=180, last_win_steps=190),
         )
         line = diagnostics.format_game_rate_line(rows)
-        self.assertIn("ez01:best_win_actions=180,last_win_actions=190", line)
-        self.assertNotIn("B=", line)
+        self.assertIn("ez01:B=180,L=190", line)
+        self.assertNotIn("best_win_actions=", line)
+        self.assertNotIn("last_win_actions=", line)
 
     def test_memory_free_action_is_seeded_but_memory_independent(self):
         from random import Random
