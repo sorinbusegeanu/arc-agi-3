@@ -45,9 +45,13 @@ jobs:
           if [ "$status" -ne 0 ]; then
             python - <<'PY'
           from pathlib import Path
-          text = Path('/tmp/v8-tests.log').read_text(encoding='utf-8', errors='replace')[-12000:]
-          text = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
-          print(f'::error::{text}')
+          text = Path('/tmp/v8-tests.log').read_text(encoding='utf-8', errors='replace')
+          marker = '\n======================================================================'
+          pos = text.find(marker)
+          detail = text[pos:] if pos >= 0 else text[-8000:]
+          detail = detail[:10000]
+          detail = detail.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+          print(f'::error::{detail}')
           PY
           fi
           exit "$status"
