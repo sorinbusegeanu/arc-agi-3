@@ -8,11 +8,11 @@ from v8 import progress_reporting_v054 as _progress_v054
 
 
 _INSTALLED = False
-_BASE_ACTOR_WORKER = None
+_BASE_ENV_INIT = None
 _BASE_ENV_STEP = None
 
-_ACTIVE_PROGRESS_KEY: tuple[int, str] | None = None
-_MAX_LEVEL_REACHED: dict[tuple[int, str], int] = {}
+_ACTIVE_GAME_ID: str | None = None
+_MAX_LEVEL_REACHED: dict[str, int] = {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,36 +20,36 @@ class EpisodeActorProgress(_progress_v054.ActorProgress):
     """Actor progress plus deepest level reached in any single current-run episode."""
 
     # -1 identifies callers/tests constructing legacy-style progress rows without
-    # the episode-depth metric. Real actor publications always pass an explicit >=0.
+    # a real environment-backed episode-depth metric.
     max_level_reached: int = -1
 
 
 def _record_level_progress(levels_completed: int) -> None:
-    key = _ACTIVE_PROGRESS_KEY
-    if key is None:
+    game_id = _ACTIVE_GAME_ID
+    if game_id is None:
         return
     level = max(0, int(levels_completed))
-    prior = int(_MAX_LEVEL_REACHED.get(key, 0))
+    prior = int(_MAX_LEVEL_REACHED.get(game_id, 0))
     if level > prior:
-        _MAX_LEVEL_REACHED[key] = level
+        _MAX_LEVEL_REACHED[game_id] = level
+
+
+def _tracked_env_init(self, *args, **kwargs) -> None:
+    global _ACTIVE_GAME_ID
+    _BASE_ENV_INIT(self, *args, **kwargs)
+    game_id = kwargs.get("game_id")
+    if game_id is None:
+        game_id = getattr(self, "game_id", None)
+    if game_id is not None:
+        _ACTIVE_GAME_ID = str(game_id)
+        _MAX_LEVEL_REACHED.setdefault(_ACTIVE_GAME_ID, 0)
+        _record_level_progress(int(getattr(self, "last_levels_completed", 0)))
 
 
 def _tracked_env_step(self, action):
     result = _BASE_ENV_STEP(self, action)
     _record_level_progress(int(getattr(self, "last_levels_completed", 0)))
     return result
-
-
-def _tracked_actor_worker(*, job, **kwargs):
-    global _ACTIVE_PROGRESS_KEY
-    prior = _ACTIVE_PROGRESS_KEY
-    key = (int(job.actor_id), str(job.game_id))
-    _ACTIVE_PROGRESS_KEY = key
-    _MAX_LEVEL_REACHED.setdefault(key, 0)
-    try:
-        return _BASE_ACTOR_WORKER(job=job, **kwargs)
-    finally:
-        _ACTIVE_PROGRESS_KEY = prior
 
 
 def _publish_episode_progress(
@@ -69,10 +69,10 @@ def _publish_episode_progress(
     if capture_active and int(wins) > 0 and first_win_step <= 0:
         first_win_step = int(steps)
 
-    key = (int(job.actor_id), str(job.game_id))
+    game_id = str(job.game_id)
     row = EpisodeActorProgress(
         int(job.actor_id),
-        str(job.game_id),
+        game_id,
         int(steps),
         int(wins),
         int(failures),
@@ -80,7 +80,7 @@ def _publish_episode_progress(
         int(replans),
         int(planned_steps),
         int(first_win_step),
-        int(_MAX_LEVEL_REACHED.get(key, 0)),
+        int(_MAX_LEVEL_REACHED.get(game_id, -1)),
     )
     for target in (progress_queue, reporting_queue):
         if target is None:
@@ -92,17 +92,17 @@ def _publish_episode_progress(
 
 
 def install_episode_progress_reporting_v821() -> None:
-    global _INSTALLED, _BASE_ACTOR_WORKER, _BASE_ENV_STEP
+    global _INSTALLED, _BASE_ENV_INIT, _BASE_ENV_STEP
     if _INSTALLED:
         return
 
     from v7.environment.arc_adapter import ArcGridEnvironment
     from v8 import actor as actor_module
 
-    _BASE_ACTOR_WORKER = actor_module.actor_worker
+    _BASE_ENV_INIT = ArcGridEnvironment.__init__
     _BASE_ENV_STEP = ArcGridEnvironment.step
     actor_module.ActorProgress = EpisodeActorProgress
-    actor_module.actor_worker = _tracked_actor_worker
     actor_module._publish_progress = _publish_episode_progress
+    ArcGridEnvironment.__init__ = _tracked_env_init
     ArcGridEnvironment.step = _tracked_env_step
     _INSTALLED = True
