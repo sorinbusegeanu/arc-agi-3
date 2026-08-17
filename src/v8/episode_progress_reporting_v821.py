@@ -3,7 +3,8 @@ from __future__ import annotations
 import queue
 from dataclasses import dataclass
 
-from v8.actor import ActorProgress
+from v8 import primary_valence as _primary
+from v8 import progress_reporting_v054 as _progress_v054
 
 
 _INSTALLED = False
@@ -15,7 +16,7 @@ _MAX_LEVEL_REACHED: dict[tuple[int, str], int] = {}
 
 
 @dataclass(frozen=True, slots=True)
-class EpisodeActorProgress(ActorProgress):
+class EpisodeActorProgress(_progress_v054.ActorProgress):
     """Actor progress plus deepest level reached in any single current-run episode."""
 
     max_level_reached: int = 0
@@ -61,6 +62,11 @@ def _publish_episode_progress(
     replans: int,
     planned_steps: int,
 ) -> None:
+    capture_active = bool(getattr(_primary, "_CAPTURE_ACTIVE", False))
+    first_win_step = int(_progress_v054._FIRST_WIN_STEP) if capture_active else 0
+    if capture_active and int(wins) > 0 and first_win_step <= 0:
+        first_win_step = int(steps)
+
     key = (int(job.actor_id), str(job.game_id))
     row = EpisodeActorProgress(
         int(job.actor_id),
@@ -71,6 +77,7 @@ def _publish_episode_progress(
         int(levels_completed),
         int(replans),
         int(planned_steps),
+        int(first_win_step),
         int(_MAX_LEVEL_REACHED.get(key, 0)),
     )
     for target in (progress_queue, reporting_queue):
@@ -92,6 +99,7 @@ def install_episode_progress_reporting_v821() -> None:
 
     _BASE_ACTOR_WORKER = actor_module.actor_worker
     _BASE_ENV_STEP = ArcGridEnvironment.step
+    actor_module.ActorProgress = EpisodeActorProgress
     actor_module.actor_worker = _tracked_actor_worker
     actor_module._publish_progress = _publish_episode_progress
     ArcGridEnvironment.step = _tracked_env_step
