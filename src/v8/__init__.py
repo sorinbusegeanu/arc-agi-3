@@ -143,12 +143,14 @@ from v8.decision_point_sampling_v821 import (
 from v8.episode_progress_reporting_v821 import (
     install_episode_progress_reporting_v821 as _install_episode_progress_reporting_v821,
 )
+from v8.solved_game_recovery_v821 import (
+    install_solved_game_recovery_v821 as _install_solved_game_recovery_v821,
+)
 
 # Install semantic/control layers in chronological order. v8.21 keeps the v8.20
 # memory semantics and replaces only no-plan random-walk discovery with bounded
-# replayable decision-point interventions. Episode progress reporting is installed
-# last so all actor paths publish the deepest single-episode level separately from
-# cumulative level-completion events.
+# replayable decision-point interventions. Episode progress reporting and solved-
+# game recovery are installed last so they observe the final actor/allocator paths.
 _install_behavior_recovery()
 _install_primary_valence_runtime()
 _install_runtime_fixups()
@@ -190,6 +192,7 @@ _install_trajectory_target_minimization_v820()
 _install_progressive_level_learning_v820()
 _install_decision_point_sampling_v821()
 _install_episode_progress_reporting_v821()
+_install_solved_game_recovery_v821()
 
 # Preserve existing import paths: `from v8.runtime import ContinuousMemoryRuntime`
 # and the package-level API both resolve to the current semantic layer.
