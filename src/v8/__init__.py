@@ -1,4 +1,4 @@
-"""ARC-AGI-3 v8.19 memory-to-intelligence runtime."""
+"""ARC-AGI-3 v8.20 memory-to-intelligence runtime."""
 
 # Install the v0.5.3 memory schema before importing development/runtime modules so
 # proposal packets, shared arenas and snapshot compatibility agree on one layout.
@@ -131,10 +131,13 @@ from v8.adaptive_learning_allocation_v819_performance_fixups import (
 from v8.adaptive_learning_allocation_v819_worker_fix import (
     install_adaptive_learning_allocation_v819_worker_fix as _install_adaptive_learning_allocation_v819_worker_fix,
 )
+from v8.trajectory_target_minimization_v820 import (
+    install_trajectory_target_minimization_v820 as _install_trajectory_target_minimization_v820,
+)
 
-# Install semantic layers in chronological order. v8.19 keeps v8.18 trajectory
-# safety, adds read-only trajectory inspection, and adds the adaptive-learning
-# allocator without changing canonical memory semantics.
+# Install semantic layers in chronological order. v8.20 keeps v8.19 solve-first
+# allocation and adds target-aware trajectory minimization without changing actor
+# control or canonical memory semantics.
 _install_behavior_recovery()
 _install_primary_valence_runtime()
 _install_runtime_fixups()
@@ -172,6 +175,7 @@ _install_adaptive_learning_allocation_v819_inflight_fix()
 _install_adaptive_learning_allocation_v819_performance_fix()
 _install_adaptive_learning_allocation_v819_performance_fixups()
 _install_adaptive_learning_allocation_v819_worker_fix()
+_install_trajectory_target_minimization_v820()
 
 # Preserve existing import paths: `from v8.runtime import ContinuousMemoryRuntime`
 # and the package-level API both resolve to the current semantic layer.
