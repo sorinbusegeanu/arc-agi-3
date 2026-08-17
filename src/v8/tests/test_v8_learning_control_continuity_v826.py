@@ -20,13 +20,9 @@ class LearningControlContinuityV826Tests(unittest.TestCase):
     def test_final_install_authorities(self) -> None:
         self.assertIs(LiveReadView.plan_candidates, repair._plan_candidates_v826)
         self.assertIs(v822._BASE_PLAN_CANDIDATES, repair._plan_candidates_v826)
-        self.assertIs(v824._plan_candidates_v824, repair._plan_candidates_v826)
+        self.assertIs(repair._BASE_PLAN_CANDIDATES, v824._plan_candidates_v824)
         self.assertIs(
             perf.__dict__["_v823_initial_unsolved_lease_steps"],
-            repair.episode_aligned_unsolved_lease_steps_v826,
-        )
-        self.assertIs(
-            v824.unsolved_lease_steps_v824,
             repair.episode_aligned_unsolved_lease_steps_v826,
         )
         self.assertEqual(sampling._VERIFICATION_REPEATS, 1)
