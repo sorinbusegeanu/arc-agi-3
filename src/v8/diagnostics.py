@@ -90,18 +90,26 @@ def solved_game_steps(rows: Iterable[GameProgress]) -> tuple[tuple[str, int], ..
     return tuple(sorted(result))
 
 
+def _deepest_level(row: GameProgress) -> int:
+    """Return deepest level reached in one episode, with legacy-row fallback."""
+    deepest = getattr(row, "max_level_reached", None)
+    if deepest is None or int(deepest) < 0:
+        deepest = getattr(row, "levels_completed", 0)
+    return max(0, int(deepest))
+
+
 def game_summary(
     rows: Iterable[GameProgress],
     *,
     levels_per_game: int = _DEFAULT_LEVELS_PER_GAME,
 ) -> tuple[float, float, int, int]:
-    """Return distinct-game current-run win rate and partial level-completion rate.
+    """Return distinct-game current-run win rate and deepest-level progress.
 
     These values intentionally describe only observations since the current process
     started; they are not a retained-competence estimate from restored memory.
     Multiple actor lanes for the same game cannot inflate progress: the maximum
-    completed-level count observed for that game is used. When no game-specific
-    level count is available, five levels per game is the declared denominator.
+    deepest level reached in a single episode for that game is used. Legacy rows
+    without an episode-depth metric fall back to cumulative ``levels_completed``.
     """
     grouped = _group_games(rows)
     if not grouped:
@@ -112,7 +120,7 @@ def game_summary(
     solved_levels = sum(
         min(
             denominator_per_game,
-            max((max(0, int(row.levels_completed)) for row in lane_rows), default=0),
+            max((_deepest_level(row) for row in lane_rows), default=0),
         )
         for lane_rows in grouped.values()
     )
@@ -121,7 +129,7 @@ def game_summary(
 
 
 def game_rates(rows: Iterable[GameProgress]) -> tuple[float, float]:
-    """Return distinct-game current-run win and partial level-completion rates."""
+    """Return distinct-game current-run win and deepest-level rates."""
     win_rate, level_rate, _solved_games, _games = game_summary(rows)
     return win_rate, level_rate
 
