@@ -128,6 +128,8 @@ def _publish_complete_optimizer_source(game_id: str, levels) -> None:
 
 
 def _publish_runtime_levels_v834(game_id: str, levels) -> None:
+    """Compose beneath v8.25 while adding a complete-game optimizer source."""
+
     result = _BASE_PUBLISH_RUNTIME_LEVELS(game_id, levels)
     _publish_complete_optimizer_source(game_id, levels)
     return result
@@ -158,19 +160,26 @@ def install_runtime_win_optimization_v834() -> None:
         return
 
     from v8 import adaptive_learning_allocation_v819 as v819
+    from v8 import complete_win_trajectory_repair_v825 as repair
     from v8 import solved_game_recovery_v821 as recovery
     from v8 import trajectory_optimizer_v818 as v818
     from v8.runtime_v82 import V82ContinuousMemoryRuntime
 
     _BASE_RESULT_PUT = v819._ResultAdapter.put
     _BASE_GAME_STATE = v819.AdaptiveLearningCoordinator.game_state
-    _BASE_PUBLISH_RUNTIME_LEVELS = recovery._publish_runtime_levels
+    _BASE_PUBLISH_RUNTIME_LEVELS = repair._BASE_PUBLISH_RUNTIME_LEVELS
     _BASE_PREFIX_FOR = v818._prefix_for
     _BASE_RUNTIME_INIT = V82ContinuousMemoryRuntime.__init__
 
     v819._ResultAdapter.put = _result_adapter_put_v834
     v819.AdaptiveLearningCoordinator.game_state = _game_state_v834
-    recovery._publish_runtime_levels = _publish_runtime_levels_v834
+
+    # v8.25 remains the public complete-WIN publication authority.  v8.34 is
+    # composed underneath its delegate so historical hook identity and v8.25's
+    # complete-solve metric updates remain intact.
+    repair._BASE_PUBLISH_RUNTIME_LEVELS = _publish_runtime_levels_v834
+    recovery._publish_runtime_levels = repair._publish_runtime_levels_v825
+
     v818._prefix_for = _prefix_for_v834
     V82ContinuousMemoryRuntime.__init__ = _runtime_init_v834
     _INSTALLED = True

@@ -8,6 +8,7 @@ from unittest import mock
 
 import v8  # noqa: F401 - installs the chronological runtime stack
 from v8 import adaptive_learning_allocation_v819 as v819
+from v8 import complete_win_trajectory_repair_v825 as repair
 from v8 import runtime_win_optimization_v834 as v834
 from v8 import solved_game_recovery_v821 as recovery
 from v8 import trajectory_optimizer_v814 as optimizer
@@ -18,7 +19,8 @@ class RuntimeWinOptimizationV834Tests(unittest.TestCase):
     def test_final_hooks_are_installed(self):
         self.assertIs(v819._ResultAdapter.put, v834._result_adapter_put_v834)
         self.assertIs(v819.AdaptiveLearningCoordinator.game_state, v834._game_state_v834)
-        self.assertIs(recovery._publish_runtime_levels, v834._publish_runtime_levels_v834)
+        self.assertIs(recovery._publish_runtime_levels, repair._publish_runtime_levels_v825)
+        self.assertIs(repair._BASE_PUBLISH_RUNTIME_LEVELS, v834._publish_runtime_levels_v834)
         self.assertIs(v818._prefix_for, v834._prefix_for_v834)
 
     def test_observed_win_immediately_promotes_allocator_state(self):
