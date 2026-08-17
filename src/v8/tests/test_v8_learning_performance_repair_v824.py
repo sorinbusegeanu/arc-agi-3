@@ -10,7 +10,6 @@ from v8 import adaptive_learning_allocation_v819 as v819
 from v8 import adaptive_learning_allocation_v819_performance_fix as perf
 from v8 import final_save_lifecycle_v812 as lifecycle
 from v8 import learning_performance_repair_v824 as repair
-from v8 import progressive_level_learning_v820 as progressive
 from v8 import runtime_repair_v822 as v822
 from v8 import trajectory_optimizer_v814 as optimizer
 from v8.model import MemoryLevel, MemoryType, MemoryUid, stable_u64
@@ -19,11 +18,16 @@ from v8.publication import LiveReadView, PlannedAction
 
 class LearningPerformanceRepairV824Tests(unittest.TestCase):
     def test_final_install_authorities(self) -> None:
-        self.assertIs(perf.__dict__["_v823_initial_unsolved_lease_steps"], repair.unsolved_lease_steps_v824)
-        self.assertIs(v819._service_submit_v819, progressive._submit_progressive_partial)
+        self.assertIs(
+            perf.__dict__["_v823_initial_unsolved_lease_steps"],
+            repair.unsolved_lease_steps_v824,
+        )
+        self.assertIs(v819._service_submit_v819, repair._prewin_submit_v824)
         self.assertIs(LiveReadView.plan_candidates, v822._BASE_PLAN_CANDIDATES)
         self.assertIs(v822._BASE_PLAN_CANDIDATES, repair._plan_candidates_v824)
-        self.assertEqual(lifecycle._LIFECYCLE_GENERATION_SPAN, 256)
+        self.assertEqual(lifecycle._LIFECYCLE_GENERATION_SPAN, 64)
+        self.assertIs(v822._BASE_LIFECYCLE_WORKER, repair._lifecycle_worker_v824)
+        self.assertEqual(repair._LIFECYCLE_MIN_INTERVAL_SECONDS, 60.0)
 
     def test_every_unsolved_lease_is_bounded(self) -> None:
         for initial in (False, True):
@@ -83,15 +87,21 @@ class LearningPerformanceRepairV824Tests(unittest.TestCase):
         strategy = MemoryUid.from_key(MemoryLevel.M7, MemoryType.STRATEGY, (10, 11, 12))
         anchor = optimizer.ReplayAnchor("ic01", 0, (), None)
         target = optimizer.TrajectoryTarget(1, "LEVEL")
-        row = optimizer.SuccessfulTrajectory("t", anchor, target, (1,), strategy, MemoryUid.zero(), 0)
+        row = optimizer.SuccessfulTrajectory(
+            "t", anchor, target, (1,), strategy, MemoryUid.zero(), 0
+        )
         key = repair._foreign_key("ic01", strategy)
         prior_mode = os.environ.get(v819._SAMPLING_MODE_ENV)
         try:
             os.environ[v819._SAMPLING_MODE_ENV] = v819.SamplingMode.TRANSFER.value
             repair._FOREIGN_TRANSFER_STRATEGIES.discard(key)
-            self.assertEqual(repair._success_to_dict_v824(row)["frontier_source"], "SAMPLER")
+            self.assertEqual(
+                repair._success_to_dict_v824(row)["frontier_source"], "SAMPLER"
+            )
             repair._FOREIGN_TRANSFER_STRATEGIES.add(key)
-            self.assertEqual(repair._success_to_dict_v824(row)["frontier_source"], "TRANSFER")
+            self.assertEqual(
+                repair._success_to_dict_v824(row)["frontier_source"], "TRANSFER"
+            )
         finally:
             repair._FOREIGN_TRANSFER_STRATEGIES.discard(key)
             if prior_mode is None:
