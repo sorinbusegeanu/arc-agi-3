@@ -49,6 +49,7 @@ class LifecycleCompetenceIntegrationV827Tests(unittest.TestCase):
         strategy_uid = MemoryUid(1, 11)
         outcome_uid = MemoryUid(2, 22)
         coordinator = adaptive.AdaptiveLearningCoordinator()
+        coordinator._v827_lifecycle_authority = True
         coordinator.register_games(("g",))
         coordinator._game_won["g"] = True
         coordinator._record("g", 1).state = adaptive.GameLearningState.SOLVED_STABLE
