@@ -33,26 +33,29 @@ class LearningControlContinuityV826Tests(unittest.TestCase):
 
     def test_existing_plan_is_not_suppressed_by_pending_discovery_probe(self) -> None:
         sentinel = (object(),)
+        view = object()
         v822._PROBE_STATE.before_plan = True
         with patch.object(
             repair,
             "_BASE_PLAN_CANDIDATES",
             Mock(return_value=sentinel),
         ) as base:
-            rows = repair._plan_candidates_v826(object(), 123, (1, 2, 3, 4))
+            rows = repair._plan_candidates_v826(view, 123, (1, 2, 3, 4))
         self.assertIs(rows, sentinel)
-        base.assert_called_once_with(object if False else unittest.mock.ANY, 123, (1, 2, 3, 4))
+        base.assert_called_once_with(view, 123, (1, 2, 3, 4))
         self.assertTrue(v822._PROBE_STATE.before_plan)
 
     def test_no_plan_preserves_probe_state_for_sampler_fallback(self) -> None:
+        view = object()
         v822._PROBE_STATE.before_plan = True
         with patch.object(
             repair,
             "_BASE_PLAN_CANDIDATES",
             Mock(return_value=()),
-        ):
-            rows = repair._plan_candidates_v826(object(), 456, (1, 2))
+        ) as base:
+            rows = repair._plan_candidates_v826(view, 456, (1, 2))
         self.assertEqual(rows, ())
+        base.assert_called_once_with(view, 456, (1, 2))
         self.assertTrue(v822._PROBE_STATE.before_plan)
 
     def test_unsolved_budget_is_not_split_at_2048(self) -> None:
