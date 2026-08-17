@@ -10,6 +10,7 @@ import v8  # noqa: F401 - installs the chronological runtime stack
 from v8 import adaptive_learning_allocation_v819 as v819
 from v8 import complete_win_trajectory_repair_v825 as repair
 from v8 import runtime_win_optimization_v834 as v834
+from v8 import runtime_win_scope_v835 as v835
 from v8 import solved_game_recovery_v821 as recovery
 from v8 import trajectory_optimizer_v814 as optimizer
 from v8 import trajectory_optimizer_v818 as v818
@@ -28,7 +29,10 @@ class RuntimeWinOptimizationV834Tests(unittest.TestCase):
             trajectory_root = os.path.join(root, "trajectory_optimizer")
             with mock.patch.dict(
                 os.environ,
-                {optimizer._TRAJECTORY_ROOT_ENV: trajectory_root},
+                {
+                    optimizer._TRAJECTORY_ROOT_ENV: trajectory_root,
+                    v835._RUN_SESSION_ENV: "v834-test-run",
+                },
                 clear=False,
             ):
                 coordinator = v819.AdaptiveLearningCoordinator()
@@ -49,7 +53,7 @@ class RuntimeWinOptimizationV834Tests(unittest.TestCase):
                     v819.GameLearningState.SOLVED_OPTIMIZING,
                 )
                 self.assertTrue(coordinator._game_won["ez01"])
-                record = coordinator._record("ez01", 5)
+                record = coordinator._record("ez01", v835._FULL_WIN_SCOPE_LEVEL)
                 self.assertEqual(record.state, v819.GameLearningState.SOLVED_OPTIMIZING)
                 self.assertEqual(record.last_success_generation, 1234)
                 self.assertEqual(record.optimizer_exhausted_version, -1)

@@ -62,3 +62,6 @@ def install_lifecycle_switch_v827() -> None:
 
     from v8.runtime_win_optimization_v834 import install_runtime_win_optimization_v834
     install_runtime_win_optimization_v834()
+
+    from v8.runtime_win_scope_v835 import install_runtime_win_scope_v835
+    install_runtime_win_scope_v835()
