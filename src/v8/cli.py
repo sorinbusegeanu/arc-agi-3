@@ -10,6 +10,7 @@ from pathlib import Path
 from v8.actor import ActorJob, run_actor_jobs
 from v8.capacity import plan_capacities
 from v8.experiments import ExperimentSummary, run_automatic_transfer_experiments
+from v8.lifecycle_switch_v827 import LIFECYCLE_ENV
 from v8.reporter import DedicatedReporter
 from v8.runtime import ContinuousMemoryRuntime, V8RuntimeConfig
 from v8.snapshot import latest_complete_snapshot
@@ -184,7 +185,9 @@ def run_continuous(args) -> int:
 
     try:
         previous_wait = os.environ.get(_GAME_WAIT_ENV)
+        previous_lifecycle = os.environ.get(LIFECYCLE_ENV)
         os.environ[_GAME_WAIT_ENV] = str(float(args.wait))
+        os.environ[LIFECYCLE_ENV] = str(args.lifecycle)
         try:
             # Restored graphs can take seconds to copy into each actor's initial
             # read cache. Keep autonomous graph writers paused until every actor
@@ -195,6 +198,7 @@ def run_continuous(args) -> int:
             print(
                 f"v8 continuous: games={len(games)} actors={len(jobs)} shards={args.shards} "
                 f"stage_workers={args.stage_workers} peers={'off' if args.no_peers else 'on'} "
+                f"lifecycle={args.lifecycle} "
                 f"snapshots={'off' if args.no_snapshots else 'async'} wait={float(args.wait):g}s/game "
                 f"graph_check={graph_check_steps}steps",
                 flush=True,
@@ -225,6 +229,10 @@ def run_continuous(args) -> int:
                 os.environ.pop(_GAME_WAIT_ENV, None)
             else:
                 os.environ[_GAME_WAIT_ENV] = previous_wait
+            if previous_lifecycle is None:
+                os.environ.pop(LIFECYCLE_ENV, None)
+            else:
+                os.environ[LIFECYCLE_ENV] = previous_lifecycle
 
         stop_reporter()
         _log("sampling done")
@@ -328,6 +336,12 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=0.0,
         help="seconds each actor waits after a complete ARC game episode (WIN/GAME_OVER)",
+    )
+    continuous.add_argument(
+        "--lifecycle",
+        choices=("on", "off"),
+        default="on",
+        help="enable or disable the dedicated lifecycle thread (default: on)",
     )
     continuous.add_argument("--actor-timeout", type=float, default=None)
     continuous.add_argument("--progress-interval-seconds", type=float, default=60.0)
