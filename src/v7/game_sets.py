@@ -17,6 +17,14 @@ BRIDGE_GAMES = ("ul01", "ul02", "ul03", "fs01", "fs02", "fs03", "co01", "tb01", 
 TRANSFER_VALIDATION_GAMES = ("ul01", "ul02", "ul03", "fs01", "fs02", "fs03", "co01", "pb01", "pb02", "pb03", "sk01", "sk02", "sk03", "ci01", "tb01", "tb02", "tb03", "cr01", "rn01", "wl01", "ex01", "ex02", "ex03", "tp01", "tp02", "tp03", "ml01", "ml02", "ml03", "bp01", "dd01", "as01", "fi01", "fw01")
 FALSIFICATION_GAMES = ("ul01", "ul02", "ul03", "fs01", "fs02", "fs03", "co01", "pb01", "pb03", "sk02", "sk03", "ci01", "tp02", "tp03", "tb02", "tb03", "cr01", "rn01", "ex02", "ex03", "ml03", "nw03", "rs03", "zq03", "dr01", "dg01", "mx01", "fb01", "vi01")
 DIVERSE_GAMES = ("ez01", "ul01", "pb01", "fs01", "tp01", "ic01", "tb01", "ex01", "bp01", "fw01")
+LEARNING_GAMES = (
+    "pb02", "pb03", "sk01", "sk02", "sk03", "ci01", "op01",
+    "ic02", "ic03", "nw01", "nw02", "nw03", "tc01",
+    "tb02", "tb03", "cr01", "wl01", "rn01",
+    "ul02", "ul03", "fs02", "fs03", "tp02", "tp03", "ex02", "ex03",
+    "fi01", "hz01", "vi01",
+    "as01", "tw01", "cq01", "ez01", "ez02", "ez03", "ez04",
+)
 
 V7_GAME_PRESETS = {
     "failed_representatives": FAILED_REPRESENTATIVES,
@@ -34,6 +42,7 @@ V7_GAME_PRESETS = {
     "transfer_validation": TRANSFER_VALIDATION_GAMES,
     "falsification": FALSIFICATION_GAMES,
     "diverse": DIVERSE_GAMES,
+    "learning": LEARNING_GAMES,
 }
 
 
