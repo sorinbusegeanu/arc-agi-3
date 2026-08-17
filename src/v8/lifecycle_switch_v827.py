@@ -45,3 +45,9 @@ def install_lifecycle_switch_v827() -> None:
     )
 
     install_sampling_baseline_recovery_v828()
+
+    from v8.sampling_progress_control_v829 import (
+        install_sampling_progress_control_v829,
+    )
+
+    install_sampling_progress_control_v829()
