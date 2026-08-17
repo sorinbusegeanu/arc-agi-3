@@ -125,6 +125,9 @@ from v8.adaptive_learning_allocation_v819_inflight_fix import (
 from v8.adaptive_learning_allocation_v819_performance_fix import (
     install_adaptive_learning_allocation_v819_performance_fix as _install_adaptive_learning_allocation_v819_performance_fix,
 )
+from v8.adaptive_learning_allocation_v819_performance_fixups import (
+    install_adaptive_learning_allocation_v819_performance_fixups as _install_adaptive_learning_allocation_v819_performance_fixups,
+)
 
 # Install semantic layers in chronological order. v8.19 keeps v8.18 trajectory
 # safety, adds read-only trajectory inspection, and adds the adaptive-learning
@@ -164,6 +167,7 @@ _install_adaptive_learning_allocation_v819()
 _install_adaptive_learning_allocation_v819_fixups()
 _install_adaptive_learning_allocation_v819_inflight_fix()
 _install_adaptive_learning_allocation_v819_performance_fix()
+_install_adaptive_learning_allocation_v819_performance_fixups()
 
 # Preserve existing import paths: `from v8.runtime import ContinuousMemoryRuntime`
 # and the package-level API both resolve to the current semantic layer.
