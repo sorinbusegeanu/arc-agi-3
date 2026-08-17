@@ -108,7 +108,11 @@ def _normalize_levels(raw_levels) -> tuple[tuple[int, ...], ...] | None:
     for index, raw in enumerate(raw_levels):
         if not isinstance(raw, dict):
             return None
-        if int(raw.get("level", index)) != index:
+        try:
+            stored_index = int(raw.get("level", index))
+        except (TypeError, ValueError):
+            return None
+        if stored_index != index:
             return None
         actions = raw.get("actions")
         if not isinstance(actions, list) or not actions:
@@ -177,7 +181,13 @@ def _load_best_successful(path: Path) -> dict[str, dict[str, object]]:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
         return {}
-    if not isinstance(raw, dict) or int(raw.get("version", 0)) != 1:
+    if not isinstance(raw, dict):
+        return {}
+    try:
+        version = int(raw.get("version", 0))
+    except (TypeError, ValueError):
+        return {}
+    if version != 1:
         return {}
     games = raw.get("games", {})
     if not isinstance(games, dict):
@@ -303,7 +313,7 @@ def _optimized_levels(service, candidate, result) -> tuple[tuple[int, ...], ...]
     if cumulative[0] != () or cumulative[-1] != full:
         return None
     levels: list[tuple[int, ...]] = []
-    for previous, current in zip(cumulative, cumulative[1:], strict=True):
+    for previous, current in zip(cumulative, cumulative[1:]):
         if len(current) <= len(previous) or current[: len(previous)] != previous:
             return None
         levels.append(current[len(previous) :])
