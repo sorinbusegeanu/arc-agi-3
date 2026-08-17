@@ -164,6 +164,9 @@ from v8.learning_control_continuity_v826 import (
 from v8.lifecycle_competence_integration_v827 import (
     install_lifecycle_competence_integration_v827 as _install_lifecycle_competence_integration_v827,
 )
+from v8.lifecycle_switch_v827 import (
+    install_lifecycle_switch_v827 as _install_lifecycle_switch_v827,
+)
 
 # Install semantic/control layers in chronological order. v8.27 makes canonical
 # lifecycle state authoritative over auxiliary trajectory/frontier competence while
@@ -216,6 +219,7 @@ _install_learning_performance_repair_v824()
 _install_complete_win_trajectory_repair_v825()
 _install_learning_control_continuity_v826()
 _install_lifecycle_competence_integration_v827()
+_install_lifecycle_switch_v827()
 
 # Preserve existing import paths: `from v8.runtime import ContinuousMemoryRuntime`
 # and the package-level API both resolve to the current semantic layer.
