@@ -3,6 +3,8 @@ from __future__ import annotations
 import queue
 from dataclasses import dataclass
 
+from v8.actor import ActorProgress
+
 
 _INSTALLED = False
 _BASE_ACTOR_WORKER = None
@@ -13,15 +15,9 @@ _MAX_LEVEL_REACHED: dict[tuple[int, str], int] = {}
 
 
 @dataclass(frozen=True, slots=True)
-class EpisodeActorProgress:
-    actor_id: int
-    game_id: str
-    steps: int
-    wins: int
-    failures: int
-    levels_completed: int
-    replans: int = 0
-    planned_steps: int = 0
+class EpisodeActorProgress(ActorProgress):
+    """Actor progress plus deepest level reached in any single current-run episode."""
+
     max_level_reached: int = 0
 
 
@@ -93,17 +89,6 @@ def install_episode_progress_reporting_v821() -> None:
 
     from v7.environment.arc_adapter import ArcGridEnvironment
     from v8 import actor as actor_module
-
-    # Preserve isinstance(row, ActorProgress) contracts used by the parent runner
-    # and dedicated reporter while adding the run-local deepest-level field.
-    global EpisodeActorProgress
-    EpisodeActorProgress = dataclass(frozen=True, slots=True)(
-        type(
-            "EpisodeActorProgress",
-            (actor_module.ActorProgress,),
-            {"__annotations__": {"max_level_reached": int}, "max_level_reached": 0},
-        )
-    )
 
     _BASE_ACTOR_WORKER = actor_module.actor_worker
     _BASE_ENV_STEP = ArcGridEnvironment.step
