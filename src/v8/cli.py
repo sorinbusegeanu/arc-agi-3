@@ -129,6 +129,7 @@ def run_continuous(args) -> int:
     graph_check_steps = int(getattr(args, "graph_check", 1_000))
     if graph_check_steps <= 0:
         raise ValueError("--graph-check must be positive")
+    lifecycle = str(getattr(args, "lifecycle", "on"))
 
     games = resolve_game_selector(args.games, args.env_root)
     jobs = _actor_jobs(
@@ -187,7 +188,7 @@ def run_continuous(args) -> int:
         previous_wait = os.environ.get(_GAME_WAIT_ENV)
         previous_lifecycle = os.environ.get(LIFECYCLE_ENV)
         os.environ[_GAME_WAIT_ENV] = str(float(args.wait))
-        os.environ[LIFECYCLE_ENV] = str(args.lifecycle)
+        os.environ[LIFECYCLE_ENV] = lifecycle
         try:
             # Restored graphs can take seconds to copy into each actor's initial
             # read cache. Keep autonomous graph writers paused until every actor
@@ -198,7 +199,7 @@ def run_continuous(args) -> int:
             print(
                 f"v8 continuous: games={len(games)} actors={len(jobs)} shards={args.shards} "
                 f"stage_workers={args.stage_workers} peers={'off' if args.no_peers else 'on'} "
-                f"lifecycle={args.lifecycle} "
+                f"lifecycle={lifecycle} "
                 f"snapshots={'off' if args.no_snapshots else 'async'} wait={float(args.wait):g}s/game "
                 f"graph_check={graph_check_steps}steps",
                 flush=True,
