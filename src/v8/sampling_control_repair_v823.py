@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import os
 import textwrap
+from dataclasses import dataclass
 
 
 _INSTALLED = False
@@ -11,6 +12,57 @@ _INITIAL_BREADTH_LEASE_STEPS = 2048
 _PREWIN_VALIDATION_MAX_UNSOLVED_GAMES = 8
 _BASE_PROGRESSIVE_SUBMIT = None
 _BASE_TARGET_COMPATIBLE = None
+
+
+@dataclass(frozen=True, slots=True)
+class V823ActorResult:
+    actor_id: int
+    game_id: str
+    steps: int
+    wins: int
+    failures: int
+    levels_completed: int
+    resets: int
+    replans: int = 0
+    planned_steps: int = 0
+    strategy_stats: tuple = ()
+    preference_probes: tuple = ()
+    replanning_trials: tuple = ()
+    pending_learning: object | None = None
+    best_win_steps: int = 0
+    last_win_steps: int = 0
+
+
+class _ResultAdapterV823:
+    """Attach process-local solve metrics to the lease result before aggregation."""
+
+    def __init__(self, target, worker_id: int, lease) -> None:
+        self.target = target
+        self.worker_id = int(worker_id)
+        self.lease = lease
+
+    def put(self, row) -> None:
+        from v8 import adaptive_learning_allocation_v819 as v819
+        from v8 import learning_fixes_v088 as learning
+
+        enriched = V823ActorResult(
+            int(getattr(row, "actor_id", self.worker_id)),
+            str(getattr(row, "game_id", self.lease.game_id)),
+            int(getattr(row, "steps", 0)),
+            int(getattr(row, "wins", 0)),
+            int(getattr(row, "failures", 0)),
+            int(getattr(row, "levels_completed", 0)),
+            int(getattr(row, "resets", 0)),
+            int(getattr(row, "replans", 0)),
+            int(getattr(row, "planned_steps", 0)),
+            tuple(getattr(row, "strategy_stats", ())),
+            tuple(getattr(row, "preference_probes", ())),
+            tuple(getattr(row, "replanning_trials", ())),
+            getattr(row, "pending_learning", None),
+            int(getattr(learning, "_BEST_WIN_STEPS", 0) or 0),
+            int(getattr(learning, "_LAST_WIN_STEPS", 0) or 0),
+        )
+        self.target.put(v819._LeaseResult(self.worker_id, self.lease, enriched))
 
 
 def requested_actor_pool(job_count: int) -> int:
@@ -39,14 +91,110 @@ def initial_unsolved_lease_steps(
     return limit
 
 
-def _install_bounded_adaptive_runner() -> None:
-    """Patch only the two scaling defects in the default v8.19 adaptive runner.
+def _adaptive_progress_rows_v823(
+    actor_module,
+    jobs,
+    completed_by_game,
+    active_progress,
+    active_leases,
+):
+    """Preserve winning-path action counts through adaptive per-game aggregation."""
 
-    The source rewrite is intentionally guarded by exact snippets so a future
-    implementation change fails loudly instead of silently applying a stale patch.
-    Explicit custom lease configurations still go through the existing v8.19
-    performance-fixup dispatcher unchanged.
-    """
+    totals: dict[str, dict[str, int]] = {
+        game: dict(values) for game, values in completed_by_game.items()
+    }
+    for worker_id, progress in active_progress.items():
+        lease = active_leases.get(worker_id)
+        if lease is None or progress is None:
+            continue
+        bucket = totals.setdefault(
+            lease.game_id,
+            {
+                "steps": 0,
+                "wins": 0,
+                "failures": 0,
+                "levels_completed": 0,
+                "replans": 0,
+                "planned_steps": 0,
+                "first_win_step": 0,
+                "best_win_steps": 0,
+                "last_win_steps": 0,
+                "resets": 0,
+            },
+        )
+        base_steps = int(bucket["steps"])
+        bucket["steps"] += int(getattr(progress, "steps", 0))
+        bucket["wins"] += int(getattr(progress, "wins", 0))
+        bucket["failures"] += int(getattr(progress, "failures", 0))
+        bucket["levels_completed"] += int(getattr(progress, "levels_completed", 0))
+        bucket["replans"] += int(getattr(progress, "replans", 0))
+        bucket["planned_steps"] += int(getattr(progress, "planned_steps", 0))
+        local_first = int(getattr(progress, "first_win_step", 0) or 0)
+        if bucket["first_win_step"] <= 0 and local_first > 0:
+            bucket["first_win_step"] = base_steps + local_first
+        local_best = int(getattr(progress, "best_win_steps", 0) or 0)
+        if local_best > 0:
+            prior_best = int(bucket.get("best_win_steps", 0) or 0)
+            bucket["best_win_steps"] = (
+                local_best if prior_best <= 0 else min(prior_best, local_best)
+            )
+        local_last = int(getattr(progress, "last_win_steps", 0) or 0)
+        if local_last > 0:
+            bucket["last_win_steps"] = local_last
+
+    first_job: dict[str, object] = {}
+    for job in jobs:
+        first_job.setdefault(str(job.game_id), job)
+    rows = []
+    for job in jobs:
+        game = str(job.game_id)
+        values = totals.get(
+            game,
+            {
+                "steps": 0,
+                "wins": 0,
+                "failures": 0,
+                "levels_completed": 0,
+                "replans": 0,
+                "planned_steps": 0,
+                "first_win_step": 0,
+                "best_win_steps": 0,
+                "last_win_steps": 0,
+            },
+        )
+        if first_job[game] is not job:
+            values = {key: 0 for key in values}
+        kwargs = dict(
+            actor_id=int(job.actor_id),
+            game_id=game,
+            steps=int(values.get("steps", 0)),
+            wins=int(values.get("wins", 0)),
+            failures=int(values.get("failures", 0)),
+            levels_completed=int(values.get("levels_completed", 0)),
+            replans=int(values.get("replans", 0)),
+            planned_steps=int(values.get("planned_steps", 0)),
+        )
+        try:
+            row = actor_module.ActorProgress(
+                **kwargs,
+                first_win_step=int(values.get("first_win_step", 0)),
+                best_win_steps=int(values.get("best_win_steps", 0)),
+                last_win_steps=int(values.get("last_win_steps", 0)),
+            )
+        except TypeError:
+            try:
+                row = actor_module.ActorProgress(
+                    **kwargs,
+                    first_win_step=int(values.get("first_win_step", 0)),
+                )
+            except TypeError:
+                row = actor_module.ActorProgress(**kwargs)
+        rows.append(row)
+    return tuple(rows)
+
+
+def _install_bounded_adaptive_runner() -> None:
+    """Patch scaling and completed-lease metric defects in the adaptive runner."""
 
     from v8 import adaptive_learning_allocation_v819_performance_fix as perf
 
@@ -62,6 +210,28 @@ def _install_bounded_adaptive_runner() -> None:
     if lease_old not in source:
         raise RuntimeError("v8.23 could not locate adaptive initial-lease authority")
     source = source.replace(lease_old, lease_new, 1)
+
+    bucket_old = '                "first_win_step": 0,\n                "resets": 0,'
+    bucket_new = '                "first_win_step": 0,\n                "best_win_steps": 0,\n                "last_win_steps": 0,\n                "resets": 0,'
+    if bucket_old not in source:
+        raise RuntimeError("v8.23 could not locate adaptive completed-game metric bucket")
+    source = source.replace(bucket_old, bucket_new, 1)
+
+    result_old = '                values["resets"] += int(getattr(result, "resets", 0))\n                pending = getattr(result, "pending_learning", None)'
+    result_new = '''                values["resets"] += int(getattr(result, "resets", 0))
+                result_best = int(getattr(result, "best_win_steps", 0) or 0)
+                if result_best > 0:
+                    prior_best = int(values.get("best_win_steps", 0) or 0)
+                    values["best_win_steps"] = (
+                        result_best if prior_best <= 0 else min(prior_best, result_best)
+                    )
+                result_last = int(getattr(result, "last_win_steps", 0) or 0)
+                if result_last > 0:
+                    values["last_win_steps"] = result_last
+                pending = getattr(result, "pending_learning", None)'''
+    if result_old not in source:
+        raise RuntimeError("v8.23 could not locate adaptive lease-result aggregation")
+    source = source.replace(result_old, result_new, 1)
 
     perf.__dict__["_v823_requested_actor_pool"] = requested_actor_pool
     perf.__dict__["_v823_initial_unsolved_lease_steps"] = initial_unsolved_lease_steps
@@ -193,5 +363,7 @@ def install_sampling_control_repair_v823() -> None:
     _BASE_TARGET_COMPATIBLE = v818._target_compatible_variant
     v818._target_compatible_variant = _target_compatible_variant_v823
 
+    v819._ResultAdapter = _ResultAdapterV823
+    v819._adaptive_progress_rows = _adaptive_progress_rows_v823
     _install_bounded_adaptive_runner()
     _INSTALLED = True
