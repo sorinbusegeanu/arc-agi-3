@@ -9,7 +9,7 @@ and validation beneath them. No legacy raw-action transfer authority is restored
 import os
 
 _INSTALLED = False
-_BASE_V829_PLAN_CHAIN = None
+_BASE_V831_PLAN_CHAIN = None
 _BASE_ENV_VALIDATE = None
 
 
@@ -20,7 +20,7 @@ def _grounded_plan_chain(self, context_signature, action_ids, **kwargs):
 
     mode = str(os.environ.get(v819._SAMPLING_MODE_ENV, v819.SamplingMode.DISCOVERY.value))
     if mode != v819.SamplingMode.TRANSFER.value:
-        return _BASE_V829_PLAN_CHAIN(self, context_signature, action_ids, **kwargs)
+        return _BASE_V831_PLAN_CHAIN(self, context_signature, action_ids, **kwargs)
 
     game = v837._current_game_id()
     if not game:
@@ -129,20 +129,21 @@ def _replay_segments_composed(service, candidate):
 
 
 def install_environment_neutrality_v837_fixups() -> None:
-    global _INSTALLED, _BASE_V829_PLAN_CHAIN, _BASE_ENV_VALIDATE
+    global _INSTALLED, _BASE_V831_PLAN_CHAIN, _BASE_ENV_VALIDATE
     if _INSTALLED:
         return
 
     from v8 import environment_neutrality_v837 as v837
     from v8 import learning_control_continuity_v826 as v826
     from v8 import learning_performance_repair_v824 as v824
-    from v8 import sampling_progress_control_v829 as v829
+    from v8 import sampling_portfolio_v831 as v831
     from v8 import trajectory_optimizer_convergence_v836 as v836
 
-    # Keep v8.29's public position under v8.24 exactly as installed. Grounding is
-    # inserted one layer lower, so v8.29/v8.24/v8.26 authority identities survive.
-    _BASE_V829_PLAN_CHAIN = v829._BASE_PLAN_CHAIN
-    v829._BASE_PLAN_CHAIN = _grounded_plan_chain
+    # Historical planner authorities remain untouched:
+    # v8.24 -> v8.29 -> v8.31.  Grounded cross-environment transfer is inserted
+    # beneath v8.31, where its non-TRANSFER behavior delegates transparently.
+    _BASE_V831_PLAN_CHAIN = v831._BASE_PLAN_CHAIN
+    v831._BASE_PLAN_CHAIN = _grounded_plan_chain
     v826._BASE_PLAN_CANDIDATES = v824._plan_candidates_v824
 
     # Custom validators remain custom. Environment factories opt into the generic
