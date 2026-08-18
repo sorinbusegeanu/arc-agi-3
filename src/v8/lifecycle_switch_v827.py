@@ -127,3 +127,8 @@ def install_lifecycle_switch_v827() -> None:
         install_restart_causal_progress_v844_fixups,
     )
     install_restart_causal_progress_v844_fixups()
+
+    # v8.8 design extension: preserve and learn from all observations emitted
+    # between two agent decision points without introducing additional actions.
+    from v8.within_action_temporal_v88 import install_within_action_temporal_v88
+    install_within_action_temporal_v88()
