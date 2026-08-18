@@ -56,7 +56,7 @@ class SamplingPersistenceV832Tests(unittest.TestCase):
             future_delta=0.0,
         )
 
-    def test_productive_singleton_extends_without_internal_length_limit(self):
+    def test_unproven_productive_singleton_does_not_auto_persist(self):
         sampler = portfolio.PortfolioSampler("ez02", seed=1)
         sampler.begin_lease(1)
         row = sampler._frontier(level=0, context=10, actions=(1, 2, 3, 4), history=())
@@ -79,26 +79,7 @@ class SamplingPersistenceV832Tests(unittest.TestCase):
             history_after=(3,),
         )
 
-        for step in range(2, 130):
-            action = sampler.forced_action(
-                level=0,
-                context=10 + step - 1,
-                actions=(1, 2, 3, 4),
-                history=(3,) * (step - 1),
-            )
-            self.assertEqual(action, 3)
-            self.assertEqual(v829._CONTROL_STATE.selection_source, "ACTION_PERSISTENCE")
-            self._observe(
-                sampler,
-                before_level=0,
-                before_context=10 + step - 1,
-                action=3,
-                after_level=0,
-                after_context=10 + step,
-                history_after=(3,) * step,
-            )
-
-        self.assertGreater(getattr(sampler, "_v832_persist_steps", 0), 64)
+        self.assertIsNone(getattr(sampler, "_v832_persist_action", None))
         self.assertFalse(hasattr(repair, "_MAX_ACTION_PERSISTENCE"))
 
     def test_level_progress_ends_rollout_and_exposes_transfer_probe(self):
