@@ -73,3 +73,6 @@ def install_lifecycle_switch_v827() -> None:
 
     from v8.runtime_observability_v836 import install_runtime_observability_v836
     install_runtime_observability_v836()
+
+    from v8.environment_neutrality_v837 import install_environment_neutrality_v837
+    install_environment_neutrality_v837()
