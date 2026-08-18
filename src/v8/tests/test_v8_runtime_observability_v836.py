@@ -47,6 +47,12 @@ class RuntimeObservabilityV836Tests(unittest.TestCase):
                 ):
                     print("v8 continuous: games=1", flush=True)
                     print("[12:34] graph source=empty(no-snapshot) nodes=0", flush=True)
+                    print(
+                        "[12:34] 20% - current_run_wins=100.0% "
+                        "current_run_levels_solved=100.0% "
+                        "current_run_solved_games=1/1 (ez01:B=25,L=60)",
+                        flush=True,
+                    )
                     for line in progress:
                         print(line, flush=True)
                     print("[12:34] sampling done", flush=True)
@@ -54,6 +60,10 @@ class RuntimeObservabilityV836Tests(unittest.TestCase):
             visible = terminal.getvalue()
             self.assertIn("v8 continuous: games=1", visible)
             self.assertIn("graph source=empty(no-snapshot)", visible)
+            self.assertIn("20% - current_run_wins=100.0%", visible)
+            self.assertIn("current_run_wins=100.0%", visible)
+            self.assertIn("current_run_levels_solved=100.0%", visible)
+            self.assertIn("current_run_solved_games=1/1", visible)
             self.assertIn("sampling done", visible)
             for line in progress:
                 self.assertNotIn(line, visible)

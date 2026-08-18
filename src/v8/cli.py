@@ -114,6 +114,18 @@ def _graph_load_line(*, snapshot_path: Path | None, restore_enabled: bool, nodes
     return f"graph source={source} nodes={int(nodes)}"
 
 
+def _restored_solved_games(runtime, games: tuple[str, ...]) -> tuple[str, ...]:
+    coordinator = getattr(runtime, "_v819_adaptive_learning", None)
+    if coordinator is None:
+        return ()
+    return tuple(
+        str(game)
+        for game in games
+        if str(getattr(coordinator.game_state(game), "value", "UNSOLVED"))
+        != "UNSOLVED"
+    )
+
+
 def run_continuous(args) -> int:
     if getattr(args, "show_best_trajectory", None):
         from v8.trajectory_inspection_v819 import show_best_trajectory
@@ -205,11 +217,23 @@ def run_continuous(args) -> int:
                 flush=True,
             )
             _log(_graph_load_line(snapshot_path=restore_source, restore_enabled=restore_enabled, nodes=loaded_nodes))
+            restored_solved = (
+                _restored_solved_games(runtime, tuple(games))
+                if restore_source is not None
+                else ()
+            )
+            if restored_solved:
+                print(
+                    f"v8 continuous: games {','.join(restored_solved)} "
+                    "have been solved before; optimizing solutions",
+                    flush=True,
+                )
             reporter = DedicatedReporter(
                 runtime._mp_ctx,
                 watermark=runtime._watermark,
                 actors=((job.actor_id, job.game_id) for job in jobs),
                 interval_seconds=args.progress_interval_seconds,
+                total_steps=total_steps,
             )
             reporter.start()
             if runtime.peers is not None:

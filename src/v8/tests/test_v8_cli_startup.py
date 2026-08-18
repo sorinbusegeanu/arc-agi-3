@@ -5,7 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from v8.cli import _graph_load_line, run_continuous
+from v8.cli import _graph_load_line, _restored_solved_games, run_continuous
 
 
 class StartupGraphLineTests(unittest.TestCase):
@@ -31,6 +31,29 @@ class StartupGraphLineTests(unittest.TestCase):
         self.assertEqual(
             _graph_load_line(snapshot_path=None, restore_enabled=False, nodes=0),
             "graph source=empty(--no-restore) nodes=0",
+        )
+
+    def test_restored_solved_games_are_selected_for_startup_message(self) -> None:
+        states = {
+            "ez01": SimpleNamespace(value="SOLVED_OPTIMIZING"),
+            "ls20": SimpleNamespace(value="SOLVED_STABLE"),
+            "tt01": SimpleNamespace(value="UNSOLVED"),
+        }
+        runtime = SimpleNamespace(
+            _v819_adaptive_learning=SimpleNamespace(
+                game_state=lambda game: states[game]
+            )
+        )
+
+        self.assertEqual(
+            _restored_solved_games(runtime, ("ez01", "tt01", "ls20")),
+            ("ez01", "ls20"),
+        )
+
+    def test_restored_solved_games_are_empty_without_coordinator(self) -> None:
+        self.assertEqual(
+            _restored_solved_games(SimpleNamespace(), ("ez01",)),
+            (),
         )
 
 
@@ -101,6 +124,7 @@ class HypothesisStartupDelayTests(unittest.TestCase):
 
         reporter_type.assert_called_once()
         self.assertEqual(reporter_type.call_args.kwargs["interval_seconds"], 60.0)
+        self.assertEqual(reporter_type.call_args.kwargs["total_steps"], 1)
         reporter.start.assert_called_once_with()
         reporter.close.assert_called_once_with()
         self.assertEqual(

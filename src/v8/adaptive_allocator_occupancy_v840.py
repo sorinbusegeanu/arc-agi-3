@@ -88,6 +88,22 @@ def _refill_idle_workers(idle_workers: set[int], assign) -> tuple[int, ...]:
     return tuple(assigned)
 
 
+def _occupancy_bounded_lease_steps(
+    recommended: int,
+    *,
+    available: int,
+    idle_slots: int,
+) -> int:
+    """Keep one large lease from starving the remaining idle actor slots."""
+
+    budget = max(0, int(available))
+    if budget <= 0:
+        return 0
+    slots = max(1, int(idle_slots))
+    fair_share = (budget + slots - 1) // slots
+    return min(budget, max(1, min(int(recommended), fair_share)))
+
+
 def _adaptive_run_actor_jobs_v840(
     runtime,
     jobs,
@@ -264,7 +280,11 @@ def _adaptive_run_actor_jobs_v840(
             )
         else:
             steps = coordinator.recommended_lease_steps(game, available)
-        steps = min(int(available), max(1, int(steps)))
+        steps = _occupancy_bounded_lease_steps(
+            int(steps),
+            available=int(available),
+            idle_slots=len(idle_workers),
+        )
         lease_id += 1
         excluded = (
             coordinator.alternative_exclusion(game)

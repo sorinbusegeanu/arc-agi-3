@@ -17,7 +17,7 @@ from v8.actor import (
 )
 from v8.evidence import EvidenceLedger, EvidenceRecord
 from v8.model import MemoryLevel, MemoryUid, ValidationState
-from v8.reporter import DedicatedReporter
+from v8.reporter import DedicatedReporter, format_budget_game_rate_line
 
 
 def evidence(evidence_id: str, *, watermark: int = 1) -> EvidenceRecord:
@@ -207,6 +207,17 @@ class ActorProgressFanoutTests(unittest.TestCase):
 
 
 class DedicatedReporterProcessTests(unittest.TestCase):
+    def test_budget_percentage_uses_total_actor_steps(self) -> None:
+        line = format_budget_game_rate_line(
+            (
+                ActorProgress(1, "tt01", 20, 0, 0, 0),
+                ActorProgress(2, "tt01", 30, 0, 0, 0),
+            ),
+            200,
+        )
+
+        self.assertTrue(line.startswith("25% - current_run_wins="))
+
     def test_process_reports_progress_only_without_hypothesis_stdout(self) -> None:
         method = "forkserver" if "forkserver" in mp.get_all_start_methods() else "spawn"
         ctx = mp.get_context(method)
@@ -218,6 +229,7 @@ class DedicatedReporterProcessTests(unittest.TestCase):
             actors=((1, "tt01"), (2, "tt02")),
             interval_seconds=0.3,
             output_queue=output,
+            total_steps=200,
         )
         try:
             reporter.start()
@@ -230,6 +242,7 @@ class DedicatedReporterProcessTests(unittest.TestCase):
                 output.get(timeout=0.1)
 
             game_line = output.get(timeout=3.0)
+            self.assertIn("10% - current_run_wins=50.0%", game_line)
             self.assertIn("current_run_wins=50.0%", game_line)
             self.assertIn("current_run_levels_solved=20.0%", game_line)
             self.assertIn("current_run_solved_games=1/2 (tt01:win_observed)", game_line)
