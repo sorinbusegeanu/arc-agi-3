@@ -65,3 +65,11 @@ def install_lifecycle_switch_v827() -> None:
 
     from v8.runtime_win_scope_v835 import install_runtime_win_scope_v835
     install_runtime_win_scope_v835()
+
+    from v8.trajectory_optimizer_convergence_v836 import (
+        install_trajectory_optimizer_convergence_v836,
+    )
+    install_trajectory_optimizer_convergence_v836()
+
+    from v8.runtime_observability_v836 import install_runtime_observability_v836
+    install_runtime_observability_v836()
