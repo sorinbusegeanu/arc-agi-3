@@ -163,12 +163,14 @@ class OptimizerScalingTests(unittest.TestCase):
             v818._ensure_validator = original_ensure
             v818._start_waiting_validators = original_start
 
-    def test_v830_budget_wrapper_remains_final_route_authority(self):
+    def test_v830_and_v819_wrappers_remain_final_route_authorities(self):
+        from v8 import adaptive_learning_allocation_v819 as v819
         from v8 import optimizer_budget_control_v830 as v830
         from v8 import trajectory_optimizer_v818 as v818
 
         self.assertIs(v818._route_candidate, v830._route_candidate_v830)
-        self.assertIs(v830._BASE_ROUTE_CANDIDATE, v841._route_candidate_base_v841)
+        self.assertIs(v830._BASE_ROUTE_CANDIDATE, v819._route_candidate_v819)
+        self.assertIs(v819._BASE_ROUTE_CANDIDATE, v841._route_candidate_base_v841)
 
 
 if __name__ == "__main__":
