@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import v8  # noqa: F401 - install chronological runtime stack
 from v8 import adaptive_allocator_occupancy_v840 as occupancy
 from v8 import adaptive_learning_allocation_v819 as v819
+from v8 import adaptive_learning_allocation_v819_performance_fix as perf
 from v8 import lease_dispatch_lifecycle_v843 as v843
 from v8.model import CognitiveState, MemoryUid, ValidationState
 
@@ -97,7 +98,7 @@ class LeaseDispatchLifecycleV843Tests(unittest.TestCase):
         self.assertEqual(assigned, list(range(1, 31)))
         self.assertEqual(view.refreshes, 0)
 
-    def test_restored_graph_initial_fill_dispatches_30_workers_from_one_coherent_index(self) -> None:
+    def test_restored_graph_initial_fill_never_rebuilds_lifecycle_index(self) -> None:
         coordinator, view = _solved_coordinator()
         assigned = []
 
@@ -119,12 +120,39 @@ class LeaseDispatchLifecycleV843Tests(unittest.TestCase):
 
         self.assertEqual(result, tuple(range(1, 31)))
         self.assertEqual(assigned, list(range(1, 31)))
+        self.assertEqual(view.refreshes, 0)
+        self.assertLess(elapsed, 0.25)
+
+    def test_non_dispatch_refresh_publishes_index_for_later_refills(self) -> None:
+        coordinator, view = _solved_coordinator()
+
+        self.assertIsNotNone(v843._dispatch_lifecycle_index(view))
         self.assertEqual(view.refreshes, 1)
-        self.assertLess(elapsed, 0.75)
+
+        workers = {1, 2}
+        occupancy._refill_idle_workers(
+            workers,
+            lambda _worker_id: coordinator.game_state("restored")
+            == v819.GameLearningState.SOLVED_OPTIMIZING,
+        )
+
+        self.assertEqual(workers, set())
+        self.assertEqual(view.refreshes, 1)
+
+    def test_allocation_telemetry_uses_cached_lifecycle_index(self) -> None:
+        coordinator, view = _solved_coordinator()
+
+        with v843._dispatch_lifecycle_cache():
+            rows = coordinator.telemetry()
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(view.refreshes, 0)
 
     def test_v843_is_final_refill_and_choose_mode_authority(self) -> None:
         self.assertIs(occupancy._refill_idle_workers, v843._refill_idle_workers_v843)
         self.assertIs(v819.AdaptiveLearningCoordinator.choose_mode, v843._choose_mode_v843)
+        self.assertIs(perf._write_allocation_log_live, v843._write_allocation_log_v843)
+        self.assertIs(perf._allocation_stdout_live, v843._allocation_stdout_v843)
 
 
 if __name__ == "__main__":

@@ -49,6 +49,35 @@ class LeaseDispatchContinuityV839Tests(unittest.TestCase):
             release.set()
             worker.close(timeout=1.0)
 
+    def test_progress_worker_coalesces_stale_pending_callbacks(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        consumed = []
+
+        def callback(value) -> None:
+            started.set()
+            if value == "first":
+                release.wait(1.0)
+            consumed.append(value)
+
+        worker = v839._AsyncQueueWorker(
+            callback,
+            name="test-coalesced-maintenance",
+            coalesce_pending=True,
+        )
+        try:
+            worker.submit("first")
+            self.assertTrue(started.wait(1.0))
+            worker.submit("stale-1")
+            worker.submit("stale-2")
+            worker.submit("latest")
+            release.set()
+            worker.flush(timeout=1.0)
+            self.assertEqual(consumed, ["first", "latest"])
+        finally:
+            release.set()
+            worker.close(timeout=1.0)
+
     def test_feedback_path_queues_during_sampling(self) -> None:
         consumed = []
         error_queue = queue.Queue()
@@ -67,6 +96,25 @@ class LeaseDispatchContinuityV839Tests(unittest.TestCase):
             worker.close(timeout=1.0)
 
         self.assertEqual(consumed, [("learning",)])
+
+    def test_sampling_completion_is_reported_before_maintenance_cleanup(self) -> None:
+        reporting = queue.Queue()
+        runtime = SimpleNamespace(_v839_sampling_active=False)
+
+        with patch.object(v839, "_BASE_RUN_ACTOR_JOBS", return_value=("done",)), patch.object(
+            v839, "_BASE_RETRY_DEFERRED"
+        ):
+            result = v839._run_actor_jobs_v839(
+                runtime,
+                (),
+                reporting_queue=reporting,
+            )
+
+        from v8.reporter import SAMPLING_COMPLETE
+
+        self.assertEqual(result, ("done",))
+        self.assertEqual(reporting.get_nowait(), SAMPLING_COMPLETE)
+        self.assertIs(runtime._v839_sampling_done_reported, True)
 
     def test_deferred_retry_is_bounded_per_pass(self) -> None:
         pending = [(object(), object()) for _ in range(6)]

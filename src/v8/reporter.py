@@ -10,12 +10,22 @@ from v8.diagnostics import format_game_rate_line
 from v8.evidence import EvidenceRecord
 
 
+SAMPLING_COMPLETE = "v8:reporter:sampling-complete"
+
+
 def _emit_line(message: str, output_queue: mp.Queue | None) -> None:
     line = f'[{time.strftime("%H:%M")}] {message}'
     if output_queue is None:
         print(line, flush=True)
     else:
         output_queue.put(line)
+
+
+def _emit_sampling_complete(output_queue: mp.Queue | None) -> None:
+    _emit_line("sampling done", output_queue)
+    if output_queue is not None:
+        output_queue.close()
+        output_queue.join_thread()
 
 
 def format_budget_game_rate_line(
@@ -62,6 +72,9 @@ def reporting_worker(
             # Evidence remains authoritative in the runtime ledger and final reports.
             # The dedicated stdout reporter intentionally ignores it for now.
             pass
+        elif row == SAMPLING_COMPLETE:
+            _emit_sampling_complete(output_queue)
+            return
 
         now = time.monotonic()
         if now < next_report:

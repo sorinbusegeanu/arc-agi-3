@@ -36,9 +36,17 @@ class LeaseDispatchMetrics:
 class _AsyncQueueWorker:
     """Single ordered maintenance worker; submit() never runs work inline."""
 
-    def __init__(self, callback, *, name: str, error_queue=None) -> None:
+    def __init__(
+        self,
+        callback,
+        *,
+        name: str,
+        error_queue=None,
+        coalesce_pending: bool = False,
+    ) -> None:
         self.callback = callback
         self.error_queue = error_queue
+        self._coalesce_pending = bool(coalesce_pending)
         self._queue: queue.Queue[object | None] = queue.Queue()
         self._lock = threading.Lock()
         self._error: BaseException | None = None
@@ -63,9 +71,19 @@ class _AsyncQueueWorker:
         with self._lock:
             if self._closed:
                 raise RuntimeError(f"{self._thread.name} is closed")
+            if self._coalesce_pending:
+                while True:
+                    try:
+                        stale = self._queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if stale is None:
+                        self._queue.put_nowait(None)
+                        self._queue.task_done()
+                        break
+                    self._queue.task_done()
             self._submitted += 1
-        self._queue.put_nowait(value)
-        with self._lock:
+            self._queue.put_nowait(value)
             self._max_pending = max(
                 self._max_pending, int(self._queue.unfinished_tasks)
             )
@@ -301,6 +319,7 @@ def _run_actor_jobs_v839(runtime, jobs, **kwargs):
         callback_worker = _AsyncQueueWorker(
             lambda rows: callback(tuple(rows)),
             name="v8-progress-maintenance",
+            coalesce_pending=True,
         )
         call_kwargs = dict(kwargs)
         call_kwargs["progress_callback"] = callback_worker.submit
@@ -316,6 +335,13 @@ def _run_actor_jobs_v839(runtime, jobs, **kwargs):
         raise
     finally:
         runtime._v839_sampling_active = prior
+
+    reporting_queue = kwargs.get("reporting_queue")
+    if reporting_queue is not None:
+        from v8.reporter import SAMPLING_COMPLETE
+
+        reporting_queue.put_nowait(SAMPLING_COMPLETE)
+        runtime._v839_sampling_done_reported = True
 
     feedback = getattr(runtime, "_v839_actor_feedback", None)
     if feedback is not None:

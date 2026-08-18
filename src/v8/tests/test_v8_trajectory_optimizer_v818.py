@@ -186,6 +186,23 @@ class ValidatorPoolTests(unittest.TestCase):
             self.assertIsNot(service._v818_game_queues["a"], service._v818_game_queues["b"])
 
 
+class InboxIngestionTests(unittest.TestCase):
+    def test_v819_duplicate_is_removed_instead_of_blocking_quiescence(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            service = TrajectoryOptimizationService(Path(root), validator=lambda _candidate: None)
+            row = source((1, 2, 3))
+            pending = service.inbox / "duplicate.json"
+            optimizer._atomic_json(pending, row.to_dict())
+            service._v819_lock = threading.Lock()
+            service._v819_source_seen = {row.trajectory_id}
+
+            with patch.object(service, "submit_trajectory") as submit:
+                v818._ingest_inbox_v818(service)
+
+            self.assertFalse(pending.exists())
+            submit.assert_not_called()
+
+
 class SafeActivationTests(unittest.TestCase):
     def test_target_compatible_variant_can_activate_without_seed_or_exact_prefix(self) -> None:
         outcome = MemoryUid.from_key(MemoryLevel.M6, MemoryType.OUTCOME, (1, 2, 3))

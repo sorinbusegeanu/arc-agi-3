@@ -27,6 +27,35 @@ _MAX_PARENT_MESSAGES_PER_CYCLE = 256
 _LEARNING_PUBLISH_INTERVAL_SECONDS = 5.0
 _ACTOR_GRAPH_CHECK_INTERVAL_STEPS = 1_000
 _ACTOR_STARTUP_TIMEOUT_SECONDS = 300.0
+_ACTOR_RING_RETRY_SECONDS = 0.001
+
+
+def _publish_actor_packet(
+    ring,
+    watermark,
+    packet_for_watermark: Callable[[int], bytes],
+    *,
+    stop_event,
+    snapshot_freeze=None,
+    retry_seconds: float = _ACTOR_RING_RETRY_SECONDS,
+) -> int | None:
+    """Publish one ordered actor packet without waiting under the global lock."""
+
+    delay = max(0.0, float(retry_seconds))
+    while not stop_event.is_set():
+        if snapshot_freeze is not None and snapshot_freeze.is_set():
+            stop_event.wait(0.002)
+            continue
+        with watermark.get_lock():
+            current = int(watermark.value) + 1
+            packet = packet_for_watermark(current)
+            # A timed wait here used to hold the global watermark lock for up
+            # to 50 ms. Under pressure that serialized the complete actor pool.
+            if ring.put(packet, timeout=0.0):
+                watermark.value = current
+                return current
+        stop_event.wait(delay)
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -519,41 +548,38 @@ def actor_worker(
 
             next_sequence = sequence + 1
             producer_sequence = sequence_base + next_sequence
-            accepted = False
-            current_watermark = 0
-            while not stop_event.is_set():
-                if snapshot_freeze is not None and snapshot_freeze.is_set():
-                    time.sleep(0.002)
-                    continue
-                with watermark.get_lock():
-                    current_watermark = int(watermark.value) + 1
-                    event = ExperienceEvent(
-                        event_id=EventId.from_producer(job.actor_id, producer_sequence),
-                        watermark=current_watermark,
-                        producer_id=job.actor_id,
-                        producer_sequence=producer_sequence,
-                        source_game_hash=stable_u64(job.game_id, person=b"v8-game"),
-                        global_step=current_watermark,
-                        context_signature=context,
-                        action_id=action,
-                        outcome_signature=outcome,
-                        family_signature=family,
-                        carrier_signature=carrier,
-                        future_option_delta=future_delta,
-                        changed_cells=changed,
-                        terminal_polarity=terminal_polarity,
-                        trajectory_signature=rolling_trajectory,
-                        next_context_signature=after_context,
-                        prediction_error=prediction_error,
-                    )
-                    packet = encode_pipeline(PipelineEvent(event))
-                    if ring.put(packet, timeout=0.05):
-                        watermark.value = current_watermark
-                        accepted = True
-                        break
-                time.sleep(0)
-            if not accepted:
+            def packet_for_watermark(current_watermark: int) -> bytes:
+                event = ExperienceEvent(
+                    event_id=EventId.from_producer(job.actor_id, producer_sequence),
+                    watermark=current_watermark,
+                    producer_id=job.actor_id,
+                    producer_sequence=producer_sequence,
+                    source_game_hash=stable_u64(job.game_id, person=b"v8-game"),
+                    global_step=current_watermark,
+                    context_signature=context,
+                    action_id=action,
+                    outcome_signature=outcome,
+                    family_signature=family,
+                    carrier_signature=carrier,
+                    future_option_delta=future_delta,
+                    changed_cells=changed,
+                    terminal_polarity=terminal_polarity,
+                    trajectory_signature=rolling_trajectory,
+                    next_context_signature=after_context,
+                    prediction_error=prediction_error,
+                )
+                return encode_pipeline(PipelineEvent(event))
+
+            published_watermark = _publish_actor_packet(
+                ring,
+                watermark,
+                packet_for_watermark,
+                stop_event=stop_event,
+                snapshot_freeze=snapshot_freeze,
+            )
+            if published_watermark is None:
                 break
+            current_watermark = int(published_watermark)
             sequence = next_sequence
 
             significance = _local_significance(changed, future_delta)

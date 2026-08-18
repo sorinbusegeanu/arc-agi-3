@@ -413,6 +413,17 @@ def _ingest_inbox_v818(service) -> None:
             row = optimizer.SuccessfulTrajectory.from_dict(raw)
             with service._lock:
                 duplicate = row.trajectory_id in service._seen_sources
+            # v8.19 routes sampler trajectories directly to source validation
+            # and tracks them separately from the original optimizer sources.
+            # Treat those as consumed too; otherwise submit_trajectory() rejects
+            # every duplicate while the inbox file remains forever, preventing
+            # runtime shutdown from ever reaching quiescence.
+            v819_lock = getattr(service, "_v819_lock", None)
+            if not duplicate and v819_lock is not None:
+                with v819_lock:
+                    duplicate = row.trajectory_id in getattr(
+                        service, "_v819_source_seen", ()
+                    )
             if duplicate:
                 remove = True
             else:

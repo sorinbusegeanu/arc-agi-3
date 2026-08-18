@@ -250,6 +250,9 @@ def _reporting_worker_v836(
             latest[int(row.actor_id)] = row
         elif isinstance(row, EvidenceRecord):
             evidence_by_id[str(row.evidence_id)] = row
+        elif row == reporter.SAMPLING_COMPLETE:
+            reporter._emit_sampling_complete(output_queue)
+            return
 
         now = time.monotonic()
         if now >= next_report:

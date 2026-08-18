@@ -7,6 +7,7 @@ import time
 import unittest
 from pathlib import Path
 
+from v8.actor import _publish_actor_packet
 from v8.capacity import (
     DEFAULT_ACTION_CAPACITY,
     DEFAULT_EDGE_CAPACITY,
@@ -19,6 +20,71 @@ from v8.ring import SharedRingBuffer
 
 
 class BackpressureTests(unittest.TestCase):
+    def test_actor_ring_retry_releases_watermark_lock_before_waiting(self) -> None:
+        class ProbeLock:
+            held = False
+
+            def __enter__(self):
+                self.held = True
+                return self
+
+            def __exit__(self, *_args):
+                self.held = False
+
+        class Watermark:
+            value = 7
+
+            def __init__(self, lock) -> None:
+                self.lock = lock
+
+            def get_lock(self):
+                return self.lock
+
+        class Ring:
+            def __init__(self, lock) -> None:
+                self.lock = lock
+                self.timeouts: list[float] = []
+
+            def put(self, _packet, *, timeout=None) -> bool:
+                self.assert_lock_held()
+                self.timeouts.append(float(timeout))
+                return len(self.timeouts) > 1
+
+            def assert_lock_held(self) -> None:
+                if not self.lock.held:
+                    raise AssertionError("watermark lock must order the nonblocking put")
+
+        class Stop:
+            def __init__(self, lock) -> None:
+                self.lock = lock
+                self.waits: list[float] = []
+
+            def is_set(self) -> bool:
+                return False
+
+            def wait(self, timeout) -> bool:
+                if self.lock.held:
+                    raise AssertionError("backpressure wait retained the watermark lock")
+                self.waits.append(float(timeout))
+                return False
+
+        lock = ProbeLock()
+        watermark = Watermark(lock)
+        ring = Ring(lock)
+        stop = Stop(lock)
+
+        published = _publish_actor_packet(
+            ring,
+            watermark,
+            lambda value: str(value).encode("ascii"),
+            stop_event=stop,
+        )
+
+        self.assertEqual(published, 8)
+        self.assertEqual(watermark.value, 8)
+        self.assertEqual(ring.timeouts, [0.0, 0.0])
+        self.assertEqual(stop.waits, [0.001])
+
     def test_temporary_full_ring_waits_instead_of_failing(self) -> None:
         ring = SharedRingBuffer(capacity=1, slot_size=8)
         stop = mp.Event()

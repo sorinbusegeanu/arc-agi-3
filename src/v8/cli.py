@@ -263,7 +263,8 @@ def run_continuous(args) -> int:
                 os.environ[LIFECYCLE_ENV] = previous_lifecycle
 
         stop_reporter()
-        _log("sampling done")
+        if getattr(runtime, "_v839_sampling_done_reported", False) is not True:
+            _log("sampling done")
         runtime.wait_quiescent(timeout=args.drain_timeout)
 
         if not args.no_automatic_experiments and not args.no_peers:

@@ -17,7 +17,7 @@ from v8.actor import (
 )
 from v8.evidence import EvidenceLedger, EvidenceRecord
 from v8.model import MemoryLevel, MemoryUid, ValidationState
-from v8.reporter import DedicatedReporter, format_budget_game_rate_line
+from v8.reporter import SAMPLING_COMPLETE, DedicatedReporter, format_budget_game_rate_line
 
 
 def evidence(evidence_id: str, *, watermark: int = 1) -> EvidenceRecord:
@@ -249,6 +249,32 @@ class DedicatedReporterProcessTests(unittest.TestCase):
             self.assertNotIn("hypotheses", game_line)
             with self.assertRaises(queue.Empty):
                 output.get(timeout=0.15)
+        finally:
+            reporter.close()
+            output.close()
+            output.join_thread()
+
+    def test_sampling_complete_stops_periodic_reports_immediately(self) -> None:
+        method = "forkserver" if "forkserver" in mp.get_all_start_methods() else "spawn"
+        ctx = mp.get_context(method)
+        output = ctx.Queue()
+        watermark = ctx.Value("Q", 0)
+        reporter = DedicatedReporter(
+            ctx,
+            watermark=watermark,
+            actors=((1, "tt01"),),
+            interval_seconds=60.0,
+            output_queue=output,
+            total_steps=100,
+        )
+        try:
+            reporter.start()
+            reporter.progress_queue.put(SAMPLING_COMPLETE)
+            self.assertIn("sampling done", output.get(timeout=3.0))
+            reporter._process.join(timeout=3.0)
+            self.assertEqual(reporter._process.exitcode, 0)
+            with self.assertRaises(queue.Empty):
+                output.get(timeout=0.1)
         finally:
             reporter.close()
             output.close()
