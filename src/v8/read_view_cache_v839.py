@@ -2,12 +2,15 @@ from __future__ import annotations
 
 """v8.39 coherent read-index reuse for graph-heavy parent maintenance."""
 
+import threading
+
 from v8.model import MemoryUid, RelationType
 
 
 _INSTALLED = False
 _BASE_STABLE_RECORDS_WITH_VERSION = None
 _BASE_NODE_RECORDS = None
+_INDEX_LOCK = threading.RLock()
 
 
 def _stable_records_with_version_v839(self, arena, *, timeout: float = 1.0):
@@ -32,28 +35,29 @@ def _cached_node_versions(self) -> tuple[int, ...] | None:
 
 
 def _node_records_v839(self, *, level=None):
-    wanted = None if level is None else int(level)
-    versions = _cached_node_versions(self)
-    cached_version = getattr(self, "_v839_node_query_version", None)
-    cache = getattr(self, "_v839_node_query_cache", None)
-    if versions is not None and versions == cached_version and isinstance(cache, dict):
-        current = tuple(int(arena.sequence) for arena in self._nodes)
-        if all(
-            (sequence & 1) or sequence == version
-            for sequence, version in zip(current, versions, strict=True)
-        ):
-            hit = cache.get(wanted)
-            if hit is not None:
-                return hit
+    with _INDEX_LOCK:
+        wanted = None if level is None else int(level)
+        versions = _cached_node_versions(self)
+        cached_version = getattr(self, "_v839_node_query_version", None)
+        cache = getattr(self, "_v839_node_query_cache", None)
+        if versions is not None and versions == cached_version and isinstance(cache, dict):
+            current = tuple(int(arena.sequence) for arena in self._nodes)
+            if all(
+                (sequence & 1) or sequence == version
+                for sequence, version in zip(current, versions, strict=True)
+            ):
+                hit = cache.get(wanted)
+                if hit is not None:
+                    return hit
 
-    rows = tuple(_BASE_NODE_RECORDS(self, level=level))
-    stable_versions = _cached_node_versions(self)
-    if stable_versions is not None:
-        if stable_versions != getattr(self, "_v839_node_query_version", None):
-            self._v839_node_query_version = stable_versions
-            self._v839_node_query_cache = {}
-        self._v839_node_query_cache[wanted] = rows
-    return rows
+        rows = tuple(_BASE_NODE_RECORDS(self, level=level))
+        stable_versions = _cached_node_versions(self)
+        if stable_versions is not None:
+            if stable_versions != getattr(self, "_v839_node_query_version", None):
+                self._v839_node_query_version = stable_versions
+                self._v839_node_query_cache = {}
+            self._v839_node_query_cache[wanted] = rows
+        return rows
 
 
 def _refresh_provenance_index(self) -> None:
@@ -90,34 +94,35 @@ def _source_games_v839(
     *,
     max_depth: int = 8,
 ) -> frozenset[int]:
-    _refresh_provenance_index(self)
-    depth = max(0, int(max_depth))
-    cache = self._v839_source_games_cache
-    key = (uid, depth)
-    cached = cache.get(key)
-    if cached is not None:
-        return cached
+    with _INDEX_LOCK:
+        _refresh_provenance_index(self)
+        depth = max(0, int(max_depth))
+        cache = self._v839_source_games_cache
+        key = (uid, depth)
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
 
-    direct = self._v839_direct_games
-    parents = self._v839_provenance_parents
-    games = set(direct.get(uid, ()))
-    frontier = {uid}
-    visited = {uid}
-    for _ in range(depth):
-        following: set[MemoryUid] = set()
-        for current in frontier:
-            for parent in parents.get(current, ()):
-                games.update(direct.get(parent, ()))
-                if parent not in visited:
-                    visited.add(parent)
-                    following.add(parent)
-        if not following:
-            break
-        frontier = following
+        direct = self._v839_direct_games
+        parents = self._v839_provenance_parents
+        games = set(direct.get(uid, ()))
+        frontier = {uid}
+        visited = {uid}
+        for _ in range(depth):
+            following: set[MemoryUid] = set()
+            for current in frontier:
+                for parent in parents.get(current, ()):
+                    games.update(direct.get(parent, ()))
+                    if parent not in visited:
+                        visited.add(parent)
+                        following.add(parent)
+            if not following:
+                break
+            frontier = following
 
-    result = frozenset(games)
-    cache[key] = result
-    return result
+        result = frozenset(games)
+        cache[key] = result
+        return result
 
 
 def install_read_view_cache_v839() -> None:
