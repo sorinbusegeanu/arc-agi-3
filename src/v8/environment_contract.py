@@ -248,7 +248,7 @@ class OptimizationScope:
 def _uid_parts(uid) -> tuple[int, int]:
     if uid is None or bool(getattr(uid, "is_zero", True)):
         return 0, 0
-    return int(getattr(uid, "hi", 0)), int(getattr(uid, "lo", 0)
+    return int(getattr(uid, "hi", 0)), int(getattr(uid, "lo", 0))
 
 
 def target_boundary(target) -> BoundaryEvent:
