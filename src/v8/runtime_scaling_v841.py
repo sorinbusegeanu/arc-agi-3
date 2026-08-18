@@ -23,6 +23,8 @@ _BASE_PEER_CLOSE = None
 _BASE_PEER_RUN_ONCE = None
 _BASE_SERVICE_STOP = None
 _BASE_QUEUE_DEPTH = None
+_BASE_RUNTIME_IS_QUIESCENT = None
+_BASE_RUNTIME_CLOSE = None
 
 
 class _SqliteBatchWorker:
@@ -498,25 +500,80 @@ def _queue_depth_v841(service) -> int:
     return base + (0 if worker is None else int(worker.pending_count()))
 
 
+def _optimizer_idle_v841(service) -> bool:
+    if service is None:
+        return True
+    worker = getattr(service, "_v841_candidate_overflow", None)
+    if worker is not None and worker.pending_count() > 0:
+        worker._wake.set()
+        return False
+    if service._sources.unfinished_tasks > 0:
+        return False
+    with service._lock:
+        active = int(service._active_validations)
+    with service._v818_validator_lock:
+        queues = tuple(service._v818_game_queues.values())
+    return bool(
+        active == 0
+        and all(queue_.unfinished_tasks == 0 for queue_ in queues)
+        and not any(service.inbox.glob("*.json"))
+    )
+
+
+def _runtime_is_quiescent_v841(self) -> bool:
+    if not _BASE_RUNTIME_IS_QUIESCENT(self):
+        return False
+    if not (
+        bool(getattr(self, "_sampling_complete", False))
+        or bool(getattr(self, "_v841_optimizer_drain", False))
+    ):
+        return True
+    return _optimizer_idle_v841(getattr(self, "_v814_trajectory_optimizer", None))
+
+
+def _runtime_close_v841(self, *, normal: bool = True, timeout: float = 120.0):
+    if normal and getattr(self, "_v814_trajectory_optimizer", None) is not None:
+        self._v841_optimizer_drain = True
+        try:
+            self.wait_quiescent(
+                timeout=max(0.1, float(timeout)),
+                resume_peers=False,
+                settle_peers=False,
+            )
+        finally:
+            self._v841_optimizer_drain = False
+    return _BASE_RUNTIME_CLOSE(self, normal=normal, timeout=timeout)
+
+
 def _service_stop_v841(self, *, drain: bool = True, timeout: float = 10.0) -> None:
     worker = getattr(self, "_v841_candidate_overflow", None)
-    if worker is not None and drain and worker.pending_count() > 0:
-        worker.drain(timeout=max(0.1, float(timeout) * 0.5))
+    deadline = time.monotonic() + max(0.1, float(timeout))
+    if drain:
+        while not _optimizer_idle_v841(self) and time.monotonic() < deadline:
+            self.raise_if_failed()
+            time.sleep(0.02)
+        if not _optimizer_idle_v841(self):
+            pending = 0 if worker is None else worker.pending_count()
+            raise TimeoutError(
+                "v8 optimizer did not drain "
+                f"(overflow={pending}, queued={_queue_depth_v841(self)})"
+            )
     try:
         return _BASE_SERVICE_STOP(
             self,
             drain=drain,
-            timeout=max(0.1, float(timeout) * (0.5 if worker is not None else 1.0)),
+            timeout=max(0.1, deadline - time.monotonic()),
         )
     finally:
         if worker is not None:
-            worker.close(drain=False, timeout=max(0.1, float(timeout) * 0.5))
+            worker.close(drain=False, timeout=max(0.1, deadline - time.monotonic()))
             self._v841_candidate_overflow = None
 
 
 def install_runtime_scaling_v841() -> None:
     global _INSTALLED, _BASE_PEER_INIT, _BASE_PEER_CLOSE, _BASE_PEER_RUN_ONCE
     global _BASE_SERVICE_STOP, _BASE_QUEUE_DEPTH
+    global _BASE_RUNTIME_IS_QUIESCENT, _BASE_RUNTIME_CLOSE
     if _INSTALLED:
         return
 
@@ -524,6 +581,7 @@ def install_runtime_scaling_v841() -> None:
     from v8 import optimizer_budget_control_v830 as v830
     from v8 import trajectory_optimizer_v818 as v818
     from v8.peers_v82 import V82DevelopmentalPeerSupervisor
+    from v8.runtime_v82 import V82ContinuousMemoryRuntime
     from v8.trajectory_optimizer_v814 import TrajectoryOptimizationService
 
     v839._feedback_worker = _feedback_worker_v841
@@ -544,4 +602,9 @@ def install_runtime_scaling_v841() -> None:
 
     _BASE_SERVICE_STOP = TrajectoryOptimizationService.stop
     TrajectoryOptimizationService.stop = _service_stop_v841
+
+    _BASE_RUNTIME_IS_QUIESCENT = V82ContinuousMemoryRuntime._is_quiescent
+    _BASE_RUNTIME_CLOSE = V82ContinuousMemoryRuntime.close
+    V82ContinuousMemoryRuntime._is_quiescent = _runtime_is_quiescent_v841
+    V82ContinuousMemoryRuntime.close = _runtime_close_v841
     _INSTALLED = True

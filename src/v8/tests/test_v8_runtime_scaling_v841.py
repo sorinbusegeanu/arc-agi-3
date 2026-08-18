@@ -172,6 +172,63 @@ class OptimizerScalingTests(unittest.TestCase):
         self.assertIs(v830._BASE_ROUTE_CANDIDATE, v819._route_candidate_v819)
         self.assertIs(v819._BASE_ROUTE_CANDIDATE, v841._route_candidate_base_v841)
 
+    def test_post_sampling_quiescence_includes_optimizer_overflow(self):
+        pending = SimpleNamespace(value=1)
+        worker = SimpleNamespace(
+            pending_count=lambda: pending.value,
+            _wake=threading.Event(),
+        )
+        service = SimpleNamespace(
+            _v841_candidate_overflow=worker,
+            _sources=SimpleNamespace(unfinished_tasks=0),
+            _lock=threading.Lock(),
+            _active_validations=0,
+            _v818_validator_lock=threading.Lock(),
+            _v818_game_queues={},
+            inbox=Path("unused-v841-inbox"),
+        )
+        runtime = SimpleNamespace(
+            _sampling_complete=True,
+            _v841_optimizer_drain=False,
+            _v814_trajectory_optimizer=service,
+        )
+        original = v841._BASE_RUNTIME_IS_QUIESCENT
+        v841._BASE_RUNTIME_IS_QUIESCENT = lambda _runtime: True
+        try:
+            self.assertFalse(v841._runtime_is_quiescent_v841(runtime))
+            self.assertTrue(worker._wake.is_set())
+            pending.value = 0
+            self.assertTrue(v841._runtime_is_quiescent_v841(runtime))
+        finally:
+            v841._BASE_RUNTIME_IS_QUIESCENT = original
+
+    def test_normal_runtime_close_drains_optimizer_before_base_close(self):
+        calls = []
+        runtime = SimpleNamespace(
+            _v814_trajectory_optimizer=object(),
+            _v841_optimizer_drain=False,
+        )
+
+        def wait_quiescent(**kwargs):
+            self.assertTrue(runtime._v841_optimizer_drain)
+            calls.append(("drain", kwargs))
+
+        runtime.wait_quiescent = wait_quiescent
+        original = v841._BASE_RUNTIME_CLOSE
+        v841._BASE_RUNTIME_CLOSE = lambda _runtime, **kwargs: calls.append(
+            ("close", kwargs)
+        )
+        try:
+            v841._runtime_close_v841(runtime, normal=True, timeout=300.0)
+        finally:
+            v841._BASE_RUNTIME_CLOSE = original
+
+        self.assertEqual([name for name, _kwargs in calls], ["drain", "close"])
+        self.assertEqual(calls[0][1]["timeout"], 300.0)
+        self.assertFalse(calls[0][1]["resume_peers"])
+        self.assertFalse(calls[0][1]["settle_peers"])
+        self.assertFalse(runtime._v841_optimizer_drain)
+
 
 if __name__ == "__main__":
     unittest.main()
