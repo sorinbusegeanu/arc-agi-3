@@ -33,18 +33,23 @@ def _target_identity_parts(target) -> tuple[object, ...]:
 
 
 def _anchor_hash_v837(anchor, target) -> int:
+    """Seedless anchor identity with generic target semantics."""
     from v8 import trajectory_optimizer_v814 as optimizer
     from v8.model import stable_u64
 
     value = stable_u64(
         str(anchor.source_id),
-        int(anchor.seed),
         optimizer.action_sequence_hash(anchor.prefix_actions),
         person=b"v8.37-anchor",
     )
     for index, part in enumerate(_target_identity_parts(target)):
         value = stable_u64(value, index, part, person=b"v8.37-anchor")
     return int(value)
+
+
+def _seedless_anchor_hash_v837(optimizer, anchor, target) -> int:
+    del optimizer
+    return _anchor_hash_v837(anchor, target)
 
 
 def _target_key_v837(source) -> tuple[object, ...]:
@@ -88,8 +93,9 @@ def install_environment_neutrality_v837_integrity() -> None:
     from v8 import trajectory_optimizer_v814 as optimizer
     from v8 import trajectory_optimizer_v818 as v818
 
-    # Generic target identity distinguishes valence/outcome scopes without relying
-    # on ARC labels. Existing serialized IDs remain readable and are not rewritten.
+    # v8.18 removed execution seed from identity. v8.37 preserves that property
+    # while replacing ARC terminal labels with generic boundary/outcome semantics.
+    v818._seedless_anchor_hash = _seedless_anchor_hash_v837
     optimizer._anchor_hash = _anchor_hash_v837
     v818._target_key = _target_key_v837
 
