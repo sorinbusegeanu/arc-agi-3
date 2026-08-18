@@ -1,0 +1,547 @@
+from __future__ import annotations
+
+"""v8.41: bound maintenance state and remove remaining control-plane stalls."""
+
+import pickle
+import queue
+import sqlite3
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+
+_INSTALLED = False
+_DEFERRED_INTERVAL_SECONDS = 0.05
+_DEFERRED_TIME_BUDGET_SECONDS = 0.025
+_DEFERRED_CHUNK_SIZE = 16
+_OPTIMIZER_OVERFLOW_PER_GAME = 256
+_OPTIMIZER_DISPATCH_INTERVAL_SECONDS = 0.02
+
+_BASE_PEER_INIT = None
+_BASE_PEER_CLOSE = None
+_BASE_PEER_RUN_ONCE = None
+_BASE_SERVICE_STOP = None
+_BASE_QUEUE_DEPTH = None
+
+
+class _SqliteBatchWorker:
+    """Bound actor-feedback RAM by buffering batches in a small SQLite queue."""
+
+    def __init__(self, callback, *, name: str, root: str | Path, error_queue=None) -> None:
+        self.callback = callback
+        self.error_queue = error_queue
+        self.path = Path(root) / "feedback_queue.sqlite3"
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self._done = threading.Condition(self._lock)
+        self._wake = threading.Event()
+        self._closed = False
+        self._error: BaseException | None = None
+        self._submitted = self._completed = self._max_pending = 0
+        self._writer = sqlite3.connect(self.path, timeout=0.1, check_same_thread=False)
+        self._writer.execute("PRAGMA journal_mode=WAL")
+        self._writer.execute("PRAGMA synchronous=NORMAL")
+        self._writer.execute(
+            "CREATE TABLE IF NOT EXISTS feedback (id INTEGER PRIMARY KEY, payload BLOB NOT NULL)"
+        )
+        # This is a runtime queue, not durable evidence. Never replay an interrupted
+        # callback from a previous process because actor feedback is not idempotent.
+        self._writer.execute("DELETE FROM feedback")
+        self._writer.commit()
+        self._thread = threading.Thread(target=self._run, name=name, daemon=True)
+        self._thread.start()
+
+    def submit(self, value) -> None:
+        payload = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+        with self._lock:
+            if self._error is not None:
+                error = self._error
+                raise RuntimeError(
+                    f"{self._thread.name} failed: {type(error).__name__}: {error}"
+                ) from error
+            if self._closed:
+                raise RuntimeError(f"{self._thread.name} is closed")
+            self._writer.execute("INSERT INTO feedback(payload) VALUES (?)", (payload,))
+            self._writer.commit()
+            self._submitted += 1
+            self._max_pending = max(
+                self._max_pending, self._submitted - self._completed
+            )
+        self._wake.set()
+
+    def _run(self) -> None:
+        reader = sqlite3.connect(self.path, timeout=0.1)
+        reader.execute("PRAGMA journal_mode=WAL")
+        try:
+            while True:
+                with self._lock:
+                    if self._closed and self._completed >= self._submitted:
+                        return
+                rows = reader.execute(
+                    "SELECT id, payload FROM feedback ORDER BY id LIMIT 32"
+                ).fetchall()
+                if not rows:
+                    self._wake.clear()
+                    self._wake.wait(0.05)
+                    continue
+                decoded = tuple(
+                    item
+                    for _row_id, payload in rows
+                    for item in tuple(pickle.loads(payload))
+                )
+                ids = tuple(int(row_id) for row_id, _payload in rows)
+                # Match v8.39 failure semantics: dequeue before callback. A failed
+                # callback is surfaced to runtime and terminates the maintenance lane.
+                placeholders = ",".join("?" for _ in ids)
+                reader.execute(f"DELETE FROM feedback WHERE id IN ({placeholders})", ids)
+                reader.commit()
+                try:
+                    self.callback(decoded)
+                except BaseException as exc:
+                    with self._done:
+                        self._error = exc
+                        self._done.notify_all()
+                    if self.error_queue is not None:
+                        try:
+                            self.error_queue.put_nowait(
+                                (self._thread.name, type(exc).__name__, str(exc))
+                            )
+                        except BaseException:
+                            pass
+                    return
+                with self._done:
+                    self._completed += len(rows)
+                    self._done.notify_all()
+        finally:
+            reader.close()
+
+    def flush(self, timeout: float = 300.0) -> None:
+        with self._done:
+            finished = self._done.wait_for(
+                lambda: self._completed >= self._submitted or self._error is not None,
+                timeout=max(0.01, float(timeout)),
+            )
+            pending = max(0, self._submitted - self._completed)
+            error = self._error
+        if error is not None:
+            raise RuntimeError(
+                f"{self._thread.name} failed: {type(error).__name__}: {error}"
+            ) from error
+        if not finished or pending:
+            raise TimeoutError(f"{self._thread.name} did not drain (pending={pending})")
+
+    def close(self, timeout: float = 300.0) -> None:
+        with self._lock:
+            if self._closed:
+                return
+        self.flush(timeout)
+        with self._lock:
+            self._closed = True
+        self._wake.set()
+        self._thread.join(timeout=max(0.01, float(timeout)))
+        if self._thread.is_alive():
+            raise TimeoutError(f"{self._thread.name} did not stop")
+        with self._lock:
+            self._writer.close()
+
+    def metrics(self) -> tuple[int, int, int, int]:
+        with self._lock:
+            return (
+                int(self._submitted),
+                int(self._completed),
+                max(0, int(self._submitted) - int(self._completed)),
+                int(self._max_pending),
+            )
+
+
+class _AdaptiveDeferredRetryWorker:
+    """Drain deferred targets by time budget and retry only when inputs change."""
+
+    def __init__(self, runtime) -> None:
+        self.runtime = runtime
+        self._request = threading.Event()
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._error: BaseException | None = None
+        self._passes = self._examined = self._resolved = 0
+        self._last_seconds = self._max_seconds = 0.0
+        self._last_signature = None
+        self._force_resume = False
+        self._thread = threading.Thread(
+            target=self._run, name="v8-deferred-target-retry", daemon=True
+        )
+        self._thread.start()
+
+    def request(self) -> None:
+        with self._lock:
+            error = self._error
+        if error is not None:
+            raise RuntimeError(
+                f"v8 deferred retry failed: {type(error).__name__}: {error}"
+            ) from error
+        self._request.set()
+
+    def _signature(self):
+        pending = getattr(self.runtime, "_v819_deferred_sources", ())
+        return (
+            int(getattr(self.runtime, "generation", 0)),
+            int(getattr(self.runtime, "watermark", 0)),
+            len(pending),
+        )
+
+    def _drain_slice(self) -> tuple[int, int]:
+        from v8 import lease_dispatch_continuity_v839 as v839
+
+        pending = getattr(self.runtime, "_v819_deferred_sources", None)
+        if not isinstance(pending, list) or not pending:
+            self._force_resume = False
+            return 0, 0
+        remaining = len(pending)
+        deadline = time.perf_counter() + _DEFERRED_TIME_BUDGET_SECONDS
+        examined = resolved = 0
+        while remaining > 0 and time.perf_counter() < deadline:
+            count, good = v839._retry_deferred_batch(
+                self.runtime, limit=min(_DEFERRED_CHUNK_SIZE, remaining)
+            )
+            if count <= 0:
+                break
+            examined += int(count)
+            resolved += int(good)
+            remaining -= int(count)
+        self._force_resume = remaining > 0
+        return examined, resolved
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            if not self._request.wait(_DEFERRED_INTERVAL_SECONDS):
+                continue
+            self._request.clear()
+            signature = self._signature()
+            if signature == self._last_signature and not self._force_resume:
+                continue
+            started = time.perf_counter()
+            try:
+                examined, resolved = self._drain_slice()
+            except BaseException as exc:
+                with self._lock:
+                    self._error = exc
+                try:
+                    self.runtime._error_queue.put_nowait(
+                        ("v8-deferred-target-retry", type(exc).__name__, str(exc))
+                    )
+                except BaseException:
+                    pass
+                return
+            elapsed = time.perf_counter() - started
+            self._last_signature = signature
+            with self._lock:
+                self._passes += 1
+                self._examined += int(examined)
+                self._resolved += int(resolved)
+                self._last_seconds = float(elapsed)
+                self._max_seconds = max(self._max_seconds, float(elapsed))
+            if self._force_resume:
+                self._request.set()
+
+    def close(self, timeout: float = 300.0) -> None:
+        self._stop.set()
+        self._request.set()
+        self._thread.join(timeout=max(0.01, float(timeout)))
+        if self._thread.is_alive():
+            raise TimeoutError("v8 deferred retry worker did not stop")
+        with self._lock:
+            error = self._error
+        if error is not None:
+            raise RuntimeError(
+                f"v8 deferred retry failed: {type(error).__name__}: {error}"
+            ) from error
+
+    def metrics(self) -> tuple[int, int, int, float, float]:
+        with self._lock:
+            return (
+                self._passes,
+                self._examined,
+                self._resolved,
+                self._last_seconds,
+                self._max_seconds,
+            )
+
+
+def _feedback_worker_v841(runtime):
+    from v8 import lease_dispatch_continuity_v839 as v839
+
+    worker = getattr(runtime, "_v839_actor_feedback", None)
+    if worker is None or bool(getattr(worker, "_closed", False)):
+        worker = _SqliteBatchWorker(
+            lambda rows: v839._BASE_RECORD_ACTOR_RESULTS(runtime, tuple(rows)),
+            name="v8-actor-feedback",
+            root=Path(runtime.root) / "maintenance",
+            error_queue=getattr(runtime, "_error_queue", None),
+        )
+        runtime._v839_actor_feedback = worker
+    return worker
+
+
+def _deferred_worker_v841(runtime):
+    worker = getattr(runtime, "_v839_deferred_retry", None)
+    if worker is None or not worker._thread.is_alive():
+        worker = _AdaptiveDeferredRetryWorker(runtime)
+        runtime._v839_deferred_retry = worker
+    return worker
+
+
+def _peer_input_token(supervisor) -> tuple[int, ...]:
+    view = getattr(supervisor, "_v813_live_read_view", None) or getattr(
+        supervisor, "read_view", None
+    )
+    arenas = tuple(getattr(view, "_nodes", ())) + tuple(getattr(view, "_edges", ()))
+    if arenas:
+        return tuple(int(arena.sequence) for arena in arenas)
+    return (int(supervisor.current_generation()), int(supervisor.current_watermark()))
+
+
+def _peer_init_v841(self, *args, **kwargs):
+    _BASE_PEER_INIT(self, *args, **kwargs)
+    self._v841_peer_executor = ThreadPoolExecutor(max_workers=9, thread_name_prefix="v8-peer")
+    self._v841_last_input_token = None
+
+
+def _parallel_analyses_v841(self, nodes, edges):
+    pool = self._v841_peer_executor
+    futures = {
+        "prediction": pool.submit(self.prediction.evaluate, nodes),
+        "context": pool.submit(self.context.propose, nodes),
+        "roles": pool.submit(self.roles.propose, nodes),
+        "future": pool.submit(self.future_options.evaluate, nodes),
+        "compression": pool.submit(self.compression.evaluate, nodes, edges),
+        "similarity": pool.submit(self.similarity.evaluate, nodes, edges),
+        "transfer": pool.submit(self.transfer.candidates, nodes, provenance=self.read_view.source_games),
+        "world": pool.submit(self.world_model.propose, nodes),
+        "replay": pool.submit(self.replay.candidates, nodes, budget=self.candidate_budget),
+    }
+    return {name: future.result() for name, future in futures.items()}
+
+
+def _peer_run_once_v841(self):
+    token = _peer_input_token(self)
+    if token == getattr(self, "_v841_last_input_token", None):
+        return None
+    before_cycles = int(getattr(self, "_cycles", 0))
+    before_cut = getattr(self, "_last_developmental_cut", None)
+    try:
+        result = _BASE_PEER_RUN_ONCE(self)
+    except BaseException:
+        self._v841_last_input_token = None
+        raise
+    if int(getattr(self, "_cycles", 0)) != before_cycles or getattr(
+        self, "_last_developmental_cut", None
+    ) is not before_cut:
+        self._v841_last_input_token = token
+    return result
+
+
+def _peer_close_v841(self):
+    try:
+        return _BASE_PEER_CLOSE(self)
+    finally:
+        executor = getattr(self, "_v841_peer_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+            self._v841_peer_executor = None
+
+
+class _CandidateOverflowDispatcher:
+    """Bounded nonblocking overflow for per-game validator queues."""
+
+    def __init__(self, service, *, per_game_capacity: int = _OPTIMIZER_OVERFLOW_PER_GAME):
+        self.service = service
+        self.per_game_capacity = max(8, int(per_game_capacity))
+        self._lock = threading.Lock()
+        self._done = threading.Condition(self._lock)
+        self._pending: dict[str, dict[str, object]] = {}
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="v8-optimizer-overflow", daemon=True)
+        self._thread.start()
+
+    @staticmethod
+    def _priority(candidate) -> tuple[int, int, str]:
+        edit = str(getattr(candidate, "edit_kind", ""))
+        edit_rank = {
+            "TARGET_MINIMIZE": 0,
+            "VALIDATE_SOURCE": 0,
+            "PROJECT_ACTION_KIND": 1,
+            "REDUCE_REPEAT": 2,
+            "DELETE_SEGMENT": 3,
+            "DELETE_ACTION": 4,
+        }.get(edit, 5)
+        return (max(0, int(getattr(candidate, "cost", len(candidate.actions)))), edit_rank, str(candidate.candidate_id))
+
+    def pending_count(self) -> int:
+        with self._lock:
+            return sum(len(values) for values in self._pending.values())
+
+    def submit(self, candidate) -> bool:
+        game = str(candidate.source.anchor.source_id)
+        candidate_id = str(candidate.candidate_id)
+        with self._done:
+            bucket = self._pending.setdefault(game, {})
+            if candidate_id in bucket:
+                return True
+            if len(bucket) < self.per_game_capacity:
+                bucket[candidate_id] = candidate
+            else:
+                worst_id, worst = max(bucket.items(), key=lambda item: self._priority(item[1]))
+                if self._priority(candidate) < self._priority(worst):
+                    del bucket[worst_id]
+                    bucket[candidate_id] = candidate
+            self._done.notify_all()
+        self._wake.set()
+        return True
+
+    def _drain_once(self) -> int:
+        from v8 import trajectory_optimizer_v818 as v818
+
+        with self._lock:
+            games = tuple(sorted(self._pending))
+        moved = 0
+        for game in games:
+            if self._stop.is_set() or self.service._stop.is_set():
+                break
+            v818._ensure_validator(self.service, game)
+            with self.service._v818_validator_lock:
+                target = self.service._v818_game_queues.setdefault(
+                    game, queue.Queue(maxsize=v818._PER_GAME_QUEUE_CAPACITY)
+                )
+            while True:
+                with self._lock:
+                    bucket = self._pending.get(game)
+                    if not bucket:
+                        break
+                    candidate_id, candidate = min(
+                        bucket.items(), key=lambda item: self._priority(item[1])
+                    )
+                try:
+                    target.put_nowait(candidate)
+                except queue.Full:
+                    break
+                with self._done:
+                    bucket = self._pending.get(game)
+                    if bucket is not None:
+                        bucket.pop(candidate_id, None)
+                        if not bucket:
+                            self._pending.pop(game, None)
+                    self._done.notify_all()
+                moved += 1
+        v818._start_waiting_validators(self.service)
+        return moved
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            if self.pending_count() <= 0:
+                self._wake.clear()
+                self._wake.wait(_OPTIMIZER_DISPATCH_INTERVAL_SECONDS)
+                continue
+            if self._drain_once() <= 0:
+                self._wake.clear()
+                self._wake.wait(_OPTIMIZER_DISPATCH_INTERVAL_SECONDS)
+
+    def drain(self, timeout: float = 10.0) -> None:
+        self._wake.set()
+        with self._done:
+            ok = self._done.wait_for(
+                lambda: sum(len(values) for values in self._pending.values()) == 0,
+                timeout=max(0.01, float(timeout)),
+            )
+            pending = sum(len(values) for values in self._pending.values())
+        if not ok or pending:
+            raise TimeoutError(f"v8 optimizer overflow did not drain (pending={pending})")
+
+    def close(self, *, drain: bool = True, timeout: float = 10.0) -> None:
+        if drain and self.pending_count() > 0:
+            self.drain(timeout)
+        self._stop.set()
+        self._wake.set()
+        self._thread.join(timeout=max(0.01, float(timeout)))
+        if self._thread.is_alive():
+            raise TimeoutError("v8 optimizer overflow dispatcher did not stop")
+
+
+def _overflow_dispatcher(service) -> _CandidateOverflowDispatcher:
+    worker = getattr(service, "_v841_candidate_overflow", None)
+    if worker is None or not worker._thread.is_alive():
+        worker = _CandidateOverflowDispatcher(service)
+        service._v841_candidate_overflow = worker
+    return worker
+
+
+def _route_candidate_base_v841(service, candidate) -> bool:
+    from v8 import trajectory_optimizer_v818 as v818
+
+    game = str(candidate.source.anchor.source_id)
+    with service._v818_validator_lock:
+        target = service._v818_game_queues.setdefault(
+            game, queue.Queue(maxsize=v818._PER_GAME_QUEUE_CAPACITY)
+        )
+    v818._ensure_validator(service, game)
+    try:
+        target.put_nowait(candidate)
+        return True
+    except queue.Full:
+        return _overflow_dispatcher(service).submit(candidate)
+
+
+def _queue_depth_v841(service) -> int:
+    base = int(_BASE_QUEUE_DEPTH(service))
+    worker = getattr(service, "_v841_candidate_overflow", None)
+    return base + (0 if worker is None else int(worker.pending_count()))
+
+
+def _service_stop_v841(self, *, drain: bool = True, timeout: float = 10.0) -> None:
+    worker = getattr(self, "_v841_candidate_overflow", None)
+    if worker is not None and drain and worker.pending_count() > 0:
+        worker.drain(timeout=max(0.1, float(timeout) * 0.5))
+    try:
+        return _BASE_SERVICE_STOP(
+            self,
+            drain=drain,
+            timeout=max(0.1, float(timeout) * (0.5 if worker is not None else 1.0)),
+        )
+    finally:
+        if worker is not None:
+            worker.close(drain=False, timeout=max(0.1, float(timeout) * 0.5))
+            self._v841_candidate_overflow = None
+
+
+def install_runtime_scaling_v841() -> None:
+    global _INSTALLED, _BASE_PEER_INIT, _BASE_PEER_CLOSE, _BASE_PEER_RUN_ONCE
+    global _BASE_SERVICE_STOP, _BASE_QUEUE_DEPTH
+    if _INSTALLED:
+        return
+
+    from v8 import lease_dispatch_continuity_v839 as v839
+    from v8 import optimizer_budget_control_v830 as v830
+    from v8 import trajectory_optimizer_v818 as v818
+    from v8.peers_v82 import V82DevelopmentalPeerSupervisor
+    from v8.trajectory_optimizer_v814 import TrajectoryOptimizationService
+
+    v839._feedback_worker = _feedback_worker_v841
+    v839._deferred_worker = _deferred_worker_v841
+
+    _BASE_PEER_INIT = V82DevelopmentalPeerSupervisor.__init__
+    _BASE_PEER_CLOSE = V82DevelopmentalPeerSupervisor.close
+    _BASE_PEER_RUN_ONCE = V82DevelopmentalPeerSupervisor.run_once
+    V82DevelopmentalPeerSupervisor.__init__ = _peer_init_v841
+    V82DevelopmentalPeerSupervisor._parallel_analyses = _parallel_analyses_v841
+    V82DevelopmentalPeerSupervisor.run_once = _peer_run_once_v841
+    V82DevelopmentalPeerSupervisor.close = _peer_close_v841
+
+    # Keep v8.30 as the public route authority; replace only its blocking delegate.
+    v830._BASE_ROUTE_CANDIDATE = _route_candidate_base_v841
+    _BASE_QUEUE_DEPTH = v818._queue_depth
+    v818._queue_depth = _queue_depth_v841
+
+    _BASE_SERVICE_STOP = TrajectoryOptimizationService.stop
+    TrajectoryOptimizationService.stop = _service_stop_v841
+    _INSTALLED = True
