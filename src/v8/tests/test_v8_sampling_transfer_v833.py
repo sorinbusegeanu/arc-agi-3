@@ -9,7 +9,7 @@ from v8 import behavior_recovery as behavior
 from v8 import decision_point_sampling_v821 as sampling
 from v8 import sampling_portfolio_v831 as portfolio
 from v8 import sampling_transfer_v833 as repair
-from v8.model import MemoryUid, stable_u64
+from v8.model import MemoryLevel, MemoryType, MemoryUid, RelationType, stable_u64
 
 
 class SamplingTransferV833Tests(unittest.TestCase):
@@ -83,7 +83,7 @@ class SamplingTransferV833Tests(unittest.TestCase):
         self.assertFalse(sampler._v833_random_rollout)
         self.assertTrue(sampler.saw_progress)
 
-    def test_foreign_m7_is_preferred_for_transfer(self):
+    def test_foreign_m7_requires_formal_target_correspondence(self):
         sampler = portfolio.PortfolioSampler("new-game", seed=4)
         sampler.begin_lease(4)
         uid = MemoryUid(11, 22)
@@ -97,34 +97,40 @@ class SamplingTransferV833Tests(unittest.TestCase):
             mean_cost=2.0,
             probationary=False,
         )
-        node = SimpleNamespace(transfer_prior=0.8)
+        node = SimpleNamespace(
+            uid=uid,
+            level=int(MemoryLevel.M7),
+            memory_type=int(MemoryType.STRATEGY),
+            key_parts=(2, 33, 44, 0),
+            transfer_prior=0.8,
+            significance=0.0,
+            learning_value=0.0,
+            support_count=8,
+        )
         foreign_game = int(stable_u64("old-game", person=b"v8-game"))
         fake = SimpleNamespace(
             _strategy_version=(2, 4),
             _strategy_fallback=(row,),
             _node_by_uid={uid: node},
             _parents={uid: set()},
-            _v815_normalized_action_priors={},
         )
         fake._refresh_strategy_cache = lambda: None
-        from v8.model import RelationType
-        provenance_edge = SimpleNamespace(
-            relation_type=int(RelationType.GAME_PROVENANCE),
-            source_uid=uid,
-            target_uid=MemoryUid(0, foreign_game),
-            score=1.0,
+        fake.edge_records = lambda: (
+            SimpleNamespace(
+                relation_type=int(RelationType.GAME_PROVENANCE),
+                source_uid=uid,
+                target_uid=MemoryUid(0, foreign_game),
+                score=1.0,
+            ),
         )
-        fake.edge_records = lambda: (provenance_edge,)
 
         with patch.object(behavior, "_CURRENT_ACTOR_VIEW", fake), patch.object(
             behavior, "strategy_can_control", return_value=True
         ):
             selected = repair._cross_game_transfer_action(sampler, (1, 2, 3))
-        self.assertIsNotNone(selected)
-        self.assertEqual(selected[0], 2)
-        self.assertEqual(selected[1], "M7")
+        self.assertIsNone(selected)
 
-    def test_normalized_m1_is_transfer_fallback(self):
+    def test_global_normalized_action_prior_is_not_cross_environment_transfer(self):
         sampler = portfolio.PortfolioSampler("new-game", seed=5)
         sampler.begin_lease(5)
         fake = SimpleNamespace(
@@ -136,11 +142,9 @@ class SamplingTransferV833Tests(unittest.TestCase):
         )
         fake._refresh_strategy_cache = lambda: None
         fake.edge_records = lambda: ()
-        with patch.object(behavior, "_CURRENT_ACTOR_VIEW", fake), patch(
-            "v8.restart_memory_v815._build_restart_indexes", return_value=None
-        ):
+        with patch.object(behavior, "_CURRENT_ACTOR_VIEW", fake):
             selected = repair._cross_game_transfer_action(sampler, (1, 2, 3))
-        self.assertEqual(selected[:2], (3, "NORMALIZED_M1"))
+        self.assertIsNone(selected)
 
 
 if __name__ == "__main__":
