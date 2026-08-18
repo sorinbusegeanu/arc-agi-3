@@ -5,6 +5,10 @@ from __future__ import annotations
 The cognitive core consumes structural transitions, opaque executable actions,
 primary valence and boundary scope. Environment-specific labels (ARC WIN,
 GAME_OVER, levels, grids, etc.) are deliberately outside this module.
+
+v8.8 additionally represents observations emitted between two agent decision
+points.  Those within-action frames are passive environment evolution: they
+belong to one externally initiated interaction and never imply extra actions.
 """
 
 from dataclasses import dataclass
@@ -18,6 +22,11 @@ class BoundaryScope(str, Enum):
     NONE = "NONE"
     SUBEPISODE = "SUBEPISODE"
     EPISODE = "EPISODE"
+
+
+class TransitionOrigin(str, Enum):
+    ACTION_TRIGGERED = "ACTION_TRIGGERED"
+    INTERNAL_EVOLUTION = "INTERNAL_EVOLUTION"
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +54,68 @@ class BoundaryEvent:
     @property
     def negative(self) -> bool:
         return self.crossed and int(self.primary_valence) < 0
+
+
+@dataclass(frozen=True, slots=True)
+class WithinActionFrame:
+    observation: Any
+    ordinal: int
+
+    def __post_init__(self) -> None:
+        ordinal = int(self.ordinal)
+        if ordinal < 0:
+            raise ValueError("within-action frame ordinal cannot be negative")
+        object.__setattr__(self, "ordinal", ordinal)
+
+
+@dataclass(frozen=True, slots=True)
+class WithinActionTrace:
+    """Ordered observations produced by one external action before control returns."""
+
+    initial_observation: Any
+    frames: tuple[WithinActionFrame, ...]
+    settled_observation: Any
+
+    def __post_init__(self) -> None:
+        frames = tuple(self.frames)
+        for expected, frame in enumerate(frames):
+            if int(frame.ordinal) != expected:
+                raise ValueError("within-action frame ordinals must be contiguous")
+        object.__setattr__(self, "frames", frames)
+
+    @property
+    def frame_count(self) -> int:
+        return len(self.frames)
+
+    @property
+    def animation_frames(self) -> tuple[Any, ...]:
+        return tuple(frame.observation for frame in self.frames[:-1])
+
+
+@dataclass(frozen=True, slots=True)
+class EnvironmentStepResult:
+    """One agent action plus all observable environment evolution it triggered."""
+
+    settled_observation: Any
+    within_action_trace: WithinActionTrace
+    available_actions: tuple[int, ...]
+    primary_valence: int = 0
+    boundary_scope: BoundaryScope = BoundaryScope.NONE
+    continuation: bool = True
+
+    def __post_init__(self) -> None:
+        actions = tuple(int(value) for value in self.available_actions)
+        object.__setattr__(self, "available_actions", actions)
+        valence = int(self.primary_valence)
+        if valence not in (-1, 0, 1):
+            raise ValueError("primary_valence must be -1, 0, or +1")
+        object.__setattr__(self, "primary_valence", valence)
+        if not isinstance(self.boundary_scope, BoundaryScope):
+            object.__setattr__(self, "boundary_scope", BoundaryScope(str(self.boundary_scope)))
+
+    @property
+    def boundary(self) -> BoundaryEvent:
+        return BoundaryEvent(self.boundary_scope, self.primary_valence, self.continuation)
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +152,7 @@ class EnvironmentTransition:
     before_context: int = 0
     after_context: int = 0
     structural_changed: bool = False
+    within_action_trace: WithinActionTrace | None = None
 
     @property
     def semantics(self) -> TransitionSemantics:
@@ -114,6 +186,10 @@ class EnvironmentCognitionAdapter(Protocol):
     def cognitive_transition_signature(self, before, after) -> int: ...
 
     def cognitive_subepisode_index(self) -> int: ...
+
+    def cognitive_within_action_trace(self) -> WithinActionTrace | None: ...
+
+    def cognitive_step_result(self) -> EnvironmentStepResult | None: ...
 
     def cognitive_transition(
         self,
@@ -172,7 +248,7 @@ class OptimizationScope:
 def _uid_parts(uid) -> tuple[int, int]:
     if uid is None or bool(getattr(uid, "is_zero", True)):
         return 0, 0
-    return int(getattr(uid, "hi", 0)), int(getattr(uid, "lo", 0))
+    return int(getattr(uid, "hi", 0)), int(getattr(uid, "lo", 0)
 
 
 def target_boundary(target) -> BoundaryEvent:
