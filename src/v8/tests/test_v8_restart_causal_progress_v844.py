@@ -105,7 +105,7 @@ class RestartCausalProgressV844Tests(unittest.TestCase):
             action_history=(),
         )
         self.assertIs(selected, row)
-        self.assertEqual(int(selected.anchor.seed), 7)  # provenance is retained
+        self.assertEqual(int(selected.anchor.seed), 7)  # in-memory provenance is retained
 
     def test_newer_validated_sidecar_survives_older_snapshot_restore(self) -> None:
         with tempfile.TemporaryDirectory() as root:
@@ -140,9 +140,10 @@ class RestartCausalProgressV844Tests(unittest.TestCase):
             )
             rows = tuple(service._validated.values())
             self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0].variant_id, "sidecar-new")
+            self.assertEqual(tuple(rows[0].actions), (1,) * 20)
             published = optimizer._load_validated_rows(service.validated_path)
-            self.assertEqual(tuple(row.variant_id for row in published), ("sidecar-new",))
+            self.assertEqual(len(published), 1)
+            self.assertEqual(tuple(published[0].actions), (1,) * 20)
 
     def test_durable_win_reconciles_solved_state_without_runtime_win_marker(self) -> None:
         with tempfile.TemporaryDirectory() as root:
@@ -197,10 +198,9 @@ class RestartCausalProgressV844Tests(unittest.TestCase):
                 os.environ[v819._SAMPLING_MODE_ENV] = v819.SamplingMode.VERIFY.value
                 optimizer._CAPTURE_SOURCE_ID = "ez01"
                 optimizer._refresh_view_variants(view)
-                self.assertEqual(
-                    tuple(value.variant_id for value in view._v814_variants),
-                    ("complete",),
-                )
+                self.assertEqual(len(view._v814_variants), 1)
+                self.assertEqual(tuple(view._v814_variants[0].actions), (1,) * 25)
+                self.assertEqual(view._v814_variants[0].target.terminal_state, "WIN")
             finally:
                 optimizer._CAPTURE_SOURCE_ID = prior_source
                 if prior_root is None:
