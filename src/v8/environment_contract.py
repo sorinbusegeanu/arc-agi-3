@@ -119,10 +119,9 @@ class OptimizationScope:
         return f"LOCAL:{int(self.local_scope)}"
 
     def legacy_budget_key(self) -> int:
-        """Stable integer storage key; it is not an environment level."""
+        """Stable scope key stored beside environment id; it is not a level."""
         value = stable_u64(
             self.kind.value,
-            self.environment_scope,
             self.boundary_scope.value,
             int(self.primary_valence),
             int(self.outcome_hi),
