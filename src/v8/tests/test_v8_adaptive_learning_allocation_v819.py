@@ -226,6 +226,19 @@ class PersistenceTests(unittest.TestCase):
         telemetry = {row.game_id: row for row in restored.telemetry()}
         self.assertEqual(telemetry["persist"].sample_steps, 0)
 
+    def test_state_dict_does_not_call_live_sampling_weight_path(self) -> None:
+        coordinator = AdaptiveLearningCoordinator()
+        coordinator.register_games(("persist",))
+
+        with patch.object(
+            coordinator,
+            "sampling_weight",
+            side_effect=AssertionError("live lifecycle scan must not run in snapshot"),
+        ):
+            payload = coordinator.state_dict()
+
+        self.assertEqual(payload["sampling_weight"]["persist"], 1.0)
+
 
 class SamplingModePolicyTests(unittest.TestCase):
     def test_alternative_mode_bypasses_optimized_sidecar_and_excludes_winner(self) -> None:

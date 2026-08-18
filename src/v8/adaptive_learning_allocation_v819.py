@@ -818,6 +818,31 @@ class AdaptiveLearningCoordinator:
 
     def state_dict(self) -> dict[str, object]:
         with self._lock:
+            def persisted_sampling_weight(game: str) -> float:
+                rows = [
+                    row
+                    for (owner, _level), row in self._records.items()
+                    if owner == game
+                ]
+                if not bool(self._game_won.get(game, False)) or not rows:
+                    state = GameLearningState.UNSOLVED
+                elif any(
+                    row.state == GameLearningState.SOLVED_OPTIMIZING
+                    for row in rows
+                ):
+                    state = GameLearningState.SOLVED_OPTIMIZING
+                else:
+                    state = GameLearningState.SOLVED_STABLE
+                base = {
+                    GameLearningState.UNSOLVED: float(self.config.unsolved_weight),
+                    GameLearningState.SOLVED_OPTIMIZING: float(
+                        self.config.optimizing_weight
+                    ),
+                    GameLearningState.SOLVED_STABLE: float(self.config.stable_weight),
+                }[state]
+                signals = self._signals.get(game, GamePrioritySignals())
+                return max(1e-9, base * signals.multiplier)
+
             return {
                 "version": 1,
                 "games": sorted(self._games),
@@ -836,7 +861,8 @@ class AdaptiveLearningCoordinator:
                     for game, signals in sorted(self._signals.items())
                 },
                 "sampling_weight": {
-                    game: float(self.sampling_weight(game)) for game in sorted(self._games)
+                    game: persisted_sampling_weight(game)
+                    for game in sorted(self._games)
                 },
             }
 
