@@ -4,6 +4,7 @@ import os
 import unittest
 
 import v8  # noqa: F401 - install chronological runtime stack
+from v8 import adaptive_allocator_breadth_v840 as breadth
 from v8 import adaptive_allocator_occupancy_v840 as v840
 from v8 import adaptive_learning_allocation_v819_performance_fix as perf
 from v8 import cli_v819
@@ -46,7 +47,7 @@ class AdaptiveAllocatorOccupancyV840Tests(unittest.TestCase):
         self.assertEqual(idle, set())
         self.assertEqual(ledger.reserved, 30)
 
-    def test_occupancy_stays_full_until_remaining_budget_is_already_inflight(self) -> None:
+    def test_occupancy_stays_full_while_uncommitted_budget_exists(self) -> None:
         ledger = v840._BudgetLedger(100)
         idle = set(range(1, 9))
         active: set[int] = set()
@@ -97,20 +98,69 @@ class AdaptiveAllocatorOccupancyV840Tests(unittest.TestCase):
             else:
                 os.environ[v823._ACTOR_POOL_ENV] = prior
 
-    def test_final_scheduler_is_v840_but_long_unsolved_episode_continuity_remains(self) -> None:
-        self.assertIs(perf._adaptive_run_actor_jobs_perf, v840._adaptive_run_actor_jobs_v840)
-        # v8.26 deliberately removed the arbitrary 2048-step episode cutoff.
-        # Occupancy repair changes reservation accounting, not semantic episode length.
-        self.assertEqual(
-            perf._v823_initial_unsolved_lease_steps(
-                available=10_000,
+    def test_first_breadth_pass_does_not_precommit_full_game_budgets(self) -> None:
+        self.assertIs(
+            perf._v823_initial_unsolved_lease_steps,
+            breadth._initial_breadth_lease_steps_v840,
+        )
+        prior = os.environ.get(breadth._ALLOCATION_LEASE_ENV)
+        try:
+            os.environ.pop(breadth._ALLOCATION_LEASE_ENV, None)
+            first = perf._v823_initial_unsolved_lease_steps(
+                available=100_000,
                 base_steps=10_000,
                 initial_probe=True,
                 worker_count=8,
                 game_count=10,
-            ),
-            10_000,
-        )
+            )
+            later = perf._v823_initial_unsolved_lease_steps(
+                available=100_000,
+                base_steps=10_000,
+                initial_probe=False,
+                worker_count=8,
+                game_count=10,
+            )
+        finally:
+            if prior is None:
+                os.environ.pop(breadth._ALLOCATION_LEASE_ENV, None)
+            else:
+                os.environ[breadth._ALLOCATION_LEASE_ENV] = prior
+        self.assertEqual(first, 4096)
+        self.assertEqual(later, 10_000)
+        self.assertEqual(first * 8, 32_768)
+
+    def test_initial_breadth_quantum_is_configurable(self) -> None:
+        prior = os.environ.get(breadth._ALLOCATION_LEASE_ENV)
+        try:
+            os.environ[breadth._ALLOCATION_LEASE_ENV] = "2500"
+            self.assertEqual(
+                perf._v823_initial_unsolved_lease_steps(
+                    available=10_000,
+                    base_steps=10_000,
+                    initial_probe=True,
+                    worker_count=6,
+                    game_count=10,
+                ),
+                2500,
+            )
+            self.assertEqual(
+                perf._v823_initial_unsolved_lease_steps(
+                    available=10_000,
+                    base_steps=10_000,
+                    initial_probe=False,
+                    worker_count=6,
+                    game_count=10,
+                ),
+                10_000,
+            )
+        finally:
+            if prior is None:
+                os.environ.pop(breadth._ALLOCATION_LEASE_ENV, None)
+            else:
+                os.environ[breadth._ALLOCATION_LEASE_ENV] = prior
+
+    def test_final_scheduler_is_v840(self) -> None:
+        self.assertIs(perf._adaptive_run_actor_jobs_perf, v840._adaptive_run_actor_jobs_v840)
 
     def test_budget_cannot_overcommit_or_double_complete(self) -> None:
         ledger = v840._BudgetLedger(10)
