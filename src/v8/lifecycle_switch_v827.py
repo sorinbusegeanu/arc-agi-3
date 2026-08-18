@@ -113,3 +113,6 @@ def install_lifecycle_switch_v827() -> None:
 
     from v8.runtime_scaling_v841_fixups import install_runtime_scaling_v841_fixups
     install_runtime_scaling_v841_fixups()
+
+    from v8.hypothesis_validation_v842 import install_hypothesis_validation_v842
+    install_hypothesis_validation_v842()
