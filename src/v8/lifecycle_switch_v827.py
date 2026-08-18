@@ -116,3 +116,6 @@ def install_lifecycle_switch_v827() -> None:
 
     from v8.hypothesis_validation_v842 import install_hypothesis_validation_v842
     install_hypothesis_validation_v842()
+
+    from v8.lease_dispatch_lifecycle_v843 import install_lease_dispatch_lifecycle_v843
+    install_lease_dispatch_lifecycle_v843()
