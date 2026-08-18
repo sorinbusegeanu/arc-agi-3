@@ -3,7 +3,7 @@ from __future__ import annotations
 """Environment-neutral cognition contracts for v8.
 
 The cognitive core consumes structural transitions, opaque executable actions,
-primary valence and boundary scope.  Environment-specific labels (ARC WIN,
+primary valence and boundary scope. Environment-specific labels (ARC WIN,
 GAME_OVER, levels, grids, etc.) are deliberately outside this module.
 """
 
@@ -65,7 +65,7 @@ class TransitionSemantics:
     def terminal_failure(self) -> bool:
         return bool(
             (self.boundary.scope is BoundaryScope.EPISODE and self.boundary.negative)
-            or not self.boundary.continuation
+            or (not self.boundary.continuation and int(self.boundary.primary_valence) <= 0)
         )
 
 
@@ -78,10 +78,26 @@ class EnvironmentTransition:
     available_actions_after: tuple[int, ...]
     structural_delta: Any
     boundary: BoundaryEvent = BoundaryEvent()
+    before_context: int = 0
+    after_context: int = 0
+    structural_changed: bool = False
+
+    @property
+    def semantics(self) -> TransitionSemantics:
+        return TransitionSemantics(
+            self.boundary,
+            structural_changed=bool(self.structural_changed),
+            context_changed=int(self.before_context) != int(self.after_context),
+        )
 
 
 class EnvironmentCognitionAdapter(Protocol):
-    """Minimal runtime surface required by environment-neutral cognition."""
+    """Runtime surface required by environment-neutral cognition.
+
+    Adapters are responsible for converting native environment state into the
+    declared structural/boundary contract. Cognitive code must not infer native
+    task labels when these methods are available.
+    """
 
     def observe(self): ...
 
@@ -92,6 +108,24 @@ class EnvironmentCognitionAdapter(Protocol):
     def available_actions(self) -> list[int] | tuple[int, ...]: ...
 
     def cognitive_boundary_event(self) -> BoundaryEvent: ...
+
+    def cognitive_context_signature(self) -> int: ...
+
+    def cognitive_transition_signature(self, before, after) -> int: ...
+
+    def cognitive_subepisode_index(self) -> int: ...
+
+    def cognitive_transition(
+        self,
+        *,
+        before_observation,
+        after_observation,
+        action_token: int,
+        available_actions_before,
+        available_actions_after,
+    ) -> EnvironmentTransition: ...
+
+    def cognitive_target_reached(self, target, outcome_uid=None) -> bool: ...
 
 
 class OptimizationScopeKind(str, Enum):
@@ -112,7 +146,10 @@ class OptimizationScope:
 
     def label(self) -> str:
         if self.kind is OptimizationScopeKind.OUTCOME:
-            return f"M6:{int(self.outcome_hi):016x}:{int(self.outcome_lo):016x}"
+            base = f"M6:{int(self.outcome_hi):016x}:{int(self.outcome_lo):016x}"
+            if self.boundary_scope is not BoundaryScope.NONE:
+                return f"{base}@{self.boundary_scope.value}:{int(self.primary_valence):+d}"
+            return base
         if self.kind is OptimizationScopeKind.BOUNDARY:
             sign = f"{int(self.primary_valence):+d}"
             return f"{self.boundary_scope.value}:{sign}"
@@ -154,15 +191,22 @@ def target_boundary(target) -> BoundaryEvent:
 def optimization_scope_for(source) -> OptimizationScope:
     environment_scope = str(getattr(getattr(source, "anchor", None), "source_id", ""))
     hi, lo = _uid_parts(getattr(source, "target_outcome_uid", None))
+    if not (hi or lo):
+        target = getattr(source, "target", None)
+        hi = int(getattr(target, "outcome_hi", 0))
+        lo = int(getattr(target, "outcome_lo", 0))
+
+    boundary = target_boundary(getattr(source, "target", None))
     if hi or lo:
         return OptimizationScope(
             OptimizationScopeKind.OUTCOME,
             environment_scope,
+            boundary.scope,
+            int(boundary.primary_valence),
             outcome_hi=hi,
             outcome_lo=lo,
         )
 
-    boundary = target_boundary(getattr(source, "target", None))
     if boundary.crossed:
         return OptimizationScope(
             OptimizationScopeKind.BOUNDARY,
@@ -180,9 +224,10 @@ def optimization_scope_for(source) -> OptimizationScope:
 
 def is_complete_positive_episode(source) -> bool:
     scope = optimization_scope_for(source)
+    boundary = target_boundary(getattr(source, "target", None))
     return bool(
-        scope.kind is OptimizationScopeKind.BOUNDARY
-        and scope.boundary_scope is BoundaryScope.EPISODE
-        and int(scope.primary_valence) > 0
+        boundary.scope is BoundaryScope.EPISODE
+        and int(boundary.primary_valence) > 0
         and not tuple(getattr(getattr(source, "anchor", None), "prefix_actions", ()))
+        and scope.kind in {OptimizationScopeKind.BOUNDARY, OptimizationScopeKind.OUTCOME}
     )
