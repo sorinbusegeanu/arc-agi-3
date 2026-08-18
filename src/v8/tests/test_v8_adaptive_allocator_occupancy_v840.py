@@ -73,6 +73,29 @@ class AdaptiveAllocatorOccupancyV840Tests(unittest.TestCase):
         self.assertEqual(ledger.reserved, 80)
         self.assertEqual(ledger.available, 0)
 
+    def test_large_restored_lease_is_shared_across_thirty_actors(self) -> None:
+        ledger = v840._BudgetLedger(10_000)
+        idle = set(range(1, 31))
+
+        def assign(worker_id: int) -> bool:
+            if ledger.available <= 0:
+                return False
+            steps = v840._occupancy_bounded_lease_steps(
+                4096,
+                available=ledger.available,
+                idle_slots=len(idle),
+            )
+            ledger.reserve(worker_id, steps)
+            return True
+
+        assigned = v840._refill_idle_workers(idle, assign)
+
+        self.assertEqual(assigned, tuple(range(1, 31)))
+        self.assertEqual(idle, set())
+        self.assertEqual(len(ledger.reservations), 30)
+        self.assertEqual(ledger.reserved, 10_000)
+        self.assertLessEqual(max(ledger.reservations.values()), 334)
+
     def test_actor_option_is_a_cap_and_all_job_descriptors_survive(self) -> None:
         self.assertIs(cli_v819._requested_actor_pool, v840._requested_actor_pool_v840)
         self.assertEqual(cli_v819._requested_actor_pool(["continuous-run", "--games", "learning"]), 8)

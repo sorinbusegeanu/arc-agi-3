@@ -41,8 +41,19 @@ class _TeeStdout:
         ):
             return False
         payload = line[8:]
+        budget_summary = False
+        if "% - current_run_wins=" in payload:
+            percentage, _separator, _summary = payload.partition(
+                "% - current_run_wins="
+            )
+            try:
+                budget_summary = 0.0 <= float(percentage) <= 100.0
+            except ValueError:
+                budget_summary = False
         return not (
             payload.startswith("graph source=")
+            or payload.startswith("current_run_wins=")
+            or budget_summary
             or payload == "sampling done"
         )
 
@@ -209,6 +220,7 @@ def _reporting_worker_v836(
     interval_seconds: float,
     output_queue=None,
     hypothesis_interval_seconds: float = _HYPOTHESIS_INTERVAL_SECONDS,
+    total_steps: int | None = None,
 ) -> None:
     from v8 import reporter
     from v8.actor import ActorProgress
@@ -242,7 +254,10 @@ def _reporting_worker_v836(
         now = time.monotonic()
         if now >= next_report:
             rows = tuple(latest[key] for key in sorted(latest))
-            reporter._emit_line(reporter.format_game_rate_line(rows), output_queue)
+            reporter._emit_line(
+                reporter.format_budget_game_rate_line(rows, total_steps),
+                output_queue,
+            )
             while next_report <= now:
                 next_report += float(interval_seconds)
 

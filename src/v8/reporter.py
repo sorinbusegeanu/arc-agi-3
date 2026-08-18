@@ -18,6 +18,20 @@ def _emit_line(message: str, output_queue: mp.Queue | None) -> None:
         output_queue.put(line)
 
 
+def format_budget_game_rate_line(
+    rows: Iterable[ActorProgress],
+    total_steps: int | None,
+) -> str:
+    rows = tuple(rows)
+    line = format_game_rate_line(rows)
+    budget = 0 if total_steps is None else max(0, int(total_steps))
+    if budget <= 0:
+        return line
+    used = min(budget, sum(max(0, int(row.steps)) for row in rows))
+    percentage = 100.0 * used / budget
+    return f"{percentage:.0f}% - {line}"
+
+
 def reporting_worker(
     *,
     event_queue: mp.Queue,
@@ -26,6 +40,7 @@ def reporting_worker(
     actors: tuple[tuple[int, str], ...],
     interval_seconds: float,
     output_queue: mp.Queue | None = None,
+    total_steps: int | None = None,
 ) -> None:
     latest = {
         int(actor_id): ActorProgress(int(actor_id), str(game_id), 0, 0, 0, 0)
@@ -53,7 +68,7 @@ def reporting_worker(
             continue
 
         rows = tuple(latest[key] for key in sorted(latest))
-        _emit_line(format_game_rate_line(rows), output_queue)
+        _emit_line(format_budget_game_rate_line(rows, total_steps), output_queue)
         while next_report <= now:
             next_report += float(interval_seconds)
 
@@ -69,6 +84,7 @@ class DedicatedReporter:
         actors: Iterable[tuple[int, str]],
         interval_seconds: float = 60.0,
         output_queue: mp.Queue | None = None,
+        total_steps: int | None = None,
     ) -> None:
         if interval_seconds <= 0:
             raise ValueError("reporting interval must be positive")
@@ -83,6 +99,7 @@ class DedicatedReporter:
                 "actors": tuple((int(actor_id), str(game_id)) for actor_id, game_id in actors),
                 "interval_seconds": float(interval_seconds),
                 "output_queue": output_queue,
+                "total_steps": total_steps,
             },
             name="v8-dedicated-reporter",
             daemon=True,
