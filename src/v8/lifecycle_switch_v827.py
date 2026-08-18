@@ -137,3 +137,8 @@ def install_lifecycle_switch_v827() -> None:
         install_within_action_temporal_v88_fixups,
     )
     install_within_action_temporal_v88_fixups()
+
+    from v8.within_action_temporal_v88_authority_fix import (
+        install_within_action_temporal_v88_authority_fix,
+    )
+    install_within_action_temporal_v88_authority_fix()
