@@ -102,3 +102,8 @@ def install_lifecycle_switch_v827() -> None:
         install_adaptive_allocator_occupancy_v840,
     )
     install_adaptive_allocator_occupancy_v840()
+
+    from v8.adaptive_allocator_breadth_v840 import (
+        install_adaptive_allocator_breadth_v840,
+    )
+    install_adaptive_allocator_breadth_v840()
