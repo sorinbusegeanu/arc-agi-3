@@ -5,6 +5,7 @@ import unittest
 
 import v8
 from v8 import actor as actor_module
+from v8 import adaptive_allocator_occupancy_v840 as occupancy
 from v8 import cli_v819
 from v8 import decision_point_sampling_v821 as sampling
 from v8 import progress_runtime_fix_v822 as progress
@@ -50,20 +51,24 @@ class SamplingBaselineRecoveryV828Tests(unittest.TestCase):
         self.assertEqual(result, "composed")
         self.assertEqual(calls, [{"job": "job", "marker": 9}])
 
-    def test_learning_set_restores_one_worker_per_game_by_default(self) -> None:
-        self.assertIs(cli_v819._requested_actor_pool, _requested_actor_pool_v828)
+    def test_v828_minimum_lane_helper_is_historical_not_final_cli_authority(self) -> None:
+        self.assertEqual(
+            _requested_actor_pool_v828(["continuous-run", "--games", "learning"]),
+            36,
+        )
+        self.assertIs(cli_v819._requested_actor_pool, occupancy._requested_actor_pool_v840)
         self.assertEqual(
             cli_v819._requested_actor_pool(["continuous-run", "--games", "learning"]),
-            36,
+            8,
         )
         self.assertEqual(
             cli_v819._requested_actor_pool(
                 ["continuous-run", "--games", "learning", "--actors", "8"]
             ),
-            36,
+            8,
         )
 
-    def test_explicit_actor_count_above_game_count_still_expands_lanes(self) -> None:
+    def test_explicit_actor_count_is_process_cap(self) -> None:
         self.assertEqual(
             cli_v819._requested_actor_pool(
                 ["continuous-run", "--games", "diverse", "--actors", "20"]
@@ -71,10 +76,10 @@ class SamplingBaselineRecoveryV828Tests(unittest.TestCase):
             20,
         )
 
-    def test_actor_batch_reports_all_learning_workers_after_restored_pool_resolution(self) -> None:
+    def test_actor_batch_keeps_all_descriptors_but_reports_process_cap(self) -> None:
         pool = cli_v819._requested_actor_pool(["continuous-run", "--games", "learning"])
         batch = cli_v819._ActorJobBatch(tuple(range(36)), pool)
-        self.assertEqual(len(batch), 36)
+        self.assertEqual(len(batch), 8)
         self.assertEqual(tuple(batch), tuple(range(36)))
 
 
