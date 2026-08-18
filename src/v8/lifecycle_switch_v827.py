@@ -97,3 +97,8 @@ def install_lifecycle_switch_v827() -> None:
         install_lease_dispatch_continuity_v839,
     )
     install_lease_dispatch_continuity_v839()
+
+    from v8.adaptive_allocator_occupancy_v840 import (
+        install_adaptive_allocator_occupancy_v840,
+    )
+    install_adaptive_allocator_occupancy_v840()
