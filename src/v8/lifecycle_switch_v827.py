@@ -132,3 +132,8 @@ def install_lifecycle_switch_v827() -> None:
     # between two agent decision points without introducing additional actions.
     from v8.within_action_temporal_v88 import install_within_action_temporal_v88
     install_within_action_temporal_v88()
+
+    from v8.within_action_temporal_v88_fixups import (
+        install_within_action_temporal_v88_fixups,
+    )
+    install_within_action_temporal_v88_fixups()
