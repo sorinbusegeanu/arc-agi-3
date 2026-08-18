@@ -110,3 +110,6 @@ def install_lifecycle_switch_v827() -> None:
 
     from v8.runtime_scaling_v841 import install_runtime_scaling_v841
     install_runtime_scaling_v841()
+
+    from v8.runtime_scaling_v841_fixups import install_runtime_scaling_v841_fixups
+    install_runtime_scaling_v841_fixups()
