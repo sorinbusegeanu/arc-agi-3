@@ -289,7 +289,15 @@ def _run_actor_jobs_v839(runtime, jobs, **kwargs):
     callback_worker = None
     call_kwargs = kwargs
     callback = kwargs.get("progress_callback")
-    if callback is not None:
+    # The production CLI callback runs automatic transfer experiments and can be
+    # graph-heavy. Keep ordinary/reporting callbacks synchronous so their deadline
+    # semantics and queue-depth observations remain exact.
+    async_maintenance_callback = bool(
+        callback is not None
+        and getattr(callback, "__name__", "") == "periodic_maintenance"
+        and getattr(callback, "__module__", "") == "v8.cli"
+    )
+    if async_maintenance_callback:
         callback_worker = _AsyncQueueWorker(
             lambda rows: callback(tuple(rows)),
             name="v8-progress-maintenance",
