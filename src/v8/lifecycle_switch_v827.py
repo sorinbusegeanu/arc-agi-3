@@ -122,3 +122,8 @@ def install_lifecycle_switch_v827() -> None:
 
     from v8.restart_causal_progress_v844 import install_restart_causal_progress_v844
     install_restart_causal_progress_v844()
+
+    from v8.restart_causal_progress_v844_fixups import (
+        install_restart_causal_progress_v844_fixups,
+    )
+    install_restart_causal_progress_v844_fixups()
