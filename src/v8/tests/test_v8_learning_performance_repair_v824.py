@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import v8
+from v8 import adaptive_allocator_breadth_v840 as breadth
 from v8 import adaptive_learning_allocation_v819 as v819
 from v8 import adaptive_learning_allocation_v819_performance_fix as perf
 from v8 import final_save_lifecycle_v812 as lifecycle
@@ -21,6 +22,10 @@ class LearningPerformanceRepairV824Tests(unittest.TestCase):
     def test_final_install_authorities(self) -> None:
         self.assertIs(
             perf.__dict__["_v823_initial_unsolved_lease_steps"],
+            breadth._initial_breadth_lease_steps_v840,
+        )
+        self.assertIs(
+            breadth._BASE_UNSOLVED_LEASE_STEPS,
             v826.episode_aligned_unsolved_lease_steps_v826,
         )
         self.assertIs(v819._service_submit_v819, repair._prewin_submit_v824)
