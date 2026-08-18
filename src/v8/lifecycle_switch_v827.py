@@ -76,3 +76,8 @@ def install_lifecycle_switch_v827() -> None:
 
     from v8.environment_neutrality_v837 import install_environment_neutrality_v837
     install_environment_neutrality_v837()
+
+    from v8.environment_neutrality_v837_fixups import (
+        install_environment_neutrality_v837_fixups,
+    )
+    install_environment_neutrality_v837_fixups()
