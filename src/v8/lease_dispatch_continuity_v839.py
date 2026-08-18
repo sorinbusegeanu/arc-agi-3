@@ -94,19 +94,25 @@ class _AsyncQueueWorker:
                 self._queue.task_done()
 
     def flush(self, timeout: float = _DRAIN_TIMEOUT_SECONDS) -> None:
-        deadline = time.monotonic() + max(0.01, float(timeout))
-        while int(self._queue.unfinished_tasks) > 0:
-            error = self.error
-            if error is not None:
-                raise RuntimeError(
-                    f"{self._thread.name} failed: {type(error).__name__}: {error}"
-                ) from error
-            if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"{self._thread.name} did not drain "
-                    f"(pending={int(self._queue.unfinished_tasks)})"
+        # Queue's condition owns the authoritative unfinished-task count. Waiting
+        # here avoids coupling maintenance cleanup to the actor scheduler's mocked
+        # or otherwise externally controlled monotonic clock.
+        with self._queue.all_tasks_done:
+            if self._queue.unfinished_tasks:
+                self._queue.all_tasks_done.wait_for(
+                    lambda: self._queue.unfinished_tasks == 0,
+                    timeout=max(0.01, float(timeout)),
                 )
-            time.sleep(0.01)
+            pending = int(self._queue.unfinished_tasks)
+        if pending:
+            raise TimeoutError(
+                f"{self._thread.name} did not drain (pending={pending})"
+            )
+        error = self.error
+        if error is not None:
+            raise RuntimeError(
+                f"{self._thread.name} failed: {type(error).__name__}: {error}"
+            ) from error
 
     def close(self, timeout: float = _DRAIN_TIMEOUT_SECONDS) -> None:
         with self._lock:
@@ -162,7 +168,7 @@ class _DeferredRetryWorker:
             if not self._request.is_set():
                 continue
             self._request.clear()
-            started = time.monotonic()
+            started = time.perf_counter()
             try:
                 examined, resolved = _retry_deferred_batch(
                     self.runtime, limit=_DEFERRED_BATCH_SIZE
@@ -177,7 +183,7 @@ class _DeferredRetryWorker:
                 except BaseException:
                     pass
                 return
-            elapsed = time.monotonic() - started
+            elapsed = time.perf_counter() - started
             with self._lock:
                 self._passes += 1
                 self._examined += examined
