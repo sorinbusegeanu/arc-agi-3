@@ -1,4 +1,4 @@
-"""ARC-AGI-3 v8.27 memory-to-intelligence runtime."""
+"""ARC-AGI-3 v8.8 memory-to-intelligence runtime."""
 
 # Install the v0.5.3 memory schema before importing development/runtime modules so
 # proposal packets, shared arenas and snapshot compatibility agree on one layout.
@@ -220,6 +220,13 @@ _install_complete_win_trajectory_repair_v825()
 _install_learning_control_continuity_v826()
 _install_lifecycle_competence_integration_v827()
 _install_lifecycle_switch_v827()
+
+# A clean process must run the same late stack that historical unit-test import
+# ordering used to assemble accidentally.
+from v8.runtime_stack_v88 import (
+    install_current_runtime_stack_v88 as _install_current_runtime_stack_v88,
+)
+_install_current_runtime_stack_v88()
 
 # Preserve existing import paths: `from v8.runtime import ContinuousMemoryRuntime`
 # and the package-level API both resolve to the current semantic layer.
