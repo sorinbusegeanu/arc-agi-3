@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 import v8
+from v8 import adaptive_allocator_breadth_v840 as breadth
 from v8 import adaptive_learning_allocation_v819_performance_fix as perf
 from v8 import decision_point_sampling_v821 as sampling
 from v8 import learning_control_continuity_v826 as repair
@@ -23,6 +24,10 @@ class LearningControlContinuityV826Tests(unittest.TestCase):
         self.assertIs(repair._BASE_PLAN_CANDIDATES, v824._plan_candidates_v824)
         self.assertIs(
             perf.__dict__["_v823_initial_unsolved_lease_steps"],
+            breadth._initial_breadth_lease_steps_v840,
+        )
+        self.assertIs(
+            breadth._BASE_UNSOLVED_LEASE_STEPS,
             repair.episode_aligned_unsolved_lease_steps_v826,
         )
         self.assertEqual(sampling._VERIFICATION_REPEATS, 1)
@@ -76,12 +81,12 @@ class LearningControlContinuityV826Tests(unittest.TestCase):
             5_000,
         )
 
-    def test_former_boundary_allows_long_first_solution(self) -> None:
+    def test_former_boundary_allows_long_subsequent_solution_attempt(self) -> None:
         required_actions = 3_000
-        lease_steps = repair.episode_aligned_unsolved_lease_steps_v826(
+        lease_steps = breadth._initial_breadth_lease_steps_v840(
             available=10_000,
             base_steps=10_000,
-            initial_probe=True,
+            initial_probe=False,
             worker_count=1,
             game_count=1,
         )
