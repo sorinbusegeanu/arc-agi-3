@@ -92,7 +92,7 @@ class RuntimeWinScopeV835Tests(unittest.TestCase):
                 )
                 self.assertIn(("ez01", v835._FULL_WIN_SCOPE_LEVEL), coordinator._records)
                 self.assertNotIn(("ez01", 11), coordinator._records)
-                self.assertTrue(any("target=FULL_WIN" in row for row in events))
+                self.assertTrue(any("target=EPISODE:+1" in row for row in events))
                 self.assertFalse(any("level=11" in row for row in events))
 
     def test_runtime_init_creates_fresh_session_before_base_init(self):
@@ -136,7 +136,7 @@ class RuntimeWinScopeV835Tests(unittest.TestCase):
             v835._FULL_WIN_SCOPE_LEVEL,
             "START",
         )
-        self.assertIn("target=FULL_WIN", message)
+        self.assertIn("target=EPISODE:+1", message)
         self.assertIn("cost=1270", message)
         self.assertNotIn(f"level={v835._FULL_WIN_SCOPE_LEVEL}", message)
 
@@ -207,7 +207,7 @@ class RuntimeWinScopeV835Tests(unittest.TestCase):
         self.assertEqual(stats.saved_actions, 100)
         self.assertNotIn(("ez01", 5), coordinator._v830_optimizer_budget_stats)
         self.assertTrue(
-            any("target=FULL_WIN" in row and "status=IMPROVED" in row for row in events)
+            any("target=EPISODE:+1" in row and "status=IMPROVED" in row for row in events)
         )
 
 
