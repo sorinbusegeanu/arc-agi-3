@@ -346,6 +346,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     continuous.add_argument("--actor-timeout", type=float, default=None)
     continuous.add_argument("--progress-interval-seconds", type=float, default=60.0)
+    continuous.add_argument(
+        "--verbose-progress",
+        action="store_true",
+        help="show runtime progress on stdout (it is always retained in root/log.txt)",
+    )
     continuous.add_argument("--drain-timeout", type=float, default=300.0)
     continuous.add_argument("--final-save-timeout", type=float, default=300.0)
     continuous.add_argument("--transfer-experiment-steps", type=int, default=32)

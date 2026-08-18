@@ -219,7 +219,7 @@ def _available_actions_at_anchor(validator, candidate) -> tuple[int, ...]:
             if str(getattr(env, "last_outcome_state", "")) == "GAME_OVER":
                 valid = False
                 break
-        if not valid or validator._target_reached(env, candidate.source.target):
+        if not valid or validator._target_reached(env, candidate.source):
             continue
         actions.update(int(value) for value in env.available_actions())
     return tuple(sorted(actions))

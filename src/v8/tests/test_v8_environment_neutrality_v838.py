@@ -134,6 +134,44 @@ class EnvironmentNeutralityV838Tests(unittest.TestCase):
         self.assertFalse(bad_result[0])
         self.assertEqual(bad_result[2], "outcome_not_preserved")
 
+    def test_target_minimization_anchor_check_passes_trajectory_source(self):
+        from v8 import trajectory_target_minimization_v820 as minimization
+
+        uid = MemoryUid(500, 600)
+
+        class SymbolicEnv:
+            def reset(self):
+                return None
+
+            def available_actions(self):
+                return (2, 3)
+
+            def cognitive_boundary_event(self):
+                return BoundaryEvent()
+
+        service = SimpleNamespace(_v818_prefix_for=lambda _candidate: ())
+        target = optimizer.TrajectoryTarget(
+            0, "BOUNDARY", BoundaryScope.EPISODE.value, +1, False, uid.hi, uid.lo
+        )
+        anchor = optimizer.ReplayAnchor("symbolic", 0, (), None)
+        source = optimizer.SuccessfulTrajectory(
+            optimizer._trajectory_id(anchor, target, (2, 3)),
+            anchor,
+            target,
+            (2, 3),
+            target_outcome_uid=MemoryUid.zero(),
+        )
+        candidate = minimization._candidate(
+            optimizer, source, minimization._TARGET_MINIMIZE, source.actions
+        )
+        validator = v837._EnvironmentReplayValidator(service, "symbolic")
+        validator._environment = lambda _seed, _root: SymbolicEnv()
+
+        self.assertEqual(
+            minimization._available_actions_at_anchor(validator, candidate),
+            (2, 3),
+        )
+
     def test_adapter_transition_overrides_conflicting_legacy_kwargs(self):
         transition = EnvironmentTransition(
             0, 0, 9, (9,), (9,), None,

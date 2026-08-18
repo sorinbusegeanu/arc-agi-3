@@ -29,6 +29,59 @@ class RuntimeObservabilityV836Tests(unittest.TestCase):
                 "mirrored-line\n",
             )
 
+    def test_continuous_progress_is_file_only_by_default(self):
+        with tempfile.TemporaryDirectory() as root:
+            terminal = io.StringIO()
+            progress = (
+                "[12:34] optimizer game=ez01 level=1 status=START",
+                "[12:34] learning state game=ez01 UNSOLVED->SOLVED_OPTIMIZING",
+                "[12:34] frontier game=ez01 level=1 source=SAMPLER",
+                "[12:34] trajectory optimization validators=1 games=1",
+                "[12:34] sampling allocation unsolved=0 optimizing=1",
+                "[12:34] lifecycle window=1 complete",
+                "[12:34] hypotheses H01=INSUFFICIENT_EVIDENCE",
+            )
+            with redirect_stdout(terminal):
+                with observability.stdout_log_context(
+                    ["continuous-run", "--root", root]
+                ):
+                    print("v8 continuous: games=1", flush=True)
+                    print("[12:34] graph source=empty(no-snapshot) nodes=0", flush=True)
+                    for line in progress:
+                        print(line, flush=True)
+                    print("[12:34] sampling done", flush=True)
+
+            visible = terminal.getvalue()
+            self.assertIn("v8 continuous: games=1", visible)
+            self.assertIn("graph source=empty(no-snapshot)", visible)
+            self.assertIn("sampling done", visible)
+            for line in progress:
+                self.assertNotIn(line, visible)
+
+            logged = (Path(root) / "log.txt").read_text(encoding="utf-8")
+            for line in progress:
+                self.assertIn(line, logged)
+
+    def test_verbose_progress_restores_terminal_output(self):
+        with tempfile.TemporaryDirectory() as root:
+            terminal = io.StringIO()
+            line = "[12:34] optimizer game=ez01 level=1 status=START"
+            with redirect_stdout(terminal):
+                with observability.stdout_log_context(
+                    [
+                        "continuous-run",
+                        "--root",
+                        root,
+                        "--verbose-progress",
+                    ]
+                ):
+                    print(line, flush=True)
+            self.assertIn(line, terminal.getvalue())
+            self.assertIn(
+                line,
+                (Path(root) / "log.txt").read_text(encoding="utf-8"),
+            )
+
     def test_hypothesis_reporting_interval_is_five_minutes(self):
         self.assertEqual(observability._HYPOTHESIS_INTERVAL_SECONDS, 300.0)
         self.assertIs(reporter.reporting_worker, observability._reporting_worker_v836)

@@ -11,25 +11,54 @@ from pathlib import Path
 
 _INSTALLED = False
 _STDOUT_LOG_ENV = "ARC_AGI3_V8_STDOUT_LOG"
+_STDOUT_PROGRESS_ENV = "ARC_AGI3_V8_STDOUT_PROGRESS"
 _HYPOTHESIS_INTERVAL_SECONDS = 300.0
 _PROCESS_MIRROR = None
 _BASE_REPORTING_WORKER = None
 
 
 class _TeeStdout:
-    def __init__(self, original, path: Path) -> None:
+    def __init__(self, original, path: Path, *, suppress_progress: bool = False) -> None:
         self.original = original
         self.path = Path(path)
+        self.suppress_progress = bool(suppress_progress)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.log = self.path.open("a", encoding="utf-8", buffering=1)
         self._lock = threading.RLock()
         self._closed = False
+        self._last_write_suppressed = False
+
+    @staticmethod
+    def _is_progress_line(value: str) -> bool:
+        line = str(value).rstrip("\r\n")
+        if not (
+            len(line) >= 8
+            and line[0] == "["
+            and line[1:3].isdigit()
+            and line[3] == ":"
+            and line[4:6].isdigit()
+            and line[6:8] == "] "
+        ):
+            return False
+        payload = line[8:]
+        return not (
+            payload.startswith("graph source=")
+            or payload == "sampling done"
+        )
 
     def write(self, value) -> int:
         text = str(value)
         with self._lock:
-            written = self.original.write(text)
             self.log.write(text)
+            suppress = bool(
+                self.suppress_progress
+                and (
+                    self._is_progress_line(text)
+                    or (self._last_write_suppressed and text in {"\n", "\r\n"})
+                )
+            )
+            self._last_write_suppressed = suppress and text not in {"\n", "\r\n"}
+            written = len(text) if suppress else self.original.write(text)
         return len(text) if written is None else int(written)
 
     def flush(self) -> None:
@@ -84,12 +113,20 @@ class _NoopMirrorHandle:
         return None
 
 
-def _install_stdout_mirror(path: str | Path):
+def _install_stdout_mirror(
+    path: str | Path,
+    *,
+    suppress_progress: bool = False,
+):
     target = Path(path)
     current = sys.stdout
-    if isinstance(current, _TeeStdout) and current.path == target:
+    if (
+        isinstance(current, _TeeStdout)
+        and current.path == target
+        and current.suppress_progress == bool(suppress_progress)
+    ):
         return _NoopMirrorHandle()
-    tee = _TeeStdout(current, target)
+    tee = _TeeStdout(current, target, suppress_progress=suppress_progress)
     sys.stdout = tee
     return _MirrorHandle(tee, current)
 
@@ -116,8 +153,11 @@ def stdout_log_context(argv=None):
         return
 
     prior_env = os.environ.get(_STDOUT_LOG_ENV)
+    prior_progress = os.environ.get(_STDOUT_PROGRESS_ENV)
+    show_progress = "--verbose-progress" in values
     os.environ[_STDOUT_LOG_ENV] = str(path)
-    handle = _install_stdout_mirror(path)
+    os.environ[_STDOUT_PROGRESS_ENV] = "1" if show_progress else "0"
+    handle = _install_stdout_mirror(path, suppress_progress=not show_progress)
     try:
         yield
     finally:
@@ -126,6 +166,10 @@ def stdout_log_context(argv=None):
             os.environ.pop(_STDOUT_LOG_ENV, None)
         else:
             os.environ[_STDOUT_LOG_ENV] = prior_env
+        if prior_progress is None:
+            os.environ.pop(_STDOUT_PROGRESS_ENV, None)
+        else:
+            os.environ[_STDOUT_PROGRESS_ENV] = prior_progress
 
 
 def _mirror_from_environment() -> None:
@@ -135,7 +179,11 @@ def _mirror_from_environment() -> None:
     raw = str(os.environ.get(_STDOUT_LOG_ENV, "")).strip()
     if not raw:
         return
-    _PROCESS_MIRROR = _install_stdout_mirror(Path(raw))
+    show_progress = str(os.environ.get(_STDOUT_PROGRESS_ENV, "1")).strip() == "1"
+    _PROCESS_MIRROR = _install_stdout_mirror(
+        Path(raw),
+        suppress_progress=not show_progress,
+    )
 
 
 def _hypothesis_status_line(evidence_rows, watermark_value: int) -> str:
