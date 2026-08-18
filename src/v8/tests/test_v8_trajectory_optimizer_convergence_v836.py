@@ -11,6 +11,7 @@ from v8 import trajectory_optimizer_convergence_v836 as convergence
 from v8 import trajectory_optimizer_v814 as optimizer
 from v8 import trajectory_optimizer_v818 as v818
 from v8 import trajectory_target_minimization_v820 as v820
+from v8.environment_contract import BoundaryEvent, BoundaryScope
 
 
 def full_source(actions, *, game="ez02", levels=5):
@@ -92,6 +93,14 @@ class TrajectoryOptimizerConvergenceV836Tests(unittest.TestCase):
                 if self.steps == 6:
                     self.last_outcome_state = "WIN"
                 return None
+
+            def cognitive_subepisode_index(self):
+                return self.last_levels_completed
+
+            def cognitive_boundary_event(self):
+                if self.last_outcome_state == "WIN":
+                    return BoundaryEvent(BoundaryScope.EPISODE, +1, False)
+                return BoundaryEvent(BoundaryScope.NONE, 0, True)
 
         class FakeReplayValidator:
             def __init__(self, _service, _game):
