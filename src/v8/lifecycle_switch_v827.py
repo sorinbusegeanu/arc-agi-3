@@ -119,3 +119,6 @@ def install_lifecycle_switch_v827() -> None:
 
     from v8.lease_dispatch_lifecycle_v843 import install_lease_dispatch_lifecycle_v843
     install_lease_dispatch_lifecycle_v843()
+
+    from v8.restart_causal_progress_v844 import install_restart_causal_progress_v844
+    install_restart_causal_progress_v844()
