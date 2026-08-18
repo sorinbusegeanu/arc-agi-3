@@ -126,6 +126,13 @@ def _restored_solved_games(runtime, games: tuple[str, ...]) -> tuple[str, ...]:
     )
 
 
+def _restored_solved_line(games: tuple[str, ...]) -> str:
+    return (
+        f"games {','.join(str(game) for game in games)} "
+        "have been solved before; optimizing solutions"
+    )
+
+
 def run_continuous(args) -> int:
     if getattr(args, "show_best_trajectory", None):
         from v8.trajectory_inspection_v819 import show_best_trajectory
@@ -223,11 +230,7 @@ def run_continuous(args) -> int:
                 else ()
             )
             if restored_solved:
-                print(
-                    f"v8 continuous: games {','.join(restored_solved)} "
-                    "have been solved before; optimizing solutions",
-                    flush=True,
-                )
+                _log(_restored_solved_line(restored_solved))
             reporter = DedicatedReporter(
                 runtime._mp_ctx,
                 watermark=runtime._watermark,

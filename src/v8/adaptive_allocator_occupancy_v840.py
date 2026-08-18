@@ -94,7 +94,7 @@ def _occupancy_bounded_lease_steps(
     available: int,
     idle_slots: int,
 ) -> int:
-    """Keep one large lease from starving the remaining idle actor slots."""
+    """Keep one large lease from starving the actor pool or its refill headroom."""
 
     budget = max(0, int(available))
     if budget <= 0:
@@ -283,7 +283,10 @@ def _adaptive_run_actor_jobs_v840(
         steps = _occupancy_bounded_lease_steps(
             int(steps),
             available=int(available),
-            idle_slots=len(idle_workers),
+            # Divide against the whole pool, not only the currently idle slots.
+            # Reserving all available credits during the first fill creates a
+            # long straggler tail in which completed workers cannot be refilled.
+            idle_slots=worker_count,
         )
         lease_id += 1
         excluded = (

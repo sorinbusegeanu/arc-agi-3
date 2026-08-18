@@ -301,7 +301,7 @@ class ContinuousMemoryRuntime:
             if self._closed or self.snapshot_service is None:
                 return
             try:
-                self.request_consistent_snapshot(timeout=max(10.0, interval))
+                self.request_async_snapshot()
             except BaseException as exc:
                 self._snapshot_error = f"{type(exc).__name__}: {exc}"
                 return
@@ -525,7 +525,6 @@ class ContinuousMemoryRuntime:
             return
         with self._maintenance_lock:
             deadline = time.monotonic() + float(timeout)
-            self._snapshot_freeze.set()
             if self.peers is not None:
                 self.peers.pause()
             try:
@@ -533,6 +532,10 @@ class ContinuousMemoryRuntime:
                     max(0.0, deadline - time.monotonic())
                 ):
                     raise TimeoutError("v8 peers did not pause for consistent snapshot")
+                # A peer cycle can take much longer than the arena capture. Actors
+                # may keep sampling while that already-paused cycle reaches idle;
+                # freeze them only for the canonical drain and coherent copy.
+                self._snapshot_freeze.set()
                 self.wait_quiescent(
                     timeout=max(0.0, deadline - time.monotonic()),
                     resume_peers=False,
@@ -550,6 +553,20 @@ class ContinuousMemoryRuntime:
                 if self.peers is not None:
                     self.peers.resume()
                 self._snapshot_freeze.clear()
+
+    def request_async_snapshot(self) -> None:
+        """Queue a latest-wins periodic snapshot without pausing actor sampling."""
+
+        if self.snapshot_service is None:
+            return
+        with self._maintenance_lock:
+            self._snapshot_id += 1
+            self.snapshot_service.request_latest(
+                self._snapshot_id,
+                self.watermark,
+                generation=self.generation,
+                auxiliary_state=self._auxiliary_state_json(),
+            )
 
     def scientific_statuses(self) -> dict[str, str]:
         if self.peers is None:

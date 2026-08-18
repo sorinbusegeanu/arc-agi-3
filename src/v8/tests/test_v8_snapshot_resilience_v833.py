@@ -11,7 +11,7 @@ from v8 import snapshot_resilience_v833 as repair
 class SnapshotResilienceV833Tests(unittest.TestCase):
     def test_periodic_peer_pause_timeout_is_skipped_not_fatal(self):
         runtime = SimpleNamespace(
-            request_consistent_snapshot=Mock(side_effect=TimeoutError("peer busy")),
+            request_async_snapshot=Mock(side_effect=TimeoutError("snapshot busy")),
             _snapshot_error=None,
         )
         status = repair._background_snapshot_attempt_v833(runtime, timeout=10.0)
@@ -21,7 +21,7 @@ class SnapshotResilienceV833Tests(unittest.TestCase):
 
     def test_real_snapshot_failure_remains_fatal(self):
         runtime = SimpleNamespace(
-            request_consistent_snapshot=Mock(side_effect=RuntimeError("snapshotter died")),
+            request_async_snapshot=Mock(side_effect=RuntimeError("snapshotter died")),
             _snapshot_error=None,
         )
         status = repair._background_snapshot_attempt_v833(runtime, timeout=10.0)

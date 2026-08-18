@@ -16,7 +16,7 @@ _BASE_SNAPSHOT_CADENCE = None
 
 def _background_snapshot_attempt_v833(runtime, *, timeout: float) -> str:
     try:
-        runtime.request_consistent_snapshot(timeout=float(timeout))
+        runtime.request_async_snapshot()
         return "saved"
     except TimeoutError:
         runtime._v833_background_snapshot_skips = int(

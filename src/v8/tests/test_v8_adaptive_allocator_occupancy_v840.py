@@ -73,7 +73,7 @@ class AdaptiveAllocatorOccupancyV840Tests(unittest.TestCase):
         self.assertEqual(ledger.reserved, 80)
         self.assertEqual(ledger.available, 0)
 
-    def test_large_restored_lease_is_shared_across_thirty_actors(self) -> None:
+    def test_large_restored_lease_keeps_refill_headroom_for_thirty_actors(self) -> None:
         ledger = v840._BudgetLedger(10_000)
         idle = set(range(1, 31))
 
@@ -83,7 +83,7 @@ class AdaptiveAllocatorOccupancyV840Tests(unittest.TestCase):
             steps = v840._occupancy_bounded_lease_steps(
                 4096,
                 available=ledger.available,
-                idle_slots=len(idle),
+                idle_slots=30,
             )
             ledger.reserve(worker_id, steps)
             return True
@@ -93,8 +93,17 @@ class AdaptiveAllocatorOccupancyV840Tests(unittest.TestCase):
         self.assertEqual(assigned, tuple(range(1, 31)))
         self.assertEqual(idle, set())
         self.assertEqual(len(ledger.reservations), 30)
-        self.assertEqual(ledger.reserved, 10_000)
+        self.assertLess(ledger.reserved, 10_000)
+        self.assertGreater(ledger.available, 0)
         self.assertLessEqual(max(ledger.reservations.values()), 334)
+
+        first_lease = ledger.reservations[1]
+        available_before_refill = ledger.available
+        ledger.complete(1, first_lease)
+        idle.add(1)
+        self.assertEqual(v840._refill_idle_workers(idle, assign), (1,))
+        self.assertIn(1, ledger.reservations)
+        self.assertLess(ledger.available, available_before_refill)
 
     def test_actor_option_is_a_cap_and_all_job_descriptors_survive(self) -> None:
         self.assertIs(cli_v819._requested_actor_pool, v840._requested_actor_pool_v840)

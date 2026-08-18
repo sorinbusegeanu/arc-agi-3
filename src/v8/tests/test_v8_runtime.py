@@ -209,7 +209,7 @@ class RuntimeTests(unittest.TestCase):
         finally:
             restored.close(normal=False)
 
-    def test_periodic_snapshot_drains_writes_without_advancing_peer_fixed_point(self) -> None:
+    def test_consistent_snapshot_drains_without_freezing_during_peer_wait(self) -> None:
         runtime = object.__new__(ContinuousMemoryRuntime)
         runtime.snapshot_service = Mock()
         runtime._maintenance_lock = threading.Lock()
@@ -218,9 +218,22 @@ class RuntimeTests(unittest.TestCase):
         runtime._watermark = SimpleNamespace(value=11, get_lock=nullcontext)
         runtime._generation = SimpleNamespace(value=17, get_lock=nullcontext)
         runtime._auxiliary_state_json = Mock(return_value="{}")
-        runtime.wait_quiescent = Mock()
         runtime.peers = Mock()
-        runtime.peers.wait_idle.return_value = True
+        freeze_observations: list[tuple[str, bool]] = []
+
+        def wait_idle(_timeout: float) -> bool:
+            freeze_observations.append(("peer_idle", runtime._snapshot_freeze.is_set()))
+            return True
+
+        def wait_quiescent(**_kwargs) -> None:
+            freeze_observations.append(("canonical_drain", runtime._snapshot_freeze.is_set()))
+
+        def capture(*_args, **_kwargs) -> None:
+            freeze_observations.append(("capture", runtime._snapshot_freeze.is_set()))
+
+        runtime.peers.wait_idle.side_effect = wait_idle
+        runtime.wait_quiescent = Mock(side_effect=wait_quiescent)
+        runtime.snapshot_service.request_consistent_capture.side_effect = capture
 
         runtime.request_consistent_snapshot(timeout=2.0)
 
@@ -231,6 +244,39 @@ class RuntimeTests(unittest.TestCase):
         self.assertFalse(runtime.wait_quiescent.call_args.kwargs["resume_peers"])
         runtime.snapshot_service.request_consistent_capture.assert_called_once()
         runtime.peers.resume.assert_called_once_with()
+        self.assertFalse(runtime._snapshot_freeze.is_set())
+        self.assertEqual(
+            freeze_observations,
+            [
+                ("peer_idle", False),
+                ("canonical_drain", True),
+                ("capture", True),
+            ],
+        )
+
+    def test_async_snapshot_never_freezes_or_drains_actors(self) -> None:
+        runtime = object.__new__(ContinuousMemoryRuntime)
+        runtime.snapshot_service = Mock()
+        runtime._maintenance_lock = threading.Lock()
+        runtime._snapshot_freeze = threading.Event()
+        runtime._snapshot_id = 7
+        runtime._watermark = SimpleNamespace(value=19, get_lock=nullcontext)
+        runtime._generation = SimpleNamespace(value=23, get_lock=nullcontext)
+        runtime._auxiliary_state_json = Mock(return_value="{}")
+        runtime.wait_quiescent = Mock()
+        runtime.peers = Mock()
+
+        runtime.request_async_snapshot()
+
+        self.assertEqual(runtime._snapshot_id, 8)
+        runtime.snapshot_service.request_latest.assert_called_once_with(
+            8,
+            19,
+            generation=23,
+            auxiliary_state="{}",
+        )
+        runtime.wait_quiescent.assert_not_called()
+        runtime.peers.pause.assert_not_called()
         self.assertFalse(runtime._snapshot_freeze.is_set())
 
 

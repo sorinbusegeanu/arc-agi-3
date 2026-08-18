@@ -5,7 +5,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from v8.cli import _graph_load_line, _restored_solved_games, run_continuous
+from v8.cli import (
+    _graph_load_line,
+    _restored_solved_games,
+    _restored_solved_line,
+    run_continuous,
+)
 
 
 class StartupGraphLineTests(unittest.TestCase):
@@ -54,6 +59,12 @@ class StartupGraphLineTests(unittest.TestCase):
         self.assertEqual(
             _restored_solved_games(SimpleNamespace(), ("ez01",)),
             (),
+        )
+
+    def test_restored_solved_line_omits_v8_continuous_prefix(self) -> None:
+        self.assertEqual(
+            _restored_solved_line(("ez01", "ls20")),
+            "games ez01,ls20 have been solved before; optimizing solutions",
         )
 
 
