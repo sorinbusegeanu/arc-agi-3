@@ -89,3 +89,8 @@ def install_lifecycle_switch_v827() -> None:
 
     from v8.environment_neutrality_v838 import install_environment_neutrality_v838
     install_environment_neutrality_v838()
+
+    from v8.lease_dispatch_continuity_v839 import (
+        install_lease_dispatch_continuity_v839,
+    )
+    install_lease_dispatch_continuity_v839()
