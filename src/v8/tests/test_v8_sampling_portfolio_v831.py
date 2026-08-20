@@ -9,6 +9,7 @@ from v8 import decision_point_sampling_v821 as sampling
 from v8 import sampling_evidence_frontier_v847 as v847
 from v8 import sampling_portfolio_v831 as repair
 from v8 import sampling_progress_control_v829 as v829
+from v8 import sampling_transfer_v833 as v833
 
 
 class SequencePortfolioTests(unittest.TestCase):
@@ -111,7 +112,8 @@ class SequencePortfolioTests(unittest.TestCase):
         self.assertEqual(sampler.base.current.kind, "RANDOM")
 
     def test_install_reuses_v821_actor_and_v847_wraps_v831_sampler(self):
-        self.assertIs(v847._BASE_DISCOVERY_ACTION.__module__, repair.__name__)
+        self.assertIs(v847._BASE_DISCOVERY_ACTION, v833._discovery_action_v833)
+        self.assertEqual(v833._BASE_DISCOVERY_ACTION.__module__, repair.__name__)
         self.assertIs(sampling._sampler_for, v847._sampler_for_v847)
         self.assertIs(v829._BASE_DISCOVERY_ACTOR, sampling._decision_actor_worker)
         self.assertIs(v829._BASE_PLAN_CHAIN, repair._plan_chain_v831)
