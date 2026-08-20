@@ -3,11 +3,13 @@ from __future__ import annotations
 import threading
 
 _INSTALLED = False
+_BASE_PEER_RUN_ONCE = None
+_peer_run_once_v845 = None
 
 
 def install_snapshot_state_consistency_v845() -> None:
     """Serialize persisted peer-state mutation with auxiliary snapshot capture."""
-    global _INSTALLED
+    global _INSTALLED, _BASE_PEER_RUN_ONCE, _peer_run_once_v845
     if _INSTALLED:
         return
 
@@ -18,6 +20,7 @@ def install_snapshot_state_consistency_v845() -> None:
 
     base_init = cls.__init__
     base_run_once = cls.run_once
+    _BASE_PEER_RUN_ONCE = base_run_once
     base_state_dict = cls.state_dict
     base_load_state = cls.load_state
     base_record_strategy_statistics = cls.record_strategy_statistics
@@ -33,6 +36,8 @@ def install_snapshot_state_consistency_v845() -> None:
     def run_once(self):
         with self._v845_state_lock:
             return base_run_once(self)
+
+    _peer_run_once_v845 = run_once
 
     def state_dict(self):
         # The v8.13 fine-grained locks protect callers that invoke _fresh/_event_id
