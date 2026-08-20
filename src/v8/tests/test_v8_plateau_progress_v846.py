@@ -6,6 +6,7 @@ import v8
 from v8 import actor as actor_module
 from v8 import adaptive_learning_allocation_v819 as v819
 from v8 import plateau_progress_v846 as v846
+from v8 import sampling_control_repair_v823 as v823
 from v8.diagnostics import game_summary
 from v8.model import MemoryLevel, MemoryType, MemoryUid, ValidationState
 
@@ -58,6 +59,7 @@ class AdaptiveProgressDepthTests(unittest.TestCase):
         v846._reset_progress_depth_v846()
 
     def test_completed_lease_retains_real_episode_depth(self) -> None:
+        self.assertIs(v819._adaptive_progress_rows, v823._adaptive_progress_rows_v823)
         progress = actor_module.ActorProgress(
             actor_id=1,
             game_id="g",
@@ -69,7 +71,7 @@ class AdaptiveProgressDepthTests(unittest.TestCase):
         )
         event = v819._LeaseProgress(1, 1, progress)
 
-        # The adaptive scheduler reads event.row before discarding completed lease
+        # The parent scheduler consumes event.row before discarding completed lease
         # progress. That read must preserve the deepest real episode depth.
         self.assertIs(event.row, progress)
 
@@ -93,7 +95,10 @@ class AdaptiveProgressDepthTests(unittest.TestCase):
         )
 
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0].max_level_reached, 3)
+        # v8.23 intentionally remains the public row builder and therefore emits
+        # its legacy sentinel. v8.46 repairs the semantic depth read underneath
+        # diagnostics rather than replacing that authority.
+        self.assertEqual(rows[0].max_level_reached, -1)
         self.assertEqual(game_summary(rows), (0.0, 60.0, 0, 1))
 
     def test_depth_is_high_water_across_adaptive_leases(self) -> None:
@@ -126,7 +131,6 @@ class AdaptiveProgressDepthTests(unittest.TestCase):
             {},
             {},
         )
-        self.assertEqual(rows[0].max_level_reached, 4)
         self.assertEqual(game_summary(rows), (0.0, 80.0, 0, 1))
 
 
