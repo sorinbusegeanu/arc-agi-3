@@ -2,16 +2,19 @@ from __future__ import annotations
 
 """Composition fixes for the v8.47 evidence-guided prefix frontier.
 
-v8.47 sequence expansion is search, not learned action persistence.  The v8.32
-public begin/reset/forced/observe methods remain authoritative.  This layer inserts
+v8.47 sequence expansion is search, not learned action persistence. The v8.32
+public begin/reset/forced/observe methods remain authoritative. This layer inserts
 frontier behavior underneath those methods, preserving the existing
 v8.33 -> v8.44 causal-proof composition.
 
 A newly reached same-level child may be expanded immediately without a reset only
-when that exact child is the globally preferred evidence frontier.  This is lazy
+when that exact child is the globally preferred evidence frontier. This is lazy
 best-first prefix expansion, not persistence: the next action is selected from the
-child's untried actions and may differ from the prior action.  There is no internal
+child's untried actions and may differ from the prior action. There is no internal
 sequence-length horizon.
+
+An already-materialized pre-v8.47 SequenceFrontier is honored as migration
+compatibility only. Normal v8.47 runtime discovery never creates that product tree.
 """
 
 
@@ -19,6 +22,7 @@ _INSTALLED = False
 _BASE_LOWER_RESET = None
 _BASE_LOWER_FORCED = None
 _BASE_LOWER_OBSERVE = None
+_BASE_DISCOVERY = None
 
 
 def _clear_continuation_v847(self) -> None:
@@ -133,9 +137,9 @@ def _lower_observe_v847(self, **kwargs) -> None:
         else frontier._canonical_id(before_level, before_context)
     )
 
-    # This calls the pre-v8.47 lower composition (v8.44 beneath v8.32). v8.32
-    # then resumes after this function and may request persistence; v8.44's wrapped
-    # arm function remains the causal-proof gate and rejects mere motion.
+    # This calls the pre-v8.47 lower composition. v8.32 resumes after this
+    # function and may request persistence; v8.44's wrapped arm function remains
+    # the causal-proof gate and rejects mere motion.
     result = _BASE_LOWER_OBSERVE(self, **kwargs)
 
     destination = frontier._record_expansion_v847(
@@ -164,9 +168,68 @@ def _lower_observe_v847(self, **kwargs) -> None:
     return result
 
 
+def _discovery_v847_legacy_compat(
+    self,
+    *,
+    level: int,
+    context: int,
+    actions: tuple[int, ...],
+    history: tuple[int, ...],
+) -> int | None:
+    """Honor explicit legacy in-memory sequence rows without creating new ones."""
+
+    from v8 import decision_point_sampling_v821 as sampling
+    from v8 import sampling_evidence_frontier_v847 as frontier
+    from v8 import sampling_portfolio_v831 as portfolio
+
+    mode = str(getattr(portfolio._PORTFOLIO_STATE, "mode", "PROGRESS"))
+    row = self.sequence_frontiers.get((int(level), int(context)))
+    if (
+        mode == "SEQUENCE"
+        and row is not None
+        and int(row.next_index) > 0
+        and int(row.next_index) < len(row.candidates)
+    ):
+        candidate = tuple(int(value) for value in row.candidates[row.next_index])
+        row.next_index += 1
+        available = {int(value) for value in actions}
+        if candidate and int(candidate[0]) in available:
+            node = frontier._register_current_v847(
+                self,
+                level=int(level),
+                context=int(context),
+                actions=tuple(actions),
+                history=tuple(history),
+            )
+            self._v847_active_expansion = (str(node.node_id), int(candidate[0]))
+            self._activate_candidate(
+                point_key=(int(level), int(context)),
+                anchor=tuple(history),
+                candidate=candidate,
+            )
+            action = int(self.active_sequence.popleft())
+            self.base.current = sampling.Intervention(
+                "SEQUENCE",
+                (int(level), int(context)),
+                action,
+                tuple(history),
+            )
+            portfolio._set_source(context, "SEQUENCE_LEGACY_COMPAT", (action,))
+            return action
+
+    return _BASE_DISCOVERY(
+        self,
+        level=int(level),
+        context=int(context),
+        actions=tuple(actions),
+        history=tuple(history),
+    )
+
+
 def install_sampling_evidence_frontier_v847_fixups() -> None:
     global _INSTALLED
     global _BASE_LOWER_RESET, _BASE_LOWER_FORCED, _BASE_LOWER_OBSERVE
+    global _BASE_DISCOVERY
     if _INSTALLED:
         return
 
@@ -177,6 +240,7 @@ def install_sampling_evidence_frontier_v847_fixups() -> None:
     _BASE_LOWER_RESET = persistence._BASE_ON_EXTERNAL_RESET
     _BASE_LOWER_FORCED = persistence._BASE_FORCED_ACTION
     _BASE_LOWER_OBSERVE = persistence._BASE_OBSERVE_TRANSITION
+    _BASE_DISCOVERY = cls.discovery_action
 
     persistence._BASE_ON_EXTERNAL_RESET = _lower_reset_v847
     persistence._BASE_FORCED_ACTION = _lower_forced_v847
@@ -187,4 +251,5 @@ def install_sampling_evidence_frontier_v847_fixups() -> None:
     cls.on_external_reset = persistence._on_external_reset_v832
     cls.forced_action = persistence._forced_action_v832
     cls.observe_transition = persistence._observe_transition_v832
+    cls.discovery_action = _discovery_v847_legacy_compat
     _INSTALLED = True
