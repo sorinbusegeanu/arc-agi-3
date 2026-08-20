@@ -6,6 +6,7 @@ from unittest.mock import Mock, patch
 
 import v8
 from v8 import decision_point_sampling_v821 as sampling
+from v8 import sampling_evidence_frontier_v847 as v847
 from v8 import sampling_portfolio_v831 as repair
 from v8 import sampling_progress_control_v829 as v829
 
@@ -30,7 +31,7 @@ class SequencePortfolioTests(unittest.TestCase):
             except AttributeError:
                 pass
 
-    def test_bounded_sequence_search_contains_repeated_two_action_paths(self):
+    def test_historical_bounded_sequence_builder_contains_repeated_two_action_paths(self):
         rows = repair._build_sequences((1, 2, 3, 4))
         self.assertEqual(rows[:4], ((1,), (2,), (3,), (4,)))
         self.assertIn((1, 1), rows)
@@ -38,43 +39,35 @@ class SequencePortfolioTests(unittest.TestCase):
         self.assertIn((4, 4), rows)
         self.assertLessEqual(len(rows), repair._MAX_SEQUENCE_CANDIDATES)
 
-    def test_same_context_noop_can_continue_with_same_action(self):
+    def test_same_context_noop_remains_expandable_without_fixed_depth(self):
         sampler = repair.PortfolioSampler("ez02", seed=1)
-        sampler.begin_lease(1)
-        row = sampler._frontier(level=0, context=10, actions=(1, 2), history=())
-        # Skip depth-1 candidates; the next breadth-first candidate is (1, 1).
-        row.next_index = 2
-        repair._set_mode("SEQUENCE")
-        first = sampler.discovery_action(
+        root = v847._register_current_v847(
+            sampler,
             level=0,
             context=10,
-            actions=(1, 2),
+            actions=(1,),
             history=(),
         )
-        self.assertEqual(first, 1)
-        sampler.observe_transition(
+        child = v847._record_expansion_v847(
+            sampler,
+            source_node_id=root.node_id,
+            action=1,
             before_level=0,
             before_context=10,
-            action=1,
             after_level=0,
             after_context=10,
-            after_actions=(1, 2),
+            after_actions=(1,),
             history_after=(1,),
             changed_cells=0,
             terminal_state="NOT_FINISHED",
-            terminal_polarity=0,
             level_advanced=False,
             prediction_error=0.0,
             future_delta=0.0,
         )
-        second = sampler.forced_action(
-            level=0,
-            context=10,
-            actions=(1, 2),
-            history=(1,),
-        )
-        self.assertEqual(second, 1)
-        self.assertEqual(v829._CONTROL_STATE.selection_source, "SEQUENCE")
+        self.assertTrue(child.latent)
+        selected = v847._best_expansion_v847(sampler)
+        self.assertIs(selected[0], child)
+        self.assertEqual(selected[1], 1)
 
     def test_random_exploration_floor_is_ten_percent_in_both_phases(self):
         sampler = repair.PortfolioSampler("ez02", seed=2)
@@ -117,8 +110,9 @@ class SequencePortfolioTests(unittest.TestCase):
         self.assertEqual(action, 1)
         self.assertEqual(sampler.base.current.kind, "RANDOM")
 
-    def test_install_reuses_v821_reset_replay_actor_beneath_v829(self):
-        self.assertIs(sampling._sampler_for, repair._sampler_for_v831)
+    def test_install_reuses_v821_actor_and_v847_wraps_v831_sampler(self):
+        self.assertIs(v847._BASE_DISCOVERY_ACTION.__module__, repair.__name__)
+        self.assertIs(sampling._sampler_for, v847._sampler_for_v847)
         self.assertIs(v829._BASE_DISCOVERY_ACTOR, sampling._decision_actor_worker)
         self.assertIs(v829._BASE_PLAN_CHAIN, repair._plan_chain_v831)
 
