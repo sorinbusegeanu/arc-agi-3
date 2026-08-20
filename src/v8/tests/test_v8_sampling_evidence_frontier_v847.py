@@ -9,6 +9,8 @@ from unittest.mock import patch
 import v8
 from v8 import decision_point_sampling_v821 as sampling
 from v8 import sampling_evidence_frontier_v847 as v847
+from v8 import sampling_evidence_frontier_v847_fixups as v847_fixups
+from v8 import sampling_persistence_v832 as persistence
 from v8 import sampling_portfolio_v831 as portfolio
 
 
@@ -26,11 +28,43 @@ class EvidencePrefixFrontierV847Tests(unittest.TestCase):
         else:
             os.environ[v847._TRAJECTORY_ROOT_ENV] = self._prior_root
 
-    def test_final_runtime_uses_v847_sampler_and_lazy_sequence_authority(self) -> None:
+    def _observe(
+        self,
+        sampler,
+        *,
+        before_context: int,
+        after_context: int,
+        action: int,
+        history_after: tuple[int, ...],
+        changed_cells: int = 2,
+        level_advanced: bool = False,
+    ) -> None:
+        sampler.observe_transition(
+            before_level=0,
+            before_context=before_context,
+            action=action,
+            after_level=1 if level_advanced else 0,
+            after_context=after_context,
+            after_actions=(1, 2),
+            history_after=history_after,
+            changed_cells=changed_cells,
+            terminal_state="NOT_FINISHED",
+            terminal_polarity=1 if level_advanced else 0,
+            level_advanced=level_advanced,
+            prediction_error=0.0,
+            future_delta=0.0,
+        )
+
+    def test_final_runtime_uses_v847_sampler_and_composed_sequence_authority(self) -> None:
         self.assertIs(sampling._sampler_for, v847._sampler_for_v847)
         self.assertIs(portfolio.PortfolioSampler.prepare_step, v847._prepare_step_v847)
-        self.assertIs(portfolio.PortfolioSampler.discovery_action, v847._discovery_action_v847)
-        self.assertIs(portfolio.PortfolioSampler.observe_transition, v847._observe_transition_v847)
+        self.assertIs(
+            portfolio.PortfolioSampler.discovery_action,
+            v847_fixups._discovery_v847_legacy_compat,
+        )
+        self.assertIs(portfolio.PortfolioSampler.observe_transition, persistence._observe_transition_v832)
+        self.assertIs(persistence._BASE_OBSERVE_TRANSITION, v847_fixups._lower_observe_v847)
+        self.assertIs(persistence._BASE_FORCED_ACTION, v847_fixups._lower_forced_v847)
         self.assertIs(
             portfolio.PortfolioSampler._schedule_next_sequence,
             v847._schedule_next_sequence_v847,
@@ -54,6 +88,76 @@ class EvidencePrefixFrontierV847Tests(unittest.TestCase):
         self.assertEqual(action, 1)
         self.assertEqual(sampler.base.current.kind, "SEQUENCE")
         self.assertEqual(sampler._v847_active_expansion[1], 1)
+
+    def test_productive_singleton_is_frontier_evidence_not_action_persistence(self) -> None:
+        sampler = portfolio.PortfolioSampler("g", seed=11)
+        sampler.begin_lease(11)
+        portfolio._set_mode("SEQUENCE")
+        action = sampler.discovery_action(
+            level=0,
+            context=10,
+            actions=(1, 2),
+            history=(),
+        )
+        self._observe(
+            sampler,
+            before_context=10,
+            after_context=11,
+            action=action,
+            history_after=(action,),
+        )
+        self.assertIsNone(getattr(sampler, "_v832_persist_action", None))
+        self.assertEqual(getattr(sampler, "_v847_continuation_node_id", None), "C:0:11")
+
+    def test_best_live_child_can_continue_without_fixed_sequence_materialization(self) -> None:
+        sampler = portfolio.PortfolioSampler("g", seed=12)
+        sampler.begin_lease(12)
+        portfolio._set_mode("SEQUENCE")
+        first = sampler.discovery_action(
+            level=0,
+            context=10,
+            actions=(1, 2),
+            history=(),
+        )
+        self.assertEqual(first, 1)
+        self._observe(
+            sampler,
+            before_context=10,
+            after_context=11,
+            action=first,
+            history_after=(1,),
+        )
+
+        second = sampler.forced_action(
+            level=0,
+            context=11,
+            actions=(1, 2),
+            history=(1,),
+        )
+        self.assertEqual(second, 1)
+        self.assertEqual(sampler.base.current.kind, "SEQUENCE")
+        self.assertIsNone(getattr(sampler, "_v832_persist_action", None))
+        self.assertEqual(sampler.active_sequence_full, (1,))
+
+    def test_level_boundary_does_not_force_frontier_continuation(self) -> None:
+        sampler = portfolio.PortfolioSampler("g", seed=13)
+        sampler.begin_lease(13)
+        portfolio._set_mode("SEQUENCE")
+        action = sampler.discovery_action(
+            level=0,
+            context=10,
+            actions=(1, 2),
+            history=(),
+        )
+        self._observe(
+            sampler,
+            before_context=10,
+            after_context=20,
+            action=action,
+            history_after=(action,),
+            level_advanced=True,
+        )
+        self.assertIsNone(getattr(sampler, "_v847_continuation_node_id", None))
 
     def test_noop_prefix_can_grow_beyond_old_depth_without_internal_horizon(self) -> None:
         sampler = portfolio.PortfolioSampler("g", seed=2)
