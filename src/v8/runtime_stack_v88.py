@@ -48,6 +48,7 @@ _LAYERS: tuple[str, ...] = (
     "within_action_temporal_v88_integrity_fix",
     "snapshot_state_consistency_v845",
     "plateau_progress_v846",
+    "sampling_evidence_frontier_v847",
 )
 
 
