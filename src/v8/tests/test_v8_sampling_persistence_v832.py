@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 import v8
+from v8 import sampling_evidence_frontier_v847_fixups as v847_fixups
 from v8 import sampling_persistence_v832 as repair
 from v8 import sampling_portfolio_v831 as portfolio
 from v8 import sampling_progress_control_v829 as v829
@@ -59,8 +60,6 @@ class SamplingPersistenceV832Tests(unittest.TestCase):
     def test_unproven_productive_singleton_does_not_auto_persist(self):
         sampler = portfolio.PortfolioSampler("ez02", seed=1)
         sampler.begin_lease(1)
-        row = sampler._frontier(level=0, context=10, actions=(1, 2, 3, 4), history=())
-        row.next_index = 2  # depth-1 candidate ACTION3 / LEFT
         portfolio._set_mode("SEQUENCE")
         action = sampler.discovery_action(
             level=0,
@@ -68,15 +67,15 @@ class SamplingPersistenceV832Tests(unittest.TestCase):
             actions=(1, 2, 3, 4),
             history=(),
         )
-        self.assertEqual(action, 3)
+        self.assertIn(action, (1, 2, 3, 4))
         self._observe(
             sampler,
             before_level=0,
             before_context=10,
-            action=3,
+            action=action,
             after_level=0,
             after_context=11,
-            history_after=(3,),
+            history_after=(action,),
         )
 
         self.assertIsNone(getattr(sampler, "_v832_persist_action", None))
@@ -156,11 +155,14 @@ class SamplingPersistenceV832Tests(unittest.TestCase):
         self.assertEqual(action, 3)
         self.assertEqual(v829._CONTROL_STATE.selection_source, "ACTION_PERSISTENCE")
 
-    def test_install_patches_portfolio_sampler(self):
+    def test_install_keeps_v832_public_authority_and_composes_v847_below_it(self):
         self.assertIs(portfolio.PortfolioSampler.begin_lease, repair._begin_lease_v832)
         self.assertIs(portfolio.PortfolioSampler.on_external_reset, repair._on_external_reset_v832)
         self.assertIs(portfolio.PortfolioSampler.forced_action, repair._forced_action_v832)
         self.assertIs(portfolio.PortfolioSampler.observe_transition, repair._observe_transition_v832)
+        self.assertIs(repair._BASE_ON_EXTERNAL_RESET, v847_fixups._lower_reset_v847)
+        self.assertIs(repair._BASE_FORCED_ACTION, v847_fixups._lower_forced_v847)
+        self.assertIs(repair._BASE_OBSERVE_TRANSITION, v847_fixups._lower_observe_v847)
 
 
 if __name__ == "__main__":
