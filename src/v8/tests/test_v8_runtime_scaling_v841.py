@@ -109,10 +109,12 @@ class PeerScalingTests(unittest.TestCase):
         finally:
             v841._BASE_PEER_RUN_ONCE = original
 
-    def test_final_peer_authorities_are_v841(self):
+    def test_v845_wraps_v841_peer_authority(self):
+        from v8 import snapshot_state_consistency_v845 as v845
         from v8.peers_v82 import V82DevelopmentalPeerSupervisor
 
-        self.assertIs(V82DevelopmentalPeerSupervisor.run_once, v841._peer_run_once_v841)
+        self.assertIs(V82DevelopmentalPeerSupervisor.run_once, v845._peer_run_once_v845)
+        self.assertIs(v845._BASE_PEER_RUN_ONCE, v841._peer_run_once_v841)
         self.assertIs(
             V82DevelopmentalPeerSupervisor._parallel_analyses,
             v841._parallel_analyses_v841,
