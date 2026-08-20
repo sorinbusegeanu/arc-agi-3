@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import unittest
 
-from v8.arena import EdgeRecord, SharedEdgeArena
+from v8.arena import (
+    EdgeRecord,
+    SharedActionArena,
+    SharedEdgeArena,
+    SharedNodeArena,
+)
 from v8.model import MemoryUid, RelationType
-from v8.publication import LiveReadView
+from v8.publication import LiveReadView, ShardReadDescriptor
 
 
 class _CrossMutatingArena:
@@ -151,6 +156,34 @@ class PublicationConcurrencyRegressionTests(unittest.TestCase):
             self.assertEqual(arena.read(0), second)
         finally:
             arena.dispose()
+
+    def test_new_view_uses_worker_cut_while_live_node_writer_is_active(self) -> None:
+        nodes = SharedNodeArena(capacity=1)
+        edges = SharedEdgeArena(capacity=1)
+        actions = SharedActionArena(capacity=1)
+        descriptors = (
+            ShardReadDescriptor(nodes.descriptor, edges.descriptor, actions.descriptor),
+        )
+        cuts = {}
+        warm = LiveReadView(descriptors, refresh_interval_seconds=None, record_cuts=cuts)
+        warm.close()
+
+        nodes.begin_write()
+        view = None
+        try:
+            view = LiveReadView(
+                descriptors,
+                refresh_interval_seconds=None,
+                record_cuts=cuts,
+            )
+            self.assertEqual(view.node_records(), ())
+        finally:
+            if view is not None:
+                view.close()
+            nodes.end_write(count=0)
+            actions.dispose()
+            edges.dispose()
+            nodes.dispose()
 
 
 if __name__ == "__main__":

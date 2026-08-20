@@ -429,6 +429,7 @@ def _decision_actor_worker(
     snapshot_freeze=None,
     startup_ready=None,
     startup_gate=None,
+    record_cuts=None,
 ) -> None:
     from v7.environment.arc_adapter import ArcGridEnvironment
     from v7.environment.encoding import (
@@ -447,7 +448,11 @@ def _decision_actor_worker(
     sampler = _sampler_for(job)
     optimizer._reset_capture(job)
     ring = SharedRingBuffer(**experience_ring_args)
-    view = LiveReadView(read_descriptors, refresh_interval_seconds=None)
+    view = LiveReadView(
+        read_descriptors,
+        refresh_interval_seconds=None,
+        record_cuts=record_cuts,
+    )
     rng = Random(job.seed)
     env = ArcGridEnvironment(game_id=job.game_id, seed=job.seed, env_root=job.env_root)
     terminal_wait_seconds = max(0.0, float(env.game_wait_seconds))

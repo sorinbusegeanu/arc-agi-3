@@ -176,6 +176,36 @@ class RestartCausalProgressV844Tests(unittest.TestCase):
             self.assertEqual(coordinator.choose_mode("ez01"), v819.SamplingMode.VERIFY)
             self.assertIn("ez01", coordinator._v844_durable_complete_games)
 
+    def test_observed_complete_solution_remains_solved_during_identity_rebuild(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            service = optimizer.TrajectoryOptimizationService(
+                Path(root),
+                validator=lambda candidate: None,
+            )
+            service._v819_best_successful = {
+                "ez02": {
+                    "levels": [{"level": 0, "actions": [1, 2]}],
+                    "successes": 1,
+                }
+            }
+            coordinator = v819.AdaptiveLearningCoordinator()
+            coordinator._v827_read_view = _EmptyLifecycleView()
+            runtime = SimpleNamespace(
+                _v814_trajectory_optimizer=service,
+                _v819_adaptive_learning=coordinator,
+                generation=10,
+            )
+
+            v844._reconcile_durable_competence_v844(runtime)
+
+            self.assertEqual(
+                coordinator.game_state("ez02"),
+                v819.GameLearningState.SOLVED_OPTIMIZING,
+            )
+            self.assertEqual(coordinator.choose_mode("ez02"), v819.SamplingMode.VERIFY)
+            self.assertTrue(coordinator._game_won["ez02"])
+            self.assertIn("ez02", coordinator._v844_durable_complete_games)
+
     def test_verify_can_replay_missing_canonical_complete_sidecar(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             row = _validated(

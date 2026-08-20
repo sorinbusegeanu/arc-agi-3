@@ -381,6 +381,7 @@ def actor_worker(
     snapshot_freeze: mp.synchronize.Event | None = None,
     startup_ready: mp.synchronize.Event | None = None,
     startup_gate: mp.synchronize.Event | None = None,
+    record_cuts: dict[tuple[str, str], tuple[tuple[object, ...], int]] | None = None,
 ) -> None:
     from v7.environment.arc_adapter import ArcGridEnvironment
     from v7.environment.encoding import (
@@ -395,6 +396,7 @@ def actor_worker(
     view = LiveReadView(
         read_descriptors,
         refresh_interval_seconds=None,
+        record_cuts=record_cuts,
     )
     rng = Random(job.seed)
     env = ArcGridEnvironment(game_id=job.game_id, seed=job.seed, env_root=job.env_root)

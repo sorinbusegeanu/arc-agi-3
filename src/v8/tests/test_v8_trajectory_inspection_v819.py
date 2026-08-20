@@ -381,6 +381,52 @@ class TrajectoryInspectionV819Tests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("game=g cost=2 source=observed reliability=1.000", stream.getvalue())
 
+    def test_cli_saves_all_best_trajectories_without_constructing_runtime(self) -> None:
+        from v8 import cli
+
+        root = Path(tempfile.mkdtemp())
+        output = root / "exports" / "best-trajectories.txt"
+        optimizer._atomic_json(
+            root / "trajectory_optimizer" / "best_successful.json",
+            {
+                "version": 1,
+                "games": {
+                    "z-game": self.solution("z-game", "z", ((3,),)),
+                    "a-game": self.solution("a-game", "a", ((1, 2), (4,))),
+                },
+            },
+        )
+        stream = io.StringIO()
+        with patch.object(
+            cli,
+            "ContinuousMemoryRuntime",
+            side_effect=AssertionError("runtime constructed"),
+        ):
+            with redirect_stdout(stream):
+                code = cli.main(
+                    [
+                        "continuous-run",
+                        "--root",
+                        str(root),
+                        "--save-best-trajectory",
+                        str(output),
+                    ]
+                )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            output.read_text(encoding="utf-8"),
+            "game=a-game cost=3 source=observed reliability=1.000\n"
+            "L0: A1,A2\n"
+            "L1: A4\n\n"
+            "game=z-game cost=1 source=observed reliability=1.000\n"
+            "L0: A3\n",
+        )
+        self.assertIn(
+            f"saved best trajectories games=2 path={output}",
+            stream.getvalue(),
+        )
+
     def test_normal_continuous_run_still_requires_games(self) -> None:
         from v8 import cli
 

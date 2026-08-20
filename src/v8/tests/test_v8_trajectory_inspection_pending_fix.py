@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import v8
+from v8 import lifecycle_competence_integration_v827 as lifecycle
 from v8 import trajectory_inspection_v819 as inspection
 from v8 import trajectory_optimizer_v814 as optimizer
 
@@ -75,6 +76,29 @@ class TrajectoryInspectionPendingFixTests(unittest.TestCase):
         self.assertIn("game=ic02 cost=3 source=observed reliability=1.000", stream.getvalue())
         self.assertIn("L0: A1,A2", stream.getvalue())
         self.assertIn("L1: A4", stream.getvalue())
+
+    def test_save_all_includes_pending_complete_solution(self) -> None:
+        root = Path(tempfile.mkdtemp())
+        output = root / "best.txt"
+        optimizer._atomic_json(
+            root / "trajectory_optimizer" / "solutions_inbox" / "pending.json",
+            self.solution("ic02", "pending", ((1, 2), (3,))),
+        )
+
+        with patch.object(
+            lifecycle,
+            "_best_visible_solution_v827",
+            side_effect=AssertionError("all-game export used per-game rescans"),
+        ):
+            code = inspection.save_best_trajectories(root, output)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            output.read_text(encoding="utf-8"),
+            "game=ic02 cost=3 source=observed reliability=1.000\n"
+            "L0: A1,A2\n"
+            "L1: A3\n",
+        )
 
     def test_solution_inbox_is_ingested_before_optimizer_inbox(self) -> None:
         order: list[str] = []

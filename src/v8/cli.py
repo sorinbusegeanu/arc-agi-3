@@ -116,13 +116,25 @@ def _graph_load_line(*, snapshot_path: Path | None, restore_enabled: bool, nodes
 
 def _restored_solved_games(runtime, games: tuple[str, ...]) -> tuple[str, ...]:
     coordinator = getattr(runtime, "_v819_adaptive_learning", None)
-    if coordinator is None:
-        return ()
+    solved = set()
+    if coordinator is not None:
+        solved.update(
+            str(game)
+            for game in games
+            if str(getattr(coordinator.game_state(game), "value", "UNSOLVED"))
+            != "UNSOLVED"
+        )
+
+    # Complete observed solutions are durable competence even while lifecycle
+    # reconciliation is rebuilding a missing canonical M7/M6 identity.  The
+    # optimizer loads this sidecar before startup reporting, so use it as the
+    # authoritative fallback instead of hiding previously solved games.
+    service = getattr(runtime, "_v814_trajectory_optimizer", None)
+    best = getattr(service, "_v819_best_successful", {})
+    if isinstance(best, dict):
+        solved.update(str(game) for game in games if str(game) in best)
     return tuple(
-        str(game)
-        for game in games
-        if str(getattr(coordinator.game_state(game), "value", "UNSOLVED"))
-        != "UNSOLVED"
+        str(game) for game in games if str(game) in solved
     )
 
 
@@ -134,6 +146,10 @@ def _restored_solved_line(games: tuple[str, ...]) -> str:
 
 
 def run_continuous(args) -> int:
+    if getattr(args, "save_best_trajectory", None):
+        from v8.trajectory_inspection_v819 import save_best_trajectories
+
+        return int(save_best_trajectories(args.root, args.save_best_trajectory))
     if getattr(args, "show_best_trajectory", None):
         from v8.trajectory_inspection_v819 import show_best_trajectory
 
@@ -179,20 +195,6 @@ def run_continuous(args) -> int:
     def periodic_maintenance(_rows) -> None:
         if reporter is not None:
             reporter.raise_if_failed()
-        if args.no_automatic_experiments or args.no_peers:
-            return
-        remaining = max(0, int(args.max_transfer_experiments) - experiments.attempted)
-        if remaining <= 0:
-            return
-        live = run_automatic_transfer_experiments(
-            runtime,
-            games=tuple(games),
-            env_root=args.env_root,
-            seed=args.seed + experiments.attempted * 7919,
-            steps_per_trial=args.transfer_experiment_steps,
-            max_trials=min(2, remaining),
-        )
-        accumulate_experiments(live)
 
     def stop_reporter() -> None:
         nonlocal reporter
@@ -224,11 +226,10 @@ def run_continuous(args) -> int:
                 flush=True,
             )
             _log(_graph_load_line(snapshot_path=restore_source, restore_enabled=restore_enabled, nodes=loaded_nodes))
-            restored_solved = (
-                _restored_solved_games(runtime, tuple(games))
-                if restore_source is not None
-                else ()
-            )
+            # Optimizer/adaptive-learning state can be restored independently
+            # of a graph snapshot. Report it whenever startup loaded a solved
+            # game, including runs whose graph source is empty(no-snapshot).
+            restored_solved = _restored_solved_games(runtime, tuple(games))
             if restored_solved:
                 _log(_restored_solved_line(restored_solved))
             reporter = DedicatedReporter(
@@ -270,6 +271,7 @@ def run_continuous(args) -> int:
         if not args.no_automatic_experiments and not args.no_peers:
             remaining = max(0, int(args.max_transfer_experiments) - experiments.attempted)
             if remaining > 0:
+                _log(f"automatic transfer experiments start trials={remaining}")
                 tail = run_automatic_transfer_experiments(
                     runtime,
                     games=tuple(games),
@@ -279,6 +281,10 @@ def run_continuous(args) -> int:
                     max_trials=remaining,
                 )
                 accumulate_experiments(tail)
+                _log(
+                    "automatic transfer experiments done "
+                    f"attempted={tail.attempted} completed={tail.completed} passed={tail.passed}"
+                )
             runtime.wait_quiescent(timeout=args.drain_timeout)
 
         metrics = runtime.metrics()
@@ -348,7 +354,14 @@ def main(argv: list[str] | None = None) -> int:
     continuous = sub.add_parser("continuous-run")
     _add_runtime_args(continuous)
     continuous.add_argument("--games", required=False, default=None)
-    continuous.add_argument("--show-best-trajectory", metavar="GAME_ID", default=None)
+    trajectory_output = continuous.add_mutually_exclusive_group()
+    trajectory_output.add_argument("--show-best-trajectory", metavar="GAME_ID", default=None)
+    trajectory_output.add_argument(
+        "--save-best-trajectory",
+        metavar="FILE",
+        default=None,
+        help="save the best visible trajectory for every game without starting the runtime",
+    )
     continuous.add_argument("--steps-per-game", type=int, default=1000)
     continuous.add_argument("--actors", type=int, default=8)
     continuous.add_argument("--seed", type=int, default=0)

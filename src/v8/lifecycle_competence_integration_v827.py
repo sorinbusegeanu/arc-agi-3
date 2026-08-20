@@ -246,6 +246,61 @@ def _best_visible_solution_v827(root: str | Path, game_id: str):
     return _best_from_history(root, str(game_id), best)
 
 
+def _all_best_visible_solutions(root: str | Path) -> dict[str, dict[str, object]]:
+    """Scan each durable trajectory source once and select one best row per game."""
+
+    from v8 import trajectory_inspection_v819 as inspection
+    from v8 import trajectory_inspection_v819_fixups as visibility
+    from v8 import trajectory_optimizer_v814 as optimizer
+
+    optimizer_root = Path(root) / "trajectory_optimizer"
+    best = dict(
+        inspection._load_best_successful(optimizer_root / "best_successful.json")
+    )
+
+    for directory in ("solutions_history", "solutions_inbox"):
+        try:
+            paths = tuple((optimizer_root / directory).glob("*.json"))
+        except OSError:
+            paths = ()
+        for path in paths:
+            try:
+                record = inspection._validated_solution_record(
+                    json.loads(path.read_text(encoding="utf-8"))
+                )
+            except (OSError, ValueError, TypeError):
+                record = None
+            if record is None:
+                continue
+            game = str(record["game_id"])
+            if inspection._is_better_solution(record, best.get(game)):
+                best[game] = record
+
+    rows_by_game: dict[str, list[object]] = {}
+    try:
+        optimizer_paths = tuple((optimizer_root / "inbox").glob("*.json"))
+    except OSError:
+        optimizer_paths = ()
+    for path in optimizer_paths:
+        try:
+            row = optimizer.SuccessfulTrajectory.from_dict(
+                json.loads(path.read_text(encoding="utf-8"))
+            )
+        except (OSError, ValueError, TypeError, KeyError):
+            continue
+        rows_by_game.setdefault(str(row.anchor.source_id), []).append(row)
+    for game, rows in rows_by_game.items():
+        for row in rows:
+            if str(row.target.terminal_state) != "WIN":
+                continue
+            record = visibility._record_from_nested_optimizer_rows(rows, row)
+            if record is not None and inspection._is_better_solution(
+                record, best.get(game)
+            ):
+                best[game] = record
+    return best
+
+
 def _available_solution_games(root: str | Path) -> tuple[str, ...]:
     from v8 import trajectory_inspection_v819 as inspection
     from v8 import trajectory_optimizer_v814 as optimizer
@@ -298,6 +353,14 @@ def _show_best_trajectory_v827(root: str | Path, game_id: str) -> int:
         formatted = ",".join(f"A{int(native_action_id(action))}" for action in actions)
         print(f"L{index}: {formatted}", flush=True)
     return 0
+
+
+def _save_best_trajectories_v827(root: str | Path, output_path: str | Path) -> int:
+    from v8 import trajectory_inspection_v819 as inspection
+
+    best = _all_best_visible_solutions(root)
+    records = tuple((game, best[game]) for game in sorted(best))
+    return inspection._save_best_trajectory_records(output_path, records)
 
 
 def _format_game_rate_line_v827(rows) -> str:
@@ -374,6 +437,7 @@ def install_lifecycle_competence_integration_v827() -> None:
     visibility._best_visible_solution = _best_visible_solution_v827
     _BASE_SHOW_BEST = inspection.show_best_trajectory
     inspection.show_best_trajectory = _show_best_trajectory_v827
+    inspection.save_best_trajectories = _save_best_trajectories_v827
 
     diagnostics.format_game_rate_line = _format_game_rate_line_v827
     try:

@@ -378,6 +378,59 @@ def show_best_trajectory(root: str | Path, game_id: str) -> int:
     return 0
 
 
+def _format_best_trajectory_lines(
+    game_id: str,
+    record: dict[str, object],
+) -> tuple[str, ...]:
+    from v8.action_targeting_v810 import native_action_id
+
+    reliability = float(record.get("reliability", 0.0))
+    lines = [
+        f"game={str(game_id)} cost={int(record['total_cost'])} "
+        f"source={record['source']} reliability={reliability:.3f}"
+    ]
+    levels = _normalize_levels(record.get("levels")) or ()
+    for index, actions in enumerate(levels):
+        formatted = ",".join(f"A{int(native_action_id(action))}" for action in actions)
+        lines.append(f"L{index}: {formatted}")
+    return tuple(lines)
+
+
+def _save_best_trajectory_records(
+    output_path: str | Path,
+    records: tuple[tuple[str, dict[str, object]], ...],
+) -> int:
+    target = Path(output_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    sections = [
+        "\n".join(_format_best_trajectory_lines(game, record))
+        for game, record in records
+    ]
+    payload = "\n\n".join(sections)
+    if payload:
+        payload += "\n"
+    temporary = target.with_name(
+        f".{target.name}.{os.getpid()}.{time.time_ns()}.tmp"
+    )
+    try:
+        temporary.write_text(payload, encoding="utf-8")
+        os.replace(temporary, target)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    print(f"saved best trajectories games={len(records)} path={target}", flush=True)
+    return 0
+
+
+def save_best_trajectories(root: str | Path, output_path: str | Path) -> int:
+    optimizer_root = Path(root) / "trajectory_optimizer"
+    games = _load_best_successful(optimizer_root / "best_successful.json")
+    records = tuple((game, games[game]) for game in sorted(games))
+    return _save_best_trajectory_records(output_path, records)
+
+
 def install_trajectory_inspection_v819() -> None:
     global _INSTALLED
     global _BASE_WRITE_SUCCESSFUL_TRAJECTORY, _BASE_SERVICE_INIT

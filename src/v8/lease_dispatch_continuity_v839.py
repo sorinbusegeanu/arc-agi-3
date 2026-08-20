@@ -304,35 +304,8 @@ def _run_actor_jobs_v839(runtime, jobs, **kwargs):
     prior = bool(getattr(runtime, "_v839_sampling_active", False))
     runtime._v839_sampling_active = True
 
-    callback_worker = None
-    call_kwargs = kwargs
-    callback = kwargs.get("progress_callback")
-    # The production CLI callback runs automatic transfer experiments and can be
-    # graph-heavy. Keep ordinary/reporting callbacks synchronous so their deadline
-    # semantics and queue-depth observations remain exact.
-    async_maintenance_callback = bool(
-        callback is not None
-        and getattr(callback, "__name__", "") == "periodic_maintenance"
-        and getattr(callback, "__module__", "") == "v8.cli"
-    )
-    if async_maintenance_callback:
-        callback_worker = _AsyncQueueWorker(
-            lambda rows: callback(tuple(rows)),
-            name="v8-progress-maintenance",
-            coalesce_pending=True,
-        )
-        call_kwargs = dict(kwargs)
-        call_kwargs["progress_callback"] = callback_worker.submit
-
     try:
-        result = _BASE_RUN_ACTOR_JOBS(runtime, jobs, **call_kwargs)
-    except BaseException:
-        if callback_worker is not None:
-            try:
-                callback_worker.close()
-            except BaseException:
-                pass
-        raise
+        result = _BASE_RUN_ACTOR_JOBS(runtime, jobs, **kwargs)
     finally:
         runtime._v839_sampling_active = prior
 
@@ -346,8 +319,6 @@ def _run_actor_jobs_v839(runtime, jobs, **kwargs):
     feedback = getattr(runtime, "_v839_actor_feedback", None)
     if feedback is not None:
         feedback.flush()
-    if callback_worker is not None:
-        callback_worker.close()
 
     deferred = getattr(runtime, "_v839_deferred_retry", None)
     if deferred is not None:

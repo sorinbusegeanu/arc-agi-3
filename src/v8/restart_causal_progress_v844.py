@@ -138,7 +138,7 @@ def _complete_validated_rows(service) -> tuple[object, ...]:
 
 
 def _reconcile_durable_competence_v844(runtime) -> None:
-    """Rebuild adaptive solved/frontier state from validated complete trajectories."""
+    """Rebuild adaptive solved/frontier state from all durable complete solutions."""
 
     from v8 import adaptive_learning_allocation_v819 as v819
     from v8 import trajectory_optimizer_v814 as optimizer
@@ -162,13 +162,41 @@ def _reconcile_durable_competence_v844(runtime) -> None:
     for row in rows:
         by_game.setdefault(str(row.anchor.source_id), []).append(row)
 
+    best = getattr(service, "_v819_best_successful", {})
+    observed_games = {
+        str(game)
+        for game, record in (best.items() if isinstance(best, dict) else ())
+        if isinstance(record, dict)
+        and isinstance(record.get("levels"), list)
+        and bool(record.get("levels"))
+        and int(record.get("successes", 0)) > 0
+    }
+
     coordinator._v844_runtime = runtime
     coordinator._v844_durable_rows = {
         game: tuple(values) for game, values in by_game.items()
     }
-    coordinator._v844_durable_complete_games = set(by_game)
+    coordinator._v844_observed_complete_games = set(observed_games)
+    coordinator._v844_durable_complete_games = set(by_game) | observed_games
 
     generation = max(1, int(getattr(runtime, "generation", 0)))
+    if observed_games:
+        from v8 import environment_neutrality_v838 as v838
+
+        episode_scope = v838._episode_scope_key()
+        with coordinator._lock:
+            coordinator.register_games(observed_games)
+            for game in observed_games:
+                coordinator._game_won[game] = True
+                record = coordinator._record(game, episode_scope)
+                if record.first_success_generation <= 0:
+                    record.first_success_generation = generation
+                record.last_success_generation = max(
+                    int(record.last_success_generation), generation
+                )
+                if record.state == v819.GameLearningState.UNSOLVED:
+                    record.state = v819.GameLearningState.SOLVED_OPTIMIZING
+
     for game, values in sorted(by_game.items()):
         coordinator.register_games((game,))
         for row in values:
@@ -209,9 +237,15 @@ def _row_identity_missing(index, row) -> bool:
 
 
 def _durable_missing_identity(coordinator, game_id: str) -> bool:
-    rows = tuple(getattr(coordinator, "_v844_durable_rows", {}).get(str(game_id), ()))
+    game = str(game_id)
+    rows = tuple(getattr(coordinator, "_v844_durable_rows", {}).get(game, ()))
     if not rows:
-        return False
+        # Observed complete solutions have executable action segments but no
+        # canonical strategy/outcome identity yet. Keep them solved and route
+        # them through verification until current graph identities are rebuilt.
+        return game in set(
+            getattr(coordinator, "_v844_observed_complete_games", set())
+        )
     view = getattr(coordinator, "_v827_read_view", None)
     if view is None:
         return False

@@ -4,7 +4,7 @@ import math
 import time
 from dataclasses import dataclass
 from hashlib import blake2b
-from typing import Iterable
+from typing import Iterable, MutableMapping
 
 from v8.arena import (
     ArenaDescriptor,
@@ -79,6 +79,10 @@ class LiveReadView:
         descriptors: Iterable[ShardReadDescriptor],
         *,
         refresh_interval_seconds: float | None = 0.0,
+        record_cuts: MutableMapping[
+            tuple[str, str], tuple[tuple[object, ...], int]
+        ]
+        | None = None,
     ) -> None:
         if refresh_interval_seconds is not None and refresh_interval_seconds < 0:
             raise ValueError("refresh interval must be non-negative")
@@ -87,6 +91,12 @@ class LiveReadView:
         self._edges = tuple(SharedEdgeArena.attach(d.edges) for d in self.descriptors)
         self._actions = tuple(SharedActionArena.attach(d.actions) for d in self.descriptors)
         self._record_cache: dict[int, tuple[tuple[object, ...], int]] = {}
+        self._record_cuts = record_cuts
+        if record_cuts is not None:
+            for arena in (*self._nodes, *self._edges):
+                cached = record_cuts.get(self._record_cut_key(arena))
+                if cached is not None:
+                    self._record_cache[id(arena)] = cached
         self._refresh_interval_seconds = (
             None if refresh_interval_seconds is None else float(refresh_interval_seconds)
         )
@@ -104,6 +114,15 @@ class LiveReadView:
         self._outcome_totals: dict[tuple[int, int], int] = {}
         for arena in (*self._nodes, *self._edges):
             self._stable_records_with_version(arena)
+
+    @staticmethod
+    def _record_cut_key(arena) -> tuple[str, str]:
+        return str(arena.kind), str(arena.descriptor.name)
+
+    def _remember_record_cut(self, arena, snapshot) -> None:
+        self._record_cache[id(arena)] = snapshot
+        if self._record_cuts is not None:
+            self._record_cuts[self._record_cut_key(arena)] = snapshot
 
     def close(self) -> None:
         for arena in (*self._nodes, *self._edges, *self._actions):
@@ -183,7 +202,7 @@ class LiveReadView:
                 if cached is not None:
                     return cached
                 raise RuntimeError(f"could not obtain coherent live {arena.kind} records") from None
-            self._record_cache[cache_key] = snapshot
+            self._remember_record_cut(arena, snapshot)
             return snapshot
         deadline = time.monotonic() + max(0.01, float(timeout))
         while time.monotonic() < deadline:
@@ -197,7 +216,7 @@ class LiveReadView:
             after = arena.sequence
             if before == after and not (after & 1):
                 snapshot = (rows, int(after))
-                self._record_cache[cache_key] = snapshot
+                self._remember_record_cut(arena, snapshot)
                 return snapshot
             if cached is not None:
                 return cached

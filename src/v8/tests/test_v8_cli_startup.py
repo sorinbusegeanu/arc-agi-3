@@ -61,6 +61,21 @@ class StartupGraphLineTests(unittest.TestCase):
             (),
         )
 
+    def test_complete_solution_sidecar_is_authoritative_during_identity_rebuild(self) -> None:
+        runtime = SimpleNamespace(
+            _v819_adaptive_learning=SimpleNamespace(
+                game_state=lambda _game: SimpleNamespace(value="UNSOLVED")
+            ),
+            _v814_trajectory_optimizer=SimpleNamespace(
+                _v819_best_successful={"ez01": {}, "ic02": {}}
+            ),
+        )
+
+        self.assertEqual(
+            _restored_solved_games(runtime, ("ez01", "ez02", "ic02")),
+            ("ez01", "ic02"),
+        )
+
     def test_restored_solved_line_omits_v8_continuous_prefix(self) -> None:
         self.assertEqual(
             _restored_solved_line(("ez01", "ls20")),
@@ -88,20 +103,23 @@ class HypothesisStartupDelayTests(unittest.TestCase):
             action_capacity_per_shard=16,
             snapshot_interval_seconds=60.0,
             no_snapshots=True,
-            no_peers=True,
+            no_peers=False,
             peer_interval_seconds=0.5,
             wait=0.0,
             actor_timeout=None,
             progress_interval_seconds=60.0,
             drain_timeout=1.0,
             final_save_timeout=1.0,
-            no_automatic_experiments=True,
-            max_transfer_experiments=0,
+            no_automatic_experiments=False,
+            max_transfer_experiments=2,
             transfer_experiment_steps=1,
         )
         runtime = Mock()
         runtime.read_view.memory_count = 0
-        runtime.peers = None
+        runtime.peers = Mock()
+        runtime._v819_adaptive_learning = SimpleNamespace(
+            game_state=lambda _game: SimpleNamespace(value="SOLVED_OPTIMIZING")
+        )
         runtime.metrics.return_value = {}
         runtime.scientific_statuses.return_value = {
             f"H{index:02d}": "INSUFFICIENT_EVIDENCE"
@@ -115,9 +133,14 @@ class HypothesisStartupDelayTests(unittest.TestCase):
         runtime.wait_quiescent.side_effect = lambda **_kwargs: lifecycle.append("runtime drained")
         runtime.metrics.side_effect = lambda: lifecycle.append("metrics") or {}
 
+        transfer_experiments = Mock(
+            return_value=SimpleNamespace(attempted=2, completed=1, passed=1)
+        )
+
         def run_jobs(_runtime, _jobs, **kwargs):
             self.assertEqual(runtime.scientific_statuses.call_count, 0)
             kwargs["progress_callback"](())
+            self.assertEqual(transfer_experiments.call_count, 0)
             self.assertEqual(runtime.scientific_statuses.call_count, 0)
             self.assertIs(kwargs["reporting_queue"], reporter.progress_queue)
             return ()
@@ -128,6 +151,10 @@ class HypothesisStartupDelayTests(unittest.TestCase):
             patch("v8.cli.ContinuousMemoryRuntime", return_value=runtime),
             patch("v8.cli.DedicatedReporter", return_value=reporter) as reporter_type,
             patch("v8.cli.run_actor_jobs", side_effect=run_jobs),
+            patch(
+                "v8.cli.run_automatic_transfer_experiments",
+                transfer_experiments,
+            ),
             patch("v8.cli._log") as log,
             patch("v8.cli.Path.write_text"),
         ):
@@ -140,9 +167,22 @@ class HypothesisStartupDelayTests(unittest.TestCase):
         reporter.close.assert_called_once_with()
         self.assertEqual(
             lifecycle,
-            ["reporter stopped", "runtime drained", "metrics"],
+            [
+                "reporter stopped",
+                "runtime drained",
+                "runtime drained",
+                "metrics",
+            ],
         )
         log.assert_any_call("sampling done")
+        log.assert_any_call(
+            "games tt01 have been solved before; optimizing solutions"
+        )
+        transfer_experiments.assert_called_once()
+        log.assert_any_call("automatic transfer experiments start trials=2")
+        log.assert_any_call(
+            "automatic transfer experiments done attempted=2 completed=1 passed=1"
+        )
         self.assertEqual(runtime.scientific_statuses.call_count, 1)
 
 

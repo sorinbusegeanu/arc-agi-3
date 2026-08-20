@@ -44,7 +44,19 @@ def _worker_until_completed_win(
     from v8 import actor as actor_module
     from v8 import adaptive_learning_allocation_v819 as v819
     from v8 import trajectory_inspection_v819 as inspection
+    from v8.publication import LiveReadView
 
+    # The parent keeps peers and canonical writers quiescent until every worker is
+    # ready. Capture one coherent cut inside that window. Each lease still gets a
+    # fresh LiveReadView (and therefore fresh game/planner state), but can fall back
+    # to the worker's latest coherent cut if live writers prevent a cold read.
+    record_cuts: dict[tuple[str, str], tuple[tuple[object, ...], int]] = {}
+    warm_view = LiveReadView(
+        read_descriptors,
+        refresh_interval_seconds=None,
+        record_cuts=record_cuts,
+    )
+    warm_view.close()
     ready_event.set()
     while not stop_event.is_set():
         try:
@@ -110,6 +122,7 @@ def _worker_until_completed_win(
                 snapshot_freeze=snapshot_freeze,
                 startup_ready=None,
                 startup_gate=None,
+                record_cuts=record_cuts,
             )
         finally:
             actor_module._reset_after_terminal_game = base_reset_after_terminal
