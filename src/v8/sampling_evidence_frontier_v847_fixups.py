@@ -2,35 +2,36 @@ from __future__ import annotations
 
 """Composition fixes for the v8.47 evidence-guided prefix frontier.
 
-v8.47 sequence expansion is search, not learned action persistence.  This layer
-routes sequence observations through the existing v8.33 -> v8.32 -> v8.44 stack
-before recording frontier evidence, so v8.44 remains the authority that decides
-whether an action has enough causal evidence to persist.
+v8.47 sequence expansion is search, not learned action persistence.  The v8.32
+public begin/reset/forced/observe methods remain authoritative.  This layer inserts
+frontier behavior underneath those methods, preserving the existing
+v8.33 -> v8.44 causal-proof composition.
 
-A newly reached same-level child may still be expanded immediately without a
-reset, but only when that exact child is the globally preferred evidence frontier.
-That is lazy best-first prefix expansion, not persistence: the next action is
-selected from the child's untried actions and may differ from the prior action.
-There is no internal sequence-length horizon.
+A newly reached same-level child may be expanded immediately without a reset only
+when that exact child is the globally preferred evidence frontier.  This is lazy
+best-first prefix expansion, not persistence: the next action is selected from the
+child's untried actions and may differ from the prior action.  There is no internal
+sequence-length horizon.
 """
 
 
 _INSTALLED = False
-_BASE_FORCED_ACTION = None
+_BASE_LOWER_RESET = None
+_BASE_LOWER_FORCED = None
+_BASE_LOWER_OBSERVE = None
 
 
 def _clear_continuation_v847(self) -> None:
     self._v847_continuation_node_id = None
 
 
-def _on_external_reset_v847_composed(self) -> None:
-    from v8 import sampling_evidence_frontier_v847 as frontier
-
+def _lower_reset_v847(self) -> None:
+    self._v847_active_expansion = None
     _clear_continuation_v847(self)
-    return frontier._on_external_reset_v847(self)
+    return _BASE_LOWER_RESET(self)
 
 
-def _forced_action_v847_composed(
+def _lower_forced_v847(
     self,
     *,
     level: int,
@@ -38,9 +39,9 @@ def _forced_action_v847_composed(
     actions: tuple[int, ...],
     history: tuple[int, ...],
 ) -> int | None:
-    """Use all older forced authorities first, then expand the live best child."""
+    """Use every older forced authority before expanding the live best child."""
 
-    forced = _BASE_FORCED_ACTION(
+    forced = _BASE_LOWER_FORCED(
         self,
         level=int(level),
         context=int(context),
@@ -63,17 +64,19 @@ def _forced_action_v847_composed(
         return None
     node, action = selected
     if str(node.node_id) != str(continuation):
-        # Another node has stronger evidence.  Leave it to the next SEQUENCE
-        # portfolio slot, which can reset/replay its stored anchor.
+        # Another node has stronger evidence. Leave it for the next SEQUENCE slot,
+        # which can reset/replay that node's stored anchor.
         _clear_continuation_v847(self)
         return None
     if (
         int(node.level) != int(level)
         or int(node.context) != int(context)
-        or tuple(int(value) for value in node.anchor) != tuple(int(value) for value in history)
+        or tuple(int(value) for value in node.anchor)
+        != tuple(int(value) for value in history)
     ):
         _clear_continuation_v847(self)
         return None
+
     available = {int(value) for value in actions}
     if int(action) not in available:
         node.available_actions.discard(int(action))
@@ -101,13 +104,15 @@ def _forced_action_v847_composed(
     return int(action)
 
 
-def _observe_transition_v847_composed(self, **kwargs) -> None:
+def _lower_observe_v847(self, **kwargs) -> None:
+    """Record sequence evidence while leaving v8.32 post-processing intact."""
+
     from v8 import sampling_evidence_frontier_v847 as frontier
 
     intervention = self.base.current
     if intervention is None or str(intervention.kind) != "SEQUENCE":
         _clear_continuation_v847(self)
-        return frontier._BASE_OBSERVE_TRANSITION(self, **kwargs)
+        return _BASE_LOWER_OBSERVE(self, **kwargs)
 
     active = getattr(self, "_v847_active_expansion", None)
     before_level = int(kwargs.get("before_level", 0))
@@ -128,10 +133,10 @@ def _observe_transition_v847_composed(self, **kwargs) -> None:
         else frontier._canonical_id(before_level, before_context)
     )
 
-    # Preserve the complete pre-v8.47 composition.  In particular, v8.32 may
-    # request persistence, but v8.44's wrapped _arm_persistence_v832 remains the
-    # causal-proof gate and rejects a merely productive singleton.
-    result = frontier._BASE_OBSERVE_TRANSITION(self, **kwargs)
+    # This calls the pre-v8.47 lower composition (v8.44 beneath v8.32). v8.32
+    # then resumes after this function and may request persistence; v8.44's wrapped
+    # arm function remains the causal-proof gate and rejects mere motion.
+    result = _BASE_LOWER_OBSERVE(self, **kwargs)
 
     destination = frontier._record_expansion_v847(
         self,
@@ -160,19 +165,26 @@ def _observe_transition_v847_composed(self, **kwargs) -> None:
 
 
 def install_sampling_evidence_frontier_v847_fixups() -> None:
-    global _INSTALLED, _BASE_FORCED_ACTION
+    global _INSTALLED
+    global _BASE_LOWER_RESET, _BASE_LOWER_FORCED, _BASE_LOWER_OBSERVE
     if _INSTALLED:
         return
 
-    from v8 import sampling_evidence_frontier_v847 as frontier
+    from v8 import sampling_persistence_v832 as persistence
     from v8 import sampling_portfolio_v831 as portfolio
 
     cls = portfolio.PortfolioSampler
-    _BASE_FORCED_ACTION = cls.forced_action
+    _BASE_LOWER_RESET = persistence._BASE_ON_EXTERNAL_RESET
+    _BASE_LOWER_FORCED = persistence._BASE_FORCED_ACTION
+    _BASE_LOWER_OBSERVE = persistence._BASE_OBSERVE_TRANSITION
 
-    # Keep v8.47 as the reset implementation but clear the live continuation
-    # marker before delegating through its v8.33/v8.32/v8.44 reset stack.
-    cls.on_external_reset = _on_external_reset_v847_composed
-    cls.forced_action = _forced_action_v847_composed
-    cls.observe_transition = _observe_transition_v847_composed
+    persistence._BASE_ON_EXTERNAL_RESET = _lower_reset_v847
+    persistence._BASE_FORCED_ACTION = _lower_forced_v847
+    persistence._BASE_OBSERVE_TRANSITION = _lower_observe_v847
+
+    # Preserve v8.32's public identities exactly as the v8.33/v8.44 compatibility
+    # layers do. v8.47 owns prepare_step/discovery and the internal frontier only.
+    cls.on_external_reset = persistence._on_external_reset_v832
+    cls.forced_action = persistence._forced_action_v832
+    cls.observe_transition = persistence._observe_transition_v832
     _INSTALLED = True
