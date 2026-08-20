@@ -11,7 +11,7 @@ from v8.actor import ActorJob, run_actor_jobs
 from v8.capacity import plan_capacities
 from v8.experiments import ExperimentSummary, run_automatic_transfer_experiments
 from v8.lifecycle_switch_v827 import LIFECYCLE_ENV
-from v8.reporter import DedicatedReporter
+from v8.reporter import DedicatedReporter, load_continuous_progress_baseline
 from v8.runtime import ContinuousMemoryRuntime, V8RuntimeConfig
 from v8.snapshot import latest_complete_snapshot
 
@@ -232,12 +232,18 @@ def run_continuous(args) -> int:
             restored_solved = _restored_solved_games(runtime, tuple(games))
             if restored_solved:
                 _log(_restored_solved_line(restored_solved))
+            progress_baseline = load_continuous_progress_baseline(
+                Path(args.root) / "log.txt",
+                games=games,
+                durable_solved_games=restored_solved,
+            )
             reporter = DedicatedReporter(
                 runtime._mp_ctx,
                 watermark=runtime._watermark,
                 actors=((job.actor_id, job.game_id) for job in jobs),
                 interval_seconds=args.progress_interval_seconds,
                 total_steps=total_steps,
+                baseline=progress_baseline,
             )
             reporter.start()
             if runtime.peers is not None:

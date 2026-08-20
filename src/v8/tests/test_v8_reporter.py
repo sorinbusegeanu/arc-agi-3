@@ -3,7 +3,9 @@ from __future__ import annotations
 import multiprocessing as mp
 import os
 import queue
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -17,7 +19,13 @@ from v8.actor import (
 )
 from v8.evidence import EvidenceLedger, EvidenceRecord
 from v8.model import MemoryLevel, MemoryUid, ValidationState
-from v8.reporter import SAMPLING_COMPLETE, DedicatedReporter, format_budget_game_rate_line
+from v8.reporter import (
+    SAMPLING_COMPLETE,
+    ContinuousProgressBaseline,
+    DedicatedReporter,
+    format_budget_game_rate_line,
+    load_continuous_progress_baseline,
+)
 
 
 def evidence(evidence_id: str, *, watermark: int = 1) -> EvidenceRecord:
@@ -204,6 +212,68 @@ class ActorProgressFanoutTests(unittest.TestCase):
         self.assertTrue(created[0].joined)
         self.assertFalse(created[1].started)
         self.assertFalse(created[1].joined)
+
+
+class ContinuousProgressBaselineTests(unittest.TestCase):
+    def test_log_high_water_and_durable_solutions_survive_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "log.txt"
+            log_path.write_text(
+                "[11:42] 97% - current_run_wins=38.9% "
+                "current_run_levels_solved=56.1% current_run_solved_games=14/36\n"
+                "[13:16] 48% - current_run_wins=5.6% "
+                "current_run_levels_solved=16.7% current_run_solved_games=2/36\n"
+                "[13:37] 0% - current_run_wins=0.0% "
+                "current_run_levels_solved=0.0% current_run_solved_games=0/36\n",
+                encoding="utf-8",
+            )
+
+            baseline = load_continuous_progress_baseline(
+                log_path,
+                games=(f"game-{index}" for index in range(36)),
+                durable_solved_games=(f"game-{index}" for index in range(14)),
+            )
+
+        self.assertEqual(baseline.solved_games, 14)
+        self.assertEqual(baseline.games, 36)
+        self.assertEqual(baseline.level_rate, 56.1)
+        self.assertEqual(len(baseline.game_ids), 14)
+
+    def test_first_report_retains_rates_while_new_budget_starts_at_zero(self) -> None:
+        rows = tuple(
+            ActorProgress(index + 1, f"game-{index}", 0, 0, 0, 0)
+            for index in range(36)
+        )
+        baseline = ContinuousProgressBaseline(
+            game_ids=tuple(f"game-{index}" for index in range(14)),
+            solved_games=14,
+            games=36,
+            level_rate=56.1,
+        )
+
+        line = format_budget_game_rate_line(rows, 36_000, baseline)
+
+        self.assertTrue(line.startswith("0% - current_run_wins=38.9%"))
+        self.assertIn("current_run_levels_solved=56.1%", line)
+        self.assertIn("current_run_solved_games=14/36", line)
+
+    def test_new_win_is_merged_with_durable_solved_game_ids(self) -> None:
+        rows = (
+            ActorProgress(1, "old", 10, 0, 0, 0),
+            ActorProgress(2, "new", 10, 1, 0, 5, first_win_step=10),
+        )
+        baseline = ContinuousProgressBaseline(
+            game_ids=("old",),
+            solved_games=1,
+            games=2,
+            level_rate=50.0,
+        )
+
+        line = format_budget_game_rate_line(rows, 200, baseline)
+
+        self.assertIn("current_run_wins=100.0%", line)
+        self.assertIn("current_run_levels_solved=100.0%", line)
+        self.assertIn("current_run_solved_games=2/2", line)
 
 
 class DedicatedReporterProcessTests(unittest.TestCase):

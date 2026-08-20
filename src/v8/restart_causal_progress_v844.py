@@ -13,7 +13,9 @@ The layer has two independent responsibilities:
 """
 
 import os
+import time
 from dataclasses import replace
+from pathlib import Path
 
 from v8.model import MemoryLevel, MemoryType, MemoryUid, ValidationState, stable_u64
 
@@ -297,7 +299,6 @@ def _refresh_variants_v844(self) -> None:
         return
 
     try:
-        from pathlib import Path
         from v8 import lifecycle_competence_integration_v827 as lifecycle
 
         index = lifecycle._lifecycle_index(self)
@@ -318,6 +319,22 @@ def _refresh_variants_v844(self) -> None:
             continue
         kept.append(row)
         seen.add(str(row.variant_id))
+
+    best = _cached_best_successful_variant(self, Path(root_raw), game)
+    if best is not None:
+        # A restart VERIFY lease exists to re-establish complete behavioral
+        # competence.  Level-local optimizer rows often have lower costs and the
+        # generic selector would otherwise choose them before the episode WIN.
+        kept = [
+            row
+            for row in kept
+            if str(row.anchor.source_id) != game
+            or str(row.target.terminal_state) == "WIN"
+        ]
+        seen = {str(row.variant_id) for row in kept}
+        if str(best.variant_id) not in seen:
+            kept.append(best)
+            seen.add(str(best.variant_id))
     kept.sort(
         key=lambda row: (
             0 if str(row.target.terminal_state) == "WIN" else 1,
@@ -327,6 +344,83 @@ def _refresh_variants_v844(self) -> None:
         )
     )
     self._v814_variants = tuple(kept)
+
+
+def _best_successful_variant(root: Path, game_id: str) -> object | None:
+    """Convert one validated complete-solution record into an ephemeral replay row."""
+
+    from v8 import trajectory_inspection_v819 as inspection
+    from v8 import trajectory_optimizer_v814 as optimizer
+
+    record = inspection._load_best_successful(root / "best_successful.json").get(
+        str(game_id)
+    )
+    if not isinstance(record, dict):
+        return None
+    levels = record.get("levels")
+    if not isinstance(levels, list) or not levels:
+        return None
+    segments = []
+    for level in levels:
+        if not isinstance(level, dict) or not isinstance(level.get("actions"), list):
+            return None
+        try:
+            actions = tuple(int(value) for value in level["actions"])
+        except (TypeError, ValueError):
+            return None
+        if not actions:
+            return None
+        segments.append(actions)
+    complete_actions = tuple(value for segment in segments for value in segment)
+    if not complete_actions:
+        return None
+
+    target_raw = dict(record.get("target", {}))
+    target_raw["levels_completed"] = len(segments)
+    target_raw["terminal_state"] = "WIN"
+    target = optimizer.TrajectoryTarget.from_dict(target_raw)
+    target_uid = getattr(target, "outcome_uid", MemoryUid.zero())
+    if not isinstance(target_uid, MemoryUid):
+        target_uid = MemoryUid.zero()
+    identity = str(record.get("variant_id") or record.get("trajectory_id") or "")
+    if not identity:
+        identity = f"{stable_u64(str(game_id), complete_actions, person=b'v8.44-best'):016x}"
+    attempts = max(1, int(record.get("attempts", 1)))
+    successes = max(1, int(record.get("successes", 1)))
+    return optimizer.ValidatedTrajectory(
+        f"restart-best:{game_id}:{identity}",
+        optimizer.ReplayAnchor(str(game_id), 0, (), None),
+        target,
+        complete_actions,
+        MemoryUid.zero(),
+        target_uid,
+        MemoryUid.zero(),
+        len(complete_actions),
+        "RESTORED_BEST_SUCCESSFUL",
+        attempts,
+        successes,
+    )
+
+
+def _cached_best_successful_variant(
+    self,
+    root: Path,
+    game_id: str,
+) -> object | None:
+    """Refresh a view-local complete replay at most once per second."""
+
+    key = (str(root), str(game_id))
+    now = time.monotonic()
+    if (
+        getattr(self, "_v844_best_successful_key", None) != key
+        or now >= float(getattr(self, "_v844_best_successful_next_refresh", 0.0))
+    ):
+        self._v844_best_successful_key = key
+        self._v844_best_successful_variant = _best_successful_variant(
+            root, str(game_id)
+        )
+        self._v844_best_successful_next_refresh = now + 1.0
+    return getattr(self, "_v844_best_successful_variant", None)
 
 
 def _runtime_init_v844(self, *args, **kwargs) -> None:

@@ -242,6 +242,98 @@ class RestartCausalProgressV844Tests(unittest.TestCase):
                 else:
                     os.environ[v819._SAMPLING_MODE_ENV] = prior_mode
 
+    def test_verify_replays_complete_best_successful_without_complete_validated_row(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            level_only = _validated(
+                variant="level-only",
+                seed=7,
+                actions=(1, 2),
+                cost_parent=2,
+                target_level=1,
+                terminal="LEVEL",
+            )
+            Path(root, "validated.json").write_text(
+                json.dumps({"version": 1, "validated": [level_only.to_dict()]}),
+                encoding="utf-8",
+            )
+            record = {
+                "environment_scope": "ez01",
+                "game_id": "ez01",
+                "source": "observed",
+                "target": {
+                    "kind": "BOUNDARY",
+                    "label": "EPISODE:+1",
+                    "boundary_scope": "EPISODE",
+                    "primary_valence": 1,
+                    "continuation": False,
+                    "outcome_uid": [0, 0],
+                    "local_scope": 0,
+                },
+                "total_cost": 5,
+                "segments": [
+                    {"segment": 0, "actions": [1, 1]},
+                    {"segment": 1, "actions": [2, 2, 2]},
+                ],
+                "levels": [
+                    {"level": 0, "actions": [1, 1]},
+                    {"level": 1, "actions": [2, 2, 2]},
+                ],
+                "attempts": 1,
+                "successes": 1,
+                "reliability": 1.0,
+                "trajectory_id": "observed-complete",
+            }
+            Path(root, "best_successful.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "target_schema_version": 2,
+                        "environments": {"ez01": record},
+                        "games": {"ez01": record},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            view = _EmptyLifecycleView()
+            prior_root = os.environ.get(optimizer._TRAJECTORY_ROOT_ENV)
+            prior_mode = os.environ.get(v819._SAMPLING_MODE_ENV)
+            prior_source = optimizer._CAPTURE_SOURCE_ID
+            try:
+                os.environ[optimizer._TRAJECTORY_ROOT_ENV] = root
+                os.environ[v819._SAMPLING_MODE_ENV] = v819.SamplingMode.VERIFY.value
+                optimizer._CAPTURE_SOURCE_ID = "ez01"
+                optimizer._refresh_view_variants(view)
+
+                complete = tuple(
+                    row
+                    for row in view._v814_variants
+                    if str(row.target.terminal_state) == "WIN"
+                )
+                self.assertEqual(len(complete), 1)
+                self.assertEqual(tuple(complete[0].actions), (1, 1, 2, 2, 2))
+                self.assertEqual(tuple(complete[0].anchor.prefix_actions), ())
+                self.assertTrue(complete[0].strategy_uid.is_zero)
+                selected = optimizer.select_validated_variant(
+                    view._v814_variants,
+                    source_id="ez01",
+                    seed=999,
+                    action_history=(),
+                )
+                self.assertIs(selected, complete[0])
+                persisted = optimizer._load_validated_rows(Path(root, "validated.json"))
+                self.assertEqual(len(persisted), 1)
+                self.assertEqual(persisted[0].target.terminal_state, "LEVEL")
+            finally:
+                optimizer._CAPTURE_SOURCE_ID = prior_source
+                if prior_root is None:
+                    os.environ.pop(optimizer._TRAJECTORY_ROOT_ENV, None)
+                else:
+                    os.environ[optimizer._TRAJECTORY_ROOT_ENV] = prior_root
+                if prior_mode is None:
+                    os.environ.pop(v819._SAMPLING_MODE_ENV, None)
+                else:
+                    os.environ[v819._SAMPLING_MODE_ENV] = prior_mode
+
     def test_unproven_motion_does_not_auto_promote_to_action_persistence(self) -> None:
         sampler = portfolio.PortfolioSampler("ez01", seed=1)
         sampler.begin_lease(1)

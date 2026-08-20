@@ -2,15 +2,75 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import queue
+import re
 import time
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable
 
 from v8.actor import ActorProgress
-from v8.diagnostics import format_game_rate_line
+from v8.diagnostics import format_game_rate_line, solved_game_ids
 from v8.evidence import EvidenceRecord
 
 
 SAMPLING_COMPLETE = "v8:reporter:sampling-complete"
+_PROGRESS_PATTERN = re.compile(
+    r"current_run_wins=(?P<wins>[0-9]+(?:\.[0-9]+)?)% "
+    r"current_run_levels_solved=(?P<levels>[0-9]+(?:\.[0-9]+)?)% "
+    r"current_run_solved_games=(?P<solved>[0-9]+)/(?P<games>[0-9]+)"
+)
+
+
+@dataclass(frozen=True)
+class ContinuousProgressBaseline:
+    """High-water competence observed under one continuous-run root."""
+
+    game_ids: tuple[str, ...] = ()
+    solved_games: int = 0
+    games: int = 0
+    level_rate: float = 0.0
+
+
+def load_continuous_progress_baseline(
+    log_path: str | Path,
+    *,
+    games: Iterable[str],
+    durable_solved_games: Iterable[str] = (),
+) -> ContinuousProgressBaseline:
+    """Recover progress across process restarts without modifying run artifacts."""
+    selected = tuple(dict.fromkeys(str(game_id) for game_id in games))
+    selected_set = set(selected)
+    durable = tuple(
+        game_id
+        for game_id in dict.fromkeys(str(game_id) for game_id in durable_solved_games)
+        if game_id in selected_set
+    )
+    best_solved = len(durable)
+    best_level_rate = 100.0 * best_solved / len(selected) if selected else 0.0
+
+    path = Path(log_path)
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        text = ""
+    for match in _PROGRESS_PATTERN.finditer(text):
+        if int(match.group("games")) != len(selected):
+            continue
+        solved = min(len(selected), max(0, int(match.group("solved"))))
+        level_rate = min(100.0, max(0.0, float(match.group("levels"))))
+        best_solved = max(best_solved, solved)
+        best_level_rate = max(best_level_rate, level_rate)
+
+    best_level_rate = max(
+        best_level_rate,
+        100.0 * best_solved / len(selected) if selected else 0.0,
+    )
+    return ContinuousProgressBaseline(
+        game_ids=durable,
+        solved_games=best_solved,
+        games=len(selected),
+        level_rate=best_level_rate,
+    )
 
 
 def _emit_line(message: str, output_queue: mp.Queue | None) -> None:
@@ -31,9 +91,33 @@ def _emit_sampling_complete(output_queue: mp.Queue | None) -> None:
 def format_budget_game_rate_line(
     rows: Iterable[ActorProgress],
     total_steps: int | None,
+    baseline: ContinuousProgressBaseline | None = None,
 ) -> str:
     rows = tuple(rows)
     line = format_game_rate_line(rows)
+    match = _PROGRESS_PATTERN.search(line)
+    if (
+        baseline is not None
+        and match is not None
+        and int(baseline.games) == int(match.group("games"))
+    ):
+        games = int(match.group("games"))
+        level_rate = float(match.group("levels"))
+        observed_ids = set(solved_game_ids(rows))
+        retained_ids = set(str(game_id) for game_id in baseline.game_ids)
+        solved_games = max(
+            int(baseline.solved_games),
+            len(observed_ids | retained_ids),
+        )
+        solved_games = min(games, solved_games)
+        win_rate = 100.0 * solved_games / games if games else 0.0
+        level_rate = max(float(baseline.level_rate), level_rate, win_rate)
+        headline = (
+            f"current_run_wins={win_rate:.1f}% "
+            f"current_run_levels_solved={level_rate:.1f}% "
+            f"current_run_solved_games={solved_games}/{games}"
+        )
+        line = line[: match.start()] + headline + line[match.end() :]
     budget = 0 if total_steps is None else max(0, int(total_steps))
     if budget <= 0:
         return line
@@ -51,6 +135,7 @@ def reporting_worker(
     interval_seconds: float,
     output_queue: mp.Queue | None = None,
     total_steps: int | None = None,
+    baseline: ContinuousProgressBaseline | None = None,
 ) -> None:
     latest = {
         int(actor_id): ActorProgress(int(actor_id), str(game_id), 0, 0, 0, 0)
@@ -81,7 +166,10 @@ def reporting_worker(
             continue
 
         rows = tuple(latest[key] for key in sorted(latest))
-        _emit_line(format_budget_game_rate_line(rows, total_steps), output_queue)
+        _emit_line(
+            format_budget_game_rate_line(rows, total_steps, baseline),
+            output_queue,
+        )
         while next_report <= now:
             next_report += float(interval_seconds)
 
@@ -98,6 +186,7 @@ class DedicatedReporter:
         interval_seconds: float = 60.0,
         output_queue: mp.Queue | None = None,
         total_steps: int | None = None,
+        baseline: ContinuousProgressBaseline | None = None,
     ) -> None:
         if interval_seconds <= 0:
             raise ValueError("reporting interval must be positive")
@@ -113,6 +202,7 @@ class DedicatedReporter:
                 "interval_seconds": float(interval_seconds),
                 "output_queue": output_queue,
                 "total_steps": total_steps,
+                "baseline": baseline,
             },
             name="v8-dedicated-reporter",
             daemon=True,

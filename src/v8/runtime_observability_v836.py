@@ -221,6 +221,7 @@ def _reporting_worker_v836(
     output_queue=None,
     hypothesis_interval_seconds: float = _HYPOTHESIS_INTERVAL_SECONDS,
     total_steps: int | None = None,
+    baseline=None,
 ) -> None:
     from v8 import reporter
     from v8.actor import ActorProgress
@@ -258,7 +259,7 @@ def _reporting_worker_v836(
         if now >= next_report:
             rows = tuple(latest[key] for key in sorted(latest))
             reporter._emit_line(
-                reporter.format_budget_game_rate_line(rows, total_steps),
+                reporter.format_budget_game_rate_line(rows, total_steps, baseline),
                 output_queue,
             )
             while next_report <= now:

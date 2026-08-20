@@ -163,6 +163,11 @@ class HypothesisStartupDelayTests(unittest.TestCase):
         reporter_type.assert_called_once()
         self.assertEqual(reporter_type.call_args.kwargs["interval_seconds"], 60.0)
         self.assertEqual(reporter_type.call_args.kwargs["total_steps"], 1)
+        progress_baseline = reporter_type.call_args.kwargs["baseline"]
+        self.assertEqual(progress_baseline.game_ids, ("tt01",))
+        self.assertEqual(progress_baseline.solved_games, 1)
+        self.assertEqual(progress_baseline.games, 1)
+        self.assertEqual(progress_baseline.level_rate, 100.0)
         reporter.start.assert_called_once_with()
         reporter.close.assert_called_once_with()
         self.assertEqual(
