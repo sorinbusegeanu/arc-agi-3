@@ -26,6 +26,8 @@ _INSTALLED = False
 _REPORT_FILE = "memory_efficiency.log"
 _SCHEMA_VERSION = 1
 _PROBATION_LOW_WINDOWS = 6
+_MEMORY_REPORT_INTERVAL_SECONDS = 300.0
+_MEMORY_REPORT_JOIN_SECONDS = 1.0
 _CURRENT_LEDGER = None
 _BASE_WRITE_ALLOCATION_LOG = None
 _BASE_RUNTIME_INIT = None
@@ -266,6 +268,11 @@ def _actor_memory_rows(root: str | Path) -> list[dict[str, object]]:
 def _runtime_init_v851(self, config) -> None:
     os.environ[_ROOT_ENV] = str(config.root)
     _BASE_RUNTIME_INIT(self, config)
+    self._v851_memory_report_lock = threading.Lock()
+    self._v851_memory_report_stop = threading.Event()
+    self._v851_memory_report_thread = None
+    self._v851_memory_report_next_due = 0.0
+    self._v851_memory_report_error = ""
 
 
 def _runtime_metrics_v851(self) -> dict[str, object]:
@@ -282,6 +289,12 @@ def _runtime_metrics_v851(self) -> dict[str, object]:
 def _runtime_cleanup_v851(self) -> None:
     global _CURRENT_LEDGER
     ledger = getattr(getattr(self, "peers", None), "ledger", None)
+    stop = getattr(self, "_v851_memory_report_stop", None)
+    if stop is not None:
+        stop.set()
+    thread = getattr(self, "_v851_memory_report_thread", None)
+    if thread is not None and thread is not threading.current_thread():
+        thread.join(timeout=_MEMORY_REPORT_JOIN_SECONDS)
     try:
         return _BASE_RUNTIME_CLEANUP(self)
     finally:
@@ -577,14 +590,61 @@ def _write_memory_efficiency_log(runtime) -> None:
         handle.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
 
 
+def _memory_report_state(runtime):
+    lock = getattr(runtime, "_v851_memory_report_lock", None)
+    if lock is None:
+        lock = threading.Lock()
+        runtime._v851_memory_report_lock = lock
+        runtime._v851_memory_report_stop = threading.Event()
+        runtime._v851_memory_report_thread = None
+        runtime._v851_memory_report_next_due = 0.0
+        runtime._v851_memory_report_error = ""
+    return lock, runtime._v851_memory_report_stop
+
+
+def _request_memory_efficiency_log(runtime, *, force: bool = False) -> bool:
+    """Start at most one expensive report without blocking lease dispatch."""
+    lock, stop = _memory_report_state(runtime)
+    with lock:
+        if stop.is_set():
+            return False
+        thread = getattr(runtime, "_v851_memory_report_thread", None)
+        if thread is not None and thread.is_alive():
+            return False
+        now = time.monotonic()
+        if not force and now < float(runtime._v851_memory_report_next_due):
+            return False
+
+        def run() -> None:
+            error = ""
+            try:
+                if not stop.is_set():
+                    _write_memory_efficiency_log(runtime)
+            except (OSError, RuntimeError, sqlite3.Error, BufferError, ValueError) as exc:
+                error = f"{type(exc).__name__}: {exc}"
+            finally:
+                with lock:
+                    runtime._v851_memory_report_error = error
+                    runtime._v851_memory_report_next_due = (
+                        time.monotonic() + _MEMORY_REPORT_INTERVAL_SECONDS
+                    )
+                    runtime._v851_memory_report_thread = None
+
+        thread = threading.Thread(
+            target=run,
+            name="v8-memory-efficiency-report",
+            daemon=True,
+        )
+        runtime._v851_memory_report_thread = thread
+        thread.start()
+        return True
+
+
 def _write_allocation_log_v851(runtime, coordinator, completed_by_game, active_progress, active_leases) -> None:
     _BASE_WRITE_ALLOCATION_LOG(
         runtime, coordinator, completed_by_game, active_progress, active_leases
     )
-    try:
-        _write_memory_efficiency_log(runtime)
-    except (OSError, RuntimeError, sqlite3.Error):
-        return
+    _request_memory_efficiency_log(runtime)
 
 
 def _reporting_worker_v851(

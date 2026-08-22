@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from unittest.mock import patch
 
 import v8  # noqa: F401 - install chronological runtime stack
 from v8 import adaptive_allocator_breadth_v840 as breadth
@@ -224,6 +225,10 @@ class AdaptiveAllocatorOccupancyV840Tests(unittest.TestCase):
                 {1: lease},
             )
         )
+
+    def test_periodic_deadline_is_based_on_work_completion_time(self) -> None:
+        with patch.object(v840.time, "monotonic", return_value=500.0):
+            self.assertEqual(v840._periodic_deadline(60.0), 560.0)
 
 
 if __name__ == "__main__":

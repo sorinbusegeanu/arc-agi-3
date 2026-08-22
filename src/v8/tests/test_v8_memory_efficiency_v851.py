@@ -3,8 +3,11 @@ from __future__ import annotations
 import hashlib
 import os
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from v8 import capacity
@@ -215,6 +218,64 @@ class MemoryEfficiencyV851Tests(unittest.TestCase):
         self.assertGreaterEqual(row["uss_bytes"], 0)
         system = memory._system_memory()
         self.assertIn("used_pct", system)
+
+    def test_allocation_logging_does_not_wait_for_memory_report(self):
+        runtime = SimpleNamespace(root="unused")
+        started = threading.Event()
+        release = threading.Event()
+        base_calls = []
+        report_calls = []
+
+        def slow_report(_runtime):
+            report_calls.append(True)
+            started.set()
+            release.wait(2.0)
+
+        with (
+            patch.object(
+                memory,
+                "_BASE_WRITE_ALLOCATION_LOG",
+                side_effect=lambda *args: base_calls.append(args),
+            ),
+            patch.object(
+                memory, "_write_memory_efficiency_log", side_effect=slow_report
+            ),
+        ):
+            before = time.monotonic()
+            memory._write_allocation_log_v851(runtime, object(), {}, {}, {})
+            elapsed = time.monotonic() - before
+            self.assertTrue(started.wait(1.0))
+            self.assertLess(elapsed, 0.5)
+            self.assertEqual(len(base_calls), 1)
+
+            memory._write_allocation_log_v851(runtime, object(), {}, {}, {})
+            self.assertEqual(len(base_calls), 2)
+            self.assertEqual(len(report_calls), 1)
+
+            thread = runtime._v851_memory_report_thread
+            self.assertIsNotNone(thread)
+            release.set()
+            thread.join(timeout=2.0)
+            self.assertFalse(thread.is_alive())
+
+    def test_memory_report_requests_are_rate_limited_after_completion(self):
+        runtime = SimpleNamespace(root="unused")
+        finished = threading.Event()
+
+        def report(_runtime):
+            finished.set()
+
+        with patch.object(memory, "_write_memory_efficiency_log", side_effect=report):
+            self.assertTrue(memory._request_memory_efficiency_log(runtime))
+            self.assertTrue(finished.wait(1.0))
+            thread = runtime._v851_memory_report_thread
+            if thread is not None:
+                thread.join(timeout=1.0)
+            self.assertFalse(memory._request_memory_efficiency_log(runtime))
+            self.assertTrue(memory._request_memory_efficiency_log(runtime, force=True))
+            thread = runtime._v851_memory_report_thread
+            if thread is not None:
+                thread.join(timeout=1.0)
 
 
 if __name__ == "__main__":

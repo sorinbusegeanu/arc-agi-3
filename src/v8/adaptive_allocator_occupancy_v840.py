@@ -107,6 +107,11 @@ def _sampling_budget_reported(
     )
 
 
+def _periodic_deadline(interval_seconds: float) -> float:
+    """Schedule from completed work, never from a stale pre-work timestamp."""
+    return time.monotonic() + float(interval_seconds)
+
+
 def _occupancy_bounded_lease_steps(
     recommended: int,
     *,
@@ -474,7 +479,7 @@ def _adaptive_run_actor_jobs_v840(
                     active_progress,
                     active_leases,
                 )
-                next_log = now + float(v819._ALLOCATION_LOG_SECONDS)
+                next_log = _periodic_deadline(v819._ALLOCATION_LOG_SECONDS)
             if now >= next_stdout:
                 perf._allocation_stdout_live(
                     coordinator,
@@ -482,7 +487,7 @@ def _adaptive_run_actor_jobs_v840(
                     active_progress,
                     active_leases,
                 )
-                next_stdout = now + float(v819._ALLOCATION_STDOUT_SECONDS)
+                next_stdout = _periodic_deadline(v819._ALLOCATION_STDOUT_SECONDS)
             if deadline is not None and now >= deadline:
                 raise TimeoutError("adaptive actor jobs timed out")
 
