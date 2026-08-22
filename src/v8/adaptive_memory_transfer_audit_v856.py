@@ -45,6 +45,29 @@ def _allowed_transfer_abstraction(row) -> bool:
     return False
 
 
+def _is_transfer_bookkeeping(row) -> bool:
+    return bool(
+        row is not None
+        and int(getattr(row, "level", -1)) == int(MemoryLevel.M4)
+        and int(getattr(row, "memory_type", -1)) == int(MemoryType.TRANSFER_EVIDENCE)
+    )
+
+
+def _structural_graph_without_transfer_bookkeeping(nodes, edges):
+    rows = tuple(nodes)
+    removed = {row.uid for row in rows if _is_transfer_bookkeeping(row)}
+    if not removed:
+        return rows, tuple(edges)
+    return (
+        tuple(row for row in rows if row.uid not in removed),
+        tuple(
+            edge
+            for edge in edges
+            if edge.source_uid not in removed and edge.target_uid not in removed
+        ),
+    )
+
+
 def _provenance_status(runtime, game_hash: int, uid, cache: dict) -> str:
     cached = cache.get(uid)
     if cached is not None:
@@ -183,8 +206,8 @@ def _transfer_candidates_v856(self, rows, edges=(), *, provenance=None):
 
 
 def _similarity_descriptors_v856(nodes, edges):
-    rows = tuple(nodes)
-    raw = _BASE_SIMILARITY_DESCRIPTORS(rows, tuple(edges))
+    rows, graph = _structural_graph_without_transfer_bookkeeping(nodes, edges)
+    raw = _BASE_SIMILARITY_DESCRIPTORS(rows, graph)
     allowed = {row.uid for row in rows if _allowed_transfer_abstraction(row)}
     return {uid: descriptor for uid, descriptor in raw.items() if uid in allowed}
 
@@ -230,11 +253,11 @@ def _structural_descriptors_v856(cls, uids, edges, by_uid):
 
 
 def _correspondence_evaluate_v856(self, nodes, edges, *, budget: int = 256):
-    rows = tuple(nodes)
+    rows, graph = _structural_graph_without_transfer_bookkeeping(nodes, edges)
     by_uid = {row.uid: row for row in rows}
-    filtered_edges = tuple(
+    graph = tuple(
         edge
-        for edge in edges
+        for edge in graph
         if int(edge.relation_type) != int(RelationType.SIMILAR_TO)
         or (
             _allowed_transfer_abstraction(by_uid.get(edge.source_uid))
@@ -244,7 +267,7 @@ def _correspondence_evaluate_v856(self, nodes, edges, *, budget: int = 256):
     return _BASE_CORRESPONDENCE_EVALUATE(
         self,
         rows,
-        filtered_edges,
+        graph,
         budget=budget,
     )
 
