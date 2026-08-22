@@ -52,8 +52,6 @@ def _with_expanded_fallback(view, callback, *, cache_attr: str):
         return callback()
     finally:
         view._strategy_fallback = list(original) if original_is_list else original
-        # Do not restore an old cache built from the narrower candidate pool. The
-        # result produced during this explicit transfer call remains the valid cache.
         if getattr(view, cache_attr, None) is None and prior_cache is not None:
             setattr(view, cache_attr, prior_cache)
 
@@ -121,8 +119,6 @@ def _plan_chain_v856(self, context_signature, action_ids, **kwargs):
                 ),
             )
 
-    # v854's own transfer wrapper would call _ordered_action a second time and can
-    # advance an active composite twice. Delegate directly to its pre-v854 chain.
     return v854._BASE_PLAN_CHAIN(self, context_signature, action_ids, **kwargs)
 
 
@@ -132,15 +128,17 @@ def install_adaptive_memory_transfer_candidate_pool_v856() -> None:
     if _INSTALLED:
         return
 
-    from v8 import environment_neutrality_v837 as v837
+    from v8 import adaptive_memory_transfer_grounding_v856 as grounding
     from v8 import learning_transfer_correctness_v854 as v854
     from v8 import sampling_portfolio_v831 as portfolio
 
-    _BASE_GROUNDED_TRANSFER = v837._grounded_transfer_index
+    # Compose beneath the v8.56 grounding authority so historical/public hook
+    # identity remains stable while the first explicit probe sees all exact rows.
+    _BASE_GROUNDED_TRANSFER = grounding._BASE_GROUNDED_TRANSFER
+    grounding._BASE_GROUNDED_TRANSFER = _grounded_transfer_candidates_v856
     _BASE_ORDERED_SEQUENCES = v854._ordered_sequences
     _BASE_PLAN_CHAIN = portfolio._BASE_PLAN_CHAIN
 
-    v837._grounded_transfer_index = _grounded_transfer_candidates_v856
     v854._ordered_sequences = _ordered_transfer_candidates_v856
     portfolio._BASE_PLAN_CHAIN = _plan_chain_v856
 
