@@ -44,6 +44,7 @@ _REFRESH_CURSOR = 0
 _REFRESH_MAX_EVENTS = 2048
 _REFRESH_MAX_EVENTS_PER_FILE = 128
 _REFRESH_MAX_SECONDS = 0.05
+_FRONTIER_LEGACY_MAX_BYTES = 1024 * 1024
 
 _COUNTER_FIELDS = (
     "steps",
@@ -532,12 +533,19 @@ def _frontier_metrics(game_id: str) -> dict[str, int]:
         return result
     token = frontier._game_token(str(game_id))
     for path in sorted(root.glob(f"{token}-*.json")):
+        metrics_path = path.with_suffix(".metrics")
+        source = metrics_path if metrics_path.exists() else path
         try:
-            stat = path.stat()
+            stat = source.stat()
         except OSError:
             continue
+        if source == path and int(stat.st_size) > _FRONTIER_LEGACY_MAX_BYTES:
+            # Older frontier payloads contain every prefix node and can be many
+            # megabytes per actor.  Reporting must remain bounded; an actor will
+            # write the compact metrics sidecar on its next dirty save.
+            continue
         signature = (int(stat.st_ino), int(stat.st_size), int(stat.st_mtime_ns))
-        cached = _FRONTIER_FILE_CACHE.get(str(path))
+        cached = _FRONTIER_FILE_CACHE.get(str(source))
         if cached is not None and cached[0] == signature:
             cached_game, metrics = cached[1], cached[2]
             if cached_game == str(game_id):
@@ -545,7 +553,7 @@ def _frontier_metrics(game_id: str) -> dict[str, int]:
                     result[field] += int(value)
             continue
         try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
+            raw = json.loads(source.read_text(encoding="utf-8"))
         except (OSError, ValueError, TypeError):
             continue
         cached_game = str(raw.get("game_id", ""))
@@ -555,29 +563,41 @@ def _frontier_metrics(game_id: str) -> dict[str, int]:
             "suppressed_click_noop_frontiers": 0,
         }
         if cached_game != str(game_id):
-            _FRONTIER_FILE_CACHE[str(path)] = (signature, cached_game, metrics)
+            _FRONTIER_FILE_CACHE[str(source)] = (signature, cached_game, metrics)
             continue
-        for item in raw.get("nodes", ()):
-            if not isinstance(item, dict):
-                continue
-            available = {int(value) for value in item.get("available_actions", ())}
-            tried = {int(value) for value in item.get("tried_actions", ())}
-            anchor = tuple(int(value) for value in item.get("anchor", ()))
-            click_available = {value for value in available if _click()._is_click_token(value)}
-            click_expandable = click_available - tried
-            if click_available or (anchor and _click()._is_click_token(anchor[-1])):
-                metrics["click_frontier_nodes"] += 1
-            if click_expandable:
-                metrics["click_frontier_expandable"] += 1
-            if bool(item.get("latent", False)) and anchor and _click()._is_click_token(anchor[-1]):
-                metrics["suppressed_click_noop_frontiers"] += 1
+        if source == metrics_path:
+            for field in metrics:
+                metrics[field] = max(0, int(raw.get(field, 0)))
+        else:
+            for item in raw.get("nodes", ()):
+                if not isinstance(item, dict):
+                    continue
+                available = {int(value) for value in item.get("available_actions", ())}
+                tried = {int(value) for value in item.get("tried_actions", ())}
+                anchor = tuple(int(value) for value in item.get("anchor", ()))
+                click_available = {
+                    value for value in available if _click()._is_click_token(value)
+                }
+                click_expandable = click_available - tried
+                if click_available or (
+                    anchor and _click()._is_click_token(anchor[-1])
+                ):
+                    metrics["click_frontier_nodes"] += 1
+                if click_expandable:
+                    metrics["click_frontier_expandable"] += 1
+                if (
+                    bool(item.get("latent", False))
+                    and anchor
+                    and _click()._is_click_token(anchor[-1])
+                ):
+                    metrics["suppressed_click_noop_frontiers"] += 1
         try:
-            after = path.stat()
+            after = source.stat()
             after_signature = (int(after.st_ino), int(after.st_size), int(after.st_mtime_ns))
         except OSError:
             after_signature = ()
         if after_signature == signature:
-            _FRONTIER_FILE_CACHE[str(path)] = (signature, cached_game, metrics)
+            _FRONTIER_FILE_CACHE[str(source)] = (signature, cached_game, metrics)
         for field, value in metrics.items():
             result[field] += int(value)
     return result

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
@@ -343,11 +344,18 @@ class EvidencePrefixFrontierV847Tests(unittest.TestCase):
             node.prediction_error = 0.8
             first._v847_dirty = True
             v847._save_sampler_state_v847(first)
+            metrics_path = v847._state_path_v847(first).with_suffix(".metrics")
+            metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+            self.assertEqual(metrics["game_id"], "g")
+            self.assertEqual(metrics["click_frontier_nodes"], 0)
+
+            metrics_path.unlink()
 
             sampling._SAMPLERS.clear()
             second = v847._sampler_for_v847(
                 SimpleNamespace(actor_id=2, game_id="g", seed=8)
             )
+            self.assertTrue(metrics_path.exists())
             restored = second._v847_nodes.get("C:2:99")
             self.assertIsNotNone(restored)
             self.assertEqual(restored.anchor, (4, 5, 6, 7, 8))

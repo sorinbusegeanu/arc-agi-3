@@ -431,6 +431,35 @@ class ActionFrontierReportSchedulingTests(unittest.TestCase):
         self.assertEqual(first["click_frontier_expandable"], 1)
         self.assertEqual(first["suppressed_click_noop_frontiers"], 1)
 
+    def test_frontier_metrics_sidecar_avoids_large_node_payload(self):
+        from v8 import sampling_evidence_frontier_v847 as frontier
+
+        with tempfile.TemporaryDirectory() as tmp:
+            trajectory_root = Path(tmp) / "trajectory_optimizer"
+            frontier_root = trajectory_root / frontier._STATE_DIR
+            frontier_root.mkdir(parents=True)
+            path = frontier_root / f"{frontier._game_token('click')}-1.json"
+            path.write_text("large payload must not be parsed", encoding="utf-8")
+            path.with_suffix(".metrics").write_text(
+                json.dumps(
+                    {
+                        "schema": 1,
+                        "game_id": "click",
+                        "click_frontier_nodes": 11,
+                        "click_frontier_expandable": 7,
+                        "suppressed_click_noop_frontiers": 3,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            os.environ[report._TRAJECTORY_ROOT_ENV] = str(trajectory_root)
+
+            metrics = report._frontier_metrics("click")
+
+        self.assertEqual(metrics["click_frontier_nodes"], 11)
+        self.assertEqual(metrics["click_frontier_expandable"], 7)
+        self.assertEqual(metrics["suppressed_click_noop_frontiers"], 3)
+
 
 if __name__ == "__main__":
     unittest.main()

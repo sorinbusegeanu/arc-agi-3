@@ -314,6 +314,61 @@ def _state_path_v847(sampler) -> Path | None:
     return Path(root) / f"{_game_token(sampler.game_id)}-{actor_id}.json"
 
 
+def _action_learning_metrics_v847(
+    nodes: dict[str, EvidencePrefixNode],
+) -> dict[str, int]:
+    from v8.action_targeting_v810 import native_action_id
+
+    result = {
+        "click_frontier_nodes": 0,
+        "click_frontier_expandable": 0,
+        "suppressed_click_noop_frontiers": 0,
+    }
+    for node in nodes.values():
+        click_available = {
+            int(value)
+            for value in node.available_actions
+            if int(native_action_id(int(value))) == 6
+        }
+        click_anchor = bool(
+            node.anchor and int(native_action_id(int(node.anchor[-1]))) == 6
+        )
+        if click_available or click_anchor:
+            result["click_frontier_nodes"] += 1
+        if click_available - node.tried_actions:
+            result["click_frontier_expandable"] += 1
+        if bool(node.latent) and click_anchor:
+            result["suppressed_click_noop_frontiers"] += 1
+    return result
+
+
+def _write_action_learning_metrics_v847(
+    path: Path,
+    *,
+    game_id: str,
+    nodes: dict[str, EvidencePrefixNode],
+) -> None:
+    metrics_path = path.with_suffix(".metrics")
+    try:
+        if metrics_path.stat().st_mtime_ns >= path.stat().st_mtime_ns:
+            return
+    except OSError:
+        pass
+    metrics_payload = {
+        "schema": _STATE_SCHEMA,
+        "game_id": str(game_id),
+        **_action_learning_metrics_v847(nodes),
+    }
+    metrics_temporary = metrics_path.with_name(
+        f".{metrics_path.name}.{os.getpid()}.tmp"
+    )
+    metrics_temporary.write_text(
+        json.dumps(metrics_payload, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    os.replace(metrics_temporary, metrics_path)
+
+
 def _save_sampler_state_v847(sampler) -> None:
     nodes = _ensure_state_v847(sampler)
     path = _state_path_v847(sampler)
@@ -331,6 +386,11 @@ def _save_sampler_state_v847(sampler) -> None:
         encoding="utf-8",
     )
     os.replace(temporary, path)
+    _write_action_learning_metrics_v847(
+        path,
+        game_id=str(sampler.game_id),
+        nodes=nodes,
+    )
     sampler._v847_dirty = False
 
 
@@ -352,6 +412,7 @@ def _load_sampler_state_v847(sampler) -> None:
                 continue
             if str(raw.get("game_id", "")) != str(sampler.game_id):
                 continue
+            source_nodes: dict[str, EvidencePrefixNode] = {}
             for item in raw.get("nodes", ()):
                 if not isinstance(item, dict):
                     continue
@@ -360,7 +421,18 @@ def _load_sampler_state_v847(sampler) -> None:
                 except (TypeError, ValueError):
                     continue
                 if node.node_id:
+                    source_nodes[node.node_id] = node
                     _upsert_node_v847(sampler, node)
+            try:
+                _write_action_learning_metrics_v847(
+                    path,
+                    game_id=str(sampler.game_id),
+                    nodes=source_nodes,
+                )
+            except OSError:
+                # The frontier itself remains usable on read-only or transiently
+                # contended roots; reporting falls back to bounded legacy rules.
+                pass
     sampler._v847_dirty = False
     sampler._v847_loaded_root = str(root)
 
