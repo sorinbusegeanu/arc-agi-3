@@ -19,8 +19,12 @@ from v8.sampling_portfolio_v831 import PortfolioSampler
 
 
 class _SyntheticClickEnvironment:
-    def __init__(self, *, width: int, height: int, seed: int = 0) -> None:
-        self._last_grid = np.full((height * 8, width * 8), 7, dtype=np.int64)
+    def __init__(
+        self, *, width: int, height: int, seed: int = 0, scale: int = 8
+    ) -> None:
+        self._last_grid = np.full(
+            (height * int(scale), width * int(scale)), 7, dtype=np.int64
+        )
         self.env = SimpleNamespace(
             _game=SimpleNamespace(
                 camera=SimpleNamespace(width=width, height=height, x=0, y=0),
@@ -112,7 +116,9 @@ class CompleteClickCoverageTests(unittest.TestCase):
             )
 
     def test_click_scan_keeps_long_observable_sweep_in_one_episode(self):
-        env = _SyntheticClickEnvironment(width=10, height=6, seed=0)
+        # 60 distinct cells while the rendered display remains inside the exact
+        # action codec's [0,63] coordinate contract.
+        env = _SyntheticClickEnvironment(width=10, height=6, seed=0, scale=6)
         sampler = PortfolioSampler("click-scan-fixture", seed=0)
         sampler.begin_lease(0)
         history: list[int] = []
