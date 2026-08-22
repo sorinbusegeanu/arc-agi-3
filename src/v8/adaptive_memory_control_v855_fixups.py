@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """Post-review correctness fixes for v8.55 adaptive M7 arbitration."""
 
+import math
 import os
 
 from v8.model import stable_u64
@@ -61,11 +62,79 @@ def _strategy_failure_evidence(node) -> int:
     return max(0, min(6, int(round(recent_window * (1.0 - reliability)))))
 
 
+def _composite_plans_cached(self, context_signature: int, available):
+    """Return exact composite plans without rescanning the full actor graph per step."""
+    from v8 import learning_blockers_v055 as blockers
+    from v8.model import MemoryUid
+    from v8.publication import PlannedAction
+
+    version = tuple(getattr(self, "_strategy_version", ()))
+    if getattr(self, "_v855_composite_index_version", None) != version:
+        by_context = {}
+        for row in getattr(self, "_node_by_uid", {}).values():
+            if blockers.is_composite_strategy(row):
+                by_context.setdefault(int(row.key_parts[3]), []).append(row)
+        for rows in by_context.values():
+            rows.sort(key=lambda row: row.uid)
+        self._v855_composite_index_version = version
+        self._v855_composite_by_context = by_context
+        self._v855_composite_path_cache = {}
+        self._v855_composite_plan_cache = {}
+
+    context = int(context_signature)
+    plan_cache = getattr(self, "_v855_composite_plan_cache", {})
+    plans = plan_cache.get(context)
+    if plans is None:
+        path_cache = getattr(self, "_v855_composite_path_cache", {})
+        built = []
+        for row in getattr(self, "_v855_composite_by_context", {}).get(context, ()):
+            path = path_cache.get(row.uid)
+            if path is None:
+                path = tuple(blockers._path_for_composite(self, row, context))
+                path_cache[row.uid] = path
+            if not path:
+                continue
+            action = int(path[0].key_parts[1])
+            outcome_uid = MemoryUid(int(row.key_parts[1]), int(row.key_parts[2]))
+            outcome = getattr(self, "_node_by_uid", {}).get(outcome_uid)
+            strategy_value = float(getattr(row, "expected_primary_valence", 0.0)) * float(
+                getattr(row, "primary_valence_confidence", 0.0)
+            )
+            outcome_value = (
+                0.0
+                if outcome is None
+                else float(getattr(outcome, "expected_primary_valence", 0.0))
+                * float(getattr(outcome, "primary_valence_confidence", 0.0))
+            )
+            reliability = float(getattr(row, "strategy_reliability", 0.0))
+            support = max(0, int(getattr(row, "support_count", 0)))
+            sequence_efficiency = 1.0 / max(1, len(path))
+            probe_bonus = 0.10 if float(getattr(row, "attempt_weight", 0.0)) < 3.0 else 0.0
+            score = (
+                reliability
+                + 1.5 * strategy_value
+                + outcome_value
+                + 0.10 * sequence_efficiency
+                + 0.05 * math.log1p(support)
+                + probe_bonus
+            )
+            built.append(
+                PlannedAction(action, outcome_uid, row.uid, float(score), False)
+            )
+        built.sort(key=lambda item: (-item.score, item.action_id, item.strategy_uid))
+        plans = tuple(built)
+        plan_cache[context] = plans
+        self._v855_composite_path_cache = path_cache
+        self._v855_composite_plan_cache = plan_cache
+
+    allowed = {int(value) for value in available}
+    return tuple(plan for plan in plans if int(plan.action_id) in allowed)
+
+
 def _adaptive_candidates(self, context_signature: int, available, **kwargs):
     """Combine ordinary exact-context M7 with exact composite procedures."""
     from v8 import adaptive_memory_control_v855 as v855
     from v8 import behavior_recovery as behavior
-    from v8 import learning_blockers_v055 as blockers
 
     ordinary, ordinary_probationary = v855._exact_m7_candidates(
         self,
@@ -77,7 +146,7 @@ def _adaptive_candidates(self, context_signature: int, available, **kwargs):
     probes = list(ordinary if ordinary_probationary else ())
 
     try:
-        composite = tuple(blockers._composite_plans(self, int(context_signature), available))
+        composite = _composite_plans_cached(self, int(context_signature), available)
     except (AttributeError, RuntimeError, TypeError, ValueError):
         composite = ()
     for plan in composite:
@@ -148,7 +217,9 @@ def _arm_composite(self, context_signature: int, plan) -> None:
     row = getattr(self, "_node_by_uid", {}).get(plan.strategy_uid)
     if row is None or not blockers.is_composite_strategy(row):
         return
-    path = blockers._path_for_composite(self, row, int(context_signature))
+    path = getattr(self, "_v855_composite_path_cache", {}).get(plan.strategy_uid)
+    if path is None:
+        path = tuple(blockers._path_for_composite(self, row, int(context_signature)))
     if path:
         self._v055_active_sequence = (
             plan.strategy_uid,
