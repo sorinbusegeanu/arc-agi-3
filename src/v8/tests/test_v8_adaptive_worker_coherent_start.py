@@ -52,7 +52,7 @@ class AdaptiveWorkerCoherentStartTests(unittest.TestCase):
             )
 
         with (
-            patch("v8.publication.LiveReadView", FakeView),
+            patch("v8.actor.LiveReadView", FakeView),
             patch("v8.actor.actor_worker", actor_worker),
         ):
             worker_fix._worker_until_completed_win(
@@ -71,6 +71,46 @@ class AdaptiveWorkerCoherentStartTests(unittest.TestCase):
 
         self.assertTrue(ready.is_set())
         self.assertEqual(seen, [(True, (("coherent",), 2))])
+
+    def test_worker_prefers_compact_actor_warmup_over_full_publication_view(self) -> None:
+        assignments = queue.Queue()
+        assignments.put(None)
+        ready = threading.Event()
+        stop = threading.Event()
+
+        class CompactView:
+            def __init__(self, _descriptors, *, refresh_interval_seconds, record_cuts):
+                self.record_cuts = record_cuts
+
+            def _warm_compact_cut(self):
+                self.record_cuts.clear()
+                self.record_cuts[("v851", "actor-compact-cut")] = (("compact",), 1)
+
+            def close(self):
+                return None
+
+        def forbidden_full_view(*_args, **_kwargs):
+            raise AssertionError("adaptive worker decoded a full publication view")
+
+        with (
+            patch("v8.actor.LiveReadView", CompactView),
+            patch("v8.publication.LiveReadView", side_effect=forbidden_full_view),
+        ):
+            worker_fix._worker_until_completed_win(
+                worker_id=22,
+                assignment_queue=assignments,
+                event_queue=queue.Queue(),
+                ready_event=ready,
+                experience_ring_args={},
+                read_descriptors=(),
+                watermark=None,
+                stop_event=stop,
+                actor_throttle=None,
+                snapshot_freeze=None,
+                trajectory_root="unused",
+            )
+
+        self.assertTrue(ready.is_set())
 
 
 if __name__ == "__main__":

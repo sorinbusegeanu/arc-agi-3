@@ -17,7 +17,7 @@ from v8 import memory_efficiency_v851_integrity as integrity
 from v8 import memory_efficiency_v851_suite_fix as suite_fix
 from v8 import memory_storage_v851 as storage
 from v8 import runtime_stack_v88
-from v8.actor_read_view_v851 import ActorReadView
+from v8.actor_read_view_v851 import ActorReadView, _COMPACT_CUT_KEY
 from v8.arena import ActionRecord, SharedActionArena, SharedEdgeArena, SharedNodeArena
 from v8.evidence import EvidenceRecord
 from v8.evidence_memory_v851 import DiskBackedEvidenceLedger, _ROOT_ENV
@@ -57,6 +57,41 @@ class MemoryEfficiencyV851Tests(unittest.TestCase):
         finally:
             if view is not None:
                 view.close()
+            nodes.dispose()
+            edges.dispose()
+            actions.dispose()
+
+    def test_actor_compact_cut_is_reused_without_full_record_snapshots(self):
+        nodes = SharedNodeArena(capacity=16)
+        edges = SharedEdgeArena(capacity=16)
+        actions = SharedActionArena(capacity=16)
+        descriptor = ShardReadDescriptor(nodes.descriptor, edges.descriptor, actions.descriptor)
+        cuts = {}
+        first = second = None
+        try:
+            first = ActorReadView(
+                (descriptor,), refresh_interval_seconds=None, record_cuts=cuts
+            )
+            first._warm_compact_cut()
+            self.assertEqual(set(cuts), {_COMPACT_CUT_KEY})
+            self.assertEqual(first._record_cache, {})
+
+            with patch.object(
+                ActorReadView,
+                "_scan_node_arena",
+                side_effect=AssertionError("compact startup cut was not reused"),
+            ):
+                second = ActorReadView(
+                    (descriptor,), refresh_interval_seconds=None, record_cuts=cuts
+                )
+                self.assertEqual(second.node_records(), ())
+                self.assertEqual(second.edge_records(), ())
+                self.assertEqual(second._record_cache, {})
+        finally:
+            if second is not None:
+                second.close()
+            if first is not None:
+                first.close()
             nodes.dispose()
             edges.dispose()
             actions.dispose()

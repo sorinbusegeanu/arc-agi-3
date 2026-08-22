@@ -28,6 +28,8 @@ _PROBE_STATES = _ACTIVE_STATES | {
     int(CognitiveState.CANDIDATE),
     int(CognitiveState.PROBATION),
 }
+_COMPACT_CUT_KEY = ("v851", "actor-compact-cut")
+_COMPACT_CUT_SCHEMA = 1
 
 
 class ActorReadView(LiveReadView):
@@ -48,6 +50,69 @@ class ActorReadView(LiveReadView):
         self._v851_bootstrapping = False
         self._strategy_cache_stale = True
         self._strategy_version = ()
+        self._restore_compact_cut()
+
+    def _restore_compact_cut(self) -> bool:
+        cuts = getattr(self, "_record_cuts", None)
+        if cuts is None:
+            return False
+        raw = cuts.get(_COMPACT_CUT_KEY)
+        if not isinstance(raw, tuple) or len(raw) != 2:
+            return False
+        payload, schema = raw
+        if schema != _COMPACT_CUT_SCHEMA or not isinstance(payload, tuple):
+            return False
+        if len(payload) != 11:
+            return False
+        (
+            self._parents,
+            self._node_by_uid,
+            self._strategy_by_context,
+            self._strategy_fallback,
+            self._preferred_outcomes,
+            self._suppressed_outcomes,
+            self._refined_action_scores,
+            self._outcome_counts,
+            self._outcome_totals,
+            self._v851_compact_nodes,
+            edge_state,
+        ) = payload
+        self._v851_compact_edges, self._strategy_version = edge_state
+        self._strategy_cache_stale = False
+        if self._refresh_interval_seconds is not None:
+            self._next_strategy_refresh = time.monotonic() + self._refresh_interval_seconds
+        try:
+            from v8 import behavior_recovery
+
+            behavior_recovery._refresh_behavior_indexes(self)
+        except (AttributeError, ImportError):
+            pass
+        return True
+
+    def _publish_compact_cut(self) -> None:
+        cuts = getattr(self, "_record_cuts", None)
+        if cuts is None:
+            return
+        payload = (
+            self._parents,
+            self._node_by_uid,
+            self._strategy_by_context,
+            self._strategy_fallback,
+            self._preferred_outcomes,
+            self._suppressed_outcomes,
+            self._refined_action_scores,
+            self._outcome_counts,
+            self._outcome_totals,
+            self._v851_compact_nodes,
+            (self._v851_compact_edges, self._strategy_version),
+        )
+        cuts.clear()
+        cuts[_COMPACT_CUT_KEY] = (payload, _COMPACT_CUT_SCHEMA)
+
+    def _warm_compact_cut(self) -> None:
+        """Build the reusable coherent actor cut before writers resume."""
+        self._strategy_cache_stale = True
+        self._refresh_strategy_cache()
 
     def _stable_records_with_version(self, arena, *, timeout: float = 1.0):
         if getattr(self, "_v851_bootstrapping", False) or not getattr(self, "_v851_ready", False):
@@ -362,3 +427,4 @@ class ActorReadView(LiveReadView):
             behavior_recovery._refresh_behavior_indexes(self)
         except (AttributeError, ImportError):
             pass
+        self._publish_compact_cut()
