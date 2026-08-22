@@ -9,6 +9,7 @@ from v8 import capacity
 from v8 import memory_efficiency_v851 as memory
 from v8 import memory_efficiency_v851_fixups as fixups
 from v8 import memory_efficiency_v851_integrity as integrity
+from v8 import memory_efficiency_v851_suite_fix as suite_fix
 from v8 import memory_storage_v851 as storage
 from v8 import runtime_stack_v88
 from v8.actor_read_view_v851 import ActorReadView
@@ -22,16 +23,18 @@ from v8.publication import ShardReadDescriptor
 class MemoryEfficiencyV851Tests(unittest.TestCase):
     def test_runtime_stack_installs_v851_layers_last(self):
         self.assertEqual(
-            runtime_stack_v88._POST_LAYERS[-3:],
+            runtime_stack_v88._POST_LAYERS[-4:],
             (
                 "memory_efficiency_v851",
                 "memory_efficiency_v851_fixups",
                 "memory_efficiency_v851_integrity",
+                "memory_efficiency_v851_suite_fix",
             ),
         )
         self.assertTrue(memory._INSTALLED)
         self.assertTrue(fixups._INSTALLED)
         self.assertTrue(integrity._INSTALLED)
+        self.assertTrue(suite_fix._INSTALLED)
         self.assertTrue(storage._INSTALLED)
 
     def test_actor_read_view_does_not_retain_full_record_cut_cache(self):
@@ -141,7 +144,7 @@ class MemoryEfficiencyV851Tests(unittest.TestCase):
         else:
             os.environ[_ROOT_ENV] = prior
 
-    def test_capacity_plan_does_not_keep_historical_capacity_or_large_legacy_floor(self):
+    def test_capacity_plan_shrinks_node_edge_but_preserves_exact_action_table(self):
         historical = capacity.SnapshotUsage(
             node_count=100,
             edge_count=200,
@@ -158,10 +161,34 @@ class MemoryEfficiencyV851Tests(unittest.TestCase):
             )
         self.assertEqual(plan.node_capacity_per_shard, integrity._MIN_NODE_CAPACITY)
         self.assertEqual(plan.edge_capacity_per_shard, integrity._MIN_EDGE_CAPACITY)
-        self.assertEqual(plan.action_capacity_per_shard, integrity._MIN_ACTION_CAPACITY)
+        self.assertEqual(plan.action_capacity_per_shard, historical.action_capacity)
         self.assertLess(plan.node_capacity_per_shard, historical.node_capacity)
         self.assertLess(plan.edge_capacity_per_shard, historical.edge_capacity)
-        self.assertLess(plan.action_capacity_per_shard, historical.action_capacity)
+
+    def test_manual_fresh_capacity_override_is_exact(self):
+        plan = capacity.plan_capacities(
+            total_steps=10_000_000,
+            shards=4,
+            restore=False,
+            node_override=123_456,
+            edge_override=234_567,
+            action_override=34_567,
+        )
+        self.assertEqual(plan.node_capacity_per_shard, 123_456)
+        self.assertEqual(plan.edge_capacity_per_shard, 234_567)
+        self.assertEqual(plan.action_capacity_per_shard, 34_567)
+
+    def test_closed_previous_ledger_does_not_break_pruning_protection_query(self):
+        prior = os.environ.get(_ROOT_ENV)
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ[_ROOT_ENV] = tmp
+            ledger = DiskBackedEvidenceLedger()
+            ledger.close()
+            self.assertEqual(ledger.protected_uids(), set())
+        if prior is None:
+            os.environ.pop(_ROOT_ENV, None)
+        else:
+            os.environ[_ROOT_ENV] = prior
 
     def test_real_process_memory_probe_is_available(self):
         row = memory._smaps_rollup(os.getpid())
