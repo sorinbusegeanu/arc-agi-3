@@ -48,8 +48,117 @@ def _set_consecutive(key: tuple[str, int, int, int, int], value: int) -> int:
     return value
 
 
+def _strategy_failure_evidence(node) -> int:
+    """Bound failure evidence to the selected strategy's own learned statistics."""
+    if node is None:
+        return 0
+    attempts = max(0.0, float(getattr(node, "attempt_weight", 0.0)))
+    reliability = max(
+        0.0,
+        min(1.0, float(getattr(node, "strategy_reliability", 0.0))),
+    )
+    recent_window = min(8.0, attempts)
+    return max(0, min(6, int(round(recent_window * (1.0 - reliability)))))
+
+
+def _adaptive_candidates(self, context_signature: int, available, **kwargs):
+    """Combine ordinary exact-context M7 with exact composite procedures."""
+    from v8 import adaptive_memory_control_v855 as v855
+    from v8 import behavior_recovery as behavior
+    from v8 import learning_blockers_v055 as blockers
+
+    ordinary, ordinary_probationary = v855._exact_m7_candidates(
+        self,
+        context_signature,
+        available,
+        **kwargs,
+    )
+    controls = list(() if ordinary_probationary else ordinary)
+    probes = list(ordinary if ordinary_probationary else ())
+
+    try:
+        composite = tuple(blockers._composite_plans(self, int(context_signature), available))
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        composite = ()
+    for plan in composite:
+        if behavior.strategy_can_control(self, plan.strategy_uid, plan.outcome_uid):
+            controls.append(plan)
+        elif behavior._strategy_can_probe(self, plan.strategy_uid, plan.outcome_uid):
+            probes.append(plan)
+
+    selected = controls if controls else probes
+    unique = {}
+    for plan in selected:
+        unique[(plan.strategy_uid, int(plan.action_id))] = plan
+    plans = tuple(
+        sorted(
+            unique.values(),
+            key=lambda row: (-float(row.score), int(row.action_id), row.strategy_uid),
+        )
+    )
+    return plans, bool(not controls and probes)
+
+
+def _continue_composite(self, context_signature: int, available):
+    """Continue an already selected composite M7 exactly as the v8.5 planner does."""
+    from v8.publication import PlannedAction
+
+    active = getattr(self, "_v055_active_sequence", None)
+    if active is None:
+        return ()
+    strategy_uid, outcome_uid, remaining = active
+    if not remaining:
+        self._v055_active_sequence = None
+        return ()
+    next_row = remaining[0]
+    action = int(next_row.key_parts[1])
+    if int(next_row.key_parts[0]) != int(context_signature) or action not in set(available):
+        self._v055_active_sequence = None
+        return ()
+    row = getattr(self, "_node_by_uid", {}).get(strategy_uid)
+    outcome = getattr(self, "_node_by_uid", {}).get(outcome_uid)
+    strategy_value = (
+        0.0
+        if row is None
+        else float(getattr(row, "expected_primary_valence", 0.0))
+        * float(getattr(row, "primary_valence_confidence", 0.0))
+    )
+    outcome_value = (
+        0.0
+        if outcome is None
+        else float(getattr(outcome, "expected_primary_valence", 0.0))
+        * float(getattr(outcome, "primary_valence_confidence", 0.0))
+    )
+    self._v055_active_sequence = (strategy_uid, outcome_uid, remaining[1:])
+    return (
+        PlannedAction(
+            action,
+            outcome_uid,
+            strategy_uid,
+            1.0 + 1.5 * strategy_value + outcome_value,
+            False,
+        ),
+    )
+
+
+def _arm_composite(self, context_signature: int, plan) -> None:
+    """Arm the remainder of a selected composite strategy for later contexts."""
+    from v8 import learning_blockers_v055 as blockers
+
+    row = getattr(self, "_node_by_uid", {}).get(plan.strategy_uid)
+    if row is None or not blockers.is_composite_strategy(row):
+        return
+    path = blockers._path_for_composite(self, row, int(context_signature))
+    if path:
+        self._v055_active_sequence = (
+            plan.strategy_uid,
+            plan.outcome_uid,
+            tuple(path[1:]),
+        )
+
+
 def _plan_chain_v855_fixup(self, context_signature, action_ids, **kwargs):
-    """Arbitrate exact same-world M7 with context-local starvation state."""
+    """Arbitrate exact same-world M7 while preserving explicit exploration authorities."""
     from v8 import adaptive_learning_allocation_v819 as v819
     from v8 import adaptive_memory_control_v855 as v855
     from v8 import sampling_portfolio_v831 as portfolio
@@ -79,16 +188,28 @@ def _plan_chain_v855_fixup(self, context_signature, action_ids, **kwargs):
         return ()
 
     portfolio_mode = str(getattr(portfolio._PORTFOLIO_STATE, "mode", "MEMORY"))
-    if portfolio_mode == "MEMORY":
-        return v855._BASE_PLAN_CHAIN(self, context_signature, available, **kwargs)
     if portfolio_mode == "RANDOM":
+        return ()
+
+    continued = _continue_composite(self, int(context_signature), available)
+    if continued:
+        v829._set_selection(
+            context_signature,
+            "M7_ADAPTIVE",
+            (row.action_id for row in continued),
+        )
+        return continued
+
+    # v8.5's plateau escape is an explicit exploration authority. Do not open a
+    # fresh M7 strategy while its bounded escape window is active.
+    if int(getattr(self, "_v055_escape_budget", 0)) > 0:
         return ()
 
     stats = v855._stats(game)
     stats["calls"] += 1.0
     level = int(getattr(v829._CONTROL_STATE, "level", 0))
     warm = v855._game_is_warm(game, level)
-    plans, probationary = v855._exact_m7_candidates(
+    plans, probationary = _adaptive_candidates(
         self,
         context_signature,
         available,
@@ -129,12 +250,7 @@ def _plan_chain_v855_fixup(self, context_signature, action_ids, **kwargs):
         stats["consecutive_exploration"] = 0.0
         return ()
 
-    failures = 0
-    if state is not None:
-        failures = max(
-            0,
-            int(v829._NO_PROGRESS.get((*state, int(top.action_id)), 0)),
-        )
+    failures = _strategy_failure_evidence(node)
     decision = v855.adaptive_m7_probability_v855(
         reliability=reliability,
         warm=warm,
@@ -161,6 +277,7 @@ def _plan_chain_v855_fixup(self, context_signature, action_ids, **kwargs):
         _set_consecutive(key, 0)
         if starvation_release:
             stats["starvation_release"] += 1.0
+        _arm_composite(self, int(context_signature), top)
         v829._set_selection(
             context_signature,
             "M7_ADAPTIVE",
@@ -195,7 +312,7 @@ def _plan_chain_v829_fixup(self, context_signature, action_ids, **kwargs):
     tested = v829._TESTED.setdefault(state, set())
     coverage_incomplete = any(action not in tested for action in available)
     portfolio_mode = str(getattr(portfolio._PORTFOLIO_STATE, "mode", "MEMORY"))
-    if coverage_incomplete and portfolio_mode not in {"MEMORY", "RANDOM"}:
+    if coverage_incomplete and portfolio_mode != "RANDOM":
         rows = tuple(
             _plan_chain_v855_fixup(
                 self,
