@@ -203,7 +203,7 @@ class AdaptiveMemoryControlV855ReviewFixTests(unittest.TestCase):
 
         with (
             patch.object(v855, "_exact_m7_candidates", return_value=((), False)),
-            patch.object(blockers, "_composite_plans", return_value=(composite_plan,)),
+            patch.object(fixups, "_composite_plans_cached", return_value=(composite_plan,)),
             patch.object(behavior, "strategy_can_control", return_value=True),
             patch.object(behavior, "_strategy_can_probe", return_value=False),
             patch.object(blockers, "is_composite_strategy", return_value=True),
@@ -217,6 +217,41 @@ class AdaptiveMemoryControlV855ReviewFixTests(unittest.TestCase):
             (composite_uid, composite_outcome, (second,)),
         )
         self.assertEqual(v829._CONTROL_STATE.selection_source, "M7_ADAPTIVE")
+
+    def test_composite_plan_cache_reuses_unchanged_strategy_version(self) -> None:
+        view = _View(draw=0.0)
+        view._strategy_version = (10, 20)
+        composite_uid = MemoryUid(7, 99)
+        outcome_uid = MemoryUid(6, 77)
+        composite = SimpleNamespace(
+            uid=composite_uid,
+            key_parts=(1 << 63, outcome_uid.hi, outcome_uid.lo, 123),
+            strategy_reliability=0.9,
+            attempt_weight=5.0,
+            support_count=4,
+            expected_primary_valence=0.0,
+            primary_valence_confidence=0.0,
+        )
+        outcome = SimpleNamespace(
+            expected_primary_valence=0.0,
+            primary_valence_confidence=0.0,
+        )
+        view._node_by_uid[composite_uid] = composite
+        view._node_by_uid[outcome_uid] = outcome
+        first = SimpleNamespace(key_parts=(123, 2, 0, 456))
+
+        with (
+            patch.object(blockers, "is_composite_strategy", side_effect=lambda row: row is composite) as is_comp,
+            patch.object(blockers, "_path_for_composite", return_value=(first,)) as path_for,
+        ):
+            first_rows = fixups._composite_plans_cached(view, 123, (1, 2, 3))
+            second_rows = fixups._composite_plans_cached(view, 123, (1, 2, 3))
+
+        self.assertEqual(first_rows, second_rows)
+        self.assertEqual(len(first_rows), 1)
+        self.assertEqual(first_rows[0].strategy_uid, composite_uid)
+        self.assertEqual(path_for.call_count, 1)
+        self.assertEqual(is_comp.call_count, len(view._node_by_uid))
 
     def test_active_composite_sequence_continues_even_during_escape_window(self) -> None:
         view = _View(draw=0.99)
