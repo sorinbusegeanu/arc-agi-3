@@ -138,7 +138,7 @@ def _complexity_multiplier_fix(
     coordinator,
     game_id: str,
     *,
-    refresh_events: bool = True,
+    refresh_events: bool = False,
 ) -> float:
     from v8 import action_learning_report_v849 as report
 

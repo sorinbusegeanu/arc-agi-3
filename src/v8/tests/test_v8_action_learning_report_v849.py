@@ -168,6 +168,18 @@ class ActionLearningAggregationTests(unittest.TestCase):
             5.0,
         )
 
+    def test_sampling_complexity_uses_cached_space_without_event_refresh(self):
+        coordinator = AdaptiveLearningCoordinator()
+        coordinator.register_games(("move", "click"))
+        coordinator._v848_action_spaces["move"] = (False, 4)
+        coordinator._v848_action_spaces["click"] = (True, 100)
+
+        with patch.object(report, "_refresh_events") as refresh_events:
+            multiplier = click._click_complexity_multiplier(coordinator, "click")
+
+        self.assertAlmostEqual(multiplier, 5.0)
+        refresh_events.assert_not_called()
+
     def test_summary_exposes_click_and_mixed_level_metrics(self):
         coordinator = AdaptiveLearningCoordinator()
         coordinator.register_games(("move", "click", "mixed"))
@@ -247,6 +259,75 @@ class ActionLearningAggregationTests(unittest.TestCase):
         }
         self.assertTrue(required.issubset(game))
         self.assertIn("click_levels_solved", payload["summary"])
+
+
+class ActionEventRefreshSchedulingTests(unittest.TestCase):
+    def setUp(self):
+        report._reset_action_learning_state_v849()
+
+    def tearDown(self):
+        report._reset_action_learning_state_v849()
+
+    @staticmethod
+    def _event(game: str = "g") -> dict[str, object]:
+        return {
+            "schema": 1,
+            "time": time.time() + 1.0,
+            "game_id": game,
+            "steps": 1,
+        }
+
+    def test_unchanged_files_are_not_reopened(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            trajectory_root = Path(tmp) / "trajectory_optimizer"
+            event_root = Path(tmp) / report._EVENT_DIR
+            event_root.mkdir()
+            path = event_root / "actor-1.jsonl"
+            path.write_text(json.dumps(self._event()) + "\n", encoding="utf-8")
+            with patch.dict(
+                os.environ,
+                {report._TRAJECTORY_ROOT_ENV: str(trajectory_root)},
+            ):
+                report._refresh_events(force=True)
+                with patch.object(
+                    Path,
+                    "open",
+                    side_effect=AssertionError("unchanged file reopened"),
+                ):
+                    report._refresh_events(force=True)
+
+    def test_bounded_refresh_resumes_from_saved_offset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            trajectory_root = Path(tmp) / "trajectory_optimizer"
+            event_root = Path(tmp) / report._EVENT_DIR
+            event_root.mkdir()
+            path = event_root / "actor-1.jsonl"
+            path.write_text(
+                "".join(json.dumps(self._event()) + "\n" for _ in range(3)),
+                encoding="utf-8",
+            )
+            with (
+                patch.dict(
+                    os.environ,
+                    {report._TRAJECTORY_ROOT_ENV: str(trajectory_root)},
+                ),
+                patch.object(report, "_REFRESH_MAX_EVENTS", 1),
+                patch.object(report, "_REFRESH_MAX_SECONDS", 60.0),
+            ):
+                report._refresh_events(force=True)
+                self.assertEqual(report._RUN["g"]["steps"], 1)
+                report._refresh_events(force=True)
+                self.assertEqual(report._RUN["g"]["steps"], 2)
+                report._refresh_events(force=True)
+                self.assertEqual(report._RUN["g"]["steps"], 3)
+
+    def test_refresh_interval_begins_when_scan_finishes(self):
+        with (
+            patch.object(report, "_event_root", return_value=None),
+            patch.object(report.time, "monotonic", side_effect=(10.0, 20.0)),
+        ):
+            report._refresh_events(force=True)
+        self.assertEqual(report._LAST_REFRESH, 20.0)
 
 
 if __name__ == "__main__":

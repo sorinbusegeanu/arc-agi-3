@@ -36,6 +36,9 @@ _SPACE: dict[str, dict[str, object]] = {}
 _RUN: dict[str, dict[str, object]] = {}
 _LAST_REFRESH = 0.0
 _REFRESH_SECONDS = 0.50
+_REFRESH_CURSOR = 0
+_REFRESH_MAX_EVENTS = 2048
+_REFRESH_MAX_SECONDS = 0.05
 
 _COUNTER_FIELDS = (
     "steps",
@@ -363,39 +366,76 @@ def _merge_event(target: dict[str, dict[str, object]], raw: dict[str, object]) -
 
 
 def _refresh_events(*, force: bool = False) -> None:
-    global _LAST_REFRESH
+    global _LAST_REFRESH, _REFRESH_CURSOR
     now = time.monotonic()
     with _REFRESH_LOCK:
         if not force and now - float(_LAST_REFRESH) < _REFRESH_SECONDS:
             return
-        _LAST_REFRESH = now
-        root = _event_root()
-        if root is None or not root.exists():
-            return
-        for path in sorted(root.glob("actor-*.jsonl")):
-            key = str(path)
-            offset = int(_FILE_OFFSETS.get(key, 0))
-            try:
-                with path.open("r", encoding="utf-8") as stream:
-                    stream.seek(offset)
-                    while True:
-                        position = stream.tell()
-                        line = stream.readline()
-                        if not line:
-                            break
-                        try:
-                            raw = json.loads(line)
-                        except (ValueError, TypeError):
-                            stream.seek(position)
-                            break
-                        if not isinstance(raw, dict) or int(raw.get("schema", 0)) != 1:
-                            continue
-                        _merge_event(_SPACE, raw)
-                        if float(raw.get("time", 0.0)) >= _RUN_STARTED_AT:
-                            _merge_event(_RUN, raw)
-                    _FILE_OFFSETS[key] = stream.tell()
-            except OSError:
-                continue
+        started = now
+        events = 0
+        checked = 0
+        try:
+            root = _event_root()
+            if root is None or not root.exists():
+                _REFRESH_CURSOR = 0
+                return
+            paths = tuple(sorted(root.glob("actor-*.jsonl")))
+            if not paths:
+                _REFRESH_CURSOR = 0
+                return
+            start = int(_REFRESH_CURSOR) % len(paths)
+            for relative_index in range(len(paths)):
+                index = (start + relative_index) % len(paths)
+                if checked > 0 and time.monotonic() - started >= _REFRESH_MAX_SECONDS:
+                    _REFRESH_CURSOR = index
+                    return
+                path = paths[index]
+                key = str(path)
+                offset = int(_FILE_OFFSETS.get(key, 0))
+                checked += 1
+                try:
+                    size = int(path.stat().st_size)
+                    if size < offset:
+                        offset = 0
+                    if size == offset:
+                        _FILE_OFFSETS[key] = offset
+                        _REFRESH_CURSOR = (index + 1) % len(paths)
+                        continue
+                    with path.open("r", encoding="utf-8") as stream:
+                        stream.seek(offset)
+                        while True:
+                            position = stream.tell()
+                            line = stream.readline()
+                            if not line:
+                                break
+                            try:
+                                raw = json.loads(line)
+                            except (ValueError, TypeError):
+                                stream.seek(position)
+                                break
+                            if isinstance(raw, dict) and int(raw.get("schema", 0)) == 1:
+                                _merge_event(_SPACE, raw)
+                                if float(raw.get("time", 0.0)) >= _RUN_STARTED_AT:
+                                    _merge_event(_RUN, raw)
+                            events += 1
+                            if (
+                                events >= _REFRESH_MAX_EVENTS
+                                or time.monotonic() - started >= _REFRESH_MAX_SECONDS
+                            ):
+                                _FILE_OFFSETS[key] = stream.tell()
+                                _REFRESH_CURSOR = index
+                                return
+                        _FILE_OFFSETS[key] = stream.tell()
+                    _REFRESH_CURSOR = (index + 1) % len(paths)
+                except OSError:
+                    _REFRESH_CURSOR = (index + 1) % len(paths)
+                    continue
+            _REFRESH_CURSOR = 0
+        finally:
+            # Rate-limit from completion, not from the beginning of a possibly
+            # slow scan. Otherwise a scan slower than the interval immediately
+            # triggers another scan and starves lease dispatch.
+            _LAST_REFRESH = time.monotonic()
 
 
 def _probe_game_action_space_v849(
@@ -683,12 +723,13 @@ def _allocation_stdout_v849(coordinator, completed_by_game, active_progress, act
 
 
 def _reset_action_learning_state_v849() -> None:
-    global _LAST_REFRESH, _RUN_STARTED_AT
+    global _LAST_REFRESH, _REFRESH_CURSOR, _RUN_STARTED_AT
     with _REFRESH_LOCK:
         _FILE_OFFSETS.clear()
         _SPACE.clear()
         _RUN.clear()
         _LAST_REFRESH = 0.0
+        _REFRESH_CURSOR = 0
         _RUN_STARTED_AT = time.time()
 
 
