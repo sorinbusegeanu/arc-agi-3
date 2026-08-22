@@ -218,7 +218,9 @@ class ContinuousProgressBaselineTests(unittest.TestCase):
     def test_log_high_water_and_durable_solutions_survive_restart(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             log_path = Path(directory) / "log.txt"
+            games = tuple(f"game-{index}" for index in range(36))
             log_path.write_text(
+                f"v8 continuous: games=36 game_ids={','.join(games)}\n"
                 "[11:42] 97% - current_run_wins=38.9% "
                 "current_run_levels_solved=56.1% current_run_solved_games=14/36\n"
                 "[13:16] 48% - current_run_wins=5.6% "
@@ -230,7 +232,7 @@ class ContinuousProgressBaselineTests(unittest.TestCase):
 
             baseline = load_continuous_progress_baseline(
                 log_path,
-                games=(f"game-{index}" for index in range(36)),
+                games=games,
                 durable_solved_games=(f"game-{index}" for index in range(14)),
             )
 
@@ -238,6 +240,54 @@ class ContinuousProgressBaselineTests(unittest.TestCase):
         self.assertEqual(baseline.games, 36)
         self.assertEqual(baseline.level_rate, 56.1)
         self.assertEqual(len(baseline.game_ids), 14)
+
+    def test_same_size_different_game_set_does_not_reuse_log_high_water(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "log.txt"
+            log_path.write_text(
+                "v8 continuous: games=2 game_ids=ez01,ez02\n"
+                "[21:04] 62% - current_run_wins=100.0% "
+                "current_run_levels_solved=100.0% current_run_solved_games=2/2 "
+                "(ez01:B=25,L=25; ez02:B=49,L=51)\n"
+                "v8 continuous: games=2 game_ids=gp01,gp02\n",
+                encoding="utf-8",
+            )
+
+            baseline = load_continuous_progress_baseline(
+                log_path,
+                games=("gp01", "gp02"),
+            )
+
+        self.assertEqual(baseline.game_ids, ())
+        self.assertEqual(baseline.solved_games, 0)
+        self.assertEqual(baseline.games, 2)
+        self.assertEqual(baseline.level_rate, 0.0)
+
+    def test_legacy_high_water_requires_matching_durable_game_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "log.txt"
+            log_path.write_text(
+                "v8 continuous: games=2\n"
+                "[21:04] 62% - current_run_wins=100.0% "
+                "current_run_levels_solved=100.0% current_run_solved_games=2/2 "
+                "(ez01:B=25,L=25; ez02:B=49,L=51)\n",
+                encoding="utf-8",
+            )
+
+            matching = load_continuous_progress_baseline(
+                log_path,
+                games=("ez01", "ez02"),
+                durable_solved_games=("ez01", "ez02"),
+            )
+            different = load_continuous_progress_baseline(
+                log_path,
+                games=("gp01", "gp02"),
+            )
+
+        self.assertEqual(matching.solved_games, 2)
+        self.assertEqual(matching.level_rate, 100.0)
+        self.assertEqual(different.solved_games, 0)
+        self.assertEqual(different.level_rate, 0.0)
 
     def test_first_report_retains_rates_while_new_budget_starts_at_zero(self) -> None:
         rows = tuple(

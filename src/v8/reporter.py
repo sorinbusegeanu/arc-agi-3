@@ -19,6 +19,11 @@ _PROGRESS_PATTERN = re.compile(
     r"current_run_levels_solved=(?P<levels>[0-9]+(?:\.[0-9]+)?)% "
     r"current_run_solved_games=(?P<solved>[0-9]+)/(?P<games>[0-9]+)"
 )
+_RUN_HEADER_PATTERN = re.compile(r"^v8 continuous: games=(?P<games>[0-9]+)\b(?P<options>.*)$")
+_GAME_IDS_PATTERN = re.compile(r"(?:^|\s)game_ids=(?P<game_ids>[^\s]+)")
+_PROGRESS_GAME_PATTERN = re.compile(
+    r"(?:\(|[;,]\s*)(?P<game_id>[A-Za-z0-9_.-]+):"
+)
 
 
 @dataclass(frozen=True)
@@ -37,7 +42,7 @@ def load_continuous_progress_baseline(
     games: Iterable[str],
     durable_solved_games: Iterable[str] = (),
 ) -> ContinuousProgressBaseline:
-    """Recover progress across process restarts without modifying run artifacts."""
+    """Recover progress only from runs with the same selected game IDs."""
     selected = tuple(dict.fromkeys(str(game_id) for game_id in games))
     selected_set = set(selected)
     durable = tuple(
@@ -45,6 +50,8 @@ def load_continuous_progress_baseline(
         for game_id in dict.fromkeys(str(game_id) for game_id in durable_solved_games)
         if game_id in selected_set
     )
+    durable_set = set(durable)
+    retained_ids = set(durable)
     best_solved = len(durable)
     best_level_rate = 100.0 * best_solved / len(selected) if selected else 0.0
 
@@ -53,20 +60,52 @@ def load_continuous_progress_baseline(
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         text = ""
-    for match in _PROGRESS_PATTERN.finditer(text):
+
+    active_game_ids: frozenset[str] | None = None
+    for line in text.splitlines():
+        header = _RUN_HEADER_PATTERN.match(line)
+        if header is not None:
+            scoped = _GAME_IDS_PATTERN.search(header.group("options"))
+            active_game_ids = (
+                frozenset(
+                    game_id
+                    for game_id in scoped.group("game_ids").split(",")
+                    if game_id
+                )
+                if scoped is not None
+                else None
+            )
+            continue
+
+        match = _PROGRESS_PATTERN.search(line)
+        if match is None:
+            continue
         if int(match.group("games")) != len(selected):
             continue
         solved = min(len(selected), max(0, int(match.group("solved"))))
+        detail_ids = set(_PROGRESS_GAME_PATTERN.findall(line[match.end() :]))
+
+        exact_scope = active_game_ids == frozenset(selected_set)
+        legacy_scope = bool(
+            active_game_ids is None
+            and solved == len(durable)
+            and detail_ids
+            and detail_ids <= durable_set
+        )
+        if not (exact_scope or legacy_scope):
+            continue
+
         level_rate = min(100.0, max(0.0, float(match.group("levels"))))
         best_solved = max(best_solved, solved)
         best_level_rate = max(best_level_rate, level_rate)
+        retained_ids.update(detail_ids & selected_set)
 
     best_level_rate = max(
         best_level_rate,
         100.0 * best_solved / len(selected) if selected else 0.0,
     )
     return ContinuousProgressBaseline(
-        game_ids=durable,
+        game_ids=tuple(game_id for game_id in selected if game_id in retained_ids),
         solved_games=best_solved,
         games=len(selected),
         level_rate=best_level_rate,

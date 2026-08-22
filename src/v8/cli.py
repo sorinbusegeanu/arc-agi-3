@@ -222,7 +222,7 @@ def run_continuous(args) -> int:
                 f"stage_workers={args.stage_workers} peers={'off' if args.no_peers else 'on'} "
                 f"lifecycle={lifecycle} "
                 f"snapshots={'off' if args.no_snapshots else 'async'} wait={float(args.wait):g}s/game "
-                f"graph_check={graph_check_steps}steps",
+                f"graph_check={graph_check_steps}steps game_ids={','.join(games)}",
                 flush=True,
             )
             _log(_graph_load_line(snapshot_path=restore_source, restore_enabled=restore_enabled, nodes=loaded_nodes))
