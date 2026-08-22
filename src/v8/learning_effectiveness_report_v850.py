@@ -2,11 +2,11 @@ from __future__ import annotations
 
 """v8.50 dedicated learning-effectiveness summary reporting.
 
-This layer is observational. It writes only high-level effectiveness metrics from
-already-authoritative adaptive allocation, M7 planning/frontier, actor progress,
-optimizer, transfer, and v8.49 action-quality telemetry. It does not emit per-game
-details, change H01-H15 decisions, or claim causal lift without controlled ablation.
-The same compact effectiveness summary replaces the older current-run stdout line.
+The report is observational. Live stdout and JSONL are generated from the same
+authoritative snapshot. Outcome/action metrics describe the current run, while M7
+and transfer validation reliability may include retained evidence attached to the
+current selectable frontier. None of these rates claims causal lift; causal
+attribution remains unavailable until a matched ablation is measured.
 """
 
 import json
@@ -21,7 +21,7 @@ _BASE_REPORTER_EMIT_LINE = None
 _BASE_PERIODIC_PROGRESS_LINE = None
 _BASE_RUN_ACTOR_JOBS = None
 _REPORT_FILE = "learning_effectiveness.log"
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _CAUSAL_STATUS = "NOT_MEASURED_NO_ABLATION"
 
 _OUTCOME_FIELDS = (
@@ -38,6 +38,7 @@ _OUTCOME_FIELDS = (
 def _empty_outcome() -> dict[str, int]:
     row = {field: 0 for field in _OUTCOME_FIELDS}
     row["first_win_step"] = 0
+    row["max_level_reached"] = 0
     return row
 
 
@@ -57,6 +58,7 @@ def _live_outcomes(completed_by_game, active_progress, active_leases) -> dict[st
             continue
         game = str(lease.game_id)
         row = result.setdefault(game, _empty_outcome())
+        base_steps = int(row["steps"])
         for field in (
             "steps",
             "wins",
@@ -70,10 +72,14 @@ def _live_outcomes(completed_by_game, active_progress, active_leases) -> dict[st
             int(row.get("max_level_reached", 0)),
             max(0, int(getattr(progress, "max_level_reached", 0))),
         )
+        local_first = max(0, int(getattr(progress, "first_win_step", 0) or 0))
+        if int(row.get("first_win_step", 0)) <= 0 and local_first > 0:
+            row["first_win_step"] = base_steps + local_first
     return result
 
 
 def _known_levels_solved(coordinator, game_id: str) -> int:
+    """Legacy helper retained for callers; current-run reporting uses observations."""
     game = str(game_id)
     with coordinator._lock:
         if bool(coordinator._game_won.get(game, False)):
@@ -87,6 +93,7 @@ def _known_levels_solved(coordinator, game_id: str) -> int:
 
 
 def _current_levels_solved(outcomes, games) -> int:
+    """Distinct current-run competence: deepest level reached once per game."""
     from v8 import plateau_progress_v846 as progress
 
     total = 0
@@ -101,7 +108,6 @@ def _current_levels_solved(outcomes, games) -> int:
             max(0, int(progress._MAX_LEVEL_REACHED.get(game, 0))),
         )
         if deepest <= 0:
-            # Compatibility for callers that provide legacy aggregate rows.
             deepest = max(0, int(row.get("levels_completed", 0)))
         total += min(5, deepest)
     return total
@@ -113,12 +119,10 @@ def _action_totals(game_ids) -> tuple[int, int]:
     observed = productive = 0
     for game_id in game_ids:
         raw = action_report._RUN.get(str(game_id), {})
-        click_actions = max(0, int(raw.get("click_actions_executed", 0)))
-        movement_actions = max(0, int(raw.get("movement_actions_executed", 0)))
-        click_productive = max(0, int(raw.get("click_productive", 0)))
-        movement_productive = max(0, int(raw.get("movement_productive", 0)))
-        observed += click_actions + movement_actions
-        productive += click_productive + movement_productive
+        observed += max(0, int(raw.get("click_actions_executed", 0)))
+        observed += max(0, int(raw.get("movement_actions_executed", 0)))
+        productive += max(0, int(raw.get("click_productive", 0)))
+        productive += max(0, int(raw.get("movement_productive", 0)))
     return observed, productive
 
 
@@ -130,8 +134,42 @@ def _telemetry_by_game(runtime, coordinator) -> dict[str, dict[str, object]]:
     }
 
 
+def _frontier_validation_totals(
+    coordinator,
+    game_ids,
+    *,
+    source: str | None = None,
+) -> tuple[int, int]:
+    """Return attempts/successes of current selectable frontier winners.
+
+    This measures empirical validation reliability, not causal improvement over a
+    memory-off policy. Restricting to one winner per scope avoids counting stale
+    dominated alternatives as current intelligence.
+    """
+    selected = {str(game_id) for game_id in game_ids}
+    attempts = successes = 0
+    with coordinator._lock:
+        scopes = tuple(coordinator.frontier.scopes())
+        for scope in scopes:
+            if str(scope.game_id) not in selected:
+                continue
+            winner = coordinator.frontier.winner(scope)
+            if winner is None:
+                continue
+            winner_source = str(getattr(winner.source, "value", winner.source))
+            if source is not None and winner_source != str(source):
+                continue
+            attempts += max(0, int(getattr(winner, "attempts", 0)))
+            successes += max(0, int(getattr(winner, "successes", 0)))
+    return attempts, min(successes, attempts)
+
+
 def _pct(numerator: int | float, denominator: int | float) -> float:
     return 0.0 if float(denominator) <= 0.0 else 100.0 * float(numerator) / float(denominator)
+
+
+def _pct_or_none(numerator: int | float, denominator: int | float) -> float | None:
+    return None if float(denominator) <= 0.0 else _pct(numerator, denominator)
 
 
 def _run_actor_jobs_v850(
@@ -169,35 +207,33 @@ def learning_effectiveness_snapshot_v850(
     action_report._refresh_events(force=True)
     outcomes = _live_outcomes(completed_by_game, active_progress, active_leases)
     telemetry = _telemetry_by_game(runtime, coordinator)
-    games = tuple(sorted(set(getattr(coordinator, "_games", ())) | set(outcomes) | set(telemetry)))
+    games = tuple(
+        sorted(set(getattr(coordinator, "_games", ())) | set(outcomes) | set(telemetry))
+    )
 
-    total_steps = sum(max(0, int(outcomes.get(game, {}).get("steps", 0))) for game in games)
-    planned_steps = sum(max(0, int(outcomes.get(game, {}).get("planned_steps", 0))) for game in games)
-    level_advances = sum(max(0, int(outcomes.get(game, {}).get("levels_completed", 0))) for game in games)
-    current_run_games_won = sum(1 for game in games if int(outcomes.get(game, {}).get("wins", 0)) > 0)
+    total_steps = sum(
+        max(0, int(outcomes.get(game, {}).get("steps", 0))) for game in games
+    )
+    planned_steps = sum(
+        max(0, int(outcomes.get(game, {}).get("planned_steps", 0))) for game in games
+    )
+    level_advance_events = sum(
+        max(0, int(outcomes.get(game, {}).get("levels_completed", 0))) for game in games
+    )
+    current_run_games_won = sum(
+        1 for game in games if int(outcomes.get(game, {}).get("wins", 0)) > 0
+    )
     current_levels_solved = _current_levels_solved(outcomes, games)
 
-    m7_applied_games = 0
-    m7_progress_games = 0
-    transfer_frontier_games = 0
-    transfer_progress_games = 0
-    optimizer_validations = 0
-    optimizer_successes = 0
-    optimizer_saved_actions = 0
-    transfer_attempts = 0
+    m7_attempts, m7_successes = _frontier_validation_totals(coordinator, games)
+    transfer_validation_attempts, transfer_validation_successes = (
+        _frontier_validation_totals(coordinator, games, source="TRANSFER")
+    )
 
+    optimizer_validations = optimizer_successes = optimizer_saved_actions = 0
+    transfer_attempts = 0
     for game in games:
-        outcome = outcomes.get(game, _empty_outcome())
         learning = telemetry.get(game, {})
-        has_progress = int(outcome.get("levels_completed", 0)) > 0 or int(outcome.get("wins", 0)) > 0
-        if int(outcome.get("planned_steps", 0)) > 0:
-            m7_applied_games += 1
-            if has_progress:
-                m7_progress_games += 1
-        if str(learning.get("frontier_source", "")) == "TRANSFER":
-            transfer_frontier_games += 1
-            if has_progress:
-                transfer_progress_games += 1
         transfer_attempts += max(0, int(learning.get("transfer_attempts", 0)))
         optimizer_validations += max(0, int(learning.get("optimizer_validations", 0)))
         optimizer_successes += max(0, int(learning.get("optimizer_successes", 0)))
@@ -214,29 +250,49 @@ def learning_effectiveness_snapshot_v850(
         "outcome_effectiveness": {
             "level_solve_rate_pct": _pct(current_levels_solved, 5 * len(games)),
             "game_solve_rate_pct": _pct(current_run_games_won, len(games)),
-            "current_run_level_advances": level_advances,
+            "current_run_levels_solved": current_levels_solved,
+            "current_run_level_advance_events": level_advance_events,
             "current_run_games_won": current_run_games_won,
         },
         "learning_application_effectiveness": {
             "m7_action_share_pct": _pct(planned_steps, total_steps),
-            "m7_strategy_effectiveness_pct": _pct(m7_progress_games, m7_applied_games),
-            "games_with_m7_applied": m7_applied_games,
+            "m7_validation_success_rate_pct": _pct_or_none(m7_successes, m7_attempts),
+            "m7_validation_attempts": m7_attempts,
+            "m7_validation_successes": m7_successes,
+            "measurement": "CURRENT_FRONTIER_VALIDATION_RELIABILITY",
         },
         "transfer_effectiveness": {
-            "transfer_effectiveness_pct": _pct(transfer_progress_games, transfer_frontier_games),
+            "transfer_validation_success_rate_pct": _pct_or_none(
+                transfer_validation_successes,
+                transfer_validation_attempts,
+            ),
+            "transfer_validation_attempts": transfer_validation_attempts,
+            "transfer_validation_successes": transfer_validation_successes,
             "transfer_attempts": transfer_attempts,
-            "games_with_transfer_frontier": transfer_frontier_games,
+            "measurement": "TRANSFER_FRONTIER_VALIDATION_RELIABILITY",
         },
         "optimizer_effectiveness": {
-            "optimizer_success_rate_pct": _pct(optimizer_successes, optimizer_validations),
+            "optimizer_success_rate_pct": _pct_or_none(
+                optimizer_successes,
+                optimizer_validations,
+            ),
+            "optimizer_validations": optimizer_validations,
+            "optimizer_successes": optimizer_successes,
             "optimizer_saved_actions": optimizer_saved_actions,
         },
         "action_effectiveness": {
-            "productive_action_rate_pct": _pct(productive_actions, observed_actions),
+            "productive_action_rate_pct": _pct_or_none(
+                productive_actions,
+                observed_actions,
+            ),
+            "observed_actions": observed_actions,
+            "productive_actions": productive_actions,
         },
         "efficiency": {
-            "steps_per_level_advance": (
-                float(total_steps) / float(level_advances) if level_advances > 0 else None
+            "steps_per_solved_level": (
+                float(total_steps) / float(current_levels_solved)
+                if current_levels_solved > 0
+                else None
             ),
             "mean_first_win_step": (
                 float(sum(first_win_steps)) / float(len(first_win_steps))
@@ -254,6 +310,13 @@ def learning_effectiveness_snapshot_v850(
         "time": time.time(),
         "generation": int(getattr(runtime, "generation", 0)),
         "watermark": int(getattr(runtime, "watermark", 0)),
+        "scope": {
+            "outcomes_and_actions": "CURRENT_RUN",
+            "strategy_validation": "CURRENT_FRONTIER_RETAINED_EVIDENCE",
+            "games": len(games),
+            "steps": total_steps,
+            "planned_steps": planned_steps,
+        },
         "effectiveness": effectiveness,
     }
 
@@ -265,6 +328,10 @@ def _compact_number(value) -> str:
     if abs(number - round(number)) < 1e-9:
         return str(int(round(number)))
     return f"{number:.1f}"
+
+
+def _compact_pct(value) -> str:
+    return "-" if value is None else f"{float(value):.1f}%"
 
 
 def format_learning_effectiveness_stdout_v850(
@@ -303,11 +370,11 @@ def format_learning_effectiveness_stdout_v850(
         f"L={float(outcome.get('level_solve_rate_pct', 0.0)):.1f}% "
         f"G={float(outcome.get('game_solve_rate_pct', 0.0)):.1f}% "
         f"M7={float(learning.get('m7_action_share_pct', 0.0)):.1f}% "
-        f"M7eff={float(learning.get('m7_strategy_effectiveness_pct', 0.0)):.1f}% "
-        f"Xfer={float(transfer.get('transfer_effectiveness_pct', 0.0)):.1f}% "
-        f"Opt={float(optimizer.get('optimizer_success_rate_pct', 0.0)):.1f}% "
-        f"Prod={float(action.get('productive_action_rate_pct', 0.0)):.1f}% "
-        f"step/L={_compact_number(efficiency.get('steps_per_level_advance'))} "
+        f"M7val={_compact_pct(learning.get('m7_validation_success_rate_pct'))} "
+        f"XferVal={_compact_pct(transfer.get('transfer_validation_success_rate_pct'))} "
+        f"Opt={_compact_pct(optimizer.get('optimizer_success_rate_pct'))} "
+        f"Prod={_compact_pct(action.get('productive_action_rate_pct'))} "
+        f"step/L={_compact_number(efficiency.get('steps_per_solved_level'))} "
         f"firstWin={_compact_number(efficiency.get('mean_first_win_step'))}"
     )
 
@@ -325,16 +392,23 @@ def _emit_effectiveness_stdout(
 
 
 def _reporter_emit_line_v850(message: str, output_queue) -> None:
-    # The dedicated reporter still owns lifecycle messages such as "sampling done",
-    # but its old current_run_* competence line is replaced by the effectiveness line
-    # emitted from the authoritative 60-second allocation snapshot above.
-    if output_queue is None and "current_run_wins=" in str(message):
+    # The parent allocator owns the authoritative terminal effectiveness line.
+    # Explicit output queues still receive the lightweight reporter presentation.
+    text = str(message)
+    if output_queue is None and (
+        "current_run_wins=" in text or " - effectiveness " in text
+    ):
         return
     _BASE_REPORTER_EMIT_LINE(message, output_queue)
 
 
 def _periodic_progress_line_v850(rows, total_steps, baseline=None) -> str:
-    """Format live actor progress in the compact v8.50 form every interval."""
+    """Compatibility presentation for explicit reporter consumers only.
+
+    Only fields derivable from ActorProgress are shown. Validation, optimizer,
+    productivity and first-win metrics remain unknown rather than being fabricated.
+    The terminal path suppresses this row and uses the authoritative snapshot.
+    """
     from v8 import reporter
 
     values = tuple(rows)
@@ -342,32 +416,15 @@ def _periodic_progress_line_v850(rows, total_steps, baseline=None) -> str:
     match = reporter._PROGRESS_PATTERN.search(base)
     if match is None:
         return base
-
     used_steps = sum(max(0, int(getattr(row, "steps", 0))) for row in values)
     planned_steps = sum(max(0, int(getattr(row, "planned_steps", 0))) for row in values)
     m7_share = _pct(planned_steps, used_steps)
-    m7_games = [row for row in values if int(getattr(row, "planned_steps", 0)) > 0]
-    m7_progress_games = sum(
-        1
-        for row in m7_games
-        if int(getattr(row, "levels_completed", 0)) > 0
-        or int(getattr(row, "wins", 0)) > 0
-    )
-    m7_effectiveness = _pct(m7_progress_games, len(m7_games))
-    level_advances = sum(
-        max(0, int(getattr(row, "levels_completed", 0))) for row in values
-    )
-    steps_per_level = (
-        float(used_steps) / float(level_advances) if level_advances > 0 else None
-    )
     return (
         f"{base[:match.start()]}effectiveness "
         f"L={float(match.group('levels')):.1f}% "
         f"G={float(match.group('wins')):.1f}% "
         f"M7={m7_share:.1f}% "
-        f"M7eff={m7_effectiveness:.1f}% "
-        "Xfer=- Opt=- Prod=- "
-        f"step/L={_compact_number(steps_per_level)} firstWin=-"
+        "M7val=- XferVal=- Opt=- Prod=- step/L=- firstWin=-"
     )
 
 
@@ -393,9 +450,18 @@ def _write_learning_effectiveness_log(
     except OSError:
         pass
 
-    # The independent reporter owns the exact one-minute stdout cadence. This
-    # richer allocator snapshot remains in JSONL; emitting both produced duplicate,
-    # contradictory terminal lines whenever the allocator view lagged actor progress.
+    scope = payload.get("scope", {})
+    used_steps = int(scope.get("steps", 0)) if isinstance(scope, dict) else 0
+    budget = max(0, int(getattr(runtime, "_v850_total_step_budget", 0)))
+    budget_pct = None if budget <= 0 else _pct(used_steps, budget)
+
+    now = time.monotonic()
+    last_steps = int(getattr(runtime, "_v850_last_effectiveness_stdout_steps", -1))
+    last_time = float(getattr(runtime, "_v850_last_effectiveness_stdout_time", -1.0))
+    if used_steps != last_steps or last_time < 0.0 or now - last_time >= 30.0:
+        _emit_effectiveness_stdout(payload, budget_consumed_pct=budget_pct)
+        runtime._v850_last_effectiveness_stdout_steps = used_steps
+        runtime._v850_last_effectiveness_stdout_time = now
 
 
 def _write_allocation_log_v850(
@@ -423,8 +489,7 @@ def _write_allocation_log_v850(
 
 def install_learning_effectiveness_report_v850() -> None:
     global _INSTALLED, _BASE_WRITE_ALLOCATION_LOG, _BASE_REPORTER_EMIT_LINE
-    global _BASE_PERIODIC_PROGRESS_LINE
-    global _BASE_RUN_ACTOR_JOBS
+    global _BASE_PERIODIC_PROGRESS_LINE, _BASE_RUN_ACTOR_JOBS
     if _INSTALLED:
         return
 
@@ -432,20 +497,14 @@ def install_learning_effectiveness_report_v850() -> None:
     from v8 import lease_dispatch_lifecycle_v843 as v843
     from v8 import reporter
 
-    # Keep v8.43 as the public allocation-report authority. Insert this report under
-    # that guard and above the v8.49 action-learning writer.
     _BASE_WRITE_ALLOCATION_LOG = v843._BASE_WRITE_ALLOCATION_LOG
     v843._BASE_WRITE_ALLOCATION_LOG = _write_allocation_log_v850
 
-    # Preserve the reporter process and its completion semantics; suppress only the
-    # old current_run_* periodic line.
     _BASE_REPORTER_EMIT_LINE = reporter._emit_line
     reporter._emit_line = _reporter_emit_line_v850
     _BASE_PERIODIC_PROGRESS_LINE = reporter.format_periodic_progress_line
     reporter.format_periodic_progress_line = _periodic_progress_line_v850
 
-    # Capture the original requested interaction budget once at the final actor-job
-    # authority so the compact effectiveness line can retain the old progress prefix.
     _BASE_RUN_ACTOR_JOBS = actor_module.run_actor_jobs
     actor_module.run_actor_jobs = _run_actor_jobs_v850
     _INSTALLED = True
