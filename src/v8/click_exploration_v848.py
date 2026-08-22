@@ -33,6 +33,7 @@ _BASE_ENV_STEP = None
 _BASE_ENV_RESET = None
 _BASE_RECORD_EXPANSION = None
 _BASE_BEST_EXPANSION = None
+_BASE_SELECT_EXPANDABLE_ACTION = None
 _BASE_REGISTER_GAMES = None
 _BASE_SAMPLING_WEIGHT = None
 
@@ -274,6 +275,15 @@ def _suppressed_click_latent(node) -> bool:
     return bool(anchor and _is_click_token(anchor[-1]))
 
 
+def _select_expandable_action_v848(actions: tuple[int, ...]) -> int:
+    """Give a click-capable frontier a click before inert movement prefixes."""
+    values = tuple(int(value) for value in actions)
+    clicks = tuple(value for value in values if _is_click_token(value))
+    if clicks:
+        return min(clicks)
+    return int(_BASE_SELECT_EXPANDABLE_ACTION(values))
+
+
 def _best_expansion_v848(sampler):
     from v8 import sampling_evidence_frontier_v847 as frontier
 
@@ -286,7 +296,7 @@ def _best_expansion_v848(sampler):
     if not candidates:
         return None
     node = max(candidates, key=frontier._priority_key_v847)
-    action = int(frontier._expandable_actions(node)[0])
+    action = _select_expandable_action_v848(frontier._expandable_actions(node))
     return node, action
 
 
@@ -389,7 +399,7 @@ def _sampling_weight_v848(self, game_id: str) -> float:
 def install_click_exploration_v848() -> None:
     global _INSTALLED
     global _BASE_ENV_INIT, _BASE_ENV_AVAILABLE, _BASE_ENV_STEP, _BASE_ENV_RESET
-    global _BASE_RECORD_EXPANSION, _BASE_BEST_EXPANSION
+    global _BASE_RECORD_EXPANSION, _BASE_BEST_EXPANSION, _BASE_SELECT_EXPANDABLE_ACTION
     global _BASE_REGISTER_GAMES, _BASE_SAMPLING_WEIGHT
     if _INSTALLED:
         return
@@ -416,8 +426,10 @@ def install_click_exploration_v848() -> None:
 
     _BASE_RECORD_EXPANSION = frontier._record_expansion_v847
     _BASE_BEST_EXPANSION = frontier._best_expansion_v847
+    _BASE_SELECT_EXPANDABLE_ACTION = frontier._select_expandable_action_v847
     frontier._record_expansion_v847 = _record_expansion_v848
     frontier._best_expansion_v847 = _best_expansion_v848
+    frontier._select_expandable_action_v847 = _select_expandable_action_v848
 
     _BASE_REGISTER_GAMES = allocation.AdaptiveLearningCoordinator.register_games
     _BASE_SAMPLING_WEIGHT = allocation.AdaptiveLearningCoordinator.sampling_weight

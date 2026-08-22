@@ -9,6 +9,7 @@ import numpy as np
 import v8
 from v8 import click_exploration_v848 as v848
 from v8 import sampling_evidence_frontier_v847 as frontier
+from v8 import sampling_portfolio_v831 as portfolio
 from v8.adaptive_learning_allocation_v819 import AdaptiveLearningCoordinator
 from v8.learning_blockers_v055 import pack_action_choice, unpack_action_choice
 from v8.model import MemoryUid
@@ -92,6 +93,43 @@ class TargetSpecificSelectionTests(unittest.TestCase):
 
 
 class ClickNoopFrontierTests(unittest.TestCase):
+    def test_click_capable_sequence_selects_click_before_movement_noops(self):
+        sampler = PortfolioSampler("click-fixture", seed=1)
+        sampler.begin_lease(1)
+        click_a = pack_action_choice(6, 3, 3)
+        click_b = pack_action_choice(6, 4, 4)
+
+        portfolio._set_mode("SEQUENCE")
+        try:
+            action = sampler.discovery_action(
+                level=0,
+                context=101,
+                actions=(1, 2, 3, 4, click_b, click_a),
+                history=(),
+            )
+        finally:
+            portfolio._set_mode(None)
+
+        self.assertEqual(action, click_a)
+        self.assertEqual(sampler.base.current.kind, "SEQUENCE")
+
+    def test_movement_only_sequence_keeps_environment_neutral_ordering(self):
+        sampler = PortfolioSampler("movement-fixture", seed=1)
+        sampler.begin_lease(1)
+
+        portfolio._set_mode("SEQUENCE")
+        try:
+            action = sampler.discovery_action(
+                level=0,
+                context=202,
+                actions=(4, 2, 3, 1),
+                history=(),
+            )
+        finally:
+            portfolio._set_mode(None)
+
+        self.assertEqual(action, 1)
+
     def test_click_noop_does_not_create_latent_frontier(self):
         sampler = PortfolioSampler("click-fixture", seed=1)
         click = pack_action_choice(6, 3, 3)

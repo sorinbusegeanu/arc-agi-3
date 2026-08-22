@@ -176,6 +176,13 @@ def _expandable_actions(node: EvidencePrefixNode) -> tuple[int, ...]:
     return tuple(sorted(int(value) for value in node.available_actions - node.tried_actions))
 
 
+def _select_expandable_action_v847(actions: tuple[int, ...]) -> int:
+    """Select one frontier action; later environment layers may refine ordering."""
+    if not actions:
+        raise ValueError("frontier action selection requires at least one action")
+    return int(actions[0])
+
+
 def _priority_key_v847(node: EvidencePrefixNode):
     """Lexicographic evidence priority; no synthetic scalar reward is introduced."""
     return (
@@ -197,7 +204,7 @@ def _best_expansion_v847(sampler):
     if not candidates:
         return None
     node = max(candidates, key=_priority_key_v847)
-    action = int(_expandable_actions(node)[0])
+    action = _select_expandable_action_v847(_expandable_actions(node))
     return node, action
 
 
@@ -520,7 +527,7 @@ def _discovery_action_v847(
         finally:
             portfolio._set_mode(None)
 
-    action = int(local[0])
+    action = _select_expandable_action_v847(local)
     self._v847_active_expansion = (str(node.node_id), action)
     self.active_point = (int(level), int(context))
     self.active_anchor = tuple(history)
