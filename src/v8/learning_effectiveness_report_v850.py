@@ -6,6 +6,7 @@ This layer is observational. It writes only high-level effectiveness metrics fro
 already-authoritative adaptive allocation, M7 planning/frontier, actor progress,
 optimizer, transfer, and v8.49 action-quality telemetry. It does not emit per-game
 details, change H01-H15 decisions, or claim causal lift without controlled ablation.
+The same compact effectiveness summary replaces the older current-run stdout line.
 """
 
 import json
@@ -16,6 +17,7 @@ from pathlib import Path
 
 _INSTALLED = False
 _BASE_WRITE_ALLOCATION_LOG = None
+_BASE_REPORTER_EMIT_LINE = None
 _REPORT_FILE = "learning_effectiveness.log"
 _SCHEMA_VERSION = 2
 _CAUSAL_STATUS = "NOT_MEASURED_NO_ABLATION"
@@ -208,6 +210,67 @@ def learning_effectiveness_snapshot_v850(
     }
 
 
+def _compact_number(value) -> str:
+    if value is None:
+        return "-"
+    number = float(value)
+    if abs(number - round(number)) < 1e-9:
+        return str(int(round(number)))
+    return f"{number:.1f}"
+
+
+def format_learning_effectiveness_stdout_v850(payload: dict[str, object]) -> str:
+    effectiveness = payload.get("effectiveness", {})
+    if not isinstance(effectiveness, dict):
+        effectiveness = {}
+    outcome = effectiveness.get("outcome_effectiveness", {})
+    learning = effectiveness.get("learning_application_effectiveness", {})
+    transfer = effectiveness.get("transfer_effectiveness", {})
+    optimizer = effectiveness.get("optimizer_effectiveness", {})
+    action = effectiveness.get("action_effectiveness", {})
+    efficiency = effectiveness.get("efficiency", {})
+    if not isinstance(outcome, dict):
+        outcome = {}
+    if not isinstance(learning, dict):
+        learning = {}
+    if not isinstance(transfer, dict):
+        transfer = {}
+    if not isinstance(optimizer, dict):
+        optimizer = {}
+    if not isinstance(action, dict):
+        action = {}
+    if not isinstance(efficiency, dict):
+        efficiency = {}
+    return (
+        "effectiveness "
+        f"L={float(outcome.get('level_solve_rate_pct', 0.0)):.1f}% "
+        f"G={float(outcome.get('game_solve_rate_pct', 0.0)):.1f}% "
+        f"M7={float(learning.get('m7_action_share_pct', 0.0)):.1f}% "
+        f"M7eff={float(learning.get('m7_strategy_effectiveness_pct', 0.0)):.1f}% "
+        f"Xfer={float(transfer.get('transfer_effectiveness_pct', 0.0)):.1f}% "
+        f"Opt={float(optimizer.get('optimizer_success_rate_pct', 0.0)):.1f}% "
+        f"Prod={float(action.get('productive_action_rate_pct', 0.0)):.1f}% "
+        f"step/L={_compact_number(efficiency.get('steps_per_level_advance'))} "
+        f"firstWin={_compact_number(efficiency.get('mean_first_win_step'))}"
+    )
+
+
+def _emit_effectiveness_stdout(payload: dict[str, object]) -> None:
+    print(
+        f'[{time.strftime("%H:%M")}] {format_learning_effectiveness_stdout_v850(payload)}',
+        flush=True,
+    )
+
+
+def _reporter_emit_line_v850(message: str, output_queue) -> None:
+    # The dedicated reporter still owns lifecycle messages such as "sampling done",
+    # but its old current_run_* competence line is replaced by the effectiveness line
+    # emitted from the authoritative 60-second allocation snapshot above.
+    if "current_run_wins=" in str(message):
+        return
+    _BASE_REPORTER_EMIT_LINE(message, output_queue)
+
+
 def _write_learning_effectiveness_log(
     runtime,
     coordinator,
@@ -228,7 +291,8 @@ def _write_learning_effectiveness_log(
         with target.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
     except OSError:
-        return
+        pass
+    _emit_effectiveness_stdout(payload)
 
 
 def _write_allocation_log_v850(
@@ -255,14 +319,20 @@ def _write_allocation_log_v850(
 
 
 def install_learning_effectiveness_report_v850() -> None:
-    global _INSTALLED, _BASE_WRITE_ALLOCATION_LOG
+    global _INSTALLED, _BASE_WRITE_ALLOCATION_LOG, _BASE_REPORTER_EMIT_LINE
     if _INSTALLED:
         return
 
     from v8 import lease_dispatch_lifecycle_v843 as v843
+    from v8 import reporter
 
     # Keep v8.43 as the public allocation-report authority. Insert this report under
     # that guard and above the v8.49 action-learning writer.
     _BASE_WRITE_ALLOCATION_LOG = v843._BASE_WRITE_ALLOCATION_LOG
     v843._BASE_WRITE_ALLOCATION_LOG = _write_allocation_log_v850
+
+    # Preserve the reporter process and its completion semantics; suppress only the
+    # old current_run_* periodic line.
+    _BASE_REPORTER_EMIT_LINE = reporter._emit_line
+    reporter._emit_line = _reporter_emit_line_v850
     _INSTALLED = True
