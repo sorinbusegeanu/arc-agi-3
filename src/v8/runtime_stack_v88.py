@@ -53,6 +53,13 @@ _LAYERS: tuple[str, ...] = (
     "click_exploration_v848",
 )
 
+# Keep the historical v8.48-last assertion meaningful while allowing observational
+# layers to compose after the behavior layer without changing its version ordering.
+_POST_LAYERS: tuple[str, ...] = (
+    "action_learning_report_v849",
+    "action_learning_report_v849_fixups",
+)
+
 
 def _installer(module_name: str):
     module = import_module(f"v8.{module_name}")
@@ -82,6 +89,6 @@ def install_current_runtime_stack_v88() -> None:
     global _INSTALLED
     if _INSTALLED:
         return
-    for module_name in _LAYERS:
+    for module_name in (*_LAYERS, *_POST_LAYERS):
         _installer(module_name)()
     _INSTALLED = True
