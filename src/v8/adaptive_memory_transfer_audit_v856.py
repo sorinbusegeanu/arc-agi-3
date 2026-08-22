@@ -2,17 +2,16 @@ from __future__ import annotations
 
 """Final v8.56 cross-game transfer correctness audit fixes.
 
-This layer keeps exact provenance fail-closed, prevents target-world execution from
-rewriting source-intrinsic learning, excludes transfer bookkeeping from structural
-similarity, and makes structural correspondence depend on graph structure rather
-than observation frequency.
+This layer keeps exact provenance fail-closed in live transfer evaluation, prevents
+target-world execution from rewriting source-intrinsic learning, excludes transfer
+bookkeeping from structural similarity, and makes structural correspondence depend
+on graph structure rather than observation frequency.
 """
 
 from collections import Counter
 from dataclasses import is_dataclass, replace
 
 from v8.model import MemoryLevel, MemoryType, MemoryUid, RelationType, stable_u64
-from v8.transfer import TransferTrial
 
 
 _INSTALLED = False
@@ -166,43 +165,20 @@ def _provenance_from_edges_v856(
     return result
 
 
-def _record_transfer_trial_v856(
-    self,
-    uid: MemoryUid,
-    *,
-    target_game_hash: int,
-    metric_on: float,
-    metric_off: float,
-    formation_games: tuple[int, ...] = (),
-    intervention: str = "matched_memory_ablation",
-) -> TransferTrial:
-    formation = tuple(sorted(set(int(value) for value in formation_games)))
-    target = int(target_game_hash)
-    effect = float(metric_on) - float(metric_off)
-    # Exact formation provenance is mandatory for a scientific held-out claim.
-    held_out = bool(formation) and target not in formation
-    trial = TransferTrial(
-        uid,
-        target,
-        float(metric_on),
-        float(metric_off),
-        effect,
-        bool(held_out and effect > float(self.effect_threshold)),
-        formation,
-        str(intervention),
-    )
-    self._trials.setdefault(uid, []).append(trial)
-    return trial
-
-
 def _transfer_candidates_v856(self, rows, edges=(), *, provenance=None):
     filtered = tuple(row for row in rows if _allowed_transfer_abstraction(row))
-    return _BASE_TRANSFER_CANDIDATES(
+    graph = tuple(edges)
+    result = _BASE_TRANSFER_CANDIDATES(
         self,
         filtered,
-        tuple(edges),
+        graph,
         provenance=provenance,
     )
+    # Preserve the legacy graph-free standalone API. In the live scientific path,
+    # exact formation provenance is mandatory before a held-out intervention exists.
+    if not graph and provenance is None:
+        return result
+    return tuple(candidate for candidate in result if tuple(candidate.formation_games))
 
 
 def _similarity_descriptors_v856(nodes, edges):
@@ -281,8 +257,8 @@ def install_adaptive_memory_transfer_audit_v856() -> None:
 
     from v8 import adaptive_memory_transfer_scope_v856 as scope
     from v8 import learning_transfer_correctness_v854 as v854
+    from v8 import lease_dispatch_continuity_v839 as v839
     from v8 import peers_v82
-    from v8.runtime_v82 import V82ContinuousMemoryRuntime
     from v8.similarity import BoundedNeighborhoodSimilarity
     from v8.structural_correspondence import StructuralCorrespondenceEstimator
     from v8.transfer import TransferValidator
@@ -291,7 +267,6 @@ def install_adaptive_memory_transfer_audit_v856() -> None:
     v854._LINEAGE = set(_CANONICAL_PROVENANCE_LINEAGE)
     peers_v82._LINEAGE = set(_CANONICAL_PROVENANCE_LINEAGE)
     TransferValidator._provenance_from_edges = staticmethod(_provenance_from_edges_v856)
-    TransferValidator.record_trial = _record_transfer_trial_v856
 
     # Transfer validation/similarity applies to semantic roles/concepts, never to
     # v8.54 TRANSFER_EVIDENCE bookkeeping nodes.
@@ -307,12 +282,13 @@ def install_adaptive_memory_transfer_audit_v856() -> None:
     _BASE_CORRESPONDENCE_EVALUATE = StructuralCorrespondenceEstimator.evaluate
     StructuralCorrespondenceEstimator.evaluate = _correspondence_evaluate_v856
 
-    # The real runtime authority is the v8.2 subclass after v8.39/v8.41 wrapping.
-    # Filter before those asynchronous feedback queues receive the batch.
+    # Preserve v8.39's public runtime hook. v8.39/v8.41 call this lower delegate when
+    # feedback is actually applied, so filtering here prevents memory contamination
+    # without changing the historical authority chain.
     _BASE_SCOPE_FILTER = scope._filter_target_scoped_learning
     scope._foreign_strategy = _unsafe_intrinsic_strategy
     scope._filter_target_scoped_learning = _filter_target_scoped_learning_v856
-    _BASE_RUNTIME_RECORD_RESULTS = V82ContinuousMemoryRuntime.record_actor_results
-    V82ContinuousMemoryRuntime.record_actor_results = _record_actor_results_v856
+    _BASE_RUNTIME_RECORD_RESULTS = v839._BASE_RECORD_ACTOR_RESULTS
+    v839._BASE_RECORD_ACTOR_RESULTS = _record_actor_results_v856
 
     _INSTALLED = True
