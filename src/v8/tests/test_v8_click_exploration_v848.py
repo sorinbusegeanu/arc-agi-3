@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -54,38 +55,31 @@ class CompleteClickCoverageTests(unittest.TestCase):
         self.assertIn(target, exposed)
         self.assertIn(background, exposed)
 
-    def test_real_click_games_expose_one_center_per_selected_cell_color(self):
-        from collections import Counter
+    def test_cell_center_clicks_select_one_observable_color_without_live_api(self):
+        frame = np.zeros((16, 16), dtype=np.int64)
+        frame[0:8, 0:8] = 2
+        frame[8:16, 0:8] = 2
+        frame[0:8, 8:16] = 5
+        frame[8:16, 8:16] = 5
+        game = SimpleNamespace(
+            camera=SimpleNamespace(width=2, height=2, x=0, y=0),
+            current_level=SimpleNamespace(grid_size=(2, 2)),
+        )
 
-        from v7.environment.arc_adapter import ArcGridEnvironment
-        from v8.action_targeting_v810 import native_action_id
-
-        expected = {
-            ("gp01", 0): (2, 4),
-            ("gp01", 1): (5, 60),
-            ("gp02", 0): (2, 4),
-            ("gp02", 1): (11, 60),
-        }
-        for (game_id, seed), (color, count) in expected.items():
-            env = ArcGridEnvironment(game_id=game_id, seed=seed)
-            try:
-                frame = env.observe()
-                clicks = tuple(
-                    action
-                    for action in env.available_actions()
-                    if native_action_id(action) == 6 and v848._is_exact_click_token(action)
-                )
-                decoded = [unpack_action_choice(action)[1] for action in clicks]
-                observed = Counter(int(frame[row["y"], row["x"]]) for row in decoded)
-                self.assertEqual(len(clicks), count)
-                self.assertEqual(observed, Counter({color: count}))
-                self.assertTrue(
-                    all(row["x"] % 8 == 4 and row["y"] % 8 == 4 for row in decoded)
-                )
-            finally:
-                close = getattr(getattr(env, "env", None), "close", None)
-                if callable(close):
-                    close()
+        for seed, expected_color in ((0, 2), (1, 5)):
+            env = SimpleNamespace(
+                env=SimpleNamespace(_game=game),
+                _v848_click_seed=seed,
+                _v848_click_target_color=None,
+            )
+            clicks = v848._canonical_click_tokens(env, frame)
+            decoded = [unpack_action_choice(action)[1] for action in clicks]
+            observed = [int(frame[row["y"], row["x"]]) for row in decoded]
+            self.assertEqual(len(clicks), 2)
+            self.assertEqual(observed, [expected_color, expected_color])
+            self.assertTrue(
+                all(row["x"] % 8 == 4 and row["y"] % 8 == 4 for row in decoded)
+            )
 
 
 class TargetSpecificSelectionTests(unittest.TestCase):
