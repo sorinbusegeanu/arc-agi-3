@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -112,6 +113,16 @@ class StructuralClickTests(unittest.TestCase):
         env.step(target.token)
         self.assertEqual(env.env.calls[-1], (6, {"x": target.x, "y": target.y}))
         self.assertEqual(set(actions), set(env.available_actions()))
+
+    def test_fragmented_grid_target_generation_remains_bounded(self):
+        grid = np.indices((64, 64)).sum(axis=0) % 2
+        started = time.perf_counter()
+        targets = structural_click_targets(grid)
+        elapsed = time.perf_counter() - started
+
+        self.assertLessEqual(len(targets), 96)
+        self.assertEqual(len({target.token for target in targets}), len(targets))
+        self.assertLess(elapsed, 2.0)
 
     def test_legacy_absolute_click_remains_executable_action_type(self):
         legacy = pack_action_choice(6, 12, 34)

@@ -167,6 +167,7 @@ def structural_click_targets(
     components = _components(array, background)
     used: dict[int, tuple[int, ...]] = {}
     rows: list[ClickTarget] = []
+    row_tokens: set[int] = set()
 
     def add(
         x: int,
@@ -191,8 +192,9 @@ def structural_click_targets(
             int(role_b),
         )
         token = _descriptor_token(descriptor, used)
-        if any(row.token == token for row in rows):
+        if token in row_tokens:
             return
+        row_tokens.add(token)
         rows.append(ClickTarget(token, x_i, y_i, kind, descriptor, int(priority)))
 
     for component in components:
