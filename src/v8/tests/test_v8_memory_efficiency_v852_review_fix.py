@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 from v8 import actor_read_view_v851 as actor_read
 from v8 import capacity
 from v8 import memory_efficiency_v851 as memory
+from v8 import memory_efficiency_v851_integrity as integrity
 from v8 import memory_efficiency_v852_review_fix as v852
 from v8 import publication
 from v8 import runtime_stack_v88
@@ -17,10 +18,13 @@ from v8.model import CognitiveState, MemoryLevel, MemoryType, MemoryUid, Relatio
 
 
 class MemoryEfficiencyV852ReviewFixTests(unittest.TestCase):
-    def test_v852_is_last_runtime_layer(self):
+    def test_v852_precedes_v853_final_layer(self):
         self.assertEqual(
-            runtime_stack_v88._POST_LAYERS[-1],
-            "memory_efficiency_v852_review_fix",
+            runtime_stack_v88._POST_LAYERS[-2:],
+            (
+                "memory_efficiency_v852_review_fix",
+                "actor_throughput_v853",
+            ),
         )
         self.assertTrue(v852._INSTALLED)
 
@@ -105,7 +109,8 @@ class MemoryEfficiencyV852ReviewFixTests(unittest.TestCase):
                 root="unused",
                 restore=True,
             )
-        self.assertEqual(plan.action_capacity_per_shard, 65_536)
+        self.assertEqual(plan.action_capacity_per_shard, integrity._MIN_ACTION_CAPACITY)
+        self.assertLess(plan.action_capacity_per_shard, historical.action_capacity)
 
     def test_snapshot_retention_keeps_latest_and_run_complete_reference(self):
         with tempfile.TemporaryDirectory() as tmp:
