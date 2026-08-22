@@ -14,6 +14,12 @@ _BASE_OBSERVE_TRANSFER = None
 _MAX_FAILURES = 6
 _BACKOFF_LIMIT = 4
 _TARGET_M1N_FAILURES: dict[tuple[str, int, int], int] = {}
+_LINEAGE = {
+    int(RelationType.PROVENANCE),
+    int(RelationType.EXPLAINS),
+    int(RelationType.LEADS_TO),
+    int(RelationType.CONTEXT_REFINES),
+}
 
 
 def _key(game_id: str, uid) -> tuple[str, int, int]:
@@ -40,6 +46,55 @@ def _is_grounded(row) -> bool:
     )
 
 
+def _provenance_resolver(view):
+    direct = {}
+    lineage = {}
+    try:
+        edges = tuple(view.edge_records())
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        edges = ()
+    for edge in edges:
+        relation = int(edge.relation_type)
+        if relation == int(RelationType.GAME_PROVENANCE) and int(edge.target_uid.hi) == 0:
+            direct.setdefault(edge.source_uid, set()).add(int(edge.target_uid.lo))
+        elif relation in _LINEAGE:
+            lineage.setdefault(edge.source_uid, set()).add(edge.target_uid)
+    cache = {}
+
+    def graph_games(uid):
+        if uid in cache:
+            return cache[uid]
+        found = set(direct.get(uid, ()))
+        frontier, visited = {uid}, {uid}
+        for _depth in range(8):
+            following = set()
+            for current in frontier:
+                for parent in lineage.get(current, ()):
+                    found.update(direct.get(parent, ()))
+                    if parent not in visited:
+                        visited.add(parent)
+                        following.add(parent)
+            if not following:
+                break
+            frontier = following
+        cache[uid] = frozenset(found)
+        return cache[uid]
+
+    source_games = getattr(view, "source_games", None)
+
+    def resolve(uid):
+        if callable(source_games):
+            try:
+                games = frozenset(int(value) for value in source_games(uid))
+            except (RuntimeError, TypeError, ValueError):
+                games = frozenset()
+            if games:
+                return games
+        return graph_games(uid)
+
+    return resolve
+
+
 def _raw_m1n_index(view, game_id: str):
     from v8 import normalized_memory_v086 as normalized
 
@@ -54,6 +109,7 @@ def _raw_m1n_index(view, game_id: str):
 
     nodes = dict(getattr(view, "_node_by_uid", {}))
     parents = getattr(view, "_parents", {})
+    games_for = _provenance_resolver(view)
     by_action: dict[int, list[tuple[float, object, str]]] = {}
     for row in nodes.values():
         if not normalized.is_normalized_contingency(row):
@@ -63,10 +119,7 @@ def _raw_m1n_index(view, game_id: str):
             parent = nodes.get(parent_uid)
             if not _is_grounded(parent):
                 continue
-            try:
-                games = frozenset(int(value) for value in view.source_games(parent_uid))
-            except (AttributeError, RuntimeError, TypeError, ValueError):
-                games = frozenset()
+            games = games_for(parent_uid)
             if games:
                 grounded.append((parent, games))
         if not grounded:
@@ -89,9 +142,7 @@ def _raw_m1n_index(view, game_id: str):
             )
 
     result = {
-        int(action): tuple(
-            sorted(rows, key=lambda item: (-float(item[0]), item[1]))
-        )
+        int(action): tuple(sorted(rows, key=lambda item: (-float(item[0]), item[1])))
         for action, rows in by_action.items()
     }
     view._v856_m1n_index_key = cache_key
@@ -158,11 +209,13 @@ def install_adaptive_memory_transfer_m1n_v856() -> None:
     if _INSTALLED:
         return
 
-    from v8 import environment_neutrality_v837 as v837
+    from v8 import adaptive_memory_transfer_grounding_v856 as grounding
     from v8 import sampling_transfer_v833 as transfer
 
-    _BASE_GROUNDED_TRANSFER = v837._grounded_transfer_index
-    v837._grounded_transfer_index = _grounded_transfer_m1n_v856
+    # Compose beneath the public grounding authority so v8.56 M7 backoff remains
+    # the single final grounded hook and M1N enrichment is an implementation detail.
+    _BASE_GROUNDED_TRANSFER = grounding._BASE_GROUNDED_TRANSFER
+    grounding._BASE_GROUNDED_TRANSFER = _grounded_transfer_m1n_v856
 
     _BASE_CROSS_GAME = transfer._cross_game_transfer_action
     transfer._cross_game_transfer_action = _cross_game_m1n_v856
