@@ -15,6 +15,7 @@ _MAX_VALIDATORS = 10
 _VALIDATION_SEEDS = (0, 1)
 _ACTIVITY_INTERVAL_SECONDS = 300.0
 _VALIDATION_IDLE_SECONDS = 5.0
+_VALIDATION_QUANTUM = 16
 _PER_GAME_QUEUE_CAPACITY = 256
 _MIN_VALIDATED_RELIABILITY = 0.50
 
@@ -360,6 +361,67 @@ def _queue_depth(service) -> int:
     return sum(int(q.qsize()) for q in queues)
 
 
+def _begin_source_work(service, source) -> None:
+    """Keep a source restartable until every routed candidate has finished."""
+    with service._lock:
+        service._v818_pending_sources[str(source.trajectory_id)] = {
+            "source": source,
+            "candidate_ids": set(),
+            "routing_open": True,
+        }
+
+
+def _track_candidate_work(service, candidate) -> None:
+    with service._lock:
+        pending = service._v818_pending_sources.get(
+            str(candidate.source.trajectory_id)
+        )
+        if pending is not None:
+            pending["candidate_ids"].add(str(candidate.candidate_id))
+
+
+def _finish_candidate_work(service, candidate) -> None:
+    source_id = str(candidate.source.trajectory_id)
+    with service._lock:
+        pending = service._v818_pending_sources.get(source_id)
+        if pending is None:
+            return
+        pending["candidate_ids"].discard(str(candidate.candidate_id))
+        if not pending["routing_open"] and not pending["candidate_ids"]:
+            service._v818_pending_sources.pop(source_id, None)
+
+
+def _end_source_routing(service, source) -> None:
+    source_id = str(source.trajectory_id)
+    with service._lock:
+        pending = service._v818_pending_sources.get(source_id)
+        if pending is None:
+            return
+        pending["routing_open"] = False
+        if not pending["candidate_ids"]:
+            service._v818_pending_sources.pop(source_id, None)
+
+
+def _restore_pending_sources(service) -> None:
+    """Move snapshot-restored sources back into the optimizer input queue."""
+    while not service._stop.is_set():
+        with service._lock:
+            if not service._v818_restored_sources:
+                return
+            source = service._v818_restored_sources[0]
+        try:
+            service._sources.put_nowait(source)
+        except queue.Full:
+            return
+        with service._lock:
+            if service._v818_restored_sources and (
+                service._v818_restored_sources[0].trajectory_id
+                == source.trajectory_id
+            ):
+                service._v818_restored_sources.pop(0)
+            service._seen_sources.add(str(source.trajectory_id))
+
+
 def _alive_validators(service) -> dict[str, threading.Thread]:
     return {
         game: thread
@@ -408,12 +470,14 @@ def _route_candidate(service, candidate) -> bool:
             game, queue.Queue(maxsize=_PER_GAME_QUEUE_CAPACITY)
         )
     _ensure_validator(service, game)
+    _track_candidate_work(service, candidate)
     while not service._stop.is_set():
         try:
             q.put(candidate, timeout=0.10)
             return True
         except queue.Full:
             _start_waiting_validators(service)
+    _finish_candidate_work(service, candidate)
     return False
 
 
@@ -493,6 +557,7 @@ def _record_validated_prefix(service, candidate, result) -> None:
 def _optimizer_loop_v818(service) -> None:
     try:
         while not service._stop.is_set():
+            _restore_pending_sources(service)
             _ingest_inbox_v818(service)
             _start_waiting_validators(service)
             try:
@@ -500,6 +565,7 @@ def _optimizer_loop_v818(service) -> None:
             except queue.Empty:
                 continue
             try:
+                _begin_source_work(service, source)
                 if int(source.round_index) >= int(service.config.max_optimization_rounds):
                     continue
                 _register_source_prefix(service, source)
@@ -523,6 +589,7 @@ def _optimizer_loop_v818(service) -> None:
                     if not _route_candidate(service, candidate):
                         break
             finally:
+                _end_source_routing(service, source)
                 service._sources.task_done()
     except BaseException as exc:
         service._fail(exc)
@@ -534,6 +601,7 @@ def _game_validator_loop(service, game_id: str) -> None:
     game = str(game_id)
     validator = _GameReplayValidator(service, game)
     idle_since = time.monotonic()
+    processed = 0
     try:
         while not service._stop.is_set():
             with service._v818_validator_lock:
@@ -639,7 +707,13 @@ def _game_validator_loop(service, game_id: str) -> None:
                     )
                     service.submit_trajectory(next_source)
             finally:
+                _finish_candidate_work(service, candidate)
                 q.task_done()
+                processed += 1
+            if processed >= _VALIDATION_QUANTUM:
+                with service._v818_validator_lock:
+                    if service._v818_waiting_games:
+                        break
     except BaseException as exc:
         service._fail(exc)
     finally:
@@ -647,6 +721,9 @@ def _game_validator_loop(service, game_id: str) -> None:
             current = service._v818_validator_threads.get(game)
             if current is threading.current_thread():
                 service._v818_validator_threads.pop(game, None)
+            q = service._v818_game_queues.get(game)
+            if q is not None and q.unfinished_tasks > 0:
+                service._v818_waiting_games.add(game)
         _start_waiting_validators(service)
 
 
@@ -764,7 +841,41 @@ def _stop_v818(service, *, drain: bool = True, timeout: float = 10.0) -> None:
 
 def _state_dict_v818(service) -> dict[str, object]:
     payload = _BASE_STATE_DICT(service)
-    payload["version"] = 2
+    payload["version"] = 3
+    with service._sources.mutex:
+        queued = tuple(service._sources.queue)
+    with service._lock:
+        pending = tuple(service._v818_pending_sources.values())
+        restored = tuple(service._v818_restored_sources)
+        pending_ids = {
+            str(row["source"].trajectory_id) for row in pending
+        } | {
+            str(row.trajectory_id) for row in (*restored, *queued)
+        }
+        incomplete_candidates = {
+            str(candidate_id)
+            for row in pending
+            for candidate_id in row["candidate_ids"]
+        }
+        payload["seen_sources"] = [
+            value
+            for value in payload.get("seen_sources", ())
+            if str(value) not in pending_ids
+        ]
+        payload["attempted"] = [
+            value
+            for value in payload.get("attempted", ())
+            if str(value) not in incomplete_candidates
+        ]
+        sources = {
+            str(row["source"].trajectory_id): row["source"]
+            for row in pending
+        }
+        sources.update({str(row.trajectory_id): row for row in restored})
+        sources.update({str(row.trajectory_id): row for row in queued})
+        payload["pending_sources"] = [
+            row.to_dict() for _source_id, row in sorted(sources.items())
+        ]
     with service._v818_validator_lock:
         payload["best_prefixes"] = {
             game: {
@@ -795,7 +906,29 @@ def _load_state_v818(service, state: dict[str, object] | None) -> None:
         # Old IDs encoded seeds; rediscover/revalidate under seedless identity.
         raw["seen_sources"] = []
         raw["attempted"] = []
+    if version < 3:
+        # v2 saved sources as seen even when their generated candidates were
+        # still only in volatile queues.  Allow durable discovery to submit
+        # those sources again; persisted candidate IDs still deduplicate work
+        # that really completed.
+        raw["seen_sources"] = []
+        raw["version"] = 3
     _BASE_LOAD_STATE(service, raw)
+    restored = []
+    for item in raw.get("pending_sources", ()):
+        if not isinstance(item, dict):
+            continue
+        try:
+            restored.append(optimizer.SuccessfulTrajectory.from_dict(item))
+        except (KeyError, TypeError, ValueError):
+            continue
+    with service._lock:
+        known = {str(row.trajectory_id) for row in service._v818_restored_sources}
+        for row in restored:
+            if str(row.trajectory_id) not in known:
+                service._v818_restored_sources.append(row)
+                service._seen_sources.add(str(row.trajectory_id))
+                known.add(str(row.trajectory_id))
     best = raw.get("best_prefixes", {})
     if isinstance(best, dict):
         with service._v818_validator_lock:
@@ -1103,6 +1236,8 @@ def install_trajectory_optimizer_v818() -> None:
         _BASE_SERVICE_INIT(self, *args, **kwargs)
         self._v818_validator_lock = threading.RLock()
         self._v818_game_queues: dict[str, queue.Queue] = {}
+        self._v818_pending_sources: dict[str, dict[str, object]] = {}
+        self._v818_restored_sources: list[object] = []
         self._v818_validator_threads: dict[str, threading.Thread] = {}
         self._v818_waiting_games: set[str] = set()
         self._v818_max_validators = _MAX_VALIDATORS

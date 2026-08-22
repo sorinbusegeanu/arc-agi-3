@@ -151,6 +151,31 @@ class LearningStateTests(unittest.TestCase):
         )
         self.assertFalse(coordinator.reserve_optimization(game_id="g", level=1, attempts=1))
 
+    def test_better_frontier_reopens_optimization_budget(self) -> None:
+        coordinator = AdaptiveLearningCoordinator()
+        target = scope("g", level=1)
+        coordinator.observe_frontier_candidate(
+            target,
+            candidate(1, cost=20, attempts=2, successes=2),
+            terminal_state="WIN",
+            generation=1,
+        )
+        record = coordinator._record("g", 1)
+        record.consumed_optimization_budget = 123
+        record.validations_since_improvement = 50
+        record.optimizer_exhausted_version = record.frontier_version
+
+        coordinator.observe_frontier_candidate(
+            target,
+            candidate(2, cost=10, attempts=2, successes=2),
+            terminal_state="WIN",
+            generation=2,
+        )
+
+        self.assertEqual(record.consumed_optimization_budget, 0)
+        self.assertEqual(record.validations_since_improvement, 0)
+        self.assertEqual(record.optimizer_exhausted_version, -1)
+
 
 class AllocationTests(unittest.TestCase):
     def test_weighted_allocator_redirects_credits_to_unsolved_game(self) -> None:

@@ -68,7 +68,63 @@ class PotentialAwareBudgetTests(unittest.TestCase):
         self.assertEqual(high_potential, 400)
         self.assertLess(low_budget, high_budget)
         self.assertLess(low_stall, high_stall)
+        self.assertLessEqual(low_stall, 20)
         self.assertEqual(high_budget, 2048)
+
+    def test_restored_no_progress_counter_remains_authoritative(self):
+        config = v819.AdaptiveLearningConfig(
+            optimization_validation_budget=2048,
+            max_validations_without_improvement=256,
+        )
+        original = v819.AdaptiveLearningCoordinator(config=config)
+        record = original._record("short", 1)
+        record.frontier_version = 4
+        record.validations_since_improvement = 17
+
+        coordinator = v819.AdaptiveLearningCoordinator(config=config)
+        coordinator.load_state(original.state_dict())
+        repair._register_candidate(
+            coordinator,
+            source_candidate(game="short", level=1, cost=2),
+        )
+        prior, present = repair._context_set(
+            repair._BUDGET_CONTEXT,
+            mode="precheck",
+            key=("short", 1),
+        )
+        try:
+            self.assertFalse(
+                coordinator.reserve_optimization(
+                    game_id="short", level=1, attempts=1
+                )
+            )
+        finally:
+            repair._context_restore(repair._BUDGET_CONTEXT, prior, present)
+        self.assertEqual(
+            coordinator._record("short", 1).optimizer_exhausted_version,
+            4,
+        )
+
+    def test_current_frontier_exhaustion_survives_restart(self):
+        coordinator = v819.AdaptiveLearningCoordinator()
+        repair._register_candidate(
+            coordinator,
+            source_candidate(game="done", level=1, cost=100),
+        )
+        record = coordinator._record("done", 1)
+        record.frontier_version = 7
+        record.optimizer_exhausted_version = 7
+        prior, present = repair._context_set(
+            repair._BUDGET_CONTEXT,
+            mode="precheck",
+            key=("done", 1),
+        )
+        try:
+            self.assertFalse(
+                coordinator.reserve_optimization(game_id="done", level=1, attempts=1)
+            )
+        finally:
+            repair._context_restore(repair._BUDGET_CONTEXT, prior, present)
 
     def test_cost_one_level_is_immediately_minimal(self):
         coordinator = v819.AdaptiveLearningCoordinator()

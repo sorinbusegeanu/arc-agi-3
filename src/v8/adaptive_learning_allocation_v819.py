@@ -558,6 +558,10 @@ class AdaptiveLearningCoordinator:
                 record.frontier_version = int(version)
                 record.optimizer_exhausted_version = -1
                 record.validations_since_improvement = 0
+                # Budgets are scoped to a frontier version.  A genuinely better
+                # trajectory must receive a fresh search window even when the
+                # preceding frontier exhausted its allowance.
+                record.consumed_optimization_budget = 0
                 record.last_frontier_improvement_generation = max(1, int(generation))
                 if previous_state == GameLearningState.SOLVED_STABLE:
                     record.state = GameLearningState.SOLVED_OPTIMIZING

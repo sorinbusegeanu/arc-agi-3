@@ -79,6 +79,7 @@ def _optimizer_loop_v836(service) -> None:
 
     try:
         while not service._stop.is_set():
+            v818._restore_pending_sources(service)
             v818._ingest_inbox_v818(service)
             v818._start_waiting_validators(service)
             try:
@@ -86,6 +87,7 @@ def _optimizer_loop_v836(service) -> None:
             except queue.Empty:
                 continue
             try:
+                v818._begin_source_work(service, source)
                 v818._register_source_prefix(service, source)
                 key = v818._target_key(source)
                 with service._v818_validator_lock:
@@ -123,6 +125,7 @@ def _optimizer_loop_v836(service) -> None:
                     if not v818._route_candidate(service, candidate):
                         break
             finally:
+                v818._end_source_routing(service, source)
                 service._sources.task_done()
     except BaseException as exc:
         service._fail(exc)

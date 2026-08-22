@@ -466,6 +466,7 @@ def _optimizer_loop_v820(service) -> None:
 
     try:
         while not service._stop.is_set():
+            v818._restore_pending_sources(service)
             v818._ingest_inbox_v818(service)
             v818._start_waiting_validators(service)
             try:
@@ -473,6 +474,7 @@ def _optimizer_loop_v820(service) -> None:
             except queue.Empty:
                 continue
             try:
+                v818._begin_source_work(service, source)
                 if int(source.round_index) >= int(service.config.max_optimization_rounds):
                     continue
                 v818._register_source_prefix(service, source)
@@ -512,6 +514,7 @@ def _optimizer_loop_v820(service) -> None:
                     if not v818._route_candidate(service, candidate):
                         break
             finally:
+                v818._end_source_routing(service, source)
                 service._sources.task_done()
     except BaseException as exc:
         service._fail(exc)
@@ -523,6 +526,7 @@ def _game_validator_loop_v820(service, game_id: str) -> None:
     game = str(game_id)
     validator = v818._GameReplayValidator(service, game)
     idle_since = time.monotonic()
+    processed = 0
     try:
         while not service._stop.is_set():
             with service._v818_validator_lock:
@@ -563,7 +567,13 @@ def _game_validator_loop_v820(service, game_id: str) -> None:
                     continue
                 _process_candidate(service, validator, candidate)
             finally:
+                v818._finish_candidate_work(service, candidate)
                 q.task_done()
+                processed += 1
+            if processed >= v818._VALIDATION_QUANTUM:
+                with service._v818_validator_lock:
+                    if service._v818_waiting_games:
+                        break
     except BaseException as exc:
         service._fail(exc)
     finally:
@@ -571,6 +581,9 @@ def _game_validator_loop_v820(service, game_id: str) -> None:
             current = service._v818_validator_threads.get(game)
             if current is threading.current_thread():
                 service._v818_validator_threads.pop(game, None)
+            q = service._v818_game_queues.get(game)
+            if q is not None and q.unfinished_tasks > 0:
+                service._v818_waiting_games.add(game)
         v818._start_waiting_validators(service)
 
 

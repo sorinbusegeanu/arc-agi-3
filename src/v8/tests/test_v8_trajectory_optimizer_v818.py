@@ -124,11 +124,85 @@ class MigrationTests(unittest.TestCase):
                 }
             )
             state = service.state_dict()
-            self.assertEqual(state["version"], 2)
+            self.assertEqual(state["version"], 3)
             self.assertNotIn("seed", state["validated"][0]["anchor"])
             self.assertNotEqual(state["validated"][0]["variant_id"], "legacy-seeded-id")
             self.assertNotIn("old-source", state["seen_sources"])
             self.assertNotIn("old-candidate", state["attempted"])
+
+    def test_v2_state_reopens_seen_sources_but_preserves_completed_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            service = TrajectoryOptimizationService(
+                Path(root), validator=lambda _candidate: None
+            )
+            service.load_state(
+                {
+                    "version": 2,
+                    "identity_schema_version": 2,
+                    "seen_sources": ["possibly-incomplete-source"],
+                    "attempted": ["completed-candidate"],
+                    "validated": [],
+                    "metrics": {},
+                }
+            )
+            state = service.state_dict()
+            self.assertNotIn("possibly-incomplete-source", state["seen_sources"])
+            self.assertIn("completed-candidate", state["attempted"])
+
+    def test_pending_source_and_incomplete_candidate_survive_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            row = source((1, 2, 3, 4))
+            candidate = optimizer.TrajectoryCandidate(
+                "in-flight-candidate",
+                row,
+                "DELETE_ACTION",
+                (1, 2, 3),
+                3,
+                1,
+            )
+            service = TrajectoryOptimizationService(
+                Path(root), validator=lambda _candidate: None
+            )
+            v818._begin_source_work(service, row)
+            v818._track_candidate_work(service, candidate)
+            v818._end_source_routing(service, row)
+            with service._lock:
+                service._seen_sources.add(row.trajectory_id)
+                service._attempted.update(
+                    {"completed-candidate", candidate.candidate_id}
+                )
+
+            state = service.state_dict()
+            self.assertEqual(
+                [item["trajectory_id"] for item in state["pending_sources"]],
+                [row.trajectory_id],
+            )
+            self.assertNotIn(row.trajectory_id, state["seen_sources"])
+            self.assertNotIn(candidate.candidate_id, state["attempted"])
+            self.assertIn("completed-candidate", state["attempted"])
+
+            restored = TrajectoryOptimizationService(
+                Path(root) / "restored", validator=lambda _candidate: None
+            )
+            restored.load_state(state)
+            self.assertIn(row.trajectory_id, restored._seen_sources)
+            self.assertEqual(len(restored._v818_restored_sources), 1)
+            v818._restore_pending_sources(restored)
+            self.assertEqual(restored._sources.get_nowait().trajectory_id, row.trajectory_id)
+
+    def test_queued_source_is_serialized_as_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            row = source((1, 2, 3))
+            service = TrajectoryOptimizationService(
+                Path(root), validator=lambda _candidate: None
+            )
+            self.assertTrue(service.submit_trajectory(row))
+            state = service.state_dict()
+            self.assertEqual(
+                [item["trajectory_id"] for item in state["pending_sources"]],
+                [row.trajectory_id],
+            )
+            self.assertNotIn(row.trajectory_id, state["seen_sources"])
 
 
 class CandidateSchedulingTests(unittest.TestCase):

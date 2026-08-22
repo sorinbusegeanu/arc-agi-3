@@ -12,7 +12,11 @@ _BASE_VALIDATE_TRACKED = None
 _BASE_PROCESS_CANDIDATE = None
 _BASE_START_WAITING_VALIDATORS = None
 
-_MIN_SEARCH_BUDGET = 64
+# Give every new frontier a bounded probe, then scale from the amount of work
+# that can still be removed.  The old floor of 64 made very short solutions
+# consume nearly the same no-progress budget as trajectories hundreds of
+# actions long.
+_MIN_SEARCH_BUDGET = 16
 _HEADROOM_BUDGET_SCALE = 8
 _SAVED_BUDGET_SCALE = 4
 _PROGRESS_REPORT_VALIDATIONS = 32
@@ -47,7 +51,12 @@ def _stats_for(coordinator, game_id: str, level: int) -> OptimizerBudgetStats:
     key = (str(game_id), max(1, int(level)))
     row = coordinator._v830_optimizer_budget_stats.get(key)
     if row is None:
-        row = OptimizerBudgetStats()
+        record = coordinator._record(*key)
+        row = OptimizerBudgetStats(
+            validations_since_improvement=max(
+                0, int(record.validations_since_improvement)
+            )
+        )
         coordinator._v830_optimizer_budget_stats[key] = row
     return row
 
@@ -123,7 +132,7 @@ def _status_message(coordinator, game_id: str, level: int, status: str) -> str:
             f"validations={int(stats.validations)} successes={int(stats.successes)} "
             f"saved={int(stats.saved_actions)} "
             f"budget={int(record.consumed_optimization_budget)}/{budget} "
-            f"no_progress={int(stats.validations_since_improvement)}/{stall}"
+            f"no_progress={int(record.validations_since_improvement)}/{stall}"
         )
 
 
@@ -212,11 +221,14 @@ def _reserve_optimization_v830(
         record = self._record(game_id, level)
         budget, stall, potential = _budget_limits(self, game_id, level)
 
-        if potential <= 0:
+        if int(record.optimizer_exhausted_version) == int(record.frontier_version):
+            status, terminal = "EXHAUSTED", True
+            allowed = False
+        elif potential <= 0:
             record.optimizer_exhausted_version = int(record.frontier_version)
             status, terminal = "MINIMAL", True
             allowed = False
-        elif int(stats.validations_since_improvement) >= int(stall):
+        elif int(record.validations_since_improvement) >= int(stall):
             record.optimizer_exhausted_version = int(record.frontier_version)
             status, terminal = "STALLED", True
             allowed = False
@@ -492,7 +504,7 @@ def optimizer_budget_snapshot(coordinator, game_id: str) -> tuple[dict[str, int]
                     "saved_actions": int(stats.saved_actions),
                     "budget_used": int(record.consumed_optimization_budget),
                     "budget_limit": int(budget),
-                    "no_progress": int(stats.validations_since_improvement),
+                    "no_progress": int(record.validations_since_improvement),
                     "no_progress_limit": int(stall),
                 }
             )
