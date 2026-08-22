@@ -50,6 +50,7 @@ _LAYERS: tuple[str, ...] = (
     "plateau_progress_v846",
     "sampling_evidence_frontier_v847",
     "sampling_evidence_frontier_v847_fixups",
+    "click_exploration_v848",
 )
 
 
