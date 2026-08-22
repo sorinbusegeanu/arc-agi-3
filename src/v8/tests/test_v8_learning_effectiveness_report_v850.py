@@ -235,7 +235,7 @@ class LearningEffectivenessReportTests(unittest.TestCase):
         self.assertIn("M7eff=100.0%", line)
         self.assertIn("step/L=30", line)
 
-    def test_log_is_jsonl_summary_only_and_write_emits_budgeted_effectiveness_line(self):
+    def test_log_is_jsonl_summary_only_and_write_does_not_duplicate_periodic_stdout(self):
         coordinator = self._coordinator()
         completed = {
             "transfer-game": {
@@ -261,9 +261,7 @@ class LearningEffectivenessReportTests(unittest.TestCase):
         self.assertIn("effectiveness", payload)
         self.assertNotIn("games", payload)
         self.assertNotIn("hypotheses", payload)
-        stdout = output.getvalue().strip()
-        self.assertIn("7% - effectiveness L=", stdout)
-        self.assertNotIn("current_run_", stdout)
+        self.assertEqual(output.getvalue(), "")
 
 
 if __name__ == "__main__":

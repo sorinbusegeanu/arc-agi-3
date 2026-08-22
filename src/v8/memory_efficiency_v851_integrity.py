@@ -146,15 +146,15 @@ def _plan_capacities_v851_integrity(
     action_growth = math.ceil(per_shard_steps * capacity_module.ACTION_GROWTH_PER_EVENT)
     node_required = int(prior.node_count) + node_growth + capacity_module.FIXED_HEADROOM
     edge_required = int(prior.edge_count) + edge_growth + capacity_module.FIXED_HEADROOM
-    node_capacity = max(
-        _MIN_NODE_CAPACITY,
-        node_required,
-        0 if node_override is None else int(node_override),
+    node_capacity = (
+        max(_MIN_NODE_CAPACITY, node_required)
+        if node_override is None
+        else int(node_override)
     )
-    edge_capacity = max(
-        _MIN_EDGE_CAPACITY,
-        edge_required,
-        0 if edge_override is None else int(edge_override),
+    edge_capacity = (
+        max(_MIN_EDGE_CAPACITY, edge_required)
+        if edge_override is None
+        else int(edge_override)
     )
 
     occupied_actions = 0
@@ -177,11 +177,13 @@ def _plan_capacities_v851_integrity(
             occupied_actions = 0
     projected_actions = occupied_actions + action_growth + capacity_module.FIXED_HEADROOM
     action_required = math.ceil(projected_actions / 0.70)
-    action_capacity = max(
-        _MIN_ACTION_CAPACITY,
-        action_required,
-        0 if action_override is None else int(action_override),
+    action_capacity = (
+        max(_MIN_ACTION_CAPACITY, action_required)
+        if action_override is None
+        else int(action_override)
     )
+    if min(node_capacity, edge_capacity, action_capacity) <= 0:
+        raise ValueError("capacity overrides must be positive")
     return capacity_module.CapacityPlan(
         int(node_capacity), int(edge_capacity), int(action_capacity)
     )
@@ -308,7 +310,7 @@ def _reporting_worker_v851_integrity(
         if now >= next_report:
             rows = tuple(latest[key] for key in sorted(latest))
             reporter._emit_line(
-                reporter.format_budget_game_rate_line(rows, total_steps, baseline),
+                reporter.format_periodic_progress_line(rows, total_steps, baseline),
                 output_queue,
             )
             while next_report <= now:

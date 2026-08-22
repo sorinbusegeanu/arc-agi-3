@@ -280,6 +280,7 @@ def _runtime_metrics_v851(self) -> dict[str, object]:
 
 
 def _runtime_cleanup_v851(self) -> None:
+    global _CURRENT_LEDGER
     ledger = getattr(getattr(self, "peers", None), "ledger", None)
     try:
         return _BASE_RUNTIME_CLEANUP(self)
@@ -289,6 +290,8 @@ def _runtime_cleanup_v851(self) -> None:
                 ledger.close()
             except sqlite3.Error:
                 pass
+        if _CURRENT_LEDGER is ledger:
+            _CURRENT_LEDGER = None
 
 
 def _peer_init_v851(self, *args, **kwargs) -> None:

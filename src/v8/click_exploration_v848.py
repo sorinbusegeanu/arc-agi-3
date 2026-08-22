@@ -617,6 +617,7 @@ def install_click_exploration_v848() -> None:
     from v8 import action_targeting_v810 as targeting
     from v8 import adaptive_learning_allocation_v819 as allocation
     from v8 import sampling_evidence_frontier_v847 as frontier
+    from v8 import sampling_persistence_v832 as persistence
     from v8 import sampling_portfolio_v831 as portfolio
 
     _BASE_ENV_INIT = adapter.ArcGridEnvironment.__init__
@@ -642,15 +643,16 @@ def install_click_exploration_v848() -> None:
     frontier._best_expansion_v847 = _best_expansion_v848
     frontier._select_expandable_action_v847 = _select_expandable_action_v848
 
-    sampler_cls = portfolio.PortfolioSampler
-    _BASE_SAMPLER_BEGIN_LEASE = sampler_cls.begin_lease
-    _BASE_SAMPLER_PREPARE_STEP = sampler_cls.prepare_step
-    _BASE_SAMPLER_FORCED_ACTION = sampler_cls.forced_action
-    _BASE_SAMPLER_OBSERVE_TRANSITION = sampler_cls.observe_transition
-    sampler_cls.begin_lease = _sampler_begin_lease_v848
-    sampler_cls.prepare_step = _sampler_prepare_step_v848
-    sampler_cls.forced_action = _sampler_forced_action_v848
-    sampler_cls.observe_transition = _sampler_observe_transition_v848
+    # Compose below the existing public v8.32/v8.47 authorities. Their wrappers
+    # deliberately expose stable identities that older diagnostics also verify.
+    _BASE_SAMPLER_BEGIN_LEASE = persistence._BASE_BEGIN_LEASE
+    persistence._BASE_BEGIN_LEASE = _sampler_begin_lease_v848
+    _BASE_SAMPLER_PREPARE_STEP = frontier._BASE_PREPARE_STEP
+    frontier._BASE_PREPARE_STEP = _sampler_prepare_step_v848
+    _BASE_SAMPLER_FORCED_ACTION = persistence._BASE_FORCED_ACTION
+    persistence._BASE_FORCED_ACTION = _sampler_forced_action_v848
+    _BASE_SAMPLER_OBSERVE_TRANSITION = persistence._BASE_OBSERVE_TRANSITION
+    persistence._BASE_OBSERVE_TRANSITION = _sampler_observe_transition_v848
 
     _BASE_REGISTER_GAMES = allocation.AdaptiveLearningCoordinator.register_games
     _BASE_SAMPLING_WEIGHT = allocation.AdaptiveLearningCoordinator.sampling_weight

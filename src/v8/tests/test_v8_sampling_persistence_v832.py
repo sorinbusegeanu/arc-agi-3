@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 import v8
+from v8 import click_exploration_v848 as v848
 from v8 import sampling_evidence_frontier_v847_fixups as v847_fixups
 from v8 import sampling_persistence_v832 as repair
 from v8 import sampling_portfolio_v831 as portfolio
@@ -161,8 +162,10 @@ class SamplingPersistenceV832Tests(unittest.TestCase):
         self.assertIs(portfolio.PortfolioSampler.forced_action, repair._forced_action_v832)
         self.assertIs(portfolio.PortfolioSampler.observe_transition, repair._observe_transition_v832)
         self.assertIs(repair._BASE_ON_EXTERNAL_RESET, v847_fixups._lower_reset_v847)
-        self.assertIs(repair._BASE_FORCED_ACTION, v847_fixups._lower_forced_v847)
-        self.assertIs(repair._BASE_OBSERVE_TRANSITION, v847_fixups._lower_observe_v847)
+        self.assertIs(repair._BASE_FORCED_ACTION, v848._sampler_forced_action_v848)
+        self.assertIs(v848._BASE_SAMPLER_FORCED_ACTION, v847_fixups._lower_forced_v847)
+        self.assertIs(repair._BASE_OBSERVE_TRANSITION, v848._sampler_observe_transition_v848)
+        self.assertIs(v848._BASE_SAMPLER_OBSERVE_TRANSITION, v847_fixups._lower_observe_v847)
 
 
 if __name__ == "__main__":

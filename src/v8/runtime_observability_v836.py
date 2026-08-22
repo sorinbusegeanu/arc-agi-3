@@ -50,10 +50,20 @@ class _TeeStdout:
                 budget_summary = 0.0 <= float(percentage) <= 100.0
             except ValueError:
                 budget_summary = False
+        effectiveness_summary = False
+        if "% - effectiveness L=" in payload:
+            percentage, _separator, _summary = payload.partition(
+                "% - effectiveness L="
+            )
+            try:
+                effectiveness_summary = 0.0 <= float(percentage) <= 100.0
+            except ValueError:
+                effectiveness_summary = False
         return not (
             payload.startswith("graph source=")
             or payload.startswith("current_run_wins=")
             or budget_summary
+            or effectiveness_summary
             or payload == "sampling done"
         )
 

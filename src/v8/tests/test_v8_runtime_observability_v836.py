@@ -53,6 +53,10 @@ class RuntimeObservabilityV836Tests(unittest.TestCase):
                         "current_run_solved_games=1/1 (ez01:B=25,L=60)",
                         flush=True,
                     )
+                    print(
+                        "[12:34] 20% - effectiveness L=40.0% G=0.0% M7=1.0%",
+                        flush=True,
+                    )
                     for line in progress:
                         print(line, flush=True)
                     print("[12:34] sampling done", flush=True)
@@ -64,6 +68,7 @@ class RuntimeObservabilityV836Tests(unittest.TestCase):
             self.assertIn("current_run_wins=100.0%", visible)
             self.assertIn("current_run_levels_solved=100.0%", visible)
             self.assertIn("current_run_solved_games=1/1", visible)
+            self.assertIn("20% - effectiveness L=40.0% G=0.0% M7=1.0%", visible)
             self.assertIn("sampling done", visible)
             for line in progress:
                 self.assertNotIn(line, visible)
@@ -94,7 +99,10 @@ class RuntimeObservabilityV836Tests(unittest.TestCase):
 
     def test_hypothesis_reporting_interval_is_five_minutes(self):
         self.assertEqual(observability._HYPOTHESIS_INTERVAL_SECONDS, 300.0)
-        self.assertIs(reporter.reporting_worker, observability._reporting_worker_v836)
+        self.assertIn(
+            reporter.reporting_worker.__name__,
+            {"_reporting_worker_v836", "_reporting_worker_v851_integrity"},
+        )
 
     def test_reporter_emits_hypothesis_status_on_its_independent_schedule(self):
         events = queue.Queue()

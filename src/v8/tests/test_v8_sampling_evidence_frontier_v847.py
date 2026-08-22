@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import v8
+from v8 import click_exploration_v848 as v848
 from v8 import decision_point_sampling_v821 as sampling
 from v8 import sampling_evidence_frontier_v847 as v847
 from v8 import sampling_evidence_frontier_v847_fixups as v847_fixups
@@ -63,8 +64,10 @@ class EvidencePrefixFrontierV847Tests(unittest.TestCase):
             v847_fixups._discovery_v847_legacy_compat,
         )
         self.assertIs(portfolio.PortfolioSampler.observe_transition, persistence._observe_transition_v832)
-        self.assertIs(persistence._BASE_OBSERVE_TRANSITION, v847_fixups._lower_observe_v847)
-        self.assertIs(persistence._BASE_FORCED_ACTION, v847_fixups._lower_forced_v847)
+        self.assertIs(persistence._BASE_OBSERVE_TRANSITION, v848._sampler_observe_transition_v848)
+        self.assertIs(v848._BASE_SAMPLER_OBSERVE_TRANSITION, v847_fixups._lower_observe_v847)
+        self.assertIs(persistence._BASE_FORCED_ACTION, v848._sampler_forced_action_v848)
+        self.assertIs(v848._BASE_SAMPLER_FORCED_ACTION, v847_fixups._lower_forced_v847)
         self.assertIs(
             portfolio.PortfolioSampler._schedule_next_sequence,
             v847._schedule_next_sequence_v847,

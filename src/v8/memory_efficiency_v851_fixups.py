@@ -53,7 +53,7 @@ def _restore_latest_snapshot_v851_fix(root, descriptors):
                 source_count, _seq = arena_module._HEADER.unpack(header)
                 source_bytes = _spec_payload_bytes(root, snapshot, spec)
                 current_expected = arena_module._HEADER.size + int(source_count) * arena.record.size
-                if label == "actions":
+                if label == "actions" and int(source_count) != int(arena.capacity):
                     storage._restore_action_stream(root, snapshot, spec, arena)
                 elif source_bytes == current_expected:
                     storage._copy_current_payload_to_arena(root, snapshot, spec, arena)

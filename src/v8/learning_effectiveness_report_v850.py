@@ -48,6 +48,7 @@ def _live_outcomes(completed_by_game, active_progress, active_leases) -> dict[st
         for field in _OUTCOME_FIELDS:
             row[field] = max(0, int(raw.get(field, 0)))
         row["first_win_step"] = max(0, int(raw.get("first_win_step", 0)))
+        row["max_level_reached"] = max(0, int(raw.get("max_level_reached", 0)))
         result[str(game_id)] = row
 
     for worker_id, progress in active_progress.items():
@@ -65,6 +66,10 @@ def _live_outcomes(completed_by_game, active_progress, active_leases) -> dict[st
             "planned_steps",
         ):
             row[field] += max(0, int(getattr(progress, field, 0)))
+        row["max_level_reached"] = max(
+            int(row.get("max_level_reached", 0)),
+            max(0, int(getattr(progress, "max_level_reached", 0))),
+        )
     return result
 
 
@@ -79,6 +84,27 @@ def _known_levels_solved(coordinator, game_id: str) -> int:
             if owner == game and str(getattr(record.state, "value", record.state)) != "UNSOLVED"
         ]
     return max(0, min(5, max(solved, default=0)))
+
+
+def _current_levels_solved(outcomes, games) -> int:
+    from v8 import plateau_progress_v846 as progress
+
+    total = 0
+    for game_id in games:
+        game = str(game_id)
+        row = outcomes.get(game, {})
+        if int(row.get("wins", 0)) > 0:
+            total += 5
+            continue
+        deepest = max(
+            max(0, int(row.get("max_level_reached", 0))),
+            max(0, int(progress._MAX_LEVEL_REACHED.get(game, 0))),
+        )
+        if deepest <= 0:
+            # Compatibility for callers that provide legacy aggregate rows.
+            deepest = max(0, int(row.get("levels_completed", 0)))
+        total += min(5, deepest)
+    return total
 
 
 def _action_totals(game_ids) -> tuple[int, int]:
@@ -149,10 +175,7 @@ def learning_effectiveness_snapshot_v850(
     planned_steps = sum(max(0, int(outcomes.get(game, {}).get("planned_steps", 0))) for game in games)
     level_advances = sum(max(0, int(outcomes.get(game, {}).get("levels_completed", 0))) for game in games)
     current_run_games_won = sum(1 for game in games if int(outcomes.get(game, {}).get("wins", 0)) > 0)
-    known_levels_solved = sum(_known_levels_solved(coordinator, game) for game in games)
-    known_games_solved = sum(
-        1 for game in games if bool(getattr(coordinator, "_game_won", {}).get(game, False))
-    )
+    current_levels_solved = _current_levels_solved(outcomes, games)
 
     m7_applied_games = 0
     m7_progress_games = 0
@@ -189,8 +212,8 @@ def learning_effectiveness_snapshot_v850(
 
     effectiveness = {
         "outcome_effectiveness": {
-            "level_solve_rate_pct": _pct(known_levels_solved, 5 * len(games)),
-            "game_solve_rate_pct": _pct(known_games_solved, len(games)),
+            "level_solve_rate_pct": _pct(current_levels_solved, 5 * len(games)),
+            "game_solve_rate_pct": _pct(current_run_games_won, len(games)),
             "current_run_level_advances": level_advances,
             "current_run_games_won": current_run_games_won,
         },
@@ -370,13 +393,9 @@ def _write_learning_effectiveness_log(
     except OSError:
         pass
 
-    outcomes = _live_outcomes(completed_by_game, active_progress, active_leases)
-    used_steps = sum(max(0, int(row.get("steps", 0))) for row in outcomes.values())
-    total_budget = max(0, int(getattr(runtime, "_v850_total_step_budget", 0)))
-    budget_consumed_pct = (
-        _pct(min(used_steps, total_budget), total_budget) if total_budget > 0 else None
-    )
-    _emit_effectiveness_stdout(payload, budget_consumed_pct=budget_consumed_pct)
+    # The independent reporter owns the exact one-minute stdout cadence. This
+    # richer allocator snapshot remains in JSONL; emitting both produced duplicate,
+    # contradictory terminal lines whenever the allocator view lagged actor progress.
 
 
 def _write_allocation_log_v850(
