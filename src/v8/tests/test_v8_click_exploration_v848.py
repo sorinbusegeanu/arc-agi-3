@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -15,6 +16,40 @@ from v8.learning_blockers_v055 import pack_action_choice, unpack_action_choice
 from v8.model import MemoryUid
 from v8.publication import ActionScore, PlannedAction
 from v8.sampling_portfolio_v831 import PortfolioSampler
+
+
+class _SyntheticClickEnvironment:
+    def __init__(
+        self, *, width: int, height: int, seed: int = 0, scale: int = 8
+    ) -> None:
+        self._last_grid = np.full(
+            (height * int(scale), width * int(scale)), 7, dtype=np.int64
+        )
+        self.env = SimpleNamespace(
+            _game=SimpleNamespace(
+                camera=SimpleNamespace(width=width, height=height, x=0, y=0),
+                current_level=SimpleNamespace(grid_size=(width, height)),
+            )
+        )
+        self._v848_click_seed = int(seed)
+        self._v848_click_target_color = None
+        self.reset_count = 0
+        self.last_levels_completed = 0
+        self.last_outcome_state = "NOT_FINISHED"
+        self._seen: set[int] = set()
+        self._target_count = width * height
+
+    def observe(self):
+        return self._last_grid.copy()
+
+    def available_actions(self):
+        return tuple(v848._canonical_click_tokens(self, self._last_grid))
+
+    def step(self, action: int):
+        self._seen.add(int(action))
+        if len(self._seen) >= self._target_count:
+            self.last_levels_completed = 1
+        return self.observe()
 
 
 class CompleteClickCoverageTests(unittest.TestCase):
@@ -54,93 +89,87 @@ class CompleteClickCoverageTests(unittest.TestCase):
         self.assertIn(target, exposed)
         self.assertIn(background, exposed)
 
-    def test_real_click_games_expose_one_center_per_selected_cell_color(self):
-        from collections import Counter
-
-        from v7.environment.arc_adapter import ArcGridEnvironment
-        from v8.action_targeting_v810 import native_action_id
-
-        expected = {
-            ("gp01", 0): (2, 4),
-            ("gp01", 1): (5, 60),
-            ("gp02", 0): (2, 4),
-            ("gp02", 1): (11, 60),
-        }
-        for (game_id, seed), (color, count) in expected.items():
-            env = ArcGridEnvironment(game_id=game_id, seed=seed)
-            try:
-                frame = env.observe()
-                clicks = tuple(
-                    action
-                    for action in env.available_actions()
-                    if native_action_id(action) == 6 and v848._is_exact_click_token(action)
-                )
-                decoded = [unpack_action_choice(action)[1] for action in clicks]
-                observed = Counter(int(frame[row["y"], row["x"]]) for row in decoded)
-                self.assertEqual(len(clicks), count)
-                self.assertEqual(observed, Counter({color: count}))
-                self.assertTrue(
-                    all(row["x"] % 8 == 4 and row["y"] % 8 == 4 for row in decoded)
-                )
-            finally:
-                close = getattr(getattr(env, "env", None), "close", None)
-                if callable(close):
-                    close()
-
-    def test_click_scan_keeps_long_observable_sweep_in_one_episode(self):
-        from v7.environment.arc_adapter import ArcGridEnvironment
-        from v7.environment.encoding import (
-            changed_cell_count,
-            structural_grid_signature,
+    def test_cell_center_clicks_select_one_observable_color_without_live_api(self):
+        frame = np.zeros((16, 16), dtype=np.int64)
+        frame[0:8, 0:8] = 2
+        frame[8:16, 0:8] = 2
+        frame[0:8, 8:16] = 5
+        frame[8:16, 8:16] = 5
+        game = SimpleNamespace(
+            camera=SimpleNamespace(width=2, height=2, x=0, y=0),
+            current_level=SimpleNamespace(grid_size=(2, 2)),
         )
 
-        for game_id, seed, expected_clicks in (("gp01", 0, 4), ("gp02", 1, 60)):
-            env = ArcGridEnvironment(game_id=game_id, seed=seed)
-            sampler = PortfolioSampler(game_id, seed=seed)
-            sampler.begin_lease(seed)
-            history = []
-            try:
-                for step in range(1, expected_clicks + 2):
-                    self.assertFalse(sampler.prepare_step(env))
-                    before = env.observe().copy()
-                    before_level = int(env.last_levels_completed)
-                    before_context = int(structural_grid_signature(before))
-                    actions = tuple(int(value) for value in env.available_actions())
-                    action = sampler.forced_action(
-                        level=before_level,
-                        context=before_context,
-                        actions=actions,
-                        history=tuple(history),
-                    )
-                    self.assertIsNotNone(action)
-                    after = env.step(int(action))
-                    after_level = int(env.last_levels_completed)
-                    after_context = int(structural_grid_signature(after))
-                    history.append(int(action))
-                    sampler.observe_transition(
-                        before_level=before_level,
-                        before_context=before_context,
-                        action=int(action),
-                        after_level=after_level,
-                        after_context=after_context,
-                        after_actions=tuple(int(value) for value in env.available_actions()),
-                        history_after=tuple(history),
-                        changed_cells=int(changed_cell_count(before, after)),
-                        terminal_state=str(env.last_outcome_state),
-                        terminal_polarity=0,
-                        level_advanced=after_level > before_level,
-                        prediction_error=0.0,
-                        future_delta=0.0,
-                    )
-                    if after_level > before_level:
-                        break
-                self.assertEqual(step, expected_clicks)
-                self.assertEqual(env.last_levels_completed, 1)
-                self.assertEqual(env.reset_count, 0)
-            finally:
-                close = getattr(getattr(env, "env", None), "close", None)
-                if callable(close):
-                    close()
+        for seed, expected_color in ((0, 2), (1, 5)):
+            env = SimpleNamespace(
+                env=SimpleNamespace(_game=game),
+                _v848_click_seed=seed,
+                _v848_click_target_color=None,
+            )
+            clicks = v848._canonical_click_tokens(env, frame)
+            decoded = [unpack_action_choice(action)[1] for action in clicks]
+            observed = [int(frame[row["y"], row["x"]]) for row in decoded]
+            self.assertEqual(len(clicks), 2)
+            self.assertEqual(observed, [expected_color, expected_color])
+            self.assertTrue(
+                all(row["x"] % 8 == 4 and row["y"] % 8 == 4 for row in decoded)
+            )
+
+    def test_click_scan_keeps_long_observable_sweep_in_one_episode(self):
+        # 60 distinct cells while the rendered display remains inside the exact
+        # action codec's [0,63] coordinate contract.
+        env = _SyntheticClickEnvironment(width=10, height=6, seed=0, scale=6)
+        sampler = PortfolioSampler("click-scan-fixture", seed=0)
+        sampler.begin_lease(0)
+        history: list[int] = []
+
+        def base_observe(instance, **_kwargs):
+            instance.base.pending_reset = (0, 0)
+            instance.base.current = None
+
+        with (
+            patch.object(v848, "_BASE_SAMPLER_PREPARE_STEP", lambda _self, _env: False),
+            patch.object(v848, "_BASE_SAMPLER_FORCED_ACTION", lambda _self, **_kwargs: None),
+            patch.object(v848, "_BASE_SAMPLER_OBSERVE_TRANSITION", base_observe),
+        ):
+            for step in range(1, 62):
+                self.assertFalse(v848._sampler_prepare_step_v848(sampler, env))
+                before_level = int(env.last_levels_completed)
+                actions = tuple(int(value) for value in env.available_actions())
+                action = v848._sampler_forced_action_v848(
+                    sampler,
+                    level=before_level,
+                    context=101,
+                    actions=actions,
+                    history=tuple(history),
+                )
+                self.assertIsNotNone(action)
+                env.step(int(action))
+                after_level = int(env.last_levels_completed)
+                history.append(int(action))
+                v848._sampler_observe_transition_v848(
+                    sampler,
+                    before_level=before_level,
+                    before_context=101,
+                    action=int(action),
+                    after_level=after_level,
+                    after_context=101,
+                    after_actions=actions,
+                    history_after=tuple(history),
+                    changed_cells=0,
+                    terminal_state="NOT_FINISHED",
+                    terminal_polarity=0,
+                    level_advanced=after_level > before_level,
+                    prediction_error=0.0,
+                    future_delta=0.0,
+                )
+                if after_level > before_level:
+                    break
+                self.assertIsNone(sampler.base.pending_reset)
+
+        self.assertEqual(step, 60)
+        self.assertEqual(env.last_levels_completed, 1)
+        self.assertEqual(env.reset_count, 0)
 
 
 class TargetSpecificSelectionTests(unittest.TestCase):

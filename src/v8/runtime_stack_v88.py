@@ -64,6 +64,7 @@ _POST_LAYERS: tuple[str, ...] = (
     "memory_efficiency_v851",
     "memory_efficiency_v851_fixups",
     "memory_efficiency_v851_integrity",
+    "memory_efficiency_v851_suite_fix",
 )
 
 
