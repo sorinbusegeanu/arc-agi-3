@@ -11,6 +11,7 @@ from v8 import adaptive_memory_transfer_candidate_pool_v856 as pool
 from v8 import adaptive_memory_transfer_experiment_v856 as experiment
 from v8 import learning_fixes_v088 as v088
 from v8 import learning_transfer_correctness_v854 as v854
+from v8 import lease_dispatch_continuity_v839 as v839
 from v8.arena import EdgeRecord, NodeRecord
 from v8.model import (
     CognitiveState,
@@ -27,7 +28,7 @@ from v8.structural_correspondence import StructuralCorrespondenceEstimator
 from v8.transfer import TransferValidator
 
 
-def _node(level, memory_type, key, *, support=3):
+def _node(level, memory_type, key, *, support=3, game_mask=0):
     uid = MemoryUid.from_key(level, memory_type, key)
     return NodeRecord(
         uid=uid,
@@ -44,7 +45,7 @@ def _node(level, memory_type, key, *, support=3):
         future_option_sum=0.0,
         score_weight=1.0,
         updated_watermark=1,
-        game_mask=0,
+        game_mask=int(game_mask),
         cognitive_state=int(CognitiveState.ACTIVE),
         validation_state=int(ValidationState.STRUCTURAL),
     )
@@ -71,8 +72,9 @@ class _ReadView:
 
 
 class AdaptiveMemoryTransferAuditV856Tests(unittest.TestCase):
-    def test_final_runtime_authority_filters_before_async_feedback(self) -> None:
-        self.assertIs(V82ContinuousMemoryRuntime.record_actor_results, audit._record_actor_results_v856)
+    def test_final_runtime_authority_is_preserved_and_lower_feedback_is_filtered(self) -> None:
+        self.assertIs(V82ContinuousMemoryRuntime.record_actor_results, v839._record_actor_results_v839)
+        self.assertIs(v839._BASE_RECORD_ACTOR_RESULTS, audit._record_actor_results_v856)
 
     def test_unknown_provenance_is_not_allowed_to_rewrite_intrinsic_strategy_quality(self) -> None:
         runtime = SimpleNamespace(read_view=_ReadView({}))
@@ -95,11 +97,7 @@ class AdaptiveMemoryTransferAuditV856Tests(unittest.TestCase):
         foreign = MemoryUid(6, 3)
         runtime = SimpleNamespace(
             read_view=_ReadView(
-                {
-                    local_a: (target,),
-                    local_b: (target,),
-                    foreign: (source,),
-                }
+                {local_a: (target,), local_b: (target,), foreign: (source,)}
             )
         )
         local_probe = SimpleNamespace(outcome_a=local_a, outcome_b=local_b)
@@ -115,16 +113,16 @@ class AdaptiveMemoryTransferAuditV856Tests(unittest.TestCase):
         filtered = audit._filter_target_scoped_learning_v856(runtime, row)
         self.assertEqual(filtered.preference_probes, (local_probe,))
 
-    def test_missing_formation_provenance_cannot_validate_transfer(self) -> None:
-        validator = TransferValidator(effect_threshold=0.0)
-        trial = validator.record_trial(
-            MemoryUid(4, 1),
-            target_game_hash=123,
-            metric_on=2.0,
-            metric_off=1.0,
-            formation_games=(),
+    def test_live_candidate_with_missing_exact_provenance_fails_closed(self) -> None:
+        left = _node(MemoryLevel.M4, MemoryType.CONCEPT, (1,), game_mask=1)
+        right = _node(MemoryLevel.M4, MemoryType.CONCEPT, (2,), game_mask=2)
+        graph = (_edge(left.uid, RelationType.TRANSFER_CORRESPONDENCE, right.uid, score=0.9),)
+        candidates = TransferValidator().candidates(
+            (left, right),
+            graph,
+            provenance=lambda _uid: frozenset(),
         )
-        self.assertFalse(trial.passed)
+        self.assertEqual(candidates, ())
 
     def test_supersedes_does_not_manufacture_cross_game_provenance(self) -> None:
         source = MemoryUid(4, 1)
@@ -143,8 +141,7 @@ class AdaptiveMemoryTransferAuditV856Tests(unittest.TestCase):
         descriptors = BoundedNeighborhoodSimilarity.descriptors((concept, evidence), ())
         self.assertIn(concept.uid, descriptors)
         self.assertNotIn(evidence.uid, descriptors)
-        candidates = TransferValidator().candidates((evidence,), ())
-        self.assertEqual(candidates, ())
+        self.assertEqual(TransferValidator().candidates((evidence,), ()), ())
 
     def test_structural_correspondence_ignores_edge_exposure_frequency(self) -> None:
         left = _node(MemoryLevel.M3, MemoryType.ROLE, (1, 1))
@@ -157,8 +154,7 @@ class AdaptiveMemoryTransferAuditV856Tests(unittest.TestCase):
             _edge(left.uid, RelationType.SIMILAR_TO, right.uid, score=0.9),
         )
         result = StructuralCorrespondenceEstimator(theta_struct=0.5).evaluate(
-            (left, right, lower_left, lower_right),
-            graph,
+            (left, right, lower_left, lower_right), graph
         )
         self.assertEqual(len(result), 1)
         self.assertTrue(result[0].admissible)
@@ -166,11 +162,7 @@ class AdaptiveMemoryTransferAuditV856Tests(unittest.TestCase):
 
     def test_explicit_transfer_composite_can_execute_before_fallback_admission(self) -> None:
         strategy_uid = MemoryUid(7, 201)
-        outcome_uid = MemoryUid(6, 201)
-        strategy = SimpleNamespace(
-            strategy_uid=strategy_uid,
-            outcome_uid=outcome_uid,
-        )
+        strategy = SimpleNamespace(strategy_uid=strategy_uid, outcome_uid=MemoryUid(6, 201))
         sequence = SimpleNamespace(score=3.5, strategy_uid=strategy_uid)
         view = SimpleNamespace(
             _strategy_by_context={123: [strategy]},
@@ -183,9 +175,7 @@ class AdaptiveMemoryTransferAuditV856Tests(unittest.TestCase):
         os.environ["ARC_AGI3_V8_SAMPLING_MODE"] = "TRANSFER"
         try:
             with patch("v8.environment_neutrality_v837._current_game_id", return_value="target"), patch.object(
-                v854,
-                "_ordered_action",
-                return_value=(2, "M7_SEQUENCE_CORRESPONDENCE", strategy_uid),
+                v854, "_ordered_action", return_value=(2, "M7_SEQUENCE_CORRESPONDENCE", strategy_uid)
             ):
                 plans = pool._plan_chain_v856(view, 123, (1, 2, 3))
         finally:
@@ -203,12 +193,9 @@ class AdaptiveMemoryTransferAuditV856Tests(unittest.TestCase):
         view = SimpleNamespace(
             strategy_has_ancestor=lambda strategy, required: strategy == strategy_uid and required == ancestor,
         )
-        grounded = {
-            9: ((4.0, strategy_uid, "M7_CORRESPONDENCE"),),
-        }
+        grounded = {9: ((4.0, strategy_uid, "M7_CORRESPONDENCE"),)}
         with patch.object(v854, "_ordered_sequences", return_value=()), patch(
-            "v8.environment_neutrality_v837._grounded_transfer_index",
-            return_value=(grounded, {}),
+            "v8.environment_neutrality_v837._grounded_transfer_index", return_value=(grounded, {})
         ):
             action, state = experiment._grounded_candidate_action(
                 read_view=view,
@@ -228,13 +215,14 @@ class AdaptiveMemoryTransferAuditV856Tests(unittest.TestCase):
         self.assertIs(experiments._probe_policy, experiment._probe_policy_grounded_v856)
 
     def test_candidate_pool_and_audit_are_installed_in_final_stack(self) -> None:
+        from v8 import adaptive_memory_transfer_grounding_v856 as grounding
         from v8 import environment_neutrality_v837 as v837
         from v8 import sampling_portfolio_v831 as portfolio
 
         self.assertIs(portfolio._BASE_PLAN_CHAIN, pool._plan_chain_v856)
         self.assertIs(v854._ordered_sequences, pool._ordered_transfer_candidates_v856)
-        self.assertIs(V82ContinuousMemoryRuntime.record_actor_results, audit._record_actor_results_v856)
-        self.assertTrue(callable(v837._grounded_transfer_index))
+        self.assertIs(v837._grounded_transfer_index, grounding._grounded_transfer_v856)
+        self.assertIs(v839._BASE_RECORD_ACTOR_RESULTS, audit._record_actor_results_v856)
 
 
 if __name__ == "__main__":
