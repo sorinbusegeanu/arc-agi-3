@@ -23,7 +23,14 @@ class _Rng:
 
 
 class _View:
-    def __init__(self, *, reliability=0.9, attempts=5.0, draw=0.0, source_games=()) -> None:
+    def __init__(
+        self,
+        *,
+        reliability=0.9,
+        attempts=5.0,
+        draw=0.0,
+        source_games=None,
+    ) -> None:
         self._behavior_rng = _Rng(draw)
         self.strategy_uid = MemoryUid(7, 11)
         self.outcome_uid = MemoryUid(6, 13)
@@ -33,6 +40,8 @@ class _View:
                 attempt_weight=float(attempts),
             )
         }
+        if source_games is None:
+            source_games = (stable_u64("g1", person=b"v8-game"),)
         self._source_games = frozenset(int(value) for value in source_games)
 
     def source_games(self, uid):
@@ -156,11 +165,9 @@ class AdaptiveMemoryControlV855Tests(unittest.TestCase):
     def test_arbitration_starvation_release_is_bounded(self) -> None:
         view = _View(draw=0.99)
         plan = self._plan(view)
-        stats = control._stats("g1")
-        stats["consecutive_exploration"] = float(
-            control._MAX_CONSECUTIVE_ARBITRATION_EXPLORATION
-        )
         with patch.object(control, "_exact_m7_candidates", return_value=((plan,), False)):
+            for _ in range(control._MAX_CONSECUTIVE_ARBITRATION_EXPLORATION):
+                self.assertEqual(control._plan_chain_v855(view, 123, (1, 2, 3)), ())
             rows = control._plan_chain_v855(view, 123, (1, 2, 3))
         self.assertEqual(rows, (plan,))
         self.assertEqual(control._stats("g1")["starvation_release"], 1.0)
