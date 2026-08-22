@@ -8,6 +8,8 @@ from unittest.mock import patch
 import v8  # noqa: F401 - installs the production runtime stack
 from v8 import adaptive_memory_transfer_audit_v856 as audit
 from v8 import adaptive_memory_transfer_candidate_pool_v856 as pool
+from v8 import adaptive_memory_transfer_experiment_v856 as experiment
+from v8 import learning_fixes_v088 as v088
 from v8 import learning_transfer_correctness_v854 as v854
 from v8.arena import EdgeRecord, NodeRecord
 from v8.model import (
@@ -194,6 +196,36 @@ class AdaptiveMemoryTransferAuditV856Tests(unittest.TestCase):
         self.assertEqual(len(plans), 1)
         self.assertEqual(plans[0].strategy_uid, strategy_uid)
         self.assertEqual(plans[0].action_id, 2)
+
+    def test_held_out_on_policy_uses_target_grounded_action_not_source_raw_action(self) -> None:
+        ancestor = MemoryUid(4, 301)
+        strategy_uid = MemoryUid(7, 301)
+        view = SimpleNamespace(
+            strategy_has_ancestor=lambda strategy, required: strategy == strategy_uid and required == ancestor,
+        )
+        grounded = {
+            9: ((4.0, strategy_uid, "M7_CORRESPONDENCE"),),
+        }
+        with patch.object(v854, "_ordered_sequences", return_value=()), patch(
+            "v8.environment_neutrality_v837._grounded_transfer_index",
+            return_value=(grounded, {}),
+        ):
+            action, state = experiment._grounded_candidate_action(
+                read_view=view,
+                game_id="target",
+                context=123,
+                actions=(2, 9),
+                required_ancestor=ancestor,
+                active_sequence=None,
+            )
+        self.assertEqual(action, 9)
+        self.assertIsNone(state)
+
+    def test_grounded_experiment_policy_is_installed_over_v088_raw_planning_probe(self) -> None:
+        from v8 import experiments
+
+        self.assertIs(v088._probe_policy_v088, experiment._probe_policy_grounded_v856)
+        self.assertIs(experiments._probe_policy, experiment._probe_policy_grounded_v856)
 
     def test_candidate_pool_and_audit_are_installed_in_final_stack(self) -> None:
         from v8 import environment_neutrality_v837 as v837
