@@ -336,20 +336,11 @@ def _run_actor_jobs_v839(runtime, jobs, **kwargs):
     # after the feedback barrier: resuming them in the small gap before the CLI's
     # wait_quiescent() call can start another large graph cycle and refill every
     # canonical queue during shutdown.
-    runtime._sampling_complete = True
-    optimizer = getattr(runtime, "_v814_trajectory_optimizer", None)
-    if optimizer is not None:
-        # Successful trajectories are already durable JSON inbox records. Stop
-        # admitting that potentially unbounded backlog once actor sampling ends;
-        # the optimizer still drains every item already admitted to RAM, while
-        # residual inbox files remain available to the next continuous run.
-        optimizer._v841_preserve_inbox_on_shutdown = True
+    _request_final_peer_drain(runtime)
 
     feedback = getattr(runtime, "_v839_actor_feedback", None)
     if feedback is not None:
         peers = getattr(runtime, "peers", None)
-        if peers is not None:
-            peers.pause()
         if peers is not None and not peers.wait_idle(_DRAIN_TIMEOUT_SECONDS):
             raise TimeoutError("v8 peers did not become idle before feedback drain")
         feedback.flush()
@@ -362,6 +353,25 @@ def _run_actor_jobs_v839(runtime, jobs, **kwargs):
     # Reporting/final save still sees all resolvable deferred validation evidence.
     _BASE_RETRY_DEFERRED(runtime)
     return result
+
+
+def _request_final_peer_drain(runtime) -> None:
+    """Stop autonomous semantic work once the actor interaction budget is spent."""
+    runtime._sampling_complete = True
+    optimizer = getattr(runtime, "_v814_trajectory_optimizer", None)
+    if optimizer is not None:
+        # Successful trajectories are already durable JSON inbox records. Stop
+        # admitting that potentially unbounded backlog once actor sampling ends;
+        # the optimizer still drains every item already admitted to RAM, while
+        # residual inbox files remain available to the next continuous run.
+        optimizer._v841_preserve_inbox_on_shutdown = True
+
+    peers = getattr(runtime, "peers", None)
+    if peers is not None:
+        cancel = getattr(peers, "_v841_peer_cancel", None)
+        if cancel is not None:
+            cancel.set()
+        peers.pause()
 
 
 def _runtime_close_v839(self, *args, **kwargs):

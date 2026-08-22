@@ -335,6 +335,9 @@ def _auto_outcome_holdout(self, nodes: tuple[NodeRecord, ...], edges: tuple[Edge
 
 def _run_once_with_validation(self) -> None:
     _BASE_V82_RUN_ONCE(self)
+    cancel = getattr(self, "_v841_peer_cancel", None)
+    if cancel is not None and cancel.is_set():
+        return
     cut = getattr(self, "last_developmental_cut", None)
     if cut is None:
         return

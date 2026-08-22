@@ -109,6 +109,48 @@ class DeferredScalingTests(unittest.TestCase):
 
 
 class PeerScalingTests(unittest.TestCase):
+    def test_cancelled_peer_cycle_does_not_read_the_graph(self):
+        class ReadView:
+            def node_records(self):
+                raise AssertionError("cancelled peer cycle must not read nodes")
+
+        peer = SimpleNamespace(
+            _run_lock=threading.Lock(),
+            _v841_peer_cancel=threading.Event(),
+            read_view=ReadView(),
+        )
+        peer._v841_peer_cancel.set()
+
+        v841._peer_run_once_v841(peer)
+
+    def test_peer_cycle_stops_after_analysis_when_final_drain_is_requested(self):
+        cancel = threading.Event()
+
+        class ReadView:
+            @staticmethod
+            def node_records():
+                return ()
+
+            @staticmethod
+            def edge_records():
+                return ()
+
+        def analyses(_nodes, _edges):
+            cancel.set()
+            return {"replay": ()}
+
+        peer = SimpleNamespace(
+            _run_lock=threading.Lock(),
+            _v841_peer_cancel=cancel,
+            read_view=ReadView(),
+            _parallel_analyses=analyses,
+        )
+
+        from v8.peers_v82 import V82DevelopmentalPeerSupervisor
+
+        base_peer_class = V82DevelopmentalPeerSupervisor.__mro__[1]
+        base_peer_class.__dict__["run_once"](peer)
+
     def test_dirty_gate_skips_unchanged_peer_input(self):
         class Arena:
             sequence = 2

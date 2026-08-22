@@ -279,13 +279,25 @@ class DevelopmentalPeerSupervisor:
         if not self._run_lock.acquire(blocking=False):
             return
         try:
+            def cancelled() -> bool:
+                event = getattr(self, "_v841_peer_cancel", None)
+                return bool(event is not None and event.is_set())
+
+            if cancelled():
+                return
             nodes = self.read_view.node_records()
             edges = self.read_view.edge_records()
+            if cancelled():
+                return
             by_uid = {row.uid: row for row in nodes}
             analyses = self._parallel_analyses(nodes, edges)
+            if cancelled():
+                return
             attended = {item.uid for item in analyses["replay"]}
 
-            for row in nodes:
+            for row_index, row in enumerate(nodes):
+                if row_index % 256 == 0 and cancelled():
+                    return
                 if row.support_count < 2:
                     continue
                 kind = {
@@ -331,6 +343,8 @@ class DevelopmentalPeerSupervisor:
                         max(row.significance, row.learning_value),
                     )
 
+            if cancelled():
+                return
             for replay in analyses["replay"]:
                 row = by_uid.get(replay.uid)
                 if row is not None and self._fresh(
@@ -340,7 +354,11 @@ class DevelopmentalPeerSupervisor:
                         "replay_priority", row, replay.priority
                     )
 
-            for evidence in analyses["prediction"]:
+            if cancelled():
+                return
+            for evidence_index, evidence in enumerate(analyses["prediction"]):
+                if evidence_index % 256 == 0 and cancelled():
+                    return
                 uid = MemoryUid(evidence.uid_hi, evidence.uid_lo)
                 row = by_uid.get(uid)
                 if row is None or not self._fresh(
@@ -353,6 +371,8 @@ class DevelopmentalPeerSupervisor:
                         "prediction_violation", row, evidence.error
                     )
 
+            if cancelled():
+                return
             for refinement in analyses["context"][: self.candidate_budget]:
                 source = by_uid.get(refinement.source_uid)
                 if source is None or not self._fresh(
@@ -389,6 +409,8 @@ class DevelopmentalPeerSupervisor:
                     refinement.contradiction_rate,
                 )
 
+            if cancelled():
+                return
             for candidate in analyses["roles"][: self.candidate_budget]:
                 watermarks = [
                     by_uid[uid].updated_watermark
@@ -433,6 +455,8 @@ class DevelopmentalPeerSupervisor:
                         validation_state=int(ValidationState.STRUCTURAL),
                     )
 
+            if cancelled():
+                return
             for evidence in analyses["future"][: self.candidate_budget]:
                 row = by_uid.get(evidence.uid)
                 if row is None or not self._fresh(
@@ -451,6 +475,8 @@ class DevelopmentalPeerSupervisor:
                     min(1.0, abs(evidence.delta) / 4.0),
                 )
 
+            if cancelled():
+                return
             for evidence in analyses["compression"][: self.candidate_budget]:
                 row = by_uid.get(evidence.uid)
                 if row is None or not self._fresh(
@@ -482,6 +508,8 @@ class DevelopmentalPeerSupervisor:
                         )
                     )
 
+            if cancelled():
+                return
             for component in analyses["world"][: self.candidate_budget]:
                 wm_watermark = max(
                     (
@@ -546,6 +574,8 @@ class DevelopmentalPeerSupervisor:
             # Similarity is candidate evidence only.  It creates a canonical
             # SIMILAR_TO edge and a transfer prior, never identity merging or
             # validation. Cross-game empirical validation remains a separate trial.
+            if cancelled():
+                return
             for evidence in analyses["similarity"][: self.candidate_budget]:
                 source = by_uid.get(evidence.source_uid)
                 target = by_uid.get(evidence.target_uid)
@@ -586,6 +616,8 @@ class DevelopmentalPeerSupervisor:
                     provenance_games=games,
                 )
 
+            if cancelled():
+                return
             for candidate in analyses["transfer"][: self.candidate_budget]:
                 row = by_uid.get(candidate.uid)
                 if row is None or not self._fresh(
@@ -607,7 +639,11 @@ class DevelopmentalPeerSupervisor:
                     provenance_games=candidate.formation_games,
                 )
 
+            if cancelled():
+                return
             classes = self.outcomes.rebuild(nodes)
+            if cancelled():
+                return
             m7_rows = [
                 row
                 for row in nodes
@@ -729,7 +765,11 @@ class DevelopmentalPeerSupervisor:
                         )
                     )
 
+            if cancelled():
+                return
             by_outcome = self.strategies.by_outcome(nodes)
+            if cancelled():
+                return
             for _outcome_uid, alternatives in by_outcome.items():
                 if len(alternatives) < 2:
                     continue
@@ -760,6 +800,8 @@ class DevelopmentalPeerSupervisor:
                             min(1.0, efficiency),
                         )
 
+            if cancelled():
+                return
             lifecycle_rows = tuple(
                 row
                 for row in nodes
@@ -781,11 +823,17 @@ class DevelopmentalPeerSupervisor:
                         validation_state=decision.validation_state,
                     )
                 )
+            if cancelled():
+                return
             protected = {
                 candidate.uid: candidate.protected_by_dependencies
                 for candidate in self.pruning.candidates(nodes, edges)
             }
-            for row in nodes:
+            if cancelled():
+                return
+            for row_index, row in enumerate(nodes):
+                if row_index % 256 == 0 and cancelled():
+                    return
                 if row.uid not in protected:
                     continue
                 decision = self.lifecycle.finalize_retirement(

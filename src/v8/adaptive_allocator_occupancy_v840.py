@@ -88,6 +88,25 @@ def _refill_idle_workers(idle_workers: set[int], assign) -> tuple[int, ...]:
     return tuple(assigned)
 
 
+def _sampling_budget_reported(
+    total_budget: int,
+    completed_by_game,
+    active_progress,
+    active_leases,
+) -> bool:
+    """True once actor progress accounts for the complete interaction budget."""
+    from v8 import adaptive_learning_allocation_v819_performance_fix as perf
+
+    live = perf._live_steps_by_game(
+        completed_by_game,
+        active_progress,
+        active_leases,
+    )
+    return sum(max(0, int(value)) for value in live.values()) >= max(
+        0, int(total_budget)
+    )
+
+
 def _occupancy_bounded_lease_steps(
     recommended: int,
     *,
@@ -213,6 +232,7 @@ def _adaptive_run_actor_jobs_v840(
     leases_by_game: dict[str, int] = {}
     initial_games = list(games)
     no_progress_retries = 0
+    final_peer_drain_requested = False
 
     def bucket(game: str) -> dict[str, int]:
         return completed_by_game.setdefault(
@@ -393,6 +413,20 @@ def _adaptive_run_actor_jobs_v840(
                     no_progress_retries = 0
                 if no_progress_retries > max(32, worker_count * 4):
                     raise RuntimeError("adaptive allocator could not consume interaction credits")
+
+            if (
+                not final_peer_drain_requested
+                and _sampling_budget_reported(
+                    total_budget,
+                    completed_by_game,
+                    active_progress,
+                    active_leases,
+                )
+            ):
+                from v8 import lease_dispatch_continuity_v839 as v839
+
+                v839._request_final_peer_drain(runtime)
+                final_peer_drain_requested = True
 
             # Refilling is global rather than tied to the worker that produced the
             # most recent completion. This keeps all process slots occupied until

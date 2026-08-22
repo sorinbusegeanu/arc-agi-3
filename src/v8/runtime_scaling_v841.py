@@ -317,6 +317,7 @@ def _peer_init_v841(self, *args, **kwargs):
     _BASE_PEER_INIT(self, *args, **kwargs)
     self._v841_peer_executor = ThreadPoolExecutor(max_workers=9, thread_name_prefix="v8-peer")
     self._v841_last_input_token = None
+    self._v841_peer_cancel = threading.Event()
 
 
 def _parallel_analyses_v841(self, nodes, edges):
@@ -336,6 +337,9 @@ def _parallel_analyses_v841(self, nodes, edges):
 
 
 def _peer_run_once_v841(self):
+    cancel = getattr(self, "_v841_peer_cancel", None)
+    if cancel is not None and cancel.is_set():
+        return None
     token = _peer_input_token(self)
     if token == getattr(self, "_v841_last_input_token", None):
         return None

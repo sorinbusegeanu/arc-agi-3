@@ -366,6 +366,9 @@ def _install_cognitive_replay() -> None:
 
     def run_once(self):
         base_run_once(self)
+        cancel = getattr(self, "_v841_peer_cancel", None)
+        if cancel is not None and cancel.is_set():
+            return
         metrics = process_replay_cognition(self)
         totals = getattr(self, "_v87_replay_totals", {"selected": 0, "processed": 0, "new_memories": 0, "revisions": 0, "correspondences": 0})
         for key, value in metrics.items():

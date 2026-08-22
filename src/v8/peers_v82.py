@@ -36,14 +36,27 @@ _LINEAGE = {
 class _FrozenCutReadView:
     """Read-only adapter so one peer interval consumes one declared shard-vector cut."""
 
-    def __init__(self, cut: DevelopmentalGenerationCut) -> None:
+    def __init__(
+        self,
+        cut: DevelopmentalGenerationCut,
+        *,
+        cancel_event: threading.Event | None = None,
+    ) -> None:
         self.cut = cut
         self._nodes = cut.nodes
         self._edges = cut.edges
         self._by_uid = {row.uid: row for row in self._nodes}
         self._direct_games: dict[MemoryUid, set[int]] = {}
         self._parents: dict[MemoryUid, set[MemoryUid]] = {}
-        for edge in self._edges:
+        self.cancelled = False
+        for edge_index, edge in enumerate(self._edges):
+            if (
+                edge_index % 256 == 0
+                and cancel_event is not None
+                and cancel_event.is_set()
+            ):
+                self.cancelled = True
+                return
             relation = int(edge.relation_type)
             if relation == int(RelationType.GAME_PROVENANCE) and int(edge.target_uid.hi) == 0:
                 self._direct_games.setdefault(edge.source_uid, set()).add(int(edge.target_uid.lo))
@@ -281,16 +294,31 @@ class V82DevelopmentalPeerSupervisor(DevelopmentalPeerSupervisor):
             return
         live_read_view = self.read_view
         try:
+            cancel = getattr(self, "_v841_peer_cancel", None)
+
+            def cancelled() -> bool:
+                return bool(cancel is not None and cancel.is_set())
+
+            if cancelled():
+                return
             cut = capture_developmental_cut(
                 live_read_view,
                 generation=int(self.current_generation()),
                 watermark=int(self.current_watermark()),
             )
+            if cancelled():
+                return
             self._last_developmental_cut = cut
-            frozen = _FrozenCutReadView(cut)
+            frozen = _FrozenCutReadView(cut, cancel_event=cancel)
+            if frozen.cancelled or cancelled():
+                return
             self.read_view = frozen
             self._process_formation(cut, frozen)
+            if cancelled():
+                return
             self._process_correspondence(cut, frozen)
+            if cancelled():
+                return
             # Base peer operators run against the exact same frozen cut.  They can
             # emit proposals, but none of those writes become inputs to this interval.
             super().run_once()

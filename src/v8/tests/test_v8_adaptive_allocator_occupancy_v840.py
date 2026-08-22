@@ -204,6 +204,27 @@ class AdaptiveAllocatorOccupancyV840Tests(unittest.TestCase):
             ledger.complete(1, 1)
         self.assertEqual(ledger.consumed + ledger.reserved + ledger.available, 10)
 
+    def test_live_progress_requests_final_drain_before_last_lease_returns(self) -> None:
+        lease = type("Lease", (), {"game_id": "g1"})()
+        progress = type("Progress", (), {"steps": 10})()
+
+        self.assertTrue(
+            v840._sampling_budget_reported(
+                10,
+                {},
+                {1: progress},
+                {1: lease},
+            )
+        )
+        self.assertFalse(
+            v840._sampling_budget_reported(
+                11,
+                {},
+                {1: progress},
+                {1: lease},
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

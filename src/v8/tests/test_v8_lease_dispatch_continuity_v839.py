@@ -123,6 +123,7 @@ class LeaseDispatchContinuityV839Tests(unittest.TestCase):
 
         class Peers:
             _pause = threading.Event()
+            _v841_peer_cancel = threading.Event()
 
             def pause(self):
                 events.append("peers-pause")
@@ -161,6 +162,7 @@ class LeaseDispatchContinuityV839Tests(unittest.TestCase):
         )
         self.assertEqual(peers.assert_timeout, v839._DRAIN_TIMEOUT_SECONDS)
         self.assertTrue(peers._pause.is_set())
+        self.assertTrue(peers._v841_peer_cancel.is_set())
         self.assertTrue(runtime._sampling_complete)
         self.assertTrue(
             runtime._v814_trajectory_optimizer._v841_preserve_inbox_on_shutdown
