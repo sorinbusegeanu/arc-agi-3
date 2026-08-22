@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from v8 import actor as actor_module
 from v8 import capacity
 from v8 import memory_efficiency_v851 as memory
 from v8 import memory_efficiency_v851_fixups as fixups
@@ -18,10 +19,10 @@ from v8 import memory_efficiency_v851_suite_fix as suite_fix
 from v8 import memory_storage_v851 as storage
 from v8 import runtime_stack_v88
 from v8.actor_read_view_v851 import ActorReadView, _COMPACT_CUT_KEY
-from v8.arena import ActionRecord, SharedActionArena, SharedEdgeArena, SharedNodeArena
+from v8.arena import ActionRecord, EdgeRecord, SharedActionArena, SharedEdgeArena, SharedNodeArena
 from v8.evidence import EvidenceRecord
 from v8.evidence_memory_v851 import DiskBackedEvidenceLedger, _ROOT_ENV
-from v8.model import MemoryLevel, MemoryUid, ValidationState
+from v8.model import MemoryLevel, MemoryUid, RelationType, ValidationState
 from v8.publication import ShardReadDescriptor
 
 
@@ -49,7 +50,10 @@ class MemoryEfficiencyV851Tests(unittest.TestCase):
         descriptor = ShardReadDescriptor(nodes.descriptor, edges.descriptor, actions.descriptor)
         view = None
         try:
-            view = ActorReadView((descriptor,), refresh_interval_seconds=None)
+            view = actor_module.open_actor_read_view(
+                (descriptor,), refresh_interval_seconds=None
+            )
+            self.assertIsInstance(view, ActorReadView)
             self.assertEqual(view._record_cache, {})
             self.assertEqual(view.node_records(), ())
             self.assertEqual(view.edge_records(), ())
@@ -60,6 +64,59 @@ class MemoryEfficiencyV851Tests(unittest.TestCase):
             nodes.dispose()
             edges.dispose()
             actions.dispose()
+
+    def test_actor_source_games_uses_compact_provenance_without_record_snapshots(self):
+        strategy = MemoryUid(1, 1)
+        parent = MemoryUid(2, 2)
+        game = 991
+        view = object.__new__(ActorReadView)
+        view._strategy_cache_stale = False
+        view._refresh_interval_seconds = None
+        view._strategy_version = (2, 2)
+        view._source_games_direct = {parent: {game}}
+        view._source_games_cache = {}
+        view._parents = {strategy: {parent}}
+        view._refresh_strategy_cache = lambda: None
+        with patch.object(
+            view,
+            "_stable_records_with_version",
+            side_effect=AssertionError("actor provenance requested a full edge snapshot"),
+        ):
+            self.assertEqual(view.source_games(strategy), frozenset({game}))
+            self.assertEqual(view.source_games(strategy), frozenset({game}))
+
+    def test_actor_provenance_scan_keeps_only_relevant_sources(self):
+        relevant = MemoryUid(3, 3)
+        irrelevant = MemoryUid(4, 4)
+        rows = (
+            EdgeRecord(
+                relevant,
+                int(RelationType.GAME_PROVENANCE),
+                MemoryUid(0, 101),
+                1,
+                1,
+            ),
+            EdgeRecord(
+                irrelevant,
+                int(RelationType.GAME_PROVENANCE),
+                MemoryUid(0, 202),
+                1,
+                1,
+            ),
+        )
+
+        class Arena:
+            sequence = 2
+            count = len(rows)
+
+            @staticmethod
+            def read(index):
+                return rows[index]
+
+        self.assertEqual(
+            ActorReadView._load_provenance_games((Arena(),), {relevant}),
+            {relevant: {101}},
+        )
 
     def test_actor_compact_cut_is_reused_without_full_record_snapshots(self):
         nodes = SharedNodeArena(capacity=16)
@@ -75,6 +132,14 @@ class MemoryEfficiencyV851Tests(unittest.TestCase):
             first._warm_compact_cut()
             self.assertEqual(set(cuts), {_COMPACT_CUT_KEY})
             self.assertEqual(first._record_cache, {})
+            with patch.object(
+                SharedEdgeArena,
+                "snapshot_records",
+                side_effect=AssertionError("actor requested a full edge snapshot"),
+            ):
+                edge_rows, edge_version = first._stable_records_with_version(first._edges[0])
+            self.assertEqual(edge_rows, ())
+            self.assertEqual(edge_version, int(first._edges[0].sequence))
 
             with patch.object(
                 ActorReadView,

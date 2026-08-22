@@ -351,6 +351,20 @@ def _reset_after_terminal_game(env, wait_seconds: float) -> None:
     env.reset()
 
 
+def open_actor_read_view(
+    read_descriptors: tuple[ShardReadDescriptor, ...],
+    *,
+    refresh_interval_seconds: float | None,
+    record_cuts: dict[tuple[str, str], tuple[tuple[object, ...], int]] | None = None,
+) -> LiveReadView:
+    """Construct the installed actor-only view through one runtime authority."""
+    return LiveReadView(
+        read_descriptors,
+        refresh_interval_seconds=refresh_interval_seconds,
+        record_cuts=record_cuts,
+    )
+
+
 def _refresh_actor_graph_if_due(
     read_view: LiveReadView,
     *,
@@ -393,7 +407,7 @@ def actor_worker(
     )
 
     ring = SharedRingBuffer(**experience_ring_args)
-    view = LiveReadView(
+    view = open_actor_read_view(
         read_descriptors,
         refresh_interval_seconds=None,
         record_cuts=record_cuts,

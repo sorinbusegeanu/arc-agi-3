@@ -29,7 +29,7 @@ _PROBE_STATES = _ACTIVE_STATES | {
     int(CognitiveState.PROBATION),
 }
 _COMPACT_CUT_KEY = ("v851", "actor-compact-cut")
-_COMPACT_CUT_SCHEMA = 1
+_COMPACT_CUT_SCHEMA = 3
 
 
 class ActorReadView(LiveReadView):
@@ -46,6 +46,11 @@ class ActorReadView(LiveReadView):
         self._v839_node_query_cache = {}
         self._v851_compact_nodes: tuple[NodeRecord, ...] = ()
         self._v851_compact_edges: tuple[EdgeRecord, ...] = ()
+        self._source_games_direct: dict[MemoryUid, set[int]] = {}
+        self._source_games_cache: dict[tuple[MemoryUid, int], frozenset[int]] = {}
+        self._compact_arena_cuts: dict[
+            tuple[str, str], tuple[tuple[object, ...], int]
+        ] = {}
         self._v851_ready = True
         self._v851_bootstrapping = False
         self._strategy_cache_stale = True
@@ -62,7 +67,7 @@ class ActorReadView(LiveReadView):
         payload, schema = raw
         if schema != _COMPACT_CUT_SCHEMA or not isinstance(payload, tuple):
             return False
-        if len(payload) != 11:
+        if len(payload) != 13:
             return False
         (
             self._parents,
@@ -74,9 +79,12 @@ class ActorReadView(LiveReadView):
             self._refined_action_scores,
             self._outcome_counts,
             self._outcome_totals,
+            self._source_games_direct,
+            self._compact_arena_cuts,
             self._v851_compact_nodes,
             edge_state,
         ) = payload
+        self._source_games_cache = {}
         self._v851_compact_edges, self._strategy_version = edge_state
         self._strategy_cache_stale = False
         if self._refresh_interval_seconds is not None:
@@ -103,6 +111,8 @@ class ActorReadView(LiveReadView):
             self._refined_action_scores,
             self._outcome_counts,
             self._outcome_totals,
+            self._source_games_direct,
+            self._compact_arena_cuts,
             self._v851_compact_nodes,
             (self._v851_compact_edges, self._strategy_version),
         )
@@ -115,11 +125,17 @@ class ActorReadView(LiveReadView):
         self._refresh_strategy_cache()
 
     def _stable_records_with_version(self, arena, *, timeout: float = 1.0):
+        del timeout
         if getattr(self, "_v851_bootstrapping", False) or not getattr(self, "_v851_ready", False):
             return (), int(arena.sequence)
-        # Compatibility path only: return a coherent cut but never retain it in the
-        # actor's record cache.
-        return arena.snapshot_records(timeout=timeout)
+        # Legacy policy wrappers may explicitly invoke a captured full-view refresh.
+        # Serve those calls from the per-arena compact cut as well; an actor must
+        # never materialize a complete node or edge snapshot.
+        self._refresh_strategy_cache()
+        return self._compact_arena_cuts.get(
+            self._record_cut_key(arena),
+            ((), int(arena.sequence)),
+        )
 
     def node_records(self, *, level=None):
         self._refresh_strategy_cache()
@@ -131,6 +147,31 @@ class ActorReadView(LiveReadView):
     def edge_records(self):
         self._refresh_strategy_cache()
         return self._v851_compact_edges
+
+    def source_games(self, uid: MemoryUid, *, max_depth: int = 8) -> frozenset[int]:
+        self._refresh_strategy_cache()
+        depth = max(0, int(max_depth))
+        key = (uid, depth)
+        cached = self._source_games_cache.get(key)
+        if cached is not None:
+            return cached
+        games = set(self._source_games_direct.get(uid, ()))
+        frontier = {uid}
+        visited = set(frontier)
+        for _ in range(depth):
+            following: set[MemoryUid] = set()
+            for current in frontier:
+                for parent in self._parents.get(current, ()):
+                    games.update(self._source_games_direct.get(parent, ()))
+                    if parent not in visited:
+                        visited.add(parent)
+                        following.add(parent)
+            if not following:
+                break
+            frontier = following
+        result = frozenset(games)
+        self._source_games_cache[key] = result
+        return result
 
     @staticmethod
     def _scan_node_arena(arena):
@@ -271,6 +312,37 @@ class ActorReadView(LiveReadView):
                 break
         return result
 
+    @staticmethod
+    def _load_provenance_games(edges, relevant: set[MemoryUid]) -> dict[MemoryUid, set[int]]:
+        if not relevant:
+            return {}
+        result: dict[MemoryUid, set[int]] = {}
+        game_provenance = int(RelationType.GAME_PROVENANCE)
+        for arena in edges:
+            for _attempt in range(20):
+                before = int(arena.sequence)
+                if before & 1:
+                    time.sleep(0.0005)
+                    continue
+                local: dict[MemoryUid, set[int]] = {}
+                count = int(arena.count)
+                for index in range(count):
+                    edge = arena.read(index)
+                    if (
+                        int(edge.relation_type) == game_provenance
+                        and edge.source_uid in relevant
+                        and int(edge.target_uid.hi) == 0
+                    ):
+                        local.setdefault(edge.source_uid, set()).add(int(edge.target_uid.lo))
+                after = int(arena.sequence)
+                if before == after and not (after & 1):
+                    for source, games in local.items():
+                        result.setdefault(source, set()).update(games)
+                    break
+            else:
+                raise RuntimeError("actor provenance scan could not obtain stable arena")
+        return result
+
     def _refresh_strategy_cache(self) -> None:
         now = time.monotonic()
         current = tuple(int(arena.sequence) for arena in (*self._nodes, *self._edges))
@@ -286,6 +358,9 @@ class ActorReadView(LiveReadView):
         active_uids: set[MemoryUid] = set()
         outcome_counts: dict[tuple[int, int], dict[int, int]] = {}
         outcome_totals: dict[tuple[int, int], int] = {}
+        compact_arena_cuts: dict[
+            tuple[str, str], tuple[tuple[object, ...], int]
+        ] = {}
         node_versions = []
         for arena in self._nodes:
             (
@@ -297,6 +372,10 @@ class ActorReadView(LiveReadView):
                 local_totals,
             ) = self._scan_node_arena(arena)
             node_versions.append(int(version))
+            compact_arena_cuts[self._record_cut_key(arena)] = (
+                tuple(local_nodes.values()),
+                int(version),
+            )
             node_by_uid.update(local_nodes)
             lineage_uids.update(local_lineage)
             active_uids.update(local_active)
@@ -330,6 +409,10 @@ class ActorReadView(LiveReadView):
                 node_by_uid=node_by_uid,
             )
             edge_versions.append(int(version))
+            compact_arena_cuts[self._record_cut_key(arena)] = (
+                tuple(local_edges),
+                int(version),
+            )
             for uid, values in local_parents.items():
                 parents.setdefault(uid, set()).update(values)
             preferred.update(local_preferred)
@@ -338,6 +421,13 @@ class ActorReadView(LiveReadView):
             compact_edges.extend(local_edges)
             needed_low.update(local_needed)
 
+        relevant_provenance = set(lineage_uids)
+        relevant_provenance.update(needed_low)
+        relevant_provenance.update(node_by_uid)
+        source_games_direct = self._load_provenance_games(
+            self._edges,
+            relevant_provenance,
+        )
         node_by_uid.update(self._load_needed_low(self._nodes, needed_low - set(node_by_uid)))
 
         refined: dict[tuple[int, int], list[float]] = {}
@@ -412,6 +502,9 @@ class ActorReadView(LiveReadView):
         }
         self._outcome_counts = outcome_counts
         self._outcome_totals = outcome_totals
+        self._source_games_direct = source_games_direct
+        self._source_games_cache = {}
+        self._compact_arena_cuts = compact_arena_cuts
         self._v851_compact_nodes = tuple(node_by_uid.values())
         self._v851_compact_edges = tuple(compact_edges)
         self._strategy_version = tuple((*node_versions, *edge_versions))

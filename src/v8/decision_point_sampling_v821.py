@@ -442,13 +442,12 @@ def _decision_actor_worker(
     from v8 import actor as actor_module
     from v8 import trajectory_optimizer_v814 as optimizer
     from v8.model import EventId, ExperienceEvent, PipelineEvent, encode_pipeline, stable_u64
-    from v8.publication import LiveReadView
     from v8.ring import SharedRingBuffer
 
     sampler = _sampler_for(job)
     optimizer._reset_capture(job)
     ring = SharedRingBuffer(**experience_ring_args)
-    view = LiveReadView(
+    view = actor_module.open_actor_read_view(
         read_descriptors,
         refresh_interval_seconds=None,
         record_cuts=record_cuts,

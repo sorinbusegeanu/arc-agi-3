@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import v8
 from v8 import actor as actor_module
@@ -22,6 +24,39 @@ class DecisionPointSamplingV821Tests(unittest.TestCase):
     def test_installed_actor_uses_v822_wrapper_over_v821_discovery_controller(self) -> None:
         self.assertIs(actor_module.actor_worker, repair._actor_worker_v822)
         self.assertIs(repair._BASE_ACTOR_WORKER, sampling._actor_worker_v821)
+
+    def test_decision_worker_constructs_view_through_actor_authority(self) -> None:
+        class ViewOpened(RuntimeError):
+            pass
+
+        descriptors = (object(),)
+        cuts = {}
+        job = SimpleNamespace(game_id="ez01")
+        with (
+            patch.object(sampling, "_sampler_for", return_value=object()),
+            patch("v8.trajectory_optimizer_v814._reset_capture"),
+            patch("v8.ring.SharedRingBuffer", return_value=object()),
+            patch.object(
+                actor_module,
+                "open_actor_read_view",
+                side_effect=ViewOpened("actor view opened"),
+            ) as opened,
+            self.assertRaisesRegex(ViewOpened, "actor view opened"),
+        ):
+            sampling._decision_actor_worker(
+                job=job,
+                experience_ring_args={},
+                read_descriptors=descriptors,
+                watermark=None,
+                stop_event=None,
+                result_queue=None,
+                record_cuts=cuts,
+            )
+        opened.assert_called_once_with(
+            descriptors,
+            refresh_interval_seconds=None,
+            record_cuts=cuts,
+        )
 
     def test_new_decision_point_suppresses_planner_until_probe_is_selected(self) -> None:
         sampler = sampling.DecisionPointSampler("ez01", seed=9)

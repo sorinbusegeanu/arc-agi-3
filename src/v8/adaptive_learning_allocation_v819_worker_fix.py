@@ -50,7 +50,7 @@ def _worker_until_completed_win(
     # ActorReadView publishes only its compact indexes into record_cuts; the generic
     # fallback retains the historical full coherent cut for unpatched runtimes.
     record_cuts: dict[tuple[str, str], tuple[tuple[object, ...], int]] = {}
-    warm_view = actor_module.LiveReadView(
+    warm_view = actor_module.open_actor_read_view(
         read_descriptors,
         refresh_interval_seconds=None,
         record_cuts=record_cuts,
