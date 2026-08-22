@@ -60,6 +60,7 @@ _POST_LAYERS: tuple[str, ...] = (
     "action_learning_report_v849_fixups",
     "action_learning_report_v849_integrity",
     "action_learning_report_v849_authority_fix",
+    "learning_effectiveness_report_v850",
 )
 
 
