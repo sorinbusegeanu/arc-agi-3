@@ -9,6 +9,7 @@ uncertainty, and repeated no-progress evidence prevent memory from monopolizing
 behavior. Explicit VERIFY/ALTERNATIVE/TRANSFER modes retain their existing policy.
 """
 
+import os
 from dataclasses import dataclass
 
 from v8.model import stable_u64
@@ -183,7 +184,7 @@ def _plan_chain_v855(self, context_signature, action_ids, **kwargs):
     from v8 import sampling_progress_control_v829 as v829
 
     mode = str(
-        __import__("os").environ.get(
+        os.environ.get(
             v819._SAMPLING_MODE_ENV,
             v819.SamplingMode.DISCOVERY.value,
         )
