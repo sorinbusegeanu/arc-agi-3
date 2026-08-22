@@ -14,6 +14,7 @@ from v8 import actor as actor_module
 from v8 import adaptive_learning_allocation_v819_performance_fix as adaptive
 from v8 import memory_efficiency_v851 as memory
 from v8 import performance_memory_v854 as v854
+from v8 import performance_memory_v854_fixups as v854_fixups
 from v8 import runtime_scaling_v841 as scaling
 from v8 import runtime_stack_v88
 from v8 import trajectory_optimizer_v814 as optimizer
@@ -23,8 +24,12 @@ from v8.model import CognitiveState, MemoryLevel, MemoryUid, ValidationState
 
 class PerformanceMemoryV854Tests(unittest.TestCase):
     def test_v854_is_final_runtime_layer(self):
-        self.assertEqual(runtime_stack_v88._FINAL_LAYERS[-1], "performance_memory_v854")
+        self.assertEqual(
+            runtime_stack_v88._FINAL_LAYERS,
+            ("performance_memory_v854", "performance_memory_v854_fixups"),
+        )
         self.assertTrue(v854._INSTALLED)
+        self.assertTrue(v854_fixups._INSTALLED)
 
     def test_idle_lifecycle_does_not_call_full_iteration(self):
         supervisor = SimpleNamespace(
@@ -46,8 +51,7 @@ class PerformanceMemoryV854Tests(unittest.TestCase):
         prior_source = optimizer._CAPTURE_SOURCE_ID
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            path = root / "validated.json"
-            path.write_text("{}", encoding="utf-8")
+            (root / "validated.json").write_text("{}", encoding="utf-8")
             os.environ[optimizer._TRAJECTORY_ROOT_ENV] = str(root)
             optimizer._CAPTURE_SOURCE_ID = "g1"
             rows = (
@@ -55,13 +59,17 @@ class PerformanceMemoryV854Tests(unittest.TestCase):
                 SimpleNamespace(anchor=SimpleNamespace(source_id="g2")),
             )
             view = SimpleNamespace(_v814_next_refresh=0.0, _v814_variants=())
+
+            def composed_loader(target):
+                target._v814_variants = rows
+
             try:
-                with patch.object(optimizer, "_load_validated_rows", return_value=rows) as load:
-                    v854._refresh_view_variants_v854(view)
+                with patch.object(v854, "_BASE_REFRESH_VARIANTS", side_effect=composed_loader) as load:
+                    v854_fixups._refresh_view_variants_v854_fixup(view)
                     self.assertEqual([row.anchor.source_id for row in view._v814_variants], ["g1"])
                     view._v814_next_refresh = 0.0
-                    v854._refresh_view_variants_v854(view)
-                    load.assert_called_once_with(path)
+                    v854_fixups._refresh_view_variants_v854_fixup(view)
+                    load.assert_called_once_with(view)
             finally:
                 optimizer._CAPTURE_SOURCE_ID = prior_source
                 if prior_root is None:
@@ -210,15 +218,15 @@ class PerformanceMemoryV854Tests(unittest.TestCase):
             invalidate_strategy_cache=lambda: calls.append(True),
         )
         self.assertEqual(
-            v854._actor_graph_check_v854(
-                view, completed_steps=1000, next_check_step=1000, check_interval_steps=1000
+            v854_fixups._actor_graph_check_v854_fixup(
+                view, completed_steps=1000, next_check_step=1000
             ),
             2000,
         )
         self.assertEqual(calls, [])
         second.sequence = 6
-        v854._actor_graph_check_v854(
-            view, completed_steps=2000, next_check_step=2000, check_interval_steps=1000
+        v854_fixups._actor_graph_check_v854_fixup(
+            view, completed_steps=2000, next_check_step=2000
         )
         self.assertEqual(calls, [True])
 
@@ -227,8 +235,8 @@ class PerformanceMemoryV854Tests(unittest.TestCase):
         self.assertGreaterEqual(report._FLUSH_STEPS, v854._ACTION_TELEMETRY_FLUSH_STEPS)
         self.assertGreaterEqual(v854._ACTOR_MEMORY_SAMPLE_SECONDS, 15.0)
         self.assertIs(adaptive._worker_until_win, v854._adaptive_worker_v854)
-        self.assertIs(actor_module._refresh_actor_graph_if_due, v854._actor_graph_check_v854)
-        self.assertIs(optimizer._refresh_view_variants, v854._refresh_view_variants_v854)
+        self.assertIs(actor_module._refresh_actor_graph_if_due, v854_fixups._actor_graph_check_v854_fixup)
+        self.assertIs(optimizer._refresh_view_variants, v854_fixups._refresh_view_variants_v854_fixup)
         self.assertIs(memory.memory_efficiency_snapshot_v851, v854._memory_efficiency_snapshot_v854)
 
 
