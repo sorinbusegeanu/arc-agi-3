@@ -80,7 +80,7 @@ class LearningEffectivenessReportTests(unittest.TestCase):
         self.assertIs(v843._BASE_WRITE_ALLOCATION_LOG, report._write_allocation_log_v850)
         self.assertIs(report._BASE_WRITE_ALLOCATION_LOG, action_report._write_allocation_log_v849)
 
-    def test_snapshot_reports_learning_application_progress_and_transfer(self):
+    def test_snapshot_contains_summary_effectiveness_metrics_only(self):
         coordinator = self._coordinator()
         action_report._RUN["transfer-game"] = action_report._empty_aggregate()
         action_report._RUN["transfer-game"]["movement_actions_executed"] = 100
@@ -115,31 +115,41 @@ class LearningEffectivenessReportTests(unittest.TestCase):
         payload = report.learning_effectiveness_snapshot_v850(
             self._runtime(), coordinator, completed, {}, {}
         )
-        summary = payload["summary"]
-        self.assertEqual(summary["sample_steps"], 150)
-        self.assertEqual(summary["planned_steps"], 80)
-        self.assertAlmostEqual(summary["planned_step_share"], 80.0 / 150.0)
-        self.assertEqual(summary["games_with_m7_plan_applied"], 2)
-        self.assertEqual(summary["games_with_m7_plan_and_current_run_progress"], 1)
-        self.assertEqual(summary["games_with_transfer_frontier"], 1)
-        self.assertEqual(summary["games_with_transfer_frontier_and_current_run_progress"], 1)
-        self.assertEqual(summary["optimizer_saved_actions"], 13)
-        self.assertAlmostEqual(summary["optimizer_success_rate"], 0.7)
-        self.assertAlmostEqual(summary["productive_action_rate"], 80.0 / 150.0)
-        self.assertFalse(summary["causal_ablation_executed"])
+        self.assertNotIn("games", payload)
+        self.assertNotIn("summary", payload)
+        metrics = payload["effectiveness"]
 
-        transfer = next(row for row in payload["games"] if row["game_id"] == "transfer-game")
-        self.assertEqual(transfer["known_levels_solved"], 5)
-        self.assertEqual(transfer["effectiveness_status"], "M7_APPLIED_WITH_CURRENT_RUN_PROGRESS")
-        self.assertEqual(transfer["frontier_source"], "TRANSFER")
-        self.assertTrue(transfer["transfer_frontier_with_current_run_progress"])
-        self.assertAlmostEqual(transfer["planned_step_share"], 0.6)
-        self.assertEqual(transfer["first_win_step"], 80)
+        outcome = metrics["outcome_effectiveness"]
+        self.assertAlmostEqual(outcome["level_solve_rate_pct"], 50.0)
+        self.assertAlmostEqual(outcome["game_solve_rate_pct"], 50.0)
+        self.assertEqual(outcome["current_run_level_advances"], 3)
+        self.assertEqual(outcome["current_run_games_won"], 1)
 
-        stuck = next(row for row in payload["games"] if row["game_id"] == "stuck-game")
-        self.assertEqual(stuck["effectiveness_status"], "M7_APPLIED_NO_CURRENT_RUN_PROGRESS")
+        learning = metrics["learning_application_effectiveness"]
+        self.assertAlmostEqual(learning["m7_action_share_pct"], 100.0 * 80.0 / 150.0)
+        self.assertAlmostEqual(learning["m7_strategy_effectiveness_pct"], 50.0)
+        self.assertEqual(learning["games_with_m7_applied"], 2)
 
-    def test_log_is_jsonl_and_keeps_hypothesis_semantics_separate(self):
+        transfer = metrics["transfer_effectiveness"]
+        self.assertAlmostEqual(transfer["transfer_effectiveness_pct"], 100.0)
+        self.assertEqual(transfer["transfer_attempts"], 3)
+        self.assertEqual(transfer["games_with_transfer_frontier"], 1)
+
+        optimizer = metrics["optimizer_effectiveness"]
+        self.assertAlmostEqual(optimizer["optimizer_success_rate_pct"], 70.0)
+        self.assertEqual(optimizer["optimizer_saved_actions"], 13)
+
+        action = metrics["action_effectiveness"]
+        self.assertAlmostEqual(action["productive_action_rate_pct"], 100.0 * 80.0 / 150.0)
+
+        efficiency = metrics["efficiency"]
+        self.assertAlmostEqual(efficiency["steps_per_level_advance"], 50.0)
+        self.assertAlmostEqual(efficiency["mean_first_win_step"], 80.0)
+
+        causal = metrics["causal_effectiveness"]
+        self.assertEqual(causal["status"], "NOT_MEASURED_NO_ABLATION")
+
+    def test_log_is_jsonl_summary_only_and_keeps_hypothesis_semantics_separate(self):
         coordinator = self._coordinator()
         completed = {
             "transfer-game": {
@@ -159,8 +169,10 @@ class LearningEffectivenessReportTests(unittest.TestCase):
             )
             path = Path(tmp) / "learning_effectiveness.log"
             payload = json.loads(path.read_text(encoding="utf-8").strip())
-        self.assertEqual(payload["schema_version"], 1)
-        self.assertEqual(payload["summary"]["causal_attribution"], "OBSERVATIONAL_NOT_ABLATED")
+        self.assertEqual(payload["schema_version"], 2)
+        self.assertIn("effectiveness", payload)
+        self.assertNotIn("games", payload)
+        self.assertNotIn("summary", payload)
         self.assertNotIn("hypotheses", payload)
 
 
