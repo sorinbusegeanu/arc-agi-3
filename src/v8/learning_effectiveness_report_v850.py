@@ -2,10 +2,11 @@ from __future__ import annotations
 
 """v8.50 dedicated learning-effectiveness summary reporting.
 
-The report is observational.  Every live stdout metric and JSONL metric now comes
-from the same current-run snapshot.  Strategy and transfer success rates use
-validated frontier attempts/successes; they are not causal-lift claims.  Causal
-attribution remains explicitly unavailable until a matched ablation is measured.
+The report is observational. Live stdout and JSONL are generated from the same
+authoritative snapshot. Outcome/action metrics describe the current run, while M7
+and transfer validation reliability may include retained evidence attached to the
+current selectable frontier. None of these rates claims causal lift; causal
+attribution remains unavailable until a matched ablation is measured.
 """
 
 import json
@@ -142,7 +143,7 @@ def _frontier_validation_totals(
     """Return attempts/successes of current selectable frontier winners.
 
     This measures empirical validation reliability, not causal improvement over a
-    memory-off policy.  Restricting to one winner per scope avoids counting stale
+    memory-off policy. Restricting to one winner per scope avoids counting stale
     dominated alternatives as current intelligence.
     """
     selected = {str(game_id) for game_id in game_ids}
@@ -310,7 +311,8 @@ def learning_effectiveness_snapshot_v850(
         "generation": int(getattr(runtime, "generation", 0)),
         "watermark": int(getattr(runtime, "watermark", 0)),
         "scope": {
-            "kind": "CURRENT_RUN",
+            "outcomes_and_actions": "CURRENT_RUN",
+            "strategy_validation": "CURRENT_FRONTIER_RETAINED_EVIDENCE",
             "games": len(games),
             "steps": total_steps,
             "planned_steps": planned_steps,
@@ -390,17 +392,40 @@ def _emit_effectiveness_stdout(
 
 
 def _reporter_emit_line_v850(message: str, output_queue) -> None:
-    # Suppress only the terminal's legacy periodic competence line.  Explicit
-    # output queues remain part of the reporter contract and are used by callers
-    # that consume progress programmatically.
-    if output_queue is None and "current_run_wins=" in str(message):
+    # The parent allocator owns the authoritative terminal effectiveness line.
+    # Explicit output queues still receive the lightweight reporter presentation.
+    text = str(message)
+    if output_queue is None and (
+        "current_run_wins=" in text or " - effectiveness " in text
+    ):
         return
     _BASE_REPORTER_EMIT_LINE(message, output_queue)
 
 
 def _periodic_progress_line_v850(rows, total_steps, baseline=None) -> str:
-    """Keep the reporter's legacy row intact; terminal emission suppresses it."""
-    return _BASE_PERIODIC_PROGRESS_LINE(tuple(rows), total_steps, baseline)
+    """Compatibility presentation for explicit reporter consumers only.
+
+    Only fields derivable from ActorProgress are shown. Validation, optimizer,
+    productivity and first-win metrics remain unknown rather than being fabricated.
+    The terminal path suppresses this row and uses the authoritative snapshot.
+    """
+    from v8 import reporter
+
+    values = tuple(rows)
+    base = _BASE_PERIODIC_PROGRESS_LINE(values, total_steps, baseline)
+    match = reporter._PROGRESS_PATTERN.search(base)
+    if match is None:
+        return base
+    used_steps = sum(max(0, int(getattr(row, "steps", 0))) for row in values)
+    planned_steps = sum(max(0, int(getattr(row, "planned_steps", 0))) for row in values)
+    m7_share = _pct(planned_steps, used_steps)
+    return (
+        f"{base[:match.start()]}effectiveness "
+        f"L={float(match.group('levels')):.1f}% "
+        f"G={float(match.group('wins')):.1f}% "
+        f"M7={m7_share:.1f}% "
+        "M7val=- XferVal=- Opt=- Prod=- step/L=- firstWin=-"
+    )
 
 
 def _write_learning_effectiveness_log(
