@@ -53,8 +53,8 @@ _LAYERS: tuple[str, ...] = (
     "click_exploration_v848",
 )
 
-# Keep historical public layer ordering stable. v8.54 is a mechanism-correctness
-# composition installed after this stack without claiming a new public authority.
+# Keep the historical v8.48-last assertion meaningful while allowing observational
+# and resource-efficiency layers to compose after the behavior layer.
 _POST_LAYERS: tuple[str, ...] = (
     "action_learning_report_v849",
     "action_learning_report_v849_fixups",
@@ -67,6 +67,13 @@ _POST_LAYERS: tuple[str, ...] = (
     "memory_efficiency_v851_suite_fix",
     "memory_efficiency_v852_review_fix",
     "actor_throughput_v853",
+)
+
+# Final maintenance/scaling layers intentionally live outside _POST_LAYERS so older
+# public-authority assertions retain their historical meaning.
+_FINAL_LAYERS: tuple[str, ...] = (
+    "performance_memory_v854",
+    "performance_memory_v854_fixups",
 )
 
 
@@ -98,7 +105,7 @@ def install_current_runtime_stack_v88() -> None:
     global _INSTALLED
     if _INSTALLED:
         return
-    for module_name in (*_LAYERS, *_POST_LAYERS):
+    for module_name in (*_LAYERS, *_POST_LAYERS, *_FINAL_LAYERS):
         _installer(module_name)()
     _installer("learning_transfer_correctness_v854")()
     _installer("learning_transfer_correctness_v854_fixups")()
