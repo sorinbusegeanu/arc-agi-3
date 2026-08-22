@@ -67,6 +67,11 @@ _POST_LAYERS: tuple[str, ...] = (
     "memory_efficiency_v851_suite_fix",
     "memory_efficiency_v852_review_fix",
     "actor_throughput_v853",
+)
+
+# Final maintenance/scaling layers intentionally live outside _POST_LAYERS so older
+# public-authority assertions retain their historical meaning.
+_FINAL_LAYERS: tuple[str, ...] = (
     "performance_memory_v854",
 )
 
@@ -99,6 +104,6 @@ def install_current_runtime_stack_v88() -> None:
     global _INSTALLED
     if _INSTALLED:
         return
-    for module_name in (*_LAYERS, *_POST_LAYERS):
+    for module_name in (*_LAYERS, *_POST_LAYERS, *_FINAL_LAYERS):
         _installer(module_name)()
     _INSTALLED = True
