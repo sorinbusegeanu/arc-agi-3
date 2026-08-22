@@ -30,7 +30,7 @@ from v8.model import (
 )
 from v8.similarity import BoundedNeighborhoodSimilarity, NeighborhoodDescriptor
 from v8.structural_events import NormalizedPrimitive, StructuralFact
-from v8.transfer import HeldOutTransferValidator
+from v8.transfer import TransferValidator
 
 
 def _node(level, memory_type, key, *, uid=None, support=5, future=1.0, transfer=0.0, watermark=1, game_mask=0):
@@ -91,7 +91,7 @@ class TransferRelationTests(unittest.TestCase):
         submitted = []
         evidence = []
         fake = SimpleNamespace(
-            transfer=HeldOutTransferValidator(),
+            transfer=TransferValidator(),
             read_view=SimpleNamespace(node_records=lambda: (row,)),
             _submit=submitted.append,
             _event_id=lambda: EventId(1, len(submitted) + 1),
@@ -260,6 +260,8 @@ class SimilaritySelectionTests(unittest.TestCase):
         )
         sim = BoundedNeighborhoodSimilarity(max_candidates=1, top_results=1, threshold=0.0)
         sim.descriptors = lambda _nodes, _edges: {source_uid: source_d, same_uid: same_d, cross_uid: cross_d}
+        sim._processed_versions[same_uid] = 1
+        sim._processed_versions[cross_uid] = 1
         rows = _similarity_v854(sim, (source, same, cross), edges)
         self.assertTrue(any(cross_uid in {row.source_uid, row.target_uid} for row in rows))
 
@@ -271,6 +273,8 @@ class SimilaritySelectionTests(unittest.TestCase):
         good_d = self._descriptor(good_uid, exact=True)
         sim = BoundedNeighborhoodSimilarity(max_candidates=1, top_results=1, threshold=0.0)
         sim.descriptors = lambda _nodes, _edges: {source_uid: source_d, bad_uid: bad_d, good_uid: good_d}
+        sim._processed_versions[bad_uid] = 1
+        sim._processed_versions[good_uid] = 1
         rows = _similarity_v854(sim, nodes, ())
         self.assertTrue(any(good_uid in {row.source_uid, row.target_uid} for row in rows))
         self.assertFalse(any(bad_uid in {row.source_uid, row.target_uid} for row in rows))
