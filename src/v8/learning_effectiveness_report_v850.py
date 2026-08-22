@@ -18,6 +18,7 @@ from pathlib import Path
 _INSTALLED = False
 _BASE_WRITE_ALLOCATION_LOG = None
 _BASE_REPORTER_EMIT_LINE = None
+_BASE_RUN_ACTOR_JOBS = None
 _REPORT_FILE = "learning_effectiveness.log"
 _SCHEMA_VERSION = 2
 _CAUSAL_STATUS = "NOT_MEASURED_NO_ABLATION"
@@ -104,6 +105,29 @@ def _telemetry_by_game(runtime, coordinator) -> dict[str, dict[str, object]]:
 
 def _pct(numerator: int | float, denominator: int | float) -> float:
     return 0.0 if float(denominator) <= 0.0 else 100.0 * float(numerator) / float(denominator)
+
+
+def _run_actor_jobs_v850(
+    runtime,
+    jobs,
+    *,
+    timeout: float | None = None,
+    progress_interval_seconds: float = 60.0,
+    progress_callback=None,
+    reporting_queue=None,
+):
+    jobs = tuple(jobs)
+    runtime._v850_total_step_budget = sum(
+        max(0, int(getattr(job, "steps", 0))) for job in jobs
+    )
+    return _BASE_RUN_ACTOR_JOBS(
+        runtime,
+        jobs,
+        timeout=timeout,
+        progress_interval_seconds=progress_interval_seconds,
+        progress_callback=progress_callback,
+        reporting_queue=reporting_queue,
+    )
 
 
 def learning_effectiveness_snapshot_v850(
@@ -219,7 +243,11 @@ def _compact_number(value) -> str:
     return f"{number:.1f}"
 
 
-def format_learning_effectiveness_stdout_v850(payload: dict[str, object]) -> str:
+def format_learning_effectiveness_stdout_v850(
+    payload: dict[str, object],
+    *,
+    budget_consumed_pct: float | None = None,
+) -> str:
     effectiveness = payload.get("effectiveness", {})
     if not isinstance(effectiveness, dict):
         effectiveness = {}
@@ -241,8 +269,13 @@ def format_learning_effectiveness_stdout_v850(payload: dict[str, object]) -> str
         action = {}
     if not isinstance(efficiency, dict):
         efficiency = {}
+    budget_prefix = (
+        ""
+        if budget_consumed_pct is None
+        else f"{max(0.0, min(100.0, float(budget_consumed_pct))):.0f}% - "
+    )
     return (
-        "effectiveness "
+        f"{budget_prefix}effectiveness "
         f"L={float(outcome.get('level_solve_rate_pct', 0.0)):.1f}% "
         f"G={float(outcome.get('game_solve_rate_pct', 0.0)):.1f}% "
         f"M7={float(learning.get('m7_action_share_pct', 0.0)):.1f}% "
@@ -255,9 +288,14 @@ def format_learning_effectiveness_stdout_v850(payload: dict[str, object]) -> str
     )
 
 
-def _emit_effectiveness_stdout(payload: dict[str, object]) -> None:
+def _emit_effectiveness_stdout(
+    payload: dict[str, object],
+    *,
+    budget_consumed_pct: float | None = None,
+) -> None:
     print(
-        f'[{time.strftime("%H:%M")}] {format_learning_effectiveness_stdout_v850(payload)}',
+        f'[{time.strftime("%H:%M")}] '
+        f"{format_learning_effectiveness_stdout_v850(payload, budget_consumed_pct=budget_consumed_pct)}",
         flush=True,
     )
 
@@ -292,7 +330,14 @@ def _write_learning_effectiveness_log(
             stream.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
     except OSError:
         pass
-    _emit_effectiveness_stdout(payload)
+
+    outcomes = _live_outcomes(completed_by_game, active_progress, active_leases)
+    used_steps = sum(max(0, int(row.get("steps", 0))) for row in outcomes.values())
+    total_budget = max(0, int(getattr(runtime, "_v850_total_step_budget", 0)))
+    budget_consumed_pct = (
+        _pct(min(used_steps, total_budget), total_budget) if total_budget > 0 else None
+    )
+    _emit_effectiveness_stdout(payload, budget_consumed_pct=budget_consumed_pct)
 
 
 def _write_allocation_log_v850(
@@ -320,9 +365,11 @@ def _write_allocation_log_v850(
 
 def install_learning_effectiveness_report_v850() -> None:
     global _INSTALLED, _BASE_WRITE_ALLOCATION_LOG, _BASE_REPORTER_EMIT_LINE
+    global _BASE_RUN_ACTOR_JOBS
     if _INSTALLED:
         return
 
+    from v8 import actor as actor_module
     from v8 import lease_dispatch_lifecycle_v843 as v843
     from v8 import reporter
 
@@ -335,4 +382,9 @@ def install_learning_effectiveness_report_v850() -> None:
     # old current_run_* periodic line.
     _BASE_REPORTER_EMIT_LINE = reporter._emit_line
     reporter._emit_line = _reporter_emit_line_v850
+
+    # Capture the original requested interaction budget once at the final actor-job
+    # authority so the compact effectiveness line can retain the old progress prefix.
+    _BASE_RUN_ACTOR_JOBS = actor_module.run_actor_jobs
+    actor_module.run_actor_jobs = _run_actor_jobs_v850
     _INSTALLED = True
