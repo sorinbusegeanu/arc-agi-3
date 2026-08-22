@@ -87,6 +87,61 @@ class CompleteClickCoverageTests(unittest.TestCase):
                 if callable(close):
                     close()
 
+    def test_click_scan_keeps_long_observable_sweep_in_one_episode(self):
+        from v7.environment.arc_adapter import ArcGridEnvironment
+        from v7.environment.encoding import (
+            changed_cell_count,
+            structural_grid_signature,
+        )
+
+        for game_id, seed, expected_clicks in (("gp01", 0, 4), ("gp02", 1, 60)):
+            env = ArcGridEnvironment(game_id=game_id, seed=seed)
+            sampler = PortfolioSampler(game_id, seed=seed)
+            sampler.begin_lease(seed)
+            history = []
+            try:
+                for step in range(1, expected_clicks + 2):
+                    self.assertFalse(sampler.prepare_step(env))
+                    before = env.observe().copy()
+                    before_level = int(env.last_levels_completed)
+                    before_context = int(structural_grid_signature(before))
+                    actions = tuple(int(value) for value in env.available_actions())
+                    action = sampler.forced_action(
+                        level=before_level,
+                        context=before_context,
+                        actions=actions,
+                        history=tuple(history),
+                    )
+                    self.assertIsNotNone(action)
+                    after = env.step(int(action))
+                    after_level = int(env.last_levels_completed)
+                    after_context = int(structural_grid_signature(after))
+                    history.append(int(action))
+                    sampler.observe_transition(
+                        before_level=before_level,
+                        before_context=before_context,
+                        action=int(action),
+                        after_level=after_level,
+                        after_context=after_context,
+                        after_actions=tuple(int(value) for value in env.available_actions()),
+                        history_after=tuple(history),
+                        changed_cells=int(changed_cell_count(before, after)),
+                        terminal_state=str(env.last_outcome_state),
+                        terminal_polarity=0,
+                        level_advanced=after_level > before_level,
+                        prediction_error=0.0,
+                        future_delta=0.0,
+                    )
+                    if after_level > before_level:
+                        break
+                self.assertEqual(step, expected_clicks)
+                self.assertEqual(env.last_levels_completed, 1)
+                self.assertEqual(env.reset_count, 0)
+            finally:
+                close = getattr(getattr(env, "env", None), "close", None)
+                if callable(close):
+                    close()
+
 
 class TargetSpecificSelectionTests(unittest.TestCase):
     def test_distinct_click_targets_survive_score_grouping(self):

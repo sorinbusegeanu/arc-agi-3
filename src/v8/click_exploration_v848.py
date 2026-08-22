@@ -36,6 +36,10 @@ _BASE_BEST_EXPANSION = None
 _BASE_SELECT_EXPANDABLE_ACTION = None
 _BASE_REGISTER_GAMES = None
 _BASE_SAMPLING_WEIGHT = None
+_BASE_SAMPLER_BEGIN_LEASE = None
+_BASE_SAMPLER_PREPARE_STEP = None
+_BASE_SAMPLER_FORCED_ACTION = None
+_BASE_SAMPLER_OBSERVE_TRANSITION = None
 
 
 def _targeting():
@@ -285,6 +289,118 @@ def _cognitive_action_executable_v848(self, action: int) -> bool:
     )
 
 
+def _reset_sampler_scan_v848(sampler, *, reset_count=None, level=None) -> None:
+    sampler._v848_scan_reset_count = reset_count
+    sampler._v848_scan_level = level
+    sampler._v848_scan_tried = set()
+    sampler._v848_scan_available = ()
+
+
+def _sampler_begin_lease_v848(self, seed: int) -> None:
+    _BASE_SAMPLER_BEGIN_LEASE(self, int(seed))
+    _reset_sampler_scan_v848(self)
+
+
+def _sampler_explicit_control_v848(sampler) -> bool:
+    return bool(
+        sampler.base.replay_actions
+        or sampler.base.replay_target is not None
+        or sampler.base.verification is not None
+        or sampler.active_sequence
+        or getattr(sampler, "_v832_persist_action", None) is not None
+        or bool(getattr(sampler, "_v833_random_rollout", False))
+        or bool(getattr(sampler, "_v833_transfer_rollout", False))
+    )
+
+
+def _sampler_prepare_step_v848(self, env) -> bool:
+    """Keep an observable click sweep in one episode instead of resetting per cell."""
+    reset_count = int(getattr(env, "reset_count", 0))
+    level = int(getattr(env, "last_levels_completed", 0))
+    if (
+        getattr(self, "_v848_scan_reset_count", None) != reset_count
+        or getattr(self, "_v848_scan_level", None) != level
+    ):
+        _reset_sampler_scan_v848(self, reset_count=reset_count, level=level)
+
+    if not _sampler_explicit_control_v848(self):
+        tokens = _canonical_click_tokens(env, env._last_grid)
+        tried = getattr(self, "_v848_scan_tried", set())
+        remaining = tuple(int(token) for token in tokens if int(token) not in tried)
+        if remaining:
+            # These resets are ordinary frontier repositioning scheduled after the
+            # preceding probe. A click sweep is already at the correct state and
+            # must remain continuous when a solution needs more than one click.
+            self.pending_sequence = None
+            self.base.pending_reset = None
+            self._v848_scan_available = remaining
+            return False
+
+    self._v848_scan_available = ()
+    return bool(_BASE_SAMPLER_PREPARE_STEP(self, env))
+
+
+def _sampler_forced_action_v848(
+    self,
+    *,
+    level: int,
+    context: int,
+    actions: tuple[int, ...],
+    history: tuple[int, ...],
+) -> int | None:
+    from v8 import decision_point_sampling_v821 as sampling
+    from v8 import sampling_portfolio_v831 as portfolio
+
+    forced = _BASE_SAMPLER_FORCED_ACTION(
+        self,
+        level=int(level),
+        context=int(context),
+        actions=tuple(actions),
+        history=tuple(history),
+    )
+    if forced is not None:
+        return int(forced)
+
+    available = {int(value) for value in actions}
+    candidates = tuple(
+        int(value)
+        for value in getattr(self, "_v848_scan_available", ())
+        if int(value) in available
+    )
+    if not candidates:
+        return None
+    action = min(candidates)
+    self._v848_scan_tried.add(action)
+    self.base.current = sampling.Intervention(
+        "CLICK_SCAN",
+        (int(level), int(context)),
+        action,
+        tuple(history),
+    )
+    portfolio._set_mode("NOVELTY")
+    portfolio._set_source(context, "CLICK_SCAN", (action,))
+    return action
+
+
+def _sampler_observe_transition_v848(self, **kwargs) -> None:
+    intervention = self.base.current
+    click_scan = bool(
+        intervention is not None and str(intervention.kind) == "CLICK_SCAN"
+    )
+    success = bool(
+        int(kwargs.get("after_level", 0)) > int(kwargs.get("before_level", 0))
+        or str(kwargs.get("terminal_state", "")) == "WIN"
+    )
+    result = _BASE_SAMPLER_OBSERVE_TRANSITION(self, **kwargs)
+    if click_scan and not success:
+        # The generic decision sampler schedules a reset after many single probes.
+        # That is useful for branching sequences but would make a long click sweep
+        # impossible. Retain its evidence while discarding only that reset request.
+        self.base.pending_reset = None
+        self.pending_sequence = None
+    return result
+
+
 def _env_reset_v848(self, *args, **kwargs):
     _ensure_env_click_state(self)
     # Coverage state deliberately survives explicit/replay resets within the same
@@ -492,6 +608,8 @@ def install_click_exploration_v848() -> None:
     global _BASE_ENV_INIT, _BASE_ENV_AVAILABLE, _BASE_ENV_STEP, _BASE_ENV_RESET
     global _BASE_RECORD_EXPANSION, _BASE_BEST_EXPANSION, _BASE_SELECT_EXPANDABLE_ACTION
     global _BASE_REGISTER_GAMES, _BASE_SAMPLING_WEIGHT
+    global _BASE_SAMPLER_BEGIN_LEASE, _BASE_SAMPLER_PREPARE_STEP
+    global _BASE_SAMPLER_FORCED_ACTION, _BASE_SAMPLER_OBSERVE_TRANSITION
     if _INSTALLED:
         return
 
@@ -499,6 +617,7 @@ def install_click_exploration_v848() -> None:
     from v8 import action_targeting_v810 as targeting
     from v8 import adaptive_learning_allocation_v819 as allocation
     from v8 import sampling_evidence_frontier_v847 as frontier
+    from v8 import sampling_portfolio_v831 as portfolio
 
     _BASE_ENV_INIT = adapter.ArcGridEnvironment.__init__
     _BASE_ENV_AVAILABLE = adapter.ArcGridEnvironment.available_actions
@@ -522,6 +641,16 @@ def install_click_exploration_v848() -> None:
     frontier._record_expansion_v847 = _record_expansion_v848
     frontier._best_expansion_v847 = _best_expansion_v848
     frontier._select_expandable_action_v847 = _select_expandable_action_v848
+
+    sampler_cls = portfolio.PortfolioSampler
+    _BASE_SAMPLER_BEGIN_LEASE = sampler_cls.begin_lease
+    _BASE_SAMPLER_PREPARE_STEP = sampler_cls.prepare_step
+    _BASE_SAMPLER_FORCED_ACTION = sampler_cls.forced_action
+    _BASE_SAMPLER_OBSERVE_TRANSITION = sampler_cls.observe_transition
+    sampler_cls.begin_lease = _sampler_begin_lease_v848
+    sampler_cls.prepare_step = _sampler_prepare_step_v848
+    sampler_cls.forced_action = _sampler_forced_action_v848
+    sampler_cls.observe_transition = _sampler_observe_transition_v848
 
     _BASE_REGISTER_GAMES = allocation.AdaptiveLearningCoordinator.register_games
     _BASE_SAMPLING_WEIGHT = allocation.AdaptiveLearningCoordinator.sampling_weight
