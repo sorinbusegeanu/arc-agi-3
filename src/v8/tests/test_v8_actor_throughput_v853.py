@@ -25,11 +25,9 @@ class ActorThroughputV853Tests(unittest.TestCase):
             memory_capacity=int(memory_capacity),
         )
 
-    def test_v853_remains_immediate_throughput_layer(self):
-        self.assertEqual(
-            runtime_stack_v88._POST_LAYERS[-2:],
-            ("actor_throughput_v853", "performance_memory_v854"),
-        )
+    def test_v853_remains_final_post_layer(self):
+        self.assertEqual(runtime_stack_v88._POST_LAYERS[-1], "actor_throughput_v853")
+        self.assertEqual(runtime_stack_v88._FINAL_LAYERS[-1], "performance_memory_v854")
         self.assertTrue(v853._INSTALLED)
 
     def test_dense_arena_alone_never_throttles_actor(self):
