@@ -285,7 +285,12 @@ def _retry_deferred_batch(runtime, *, limit: int) -> tuple[int, int]:
     processed = resolved = 0
     try:
         for candidate, result in batch:
-            target_uid = v818._resolve_target_outcome(runtime, candidate, result)
+            target_uid = v818._resolve_target_outcome(
+                runtime,
+                candidate,
+                result,
+                refresh_view=False,
+            )
             if target_uid.is_zero:
                 unresolved.append((candidate, result))
             else:
@@ -350,8 +355,13 @@ def _run_actor_jobs_v839(runtime, jobs, **kwargs):
         deferred.close()
         runtime._v839_deferred_retry = None
 
-    # Reporting/final save still sees all resolvable deferred validation evidence.
-    _BASE_RETRY_DEFERRED(runtime)
+    # Retry the current durable set once against the already-built behavior
+    # index.  A final drain must not rebuild a million-edge graph merely to
+    # discover that an outcome is still unresolved; those rows remain durable
+    # for the next coherent refresh/run.
+    pending = getattr(runtime, "_v819_deferred_sources", None)
+    if isinstance(pending, list) and pending:
+        _retry_deferred_batch(runtime, limit=len(pending))
     return result
 
 

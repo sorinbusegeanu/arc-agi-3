@@ -277,6 +277,8 @@ class PerformanceMemoryV854Tests(unittest.TestCase):
         ):
             v854._retry_deferred_v854(runtime)
         self.assertEqual(resolve.call_count, v854._DEFERRED_RETRY_BATCH)
+        for call in resolve.call_args_list:
+            self.assertFalse(call.kwargs["refresh_view"])
         publish.assert_not_called()
         self.assertEqual(len(runtime._v818_deferred_trajectory_bindings), 40)
 

@@ -198,6 +198,8 @@ class LeaseDispatchContinuityV839Tests(unittest.TestCase):
         self.assertEqual(examined, 4)
         self.assertEqual(resolved, 0)
         self.assertEqual(resolve.call_count, 4)
+        for call in resolve.call_args_list:
+            self.assertFalse(call.kwargs["refresh_view"])
         publish.assert_not_called()
         self.assertEqual(len(runtime._v819_deferred_sources), 6)
 

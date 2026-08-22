@@ -107,6 +107,54 @@ class SeedlessIdentityTests(unittest.TestCase):
         )
 
 
+class DeferredOutcomeResolutionTests(unittest.TestCase):
+    def test_stale_index_retry_never_refreshes_live_graph(self) -> None:
+        outcome = MemoryUid.from_key(
+            MemoryLevel.M6,
+            MemoryType.OUTCOME,
+            (91, 92, 93),
+        )
+
+        class ReadView:
+            _node_by_uid = {}
+            _behavior_observed_outcomes = {(123, 6, 999): {outcome}}
+
+            @staticmethod
+            def node_records(**_kwargs):
+                raise AssertionError("deferred retry refreshed node graph")
+
+            @staticmethod
+            def _refresh_strategy_cache():
+                raise AssertionError("deferred retry refreshed behavior graph")
+
+        candidate = optimizer.TrajectoryCandidate(
+            "deferred",
+            source((6,), game="g"),
+            "VALIDATE_SOURCE",
+            (6,),
+            0,
+            0,
+        )
+        result = SimpleNamespace(
+            success=True,
+            terminal_context=456,
+            terminal_action=6,
+            outcome_signature=999,
+        )
+        runtime = SimpleNamespace(read_view=ReadView())
+        from v8 import normalized_memory_v086_fixups as grounding
+
+        with patch.object(grounding, "_grounded_context", return_value=123):
+            resolved = v818._resolve_target_outcome(
+                runtime,
+                candidate,
+                result,
+                refresh_view=False,
+            )
+
+        self.assertEqual(resolved, outcome)
+
+
 class MigrationTests(unittest.TestCase):
     def test_v1_state_migrates_without_seed_identity(self) -> None:
         with tempfile.TemporaryDirectory() as root:

@@ -953,10 +953,24 @@ def _load_state_v818(service, state: dict[str, object] | None) -> None:
                         continue
 
 
-def _resolve_target_outcome(runtime, candidate, result) -> MemoryUid:
+def _resolve_target_outcome(
+    runtime,
+    candidate,
+    result,
+    *,
+    refresh_view: bool = True,
+) -> MemoryUid:
     current = candidate.source.target_outcome_uid
     if not current.is_zero:
-        if any(row.uid == current for row in runtime.read_view.node_records(level=MemoryLevel.M6)):
+        if refresh_view:
+            present = any(
+                row.uid == current
+                for row in runtime.read_view.node_records(level=MemoryLevel.M6)
+            )
+        else:
+            row = getattr(runtime.read_view, "_node_by_uid", {}).get(current)
+            present = row is not None and int(row.level) == int(MemoryLevel.M6)
+        if present:
             return current
     if not bool(getattr(result, "success", False)):
         return MemoryUid.zero()
@@ -974,12 +988,28 @@ def _resolve_target_outcome(runtime, candidate, result) -> MemoryUid:
             raw_context,
         )
         for context in contexts:
-            matches = behavior.observed_outcome_uids(
-                runtime.read_view,
-                context_signature=context,
-                action_id=int(result.terminal_action),
-                outcome_signature=int(result.outcome_signature),
-            )
+            if refresh_view:
+                matches = behavior.observed_outcome_uids(
+                    runtime.read_view,
+                    context_signature=context,
+                    action_id=int(result.terminal_action),
+                    outcome_signature=int(result.outcome_signature),
+                )
+            else:
+                key = (
+                    int(context),
+                    int(result.terminal_action),
+                    int(result.outcome_signature),
+                )
+                matches = tuple(
+                    sorted(
+                        getattr(
+                            runtime.read_view,
+                            "_behavior_observed_outcomes",
+                            {},
+                        ).get(key, ())
+                    )
+                )
             if matches:
                 return sorted(matches)[0]
     except BaseException:
@@ -1012,7 +1042,12 @@ def _retry_deferred(runtime) -> None:
         return
     remaining = []
     for candidate, result, validated in pending:
-        target_uid = _resolve_target_outcome(runtime, candidate, result)
+        target_uid = _resolve_target_outcome(
+            runtime,
+            candidate,
+            result,
+            refresh_view=False,
+        )
         if target_uid.is_zero:
             remaining.append((candidate, result, validated))
             continue

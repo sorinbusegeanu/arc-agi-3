@@ -1674,7 +1674,12 @@ def _retry_deferred_sources(runtime) -> None:
         return
     remaining = []
     for candidate, result in pending:
-        target_uid = v818._resolve_target_outcome(runtime, candidate, result)
+        target_uid = v818._resolve_target_outcome(
+            runtime,
+            candidate,
+            result,
+            refresh_view=False,
+        )
         if target_uid.is_zero:
             remaining.append((candidate, result))
             continue

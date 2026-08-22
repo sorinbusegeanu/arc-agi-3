@@ -510,7 +510,12 @@ def _retry_deferred_v854(runtime) -> None:
     tail = pending[_DEFERRED_RETRY_BATCH:]
     unresolved = []
     for candidate, result, validated in head:
-        target_uid = v818._resolve_target_outcome(runtime, candidate, result)
+        target_uid = v818._resolve_target_outcome(
+            runtime,
+            candidate,
+            result,
+            refresh_view=False,
+        )
         if target_uid.is_zero:
             unresolved.append((candidate, result, validated))
             continue
