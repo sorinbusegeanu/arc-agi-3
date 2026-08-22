@@ -8,6 +8,7 @@ from unittest.mock import patch
 import v8
 from v8 import adaptive_learning_allocation_v819 as v819
 from v8 import adaptive_memory_control_v855 as control
+from v8 import adaptive_memory_transfer_integrity_v856 as integrity
 from v8 import sampling_portfolio_v831 as portfolio
 from v8 import sampling_progress_control_v829 as v829
 from v8.model import MemoryUid, stable_u64
@@ -85,7 +86,7 @@ class AdaptiveMemoryControlV855Tests(unittest.TestCase):
     def _plan(view: _View) -> PlannedAction:
         return PlannedAction(2, view.outcome_uid, view.strategy_uid, 1.0, False)
 
-    def test_probability_keeps_exploration_floor_and_failure_backoff(self) -> None:
+    def test_probability_keeps_combined_exploration_floor_and_failure_backoff(self) -> None:
         cold = control.adaptive_m7_probability_v855(reliability=1.0, warm=False)
         warm = control.adaptive_m7_probability_v855(reliability=1.0, warm=True)
         failed = control.adaptive_m7_probability_v855(
@@ -98,8 +99,16 @@ class AdaptiveMemoryControlV855Tests(unittest.TestCase):
             warm=False,
             probationary=True,
         )
-        self.assertGreaterEqual(cold.exploration_probability, 0.25)
-        self.assertGreaterEqual(warm.exploration_probability, 0.15)
+        self.assertAlmostEqual(
+            integrity._PORTFOLIO_RANDOM_FLOOR
+            + (1.0 - integrity._PORTFOLIO_RANDOM_FLOOR) * cold.exploration_probability,
+            0.25,
+        )
+        self.assertAlmostEqual(
+            integrity._PORTFOLIO_RANDOM_FLOOR
+            + (1.0 - integrity._PORTFOLIO_RANDOM_FLOOR) * warm.exploration_probability,
+            0.15,
+        )
         self.assertGreater(failed.exploration_probability, warm.exploration_probability)
         self.assertLessEqual(probe.memory_probability, 0.10)
 
