@@ -8,12 +8,14 @@ from pathlib import Path
 from v8 import action_learning_report_v849 as action_report
 from v8 import learning_effectiveness_report_v850 as report
 from v8 import runtime_stack_v88
+from v8 import lease_dispatch_lifecycle_v843 as v843
 from v8.adaptive_learning_allocation_v819 import (
     AdaptiveLearningCoordinator,
     FrontierCandidate,
     FrontierScope,
     FrontierSource,
     GameLearningState,
+    GameLevelLearningRecord,
 )
 from v8.model import MemoryUid, ValidationState
 
@@ -58,9 +60,9 @@ class LearningEffectivenessReportTests(unittest.TestCase):
         )
         with coordinator._lock:
             coordinator._game_won["transfer-game"] = True
-            coordinator._records[("transfer-game", 3)] = type(
-                "Record", (), {"state": GameLearningState.SOLVED_OPTIMIZING}
-            )()
+            coordinator._records[("transfer-game", 3)] = GameLevelLearningRecord(
+                state=GameLearningState.SOLVED_OPTIMIZING
+            )
             run = coordinator._run["transfer-game"]
             run.sample_steps = 100
             run.transfer_attempts = 3
@@ -72,9 +74,11 @@ class LearningEffectivenessReportTests(unittest.TestCase):
             coordinator._run["stuck-game"].sample_steps = 50
         return coordinator
 
-    def test_runtime_stack_installs_report_after_v849(self):
+    def test_runtime_stack_installs_report_after_v849_without_replacing_public_authority(self):
         self.assertEqual(runtime_stack_v88._POST_LAYERS[-1], "learning_effectiveness_report_v850")
         self.assertTrue(report._INSTALLED)
+        self.assertIs(v843._BASE_WRITE_ALLOCATION_LOG, report._write_allocation_log_v850)
+        self.assertIs(report._BASE_WRITE_ALLOCATION_LOG, action_report._write_allocation_log_v849)
 
     def test_snapshot_reports_learning_application_progress_and_transfer(self):
         coordinator = self._coordinator()
