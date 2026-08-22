@@ -51,7 +51,7 @@ def _refresh_view_variants_v854_fixup(view) -> None:
         view._v814_next_refresh = now + _VARIANT_REFRESH_SECONDS
         return
 
-    # The composed historical loader has its own one-second gate.  We are the
+    # The composed historical loader has its own one-second gate. We are the
     # outer gate now, so open the inner gate for this genuine input change.
     view._v814_next_refresh = 0.0
     v854._BASE_REFRESH_VARIANTS(view)
@@ -76,14 +76,26 @@ def _actor_graph_check_v854_fixup(
     next_check_step: int,
     check_interval_steps: int = 1_000,
 ) -> int:
-    """Keep the historical optional graph-check interval contract."""
+    """Keep historical generic-view semantics while optimizing real actor views."""
+    interval = int(check_interval_steps)
+    if interval <= 0:
+        raise ValueError("graph check interval must be positive")
+    if int(completed_steps) < int(next_check_step):
+        return int(next_check_step)
+
+    nodes = getattr(read_view, "_nodes", None)
+    edges = getattr(read_view, "_edges", None)
+    if not isinstance(nodes, (tuple, list)) or not isinstance(edges, (tuple, list)):
+        read_view.invalidate_strategy_cache()
+        return (int(completed_steps) // interval + 1) * interval
+
     from v8 import performance_memory_v854 as v854
 
     return v854._actor_graph_check_v854(
         read_view,
         completed_steps=completed_steps,
         next_check_step=next_check_step,
-        check_interval_steps=check_interval_steps,
+        check_interval_steps=interval,
     )
 
 
