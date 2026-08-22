@@ -107,4 +107,6 @@ def install_current_runtime_stack_v88() -> None:
         return
     for module_name in (*_LAYERS, *_POST_LAYERS, *_FINAL_LAYERS):
         _installer(module_name)()
+    _installer("learning_transfer_correctness_v854")()
+    _installer("learning_transfer_correctness_v854_fixups")()
     _INSTALLED = True

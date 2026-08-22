@@ -73,7 +73,7 @@ class V087IntelligenceLoopTests(unittest.TestCase):
         self.assertFalse(any(int(item.level) == int(MemoryLevel.M5) for item in engine.propose((failed,), (), budget=16)))
         self.assertTrue(any(int(item.level) == int(MemoryLevel.M5) for item in engine.propose((validated,), (), budget=16)))
 
-    def test_failed_transfer_persistently_penalizes_and_quarantines(self):
+    def test_failed_transfer_is_target_scoped_and_does_not_quarantine_source(self):
         concept = node(MemoryLevel.M4, MemoryType.CONCEPT, (31, 32), support=5, cognitive=CognitiveState.VALIDATED, validation=ValidationState.VALIDATED)
         consequence = node(MemoryLevel.M5, MemoryType.CONSEQUENCE, (concept.uid.hi, concept.uid.lo, 44, 1), cognitive=CognitiveState.ACTIVE, validation=ValidationState.STRUCTURAL)
         view = FakeReadView((concept, consequence), (edge(consequence, RelationType.EXPLAINS, concept),))
@@ -81,11 +81,13 @@ class V087IntelligenceLoopTests(unittest.TestCase):
         supervisor = V82DevelopmentalPeerSupervisor(read_view=view, submit_proposal=submitted.append, watermark=lambda: 20, generation=lambda: 1, interval_seconds=100.0)
         for target in (101, 102, 103):
             supervisor.record_transfer_trial(concept.uid, target_game_hash=target, metric_on=0.0, metric_off=1.0, formation_games=(1, 2))
-        concept_updates = [item for item in submitted if item.uid == concept.uid]
-        self.assertLess(concept_updates[-1].transfer_prior_sum, 0.0)
-        self.assertEqual(concept_updates[-1].validation_state, int(ValidationState.FAILED))
-        self.assertEqual(concept_updates[-1].cognitive_state, int(CognitiveState.QUARANTINED))
-        self.assertTrue(any(item.uid == consequence.uid and item.validation_state == int(ValidationState.FAILED) and item.cognitive_state == int(CognitiveState.QUARANTINED) for item in submitted))
+        relation_updates = [item for item in submitted if int(item.memory_type) == int(MemoryType.TRANSFER_EVIDENCE)]
+        self.assertEqual(len(relation_updates), 3)
+        self.assertTrue(all(item.parent_uid == concept.uid for item in relation_updates))
+        self.assertTrue(all(item.transfer_prior_sum < 0.0 for item in relation_updates))
+        self.assertTrue(all(item.validation_state == int(ValidationState.TESTED) for item in relation_updates))
+        self.assertFalse(any(item.uid == concept.uid for item in submitted))
+        self.assertFalse(any(item.uid == consequence.uid for item in submitted))
         state = supervisor.state_dict()
         restored = V82DevelopmentalPeerSupervisor(read_view=view, submit_proposal=lambda proposal: None, watermark=lambda: 20, generation=lambda: 1, interval_seconds=100.0)
         restored.load_state(state)
