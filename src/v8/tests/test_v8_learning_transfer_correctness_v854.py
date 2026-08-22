@@ -179,8 +179,8 @@ class NormalizedGroundingTests(unittest.TestCase):
 
 class OrderedTransferTests(unittest.TestCase):
     def test_composite_transfer_executes_in_learned_order(self):
-        first = _grounded(100, 4, 1, 101)
-        second = _grounded(101, 2, 2, 102)
+        first = _grounded(100, 4, 101, 1)
+        second = _grounded(101, 2, 102, 2)
         strategy = MemoryUid(7, 7)
         sequence = OrderedTransferSequence(2.0, strategy, MemoryUid(8, 8), (first, second))
         game = "target"
@@ -190,6 +190,7 @@ class OrderedTransferTests(unittest.TestCase):
             _v854_ordered_key=((9,), game_hash),
             _v854_ordered=(sequence,),
             _strategy_version=(9,),
+            _refresh_strategy_cache=lambda: None,
         )
         first_choice = _ordered_action(view, game, 100, {2, 4})
         self.assertEqual(first_choice[0], 4)
@@ -201,7 +202,7 @@ class CompositeFormationTests(unittest.TestCase):
     def test_strategy_formation_can_exceed_six_actions(self):
         from v8 import behavior_recovery as behavior
 
-        chain = [_grounded(i, (i % 5) + 1, 100 + i, i + 1, support=8) for i in range(8)]
+        chain = [_grounded(i, (i % 5) + 1, i + 1, 100 + i, support=8) for i in range(8)]
         outcome = _node(MemoryLevel.M6, MemoryType.OUTCOME, (1, 2, 3), support=8)
         engine = SimpleNamespace(min_contingency_support=1, _admissible=lambda _row: True)
         with patch.object(behavior, "causal_m1_ancestors", return_value={chain[-1].uid}):
@@ -260,8 +261,6 @@ class SimilaritySelectionTests(unittest.TestCase):
         )
         sim = BoundedNeighborhoodSimilarity(max_candidates=1, top_results=1, threshold=0.0)
         sim.descriptors = lambda _nodes, _edges: {source_uid: source_d, same_uid: same_d, cross_uid: cross_d}
-        sim._processed_versions[same_uid] = 1
-        sim._processed_versions[cross_uid] = 1
         rows = _similarity_v854(sim, (source, same, cross), edges)
         self.assertTrue(any(cross_uid in {row.source_uid, row.target_uid} for row in rows))
 
@@ -273,8 +272,6 @@ class SimilaritySelectionTests(unittest.TestCase):
         good_d = self._descriptor(good_uid, exact=True)
         sim = BoundedNeighborhoodSimilarity(max_candidates=1, top_results=1, threshold=0.0)
         sim.descriptors = lambda _nodes, _edges: {source_uid: source_d, bad_uid: bad_d, good_uid: good_d}
-        sim._processed_versions[bad_uid] = 1
-        sim._processed_versions[good_uid] = 1
         rows = _similarity_v854(sim, nodes, ())
         self.assertTrue(any(good_uid in {row.source_uid, row.target_uid} for row in rows))
         self.assertFalse(any(bad_uid in {row.source_uid, row.target_uid} for row in rows))
