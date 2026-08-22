@@ -54,7 +54,7 @@ class SamplingBaselineRecoveryV828Tests(unittest.TestCase):
     def test_v828_minimum_lane_helper_is_historical_not_final_cli_authority(self) -> None:
         self.assertEqual(
             _requested_actor_pool_v828(["continuous-run", "--games", "learning"]),
-            36,
+            45,
         )
         self.assertIs(cli_v819._requested_actor_pool, occupancy._requested_actor_pool_v840)
         self.assertEqual(

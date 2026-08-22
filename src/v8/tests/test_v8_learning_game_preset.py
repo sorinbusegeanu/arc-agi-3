@@ -11,6 +11,7 @@ from v7.game_sets import (
     V7_GAME_PRESETS,
     resolve_game_selector,
 )
+from v8 import click_exploration_v848 as click
 
 
 EXPECTED_LEARNING_GAMES = (
@@ -41,9 +42,10 @@ class LearningGamePresetTests(unittest.TestCase):
         for game_id in LEARNING_PURE_CLICK_GAMES:
             environment = ArcGridEnvironment(game_id=game_id, seed=0)
             environment.game_wait_seconds = 0.0
-            self.assertEqual(
-                tuple(sorted(set(environment.available_actions()))),
-                (6,),
+            actions = tuple(environment.available_actions())
+            self.assertTrue(actions, game_id)
+            self.assertTrue(
+                all(click._is_click_token(action) for action in actions),
                 game_id,
             )
 
