@@ -23,9 +23,9 @@ from v8.publication import ShardReadDescriptor
 
 
 class MemoryEfficiencyV851Tests(unittest.TestCase):
-    def test_runtime_stack_installs_v851_layers_last(self):
+    def test_runtime_stack_installs_v851_layers_in_order(self):
         self.assertEqual(
-            runtime_stack_v88._POST_LAYERS[-4:],
+            runtime_stack_v88._POST_LAYERS[-5:-1],
             (
                 "memory_efficiency_v851",
                 "memory_efficiency_v851_fixups",
