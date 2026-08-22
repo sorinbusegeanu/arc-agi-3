@@ -9,6 +9,7 @@ for snapshot compatibility.
 """
 
 import os
+import time
 from dataclasses import dataclass
 
 from v8.environment_contract import (
@@ -36,6 +37,11 @@ _BASE_V836_GENERATE = None
 _BASE_V836_REPLAY_LEVELS = None
 _BASE_V836_PUBLISH = None
 _SCOPE_LABELS: dict[tuple[str, int], str] = {}
+_POSITIVE_EPISODE_MARKER_CACHE: dict[
+    str,
+    tuple[float, tuple[int, int, int] | None, dict[str, object] | None],
+] = {}
+_POSITIVE_EPISODE_MARKER_POLL_SECONDS = 0.25
 
 
 # ---------------------------------------------------------------------------
@@ -1006,21 +1012,58 @@ def _write_runtime_positive_episode_marker(game_id: str, result) -> None:
             "steps": max(1, int(getattr(result, "steps", 0))),
         },
     )
+    _POSITIVE_EPISODE_MARKER_CACHE.pop(str(path), None)
+
+
+def _read_positive_episode_marker(path) -> dict[str, object] | None:
+    import json
+
+    now = time.monotonic()
+    key = str(path)
+    cached = _POSITIVE_EPISODE_MARKER_CACHE.get(key)
+    if cached is not None and now < float(cached[0]):
+        return cached[2]
+    try:
+        stat = path.stat()
+    except OSError:
+        _POSITIVE_EPISODE_MARKER_CACHE[key] = (
+            now + _POSITIVE_EPISODE_MARKER_POLL_SECONDS,
+            None,
+            None,
+        )
+        return None
+    signature = (int(stat.st_ino), int(stat.st_size), int(stat.st_mtime_ns))
+    if cached is not None and cached[1] == signature:
+        _POSITIVE_EPISODE_MARKER_CACHE[key] = (
+            now + _POSITIVE_EPISODE_MARKER_POLL_SECONDS,
+            signature,
+            cached[2],
+        )
+        return cached[2]
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        raw = value if isinstance(value, dict) else None
+    except (OSError, TypeError, ValueError):
+        raw = None
+    _POSITIVE_EPISODE_MARKER_CACHE[key] = (
+        now + _POSITIVE_EPISODE_MARKER_POLL_SECONDS,
+        signature,
+        raw,
+    )
+    return raw
 
 
 def _promote_positive_episode_v837(coordinator, game_id: str) -> bool:
-    import json
     from v8 import adaptive_learning_allocation_v819 as v819
     from v8 import runtime_win_optimization_v834 as v834
     from v8 import runtime_win_scope_v835 as v835
 
     session = str(os.environ.get(v835._RUN_SESSION_ENV, "")).strip()
     path = v834._marker_path(game_id)
-    if not session or path is None or not path.is_file():
+    if not session or path is None:
         return False
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, TypeError, ValueError):
+    raw = _read_positive_episode_marker(path)
+    if raw is None:
         return False
     game = str(game_id)
     if str(raw.get("environment_scope", raw.get("game_id", ""))) != game:

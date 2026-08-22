@@ -88,7 +88,10 @@ class DeferredScalingTests(unittest.TestCase):
 
         original = v839._retry_deferred_batch
 
+        limits = []
+
         def retry(target, *, limit):
+            limits.append(int(limit))
             count = min(len(target._v819_deferred_sources), int(limit))
             del target._v819_deferred_sources[:count]
             return count, count
@@ -106,6 +109,36 @@ class DeferredScalingTests(unittest.TestCase):
         self.assertEqual(examined, 40)
         self.assertEqual(resolved, 40)
         self.assertEqual(runtime._v819_deferred_sources, [])
+        self.assertEqual(limits, [1] * 40)
+
+    def test_deferred_worker_stops_between_single_item_retries(self):
+        runtime = SimpleNamespace(
+            _v819_deferred_sources=[object() for _ in range(3)],
+            generation=1,
+            watermark=1,
+            _error_queue=queue.Queue(),
+        )
+        from v8 import lease_dispatch_continuity_v839 as v839
+
+        original = v839._retry_deferred_batch
+        worker = v841._AdaptiveDeferredRetryWorker(runtime)
+        calls = []
+
+        def retry(target, *, limit):
+            calls.append(int(limit))
+            del target._v819_deferred_sources[:1]
+            worker._stop.set()
+            return 1, 0
+
+        v839._retry_deferred_batch = retry
+        try:
+            examined, resolved = worker._drain_slice()
+        finally:
+            v839._retry_deferred_batch = original
+            worker.close(timeout=1.0)
+        self.assertEqual((examined, resolved), (1, 0))
+        self.assertEqual(calls, [1])
+        self.assertEqual(len(runtime._v819_deferred_sources), 2)
 
 
 class PeerScalingTests(unittest.TestCase):

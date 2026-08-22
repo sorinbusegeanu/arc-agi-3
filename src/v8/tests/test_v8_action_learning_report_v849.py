@@ -321,6 +321,37 @@ class ActionEventRefreshSchedulingTests(unittest.TestCase):
                 report._refresh_events(force=True)
                 self.assertEqual(report._RUN["g"]["steps"], 3)
 
+    def test_busy_actor_file_does_not_starve_other_actor_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            trajectory_root = Path(tmp) / "trajectory_optimizer"
+            event_root = Path(tmp) / report._EVENT_DIR
+            event_root.mkdir()
+            (event_root / "actor-1.jsonl").write_text(
+                "".join(json.dumps(self._event("busy")) + "\n" for _ in range(4)),
+                encoding="utf-8",
+            )
+            click_event = {
+                **self._event("click"),
+                "native_types": [6],
+            }
+            (event_root / "actor-2.jsonl").write_text(
+                json.dumps(click_event) + "\n",
+                encoding="utf-8",
+            )
+            with (
+                patch.dict(
+                    os.environ,
+                    {report._TRAJECTORY_ROOT_ENV: str(trajectory_root)},
+                ),
+                patch.object(report, "_REFRESH_MAX_EVENTS_PER_FILE", 1),
+                patch.object(report, "_REFRESH_MAX_EVENTS", 10),
+                patch.object(report, "_REFRESH_MAX_SECONDS", 60.0),
+            ):
+                report._refresh_events(force=True)
+            self.assertEqual(report._RUN["busy"]["steps"], 1)
+            self.assertEqual(report._RUN["click"]["steps"], 1)
+            self.assertEqual(report._SPACE["click"]["native_types"], {6})
+
     def test_refresh_interval_begins_when_scan_finishes(self):
         with (
             patch.object(report, "_event_root", return_value=None),
@@ -328,6 +359,77 @@ class ActionEventRefreshSchedulingTests(unittest.TestCase):
         ):
             report._refresh_events(force=True)
         self.assertEqual(report._LAST_REFRESH, 20.0)
+
+
+class ActionFrontierReportSchedulingTests(unittest.TestCase):
+    def setUp(self):
+        self.prior_root = os.environ.get(report._TRAJECTORY_ROOT_ENV)
+        report._reset_action_learning_state_v849()
+
+    def tearDown(self):
+        if self.prior_root is None:
+            os.environ.pop(report._TRAJECTORY_ROOT_ENV, None)
+        else:
+            os.environ[report._TRAJECTORY_ROOT_ENV] = self.prior_root
+        report._reset_action_learning_state_v849()
+
+    def test_movement_game_does_not_scan_click_frontier(self):
+        coordinator = AdaptiveLearningCoordinator()
+        coordinator.register_games(("movement",))
+        report._SPACE["movement"] = {
+            **report._empty_aggregate(),
+            "native_types": {1, 2, 3, 4},
+            "movement_actions_available": {1, 2, 3, 4},
+        }
+
+        with patch.object(
+            report,
+            "_frontier_metrics",
+            side_effect=AssertionError("movement frontier scanned"),
+        ):
+            row = report._game_row(coordinator, "movement", refresh_events=False)
+
+        self.assertEqual(row["click_frontier_nodes"], 0)
+        self.assertEqual(row["click_frontier_expandable"], 0)
+
+    def test_unchanged_frontier_file_is_not_reparsed(self):
+        from v8 import sampling_evidence_frontier_v847 as frontier
+
+        with tempfile.TemporaryDirectory() as tmp:
+            trajectory_root = Path(tmp) / "trajectory_optimizer"
+            frontier_root = trajectory_root / frontier._STATE_DIR
+            frontier_root.mkdir(parents=True)
+            path = frontier_root / f"{frontier._game_token('click')}-1.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "game_id": "click",
+                        "nodes": [
+                            {
+                                "available_actions": [6],
+                                "tried_actions": [],
+                                "anchor": [6],
+                                "latent": True,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            os.environ[report._TRAJECTORY_ROOT_ENV] = str(trajectory_root)
+
+            first = report._frontier_metrics("click")
+            with patch.object(
+                Path,
+                "read_text",
+                side_effect=AssertionError("unchanged frontier reparsed"),
+            ):
+                second = report._frontier_metrics("click")
+
+        self.assertEqual(first, second)
+        self.assertEqual(first["click_frontier_nodes"], 1)
+        self.assertEqual(first["click_frontier_expandable"], 1)
+        self.assertEqual(first["suppressed_click_noop_frontiers"], 1)
 
 
 if __name__ == "__main__":

@@ -13,6 +13,29 @@ from v8 import sampling_control_repair_v823 as v823
 
 
 class AdaptiveAllocatorOccupancyV840Tests(unittest.TestCase):
+    def test_failed_process_check_polls_all_sentinels_once(self) -> None:
+        read_fd, write_fd = os.pipe()
+
+        class Process:
+            sentinel = read_fd
+            code = None
+
+            @property
+            def exitcode(self):
+                if self.code is None:
+                    raise AssertionError("live process exitcode was polled")
+                return self.code
+
+        process = Process()
+        try:
+            self.assertEqual(v840._failed_processes((process,)), ())
+            process.code = -9
+            os.write(write_fd, b"x")
+            self.assertEqual(v840._failed_processes((process,)), (process,))
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+
     def test_normal_completion_releases_full_reservation(self) -> None:
         ledger = v840._BudgetLedger(100)
         ledger.reserve(1, 10)
@@ -229,6 +252,14 @@ class AdaptiveAllocatorOccupancyV840Tests(unittest.TestCase):
     def test_periodic_deadline_is_based_on_work_completion_time(self) -> None:
         with patch.object(v840.time, "monotonic", return_value=500.0):
             self.assertEqual(v840._periodic_deadline(60.0), 560.0)
+
+    def test_periodic_advance_stays_anchored_after_short_report(self) -> None:
+        with patch.object(v840.time, "monotonic", return_value=115.0):
+            self.assertEqual(v840._advance_periodic_deadline(100.0, 60.0), 160.0)
+
+    def test_periodic_advance_skips_deadline_missed_by_slow_report(self) -> None:
+        with patch.object(v840.time, "monotonic", return_value=175.0):
+            self.assertEqual(v840._advance_periodic_deadline(100.0, 60.0), 220.0)
 
 
 if __name__ == "__main__":

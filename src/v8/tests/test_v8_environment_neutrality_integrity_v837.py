@@ -1,15 +1,23 @@
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import v8  # noqa: F401
+from v8 import environment_neutrality_v837 as neutrality
 from v8 import sampling_transfer_v833 as transfer
 from v8 import trajectory_optimizer_v814 as optimizer
 from v8.environment_contract import BoundaryEvent, BoundaryScope
 
 
 class EnvironmentNeutralityIntegrityV837Tests(unittest.TestCase):
+    def tearDown(self):
+        neutrality._POSITIVE_EPISODE_MARKER_CACHE.clear()
+
     def test_legacy_win_and_generic_positive_episode_share_target_identity(self):
         anchor = optimizer.ReplayAnchor("env", 0, (), None)
         legacy = optimizer.TrajectoryTarget(5, "WIN")
@@ -50,6 +58,30 @@ class EnvironmentNeutralityIntegrityV837Tests(unittest.TestCase):
             priority=4,
         )
         self.assertEqual(calls, [])
+
+    def test_unchanged_positive_episode_marker_is_not_reparsed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "game.json"
+            expected = {"game_id": "game", "run_session": "session"}
+            path.write_text(json.dumps(expected), encoding="utf-8")
+            self.assertEqual(neutrality._read_positive_episode_marker(path), expected)
+            with patch.object(
+                Path,
+                "read_text",
+                side_effect=AssertionError("unchanged marker reparsed"),
+            ):
+                self.assertEqual(neutrality._read_positive_episode_marker(path), expected)
+
+    def test_missing_positive_episode_marker_is_polled_not_statted_per_lease(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "missing.json"
+            self.assertIsNone(neutrality._read_positive_episode_marker(path))
+            with patch.object(
+                Path,
+                "stat",
+                side_effect=AssertionError("missing marker stat repeated"),
+            ):
+                self.assertIsNone(neutrality._read_positive_episode_marker(path))
 
 
 if __name__ == "__main__":

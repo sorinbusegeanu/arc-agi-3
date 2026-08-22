@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import v8
@@ -178,6 +179,30 @@ class LearningStateTests(unittest.TestCase):
 
 
 class AllocationTests(unittest.TestCase):
+    def test_telemetry_never_waits_for_optimizer_validator_lock(self) -> None:
+        class NonBlockingOnlyLock:
+            def acquire(self, *, blocking=True):
+                self.assert_nonblocking = not blocking
+                return False
+
+            def release(self):
+                raise AssertionError("unacquired lock released")
+
+        coordinator = AdaptiveLearningCoordinator()
+        coordinator.register_games(("game",))
+        lock = NonBlockingOnlyLock()
+        service = SimpleNamespace(
+            _v818_validator_lock=lock,
+            _v818_game_queues={},
+            _v818_validator_threads={},
+        )
+
+        rows = coordinator.telemetry(optimizer_service=service)
+
+        self.assertEqual(len(rows), 1)
+        self.assertFalse(rows[0].optimizer_active)
+        self.assertTrue(lock.assert_nonblocking)
+
     def test_weighted_allocator_redirects_credits_to_unsolved_game(self) -> None:
         config = AdaptiveLearningConfig(stabilization_generations=1)
         coordinator = AdaptiveLearningCoordinator(config=config)

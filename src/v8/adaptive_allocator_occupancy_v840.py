@@ -5,6 +5,7 @@ import os
 import queue
 import time
 from dataclasses import dataclass, field
+from multiprocessing.connection import wait as wait_connections
 from pathlib import Path
 
 
@@ -88,6 +89,21 @@ def _refill_idle_workers(idle_workers: set[int], assign) -> tuple[int, ...]:
     return tuple(assigned)
 
 
+def _failed_processes(processes) -> tuple[object, ...]:
+    """Check all worker sentinels with one nonblocking OS wait."""
+    rows = tuple(processes)
+    if not rows:
+        return ()
+    by_sentinel = {process.sentinel: process for process in rows}
+    ready = wait_connections(tuple(by_sentinel), timeout=0.0)
+    failed = []
+    for sentinel in ready:
+        process = by_sentinel[sentinel]
+        if process.exitcode not in (None, 0):
+            failed.append(process)
+    return tuple(failed)
+
+
 def _sampling_budget_reported(
     total_budget: int,
     completed_by_game,
@@ -110,6 +126,19 @@ def _sampling_budget_reported(
 def _periodic_deadline(interval_seconds: float) -> float:
     """Schedule from completed work, never from a stale pre-work timestamp."""
     return time.monotonic() + float(interval_seconds)
+
+
+def _advance_periodic_deadline(deadline: float, interval_seconds: float) -> float:
+    """Keep periodic work anchored while skipping intervals missed by slow work."""
+    interval = float(interval_seconds)
+    if interval <= 0.0:
+        raise ValueError("periodic interval must be positive")
+    next_deadline = float(deadline) + interval
+    now = time.monotonic()
+    if next_deadline <= now:
+        missed = int((now - next_deadline) // interval) + 1
+        next_deadline += float(missed) * interval
+    return next_deadline
 
 
 def _occupancy_bounded_lease_steps(
@@ -347,7 +376,7 @@ def _adaptive_run_actor_jobs_v840(
         for process in processes:
             process.start()
         while not all(event.is_set() for event in ready):
-            failed = [process for process in processes if process.exitcode not in (None, 0)]
+            failed = _failed_processes(processes)
             if failed:
                 detail = ", ".join(f"{p.name}={p.exitcode}" for p in failed)
                 raise RuntimeError(f"adaptive actor failed during startup: {detail}")
@@ -447,7 +476,7 @@ def _adaptive_run_actor_jobs_v840(
             else:
                 coordinator.stabilize(generation=int(runtime.generation))
 
-            failed = [process for process in processes if process.exitcode not in (None, 0)]
+            failed = _failed_processes(processes)
             if failed:
                 detail = ", ".join(f"{p.name}={p.exitcode}" for p in failed)
                 raise RuntimeError(f"adaptive actor failed: {detail}")
@@ -479,7 +508,10 @@ def _adaptive_run_actor_jobs_v840(
                     active_progress,
                     active_leases,
                 )
-                next_log = _periodic_deadline(v819._ALLOCATION_LOG_SECONDS)
+                next_log = _advance_periodic_deadline(
+                    next_log,
+                    v819._ALLOCATION_LOG_SECONDS,
+                )
             if now >= next_stdout:
                 perf._allocation_stdout_live(
                     coordinator,
@@ -487,7 +519,10 @@ def _adaptive_run_actor_jobs_v840(
                     active_progress,
                     active_leases,
                 )
-                next_stdout = _periodic_deadline(v819._ALLOCATION_STDOUT_SECONDS)
+                next_stdout = _advance_periodic_deadline(
+                    next_stdout,
+                    v819._ALLOCATION_STDOUT_SECONDS,
+                )
             if deadline is not None and now >= deadline:
                 raise TimeoutError("adaptive actor jobs timed out")
 

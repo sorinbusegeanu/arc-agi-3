@@ -141,6 +141,17 @@ class MemoryEfficiencyV851Tests(unittest.TestCase):
             self.assertEqual(edge_rows, ())
             self.assertEqual(edge_version, int(first._edges[0].sequence))
 
+            nodes.begin_write()
+            nodes.end_write(count=0)
+            first.invalidate_strategy_cache()
+            with patch.object(
+                ActorReadView,
+                "_scan_node_arena",
+                side_effect=AssertionError("actor attempted an incoherent live graph rescan"),
+            ):
+                self.assertEqual(first.node_records(), ())
+            self.assertFalse(first._strategy_cache_stale)
+
             with patch.object(
                 ActorReadView,
                 "_scan_node_arena",

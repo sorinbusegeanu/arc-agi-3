@@ -34,10 +34,15 @@ _REFRESH_LOCK = threading.RLock()
 _FILE_OFFSETS: dict[str, int] = {}
 _SPACE: dict[str, dict[str, object]] = {}
 _RUN: dict[str, dict[str, object]] = {}
+_FRONTIER_FILE_CACHE: dict[
+    str,
+    tuple[tuple[int, int, int], str, dict[str, int]],
+] = {}
 _LAST_REFRESH = 0.0
 _REFRESH_SECONDS = 0.50
 _REFRESH_CURSOR = 0
 _REFRESH_MAX_EVENTS = 2048
+_REFRESH_MAX_EVENTS_PER_FILE = 128
 _REFRESH_MAX_SECONDS = 0.05
 
 _COUNTER_FIELDS = (
@@ -387,7 +392,7 @@ def _refresh_events(*, force: bool = False) -> None:
             for relative_index in range(len(paths)):
                 index = (start + relative_index) % len(paths)
                 if checked > 0 and time.monotonic() - started >= _REFRESH_MAX_SECONDS:
-                    _REFRESH_CURSOR = index
+                    _REFRESH_CURSOR = (index + 1) % len(paths)
                     return
                 path = paths[index]
                 key = str(path)
@@ -403,6 +408,7 @@ def _refresh_events(*, force: bool = False) -> None:
                         continue
                     with path.open("r", encoding="utf-8") as stream:
                         stream.seek(offset)
+                        file_events = 0
                         while True:
                             position = stream.tell()
                             line = stream.readline()
@@ -418,13 +424,16 @@ def _refresh_events(*, force: bool = False) -> None:
                                 if float(raw.get("time", 0.0)) >= _RUN_STARTED_AT:
                                     _merge_event(_RUN, raw)
                             events += 1
+                            file_events += 1
                             if (
                                 events >= _REFRESH_MAX_EVENTS
                                 or time.monotonic() - started >= _REFRESH_MAX_SECONDS
                             ):
                                 _FILE_OFFSETS[key] = stream.tell()
-                                _REFRESH_CURSOR = index
+                                _REFRESH_CURSOR = (index + 1) % len(paths)
                                 return
+                            if file_events >= _REFRESH_MAX_EVENTS_PER_FILE:
+                                break
                         _FILE_OFFSETS[key] = stream.tell()
                     _REFRESH_CURSOR = (index + 1) % len(paths)
                 except OSError:
@@ -524,10 +533,29 @@ def _frontier_metrics(game_id: str) -> dict[str, int]:
     token = frontier._game_token(str(game_id))
     for path in sorted(root.glob(f"{token}-*.json")):
         try:
+            stat = path.stat()
+        except OSError:
+            continue
+        signature = (int(stat.st_ino), int(stat.st_size), int(stat.st_mtime_ns))
+        cached = _FRONTIER_FILE_CACHE.get(str(path))
+        if cached is not None and cached[0] == signature:
+            cached_game, metrics = cached[1], cached[2]
+            if cached_game == str(game_id):
+                for field, value in metrics.items():
+                    result[field] += int(value)
+            continue
+        try:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError, TypeError):
             continue
-        if str(raw.get("game_id", "")) != str(game_id):
+        cached_game = str(raw.get("game_id", ""))
+        metrics = {
+            "click_frontier_nodes": 0,
+            "click_frontier_expandable": 0,
+            "suppressed_click_noop_frontiers": 0,
+        }
+        if cached_game != str(game_id):
+            _FRONTIER_FILE_CACHE[str(path)] = (signature, cached_game, metrics)
             continue
         for item in raw.get("nodes", ()):
             if not isinstance(item, dict):
@@ -538,11 +566,20 @@ def _frontier_metrics(game_id: str) -> dict[str, int]:
             click_available = {value for value in available if _click()._is_click_token(value)}
             click_expandable = click_available - tried
             if click_available or (anchor and _click()._is_click_token(anchor[-1])):
-                result["click_frontier_nodes"] += 1
+                metrics["click_frontier_nodes"] += 1
             if click_expandable:
-                result["click_frontier_expandable"] += 1
+                metrics["click_frontier_expandable"] += 1
             if bool(item.get("latent", False)) and anchor and _click()._is_click_token(anchor[-1]):
-                result["suppressed_click_noop_frontiers"] += 1
+                metrics["suppressed_click_noop_frontiers"] += 1
+        try:
+            after = path.stat()
+            after_signature = (int(after.st_ino), int(after.st_size), int(after.st_mtime_ns))
+        except OSError:
+            after_signature = ()
+        if after_signature == signature:
+            _FRONTIER_FILE_CACHE[str(path)] = (signature, cached_game, metrics)
+        for field, value in metrics.items():
+            result[field] += int(value)
     return result
 
 
@@ -630,7 +667,16 @@ def _game_row(
             )
         ),
     }
-    row.update(_frontier_metrics(game))
+    if kind in {"click", "mixed"}:
+        row.update(_frontier_metrics(game))
+    else:
+        row.update(
+            {
+                "click_frontier_nodes": 0,
+                "click_frontier_expandable": 0,
+                "suppressed_click_noop_frontiers": 0,
+            }
+        )
     return row
 
 
@@ -728,6 +774,7 @@ def _reset_action_learning_state_v849() -> None:
         _FILE_OFFSETS.clear()
         _SPACE.clear()
         _RUN.clear()
+        _FRONTIER_FILE_CACHE.clear()
         _LAST_REFRESH = 0.0
         _REFRESH_CURSOR = 0
         _RUN_STARTED_AT = time.time()

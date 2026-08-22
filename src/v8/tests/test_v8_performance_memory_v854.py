@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import v8  # noqa: F401 - install current runtime stack
+from v7.environment.arc_adapter import ArcGridEnvironment
 from v8 import action_learning_report_v849 as report
 from v8 import actor as actor_module
 from v8 import adaptive_learning_allocation_v819_performance_fix as adaptive
@@ -23,6 +24,52 @@ from v8.model import CognitiveState, MemoryLevel, MemoryUid, ValidationState
 
 
 class PerformanceMemoryV854Tests(unittest.TestCase):
+    def test_fi01_spread_deduplicates_shared_frontier_cells(self):
+        class Fire:
+            tags = {"fire"}
+
+            def __init__(self, x, y):
+                self.x = x
+                self.y = y
+
+            def clone(self):
+                return Fire(self.x, self.y)
+
+            def set_position(self, x, y):
+                self.x, self.y = x, y
+                return self
+
+        class Level:
+            grid_size = (3, 3)
+
+            def __init__(self):
+                self.sprites = [Fire(0, 1), Fire(2, 1)]
+
+            def get_sprites_by_tag(self, tag):
+                return [sprite for sprite in self.sprites if tag in sprite.tags]
+
+            def get_sprite_at(self, x, y, *, ignore_collidable=False):
+                del ignore_collidable
+                return next(
+                    (sprite for sprite in self.sprites if (sprite.x, sprite.y) == (x, y)),
+                    None,
+                )
+
+            def add_sprite(self, sprite):
+                self.sprites.append(sprite)
+
+        level = Level()
+        v854._spread_fi01_v854(SimpleNamespace(current_level=level))
+        positions = [(sprite.x, sprite.y) for sprite in level.sprites]
+        self.assertEqual(positions.count((1, 1)), 1)
+        self.assertEqual(len(positions), len(set(positions)))
+
+    def test_fi01_environment_installs_bounded_spread(self):
+        env = ArcGridEnvironment(game_id="fi01")
+        game = env.env._game
+        self.assertIs(game._spread.__func__, v854._spread_fi01_v854)
+        self.assertTrue(hasattr(game, "_v854_original_spread"))
+
     def test_v854_is_final_runtime_layer(self):
         self.assertEqual(
             runtime_stack_v88._FINAL_LAYERS,
@@ -109,6 +156,32 @@ class PerformanceMemoryV854Tests(unittest.TestCase):
             try:
                 with patch.object(v854, "_pid_alive", return_value=False):
                     self.assertEqual(v854._prune_consumed_action_event_files_v854(), 1)
+                self.assertFalse(path.exists())
+            finally:
+                report._FILE_OFFSETS.pop(str(path), None)
+                if prior_root is None:
+                    os.environ.pop(report._TRAJECTORY_ROOT_ENV, None)
+                else:
+                    os.environ[report._TRAJECTORY_ROOT_ENV] = prior_root
+
+    def test_prior_run_actor_event_is_pruned_before_replay(self):
+        prior_root = os.environ.get(report._TRAJECTORY_ROOT_ENV)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            os.environ[report._TRAJECTORY_ROOT_ENV] = str(root / "trajectory_optimizer")
+            event_root = root / report._EVENT_DIR
+            event_root.mkdir(parents=True)
+            path = event_root / "actor-12345.jsonl"
+            path.write_text('{"schema":1,"game_id":"stale"}\n', encoding="utf-8")
+            stale_time = float(report._RUN_STARTED_AT) - 10.0
+            os.utime(path, (stale_time, stale_time))
+            try:
+                with (
+                    patch.object(v854, "_pid_alive", return_value=True),
+                    patch.object(v854, "_BASE_REFRESH_EVENTS") as refresh,
+                ):
+                    v854._refresh_events_v854(force=True)
+                    refresh.assert_called_once_with(force=True)
                 self.assertFalse(path.exists())
             finally:
                 report._FILE_OFFSETS.pop(str(path), None)

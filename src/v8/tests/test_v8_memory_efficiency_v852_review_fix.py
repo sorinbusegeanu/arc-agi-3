@@ -51,6 +51,23 @@ class MemoryEfficiencyV852ReviewFixTests(unittest.TestCase):
         finally:
             v852._BASE_ACTOR_REFRESH = original
 
+    def test_actor_compact_session_cut_defers_live_graph_invalidation(self):
+        original = v852._BASE_ACTOR_REFRESH
+        calls = []
+        dummy = SimpleNamespace(
+            _v851_ready=True,
+            _strategy_cache_stale=True,
+            _refresh_interval_seconds=None,
+            _strategy_version=(20, 40),
+        )
+        try:
+            v852._BASE_ACTOR_REFRESH = lambda instance: calls.append(instance)
+            v852._actor_refresh_strategy_cache_v852(dummy)
+        finally:
+            v852._BASE_ACTOR_REFRESH = original
+        self.assertEqual(calls, [])
+        self.assertFalse(dummy._strategy_cache_stale)
+
     def test_depends_on_is_strategy_lineage(self):
         relation = int(RelationType.DEPENDS_ON)
         self.assertIn(relation, publication._LINEAGE_RELATIONS)
@@ -90,6 +107,42 @@ class MemoryEfficiencyV852ReviewFixTests(unittest.TestCase):
             games=1,
         )
         self.assertTrue(v852._has_transferable_ancestor_v852(dummy, child))
+
+    def test_transferable_ancestor_cache_is_reused_and_graph_scoped(self):
+        child = MemoryUid(1, 1)
+        parent = MemoryUid(2, 2)
+
+        class GuardedParents(dict):
+            fail = False
+
+            def get(self, *args, **kwargs):
+                if self.fail:
+                    raise AssertionError("cached query rescanned lineage")
+                return super().get(*args, **kwargs)
+
+        parents = GuardedParents({child: {parent}})
+        dummy = SimpleNamespace(
+            _parents=parents,
+            _node_by_uid={
+                parent: SimpleNamespace(
+                    level=int(MemoryLevel.M4),
+                    cognitive_state=int(CognitiveState.ACTIVE),
+                    validation_state=int(ValidationState.VALIDATED),
+                    game_evidence_count=2,
+                )
+            },
+            _strategy_version=(),
+        )
+
+        self.assertTrue(v852._has_transferable_ancestor_v852(dummy, child))
+
+        # Keep the graph identity stable to prove the result is reused.
+        parents.fail = True
+        self.assertTrue(v852._has_transferable_ancestor_v852(dummy, child))
+
+        # Publication replaces the index objects on each coherent graph cut.
+        dummy._parents = {}
+        self.assertFalse(v852._has_transferable_ancestor_v852(dummy, child))
 
     def test_restored_action_capacity_does_not_grow_from_table_size_alone(self):
         historical = capacity.SnapshotUsage(

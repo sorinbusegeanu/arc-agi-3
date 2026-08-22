@@ -26,6 +26,7 @@ _BASE_WRITE_STREAM_MANIFEST = None
 _BASE_ADAPTIVE_WORKER = None
 _SNAPSHOT_RETENTION = 3
 _STREAM_BYTES = 4 * 1024 * 1024
+_TRANSFER_INDEX_LOCK = threading.Lock()
 
 _ACTIVE_STATES = {
     int(CognitiveState.ACTIVE),
@@ -35,7 +36,19 @@ _ACTIVE_STATES = {
 
 
 def _actor_refresh_strategy_cache_v852(self) -> None:
-    """Respect actor graph-check invalidation instead of rescanning on every write."""
+    """Keep one coherent compact graph cut for the actor-process lifetime.
+
+    Canonical writers are quiescent only while the adaptive worker builds its
+    startup cut.  A full compact rescan after writers resume cannot obtain one
+    global seqlock version on a large graph and used to repeat the scan until the
+    actor crashed.  Action arenas and the actor-local overlay remain live; graph
+    changes become visible at the next coherent worker startup.
+    """
+    if bool(getattr(self, "_v851_ready", False)) and getattr(
+        self, "_strategy_version", ()
+    ):
+        self._strategy_cache_stale = False
+        return
     if not bool(getattr(self, "_strategy_cache_stale", True)):
         interval = getattr(self, "_refresh_interval_seconds", None)
         if interval is None:
@@ -48,8 +61,23 @@ def _actor_refresh_strategy_cache_v852(self) -> None:
     return _BASE_ACTOR_REFRESH(self)
 
 
-def _has_transferable_ancestor_v852(self, uid: MemoryUid, *, max_depth: int = 8) -> bool:
-    """Only behaviorally admissible, non-failed active ancestors enable transfer."""
+def _admissible_transfer_source_v852(row) -> bool:
+    if row is None or int(row.level) < int(MemoryLevel.M3):
+        return False
+    validation = int(row.validation_state)
+    return (
+        int(row.cognitive_state) in _ACTIVE_STATES
+        and validation != int(ValidationState.FAILED)
+        and (
+            int(getattr(row, "game_evidence_count", 0)) >= 2
+            or validation == int(ValidationState.VALIDATED)
+        )
+    )
+
+
+def _has_transferable_ancestor_direct_v852(
+    self, uid: MemoryUid, *, max_depth: int
+) -> bool:
     frontier = {uid}
     visited = set(frontier)
     for _depth in range(max(0, int(max_depth))):
@@ -57,18 +85,8 @@ def _has_transferable_ancestor_v852(self, uid: MemoryUid, *, max_depth: int = 8)
         for current in frontier:
             for parent in self._parents.get(current, ()):
                 row = self._node_by_uid.get(parent)
-                if row is not None and int(row.level) >= int(MemoryLevel.M3):
-                    validation = int(row.validation_state)
-                    admissible_state = int(row.cognitive_state) in _ACTIVE_STATES
-                    admissible_validation = validation != int(ValidationState.FAILED)
-                    cross_game = int(getattr(row, "game_evidence_count", 0)) >= 2
-                    explicitly_validated = validation == int(ValidationState.VALIDATED)
-                    if (
-                        admissible_state
-                        and admissible_validation
-                        and (cross_game or explicitly_validated)
-                    ):
-                        return True
+                if _admissible_transfer_source_v852(row):
+                    return True
                 if parent not in visited:
                     visited.add(parent)
                     following.add(parent)
@@ -76,6 +94,50 @@ def _has_transferable_ancestor_v852(self, uid: MemoryUid, *, max_depth: int = 8)
             return False
         frontier = following
     return False
+
+
+def _transferable_uids_v852(self, *, max_depth: int) -> set[MemoryUid]:
+    """Build transfer reachability once for a coherent publication graph cut."""
+    depth_limit = max(0, int(max_depth))
+    graph_identity = (id(self._parents), id(self._node_by_uid), depth_limit)
+    with _TRANSFER_INDEX_LOCK:
+        if getattr(self, "_v852_transferable_index_graph", None) == graph_identity:
+            return self._v852_transferable_uids
+
+        admissible = {
+            uid
+            for uid, row in self._node_by_uid.items()
+            if _admissible_transfer_source_v852(row)
+        }
+        transferable: set[MemoryUid] = set()
+        parents_by_child = self._parents
+        for _depth in range(depth_limit):
+            added: set[MemoryUid] = set()
+            for child, parents in parents_by_child.items():
+                if child in transferable:
+                    continue
+                if any(
+                    parent in admissible or parent in transferable
+                    for parent in parents
+                ):
+                    added.add(child)
+            if not added:
+                break
+            transferable.update(added)
+
+        self._v852_transferable_index_graph = graph_identity
+        self._v852_transferable_uids = transferable
+        return transferable
+
+
+def _has_transferable_ancestor_v852(self, uid: MemoryUid, *, max_depth: int = 8) -> bool:
+    """Only behaviorally admissible, non-failed active ancestors enable transfer."""
+    # Real read views expose a strategy version and replace both graph indexes
+    # atomically for each coherent cut.  Build a graph-wide reachability index
+    # there; lightweight callers without that contract retain direct semantics.
+    if hasattr(self, "_strategy_version"):
+        return uid in _transferable_uids_v852(self, max_depth=max_depth)
+    return _has_transferable_ancestor_direct_v852(self, uid, max_depth=max_depth)
 
 
 def _occupied_action_count(root: str | Path) -> int:

@@ -159,14 +159,22 @@ def install_adaptive_learning_allocation_v819_fixups() -> None:
         if optimizer_service is None:
             return tuple(rows)
         active_by_game = {}
+        lock = getattr(optimizer_service, "_v818_validator_lock", None)
+        acquired = False
         try:
-            with optimizer_service._v818_validator_lock:
+            acquired = bool(lock is not None and lock.acquire(blocking=False))
+            if acquired:
                 for game, game_queue in optimizer_service._v818_game_queues.items():
                     # Queue.unfinished_tasks remains positive while a candidate is
                     # actively validating, so no separate always-alive thread test
                     # is needed and idle validators do not look active forever.
                     active_by_game[str(game)] = bool(game_queue.unfinished_tasks > 0)
         except BaseException:
+            return tuple(rows)
+        finally:
+            if acquired:
+                lock.release()
+        if not acquired:
             return tuple(rows)
         return tuple(
             replace(

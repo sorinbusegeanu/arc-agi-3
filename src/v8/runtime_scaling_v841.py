@@ -14,7 +14,7 @@ from pathlib import Path
 _INSTALLED = False
 _DEFERRED_INTERVAL_SECONDS = 0.05
 _DEFERRED_TIME_BUDGET_SECONDS = 0.025
-_DEFERRED_CHUNK_SIZE = 16
+_DEFERRED_CHUNK_SIZE = 1
 _OPTIMIZER_OVERFLOW_PER_GAME = 256
 _OPTIMIZER_DISPATCH_INTERVAL_SECONDS = 0.02
 
@@ -212,7 +212,11 @@ class _AdaptiveDeferredRetryWorker:
         remaining = len(pending)
         deadline = time.perf_counter() + _DEFERRED_TIME_BUDGET_SECONDS
         examined = resolved = 0
-        while remaining > 0 and time.perf_counter() < deadline:
+        while (
+            remaining > 0
+            and not self._stop.is_set()
+            and time.perf_counter() < deadline
+        ):
             count, good = v839._retry_deferred_batch(
                 self.runtime, limit=min(_DEFERRED_CHUNK_SIZE, remaining)
             )

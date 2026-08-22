@@ -19,6 +19,7 @@ import gc
 import os
 import threading
 import time
+import types
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -30,6 +31,7 @@ _INSTALLED = False
 _BASE_LIFECYCLE_ITERATION = None
 _BASE_REFRESH_VARIANTS = None
 _BASE_ENV_AVAILABLE = None
+_BASE_ENV_INIT = None
 _BASE_REFRESH_EVENTS = None
 _BASE_ACTOR_GRAPH_CHECK = None
 _BASE_ADAPTIVE_WORKER = None
@@ -114,6 +116,42 @@ def _env_available_v854(env):
     return result
 
 
+def _spread_fi01_v854(game) -> None:
+    """Preserve fi01 fire semantics without adding duplicate sprites per cell."""
+    level = game.current_level
+    fires = tuple(level.get_sprites_by_tag("fire"))
+    if not fires:
+        return
+    width, height = level.grid_size
+    additions: set[tuple[int, int]] = set()
+    blocked = {"wall", "fire", "break_tile", "goal"}
+    for fire in fires:
+        for dx, dy in ((0, -1), (0, 1), (-1, 0), (1, 0)):
+            nx, ny = int(fire.x) + dx, int(fire.y) + dy
+            if not (0 <= nx < int(width) and 0 <= ny < int(height)):
+                continue
+            if (nx, ny) in additions:
+                continue
+            sprite = level.get_sprite_at(nx, ny, ignore_collidable=True)
+            if sprite is not None and blocked.intersection(sprite.tags):
+                continue
+            additions.add((nx, ny))
+    template = fires[0]
+    for nx, ny in additions:
+        level.add_sprite(template.clone().set_position(nx, ny))
+
+
+def _env_init_v854(self, *args, **kwargs) -> None:
+    _BASE_ENV_INIT(self, *args, **kwargs)
+    game_id = str(kwargs.get("game_id", ""))
+    if not game_id:
+        game_id = str(getattr(getattr(self.env, "environment_info", None), "game_id", ""))
+    game = getattr(self.env, "_game", None)
+    if game_id == "fi01" and game is not None and hasattr(game, "_spread"):
+        game._v854_original_spread = game._spread
+        game._spread = types.MethodType(_spread_fi01_v854, game)
+
+
 def _changed_v854(before, after) -> bool:
     """Exact grid change test without allocating a full temporary boolean grid."""
     import numpy as np
@@ -160,8 +198,23 @@ def _prune_consumed_action_event_files_v854() -> int:
     for path in tuple(root.glob("actor-*.jsonl")):
         key = str(path)
         try:
-            size = int(path.stat().st_size)
+            stat = path.stat()
+            size = int(stat.st_size)
         except OSError:
+            continue
+        # Actor event streams are process-local telemetry, not canonical memory.
+        # A new controller must not spend many reporting intervals replaying dead
+        # streams merely to rediscover action-space shape. Current actors publish
+        # that shape in their first delta. Remove files that unambiguously predate
+        # this controller before considering saved offsets or PID reuse.
+        stale_run = float(stat.st_mtime) < float(report._RUN_STARTED_AT)
+        if stale_run:
+            try:
+                path.unlink()
+            except OSError:
+                continue
+            report._FILE_OFFSETS.pop(key, None)
+            removed += 1
             continue
         if int(report._FILE_OFFSETS.get(key, 0)) < size:
             continue
@@ -178,6 +231,9 @@ def _prune_consumed_action_event_files_v854() -> int:
 
 
 def _refresh_events_v854(*, force: bool = False) -> None:
+    # Clear stale-run streams before the bounded reader chooses its round-robin
+    # cursor, otherwise hundreds of dead actor files delay current-run telemetry.
+    _prune_consumed_action_event_files_v854()
     _BASE_REFRESH_EVENTS(force=force)
     _prune_consumed_action_event_files_v854()
 
@@ -565,7 +621,7 @@ def _actor_graph_check_v854(
 def install_performance_memory_v854() -> None:
     global _INSTALLED
     global _BASE_LIFECYCLE_ITERATION, _BASE_REFRESH_VARIANTS
-    global _BASE_ENV_AVAILABLE, _BASE_REFRESH_EVENTS, _BASE_ACTOR_GRAPH_CHECK
+    global _BASE_ENV_INIT, _BASE_ENV_AVAILABLE, _BASE_REFRESH_EVENTS, _BASE_ACTOR_GRAPH_CHECK
     global _BASE_ADAPTIVE_WORKER, _BASE_OVERFLOW_INIT, _BASE_OVERFLOW_SUBMIT
     global _BASE_HYPOTHESIS_STATUS_LINE
     if _INSTALLED:
@@ -588,6 +644,8 @@ def install_performance_memory_v854() -> None:
     _BASE_REFRESH_VARIANTS = optimizer._refresh_view_variants
     optimizer._refresh_view_variants = _refresh_view_variants_v854
 
+    _BASE_ENV_INIT = ArcGridEnvironment.__init__
+    ArcGridEnvironment.__init__ = _env_init_v854
     _BASE_ENV_AVAILABLE = report._BASE_ENV_AVAILABLE
     ArcGridEnvironment.available_actions = _env_available_v854
     report._changed = _changed_v854

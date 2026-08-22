@@ -768,6 +768,27 @@ class AdaptiveLearningCoordinator:
         *,
         optimizer_service=None,
     ) -> tuple[GameLearningTelemetrySnapshot, ...]:
+        optimizer_activity: dict[str, bool] = {}
+        if optimizer_service is not None:
+            lock = getattr(optimizer_service, "_v818_validator_lock", None)
+            acquired = False
+            try:
+                acquired = bool(lock is not None and lock.acquire(blocking=False))
+                if acquired:
+                    queues = dict(getattr(optimizer_service, "_v818_game_queues", {}))
+                    threads = dict(getattr(optimizer_service, "_v818_validator_threads", {}))
+                    for game in set(queues) | set(threads):
+                        q = queues.get(game)
+                        thread = threads.get(game)
+                        optimizer_activity[str(game)] = bool(
+                            (q is not None and q.unfinished_tasks > 0)
+                            or (thread is not None and thread.is_alive())
+                        )
+            except BaseException:
+                optimizer_activity = {}
+            finally:
+                if acquired:
+                    lock.release()
         with self._lock:
             games = tuple(sorted(self._games))
             total = max(1, self.total_sample_steps())
@@ -785,18 +806,7 @@ class AdaptiveLearningCoordinator:
                     reliability = float(winner.reliability)
                     source = winner.source.value
                     version = self.frontier.version(scope)
-                optimizer_active = False
-                if optimizer_service is not None:
-                    try:
-                        with optimizer_service._v818_validator_lock:
-                            q = optimizer_service._v818_game_queues.get(game)
-                            thread = optimizer_service._v818_validator_threads.get(game)
-                            optimizer_active = bool(
-                                (q is not None and q.unfinished_tasks > 0)
-                                or (thread is not None and thread.is_alive())
-                            )
-                    except BaseException:
-                        optimizer_active = False
+                optimizer_active = bool(optimizer_activity.get(game, False))
                 result.append(
                     GameLearningTelemetrySnapshot(
                         game,
