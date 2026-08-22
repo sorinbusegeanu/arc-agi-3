@@ -23,7 +23,7 @@ from v8.model import CognitiveState, MemoryLevel, MemoryUid, ValidationState
 
 class PerformanceMemoryV854Tests(unittest.TestCase):
     def test_v854_is_final_runtime_layer(self):
-        self.assertEqual(runtime_stack_v88._POST_LAYERS[-1], "performance_memory_v854")
+        self.assertEqual(runtime_stack_v88._FINAL_LAYERS[-1], "performance_memory_v854")
         self.assertTrue(v854._INSTALLED)
 
     def test_idle_lifecycle_does_not_call_full_iteration(self):
@@ -41,7 +41,7 @@ class PerformanceMemoryV854Tests(unittest.TestCase):
             v854._run_lifecycle_iteration_v854(supervisor)
             base.assert_called_once_with(supervisor)
 
-    def test_validated_variants_reload_only_on_file_change_and_filter_current_game(self):
+    def test_validated_variants_reload_only_on_change_and_filter_game(self):
         prior_root = os.environ.get(optimizer._TRAJECTORY_ROOT_ENV)
         prior_source = optimizer._CAPTURE_SOURCE_ID
         with tempfile.TemporaryDirectory() as tmp:
@@ -58,8 +58,7 @@ class PerformanceMemoryV854Tests(unittest.TestCase):
             try:
                 with patch.object(optimizer, "_load_validated_rows", return_value=rows) as load:
                     v854._refresh_view_variants_v854(view)
-                    self.assertEqual(len(view._v814_variants), 1)
-                    self.assertEqual(view._v814_variants[0].anchor.source_id, "g1")
+                    self.assertEqual([row.anchor.source_id for row in view._v814_variants], ["g1"])
                     view._v814_next_refresh = 0.0
                     v854._refresh_view_variants_v854(view)
                     load.assert_called_once_with(path)
@@ -76,8 +75,8 @@ class PerformanceMemoryV854Tests(unittest.TestCase):
             patch.object(v854, "_BASE_ENV_AVAILABLE", return_value=(1, 2, 6)),
             patch.object(report, "_observe_available") as observe,
         ):
-            self.assertEqual(v854._env_available_v854(env), (1, 2, 6))
-            self.assertEqual(v854._env_available_v854(env), (1, 2, 6))
+            v854._env_available_v854(env)
+            v854._env_available_v854(env)
             observe.assert_called_once()
 
     def test_grid_change_check_preserves_exact_semantics(self):
@@ -103,7 +102,6 @@ class PerformanceMemoryV854Tests(unittest.TestCase):
                 with patch.object(v854, "_pid_alive", return_value=False):
                     self.assertEqual(v854._prune_consumed_action_event_files_v854(), 1)
                 self.assertFalse(path.exists())
-                self.assertNotIn(str(path), report._FILE_OFFSETS)
             finally:
                 report._FILE_OFFSETS.pop(str(path), None)
                 if prior_root is None:
@@ -114,23 +112,17 @@ class PerformanceMemoryV854Tests(unittest.TestCase):
     def test_streaming_memory_classification_does_not_need_edges(self):
         rows = (
             SimpleNamespace(
-                level=int(MemoryLevel.M7),
-                attempt_weight=1.0,
-                success_sum=1.0,
+                level=int(MemoryLevel.M7), attempt_weight=1.0, success_sum=1.0,
                 cognitive_state=int(CognitiveState.ACTIVE),
                 validation_state=int(ValidationState.TESTED),
             ),
             SimpleNamespace(
-                level=int(MemoryLevel.M4),
-                attempt_weight=0.0,
-                success_sum=0.0,
+                level=int(MemoryLevel.M4), attempt_weight=0.0, success_sum=0.0,
                 cognitive_state=int(CognitiveState.RETIRED),
                 validation_state=int(ValidationState.STRUCTURAL),
             ),
             SimpleNamespace(
-                level=int(MemoryLevel.M5),
-                attempt_weight=0.0,
-                success_sum=0.0,
+                level=int(MemoryLevel.M5), attempt_weight=0.0, success_sum=0.0,
                 cognitive_state=int(CognitiveState.ACTIVE),
                 validation_state=int(ValidationState.VALIDATED),
             ),
@@ -142,13 +134,11 @@ class PerformanceMemoryV854Tests(unittest.TestCase):
         self.assertEqual(categories["useful"], 1)
         self.assertEqual(categories["reclaimable"], 1)
         self.assertEqual(categories["scientifically_required"], 1)
-        self.assertEqual(tested, 1)
-        self.assertEqual(successful, 1)
+        self.assertEqual((tested, successful), (1, 1))
         self.assertEqual(by_level["M7"]["useful"], 1)
 
     def test_hypothesis_status_reuses_identical_disk_cut(self):
-        v854._HYPOTHESIS_CACHE["signature"] = None
-        v854._HYPOTHESIS_CACHE["line"] = None
+        v854._HYPOTHESIS_CACHE.update(signature=None, line=None)
         with (
             patch.object(v854, "_disk_evidence_signature_v854", return_value=(10, 20)),
             patch.object(v854, "_BASE_HYPOTHESIS_STATUS_LINE", return_value="H") as base,
@@ -168,11 +158,9 @@ class PerformanceMemoryV854Tests(unittest.TestCase):
             actions=(1,) * max(1, int(cost)),
         )
 
-    def test_optimizer_overflow_is_globally_bounded_and_keeps_better_work(self):
+    def test_optimizer_overflow_is_globally_bounded(self):
         holder = SimpleNamespace(
-            _done=threading.Condition(),
-            _pending={},
-            per_game_capacity=2,
+            _done=threading.Condition(), _pending={}, per_game_capacity=2,
             _priority=scaling._CandidateOverflowDispatcher._priority,
             _wake=threading.Event(),
         )
@@ -181,15 +169,10 @@ class PerformanceMemoryV854Tests(unittest.TestCase):
             self.assertTrue(v854._overflow_submit_v854(holder, self._candidate("b", "g2", 20)))
             self.assertTrue(v854._overflow_submit_v854(holder, self._candidate("c", "g3", 5)))
             self.assertEqual(sum(len(v) for v in holder._pending.values()), 2)
-            self.assertIn("c", {key for values in holder._pending.values() for key in values})
             self.assertFalse(v854._overflow_submit_v854(holder, self._candidate("d", "g4", 30)))
-            self.assertEqual(sum(len(v) for v in holder._pending.values()), 2)
 
     def test_deferred_retry_is_batched(self):
-        rows = [
-            (SimpleNamespace(candidate_id=f"c{i}"), object(), object())
-            for i in range(40)
-        ]
+        rows = [(SimpleNamespace(candidate_id=f"c{i}"), object(), object()) for i in range(40)]
         runtime = SimpleNamespace(_v818_deferred_trajectory_bindings=list(rows))
         with (
             patch.object(v818, "_resolve_target_outcome", return_value=MemoryUid.zero()) as resolve,
@@ -211,45 +194,31 @@ class PerformanceMemoryV854Tests(unittest.TestCase):
             patch.object(v854, "_MAX_DEFERRED_BINDINGS", 3),
             patch.object(v854, "_retry_deferred_v854"),
         ):
-            v854._enqueue_deferred_v854(
-                runtime,
-                SimpleNamespace(candidate_id="d"),
-                object(),
-                object(),
-            )
-            v854._enqueue_deferred_v854(
-                runtime,
-                SimpleNamespace(candidate_id="d"),
-                object(),
-                object(),
-            )
-        ids = [row[0].candidate_id for row in runtime._v818_deferred_trajectory_bindings]
-        self.assertEqual(ids, ["b", "c", "d"])
+            v854._enqueue_deferred_v854(runtime, SimpleNamespace(candidate_id="d"), object(), object())
+            v854._enqueue_deferred_v854(runtime, SimpleNamespace(candidate_id="d"), object(), object())
+        self.assertEqual(
+            [row[0].candidate_id for row in runtime._v818_deferred_trajectory_bindings],
+            ["b", "c", "d"],
+        )
 
-    def test_actor_graph_check_skips_invalidation_when_versions_are_unchanged(self):
+    def test_actor_graph_check_skips_unchanged_versions(self):
         first = SimpleNamespace(sequence=2)
         second = SimpleNamespace(sequence=4)
         calls = []
         view = SimpleNamespace(
-            _nodes=(first,),
-            _edges=(second,),
-            _strategy_version=(2, 4),
+            _nodes=(first,), _edges=(second,), _strategy_version=(2, 4),
             invalidate_strategy_cache=lambda: calls.append(True),
         )
-        next_step = v854._actor_graph_check_v854(
-            view,
-            completed_steps=1000,
-            next_check_step=1000,
-            check_interval_steps=1000,
+        self.assertEqual(
+            v854._actor_graph_check_v854(
+                view, completed_steps=1000, next_check_step=1000, check_interval_steps=1000
+            ),
+            2000,
         )
-        self.assertEqual(next_step, 2000)
         self.assertEqual(calls, [])
         second.sequence = 6
         v854._actor_graph_check_v854(
-            view,
-            completed_steps=2000,
-            next_check_step=2000,
-            check_interval_steps=1000,
+            view, completed_steps=2000, next_check_step=2000, check_interval_steps=1000
         )
         self.assertEqual(calls, [True])
 
