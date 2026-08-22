@@ -65,8 +65,24 @@ class PerformanceMemoryV854Tests(unittest.TestCase):
         self.assertEqual(len(positions), len(set(positions)))
 
     def test_fi01_environment_installs_bounded_spread(self):
-        env = ArcGridEnvironment(game_id="fi01")
-        game = env.env._game
+        # The public ARC catalog is mutable, so exercise the installer against a
+        # synthetic adapter shell rather than requiring fi01 to be online in CI.
+        class Game:
+            def _spread(self):
+                return None
+
+        game = Game()
+        target = object.__new__(ArcGridEnvironment)
+
+        def base_init(env, *args, **kwargs):
+            del args, kwargs
+            env.env = SimpleNamespace(
+                _game=game,
+                environment_info=SimpleNamespace(game_id="fi01"),
+            )
+
+        with patch.object(v854, "_BASE_ENV_INIT", side_effect=base_init):
+            v854._env_init_v854(target, game_id="fi01")
         self.assertIs(game._spread.__func__, v854._spread_fi01_v854)
         self.assertTrue(hasattr(game, "_v854_original_spread"))
 
