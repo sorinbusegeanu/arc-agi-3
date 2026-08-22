@@ -6,6 +6,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
@@ -201,6 +202,16 @@ class ActionLearningAggregationTests(unittest.TestCase):
         mixed = next(row for row in payload["games"] if row["game_id"] == "mixed")
         self.assertEqual(mixed["exact_click_targets_tested"], 3)
         self.assertEqual(mixed["unique_productive_click_targets"], 2)
+
+    def test_snapshot_refreshes_actor_events_once_for_all_games(self):
+        coordinator = AdaptiveLearningCoordinator()
+        coordinator.register_games(tuple(f"game-{index}" for index in range(36)))
+
+        with patch.object(report, "_refresh_events") as refresh_events:
+            payload = report.action_learning_snapshot_v849(coordinator)
+
+        self.assertEqual(len(payload["games"]), 36)
+        refresh_events.assert_called_once_with(force=True)
 
     def test_action_learning_log_contains_per_game_blocker_metrics(self):
         coordinator = AdaptiveLearningCoordinator()

@@ -398,9 +398,14 @@ def _refresh_events(*, force: bool = False) -> None:
                 continue
 
 
-def _probe_game_action_space_v849(game_id: str):
+def _probe_game_action_space_v849(
+    game_id: str,
+    *,
+    refresh_events: bool = True,
+):
     """Non-invasive replacement for v8.48's environment-construction probe."""
-    _refresh_events()
+    if refresh_events:
+        _refresh_events()
     row = _SPACE.get(str(game_id))
     if row is None:
         return None
@@ -410,8 +415,14 @@ def _probe_game_action_space_v849(game_id: str):
     return 6 in native, max(1, int(row["max_branching"]))
 
 
-def _click_complexity_multiplier_v849(coordinator, game_id: str) -> float:
-    _refresh_events()
+def _click_complexity_multiplier_v849(
+    coordinator,
+    game_id: str,
+    *,
+    refresh_events: bool = True,
+) -> float:
+    if refresh_events:
+        _refresh_events()
     game = str(game_id)
     measured = None
     with coordinator._lock:
@@ -419,7 +430,7 @@ def _click_complexity_multiplier_v849(coordinator, game_id: str) -> float:
         if prior is not None:
             measured = prior
     if measured is None:
-        measured = _probe_game_action_space_v849(game)
+        measured = _probe_game_action_space_v849(game, refresh_events=False)
     if not measured or not bool(measured[0]):
         return 1.0
 
@@ -495,10 +506,16 @@ def _frontier_metrics(game_id: str) -> dict[str, int]:
     return result
 
 
-def _game_row(coordinator, game_id: str) -> dict[str, object]:
+def _game_row(
+    coordinator,
+    game_id: str,
+    *,
+    refresh_events: bool = True,
+) -> dict[str, object]:
     from v8 import plateau_progress_v846 as progress
 
-    _refresh_events(force=True)
+    if refresh_events:
+        _refresh_events(force=True)
     game = str(game_id)
     run = _RUN.get(game, _empty_aggregate())
     space = _SPACE.get(game, run)
@@ -565,7 +582,13 @@ def _game_row(coordinator, game_id: str) -> dict[str, object]:
         "mixed_sequences_level_advancing": int(run["mixed_sequences_level_advancing"]),
         "allocation_steps": allocation_steps,
         "allocation_share": float(allocation_steps) / float(total_steps),
-        "click_complexity_multiplier": float(_click_complexity_multiplier_v849(coordinator, game)),
+        "click_complexity_multiplier": float(
+            _click_complexity_multiplier_v849(
+                coordinator,
+                game,
+                refresh_events=False,
+            )
+        ),
     }
     row.update(_frontier_metrics(game))
     return row
@@ -574,7 +597,10 @@ def _game_row(coordinator, game_id: str) -> dict[str, object]:
 def action_learning_snapshot_v849(coordinator) -> dict[str, object]:
     _refresh_events(force=True)
     games = tuple(sorted(getattr(coordinator, "_games", ())))
-    rows = [_game_row(coordinator, game) for game in games]
+    rows = [
+        _game_row(coordinator, game, refresh_events=False)
+        for game in games
+    ]
     click_capable = [row for row in rows if row["action_space_type"] in {"click", "mixed"}]
     click_only = [row for row in rows if row["action_space_type"] == "click"]
     mixed = [row for row in rows if row["action_space_type"] == "mixed"]

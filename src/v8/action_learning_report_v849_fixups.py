@@ -86,10 +86,19 @@ def _merge_event_fix(target, raw) -> None:
         values.update(int(value) for value in raw.get("productive_click_targets", ()))
 
 
-def _game_row_fix(coordinator, game_id: str) -> dict[str, object]:
+def _game_row_fix(
+    coordinator,
+    game_id: str,
+    *,
+    refresh_events: bool = True,
+) -> dict[str, object]:
     from v8 import action_learning_report_v849 as report
 
-    row = _BASE_GAME_ROW(coordinator, game_id)
+    row = _BASE_GAME_ROW(
+        coordinator,
+        game_id,
+        refresh_events=refresh_events,
+    )
     run = report._RUN.get(str(game_id), {})
     exact = run.get("exact_click_targets_tested", set())
     productive = run.get("productive_click_targets", set())
@@ -125,16 +134,25 @@ def _snapshot_fix(coordinator) -> dict[str, object]:
     return payload
 
 
-def _complexity_multiplier_fix(coordinator, game_id: str) -> float:
+def _complexity_multiplier_fix(
+    coordinator,
+    game_id: str,
+    *,
+    refresh_events: bool = True,
+) -> float:
     from v8 import action_learning_report_v849 as report
 
-    report._refresh_events()
+    if refresh_events:
+        report._refresh_events()
     game = str(game_id)
     with coordinator._lock:
         coordinator_spaces = dict(getattr(coordinator, "_v848_action_spaces", {}))
     measured = coordinator_spaces.get(game)
     if measured is None:
-        measured = report._probe_game_action_space_v849(game)
+        measured = report._probe_game_action_space_v849(
+            game,
+            refresh_events=False,
+        )
     if not measured or not bool(measured[0]):
         return 1.0
 
