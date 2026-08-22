@@ -40,6 +40,7 @@ class LearningEffectivenessReportTests(unittest.TestCase):
                 "generation": 17,
                 "watermark": 1234,
                 "_v814_trajectory_optimizer": None,
+                "_v850_total_step_budget": 300,
             },
         )()
 
@@ -162,7 +163,7 @@ class LearningEffectivenessReportTests(unittest.TestCase):
             "NOT_MEASURED_NO_ABLATION",
         )
 
-    def test_compact_stdout_contains_effectiveness_ratios_only(self):
+    def test_compact_stdout_prefixes_consumed_step_budget(self):
         coordinator = self._coordinator()
         action_report._RUN["transfer-game"] = action_report._empty_aggregate()
         action_report._RUN["transfer-game"]["movement_actions_executed"] = 100
@@ -173,13 +174,31 @@ class LearningEffectivenessReportTests(unittest.TestCase):
         payload = report.learning_effectiveness_snapshot_v850(
             self._runtime(), coordinator, self._completed(), {}, {}
         )
-        line = report.format_learning_effectiveness_stdout_v850(payload)
+        line = report.format_learning_effectiveness_stdout_v850(
+            payload,
+            budget_consumed_pct=50.0,
+        )
         self.assertEqual(
             line,
-            "effectiveness L=50.0% G=50.0% M7=53.3% M7eff=50.0% "
+            "50% - effectiveness L=50.0% G=50.0% M7=53.3% M7eff=50.0% "
             "Xfer=100.0% Opt=70.0% Prod=53.3% step/L=50 firstWin=80",
         )
         self.assertNotIn("current_run_", line)
+
+    def test_actor_job_wrapper_captures_requested_step_budget(self):
+        runtime = type("Runtime", (), {})()
+        jobs = (
+            type("Job", (), {"steps": 100})(),
+            type("Job", (), {"steps": 250})(),
+        )
+        base = report._BASE_RUN_ACTOR_JOBS
+        try:
+            report._BASE_RUN_ACTOR_JOBS = lambda runtime, jobs, **kwargs: tuple(jobs)
+            result = report._run_actor_jobs_v850(runtime, jobs)
+        finally:
+            report._BASE_RUN_ACTOR_JOBS = base
+        self.assertEqual(runtime._v850_total_step_budget, 350)
+        self.assertEqual(result, jobs)
 
     def test_old_current_run_stdout_is_suppressed_but_sampling_done_is_preserved(self):
         calls = []
@@ -195,7 +214,7 @@ class LearningEffectivenessReportTests(unittest.TestCase):
             report._BASE_REPORTER_EMIT_LINE = base
         self.assertEqual(calls, ["sampling done"])
 
-    def test_log_is_jsonl_summary_only_and_write_emits_one_effectiveness_line(self):
+    def test_log_is_jsonl_summary_only_and_write_emits_budgeted_effectiveness_line(self):
         coordinator = self._coordinator()
         completed = {
             "transfer-game": {
@@ -222,7 +241,7 @@ class LearningEffectivenessReportTests(unittest.TestCase):
         self.assertNotIn("games", payload)
         self.assertNotIn("hypotheses", payload)
         stdout = output.getvalue().strip()
-        self.assertIn("effectiveness L=", stdout)
+        self.assertIn("7% - effectiveness L=", stdout)
         self.assertNotIn("current_run_", stdout)
 
 
