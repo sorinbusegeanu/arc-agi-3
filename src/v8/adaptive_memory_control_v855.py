@@ -72,8 +72,6 @@ def adaptive_m7_probability_v855(
     if progress_replay and not probationary:
         memory = max(memory, min(1.0 - floor, 0.85))
 
-    # Repeated no-progress evidence backs memory off even when an old reliability
-    # estimate remains high. The hard floor is reapplied after the reduction.
     if failures:
         memory *= 1.0 / (1.0 + 0.25 * failures)
 
@@ -133,8 +131,6 @@ def _same_world(view, strategy_uid, game_hash: int) -> bool:
         games = set(int(value) for value in view.source_games(strategy_uid))
     except (AttributeError, TypeError, ValueError):
         games = set()
-    # Unknown provenance is not treated as foreign. Explicitly foreign-only M7 is
-    # left to the existing TRANSFER mode and its target-scoped validation policy.
     return not games or int(game_hash) in games
 
 
@@ -179,6 +175,7 @@ def _exact_m7_candidates(view, context_signature: int, action_ids, **kwargs):
 
 
 def _plan_chain_v855(self, context_signature, action_ids, **kwargs):
+    """Arbitrate M7 against exploration in non-MEMORY DISCOVERY portfolio slots."""
     from v8 import adaptive_learning_allocation_v819 as v819
     from v8 import sampling_portfolio_v831 as portfolio
     from v8 import sampling_progress_control_v829 as v829
@@ -203,15 +200,15 @@ def _plan_chain_v855(self, context_signature, action_ids, **kwargs):
     state = v829._state_key(context_signature)
     progress_action = None if state is None else v829._PROGRESS_ACTION.get(state)
     if progress_action in available:
-        # Proven progress replay remains authoritative; adaptive M7 must not displace
-        # a directly observed successful action for this exact state.
         v829._set_selection(context_signature, "PROGRESS_REPLAY", (progress_action,))
         return ()
 
     portfolio_mode = str(getattr(portfolio._PORTFOLIO_STATE, "mode", "MEMORY"))
+    if portfolio_mode == "MEMORY":
+        # Keep the historical MEMORY path intact. v8.55 only opens additional
+        # arbitration opportunities in slots that previously hard-blocked M7.
+        return _BASE_PLAN_CHAIN(self, context_signature, available, **kwargs)
     if portfolio_mode == "RANDOM":
-        # Existing unconditional random portfolio slots remain a hard exploration
-        # channel independent of learned-memory confidence.
         return ()
 
     stats = _stats(game)
@@ -253,15 +250,11 @@ def _plan_chain_v855(self, context_signature, action_ids, **kwargs):
             0,
             int(v829._NO_PROGRESS.get((*state, int(top.action_id)), 0)),
         )
-    historical_progress = bool(
-        state is not None and v829._PROGRESS_ACTION.get(state) == int(top.action_id)
-    )
     decision = adaptive_m7_probability_v855(
         reliability=reliability,
         warm=warm,
         failures=failures,
         probationary=probationary,
-        progress_replay=historical_progress,
     )
     stats["eligible"] += 1.0
     stats["last_floor"] = float(decision.exploration_floor)
@@ -299,11 +292,15 @@ def install_adaptive_memory_control_v855() -> None:
     if _INSTALLED:
         return
 
-    from v8 import learning_performance_repair_v824 as v824
+    from v8 import sampling_portfolio_v831 as portfolio
+    from v8 import sampling_progress_control_v829 as v829
 
-    # v824 is the public planner wrapper. Later layers v8.29/v8.31/v8.54 compose
-    # through this delegate, so inserting here relaxes only the DISCOVERY hard gate
-    # while keeping those historical public function identities unchanged.
-    _BASE_PLAN_CHAIN = v824._BASE_PLAN_CHAIN
-    v824._BASE_PLAN_CHAIN = _plan_chain_v855
+    # Preserve the historical delegate identities asserted by v8.29/v8.31:
+    # v824 -> v829 and v829 -> portfolio._plan_chain_v831. Rebind the portfolio
+    # symbol and its v829 delegate together, while retaining the old v831 function
+    # as our base. This inserts arbitration exactly where v831 previously returned
+    # an unconditional empty plan for non-MEMORY slots.
+    _BASE_PLAN_CHAIN = portfolio._plan_chain_v831
+    portfolio._plan_chain_v831 = _plan_chain_v855
+    v829._BASE_PLAN_CHAIN = portfolio._plan_chain_v831
     _INSTALLED = True
