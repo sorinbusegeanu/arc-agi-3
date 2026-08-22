@@ -132,6 +132,18 @@ class DiskBackedEvidenceLedger:
             )
         return tuple(self._decode(raw) for raw in payloads)
 
+    def truncate_after(self, watermark: int) -> int:
+        """Roll evidence back to the graph's restored recovery watermark."""
+        limit = max(0, int(watermark))
+        with self._lock:
+            cursor = self._db.execute(
+                "DELETE FROM evidence WHERE available>? OR decision>?",
+                (limit, limit),
+            )
+            removed = max(0, int(cursor.rowcount))
+            self._db.commit()
+        return removed
+
     def protected_uids(self) -> set[MemoryUid]:
         zero = MemoryUid.zero().hex()
         with self._lock:
