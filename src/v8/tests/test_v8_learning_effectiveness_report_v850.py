@@ -125,7 +125,7 @@ class LearningEffectivenessReportTests(unittest.TestCase):
         self.assertIs(report._BASE_WRITE_ALLOCATION_LOG, action_report._write_allocation_log_v849)
         self.assertIs(reporter._emit_line, report._reporter_emit_line_v850)
 
-    def test_snapshot_uses_one_current_run_scope_and_validated_strategy_rates(self):
+    def test_snapshot_separates_current_run_and_retained_validation_scopes(self):
         coordinator = self._coordinator()
         self._action_fixture()
 
@@ -133,7 +133,11 @@ class LearningEffectivenessReportTests(unittest.TestCase):
             self._runtime(), coordinator, self._completed(), {}, {}
         )
         self.assertEqual(payload["schema_version"], 3)
-        self.assertEqual(payload["scope"]["kind"], "CURRENT_RUN")
+        self.assertEqual(payload["scope"]["outcomes_and_actions"], "CURRENT_RUN")
+        self.assertEqual(
+            payload["scope"]["strategy_validation"],
+            "CURRENT_FRONTIER_RETAINED_EVIDENCE",
+        )
         self.assertEqual(payload["scope"]["steps"], 150)
         self.assertNotIn("games", payload)
 
@@ -248,24 +252,33 @@ class LearningEffectivenessReportTests(unittest.TestCase):
         self.assertEqual(runtime._v850_total_step_budget, 350)
         self.assertEqual(result, jobs)
 
-    def test_legacy_periodic_progress_is_suppressed_but_sampling_done_is_preserved(self):
+    def test_lightweight_periodic_progress_is_queue_only(self):
         rows = (
             ActorProgress(1, "a", 40, 1, 0, 2, planned_steps=30),
             ActorProgress(2, "b", 20, 0, 0, 0, planned_steps=0),
         )
         line = report._periodic_progress_line_v850(rows, 120)
-        self.assertIn("current_run_wins=", line)
-        self.assertNotIn("effectiveness", line)
+        self.assertTrue(line.startswith("50% - effectiveness "))
+        self.assertIn("L=20.0%", line)
+        self.assertIn("G=50.0%", line)
+        self.assertIn("M7=50.0%", line)
+        self.assertIn("M7val=-", line)
+        self.assertIn("XferVal=-", line)
+        self.assertIn("step/L=-", line)
 
         calls = []
         base = report._BASE_REPORTER_EMIT_LINE
         try:
-            report._BASE_REPORTER_EMIT_LINE = lambda message, output_queue: calls.append(message)
+            report._BASE_REPORTER_EMIT_LINE = lambda message, output_queue: calls.append(
+                (message, output_queue)
+            )
             report._reporter_emit_line_v850(line, None)
+            marker = object()
+            report._reporter_emit_line_v850(line, marker)
             report._reporter_emit_line_v850("sampling done", None)
         finally:
             report._BASE_REPORTER_EMIT_LINE = base
-        self.assertEqual(calls, ["sampling done"])
+        self.assertEqual(calls, [(line, marker), ("sampling done", None)])
 
     def test_log_is_jsonl_and_same_snapshot_is_emitted_to_stdout(self):
         coordinator = self._coordinator()
