@@ -114,4 +114,5 @@ def install_current_runtime_stack_v88() -> None:
     _installer("adaptive_memory_control_v855_final_fix")()
     _installer("adaptive_memory_transfer_integrity_v856")()
     _installer("adaptive_memory_transfer_integrity_v856_fixups")()
+    _installer("adaptive_memory_transfer_scope_v856")()
     _INSTALLED = True
