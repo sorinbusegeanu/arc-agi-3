@@ -422,8 +422,7 @@ def _trial_v838(self, candidate, execution_seed: int, prefix: tuple[int, ...]):
     env = self._environment(execution_seed, candidate.source.anchor.env_root)
     prefix_executed = 0
     for action in prefix:
-        available = {int(value) for value in env.available_actions()}
-        if int(action) not in available:
+        if not self._action_available(env, int(action)):
             return False, 0, "prefix_action_unavailable", 0, 0, 0, prefix_executed
         env.step(int(action))
         prefix_executed += 1
@@ -438,8 +437,7 @@ def _trial_v838(self, candidate, execution_seed: int, prefix: tuple[int, ...]):
 
     candidate_steps = 0
     for action in candidate.actions:
-        available = {int(value) for value in env.available_actions()}
-        if int(action) not in available:
+        if not self._action_available(env, int(action)):
             return False, candidate_steps, "candidate_action_unavailable", 0, 0, 0, prefix_executed
         before = env.observe()
         context = int(getattr(env, "cognitive_context_signature", lambda: 0)())

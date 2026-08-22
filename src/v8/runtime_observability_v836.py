@@ -259,7 +259,7 @@ def _reporting_worker_v836(
         if now >= next_report:
             rows = tuple(latest[key] for key in sorted(latest))
             reporter._emit_line(
-                reporter.format_budget_game_rate_line(rows, total_steps, baseline),
+                reporter.format_periodic_progress_line(rows, total_steps, baseline),
                 output_queue,
             )
             while next_report <= now:

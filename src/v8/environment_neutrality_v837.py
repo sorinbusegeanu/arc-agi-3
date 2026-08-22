@@ -712,12 +712,26 @@ class _EnvironmentReplayValidator:
     def _target_reached(self, env, source) -> bool:
         return _generic_target_reached(env, source)
 
+    @staticmethod
+    def _action_available(env, action: int) -> bool:
+        token = int(action)
+        if token in {int(value) for value in env.available_actions()}:
+            return True
+        # An adapter may expose a bounded subset for exploration while still
+        # accepting a previously captured concrete action during replay.
+        executable = getattr(env, "cognitive_action_executable", None)
+        if not callable(executable):
+            return False
+        try:
+            return bool(executable(token))
+        except (TypeError, ValueError):
+            return False
+
     def _trial(self, candidate, execution_seed: int, prefix: tuple[int, ...]):
         env = self._environment(execution_seed, candidate.source.anchor.env_root)
         prefix_executed = 0
         for action in prefix:
-            available = {int(value) for value in env.available_actions()}
-            if int(action) not in available:
+            if not self._action_available(env, int(action)):
                 return False, 0, "prefix_action_unavailable", 0, 0, 0, prefix_executed
             env.step(int(action))
             prefix_executed += 1
@@ -728,8 +742,7 @@ class _EnvironmentReplayValidator:
 
         candidate_steps = 0
         for action in candidate.actions:
-            available = {int(value) for value in env.available_actions()}
-            if int(action) not in available:
+            if not self._action_available(env, int(action)):
                 return False, candidate_steps, "candidate_action_unavailable", 0, 0, 0, prefix_executed
             before = env.observe()
             context = _generic_context_signature(env)

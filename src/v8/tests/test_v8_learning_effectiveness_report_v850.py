@@ -12,6 +12,7 @@ from v8 import learning_effectiveness_report_v850 as report
 from v8 import memory_efficiency_v851 as memory_efficiency
 from v8 import lease_dispatch_lifecycle_v843 as v843
 from v8 import reporter
+from v8.actor import ActorProgress
 from v8 import runtime_stack_v88
 from v8.adaptive_learning_allocation_v819 import (
     AdaptiveLearningCoordinator,
@@ -218,6 +219,21 @@ class LearningEffectivenessReportTests(unittest.TestCase):
         finally:
             report._BASE_REPORTER_EMIT_LINE = base
         self.assertEqual(calls, ["sampling done"])
+
+    def test_periodic_actor_progress_uses_compact_effectiveness_format(self):
+        rows = (
+            ActorProgress(1, "a", 40, 1, 0, 2, planned_steps=30),
+            ActorProgress(2, "b", 20, 0, 0, 0, planned_steps=0),
+        )
+
+        line = report._periodic_progress_line_v850(rows, 120)
+
+        self.assertTrue(line.startswith("50% - effectiveness "))
+        self.assertIn("L=20.0%", line)
+        self.assertIn("G=50.0%", line)
+        self.assertIn("M7=50.0%", line)
+        self.assertIn("M7eff=100.0%", line)
+        self.assertIn("step/L=30", line)
 
     def test_log_is_jsonl_summary_only_and_write_emits_budgeted_effectiveness_line(self):
         coordinator = self._coordinator()

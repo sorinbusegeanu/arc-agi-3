@@ -73,6 +73,23 @@ class _GameReplayValidator:
             return state == "WIN"
         return levels >= int(target.levels_completed)
 
+    @staticmethod
+    def _action_available(env, action: int) -> bool:
+        token = int(action)
+        if token in {int(value) for value in env.available_actions()}:
+            return True
+        # Exact-coordinate paging bounds exploration, not the native ACTION6
+        # contract. Captured in-bounds coordinates remain executable in replay.
+        try:
+            from v8 import click_exploration_v848 as click
+
+            return bool(
+                click._is_exact_click_token(token)
+                and click._valid_exact_click(token, env.observe())
+            )
+        except (AttributeError, TypeError, ValueError):
+            return False
+
     def _trial(self, candidate, execution_seed: int, prefix: tuple[int, ...]):
         from v7.environment.encoding import structural_grid_signature, transition_signature
 
@@ -80,8 +97,7 @@ class _GameReplayValidator:
         target = candidate.source.target
         prefix_executed = 0
         for action in prefix:
-            available = {int(value) for value in env.available_actions()}
-            if int(action) not in available:
+            if not self._action_available(env, int(action)):
                 return False, 0, "prefix_action_unavailable", 0, 0, 0, prefix_executed
             env.step(int(action))
             prefix_executed += 1
@@ -93,8 +109,7 @@ class _GameReplayValidator:
 
         candidate_steps = 0
         for action in candidate.actions:
-            available = {int(value) for value in env.available_actions()}
-            if int(action) not in available:
+            if not self._action_available(env, int(action)):
                 return False, candidate_steps, "candidate_action_unavailable", 0, 0, 0, prefix_executed
             before = env.observe()
             context = int(structural_grid_signature(before))

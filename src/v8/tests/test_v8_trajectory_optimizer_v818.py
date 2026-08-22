@@ -27,6 +27,7 @@ from v8.trajectory_optimizer_v814 import (
 )
 from v8 import trajectory_optimizer_v814 as optimizer
 from v8 import trajectory_optimizer_v818 as v818
+from v8.learning_blockers_v055 import pack_action_choice
 
 
 def source(actions, *, seed=1, prefix=(), game="world", level=1, outcome=None):
@@ -154,6 +155,16 @@ class CandidateSchedulingTests(unittest.TestCase):
 
 
 class ValidatorPoolTests(unittest.TestCase):
+    def test_exact_click_is_replayable_outside_current_exploration_page(self) -> None:
+        env = SimpleNamespace(
+            available_actions=lambda: (1, 2, 3, 4),
+            cognitive_action_executable=lambda action: action == exact_click,
+        )
+        exact_click = pack_action_choice(6, 4, 4)
+
+        self.assertTrue(v818._GameReplayValidator._action_available(env, exact_click))
+        self.assertFalse(v818._GameReplayValidator._action_available(env, 5))
+
     def test_validator_pool_is_bounded_to_ten_games(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             service = TrajectoryOptimizationService(Path(root), validator=lambda _candidate: None)

@@ -18,6 +18,7 @@ from pathlib import Path
 _INSTALLED = False
 _BASE_WRITE_ALLOCATION_LOG = None
 _BASE_REPORTER_EMIT_LINE = None
+_BASE_PERIODIC_PROGRESS_LINE = None
 _BASE_RUN_ACTOR_JOBS = None
 _REPORT_FILE = "learning_effectiveness.log"
 _SCHEMA_VERSION = 2
@@ -304,9 +305,47 @@ def _reporter_emit_line_v850(message: str, output_queue) -> None:
     # The dedicated reporter still owns lifecycle messages such as "sampling done",
     # but its old current_run_* competence line is replaced by the effectiveness line
     # emitted from the authoritative 60-second allocation snapshot above.
-    if "current_run_wins=" in str(message):
+    if output_queue is None and "current_run_wins=" in str(message):
         return
     _BASE_REPORTER_EMIT_LINE(message, output_queue)
+
+
+def _periodic_progress_line_v850(rows, total_steps, baseline=None) -> str:
+    """Format live actor progress in the compact v8.50 form every interval."""
+    from v8 import reporter
+
+    values = tuple(rows)
+    base = _BASE_PERIODIC_PROGRESS_LINE(values, total_steps, baseline)
+    match = reporter._PROGRESS_PATTERN.search(base)
+    if match is None:
+        return base
+
+    used_steps = sum(max(0, int(getattr(row, "steps", 0))) for row in values)
+    planned_steps = sum(max(0, int(getattr(row, "planned_steps", 0))) for row in values)
+    m7_share = _pct(planned_steps, used_steps)
+    m7_games = [row for row in values if int(getattr(row, "planned_steps", 0)) > 0]
+    m7_progress_games = sum(
+        1
+        for row in m7_games
+        if int(getattr(row, "levels_completed", 0)) > 0
+        or int(getattr(row, "wins", 0)) > 0
+    )
+    m7_effectiveness = _pct(m7_progress_games, len(m7_games))
+    level_advances = sum(
+        max(0, int(getattr(row, "levels_completed", 0))) for row in values
+    )
+    steps_per_level = (
+        float(used_steps) / float(level_advances) if level_advances > 0 else None
+    )
+    return (
+        f"{base[:match.start()]}effectiveness "
+        f"L={float(match.group('levels')):.1f}% "
+        f"G={float(match.group('wins')):.1f}% "
+        f"M7={m7_share:.1f}% "
+        f"M7eff={m7_effectiveness:.1f}% "
+        "Xfer=- Opt=- Prod=- "
+        f"step/L={_compact_number(steps_per_level)} firstWin=-"
+    )
 
 
 def _write_learning_effectiveness_log(
@@ -365,6 +404,7 @@ def _write_allocation_log_v850(
 
 def install_learning_effectiveness_report_v850() -> None:
     global _INSTALLED, _BASE_WRITE_ALLOCATION_LOG, _BASE_REPORTER_EMIT_LINE
+    global _BASE_PERIODIC_PROGRESS_LINE
     global _BASE_RUN_ACTOR_JOBS
     if _INSTALLED:
         return
@@ -382,6 +422,8 @@ def install_learning_effectiveness_report_v850() -> None:
     # old current_run_* periodic line.
     _BASE_REPORTER_EMIT_LINE = reporter._emit_line
     reporter._emit_line = _reporter_emit_line_v850
+    _BASE_PERIODIC_PROGRESS_LINE = reporter.format_periodic_progress_line
+    reporter.format_periodic_progress_line = _periodic_progress_line_v850
 
     # Capture the original requested interaction budget once at the final actor-job
     # authority so the compact effectiveness line can retain the old progress prefix.

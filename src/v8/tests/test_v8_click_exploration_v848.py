@@ -54,6 +54,39 @@ class CompleteClickCoverageTests(unittest.TestCase):
         self.assertIn(target, exposed)
         self.assertIn(background, exposed)
 
+    def test_real_click_games_expose_one_center_per_selected_cell_color(self):
+        from collections import Counter
+
+        from v7.environment.arc_adapter import ArcGridEnvironment
+        from v8.action_targeting_v810 import native_action_id
+
+        expected = {
+            ("gp01", 0): (2, 4),
+            ("gp01", 1): (5, 60),
+            ("gp02", 0): (2, 4),
+            ("gp02", 1): (11, 60),
+        }
+        for (game_id, seed), (color, count) in expected.items():
+            env = ArcGridEnvironment(game_id=game_id, seed=seed)
+            try:
+                frame = env.observe()
+                clicks = tuple(
+                    action
+                    for action in env.available_actions()
+                    if native_action_id(action) == 6 and v848._is_exact_click_token(action)
+                )
+                decoded = [unpack_action_choice(action)[1] for action in clicks]
+                observed = Counter(int(frame[row["y"], row["x"]]) for row in decoded)
+                self.assertEqual(len(clicks), count)
+                self.assertEqual(observed, Counter({color: count}))
+                self.assertTrue(
+                    all(row["x"] % 8 == 4 and row["y"] % 8 == 4 for row in decoded)
+                )
+            finally:
+                close = getattr(getattr(env, "env", None), "close", None)
+                if callable(close):
+                    close()
+
 
 class TargetSpecificSelectionTests(unittest.TestCase):
     def test_distinct_click_targets_survive_score_grouping(self):

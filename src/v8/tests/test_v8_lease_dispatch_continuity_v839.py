@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 from v8 import actor as actor_module
 from v8 import adaptive_learning_allocation_v819 as v819
 from v8 import lease_dispatch_continuity_v839 as v839
+from v8 import learning_effectiveness_report_v850 as v850
 from v8 import trajectory_optimizer_v818 as v818
 from v8.model import MemoryUid
 from v8.runtime_v82 import V82ContinuousMemoryRuntime
@@ -16,7 +17,8 @@ from v8.runtime_v82 import V82ContinuousMemoryRuntime
 
 class LeaseDispatchContinuityV839Tests(unittest.TestCase):
     def test_final_runtime_hooks_are_installed(self) -> None:
-        self.assertIs(actor_module.run_actor_jobs, v839._run_actor_jobs_v839)
+        self.assertIs(actor_module.run_actor_jobs, v850._run_actor_jobs_v850)
+        self.assertIs(v850._BASE_RUN_ACTOR_JOBS, v839._run_actor_jobs_v839)
         self.assertIs(
             V82ContinuousMemoryRuntime.record_actor_results,
             v839._record_actor_results_v839,

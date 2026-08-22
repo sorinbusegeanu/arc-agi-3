@@ -116,6 +116,8 @@ def _ensure_env_click_state(env) -> None:
         env._v848_click_page_tried = set()
     if not hasattr(env, "_v848_replayable_clicks"):
         env._v848_replayable_clicks = set()
+    if not hasattr(env, "_v848_click_target_color"):
+        env._v848_click_target_color = None
 
 
 def _env_init_v848(self, *args, **kwargs) -> None:
@@ -125,6 +127,80 @@ def _env_init_v848(self, *args, **kwargs) -> None:
     self._v848_click_page = None
     self._v848_click_page_tried = set()
     self._v848_replayable_clicks = set()
+    self._v848_click_target_color = None
+
+
+def _canonical_click_cells(env, grid) -> tuple[tuple[int, int, int], ...]:
+    """Return observable color and one display-space center per visible game cell."""
+    import numpy as np
+
+    array = np.asarray(grid)
+    if array.ndim != 2 or array.size <= 0:
+        return ()
+    wrapper = getattr(env, "env", None)
+    game = getattr(wrapper, "_game", None)
+    camera = getattr(game, "camera", None)
+    level = getattr(game, "current_level", None)
+    grid_size = getattr(level, "grid_size", None)
+    if camera is None or grid_size is None:
+        return ()
+    try:
+        camera_width = int(camera.width)
+        camera_height = int(camera.height)
+        camera_x = int(camera.x)
+        camera_y = int(camera.y)
+        world_width, world_height = (int(grid_size[0]), int(grid_size[1]))
+    except (AttributeError, TypeError, ValueError, IndexError):
+        return ()
+    if min(camera_width, camera_height, world_width, world_height) <= 0:
+        return ()
+
+    height, width = (int(array.shape[0]), int(array.shape[1]))
+    scale = min(width // camera_width, height // camera_height)
+    if scale <= 0:
+        return ()
+    x_padding = (width - camera_width * scale) // 2
+    y_padding = (height - camera_height * scale) // 2
+    rows = []
+    for world_y in range(max(0, camera_y), min(world_height, camera_y + camera_height)):
+        for world_x in range(max(0, camera_x), min(world_width, camera_x + camera_width)):
+            display_x = x_padding + (world_x - camera_x) * scale + scale // 2
+            display_y = y_padding + (world_y - camera_y) * scale + scale // 2
+            if 0 <= display_x < width and 0 <= display_y < height:
+                rows.append((int(array[display_y, display_x]), display_x, display_y))
+    return tuple(rows)
+
+
+def _canonical_click_tokens(env, grid) -> tuple[int, ...]:
+    from v8.learning_blockers_v055 import pack_action_choice
+
+    rows = _canonical_click_cells(env, grid)
+    if not rows:
+        return ()
+    colors = tuple(sorted({int(color) for color, _x, _y in rows}))
+    selected = getattr(env, "_v848_click_target_color", None)
+    if selected not in colors:
+        selected = int(colors[int(env._v848_click_seed) % len(colors)])
+        env._v848_click_target_color = selected
+    return tuple(
+        pack_action_choice(6, int(x), int(y))
+        for color, x, y in rows
+        if int(color) == int(selected)
+    )
+
+
+def _exact_click_pages(env, grid) -> tuple[tuple[int, ...], ...]:
+    canonical = _canonical_click_tokens(env, grid)
+    if canonical:
+        size = _coverage_page_size()
+        return tuple(
+            tuple(canonical[start : start + size])
+            for start in range(0, len(canonical), size)
+        )
+    return tuple(
+        exact_click_coverage_page(grid, page)
+        for page in range(_coverage_page_count(grid))
+    )
 
 
 def _env_available_v848(self):
@@ -133,15 +209,16 @@ def _env_available_v848(self):
     if not any(_is_click_token(value) for value in base):
         return list(base)
 
-    pages = _coverage_page_count(self._last_grid)
-    if pages <= 0:
+    exact_pages = _exact_click_pages(self, self._last_grid)
+    if not exact_pages:
         return list(base)
+    pages = len(exact_pages)
     if self._v848_click_page is None:
         self._v848_click_page = int(self._v848_click_seed) % int(pages)
     else:
         self._v848_click_page = int(self._v848_click_page) % int(pages)
 
-    coverage = exact_click_coverage_page(self._last_grid, int(self._v848_click_page))
+    coverage = exact_pages[int(self._v848_click_page)]
     replayable = tuple(
         int(value)
         for value in getattr(self, "_v848_replayable_clicks", ())
@@ -158,11 +235,12 @@ def _env_step_v848(self, action):
     exact = _is_exact_click_token(token)
     before = np.asarray(self._last_grid).copy()
     before_levels = int(getattr(self, "last_levels_completed", 0))
-    pages = _coverage_page_count(before)
+    exact_pages = _exact_click_pages(self, before)
+    pages = len(exact_pages)
     if pages > 0 and self._v848_click_page is None:
         self._v848_click_page = int(self._v848_click_seed) % int(pages)
     page_tokens = set(
-        exact_click_coverage_page(before, int(self._v848_click_page or 0))
+        exact_pages[int(self._v848_click_page or 0) % pages]
         if pages > 0
         else ()
     )
@@ -185,13 +263,26 @@ def _env_step_v848(self, action):
     if exact and (level_progress or structural_change):
         self._v848_replayable_clicks.add(token)
 
+    if level_progress:
+        self._v848_click_page = None
+        self._v848_click_page_tried.clear()
+
     # Advance only after every exact coordinate in the exposed page has actually
     # been tried. This prevents an ever-moving target set from leaving untested
     # actions behind in the evidence frontier.
-    if page_tokens and page_tokens.issubset(self._v848_click_page_tried):
+    if not level_progress and page_tokens and page_tokens.issubset(self._v848_click_page_tried):
         self._v848_click_page = (int(self._v848_click_page or 0) + 1) % max(1, pages)
         self._v848_click_page_tried.clear()
     return result
+
+
+def _cognitive_action_executable_v848(self, action: int) -> bool:
+    """Report native legality independently from the bounded exploration page."""
+    _ensure_env_click_state(self)
+    return bool(
+        _is_exact_click_token(int(action))
+        and _valid_exact_click(int(action), self._last_grid)
+    )
 
 
 def _env_reset_v848(self, *args, **kwargs):
@@ -417,6 +508,7 @@ def install_click_exploration_v848() -> None:
     adapter.ArcGridEnvironment.available_actions = _env_available_v848
     adapter.ArcGridEnvironment.step = _env_step_v848
     adapter.ArcGridEnvironment.reset = _env_reset_v848
+    adapter.ArcGridEnvironment.cognitive_action_executable = _cognitive_action_executable_v848
 
     # The installed v8.10 wrappers resolve these helpers at call time, so replacing
     # the helpers preserves the public LiveReadView method identities.

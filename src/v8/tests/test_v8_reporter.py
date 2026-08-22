@@ -362,10 +362,10 @@ class DedicatedReporterProcessTests(unittest.TestCase):
                 output.get(timeout=0.1)
 
             game_line = output.get(timeout=3.0)
-            self.assertIn("10% - current_run_wins=50.0%", game_line)
-            self.assertIn("current_run_wins=50.0%", game_line)
-            self.assertIn("current_run_levels_solved=20.0%", game_line)
-            self.assertIn("current_run_solved_games=1/2 (tt01:win_observed)", game_line)
+            self.assertIn("10% - effectiveness", game_line)
+            self.assertIn("L=20.0%", game_line)
+            self.assertIn("G=50.0%", game_line)
+            self.assertIn("M7=0.0%", game_line)
             self.assertNotIn("hypotheses", game_line)
             with self.assertRaises(queue.Empty):
                 output.get(timeout=0.15)

@@ -165,6 +165,11 @@ def format_budget_game_rate_line(
     return f"{percentage:.0f}% - {line}"
 
 
+# Runtime reporting layers may replace the periodic presentation without changing
+# the baseline parser/formatter contract used by restart recovery.
+format_periodic_progress_line = format_budget_game_rate_line
+
+
 def reporting_worker(
     *,
     event_queue: mp.Queue,
@@ -206,7 +211,7 @@ def reporting_worker(
 
         rows = tuple(latest[key] for key in sorted(latest))
         _emit_line(
-            format_budget_game_rate_line(rows, total_steps, baseline),
+            format_periodic_progress_line(rows, total_steps, baseline),
             output_queue,
         )
         while next_report <= now:
