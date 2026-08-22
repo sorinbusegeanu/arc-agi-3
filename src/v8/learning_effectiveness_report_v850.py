@@ -390,15 +390,16 @@ def _emit_effectiveness_stdout(
 
 
 def _reporter_emit_line_v850(message: str, output_queue) -> None:
-    # Periodic competence rows are intentionally suppressed: the parent allocator
-    # emits the authoritative full effectiveness snapshot at the same 60 s cadence.
-    if "current_run_wins=" in str(message):
+    # Suppress only the terminal's legacy periodic competence line.  Explicit
+    # output queues remain part of the reporter contract and are used by callers
+    # that consume progress programmatically.
+    if output_queue is None and "current_run_wins=" in str(message):
         return
     _BASE_REPORTER_EMIT_LINE(message, output_queue)
 
 
 def _periodic_progress_line_v850(rows, total_steps, baseline=None) -> str:
-    """Keep the reporter's legacy row intact so _reporter_emit_line_v850 suppresses it."""
+    """Keep the reporter's legacy row intact; terminal emission suppresses it."""
     return _BASE_PERIODIC_PROGRESS_LINE(tuple(rows), total_steps, baseline)
 
 
@@ -429,8 +430,6 @@ def _write_learning_effectiveness_log(
     budget = max(0, int(getattr(runtime, "_v850_total_step_budget", 0)))
     budget_pct = None if budget <= 0 else _pct(used_steps, budget)
 
-    # Avoid an immediate duplicate final line while retaining the normal minute
-    # cadence even when progress stalls.
     now = time.monotonic()
     last_steps = int(getattr(runtime, "_v850_last_effectiveness_stdout_steps", -1))
     last_time = float(getattr(runtime, "_v850_last_effectiveness_stdout_time", -1.0))
