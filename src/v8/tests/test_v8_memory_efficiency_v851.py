@@ -28,7 +28,7 @@ from v8.publication import ShardReadDescriptor
 class MemoryEfficiencyV851Tests(unittest.TestCase):
     def test_runtime_stack_installs_v851_layers_in_order(self):
         self.assertEqual(
-            runtime_stack_v88._POST_LAYERS[-5:-1],
+            runtime_stack_v88._POST_LAYERS[-6:-2],
             (
                 "memory_efficiency_v851",
                 "memory_efficiency_v851_fixups",
@@ -168,7 +168,7 @@ class MemoryEfficiencyV851Tests(unittest.TestCase):
         else:
             os.environ[_ROOT_ENV] = prior
 
-    def test_capacity_plan_shrinks_node_edge_but_preserves_exact_action_table(self):
+    def test_capacity_plan_shrinks_all_arenas_from_retained_occupancy(self):
         historical = capacity.SnapshotUsage(
             node_count=100,
             edge_count=200,
@@ -182,9 +182,10 @@ class MemoryEfficiencyV851Tests(unittest.TestCase):
             )
         self.assertEqual(plan.node_capacity_per_shard, integrity._MIN_NODE_CAPACITY)
         self.assertEqual(plan.edge_capacity_per_shard, integrity._MIN_EDGE_CAPACITY)
-        self.assertEqual(plan.action_capacity_per_shard, historical.action_capacity)
+        self.assertEqual(plan.action_capacity_per_shard, integrity._MIN_ACTION_CAPACITY)
         self.assertLess(plan.node_capacity_per_shard, historical.node_capacity)
         self.assertLess(plan.edge_capacity_per_shard, historical.edge_capacity)
+        self.assertLess(plan.action_capacity_per_shard, historical.action_capacity)
 
     def test_manual_fresh_capacity_override_is_exact(self):
         plan = capacity.plan_capacities(
