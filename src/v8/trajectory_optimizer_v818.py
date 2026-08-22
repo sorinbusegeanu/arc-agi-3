@@ -463,6 +463,23 @@ def _start_waiting_validators(service) -> None:
         _ensure_validator(service, game)
 
 
+def _retire_game_validator(service, game_id: str) -> None:
+    """Give an already-waiting game the freed slot before requeueing this one."""
+    game = str(game_id)
+    requeue = False
+    with service._v818_validator_lock:
+        current = service._v818_validator_threads.get(game)
+        if current is threading.current_thread():
+            service._v818_validator_threads.pop(game, None)
+        q = service._v818_game_queues.get(game)
+        requeue = bool(q is not None and q.unfinished_tasks > 0)
+    _start_waiting_validators(service)
+    if requeue:
+        with service._v818_validator_lock:
+            service._v818_waiting_games.add(game)
+        _start_waiting_validators(service)
+
+
 def _route_candidate(service, candidate) -> bool:
     game = str(candidate.source.anchor.source_id)
     with service._v818_validator_lock:
@@ -717,14 +734,7 @@ def _game_validator_loop(service, game_id: str) -> None:
     except BaseException as exc:
         service._fail(exc)
     finally:
-        with service._v818_validator_lock:
-            current = service._v818_validator_threads.get(game)
-            if current is threading.current_thread():
-                service._v818_validator_threads.pop(game, None)
-            q = service._v818_game_queues.get(game)
-            if q is not None and q.unfinished_tasks > 0:
-                service._v818_waiting_games.add(game)
-        _start_waiting_validators(service)
+        _retire_game_validator(service, game)
 
 
 def _drain_v818(service, timeout: float = 10.0) -> bool:

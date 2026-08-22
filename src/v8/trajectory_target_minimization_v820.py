@@ -577,14 +577,7 @@ def _game_validator_loop_v820(service, game_id: str) -> None:
     except BaseException as exc:
         service._fail(exc)
     finally:
-        with service._v818_validator_lock:
-            current = service._v818_validator_threads.get(game)
-            if current is threading.current_thread():
-                service._v818_validator_threads.pop(game, None)
-            q = service._v818_game_queues.get(game)
-            if q is not None and q.unfinished_tasks > 0:
-                service._v818_waiting_games.add(game)
-        v818._start_waiting_validators(service)
+        v818._retire_game_validator(service, game)
 
 
 def install_trajectory_target_minimization_v820() -> None:

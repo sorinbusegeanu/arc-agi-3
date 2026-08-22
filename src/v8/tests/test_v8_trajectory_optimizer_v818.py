@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import queue
 import tempfile
 import threading
 import unittest
@@ -269,6 +270,27 @@ class ValidatorPoolTests(unittest.TestCase):
                 service._v818_game_queues["a"] = __import__("queue").Queue()
                 service._v818_game_queues["b"] = __import__("queue").Queue()
             self.assertIsNot(service._v818_game_queues["a"], service._v818_game_queues["b"])
+
+    def test_validation_quantum_hands_slot_to_existing_waiter_first(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            service = TrajectoryOptimizationService(
+                Path(root), validator=lambda _candidate: None
+            )
+            active = queue.Queue()
+            active.put(object())
+            service._v818_game_queues["active"] = active
+            service._v818_validator_threads["active"] = threading.current_thread()
+            service._v818_waiting_games = {"waiting"}
+            calls = []
+
+            def ensure(_service, game):
+                calls.append(str(game))
+                _service._v818_waiting_games.discard(str(game))
+
+            with patch.object(v818, "_ensure_validator", side_effect=ensure):
+                v818._retire_game_validator(service, "active")
+
+            self.assertEqual(calls, ["waiting", "active"])
 
 
 class InboxIngestionTests(unittest.TestCase):
