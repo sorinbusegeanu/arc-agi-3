@@ -3,7 +3,14 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
-from v7.game_sets import LEARNING_GAMES, V7_GAME_PRESETS, resolve_game_selector
+from v7.environment.arc_adapter import ArcGridEnvironment
+from v7.game_sets import (
+    LEARNING_GAMES,
+    LEARNING_GP_GAMES,
+    LEARNING_PURE_CLICK_GAMES,
+    V7_GAME_PRESETS,
+    resolve_game_selector,
+)
 
 
 EXPECTED_LEARNING_GAMES = (
@@ -13,15 +20,32 @@ EXPECTED_LEARNING_GAMES = (
     "ul02", "ul03", "fs02", "fs03", "tp02", "tp03", "ex02", "ex03",
     "fi01", "hz01", "vi01",
     "as01", "tw01", "cq01", "ez01", "ez02", "ez03", "ez04",
+    "cv01", "dm01", "mm01", "pt01", "sq01",
+    "gp01", "gp02", "gp03", "gp04",
 )
+
+EXPECTED_PURE_CLICK_GAMES = ("cv01", "dm01", "mm01", "pt01", "sq01")
+EXPECTED_GP_GAMES = ("gp01", "gp02", "gp03", "gp04")
 
 
 class LearningGamePresetTests(unittest.TestCase):
     def test_learning_preset_has_exact_requested_games(self) -> None:
         self.assertEqual(LEARNING_GAMES, EXPECTED_LEARNING_GAMES)
         self.assertEqual(V7_GAME_PRESETS["learning"], EXPECTED_LEARNING_GAMES)
-        self.assertEqual(len(LEARNING_GAMES), 36)
-        self.assertEqual(len(set(LEARNING_GAMES)), 36)
+        self.assertEqual(len(LEARNING_GAMES), 45)
+        self.assertEqual(len(set(LEARNING_GAMES)), 45)
+
+    def test_learning_additions_have_requested_click_scopes(self) -> None:
+        self.assertEqual(LEARNING_PURE_CLICK_GAMES, EXPECTED_PURE_CLICK_GAMES)
+        self.assertEqual(LEARNING_GP_GAMES, EXPECTED_GP_GAMES)
+        for game_id in LEARNING_PURE_CLICK_GAMES:
+            environment = ArcGridEnvironment(game_id=game_id, seed=0)
+            environment.game_wait_seconds = 0.0
+            self.assertEqual(
+                tuple(sorted(set(environment.available_actions()))),
+                (6,),
+                game_id,
+            )
 
     def test_learning_selector_resolves_through_v8_cli_selector_path(self) -> None:
         with patch("v7.game_sets.registered_game_ids", return_value=EXPECTED_LEARNING_GAMES):
