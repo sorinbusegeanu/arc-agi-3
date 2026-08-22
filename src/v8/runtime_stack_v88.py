@@ -73,6 +73,7 @@ _POST_LAYERS: tuple[str, ...] = (
 # public-authority assertions retain their historical meaning.
 _FINAL_LAYERS: tuple[str, ...] = (
     "performance_memory_v854",
+    "performance_memory_v854_fixups",
 )
 
 
