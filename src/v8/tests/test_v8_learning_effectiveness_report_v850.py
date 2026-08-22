@@ -9,6 +9,7 @@ from pathlib import Path
 
 from v8 import action_learning_report_v849 as action_report
 from v8 import learning_effectiveness_report_v850 as report
+from v8 import memory_efficiency_v851 as memory_efficiency
 from v8 import lease_dispatch_lifecycle_v843 as v843
 from v8 import reporter
 from v8 import runtime_stack_v88
@@ -103,10 +104,14 @@ class LearningEffectivenessReportTests(unittest.TestCase):
             },
         }
 
-    def test_runtime_stack_installs_report_after_v849_without_replacing_public_authority(self):
-        self.assertEqual(runtime_stack_v88._POST_LAYERS[-1], "learning_effectiveness_report_v850")
+    def test_runtime_stack_keeps_v850_beneath_v851_without_replacing_public_authority(self):
+        self.assertLess(
+            runtime_stack_v88._POST_LAYERS.index("learning_effectiveness_report_v850"),
+            runtime_stack_v88._POST_LAYERS.index("memory_efficiency_v851"),
+        )
         self.assertTrue(report._INSTALLED)
-        self.assertIs(v843._BASE_WRITE_ALLOCATION_LOG, report._write_allocation_log_v850)
+        self.assertIs(v843._BASE_WRITE_ALLOCATION_LOG, memory_efficiency._write_allocation_log_v851)
+        self.assertIs(memory_efficiency._BASE_WRITE_ALLOCATION_LOG, report._write_allocation_log_v850)
         self.assertIs(report._BASE_WRITE_ALLOCATION_LOG, action_report._write_allocation_log_v849)
         self.assertIs(reporter._emit_line, report._reporter_emit_line_v850)
 
