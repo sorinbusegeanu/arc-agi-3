@@ -54,13 +54,14 @@ _LAYERS: tuple[str, ...] = (
 )
 
 # Keep the historical v8.48-last assertion meaningful while allowing observational
-# layers to compose after the behavior layer without changing its version ordering.
+# and resource-efficiency layers to compose after the behavior layer.
 _POST_LAYERS: tuple[str, ...] = (
     "action_learning_report_v849",
     "action_learning_report_v849_fixups",
     "action_learning_report_v849_integrity",
     "action_learning_report_v849_authority_fix",
     "learning_effectiveness_report_v850",
+    "memory_efficiency_v851",
 )
 
 
