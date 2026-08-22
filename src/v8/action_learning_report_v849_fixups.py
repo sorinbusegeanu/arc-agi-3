@@ -91,6 +91,7 @@ def _game_row_fix(
     game_id: str,
     *,
     refresh_events: bool = True,
+    frontier_index=None,
 ) -> dict[str, object]:
     from v8 import action_learning_report_v849 as report
 
@@ -98,6 +99,7 @@ def _game_row_fix(
         coordinator,
         game_id,
         refresh_events=refresh_events,
+        frontier_index=frontier_index,
     )
     run = report._RUN.get(str(game_id), {})
     exact = run.get("exact_click_targets_tested", set())

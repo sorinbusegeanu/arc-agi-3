@@ -517,7 +517,37 @@ def _space_type(row: dict[str, object] | None) -> str:
     return "movement"
 
 
-def _frontier_metrics(game_id: str) -> dict[str, int]:
+def _frontier_file_index() -> dict[str, tuple[Path, ...]]:
+    from v8 import sampling_evidence_frontier_v847 as frontier
+
+    raw_root = os.environ.get(_TRAJECTORY_ROOT_ENV)
+    if raw_root is None:
+        return {}
+    root = Path(raw_root) / frontier._STATE_DIR
+    if not root.exists():
+        return {}
+    grouped: dict[str, list[Path]] = {}
+    try:
+        entries = tuple(root.iterdir())
+    except OSError:
+        return {}
+    for path in entries:
+        name = path.name
+        if name.startswith(".") or not name.endswith(".json") or "-" not in name:
+            continue
+        token = name.split("-", 1)[0]
+        grouped.setdefault(token, []).append(path)
+    return {
+        token: tuple(sorted(paths))
+        for token, paths in grouped.items()
+    }
+
+
+def _frontier_metrics(
+    game_id: str,
+    *,
+    frontier_index: dict[str, tuple[Path, ...]] | None = None,
+) -> dict[str, int]:
     from v8 import sampling_evidence_frontier_v847 as frontier
 
     raw_root = os.environ.get(_TRAJECTORY_ROOT_ENV)
@@ -528,11 +558,9 @@ def _frontier_metrics(game_id: str) -> dict[str, int]:
     }
     if raw_root is None:
         return result
-    root = Path(raw_root) / frontier._STATE_DIR
-    if not root.exists():
-        return result
     token = frontier._game_token(str(game_id))
-    for path in sorted(root.glob(f"{token}-*.json")):
+    index = _frontier_file_index() if frontier_index is None else frontier_index
+    for path in index.get(token, ()):
         metrics_path = path.with_suffix(".metrics")
         source = metrics_path if metrics_path.exists() else path
         try:
@@ -608,6 +636,7 @@ def _game_row(
     game_id: str,
     *,
     refresh_events: bool = True,
+    frontier_index: dict[str, tuple[Path, ...]] | None = None,
 ) -> dict[str, object]:
     from v8 import plateau_progress_v846 as progress
 
@@ -688,7 +717,7 @@ def _game_row(
         ),
     }
     if kind in {"click", "mixed"}:
-        row.update(_frontier_metrics(game))
+        row.update(_frontier_metrics(game, frontier_index=frontier_index))
     else:
         row.update(
             {
@@ -703,8 +732,14 @@ def _game_row(
 def action_learning_snapshot_v849(coordinator) -> dict[str, object]:
     _refresh_events(force=True)
     games = tuple(sorted(getattr(coordinator, "_games", ())))
+    frontier_index = _frontier_file_index()
     rows = [
-        _game_row(coordinator, game, refresh_events=False)
+        _game_row(
+            coordinator,
+            game,
+            refresh_events=False,
+            frontier_index=frontier_index,
+        )
         for game in games
     ]
     click_capable = [row for row in rows if row["action_space_type"] in {"click", "mixed"}]

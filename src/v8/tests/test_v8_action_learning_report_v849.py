@@ -460,6 +460,38 @@ class ActionFrontierReportSchedulingTests(unittest.TestCase):
         self.assertEqual(metrics["click_frontier_expandable"], 7)
         self.assertEqual(metrics["suppressed_click_noop_frontiers"], 3)
 
+    def test_snapshot_indexes_frontier_directory_once(self):
+        coordinator = AdaptiveLearningCoordinator()
+        coordinator.register_games(("click-a", "click-b"))
+        for game in ("click-a", "click-b"):
+            report._SPACE[game] = {
+                **report._empty_aggregate(),
+                "native_types": {6},
+            }
+        frontier_index = {}
+        with (
+            patch.object(
+                report,
+                "_frontier_file_index",
+                return_value=frontier_index,
+            ) as build_index,
+            patch.object(
+                report,
+                "_frontier_metrics",
+                return_value={
+                    "click_frontier_nodes": 0,
+                    "click_frontier_expandable": 0,
+                    "suppressed_click_noop_frontiers": 0,
+                },
+            ) as metrics,
+        ):
+            report.action_learning_snapshot_v849(coordinator)
+
+        build_index.assert_called_once_with()
+        self.assertEqual(metrics.call_count, 2)
+        for call in metrics.call_args_list:
+            self.assertIs(call.kwargs["frontier_index"], frontier_index)
+
 
 if __name__ == "__main__":
     unittest.main()
