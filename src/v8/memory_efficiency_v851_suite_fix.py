@@ -190,6 +190,7 @@ def _restore_actor_authority() -> None:
 def _restore_sampler_authorities() -> None:
     from v8 import click_exploration_v848 as click
     from v8 import sampling_evidence_frontier_v847 as frontier
+    from v8 import sampling_evidence_frontier_v847_fixups as frontier_fixups
     from v8 import sampling_persistence_v832 as persistence
     from v8 import sampling_portfolio_v831 as portfolio
 
@@ -207,6 +208,20 @@ def _restore_sampler_authorities() -> None:
         click._BASE_SAMPLER_PREPARE_STEP = frontier._BASE_PREPARE_STEP
         frontier._BASE_PREPARE_STEP = click._sampler_prepare_step_v848
         cls.prepare_step = frontier._prepare_step_v847
+
+    # v8.32 must stay the public forced-action authority and v8.47 must remain its
+    # immediate lower layer. Insert v8.48 below v8.47 instead of replacing either.
+    if cls.forced_action is click._sampler_forced_action_v848:
+        click._BASE_SAMPLER_FORCED_ACTION = frontier_fixups._BASE_LOWER_FORCED
+        frontier_fixups._BASE_LOWER_FORCED = click._sampler_forced_action_v848
+        cls.forced_action = persistence._forced_action_v832
+
+    # Same composition for transition observation: v8.32 public -> v8.47 evidence
+    # -> v8.48 click sweep -> historical lower implementation.
+    if cls.observe_transition is click._sampler_observe_transition_v848:
+        click._BASE_SAMPLER_OBSERVE_TRANSITION = frontier_fixups._BASE_LOWER_OBSERVE
+        frontier_fixups._BASE_LOWER_OBSERVE = click._sampler_observe_transition_v848
+        cls.observe_transition = persistence._observe_transition_v832
 
 
 def _restore_reporter_authority() -> None:
