@@ -432,49 +432,64 @@ def _install_probe_planning_and_efficiency_search() -> None:
 
 def _install_terminal_efficiency_feedback() -> None:
     from v8 import runtime as runtime_module
-    from v8 import trajectory_efficiency_v054 as efficiency_module
 
     base_record = runtime_module.ContinuousMemoryRuntime.record_actor_results
 
     def record_actor_results(self, results):
         rows = tuple(results)
         base_record(self, rows)
-        if self.peers is None:
-            return
-        m7 = {
-            row.uid: row
-            for row in self.read_view.node_records(level=MemoryLevel.M7)
-        }
-        for result in rows:
-            game_hash = stable_u64(result.game_id, person=b"v8-game")
-            for credit in getattr(result, "primary_valence_credits", ()):
-                if int(credit.level) != int(MemoryLevel.M7) or float(credit.valence_sum) <= 0.0:
-                    continue
-                actions = efficiency_module._actions_from_discounted_valence(credit)
-                row = m7.get(credit.uid)
-                if actions is None or row is None:
-                    continue
-                weight = _TERMINAL_EFFICIENCY_WEIGHT
-                self.peers._submit(
-                    self.peers._existing_proposal(
-                        row,
-                        success_sum=weight,
-                        cost_sum=float(actions) * weight,
-                        attempt_weight=weight,
-                        source_game_hash=int(game_hash),
-                    )
-                )
-                self.peers._append_evidence(
-                    "terminal_strategy_efficiency",
-                    row,
-                    min(1.0, 1.0 / max(1.0, float(actions))),
-                    unique=True,
-                    provenance_games=(int(game_hash),),
-                    causal_intervention="positive_terminal_distance",
-                    effect_direction=1,
-                )
+        _record_terminal_efficiency_feedback(self, rows)
 
     runtime_module.ContinuousMemoryRuntime.record_actor_results = record_actor_results
+
+
+def _record_terminal_efficiency_feedback(runtime, rows) -> None:
+    """Record terminal efficiency from the existing live index in bounded time."""
+    if runtime.peers is None:
+        return
+
+    from v8 import trajectory_efficiency_v054 as efficiency_module
+
+    # Actor credits refer to strategies selected from this view.  Use its existing
+    # coherent index instead of decoding every node after each feedback batch.  On
+    # large restored graphs, a full refresh races active writers and can keep the
+    # feedback worker busy past the five-minute shutdown deadline.
+    by_uid = getattr(runtime.read_view, "_node_by_uid", {})
+    for result in rows:
+        game_hash = stable_u64(result.game_id, person=b"v8-game")
+        for credit in getattr(result, "primary_valence_credits", ()):
+            if (
+                int(credit.level) != int(MemoryLevel.M7)
+                or float(credit.valence_sum) <= 0.0
+            ):
+                continue
+            actions = efficiency_module._actions_from_discounted_valence(credit)
+            row = by_uid.get(credit.uid)
+            if (
+                actions is None
+                or row is None
+                or int(getattr(row, "level", -1)) != int(MemoryLevel.M7)
+            ):
+                continue
+            weight = _TERMINAL_EFFICIENCY_WEIGHT
+            runtime.peers._submit(
+                runtime.peers._existing_proposal(
+                    row,
+                    success_sum=weight,
+                    cost_sum=float(actions) * weight,
+                    attempt_weight=weight,
+                    source_game_hash=int(game_hash),
+                )
+            )
+            runtime.peers._append_evidence(
+                "terminal_strategy_efficiency",
+                row,
+                min(1.0, 1.0 / max(1.0, float(actions))),
+                unique=True,
+                provenance_games=(int(game_hash),),
+                causal_intervention="positive_terminal_distance",
+                effect_direction=1,
+            )
 
 
 def _install_solve_efficiency_reporting() -> None:

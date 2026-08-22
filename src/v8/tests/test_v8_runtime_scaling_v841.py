@@ -9,9 +9,45 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from v8 import runtime_scaling_v841 as v841
+from v8.model import MemoryLevel, MemoryUid
+from v8.peers import DevelopmentalPeerSupervisor
 
 
 class FeedbackScalingTests(unittest.TestCase):
+    def test_strategy_statistics_use_existing_index_without_graph_scan(self):
+        uid = MemoryUid(1, 2)
+        row = SimpleNamespace(uid=uid, level=int(MemoryLevel.M7))
+        submitted = []
+        evidence = []
+
+        class ReadView:
+            _node_by_uid = {uid: row}
+
+            def node_records(self, **_kwargs):
+                raise AssertionError("feedback must not rescan the live graph")
+
+        supervisor = SimpleNamespace(
+            read_view=ReadView(),
+            _v845_state_lock=threading.RLock(),
+            _existing_proposal=lambda value, **kwargs: (value, kwargs),
+            _submit=submitted.append,
+            _append_evidence=lambda *args, **kwargs: evidence.append((args, kwargs)),
+        )
+
+        accepted = DevelopmentalPeerSupervisor.record_strategy_statistics(
+            supervisor,
+            uid,
+            attempts=1,
+            successes=1,
+            cost=3.0,
+            source_game_hash=7,
+        )
+
+        self.assertTrue(accepted)
+        self.assertEqual(len(submitted), 1)
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(evidence[0][1]["provenance_games"], (7,))
+
     def test_feedback_worker_uses_disk_queue_and_preserves_order(self):
         release = threading.Event()
         seen = []
@@ -203,6 +239,40 @@ class OptimizerScalingTests(unittest.TestCase):
             self.assertTrue(v841._runtime_is_quiescent_v841(runtime))
         finally:
             v841._BASE_RUNTIME_IS_QUIESCENT = original
+
+    def test_post_sampling_preserves_durable_inbox_after_ram_work_drains(self):
+        with tempfile.TemporaryDirectory() as root:
+            inbox = Path(root)
+            (inbox / "pending.json").write_text("{}", encoding="utf-8")
+            service = SimpleNamespace(
+                _v841_candidate_overflow=None,
+                _v841_preserve_inbox_on_shutdown=True,
+                _sources=SimpleNamespace(unfinished_tasks=0),
+                _lock=threading.Lock(),
+                _active_validations=0,
+                _v818_validator_lock=threading.Lock(),
+                _v818_game_queues={},
+                inbox=inbox,
+            )
+
+            self.assertTrue(v841._optimizer_idle_v841(service))
+
+            service._sources.unfinished_tasks = 1
+            self.assertFalse(v841._optimizer_idle_v841(service))
+
+    def test_shutdown_mode_stops_admitting_durable_inbox(self):
+        calls = []
+        service = SimpleNamespace(_v841_preserve_inbox_on_shutdown=True)
+        original = v841._BASE_INGEST_INBOX
+        v841._BASE_INGEST_INBOX = lambda target: calls.append(target)
+        try:
+            v841._ingest_inbox_v841(service)
+            service._v841_preserve_inbox_on_shutdown = False
+            v841._ingest_inbox_v841(service)
+        finally:
+            v841._BASE_INGEST_INBOX = original
+
+        self.assertEqual(calls, [service])
 
     def test_normal_runtime_close_drains_optimizer_before_base_close(self):
         calls = []

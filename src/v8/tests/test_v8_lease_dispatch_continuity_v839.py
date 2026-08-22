@@ -4,7 +4,7 @@ import queue
 import threading
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from v8 import actor as actor_module
 from v8 import adaptive_learning_allocation_v819 as v819
@@ -115,6 +115,72 @@ class LeaseDispatchContinuityV839Tests(unittest.TestCase):
         self.assertEqual(result, ("done",))
         self.assertEqual(reporting.get_nowait(), SAMPLING_COMPLETE)
         self.assertIs(runtime._v839_sampling_done_reported, True)
+
+    def test_feedback_drain_pauses_peer_cycles_and_waits_for_idle(self) -> None:
+        events = []
+        reporting = queue.Queue()
+        feedback = SimpleNamespace(flush=lambda: events.append("feedback-flush"))
+
+        class Peers:
+            _pause = threading.Event()
+
+            def pause(self):
+                events.append("peers-pause")
+                self._pause.set()
+
+            def wait_idle(self, timeout):
+                self.assert_timeout = timeout
+                events.append("peers-idle")
+                return True
+
+            def resume(self):
+                events.append("peers-resume")
+                self._pause.clear()
+
+        peers = Peers()
+        runtime = SimpleNamespace(
+            _v839_sampling_active=False,
+            _v839_actor_feedback=feedback,
+            peers=peers,
+            _v814_trajectory_optimizer=SimpleNamespace(),
+        )
+
+        with patch.object(v839, "_BASE_RUN_ACTOR_JOBS", return_value=("done",)), patch.object(
+            v839, "_BASE_RETRY_DEFERRED"
+        ):
+            result = v839._run_actor_jobs_v839(
+                runtime,
+                (),
+                reporting_queue=reporting,
+            )
+
+        self.assertEqual(result, ("done",))
+        self.assertEqual(
+            events,
+            ["peers-pause", "peers-idle", "feedback-flush"],
+        )
+        self.assertEqual(peers.assert_timeout, v839._DRAIN_TIMEOUT_SECONDS)
+        self.assertTrue(peers._pause.is_set())
+        self.assertTrue(runtime._sampling_complete)
+        self.assertTrue(
+            runtime._v814_trajectory_optimizer._v841_preserve_inbox_on_shutdown
+        )
+
+    def test_abnormal_runtime_close_aborts_feedback_without_second_drain(self) -> None:
+        feedback = SimpleNamespace(abort=Mock(), close=Mock())
+        runtime = SimpleNamespace(
+            _v839_actor_feedback=feedback,
+            _v839_deferred_retry=None,
+        )
+
+        with patch.object(v839, "_BASE_RUNTIME_CLOSE", return_value="closed") as close:
+            result = v839._runtime_close_v839(runtime, normal=False)
+
+        self.assertEqual(result, "closed")
+        feedback.abort.assert_called_once_with()
+        feedback.close.assert_not_called()
+        close.assert_called_once_with(runtime, normal=False)
+        self.assertIsNone(runtime._v839_actor_feedback)
 
     def test_deferred_retry_is_bounded_per_pass(self) -> None:
         pending = [(object(), object()) for _ in range(6)]

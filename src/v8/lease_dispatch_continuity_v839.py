@@ -146,6 +146,21 @@ class _AsyncQueueWorker:
         if self._thread.is_alive():
             raise TimeoutError(f"{self._thread.name} did not stop")
 
+    def abort(self) -> None:
+        """Stop accepting work without repeating a failed drain on error cleanup."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
+            else:
+                self._queue.task_done()
+        self._queue.put_nowait(None)
+
     def metrics(self) -> tuple[int, int, int, int]:
         with self._lock:
             return (
@@ -316,8 +331,27 @@ def _run_actor_jobs_v839(runtime, jobs, **kwargs):
         reporting_queue.put_nowait(SAMPLING_COMPLETE)
         runtime._v839_sampling_done_reported = True
 
+    # Late adaptive allocator replacements bypass v8.9's actor wrapper, so make
+    # the final-drain state authoritative here as well.  Peers must stay paused
+    # after the feedback barrier: resuming them in the small gap before the CLI's
+    # wait_quiescent() call can start another large graph cycle and refill every
+    # canonical queue during shutdown.
+    runtime._sampling_complete = True
+    optimizer = getattr(runtime, "_v814_trajectory_optimizer", None)
+    if optimizer is not None:
+        # Successful trajectories are already durable JSON inbox records. Stop
+        # admitting that potentially unbounded backlog once actor sampling ends;
+        # the optimizer still drains every item already admitted to RAM, while
+        # residual inbox files remain available to the next continuous run.
+        optimizer._v841_preserve_inbox_on_shutdown = True
+
     feedback = getattr(runtime, "_v839_actor_feedback", None)
     if feedback is not None:
+        peers = getattr(runtime, "peers", None)
+        if peers is not None:
+            peers.pause()
+        if peers is not None and not peers.wait_idle(_DRAIN_TIMEOUT_SECONDS):
+            raise TimeoutError("v8 peers did not become idle before feedback drain")
         feedback.flush()
 
     deferred = getattr(runtime, "_v839_deferred_retry", None)
@@ -331,9 +365,15 @@ def _run_actor_jobs_v839(runtime, jobs, **kwargs):
 
 
 def _runtime_close_v839(self, *args, **kwargs):
+    normal = bool(kwargs.get("normal", args[0] if args else True))
     feedback = getattr(self, "_v839_actor_feedback", None)
     if feedback is not None:
-        feedback.close()
+        if normal:
+            feedback.close()
+        else:
+            abort = getattr(feedback, "abort", None)
+            if callable(abort):
+                abort()
         self._v839_actor_feedback = None
     deferred = getattr(self, "_v839_deferred_retry", None)
     if deferred is not None:

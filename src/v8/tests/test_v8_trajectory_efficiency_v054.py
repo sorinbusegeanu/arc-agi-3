@@ -2,20 +2,78 @@ from __future__ import annotations
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from v8 import actor, primary_valence
-from v8.model import MemoryLevel, MemoryType, MemoryUid
+from v8.model import CognitiveState, MemoryLevel, MemoryType, MemoryUid
 from v8.runtime_v82 import V82ContinuousMemoryRuntime
 from v8.scientific_traceability import TRACEABILITY
 from v8.trajectory_efficiency_v054 import (
     TrajectoryEfficiencyTracker,
     _TRACKER,
+    _append_evidence_v054,
     _actions_from_discounted_valence,
     _relative_efficiency,
 )
 
 
 class TrajectoryEfficiencyV054Tests(unittest.TestCase):
+    def test_efficiency_evidence_uses_existing_index_without_graph_scan(self):
+        outcome = MemoryUid(4, 5)
+        strategy = MemoryUid(6, 7)
+        row = SimpleNamespace(
+            uid=strategy,
+            level=int(MemoryLevel.M7),
+            key_parts=(1, outcome.hi, outcome.lo, 9),
+        )
+        other = MemoryUid(8, 9)
+        cohort = (
+            SimpleNamespace(
+                strategy_uid=strategy,
+                outcome_uid=outcome,
+                context_bucket=9,
+                mean_cost=4.0,
+            ),
+            SimpleNamespace(
+                strategy_uid=other,
+                outcome_uid=outcome,
+                context_bucket=9,
+                mean_cost=2.0,
+            ),
+        )
+
+        class ReadView:
+            _node_by_uid = {
+                strategy: SimpleNamespace(
+                    attempt_weight=1.0,
+                    cognitive_state=int(CognitiveState.ACTIVE),
+                ),
+                other: SimpleNamespace(
+                    attempt_weight=1.0,
+                    cognitive_state=int(CognitiveState.ACTIVE),
+                ),
+            }
+            _strategy_by_context = {9: cohort}
+
+            def node_records(self, **_kwargs):
+                raise AssertionError("efficiency evidence must not rescan the graph")
+
+        supervisor = SimpleNamespace(read_view=ReadView())
+
+        with patch(
+            "v8.trajectory_efficiency_v054._BASE_APPEND_EVIDENCE",
+            return_value="recorded",
+        ) as append:
+            result = _append_evidence_v054(
+                supervisor,
+                "strategy_efficiency",
+                row,
+                0.1,
+            )
+
+        self.assertEqual(result, "recorded")
+        self.assertEqual(append.call_args.args[3], 0.5)
+
     def test_tracker_counts_actions_until_represented_outcome(self) -> None:
         tracker = TrajectoryEfficiencyTracker()
         strategy = MemoryUid.from_key(MemoryLevel.M7, MemoryType.STRATEGY, (1, 2, 3, 4))

@@ -4,7 +4,7 @@ import math
 from dataclasses import dataclass, replace
 
 from v8 import primary_valence as _primary
-from v8.model import MemoryLevel, MemoryType, MemoryUid, stable_u64
+from v8.model import CognitiveState, MemoryLevel, MemoryType, MemoryUid, stable_u64
 
 
 _RELATIVE_EFFICIENCY_WEIGHT = 0.15
@@ -256,19 +256,41 @@ def _score_strategy_rows_v054(view, rows, **kwargs):
 
 def _append_evidence_v054(self, kind, row, value, **kwargs):
     if kind == "strategy_efficiency":
-        nodes = tuple(self.read_view.node_records(level=MemoryLevel.M7))
-        grouped = self.strategies.by_outcome(nodes)
-        outcome_uid = MemoryUid(int(row.key_parts[1]), int(row.key_parts[2])) if len(row.key_parts) >= 3 else MemoryUid.zero()
-        cohort = grouped.get(outcome_uid, ())
-        context_bucket = int(row.key_parts[3]) if len(row.key_parts) >= 4 else 0
-        empirical = tuple(
-            item for item in cohort
-            if item.attempts > 0 and int(item.context_bucket) == context_bucket
+        outcome_uid = (
+            MemoryUid(int(row.key_parts[1]), int(row.key_parts[2]))
+            if len(row.key_parts) >= 3
+            else MemoryUid.zero()
         )
+        context_bucket = int(row.key_parts[3]) if len(row.key_parts) >= 4 else 0
+        by_uid = getattr(self.read_view, "_node_by_uid", {})
+        active_states = {
+            int(CognitiveState.ACTIVE),
+            int(CognitiveState.VALIDATED),
+            int(CognitiveState.REACTIVATED),
+        }
+        cohort = tuple(
+            item
+            for item in getattr(self.read_view, "_strategy_by_context", {}).get(
+                context_bucket, ()
+            )
+            if item.outcome_uid == outcome_uid
+        )
+        empirical = []
+        for item in cohort:
+            source = by_uid.get(item.strategy_uid)
+            if source is None:
+                continue
+            attempts = max(0, int(round(float(source.attempt_weight))))
+            if attempts <= 0 or int(source.cognitive_state) not in active_states:
+                continue
+            empirical.append(item)
         if len(empirical) < 2:
             return None
         best = min(item.mean_cost for item in empirical)
-        current = next((item for item in empirical if item.uid == row.uid), None)
+        current = next(
+            (item for item in empirical if item.strategy_uid == row.uid),
+            None,
+        )
         if current is None:
             return None
         value = best / max(1e-9, current.mean_cost)

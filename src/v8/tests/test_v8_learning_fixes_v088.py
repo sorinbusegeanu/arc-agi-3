@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import v8
@@ -9,6 +10,7 @@ from v8.learning_fixes_v088 import (
     ActorProgress,
     _memory_free_action,
     _probe_policy_v088,
+    _record_terminal_efficiency_feedback,
     _run_automatic_transfer_experiments_v088,
 )
 from v8.model import CognitiveState, MemoryLevel, MemoryType, MemoryUid, ValidationState
@@ -61,6 +63,44 @@ def node(
 
 
 class V088LearningFixTests(unittest.TestCase):
+    def test_terminal_efficiency_feedback_uses_existing_index_without_graph_scan(self):
+        strategy = node(
+            MemoryLevel.M7,
+            MemoryType.STRATEGY,
+            (1, 2, 3, 4),
+        )
+        credit = SimpleNamespace(
+            uid=strategy.uid,
+            level=int(MemoryLevel.M7),
+            valence_sum=1.0,
+            weight=1.0,
+        )
+        submitted = []
+        evidence = []
+
+        class ReadView:
+            _node_by_uid = {strategy.uid: strategy}
+
+            def node_records(self, **_kwargs):
+                raise AssertionError("feedback must not rescan the live graph")
+
+        peers = SimpleNamespace(
+            _existing_proposal=lambda row, **kwargs: (row, kwargs),
+            _submit=submitted.append,
+            _append_evidence=lambda *args, **kwargs: evidence.append((args, kwargs)),
+        )
+        runtime = SimpleNamespace(peers=peers, read_view=ReadView())
+        result = SimpleNamespace(
+            game_id="ez01",
+            primary_valence_credits=(credit,),
+        )
+
+        _record_terminal_efficiency_feedback(runtime, (result,))
+
+        self.assertEqual(len(submitted), 1)
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(evidence[0][0][0], "terminal_strategy_efficiency")
+
     def test_concept_identity_preserves_full_role_descriptor(self):
         role = node(MemoryLevel.M3, MemoryType.ROLE, (11, 22, 1, 33), support=4, transfer=0.75)
         candidates = EvidenceGatedPromotionEngine().propose((role,), (), budget=16)

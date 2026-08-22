@@ -23,6 +23,7 @@ _BASE_PEER_CLOSE = None
 _BASE_PEER_RUN_ONCE = None
 _BASE_SERVICE_STOP = None
 _BASE_QUEUE_DEPTH = None
+_BASE_INGEST_INBOX = None
 _BASE_RUNTIME_IS_QUIESCENT = None
 _BASE_RUNTIME_CLOSE = None
 
@@ -78,7 +79,7 @@ class _SqliteBatchWorker:
         try:
             while True:
                 with self._lock:
-                    if self._closed and self._completed >= self._submitted:
+                    if self._closed:
                         return
                 rows = reader.execute(
                     "SELECT id, payload FROM feedback ORDER BY id LIMIT 32"
@@ -146,6 +147,15 @@ class _SqliteBatchWorker:
             raise TimeoutError(f"{self._thread.name} did not stop")
         with self._lock:
             self._writer.close()
+
+    def abort(self) -> None:
+        """Release the writer promptly during an already-failing runtime close."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._writer.close()
+        self._wake.set()
 
     def metrics(self) -> tuple[int, int, int, int]:
         with self._lock:
@@ -500,6 +510,12 @@ def _queue_depth_v841(service) -> int:
     return base + (0 if worker is None else int(worker.pending_count()))
 
 
+def _ingest_inbox_v841(service) -> None:
+    if bool(getattr(service, "_v841_preserve_inbox_on_shutdown", False)):
+        return
+    return _BASE_INGEST_INBOX(service)
+
+
 def _optimizer_idle_v841(service) -> bool:
     if service is None:
         return True
@@ -513,10 +529,13 @@ def _optimizer_idle_v841(service) -> bool:
         active = int(service._active_validations)
     with service._v818_validator_lock:
         queues = tuple(service._v818_game_queues.values())
+    durable_inbox_idle = bool(
+        getattr(service, "_v841_preserve_inbox_on_shutdown", False)
+    ) or not any(service.inbox.glob("*.json"))
     return bool(
         active == 0
         and all(queue_.unfinished_tasks == 0 for queue_ in queues)
-        and not any(service.inbox.glob("*.json"))
+        and durable_inbox_idle
     )
 
 
@@ -561,7 +580,11 @@ def _service_stop_v841(self, *, drain: bool = True, timeout: float = 10.0) -> No
     try:
         return _BASE_SERVICE_STOP(
             self,
-            drain=drain,
+            # In preserve mode the wrapper has already drained all admitted RAM
+            # work. The v8.18 drain also requires an empty durable inbox, which is
+            # deliberately deferred to the next run and must not delay shutdown.
+            drain=drain
+            and not bool(getattr(self, "_v841_preserve_inbox_on_shutdown", False)),
             timeout=max(0.1, deadline - time.monotonic()),
         )
     finally:
@@ -572,7 +595,7 @@ def _service_stop_v841(self, *, drain: bool = True, timeout: float = 10.0) -> No
 
 def install_runtime_scaling_v841() -> None:
     global _INSTALLED, _BASE_PEER_INIT, _BASE_PEER_CLOSE, _BASE_PEER_RUN_ONCE
-    global _BASE_SERVICE_STOP, _BASE_QUEUE_DEPTH
+    global _BASE_SERVICE_STOP, _BASE_QUEUE_DEPTH, _BASE_INGEST_INBOX
     global _BASE_RUNTIME_IS_QUIESCENT, _BASE_RUNTIME_CLOSE
     if _INSTALLED:
         return
@@ -599,6 +622,10 @@ def install_runtime_scaling_v841() -> None:
     v830._BASE_ROUTE_CANDIDATE = _route_candidate_base_v841
     _BASE_QUEUE_DEPTH = v818._queue_depth
     v818._queue_depth = _queue_depth_v841
+
+    _BASE_INGEST_INBOX = v818._ingest_inbox_v818
+    v818._ingest_inbox_v818 = _ingest_inbox_v841
+    TrajectoryOptimizationService._ingest_inbox = _ingest_inbox_v841
 
     _BASE_SERVICE_STOP = TrajectoryOptimizationService.stop
     TrajectoryOptimizationService.stop = _service_stop_v841

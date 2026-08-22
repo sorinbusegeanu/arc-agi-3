@@ -818,15 +818,12 @@ class DevelopmentalPeerSupervisor:
         cost: float,
         source_game_hash: int,
     ) -> bool:
-        row = next(
-            (
-                value
-                for value in self.read_view.node_records(level=MemoryLevel.M7)
-                if value.uid == uid
-            ),
-            None,
-        )
-        if row is None or attempts <= 0:
+        row = getattr(self.read_view, "_node_by_uid", {}).get(uid)
+        if (
+            row is None
+            or int(getattr(row, "level", -1)) != int(MemoryLevel.M7)
+            or attempts <= 0
+        ):
             return False
         self._submit(
             self._existing_proposal(
@@ -842,6 +839,7 @@ class DevelopmentalPeerSupervisor:
             row,
             min(1.0, float(attempts) / max(1.0, float(cost))),
             unique=True,
+            provenance_games=(int(source_game_hash),),
         )
         return True
 
