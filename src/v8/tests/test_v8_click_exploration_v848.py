@@ -123,9 +123,11 @@ class CompleteClickCoverageTests(unittest.TestCase):
         sampler.begin_lease(0)
         history: list[int] = []
 
-        def base_observe(instance, **_kwargs):
+        def base_observe(instance, **kwargs):
             instance.base.pending_reset = (0, 0)
             instance.base.current = None
+            if int(kwargs["after_level"]) > int(kwargs["before_level"]):
+                instance.base.verification = SimpleNamespace(remaining=1)
 
         with (
             patch.object(v848, "_BASE_SAMPLER_PREPARE_STEP", lambda _self, _env: False),
@@ -164,6 +166,8 @@ class CompleteClickCoverageTests(unittest.TestCase):
                     future_delta=0.0,
                 )
                 if after_level > before_level:
+                    self.assertIsNone(sampler.base.pending_reset)
+                    self.assertIsNone(sampler.base.verification)
                     break
                 self.assertIsNone(sampler.base.pending_reset)
 

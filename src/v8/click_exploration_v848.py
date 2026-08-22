@@ -392,12 +392,18 @@ def _sampler_observe_transition_v848(self, **kwargs) -> None:
         or str(kwargs.get("terminal_state", "")) == "WIN"
     )
     result = _BASE_SAMPLER_OBSERVE_TRANSITION(self, **kwargs)
-    if click_scan and not success:
-        # The generic decision sampler schedules a reset after many single probes.
-        # That is useful for branching sequences but would make a long click sweep
-        # impossible. Retain its evidence while discarding only that reset request.
+    if click_scan:
+        # The generic decision sampler schedules a reset after single probes and a
+        # replay verification after a level boundary. Both are useful for branching
+        # sequences, but a click sweep already demonstrates its complete cumulative
+        # prefix in the live episode. Restarting that prefix after every painted
+        # level prevents the sweep from reaching later levels. Retain the learned
+        # successful/transfer action while discarding only the redundant control
+        # requests, matching the causal-progress continuation contract in v8.44.
         self.base.pending_reset = None
         self.pending_sequence = None
+        if success:
+            self.base.verification = None
     return result
 
 
