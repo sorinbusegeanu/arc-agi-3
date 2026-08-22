@@ -8,7 +8,6 @@ from v8 import actor as actor_module
 from v8 import adaptive_allocator_occupancy_v840 as occupancy
 from v8 import cli_v819
 from v8 import decision_point_sampling_v821 as sampling
-from v8 import memory_efficiency_v851 as memory_efficiency
 from v8 import progress_runtime_fix_v822 as progress
 from v8 import sampling_baseline_recovery_v828 as baseline
 from v8.sampling_baseline_recovery_v828 import _requested_actor_pool_v828
@@ -23,8 +22,7 @@ class SamplingBaselineRecoveryV828Tests(unittest.TestCase):
         try:
             os.environ[sampling._SAMPLING_MODE_ENV] = "DISCOVERY"
             self.assertTrue(sampling._decision_mode_enabled())
-            self.assertIs(actor_module.actor_worker, memory_efficiency._actor_worker_v851)
-            self.assertIs(memory_efficiency._BASE_ACTOR_WORKER, progress._actor_worker_with_solve_metrics_v822)
+            self.assertIs(actor_module.actor_worker, progress._actor_worker_with_solve_metrics_v822)
             self.assertIs(progress._BASE_ACTOR_WORKER, baseline._actor_delegate_v828)
             result = progress._BASE_ACTOR_WORKER(job="job", marker=7)
         finally:

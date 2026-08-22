@@ -171,6 +171,24 @@ class CompleteClickCoverageTests(unittest.TestCase):
         self.assertEqual(env.last_levels_completed, 1)
         self.assertEqual(env.reset_count, 0)
 
+    def test_gp02_goal_contains_only_paintable_floor_cells(self):
+        from v7.environment.arc_adapter import ArcGridEnvironment
+
+        env = ArcGridEnvironment(game_id="gp02", seed=1)
+        game = env.env._game
+        game.set_level(3)
+        walls = {
+            (int(sprite.x), int(sprite.y))
+            for sprite in game.current_level.get_sprites_by_tag("wall")
+        }
+        hints = {
+            (int(sprite.x), int(sprite.y))
+            for sprite in game.current_level.get_sprites_by_tag("hint")
+        }
+        self.assertTrue(game._goal)
+        self.assertTrue(game._goal.isdisjoint(walls))
+        self.assertEqual(hints, game._goal)
+
 
 class TargetSpecificSelectionTests(unittest.TestCase):
     def test_distinct_click_targets_survive_score_grouping(self):

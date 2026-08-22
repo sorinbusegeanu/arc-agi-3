@@ -76,10 +76,7 @@ class WinActionReportingV822Tests(unittest.TestCase):
             ) = prior_metrics
 
     def test_solve_metric_wrapper_is_final_actor_authority(self) -> None:
-        from v8 import memory_efficiency_v851 as memory_efficiency
-
-        self.assertIs(actor_module.actor_worker, memory_efficiency._actor_worker_v851)
-        self.assertIs(memory_efficiency._BASE_ACTOR_WORKER, progress._actor_worker_with_solve_metrics_v822)
+        self.assertIs(actor_module.actor_worker, progress._actor_worker_with_solve_metrics_v822)
 
 
 if __name__ == "__main__":

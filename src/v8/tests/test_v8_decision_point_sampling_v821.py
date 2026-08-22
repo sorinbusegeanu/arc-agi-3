@@ -6,7 +6,6 @@ import unittest
 import v8
 from v8 import actor as actor_module
 from v8 import decision_point_sampling_v821 as sampling
-from v8 import memory_efficiency_v851 as memory_efficiency
 from v8 import runtime_repair_v822 as repair
 
 
@@ -21,8 +20,7 @@ class _Env:
 
 class DecisionPointSamplingV821Tests(unittest.TestCase):
     def test_installed_actor_uses_v822_wrapper_over_v821_discovery_controller(self) -> None:
-        self.assertIs(actor_module.actor_worker, memory_efficiency._actor_worker_v851)
-        self.assertIs(memory_efficiency._BASE_ACTOR_WORKER, repair._actor_worker_v822)
+        self.assertIs(actor_module.actor_worker, repair._actor_worker_v822)
         self.assertIs(repair._BASE_ACTOR_WORKER, sampling._actor_worker_v821)
 
     def test_new_decision_point_suppresses_planner_until_probe_is_selected(self) -> None:
