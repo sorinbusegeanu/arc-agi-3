@@ -2,14 +2,14 @@ from __future__ import annotations
 
 """v8.56 click trajectory audit and inspection.
 
-Successful trajectories must preserve the executable action token for replay while
-also exposing the concrete click coordinates that were executed. Exact-coordinate
-ACTION6 tokens are already reversible; structural click tokens are location-
-independent and therefore need an observational audit captured at execution time.
+Successful trajectories keep their executable action tokens unchanged while
+inspection also exposes the concrete click coordinates that were executed.
+Exact-coordinate ACTION6 tokens are reversible already; structural click tokens are
+location-independent and therefore receive an observational execution audit.
 
 This layer is observational only. It does not change action identity, optimizer
-selection, validation, replay, canonical memory mutation, or the public v8.22
-environment-step authority.
+selection, validation, replay, canonical memory mutation, or historical adapter
+function authorities.
 """
 
 import os
@@ -18,8 +18,8 @@ from pathlib import Path
 
 
 _INSTALLED = False
-_BASE_ENV_STEP = None
-_BASE_ENV_RESET = None
+_BASE_CLICK_STEP = None
+_BASE_CLICK_RESET = None
 _BASE_RESET_CAPTURE = None
 _BASE_RESET_OBSERVED_CAPTURE = None
 _BASE_VALIDATED_SOLUTION_RECORD = None
@@ -55,17 +55,13 @@ def _fallback_action_audit(token: int) -> dict[str, object]:
 
 
 def describe_executed_action(env, token: int) -> dict[str, object]:
-    """Describe the click target that the active ACTION6 wrapper will execute."""
+    """Describe the click target that v8.10 will resolve for this action."""
     from v8 import action_targeting_v810 as targeting
 
     value = int(token)
     row = _fallback_action_audit(value)
     native = int(row["native_action"])
-    if native != 6:
-        return row
-
-    # Exact-coordinate clicks carry their own reversible coordinates.
-    if "x" in row and "y" in row:
+    if native != 6 or ("x" in row and "y" in row):
         return row
 
     target = None
@@ -95,8 +91,8 @@ def describe_executed_action(env, token: int) -> dict[str, object]:
     return row
 
 
-def _env_step_v856(self, action):
-    """Audit underneath v8.22; never replace ArcGridEnvironment.step itself."""
+def _click_step_v856(self, action):
+    """Observe execution below v8.49 without replacing adapter authorities."""
     from v8 import trajectory_optimizer_v814 as optimizer
 
     capture = bool(getattr(optimizer, "_CAPTURE_ACTIVE", False))
@@ -106,27 +102,17 @@ def _env_step_v856(self, action):
         _ACTION_AUDIT_HISTORY.append(dict(audit))
         appended = True
     self._v856_last_action_audit = dict(audit)
-
     try:
-        result = _BASE_ENV_STEP(self, action)
+        return _BASE_CLICK_STEP(self, action)
     except BaseException:
         if appended and _ACTION_AUDIT_HISTORY:
             _ACTION_AUDIT_HISTORY.pop()
         raise
 
-    if capture:
-        state = str(getattr(self, "last_outcome_state", ""))
-        reset_boundary = bool(getattr(self, "last_step_was_reset_boundary", False))
-        # v8.14/v8.19 trajectory publication runs inside _BASE_ENV_STEP. Clear only
-        # after it has consumed the audit for the terminal/resetting action.
-        if state in {"WIN", "GAME_OVER"} or reset_boundary:
-            _ACTION_AUDIT_HISTORY.clear()
-    return result
 
-
-def _env_reset_v856(self, *args, **kwargs):
+def _click_reset_v856(self, *args, **kwargs):
     _ACTION_AUDIT_HISTORY.clear()
-    return _BASE_ENV_RESET(self, *args, **kwargs)
+    return _BASE_CLICK_RESET(self, *args, **kwargs)
 
 
 def _reset_capture_v856(job=None) -> None:
@@ -370,10 +356,9 @@ def _format_best_trajectory_lines_v856(
 
 def _show_best_trajectory_v856(root: str | Path, game_id: str) -> int:
     from v8 import lifecycle_competence_integration_v827 as lifecycle
-    from v8 import trajectory_inspection_v819_fixups as fixups
 
     game = str(game_id)
-    record = fixups._best_visible_solution(root, game)
+    record = lifecycle._best_visible_solution_v827(root, game)
     if record is None:
         available = lifecycle._available_solution_games(root)
         suffix = "" if not available else "; available=" + ",".join(available)
@@ -386,24 +371,24 @@ def _show_best_trajectory_v856(root: str | Path, game_id: str) -> int:
 
 def install_trajectory_click_audit_v856() -> None:
     global _INSTALLED
-    global _BASE_ENV_STEP, _BASE_ENV_RESET, _BASE_RESET_CAPTURE
+    global _BASE_CLICK_STEP, _BASE_CLICK_RESET, _BASE_RESET_CAPTURE
     global _BASE_RESET_OBSERVED_CAPTURE, _BASE_VALIDATED_SOLUTION_RECORD
     global _BASE_OBSERVED_SOLUTION
     if _INSTALLED:
         return
 
+    from v8 import click_exploration_v848 as click
     from v8 import lifecycle_competence_integration_v827 as lifecycle
-    from v8 import runtime_repair_v822 as repair
     from v8 import trajectory_inspection_v819 as inspection
     from v8 import trajectory_optimizer_v814 as optimizer
 
-    # Keep ArcGridEnvironment.step/reset owned by v8.22.  v8.22 deliberately calls
-    # these private delegates underneath its public recovery boundary, so auditing
-    # here observes the same execution without changing historical authorities.
-    _BASE_ENV_STEP = repair._BASE_ENV_STEP
-    _BASE_ENV_RESET = repair._BASE_ENV_RESET
-    repair._BASE_ENV_STEP = _env_step_v856
-    repair._BASE_ENV_RESET = _env_reset_v856
+    # v8.49 calls these v8.48 functions dynamically, so this is the lowest safe
+    # observational insertion point. It leaves ArcGridEnvironment.step/reset and
+    # all v8.22/v8.21/v8.29 private authority links unchanged.
+    _BASE_CLICK_STEP = click._env_step_v848
+    _BASE_CLICK_RESET = click._env_reset_v848
+    click._env_step_v848 = _click_step_v856
+    click._env_reset_v848 = _click_reset_v856
 
     _BASE_RESET_CAPTURE = optimizer._reset_capture
     _BASE_RESET_OBSERVED_CAPTURE = inspection._reset_observed_capture
@@ -414,8 +399,8 @@ def install_trajectory_click_audit_v856() -> None:
     inspection._reset_observed_capture = _reset_observed_capture_v856
     inspection._observed_solution = _observed_solution_v856
 
-    # v8.27 owns the complete-solution writer so durable solutions_history remains
-    # intact.  Replace only its private delegate; do not bypass the v8.27 wrapper.
+    # v8.27 remains the complete-solution/history authority. Replace only the base
+    # writer it delegates to so history and inbox both receive the audit payload.
     lifecycle._BASE_WRITE_COMPLETE_OBSERVED_SOLUTION = _write_complete_observed_solution_v856
 
     inspection._validated_solution_record = _validated_solution_record_v856
