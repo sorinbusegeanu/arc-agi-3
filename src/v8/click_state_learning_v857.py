@@ -8,8 +8,8 @@ is sufficient for many binary/erase click games but cannot systematically discov
 three-state mechanics where a productive cell must be clicked twice.
 
 This layer keeps the installed v8.48 sampler authorities unchanged. It composes
-beneath their private delegates and adds two bounded phases after v8.48's original
-one-color sweep:
+beneath their existing v8.47 lower delegate and adds two bounded phases after
+v8.48's original one-color sweep:
 
 * visit every remaining observable game-cell centre, independent of rendered color;
 * click each productive coordinate at most one additional time per reset/level.
@@ -130,7 +130,7 @@ def _sampler_forced_fallback_v857(
     actions: tuple[int, ...],
     history: tuple[int, ...],
 ) -> int | None:
-    """Supply v8.57 phases beneath v8.48's installed forced-action wrapper."""
+    """Supply v8.57 click phases below the existing v8.47 forced delegate."""
     from v8 import click_exploration_v848 as click
     from v8 import decision_point_sampling_v821 as sampling
     from v8 import sampling_portfolio_v831 as portfolio
@@ -207,18 +207,21 @@ def install_click_state_learning_v857() -> None:
 
     from v8 import action_learning_report_v849 as report
     from v8 import click_exploration_v848 as click
+    from v8 import sampling_evidence_frontier_v847_fixups as frontier_fixups
 
     # Environment availability uses all observable cell states. v8.48 still owns
-    # ArcGridEnvironment.available_actions and its public/private wrapper identity.
+    # ArcGridEnvironment.available_actions and its wrapper identity.
     _BASE_EXACT_CLICK_PAGES = click._exact_click_pages
     click._exact_click_pages = _exact_click_pages_v857
 
-    # Compose *inside* v8.48. The stable delegates installed into v8.32/v8.47 remain
-    # exactly v8.48 functions, satisfying the historical runtime authority contract.
+    # Prepare-step extension is beneath v8.48. Forced-action extension is one layer
+    # deeper, beneath v8.47, so the historical v8.48 -> v8.47 authority chain remains
+    # byte-for-byte identifiable while v8.57 can still supply additional click work.
     _LOWER_PREPARE_STEP = click._BASE_SAMPLER_PREPARE_STEP
     click._BASE_SAMPLER_PREPARE_STEP = _sampler_prepare_fallback_v857
-    _LOWER_FORCED_ACTION = click._BASE_SAMPLER_FORCED_ACTION
-    click._BASE_SAMPLER_FORCED_ACTION = _sampler_forced_fallback_v857
+
+    _LOWER_FORCED_ACTION = frontier_fixups._BASE_LOWER_FORCED
+    frontier_fixups._BASE_LOWER_FORCED = _sampler_forced_fallback_v857
 
     _BASE_SPACE_TYPE = report._space_type
     report._space_type = _space_type_v857
