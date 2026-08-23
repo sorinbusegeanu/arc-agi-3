@@ -65,6 +65,30 @@ class ClickStateLearningV857Tests(unittest.TestCase):
         pages = click_v857._exact_click_pages_v857(env, frame)
         self.assertEqual({token for page in pages for token in page}, set(tokens))
 
+    def test_remaining_color_states_are_scanned_after_v848_first_pass(self) -> None:
+        frame, env = self._frame_and_env()
+        tokens = click_v857._all_cell_click_tokens(env, frame)
+        sampler = PortfolioSampler("gp03-all-state-fixture", seed=0)
+        sampler.begin_lease(0)
+        sampler._v848_scan_tried = set(tokens[:2])
+        sampler._v857_scan_stamp = (0, 0)
+        sampler._v857_repeat_tried = set()
+
+        with patch.object(click_v857, "_LOWER_PREPARE_STEP", return_value=True):
+            self.assertFalse(click_v857._sampler_prepare_fallback_v857(sampler, env))
+        self.assertEqual(set(sampler._v857_additional_available), set(tokens[2:]))
+
+        with patch.object(click_v857, "_LOWER_FORCED_ACTION", return_value=None):
+            selected = click_v857._sampler_forced_fallback_v857(
+                sampler,
+                level=0,
+                context=1,
+                actions=tuple(tokens),
+                history=(),
+            )
+        self.assertIn(selected, set(tokens[2:]))
+        self.assertIn(selected, sampler._v848_scan_tried)
+
     def test_productive_coordinate_gets_exactly_one_bounded_second_click(self) -> None:
         frame, env = self._frame_and_env()
         tokens = click_v857._all_cell_click_tokens(env, frame)
@@ -73,20 +97,18 @@ class ClickStateLearningV857Tests(unittest.TestCase):
 
         sampler = PortfolioSampler("gp03-repeat-fixture", seed=0)
         sampler.begin_lease(0)
-        sampler._v848_scan_reset_count = 0
-        sampler._v848_scan_level = 0
         sampler._v848_scan_tried = set(tokens)
-        sampler._v848_scan_available = ()
-        sampler._v857_repeat_stamp = (0, 0)
+        sampler._v857_scan_stamp = (0, 0)
         sampler._v857_repeat_tried = set()
+        sampler._v857_additional_available = ()
         sampler._v857_repeat_available = ()
 
-        with patch.object(click_v857, "_BASE_PREPARE_STEP", return_value=True):
-            self.assertFalse(click_v857._sampler_prepare_step_v857(sampler, env))
+        with patch.object(click_v857, "_LOWER_PREPARE_STEP", return_value=True):
+            self.assertFalse(click_v857._sampler_prepare_fallback_v857(sampler, env))
         self.assertEqual(sampler._v857_repeat_available, (target,))
 
-        with patch.object(click_v857, "_BASE_FORCED_ACTION", return_value=None):
-            selected = click_v857._sampler_forced_action_v857(
+        with patch.object(click_v857, "_LOWER_FORCED_ACTION", return_value=None):
+            selected = click_v857._sampler_forced_fallback_v857(
                 sampler,
                 level=0,
                 context=1,
@@ -96,8 +118,8 @@ class ClickStateLearningV857Tests(unittest.TestCase):
         self.assertEqual(selected, target)
         self.assertEqual(sampler._v857_repeat_tried, {target})
 
-        with patch.object(click_v857, "_BASE_PREPARE_STEP", return_value=True):
-            self.assertTrue(click_v857._sampler_prepare_step_v857(sampler, env))
+        with patch.object(click_v857, "_LOWER_PREPARE_STEP", return_value=True):
+            self.assertTrue(click_v857._sampler_prepare_fallback_v857(sampler, env))
         self.assertEqual(sampler._v857_repeat_available, ())
 
     def test_unproductive_coordinate_is_never_repeated(self) -> None:
@@ -105,14 +127,12 @@ class ClickStateLearningV857Tests(unittest.TestCase):
         tokens = click_v857._all_cell_click_tokens(env, frame)
         sampler = PortfolioSampler("gp03-noop-fixture", seed=0)
         sampler.begin_lease(0)
-        sampler._v848_scan_reset_count = 0
-        sampler._v848_scan_level = 0
         sampler._v848_scan_tried = set(tokens)
-        sampler._v857_repeat_stamp = (0, 0)
+        sampler._v857_scan_stamp = (0, 0)
         sampler._v857_repeat_tried = set()
 
-        with patch.object(click_v857, "_BASE_PREPARE_STEP", return_value=True):
-            self.assertTrue(click_v857._sampler_prepare_step_v857(sampler, env))
+        with patch.object(click_v857, "_LOWER_PREPARE_STEP", return_value=True):
+            self.assertTrue(click_v857._sampler_prepare_fallback_v857(sampler, env))
 
     def test_observed_nonclick_noops_reclassify_native_mixed_as_click(self) -> None:
         row = {
@@ -124,7 +144,6 @@ class ClickStateLearningV857Tests(unittest.TestCase):
         self.assertEqual(click_v857._space_type_v857(row), "click")
         row["movement_productive"] = 1
         self.assertEqual(click_v857._space_type_v857(row), "mixed")
-
 
 
 def _role_node(key: tuple[int, ...], watermark: int) -> NodeRecord:
@@ -211,7 +230,7 @@ class TransferCorrespondenceV857Tests(unittest.TestCase):
         candidates = TransferValidator().candidates(
             (a, b),
             (edge,),
-            provenance=view.source_games,
+            provenance=lambda uid: view.source_games(uid),
         )
         self.assertEqual(len(candidates), 2)
 
