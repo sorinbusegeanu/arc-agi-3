@@ -8,7 +8,8 @@ ACTION6 tokens are already reversible; structural click tokens are location-
 independent and therefore need an observational audit captured at execution time.
 
 This layer is observational only. It does not change action identity, optimizer
-selection, validation, replay, or canonical memory mutation.
+selection, validation, replay, canonical memory mutation, or the public v8.22
+environment-step authority.
 """
 
 import os
@@ -18,9 +19,11 @@ from pathlib import Path
 
 _INSTALLED = False
 _BASE_ENV_STEP = None
+_BASE_ENV_RESET = None
 _BASE_RESET_CAPTURE = None
 _BASE_RESET_OBSERVED_CAPTURE = None
 _BASE_VALIDATED_SOLUTION_RECORD = None
+_BASE_OBSERVED_SOLUTION = None
 
 _ACTION_AUDIT_HISTORY: list[dict[str, object]] = []
 _OBSERVED_LEVEL_AUDITS: list[tuple[dict[str, object], ...]] = []
@@ -93,6 +96,7 @@ def describe_executed_action(env, token: int) -> dict[str, object]:
 
 
 def _env_step_v856(self, action):
+    """Audit underneath v8.22; never replace ArcGridEnvironment.step itself."""
     from v8 import trajectory_optimizer_v814 as optimizer
 
     capture = bool(getattr(optimizer, "_CAPTURE_ACTIVE", False))
@@ -118,6 +122,11 @@ def _env_step_v856(self, action):
         if state in {"WIN", "GAME_OVER"} or reset_boundary:
             _ACTION_AUDIT_HISTORY.clear()
     return result
+
+
+def _env_reset_v856(self, *args, **kwargs):
+    _ACTION_AUDIT_HISTORY.clear()
+    return _BASE_ENV_RESET(self, *args, **kwargs)
 
 
 def _reset_capture_v856(job=None) -> None:
@@ -154,9 +163,20 @@ def _level_payload_with_audit(
             "actions": [int(value) for value in actions],
         }
         if index < len(audits) and len(audits[index]) == len(actions):
-            level["action_audit"] = [dict(item) for item in audits[index]]
+            rows = tuple(dict(item) for item in audits[index])
+            if any(int(item.get("native_action", -1)) == 6 for item in rows):
+                level["action_audit"] = list(rows)
         payload.append(level)
     return payload
+
+
+def _observed_solution_v856(row, levels) -> dict[str, object]:
+    solution = dict(_BASE_OBSERVED_SOLUTION(row, levels))
+    canonical = tuple(tuple(int(value) for value in level) for level in levels)
+    audits = (*tuple(_OBSERVED_LEVEL_AUDITS), _audit_for_segment(row))
+    if len(audits) == len(canonical):
+        solution["levels"] = _level_payload_with_audit(canonical, tuple(audits))
+    return solution
 
 
 def _write_complete_observed_solution_v856(row) -> None:
@@ -349,13 +369,15 @@ def _format_best_trajectory_lines_v856(
 
 
 def _show_best_trajectory_v856(root: str | Path, game_id: str) -> int:
-    from v8 import trajectory_inspection_v819 as inspection
+    from v8 import lifecycle_competence_integration_v827 as lifecycle
     from v8 import trajectory_inspection_v819_fixups as fixups
 
     game = str(game_id)
     record = fixups._best_visible_solution(root, game)
     if record is None:
-        print(f"game={game} no successful trajectory found", flush=True)
+        available = lifecycle._available_solution_games(root)
+        suffix = "" if not available else "; available=" + ",".join(available)
+        print(f"game={game} no successful trajectory found{suffix}", flush=True)
         return 1
     for line in _format_best_trajectory_lines_v856(game, record):
         print(line, flush=True)
@@ -364,24 +386,38 @@ def _show_best_trajectory_v856(root: str | Path, game_id: str) -> int:
 
 def install_trajectory_click_audit_v856() -> None:
     global _INSTALLED
-    global _BASE_ENV_STEP, _BASE_RESET_CAPTURE, _BASE_RESET_OBSERVED_CAPTURE
-    global _BASE_VALIDATED_SOLUTION_RECORD
+    global _BASE_ENV_STEP, _BASE_ENV_RESET, _BASE_RESET_CAPTURE
+    global _BASE_RESET_OBSERVED_CAPTURE, _BASE_VALIDATED_SOLUTION_RECORD
+    global _BASE_OBSERVED_SOLUTION
     if _INSTALLED:
         return
 
-    from v7.environment.arc_adapter import ArcGridEnvironment
+    from v8 import lifecycle_competence_integration_v827 as lifecycle
+    from v8 import runtime_repair_v822 as repair
     from v8 import trajectory_inspection_v819 as inspection
     from v8 import trajectory_optimizer_v814 as optimizer
 
-    _BASE_ENV_STEP = ArcGridEnvironment.step
+    # Keep ArcGridEnvironment.step/reset owned by v8.22.  v8.22 deliberately calls
+    # these private delegates underneath its public recovery boundary, so auditing
+    # here observes the same execution without changing historical authorities.
+    _BASE_ENV_STEP = repair._BASE_ENV_STEP
+    _BASE_ENV_RESET = repair._BASE_ENV_RESET
+    repair._BASE_ENV_STEP = _env_step_v856
+    repair._BASE_ENV_RESET = _env_reset_v856
+
     _BASE_RESET_CAPTURE = optimizer._reset_capture
     _BASE_RESET_OBSERVED_CAPTURE = inspection._reset_observed_capture
     _BASE_VALIDATED_SOLUTION_RECORD = inspection._validated_solution_record
+    _BASE_OBSERVED_SOLUTION = inspection._observed_solution
 
-    ArcGridEnvironment.step = _env_step_v856
     optimizer._reset_capture = _reset_capture_v856
     inspection._reset_observed_capture = _reset_observed_capture_v856
-    inspection._write_complete_observed_solution = _write_complete_observed_solution_v856
+    inspection._observed_solution = _observed_solution_v856
+
+    # v8.27 owns the complete-solution writer so durable solutions_history remains
+    # intact.  Replace only its private delegate; do not bypass the v8.27 wrapper.
+    lifecycle._BASE_WRITE_COMPLETE_OBSERVED_SOLUTION = _write_complete_observed_solution_v856
+
     inspection._validated_solution_record = _validated_solution_record_v856
     inspection._format_best_trajectory_lines = _format_best_trajectory_lines_v856
     inspection.show_best_trajectory = _show_best_trajectory_v856
