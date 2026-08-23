@@ -174,13 +174,25 @@ def score_memory(row: NodeRecord, *, developmental_stage: int | None = None) -> 
 
 def _rank_normalize(
     values: list[tuple[MemoryUid, float]],
-) -> dict[MemoryUid, float]:
+    *,
+    cancel_event=None,
+) -> dict[MemoryUid, float] | None:
+    if cancel_event is not None and cancel_event.is_set():
+        return None
     if len(values) < 4:
         return {uid: _clip(value) for uid, value in values}
     ordered = sorted(values, key=lambda item: (float(item[1]), item[0]))
+    if cancel_event is not None and cancel_event.is_set():
+        return None
     denominator = max(1, len(ordered) - 1)
     result: dict[MemoryUid, float] = {}
     for rank, (uid, _value) in enumerate(ordered):
+        if (
+            rank % 4096 == 0
+            and cancel_event is not None
+            and cancel_event.is_set()
+        ):
+            return None
         result[uid] = rank / denominator
     return result
 
@@ -189,22 +201,41 @@ def score_memories(
     rows: Iterable[NodeRecord],
     *,
     developmental_stage: int,
-) -> dict[MemoryUid, ISFScore]:
+    cancel_event=None,
+) -> dict[MemoryUid, ISFScore] | None:
     """Deterministically normalize within (level,type,Stage_t) comparison classes."""
     stage = max(0, min(6, int(developmental_stage)))
     grouped: dict[tuple[int, int, int], list[NodeRecord]] = defaultdict(list)
-    for row in rows:
+    for index, row in enumerate(rows):
+        if (
+            index % 4096 == 0
+            and cancel_event is not None
+            and cancel_event.is_set()
+        ):
+            return None
         grouped[(int(row.level), int(row.memory_type), stage)].append(row)
 
     result: dict[MemoryUid, ISFScore] = {}
     for members in grouped.values():
+        if cancel_event is not None and cancel_event.is_set():
+            return None
         raw = {row.uid: raw_components(row) for row in members}
         normalized_channels: list[dict[MemoryUid, float]] = []
         for index in range(5):
-            normalized_channels.append(
-                _rank_normalize([(row.uid, raw[row.uid][index]) for row in members])
+            normalized = _rank_normalize(
+                [(row.uid, raw[row.uid][index]) for row in members],
+                cancel_event=cancel_event,
             )
-        for row in members:
+            if normalized is None:
+                return None
+            normalized_channels.append(normalized)
+        for index, row in enumerate(members):
+            if (
+                index % 4096 == 0
+                and cancel_event is not None
+                and cancel_event.is_set()
+            ):
+                return None
             future = raw[row.uid][5]
             components = (
                 normalized_channels[0][row.uid],

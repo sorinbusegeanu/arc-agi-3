@@ -333,9 +333,19 @@ def _parallel_analyses_v841(self, nodes, edges):
         "future": pool.submit(self.future_options.evaluate, nodes),
         "compression": pool.submit(self.compression.evaluate, nodes, edges),
         "similarity": pool.submit(self.similarity.evaluate, nodes, edges),
-        "transfer": pool.submit(self.transfer.candidates, nodes, provenance=self.read_view.source_games),
+        "transfer": pool.submit(
+            self.transfer.candidates,
+            nodes,
+            provenance=self.read_view.source_games,
+            cancel_event=self._v841_peer_cancel,
+        ),
         "world": pool.submit(self.world_model.propose, nodes),
-        "replay": pool.submit(self.replay.candidates, nodes, budget=self.candidate_budget),
+        "replay": pool.submit(
+            self.replay.candidates,
+            nodes,
+            budget=self.candidate_budget,
+            cancel_event=self._v841_peer_cancel,
+        ),
     }
     return {name: future.result() for name, future in futures.items()}
 
@@ -498,6 +508,11 @@ def _overflow_dispatcher(service) -> _CandidateOverflowDispatcher:
 
 def _route_candidate_base_v841(service, candidate) -> bool:
     from v8 import trajectory_optimizer_v818 as v818
+    from v8 import trajectory_target_minimization_v820 as v820
+
+    if v820._validation_cancel_requested(service):
+        v820._preserve_cancelled_source(service, candidate)
+        return False
 
     game = str(candidate.source.anchor.source_id)
     with service._v818_validator_lock:
@@ -522,6 +537,60 @@ def _ingest_inbox_v841(service) -> None:
     if bool(getattr(service, "_v841_preserve_inbox_on_shutdown", False)):
         return
     return _BASE_INGEST_INBOX(service)
+
+
+def _cancel_optimizer_validations_v841(service) -> None:
+    """Cancel volatile validation work while preserving every source durably."""
+
+    from v8 import trajectory_target_minimization_v820 as v820
+
+    cancel = getattr(service, "_v841_validation_cancel", None)
+    if cancel is None:
+        cancel = threading.Event()
+        service._v841_validation_cancel = cancel
+    cancel.set()
+
+    if not hasattr(service, "_sources"):
+        return
+
+    worker = getattr(service, "_v841_candidate_overflow", None)
+    if worker is not None:
+        with worker._lock:
+            overflow = tuple(
+                candidate
+                for bucket in worker._pending.values()
+                for candidate in bucket.values()
+            )
+        for candidate in overflow:
+            v820._preserve_cancelled_source(service, candidate)
+        worker.close(drain=False, timeout=5.0)
+        service._v841_candidate_overflow = None
+
+    while True:
+        try:
+            source = service._sources.get_nowait()
+        except queue.Empty:
+            break
+        with service._lock:
+            known = {
+                str(row.trajectory_id)
+                for row in service._v818_restored_sources
+            }
+            if str(source.trajectory_id) not in known:
+                service._v818_restored_sources.append(source)
+        service._sources.task_done()
+
+    with service._v818_validator_lock:
+        queues = tuple(service._v818_game_queues.values())
+        service._v818_waiting_games.clear()
+    for validation_queue in queues:
+        while True:
+            try:
+                candidate = validation_queue.get_nowait()
+            except queue.Empty:
+                break
+            v820._preserve_cancelled_source(service, candidate)
+            validation_queue.task_done()
 
 
 def _optimizer_idle_v841(service) -> bool:

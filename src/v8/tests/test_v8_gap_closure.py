@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from v8 import replay as replay_module
 from v8.arena import NodeRecord
 from v8.development import derive_proposal
 from v8.dirty import DirtyAccumulator
 from v8.evaluation import ScientificHypothesisEvaluator
 from v8.evidence import EvidenceLedger, EvidenceRecord
-from v8.isf import score_memory
+from v8.isf import score_memories, score_memory
 from v8.lifecycle import LifecycleController
 from v8.model import (
     CognitiveState,
@@ -113,6 +116,63 @@ class DevelopmentalControlTests(unittest.TestCase):
         rows = ReplayScheduler(min_priority=0.0).candidates((low, high), budget=1)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].uid, high.uid)
+
+    def test_replay_attention_uses_exact_bounded_top_k(self) -> None:
+        rows = tuple(
+            node(
+                MemoryLevel.M4,
+                MemoryType.CONCEPT,
+                (index, 1),
+                support=8,
+                prediction_error=float(index) / 20.0,
+            )
+            for index in range(20)
+        )
+        original = replay_module.heapq.nsmallest
+        with mock.patch.object(
+            replay_module.heapq,
+            "nsmallest",
+            side_effect=original,
+        ) as bounded:
+            selected = ReplayScheduler(min_priority=0.0).candidates(rows, budget=3)
+
+        self.assertEqual(len(selected), 3)
+        self.assertEqual(bounded.call_args.args[0], 3)
+        self.assertNotIsInstance(bounded.call_args.args[1], (list, tuple))
+        self.assertEqual(
+            tuple((row.priority, row.uid) for row in selected),
+            tuple(sorted(
+                ((row.priority, row.uid) for row in selected),
+                key=lambda item: (-item[0], item[1]),
+            )),
+        )
+
+    def test_replay_scoring_honors_cancel_after_grouping_starts(self) -> None:
+        cancel = threading.Event()
+        row = node(MemoryLevel.M4, MemoryType.CONCEPT, (1, 1), support=8)
+
+        class CancellingRows:
+            def __iter__(self):
+                for index in range(5000):
+                    if index == 1:
+                        cancel.set()
+                    yield row
+
+        self.assertIsNone(
+            score_memories(
+                CancellingRows(),
+                developmental_stage=0,
+                cancel_event=cancel,
+            )
+        )
+        self.assertEqual(
+            ReplayScheduler(min_priority=0.0).candidates(
+                (row,),
+                budget=1,
+                cancel_event=cancel,
+            ),
+            (),
+        )
 
     def test_world_model_requires_multiple_concept_consequences(self) -> None:
         a = node(MemoryLevel.M5, MemoryType.CONSEQUENCE, (10, 11, 99, 1), support=3)

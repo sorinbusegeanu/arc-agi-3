@@ -9,8 +9,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from v8 import runtime_scaling_v841 as v841
+from v8.developmental_cut import DevelopmentalGenerationCut
 from v8.model import MemoryLevel, MemoryUid
 from v8.peers import DevelopmentalPeerSupervisor
+from v8.peers_v82 import _FrozenCutReadView, V82DevelopmentalPeerSupervisor
 
 
 class FeedbackScalingTests(unittest.TestCase):
@@ -142,6 +144,38 @@ class DeferredScalingTests(unittest.TestCase):
 
 
 class PeerScalingTests(unittest.TestCase):
+    def test_frozen_provenance_walk_honors_final_drain_cancellation(self):
+        cancel = threading.Event()
+        cut = DevelopmentalGenerationCut(0, 0, (), (), (), "")
+        frozen = _FrozenCutReadView(cut, cancel_event=cancel)
+        child = MemoryUid(1, 1)
+        parent = MemoryUid(2, 2)
+        frozen._parents[child] = {parent}
+        cancel.set()
+
+        self.assertEqual(frozen.source_games(child), frozenset())
+        self.assertTrue(frozen.cancelled)
+
+    def test_primary_valence_formation_stops_before_cancelled_candidate(self):
+        cancel = threading.Event()
+
+        class Promotion:
+            @staticmethod
+            def propose(*_args, **_kwargs):
+                cancel.set()
+                yield object()
+
+        peer = SimpleNamespace(
+            _v841_peer_cancel=cancel,
+            promotion=Promotion(),
+            candidate_budget=8,
+            _primary_valence_formation_state={},
+        )
+        frozen = SimpleNamespace(cancelled=False)
+        cut = SimpleNamespace(nodes=(), edges=())
+
+        V82DevelopmentalPeerSupervisor._process_formation(peer, cut, frozen)
+
     def test_cancelled_peer_cycle_does_not_read_the_graph(self):
         class ReadView:
             def node_records(self):
@@ -233,6 +267,44 @@ class PeerScalingTests(unittest.TestCase):
 
 
 class OptimizerScalingTests(unittest.TestCase):
+    def test_final_drain_discards_volatile_candidates_but_preserves_source(self):
+        from v8 import trajectory_optimizer_v814 as optimizer
+        from v8 import trajectory_optimizer_v818 as v818
+        from v8 import trajectory_target_minimization_v820 as v820
+
+        with tempfile.TemporaryDirectory() as root:
+            service = optimizer.TrajectoryOptimizationService(
+                Path(root), validator=lambda _candidate: None
+            )
+            anchor = optimizer.ReplayAnchor("g", 0, (), None)
+            target = optimizer.TrajectoryTarget(1, "LEVEL")
+            source = optimizer.SuccessfulTrajectory(
+                optimizer._trajectory_id(anchor, target, (1, 2, 3)),
+                anchor,
+                target,
+                (1, 2, 3),
+                MemoryUid.zero(),
+                MemoryUid.zero(),
+                1,
+            )
+            candidate = v820._candidate(
+                optimizer, source, "DELETE_ACTION", (1, 2), 2, 1
+            )
+            v818._begin_source_work(service, source)
+            v818._track_candidate_work(service, candidate)
+            validation_queue = queue.Queue()
+            validation_queue.put(candidate)
+            service._v818_game_queues["g"] = validation_queue
+
+            v841._cancel_optimizer_validations_v841(service)
+
+            self.assertTrue(service._v841_validation_cancel.is_set())
+            self.assertEqual(validation_queue.unfinished_tasks, 0)
+            self.assertEqual(
+                [item["trajectory_id"] for item in service.state_dict()["pending_sources"]],
+                [source.trajectory_id],
+            )
+
     def test_full_validator_queue_routes_to_nonblocking_overflow(self):
         from v8 import trajectory_optimizer_v818 as v818
 

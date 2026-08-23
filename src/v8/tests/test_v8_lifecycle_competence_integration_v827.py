@@ -7,10 +7,11 @@ import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import v8
 from v8 import adaptive_learning_allocation_v819 as adaptive
+from v8 import adaptive_learning_allocation_v819_solve_fix as solve_fix
 from v8 import lifecycle_competence_integration_v827 as integration
 from v8 import lifecycle_switch_v827 as switch
 from v8 import trajectory_inspection_v819 as inspection
@@ -101,6 +102,46 @@ class LifecycleCompetenceIntegrationV827Tests(unittest.TestCase):
                 coordinator.game_state("g"),
                 adaptive.GameLearningState.UNSOLVED,
             )
+
+    def test_optimizer_admission_uses_cached_lifecycle_index(self) -> None:
+        coordinator, _strategy_uid = self._coordinator(
+            CognitiveState.ACTIVE,
+            CognitiveState.ACTIVE,
+        )
+        coordinator._v827_read_view._refresh_strategy_cache = Mock(
+            side_effect=AssertionError("optimizer admission must not refresh graph")
+        )
+
+        self.assertEqual(
+            solve_fix._cached_game_state(coordinator, "g"),
+            adaptive.GameLearningState.SOLVED_STABLE,
+        )
+        coordinator._v827_read_view._refresh_strategy_cache.assert_not_called()
+
+    def test_telemetry_uses_cached_state_without_graph_refresh(self) -> None:
+        coordinator, _strategy_uid = self._coordinator(
+            CognitiveState.ACTIVE,
+            CognitiveState.ACTIVE,
+        )
+        coordinator._v827_read_view._refresh_strategy_cache = Mock(
+            side_effect=AssertionError("telemetry must not refresh graph")
+        )
+        coordinator.game_state = Mock(
+            side_effect=AssertionError("telemetry must use cached game state")
+        )
+        coordinator.sampling_weight = Mock(
+            side_effect=AssertionError("telemetry must use cached state weight")
+        )
+
+        rows = coordinator.telemetry()
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(
+            rows[0].state,
+            adaptive.GameLearningState.SOLVED_STABLE.value,
+        )
+        self.assertEqual(rows[0].sampling_weight, coordinator.config.stable_weight)
+        coordinator._v827_read_view._refresh_strategy_cache.assert_not_called()
 
     def test_sidecar_lifecycle_pair_blocks_retired_and_allows_quarantine_only_explicitly(self) -> None:
         strategy_uid = MemoryUid(1, 1)

@@ -362,6 +362,11 @@ class LiveReadView:
             counts[outcome] = counts.get(outcome, 0) + support
             outcome_totals[key] = outcome_totals.get(key, 0) + support
         parents: dict[MemoryUid, set[MemoryUid]] = {}
+        cache_transfer_indexes = not bool(
+            getattr(self, "_behavior_actor_mode", False)
+        )
+        direct_games: dict[MemoryUid, set[int]] = {}
+        transfer_edges: list[EdgeRecord] = []
         preferred: set[MemoryUid] = set()
         suppressed: set[MemoryUid] = set()
         refined: dict[tuple[int, int], list[float]] = {}
@@ -369,6 +374,16 @@ class LiveReadView:
             relation = int(edge.relation_type)
             if relation in _LINEAGE_RELATIONS:
                 parents.setdefault(edge.source_uid, set()).add(edge.target_uid)
+            if cache_transfer_indexes:
+                if (
+                    relation == int(RelationType.GAME_PROVENANCE)
+                    and int(edge.target_uid.hi) == 0
+                ):
+                    direct_games.setdefault(edge.source_uid, set()).add(
+                        int(edge.target_uid.lo)
+                    )
+                elif relation == int(RelationType.TRANSFER_CORRESPONDENCE):
+                    transfer_edges.append(edge)
             if relation == int(RelationType.PREFERENCE) and edge.source_uid in active_uids:
                 preferred.add(edge.source_uid)
             if relation == int(RelationType.SUPERSEDES) and edge.source_uid in active_uids:
@@ -393,6 +408,16 @@ class LiveReadView:
 
         self._parents = parents
         self._node_by_uid = node_by_uid
+        if cache_transfer_indexes:
+            # Transfer validation runs after the final canonical drain. Reuse the
+            # exact coherent edge cut already scanned here instead of rebuilding
+            # provenance over every edge a second time at process shutdown.
+            self._v839_provenance_version = tuple(edge_versions)
+            self._v839_direct_games = direct_games
+            self._v839_provenance_parents = parents
+            self._v839_source_games_cache = {}
+            self._v839_transfer_version = tuple(edge_versions)
+            self._v839_transfer_edges = tuple(transfer_edges)
         by_context: dict[int, list[_StrategyRow]] = {}
         fallback: list[_StrategyRow] = []
         for row in nodes:

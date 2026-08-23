@@ -85,6 +85,7 @@ def _lower_forced_v847(
     if int(action) not in available:
         node.available_actions.discard(int(action))
         self._v847_dirty = True
+        frontier._touch_node_v847(self, node)
         _clear_continuation_v847(self)
         return None
 

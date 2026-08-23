@@ -793,7 +793,12 @@ class AdaptiveLearningCoordinator:
             games = tuple(sorted(self._games))
             total = max(1, self.total_sample_steps())
             result = []
+            state_reader = getattr(self, "_v819_telemetry_game_state", None)
+            if not callable(state_reader):
+                state_reader = self.game_state
+            weight_reader = getattr(self, "_v819_telemetry_sampling_weight", None)
             for game in games:
+                state = state_reader(game)
                 run = self._run.setdefault(game, GameRunTelemetry())
                 best = self.frontier.best_for_game(game)
                 if best is None:
@@ -810,10 +815,14 @@ class AdaptiveLearningCoordinator:
                 result.append(
                     GameLearningTelemetrySnapshot(
                         game,
-                        self.game_state(game).value,
+                        state.value,
                         int(run.sample_steps),
                         float(run.sample_steps) / float(total),
-                        float(self.sampling_weight(game)),
+                        float(
+                            weight_reader(game, state)
+                            if callable(weight_reader)
+                            else self.sampling_weight(game)
+                        ),
                         run.last_mode.value,
                         cost,
                         reliability,

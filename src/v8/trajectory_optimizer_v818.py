@@ -93,11 +93,14 @@ class _GameReplayValidator:
 
     def _trial(self, candidate, execution_seed: int, prefix: tuple[int, ...]):
         from v7.environment.encoding import structural_grid_signature, transition_signature
+        from v8 import trajectory_target_minimization_v820 as v820
 
+        v820._raise_if_validation_cancelled(self.service)
         env = self._environment(execution_seed, candidate.source.anchor.env_root)
         target = candidate.source.target
         prefix_executed = 0
         for action in prefix:
+            v820._raise_if_validation_cancelled(self.service)
             if not self._action_available(env, int(action)):
                 return False, 0, "prefix_action_unavailable", 0, 0, 0, prefix_executed
             env.step(int(action))
@@ -110,6 +113,7 @@ class _GameReplayValidator:
 
         candidate_steps = 0
         for action in candidate.actions:
+            v820._raise_if_validation_cancelled(self.service)
             if not self._action_available(env, int(action)):
                 return False, candidate_steps, "candidate_action_unavailable", 0, 0, 0, prefix_executed
             before = env.observe()

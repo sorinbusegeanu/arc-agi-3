@@ -17,6 +17,45 @@ _PROCESS_MIRROR = None
 _BASE_REPORTING_WORKER = None
 
 
+class _AsyncHypothesisReporter:
+    """Evaluate the slower scientific summary without delaying minute telemetry."""
+
+    def __init__(self) -> None:
+        self._thread = None
+        self._results = queue.SimpleQueue()
+
+    def start(self, evidence_rows, watermark_value: int) -> bool:
+        if self._thread is not None and self._thread.is_alive():
+            return False
+
+        def evaluate() -> None:
+            try:
+                result = (True, _hypothesis_status_line(evidence_rows, watermark_value))
+            except BaseException as exc:
+                result = (False, exc)
+            self._results.put(result)
+
+        self._thread = threading.Thread(
+            target=evaluate,
+            name="v8-hypothesis-reporter",
+            daemon=True,
+        )
+        self._thread.start()
+        return True
+
+    def emit_ready(self, output_queue=None) -> None:
+        from v8 import reporter
+
+        while True:
+            try:
+                succeeded, value = self._results.get_nowait()
+            except queue.Empty:
+                return
+            if not succeeded:
+                raise value
+            reporter._emit_line(str(value), output_queue)
+
+
 class _TeeStdout:
     def __init__(self, original, path: Path, *, suppress_progress: bool = False) -> None:
         self.original = original
@@ -245,6 +284,7 @@ def _reporting_worker_v836(
     now = time.monotonic()
     next_report = now + float(interval_seconds)
     next_hypotheses = now + max(0.001, float(hypothesis_interval_seconds))
+    hypotheses = _AsyncHypothesisReporter()
 
     while not stop_event.is_set():
         now = time.monotonic()
@@ -275,12 +315,13 @@ def _reporting_worker_v836(
             while next_report <= now:
                 next_report += float(interval_seconds)
 
+        hypotheses.emit_ready(output_queue)
+
         if now >= next_hypotheses:
-            line = _hypothesis_status_line(
+            hypotheses.start(
                 tuple(evidence_by_id.values()),
                 int(getattr(watermark, "value", 0)),
             )
-            reporter._emit_line(line, output_queue)
             while next_hypotheses <= now:
                 next_hypotheses += max(0.001, float(hypothesis_interval_seconds))
 

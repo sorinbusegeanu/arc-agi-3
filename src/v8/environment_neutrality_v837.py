@@ -734,9 +734,13 @@ class _EnvironmentReplayValidator:
             return False
 
     def _trial(self, candidate, execution_seed: int, prefix: tuple[int, ...]):
+        from v8 import trajectory_target_minimization_v820 as v820
+
+        v820._raise_if_validation_cancelled(self.service)
         env = self._environment(execution_seed, candidate.source.anchor.env_root)
         prefix_executed = 0
         for action in prefix:
+            v820._raise_if_validation_cancelled(self.service)
             if not self._action_available(env, int(action)):
                 return False, 0, "prefix_action_unavailable", 0, 0, 0, prefix_executed
             env.step(int(action))
@@ -748,6 +752,7 @@ class _EnvironmentReplayValidator:
 
         candidate_steps = 0
         for action in candidate.actions:
+            v820._raise_if_validation_cancelled(self.service)
             if not self._action_available(env, int(action)):
                 return False, candidate_steps, "candidate_action_unavailable", 0, 0, 0, prefix_executed
             before = env.observe()
@@ -763,6 +768,7 @@ class _EnvironmentReplayValidator:
 
     def validate(self, candidate):
         from v8 import trajectory_optimizer_v818 as v818
+        from v8 import trajectory_target_minimization_v820 as v820
 
         prefix = tuple(self.service._v818_prefix_for(candidate))
         successes = attempts = total_actions = 0
@@ -770,9 +776,12 @@ class _EnvironmentReplayValidator:
         last_reason = "target_not_reached"
         terminal_context = terminal_action = outcome_signature = 0
         for seed in v818._VALIDATION_SEEDS:
+            v820._raise_if_validation_cancelled(self.service)
             attempts += 1
             try:
                 ok, steps, reason, context, action, outcome, _prefix_steps = self._trial(candidate, seed, prefix)
+            except v820._ValidationCancelled:
+                raise
             except BaseException as exc:
                 ok, steps, reason = False, 0, f"{type(exc).__name__}: {exc}"
                 context = action = outcome = 0

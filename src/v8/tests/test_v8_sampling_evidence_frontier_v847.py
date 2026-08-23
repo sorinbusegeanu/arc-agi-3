@@ -328,6 +328,35 @@ class EvidencePrefixFrontierV847Tests(unittest.TestCase):
         selected = v847._best_expansion_v847(sampler)
         self.assertIs(selected[0], high)
 
+    def test_best_expansion_uses_incremental_index_without_frontier_scan(self) -> None:
+        sampler = portfolio.PortfolioSampler("g", seed=51)
+        nodes = [
+            v847.EvidencePrefixNode(
+                f"C:0:{context}",
+                0,
+                context,
+                (),
+                available_actions={1},
+                prediction_error=float(context) / 1000.0,
+            )
+            for context in range(1000)
+        ]
+        for node in nodes:
+            v847._upsert_node_v847(sampler, node)
+
+        class NoScanDict(dict):
+            def values(self):
+                raise AssertionError("best expansion must not scan all frontier nodes")
+
+        sampler._v847_nodes = NoScanDict(sampler._v847_nodes)
+        selected = v847._best_expansion_v847(sampler)
+        self.assertIs(selected[0], nodes[-1])
+
+        nodes[-1].tried_actions.add(1)
+        v847._touch_node_v847(sampler, nodes[-1])
+        selected = v847._best_expansion_v847(sampler)
+        self.assertIs(selected[0], nodes[-2])
+
     def test_frontier_state_restores_across_actor_ids_from_existing_runtime_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             os.environ[v847._TRAJECTORY_ROOT_ENV] = tmp

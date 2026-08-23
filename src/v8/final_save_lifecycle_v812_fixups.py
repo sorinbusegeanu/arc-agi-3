@@ -13,6 +13,17 @@ def _run_generation_lifecycle(supervisor, nodes) -> int:
     from v8 import final_save_lifecycle_v812 as base
 
     lifecycle = supervisor.lifecycle
+    pause = getattr(supervisor, "_pause", None)
+    stop_event = getattr(supervisor, "_stop", None)
+
+    def cancelled() -> bool:
+        return bool(
+            (pause is not None and pause.is_set())
+            or (stop_event is not None and stop_event.is_set())
+        )
+
+    if cancelled():
+        return 0
     if not bool(getattr(lifecycle, "_v812_enforce_generation_sweep", False)):
         return 0
     global_window = max(0, int(supervisor.current_generation())) // int(
@@ -37,7 +48,11 @@ def _run_generation_lifecycle(supervisor, nodes) -> int:
         start = int(getattr(lifecycle, "_v812_next_bucket", 0))
         stop = min(int(base._LIFECYCLE_BUCKETS), start + buckets_per_cycle)
         for bucket in range(start, stop):
-            for row in nodes:
+            if cancelled():
+                return evaluated
+            for row_index, row in enumerate(nodes):
+                if row_index % 256 == 0 and cancelled():
+                    return evaluated
                 if (
                     (int(row.uid.hi) ^ int(row.uid.lo))
                     & (base._LIFECYCLE_BUCKETS - 1)
@@ -59,6 +74,8 @@ def _run_generation_lifecycle(supervisor, nodes) -> int:
                         validation_state=int(decision.validation_state),
                     )
                 )
+        if cancelled():
+            return evaluated
         lifecycle._v812_next_bucket = stop
         if stop >= int(base._LIFECYCLE_BUCKETS):
             lifecycle._v812_last_completed_window = active_window

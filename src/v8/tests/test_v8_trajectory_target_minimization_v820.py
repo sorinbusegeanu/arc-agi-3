@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -207,6 +208,43 @@ class SearchOrderingTests(unittest.TestCase):
 
 
 class ValidationResultTests(unittest.TestCase):
+    def test_final_drain_cancellation_preserves_source_without_failed_result(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            service = optimizer.TrajectoryOptimizationService(
+                Path(root), validator=lambda _c: None
+            )
+            row = source((1, 2, 3, 4, 5), game="cancelled")
+            candidate = v820._candidate(
+                optimizer,
+                row,
+                "DELETE_SEGMENT",
+                row.actions[:-1],
+                4,
+                1,
+            )
+            cancel = threading.Event()
+            service._v841_validation_cancel = cancel
+
+            def cancel_during_validation(_candidate):
+                cancel.set()
+                return result(False, attempts=1, successes=0)
+
+            with self.assertRaises(v820._ValidationCancelled):
+                v820._validate_tracked(
+                    service,
+                    FakeValidator(cancel_during_validation),
+                    candidate,
+                )
+
+            self.assertEqual(service._active_validations, 0)
+            self.assertNotIn(candidate.candidate_id, service._attempted)
+            state = service.state_dict()
+            self.assertEqual(
+                [item["trajectory_id"] for item in state["pending_sources"]],
+                [row.trajectory_id],
+            )
+            self.assertTrue((service.inbox / f"shutdown-{row.trajectory_id}.json").exists())
+
     def test_real_validator_reports_each_successful_seed_stopping_point(self) -> None:
         from v8 import trajectory_optimizer_v818 as v818
         from v8.trajectory_validation_v814 import validate_arc_candidate

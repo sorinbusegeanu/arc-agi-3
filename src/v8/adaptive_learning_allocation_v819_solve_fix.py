@@ -1,11 +1,71 @@
 from __future__ import annotations
 
+import os
 from collections import defaultdict
 
 
 _INSTALLED = False
 _BASE_SERVICE_SUBMIT_V819 = None
 _BASE_PUBLISH_VALIDATED_SOURCE_V819 = None
+
+
+def _cached_game_state(coordinator, game_id: str):
+    """Read allocation/lifecycle state without rebuilding a multi-million-node index."""
+    from v8 import adaptive_learning_allocation_v819 as v819
+    from v8 import lifecycle_competence_integration_v827 as lifecycle
+
+    game = str(game_id)
+    if not all(
+        hasattr(coordinator, name)
+        for name in ("_lock", "_game_won", "_records")
+    ):
+        return coordinator.game_state(game)
+    with coordinator._lock:
+        if not bool(coordinator._game_won.get(game, False)):
+            return v819.GameLearningState.UNSOLVED
+        rows = [
+            row
+            for (owner, _level), row in coordinator._records.items()
+            if owner == game
+        ]
+        if not rows:
+            return v819.GameLearningState.UNSOLVED
+        state = (
+            v819.GameLearningState.SOLVED_OPTIMIZING
+            if any(
+                row.state == v819.GameLearningState.SOLVED_OPTIMIZING
+                for row in rows
+            )
+            else v819.GameLearningState.SOLVED_STABLE
+        )
+
+    lifecycle_class = lifecycle._cached_frontier_lifecycle_class(coordinator, game)
+    if lifecycle_class in {"UNKNOWN", "ACTIVE"}:
+        return state
+    if lifecycle_class == "QUARANTINED":
+        return v819.GameLearningState.SOLVED_OPTIMIZING
+    return v819.GameLearningState.UNSOLVED
+
+
+def _cached_sampling_weight(coordinator, game_id: str, state) -> float:
+    """Report the installed allocation weight without another lifecycle refresh."""
+    from v8 import adaptive_learning_allocation_v819 as v819
+
+    base = {
+        v819.GameLearningState.UNSOLVED: float(coordinator.config.unsolved_weight),
+        v819.GameLearningState.SOLVED_OPTIMIZING: float(
+            coordinator.config.optimizing_weight
+        ),
+        v819.GameLearningState.SOLVED_STABLE: float(coordinator.config.stable_weight),
+    }[state]
+    enabled = str(os.environ.get("ARC_AGI3_V8_PLATEAU_PRIORITY_ENABLED", "0")).lower()
+    if enabled not in {"1", "true", "yes", "on"}:
+        return max(1e-9, base)
+    with coordinator._lock:
+        signals = coordinator._signals.setdefault(
+            str(game_id), v819.GamePrioritySignals()
+        )
+        return max(1e-9, base * signals.multiplier)
 
 
 def _game_is_validated_solved(service, game_id: str) -> bool:
@@ -16,7 +76,7 @@ def _game_is_validated_solved(service, game_id: str) -> bool:
     try:
         from v8 import adaptive_learning_allocation_v819 as v819
 
-        return coordinator.game_state(str(game_id)) != v819.GameLearningState.UNSOLVED
+        return _cached_game_state(coordinator, str(game_id)) != v819.GameLearningState.UNSOLVED
     except BaseException:
         return False
 
@@ -117,6 +177,10 @@ def install_adaptive_learning_allocation_v819_solve_fix() -> None:
 
     _BASE_SERVICE_SUBMIT_V819 = v819._service_submit_v819
     _BASE_PUBLISH_VALIDATED_SOURCE_V819 = v819._publish_validated_source
+    v819.AdaptiveLearningCoordinator._v819_telemetry_game_state = _cached_game_state
+    v819.AdaptiveLearningCoordinator._v819_telemetry_sampling_weight = (
+        _cached_sampling_weight
+    )
     v819._service_submit_v819 = _service_submit_solve_first
     v819._publish_validated_source = _publish_validated_source_solve_first
     _INSTALLED = True

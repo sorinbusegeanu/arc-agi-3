@@ -14,6 +14,52 @@ _TARGET_MINIMIZE = "TARGET_MINIMIZE"
 _DIRECT_ACTION = "DIRECT_ACTION"
 _TRUNCATE_SUCCESS_PREFIX = "TRUNCATE_SUCCESS_PREFIX"
 _DELTA_DELETE = "DELTA_DELETE"
+_CANCELLED_SOURCE_MARKER = "__v841_shutdown_cancelled__"
+
+
+class _ValidationCancelled(RuntimeError):
+    """Internal control flow for a replay interrupted by final shutdown drain."""
+
+
+def _validation_cancel_requested(service) -> bool:
+    cancel = getattr(service, "_v841_validation_cancel", None)
+    if cancel is None:
+        return False
+    is_set = getattr(cancel, "is_set", None)
+    return bool(is_set()) if callable(is_set) else bool(cancel)
+
+
+def _raise_if_validation_cancelled(service) -> None:
+    if _validation_cancel_requested(service):
+        raise _ValidationCancelled("trajectory validation cancelled for final drain")
+
+
+def _preserve_cancelled_source(service, candidate) -> None:
+    """Keep an interrupted optimizer source restartable in the next snapshot."""
+
+    source = candidate.source
+    source_id = str(source.trajectory_id)
+    with service._lock:
+        service._attempted.discard(str(candidate.candidate_id))
+        pending = service._v818_pending_sources.get(source_id)
+        if pending is None:
+            pending = {
+                "source": source,
+                "candidate_ids": set(),
+                "routing_open": False,
+            }
+            service._v818_pending_sources[source_id] = pending
+        pending["candidate_ids"].add(f"{_CANCELLED_SOURCE_MARKER}:{source_id}")
+
+    # Round-zero source-validation trajectories do not pass through the normal
+    # v8.18 pending-source map. Keep an atomic inbox copy as well, so cancellation
+    # never turns a successful sampler observation into volatile-only work.
+    if int(getattr(source, "round_index", 0)) == 0:
+        from v8 import trajectory_optimizer_v814 as optimizer
+
+        service.inbox.mkdir(parents=True, exist_ok=True)
+        target = service.inbox / f"shutdown-{source_id}.json"
+        optimizer._atomic_json(target, source.to_dict())
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +120,7 @@ def _game_validate_v820(self, candidate) -> V820ValidationResult:
     levels_completed = 0
 
     for execution_seed in v818._VALIDATION_SEEDS:
+        _raise_if_validation_cancelled(self.service)
         attempts += 1
         try:
             ok, steps, reason, context, action, outcome, _prefix_steps = self._trial(
@@ -81,6 +128,8 @@ def _game_validate_v820(self, candidate) -> V820ValidationResult:
                 execution_seed,
                 prefix,
             )
+        except _ValidationCancelled:
+            raise
         except BaseException as exc:
             ok = False
             steps = 0
@@ -208,9 +257,11 @@ def _available_actions_at_anchor(validator, candidate) -> tuple[int, ...]:
     prefix = tuple(validator.service._v818_prefix_for(candidate))
     actions: set[int] = set()
     for execution_seed in v818._VALIDATION_SEEDS:
+        _raise_if_validation_cancelled(validator.service)
         env = validator._environment(execution_seed, candidate.source.anchor.env_root)
         valid = True
         for action in prefix:
+            _raise_if_validation_cancelled(validator.service)
             available = {int(value) for value in env.available_actions()}
             if int(action) not in available:
                 valid = False
@@ -226,13 +277,19 @@ def _available_actions_at_anchor(validator, candidate) -> tuple[int, ...]:
 
 
 def _validate_tracked(service, validator, candidate, *, skip_attempted: bool = True):
+    _raise_if_validation_cancelled(service)
     with service._lock:
         if skip_attempted and candidate.candidate_id in service._attempted:
             return None
         service._attempted.add(candidate.candidate_id)
         service._active_validations += 1
     try:
-        result = validator.validate(candidate)
+        try:
+            result = validator.validate(candidate)
+            _raise_if_validation_cancelled(service)
+        except _ValidationCancelled:
+            _preserve_cancelled_source(service, candidate)
+            raise
     finally:
         with service._lock:
             service._active_validations -= 1
@@ -401,6 +458,7 @@ def _process_target_minimize(service, validator, marker) -> None:
     with service._lock:
         service._candidates_generated += len(direct_actions) + 1
     for action in direct_actions:
+        _raise_if_validation_cancelled(service)
         direct = _candidate(
             optimizer,
             source,
@@ -529,6 +587,8 @@ def _game_validator_loop_v820(service, game_id: str) -> None:
     processed = 0
     try:
         while not service._stop.is_set():
+            if _validation_cancel_requested(service):
+                break
             with service._v818_validator_lock:
                 q = service._v818_game_queues.setdefault(
                     game, queue.Queue(maxsize=v818._PER_GAME_QUEUE_CAPACITY)
@@ -541,6 +601,7 @@ def _game_validator_loop_v820(service, game_id: str) -> None:
                     break
                 continue
             idle_since = time.monotonic()
+            cancelled = False
             try:
                 if candidate.edit_kind == _TARGET_MINIMIZE:
                     _process_target_minimize(service, validator, candidate)
@@ -566,10 +627,15 @@ def _game_validator_loop_v820(service, game_id: str) -> None:
                     )
                     continue
                 _process_candidate(service, validator, candidate)
+            except _ValidationCancelled:
+                cancelled = True
             finally:
-                v818._finish_candidate_work(service, candidate)
+                if not cancelled:
+                    v818._finish_candidate_work(service, candidate)
                 q.task_done()
                 processed += 1
+            if cancelled:
+                break
             if processed >= v818._VALIDATION_QUANTUM:
                 with service._v818_validator_lock:
                     if service._v818_waiting_games:

@@ -71,6 +71,20 @@ def _lifecycle_index(read_view):
 def _frontier_lifecycle_class(coordinator, game_id: str) -> str:
     view = getattr(coordinator, "_v827_read_view", None)
     index = _lifecycle_index(view)
+    return _frontier_lifecycle_class_from_index(coordinator, game_id, index)
+
+
+def _cached_frontier_lifecycle_class(coordinator, game_id: str) -> str:
+    """Classify a frontier from the last published graph index without rebuilding it."""
+
+    if not bool(getattr(coordinator, "_v827_lifecycle_authority", True)):
+        return "UNKNOWN"
+    view = getattr(coordinator, "_v827_read_view", None)
+    index = None if view is None else getattr(view, "_node_by_uid", None)
+    return _frontier_lifecycle_class_from_index(coordinator, game_id, index)
+
+
+def _frontier_lifecycle_class_from_index(coordinator, game_id: str, index) -> str:
     if index is None:
         return "UNKNOWN"
 

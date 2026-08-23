@@ -62,6 +62,55 @@ class DedicatedLifecycleWorkerTests(unittest.TestCase):
 
         self.assertEqual(repair._LIFECYCLE_START_DELAY_SECONDS, 300.0)
 
+    def test_paused_lifecycle_iteration_does_not_read_graph(self) -> None:
+        from v8 import dedicated_lifecycle_v813 as dedicated
+
+        class ReadView:
+            @staticmethod
+            def node_records():
+                raise AssertionError("paused lifecycle must not scan nodes")
+
+        supervisor = type("Supervisor", (), {})()
+        supervisor._pause = threading.Event()
+        supervisor._stop = threading.Event()
+        supervisor._pause.set()
+        supervisor._v813_live_read_view = ReadView()
+        supervisor._v845_state_lock = threading.RLock()
+        supervisor.lifecycle = type(
+            "Lifecycle",
+            (),
+            {"_v812_active_window": 0, "_v812_last_completed_window": -1},
+        )()
+        supervisor.current_generation = lambda: 0
+
+        dedicated._run_lifecycle_iteration(supervisor)
+
+    def test_lifecycle_progress_scan_stops_when_pause_arrives(self) -> None:
+        from v8 import dedicated_lifecycle_v813 as dedicated
+
+        supervisor = type("Supervisor", (), {})()
+        supervisor._pause = threading.Event()
+        supervisor._stop = threading.Event()
+        supervisor.lifecycle = type("Lifecycle", (), {})()
+        supervisor.lifecycle._v813_progress_window = -1
+        supervisor.lifecycle._v813_progress_evaluated = 0
+
+        class Nodes:
+            def __iter__(self):
+                supervisor._pause.set()
+                yield node((303,))
+
+        completed = dedicated._initialize_progress(
+            supervisor,
+            Nodes(),
+            target_window=1,
+            next_bucket=8,
+        )
+
+        self.assertFalse(completed)
+        self.assertEqual(supervisor.lifecycle._v813_progress_window, -1)
+        self.assertEqual(supervisor.lifecycle._v813_progress_evaluated, 0)
+
     def test_lifecycle_completes_while_main_peer_cycle_is_blocked(self) -> None:
         entered = threading.Event()
         release = threading.Event()

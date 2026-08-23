@@ -42,7 +42,8 @@ class TransferValidator:
         edges: tuple[EdgeRecord, ...],
         *,
         max_depth: int = 8,
-    ) -> dict[MemoryUid, tuple[int, ...]]:
+        cancel_event=None,
+    ) -> dict[MemoryUid, tuple[int, ...]] | None:
         direct: dict[MemoryUid, set[int]] = {}
         parents: dict[MemoryUid, set[MemoryUid]] = {}
         lineage = {
@@ -52,7 +53,13 @@ class TransferValidator:
             int(RelationType.SUPERSEDES),
             int(RelationType.LEADS_TO),
         }
-        for edge in edges:
+        for index, edge in enumerate(edges):
+            if (
+                index % 4096 == 0
+                and cancel_event is not None
+                and cancel_event.is_set()
+            ):
+                return None
             relation = int(edge.relation_type)
             if relation == int(RelationType.GAME_PROVENANCE) and int(edge.target_uid.hi) == 0:
                 direct.setdefault(edge.source_uid, set()).add(int(edge.target_uid.lo))
@@ -60,13 +67,61 @@ class TransferValidator:
                 parents.setdefault(edge.source_uid, set()).add(edge.target_uid)
 
         result: dict[MemoryUid, tuple[int, ...]] = {}
-        for uid in uids:
+        for index, uid in enumerate(uids):
+            if (
+                index % 4096 == 0
+                and cancel_event is not None
+                and cancel_event.is_set()
+            ):
+                return None
             found = set(direct.get(uid, ()))
             frontier = {uid}
             visited = {uid}
             for _depth in range(max(0, int(max_depth))):
+                if cancel_event is not None and cancel_event.is_set():
+                    return None
                 following: set[MemoryUid] = set()
                 for current in frontier:
+                    if cancel_event is not None and cancel_event.is_set():
+                        return None
+                    for parent in parents.get(current, ()):
+                        found.update(direct.get(parent, ()))
+                        if parent not in visited:
+                            visited.add(parent)
+                            following.add(parent)
+                if not following:
+                    break
+                frontier = following
+            result[uid] = tuple(sorted(found))
+        return result
+
+    @staticmethod
+    def _provenance_from_indexes(
+        uids: tuple[MemoryUid, ...],
+        direct: dict[MemoryUid, set[int]],
+        parents: dict[MemoryUid, set[MemoryUid]],
+        *,
+        max_depth: int = 8,
+        cancel_event=None,
+    ) -> dict[MemoryUid, tuple[int, ...]] | None:
+        result: dict[MemoryUid, tuple[int, ...]] = {}
+        for index, uid in enumerate(uids):
+            if (
+                index % 4096 == 0
+                and cancel_event is not None
+                and cancel_event.is_set()
+            ):
+                return None
+            found = set(direct.get(uid, ()))
+            frontier = {uid}
+            visited = {uid}
+            for _depth in range(max(0, int(max_depth))):
+                if cancel_event is not None and cancel_event.is_set():
+                    return None
+                following: set[MemoryUid] = set()
+                for current in frontier:
+                    if cancel_event is not None and cancel_event.is_set():
+                        return None
                     for parent in parents.get(current, ()):
                         found.update(direct.get(parent, ()))
                         if parent not in visited:
@@ -84,7 +139,10 @@ class TransferValidator:
         edges: tuple[EdgeRecord, ...] = (),
         *,
         provenance: Callable[[MemoryUid], frozenset[int]] | None = None,
+        cancel_event=None,
     ) -> tuple[TransferCandidate, ...]:
+        if cancel_event is not None and cancel_event.is_set():
+            return ()
         eligible = {
             row.uid: row
             for row in rows
@@ -94,13 +152,41 @@ class TransferValidator:
             return ()
 
         bound_read_view = None
+        cached_direct = None
+        cached_parents = None
         if provenance is not None:
             owner = getattr(provenance, "__self__", None)
             edge_records = getattr(owner, "edge_records", None)
             if callable(edge_records):
                 bound_read_view = owner
-                if not edges:
+                transfer_version = tuple(
+                    getattr(bound_read_view, "_v839_transfer_version", ())
+                )
+                provenance_version = tuple(
+                    getattr(bound_read_view, "_v839_provenance_version", ())
+                )
+                direct = getattr(bound_read_view, "_v839_direct_games", None)
+                parents = getattr(
+                    bound_read_view, "_v839_provenance_parents", None
+                )
+                transfer_edges = getattr(
+                    bound_read_view, "_v839_transfer_edges", None
+                )
+                if (
+                    transfer_version
+                    and transfer_version == provenance_version
+                    and isinstance(direct, dict)
+                    and isinstance(parents, dict)
+                    and isinstance(transfer_edges, tuple)
+                ):
+                    if not edges:
+                        edges = transfer_edges
+                    cached_direct = direct
+                    cached_parents = parents
+                elif not edges:
                     edges = tuple(edge_records())
+                if cancel_event is not None and cancel_event.is_set():
+                    return ()
 
         # Compatibility fallback for pure unit use without a graph.  In the live
         # runtime, where edges are present, formal TRANSFER_CORRESPONDENCE is required.
@@ -115,11 +201,40 @@ class TransferValidator:
                     result.append(TransferCandidate(row.uid, games, recurrence))
             return tuple(result)
 
-        graph_games = (
-            self._provenance_from_edges(tuple(eligible), edges)
-            if bound_read_view is not None
-            else None
-        )
+        relevant_uids: set[MemoryUid] = set()
+        for index, edge in enumerate(edges):
+            if (
+                index % 4096 == 0
+                and cancel_event is not None
+                and cancel_event.is_set()
+            ):
+                return ()
+            if int(edge.relation_type) != int(RelationType.TRANSFER_CORRESPONDENCE):
+                continue
+            if edge.source_uid in eligible:
+                relevant_uids.add(edge.source_uid)
+            if edge.target_uid in eligible:
+                relevant_uids.add(edge.target_uid)
+        if not relevant_uids:
+            return ()
+
+        requested_uids = tuple(sorted(relevant_uids))
+        graph_games = None
+        if cached_direct is not None and cached_parents is not None:
+            graph_games = self._provenance_from_indexes(
+                requested_uids,
+                cached_direct,
+                cached_parents,
+                cancel_event=cancel_event,
+            )
+            if graph_games is None:
+                return ()
+        elif bound_read_view is not None:
+            graph_games = self._provenance_from_edges(
+                requested_uids, edges, cancel_event=cancel_event
+            )
+            if graph_games is None:
+                return ()
 
         def games(uid: MemoryUid) -> tuple[int, ...]:
             row = eligible.get(uid)
@@ -133,7 +248,13 @@ class TransferValidator:
             return tuple(index for index in range(64) if mask & (1 << index))
 
         best: dict[MemoryUid, TransferCandidate] = {}
-        for edge in edges:
+        for index, edge in enumerate(edges):
+            if (
+                index % 4096 == 0
+                and cancel_event is not None
+                and cancel_event.is_set()
+            ):
+                return ()
             if int(edge.relation_type) != int(RelationType.TRANSFER_CORRESPONDENCE):
                 continue
             if edge.source_uid not in eligible or edge.target_uid not in eligible:

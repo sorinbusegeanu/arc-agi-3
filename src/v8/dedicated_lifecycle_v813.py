@@ -41,18 +41,27 @@ def _generation_dispatch(supervisor, nodes) -> int:
     return 0 if runner is None else int(runner(supervisor, nodes))
 
 
-def _initialize_progress(supervisor, nodes, target_window: int, next_bucket: int) -> None:
+def _lifecycle_cancelled(supervisor) -> bool:
+    return bool(supervisor._pause.is_set() or supervisor._stop.is_set())
+
+
+def _initialize_progress(supervisor, nodes, target_window: int, next_bucket: int) -> bool:
     from v8 import final_save_lifecycle_v812 as base
 
     lifecycle = supervisor.lifecycle
     if int(getattr(lifecycle, "_v813_progress_window", -1)) == int(target_window):
-        return
+        return True
+    evaluated = 0
+    for row_index, row in enumerate(nodes):
+        if row_index % 256 == 0 and _lifecycle_cancelled(supervisor):
+            return False
+        if _bucket(row.uid, base._LIFECYCLE_BUCKETS) < int(next_bucket):
+            evaluated += 1
+    if _lifecycle_cancelled(supervisor):
+        return False
     lifecycle._v813_progress_window = int(target_window)
-    lifecycle._v813_progress_evaluated = sum(
-        1
-        for row in nodes
-        if _bucket(row.uid, base._LIFECYCLE_BUCKETS) < int(next_bucket)
-    )
+    lifecycle._v813_progress_evaluated = evaluated
+    return True
 
 
 def _finalize_retirements(supervisor, *, window: int) -> tuple[object, ...]:
@@ -95,10 +104,10 @@ def _run_lifecycle_iteration(supervisor) -> None:
     from v8 import final_save_lifecycle_v812 as base
 
     runner = _BASE_GENERATION_RUNNER
-    if runner is None:
+    if runner is None or _lifecycle_cancelled(supervisor):
         return
     nodes = tuple(supervisor._v813_live_read_view.node_records())
-    if not nodes:
+    if not nodes or _lifecycle_cancelled(supervisor):
         return
 
     lifecycle = supervisor.lifecycle
@@ -116,8 +125,16 @@ def _run_lifecycle_iteration(supervisor) -> None:
     if target_window < 0:
         return
 
-    _initialize_progress(supervisor, nodes, target_window, next_bucket_before)
+    if not _initialize_progress(
+        supervisor,
+        nodes,
+        target_window,
+        next_bucket_before,
+    ):
+        return
     evaluated = int(runner(supervisor, nodes))
+    if _lifecycle_cancelled(supervisor):
+        return
     lifecycle._v813_progress_evaluated = int(
         getattr(lifecycle, "_v813_progress_evaluated", 0)
     ) + evaluated
@@ -132,7 +149,11 @@ def _run_lifecycle_iteration(supervisor) -> None:
     if not completed:
         return
 
+    if _lifecycle_cancelled(supervisor):
+        return
     final_nodes = _finalize_retirements(supervisor, window=target_window)
+    if _lifecycle_cancelled(supervisor):
+        return
     quarantined, retire_pending, retired, reactivated = _state_counts(final_nodes)
     print(
         f"[{time.strftime('%H:%M')}] lifecycle window={target_window} complete "

@@ -8,6 +8,7 @@ import v8
 from v8.arena import NodeRecord
 from v8.learning_fixes_v088 import (
     ActorProgress,
+    _coherent_cached_transfer_cut,
     _memory_free_action,
     _probe_policy_v088,
     _record_terminal_efficiency_feedback,
@@ -63,6 +64,36 @@ def node(
 
 
 class V088LearningFixTests(unittest.TestCase):
+    def test_coherent_transfer_cut_reuses_matching_record_cache(self):
+        node_arena = object()
+        edge_arena = object()
+        row = node(MemoryLevel.M4, MemoryType.CONCEPT, (7, 8, 9))
+        edge = object()
+        view = SimpleNamespace(
+            _nodes=(node_arena,),
+            _edges=(edge_arena,),
+            _strategy_version=(2, 4),
+            _record_cache={
+                id(node_arena): ((row,), 2),
+                id(edge_arena): ((edge,), 4),
+            },
+            _node_by_uid={row.uid: row},
+        )
+
+        self.assertEqual(
+            _coherent_cached_transfer_cut(view),
+            ((row,), (edge,)),
+        )
+        transfer_edge = object()
+        view._v839_transfer_version = (4,)
+        view._v839_transfer_edges = (transfer_edge,)
+        self.assertEqual(
+            _coherent_cached_transfer_cut(view),
+            ((row,), (transfer_edge,)),
+        )
+        view._strategy_version = (2, 6)
+        self.assertIsNone(_coherent_cached_transfer_cut(view))
+
     def test_terminal_efficiency_feedback_uses_existing_index_without_graph_scan(self):
         strategy = node(
             MemoryLevel.M7,

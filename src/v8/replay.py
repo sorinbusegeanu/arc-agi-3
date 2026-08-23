@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import heapq
 from dataclasses import dataclass
 
 from v8.arena import NodeRecord
@@ -32,32 +33,60 @@ class ReplayScheduler:
         rows: tuple[NodeRecord, ...],
         *,
         budget: int,
+        cancel_event=None,
     ) -> tuple[ReplayCandidate, ...]:
+        if cancel_event is not None and cancel_event.is_set():
+            return ()
         stage = infer_developmental_stage(rows)
         self.last_developmental_stage = publish_developmental_stage(stage)
-        scores = score_memories(rows, developmental_stage=stage)
-        ranked: list[ReplayCandidate] = []
-        for row in rows:
-            if int(row.cognitive_state) in {
-                int(CognitiveState.RETIRED),
-                int(CognitiveState.RETIRE_PENDING),
-            }:
-                continue
-            score = scores[row.uid]
-            novelty = 1.0 / max(1.0, float(row.support_count))
-            priority = score.total + 0.10 * novelty
-            if priority < self.min_priority:
-                continue
-            if score.prediction_error >= 0.5:
-                reason = "prediction_violation"
-            elif score.transfer_potential >= 0.4:
-                reason = "transfer_opportunity"
-            elif score.explanatory_potential >= 0.4:
-                reason = "explanatory_opportunity"
-            elif score.future_option_value >= 0.4:
-                reason = "future_option"
-            else:
-                reason = "developmental_importance"
-            ranked.append(ReplayCandidate(row.uid, float(priority), score, reason))
-        ranked.sort(key=lambda item: (-item.priority, item.uid))
-        return tuple(ranked[: max(0, int(budget))])
+        scores = score_memories(
+            rows,
+            developmental_stage=stage,
+            cancel_event=cancel_event,
+        )
+        if scores is None:
+            return ()
+        limit = max(0, int(budget))
+        if limit <= 0:
+            return ()
+
+        def eligible():
+            for index, row in enumerate(rows):
+                if (
+                    index % 4096 == 0
+                    and cancel_event is not None
+                    and cancel_event.is_set()
+                ):
+                    return
+                if int(row.cognitive_state) in {
+                    int(CognitiveState.RETIRED),
+                    int(CognitiveState.RETIRE_PENDING),
+                }:
+                    continue
+                score = scores[row.uid]
+                novelty = 1.0 / max(1.0, float(row.support_count))
+                priority = score.total + 0.10 * novelty
+                if priority < self.min_priority:
+                    continue
+                if score.prediction_error >= 0.5:
+                    reason = "prediction_violation"
+                elif score.transfer_potential >= 0.4:
+                    reason = "transfer_opportunity"
+                elif score.explanatory_potential >= 0.4:
+                    reason = "explanatory_opportunity"
+                elif score.future_option_value >= 0.4:
+                    reason = "future_option"
+                else:
+                    reason = "developmental_importance"
+                yield ReplayCandidate(row.uid, float(priority), score, reason)
+
+        # The attention budget is small while a restored graph can contain
+        # millions of nodes. Keep exact deterministic ordering without
+        # materializing and sorting every eligible candidate.
+        return tuple(
+            heapq.nsmallest(
+                limit,
+                eligible(),
+                key=lambda item: (-item.priority, item.uid),
+            )
+        )

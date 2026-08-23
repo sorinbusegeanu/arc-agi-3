@@ -347,18 +347,44 @@ def _install_isf_semantics() -> None:
         stage = isf_module._fallback_stage(row) if developmental_stage is None else max(0, min(6, int(developmental_stage)))
         return build_score(row, isf_module.raw_components(row), stage)
 
-    def score_memories(rows, *, developmental_stage):
-        rows = tuple(rows)
+    def score_memories(rows, *, developmental_stage, cancel_event=None):
         stage = max(0, min(6, int(developmental_stage)))
         grouped = defaultdict(list)
-        for row in rows:
+        for index, row in enumerate(rows):
+            if (
+                index % 4096 == 0
+                and cancel_event is not None
+                and cancel_event.is_set()
+            ):
+                return None
             grouped[(int(row.level), int(row.memory_type), stage)].append(row)
         result = {}
         for members in grouped.values():
+            if cancel_event is not None and cancel_event.is_set():
+                return None
             raw = {row.uid: isf_module.raw_components(row) for row in members}
-            normalized = [isf_module._rank_normalize([(row.uid, raw[row.uid][i]) for row in members]) for i in range(5)]
-            valence_norm = isf_module._rank_normalize([(row.uid, valence_impact(row)) for row in members])
-            for row in members:
+            normalized = []
+            for channel in range(5):
+                values = isf_module._rank_normalize(
+                    [(row.uid, raw[row.uid][channel]) for row in members],
+                    cancel_event=cancel_event,
+                )
+                if values is None:
+                    return None
+                normalized.append(values)
+            valence_norm = isf_module._rank_normalize(
+                [(row.uid, valence_impact(row)) for row in members],
+                cancel_event=cancel_event,
+            )
+            if valence_norm is None:
+                return None
+            for index, row in enumerate(members):
+                if (
+                    index % 4096 == 0
+                    and cancel_event is not None
+                    and cancel_event.is_set()
+                ):
+                    return None
                 option_impact, prediction, learning, transfer, explanatory = [normalized[i][row.uid] for i in range(5)]
                 future = raw[row.uid][5]
                 weighted = (valence_norm[row.uid], option_impact, prediction, learning, transfer, explanatory)
@@ -651,11 +677,27 @@ def _install_peer_formation_semantics() -> None:
     from v8 import peers_v82 as peers_v82_module
 
     def process_formation(self, cut, frozen):
-        by_uid = {row.uid: row for row in cut.nodes}
+        cancel = getattr(self, "_v841_peer_cancel", None)
+
+        def cancelled():
+            return bool(
+                getattr(frozen, "cancelled", False)
+                or (cancel is not None and cancel.is_set())
+            )
+
+        if cancelled():
+            return
+        by_uid = {}
+        for row_index, row in enumerate(cut.nodes):
+            if row_index % 256 == 0 and cancelled():
+                return
+            by_uid[row.uid] = row
         state = getattr(self, "_primary_valence_formation_state", None)
         if state is None:
             state = {}; self._primary_valence_formation_state = state
         for candidate in self.promotion.propose(cut.nodes, cut.edges, budget=self.candidate_budget):
+            if cancelled():
+                return
             parent_watermark = max((by_uid[uid].updated_watermark for uid in candidate.parents if uid in by_uid), default=cut.watermark)
             freshness = f"v82-formation:{int(candidate.level)}:{int(candidate.memory_type)}"
             if not self._fresh(freshness, candidate.uid, parent_watermark):
@@ -685,7 +727,12 @@ def _install_peer_formation_semantics() -> None:
                 self._submit(self._existing_proposal(identity, parent_uid=parent,
                     relation_type=self._relation_for(candidate, extra_parent=True)))
             provenance_games = set()
-            for parent in candidate.parents: provenance_games.update(frozen.source_games(parent))
+            for parent in candidate.parents:
+                if cancelled():
+                    return
+                provenance_games.update(frozen.source_games(parent))
+            if cancelled():
+                return
             self._append_evidence(candidate.evidence_kind, candidate, candidate.evidence_value,
                 validation_state=int(candidate.validation_state), provenance_games=tuple(sorted(provenance_games)))
 

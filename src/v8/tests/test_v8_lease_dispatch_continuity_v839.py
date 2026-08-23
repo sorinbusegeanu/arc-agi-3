@@ -146,6 +146,7 @@ class LeaseDispatchContinuityV839Tests(unittest.TestCase):
             _v839_actor_feedback=feedback,
             peers=peers,
             _v814_trajectory_optimizer=SimpleNamespace(),
+            _snapshot_thread_stop=threading.Event(),
         )
 
         with patch.object(v839, "_BASE_RUN_ACTOR_JOBS", return_value=("done",)), patch.object(
@@ -166,6 +167,7 @@ class LeaseDispatchContinuityV839Tests(unittest.TestCase):
         self.assertTrue(peers._pause.is_set())
         self.assertTrue(peers._v841_peer_cancel.is_set())
         self.assertTrue(runtime._sampling_complete)
+        self.assertTrue(runtime._snapshot_thread_stop.is_set())
         self.assertTrue(
             runtime._v814_trajectory_optimizer._v841_preserve_inbox_on_shutdown
         )

@@ -25,9 +25,13 @@ def _is_runtime_unsolved_partial(service, trajectory) -> bool:
         return False
     try:
         from v8 import adaptive_learning_allocation_v819 as v819
+        from v8 import adaptive_learning_allocation_v819_solve_fix as solve_fix
 
         return (
-            runtime._v819_adaptive_learning.game_state(str(trajectory.anchor.source_id))
+            solve_fix._cached_game_state(
+                runtime._v819_adaptive_learning,
+                str(trajectory.anchor.source_id),
+            )
             == v819.GameLearningState.UNSOLVED
         )
     except BaseException:
@@ -97,10 +101,12 @@ def _submit_next_source_progressive(service, candidate, validated) -> None:
     if runtime is not None and str(candidate.source.target.terminal_state) != "WIN":
         try:
             from v8 import adaptive_learning_allocation_v819 as v819
+            from v8 import adaptive_learning_allocation_v819_solve_fix as solve_fix
 
             if (
-                runtime._v819_adaptive_learning.game_state(
-                    str(candidate.source.anchor.source_id)
+                solve_fix._cached_game_state(
+                    runtime._v819_adaptive_learning,
+                    str(candidate.source.anchor.source_id),
                 )
                 == v819.GameLearningState.UNSOLVED
             ):

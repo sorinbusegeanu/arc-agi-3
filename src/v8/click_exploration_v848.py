@@ -500,17 +500,11 @@ def _select_expandable_action_v848(actions: tuple[int, ...]) -> int:
 def _best_expansion_v848(sampler):
     from v8 import sampling_evidence_frontier_v847 as frontier
 
-    nodes = frontier._ensure_state_v847(sampler)
-    candidates = [
-        node
-        for node in nodes.values()
-        if frontier._expandable_actions(node) and not _suppressed_click_latent(node)
-    ]
-    if not candidates:
-        return None
-    node = max(candidates, key=frontier._priority_key_v847)
-    action = _select_expandable_action_v848(frontier._expandable_actions(node))
-    return node, action
+    return frontier._best_expansion_indexed_v847(
+        sampler,
+        predicate=lambda node: not _suppressed_click_latent(node),
+        action_selector=_select_expandable_action_v848,
+    )
 
 
 def _record_expansion_v848(sampler, **kwargs):
@@ -541,6 +535,7 @@ def _record_expansion_v848(sampler, **kwargs):
     if source is not None:
         source.failures += 1
         sampler._v847_dirty = True
+        frontier._touch_node_v847(sampler, source)
     if destination is not None and bool(getattr(destination, "latent", False)):
         nodes.pop(str(destination.node_id), None)
         sampler._v847_dirty = True

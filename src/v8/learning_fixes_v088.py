@@ -198,6 +198,37 @@ def _held_out_games(training_games: tuple[str, ...], env_root: str | None) -> tu
     )
 
 
+def _coherent_cached_transfer_cut(view):
+    """Return the exact strategy-cache graph cut without rereading live arenas."""
+    version = tuple(getattr(view, "_strategy_version", ()))
+    node_arenas = tuple(getattr(view, "_nodes", ()))
+    edge_arenas = tuple(getattr(view, "_edges", ()))
+    arenas = (*node_arenas, *edge_arenas)
+    if not version or len(version) != len(arenas):
+        return None
+    record_cache = getattr(view, "_record_cache", None)
+    node_by_uid = getattr(view, "_node_by_uid", None)
+    if not isinstance(record_cache, dict) or not isinstance(node_by_uid, dict):
+        return None
+
+    edge_cuts = []
+    for index, arena in enumerate(arenas):
+        cached = record_cache.get(id(arena))
+        if cached is None or int(cached[1]) != int(version[index]):
+            return None
+        if index >= len(node_arenas):
+            edge_cuts.append(tuple(cached[0]))
+    if tuple(getattr(view, "_strategy_version", ())) != version:
+        return None
+    nodes = tuple(node_by_uid.values())
+    edge_version = tuple(version[len(node_arenas) :])
+    if tuple(getattr(view, "_v839_transfer_version", ())) == edge_version:
+        edges = tuple(getattr(view, "_v839_transfer_edges", ()))
+    else:
+        edges = tuple(row for cut in edge_cuts for row in cut)
+    return nodes, edges
+
+
 def _run_automatic_transfer_experiments_v088(
     runtime,
     *,
@@ -216,12 +247,24 @@ def _run_automatic_transfer_experiments_v088(
     if not holdouts:
         return ExperimentSummary(0, 0, 0)
 
-    nodes = runtime.read_view.node_records()
+    cached_cut = _coherent_cached_transfer_cut(runtime.read_view)
+    if cached_cut is None:
+        nodes = runtime.read_view.node_records()
+        edges = None
+    else:
+        nodes, edges = cached_cut
     by_uid = {row.uid: row for row in nodes}
-    candidates = runtime.peers.transfer.candidates(
-        nodes,
-        provenance=runtime.read_view.source_games,
-    )
+    if edges is None:
+        candidates = runtime.peers.transfer.candidates(
+            nodes,
+            provenance=runtime.read_view.source_games,
+        )
+    else:
+        candidates = runtime.peers.transfer.candidates(
+            nodes,
+            edges=edges,
+            provenance=runtime.read_view.source_games,
+        )
     attempted = completed = passed = 0
     game_hashes = {game: stable_u64(game, person=b"v8-game") for game in holdouts}
 

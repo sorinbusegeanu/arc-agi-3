@@ -4,10 +4,12 @@ import io
 import queue
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import v8  # noqa: F401 - installs the chronological runtime stack
 from v8 import reporter
@@ -128,6 +130,51 @@ class RuntimeObservabilityV836Tests(unittest.TestCase):
             self.assertIn("H15=INSUFFICIENT_EVIDENCE", line)
             self.assertNotIn("current_run_wins", line)
         finally:
+            stop.set()
+            thread.join(timeout=1.0)
+        self.assertFalse(thread.is_alive())
+
+    def test_slow_hypothesis_evaluation_does_not_delay_progress(self):
+        events = queue.Queue()
+        output = queue.Queue()
+        stop = threading.Event()
+        evaluation_started = threading.Event()
+        release_evaluation = threading.Event()
+
+        def slow_hypothesis(*_args):
+            evaluation_started.set()
+            release_evaluation.wait(timeout=1.0)
+            return "hypotheses H01=VALID"
+
+        thread = threading.Thread(
+            target=observability._reporting_worker_v836,
+            kwargs={
+                "event_queue": events,
+                "stop_event": stop,
+                "watermark": SimpleNamespace(value=0),
+                "actors": ((1, "g"),),
+                "interval_seconds": 0.05,
+                "output_queue": output,
+                "hypothesis_interval_seconds": 0.01,
+            },
+            daemon=True,
+        )
+        try:
+            with patch.object(
+                observability,
+                "_hypothesis_status_line",
+                side_effect=slow_hypothesis,
+            ):
+                thread.start()
+                self.assertTrue(evaluation_started.wait(timeout=1.0))
+                started = time.monotonic()
+                line = output.get(timeout=0.5)
+                self.assertIn("%", line)
+                self.assertLess(time.monotonic() - started, 0.25)
+                release_evaluation.set()
+                self.assertIn("hypotheses H01=VALID", output.get(timeout=0.5))
+        finally:
+            release_evaluation.set()
             stop.set()
             thread.join(timeout=1.0)
         self.assertFalse(thread.is_alive())

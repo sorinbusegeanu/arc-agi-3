@@ -368,6 +368,11 @@ def _run_actor_jobs_v839(runtime, jobs, **kwargs):
 def _request_final_peer_drain(runtime) -> None:
     """Stop autonomous semantic work once the actor interaction budget is spent."""
     runtime._sampling_complete = True
+    snapshot_stop = getattr(runtime, "_snapshot_thread_stop", None)
+    if snapshot_stop is not None:
+        # A final strict snapshot follows the canonical drain. Do not let a new
+        # opportunistic cadence snapshot race peer/lifecycle cancellation here.
+        snapshot_stop.set()
     optimizer = getattr(runtime, "_v814_trajectory_optimizer", None)
     if optimizer is not None:
         # Successful trajectories are already durable JSON inbox records. Stop
@@ -375,6 +380,9 @@ def _request_final_peer_drain(runtime) -> None:
         # the optimizer still drains every item already admitted to RAM, while
         # residual inbox files remain available to the next continuous run.
         optimizer._v841_preserve_inbox_on_shutdown = True
+        from v8 import runtime_scaling_v841 as scaling
+
+        scaling._cancel_optimizer_validations_v841(optimizer)
 
     peers = getattr(runtime, "peers", None)
     if peers is not None:

@@ -45,6 +45,7 @@ class _FrozenCutReadView:
         self.cut = cut
         self._nodes = cut.nodes
         self._edges = cut.edges
+        self._cancel_event = cancel_event
         self._by_uid = {row.uid: row for row in self._nodes}
         self._direct_games: dict[MemoryUid, set[int]] = {}
         self._parents: dict[MemoryUid, set[MemoryUid]] = {}
@@ -73,12 +74,18 @@ class _FrozenCutReadView:
         return self._edges
 
     def source_games(self, uid: MemoryUid, *, max_depth: int = 8) -> frozenset[int]:
+        if self._cancel_event is not None and self._cancel_event.is_set():
+            self.cancelled = True
+            return frozenset()
         games = set(self._direct_games.get(uid, ()))
         frontier = {uid}
         visited = {uid}
         for _depth in range(max(0, int(max_depth))):
             following: set[MemoryUid] = set()
             for current in frontier:
+                if self._cancel_event is not None and self._cancel_event.is_set():
+                    self.cancelled = True
+                    return frozenset()
                 for parent in self._parents.get(current, ()):
                     games.update(self._direct_games.get(parent, ()))
                     if parent not in visited:

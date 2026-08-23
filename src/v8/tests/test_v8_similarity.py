@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import threading
 import unittest
 from struct import Struct
+from unittest import mock
 
 from v8.arena import EdgeRecord, NodeRecord, SharedEdgeArena
 from v8.model import (
@@ -170,6 +172,118 @@ class BoundedSimilarityTests(unittest.TestCase):
             provenance=lambda _uid: frozenset({101}),
         )
         self.assertEqual(candidates, ())
+
+    def test_transfer_candidates_reuse_coherent_read_view_indexes(self) -> None:
+        a = role_node((1, 0), watermark=5)
+        b = role_node((2, 0), watermark=6)
+        unrelated = role_node((3, 0), watermark=7)
+        source, target = sorted((a.uid, b.uid))
+        correspondence = EdgeRecord(
+            source,
+            int(RelationType.TRANSFER_CORRESPONDENCE),
+            target,
+            1,
+            6,
+            0.9,
+            1.0,
+        )
+
+        class CachedView:
+            _v839_transfer_version = (8,)
+            _v839_provenance_version = (8,)
+            _v839_transfer_edges = (correspondence,)
+            _v839_direct_games = {
+                a.uid: {101},
+                b.uid: {202},
+                unrelated.uid: {303},
+            }
+            _v839_provenance_parents = {}
+
+            def edge_records(self):
+                raise AssertionError("coherent transfer indexes must avoid edge scan")
+
+            def source_games(self, _uid):
+                raise AssertionError("coherent direct/parent indexes must be reused")
+
+        original = TransferValidator._provenance_from_indexes
+        with mock.patch.object(
+            TransferValidator,
+            "_provenance_from_indexes",
+            wraps=original,
+        ) as provenance:
+            candidates = TransferValidator().candidates(
+                (a, b, unrelated), provenance=CachedView().source_games
+            )
+
+        self.assertEqual(len(candidates), 2)
+        self.assertEqual(
+            {item.formation_games for item in candidates},
+            {(101,), (202,)},
+        )
+        self.assertEqual(set(provenance.call_args.args[0]), {a.uid, b.uid})
+
+    def test_transfer_candidate_scan_stops_before_cold_edge_read_after_cancel(self) -> None:
+        a = role_node((1, 0), watermark=5)
+        cancel = threading.Event()
+        cancel.set()
+
+        class ColdView:
+            def edge_records(self):
+                raise AssertionError("cancelled peer transfer must not read graph")
+
+            def source_games(self, _uid):
+                return frozenset()
+
+        self.assertEqual(
+            TransferValidator().candidates(
+                (a,),
+                provenance=ColdView().source_games,
+                cancel_event=cancel,
+            ),
+            (),
+        )
+
+    def test_transfer_provenance_scan_honors_cancel_after_start(self) -> None:
+        a = role_node((1, 0), watermark=5)
+        cancel = threading.Event()
+        edge = EdgeRecord(
+            a.uid,
+            int(RelationType.EXPLAINS),
+            MemoryUid(9, 9),
+            1,
+            1,
+        )
+
+        class CancellingEdges:
+            def __iter__(self):
+                for index in range(5000):
+                    if index == 1:
+                        cancel.set()
+                    yield edge
+
+        self.assertIsNone(
+            TransferValidator._provenance_from_edges(
+                (a.uid,), CancellingEdges(), cancel_event=cancel
+            )
+        )
+
+    def test_transfer_provenance_expansion_honors_cancel_after_edge_scan(self) -> None:
+        cancel = threading.Event()
+        uid = MemoryUid(7, 7)
+
+        class CancellingDirect(dict):
+            def get(self, key, default=None):
+                cancel.set()
+                return super().get(key, default)
+
+        self.assertIsNone(
+            TransferValidator._provenance_from_indexes(
+                (uid,) * 5000,
+                CancellingDirect(),
+                {},
+                cancel_event=cancel,
+            )
+        )
 
     def test_similarity_memory_proposal_serializes_as_relation_packet(self) -> None:
         a = role_node((1, 0), watermark=10)

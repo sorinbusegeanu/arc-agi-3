@@ -21,6 +21,7 @@ transfer validation semantics are unchanged.
 """
 
 import hashlib
+import heapq
 import json
 import multiprocessing.util as mp_util
 import os
@@ -95,6 +96,24 @@ class EvidencePrefixNode:
         )
 
 
+class _MaxPriority:
+    __slots__ = ("value",)
+
+    def __init__(self, value) -> None:
+        self.value = value
+
+    def __lt__(self, other) -> bool:
+        return self.value > other.value
+
+
+def _reset_expansion_index_v847(sampler, nodes) -> None:
+    sampler._v847_expansion_heap = []
+    sampler._v847_node_versions = {}
+    sampler._v847_index_counter = 0
+    for node in nodes.values():
+        _touch_node_v847(sampler, node)
+
+
 def _ensure_state_v847(sampler) -> dict[str, EvidencePrefixNode]:
     nodes = getattr(sampler, "_v847_nodes", None)
     if nodes is None:
@@ -104,6 +123,9 @@ def _ensure_state_v847(sampler) -> dict[str, EvidencePrefixNode]:
         sampler._v847_active_expansion = None
         sampler._v847_loaded_root = None
         sampler._v847_actor_id = 0
+        _reset_expansion_index_v847(sampler, nodes)
+    elif not hasattr(sampler, "_v847_expansion_heap"):
+        _reset_expansion_index_v847(sampler, nodes)
     return nodes
 
 
@@ -144,11 +166,13 @@ def _upsert_node_v847(sampler, node: EvidencePrefixNode) -> EvidencePrefixNode:
     if current is None:
         nodes[str(node.node_id)] = node
         sampler._v847_dirty = True
+        _touch_node_v847(sampler, node)
         return node
     before = current.to_dict()
     _merge_node_v847(current, node)
     if current.to_dict() != before:
         sampler._v847_dirty = True
+        _touch_node_v847(sampler, current)
     return current
 
 
@@ -198,14 +222,40 @@ def _priority_key_v847(node: EvidencePrefixNode):
     )
 
 
-def _best_expansion_v847(sampler):
+def _touch_node_v847(sampler, node: EvidencePrefixNode) -> None:
+    if bool(getattr(sampler, "_v847_index_suspended", False)):
+        return
+    counter = int(getattr(sampler, "_v847_index_counter", 0)) + 1
+    sampler._v847_index_counter = counter
+    versions = sampler._v847_node_versions
+    versions[str(node.node_id)] = counter
+    heapq.heappush(
+        sampler._v847_expansion_heap,
+        (_MaxPriority(_priority_key_v847(node)), counter, str(node.node_id)),
+    )
+
+
+def _best_expansion_indexed_v847(sampler, *, predicate=None, action_selector=None):
     nodes = _ensure_state_v847(sampler)
-    candidates = [node for node in nodes.values() if _expandable_actions(node)]
-    if not candidates:
-        return None
-    node = max(candidates, key=_priority_key_v847)
-    action = _select_expandable_action_v847(_expandable_actions(node))
-    return node, action
+    heap = sampler._v847_expansion_heap
+    versions = sampler._v847_node_versions
+    while heap:
+        _priority, version, node_id = heap[0]
+        node = nodes.get(str(node_id))
+        if node is None or int(versions.get(str(node_id), -1)) != int(version):
+            heapq.heappop(heap)
+            continue
+        actions = _expandable_actions(node)
+        if not actions or (predicate is not None and not bool(predicate(node))):
+            heapq.heappop(heap)
+            continue
+        selector = _select_expandable_action_v847 if action_selector is None else action_selector
+        return node, int(selector(actions))
+    return None
+
+
+def _best_expansion_v847(sampler):
+    return _best_expansion_indexed_v847(sampler)
 
 
 def _productive_v847(
@@ -255,6 +305,7 @@ def _record_expansion_v847(
     if str(terminal_state) == "GAME_OVER":
         source.failures += 1
     sampler._v847_dirty = True
+    _touch_node_v847(sampler, source)
 
     if str(terminal_state) == "GAME_OVER" or not tuple(after_actions):
         return None
@@ -402,8 +453,13 @@ def _load_sampler_state_v847(sampler) -> None:
         return
     root = Path(root)
     token = _game_token(sampler.game_id)
-    if root.exists():
-        for path in sorted(root.glob(f"{token}-*.json")):
+    sampler._v847_index_suspended = True
+    try:
+        if root.exists():
+            paths = sorted(root.glob(f"{token}-*.json"))
+        else:
+            paths = ()
+        for path in paths:
             try:
                 raw = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, ValueError, TypeError):
@@ -433,6 +489,9 @@ def _load_sampler_state_v847(sampler) -> None:
                 # The frontier itself remains usable on read-only or transiently
                 # contended roots; reporting falls back to bounded legacy rules.
                 pass
+    finally:
+        sampler._v847_index_suspended = False
+        _reset_expansion_index_v847(sampler, nodes)
     sampler._v847_dirty = False
     sampler._v847_loaded_root = str(root)
 
@@ -484,6 +543,7 @@ def _sampler_for_v847(job):
     root_text = None if root is None else str(root)
     if getattr(sampler, "_v847_loaded_root", None) != root_text:
         sampler._v847_nodes.clear()
+        _reset_expansion_index_v847(sampler, sampler._v847_nodes)
         sampler._v847_state_root = root
         sampler._v847_actor_id = int(job.actor_id)
         _load_sampler_state_v847(sampler)
