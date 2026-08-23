@@ -7,6 +7,8 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import v8
 from v8 import trajectory_click_audit_v856 as audit
@@ -44,6 +46,38 @@ class TrajectoryClickAuditV856Tests(unittest.TestCase):
             "successes": 1,
             "reliability": 1.0,
         }
+
+    def test_runtime_audit_preserves_structural_token_and_records_resolved_target(self) -> None:
+        token = int(_STRUCTURAL_CLICK_MARKER | (555 << 8) | 6)
+        env = SimpleNamespace(
+            _v810_click_targets={
+                token: SimpleNamespace(x=4, y=6, kind="component_center")
+            },
+            _v810_last_changed=(),
+            _last_grid=((0,),),
+        )
+        prior_capture = optimizer._CAPTURE_ACTIVE
+        try:
+            optimizer._CAPTURE_ACTIVE = True
+            audit._ACTION_AUDIT_HISTORY.clear()
+            with patch.object(audit, "_BASE_CLICK_STEP", return_value="ok") as base:
+                result = audit._click_step_v856(env, token)
+            self.assertEqual(result, "ok")
+            base.assert_called_once_with(env, token)
+            self.assertEqual(
+                audit._ACTION_AUDIT_HISTORY,
+                [
+                    {
+                        "action_token": token,
+                        "native_action": 6,
+                        "x": 4,
+                        "y": 6,
+                        "target_kind": "component_center",
+                    }
+                ],
+            )
+        finally:
+            optimizer._CAPTURE_ACTIVE = prior_capture
 
     def test_existing_exact_click_token_is_decoded_without_new_audit(self) -> None:
         root = Path(tempfile.mkdtemp())
