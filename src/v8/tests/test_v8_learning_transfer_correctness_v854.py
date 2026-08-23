@@ -204,11 +204,31 @@ class CompositeFormationTests(unittest.TestCase):
 
         chain = [_grounded(i, (i % 5) + 1, i + 1, 100 + i, support=8) for i in range(8)]
         outcome = _node(MemoryLevel.M6, MemoryType.OUTCOME, (1, 2, 3), support=8)
+        second_outcome = _node(
+            MemoryLevel.M6, MemoryType.OUTCOME, (4, 5, 6), support=8
+        )
         engine = SimpleNamespace(min_contingency_support=1, _admissible=lambda _row: True)
-        with patch.object(behavior, "causal_m1_ancestors", return_value={chain[-1].uid}):
-            rows = _adaptive_composites(engine, tuple(chain) + (outcome,), (), limit=256)
+        with (
+            patch.object(
+                behavior,
+                "causal_m1_ancestors",
+                return_value={chain[-1].uid},
+            ),
+            patch.object(
+                behavior,
+                "_parent_map",
+                wraps=behavior._parent_map,
+            ) as parent_map,
+        ):
+            rows = _adaptive_composites(
+                engine,
+                tuple(chain) + (outcome, second_outcome),
+                (),
+                limit=256,
+            )
         self.assertTrue(rows)
         self.assertGreaterEqual(max(len(row.parents) - 1 for row in rows), 8)
+        parent_map.assert_called_once()
 
 
 class SessionCreditTests(unittest.TestCase):

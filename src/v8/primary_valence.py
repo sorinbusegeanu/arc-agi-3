@@ -695,7 +695,15 @@ def _install_peer_formation_semantics() -> None:
         state = getattr(self, "_primary_valence_formation_state", None)
         if state is None:
             state = {}; self._primary_valence_formation_state = state
-        for candidate in self.promotion.propose(cut.nodes, cut.edges, budget=self.candidate_budget):
+        prior_cancel = getattr(self.promotion, "_v841_cancel_event", None)
+        self.promotion._v841_cancel_event = cancel
+        try:
+            candidates = self.promotion.propose(
+                cut.nodes, cut.edges, budget=self.candidate_budget
+            )
+        finally:
+            self.promotion._v841_cancel_event = prior_cancel
+        for candidate in candidates:
             if cancelled():
                 return
             parent_watermark = max((by_uid[uid].updated_watermark for uid in candidate.parents if uid in by_uid), default=cut.watermark)

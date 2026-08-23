@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import unittest
 from random import Random
 from types import SimpleNamespace
@@ -7,6 +8,7 @@ from types import SimpleNamespace
 from v8.arena import EdgeRecord, NodeRecord
 from v8.behavior_recovery import (
     CausalEvidenceGatedPromotionEngine,
+    _parent_map,
     _plan_candidates,
     canonical_outcome_key,
     observed_outcome_uids,
@@ -92,6 +94,20 @@ class CanonicalOutcomeTests(unittest.TestCase):
 
 
 class CausalStrategyFormationTests(unittest.TestCase):
+    def test_parent_index_build_honors_cancellation_after_start(self) -> None:
+        cancel = threading.Event()
+        row = MemoryUid(1, 1)
+        lineage = edge(row, RelationType.EXPLAINS, MemoryUid(2, 2))
+
+        class CancellingEdges:
+            def __iter__(self):
+                for index in range(5000):
+                    if index == 1:
+                        cancel.set()
+                    yield lineage
+
+        self.assertIsNone(_parent_map(CancellingEdges(), cancel_event=cancel))
+
     def test_m7_is_formed_only_from_m1_in_outcome_lineage(self) -> None:
         linked = node(MemoryLevel.M1, MemoryType.CONTINGENCY, (10, 2, 77, 11), support=5)
         unrelated = node(MemoryLevel.M1, MemoryType.CONTINGENCY, (20, 3, 88, 21), support=5)

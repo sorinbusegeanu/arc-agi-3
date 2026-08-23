@@ -6,6 +6,7 @@ Actors retain the M7/M6/control lineage and aggregated M1 prediction information
 actually use, instead of caching every NodeRecord and EdgeRecord in every process.
 """
 
+import heapq
 import time
 
 from v8.arena import EdgeRecord, NodeRecord
@@ -30,6 +31,7 @@ _PROBE_STATES = _ACTIVE_STATES | {
 }
 _COMPACT_CUT_KEY = ("v851", "actor-compact-cut")
 _COMPACT_CUT_SCHEMA = 3
+_MAX_OUTCOME_KEYS_PER_ARENA = 32_768
 
 
 class ActorReadView(LiveReadView):
@@ -192,6 +194,8 @@ class ActorReadView(LiveReadView):
             active_uids: set[MemoryUid] = set()
             outcome_counts: dict[tuple[int, int], dict[int, int]] = {}
             outcome_totals: dict[tuple[int, int], int] = {}
+            outcome_recency: dict[tuple[int, int], int] = {}
+            outcome_heap: list[tuple[int, tuple[int, int]]] = []
             for index in range(count):
                 row = arena.read(index)
                 level = int(row.level)
@@ -213,9 +217,31 @@ class ActorReadView(LiveReadView):
                         pass
                 if level == int(MemoryLevel.M1) and len(row.key_parts) >= 3:
                     key = (int(row.key_parts[0]), signed_u64(int(row.key_parts[1])))
+                    updated = int(row.updated_watermark)
+                    if key not in outcome_counts:
+                        while outcome_heap and outcome_recency.get(
+                            outcome_heap[0][1]
+                        ) != outcome_heap[0][0]:
+                            heapq.heappop(outcome_heap)
+                        if len(outcome_counts) >= _MAX_OUTCOME_KEYS_PER_ARENA:
+                            oldest = outcome_heap[0] if outcome_heap else None
+                            if oldest is not None and (updated, key) <= oldest:
+                                continue
+                            if oldest is not None:
+                                _watermark, evicted = heapq.heappop(outcome_heap)
+                                outcome_counts.pop(evicted, None)
+                                outcome_totals.pop(evicted, None)
+                                outcome_recency.pop(evicted, None)
+                        outcome_counts[key] = {}
+                        outcome_totals[key] = 0
+                        outcome_recency[key] = updated
+                        heapq.heappush(outcome_heap, (updated, key))
+                    elif updated > outcome_recency.get(key, -1):
+                        outcome_recency[key] = updated
+                        heapq.heappush(outcome_heap, (updated, key))
                     support = max(0, int(row.support_count))
                     outcome = int(row.key_parts[2])
-                    bucket = outcome_counts.setdefault(key, {})
+                    bucket = outcome_counts[key]
                     bucket[outcome] = bucket.get(outcome, 0) + support
                     outcome_totals[key] = outcome_totals.get(key, 0) + support
             after = int(arena.sequence)

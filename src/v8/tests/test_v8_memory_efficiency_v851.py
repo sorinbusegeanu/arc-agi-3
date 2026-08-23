@@ -19,7 +19,7 @@ from v8 import memory_efficiency_v851_suite_fix as suite_fix
 from v8 import memory_storage_v851 as storage
 from v8 import runtime_stack_v88
 from v8.actor_read_view_v851 import ActorReadView, _COMPACT_CUT_KEY
-from v8.arena import ActionRecord, EdgeRecord, SharedActionArena, SharedEdgeArena, SharedNodeArena
+from v8.arena import ActionRecord, EdgeRecord, NodeRecord, SharedActionArena, SharedEdgeArena, SharedNodeArena
 from v8.evidence import EvidenceRecord
 from v8.evidence_memory_v851 import DiskBackedEvidenceLedger, _ROOT_ENV
 from v8.model import MemoryLevel, MemoryUid, RelationType, ValidationState
@@ -117,6 +117,47 @@ class MemoryEfficiencyV851Tests(unittest.TestCase):
             ActorReadView._load_provenance_games((Arena(),), {relevant}),
             {relevant: {101}},
         )
+
+    def test_actor_prediction_cut_bounds_keys_during_arena_scan(self):
+        def prediction_row(context: int, watermark: int) -> NodeRecord:
+            return NodeRecord(
+                uid=MemoryUid(context, watermark),
+                fingerprint=context,
+                level=int(MemoryLevel.M1),
+                memory_type=100,
+                key_parts=(context, 7, context + 100),
+                support_count=context,
+                significance_sum=0.0,
+                prediction_error_sum=0.0,
+                learning_value_sum=0.0,
+                transfer_prior_sum=0.0,
+                explanatory_sum=0.0,
+                future_option_sum=0.0,
+                score_weight=1.0,
+                updated_watermark=watermark,
+            )
+
+        rows = (
+            prediction_row(1, 10),
+            prediction_row(2, 20),
+            prediction_row(3, 30),
+        )
+
+        class Arena:
+            sequence = 2
+            count = len(rows)
+
+            @staticmethod
+            def read(index):
+                return rows[index]
+
+        with patch("v8.actor_read_view_v851._MAX_OUTCOME_KEYS_PER_ARENA", 2):
+            _version, _nodes, _lineage, _active, counts, totals = (
+                ActorReadView._scan_node_arena(Arena())
+            )
+
+        self.assertEqual({key[0] for key in counts}, {2, 3})
+        self.assertEqual(sum(totals.values()), 5)
 
     def test_actor_compact_cut_is_reused_without_full_record_snapshots(self):
         nodes = SharedNodeArena(capacity=16)

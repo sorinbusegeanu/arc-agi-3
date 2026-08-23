@@ -78,9 +78,19 @@ def canonical_outcome_uid(consequence: NodeRecord) -> MemoryUid:
     )
 
 
-def _parent_map(edges: tuple[EdgeRecord, ...]) -> dict[MemoryUid, set[MemoryUid]]:
+def _parent_map(
+    edges: tuple[EdgeRecord, ...],
+    *,
+    cancel_event=None,
+) -> dict[MemoryUid, set[MemoryUid]] | None:
     parents: dict[MemoryUid, set[MemoryUid]] = {}
-    for edge in edges:
+    for index, edge in enumerate(edges):
+        if (
+            index % 4096 == 0
+            and cancel_event is not None
+            and cancel_event.is_set()
+        ):
+            return None
         if int(edge.relation_type) in _LINEAGE_RELATIONS:
             parents.setdefault(edge.source_uid, set()).add(edge.target_uid)
     return parents
@@ -92,16 +102,37 @@ def causal_m1_ancestors(
     nodes: tuple[NodeRecord, ...],
     edges: tuple[EdgeRecord, ...],
     max_depth: int = 8,
+    cancel_event=None,
+    node_by_uid: dict[MemoryUid, NodeRecord] | None = None,
+    parents: dict[MemoryUid, set[MemoryUid]] | None = None,
 ) -> frozenset[MemoryUid]:
     """Return M1 contingencies actually present in an M6 outcome's lineage."""
-    by_uid = {row.uid: row for row in nodes}
-    parents = _parent_map(edges)
+    if node_by_uid is None:
+        by_uid = {}
+        for index, row in enumerate(nodes):
+            if (
+                index % 4096 == 0
+                and cancel_event is not None
+                and cancel_event.is_set()
+            ):
+                return frozenset()
+            by_uid[row.uid] = row
+    else:
+        by_uid = node_by_uid
+    if parents is None:
+        parents = _parent_map(edges, cancel_event=cancel_event)
+        if parents is None:
+            return frozenset()
     result: set[MemoryUid] = set()
     frontier = {outcome_uid}
     visited = set(frontier)
     for _depth in range(max(1, int(max_depth))):
+        if cancel_event is not None and cancel_event.is_set():
+            return frozenset()
         following: set[MemoryUid] = set()
         for current in frontier:
+            if cancel_event is not None and cancel_event.is_set():
+                return frozenset()
             for parent in parents.get(current, ()):
                 row = by_uid.get(parent)
                 if row is not None and int(row.level) == int(MemoryLevel.M1):

@@ -670,27 +670,43 @@ def _adaptive_composites(engine, nodes, edges, *, limit: int):
     from v8 import learning_blockers_v055 as blockers
     from v8.promotion import FormationCandidate
 
-    m1 = [
-        row for row in nodes
-        if int(row.level) == int(MemoryLevel.M1)
-        and int(row.memory_type) == int(MemoryType.CONTINGENCY)
-        and len(row.key_parts) >= 4
-        and row.support_count >= int(getattr(engine, "min_contingency_support", 3))
-        and engine._admissible(row)
-    ]
+    cancel_event = getattr(engine, "_v841_cancel_event", None)
+
+    def cancelled() -> bool:
+        return bool(cancel_event is not None and cancel_event.is_set())
+
+    if cancelled():
+        return ()
+
+    m1 = []
+    outcomes = []
+    for index, row in enumerate(nodes):
+        if index % 4096 == 0 and cancelled():
+            return ()
+        if (
+            int(row.level) == int(MemoryLevel.M1)
+            and int(row.memory_type) == int(MemoryType.CONTINGENCY)
+            and len(row.key_parts) >= 4
+            and row.support_count >= int(getattr(engine, "min_contingency_support", 3))
+            and engine._admissible(row)
+        ):
+            m1.append(row)
+        elif (
+            int(row.level) == int(MemoryLevel.M6)
+            and int(row.memory_type) == int(MemoryType.OUTCOME)
+            and len(row.key_parts) >= 3
+            and engine._admissible(row)
+        ):
+            outcomes.append(row)
     incoming = defaultdict(list)
     for row in m1:
         incoming[int(row.key_parts[3])].append(row)
     for rows in incoming.values():
         rows.sort(key=lambda r: (-_row_value(r), r.uid))
-    outcomes = [
-        row for row in nodes
-        if int(row.level) == int(MemoryLevel.M6)
-        and int(row.memory_type) == int(MemoryType.OUTCOME)
-        and len(row.key_parts) >= 3
-        and engine._admissible(row)
-    ]
     by_uid = {row.uid: row for row in m1}
+    parents = behavior._parent_map(tuple(edges), cancel_event=cancel_event)
+    if parents is None or cancelled():
+        return ()
     graph_scale = max(1, len(m1))
     depth_limit = min(_MAX_COMPOSITE_ACTIONS, max(6, 4 + int(math.ceil(math.log2(graph_scale + 1)))))
     predecessor_cap = min(16, max(4, int(math.sqrt(max(1, limit))) + 2))
@@ -698,15 +714,33 @@ def _adaptive_composites(engine, nodes, edges, *, limit: int):
     result, seen = [], set()
 
     for outcome in sorted(outcomes, key=lambda r: r.uid):
-        ancestors = behavior.causal_m1_ancestors(outcome.uid, nodes=tuple(nodes), edges=tuple(edges), max_depth=max(8, depth_limit + 2))
+        if cancelled():
+            return ()
+        ancestors = behavior.causal_m1_ancestors(
+            outcome.uid,
+            nodes=(),
+            edges=(),
+            max_depth=max(8, depth_limit + 2),
+            cancel_event=cancel_event,
+            node_by_uid=by_uid,
+            parents=parents,
+        )
+        if cancelled():
+            return ()
         for target_uid in sorted(ancestors):
+            if cancelled():
+                return ()
             target = by_uid.get(target_uid)
             if target is None:
                 continue
             paths = [[target]]
             for _ in range(depth_limit - 1):
+                if cancelled():
+                    return ()
                 extended = []
                 for path in paths:
+                    if cancelled():
+                        return ()
                     before = int(path[0].key_parts[0])
                     used = {r.uid for r in path}
                     for predecessor in incoming.get(before, ())[:predecessor_cap]:
