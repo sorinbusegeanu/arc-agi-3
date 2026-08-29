@@ -3,17 +3,17 @@ from __future__ import annotations
 """v8.60 state-transition-driven click exploration.
 
 v8.57 made click coverage complete, but productive coordinates were still explored
-only after the broad sweep and were repeated at most once.  For multi-state click
+only after the broad sweep and were repeated at most once. For multi-state click
 mechanics (notably gp03), that spends most of a small interaction budget discovering
 coordinates instead of characterizing the causal state machine of a coordinate that
 has already produced evidence.
 
-This layer composes above the existing v8.48/v8.57 sampler hooks.  A productive
-CLICK_SCAN/CLICK_CHARACTERIZE transition immediately becomes a bounded local
-characterization sequence.  The same executable coordinate is re-clicked while it
-continues to produce novel observable state transitions.  Characterization stops on
-no observable change, terminal/level progress, a repeated transition (cycle), or the
-bounded repeat cap.  Broad coverage then resumes from the existing frontier.
+This layer composes beneath the established v8.32/v8.47 public sampler authorities.
+A productive CLICK_SCAN/CLICK_CHARACTERIZE transition immediately becomes a bounded
+local characterization sequence. The same executable coordinate is re-clicked while
+it continues to produce novel observable state transitions. Characterization stops
+on no observable change, terminal/level progress, a repeated transition (cycle), or
+the bounded repeat cap. Broad coverage then resumes from the existing frontier.
 """
 
 import os
@@ -66,15 +66,15 @@ def _begin_lease_v860(self, seed: int) -> None:
     _BASE_BEGIN_LEASE(self, int(seed))
     _ensure_state(self)
     _clear_pending(self)
-    # Transition knowledge deliberately survives leases in the same actor.  Only
-    # the active characterization continuation is lease-local.
+    # Transition knowledge survives leases in the same worker. Only an active
+    # continuation is lease-local.
 
 
 def _prepare_step_v860(self, env) -> bool:
     _ensure_state(self)
     if self._v860_pending_action is not None:
-        # Characterization is already at the informative successor state.  Do not
-        # let generic frontier repositioning reset the episode before the repeat.
+        # We are already at the informative successor state. Do not let lower
+        # frontier machinery reset/replay before the characterization click.
         self.pending_sequence = None
         self.base.pending_reset = None
         return False
@@ -152,17 +152,14 @@ def _observe_transition_v860(self, **kwargs) -> None:
     intervention = self.base.current
     transition = _productive_click_transition(intervention, kwargs)
 
-    # Preserve all existing learning/frontier semantics first.  v8.48 clears the
-    # generic single-probe reset for CLICK_SCAN, which is exactly what local
-    # characterization needs.
-    _BASE_OBSERVE_TRANSITION(self, **kwargs)
+    # Preserve all older learning/frontier bookkeeping before adding the local
+    # characterization continuation.
+    result = _BASE_OBSERVE_TRANSITION(self, **kwargs)
 
     if transition is None:
-        # A characterization click that stopped changing state is direct evidence
-        # that this local chain is exhausted.  Resume broad/frontier exploration.
         if intervention is not None and str(getattr(intervention, "kind", "")) == "CLICK_CHARACTERIZE":
             _clear_pending(self)
-        return
+        return result
 
     key = (
         int(transition.action),
@@ -177,16 +174,16 @@ def _observe_transition_v860(self, **kwargs) -> None:
     depth = int(self._v860_repeat_depth.get(action, 0)) + 1
     self._v860_repeat_depth[action] = depth
 
-    # State-transition novelty, not action novelty, controls exploitation.  A
-    # repeated edge means we have entered a cycle; another click would spend budget
-    # without adding a new local causal transition.
+    # State-transition novelty, not action novelty, controls exploitation. A
+    # repeated edge means the local state machine has cycled.
     if prior_seen or depth >= _repeat_cap():
         _clear_pending(self)
-        return
+        return result
 
     self._v860_pending_action = action
     self.pending_sequence = None
     self.base.pending_reset = None
+    return result
 
 
 def transition_telemetry_v860(sampler) -> dict[str, object]:
@@ -206,15 +203,23 @@ def install_click_transition_exploration_v860() -> None:
     if _INSTALLED:
         return
 
-    from v8.sampling_portfolio_v831 import PortfolioSampler
+    from v8 import sampling_evidence_frontier_v847 as frontier
+    from v8 import sampling_persistence_v832 as persistence
 
-    _BASE_BEGIN_LEASE = PortfolioSampler.begin_lease
-    _BASE_PREPARE_STEP = PortfolioSampler.prepare_step
-    _BASE_FORCED_ACTION = PortfolioSampler.forced_action
-    _BASE_OBSERVE_TRANSITION = PortfolioSampler.observe_transition
+    # Compose only through established lower delegates. Public identities remain:
+    #   PortfolioSampler.begin_lease      -> v8.32
+    #   PortfolioSampler.prepare_step     -> v8.47
+    #   PortfolioSampler.forced_action    -> v8.32
+    #   PortfolioSampler.observe_transition -> v8.32
+    _BASE_BEGIN_LEASE = persistence._BASE_BEGIN_LEASE
+    persistence._BASE_BEGIN_LEASE = _begin_lease_v860
 
-    PortfolioSampler.begin_lease = _begin_lease_v860
-    PortfolioSampler.prepare_step = _prepare_step_v860
-    PortfolioSampler.forced_action = _forced_action_v860
-    PortfolioSampler.observe_transition = _observe_transition_v860
+    _BASE_PREPARE_STEP = frontier._BASE_PREPARE_STEP
+    frontier._BASE_PREPARE_STEP = _prepare_step_v860
+
+    _BASE_FORCED_ACTION = persistence._BASE_FORCED_ACTION
+    persistence._BASE_FORCED_ACTION = _forced_action_v860
+
+    _BASE_OBSERVE_TRANSITION = persistence._BASE_OBSERVE_TRANSITION
+    persistence._BASE_OBSERVE_TRANSITION = _observe_transition_v860
     _INSTALLED = True
