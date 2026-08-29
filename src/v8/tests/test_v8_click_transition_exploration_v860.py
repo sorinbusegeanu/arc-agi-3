@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import v8
+from v8 import click_exploration_v848 as click
 from v8 import click_transition_exploration_v860 as v860
 from v8 import sampling_evidence_frontier_v847 as frontier
 from v8 import sampling_persistence_v832 as persistence
@@ -147,15 +148,21 @@ class ClickTransitionExplorationV860Tests(unittest.TestCase):
             v860._observe_transition_v860(self.sampler, **kwargs)
         self.assertIsNone(self.sampler._v860_pending_action)
 
-    def test_runtime_stack_preserves_public_authorities_and_installs_v860_below_them(self) -> None:
+    def test_runtime_stack_preserves_historical_authorities_and_installs_v860_deep(self) -> None:
         self.assertIs(PortfolioSampler.begin_lease, persistence._begin_lease_v832)
         self.assertIs(PortfolioSampler.prepare_step, frontier._prepare_step_v847)
         self.assertIs(PortfolioSampler.forced_action, persistence._forced_action_v832)
         self.assertIs(PortfolioSampler.observe_transition, persistence._observe_transition_v832)
-        self.assertIs(persistence._BASE_BEGIN_LEASE, v860._begin_lease_v860)
-        self.assertIs(frontier._BASE_PREPARE_STEP, v860._prepare_step_v860)
-        self.assertIs(persistence._BASE_FORCED_ACTION, v860._forced_action_v860)
-        self.assertIs(persistence._BASE_OBSERVE_TRANSITION, v860._observe_transition_v860)
+
+        self.assertIs(persistence._BASE_BEGIN_LEASE, click._sampler_begin_lease_v848)
+        self.assertIs(frontier._BASE_PREPARE_STEP, click._sampler_prepare_step_v848)
+        self.assertIs(persistence._BASE_FORCED_ACTION, click._sampler_forced_action_v848)
+        self.assertIs(persistence._BASE_OBSERVE_TRANSITION, click._sampler_observe_transition_v848)
+
+        self.assertIs(click._BASE_SAMPLER_BEGIN_LEASE, v860._begin_lease_v860)
+        self.assertIs(click._BASE_SAMPLER_PREPARE_STEP, v860._prepare_step_v860)
+        self.assertIs(click._BASE_SAMPLER_FORCED_ACTION, v860._forced_action_v860)
+        self.assertIs(click._BASE_SAMPLER_OBSERVE_TRANSITION, v860._observe_transition_v860)
 
 
 if __name__ == "__main__":
