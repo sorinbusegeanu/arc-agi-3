@@ -272,7 +272,7 @@ class ActionEventRefreshSchedulingTests(unittest.TestCase):
     def _event(game: str = "g") -> dict[str, object]:
         return {
             "schema": 1,
-            "time": time.time() + 1.0,
+            "time": report._RUN_STARTED_AT + 60.0,
             "game_id": game,
             "steps": 1,
         }
