@@ -4,7 +4,8 @@ from dataclasses import dataclass
 from random import Random
 import time
 
-from v8.actor import ActorJob, ActorProgress, ActorResult
+from v8.actor import ActorJob, ActorProgress, ActorResult, run_actor_jobs as run_arc_actor_jobs
+from v8.experiments import ExperimentSummary, run_automatic_transfer_experiments
 from v8.model import stable_u64
 from v8.multi_environment_run import make_adapter
 
@@ -36,18 +37,16 @@ MIX_SPECS: tuple[EnvironmentRunSpec, ...] = (
     EnvironmentRunSpec("arc", "ez02"),
     EnvironmentRunSpec("arc", "ic01"),
     EnvironmentRunSpec("gym", "FrozenLake-v1", "is_slippery=false"),
-    EnvironmentRunSpec("gym", "ArcAgi/Chess-v0", "opponent=random,agent_color=white"),
+    EnvironmentRunSpec("chess", "ArcAgi/Chess-v0", "opponent=random,agent_color=white"),
 )
-
-
-_INSTALLED = False
-_BASE_RESOLVE_GAME_SELECTOR = None
-_BASE_RUN_ACTOR_JOBS = None
-_BASE_TRANSFER_EXPERIMENTS = None
 
 
 def is_mix_selector(selector: object) -> bool:
     return str(selector).strip().lower() == "mix"
+
+
+def resolve_mixed_game_selector(selector: object) -> tuple[str, ...] | None:
+    return MIX_GAME_IDS if is_mix_selector(selector) else None
 
 
 def is_generic_game(game_id: str) -> bool:
@@ -199,13 +198,12 @@ def run_mixed_actor_jobs(
     arc_jobs = tuple(job for job in jobs if not is_generic_game(job.game_id))
     results: list[ActorResult] = []
 
-    # Keep the mature ARC worker stack intact. It runs first so generic environments
-    # can immediately query ARC-derived shared memory in the same runtime. Generic
-    # evidence is then ingested into that same graph and is available to peers,
-    # snapshots, restart and the next mixed run.
+    # Preserve the mature ARC process/optimizer stack. All five jobs use the same
+    # ContinuousMemoryRuntime, so their canonical memories and higher-order peer
+    # derivations share one graph and one snapshot lineage.
     if arc_jobs:
         results.extend(
-            _BASE_RUN_ACTOR_JOBS(
+            run_arc_actor_jobs(
                 runtime,
                 arc_jobs,
                 timeout=timeout,
@@ -235,41 +233,11 @@ def run_mixed_actor_jobs(
     return tuple(sorted(results, key=lambda row: row.actor_id))
 
 
-def _resolve_game_selector(selector, env_root=None):
-    if is_mix_selector(selector):
-        return MIX_GAME_IDS
-    return _BASE_RESOLVE_GAME_SELECTOR(selector, env_root)
-
-
-def _run_actor_jobs(runtime, jobs, **kwargs):
-    jobs = tuple(jobs)
-    if any(is_generic_game(job.game_id) for job in jobs):
-        return run_mixed_actor_jobs(runtime, jobs, **kwargs)
-    return _BASE_RUN_ACTOR_JOBS(runtime, jobs, **kwargs)
-
-
-def _run_transfer_experiments(runtime, *, games, **kwargs):
-    # The legacy automatic experiment harness constructs ARC environments directly.
-    # Keep it ARC-only until a later experiment harness consumes cognition adapters.
+def run_mixed_transfer_experiments(runtime, *, games, **kwargs) -> ExperimentSummary:
+    # The legacy automatic experiment harness still constructs ARC environments
+    # directly. Cross-family evidence is learned through the shared graph, while
+    # this legacy active intervention remains ARC-only until it consumes adapters.
     arc_games = tuple(str(game) for game in games if not is_generic_game(str(game)))
     if len(arc_games) < 2:
-        from v8.experiments import ExperimentSummary
         return ExperimentSummary(0, 0, 0)
-    return _BASE_TRANSFER_EXPERIMENTS(runtime, games=arc_games, **kwargs)
-
-
-def install_mixed_environment_v859() -> None:
-    global _INSTALLED, _BASE_RESOLVE_GAME_SELECTOR, _BASE_RUN_ACTOR_JOBS, _BASE_TRANSFER_EXPERIMENTS
-    if _INSTALLED:
-        return
-    import v7.game_sets as game_sets
-    import v8.actor as actor
-    import v8.experiments as experiments
-
-    _BASE_RESOLVE_GAME_SELECTOR = game_sets.resolve_game_selector
-    _BASE_RUN_ACTOR_JOBS = actor.run_actor_jobs
-    _BASE_TRANSFER_EXPERIMENTS = experiments.run_automatic_transfer_experiments
-    game_sets.resolve_game_selector = _resolve_game_selector
-    actor.run_actor_jobs = _run_actor_jobs
-    experiments.run_automatic_transfer_experiments = _run_transfer_experiments
-    _INSTALLED = True
+    return run_automatic_transfer_experiments(runtime, games=arc_games, **kwargs)
