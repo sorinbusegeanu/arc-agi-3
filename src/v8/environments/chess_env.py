@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import gymnasium as gym
 import numpy as np
 
 from v8.environment_contract import (
@@ -28,9 +29,8 @@ CHESS_ACTION_COUNT = 64 * 64 * 5
 def _imports():
     try:
         import chess
-        import gymnasium as gym
     except ImportError as exc:  # pragma: no cover - dependency error is explicit
-        raise RuntimeError("chess environment requires gymnasium and chess") from exc
+        raise RuntimeError("chess environment requires chess") from exc
     return chess, gym
 
 
@@ -89,7 +89,7 @@ def _repetition_count(board) -> int:
     return 1
 
 
-class ChessGymEnv:
+class ChessGymEnv(gym.Env):
     """Single-agent local chess environment with an automatic local opponent.
 
     One Gym step is one agent move plus, when the game continues, one opponent move.
@@ -105,7 +105,8 @@ class ChessGymEnv:
         agent_color: str = "white",
         initial_fen: str | None = None,
     ) -> None:
-        chess, gym = _imports()
+        super().__init__()
+        chess, _gym = _imports()
         if opponent not in {"random", "first"}:
             raise ValueError("opponent must be 'random' or 'first'")
         if agent_color not in {"white", "black"}:
@@ -118,7 +119,6 @@ class ChessGymEnv:
             np.asarray([13] * 64 + [2, 16, 65, 151, 512, 6], dtype=np.int64)
         )
         self.board = chess.Board(initial_fen) if initial_fen else chess.Board()
-        self.np_random = np.random.default_rng()
 
     def _observation(self) -> np.ndarray:
         chess, _gym = _imports()
@@ -161,9 +161,8 @@ class ChessGymEnv:
         self.board.push(move)
 
     def reset(self, *, seed: int | None = None, options=None):
+        super().reset(seed=seed)
         del options
-        if seed is not None:
-            self.np_random = np.random.default_rng(int(seed))
         chess, _gym = _imports()
         self.board = chess.Board(self.initial_fen) if self.initial_fen else chess.Board()
         if bool(self.board.turn) != bool(self.agent_color) and self._outcome() is None:
@@ -202,10 +201,10 @@ class ChessGymEnv:
 
 
 def register_chess_gym() -> None:
-    _chess, gym = _imports()
-    if CHESS_GYM_ID in gym.registry:
+    _chess, gym_module = _imports()
+    if CHESS_GYM_ID in gym_module.registry:
         return
-    gym.register(
+    gym_module.register(
         id=CHESS_GYM_ID,
         entry_point="v8.environments.chess_env:ChessGymEnv",
         max_episode_steps=512,
