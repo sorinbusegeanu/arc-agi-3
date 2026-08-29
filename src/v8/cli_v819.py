@@ -77,6 +77,20 @@ def _requested_games(values: list[str]) -> str | None:
     return parsed.games
 
 
+def _requested_run_budget(values: list[str]) -> tuple[int, int]:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--steps-per-game", type=int, default=1000)
+    parser.add_argument("--graph-check", type=int, default=1000)
+    parsed, _unknown = parser.parse_known_args(values)
+    steps = int(parsed.steps_per_game)
+    graph_check = int(parsed.graph_check)
+    if steps <= 0:
+        raise ValueError("--steps-per-game must be positive")
+    if graph_check <= 0:
+        raise ValueError("--graph-check must be positive")
+    return steps, graph_check
+
+
 def _validate(args) -> None:
     positive_ints = (
         "allocation_lease_steps",
@@ -116,15 +130,30 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if "continuous-run" in remaining:
             actor_pool = _requested_actor_pool(remaining)
+            requested_steps, graph_check = _requested_run_budget(remaining)
+            print(
+                f"v8 requested budget: steps_per_game={requested_steps} "
+                f"graph_check_interval={graph_check}steps",
+                flush=True,
+            )
             changed[_ACTOR_POOL_ENV] = os.environ.get(_ACTOR_POOL_ENV)
             os.environ[_ACTOR_POOL_ENV] = str(actor_pool)
 
-            # base cli intentionally retains one descriptor per game so budgets and
-            # reporting cover every game.  Only process concurrency is capped.
+            # base cli intentionally retains every job descriptor so requested
+            # interaction credits remain intact. Only process concurrency is capped.
             prior_actor_jobs = base_cli._actor_jobs
 
             def pooled_actor_jobs(*args, **kwargs):
-                return _ActorJobBatch(prior_actor_jobs(*args, **kwargs), actor_pool)
+                batch = prior_actor_jobs(*args, **kwargs)
+                requested_games = tuple(args[0]) if args else tuple(kwargs.get("games", ()))
+                expected = int(kwargs.get("steps_per_game", requested_steps)) * len(requested_games)
+                actual = sum(max(0, int(job.steps)) for job in batch)
+                if requested_games and actual != expected:
+                    raise RuntimeError(
+                        "v8 actor budget mismatch: "
+                        f"requested={expected} scheduled={actual}"
+                    )
+                return _ActorJobBatch(batch, actor_pool)
 
             base_cli._actor_jobs = pooled_actor_jobs
 
