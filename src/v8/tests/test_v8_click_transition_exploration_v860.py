@@ -7,6 +7,8 @@ from unittest.mock import patch
 
 import v8
 from v8 import click_transition_exploration_v860 as v860
+from v8 import sampling_evidence_frontier_v847 as frontier
+from v8 import sampling_persistence_v832 as persistence
 from v8.decision_point_sampling_v821 import Intervention
 from v8.learning_blockers_v055 import pack_action_choice
 from v8.sampling_portfolio_v831 import PortfolioSampler
@@ -82,7 +84,6 @@ class ClickTransitionExplorationV860Tests(unittest.TestCase):
         self.assertEqual(self.sampler._v860_pending_action, self.action)
         self.sampler._v860_pending_action = None
 
-        # 40 -> 41 is now a repeated transition: local state machine has cycled.
         self._observe(40, 41, kind="CLICK_CHARACTERIZE")
         self.assertIsNone(self.sampler._v860_pending_action)
         self.assertEqual(len(self.sampler._v860_seen_transitions), 2)
@@ -146,10 +147,15 @@ class ClickTransitionExplorationV860Tests(unittest.TestCase):
             v860._observe_transition_v860(self.sampler, **kwargs)
         self.assertIsNone(self.sampler._v860_pending_action)
 
-    def test_runtime_stack_installs_v860_above_v857_sampler(self) -> None:
-        self.assertIs(PortfolioSampler.prepare_step, v860._prepare_step_v860)
-        self.assertIs(PortfolioSampler.forced_action, v860._forced_action_v860)
-        self.assertIs(PortfolioSampler.observe_transition, v860._observe_transition_v860)
+    def test_runtime_stack_preserves_public_authorities_and_installs_v860_below_them(self) -> None:
+        self.assertIs(PortfolioSampler.begin_lease, persistence._begin_lease_v832)
+        self.assertIs(PortfolioSampler.prepare_step, frontier._prepare_step_v847)
+        self.assertIs(PortfolioSampler.forced_action, persistence._forced_action_v832)
+        self.assertIs(PortfolioSampler.observe_transition, persistence._observe_transition_v832)
+        self.assertIs(persistence._BASE_BEGIN_LEASE, v860._begin_lease_v860)
+        self.assertIs(frontier._BASE_PREPARE_STEP, v860._prepare_step_v860)
+        self.assertIs(persistence._BASE_FORCED_ACTION, v860._forced_action_v860)
+        self.assertIs(persistence._BASE_OBSERVE_TRANSITION, v860._observe_transition_v860)
 
 
 if __name__ == "__main__":
