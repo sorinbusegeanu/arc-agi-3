@@ -9,6 +9,7 @@ import v8
 from v8 import click_exploration_v848 as click
 from v8 import click_transition_exploration_v860 as v860
 from v8 import sampling_evidence_frontier_v847 as frontier
+from v8 import sampling_evidence_frontier_v847_fixups as frontier_fixups
 from v8 import sampling_persistence_v832 as persistence
 from v8.decision_point_sampling_v821 import Intervention
 from v8.learning_blockers_v055 import pack_action_choice
@@ -161,8 +162,10 @@ class ClickTransitionExplorationV860Tests(unittest.TestCase):
 
         self.assertIs(click._BASE_SAMPLER_BEGIN_LEASE, v860._begin_lease_v860)
         self.assertIs(click._BASE_SAMPLER_PREPARE_STEP, v860._prepare_step_v860)
-        self.assertIs(click._BASE_SAMPLER_FORCED_ACTION, v860._forced_action_v860)
-        self.assertIs(click._BASE_SAMPLER_OBSERVE_TRANSITION, v860._observe_transition_v860)
+        self.assertIs(click._BASE_SAMPLER_FORCED_ACTION, frontier_fixups._lower_forced_v847)
+        self.assertIs(click._BASE_SAMPLER_OBSERVE_TRANSITION, frontier_fixups._lower_observe_v847)
+        self.assertIs(frontier_fixups._BASE_LOWER_FORCED, v860._forced_action_v860)
+        self.assertIs(frontier_fixups._BASE_LOWER_OBSERVE, v860._observe_transition_v860)
 
 
 if __name__ == "__main__":
