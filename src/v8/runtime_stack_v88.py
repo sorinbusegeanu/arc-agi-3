@@ -116,4 +116,5 @@ def install_current_runtime_stack_v88() -> None:
     _installer("click_state_learning_v857")()
     _installer("transfer_correspondence_v857")()
     _installer("click_transition_exploration_v860")()
+    _installer("click_transition_graph_v861")()
     _INSTALLED = True
