@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
-import v8  # installs the current runtime stack including v8.59
-from v7.game_sets import resolve_game_selector
+import v8
 from v8 import actor as actor_module
+from v8 import cli as base_cli
 from v8.cli import _actor_jobs
+from v8.cli_v819 import main as adaptive_cli_main
 from v8.mixed_environment_v859 import (
     ARC_GAME_IDS,
     GENERIC_GAME_IDS,
@@ -14,7 +16,9 @@ from v8.mixed_environment_v859 import (
     _choose_action,
     is_generic_game,
     is_mix_selector,
+    resolve_mixed_game_selector,
     run_generic_actor_job,
+    run_mixed_actor_jobs,
 )
 
 
@@ -73,15 +77,13 @@ class _Runtime:
 class MixedEnvironmentV859Tests(unittest.TestCase):
     def test_mix_selector_is_exactly_five_games_from_three_environment_categories(self):
         self.assertTrue(is_mix_selector("mix"))
-        self.assertEqual(resolve_game_selector("mix", None), MIX_GAME_IDS)
+        self.assertEqual(resolve_mixed_game_selector("mix"), MIX_GAME_IDS)
+        self.assertIsNone(resolve_mixed_game_selector("ez01,ez02"))
         self.assertEqual(len(MIX_GAME_IDS), 5)
         self.assertEqual(tuple(spec.environment_id for spec in MIX_SPECS), MIX_GAME_IDS)
-        self.assertEqual({spec.environment_family for spec in MIX_SPECS}, {"arc", "gym"})
+        self.assertEqual({spec.environment_family for spec in MIX_SPECS}, {"arc", "gym", "chess"})
         self.assertEqual(ARC_GAME_IDS, {"ez01", "ez02", "ic01"})
         self.assertEqual(GENERIC_GAME_IDS, {"FrozenLake-v1", "ArcAgi/Chess-v0"})
-
-    def test_non_mix_selector_delegates_to_existing_arc_selector(self):
-        self.assertEqual(resolve_game_selector("ez01,ez02", None), ("ez01", "ez02"))
 
     def test_five_actors_give_one_lane_to_each_mix_entry(self):
         jobs = _actor_jobs(
@@ -157,8 +159,29 @@ class MixedEnvironmentV859Tests(unittest.TestCase):
         self.assertNotEqual(frozen.events[0]["source_game_hash"], chess.events[0]["source_game_hash"])
         self.assertNotEqual(frozen.events[0]["carrier_signature"], chess.events[0]["carrier_signature"])
 
-    def test_runtime_stack_installs_mixed_run_actor_authority(self):
-        self.assertEqual(actor_module.run_actor_jobs.__module__, "v8.mixed_environment_v859")
+    def test_mix_cli_patches_only_cli_dispatch_and_restores_it_after_run(self):
+        original_actor_dispatch = base_cli.run_actor_jobs
+        original_experiment_dispatch = base_cli.run_automatic_transfer_experiments
+
+        def inspect_main(argv):
+            from v7.game_sets import resolve_game_selector
+
+            self.assertEqual(resolve_game_selector("mix", None), MIX_GAME_IDS)
+            self.assertIs(base_cli.run_actor_jobs, run_mixed_actor_jobs)
+            self.assertEqual(argv[:3], ["continuous-run", "--games", "mix"])
+            return 0
+
+        with patch.object(base_cli, "main", side_effect=inspect_main):
+            self.assertEqual(
+                adaptive_cli_main(["continuous-run", "--games", "mix", "--actors", "5"]),
+                0,
+            )
+        self.assertIs(base_cli.run_actor_jobs, original_actor_dispatch)
+        self.assertIs(base_cli.run_automatic_transfer_experiments, original_experiment_dispatch)
+
+    def test_arc_actor_public_authority_is_not_replaced_by_mix_feature(self):
+        self.assertIsNot(actor_module.run_actor_jobs, run_mixed_actor_jobs)
+        self.assertNotEqual(actor_module.run_actor_jobs.__module__, "v8.mixed_environment_v859")
 
 
 if __name__ == "__main__":
