@@ -70,6 +70,13 @@ def _requested_actor_pool(values: list[str]) -> int:
     return value
 
 
+def _requested_games(values: list[str]) -> str | None:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--games", default=None)
+    parsed, _unknown = parser.parse_known_args(values)
+    return parsed.games
+
+
 def _validate(args) -> None:
     positive_ints = (
         "allocation_lease_steps",
@@ -102,6 +109,10 @@ def main(argv: list[str] | None = None) -> int:
 
     changed: dict[str, str | None] = {}
     prior_actor_jobs = None
+    prior_run_actor_jobs = None
+    prior_transfer_experiments = None
+    prior_game_selector = None
+    game_sets = None
     try:
         if "continuous-run" in remaining:
             actor_pool = _requested_actor_pool(remaining)
@@ -117,6 +128,30 @@ def main(argv: list[str] | None = None) -> int:
 
             base_cli._actor_jobs = pooled_actor_jobs
 
+            from v8.mixed_environment_v859 import (
+                MIX_GAME_IDS,
+                is_mix_selector,
+                run_mixed_actor_jobs,
+                run_mixed_transfer_experiments,
+            )
+
+            if is_mix_selector(_requested_games(remaining)):
+                import v7.game_sets as game_sets_module
+
+                game_sets = game_sets_module
+                prior_game_selector = game_sets.resolve_game_selector
+                prior_run_actor_jobs = base_cli.run_actor_jobs
+                prior_transfer_experiments = base_cli.run_automatic_transfer_experiments
+
+                def mixed_game_selector(selector, env_root=None):
+                    if is_mix_selector(selector):
+                        return MIX_GAME_IDS
+                    return prior_game_selector(selector, env_root)
+
+                game_sets.resolve_game_selector = mixed_game_selector
+                base_cli.run_actor_jobs = run_mixed_actor_jobs
+                base_cli.run_automatic_transfer_experiments = run_mixed_transfer_experiments
+
         for attribute, env_name in _ENV_OPTIONS.items():
             value = getattr(allocation, attribute)
             if value is None:
@@ -131,6 +166,12 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         if prior_actor_jobs is not None:
             base_cli._actor_jobs = prior_actor_jobs
+        if prior_run_actor_jobs is not None:
+            base_cli.run_actor_jobs = prior_run_actor_jobs
+        if prior_transfer_experiments is not None:
+            base_cli.run_automatic_transfer_experiments = prior_transfer_experiments
+        if game_sets is not None and prior_game_selector is not None:
+            game_sets.resolve_game_selector = prior_game_selector
         for env_name, previous in changed.items():
             if previous is None:
                 os.environ.pop(env_name, None)
