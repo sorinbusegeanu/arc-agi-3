@@ -118,4 +118,5 @@ def install_current_runtime_stack_v88() -> None:
     _installer("click_transition_exploration_v860")()
     _installer("click_transition_graph_v861")()
     _installer("click_transition_graph_v861_fixups")()
+    _installer("click_transition_graph_v861_authority_fix")()
     _INSTALLED = True
