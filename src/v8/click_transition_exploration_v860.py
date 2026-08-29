@@ -194,19 +194,22 @@ def install_click_transition_exploration_v860() -> None:
         return
 
     from v8 import click_exploration_v848 as click
+    from v8 import sampling_evidence_frontier_v847_fixups as frontier_fixups
 
-    # v8.48 is already the established immediate lower delegate beneath the
-    # historical public sampler authorities. Compose inside its saved bases so
-    # both public and intermediate authority identities remain unchanged.
+    # begin/prepare can compose in the v8.48 saved bases without replacing public
+    # or intermediate authorities.
     _BASE_BEGIN_LEASE = click._BASE_SAMPLER_BEGIN_LEASE
     click._BASE_SAMPLER_BEGIN_LEASE = _begin_lease_v860
 
     _BASE_PREPARE_STEP = click._BASE_SAMPLER_PREPARE_STEP
     click._BASE_SAMPLER_PREPARE_STEP = _prepare_step_v860
 
-    _BASE_FORCED_ACTION = click._BASE_SAMPLER_FORCED_ACTION
-    click._BASE_SAMPLER_FORCED_ACTION = _forced_action_v860
+    # v8.48's forced/observe saved bases are themselves pinned v8.47 authorities.
+    # Insert below those fixups so every historical identity remains exact:
+    # public v8.32 -> v8.48 -> v8.47 fixup -> v8.60 -> older composition.
+    _BASE_FORCED_ACTION = frontier_fixups._BASE_LOWER_FORCED
+    frontier_fixups._BASE_LOWER_FORCED = _forced_action_v860
 
-    _BASE_OBSERVE_TRANSITION = click._BASE_SAMPLER_OBSERVE_TRANSITION
-    click._BASE_SAMPLER_OBSERVE_TRANSITION = _observe_transition_v860
+    _BASE_OBSERVE_TRANSITION = frontier_fixups._BASE_LOWER_OBSERVE
+    frontier_fixups._BASE_LOWER_OBSERVE = _observe_transition_v860
     _INSTALLED = True
