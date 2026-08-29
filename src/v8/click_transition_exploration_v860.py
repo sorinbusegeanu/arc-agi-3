@@ -56,25 +56,52 @@ def _ensure_state(sampler) -> None:
         sampler._v860_seen_transitions = set()
     if not hasattr(sampler, "_v860_transition_counts"):
         sampler._v860_transition_counts = {}
+    if not hasattr(sampler, "_v860_scope_stamp"):
+        sampler._v860_scope_stamp = None
 
 
 def _clear_pending(sampler) -> None:
     sampler._v860_pending_action = None
 
 
+def _clear_episode_state(sampler) -> None:
+    _ensure_state(sampler)
+    _clear_pending(sampler)
+    sampler._v860_repeat_depth.clear()
+    sampler._v860_seen_transitions.clear()
+    sampler._v860_transition_counts.clear()
+
+
 def _begin_lease_v860(self, seed: int) -> None:
     _BASE_BEGIN_LEASE(self, int(seed))
-    _ensure_state(self)
-    _clear_pending(self)
+    _clear_episode_state(self)
+    self._v860_scope_stamp = None
 
 
 def _prepare_step_v860(self, env) -> bool:
     _ensure_state(self)
+    stamp = (
+        int(getattr(env, "reset_count", 0)),
+        int(getattr(env, "last_levels_completed", 0)),
+    )
+    prior_stamp = self._v860_scope_stamp
+    if prior_stamp is not None and stamp != prior_stamp:
+        _clear_episode_state(self)
+    self._v860_scope_stamp = stamp
+
+    # v8.61 consumes these optional fields to learn local cell-state dynamics
+    # without changing the actor/environment contract.
+    self._v861_env = env
     if self._v860_pending_action is not None:
         self.pending_sequence = None
         self.base.pending_reset = None
+        self._v861_before_observation = getattr(env, "_last_grid", None)
+        self._v861_current_observation = getattr(env, "_last_grid", None)
         return False
-    return bool(_BASE_PREPARE_STEP(self, env))
+    reset = bool(_BASE_PREPARE_STEP(self, env))
+    self._v861_before_observation = getattr(env, "_last_grid", None)
+    self._v861_current_observation = getattr(env, "_last_grid", None)
+    return reset
 
 
 def _forced_action_v860(
