@@ -8,8 +8,8 @@ mechanics (notably gp03), that spends most of a small interaction budget discove
 coordinates instead of characterizing the causal state machine of a coordinate that
 has already produced evidence.
 
-This layer composes beneath the established v8.32/v8.47 public sampler authorities.
-A productive CLICK_SCAN/CLICK_CHARACTERIZE transition immediately becomes a bounded
+This layer composes beneath the established v8.32/v8.47/v8.48 authorities. A
+productive CLICK_SCAN/CLICK_CHARACTERIZE transition immediately becomes a bounded
 local characterization sequence. The same executable coordinate is re-clicked while
 it continues to produce novel observable state transitions. Characterization stops
 on no observable change, terminal/level progress, a repeated transition (cycle), or
@@ -66,15 +66,11 @@ def _begin_lease_v860(self, seed: int) -> None:
     _BASE_BEGIN_LEASE(self, int(seed))
     _ensure_state(self)
     _clear_pending(self)
-    # Transition knowledge survives leases in the same worker. Only an active
-    # continuation is lease-local.
 
 
 def _prepare_step_v860(self, env) -> bool:
     _ensure_state(self)
     if self._v860_pending_action is not None:
-        # We are already at the informative successor state. Do not let lower
-        # frontier machinery reset/replay before the characterization click.
         self.pending_sequence = None
         self.base.pending_reset = None
         return False
@@ -147,13 +143,10 @@ def _productive_click_transition(intervention, kwargs) -> ClickTransition | None
     )
 
 
-def _observe_transition_v860(self, **kwargs) -> None:
+def _observe_transition_v860(self, **kwargs):
     _ensure_state(self)
     intervention = self.base.current
     transition = _productive_click_transition(intervention, kwargs)
-
-    # Preserve all older learning/frontier bookkeeping before adding the local
-    # characterization continuation.
     result = _BASE_OBSERVE_TRANSITION(self, **kwargs)
 
     if transition is None:
@@ -173,9 +166,6 @@ def _observe_transition_v860(self, **kwargs) -> None:
     action = int(transition.action)
     depth = int(self._v860_repeat_depth.get(action, 0)) + 1
     self._v860_repeat_depth[action] = depth
-
-    # State-transition novelty, not action novelty, controls exploitation. A
-    # repeated edge means the local state machine has cycled.
     if prior_seen or depth >= _repeat_cap():
         _clear_pending(self)
         return result
@@ -203,23 +193,20 @@ def install_click_transition_exploration_v860() -> None:
     if _INSTALLED:
         return
 
-    from v8 import sampling_evidence_frontier_v847 as frontier
-    from v8 import sampling_persistence_v832 as persistence
+    from v8 import click_exploration_v848 as click
 
-    # Compose only through established lower delegates. Public identities remain:
-    #   PortfolioSampler.begin_lease      -> v8.32
-    #   PortfolioSampler.prepare_step     -> v8.47
-    #   PortfolioSampler.forced_action    -> v8.32
-    #   PortfolioSampler.observe_transition -> v8.32
-    _BASE_BEGIN_LEASE = persistence._BASE_BEGIN_LEASE
-    persistence._BASE_BEGIN_LEASE = _begin_lease_v860
+    # v8.48 is already the established immediate lower delegate beneath the
+    # historical public sampler authorities. Compose inside its saved bases so
+    # both public and intermediate authority identities remain unchanged.
+    _BASE_BEGIN_LEASE = click._BASE_SAMPLER_BEGIN_LEASE
+    click._BASE_SAMPLER_BEGIN_LEASE = _begin_lease_v860
 
-    _BASE_PREPARE_STEP = frontier._BASE_PREPARE_STEP
-    frontier._BASE_PREPARE_STEP = _prepare_step_v860
+    _BASE_PREPARE_STEP = click._BASE_SAMPLER_PREPARE_STEP
+    click._BASE_SAMPLER_PREPARE_STEP = _prepare_step_v860
 
-    _BASE_FORCED_ACTION = persistence._BASE_FORCED_ACTION
-    persistence._BASE_FORCED_ACTION = _forced_action_v860
+    _BASE_FORCED_ACTION = click._BASE_SAMPLER_FORCED_ACTION
+    click._BASE_SAMPLER_FORCED_ACTION = _forced_action_v860
 
-    _BASE_OBSERVE_TRANSITION = persistence._BASE_OBSERVE_TRANSITION
-    persistence._BASE_OBSERVE_TRANSITION = _observe_transition_v860
+    _BASE_OBSERVE_TRANSITION = click._BASE_SAMPLER_OBSERVE_TRANSITION
+    click._BASE_SAMPLER_OBSERVE_TRANSITION = _observe_transition_v860
     _INSTALLED = True
