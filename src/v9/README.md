@@ -5,6 +5,7 @@
 Current landed scope:
 
 - v9.00 baseline/scientific manifest;
-- v9.01 modality and environment provenance contracts.
+- v9.01 modality and environment provenance contracts;
+- v9.02 passive symbol timeline and bounded ingestion.
 
 The cognitive graph and action-selection authority remain the current v8 runtime. Later v9 phases must be added in dependency order and must preserve the full v8 regression suite before gaining authority.
