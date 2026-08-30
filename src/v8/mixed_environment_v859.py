@@ -168,10 +168,30 @@ def _generic_read_view(runtime):
     return runtime.read_view, False
 
 
+def _restored_generic_candidate(game_id: str) -> dict[str, object] | None:
+    from v8.restored_competence_v872 import generic_replay_candidate_v872
+    from v8.verified_success_metrics_v866 import _configured_success_root
+
+    return generic_replay_candidate_v872(_configured_success_root(), str(game_id))
+
+
 def run_generic_actor_job(runtime, job: ActorJob, *, reporting_queue=None) -> ActorResult:
     if not is_generic_game(job.game_id):
         raise ValueError(f"{job.game_id!r} is not a generic mixed-environment game")
-    adapter = make_adapter(job.game_id, seed=int(job.seed))
+    restored = _restored_generic_candidate(job.game_id)
+    restored_actions = (
+        tuple(int(value) for value in restored.get("actions", ()))
+        if isinstance(restored, dict)
+        else ()
+    )
+    restored_index = 0
+    restored_active = bool(restored_actions)
+    adapter_seed = (
+        int(restored.get("seed", job.seed))
+        if isinstance(restored, dict)
+        else int(job.seed)
+    )
+    adapter = make_adapter(job.game_id, seed=adapter_seed)
     view, owns_view = _generic_read_view(runtime)
     rng = Random(int(job.seed))
     sequence = wins = failures = resets = planned_steps = 0
@@ -207,7 +227,20 @@ def run_generic_actor_job(runtime, job: ActorJob, *, reporting_queue=None) -> Ac
                 )
                 continue
             context = int(adapter.observation_signature(before))
-            action, planned = _choose_action(view, context, before_actions, rng, float(job.epsilon))
+            if restored_active:
+                restored_action = int(restored_actions[restored_index])
+                if restored_action in before_actions:
+                    action, planned = restored_action, True
+                    restored_index += 1
+                else:
+                    restored_active = False
+                    action, planned = _choose_action(
+                        view, context, before_actions, rng, float(job.epsilon)
+                    )
+            else:
+                action, planned = _choose_action(
+                    view, context, before_actions, rng, float(job.epsilon)
+                )
             planned_steps += int(planned)
             distribution = view.outcome_distribution(context, action)
             after = adapter.step(action)
@@ -264,6 +297,21 @@ def run_generic_actor_job(runtime, job: ActorJob, *, reporting_queue=None) -> Ac
                     wins += 1
                 elif boundary.primary_valence < 0:
                     failures += 1
+                restored_active = False
+                adapter.reset()
+                resets += 1
+                trajectory = stable_u64(
+                    adapter.identity.source_hash,
+                    job.seed,
+                    resets,
+                    producer_sequence,
+                    person=b"v8.59-mix-trajectory",
+                )
+            elif restored_active and restored_index >= len(restored_actions):
+                # A restored trajectory earns no competence credit unless its final
+                # action reproduces a positive terminal boundary. Resume ordinary
+                # learning from a clean episode after an unsuccessful replay.
+                restored_active = False
                 adapter.reset()
                 resets += 1
                 trajectory = stable_u64(

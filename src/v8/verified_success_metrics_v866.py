@@ -141,6 +141,15 @@ def record_verified_success_v866(
             _atomic_json(target, payload)
     except OSError:
         return False
+    if state == "WIN":
+        try:
+            from v8.restored_competence_v872 import persist_generic_win_v872
+
+            persist_generic_win_v872(success_root, payload)
+        except OSError:
+            # Current-run verified evidence remains authoritative even if the
+            # optional cross-run generic replay promotion cannot be written.
+            pass
     return True
 
 
@@ -272,6 +281,11 @@ def _prepare_runtime_success_root(runtime) -> Path:
             "source": "CURRENT_RUN_ONLY",
         },
     )
+    from v8.restored_competence_v872 import (
+        capture_startup_restored_competence_v872,
+    )
+
+    capture_startup_restored_competence_v872(base, root)
     return root
 
 
@@ -299,11 +313,16 @@ def _selected_games(runtime) -> tuple[str, ...]:
 
 
 def _runtime_metrics_v866(self):
+    from v8.restored_competence_v872 import restored_competence_snapshot_v872
+
     payload = _BASE_RUNTIME_METRICS(self)
     if not isinstance(payload, dict):
         payload = dict(payload)
     payload["verified_success"] = verified_success_snapshot_v866(
         self, _selected_games(self)
+    )
+    payload["restored_competence"] = restored_competence_snapshot_v872(
+        _runtime_success_root(self), _selected_games(self)
     )
     return payload
 
@@ -442,6 +461,9 @@ def learning_effectiveness_snapshot_v866(
         outcomes = getattr(coordinator, "_games", ())
         games = tuple(dict.fromkeys(str(game) for game in outcomes))
     verified = verified_success_snapshot_v866(runtime, games)
+    from v8.restored_competence_v872 import restored_competence_snapshot_v872
+
+    restored = restored_competence_snapshot_v872(_runtime_success_root(runtime), games)
 
     effectiveness = base.get("effectiveness", {})
     outcome = effectiveness.get("outcome_effectiveness", {})
@@ -476,9 +498,11 @@ def learning_effectiveness_snapshot_v866(
         None if solved_levels <= 0 else float(used_steps) / float(solved_levels)
     )
     efficiency["mean_first_win_step"] = verified["mean_first_win_step"]
+    effectiveness["restored_competence"] = restored
     scope["games"] = len(games)
     scope["outcome_source"] = verified["source"]
     base["verified_success"] = verified
+    base["restored_competence"] = restored
     return base
 
 
@@ -535,6 +559,8 @@ def _write_learning_effectiveness_log_v866(
 
 
 def _periodic_progress_line_v866(rows, total_steps, baseline=None) -> str:
+    from v8.restored_competence_v872 import restored_competence_snapshot_v872
+
     values = tuple(rows)
     root = _configured_success_root()
     if root is None:
@@ -543,6 +569,7 @@ def _periodic_progress_line_v866(rows, total_steps, baseline=None) -> str:
         dict.fromkeys(str(getattr(row, "game_id", "")) for row in values)
     )
     verified = verified_success_snapshot_v866(root, games)
+    restored = restored_competence_snapshot_v872(root, games)
     used_steps = sum(max(0, int(getattr(row, "steps", 0))) for row in values)
     planned_steps = sum(
         max(0, int(getattr(row, "planned_steps", 0))) for row in values
@@ -559,6 +586,8 @@ def _periodic_progress_line_v866(rows, total_steps, baseline=None) -> str:
         f"{max(0.0, min(100.0, budget_pct)):.0f}% - effectiveness "
         f"L={float(verified['level_solve_rate_pct']):.1f}% "
         f"G={float(verified['game_solve_rate_pct']):.1f}% "
+        f"RestL={float(restored['restored_level_solve_rate_pct']):.1f}% "
+        f"RestG={float(restored['restored_game_solve_rate_pct']):.1f}% "
         f"M7={m7:.1f}% "
         "M7val=- XferVal=- Opt=- Prod=- "
         f"step/L={report._compact_number(step_per_level)} "

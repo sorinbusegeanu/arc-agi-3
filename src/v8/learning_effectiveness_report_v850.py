@@ -348,6 +348,7 @@ def format_learning_effectiveness_stdout_v850(
     optimizer = effectiveness.get("optimizer_effectiveness", {})
     action = effectiveness.get("action_effectiveness", {})
     efficiency = effectiveness.get("efficiency", {})
+    restored = effectiveness.get("restored_competence")
     if not isinstance(outcome, dict):
         outcome = {}
     if not isinstance(learning, dict):
@@ -360,6 +361,12 @@ def format_learning_effectiveness_stdout_v850(
         action = {}
     if not isinstance(efficiency, dict):
         efficiency = {}
+    restored_text = ""
+    if isinstance(restored, dict):
+        restored_text = (
+            f"RestL={float(restored.get('restored_level_solve_rate_pct', 0.0)):.1f}% "
+            f"RestG={float(restored.get('restored_game_solve_rate_pct', 0.0)):.1f}% "
+        )
     budget_prefix = (
         ""
         if budget_consumed_pct is None
@@ -369,6 +376,7 @@ def format_learning_effectiveness_stdout_v850(
         f"{budget_prefix}effectiveness "
         f"L={float(outcome.get('level_solve_rate_pct', 0.0)):.1f}% "
         f"G={float(outcome.get('game_solve_rate_pct', 0.0)):.1f}% "
+        f"{restored_text}"
         f"M7={float(learning.get('m7_action_share_pct', 0.0)):.1f}% "
         f"M7val={_compact_pct(learning.get('m7_validation_success_rate_pct'))} "
         f"XferVal={_compact_pct(transfer.get('transfer_validation_success_rate_pct'))} "
