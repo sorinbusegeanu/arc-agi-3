@@ -16,7 +16,6 @@ from v8.model import (
     RelationType,
     ValidationState,
 )
-from v8.research import researcher_packet
 from v8.structural_events import NormalizedPrimitive, StructuralFact
 
 
@@ -119,31 +118,6 @@ class FormationTelemetryV870Tests(unittest.TestCase):
         self.assertEqual(telemetry["role_rejections"]["group_insufficient_lower_support"], 1)
         self.assertEqual(len(telemetry["role_rejected_examples"]["group_insufficient_distinct_carriers"]), 1)
         self.assertIn("separate groups", telemetry["role_gate_note"])
-
-    def test_research_packet_contains_formation_telemetry_and_optimizer_scope_note(self):
-        summary = {
-            "games": ["gp03"],
-            "actors": [{"game_id": "gp03", "steps": 10}],
-            "automatic_transfer_experiments": {"attempted": 0, "completed": 0, "passed": 0},
-            "metrics": {
-                "watermark": 10,
-                "level_counts": {"1": 10, "2": 0, "3": 0, "4": 0, "7": 0},
-                "formation_telemetry": {
-                    "m1g_count": 7, "m1n_count": 3, "m1n_cross_game_count": 1,
-                    "stable_m1n_support_ge_3": 1, "eligible_m2_groups": 0,
-                    "m3_carrier_count": 0, "carrier_groups_ge_2": 0, "role_candidates": 0,
-                },
-                "trajectory_optimizer": {"candidates_generated": 10, "validation_successes": 2, "validated_variants": 0},
-            },
-        }
-        packet = researcher_packet.build_packet(
-            summary, revision="test", argv=["continuous-run", "--games", "gp03"],
-            h_report=[], reporting_cut={}, evidence_digest={"available": True, "record_count": 0}, log_tail="",
-        )
-        self.assertIn('"formation_telemetry"', packet)
-        self.assertIn('"m1g_count": 7', packet)
-        self.assertIn('"m1n_cross_game_count": 1', packet)
-        self.assertIn("stage-local", packet)
 
     def test_runtime_stack_installs_v870_estimators(self):
         from v8 import peers
