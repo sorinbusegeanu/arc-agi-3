@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-BASELINE_GIT_COMMIT = "bdffa0ae3e199e2d76a925645eecb114b2cd9b16"
+BASELINE_GIT_COMMIT = "6c8310b367a6a6eac0fa4916081e2ab11d3eb7c8"
 PLANNED_BASELINE_GIT_COMMIT = "429842c7ff443a450c836a48509ce85062fcb1f1"
 
 
@@ -27,17 +27,47 @@ class ScientificConfig:
     default_cli_entrypoint: str = "v8.__main__ -> v8.cli_v819.main + v8.research.default_cli"
     symbol_codec_version: str = "v9-symbol-codec-1"
     environment_registry_version: int = 1
+    multimodal_schema_version: int = 1
+    progressive_radii: tuple[int, ...] = (1, 2, 4, 8)
+    beta_by_radius: tuple[tuple[int, float], ...] = (
+        (1, 1.0),
+        (2, 1.0),
+        (4, 1.0),
+        (8, 1.0),
+    )
+    normalization_reservoir_limit: int = 16
+    symbol_fact_budget: int = 8
+    cross_modal_fact_budget: int = 8
+    babyai_task_subset: tuple[str, ...] = (
+        "GoTo",
+        "Open",
+        "Pickup",
+        "PutNext",
+        "Unlock",
+    )
+    symbol_behavior_gate: str = "G4_LOCAL_G5_CROSS_ENVIRONMENT"
+    runtime_consolidation_requires_empirical_gates: bool = True
 
     @property
     def config_id(self) -> str:
-        payload = self.as_dict(include_id=False)
-        return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+        return hashlib.sha256(
+            _canonical_json(self.as_dict(include_id=False)).encode("utf-8")
+        ).hexdigest()
 
     def as_dict(self, *, include_id: bool = True) -> dict[str, Any]:
         payload = asdict(self)
-        payload["runtime_stack_layers"] = list(self.runtime_stack_layers)
-        payload["arena_packet_sizes"] = [list(row) for row in self.arena_packet_sizes]
-        payload["arena_record_sizes"] = [list(row) for row in self.arena_record_sizes]
+        for name in (
+            "runtime_stack_layers",
+            "progressive_radii",
+            "babyai_task_subset",
+        ):
+            payload[name] = list(payload[name])
+        for name in (
+            "arena_packet_sizes",
+            "arena_record_sizes",
+            "beta_by_radius",
+        ):
+            payload[name] = [list(row) for row in payload[name]]
         if include_id:
             payload["scientific_config_id"] = self.config_id
         return payload
@@ -93,7 +123,9 @@ class ScientificConfig:
         )
 
 
-def write_scientific_config_manifest(root: str | Path, config: ScientificConfig) -> Path:
+def write_scientific_config_manifest(
+    root: str | Path, config: ScientificConfig
+) -> Path:
     root_path = Path(root)
     root_path.mkdir(parents=True, exist_ok=True)
     target = root_path / "scientific_config.json"
@@ -105,5 +137,7 @@ def write_scientific_config_manifest(root: str | Path, config: ScientificConfig)
                 "run root already contains a different ScientificConfig; use a new run root"
             )
         return target
-    target.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    target.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     return target
