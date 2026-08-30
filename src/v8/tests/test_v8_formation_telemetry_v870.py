@@ -122,11 +122,11 @@ class FormationTelemetryV870Tests(unittest.TestCase):
         f1 = node(MemoryLevel.M2, MemoryType.FAMILY, (1001, 0))
         f2 = node(MemoryLevel.M2, MemoryType.FAMILY, (2002, 0))
 
-        c1 = node(MemoryLevel.M3, MemoryType.CARRIER, (111, 501, 0))
-        c2 = node(MemoryLevel.M3, MemoryType.CARRIER, (222, 502, 0))
-        c3 = node(MemoryLevel.M3, MemoryType.CARRIER, (333, 503, 1))
-        c4 = node(MemoryLevel.M3, MemoryType.CARRIER, (444, 504, -1))
-        c5 = node(MemoryLevel.M3, MemoryType.CARRIER, (555, 505, -1))
+        c1 = node(MemoryLevel.M3, MemoryType.CARRIER, (111, 501, 0), future=0.0)
+        c2 = node(MemoryLevel.M3, MemoryType.CARRIER, (222, 502, 0), future=0.0)
+        c3 = node(MemoryLevel.M3, MemoryType.CARRIER, (333, 503, 1), future=1.0)
+        c4 = node(MemoryLevel.M3, MemoryType.CARRIER, (444, 504, -1), future=-1.0)
+        c5 = node(MemoryLevel.M3, MemoryType.CARRIER, (555, 505, -1), future=-1.0)
 
         edges = (
             edge(c1, RelationType.EXPLAINS, f1),
