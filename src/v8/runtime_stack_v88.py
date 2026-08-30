@@ -137,4 +137,5 @@ def install_current_runtime_stack_v88() -> None:
     _publish_runtime_api_for_late_bootstrap()
     _installer("verified_success_metrics_v866")()
     _installer("verified_success_metrics_v866_fixups")()
+    _installer("actor_compact_scan_resilience_v867")()
     _INSTALLED = True
