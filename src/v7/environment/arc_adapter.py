@@ -9,6 +9,7 @@ import numpy as np
 
 
 _GAME_WAIT_ENV = "ARC_AGI3_GAME_WAIT_SECONDS"
+_ARCENGINE_RENDER_COMPAT_INSTALLED = False
 
 
 class ArcGridEnvironment:
@@ -143,6 +144,53 @@ def _ensure_arc_paths() -> None:
         value = str(repo_root / relative)
         if value not in sys.path:
             sys.path.insert(0, value)
+    _install_arcengine_render_compatibility()
+
+
+def _install_arcengine_render_compatibility() -> None:
+    """Normalize game-provided sprite render lists at the ARCEngine camera boundary.
+
+    ARC environment code can mutate or override a sprite so ``render()`` returns a
+    2-D Python list. ARCEngine 0.9.3 assumes the return value is an ndarray and reads
+    ``.shape`` immediately, which crashes ACTION6 handling before the adapter can
+    observe the transition. Keep the engine semantics unchanged and normalize only
+    the rendered pixel matrix passed into the camera implementation.
+    """
+    global _ARCENGINE_RENDER_COMPAT_INSTALLED
+    if _ARCENGINE_RENDER_COMPAT_INSTALLED:
+        return
+
+    try:
+        from arcengine.camera import Camera
+    except ImportError:
+        return
+
+    base_raw_render = Camera._raw_render
+    if getattr(base_raw_render, "_arc_list_render_compatible", False):
+        _ARCENGINE_RENDER_COMPAT_INSTALLED = True
+        return
+
+    class _RenderableSpriteProxy:
+        __slots__ = ("_sprite",)
+
+        def __init__(self, sprite: Any) -> None:
+            self._sprite = sprite
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._sprite, name)
+
+        def render(self) -> np.ndarray:
+            pixels = np.asarray(self._sprite.render(), dtype=np.int8)
+            if pixels.ndim != 2 or pixels.size == 0:
+                raise ValueError(f"expected non-empty 2D sprite render, got shape {pixels.shape}")
+            return pixels
+
+    def _raw_render_list_safe(self: Any, sprites: list[Any]) -> np.ndarray:
+        return base_raw_render(self, [_RenderableSpriteProxy(sprite) for sprite in sprites])
+
+    setattr(_raw_render_list_safe, "_arc_list_render_compatible", True)
+    Camera._raw_render = _raw_render_list_safe
+    _ARCENGINE_RENDER_COMPAT_INSTALLED = True
 
 
 def _candidate_environment_roots(env_root: str | None) -> tuple[Path, ...]:
