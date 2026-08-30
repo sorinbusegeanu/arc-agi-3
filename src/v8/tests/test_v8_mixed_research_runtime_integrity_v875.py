@@ -55,7 +55,7 @@ class _Stop:
 
 
 class MixedResearchRuntimeIntegrityV875Tests(unittest.TestCase):
-    def test_normalized_m2_keeps_legacy_label_and_h03_accepts_both_spellings(self):
+    def test_normalized_m2_uses_canonical_family_compression_only(self):
         proposal = intelligence.CompressionProposal(
             uid=MemoryUid.from_key(MemoryLevel.M2, MemoryType.FAMILY, (1, 2)),
             key_parts=(1, 2),
@@ -70,10 +70,9 @@ class MixedResearchRuntimeIntegrityV875Tests(unittest.TestCase):
             future_option_delta=0.0,
         )
         candidate = intelligence._compression_to_candidate(proposal)
-        self.assertEqual(candidate.evidence_kind, "generative_compression")
+        self.assertEqual(candidate.evidence_kind, "family_compression")
         h03 = next(row for row in evaluation.CONTRACTS if row.hypothesis_id == "H03")
-        self.assertIn("family_compression", h03.required_kinds)
-        self.assertIn("generative_compression", h03.required_kinds)
+        self.assertEqual(h03.required_kinds, ("family_compression",))
 
     def test_telemetry_state_reads_live_game_state_authority(self):
         expected = allocation.GameLearningState.SOLVED_OPTIMIZING
