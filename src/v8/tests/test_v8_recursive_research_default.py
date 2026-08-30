@@ -62,7 +62,7 @@ class DefaultRecursiveResearchTests(unittest.TestCase):
         )
         self.assertIn("ARC-only subset of mix", packet)
         self.assertIn("does not causally test those families", packet)
-        self.assertIn("restored historical evidence", packet)
+        self.assertIn("cumulative restored evidence", packet)
 
     def test_evidence_digest_samples_recent_records_not_oldest(self):
         with tempfile.TemporaryDirectory() as tmp:
