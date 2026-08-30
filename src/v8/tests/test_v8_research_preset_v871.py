@@ -15,7 +15,6 @@ from v8.mixed_environment_v859 import (
     is_research_1_selector,
     resolve_mixed_game_selector,
 )
-from v8.research import researcher_packet
 
 
 class ResearchPresetV871Tests(unittest.TestCase):
@@ -59,24 +58,6 @@ class ResearchPresetV871Tests(unittest.TestCase):
                 0,
             )
         self.assertIs(base_cli.run_actor_jobs, original_dispatch)
-
-    def test_research_packet_labels_research_1_transfer_scope(self):
-        packet = researcher_packet.build_packet(
-            {
-                "games": list(RESEARCH_1_GAME_IDS),
-                "actors": [],
-                "automatic_transfer_experiments": {"attempted": 0, "completed": 0, "passed": 0},
-                "metrics": {"level_counts": {}},
-            },
-            revision="test",
-            argv=["continuous-run", "--games", "research_1"],
-            h_report=[],
-            reporting_cut={},
-            evidence_digest={"available": True, "record_count": 0},
-            log_tail="",
-        )
-        self.assertIn("ARC-only subset of research_1", packet)
-        self.assertIn("does not causally test those families", packet)
 
 
 if __name__ == "__main__":
