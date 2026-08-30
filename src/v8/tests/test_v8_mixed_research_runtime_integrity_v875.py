@@ -9,6 +9,7 @@ from unittest.mock import patch
 import v8
 from v8 import actor
 from v8 import adaptive_learning_allocation_v819 as allocation
+from v8 import evaluation
 from v8 import intelligence_loop_v087 as intelligence
 from v8 import lease_dispatch_continuity_v839 as lease
 from v8 import mixed_environment_v859 as mixed
@@ -54,7 +55,7 @@ class _Stop:
 
 
 class MixedResearchRuntimeIntegrityV875Tests(unittest.TestCase):
-    def test_normalized_m2_uses_canonical_family_compression_evidence(self):
+    def test_normalized_m2_keeps_legacy_label_and_h03_accepts_both_spellings(self):
         proposal = intelligence.CompressionProposal(
             uid=MemoryUid.from_key(MemoryLevel.M2, MemoryType.FAMILY, (1, 2)),
             key_parts=(1, 2),
@@ -69,7 +70,10 @@ class MixedResearchRuntimeIntegrityV875Tests(unittest.TestCase):
             future_option_delta=0.0,
         )
         candidate = intelligence._compression_to_candidate(proposal)
-        self.assertEqual(candidate.evidence_kind, "family_compression")
+        self.assertEqual(candidate.evidence_kind, "generative_compression")
+        h03 = next(row for row in evaluation.CONTRACTS if row.hypothesis_id == "H03")
+        self.assertIn("family_compression", h03.required_kinds)
+        self.assertIn("generative_compression", h03.required_kinds)
 
     def test_telemetry_state_reads_live_game_state_authority(self):
         expected = allocation.GameLearningState.SOLVED_OPTIMIZING
@@ -167,11 +171,16 @@ class MixedResearchRuntimeIntegrityV875Tests(unittest.TestCase):
         self.assertTrue(any("sampling done" in row for row in output.rows))
         self.assertTrue(output.closed)
 
-    def test_dedicated_reporter_is_no_longer_v850_suppressed(self):
+    def test_dedicated_reporter_keeps_v850_hook_identity_without_suppression(self):
         from v8 import learning_effectiveness_report_v850 as effectiveness
 
-        self.assertIsNot(reporter._emit_line, effectiveness._reporter_emit_line_v850)
+        self.assertIs(reporter._emit_line, effectiveness._reporter_emit_line_v850)
         self.assertIs(reporter.reporting_worker, v875._reporting_worker_v875)
+        with patch.object(effectiveness, "_BASE_REPORTER_EMIT_LINE") as base_emit:
+            reporter._emit_line("10% - effectiveness L=0.0% G=0.0%", None)
+        base_emit.assert_called_once_with(
+            "10% - effectiveness L=0.0% G=0.0%", None
+        )
 
     def test_generic_production_path_prefers_process_workers(self):
         runtime = SimpleNamespace(
