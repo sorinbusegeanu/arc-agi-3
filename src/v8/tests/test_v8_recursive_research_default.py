@@ -5,44 +5,41 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from v8.research.default_analysis import derive_chain_evidence
-from v8.research.researcher_packet import (
-    _evidence_digest,
-    build_packet,
-    write_researcher_packet,
-)
-from v8.research.default_cli import run_with_default_research
 from v8.research.contracts import ChainStatus
+from v8.research.default_analysis import derive_chain_evidence
+from v8.research.default_cli import run_with_default_research
+from v8.research.experiment_artifacts import (
+    DECISION_NAME,
+    EVIDENCE_NAME,
+    _DECISION_BEGIN,
+    _DECISION_END,
+    _evidence_digest,
+    capture_experiment_start,
+    write_experiment_evidence,
+)
 
 
 class DefaultRecursiveResearchTests(unittest.TestCase):
-    def _summary(self):
+    def _summary(self, *, watermark=300, memories=20, evidence_records=7):
         return {
             "games": ["ic01", "gp03", "ArcAgi/Sudoku-v0"],
             "actors": [
-                {"game_id": "ic01", "steps": 100, "wins": 1, "failures": 0,
-                 "levels_completed": 1, "replans": 0, "planned_steps": 10, "resets": 1},
-                {"game_id": "gp03", "steps": 100, "wins": 0, "failures": 1,
-                 "levels_completed": 0, "replans": 0, "planned_steps": 0, "resets": 2},
-                {"game_id": "ArcAgi/Sudoku-v0", "steps": 100, "wins": 0, "failures": 0,
-                 "levels_completed": 0, "replans": 0, "planned_steps": 0, "resets": 3},
+                {"game_id": "ic01", "steps": 100, "wins": 1, "failures": 0, "levels_completed": 1, "resets": 1},
+                {"game_id": "gp03", "steps": 100, "wins": 0, "failures": 1, "levels_completed": 0, "resets": 2},
+                {"game_id": "ArcAgi/Sudoku-v0", "steps": 100, "wins": 0, "failures": 0, "levels_completed": 0, "resets": 3},
             ],
             "automatic_transfer_experiments": {"attempted": 2, "completed": 2, "passed": 1},
-            "hypotheses": {"H01": "VALID"},
             "metrics": {
-                "watermark": 300,
-                "generation": 4,
-                "memories": 20,
+                "watermark": watermark,
+                "memories": memories,
                 "edges": 30,
-                "evidence_records": 7,
+                "evidence_records": evidence_records,
                 "level_counts": {"1": 10, "2": 4, "3": 3, "4": 2, "7": 1},
-                "peers": None,
+                "formation_telemetry": {"m1n_count": 10, "eligible_m2_groups": 2, "role_candidates": 1},
                 "verified_success": {"game_solve_rate_pct": 33.3},
-                "trajectory_optimizer": {"candidates_generated": 0},
+                "trajectory_optimizer": {"candidates_generated": 2, "validation_successes": 1},
                 "adaptive_learning": {"states": {"UNSOLVED": 2}, "sample_steps": 200},
-                "process_memory": {"rss_bytes": 999999999},
             },
-            "final_snapshot": {"digest": "large-low-value-snapshot-digest"},
         }
 
     def test_missing_transfer_evidence_remains_insufficient(self):
@@ -51,98 +48,62 @@ class DefaultRecursiveResearchTests(unittest.TestCase):
         evidence = derive_chain_evidence(summary)
         self.assertEqual(evidence["M4_RELEVANT_CANDIDATE"].status, ChainStatus.INSUFFICIENT_EVIDENCE)
 
-    def test_packet_delegates_hypothesis_and_next_experiment_to_llm(self):
-        packet = build_packet(
-            self._summary(), revision="abc", argv=["continuous-run", "--games", "mix"],
-            h_report=[{"hypothesis_id": "H01", "final_decision": "VALID"}],
-            reporting_cut={"watermark": 300},
-            evidence_digest={"available": True, "record_count": 4},
-            log_tail="sample log",
-        )
-        self.assertIn("has **not selected a research hypothesis or next experiment**", packet)
-        self.assertIn("Competing hypotheses", packet)
-        self.assertIn("Most informative next experiment", packet)
-        self.assertIn("--games mix", packet)
-
-    def test_mix_packet_labels_arc_only_intervention_scope(self):
-        packet = build_packet(
-            self._summary(), revision="abc", argv=["continuous-run", "--games", "mix"],
-            h_report=[], reporting_cut={},
-            evidence_digest={"available": True, "record_count": 0},
-            log_tail="",
-        )
-        self.assertIn("ARC-only subset of mix", packet)
-        self.assertIn("does not causally test those families", packet)
-        self.assertIn("cumulative restored evidence", packet)
-
-    def test_evidence_digest_keeps_aggregates_and_omits_raw_samples(self):
+    def test_evidence_digest_can_be_scoped_to_pre_run_byte_boundary(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "evidence.jsonl"
-            rows = []
-            for watermark in range(1, 6):
-                rows.append({
-                    "evidence_id": f"row-{watermark}",
-                    "evidence_kind": "transfer_trial_pass",
-                    "decision_watermark": watermark,
-                    "evidence_available_watermark": watermark,
-                    "effect_direction": 1,
-                    "source_game_hash": 1,
-                    "target_game_hash": 2,
-                })
-            path.write_text(
-                "".join(json.dumps(row) + "\n" for row in rows),
-                encoding="utf-8",
-            )
-            digest = _evidence_digest(path)
-        self.assertEqual(digest["record_count"], 5)
-        self.assertEqual(digest["evidence_kind_counts"], {"transfer_trial_pass": 5})
-        self.assertEqual(digest["distinct_source_games"], 1)
-        self.assertEqual(digest["distinct_target_games"], 1)
-        self.assertNotIn("samples", digest)
+            first = json.dumps({"evidence_kind": "old", "effect_direction": 0}) + "\n"
+            path.write_text(first, encoding="utf-8")
+            offset = path.stat().st_size
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"evidence_kind": "new", "effect_direction": 1, "hypothesis_id": "H05"}) + "\n")
+            digest = _evidence_digest(path, start_offset=offset)
+        self.assertEqual(digest["record_count"], 1)
+        self.assertEqual(digest["evidence_kind_counts"], {"new": 1})
+        self.assertEqual(digest["hypothesis_id_counts"], {"H05": 1})
 
-    def test_packet_omits_duplicate_and_low_value_raw_sections(self):
-        packet = build_packet(
-            self._summary(), revision="abc", argv=["continuous-run", "--games", "mix"],
-            h_report=[{
-                "hypothesis_id": "H01",
-                "final_decision": "VALID",
-                "evidence_count": 12,
-                "blocker": "",
-                "paper_claim": "large duplicate claim",
-                "required_measurements": ["duplicate"],
-            }],
-            reporting_cut={"duplicated": "reporting-cut"},
-            evidence_digest={"available": True, "record_count": 4},
-            log_tail="sample log",
-        )
-        self.assertIn("## H01-H15 compact status", packet)
-        self.assertIn("## Key current-run evidence", packet)
-        self.assertIn("## Evidence-ledger aggregate digest", packet)
-        self.assertNotIn("## Reporting cut", packet)
-        self.assertNotIn("## Full run summary", packet)
-        self.assertNotIn("large-low-value-snapshot-digest", packet)
-        self.assertNotIn("999999999", packet)
-        self.assertNotIn("large duplicate claim", packet)
-        self.assertIn('"game_id": "ic01"', packet)
-        self.assertIn('"wins": 1', packet)
-
-    def test_writer_creates_single_llm_handoff_file_and_removes_stale_outputs(self):
+    def test_start_boundary_captures_reused_memory_and_explicit_decision(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "v8_run_summary.json").write_text(json.dumps(self._summary()), encoding="utf-8")
-            (root / "reports").mkdir()
-            (root / "reports" / "h01_h15.json").write_text("[]", encoding="utf-8")
-            (root / "reports" / "reporting_cut.json").write_text("{}", encoding="utf-8")
             research = root / "research"
-            (research / "evidence_packages").mkdir(parents=True)
-            (research / "evidence_packages" / "stale.json").write_text("{}", encoding="utf-8")
-            (research / "next_experiment.json").write_text("{}", encoding="utf-8")
-            (research / "runtime_hypotheses.json").write_text("[]", encoding="utf-8")
-            path = write_researcher_packet(root, argv=["continuous-run", "--games", "mix"])
-            self.assertEqual(path.name, "LLM_RESEARCH_PACKET.md")
-            self.assertEqual([p.name for p in research.iterdir()], ["LLM_RESEARCH_PACKET.md"])
+            research.mkdir()
+            metadata = {"change_id": "R001-T1", "change_type": "TELEMETRY", "target_hypothesis": "H05"}
+            (research / DECISION_NAME).write_text(
+                f"# RESEARCH_DECISION\n{_DECISION_BEGIN}\n{json.dumps(metadata)}\n{_DECISION_END}\n",
+                encoding="utf-8",
+            )
+            boundary_path = capture_experiment_start(root, argv=["continuous-run", "--games", "research_1"])
+            boundary = json.loads(boundary_path.read_text(encoding="utf-8"))
+        self.assertEqual(boundary["start_state"]["watermark"], 300)
+        self.assertEqual(boundary["decision_metadata"]["change_id"], "R001-T1")
+        self.assertIn("memory is intentionally reused", boundary["start_state_source"])
 
-    def test_exact_existing_continuous_command_triggers_packet_not_local_research_decision(self):
+    def test_evidence_reports_start_end_delta_local_ledger_and_formation_funnel(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "v8_run_summary.json").write_text(json.dumps(self._summary(watermark=100, memories=10, evidence_records=2)), encoding="utf-8")
+            (root / "evidence").mkdir()
+            ledger = root / "evidence" / "v8_evidence.jsonl"
+            ledger.write_text(json.dumps({"evidence_kind": "old"}) + "\n", encoding="utf-8")
+            capture_experiment_start(root, argv=["continuous-run", "--games", "research_1"])
+            with ledger.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"evidence_kind": "role_candidate", "hypothesis_id": "H05", "effect_direction": 1}) + "\n")
+            (root / "v8_run_summary.json").write_text(json.dumps(self._summary(watermark=150, memories=14, evidence_records=3)), encoding="utf-8")
+            (root / "reports").mkdir()
+            (root / "reports" / "h01_h15.json").write_text(json.dumps([{"hypothesis_id": "H05", "final_decision": "PARTIALLY_VALID"}]), encoding="utf-8")
+            (root / "reports" / "reporting_cut.json").write_text(json.dumps({"watermark": 150}), encoding="utf-8")
+            path = write_experiment_evidence(root, exit_code=0)
+            text = path.read_text(encoding="utf-8")
+        self.assertEqual(path.name, EVIDENCE_NAME)
+        self.assertIn("## Start state", text)
+        self.assertIn("## End state", text)
+        self.assertIn("## Experiment deltas", text)
+        self.assertIn('"watermark": 50', text)
+        self.assertIn('"role_candidate": 1', text)
+        self.assertIn('"formation_telemetry"', text)
+        self.assertIn("Cumulative state — context only", text)
+
+    def test_normal_continuous_run_generates_evidence_not_legacy_packet(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
 
@@ -151,15 +112,14 @@ class DefaultRecursiveResearchTests(unittest.TestCase):
                 return 0
 
             result = run_with_default_research(fake_main, [
-                "continuous-run", "--root", str(root), "--games", "mix",
-                "--steps-per-game", "1000", "--actors", "10", "--shards", "4", "--stage-workers", "2",
+                "continuous-run", "--root", str(root), "--games", "research_1",
+                "--steps-per-game", "20000", "--actors", "30", "--shards", "4", "--stage-workers", "2",
             ])
             self.assertEqual(result, 0)
-            self.assertTrue((root / "research" / "LLM_RESEARCH_PACKET.md").is_file())
-            self.assertFalse((root / "research" / "next_experiment.json").exists())
-            self.assertFalse((root / "research" / "runtime_hypotheses.json").exists())
+            self.assertTrue((root / "research" / EVIDENCE_NAME).is_file())
+            self.assertFalse((root / "research" / "LLM_RESEARCH_PACKET.md").exists())
 
-    def test_non_continuous_command_does_not_create_packet(self):
+    def test_non_continuous_command_does_not_create_research_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             self.assertEqual(run_with_default_research(lambda _argv: 0, ["smoke", "--root", str(root)]), 0)
