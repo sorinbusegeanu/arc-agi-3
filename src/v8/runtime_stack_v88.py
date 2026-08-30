@@ -140,4 +140,5 @@ def install_current_runtime_stack_v88() -> None:
     _installer("actor_compact_scan_resilience_v867")()
     _installer("verified_trajectory_export_v868")()
     _installer("verified_trajectory_provenance_v869")()
+    _installer("formation_telemetry_v870")()
     _INSTALLED = True
