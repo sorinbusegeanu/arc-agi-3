@@ -65,10 +65,14 @@ class InteractionTimelineEvent:
             raise ValueError("interaction events must use WORLD modality")
         if self.identity.event_id != self.experience.event_id:
             raise ValueError("timeline and experience EventId must match")
+        if self.identity.causal_watermark != self.experience.watermark:
+            raise ValueError("timeline and experience watermarks must match")
         if self.identity.producer_id != self.experience.producer_id:
             raise ValueError("timeline and experience producer_id must match")
         if self.identity.producer_sequence != self.experience.producer_sequence:
             raise ValueError("timeline and experience producer_sequence must match")
+        if self.identity.environment_instance_id != self.experience.source_game_hash:
+            raise ValueError("environment instance id must match source_game_hash compatibility alias")
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,11 +249,16 @@ class BoundedMultimodalTimeline:
         self.max_pending_passive_events = int(max_pending_passive_events)
         self.telemetry = TimelineOverflowTelemetry()
         self._pending: deque[TimelineEvent] = deque()
+        self._pending_passive_count = 0
         self._last_ordering_key: tuple[int, int, int] | None = None
 
     @property
     def pending_count(self) -> int:
         return len(self._pending)
+
+    @property
+    def pending_passive_count(self) -> int:
+        return int(self._pending_passive_count)
 
     @property
     def committed_action_count(self) -> int:
@@ -259,14 +268,13 @@ class BoundedMultimodalTimeline:
         key = event.identity.ordering_key
         if self._last_ordering_key is not None and key < self._last_ordering_key:
             raise ValueError("timeline events must be appended in causal order")
-        if not isinstance(event, InteractionTimelineEvent):
-            passive_pending = sum(
-                1 for row in self._pending if not isinstance(row, InteractionTimelineEvent)
-            )
-            if passive_pending >= self.max_pending_passive_events:
-                self.telemetry.pending_overflow_dropped += 1
-                return False
+        passive = not isinstance(event, InteractionTimelineEvent)
+        if passive and self._pending_passive_count >= self.max_pending_passive_events:
+            self.telemetry.pending_overflow_dropped += 1
+            return False
         self._pending.append(event)
+        if passive:
+            self._pending_passive_count += 1
         self._last_ordering_key = key
         return True
 
@@ -329,6 +337,8 @@ class BoundedMultimodalTimeline:
         self.telemetry.committed_events += 1
         if isinstance(event, InteractionTimelineEvent):
             self.telemetry.committed_actions += 1
+        else:
+            self._pending_passive_count -= 1
         return event
 
     def pending_events(self) -> tuple[TimelineEvent, ...]:
@@ -340,6 +350,7 @@ class BoundedMultimodalTimeline:
             "max_symbols_per_window": self.max_symbols_per_window,
             "max_symbol_payload_bytes": self.max_symbol_payload_bytes,
             "max_pending_passive_events": self.max_pending_passive_events,
+            "pending_passive_count": self._pending_passive_count,
             "telemetry": asdict(self.telemetry),
             "last_ordering_key": list(self._last_ordering_key) if self._last_ordering_key else None,
             "pending_packets": [encode_timeline_event(row).hex() for row in self._pending],
@@ -357,12 +368,26 @@ class BoundedMultimodalTimeline:
         telemetry = state.get("telemetry", {})
         if isinstance(telemetry, dict):
             timeline.telemetry = TimelineOverflowTelemetry(
-                **{field: int(telemetry.get(field, 0)) for field in TimelineOverflowTelemetry.__dataclass_fields__}
+                **{
+                    field: int(telemetry.get(field, 0))
+                    for field in TimelineOverflowTelemetry.__dataclass_fields__
+                }
             )
         packets = state.get("pending_packets", [])
         if not isinstance(packets, list):
             raise ValueError("pending timeline packets must be a list")
-        timeline._pending = deque(decode_timeline_event(bytes.fromhex(str(raw))) for raw in packets)
+        timeline._pending = deque(
+            decode_timeline_event(bytes.fromhex(str(raw))) for raw in packets
+        )
+        actual_passive_count = sum(
+            1 for row in timeline._pending if not isinstance(row, InteractionTimelineEvent)
+        )
+        saved_passive_count = int(state.get("pending_passive_count", actual_passive_count))
+        if saved_passive_count != actual_passive_count:
+            raise ValueError("pending passive-event count does not match restored packets")
+        if actual_passive_count > timeline.max_pending_passive_events:
+            raise ValueError("restored passive-event count exceeds configured bound")
+        timeline._pending_passive_count = actual_passive_count
         last = state.get("last_ordering_key")
         if isinstance(last, list) and len(last) == 3:
             timeline._last_ordering_key = tuple(int(value) for value in last)
