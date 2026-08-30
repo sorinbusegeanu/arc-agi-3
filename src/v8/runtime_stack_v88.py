@@ -147,4 +147,5 @@ def install_current_runtime_stack_v88() -> None:
     _installer("mixed_research_runtime_integrity_v876")()
     _installer("generic_result_flush_v877")()
     _installer("research_integrity_v878")()
+    _installer("information_flow_integrity_v879")()
     _INSTALLED = True
