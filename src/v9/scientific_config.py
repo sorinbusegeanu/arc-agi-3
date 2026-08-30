@@ -22,7 +22,9 @@ class ScientificConfig:
     planned_baseline_git_commit: str = PLANNED_BASELINE_GIT_COMMIT
     runtime_stack_layers: tuple[str, ...] = ()
     arena_packet_sizes: tuple[tuple[str, int], ...] = ()
+    arena_record_sizes: tuple[tuple[str, int], ...] = ()
     default_cli_contract: str = "PYTHONPATH=src python -m v8 continuous-run"
+    default_cli_entrypoint: str = "v8.__main__ -> v8.cli_v819.main + v8.research.default_cli"
     symbol_codec_version: str = "v9-symbol-codec-1"
     environment_registry_version: int = 1
 
@@ -35,13 +37,14 @@ class ScientificConfig:
         payload = asdict(self)
         payload["runtime_stack_layers"] = list(self.runtime_stack_layers)
         payload["arena_packet_sizes"] = [list(row) for row in self.arena_packet_sizes]
+        payload["arena_record_sizes"] = [list(row) for row in self.arena_record_sizes]
         if include_id:
             payload["scientific_config_id"] = self.config_id
         return payload
 
     @classmethod
     def capture_current(cls) -> "ScientificConfig":
-        from v8 import model
+        from v8 import arena, model
         from v8.runtime_stack_v88 import _FINAL_LAYERS, _LAYERS, _POST_LAYERS
 
         late = (
@@ -72,15 +75,21 @@ class ScientificConfig:
             "research_integrity_v878",
             "information_flow_integrity_v879",
         )
-        sizes = (
+        packet_sizes = (
             ("EXPERIENCE_PACKET_SIZE", int(model.EXPERIENCE_PACKET_SIZE)),
             ("PIPELINE_PACKET_SIZE", int(model.PIPELINE_PACKET_SIZE)),
             ("PROPOSAL_PACKET_SIZE", int(model.PROPOSAL_PACKET_SIZE)),
             ("RELATION_PROPOSAL_PACKET_SIZE", int(model.RELATION_PROPOSAL_PACKET_SIZE)),
         )
+        record_sizes = (
+            ("NODE_RECORD_SIZE", int(arena._NODE.size)),
+            ("EDGE_RECORD_SIZE", int(arena._EDGE.size)),
+            ("ACTION_RECORD_SIZE", int(arena._ACTION.size)),
+        )
         return cls(
             runtime_stack_layers=tuple((*_LAYERS, *_POST_LAYERS, *_FINAL_LAYERS, *late)),
-            arena_packet_sizes=sizes,
+            arena_packet_sizes=packet_sizes,
+            arena_record_sizes=record_sizes,
         )
 
 
