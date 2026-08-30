@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 
 import v8  # noqa: F401 - installs the production runtime stack
@@ -10,6 +11,7 @@ from v8.environments.sudoku_env import SudokuAdapter
 from v8 import trajectory_inspection_v819 as inspection
 from v8 import verified_success_metrics_v866 as verified
 from v8 import verified_trajectory_export_v868 as export
+from v8.research import researcher_packet
 
 
 class VerifiedTrajectoryProvenanceV869Tests(unittest.TestCase):
@@ -73,6 +75,66 @@ class VerifiedTrajectoryProvenanceV869Tests(unittest.TestCase):
             verified._VerifiedAdapterProxy.step.__module__,
             "v8.verified_trajectory_provenance_v869",
         )
+
+    def test_research_packet_does_not_call_carriers_roles(self):
+        summary = {
+            "games": ["gp03"],
+            "actors": [{"game_id": "gp03", "steps": 100}],
+            "automatic_transfer_experiments": {"attempted": 0, "completed": 0, "passed": 0},
+            "metrics": {
+                "level_counts": {"1": 100, "2": 2, "3": 9, "4": 0, "7": 0},
+                "watermark": 100,
+            },
+        }
+        packet = researcher_packet.build_packet(
+            summary,
+            revision="test",
+            argv=["continuous-run", "--games", "gp03"],
+            h_report=[],
+            reporting_cut={},
+            evidence_digest={
+                "available": True,
+                "record_count": 1,
+                "evidence_kind_counts": {"carrier_candidate": 1},
+            },
+            log_tail="",
+        )
+        start = packet.index("## Deterministic causal-chain diagnostic")
+        end = packet.index("## H01-H15 compact status")
+        diagnostic = packet[start:end]
+        self.assertIn('"edge": "M3_ROLE_FORMATION"', diagnostic)
+        self.assertIn('"status": "INSUFFICIENT_EVIDENCE"', diagnostic)
+        self.assertIn('"first_unresolved_link": "M3_ROLE_FORMATION"', diagnostic)
+        self.assertIn("no role_candidate evidence exists", diagnostic)
+
+    def test_research_packet_passes_m3_role_only_with_role_candidate_evidence(self):
+        summary = {
+            "games": ["gp03"],
+            "actors": [{"game_id": "gp03", "steps": 100}],
+            "automatic_transfer_experiments": {"attempted": 0, "completed": 0, "passed": 0},
+            "metrics": {
+                "level_counts": {"1": 100, "2": 2, "3": 9, "4": 0, "7": 0},
+                "watermark": 100,
+            },
+        }
+        packet = researcher_packet.build_packet(
+            summary,
+            revision="test",
+            argv=["continuous-run", "--games", "gp03"],
+            h_report=[],
+            reporting_cut={},
+            evidence_digest={
+                "available": True,
+                "record_count": 1,
+                "evidence_kind_counts": {"role_candidate": 1},
+            },
+            log_tail="",
+        )
+        start = packet.index("## Deterministic causal-chain diagnostic")
+        end = packet.index("## H01-H15 compact status")
+        diagnostic = packet[start:end]
+        self.assertIn('"edge": "M3_ROLE_FORMATION"', diagnostic)
+        self.assertIn('"evidence_count": 1', diagnostic)
 
 
 if __name__ == "__main__":
