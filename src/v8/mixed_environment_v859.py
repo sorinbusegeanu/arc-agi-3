@@ -30,9 +30,7 @@ class EnvironmentRunSpec:
 
 
 MIX_SPECS: tuple[EnvironmentRunSpec, ...] = (
-    EnvironmentRunSpec("arc", "ic01"),
     EnvironmentRunSpec("arc", "gp03"),
-    EnvironmentRunSpec("arc", "ic02", "difficulty=medium"),
     EnvironmentRunSpec("arc", "tp02", "difficulty=medium"),
     EnvironmentRunSpec("gym", "FrozenLake-v1", "is_slippery=false"),
     EnvironmentRunSpec("chess", "ArcAgi/Chess-v0", "opponent=random,agent_color=white"),
