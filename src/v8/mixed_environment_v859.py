@@ -45,17 +45,62 @@ GENERIC_GAME_IDS = frozenset(
 )
 MIX_TRANSFER_EXPERIMENT_SCOPE = "arc-only"
 
+# research_1 is deliberately heterogeneous while retaining several related ARC pairs
+# so the same run can test both transfer opportunity and negative/unrelated transfer.
+# ARC pairs: tp01/tp02 (teleport relation), gp01/gp03 (click-state transformation),
+# ex01/ex02 (temporal hold dynamics). lo01, mm01 and fi01 add compositional,
+# hidden-state and dynamic-hazard pressure respectively. Generic environments remain
+# restricted to adapters whose observation/action and terminal-valence contracts are
+# already validated in production.
+RESEARCH_1_SPECS: tuple[EnvironmentRunSpec, ...] = (
+    EnvironmentRunSpec("arc", "tp01"),
+    EnvironmentRunSpec("arc", "tp02"),
+    EnvironmentRunSpec("arc", "gp01"),
+    EnvironmentRunSpec("arc", "gp03"),
+    EnvironmentRunSpec("arc", "ex01"),
+    EnvironmentRunSpec("arc", "ex02"),
+    EnvironmentRunSpec("arc", "lo01"),
+    EnvironmentRunSpec("arc", "mm01"),
+    EnvironmentRunSpec("arc", "fi01"),
+    EnvironmentRunSpec("gym", "FrozenLake-v1", "is_slippery=false"),
+    EnvironmentRunSpec("chess", "ArcAgi/Chess-v0", "opponent=random,agent_color=white"),
+    EnvironmentRunSpec("sudoku", "ArcAgi/Sudoku-v0", "size=9,clues=36"),
+)
+RESEARCH_1_GAME_IDS: tuple[str, ...] = tuple(
+    spec.environment_id for spec in RESEARCH_1_SPECS
+)
+RESEARCH_1_ARC_GAME_IDS = frozenset(
+    spec.environment_id for spec in RESEARCH_1_SPECS if spec.environment_family == "arc"
+)
+RESEARCH_1_GENERIC_GAME_IDS = frozenset(
+    spec.environment_id for spec in RESEARCH_1_SPECS if spec.environment_family != "arc"
+)
+RESEARCH_1_TRANSFER_EXPERIMENT_SCOPE = "arc-only"
+_ALL_GENERIC_GAME_IDS = GENERIC_GAME_IDS | RESEARCH_1_GENERIC_GAME_IDS
+
 
 def is_mix_selector(selector: object) -> bool:
     return str(selector).strip().lower() == "mix"
 
 
+def is_research_1_selector(selector: object) -> bool:
+    return str(selector).strip().lower() == "research_1"
+
+
+def is_mixed_environment_selector(selector: object) -> bool:
+    return is_mix_selector(selector) or is_research_1_selector(selector)
+
+
 def resolve_mixed_game_selector(selector: object) -> tuple[str, ...] | None:
-    return MIX_GAME_IDS if is_mix_selector(selector) else None
+    if is_mix_selector(selector):
+        return MIX_GAME_IDS
+    if is_research_1_selector(selector):
+        return RESEARCH_1_GAME_IDS
+    return None
 
 
 def is_generic_game(game_id: str) -> bool:
-    return str(game_id) in GENERIC_GAME_IDS
+    return str(game_id) in _ALL_GENERIC_GAME_IDS
 
 
 def _choose_action(view, context: int, actions: tuple[int, ...], rng: Random, epsilon: float) -> tuple[int, bool]:
@@ -389,7 +434,7 @@ def run_mixed_actor_jobs(
 
 
 def run_mixed_transfer_experiments(runtime, *, games, **kwargs) -> ExperimentSummary:
-    arc_games = tuple(str(game) for game in games if str(game) in ARC_GAME_IDS)
+    arc_games = tuple(str(game) for game in games if not is_generic_game(str(game)))
     if len(arc_games) < 2:
         return ExperimentSummary(0, 0, 0)
     return run_automatic_transfer_experiments(runtime, games=arc_games, **kwargs)
