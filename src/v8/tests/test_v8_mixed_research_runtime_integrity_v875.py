@@ -171,16 +171,43 @@ class MixedResearchRuntimeIntegrityV875Tests(unittest.TestCase):
         self.assertTrue(any("sampling done" in row for row in output.rows))
         self.assertTrue(output.closed)
 
-    def test_dedicated_reporter_keeps_v850_hook_identity_without_suppression(self):
+    def test_dedicated_reporter_keeps_parent_suppression_but_emits_authoritatively(self):
         from v8 import learning_effectiveness_report_v850 as effectiveness
 
+        line = "10% - effectiveness L=0.0% G=0.0%"
         self.assertIs(reporter._emit_line, effectiveness._reporter_emit_line_v850)
         self.assertIs(reporter.reporting_worker, v875._reporting_worker_v875)
+
+        marker = object()
         with patch.object(effectiveness, "_BASE_REPORTER_EMIT_LINE") as base_emit:
-            reporter._emit_line("10% - effectiveness L=0.0% G=0.0%", None)
-        base_emit.assert_called_once_with(
-            "10% - effectiveness L=0.0% G=0.0%", None
-        )
+            reporter._emit_line(line, None)
+            base_emit.assert_not_called()
+            reporter._emit_line(line, marker)
+        base_emit.assert_called_once_with(line, marker)
+
+        events = queue.Queue()
+        events.put(actor.ActorProgress(1, "tp01", 3, 0, 0, 0))
+        events.put(reporter.SAMPLING_COMPLETE)
+        with (
+            patch.object(effectiveness, "_BASE_REPORTER_EMIT_LINE") as base_emit,
+            patch.object(
+                reporter,
+                "format_periodic_progress_line",
+                return_value=line,
+            ),
+        ):
+            v875._reporting_worker_v875(
+                event_queue=events,
+                stop_event=_Stop(),
+                watermark=_Watermark(),
+                actors=((1, "tp01"),),
+                interval_seconds=60.0,
+                output_queue=None,
+                total_steps=3,
+            )
+        emitted = [call.args[0] for call in base_emit.call_args_list]
+        self.assertTrue(any(value.startswith("100% - effectiveness") for value in emitted))
+        self.assertIn("sampling done", emitted)
 
     def test_generic_production_path_prefers_process_workers(self):
         runtime = SimpleNamespace(
