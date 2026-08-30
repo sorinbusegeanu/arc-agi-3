@@ -141,4 +141,5 @@ def install_current_runtime_stack_v88() -> None:
     _installer("verified_trajectory_export_v868")()
     _installer("verified_trajectory_provenance_v869")()
     _installer("formation_telemetry_v870")()
+    _installer("research_preset_v871")()
     _INSTALLED = True
