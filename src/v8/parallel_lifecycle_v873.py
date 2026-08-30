@@ -60,7 +60,10 @@ class _RetirementBucketResult:
 
 def _worker_count(item_count: int) -> int:
     configured = os.environ.get("ARC_AGI3_V8_LIFECYCLE_WORKERS", "").strip()
-    requested = int(configured) if configured else int(os.cpu_count() or 1)
+    try:
+        requested = int(configured) if configured else int(os.cpu_count() or 1)
+    except ValueError:
+        requested = int(os.cpu_count() or 1)
     return max(1, min(int(item_count), _MAX_WORKERS, requested))
 
 
@@ -136,7 +139,9 @@ def _partition_nodes(
         )
         for index, chunk in enumerate(chunks)
     )
-    results = tuple(sorted((future.result() for future in futures), key=lambda row: row.index))
+    results = tuple(
+        sorted((future.result() for future in futures), key=lambda row: row.index)
+    )
     if cancel_event.is_set() or not all(result.complete for result in results):
         return None
     merged: list[list[object]] = [[] for _ in range(int(bucket_count))]
@@ -216,7 +221,11 @@ def _analyze_lifecycle_bucket(
     )
 
 
-def _commit_lifecycle_bucket(supervisor, result: _LifecycleBucketResult, window: int) -> None:
+def _commit_lifecycle_bucket(
+    supervisor,
+    result: _LifecycleBucketResult,
+    window: int,
+) -> None:
     lifecycle = supervisor.lifecycle
     for uid, value in result.low_window_updates:
         if value is None:
@@ -252,7 +261,9 @@ def _analyze_lifecycle_slice(
     if callable(sync_stage):
         sync_stage()
     previous = int(getattr(lifecycle, "_v812_last_completed_window", -1))
-    lifecycle._v812_window_delta = 1 if previous < 0 else max(1, int(window) - previous)
+    lifecycle._v812_window_delta = (
+        1 if previous < 0 else max(1, int(window) - previous)
+    )
     lifecycle._v812_sweep_mode = True
     cancel_event = _LifecycleCancelEvent(supervisor)
     try:
@@ -266,7 +277,9 @@ def _analyze_lifecycle_slice(
             )
             for bucket in range(int(start), int(stop))
         )
-        results = tuple(sorted((future.result() for future in futures), key=lambda row: row.bucket))
+        results = tuple(
+            sorted((future.result() for future in futures), key=lambda row: row.bucket)
+        )
     finally:
         lifecycle._v812_sweep_mode = False
         lifecycle._v812_window_delta = 1
@@ -504,7 +517,9 @@ def _run_parallel_lifecycle_iteration_v873(supervisor) -> None:
         )
         for bucket in range(start, stop)
     )
-    results = tuple(sorted((future.result() for future in futures), key=lambda row: row.bucket))
+    results = tuple(
+        sorted((future.result() for future in futures), key=lambda row: row.bucket)
+    )
     expected = start
     for result in results:
         if result.bucket != expected or not result.complete:
