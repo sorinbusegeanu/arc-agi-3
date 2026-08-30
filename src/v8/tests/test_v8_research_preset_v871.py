@@ -76,7 +76,7 @@ class ResearchPresetV871Tests(unittest.TestCase):
             log_tail="",
         )
         self.assertIn("ARC-only subset of research_1", packet)
-        self.assertIn("do not causally test those families", packet)
+        self.assertIn("does not causally test those families", packet)
 
 
 if __name__ == "__main__":
