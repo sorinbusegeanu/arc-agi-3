@@ -48,6 +48,7 @@ def _pruning_candidates_v851_integrity(
     edges,
     *,
     protected_evidence_uids=frozenset(),
+    cancel_event=None,
 ):
     from v8 import memory_efficiency_v851 as memory
 
@@ -64,8 +65,11 @@ def _pruning_candidates_v851_integrity(
             rows,
             edge_rows,
             protected_evidence_uids=protected_evidence,
+            cancel_event=cancel_event,
         )
     )
+    if cancel_event is not None and cancel_event.is_set():
+        return ()
     active_states = {
         int(CognitiveState.ACTIVE),
         int(CognitiveState.VALIDATED),
@@ -89,6 +93,8 @@ def _pruning_candidates_v851_integrity(
             required.setdefault(edge.target_uid, set()).add(edge.source_uid)
     by_uid = {row.uid: row for row in rows}
     for index, candidate in enumerate(result):
+        if index % 256 == 0 and cancel_event is not None and cancel_event.is_set():
+            return ()
         row = by_uid.get(candidate.uid)
         if row is None:
             continue
@@ -115,6 +121,8 @@ def _pruning_candidates_v851_integrity(
             bool(candidate.has_semantic_replacement),
             True,
         )
+    if cancel_event is not None and cancel_event.is_set():
+        return ()
     return tuple(result)
 
 

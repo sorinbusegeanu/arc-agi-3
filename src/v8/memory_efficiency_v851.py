@@ -420,7 +420,14 @@ def _blocking_dependency_uids(nodes, edges, target_uid: MemoryUid) -> set[Memory
     }
 
 
-def _pruning_candidates_v851(self, nodes, edges, *, protected_evidence_uids=frozenset()):
+def _pruning_candidates_v851(
+    self,
+    nodes,
+    edges,
+    *,
+    protected_evidence_uids=frozenset(),
+    cancel_event=None,
+):
     protected_evidence = set(protected_evidence_uids)
     ledger = _CURRENT_LEDGER
     if ledger is not None and hasattr(ledger, "protected_uids"):
@@ -433,10 +440,15 @@ def _pruning_candidates_v851(self, nodes, edges, *, protected_evidence_uids=froz
             rows,
             edge_rows,
             protected_evidence_uids=protected_evidence,
+            cancel_event=cancel_event,
         )
     )
+    if cancel_event is not None and cancel_event.is_set():
+        return ()
     by_uid = {row.uid: row for row in rows}
     for index, candidate in enumerate(result):
+        if index % 256 == 0 and cancel_event is not None and cancel_event.is_set():
+            return ()
         row = by_uid.get(candidate.uid)
         if row is None:
             continue
@@ -457,6 +469,8 @@ def _pruning_candidates_v851(self, nodes, edges, *, protected_evidence_uids=froz
             protected_by_evidence=False,
             safe_to_retire=True,
         )
+    if cancel_event is not None and cancel_event.is_set():
+        return ()
     return tuple(result)
 
 

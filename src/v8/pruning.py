@@ -70,8 +70,16 @@ class PruningPlanner:
         edges: tuple[EdgeRecord, ...],
         *,
         protected_evidence_uids: frozenset[MemoryUid] | set[MemoryUid] = frozenset(),
+        cancel_event=None,
     ) -> tuple[PruneCandidate, ...]:
+        def cancelled() -> bool:
+            return bool(cancel_event is not None and cancel_event.is_set())
+
+        if cancelled():
+            return ()
         by_uid = {row.uid: row for row in nodes}
+        if cancelled():
+            return ()
         active = {
             row.uid
             for row in nodes
@@ -79,7 +87,9 @@ class PruningPlanner:
         }
         required_by_active: dict[MemoryUid, set[MemoryUid]] = defaultdict(set)
         superseded_by_active: dict[MemoryUid, set[MemoryUid]] = defaultdict(set)
-        for edge in edges:
+        for edge_index, edge in enumerate(edges):
+            if edge_index % 256 == 0 and cancelled():
+                return ()
             if edge.source_uid not in active:
                 continue
             relation = int(edge.relation_type)
@@ -95,7 +105,9 @@ class PruningPlanner:
 
         evidence_protected = set(protected_evidence_uids)
         result = []
-        for row in nodes:
+        for row_index, row in enumerate(nodes):
+            if row_index % 256 == 0 and cancelled():
+                return ()
             if int(row.cognitive_state) != int(CognitiveState.RETIRE_PENDING):
                 continue
 
@@ -156,4 +168,4 @@ class PruningPlanner:
                     bool(safe),
                 )
             )
-        return tuple(result)
+        return () if cancelled() else tuple(result)
