@@ -26,6 +26,16 @@ class ResearchIntegrityV863Tests(unittest.TestCase):
             path.write_text("{}", encoding="utf-8")
         return paths
 
+    @staticmethod
+    def _run_args(root: Path, *, no_restore: bool = False):
+        return SimpleNamespace(
+            root=root,
+            no_restore=bool(no_restore),
+            games="mix",
+            show_best_trajectory=None,
+            save_best_trajectory=None,
+        )
+
     def test_clean_run_purges_orphan_optimizer_behavioral_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -39,35 +49,55 @@ class ResearchIntegrityV863Tests(unittest.TestCase):
             self.assertTrue(all(not path.exists() for path in paths))
             self.assertTrue(log.exists())
 
-    def test_runtime_init_purges_when_no_snapshot_is_restorable(self) -> None:
+    def test_cli_clean_run_purges_when_no_snapshot_is_restorable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             paths = self._optimizer_artifacts(root)
-            config = SimpleNamespace(root=root, restore=True)
-            runtime = SimpleNamespace()
 
-            with patch("v8.snapshot.latest_complete_snapshot", return_value=None), patch.object(
-                v863, "_BASE_RUNTIME_INIT", lambda self, config, *args, **kwargs: None
-            ):
-                v863._runtime_init_v863(runtime, config)
+            with patch("v8.snapshot.latest_complete_snapshot", return_value=None):
+                removed = v863.prepare_clean_continuous_run(self._run_args(root))
 
             self.assertTrue(all(not path.exists() for path in paths))
-            self.assertEqual(len(runtime._v863_clean_run_purged_optimizer), 4)
+            self.assertEqual(len(removed), 4)
 
-    def test_runtime_init_preserves_optimizer_state_with_restorable_snapshot(self) -> None:
+    def test_cli_run_preserves_optimizer_state_with_restorable_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             paths = self._optimizer_artifacts(root)
-            config = SimpleNamespace(root=root, restore=True)
-            runtime = SimpleNamespace()
 
-            with patch("v8.snapshot.latest_complete_snapshot", return_value=root / "snapshot"), patch.object(
-                v863, "_BASE_RUNTIME_INIT", lambda self, config, *args, **kwargs: None
-            ):
-                v863._runtime_init_v863(runtime, config)
+            with patch("v8.snapshot.latest_complete_snapshot", return_value=root / "snapshot"):
+                removed = v863.prepare_clean_continuous_run(self._run_args(root))
 
             self.assertTrue(all(path.exists() for path in paths))
-            self.assertEqual(runtime._v863_clean_run_purged_optimizer, ())
+            self.assertEqual(removed, ())
+
+    def test_no_restore_forces_clean_optimizer_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self._optimizer_artifacts(root)
+
+            with patch("v8.snapshot.latest_complete_snapshot") as latest:
+                removed = v863.prepare_clean_continuous_run(
+                    self._run_args(root, no_restore=True)
+                )
+
+            latest.assert_not_called()
+            self.assertTrue(all(not path.exists() for path in paths))
+            self.assertEqual(len(removed), 4)
+
+    def test_non_run_trajectory_inspection_never_purges(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self._optimizer_artifacts(root)
+            args = self._run_args(root)
+            args.show_best_trajectory = "ic01"
+
+            with patch("v8.snapshot.latest_complete_snapshot") as latest:
+                removed = v863.prepare_clean_continuous_run(args)
+
+            latest.assert_not_called()
+            self.assertEqual(removed, ())
+            self.assertTrue(all(path.exists() for path in paths))
 
     def test_mixed_sampling_defers_all_early_completion_paths(self) -> None:
         runtime = SimpleNamespace(_v863_mixed_sampling_active=True)
