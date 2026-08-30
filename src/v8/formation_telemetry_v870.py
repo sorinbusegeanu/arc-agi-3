@@ -22,7 +22,6 @@ from v8.structural_events import normalized_family_key
 
 
 _INSTALLED = False
-_BASE_PARALLEL_ANALYSES = None
 _BASE_RUNTIME_METRICS = None
 _BASE_KEY_RUN_SUMMARY = None
 
@@ -196,24 +195,17 @@ class V870RelationalRoleEstimator(V087RelationalRoleEstimator):
         return tuple(result)
 
 
-def _parallel_analyses_v870(self, nodes, edges):
-    analyses = _BASE_PARALLEL_ANALYSES(self, nodes, edges)
-    compression = getattr(self.compression, "_v870_formation_telemetry", {})
-    roles = getattr(self.roles, "_v870_formation_telemetry", {})
-    merged: dict[str, object] = {}
-    if isinstance(compression, dict):
-        merged.update(compression)
-    if isinstance(roles, dict):
-        merged.update(roles)
-    self._v870_formation_telemetry = merged
-    return analyses
-
-
 def _runtime_metrics_v870(self):
     payload = dict(_BASE_RUNTIME_METRICS(self))
     peers = getattr(self, "peers", None)
-    telemetry = getattr(peers, "_v870_formation_telemetry", {}) if peers is not None else {}
-    payload["formation_telemetry"] = dict(telemetry) if isinstance(telemetry, dict) else {}
+    merged: dict[str, object] = {}
+    if peers is not None:
+        for name in ("compression", "roles"):
+            estimator = getattr(peers, name, None)
+            telemetry = getattr(estimator, "_v870_formation_telemetry", {})
+            if isinstance(telemetry, dict):
+                merged.update(telemetry)
+    payload["formation_telemetry"] = merged
     return payload
 
 
@@ -228,7 +220,7 @@ def _key_run_summary_v870(summary):
 
 
 def install_formation_telemetry_v870() -> None:
-    global _INSTALLED, _BASE_PARALLEL_ANALYSES, _BASE_RUNTIME_METRICS, _BASE_KEY_RUN_SUMMARY
+    global _INSTALLED, _BASE_RUNTIME_METRICS, _BASE_KEY_RUN_SUMMARY
     if _INSTALLED:
         return
 
@@ -246,9 +238,6 @@ def install_formation_telemetry_v870() -> None:
     loop_module.V087RelationalRoleEstimator = V870RelationalRoleEstimator
     roles_module.FunctionalRoleEstimator = V870RelationalRoleEstimator
     peers_module.FunctionalRoleEstimator = V870RelationalRoleEstimator
-
-    _BASE_PARALLEL_ANALYSES = peers_module.DevelopmentalPeerSupervisor._parallel_analyses
-    peers_module.DevelopmentalPeerSupervisor._parallel_analyses = _parallel_analyses_v870
 
     _BASE_RUNTIME_METRICS = runtime_v82.V82ContinuousMemoryRuntime.metrics
     runtime_v82.V82ContinuousMemoryRuntime.metrics = _runtime_metrics_v870
