@@ -4,7 +4,7 @@ import json
 import os
 import shutil
 import subprocess
-from collections import Counter, defaultdict, deque
+from collections import Counter
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -14,9 +14,7 @@ from .default_analysis import derive_chain_evidence
 
 
 PACKET_NAME = "LLM_RESEARCH_PACKET.md"
-_MAX_EVIDENCE_SAMPLES = 96
-_MAX_SAMPLES_PER_KIND = 3
-_MAX_LOG_LINES = 200
+_MAX_LOG_LINES = 80
 _STALE_HANDOFF_OUTPUTS = (
     "research_summary.md",
     "causal_chain_report.json",
@@ -72,7 +70,6 @@ def _chain_payload(summary: Mapping[str, Any], *, mix_requested: bool = False) -
                 "edge": edge.edge,
                 "status": edge.status.value,
                 "evidence_count": edge.evidence_count,
-                "evidence_ids": list(edge.evidence_ids),
                 "blocker": edge.blocker,
             }
             for edge in result.edges
@@ -89,15 +86,12 @@ def _chain_payload(summary: Mapping[str, Any], *, mix_requested: bool = False) -
 
 def _evidence_digest(path: Path) -> dict[str, Any]:
     if not path.is_file():
-        return {"available": False, "record_count": 0, "samples": []}
+        return {"available": False, "record_count": 0}
     kinds: Counter[str] = Counter()
     interventions: Counter[str] = Counter()
     effects: Counter[str] = Counter()
     sources: set[int] = set()
     targets: set[int] = set()
-    recent_by_kind: defaultdict[str, deque[dict[str, Any]]] = defaultdict(
-        lambda: deque(maxlen=_MAX_SAMPLES_PER_KIND)
-    )
     records = 0
     invalid = 0
     try:
@@ -114,8 +108,7 @@ def _evidence_digest(path: Path) -> dict[str, Any]:
                     invalid += 1
                     continue
                 records += 1
-                kind = str(row.get("evidence_kind", "unknown"))
-                kinds[kind] += 1
+                kinds[str(row.get("evidence_kind", "unknown"))] += 1
                 intervention = str(row.get("causal_intervention", "") or "")
                 if intervention:
                     interventions[intervention] += 1
@@ -127,23 +120,9 @@ def _evidence_digest(path: Path) -> dict[str, Any]:
                     sources.add(source)
                 if target:
                     targets.add(target)
-                recent_by_kind[kind].append(row)
     except OSError as exc:
         return {"available": False, "error": f"{type(exc).__name__}: {exc}"}
 
-    samples = [
-        row
-        for rows in recent_by_kind.values()
-        for row in rows
-    ]
-    samples.sort(
-        key=lambda row: (
-            int(row.get("decision_watermark", 0) or 0),
-            int(row.get("evidence_available_watermark", 0) or 0),
-        ),
-        reverse=True,
-    )
-    samples = samples[:_MAX_EVIDENCE_SAMPLES]
     return {
         "available": True,
         "record_count": records,
@@ -153,12 +132,74 @@ def _evidence_digest(path: Path) -> dict[str, Any]:
         "effect_direction_counts": dict(sorted(effects.items())),
         "distinct_source_games": len(sources),
         "distinct_target_games": len(targets),
-        "samples": samples,
-        "sampling_note": (
-            f"Counts cover the full ledger; samples are the most recent {_MAX_SAMPLES_PER_KIND} "
-            f"per evidence kind, capped at {_MAX_EVIDENCE_SAMPLES} total. The ledger may include "
-            "restored historical evidence from prior runs."
-        ),
+        "scope_note": "Counts cover the complete persisted ledger and may include restored historical evidence.",
+    }
+
+
+def _hypothesis_summary(h_report: Any) -> list[dict[str, Any]]:
+    if not isinstance(h_report, list):
+        return []
+    result: list[dict[str, Any]] = []
+    for row in h_report:
+        if not isinstance(row, Mapping):
+            continue
+        result.append({
+            "hypothesis_id": row.get("hypothesis_id"),
+            "decision": row.get("final_decision", row.get("raw_decision")),
+            "evidence_count": row.get("evidence_count", 0),
+            "blocker": row.get("blocker", ""),
+        })
+    return result
+
+
+def _game_outcomes(summary: Mapping[str, Any]) -> list[dict[str, Any]]:
+    aggregates: dict[str, dict[str, int]] = {}
+    actors = summary.get("actors", [])
+    if not isinstance(actors, list):
+        return []
+    for actor in actors:
+        if not isinstance(actor, Mapping):
+            continue
+        game = str(actor.get("game_id", ""))
+        if not game:
+            continue
+        row = aggregates.setdefault(game, {
+            "steps": 0,
+            "wins": 0,
+            "failures": 0,
+            "levels_completed": 0,
+            "resets": 0,
+        })
+        for key in tuple(row):
+            row[key] += int(actor.get(key, 0) or 0)
+    return [{"game_id": game, **aggregates[game]} for game in sorted(aggregates)]
+
+
+def _key_run_summary(summary: Mapping[str, Any]) -> dict[str, Any]:
+    metrics = summary.get("metrics", {})
+    if not isinstance(metrics, Mapping):
+        metrics = {}
+    adaptive = metrics.get("adaptive_learning", {})
+    adaptive_summary: dict[str, Any] = {}
+    if isinstance(adaptive, Mapping):
+        adaptive_summary = {
+            "states": adaptive.get("states", {}),
+            "sample_steps": adaptive.get("sample_steps", 0),
+        }
+    return {
+        "games": list(summary.get("games", [])) if isinstance(summary.get("games", []), list) else [],
+        "current_run_outcomes_by_game": _game_outcomes(summary),
+        "automatic_transfer_experiments": summary.get("automatic_transfer_experiments", {}),
+        "memory": {
+            "watermark": metrics.get("watermark"),
+            "memories": metrics.get("memories"),
+            "edges": metrics.get("edges"),
+            "evidence_records": metrics.get("evidence_records"),
+            "level_counts": metrics.get("level_counts", {}),
+        },
+        "verified_success": metrics.get("verified_success", {}),
+        "trajectory_optimizer": metrics.get("trajectory_optimizer", {}),
+        "adaptive_learning": adaptive_summary,
     }
 
 
@@ -178,6 +219,7 @@ def build_packet(
     summary: Mapping[str, Any], *, revision: str, argv: Sequence[str],
     h_report: Any, reporting_cut: Any, evidence_digest: Mapping[str, Any], log_tail: str,
 ) -> str:
+    del reporting_cut
     command = "PYTHONPATH=src python -m v8 " + " ".join(str(x) for x in argv)
     mixed = _mix_requested(argv)
     scope_note = (
@@ -230,30 +272,24 @@ Return exactly these sections:
 {_dump(_chain_payload(summary, mix_requested=mixed))}
 ```
 
-## H01-H15 scientific report
+## H01-H15 compact status
 
 ```json
-{_dump(h_report)}
+{_dump(_hypothesis_summary(h_report))}
 ```
 
-## Reporting cut
+## Key current-run evidence
 
 ```json
-{_dump(reporting_cut)}
+{_dump(_key_run_summary(summary))}
 ```
 
-## Full run summary
+## Evidence-ledger aggregate digest
+
+Counts cover the complete persisted ledger. Individual evidence rows are intentionally omitted because they add volume without materially improving discrimination at handoff time.
 
 ```json
-{_dump(summary)}
-```
-
-## Evidence-ledger digest
-
-Counts cover the complete persisted ledger. Samples are recent rather than first-seen so restored long-running research does not bias the LLM toward stale early evidence.
-
-```json
-{_dump(evidence_digest)}
+{_dump(dict(evidence_digest))}
 ```
 
 ## Recent runtime log
