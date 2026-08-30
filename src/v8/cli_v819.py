@@ -158,23 +158,28 @@ def main(argv: list[str] | None = None) -> int:
             base_cli._actor_jobs = pooled_actor_jobs
 
             from v8.mixed_environment_v859 import (
-                MIX_GAME_IDS,
-                is_mix_selector,
+                is_mixed_environment_selector,
+                resolve_mixed_game_selector,
                 run_mixed_actor_jobs,
                 run_mixed_transfer_experiments,
             )
 
-            if is_mix_selector(_requested_games(remaining)):
+            requested_selector = _requested_games(remaining)
+            if is_mixed_environment_selector(requested_selector):
                 import v7.game_sets as game_sets_module
 
+                selected_games = resolve_mixed_game_selector(requested_selector)
+                if selected_games is None:
+                    raise ValueError(f"unsupported mixed environment selector: {requested_selector}")
                 game_sets = game_sets_module
                 prior_game_selector = game_sets.resolve_game_selector
                 prior_run_actor_jobs = base_cli.run_actor_jobs
                 prior_transfer_experiments = base_cli.run_automatic_transfer_experiments
 
                 def mixed_game_selector(selector, env_root=None):
-                    if is_mix_selector(selector):
-                        return MIX_GAME_IDS
+                    resolved = resolve_mixed_game_selector(selector)
+                    if resolved is not None:
+                        return resolved
                     return prior_game_selector(selector, env_root)
 
                 game_sets.resolve_game_selector = mixed_game_selector
