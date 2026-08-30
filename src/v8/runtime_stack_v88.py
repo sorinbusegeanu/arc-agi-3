@@ -142,4 +142,5 @@ def install_current_runtime_stack_v88() -> None:
     _installer("verified_trajectory_provenance_v869")()
     _installer("formation_telemetry_v870")()
     _installer("parallel_lifecycle_v873")()
+    _installer("run_integrity_v874")()
     _INSTALLED = True
