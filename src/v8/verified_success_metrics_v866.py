@@ -29,6 +29,7 @@ _BASE_RUNTIME_METRICS = None
 _BASE_ACTOR_RUN_JOBS = None
 _BASE_MIXED_RUN_JOBS = None
 _BASE_MAKE_ADAPTER = None
+_BASE_ARC_ENV_STEP = None
 _BASE_TRAJECTORY_RESET_CAPTURE = None
 _BASE_TRAJECTORY_CAPTURE_STEP = None
 _BASE_TRAJECTORY_WRITE = None
@@ -599,6 +600,7 @@ def install_verified_success_metrics_v866() -> None:
     global _INSTALLED
     global _BASE_RUNTIME_START, _BASE_RUNTIME_CLOSE, _BASE_RUNTIME_METRICS
     global _BASE_ACTOR_RUN_JOBS, _BASE_MIXED_RUN_JOBS, _BASE_MAKE_ADAPTER
+    global _BASE_ARC_ENV_STEP
     global _BASE_TRAJECTORY_RESET_CAPTURE, _BASE_TRAJECTORY_CAPTURE_STEP
     global _BASE_TRAJECTORY_WRITE, _BASE_EFFECTIVENESS_SNAPSHOT
     global _BASE_PERIODIC_PROGRESS, _BASE_EFFECTIVENESS_LOG
@@ -629,8 +631,13 @@ def install_verified_success_metrics_v866() -> None:
 
     _BASE_TRAJECTORY_RESET_CAPTURE = trajectory._reset_capture
     trajectory._reset_capture = _reset_capture_v866
-    _BASE_TRAJECTORY_CAPTURE_STEP = trajectory._capture_env_step
-    trajectory._capture_env_step = _capture_env_step_v866
+    # v8.14's original capture wrapper is still in the composed production chain,
+    # even though later layers own the public adapter method. Insert beneath that
+    # wrapper so all later temporal, recovery, click, and sampling authorities keep
+    # their exact bindings while every real captured ARC step reaches v8.66.
+    _BASE_ARC_ENV_STEP = trajectory._BASE_ENV_STEP
+    _BASE_TRAJECTORY_CAPTURE_STEP = _BASE_ARC_ENV_STEP
+    trajectory._BASE_ENV_STEP = _capture_env_step_v866
     _BASE_TRAJECTORY_WRITE = trajectory._write_successful_trajectory
     trajectory._write_successful_trajectory = _write_successful_trajectory_v866
 

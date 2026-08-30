@@ -4,9 +4,11 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from v8 import learning_effectiveness_report_v850 as report
 from v8 import trajectory_optimizer_v814 as trajectory
+from v8 import verified_success_metrics_v866 as verified
 from v8.actor import ActorProgress
 from v8.adaptive_learning_allocation_v819 import AdaptiveLearningCoordinator
 from v8.mixed_environment_v859 import MIX_GAME_IDS
@@ -98,6 +100,53 @@ class VerifiedSuccessMetricsV866Tests(unittest.TestCase):
             self.assertEqual(outcome["actor_reported_games_won"], 1)
             self.assertIsNone(efficiency["steps_per_solved_level"])
             self.assertIsNone(efficiency["mean_first_win_step"])
+
+    def test_arc_environment_uses_verified_capture_step_wrapper(self):
+        from v7.environment.arc_adapter import ArcGridEnvironment
+        from v8 import learning_transfer_correctness_v854 as transfer
+        from v8 import runtime_repair_v822 as runtime_repair
+
+        self.assertIs(ArcGridEnvironment.step, runtime_repair._runtime_env_step)
+        self.assertIs(transfer._BASE_RESTART_STEP, trajectory._capture_env_step)
+        self.assertIs(
+            trajectory._BASE_ENV_STEP,
+            verified._capture_env_step_v866,
+        )
+
+    def test_composed_arc_capture_advances_verified_step(self):
+        from v8 import learning_transfer_correctness_v854 as transfer
+
+        prior = (
+            trajectory._CAPTURE_ACTIVE,
+            trajectory._CAPTURE_PREFIX,
+            trajectory._CAPTURE_SEGMENT,
+            trajectory._ACTOR_ACTION_HISTORY,
+            trajectory._ACTOR_RESET_EPOCH,
+        )
+        sentinel = object()
+        try:
+            trajectory._CAPTURE_ACTIVE = True
+            trajectory._CAPTURE_PREFIX = []
+            trajectory._CAPTURE_SEGMENT = []
+            trajectory._ACTOR_ACTION_HISTORY = []
+            _ARC_CAPTURE.step = 0
+            with patch.object(
+                verified,
+                "_BASE_TRAJECTORY_CAPTURE_STEP",
+                return_value=sentinel,
+            ) as lower:
+                result = transfer._BASE_RESTART_STEP(object(), 7)
+            self.assertIs(result, sentinel)
+            self.assertEqual(_ARC_CAPTURE.step, 1)
+            lower.assert_called_once()
+        finally:
+            (
+                trajectory._CAPTURE_ACTIVE,
+                trajectory._CAPTURE_PREFIX,
+                trajectory._CAPTURE_SEGMENT,
+                trajectory._ACTOR_ACTION_HISTORY,
+                trajectory._ACTOR_RESET_EPOCH,
+            ) = prior
 
     def test_verified_arc_level_and_win_drive_metrics(self):
         with tempfile.TemporaryDirectory() as tmp:
