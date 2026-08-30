@@ -4,7 +4,7 @@ import json
 import os
 import shutil
 import subprocess
-from collections import Counter, defaultdict, deque
+from collections import Counter
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -14,9 +14,21 @@ from .default_analysis import derive_chain_evidence
 
 
 PACKET_NAME = "LLM_RESEARCH_PACKET.md"
-_MAX_EVIDENCE_SAMPLES = 96
-_MAX_SAMPLES_PER_KIND = 3
-_MAX_LOG_LINES = 200
+_MAX_LOG_LINES = 40
+_RUNTIME_SIGNAL_TERMS = (
+    "traceback",
+    "runtimeerror",
+    "exception",
+    " error",
+    "failed",
+    "warning",
+    "sampling done",
+    "automatic transfer",
+    "trajectory optimization",
+    "effectiveness",
+    "graph source=",
+    "learning state ",
+)
 _STALE_HANDOFF_OUTPUTS = (
     "research_summary.md",
     "causal_chain_report.json",
@@ -73,7 +85,7 @@ def _chain_payload(summary: Mapping[str, Any], *, mix_requested: bool = False) -
                 "status": edge.status.value,
                 "evidence_count": edge.evidence_count,
                 "evidence_ids": list(edge.evidence_ids),
-                "blocker": edge.blocker,
+                **({"blocker": edge.blocker} if edge.blocker else {}),
             }
             for edge in result.edges
         ],
@@ -89,15 +101,12 @@ def _chain_payload(summary: Mapping[str, Any], *, mix_requested: bool = False) -
 
 def _evidence_digest(path: Path) -> dict[str, Any]:
     if not path.is_file():
-        return {"available": False, "record_count": 0, "samples": []}
+        return {"available": False, "record_count": 0}
     kinds: Counter[str] = Counter()
     interventions: Counter[str] = Counter()
     effects: Counter[str] = Counter()
     sources: set[int] = set()
     targets: set[int] = set()
-    recent_by_kind: defaultdict[str, deque[dict[str, Any]]] = defaultdict(
-        lambda: deque(maxlen=_MAX_SAMPLES_PER_KIND)
-    )
     records = 0
     invalid = 0
     try:
@@ -114,8 +123,7 @@ def _evidence_digest(path: Path) -> dict[str, Any]:
                     invalid += 1
                     continue
                 records += 1
-                kind = str(row.get("evidence_kind", "unknown"))
-                kinds[kind] += 1
+                kinds[str(row.get("evidence_kind", "unknown"))] += 1
                 intervention = str(row.get("causal_intervention", "") or "")
                 if intervention:
                     interventions[intervention] += 1
@@ -127,39 +135,134 @@ def _evidence_digest(path: Path) -> dict[str, Any]:
                     sources.add(source)
                 if target:
                     targets.add(target)
-                recent_by_kind[kind].append(row)
     except OSError as exc:
         return {"available": False, "error": f"{type(exc).__name__}: {exc}"}
 
-    samples = [
-        row
-        for rows in recent_by_kind.values()
-        for row in rows
-    ]
-    samples.sort(
-        key=lambda row: (
-            int(row.get("decision_watermark", 0) or 0),
-            int(row.get("evidence_available_watermark", 0) or 0),
-        ),
-        reverse=True,
-    )
-    samples = samples[:_MAX_EVIDENCE_SAMPLES]
     return {
         "available": True,
         "record_count": records,
-        "invalid_lines": invalid,
+        **({"invalid_lines": invalid} if invalid else {}),
         "evidence_kind_counts": dict(sorted(kinds.items())),
         "causal_intervention_counts": dict(sorted(interventions.items())),
         "effect_direction_counts": dict(sorted(effects.items())),
         "distinct_source_games": len(sources),
         "distinct_target_games": len(targets),
-        "samples": samples,
-        "sampling_note": (
-            f"Counts cover the full ledger; samples are the most recent {_MAX_SAMPLES_PER_KIND} "
-            f"per evidence kind, capped at {_MAX_EVIDENCE_SAMPLES} total. The ledger may include "
-            "restored historical evidence from prior runs."
+    }
+
+
+def _compact_evidence_digest(value: Mapping[str, Any]) -> dict[str, Any]:
+    keys = (
+        "available",
+        "record_count",
+        "invalid_lines",
+        "error",
+        "evidence_kind_counts",
+        "causal_intervention_counts",
+        "effect_direction_counts",
+        "distinct_source_games",
+        "distinct_target_games",
+    )
+    return {key: value[key] for key in keys if key in value}
+
+
+def _compact_hypotheses(h_report: Any) -> list[dict[str, Any]]:
+    if isinstance(h_report, Mapping):
+        rows = h_report.get("decisions", ())
+    else:
+        rows = h_report
+    if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
+        return []
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        item = {
+            "id": str(row.get("hypothesis_id", "")),
+            "decision": str(row.get("final_decision", row.get("raw_decision", "UNKNOWN"))),
+            "evidence_count": int(row.get("evidence_count", 0) or 0),
+        }
+        claim = str(row.get("paper_claim", "") or "").strip()
+        blocker = str(row.get("blocker", "") or "").strip()
+        if claim:
+            item["claim"] = claim
+        if blocker:
+            item["blocker"] = blocker
+        result.append(item)
+    return result
+
+
+def _game_outcomes(summary: Mapping[str, Any]) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    actors = summary.get("actors", ())
+    if not isinstance(actors, Sequence) or isinstance(actors, (str, bytes)):
+        return []
+    for actor in actors:
+        if not isinstance(actor, Mapping):
+            continue
+        game = str(actor.get("game_id", "unknown"))
+        if game not in grouped:
+            grouped[game] = {
+                "game_id": game,
+                "actors": 0,
+                "active_actors": 0,
+                "steps": 0,
+                "levels_completed": 0,
+                "wins": 0,
+                "failures": 0,
+                "resets": 0,
+                "planned_steps": 0,
+                "replans": 0,
+            }
+            order.append(game)
+        item = grouped[game]
+        item["actors"] += 1
+        steps = int(actor.get("steps", 0) or 0)
+        if steps > 0:
+            item["active_actors"] += 1
+        item["steps"] += steps
+        for key in (
+            "levels_completed", "wins", "failures", "resets", "planned_steps", "replans"
+        ):
+            item[key] += int(actor.get(key, 0) or 0)
+    return [grouped[game] for game in order]
+
+
+def _memory_research_state(summary: Mapping[str, Any]) -> dict[str, Any]:
+    metrics = summary.get("metrics", {})
+    if not isinstance(metrics, Mapping):
+        metrics = {}
+    raw_counts = metrics.get("level_counts", {})
+    if not isinstance(raw_counts, Mapping):
+        raw_counts = {}
+    levels = {
+        f"M{level}": int(raw_counts.get(str(level), raw_counts.get(level, 0)) or 0)
+        for level in range(8)
+    }
+    state: dict[str, Any] = {
+        "memories": int(metrics.get("memories", 0) or 0),
+        "edges": int(metrics.get("edges", 0) or 0),
+        "memory_levels": levels,
+        "automatic_transfer_experiments": summary.get(
+            "automatic_transfer_experiments", {"attempted": 0, "completed": 0, "passed": 0}
         ),
     }
+    normalization = metrics.get("memory_normalization")
+    if isinstance(normalization, Mapping):
+        useful = {
+            key: normalization[key]
+            for key in (
+                "m1g_nodes",
+                "m1n_nodes",
+                "m1n_cross_game_nodes",
+                "m1n_per_grounded_support",
+                "m2_from_m1n",
+            )
+            if key in normalization
+        }
+        if useful:
+            state["memory_normalization"] = useful
+    return state
 
 
 def _log_tail(path: Path) -> str:
@@ -167,7 +270,11 @@ def _log_tail(path: Path) -> str:
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return ""
-    return "\n".join(lines[-_MAX_LOG_LINES:])
+    selected = [
+        line for line in lines
+        if any(term in line.lower() for term in _RUNTIME_SIGNAL_TERMS)
+    ]
+    return "\n".join(selected[-_MAX_LOG_LINES:])
 
 
 def _dump(value: Any) -> str:
@@ -178,18 +285,26 @@ def build_packet(
     summary: Mapping[str, Any], *, revision: str, argv: Sequence[str],
     h_report: Any, reporting_cut: Any, evidence_digest: Mapping[str, Any], log_tail: str,
 ) -> str:
+    # reporting_cut remains an accepted argument for compatibility, but its traceability,
+    # digests, contracts and duplicated H decisions are deliberately excluded from the
+    # LLM handoff. The complete files remain on disk for deterministic auditing.
+    del reporting_cut
     command = "PYTHONPATH=src python -m v8 " + " ".join(str(x) for x in argv)
     mixed = _mix_requested(argv)
     scope_note = (
         "- Automatic transfer intervention scope: `ARC-only subset of mix`\n"
-        "- Important: Gym, Chess, and Sudoku share the memory graph during sampling, but the current automatic transfer intervention harness does not causally test those families.\n"
+        "- Gym, Chess, and Sudoku share memory during sampling but are not causally tested by the current automatic transfer harness.\n"
         if mixed
         else "- Automatic transfer intervention scope: selected ARC games supported by the experiment harness.\n"
     )
+    runtime_section = (
+        f"## Relevant runtime signals\n\n```text\n{log_tail}\n```\n\n"
+        if log_tail.strip()
+        else ""
+    )
     return f"""# ARC-AGI-3 LLM Research Packet
 
-Upload this **single file** to a frontier LLM researcher after the run.
-The local system prepared evidence and conservative diagnostics only. It has **not selected a research hypothesis or next experiment**.
+Use this packet to choose the **next discriminating research experiment**. It intentionally omits raw implementation telemetry, duplicate reports, process-memory data, hashes, PIDs, queue statistics, static contracts, and raw evidence-ledger records.
 
 ## Researcher task
 
@@ -202,7 +317,7 @@ The local system prepared evidence and conservative diagnostics only. It has **n
 7. Preregister predicted metric changes, expected unchanged metrics, and a falsifying result before the experiment is run.
 8. Recommend architecture change only after bugs, artifacts, and existing-mechanism explanations are reasonably excluded.
 9. If evidence cannot discriminate explanations, state `INSUFFICIENT_EVIDENCE` and specify what evidence is missing.
-10. Treat cumulative restored evidence and current-run actor outcomes as different evidence scopes; do not infer that historical evidence was produced by this run.
+10. Treat cumulative evidence-ledger/H01-H15 evidence separately from current-run game outcomes.
 
 Return exactly these sections:
 
@@ -222,51 +337,47 @@ Return exactly these sections:
 - Revision: `{revision}`
 - Command: `{command}`
 {scope_note}
-## Deterministic causal-chain diagnostic
+## Causal-chain diagnostic
 
-`INSUFFICIENT_EVIDENCE` means the local system refused to infer a causal failure.
+`INSUFFICIENT_EVIDENCE` means unresolved, not failed.
 
 ```json
 {_dump(_chain_payload(summary, mix_requested=mixed))}
 ```
 
-## H01-H15 scientific report
+## H01-H15 status and blockers
+
+Only the claim, decision, evidence count and active blocker are included.
 
 ```json
-{_dump(h_report)}
+{_dump(_compact_hypotheses(h_report))}
 ```
 
-## Reporting cut
+## Current-run game outcomes
+
+Actors are aggregated by game. `active_actors` means actors with at least one sampled step.
 
 ```json
-{_dump(reporting_cut)}
+{_dump(_game_outcomes(summary))}
 ```
 
-## Full run summary
+## Memory and transfer state
 
 ```json
-{_dump(summary)}
+{_dump(_memory_research_state(summary))}
 ```
 
-## Evidence-ledger digest
+## Cumulative evidence-ledger summary
 
-Counts cover the complete persisted ledger. Samples are recent rather than first-seen so restored long-running research does not bias the LLM toward stale early evidence.
+This may include restored historical evidence from earlier runs. Raw records are intentionally excluded.
 
 ```json
-{_dump(evidence_digest)}
+{_dump(_compact_evidence_digest(evidence_digest))}
 ```
 
-## Recent runtime log
+{runtime_section}## Research discipline
 
-Last {_MAX_LOG_LINES} lines when available.
-
-```text
-{log_tail}
-```
-
-## Research discipline
-
-A bug fix restores intended implementation and does not by itself validate a cognitive hypothesis. Correlation may generate a hypothesis but does not establish causality. Prefer matched interventions and ablations. The objective is to determine where useful information stops propagating through `experience -> memory -> abstraction -> transfer/retrieval -> action -> outcome`, then choose the experiment that most reduces uncertainty.
+A bug fix restores intended implementation and does not validate a cognitive hypothesis. Correlation may generate a hypothesis but does not establish causality. Prefer matched interventions and ablations. Determine where useful information stops propagating through `experience -> memory -> abstraction -> transfer/retrieval -> action -> outcome`, then choose the experiment that most reduces uncertainty.
 """
 
 
@@ -292,7 +403,7 @@ def write_researcher_packet(root: str | Path, *, argv: Sequence[str]) -> Path:
         revision=_git_revision(),
         argv=argv,
         h_report=_read_json(root / "reports" / "h01_h15.json", []),
-        reporting_cut=_read_json(root / "reports" / "reporting_cut.json", {}),
+        reporting_cut={},
         evidence_digest=_evidence_digest(root / "evidence" / "v8_evidence.jsonl"),
         log_tail=_log_tail(root / "log.txt"),
     )

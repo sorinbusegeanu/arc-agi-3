@@ -124,6 +124,7 @@ def main(argv: list[str] | None = None) -> int:
     changed: dict[str, str | None] = {}
     prior_actor_jobs = None
     prior_run_actor_jobs = None
+    prior_run_continuous = None
     prior_transfer_experiments = None
     prior_game_selector = None
     game_sets = None
@@ -138,6 +139,24 @@ def main(argv: list[str] | None = None) -> int:
             )
             changed[_ACTOR_POOL_ENV] = os.environ.get(_ACTOR_POOL_ENV)
             os.environ[_ACTOR_POOL_ENV] = str(actor_pool)
+
+            # Clean-run isolation belongs to the actual CLI experiment boundary,
+            # not to direct runtime construction used by restart/unit fixtures.
+            from v8.research_integrity_v863 import prepare_clean_continuous_run
+
+            prior_run_continuous = base_cli.run_continuous
+
+            def guarded_run_continuous(args):
+                removed = prepare_clean_continuous_run(args)
+                if removed:
+                    print(
+                        "v8 clean run: discarded orphan optimizer state "
+                        f"files={len(removed)}",
+                        flush=True,
+                    )
+                return prior_run_continuous(args)
+
+            base_cli.run_continuous = guarded_run_continuous
 
             # base cli intentionally retains every job descriptor so requested
             # interaction credits remain intact. Only process concurrency is capped.
@@ -197,6 +216,8 @@ def main(argv: list[str] | None = None) -> int:
             base_cli._actor_jobs = prior_actor_jobs
         if prior_run_actor_jobs is not None:
             base_cli.run_actor_jobs = prior_run_actor_jobs
+        if prior_run_continuous is not None:
+            base_cli.run_continuous = prior_run_continuous
         if prior_transfer_experiments is not None:
             base_cli.run_automatic_transfer_experiments = prior_transfer_experiments
         if game_sets is not None and prior_game_selector is not None:
