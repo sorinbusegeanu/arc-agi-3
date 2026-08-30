@@ -136,4 +136,5 @@ def install_current_runtime_stack_v88() -> None:
     _installer("incremental_peer_drain_v862")()
     _publish_runtime_api_for_late_bootstrap()
     _installer("verified_success_metrics_v866")()
+    _installer("verified_success_metrics_v866_fixups")()
     _INSTALLED = True
