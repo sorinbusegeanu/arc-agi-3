@@ -132,10 +132,12 @@ def run_generic_actor_job(runtime, job: ActorJob, *, reporting_queue=None) -> Ac
     view, owns_view = _generic_read_view(runtime)
     rng = Random(int(job.seed))
     sequence = wins = failures = resets = planned_steps = 0
+    sequence_base = max(0, int(getattr(runtime, "watermark", 0)))
     trajectory = stable_u64(
         adapter.identity.source_hash,
         job.actor_id,
         job.seed,
+        sequence_base,
         person=b"v8.59-mix-trajectory",
     )
     next_progress = time.monotonic() + 5.0
@@ -157,6 +159,7 @@ def run_generic_actor_job(runtime, job: ActorJob, *, reporting_queue=None) -> Ac
                     adapter.identity.source_hash,
                     job.seed,
                     resets,
+                    sequence_base,
                     person=b"v8.59-mix-trajectory",
                 )
                 continue
@@ -193,9 +196,10 @@ def run_generic_actor_job(runtime, job: ActorJob, *, reporting_queue=None) -> Ac
                 int(action_schema.schema_id),
                 person=b"v8.59-schema-carrier",
             )
+            producer_sequence = sequence_base + requested_step
             event = runtime.make_experience(
                 producer_id=int(job.actor_id),
-                producer_sequence=requested_step,
+                producer_sequence=producer_sequence,
                 source_game_hash=int(adapter.identity.source_hash),
                 global_step=max(0, int(runtime.watermark)),
                 context_signature=context,
@@ -223,6 +227,7 @@ def run_generic_actor_job(runtime, job: ActorJob, *, reporting_queue=None) -> Ac
                     adapter.identity.source_hash,
                     job.seed,
                     resets,
+                    producer_sequence,
                     person=b"v8.59-mix-trajectory",
                 )
             now = time.monotonic()
