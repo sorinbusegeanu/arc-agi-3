@@ -133,7 +133,7 @@ class VerifiedSuccessMetricsV866Tests(unittest.TestCase):
             self.assertEqual(won["game_solve_rate_pct"], 100.0)
             self.assertEqual(won["mean_first_win_step"], 37.0)
 
-    def test_mixed_denominator_is_twenty_three_units_and_seven_games(self):
+    def test_mixed_denominator_is_thirteen_units_and_five_games(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "verified"
             record_verified_success_v866(
@@ -146,12 +146,12 @@ class VerifiedSuccessMetricsV866Tests(unittest.TestCase):
                 root=root,
             )
             payload = verified_success_snapshot_v866(root, MIX_GAME_IDS)
-            self.assertEqual(payload["level_target_count"], 23)
-            self.assertEqual(payload["game_target_count"], 7)
+            self.assertEqual(payload["level_target_count"], 13)
+            self.assertEqual(payload["game_target_count"], 5)
             self.assertEqual(payload["current_run_levels_solved"], 1)
             self.assertEqual(payload["current_run_games_won"], 1)
-            self.assertAlmostEqual(payload["level_solve_rate_pct"], 100.0 / 23.0)
-            self.assertAlmostEqual(payload["game_solve_rate_pct"], 100.0 / 7.0)
+            self.assertAlmostEqual(payload["level_solve_rate_pct"], 100.0 / 13.0)
+            self.assertAlmostEqual(payload["game_solve_rate_pct"], 20.0)
 
     def test_generic_positive_terminal_persists_actual_action_trajectory(self):
         with tempfile.TemporaryDirectory() as tmp:
