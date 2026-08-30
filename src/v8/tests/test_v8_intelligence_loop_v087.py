@@ -48,7 +48,7 @@ class V087IntelligenceLoopTests(unittest.TestCase):
         self.assertEqual(len(proposals), 1)
         self.assertEqual(set(proposals[0].parents), {m1a.uid, m1b.uid})
         candidates = EvidenceGatedPromotionEngine().propose((m1a, m1b), (), budget=16)
-        self.assertTrue(any(item.evidence_kind == "generative_compression" for item in candidates))
+        self.assertTrue(any(item.evidence_kind == "family_compression" for item in candidates))
 
     def test_relational_roles_ignore_raw_family_identity(self):
         m1a = node(MemoryLevel.M1, MemoryType.CONTINGENCY, (11, 1, 2, 12))
