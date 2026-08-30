@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 from typing import Callable, Sequence
 
-from .researcher_packet import write_researcher_packet
+from .experiment_artifacts import capture_experiment_start, write_experiment_evidence
 
 
 def _requested_root(values: Sequence[str]) -> Path:
@@ -33,28 +33,41 @@ def run_with_default_research(
     argv: list[str] | None = None,
 ) -> int:
     values = list(sys.argv[1:] if argv is None else argv)
+    normal_run = _is_normal_continuous_run(values)
+    root = _requested_root(values)
+
+    if normal_run:
+        try:
+            capture_experiment_start(root, argv=values)
+        except BaseException as exc:
+            print(
+                f'[{time.strftime("%H:%M")}] experiment boundary capture failed: '
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            return 2
+
     result = int(main_func(values))
-    if result != 0 or not _is_normal_continuous_run(values):
+    if not normal_run:
         return result
 
-    root = _requested_root(values)
     try:
-        packet = write_researcher_packet(root, argv=values)
+        evidence = write_experiment_evidence(root, exit_code=result)
     except BaseException as exc:
         research_root = root / "research"
         research_root.mkdir(parents=True, exist_ok=True)
-        (research_root / "LLM_RESEARCH_PACKET_ERROR.txt").write_text(
+        (research_root / "EXPERIMENT_EVIDENCE_ERROR.txt").write_text(
             f"{type(exc).__name__}: {exc}\n", encoding="utf-8"
         )
         print(
-            f'[{time.strftime("%H:%M")}] LLM research packet failed: '
+            f'[{time.strftime("%H:%M")}] experiment evidence failed: '
             f"{type(exc).__name__}: {exc}",
             flush=True,
         )
         return result
 
     print(
-        f'[{time.strftime("%H:%M")}] LLM research packet ready: {packet}',
+        f'[{time.strftime("%H:%M")}] experiment evidence ready: {evidence}',
         flush=True,
     )
     return result
