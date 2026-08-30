@@ -1,0 +1,65 @@
+from __future__ import annotations
+
+from enum import Enum
+
+
+class FailureCategory(str, Enum):
+    BUG = "BUG"
+    PERFORMANCE_BOTTLENECK = "PERFORMANCE_BOTTLENECK"
+    EXPERIMENTAL_ARTIFACT = "EXPERIMENTAL_ARTIFACT"
+    MECHANISM_FAILURE = "MECHANISM_FAILURE"
+    ARCHITECTURAL_LIMITATION = "ARCHITECTURAL_LIMITATION"
+    UNKNOWN = "UNKNOWN"
+
+
+class FailureLevel(str, Enum):
+    LOCAL = "LOCAL"
+    STRUCTURAL = "STRUCTURAL"
+    FOUNDATIONAL = "FOUNDATIONAL"
+
+
+class ChainStatus(str, Enum):
+    PASS = "PASS"
+    FAIL = "FAIL"
+    INSUFFICIENT_EVIDENCE = "INSUFFICIENT_EVIDENCE"
+    NOT_REACHED = "NOT_REACHED"
+
+
+class Confidence(str, Enum):
+    VERY_LOW = "VERY_LOW"
+    LOW = "LOW"
+    MEDIUM = "MEDIUM"
+    HIGH = "HIGH"
+    VERY_HIGH = "VERY_HIGH"
+
+
+class ExperimentPurpose(str, Enum):
+    DIAGNOSTIC = "DIAGNOSTIC"
+    ABLATION = "ABLATION"
+    DISCRIMINATION = "DISCRIMINATION"
+    REPLICATION = "REPLICATION"
+    ROBUSTNESS = "ROBUSTNESS"
+    ARCHITECTURE = "ARCHITECTURE"
+
+
+class PredictionDirection(str, Enum):
+    UP = "UP"
+    DOWN = "DOWN"
+    FLAT = "FLAT"
+
+
+class PredictionOutcome(str, Enum):
+    CONFIRMED = "CONFIRMED"
+    CONTRADICTED = "CONTRADICTED"
+    INCONCLUSIVE = "INCONCLUSIVE"
+
+
+DEFAULT_CAUSAL_CHAIN = (
+    "M1_FORMATION",
+    "M2_ABSTRACTION",
+    "M3_ROLE_FORMATION",
+    "M4_RELEVANT_CANDIDATE",
+    "CROSS_WORLD_RETRIEVAL",
+    "ACTION_INTEGRATION",
+    "BEHAVIORAL_IMPROVEMENT",
+)
