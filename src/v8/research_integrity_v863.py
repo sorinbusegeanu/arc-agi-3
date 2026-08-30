@@ -39,9 +39,16 @@ def _purge_orphan_optimizer_state(root: str | Path) -> tuple[str, ...]:
 
 
 def prepare_clean_continuous_run(args) -> tuple[str, ...]:
-    """Discard optimizer behavior only when this CLI run has no graph to restore."""
+    """Discard optimizer behavior only for a real run with no graph to restore."""
 
     from v8.snapshot import latest_complete_snapshot
+
+    if getattr(args, "show_best_trajectory", None) or getattr(
+        args, "save_best_trajectory", None
+    ):
+        return ()
+    if not getattr(args, "games", None):
+        return ()
 
     root = Path(getattr(args, "root"))
     restore = not bool(getattr(args, "no_restore", False))
