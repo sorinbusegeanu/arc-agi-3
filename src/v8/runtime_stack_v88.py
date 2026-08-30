@@ -143,4 +143,5 @@ def install_current_runtime_stack_v88() -> None:
     _installer("formation_telemetry_v870")()
     _installer("parallel_lifecycle_v873")()
     _installer("run_integrity_v874")()
+    _installer("mixed_research_runtime_integrity_v875")()
     _INSTALLED = True
