@@ -22,16 +22,15 @@ def _generic_process_worker_v877(**kwargs) -> None:
     try:
         return _BASE_GENERIC_PROCESS_WORKER(**kwargs)
     finally:
-        if result_queue is None:
-            return
-        try:
-            result_queue.close()
-        except (AttributeError, ValueError, OSError):
-            pass
-        try:
-            result_queue.join_thread()
-        except (AttributeError, RuntimeError, ValueError, OSError):
-            pass
+        if result_queue is not None:
+            try:
+                result_queue.close()
+            except (AttributeError, ValueError, OSError):
+                pass
+            try:
+                result_queue.join_thread()
+            except (AttributeError, RuntimeError, ValueError, OSError):
+                pass
 
 
 def install_generic_result_flush_v877() -> None:
