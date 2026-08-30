@@ -21,17 +21,28 @@ class DefaultRecursiveResearchTests(unittest.TestCase):
             "games": ["ic01", "gp03", "ArcAgi/Sudoku-v0"],
             "actors": [
                 {"game_id": "ic01", "steps": 100, "wins": 1, "failures": 0,
-                 "levels_completed": 1, "replans": 0, "planned_steps": 10},
+                 "levels_completed": 1, "replans": 0, "planned_steps": 10, "resets": 1},
                 {"game_id": "gp03", "steps": 100, "wins": 0, "failures": 1,
-                 "levels_completed": 0, "replans": 0, "planned_steps": 0},
+                 "levels_completed": 0, "replans": 0, "planned_steps": 0, "resets": 2},
                 {"game_id": "ArcAgi/Sudoku-v0", "steps": 100, "wins": 0, "failures": 0,
-                 "levels_completed": 0, "replans": 0, "planned_steps": 0},
+                 "levels_completed": 0, "replans": 0, "planned_steps": 0, "resets": 3},
             ],
             "automatic_transfer_experiments": {"attempted": 2, "completed": 2, "passed": 1},
             "hypotheses": {"H01": "VALID"},
-            "metrics": {"watermark": 300, "generation": 4, "memories": 20, "edges": 30,
-                        "level_counts": {"1": 10, "2": 4, "3": 3, "4": 2, "7": 1}, "peers": None},
-            "final_snapshot": None,
+            "metrics": {
+                "watermark": 300,
+                "generation": 4,
+                "memories": 20,
+                "edges": 30,
+                "evidence_records": 7,
+                "level_counts": {"1": 10, "2": 4, "3": 3, "4": 2, "7": 1},
+                "peers": None,
+                "verified_success": {"game_solve_rate_pct": 33.3},
+                "trajectory_optimizer": {"candidates_generated": 0},
+                "adaptive_learning": {"states": {"UNSOLVED": 2}, "sample_steps": 200},
+                "process_memory": {"rss_bytes": 999999999},
+            },
+            "final_snapshot": {"digest": "large-low-value-snapshot-digest"},
         }
 
     def test_missing_transfer_evidence_remains_insufficient(self):
@@ -45,7 +56,7 @@ class DefaultRecursiveResearchTests(unittest.TestCase):
             self._summary(), revision="abc", argv=["continuous-run", "--games", "mix"],
             h_report=[{"hypothesis_id": "H01", "final_decision": "VALID"}],
             reporting_cut={"watermark": 300},
-            evidence_digest={"available": True, "record_count": 4, "samples": []},
+            evidence_digest={"available": True, "record_count": 4},
             log_tail="sample log",
         )
         self.assertIn("has **not selected a research hypothesis or next experiment**", packet)
@@ -57,14 +68,14 @@ class DefaultRecursiveResearchTests(unittest.TestCase):
         packet = build_packet(
             self._summary(), revision="abc", argv=["continuous-run", "--games", "mix"],
             h_report=[], reporting_cut={},
-            evidence_digest={"available": True, "record_count": 0, "samples": []},
+            evidence_digest={"available": True, "record_count": 0},
             log_tail="",
         )
         self.assertIn("ARC-only subset of mix", packet)
         self.assertIn("does not causally test those families", packet)
         self.assertIn("cumulative restored evidence", packet)
 
-    def test_evidence_digest_samples_recent_records_not_oldest(self):
+    def test_evidence_digest_keeps_aggregates_and_omits_raw_samples(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "evidence.jsonl"
             rows = []
@@ -84,10 +95,36 @@ class DefaultRecursiveResearchTests(unittest.TestCase):
             )
             digest = _evidence_digest(path)
         self.assertEqual(digest["record_count"], 5)
-        self.assertEqual(
-            [row["decision_watermark"] for row in digest["samples"]],
-            [5, 4, 3],
+        self.assertEqual(digest["evidence_kind_counts"], {"transfer_trial_pass": 5})
+        self.assertEqual(digest["distinct_source_games"], 1)
+        self.assertEqual(digest["distinct_target_games"], 1)
+        self.assertNotIn("samples", digest)
+
+    def test_packet_omits_duplicate_and_low_value_raw_sections(self):
+        packet = build_packet(
+            self._summary(), revision="abc", argv=["continuous-run", "--games", "mix"],
+            h_report=[{
+                "hypothesis_id": "H01",
+                "final_decision": "VALID",
+                "evidence_count": 12,
+                "blocker": "",
+                "paper_claim": "large duplicate claim",
+                "required_measurements": ["duplicate"],
+            }],
+            reporting_cut={"duplicated": "reporting-cut"},
+            evidence_digest={"available": True, "record_count": 4},
+            log_tail="sample log",
         )
+        self.assertIn("## H01-H15 compact status", packet)
+        self.assertIn("## Key current-run evidence", packet)
+        self.assertIn("## Evidence-ledger aggregate digest", packet)
+        self.assertNotIn("## Reporting cut", packet)
+        self.assertNotIn("## Full run summary", packet)
+        self.assertNotIn("large-low-value-snapshot-digest", packet)
+        self.assertNotIn("999999999", packet)
+        self.assertNotIn("large duplicate claim", packet)
+        self.assertIn('"game_id": "ic01"', packet)
+        self.assertIn('"wins": 1', packet)
 
     def test_writer_creates_single_llm_handoff_file_and_removes_stale_outputs(self):
         with tempfile.TemporaryDirectory() as tmp:
