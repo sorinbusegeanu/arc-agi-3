@@ -16,6 +16,12 @@ from v8.environments.schemas import (
     EnvironmentIdentity,
     ObservationSchema,
 )
+from v8.environments.sudoku_env import (
+    SUDOKU_ENV_ID,
+    SudokuAdapter,
+    decode_sudoku_action,
+    encode_sudoku_action,
+)
 
 register_chess_gym()
 
@@ -29,7 +35,11 @@ __all__ = [
     "EnvironmentIdentity",
     "GymDiscreteAdapter",
     "ObservationSchema",
+    "SUDOKU_ENV_ID",
+    "SudokuAdapter",
     "decode_chess_move",
+    "decode_sudoku_action",
     "encode_chess_move",
+    "encode_sudoku_action",
     "register_chess_gym",
 ]

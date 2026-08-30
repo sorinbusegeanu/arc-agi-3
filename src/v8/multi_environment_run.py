@@ -6,7 +6,7 @@ from pathlib import Path
 from random import Random
 
 from v8 import ContinuousMemoryRuntime, V8RuntimeConfig
-from v8.environments import ChessAdapter, GymDiscreteAdapter
+from v8.environments import ChessAdapter, GymDiscreteAdapter, SudokuAdapter
 from v8.model import stable_u64
 
 
@@ -20,7 +20,9 @@ def make_adapter(name: str, *, seed: int, slippery: bool = False, chess_opponent
         )
     if key in {"chess", "arcagi/chess-v0", "gym:arcagi/chess-v0"}:
         return ChessAdapter(seed=int(seed), opponent=str(chess_opponent))
-    raise ValueError(f"unsupported environment {name!r}; choices=frozenlake,chess")
+    if key in {"sudoku", "arcagi/sudoku-v0", "puzzle:arcagi/sudoku-v0"}:
+        return SudokuAdapter(seed=int(seed))
+    raise ValueError(f"unsupported environment {name!r}; choices=frozenlake,chess,sudoku")
 
 
 def _choose_action(view, context: int, actions: tuple[int, ...], rng: Random, epsilon: float) -> int:
@@ -184,7 +186,7 @@ def run_environment(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m v8.multi_environment_run")
-    parser.add_argument("--environment", choices=("frozenlake", "chess"), required=True)
+    parser.add_argument("--environment", choices=("frozenlake", "chess", "sudoku"), required=True)
     parser.add_argument("--root", default="runs/v8/multi-environment")
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=0)

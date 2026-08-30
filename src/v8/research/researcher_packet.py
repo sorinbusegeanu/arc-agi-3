@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -16,6 +17,14 @@ PACKET_NAME = "LLM_RESEARCH_PACKET.md"
 _MAX_EVIDENCE_SAMPLES = 96
 _MAX_SAMPLES_PER_KIND = 3
 _MAX_LOG_LINES = 200
+_STALE_HANDOFF_OUTPUTS = (
+    "research_summary.md",
+    "causal_chain_report.json",
+    "runtime_hypotheses.json",
+    "next_experiment.json",
+    "latest_evidence_package.json",
+    "evidence_packages",
+)
 
 
 def _git_revision() -> str:
@@ -41,12 +50,20 @@ def _read_json(path: Path, default: Any) -> Any:
         return default
 
 
-def _chain_payload(summary: Mapping[str, Any]) -> dict[str, Any]:
+def _mix_requested(argv: Sequence[str]) -> bool:
+    values = tuple(str(value) for value in argv)
+    for index, value in enumerate(values[:-1]):
+        if value == "--games" and values[index + 1].strip().lower() == "mix":
+            return True
+    return False
+
+
+def _chain_payload(summary: Mapping[str, Any], *, mix_requested: bool = False) -> dict[str, Any]:
     result = audit_chain(derive_chain_evidence(summary))
     first_unresolved = next(
         (edge.edge for edge in result.edges if edge.status != ChainStatus.PASS), None
     )
-    return {
+    payload = {
         "complete": result.complete,
         "first_broken_link": result.first_broken_link,
         "first_unresolved_link": first_unresolved,
@@ -61,6 +78,13 @@ def _chain_payload(summary: Mapping[str, Any]) -> dict[str, Any]:
             for edge in result.edges
         ],
     }
+    if mix_requested:
+        payload["automatic_transfer_scope"] = "ARC-only subset of mix"
+        payload["scope_warning"] = (
+            "Automatic transfer interventions do not test Gym, Chess, or Sudoku. "
+            "Do not interpret them as cross-family causal transfer evidence."
+        )
+    return payload
 
 
 def _evidence_digest(path: Path) -> dict[str, Any]:
@@ -71,8 +95,9 @@ def _evidence_digest(path: Path) -> dict[str, Any]:
     effects: Counter[str] = Counter()
     sources: set[int] = set()
     targets: set[int] = set()
-    samples_per_kind: defaultdict[str, int] = defaultdict(int)
-    samples: list[dict[str, Any]] = []
+    recent_by_kind: defaultdict[str, deque[dict[str, Any]]] = defaultdict(
+        lambda: deque(maxlen=_MAX_SAMPLES_PER_KIND)
+    )
     records = 0
     invalid = 0
     try:
@@ -102,11 +127,23 @@ def _evidence_digest(path: Path) -> dict[str, Any]:
                     sources.add(source)
                 if target:
                     targets.add(target)
-                if len(samples) < _MAX_EVIDENCE_SAMPLES and samples_per_kind[kind] < _MAX_SAMPLES_PER_KIND:
-                    samples.append(row)
-                    samples_per_kind[kind] += 1
+                recent_by_kind[kind].append(row)
     except OSError as exc:
         return {"available": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    samples = [
+        row
+        for rows in recent_by_kind.values()
+        for row in rows
+    ]
+    samples.sort(
+        key=lambda row: (
+            int(row.get("decision_watermark", 0) or 0),
+            int(row.get("evidence_available_watermark", 0) or 0),
+        ),
+        reverse=True,
+    )
+    samples = samples[:_MAX_EVIDENCE_SAMPLES]
     return {
         "available": True,
         "record_count": records,
@@ -117,7 +154,11 @@ def _evidence_digest(path: Path) -> dict[str, Any]:
         "distinct_source_games": len(sources),
         "distinct_target_games": len(targets),
         "samples": samples,
-        "sampling_note": f"Counts cover the full ledger; samples are capped at {_MAX_SAMPLES_PER_KIND} per kind and {_MAX_EVIDENCE_SAMPLES} total.",
+        "sampling_note": (
+            f"Counts cover the full ledger; samples are the most recent {_MAX_SAMPLES_PER_KIND} "
+            f"per evidence kind, capped at {_MAX_EVIDENCE_SAMPLES} total. The ledger may include "
+            "restored historical evidence from prior runs."
+        ),
     }
 
 
@@ -138,6 +179,13 @@ def build_packet(
     h_report: Any, reporting_cut: Any, evidence_digest: Mapping[str, Any], log_tail: str,
 ) -> str:
     command = "PYTHONPATH=src python -m v8 " + " ".join(str(x) for x in argv)
+    mixed = _mix_requested(argv)
+    scope_note = (
+        "- Automatic transfer intervention scope: `ARC-only subset of mix`\n"
+        "- Important: Gym, Chess, and Sudoku share the memory graph during sampling, but the current automatic transfer intervention harness does not causally test those families.\n"
+        if mixed
+        else "- Automatic transfer intervention scope: selected ARC games supported by the experiment harness.\n"
+    )
     return f"""# ARC-AGI-3 LLM Research Packet
 
 Upload this **single file** to a frontier LLM researcher after the run.
@@ -154,6 +202,7 @@ The local system prepared evidence and conservative diagnostics only. It has **n
 7. Preregister predicted metric changes, expected unchanged metrics, and a falsifying result before the experiment is run.
 8. Recommend architecture change only after bugs, artifacts, and existing-mechanism explanations are reasonably excluded.
 9. If evidence cannot discriminate explanations, state `INSUFFICIENT_EVIDENCE` and specify what evidence is missing.
+10. Treat cumulative restored evidence and current-run actor outcomes as different evidence scopes; do not infer that historical evidence was produced by this run.
 
 Return exactly these sections:
 
@@ -172,13 +221,13 @@ Return exactly these sections:
 
 - Revision: `{revision}`
 - Command: `{command}`
-
+{scope_note}
 ## Deterministic causal-chain diagnostic
 
 `INSUFFICIENT_EVIDENCE` means the local system refused to infer a causal failure.
 
 ```json
-{_dump(_chain_payload(summary))}
+{_dump(_chain_payload(summary, mix_requested=mixed))}
 ```
 
 ## H01-H15 scientific report
@@ -201,7 +250,7 @@ Return exactly these sections:
 
 ## Evidence-ledger digest
 
-Counts cover the complete persisted ledger; representative raw rows are bounded to keep this file practical to upload.
+Counts cover the complete persisted ledger. Samples are recent rather than first-seen so restored long-running research does not bias the LLM toward stale early evidence.
 
 ```json
 {_dump(evidence_digest)}
@@ -221,6 +270,18 @@ A bug fix restores intended implementation and does not by itself validate a cog
 """
 
 
+def _remove_stale_handoff_outputs(research_root: Path) -> None:
+    for name in _STALE_HANDOFF_OUTPUTS:
+        path = research_root / name
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+
 def write_researcher_packet(root: str | Path, *, argv: Sequence[str]) -> Path:
     root = Path(root)
     summary = _read_json(root / "v8_run_summary.json", None)
@@ -237,6 +298,7 @@ def write_researcher_packet(root: str | Path, *, argv: Sequence[str]) -> Path:
     )
     research_root = root / "research"
     research_root.mkdir(parents=True, exist_ok=True)
+    _remove_stale_handoff_outputs(research_root)
     target = research_root / PACKET_NAME
     temp = target.with_suffix(target.suffix + ".tmp")
     temp.write_text(packet, encoding="utf-8")
