@@ -82,11 +82,11 @@ class _Runtime:
 
 
 class MixedEnvironmentV859Tests(unittest.TestCase):
-    def test_mix_selector_has_seven_games_across_four_environment_categories(self):
+    def test_mix_selector_has_five_games_across_four_environment_categories(self):
         self.assertTrue(is_mix_selector("mix"))
         self.assertEqual(resolve_mixed_game_selector("mix"), MIX_GAME_IDS)
         self.assertIsNone(resolve_mixed_game_selector("ic01,gp03"))
-        self.assertEqual(len(MIX_GAME_IDS), 7)
+        self.assertEqual(len(MIX_GAME_IDS), 5)
         self.assertEqual(tuple(spec.environment_id for spec in MIX_SPECS), MIX_GAME_IDS)
         self.assertEqual(
             {spec.environment_family for spec in MIX_SPECS},
@@ -94,29 +94,31 @@ class MixedEnvironmentV859Tests(unittest.TestCase):
         )
         self.assertNotIn("ez01", MIX_GAME_IDS)
         self.assertNotIn("ez02", MIX_GAME_IDS)
+        self.assertNotIn("ic01", MIX_GAME_IDS)
+        self.assertNotIn("ic02", MIX_GAME_IDS)
         self.assertIn("gp03", MIX_GAME_IDS)
         self.assertIn("ArcAgi/Sudoku-v0", MIX_GAME_IDS)
-        self.assertEqual(ARC_GAME_IDS, {"ic01", "gp03", "ic02", "tp02"})
+        self.assertEqual(ARC_GAME_IDS, {"gp03", "tp02"})
         self.assertEqual(
             GENERIC_GAME_IDS,
             {"FrozenLake-v1", "ArcAgi/Chess-v0", "ArcAgi/Sudoku-v0"},
         )
         self.assertEqual(MIX_TRANSFER_EXPERIMENT_SCOPE, "arc-only")
 
-    def test_seven_actors_give_one_lane_to_each_mix_entry(self):
+    def test_five_actors_give_one_lane_to_each_mix_entry(self):
         jobs = _actor_jobs(
             MIX_GAME_IDS,
-            actors=7,
+            actors=5,
             steps_per_game=100,
             seed=0,
             env_root=None,
             epsilon=0.1,
         )
-        self.assertEqual(len(jobs), 7)
+        self.assertEqual(len(jobs), 5)
         self.assertEqual(tuple(job.game_id for job in jobs), MIX_GAME_IDS)
         self.assertTrue(all(job.steps == 100 for job in jobs))
 
-    def test_actor_count_below_seven_still_preserves_all_environments(self):
+    def test_actor_count_below_five_still_preserves_all_environments(self):
         jobs = _actor_jobs(
             MIX_GAME_IDS,
             actors=2,
@@ -126,7 +128,7 @@ class MixedEnvironmentV859Tests(unittest.TestCase):
             epsilon=0.1,
         )
         self.assertEqual(tuple(job.game_id for job in jobs), MIX_GAME_IDS)
-        self.assertEqual(sum(job.steps for job in jobs), 175)
+        self.assertEqual(sum(job.steps for job in jobs), 125)
 
     def test_generic_classifier_does_not_capture_arc_games(self):
         for game in ARC_GAME_IDS:
@@ -230,15 +232,15 @@ class MixedEnvironmentV859Tests(unittest.TestCase):
         runtime = _Runtime()
         runtime.peers = _Peers()
 
-        arc_job = actor_module.ActorJob(1, "ic01", 1, 1)
+        arc_job = actor_module.ActorJob(1, "gp03", 1, 1)
         generic_job = actor_module.ActorJob(2, "ArcAgi/Sudoku-v0", 1, 2)
 
         def fake_arc(_runtime, jobs, **_kwargs):
-            self.assertEqual(tuple(job.game_id for job in jobs), ("ic01",))
+            self.assertEqual(tuple(job.game_id for job in jobs), ("gp03",))
             runtime.peers._pause.clear()
             self.assertTrue(generic_started.wait(1.0))
             arc_can_finish.set()
-            return (actor_module.ActorResult(1, "ic01", 1, 0, 0, 0, 0),)
+            return (actor_module.ActorResult(1, "gp03", 1, 0, 0, 0, 0),)
 
         def fake_generic(_runtime, job, **_kwargs):
             self.assertEqual(job.game_id, "ArcAgi/Sudoku-v0")
@@ -267,7 +269,7 @@ class MixedEnvironmentV859Tests(unittest.TestCase):
 
         with patch.object(base_cli, "main", side_effect=inspect_main):
             self.assertEqual(
-                adaptive_cli_main(["continuous-run", "--games", "mix", "--actors", "7"]),
+                adaptive_cli_main(["continuous-run", "--games", "mix", "--actors", "5"]),
                 0,
             )
         self.assertIs(base_cli.run_actor_jobs, original_actor_dispatch)
