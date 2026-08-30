@@ -9,6 +9,7 @@ installer guard.
 """
 
 from importlib import import_module
+import sys
 
 
 _INSTALLED = False
@@ -101,6 +102,19 @@ def _installer(module_name: str):
     return candidates[0]
 
 
+def _publish_runtime_api_for_late_bootstrap() -> None:
+    """Expose the package runtime API before late layers import package-level names."""
+    package = sys.modules.get("v8")
+    if package is None:
+        return
+    runtime = import_module("v8.runtime")
+    runtime_v82 = import_module("v8.runtime_v82")
+    continuous_runtime = runtime_v82.V82ContinuousMemoryRuntime
+    runtime.ContinuousMemoryRuntime = continuous_runtime
+    package.ContinuousMemoryRuntime = continuous_runtime
+    package.V8RuntimeConfig = runtime.V8RuntimeConfig
+
+
 def install_current_runtime_stack_v88() -> None:
     global _INSTALLED
     if _INSTALLED:
@@ -120,5 +134,6 @@ def install_current_runtime_stack_v88() -> None:
     _installer("click_transition_graph_v861_fixups")()
     _installer("click_transition_graph_v861_authority_fix")()
     _installer("incremental_peer_drain_v862")()
+    _publish_runtime_api_for_late_bootstrap()
     _installer("verified_success_metrics_v866")()
     _INSTALLED = True
