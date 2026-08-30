@@ -148,48 +148,63 @@ def _ensure_arc_paths() -> None:
 
 
 def _install_arcengine_render_compatibility() -> None:
-    """Normalize game-provided sprite render lists at the ARCEngine camera boundary.
+    """Normalize list-backed sprite renders wherever ARCEngine reads ndarray shape.
 
-    ARC environment code can mutate or override a sprite so ``render()`` returns a
-    2-D Python list. ARCEngine 0.9.3 assumes the return value is an ndarray and reads
-    ``.shape`` immediately, which crashes ACTION6 handling before the adapter can
-    observe the transition. Keep the engine semantics unchanged and normalize only
-    the rendered pixel matrix passed into the camera implementation.
+    Some ARC game sprites override ``render()`` and return a 2-D Python list.
+    ARCEngine 0.9.3 reads ``render().shape`` both from ``Sprite.width/height``
+    during collision lookup and from ``Camera._raw_render`` during rendering.
+    Normalize both boundaries without changing game semantics.
     """
     global _ARCENGINE_RENDER_COMPAT_INSTALLED
-    if _ARCENGINE_RENDER_COMPAT_INSTALLED:
-        return
 
     try:
         from arcengine.camera import Camera
+        from arcengine.sprites import Sprite
     except ImportError:
         return
 
+    def _sprite_pixels(sprite: Any) -> np.ndarray:
+        pixels = np.asarray(sprite.render(), dtype=np.int8)
+        if pixels.ndim != 2 or pixels.size == 0:
+            raise ValueError(f"expected non-empty 2D sprite render, got shape {pixels.shape}")
+        return pixels
+
+    width_getter = getattr(getattr(Sprite, "width", None), "fget", None)
+    if not getattr(width_getter, "_arc_list_render_compatible", False):
+        def _width_list_safe(self: Any) -> int:
+            return int(_sprite_pixels(self).shape[1])
+
+        setattr(_width_list_safe, "_arc_list_render_compatible", True)
+        Sprite.width = property(_width_list_safe)
+
+    height_getter = getattr(getattr(Sprite, "height", None), "fget", None)
+    if not getattr(height_getter, "_arc_list_render_compatible", False):
+        def _height_list_safe(self: Any) -> int:
+            return int(_sprite_pixels(self).shape[0])
+
+        setattr(_height_list_safe, "_arc_list_render_compatible", True)
+        Sprite.height = property(_height_list_safe)
+
     base_raw_render = Camera._raw_render
-    if getattr(base_raw_render, "_arc_list_render_compatible", False):
-        _ARCENGINE_RENDER_COMPAT_INSTALLED = True
-        return
+    if not getattr(base_raw_render, "_arc_list_render_compatible", False):
+        class _RenderableSpriteProxy:
+            __slots__ = ("_sprite",)
 
-    class _RenderableSpriteProxy:
-        __slots__ = ("_sprite",)
+            def __init__(self, sprite: Any) -> None:
+                self._sprite = sprite
 
-        def __init__(self, sprite: Any) -> None:
-            self._sprite = sprite
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._sprite, name)
 
-        def __getattr__(self, name: str) -> Any:
-            return getattr(self._sprite, name)
+            def render(self) -> np.ndarray:
+                return _sprite_pixels(self._sprite)
 
-        def render(self) -> np.ndarray:
-            pixels = np.asarray(self._sprite.render(), dtype=np.int8)
-            if pixels.ndim != 2 or pixels.size == 0:
-                raise ValueError(f"expected non-empty 2D sprite render, got shape {pixels.shape}")
-            return pixels
+        def _raw_render_list_safe(self: Any, sprites: list[Any]) -> np.ndarray:
+            return base_raw_render(self, [_RenderableSpriteProxy(sprite) for sprite in sprites])
 
-    def _raw_render_list_safe(self: Any, sprites: list[Any]) -> np.ndarray:
-        return base_raw_render(self, [_RenderableSpriteProxy(sprite) for sprite in sprites])
+        setattr(_raw_render_list_safe, "_arc_list_render_compatible", True)
+        Camera._raw_render = _raw_render_list_safe
 
-    setattr(_raw_render_list_safe, "_arc_list_render_compatible", True)
-    Camera._raw_render = _raw_render_list_safe
     _ARCENGINE_RENDER_COMPAT_INSTALLED = True
 
 
