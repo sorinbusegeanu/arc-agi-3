@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 from typing import Callable, Sequence
 
-from .default_analysis import run_default_research_analysis
+from .researcher_packet import write_researcher_packet
 
 
 def _requested_root(values: Sequence[str]) -> Path:
@@ -39,25 +39,22 @@ def run_with_default_research(
 
     root = _requested_root(values)
     try:
-        analysis = run_default_research_analysis(root)
+        packet = write_researcher_packet(root, argv=values)
     except BaseException as exc:
         research_root = root / "research"
         research_root.mkdir(parents=True, exist_ok=True)
-        (research_root / "ERROR.txt").write_text(
+        (research_root / "LLM_RESEARCH_PACKET_ERROR.txt").write_text(
             f"{type(exc).__name__}: {exc}\n", encoding="utf-8"
         )
         print(
-            f'[{time.strftime("%H:%M")}] research analysis failed: '
+            f'[{time.strftime("%H:%M")}] LLM research packet failed: '
             f"{type(exc).__name__}: {exc}",
             flush=True,
         )
         return result
 
-    chain = analysis["chain"]
-    focus = chain.get("first_unresolved_link") or "none"
     print(
-        f'[{time.strftime("%H:%M")}] research analysis done '
-        f"first_unresolved={focus} report={analysis['report_path']}",
+        f'[{time.strftime("%H:%M")}] LLM research packet ready: {packet}',
         flush=True,
     )
     return result
