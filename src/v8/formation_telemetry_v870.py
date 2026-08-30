@@ -23,7 +23,6 @@ from v8.structural_events import normalized_family_key
 
 _INSTALLED = False
 _BASE_RUNTIME_METRICS = None
-_BASE_KEY_RUN_SUMMARY = None
 _MAX_REJECTED_EXAMPLES = 3
 
 
@@ -298,26 +297,8 @@ def _runtime_metrics_v870(self):
     return payload
 
 
-def _key_run_summary_v870(summary):
-    payload = dict(_BASE_KEY_RUN_SUMMARY(summary))
-    metrics = summary.get("metrics", {}) if isinstance(summary, dict) else {}
-    telemetry = metrics.get("formation_telemetry", {}) if isinstance(metrics, dict) else {}
-    memory = dict(payload.get("memory", {}))
-    memory["formation_telemetry"] = dict(telemetry) if isinstance(telemetry, dict) else {}
-    payload["memory"] = memory
-
-    optimizer = payload.get("trajectory_optimizer", {})
-    if isinstance(optimizer, dict):
-        optimizer = dict(optimizer)
-        optimizer["counter_scope_note"] = (
-            "generated, validation_successes, validated_variants, saved/frontier counters are stage-local and must not be assumed to be one-to-one."
-        )
-        payload["trajectory_optimizer"] = optimizer
-    return payload
-
-
 def install_formation_telemetry_v870() -> None:
-    global _INSTALLED, _BASE_RUNTIME_METRICS, _BASE_KEY_RUN_SUMMARY
+    global _INSTALLED, _BASE_RUNTIME_METRICS
     if _INSTALLED:
         return
 
@@ -326,7 +307,6 @@ def install_formation_telemetry_v870() -> None:
     from v8 import peers as peers_module
     from v8 import roles as roles_module
     from v8 import runtime_v82
-    from v8.research import researcher_packet
 
     loop_module.V087GenerativeCompressionEstimator = V870GenerativeCompressionEstimator
     compression_module.CompressionEstimator = V870GenerativeCompressionEstimator
@@ -338,7 +318,4 @@ def install_formation_telemetry_v870() -> None:
 
     _BASE_RUNTIME_METRICS = runtime_v82.V82ContinuousMemoryRuntime.metrics
     runtime_v82.V82ContinuousMemoryRuntime.metrics = _runtime_metrics_v870
-
-    _BASE_KEY_RUN_SUMMARY = researcher_packet._key_run_summary
-    researcher_packet._key_run_summary = _key_run_summary_v870
     _INSTALLED = True
