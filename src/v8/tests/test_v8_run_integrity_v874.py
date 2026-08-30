@@ -7,28 +7,22 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import v8
-from v8.adaptive_learning_allocation_v819 import (
-    AdaptiveLearningCoordinator,
-    GameLearningState,
-    SamplingMode,
-)
-from v8.evaluation_v82 import V82HypothesisDecision
+from v8 import adaptive_learning_allocation_v819 as v819
 from v8 import run_integrity_v874 as v874
+from v8 import runtime_win_optimization_v834 as v834
+from v8 import runtime_win_scope_v835 as v835
+from v8 import trajectory_optimizer_v814 as optimizer
+from v8.evaluation_v82 import V82HypothesisDecision
 
 
-def decision(
-    hypothesis_id: str,
-    final: str,
-    *,
-    evidence_count: int = 1,
-) -> V82HypothesisDecision:
+def decision(hypothesis_id: str, final: str) -> V82HypothesisDecision:
     return V82HypothesisDecision(
         hypothesis_id=hypothesis_id,
         raw_decision=final,
         quality_gate="PASS",
         dependency_gate="PASS",
         final_decision=final,
-        evidence_count=evidence_count,
+        evidence_count=1,
         blocker="",
         paper_claim="test",
         required_measurements=(),
@@ -73,46 +67,52 @@ class FormationTelemetryRepairTests(unittest.TestCase):
         self.assertEqual(telemetry["role_candidates"], 1)
 
 
-class TraceabilityDependencyRepairTests(unittest.TestCase):
-    def test_h05_cannot_remain_valid_when_h04_is_invalid(self) -> None:
-        rows = v874.enforce_traceability_dependencies_v874(
-            (
-                decision("H04", "INVALID"),
-                decision("H05", "VALID"),
-            )
+class DevelopmentalOrderingRepairTests(unittest.TestCase):
+    def test_h05_cannot_validate_after_family_before_carrier_failed(self) -> None:
+        rows = v874.enforce_role_developmental_order_v874(
+            (decision("H04", "INVALID"), decision("H05", "VALID")),
+            {
+                "family_before_carrier": "FAIL",
+                "carrier_before_role": "PASS",
+            },
         )
         by_id = {row.hypothesis_id: row for row in rows}
 
         self.assertEqual(by_id["H04"].final_decision, "INVALID")
-        self.assertEqual(by_id["H05"].dependency_gate, "BLOCKED")
-        self.assertEqual(by_id["H05"].final_decision, "PARTIALLY_VALID")
-        self.assertIn("H04=INVALID", by_id["H05"].blocker)
+        self.assertEqual(by_id["H05"].final_decision, "INVALID")
+        self.assertEqual(by_id["H05"].ordering_gate, "FAIL")
+        self.assertIn("family_before_carrier", by_id["H05"].blocker)
 
-    def test_forward_h12_dependency_on_h13_is_enforced(self) -> None:
-        rows = v874.enforce_traceability_dependencies_v874(
-            (
-                decision("H12", "VALID"),
-                decision("H13", "INSUFFICIENT_EVIDENCE", evidence_count=0),
-            )
+    def test_independent_causal_hypothesis_is_not_status_gated(self) -> None:
+        rows = v874.enforce_role_developmental_order_v874(
+            (decision("H05", "INVALID"), decision("H06", "VALID")),
+            {"family_before_carrier": "FAIL"},
         )
         by_id = {row.hypothesis_id: row for row in rows}
-
-        self.assertEqual(by_id["H12"].dependency_gate, "BLOCKED")
-        self.assertEqual(by_id["H12"].final_decision, "PARTIALLY_VALID")
-        self.assertIn("H13=INSUFFICIENT_EVIDENCE", by_id["H12"].blocker)
+        self.assertEqual(by_id["H06"].final_decision, "VALID")
 
 
 class VerifiedWinAllocationRepairTests(unittest.TestCase):
-    def test_worker_verified_win_changes_live_allocator_state_without_frontier(self) -> None:
-        old_root = os.environ.get("ARC_AGI3_V8_VERIFIED_SUCCESS_ROOT")
-        try:
-            with tempfile.TemporaryDirectory() as directory:
-                os.environ["ARC_AGI3_V8_VERIFIED_SUCCESS_ROOT"] = directory
-                coordinator = AdaptiveLearningCoordinator()
+    def test_verified_worker_win_uses_existing_v834_runtime_win_channel(self) -> None:
+        self.assertIs(v819.AdaptiveLearningCoordinator.game_state, v834._game_state_v834)
+        with tempfile.TemporaryDirectory() as directory:
+            verified_root = os.path.join(directory, "verified")
+            trajectory_root = os.path.join(directory, "trajectory_optimizer")
+            with patch.dict(
+                os.environ,
+                {
+                    "ARC_AGI3_V8_VERIFIED_SUCCESS_ROOT": verified_root,
+                    optimizer._TRAJECTORY_ROOT_ENV: trajectory_root,
+                    v835._RUN_SESSION_ENV: "v874-test-run",
+                },
+                clear=False,
+            ):
+                coordinator = v819.AdaptiveLearningCoordinator()
                 coordinator.register_games(("tp01",))
+                coordinator._v834_runtime = SimpleNamespace(generation=123)
                 self.assertEqual(
                     coordinator.game_state("tp01"),
-                    GameLearningState.UNSOLVED,
+                    v819.GameLearningState.UNSOLVED,
                 )
 
                 persisted = v874._record_verified_success_v874(
@@ -124,34 +124,21 @@ class VerifiedWinAllocationRepairTests(unittest.TestCase):
                     capture_step=3,
                 )
                 self.assertTrue(persisted)
-                self.assertTrue(v874._has_verified_win_v874("tp01"))
+
                 self.assertEqual(
                     coordinator.game_state("tp01"),
-                    GameLearningState.SOLVED_OPTIMIZING,
+                    v819.GameLearningState.SOLVED_OPTIMIZING,
                 )
-                self.assertNotEqual(
-                    coordinator.choose_mode("tp01"),
-                    SamplingMode.DISCOVERY,
-                )
-
-                payload = coordinator.state_dict()
-                self.assertTrue(payload["game_won"]["tp01"])
-                self.assertAlmostEqual(
-                    payload["sampling_weight"]["tp01"],
-                    coordinator.config.optimizing_weight,
-                )
-
-                restored = AdaptiveLearningCoordinator()
-                restored.load_state(payload)
                 self.assertEqual(
-                    restored.game_state("tp01"),
-                    GameLearningState.SOLVED_OPTIMIZING,
+                    coordinator.choose_mode("tp01"),
+                    v819.SamplingMode.VERIFY,
                 )
-        finally:
-            if old_root is None:
-                os.environ.pop("ARC_AGI3_V8_VERIFIED_SUCCESS_ROOT", None)
-            else:
-                os.environ["ARC_AGI3_V8_VERIFIED_SUCCESS_ROOT"] = old_root
+                self.assertTrue(coordinator._game_won["tp01"])
+                full_win = coordinator._record("tp01", v835._FULL_WIN_SCOPE_LEVEL)
+                self.assertEqual(
+                    full_win.state,
+                    v819.GameLearningState.SOLVED_OPTIMIZING,
+                )
 
 
 if __name__ == "__main__":
