@@ -17,7 +17,19 @@ _INSTALLED = False
 
 
 def _reporter_emit_line_v850(message: str, output_queue) -> None:
-    """Keep the v8.50 public hook while no longer suppressing dedicated reports."""
+    """Keep v8.50's parent-side duplicate suppression and public hook identity."""
+    from v8 import learning_effectiveness_report_v850 as effectiveness
+
+    if output_queue is None and (
+        " - effectiveness " in str(message)
+        or str(message).startswith("effectiveness ")
+    ):
+        return
+    effectiveness._BASE_REPORTER_EMIT_LINE(message, output_queue)
+
+
+def _dedicated_emit(message: str, output_queue) -> None:
+    """Dedicated reporter output bypasses v8.50 parent-side suppression."""
     from v8 import learning_effectiveness_report_v850 as effectiveness
 
     effectiveness._BASE_REPORTER_EMIT_LINE(message, output_queue)
@@ -76,14 +88,14 @@ def _reporting_worker_v851_integrity(
                 )
                 from v8 import mixed_research_runtime_integrity_v875 as v875
 
-                reporter._emit_line(v875._force_complete_percentage(line), output_queue)
+                _dedicated_emit(v875._force_complete_percentage(line), output_queue)
             reporter._emit_sampling_complete(output_queue)
             return
 
         now = time.monotonic()
         if now >= next_report:
             rows = tuple(latest[key] for key in sorted(latest))
-            reporter._emit_line(
+            _dedicated_emit(
                 reporter.format_periodic_progress_line(rows, total_steps, baseline),
                 output_queue,
             )
@@ -93,7 +105,7 @@ def _reporting_worker_v851_integrity(
         if now >= next_hypotheses:
             current = int(getattr(watermark, "value", 0))
             evidence = memory_integrity._read_evidence_for_report(root, current)
-            reporter._emit_line(
+            _dedicated_emit(
                 _hypothesis_status_line(evidence, current),
                 output_queue,
             )
@@ -114,10 +126,15 @@ def _authoritative_telemetry_game_state_v875(self, game_id: str):
 
 
 def _request_final_peer_drain_v875(runtime) -> None:
-    """Only the outer mixed runner may transition the runtime into final drain."""
+    """Only the outer production mixed runner transitions into final drain."""
     from v8 import mixed_research_runtime_integrity_v875 as v875
 
     if bool(getattr(runtime, "_v839_defer_sampling_finish", False)):
+        return
+    peers = getattr(runtime, "peers", None)
+    if peers is not None and not callable(getattr(peers, "pause", None)):
+        # Lightweight/historical test runners expose only the peer pause event and
+        # never owned the production final-drain protocol.
         return
     v875._emit_phase(runtime, "optimizer_drain")
     return v875._BASE_FINAL_PEER_DRAIN(runtime)
@@ -197,7 +214,8 @@ def install_mixed_research_runtime_integrity_v876() -> None:
         _authoritative_telemetry_game_state_v875
     )
 
-    # Preserve v8.50's public hook identity while removing its suppression rule.
+    # v8.50 still suppresses duplicate parent-side effectiveness lines. The
+    # dedicated worker bypasses that suppression through _dedicated_emit.
     effectiveness._reporter_emit_line_v850 = _reporter_emit_line_v850
     reporter._emit_line = effectiveness._reporter_emit_line_v850
 
