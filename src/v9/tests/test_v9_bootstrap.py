@@ -8,7 +8,11 @@ from dataclasses import FrozenInstanceError
 from v8.environments.schemas import EnvironmentIdentity
 from v9.environment_registry import EnvironmentIdentityRegistry
 from v9.modalities.symbols import DeterministicSymbolCodec, ModalityId
-from v9.scientific_config import ScientificConfig, write_scientific_config_manifest
+from v9.scientific_config import (
+    BASELINE_GIT_COMMIT,
+    ScientificConfig,
+    write_scientific_config_manifest,
+)
 
 
 class V9BootstrapTests(unittest.TestCase):
@@ -19,6 +23,16 @@ class V9BootstrapTests(unittest.TestCase):
         self.assertEqual(len(first.config_id), 64)
         with self.assertRaises(FrozenInstanceError):
             first.design_version = "changed"  # type: ignore[misc]
+
+    def test_current_capture_records_live_v8_authorities(self) -> None:
+        config = ScientificConfig.capture_current()
+        self.assertEqual(config.implementation_baseline_git_commit, BASELINE_GIT_COMMIT)
+        self.assertIn("information_flow_integrity_v879", config.runtime_stack_layers)
+        self.assertGreaterEqual(len(config.arena_packet_sizes), 4)
+        self.assertGreaterEqual(len(config.arena_record_sizes), 3)
+        self.assertTrue(all(size > 0 for _name, size in config.arena_packet_sizes))
+        self.assertTrue(all(size > 0 for _name, size in config.arena_record_sizes))
+        self.assertIn("v8.cli_v819.main", config.default_cli_entrypoint)
 
     def test_manifest_rejects_different_config_in_same_run_root(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
