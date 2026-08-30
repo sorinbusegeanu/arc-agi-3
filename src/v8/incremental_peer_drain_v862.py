@@ -3,10 +3,10 @@ from __future__ import annotations
 """v8.62: bounded incremental peer processing and finite post-sampling drain.
 
 The historical peer pass materializes the complete node/edge graph before doing any
-work.  That is acceptable for small graphs but makes one peer pass effectively
-uninterruptible once the graph reaches millions of rows.  v8.62 keeps the existing
+work. That is acceptable for small graphs but makes one peer pass effectively
+uninterruptible once the graph reaches millions of rows. v8.62 keeps the existing
 peer semantics and authority chain while feeding the historical pass bounded,
-coherent arena slices.  Scan offsets are stored in the already-persisted ``_seen``
+coherent arena slices. Scan offsets are stored in the already-persisted ``_seen``
 map, so interrupted maintenance resumes on the next run without a full rescan.
 """
 
@@ -95,6 +95,16 @@ def _save_offset(supervisor, key, value: int) -> None:
         seen[key] = max(int(seen.get(key, 0)), max(0, int(value)))
 
 
+def _arena_backed(values) -> bool:
+    values = tuple(values)
+    return bool(values) and all(
+        hasattr(value, "count")
+        and hasattr(value, "read")
+        and hasattr(value, "sequence")
+        for value in values
+    )
+
+
 def _peer_run_once_v862(self):
     view = getattr(self, "_v813_live_read_view", None) or getattr(self, "read_view", None)
     if view is None:
@@ -102,7 +112,10 @@ def _peer_run_once_v862(self):
 
     node_arenas = tuple(getattr(view, "_nodes", ()))
     edge_arenas = tuple(getattr(view, "_edges", ()))
-    if not node_arenas:
+    # Several scientific unit fixtures intentionally expose already-materialized
+    # NodeRecord/EdgeRecord tuples here. They are small and must retain historical
+    # behavior; only production shared arenas need incremental slicing.
+    if not _arena_backed(node_arenas) or (edge_arenas and not _arena_backed(edge_arenas)):
         return _BASE_PEER_RUN_ONCE(self)
 
     node_rows, node_offset, node_wrapped = _bounded_arena_slice(
@@ -114,8 +127,6 @@ def _peer_run_once_v862(self):
     _save_offset(self, _NODE_OFFSET_KEY, node_offset)
     _save_offset(self, _EDGE_OFFSET_KEY, edge_offset)
 
-    # Preserve the historical analyses, but make every graph accessor used during
-    # this pass see only the coherent bounded cut. Small graphs still see all rows.
     original_nodes = view.node_records
     original_edges = view.edge_records
     before_cycles = int(getattr(self, "_cycles", 0))
@@ -146,8 +157,7 @@ def _peer_run_once_v862(self):
     else:
         # v8.41 marks an input token complete when the delegated cycle counter or
         # developmental cut advances. Keep both unchanged until one bounded sweep
-        # has actually completed, allowing the next interval to consume the next
-        # slice even when the graph token itself is unchanged.
+        # has completed so the next interval consumes the next slice.
         self._cycles = before_cycles
         if hasattr(self, "_last_developmental_cut"):
             self._last_developmental_cut = before_cut
@@ -162,9 +172,9 @@ def _runtime_wait_quiescent_v862(
     resume_peers: bool = True,
     settle_peers: bool = True,
 ):
-    # Once sampling/admission has ended, quiescence means that already-admitted
-    # canonical work is drained. It must not mean recursively deriving the entire
-    # graph to a peer fixed point. Peer scan offsets are durable and resume later.
+    # After sampling/admission ends, quiescence means already-admitted canonical
+    # work is drained. It must not recursively derive the entire graph to a fixed
+    # point. Persisted peer offsets resume unfinished maintenance on the next run.
     if bool(getattr(self, "_sampling_complete", False)) or not bool(
         getattr(self, "_accepting", True)
     ):
@@ -186,8 +196,6 @@ def install_incremental_peer_drain_v862() -> None:
     from v8 import runtime_scaling_v841 as v841
     from v8.runtime import ContinuousMemoryRuntime
 
-    # Insert below v8.41's unchanged public token/cancellation wrapper. This keeps
-    # v8.45 snapshot locking and all historical peer authority identities intact.
     _BASE_PEER_RUN_ONCE = v841._BASE_PEER_RUN_ONCE
     v841._BASE_PEER_RUN_ONCE = _peer_run_once_v862
 
