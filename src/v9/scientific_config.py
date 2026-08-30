@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-BASELINE_GIT_COMMIT = "fce90e923d321c506da9d1fbd0f9fa21209b49f4"
+BASELINE_GIT_COMMIT = "bdffa0ae3e199e2d76a925645eecb114b2cd9b16"
 PLANNED_BASELINE_GIT_COMMIT = "429842c7ff443a450c836a48509ce85062fcb1f1"
 
 
@@ -70,6 +70,7 @@ class ScientificConfig:
             "mixed_research_runtime_integrity_v876",
             "generic_result_flush_v877",
             "research_integrity_v878",
+            "information_flow_integrity_v879",
         )
         sizes = (
             ("EXPERIENCE_PACKET_SIZE", int(model.EXPERIENCE_PACKET_SIZE)),
