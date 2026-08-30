@@ -95,7 +95,8 @@ def _role_propose_v879(self, rows, edges):
 
 
 def _world_propose_v879(self, rows, edges=()):
-    result = tuple(_BASE_WORLD_PROPOSE(self, rows, edges))
+    del edges
+    result = tuple(_BASE_WORLD_PROPOSE(self, rows))
     self._v879_world_parents = {
         component.uid: tuple(component.consequences)
         for component in result
