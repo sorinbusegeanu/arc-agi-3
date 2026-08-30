@@ -56,18 +56,30 @@ class V9MultimodalTimelineTests(unittest.TestCase):
         events = (
             PassiveWorldEvent(_identity(1, ModalityId.WORLD), 11, 111),
             PassiveSymbolEvent(
-                _identity(2, ModalityId.SYMBOL), codec.vocabulary_id, codec.stream_id("s"), codec.symbol_id("A"), 0
+                _identity(2, ModalityId.SYMBOL),
+                codec.vocabulary_id,
+                codec.stream_id("s"),
+                codec.symbol_id("A"),
+                0,
             ),
             PassiveSymbolEvent(
-                _identity(3, ModalityId.SYMBOL), codec.vocabulary_id, codec.stream_id("s"), codec.symbol_id("B"), 1
+                _identity(3, ModalityId.SYMBOL),
+                codec.vocabulary_id,
+                codec.stream_id("s"),
+                codec.symbol_id("B"),
+                1,
             ),
             InteractionTimelineEvent(_identity(4, ModalityId.WORLD), _experience(4)),
             PassiveWorldEvent(_identity(5, ModalityId.WORLD), 11, 112),
         )
         self.assertTrue(all(timeline.append(event) for event in events))
         popped = tuple(timeline.pop_next() for _ in events)
-        self.assertEqual(tuple(row.identity.producer_sequence for row in popped), (1, 2, 3, 4, 5))
+        self.assertEqual(
+            tuple(row.identity.producer_sequence for row in popped),
+            (1, 2, 3, 4, 5),
+        )
         self.assertEqual(timeline.committed_action_count, 1)
+        self.assertEqual(timeline.pending_passive_count, 0)
 
     def test_passive_symbol_has_no_action_id_and_does_not_increment_action_count(self) -> None:
         codec = DeterministicSymbolCodec("passive")
@@ -123,10 +135,32 @@ class V9MultimodalTimelineTests(unittest.TestCase):
         )
         self.assertEqual(len(admitted), 1)
         self.assertEqual(timeline.pending_count, 1)
+        self.assertEqual(timeline.pending_passive_count, 1)
         self.assertEqual(timeline.telemetry.symbol_limit_dropped, 1)
         self.assertEqual(timeline.telemetry.pending_overflow_dropped, 1)
         self.assertEqual(timeline.telemetry.symbol_observations_seen, 3)
         self.assertEqual(timeline.telemetry.symbol_observations_admitted, 1)
+
+    def test_payload_bound_is_accounted_without_unbounded_retention(self) -> None:
+        codec = DeterministicSymbolCodec("payload")
+        timeline = BoundedMultimodalTimeline(
+            max_symbols_per_window=4,
+            max_symbol_payload_bytes=2,
+            max_pending_passive_events=4,
+        )
+        admitted = timeline.ingest_symbol_window(
+            codec,
+            ("AAA", "B"),
+            stream_name="s",
+            environment_instance_id=77,
+            episode_id=EpisodeId(99),
+            causal_watermark=1,
+            producer_id=4,
+            first_producer_sequence=1,
+        )
+        self.assertEqual(len(admitted), 1)
+        self.assertEqual(admitted[0].position, 1)
+        self.assertEqual(timeline.telemetry.payload_limit_dropped, 1)
 
     def test_legacy_experience_packet_remains_decodable(self) -> None:
         experience = _experience(5)
@@ -134,22 +168,34 @@ class V9MultimodalTimelineTests(unittest.TestCase):
         self.assertIsInstance(restored, InteractionTimelineEvent)
         self.assertEqual(restored.experience, experience)
         self.assertTrue(restored.legacy_episode_unknown)
-        self.assertEqual(restored.identity.environment_instance_id, experience.source_game_hash)
+        self.assertEqual(
+            restored.identity.environment_instance_id,
+            experience.source_game_hash,
+        )
         self.assertEqual(restored.identity.episode_id.value, 0)
 
     def test_pending_timeline_order_survives_state_restore(self) -> None:
         codec = DeterministicSymbolCodec("restart")
         timeline = BoundedMultimodalTimeline(max_pending_passive_events=4)
         first = PassiveSymbolEvent(
-            _identity(1, ModalityId.SYMBOL), codec.vocabulary_id, codec.stream_id("s"), codec.symbol_id("A"), 0
+            _identity(1, ModalityId.SYMBOL),
+            codec.vocabulary_id,
+            codec.stream_id("s"),
+            codec.symbol_id("A"),
+            0,
         )
         second = PassiveSymbolEvent(
-            _identity(2, ModalityId.SYMBOL), codec.vocabulary_id, codec.stream_id("s"), codec.symbol_id("B"), 1
+            _identity(2, ModalityId.SYMBOL),
+            codec.vocabulary_id,
+            codec.stream_id("s"),
+            codec.symbol_id("B"),
+            1,
         )
         timeline.append(first)
         timeline.append(second)
         restored = BoundedMultimodalTimeline.from_state_dict(timeline.state_dict())
         self.assertEqual(restored.pending_events(), (first, second))
+        self.assertEqual(restored.pending_passive_count, 2)
         self.assertEqual(restored.pop_next(), first)
         self.assertEqual(restored.pop_next(), second)
 
