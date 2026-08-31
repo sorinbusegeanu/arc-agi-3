@@ -148,4 +148,7 @@ def install_current_runtime_stack_v88() -> None:
     _installer("generic_result_flush_v877")()
     _installer("research_integrity_v878")()
     _installer("information_flow_integrity_v879")()
+    # v9.3 is one final integration authority over the stable v8.79 stack. It adds
+    # multimodal research semantics without introducing another M0-M7 memory engine.
+    _installer("hydra_v9")()
     _INSTALLED = True
