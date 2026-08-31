@@ -234,6 +234,64 @@ class V088LearningFixTests(unittest.TestCase):
         self.assertEqual(summary.attempted, 0)
         self.assertEqual(summary.completed, 0)
 
+    def test_unexecutable_transfer_candidate_scan_is_bounded(self):
+        candidates = tuple(
+            TransferCandidate(
+                MemoryUid.from_key(
+                    MemoryLevel.M4,
+                    MemoryType.CONCEPT,
+                    (index + 1, 2, 3, 4),
+                ),
+                1,
+                1.0 - index / 1000.0,
+                (101,),
+                MemoryUid.zero(),
+                (),
+            )
+            for index in range(100)
+        )
+
+        class Transfer:
+            def candidates(self, nodes, provenance=None):
+                del nodes, provenance
+                return candidates
+
+        class Peers:
+            transfer = Transfer()
+
+            def record_transfer_trial(self, *args, **kwargs):
+                raise AssertionError("unexecutable candidate must not become a trial")
+
+        class ReadView:
+            def node_records(self):
+                return ()
+
+            def source_games(self, uid):
+                del uid
+                return frozenset()
+
+        class Runtime:
+            peers = Peers()
+            read_view = ReadView()
+
+        with patch(
+            "v8.learning_fixes_v088._held_out_games", return_value=("hold01",)
+        ), patch(
+            "v8.learning_fixes_v088._probe_policy_v088", return_value=(0.0, 0)
+        ) as probe:
+            summary = _run_automatic_transfer_experiments_v088(
+                Runtime(),
+                games=("train01",),
+                env_root=None,
+                seed=0,
+                steps_per_trial=4,
+                max_trials=2,
+            )
+
+        self.assertEqual(summary.attempted, 0)
+        self.assertEqual(summary.completed, 0)
+        self.assertEqual(probe.call_count, 2)
+
     def test_efficiency_is_relative_to_same_outcome_alternatives(self):
         from v8 import behavior_recovery as behavior_module
 

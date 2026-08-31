@@ -266,6 +266,8 @@ def _run_automatic_transfer_experiments_v088(
             provenance=runtime.read_view.source_games,
         )
     attempted = completed = passed = 0
+    eligibility_probes = 0
+    eligibility_probe_limit = max(1, int(max_trials))
     game_hashes = {game: stable_u64(game, person=b"v8-game") for game in holdouts}
 
     for candidate in sorted(candidates, key=lambda row: (-row.structural_score, row.uid)):
@@ -276,6 +278,13 @@ def _run_automatic_transfer_experiments_v088(
             target_hash = int(game_hashes[game_id])
             if target_hash in formation:
                 continue
+            # max_trials bounds completed causal comparisons, but an inapplicable
+            # ancestor does not become a trial. Bound that ranked eligibility scan
+            # separately so a graph containing only unexecutable transfer concepts
+            # cannot hold shutdown in environment probes indefinitely.
+            if eligibility_probes >= eligibility_probe_limit:
+                return ExperimentSummary(attempted, completed, passed)
+            eligibility_probes += 1
             trial_seed = int(seed) + (completed + 1) * 7919
             on_metric, used = _probe_policy_v088(
                 read_view=runtime.read_view,
