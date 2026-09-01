@@ -28,6 +28,7 @@ _EPISODE_STEPS = 0
 _FIRST_WIN_STEPS = 0
 _BEST_WIN_STEPS = 0
 _LAST_WIN_STEPS = 0
+_MAX_TRANSFER_DIAGNOSTIC_ACTIONS = 256
 
 _TRANSFER_EXECUTABLE_FIELDS = (
     "existing M3 or M4 transfer ancestor",
@@ -300,7 +301,11 @@ def _probe_policy_v088(
     wins = failures = level_gain = used = 0
     observed_contexts: set[int] = set()
     observed_actions: set[int] = set()
+    executed_actions: list[int] = []
+    executed_action_count = 0
+    lower_actions_used: set[int] = set()
     plan_misses = 0
+    memory_queries = 0
     evidence_cursor = 0
     evidence_used = 0
     evidence_unsupported_steps = 0
@@ -308,20 +313,26 @@ def _probe_policy_v088(
     evidence_actions = tuple(
         int(value) for value in (execution_evidence or {}).get("action_ids", ())
     )
+    initial_state_signature = None
+    initial_available_actions: tuple[int, ...] = ()
     last_levels = int(env.last_levels_completed)
     for _ in range(max(1, int(steps))):
         before = env.observe()
         actions = tuple(sorted(set(int(value) for value in env.available_actions())))
+        if initial_state_signature is None:
+            initial_state_signature = int(structural_grid_signature(before))
+            initial_available_actions = actions
         if not actions:
             env.reset()
             last_levels = int(env.last_levels_completed)
             continue
+        observed_actions.update(actions)
         if required_ancestor is None:
             action = _memory_free_action(actions, rng)
         else:
             context = int(structural_grid_signature(before))
             observed_contexts.add(context)
-            observed_actions.update(actions)
+            memory_queries += 1
             plan = read_view.planned_action(
                 context,
                 actions,
@@ -340,11 +351,15 @@ def _probe_policy_v088(
                     action = int(mapped)
                     used += 1
                     evidence_used += 1
+                    lower_actions_used.add(int(mapped))
             else:
                 action = int(plan.action_id)
                 used += 1
                 planned_strategy_ids.add(str(plan.strategy_uid.hex()))
         env.step(action)
+        executed_action_count += 1
+        if len(executed_actions) < _MAX_TRANSFER_DIAGNOSTIC_ACTIONS:
+            executed_actions.append(int(action))
         if env.last_outcome_polarity == "positive":
             wins += 1
         elif env.last_outcome_polarity == "negative":
@@ -368,6 +383,42 @@ def _probe_policy_v088(
                     ),
                     "execution_evidence_kind": (execution_evidence or {}).get("kind"),
                     "execution_evidence_action_ids": list(evidence_actions[:32]),
+                    "target_world": str(game_id),
+                    "probe_seed": int(seed),
+                    "initial_state_signature": initial_state_signature,
+                    "initial_available_action_ids": list(initial_available_actions),
+                    "executed_target_actions": list(executed_actions),
+                    "executed_target_action_count": int(executed_action_count),
+                    "executed_target_actions_truncated": bool(
+                        executed_action_count > len(executed_actions)
+                    ),
+                    "memory_policy_enabled": required_ancestor is not None,
+                    "required_ancestor_id": _uid_value(required_ancestor),
+                    "target_memory_query_count": int(memory_queries),
+                    "target_memory_leakage": False,
+                    "outcome": {
+                        "wins": int(wins),
+                        "failures": int(failures),
+                        "level_gain": int(level_gain),
+                    },
+                    "score": float(metric),
+                    "grounded_source_memory_ids_actually_used": (
+                        list(
+                            (execution_evidence or {}).get(
+                                "source_grounded_memory_ids", ()
+                            )
+                        )[:8]
+                        if evidence_used > 0
+                        else []
+                    ),
+                    "grounded_correspondence_memory_ids_actually_used": [
+                        str(row.get("memory_id"))
+                        for row in (execution_evidence or {}).get(
+                            "mapped_action_evidence", ()
+                        )
+                        if int(row.get("action_id", 0)) in lower_actions_used
+                        and row.get("memory_id") is not None
+                    ][:8],
                     "observed_context_signatures": sorted(observed_contexts)[:8],
                     "observed_context_buckets": sorted(
                         stable_u64(value, person=b"v8-context")
@@ -485,6 +536,7 @@ def _grounded_lineage_action_evidence(
         return {
             "kind": None,
             "action_ids": [],
+            "action_evidence": [],
             "grounded_memory_ids": [],
             "resolution_status": "required_ancestor_lookup_returned_none",
             "failure_reason": "required_ancestor_lookup_returned_none",
@@ -531,6 +583,7 @@ def _grounded_lineage_action_evidence(
         key=lambda row: (-int(row.support_count), -int(row.updated_watermark), row.uid)
     )
     actions = []
+    action_evidence = []
     seen_actions: set[int] = set()
     for row in grounded:
         action = signed_u64(int(row.key_parts[1]))
@@ -538,12 +591,16 @@ def _grounded_lineage_action_evidence(
             continue
         seen_actions.add(action)
         actions.append(action)
+        action_evidence.append(
+            {"action_id": int(action), "memory_id": _uid_value(row.uid)}
+        )
         if len(actions) >= 64:
             break
     if not actions:
         return {
             "kind": None,
             "action_ids": [],
+            "action_evidence": [],
             "grounded_memory_ids": [],
             "resolution_status": "no_grounded_action_evidence_in_lineage",
             "failure_reason": "no_grounded_action_evidence_in_lineage",
@@ -551,7 +608,10 @@ def _grounded_lineage_action_evidence(
     return {
         "kind": "grounded_lineage",
         "action_ids": actions,
-        "grounded_memory_ids": [_uid_value(row.uid) for row in grounded[:8]],
+        "action_evidence": action_evidence,
+        "grounded_memory_ids": [
+            str(row["memory_id"]) for row in action_evidence[:8]
+        ],
         "grounded_memory_count": len(grounded),
         "resolution_status": "grounded_action_evidence_resolved",
         "failure_reason": None,
@@ -856,10 +916,10 @@ def _transfer_execution_evidence(
     candidate,
     source_trajectories: dict[int, dict[str, object]],
 ) -> dict[str, object]:
-    grounded = _grounded_lineage_action_evidence(
+    source_grounded = _grounded_lineage_action_evidence(
         read_view, nodes, edges, candidate.uid
     )
-    trajectory = next(
+    source_trajectory = next(
         (
             source_trajectories[int(world)]
             for world in candidate.formation_games
@@ -867,40 +927,111 @@ def _transfer_execution_evidence(
         ),
         None,
     )
-    actions = []
-    seen: set[int] = set()
-    for value in (
-        *grounded.get("action_ids", ()),
-        *((trajectory or {}).get("action_ids", ())),
-    ):
-        action = int(value)
-        if action not in seen:
-            seen.add(action)
-            actions.append(action)
-    if actions:
-        if grounded.get("action_ids") and trajectory is not None:
-            kind = "grounded_lineage_and_source_trajectory"
-        elif grounded.get("action_ids"):
-            kind = "grounded_lineage"
-        else:
-            kind = "source_trajectory"
+    source_actions = tuple(int(value) for value in source_grounded.get("action_ids", ()))
+    source_kind = "grounded_source_lineage"
+    if not source_actions and source_trajectory is not None:
+        source_actions = tuple(
+            int(value) for value in source_trajectory.get("action_ids", ())
+        )
+        source_kind = "replayable_source_trajectory"
+    if not source_actions:
         return {
-            **grounded,
-            "kind": kind,
-            "action_ids": actions[:64],
-            "source_trajectory": trajectory,
-            "resolution_status": "lower_level_transfer_evidence_resolved",
-            "failure_reason": None,
+            **source_grounded,
+            "kind": None,
+            "action_ids": [],
+            "source_action_sequence": [],
+            "source_trajectory": None,
+            "correspondence_conditioned_mapping": False,
+            "resolution_status": "no_executable_lower_level_transfer_evidence",
+            "failure_reason": (
+                "no_grounded_action_evidence_in_lineage_and_no_replayable_source_trajectory"
+            ),
         }
-    return {
-        **grounded,
-        "kind": None,
-        "action_ids": [],
-        "source_trajectory": None,
-        "resolution_status": "no_executable_lower_level_transfer_evidence",
-        "failure_reason": (
-            "no_grounded_action_evidence_in_lineage_and_no_replayable_source_trajectory"
+
+    correspondence_uid = candidate.correspondence_uid
+    correspondence_grounded = _grounded_lineage_action_evidence(
+        read_view, nodes, edges, correspondence_uid
+    )
+    correspondence_trajectory = next(
+        (
+            source_trajectories[int(world)]
+            for world in candidate.correspondence_games
+            if int(world) in source_trajectories
         ),
+        None,
+    )
+    mapped_actions = tuple(
+        int(value) for value in correspondence_grounded.get("action_ids", ())
+    )
+    mapped_kind = "grounded_correspondence_lineage"
+    mapped_action_evidence = list(correspondence_grounded.get("action_evidence", ()))
+    if not mapped_actions and correspondence_trajectory is not None:
+        mapped_actions = tuple(
+            int(value) for value in correspondence_trajectory.get("action_ids", ())
+        )
+        mapped_kind = "replayable_correspondence_trajectory"
+        mapped_action_evidence = [
+            {
+                "action_id": int(value),
+                "memory_id": None,
+                "trajectory_id": correspondence_trajectory.get("trajectory_id"),
+            }
+            for value in mapped_actions
+        ]
+    if not mapped_actions:
+        return {
+            **source_grounded,
+            "kind": None,
+            "action_ids": [],
+            "source_action_sequence": list(source_actions[:64]),
+            "source_evidence_kind": source_kind,
+            "source_grounded_memory_ids": list(
+                source_grounded.get("grounded_memory_ids", ())
+            )[:8],
+            "source_trajectory": source_trajectory,
+            "correspondence_ancestor_id": _uid_value(correspondence_uid),
+            "correspondence_grounded_memory_ids": [],
+            "correspondence_trajectory": None,
+            "correspondence_conditioned_mapping": False,
+            "resolution_status": "correspondence_action_mapping_unresolved",
+            "failure_reason": (
+                "no_grounded_action_evidence_in_correspondence_lineage_and_"
+                "no_replayable_correspondence_trajectory"
+            ),
+        }
+
+    mapping = {
+        "kind": "formal_correspondence_to_grounded_counterpart_lineage",
+        "source_ancestor_id": _uid_value(candidate.uid),
+        "correspondence_ancestor_id": _uid_value(correspondence_uid),
+        "correspondence_score": float(candidate.structural_score),
+        "source_action_sequence": list(source_actions[:64]),
+        "mapped_action_sequence": list(mapped_actions[:64]),
+        "selection_rule": (
+            "execute existing grounded actions from the formally corresponding "
+            "ancestor lineage; target availability may only filter these actions"
+        ),
+    }
+    return {
+        "kind": mapped_kind,
+        "action_ids": list(mapped_actions[:64]),
+        "mapped_action_evidence": mapped_action_evidence[:64],
+        "source_action_sequence": list(source_actions[:64]),
+        "source_evidence_kind": source_kind,
+        "source_grounded_memory_ids": list(
+            source_grounded.get("grounded_memory_ids", ())
+        )[:8],
+        "source_trajectory": source_trajectory,
+        "correspondence_ancestor_id": _uid_value(correspondence_uid),
+        "correspondence_grounded_memory_ids": list(
+            correspondence_grounded.get("grounded_memory_ids", ())
+        )[:8],
+        "correspondence_trajectory": correspondence_trajectory,
+        "correspondence_mapping": mapping,
+        "correspondence_conditioned_mapping": True,
+        "generic_source_actions_reused_without_correspondence": False,
+        "resolution_status": "correspondence_conditioned_transfer_evidence_resolved",
+        "failure_reason": None,
     }
 
 
@@ -1137,6 +1268,62 @@ def _target_resolution_event(
     }
 
 
+def _transfer_trial_failure_reason(trial, threshold: float) -> str | None:
+    if bool(trial.passed):
+        return None
+    effect = float(trial.effect)
+    if effect == float(threshold):
+        return "transfer_effect_equal_to_existing_threshold"
+    if effect < float(threshold):
+        return "transfer_effect_below_existing_threshold"
+    return "transfer_trial_not_held_out"
+
+
+def _matched_probe_diagnostic(
+    intervention: dict[str, object],
+    control: dict[str, object],
+) -> dict[str, object]:
+    same_target = intervention.get("target_world") == control.get("target_world")
+    same_seed = intervention.get("probe_seed") == control.get("probe_seed")
+    same_horizon = intervention.get("probe_steps") == control.get("probe_steps")
+    same_initial_state = (
+        intervention.get("initial_state_signature")
+        == control.get("initial_state_signature")
+    )
+    same_initial_actions = (
+        intervention.get("initial_available_action_ids")
+        == control.get("initial_available_action_ids")
+    )
+    control_memory_free = (
+        control.get("memory_policy_enabled") is False
+        and int(control.get("target_memory_query_count", 0)) == 0
+        and control.get("execution_evidence_kind") is None
+    )
+    return {
+        "same_target_world": bool(same_target),
+        "same_initial_target_state": bool(same_initial_state),
+        "same_initial_available_actions": bool(same_initial_actions),
+        "same_seed": bool(same_seed),
+        "same_horizon": bool(same_horizon),
+        "intervention_memory_policy_enabled": bool(
+            intervention.get("memory_policy_enabled")
+        ),
+        "control_memory_policy_enabled": bool(control.get("memory_policy_enabled")),
+        "control_target_memory_query_count": int(
+            control.get("target_memory_query_count", 0)
+        ),
+        "control_target_memory_leakage": not bool(control_memory_free),
+        "only_transfer_policy_differs": bool(
+            same_target
+            and same_initial_state
+            and same_initial_actions
+            and same_seed
+            and same_horizon
+            and control_memory_free
+        ),
+    }
+
+
 def _run_automatic_transfer_experiments_v088(
     runtime,
     *,
@@ -1195,6 +1382,7 @@ def _run_automatic_transfer_experiments_v088(
     executable_reference = _executable_reference(runtime.read_view, nodes)
     candidate_execution: dict[MemoryUid, dict[str, object]] = {}
     candidate_evidence: dict[MemoryUid, dict[str, object]] = {}
+    mapped_sequence_targets: dict[tuple[int, ...], set[str]] = {}
 
     def reject(reason: str) -> None:
         scheduling_rejections[reason] = scheduling_rejections.get(reason, 0) + 1
@@ -1371,6 +1559,7 @@ def _run_automatic_transfer_experiments_v088(
                 continue
             eligible_target_worlds += 1
             attempted += 1
+            control_diagnostic: dict[str, object] = {}
             off_metric, _ = _probe_policy_v088(
                 read_view=runtime.read_view,
                 game_id=game_id,
@@ -1378,6 +1567,7 @@ def _run_automatic_transfer_experiments_v088(
                 seed=trial_seed,
                 steps=steps_per_trial,
                 required_ancestor=None,
+                diagnostic=control_diagnostic,
             )
             trial = runtime.peers.record_transfer_trial(
                 candidate.uid,
@@ -1387,6 +1577,121 @@ def _run_automatic_transfer_experiments_v088(
                 formation_games=formation,
                 intervention="matched_arc_target_memory_vs_memory_free",
             )
+            threshold = float(runtime.peers.transfer.effect_threshold)
+            failure_reason = _transfer_trial_failure_reason(trial, threshold)
+            mapped_sequence = tuple(
+                int(value) for value in execution_evidence.get("action_ids", ())
+            )
+            prior_mapping_targets = mapped_sequence_targets.setdefault(
+                mapped_sequence, set()
+            )
+            reused_mapping = bool(
+                prior_mapping_targets and str(game_id) not in prior_mapping_targets
+            )
+            matched_control = _matched_probe_diagnostic(
+                probe_diagnostic, control_diagnostic
+            )
+            flow.emit_bounded(
+                "transfer",
+                "transfer_trial_evaluation",
+                input_count=1,
+                output_count=int(trial.passed),
+                rejection_counts=({failure_reason: 1} if failure_reason else {}),
+                examples=(
+                    {
+                        "source_ancestor_id": _uid_value(candidate.uid),
+                        "target_world": str(game_id),
+                        "computed_transfer_effect": float(trial.effect),
+                        "passed": bool(trial.passed),
+                    },
+                ),
+                fields={
+                    "source_ancestor_id": _uid_value(candidate.uid),
+                    "source_ancestor_level": _enum_name(
+                        MemoryLevel, getattr(by_uid.get(candidate.uid), "level", -1)
+                    ),
+                    "grounded_source_memory_ids_actually_used": list(
+                        probe_diagnostic.get(
+                            "grounded_source_memory_ids_actually_used", ()
+                        )
+                    ),
+                    "grounded_correspondence_memory_ids_actually_used": list(
+                        probe_diagnostic.get(
+                            "grounded_correspondence_memory_ids_actually_used", ()
+                        )
+                    ),
+                    "exact_source_action_sequence": list(
+                        execution_evidence.get("source_action_sequence", ())
+                    ),
+                    "exact_actions_executed_on_target": list(
+                        probe_diagnostic.get("executed_target_actions", ())
+                    ),
+                    "correspondence_ancestor_id": _uid_value(
+                        candidate.correspondence_uid
+                    ),
+                    "correspondence_score": float(candidate.structural_score),
+                    "correspondence_mapping": dict(
+                        execution_evidence.get("correspondence_mapping", {})
+                    ),
+                    "correspondence_conditioned_mapping": bool(
+                        execution_evidence.get("correspondence_conditioned_mapping")
+                    ),
+                    "generic_source_actions_reused_without_correspondence": bool(
+                        execution_evidence.get(
+                            "generic_source_actions_reused_without_correspondence"
+                        )
+                    ),
+                    "mapped_sequence_reused_across_distinct_targets": reused_mapping,
+                    "prior_targets_with_same_mapped_sequence": sorted(
+                        prior_mapping_targets
+                    )[:8],
+                    "target_world": str(game_id),
+                    "target_world_hash": int(target_hash),
+                    "intervention": {
+                        "outcome": dict(probe_diagnostic.get("outcome", {})),
+                        "score": float(on_metric),
+                        "seed": int(trial_seed),
+                        "horizon": int(steps_per_trial),
+                        "initial_state_signature": probe_diagnostic.get(
+                            "initial_state_signature"
+                        ),
+                        "initial_available_action_ids": list(
+                            probe_diagnostic.get("initial_available_action_ids", ())
+                        ),
+                        "target_memory_query_count": int(
+                            probe_diagnostic.get("target_memory_query_count", 0)
+                        ),
+                    },
+                    "matched_memory_free_control": {
+                        "outcome": dict(control_diagnostic.get("outcome", {})),
+                        "score": float(off_metric),
+                        "seed": int(trial_seed),
+                        "horizon": int(steps_per_trial),
+                        "initial_state_signature": control_diagnostic.get(
+                            "initial_state_signature"
+                        ),
+                        "initial_available_action_ids": list(
+                            control_diagnostic.get("initial_available_action_ids", ())
+                        ),
+                        "actions": list(
+                            control_diagnostic.get("executed_target_actions", ())
+                        ),
+                        "target_memory_query_count": int(
+                            control_diagnostic.get("target_memory_query_count", 0)
+                        ),
+                        "target_memory_leakage": bool(
+                            matched_control["control_target_memory_leakage"]
+                        ),
+                    },
+                    "matched_control_checks": matched_control,
+                    "computed_transfer_effect": float(trial.effect),
+                    "existing_pass_threshold": threshold,
+                    "pass_predicate": "held_out and effect > effect_threshold",
+                    "passed": bool(trial.passed),
+                    "exact_failure_reason": failure_reason,
+                },
+            )
+            prior_mapping_targets.add(str(game_id))
             completed += 1
             passed += int(trial.passed)
             add_example(

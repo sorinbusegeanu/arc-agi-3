@@ -60,6 +60,10 @@ def _candidate(row: NodeRecord) -> TransferCandidate:
     )
 
 
+def _correspondence_ancestor(index: int = 999) -> NodeRecord:
+    return _memory(index, MemoryLevel.M3, MemoryType.ROLE, (999,))
+
+
 def _empty_inventory() -> dict[str, object]:
     return {
         "identity_index": "GAME_PROVENANCE target UID low word",
@@ -318,6 +322,31 @@ class _TransferProbeEnvironment:
         return ((0,),)
 
 
+class _EffectProbeEnvironment:
+    def __init__(self, *, game_id, seed, **_kwargs):
+        self.game_id = str(game_id)
+        self.seed = int(seed)
+        self.last_levels_completed = 0
+        self.last_outcome_polarity = "neutral"
+        self.actions = []
+
+    def observe(self):
+        return ((0,),)
+
+    def available_actions(self):
+        return (1, 2)
+
+    def step(self, action):
+        action = int(action)
+        self.actions.append(action)
+        self.last_outcome_polarity = "positive" if action == 2 else "neutral"
+        return ((action,),)
+
+    def reset(self):
+        self.last_outcome_polarity = "neutral"
+        return ((0,),)
+
+
 def _transfer_runtime(candidate_row, lineage_rows, parents):
     candidate = _candidate(candidate_row)
     transfer = TransferValidator()
@@ -363,13 +392,28 @@ def test_grounded_m3_and_m4_lineage_schedule_without_m7() -> None:
     )
     role = _memory(61, MemoryLevel.M3, MemoryType.ROLE)
     concept = _memory(62, MemoryLevel.M4, MemoryType.CONCEPT)
+    mapped = _memory(
+        63,
+        MemoryLevel.M1,
+        MemoryType.CONTINGENCY,
+        (401, 2, 402, 403),
+    )
+    correspondence = _correspondence_ancestor()
 
     for candidate_row, rows, parents in (
-        (role, (grounded, role), {role.uid: {grounded.uid}}),
+        (
+            role,
+            (grounded, mapped, role, correspondence),
+            {role.uid: {grounded.uid}, correspondence.uid: {mapped.uid}},
+        ),
         (
             concept,
-            (grounded, role, concept),
-            {concept.uid: {role.uid}, role.uid: {grounded.uid}},
+            (grounded, mapped, role, concept, correspondence),
+            {
+                concept.uid: {role.uid},
+                role.uid: {grounded.uid},
+                correspondence.uid: {mapped.uid},
+            },
         ),
     ):
         with tempfile.TemporaryDirectory() as raw_root, patch.dict(
@@ -449,7 +493,12 @@ def test_replayable_source_trajectory_can_schedule_without_m7() -> None:
                             "trajectory_id": "source-win",
                             "successes": 1,
                             "levels": [{"level": 0, "actions": [2]}],
-                        }
+                        },
+                        "correspondence": {
+                            "trajectory_id": "correspondence-win",
+                            "successes": 1,
+                            "levels": [{"level": 0, "actions": [2]}],
+                        },
                     },
                 }
             ),
@@ -479,6 +528,13 @@ def test_grounded_actions_unsupported_by_target_are_rejected_exactly() -> None:
         (101, 9, 202, 303),
     )
     ancestor = _memory(77, MemoryLevel.M3, MemoryType.ROLE)
+    mapped = _memory(
+        78,
+        MemoryLevel.M1,
+        MemoryType.CONTINGENCY,
+        (401, 9, 402, 403),
+    )
+    correspondence = _correspondence_ancestor()
     with tempfile.TemporaryDirectory() as raw_root, patch.dict(
         os.environ, {"ARC_AGI3_V8_ROOT": raw_root}, clear=False
     ), patch.object(
@@ -489,8 +545,11 @@ def test_grounded_actions_unsupported_by_target_are_rejected_exactly() -> None:
         flow.reset_for_tests()
         runtime, recorded, _evidence = _transfer_runtime(
             ancestor,
-            (grounded, ancestor),
-            {ancestor.uid: {grounded.uid}},
+            (grounded, mapped, ancestor, correspondence),
+            {
+                ancestor.uid: {grounded.uid},
+                correspondence.uid: {mapped.uid},
+            },
         )
         result = learning._run_automatic_transfer_experiments_v088(
             runtime,
@@ -588,3 +647,131 @@ def test_existing_m7_plan_remains_first_execution_path() -> None:
     assert used == 4
     assert diagnostic["m7_planned_steps"] == 4
     assert diagnostic["lower_level_evidence_steps"] == 0
+
+
+def test_correspondence_conditions_actions_and_positive_effect_passes() -> None:
+    source_grounded = _memory(
+        90,
+        MemoryLevel.M1,
+        MemoryType.CONTINGENCY,
+        (101, 9, 202, 303),
+    )
+    ancestor = _memory(91, MemoryLevel.M3, MemoryType.ROLE)
+    mapped_grounded = _memory(
+        92,
+        MemoryLevel.M1,
+        MemoryType.CONTINGENCY,
+        (401, 2, 402, 403),
+    )
+    correspondence = _correspondence_ancestor()
+    rows = (source_grounded, mapped_grounded, ancestor, correspondence)
+    parents = {
+        ancestor.uid: {source_grounded.uid},
+        correspondence.uid: {mapped_grounded.uid},
+    }
+
+    with tempfile.TemporaryDirectory() as raw_root, patch.dict(
+        os.environ, {"ARC_AGI3_V8_ROOT": raw_root}, clear=False
+    ), patch.object(
+        learning, "_held_out_games", return_value=("target",)
+    ), patch.object(
+        learning, "_memory_free_action", return_value=1
+    ), patch(
+        "v7.environment.arc_adapter.ArcGridEnvironment", _EffectProbeEnvironment
+    ):
+        flow.reset_for_tests()
+        runtime, recorded, _evidence = _transfer_runtime(ancestor, rows, parents)
+        result = learning._run_automatic_transfer_experiments_v088(
+            runtime,
+            games=("source",),
+            env_root=None,
+            seed=9,
+            steps_per_trial=4,
+            max_trials=1,
+        )
+        records = [
+            json.loads(line)
+            for line in (Path(raw_root) / flow.LOG_NAME)
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+
+    evaluation = next(
+        row for row in records if row["stage"] == "transfer_trial_evaluation"
+    )
+    scheduling = next(
+        row for row in records if row["stage"] == "transfer_experiment_scheduling"
+    )
+    assert (result.attempted, result.completed, result.passed) == (1, 1, 1)
+    assert len(recorded) == 1
+    assert recorded[0].effect == 5.0
+    assert recorded[0].passed is True
+    assert scheduling["examples"][0]["scheduler_decision"] == "transfer_trial_pass"
+
+    assert evaluation["exact_source_action_sequence"] == [9]
+    assert evaluation["exact_actions_executed_on_target"] == [2, 2, 2, 2]
+    assert evaluation["correspondence_mapping"]["mapped_action_sequence"] == [2]
+    assert evaluation["correspondence_conditioned_mapping"] is True
+    assert evaluation["generic_source_actions_reused_without_correspondence"] is False
+    assert evaluation["grounded_source_memory_ids_actually_used"] == [
+        source_grounded.uid.hex()
+    ]
+    assert evaluation["grounded_correspondence_memory_ids_actually_used"] == [
+        mapped_grounded.uid.hex()
+    ]
+    assert evaluation["intervention"]["score"] == 5.0
+    assert evaluation["matched_memory_free_control"]["score"] == 0.0
+    assert evaluation["matched_memory_free_control"]["actions"] == [1, 1, 1, 1]
+    assert evaluation["intervention"]["initial_state_signature"] == evaluation[
+        "matched_memory_free_control"
+    ]["initial_state_signature"]
+    assert evaluation["intervention"]["initial_available_action_ids"] == [1, 2]
+    assert evaluation["matched_memory_free_control"][
+        "initial_available_action_ids"
+    ] == [1, 2]
+    assert evaluation["matched_memory_free_control"]["target_memory_query_count"] == 0
+    assert evaluation["matched_memory_free_control"]["target_memory_leakage"] is False
+    assert evaluation["computed_transfer_effect"] == 5.0
+    assert evaluation["existing_pass_threshold"] == 0.0
+    assert evaluation["exact_failure_reason"] is None
+    assert evaluation["matched_control_checks"] == {
+        "same_target_world": True,
+        "same_initial_target_state": True,
+        "same_initial_available_actions": True,
+        "same_seed": True,
+        "same_horizon": True,
+        "intervention_memory_policy_enabled": True,
+        "control_memory_policy_enabled": False,
+        "control_target_memory_query_count": 0,
+        "control_target_memory_leakage": False,
+        "only_transfer_policy_differs": True,
+    }
+
+
+def test_transfer_effect_calculation_preserves_strict_existing_threshold() -> None:
+    uid = MemoryUid.from_key(MemoryLevel.M3, MemoryType.ROLE, (1000,))
+    validator = TransferValidator(effect_threshold=0.0)
+
+    positive = validator.record_trial(
+        uid, target_game_hash=1, metric_on=2.0, metric_off=0.5
+    )
+    zero = validator.record_trial(
+        uid, target_game_hash=2, metric_on=1.0, metric_off=1.0
+    )
+    negative = validator.record_trial(
+        uid, target_game_hash=3, metric_on=0.25, metric_off=1.0
+    )
+
+    assert positive.effect == 1.5
+    assert positive.passed is True
+    assert learning._transfer_trial_failure_reason(positive, 0.0) is None
+    assert zero.effect == 0.0
+    assert zero.passed is False
+    assert learning._transfer_trial_failure_reason(zero, 0.0) == (
+        "transfer_effect_equal_to_existing_threshold"
+    )
+    assert negative.effect == -0.75
+    assert negative.passed is False
+    assert learning._transfer_trial_failure_reason(negative, 0.0) == (
+        "transfer_effect_below_existing_threshold"
+    )
