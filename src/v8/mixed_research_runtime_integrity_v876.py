@@ -166,6 +166,9 @@ def _run_mixed_actor_jobs_v875(runtime, jobs, **kwargs):
 
     v875._publish_final_job_progress(reporting_queue, jobs, result)
     _request_final_peer_drain_v875(runtime)
+    from v8 import lease_dispatch_continuity_v839 as lease
+
+    lease._finish_actor_job_maintenance_v839(runtime)
     if reporting_queue is not None:
         from v8.reporter import SAMPLING_COMPLETE
 

@@ -172,6 +172,65 @@ class LeaseDispatchContinuityV839Tests(unittest.TestCase):
             runtime._v814_trajectory_optimizer._v841_preserve_inbox_on_shutdown
         )
 
+    def test_deferred_mixed_feedback_flush_is_owned_by_outer_runner(self) -> None:
+        feedback = SimpleNamespace(flush=Mock())
+        peers = SimpleNamespace(wait_idle=Mock())
+        deferred = SimpleNamespace(close=Mock())
+        runtime = SimpleNamespace(
+            _v839_sampling_active=False,
+            _v839_defer_sampling_finish=True,
+            _v839_actor_feedback=feedback,
+            _v839_deferred_retry=deferred,
+            peers=peers,
+        )
+
+        with patch.object(
+            v839, "_BASE_RUN_ACTOR_JOBS", return_value=("done",)
+        ), patch.object(v839, "_BASE_RETRY_DEFERRED"), patch.object(
+            v839, "_request_final_peer_drain"
+        ) as request_final_drain:
+            result = v839._run_actor_jobs_v839(runtime, ())
+
+        self.assertEqual(result, ("done",))
+        request_final_drain.assert_called_once_with(runtime)
+        peers.wait_idle.assert_not_called()
+        feedback.flush.assert_not_called()
+        deferred.close.assert_not_called()
+
+    def test_outer_feedback_maintenance_waits_for_paused_peers_then_flushes(self) -> None:
+        events = []
+        runtime = SimpleNamespace(
+            _v839_actor_feedback=SimpleNamespace(
+                metrics=lambda: (5, 4, 1, 3),
+                flush=lambda: events.append("feedback-flush"),
+            ),
+            _v839_deferred_retry=None,
+            peers=SimpleNamespace(
+                wait_idle=lambda timeout: events.append(("peers-idle", timeout)) or True
+            ),
+        )
+
+        v839._finish_actor_job_maintenance_v839(runtime)
+
+        self.assertEqual(
+            events,
+            [("peers-idle", v839._DRAIN_TIMEOUT_SECONDS), "feedback-flush"],
+        )
+
+    def test_completed_feedback_skips_peer_idle_wait(self) -> None:
+        feedback = SimpleNamespace(metrics=lambda: (4, 4, 0, 2), flush=Mock())
+        peers = SimpleNamespace(wait_idle=Mock())
+        runtime = SimpleNamespace(
+            _v839_actor_feedback=feedback,
+            _v839_deferred_retry=None,
+            peers=peers,
+        )
+
+        v839._finish_actor_job_maintenance_v839(runtime)
+
+        peers.wait_idle.assert_not_called()
+        feedback.flush.assert_called_once_with()
+
     def test_abnormal_runtime_close_aborts_feedback_without_second_drain(self) -> None:
         feedback = SimpleNamespace(abort=Mock(), close=Mock())
         runtime = SimpleNamespace(

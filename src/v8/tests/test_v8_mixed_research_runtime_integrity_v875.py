@@ -95,6 +95,7 @@ class MixedResearchRuntimeIntegrityV875Tests(unittest.TestCase):
     def test_outer_mixed_runner_is_only_sampling_complete_authority(self):
         runtime = _Runtime()
         progress = queue.Queue()
+        completion_events = []
         jobs = (
             actor.ActorJob(1, "tp01", 5, 1),
             actor.ActorJob(2, "FrozenLake-v1", 5, 2),
@@ -111,11 +112,21 @@ class MixedResearchRuntimeIntegrityV875Tests(unittest.TestCase):
             return rows
 
         def final_drain(inner_runtime):
+            completion_events.append("peer-drain")
             inner_runtime._sampling_complete = True
+
+        def finish_maintenance(inner_runtime):
+            self.assertTrue(inner_runtime._sampling_complete)
+            completion_events.append("feedback-drain")
 
         with (
             patch.object(v875, "_BASE_MIXED_RUN", side_effect=base_run),
             patch.object(v875, "_BASE_FINAL_PEER_DRAIN", side_effect=final_drain),
+            patch.object(
+                lease,
+                "_finish_actor_job_maintenance_v839",
+                side_effect=finish_maintenance,
+            ),
         ):
             result = v875._run_mixed_actor_jobs_v875(
                 runtime,
@@ -124,6 +135,7 @@ class MixedResearchRuntimeIntegrityV875Tests(unittest.TestCase):
             )
 
         self.assertEqual(result, rows)
+        self.assertEqual(completion_events, ["peer-drain", "feedback-drain"])
         self.assertTrue(runtime._sampling_complete)
         self.assertTrue(runtime._v839_sampling_done_reported)
         emitted = []

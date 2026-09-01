@@ -343,10 +343,33 @@ def _run_actor_jobs_v839(runtime, jobs, **kwargs):
     # canonical queue during shutdown.
     _request_final_peer_drain(runtime)
 
+    # A mixed ARC+generic run keeps this inner completion provisional until every
+    # environment has stopped producing experience.  The outer mixed runner owns
+    # peer pause/drain and calls this maintenance barrier after that transition.
+    if bool(getattr(runtime, "_v839_defer_sampling_finish", False)):
+        return result
+
+    _finish_actor_job_maintenance_v839(runtime)
+    return result
+
+
+def _finish_actor_job_maintenance_v839(runtime) -> None:
+    """Drain actor feedback only after the completion owner has paused peers."""
     feedback = getattr(runtime, "_v839_actor_feedback", None)
     if feedback is not None:
         peers = getattr(runtime, "peers", None)
-        if peers is not None and not peers.wait_idle(_DRAIN_TIMEOUT_SECONDS):
+        metrics = getattr(feedback, "metrics", None)
+        pending = None
+        if callable(metrics):
+            try:
+                pending = int(metrics()[2])
+            except (IndexError, TypeError, ValueError):
+                pending = None
+        if (
+            peers is not None
+            and pending != 0
+            and not peers.wait_idle(_DRAIN_TIMEOUT_SECONDS)
+        ):
             raise TimeoutError("v8 peers did not become idle before feedback drain")
         feedback.flush()
 
@@ -362,7 +385,6 @@ def _run_actor_jobs_v839(runtime, jobs, **kwargs):
     pending = getattr(runtime, "_v819_deferred_sources", None)
     if isinstance(pending, list) and pending:
         _retry_deferred_batch(runtime, limit=len(pending))
-    return result
 
 
 def _request_final_peer_drain(runtime) -> None:
