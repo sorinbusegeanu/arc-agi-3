@@ -264,6 +264,10 @@ def capture_experiment_start(root: str | Path, *, argv: Sequence[str]) -> Path:
     }
     path = research_root / _BOUNDARY_NAME
     _atomic_json(path, boundary)
+    # The preceding report belongs to the parent experiment. Once its identity
+    # has been captured above, do not leave it visible as if it described the new
+    # run. Successful completion atomically writes this run's replacement.
+    _atomic_text(evidence_path, "")
     return path
 
 

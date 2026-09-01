@@ -43,6 +43,29 @@ def bounded_examples(rows: Iterable[Mapping[str, object]]) -> list[dict[str, obj
     return [dict(row) for row in list(rows)[:MAX_EXAMPLES]]
 
 
+def begin_run(root: str | Path) -> Path:
+    """Start one fresh per-run diagnostic log before worker processes launch."""
+    path_root = Path(root)
+    path = path_root / LOG_NAME
+    root_key = str(path_root)
+    with _lock:
+        path_root.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(
+            path,
+            os.O_CREAT | os.O_TRUNC | os.O_WRONLY,
+            0o644,
+        )
+        os.close(descriptor)
+        _sequence.pop(root_key, None)
+        for key in tuple(_counters):
+            if key[0] == root_key:
+                del _counters[key]
+        for key in tuple(_detail_counts):
+            if key[0] == root_key:
+                del _detail_counts[key]
+    return path
+
+
 def add_counters(subsystem: str, **deltas: int) -> None:
     root = _run_root()
     if root is None:

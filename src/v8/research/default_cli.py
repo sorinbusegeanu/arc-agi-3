@@ -39,6 +39,9 @@ def run_with_default_research(
     if normal_run:
         try:
             capture_experiment_start(root, argv=values)
+            from v8 import information_flow_diagnostics as information_flow
+
+            information_flow.begin_run(root)
         except BaseException as exc:
             print(
                 f'[{time.strftime("%H:%M")}] experiment boundary capture failed: '

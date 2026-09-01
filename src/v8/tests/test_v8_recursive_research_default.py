@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from v8 import information_flow_diagnostics as flow
 from v8.research.contracts import ChainStatus
 from v8.research.default_analysis import derive_chain_evidence
 from v8.research.default_cli import run_with_default_research
@@ -118,6 +121,60 @@ class DefaultRecursiveResearchTests(unittest.TestCase):
             self.assertEqual(result, 0)
             self.assertTrue((root / "research" / EVIDENCE_NAME).is_file())
             self.assertFalse((root / "research" / "LLM_RESEARCH_PACKET.md").exists())
+
+    def test_normal_run_replaces_prior_evidence_and_information_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            research = root / "research"
+            research.mkdir(parents=True)
+            evidence_path = research / EVIDENCE_NAME
+            evidence_path.write_text(
+                "# prior evidence\n- experiment_id: `prior-experiment`\nOLD_EVIDENCE\n",
+                encoding="utf-8",
+            )
+            information_path = root / flow.LOG_NAME
+            information_path.write_text(
+                '{"stage":"OLD_INFORMATION"}\n', encoding="utf-8"
+            )
+
+            def fake_main(_argv):
+                self.assertEqual(evidence_path.read_text(encoding="utf-8"), "")
+                self.assertEqual(information_path.read_text(encoding="utf-8"), "")
+                with patch.dict(
+                    os.environ,
+                    {"ARC_AGI3_V8_ROOT": str(root)},
+                    clear=False,
+                ):
+                    flow.emit(
+                        "transfer",
+                        "CURRENT_INFORMATION",
+                        input_count=1,
+                        output_count=1,
+                    )
+                (root / "v8_run_summary.json").write_text(
+                    json.dumps(self._summary()), encoding="utf-8"
+                )
+                return 0
+
+            result = run_with_default_research(
+                fake_main,
+                [
+                    "continuous-run",
+                    "--root",
+                    str(root),
+                    "--games",
+                    "research_1",
+                ],
+            )
+
+            evidence = evidence_path.read_text(encoding="utf-8")
+            information = information_path.read_text(encoding="utf-8")
+
+        self.assertEqual(result, 0)
+        self.assertNotIn("OLD_EVIDENCE", evidence)
+        self.assertIn("parent_experiment_id: `prior-experiment`", evidence)
+        self.assertNotIn("OLD_INFORMATION", information)
+        self.assertIn("CURRENT_INFORMATION", information)
 
     def test_non_continuous_command_does_not_create_research_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:

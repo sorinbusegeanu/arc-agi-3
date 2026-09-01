@@ -59,6 +59,38 @@ def _records(root: Path, *, stage: str | None = None) -> list[dict[str, object]]
     return rows if stage is None else [row for row in rows if row["stage"] == stage]
 
 
+def test_begin_run_replaces_prior_log_and_resets_process_counters() -> None:
+    with tempfile.TemporaryDirectory() as raw_root, patch.dict(
+        os.environ, {"ARC_AGI3_V8_ROOT": raw_root}, clear=False
+    ):
+        root = Path(raw_root)
+        path = root / flow.LOG_NAME
+        path.write_text('{"stage":"prior-run"}\n', encoding="utf-8")
+        flow.add_counters("transfer", scheduled_trials=7)
+        flow.emit_bounded(
+            "transfer",
+            "bounded-stage",
+            input_count=1,
+            output_count=1,
+        )
+
+        assert flow.begin_run(root) == path
+        assert path.read_text(encoding="utf-8") == ""
+        assert flow.counter_snapshot("transfer") == {}
+        flow.emit(
+            "transfer",
+            "current-run",
+            input_count=1,
+            output_count=1,
+        )
+
+        rows = _records(root)
+
+    assert len(rows) == 1
+    assert rows[0]["stage"] == "current-run"
+    assert rows[0]["sequence"] == 1
+
+
 def test_transfer_candidate_rejections_are_exact_and_reconcile() -> None:
     with tempfile.TemporaryDirectory() as raw_root, patch.dict(
         os.environ, {"ARC_AGI3_V8_ROOT": raw_root}, clear=False
