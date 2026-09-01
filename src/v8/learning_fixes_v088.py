@@ -423,12 +423,29 @@ def _direct_target_memory_inventories(
         by_uid = {row.uid: row for row in nodes}
     wanted = {int(value) for value in target_hashes}
     rows_by_hash: dict[int, list[object]] = {value: [] for value in wanted}
+    seen_by_hash: dict[int, set[MemoryUid]] = {value: set() for value in wanted}
     for uid, games in direct.items():
         row = by_uid.get(uid)
         if row is None:
             continue
         for value in wanted.intersection(int(game) for game in games):
             rows_by_hash[value].append(row)
+            seen_by_hash[value].add(row.uid)
+    source_games = getattr(read_view, "source_games", None)
+    if callable(source_games):
+        for row in nodes:
+            if int(row.level) not in {
+                int(MemoryLevel.M3), int(MemoryLevel.M4), int(MemoryLevel.M7)
+            }:
+                continue
+            try:
+                inherited = wanted.intersection(int(game) for game in source_games(row.uid))
+            except BaseException:
+                continue
+            for value in inherited:
+                if row.uid not in seen_by_hash[value]:
+                    rows_by_hash[value].append(row)
+                    seen_by_hash[value].add(row.uid)
     result: dict[int, dict[str, object]] = {}
     for target_hash, rows in rows_by_hash.items():
         levels: dict[str, int] = {}
@@ -444,7 +461,7 @@ def _direct_target_memory_inventories(
             and len(row.key_parts) >= 2
         ]
         result[target_hash] = {
-            "identity_index": "GAME_PROVENANCE target UID low word",
+            "identity_index": "GAME_PROVENANCE target UID low word plus lineage inheritance",
             "identities_actually_present_count": len(rows),
             "memory_counts_by_level": levels,
             "m3_exists": bool(m3),
