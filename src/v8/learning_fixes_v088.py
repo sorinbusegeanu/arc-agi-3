@@ -602,8 +602,8 @@ def _grounded_lineage_action_evidence(
             "action_ids": [],
             "action_evidence": [],
             "grounded_memory_ids": [],
-            "resolution_status": "no_grounded_action_evidence_in_lineage",
-            "failure_reason": "no_grounded_action_evidence_in_lineage",
+            "resolution_status": "no_grounded_action_evidence",
+            "failure_reason": "no_grounded_action_evidence",
         }
     return {
         "kind": "grounded_lineage",
@@ -693,7 +693,7 @@ def _candidate_execution_snapshot(
         reason = str(
             (execution_evidence or {}).get(
                 "failure_reason",
-                "no_grounded_action_evidence_in_lineage_and_no_replayable_source_trajectory",
+                "no_grounded_action_evidence",
             )
         )
         missing_fields.append(
@@ -943,9 +943,11 @@ def _transfer_execution_evidence(
             "source_trajectory": None,
             "correspondence_conditioned_mapping": False,
             "resolution_status": "no_executable_lower_level_transfer_evidence",
-            "failure_reason": (
-                "no_grounded_action_evidence_in_lineage_and_no_replayable_source_trajectory"
-            ),
+            "failure_reason": "no_grounded_action_evidence",
+            "lower_level_resolution_failures": [
+                "no_grounded_action_evidence",
+                "no_replayable_source_trajectory",
+            ],
         }
 
     correspondence_uid = candidate.correspondence_uid
@@ -994,10 +996,12 @@ def _transfer_execution_evidence(
             "correspondence_trajectory": None,
             "correspondence_conditioned_mapping": False,
             "resolution_status": "correspondence_action_mapping_unresolved",
-            "failure_reason": (
-                "no_grounded_action_evidence_in_correspondence_lineage_and_"
-                "no_replayable_correspondence_trajectory"
-            ),
+            "failure_reason": "no_grounded_action_evidence",
+            "failure_scope": "transfer_correspondence_lineage",
+            "lower_level_resolution_failures": [
+                "no_grounded_action_evidence",
+                "no_replayable_source_trajectory",
+            ],
         }
 
     mapping = {
@@ -1192,12 +1196,15 @@ def _target_resolution_event(
     }
     failure = candidate_snapshot["executable_predicate_failure_reason"]
     missing_fields = list(candidate_snapshot["missing_or_invalid_executable_fields"])
+    target_action_failure_detail = None
     if int(used) <= 0 and failure == "lower_level_transfer_evidence_available_for_target_probe":
         if not probe_diagnostic.get("available_action_ids"):
-            failure = "target_environment_exposed_no_actions"
+            failure = "target_action_unsupported"
+            target_action_failure_detail = "target_environment_exposed_no_actions"
             missing_fields.append("target environment action availability")
         else:
-            failure = "resolved_source_actions_unsupported_by_target_environment"
+            failure = "target_action_unsupported"
+            target_action_failure_detail = "mapped_action_not_in_target_action_set"
             missing_fields.append("source action supported by target environment")
     elif int(used) <= 0 and failure == "executable_m7_descendant_available_for_target_probe":
         cached = candidate_snapshot.get("cached_executable_descendants", [])
@@ -1245,6 +1252,12 @@ def _target_resolution_event(
         ),
         "executable_predicate_result": bool(int(used) > 0),
         "exact_executable_predicate_failure_reason": failure,
+        "target_action_failure_detail": target_action_failure_detail,
+        "lower_level_resolution_failures": list(
+            candidate_snapshot.get("lower_level_execution_evidence", {}).get(
+                "lower_level_resolution_failures", ()
+            )
+        ),
         "required_executable_fields": candidate_snapshot["required_executable_fields"],
         "missing_or_invalid_executable_fields": missing_fields,
         "successful_trajectory": trajectory,
@@ -1261,8 +1274,8 @@ def _target_resolution_event(
             "executable_reference": executable_reference,
             "rejected_reference": ancestor,
             "minimal_structural_difference": (
-                "rejected transfer ancestor has neither usable M7 control nor existing "
-                "grounded source actions supported by the target"
+                "no existing grounded or replayable transfer action was supported "
+                "by the target"
             ),
         },
     }
@@ -1551,7 +1564,7 @@ def _run_automatic_transfer_experiments_v088(
             if used <= 0:
                 rejection_reason = str(
                     resolution.get("exact_executable_predicate_failure_reason")
-                    or "target_memory_not_executable"
+                    or "no_grounded_action_evidence"
                 )
                 reject(rejection_reason)
                 add_example(candidate, game_id, target_hash, eligible=False,

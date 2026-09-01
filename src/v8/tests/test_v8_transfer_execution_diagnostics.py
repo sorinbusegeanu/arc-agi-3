@@ -126,7 +126,7 @@ def test_target_memory_exists_but_fails_executable_predicate() -> None:
 
     assert snapshot["lookup_result_status"] == "found_structural_ancestor"
     assert snapshot["executable_predicate_failure_reason"] == (
-        "no_grounded_action_evidence_in_lineage_and_no_replayable_source_trajectory"
+        "no_grounded_action_evidence"
     )
     assert "grounded lineage action evidence or replayable source trajectory" in snapshot[
         "missing_or_invalid_executable_fields"
@@ -275,7 +275,7 @@ def test_resolution_instrumentation_does_not_change_scheduler_result() -> None:
 
     assert (result.attempted, result.completed, result.passed) == (0, 0, 0)
     assert detail[0]["exact_executable_predicate_failure_reason"] == (
-        "no_grounded_action_evidence_in_lineage_and_no_replayable_source_trajectory"
+        "no_grounded_action_evidence"
     )
     assert detail[0]["target_memory_level"] == "M3"
 
@@ -425,6 +425,9 @@ def test_grounded_m3_and_m4_lineage_schedule_without_m7() -> None:
         ):
             flow.reset_for_tests()
             runtime, recorded, evidence = _transfer_runtime(candidate_row, rows, parents)
+            snapshot = learning._candidate_execution_snapshot(
+                runtime.read_view, rows, candidate_row.uid
+            )
             result = learning._run_automatic_transfer_experiments_v088(
                 runtime,
                 games=("source",),
@@ -435,8 +438,11 @@ def test_grounded_m3_and_m4_lineage_schedule_without_m7() -> None:
             )
 
         assert (result.attempted, result.completed, result.passed) == (1, 1, 0)
+        assert snapshot["m7_descendant_count"] == 0
+        assert snapshot["cached_executable_descendant_count"] == 0
         assert len(recorded) == 1
         assert recorded[0].passed is False
+        assert "transfer_trial_fail" in evidence
         assert "transfer_trial_pass" not in evidence
 
 
@@ -468,9 +474,14 @@ def test_candidate_without_grounded_or_trajectory_evidence_remains_rejected() ->
     assert (result.attempted, result.completed, result.passed) == (0, 0, 0)
     assert not recorded
     assert "transfer_trial_pass" not in evidence
+    assert "transfer_trial_fail" not in evidence
     assert detail[0]["exact_executable_predicate_failure_reason"] == (
-        "no_grounded_action_evidence_in_lineage_and_no_replayable_source_trajectory"
+        "no_grounded_action_evidence"
     )
+    assert detail[0]["lower_level_resolution_failures"] == [
+        "no_grounded_action_evidence",
+        "no_replayable_source_trajectory",
+    ]
 
 
 def test_replayable_source_trajectory_can_schedule_without_m7() -> None:
@@ -543,7 +554,7 @@ def test_grounded_actions_unsupported_by_target_are_rejected_exactly() -> None:
         "v7.environment.arc_adapter.ArcGridEnvironment", _TransferProbeEnvironment
     ):
         flow.reset_for_tests()
-        runtime, recorded, _evidence = _transfer_runtime(
+        runtime, recorded, evidence = _transfer_runtime(
             ancestor,
             (grounded, mapped, ancestor, correspondence),
             {
@@ -567,8 +578,13 @@ def test_grounded_actions_unsupported_by_target_are_rejected_exactly() -> None:
 
     assert (result.attempted, result.completed, result.passed) == (0, 0, 0)
     assert not recorded
+    assert "transfer_trial_pass" not in evidence
+    assert "transfer_trial_fail" not in evidence
     assert detail[0]["exact_executable_predicate_failure_reason"] == (
-        "resolved_source_actions_unsupported_by_target_environment"
+        "target_action_unsupported"
+    )
+    assert detail[0]["target_action_failure_detail"] == (
+        "mapped_action_not_in_target_action_set"
     )
 
 
@@ -680,7 +696,7 @@ def test_correspondence_conditions_actions_and_positive_effect_passes() -> None:
         "v7.environment.arc_adapter.ArcGridEnvironment", _EffectProbeEnvironment
     ):
         flow.reset_for_tests()
-        runtime, recorded, _evidence = _transfer_runtime(ancestor, rows, parents)
+        runtime, recorded, evidence = _transfer_runtime(ancestor, rows, parents)
         result = learning._run_automatic_transfer_experiments_v088(
             runtime,
             games=("source",),
@@ -706,6 +722,7 @@ def test_correspondence_conditions_actions_and_positive_effect_passes() -> None:
     assert len(recorded) == 1
     assert recorded[0].effect == 5.0
     assert recorded[0].passed is True
+    assert "transfer_trial_fail" not in evidence
     assert scheduling["examples"][0]["scheduler_decision"] == "transfer_trial_pass"
 
     assert evaluation["exact_source_action_sequence"] == [9]
