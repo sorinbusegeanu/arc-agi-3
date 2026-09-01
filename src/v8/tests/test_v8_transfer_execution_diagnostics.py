@@ -126,7 +126,7 @@ def test_target_memory_exists_but_fails_executable_predicate() -> None:
 
     assert snapshot["lookup_result_status"] == "found_structural_ancestor"
     assert snapshot["executable_predicate_failure_reason"] == (
-        "no_grounded_action_evidence"
+        "no_grounded_action_evidence_for_transfer_ancestor"
     )
     assert "grounded lineage action evidence or replayable source trajectory" in snapshot[
         "missing_or_invalid_executable_fields"
@@ -275,7 +275,7 @@ def test_resolution_instrumentation_does_not_change_scheduler_result() -> None:
 
     assert (result.attempted, result.completed, result.passed) == (0, 0, 0)
     assert detail[0]["exact_executable_predicate_failure_reason"] == (
-        "no_grounded_action_evidence"
+        "no_grounded_action_evidence_for_transfer_ancestor"
     )
     assert detail[0]["target_memory_level"] == "M3"
 
@@ -383,7 +383,7 @@ def _transfer_runtime(candidate_row, lineage_rows, parents):
     return SimpleNamespace(peers=peers, read_view=View()), recorded, evidence
 
 
-def test_grounded_m3_and_m4_lineage_schedule_without_m7() -> None:
+def test_grounded_m3_lineage_schedules_without_m7() -> None:
     grounded = _memory(
         60,
         MemoryLevel.M1,
@@ -391,59 +391,49 @@ def test_grounded_m3_and_m4_lineage_schedule_without_m7() -> None:
         (101, 2, 202, 303),
     )
     role = _memory(61, MemoryLevel.M3, MemoryType.ROLE)
-    concept = _memory(62, MemoryLevel.M4, MemoryType.CONCEPT)
-    mapped = _memory(
-        63,
-        MemoryLevel.M1,
-        MemoryType.CONTINGENCY,
-        (401, 2, 402, 403),
-    )
-    correspondence = _correspondence_ancestor()
-
-    for candidate_row, rows, parents in (
-        (
-            role,
-            (grounded, mapped, role, correspondence),
-            {role.uid: {grounded.uid}, correspondence.uid: {mapped.uid}},
-        ),
-        (
-            concept,
-            (grounded, mapped, role, concept, correspondence),
-            {
-                concept.uid: {role.uid},
-                role.uid: {grounded.uid},
-                correspondence.uid: {mapped.uid},
-            },
-        ),
+    rows = (grounded, role)
+    with tempfile.TemporaryDirectory() as raw_root, patch.dict(
+        os.environ, {"ARC_AGI3_V8_ROOT": raw_root}, clear=False
+    ), patch.object(
+        learning, "_held_out_games", return_value=("target",)
+    ), patch(
+        "v7.environment.arc_adapter.ArcGridEnvironment", _TransferProbeEnvironment
     ):
-        with tempfile.TemporaryDirectory() as raw_root, patch.dict(
-            os.environ, {"ARC_AGI3_V8_ROOT": raw_root}, clear=False
-        ), patch.object(
-            learning, "_held_out_games", return_value=("target",)
-        ), patch(
-            "v7.environment.arc_adapter.ArcGridEnvironment", _TransferProbeEnvironment
-        ):
-            flow.reset_for_tests()
-            runtime, recorded, evidence = _transfer_runtime(candidate_row, rows, parents)
-            snapshot = learning._candidate_execution_snapshot(
-                runtime.read_view, rows, candidate_row.uid
-            )
-            result = learning._run_automatic_transfer_experiments_v088(
-                runtime,
-                games=("source",),
-                env_root=None,
-                seed=3,
-                steps_per_trial=4,
-                max_trials=1,
-            )
+        flow.reset_for_tests()
+        runtime, recorded, evidence = _transfer_runtime(
+            role, rows, {role.uid: {grounded.uid}}
+        )
+        snapshot = learning._candidate_execution_snapshot(
+            runtime.read_view, rows, role.uid
+        )
+        result = learning._run_automatic_transfer_experiments_v088(
+            runtime,
+            games=("source",),
+            env_root=None,
+            seed=3,
+            steps_per_trial=4,
+            max_trials=1,
+        )
+        records = [
+            json.loads(line)
+            for line in (Path(raw_root) / flow.LOG_NAME)
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
 
-        assert (result.attempted, result.completed, result.passed) == (1, 1, 0)
-        assert snapshot["m7_descendant_count"] == 0
-        assert snapshot["cached_executable_descendant_count"] == 0
-        assert len(recorded) == 1
-        assert recorded[0].passed is False
-        assert "transfer_trial_fail" in evidence
-        assert "transfer_trial_pass" not in evidence
+    resolution = next(
+        row for row in records if row["stage"] == "target_memory_resolution"
+    )
+    assert (result.attempted, result.completed, result.passed) == (1, 1, 0)
+    assert snapshot["m7_descendant_count"] == 0
+    assert snapshot["cached_executable_descendant_count"] == 0
+    assert resolution["probe_observations"]["execution_evidence_kind"] == (
+        "grounded_source_lineage"
+    )
+    assert len(recorded) == 1
+    assert recorded[0].passed is False
+    assert "transfer_trial_fail" in evidence
+    assert "transfer_trial_pass" not in evidence
 
 
 def test_candidate_without_grounded_or_trajectory_evidence_remains_rejected() -> None:
@@ -476,16 +466,16 @@ def test_candidate_without_grounded_or_trajectory_evidence_remains_rejected() ->
     assert "transfer_trial_pass" not in evidence
     assert "transfer_trial_fail" not in evidence
     assert detail[0]["exact_executable_predicate_failure_reason"] == (
-        "no_grounded_action_evidence"
+        "no_grounded_action_evidence_for_transfer_ancestor"
     )
     assert detail[0]["lower_level_resolution_failures"] == [
-        "no_grounded_action_evidence",
+        "no_grounded_action_evidence_for_transfer_ancestor",
         "no_replayable_source_trajectory",
     ]
 
 
-def test_replayable_source_trajectory_can_schedule_without_m7() -> None:
-    ancestor = _memory(75, MemoryLevel.M3, MemoryType.ROLE)
+def test_m4_replayable_source_trajectory_schedules_without_m7() -> None:
+    ancestor = _memory(75, MemoryLevel.M4, MemoryType.CONCEPT)
     with tempfile.TemporaryDirectory() as raw_root, patch.dict(
         os.environ, {"ARC_AGI3_V8_ROOT": raw_root}, clear=False
     ), patch.object(
@@ -505,11 +495,6 @@ def test_replayable_source_trajectory_can_schedule_without_m7() -> None:
                             "successes": 1,
                             "levels": [{"level": 0, "actions": [2]}],
                         },
-                        "correspondence": {
-                            "trajectory_id": "correspondence-win",
-                            "successes": 1,
-                            "levels": [{"level": 0, "actions": [2]}],
-                        },
                     },
                 }
             ),
@@ -525,8 +510,21 @@ def test_replayable_source_trajectory_can_schedule_without_m7() -> None:
             steps_per_trial=4,
             max_trials=1,
         )
+        records = [
+            json.loads(line)
+            for line in (Path(raw_root) / flow.LOG_NAME)
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
 
+    resolution = next(
+        row for row in records if row["stage"] == "target_memory_resolution"
+    )
     assert (result.attempted, result.completed, result.passed) == (1, 1, 0)
+    assert resolution["required_ancestor_resolution"]["m7_descendant_count"] == 0
+    assert resolution["probe_observations"]["execution_evidence_kind"] == (
+        "replayable_source_trajectory"
+    )
     assert len(recorded) == 1
     assert "transfer_trial_pass" not in evidence
 
@@ -539,6 +537,12 @@ def test_grounded_actions_unsupported_by_target_are_rejected_exactly() -> None:
         (101, 9, 202, 303),
     )
     ancestor = _memory(77, MemoryLevel.M3, MemoryType.ROLE)
+    partially_supported = _memory(
+        79,
+        MemoryLevel.M1,
+        MemoryType.CONTINGENCY,
+        (102, 2, 203, 304),
+    )
     mapped = _memory(
         78,
         MemoryLevel.M1,
@@ -546,6 +550,12 @@ def test_grounded_actions_unsupported_by_target_are_rejected_exactly() -> None:
         (401, 9, 402, 403),
     )
     correspondence = _correspondence_ancestor()
+    mapped_partially_supported = _memory(
+        80,
+        MemoryLevel.M1,
+        MemoryType.CONTINGENCY,
+        (402, 2, 403, 404),
+    )
     with tempfile.TemporaryDirectory() as raw_root, patch.dict(
         os.environ, {"ARC_AGI3_V8_ROOT": raw_root}, clear=False
     ), patch.object(
@@ -556,10 +566,17 @@ def test_grounded_actions_unsupported_by_target_are_rejected_exactly() -> None:
         flow.reset_for_tests()
         runtime, recorded, evidence = _transfer_runtime(
             ancestor,
-            (grounded, mapped, ancestor, correspondence),
+            (
+                grounded,
+                partially_supported,
+                mapped,
+                mapped_partially_supported,
+                ancestor,
+                correspondence,
+            ),
             {
-                ancestor.uid: {grounded.uid},
-                correspondence.uid: {mapped.uid},
+                ancestor.uid: {grounded.uid, partially_supported.uid},
+                correspondence.uid: {mapped.uid, mapped_partially_supported.uid},
             },
         )
         result = learning._run_automatic_transfer_experiments_v088(
@@ -581,8 +598,11 @@ def test_grounded_actions_unsupported_by_target_are_rejected_exactly() -> None:
     assert "transfer_trial_pass" not in evidence
     assert "transfer_trial_fail" not in evidence
     assert detail[0]["exact_executable_predicate_failure_reason"] == (
-        "target_action_unsupported"
+        "source_actions_not_supported_by_target"
     )
+    assert detail[0]["probe_observations"][
+        "source_actions_not_supported_by_target"
+    ] == [9]
     assert detail[0]["target_action_failure_detail"] == (
         "mapped_action_not_in_target_action_set"
     )
