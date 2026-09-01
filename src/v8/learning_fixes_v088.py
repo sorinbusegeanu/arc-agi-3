@@ -12,7 +12,9 @@ from v8.model import (
     MemoryLevel,
     MemoryType,
     MemoryUid,
+    RelationType,
     ValidationState,
+    signed_u64,
     stable_u64,
 )
 
@@ -28,16 +30,17 @@ _BEST_WIN_STEPS = 0
 _LAST_WIN_STEPS = 0
 
 _TRANSFER_EXECUTABLE_FIELDS = (
-    "M7 level",
-    "STRATEGY memory type",
-    "key_parts[action_id,outcome_uid_hi,outcome_uid_lo,context_bucket]",
-    "candidate/probation/active/validated/reactivated cognitive state",
-    "positive support_count",
-    "existing probeable outcome memory",
-    "lineage to required transfer ancestor within depth 8",
+    "existing M3 or M4 transfer ancestor",
+    "existing M7 strategy or grounded M1 action evidence or replayable source trajectory",
+    "grounded evidence linked to the transfer ancestor or its source-world provenance",
     "action available in target environment",
-    "matching target context or transferable fallback",
 )
+_TRANSFER_LINEAGE_RELATIONS = {
+    int(RelationType.PROVENANCE),
+    int(RelationType.EXPLAINS),
+    int(RelationType.LEADS_TO),
+    int(RelationType.CONTEXT_REFINES),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,6 +262,24 @@ def _memory_free_action(actions, rng: Random) -> int:
     return choices[rng.randrange(len(choices))]
 
 
+def _mapped_evidence_action(
+    evidence_actions: tuple[int, ...],
+    available_actions: tuple[int, ...],
+    cursor: int,
+) -> tuple[int | None, int]:
+    """Map one existing source action by exact target action identity."""
+    if not evidence_actions:
+        return None, int(cursor)
+    available = {int(value) for value in available_actions}
+    start = int(cursor) % len(evidence_actions)
+    for offset in range(len(evidence_actions)):
+        index = (start + offset) % len(evidence_actions)
+        action = int(evidence_actions[index])
+        if action in available:
+            return action, (index + 1) % len(evidence_actions)
+    return None, start
+
+
 def _probe_policy_v088(
     *,
     read_view,
@@ -267,6 +288,7 @@ def _probe_policy_v088(
     seed: int,
     steps: int,
     required_ancestor: MemoryUid | None,
+    execution_evidence: dict[str, object] | None = None,
     diagnostic: dict[str, object] | None = None,
 ) -> tuple[float, int]:
     """Matched intervention: target-memory ON versus genuinely memory-free OFF."""
@@ -279,7 +301,13 @@ def _probe_policy_v088(
     observed_contexts: set[int] = set()
     observed_actions: set[int] = set()
     plan_misses = 0
+    evidence_cursor = 0
+    evidence_used = 0
+    evidence_unsupported_steps = 0
     planned_strategy_ids: set[str] = set()
+    evidence_actions = tuple(
+        int(value) for value in (execution_evidence or {}).get("action_ids", ())
+    )
     last_levels = int(env.last_levels_completed)
     for _ in range(max(1, int(steps))):
         before = env.observe()
@@ -302,7 +330,16 @@ def _probe_policy_v088(
             )
             if plan is None:
                 plan_misses += 1
-                action = _memory_free_action(actions, rng)
+                mapped, evidence_cursor = _mapped_evidence_action(
+                    evidence_actions, actions, evidence_cursor
+                )
+                if mapped is None:
+                    evidence_unsupported_steps += int(bool(evidence_actions))
+                    action = _memory_free_action(actions, rng)
+                else:
+                    action = int(mapped)
+                    used += 1
+                    evidence_used += 1
             else:
                 action = int(plan.action_id)
                 used += 1
@@ -324,6 +361,13 @@ def _probe_policy_v088(
                     "probe_steps": max(1, int(steps)),
                     "plan_misses": int(plan_misses),
                     "planned_steps": int(used),
+                    "m7_planned_steps": int(used - evidence_used),
+                    "lower_level_evidence_steps": int(evidence_used),
+                    "lower_level_evidence_unsupported_steps": int(
+                        evidence_unsupported_steps
+                    ),
+                    "execution_evidence_kind": (execution_evidence or {}).get("kind"),
+                    "execution_evidence_action_ids": list(evidence_actions[:32]),
                     "observed_context_signatures": sorted(observed_contexts)[:8],
                     "observed_context_buckets": sorted(
                         stable_u64(value, person=b"v8-context")
@@ -424,6 +468,96 @@ def _has_cached_ancestor(
     return False
 
 
+def _grounded_lineage_action_evidence(
+    read_view,
+    nodes,
+    edges,
+    candidate_uid: MemoryUid,
+    *,
+    max_depth: int = 8,
+) -> dict[str, object]:
+    """Resolve existing action-bearing M1 memories below an M3/M4 ancestor."""
+    node_by_uid = getattr(read_view, "_node_by_uid", None)
+    if not isinstance(node_by_uid, dict) or candidate_uid not in node_by_uid:
+        node_by_uid = {row.uid: row for row in nodes}
+    candidate = node_by_uid.get(candidate_uid)
+    if candidate is None:
+        return {
+            "kind": None,
+            "action_ids": [],
+            "grounded_memory_ids": [],
+            "resolution_status": "required_ancestor_lookup_returned_none",
+            "failure_reason": "required_ancestor_lookup_returned_none",
+        }
+
+    parents = getattr(read_view, "_parents", None)
+    if not isinstance(parents, dict) or candidate_uid not in parents:
+        parents = {}
+        for edge in edges or ():
+            if int(edge.relation_type) in _TRANSFER_LINEAGE_RELATIONS:
+                parents.setdefault(edge.source_uid, set()).add(edge.target_uid)
+
+    blocked_states = {
+        int(CognitiveState.QUARANTINED),
+        int(CognitiveState.RETIRE_PENDING),
+        int(CognitiveState.RETIRED),
+    }
+    grounded = []
+    frontier = {candidate_uid}
+    visited = set(frontier)
+    for _depth in range(max(0, int(max_depth))):
+        following: set[MemoryUid] = set()
+        for current in frontier:
+            for parent in parents.get(current, ()):
+                row = node_by_uid.get(parent)
+                if (
+                    row is not None
+                    and int(row.level) == int(MemoryLevel.M1)
+                    and int(row.memory_type) == int(MemoryType.CONTINGENCY)
+                    and len(row.key_parts) >= 4
+                    and int(row.support_count) > 0
+                    and int(row.cognitive_state) not in blocked_states
+                    and int(row.validation_state) != int(ValidationState.FAILED)
+                ):
+                    grounded.append(row)
+                if parent not in visited:
+                    visited.add(parent)
+                    following.add(parent)
+        if not following:
+            break
+        frontier = following
+
+    grounded.sort(
+        key=lambda row: (-int(row.support_count), -int(row.updated_watermark), row.uid)
+    )
+    actions = []
+    seen_actions: set[int] = set()
+    for row in grounded:
+        action = signed_u64(int(row.key_parts[1]))
+        if action in seen_actions:
+            continue
+        seen_actions.add(action)
+        actions.append(action)
+        if len(actions) >= 64:
+            break
+    if not actions:
+        return {
+            "kind": None,
+            "action_ids": [],
+            "grounded_memory_ids": [],
+            "resolution_status": "no_grounded_action_evidence_in_lineage",
+            "failure_reason": "no_grounded_action_evidence_in_lineage",
+        }
+    return {
+        "kind": "grounded_lineage",
+        "action_ids": actions,
+        "grounded_memory_ids": [_uid_value(row.uid) for row in grounded[:8]],
+        "grounded_memory_count": len(grounded),
+        "resolution_status": "grounded_action_evidence_resolved",
+        "failure_reason": None,
+    }
+
+
 def _node_diagnostic(row) -> dict[str, object] | None:
     if row is None:
         return None
@@ -456,7 +590,12 @@ def _strategy_cache_rows(read_view) -> tuple[object, ...]:
     return tuple(result)
 
 
-def _candidate_execution_snapshot(read_view, nodes, candidate_uid: MemoryUid) -> dict[str, object]:
+def _candidate_execution_snapshot(
+    read_view,
+    nodes,
+    candidate_uid: MemoryUid,
+    execution_evidence: dict[str, object] | None = None,
+) -> dict[str, object]:
     """Describe the already-built planning cache without making another decision."""
     node_by_uid = getattr(read_view, "_node_by_uid", None)
     if not isinstance(node_by_uid, dict):
@@ -486,14 +625,20 @@ def _candidate_execution_snapshot(read_view, nodes, candidate_uid: MemoryUid) ->
     elif int(candidate.level) not in {int(MemoryLevel.M3), int(MemoryLevel.M4)}:
         reason = "required_ancestor_wrong_memory_level"
         missing_fields.append("M3 or M4 required transfer ancestor")
-    elif not m7_descendants:
-        reason = "no_m7_strategy_descendant_for_required_ancestor"
-        missing_fields.extend(("M7 strategy descendant", "lineage to required transfer ancestor"))
-    elif not cached:
-        reason = "m7_descendants_failed_strategy_cache_predicate"
-        missing_fields.append("probeable M7 strategy cache row")
-    else:
+    elif cached:
         reason = "executable_m7_descendant_available_for_target_probe"
+    elif (execution_evidence or {}).get("action_ids"):
+        reason = "lower_level_transfer_evidence_available_for_target_probe"
+    else:
+        reason = str(
+            (execution_evidence or {}).get(
+                "failure_reason",
+                "no_grounded_action_evidence_in_lineage_and_no_replayable_source_trajectory",
+            )
+        )
+        missing_fields.append(
+            "grounded lineage action evidence or replayable source trajectory"
+        )
     return {
         "lookup_result_status": (
             "not_found" if candidate is None else "found_structural_ancestor"
@@ -518,6 +663,7 @@ def _candidate_execution_snapshot(read_view, nodes, candidate_uid: MemoryUid) ->
             }
             for row in cached[:8]
         ],
+        "lower_level_execution_evidence": dict(execution_evidence or {}),
         "executable_predicate_failure_reason": reason,
         "required_executable_fields": list(_TRANSFER_EXECUTABLE_FIELDS),
         "missing_or_invalid_executable_fields": missing_fields,
@@ -571,8 +717,10 @@ def _direct_target_memory_inventories(
         lower = [
             row
             for row in rows
-            if int(row.level) in {int(MemoryLevel.M1), int(MemoryLevel.M2)}
-            and len(row.key_parts) >= 2
+            if int(row.level) == int(MemoryLevel.M1)
+            and int(row.memory_type) == int(MemoryType.CONTINGENCY)
+            and len(row.key_parts) >= 4
+            and int(row.support_count) > 0
         ]
         result[target_hash] = {
             "identity_index": "GAME_PROVENANCE target UID low word plus lineage inheritance",
@@ -584,11 +732,10 @@ def _direct_target_memory_inventories(
             "m4_ids": [_uid_value(row.uid) for row in m4[:8]],
             "action_bearing_lower_level_memory_exists": bool(lower),
             "action_bearing_lower_level_memory_ids": [_uid_value(row.uid) for row in lower[:8]],
-            "executable_lower_level_memory_exists": False,
-            "executable_lower_level_memory_ids": [],
+            "executable_lower_level_memory_exists": bool(lower),
+            "executable_lower_level_memory_ids": [_uid_value(row.uid) for row in lower[:8]],
             "lower_level_execution_note": (
-                "LiveReadView.planned_action executes cached M7 strategies; M1/M2 rows "
-                "are not direct transfer-execution objects"
+                "held-out transfer may reuse grounded M1 actions without an M7 strategy"
             ),
         }
     return result
@@ -602,14 +749,164 @@ def _load_json_object(path: Path) -> dict[str, object]:
     return raw if isinstance(raw, dict) else {}
 
 
-def _trajectory_inventory(games: tuple[str, ...]) -> dict[str, dict[str, object]]:
+def _trajectory_optimizer_root() -> Path | None:
     raw_root = str(os.environ.get("ARC_AGI3_V8_ROOT", "")).strip()
     trajectory_root = str(os.environ.get("ARC_AGI3_V8_TRAJECTORY_ROOT", "")).strip()
     if raw_root:
-        root = Path(raw_root) / "trajectory_optimizer"
-    elif trajectory_root:
-        root = Path(trajectory_root)
-    else:
+        return Path(raw_root) / "trajectory_optimizer"
+    return Path(trajectory_root) if trajectory_root else None
+
+
+def _trajectory_actions(row: dict[str, object]) -> tuple[int, ...]:
+    actions = row.get("actions")
+    if isinstance(actions, list):
+        try:
+            return tuple(int(value) for value in actions)
+        except (TypeError, ValueError):
+            return ()
+    levels = row.get("levels")
+    if not isinstance(levels, list):
+        return ()
+    result = []
+    try:
+        for level in levels:
+            if isinstance(level, dict) and isinstance(level.get("actions"), list):
+                result.extend(int(value) for value in level["actions"])
+    except (TypeError, ValueError):
+        return ()
+    return tuple(result)
+
+
+def _source_trajectory_index(games: tuple[str, ...]) -> dict[int, dict[str, object]]:
+    root = _trajectory_optimizer_root()
+    if root is None:
+        return {}
+    by_game: dict[str, list[dict[str, object]]] = {}
+    for filename in ("best_successful.json", "generic_best_successful.json"):
+        payload = _load_json_object(root / filename)
+        for key in ("games", "environments"):
+            store = payload.get(key)
+            if not isinstance(store, dict):
+                continue
+            for game_id, raw in store.items():
+                if not isinstance(raw, dict):
+                    continue
+                actions = _trajectory_actions(raw)
+                if not actions:
+                    continue
+                by_game.setdefault(str(game_id), []).append(
+                    {
+                        "kind": "source_trajectory",
+                        "action_ids": list(actions),
+                        "source_game_id": str(game_id),
+                        "source_world_hash": stable_u64(str(game_id), person=b"v8-game"),
+                        "trajectory_id": str(
+                            raw.get("trajectory_id", raw.get("variant_id", ""))
+                        ) or None,
+                        "trajectory_source": filename,
+                    }
+                )
+    validated = _load_json_object(root / "validated.json").get("validated")
+    if isinstance(validated, list):
+        for raw in validated:
+            if not isinstance(raw, dict):
+                continue
+            anchor = raw.get("anchor")
+            game_id = str(anchor.get("source_id", "")) if isinstance(anchor, dict) else ""
+            actions = _trajectory_actions(raw)
+            try:
+                successes = int(raw.get("successes", 0) or 0)
+            except (TypeError, ValueError):
+                successes = 0
+            if not game_id or not actions or successes <= 0:
+                continue
+            by_game.setdefault(game_id, []).append(
+                {
+                    "kind": "source_trajectory",
+                    "action_ids": list(actions),
+                    "source_game_id": game_id,
+                    "source_world_hash": stable_u64(game_id, person=b"v8-game"),
+                    "trajectory_id": str(raw.get("variant_id", "")) or None,
+                    "trajectory_source": "validated.json",
+                }
+            )
+
+    result: dict[int, dict[str, object]] = {}
+    ordered_games = tuple(dict.fromkeys((*games, *sorted(by_game))))
+    for game_id in ordered_games:
+        choices = by_game.get(str(game_id), ())
+        if not choices:
+            continue
+        selected = min(
+            choices,
+            key=lambda row: (
+                len(row["action_ids"]),
+                str(row.get("trajectory_id") or ""),
+                str(row.get("trajectory_source") or ""),
+            ),
+        )
+        result[int(selected["source_world_hash"])] = dict(selected)
+    return result
+
+
+def _transfer_execution_evidence(
+    read_view,
+    nodes,
+    edges,
+    candidate,
+    source_trajectories: dict[int, dict[str, object]],
+) -> dict[str, object]:
+    grounded = _grounded_lineage_action_evidence(
+        read_view, nodes, edges, candidate.uid
+    )
+    trajectory = next(
+        (
+            source_trajectories[int(world)]
+            for world in candidate.formation_games
+            if int(world) in source_trajectories
+        ),
+        None,
+    )
+    actions = []
+    seen: set[int] = set()
+    for value in (
+        *grounded.get("action_ids", ()),
+        *((trajectory or {}).get("action_ids", ())),
+    ):
+        action = int(value)
+        if action not in seen:
+            seen.add(action)
+            actions.append(action)
+    if actions:
+        if grounded.get("action_ids") and trajectory is not None:
+            kind = "grounded_lineage_and_source_trajectory"
+        elif grounded.get("action_ids"):
+            kind = "grounded_lineage"
+        else:
+            kind = "source_trajectory"
+        return {
+            **grounded,
+            "kind": kind,
+            "action_ids": actions[:64],
+            "source_trajectory": trajectory,
+            "resolution_status": "lower_level_transfer_evidence_resolved",
+            "failure_reason": None,
+        }
+    return {
+        **grounded,
+        "kind": None,
+        "action_ids": [],
+        "source_trajectory": None,
+        "resolution_status": "no_executable_lower_level_transfer_evidence",
+        "failure_reason": (
+            "no_grounded_action_evidence_in_lineage_and_no_replayable_source_trajectory"
+        ),
+    }
+
+
+def _trajectory_inventory(games: tuple[str, ...]) -> dict[str, dict[str, object]]:
+    root = _trajectory_optimizer_root()
+    if root is None:
         return {game: {"successful_trajectory_exists": False} for game in games}
     result = {game: {"successful_trajectory_exists": False} for game in games}
     for filename in ("best_successful.json", "generic_best_successful.json"):
@@ -764,7 +1061,14 @@ def _target_resolution_event(
     }
     failure = candidate_snapshot["executable_predicate_failure_reason"]
     missing_fields = list(candidate_snapshot["missing_or_invalid_executable_fields"])
-    if int(used) <= 0 and failure == "executable_m7_descendant_available_for_target_probe":
+    if int(used) <= 0 and failure == "lower_level_transfer_evidence_available_for_target_probe":
+        if not probe_diagnostic.get("available_action_ids"):
+            failure = "target_environment_exposed_no_actions"
+            missing_fields.append("target environment action availability")
+        else:
+            failure = "resolved_source_actions_unsupported_by_target_environment"
+            missing_fields.append("source action supported by target environment")
+    elif int(used) <= 0 and failure == "executable_m7_descendant_available_for_target_probe":
         cached = candidate_snapshot.get("cached_executable_descendants", [])
         actions = {int(value) for value in probe_diagnostic.get("available_action_ids", [])}
         contexts = {int(value) for value in probe_diagnostic.get("observed_context_buckets", [])}
@@ -804,7 +1108,10 @@ def _target_resolution_event(
         "selected_game_or_environment_id": str(game_id),
         "adapter_family": "ARC",
         "execution_adapter": "v7.environment.arc_adapter.ArcGridEnvironment",
-        "executable_predicate": "probe planned_action returned at least once (used > 0)",
+        "executable_predicate": (
+            "probe used an existing M7 plan, grounded lineage action, or replayable "
+            "source trajectory action at least once (used > 0)"
+        ),
         "executable_predicate_result": bool(int(used) > 0),
         "exact_executable_predicate_failure_reason": failure,
         "required_executable_fields": candidate_snapshot["required_executable_fields"],
@@ -823,8 +1130,8 @@ def _target_resolution_event(
             "executable_reference": executable_reference,
             "rejected_reference": ancestor,
             "minimal_structural_difference": (
-                "rejected transfer ancestor has no action-bearing M7 strategy descendant "
-                "reachable through graph lineage"
+                "rejected transfer ancestor has neither usable M7 control nor existing "
+                "grounded source actions supported by the target"
             ),
         },
     }
@@ -884,8 +1191,10 @@ def _run_automatic_transfer_experiments_v088(
         runtime.read_view, nodes, tuple(game_hashes.values())
     )
     trajectories = _trajectory_inventory(holdouts)
+    source_trajectories = _source_trajectory_index(tuple(games))
     executable_reference = _executable_reference(runtime.read_view, nodes)
     candidate_execution: dict[MemoryUid, dict[str, object]] = {}
+    candidate_evidence: dict[MemoryUid, dict[str, object]] = {}
 
     def reject(reason: str) -> None:
         scheduling_rejections[reason] = scheduling_rejections.get(reason, 0) + 1
@@ -979,6 +1288,16 @@ def _run_automatic_transfer_experiments_v088(
             eligibility_probes += 1
             trial_seed = int(seed) + (completed + 1) * 7919
             probe_diagnostic: dict[str, object] = {}
+            execution_evidence = candidate_evidence.get(candidate.uid)
+            if execution_evidence is None:
+                execution_evidence = _transfer_execution_evidence(
+                    runtime.read_view,
+                    nodes,
+                    edges,
+                    candidate,
+                    source_trajectories,
+                )
+                candidate_evidence[candidate.uid] = execution_evidence
             on_metric, used = _probe_policy_v088(
                 read_view=runtime.read_view,
                 game_id=game_id,
@@ -986,12 +1305,16 @@ def _run_automatic_transfer_experiments_v088(
                 seed=trial_seed,
                 steps=steps_per_trial,
                 required_ancestor=candidate.uid,
+                execution_evidence=execution_evidence,
                 diagnostic=probe_diagnostic,
             )
             candidate_snapshot = candidate_execution.get(candidate.uid)
             if candidate_snapshot is None:
                 candidate_snapshot = _candidate_execution_snapshot(
-                    runtime.read_view, nodes, candidate.uid
+                    runtime.read_view,
+                    nodes,
+                    candidate.uid,
+                    execution_evidence,
                 )
                 candidate_execution[candidate.uid] = candidate_snapshot
             resolution = _target_resolution_event(
@@ -1038,9 +1361,13 @@ def _run_automatic_transfer_experiments_v088(
                 fields=resolution,
             )
             if used <= 0:
-                reject("target_memory_not_executable")
+                rejection_reason = str(
+                    resolution.get("exact_executable_predicate_failure_reason")
+                    or "target_memory_not_executable"
+                )
+                reject(rejection_reason)
                 add_example(candidate, game_id, target_hash, eligible=False,
-                            decision="not_scheduled", reason="target_memory_not_executable")
+                            decision="not_scheduled", reason=rejection_reason)
                 continue
             eligible_target_worlds += 1
             attempted += 1

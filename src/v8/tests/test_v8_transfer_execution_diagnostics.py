@@ -18,7 +18,7 @@ from v8.model import (
     ValidationState,
     stable_u64,
 )
-from v8.publication import _StrategyRow
+from v8.publication import PlannedAction, _StrategyRow
 from v8.transfer import TransferCandidate, TransferValidator
 
 
@@ -122,9 +122,11 @@ def test_target_memory_exists_but_fails_executable_predicate() -> None:
 
     assert snapshot["lookup_result_status"] == "found_structural_ancestor"
     assert snapshot["executable_predicate_failure_reason"] == (
-        "no_m7_strategy_descendant_for_required_ancestor"
+        "no_grounded_action_evidence_in_lineage_and_no_replayable_source_trajectory"
     )
-    assert "M7 strategy descendant" in snapshot["missing_or_invalid_executable_fields"]
+    assert "grounded lineage action evidence or replayable source trajectory" in snapshot[
+        "missing_or_invalid_executable_fields"
+    ]
 
 
 def test_target_memory_lookup_returns_no_memory() -> None:
@@ -269,7 +271,7 @@ def test_resolution_instrumentation_does_not_change_scheduler_result() -> None:
 
     assert (result.attempted, result.completed, result.passed) == (0, 0, 0)
     assert detail[0]["exact_executable_predicate_failure_reason"] == (
-        "no_m7_strategy_descendant_for_required_ancestor"
+        "no_grounded_action_evidence_in_lineage_and_no_replayable_source_trajectory"
     )
     assert detail[0]["target_memory_level"] == "M3"
 
@@ -295,3 +297,294 @@ def test_target_resolution_detail_collection_is_bounded() -> None:
 
     assert len(records) == flow.MAX_EXAMPLES
 
+
+class _TransferProbeEnvironment:
+    def __init__(self, **_kwargs):
+        self.last_levels_completed = 0
+        self.last_outcome_polarity = "neutral"
+        self.actions = []
+
+    def observe(self):
+        return ((0,),)
+
+    def available_actions(self):
+        return (2,)
+
+    def step(self, action):
+        self.actions.append(int(action))
+        return ((int(action),),)
+
+    def reset(self):
+        return ((0,),)
+
+
+def _transfer_runtime(candidate_row, lineage_rows, parents):
+    candidate = _candidate(candidate_row)
+    transfer = TransferValidator()
+    transfer.candidates = lambda *_args, **_kwargs: (candidate,)
+    recorded = []
+    evidence = []
+
+    def record(uid, **kwargs):
+        trial = transfer.record_trial(uid, **kwargs)
+        recorded.append(trial)
+        return trial
+
+    class View:
+        _node_by_uid = {row.uid: row for row in lineage_rows}
+        _parents = parents
+        _strategy_by_context = {}
+        _strategy_fallback = ()
+        _v839_direct_games = {}
+
+        def node_records(self):
+            return tuple(lineage_rows)
+
+        def source_games(self, uid):
+            return frozenset(candidate.formation_games) if uid == candidate.uid else frozenset()
+
+        def planned_action(self, *_args, **_kwargs):
+            return None
+
+    peers = SimpleNamespace(
+        transfer=transfer,
+        record_transfer_trial=record,
+        _append_evidence=lambda kind, *_args, **_kwargs: evidence.append(kind),
+    )
+    return SimpleNamespace(peers=peers, read_view=View()), recorded, evidence
+
+
+def test_grounded_m3_and_m4_lineage_schedule_without_m7() -> None:
+    grounded = _memory(
+        60,
+        MemoryLevel.M1,
+        MemoryType.CONTINGENCY,
+        (101, 2, 202, 303),
+    )
+    role = _memory(61, MemoryLevel.M3, MemoryType.ROLE)
+    concept = _memory(62, MemoryLevel.M4, MemoryType.CONCEPT)
+
+    for candidate_row, rows, parents in (
+        (role, (grounded, role), {role.uid: {grounded.uid}}),
+        (
+            concept,
+            (grounded, role, concept),
+            {concept.uid: {role.uid}, role.uid: {grounded.uid}},
+        ),
+    ):
+        with tempfile.TemporaryDirectory() as raw_root, patch.dict(
+            os.environ, {"ARC_AGI3_V8_ROOT": raw_root}, clear=False
+        ), patch.object(
+            learning, "_held_out_games", return_value=("target",)
+        ), patch(
+            "v7.environment.arc_adapter.ArcGridEnvironment", _TransferProbeEnvironment
+        ):
+            flow.reset_for_tests()
+            runtime, recorded, evidence = _transfer_runtime(candidate_row, rows, parents)
+            result = learning._run_automatic_transfer_experiments_v088(
+                runtime,
+                games=("source",),
+                env_root=None,
+                seed=3,
+                steps_per_trial=4,
+                max_trials=1,
+            )
+
+        assert (result.attempted, result.completed, result.passed) == (1, 1, 0)
+        assert len(recorded) == 1
+        assert recorded[0].passed is False
+        assert "transfer_trial_pass" not in evidence
+
+
+def test_candidate_without_grounded_or_trajectory_evidence_remains_rejected() -> None:
+    ancestor = _memory(70, MemoryLevel.M3, MemoryType.ROLE)
+    with tempfile.TemporaryDirectory() as raw_root, patch.dict(
+        os.environ, {"ARC_AGI3_V8_ROOT": raw_root}, clear=False
+    ), patch.object(
+        learning, "_held_out_games", return_value=("target",)
+    ), patch(
+        "v7.environment.arc_adapter.ArcGridEnvironment", _TransferProbeEnvironment
+    ):
+        flow.reset_for_tests()
+        runtime, recorded, evidence = _transfer_runtime(ancestor, (ancestor,), {})
+        result = learning._run_automatic_transfer_experiments_v088(
+            runtime,
+            games=("source",),
+            env_root=None,
+            seed=4,
+            steps_per_trial=4,
+            max_trials=1,
+        )
+        records = [
+            json.loads(line)
+            for line in (Path(raw_root) / flow.LOG_NAME).read_text(encoding="utf-8").splitlines()
+        ]
+        detail = [row for row in records if row["stage"] == "target_memory_resolution"]
+
+    assert (result.attempted, result.completed, result.passed) == (0, 0, 0)
+    assert not recorded
+    assert "transfer_trial_pass" not in evidence
+    assert detail[0]["exact_executable_predicate_failure_reason"] == (
+        "no_grounded_action_evidence_in_lineage_and_no_replayable_source_trajectory"
+    )
+
+
+def test_replayable_source_trajectory_can_schedule_without_m7() -> None:
+    ancestor = _memory(75, MemoryLevel.M3, MemoryType.ROLE)
+    with tempfile.TemporaryDirectory() as raw_root, patch.dict(
+        os.environ, {"ARC_AGI3_V8_ROOT": raw_root}, clear=False
+    ), patch.object(
+        learning, "_held_out_games", return_value=("target",)
+    ), patch(
+        "v7.environment.arc_adapter.ArcGridEnvironment", _TransferProbeEnvironment
+    ):
+        optimizer_root = Path(raw_root) / "trajectory_optimizer"
+        optimizer_root.mkdir(parents=True)
+        (optimizer_root / "best_successful.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "games": {
+                        "source": {
+                            "trajectory_id": "source-win",
+                            "successes": 1,
+                            "levels": [{"level": 0, "actions": [2]}],
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        flow.reset_for_tests()
+        runtime, recorded, evidence = _transfer_runtime(ancestor, (ancestor,), {})
+        result = learning._run_automatic_transfer_experiments_v088(
+            runtime,
+            games=("source",),
+            env_root=None,
+            seed=7,
+            steps_per_trial=4,
+            max_trials=1,
+        )
+
+    assert (result.attempted, result.completed, result.passed) == (1, 1, 0)
+    assert len(recorded) == 1
+    assert "transfer_trial_pass" not in evidence
+
+
+def test_grounded_actions_unsupported_by_target_are_rejected_exactly() -> None:
+    grounded = _memory(
+        76,
+        MemoryLevel.M1,
+        MemoryType.CONTINGENCY,
+        (101, 9, 202, 303),
+    )
+    ancestor = _memory(77, MemoryLevel.M3, MemoryType.ROLE)
+    with tempfile.TemporaryDirectory() as raw_root, patch.dict(
+        os.environ, {"ARC_AGI3_V8_ROOT": raw_root}, clear=False
+    ), patch.object(
+        learning, "_held_out_games", return_value=("target",)
+    ), patch(
+        "v7.environment.arc_adapter.ArcGridEnvironment", _TransferProbeEnvironment
+    ):
+        flow.reset_for_tests()
+        runtime, recorded, _evidence = _transfer_runtime(
+            ancestor,
+            (grounded, ancestor),
+            {ancestor.uid: {grounded.uid}},
+        )
+        result = learning._run_automatic_transfer_experiments_v088(
+            runtime,
+            games=("source",),
+            env_root=None,
+            seed=8,
+            steps_per_trial=4,
+            max_trials=1,
+        )
+        records = [
+            json.loads(line)
+            for line in (Path(raw_root) / flow.LOG_NAME).read_text(encoding="utf-8").splitlines()
+        ]
+        detail = [row for row in records if row["stage"] == "target_memory_resolution"]
+
+    assert (result.attempted, result.completed, result.passed) == (0, 0, 0)
+    assert not recorded
+    assert detail[0]["exact_executable_predicate_failure_reason"] == (
+        "resolved_source_actions_unsupported_by_target_environment"
+    )
+
+
+def test_formation_provenance_still_excludes_held_out_target() -> None:
+    target_hash = stable_u64("target", person=b"v8-game")
+    grounded = _memory(
+        80,
+        MemoryLevel.M1,
+        MemoryType.CONTINGENCY,
+        (101, 2, 202, 303),
+    )
+    ancestor = _memory(81, MemoryLevel.M3, MemoryType.ROLE)
+    candidate = TransferCandidate(
+        ancestor.uid,
+        1,
+        1.0,
+        (target_hash,),
+        MemoryUid.zero(),
+        (stable_u64("other", person=b"v8-game"),),
+    )
+    transfer = TransferValidator()
+    transfer.candidates = lambda *_args, **_kwargs: (candidate,)
+    view = SimpleNamespace(
+        node_records=lambda: (grounded, ancestor),
+        source_games=lambda _uid: frozenset((target_hash,)),
+        _node_by_uid={grounded.uid: grounded, ancestor.uid: ancestor},
+        _parents={ancestor.uid: {grounded.uid}},
+        _strategy_by_context={},
+        _strategy_fallback=(),
+        _v839_direct_games={},
+    )
+    runtime = SimpleNamespace(
+        peers=SimpleNamespace(
+            transfer=transfer,
+            record_transfer_trial=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("provenance-rejected target scheduled")
+            ),
+        ),
+        read_view=view,
+    )
+
+    with patch.object(learning, "_held_out_games", return_value=("target",)), patch.object(
+        learning, "_probe_policy_v088", side_effect=AssertionError("probe should not run")
+    ):
+        result = learning._run_automatic_transfer_experiments_v088(
+            runtime,
+            games=("source",),
+            env_root=None,
+            seed=5,
+            steps_per_trial=4,
+            max_trials=1,
+        )
+
+    assert (result.attempted, result.completed, result.passed) == (0, 0, 0)
+
+
+def test_existing_m7_plan_remains_first_execution_path() -> None:
+    strategy_uid = MemoryUid.from_key(MemoryLevel.M7, MemoryType.STRATEGY, (2, 3, 4, 5))
+    plan = PlannedAction(2, MemoryUid.zero(), strategy_uid, 1.0)
+    view = SimpleNamespace(planned_action=lambda *_args, **_kwargs: plan)
+    diagnostic = {}
+
+    with patch("v7.environment.arc_adapter.ArcGridEnvironment", _TransferProbeEnvironment):
+        metric, used = learning._probe_policy_v088(
+            read_view=view,
+            game_id="target",
+            env_root=None,
+            seed=6,
+            steps=4,
+            required_ancestor=MemoryUid.zero(),
+            execution_evidence={"kind": "grounded_lineage", "action_ids": [2]},
+            diagnostic=diagnostic,
+        )
+
+    assert metric == 0.0
+    assert used == 4
+    assert diagnostic["m7_planned_steps"] == 4
+    assert diagnostic["lower_level_evidence_steps"] == 0
