@@ -107,29 +107,143 @@ def _install_provisional_validation_scaffold() -> None:
     loop_module._validated_concept_parent = concept_parent_ready
 
     current_engine = promotion_module.EvidenceGatedPromotionEngine
+    base_engine = behavior_module._BasePromotionEngine
+
+    def normalize_candidate(engine, candidate, by_uid):
+        if int(candidate.level) == int(MemoryLevel.M4) and candidate.parents:
+            role = by_uid.get(candidate.parents[0])
+            if role is not None and int(role.memory_type) == int(MemoryType.ROLE):
+                key = tuple(int(value) for value in role.key_parts)
+                if key:
+                    return replace(
+                        candidate,
+                        key_parts=key,
+                        uid=MemoryUid.from_key(MemoryLevel.M4, MemoryType.CONCEPT, key),
+                    )
+        if int(candidate.level) == int(MemoryLevel.M6):
+            canonicalize = getattr(engine, "_canonicalize_m6", None)
+            if callable(canonicalize):
+                return canonicalize(candidate, by_uid)
+        return candidate
+
+    def missing_higher_candidates(engine, rows, edges, by_uid, *, limit: int):
+        """Recover higher layers starved by lower-level proposal churn."""
+        if limit <= 0:
+            return ()
+        cancel = getattr(engine, "_v841_cancel_event", None)
+
+        def cancelled() -> bool:
+            return bool(cancel is not None and cancel.is_set())
+
+        if cancelled():
+            return ()
+        seen: set[MemoryUid] = set(by_uid)
+
+        def collect(candidates) -> list[object]:
+            selected = []
+            for raw in candidates:
+                candidate = normalize_candidate(engine, raw, by_uid)
+                if candidate.uid in seen:
+                    continue
+                if int(candidate.level) == int(MemoryLevel.M5) and not concept_parent_ready(
+                    candidate, by_uid
+                ):
+                    continue
+                seen.add(candidate.uid)
+                selected.append(candidate)
+            selected.sort(key=lambda item: item.uid)
+            return selected
+
+        m4_sources = []
+        m5_sources = []
+        m6_sources = []
+        has_m6 = False
+        for index, row in enumerate(rows):
+            if index % 4096 == 0 and cancelled():
+                return ()
+            level = int(row.level)
+            if level == int(MemoryLevel.M3) and int(row.memory_type) == int(MemoryType.ROLE):
+                m4_sources.append(row)
+            elif level == int(MemoryLevel.M4):
+                m5_sources.append(row)
+            elif level == int(MemoryLevel.M5):
+                m6_sources.append(row)
+            elif level == int(MemoryLevel.M6):
+                has_m6 = True
+        # Build each missing tier independently so lower-level candidate ordering
+        # cannot hide it.  The base engine supplies the exact existing predicates
+        # and candidate schemas for each isolated tier.
+        m6_candidates = collect(
+            base_engine.propose(engine, tuple(m6_sources), (), budget=limit)
+        )
+        if cancelled():
+            return ()
+        m5_candidates = collect(
+            base_engine.propose(engine, tuple(m5_sources), (), budget=limit)
+        )
+        if cancelled():
+            return ()
+        m4_candidates = collect(
+            base_engine.propose(engine, tuple(m4_sources), (), budget=limit)
+        )
+
+        m7_builder = getattr(engine, "_causal_strategies", None)
+        m7_candidates = []
+        if callable(m7_builder) and has_m6 and not cancelled():
+            m7_candidates = collect(m7_builder(rows, edges, limit=limit))
+
+        # Round-robin the tiers so sustained work at one depth cannot recreate the
+        # starvation that this reservation removes at another depth.
+        tiers = (m7_candidates, m6_candidates, m5_candidates, m4_candidates)
+        offsets = [0, 0, 0, 0]
+        result = []
+        while len(result) < limit:
+            progressed = False
+            for index, tier in enumerate(tiers):
+                offset = offsets[index]
+                if offset >= len(tier):
+                    continue
+                result.append(tier[offset])
+                offsets[index] += 1
+                progressed = True
+                if len(result) >= limit:
+                    break
+            if not progressed:
+                break
+        return tuple(result)
 
     class V088PromotionEngine(current_engine):
         def propose(self, nodes, edges, *, budget: int = 256):
+            limit = max(0, int(budget))
+            if limit <= 0:
+                return ()
             rows = tuple(nodes)
+            graph = tuple(edges)
             by_uid = {row.uid: row for row in rows}
+            base = tuple(super().propose(rows, graph, budget=limit))
+            reserve = min(limit, max(1, limit // 4))
+            supplements = missing_higher_candidates(
+                self,
+                rows,
+                graph,
+                by_uid,
+                limit=reserve,
+            )
             result = []
             seen: set[MemoryUid] = set()
-            for candidate in super().propose(rows, tuple(edges), budget=budget):
-                if int(candidate.level) == int(MemoryLevel.M4) and candidate.parents:
-                    role = by_uid.get(candidate.parents[0])
-                    if role is not None and int(role.memory_type) == int(MemoryType.ROLE):
-                        key = tuple(int(value) for value in role.key_parts)
-                        if key:
-                            candidate = replace(
-                                candidate,
-                                key_parts=key,
-                                uid=MemoryUid.from_key(MemoryLevel.M4, MemoryType.CONCEPT, key),
-                            )
+            base_higher = tuple(
+                candidate for candidate in base if int(candidate.level) >= int(MemoryLevel.M4)
+            )
+            base_lower = tuple(
+                candidate for candidate in base if int(candidate.level) < int(MemoryLevel.M4)
+            )
+            for candidate in (*supplements, *base_higher, *base_lower):
+                candidate = normalize_candidate(self, candidate, by_uid)
                 if candidate.uid in seen:
                     continue
                 seen.add(candidate.uid)
                 result.append(candidate)
-                if len(result) >= max(0, int(budget)):
+                if len(result) >= limit:
                     break
             return tuple(result)
 
