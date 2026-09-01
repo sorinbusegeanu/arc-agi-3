@@ -408,6 +408,8 @@ def _end_source_routing(service, source) -> None:
 
 def _restore_pending_sources(service) -> None:
     """Move snapshot-restored sources back into the optimizer input queue."""
+    from v8 import information_flow_diagnostics as flow
+
     while not service._stop.is_set():
         with service._lock:
             if not service._v818_restored_sources:
@@ -424,6 +426,24 @@ def _restore_pending_sources(service) -> None:
             ):
                 service._v818_restored_sources.pop(0)
             service._seen_sources.add(str(source.trajectory_id))
+        flow.add_counters("trajectory_optimizer", trajectories_received=1)
+        flow.emit_bounded(
+            "trajectory_optimizer", "restored_optimizer_source",
+            input_count=1, output_count=1,
+            examples=(
+                {"trajectory_id": str(source.trajectory_id),
+                 "producer_source_stage": "snapshot_restore",
+                 "submitted_to_optimizer": True,
+                 "optimizer_received": True,
+                 "counted_in_trajectories_seen": False,
+                 "counter_path": "restored_source_queue_bypass",
+                 "optimizer_candidates_generated": None,
+                 "validation_attempts": None,
+                 "validation_result": None,
+                 "accepted_variant_id": None,
+                 "rejection_reason": None},
+            ),
+        )
 
 
 def _alive_validators(service) -> dict[str, threading.Thread]:
@@ -504,15 +524,21 @@ def _route_candidate(service, candidate) -> bool:
 
 def _ingest_inbox_v818(service) -> None:
     from v8 import trajectory_optimizer_v814 as optimizer
+    from v8 import information_flow_diagnostics as flow
 
     service.inbox.mkdir(parents=True, exist_ok=True)
     for path in sorted(service.inbox.glob("*.json"))[:128]:
         remove = False
+        row = None
+        rejection_reason = None
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
             row = optimizer.SuccessfulTrajectory.from_dict(raw)
+            flow.add_counters("trajectory_optimizer", trajectories_received=1)
             with service._lock:
                 duplicate = row.trajectory_id in service._seen_sources
+            if duplicate:
+                rejection_reason = "duplicate_legacy_optimizer_source"
             # v8.19 routes sampler trajectories directly to source validation
             # and tracks them separately from the original optimizer sources.
             # Treat those as consumed too; otherwise submit_trajectory() rejects
@@ -521,16 +547,39 @@ def _ingest_inbox_v818(service) -> None:
             v819_lock = getattr(service, "_v819_lock", None)
             if not duplicate and v819_lock is not None:
                 with v819_lock:
-                    duplicate = row.trajectory_id in getattr(
+                    runtime_duplicate = row.trajectory_id in getattr(
                         service, "_v819_source_seen", ()
                     )
+                    duplicate = runtime_duplicate
+                    if runtime_duplicate:
+                        rejection_reason = "duplicate_source_validation_source"
             if duplicate:
                 remove = True
             else:
                 remove = bool(service.submit_trajectory(row))
+                if not remove:
+                    rejection_reason = "optimizer_submission_rejected"
         except BaseException as exc:
             service._log("inbox_error", path=str(path), error=f"{type(exc).__name__}: {exc}")
+            rejection_reason = f"inbox_decode_error:{type(exc).__name__}"
             remove = True
+        flow.emit_bounded(
+            "trajectory_optimizer", "optimizer_inbox_receive",
+            input_count=1, output_count=int(row is not None and rejection_reason is None),
+            rejection_counts={} if rejection_reason is None else {rejection_reason: 1},
+            examples=(
+                {"trajectory_id": None if row is None else str(row.trajectory_id),
+                 "producer_source_stage": "optimizer_inbox",
+                 "submitted_to_optimizer": True,
+                 "optimizer_received": row is not None,
+                 "counted_in_trajectories_seen": None,
+                 "optimizer_candidates_generated": None,
+                 "validation_attempts": None,
+                 "validation_result": None,
+                 "accepted_variant_id": None,
+                 "rejection_reason": rejection_reason},
+            ),
+        )
         if remove:
             try:
                 path.unlink(missing_ok=True)
@@ -576,6 +625,8 @@ def _record_validated_prefix(service, candidate, result) -> None:
 
 
 def _optimizer_loop_v818(service) -> None:
+    from v8 import information_flow_diagnostics as flow
+
     try:
         while not service._stop.is_set():
             _restore_pending_sources(service)
@@ -588,6 +639,20 @@ def _optimizer_loop_v818(service) -> None:
             try:
                 _begin_source_work(service, source)
                 if int(source.round_index) >= int(service.config.max_optimization_rounds):
+                    flow.emit_bounded(
+                        "trajectory_optimizer", "optimizer_candidate_generation",
+                        input_count=1, output_count=0,
+                        rejection_counts={"maximum_optimization_round_reached": 1},
+                        examples=({"trajectory_id": str(source.trajectory_id),
+                                   "producer_source_stage": "optimizer_edit_queue",
+                                   "optimizer_received": True,
+                                   "counted_in_trajectories_seen": str(source.trajectory_id) in service._seen_sources,
+                                   "optimizer_candidates_generated": 0,
+                                   "validation_attempts": 0,
+                                   "validation_result": None,
+                                   "accepted_variant_id": None,
+                                   "rejection_reason": "maximum_optimization_round_reached"},),
+                    )
                     continue
                 _register_source_prefix(service, source)
                 key = _target_key(source)
@@ -598,6 +663,21 @@ def _optimizer_loop_v818(service) -> None:
                 rows = _generate_v818(source, service.config)
                 with service._lock:
                     service._candidates_generated += len(rows)
+                flow.add_counters("trajectory_optimizer", candidates_generated=len(rows))
+                flow.emit_bounded(
+                    "trajectory_optimizer", "optimizer_candidate_generation",
+                    input_count=1, output_count=len(rows),
+                    rejection_counts={} if rows else {"candidate_generator_returned_no_variants": 1},
+                    examples=({"trajectory_id": str(source.trajectory_id),
+                               "producer_source_stage": "optimizer_edit_queue",
+                               "optimizer_received": True,
+                               "counted_in_trajectories_seen": str(source.trajectory_id) in service._seen_sources,
+                               "optimizer_candidates_generated": len(rows),
+                               "validation_attempts": 0,
+                               "validation_result": None,
+                               "accepted_variant_id": None,
+                               "rejection_reason": None if rows else "candidate_generator_returned_no_variants"},),
+                )
                 service._log(
                     "candidates",
                     trajectory_id=source.trajectory_id,
@@ -618,6 +698,7 @@ def _optimizer_loop_v818(service) -> None:
 
 def _game_validator_loop(service, game_id: str) -> None:
     from v8 import trajectory_optimizer_v814 as optimizer
+    from v8 import information_flow_diagnostics as flow
 
     game = str(game_id)
     validator = _GameReplayValidator(service, game)
@@ -649,10 +730,40 @@ def _game_validator_loop(service, game_id: str) -> None:
                         candidate_cost=candidate.cost,
                         frontier_cost=frontier,
                     )
+                    flow.emit_bounded(
+                        "trajectory_optimizer", "optimizer_validation",
+                        input_count=1, output_count=0,
+                        rejection_counts={"frontier_cost_pruned": 1},
+                        examples=({"trajectory_id": str(candidate.source.trajectory_id),
+                                   "candidate_id": str(candidate.candidate_id),
+                                   "producer_source_stage": str(candidate.edit_kind),
+                                   "optimizer_received": True,
+                                   "counted_in_trajectories_seen": str(candidate.source.trajectory_id) in service._seen_sources,
+                                   "optimizer_candidates_generated": 1,
+                                   "validation_attempts": 0,
+                                   "validation_result": "not_attempted",
+                                   "accepted_variant_id": None,
+                                   "rejection_reason": "frontier_cost_pruned"},),
+                    )
                     continue
 
                 with service._lock:
                     if candidate.candidate_id in service._attempted:
+                        flow.emit_bounded(
+                            "trajectory_optimizer", "optimizer_validation",
+                            input_count=1, output_count=0,
+                            rejection_counts={"duplicate_candidate": 1},
+                            examples=({"trajectory_id": str(candidate.source.trajectory_id),
+                                       "candidate_id": str(candidate.candidate_id),
+                                       "producer_source_stage": str(candidate.edit_kind),
+                                       "optimizer_received": True,
+                                       "counted_in_trajectories_seen": str(candidate.source.trajectory_id) in service._seen_sources,
+                                       "optimizer_candidates_generated": 1,
+                                       "validation_attempts": 0,
+                                       "validation_result": "not_attempted",
+                                       "accepted_variant_id": None,
+                                       "rejection_reason": "duplicate_candidate"},),
+                        )
                         continue
                     service._attempted.add(candidate.candidate_id)
                     service._active_validations += 1
@@ -665,6 +776,10 @@ def _game_validator_loop(service, game_id: str) -> None:
                 with service._lock:
                     service._validations += int(result.attempts)
                     service._validation_successes += int(result.successes)
+                flow.add_counters(
+                    "trajectory_optimizer", validations=int(result.attempts),
+                    validation_successes=int(result.successes),
+                )
 
                 accepted = False
                 validated = None
@@ -694,6 +809,32 @@ def _game_validator_loop(service, game_id: str) -> None:
                                 service._v818_best_candidate = int(candidate.cost)
                         _record_validated_prefix(service, candidate, result)
                         service._publish_validated()
+
+                if accepted:
+                    rejection_reason = None
+                elif not bool(result.success):
+                    rejection_reason = str(result.reason or "validation_failed")
+                elif int(candidate.cost) >= int(candidate.source.cost):
+                    rejection_reason = "validation_success_without_cost_reduction"
+                else:
+                    rejection_reason = "validated_variant_not_selected_as_frontier"
+                flow.add_counters("trajectory_optimizer", accepted_variants=int(accepted))
+                flow.emit_bounded(
+                    "trajectory_optimizer", "optimizer_validation",
+                    input_count=1, output_count=int(accepted),
+                    rejection_counts={} if rejection_reason is None else {rejection_reason: 1},
+                    examples=({"trajectory_id": str(candidate.source.trajectory_id),
+                               "candidate_id": str(candidate.candidate_id),
+                               "producer_source_stage": str(candidate.edit_kind),
+                               "optimizer_received": True,
+                               "counted_in_trajectories_seen": str(candidate.source.trajectory_id) in service._seen_sources,
+                               "optimizer_candidates_generated": 1,
+                               "validation_attempts": int(result.attempts),
+                               "validation_successes": int(result.successes),
+                               "validation_result": str(result.reason),
+                               "accepted_variant_id": str(candidate.candidate_id) if accepted else None,
+                               "rejection_reason": rejection_reason},),
+                )
 
                 service._log(
                     "validation",

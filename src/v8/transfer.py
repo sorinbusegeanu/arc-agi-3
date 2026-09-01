@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import asdict, dataclass
 from typing import Callable
 
 from v8.arena import EdgeRecord, NodeRecord
+from v8 import information_flow_diagnostics as flow
 from v8.model import MemoryLevel, MemoryUid, RelationType
 
 
@@ -142,6 +144,10 @@ class TransferValidator:
         cancel_event=None,
     ) -> tuple[TransferCandidate, ...]:
         if cancel_event is not None and cancel_event.is_set():
+            flow.emit(
+                "transfer", "candidate_selection", input_count=0, output_count=0,
+                rejection_counts={"cancelled": 1},
+            )
             return ()
         eligible = {
             row.uid: row
@@ -149,7 +155,14 @@ class TransferValidator:
             if int(row.level) in {int(MemoryLevel.M3), int(MemoryLevel.M4)}
         }
         if not eligible:
+            flow.emit(
+                "transfer", "candidate_selection", input_count=len(rows), output_count=0,
+                rejection_counts={"m3_or_m4_unavailable": len(rows)},
+                fields={"m3_available": False, "m4_available": False},
+            )
             return ()
+        m3_available = any(int(row.level) == int(MemoryLevel.M3) for row in eligible.values())
+        m4_available = any(int(row.level) == int(MemoryLevel.M4) for row in eligible.values())
 
         bound_read_view = None
         cached_direct = None
@@ -192,6 +205,8 @@ class TransferValidator:
         # runtime, where edges are present, formal TRANSFER_CORRESPONDENCE is required.
         if not edges and provenance is None:
             result = []
+            rejected: Counter[str] = Counter()
+            examples = []
             for row in eligible.values():
                 games = int(row.game_evidence_count)
                 recurrence = min(1.0, games / 4.0) * min(
@@ -199,7 +214,32 @@ class TransferValidator:
                 )
                 if games >= 2 and recurrence > 0.0:
                     result.append(TransferCandidate(row.uid, games, recurrence))
-            return tuple(result)
+                    decision = "admissible"
+                else:
+                    decision = "insufficient_game_recurrence"
+                    rejected[decision] += 1
+                if len(examples) < flow.MAX_EXAMPLES:
+                    examples.append({
+                        "source_world": None,
+                        "candidate_target_world": None,
+                        "candidate_uid": flow.uid_text(row.uid),
+                        "correspondence_score": recurrence,
+                        "provenance_distinct": None,
+                        "m3_available": m3_available,
+                        "m4_available": m4_available,
+                        "held_out_eligibility": None,
+                        "scheduler_decision": "not_reached",
+                        "rejection_reason": None if decision == "admissible" else decision,
+                    })
+            output = tuple(result)
+            flow.add_counters("transfer", admissible_candidates=len(output))
+            flow.emit(
+                "transfer", "candidate_selection", input_count=len(eligible),
+                output_count=len(output), rejection_counts=rejected, examples=examples,
+                fields={"m3_available": m3_available, "m4_available": m4_available,
+                        "compatibility_fallback": True},
+            )
+            return output
 
         relevant_uids: set[MemoryUid] = set()
         for index, edge in enumerate(edges):
@@ -216,6 +256,15 @@ class TransferValidator:
             if edge.target_uid in eligible:
                 relevant_uids.add(edge.target_uid)
         if not relevant_uids:
+            count = sum(
+                int(int(edge.relation_type) == int(RelationType.TRANSFER_CORRESPONDENCE))
+                for edge in edges
+            )
+            flow.emit(
+                "transfer", "candidate_selection", input_count=count, output_count=0,
+                rejection_counts={"source_or_target_not_m3_or_m4": count} if count else {},
+                fields={"m3_available": m3_available, "m4_available": m4_available},
+            )
             return ()
 
         requested_uids = tuple(sorted(relevant_uids))
@@ -248,6 +297,29 @@ class TransferValidator:
             return tuple(index for index in range(64) if mask & (1 << index))
 
         best: dict[MemoryUid, TransferCandidate] = {}
+        considered = 0
+        rejected: Counter[str] = Counter()
+        examples: list[dict[str, object]] = []
+
+        def example(edge, *, uid=None, own_games=(), other_games=(), reason=None) -> None:
+            if len(examples) >= flow.MAX_EXAMPLES:
+                return
+            examples.append(
+                {
+                    "source_world": list(own_games),
+                    "candidate_target_world": list(other_games),
+                    "candidate_uid": flow.uid_text(uid if uid is not None else edge.source_uid),
+                    "correspondence_uid": flow.uid_text(edge.target_uid),
+                    "correspondence_score": float(edge.score),
+                    "provenance_distinct": bool(own_games and other_games and set(own_games) != set(other_games)),
+                    "m3_available": m3_available,
+                    "m4_available": m4_available,
+                    "held_out_eligibility": None,
+                    "scheduler_decision": "not_reached",
+                    "rejection_reason": reason,
+                }
+            )
+
         for index, edge in enumerate(edges):
             if (
                 index % 4096 == 0
@@ -258,23 +330,47 @@ class TransferValidator:
             if int(edge.relation_type) != int(RelationType.TRANSFER_CORRESPONDENCE):
                 continue
             if edge.source_uid not in eligible or edge.target_uid not in eligible:
+                considered += 1
+                rejected["source_or_target_not_m3_or_m4"] += 1
+                example(edge, reason="source_or_target_not_m3_or_m4")
                 continue
             score = float(edge.score)
             if score <= 0.0:
+                considered += 1
+                rejected["nonpositive_correspondence_score"] += 1
+                example(edge, reason="nonpositive_correspondence_score")
                 continue
             left_games = games(edge.source_uid)
             right_games = games(edge.target_uid)
-            if not left_games or not right_games:
+            if not left_games:
+                considered += 1
+                rejected["source_provenance_missing"] += 1
+                example(edge, own_games=left_games, other_games=right_games,
+                        reason="source_provenance_missing")
+                continue
+            if not right_games:
+                considered += 1
+                rejected["target_provenance_missing"] += 1
+                example(edge, own_games=left_games, other_games=right_games,
+                        reason="target_provenance_missing")
                 continue
             left_set, right_set = set(left_games), set(right_games)
             if left_set == right_set:
+                considered += 1
+                rejected["provenance_not_distinct"] += 1
+                example(edge, own_games=left_games, other_games=right_games,
+                        reason="provenance_not_distinct")
                 continue
 
             for uid, own_games, other_uid, other_games in (
                 (edge.source_uid, left_games, edge.target_uid, right_games),
                 (edge.target_uid, right_games, edge.source_uid, left_games),
             ):
+                considered += 1
                 if not (set(other_games) - set(own_games)):
+                    rejected["no_new_target_world"] += 1
+                    example(edge, uid=uid, own_games=own_games, other_games=other_games,
+                            reason="no_new_target_world")
                     continue
                 candidate = TransferCandidate(
                     uid=uid,
@@ -292,8 +388,39 @@ class TransferValidator:
                     prior.structural_score,
                     prior.correspondence_uid,
                 ):
+                    if prior is not None:
+                        rejected["superseded_by_stronger_correspondence"] += 1
                     best[uid] = candidate
-        return tuple(best[uid] for uid in sorted(best))
+                else:
+                    rejected["superseded_by_stronger_correspondence"] += 1
+                    example(edge, uid=uid, own_games=own_games, other_games=other_games,
+                            reason="superseded_by_stronger_correspondence")
+        output = tuple(best[uid] for uid in sorted(best))
+        for candidate in output:
+            if len(examples) >= flow.MAX_EXAMPLES:
+                break
+            examples.append(
+                {
+                    "source_world": list(candidate.formation_games),
+                    "candidate_target_world": list(candidate.correspondence_games),
+                    "candidate_uid": flow.uid_text(candidate.uid),
+                    "correspondence_uid": flow.uid_text(candidate.correspondence_uid),
+                    "correspondence_score": candidate.structural_score,
+                    "provenance_distinct": set(candidate.formation_games) != set(candidate.correspondence_games),
+                    "m3_available": m3_available,
+                    "m4_available": m4_available,
+                    "held_out_eligibility": None,
+                    "scheduler_decision": "candidate_admissible",
+                    "rejection_reason": None,
+                }
+            )
+        flow.add_counters("transfer", admissible_candidates=len(output))
+        flow.emit(
+            "transfer", "candidate_selection", input_count=considered,
+            output_count=len(output), rejection_counts=rejected, examples=examples,
+            fields={"m3_available": m3_available, "m4_available": m4_available},
+        )
+        return output
 
     def record_trial(
         self,

@@ -418,6 +418,30 @@ def _capture_env_step_v866(self, action):
 
 def _write_successful_trajectory_v866(row) -> None:
     _BASE_TRAJECTORY_WRITE(row)
+    from v8 import information_flow_diagnostics as flow
+
+    flow.add_counters(
+        "trajectory_optimizer",
+        successful_trajectories_produced=1,
+        trajectories_submitted=1,
+    )
+    flow.emit_bounded(
+        "trajectory_optimizer", "successful_trajectory_produced",
+        input_count=1, output_count=1,
+        examples=(
+            {"trajectory_id": str(row.trajectory_id),
+             "producer_source_stage": "verified_success_capture",
+             "source_world": str(row.anchor.source_id),
+             "submitted_to_optimizer": True,
+             "optimizer_received": None,
+             "counted_in_trajectories_seen": None,
+             "optimizer_candidates_generated": None,
+             "validation_attempts": None,
+             "validation_result": None,
+             "accepted_variant_id": None,
+             "rejection_reason": None},
+        ),
+    )
     try:
         record_verified_success_v866(
             game_id=str(row.anchor.source_id),
@@ -462,6 +486,39 @@ def learning_effectiveness_snapshot_v866(
         outcomes = getattr(coordinator, "_games", ())
         games = tuple(dict.fromkeys(str(game) for game in outcomes))
     verified = verified_success_snapshot_v866(runtime, games)
+    from v8 import information_flow_diagnostics as flow
+
+    service = getattr(runtime, "_v814_trajectory_optimizer", None)
+    if service is not None:
+        with service._lock:
+            optimizer_counters = {
+                "successful_trajectories_produced": int(verified["successful_trajectories"]),
+                "trajectories_submitted": int(verified["successful_trajectories"]),
+                "trajectories_received": int(flow.counter_snapshot("trajectory_optimizer").get("trajectories_received", 0)),
+                "trajectories_seen": int(service._trajectories_seen),
+                "candidates_generated": int(service._candidates_generated),
+                "validations": int(service._validations),
+                "validation_successes": int(service._validation_successes),
+                "accepted_variants": len(service._validated),
+            }
+        bypassed = max(
+            0,
+            optimizer_counters["trajectories_received"]
+            - optimizer_counters["trajectories_seen"],
+        )
+        flow.emit(
+            "trajectory_optimizer", "pipeline_summary",
+            input_count=optimizer_counters["successful_trajectories_produced"],
+            output_count=optimizer_counters["accepted_variants"],
+            rejection_counts=(
+                {"received_without_legacy_trajectories_seen_increment": bypassed}
+                if bypassed else {}
+            ),
+            fields={"counters": optimizer_counters,
+                    "trajectories_seen_counter_owner": "legacy_edit_source_queue",
+                    "source_validation_bypasses_trajectories_seen": True,
+                    "counter_scope": "current_run_verified_and_optimizer_service"},
+        )
     from v8.restored_competence_v872 import restored_competence_snapshot_v872
 
     restored = restored_competence_snapshot_v872(_runtime_success_root(runtime), games)

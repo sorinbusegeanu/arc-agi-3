@@ -76,6 +76,7 @@ def _optimizer_loop_v836(service) -> None:
     from v8 import trajectory_optimizer_v814 as optimizer
     from v8 import trajectory_optimizer_v818 as v818
     from v8 import trajectory_target_minimization_v820 as v820
+    from v8 import information_flow_diagnostics as flow
 
     try:
         while not service._stop.is_set():
@@ -112,6 +113,21 @@ def _optimizer_loop_v836(service) -> None:
 
                 with service._lock:
                     service._candidates_generated += len(rows)
+                flow.add_counters("trajectory_optimizer", candidates_generated=len(rows))
+                flow.emit_bounded(
+                    "trajectory_optimizer", "optimizer_candidate_generation",
+                    input_count=1, output_count=len(rows),
+                    rejection_counts={} if rows else {"candidate_generator_returned_no_variants": 1},
+                    examples=({"trajectory_id": str(source.trajectory_id),
+                               "producer_source_stage": "optimizer_edit_queue",
+                               "optimizer_received": True,
+                               "counted_in_trajectories_seen": str(source.trajectory_id) in service._seen_sources,
+                               "optimizer_candidates_generated": len(rows),
+                               "validation_attempts": 0,
+                               "validation_result": None,
+                               "accepted_variant_id": None,
+                               "rejection_reason": None if rows else "candidate_generator_returned_no_variants"},),
+                )
                 service._log(
                     "candidates",
                     trajectory_id=source.trajectory_id,

@@ -695,13 +695,41 @@ class TrajectoryOptimizationService:
 
     def metrics(self) -> TrajectoryOptimizerMetrics:
         with self._lock:
-            return TrajectoryOptimizerMetrics(
+            result = TrajectoryOptimizerMetrics(
                 self._trajectories_seen,
                 self._candidates_generated,
                 self._validations,
                 self._validation_successes,
                 len(self._validated),
             )
+        from v8 import information_flow_diagnostics as flow
+
+        observed = flow.counter_snapshot("trajectory_optimizer")
+        counters = {
+            "successful_trajectories_produced": int(observed.get("successful_trajectories_produced", 0)),
+            "trajectories_submitted": int(observed.get("trajectories_submitted", 0)),
+            "trajectories_received": int(observed.get("trajectories_received", 0)),
+            "trajectories_seen": int(result.trajectories_seen),
+            "candidates_generated": int(result.candidates_generated),
+            "validations": int(result.validations),
+            "validation_successes": int(result.validation_successes),
+            "accepted_variants": int(result.validated_variants),
+        }
+        bypassed = max(0, counters["trajectories_received"] - counters["trajectories_seen"])
+        flow.emit(
+            "trajectory_optimizer", "pipeline_summary",
+            input_count=counters["successful_trajectories_produced"],
+            output_count=counters["accepted_variants"],
+            rejection_counts=(
+                {"received_without_legacy_trajectories_seen_increment": bypassed}
+                if bypassed else {}
+            ),
+            fields={"counters": counters,
+                    "trajectories_seen_counter_owner": "legacy_edit_source_queue",
+                    "source_validation_bypasses_trajectories_seen": True,
+                    "counter_scope": "current_process_observed"},
+        )
+        return result
 
     def state_dict(self) -> dict[str, object]:
         with self._lock:

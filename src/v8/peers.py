@@ -618,11 +618,35 @@ class DevelopmentalPeerSupervisor:
 
             if cancelled():
                 return
-            for candidate in analyses["transfer"][: self.candidate_budget]:
+            from v8 import information_flow_diagnostics as flow
+
+            transfer_candidates = tuple(analyses["transfer"][: self.candidate_budget])
+            transfer_rejections: dict[str, int] = {}
+            transfer_examples: list[dict[str, object]] = []
+            transfer_emitted = 0
+            for candidate in transfer_candidates:
                 row = by_uid.get(candidate.uid)
-                if row is None or not self._fresh(
-                    "transfer", row.uid, row.updated_watermark
-                ):
+                reason = None
+                if row is None:
+                    reason = "candidate_node_missing"
+                elif not self._fresh("transfer", row.uid, row.updated_watermark):
+                    reason = "stale_transfer_candidate"
+                if reason is not None:
+                    transfer_rejections[reason] = transfer_rejections.get(reason, 0) + 1
+                    if len(transfer_examples) < flow.MAX_EXAMPLES:
+                        transfer_examples.append(
+                            {"source_world": list(candidate.formation_games),
+                             "candidate_target_world": list(candidate.correspondence_games),
+                             "candidate_uid": flow.uid_text(candidate.uid),
+                             "correspondence_uid": flow.uid_text(candidate.correspondence_uid),
+                             "correspondence_score": candidate.structural_score,
+                             "provenance_distinct": set(candidate.formation_games) != set(candidate.correspondence_games),
+                             "m3_available": bool(row is not None and int(row.level) == int(MemoryLevel.M3)),
+                             "m4_available": bool(row is not None and int(row.level) == int(MemoryLevel.M4)),
+                             "held_out_eligibility": None,
+                             "scheduler_decision": "not_reached",
+                             "rejection_reason": reason}
+                        )
                     continue
                 self._submit(
                     self._existing_proposal(
@@ -638,6 +662,27 @@ class DevelopmentalPeerSupervisor:
                     validation_state=int(ValidationState.STRUCTURAL),
                     provenance_games=candidate.formation_games,
                 )
+                transfer_emitted += 1
+                if len(transfer_examples) < flow.MAX_EXAMPLES:
+                    transfer_examples.append(
+                        {"source_world": list(candidate.formation_games),
+                         "candidate_target_world": list(candidate.correspondence_games),
+                         "candidate_uid": flow.uid_text(candidate.uid),
+                         "correspondence_uid": flow.uid_text(candidate.correspondence_uid),
+                         "correspondence_score": candidate.structural_score,
+                         "provenance_distinct": set(candidate.formation_games) != set(candidate.correspondence_games),
+                         "m3_available": int(row.level) == int(MemoryLevel.M3),
+                         "m4_available": int(row.level) == int(MemoryLevel.M4),
+                         "held_out_eligibility": None,
+                         "scheduler_decision": "transfer_structural_recorded",
+                         "rejection_reason": None}
+                    )
+            flow.add_counters("transfer", transfer_structural_count=transfer_emitted)
+            flow.emit(
+                "transfer", "transfer_structural", input_count=len(transfer_candidates),
+                output_count=transfer_emitted, rejection_counts=transfer_rejections,
+                examples=transfer_examples,
+            )
 
             if cancelled():
                 return

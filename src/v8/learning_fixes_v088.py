@@ -239,12 +239,18 @@ def _run_automatic_transfer_experiments_v088(
     max_trials: int = 8,
 ):
     from v8.experiments import ExperimentSummary
+    from v8 import information_flow_diagnostics as flow
 
     if runtime.peers is None or max_trials <= 0 or steps_per_trial <= 0:
+        reason = "peer_supervisor_unavailable" if runtime.peers is None else "transfer_trial_budget_disabled"
+        flow.emit("transfer", "transfer_experiment_scheduling", input_count=0,
+                  output_count=0, rejection_counts={reason: 1})
         return ExperimentSummary(0, 0, 0)
 
     holdouts = _held_out_games(tuple(games), env_root)
     if not holdouts:
+        flow.emit("transfer", "transfer_experiment_scheduling", input_count=0,
+                  output_count=0, rejection_counts={"no_held_out_worlds": 1})
         return ExperimentSummary(0, 0, 0)
 
     cached_cut = _coherent_cached_transfer_cut(runtime.read_view)
@@ -266,24 +272,103 @@ def _run_automatic_transfer_experiments_v088(
             provenance=runtime.read_view.source_games,
         )
     attempted = completed = passed = 0
+    eligible_target_worlds = 0
+    considered_pairs = 0
+    scheduling_rejections: dict[str, int] = {}
+    scheduling_examples: list[dict[str, object]] = []
     eligibility_probes = 0
     eligibility_probe_limit = max(1, int(max_trials))
     game_hashes = {game: stable_u64(game, person=b"v8-game") for game in holdouts}
+
+    def reject(reason: str) -> None:
+        scheduling_rejections[reason] = scheduling_rejections.get(reason, 0) + 1
+
+    def add_example(candidate, game_id, target_hash, *, eligible, decision, reason) -> None:
+        if len(scheduling_examples) >= flow.MAX_EXAMPLES:
+            return
+        row = by_uid.get(candidate.uid)
+        scheduling_examples.append(
+            {"source_world": list(candidate.formation_games),
+             "candidate_target_world": str(game_id),
+             "candidate_target_world_hash": int(target_hash),
+             "candidate_uid": flow.uid_text(candidate.uid),
+             "correspondence_uid": flow.uid_text(candidate.correspondence_uid),
+             "correspondence_score": float(candidate.structural_score),
+             "provenance_distinct": set(candidate.formation_games) != set(candidate.correspondence_games),
+             "m3_available": bool(row is not None and int(row.level) == int(MemoryLevel.M3)),
+             "m4_available": bool(row is not None and int(row.level) == int(MemoryLevel.M4)),
+             "held_out_eligibility": bool(eligible),
+             "scheduler_decision": str(decision),
+             "rejection_reason": reason}
+        )
+
+    def finish(stop_reason: str | None = None):
+        failed = completed - passed
+        if stop_reason is not None:
+            reject(stop_reason)
+        flow.add_counters(
+            "transfer", eligible_target_worlds=eligible_target_worlds,
+            scheduled_trials=attempted, completed_trials=completed,
+            passed_trials=passed, failed_trials=failed,
+        )
+        flow.emit(
+            "transfer", "transfer_experiment_scheduling",
+            input_count=considered_pairs, output_count=attempted,
+            rejection_counts=scheduling_rejections, examples=scheduling_examples,
+            fields={"eligible_target_worlds": eligible_target_worlds,
+                    "scheduled_trials": attempted, "completed_trials": completed,
+                    "passed_trials": passed, "failed_trials": failed,
+                    "eligibility_probe_limit": eligibility_probe_limit},
+        )
+        flow.emit(
+            "transfer", "transfer_trial_completion", input_count=completed,
+            output_count=passed,
+            rejection_counts=(
+                {"transfer_effect_not_above_existing_threshold": failed}
+                if failed else {}
+            ),
+            examples=scheduling_examples,
+            fields={"completed_trials": completed, "passed_trials": passed,
+                    "failed_trials": failed},
+        )
+        observed = flow.counter_snapshot("transfer")
+        pipeline = {
+            "structural_correspondence_count": int(observed.get("structural_correspondence_count", 0)),
+            "transfer_structural_count": int(observed.get("transfer_structural_count", 0)),
+            "admissible_candidates": len(candidates),
+            "eligible_target_worlds": eligible_target_worlds,
+            "scheduled_trials": attempted,
+            "completed_trials": completed,
+            "passed_trials": passed,
+            "failed_trials": failed,
+        }
+        flow.emit(
+            "transfer", "pipeline_summary", input_count=pipeline["structural_correspondence_count"],
+            output_count=passed, rejection_counts=scheduling_rejections,
+            fields={"counters": pipeline, "counter_scope": "current_process_observed"},
+        )
+        return ExperimentSummary(attempted, completed, passed)
 
     for candidate in sorted(candidates, key=lambda row: (-row.structural_score, row.uid)):
         formation = tuple(candidate.formation_games)
         for game_id in holdouts:
             if completed >= int(max_trials):
-                return ExperimentSummary(attempted, completed, passed)
+                return finish("completed_trial_limit_reached")
             target_hash = int(game_hashes[game_id])
+            considered_pairs += 1
             if target_hash in formation:
+                reject("target_world_in_formation_provenance")
+                add_example(candidate, game_id, target_hash, eligible=False,
+                            decision="rejected", reason="target_world_in_formation_provenance")
                 continue
             # max_trials bounds completed causal comparisons, but an inapplicable
             # ancestor does not become a trial. Bound that ranked eligibility scan
             # separately so a graph containing only unexecutable transfer concepts
             # cannot hold shutdown in environment probes indefinitely.
             if eligibility_probes >= eligibility_probe_limit:
-                return ExperimentSummary(attempted, completed, passed)
+                add_example(candidate, game_id, target_hash, eligible=False,
+                            decision="not_scheduled", reason="eligibility_probe_limit_reached")
+                return finish("eligibility_probe_limit_reached")
             eligibility_probes += 1
             trial_seed = int(seed) + (completed + 1) * 7919
             on_metric, used = _probe_policy_v088(
@@ -295,7 +380,11 @@ def _run_automatic_transfer_experiments_v088(
                 required_ancestor=candidate.uid,
             )
             if used <= 0:
+                reject("target_memory_not_executable")
+                add_example(candidate, game_id, target_hash, eligible=False,
+                            decision="not_scheduled", reason="target_memory_not_executable")
                 continue
+            eligible_target_worlds += 1
             attempted += 1
             off_metric, _ = _probe_policy_v088(
                 read_view=runtime.read_view,
@@ -315,6 +404,11 @@ def _run_automatic_transfer_experiments_v088(
             )
             completed += 1
             passed += int(trial.passed)
+            add_example(
+                candidate, game_id, target_hash, eligible=True,
+                decision="transfer_trial_pass" if trial.passed else "transfer_trial_fail",
+                reason=None if trial.passed else "transfer_effect_not_above_existing_threshold",
+            )
             if not trial.passed:
                 row = by_uid.get(candidate.uid)
                 if row is not None:
@@ -339,7 +433,7 @@ def _run_automatic_transfer_experiments_v088(
                             causal_intervention="matched_arc_target_memory_vs_memory_free",
                             effect_direction=-1,
                         )
-    return ExperimentSummary(attempted, completed, passed)
+    return finish()
 
 
 def _install_transfer_experiments() -> None:

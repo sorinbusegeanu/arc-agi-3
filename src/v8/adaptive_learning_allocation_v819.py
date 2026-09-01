@@ -1556,6 +1556,35 @@ def _source_validation_candidate(optimizer, source):
 def _service_submit_v819(service, trajectory) -> bool:
     from v8 import trajectory_optimizer_v814 as optimizer
     from v8 import trajectory_optimizer_v818 as v818
+    from v8 import information_flow_diagnostics as flow
+
+    def report(result: bool, reason: str | None, before_seen: int) -> bool:
+        after_seen = int(getattr(service, "_trajectories_seen", 0))
+        seen_delta = max(0, after_seen - int(before_seen))
+        flow.add_counters("trajectory_optimizer", trajectories_seen=seen_delta)
+        flow.emit_bounded(
+            "trajectory_optimizer", "optimizer_submission",
+            input_count=1, output_count=int(result),
+            rejection_counts={} if reason is None else {reason: 1},
+            examples=(
+                {"trajectory_id": str(trajectory.trajectory_id),
+                 "producer_source_stage": "optimizer_round_source" if int(getattr(trajectory, "round_index", 0)) else "successful_trajectory",
+                 "submitted_to_optimizer": True,
+                 "optimizer_received": True,
+                 "counted_in_trajectories_seen": bool(seen_delta),
+                 "trajectories_seen_before": int(before_seen),
+                 "trajectories_seen_after": after_seen,
+                 "counter_path": "legacy_edit_queue" if seen_delta else "source_validation_bypass",
+                 "optimizer_candidates_generated": None,
+                 "validation_attempts": None,
+                 "validation_result": None,
+                 "accepted_variant_id": None,
+                 "rejection_reason": reason},
+            ),
+        )
+        return result
+
+    before_seen = int(getattr(service, "_trajectories_seen", 0))
 
     if int(getattr(trajectory, "round_index", 0)) != 0:
         runtime = getattr(service, "_v819_runtime", None)
@@ -1568,12 +1597,13 @@ def _service_submit_v819(service, trajectory) -> bool:
                 or record.validations_since_improvement >= coord.config.max_validations_without_improvement
             ):
                 record.optimizer_exhausted_version = record.frontier_version
-                return False
-        return _BASE_SERVICE_SUBMIT(service, trajectory)
+                return report(False, "existing_optimizer_budget_exhausted", before_seen)
+        result = bool(_BASE_SERVICE_SUBMIT(service, trajectory))
+        return report(result, None if result else "legacy_optimizer_queue_rejected", before_seen)
 
     with service._v819_lock:
         if trajectory.trajectory_id in service._v819_source_seen:
-            return False
+            return report(False, "duplicate_source_validation_source", before_seen)
         service._v819_source_seen.add(trajectory.trajectory_id)
         service._v819_source_pending[trajectory.trajectory_id] = trajectory
         source_kind = _SOURCE_KIND_BY_TRAJECTORY.pop(
@@ -1588,7 +1618,11 @@ def _service_submit_v819(service, trajectory) -> bool:
             service._v819_source_seen.discard(trajectory.trajectory_id)
             service._v819_source_pending.pop(trajectory.trajectory_id, None)
             service._v819_source_kind.pop(trajectory.trajectory_id, None)
-    return routed
+    return report(
+        routed,
+        None if routed else "source_validation_route_rejected",
+        before_seen,
+    )
 
 
 def _route_candidate_v819(service, candidate) -> bool:

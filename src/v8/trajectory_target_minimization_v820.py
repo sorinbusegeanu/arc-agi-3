@@ -277,9 +277,26 @@ def _available_actions_at_anchor(validator, candidate) -> tuple[int, ...]:
 
 
 def _validate_tracked(service, validator, candidate, *, skip_attempted: bool = True):
+    from v8 import information_flow_diagnostics as flow
+
     _raise_if_validation_cancelled(service)
     with service._lock:
         if skip_attempted and candidate.candidate_id in service._attempted:
+            flow.emit_bounded(
+                "trajectory_optimizer", "optimizer_validation",
+                input_count=1, output_count=0,
+                rejection_counts={"duplicate_candidate": 1},
+                examples=({"trajectory_id": str(candidate.source.trajectory_id),
+                           "candidate_id": str(candidate.candidate_id),
+                           "producer_source_stage": str(candidate.edit_kind),
+                           "optimizer_received": True,
+                           "counted_in_trajectories_seen": str(candidate.source.trajectory_id) in service._seen_sources,
+                           "optimizer_candidates_generated": 1,
+                           "validation_attempts": 0,
+                           "validation_result": "not_attempted",
+                           "accepted_variant_id": None,
+                           "rejection_reason": "duplicate_candidate"},),
+            )
             return None
         service._attempted.add(candidate.candidate_id)
         service._active_validations += 1
@@ -296,6 +313,10 @@ def _validate_tracked(service, validator, candidate, *, skip_attempted: bool = T
     with service._lock:
         service._validations += int(result.attempts)
         service._validation_successes += int(result.successes)
+    flow.add_counters(
+        "trajectory_optimizer", validations=int(result.attempts),
+        validation_successes=int(result.successes),
+    )
     return result
 
 
@@ -340,13 +361,36 @@ def _canonicalize_success(service, validator, candidate, result):
 def _accept_frontier(service, candidate, result):
     from v8 import trajectory_optimizer_v814 as optimizer
     from v8 import trajectory_optimizer_v818 as v818
+    from v8 import information_flow_diagnostics as flow
 
-    if not bool(result.success) or int(candidate.cost) >= int(candidate.source.cost):
-        return False, None
+    def report(accepted: bool, reason: str | None, validated=None):
+        flow.add_counters("trajectory_optimizer", accepted_variants=int(accepted))
+        flow.emit_bounded(
+            "trajectory_optimizer", "optimizer_validation",
+            input_count=1, output_count=int(accepted),
+            rejection_counts={} if reason is None else {reason: 1},
+            examples=({"trajectory_id": str(candidate.source.trajectory_id),
+                       "candidate_id": str(candidate.candidate_id),
+                       "producer_source_stage": str(candidate.edit_kind),
+                       "optimizer_received": True,
+                       "counted_in_trajectories_seen": str(candidate.source.trajectory_id) in service._seen_sources,
+                       "optimizer_candidates_generated": 1,
+                       "validation_attempts": int(result.attempts),
+                       "validation_successes": int(result.successes),
+                       "validation_result": str(result.reason),
+                       "accepted_variant_id": str(candidate.candidate_id) if accepted else None,
+                       "rejection_reason": reason},),
+        )
+        return accepted, validated
+
+    if not bool(result.success):
+        return report(False, str(result.reason or "validation_failed"))
+    if int(candidate.cost) >= int(candidate.source.cost):
+        return report(False, "validation_success_without_cost_reduction")
     row = service._accept(candidate)
     accepted = getattr(row, "variant_id", None) == candidate.candidate_id
     if not accepted:
-        return False, None
+        return report(False, "validated_variant_not_selected_as_frontier")
 
     validated = replace(
         row,
@@ -371,7 +415,7 @@ def _accept_frontier(service, candidate, result):
             service._v818_best_candidate = int(candidate.cost)
     v818._record_validated_prefix(service, candidate, result)
     service._publish_validated()
-    return True, validated
+    return report(True, None, validated)
 
 
 def _submit_next_source(service, candidate, validated) -> None:
@@ -457,6 +501,10 @@ def _process_target_minimize(service, validator, marker) -> None:
     direct_actions = _available_actions_at_anchor(validator, marker)
     with service._lock:
         service._candidates_generated += len(direct_actions) + 1
+    from v8 import information_flow_diagnostics as flow
+    flow.add_counters(
+        "trajectory_optimizer", candidates_generated=len(direct_actions) + 1,
+    )
     for action in direct_actions:
         _raise_if_validation_cancelled(service)
         direct = _candidate(
@@ -624,6 +672,22 @@ def _game_validator_loop_v820(service, game_id: str) -> None:
                         game=game,
                         candidate_cost=candidate.cost,
                         frontier_cost=frontier,
+                    )
+                    from v8 import information_flow_diagnostics as flow
+                    flow.emit_bounded(
+                        "trajectory_optimizer", "optimizer_validation",
+                        input_count=1, output_count=0,
+                        rejection_counts={"frontier_cost_pruned": 1},
+                        examples=({"trajectory_id": str(candidate.source.trajectory_id),
+                                   "candidate_id": str(candidate.candidate_id),
+                                   "producer_source_stage": str(candidate.edit_kind),
+                                   "optimizer_received": True,
+                                   "counted_in_trajectories_seen": str(candidate.source.trajectory_id) in service._seen_sources,
+                                   "optimizer_candidates_generated": 1,
+                                   "validation_attempts": 0,
+                                   "validation_result": "not_attempted",
+                                   "accepted_variant_id": None,
+                                   "rejection_reason": "frontier_cost_pruned"},),
                     )
                     continue
                 _process_candidate(service, validator, candidate)

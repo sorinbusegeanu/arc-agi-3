@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import Counter
 from dataclasses import dataclass
 
 from v8.carriers import CarrierEstimator
@@ -255,21 +256,41 @@ class V82DevelopmentalPeerSupervisor(DevelopmentalPeerSupervisor):
         cut: DevelopmentalGenerationCut,
         frozen: _FrozenCutReadView,
     ) -> None:
+        from v8 import information_flow_diagnostics as flow
+
         by_uid = {row.uid: row for row in cut.nodes}
-        for evidence in self.correspondence.evaluate(
-            cut.nodes,
-            cut.edges,
-            budget=self.candidate_budget,
-        ):
+        evaluated = tuple(self.correspondence.evaluate(
+            cut.nodes, cut.edges, budget=self.candidate_budget,
+        ))
+        rejected: Counter[str] = Counter()
+        examples: list[dict[str, object]] = []
+        emitted = 0
+        for evidence in evaluated:
             source = by_uid.get(evidence.source_uid)
             target = by_uid.get(evidence.target_uid)
             if source is None or target is None:
+                reason = "source_or_target_node_missing"
+                rejected[reason] += 1
+                if len(examples) < flow.MAX_EXAMPLES:
+                    examples.append({"source_uid": flow.uid_text(evidence.source_uid),
+                                     "target_uid": flow.uid_text(evidence.target_uid),
+                                     "correspondence_score": float(evidence.similarity_score),
+                                     "rejection_reason": reason})
                 continue
             freshness = f"v82-correspondence:{target.uid.hex()}"
             if not self._fresh(freshness, source.uid, evidence.evidence_watermark):
+                reason = "stale_correspondence"
+                rejected[reason] += 1
+                if len(examples) < flow.MAX_EXAMPLES:
+                    examples.append({"source_uid": flow.uid_text(source.uid),
+                                     "target_uid": flow.uid_text(target.uid),
+                                     "correspondence_score": float(evidence.similarity_score),
+                                     "rejection_reason": reason})
                 continue
             score = max(0.0, min(1.0, 1.0 - float(evidence.epsilon_struct)))
-            games = tuple(sorted(frozen.source_games(source.uid) | frozen.source_games(target.uid)))
+            source_games = frozen.source_games(source.uid)
+            target_games = frozen.source_games(target.uid)
+            games = tuple(sorted(source_games | target_games))
             if evidence.admissible:
                 self._submit(
                     self._existing_proposal(
@@ -286,7 +307,15 @@ class V82DevelopmentalPeerSupervisor(DevelopmentalPeerSupervisor):
                     validation_state=int(ValidationState.STRUCTURAL),
                     provenance_games=games,
                 )
+                emitted += 1
+                reason = None
             else:
+                reason = (
+                    "structural_mapping_empty"
+                    if int(evidence.mapping_size) <= 0
+                    else "structural_error_not_below_existing_threshold"
+                )
+                rejected[reason] += 1
                 self._append_evidence(
                     "structural_correspondence_fail",
                     source,
@@ -295,6 +324,25 @@ class V82DevelopmentalPeerSupervisor(DevelopmentalPeerSupervisor):
                     provenance_games=games,
                     effect_direction=-1,
                 )
+            if len(examples) < flow.MAX_EXAMPLES:
+                examples.append(
+                    {"source_uid": flow.uid_text(source.uid),
+                     "target_uid": flow.uid_text(target.uid),
+                     "source_world": sorted(source_games),
+                     "candidate_target_world": sorted(target_games),
+                     "correspondence_score": score,
+                     "provenance_distinct": source_games != target_games,
+                     "m3_available": int(source.level) == int(MemoryLevel.M3),
+                     "m4_available": int(source.level) == int(MemoryLevel.M4),
+                     "held_out_eligibility": None,
+                     "scheduler_decision": "not_reached",
+                     "rejection_reason": reason}
+                )
+        flow.add_counters("transfer", structural_correspondence_count=emitted)
+        flow.emit(
+            "transfer", "structural_correspondence", input_count=len(evaluated),
+            output_count=emitted, rejection_counts=rejected, examples=examples,
+        )
 
     def run_once(self) -> None:
         if not self._v82_run_lock.acquire(blocking=False):
