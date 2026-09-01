@@ -591,6 +591,15 @@ def _write_learning_effectiveness_log_v866(
     except OSError:
         pass
 
+    # During a mixed run this callback belongs to the inner ARC allocator.  Its
+    # progress excludes concurrent generic actors while the runtime budget covers
+    # every job, so printing that ratio beside the all-actor dedicated reporter
+    # creates a second, lower percentage that appears to move backwards.  Keep
+    # the detailed JSONL record, but leave mixed-run stdout to the all-actor
+    # reporter. Pure ARC runs retain this authoritative presentation.
+    if bool(getattr(runtime, "_v866_mixed_scope_active", False)):
+        return
+
     scope = payload.get("scope", {})
     used_steps = int(scope.get("steps", 0)) if isinstance(scope, dict) else 0
     budget = max(

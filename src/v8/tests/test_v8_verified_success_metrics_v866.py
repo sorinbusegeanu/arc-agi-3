@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
@@ -250,6 +251,55 @@ class VerifiedSuccessMetricsV866Tests(unittest.TestCase):
             self.assertIn("G=0.0%", line)
             self.assertIn("step/L=-", line)
             self.assertIn("firstWin=-", line)
+
+    def test_inner_mixed_effectiveness_stdout_is_suppressed_but_json_is_kept(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = _Runtime(Path(tmp), ("ic01", "FrozenLake-v1"))
+            runtime._v866_mixed_scope_active = True
+            payload = {"scope": {"steps": 50}, "effectiveness": {}}
+
+            with patch.object(
+                verified,
+                "learning_effectiveness_snapshot_v866",
+                return_value=payload,
+            ), patch.object(report, "_emit_effectiveness_stdout") as emit:
+                verified._write_learning_effectiveness_log_v866(
+                    runtime,
+                    object(),
+                    {},
+                    {},
+                    {},
+                )
+
+            emit.assert_not_called()
+            records = [
+                json.loads(line)
+                for line in (Path(tmp) / report._REPORT_FILE)
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual(records, [payload])
+
+    def test_pure_arc_effectiveness_stdout_remains_enabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = _Runtime(Path(tmp), ("ic01",))
+            runtime._v866_mixed_scope_active = False
+            payload = {"scope": {"steps": 50}, "effectiveness": {}}
+
+            with patch.object(
+                verified,
+                "learning_effectiveness_snapshot_v866",
+                return_value=payload,
+            ), patch.object(report, "_emit_effectiveness_stdout") as emit:
+                verified._write_learning_effectiveness_log_v866(
+                    runtime,
+                    object(),
+                    {},
+                    {},
+                    {},
+                )
+
+            emit.assert_called_once_with(payload, budget_consumed_pct=50.0)
 
 
 if __name__ == "__main__":
