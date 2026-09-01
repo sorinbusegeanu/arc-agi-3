@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
 import queue
 from dataclasses import dataclass, replace
+from pathlib import Path
 from random import Random
 
 from v8.model import (
@@ -24,6 +26,18 @@ _EPISODE_STEPS = 0
 _FIRST_WIN_STEPS = 0
 _BEST_WIN_STEPS = 0
 _LAST_WIN_STEPS = 0
+
+_TRANSFER_EXECUTABLE_FIELDS = (
+    "M7 level",
+    "STRATEGY memory type",
+    "key_parts[action_id,outcome_uid_hi,outcome_uid_lo,context_bucket]",
+    "candidate/probation/active/validated/reactivated cognitive state",
+    "positive support_count",
+    "existing probeable outcome memory",
+    "lineage to required transfer ancestor within depth 8",
+    "action available in target environment",
+    "matching target context or transferable fallback",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,6 +153,7 @@ def _probe_policy_v088(
     seed: int,
     steps: int,
     required_ancestor: MemoryUid | None,
+    diagnostic: dict[str, object] | None = None,
 ) -> tuple[float, int]:
     """Matched intervention: target-memory ON versus genuinely memory-free OFF."""
     from v7.environment.arc_adapter import ArcGridEnvironment
@@ -147,6 +162,10 @@ def _probe_policy_v088(
     env = ArcGridEnvironment(game_id=game_id, seed=seed, env_root=env_root)
     rng = Random(int(seed) ^ 0x8A11)
     wins = failures = level_gain = used = 0
+    observed_contexts: set[int] = set()
+    observed_actions: set[int] = set()
+    plan_misses = 0
+    planned_strategy_ids: set[str] = set()
     last_levels = int(env.last_levels_completed)
     for _ in range(max(1, int(steps))):
         before = env.observe()
@@ -159,6 +178,8 @@ def _probe_policy_v088(
             action = _memory_free_action(actions, rng)
         else:
             context = int(structural_grid_signature(before))
+            observed_contexts.add(context)
+            observed_actions.update(actions)
             plan = read_view.planned_action(
                 context,
                 actions,
@@ -166,10 +187,12 @@ def _probe_policy_v088(
                 ignore_preference=True,
             )
             if plan is None:
+                plan_misses += 1
                 action = _memory_free_action(actions, rng)
             else:
                 action = int(plan.action_id)
                 used += 1
+                planned_strategy_ids.add(str(plan.strategy_uid.hex()))
         env.step(action)
         if env.last_outcome_polarity == "positive":
             wins += 1
@@ -180,6 +203,24 @@ def _probe_policy_v088(
             level_gain += current_levels - last_levels
         last_levels = current_levels
     metric = (5.0 * wins + 2.0 * level_gain - 0.25 * failures) / max(1.0, float(steps))
+    if diagnostic is not None:
+        try:
+            diagnostic.update(
+                {
+                    "probe_steps": max(1, int(steps)),
+                    "plan_misses": int(plan_misses),
+                    "planned_steps": int(used),
+                    "observed_context_signatures": sorted(observed_contexts)[:8],
+                    "observed_context_buckets": sorted(
+                        stable_u64(value, person=b"v8-context")
+                        for value in observed_contexts
+                    )[:8],
+                    "available_action_ids": sorted(observed_actions)[:32],
+                    "planned_strategy_ids": sorted(planned_strategy_ids)[:8],
+                }
+            )
+        except BaseException:
+            pass
     return float(metric), used
 
 
@@ -227,6 +268,435 @@ def _coherent_cached_transfer_cut(view):
     else:
         edges = tuple(row for cut in edge_cuts for row in cut)
     return nodes, edges
+
+
+def _enum_name(enum_type, value) -> str:
+    try:
+        return enum_type(int(value)).name
+    except (TypeError, ValueError):
+        return f"UNKNOWN_{value}"
+
+
+def _uid_value(value) -> str | None:
+    if value is None:
+        return None
+    method = getattr(value, "hex", None)
+    return str(method()) if callable(method) else str(value)
+
+
+def _has_cached_ancestor(
+    parents: dict[MemoryUid, set[MemoryUid]],
+    uid: MemoryUid,
+    ancestor_uid: MemoryUid,
+    *,
+    max_depth: int = 8,
+) -> bool:
+    if uid == ancestor_uid:
+        return True
+    frontier = {uid}
+    visited = set(frontier)
+    for _depth in range(max(0, int(max_depth))):
+        following: set[MemoryUid] = set()
+        for current in frontier:
+            for parent in parents.get(current, ()):
+                if parent == ancestor_uid:
+                    return True
+                if parent not in visited:
+                    visited.add(parent)
+                    following.add(parent)
+        if not following:
+            return False
+        frontier = following
+    return False
+
+
+def _node_diagnostic(row) -> dict[str, object] | None:
+    if row is None:
+        return None
+    return {
+        "memory_id": _uid_value(row.uid),
+        "memory_level": _enum_name(MemoryLevel, row.level),
+        "memory_level_value": int(row.level),
+        "memory_kind": _enum_name(MemoryType, row.memory_type),
+        "memory_type_value": int(row.memory_type),
+        "key_parts": [int(value) for value in row.key_parts],
+        "support_count": int(row.support_count),
+        "cognitive_state": _enum_name(CognitiveState, row.cognitive_state),
+        "validation_state": _enum_name(ValidationState, row.validation_state),
+        "updated_watermark": int(row.updated_watermark),
+    }
+
+
+def _strategy_cache_rows(read_view) -> tuple[object, ...]:
+    result: list[object] = []
+    seen: set[MemoryUid] = set()
+    for values in getattr(read_view, "_strategy_by_context", {}).values():
+        for row in values:
+            if row.strategy_uid not in seen:
+                seen.add(row.strategy_uid)
+                result.append(row)
+    for row in getattr(read_view, "_strategy_fallback", ()):
+        if row.strategy_uid not in seen:
+            seen.add(row.strategy_uid)
+            result.append(row)
+    return tuple(result)
+
+
+def _candidate_execution_snapshot(read_view, nodes, candidate_uid: MemoryUid) -> dict[str, object]:
+    """Describe the already-built planning cache without making another decision."""
+    node_by_uid = getattr(read_view, "_node_by_uid", None)
+    if not isinstance(node_by_uid, dict):
+        node_by_uid = {row.uid: row for row in nodes}
+    parents = getattr(read_view, "_parents", {})
+    if not isinstance(parents, dict):
+        parents = {}
+    candidate = node_by_uid.get(candidate_uid)
+    relevant_levels = {int(MemoryLevel.M4), int(MemoryLevel.M7)}
+    descendants = [
+        row
+        for row in nodes
+        if int(row.level) in relevant_levels
+        and _has_cached_ancestor(parents, row.uid, candidate_uid)
+    ]
+    m4_descendants = [row for row in descendants if int(row.level) == int(MemoryLevel.M4)]
+    m7_descendants = [row for row in descendants if int(row.level) == int(MemoryLevel.M7)]
+    cached = [
+        row
+        for row in _strategy_cache_rows(read_view)
+        if _has_cached_ancestor(parents, row.strategy_uid, candidate_uid)
+    ]
+    missing_fields: list[str] = []
+    if candidate is None:
+        reason = "required_ancestor_lookup_returned_none"
+        missing_fields.append("required transfer ancestor memory")
+    elif int(candidate.level) not in {int(MemoryLevel.M3), int(MemoryLevel.M4)}:
+        reason = "required_ancestor_wrong_memory_level"
+        missing_fields.append("M3 or M4 required transfer ancestor")
+    elif not m7_descendants:
+        reason = "no_m7_strategy_descendant_for_required_ancestor"
+        missing_fields.extend(("M7 strategy descendant", "lineage to required transfer ancestor"))
+    elif not cached:
+        reason = "m7_descendants_failed_strategy_cache_predicate"
+        missing_fields.append("probeable M7 strategy cache row")
+    else:
+        reason = "executable_m7_descendant_available_for_target_probe"
+    return {
+        "lookup_result_status": (
+            "not_found" if candidate is None else "found_structural_ancestor"
+        ),
+        "required_ancestor_memory": _node_diagnostic(candidate),
+        "candidate_is_m3": bool(candidate is not None and int(candidate.level) == int(MemoryLevel.M3)),
+        "candidate_is_m4": bool(candidate is not None and int(candidate.level) == int(MemoryLevel.M4)),
+        "m4_descendant_count": len(m4_descendants),
+        "m4_descendant_ids": [_uid_value(row.uid) for row in m4_descendants[:8]],
+        "m7_descendant_count": len(m7_descendants),
+        "m7_descendant_ids": [_uid_value(row.uid) for row in m7_descendants[:8]],
+        "cached_executable_descendant_count": len(cached),
+        "cached_executable_descendants": [
+            {
+                "strategy_id": _uid_value(row.strategy_uid),
+                "action_id": int(row.action_id),
+                "outcome_id": _uid_value(row.outcome_uid),
+                "context_bucket": int(row.context_bucket),
+                "support": int(row.support),
+                "probationary": bool(row.probationary),
+                "transferable_fallback": bool(row.transferable),
+            }
+            for row in cached[:8]
+        ],
+        "executable_predicate_failure_reason": reason,
+        "required_executable_fields": list(_TRANSFER_EXECUTABLE_FIELDS),
+        "missing_or_invalid_executable_fields": missing_fields,
+    }
+
+
+def _direct_target_memory_inventories(
+    read_view,
+    nodes,
+    target_hashes: tuple[int, ...],
+) -> dict[int, dict[str, object]]:
+    direct = getattr(read_view, "_v839_direct_games", {})
+    if not isinstance(direct, dict):
+        direct = {}
+    by_uid = getattr(read_view, "_node_by_uid", None)
+    if not isinstance(by_uid, dict):
+        by_uid = {row.uid: row for row in nodes}
+    wanted = {int(value) for value in target_hashes}
+    rows_by_hash: dict[int, list[object]] = {value: [] for value in wanted}
+    for uid, games in direct.items():
+        row = by_uid.get(uid)
+        if row is None:
+            continue
+        for value in wanted.intersection(int(game) for game in games):
+            rows_by_hash[value].append(row)
+    result: dict[int, dict[str, object]] = {}
+    for target_hash, rows in rows_by_hash.items():
+        levels: dict[str, int] = {}
+        for row in rows:
+            name = _enum_name(MemoryLevel, row.level)
+            levels[name] = levels.get(name, 0) + 1
+        m3 = [row for row in rows if int(row.level) == int(MemoryLevel.M3)]
+        m4 = [row for row in rows if int(row.level) == int(MemoryLevel.M4)]
+        lower = [
+            row
+            for row in rows
+            if int(row.level) in {int(MemoryLevel.M1), int(MemoryLevel.M2)}
+            and len(row.key_parts) >= 2
+        ]
+        result[target_hash] = {
+            "identity_index": "GAME_PROVENANCE target UID low word",
+            "identities_actually_present_count": len(rows),
+            "memory_counts_by_level": levels,
+            "m3_exists": bool(m3),
+            "m3_ids": [_uid_value(row.uid) for row in m3[:8]],
+            "m4_exists": bool(m4),
+            "m4_ids": [_uid_value(row.uid) for row in m4[:8]],
+            "action_bearing_lower_level_memory_exists": bool(lower),
+            "action_bearing_lower_level_memory_ids": [_uid_value(row.uid) for row in lower[:8]],
+            "executable_lower_level_memory_exists": False,
+            "executable_lower_level_memory_ids": [],
+            "lower_level_execution_note": (
+                "LiveReadView.planned_action executes cached M7 strategies; M1/M2 rows "
+                "are not direct transfer-execution objects"
+            ),
+        }
+    return result
+
+
+def _load_json_object(path: Path) -> dict[str, object]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _trajectory_inventory(games: tuple[str, ...]) -> dict[str, dict[str, object]]:
+    raw_root = str(os.environ.get("ARC_AGI3_V8_ROOT", "")).strip()
+    trajectory_root = str(os.environ.get("ARC_AGI3_V8_TRAJECTORY_ROOT", "")).strip()
+    if raw_root:
+        root = Path(raw_root) / "trajectory_optimizer"
+    elif trajectory_root:
+        root = Path(trajectory_root)
+    else:
+        return {game: {"successful_trajectory_exists": False} for game in games}
+    result = {game: {"successful_trajectory_exists": False} for game in games}
+    for filename in ("best_successful.json", "generic_best_successful.json"):
+        payload = _load_json_object(root / filename)
+        stores = []
+        for key in ("games", "environments"):
+            value = payload.get(key)
+            if isinstance(value, dict):
+                stores.append(value)
+        for game in games:
+            for store in stores:
+                row = store.get(game)
+                if not isinstance(row, dict):
+                    continue
+                levels = row.get("levels")
+                actions = row.get("actions")
+                executable = bool(
+                    (isinstance(actions, list) and actions)
+                    or (isinstance(levels, list) and any(
+                        isinstance(level, dict) and level.get("actions") for level in levels
+                    ))
+                )
+                result[game] = {
+                    "successful_trajectory_exists": True,
+                    "trajectory_id": str(row.get("trajectory_id", row.get("variant_id", ""))) or None,
+                    "trajectory_source": filename,
+                    "linked_memory_id": row.get("strategy_uid") or row.get("parent_strategy_uid"),
+                    "memory_level": "M7" if row.get("strategy_uid") else None,
+                    "executable_representation_available": executable,
+                    "action_sequence_schema": "actions" if isinstance(actions, list) else "levels[].actions",
+                }
+                break
+    validated = _load_json_object(root / "validated.json").get("validated")
+    if isinstance(validated, list):
+        for row in validated:
+            if not isinstance(row, dict):
+                continue
+            anchor = row.get("anchor")
+            game = str(anchor.get("source_id", "")) if isinstance(anchor, dict) else ""
+            if game not in result or result[game]["successful_trajectory_exists"]:
+                continue
+            result[game] = {
+                "successful_trajectory_exists": True,
+                "trajectory_id": str(row.get("variant_id", "")) or None,
+                "trajectory_source": "validated.json",
+                "linked_memory_id": row.get("strategy_uid") or row.get("parent_strategy_uid"),
+                "memory_level": "M7" if row.get("strategy_uid") else None,
+                "executable_representation_available": bool(row.get("actions")),
+                "action_sequence_schema": "actions",
+            }
+    return result
+
+
+def _executable_reference(read_view, nodes) -> dict[str, object]:
+    """Return one bounded representation already executable elsewhere in v8."""
+    node_by_uid = getattr(read_view, "_node_by_uid", None)
+    if not isinstance(node_by_uid, dict):
+        node_by_uid = {row.uid: row for row in nodes}
+    cached = _strategy_cache_rows(read_view)
+    if cached:
+        strategy = cached[0]
+        return {
+            "representation": "graph_planner_strategy_cache",
+            "runtime_consumer": "LiveReadView.planned_action",
+            "memory": _node_diagnostic(node_by_uid.get(strategy.strategy_uid)),
+            "action_sequence_representation": {"action_id": int(strategy.action_id)},
+            "trajectory_or_source_reference": None,
+            "environment_or_world_reference": "context_bucket",
+            "provenance": "graph lineage and GAME_PROVENANCE edges",
+            "replay_or_execution_metadata": {
+                "outcome_id": _uid_value(strategy.outcome_uid),
+                "context_bucket": int(strategy.context_bucket),
+                "transferable_fallback": bool(strategy.transferable),
+            },
+            "adapter_specific_fields": [],
+        }
+    raw_root = str(os.environ.get("ARC_AGI3_V8_ROOT", "")).strip()
+    trajectory_root = str(os.environ.get("ARC_AGI3_V8_TRAJECTORY_ROOT", "")).strip()
+    root = Path(raw_root) / "trajectory_optimizer" if raw_root else (
+        Path(trajectory_root) if trajectory_root else None
+    )
+    if root is not None:
+        for filename in ("best_successful.json", "generic_best_successful.json"):
+            payload = _load_json_object(root / filename)
+            for key in ("games", "environments"):
+                store = payload.get(key)
+                if not isinstance(store, dict):
+                    continue
+                for game, row in sorted(store.items()):
+                    if not isinstance(row, dict):
+                        continue
+                    actions = row.get("actions")
+                    levels = row.get("levels")
+                    if not (
+                        (isinstance(actions, list) and actions)
+                        or (isinstance(levels, list) and levels)
+                    ):
+                        continue
+                    return {
+                        "representation": "durable_successful_trajectory_sidecar",
+                        "runtime_consumer": "restored competence replay",
+                        "memory": None,
+                        "memory_level": None,
+                        "payload_schema": filename,
+                        "action_sequence_representation": (
+                            "actions" if isinstance(actions, list) else "levels[].actions"
+                        ),
+                        "trajectory_or_source_reference": str(
+                            row.get("trajectory_id", row.get("variant_id", ""))
+                        ) or None,
+                        "environment_or_world_reference": str(game),
+                        "provenance": row.get("source"),
+                        "replay_or_execution_metadata": {
+                            "seed": row.get("seed"),
+                            "terminal_state": row.get("terminal_state"),
+                            "successes": row.get("successes"),
+                        },
+                        "adapter_specific_fields": (
+                            ["levels"] if isinstance(levels, list) else ["seed"]
+                        ),
+                    }
+    return {
+        "representation": "none_found_in_current_graph_or_durable_sidecars",
+        "runtime_consumer": None,
+        "required_graph_schema": list(_TRANSFER_EXECUTABLE_FIELDS),
+    }
+
+
+def _target_resolution_event(
+    *,
+    read_view,
+    nodes,
+    candidate,
+    game_id: str,
+    target_hash: int,
+    probe_diagnostic: dict[str, object],
+    candidate_snapshot: dict[str, object],
+    target_inventory: dict[str, object],
+    trajectory: dict[str, object],
+    executable_reference: dict[str, object],
+    used: int,
+) -> dict[str, object]:
+    ancestor = candidate_snapshot.get("required_ancestor_memory")
+    candidate_games = sorted(int(value) for value in candidate.formation_games)
+    correspondence_games = sorted(int(value) for value in candidate.correspondence_games)
+    linked = trajectory.get("linked_memory_id")
+    requested_identity = {
+        "selected_game_or_environment_id": str(game_id),
+        "provenance_world_hash": int(target_hash),
+        "required_ancestor_uid": _uid_value(candidate.uid),
+        "context_buckets": probe_diagnostic.get("observed_context_buckets", []),
+    }
+    failure = candidate_snapshot["executable_predicate_failure_reason"]
+    missing_fields = list(candidate_snapshot["missing_or_invalid_executable_fields"])
+    if int(used) <= 0 and failure == "executable_m7_descendant_available_for_target_probe":
+        cached = candidate_snapshot.get("cached_executable_descendants", [])
+        actions = {int(value) for value in probe_diagnostic.get("available_action_ids", [])}
+        contexts = {int(value) for value in probe_diagnostic.get("observed_context_buckets", [])}
+        action_rows = [row for row in cached if int(row.get("action_id", -1)) in actions]
+        if not action_rows:
+            failure = "descendant_strategy_action_unavailable_in_target_environment"
+            missing_fields.append("action available in target environment")
+        elif not any(
+            int(row.get("context_bucket", -1)) in contexts
+            or bool(row.get("transferable_fallback"))
+            for row in action_rows
+        ):
+            failure = "no_matching_target_context_or_transferable_fallback"
+            missing_fields.append("matching target context or transferable fallback")
+        else:
+            failure = "composed_planner_or_execution_adapter_rejected_cached_strategy"
+    if int(used) > 0:
+        failure = None
+    return {
+        "source_world": candidate_games,
+        "target_world": str(game_id),
+        "transfer_candidate_id": _uid_value(candidate.uid),
+        "correspondence_id": _uid_value(candidate.correspondence_uid),
+        "target_memory_id": None if ancestor is None else ancestor.get("memory_id"),
+        "target_memory_role": "required source-side transfer ancestor; no target-specific object is looked up",
+        "target_memory_level": None if ancestor is None else ancestor.get("memory_level"),
+        "target_memory_kind": None if ancestor is None else ancestor.get("memory_kind"),
+        "lookup_key_used": requested_identity,
+        "lookup_result_status": candidate_snapshot["lookup_result_status"],
+        "target_specific_memory_lookup_performed": False,
+        "requested_lookup_identity": requested_identity,
+        "candidate_memory_identities_actually_present": {
+            "formation_world_hashes": candidate_games,
+            "correspondence_world_hashes": correspondence_games,
+        },
+        "provenance_world_hash": int(target_hash),
+        "selected_game_or_environment_id": str(game_id),
+        "adapter_family": "ARC",
+        "execution_adapter": "v7.environment.arc_adapter.ArcGridEnvironment",
+        "executable_predicate": "probe planned_action returned at least once (used > 0)",
+        "executable_predicate_result": bool(int(used) > 0),
+        "exact_executable_predicate_failure_reason": failure,
+        "required_executable_fields": candidate_snapshot["required_executable_fields"],
+        "missing_or_invalid_executable_fields": missing_fields,
+        "successful_trajectory": trajectory,
+        "successful_trajectory_link_reached_by_transfer_lookup": bool(linked) and bool(int(used) > 0),
+        "target_world_memory": target_inventory,
+        "m3_exists_for_target_world": bool(target_inventory.get("m3_exists")),
+        "m4_exists_for_target_world": bool(target_inventory.get("m4_exists")),
+        "executable_lower_level_memory_exists_for_target_world": bool(
+            target_inventory.get("executable_lower_level_memory_exists")
+        ),
+        "required_ancestor_resolution": candidate_snapshot,
+        "probe_observations": probe_diagnostic,
+        "executable_vs_rejected_comparison": {
+            "executable_reference": executable_reference,
+            "rejected_reference": ancestor,
+            "minimal_structural_difference": (
+                "rejected transfer ancestor has no action-bearing M7 strategy descendant "
+                "reachable through graph lineage"
+            ),
+        },
+    }
 
 
 def _run_automatic_transfer_experiments_v088(
@@ -279,6 +749,12 @@ def _run_automatic_transfer_experiments_v088(
     eligibility_probes = 0
     eligibility_probe_limit = max(1, int(max_trials))
     game_hashes = {game: stable_u64(game, person=b"v8-game") for game in holdouts}
+    target_inventories = _direct_target_memory_inventories(
+        runtime.read_view, nodes, tuple(game_hashes.values())
+    )
+    trajectories = _trajectory_inventory(holdouts)
+    executable_reference = _executable_reference(runtime.read_view, nodes)
+    candidate_execution: dict[MemoryUid, dict[str, object]] = {}
 
     def reject(reason: str) -> None:
         scheduling_rejections[reason] = scheduling_rejections.get(reason, 0) + 1
@@ -371,6 +847,7 @@ def _run_automatic_transfer_experiments_v088(
                 return finish("eligibility_probe_limit_reached")
             eligibility_probes += 1
             trial_seed = int(seed) + (completed + 1) * 7919
+            probe_diagnostic: dict[str, object] = {}
             on_metric, used = _probe_policy_v088(
                 read_view=runtime.read_view,
                 game_id=game_id,
@@ -378,6 +855,56 @@ def _run_automatic_transfer_experiments_v088(
                 seed=trial_seed,
                 steps=steps_per_trial,
                 required_ancestor=candidate.uid,
+                diagnostic=probe_diagnostic,
+            )
+            candidate_snapshot = candidate_execution.get(candidate.uid)
+            if candidate_snapshot is None:
+                candidate_snapshot = _candidate_execution_snapshot(
+                    runtime.read_view, nodes, candidate.uid
+                )
+                candidate_execution[candidate.uid] = candidate_snapshot
+            resolution = _target_resolution_event(
+                read_view=runtime.read_view,
+                nodes=nodes,
+                candidate=candidate,
+                game_id=game_id,
+                target_hash=target_hash,
+                probe_diagnostic=probe_diagnostic,
+                candidate_snapshot=candidate_snapshot,
+                target_inventory=target_inventories.get(
+                    target_hash,
+                    {
+                        "identity_index": "GAME_PROVENANCE target UID low word",
+                        "identities_actually_present_count": 0,
+                        "memory_counts_by_level": {},
+                        "m3_exists": False,
+                        "m4_exists": False,
+                        "executable_lower_level_memory_exists": False,
+                    },
+                ),
+                trajectory=trajectories.get(
+                    game_id, {"successful_trajectory_exists": False}
+                ),
+                executable_reference=executable_reference,
+                used=used,
+            )
+            flow.emit_bounded(
+                "transfer",
+                "target_memory_resolution",
+                input_count=1,
+                output_count=int(used > 0),
+                rejection_counts=(
+                    {str(resolution["exact_executable_predicate_failure_reason"]): 1}
+                    if used <= 0 else {}
+                ),
+                examples=(
+                    {
+                        "transfer_candidate_id": resolution["transfer_candidate_id"],
+                        "target_world": game_id,
+                        "trajectory_id": resolution["successful_trajectory"].get("trajectory_id"),
+                    },
+                ),
+                fields=resolution,
             )
             if used <= 0:
                 reject("target_memory_not_executable")
