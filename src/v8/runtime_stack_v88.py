@@ -54,8 +54,6 @@ _LAYERS: tuple[str, ...] = (
     "click_exploration_v848",
 )
 
-# Keep the historical v8.48-last assertion meaningful while allowing observational
-# and resource-efficiency layers to compose after the behavior layer.
 _POST_LAYERS: tuple[str, ...] = (
     "action_learning_report_v849",
     "action_learning_report_v849_fixups",
@@ -70,8 +68,6 @@ _POST_LAYERS: tuple[str, ...] = (
     "actor_throughput_v853",
 )
 
-# Final maintenance/scaling layers intentionally live outside _POST_LAYERS so older
-# public-authority assertions retain their historical meaning.
 _FINAL_LAYERS: tuple[str, ...] = (
     "performance_memory_v854",
     "performance_memory_v854_fixups",
@@ -103,7 +99,6 @@ def _installer(module_name: str):
 
 
 def _publish_runtime_api_for_late_bootstrap() -> None:
-    """Expose the package runtime API before late layers import package-level names."""
     package = sys.modules.get("v8")
     if package is None:
         return
@@ -148,4 +143,15 @@ def install_current_runtime_stack_v88() -> None:
     _installer("generic_result_flush_v877")()
     _installer("research_integrity_v878")()
     _installer("information_flow_integrity_v879")()
+    # Hydra v9 is the single post-v8.79 multimodal integration authority.
+    _installer("hydra_v9")()
+
+    # Hydra must not replace the already-public v8.45 peer lock authority. Its
+    # structural correspondence pass is invoked from Hydra-specific maintenance and
+    # research paths instead of changing the public supervisor entrypoint.
+    from v8 import peers_v82
+    from v8.snapshot_state_consistency_v845 import _peer_run_once_v845
+
+    if _peer_run_once_v845 is not None:
+        peers_v82.V82DevelopmentalPeerSupervisor.run_once = _peer_run_once_v845
     _INSTALLED = True
